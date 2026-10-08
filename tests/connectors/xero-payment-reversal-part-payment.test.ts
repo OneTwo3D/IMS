@@ -1216,7 +1216,7 @@ test('a withheld reversal is asked again on a timer, and a cancelled registratio
   state.purchaseInvoices = [paidBillRow()]
   // The registration is a CANCELLED row the orphan sweep PROVED pre-call. o3d-f709 C1: this used to
   // be an operator's NOT_POSTED settlement, which no longer resolves anything (a person's word about a
-  // ledger IMS never read); the sweep's `abandonedBeforeRemoteCall` is the proof that makes the zero
+  // ledger IMS did not check); the sweep's `abandonedBeforeRemoteCall` is the proof that makes the zero
   // the whole story.
   state.syncLogs = [billRegistration({
     status: 'CANCELLED', externalTransactionId: null, syncedAt: null,

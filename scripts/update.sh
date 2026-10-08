@@ -4783,7 +4783,38 @@ resume_from_interrupted_arming() {
 # @deploy-phase: preflight
 # ---------------------------------------------------------------------------
 CURRENT_STEP="preflight"
+# NODE_OPTIONS FOR THE BUILD STEP ONLY, AND ONLY THE HEAP CEILING.
+#
+# `next build` runs a TypeScript pass whose heap outgrows Node's default old-space limit
+# (about 2 GB on an 8 GB host): a rehearsal on an 8 GB machine aborted at ~2 GB and again at
+# 3 GB and completed at 5 GB. The build is the only step that needs it, so it is handed to the
+# build and not exported for the whole run. It is a CEILING and not a reservation: a host with
+# less memory fails the build (before anything is stopped) instead of finishing it, which is why
+# docs/installation.md states the memory the build needs.
+#   IMS_BUILD_MAX_OLD_SPACE_MB  overrides the 6144 default (whole megabytes, 1000-999999) and
+#                               replaces a --max-old-space-size already present in NODE_OPTIONS;
+#                               without it, an operator's own --max-old-space-size is left alone.
+# The three entrypoints carry byte-identical copies of this function (a test compares them).
+build_node_options() {
+  local mb="${IMS_BUILD_MAX_OLD_SPACE_MB:-}" current="${NODE_OPTIONS:-}"
+  if [[ -n "${mb}" ]]; then
+    [[ "${mb}" =~ ^[1-9][0-9]{3,5}$ ]] || { echo "IMS_BUILD_MAX_OLD_SPACE_MB must be a whole number of megabytes between 1000 and 999999, not '${mb}'." >&2; return 1; }
+    current="$(printf '%s' "${current}" | sed -E 's/(^| )--max-old-space-size[= ][^ ]*//g')"
+    current="${current#"${current%%[![:space:]]*}"}"
+  elif [[ "${current}" == *--max-old-space-size* ]]; then
+    printf '%s' "${current}"
+    return 0
+  else
+    mb=6144
+  fi
+  printf '%s' "${current:+${current} }--max-old-space-size=${mb}"
+}
+
 header "Preflight"
+
+# Validated before the lock, the fence or the pull: a malformed override found at the build step
+# is found after the pull. See build_node_options().
+BUILD_NODE_OPTIONS="$(build_node_options)" || die "Nothing has been changed."
 
 if ! $DRY_RUN; then
   acquire_cutover_lock
@@ -5207,7 +5238,7 @@ if ! $SKIP_BUILD; then
   # build touches in the database fails with "permission denied for database" — the fence
   # working as intended, presenting as a build error.
   build_rc=0
-  run run_as_user_db \
+  NODE_OPTIONS="${BUILD_NODE_OPTIONS}" run run_as_user_db \
     npm run build --prefix "${APP_DIR}" || build_rc=$?
   # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The build"

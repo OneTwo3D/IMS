@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { roundMoney } from '@/lib/domain/math/decimal'
 import {
@@ -1477,10 +1478,10 @@ export async function updateMirroredAccountingEventStatus(
           ...(claim.orderEstablished
             ? {}
             : {
-                message: 'The document id moved to a later revision on an ASSUMED order: nothing placed '
+                message: withLedgerCheck('The document id moved to a later revision on an ASSUMED order: nothing placed '
                   + 'these two writes against each other. Compare the document in the accounting system '
                   + 'with both payloads, and if the released row is the one that describes it, re-post '
-                  + 'that revision — its write returns a real revision stamp and settles the claim.',
+                  + 'that revision — its write returns a real revision stamp and settles the claim.'),
               }),
           metadata: {
             connector: params.connector,

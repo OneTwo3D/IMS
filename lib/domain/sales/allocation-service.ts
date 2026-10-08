@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { randomUUID } from 'node:crypto'
 
 import { Prisma } from '@/app/generated/prisma/client'
@@ -1119,12 +1120,12 @@ export async function reverseOrphanedAllocationPosting(
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
+          withLedgerCheck(`Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
           + `${orderId} carrying £${snapshotAmount.toFixed(2)} of what Group A2 recorded posting for them, but `
           + `NO Allocated Inventory reversal was raised: the accounting connector this reversal would be `
           + `raised on cannot be established, so there is no way to tell whether it is the ledger A2 debited. `
           + `Post the DR Inventory / CR Allocated Inventory reversal by hand if the debit is real and in these `
-          + `books.`,
+          + `books.`),
       },
     })
     return
@@ -1212,14 +1213,14 @@ export async function reverseOrphanedAllocationPosting(
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
+          withLedgerCheck(`Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
           + `${orderRef} carrying £${snapshotAmount.toFixed(2)} of what Group A2 recorded posting for them `
           + `(cost layer(s) ${[...new Set(orphaned.map((entry) => entry.costLayerId))].join(', ')}), but NO `
           + `Allocated Inventory reversal was raised: ${proof.reason}. An amount recorded beside the units `
           + `says how many pounds they carried, never that a journal posted them or which ledger it posted `
           + `them to (o3d-o97 r3), and a credit raised on that alone moves money that was never there. `
           + `Post CR ${settings.allocatedInventoryAccount} / DR ${settings.inventoryAccount} £`
-          + `${snapshotAmount.toFixed(2)} by hand if the debit is real and in these books.`,
+          + `${snapshotAmount.toFixed(2)} by hand if the debit is real and in these books.`),
       },
     })
     return
@@ -1437,7 +1438,7 @@ async function assertAllocationReversalQueued(
       tag: 'accounting',
       level: 'ERROR',
       description:
-        `Allocation reversal of £${amount.toFixed(2)} on order ${orderId} was NOT queued — no `
+        withLedgerCheck(`Allocation reversal of £${amount.toFixed(2)} on order ${orderId} was NOT queued — no `
         + `AccountingSyncLog row exists for reversal token ${reversalToken}. `
         + `${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) left the order and their `
         + 'Group A2 Allocated Inventory debit has been left standing with nothing downstream to '
@@ -1448,7 +1449,7 @@ async function assertAllocationReversalQueued(
             + 'connector selection back does not undo the debit — post the journal by hand.'
           : enqueueOutcome?.reason === 'not-configured'
             ? 'The connector does not post this journal type, so nothing will ever queue for it.'
-            : 'The enqueue reported no reason.'),
+            : 'The enqueue reported no reason.')),
       metadata: {
         reversalToken,
         amount,
@@ -1760,7 +1761,7 @@ export async function resetAllocationAccountingIfStaged(
             `Allocations changed on an order whose Group A2 posting still stands, so the A2 stamp and its `
             + `recorded debit were KEPT rather than cleared: ${stagedDebit.reason}. The declared set holds `
             + `quantity nothing has accounted, but NO allocation row records what A2 already accounted, so `
-            + `handing this order back would re-value and re-post every unit on it rather than the new ones. `
+            + `handing this order back would cause every unit on it to be re-valued and re-posted rather than the new ones. `
             + `The newly allocated quantity is NOT reclassified — reclassify it by hand, or re-run the `
             + `change once the rows carry their posted records.`,
         },

@@ -103,6 +103,7 @@
  * duplicate journal nobody notices.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 
 import {
@@ -561,7 +562,7 @@ export function describeCreateDispatchNotSent(params: {
  */
 export function describeCreateDispatchRemedy(type: AccountingSyncType): string {
   if (isDailyBatchSyncType(type)) {
-    return 'REMEDY: look in the accounting system for that journal. If it is there, record its id '
+    return withLedgerCheck('REMEDY: look in the accounting system for that journal. If it is there, record its id '
       + 'against this row with the per-row settlement action on /sync, choosing "It DID post" — a '
       + 'DAILY BATCH row accepts that assertion and only that one. It leaves the row SYNCED, which '
       + 'blocks both the batch recreate probe and the order delete guard, so no second journal is '
@@ -571,7 +572,7 @@ export function describeCreateDispatchRemedy(type: AccountingSyncType): string {
       + 'journal is NOT there, post it in the accounting system from this row\'s own lines and record '
       + 'that id here the same way: a batch covers every order staged into it, so there is deliberately '
       + 'no per-row cancel-and-re-queue for one — cancelling it would let an order be hard-deleted while '
-      + 'a recreate was already building a journal containing its value.'
+      + 'a recreate was already building a journal containing its value.')
   }
   return 'REMEDY: look in Xero for that document. If it is there, record its id against this row with '
     + 'the per-row settlement action on /sync (it is written as an operator assertion, not a connector '

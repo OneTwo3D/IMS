@@ -1,5 +1,6 @@
 'use client'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { AlertTriangle, Loader2 } from 'lucide-react'
@@ -7,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { cancelOrphanedAccountingSyncRows } from '@/app/actions/accounting-sync'
 import type { ConnectorOrphanSummary } from '@/lib/domain/accounting/connector-orphans'
 import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
+import { describeDocumentIdClaim, describeLedgerStanding } from '@/lib/domain/accounting/ledger-standing-display'
 import { resolveConnectorOrphanBannerState } from '@/lib/domain/accounting/stranded-sync-visibility'
 import { observeServerRender } from '@/lib/domain/accounting/server-render-marker'
 import { SettleSyncRowControl } from './settle-sync-row-control'
@@ -256,9 +258,9 @@ export function ConnectorOrphanBanner({
                   + ' whose reply was lost can still commit after any render. Treat them as newer, not as'
                   + ' authoritative — check the activity log before retrying.'
                 // The honest report of an unobservable completion.
-                : ' A reload of the rows below was requested but has NOT been confirmed — it reports no completion, it can'
+                : withLedgerCheck(' A reload of the rows below was requested but has NOT been confirmed — it reports no completion, it can'
                   + ' be served from cache, and it can fail. Do NOT treat the rows below as authoritative: reload this page'
-                  + ' yourself, and check the activity log, before retrying.'}
+                  + ' yourself, and check the activity log, before retrying.')}
             </p>
           )}
           {notice && <p className="text-xs font-medium">{notice}</p>}
@@ -305,8 +307,18 @@ export function ConnectorOrphanBanner({
                             that connector before it stalled — the operator needs that token to find
                             the document, so it is shown rather than hidden behind the status.
                           */}
-                          {row.externalTransactionId && (
-                            <div className="opacity-70">posted as {row.externalTransactionId}</div>
+                          {/*
+                            o3d-1e7sl (D4): said by STANDING, not as an unqualified "posted as". A typed
+                            document id and a connector-issued one are not the same claim, and a retired row
+                            that names nothing is not thereby proven unsent.
+                          */}
+                          {describeDocumentIdClaim(row) !== null && (
+                            <div className="opacity-70">{describeDocumentIdClaim(row)}</div>
+                          )}
+                          {describeLedgerStanding(row).label !== null && (
+                            <div className="text-amber-600 dark:text-amber-400" title={describeLedgerStanding(row).detail}>
+                              {describeLedgerStanding(row).label}
+                            </div>
                           )}
                         </td>
                         <td className="pr-3 py-0.5">

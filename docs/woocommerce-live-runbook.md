@@ -180,3 +180,4 @@ Expected result:
 - WooCommerce order/product screenshots or REST responses
 - Exact SKUs, WC order IDs, and tracking numbers used in the run
 - Whether webhook jobs auto-drained or had to be forced manually
+- For the first load: the JSON report of `npm run rehearse:woo-import` run on the commit being deployed (see `docs/installation.md`, "WooCommerce initial-import rehearsal"), and the resolved order-status list the Sync page prints before **Import Active Orders** is pressed

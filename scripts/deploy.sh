@@ -591,6 +591,36 @@ if [[ $EUID -ne 0 ]] && ! $DRY_RUN; then
   die "Run as root: it stops a systemd unit and rewrites the ${APP_USER} crontab. (--dry-run works unprivileged.)"
 fi
 
+# NODE_OPTIONS FOR THE BUILD STEP ONLY, AND ONLY THE HEAP CEILING.
+#
+# `next build` runs a TypeScript pass whose heap outgrows Node's default old-space limit
+# (about 2 GB on an 8 GB host): a rehearsal on an 8 GB machine aborted at ~2 GB and again at
+# 3 GB and completed at 5 GB. The build is the only step that needs it, so it is handed to the
+# build and not exported for the whole run. It is a CEILING and not a reservation: a host with
+# less memory fails the build (before anything is stopped) instead of finishing it, which is why
+# docs/installation.md states the memory the build needs.
+#   IMS_BUILD_MAX_OLD_SPACE_MB  overrides the 6144 default (whole megabytes, 1000-999999) and
+#                               replaces a --max-old-space-size already present in NODE_OPTIONS;
+#                               without it, an operator's own --max-old-space-size is left alone.
+# The three entrypoints carry byte-identical copies of this function (a test compares them).
+build_node_options() {
+  local mb="${IMS_BUILD_MAX_OLD_SPACE_MB:-}" current="${NODE_OPTIONS:-}"
+  if [[ -n "${mb}" ]]; then
+    [[ "${mb}" =~ ^[1-9][0-9]{3,5}$ ]] || { echo "IMS_BUILD_MAX_OLD_SPACE_MB must be a whole number of megabytes between 1000 and 999999, not '${mb}'." >&2; return 1; }
+    current="$(printf '%s' "${current}" | sed -E 's/(^| )--max-old-space-size[= ][^ ]*//g')"
+    current="${current#"${current%%[![:space:]]*}"}"
+  elif [[ "${current}" == *--max-old-space-size* ]]; then
+    printf '%s' "${current}"
+    return 0
+  else
+    mb=6144
+  fi
+  printf '%s' "${current:+${current} }--max-old-space-size=${mb}"
+}
+
+# Validated up front: a malformed override found at the build step is found after the pull.
+BUILD_NODE_OPTIONS="$(build_node_options)" || { echo "Nothing has been changed." >&2; exit 1; }
+
 as_app_user() {
   if [[ "$(id -un)" == "$APP_USER" ]]; then
     "$@"
@@ -4415,7 +4445,7 @@ if ! $SKIP_BUILD; then
     # HIGH 2). The placement now runs before the failure is propagated, and on a run that
     # ADOPTED a fence that placement can itself refuse -- so a diagnostic left below it would be
     # lost on exactly the run that needed both answers.
-    as_app_user_db npm run build >"$BUILD_LOG" 2>&1 || { build_rc=$?; tail -40 "$BUILD_LOG" >&2; }
+    NODE_OPTIONS="${BUILD_NODE_OPTIONS}" as_app_user_db npm run build >"$BUILD_LOG" 2>&1 || { build_rc=$?; tail -40 "$BUILD_LOG" >&2; }
     # A BUILD IS A DATABASE CONSUMER TOO, ON THE RECOVERY PATH (o3d-secops r33, Codex HIGH 1). On
     # an ordinary run this is a no-op: no fence is standing yet, so pin_migration_window() returns
     # at once. On a run that ADOPTED a standing fence it is not -- the migration URL is live by

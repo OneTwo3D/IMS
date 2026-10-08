@@ -1,5 +1,6 @@
 'use server'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -2142,11 +2143,11 @@ async function queueRefundAccountingActions(input: {
         tag: 'accounting',
         level: 'WARNING',
         description:
-          `NOTHING WAS QUEUED. The staged ${sync.type} for refund ${input.refundId} was persisted before `
+          withLedgerCheck(`NOTHING WAS QUEUED. The staged ${sync.type} for refund ${input.refundId} was persisted before `
           + 'IMS recorded which accounting connector a staged journal’s account codes came from, so its '
           + 'chart cannot be established and routing it by whatever connector is active now could post '
           + 'one ledger’s codes into the other’s books. This posting is still OUTSTANDING: check '
-          + 'whether it already posted, and if not raise it by hand from the refund’s own snapshots.',
+          + 'whether it already posted, and if not raise it by hand from the refund’s own snapshots.'),
         metadata: { refundId: input.refundId, type: sync.type, referenceId: sync.referenceId },
       }).catch(() => { /* the refusal below is what the ledger acts on; logging must not throw */ })
       ledger.account(sync, { queued: false, reason: 'refused', connector: null })
@@ -2808,7 +2809,7 @@ export async function raiseChargebackForReversedOrder(
       action: 'chargeback_requires_manual_handling',
       tag: 'accounting',
       level: 'WARNING',
-      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} that already has prior refunds — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually.`,
+      description: withLedgerCheck(`Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} that already has prior refunds — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually.`),
       resolveUser: false,
     })
     return { raised: false, reason: 'order has prior refunds — manual chargeback required' }
@@ -2893,8 +2894,8 @@ export async function raiseChargebackForReversedOrder(
       level: 'WARNING',
       description:
         discountDecision.reason === 'RESTATED_AFTER_POSTING'
-          ? `Payment reversed on order ${orderRef}, whose order-level discount was restated after its invoice posted: the ledger document charged ${discountDecision.postedAmount} ${order.currency} and the order now carries ${discountDecision.orderAmount} ${order.currency} (${discountDecision.detail}). Auto-chargeback skipped — reversing the order's figure over-credits the difference, and reversing the posted figure under-credits it if the manual ledger adjustment for this order has already been made. Raise the credit note manually against the document as it stands.`
-          : `Payment reversed on order ${orderRef}, but the order-level discount the invoice actually posted could not be established (${discountDecision.detail}) — auto-chargeback skipped; raise the credit note manually against the posted invoice.`,
+          ? withLedgerCheck(`Payment reversed on order ${orderRef}, whose order-level discount was restated after its invoice posted: the ledger document charged ${discountDecision.postedAmount} ${order.currency} and the order now carries ${discountDecision.orderAmount} ${order.currency} (${discountDecision.detail}). Auto-chargeback skipped — reversing the order's figure over-credits the difference, and reversing the posted figure under-credits it if the manual ledger adjustment for this order has already been made. Raise the credit note manually against the document as it stands.`)
+          : withLedgerCheck(`Payment reversed on order ${orderRef}, but the order-level discount the invoice actually posted could not be established (${discountDecision.detail}) — auto-chargeback skipped; raise the credit note manually against the posted invoice.`),
       metadata: {
         reason: discountDecision.reason,
         detail: discountDecision.detail,
@@ -2945,7 +2946,7 @@ export async function raiseChargebackForReversedOrder(
         action: 'chargeback_requires_manual_handling',
         tag: 'accounting',
         level: 'WARNING',
-        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount, but ${accountDecision.reason} — auto-chargeback skipped; raise the credit note manually.`,
+        description: withLedgerCheck(`Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount, but ${accountDecision.reason} — auto-chargeback skipped; raise the credit note manually.`),
         resolveUser: false,
       })
       return { raised: false, reason: `order-level discount: ${accountDecision.reason} — manual chargeback required` }
@@ -3016,7 +3017,7 @@ export async function raiseChargebackForReversedOrder(
       action: 'chargeback_requires_manual_handling',
       tag: 'accounting',
       level: 'WARNING',
-      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} but a refund was recorded concurrently — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually. ${result.error ?? ''}`.trim(),
+      description: withLedgerCheck(`Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} but a refund was recorded concurrently — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually. ${result.error ?? ''}`).trim(),
       resolveUser: false,
     })
     return { raised: false, reason: 'order has prior refunds — manual chargeback required' }
@@ -3041,9 +3042,9 @@ export async function raiseChargebackForReversedOrder(
       tag: 'accounting',
       level: 'WARNING',
       description:
-        `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} but the ` +
+        withLedgerCheck(`Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} but the ` +
         `revenue unwind was refused: ${result.error ?? ''} Raise the credit note manually, or restore the ` +
-        'tax mapping and re-run the payment poller.',
+        'tax mapping and re-run the payment poller.'),
       resolveUser: false,
     })
     return { raised: false, error: result.error, manualResolutionRequired: true }

@@ -1,5 +1,7 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingLinkSource, AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { NAMES_A_DOCUMENT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { isUniqueConstraintViolation, uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
@@ -361,12 +363,12 @@ function externalIdConflictMessage(params: {
   otherLabel: string
 }): string {
   return (
-    `Refusing to link ${params.documentLabel} ${params.localId} to ${params.connector} ${params.remoteLabel} ${params.externalId}: `
+    withLedgerCheck(`Refusing to link ${params.documentLabel} ${params.localId} to ${params.connector} ${params.remoteLabel} ${params.externalId}: `
     + `that external id is ALREADY HELD LOCALLY by another ${params.otherLabel}, and one ledger document cannot belong to two `
     + 'local documents — every later correction, payment or status update would act on the wrong one. The likeliest cause is that '
     + 'this connector was reconnected to a different company/organisation which has reissued an id a document from the previous one '
     + `still holds; the next likeliest is that the ledger merged two of our documents on a shared number. Check which record currently `
-    + `carries ${params.externalId} and resolve it by hand — nothing here will overwrite it.`
+    + `carries ${params.externalId} and resolve it by hand — nothing here will overwrite it.`)
   )
 }
 
@@ -513,7 +515,12 @@ export async function resolvePurchaseOrderBackReference(
       type: 'PURCHASE_INVOICE',
       referenceType: 'PurchaseOrder',
       referenceId: params.purchaseOrderId,
-      externalTransactionId: { not: null },
+      // Rows that NAME a document, in any status and on any basis (o3d-1e7sl). An EXISTENCE reading
+      // (D2): a competitor claims a bill for this PO whether the ledger issued its id or an operator
+      // typed it, so an operator-asserted competitor counts - dropping it would read ambiguity as
+      // certainty, the direction this count must never err in. The module's wording of "names a
+      // document" (`NAMES_A_DOCUMENT_WHERE`), not a hand-written `{ not: null }`.
+      ...NAMES_A_DOCUMENT_WHERE,
     },
   })
   // EXACTLY one, not "at most one". Zero used to fall through to `unique`, which meant the
@@ -1067,11 +1074,11 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     } catch (error) {
       if (!isExternalBillIdConflict(error)) throw error
       throw new Error(
-        `Refusing to link PurchaseInvoice ${referenceId} to ${connector} bill ${externalId}: that external id is ALREADY HELD LOCALLY by `
+        withLedgerCheck(`Refusing to link PurchaseInvoice ${referenceId} to ${connector} bill ${externalId}: that external id is ALREADY HELD LOCALLY by `
         + 'another purchase invoice, and one ledger document cannot belong to two local bills — every later correction would rewrite the '
         + 'wrong one. The likeliest cause is that this connector was reconnected to a different company/organisation which has reissued an '
         + 'id a bill from the previous one still holds; the next likeliest is that an earlier repair mis-attributed it. Check which bill '
-        + `currently carries ${externalId} and resolve it by hand — nothing here will overwrite it.`,
+        + `currently carries ${externalId} and resolve it by hand — nothing here will overwrite it.`),
         { cause: error },
       )
     }

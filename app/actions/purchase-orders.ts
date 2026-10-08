@@ -1,5 +1,6 @@
 'use server'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
@@ -2927,7 +2928,7 @@ export async function returnPurchaseOrder(
           tag: 'purchase',
           level: creditNote ? 'INFO' : 'WARNING',
           description: creditNote
-            ? `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — a DRAFT supplier credit note of ${po.currency} ${creditNote.amountForeign.toFixed(2)} was created for review. Post it to credit the supplier bill.`
+            ? withLedgerCheck(`Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — a DRAFT supplier credit note of ${po.currency} ${creditNote.amountForeign.toFixed(2)} was created for review. Post it to credit the supplier bill.`)
             : `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — ${overBilling.totalOverBilledValueBase} over-billed (base currency) across ${overBilling.bills.length} bill(s). Raise a supplier credit.`,
           metadata: {
             reference: po.reference,
@@ -2954,7 +2955,7 @@ export async function returnPurchaseOrder(
           action: 'return_credit_suppressed',
           tag: 'purchase',
           level: 'WARNING',
-          description: `Return on PO ${po.reference}: ${po.currency} ${suppressedReturnCredit.toFixed(2)} of return credit (cumulative) could not be auto-created because existing credit notes (e.g. a manual allowance) already use the bill's creditable amount. Review and raise the outstanding supplier credit manually.`,
+          description: withLedgerCheck(`Return on PO ${po.reference}: ${po.currency} ${suppressedReturnCredit.toFixed(2)} of return credit (cumulative) could not be auto-created because existing credit notes (e.g. a manual allowance) already use the bill's creditable amount. Review and raise the outstanding supplier credit manually.`),
           metadata: { reference: po.reference, suppressedReturnCreditForeign: suppressedReturnCredit, currency: po.currency },
         })
       }
@@ -3812,12 +3813,12 @@ export async function updateInvoice(
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `The bill edit was SAVED IN IMS but NOT queued to the accounting connector: the accounting `
+          withLedgerCheck(`The bill edit was SAVED IN IMS but NOT queued to the accounting connector: the accounting `
           + `queue ${billUpdateSync.outcome === 'refused-chart-retired' ? 'REFUSED (the accounting connector this edit was built for is no longer the active one)' : 'declined'} a PURCHASE_INVOICE_UPDATE for bill `
           + `${normalizedHeader.invoiceNumber ?? invoice.invoiceNumber ?? invoice.id}. The ledger still `
           + `holds the PREVIOUS version of this bill and nothing will retry on its own — either re-save `
           + `the bill once the accounting connector selection has settled, or correct the bill by hand in `
-          + `the ledger.`,
+          + `the ledger.`),
         metadata: {
           reference: invoice.po.reference,
           invoiceId: invoice.id,
@@ -4134,9 +4135,9 @@ export async function markBillPaid(
               `declined a BILL_PAYMENT for a bill the ledger already holds (posting for this sync type ` +
               `is switched off), so the paid status was rolled back rather than left standing with ` +
               `nothing queued.`
-          : `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
+          : withLedgerCheck(`Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
             `queued for the accounting connector, so the paid status was rolled back rather than left ` +
-            `standing with nothing queued. Retry, or record the payment in the ledger by hand.`,
+            `standing with nothing queued. Retry, or record the payment in the ledger by hand.`),
         metadata: {
           invoiceId: invoice.id,
           reference: invoice.po.reference,
@@ -4153,8 +4154,8 @@ export async function markBillPaid(
         success: false,
         error: declined
           ? billPaymentEnqueueDeclinedMessage(declineReason)
-          : 'The payment could not be queued for the accounting connector, so the bill was not marked ' +
-            'paid. Nothing was changed — try again, or record the payment in the ledger by hand.',
+          : withLedgerCheck('The payment could not be queued for the accounting connector, so the bill was not marked ' +
+            'paid. Nothing was changed — try again, or record the payment in the ledger by hand.'),
       }
     }
 
@@ -4194,9 +4195,9 @@ export async function markBillPaid(
         tag: 'purchase',
         level: 'WARNING',
         description:
-          `Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID before it posted to the ` +
+          withLedgerCheck(`Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID before it posted to the ` +
           `accounting connector, so no payment was queued. Once the bill posts, record the payment ` +
-          `again (or in the ledger directly) — posting the bill does not settle it.`,
+          `again (or in the ledger directly) — posting the bill does not settle it.`),
         metadata: { invoiceId: invoice.id, reference: invoice.po.reference, amountForeign: paymentAmount },
       }).catch(() => {})
     }
@@ -4485,9 +4486,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: it was `
+          withLedgerCheck(`Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: it was `
           + `prepared against ${creditNotePosting.chartConnector}'s chart of accounts and the active accounting `
-          + `connector is now ${creditNotePosting.activeConnector ?? 'none'}. The credit note is still a draft.`,
+          + `connector is now ${creditNotePosting.activeConnector ?? 'none'}. The credit note is still a draft.`),
         metadata: {
           creditNoteId: cn.id,
           reference: cn.po.reference,
@@ -4499,9 +4500,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       return {
         success: false,
         error:
-          'The credit note was NOT posted: the accounting connector changed while it was being prepared, so its '
+          withLedgerCheck('The credit note was NOT posted: the accounting connector changed while it was being prepared, so its '
           + 'account codes no longer describe the ledger it would be sent to. It is still a draft — post it again '
-          + 'once the accounting connector selection has settled.',
+          + 'once the accounting connector selection has settled.'),
       }
     }
     const shouldQueueXero =
@@ -4523,10 +4524,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         tag: 'accounting',
         level: 'WARNING',
         description:
-          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} is recorded as POSTED in `
+          withLedgerCheck(`Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} is recorded as POSTED in `
           + `IMS but was NOT sent to ${settings.connector ?? 'the accounting connector'}: IMS has no supplier `
           + 'credit-note poster for it. Payables in the ledger do NOT reflect this credit — enter it there by '
-          + 'hand if the ledger should show it.',
+          + 'hand if the ledger should show it.'),
         metadata: { creditNoteId: cn.id, reference: cn.po.reference, chartConnector: settings.connector },
       }).catch(() => { /* the post itself is unaffected */ })
     }
@@ -4648,9 +4649,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: the `
+          withLedgerCheck(`Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: the `
           + `accounting queue ${declined.reason === 'refused' ? 'REFUSED' : 'declined'} the ACCPAYCREDIT, so `
-          + `the credit note was left DRAFT rather than marked POSTED in IMS with nothing in the ledger.`,
+          + `the credit note was left DRAFT rather than marked POSTED in IMS with nothing in the ledger.`),
         metadata: {
           creditNoteId: cn.id,
           reference: cn.po.reference,

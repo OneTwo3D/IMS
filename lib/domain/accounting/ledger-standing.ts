@@ -216,6 +216,35 @@ export function isProvenLedgerFact(row: LedgerStandingRow): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// EXISTENCE READINGS (o3d-1e7sl, slice 1c). D2: an operator's typed document id counts for EXISTENCE
+// questions ("is there a document I must not duplicate, must not orphan, must not let a competing claim
+// shadow?") and never for AMOUNT questions. The readers below ask the first kind; each is a DECLARED
+// reading, not a second statement of the table.
+// ---------------------------------------------------------------------------
+
+/**
+ * Does the row NAME a document? `externalTransactionId` holds a value, whatever the status and whatever
+ * the basis. A CLAIM of existence, not a ledger fact: an operator-typed id and a connector-issued one
+ * both name a document, and a VERIFIED_REVERSAL row keeps the id of the payment the ledger deleted. The
+ * readers that use it ask "does a document stand or may one stand against this?" - the question a
+ * second posting, a competing back-reference or a hard delete must not guess about. Whose word it is
+ * is `ledgerStanding`'s to say, and a reader that acts on an AMOUNT must ask that instead.
+ */
+export function namesADocument(row: { externalTransactionId: string | null }): boolean {
+  return typeof row.externalTransactionId === 'string' && row.externalTransactionId.trim().length > 0
+}
+
+/**
+ * Does the row CLAIM TO HAVE POSTED - by a document id, or by having reached SYNCED (which an id-less
+ * type does without one)? Whoever's claim it is: connector (CONFIRMED_POSTED), operator
+ * (ASSERTED_POSTED) or a basis this build does not recognise (UNKNOWN, kept: an unrecognised basis can
+ * never be what lets a row expire). The reading retention's "only local record of a document" set is.
+ */
+export function claimsToHavePosted(row: LedgerStandingRow): boolean {
+  return namesADocument(row) || row.status === 'SYNCED'
+}
+
+// ---------------------------------------------------------------------------
 // THE WORK SLOT - "may another posting for this key be raised?"
 // ---------------------------------------------------------------------------
 
@@ -257,6 +286,20 @@ export function workSlotStanding(row: LedgerStandingRow): WorkSlotStanding {
   }
   if (ledgerStanding(row) === 'ASSERTED_NOT_POSTED') return { slot: 'BLOCKED', asserted: true }
   return { slot: 'FREE', asserted }
+}
+
+/**
+ * Does ANOTHER sync row own the mirrored AccountingEvent it shares a key with? (o3d-1e7sl)
+ *
+ * Mirror identity is logical, not per-row (every attempt at one document maps to one event), so a row
+ * that may still post (PENDING / PROCESSING), has posted (SYNCED) or NAMES A DOCUMENT in any status
+ * (a FAILED row with an id is a document that exists, o3d-ju8t; an operator-typed id is a claim that
+ * one does) owns it: settling a sibling must not terminalise an event that row is responsible for. An
+ * EXISTENCE reading (D2) - asserted rows own their mirror too - and it reads the work slot and the id,
+ * never the amount.
+ */
+export function ownsMirroredEvent(row: LedgerStandingRow): boolean {
+  return workSlotStanding(row).slot === 'OCCUPIED' || namesADocument(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +390,37 @@ export const MAY_HAVE_REACHED_LEDGER_WHERE: Prisma.AccountingSyncLogWhereInput =
  */
 export const WORK_SLOT_OCCUPIED_WHERE: Prisma.AccountingSyncLogWhereInput = {
   status: { in: [...WORK_SLOT_STATUSES] },
+}
+
+/** Rendering of {@link namesADocument}: the row carries a document id (any status, any basis). */
+export const NAMES_A_DOCUMENT_WHERE: Prisma.AccountingSyncLogWhereInput = ID_PRESENT
+
+/** Rendering of {@link ownsMirroredEvent}: holds the work slot, or names a document. */
+export const OWNS_MIRRORED_EVENT_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  OR: [WORK_SLOT_OCCUPIED_WHERE, ID_PRESENT],
+}
+
+/**
+ * Rows an OPERATOR claims posted: truth-table row 3 exactly (OPERATOR_ASSERTION + a typed id, on a row
+ * that is not unfinished work - row 2 reads a PENDING/PROCESSING assertion UNKNOWN). Null-total: the
+ * nullable `settlementBasis` is tested with an explicit `IS NOT NULL` arm beside the equality, so a row
+ * with no basis is FALSE here and not SQL NULL (the fragment is consumed under a `NOT` by retention).
+ */
+export const ASSERTED_POSTED_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  AND: [
+    { settlementBasis: { not: null } },
+    { settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS },
+    ID_PRESENT,
+    { status: { notIn: ['PENDING', 'PROCESSING'] } },
+  ],
+}
+
+/**
+ * Rendering of {@link claimsToHavePosted}: SYNCED, or naming a document, whoever's claim it is.
+ * Every arm is null-total (`status` is non-nullable; the id arm is the paired `IS NOT NULL` form).
+ */
+export const CLAIMS_TO_HAVE_POSTED_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  OR: [{ status: 'SYNCED' }, ID_PRESENT],
 }
 
 // ---------------------------------------------------------------------------

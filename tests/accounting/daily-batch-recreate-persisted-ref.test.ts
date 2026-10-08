@@ -712,7 +712,7 @@ test('o3d-jit6 r2#2: a SYNCED row settled BY HAND blocks the rebuild and is REPO
   assert.equal(refusals.length, 1, 'but never silently — nothing has confirmed that journal exists')
   assert.match(refusals[0], /log-a2-asserted, SYNCED, external id MJ-typed-by-a-human/)
   assert.match(refusals[0], /settled BY HAND/)
-  assert.match(refusals[0], /never read the document/)
+  assert.match(refusals[0], /did not verify the document/)
   assert.match(refusals[0], /no sweep will ever raise it again/,
     'the operator has to be told what a wrong assertion costs, or the report is noise')
 })

@@ -1,6 +1,11 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { readDiscountRestatement, restatementHadPostedInvoice } from './discount-restatement'
-import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
+import {
+  LEDGER_STANDING_SELECT,
+  NAMES_A_DOCUMENT_WHERE,
+  ledgerStanding,
+  mirroredPostStanding,
+} from '@/lib/domain/accounting/ledger-standing'
 
 /**
  * o3d-y14 r3 finding 1 — WHAT THE INVOICE POSTED, for a chargeback that must mirror it.
@@ -813,21 +818,34 @@ export async function resolvePostedOrderDiscount(
     }
   }
   // o3d-9kek: a post can succeed and never write its id back, so the column alone under-reports.
-  const postedButUnlinked = await client.accountingSyncLog.count({
+  //
+  // o3d-1e7sl (G17): ASKED THROUGH THE LEDGER-STANDING MODULE, AND REPORTED BY STANDING. The read was
+  // `status SYNCED AND id IS NOT NULL` and the sentence said "N posted sales invoice(s) exist" - true of a
+  // connector's writeback, a claim about the ledger on a row an operator typed an id into. It now selects
+  // every row that NAMES a document (an EXISTENCE reading, D2: any claimed document keeps the answer
+  // UNRECOVERABLE, which is the safe direction), widened from SYNCED to any status because a FAILED or
+  // cancelled row that names an invoice is a document that exists (o3d-ju8t), and says how many rest on the
+  // connector and how many on an operator's word.
+  const unlinkedInvoiceRows = await client.accountingSyncLog.findMany({
     where: {
       referenceType: 'SalesOrder',
       referenceId: order.id,
       type: { in: [...POSTED_SALES_INVOICE_EVENT_TYPES] },
-      status: { in: ['SYNCED'] },
-      externalTransactionId: { not: null },
+      ...NAMES_A_DOCUMENT_WHERE,
     },
+    select: { ...LEDGER_STANDING_SELECT },
   })
+  const postedButUnlinked = unlinkedInvoiceRows.length
   if (postedButUnlinked > 0) {
+    const asserted = unlinkedInvoiceRows.filter((row) => ledgerStanding(row) === 'ASSERTED_POSTED').length
+    const confirmed = unlinkedInvoiceRows.filter((row) => ledgerStanding(row) === 'CONFIRMED_POSTED').length
     return {
       source: 'UNRECOVERABLE',
       detail:
-        `${postedButUnlinked} posted sales invoice(s) exist for this order with no accountingInvoiceId ` +
-        'written back, and no posted accounting event records what they charged',
+        `${postedButUnlinked} sales invoice row(s) name a document for this order with no accountingInvoiceId ` +
+        `written back (${confirmed} confirmed by the connector, ${asserted} typed in by an operator and not ` +
+        `verified against the ledger, ${postedButUnlinked - confirmed - asserted} neither), ` +
+        'and no posted accounting event records what they charged',
     }
   }
 

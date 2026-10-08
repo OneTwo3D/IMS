@@ -1,4 +1,6 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
+import { AFTER_DECLINE_STEP, CHECK_AFTERWARDS, LEDGER_CHECK_FIRST, MARK_REMEDY_TAIL } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 
@@ -142,8 +144,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
         `NOTHING WAS QUEUED. The sales invoice update for ${params.orderNumber} was built from `
         + `${params.chartConnector ?? 'no'} connector's chart of accounts, and the active accounting `
         + `connector is now ${connector?.id ?? 'none'}, so its account codes do not describe the ledger `
-        + 'it would have been written to. The update is still OUTSTANDING: re-save the order once the '
-        + 'accounting connector selection has settled.',
+        + 'it would have been written to. The update is still OUTSTANDING. ' + LEDGER_CHECK_FIRST
+        + 're-save the order once the accounting connector selection has settled.',
       metadata: {
         accountingInvoiceId: params.accountingInvoiceId,
         orderNumber: params.orderNumber,
@@ -160,8 +162,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       reason: 'retired_chart',
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy:
-        'Re-save the order once the accounting connector selection has settled, or correct the invoice by hand '
-        + 'in the books its account codes belong to and mark this row handled — that stops IMS updating it too.',
+        LEDGER_CHECK_FIRST + 're-save the order once the accounting connector selection has settled, or correct the invoice by hand '
+        + 'in the books its account codes belong to and mark this row handled. ' + MARK_REMEDY_TAIL,
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector },
     })
     return
@@ -186,8 +188,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
         + 'a document id in the accounting system\'s own database and IMS keeps it when the connector '
         + 'selection changes, so it must not be assumed to belong to whichever connector is active now — '
         + 'the update would rewrite a document this connector does not hold. The update is still '
-        + 'OUTSTANDING: re-post the invoice from this order so the document and its connector are recorded '
-        + 'together, or correct the invoice by hand in the books that hold it.',
+        + 'OUTSTANDING. ' + LEDGER_CHECK_FIRST + 'correct the invoice by hand in the books that hold it; do not re-post the invoice from this order, which would create a second document.',
       metadata: {
         accountingInvoiceId: params.accountingInvoiceId,
         orderNumber: params.orderNumber,
@@ -206,8 +207,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy:
         // o3d-j625 r7 (review H-A): r5 said "re-post the invoice from this order", which IMS does not offer.
-        'IMS cannot show which accounting connector holds this invoice, so it will not update it. Correct the '
-        + 'invoice by hand in the ledger that holds it, then mark this row handled — that stops IMS updating it too.',
+        withLedgerCheck('IMS cannot show which accounting connector holds this invoice, so it will not update it. Correct the '
+        + 'invoice by hand in the ledger that holds it, then mark this row handled. ' + MARK_REMEDY_TAIL),
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector },
     })
     return
@@ -267,15 +268,15 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       description: handPostDeferred
         ? `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `
           + 'IMS. An operator has taken this posting to settle it BY HAND and still holds it, so IMS did not '
-          + `queue this edit — and accounting invoice ${params.accountingInvoiceId} shows neither this version `
-          + 'nor, yet, theirs. This stays outstanding in the exception inbox while they hold it and after they '
-          + 'finish; nothing requeues it on its own. Re-save the order to queue its current version once the '
-          + 'refused posting shows no claim.'
+          + `queue this edit. What the accounting invoice ${params.accountingInvoiceId} holds now is NOT known to IMS: `
+          + 'inspect its current version in the accounting system before deciding what remains owed. This stays outstanding in the exception inbox while they hold it and after they '
+          + 'finish; nothing requeues it on its own. ' + LEDGER_CHECK_FIRST
+          + 're-save the order once the refused posting shows no claim.'
         : `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `
         + `IMS. The accounting queue REFUSED it (an unresolved earlier attempt, a deleted order, a stale discount, `
         + `or an accounting connector change under the write — see the accounting activity log), so accounting `
         + `invoice ${params.accountingInvoiceId} still shows the PREVIOUS version and nothing retries this on its `
-        + 'own. Re-save the order once the cause is resolved, or correct the invoice by hand in the ledger.',
+        + 'own. ' + LEDGER_CHECK_FIRST + 're-save the order once the cause is resolved, or correct the invoice by hand in the ledger.',
       metadata: {
         accountingInvoiceId: params.accountingInvoiceId,
         orderNumber: params.orderNumber,
@@ -295,10 +296,10 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy: handPostDeferred
         ? 'An operator is settling this posting by hand — see "Postings being settled by hand". IMS did not '
-          + 'queue THIS edit, and will not while they hold it. When the claim ends, re-save the order to queue '
-          + 'its current version, or post that version by hand and mark this row handled.'
-        : 'Re-save the order once the cause is resolved (see the accounting activity log), or correct the '
-        + 'invoice by hand in the ledger and mark this row handled — that stops IMS updating it too.',
+          + 'queue THIS edit, and does not queue it while they hold the claim. '
+          + AFTER_DECLINE_STEP + ' ' + CHECK_AFTERWARDS
+        : LEDGER_CHECK_FIRST + 're-save the order once the cause is resolved (see the accounting activity log), or correct the '
+        + 'invoice by hand in the ledger and mark this row handled. ' + MARK_REMEDY_TAIL,
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector, enqueueReason: enqueued.reason ?? null },
     })
     return
@@ -321,7 +322,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       ? `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was already queued`
       : enqueued.reason === 'handled-by-hand'
         ? `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was NOT queued: `
-          + 'it is marked handled — posted by hand in the ledger — so IMS does not post it too'
+          + 'it is marked handled (an operator confirmed the current version is in the ledger) so IMS does not post it too'
         : `Queued sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId}`,
     metadata: {
       accountingInvoiceId: params.accountingInvoiceId,

@@ -8,6 +8,19 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### WooCommerce initial-import rehearsal (`npm run rehearse:woo-import`)
+
+- **The real initial order import can now be rehearsed against a local fake WooCommerce store.** It runs the
+  actual import and allocation code into a throwaway PostgreSQL cluster and writes a JSON and Markdown report
+  (orders fetched, imported and skipped with reason; R9 and R4; the orders that imported but cannot be
+  allocated; a second pass that must import nothing; stock landing later; the one-shot stamp). It never
+  contacts a real host, never writes (the report proves no request but GET reached the store and the
+  outbound-write hold refused nothing), and a rehearsal pass never sets the completion stamp or moves the
+  sync cursor (`runInitialImport(progress, { stampCompletion: false })`; the Sync page's own path still
+  stamps). Documented in docs/installation.md, "WooCommerce initial-import rehearsal".
+- **`wcFetch` (reads only) accepts a loopback `http` store when `E2E_TEST_MODE=1` and `NODE_ENV` is not
+  `production`**, the same condition the stored-URL check already applied. Writes do not.
+
 ### The deploy admin database credential is root's alone (o3d-1bgr, o3d-bpbv)
 
 - **The application account no longer holds, inherits or can read the admin database credential.** It used to

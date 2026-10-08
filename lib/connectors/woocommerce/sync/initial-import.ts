@@ -178,9 +178,37 @@ export async function startInitialImport(): Promise<void> {
 // The actual import logic
 // ---------------------------------------------------------------------------
 
-async function runInitialImport(progress: InitialImportProgress) {
+/**
+ * What one pass did, for the rehearsal harness (scripts/rehearse-woo-import.ts). `startInitialImport`
+ * ignores it. `stamped` is true only when THIS call wrote the one-shot completion stamp.
+ */
+export type InitialImportRunResult = {
+  outcome: 'not-run' | 'complete' | 'failed' | 'threw'
+  stamped: boolean
+  statuses: string[]
+  unrecordedRefusals: number
+  progress: InitialImportProgress
+}
+
+export type InitialImportRunOptions = {
+  /**
+   * Default true: a pass judged complete writes `wc_initial_import_completed` and `last_wc_order_sync_at`,
+   * the two irreversible writes described above. A REHEARSAL passes false: the pass still reads, imports
+   * and judges exactly as a real one does, but writes neither stamp, so the real button is still armed
+   * afterwards. Only scripts/rehearse-woo-import.ts passes false; the Sync page never does.
+   */
+  stampCompletion?: boolean
+}
+
+export async function runInitialImport(
+  progress: InitialImportProgress,
+  options: InitialImportRunOptions = {},
+): Promise<InitialImportRunResult> {
+  const stampCompletion = options.stampCompletion !== false
+  const runResult: InitialImportRunResult = { outcome: 'not-run', stamped: false, statuses: [], unrecordedRefusals: 0, progress }
   try {
     const statuses = await getWcPullStatuses('initial')
+    runResult.statuses = statuses
 
     // No statuses selected is an instruction, not an unset setting. Marking the
     // import COMPLETE here would unlock live order sync on a configuration that
@@ -205,7 +233,7 @@ async function runInitialImport(progress: InitialImportProgress) {
         message: WC_NO_STATUSES_SELECTED_MESSAGE,
         actionUrl: '/sync',
       })
-      return
+      return runResult
     }
 
     progress.message = `Importing orders (${statuses.join(', ')})\u2026`
@@ -347,6 +375,7 @@ async function runInitialImport(progress: InitialImportProgress) {
     // -----------------------------------------------------------------------
     // Completion
     // -----------------------------------------------------------------------
+    runResult.unrecordedRefusals = unrecordedRefusals
     const outcome = decideInitialImportOutcome({
       imported: progress.activeOrdersImported,
       skipped: progress.activeOrdersSkipped,
@@ -356,6 +385,7 @@ async function runInitialImport(progress: InitialImportProgress) {
       unreadPages,
     })
 
+    runResult.outcome = outcome
     if (outcome === 'failed') {
       // Every order errored and nothing was imported \u2014 a systemic failure (e.g.
       // no storefront-synced warehouse). Do NOT mark the import complete: that
@@ -398,19 +428,23 @@ async function runInitialImport(progress: InitialImportProgress) {
         message: progress.message,
         actionUrl: '/sync',
       })
-      return
+      return runResult
     }
 
-    await db.setting.upsert({
-      where: { key: 'wc_initial_import_completed' },
-      create: { key: 'wc_initial_import_completed', value: 'true' },
-      update: { value: 'true' },
-    })
-    await db.setting.upsert({
-      where: { key: 'last_wc_order_sync_at' },
-      create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
-      update: { value: new Date().toISOString() },
-    })
+    // THE ONE-SHOT, IRREVERSIBLE STAMP. Skipped, and only skipped, by a rehearsal (stampCompletion: false).
+    if (stampCompletion) {
+      await db.setting.upsert({
+        where: { key: 'wc_initial_import_completed' },
+        create: { key: 'wc_initial_import_completed', value: 'true' },
+        update: { value: 'true' },
+      })
+      await db.setting.upsert({
+        where: { key: 'last_wc_order_sync_at' },
+        create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
+        update: { value: new Date().toISOString() },
+      })
+      runResult.stamped = true
+    }
 
     progress.status = 'done'
     const parts: string[] = []
@@ -418,7 +452,7 @@ async function runInitialImport(progress: InitialImportProgress) {
     if (progress.activeOrdersSkipped > 0) parts.push(`${progress.activeOrdersSkipped} already imported`)
     if (progress.errors.length > 0) parts.push(`${progress.errors.length} errors`)
     if (parts.length === 0) parts.push('No active orders found')
-    progress.message = parts.join(' \u00b7 ')
+    progress.message = parts.join(' \u00b7 ') + (stampCompletion ? '' : ' \u00b7 REHEARSAL: not stamped')
     await saveProgress(progress)
 
     await logActivity({
@@ -435,7 +469,9 @@ async function runInitialImport(progress: InitialImportProgress) {
       message: progress.message,
       actionUrl: '/sync',
     })
+    return runResult
   } catch (e) {
+    runResult.outcome = 'threw'
     progress.status = 'error'
     progress.message = String(e)
     progress.errors.push(String(e))
@@ -456,6 +492,7 @@ async function runInitialImport(progress: InitialImportProgress) {
       message: String(e),
       actionUrl: '/sync',
     })
+    return runResult
   }
 }
 

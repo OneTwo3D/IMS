@@ -1,5 +1,7 @@
 // decimal-boundary-ok: server-action-boundary (numeric stock adjustment input validation)
+import type { Prisma } from '@/app/generated/prisma/client'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 
 const QUANTITY_EPSILON = 0.000001
 
@@ -156,4 +158,33 @@ export function assertAdjustmentEditFifoFeasible(
     )
   }
   return { availableAfterCleanup }
+}
+
+/**
+ * MAY THIS STOCK ADJUSTMENT'S JOURNAL HAVE REACHED THE LEDGER? (o3d-f709 G3 / o3d-1e7sl)
+ *
+ * An in-place edit re-books quantity, cost layers and COGS but cannot revise a journal that was already posted
+ * for the movement, so the edit is refused once any INVENTORY_ADJUSTMENT row for it MAY HAVE REACHED THE LEDGER:
+ * everything except a row PROVEN never to have been sent (`MAY_HAVE_REACHED_LEDGER_WHERE`, ledger-standing.ts).
+ * That is PENDING / PROCESSING / SYNCED / FAILED (a FAILED row can be re-queued and would then post the OLD
+ * value), a cancelled row naming a document, an operator's NOT_POSTED settlement (a claim, not proof - C1) and a
+ * cancellation that recorded no pre-call proof. A row the orphan sweep stamped pre-call does not block.
+ *
+ * Extracted from the server action so the decision is testable per standing without the action's session,
+ * stock-level and FIFO machinery: the action calls this and refuses on `true`.
+ */
+export async function adjustmentJournalMayHaveReachedLedger(
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  movementId: string,
+): Promise<boolean> {
+  const row = await tx.accountingSyncLog.findFirst({
+    where: {
+      referenceType: 'StockMovement',
+      referenceId: movementId,
+      type: 'INVENTORY_ADJUSTMENT',
+      ...MAY_HAVE_REACHED_LEDGER_WHERE,
+    },
+    select: { id: true },
+  })
+  return row !== null
 }

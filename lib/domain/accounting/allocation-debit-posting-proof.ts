@@ -62,6 +62,8 @@
  * caller can reach for the other's answer by accident.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import {
   parseAllocationDebitPasses,
   sumAllocationDebitPasses,
@@ -158,25 +160,25 @@ export function assertedJournalRemedy(params: {
   if (params.full) {
     // A FULL refund closes both batch windows for ever: the whole open balance is what is stranded.
     return ob
-      ? 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand in Xero ' +
-        `(DR Inventory / CR Allocated Inventory £${ob.open.toFixed(2)}: the ${balanceText}; do not credit more than the open balance).${DEDUCT} ` + tail
-      : 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
-        'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited; the open balance could not be established here, so none is given).' + DEDUCT + ' ' + tail
+      ? withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand in Xero ' +
+        `(DR Inventory / CR Allocated Inventory £${ob.open.toFixed(2)}: the ${balanceText}; do not credit more than the open balance).${DEDUCT} ` + tail)
+      : withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
+        'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited; the open balance could not be established here, so none is given).' + DEDUCT + ' ' + tail)
   }
   // A PARTIAL refund: the rest of the order's A2 debit belongs to units the customer still holds.
   if (ob && params.withheldAmount !== null && params.withheldAmount > 0.005) {
     const credit = Math.min(params.withheldAmount, ob.open)
     return (
-      'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY. ' +
+      withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY. ' +
       `Refunded units value £${params.withheldAmount.toFixed(2)}; ${balanceText}; credit the LESSER: DR Inventory / CR Allocated Inventory £${credit.toFixed(2)}. ` +
       "Do NOT credit more than the open balance and do NOT credit anything else: the rest of this order's A2 debit covers units the customer still holds and comes out when they are dispatched or refunded." +
-      DEDUCT + ' ' + tail
+      DEDUCT + ' ' + tail)
     )
   }
   return (
-    'WHAT TO DO TODAY: confirm the journal in Xero and reconcile the Allocated Inventory for the REFUNDED UNITS ONLY in Xero. ' +
+    withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero and reconcile the Allocated Inventory for the REFUNDED UNITS ONLY in Xero. ' +
     'The IMS could not establish the figure for this refund, so none is given: work it out from the refunded lines and the order\'s open A2 balance (recorded debit less relief already credited), credit the lesser, and do NOT credit the order\'s whole A2 debit ' +
-    '(the rest covers units the customer still holds).' + DEDUCT + ' ' + tail
+    '(the rest covers units the customer still holds).' + DEDUCT + ' ' + tail)
   )
 }
 
@@ -192,7 +194,7 @@ export function describeJournalRowState(row: LedgerStandingRow): string {
  */
 export function unprovedJournalClause(proof: { statuses: string; asserted?: boolean }): string {
   return proof.asserted
-    ? `${proof.statuses} (a document id an operator typed in - IMS never read the ledger, and the journal's lines are what was queued, not a ledger figure), not a connector-confirmed posting`
+    ? `${proof.statuses} (a document id an operator typed in - IMS did not verify it against the ledger, and the journal's lines are what was queued, not a ledger figure), not a connector-confirmed posting`
     : `${proof.statuses}, not SYNCED`
 }
 
@@ -581,13 +583,17 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         kind: 'refused',
         reason: journalRowIsSettled(journal)
           ? 'the A2 journal this order was staged into is SYNCED but its settlement basis is not one this build recognises, so whether it reached the ledger cannot be established'
+          : standing === 'PROVEN_NOT_POSTED' && provenCauseOf(journal) === 'VERIFIED_REVERSAL'
+            // A verified reversal is proof the document is no longer in the ledger, NOT that it never was: it can keep
+            // the id of a journal that posted and was later reversed (Codex round 1, o3d-1e7sl). Say that.
+            ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED: it was verified reversed in the ledger and is no longer present there. It may have been posted earlier, so check whether a debit to Allocated Inventory still stands before reconciling`
           : standing === 'PROVEN_NOT_POSTED'
             ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED, and it is PROVEN never to have posted — nothing has been debited to Allocated Inventory for this order to reverse`
             : standing === 'LIVE_WORK'
               ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED — it is still queued or in flight, so nothing has been confirmed as debited yet`
               // ASSERTED_NOT_POSTED, UNKNOWN, or a row naming a connector id that never settled: UNPROVEN either way
               // (C1: a person's "did not post", a cancellation or a failure does not prove the ledger was untouched).
-              : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — whether it reached the ledger is UNPROVEN (a cancelled row, a failed row or a settled "did not post" can still have posted). CHECK Xero for that journal before reconciling: if it posted, the debit to Allocated Inventory stands and has to be reversed by hand; if it did not, there is nothing to reverse`,
+              : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — whether it reached the ledger is UNPROVEN (a cancelled row, a failed row or a settled "did not post" can still have posted). CHECK Xero for that journal before reconciling. If it exists there, the debit to Allocated Inventory stands and has to be reversed by hand. If it does not exist, there is nothing to undo`,
       }
     }
     // o3d-o97 r5 — AND SYNCED IS STILL NOT A STATEMENT ABOUT POUNDS. The batch journal covers a whole
@@ -614,7 +620,7 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         reason: proof.kind === 'illegible'
           ? `the A2 journal this order was staged into has settled but its lines are no longer readable (evidence compaction), so whether it debited Allocated Inventory (${target.allocatedInventoryAccount}) at all — let alone the £${share.toFixed(2)} recorded against this order — cannot be established`
           : proof.asserted
-            ? `the A2 journal this order was staged into was settled as posted by an OPERATOR typing in a document id (${proof.statuses}), so it is claimed to exist but nobody read its lines in the ledger: the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount}) and nothing is credited against it — confirm the journal in the accounting system`
+            ? `the A2 journal this order was staged into was settled as posted by an OPERATOR typing in a document id (${proof.statuses}), so it is claimed to exist but its lines were not verified against the ledger: the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount}) and nothing is credited against it — confirm the journal in the accounting system`
             : `the A2 journal this order was staged into cannot be read as evidence (${proof.statuses}), so the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount})`,
       }
     }

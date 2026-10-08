@@ -1481,7 +1481,7 @@ If any of those does not hold, the receipt is still recorded in the IMS, nothing
 
 **A re-issued invoice** (deleted in Xero and posted again) starts with a clean slate: payments registered against the old invoice no longer count against the new one, and the payment for the replacement is queued rather than skipped as already-done.
 
-Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there. A receipt whose registration an operator settled as **"did not post"** is refused too: that settlement is a person's word about a ledger the IMS never read, so the registration is treated as an attempt nobody can speak for — look at the invoice in Xero and, if a payment is on it, reverse it and enter its reference (the IMS then checks that exact payment before deleting anything).
+Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there. A receipt whose registration an operator settled as **"did not post"** is refused too: that settlement is a person's word about a ledger the IMS did not check, so the registration is treated as an attempt nobody can speak for — look at the invoice in Xero and, if a payment is on it, reverse it and enter its reference (the IMS then checks that exact payment before deleting anything).
 
 ### Supplier bills: marking one paid again
 
@@ -1501,8 +1501,8 @@ The payment poller clears **Paid** on a bill whose payment Xero has demonstrably
 | The registration is **being sent now** (claimed by the sync worker) | The request may already be on its way and nothing here can recall it | Wait for that entry to finish — it will end up synced or failed; a dead claim is released after 15 minutes — then check the bill in Xero |
 | The registration is **synced** and no poll has retired it | It posted, and no Xero read has since disproved it | Open the bill in Xero. If the payment is there, the bill is settled. If it is genuinely gone, cancel that sync entry and mark the bill paid again |
 | The registration **failed** | A failed money call is *not* proof that nothing reached Xero — the payment may have been created and the response lost | Open the bill in Xero. If the failed payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
-| The registration was **settled as "did not post"** by an operator | An operator's "not posted" is a person's word about a ledger the IMS never read — a lost response or a payment made by hand leaves the same row — so it does **not** clear the refusal | Open the bill in Xero. If the payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
-| The registration was **settled as "did post"** by an operator (a payment id typed in) | The IMS never saw that payment, and paying again could pay the supplier twice | Open the bill in Xero and confirm the payment. If it is not there, the record was wrong — pay the bill in Xero directly |
+| The registration was **settled as "did not post"** by an operator | An operator's "not posted" is a person's word about a ledger the IMS did not check — a lost response or a payment made by hand leaves the same row — so it does **not** clear the refusal | Open the bill in Xero. If the payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
+| The registration was **settled as "did post"** by an operator (a payment id typed in) | The IMS did not verify that payment, and paying again could pay the supplier twice | Open the bill in Xero and confirm the payment. If it is not there, the record was wrong — pay the bill in Xero directly |
 | The registration **changed status** while the bill was being marked paid | A worker picked it up mid-operation, so its outcome is open | Check that entry, then try again |
 
 A failed registration whose stored request was missing a field Xero rejects before sending (no invoice id, no bank account, no amount) blocks nothing — that one *is* provable. So does a registration the IMS itself retired before it was ever sent (superseded by **Mark as paid**, or cancelled by the sweep while still queued) and one whose payment the poller verified as reversed in Xero.
@@ -2022,12 +2022,13 @@ them — now carry a **Settle** control (the gavel icon) beside Retry, both in t
 stranded-rows banner. It records what *you* found in Xero:
 
 - **It DID post** — you supply the Xero document id. The row becomes **Synced** and records that id.
-- **It did NOT post** — the row becomes **Cancelled** and no id is written, which lets the order be
-  deleted again. **It does NOT free the posting to be sent again.** Your statement is your word about
-  a ledger IMS never read — a lost response, a late webhook or a payment made by hand all leave the
+- **It did NOT post** — the row becomes **Cancelled** and no id is written, and it is shown everywhere as
+  **asserted: not posted**. **It does NOT make the order deletable again, and it does NOT free the posting to
+  be sent again.** (The order's Delete stays refused — cancel the order instead, which keeps the record.) Your statement is your word about
+  a ledger IMS did not check — a lost response, a late webhook or a payment made by hand all leave the
   same row — so IMS treats the row as *possibly posted*: it will not queue a replacement, it will not
-  clear a held "paid" flag, it will refuse to delete the receipt it registered, and it keeps the row
-  (aged-out rows are compacted, never deleted). To get the posting into the ledger, **record it in
+  clear a held "paid" flag, it will refuse deletion of the receipt it registered, and it keeps the row
+  (aged-out rows are compacted, never deleted). To get the posting into the ledger, **check Xero first and, only if the document is not there, record it in
   Xero by hand and mark the posting handled** in the refusal inbox.
 
 Read what this is, because it is not a repair. IMS cannot check either statement; the control records
@@ -2055,16 +2056,51 @@ there is nothing to settle, and if it is not, reverse it in Xero before recordin
 
 **A document id you typed in is a claim that the document exists, not a figure the IMS read.** Settling a row as "posted" with a document id you entered stops the IMS posting it a second time, but the lines IMS holds for it are what was *queued*, not what Xero holds. So wherever an amount is needed, the IMS no longer uses them:
 
-- **A refund** that has to net an earlier reversal journal you settled this way (an order-level reversal, an Allocated Inventory reversal, the order's A2 batch journal, or an earlier refund's reversal) **withholds its Allocated Inventory reversal** instead of crediting against a figure nobody read: nothing is credited, the order keeps its A2 stamp, and the refund row's allocation-basis note says "settled as posted by an OPERATOR" and gives the steps. It is announced twice: a warning in the activity log at the moment it is withheld, and the standing **critical** accounting finding `sales_order_refund_allocation_basis_unresolved` for that refund. **What you must do today:** check the journal in Xero, then raise the credit by hand in Xero (DR Inventory / CR Allocated Inventory). What to credit depends on the refund. For a **full** refund it is the open balance (the recorded A2 debit less relief already credited; the note states each figure). For a **partial** refund it is **the lesser of two figures** the note states side by side: what the refunded units value, and the order's open A2 balance (recorded debit less relief already credited). Never credit more than the open balance, and credit nothing for the units the customer still holds, whose part of the A2 debit comes out when they are dispatched or refunded. If you already applied a manual credit for this order, deduct it. If the note says it could not establish the figure, work it out from the refunded lines; it never prescribes the order's whole debit for a partial refund; the same is said when the open balance itself cannot be established (for example, another reversal it depends on is also settled by hand). The IMS does **not** yet have a screen that records that credit or clears the finding, and checking the journal does not change what the IMS stored, so neither a later refund nor a full refund resolves it; the finding stays listed until that action exists. An unearned-revenue reversal you settled this way is still counted (arithmetic unchanged for now) and the refund adds a warning to the activity log.
-- **The deferred-revenue true-up** of the daily batch and its preview count the same rows as before and now say, per order, which rows they rest on that nobody read (an asserted row they counted, or a cancelled row that may have posted and they left out). The Daily Batch panel shows the warnings above the preview figures (an amber box, one line per order); the batch logs them. Nothing is held back yet.
+- **A refund** that has to net an earlier reversal journal you settled this way (an order-level reversal, an Allocated Inventory reversal, the order's A2 batch journal, or an earlier refund's reversal) **withholds its Allocated Inventory reversal** instead of crediting against a figure not verified against the ledger: nothing is credited, the order keeps its A2 stamp, and the refund row's allocation-basis note says "settled as posted by an OPERATOR" and gives the steps. It is announced twice: a warning in the activity log at the moment it is withheld, and the standing **critical** accounting finding `sales_order_refund_allocation_basis_unresolved` for that refund. **What you must do today:** check the journal in Xero, then raise the credit by hand in Xero (DR Inventory / CR Allocated Inventory). What to credit depends on the refund. For a **full** refund it is the open balance (the recorded A2 debit less relief already credited; the note states each figure). For a **partial** refund it is **the lesser of two figures** the note states side by side: what the refunded units value, and the order's open A2 balance (recorded debit less relief already credited). Never credit more than the open balance, and credit nothing for the units the customer still holds, whose part of the A2 debit comes out when they are dispatched or refunded. If you already applied a manual credit for this order, deduct it. If the note says it could not establish the figure, work it out from the refunded lines; it never prescribes the order's whole debit for a partial refund; the same is said when the open balance itself cannot be established (for example, another reversal it depends on is also settled by hand). The IMS does **not** yet have a screen that records that credit or clears the finding, and checking the journal does not change what the IMS stored, so neither a later refund nor a full refund resolves it; the finding stays listed until that action exists. An unearned-revenue reversal you settled this way is still counted (arithmetic unchanged for now) and the refund adds a warning to the activity log.
+- **The deferred-revenue true-up** of the daily batch and its preview count the same rows as before and now say, per order, which rows they rest on that were not verified against the ledger (an asserted row they counted, or a cancelled row that may have posted and they left out). The Daily Batch panel shows the warnings above the preview figures (an amber box, one line per order); the batch logs them. Nothing is held back yet.
 - **The unrealised FX run** still treats a journal you typed in as existing (so it does not post it twice) and logs a warning for each one it relied on.
 - **A discount restated or reversed from a posted document** (chargebacks, the restated-discount handoff, credit-note netting) goes to **manual** when the posted document's mirror records only your assertion, or records no confirmation at all (every mirror written before the IMS recorded how a post was confirmed). Raise the credit note or adjustment by hand.
+
+**What the sync pages now show: whose word a row rests on.** A row's badge and its document id are no longer
+left to be read as "Xero holds it". The sync log, the stranded-rows banner, the exceptions inbox and the health
+page say which of these a row is:
+
+| Shown as | What it means | What it does NOT mean |
+| --- | --- | --- |
+| *(no badge), "posted as INV-1"* | Xero answered and returned that document | — |
+| **asserted** | An operator typed that document id in; IMS did not verify the document or its amount | that Xero holds it |
+| **asserted: not posted** | An operator settled the row "did not post". A claim, not proof | that nothing reached Xero — a lost response or a late webhook leaves the same row |
+| **unproven** | A failed row, or one retired by something that could not tell whether a request had already been sent | that nothing was sent |
+| **never sent** | The row was retired before any request was made, and that was recorded at the time (orphan sweep, supersession) | — |
+| **verified reversed** | IMS asked Xero and it reported the payment gone. It may have been posted earlier; the id on the row is kept for the audit trail | that it was never sent |
+| **rejected before posting** | The row's own stored request is missing something the connector requires, so it was refused before any request could be accepted | — |
+
+Only **never sent** (a pre-call abandonment recorded at the time) is ever described as not sent; a **verified reversed** row may well have been posted first. An unproven or asserted-not-posted row always says to look in
+Xero. The same rule shapes the rest of the product:
+
+- **Deleting an order** is refused while any of its accounting rows may have reached Xero — that now includes a
+  cancelled row nobody proved was unsent, and a row settled "did not post". The message says the document is
+  *unproven*, to check Xero, and to **cancel the order instead**. The orphan sweep's own cancellations (stamped
+  before any request) and a payment IMS verified gone from Xero still let the order go.
+- **Taking a refused posting for hand posting** is not blocked by a cancelled row (a cancelled row can never post
+  again, and hand-posting is the remedy for it) but the inbox, and the log entry written when you take the posting,
+  now list every earlier attempt retired without proof — "settled by an operator as NOT posted (an assertion, not
+  proof that it did not post)" — and tell you to **look in Xero first and post by hand only if the document is not there**, because a second document is
+  not undone by marking the posting handled.
+- **Retention** keeps every row an operator typed a document id into, whatever it is keyed to, as a compacted
+  tombstone: the personal data in its payload still expires on schedule, the claim (connector, type, reference, status,
+  id, basis) is never deleted.
+- **The health page** no longer shows a batch whose journal id was typed in as a plain green SYNCED; it reads
+  "SYNCED (asserted by an operator, not confirmed)" and warns. **Reconciliation** says whose post a "posted event has
+  no external ID" finding is, and the **invariant check** logs an info finding for each posting that counts as
+  evidence only on an operator's assertion. A discount or restatement decision that finds an invoice row naming a document
+  says how many rest on the connector and how many on an operator's word.
 
 **Settling "it did not post" retires that attempt, not the document.** A "did not post" settlement
 marks the shared accounting event **Void**, which is what stops a finished row leaving work that
 reconciliation reads as still owed. It is not a statement that the document is no longer wanted. Since
 IMS no longer treats your statement as proof, the posting is **not** queued again on the strength of it
-(see above): the enqueue is refused and the posting stays owed until you record it in Xero by hand and
+(see above): the enqueue is refused and the posting stays owed until you check Xero and, only if the document is not there, record it by hand and
 mark it handled. A replacement that arrives some other way — after a row IMS itself retired — takes a
 Void event of this kind back to **Pending**, and the revival is recorded against the event in its own
 history.
@@ -2313,10 +2349,12 @@ allocation is only queued when that recorded connector is the one it would post 
 
 **Documents posted before this version have no recorded connector, and are refused too.** This is
 deliberate and is *not* a narrow window like the chart refusal above: IMS does not guess which ledger holds
-an older invoice, because guessing is the mistake being prevented. To pay or edit such a document through
-IMS, re-post it so the document and its connector are recorded together. For a customer payment, follow
-the remedy in the refusal message itself: it says whether settling by hand is safe, because a deferred
-re-drive may still register the receipt.
+an older invoice, because guessing is the mistake being prevented. **Do not re-post it:** a
+document that is already in a ledger and is posted again can create a second one. Identify the existing
+document in the accounting system and confirm it exists there, then pay or edit it in the accounting system
+itself (IMS will not do it for a document whose connector it cannot prove, and has no step that makes it
+guess). For a customer payment, follow the remedy in the refusal message itself: it says whether settling
+by hand is safe, because a deferred re-drive may still register the receipt.
 
 **The payment account mapping is shared by every accounting connector.** Its keys (`method:currency`)
 are connector-neutral, but each value is one connector's own bank-account ID. A customer payment is
@@ -2360,7 +2398,7 @@ Three things about those rows:
 | --- | --- |
 | `tax_rate_sync` (TAX_RATE_SYNC / TaxRate) | Saving the tax rate again pushes it to whichever connector is active then; it leaves this list when the push is queued. |
 
-**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then post it by hand, then *Mark as handled*.
+**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type, then *Mark as handled*.
 
 | Refused posting | Why |
 | --- | --- |
@@ -2372,11 +2410,11 @@ Three things about those rows:
 | `unrealised_fx_journal` (UNREALISED_FX_JOURNAL / FxRevaluation) | The FX revaluation raises this journal only for the date it runs for; the daily run values today, so a refused journal for an earlier date is not raised again unless that date is re-run. |
 | `landed_cost_cogs_journal` (COGS_JOURNAL / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
 | `landed_cost_transit_journal` (STOCK_IN_TRANSIT / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
-| `refund_credit_note` (CREDIT_NOTE / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
-| `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
-| `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_credit_note` (CREDIT_NOTE / SalesOrderRefund) | The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 
-**Nothing in IMS posts it again** — press *Take for hand posting* first, then post it by hand, then *Mark as handled* (which also stops IMS ever posting it).
+**Nothing in IMS posts it again** — press *Take for hand posting* first, then identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type, then *Mark as handled* (which also stops IMS ever posting it).
 
 | Refused posting | Why |
 | --- | --- |
@@ -2397,125 +2435,38 @@ Three things about those rows:
 
   **Settling a posting by hand is two steps, and the first one is not optional.**
 
-  **1. Take for hand posting.** Press this *before* you go to the ledger. In one step IMS cancels its own
-  queued attempt at that exact posting (if nothing has picked it up yet) and then refuses to queue that
-  posting at all for as long as you hold it — not on a sweep, not because somebody else saved the document.
-  Each refused attempt is logged as `accounting_posting_suppressed_hand_post_claimed`. That is what makes it
-  safe to spend twenty minutes in the ledger: nothing can post it behind you. If a sync row for it may
-  ALREADY have been sent (it is being processed, has failed, or carries a document id) you are refused here
-  and nothing is changed — check the ledger and settle that sync row first. While you hold it the row stays
-  on this list, marked as being settled by you; another operator who opens the page is told you have it and
-  is not offered the action, so two people cannot post the same thing.
+  What to do in the ledger depends on what IMS knows, and every surface says the same thing (the row, the *Take for hand posting*, *Mark as handled* and *Release* dialogs, and the log entry are all produced by one function):
 
-  **2. Mark as handled** means: *"I posted this by hand; IMS will not post it."* It asks for an optional note
-  (for example the ledger journal number) and records who marked it and when. From then on IMS refuses every
-  automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a follow-up) — each refusal is
-  logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach the ledger twice. It is
-  refused if you do not hold the posting: taking it is what establishes that IMS was standing back while you
-  wrote to the ledger, and without that the two could have happened at once. IMS also refuses the mark on a
-  row that clears itself, whatever the page showed. A row that clears itself leaves the list when the posting
-  is queued — by any path. Resolved rows from the last 30 days are listed underneath with how each was closed.
+<!-- hand-post-instruction:begin -->
+Take the posting for hand posting first and hold that claim while you work: every row below applies only under that claim.
 
-  **Release** gives the posting back if you are not going to post it. IMS may queue and post it again from
-  that moment, and the refusal stays on the list, so do **not** release it if you have already posted it by
-  hand — press *Mark as handled* instead, or the ledger can get it twice. Releasing somebody else's claim is
-  allowed (otherwise a posting nobody can settle would be stuck for ever) and is recorded as a **warning**.
-  If the refusal carries an **incomplete history** (see below), releasing it says so and the row stays
-  outstanding — releasing does not settle that debt, and neither does marking it handled.
+| Posting type | What the page, the dialogs and the log tell you | When to press *Mark as handled* |
+|---|---|---|
+| An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing | Hold the hand-post claim, then: check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): if the current version is there, do not post again; if only an earlier version is there, apply the update to it (do not raise a second document); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
+| A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded | Hold the hand-post claim, then: check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| Any other posting (no earlier document can exist) | Hold the hand-post claim, then: check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
+| The posting type is not known where the text is shown | Hold the hand-post claim, then: identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type. | Only once the CURRENT version of the posting is in the ledger. |
+<!-- hand-post-instruction:end -->
 
-  **Every posting being settled by hand is listed in its own section — *Postings being settled by hand*.**
-  A claim never times out, on purpose: one that lapsed on a timer would re-open exactly the interval it
-  closes, leaving an operator in the ledger with IMS free to queue the posting again. So a claim ends only
-  when somebody confirms the posting or releases it, and that is only safe if every claim can be found. That
-  section is independent of the refusal list below, which shows the *oldest 50 debts* and would otherwise
-  hide a newer claim behind unrelated work. Each row shows who holds it, how long it has been held, and how
-  many postings IMS has declined to queue behind it. **That count includes an attempt that was already
-  queued when you took the posting**: taking it cancels that attempt, so from that moment the posting is
-  owed again — and the document it came from is told so, instead of being left recording that its work was
-  queued. Those are logged as `accounting_posting_refusal_clear_declined_hand_post_claim`, and the posting
-  is recorded as outstanding in the usual way. **Very rarely the count itself cannot be written** — if so the
-  row says "at least one, NOT COUNTED" rather than a number, and marking the posting handled keeps it open
-  and tells you the history is incomplete. Treat that as "the ledger may be behind": compare the document
-  with the ledger, then re-save it so IMS queues the current version. Anything held far longer than a hand
-  posting takes is
-  flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
+<!-- hand-post-settlement:begin -->
+  **1. Take for hand posting.** Press this *before* you go to the ledger. While you hold the claim, IMS does not queue this posting. (Not on a sweep, not when another operator saves the document.) It cancels any queued attempt at that posting that nothing has picked up. If a sync row for it may ALREADY have been sent (it is being processed, has failed, or carries a document id) you are refused here and nothing is changed: check the ledger and settle that sync row first. While you hold the claim the row is on this list, marked as being settled by you; another operator who opens the page is told you hold it. Each refused attempt is logged as `accounting_posting_suppressed_hand_post_claimed`.
 
-  **This list is a view of what is being held, not a roll-call.** The longest-held claims are listed
-  *separately at the top* — start there, because those are the ones most likely to have been forgotten, and
-  each of them has its own Release. Below them is the rest of the list, and **Show more claims** pages through
-  it. That paging is navigation, nothing more: the page does **not** tell you when you have seen them all,
-  because it cannot. Postings are taken and given back while you read, and taking one does not create anything
-  new — it marks a refusal that may be months old — so a posting taken after you have paged past its place
-  simply will not appear. Earlier versions of this page tried to say "that is every active claim" and were
-  wrong four times in four different ways; the sentence is gone rather than hedged.
+  **2. Mark as handled.** Marking this records your confirmation and cancels IMS's own queued retry of this posting. IMS does not read the ledger when you press it: it takes your word, so press it only when the table above says so. It asks for an optional note (for example the ledger journal number) and records who marked it and when. It is refused if you do not hold the posting, and on a row that IMS clears itself. Check Sync > Exceptions afterwards to see whether this row closed or a new one appeared. Resolved rows from the last 30 days are listed underneath with how each was closed.
 
-  **So to reach a specific posting, SEARCH for its document instead of paging.** The Find box goes straight to
-  it, and it is the only route that does not depend on where a claim sits in a list.
+  **Release.** Releasing gives up your claim on this posting. Do not release it if you have already posted it by hand: press *Mark as handled* instead. Releasing somebody else's claim is allowed and is recorded as a **warning**. Check Sync > Exceptions afterwards to see whether this row closed or a new one appeared.
 
-  If you know the document, do not walk: the **Find** box goes straight to it. It searches the **reference
-  id** (an order or PO number), the **reference type**, the **posting type** and the **refusal id** — it does
-  **not** search the holder's name, so an empty result there is not evidence that nobody holds the posting.
-  Clearing the box returns to the first page.
+  **Postings being settled by hand.** Every claim is listed in its own section, independent of the refusal list (which shows the oldest 50 debts). A claim has no expiry: somebody confirms the posting or releases it. Each row shows who holds it, how long it has been held, and how many postings IMS declined to queue while it was held. That count includes an attempt that was already queued when the posting was taken: taking it cancels that attempt, and the decline is logged as `accounting_posting_refusal_clear_declined_hand_post_claim`. If the count could not be written the row says "at least one, NOT COUNTED" and its history is incomplete: compare the document with the ledger. Check Sync > Exceptions afterwards to see whether this row closed or a new one appeared. Anything held far longer than a hand posting takes is flagged: a prompt to ask the holder or release it.
 
-  **Anybody with sync access may release anybody's claim**, which is the answer rather than an oversight: if
-  only the holder could, a claim taken by somebody who has left would suppress that posting for ever. The
-  Release control is on **every** row of that section, not only on your own, and each release is recorded as
-  a warning naming who released whose.
+  **Finding a claim.** The longest-held claims are listed separately at the top, each with its own Release. Below them is the rest of the list, and **Show more claims** pages through it. The page does not tell you when you have seen every claim, because claims are taken and given back while you read. To reach a specific posting, SEARCH for its document: the **Find** box searches the reference id (an order or PO number), the reference type, the posting type and the refusal id. It does not search the holder's name, so an empty result is not evidence that nobody holds the posting. Anybody with sync access may release anybody's claim.
 
-  **If the document is saved again while you hold it, the row does not close.** While your claim is held IMS
-  declines to queue that posting — including a *later version* of the same document, on the entries where
-  successive versions share one (an invoice update, a bill update, a bill payment). Each decline is counted
-  on the row, and shown in the claims section as *postponed behind it*. When you then press *Mark as handled*
-  IMS records the posting you really made, **and leaves the row outstanding**, because you posted the version
-  you had and the ledger still does not hold the current one. The page says so instead of "marked as handled".
-  Releasing the claim does the same: the postponed attempts are added to the row's count and its clock moves
-  to now. Nothing re-queues them by itself — **re-save the document** and IMS queues its current version, or
-  post that current version by hand and mark it again. On every other kind of posting the entry names one
-  posting for ever, so a declined attempt was a *retry* of what you just posted by hand: those rows close and
-  suppress exactly as before.
+  **If the document is saved again while you hold the claim.** IMS declines to queue that posting, including a later version of the same document (an invoice update, a bill update, a bill payment). Each decline is counted on the row and shown in the claims section as *postponed behind it*. When you press *Mark as handled* after that, the page tells you whether the row is still outstanding. Check whether the current version is already in the accounting system. If it is, take a fresh claim and mark the outstanding refusal handled. If it is absent, EITHER take a fresh claim first (the claim is what stops IMS queueing it while you post), check the ledger again under that claim, and only then post the current version by hand, OR - holding NO claim, because a save is declined while a claim is held - re-save the document. Check Sync > Exceptions afterwards to see whether this row closed or a new one appeared.
 
-  **An earlier version of the same document does not block you.** For the postings where successive versions
-  share one entry — an invoice update, a bill update, a bill payment — the ledger may already hold the
-  *previous* version. IMS names that document on the row and tells you your hand posting **replaces** it;
-  it does not stop you taking the posting, because that entry has already been made and is never going to be
-  made again. Edit the document the ledger holds; do not raise a second one.
-* **A posting marked handled stays handled.** If the same posting is refused again later it is logged
-  (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
-  IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
-* **And that holds when the two happen at the same moment.** Marking a posting handled, queueing it, and
-  recording a refusal of it all take the same lock on that one posting, so a refusal cannot land in the gap
-  between your *Mark as handled* and its save and put the row back on the list — which would have asked you
-  to post, by hand, something you had just posted by hand. A refusal that arrives while the posting is being
-  queued is logged (`accounting_posting_refused_after_queued`) and not listed, because the posting is in the
-  accounting sync log. A refusal raised from inside a piece of work that cannot wait for that lock is not
-  lost either: it is held with that work — it commits or rolls back with it — and the next **accounting
-  sync** run settles it under the posting's lock, which is the wait the original job was not allowed to
-  make. If the job holding the lock queued the posting, nothing is owed and the claim disappears; if that
-  job rolled back or never queued it, the refusal becomes an ordinary row on this list. "Queued" here means
-  a posting IMS **watched appear** while the refusal was waiting — an **earlier** entry for the same
-  document (successive edits of one invoice, successive payments of one bill) does not settle it, because
-  the ledger would still be holding the earlier version; nor does an entry that was later **cancelled**,
-  because a cancelled entry is never going to reach the ledger; nor does an entry released back to the
-  connector from cancelled, because that is the same entry going round again rather than a new one. It is
-  logged as `accounting_posting_refusal_not_recorded_contended` at the moment it is held, and the refusal
-  itself is in the accounting activity log as always.
-* **When IMS cannot tell whether a posting beat a refusal, it lists the refusal.** Outside the window
-  above — a refusal that was never made to wait for anything — IMS has no way to know whether an entry
-  already in the sync log was queued before or after the refusal was decided: the two timestamps may have
-  been written by different IMS processes, and comparing clocks is not the same as knowing which of two
-  events happened first. So
-  such a refusal is listed. If you find a row here whose posting is in fact sitting in the accounting sync
-  log, that is this choice: look at the sync log entry and settle it there, and note that *Take for hand
-  posting* will refuse the row while IMS may already have posted it, and tell you so.
-* **A claim that nothing has settled shows up as "Unconfirmed".** If the accounting sync run has not
-  settled one of those held refusals within about 15 minutes, it is listed in this section marked
-  **Unconfirmed — not yet known to be owed**, so a reconciler that has stopped running is visible instead
-  of silent. An unconfirmed row offers no *Take for hand posting* action and **must not be posted by hand**:
-  until it is settled the posting may still belong to the job that held the lock, and posting it by hand
-  in that window is exactly how a journal reaches the ledger twice. The usual cause of a row sitting here
-  is that `/api/cron/accounting-sync` is not running — check that before anything else. A claim the run
-  keeps failing to settle eventually stops being retried and moves to the **integration outbox failures**
-  section instead, so it is in one place at a time.
+  **An earlier version of the same document.** For the postings where successive versions share one entry (an invoice update, a bill update, a bill payment) the ledger may already hold the previous version. IMS names that document on the row and does not stop you taking the posting. Whatever its standing, the earlier document is not the current version: check the ledger for the CURRENT version (the table above).
+
+  **Refusals recorded after a mark.** A refusal of a posting that was marked handled is logged (`accounting_posting_refused_after_handled_by_hand`) or listed, depending on the posting type. A refusal that arrives while the posting is being queued is logged (`accounting_posting_refused_after_queued`) and not listed, because the posting is in the accounting sync log. A refusal raised from inside a piece of work that is not allowed to wait for the posting's lock is held with that work, and the next **accounting sync** run settles it under the lock (`accounting_posting_refusal_not_recorded_contended`). When IMS is unable to tell whether a posting beat a refusal it lists the refusal: look at the sync log entry and settle it there; *Take for hand posting* is refused while IMS may already have posted.
+
+  **Unconfirmed rows.** A held refusal that the accounting sync run has not settled within about 15 minutes is listed marked **Unconfirmed — not yet known to be owed**. An unconfirmed row offers no *Take for hand posting* action and **must not be posted by hand**: the posting may still belong to the job that held the lock. The usual cause is that `/api/cron/accounting-sync` is not running: check that first. A claim the run keeps failing to settle is moved to the **integration outbox failures** section.
+<!-- hand-post-settlement:end -->
 * **If IMS cannot tell whether a posting was marked handled, it does not post it.** The check runs before
   every accounting entry is queued. When the check itself cannot be made — the database is unreachable, the
   query times out, the transaction is cancelled — IMS refuses the enqueue rather than reading "cannot tell"

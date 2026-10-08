@@ -95,6 +95,13 @@ export type AccountingSyncLogRow = {
    * is the whole defect this column exists to stop.
    */
   settlementBasis: string | null
+  /**
+   * o3d-1e7sl: whether the canceller PROVED the row pre-call (the orphan sweep and the never-claimed
+   * sale-cancel sweep stamp `true` in the same UPDATE as the status). REQUIRED for the reason the basis
+   * above is: an absent column reads as "not flagged", which the page would show as UNPROVEN for a row
+   * that is proven - the safe direction, but a wrong badge; a loader that forgot it must fail `tsc`.
+   */
+  abandonedBeforeRemoteCall: boolean | null
   syncedAt: string | null
   createdAt: string
 }

@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
@@ -1763,7 +1764,7 @@ async function stageRefundAccountingReversals(
           action: 'refund_unearned_reversal_rests_on_operator_assertion',
           tag: 'accounting',
           level: 'WARNING',
-          description: `${assertedUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order were settled as posted by an OPERATOR typing in a document id, and this refund counted their queued payload as unearned revenue already reversed (£${priorUnearnedReversed.toFixed(2)} in total, all rows). IMS never read those journals in the ledger: check the unearned revenue account for this order.`,
+          description: `${assertedUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order were settled as posted by an OPERATOR typing in a document id, and this refund counted their queued payload as unearned revenue already reversed (£${priorUnearnedReversed.toFixed(2)} in total, all rows). IMS did not verify those journals against the ledger: check the unearned revenue account for this order.`,
           metadata: {
             orderId: params.orderId,
             refundId: params.refundId,
@@ -2010,7 +2011,7 @@ async function stageRefundAccountingReversals(
       // says why (the existing `priorRefundReliefUnresolved` branch), exactly as for a prior refund's
       // own journal below. Queued (PENDING/PROCESSING) rows keep counting, as they always have.
       if (ledgerStanding(row) === 'ASSERTED_POSTED') {
-        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS never read it in the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
+        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS did not verify it against the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
         continue
       }
       priorRefundAllocationRelief += extractPayloadNetMovement(row.payload, settings.allocatedInventoryAccount, 'credit')
@@ -3447,12 +3448,12 @@ export function unserviceableRefundAccountingRetryPins(
 
 /** The refusal an unserviceable pin produces, named so an operator knows which ledger and why. */
 export function unserviceableRefundAccountingRetryError(pins: readonly string[]): string {
-  return 'This refund\'s staged accounting reversals are pinned to '
+  return withLedgerCheck('This refund\'s staged accounting reversals are pinned to '
     + `${pins.join(', ')}, which this build no longer ships. They are NOT re-queued: an unpinned `
     + 'retry would post them to the active ledger instead, crediting one set of books for a '
     + 'reversal that was proved against another. The refund keeps its retry flag and its staged '
     + 'reversals, so nothing is lost — reconnect that ledger, or raise the reversals against it by '
-    + 'hand and clear the flag.'
+    + 'hand and clear the flag.')
 }
 
 /**
@@ -3810,10 +3811,10 @@ export async function createSalesOrderRefund(
       const rateByTaxType = buildTaxTypeRateIndex(salesTaxRates)
       const identityMoved = (target: string, was: string, now: string) => ({
         error:
-          `The VAT identity of ${target} changed while this refund was being recorded — it was ${was} ` +
+          withLedgerCheck(`The VAT identity of ${target} changed while this refund was being recorded — it was ${was} ` +
           `when the amount was converted and is ${now} now, so the credit note would not come to the ` +
           'figure that was reconciled. Nothing has been credited. Re-open the refund and record it ' +
-          'again against the tax settings that now apply.',
+          'again against the tax settings that now apply.'),
       } as const)
       for (const expected of input.expectedTaxIdentities) {
         const target = expected.lineKind === 'shipping'
@@ -3941,11 +3942,11 @@ export async function createSalesOrderRefund(
       const conflictResult: { conflict: RefundCreationConflict; conflictError: string } = input.chargeback
         ? {
             conflict: 'prior-refund',
-            conflictError: `Order already carries refund ${conflictRef} — auto-chargeback skipped because the remaining balance is ambiguous; raise the credit note manually.`,
+            conflictError: withLedgerCheck(`Order already carries refund ${conflictRef} — auto-chargeback skipped because the remaining balance is ambiguous; raise the credit note manually.`),
           }
         : {
             conflict: 'prior-chargeback',
-            conflictError: `Order was already charged back (credit note ${conflictRef}) — a second credit note would double-reverse it; reconcile this refund manually.`,
+            conflictError: withLedgerCheck(`Order was already charged back (credit note ${conflictRef}) — a second credit note would double-reverse it; reconcile this refund manually.`),
           }
       return conflictResult
     }
@@ -4037,9 +4038,9 @@ export async function createSalesOrderRefund(
     if (!allExistingRefundsNet) {
       return {
         error:
-          'This order has an earlier refund recorded on a legacy/unknown amount basis, which cannot be ' +
+          withLedgerCheck('This order has an earlier refund recorded on a legacy/unknown amount basis, which cannot be ' +
           'safely reconciled with a new refund automatically. Reconcile the order manually before creating ' +
-          'another refund.',
+          'another refund.'),
         quarantine: true as const,
       } as const
     }
@@ -5278,10 +5279,10 @@ export async function retrySalesOrderRefundAccounting(
         if (recordVerdict === 'staged-never-recorded') {
           return {
             success: false,
-            error: 'This refund\'s accounting reversals were staged but the record of them was never '
+            error: withLedgerCheck('This refund\'s accounting reversals were staged but the record of them was never '
               + 'written, and the same staging cleared the order\'s revenue deferral — so no retry can '
               + 'derive them again. Raise the COGS/unearned/allocated-inventory reversals manually against '
-              + 'the refund\'s own cost snapshots and reconcile the order, then clear this flag by hand.',
+              + 'the refund\'s own cost snapshots and reconcile the order, then clear this flag by hand.'),
           }
         }
         // -----------------------------------------------------------------------------------------
@@ -5318,12 +5319,12 @@ export async function retrySalesOrderRefundAccounting(
         if (recordVerdict === 'undecidable') {
           return {
             success: false,
-            error: 'This refund predates the record of whether its accounting reversals were staged, so '
+            error: withLedgerCheck('This refund predates the record of whether its accounting reversals were staged, so '
               + 'nothing here can tell a reversal that was staged and lost from one that was never owed — '
               + 'and the order\'s revenue deferral is already gone either way, so no retry can derive it. '
               + 'Check whether a COGS/unearned/allocated-inventory reversal was posted for this refund: if '
               + 'it was not and one was due, raise it manually from the refund\'s own cost snapshots; if '
-              + 'nothing was owed, clear this flag by hand. Retrying cannot decide it.',
+              + 'nothing was owed, clear this flag by hand. Retrying cannot decide it.'),
           }
         }
         return {

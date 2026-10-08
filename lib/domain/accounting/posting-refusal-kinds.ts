@@ -75,15 +75,15 @@ export const POSTING_REFUSAL_KINDS = {
   },
   refund_credit_note: {
     type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', clearing: 'retried',
-    how: 'Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time.',
+    how: 'The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time.',
   },
   refund_cogs_reversal: {
     type: 'COGS_REVERSAL', referenceType: 'SalesOrderRefund', clearing: 'retried',
-    how: 'Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time.',
+    how: 'The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time.',
   },
   refund_unearned_reversal: {
     type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrderRefund', clearing: 'retried',
-    how: 'Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time.',
+    how: 'The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time.',
   },
   // ── manual ──────────────────────────────────────────────────────────────────────────────────────────
   sales_invoice_order: {

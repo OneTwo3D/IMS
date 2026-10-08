@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -602,10 +603,10 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
         // per-refund record `syncWcRefund` already wrote (`refund_sync_suppressed_by_chargeback`, at
         // ERROR when units were returned).
         permanentFailures.push(
-          `syncRefundsForOrder: ${terminallyUnappliable} of ${refundSweep.fetched} refunds read for this `
+          withLedgerCheck(`syncRefundsForOrder: ${terminallyUnappliable} of ${refundSweep.fetched} refunds read for this `
           + 'order can NEVER be applied in IMS (suppressed by a chargeback, or already recorded against a '
           + 'different order), so the delivery is settled without them and this order will keep reading '
-          + 'as short by that amount. Reconcile them by hand.',
+          + 'as short by that amount. Reconcile them by hand.'),
         )
       }
       if (settledTheOrder && refundSweep !== null && refundSweep.fetched > 0) {

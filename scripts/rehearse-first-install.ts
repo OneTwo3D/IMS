@@ -103,16 +103,16 @@ import {
 import { type Cluster, currentUser, freePort, pgBinDir, startCluster, toolEnv } from '../tests/scripts/real-postgres-cluster.ts'
 
 // The publication helpers live in lib/ops/published-report.ts (the readiness gate publishes its report the same way).
-export { ancestorProblem, checkAncestors, verifyPublishedReport, writeExclusive }
+export { ancestorProblem, checkAncestors, fsyncDirectory, verifyPublishedReport, writeExclusive }
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const DEFAULT_PARENT = '/var/tmp'
 const DEFAULT_REPORT_DIR = '/var/tmp/ims-rehearsal-reports'
-const RUN_DIR_PREFIX = 'ims-rehearsal-'
+export const RUN_DIR_PREFIX = 'ims-rehearsal-'
 const SOURCE_DATABASE = 'ims_rehearsal'
 const RESTORE_DATABASE = 'ims_rehearsal_restore'
 const CHILD_TIMEOUT_MS = 15 * 60 * 1000
-const OUTPUT_TAIL_BYTES = 16 * 1024
+export const OUTPUT_TAIL_BYTES = 16 * 1024
 
 /** Seams for the rehearsal's own tests. The command line does not reach any of them. */
 export type RehearsalHooks = {
@@ -154,10 +154,10 @@ export type RehearsalOutcome = {
   runRoot?: string
 }
 
-type ChildResult = { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }
+export type ChildResult = { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }
 type StepOutcome = { status: 'passed' | 'failed'; reason?: string; detail?: Record<string, unknown>; required?: boolean; skipped?: boolean }
 
-type RunState = {
+export type RunState = {
   root: string
   envFile: string
   /** device and inode of the env file, recorded when this run created it */
@@ -177,11 +177,11 @@ type RunState = {
 // ---------------------------------------------------------------------------------------------
 
 /** The file-system type under a path, from `stat -f`. */
-function filesystemType(target: string): string {
+export function filesystemType(target: string): string {
   return execFileSync('stat', ['-f', '-c', '%T', target], { encoding: 'utf8', env: toolEnv() }).trim()
 }
 
-const RAM_BACKED = new Set(['tmpfs', 'ramfs'])
+export const RAM_BACKED = new Set(['tmpfs', 'ramfs'])
 
 function readProcStat(pid: number): { state: string; ppid: number } | null {
   try {
@@ -316,7 +316,7 @@ export function processesNaming(needle: string): number[] {
   return hits
 }
 
-function tail(text: string, bytes = OUTPUT_TAIL_BYTES): string {
+export function tail(text: string, bytes = OUTPUT_TAIL_BYTES): string {
   return text.length > bytes ? text.slice(text.length - bytes) : text
 }
 
@@ -341,7 +341,7 @@ export function inheritedEnv(scratchRoot: string): Record<string, string> {
   return env
 }
 
-function parseEnvFile(file: string): Record<string, string> {
+export function parseEnvFile(file: string): Record<string, string> {
   const env: Record<string, string> = {}
   for (const line of readFileSync(file, 'utf8').split('\n')) {
     if (line === '' || line.startsWith('#')) continue
@@ -353,7 +353,12 @@ function parseEnvFile(file: string): Record<string, string> {
 
 let currentChild: ChildProcess | null = null
 
-function runChild(spec: { cmd: string; args: string[]; env: Record<string, string>; cwd: string; stdin?: string; timeoutMs?: number }): Promise<ChildResult> {
+/** The step child currently running, so a signal handler in another module can stop it. */
+export function getCurrentChild(): ChildProcess | null {
+  return currentChild
+}
+
+export function runChild(spec: { cmd: string; args: string[]; env: Record<string, string>; cwd: string; stdin?: string; timeoutMs?: number }): Promise<ChildResult> {
   return new Promise((resolve) => {
     // detached: the child leads its own process group, so a timeout stops it and what it started,
     // by the group id of a process THIS script created.
@@ -386,16 +391,16 @@ function runChild(spec: { cmd: string; args: string[]; env: Record<string, strin
 // The throwaway cluster.
 // ---------------------------------------------------------------------------------------------
 
-function randomHex(bytes: number): string {
+export function randomHex(bytes: number): string {
   return randomBytes(bytes).toString('hex')
 }
 
-function ident(name: string): string {
+export function ident(name: string): string {
   return `"${name.replace(/"/g, '""')}"`
 }
 
 /** Run SQL on the cluster as its bootstrap superuser, over the private socket, with the SQL on stdin. */
-function socketPsql(cluster: Cluster, sql: string, database = 'postgres'): string {
+export function socketPsql(cluster: Cluster, sql: string, database = 'postgres'): string {
   const env = { PATH: process.env.PATH } as unknown as NodeJS.ProcessEnv
   return execFileSync('psql', [
     '-X', '-w', '-q', '-tA', '-v', 'ON_ERROR_STOP=1',
@@ -403,11 +408,11 @@ function socketPsql(cluster: Cluster, sql: string, database = 'postgres'): strin
   ], { input: sql, encoding: 'utf8', env, stdio: ['pipe', 'pipe', 'pipe'] }).trim()
 }
 
-function databaseUrl(role: string, password: string, port: number, database: string): string {
+export function databaseUrl(role: string, password: string, port: number, database: string): string {
   return `postgresql://${encodeURIComponent(role)}:${encodeURIComponent(password)}@127.0.0.1:${port}/${database}`
 }
 
-async function withClient<T>(url: string, fn: (client: pg.Client) => Promise<T>): Promise<T> {
+export async function withClient<T>(url: string, fn: (client: pg.Client) => Promise<T>): Promise<T> {
   const client = new pg.Client({ connectionString: url, connectionTimeoutMillis: 10_000 })
   await client.connect()
   try {
@@ -443,7 +448,7 @@ function countMigrationDirectories(repoRoot: string): number {
 // Teardown. Synchronous on purpose: it must be able to finish inside a signal handler.
 // ---------------------------------------------------------------------------------------------
 
-class DirectoryReplacedError extends Error {}
+export class DirectoryReplacedError extends Error {}
 
 /** `birthtimeMs` is recorded where the file system reports one: an inode NUMBER can be reused after a delete, its creation time cannot match by accident. */
 export type FileIdentity = { dev: number; ino: number; birthtimeMs?: number }
@@ -491,7 +496,7 @@ export function shredFile(file: string, expected: FileIdentity | null): { ok: bo
   return { ok: !existsSync(file) }
 }
 
-function teardownRun(state: RunState): TeardownResult {
+export function teardownRun(state: RunState): TeardownResult {
   const errors: string[] = []
   // A start that failed after the fork left no handle and no pid: read both from the data directory.
   if (state.postmaster === null) state.postmaster = capturePostmaster(path.join(state.root, 'pg', 'data'))

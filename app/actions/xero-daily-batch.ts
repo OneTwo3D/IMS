@@ -1,5 +1,6 @@
 'use server'
 
+import { describeLedgerStanding } from '@/lib/domain/accounting/ledger-standing-display'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
@@ -108,6 +109,12 @@ export type DailyBatchHistoryEntry = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * Codex round 6: the row's STANDING, so a SYNCED row an operator settled is not shown as if the ledger confirmed it.
+   * `standingLabel` is null for a confirmed or queued row (the status says it all); `standingDetail` is the tooltip.
+   */
+  standingLabel?: string | null
+  standingDetail?: string
   /**
    * o3d-e2mz: the attempt this row is on, so the panel's per-row retry can name the attempt it was
    * requested about. Optional because connectors whose processor stamps none report none.
@@ -685,6 +692,8 @@ export async function getXeroDailyBatchHistory(
       errorMessage: row.errorMessage,
       retryCount: row.retryCount,
       attemptRevision: row.attemptRevision,
+      standingLabel: describeLedgerStanding(row).label,
+      standingDetail: describeLedgerStanding(row).detail,
       lines,
     }
 

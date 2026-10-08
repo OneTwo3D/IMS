@@ -27,6 +27,7 @@ import {
   buildBackReferenceCandidateQuery,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { NAMES_A_DOCUMENT_WHERE, ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { adapterUniqueViolation, legacyUniqueViolation } from '../helpers/prisma-unique-error'
 
 /** The mapped table names, so a constraint-name fixture reads like the one Postgres actually raises. */
@@ -56,9 +57,12 @@ type FakeSyncRow = {
   referenceId?: string
   status: string
   externalTransactionId: string | null
+  /** o3d-1e7sl: the standing columns. Absent = the connector's own writeback (NULL), as every older fixture means. */
+  settlementBasis?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
-const SYNC_ROW_COLUMNS = new Set(['connector', 'type', 'referenceType', 'referenceId', 'status', 'externalTransactionId'])
+const SYNC_ROW_COLUMNS = new Set(['connector', 'type', 'referenceType', 'referenceId', 'status', 'externalTransactionId', 'settlementBasis', 'abandonedBeforeRemoteCall'])
 const BILL_COLUMNS = new Set(['poId', 'accountingInvoiceId', 'id'])
 
 /**
@@ -74,6 +78,11 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>, c
   for (const [key, condition] of Object.entries(where)) {
     if (key === 'OR') {
       if (!(condition as Array<Record<string, unknown>>).some((clause) => matches(row, clause, columns))) return false
+      continue
+    }
+    // o3d-1e7sl: `NAMES_A_DOCUMENT_WHERE` (ledger-standing.ts) is an AND of the paired id arms.
+    if (key === 'AND') {
+      if (!(condition as Array<Record<string, unknown>>).every((clause) => matches(row, clause, columns))) return false
       continue
     }
     if (!columns.has(key)) throw new Error(`fake db: unknown column "${key}" in where clause`)
@@ -393,7 +402,10 @@ test('resolvePurchaseOrderBackReference counts the whole population for the PO, 
   // checking `status` would pass with the exclusion back in place, which is how this defect
   // survived its own regression test in the sweep suite.
   assert.equal('status' in (calls.lastCountWhere ?? {}), false, 'the status must not be asked at all')
-  assert.deepEqual(calls.lastCountWhere?.externalTransactionId, { not: null })
+  // o3d-1e7sl (G9): the evidence clause is the ledger-standing module's own wording of "names a document",
+  // spread into the where - asserted by IDENTITY, so a hand-written `{ not: null }` beside it fails here.
+  assert.equal('externalTransactionId' in (calls.lastCountWhere ?? {}), false, 'no hand-written id clause')
+  assert.deepEqual(calls.lastCountWhere?.AND, (NAMES_A_DOCUMENT_WHERE as { AND: unknown }).AND)
   assert.deepEqual(calls.lastBillWhere, { poId: 'po-1', accountingInvoiceId: null })
 })
 
@@ -454,6 +466,49 @@ test('[o3d-9kek f2] a sibling with NO external id has posted nothing and cannot 
   })
   const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
   assert.deepEqual(resolved, { outcome: 'unique', purchaseInvoiceId: 'bill-1' })
+})
+
+test('[o3d-1e7sl G9] a COMPETING sync row counts when it NAMES a document, whoever made the claim - one case per standing', async () => {
+  // EXISTENCE, not amount (D2): a competitor claims a bill for this PO whether the ledger issued its id or an
+  // operator typed it, and dropping an asserted one would read ambiguity as certainty. A row that names NO
+  // document (an operator's NOT_POSTED, a proven-unsent cancellation, a FAILED/CANCELLED row with nothing,
+  // queued work) competes for no bill link. The self row is a confirmed SYNCED id; the competitor varies.
+  const cases: Array<{ name: string; standing: LedgerStanding; row: Partial<FakeSyncRow>; competes: boolean }> = [
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'XBILL-2' }, competes: true },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'XBILL-2', settlementBasis: 'OPERATOR_ASSERTION' }, competes: true },
+    { name: 'CANCELLED still naming the ledger document', standing: 'CONFIRMED_POSTED', row: { status: 'CANCELLED', externalTransactionId: 'XBILL-2' }, competes: true },
+    { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }, competes: false },
+    { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', abandonedBeforeRemoteCall: true }, competes: false },
+    { name: 'UNKNOWN (FAILED, no id)', standing: 'UNKNOWN', row: { status: 'FAILED' }, competes: false },
+    { name: 'LIVE_WORK (PENDING, no id)', standing: 'LIVE_WORK', row: { status: 'PENDING' }, competes: false },
+  ]
+  let ambiguous = 0
+  for (const c of cases) {
+    const other: FakeSyncRow = {
+      id: 'log-other', connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1',
+      status: 'SYNCED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, ...c.row,
+    }
+    const standing = ledgerStanding({
+      status: other.status, externalTransactionId: other.externalTransactionId,
+      settlementBasis: other.settlementBasis ?? null, abandonedBeforeRemoteCall: other.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# G9 precondition: ${c.name}: ${JSON.stringify(c.row)} => ${standing}`)
+    assert.equal(standing, c.standing, c.name)
+    const { deps } = makeDeps({
+      bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+      poSyncRows: [selfRow('po-1', 'XBILL-1'), other],
+    })
+    const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+    if (c.competes) {
+      ambiguous += 1
+      assert.equal(resolved.outcome, 'ambiguous', c.name)
+      assert.equal((resolved as { reason?: string }).reason, 'MULTIPLE_SYNC_ROWS', c.name)
+    } else {
+      assert.deepEqual(resolved, { outcome: 'unique', purchaseInvoiceId: 'bill-1' }, c.name)
+    }
+  }
+  console.log(`# G9 cases: ${cases.length}; competing (ambiguous): ${ambiguous}`)
+  assert.ok(ambiguous > 0 && ambiguous < cases.length)
 })
 
 test('applyBackReference REFUSES to guess which bill an ambiguous PO row belongs to', async () => {
