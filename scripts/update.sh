@@ -5179,47 +5179,59 @@ if ! $NO_GIT; then
     [[ -n "${GIT_REPO_URL:-}" ]] || die "No git checkout and no GIT_REPO_URL in ${DEPLOY_META_SOURCE:-${IMS_DRIVER_DEPLOY_META} or ${DEPLOY_META_FILE}}. Use --no-git to skip."
     GIT_BRANCH="${GIT_BRANCH:-main}"
 
-    TMP_CLONE_DIR="$(mktemp -d -t ims-update.XXXXXX)"
-    TMP_CLONE_WORKTREE="${TMP_CLONE_DIR}/repo"
-    chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
     CURRENT_COMMIT="none"
+    if $DRY_RUN; then
+      # A DRY RUN WRITES NOTHING, AND THIS BRANCH IS ALL WRITES (Codex review of the dry-run banner).
+      # It makes a directory, clones into it, `rsync --delete`s the clone over ${APP_DIR}, copies .git
+      # in and re-owns the whole tree. Unguarded, a root dry run on an installation without a .git
+      # directory replaced and deleted installed files, and the exit trap then told the operator
+      # nothing had been written.
+      NEW_COMMIT="not-fetched-in-a-dry-run"
+      echo -e "${YELLOW}[DRY]${RESET}   would clone ${GIT_REPO_URL} (${GIT_BRANCH}) into a temporary directory as ${APP_USER},"
+      echo -e "${YELLOW}[DRY]${RESET}   rsync it over ${APP_DIR} with --delete (sparing .git, .deploy-meta, node_modules, .next, .env,"
+      echo -e "${YELLOW}[DRY]${RESET}   .env.local, backups, uploads, public/uploads), copy its .git in, and re-own ${APP_DIR} to ${APP_USER}"
+    else
+      TMP_CLONE_DIR="$(mktemp -d -t ims-update.XXXXXX)"
+      TMP_CLONE_WORKTREE="${TMP_CLONE_DIR}/repo"
+      chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
 
-    info "Cloning ${GIT_REPO_URL} (${GIT_BRANCH}) into a temporary worktree..."
-    # `--` before the URL: GIT_REPO_URL comes out of the application-owned .deploy-meta, and a
-    # value beginning with `-` would otherwise be parsed by git as an OPTION rather than a
-    # repository (`--upload-pack=…` runs a command). The clone already runs AS THE APPLICATION
-    # USER, so that was never a privilege crossing — this keeps it from being a surprise either.
-    run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
-      -- "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
-    NEW_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
-    info "Fetched commit: ${NEW_COMMIT:0:8}"
+      info "Cloning ${GIT_REPO_URL} (${GIT_BRANCH}) into a temporary worktree..."
+      # `--` before the URL: GIT_REPO_URL comes out of the application-owned .deploy-meta, and a
+      # value beginning with `-` would otherwise be parsed by git as an OPTION rather than a
+      # repository (`--upload-pack=…` runs a command). The clone already runs AS THE APPLICATION
+      # USER, so that was never a privilege crossing — this keeps it from being a surprise either.
+      run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
+        -- "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
+      NEW_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
+      info "Fetched commit: ${NEW_COMMIT:0:8}"
 
-    privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
-    rsync -a --delete \
-      --exclude='.git' \
-      --exclude='.deploy-meta' \
-      --exclude='node_modules' \
-      --exclude='.next' \
-      --exclude='.env' \
-      --exclude='.env.local' \
-      --exclude='backups' \
-      --exclude='uploads' \
-      --exclude='public/uploads' \
-      "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
-    # THE GIT METADATA GOES INTO A DIRECTORY THIS RUN CREATED AND PINNED (o3d-ov60). It was
-    # `rm -rf "${APP_DIR}/.git"` and then `cp -a … "${APP_DIR}/.git"`, and the `rm` is what opened
-    # it: it removes a symlink without following it, and leaves the NAME free for ${APP_USER} —
-    # who owns ${APP_DIR} — to re-create as a link to a directory of their choosing before the
-    # root-side `cp` runs. o3d-czpy built copy_tree_into_new_dir() for exactly this and gave it
-    # install.sh's two clone paths; this one, which does the identical thing in the identical
-    # place, was left on the raw pair. See the prose above the helper in
-    # scripts/lib/cutover-namespace.sh for what the `mkdir`, the `cd` and the `..` check buy.
-    privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
-    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
-    privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
-    chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
-    rm -rf "${TMP_CLONE_DIR}"
-    success "Repository synced into existing app directory."
+      privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
+      rsync -a --delete \
+        --exclude='.git' \
+        --exclude='.deploy-meta' \
+        --exclude='node_modules' \
+        --exclude='.next' \
+        --exclude='.env' \
+        --exclude='.env.local' \
+        --exclude='backups' \
+        --exclude='uploads' \
+        --exclude='public/uploads' \
+        "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
+      # THE GIT METADATA GOES INTO A DIRECTORY THIS RUN CREATED AND PINNED (o3d-ov60). It was
+      # `rm -rf "${APP_DIR}/.git"` and then `cp -a … "${APP_DIR}/.git"`, and the `rm` is what opened
+      # it: it removes a symlink without following it, and leaves the NAME free for ${APP_USER} —
+      # who owns ${APP_DIR} — to re-create as a link to a directory of their choosing before the
+      # root-side `cp` runs. o3d-czpy built copy_tree_into_new_dir() for exactly this and gave it
+      # install.sh's two clone paths; this one, which does the identical thing in the identical
+      # place, was left on the raw pair. See the prose above the helper in
+      # scripts/lib/cutover-namespace.sh for what the `mkdir`, the `cd` and the `..` check buy.
+      privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
+      copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+      privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
+      chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+      rm -rf "${TMP_CLONE_DIR}"
+      success "Repository synced into existing app directory."
+    fi
   fi
 fi
 

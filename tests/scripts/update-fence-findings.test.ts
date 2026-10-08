@@ -14,14 +14,14 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, symlinkSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import { EXIT_ERROR, assessUnrecordedRelease, STATE_ABSENT } from '@/scripts/fence-db-connections.mjs'
 
 import { shippedFunction } from './real-postgres-cluster.ts'
-import { withTempDir } from './temp-dir.ts'
+import { createTempDirSync, withTempDir } from './temp-dir.ts'
 
 const REPO = process.cwd()
 const read = (rel: string): string => readFileSync(join(REPO, rel), 'utf8')
@@ -230,4 +230,74 @@ test('runuser: update.sh run_as_user does not call runuser for a caller that can
   assert.notEqual(trunkFn, fn, 'precondition: the guard was found to cut out')
   const control = bash(['exec 2>&1', 'runuser() { echo "runuser: may not be used by non-root users"; return 1; }', trunkFn, 'run_as_user imsapp echo RAN_AS_CALLER; echo "RC=$?"'].join('\n'))
   assert.match(control.out, /may not be used by non-root users/, 'without the guard the unprivileged caller is refused')
+})
+
+// ---------------------------------------------------------------------------
+// dry run -- the no-.git pull branch writes nothing
+// ---------------------------------------------------------------------------
+
+/** The shipped pull step of update.sh, from `if ! $NO_GIT; then` to its closing `fi`. */
+function pullStep(source: string): string {
+  const lines = source.split('\n')
+  const start = lines.findIndex((l, i) => l === 'if ! $NO_GIT; then' && /Pulling latest code from git/.test(lines[i + 1] ?? ''))
+  const synced = lines.findIndex((l) => l.includes('success "Repository synced into existing app directory."'))
+  assert.ok(start > 0 && synced > start, `precondition: the pull step was found (${start}..${synced})`)
+  const end = lines.findIndex((l, i) => i > synced && l === 'fi')
+  return lines.slice(start, end + 1).join('\n')
+}
+
+const MUTATING = ['mktemp', 'chown', 'rsync', 'rm', 'mv', 'cp', 'mkdir', 'chmod', 'copy_tree_into_new_dir', 'git-clone', 'git-fetch', 'git-reset', 'ln', 'tee']
+
+function pullRig(source: string, dry: 'true' | 'false', opts: { cutGuard?: boolean } = {}): { calls: string[]; status: number; out: string } {
+  const callsDir = createTempDirSync('ims-pull-rig-')
+  let step = pullStep(source)
+  if (opts.cutGuard) {
+    assert.ok(step.includes('    if $DRY_RUN; then\n'), 'precondition: the dry-run guard exists to cut')
+    step = step.replace('    if $DRY_RUN; then\n', '    if false; then\n')
+  }
+  const stubs = MUTATING.filter((n) => !n.startsWith('git-') && n !== 'copy_tree_into_new_dir')
+    .map((n) => `${n}() { echo "CALL:${n} $*" >> "$CALLS"; }`)
+  const program = [
+    'exec 2>&1',
+    `CALLS='${join(callsDir, 'calls.log')}'; : > "$CALLS"`,
+    // The recorder for mktemp must still hand back a path to the code under test.
+    'mktemp() { echo "CALL:mktemp $*" >> "$CALLS"; echo /tmp/fake-clone-dir; }',
+    ...stubs.filter((s) => !s.startsWith('mktemp()')),
+    'copy_tree_into_new_dir() { echo "CALL:copy_tree_into_new_dir $*" >> "$CALLS"; }',
+    // git is run through run_git_as_user: record the verb; rev-parse is a read and answers.
+    'run_git_as_user() { shift; if [[ "$*" == *clone* ]]; then echo "CALL:git-clone $*" >> "$CALLS"; elif [[ "$*" == *fetch* ]]; then echo "CALL:git-fetch $*" >> "$CALLS"; elif [[ "$*" == *reset* ]]; then echo "CALL:git-reset $*" >> "$CALLS"; elif [[ "$*" == *rev-parse* ]]; then echo abc12345; fi; }',
+    'privileged_spare_running_tree() { return 0; }',
+    'header() { echo "H: $*"; }; info() { echo "I: $*"; }; warn() { echo "W: $*"; }; success() { echo "S: $*"; }; die() { echo "DIE: $*"; exit 9; }',
+    'YELLOW=""; RESET=""',
+    `DRY_RUN=${dry}; NO_GIT=false; APP_USER=app; APP_DIR=/nonexistent-app-dir; GIT_REPO_URL=file:///repo.git; GIT_BRANCH=main`,
+    'APP_PORT=3000; APP_PORT_SOURCE=x; DEPLOY_META_SOURCE=x; IMS_DRIVER_DEPLOY_META=x; DEPLOY_META_FILE=x',
+    shippedFunction(source, 'run'),
+    step,
+    'echo "DONE commit=${NEW_COMMIT:-unset}"',
+    'cat "$CALLS"',
+  ].join('\n')
+  const r = bash(program)
+  rmSync(callsDir, { recursive: true, force: true })
+  const calls = r.out.split('\n').filter((l) => l.startsWith('CALL:'))
+  return { calls, status: r.status, out: r.out }
+}
+
+test('dry run: the pull step of a checkout WITHOUT .git performs no write of any kind', () => {
+  const real = pullRig(UPDATE, 'false')
+  const verbs = (c: string[]) => c.map((l) => l.slice(5).split(' ')[0])
+  console.log(`  control (real run, no .git): ${JSON.stringify(verbs(real.calls))}`)
+  assert.ok(verbs(real.calls).includes('rsync') && verbs(real.calls).includes('git-clone') && verbs(real.calls).includes('chown'),
+    'precondition: the rig sees the clone, the rsync --delete and the chown when the run is real')
+  assert.ok(real.calls.some((c) => c.includes('rsync -a --delete')), 'and the rsync is the destructive one')
+
+  const dry = pullRig(UPDATE, 'true')
+  console.log(`  dry run: calls=${JSON.stringify(dry.calls)}; ${JSON.stringify(dry.out.split('\n').filter((l) => /DRY|DONE|DIE/.test(l)).map((l) => l.slice(0, 80)))}`)
+  assert.equal(dry.status, 0, dry.out)
+  assert.deepEqual(dry.calls, [], 'a dry run touches nothing: no mktemp, clone, rsync, copy, chown or rm')
+  assert.match(dry.out, /\[DRY\]|would clone/)
+  assert.match(dry.out, /DONE commit=not-fetched-in-a-dry-run/)
+  // Isolating arm / named mutation: the same step with the guard disabled DOES write.
+  const cut = pullRig(UPDATE, 'true', { cutGuard: true })
+  console.log(`  dry run with the guard cut: ${JSON.stringify(verbs(cut.calls))}`)
+  assert.ok(cut.calls.length > 0, 'without the guard the dry run writes (this is the defect)')
 })
