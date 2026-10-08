@@ -19,7 +19,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join } from 'node:path'
 
@@ -32,15 +32,31 @@ export function shippedFunction(source: string, name: string): string {
   return source.slice(start + 1, end + 3)
 }
 
-/** The server binaries, wherever this distribution keeps them. */
+/**
+ * The environment every tool this file starts runs under: a short whitelist, never the caller's whole
+ * environment. `BASH_ENV`, `ENV`, `SHELLOPTS`, `PS4`, `LD_PRELOAD` and `NODE_OPTIONS` in the caller's
+ * environment would otherwise run code, outside anything the caller meant to isolate, in whichever of
+ * these tools starts a shell (pg_ctl and initdb both do).
+ */
+export function toolEnv(): NodeJS.ProcessEnv {
+  const env = {} as Record<string, string>
+  for (const name of ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR']) {
+    const value = process.env[name]
+    if (value !== undefined) env[name] = value
+  }
+  return env as unknown as NodeJS.ProcessEnv
+}
+
+/** The server binaries, wherever this distribution keeps them. No shell is involved in finding them. */
 export function pgBinDir(): string {
-  const candidates = execFileSync('bash', [
-    '-c',
-    'ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1; command -v initdb 2>/dev/null | xargs -r dirname',
-  ], { encoding: 'utf8' })
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
+  const candidates: string[] = []
+  const versions = existsSync('/usr/lib/postgresql')
+    ? readdirSync('/usr/lib/postgresql').filter((name) => /^\d+(\.\d+)*$/.test(name))
+    : []
+  versions.sort((x, y) => x.localeCompare(y, undefined, { numeric: true }))
+  const newest = versions[versions.length - 1]
+  if (newest !== undefined) candidates.push(join('/usr/lib/postgresql', newest, 'bin'))
+  for (const dir of (process.env.PATH ?? '').split(':')) if (dir !== '' && existsSync(join(dir, 'initdb'))) candidates.push(dir)
   for (const dir of candidates) {
     if (existsSync(join(dir, 'initdb')) && existsSync(join(dir, 'pg_ctl'))) return dir
   }
@@ -79,7 +95,7 @@ export interface Cluster {
 
 /** The OS account the tests run as, which is also the cluster's superuser. */
 export function currentUser(): string {
-  return execFileSync('id', ['-un'], { encoding: 'utf8' }).trim()
+  return execFileSync('id', ['-un'], { encoding: 'utf8', env: toolEnv() }).trim()
 }
 
 /** An environment with every libpq variable removed, so no test inherits a connection. */
@@ -135,7 +151,7 @@ export function startCluster(
     '-E', 'UTF8',
     '--no-sync',
     '-N',
-  ], { stdio: 'pipe' })
+  ], { stdio: 'pipe', env: toolEnv() })
   if (hbaHostLines.length > 0) {
     const hba = join(data, 'pg_hba.conf')
     // FIRST, because PostgreSQL takes the FIRST matching record and stops. Appending would be a
@@ -157,7 +173,7 @@ export function startCluster(
       '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost',
       '-keyout', join(data, 'server.key'),
       '-out', join(data, 'server.crt'),
-    ], { stdio: 'pipe' })
+    ], { stdio: 'pipe', env: toolEnv() })
     chmodSync(join(data, 'server.key'), 0o600)
     writeFileSync(join(data, 'postgresql.conf'), `${readFileSync(join(data, 'postgresql.conf'), 'utf8')}\nssl = on\n`)
   }
@@ -188,7 +204,7 @@ export function cloneCluster(root: string, source: Cluster, name: string, port: 
     '-p', String(source.port),
     '-U', currentUser(),
     '-X', 'stream',
-  ], { stdio: 'pipe', env: cleanLibpqEnv() })
+  ], { stdio: 'pipe', env: toolEnv() })
   return bringUp(root, name, data, socket, port, listen)
 }
 
@@ -200,7 +216,7 @@ function bringUp(root: string, name: string, data: string, socket: string, port:
     '-l', join(root, name, 'pg.log'),
     '-o', `-p ${port} -k ${socket} -c listen_addresses=${listen}`,
     '-w', 'start',
-  ], { stdio: 'pipe' })
+  ], { stdio: 'pipe', env: toolEnv() })
 
   return {
     name,
@@ -208,7 +224,7 @@ function bringUp(root: string, name: string, data: string, socket: string, port:
     socket,
     port,
     psql(args, options = {}) {
-      const env = cleanLibpqEnv()
+      const env = toolEnv()
       if (options.password !== undefined) env.PGPASSWORD = options.password
       return execFileSync('psql', [
         '-X', '-w', '-q', '-tA', '-v', 'ON_ERROR_STOP=1',
@@ -221,7 +237,7 @@ function bringUp(root: string, name: string, data: string, socket: string, port:
     },
     stop() {
       try {
-        execFileSync(join(bin, 'pg_ctl'), ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' })
+        execFileSync(join(bin, 'pg_ctl'), ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe', env: toolEnv() })
       } catch {
         // A cluster that never came up, or one already gone; the directory removal below is what
         // actually matters and it happens either way.

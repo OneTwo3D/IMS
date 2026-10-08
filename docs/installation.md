@@ -1283,6 +1283,7 @@ Each cron endpoint requires `Authorization: Bearer ${CRON_SECRET}` in the reques
 - [ ] Remote upload (S3 or SFTP) configured under Settings > Backup. Local-only backups are vulnerable to the same incident that takes down the application server.
 - [ ] Restore round-trip tested on a staging environment — confirm the manifest validation passes and the database is functional after restore.
 - [ ] `DATABASE_RESTORE_MAX_FILE_BYTES` raised if your typical backup exceeds 50MB.
+- [ ] A [fresh-install rehearsal](#fresh-install-rehearsal) is GREEN for the commit being deployed — it demonstrates the dump-and-restore round trip on a throwaway cluster before any data is loaded.
 
 ### Integrations
 
@@ -1359,6 +1360,72 @@ above is the single enforcement point.
 - [ ] Email notifications working — admin recipients receive critical-finding notifications from the invariant check cron.
 - [ ] Application logs are being collected (stdout/journald → your log aggregator).
 
+
+## Fresh-install rehearsal
+
+`npm run rehearse:first-install` rehearses the **first install of a production instance** — `prisma migrate deploy`, `npm run db:seed`, `scripts/provision-instance.mjs` — on a PostgreSQL cluster created for the occasion and thrown away afterwards, and writes a readiness report. It does **not** run `scripts/install.sh`, `update.sh` or `deploy.sh`, touches no service, and never connects to the database the checkout's `.env` names. It is the rehearsal behind o3d-zjsb5.2 (provision production, AC2–AC6) and o3d-zjsb5.3 (the base currency is fixed before any data exists), and the restore drill the opening-stock load depends on.
+
+```bash
+# As the account that owns the checkout (NOT root), with PostgreSQL server binaries installed
+# (Debian: apt-get install postgresql) and `npx prisma generate` already run:
+npm run rehearse:first-install
+# Optional: --root <dir> (parent of the throwaway cluster, default /var/tmp) and
+#           --report-dir <dir> (default /var/tmp/ims-rehearsal-reports).
+```
+
+A first measured run, 279 migrations, took 18 seconds. It runs one `tsx`, `prisma` or `npm` process at a time beside the cluster; on a memory-constrained shared host take the same lock the test tiers take.
+
+### What it builds, and what it refuses to touch
+
+- **A cluster of its own** in a fresh `ims-rehearsal-*` directory under `--root`, on a private loopback TCP port, with `scram-sha-256` password authentication exactly as CI configures it (the report records that the stored password is a SCRAM verifier and that every `host` rule in `pg_hba.conf` is scram). `--root` is refused when it is on a RAM-backed file system (`tmpfs`, `ramfs`): the cluster and its dump would be held in memory. Every run creates a new directory, so a re-run never meets the previous run's cluster.
+- **Its own superuser role** with a random password. The password and the other generated secrets live in a mode-600 `rehearsal.env` inside the run directory and in the environment of the child processes — never on a command line, so they are not visible in `ps`. The file is shredded in the teardown (`shred -u`; on a copy-on-write file system an overwrite is not a guarantee, which is acceptable because the cluster it unlocks is deleted in the same breath).
+- **No inherited database.** The script never reads `DATABASE_URL` from the environment it was started in; if one is set the report says it was ignored. Every child process gets a **whitelisted** environment (`PATH`, `LANG`, `LC_ALL`, `TZ`; `HOME` and the npm cache are the run directory's own, so a user `.npmrc` (script shell, registries) is never read; the caller's `NODE_OPTIONS`, `NODE_PATH`, `LD_*` and proxy variables are never forwarded, because a `--require` there would run code in every child before any guard here, and the children get only the rehearsal's own `--max-old-space-size`) plus the throwaway cluster's own values, and immediately before a child is spawned or a connection opened the URL it would use is checked against the cluster's host, port, role and database names — anything else is refused, and so is an environment carrying `SMTP_*`, a connector credential or outbound grant, `NOTIFICATION_EMAIL`, or a libpq override (`PGHOST`, `PGPORT`, …). `IMS_SKIP_ENV_FILE=1` is set for the children so that `scripts/prisma-dev-db.sh` (behind `npm run validate:db`) does not source the checkout's `.env.local` / `.env` over the rehearsal's `DATABASE_URL`, and `dotenv` is pointed at an empty file so the `dotenv/config` imports in `prisma.config.ts` and `prisma/seed.ts` cannot pull an SMTP host, a connector key or a second database URL out of the checkout's `.env`.
+- **No email, no connectors, no network.** SMTP stays unset, so `provision-instance.mjs` logs that it skipped the provisioning email (the rehearsal asserts that line and the absence of "Provisioning email sent"); no WooCommerce, Mintsoft, Xero or other credential exists in any environment; nothing leaves the loopback interface.
+
+### Exit codes
+
+This table is the only place the codes are documented; `REHEARSAL_EXIT` in `lib/ops/first-install-rehearsal.ts` is its source and `tests/scripts/rehearse-first-install.test.ts` fails if the two disagree.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | GREEN: every required step passed and the teardown left nothing behind. |
+| 1 | RED: a required step failed, was skipped, or threw. The report says which. |
+| 2 | Refused to start: bad arguments, no PostgreSQL server binaries, run as root, or the work directory is on a RAM-backed file system. Nothing was created. |
+| 3 | The teardown could not remove everything it created (cluster, env file, directory or a process). The report names what is left. Takes precedence over RED. |
+
+### The readiness report
+
+Two files per run, `readiness-report.json` and `readiness-report.md`, under `<report-dir>/<run id>/` (the Markdown is also printed). Both are written under temporary names and renamed into place with the JSON last; if either write fails, everything is removed and an amended RED pair is attempted, so no GREEN file ever sits beside a failed one. A run interrupted by SIGINT/SIGTERM is RED even if every step that ran passed. The JSON carries `verdict`, `exitCode`, one entry per step (`id`, `item`, `required`, `status`, `reason`, `detail`) and the `teardown` record; a consumer needs only `verdict === "GREEN"` and, for the detail, `steps[].status`.
+
+| Item | Step | What a PASS means |
+| --- | --- | --- |
+| 1 | `prisma migrate deploy`, `prisma migrate status` | Every migration directory on disk is recorded as applied (the count is in the report) and `migrate status` says the schema is up to date. |
+| 2 | Seeded rows | Exactly one Organisation, `default`, with base currency **GBP** and country GB; the `DEFAULT` warehouse, flagged default and the only one; at least four tax rates including the default `UK Standard Rate (20%)`; the six seeded currencies; one active admin from `provision-instance.mjs`; no SMTP settings. **A non-GBP base currency makes the report RED.** |
+| 3 | `isBaseCurrencyLocked()` | Asked of the application's own code (`scripts/lib/first-install-probe.ts`, run against the throwaway database) after the six tables the lock reads were counted at zero and the `base_currency_locked` setting was found absent: the answer must be `false`. |
+| 4 | `system_identifier` | Read from `pg_control_system()` and recorded, so a later restore or clone can be told apart from the cluster that produced the report. |
+| 5 | `npm run preflight:production` | Exits 0. It checks **infrastructure** readiness only (secrets, URLs, writable directories, the push-state enum); it is not a data check. Warnings are listed in the report. |
+| 6 | `npm run validate:db` | Exits 0, which includes the check that the non-negative and `reservedQty <= quantity` constraints are installed and fire. The concurrency tier inside it is skipped unless `IMS_CONCURRENCY_SCRATCH_DB` is set, and the report says so. |
+| 7 | `npm run invariant-check:preflight` | Exits 0: no critical invariant findings on the freshly provisioned database. |
+| 8 | `npm run outbound:status` | **Optional while `package.json` has no `outbound:status` script** (the step is recorded as skipped, with the reason, and does not make the report RED); **required the moment the script exists**: it is run as `npm run outbound:status -- --json --expect-held`, must exit 0, and its JSON report must list each of woocommerce, mintsoft and xero exactly once with `state` equal to `held` and `anyGranted` false (a granted or unreadable grant, a missing, duplicated or unknown connector fails; the output must contain exactly one JSON report with nothing around it but the npm banner and the `Exit code` line, so two reports or any other text fail; free text is never searched for the word held). |
+| 9 | Restore drill | `pg_dump -Fc` of the installed database, `pg_restore` into a **second** database on the same cluster, then for **every** table of either side the row count and an md5 over the sorted per-row digests must be identical. A table missing from or invented by the restore is a mismatch. A comparison that saw no tables, or only empty ones, fails as vacuous. The report also lists any table whose content changed between provisioning and the dump (informational). It compares the `public` schema's tables; it does not compare sequences, roles or large objects. |
+
+**Every fact a step records is counted, with four deliberate exceptions recorded for information only and never part of a verdict:** the `warnings` of `preflight:production` (they are listed so a human can accept them), `concurrencyTierSkippedInsideValidateDb`, the invariant preflight `summary` line (its exit code is what counts) and `tablesChangedSinceProvisioning`. Anything else in a step's detail (the base-currency table counts and lock-setting row count, the parity counts, the seeded rows, the migration counts) is part of that step's pass condition.
+
+**Report files.** Each run's report directory is created exclusively (mode 700; a pre-existing path of that name, including a planted symlink, refuses the publication) inside a `--report-dir` that must be a real directory owned by the running account and not writable by group or others. Files are created `O_EXCL|O_NOFOLLOW` under random temporary names, fsynced and renamed, Markdown first and the JSON last. **The JSON is the authoritative commit record** and carries `companionMarkdownSha256`; a consumer should treat a report as complete only when that digest matches the Markdown beside it. The two renames are not atomic as a pair: after a crash or power loss a directory can hold a Markdown without a JSON, or `*.tmp` leftovers, and neither is a report.
+
+**Every process the rehearsal launches (none through a shell, none with the caller's environment).** `stat -f` (file-system type of `--root`); the PostgreSQL tools `initdb`, `pg_ctl` (start and stop), `psql`, `openssl` (not used by the rehearsal's own cluster), `pg_dump` and `pg_restore`, under a short whitelist (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR`; the dump and restore add only the `PG*` connection variables of the throwaway cluster); `id -un` for the cluster's bootstrap account; and the step children `prisma`, `tsx`, `node scripts/provision-instance.mjs`, `npm run ...`, which get the step environment described above. PostgreSQL binaries are found by reading `/usr/lib/postgresql` and `PATH` directly, not by running a shell. An exported `BASH_ENV`, `ENV`, `SHELLOPTS`, `PS4`, `LD_PRELOAD` or `NODE_OPTIONS` therefore executes nowhere in the run; a test exports canaries for the first four and proves, with a positive control, that none fires in any phase.
+
+**What the rehearsal trusts on the host, and what it refuses.** `--root` and `--report-dir` are checked, with every ancestor up to `/`: each must be a real directory (never a symlink), owned by root or the running account, and not writable by group or others unless it is a root-owned sticky directory (`/tmp`, `/var/tmp`); otherwise the run is refused (exit 2, nothing created). The `--report-dir` itself must also be owned by the running account and not writable by anyone else. The secret env file is created exclusively and its device and inode recorded; the teardown overwrites it only through a descriptor opened `O_NOFOLLOW|O_NONBLOCK` whose device, inode and creation time still match (inode numbers are reused after a delete, so the number alone is not identity), and otherwise leaves it alone and exits 3 (there is no overwrite-by-path fallback). The report directory's device and inode are re-checked before the first write, before each rename and before the paths are returned; a replaced directory fails the publication (RED, exit 1) and nothing in it is cleaned up. **Residual, accepted:** Node has no directory-descriptor-anchored `openat`, so these are path walks with identity checks, not held handles. A same-host attacker who can already modify an ancestor that passed the check (the account itself, or root) is out of scope; the tool refuses configurations in which any OTHER account could.
+
+A step that does not run because an earlier prerequisite failed (`migrate deploy`, `db:seed`, `provision-instance.mjs`) is recorded as **skipped** and, being required, keeps the report RED. Every step in the catalogue appears in every report, so an aborted run cannot read as green.
+
+### The teardown
+
+It runs in a `finally`, whether a step failed, a step threw, or the cluster never finished starting. A SIGINT or SIGTERM stops the running step, marks the remaining steps skipped and still writes the report (RED, exit 1) and the teardown record; a second signal skips the report and only tears down (exit 3). It stops the cluster, shreds the env file, removes the run directory, and then looks for what is left: any process that was a descendant of the postmaster this run started, and any process whose command line names the run directory. The postmaster is identified from the cluster's own `postmaster.pid` (also when the start itself failed after the fork): it must be a `postgres -D <run dir>` process whose start time matches the pid file's record. It is stopped with `pg_ctl` only after that identity is re-confirmed; there is no unconditional stop and no numeric-pid SIGKILL, and the run directory is not removed while any process still runs from it. Between the identity check and `pg_ctl` the pid file is re-confirmed to still name that pid, directory and start record. **Residual, accepted:** the check and `pg_ctl` remain two acts (there is no pidfd to hand to `pg_ctl`), so a replacement taking the directory in the microseconds after the last read would be stopped; the cluster is on a private port in a directory only this run knows. A postmaster that cannot be stopped that way, or that has been replaced, is left alone; survivors are listed as **orphan PIDs** in the report and turn the exit code to 3.
+
+### How it feeds the go/no-go gate
+
+The go/no-go gate (o3d-zjsb5.18) wants evidence that a fresh install of **this build** provisions cleanly and that a backup taken before any load restores to an identical database. A GREEN report from the commit being deployed is that evidence for items 1–7 and 9; item 8 joins it once the outbound hold exists. Attach the JSON, not a paraphrase of it. The rehearsal does not replace the gate's data checks (the invariant preflight against the **real** database, the reconciliation pack) and says nothing about the real host: `install.sh`, the service account, nginx and the production `.env` are outside it.
 
 ## Updating
 

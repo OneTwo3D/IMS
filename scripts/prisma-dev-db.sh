@@ -4,7 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-if [[ -f ".env.local" ]]; then
+# IMS_SKIP_ENV_FILE=1 leaves the caller's environment alone. The fresh-install rehearsal
+# (scripts/rehearse-first-install.ts) sets it: it must reach its own throwaway cluster, and sourcing
+# a checkout's .env.local / .env here REPLACES the DATABASE_URL it was handed.
+if [[ "${IMS_SKIP_ENV_FILE:-}" == "1" ]]; then
+  :
+elif [[ -f ".env.local" ]]; then
   set -a
   # shellcheck disable=SC1091
   source ".env.local"
