@@ -44,6 +44,7 @@ let wcError: string | null = null
 let statusOrders: Array<Record<string, unknown>> = []
 let fetchOrderStatusImpl: (reference: string) => Promise<unknown> = async () => null
 let resolution: { kind: string; id?: string } = { kind: 'one', id: 'mintsoft' }
+let probeImpl: ((reference: string) => Promise<string>) | null = async () => 'ABSENT'
 
 const orderDb: Record<string, unknown> = {
   setting: { findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { key: where.key, value: settings.get(where.key) } : null), upsert },
@@ -89,7 +90,7 @@ mock.module('@/lib/connectors/wms/registry', {
   namedExports: {
     getWmsConnector: () => ({
       fetchOrderStatus: (reference: string) => fetchOrderStatusImpl(reference),
-      probeOrderPresence: async () => 'ABSENT',
+      ...(probeImpl ? { probeOrderPresence: (reference: string) => probeImpl!(reference) } : {}),
     }),
     getWmsConnectorDef: () => ({ label: 'Mintsoft' }),
   },
@@ -108,6 +109,7 @@ function reset() {
   statusOrders = []
   fetchOrderStatusImpl = async () => null
   resolution = { kind: 'one', id: 'mintsoft' }
+  probeImpl = async () => 'ABSENT'
 }
 
 function wcOrder(id: number) {
@@ -235,4 +237,29 @@ test('[order-status] a skipped run (no single connector) does not advance the st
   console.log(`precondition: ${JSON.stringify(result)}`)
   assert.equal(typeof result.skipped, 'string')
   assert.equal(upserts.includes(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING), false)
+})
+
+test('[order-status] every null fetch the presence probe cannot settle withholds the stamp; settled ones advance it', async () => {
+  const { runWmsOrderStatusSweep } = await import('@/lib/domain/wms/order-status-sweep')
+  const order = (id: string) => ({ id, shoppingLinks: [{ externalOrderNumber: `W-${id}` }], wmsOrderStatus: null })
+  const previous = '2026-10-01T00:00:00.000Z'
+  const cases: Array<{ name: string; probe: ((r: string) => Promise<string>) | null; advances: boolean }> = [
+    { name: 'probe throws', probe: async () => { throw new Error('Mintsoft HTTP 503') }, advances: false },
+    { name: 'connector has no probe', probe: null, advances: false },
+    { name: 'probe finds the order but its status was unreadable', probe: async () => 'FOUND', advances: false },
+    { name: 'probe answers ABSENT (confirmed absent)', probe: async () => 'ABSENT', advances: true },
+    { name: 'probe answers AMBIGUOUS (the warehouse answered)', probe: async () => 'AMBIGUOUS', advances: true },
+  ]
+  for (const c of cases) {
+    reset()
+    settings.set(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING, previous)
+    statusOrders = [order('a')]
+    probeImpl = c.probe
+    const result = await runWmsOrderStatusSweep()
+    const moved = settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING) !== previous
+    console.log(`precondition (${c.name}): result=${JSON.stringify(result)} stampMoved=${moved}`)
+    assert.equal(result.scanned, 1, c.name)
+    assert.equal(result.failed, 0, `${c.name}: the returned counters keep their meaning`)
+    assert.equal(moved, c.advances, c.name)
+  }
 })

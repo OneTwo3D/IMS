@@ -122,6 +122,11 @@ export async function runWmsOrderStatusSweep(
 
   let updated = 0
   let failed = 0
+  // Orders whose read did not RESOLVE even though nothing threw: a null fetch whose presence probe
+  // failed, could not run, or found the order without being able to read its status. They are not
+  // `failed` (the returned counters and the snapshot rows keep their meaning), but the read-sync
+  // last-success stamp is withheld while any exists: the cache is not current for that order.
+  let unresolvedReads = 0
 
   for (const order of orders) {
     const reference = order.shoppingLinks[0]?.externalOrderNumber?.trim()
@@ -162,6 +167,7 @@ export async function runWmsOrderStatusSweep(
           // Keep the existing verdict; nothing to re-resolve.
         } else if (!connector.probeOrderPresence) {
           notFoundReason = 'WMS lookup could not be confirmed — connector cannot probe presence'
+          unresolvedReads += 1
         } else {
           try {
             const presence = await connector.probeOrderPresence(reference)
@@ -169,11 +175,15 @@ export async function runWmsOrderStatusSweep(
             // FOUND after a null fetch is a CONTRADICTION, not ambiguity: the order is there but
             // its status could not be read. Distinct marker so the reason stays truthful, and it
             // blocks for the same reason — the warehouse holds this order.
-            else if (presence === 'FOUND') notFoundReason = WMS_LOOKUP_PRESENT_NO_STATUS
+            else if (presence === 'FOUND') {
+              notFoundReason = WMS_LOOKUP_PRESENT_NO_STATUS
+              unresolvedReads += 1
+            }
           } catch (probeError) {
             notFoundReason = `WMS presence probe failed: ${
               probeError instanceof Error ? probeError.message : String(probeError)
             }`
+            unresolvedReads += 1
           }
         }
       }
@@ -281,11 +291,14 @@ export async function runWmsOrderStatusSweep(
 
   // The LAST-SUCCESS stamp (read-sync liveness). Reached only by a run that resolved a connector and a
   // lookup source (every skip above returned before here) and read every order it selected without an
-  // error: `failed` counts a lookup or snapshot write that threw. A run that selected no orders because
+  // error AND resolved every read: `failed` counts a lookup or snapshot write that threw, and
+  // `unresolvedReads` counts a null fetch that the presence probe could not settle (probe threw, no
+  // probe on the connector, or the order is present but its status unreadable). An AMBIGUOUS answer and a
+  // confirmed absence ARE answers from the warehouse and count. A run that selected no orders because
   // none were stale counts - that is a sweep that legitimately found nothing to refresh. A run with any
   // failure does not, so one order that keeps failing keeps the stamp from advancing, which is the
   // honest reading: the cache is not being kept current for it.
-  if (failed === 0) {
+  if (failed === 0 && unresolvedReads === 0) {
     const stampedAt = new Date().toISOString()
     await db.setting.upsert({
       where: { key: WMS_ORDER_STATUS_LAST_SUCCESS_SETTING },

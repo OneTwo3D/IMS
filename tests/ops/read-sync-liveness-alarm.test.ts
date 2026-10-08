@@ -36,6 +36,11 @@ class Harness {
   delivered: Array<{ title: string; message: string; actionUrl: string }> = []
   warnings: Array<{ stream: ReadSyncStreamId; description: string }> = []
   failDelivery = false
+  failActivityWrite = false
+  /** Called inside the claim transaction after the claim won and before delivery: lets a test interleave a rival run. */
+  afterClaim: (() => Promise<void>) | null = null
+  private pendingDelivered: Harness['delivered'] = []
+  private pendingWarnings: Harness['warnings'] = []
   /** The inputs as they stand at a given clock: fresh feeds stay 30 minutes old however far the clock moves. */
   build: (at: Date) => ReadSyncInputs
 
@@ -55,14 +60,33 @@ class Harness {
     },
     $transaction: async <T>(fn: (tx: ReadSyncAlarmTx) => Promise<T>) => {
       const snapshot = new Map(this.settings)
+      this.pendingDelivered = []
+      this.pendingWarnings = []
       const tx: ReadSyncAlarmTx = {
-        setting: { upsert: async ({ where, create, update }) => { this.settings.set(where.key, this.settings.has(where.key) ? update.value : create.value) } },
+        setting: {
+          createMany: async ({ data }) => {
+            let count = 0
+            for (const row of data) if (!this.settings.has(row.key)) { this.settings.set(row.key, row.value); count += 1 }
+            return { count }
+          },
+          updateMany: async ({ where, data }) => {
+            if (this.settings.get(where.key) !== where.value) return { count: 0 }
+            this.settings.set(where.key, data.value)
+            return { count: 1 }
+          },
+        },
       }
       try {
-        return await fn(tx)
+        const value = await fn(tx)
+        this.delivered.push(...this.pendingDelivered)
+        this.warnings.push(...this.pendingWarnings)
+        return value
       } catch (error) {
         this.settings = snapshot
         throw error
+      } finally {
+        this.pendingDelivered = []
+        this.pendingWarnings = []
       }
     },
   }
@@ -74,9 +98,13 @@ class Harness {
       readInputs: async () => this.build(now),
       notifyAdmins: async (_tx, title, message, actionUrl) => {
         if (this.failDelivery) throw new Error('no active ADMIN users to notify')
-        this.delivered.push({ title, message, actionUrl })
+        this.pendingDelivered.push({ title, message, actionUrl })
+        if (this.afterClaim) await this.afterClaim()
       },
-      logWarning: async (entry) => { this.warnings.push({ stream: entry.stream, description: entry.description }) },
+      logWarning: async (_tx, entry) => {
+        if (this.failActivityWrite) throw new Error('activity_logs insert failed')
+        this.pendingWarnings.push({ stream: entry.stream, description: entry.description })
+      },
     })
   }
 }
@@ -204,4 +232,55 @@ test('a feed that is switched off is not alarmed, and forgets an earlier breach'
   harness.build = (at) => inputs({ xeroConnected: false }, { 'xero-tax-rates': ago(100 * HOUR) }, at)
   assert.deepEqual((await harness.run(new Date(NOW.getTime() + HOUR))).alerted, [])
   assert.equal(harness.settings.has(readSyncAlertedSettingKey('xero-tax-rates')), false)
+})
+
+test('[claim] a run that lost the claim to a rival delivers nothing (conditional write, not read-then-write)', async () => {
+  // Two runs read the same "no breach recorded" state; the rival's transaction commits its claim between
+  // this run's read and this run's claim. Without a conditional claim both would deliver.
+  const harness = new Harness((at) => inputs({}, { 'xero-tax-rates': ago(100 * HOUR) }, at))
+  const key = readSyncAlertedSettingKey('xero-tax-rates')
+  const stale = `stale:${ago(100 * HOUR).toISOString()}`
+  const realFindMany = harness.db.setting.findMany
+  harness.db.setting.findMany = async (args) => {
+    const rows = await realFindMany(args)
+    // The rival commits its claim AFTER this run has read the (empty) state.
+    harness.settings.set(key, stale)
+    return rows
+  }
+  const result = await harness.run()
+  console.log(`precondition: rival row=${harness.settings.get(key)} delivered=${harness.delivered.length} alerted=${JSON.stringify(result.alerted)}`)
+  assert.deepEqual(result.alerted, [])
+  assert.equal(harness.delivered.length, 0, 'the loser delivers nothing')
+  assert.equal(harness.warnings.length, 0)
+  assert.equal(result.status, 'SUCCEEDED')
+
+  // The same race over an UPDATE (a renewed breach): the rival moved the row between read and claim.
+  const h2 = new Harness((at) => inputs({}, { 'xero-tax-rates': ago(100 * HOUR) }, at))
+  h2.settings.set(key, 'stale:2026-01-01T00:00:00.000Z')
+  const read2 = h2.db.setting.findMany
+  h2.db.setting.findMany = async (args) => {
+    const rows = await read2(args)
+    h2.settings.set(key, stale)
+    return rows
+  }
+  const r2 = await h2.run()
+  assert.deepEqual(r2.alerted, [])
+  assert.equal(h2.delivered.length, 0)
+})
+
+test('[activity] a failed activity write rolls the claim back with the notification: the breach is retried, not lost', async () => {
+  const harness = new Harness((at) => inputs({}, { 'mintsoft-dispatch-poll': ago(100 * HOUR) }, at))
+  harness.failActivityWrite = true
+  const failed = await harness.run()
+  console.log(`precondition: status=${failed.status} delivered=${harness.delivered.length} stamp=${harness.settings.get(readSyncAlertedSettingKey('mintsoft-dispatch-poll'))}`)
+  assert.equal(failed.status, 'FAILED')
+  assert.equal(harness.delivered.length, 0, 'the notification rolled back with the claim')
+  assert.equal(harness.settings.has(readSyncAlertedSettingKey('mintsoft-dispatch-poll')), false)
+
+  harness.failActivityWrite = false
+  const retried = await harness.run(new Date(NOW.getTime() + HOUR))
+  assert.equal(retried.status, 'SUCCEEDED')
+  assert.deepEqual(retried.alerted, ['mintsoft-dispatch-poll'])
+  assert.equal(harness.delivered.length, 1)
+  assert.equal(harness.warnings.length, 1)
 })

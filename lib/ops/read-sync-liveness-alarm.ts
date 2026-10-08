@@ -30,16 +30,26 @@ import {
 import { parseReadSyncStamp } from './read-sync-liveness'
 import { assembleReadSyncReport, type ReadSyncInputs } from './read-sync-status'
 
+export type ReadSyncAlarmLogEntry = {
+  stream: ReadSyncStreamId
+  title: string
+  description: string
+  metadata: Record<string, unknown>
+}
+
 export type ReadSyncAlarmTx = {
   setting: {
-    upsert(args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }): Promise<unknown>
+    /** Insert-if-absent: `count` is 1 only for the transaction whose insert took effect. */
+    createMany(args: { data: Array<{ key: string; value: string }>; skipDuplicates: true }): Promise<{ count: number }>
+    /** Conditional write: `count` is 1 only if the row still held `where.value` when this transaction took its lock. */
+    updateMany(args: { where: { key: string; value: string }; data: { value: string } }): Promise<{ count: number }>
   }
 }
 
 export type ReadSyncAlarmDb = {
   setting: {
     findMany(args: { where: { key: { in: string[] } }; select: { key: true; value: true } }): Promise<Array<{ key: string; value: string }>>
-    upsert: ReadSyncAlarmTx['setting']['upsert']
+    upsert(args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }): Promise<unknown>
     deleteMany(args: { where: { key: string } }): Promise<unknown>
   }
   $transaction<T>(fn: (tx: ReadSyncAlarmTx) => Promise<T>): Promise<T>
@@ -51,7 +61,8 @@ export type ReadSyncAlarmDeps = {
   readInputs: () => Promise<ReadSyncInputs>
   /** Deliver to every active admin inside the claim transaction; must THROW when nobody can be told. */
   notifyAdmins: (tx: ReadSyncAlarmTx, title: string, message: string, actionUrl: string) => Promise<void>
-  logWarning: (entry: { stream: ReadSyncStreamId; title: string; description: string; metadata: Record<string, unknown> }) => Promise<void>
+  /** Write the WARNING activity entry INSIDE the claim transaction; must THROW if it cannot, so the claim rolls back and the breach is retried. */
+  logWarning: (tx: ReadSyncAlarmTx, entry: ReadSyncAlarmLogEntry) => Promise<void>
 }
 
 export type ReadSyncAlarmResult = {
@@ -111,22 +122,7 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
       trackedSince: trackedSince.toISOString(),
       futureTimestamp: entry.futureTimestamp,
     })
-    try {
-      await db.$transaction(async (tx) => {
-        await tx.setting.upsert({
-          where: { key: stampKey },
-          create: { key: stampKey, value: breachKey },
-          update: { value: breachKey },
-        })
-        await deps.notifyAdmins(tx, alert.title, alert.message, '/sync')
-      })
-    } catch (error) {
-      deliveryFailures += 1
-      console.error(`[read-sync-liveness] alert delivery failed for ${entry.stream}:`, error)
-      continue
-    }
-    alerted.push(entry.stream)
-    await deps.logWarning({
+    const logEntry: ReadSyncAlarmLogEntry = {
       stream: entry.stream,
       title: alert.title,
       description: alert.message,
@@ -138,7 +134,30 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
         maxAgeMs,
         trackedSince: trackedSince.toISOString(),
       },
-    })
+    }
+    // CLAIM, DELIVER AND RECORD IN ONE TRANSACTION, AND DELIVER ONLY IF THIS TRANSACTION WON THE CLAIM.
+    // The claim is a conditional write against the value read above: an insert-if-absent when no breach
+    // was recorded, otherwise an update that matches only if the row still holds what was read. Two runs
+    // of the job racing over the same breach take the row's lock in turn; the second finds the first's
+    // value (or its row) and its write matches nothing, so it delivers nothing. The activity entry is
+    // written in the same transaction, so a failed write rolls the claim back and the breach is retried
+    // rather than being marked alerted with no record of it.
+    const prior = stored.get(stampKey)
+    try {
+      const won = await db.$transaction(async (tx) => {
+        const claimed = prior === undefined
+          ? await tx.setting.createMany({ data: [{ key: stampKey, value: breachKey }], skipDuplicates: true })
+          : await tx.setting.updateMany({ where: { key: stampKey, value: prior }, data: { value: breachKey } })
+        if (claimed.count !== 1) return false
+        await deps.notifyAdmins(tx, alert.title, alert.message, '/sync')
+        await deps.logWarning(tx, logEntry)
+        return true
+      })
+      if (won) alerted.push(entry.stream)
+    } catch (error) {
+      deliveryFailures += 1
+      console.error(`[read-sync-liveness] alert delivery failed for ${entry.stream}:`, error)
+    }
   }
 
   if (deliveryFailures > 0) {
@@ -150,7 +169,6 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
 /** The real wiring: the shared database, the watchdog's own delivery, the activity log. */
 export async function runReadSyncLivenessAlarmLive(now: Date = new Date()): Promise<ReadSyncAlarmResult> {
   const { db } = await import('@/lib/db')
-  const { logActivity } = await import('@/lib/activity-log')
   const { notifyActiveAdmins } = await import('@/lib/domain/wms/watchdog-sweep')
   const { readReadSyncInputs } = await import('./read-sync-status')
   return runReadSyncLivenessAlarm({
@@ -158,15 +176,19 @@ export async function runReadSyncLivenessAlarmLive(now: Date = new Date()): Prom
     now,
     readInputs: readReadSyncInputs,
     notifyAdmins: (tx, title, message, actionUrl) => notifyActiveAdmins(tx as never, title, message, actionUrl),
-    logWarning: async (entry) => {
-      await logActivity({
-        entityType: 'SYNC',
-        action: READ_SYNC_ALERT_ACTION,
-        tag: 'sync',
-        level: 'WARNING',
-        description: entry.description,
-        metadata: entry.metadata as never,
-        resolveUser: false,
+    logWarning: async (tx, entry) => {
+      // Not logActivity(): that swallows its own failures, and a swallowed failure here would mark the
+      // breach alerted with nothing recorded. Same redaction, written on the claim's transaction.
+      const { redactActivityLogText, sanitizeActivityLogMetadata } = await import('@/lib/activity-log')
+      await (tx as unknown as { activityLog: { create(args: unknown): Promise<unknown> } }).activityLog.create({
+        data: {
+          entityType: 'SYNC',
+          action: READ_SYNC_ALERT_ACTION,
+          tag: 'sync',
+          level: 'WARNING',
+          description: redactActivityLogText(entry.description),
+          metadata: sanitizeActivityLogMetadata(entry.metadata),
+        },
       })
     },
   })

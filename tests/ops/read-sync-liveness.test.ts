@@ -20,6 +20,7 @@ import {
 } from '../../lib/ops/read-sync-liveness-constants.ts'
 import {
   assembleReadSyncReport,
+  scheduledSlugsIn,
   readSyncStatusExitCode,
   renderReadSyncStatusText,
   type ReadSyncInputs,
@@ -47,6 +48,7 @@ function allOnInputs(overrides: Partial<ReadSyncInputs> = {}): ReadSyncInputs {
   }
   const cronEnabled: Record<string, boolean> = {}
   for (const def of READ_SYNC_STREAMS) if (def.cronSlug) cronEnabled[def.cronSlug] = true
+  cronEnabled['read-sync-liveness'] = true
   return {
     settings,
     pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
@@ -228,9 +230,9 @@ test('one entry per active binding, each judged on its own cadence', () => {
 test('exit-code table: unique codes, every name used by the code, array order is precedence', async () => {
   const codes = READ_SYNC_STATUS_EXIT_CODES.map((row) => row.code)
   assert.equal(new Set(codes).size, codes.length)
-  assert.deepEqual([...codes].sort(), [0, 1, 2, 3, 4, 5])
+  assert.deepEqual([...codes].sort(), [0, 1, 2, 3, 4, 5, 6])
   const names = READ_SYNC_STATUS_EXIT_CODES.map((row) => row.name)
-  assert.deepEqual(names.slice(0, 5), ['failed', 'usage', 'stale', 'never', 'off'])
+  assert.deepEqual(names.slice(0, 6), ['failed', 'usage', 'stale', 'unscheduled', 'never', 'off'])
   assert.equal(names[names.length - 1], 'ok')
 })
 
@@ -277,4 +279,55 @@ test('alert text says only what the stamp shows, names no unconditional action, 
   assert.equal(texts, READ_SYNC_STREAM_IDS.length * 2)
   const future = buildReadSyncAlert({ stream: 'xero-tax-rates', state: 'stale', lastSuccessAt: '2027-01-01T00:00:00.000Z', maxAgeMs: 6 * HOUR, trackedSince: null, futureTimestamp: true })
   assert.match(future.message, /later than the clock/)
+})
+
+const BLOCK_START = '# --- OTI CRON START ---'
+const BLOCK_END = '# --- OTI CRON END ---'
+function crontabWith(slugs: string[], extra: string[] = []): string {
+  return [BLOCK_START, '# Managed by One Two Inventory', 'BASE_URL="http://localhost:3000/api/cron"', '',
+    ...slugs.flatMap((slug) => [`# ${slug}`, `0 * * * *  curl -sf -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${slug}" >> '/var/log/x' 2>&1`, '']),
+    BLOCK_END, ...extra, ''].join('\n')
+}
+const NEEDED = ['read-sync-liveness', 'wc-reconcile', 'wms-order-status', 'account-balance-snapshot', 'xero-tax-rate-drift', 'mintsoft-stock-sync']
+
+test('[scheduler] an enabled alarm job with no crontab entry is reported, and exits 6', () => {
+  const base = allOnInputs()
+  const missing = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: crontabWith(NEEDED.filter((slug) => slug !== 'read-sync-liveness')) } }, NOW)
+  console.log(`precondition: scheduler=${JSON.stringify(missing.scheduler)} counts=${JSON.stringify(missing.counts)}`)
+  assert.deepEqual(missing.scheduler.unscheduled, ['read-sync-liveness'])
+  assert.equal(missing.counts.fresh, missing.entries.length, 'every feed is fresh: only the scheduler is wrong')
+  assert.equal(readSyncStatusExitCode(missing), 6)
+  assert.match(renderReadSyncStatusText(missing), /UNSCHEDULED: read-sync-liveness is enabled but not in the managed crontab/)
+  assert.doesNotMatch(renderReadSyncStatusText(missing), /^CURRENT:/)
+
+  const all = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: crontabWith(NEEDED) } }, NOW)
+  assert.deepEqual(all.scheduler, { examined: true, unreadable: null, unscheduled: [] })
+  assert.equal(readSyncStatusExitCode(all), 0)
+})
+
+test('[scheduler] a stream job that is enabled but unscheduled counts; a disabled one does not; a commented or unmanaged line is not a schedule', () => {
+  const base = allOnInputs()
+  const noWc = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: crontabWith(NEEDED.filter((slug) => slug !== 'wc-reconcile')) } }, NOW)
+  assert.deepEqual(noWc.scheduler.unscheduled, ['wc-reconcile'])
+  const disabled = assembleReadSyncReport({ ...base, cronEnabled: { ...base.cronEnabled, 'wc-reconcile': false }, crontab: { resolved: true, text: crontabWith(NEEDED.filter((slug) => slug !== 'wc-reconcile')) } }, NOW)
+  assert.deepEqual(disabled.scheduler.unscheduled, [])
+  const commented = [BLOCK_START, '# 0 * * * *  curl "$BASE_URL/read-sync-liveness"', BLOCK_END].join('\n')
+  assert.equal(scheduledSlugsIn(commented).has('read-sync-liveness'), false)
+  const outside = `0 * * * * curl "$BASE_URL/read-sync-liveness"\n${crontabWith([])}`
+  assert.equal(scheduledSlugsIn(outside).has('read-sync-liveness'), false)
+  assert.equal(scheduledSlugsIn(crontabWith(['a-b', 'c'])).size, 2)
+})
+
+test('[scheduler] an unreadable crontab is not a pass; precedence is stale > unscheduled > never > off', () => {
+  const base = allOnInputs()
+  const unreadable = assembleReadSyncReport({ ...base, crontab: { resolved: false, reason: 'crontab -l timed out' } }, NOW)
+  assert.equal(readSyncStatusExitCode(unreadable), 6)
+  assert.match(renderReadSyncStatusText(unreadable), /SCHEDULER NOT CHECKED: .*timed out/)
+
+  const noStamp = new Map(base.settings); noStamp.delete('xero_balance_snapshot_last_success_at')
+  const unscheduledAndNever = assembleReadSyncReport({ ...base, settings: noStamp, crontab: { resolved: true, text: crontabWith([]) } }, NOW)
+  assert.ok(unscheduledAndNever.counts.never > 0 && unscheduledAndNever.scheduler.unscheduled.length > 0)
+  assert.equal(readSyncStatusExitCode(unscheduledAndNever), 6)
+  const staleToo = assembleReadSyncReport({ ...base, lastDispatchSuccessAt: ago(5 * HOUR), crontab: { resolved: true, text: crontabWith([]) } }, NOW)
+  assert.equal(readSyncStatusExitCode(staleToo), 1)
 })

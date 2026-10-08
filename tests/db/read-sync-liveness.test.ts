@@ -105,7 +105,10 @@ test('the alarm fires against real tables: stamp and notification commit togethe
       now: new Date(),
       readInputs: async () => inputs,
       notifyAdmins: (inner, title, message, actionUrl) => notifyActiveAdmins(inner as never, title, message, actionUrl),
-      logWarning: async (entry) => { warnings.push(entry.description) },
+      logWarning: async (inner, entry) => {
+        warnings.push(entry.description)
+        await (inner as Tx).activityLog.create({ data: { entityType: 'SYNC', action: 'read_sync_stream_stale', tag: 'sync', level: 'WARNING', description: entry.description } })
+      },
     })
     const mine = await tx.notification.findMany({ where: { userId: admin.id }, select: { title: true, message: true, type: true, actionUrl: true } })
     const stamp = await tx.setting.findUnique({ where: { key: readSyncAlertedSettingKey('xero-tax-rates') } })
