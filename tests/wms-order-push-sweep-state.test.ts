@@ -120,6 +120,9 @@ function makePort(seed: Seed) {
   const guardMisses: Array<{ id: string; fromState: string; actual: string }> = []
   const events: WmsMutationEventInput[] = []
   const claims: string[] = []
+  const ownedWrites: Array<{ orderId: string; data: Record<string, unknown> }> = []
+  // The create dispatch stamp as the real link row carries it, so interleavings can be driven against it.
+  const link: { state: string; lastAttemptAt: Date | null } = { state: 'PENDING_CREATE', lastAttemptAt: null }
   const port: WmsOrderPushPort = {
     activeBindings: async () => seed.bindings ?? BINDINGS,
     releasableHeldOrders: async () => seed.releasable ?? [],
@@ -129,8 +132,9 @@ function makePort(seed: Seed) {
       validationFailures.push({ orderId, connector, error, attemptedAt })
       return seed.recordValidationFailure ? seed.recordValidationFailure(orderId) : true
     },
-    claimForCreate: async (orderId) => {
+    claimForCreate: async (orderId, _connector, attemptedAt) => {
       claims.push(orderId)
+      link.lastAttemptAt = attemptedAt
       // o3d-2k5r r4: the port now answers with an OUTCOME, because a boolean could not express
       // "an expired claim was parked". A seed that says false still means "another worker owns
       // this" — the park has its own suite (wms-create-claim-crash-recovery.test.ts).
@@ -143,9 +147,18 @@ function makePort(seed: Seed) {
     cancellableLinks: async () => seed.cancellable ?? [],
     upsertByOrder: async (orderId, create, update) => {
       upserts.push({ orderId, create, update })
+      if ('lastAttemptAt' in update) link.lastAttemptAt = (update.lastAttemptAt as Date | null | undefined) ?? null
       if (seed.failLinkWrites) throw new Error('worker died before the writeback')
     },
     updateLink: async (id, data) => { updates.push({ id, data }) },
+    updateLinkIfCreateClaimOwned: async (orderId, stamp, data) => {
+      // The CAS the Prisma port implements: applies only while the link is PENDING_CREATE and still
+      // carries EXACTLY the stamp this worker wrote at claim time.
+      if (link.state !== 'PENDING_CREATE' || link.lastAttemptAt?.getTime() !== stamp.getTime()) return false
+      ownedWrites.push({ orderId, data })
+      if ('lastAttemptAt' in data) link.lastAttemptAt = (data.lastAttemptAt as Date | null | undefined) ?? null
+      return true
+    },
     updateLinkIfState: async (id, fromState, data) => {
       // The CAS, modelled the way the Prisma port implements it: the write applies only if the
       // link is STILL in `fromState` at the moment it lands. `stateAtWrite` is how a test says
@@ -157,7 +170,7 @@ function makePort(seed: Seed) {
     },
     recordEvent: async (event) => { events.push(event) },
   }
-  return { port, upserts, updates, events, claims, validationFailures, guardMisses }
+  return { port, upserts, updates, events, claims, validationFailures, guardMisses, link, ownedWrites }
 }
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
@@ -310,6 +323,41 @@ test('create: the 5th consecutive failure dead-letters', async () => {
   assert.equal(r.failed, 0)
   assert.equal(upserts[0].update.state, 'DEAD_LETTER')
   assert.equal(upserts[0].update.attempts, 5)
+})
+
+test('outbound-write hold: a HELD create spends no attempt and never dead-letters, even as the 5th failure; an ordinary one still does', async () => {
+  const { outboundWriteRefusal, OutboundWriteHeldError } = await import('../lib/security/outbound-write-grant')
+  const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'https://api.mintsoft.co.uk/api/Order', writeScopeId: '89', env: {} })
+  assert.ok(refusal, 'precondition: the real refusal path refused the create')
+  // mintsoftRequest turns the hold into a returned error and createOrder rethrows it as a plain Error.
+  const heldText = new OutboundWriteHeldError(refusal, 0).message
+  console.log('precondition (held create): order is on its 5th attempt (pushAttempts 4), where an ordinary failure dead-letters')
+
+  const held = connector({ pushOrder: async () => { throw new Error(heldText) } })
+  const heldPort = makePort({ createCandidates: [candidate({ pushAttempts: 4 })] })
+  const heldResult = await runWmsOrderPushSweepCore(held, 'mintsoft', heldPort.port, { now: NOW })
+  assert.equal(heldResult.deadLettered, 0)
+  assert.equal(heldResult.failed, 1)
+  assert.equal(heldPort.ownedWrites.length, 1, 'the held write went through the claim-owned compare-and-set')
+  assert.equal(heldPort.ownedWrites[0].data.state, 'PENDING_CREATE')
+  assert.equal(heldPort.ownedWrites[0].data.attempts, 4, 'no attempt was spent')
+  assert.match(String(heldPort.ownedWrites[0].data.lastError), /Outbound write HELD/)
+  // THE DISPATCH STAMP: lastAttemptAt is what makes a later sweep park the link AMBIGUOUS_CREATE. A proven
+  // pre-send hold sent nothing, so it must leave none, and the link must be claimable again after the lease.
+  const { decideCreateClaim } = await import('../lib/domain/wms/order-push-sweep')
+  const later = new Date(NOW().getTime() + 60 * 60 * 1000) // an hour: well past the 5-minute create lease
+  assert.equal(heldPort.upserts.length, 0, 'and no unconditional upsert was made')
+  assert.equal(heldPort.link.lastAttemptAt, null, 'a held create leaves no dispatch stamp')
+  assert.equal(decideCreateClaim({ state: heldPort.link.state, lastAttemptAt: heldPort.link.lastAttemptAt }, later), 'CLAIM', 'a later sweep, after the lease and after a grant, offers it for create again')
+
+  const ordinary = connector({ pushOrder: async () => { throw new Error('still down') } })
+  const controlPort = makePort({ createCandidates: [candidate({ pushAttempts: 4 })] })
+  const controlResult = await runWmsOrderPushSweepCore(ordinary, 'mintsoft', controlPort.port, { now: NOW })
+  assert.equal(controlResult.deadLettered, 1, 'the control: the same order with an ordinary failure dead-letters')
+  const stamped = makePort({ createCandidates: [candidate({ pushAttempts: 1 })] })
+  await runWmsOrderPushSweepCore(ordinary, 'mintsoft', stamped.port, { now: NOW })
+  assert.ok(stamped.upserts[0].update.lastAttemptAt instanceof Date, 'control: an ordinary failure keeps the stamp')
+  assert.equal(decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: stamped.upserts[0].update.lastAttemptAt as Date }, later), 'PARK_AMBIGUOUS', 'control: and a later sweep parks it ambiguous, which is the path the hold must not take')
 })
 
 test('o3d-92fu create: a line with no SKU parks VALIDATION_FAILED — no claim, no remote call, no dead letter', async () => {
@@ -1349,4 +1397,38 @@ test('[o3d-bjc.8] a create that succeeds after failures gets a FULL verification
   )
   assert.equal(upserts[0].update.attempts, 0)
   assert.equal(upserts[0].create.attempts, 0)
+})
+
+test('outbound-write hold (interleaving): a LATE held worker does not erase a NEWER worker claim stamp', async () => {
+  const { outboundWriteRefusal, OutboundWriteHeldError } = await import('../lib/security/outbound-write-grant')
+  const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'https://api.mintsoft.co.uk/api/Order', writeScopeId: '89', env: {} })
+  assert.ok(refusal)
+  const heldText = new OutboundWriteHeldError(refusal, 0).message
+  const newerStamp = new Date(NOW().getTime() + 10 * 60 * 1000)
+  const slot: { port?: ReturnType<typeof makePort> } = {}
+  // Worker A claimed at NOW, is waiting inside pushOrder; its claim lapses and worker B re-claims (stamp
+  // newerStamp) BEFORE A's hold surfaces. Driven by the connector double, no sleeps.
+  const lateHeld = connector({ pushOrder: async () => { slot.port!.link.lastAttemptAt = newerStamp; throw new Error(heldText) } })
+  slot.port = makePort({ createCandidates: [candidate({ pushAttempts: 2 })] })
+  console.log('precondition (late held worker): A stamped NOW; B re-claims with a newer stamp while A is inside pushOrder; A then fails with a hop-0 hold')
+  const r = await runWmsOrderPushSweepCore(lateHeld, 'mintsoft', slot.port.port, { now: NOW })
+  assert.equal(r.deadLettered, 0)
+  assert.equal(slot.port.link.lastAttemptAt?.getTime(), newerStamp.getTime(), "B's claim stamp survives A's late hold")
+  assert.equal(slot.port.ownedWrites.length, 0, 'A wrote nothing: it no longer owns the claim')
+  assert.equal(slot.port.upserts.length, 0)
+})
+
+test('outbound-write hold (interleaving): a hold that FOLLOWS a create that was processed (courier-fallback PUT) leaves the stamp (maybe-sent)', async () => {
+  const { outboundWriteRefusal, OutboundWriteHeldError, } = await import('../lib/security/outbound-write-grant')
+  const { outboundTextAfterEarlierSend } = await import('../lib/security/outbound-write-hold-constants')
+  const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'POST', url: 'https://api.mintsoft.co.uk/api/Auth', writeScopeId: '89', env: {} })
+  assert.ok(refusal)
+  const afterSend = outboundTextAfterEarlierSend(new OutboundWriteHeldError(refusal, 0).message, 'Mintsoft')
+  console.log('precondition (maybe-sent hold): the connector reports a hold that came AFTER its first PUT was processed and answered (the courier-fallback second PUT is held)')
+  const port = makePort({ createCandidates: [candidate({ pushAttempts: 1 })] })
+  const r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { throw new Error(afterSend) } }), 'mintsoft', port.port, { now: NOW })
+  assert.equal(port.ownedWrites.length, 0, 'the stamp is not cleared')
+  assert.ok(port.link.lastAttemptAt instanceof Date, 'the dispatch stamp stands: a later sweep parks it ambiguous, never re-PUTs')
+  assert.equal(port.upserts[0].update.attempts, 2, 'it is an ordinary failure: an attempt is spent')
+  assert.equal(r.failed, 1)
 })

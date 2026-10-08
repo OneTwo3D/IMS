@@ -50,10 +50,14 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   // Admin-only note with accounting invoice link
   if (accountingInvoiceUrl) {
     try {
-      await wcPost(`orders/${wcLink.externalOrderId}/notes`, {
+      const noteResult = await wcPost(`orders/${wcLink.externalOrderId}/notes`, {
         note: `Accounting invoice: <a href="${accountingInvoiceUrl}">View Invoice</a>`,
         customer_note: false,
       })
+      // Only a HELD write is turned into a failure here: it did not reach WooCommerce, and reporting
+      // success would let the caller mark the notification done and lose it. (Other returned errors keep
+      // their existing, non-critical handling.)
+      if (noteResult.held) failure = `Failed to add the invoice note to the WooCommerce order: ${noteResult.error}`
     } catch {
       // Non-critical — admin note failure is not logged
     }
@@ -68,7 +72,8 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
 
   if (metaData.length > 0) {
     try {
-      await wcPut(`orders/${wcLink.externalOrderId}`, { meta_data: metaData })
+      const metaResult = await wcPut(`orders/${wcLink.externalOrderId}`, { meta_data: metaData })
+      if (metaResult.held && !failure) failure = `Failed to store invoice metadata on WooCommerce order: ${metaResult.error}`
     } catch (e) {
       await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_order_meta_failed', tag: 'sync', level: 'WARNING',

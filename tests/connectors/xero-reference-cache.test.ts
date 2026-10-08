@@ -1,3 +1,4 @@
+import { grantXeroWrites } from '../helpers/outbound-grants'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -30,7 +31,11 @@ mock.module('@/lib/security/connector-fetch', {
 })
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
-    getAccessToken: async () => (tenantId === null ? null : { accessToken: 'tok', tenantId }),
+    getAccessToken: async () => {
+      if (tenantId === null) return null
+      grantXeroWrites(tenantId)
+      return { accessToken: 'tok', tenantId }
+    },
     // The disconnected branch now asks WHY there is no token, so that an env allow-list block reads as
     // one instead of as a lost token (o3d-9tbz). A double missing this export made the call throw
     // "getStoredTenantBlockReason is not a function" from inside the not-connected path.

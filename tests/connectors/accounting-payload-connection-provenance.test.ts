@@ -1,3 +1,4 @@
+import { grantXeroWrites } from '../helpers/outbound-grants'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -458,8 +459,11 @@ mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
     getGrantedScopes: async () => null,
     getStoredTenantBlockReason: async () => null,
-    getAccessToken: async () =>
-      state.activeTenantId === null ? null : { accessToken: 'access-token', tenantId: state.activeTenantId },
+    getAccessToken: async () => {
+      if (state.activeTenantId === null) return null
+      grantXeroWrites(state.activeTenantId)
+      return { accessToken: 'access-token', tenantId: state.activeTenantId }
+    },
   },
 })
 // MOCKED AT THE WIRE, NOT AT `xeroPost`. The verdict now lives inside the real client, at the last

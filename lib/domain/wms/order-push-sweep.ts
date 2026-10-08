@@ -1,3 +1,4 @@
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -794,6 +795,14 @@ export interface WmsOrderPushPort {
    * taken under the order's row lock.
    */
   updateLinkIfState(id: string, fromState: PushState, data: LinkWrite): Promise<boolean>
+  /**
+   * COMPARE-AND-SET ON THIS WORKER'S OWN CREATE CLAIM. Writes `data` only while the order's link is still
+   * PENDING_CREATE and its `lastAttemptAt` (the create dispatch stamp) is still exactly `stamp`, the value
+   * this worker wrote at claim time. A newer worker's claim carries a different stamp, so the write then
+   * matches nothing and returns false: a late finisher can never erase or overwrite someone else's claim.
+   * Optional: a port without it simply leaves the stamp in place (the safe direction).
+   */
+  updateLinkIfCreateClaimOwned?(orderId: string, stamp: Date, data: LinkWrite): Promise<boolean>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
 }
@@ -1761,15 +1770,32 @@ export async function runWmsOrderPushSweepCore(
           )
         }
       } catch (error) {
-        const attempts = order.pushAttempts + 1
-        const dead = attempts >= MAX_ATTEMPTS
+        // A held write (outbound-write hold) spends no attempt and can never dead-letter: the order did
+        // not fail to push, this installation has not been granted the WMS.
+        const heldByOutboundHold = push === null && isOutboundWriteHeldText(error instanceof Error ? error.message : String(error))
+        const attempts = heldByOutboundHold ? order.pushAttempts : order.pushAttempts + 1
+        const dead = !heldByOutboundHold && attempts >= MAX_ATTEMPTS
         const message = scrubWmsError(error, 'WMS order push failed')
         if (dead) result.deadLettered += 1
         else result.failed += 1
         const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
-        await port
-          .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: ts }, { state, attempts, lastError: message, lastAttemptAt: ts })
-          .catch(() => {})
+        // `lastAttemptAt` IS the create dispatch stamp (decideCreateClaim): a stamped PENDING_CREATE link is
+        // skipped until its lease expires and then parked AMBIGUOUS_CREATE ("a create may have left"). A
+        // PROVEN pre-send hold sent nothing in THIS WHOLE PUSH (the connector converts a hold that follows an
+        // earlier sent request into a maybe-sent text, so it is not recognised here), so it must leave NO
+        // stamp - otherwise the order stops being offered for create even after the destination is granted.
+        // Every other failure keeps the stamp.
+        if (heldByOutboundHold) {
+          // Written ONLY while the link still carries THIS worker's own claim stamp (compare-and-set): if the
+          // claim lapsed and another worker has since re-claimed the order, this late finisher must not erase
+          // that worker's stamp (a lost update that would let a second create go out). If it no longer owns
+          // the claim, or the port cannot compare, NOTHING is written and the stamp stands.
+          await port.updateLinkIfCreateClaimOwned?.(order.id, ts, { state, attempts, lastError: message, lastAttemptAt: null }).catch(() => false)
+        } else {
+          await port
+            .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: ts }, { state, attempts, lastError: message, lastAttemptAt: ts })
+            .catch(() => {})
+        }
         await audit({
           action: 'order_create', outcome: push ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push?.externalOrderId ?? null,
           summary: push
@@ -2668,6 +2694,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async updateLink(id, data) {
       await db.wmsOrderPushLink.update({ where: { id }, data })
+    },
+    async updateLinkIfCreateClaimOwned(orderId, stamp, data) {
+      const { count } = await db.wmsOrderPushLink.updateMany({
+        where: { orderId, state: 'PENDING_CREATE', lastAttemptAt: stamp },
+        data,
+      })
+      return count > 0
     },
     async updateLinkIfState(id, fromState, data) {
       // updateMany, not update: `update` has no way to express a predicate beyond the unique
