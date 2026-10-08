@@ -268,7 +268,15 @@ export async function loadInvoicePdf(orderId: string): Promise<Buffer | null> {
 export async function saveInvoicePdfFile(orderId: string, buffer: Buffer): Promise<string> {
   const filePath = getInvoicePdfPath(orderId)
   await ensureInvoicePdfStorageDir(filePath)
-  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomBytes(8).toString('hex')}.tmp`)
+  // NOT path.join(path.dirname(filePath), ...). `next build` (Turbopack) models a path.join whose first
+  // operand is a call result as "somewhere under the project root" and lists the whole project
+  // directory to find what it might name; on an installed host that listing fails with EACCES on the
+  // root-owned 0700 `.ims-publish` staging directory and panics the build. Measured with a real
+  // `next build` as the application user against such a directory (with the unchanged file the build
+  // panics; with only this expression replaced it completes): a template string builds the same
+  // path without being modelled. A turbopackIgnore comment on these calls does NOT help; it only
+  // applies to import()/require()/Worker expressions. tests/scripts/first-install-blockers.test.ts pins the shape.
+  const tempPath = `${path.dirname(filePath)}${path.sep}.${path.basename(filePath)}.${randomBytes(8).toString('hex')}.tmp`
   // Connector PDFs are idempotently re-fetchable, so atomic rename is enough
   // here; this intentionally does not fsync the directory for crash durability.
   await writeFile(tempPath, buffer)

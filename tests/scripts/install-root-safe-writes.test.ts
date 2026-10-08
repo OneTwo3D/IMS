@@ -7275,6 +7275,7 @@ test('[o3d-secops] the gate is the first line of the run that names any of the t
     'BACKUP_DIR="${DATA_DIR}/backups"',
     'UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"',
     'PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"',
+    'INVOICE_PDF_STORAGE_DIR="${DATA_DIR}/invoice-pdfs"',
     'readonly DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"',
     'DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"',
     'crontab_lock_paths "${CUTOVER_ROOT_DIR}" "${DATA_DIR}"',

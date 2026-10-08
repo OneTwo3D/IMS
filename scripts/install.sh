@@ -710,6 +710,11 @@ readonly LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
 PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
+# Connector-downloaded invoice PDFs. The application falls back to ./data/invoices under its
+# working directory when this is unset, and `npm run preflight:production` REFUSES that fallback
+# (it must be explicit and it must exist), so a stock install has to write the variable and create
+# the directory or it fails its own readiness gate.
+INVOICE_PDF_STORAGE_DIR="${DATA_DIR}/invoice-pdfs"
 # The crontab reconciliation lock is composed from ${CUTOVER_ROOT_DIR} by crontab_lock_paths(),
 # just below the library that defines it — the two components live in scripts/lib/crontab-lock.sh
 # and nowhere else, because deploy.sh and update.sh compose the same path from the same root-owned
@@ -6833,6 +6838,19 @@ release_db_connections() {
   # GRANTS CONNECT back from a record of what was revoked, as the application user and with
   # DEPLOY_ADMIN_DATABASE_URL in its environment; running the checkout's own file for that let the
   # account being released rewrite what "released" means, and report success without doing it.
+  # A FIRST INSTALL RAISED NO FENCE, SO THERE IS NOTHING TO ASK ABOUT (D4 rehearsal, first install).
+  # The only caller that reaches here on a first install is the start step, which used to ask
+  # unconditionally: resolve_fence_script() below REFUSES on a first install by design (nothing was
+  # fenced, so the helper is never executed with the admin credential), the refusal was returned as
+  # a failed release, and every first install died after the migration and the seed with the unit
+  # enabled and not started. The skip is keyed on the SAME flag that makes the resolver refuse -- it
+  # is armed only by first_install_fence_policy(), in the one branch that never raises a fence, and
+  # nothing ever clears it -- so it cannot skip a release on a run that raised one: on every
+  # upgrade, adoption and recovery path the flag is false and the release below runs unchanged.
+  if ${FIRST_INSTALL_NO_CREDENTIALED_FENCE}; then
+    info "This run created the database itself and fenced nothing, so there is no connection fence to lift before the application starts."
+    return 0
+  fi
   local rc=0 fence_script
   fence_script="$(resolve_fence_script)" || { error "Cannot release the connection fence: this run has no fence script it is willing to execute (the reason is printed above), so nothing here can ask the database whether one is standing."; return 1; }
   # THE CHALLENGE, ISSUED BEFORE THE RELEASE RUNS (o3d-secops r31, Codex HIGH 1).
@@ -7527,6 +7545,33 @@ prompt_yn() {
   printf -v "$varname" '%s' "${input,,}"
 }
 
+# NODE_OPTIONS FOR THE BUILD STEP ONLY, AND ONLY THE HEAP CEILING.
+#
+# `next build` runs a TypeScript pass whose heap outgrows Node's default old-space limit
+# (about 2 GB on an 8 GB host): a rehearsal on an 8 GB machine aborted at ~2 GB and again at
+# 3 GB and completed at 5 GB. The build is the only step that needs it, so it is handed to the
+# build and not exported for the whole run. It is a CEILING and not a reservation: a host with
+# less memory fails the build (before anything is stopped) instead of finishing it, which is why
+# docs/installation.md states the memory the build needs.
+#   IMS_BUILD_MAX_OLD_SPACE_MB  overrides the 6144 default (whole megabytes, 1000-999999) and
+#                               replaces a --max-old-space-size already present in NODE_OPTIONS;
+#                               without it, an operator's own --max-old-space-size is left alone.
+# The three entrypoints carry byte-identical copies of this function (a test compares them).
+build_node_options() {
+  local mb="${IMS_BUILD_MAX_OLD_SPACE_MB:-}" current="${NODE_OPTIONS:-}"
+  if [[ -n "${mb}" ]]; then
+    [[ "${mb}" =~ ^[1-9][0-9]{3,5}$ ]] || { echo "IMS_BUILD_MAX_OLD_SPACE_MB must be a whole number of megabytes between 1000 and 999999, not '${mb}'." >&2; return 1; }
+    current="$(printf '%s' "${current}" | sed -E 's/(^| )--max-old-space-size[= ][^ ]*//g')"
+    current="${current#"${current%%[![:space:]]*}"}"
+  elif [[ "${current}" == *--max-old-space-size* ]]; then
+    printf '%s' "${current}"
+    return 0
+  else
+    mb=6144
+  fi
+  printf '%s' "${current:+${current} }--max-old-space-size=${mb}"
+}
+
 # ---------------------------------------------------------------------------
 # 1. Pre-flight checks
 # ---------------------------------------------------------------------------
@@ -7602,6 +7647,10 @@ else
   warn "Neither curl nor wget is installed yet; skipping network pre-flight probe."
 fi
 
+# The build's heap ceiling is validated HERE, before any package, account or directory is touched,
+# because a malformed override found at the build step would be found after all of those.
+BUILD_NODE_OPTIONS="$(build_node_options)" || die "Nothing has been changed."
+
 success "Pre-flight checks passed."
 
 # ---------------------------------------------------------------------------
@@ -7620,6 +7669,13 @@ header "Configuration"
 # SETTINGS_ENCRYPTION_KEY makes every encrypted Setting already in the database
 # permanently undecryptable.
 load_existing_env "${APP_DIR}/.env"
+
+# THE INVOICE PDF DIRECTORY IS WHERE THE PREVIOUS RUN PUT IT. The default assigned among the other
+# path defaults is only the answer for a host with no .env: a re-run that rewrote .env with that
+# default would silently repoint a live installation away from the PDFs it has already stored.
+INVOICE_PDF_STORAGE_DIR="$(existing_env INVOICE_PDF_STORAGE_DIR "${INVOICE_PDF_STORAGE_DIR}")"
+[[ "${INVOICE_PDF_STORAGE_DIR}" == /* && "${INVOICE_PDF_STORAGE_DIR}" != *"/../"* && "${INVOICE_PDF_STORAGE_DIR}" != */.. ]] || die \
+  "INVOICE_PDF_STORAGE_DIR in ${APP_DIR}/.env is '${INVOICE_PDF_STORAGE_DIR}', which is not an absolute path without '..' components. Correct it (or remove the line to use the default under ${DATA_DIR}) and re-run. Nothing has been changed."
 
 echo -e "${YELLOW}Please provide the following configuration values."
 echo -e "Press Enter to accept the default shown in brackets.${RESET}"
@@ -7706,6 +7762,12 @@ prompt DEFAULT_ADMIN_EMAIL "Default admin email (leave blank to skip auto-create
 if [[ -n "${DEFAULT_ADMIN_EMAIL}" ]]; then
   prompt DEFAULT_ADMIN_PASSWORD "Default admin password" "$(openssl rand -base64 18 | tr -d '\n' | cut -c1-20)" "secret"
   prompt NOTIFICATION_EMAIL "Email address to receive the login details" "${DEFAULT_ADMIN_EMAIL}"
+else
+  # No default administrator was asked for. The bootstrap below still runs (it also seeds the
+  # public URL, SMTP and WooCommerce settings) and expands this name under `set -u`, so it is
+  # defined here as empty rather than left to be unbound; an exported value is deliberately
+  # discarded because nothing will create the account it belongs to.
+  DEFAULT_ADMIN_PASSWORD=""
 fi
 
 # THE INSTALLED DATABASE CREDENTIAL, RECOVERED THE WAY REDIS_URL ALREADY WAS (o3d-2sm1.5 r38,
@@ -8108,6 +8170,20 @@ prompt SMTP_FROM_NAME "SMTP from name" "IMS"
 prompt SMTP_FROM_EMAIL "SMTP from email" ""
 prompt SMTP_REPLY_TO  "SMTP reply-to email" ""
 
+# Both are written into .env below, and both are optional: blank leaves the login challenge off
+# (lib/turnstile.ts treats an empty pair as disabled). They are collected HERE, with the rest of
+# the configuration and before the first package, user or directory is touched, because an unset
+# one used to abort the .env write after all of those had already happened.
+echo ""
+info "--- Cloudflare Turnstile on the login page (optional — blank leaves it disabled) ---"
+# A re-run keeps what the previous .env had (Enter accepts it); clearing is an explicit choice --
+# type the word `none` (or export it for --non-interactive) -- because a blank answer used to be
+# indistinguishable from "I did not notice this question" and silently switched the challenge off.
+prompt NEXT_PUBLIC_TURNSTILE_SITE_KEY "Turnstile site key (type none to disable)" "$(existing_env NEXT_PUBLIC_TURNSTILE_SITE_KEY)"
+prompt TURNSTILE_SECRET_KEY           "Turnstile secret key (type none to disable)" "$(existing_env TURNSTILE_SECRET_KEY)" "secret" "$([[ -n "$(existing_env TURNSTILE_SECRET_KEY)" ]] && printf 'kept from the existing .env' || true)"
+[[ "${NEXT_PUBLIC_TURNSTILE_SITE_KEY}" != "none" ]] || NEXT_PUBLIC_TURNSTILE_SITE_KEY=""
+[[ "${TURNSTILE_SECRET_KEY}" != "none" ]] || TURNSTILE_SECRET_KEY=""
+
 echo ""
 info "--- nginx ---"
 prompt_yn CONFIGURE_NGINX "Configure nginx reverse proxy?" "y"
@@ -8398,6 +8474,19 @@ mkdir_service_subdir "${DATA_DIR}" 022 \
   "${UPLOAD_STORAGE_DIR}/quarantine/invoices" \
   "${PUBLIC_UPLOAD_STORAGE_DIR}/branding" \
   "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars"
+# The invoice PDF directory is private to the application account (signed links are the only way
+# to read it): mode 750, owner ${APP_USER}. The state-tree ownership walk below re-asserts the
+# owner and leaves the mode alone.
+if [[ "${INVOICE_PDF_STORAGE_DIR}" == "${DATA_DIR}/"* ]]; then
+  own_service_subdir "${DATA_DIR}" 022 "${INVOICE_PDF_STORAGE_DIR}" "${APP_USER}" 750
+else
+  # A location the operator chose outside the state directory is theirs to provide: root does not
+  # create paths it cannot walk symlink-safely from a root it owns. It must already be there, be a
+  # real directory, and be writable by the application account, or the run stops BEFORE .env is
+  # written (and so before anything points the application at it).
+  { [[ -d "${INVOICE_PDF_STORAGE_DIR}" && ! -L "${INVOICE_PDF_STORAGE_DIR}" ]] && run_as_user "${APP_USER}" test -w "${INVOICE_PDF_STORAGE_DIR}"; } || die \
+    "INVOICE_PDF_STORAGE_DIR is '${INVOICE_PDF_STORAGE_DIR}', outside ${DATA_DIR}. This installer does not create directories there: create it as a real directory (not a symlink) that ${APP_USER} owns, mode 750, then re-run. Nothing has been started."
+fi
 mkdir_service_subdir "${APP_DIR}" 022 "${APP_DIR}/backups"
 
 # AND /tmp/${APP_NAME}/pdf AND /tmp/${APP_NAME}/uploads ARE NOT CREATED AT ALL ANY MORE (o3d-czpy).
@@ -8864,6 +8953,7 @@ TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}
 BACKUP_DIR=${BACKUP_DIR}
 UPLOAD_STORAGE_DIR=${UPLOAD_STORAGE_DIR}
 PUBLIC_UPLOAD_STORAGE_DIR=${PUBLIC_UPLOAD_STORAGE_DIR}
+INVOICE_PDF_STORAGE_DIR=${INVOICE_PDF_STORAGE_DIR}
 FILE_SCAN_MODE=disabled
 FILE_SCAN_COMMAND_ARGV=
 FILE_SCAN_COMMAND=
@@ -9024,7 +9114,7 @@ header "Building Next.js application (existing installation still serving)"
 # "permission denied for database" — the fence working as intended, presenting as a build
 # error.
 build_rc=0
-run_as_user_db \
+NODE_OPTIONS="${BUILD_NODE_OPTIONS}" run_as_user_db \
   npm run build --prefix "${APP_DIR}" || build_rc=$?
 # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The build"
