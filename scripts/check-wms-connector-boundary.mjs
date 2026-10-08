@@ -339,6 +339,10 @@ const ALLOWLIST = [
   // generic transport (lib/security/connector-fetch.ts) carries only a connector-neutral scope id.
   'lib/security/outbound-write-grant.ts',
   'lib/security/outbound-write-hold-constants.ts',
+  // The producer-side hold is the same per-destination registry one step earlier: one live-from variable
+  // per connector, and the ownership map names each connector's operations and incumbents.
+  'lib/security/producer-disposition-constants.ts',
+  'lib/security/writer-ownership-map.ts',
   'lib/ops/outbound-status.ts',
   'lib/integration-plugins.ts',
   // The plugin setting keys, split out of lib/integration-plugins.ts so the full-chain quiesce
