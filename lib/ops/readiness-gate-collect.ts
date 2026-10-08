@@ -33,6 +33,7 @@ import {
   PACK_ITEMS,
   READ_SYNC_STATUS_SCRIPT,
   REQUIRED_CHECK_CONSTRAINTS,
+  normaliseConstraintDefinition,
   REHEARSAL_TRUST_TEXT,
   SCHEMA_STATE_SCRIPTS,
   type PackItemId,
@@ -76,8 +77,8 @@ export type GateDeps = {
   readPackageScripts: () => Record<string, string>
   /** The commit and tree of the checkout the gate runs from. Throws when git cannot say. */
   readBuildIdentity: () => BuildIdentity
-  /** Names of the CHECK constraints that exist and are validated (a read of pg_constraint). */
-  readInstalledConstraints: () => Promise<string[]>
+  /** Every CHECK constraint carrying one of the required NAMES, with its table and schema (a read of pg_constraint). */
+  readInstalledConstraints: () => Promise<ConstraintRow[]>
   /** The newest rehearsal report in `dir`, or a reason there is none. Throws when the directory cannot be read. */
   readNewestRehearsal: (dir: string, now: Date) => RehearsalEvidence | { none: string } | { untrusted: string }
   /** The environment of this process, read only by name. */
@@ -295,6 +296,36 @@ export function assessReconciliationReadiness(readiness: AccountingReconciliatio
 }
 
 // ---------------------------------------------------------------------------------------------
+// CHECK constraints, by name AND table AND definition.
+// ---------------------------------------------------------------------------------------------
+
+export type ConstraintRow = { schema: string; table: string; name: string; validated: boolean; definition: string; currentSchema: string }
+
+/**
+ * Problems with the required CHECK constraints in `rows` (every constraint carrying a required NAME, in any schema).
+ * A same-named constraint on another table or schema is IGNORED, never counted: only a constraint in the application's
+ * schema, on the expected table, validated, whose definition equals the expected one (normalised) satisfies a requirement.
+ */
+export function assessCheckConstraints(rows: readonly ConstraintRow[]): string[] {
+  const problems: string[] = []
+  for (const expected of REQUIRED_CHECK_CONSTRAINTS) {
+    const named = rows.filter((row) => row.name === expected.name)
+    const home = named.filter((row) => row.table === expected.table && row.schema === row.currentSchema)
+    if (home.length === 0) {
+      problems.push(`CHECK constraint ${expected.name} is not installed on ${expected.table}${named.length > 0 ? ` (a constraint of that name exists elsewhere: ${named.map((row) => `${row.schema}.${row.table}`).join(', ')}, which does not count)` : ''}`)
+      continue
+    }
+    if (home.length > 1) { problems.push(`CHECK constraint ${expected.name} on ${expected.table} appears ${home.length} times`); continue }
+    const row = home[0]!
+    if (!row.validated) problems.push(`CHECK constraint ${expected.name} on ${expected.table} is not validated`)
+    if (normaliseConstraintDefinition(row.definition) !== normaliseConstraintDefinition(expected.definition)) {
+      problems.push(`CHECK constraint ${expected.name} on ${expected.table} has the definition ${row.definition}, not the expected ${expected.definition}`)
+    }
+  }
+  return problems
+}
+
+// ---------------------------------------------------------------------------------------------
 // The collection.
 // ---------------------------------------------------------------------------------------------
 
@@ -320,12 +351,10 @@ export async function collectGateResults(options: CollectOptions, deps: GateDeps
       if (run.timedOut || run.exitCode === null) return { kind: 'unreadable', reason: `npm run ${script} did not complete${run.timedOut ? ' within the time allowed' : `: ${tail(run.stderr).slice(-300)}`}` } as CheckResult
       if (run.exitCode !== 0) problems.push(`npm run ${script} exited ${run.exitCode}: ${tail(run.stdout + run.stderr).slice(-400).replace(/\s+/g, ' ')}`)
     }
-    const installed = new Set(await deps.readInstalledConstraints())
-    const missing = REQUIRED_CHECK_CONSTRAINTS.filter((name) => !installed.has(name))
-    if (missing.length > 0) problems.push(`CHECK constraint(s) not installed or not validated: ${missing.join(', ')}`)
+    problems.push(...assessCheckConstraints(await deps.readInstalledConstraints()))
     return problems.length > 0
       ? { kind: 'fail', reasons: problems } as CheckResult
-      : { kind: 'pass', summary: `schema up to date, no drift, ${REQUIRED_CHECK_CONSTRAINTS.length} CHECK constraints installed`, detail: { scripts: [...SCHEMA_STATE_SCRIPTS], constraints: [...REQUIRED_CHECK_CONSTRAINTS] } } as CheckResult
+      : { kind: 'pass', summary: `schema up to date, no drift, ${REQUIRED_CHECK_CONSTRAINTS.length} CHECK constraints on their tables, validated, with their definitions`, detail: { scripts: [...SCHEMA_STATE_SCRIPTS], constraints: [...REQUIRED_CHECK_CONSTRAINTS] } } as CheckResult
   })
 
   // 3. Outbound status.
@@ -404,11 +433,14 @@ export function readPackageScriptsFrom(repoRoot: string): Record<string, string>
   return parsed.scripts
 }
 
-export async function defaultReadInstalledConstraints(): Promise<string[]> {
+export async function defaultReadInstalledConstraints(): Promise<ConstraintRow[]> {
   const { db } = await import('@/lib/db')
-  const names = [...REQUIRED_CHECK_CONSTRAINTS]
-  const rows = await db.$queryRaw<Array<{ conname: string }>>`
-    SELECT c.conname FROM pg_constraint c
-    WHERE c.contype = 'c' AND c.convalidated AND c.conname = ANY(${names}::text[])`
-  return rows.map((row) => row.conname)
+  const names = REQUIRED_CHECK_CONSTRAINTS.map((entry) => entry.name)
+  return db.$queryRaw<ConstraintRow[]>`
+    SELECT n.nspname AS "schema", c.relname AS "table", k.conname AS "name", k.convalidated AS "validated",
+           pg_get_constraintdef(k.oid) AS "definition", current_schema() AS "currentSchema"
+    FROM pg_constraint k
+    JOIN pg_class c ON c.oid = k.conrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE k.contype = 'c' AND k.conname = ANY(${names}::text[])`
 }

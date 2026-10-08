@@ -7,20 +7,22 @@ import test, { after } from 'node:test'
 import { chmodSync } from 'node:fs'
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import {
+  assessCheckConstraints,
   CHILD_ENV_FIXED,
   CHILD_ENV_WHITELIST,
   assessReconciliationReadiness,
   buildChildEnv,
   collectGateResults,
+  type ConstraintRow,
   readNewestRehearsal,
   type ChildSpec,
   type GateDeps,
 } from '../../lib/ops/readiness-gate-collect.ts'
 import { FORBIDDEN_ENV_PATTERNS } from '../../lib/ops/first-install-rehearsal.ts'
-import { READ_SYNC_STATUS_SCRIPT, REQUIRED_CHECK_CONSTRAINTS, REQUIRED_READ_SYNC_STREAMS, SCHEMA_STATE_SCRIPTS } from '../../lib/ops/readiness-gate-constants.ts'
+import { normaliseConstraintDefinition, READ_SYNC_STATUS_SCRIPT, REQUIRED_CHECK_CONSTRAINTS, REQUIRED_READ_SYNC_STREAMS, SCHEMA_STATE_SCRIPTS } from '../../lib/ops/readiness-gate-constants.ts'
 import { decideVerdict } from '../../lib/ops/readiness-gate.ts'
 import type { AccountingReconciliationReadiness } from '../../lib/ops/rollout-readiness.ts'
-import { ALL_CONSTRAINTS, DAY, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal } from '../helpers/readiness-gate-fixtures.ts'
+import { ALL_CONSTRAINTS, DAY, PG_RENDERED, constraintRows, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal } from '../helpers/readiness-gate-fixtures.ts'
 
 /**
  * COLLECTION: every dependency failing is `unreadable`, never silence; the child environment is a
@@ -89,7 +91,7 @@ test('every dependency that throws, rejects or returns garbage becomes NO-GO, ne
     ['a schema script cannot start', { runScript: async () => ({ exitCode: null, stdout: '', stderr: 'ENOENT', timedOut: false }) }, 'schema-state'],
     ['a schema script times out', { runScript: async () => ({ exitCode: null, stdout: '', stderr: '', timedOut: true }) }, 'schema-state'],
     ['a schema script reports drift (exit 1)', { runScript: async () => ({ exitCode: 1, stdout: 'drift', stderr: '', timedOut: false }) }, 'schema-state'],
-    ['a CHECK constraint is not installed', { readInstalledConstraints: async () => REQUIRED_CHECK_CONSTRAINTS.slice(1) as unknown as string[] }, 'schema-state'],
+    ['a CHECK constraint is not installed', { readInstalledConstraints: async () => constraintRows().slice(1) }, 'schema-state'],
     ['the constraint catalogue cannot be read', { readInstalledConstraints: async () => { throw new Error('permission denied') } }, 'schema-state'],
     ['rehearsal dir unreadable', { readNewestRehearsal: () => { throw new Error('EACCES') } }, 'first-install-rehearsal'],
     ['no rehearsal', { readNewestRehearsal: () => ({ none: 'no rehearsal report was found' }) }, 'first-install-rehearsal'],
@@ -115,11 +117,11 @@ test('read-sync liveness is optional until the script exists, then required and 
   const absent = deps()
   assert.equal((await collectGateResults(OPTIONS, absent)).results['read-sync-liveness']!.kind, 'not-available')
   const entry = (stream: string, over: object = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: '2026-10-08T11:00:00.000Z', ageMs: 3600000, maxAgeMs: 259200000, futureTimestamp: false, ...over })
-  const stdout = JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 6, stale: 0, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name)), scheduler: { examined: true, unreadable: null, unscheduled: [] } })
+  const stdout = JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 6, stale: 0, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name)), scheduler: { examined: true, unreadable: null, blockProblem: null, unscheduled: [], disabled: [] } })
   const present = deps({}, { [READ_SYNC_STATUS_SCRIPT]: 'tsx scripts/read-sync-status.ts' })
   present.runScript = async (spec) => { present.spawned.push(spec); return { exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? stdout : '', stderr: '', timedOut: false } }
   assert.equal((await collectGateResults(OPTIONS, present)).results['read-sync-liveness']!.kind, 'pass')
-  const stale = deps({ runScript: async (spec) => ({ exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 0, stale: 6, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name, { state: 'stale' })), scheduler: { examined: true, unreadable: null, unscheduled: [] } }) : '', stderr: '', timedOut: false }) }, { [READ_SYNC_STATUS_SCRIPT]: 'x' })
+  const stale = deps({ runScript: async (spec) => ({ exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 0, stale: 6, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name, { state: 'stale' })), scheduler: { examined: true, unreadable: null, blockProblem: null, unscheduled: [], disabled: [] } }) : '', stderr: '', timedOut: false }) }, { [READ_SYNC_STATUS_SCRIPT]: 'x' })
   assert.equal((await collectGateResults(OPTIONS, stale)).results['read-sync-liveness']!.kind, 'fail')
   const spawnedPresent = present.spawned.map((spec) => `${spec.script}:${spec.silent}`)
   assert.deepEqual(spawnedPresent, [...SCHEMA_STATE_SCRIPTS.map((name) => `${name}:false`), `${READ_SYNC_STATUS_SCRIPT}:true`])
@@ -365,4 +367,54 @@ test('PRISMA_DEV_DB_CONFIRM is passed to the children only if the operator set i
   const withIt = deps({ env: { ...deps().env, PRISMA_DEV_DB_CONFIRM: '1' } })
   await collectGateResults(OPTIONS, withIt)
   assert.equal(withIt.spawned[0]!.env.PRISMA_DEV_DB_CONFIRM, '1')
+})
+
+test('CHECK constraints are verified by NAME + TABLE + SCHEMA + VALIDATED + DEFINITION; a same-named constraint elsewhere is not evidence [mutation: match by name only]', () => {
+  const good = constraintRows()
+  assert.deepEqual(assessCheckConstraints(good), [], 'control: PostgreSQL\'s own renderings of all required constraints satisfy the check')
+  console.log(`precondition: ${good.length} required constraints, control passes`)
+  const without = (name: string) => good.filter((row) => row.name !== name)
+  const mutate = (name: string, change: Partial<ConstraintRow>) => good.map((row) => (row.name === name ? { ...row, ...change } : row))
+  const cases: Array<[string, ConstraintRow[], RegExp]> = [
+    ['missing', without('stock_levels_quantity_nonnegative'), /stock_levels_quantity_nonnegative is not installed on stock_levels/],
+    ['same name on a DIFFERENT table (the original is gone)', mutate('cost_layers_received_nonnegative', { table: 'purchase_orders' }), /exists elsewhere: public\.purchase_orders, which does not count/],
+    ['same name in a DIFFERENT schema', mutate('stock_movements_qty_nonnegative', { schema: 'tenant_b' }), /exists elsewhere: tenant_b\.stock_movements/],
+    ['present but NOT VALID', mutate('stock_levels_reserved_nonnegative', { validated: false }), /is not validated/],
+    ['wrong definition', mutate('cost_layers_remaining_qty_non_negative', { definition: 'CHECK (("remainingQty" >= (-1)::numeric))' }), /has the definition/],
+    ['a weaker definition under the right name', mutate('stock_levels_reserved_qty_lte_quantity', { definition: 'CHECK (true)' }), /has the definition CHECK \(true\)/],
+    ['the right one twice', [...good, good[0]!], /appears 2 times/],
+  ]
+  for (const [label, rows, message] of cases) {
+    const problems = assessCheckConstraints(rows)
+    assert.ok(problems.length > 0, `${label}: must be a problem`)
+    assert.match(problems.join(' | '), message, label)
+  }
+  // The decoy alongside the real one changes nothing; the real one still counts.
+  assert.deepEqual(assessCheckConstraints([...good, { ...good[0]!, table: 'decoy_table' }, { ...good[1]!, schema: 'other' }]), [])
+  // Reaches the verdict as a failed schema-state check.
+  console.log(`precondition: ${cases.length} constraint problems detected`)
+})
+
+test('the expected CHECK constraints are exactly the migrations\' (name, table and definition appear in a migration), and cover the validate:db probe list', () => {
+  const migrations = path.join(ROOT, 'prisma/migrations')
+  const sql = readdirSync(migrations).flatMap((dir) => {
+    try { return [readFileSync(path.join(migrations, dir, 'migration.sql'), 'utf8')] } catch { return [] }
+  }).join('\n')
+  let checked = 0
+  for (const entry of REQUIRED_CHECK_CONSTRAINTS) {
+    const at = sql.indexOf(`ADD CONSTRAINT "${entry.name}"`)
+    assert.notEqual(at, -1, `${entry.name} is added by a migration`)
+    const statement = sql.slice(at, sql.indexOf(';', at) === -1 ? at + 400 : at + 400)
+    assert.ok(normaliseConstraintDefinition(statement).includes(normaliseConstraintDefinition(entry.definition)), `${entry.name}: the migration's definition is ${entry.definition}`)
+    // And the ALTER TABLE naming the expected table precedes it.
+    const alter = sql.lastIndexOf('ALTER TABLE', at)
+    assert.ok(sql.slice(alter, at).includes(`"${entry.table}"`), `${entry.name} is added to ${entry.table}`)
+    checked += 1
+  }
+  console.log(`precondition: ${checked} constraints matched to their migration statements`)
+  const probe = readFileSync(path.join(ROOT, 'scripts/check-stock-quantity-constraints.mjs'), 'utf8')
+  const probed = [...probe.matchAll(/constraint: '([a-z_]+)'/g)].map((match) => match[1]!)
+  assert.equal(probed.length, 6)
+  for (const name of probed) assert.ok(REQUIRED_CHECK_CONSTRAINTS.some((entry) => entry.name === name), `${name} (made to fire by validate:db) is required by the gate`)
+  assert.deepEqual(Object.keys(PG_RENDERED).sort(), REQUIRED_CHECK_CONSTRAINTS.map((entry) => entry.name).sort())
 })

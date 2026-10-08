@@ -507,6 +507,40 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date, ga
 
 // ---- read-sync liveness ------------------------------------------------------------------------
 
+/**
+ * Every field the verdict depends on must be PRESENT with the right type. A producer that drops or renames one is a
+ * contract change this gate was not written against, so the output is unreadable (NO-GO), never "fresh by default".
+ * Returns the first problem, or null.
+ */
+export function readSyncShapeProblem(parsed: unknown): string | null {
+  const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+  const stringArray = (value: unknown): boolean => Array.isArray(value) && value.every((item) => typeof item === 'string')
+  if (!isObject(parsed)) return 'not a JSON object'
+  if (parsed.schemaVersion !== READ_SYNC_SCHEMA_VERSION) return `schemaVersion is not ${READ_SYNC_SCHEMA_VERSION}, so the meaning of its fields is not the one this gate was written against`
+  if (typeof parsed.generatedAt !== 'string' || !ISO_RE.test(parsed.generatedAt) || !Number.isFinite(Date.parse(parsed.generatedAt))) return 'generatedAt is missing or not an ISO time'
+  const counts = parsed.counts
+  if (!isObject(counts) || !['fresh', 'stale', 'never', 'off'].every((state) => Number.isInteger(counts[state]) && (counts[state] as number) >= 0)) return 'counts is missing or does not carry fresh, stale, never and off as whole numbers'
+  if (!Array.isArray(parsed.entries) || parsed.entries.length === 0) return 'entries is missing or empty (an empty list proves nothing is fresh)'
+  for (const [index, raw] of parsed.entries.entries()) {
+    if (!isObject(raw)) return `entries[${index}] is not an object`
+    if (typeof raw.stream !== 'string' || raw.stream === '') return `entries[${index}] has no stream name`
+    if (!('instance' in raw) || (raw.instance !== null && typeof raw.instance !== 'string')) return `entries[${index}] (${raw.stream}) has no instance (null or a string)`
+    if (typeof raw.state !== 'string' || !['fresh', 'stale', 'never', 'off'].includes(raw.state)) return `entries[${index}] (${raw.stream}) has an unrecognised state ${JSON.stringify(raw.state)}`
+    if (!('lastSuccessAt' in raw) || (raw.lastSuccessAt !== null && typeof raw.lastSuccessAt !== 'string')) return `entries[${index}] (${raw.stream}) has no lastSuccessAt (null or a string)`
+    if (!('ageMs' in raw) || (raw.ageMs !== null && typeof raw.ageMs !== 'number')) return `entries[${index}] (${raw.stream}) has no ageMs (null or a number)`
+    if (!('maxAgeMs' in raw) || (raw.maxAgeMs !== null && typeof raw.maxAgeMs !== 'number')) return `entries[${index}] (${raw.stream}) has no maxAgeMs (null or a number)`
+    if (typeof raw.futureTimestamp !== 'boolean') return `entries[${index}] (${raw.stream}) has no futureTimestamp flag`
+  }
+  const scheduler = parsed.scheduler
+  if (!isObject(scheduler)) return 'scheduler is missing'
+  if (typeof scheduler.examined !== 'boolean') return 'scheduler.examined is missing'
+  if (!('unreadable' in scheduler) || (scheduler.unreadable !== null && typeof scheduler.unreadable !== 'string')) return 'scheduler.unreadable is missing (null or a string)'
+  if (!('blockProblem' in scheduler) || (scheduler.blockProblem !== null && typeof scheduler.blockProblem !== 'string')) return 'scheduler.blockProblem is missing (null or a string)'
+  if (!stringArray(scheduler.unscheduled)) return 'scheduler.unscheduled is missing (a list)'
+  if (!stringArray(scheduler.disabled)) return 'scheduler.disabled is missing (a list)'
+  return null
+}
+
 /** How far ahead of the gate's clock a recorded success may be before it is not believed (clock skew). */
 export const READ_SYNC_FUTURE_TOLERANCE_MS = 5 * 60_000
 export const READ_SYNC_GENERATED_TOLERANCE_MS = 10 * 60_000
@@ -527,57 +561,47 @@ export function assessReadSyncStatus(run: { exitCode: number | null; stdout: str
   } catch {
     return unreadable('the read-sync status output is not one JSON object')
   }
-  const root = parsed as { schemaVersion?: unknown; generatedAt?: unknown; counts?: unknown; entries?: unknown; scheduler?: { examined?: unknown; unreadable?: unknown; unscheduled?: unknown } } | null
-  if (root === null || typeof root !== 'object' || root.schemaVersion !== READ_SYNC_SCHEMA_VERSION) {
-    return unreadable(`the read-sync status output does not declare schemaVersion ${READ_SYNC_SCHEMA_VERSION}, so this gate cannot tell whether the meaning of its fields is the one it was written against`)
+  const shape = readSyncShapeProblem(parsed)
+  if (shape !== null) return unreadable(`the read-sync status output does not have the shape this gate was written against: ${shape}`)
+  const root = parsed as {
+    generatedAt: string
+    counts: Record<string, number>
+    entries: Array<{ stream: string; instance: string | null; state: string; lastSuccessAt: string | null; ageMs: number | null; maxAgeMs: number | null; futureTimestamp: boolean }>
+    scheduler: { examined: boolean; unreadable: string | null; blockProblem: string | null; unscheduled: string[]; disabled: string[] }
   }
-  if (!Array.isArray(root.entries) || root.entries.length === 0) {
-    return unreadable('the read-sync status output has no entries list, or it is empty (an empty list proves nothing is fresh)')
-  }
-  const generated = typeof root.generatedAt === 'string' && ISO_RE.test(root.generatedAt) ? Date.parse(root.generatedAt) : Number.NaN
-  if (!Number.isFinite(generated)) return unreadable('the read-sync status output has no valid generatedAt')
+  const generated = Date.parse(root.generatedAt)
   const problems: string[] = []
   if (Math.abs(now.getTime() - generated) > READ_SYNC_GENERATED_TOLERANCE_MS) problems.push(`the read-sync status says it was generated at ${root.generatedAt}, which is not now`)
   const seen = new Set<string>()
   const streams = new Set<string>()
   const tally: Record<string, number> = { fresh: 0, stale: 0, never: 0, off: 0 }
-  for (const [index, raw] of root.entries.entries()) {
-    const entry = raw as { stream?: unknown; instance?: unknown; state?: unknown; lastSuccessAt?: unknown; ageMs?: unknown; maxAgeMs?: unknown; futureTimestamp?: unknown } | null
-    if (entry === null || typeof entry !== 'object' || typeof entry.stream !== 'string' || entry.stream === '') return unreadable(`read-sync entry #${index} has no stream name`)
+  for (const entry of root.entries) {
     const name = entry.stream
-    if (typeof entry.state !== 'string' || !(entry.state in tally)) { problems.push(`stream ${name} has an unrecognised state ${JSON.stringify(entry.state)}`); continue }
     tally[entry.state] = (tally[entry.state] ?? 0) + 1
     if (!(REQUIRED_READ_SYNC_STREAMS as readonly string[]).includes(name)) { problems.push(`read-sync reports a stream ${name} that is not in the required catalogue`); continue }
-    const key = `${name}/${typeof entry.instance === 'string' ? entry.instance : ''}`
+    const key = `${name}/${entry.instance ?? ''}`
     if (seen.has(key)) return unreadable(`read-sync entry ${key} is listed twice`)
     seen.add(key)
     streams.add(name)
     if (entry.state !== 'fresh') { problems.push(`stream ${key} is ${JSON.stringify(entry.state)}, not fresh`); continue }
-    const at = typeof entry.lastSuccessAt === 'string' && ISO_RE.test(entry.lastSuccessAt) ? Date.parse(entry.lastSuccessAt) : Number.NaN
+    const at = entry.lastSuccessAt !== null && ISO_RE.test(entry.lastSuccessAt) ? Date.parse(entry.lastSuccessAt) : Number.NaN
     if (!Number.isFinite(at)) { problems.push(`stream ${key} is marked fresh but has no valid lastSuccessAt`); continue }
-    if (typeof entry.futureTimestamp !== 'boolean') { problems.push(`stream ${key} does not say whether its last success is in the future`); continue }
     const future = at > generated + READ_SYNC_FUTURE_TOLERANCE_MS
     if (future || entry.futureTimestamp) { problems.push(`stream ${key} has a lastSuccessAt later than the clock (${entry.lastSuccessAt})`); continue }
-    if (typeof entry.ageMs !== 'number' || Math.abs(entry.ageMs - (generated - at)) > READ_SYNC_AGE_TOLERANCE_MS) { problems.push(`stream ${key} reports an age that does not match its lastSuccessAt and the report time`); continue }
-    if (typeof entry.maxAgeMs !== 'number' || !(entry.maxAgeMs > 0)) { problems.push(`stream ${key} reports no age limit`); continue }
+    if (entry.ageMs === null || Math.abs(entry.ageMs - (generated - at)) > READ_SYNC_AGE_TOLERANCE_MS) { problems.push(`stream ${key} reports an age that does not match its lastSuccessAt and the report time`); continue }
+    if (entry.maxAgeMs === null || !(entry.maxAgeMs > 0)) { problems.push(`stream ${key} reports no age limit`); continue }
     if (generated - at >= entry.maxAgeMs) problems.push(`stream ${key} last succeeded at ${entry.lastSuccessAt}, older than its limit`)
   }
-  const counts = root.counts as Record<string, unknown> | null
-  if (counts === null || typeof counts !== 'object' || Object.keys(tally).some((state) => counts[state] !== tally[state])) {
-    problems.push('the read-sync counts do not match the entries they summarise')
-  }
+  if (Object.keys(tally).some((state) => root.counts[state] !== tally[state])) problems.push('the read-sync counts do not match the entries they summarise')
   for (const required of REQUIRED_READ_SYNC_STREAMS) {
     if (!streams.has(required)) problems.push(`required stream ${required} is missing from the read-sync status output`)
   }
   const scheduler = root.scheduler
-  if (!scheduler || scheduler.examined !== true) problems.push('the read-sync status did not examine the scheduler')
-  else {
-    if (scheduler.unreadable !== null && scheduler.unreadable !== undefined) problems.push('the read-sync scheduler check could not read the crontab')
-    if (!Array.isArray(scheduler.unscheduled) || scheduler.unscheduled.length > 0) problems.push('a job behind a read-sync stream has no managed crontab entry')
-    const extra = scheduler as { blockProblem?: unknown; disabled?: unknown }
-    if (extra.blockProblem !== null && extra.blockProblem !== undefined) problems.push('the managed crontab block has a problem, so the scheduled jobs may not run')
-    if (Array.isArray(extra.disabled) && extra.disabled.length > 0) problems.push('a job behind a read-sync stream is disabled in the crontab')
-  }
+  if (!scheduler.examined) problems.push('the read-sync status did not examine the scheduler')
+  if (scheduler.unreadable !== null) problems.push('the read-sync scheduler check could not read the crontab')
+  if (scheduler.blockProblem !== null) problems.push('the managed crontab block has a problem, so the scheduled jobs may not run')
+  if (scheduler.unscheduled.length > 0) problems.push('a job behind a read-sync stream has no managed crontab entry')
+  if (scheduler.disabled.length > 0) problems.push('a job behind a read-sync stream is disabled in the crontab')
   const detail = { streams: [...streams].sort(), entries: seen.size }
   return problems.length === 0 ? pass(`${seen.size} entries across ${streams.size} required streams, each fresh with a valid last success`, detail) : fail(problems, detail)
 }

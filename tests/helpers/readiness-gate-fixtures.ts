@@ -4,6 +4,7 @@ import {
   REQUIRED_CHECK_CONSTRAINTS,
   type ReadinessPhase,
 } from '../../lib/ops/readiness-gate-constants.ts'
+import type { ConstraintRow } from '../../lib/ops/readiness-gate-collect.ts'
 import type { BuildIdentity } from '../../lib/ops/build-identity.ts'
 import {
   type AcceptanceFile,
@@ -132,4 +133,18 @@ export function acceptanceText(entries: Array<Record<string, unknown>>): string 
 
 export const PHASES: ReadinessPhase[] = ['P0', 'P1', 'P2']
 
-export const ALL_CONSTRAINTS = async (): Promise<string[]> => [...REQUIRED_CHECK_CONSTRAINTS]
+/** How PostgreSQL 17 renders each required constraint (captured with pg_get_constraintdef on a migrated database). */
+export const PG_RENDERED: Record<string, string> = {
+  stock_levels_quantity_nonnegative: 'CHECK ((quantity >= (0)::numeric))',
+  stock_levels_reserved_nonnegative: 'CHECK (("reservedQty" >= (0)::numeric))',
+  stock_levels_reserved_qty_lte_quantity: 'CHECK (("reservedQty" <= quantity))',
+  cost_layers_received_nonnegative: 'CHECK (("receivedQty" >= (0)::numeric))',
+  cost_layers_remaining_qty_non_negative: 'CHECK (("remainingQty" >= (0)::numeric))',
+  cost_layers_remaining_qty_lte_received_qty: 'CHECK (("remainingQty" <= "receivedQty"))',
+  stock_movements_qty_nonnegative: 'CHECK ((qty >= (0)::numeric))',
+}
+
+export function constraintRows(): ConstraintRow[] {
+  return REQUIRED_CHECK_CONSTRAINTS.map((entry) => ({ schema: 'public', table: entry.table, name: entry.name, validated: true, definition: PG_RENDERED[entry.name]!, currentSchema: 'public' }))
+}
+export const ALL_CONSTRAINTS = async (): Promise<ConstraintRow[]> => constraintRows()

@@ -84,7 +84,7 @@ export const REQUIRED_READ_SYNC_STREAMS = [
   'xero-balance-snapshots',
   'xero-tax-rates',
 ] as const
-export const READ_SYNC_CONTRACT = `${READ_SYNC_CONTRACT_VERSION}: \`npm run --silent read-sync:status\` exits 0 and prints one JSON object with \`schemaVersion\` 1, \`generatedAt\`, \`counts\` that equal the tally of its entries, and an \`entries\` list (one per stream, or per binding for the stock sync) carrying \`stream\`, \`state\` (must be fresh), \`lastSuccessAt\` (a valid ISO time, not in the future), \`futureTimestamp\`, \`ageMs\` (consistent with the two times) and \`maxAgeMs\`, covering all of ${REQUIRED_READ_SYNC_STREAMS.join(', ')}, and a \`scheduler\` object that was examined, readable, with nothing unscheduled`
+export const READ_SYNC_CONTRACT = `${READ_SYNC_CONTRACT_VERSION}: \`npm run --silent read-sync:status\` exits 0 and prints one JSON object with \`schemaVersion\` 1, \`generatedAt\`, \`counts\` that equal the tally of its entries, and an \`entries\` list (one per stream, or per binding for the stock sync) carrying \`stream\`, \`state\` (must be fresh), \`lastSuccessAt\` (a valid ISO time, not in the future), \`futureTimestamp\`, \`ageMs\` (consistent with the two times) and \`maxAgeMs\`, covering all of ${REQUIRED_READ_SYNC_STREAMS.join(', ')}, and a \`scheduler\` object with \`examined\` true, \`unreadable\` and \`blockProblem\` exactly null, and \`unscheduled\` and \`disabled\` empty lists. Every field named here must be present with its type; a missing or malformed one makes the output unreadable, not fresh`
 
 /** What the build identity covers, said in every GO and in the docs. */
 export const BUILD_SCOPE_TEXT = 'The rehearsal is tied to this build by source commit and source tree only; it is NOT tied to the build artefact (.next/BUILD_ID) and NOT to the .env configuration.'
@@ -97,15 +97,28 @@ export const REHEARSAL_TRUST_TEXT = (reason: string) => `the rehearsal report lo
  * schema and the migration table, and the drift check wraps migrate diff); none of them regenerates the client.
  */
 export const SCHEMA_STATE_SCRIPTS = ['db:migrate:status', 'db:schema:diff', 'db:schema:drift'] as const
-/** The CHECK constraints validate:db's probe makes fire (scripts/check-stock-quantity-constraints.mjs). The gate only verifies they are installed and validated. */
-export const REQUIRED_CHECK_CONSTRAINTS = [
-  'stock_levels_quantity_nonnegative',
-  'stock_levels_reserved_nonnegative',
-  'cost_layers_received_nonnegative',
-  'cost_layers_remaining_qty_non_negative',
-  'cost_layers_remaining_qty_lte_received_qty',
-  'stock_movements_qty_nonnegative',
+/**
+ * The CHECK constraints the stock tables must carry, each by NAME, TABLE and DEFINITION. PostgreSQL constraint names are only
+ * unique per table, so a name alone proves nothing: the gate checks that THIS constraint is on THIS table in the application's
+ * schema, validated, with this definition (the SQL of the migration that created it, compared after normalisation). The first
+ * six are the ones scripts/check-stock-quantity-constraints.mjs makes fire; the seventh is the reserved-not-above-quantity rule
+ * of 20260424180000_stock_integrity_checks.
+ */
+export type ExpectedCheckConstraint = { name: string; table: string; definition: string }
+export const REQUIRED_CHECK_CONSTRAINTS: readonly ExpectedCheckConstraint[] = [
+  { name: 'stock_levels_quantity_nonnegative', table: 'stock_levels', definition: 'CHECK ("quantity" >= 0)' },
+  { name: 'stock_levels_reserved_nonnegative', table: 'stock_levels', definition: 'CHECK ("reservedQty" >= 0)' },
+  { name: 'stock_levels_reserved_qty_lte_quantity', table: 'stock_levels', definition: 'CHECK ("reservedQty" <= "quantity")' },
+  { name: 'cost_layers_received_nonnegative', table: 'cost_layers', definition: 'CHECK ("receivedQty" >= 0)' },
+  { name: 'cost_layers_remaining_qty_non_negative', table: 'cost_layers', definition: 'CHECK ("remainingQty" >= 0)' },
+  { name: 'cost_layers_remaining_qty_lte_received_qty', table: 'cost_layers', definition: 'CHECK ("remainingQty" <= "receivedQty")' },
+  { name: 'stock_movements_qty_nonnegative', table: 'stock_movements', definition: 'CHECK ("qty" >= 0)' },
 ] as const
+
+/** One definition, comparable across the migration's SQL and pg_get_constraintdef's rendering of it. */
+export function normaliseConstraintDefinition(definition: string): string {
+  return definition.toLowerCase().replace(/::numeric/g, '').replace(/[\s()"]/g, '')
+}
 
 export const DEFAULT_REPORT_DIR = '/var/tmp/ims-readiness-gate-reports'
 export const DEFAULT_REHEARSAL_DIR = '/var/tmp/ims-rehearsal-reports'
@@ -177,7 +190,7 @@ export const CHECK_CATALOGUE: readonly CheckDefinition[] = [
     id: 'schema-state',
     title: 'Database schema is applied, has not drifted, and the CHECK constraints are installed (read-only)',
     requirement: ALL_PHASES('required'),
-    expectation: ALL_PHASES('prisma migrate status says the schema is up to date, the schema diff and the drift check find no difference, and the six stock CHECK constraints exist and are validated. These only read; npm run validate:db (which makes the constraints fire with a rolled-back probe and regenerates the client) is not run by the gate.'),
+    expectation: ALL_PHASES('prisma migrate status says the schema is up to date, the schema diff and the drift check find no difference, and the seven stock CHECK constraints exist on their own tables, validated, with the definitions the migrations gave them. These only read; npm run validate:db (which makes the constraints fire with a rolled-back probe and regenerates the client) is not run by the gate.'),
   },
   {
     id: 'outbound-status',
