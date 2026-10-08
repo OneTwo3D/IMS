@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { InputError, ingestDataset, parseColumnMap, type ColumnMap, type IngestedDataset } from './ingest'
+import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
@@ -45,11 +45,11 @@ interface Manifest {
   purchaseOrderKeyPrefix: string | null
   transferKeyPrefix: string | null
   maxPurchaseTaxRate: string | null
-  inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null }>
+  inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null; supersedesEarlier: boolean }>
 }
 
 const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'inputs'])
-const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap'])
+const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap', 'supersedesEarlier'])
 
 function parseManifest(text: string): Manifest {
   let raw: unknown
@@ -83,9 +83,13 @@ function parseManifest(text: string): Manifest {
     if (typeof e.dataset !== 'string' || !(DATASET_NAMES as readonly string[]).includes(e.dataset)) throw new UsageError(`manifest input dataset must be one of ${DATASET_NAMES.join(', ')}`)
     if (typeof e.file !== 'string' || e.file === '') throw new UsageError(`manifest input ${e.dataset} needs a file`)
     if (e.columnMap !== undefined && (typeof e.columnMap !== 'string' || e.columnMap === '')) throw new UsageError(`manifest input ${e.dataset}: columnMap must be a path`)
-    if (seen.has(e.dataset)) throw new UsageError(`dataset ${e.dataset} is listed twice; one file per dataset (concatenate exports before running)`)
-    seen.add(e.dataset)
-    inputs.push({ dataset: e.dataset as DatasetName, file: e.file, columnMap: typeof e.columnMap === 'string' ? e.columnMap : null })
+    if (e.supersedesEarlier !== undefined && typeof e.supersedesEarlier !== 'boolean') throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier must be true or false`)
+    if (e.supersedesEarlier === true && e.dataset !== 'products') throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier is only supported for the products dataset`)
+    if (e.supersedesEarlier === true && !inputs.some((earlier) => earlier.dataset === e.dataset)) throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier needs an earlier file for the same dataset (list the file to be replaced first)`)
+    const key = `${e.dataset}\u0000${path.normalize(e.file)}`
+    if (seen.has(key)) throw new UsageError(`dataset ${e.dataset} lists the file ${e.file} twice`)
+    seen.add(key)
+    inputs.push({ dataset: e.dataset as DatasetName, file: e.file, columnMap: typeof e.columnMap === 'string' ? e.columnMap : null, supersedesEarlier: e.supersedesEarlier === true })
   }
   return {
     baseCurrency: m.baseCurrency,
@@ -162,12 +166,17 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
   }
 
   const resolve = (file: string) => path.resolve(manifestDir, file)
-  const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
+  const parts: Partial<Record<DatasetName, Array<{ ingested: IngestedDataset; supersedes: boolean }>>> = {}
+  const layouts = new Map<DatasetName, Set<string>>()
   const maps = new Map<string, ColumnMap>()
+  const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
+  const problems: string[] = []
   try {
-    const problems: string[] = []
+    // Pass 1: resolve every column map and check the manifest as a whole BEFORE any dataset file is read, so a missing or malformed data
+    // file cannot turn a manifest error (exit 2) into an input error (exit 3).
+    const resolved: Array<{ input: (typeof manifest.inputs)[number]; mapping: DatasetMapping | null }> = []
     for (const input of manifest.inputs) {
-      let mapping = null
+      let mapping: DatasetMapping | null = null
       if (input.columnMap !== null) {
         const mapPath = resolve(input.columnMap)
         let map = maps.get(mapPath)
@@ -196,6 +205,17 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
           continue
         }
       }
+      layouts.set(input.dataset, (layouts.get(input.dataset) ?? new Set()).add(mapping?.wide ? 'wide' : 'canonical-or-long'))
+      resolved.push({ input, mapping })
+    }
+    for (const [name, kinds] of layouts) {
+      if (kinds.size > 1) {
+        io.stderr(`first-load-prepare: dataset ${name} is listed with a mix of wide-warehouse-block files and other files; one run reads a dataset either entirely wide or entirely not wide, because rows of the same SKU and warehouse in two layouts could not be told apart and would be added together. Nothing was read.\n\n${usageText()}`)
+        return EXIT_CODES.USAGE
+      }
+    }
+    // Pass 2: read the files.
+    for (const { input, mapping } of resolved) {
       let bytes: Buffer
       try {
         bytes = readFileSync(resolve(input.file))
@@ -204,13 +224,14 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         continue
       }
       try {
-        datasets[input.dataset] = ingestDataset(input.dataset, bytes, input.file, mapping)
+        ;(parts[input.dataset] ??= []).push({ ingested: ingestDataset(input.dataset, bytes, input.file, mapping), supersedes: input.supersedesEarlier })
       } catch (error) {
         if (error instanceof InputError) problems.push(...error.problems)
         else throw error
       }
     }
     if (problems.length > 0) throw new InputError(problems)
+    for (const name of Object.keys(parts) as DatasetName[]) datasets[name] = mergeIngested(parts[name]!.map((part) => part.ingested), parts[name]!.map((part) => part.supersedes))
   } catch (error) {
     if (error instanceof InputError) {
       io.stderr(`first-load-prepare: an input cannot be used, nothing was written:\n${error.problems.map((p) => `  - ${p}`).join('\n')}\n`)

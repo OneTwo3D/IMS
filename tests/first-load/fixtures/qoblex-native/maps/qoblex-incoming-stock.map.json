@@ -1,0 +1,60 @@
+{
+  "formatVersion": 1,
+  "source": "qoblex",
+  "datasets": {
+    "purchase-order-lines": {
+      "expectedHeaders": [
+        "Product variant",
+        "SKU",
+        "Created on",
+        "Received on",
+        "Due On",
+        "Purchase Order",
+        "Status",
+        "Ordered Quantity",
+        "Received Quantity",
+        "Price",
+        "Discount (%)",
+        "Supplier",
+        "Supplier Reference"
+      ],
+      "columns": {
+        "orderKey": "Purchase Order",
+        "supplierName": "Supplier",
+        "status": "Status",
+        "sku": "SKU",
+        "qtyOrdered": "Ordered Quantity",
+        "qtyReceived": "Received Quantity",
+        "unitCostForeign": "Price",
+        "supplierRef": "Supplier Reference",
+        "expectedDelivery": "Due On"
+      },
+      "constants": {
+        "destinationWarehouseCode": "MIL1"
+      },
+      "derived": {
+        "currency": "supplierName",
+        "fxRateToBase": "currency"
+      },
+      "dateFormats": {
+        "expectedDelivery": "ddd, MMM D YYYY"
+      },
+      "valueMaps": {
+        "status": {
+          "Approved": "OPEN",
+          "PartiallyReceived": "OPEN"
+        },
+        "currency": {
+          "Supplier Alpha": "USD",
+          "Supplier Beta": "GBP",
+          "Supplier Gamma": "EUR"
+        },
+        "fxRateToBase": {
+          "GBP": "",
+          "USD": "1.25",
+          "EUR": "1.15"
+        }
+      }
+    }
+  }
+}
