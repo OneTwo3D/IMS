@@ -36,10 +36,12 @@ export type SchedulerVerdict = {
 }
 
 export function verifyJobsScheduled(
-  crontabText: string,
+  rawCrontabText: string,
   wanted: readonly CrontabJobDef[],
   storedSchedules: Readonly<Record<string, string | undefined>>,
 ): SchedulerVerdict {
+  // CRLF and lone CR are line endings too: normalise ONCE, before marker detection, extraction and header comparison.
+  const crontabText = rawCrontabText.replace(/\r\n?/g, '\n')
   const allMissing = (blockProblem: string): SchedulerVerdict => ({ blockProblem, missing: wanted.map((job) => job.slug) })
 
   // EXACTLY ONE managed region. extractOtiBlock concatenates every region it finds, so a valid block plus a

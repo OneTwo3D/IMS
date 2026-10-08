@@ -325,3 +325,26 @@ test('[anchor] a rival that replaced the bad anchor first wins: this run writes 
   assert.equal(harness.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING), new Date(NOW.getTime() - 2 * HOUR).toISOString())
   assert.equal(harness.warnings.filter((w) => w.stream === 'liveness-anchor').length, 0)
 })
+
+test('[anchor] a FUTURE first-evaluation anchor (even year 275760) is invalid: replaced once, reported, and the alarm still fires; within tolerance it is kept', async () => {
+  const limit = 6 * HOUR
+  for (const future of ['+275760-09-13T00:00:00.000Z', new Date(NOW.getTime() + 10 * 60_000).toISOString(), '2099-01-01T00:00:00.000Z']) {
+    const harness = new Harness((at) => inputs({}, { 'xero-tax-rates': null }, at))
+    harness.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, future)
+    await harness.run()
+    console.log(`precondition (${future}): anchor now ${harness.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING)} warnings=${harness.warnings.filter((w) => w.stream === 'liveness-anchor').length}`)
+    assert.equal(harness.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING), NOW.toISOString(), 'replaced by now')
+    assert.equal(harness.warnings.filter((w) => w.stream === 'liveness-anchor').length, 1)
+    assert.match(harness.warnings[0]!.description, /in the future/)
+    const after = await harness.run(new Date(NOW.getTime() + limit))
+    assert.deepEqual(after.alerted, ['xero-tax-rates'], 'a future anchor cannot silence the never-succeeded alarm')
+    assert.equal(harness.warnings.filter((w) => w.stream === 'liveness-anchor').length, 1, 'once per replacement')
+  }
+  // Within the clock-skew tolerance the anchor is believed and left alone.
+  const kept = new Harness((at) => inputs({}, { 'xero-tax-rates': null }, at))
+  const skewed = new Date(NOW.getTime() + 4 * 60_000).toISOString()
+  kept.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, skewed)
+  await kept.run()
+  assert.equal(kept.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING), skewed)
+  assert.equal(kept.warnings.filter((w) => w.stream === 'liveness-anchor').length, 0)
+})

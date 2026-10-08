@@ -27,7 +27,7 @@ import {
   readSyncAlertedSettingKey,
   type ReadSyncStreamId,
 } from './read-sync-liveness-constants'
-import { parseReadSyncStamp } from './read-sync-liveness'
+import { parseReadSyncStamp, READ_SYNC_FUTURE_TOLERANCE_MS } from './read-sync-liveness'
 import { assembleReadSyncReport, type ReadSyncInputs } from './read-sync-status'
 
 export type ReadSyncAlarmLogEntry = {
@@ -93,6 +93,8 @@ export async function claimBreachAndDeliver(
   claim: { stampKey: string; prior: string | undefined; breachKey: string; alert: { title: string; message: string }; logEntry: ReadSyncAlarmLogEntry },
 ): Promise<boolean> {
   return deps.db.$transaction(async (tx) => {
+    // A stalled statement is cancelled by the server rather than abandoned by the caller.
+    await (tx as unknown as { $executeRawUnsafe?: (sql: string) => Promise<unknown> }).$executeRawUnsafe?.(`SET LOCAL statement_timeout = ${ALARM_STATEMENT_TIMEOUT_MS}`)
     const claimed = claim.prior === undefined
       ? await tx.setting.createMany({ data: [{ key: claim.stampKey, value: claim.breachKey }], skipDuplicates: true })
       : await tx.setting.updateMany({ where: { key: claim.stampKey, value: claim.prior }, data: { value: claim.breachKey } })
@@ -104,6 +106,7 @@ export async function claimBreachAndDeliver(
 }
 
 /** The claim transaction is bounded: a stuck connection or lock cannot hold a cron run indefinitely. */
+export const ALARM_STATEMENT_TIMEOUT_MS = 10_000
 export const ALARM_TRANSACTION_BOUNDS = { maxWait: 5_000, timeout: 15_000 } as const
 
 export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise<ReadSyncAlarmResult> {
@@ -128,14 +131,15 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
       create: { key: READ_SYNC_FIRST_EVALUATED_SETTING, value: now.toISOString() },
       update: { value: now.toISOString() },
     })
-  } else if (trackedSince === null) {
+  } else if (trackedSince === null || trackedSince.getTime() > now.getTime() + READ_SYNC_FUTURE_TOLERANCE_MS) {
+    const invalidWhy = trackedSince === null ? 'was not a time' : 'is in the future of this server\'s clock'
     const replaced = await db.$transaction(async (tx) => {
       const claimed = await tx.setting.updateMany({ where: { key: READ_SYNC_FIRST_EVALUATED_SETTING, value: storedAnchor }, data: { value: now.toISOString() } })
       if (claimed.count !== 1) return false
       await deps.logWarning(tx, {
         stream: 'liveness-anchor',
         title: 'Read-sync liveness start time was unreadable',
-        description: `The stored start time of read-sync liveness tracking (${READ_SYNC_FIRST_EVALUATED_SETTING}) was not a time and has been replaced with ${now.toISOString()}. Feeds that have never succeeded are alarmed only after their limit has passed since then.`,
+        description: `The stored start time of read-sync liveness tracking (${READ_SYNC_FIRST_EVALUATED_SETTING}) ${invalidWhy} and has been replaced with ${now.toISOString()}. Feeds that have never succeeded are alarmed only after their limit has passed since then.`,
         metadata: { action: READ_SYNC_ALERT_ACTION, kind: 'anchor-replaced', invalidValue: storedAnchor.slice(0, 80) },
       })
       return true
@@ -145,7 +149,8 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
     } else {
       // Another run replaced it first: use what it persisted; never write again here.
       const reread = await db.setting.findMany({ where: { key: { in: [READ_SYNC_FIRST_EVALUATED_SETTING] } }, select: { key: true, value: true } })
-      trackedSince = parseReadSyncStamp(reread[0]?.value) ?? now
+      const rival = parseReadSyncStamp(reread[0]?.value)
+      trackedSince = rival !== null && rival.getTime() <= now.getTime() + READ_SYNC_FUTURE_TOLERANCE_MS ? rival : now
     }
   }
   if (trackedSince === null) trackedSince = now

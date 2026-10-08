@@ -93,15 +93,15 @@ test('[guard] a missing watchdog while the stock sync is in play, and a switched
   assert.match(off.delivered[0]!.message, /switched off: wms-watchdog/)
 })
 
-test('[guard] everything in place raises nothing and forgets an earlier breach; an unreadable crontab raises nothing', async () => {
+test('[guard] everything in place raises nothing and forgets an earlier breach; an unexamined scheduler raises nothing', async () => {
   const r = rig()
   r.settings.set(READ_SYNC_SCHEDULER_ALERTED_SETTING, 'scheduler:old')
   const ok = await runSchedulerCoverageGuard({ ...r.deps, readInputs: async () => inputs(block(NEEDED)) })
   assert.equal(ok.status, 'OK')
   assert.equal(r.delivered.length, 0)
   assert.equal(r.settings.has(READ_SYNC_SCHEDULER_ALERTED_SETTING), false)
-  const unreadable = await runSchedulerCoverageGuard({ ...r.deps, readInputs: async () => inputs(null) })
-  assert.equal(unreadable.status, 'NOT_EXAMINED')
+  const noCrontabInput = await runSchedulerCoverageGuard({ ...r.deps, readInputs: async () => inputs(null, { crontab: undefined }) })
+  assert.equal(noCrontabInput.status, 'NOT_EXAMINED', 'no crontab was examined at all: nothing to say')
   assert.equal(r.delivered.length, 0)
 })
 
@@ -125,7 +125,6 @@ mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeRespon
 mock.module('@/lib/trackship', { namedExports: { checkDeliveryStatus: async () => { events.push('core:start'); await coreGate; events.push('core:end'); return { checked: 0 } } } })
 mock.module('@/lib/ops/read-sync-scheduler-guard', {
   namedExports: {
-    SCHEDULER_GUARD_ROUTE_DEADLINE_MS: 250,
     startSchedulerCoverageGuard: () => { events.push('guard:start'); return guardPromise() },
   },
 })
@@ -146,16 +145,51 @@ test('[route] a STALLED delivery poll cannot prevent the guard: it has already s
   assert.deepEqual(await response.json(), { checked: 0 })
 })
 
-test('[route] a HANGING guard cannot delay the answer beyond the deadline', async () => {
-  events.length = 0
-  coreGate = Promise.resolve()
-  guardPromise = () => new Promise(() => undefined) // never settles
+test('[route] the guard is NEVER awaited: a slow guard adds nothing to the response, a failing guard changes nothing', async () => {
   const { GET } = await import('../../app/api/cron/delivery-status/route.ts')
-  const startedAt = Date.now()
-  const response = await GET(new Request('http://localhost/api/cron/delivery-status'))
-  const elapsed = Date.now() - startedAt
-  console.log(`precondition: answered in ${elapsed}ms against a 250ms guard deadline with a guard that never settles`)
-  assert.equal(response.status, 200)
-  assert.ok(elapsed >= 200, `the route did wait for the guard up to its deadline (${elapsed}ms)`)
-  assert.ok(elapsed < 1500, `and not beyond it (${elapsed}ms)`)
+  const answer = async () => {
+    const startedAt = Date.now()
+    const response = await GET(new Request('http://localhost/api/cron/delivery-status'))
+    return { elapsed: Date.now() - startedAt, response }
+  }
+
+  events.length = 0; coreGate = Promise.resolve()
+  guardPromise = () => new Promise((resolve) => setTimeout(() => resolve({ status: 'OK', problems: [] }), 2_000)) // slow guard
+  const slow = await answer()
+  console.log(`precondition: answered in ${slow.elapsed}ms with a guard that takes 2000ms`)
+  assert.equal(slow.response.status, 200)
+  assert.deepEqual(await slow.response.json(), { checked: 0 })
+  assert.ok(slow.elapsed < 500, `the response was not delayed by the guard (${slow.elapsed}ms)`)
+
+  guardPromise = () => Promise.reject(new Error('guard exploded')) // rejecting promise: no unhandled rejection, same answer
+  const rejecting = await answer()
+  assert.equal(rejecting.response.status, 200)
+  assert.deepEqual(await rejecting.response.json(), { checked: 0 })
+
+  guardPromise = () => { throw new Error('guard threw synchronously') }
+  const throwing = await answer()
+  assert.equal(throwing.response.status, 200)
+  assert.deepEqual(await throwing.response.json(), { checked: 0 })
+})
+
+test('[guard] an unreadable crontab raises ONE distinct "could not be verified" reminder per UTC day, not per run', async () => {
+  const r = rig()
+  let clock = new Date('2026-10-08T10:00:00Z')
+  const run = () => runSchedulerCoverageGuard({ ...r.deps, now: () => clock, readInputs: async () => inputs(null) })
+  const first = await run()
+  console.log(`precondition: ${JSON.stringify(first)} delivered=${r.delivered.length}`)
+  assert.equal(first.status, 'ALERTED')
+  assert.equal(r.delivered[0]!.title, 'Scheduler coverage could not be verified')
+  assert.match(r.delivered[0]!.message, /npm run read-sync:status/)
+  assert.match(r.delivered[0]!.message, /at most once a day/)
+  clock = new Date('2026-10-08T23:59:00Z')
+  assert.equal((await run()).status, 'ALREADY_ALERTED')
+  assert.equal(r.delivered.length, 1, 'same day: no repeat')
+  clock = new Date('2026-10-09T00:01:00Z')
+  assert.equal((await run()).status, 'ALERTED')
+  assert.equal(r.delivered.length, 2, 'next day: one reminder')
+  // Once readable and healthy the reminder state is forgotten.
+  const ok = await runSchedulerCoverageGuard({ ...r.deps, now: () => clock, readInputs: async () => inputs(block(NEEDED)) })
+  assert.equal(ok.status, 'OK')
+  assert.equal(r.settings.has(READ_SYNC_SCHEDULER_ALERTED_SETTING), false)
 })

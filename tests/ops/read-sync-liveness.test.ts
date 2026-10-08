@@ -427,3 +427,21 @@ test('[json] the status document carries schemaVersion 1 and generatedAt, and th
     assert.ok(key in doc.entries[0]!, `entry field ${key} is unchanged`)
   }
 })
+
+test('[scheduler] CRLF and lone-CR crontabs: a complete block is scheduled, a damaged job in one is not', () => {
+  const wanted = registryDefs().filter((job) => job.slug === 'read-sync-liveness')
+  const good = generatedBlock(['read-sync-liveness'])
+  const verdict = (text: string) => verifyJobsScheduled(text, wanted, {})
+  const crlf = good.replace(/\n/g, '\r\n')
+  const cr = good.replace(/\n/g, '\r')
+  console.log(`precondition: CRLF crontab ${crlf.split('\r\n').length} lines, verdict ${JSON.stringify(verdict(crlf))}`)
+  assert.deepEqual(verdict(good), { blockProblem: null, missing: [] })
+  assert.deepEqual(verdict(crlf), { blockProblem: null, missing: [] })
+  assert.deepEqual(verdict(cr), { blockProblem: null, missing: [] })
+  const damaged = crlf.replace('curl -sf', 'echo')
+  assert.deepEqual(verdict(damaged).missing, ['read-sync-liveness'])
+  const commented = crlf.replace(/(\r\n)([^#\r\n][^\r\n]*\$BASE_URL\/read-sync-liveness)/, '$1# $2')
+  assert.deepEqual(verdict(commented).missing, ['read-sync-liveness'])
+  const twoBlocks = crlf + good.replace(/\n/g, '\r\n')
+  assert.notEqual(verdict(twoBlocks).blockProblem, null)
+})
