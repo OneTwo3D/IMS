@@ -81,6 +81,21 @@ export function parseProducerCutoff(raw: string | undefined): CutoffRead {
   return { ok: true, at }
 }
 
+/**
+ * A timestamp as a FINITE epoch-millisecond number, read once, or null. Only a real Date is accepted, and its
+ * time value is read through Date.prototype.getTime so that a subclass or an injected object cannot answer
+ * with Infinity, undefined, a string or an exception of its own choosing; anything else is unreadable.
+ */
+function readInstant(value: unknown): number | null {
+  try {
+    if (!(value instanceof Date)) return null
+    const ms: unknown = Date.prototype.getTime.call(value)
+    return typeof ms === 'number' && Number.isFinite(ms) ? ms : null
+  } catch {
+    return null
+  }
+}
+
 function shadow(
   reason: ProducerReason,
   base: Pick<ProducerDecision, 'owner' | 'phase' | 'cutoff' | 'grant'>,
@@ -111,9 +126,11 @@ function evaluate<D extends OutboundConnector>(
   if (!cutoff.ok) {
     return shadow(cutoff.reason === 'absent' ? 'no_cutoff' : 'unreadable_cutoff', { owner: p1Owner, phase: 'P1', cutoff: null, grant: 'granted' })
   }
-  const nowMs = now.getTime()
-  if (Number.isNaN(nowMs)) return shadow('unreadable', { owner: p1Owner, phase: 'P1', cutoff: cutoff.at, grant: 'granted' })
-  if (nowMs < cutoff.at.getTime()) return shadow('before_cutoff', { owner: p1Owner, phase: 'P1', cutoff: cutoff.at, grant: 'granted' })
+  const nowMs = readInstant(now)
+  if (nowMs === null) return shadow('unreadable', { owner: p1Owner, phase: 'P1', cutoff: cutoff.at, grant: 'granted' })
+  const cutoffMs = readInstant(cutoff.at)
+  if (cutoffMs === null) return shadow('unreadable_cutoff', { owner: p1Owner, phase: 'P1', cutoff: null, grant: 'granted' })
+  if (nowMs < cutoffMs) return shadow('before_cutoff', { owner: p1Owner, phase: 'P1', cutoff: cutoff.at, grant: 'granted' })
 
   // Phase P2 for this destination from here on.
   const owner: WriterOwner = row?.owners.P2 ?? 'unknown'
@@ -126,8 +143,9 @@ function evaluate<D extends OutboundConnector>(
     // re-produce a pre-cut-off obligation as new work.
     if (row?.obligationTime === 'required') return shadow('obligation_time_required', base)
   } else {
-    if (!(obligationAt instanceof Date) || Number.isNaN(obligationAt.getTime())) return shadow('unreadable_obligation', base)
-    if (obligationAt.getTime() < cutoff.at.getTime()) return shadow('obligation_before_cutoff', base)
+    const obligationMs = readInstant(obligationAt)
+    if (obligationMs === null) return shadow('unreadable_obligation', base)
+    if (obligationMs < cutoffMs) return shadow('obligation_before_cutoff', base)
   }
   return { disposition: 'LIVE', reason: 'live', ...base }
 }

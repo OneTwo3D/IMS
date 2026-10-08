@@ -77,15 +77,15 @@ export function producerAgreementText(connector: OutboundConnector, detail: 'cut
   const cutoff = PRODUCER_CUTOFF_ENV[connector]
   switch (detail) {
     case 'agreed_held':
-      return `${label}: held. Neither ${grant} nor ${cutoff} is set, so IMS records what it would have written as a shadow and sends nothing.`
+      return `${label}: held. Neither ${grant} nor ${cutoff} is set, so the producer-side decision for every ${label} operation is SHADOW.`
     case 'agreed_live':
-      return `${label}: ${grant} and ${cutoff} are both readable, so IMS produces work for the operations it owns from the live-from instant.`
+      return `${label}: ${grant} and ${cutoff} are both readable, so the producer-side decision is LIVE for the operations IMS owns from the live-from instant and SHADOW for the rest.`
     case 'cutoff_without_grant':
-      return `${label}: INCONSISTENT. ${cutoff} is set but ${grant} is not, so work is shadowed and the transport would refuse it anyway. Set both or neither.`
+      return `${label}: INCONSISTENT. ${cutoff} is set but ${grant} is not, so the producer-side decision is SHADOW and the transport refuses ${label} writes. Set both or neither.`
     case 'grant_without_cutoff':
-      return `${label}: INCONSISTENT. ${grant} is set but ${cutoff} is not, so the transport would allow writes while every producer shadows its work and nothing is queued. Set both or neither.`
+      return `${label}: INCONSISTENT. ${grant} is set but ${cutoff} is not, so the producer-side decision is SHADOW while the transport allows ${label} writes. Set both or neither.`
     case 'unreadable':
-      return `${label}: ${grant} or ${cutoff} is set but cannot be read, so work is shadowed. Fix the value.`
+      return `${label}: ${grant} or ${cutoff} is set but cannot be read, so the producer-side decision is SHADOW. Fix the value.`
   }
 }
 
@@ -104,18 +104,18 @@ const CUTOFF_ROWS = OUTBOUND_CONNECTORS.map(
 
 export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
   overview: [
-    'The outbound-write hold refuses a request at the HTTP boundary. The producer-side hold decides earlier whether a piece of work is queued for delivery at all. For each destination and operation the decision is LIVE or SHADOW. A SHADOW is a record of what IMS would have written; it is never queued and never delivered later. The decision reads the environment only: no database and no network call.',
+    'THE PRODUCER-SIDE HOLD IS NOT YET ENFORCED. In this version it is a decision module only: nothing in IMS calls it, `npm run outbound:status` does not report on it, and every producer still queues work exactly as before. The only barrier is the outbound-write hold above, which reads a grant on its own: a destination whose grant is set permits the existing outbound writes through the transport whether or not the live-from variable below is set. The places that will consult the decision arrive in later changes, and the paragraphs below describe what the decision returns, not what IMS does today.',
     '',
-    'Work is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is shadowed when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it.',
+    'For each destination and operation the decision is LIVE or SHADOW. A SHADOW is the record of what IMS would have written, which a later change will keep instead of queuing the work; it is never to be delivered later. The decision reads the environment only: no database and no network call. It is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is SHADOW when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it.',
     '',
-    'A grant without a live-from instant, or a live-from instant without a grant, is inconsistent. Both directions are safe (nothing is delivered), and both are reported. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination.',
+    'A grant without a live-from instant, or a live-from instant without a grant, is inconsistent: the decision is SHADOW, while today the transport still allows the writes of a granted destination. A later change will report the inconsistency in `npm run outbound:status`. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination.',
   ].join('\n'),
   cutoffs: [
     '| Variable | Destination | Value |',
     '|---|---|---|',
     ...CUTOFF_ROWS,
     '',
-    'Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable and keeps the destination in shadow. Setting a variable does not start any writer; each destination also needs its outbound-write grant, and the ownership map decides which operations IMS may produce.',
+    'Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable, and the decision for that destination is SHADOW. Setting a variable changes nothing in this version, because nothing consults it yet; in later changes, once the producers consult the decision, each destination will need its outbound-write grant as well, and the ownership map will decide which operations IMS may produce.',
   ].join('\n'),
 }
 

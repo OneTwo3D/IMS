@@ -291,23 +291,24 @@ test('arm e: obligationAt before the cut-off is SHADOW; at the cut-off is LIVE; 
   assert.equal(explainProducerDisposition('mintsoft', op as never, new Date('x'), { env, now: NOW }).reason, 'unreadable_obligation')
 })
 
-test('arm f: a throwing environment or clock is SHADOW with reason unreadable, and nothing propagates', () => {
+test('arm f: a throwing environment, clock or obligationAt is SHADOW, and nothing propagates', () => {
   const throwingEnv = new Proxy({}, { get() { throw new Error('env read failed') }, has() { throw new Error('env read failed') }, ownKeys() { throw new Error('env read failed') } }) as Record<string, string | undefined>
   assert.throws(() => throwingEnv.ANYTHING, /env read failed/, 'precondition: the environment really throws')
-  const throwingNow = new Date(NOW) as Date
-  throwingNow.getTime = () => { throw new Error('clock failed') }
-  assert.throws(() => throwingNow.getTime(), /clock failed/, 'precondition: the clock really throws')
+  const throwingContext = (env: Record<string, string | undefined>) => ({ env, get now(): Date { throw new Error('clock failed') } })
+  assert.throws(() => throwingContext({}).now, /clock failed/, 'precondition: the clock really throws')
+  // A Proxy of a Date passes instanceof but has no time slot: reading it throws.
+  const proxyDate = new Proxy(new Date(NOW), {})
+  assert.ok(proxyDate instanceof Date)
+  assert.throws(() => Date.prototype.getTime.call(proxyDate), TypeError, 'precondition: the obligation really throws when read')
   const liveEnv = envFor('xero', 'ok', '2026-01-01T00:00:00Z')
   for (const destination of OUTBOUND_CONNECTORS) {
     const op = OPERATION[destination].IMS as never
     const a = explainProducerDisposition(destination, op, undefined, { env: throwingEnv, now: NOW })
-    const b = explainProducerDisposition(destination, op, undefined, { env: envFor(destination, 'ok', '2026-01-01T00:00:00Z'), now: throwingNow })
-    const brokenObligation = new Date(NOW)
-    brokenObligation.getTime = () => { throw new Error('obligation failed') }
-    const c = explainProducerDisposition(destination, op, brokenObligation, { env: envFor(destination, 'ok', '2026-01-01T00:00:00Z'), now: NOW })
+    const b = explainProducerDisposition(destination, op, LATE, throwingContext(envFor(destination, 'ok', '2026-01-01T00:00:00Z')))
+    const c = explainProducerDisposition(destination, op, proxyDate, { env: envFor(destination, 'ok', '2026-01-01T00:00:00Z'), now: NOW })
     console.log(`# arm f ${destination}: env=${a.reason} clock=${b.reason} obligation=${c.reason}`)
     assert.deepEqual([a.disposition, b.disposition, c.disposition], ['SHADOW', 'SHADOW', 'SHADOW'])
-    assert.deepEqual([a.reason, b.reason, c.reason], ['unreadable', 'unreadable', 'unreadable'])
+    assert.deepEqual([a.reason, b.reason, c.reason], ['unreadable', 'unreadable', 'unreadable_obligation'])
     assert.equal(producerDisposition(destination, op, undefined, { env: throwingEnv }), 'SHADOW')
   }
   assert.equal(call('xero', 'purchase.bill', LATE, liveEnv), 'LIVE', 'isolating arm: the same inputs without the throw are LIVE')
@@ -377,4 +378,46 @@ test('grant/cut-off agreement: both absent held, both readable live, exactly one
   }
   console.log(`# agreement: ${cells} cells`)
   assert.equal(cells, 3 * table.length)
+})
+
+/** A Date whose own getTime answers with `answer` (or throws), while its real time value is `real`. */
+function spoofed(real: string, answer: unknown | 'throw'): Date {
+  const date = new Date(real)
+  ;(date as { getTime: () => unknown }).getTime = () => { if (answer === 'throw') throw new Error('getTime failed'); return answer }
+  return date
+}
+const FAKE_ANSWERS: Array<[string, unknown]> = [['Infinity', Infinity], ['-Infinity', -Infinity], ['undefined', undefined], ['null', null], ['a string', '9999999999999'], ['NaN', NaN], ['throws', 'throw']]
+
+test('arm j: an unreadable clock or obligationAt can never pass a time gate (non-finite, undefined, null, string, throwing, non-Date)', () => {
+  const op = OPERATION.xero.IMS
+  const env2099 = envFor('xero', 'ok', '2099-01-01T00:00:00Z')
+  const envPast = envFor('xero', 'ok', '2026-01-01T00:00:00Z')
+  let examined = 0
+  for (const [label, answer] of FAKE_ANSWERS) {
+    // now: a 2026 clock whose getTime lies, against a 2099 cut-off, must not be LIVE.
+    const nowSpoof = spoofed('2026-06-01T12:00:00Z', answer)
+    const a = explainProducerDisposition('xero', op as never, LATE, { env: env2099, now: nowSpoof })
+    // obligationAt whose getTime lies, against a past cut-off with a real obligation time BEFORE it.
+    const obligationSpoof = spoofed('2025-01-01T00:00:00Z', answer)
+    const b = explainProducerDisposition('xero', op as never, obligationSpoof, { env: envPast, now: NOW })
+    examined += 2
+    console.log(`# arm j ${label}: now=${a.disposition}/${a.reason} obligation=${b.disposition}/${b.reason}`)
+    assert.equal(a.disposition, 'SHADOW', `now getTime -> ${label}`)
+    assert.equal(b.disposition, 'SHADOW', `obligationAt getTime -> ${label}`)
+    assert.equal(b.reason, 'obligation_before_cutoff', `the REAL time value (2025) is what is read, not the lie (${label})`)
+  }
+  // Non-Date objects that merely quack like one.
+  for (const fake of [{ getTime: () => 1e15 }, { getTime: () => Infinity }, Object.create(null), 1e15, '2099-01-01T00:00:00Z']) {
+    const a = explainProducerDisposition('xero', op as never, LATE, { env: envPast, now: fake as unknown as Date })
+    const b = explainProducerDisposition('xero', op as never, fake as unknown as Date, { env: envPast, now: NOW })
+    examined += 2
+    assert.deepEqual([a.disposition, a.reason, b.disposition, b.reason], ['SHADOW', 'unreadable', 'SHADOW', 'unreadable_obligation'])
+  }
+  // The infinity clock against a 2099 cut-off specifically (the reported bypass), with the real value in 2026.
+  assert.equal(producerDisposition('xero', op as never, LATE, { env: env2099, now: spoofed('2026-06-01T12:00:00Z', Infinity) }), 'SHADOW')
+  // Isolating arm: a genuine Date is read, and its real value decides (2100 clock whose getTime lies low is still LIVE: the lie is ignored).
+  assert.equal(producerDisposition('xero', op as never, new Date('2100-01-01T00:00:00Z'), { env: env2099, now: spoofed('2100-01-01T00:00:00Z', -Infinity) }), 'LIVE')
+  assert.equal(producerDisposition('xero', op as never, LATE, { env: envPast, now: NOW }), 'LIVE')
+  console.log(`# arm j: ${examined} cells examined`)
+  assert.equal(examined, FAKE_ANSWERS.length * 2 + 10)
 })

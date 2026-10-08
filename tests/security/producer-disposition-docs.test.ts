@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { producerAgreementText } from '../../lib/security/producer-disposition-constants.ts'
 import { OUTBOUND_CONNECTORS } from '../../lib/security/outbound-write-hold-constants.ts'
 import {
   PRODUCER_CUTOFF_ENV,
@@ -62,4 +63,36 @@ test('each cut-off variable is documented exactly once, in a table row, and no u
   }
   const documented = new Set([...text.matchAll(/^\| `([A-Z0-9_]+_WRITES_LIVE_FROM)` \|/gm)].map((match) => match[1]))
   assert.deepEqual([...documented].sort(), Object.values(PRODUCER_CUTOFF_ENV).sort())
+})
+
+/**
+ * THE UNWIRED MODULE IS DESCRIBED TRUTHFULLY. While no production code calls the decision, operator text must
+ * say so, must not claim behaviour that only a later change delivers, and may use "will" only for a later change.
+ */
+test('operator text for the unwired producer hold says it is not enforced, claims no present effect, and uses "will" only for later changes', () => {
+  const texts = [...Object.values(PRODUCER_DOC_BLOCKS)]
+  for (const connector of OUTBOUND_CONNECTORS) {
+    for (const detail of ['agreed_held', 'agreed_live', 'cutoff_without_grant', 'grant_without_cutoff', 'unreadable'] as const) texts.push(producerAgreementText(connector, detail))
+  }
+  assert.ok(PRODUCER_DOC_BLOCKS.overview.startsWith('THE PRODUCER-SIDE HOLD IS NOT YET ENFORCED.'))
+  assert.match(PRODUCER_DOC_BLOCKS.overview, /grant is set permits the existing outbound writes through the transport/)
+  const forbidden = [/nothing is delivered/i, /both are reported/i, /cannot deliver/i, /is reported by/i, /records what it would have written/i, /sends nothing/i, /does not start any writer/i, /keeps the destination in shadow/i]
+  let sentences = 0
+  let willSentences = 0
+  for (const text of texts) {
+    for (const pattern of forbidden) assert.ok(!pattern.test(text), `forbidden claim ${pattern}: ${text.slice(0, 80)}`)
+    for (const sentence of text.split(/(?<=[.;])\s+/)) {
+      sentences += 1
+      if (/\bwill\b/i.test(sentence)) {
+        willSentences += 1
+        assert.match(sentence, /later (change|slice)/i, `"will" without naming a later change: ${sentence.slice(0, 100)}`)
+      }
+    }
+  }
+  console.log(`# docs wording: texts=${texts.length} sentences=${sentences} will-sentences=${willSentences}`)
+  assert.ok(willSentences >= 3, 'precondition: the rule examined sentences that use "will"')
+  // Rule can fail: an unconditional sentence is caught.
+  assert.throws(() => assert.match('Nothing will be queued.', /later (change|slice)/i))
+  // No text claims outbound:status reports the inconsistency today.
+  for (const text of texts) assert.ok(!/outbound:status` (reports|shows|prints)/.test(text))
 })
