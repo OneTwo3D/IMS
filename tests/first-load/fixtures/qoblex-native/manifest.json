@@ -1,0 +1,15 @@
+{
+  "formatVersion": 1,
+  "baseCurrency": "GBP",
+  "asOf": "2026-10-08",
+  "purchaseOrderKeyPrefix": "QBX-",
+  "maxPurchaseTaxRate": "0.25",
+  "inputs": [
+    { "dataset": "products", "file": "stock-on-hand.csv", "columnMap": "maps/qoblex-stock-on-hand.map.json" },
+    { "dataset": "products", "file": "bundles.csv", "columnMap": "maps/qoblex-bundles.map.json", "supersedesEarlier": true },
+    { "dataset": "recipe-lines", "file": "bundles.csv", "columnMap": "maps/qoblex-bundles.map.json" },
+    { "dataset": "stock-lots", "file": "stock-on-hand.csv", "columnMap": "maps/qoblex-stock-on-hand.map.json" },
+    { "dataset": "suppliers", "file": "contacts.csv", "columnMap": "maps/qoblex-contacts.map.json" },
+    { "dataset": "purchase-order-lines", "file": "incoming-stock.csv", "columnMap": "maps/qoblex-incoming-stock.map.json" }
+  ]
+}

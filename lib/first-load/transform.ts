@@ -1587,6 +1587,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     for (const rejection of dataset.rejected) {
       run.add(name, rejection.line, `line ${rejection.line}`, 'REJECTED', rejection.code, rejection.reason)
     }
+    for (const replaced of dataset.superseded) run.add(name, replaced.line, replaced.key, 'EXCLUDED', 'SUPERSEDED_BY_LATER_FILE', replaced.reason)
   }
 
   loadExclusions(run)

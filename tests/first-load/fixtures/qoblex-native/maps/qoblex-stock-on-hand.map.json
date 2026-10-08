@@ -1,0 +1,171 @@
+{
+  "formatVersion": 1,
+  "source": "qoblex",
+  "datasets": {
+    "products": {
+      "rowsAboveHeader": 1,
+      "expectedHeaders": [
+        "Product",
+        "Barcode",
+        "Sku",
+        "Brand",
+        "Product Type",
+        "State",
+        "Supplier",
+        "Updated At",
+        "Moving Average Cost",
+        "Total Cost",
+        "Purchase Price",
+        "Wholesale Price",
+        "Retail Price",
+        "Retail Compare Price",
+        "Wholesale Compare Price",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "On Back Order Quantity",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level"
+      ],
+      "columns": {
+        "sku": "Sku",
+        "name": "Product",
+        "type": "Product Type",
+        "barcode": "Barcode",
+        "active": "State"
+      },
+      "valueMaps": {
+        "type": {
+          "simple": "SIMPLE",
+          "variable": "VARIANT"
+        },
+        "active": {
+          "Active": "TRUE"
+        }
+      }
+    },
+    "stock-lots": {
+      "rowsAboveHeader": 1,
+      "expectedHeaders": [
+        "Product",
+        "Barcode",
+        "Sku",
+        "Brand",
+        "Product Type",
+        "State",
+        "Supplier",
+        "Updated At",
+        "Moving Average Cost",
+        "Total Cost",
+        "Purchase Price",
+        "Wholesale Price",
+        "Retail Price",
+        "Retail Compare Price",
+        "Wholesale Compare Price",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "On Back Order Quantity",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level",
+        "Location Is Deleted",
+        "Quantity",
+        "Allocated Quantity",
+        "Available Quantity",
+        "Incoming Quantity",
+        "Buffer Quantity",
+        "Alert Level"
+      ],
+      "columns": {
+        "sku": "Sku",
+        "unitCost": "Moving Average Cost"
+      },
+      "constants": {
+        "currency": "GBP"
+      },
+      "rowSelect": {
+        "column": "Product Type",
+        "keep": [
+          "simple",
+          "variable"
+        ]
+      },
+      "wide": {
+        "blockStart": "after-label",
+        "warehouses": {
+          "1 MIL1": "MIL1",
+          "2 Cambridge Warehouse": "CAMBRIDGE",
+          "3 Restock": "RESTOCK",
+          "4 Quarantaine Cambridge": "QUARANTINE-CAMBRIDGE",
+          "5 RXT2": "RXT2"
+        },
+        "blockColumns": {
+          "qty": "Quantity"
+        }
+      }
+    }
+  }
+}

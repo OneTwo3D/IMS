@@ -45,11 +45,11 @@ interface Manifest {
   purchaseOrderKeyPrefix: string | null
   transferKeyPrefix: string | null
   maxPurchaseTaxRate: string | null
-  inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null }>
+  inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null; supersedesEarlier: boolean }>
 }
 
 const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'inputs'])
-const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap'])
+const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap', 'supersedesEarlier'])
 
 function parseManifest(text: string): Manifest {
   let raw: unknown
@@ -83,10 +83,13 @@ function parseManifest(text: string): Manifest {
     if (typeof e.dataset !== 'string' || !(DATASET_NAMES as readonly string[]).includes(e.dataset)) throw new UsageError(`manifest input dataset must be one of ${DATASET_NAMES.join(', ')}`)
     if (typeof e.file !== 'string' || e.file === '') throw new UsageError(`manifest input ${e.dataset} needs a file`)
     if (e.columnMap !== undefined && (typeof e.columnMap !== 'string' || e.columnMap === '')) throw new UsageError(`manifest input ${e.dataset}: columnMap must be a path`)
+    if (e.supersedesEarlier !== undefined && typeof e.supersedesEarlier !== 'boolean') throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier must be true or false`)
+    if (e.supersedesEarlier === true && e.dataset !== 'products') throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier is only supported for the products dataset`)
+    if (e.supersedesEarlier === true && !inputs.some((earlier) => earlier.dataset === e.dataset)) throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier needs an earlier file for the same dataset (list the file to be replaced first)`)
     const key = `${e.dataset}\u0000${path.normalize(e.file)}`
     if (seen.has(key)) throw new UsageError(`dataset ${e.dataset} lists the file ${e.file} twice`)
     seen.add(key)
-    inputs.push({ dataset: e.dataset as DatasetName, file: e.file, columnMap: typeof e.columnMap === 'string' ? e.columnMap : null })
+    inputs.push({ dataset: e.dataset as DatasetName, file: e.file, columnMap: typeof e.columnMap === 'string' ? e.columnMap : null, supersedesEarlier: e.supersedesEarlier === true })
   }
   return {
     baseCurrency: m.baseCurrency,
@@ -163,7 +166,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
   }
 
   const resolve = (file: string) => path.resolve(manifestDir, file)
-  const parts: Partial<Record<DatasetName, IngestedDataset[]>> = {}
+  const parts: Partial<Record<DatasetName, Array<{ ingested: IngestedDataset; supersedes: boolean }>>> = {}
   const maps = new Map<string, ColumnMap>()
   const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
   try {
@@ -206,14 +209,14 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         continue
       }
       try {
-        ;(parts[input.dataset] ??= []).push(ingestDataset(input.dataset, bytes, input.file, mapping))
+        ;(parts[input.dataset] ??= []).push({ ingested: ingestDataset(input.dataset, bytes, input.file, mapping), supersedes: input.supersedesEarlier })
       } catch (error) {
         if (error instanceof InputError) problems.push(...error.problems)
         else throw error
       }
     }
     if (problems.length > 0) throw new InputError(problems)
-    for (const name of Object.keys(parts) as DatasetName[]) datasets[name] = mergeIngested(parts[name]!)
+    for (const name of Object.keys(parts) as DatasetName[]) datasets[name] = mergeIngested(parts[name]!.map((part) => part.ingested), parts[name]!.map((part) => part.supersedes))
   } catch (error) {
     if (error instanceof InputError) {
       io.stderr(`first-load-prepare: an input cannot be used, nothing was written:\n${error.problems.map((p) => `  - ${p}`).join('\n')}\n`)

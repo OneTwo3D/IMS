@@ -1,0 +1,77 @@
+{
+  "formatVersion": 1,
+  "source": "qoblex",
+  "datasets": {
+    "products": {
+      "expectedHeaders": [
+        "Product Name",
+        "SKU",
+        "Bundled Quantity",
+        "Total in Stock",
+        "Allocated",
+        "Available",
+        "Cost",
+        "Weight",
+        "Line Type"
+      ],
+      "columns": {
+        "sku": "SKU",
+        "name": "Product Name",
+        "type": "Line Type",
+        "weight": "Weight"
+      },
+      "rowSelect": {
+        "column": "Line Type",
+        "keep": [
+          "Bundle",
+          "BillOfMaterial"
+        ],
+        "skip": [
+          "Part"
+        ]
+      },
+      "valueMaps": {
+        "type": {
+          "Bundle": "KIT",
+          "BillOfMaterial": "BOM"
+        }
+      }
+    },
+    "recipe-lines": {
+      "expectedHeaders": [
+        "Product Name",
+        "SKU",
+        "Bundled Quantity",
+        "Total in Stock",
+        "Allocated",
+        "Available",
+        "Cost",
+        "Weight",
+        "Line Type"
+      ],
+      "columns": {
+        "componentSku": "SKU",
+        "qty": "Bundled Quantity"
+      },
+      "rowSelect": {
+        "column": "Line Type",
+        "keep": [
+          "Part"
+        ],
+        "skip": [
+          "Bundle",
+          "BillOfMaterial"
+        ]
+      },
+      "parentFrom": {
+        "column": "Line Type",
+        "parentValues": [
+          "Bundle",
+          "BillOfMaterial"
+        ],
+        "skuColumn": "SKU",
+        "into": "parentSku"
+      }
+    }
+  }
+}

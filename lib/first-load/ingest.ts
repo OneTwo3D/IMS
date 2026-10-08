@@ -142,6 +142,7 @@ function parseLayoutKeys(
       if (w.blockStart !== 'after-label' && w.blockStart !== 'at-label') problems.push(`${where}.wide.blockStart must be "after-label" (a block starts in the column after its label) or "at-label" (in the label's own column)`)
       const warehouses = stringRecord(w.warehouses ?? {}, `${where}.wide.warehouses`, problems)
       if (Object.keys(warehouses).length === 0) problems.push(`${where}.wide.warehouses must name at least one warehouse label`)
+      if (Object.keys(warehouses).length > 99) problems.push(`${where}.wide.warehouses names more than 99 warehouses; a block is numbered with two digits in the report`)
       const codes = new Map<string, string>()
       for (const [label, code] of Object.entries(warehouses)) {
         if (label !== label.trim() || label === '') problems.push(`${where}.wide.warehouses: label ${JSON.stringify(label)} must be non-empty and trimmed (labels are trimmed before they are matched)`)
@@ -354,6 +355,11 @@ export interface IngestedDataset {
   recordsRead: number
   /** Rows the map's closed `rowSelect.skip` list deliberately left out, by the value that skipped them. Not records. */
   rowsSkipped: Record<string, number>
+  /**
+   * Rows a LATER file of the same dataset deliberately replaced (manifest `supersedesEarlier`), with the line they were on.
+   * They are records read, and the transform books each as EXCLUDED, so the accounting still reconciles.
+   */
+  superseded: Array<{ line: number; key: string; reason: string }>
   /** One entry per file read into this dataset (several when a manifest lists the dataset more than once). */
   parts: Array<{ file: string; sha256: string; bytes: number }>
 }
@@ -361,9 +367,28 @@ export interface IngestedDataset {
 /** A dataset read from several files: line numbers of part N are reported as N * PART_LINE_STRIDE + the physical line (part 0 is the first file listed). */
 export const PART_LINE_STRIDE = 1_000_000
 
-export function mergeIngested(parts: IngestedDataset[]): IngestedDataset {
-  if (parts.length === 1) return parts[0]
+/**
+ * Merge the files of one dataset. A part flagged `supersedesEarlier` (products only) replaces rows of EARLIER parts that have the same SKU
+ * (compared upper-case, as the importers do); the replaced rows are kept in `superseded`, never silently dropped.
+ */
+export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = parts.map(() => false)): IngestedDataset {
+  if (parts.length === 1 && !supersedes[0]) return parts[0]
   const first = parts[0]
+  const superseded: IngestedDataset['superseded'] = parts.flatMap((part, index) => part.superseded.map((entry) => ({ ...entry, line: Number((entry.line + index * PART_LINE_STRIDE).toFixed(2)) })))
+  const kept: CanonRow[][] = parts.map((part) => part.rows)
+  parts.forEach((part, index) => {
+    if (!supersedes[index]) return
+    const keys = new Set(part.rows.map((row) => row.values.sku.toUpperCase()).filter((key) => key !== ''))
+    for (let earlier = 0; earlier < index; earlier++) {
+      const stay: CanonRow[] = []
+      for (const row of kept[earlier]) {
+        const key = row.values.sku.toUpperCase()
+        if (keys.has(key)) superseded.push({ line: Number((row.line + earlier * PART_LINE_STRIDE).toFixed(2)), key: row.values.sku, reason: `replaced by the row for the same SKU in ${part.file} (the manifest says that file supersedes earlier ones)` })
+        else stay.push(row)
+      }
+      kept[earlier] = stay
+    }
+  })
   const rowsSkipped: Record<string, number> = {}
   const unmapped: string[] = []
   for (const part of parts) {
@@ -371,6 +396,7 @@ export function mergeIngested(parts: IngestedDataset[]): IngestedDataset {
     for (const name of part.unmappedHeaders) if (!unmapped.includes(name)) unmapped.push(name)
   }
   const offset = (index: number) => index * PART_LINE_STRIDE
+  const shifted = (line: number, index: number) => Number((line + offset(index)).toFixed(2))
   return {
     dataset: first.dataset,
     file: parts.map((part) => part.file).join(' + '),
@@ -378,10 +404,11 @@ export function mergeIngested(parts: IngestedDataset[]): IngestedDataset {
     bytes: parts.reduce((total, part) => total + part.bytes, 0),
     hadBom: parts.some((part) => part.hadBom),
     blankRows: parts.reduce((total, part) => total + part.blankRows, 0),
-    rows: parts.flatMap((part, index) => part.rows.map((row) => ({ ...row, line: row.line + offset(index) }))),
-    rejected: parts.flatMap((part, index) => part.rejected.map((rejection) => ({ ...rejection, line: rejection.line + offset(index) }))),
+    rows: kept.flatMap((rows, index) => rows.map((row) => ({ ...row, line: shifted(row.line, index) }))),
+    rejected: parts.flatMap((part, index) => part.rejected.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))),
     unmappedHeaders: unmapped,
     recordsRead: parts.reduce((total, part) => total + part.recordsRead, 0),
+    superseded,
     rowsSkipped,
     parts: parts.flatMap((part) => part.parts),
   }
@@ -399,6 +426,15 @@ function hint(wanted: string, headers: string[]): string {
   const folded = wanted.toLowerCase().replace(/[^a-z0-9]/g, '')
   const near = headers.filter((header) => header.toLowerCase().replace(/[^a-z0-9]/g, '') === folded)
   return near.length > 0 ? ` A similar header exists (${near.map((h) => JSON.stringify(h)).join(', ')}); it was NOT used, correct the column map if it is the right one.` : ''
+}
+
+/**
+ * The identity of one canonical record from a wide-warehouse-blocks file: source line L, warehouse block B (1-based, file order)
+ * is reported as L.0B (line 12, block 3 = 12.03), so every record has its own number and its own disposition.
+ * A row refused before it is split into blocks (ragged, unlisted row kind) is one record, reported as the plain line.
+ */
+export function slotLine(line: number, position: number): number {
+  return Number((line + (position + 1) / 100).toFixed(2))
 }
 
 interface Block {
@@ -467,7 +503,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const sha256 = createHash('sha256').update(bytes).digest('hex')
   let text: string
   try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch {
     throw new InputError([`${file}: not valid UTF-8 (re-export as UTF-8; the tool does not guess another encoding)`])
   }
@@ -572,13 +608,11 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
 
   for (const record of records) {
     if (record.cells.length !== header.length) {
-      for (let i = 0; i < emissions.length; i++) {
-        rejected.push({
-          line: record.line,
-          code: 'RAGGED_ROW',
-          reason: `the row has ${record.cells.length} cell(s) but the header has ${header.length}; a short or long row is never padded or truncated`,
-        })
-      }
+      rejected.push({
+        line: record.line,
+        code: 'RAGGED_ROW',
+        reason: `the row has ${record.cells.length} cell(s) but the header has ${header.length}; a short or long row is never padded or truncated`,
+      })
       if (mapping?.parentFrom) parent = null
       continue
     }
@@ -601,11 +635,12 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         continue
       }
     }
-    for (const block of emissions) {
+    for (const [position, block] of emissions.entries()) {
+      const line = block ? slotLine(record.line, position) : record.line
       const values: Record<string, string> = {}
       let bad: IngestRejection | null = null
       const fail = (code: string, reason: string) => {
-        if (bad === null) bad = { line: record.line, code, reason }
+        if (bad === null) bad = { line, code, reason }
       }
       for (const column of spec.columns) {
         if (column in derived) continue
@@ -640,7 +675,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         }
       }
       if (bad) rejected.push(bad)
-      else rows.push({ line: record.line, values })
+      else rows.push({ line, values })
     }
   }
 
@@ -659,6 +694,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     rejected,
     unmappedHeaders,
     recordsRead: rows.length + rejected.length,
+    superseded: [],
     rowsSkipped,
     parts: [{ file, sha256, bytes: bytes.length }],
   }

@@ -1,0 +1,72 @@
+{
+  "formatVersion": 1,
+  "source": "qoblex",
+  "datasets": {
+    "suppliers": {
+      "expectedHeaders": [
+        "Purchase Tax Class Name",
+        "Currency",
+        "Minimum Order Value",
+        "Company name",
+        "Contact person",
+        "Phone number",
+        "Email",
+        "Wholesale or Retail",
+        "Tax Number",
+        "EOIR",
+        "Price List Name",
+        "Account Manager Name",
+        "Payment Term Name",
+        "Discount",
+        "Notes",
+        "Website",
+        "Fax Number",
+        "Shipping Address Line1",
+        "Shipping Address Line2",
+        "Shipping Address City",
+        "Shipping Address State",
+        "Shipping Address ZipCode",
+        "Shipping Address Phone Number",
+        "Shipping Address Mobile Number",
+        "Shipping Address Country",
+        "Billing Address Line1",
+        "Billing Address Line2",
+        "Billing Address City",
+        "Billing Address State",
+        "Billing Address ZipCode",
+        "Billing Address Phone Number",
+        "Billing Address Mobile Number",
+        "Billing Address Country"
+      ],
+      "columns": {
+        "name": "Company name",
+        "contactName": "Contact person",
+        "email": "Email",
+        "phone": "Phone number",
+        "currency": "Currency",
+        "vatNumber": "Tax Number",
+        "paymentTermsDays": "Payment Term Name",
+        "addressLine1": "Shipping Address Line1",
+        "addressLine2": "Shipping Address Line2",
+        "city": "Shipping Address City",
+        "county": "Shipping Address State",
+        "postcode": "Shipping Address ZipCode",
+        "country": "Shipping Address Country",
+        "notes": "Notes"
+      },
+      "rowSelect": {
+        "column": "Wholesale or Retail",
+        "keep": [
+          "Wholesale"
+        ]
+      },
+      "valueMaps": {
+        "paymentTermsDays": {
+          "": "",
+          "NONE": "",
+          "30 days net": "30"
+        }
+      }
+    }
+  }
+}
