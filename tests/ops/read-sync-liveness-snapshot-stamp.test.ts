@@ -25,7 +25,13 @@ let chart: Array<{ externalAccountId: string; code: string | null; name: string 
 let storedCount: (n: number) => number = (n) => n
 
 mock.module('@/lib/db', {
-  namedExports: { db: { accountingAccount: { findMany: async () => chart } } },
+  namedExports: {
+    db: {
+      accountingAccount: { findMany: async () => chart },
+      // A stamp written through the shared client, i.e. OUTSIDE the fenced transaction, lands here with call 0.
+      setting: { upsert: async ({ where }: { where: { key: string } }) => { committed.push({ call: 0, kind: 'stamp', detail: where.key }) } },
+    },
+  },
 })
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/connectors/xero/settings', {
