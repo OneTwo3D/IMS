@@ -257,8 +257,8 @@ function pullRig(source: string, dry: 'true' | 'false', opts: { cutGuard?: boole
   const callsDir = createTempDirSync('ims-pull-rig-')
   let step = pullStep(source)
   if (opts.cutGuard) {
-    assert.ok(step.includes('    if $DRY_RUN; then\n'), 'precondition: the dry-run guard exists to cut')
-    step = step.replace('    if $DRY_RUN; then\n', '    if false; then\n')
+    assert.ok(step.includes('  elif $DRY_RUN; then\n'), 'precondition: the dry-run guard exists to cut')
+    step = step.replace('  elif $DRY_RUN; then\n', '  elif false; then\n')
   }
   const stubs = MUTATING.filter((n) => !n.startsWith('git-') && n !== 'copy_tree_into_new_dir')
     .map((n) => `${n}() { echo "CALL:${n} $*" >> "$CALLS"; }`)
