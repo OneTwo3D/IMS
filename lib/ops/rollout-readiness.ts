@@ -187,10 +187,10 @@ export async function collectRolloutReadiness(
   const timeoutMs = options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS
   const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_READINESS_CACHE_TTL_MS
   const staleAfter = new Date(now.getTime() + cacheTtlMs).toISOString()
-  const [preflightResult, adminHealthResult, reconciliationResult] = await Promise.all([
+  const [preflightResult, adminHealthResult, reconciliation] = await Promise.all([
     settleReadinessAdapter('production-preflight', adapters.runPreflight(), timeoutMs),
     settleReadinessAdapter('admin-health', adapters.collectAdminHealth(), timeoutMs),
-    settleReadinessAdapter('accounting-reconciliation', adapters.latestAccountingReconciliationRun(), timeoutMs),
+    collectAccountingReconciliationReadiness(adapters, now, timeoutMs),
   ])
 
   const blockers: RolloutReadinessFinding[] = []
@@ -201,48 +201,13 @@ export async function collectRolloutReadiness(
   const adminHealth = adminHealthResult.ok
     ? adminHealthResult.value
     : unavailableAdminHealth(checkedAt, adminHealthResult.error)
-  const latestAccountingReconciliationRun = reconciliationResult.ok
-    ? reconciliationResult.value
-    : null
-
-  if (!reconciliationResult.ok) {
-    warnings.push({
-      id: 'readiness-adapter:accounting-reconciliation',
-      severity: 'warning',
-      source: 'rollout-readiness',
-      message: 'Accounting reconciliation readiness check failed or timed out.',
-      details: { error: summarizeReadinessError(reconciliationResult.error) },
-    })
-  }
 
   classifyPreflight(preflight, blockers, warnings)
   classifyAdminHealth(adminHealth, blockers, warnings)
-  classifyAccountingReconciliation(latestAccountingReconciliationRun, blockers, warnings)
-
-  // o3d-6e4v: completeness is a question about the HISTORY, asked separately from the newest run's
-  // status and counts. An adapter that fails is not a clean answer: it is a blocker, because the only
-  // thing this check establishes is a proof, and there is none.
-  let accountingReconciliationProof: ReconciliationProof | null = null
-  if (latestAccountingReconciliationRun) {
-    const historyResult = await settleReadinessAdapter(
-      'accounting-reconciliation-history',
-      adapters.accountingReconciliationHistory(latestAccountingReconciliationRun),
-      timeoutMs,
-    )
-    if (historyResult.ok) {
-      accountingReconciliationProof = evaluateReconciliationProof(latestAccountingReconciliationRun, historyResult.value)
-      classifyReconciliationProof(accountingReconciliationProof, blockers, warnings)
-    } else {
-      blockers.push({
-        id: 'accounting-reconciliation:completeness-unevaluated',
-        severity: 'blocker',
-        source: 'accounting-reconciliation',
-        message: 'Whether the accounting reconciliation is complete could not be established: its run history could not be read.',
-        details: { error: summarizeReadinessError(historyResult.error) },
-      })
-    }
-    classifyReconciliationAge(latestAccountingReconciliationRun, now, warnings)
-  }
+  blockers.push(...reconciliation.blockers)
+  warnings.push(...reconciliation.warnings)
+  const latestAccountingReconciliationRun = reconciliation.latest
+  const accountingReconciliationProof = reconciliation.proof
 
   const status: RolloutReadinessStatus = blockers.length > 0
     ? 'blocked'
@@ -277,6 +242,69 @@ export async function collectRolloutReadiness(
       accountingReconciliationProof,
     },
   })
+}
+
+export type AccountingReconciliationReadiness = {
+  latest: LatestAccountingReconciliationRun | null
+  proof: ReconciliationProof | null
+  blockers: RolloutReadinessFinding[]
+  warnings: RolloutReadinessFinding[]
+}
+
+/**
+ * o3d-6e4v: EVERYTHING THE READINESS VERDICT SAYS ABOUT THE ACCOUNTING RECONCILIATION, in one place so the
+ * HTTP endpoint and the executable go/no-go gate (lib/ops/readiness-gate-collect.ts) read the same answer
+ * from the same code instead of two copies of it.
+ *
+ * Completeness is a question about the HISTORY, asked separately from the newest run's status and counts.
+ * An adapter that fails is never read as "no run" or "clean": the newest run being unreadable and the
+ * history being unreadable are both blockers, because the only thing this establishes is a proof and there
+ * is none. (Before o3d-6e4v an unreadable newest-run read was a WARNING, which `?allowWarnings=true`
+ * converts to HTTP 200.)
+ */
+export async function collectAccountingReconciliationReadiness(
+  adapters: Pick<RolloutReadinessAdapters, 'latestAccountingReconciliationRun' | 'accountingReconciliationHistory'>,
+  now: Date,
+  timeoutMs: number = DEFAULT_READINESS_TIMEOUT_MS,
+): Promise<AccountingReconciliationReadiness> {
+  const blockers: RolloutReadinessFinding[] = []
+  const warnings: RolloutReadinessFinding[] = []
+  const latestResult = await settleReadinessAdapter('accounting-reconciliation', adapters.latestAccountingReconciliationRun(), timeoutMs)
+  if (!latestResult.ok) {
+    blockers.push({
+      id: 'readiness-adapter:accounting-reconciliation',
+      severity: 'blocker',
+      source: 'rollout-readiness',
+      message: 'Accounting reconciliation readiness check failed or timed out, so whether the reconciliation is complete was not established.',
+      details: { error: summarizeReadinessError(latestResult.error) },
+    })
+    return { latest: null, proof: null, blockers, warnings }
+  }
+  const latest = latestResult.value
+  classifyAccountingReconciliation(latest, blockers, warnings)
+
+  let proof: ReconciliationProof | null = null
+  if (latest) {
+    const historyResult = await settleReadinessAdapter(
+      'accounting-reconciliation-history',
+      adapters.accountingReconciliationHistory(latest),
+      timeoutMs,
+    )
+    if (historyResult.ok) {
+      proof = evaluateReconciliationProof(latest, historyResult.value)
+      classifyReconciliationProof(proof, blockers, warnings)
+    } else {
+      blockers.push({
+        id: 'accounting-reconciliation:completeness-unevaluated',
+        severity: 'blocker',
+        source: 'accounting-reconciliation',
+        message: 'Whether the accounting reconciliation is complete could not be established: its run history could not be read.',
+        details: { error: summarizeReadinessError(historyResult.error) },
+      })
+    }
+    classifyReconciliationAge(latest, now, warnings)
+  }
+  return { latest, proof, blockers, warnings }
 }
 
 export function createRolloutReadinessHandler({
