@@ -63,6 +63,8 @@ test('owner answers of 2026-10-08 are in the map', () => {
   assert.equal(owner('woocommerce.order.trackship-reconcile', 'P2'), 'woo-mintsoft-plugin')
   assert.equal(owner('mintsoft.product.upsert', 'P2'), 'IMS')
   assert.equal(owner('mintsoft.order.cancel', 'P2'), 'IMS')
+  assert.equal(owner('mintsoft.order.amend', 'P2'), 'unknown', 'amending a bridge-created order is not settled, so it stays in shadow')
+  assert.equal(owner('mintsoft.order.create', 'P2'), 'IMS')
 })
 
 test('unknown owners are exactly the listed set (a change here is a decision, not an accident)', () => {
@@ -78,6 +80,7 @@ test('unknown owners are exactly the listed set (a change here is a decision, no
     'customer-email.order-confirmation@P1',
     'customer-email.order-confirmation@P2',
     'mintsoft.asn.create@P1',
+    'mintsoft.order.amend@P2',
     'mintsoft.order.comment@P1',
     'woocommerce.fx-rates@P1',
     'woocommerce.stock@P1',

@@ -46,6 +46,7 @@ export const PRODUCER_REASONS = [
   'not_ims_owned',
   'owner_unknown',
   'unreadable_obligation',
+  'obligation_time_required',
   'obligation_before_cutoff',
   'unreadable',
 ] as const
@@ -61,6 +62,7 @@ export const PRODUCER_REASON_TEXT: Record<ProducerReason, string> = {
   not_ims_owned: 'another writer owns this operation in the current phase',
   owner_unknown: 'who owns this operation in the current phase has not been established',
   unreadable_obligation: 'the business-event time of this work could not be read',
+  obligation_time_required: 'this operation needs the time of its business event and the producer did not supply it',
   obligation_before_cutoff: 'the business event happened before the live-from instant, so it belongs to the writer that owned it then',
   unreadable: 'the decision could not be evaluated',
 }
@@ -104,7 +106,7 @@ export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
   overview: [
     'The outbound-write hold refuses a request at the HTTP boundary. The producer-side hold decides earlier whether a piece of work is queued for delivery at all. For each destination and operation the decision is LIVE or SHADOW. A SHADOW is a record of what IMS would have written; it is never queued and never delivered later. The decision reads the environment only: no database and no network call.',
     '',
-    'Work is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and, where the work carries the time of its business event, that time is at or after the live-from instant. A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it.',
+    'Work is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is shadowed when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it.',
     '',
     'A grant without a live-from instant, or a live-from instant without a grant, is inconsistent. Both directions are safe (nothing is delivered), and both are reported. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination.',
   ].join('\n'),
@@ -113,7 +115,7 @@ export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
     '|---|---|---|',
     ...CUTOFF_ROWS,
     '',
-    'Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, a list or any other shape is unreadable and keeps the destination in shadow. Setting a variable does not start any writer; each destination also needs its outbound-write grant, and the ownership map decides which operations IMS may produce.',
+    'Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable and keeps the destination in shadow. Setting a variable does not start any writer; each destination also needs its outbound-write grant, and the ownership map decides which operations IMS may produce.',
   ].join('\n'),
 }
 

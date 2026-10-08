@@ -29,6 +29,8 @@ import { OUTBOUND_CONNECTORS, OUTBOUND_GRANT_ENV, type OutboundConnector } from 
 
 const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
 const NOW = new Date('2026-06-01T12:00:00Z')
+/** A business-event time after every cut-off used below, for cells that must reach LIVE on a row that requires one. */
+const LATE = new Date('2027-01-01T00:00:00Z')
 
 const GRANT_VALUE: Record<OutboundConnector, { ok: string; unreadable: string }> = {
   woocommerce: { ok: 'https://shop.example.com', unreadable: 'https://a.example.com,https://b.example.com' },
@@ -43,7 +45,7 @@ type ObligationCase = { label: string; value: Date | undefined; klass: 'absent' 
 
 const CUTOFF_CASES: CutoffCase[] = [
   { label: 'unset', value: undefined, klass: 'absent' },
-  { label: 'blank', value: '   ', klass: 'absent' },
+  { label: 'empty string', value: '', klass: 'absent' },
   { label: 'future', value: '2026-12-01T00:00:00Z', klass: 'future' },
   { label: 'past', value: '2026-01-01T00:00:00Z', klass: 'past', at: new Date('2026-01-01T00:00:00Z') },
   { label: 'past, fraction', value: '2026-01-01T00:00:00.250Z', klass: 'past', at: new Date('2026-01-01T00:00:00.250Z') },
@@ -51,6 +53,16 @@ const CUTOFF_CASES: CutoffCase[] = [
   { label: 'earlier today (same calendar day)', value: '2026-06-01T11:00:00Z', klass: 'past', at: new Date('2026-06-01T11:00:00Z') },
   { label: 'later today (same calendar day)', value: '2026-06-01T13:00:00Z', klass: 'future' },
   { label: 'garbage', value: 'soon', klass: 'malformed' },
+  { label: 'whitespace only', value: '   ', klass: 'malformed' },
+  { label: 'leading space', value: ' 2026-01-01T00:00:00Z', klass: 'malformed' },
+  { label: 'trailing space', value: '2026-01-01T00:00:00Z ', klass: 'malformed' },
+  { label: 'trailing tab', value: '2026-01-01T00:00:00Z\t', klass: 'malformed' },
+  { label: 'trailing newline', value: '2026-01-01T00:00:00Z\n', klass: 'malformed' },
+  { label: 'leading NBSP', value: '\u00a02026-01-01T00:00:00Z', klass: 'malformed' },
+  { label: 'trailing zero-width space', value: '2026-01-01T00:00:00Z\u200b', klass: 'malformed' },
+  { label: 'sub-millisecond (4 digits)', value: '2026-01-01T00:00:00.0001Z', klass: 'malformed' },
+  { label: 'sub-millisecond (9 digits, one ns past noon)', value: '2026-06-01T12:00:00.000000001Z', klass: 'malformed' },
+  { label: 'sub-millisecond zeros (6 digits)', value: '2026-01-01T00:00:00.000000Z', klass: 'malformed' },
   { label: 'date only', value: '2026-01-01', klass: 'malformed' },
   { label: 'no zone', value: '2026-01-01T00:00:00', klass: 'malformed' },
   { label: 'offset +00:00', value: '2026-01-01T00:00:00+00:00', klass: 'malformed' },
@@ -76,6 +88,8 @@ const OPERATION: Record<OutboundConnector, Record<OwnerCase, string>> = {
   mintsoft: { IMS: 'order.create', other: 'auth.login', unknown: 'no-such-operation' },
   woocommerce: { IMS: 'order.status', other: 'order.withdrawal-outcome', unknown: 'no-such-operation' },
 }
+/** IMS-owned operations whose row says obligationTime 'not-applicable'. Xero has none: every IMS-owned Xero row needs a document date. */
+const OPERATION_NOT_APPLICABLE: Partial<Record<OutboundConnector, string>> = { mintsoft: 'order.cancel', woocommerce: 'stock' }
 
 function envFor(destination: OutboundConnector, grant: GrantCase, cutoff: string | undefined): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {}
@@ -84,7 +98,8 @@ function envFor(destination: OutboundConnector, grant: GrantCase, cutoff: string
   return env
 }
 
-function oracleLive(grant: GrantCase, cutoff: CutoffCase, owner: OwnerCase, obligation: ObligationCase): boolean {
+function oracleLive(grant: GrantCase, cutoff: CutoffCase, owner: OwnerCase, obligation: ObligationCase, required: boolean): boolean {
+  if (required && obligation.value === undefined) return false
   return grant === 'ok'
     && cutoff.klass === 'past'
     && owner === 'IMS'
@@ -95,31 +110,91 @@ function oracleLive(grant: GrantCase, cutoff: CutoffCase, owner: OwnerCase, obli
 const call = (destination: OutboundConnector, operation: string, obligationAt: Date | undefined, env: Record<string, string | undefined>, now: Date = NOW) =>
   producerDisposition(destination, operation as never, obligationAt, { env, now })
 
-test('truth table: LIVE in exactly the allowed cells, over grant x cut-off x owner x obligationAt x destination', () => {
+test('truth table: LIVE in exactly the allowed cells, over grant x cut-off x owner/applicability x obligationAt x destination', () => {
   const grants: GrantCase[] = ['ok', 'absent', 'unreadable']
-  const owners: OwnerCase[] = ['IMS', 'other', 'unknown']
+  type Variant = { owner: OwnerCase; required: boolean; operation: string; label: string }
+  const variantsFor = (destination: OutboundConnector): Variant[] => {
+    const variants: Variant[] = [
+      { owner: 'IMS', required: true, operation: OPERATION[destination].IMS, label: 'IMS/required' },
+      { owner: 'other', required: true, operation: OPERATION[destination].other, label: 'other' },
+      { owner: 'unknown', required: true, operation: OPERATION[destination].unknown, label: 'unknown' },
+    ]
+    const notApplicable = OPERATION_NOT_APPLICABLE[destination]
+    if (notApplicable) variants.push({ owner: 'IMS', required: false, operation: notApplicable, label: 'IMS/not-applicable' })
+    return variants
+  }
   let cells = 0
   let live = 0
   let expectedLive = 0
   const wrong: string[] = []
   for (const destination of OUTBOUND_CONNECTORS) {
-    for (const grant of grants) for (const cutoff of CUTOFF_CASES) for (const owner of owners) for (const obligation of OBLIGATION_CASES) {
-      const actual = call(destination, OPERATION[destination][owner], obligation.value, envFor(destination, grant, cutoff.value))
-      const expected = oracleLive(grant, cutoff, owner, obligation) ? 'LIVE' : 'SHADOW'
+    for (const grant of grants) for (const cutoff of CUTOFF_CASES) for (const variant of variantsFor(destination)) for (const obligation of OBLIGATION_CASES) {
+      const actual = call(destination, variant.operation, obligation.value, envFor(destination, grant, cutoff.value))
+      const expected = oracleLive(grant, cutoff, variant.owner, obligation, variant.required) ? 'LIVE' : 'SHADOW'
       cells += 1
       if (actual === 'LIVE') live += 1
       if (expected === 'LIVE') expectedLive += 1
-      if (actual !== expected) wrong.push(`${destination} grant=${grant} cutoff=${cutoff.label} owner=${owner} obligation=${obligation.label}: got ${actual}, want ${expected}`)
+      if (actual !== expected) wrong.push(`${destination} grant=${grant} cutoff=${cutoff.label} variant=${variant.label} obligation=${obligation.label}: got ${actual}, want ${expected}`)
     }
   }
   console.log(`# precondition: cells=${cells} live=${live} expectedLive=${expectedLive}`)
-  assert.equal(cells, 3 * 3 * CUTOFF_CASES.length * 3 * OBLIGATION_CASES.length)
-  // Derived by hand, not from the oracle: per destination, 3 past cut-offs (Jan 2026) x {absent, 2026-03-01} + the
-  // 'earlier today' cut-off x {absent} = 3 x 2 + 1 = 7; three destinations = 21.
-  assert.equal(expectedLive, 21)
+  // 3 destinations, 3 grants, N cut-offs, 4 obligations, and (3 + 1) variants for mintsoft and woocommerce, 3 for xero = 11.
+  assert.equal(cells, 3 * CUTOFF_CASES.length * OBLIGATION_CASES.length * 11)
+  // Derived by hand, not from the oracle. Past cut-offs: three in Jan 2026 and 'earlier today' (2026-06-01T11:00).
+  // Obligations: absent, 2025-12-31 (before), 2026-03-01 (after Jan, before 'earlier today'), invalid.
+  //   IMS/required   : only '2026-03-01' qualifies, and only against the 3 Jan cut-offs      = 3 per destination x 3 = 9
+  //   IMS/not-applic.: absent qualifies against all 4 past cut-offs, '2026-03-01' against 3  = 7 for mintsoft and woocommerce = 14
+  assert.equal(expectedLive, 9 + 14)
   assert.ok(expectedLive > 0, 'the table must contain LIVE cells, or "LIVE only in the allowed cells" is vacuous')
   assert.deepEqual(wrong, [])
   assert.equal(live, expectedLive)
+})
+
+test('arm g: a row that requires the business-event time is SHADOW (obligation_time_required) when the producer omits it', async () => {
+  const { ownershipRowFor } = await import('../../lib/security/writer-ownership-map.ts')
+  for (const destination of OUTBOUND_CONNECTORS) {
+    const required = ownershipRowFor(destination, OPERATION[destination].IMS)
+    assert.equal(required?.obligationTime, 'required', `precondition: ${destination}.${OPERATION[destination].IMS} requires it`)
+    const env = envFor(destination, 'ok', '2026-01-01T00:00:00Z')
+    const omitted = explainProducerDisposition(destination, OPERATION[destination].IMS as never, undefined, { env, now: NOW })
+    const given = explainProducerDisposition(destination, OPERATION[destination].IMS as never, new Date('2026-03-01T00:00:00Z'), { env, now: NOW })
+    console.log(`# arm g ${destination}: omitted=${omitted.disposition}/${omitted.reason} given=${given.disposition}/${given.reason}`)
+    assert.deepEqual([omitted.disposition, omitted.reason], ['SHADOW', 'obligation_time_required'])
+    assert.equal(given.disposition, 'LIVE')
+    const notApplicable = OPERATION_NOT_APPLICABLE[destination]
+    if (notApplicable) {
+      assert.equal(ownershipRowFor(destination, notApplicable)?.obligationTime, 'not-applicable')
+      assert.equal(call(destination, notApplicable, undefined, env), 'LIVE', 'isolating arm: a not-applicable row is LIVE without it')
+    }
+  }
+})
+
+test('arm h: cut-off precision beyond a millisecond is unreadable, never rounded down into an earlier instant', () => {
+  const op = OPERATION.xero.IMS
+  const obligation = new Date('2026-07-01T00:00:00Z')
+  const env = envFor('xero', 'ok', '2026-06-01T12:00:00.000000001Z')
+  const atFloor = new Date('2026-06-01T12:00:00.000Z')
+  const decision = explainProducerDisposition('xero', op as never, obligation, { env, now: atFloor })
+  console.log(`# arm h: ns cut-off at its millisecond floor => ${decision.disposition}/${decision.reason}`)
+  assert.deepEqual([decision.disposition, decision.reason], ['SHADOW', 'unreadable_cutoff'])
+  // Boundary: exactly millisecond precision is still read, to the millisecond.
+  assert.equal(parseProducerCutoff('2026-06-01T12:00:00.001Z').ok, true)
+  assert.equal(parseProducerCutoff('2026-06-01T12:00:00.0010Z').ok, false)
+  assert.equal(parseProducerCutoff('2026-06-01T12:00:00.0000Z').ok, false)
+})
+
+test('arm i: surrounding whitespace on a cut-off is unreadable (no trimming), and NOT absent', () => {
+  const decisions = ['2026-01-01T00:00:00Z ', ' 2026-01-01T00:00:00Z', '\t2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z\n', '\u00a02026-01-01T00:00:00Z', '2026-01-01T00:00:00Z\u200b', '   '].map((value) => {
+    const decision = explainProducerDisposition('xero', 'purchase.bill', new Date('2026-03-01T00:00:00Z'), { env: envFor('xero', 'ok', value), now: NOW })
+    return { value, ...decision }
+  })
+  for (const d of decisions) {
+    console.log(`# arm i ${JSON.stringify(d.value)}: ${d.disposition}/${d.reason}`)
+    assert.deepEqual([d.disposition, d.reason], ['SHADOW', 'unreadable_cutoff'])
+  }
+  assert.equal(explainProducerDisposition('xero', 'purchase.bill', new Date('2026-03-01T00:00:00Z'), { env: envFor('xero', 'ok', '2026-01-01T00:00:00Z'), now: NOW }).disposition, 'LIVE', 'isolating arm: the same value without the whitespace is LIVE')
+  assert.equal(parseProducerCutoff('').ok, false)
+  assert.equal(producerGrantCutoffAgreement('xero', envFor('xero', 'ok', '2026-01-01T00:00:00Z ')).state, 'unreadable')
 })
 
 test('operation ownership used by the table is what the map says (the table cannot drift from the map)', async () => {
@@ -169,12 +244,12 @@ test('arm b: a cut-off that is not strict ISO-8601 with Z is SHADOW with reason 
 test('arm c: a future instant is SHADOW until now >= cut-off, to the millisecond, not the calendar day', () => {
   const env = envFor('xero', 'ok', '2026-06-01T12:00:00.001Z')
   const op = OPERATION.xero.IMS
-  const before = call('xero', op, undefined, env, new Date('2026-06-01T12:00:00.000Z'))
-  const at = call('xero', op, undefined, env, new Date('2026-06-01T12:00:00.001Z'))
-  const after = call('xero', op, undefined, env, new Date('2026-06-01T12:00:00.002Z'))
+  const before = call('xero', op, LATE, env, new Date('2026-06-01T12:00:00.000Z'))
+  const at = call('xero', op, LATE, env, new Date('2026-06-01T12:00:00.001Z'))
+  const after = call('xero', op, LATE, env, new Date('2026-06-01T12:00:00.002Z'))
   console.log(`# arm c: before=${before} at=${at} after=${after}`)
   assert.deepEqual([before, at, after], ['SHADOW', 'LIVE', 'LIVE'])
-  const sameDayLater = explainProducerDisposition('xero', op as never, undefined, { env: envFor('xero', 'ok', '2026-06-01T13:00:00Z'), now: NOW })
+  const sameDayLater = explainProducerDisposition('xero', op as never, LATE, { env: envFor('xero', 'ok', '2026-06-01T13:00:00Z'), now: NOW })
   assert.equal(sameDayLater.reason, 'before_cutoff')
   assert.equal(sameDayLater.phase, 'P1')
 })
@@ -193,14 +268,14 @@ test('arm d: an operation IMS does not own is SHADOW even when fully granted and
   assert.equal(tax.owner, 'unknown')
   assert.equal(tax.reason, 'owner_unknown')
   // Isolating arm: the same environment IS live for an IMS-owned operation.
-  assert.equal(call('xero', 'purchase.bill', undefined, env), 'LIVE')
+  assert.equal(call('xero', 'purchase.bill', LATE, env), 'LIVE')
 })
 
 test('arm e: obligationAt before the cut-off is SHADOW; at the cut-off is LIVE; an unreadable obligationAt is SHADOW', () => {
   const env = envFor('mintsoft', 'ok', '2026-01-01T00:00:00Z')
   const op = OPERATION.mintsoft.IMS
   const cases: Array<[string, Date | undefined, string]> = [
-    ['absent', undefined, 'LIVE'],
+    ['absent (row requires it)', undefined, 'SHADOW'],
     ['one ms before', new Date('2025-12-31T23:59:59.999Z'), 'SHADOW'],
     ['exactly at', CUTOFF_PAST, 'LIVE'],
     ['after', new Date('2026-03-01T00:00:00Z'), 'LIVE'],
@@ -235,28 +310,28 @@ test('arm f: a throwing environment or clock is SHADOW with reason unreadable, a
     assert.deepEqual([a.reason, b.reason, c.reason], ['unreadable', 'unreadable', 'unreadable'])
     assert.equal(producerDisposition(destination, op, undefined, { env: throwingEnv }), 'SHADOW')
   }
-  assert.equal(call('xero', 'purchase.bill', undefined, liveEnv), 'LIVE', 'isolating arm: the same inputs without the throw are LIVE')
+  assert.equal(call('xero', 'purchase.bill', LATE, liveEnv), 'LIVE', 'isolating arm: the same inputs without the throw are LIVE')
   assert.equal(producerGrantCutoffAgreement('xero', throwingEnv).state, 'unreadable')
 })
 
 test('property: never throws, and never LIVE unless the cut-off is a strict instant and the grant is readable (seeded)', () => {
   let seed = 0x5eed
   const rand = (n: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % n }
-  const fragments = ['2026', '-', '01', 'T', ':', 'Z', 'z', '+', '00', '.', ',', ' ', '1', '9', 'x', '\n', '\u0000', '24', '60', '99', '2026-01-01T00:00:00', '0']
+  const fragments = ['\t', '\u00a0', '\u200b', '.000000001', '.0001', '2026', '-', '01', 'T', ':', 'Z', 'z', '+', '00', '.', ',', ' ', '1', '9', 'x', '\n', '\u0000', '24', '60', '99', '2026-01-01T00:00:00', '0']
   const randomText = () => Array.from({ length: 1 + rand(10) }, () => fragments[rand(fragments.length)]).join('')
   const weirdValues: unknown[] = [undefined, null, 0, 1, NaN, {}, [], 'LIVE', true, () => 1]
-  const STRICT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?Z$/
+  const STRICT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z$/
   let live = 0
   let strict = 0
   let total = 0
   for (let i = 0; i < 4000; i++) {
     const destination = OUTBOUND_CONNECTORS[rand(3)]!
-    const cutoffText = rand(5) === 0 ? '2026-01-01T00:00:00Z' : randomText()
-    const grantMode = rand(3)
+    const cutoffText = rand(3) === 0 ? (rand(2) ? ['', ' ', '\t', '\n'][rand(4)]! + '2026-01-01T00:00:00Z' + ['', ' ', '\t', '\n', '\u00a0', '\u200b'][rand(6)]! : '2026-01-01T00:00:00Z') : randomText()
+    const grantMode = rand(2) ? 0 : rand(3)
     const env: Record<string, string | undefined> = { [PRODUCER_CUTOFF_ENV[destination]]: cutoffText }
     if (grantMode === 0) env[OUTBOUND_GRANT_ENV[destination]] = GRANT_VALUE[destination].ok
     if (grantMode === 1) env[OUTBOUND_GRANT_ENV[destination]] = randomText()
-    const obligation = rand(4) === 0 ? (weirdValues[rand(weirdValues.length)] as Date | undefined) : (rand(2) ? new Date(rand(2) ? 1_800_000_000_000 : NaN) : undefined)
+    const obligation = rand(5) === 0 ? (weirdValues[rand(weirdValues.length)] as Date | undefined) : (rand(5) === 0 ? undefined : new Date(rand(6) === 0 ? NaN : 1_800_000_000_000))
     const operation = rand(4) === 0 ? (weirdValues[rand(weirdValues.length)] as never) : (OPERATION[destination].IMS as never)
     let result: string
     assert.doesNotThrow(() => { result = producerDisposition(destination, operation, obligation, { env, now: rand(6) === 0 ? new Date(NaN) : NOW }) })
@@ -265,7 +340,8 @@ test('property: never throws, and never LIVE unless the cut-off is a strict inst
     if (STRICT.test(cutoffText)) strict += 1
     if (result === 'LIVE') {
       live += 1
-      assert.ok(STRICT.test(cutoffText.trim()), `LIVE on a malformed cut-off: ${JSON.stringify(cutoffText)}`)
+      assert.ok(STRICT.test(cutoffText), `LIVE on a malformed cut-off: ${JSON.stringify(cutoffText)}`)
+      assert.ok(obligation instanceof Date && !Number.isNaN(obligation.getTime()), 'LIVE on a required row without a valid obligationAt')
       assert.equal(grantMode, 0, 'LIVE without a readable grant')
     }
   }

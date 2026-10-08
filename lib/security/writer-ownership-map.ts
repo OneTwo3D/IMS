@@ -138,9 +138,9 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'required',
     note: 'IMS creates only orders paid from the live-from instant; it never creates an order the bridge created (the obligation time is the paid time).',
   }),
-  row('mintsoft', 'order.amend', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
+  row('mintsoft', 'order.amend', { P1: 'woo-mintsoft-plugin', P2: 'unknown' }, {
     obligationTime: 'required',
-    note: 'Whether IMS may amend an order that the bridge created is not settled; passing the obligation time keeps such an order in shadow.',
+    note: 'Unresolved: whether IMS may amend an order the bridge created (decision D8 settles cancel and hold only). Unknown resolves to SHADOW until decided.',
   }),
   row('mintsoft', 'order.cancel', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',

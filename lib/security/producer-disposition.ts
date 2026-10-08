@@ -11,8 +11,9 @@
  *  2. the destination's live-from variable is set and is one UTC instant in ISO-8601 with an explicit Z;
  *  3. now is at or after that instant (a future instant is a scheduled flip and stays SHADOW until then);
  *  4. the ownership map says IMS owns the operation in the phase that 1-3 establish (P2);
- *  5. when the caller passes `obligationAt`, the business-event time of the work, it is at or after the
- *     instant (work for an event that happened before it belongs to the writer that owned it then).
+ *  5. the business-event time of the work, `obligationAt`, is at or after the instant (work for an event that
+ *     happened before it belongs to the writer that owned it then); for a row the map marks obligationTime
+ *     'required' it MUST be passed, and omitting it is SHADOW. Rows marked 'not-applicable' may omit it.
  *
  * Absent, unreadable, inconsistent, unmapped and thrown are all SHADOW. The function never throws and
  * never returns LIVE for a value it could not read.
@@ -56,16 +57,21 @@ type CutoffRead =
   | { ok: true; at: Date }
   | { ok: false; reason: 'absent' | 'unreadable' }
 
-const ISO_UTC_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?Z$/
+const ISO_UTC_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?Z$/
 
-/** One UTC instant in ISO-8601 with an explicit Z. No lenient Date.parse: a date alone, an offset, a list or text is unreadable. */
+/**
+ * One UTC instant in ISO-8601 with an explicit Z, to at most a millisecond. No lenient Date.parse, and NO trimming:
+ * a date alone, an offset, a list, text, surrounding whitespace of any kind, or precision finer than a millisecond
+ * (which a Date cannot hold and would be rounded down into an EARLIER instant) is unreadable. Only unset and the
+ * empty string are absent.
+ */
 export function parseProducerCutoff(raw: string | undefined): CutoffRead {
-  if (raw === undefined || raw.trim() === '') return { ok: false, reason: 'absent' }
-  const match = ISO_UTC_RE.exec(raw.trim())
+  if (raw === undefined || raw === '') return { ok: false, reason: 'absent' }
+  const match = ISO_UTC_RE.exec(raw)
   if (!match) return { ok: false, reason: 'unreadable' }
   const [year, month, day, hour, minute] = [match[1], match[2], match[3], match[4], match[5]].map(Number) as [number, number, number, number, number]
   const second = match[6] === undefined ? 0 : Number(match[6])
-  const millis = match[7] === undefined ? 0 : Number(match[7].padEnd(3, '0').slice(0, 3))
+  const millis = match[7] === undefined ? 0 : Number(match[7].padEnd(3, '0'))
   if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return { ok: false, reason: 'unreadable' }
   const at = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millis))
   // A day that does not exist (2026-02-30) rolls over in Date.UTC; reject any roll-over.
@@ -115,7 +121,11 @@ function evaluate<D extends OutboundConnector>(
   if (owner === 'unknown') return shadow('owner_unknown', base)
   if (owner !== 'IMS') return shadow('not_ims_owned', base)
 
-  if (obligationAt !== undefined) {
+  if (obligationAt === undefined) {
+    // A row that says the business-event time is required cannot be LIVE without it: an omitted time would
+    // re-produce a pre-cut-off obligation as new work.
+    if (row?.obligationTime === 'required') return shadow('obligation_time_required', base)
+  } else {
     if (!(obligationAt instanceof Date) || Number.isNaN(obligationAt.getTime())) return shadow('unreadable_obligation', base)
     if (obligationAt.getTime() < cutoff.at.getTime()) return shadow('obligation_before_cutoff', base)
   }
