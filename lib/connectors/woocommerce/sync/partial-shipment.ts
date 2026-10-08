@@ -15,6 +15,7 @@
 import { createHmac } from 'node:crypto'
 
 import { db } from '@/lib/db'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getSettingValues } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '../url-safety'
@@ -119,6 +120,7 @@ export async function pushPartialShipmentToWc(
     const json = (await res.json().catch(() => ({}))) as { ok?: boolean; all_done?: boolean; duplicate?: boolean }
     return { supported: true, ok: json.ok !== false, allDone: json.all_done, duplicate: json.duplicate }
   } catch (e) {
-    return { supported: true, ok: false, error: String(e) }
+    // A hold is reported with its own text, not as `String(e)` (which would prefix the error class).
+    return { supported: true, ok: false, error: isOutboundWriteHeldError(e) ? e.message : String(e) }
   }
 }

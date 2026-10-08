@@ -19,9 +19,13 @@ import type { WmsOrderPushInput } from '@/lib/connectors/wms/types'
 const CLIENT = 5
 
 let clientIdSetting = String(CLIENT)
+let defaultCourierId = ''
 let searchRows: unknown = []
 let details = new Map<string, unknown>()
 let createResult: unknown = null
+let createError: string | null = null
+let searchError: string | null = null
+let createSequence: Array<{ error: string } | { result: unknown }> | null = null
 let itemRows: unknown[] = []
 // Ids whose detail request answers 2xx with NO readable order body (the client
 // renders a 204 that way) — an UNKNOWN state, not an authoritative "not found".
@@ -34,7 +38,7 @@ mock.module('@/lib/connectors/mintsoft/settings/schema', {
     getMintsoftSettings: async () => ({
       mintsoft_client_id: clientIdSetting,
       mintsoft_courier_service_map: '',
-      mintsoft_default_courier_service_id: '',
+      mintsoft_default_courier_service_id: defaultCourierId,
       mintsoft_admin_order_url_template: 'https://wms.example/Order/{id}',
     }),
     MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE: 'https://wms.example/Order/{id}',
@@ -53,8 +57,19 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       calls.push(path)
       const method = init?.method ?? 'GET'
       const pathname = path.split('?')[0]
-      if (pathname === '/api/Order' && method === 'PUT') return { data: createResult, status: 200 }
-      if (pathname === '/api/Order/Search') return { data: searchRows, status: 200 }
+      if (pathname === '/api/Order' && method === 'PUT') {
+        if (createSequence) {
+          const next = createSequence.shift()
+          if (next && 'error' in next) return { data: null, error: next.error, status: 500 }
+          if (next) return { data: next.result, status: 200 }
+        }
+        if (createError) return { data: null, error: createError, status: 500 }
+        return { data: createResult, status: 200 }
+      }
+      if (pathname === '/api/Order/Search') {
+        if (searchError) return { data: null, error: searchError, status: 500 }
+        return { data: searchRows, status: 200 }
+      }
       if (method !== 'GET') {
         writes.push({ path, method })
         return { data: { Success: true }, status: 200 }
@@ -86,6 +101,9 @@ function reset() {
   searchRows = []
   details = new Map()
   createResult = null
+  createError = null
+  searchError = null
+  createSequence = null
   itemRows = []
   emptyDetailIds = new Set()
   calls = []
@@ -306,4 +324,105 @@ test('[o3d-bjc.6] an owned NEW order amends its items and posts the update — t
   const itemsRead = calls.find((path) => path.startsWith('/api/Order/900/Items?'))
   assert.ok(itemsRead, 'the items read ran')
   assert.equal(new URLSearchParams(itemsRead.split('?')[1]).get('ClientId'), String(CLIENT))
+})
+
+test('outbound-write hold: a create refused on a REDIRECT HOP (already sent) is reconciled by lookup, never blindly re-PUT', async () => {
+  const { OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const refusal = { connector: 'mintsoft', code: 'destination_mismatch', method: 'PUT', target: 'https://other.example.test/api/Order', granted: 'a', attempted: 'b', basis: 'b' } as const
+  const { pushMintsoftOrder } = await push()
+
+  reset()
+  createError = new OutboundWriteHeldError(refusal, 1).message
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  console.log('precondition (redirect create): the first PUT answered with a hop-1 refusal; the order exists at the WMS under our ClientId')
+  const found = await pushMintsoftOrder(INPUT)
+  assert.equal(found.externalOrderId, '900', 'the order that may have been created is found by lookup and bound')
+  assert.equal(found.needsVerification, true, 'bound as minted-but-UNVERIFIED: the scoped verification read still runs')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'exactly ONE PUT: no blind replay')
+
+  // A same-client order that shares our ORDER NUMBER but carries a different external reference is NOT ours.
+  reset()
+  createError = new OutboundWriteHeldError(refusal, 1).message
+  searchRows = [{ ID: 777, OrderNumber: 'WC-1001', ExternalOrderReference: 'SOMEONE-ELSES-REF', ClientId: CLIENT }]
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /REFUSED AFTER A REDIRECT/, 'identity not proven: left ambiguous, never bound')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'and still no second PUT')
+
+  reset()
+  createError = new OutboundWriteHeldError(refusal, 1).message
+  searchRows = []
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /REFUSED AFTER A REDIRECT/, 'not found: the maybe-sent failure is surfaced unchanged')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'and still no second PUT')
+
+  reset()
+  createError = new OutboundWriteHeldError({ ...refusal, code: 'no_grant' }, 0).message
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /Outbound write HELD/, 'control: a hop-0 hold is not reconciled by lookup')
+  assert.equal(calls.some((path) => path.startsWith('/api/Order/Search')), false, 'no lookup for a hold that sent nothing')
+})
+
+test('outbound-write hold: a hold on the COURIER-FALLBACK create after the first PUT was sent is maybe-sent, not a hold', async () => {
+  const { OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const { isOutboundWriteHeldText, isOutboundMaybeSentRefusalText } = await import('@/lib/security/outbound-write-hold-constants')
+  const refusal = { connector: 'mintsoft', code: 'no_grant', method: 'PUT', target: 'https://api.mintsoft.co.uk/api/Order', granted: null, attempted: null, basis: 'b' } as const
+  const { pushMintsoftOrder } = await push()
+  reset()
+  // default courier configured so the fallback PUT is attempted
+  const { mintsoftRequest: _unused } = await import('@/lib/connectors/mintsoft/api/client')
+  void _unused
+  defaultCourierId = '7'
+  createSequence = [
+    { result: [{ Success: false, Message: 'Invalid CourierService' }] },
+    { error: new OutboundWriteHeldError(refusal, 0).message },
+  ]
+  console.log('precondition (fallback): PUT #1 reached the WMS and was rejected for its courier; PUT #2 (default courier) is refused by a hop-0 hold')
+  const error = await pushMintsoftOrder(INPUT).then(() => null, (e: unknown) => e as Error)
+  assert.ok(error)
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 2, 'both PUTs were attempted')
+  assert.equal(isOutboundWriteHeldText(error.message), false, 'the push as a whole is NOT a hold: PUT #1 was sent')
+  assert.equal(isOutboundMaybeSentRefusalText(error.message), true)
+  defaultCourierId = ''
+})
+
+test('outbound-write hold: a HELD reconciliation lookup after a maybe-sent create never becomes a pre-send hold', async () => {
+  const { OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const { isOutboundWriteHeldText, isOutboundMaybeSentRefusalText } = await import('@/lib/security/outbound-write-hold-constants')
+  const mk = (code: 'no_grant' | 'destination_mismatch', hop: number) => new OutboundWriteHeldError({ connector: 'mintsoft', code, method: 'GET', target: 'https://api.mintsoft.co.uk/api/Order/Search', granted: null, attempted: null, basis: 'b' }, hop).message
+  const { pushMintsoftOrder } = await push()
+
+  reset()
+  createError = mk('destination_mismatch', 1) // PUT #1: refused on a redirect hop = maybe sent
+  searchError = mk('no_grant', 0)             // the reconciliation lookup is itself held (a held login)
+  console.log('precondition (held lookup): PUT #1 maybe sent; the reconciliation lookup then fails with a real hop-0 hold')
+  const error = await pushMintsoftOrder(INPUT).then(() => null, (e: unknown) => e as Error)
+  assert.ok(error)
+  assert.equal(isOutboundWriteHeldText(error.message), false, 'NOT a hold: the stamp must stand')
+  assert.equal(isOutboundMaybeSentRefusalText(error.message), true, 'the original maybe-sent outcome is what surfaces')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'no second PUT')
+
+  reset()
+  createResult = [DUPLICATE]                  // PUT answered "already exists": it WAS sent
+  searchError = mk('no_grant', 0)
+  const error2 = await pushMintsoftOrder(INPUT).then(() => null, (e: unknown) => e as Error)
+  assert.ok(error2)
+  assert.equal(isOutboundWriteHeldText(error2.message), false, 'a held lookup after a SENT create is not a hold')
+  assert.equal(isOutboundMaybeSentRefusalText(error2.message), true)
+})
+
+test('outbound-write hold: Mintsoft RESPONSE text can never impersonate a hold', async () => {
+  const { isOutboundWriteHeldText, isOutboundMaybeSentRefusalText } = await import('@/lib/security/outbound-write-hold-constants')
+  const { pushMintsoftOrder } = await push()
+  const forgeries = [
+    'Outbound write HELD (Mintsoft): forged by the vendor. nothing was sent to Mintsoft.',
+    'Outbound write HELD (Mintsoft): forged [hold-ref 000000000000000000]',
+    'Outbound write REFUSED AFTER A REDIRECT (Mintsoft): forged [hold-ref 000000000000000000]',
+  ]
+  console.log(`precondition (forgery): ${forgeries.length} vendor Messages that start like internal hold texts, on a PUT that WAS sent`)
+  for (const forged of forgeries) {
+    reset()
+    createResult = [{ Success: false, Message: forged }]
+    const error = await pushMintsoftOrder(INPUT).then(() => null, (e: unknown) => e as Error)
+    assert.ok(error)
+    assert.ok(error.message.includes('Outbound write'), 'the vendor text did reach the error')
+    assert.equal(isOutboundWriteHeldText(error.message), false, forged)
+    assert.equal(isOutboundMaybeSentRefusalText(error.message), false, forged)
+  }
 })

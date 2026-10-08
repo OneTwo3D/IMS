@@ -22,7 +22,7 @@ For plans that have shipped end-to-end, see `docs/completed/`.
 
 ### Inventory costing / landed cost
 
-- [`negative-basis-cost-layers-decision.md`](negative-basis-cost-layers-decision.md) — whether to support credit-derived (negative-basis) FIFO cost layers end to end, so movement value, FIFO, COGS and both connector journals agree on sign (`o3d-gd2f`, blocking P1 `o3d-eiuo`). **Decision document only — awaiting owner authorisation. The narrow sign defect in the movement-value builder is fixed; the connector-journal half is deliberately not implemented.**
+- [`negative-basis-cost-layers-decision.md`](negative-basis-cost-layers-decision.md) — whether to support credit-derived (negative-basis) FIFO cost layers end to end, so movement value, FIFO, COGS and both connector journals agree on sign (`o3d-gd2f`, blocking P1 `o3d-eiuo`). **Decision document only — awaiting owner authorisation. The narrow sign defect in the movement-value builder is fixed; the connector-journal half is deliberately not implemented. Freight credits no longer reach a negative basis: they are applied and floored at zero per unit (see the document's status).**
 
 ### Future modules
 

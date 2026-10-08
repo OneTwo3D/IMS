@@ -13,6 +13,7 @@
  * reconciliation sweeps (X-02) that compare GL movement against the IMS subledger.
  */
 import { readFileSync, writeFileSync } from 'node:fs'
+import { guardedExternalFetch } from '../../../lib/security/guarded-external-fetch'
 import { Client } from 'pg'
 import { xeroGet, xeroPost } from '../../../lib/connectors/xero/api.ts'
 import { getAccessToken } from '../../../lib/connectors/xero/auth.ts'
@@ -36,7 +37,7 @@ async function xeroDelete(path: string): Promise<{ ok: boolean; status: number; 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 30_000)
   try {
-    const res = await fetch(`${XERO_BASE_URL}/${path}`, {
+    const res = await guardedExternalFetch(`${XERO_BASE_URL}/${path}`, {
       method: 'DELETE',
       headers: {
         Authorization: `Bearer ${auth.accessToken}`,
@@ -44,7 +45,7 @@ async function xeroDelete(path: string): Promise<{ ok: boolean; status: number; 
         Accept: 'application/json',
       },
       signal: controller.signal,
-    })
+    }, { connectorName: 'Xero' })
     if (res.ok) return { ok: true, status: res.status }
     return { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 300) }
   } catch (e) {

@@ -1,3 +1,4 @@
+import { grantXeroWrites } from '../helpers/outbound-grants'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { readFileSync } from 'node:fs'
@@ -84,6 +85,7 @@ mock.module('@/lib/connectors/xero/auth', {
       // round 5 the authorisation ran before this; under round 6 it runs after it, which is what makes
       // the checked tenant and the used tenant the same resolution.
       trace.push('resolve-auth')
+      grantXeroWrites(currentTenant)
       return { accessToken: 'access-token', tenantId: currentTenant }
     },
     getStoredTenantBlockReason: async () => null,

@@ -18,6 +18,7 @@
 import { createHmac } from 'node:crypto'
 
 import { db } from '@/lib/db'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getSettingValues } from '@/lib/settings-store'
 import type { FxRatePush, FxRatePushResult } from '../types'
@@ -77,7 +78,7 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
     const json = (await res.json().catch(() => ({}))) as { pushed?: number; ok?: boolean }
     return { supported: true, pushed: Number(json.pushed ?? rates.length), errors: [] }
   } catch (e) {
-    return { supported: true, pushed: 0, errors: [String(e)] }
+    return { supported: true, pushed: 0, errors: [isOutboundWriteHeldError(e) ? e.message : String(e)] }
   }
 }
 
@@ -131,6 +132,9 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
       connectorName: 'WooCommerce',
     })
   } catch (e) {
+    // The probe is a POST, so the outbound-write hold governs it. A held probe says so; it did not
+    // reach the store, so it cannot be reported as the store being unreachable.
+    if (isOutboundWriteHeldError(e)) return { status: 'NOT_CONFIGURED', message: e.message }
     return {
       status: 'UNREACHABLE',
       message: `Could not reach ${endpoint}: ${String(e).slice(0, 200)}`,

@@ -4,6 +4,7 @@
 
 import { db } from '@/lib/db'
 import { xeroGet, xeroGetCached } from './api'
+import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
 
 const XERO_CONNECTOR = 'xero'
 
@@ -23,56 +24,58 @@ type AccountingAccountResponse = {
  * Pull the full chart of accounts from Xero and upsert into AccountingAccount.
  */
 export async function syncChartOfAccounts(): Promise<{ synced: number; errors: string[] }> {
+  // o3d-6thk1 round 3: the connection the fetch is made under is remembered BEFORE it, and the write below is
+  // refused if a rebind happened in between (see connection-fence.ts). Without that, a refresh that fetched
+  // organisation A could land A's chart AFTER the rebind to B had cleared the cache, and the Sync page would
+  // offer A's accounts for B's re-map.
+  const connection = await captureXeroConnection()
   const res = await xeroGet<AccountingAccountResponse>('Accounts')
   if (!res.ok || !res.data) {
     return { synced: 0, errors: [res.error ?? 'Failed to fetch accounts'] }
   }
+  const accounts = res.data.Accounts
 
-  const errors: string[] = []
-  let synced = 0
-
-  for (const acc of res.data.Accounts) {
-    try {
-      await db.accountingAccount.upsert({
-        where: {
-          connector_externalAccountId: {
+  // ALL-OR-NOTHING inside one transaction held under the lock: a statement that fails inside an interactive
+  // transaction aborts it, so a per-account failure now fails the refresh (and is reported) instead of
+  // leaving a half-written chart.
+  let fenced
+  try {
+    fenced = await withXeroConnectionFence(connection, async (tx) => {
+      for (const acc of accounts) {
+        await tx.accountingAccount.upsert({
+          where: { connector_externalAccountId: { connector: XERO_CONNECTOR, externalAccountId: acc.AccountID } },
+          create: {
             connector: XERO_CONNECTOR,
             externalAccountId: acc.AccountID,
+            code: acc.Code ?? null,
+            name: acc.Name,
+            type: acc.Type,
+            taxType: acc.TaxType ?? null,
+            active: acc.Status === 'ACTIVE',
+            syncedAt: new Date(),
           },
-        },
-        create: {
-          connector: XERO_CONNECTOR,
-          externalAccountId: acc.AccountID,
-          code: acc.Code ?? null,
-          name: acc.Name,
-          type: acc.Type,
-          taxType: acc.TaxType ?? null,
-          active: acc.Status === 'ACTIVE',
-          syncedAt: new Date(),
-        },
-        update: {
-          code: acc.Code ?? null,
-          name: acc.Name,
-          type: acc.Type,
-          taxType: acc.TaxType ?? null,
-          active: acc.Status === 'ACTIVE',
-          syncedAt: new Date(),
-        },
+          update: {
+            code: acc.Code ?? null,
+            name: acc.Name,
+            type: acc.Type,
+            taxType: acc.TaxType ?? null,
+            active: acc.Status === 'ACTIVE',
+            syncedAt: new Date(),
+          },
+        })
+      }
+      // Deactivate accounts that no longer exist in Xero
+      await tx.accountingAccount.updateMany({
+        where: { connector: XERO_CONNECTOR, externalAccountId: { notIn: accounts.map((a) => a.AccountID) } },
+        data: { active: false },
       })
-      synced++
-    } catch (e) {
-      errors.push(`Account ${acc.Code}: ${String(e)}`)
-    }
+      return accounts.length
+    }, { timeoutMs: 120_000 })
+  } catch (e) {
+    return { synced: 0, errors: [`Chart of accounts was not stored: ${String(e)}`] }
   }
-
-  // Deactivate accounts that no longer exist in Xero
-  const externalAccountIds = res.data.Accounts.map(a => a.AccountID)
-  await db.accountingAccount.updateMany({
-    where: { connector: XERO_CONNECTOR, externalAccountId: { notIn: externalAccountIds } },
-    data: { active: false },
-  })
-
-  return { synced, errors }
+  if (!fenced.ok) return { synced: 0, errors: [fenced.error] }
+  return { synced: fenced.value, errors: [] }
 }
 
 export async function listStoredAccounts(): Promise<Array<{ code: string; name: string; type: string }>> {

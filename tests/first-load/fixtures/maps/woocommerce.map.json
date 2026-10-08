@@ -1,0 +1,10 @@
+{
+  "formatVersion": 1,
+  "source": "woocommerce",
+  "datasets": {
+    "woo-products": {
+      "columns": { "sku": "SKU", "wooProductId": "ID", "type": "Product type" },
+      "valueMaps": { "type": { "simple": "SIMPLE", "variable": "VARIABLE", "variation": "VARIANT" } }
+    }
+  }
+}

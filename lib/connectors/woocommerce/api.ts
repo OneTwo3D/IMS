@@ -1,5 +1,6 @@
 import { getSettingValues } from '@/lib/settings-store'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import type { ConnectorCredentials } from '../types'
 import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentials } from './credentials'
 import { validateWooCommerceBaseUrl } from './url-safety'
@@ -256,7 +257,7 @@ export async function wcPost(
   path: string,
   body: unknown,
   creds?: ConnectorCredentials | null,
-): Promise<{ data: unknown; error?: string }> {
+): Promise<{ data: unknown; error?: string; held?: true }> {
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
     logMissingWooCommerceCredentials()
@@ -267,14 +268,23 @@ export async function wcPost(
   const safeCredentials = validatedCredentials.credentials
 
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
-  const res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
-    method: 'POST',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: wcRequestSignal(),
-  }, {
-    connectorName: 'WooCommerce',
-  })
+  let res: Response
+  try {
+    res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: wcRequestSignal(),
+    }, {
+      connectorName: 'WooCommerce',
+    })
+  } catch (error) {
+    // The outbound-write hold refused this request before it left IMS. Reported in this function's
+    // ordinary error shape (callers already handle `error`), with the hold's own text verbatim and
+    // `held: true` so a caller that cares can tell a hold from WooCommerce rejecting the write.
+    if (isOutboundWriteHeldError(error)) return error.nothingSent ? { data: null, error: error.message, held: true } : { data: null, error: error.message }
+    throw error
+  }
 
   if (!res.ok) {
     const detail = await readErrorDetails(res)
@@ -287,7 +297,7 @@ export async function wcPut(
   path: string,
   body: unknown,
   creds?: ConnectorCredentials | null,
-): Promise<{ data: unknown; error?: string }> {
+): Promise<{ data: unknown; error?: string; held?: true }> {
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
     logMissingWooCommerceCredentials()
@@ -298,14 +308,23 @@ export async function wcPut(
   const safeCredentials = validatedCredentials.credentials
 
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
-  const res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
-    method: 'PUT',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: wcRequestSignal(),
-  }, {
-    connectorName: 'WooCommerce',
-  })
+  let res: Response
+  try {
+    res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: wcRequestSignal(),
+    }, {
+      connectorName: 'WooCommerce',
+    })
+  } catch (error) {
+    // The outbound-write hold refused this request before it left IMS. Reported in this function's
+    // ordinary error shape (callers already handle `error`), with the hold's own text verbatim and
+    // `held: true` so a caller that cares can tell a hold from WooCommerce rejecting the write.
+    if (isOutboundWriteHeldError(error)) return error.nothingSent ? { data: null, error: error.message, held: true } : { data: null, error: error.message }
+    throw error
+  }
 
   if (!res.ok) {
     const detail = await readErrorDetails(res)

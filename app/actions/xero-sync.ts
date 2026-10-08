@@ -25,6 +25,15 @@ import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
+import {
+  XERO_ACCOUNT_ROLE_KEYS,
+  confirmMappingOwnership,
+  gateMappingSave,
+  readMappingOwnership,
+  stampMappingOwner,
+  syncReadinessVerdict,
+  type AccountMappingRebindTx,
+} from '@/lib/connectors/xero/account-mapping-rebind'
 import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
@@ -150,7 +159,14 @@ async function buildXeroConnectionFingerprint(): Promise<string> {
   })
 }
 
-export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
+export async function saveXeroSettings(
+  data: Partial<XeroSettings>,
+  /**
+   * o3d-6thk1: the organisation the operator's page was rendered against (`undefined` = no page, skip).
+   * A save composed for a DIFFERENT organisation is refused under the mapping lock.
+   */
+  expectedTenantId?: string | null,
+): Promise<{ success: boolean; error?: string }> {
   try {
     await requireXeroCredentialAdmin()
     if (shouldFreshGateSecretWrite(data, 'xero_client_secret')) {
@@ -186,6 +202,9 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
           if (readiness.missingAccounts.length > 0) {
             reasons.push(`missing account mappings (${readiness.missingAccounts.map(a => a.label).join(', ')})`)
           }
+          if (readiness.mappingOwnership.state !== 'owned') {
+            reasons.push(`confirm the account mapping belongs to ${readiness.mappingOwnership.boundTenantName ?? 'the connected organisation'} (re-mapping and saving does not end the hold; confirming does)`)
+          }
           if (readiness.missingTaxTypes.length > 0) {
             reasons.push(`missing Xero tax type on IMS VAT rates (${readiness.missingTaxTypes.map(t => t.name).join(', ')})`)
           }
@@ -216,8 +235,13 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
     // and then the rows in one `ORDER BY key` statement — the same order the plugin-selection writers
     // and `queueAccountingSyncTx` already use, because it is the same lock. This transaction holds no
     // other lock before it, so it cannot invert anything.
-    await db.$transaction(async (tx) => {
+    const writesMapping = entries.some(([k]) => XERO_ACCOUNT_ROLE_KEYS.includes(k))
+    const refusal = await db.$transaction(async (tx) => {
       await lockAccountingMappingSelection(tx, 'xero')
+      // o3d-6thk1: under the SAME lock the binding takes, decide whether this save may proceed (a page
+      // composed for another organisation may not) and whether it may take ownership of the mapping.
+      const gate = await gateMappingSave(tx, { connector: 'xero', expectedTenantId })
+      if (!gate.ok) return gate.error
       for (const [k, v] of entries) {
         await tx.setting.upsert({
           where: { key: k },
@@ -225,7 +249,10 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
           update: { value: serializeSettingValue(k, v ?? '') },
         })
       }
+      if (writesMapping && gate.stampAfterWrite && gate.boundTenantId) await stampMappingOwner(tx, gate.boundTenantId)
+      return null
     })
+    if (refusal) return { success: false, error: refusal }
 
     await logActivity({
       entityType: 'SYSTEM',
@@ -971,6 +998,11 @@ export async function retryFailedXeroSync(
 export type XeroSyncReadiness = {
   ready: boolean
   notConnected: boolean
+  /**
+   * o3d-6thk1: whose the stored account mapping is. 'unconfirmed' (no record of which organisation it was
+   * set up for) and 'other-organisation' both block `ready` until the operator confirms or re-maps.
+   */
+  mappingOwnership: { state: 'owned' | 'unconfirmed' | 'other-organisation'; boundTenantId: string | null; boundTenantName: string | null }
   missingAccounts: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
   /**
@@ -1021,12 +1053,45 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
   // stops the specific syncs that need the missing scope. Blocking the whole connector over it would be a
   // worse outage than the fault. It is surfaced as its own warning with the one action that fixes it.
   const missing = missingScopes(granted)
+  const ownership = await readMappingOwnership(db as unknown as AccountMappingRebindTx, 'xero')
 
   return {
-    ready: connStatus.connected && missingAccounts.length === 0 && missingTaxTypes.length === 0,
+    ready: syncReadinessVerdict({ connected: connStatus.connected, missingAccounts: missingAccounts.length, missingTaxTypes: missingTaxTypes.length, ownership: ownership.state }),
     notConnected: !connStatus.connected,
+    mappingOwnership: { state: ownership.state, boundTenantId: ownership.boundTenantId, boundTenantName: ownership.boundTenantName },
     missingAccounts,
     missingTaxTypes,
     missingScopes: missing,
+  }
+}
+
+/**
+ * o3d-6thk1: the operator's explicit, audited confirmation that the stored account mapping (accounts,
+ * payment map, tax types) belongs to the organisation Xero is connected to. It exists because a mapping
+ * of UNKNOWN provenance is kept rather than deleted on a reconnect, and sync stays off until someone who
+ * can see the mapping says it is this organisation's. Writes the stamp; records who and when.
+ */
+export async function confirmXeroAccountMappingOwnership(
+  expectedTenantId: string,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { user } = await requireFreshXeroCredentialAdmin()
+    const result = await db.$transaction(async (tx) => {
+      await lockAccountingMappingSelection(tx, 'xero')
+      return confirmMappingOwnership(tx as unknown as AccountMappingRebindTx, { connector: 'xero', expectedTenantId })
+    })
+    if (!result.ok) return { success: false, error: result.error }
+    await logActivity({
+      entityType: 'SYSTEM',
+      entityId: user?.id,
+      action: 'xero_account_mapping_confirmed',
+      tag: 'sync',
+      description: `Confirmed that the stored Xero account mapping belongs to ${result.tenantName ?? result.tenantId}`,
+      metadata: { connector: 'xero', tenantId: result.tenantId, previousStamp: result.previousStamp, changed: result.changed, confirmedByUserId: user?.id ?? null },
+    })
+    revalidatePath('/sync')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
   }
 }

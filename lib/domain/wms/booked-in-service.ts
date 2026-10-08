@@ -50,9 +50,12 @@ import {
 } from '@/lib/domain/accounting/enqueue-outcome'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 import {
-  computeGrossUnitCostBaseByLine,
+  computeLandedCostForPendingLines,
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
 } from '@/lib/domain/purchasing/landed-cost-service'
+import { unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
+import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -390,6 +393,10 @@ export async function processBookedInEvent(
       poReference: string
       outcome: EnqueueOutcomeLike
     }> = []
+    // A negative landed cost larger than a line's goods cost is held at zero (landed-cost-allocation.ts).
+    // One entry per PO line this book-in laid a layer for at that floored cost, reported AFTER the commit for
+    // the same reason as the declines above (an activity write uses its own connection).
+    const creditFloorReports: Array<{ poId: string; poReference: string; entries: Map<string, FlooredLandedCreditEntry> }> = []
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
@@ -930,11 +937,11 @@ export async function processBookedInEvent(
                 // here so the book-in reads the same inputs the manual receipt reads
                 // (app/actions/purchase-orders.ts:1841-1871), rather than a cheaper approximation.
                 totalBase: true,
-                product: { select: { weight: true } },
+                product: { select: { weight: true, sku: true } },
               },
             },
             freightCostLines: {
-              select: { amountBase: true, distributionMethod: true },
+              select: { id: true, amountBase: true, distributionMethod: true },
             },
             landedCostLinks: {
               // o3d-8m8pe: a CANCELLED freight PO must not contribute to the cost of these units. This
@@ -956,7 +963,7 @@ export async function processBookedInEvent(
                 freightPO: {
                   select: {
                     freightCostLines: {
-                      select: { amountBase: true, distributionMethod: true },
+                      select: { id: true, amountBase: true, distributionMethod: true },
                     },
                   },
                 },
@@ -1010,7 +1017,7 @@ export async function processBookedInEvent(
         // "not allocated yet". The remaining `?? ` copy of this bug is in the WMS stock-sync align-up
         // path, lib/connectors/mintsoft/sync/stock-sync.ts:1375; it is a different path in a different
         // transaction and is recorded on o3d-6nd55, which fixes that path next.)
-        const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
+        const landedAllocation = computeLandedCostForPendingLines({
           lines: po.lines.map((line) => ({
             id: line.id,
             qty: line.qty,
@@ -1020,16 +1027,22 @@ export async function processBookedInEvent(
             weight: line.product?.weight ?? null,
           })),
           directCostLines: po.freightCostLines.map((costLine) => ({
+            id: costLine.id,
             amountBase: costLine.amountBase,
             distributionMethod: costLine.distributionMethod,
           })),
           linkedCostLines: po.landedCostLinks.flatMap((link) => (
             link.freightPO.freightCostLines.map((costLine) => ({
+              id: costLine.id,
               amountBase: costLine.amountBase,
               distributionMethod: costLine.distributionMethod,
             }))
           )),
         })
+        const grossUnitCostBaseByLine = landedAllocation.grossUnitCostBaseByLine
+        const floorByPoLine = new Map(landedAllocation.floors.map((floor) => [floor.lineId, floor]))
+        const creditFloorEntries = new Map<string, FlooredLandedCreditEntry>()
+        creditFloorReports.push({ poId, poReference: po.reference, entries: creditFloorEntries })
 
         const lockedLineById = new Map(po.lines.map((line) => [line.id, line]))
         const reconciledLines = receiptLines.map((receiptLine) => {
@@ -1106,7 +1119,7 @@ export async function processBookedInEvent(
             // value fields, the cost layer's unitCostBase and the journal's amount. Three consumers
             // disagreeing about the cost of the same units would be a worse defect than the missing
             // journal. See the block above the loop for why this is the gross cost.
-            const unitCostBase = grossUnitCostBaseByLine.get(poLine.id) ?? Number(poLine.unitCostBase)
+            const unitCostBase = grossUnitCostBaseByLine.get(poLine.id) ?? toDecimal(poLine.unitCostBase)
             if (receiptLine.stockQtyToAdd > 0) {
               try {
                 // The catch below keeps using `tx`, so the failing insert must not poison it
@@ -1187,6 +1200,16 @@ export async function processBookedInEvent(
                 receiptValueBase,
                 multiplyMoney(toDecimal(receiptLine.stockQtyToAdd), toDecimal(unitCostBase)),
               )
+              const floor = floorByPoLine.get(poLine.id)
+              if (floor) {
+                const previous = creditFloorEntries.get(poLine.id)
+                const unabsorbedBase = unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, receiptLine.stockQtyToAdd)
+                creditFloorEntries.set(poLine.id, {
+                  label: poLine.product?.sku ?? poLine.id,
+                  unabsorbedBase: previous ? previous.unabsorbedBase.add(unabsorbedBase) : unabsorbedBase,
+                  unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
+                })
+              }
 
               await tx.stockLevel.upsert({
                 where: {
@@ -1770,6 +1793,16 @@ export async function processBookedInEvent(
           wmsInboundReceiptEventId: event.id,
           chartConnector: accountingConnector,
         },
+      })
+    }
+
+    // Reported only for the layers this book-in actually laid (a replay or a refused path leaves the map empty).
+    for (const report of creditFloorReports) {
+      if (report.entries.size === 0) continue
+      await logFlooredLandedCredit({
+        purchaseOrderId: report.poId,
+        context: `PO ${report.poReference} Mintsoft book-in ${event.externalAsnId}`,
+        entries: [...report.entries.values()],
       })
     }
 

@@ -50,6 +50,37 @@ So:
   organisations in Xero is the quicker one if you only ever want the single organisation.
 - **Once connected**, IMS pins that organisation and every later reconnect must match it, exactly as
   before. Disconnecting clears the pin.
+- **Connecting to a different organisation does not carry the old organisation's mapping with it.** The account
+  codes (all fifteen roles under *Account Mapping*), the Payment Account Mapping, the reverse-charge tax types and
+  each IMS tax rate's Xero tax type describe one organisation's chart. IMS remembers which organisation the mapping
+  belongs to (`xero_account_mapping_tenant_id`, written by every connect and by every mapping save made while
+  ownership is not in doubt; it survives **Disconnect**). Three cases:
+  - **Known different organisation** (the remembered organisation, or the stored token's, is not the one you
+    connected): in the same transaction as the new binding IMS clears the account roles, the payment map, the
+    reverse-charge types, the IMS tax-rate Xero tax types, the cached chart of accounts and the tax-drift snapshot,
+    and switches **Xero sync off**. It is not an automatic re-map (matching old codes to a new chart would be a guess)
+    and nothing already stored is rewritten. Open Sync settings, run **Sync accounts**, choose each account and each
+    tax type, then switch sync back on; the readiness check names whatever is still missing.
+  - **Same organisation**, including after **Disconnect**: everything is kept.
+  - **Unknown** (an instance bound before IMS recorded this, then disconnected): IMS **cannot tell** whether the
+    mapping is this organisation's, so it does **not delete it**. The mapping is kept, **sync is switched off** and
+    Sync settings shows *Confirm the account mapping belongs to <organisation>*. Review the mapping and press the
+    confirm button (an admin step-up action, recorded in the activity log with who and when). This hold is
+    **persisted** (`xero_account_mapping_unconfirmed`): reconnecting again, to the same organisation or a different
+    one, keeps the mapping, keeps sync off and stamps nothing, because the token row a reconnect creates proves which
+    organisation the token is for, not which one the mapping was made for. Only the confirm button ends the hold
+    (saving the form does not: you may keep codes the new chart happens to share, and saving is not checking each
+    one). The callback message says "could not confirm which organisation this
+    mapping was set up for"; it never claims the mapping belonged to another organisation.
+  A mapping save or payment-map save made from a page rendered against a different organisation than the one now
+  connected is refused (reload and review), and both saves serialise with the connect on the same lock, so a stale tab
+  cannot put the previous organisation's mapping back. Anything that reads data from Xero and stores it afterwards
+  (**Sync accounts**, the tax-type auto-link / generate / single-rate mapping, the tax-rate drift snapshot, the GL
+  balance snapshots) remembers which connection it fetched under and discards the result, with a clear message, if
+  the organisation was changed in between; run it again against the organisation now connected. `LEAVE`d on purpose: the app credentials, the sync-mode and
+  batch/polling switches, the payment-poll time cursor, the invoice/bill URL templates, per-document contact/item ids
+  (their provenance already ignores another organisation's) and every posted document's ids and sync rows (the tenant
+  stamp on each refuses them at egress).
 - **Two connections at once bind one organisation, not two.** The pin and the stored token are written
   in a single database transaction, and the pin's key is a primary key, so if two OAuth callbacks are in
   flight at the same time — two browser tabs, two operators, a replayed redirect — exactly one of them
@@ -2581,10 +2612,13 @@ The daily batch intentionally processes A1 revenue deferral, A2 inventory alloca
 Retry behavior is marker-driven. If the process stops after A1, the next run skips A1-marked orders and continues with A2. If it stops after A2, the next run continues with Group B. If Group B partially fails, unmarked shipments remain eligible for the next run. Do not manually clear these dates unless finance has also reversed any exported journals.
 
 **The daily batch refuses a negative cost, by name, instead of posting it short.** A cost layer's
-unit cost can go below zero when a landed-cost recalculation spreads a credit freight cost line
-larger than the goods it is spread over, and the recalculation rewrites the cost recorded on
-allocations and shipments that already used that layer. The daily batch now checks for it in three
-places:
+unit cost used to be able to go below zero when a landed-cost recalculation spread a credit freight
+cost line larger than the goods it was spread over, rewriting the cost recorded on allocations and
+shipments that already used that layer. Landed cost can no longer do that to a purchase order's own
+layers: a unit is valued at zero instead of below it (see *Recalculation after receipt* in the purchasing guide;
+manufactured goods built from such a layer are not floored). The daily batch keeps
+its three checks as defence in depth against any other source of a negative cost, because posting one
+short is the defect they exist to prevent:
 
 - **Group A2** — an order whose allocated or dispatched units would be reclassified at a negative
   cost is not reclassified. The other orders in the batch are reclassified as normal, and the
@@ -2600,9 +2634,9 @@ places:
   unit in it.
 
 For Group A2 and Group B nothing about the refused order is stamped, so it stays queued: correct the
-cost basis (usually by removing or correcting the credit freight cost line on the purchase order,
-which re-runs the landed-cost recalculation) and the next batch reclassifies the order, then posts
-its COGS — the Allocated Inventory debit and credit come out equal. For a refused **rebuild** the
+cost basis that went negative (the activity log entry names the cost layer) and the next batch
+reclassifies the order, then posts its COGS — the Allocated Inventory debit and credit come out
+equal. For a refused **rebuild** the
 shipments are already stamped from the original run; correcting the cost basis revalues their COGS
 back above zero, and the next batch's rebuild sweep then recreates the missing journal. Nothing
 needs clearing by hand in either case. Before this, Group A2 debited Allocated Inventory short,
@@ -2613,12 +2647,13 @@ order (or, for a rebuild, against the batch reference), naming the shipment and 
 it is listed first in the daily batch run's errors, which marks that cron run failed. A failed cron
 run shows on System Health as a warning, not an alert, so the activity log is the place to look.
 
-**A shipment that was *already* journaled is protected earlier, at the recalculation itself.**
+**A shipment that was *already* journaled is protected earlier, at the revaluation itself.**
 Revaluing it below zero used to post the reversal of its old COGS and drop the negative repost, so
-the difference posted nowhere. Now the landed-cost recalculation refuses and changes nothing (see
-*Recalculation after receipt* in the purchasing guide). A refused recalculation leaves that
-shipment's recorded cost as it was, so none of the three batch checks above ever sees a negative
-cost from it (o3d-c08y).
+the difference posted nowhere. The revaluation refuses and changes nothing if it is ever asked to
+(see *Recalculation after receipt* in the purchasing guide). A landed-cost recalculation cannot ask
+any more for a purchase order's own layers, because it floors each unit cost at zero, so a freight credit that exceeds the goods
+cost revalues the shipment down to 0.00 (the reversal leg only) and reports the part of the credit it
+could not absorb as a warning. The refusal stays as the backstop (o3d-c08y).
 
 **The checks above read each shipment's cost *after* locking it, so a recalculation running at the
 same time cannot slip a stale value past them.** A landed-cost recalculation may change a shipment's

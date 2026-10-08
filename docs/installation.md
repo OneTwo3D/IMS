@@ -4604,6 +4604,42 @@ where each of those actually lives (o3d-esha).
 
 IMS-session invoice PDF links intentionally bind to the current session and client IP. This limits copied-link replay, but users who switch networks, reconnect a VPN, or resume a tab after their IP changes may need to return to the invoice page and request a fresh link. Customer-facing shopping invoice downloads avoid this IMS session/IP binding by using the shopping platform ownership check plus the short-lived `/api/shopping/{connector}/invoice-pdf` server-to-server handoff.
 
+### Outbound-write hold: which destinations IMS may write to
+
+<!-- outbound-write-hold:overview -->
+IMS refuses every request that could change something in WooCommerce, Mintsoft or Xero unless the environment of this installation names the one destination it may write to. The refusal is made at the HTTP boundary that every connector request goes through, on every request and on every redirect hop, and the default is to refuse. The permission is read from environment variables only and never from the database, so a restored backup, a cloned installation or a new checkout does not inherit a permission that was granted to a different installation. A value that cannot be read is not a permission. Reading is never held: only requests that could change something are.
+<!-- /outbound-write-hold:overview -->
+
+<!-- outbound-write-hold:grants -->
+| Variable | Connector | Value |
+|---|---|---|
+| `WC_WRITEBACK_ALLOWED_ORIGIN` | WooCommerce | exactly one store origin, for example https://shop.example.com |
+| `MINTSOFT_WRITE_ALLOWED` | Mintsoft | the Mintsoft base URL and the ClientId separated by one vertical bar, for example https://api.mintsoft.co.uk|89; to also allow key-minting logins append a third part naming the one username, for example https://api.mintsoft.co.uk|89|login=ims-service |
+| `XERO_WRITE_ALLOWED_TENANT` | Xero | exactly one Xero tenant id (a UUID) |
+
+Each variable names exactly one destination. A list, a wildcard, a boolean or a value in any other shape is unreadable and grants nothing. Changing the store URL, the Mintsoft base URL or the Xero organisation in Settings revokes the permission instead of inheriting it, because the comparison is against the destination of the request that is actually being made. Setting a variable changes what the installation may do; it does not start any writer.
+<!-- /outbound-write-hold:grants -->
+
+<!-- outbound-write-hold:held-meaning -->
+A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Every such message ends with a short reference in square brackets (`[hold-ref ...]`) that is derived from the settings encryption key of the installation, so every process agrees on it and it survives restarts; it is bound to the exact text it ends, so it cannot be copied onto another message, and IMS does not write hold or error text into anything it sends to a destination: a census test scans every source file for the common shapes of such a write (comment and note writers and free-text payload fields built from a caught error), so a destination should never be sent a text it could echo back. That census is syntactic; it does not follow text through helper functions, closures, object spreads or computed keys. The residual is stated plainly: a person who copies a complete hold text into a free-text field by hand, or a code path of a shape the census does not cover, could put one in front of a destination; the reference prevents only forgery and moving a reference onto other text. It is how IMS tells its own hold text from text a destination sent, within the limits just stated. Without that key no failure is recognised as a hold, and the log says so once. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent and may have taken effect. That refusal begins "Outbound write REFUSED AFTER A REDIRECT", is not a hold, and is treated like any other failure of unknown outcome: it spends an attempt and can be dead-lettered for an operator to check.
+
+A refused login after an HTTP 401 is a pure hold only when that 401 came straight back from the original request with no redirect followed (Mintsoft rejects an unauthenticated request before it processes it); a 401 after a followed redirect, or whose redirect count is unknown, may follow a request that took effect, so it is handled as an uncertain outcome, not as a hold. A gateway or proxy in front of Mintsoft that answers 401 after Mintsoft processed the request cannot be excluded; that is an accepted inter-system limit. Mintsoft's key-minting login (`POST /api/Auth`, which issues a new tenant API key and invalidates the old one) is a write and is held. It is granted only by a third part of the Mintsoft variable, `|login=<username>`, and only for requests that carry exactly that username (and the granted ClientId). An installation that authenticates to Mintsoft with a username and password and has no such grant cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero's token exchange (`POST https://identity.xero.com/connect/token`, https only, exactly that path, on every redirect hop) is allowed as a deliberate exception: it rotates IMS's own Xero credentials but changes no accounting data, and every Xero read depends on it. Every Xero write must reach `api.xero.com` on every hop; a redirect to any other origin is refused before the body is sent.
+<!-- /outbound-write-hold:held-meaning -->
+
+<!-- outbound-write-hold:status-command -->
+`npm run outbound:status` answers "is this installation writing to anything?". It reads only the environment and the activity log, makes no network call and writes nothing. It prints, for each connector, whether writes are held or granted (and to which destination), whether the grant variable is unreadable, and how many refused writes were logged in the last 24 hours (a lower bound: refusals the rate limit suppressed are added only when the next entry is written). Pass `--json` for a machine-readable report and `--expect-held` to fail when any connector may write.
+
+| Exit code | Name | Meaning |
+|---|---|---|
+| 0 | ok | the report was produced, every grant variable is absent or readable, and the refusal counts were read; a fully held installation is a success |
+| 1 | unreadable-grant | a grant variable is set but unreadable; it is treated as no grant (held) but it is an operator error to fix |
+| 2 | counts-unavailable | the grant states were printed but the recent refusal counts could not be read from the database |
+| 3 | usage | an unknown argument was given; nothing was evaluated |
+| 4 | expected-held-violated | `--expect-held` was given and at least one connector has a readable grant (IMS may write to something) |
+| 5 | failed | the report could not be produced because of an unexpected error |
+<!-- /outbound-write-hold:status-command -->
+
+
 ### Connection pooling in front of `DATABASE_URL` is not supported
 
 **IMS does not support a transaction-pooling proxy — PgBouncer `pool_mode = transaction`, Odyssey

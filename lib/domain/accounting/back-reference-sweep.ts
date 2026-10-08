@@ -851,8 +851,8 @@ const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason']
   MULTIPLE_UNLINKED_BILLS: () =>
     'the PO has several bills with no external id, so which one this external id belongs to cannot be determined. Link them manually.',
   NO_LIVE_SYNC_ROW: () =>
-    'no live posted sync row for this PO carries this external id any more — its record was deleted or cancelled while the repair was in flight, '
-    + 'so there is no longer any evidence of which bill it posted. Check the accounting ledger and link the bill manually.',
+    'no live posted sync row for this PO carries this external id any more — its record was deleted or had its external id cleared while the repair was in flight, '
+    + 'so there is no longer any evidence of which bill it posted (a surviving row for this PO that names a DIFFERENT external id is not evidence for this one). Check the accounting ledger and link the bill manually.',
   EXTERNAL_ID_LINKED_ELSEWHERE: (a) =>
     `this external id is already linked to bill ${a.linkedPurchaseInvoiceId ?? 'unknown'} on purchase order ${a.linkedPurchaseOrderId ?? 'unknown'}, `
     + 'so it cannot also belong to a bill of this one. Either that link or this sync row is wrong — resolve it manually. '

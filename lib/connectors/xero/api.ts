@@ -6,6 +6,8 @@ import { getAccessToken, getStoredTenantBlockReason } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { accountingPostingIntentRefusal } from '@/lib/connectors/accounting-posting-intent'
 import { accountingEgressRefusal } from '@/lib/connectors/accounting-egress-authorization'
+import { outboundWriteRefusal, OutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
+import { recordOutboundWriteRefusal } from '@/lib/security/outbound-write-refusal-log'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
@@ -45,6 +47,13 @@ const XERO_NOT_SENT_STATUS = 0
  *  • `egress-unauthorised`    `accountingEgressRefusal` is the last statement before `noteRequest`,
  *                             and nothing between it and `connectorFetch` awaits. On the attempt it
  *                             refuses, `connectorFetch` is never called.
+ *  • `outbound-write-held`    the outbound-write hold (lib/security/outbound-write-grant.ts) refused a
+ *                             WRITE. Evaluated above the retry loop, immediately after the posting
+ *                             intent and before the first `waitForBudget`, so it returns with no
+ *                             `connectorFetch` entered and no budget spent. `connectorFetch` re-checks
+ *                             every attempt as the enforcing boundary; a refusal THAT raises (only
+ *                             possible if the environment changed mid-call) is untagged, i.e. errs
+ *                             towards "sent".
  *  • `rate-budget-refused`    every budget refusal — the minute wait, the rolling-day cap, and both
  *                             idempotency-window bounds — returns BEFORE `noteRequest`, which is why
  *                             a refusal consumes no Xero budget.
@@ -110,6 +119,7 @@ export type XeroNotSentReason =
   | 'no-connection'
   | 'posting-intent-refused'
   | 'egress-unauthorised'
+  | 'outbound-write-held'
   | 'rate-budget-refused'
   | 'connection-unresolvable'
   | 'request-unbuildable'
@@ -488,6 +498,27 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   if (intentRefusal) {
     return markNotSent('posting-intent-refused', {
       ok: false, status: XERO_NOT_SENT_STATUS, text: async () => intentRefusal,
+    }) as Response
+  }
+
+  // THE OUTBOUND-WRITE HOLD, above the retry loop (see `outbound-write-held` in XeroNotSentReason). The
+  // method, URL and tenant header are fixed for the whole call, so one evaluation here is the verdict
+  // for every attempt; `connectorFetch` repeats it per attempt as the enforcing boundary. A refusal is
+  // PROVABLY pre-egress and is tagged so the caller treats it as "never sent": the dispatch marker is
+  // released and the row stays retryable, instead of being left as an untagged throw (= "may have been
+  // sent") that would wedge the row behind a ledger check for a request that never left.
+  const heldRefusal = outboundWriteRefusal({
+    connectorName: XERO_CONNECTOR,
+    method: init.method,
+    url,
+    headers: init.headers,
+    body: init.body,
+  })
+  if (heldRefusal) {
+    const held = new OutboundWriteHeldError(heldRefusal, 0)
+    await recordOutboundWriteRefusal(held)
+    return markNotSent('outbound-write-held', {
+      ok: false, status: XERO_NOT_SENT_STATUS, text: async () => held.message,
     }) as Response
   }
 

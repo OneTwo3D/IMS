@@ -113,6 +113,11 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
   const { db } = await import('@/lib/db')
   const { logActivity } = await import('@/lib/activity-log')
   const { fetchXeroTaxRates } = await import('./tax-rates')
+  const { captureXeroConnection, withXeroConnectionFence } = await import('./connection-fence')
+  // o3d-6thk1 round 3: the snapshot describes the organisation the rates were fetched from. Remember the
+  // connection BEFORE the fetch; if it moved, the snapshot is not written (and the last-checked stamp is not
+  // advanced, so the next sweep runs against the organisation now connected).
+  const connection = await captureXeroConnection()
 
   const result = await sweepTaxRateDrift({
     async loadImsProfiles() {
@@ -168,20 +173,22 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
   // duration-independent (no activity-log time-window heuristic) and fully
   // replaced each run, so a fixed rate drops out on the next completed sweep.
   const snapshot = JSON.stringify(buildDriftSnapshot(result))
-  await db.setting.upsert({
-    where: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING },
-    create: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING, value: snapshot },
-    update: { value: snapshot },
-  })
-
-  // Advance last-checked only after the snapshot has persisted, so the reader's
-  // freshness/staleness guard never treats a stale snapshot as current.
   const checkedAt = new Date().toISOString()
-  await db.setting.upsert({
-    where: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING },
-    create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: checkedAt },
-    update: { value: checkedAt },
+  const fenced = await withXeroConnectionFence(connection, async (tx) => {
+    await tx.setting.upsert({
+      where: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING },
+      create: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING, value: snapshot },
+      update: { value: snapshot },
+    })
+    // Advance last-checked only after the snapshot has persisted (same transaction, written second), so the
+    // reader's freshness/staleness guard never treats a stale snapshot as current.
+    await tx.setting.upsert({
+      where: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING },
+      create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: checkedAt },
+      update: { value: checkedAt },
+    })
   })
+  if (!fenced.ok) console.warn(`[xero] tax-rate drift snapshot discarded: ${fenced.error}`)
 
   return result
 }
