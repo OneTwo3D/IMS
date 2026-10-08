@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { InputError, ingestDataset, parseColumnMap, type ColumnMap, type IngestedDataset } from './ingest'
+import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
@@ -83,8 +83,9 @@ function parseManifest(text: string): Manifest {
     if (typeof e.dataset !== 'string' || !(DATASET_NAMES as readonly string[]).includes(e.dataset)) throw new UsageError(`manifest input dataset must be one of ${DATASET_NAMES.join(', ')}`)
     if (typeof e.file !== 'string' || e.file === '') throw new UsageError(`manifest input ${e.dataset} needs a file`)
     if (e.columnMap !== undefined && (typeof e.columnMap !== 'string' || e.columnMap === '')) throw new UsageError(`manifest input ${e.dataset}: columnMap must be a path`)
-    if (seen.has(e.dataset)) throw new UsageError(`dataset ${e.dataset} is listed twice; one file per dataset (concatenate exports before running)`)
-    seen.add(e.dataset)
+    const key = `${e.dataset}\u0000${path.normalize(e.file)}`
+    if (seen.has(key)) throw new UsageError(`dataset ${e.dataset} lists the file ${e.file} twice`)
+    seen.add(key)
     inputs.push({ dataset: e.dataset as DatasetName, file: e.file, columnMap: typeof e.columnMap === 'string' ? e.columnMap : null })
   }
   return {
@@ -162,8 +163,9 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
   }
 
   const resolve = (file: string) => path.resolve(manifestDir, file)
-  const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
+  const parts: Partial<Record<DatasetName, IngestedDataset[]>> = {}
   const maps = new Map<string, ColumnMap>()
+  const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
   try {
     const problems: string[] = []
     for (const input of manifest.inputs) {
@@ -204,13 +206,14 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         continue
       }
       try {
-        datasets[input.dataset] = ingestDataset(input.dataset, bytes, input.file, mapping)
+        ;(parts[input.dataset] ??= []).push(ingestDataset(input.dataset, bytes, input.file, mapping))
       } catch (error) {
         if (error instanceof InputError) problems.push(...error.problems)
         else throw error
       }
     }
     if (problems.length > 0) throw new InputError(problems)
+    for (const name of Object.keys(parts) as DatasetName[]) datasets[name] = mergeIngested(parts[name]!)
   } catch (error) {
     if (error instanceof InputError) {
       io.stderr(`first-load-prepare: an input cannot be used, nothing was written:\n${error.problems.map((p) => `  - ${p}`).join('\n')}\n`)

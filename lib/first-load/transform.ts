@@ -142,6 +142,8 @@ export interface PrepareReport {
     hadBom: boolean
     blankRows: number
     recordsRead: number
+    rowsSkipped: number
+    parts: Array<{ file: string; sha256: string; bytes: number }>
     unmappedHeaders: string[]
   }>
   notSupplied: DatasetName[]
@@ -1678,7 +1680,7 @@ export function prepare(input: PrepareInput): PrepareResult {
       .filter((name) => input.datasets[name])
       .map((name) => {
         const d = input.datasets[name]!
-        return { dataset: name, file: d.file, sha256: d.sha256, bytes: d.bytes, hadBom: d.hadBom, blankRows: d.blankRows, recordsRead: d.recordsRead, unmappedHeaders: d.unmappedHeaders }
+        return { dataset: name, file: d.file, sha256: d.sha256, bytes: d.bytes, hadBom: d.hadBom, blankRows: d.blankRows, recordsRead: d.recordsRead, rowsSkipped: Object.values(d.rowsSkipped).reduce((a, b) => a + b, 0), parts: d.parts, unmappedHeaders: d.unmappedHeaders }
       }),
     notSupplied,
     checks,
