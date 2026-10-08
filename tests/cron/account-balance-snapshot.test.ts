@@ -88,7 +88,9 @@ test('account balance snapshot cron syncs the previous UTC day', async () => {
     )
 
     assert.equal(response.status, 200)
-    assert.deepEqual(calls, [{ balanceDate: '2026-06-01', syncRunId: 'run-account-balance-snapshot-test' }])
+    // recordScheduledPullSuccess is the scheduled pull's opt-in to the read-sync last-success stamp; an
+    // on-demand refresh never passes it.
+    assert.deepEqual(calls, [{ balanceDate: '2026-06-01', syncRunId: 'run-account-balance-snapshot-test', recordScheduledPullSuccess: true }])
     assert.equal(logs.length, 1)
     assert.deepEqual(logs[0]?.counts, { fetched: 4, persisted: 2, skipped: 0, errors: 0 })
     const payload = await response.json() as { balanceDate: string; runId: string; persisted: number }

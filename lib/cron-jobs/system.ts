@@ -7,7 +7,7 @@ registerCronJobs([
     module: 'system',
     moduleLabel: 'System',
     label: 'Read-Sync Liveness Alarm',
-    description: 'Hourly check that every read feed (WooCommerce order sweep, Mintsoft despatch poll and order-status refresh, Xero balance snapshots and tax rates) has recorded a successful run within its limit. Alerts admins once per breach. Read-only: it only reads IMS\'s own database and writes dedupe stamps and notifications.',
+    description: 'Hourly check that every read feed that keeps IMS current (storefront order sweep, warehouse despatch poll and order-status refresh, accounting balance snapshots and tax rates) has recorded a successful run within its limit. Alerts admins once per breach. Read-only: it only reads IMS\'s own database and writes dedupe stamps and notifications.',
     defaultSchedule: '25 * * * *',
     defaultEnabled: true,
   },

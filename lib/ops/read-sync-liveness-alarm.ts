@@ -10,8 +10,9 @@
  * It is cleared when the feed is fresh again or switched off, so a RENEWED breach alerts again, and a
  * breach that continues does not repeat.
  *
- * The Mintsoft stock sync is deliberately not handled here: its alert is the watchdog's, over the same
- * `bindingStaleAfterMs` rule this module's constants own. Everything else is.
+ * A feed whose registry row says another job raises its alarm (the warehouse stock sync: the WMS
+ * watchdog, over the same `bindingStaleAfterMs` rule this registry owns) is deliberately not handled
+ * here. Everything else is.
  *
  * A feed that has NEVER recorded a success is alarmed only once its limit has elapsed since this job
  * first evaluated (`read_sync_liveness_first_evaluated_at`), because a deployment that adds the stamps
@@ -21,6 +22,7 @@
 import {
   READ_SYNC_ALERT_ACTION,
   READ_SYNC_FIRST_EVALUATED_SETTING,
+  READ_SYNC_STREAMS,
   buildReadSyncAlert,
   readSyncAlertedSettingKey,
   type ReadSyncStreamId,
@@ -60,8 +62,10 @@ export type ReadSyncAlarmResult = {
   reason?: string
 }
 
-/** Streams whose alert belongs to another job. */
-const ALARMED_ELSEWHERE: ReadonlySet<ReadSyncStreamId> = new Set<ReadSyncStreamId>(['mintsoft-stock-sync'])
+/** Streams whose alert belongs to another job, read from the registry so no connector is named here. */
+const ALARMED_ELSEWHERE: ReadonlySet<ReadSyncStreamId> = new Set<ReadSyncStreamId>(
+  READ_SYNC_STREAMS.filter((def) => def.alarm !== 'read-sync-liveness').map((def) => def.id),
+)
 
 export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise<ReadSyncAlarmResult> {
   const { db, now } = deps

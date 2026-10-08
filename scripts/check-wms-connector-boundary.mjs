@@ -340,6 +340,12 @@ const ALLOWLIST = [
   'lib/security/outbound-write-grant.ts',
   'lib/security/outbound-write-hold-constants.ts',
   'lib/ops/outbound-status.ts',
+  // The read-sync liveness registry IS a per-connector inventory of the read feeds that keep IMS current
+  // (one row and one limit per feed, so it necessarily names each connector), exactly as the outbound hold
+  // names each destination. The alarm and the status script are generic: they iterate this registry and
+  // spell no connector themselves.
+  'lib/ops/read-sync-liveness-constants.ts',
+  'lib/ops/read-sync-status.ts',
   'lib/integration-plugins.ts',
   // The plugin setting keys, split out of lib/integration-plugins.ts so the full-chain quiesce
   // harness can name them without importing Prisma (o3d-osl8 round 6). Same registry, same reason

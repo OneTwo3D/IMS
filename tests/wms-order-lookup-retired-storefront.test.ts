@@ -61,6 +61,8 @@ mock.module('@/lib/connectors/wms/registry', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The sweep stamps its read-sync last-success time when it finishes without a failed order.
+      setting: { upsert: async () => ({}) },
       wmsConnection: {
         findFirst: async () => {
           dbCalls.push('wmsConnection.findFirst')
