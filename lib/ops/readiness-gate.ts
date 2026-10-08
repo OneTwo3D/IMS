@@ -34,7 +34,7 @@ import {
   type ReadinessVerdict,
   type Requirement,
 } from '@/lib/ops/readiness-gate-constants'
-import { STEP_CATALOGUE, isRed, teardownIncomplete, type RehearsalReport } from '@/lib/ops/first-install-rehearsal'
+import { STEP_CATALOGUE, teardownIncomplete, type RehearsalReport } from '@/lib/ops/first-install-rehearsal'
 import { OUTBOUND_CONNECTORS } from '@/lib/security/outbound-write-hold-constants'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -458,7 +458,8 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date): C
   if (report.exitCode !== 0) failures.push(`the rehearsal exit code is ${JSON.stringify(report.exitCode)}, not 0`)
   if (report.interrupted !== null && report.interrupted !== undefined) failures.push(`the rehearsal was interrupted (${String(report.interrupted)})`)
 
-  // Do not trust the verdict field alone: recompute it from the steps and the teardown.
+  // Do not trust the verdict field alone: judge the steps and the teardown themselves. Every catalogue step must be
+  // present exactly once, required AND passed, which is strictly stronger than the rehearsal's own isRed(steps).
   const steps = Array.isArray(report.steps) ? report.steps : null
   if (steps === null) failures.push('the report has no steps list')
   else {
@@ -471,7 +472,6 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date): C
     for (const step of steps) {
       if (!STEP_CATALOGUE.some((definition) => definition.id === step?.id)) failures.push(`the report has an unknown step ${String(step?.id)}`)
     }
-    if (isRed(steps)) failures.push('recomputing the verdict from the steps gives RED')
   }
   if (!report.teardown || typeof report.teardown !== 'object') failures.push('the report has no teardown record')
   else if (teardownIncomplete(report.teardown)) failures.push('the rehearsal teardown was incomplete')
@@ -593,7 +593,7 @@ export function verdictStatement(report: Pick<GateReport, 'verdict' | 'phase' | 
     : ''
   switch (report.verdict) {
     case 'NO-GO':
-      return `NO-GO for ${report.phase}: at least one reason below stops it. Nothing was changed by the gate.${unavailable}`
+      return `NO-GO for ${report.phase}: at least one reason below stops it. The gate changes no data in the database; its validate:db step runs a probe inside a transaction that is rolled back.${unavailable}`
     case 'GO':
       return `GO for ${report.phase}: every check this gate defines as required for ${report.phase} passed against the database and environment it was run with, at the time stated. It says nothing about checks that are not listed as passed.${unavailable}`
     case 'GO-WITH-ACCEPTED-WARNINGS':

@@ -308,6 +308,8 @@ test('invariant report: complete and clean passes; every other shape fails; warn
     ['preflight not ok', cleanInvariant({ ok: false })],
     ['inventory report truncated flag', cleanInvariant({ truncated: true })],
     ['truncated sentinel finding', cleanInvariant({ inventory: [{ severity: 'critical', code: 'invariant_report_truncated', message: 'x' }] })],
+    // Isolating arm: the sentinel code is refused on its own, even if it were labelled a warning (the critical-severity rule cannot be what catches it).
+    ['truncated sentinel finding labelled warning', cleanInvariant({ inventory: [{ severity: 'warning', code: 'invariant_report_truncated', message: 'x' }] })],
     ['inventory report absent', cleanInvariant({ nullReport: 'inventory' })],
     ['accounting report absent', cleanInvariant({ nullReport: 'accounting' })],
     ['sales report absent', cleanInvariant({ nullReport: 'sales' })],
