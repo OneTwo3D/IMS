@@ -438,6 +438,10 @@ test('[o3d-6e4v] every not-proven proof state yields a blocker, except the one c
   const blockers: Parameters<typeof classifyReconciliationProof>[1] = []
   classifyReconciliationProof({ state: 'not-proven', unresolved: [], overflow: false, newest: 'truncated', notRecordedAfterRecording: false }, blockers, [])
   assert.deepEqual(blockers.map((b) => b.id), ['accounting-reconciliation:newest-run-incomplete'])
+  // Isolating arm for the fallback: a state no rule above knows (a future newest-run state) is still a blocker.
+  const unknown: Parameters<typeof classifyReconciliationProof>[1] = []
+  classifyReconciliationProof({ state: 'not-proven', unresolved: [], overflow: false, newest: 'something-new' as never, notRecordedAfterRecording: false }, unknown, [])
+  assert.deepEqual(unknown.map((b) => b.id), ['accounting-reconciliation:completeness-unclassified'])
   // A proven proof adds nothing.
   const none: Parameters<typeof classifyReconciliationProof>[1] = []
   classifyReconciliationProof({ state: 'proven' }, none, [])
