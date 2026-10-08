@@ -239,36 +239,53 @@ test('ARM (count): one order missing from IMS is RED and named', { timeout: TIME
   assert.match(step(report, 'r9-orders').reason ?? '', /not in IMS: 5004/)
 })
 
-// ARM (read-only). MUTATION: delete the non-GET failure in assessReadOnly (or let the fake answer a POST 200 and not record it) and this goes green.
-test('ARM (non-GET): a write that reaches the store is RED, named, and recorded by the store itself', { timeout: TIMEOUT }, async (t) => {
+// ARM (read-only). MUTATION: change `if (nonGet.length > 0)` in assessReadOnly to `if (false)` and this goes green.
+// ISOLATING: the rogue write is authenticated and aimed at a route the fake models, so the non-GET fact is the ONLY
+// thing that can make the step red (the unmodelled-route and credential checks cannot mask the mutation).
+test('ARM (non-GET): an authenticated write to a modelled route is RED for that reason alone, named, and recorded by the store itself', { timeout: TIMEOUT }, async (t) => {
   const holder: { fake?: FakeWooCommerce } = {}
   const hooks: WooRehearsalHooks = {
     onFakeStore: async (f) => {
       holder.fake = f
-      // The control: a plain POST to the fake, as a rogue webhook registration would be.
-      const res = await fetch(`${f.url}/wp-json/wc/v3/webhooks`, { method: 'POST', headers: { authorization: 'Basic eDp5', 'content-type': 'application/json' }, body: '{}' })
+      // The control: a plain POST to the fake, as a rogue order update would be.
+      const res = await fetch(`${f.url}/wp-json/wc/v3/orders`, { method: 'POST', headers: { authorization: f.authorization, 'content-type': 'application/json' }, body: '{}' })
       assert.equal(res.status, 405)
     },
   }
   const { report } = await rehearse(t, { only: new Set<WooStepId>([...PREREQS, 'rehearsal-import', 'read-only-proof']), hooks })
   assert.ok(holder.fake)
   assert.equal(holder.fake.writeViolations().length, 1, 'precondition: the store recorded the write')
+  assert.deepEqual({ authenticated: holder.fake.requests[0]!.authenticated, modelled: holder.fake.requests[0]!.modelled }, { authenticated: true, modelled: true }, 'precondition: nothing but the method is wrong with the rogue request')
   assert.deepEqual(redSteps(report), ['read-only-proof'])
-  assert.match(step(report, 'read-only-proof').reason ?? '', /1 non-GET request\(s\) reached the store: POST \/wp-json\/wc\/v3\/webhooks/)
+  const reason = step(report, 'read-only-proof').reason ?? ''
+  assert.equal(reason, '1 non-GET request(s) reached the store: POST /wp-json/wc/v3/orders', 'the non-GET fact is the only reason')
   assert.equal(report.readOnly!.nonGetRequests, 1)
 })
 
-// ARM (unmodelled). A request for a route the fake does not model means the import asked for something the rehearsal cannot vouch for.
-test('ARM (unmodelled route): a GET the fake does not model is RED', { timeout: TIMEOUT }, async (t) => {
+// ARM (unmodelled). ISOLATING: an authenticated GET for a route the fake does not model. MUTATION: delete the `unmodelled` failure in assessReadOnly.
+test('ARM (unmodelled route): an authenticated GET the fake does not model is RED for that reason alone', { timeout: TIMEOUT }, async (t) => {
   const hooks: WooRehearsalHooks = {
     onFakeStore: async (f) => {
-      const res = await fetch(`${f.url}/wp-json/wc/v3/products?sku=A`, { headers: { authorization: 'Basic eDp5' } })
-      assert.equal(res.status, 401, 'the rogue GET is unauthenticated here')
+      const res = await fetch(`${f.url}/wp-json/wc/v3/products?sku=A`, { headers: { authorization: f.authorization } })
+      assert.equal(res.status, 404, 'the fake does not model /products')
     },
   }
   const { report } = await rehearse(t, { only: new Set<WooStepId>([...PREREQS, 'rehearsal-import', 'read-only-proof']), hooks })
   assert.deepEqual(redSteps(report), ['read-only-proof'])
-  assert.match(step(report, 'read-only-proof').reason ?? '', /routes the fake does not model/)
+  assert.equal(step(report, 'read-only-proof').reason, '1 request(s) were for routes the fake does not model: GET /wp-json/wc/v3/products')
+})
+
+// ARM (credentials). A request that did not carry the store credentials is RED for that reason alone. MUTATION: delete the `unauthenticated` failure.
+test('ARM (unauthenticated request): a GET without the store credentials is RED for that reason alone', { timeout: TIMEOUT }, async (t) => {
+  const hooks: WooRehearsalHooks = {
+    onFakeStore: async (f) => {
+      const res = await fetch(`${f.url}/wp-json/wc/v3/orders?per_page=1`)
+      assert.equal(res.status, 401)
+    },
+  }
+  const { report } = await rehearse(t, { only: new Set<WooStepId>([...PREREQS, 'rehearsal-import', 'read-only-proof']), hooks })
+  assert.deepEqual(redSteps(report), ['read-only-proof'])
+  assert.equal(step(report, 'read-only-proof').reason, '1 request(s) did not carry the store credentials')
 })
 
 // ARM (page hole). A store that fails page 2 must leave the pass failed and the rehearsal RED, and write no stamp.

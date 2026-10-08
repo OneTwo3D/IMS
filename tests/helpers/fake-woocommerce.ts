@@ -53,6 +53,8 @@ export type FakeWooCommerce = {
   readonly url: string
   readonly port: number
   readonly requests: readonly RecordedRequest[]
+  /** The Authorization header value a request must carry to be authenticated (a test aims a rogue request with it). */
+  readonly authorization: string
   /** Requests whose method was not GET or HEAD. */
   writeViolations(): RecordedRequest[]
   /** Requests for routes the fake does not model (the import asked for something unexpected). */
@@ -90,26 +92,31 @@ export async function startFakeWooCommerce(options: FakeWooCommerceOptions): Pro
     // Drain any body so a rogue write cannot hang the socket; the body itself is never read.
     req.resume()
 
+    // Authentication and routing are judged for EVERY method, so a write to a route the fake models, with
+    // the right credentials, is recorded as exactly that: a non-GET request and nothing else. (A test
+    // that wants to know a write was caught for that reason alone needs the other two facts to be clean.)
+    record.authenticated = req.headers.authorization === expectedAuth
+    const routePath = url.pathname.startsWith(`${WC_PREFIX}/`) ? url.pathname.slice(WC_PREFIX.length) : null
+    record.modelled = routePath !== null && (routePath === '/orders' || /^\/orders\/\d+(\/refunds)?$/.test(routePath))
+
     if (method !== 'GET' && method !== 'HEAD') {
       finish(405)
       wcError(res, 405, 'rest_no_route', 'No route was found matching the URL and request method.')
       return
     }
-    if (!url.pathname.startsWith(`${WC_PREFIX}/`)) {
+    if (routePath === null) {
       finish(404)
       wcError(res, 404, 'rest_no_route', 'No route was found matching the URL and request method.')
       return
     }
-    record.authenticated = req.headers.authorization === expectedAuth
     if (!record.authenticated) {
       finish(401)
       wcError(res, 401, 'woocommerce_rest_cannot_view', 'Sorry, you cannot list resources.')
       return
     }
-    const route = url.pathname.slice(WC_PREFIX.length)
+    const route = routePath
 
     if (route === '/orders') {
-      record.modelled = true
       const perPage = Math.min(Math.max(Number.parseInt(query.per_page ?? '10', 10) || 10, 1), 100)
       const page = Math.max(Number.parseInt(query.page ?? '1', 10) || 1, 1)
       const statuses = (query.status ?? 'any').split(',').map((s) => s.trim()).filter(Boolean)
@@ -139,7 +146,6 @@ export async function startFakeWooCommerce(options: FakeWooCommerceOptions): Pro
 
     const refunds = /^\/orders\/(\d+)\/refunds$/.exec(route)
     if (refunds) {
-      record.modelled = true
       finish(200)
       json(res, 200, [], options.omitPaginationHeaders ? {} : { 'x-wp-total': '0', 'x-wp-totalpages': '1' })
       return
@@ -147,7 +153,6 @@ export async function startFakeWooCommerce(options: FakeWooCommerceOptions): Pro
 
     const one = /^\/orders\/(\d+)$/.exec(route)
     if (one) {
-      record.modelled = true
       const found = orders.find((o) => o.id === Number(one[1]))
       if (!found) {
         finish(404)
@@ -174,6 +179,7 @@ export async function startFakeWooCommerce(options: FakeWooCommerceOptions): Pro
     url: `http://127.0.0.1:${port}`,
     port,
     requests,
+    authorization: expectedAuth,
     writeViolations: () => requests.filter((r) => r.method !== 'GET' && r.method !== 'HEAD'),
     unmodelledRequests: () => requests.filter((r) => !r.modelled),
     countInStatuses: (statuses) => orders.filter((o) => statuses.includes(o.status)).length,

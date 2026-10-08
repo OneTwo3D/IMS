@@ -118,7 +118,11 @@ test('a write with a body is drained and recorded, and a route the fake does not
     })
     await call(fake.url, '/wp-json/wc/v3/products?sku=A')
     assert.equal(fake.writeViolations().length, 1)
-    assert.deepEqual(fake.unmodelledRequests().map((r) => `${r.method} ${r.path}`), ['POST /wp-json/wc/v3/orders', 'GET /wp-json/wc/v3/products'])
+    // The POST to a route the fake models is a write and nothing else: authenticated, modelled, non-GET.
+    const post = fake.requests[0]!
+    assert.deepEqual({ method: post.method, authenticated: post.authenticated, modelled: post.modelled }, { method: 'POST', authenticated: true, modelled: true })
+    assert.deepEqual(fake.unmodelledRequests().map((r) => `${r.method} ${r.path}`), ['GET /wp-json/wc/v3/products'])
+    assert.equal(fake.authorization, AUTH)
   } finally {
     await fake.close()
   }
