@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { assertSafeToDelete, makeScratchRoot } from './safe-temp-root'
+import { assertSafeToDelete, findRepoRoot, makeScratchRoot } from './safe-temp-root'
 
 /**
  * The deletion guard, exercised ONLY against a throwaway tree that stands in for the repo and the temp dir.
@@ -12,7 +11,8 @@ import { assertSafeToDelete, makeScratchRoot } from './safe-temp-root'
  */
 
 function fakeWorld() {
-  const world = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-world-')))
+  const worldScratch = makeScratchRoot('safe-root-world-') // via the guarded helper: never created inside the scanned tree
+  const world = worldScratch.root
   const tmpBase = join(world, 'tmp')
   const repo = join(world, 'tmp', 'checkouts', 'repo') // the stand-in repo lives UNDER the stand-in tmp dir on purpose
   mkdirSync(repo, { recursive: true })
@@ -20,7 +20,7 @@ function fakeWorld() {
   writeFileSync(join(repo, 'precious.txt'), 'keep')
   // `options` places the scratch root in a tmp dir that is clean of the repo; `guardOptions` makes the repo sit under tmp
   // so assertSafeToDelete can be shown refusing it.
-  return { world, tmpBase, repo, cleanTmp: join(world, 'cleantmp'), options: { tmpBase: join(world, 'cleantmp'), repoRoot: repo }, guardOptions: { tmpBase, repoRoot: repo } }
+  return { world, dispose: () => worldScratch.dispose(), tmpBase, repo, cleanTmp: join(world, 'cleantmp'), options: { tmpBase: join(world, 'cleantmp'), repoRoot: repo }, guardOptions: { tmpBase, repoRoot: repo } }
 }
 
 test('a scratch root is created under the temp dir and disposed of; only that directory goes', () => {
@@ -35,13 +35,14 @@ test('a scratch root is created under the temp dir and disposed of; only that di
     scratch.dispose()
     assert.equal(existsSync(scratch.root), false)
     assert.ok(existsSync(sibling) && existsSync(join(w.repo, 'precious.txt')))
-  } finally { rmSync(w.world, { recursive: true, force: true }) }
+  } finally { w.dispose() }
 })
 
 test('dispose REFUSES (throws, deletes nothing) for: the repo root, an ancestor, a path outside tmp, a symlink to the repo, the temp dir itself, a different path, a ".." path', () => {
   const w = fakeWorld()
   try {
-    const outside = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-outside-')))
+    const outsideScratch = makeScratchRoot('safe-root-outside-')
+    const outside = outsideScratch.root
     const link = join(w.tmpBase, 'link-to-repo')
     symlinkSync(w.repo, link)
     const scratch = makeScratchRoot('probe-', w.options)
@@ -62,8 +63,8 @@ test('dispose REFUSES (throws, deletes nothing) for: the repo root, an ancestor,
     assert.ok(existsSync(join(w.repo, 'precious.txt')), 'the stand-in repo is intact')
     assert.ok(existsSync(outside) && existsSync(w.tmpBase) && existsSync(link))
     scratch.dispose()
-    rmSync(outside, { recursive: true, force: true })
-  } finally { rmSync(w.world, { recursive: true, force: true }) }
+    outsideScratch.dispose()
+  } finally { w.dispose() }
 })
 
 test('dispose refuses after the directory was swapped for a symlink to the repo (deletes nothing)', () => {
@@ -74,11 +75,12 @@ test('dispose refuses after the directory was swapped for a symlink to the repo 
     symlinkSync(w.repo, scratch.root)
     assert.throws(() => scratch.dispose(), /symlink/)
     assert.ok(existsSync(join(w.repo, 'precious.txt')))
-  } finally { rmSync(w.world, { recursive: true, force: true }) }
+  } finally { w.dispose() }
 })
 
 test('isolating cases: each remaining rule refuses on its own (the other rules would allow it)', () => {
-  const world = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-iso-')))
+  const worldScratch = makeScratchRoot('safe-root-iso-')
+  const world = worldScratch.root
   try {
     const tmpBase = join(world, 'tmp')
     const repo = join(world, 'elsewhere', 'repo') // the stand-in repo is OUTSIDE the stand-in tmp dir
@@ -96,11 +98,12 @@ test('isolating cases: each remaining rule refuses on its own (the other rules w
     mkdirSync(join(repo2, 'sub'), { recursive: true })
     assert.throws(() => assertSafeToDelete(join(repo2, 'sub'), join(repo2, 'sub'), { tmpBase, repoRoot: repo2 }), /inside the repository/)
     scratch.dispose()
-  } finally { rmSync(world, { recursive: true, force: true }) }
+  } finally { worldScratch.dispose() }
 })
 
 test('a temp base inside, equal to, or above the repository is refused BEFORE anything is created (direct and through a symlink)', () => {
-  const world = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-tmpbase-')))
+  const worldScratch = makeScratchRoot('safe-root-tmpbase-')
+  const world = worldScratch.root
   try {
     const repo = join(world, 'repo')
     const lib = join(repo, 'lib')
@@ -118,7 +121,7 @@ test('a temp base inside, equal to, or above the repository is refused BEFORE an
     assert.equal(before(), snapshot, 'nothing was created inside the stand-in repo')
     const ok = makeScratchRoot('probe-', { tmpBase: elsewhere, repoRoot: repo })
     ok.dispose()
-  } finally { rmSync(world, { recursive: true, force: true }) }
+  } finally { worldScratch.dispose() }
 })
 
 function readdirListing(dir: string): string {
@@ -127,13 +130,14 @@ function readdirListing(dir: string): string {
 
 test('the repository root comes from the module location, not the working directory', () => {
   const original = process.cwd()
-  const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-cwd-')))
+  const elsewhereScratch = makeScratchRoot('safe-root-cwd-')
+  const elsewhere = elsewhereScratch.root
   try {
     process.chdir(elsewhere)
     const scratch = makeScratchRoot('probe-') // default options: real tmpdir, repo found from this file's location
     scratch.dispose()
     assert.equal(process.cwd(), elsewhere, 'precondition: the working directory is NOT the repository')
-  } finally { process.chdir(original); rmSync(elsewhere, { recursive: true, force: true }) }
+  } finally { process.chdir(original); elsewhereScratch.dispose() }
 })
 
 test('IDENTITY: a different directory moved into the path after creation is refused and left intact', () => {
@@ -148,5 +152,46 @@ test('IDENTITY: a different directory moved into the path after creation is refu
     console.log('precondition (identity): the created directory was replaced by another real directory at the same path')
     assert.throws(() => scratch.dispose(), /device\/inode changed/)
     assert.ok(existsSync(join(scratch.root, 'precious.txt')), 'the other directory is intact')
-  } finally { rmSync(w.world, { recursive: true, force: true }) }
+  } finally { w.dispose() }
+})
+
+test('the checkout root is the TOPMOST marker, so a nested package.json cannot narrow the boundary; a copied helper under a nested package is still bounded', () => {
+  const scratch = makeScratchRoot('safe-root-nested-')
+  try {
+    const checkout = join(scratch.root, 'checkout')
+    mkdirSync(join(checkout, 'tests', 'helpers'), { recursive: true })
+    mkdirSync(join(checkout, 'lib'))
+    mkdirSync(join(checkout, 'app'))
+    writeFileSync(join(checkout, 'package.json'), '{}')
+    writeFileSync(join(checkout, '.git'), 'gitdir: elsewhere') // a worktree has a .git FILE
+    writeFileSync(join(checkout, 'tests', 'package.json'), '{}') // a nested package
+    const nestedHelperDir = join(checkout, 'tests', 'helpers')
+    console.log('precondition (nested package): stand-in checkout with .git, lib/, and a package.json nested under tests/')
+    assert.equal(findRepoRoot(nestedHelperDir), realpathSync(checkout), 'the topmost marker wins, not the nearest package.json')
+    // TMPDIR at the sibling lib/ is refused because the repo root is the checkout, not tests/
+    assert.throws(() => makeScratchRoot('probe-', { tmpBase: join(checkout, 'lib'), repoRoot: findRepoRoot(nestedHelperDir) }), /refusing to create a scratch root/)
+    assert.deepEqual(readdirSync(join(checkout, 'lib')), [])
+    // a source export with no .git: the fallback needs package.json AND app/lib/tests
+    const exported = join(scratch.root, 'export')
+    mkdirSync(join(exported, 'tests', 'helpers'), { recursive: true })
+    mkdirSync(join(exported, 'lib')); mkdirSync(join(exported, 'app'))
+    writeFileSync(join(exported, 'package.json'), '{}')
+    writeFileSync(join(exported, 'tests', 'package.json'), '{}')
+    assert.equal(findRepoRoot(join(exported, 'tests', 'helpers')), realpathSync(exported))
+    // no marker at all: refuses to guess
+    const bare = join(scratch.root, 'bare'); mkdirSync(bare)
+    assert.throws(() => findRepoRoot(bare), /cannot locate the repository root/)
+  } finally { scratch.dispose() }
+})
+
+test('a prefix cannot steer the new directory out of the checked base', () => {
+  const w = fakeWorld()
+  try {
+    const bad = ['../escape-', 'a/b-', '/abs-', '', '..', '.', 'x\0y-', 'a\\b-']
+    console.log(`precondition (prefix): ${bad.length} hostile prefixes against a throwaway base`)
+    const before = readdirSync(w.cleanTmp).join(',')
+    for (const prefix of bad) assert.throws(() => makeScratchRoot(prefix, w.options), /refusing prefix/, JSON.stringify(prefix))
+    assert.equal(readdirSync(w.cleanTmp).join(','), before, 'nothing was created')
+    assert.equal(existsSync(join(w.world, 'escape-')), false)
+  } finally { w.dispose() }
 })

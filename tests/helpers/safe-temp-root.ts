@@ -30,14 +30,28 @@ import { fileURLToPath } from 'node:url'
  * `options` exist so the guard can be exercised against a throwaway tree standing in for the repo; production
  * use passes none.
  */
-function findRepoRoot(): string {
-  let dir = dirname(fileURLToPath(import.meta.url))
-  for (;;) {
-    if (existsSync(join(dir, 'package.json'))) return realpathSync(dir)
+const TOP_LEVEL_DIRS = ['app', 'lib', 'tests']
+
+/**
+ * The checkout root, found by walking UP from `startDir` (default: this file) and taking the TOPMOST ancestor that
+ * satisfies a marker a nested package cannot satisfy: a directory holding package.json AND a `.git` entry (a
+ * directory, or a file in a worktree). A package.json nested under tests/ therefore cannot narrow the boundary.
+ * With no `.git` anywhere (a source export), the topmost ancestor holding package.json together with the
+ * repository's known top-level directories (app, lib, tests) is used instead.
+ */
+export function findRepoRoot(startDir: string = dirname(fileURLToPath(import.meta.url))): string {
+  const ancestors: string[] = []
+  for (let dir = realpathSync(startDir); ; ) {
+    ancestors.push(dir)
     const parent = dirname(dir)
-    if (parent === dir) throw new Error('safe-temp-root: cannot locate the repository root from the module location')
+    if (parent === dir) break
     dir = parent
   }
+  const withMarker = (ok: (dir: string) => boolean) => [...ancestors].reverse().find(ok) // topmost first
+  const found = withMarker((dir) => existsSync(join(dir, 'package.json')) && existsSync(join(dir, '.git')))
+    ?? withMarker((dir) => existsSync(join(dir, 'package.json')) && TOP_LEVEL_DIRS.every((name) => existsSync(join(dir, name))))
+  if (!found) throw new Error('safe-temp-root: cannot locate the repository root from the module location')
+  return found
 }
 
 export type ScratchRoot = { root: string; dispose: () => void }
@@ -71,6 +85,10 @@ export function assertSafeToDelete(target: string, recorded: string, options: Sc
 }
 
 export function makeScratchRoot(prefix: string, options: ScratchRootOptions = {}): ScratchRoot {
+  // The prefix is a file NAME fragment: it must not be able to steer the new directory out of the checked base.
+  if (prefix === '' || /[\\/\0]/.test(prefix) || prefix.split('.').every((part) => part === '') || prefix.includes('..')) {
+    throw new Error(`safe-temp-root: refusing prefix ${JSON.stringify(prefix)}: it must be a plain name fragment (no separators, dot segments or NUL)`)
+  }
   const base = realpathSync(options.tmpBase ?? tmpdir())
   const repoRoot = realpathSync(options.repoRoot ?? findRepoRoot())
   // Refuse BEFORE creating anything: a temp base inside, equal to, or above the repository would put the probe
@@ -79,6 +97,10 @@ export function makeScratchRoot(prefix: string, options: ScratchRootOptions = {}
     throw new Error(`safe-temp-root: refusing to create a scratch root: the temp directory ${JSON.stringify(base)} is inside, equal to, or an ancestor of the repository ${JSON.stringify(repoRoot)}. Point TMPDIR at a directory outside the repository.`)
   }
   const created = mkdtempSync(join(base, prefix))
+  if (dirname(created) !== base) {
+    rmSync(created, { recursive: true, force: true })
+    throw new Error('safe-temp-root: the created directory is not directly under the checked temp base')
+  }
   const recorded = created
   const first = lstatSync(created)
   const identity: DirIdentity = { dev: first.dev, ino: first.ino }
