@@ -162,14 +162,23 @@ test('F1: every ${NAME} the .env template interpolates is assigned by a prompt o
   assert.deepEqual(unassigned, [], 'every interpolated name must be defined, or the set -u .env write dies after packages and the user exist')
 })
 
+/** The Turnstile block exactly as shipped: both prompts and the two explicit-clear lines. */
+function turnstileBlock(): string {
+  const lines = INSTALL.split('\n')
+  const start = lines.findIndex((t) => t.startsWith('prompt NEXT_PUBLIC_TURNSTILE_SITE_KEY '))
+  const end = lines.findIndex((t) => t.startsWith('[[ "${TURNSTILE_SECRET_KEY}" != "none" ]]'))
+  assert.ok(start > 0 && end > start, `precondition: Turnstile block found (${start}..${end})`)
+  return lines.slice(start, end + 1).join('\n')
+}
+
+const turnstileProgram = (existing: string, exports: string): string =>
+  ['set -uo pipefail', 'NON_INTERACTIVE=true', 'declare -A EXISTING_ENV=()', existing,
+    shippedFunction(INSTALL, 'existing_env'), shippedFunction(INSTALL, 'prompt'), exports, turnstileBlock(),
+    'echo "SITE=[${NEXT_PUBLIC_TURNSTILE_SITE_KEY}] SECRET=[${TURNSTILE_SECRET_KEY}]"'].join('\n')
+
 test('F1: the Turnstile prompts leave both variables defined (empty) under set -u, and honour an exported value', () => {
-  const promptLines = INSTALL.split('\n').filter((t) => /^prompt (NEXT_PUBLIC_TURNSTILE_SITE_KEY|TURNSTILE_SECRET_KEY)\b/.test(t))
-  assert.equal(promptLines.length, 2, 'precondition: both prompts found')
-  const program = (exports: string) =>
-    ['set -uo pipefail', 'NON_INTERACTIVE=true', shippedFunction(INSTALL, 'prompt'), exports, ...promptLines,
-      'echo "SITE=[${NEXT_PUBLIC_TURNSTILE_SITE_KEY}] SECRET=[${TURNSTILE_SECRET_KEY}]"'].join('\n')
-  const empty = bash(program(''))
-  const given = bash(program('export NEXT_PUBLIC_TURNSTILE_SITE_KEY=site-abc TURNSTILE_SECRET_KEY=sec-xyz'))
+  const empty = bash(turnstileProgram('', ''))
+  const given = bash(turnstileProgram('', 'export NEXT_PUBLIC_TURNSTILE_SITE_KEY=site-abc TURNSTILE_SECRET_KEY=sec-xyz'))
   console.log(`  F1 behaviour: unset -> ${empty.out.trim()}; exported -> ${given.out.trim()}`)
   assert.equal(empty.status, 0, empty.out)
   assert.match(empty.out, /SITE=\[\] SECRET=\[\]/)
@@ -180,6 +189,19 @@ test('F1: the Turnstile prompts leave both variables defined (empty) under set -
   const collected = INSTALL.split('\n').findIndex((t) => t.includes('Configuration collected. Starting installation')) + 1
   console.log(`  F1 order: prompt at line ${prompts}, "Configuration collected" at ${collected}`)
   assert.ok(prompts > 0 && prompts < collected, 'asked before "Configuration collected", which precedes every package install')
+})
+
+test('re-run: an existing Turnstile pair is kept by default and cleared only by an explicit "none"', () => {
+  const existing = 'EXISTING_ENV[NEXT_PUBLIC_TURNSTILE_SITE_KEY]=old-site; EXISTING_ENV[TURNSTILE_SECRET_KEY]=old-secret'
+  const kept = bash(turnstileProgram(existing, ''))
+  const overridden = bash(turnstileProgram(existing, 'export NEXT_PUBLIC_TURNSTILE_SITE_KEY=new-site'))
+  const cleared = bash(turnstileProgram(existing, 'export NEXT_PUBLIC_TURNSTILE_SITE_KEY=none TURNSTILE_SECRET_KEY=none'))
+  const blankExport = bash(turnstileProgram(existing, 'export NEXT_PUBLIC_TURNSTILE_SITE_KEY= TURNSTILE_SECRET_KEY='))
+  console.log(`  re-run Turnstile: default -> ${kept.out.trim()}; one overridden -> ${overridden.out.trim()}; none -> ${cleared.out.trim()}; blank export -> ${blankExport.out.trim()}`)
+  assert.match(kept.out, /SITE=\[old-site\] SECRET=\[old-secret\]/, 'accepting the defaults keeps the existing pair')
+  assert.match(overridden.out, /SITE=\[new-site\] SECRET=\[old-secret\]/, 'an explicit value wins for that key only')
+  assert.match(cleared.out, /SITE=\[\] SECRET=\[\]/, '"none" is the explicit way to clear')
+  assert.match(blankExport.out, /SITE=\[old-site\] SECRET=\[old-secret\]/, 'a blank is NOT a request to clear')
 })
 
 // ---------------------------------------------------------------------------
@@ -310,7 +332,7 @@ test('F7: the installer defines, writes and creates INVOICE_PDF_STORAGE_DIR unde
   const lines = code(INSTALL)
   const def = lines.find((l) => /^INVOICE_PDF_STORAGE_DIR="\$\{DATA_DIR\}\/invoice-pdfs"$/.test(l.text))
   const env = lines.find((l) => l.text === 'INVOICE_PDF_STORAGE_DIR=${INVOICE_PDF_STORAGE_DIR}')
-  const make = lines.find((l) => /^own_service_subdir "\$\{DATA_DIR\}" 022 "\$\{INVOICE_PDF_STORAGE_DIR\}" "\$\{APP_USER\}" 750$/.test(l.text))
+  const make = lines.find((l) => /^\s*own_service_subdir "\$\{DATA_DIR\}" 022 "\$\{INVOICE_PDF_STORAGE_DIR\}" "\$\{APP_USER\}" 750$/.test(l.text))
   const chown = lines.find((l) => /^chown_state_tree "\$\{DATA_DIR\}"/.test(l.text))
   console.log(`  F7 static: default=${def?.n} env-line=${env?.n} create=${make?.n} state-tree chown=${chown?.n}`)
   assert.ok(def && env && make && chown, 'precondition: all four statements found')
@@ -360,52 +382,96 @@ test('F7: the production preflight passes the storage rules for the directory an
   })
 })
 
+/** The re-run statements, as shipped: from the existing_env assignment through its absolute-path refusal. */
+function invoiceReuseBlock(): string {
+  const lines = INSTALL.split('\n')
+  const start = lines.findIndex((t) => t.startsWith('INVOICE_PDF_STORAGE_DIR="$(existing_env INVOICE_PDF_STORAGE_DIR '))
+  assert.ok(start > 0, 'precondition: the re-run assignment exists')
+  return lines.slice(start, start + 4).join('\n')
+}
+
+test('re-run: an existing INVOICE_PDF_STORAGE_DIR is kept, the default only fills an absent one, a bad one stops the run', () => {
+  const run = (existing: string) => bash(['set -uo pipefail', 'DATA_DIR=/var/lib/x', 'APP_DIR=/opt/x',
+    'INVOICE_PDF_STORAGE_DIR="${DATA_DIR}/invoice-pdfs"', 'die() { echo "DIE: $*"; exit 9; }',
+    'declare -A EXISTING_ENV=()', existing, shippedFunction(INSTALL, 'existing_env'), invoiceReuseBlock(),
+    'echo "DIR=[${INVOICE_PDF_STORAGE_DIR}]"'].join('\n'))
+  const fresh = run('')
+  const custom = run('EXISTING_ENV[INVOICE_PDF_STORAGE_DIR]=/mnt/pdfs')
+  const relative = run('EXISTING_ENV[INVOICE_PDF_STORAGE_DIR]=data/invoices')
+  const dotdot = run('EXISTING_ENV[INVOICE_PDF_STORAGE_DIR]=/mnt/../etc')
+  console.log(`  re-run invoice dir: fresh -> ${fresh.out.trim()}; existing -> ${custom.out.trim()}; relative -> ${relative.status}; dotdot -> ${dotdot.status}`)
+  assert.match(fresh.out, /DIR=\[\/var\/lib\/x\/invoice-pdfs\]/)
+  assert.match(custom.out, /DIR=\[\/mnt\/pdfs\]/, 'the previous run\'s location is not replaced by the default')
+  assert.equal(relative.status, 9, 'a relative value is refused')
+  assert.equal(dotdot.status, 9, 'and so is one with ".." components')
+  // Ordering: read before anything is created or written.
+  const lines = code(INSTALL)
+  const reuse = lines.find((l) => l.text.startsWith('INVOICE_PDF_STORAGE_DIR="$(existing_env '))!
+  const firstChange = lines.find((l) => /\b(apt-get install|useradd)\b/.test(l.text))!
+  assert.ok(reuse.n < firstChange.n, 'the existing value is read before the first package or account change')
+})
+
+test('re-run: the selected directory is created under the state dir, or must already exist and be writable elsewhere; nothing is written first', () => {
+  const lines = INSTALL.split('\n')
+  const start = lines.findIndex((t) => t === 'if [[ "${INVOICE_PDF_STORAGE_DIR}" == "${DATA_DIR}/"* ]]; then')
+  const end = lines.findIndex((t, i) => i > start && t === 'fi')
+  assert.ok(start > 0 && end > start, 'precondition: the creation block exists')
+  const block = lines.slice(start, end + 1).join('\n')
+  const run = (setup: string) => bash(['set -uo pipefail', 'exec 2>&1', 'DATA_DIR=/var/lib/x', 'APP_USER=imsapp',
+    'die() { echo "DIE: $*"; exit 9; }', 'own_service_subdir() { echo "OWNED $*"; }',
+    'run_as_user() { shift; "$@"; }', setup, block, 'echo REACHED_END'].join('\n'))
+  const inside = run('INVOICE_PDF_STORAGE_DIR=/var/lib/x/invoice-pdfs')
+  const missing = run('INVOICE_PDF_STORAGE_DIR=/nonexistent-dir-for-test')
+  const real = run('mkdir -p /tmp/fib-real-dir; INVOICE_PDF_STORAGE_DIR=/tmp/fib-real-dir')
+  const link = run('mkdir -p /tmp/fib-target; ln -sfn /tmp/fib-target /tmp/fib-link; INVOICE_PDF_STORAGE_DIR=/tmp/fib-link')
+  console.log(`  creation: inside -> ${inside.out.trim()}; missing -> ${missing.status}; existing -> ${real.out.trim()}; symlink -> ${link.status}`)
+  assert.match(inside.out, /OWNED \/var\/lib\/x 022 \/var\/lib\/x\/invoice-pdfs imsapp 750/)
+  assert.equal(missing.status, 9, 'a directory outside the state dir that does not exist stops the run')
+  assert.match(real.out, /REACHED_END/)
+  assert.doesNotMatch(real.out, /OWNED/, 'and root creates nothing there')
+  assert.equal(link.status, 9, 'a symlink is refused')
+  // It is before the .env is written.
+  const create = code(INSTALL).find((l) => l.text === 'if [[ "${INVOICE_PDF_STORAGE_DIR}" == "${DATA_DIR}/"* ]]; then')!
+  const write = code(INSTALL).find((l) => /render_app_env_file/.test(l.text) && l.n > create.n)
+  console.log(`  creation at line ${create.n}; first render_app_env_file use after it at ${write?.n}`)
+  assert.ok(write && create.n < write.n, 'the directory is selected and validated before .env is rendered')
+})
+
 // ---------------------------------------------------------------------------
 // F2 -- lib/invoice-pdf.ts must not make `next build` (Turbopack) list the project directory
 // ---------------------------------------------------------------------------
 
-test('F2: every build-time path expression in lib/invoice-pdf.ts carries a turbopackIgnore marker on its first argument', () => {
+test('F2: lib/invoice-pdf.ts has no path.join/path.resolve whose first operand is a call result (the shape that panicked a real next build)', () => {
+  // MEASURED, NOT INFERRED. A real `next build` as the application user in the D4 container, with a
+  // root-owned 0700 empty `.ims-publish` in the application directory: the unchanged file panics
+  // (EACCES, reading dir .../.ims-publish); a `turbopackIgnore` comment on every fs/path argument
+  // (the first attempt at this fix) still panics, because that comment applies only to import(),
+  // require() and Worker; stubbing path.join makes the build pass; replacing ONLY the
+  // path.join(path.dirname(filePath), ...) in saveInvoicePdfFile with a template string makes the full
+  // build pass (BUILD_EXIT 0, directory still root:root 0700). This test cannot run Turbopack; it
+  // pins the one measured shape so that it is not written back.
   const file = 'lib/invoice-pdf.ts'
   const text = read(file)
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)
-  const FS = new Set(['access', 'mkdir', 'lstat', 'readFile', 'realpath', 'rename', 'writeFile'])
-  const PATH = new Set(['resolve', 'join', 'dirname'])
-  const isPathCall = (n: ts.Node): n is ts.CallExpression =>
-    ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) &&
-    ts.isIdentifier(n.expression.expression) && n.expression.expression.text === 'path' && PATH.has(n.expression.name.text)
-  /** The leftmost leaf: a nested path.* call hands its own first argument up. */
-  const leaf = (n: ts.Expression): ts.Expression => (isPathCall(n) && n.arguments[0] ? leaf(n.arguments[0]) : n)
-  const marked = (n: ts.Node): boolean =>
-    // The trivia between the previous token and this node's first token (a comment on the same line as
-    // the opening parenthesis is a TRAILING comment to the compiler API, so range helpers would miss it).
-    /^\s*\/\*\s*turbopackIgnore:\s*true\s*\*\/\s*$/.test(text.slice(n.getFullStart(), n.getStart()))
-
-  const checked: string[] = []
-  const unmarked: string[] = []
+  const examined: string[] = []
+  const offenders: string[] = []
   const visit = (n: ts.Node): void => {
-    if (ts.isCallExpression(n)) {
-      const callee = ts.isIdentifier(n.expression) ? n.expression.text : undefined
-      const isFs = callee !== undefined && FS.has(callee)
-      if ((isFs || isPathCall(n)) && n.arguments[0]) {
-        const where = `${(callee ?? (n.expression as ts.PropertyAccessExpression).name.text)}@L${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`
-        const first = leaf(n.arguments[0])
-        checked.push(where)
-        if (!marked(first)) unmarked.push(where)
-      }
-      // rename(a, b): the second path is also a path.
-      if (callee === 'rename' && n.arguments[1]) {
-        checked.push(`rename#2@L${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`)
-        if (!marked(leaf(n.arguments[1]))) unmarked.push(`rename#2@L${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`)
-      }
+    if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && ts.isIdentifier(n.expression.expression) &&
+        n.expression.expression.text === 'path' && ['join', 'resolve'].includes(n.expression.name.text) && n.arguments[0]) {
+      const first = n.arguments[0]
+      const where = `${n.expression.name.text}@L${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`
+      examined.push(where)
+      if (ts.isCallExpression(first) && first.getText() !== 'process.cwd()') offenders.push(`${where}: first operand ${first.getText()}`)
     }
     ts.forEachChild(n, visit)
   }
   visit(sf)
-  console.log(`  F2 precondition: ${checked.length} fs/path calls examined: ${checked.join(' ')}`)
-  console.log(`  F2 unmarked: ${JSON.stringify(unmarked)}`)
-  assert.ok(checked.length >= 14, 'precondition: the calls were found (fs and path, including the cwd fallback)')
-  assert.ok(checked.some((c) => c.startsWith('join@')) && checked.some((c) => c.startsWith('readFile@')), 'precondition: both kinds present')
-  assert.deepEqual(unmarked, [], 'an unmarked call lets Turbopack list the whole project directory, which panics on the root-owned 0700 .ims-publish directory')
+  console.log(`  F2 precondition: ${examined.length} path.join/path.resolve calls examined: ${examined.join(' ')}`)
+  console.log(`  F2 offenders: ${JSON.stringify(offenders)}`)
+  assert.ok(examined.length >= 3, 'precondition: the calls were found')
+  assert.ok(text.includes('${path.dirname(filePath)}${path.sep}.${path.basename(filePath)}'), 'precondition: the template-string form is what builds the temporary path')
+  assert.deepEqual(offenders, [])
+  assert.doesNotMatch(text, /\/\*\s*turbopackIgnore/, 'and no marker is relied on: it does not apply to these calls')
 })
 
 test('F2: the fix leaves publish_durable_file\'s mode check alone (no scripts change touches the staging mode)', () => {

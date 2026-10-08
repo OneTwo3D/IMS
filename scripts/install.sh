@@ -7670,6 +7670,13 @@ header "Configuration"
 # permanently undecryptable.
 load_existing_env "${APP_DIR}/.env"
 
+# THE INVOICE PDF DIRECTORY IS WHERE THE PREVIOUS RUN PUT IT. The default assigned among the other
+# path defaults is only the answer for a host with no .env: a re-run that rewrote .env with that
+# default would silently repoint a live installation away from the PDFs it has already stored.
+INVOICE_PDF_STORAGE_DIR="$(existing_env INVOICE_PDF_STORAGE_DIR "${INVOICE_PDF_STORAGE_DIR}")"
+[[ "${INVOICE_PDF_STORAGE_DIR}" == /* && "${INVOICE_PDF_STORAGE_DIR}" != *"/../"* && "${INVOICE_PDF_STORAGE_DIR}" != */.. ]] || die \
+  "INVOICE_PDF_STORAGE_DIR in ${APP_DIR}/.env is '${INVOICE_PDF_STORAGE_DIR}', which is not an absolute path without '..' components. Correct it (or remove the line to use the default under ${DATA_DIR}) and re-run. Nothing has been changed."
+
 echo -e "${YELLOW}Please provide the following configuration values."
 echo -e "Press Enter to accept the default shown in brackets.${RESET}"
 if (( ${#EXISTING_ENV[@]} > 0 )); then
@@ -8169,8 +8176,13 @@ prompt SMTP_REPLY_TO  "SMTP reply-to email" ""
 # one used to abort the .env write after all of those had already happened.
 echo ""
 info "--- Cloudflare Turnstile on the login page (optional — blank leaves it disabled) ---"
-prompt NEXT_PUBLIC_TURNSTILE_SITE_KEY "Turnstile site key" ""
-prompt TURNSTILE_SECRET_KEY           "Turnstile secret key" "" "secret"
+# A re-run keeps what the previous .env had (Enter accepts it); clearing is an explicit choice --
+# type the word `none` (or export it for --non-interactive) -- because a blank answer used to be
+# indistinguishable from "I did not notice this question" and silently switched the challenge off.
+prompt NEXT_PUBLIC_TURNSTILE_SITE_KEY "Turnstile site key (type none to disable)" "$(existing_env NEXT_PUBLIC_TURNSTILE_SITE_KEY)"
+prompt TURNSTILE_SECRET_KEY           "Turnstile secret key (type none to disable)" "$(existing_env TURNSTILE_SECRET_KEY)" "secret" "$([[ -n "$(existing_env TURNSTILE_SECRET_KEY)" ]] && printf 'kept from the existing .env' || true)"
+[[ "${NEXT_PUBLIC_TURNSTILE_SITE_KEY}" != "none" ]] || NEXT_PUBLIC_TURNSTILE_SITE_KEY=""
+[[ "${TURNSTILE_SECRET_KEY}" != "none" ]] || TURNSTILE_SECRET_KEY=""
 
 echo ""
 info "--- nginx ---"
@@ -8465,7 +8477,16 @@ mkdir_service_subdir "${DATA_DIR}" 022 \
 # The invoice PDF directory is private to the application account (signed links are the only way
 # to read it): mode 750, owner ${APP_USER}. The state-tree ownership walk below re-asserts the
 # owner and leaves the mode alone.
-own_service_subdir "${DATA_DIR}" 022 "${INVOICE_PDF_STORAGE_DIR}" "${APP_USER}" 750
+if [[ "${INVOICE_PDF_STORAGE_DIR}" == "${DATA_DIR}/"* ]]; then
+  own_service_subdir "${DATA_DIR}" 022 "${INVOICE_PDF_STORAGE_DIR}" "${APP_USER}" 750
+else
+  # A location the operator chose outside the state directory is theirs to provide: root does not
+  # create paths it cannot walk symlink-safely from a root it owns. It must already be there, be a
+  # real directory, and be writable by the application account, or the run stops BEFORE .env is
+  # written (and so before anything points the application at it).
+  { [[ -d "${INVOICE_PDF_STORAGE_DIR}" && ! -L "${INVOICE_PDF_STORAGE_DIR}" ]] && run_as_user "${APP_USER}" test -w "${INVOICE_PDF_STORAGE_DIR}"; } || die \
+    "INVOICE_PDF_STORAGE_DIR is '${INVOICE_PDF_STORAGE_DIR}', outside ${DATA_DIR}. This installer does not create directories there: create it, owned by ${APP_USER} and not a symlink (chown ${APP_USER}:${APP_USER}; chmod 750), then re-run. Nothing has been started."
+fi
 mkdir_service_subdir "${APP_DIR}" 022 "${APP_DIR}/backups"
 
 # AND /tmp/${APP_NAME}/pdf AND /tmp/${APP_NAME}/uploads ARE NOT CREATED AT ALL ANY MORE (o3d-czpy).
