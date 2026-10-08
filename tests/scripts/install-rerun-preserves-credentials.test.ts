@@ -210,6 +210,7 @@ async function runInstallerCapturing(
     BACKUP_DIR="\${DATA_DIR}/backups"
     UPLOAD_STORAGE_DIR="\${DATA_DIR}/uploads"
     PUBLIC_UPLOAD_STORAGE_DIR="\${DATA_DIR}/public-uploads"
+    INVOICE_PDF_STORAGE_DIR="\${DATA_DIR}/invoice-pdfs"
     APP_PORT=3000
     APP_DOMAIN=ims.example.com
     DATABASE_URL=postgresql://imsuser:pw@localhost:5432/one_two_inventory
