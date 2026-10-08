@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, renameSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, linkSync, renameSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type TestContext, test } from 'node:test'
 import { pgBinDir, startCluster } from './real-postgres-cluster.ts'
@@ -921,12 +921,16 @@ for (const mode of ['symlink', 'different file'] as const) {
           envFile = join(parent, run, 'rehearsal.env')
           rmSync(envFile)
           if (mode === 'symlink') symlinkSync(victim, envFile)
-          else writeFileSync(envFile, 'decoy contents')
+          else {
+            // A hard link, so the decoy outlives the run directory and its content can be read afterwards.
+            writeFileSync(join(parent, 'decoy-keep'), 'decoy contents')
+            linkSync(join(parent, 'decoy-keep'), envFile)
+          }
         },
       },
     })
     assert.ok(outcome.report)
-    const decoy = mode === 'symlink' ? readFileSync(victim, 'utf8') : (existsSync(envFile) ? readFileSync(envFile, 'utf8') : '(removed with the run directory)')
+    const decoy = mode === 'symlink' ? readFileSync(victim, 'utf8') : readFileSync(join(parent, 'decoy-keep'), 'utf8')
     console.log(`# env file replaced by a ${mode}; victim now ${JSON.stringify(readFileSync(victim, 'utf8'))}; decoy now ${JSON.stringify(decoy)}; envFileShredded=${outcome.report.teardown?.envFileShredded}; exit ${outcome.exitCode}; errors ${JSON.stringify(outcome.report.teardown?.errors)}`)
     assert.ok(envFile.length > 0, 'precondition: the replacement happened')
     assert.equal(readFileSync(victim, 'utf8'), 'precious', 'the symlink target was not overwritten')
