@@ -1427,6 +1427,81 @@ It runs in a `finally`, whether a step failed, a step threw, or the cluster neve
 
 The go/no-go gate (o3d-zjsb5.18) wants evidence that a fresh install of **this build** provisions cleanly and that a backup taken before any load restores to an identical database. A GREEN report from the commit being deployed is that evidence for items 1–7 and 9; item 8 joins it once the outbound hold exists. Attach the JSON, not a paraphrase of it. The rehearsal does not replace the gate's data checks (the invariant preflight against the **real** database, the reconciliation pack) and says nothing about the real host: `install.sh`, the service account, nginx and the production `.env` are outside it.
 
+## WooCommerce initial-import rehearsal
+
+`npm run rehearse:woo-import` runs the **real WooCommerce initial order import** (the code behind **Import Active Orders**: `lib/connectors/woocommerce/sync/initial-import.ts`, `importWcOrder` and the allocation service) end to end against a **local fake WooCommerce REST server** serving synthetic orders, into a PostgreSQL cluster created for the occasion and thrown away afterwards, and writes a report. It is the rehearsal behind the first load's order import (o3d-zjsb5.16): it shows, before anything touches the live store, what the import does with open orders, which of them it cannot allocate, and whether the numbers agree.
+
+```bash
+# As the account that owns the checkout (NOT root), with PostgreSQL server binaries installed
+# and `npx prisma generate` already run:
+npm run rehearse:woo-import
+# Optional: --root <dir> (parent of the throwaway cluster, default /var/tmp),
+#           --report-dir <dir> (default /var/tmp/ims-rehearsal-reports) and
+#           --check-deployment-statuses <env file> (read-only check of a deployment's actual status selection).
+```
+
+A measured run takes well under a minute. It uses the same cluster helper, environment whitelist, secret handling and teardown as the [fresh-install rehearsal](#fresh-install-rehearsal) (see there for what it builds and refuses to touch), and the same report publication discipline; on a memory-constrained shared host take the same lock the test tiers take.
+
+### What it never does
+
+- **It never contacts a real host.** The fake binds `127.0.0.1` on an ephemeral port. The connector reaches it through the ordinary settings in the throwaway database (`wc_url` and the two credential rows), and the connector's read path accepts a loopback `http` URL only when `E2E_TEST_MODE=1` and `NODE_ENV` is not `production`; the rehearsal sets the first and leaves the second unset in the processes it starts. The write calls (`wcPost`, `wcPut`) do not carry that allowance, so a write to the fake would be refused by the transport as well as by the hold.
+- **It never writes.** The import is read-only. No outbound-write grant (`WC_WRITEBACK_ALLOWED_ORIGIN`, `MINTSOFT_WRITE_ALLOWED`, `XERO_WRITE_ALLOWED_TENANT`) exists in any environment it builds. The report proves that `npm run outbound:status` reports every connector held before and after, that **no request other than GET reached the fake**, that no request was for a route the fake does not model, and that the outbound-write hold refused nothing (a refusal would mean the import tried to write). No webhook is registered: that would be a POST, and the fake records any.
+- **It never sets the one-shot stamp on a rehearsal pass.** A rehearsal pass never writes the one-shot completion stamp (wc_initial_import_completed) or the order-sync cursor (last_wc_order_sync_at). Only a real pass does, and a real pass cannot be undone. The seam is `runInitialImport(progress, { stampCompletion })`: the button's own path leaves it at its default (stamp), the rehearsal passes `false`. The report shows the two stamp keys absent after the rehearsal passes and present only after the one real pass that closes the run, and shows the button declining to run again after it.
+
+### What it builds
+
+A store of synthetic orders in every status the first load cares about (see `tests/fixtures/woo-import/orders.ts`): processing, pending and on-hold orders to import; completed, cancelled, refunded and failed orders the owner decision abandons; registered and guest customers; coupons spread across lines; fees; two tax rates plus one WooCommerce rate id IMS has no mapping for; a tax-inclusive store; shipping with tax; a partial refund; a euro order and a US-dollar order (both with a GBP rate seeded; a dedicated test leaves the USD rate out); lines for SKUs IMS holds with and without stock, a SKU IMS does not hold, and a line with no SKU; and enough ordinary orders that the walk must read three pages. Every order's total is exactly the sum of its parts.
+
+### The report
+
+Two files per run, `woo-import-report.json` and `woo-import-report.md`, under `<report-dir>/<run id>/`, published with the same discipline as the fresh-install report (exclusive directory, temporary names, Markdown first and the JSON last as the commit record naming its companion by sha256).
+
+| Step | What a PASS means |
+| --- | --- |
+| Every migration applied by migrate deploy | `prisma migrate deploy` exited 0 and migrations are recorded as applied. |
+| npm run db:seed | The seed exited 0. |
+| IMS-side fixtures: products, opening stock, tax mappings, FX rate, store settings | The IMS side exists (three SKUs, opening stock for two, WooCommerce tax rates 1 and 2 mapped, a GBP-to-EUR rate, the store connection settings, the status selection) and nothing is reserved, allocated or imported yet. |
+| No outbound-write grant exists: outbound:status reports every connector held | `npm run outbound:status -- --json --expect-held` exits 0 with WooCommerce, Mintsoft and Xero each `held`. |
+| The real initial-import pass runs as a rehearsal (no stamp) | `runInitialImport` ran with `stampCompletion: false`; the report records what it fetched, imported, skipped and failed. |
+| SIMULATED configuration check: the status list the rehearsal itself configured resolves to the owner decision | **A simulated check, and only that.** The harness itself puts the `wc_sync_order_statuses` selection into its throwaway database, so this step shows that the list `getWcPullStatuses('initial')` resolves from the decided selection is exactly `on-hold`, `pending`, `processing` and none of `cancelled`, `completed`, `failed`, `refunded`. It says nothing about any real installation. |
+| Deployment: the target installation's wc_sync_order_statuses resolves to the owner decision (NOT CHECKED unless --check-deployment-statuses is given) | The only step that looks at a real installation, and it is **NOT CHECKED** unless `--check-deployment-statuses <env file>` is given (a mode-600 file holding `DATABASE_URL=` of the deployment). Then its actual `wc_sync_order_statuses` is read in one read-only transaction and judged against the decision: a missing row is the default, `processing` alone, and FAILS. A fresh install defaults to `processing` only, so the intended deployment's setting must be checked before D7 is considered satisfied. Not checked is reported as NOT CHECKED, never as a pass. |
+| The pass judges itself COMPLETE on its own terms (no unread page, no truncated read, no unrecorded refusal) | The pass ended `complete`, with no unrecorded refusal and no per-order error (an error is an order that did not import). |
+| A rehearsal wrote neither the completion stamp nor the sync cursor | Both keys were absent before and after the rehearsal pass. |
+| R9: exact order count in the selected statuses; value within tolerance per order | Every order the store holds in a selected status is in IMS: the count is exact and nothing is excused. An order that is missing fails R9 and the verdict whether or not a durable retry row (the pending-FX queue) exists for it; the retry row is reported beside it as a recovery fact, because the stamp moves the cursor past the order regardless. No order outside the selected statuses is in IMS. For each imported order the stored total equals the total WooCommerce stated, in the order currency and in GBP at the seeded rate, and the order's own parts (line nets, tax, shipping, less any order-level discount) add up to its total, each within GBP 0.01 (`R9_VALUE_TOLERANCE`). |
+| R4: reserved quantity equals the sum of allocations, per stock row | For every stock row, `reservedQty` equals the sum of `OrderAllocation.qty` within 0.0001 (`R4_QUANTITY_TOLERANCE`), and some row holds a reservation, so it examined something. |
+| Every allocation row was derived by the allocation service (none seeded by hand) | Nothing was reserved or allocated before the import; every allocation row now carries its product's current fulfilment-graph version and belongs to an imported order. |
+| Orders and lines that imported but could not be allocated are listed | The list is in the report: lines with no product link (a SKU IMS does not hold, a line with no SKU, a fee) are never allocatable; lines with a product that are short of stock wait for it. |
+| A second pass imports nothing new | A second rehearsal pass imports none, creates no order or line, skips every order the first imported, and reports no error. |
+| OD-4 (PROCESSING and ALLOCATED orders only): every such order that was waiting before stock landed is allocated after the backorder allocator and the sweep | Stock added after the import allocates nothing by itself; the backorder allocator (the call the stock-adjustment, purchase-receipt and transfer-receipt actions make) and then the reallocation sweep allocate every PROCESSING or ALLOCATED order that was waiting; R4 still holds afterwards. This step claims nothing about other statuses. |
+| Every order still short after stock landed is listed by status; none of a status expected to allocate remains short; ON_HOLD and PENDING_PAYMENT are named as not expected to allocate | After the landing, every imported order that still has a product line short of stock is listed by status. It fails if one of a status expected to allocate (PROCESSING, ALLOCATED) remains short, or if a short order has a status nobody classified. ON_HOLD and PENDING_PAYMENT orders are printed as their own group, **not expected to allocate (o3d-zjsb5.36)**, and are named as such in the report, so the report never implies they allocated. |
+| A real pass stamps completion and the sync cursor (once) | The one real pass ends `complete`, imports nothing on top of the imported set, and leaves `wc_initial_import_completed` = `true` and a `last_wc_order_sync_at` timestamp. |
+| After the stamp the import button declines to run again | `startInitialImport` returns without scheduling a pass and the progress row is unchanged. |
+| Read-only: no request other than GET reached the store, none was unmodelled, the hold refused nothing | See "What it never does". The email outbox also stays empty. |
+| npm run invariant-check:preflight exits 0 on the imported data | No critical invariant finding (including `stock_reserved_source_mismatch`) on the imported, allocated data. |
+
+### Findings that do not turn the run RED
+
+The report has a **Findings** section for things the owner must read that the application does today and that a rehearsal cannot call wrong:
+
+- **A pass can end COMPLETE with orders that did not import.** An order the import cannot convert (no GBP rate for its currency) is queued for retry after the next FX-rate refresh and the pass still completes; a real pass then stamps and moves the cursor. In a normal run every currency has a rate and this does not occur; with the rate left out R9 fails for the missing order and the report lists the retry row as a recovery fact.
+- **Orders short of stock in a status other than PROCESSING or ALLOCATED are not allocated when stock lands (not expected to allocate, o3d-zjsb5.36).** The backorder allocator and the reallocation sweep act on those two statuses only, so an on-hold or pending-payment order that imports short of stock stays unallocated until something moves it.
+- **Lines with no product link are never allocatable**, whatever stock lands.
+
+### What this does not prove
+
+This rehearsal runs the real import against a SYNTHETIC store. It does not prove how your real store answers (payload quirks, plugin meta keys, a page past the last one), which customers the import creates, whether a real product link resolves by SKU, or how your tax-rate mappings copy. Run it on recorded orders before relying on it. The rehearsal also configures no accounting connector, so nothing is queued for it; a real store with one will queue sales invoices for PROCESSING orders, held from sending by the outbound-write hold.
+
+### Exit codes
+
+This table is the only place the codes are documented; `WOO_IMPORT_EXIT` in `lib/ops/woo-import-rehearsal.ts` is its source and `tests/woo-import-rehearsal-assessors.test.ts` fails if the two disagree.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | GREEN: every required step passed and the teardown left nothing behind. |
+| 1 | RED: a required step failed, was skipped, or threw. The report says which. |
+| 2 | Refused to start: bad arguments, no PostgreSQL server binaries, run as root, or the work directory is on a RAM-backed file system. Nothing was created. |
+| 3 | The teardown could not remove everything it created (cluster, env file, directory or a process). The report names what is left. Takes precedence over RED. |
+
 ## Updating
 
 To update to a newer version:
