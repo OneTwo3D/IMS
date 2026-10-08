@@ -16,14 +16,20 @@
  * for it.
  */
 
+import { raceWithDeadline } from './bounded-wait'
 import { claimBreachAndDeliver, liveAlarmDelivery, type ReadSyncAlarmDeps } from './read-sync-liveness-alarm'
 import { READ_SYNC_ALERT_ACTION, READ_SYNC_STATUS_COMMAND } from './read-sync-liveness-constants'
 import { checkScheduler, readReadSyncInputs, type ReadSyncInputs } from './read-sync-status'
 
 export const READ_SYNC_SCHEDULER_ALERTED_SETTING = 'read_sync_scheduler_alerted'
 
+/** The cron route waits at most this long for the guard AFTER its own work; the guard keeps running regardless. */
+export const SCHEDULER_GUARD_ROUTE_DEADLINE_MS = 3_000
+/** Hard ceiling on one whole guard run (crontab read 5 s, DB reads, claim transaction 15 s): a stuck run is abandoned and a later one may start. */
+export const SCHEDULER_GUARD_CEILING_MS = 30_000
+
 export type SchedulerGuardResult = {
-  status: 'OK' | 'ALERTED' | 'ALREADY_ALERTED' | 'NOT_EXAMINED' | 'FAILED'
+  status: 'OK' | 'ALERTED' | 'ALREADY_ALERTED' | 'NOT_EXAMINED' | 'FAILED' | 'TIMED_OUT' | 'SKIPPED_IN_FLIGHT'
   problems: string[]
 }
 
@@ -71,3 +77,34 @@ export async function runSchedulerCoverageGuardSafely(): Promise<SchedulerGuardR
     return { status: 'FAILED', problems: [] }
   }
 }
+
+let guardInFlight: Promise<SchedulerGuardResult> | null = null
+
+/**
+ * START the guard in the background and hand back a promise that NEVER REJECTS and settles within the
+ * ceiling. Re-entrant safe: while a run is in flight (overlapping 15-minute invocations, a stuck run) a
+ * second call starts nothing and answers SKIPPED_IN_FLIGHT. The in-flight mark is released when the run
+ * settles or the ceiling passes, whichever is first, so one stuck run cannot disable the guard for ever.
+ */
+export function startSchedulerCoverageGuard(
+  options: { run?: () => Promise<SchedulerGuardResult>; ceilingMs?: number } = {},
+): Promise<SchedulerGuardResult> {
+  if (guardInFlight) return Promise.resolve({ status: 'SKIPPED_IN_FLIGHT', problems: [] })
+  const run = options.run ?? runSchedulerCoverageGuardSafely
+  const bounded = raceWithDeadline(
+    (async () => {
+      try { return await run() } catch (error) {
+        console.error('[read-sync-liveness] scheduler coverage guard failed:', error)
+        return { status: 'FAILED', problems: [] } as SchedulerGuardResult
+      }
+    })(),
+    options.ceilingMs ?? SCHEDULER_GUARD_CEILING_MS,
+    { status: 'TIMED_OUT', problems: [] } as SchedulerGuardResult,
+  )
+  const tracked = bounded.finally(() => { if (guardInFlight === tracked) guardInFlight = null })
+  guardInFlight = tracked
+  return tracked
+}
+
+/** Test seam: forget an in-flight run. */
+export function resetSchedulerCoverageGuardForTests(): void { guardInFlight = null }

@@ -50,6 +50,7 @@ function rig() {
       setting: {
         findMany: async ({ where }: { where: { key: { in: string[] } } }) => where.key.in.filter((k) => settings.has(k)).map((key) => ({ key, value: settings.get(key)! })),
         upsert: async () => undefined,
+        updateMany: async () => ({ count: 0 }),
         deleteMany: async ({ where }: { where: { key: string } }) => { settings.delete(where.key) },
       },
       $transaction: async <T>(fn: (tx: ReadSyncAlarmTx) => Promise<T>) => {
@@ -114,22 +115,47 @@ test('[guard] once per distinct problem; a changed problem alerts again', async 
   assert.equal(r.delivered.length, 2)
 })
 
-// ---- the route: the job that is scheduled everywhere calls the guard, and cannot be broken by it ----
-let guardCalls = 0
+// ---- the route: the job that is scheduled everywhere starts the guard FIRST and cannot be delayed by it ----
+const events: string[] = []
+let coreGate: Promise<void> = Promise.resolve()
+let guardPromise: () => Promise<unknown> = async () => ({ status: 'OK', problems: [] })
 mock.module('@/lib/cron-auth', { namedExports: { verifyCron: async () => null } })
 mock.module('@/lib/cron-rate-limit', { namedExports: { enforceCronRateLimit: async () => null, CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX: 4 } })
 mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeResponse: async () => null } })
-mock.module('@/lib/trackship', { namedExports: { checkDeliveryStatus: async () => ({ checked: 0 }) } })
+mock.module('@/lib/trackship', { namedExports: { checkDeliveryStatus: async () => { events.push('core:start'); await coreGate; events.push('core:end'); return { checked: 0 } } } })
 mock.module('@/lib/ops/read-sync-scheduler-guard', {
-  namedExports: { runSchedulerCoverageGuardSafely: async () => { guardCalls += 1; return { status: 'OK', problems: [] } } },
+  namedExports: {
+    SCHEDULER_GUARD_ROUTE_DEADLINE_MS: 250,
+    startSchedulerCoverageGuard: () => { events.push('guard:start'); return guardPromise() },
+  },
 })
 
-test('[route] delivery-status runs the scheduler guard after its own work and still answers', async () => {
-  guardCalls = 0
+test('[route] a STALLED delivery poll cannot prevent the guard: it has already started', async () => {
+  events.length = 0
+  let release!: () => void
+  coreGate = new Promise<void>((resolve) => { release = resolve })
+  guardPromise = async () => ({ status: 'OK', problems: [] })
   const { GET } = await import('../../app/api/cron/delivery-status/route.ts')
-  const response = await GET(new Request('http://localhost/api/cron/delivery-status'))
-  console.log(`precondition: status=${response.status} guardCalls=${guardCalls}`)
+  const pending = GET(new Request('http://localhost/api/cron/delivery-status'))
+  await new Promise((resolve) => setTimeout(resolve, 50)) // let the handler reach the stalled poll
+  console.log(`precondition: events while the core poll is still stalled = ${JSON.stringify(events)}`)
+  assert.deepEqual(events, ['guard:start', 'core:start'], 'the guard started before the core work, and the core work is still stalled')
+  release()
+  const response = await pending
   assert.equal(response.status, 200)
   assert.deepEqual(await response.json(), { checked: 0 })
-  assert.equal(guardCalls, 1)
+})
+
+test('[route] a HANGING guard cannot delay the answer beyond the deadline', async () => {
+  events.length = 0
+  coreGate = Promise.resolve()
+  guardPromise = () => new Promise(() => undefined) // never settles
+  const { GET } = await import('../../app/api/cron/delivery-status/route.ts')
+  const startedAt = Date.now()
+  const response = await GET(new Request('http://localhost/api/cron/delivery-status'))
+  const elapsed = Date.now() - startedAt
+  console.log(`precondition: answered in ${elapsed}ms against a 250ms guard deadline with a guard that never settles`)
+  assert.equal(response.status, 200)
+  assert.ok(elapsed >= 200, `the route did wait for the guard up to its deadline (${elapsed}ms)`)
+  assert.ok(elapsed < 1500, `and not beyond it (${elapsed}ms)`)
 })

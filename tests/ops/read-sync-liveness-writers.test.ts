@@ -320,3 +320,21 @@ test('[order-status] an unresolved order keeps the stamp withheld on LATER sweep
   assert.equal(snapshots.get('a')?.lastError, 'Order confirmed absent in WMS (presence-probed)')
   assert.notEqual(settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING), previous, 'resolved: the stamp advances')
 })
+
+test('[order-status] an in-scope order with a blank or whitespace reference is unresolved, not skipped', async () => {
+  const { runWmsOrderStatusSweep, WMS_LOOKUP_NO_REFERENCE } = await import('@/lib/domain/wms/order-status-sweep')
+  const previous = '2026-10-01T00:00:00.000Z'
+  for (const blank of ['', '   ', '\t\n']) {
+    reset()
+    settings.set(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING, previous)
+    statusOrders = [{ id: 'blank', shoppingLinks: [{ externalOrderNumber: blank }], wmsOrderStatus: null }]
+    const run1 = await runWmsOrderStatusSweep()
+    console.log(`precondition (${JSON.stringify(blank)}): ${JSON.stringify(run1)} snapshot=${snapshots.get('blank')?.lastError} stamp moved=${settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING) !== previous}`)
+    assert.equal(snapshots.get('blank')?.lastError, WMS_LOOKUP_NO_REFERENCE)
+    assert.equal(settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING), previous, 'a blank reference is not a green sweep')
+    // A later sweep that selects nothing else still sees it through the persisted snapshot.
+    statusOrders = []
+    await runWmsOrderStatusSweep()
+    assert.equal(settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING), previous)
+  }
+})

@@ -21,6 +21,8 @@ import {
   buildOtiCrontabBlock,
   DEFAULT_CRON_LOG_PATH,
   extractOtiBlock,
+  OTI_CRON_END_MARKER,
+  OTI_CRON_START_MARKER,
   parseOtiCrontabStatus,
   type CrontabJobDef,
   type CrontabSecretRef,
@@ -39,6 +41,16 @@ export function verifyJobsScheduled(
   storedSchedules: Readonly<Record<string, string | undefined>>,
 ): SchedulerVerdict {
   const allMissing = (blockProblem: string): SchedulerVerdict => ({ blockProblem, missing: wanted.map((job) => job.slug) })
+
+  // EXACTLY ONE managed region. extractOtiBlock concatenates every region it finds, so a valid block plus a
+  // second complete or malformed one (or a stray, nested or extra marker) would otherwise be read as one
+  // block and could vouch for a job the real schedule does not carry.
+  const markerLines = crontabText.split('\n').map((line, index) => ({ line: line.trim(), index })).filter((entry) => /OTI CRON (START|END)/i.test(entry.line))
+  const starts = markerLines.filter((entry) => entry.line === OTI_CRON_START_MARKER)
+  const ends = markerLines.filter((entry) => entry.line === OTI_CRON_END_MARKER)
+  if (markerLines.length !== 2 || starts.length !== 1 || ends.length !== 1 || starts[0]!.index >= ends[0]!.index) {
+    return allMissing(`the crontab must hold exactly one managed region, but it has ${markerLines.length} marker line(s) (${starts.length} start, ${ends.length} end, in the order ${markerLines.map((entry) => (entry.line === OTI_CRON_START_MARKER ? 'start' : entry.line === OTI_CRON_END_MARKER ? 'end' : 'malformed')).join(', ') || 'none'})`)
+  }
 
   const status = parseOtiCrontabStatus(crontabText, null)
   if (!status.blockPresent) return allMissing('there is no complete managed block (both markers) in the crontab')

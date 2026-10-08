@@ -34,7 +34,7 @@ const ago = (ms: number) => new Date(NOW.getTime() - ms)
 class Harness {
   settings = new Map<string, string>()
   delivered: Array<{ title: string; message: string; actionUrl: string }> = []
-  warnings: Array<{ stream: ReadSyncStreamId | 'scheduler'; description: string }> = []
+  warnings: Array<{ stream: ReadSyncStreamId | 'scheduler' | 'liveness-anchor'; description: string }> = []
   failDelivery = false
   failActivityWrite = false
   /** Called inside the claim transaction after the claim won and before delivery: lets a test interleave a rival run. */
@@ -56,6 +56,11 @@ class Harness {
       },
       deleteMany: async ({ where }) => {
         this.settings.delete(where.key)
+      },
+      updateMany: async ({ where, data }) => {
+        if (this.settings.get(where.key) !== where.value) return { count: 0 }
+        this.settings.set(where.key, data.value)
+        return { count: 1 }
       },
     },
     $transaction: async <T>(fn: (tx: ReadSyncAlarmTx) => Promise<T>) => {
@@ -283,4 +288,40 @@ test('[activity] a failed activity write rolls the claim back with the notificat
   assert.deepEqual(retried.alerted, ['mintsoft-dispatch-poll'])
   assert.equal(harness.delivered.length, 1)
   assert.equal(harness.warnings.length, 1)
+})
+
+test('[anchor] an unparsable first-evaluation anchor is replaced ONCE, reported once, and the never-succeeded alarm then fires after the limit', async () => {
+  const harness = new Harness((at) => inputs({}, { 'xero-tax-rates': null }, at))
+  harness.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, 'not a time')
+  const limit = 6 * HOUR
+
+  const first = await harness.run()
+  const replaced = harness.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING)
+  console.log(`precondition: run1 alerted=${JSON.stringify(first.alerted)} anchor now ${replaced} warnings=${harness.warnings.length}`)
+  assert.equal(replaced, NOW.toISOString(), 'the bad value was replaced with now')
+  assert.equal(harness.warnings.filter((w) => w.stream === 'liveness-anchor').length, 1, 'and the fault is reported')
+  assert.deepEqual(first.alerted, [])
+
+  // Later runs use the PERSISTED anchor: it is not rewritten, so the limit can be reached.
+  await harness.run(new Date(NOW.getTime() + limit - 1))
+  assert.equal(harness.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING), NOW.toISOString(), 'not moved by later runs')
+  assert.equal(harness.warnings.filter((w) => w.stream === 'liveness-anchor').length, 1, 'reported once per replacement, not per run')
+  const after = await harness.run(new Date(NOW.getTime() + limit))
+  assert.deepEqual(after.alerted, ['xero-tax-rates'], 'the feed that has never succeeded is alarmed once the limit has run')
+})
+
+test('[anchor] a rival that replaced the bad anchor first wins: this run writes nothing and uses the rival\'s value', async () => {
+  const harness = new Harness((at) => inputs({}, { 'xero-tax-rates': null }, at))
+  harness.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, 'not a time')
+  const real = harness.db.setting.findMany
+  let reads = 0
+  harness.db.setting.findMany = async (args) => {
+    const rows = await real(args)
+    reads += 1
+    if (reads === 1) harness.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, new Date(NOW.getTime() - 2 * HOUR).toISOString())
+    return rows
+  }
+  await harness.run()
+  assert.equal(harness.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING), new Date(NOW.getTime() - 2 * HOUR).toISOString())
+  assert.equal(harness.warnings.filter((w) => w.stream === 'liveness-anchor').length, 0)
 })

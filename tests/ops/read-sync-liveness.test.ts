@@ -381,6 +381,11 @@ test('[scheduler] lines that cannot run the job do not count: commented, outside
     ['label line removed', mutate((c) => { c.splice(jobLine - 1, 1) }), 'missing'],
     ['only outside the markers', ['0 * * * * curl -sf "$BASE_URL/read-sync-liveness"'].join('\n') + '\n', 'block'],
     ['END marker missing (partial block)', mutate((c) => { c.splice(c.findIndex((line) => line.includes('OTI CRON END')), 1) }), 'block'],
+    ['a second COMPLETE managed block beside the good one', lines.join('\n') + '\n' + generatedBlock(['read-sync-liveness']), 'block'],
+    ['a second, malformed managed block (extra START)', lines.join('\n') + '\n# --- OTI CRON START ---\n0 * * * * curl "$BASE_URL/read-sync-liveness"\n', 'block'],
+    ['nested markers', mutate((c) => { c.splice(jobLine, 0, '# --- OTI CRON START ---') }), 'block'],
+    ['a stray END marker outside the region', lines.join('\n') + '\n# --- OTI CRON END ---\n', 'block'],
+    ['a loosely spelled marker', lines.join('\n') + '\n#--- OTI CRON START ---x\n', 'block'],
     ['BASE_URL assignment removed', mutate((c) => { c.splice(c.findIndex((line) => line.startsWith('BASE_URL=')), 1) }), 'block'],
     ['secret source edited out', mutate((c) => { const i = c.findIndex((line) => line.startsWith('# CRON_SECRET is read from')); c[i] = '# nothing' }), 'block'],
   ]

@@ -66,6 +66,13 @@ export const WMS_LOOKUP_AMBIGUOUS = 'WMS lookup ambiguous — several orders mat
 export const WMS_LOOKUP_PRESENT_NO_STATUS = 'WMS holds this order but its status could not be read'
 
 /**
+ * The lastError of a snapshot written for an in-scope order whose storefront link carries a blank or
+ * whitespace-only order number. There is nothing to look up, so the order's WMS status cannot be known:
+ * that is UNRESOLVED (it withholds the read-sync stamp and is retried on every sweep), not "skip it".
+ */
+export const WMS_LOOKUP_NO_REFERENCE = 'The storefront link has no usable order number, so the WMS cannot be asked about this order'
+
+/**
  * A snapshot row whose lookup did NOT resolve: it carries a `lastError` that is not one of the two
  * answers the warehouse itself gave about a missing order (confirmed absent, ambiguous). That covers a
  * presence probe that failed or could not run, a present order whose status was unreadable, a thrown
@@ -159,7 +166,21 @@ export async function runWmsOrderStatusSweep(
 
   for (const order of orders) {
     const reference = order.shoppingLinks[0]?.externalOrderNumber?.trim()
-    if (!reference) continue
+    if (!reference) {
+      // The scope only excludes a NULL order number, so a blank or whitespace one lands here. It is not
+      // skipped silently: an unresolved snapshot is persisted (so it is retried every sweep and counted by
+      // the stamp guard even when it is beyond this batch), and this run's stamp is withheld.
+      unresolvedReads += 1
+      await db.wmsOrderStatusSnapshot.upsert({
+        where: { orderId: order.id },
+        create: {
+          orderId: order.id, connector: connectorId, connectorLabel, externalOrderId: '', externalOrderNumber: '',
+          status: '', statusLabel: 'Unknown', lastError: WMS_LOOKUP_NO_REFERENCE,
+        },
+        update: { fetchedAt: new Date(), lastError: WMS_LOOKUP_NO_REFERENCE },
+      })
+      continue
+    }
 
     try {
       const status = await connector.fetchOrderStatus(reference)

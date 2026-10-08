@@ -31,7 +31,7 @@ import { parseReadSyncStamp } from './read-sync-liveness'
 import { assembleReadSyncReport, type ReadSyncInputs } from './read-sync-status'
 
 export type ReadSyncAlarmLogEntry = {
-  stream: ReadSyncStreamId | 'scheduler'
+  stream: ReadSyncStreamId | 'scheduler' | 'liveness-anchor'
   title: string
   description: string
   metadata: Record<string, unknown>
@@ -51,8 +51,9 @@ export type ReadSyncAlarmDb = {
     findMany(args: { where: { key: { in: string[] } }; select: { key: true; value: true } }): Promise<Array<{ key: string; value: string }>>
     upsert(args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }): Promise<unknown>
     deleteMany(args: { where: { key: string } }): Promise<unknown>
+    updateMany(args: { where: { key: string; value: string }; data: { value: string } }): Promise<{ count: number }>
   }
-  $transaction<T>(fn: (tx: ReadSyncAlarmTx) => Promise<T>): Promise<T>
+  $transaction<T>(fn: (tx: ReadSyncAlarmTx) => Promise<T>, options?: { maxWait?: number; timeout?: number }): Promise<T>
 }
 
 export type ReadSyncAlarmDeps = {
@@ -99,8 +100,11 @@ export async function claimBreachAndDeliver(
     await deps.notifyAdmins(tx, claim.alert.title, claim.alert.message, '/sync')
     await deps.logWarning(tx, claim.logEntry)
     return true
-  })
+  }, ALARM_TRANSACTION_BOUNDS)
 }
+
+/** The claim transaction is bounded: a stuck connection or lock cannot hold a cron run indefinitely. */
+export const ALARM_TRANSACTION_BOUNDS = { maxWait: 5_000, timeout: 15_000 } as const
 
 export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise<ReadSyncAlarmResult> {
   const { db, now } = deps
@@ -111,16 +115,40 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
   const stampKeys = [READ_SYNC_FIRST_EVALUATED_SETTING, ...entries.map((entry) => readSyncAlertedSettingKey(entry.stream))]
   const stored = new Map((await db.setting.findMany({ where: { key: { in: stampKeys } }, select: { key: true, value: true } })).map((row) => [row.key, row.value]))
 
-  // The first-evaluation anchor is written once and never moved.
-  let trackedSince = parseReadSyncStamp(stored.get(READ_SYNC_FIRST_EVALUATED_SETTING))
-  if (trackedSince === null) {
+  // The first-evaluation anchor is written once and never moved, with ONE exception: a stored value that
+  // is not a time is replaced - once, by a compare-and-set on the bad value - and reported. Overwriting it
+  // on every run instead would keep "tracking began" at "now" for ever, so a feed that has never
+  // succeeded would never reach its limit and its alarm would never fire.
+  const storedAnchor = stored.get(READ_SYNC_FIRST_EVALUATED_SETTING)
+  let trackedSince = parseReadSyncStamp(storedAnchor)
+  if (storedAnchor === undefined) {
     trackedSince = now
     await db.setting.upsert({
       where: { key: READ_SYNC_FIRST_EVALUATED_SETTING },
       create: { key: READ_SYNC_FIRST_EVALUATED_SETTING, value: now.toISOString() },
       update: { value: now.toISOString() },
     })
+  } else if (trackedSince === null) {
+    const replaced = await db.$transaction(async (tx) => {
+      const claimed = await tx.setting.updateMany({ where: { key: READ_SYNC_FIRST_EVALUATED_SETTING, value: storedAnchor }, data: { value: now.toISOString() } })
+      if (claimed.count !== 1) return false
+      await deps.logWarning(tx, {
+        stream: 'liveness-anchor',
+        title: 'Read-sync liveness start time was unreadable',
+        description: `The stored start time of read-sync liveness tracking (${READ_SYNC_FIRST_EVALUATED_SETTING}) was not a time and has been replaced with ${now.toISOString()}. Feeds that have never succeeded are alarmed only after their limit has passed since then.`,
+        metadata: { action: READ_SYNC_ALERT_ACTION, kind: 'anchor-replaced', invalidValue: storedAnchor.slice(0, 80) },
+      })
+      return true
+    }, ALARM_TRANSACTION_BOUNDS)
+    if (replaced) {
+      trackedSince = now
+    } else {
+      // Another run replaced it first: use what it persisted; never write again here.
+      const reread = await db.setting.findMany({ where: { key: { in: [READ_SYNC_FIRST_EVALUATED_SETTING] } }, select: { key: true, value: true } })
+      trackedSince = parseReadSyncStamp(reread[0]?.value) ?? now
+    }
   }
+  if (trackedSince === null) trackedSince = now
 
   const alerted: ReadSyncStreamId[] = []
   let deliveryFailures = 0
