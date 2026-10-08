@@ -75,11 +75,13 @@ import {
   WOO_IMPORT_EXIT,
   WOO_IMPORT_EXIT_MEANING,
   WOO_STEP_CATALOGUE,
+  type AllocationFact,
   type ImportedOrderFact,
   type LandingFacts,
   type OrderRow,
   type PassFacts,
   type R4Result,
+  type SideEffects,
   type R9Result,
   type StampFacts,
   type StockRowFact,
@@ -136,6 +138,7 @@ const DRIVER = 'scripts/lib/woo-import-driver.ts'
 
 /** Stock that lands AFTER the import, per SKU: B had none, C had 100 and the bulk orders ask for more. */
 const LANDING = [
+  { sku: SKU_STOCKED, qty: 100, unitCost: 4 },
   { sku: SKU_UNSTOCKED, qty: 10, unitCost: 4 },
   { sku: SKU_PLENTY, qty: 60, unitCost: 5 },
 ]
@@ -278,10 +281,14 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
   let r4 = null as R4Result | null
   let r4AfterLanding = null as R4Result | null
   let landing = null as LandingFacts | null
+  let allocationAtImport = new Map<number, AllocationFact>()
+  const findings: WooImportReport['findings'] = []
   let stampAfterRealPass = null as StampFacts | null
   let readOnly = null as ReturnType<typeof assessReadOnly> | null
   let unallocatable: WooImportReport['unallocatable'] = []
   let counts = { ordersFirst: 0, linesFirst: 0 }
+  let fetchedFirstPass = null as number | null
+  let sideEffects = null as SideEffects | null
   let abortedRows: OrderRow[] = []
 
   let interrupted: string | null = null
@@ -445,9 +452,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
                (so."customerId" is not null) as "hasCustomer",
                (select coalesce(sum(sol."totalForeign"), 0)::float8 from sales_order_lines sol where sol."orderId" = so.id) as "lineTotalForeignSum",
                (select count(*)::int from sales_order_lines sol where sol."orderId" = so.id) as "lineCount",
-               (select count(*)::int from sales_order_lines sol where sol."orderId" = so.id and sol."productId" is null) as "linesWithoutProduct",
-               (select coalesce(sum(sol.qty), 0)::float8 from sales_order_lines sol where sol."orderId" = so.id) as "wantedQty",
-               (select coalesce(sum(oa.qty), 0)::float8 from order_allocations oa where oa."orderId" = so.id) as "allocatedQty"
+               (select count(*)::int from sales_order_lines sol where sol."orderId" = so.id and sol."productId" is null) as "linesWithoutProduct"
           from shopping_order_links l join sales_orders so on so.id = l."orderId"
          where l.connector = 'woocommerce' order by l."externalOrderId"::bigint`)
         .then((r) => r.rows.map((row) => ({ ...row, externalOrderId: Number(row.externalOrderId) }) as ImportedOrderFact))
@@ -462,7 +467,22 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
     const countOrders = (client: pg.Client) =>
       client.query(`select (select count(*)::int from sales_orders) as orders, (select count(*)::int from sales_order_lines) as lines`).then((r) => ({ orders: num(r.rows[0].orders), lines: num(r.rows[0].lines) }))
 
-    const unallocatedMap = (facts: readonly ImportedOrderFact[]) => new Map(facts.map((f) => [f.externalOrderId, { lines: 0, qty: Math.max(0, Math.round((f.wantedQty - f.allocatedQty) * 10_000) / 10_000) }]))
+    const readAllocation = (client: pg.Client): Promise<Map<number, AllocationFact>> =>
+      client.query(`
+        select l."externalOrderId", so.status::text as "imsStatus", so."orderNumber",
+               (select count(*)::int from sales_order_lines sol where sol."orderId" = so.id and sol."productId" is null) as "noProductLines",
+               (select count(*)::int from sales_order_lines sol where sol."orderId" = so.id and sol."productId" is not null
+                   and sol.qty > coalesce((select sum(oa.qty) from order_allocations oa where oa."lineId" = sol.id), 0) + 0.0001) as "shortLines",
+               (select coalesce(sum(sol.qty - coalesce((select sum(oa.qty) from order_allocations oa where oa."lineId" = sol.id), 0)), 0)::float8
+                  from sales_order_lines sol where sol."orderId" = so.id and sol."productId" is not null
+                   and sol.qty > coalesce((select sum(oa.qty) from order_allocations oa where oa."lineId" = sol.id), 0) + 0.0001) as "shortQty"
+          from shopping_order_links l join sales_orders so on so.id = l."orderId" where l.connector = 'woocommerce'`)
+        .then((r) => new Map(r.rows.map((row) => [Number(row.externalOrderId), { imsStatus: String(row.imsStatus), orderNumber: String(row.orderNumber), noProductLines: num(row.noProductLines), shortLines: num(row.shortLines), shortQty: Math.round(num(row.shortQty) * 10_000) / 10_000 }])))
+
+    /** Orders the import refused for a reason that leaves a durable retry row (the pending-FX queue). */
+    const readRetryRecorded = (client: pg.Client): Promise<Set<number>> =>
+      client.query(`select "externalId" from shopping_sync_logs where connector = 'woocommerce' and status = 'PENDING' and "entityType" = 'SalesOrder' and "entityId" is null and payload->>'reason' = 'missing_fx_rate'`)
+        .then((r) => new Set(r.rows.map((row) => Number(row.externalId))))
 
     const runStep = async (def: WooStepDefinition, body: () => Promise<StepOutcome>): Promise<boolean> => {
       if (!included(def)) return true
@@ -528,14 +548,42 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
           const c = await countOrders(client)
           counts = { ordersFirst: c.orders, linesFirst: c.lines }
         })
+        sideEffects = await db(async (client): Promise<SideEffects> => {
+          const one = async (sql: string): Promise<number> => { try { return num((await client.query(sql)).rows[0].n) } catch { return -1 } }
+          const queue = await client.query(`select type::text || '/' || status::text as k, count(*)::int as n from accounting_sync_logs group by 1 order by 1`).catch(() => ({ rows: [] as Array<{ k: string; n: number }> }))
+          return {
+            customersCreated: await one('select count(*)::int as n from customers'),
+            customerLinksCreated: await one(`select count(*)::int as n from shopping_customer_links where connector = 'woocommerce'`),
+            ordersWithoutCustomer: await one('select count(*)::int as n from sales_orders where "customerId" is null'),
+            linesLinkedToProduct: await one('select count(*)::int as n from sales_order_lines where "productId" is not null'),
+            linesWithoutProduct: await one('select count(*)::int as n from sales_order_lines where "productId" is null'),
+            ordersWithTaxRateFallback: await one(`select count(distinct "entityId")::int as n from activity_logs where action = 'tax_rate_fallback'`),
+            accountingQueue: Object.fromEntries(queue.rows.map((row) => [row.k, row.n])),
+            stockSyncJobs: await one('select count(*)::int as n from stock_sync_jobs'),
+            integrationOutbox: await one('select count(*)::int as n from integration_outbox'),
+            emailOutbox: await one('select count(*)::int as n from email_outbox'),
+          }
+        })
+        fetchedFirstPass = fake!.requests.filter((r) => r.path.endsWith('/orders')).reduce((sum, r) => sum + (r.returned ?? 0), 0)
         const dbOrders = importedFacts.length
         return { status: 'passed', detail: { outcome: firstPass.outcome, imported: firstPass.imported, skipped: firstPass.skipped, errors: firstPass.errors.length, ordersInIms: dbOrders, requestsSoFar: fake!.requests.length } }
       },
       'status-selection': async () => verdictOf(assessStatusSelection(firstPass?.statuses ?? []), { resolved: firstPass?.statuses ?? [] }),
-      'pass-complete': async () => verdictOf(assessPassComplete(firstPass!, knownBadIds), { outcome: firstPass!.outcome, errors: firstPass!.errors.map((e) => tail(e, 300)) }),
+      'pass-complete': async () => {
+        if (firstPass!.outcome === 'complete' && firstPass!.errors.length > 0) {
+          findings.push({
+            code: 'pass-complete-with-orders-that-did-not-import',
+            text: `The pass ended COMPLETE although ${firstPass!.errors.length} order(s) did not import (${firstPass!.errors.map((e) => tail(e, 160)).join(' | ')}). A real pass would stamp completion and move the sync cursor past them; only an order with a durable retry row (the pending-FX queue) is recoverable afterwards. R9 checks that each such order has one.`,
+            orders: knownBadIds.map(String),
+          })
+        }
+        return verdictOf(assessPassComplete(firstPass!, knownBadIds), { outcome: firstPass!.outcome, errors: firstPass!.errors.map((e) => tail(e, 300)) })
+      },
       'no-stamp-on-rehearsal': async () => verdictOf(assessNoStampAfterRehearsal({ before: firstPass!.stampBefore, after: firstPass!.stampAfter, stampedFlag: firstPass!.stamped }), { before: firstPass!.stampBefore, after: firstPass!.stampAfter }),
       'r9-orders': async () => {
-        r9 = assessR9({ store: storeFacts, imported: importedFacts, selectedStatuses: firstPass!.statuses, unallocatedByOrder: unallocatedMap(importedFacts) })
+        const [allocation, retry] = await db(async (client) => [await readAllocation(client), await readRetryRecorded(client)] as const)
+        allocationAtImport = allocation
+        r9 = assessR9({ store: storeFacts, imported: importedFacts, selectedStatuses: firstPass!.statuses, allocation, retryRecorded: retry })
         abortedRows = r9.rows
         return verdictOf(r9.assessment, { expected: r9.expectedCount, imported: r9.importedCount, knownBad: r9.knownBadCount, maxValueDiffForeign: r9.maxValueDiffForeign, maxValueDiffBase: r9.maxValueDiffBase, maxComponentsDiff: r9.maxComponentsDiff, tolerance: R9_VALUE_TOLERANCE })
       },
@@ -559,19 +607,15 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
         return { status: ok ? 'passed' : 'failed', reason: ok ? undefined : `allocation rows: ${facts.total}, with a stale graph version: ${facts.stale}, not from an imported order: ${facts.notFromImport}`, detail: { allocationRows: num(facts.total), staleGraphVersion: num(facts.stale), notFromImport: num(facts.notFromImport) } }
       },
       'unallocatable-list': async () => {
-        const rows = await db((client) => client.query(`
-          select l."externalOrderId", so."orderNumber",
-                 (select count(*)::int from sales_order_lines sol where sol."orderId" = so.id
-                    and (sol."productId" is null or sol.qty > coalesce((select sum(oa.qty) from order_allocations oa where oa."lineId" = sol.id), 0) + 0.0001)) as lines,
-                 (select coalesce(sum(sol.qty), 0)::float8 from sales_order_lines sol where sol."orderId" = so.id)
-                   - (select coalesce(sum(oa.qty), 0)::float8 from order_allocations oa where oa."orderId" = so.id) as qty
-            from shopping_order_links l join sales_orders so on so.id = l."orderId" where l.connector = 'woocommerce' order by l."externalOrderId"::bigint`).then((r) => r.rows))
-        unallocatable = rows.filter((row) => num(row.lines) > 0).map((row) => ({ externalOrderId: Number(row.externalOrderId), orderNumber: String(row.orderNumber), unallocatableLines: num(row.lines), unallocatedQty: Math.round(num(row.qty) * 10_000) / 10_000, stage: 'at-import' as const }))
+        unallocatable = [...allocationAtImport.entries()]
+          .filter(([, fact]) => fact.noProductLines > 0 || fact.shortLines > 0)
+          .sort(([x], [y]) => x - y)
+          .map(([externalOrderId, fact]) => ({ externalOrderId, orderNumber: fact.orderNumber, imsStatus: fact.imsStatus, noProductLines: fact.noProductLines, shortLines: fact.shortLines, shortQty: fact.shortQty, afterLanding: 'not-run' as const }))
         // The list is recorded whatever it holds; this step fails only if the fixtures promised some
         // and the list is empty (the rehearsal would then be examining nothing).
         const promised = fixtures.filter((f) => f.expectation === 'imports-with-unallocatable-lines').length
         const ok = promised === 0 || unallocatable.length > 0
-        return { status: ok ? 'passed' : 'failed', reason: ok ? undefined : `the fixtures promise ${promised} order(s) with unallocatable lines and none was found`, detail: { listed: unallocatable.length, promisedByFixtures: promised } }
+        return { status: ok ? 'passed' : 'failed', reason: ok ? undefined : `the fixtures promise ${promised} order(s) with unallocatable lines and none was found`, detail: { listed: unallocatable.length, withNoProductLine: unallocatable.filter((r) => r.noProductLines > 0).length, shortOfStock: unallocatable.filter((r) => r.shortLines > 0).length, promisedByFixtures: promised } }
       },
       'idempotent-second-pass': async () => {
         const { run, payload } = await driver('idempotent-second-pass', 'import-rehearsal')
@@ -583,15 +627,28 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
       'stock-lands-later': async () => {
         const { run, payload } = await driver('stock-lands-later', 'land-stock')
         if (run.exitCode !== 0 || payload === null) return { status: 'failed', reason: `the driver did not report (exit ${run.exitCode}). ${outputTail(run)}` }
-        landing = { beforeLanding: payload.beforeLanding, afterLandingBeforeTrigger: payload.afterLandingBeforeTrigger, afterBackorderAllocator: payload.afterBackorderAllocator, afterSweep: payload.afterSweep }
-        r4AfterLanding = assessR4(await db(readStockRows))
-        // The on-hold order for the unstocked SKU (5003) is the one stock landing must clear.
-        const assessment = assessLanding(landing, ['5003'])
-        const failures = [...assessment.failures, ...r4AfterLanding.assessment.failures.map((f) => `R4 after landing: ${f}`)]
-        // What is STILL waiting after the sweep joins the unallocatable list.
-        const stillWaiting = new Set(landing.afterSweep)
-        unallocatable = unallocatable.map((row) => ({ ...row, stage: stillWaiting.has(String(row.externalOrderId)) ? ('still-waiting-after-landing' as const) : row.stage }))
-        return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { waitingBefore: landing.beforeLanding.length, afterBareLanding: landing.afterLandingBeforeTrigger.length, afterBackorderAllocator: landing.afterBackorderAllocator.length, afterSweep: landing.afterSweep.length, backorders: payload.backorders, sweep: payload.sweep } }
+        landing = { beforeLanding: payload.beforeLanding, afterLandingBeforeTrigger: payload.afterLandingBeforeTrigger, afterBackorderAllocator: payload.afterBackorderAllocator, afterSweep: payload.afterSweep, statusByOrder: payload.statusByOrder }
+        const after = await db(async (client) => ({ stock: await readStockRows(client), allocation: await readAllocation(client) }))
+        r4AfterLanding = assessR4(after.stock)
+        const landed = assessLanding(landing)
+        const failures = [...landed.assessment.failures, ...r4AfterLanding.assessment.failures.map((f) => `R4 after landing: ${f}`)]
+        unallocatable = unallocatable.map((row) => {
+          const now = after.allocation.get(row.externalOrderId)
+          const stillShort = (now?.shortLines ?? 0) > 0
+          return { ...row, afterLanding: stillShort ? ('still-waiting' as const) : row.shortLines > 0 ? ('allocated-when-stock-landed' as const) : ('never-allocatable-lines-without-product' as const) }
+        })
+        if (landed.notPickedUp.length > 0) {
+          findings.push({
+            code: 'imported-short-orders-outside-processing-are-not-allocated-when-stock-lands',
+            text: `${landed.notPickedUp.length} imported order(s) were short of stock at import and are still unallocated after stock landed and both the backorder allocator and the reallocation sweep ran, because both act only on PROCESSING and ALLOCATED orders (${[...new Set(landed.notPickedUp.map((o) => o.imsStatus))].join(', ')} here). An open WooCommerce order in on-hold or pending status that imports short of stock waits until something moves it.`,
+            orders: landed.notPickedUp.map((o) => o.orderNumber),
+          })
+        }
+        const withoutProduct = unallocatable.filter((row) => row.noProductLines > 0)
+        if (withoutProduct.length > 0) {
+          findings.push({ code: 'lines-without-product-are-never-allocatable', text: `${withoutProduct.length} imported order(s) carry a line with no product link (a SKU IMS does not hold, a line with no SKU, or a fee). No stock landing allocates such a line; the SKU must exist in IMS (and the line be re-linked) before it can.`, orders: withoutProduct.map((r) => String(r.externalOrderId)) })
+        }
+        return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { waitingBefore: landing.beforeLanding.length, afterBareLanding: landing.afterLandingBeforeTrigger.length, afterBackorderAllocator: landing.afterBackorderAllocator.length, afterSweep: landing.afterSweep.length, pickedUp: landed.pickedUp.length, notPickedUp: landed.notPickedUp, backorders: { allocated: payload.backorders?.allocated, skipped: payload.backorders?.skipped, errors: payload.backorders?.errors }, sweep: payload.sweep } }
       },
       'real-pass-stamps': async () => {
         const { run, payload } = await driver('real-pass-stamps', 'import-real')
@@ -631,6 +688,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
           holdRefusals: refusals,
         })
         const failures = [...readOnly.assessment.failures, ...held.failures.map((f) => `outbound status after the import: ${f}`)]
+        if (sideEffects !== null && sideEffects.emailOutbox !== 0) failures.push(`the import queued ${sideEffects.emailOutbox} email(s) (email_outbox must stay empty)`)
         return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { totalRequests: readOnly.totalRequests, nonGet: readOnly.nonGet.length, unmodelled: readOnly.unmodelled.length, byRoute: readOnly.byRoute, holdRefusals: refusals } }
       },
       'invariant-preflight': async () => {
@@ -687,7 +745,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
   const r9Final = r9
   const r4Final = r4
   const readOnlyFinal = readOnly
-  const fetchedFromStore = fake ? fake.requests.filter((r) => r.path.endsWith('/orders') && r.status === 200).length : null
+  const orderListRequests = fake ? fake.requests.filter((r) => r.path.endsWith('/orders') && r.status === 200).length : null
   const report = buildWooImportReport({
     runId,
     startedAt: startedAt.toISOString(),
@@ -697,7 +755,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
     store: { kind: 'synthetic-fake', bind: fake ? fake.url : '(never started)', ordersTotal: storeFacts.length, ordersByStatus },
     statuses: { resolved: importedFirst?.statuses ?? [], decided: [...DECIDED_IMPORT_STATUSES], abandoned: [...ABANDONED_STATUSES] },
     tallies: {
-      fetchedFromStore: r9Final ? r9Final.importedCount + r9Final.knownBadCount + (r9Final.missing.length) : null,
+      fetchedFromStore: fetchedFirstPass,
       importedFirstPass: importedFirst?.imported ?? null,
       skippedFirstPass: importedFirst?.skipped ?? null,
       errorsFirstPass: importedFirst?.errors.length ?? null,
@@ -711,12 +769,14 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
     orders: r9Final ? r9Final.rows : abortedRows,
     skippedWithReason: (r9Final ? r9Final.rows : []).filter((row) => row.outcome === 'not-imported').map((row) => ({ externalOrderId: row.externalOrderId, reason: row.reason ?? '' })),
     unallocatable,
+    sideEffects,
+    findings,
     landing,
     stamp: { afterRehearsal: stampAfterRehearsal, afterRealPass: stampAfterRealPass },
     readOnly: readOnlyFinal ? { totalRequests: readOnlyFinal.totalRequests, byRoute: readOnlyFinal.byRoute, nonGetRequests: readOnlyFinal.nonGet.length, unmodelledRequests: readOnlyFinal.unmodelled.length, holdRefusals: readOnlyFinal.holdRefusals } : null,
     steps: results,
     teardown: state.teardown,
-    notes: [...notes, ...(fetchedFromStore === null ? [] : [`The fake store answered ${fetchedFromStore} order-list request(s) with HTTP 200.`])],
+    notes: [...notes, ...(orderListRequests === null ? [] : [`The fake store answered ${orderListRequests} order-list request(s) with HTTP 200 over the whole run (two rehearsal passes and one real pass).`])],
     interrupted: interrupted as string | null,
   })
 

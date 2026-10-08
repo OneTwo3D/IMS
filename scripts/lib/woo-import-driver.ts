@@ -155,16 +155,22 @@ async function landStock(): Promise<void> {
   const { allocateBackordersForProducts } = await import('@/lib/fulfillment/backorder-allocator')
   const { sweepUnallocatedProcessingOrders } = await import('@/lib/fulfillment/reallocation-sweep')
 
+  // Orders with a PRODUCT line whose allocation is short of the quantity ordered: the ones waiting for stock.
   const snapshot = async () => {
-    const rows = await db.$queryRawUnsafe<Array<{ orderNumber: string; allocated: string; wanted: string }>>(`
-      select so."externalOrderNumber" as "orderNumber",
-             coalesce((select sum(oa.qty) from order_allocations oa where oa."orderId" = so.id), 0)::text as allocated,
-             coalesce((select sum(sol.qty) from sales_order_lines sol where sol."orderId" = so.id), 0)::text as wanted
-        from sales_orders so order by so."externalOrderNumber"`)
-    return rows.filter((r) => Number(r.allocated) + 0.0001 < Number(r.wanted)).map((r) => r.orderNumber)
+    const rows = await db.$queryRawUnsafe<Array<{ orderNumber: string; status: string }>>(`
+      select so."externalOrderNumber" as "orderNumber", so.status::text as status
+        from sales_orders so
+       where exists (
+         select 1 from sales_order_lines sol
+          where sol."orderId" = so.id and sol."productId" is not null
+            and sol.qty > coalesce((select sum(oa.qty) from order_allocations oa where oa."lineId" = sol.id), 0) + 0.0001)
+       order by so."externalOrderNumber"`)
+    return rows
   }
 
-  const beforeLanding = await snapshot()
+  const beforeLandingRows = await snapshot()
+  const statusByOrder = Object.fromEntries(beforeLandingRows.map((r) => [r.orderNumber, r.status]))
+  const beforeLanding = beforeLandingRows.map((r) => r.orderNumber)
   const productIds: string[] = []
   for (const item of landing) {
     const product = await db.product.findUniqueOrThrow({ where: { sku: item.sku }, select: { id: true } })
@@ -174,17 +180,17 @@ async function landStock(): Promise<void> {
     })
   }
   // Stock is on the shelf and NOTHING has been told: this is what a bare stock write does.
-  const afterLandingBeforeTrigger = await snapshot()
+  const afterLandingBeforeTrigger = (await snapshot()).map((r) => r.orderNumber)
 
   // The call the stock-adjustment, purchase-receipt and transfer-receipt actions make after they add stock.
   const backorders = await allocateBackordersForProducts(productIds, { source: 'stock_adjustment', referenceLabel: 'rehearsal' })
-  const afterBackorderAllocator = await snapshot()
+  const afterBackorderAllocator = (await snapshot()).map((r) => r.orderNumber)
 
   // The cron route that catches whatever the event-driven call left behind.
   const sweep = await sweepUnallocatedProcessingOrders({ limit: 500 })
-  const afterSweep = await snapshot()
+  const afterSweep = (await snapshot()).map((r) => r.orderNumber)
 
-  emit({ phase: 'land-stock', landing, beforeLanding, afterLandingBeforeTrigger, backorders, afterBackorderAllocator, sweep, afterSweep })
+  emit({ phase: 'land-stock', landing, statusByOrder, beforeLanding, afterLandingBeforeTrigger, backorders, afterBackorderAllocator, sweep, afterSweep })
 }
 
 async function main(): Promise<void> {

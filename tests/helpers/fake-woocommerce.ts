@@ -32,6 +32,8 @@ export type RecordedRequest = {
   /** the HTTP status the fake answered */
   status: number
   authenticated: boolean
+  /** For an order list: how many orders the response carried. */
+  returned?: number
 }
 
 export type FakeWooCommerceOptions = {
@@ -129,7 +131,9 @@ export async function startFakeWooCommerce(options: FakeWooCommerceOptions): Pro
         return
       }
       finish(200)
-      json(res, 200, sorted.slice((page - 1) * perPage, page * perPage), headers)
+      const slice = sorted.slice((page - 1) * perPage, page * perPage)
+      record.returned = slice.length
+      json(res, 200, slice, headers)
       return
     }
 

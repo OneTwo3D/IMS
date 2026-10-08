@@ -142,8 +142,18 @@ export type ImportedOrderFact = {
   lineCount: number
   linesWithoutProduct: number
   hasCustomer: boolean
-  wantedQty: number
-  allocatedQty: number
+}
+
+/** What allocation did for one imported order, from the rows the allocation service wrote. */
+export type AllocationFact = {
+  imsStatus: string
+  orderNumber: string
+  /** Lines with no product link: a SKU IMS does not hold, a line with no SKU, a fee. They can never be allocated. */
+  noProductLines: number
+  /** Lines with a product whose allocation is short of the quantity ordered: they wait for stock. */
+  shortLines: number
+  /** The quantity those lines are short by. */
+  shortQty: number
 }
 
 export type OrderRow = {
@@ -158,8 +168,12 @@ export type OrderRow = {
   valueDiffBase: number | null
   componentsDiffForeign: number | null
   withinTolerance: boolean | null
-  unallocatableLines: number
-  unallocatedQty: number
+  imsStatus: string | null
+  noProductLines: number
+  shortLines: number
+  shortQty: number
+  /** For an order in a selected status that did not import: is a durable retry row recorded for it? */
+  retryRecorded: boolean | null
   reason?: string
 }
 
@@ -196,7 +210,9 @@ export function assessR9(input: {
   imported: readonly ImportedOrderFact[]
   selectedStatuses: readonly string[]
   tolerance?: number
-  unallocatedByOrder?: ReadonlyMap<number, { lines: number; qty: number }>
+  allocation?: ReadonlyMap<number, AllocationFact>
+  /** External order ids that have a durable retry row (the pending-FX queue). A selected order that did not import must have one, or the stamp strands it. */
+  retryRecorded?: ReadonlySet<number>
 }): R9Result {
   const tolerance = input.tolerance ?? R9_VALUE_TOLERANCE
   const failures: string[] = []
@@ -217,7 +233,7 @@ export function assessR9(input: {
   let maxComponents = 0
   for (const order of input.store) {
     const fact = byId.get(order.id)
-    const unallocated = input.unallocatedByOrder?.get(order.id)
+    const alloc = input.allocation?.get(order.id)
     const wcTotal = Number(order.total)
     if (!fact) {
       rows.push({
@@ -232,11 +248,16 @@ export function assessR9(input: {
         valueDiffBase: null,
         componentsDiffForeign: null,
         withinTolerance: null,
-        unallocatableLines: 0,
-        unallocatedQty: 0,
+        imsStatus: null,
+        noProductLines: 0,
+        shortLines: 0,
+        shortQty: 0,
+        retryRecorded: input.selectedStatuses.includes(order.status) ? (input.retryRecorded?.has(order.id) ?? false) : null,
         reason: !input.selectedStatuses.includes(order.status)
           ? `status ${order.status} is not selected: abandoned by decision, never asked for`
-          : order.expectation === 'fails-to-import' ? 'declared known to fail (probe)' : 'MISSING',
+          : order.expectation === 'fails-to-import'
+            ? `declared known to fail (probe); ${input.retryRecorded?.has(order.id) ? 'a durable retry row is recorded, so the stamp does not strand it' : 'NO durable retry row: the stamp would strand it'}`
+            : 'MISSING',
       })
       continue
     }
@@ -262,14 +283,19 @@ export function assessR9(input: {
       valueDiffBase: diffBase,
       componentsDiffForeign: componentsDiff,
       withinTolerance: within,
-      unallocatableLines: (unallocated?.lines ?? 0) + fact.linesWithoutProduct,
-      unallocatedQty: unallocated?.qty ?? 0,
+      imsStatus: alloc?.imsStatus ?? fact.status,
+      noProductLines: alloc?.noProductLines ?? fact.linesWithoutProduct,
+      shortLines: alloc?.shortLines ?? 0,
+      shortQty: alloc?.shortQty ?? 0,
+      retryRecorded: null,
     })
   }
 
   if (missing.length > 0) failures.push(`${missing.length} order(s) in the selected statuses are not in IMS: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ', ...' : ''}`)
   if (knownBadThatImported.length > 0) failures.push(`${knownBadThatImported.length} order(s) declared known to fail imported anyway (the probe proves nothing): ${knownBadThatImported.join(', ')}`)
   if (importedFromAbandonedStatus.length > 0) failures.push(`${importedFromAbandonedStatus.length} order(s) outside the selected statuses are in IMS: ${importedFromAbandonedStatus.join(', ')}`)
+  const stranded = knownBad.filter((order) => !byId.has(order.id) && !(input.retryRecorded?.has(order.id) ?? false)).map((order) => order.id)
+  if (stranded.length > 0) failures.push(`${stranded.length} order(s) that did not import have no durable retry row, so the stamp would strand them for good: ${stranded.join(', ')}`)
   if (overTolerance.length > 0) failures.push(`${overTolerance.length} order(s) differ from WooCommerce by more than ${tolerance}: ${overTolerance.slice(0, 10).join(', ')}`)
   if (selected.length === 0) failures.push('the store holds no order in any selected status, so the count proves nothing')
 
@@ -410,34 +436,65 @@ export function assessStatusSelection(resolved: readonly string[], decided: read
   return { ok: failures.length === 0, failures }
 }
 
+/** The IMS order statuses the backorder allocator and the reallocation sweep act on (lib/fulfillment/reallocation-sweep-selection.ts). */
+export const STOCK_LANDING_ELIGIBLE_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
+
 export type LandingFacts = {
+  /** Order numbers of imported orders with at least one product line short of stock, at each stage. */
   beforeLanding: string[]
   afterLandingBeforeTrigger: string[]
   afterBackorderAllocator: string[]
   afterSweep: string[]
+  /** IMS status of every order that was waiting before the stock landed. */
+  statusByOrder: Record<string, string>
+}
+
+export type LandingAssessment = {
+  assessment: Assessment
+  /** Waiting orders in a status neither mechanism looks at: they stay unallocated after the stock lands. */
+  notPickedUp: Array<{ orderNumber: string; imsStatus: string }>
+  pickedUp: string[]
 }
 
 /**
  * OD-4. Orders that could not be allocated at import must become allocated when stock lands. Recorded
  * stage by stage because the stages are different mechanisms: stock on the shelf alone allocates nothing;
  * the event-driven backorder allocator picks up the SKUs it is told about; the cron sweep picks up the rest.
+ * Both look only at PROCESSING and ALLOCATED orders, so a waiting order in another status (ON_HOLD,
+ * PENDING) is NOT picked up: that is reported as `notPickedUp`, never hidden, and it does not fail the
+ * step, because it is what the application does today; it is the finding the owner needs to see.
  */
-export function assessLanding(input: LandingFacts, orderNumbersExpectedToWait: readonly string[]): Assessment {
+export function assessLanding(input: LandingFacts): LandingAssessment {
   const failures: string[] = []
-  if (input.beforeLanding.length === 0) failures.push('precondition failed: no order was waiting for stock before it landed, so nothing was proved')
-  const stillWaitingBare = input.beforeLanding.filter((order) => !input.afterLandingBeforeTrigger.includes(order))
-  if (stillWaitingBare.length > 0) failures.push(`stock landing alone allocated ${stillWaitingBare.length} order(s) without any trigger (the stages below would then prove nothing): ${stillWaitingBare.slice(0, 5).join(', ')}`)
-  const improvedBy = input.beforeLanding.filter((order) => !input.afterSweep.includes(order))
-  if (improvedBy.length === 0) failures.push('no waiting order became allocated after the backorder allocator and the sweep ran')
-  for (const order of orderNumbersExpectedToWait) {
-    if (input.afterSweep.includes(order)) failures.push(`order ${order} was expected to be allocated once stock landed and is still waiting`)
-  }
-  return { ok: failures.length === 0, failures }
+  const eligible = (order: string): boolean => (STOCK_LANDING_ELIGIBLE_STATUSES as readonly string[]).includes(input.statusByOrder[order] ?? '')
+  const waitingEligible = input.beforeLanding.filter(eligible)
+  if (waitingEligible.length === 0) failures.push('precondition failed: no PROCESSING/ALLOCATED order was waiting for stock before it landed, so nothing was proved')
+  const allocatedByBareLanding = input.beforeLanding.filter((order) => !input.afterLandingBeforeTrigger.includes(order))
+  if (allocatedByBareLanding.length > 0) failures.push(`stock landing alone allocated ${allocatedByBareLanding.length} order(s) without any trigger (the stages below would then prove nothing): ${allocatedByBareLanding.slice(0, 5).join(', ')}`)
+  const stuck = waitingEligible.filter((order) => input.afterSweep.includes(order))
+  if (stuck.length > 0) failures.push(`${stuck.length} PROCESSING/ALLOCATED order(s) are still waiting after the stock landed and both mechanisms ran: ${stuck.slice(0, 8).join(', ')}`)
+  const pickedUp = input.beforeLanding.filter((order) => !input.afterSweep.includes(order))
+  const notPickedUp = input.beforeLanding.filter((order) => !eligible(order) && input.afterSweep.includes(order)).map((orderNumber) => ({ orderNumber, imsStatus: input.statusByOrder[orderNumber] ?? 'unknown' }))
+  return { assessment: { ok: failures.length === 0, failures }, notPickedUp, pickedUp }
 }
 
 // ---------------------------------------------------------------------------------------------
 // The report.
 // ---------------------------------------------------------------------------------------------
+
+export type SideEffects = {
+  customersCreated: number
+  customerLinksCreated: number
+  ordersWithoutCustomer: number
+  linesLinkedToProduct: number
+  linesWithoutProduct: number
+  ordersWithTaxRateFallback: number
+  /** Rows the import queued for the accounting connector, by `type/status`: queued, not sent. */
+  accountingQueue: Record<string, number>
+  stockSyncJobs: number
+  integrationOutbox: number
+  emailOutbox: number
+}
 
 export type WooImportReport = {
   schemaVersion: 1
@@ -466,7 +523,20 @@ export type WooImportReport = {
   r4: { rowsChecked: number; rowsWithReservations: number; worstDiff: number; tolerance: number; afterLanding: { rowsChecked: number; worstDiff: number } | null } | null
   orders: OrderRow[]
   skippedWithReason: Array<{ externalOrderId: number; reason: string }>
-  unallocatable: Array<{ externalOrderId: number; orderNumber: string; unallocatableLines: number; unallocatedQty: number; stage: 'at-import' | 'still-waiting-after-landing' }>
+  /** Imported orders that could not be fully allocated at import, and what became of them when stock landed. */
+  unallocatable: Array<{
+    externalOrderId: number
+    orderNumber: string
+    imsStatus: string
+    noProductLines: number
+    shortLines: number
+    shortQty: number
+    afterLanding: 'allocated-when-stock-landed' | 'still-waiting' | 'never-allocatable-lines-without-product' | 'not-run'
+  }>
+  /** What the first pass left in IMS beyond orders and allocations: customers, product links, and rows queued for connectors (queued, never sent). */
+  sideEffects: SideEffects | null
+  /** Things the owner must read that do not make the run RED. */
+  findings: Array<{ code: string; text: string; orders: string[] }>
   landing: LandingFacts | null
   stamp: { afterRehearsal: StampFacts | null; afterRealPass: StampFacts | null }
   readOnly: { totalRequests: number; byRoute: Record<string, number>; nonGetRequests: number; unmodelledRequests: number; holdRefusals: Record<string, number | null> } | null
@@ -549,15 +619,31 @@ export function renderWooImportMarkdown(report: WooImportReport): string {
   lines.push('')
   if (report.unallocatable.length === 0) lines.push('None.')
   else {
-    lines.push('| Order | IMS number | Lines without allocation | Quantity not allocated | Stage |')
-    lines.push('| --- | --- | --- | --- | --- |')
-    for (const row of report.unallocatable) lines.push(`| ${row.externalOrderId} | ${cell(row.orderNumber)} | ${row.unallocatableLines} | ${row.unallocatedQty} | ${row.stage} |`)
+    lines.push('Lines without a product link (a SKU IMS does not hold, a line with no SKU, a fee) can never be allocated. Lines with a product that are short of stock wait for it.')
+    lines.push('')
+    lines.push('| Order | IMS status | Lines without a product | Lines short of stock | Quantity short | After stock landed |')
+    lines.push('| --- | --- | --- | --- | --- | --- |')
+    for (const row of report.unallocatable) lines.push(`| ${row.externalOrderId} | ${cell(row.imsStatus)} | ${row.noProductLines} | ${row.shortLines} | ${row.shortQty} | ${row.afterLanding} |`)
   }
   lines.push('')
+  if (report.findings.length > 0) {
+    lines.push('## Findings (do not fail the run; read them)')
+    lines.push('')
+    for (const finding of report.findings) lines.push(`- **${finding.code}**: ${cell(finding.text)}${finding.orders.length > 0 ? ` Orders: ${finding.orders.slice(0, 20).join(', ')}${finding.orders.length > 20 ? ', ...' : ''}.` : ''}`)
+    lines.push('')
+  }
   if (report.landing) {
     lines.push('## OD-4: stock lands after the import')
     lines.push('')
     lines.push(`Waiting before stock landed: ${report.landing.beforeLanding.length}. After stock landed, before anything was triggered: ${report.landing.afterLandingBeforeTrigger.length}. After the backorder allocator: ${report.landing.afterBackorderAllocator.length}. After the cron sweep: ${report.landing.afterSweep.length}.`)
+    lines.push('')
+  }
+  if (report.sideEffects) {
+    const e = report.sideEffects
+    lines.push('## What the first pass left behind besides orders')
+    lines.push('')
+    lines.push(`Customers created: ${e.customersCreated} (links to WooCommerce customers: ${e.customerLinksCreated}); orders with no customer: ${e.ordersWithoutCustomer}. Lines linked to a product by SKU: ${e.linesLinkedToProduct}; lines with no product: ${e.linesWithoutProduct}. Orders that used the default tax rate because WooCommerce's rate id was not mapped: ${e.ordersWithTaxRateFallback}.`)
+    lines.push(`Queued for connectors, never sent (the outbound-write hold refuses the send): accounting queue ${JSON.stringify(e.accountingQueue)}; stock-sync jobs ${e.stockSyncJobs}; integration outbox ${e.integrationOutbox}; email outbox ${e.emailOutbox}.`)
     lines.push('')
   }
   lines.push('## Stamp')
