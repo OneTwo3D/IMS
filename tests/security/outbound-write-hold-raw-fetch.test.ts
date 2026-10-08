@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import ts from 'typescript'
@@ -117,7 +118,8 @@ test('every non-GET raw fetch under scripts/ and e2e/ goes through guardedExtern
 })
 
 test('the scanner can fail: it flags an alias, a member call, a spread, a quoted method key, an unknown shape and a raw http request', () => {
-  const dir = join(process.cwd(), 'tmp-rawfetch-probe')
+  // A PRIVATE temp dir outside the source tree: tests that scan the tree run in parallel with this one.
+  const dir = mkdtempSync(join(tmpdir(), 'rawfetch-probe-'))
   const cases: Record<string, string> = {
     alias: "const f = fetch\nawait f('https://api.xero.com/x', { method: 'POST' })",
     member: "await globalThis.fetch('https://shop.example.com/x', { method: 'DELETE' })",
@@ -127,7 +129,6 @@ test('the scanner can fail: it flags an alias, a member call, a spread, a quoted
     http: "import https from 'node:https'\nhttps.request('https://shop.example.com/x')",
   }
   let flagged = 0
-  mkdirSync(dir, { recursive: true })
   try {
     for (const [name, code] of Object.entries(cases)) {
       const file = join(dir, `${name}.ts`)
