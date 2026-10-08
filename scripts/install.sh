@@ -8485,7 +8485,7 @@ else
   # real directory, and be writable by the application account, or the run stops BEFORE .env is
   # written (and so before anything points the application at it).
   { [[ -d "${INVOICE_PDF_STORAGE_DIR}" && ! -L "${INVOICE_PDF_STORAGE_DIR}" ]] && run_as_user "${APP_USER}" test -w "${INVOICE_PDF_STORAGE_DIR}"; } || die \
-    "INVOICE_PDF_STORAGE_DIR is '${INVOICE_PDF_STORAGE_DIR}', outside ${DATA_DIR}. This installer does not create directories there: create it, owned by ${APP_USER} and not a symlink (chown ${APP_USER}:${APP_USER}; chmod 750), then re-run. Nothing has been started."
+    "INVOICE_PDF_STORAGE_DIR is '${INVOICE_PDF_STORAGE_DIR}', outside ${DATA_DIR}. This installer does not create directories there: create it as a real directory (not a symlink) that ${APP_USER} owns, mode 750, then re-run. Nothing has been started."
 fi
 mkdir_service_subdir "${APP_DIR}" 022 "${APP_DIR}/backups"
 
