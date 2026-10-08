@@ -1000,6 +1000,8 @@ function runMarkerHarness(entry: (typeof MARKER_CASES)[number], call: string): s
       durabilityFunctions(entry.source),
       shellFunction(entry.source, entry.markerFn),
       shellFunction(entry.source, 'mark_schema_touched'),
+      // The marker's connection-fence word comes from the one shared claim (scripts/lib/db-fence-protected.sh).
+      shellFunction(readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8'), 'db_connect_fence_claim'),
       call,
     ].join('\n')
     execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -8891,7 +8893,7 @@ const START_COMMAND = /^\s*(run\s+)?systemctl start\b/
  * prove the result is not vacuous by re-running the same extraction over a mutated copy.
  */
 function startWindowBounds(lines: string[]): { from: number; to: number } {
-  const proof = lines.findIndex((line) => /^require_start_identity_bound\s*\|\|/.test(line))
+  const proof = lines.findIndex((line) => /^\s*require_start_identity_bound\s*\|\|/.test(line))
   assert.notEqual(proof, -1, 'the entrypoint must still prove the binding before it starts anything')
 
   // Walk off the end of the refusal banner. The proof is `require_start_identity_bound || die \`
