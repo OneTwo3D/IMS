@@ -56,6 +56,7 @@ import { pathToFileURL } from 'node:url'
 
 import type pg from 'pg'
 
+import { databaseUrlSchema, pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
 import { parseWcSyncOrderStatuses } from '../lib/connectors/woocommerce/order-status-filter.ts'
 
 import {
@@ -921,10 +922,26 @@ ${Object.entries(WOO_IMPORT_EXIT_MEANING).map(([code, meaning]) => `  ${code}  $
  * absent). Reads one settings row and writes nothing; the URL is never logged.
  */
 export async function readDeploymentStatusSetting(databaseUrl: string): Promise<string | null> {
-  return withClient(databaseUrl, async (client) => {
+  // THE SCHEMA IS THE APPLICATION'S, resolved by the application's own helper (lib/db/database-url-schema.mjs):
+  // `?schema=` and the libpq `search_path` spelling, a conflict between them refused, no schema named meaning
+  // `public`. pg itself ignores `?schema=`, so the connection is pinned to that schema through the same
+  // `options=-c search_path=` the application's pool sends, AND the query is schema-qualified, so the row can
+  // only come from exactly that schema. Anything that cannot be resolved or pinned THROWS: the step is then RED,
+  // never a pass.
+  const schema = databaseUrlSchema(databaseUrl)
+  if (schema === null || schema === '') throw new Error('the deployment DATABASE_URL could not be parsed, so its schema cannot be resolved')
+  const config = pgConnectionConfig(databaseUrl)
+  if (config.onConnect) throw new Error('the deployment DATABASE_URL needs a startup-option backend guard (a non-ASCII schema or option), which this read-only check does not support; check the setting by hand')
+  const pinnedUrl = new URL(config.connectionString)
+  if (config.options) pinnedUrl.searchParams.set('options', config.options)
+  pinnedUrl.searchParams.delete('schema')
+  const quoted = `"${schema.replace(/"/g, '""')}"`
+  return withClient(pinnedUrl.toString(), async (client) => {
     await client.query('begin read only')
     try {
-      const result = await client.query<{ value: string }>('select value from settings where key = $1', ['wc_sync_order_statuses'])
+      const found = await client.query<{ present: string | null }>('select to_regclass($1)::text as present', [`${quoted}.settings`])
+      if (found.rows[0]?.present == null) throw new Error(`the deployment schema ${schema} has no settings table, so its status selection cannot be read`)
+      const result = await client.query<{ value: string }>(`select value from ${quoted}.settings where key = $1`, ['wc_sync_order_statuses'])
       return result.rows[0]?.value ?? null
     } finally {
       await client.query('rollback')

@@ -438,6 +438,24 @@ test('readDeploymentStatusSetting reads the one settings row over a real connect
   assert.equal(await readDeploymentStatusSetting(url), '["processing","pending"]')
   const after = cluster.psql(['-c', 'select count(*) || md5(string_agg(key || value, \',\' order by key)) from settings'], { database: 'depdb' })
   assert.equal(after, before, 'the table is unchanged')
+
+  // FAILING-FIRST (review round 2): the deployment's schema is the application's `?schema=`, not `public`.
+  // MUTATION: `const schema = databaseUrlSchema(databaseUrl)` -> `const schema = 'public'` in readDeploymentStatusSetting.
+  const good = '["processing","pending","on-hold"]'
+  cluster.psql(['-c', `update settings set value = '${good}' where key = 'wc_sync_order_statuses'`], { database: 'depdb' })
+  cluster.psql(['-c', 'create schema tenant_a authorization depr; create schema tenant_b authorization depr; create schema tenant_c authorization depr'], { database: 'depdb' })
+  cluster.psql(['-c', `create table tenant_a.settings (key text primary key, value text not null); insert into tenant_a.settings values ('wc_sync_order_statuses', '["processing"]')`], { database: 'depdb' })
+  cluster.psql(['-c', 'alter table tenant_a.settings owner to depr'], { database: 'depdb' })
+  cluster.psql(['-c', `create table tenant_c.settings (key text primary key, value text not null)`], { database: 'depdb' })
+  cluster.psql(['-c', 'alter table tenant_c.settings owner to depr'], { database: 'depdb' })
+  console.log(`precondition: public says ${good}; tenant_a says ["processing"]; tenant_b has no settings table; tenant_c has the table and no row`)
+  assert.equal(await readDeploymentStatusSetting(url), good, 'no schema named: public')
+  assert.equal(await readDeploymentStatusSetting(`${url}?schema=tenant_a`), '["processing"]', 'the named schema wins over public, which says OK')
+  assert.equal(await readDeploymentStatusSetting(`${url}?schema=tenant_c`), null, 'table present, row absent: null (the default then FAILS), not public\'s value')
+  await assert.rejects(readDeploymentStatusSetting(`${url}?schema=tenant_b`), /no settings table/, 'schema without the table: refused, public is not consulted')
+  await assert.rejects(readDeploymentStatusSetting(`${url}?schema=no_such_schema`), /no settings table/)
+  await assert.rejects(readDeploymentStatusSetting(`${url}?schema=tenant_a&options=-c%20search_path%3Dtenant_c`), /./, 'two different schemas named: refused')
+  await assert.rejects(readDeploymentStatusSetting('not a url'), /could not be parsed/)
 })
 
 test('--check-deployment-statuses is parsed, and an unreadable or group-readable env file is refused (exit 2) before a cluster is created', () => {
