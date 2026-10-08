@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import test, { after } from 'node:test'
 
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import { READINESS_GATE_EXIT_CODES } from '../../lib/ops/readiness-gate-constants.ts'
@@ -12,6 +11,17 @@ import { parseGateArgs, runReadinessGate } from '../../scripts/readiness-gate.ts
 import { NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance } from '../helpers/readiness-gate-fixtures.ts'
 
 const ROOT = process.cwd()
+
+// Report directories must sit under ancestors only root or this account can modify (the gate refuses
+// otherwise), and the unit runner's private TMPDIR is group/other-writable, so these live under /var/tmp
+// (a root-owned sticky directory, on disk) and are removed when the file finishes.
+const bases: string[] = []
+function scratchBase(prefix: string): string {
+  const dir = mkdtempSync(path.join('/var/tmp', prefix))
+  bases.push(dir)
+  return dir
+}
+after(() => { for (const dir of bases) rmSync(dir, { recursive: true, force: true }) })
 const URL_ENV = { DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/db', PATH: process.env.PATH }
 
 function deps(overrides: Partial<GateDeps> = {}): GateDeps {
@@ -31,7 +41,7 @@ function deps(overrides: Partial<GateDeps> = {}): GateDeps {
 
 type Run = { code: number; out: string[]; err: string[]; reportDir: string }
 async function run(argv: string[], depsOverride: Partial<GateDeps> = {}, extra: { env?: Record<string, string | undefined>; publishHooks?: Parameters<typeof runReadinessGate>[0]['publishHooks']; reportDir?: string } = {}): Promise<Run> {
-  const base = mkdtempSync(path.join(tmpdir(), 'ims-gate-cli-'))
+  const base = scratchBase('ims-gate-cli-')
   const reportDir = extra.reportDir ?? path.join(base, 'reports')
   const out: string[] = []
   const err: string[] = []
@@ -49,7 +59,7 @@ async function run(argv: string[], depsOverride: Partial<GateDeps> = {}, extra: 
 
 // The acceptance file path above does not exist and is explicit => refused. Tests that need "no file" use runNoFile.
 async function runNoFile(argv: string[], depsOverride: Partial<GateDeps> = {}, extra: Parameters<typeof run>[2] = {}): Promise<Run> {
-  const base = mkdtempSync(path.join(tmpdir(), 'ims-gate-cli-'))
+  const base = scratchBase('ims-gate-cli-')
   const reportDir = extra.reportDir ?? path.join(base, 'reports')
   const out: string[] = []
   const err: string[] = []
@@ -150,7 +160,7 @@ test('GO-WITH-ACCEPTED-WARNINGS: exit 10 with a current acceptance, exit 1 witho
   const without = await runNoFile(['--phase', 'P0'], { runInvariant: async () => warned })
   assert.equal(without.code, 1)
 
-  const base = mkdtempSync(path.join(tmpdir(), 'ims-gate-acc-'))
+  const base = scratchBase('ims-gate-acc-')
   const file = path.join(base, 'acceptances.json')
   writeFileSync(file, acceptanceText([validAcceptance(id)]))
   const out: string[] = []
@@ -181,12 +191,11 @@ test('a GO whose report cannot be published is exit 3, never 0 (and a NO-GO stay
 })
 
 test('an unsafe report directory is refused (exit 2) before any check runs', async () => {
-  const base = mkdtempSync(path.join(tmpdir(), 'ims-gate-unsafe-'))
+  const base = scratchBase('ims-gate-unsafe-')
   chmodSync(base, 0o777)
   let invariantCalls = 0
   const result = await runNoFile(['--phase', 'P0'], { runInvariant: async () => { invariantCalls += 1; return cleanInvariant() } }, { reportDir: path.join(base, 'reports') })
   chmodSync(base, 0o700)
-  rmSync(base, { recursive: true, force: true })
   assert.equal(result.code, 2)
   assert.equal(invariantCalls, 0, 'no check ran')
 })
