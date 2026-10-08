@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -16,19 +16,22 @@ function fakeWorld() {
   const tmpBase = join(world, 'tmp')
   const repo = join(world, 'tmp', 'checkouts', 'repo') // the stand-in repo lives UNDER the stand-in tmp dir on purpose
   mkdirSync(repo, { recursive: true })
+  mkdirSync(join(world, 'cleantmp'), { recursive: true })
   writeFileSync(join(repo, 'precious.txt'), 'keep')
-  return { world, tmpBase, repo, options: { tmpBase, repoRoot: repo } }
+  // `options` places the scratch root in a tmp dir that is clean of the repo; `guardOptions` makes the repo sit under tmp
+  // so assertSafeToDelete can be shown refusing it.
+  return { world, tmpBase, repo, cleanTmp: join(world, 'cleantmp'), options: { tmpBase: join(world, 'cleantmp'), repoRoot: repo }, guardOptions: { tmpBase, repoRoot: repo } }
 }
 
 test('a scratch root is created under the temp dir and disposed of; only that directory goes', () => {
   const w = fakeWorld()
   try {
-    const sibling = join(w.tmpBase, 'sibling')
+    const sibling = join(w.cleanTmp, 'sibling')
     mkdirSync(sibling)
     const scratch = makeScratchRoot('probe-', w.options)
     writeFileSync(join(scratch.root, 'f.txt'), 'x')
     console.log(`precondition (scratch): created ${scratch.root} beside a sibling and a stand-in repo`)
-    assert.ok(scratch.root.startsWith(w.tmpBase))
+    assert.ok(scratch.root.startsWith(w.cleanTmp))
     scratch.dispose()
     assert.equal(existsSync(scratch.root), false)
     assert.ok(existsSync(sibling) && existsSync(join(w.repo, 'precious.txt')))
@@ -54,7 +57,7 @@ test('dispose REFUSES (throws, deletes nothing) for: the repo root, an ancestor,
     ]
     console.log(`precondition (guard): ${cases.length} forbidden targets against a throwaway stand-in tree`)
     for (const [name, target, recorded] of cases) {
-      assert.throws(() => assertSafeToDelete(target, recorded, w.options), /refusing to delete/, name)
+      assert.throws(() => assertSafeToDelete(target, recorded, w.guardOptions), /refusing to delete/, name)
     }
     assert.ok(existsSync(join(w.repo, 'precious.txt')), 'the stand-in repo is intact')
     assert.ok(existsSync(outside) && existsSync(w.tmpBase) && existsSync(link))
@@ -94,4 +97,56 @@ test('isolating cases: each remaining rule refuses on its own (the other rules w
     assert.throws(() => assertSafeToDelete(join(repo2, 'sub'), join(repo2, 'sub'), { tmpBase, repoRoot: repo2 }), /inside the repository/)
     scratch.dispose()
   } finally { rmSync(world, { recursive: true, force: true }) }
+})
+
+test('a temp base inside, equal to, or above the repository is refused BEFORE anything is created (direct and through a symlink)', () => {
+  const world = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-tmpbase-')))
+  try {
+    const repo = join(world, 'repo')
+    const lib = join(repo, 'lib')
+    mkdirSync(lib, { recursive: true })
+    const linkToLib = join(world, 'tmp-link')
+    symlinkSync(lib, linkToLib)
+    const elsewhere = join(world, 'elsewhere')
+    mkdirSync(elsewhere)
+    const before = () => [readdirListing(lib), readdirListing(repo)].join('|')
+    const snapshot = before()
+    console.log('precondition (tmp base in repo): stand-in repo with lib/, TMPDIR pointed at lib/, at a symlink to lib/, at the repo, and above it')
+    for (const [name, tmpBase] of [['lib/ directly', lib], ['a symlink to lib/', linkToLib], ['the repo root', repo], ['an ancestor of the repo', world]] as const) {
+      assert.throws(() => makeScratchRoot('probe-', { tmpBase, repoRoot: repo }), /refusing to create a scratch root/, name)
+    }
+    assert.equal(before(), snapshot, 'nothing was created inside the stand-in repo')
+    const ok = makeScratchRoot('probe-', { tmpBase: elsewhere, repoRoot: repo })
+    ok.dispose()
+  } finally { rmSync(world, { recursive: true, force: true }) }
+})
+
+function readdirListing(dir: string): string {
+  return readdirSync(dir).sort().join(',')
+}
+
+test('the repository root comes from the module location, not the working directory', () => {
+  const original = process.cwd()
+  const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-cwd-')))
+  try {
+    process.chdir(elsewhere)
+    const scratch = makeScratchRoot('probe-') // default options: real tmpdir, repo found from this file's location
+    scratch.dispose()
+    assert.equal(process.cwd(), elsewhere, 'precondition: the working directory is NOT the repository')
+  } finally { process.chdir(original); rmSync(elsewhere, { recursive: true, force: true }) }
+})
+
+test('IDENTITY: a different directory moved into the path after creation is refused and left intact', () => {
+  const w = fakeWorld()
+  try {
+    const scratch = makeScratchRoot('probe-', w.options)
+    const stranger = join(w.cleanTmp, 'stranger')
+    mkdirSync(stranger)
+    writeFileSync(join(stranger, 'precious.txt'), 'keep')
+    rmSync(scratch.root, { recursive: true })
+    renameSync(stranger, scratch.root) // same path, different directory (a different inode)
+    console.log('precondition (identity): the created directory was replaced by another real directory at the same path')
+    assert.throws(() => scratch.dispose(), /device\/inode changed/)
+    assert.ok(existsSync(join(scratch.root, 'precious.txt')), 'the other directory is intact')
+  } finally { rmSync(w.world, { recursive: true, force: true }) }
 })
