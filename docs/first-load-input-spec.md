@@ -8,10 +8,14 @@ anywhere; uploading the files through the importers (dry-run preview first) is a
 
 Scope of this tool and what is still open:
 
-- Built: the canonical input datasets, the validators and transforms, the report, and the CLI.
-- **Not built here:** the apply runner that drives the importers (a later work package), and the **real column maps** for Qoblex, Mintsoft and WooCommerce.
-  Those wait for the owner's 50-row sample exports. The maps shipped under `tests/first-load/fixtures/maps/` use **invented headers** and are only
-  there to prove the mechanism. Do not copy a header from them into a real map.
+- Built: the canonical input datasets, the validators and transforms, the report, the CLI, and the **real column maps for the four Qoblex exports**
+  (`tests/first-load/fixtures/qoblex-native/maps/`, see "Qoblex native exports").
+- **Where each system's data comes from.** Qoblex has no API, so **Qoblex is the one file-based load, and it goes through this tool.** Xero (chart of accounts,
+  tax rates, trial balance), Mintsoft (products, stock) and WooCommerce (products, orders, tax rates, order statuses) are read **through the existing read-only
+  connectors, as separate steps**; this tool has no column maps for them and none are planned. The `wms-*` and `woo-products` datasets stay in the tool only so the R14
+  coverage check can be rehearsed offline from files (the maps under `tests/first-load/fixtures/maps/` use **invented headers** to prove the mechanism; do not copy a
+  header from them into a real map). In a real run the coverage inputs come from the connectors.
+- **Not built here:** the apply runner that drives the importers (a later work package).
 - Not covered by an importer, so not produced: supplier product costs (`SupplierProduct` has no CSV importer) and customers (no source is defined for them
   in this work). Both are reported as gaps in the summary at the end of this page.
 
@@ -65,8 +69,12 @@ A JSON file. Relative paths are relative to the manifest. Unknown keys are refus
 - `inTransitConvention` is required when a `transfers` dataset is supplied (see "In-transit stock").
 - `purchaseOrderKeyPrefix` and `transferKeyPrefix` are required when the matching dataset is supplied. They are prefixed to every order or transfer key so a loaded
   reference cannot collide with a reference IMS generates later.
-- One file per dataset. Concatenate multi-part exports first. An input with `columnMap` is a native export read through that map; an input without it must already
-  be a canonical file (below).
+- An input with `columnMap` is a native export read through that map; an input without it must already be a canonical file (below).
+- A dataset may be listed more than once, once per file (the same file twice is refused). The files are read in the order listed and their records are concatenated.
+  Line numbers of the second and later files are reported as `N * 1,000,000 + the physical line` (the first file is 0). An input may carry `"supersedesEarlier": true`
+  (products only, and only after an earlier file for the same dataset): a product row in an EARLIER file with the same SKU (upper-case) is then replaced by the row in this file, and
+  each replaced row is booked as excluded with the code `SUPERSEDED_BY_LATER_FILE`, so the accounting still reconciles. Without the flag, two files naming one SKU are two conflicting
+  rows, which the products check refuses. This is how Qoblex's bundles file (which knows a product is a KIT or BOM) corrects the type the stock report gives the same SKU (SIMPLE).
 
 ## Canonical datasets
 
@@ -247,7 +255,7 @@ SKUs that already exist in the target IMS (from `/api/export/products`). The fou
 
 ## Column maps
 
-A column map is JSON, one file per **source**, with one entry per dataset that source feeds. Qoblex feeds products, recipe-lines, stock-lots, suppliers,
+A column map is JSON, one per source file (or one per source when its files share a layout), with one entry per dataset that file feeds. Qoblex feeds products, recipe-lines, stock-lots, suppliers,
 purchase-order-lines and transfers; the 3PL (today Mintsoft) feeds wms-products and wms-stock and is named `"source": "wms"` in a column map; WooCommerce feeds woo-products.
 
 ```json
@@ -274,6 +282,12 @@ purchase-order-lines and transfers; the 3PL (today Mintsoft) feeds wms-products 
 | `expectedHeaders` | optional; when present the file's header row must equal it exactly |
 | `delimiter` | `,` (default), `;`, tab or `\|` |
 | `decimalSeparator` | optional; only `.` is accepted |
+| `rowsAboveHeader` | `0` (default) or `1`: one row of labels above the header row (needed by `wide`; also set on a map that reads the same file without `wide`, so the label row is skipped) |
+| `wide` | the wide warehouse blocks layout (below) |
+| `rowSelect` | `{ "column", "keep": [...], "skip": [...] }`: a closed list of the values of one source column; see "Row kinds and grouped parents" |
+| `parentFrom` | `{ "column", "parentValues", "skuColumn", "into" }`: rows after a parent row inherit its SKU; see "Row kinds and grouped parents" |
+| `derived` | canonical column to the canonical column it is derived from, e.g. `{ "currency": "supplierName", "fxRateToBase": "currency" }`; each needs its own closed `valueMaps` entry |
+| `dateFormats` | canonical column to a source date format; the value is converted to `YYYY-MM-DD` |
 
 It fails closed, and each of these is an error that stops the run (exit 3) rather than something guessed:
 
@@ -281,10 +295,51 @@ It fails closed, and each of these is an error that stops the run (exit 3) rathe
 - two canonical columns mapped to one source header, a column both mapped and given a constant, an unknown canonical column name, an unknown key anywhere;
 - a required canonical column that is neither mapped nor a constant;
 - a `decimalSeparator` other than `.`: decimal commas are rejected, never converted;
-- a map entry for a dataset that source cannot feed.
+- a map entry for a dataset that source cannot feed;
+- a `derived` column without its own `valueMaps`, derived from itself, from a column derived later, or also mapped; a `dateFormats` entry on a column that is not mapped, without exactly one year, month and day token, or on a column that also has `valueMaps`;
+- anything in the wide layout that does not hold (below).
 
 A source value that is not in a column's `valueMaps` rejects **that row** with its line number; it is not passed through. A source column that no canonical
 column reads is listed in the report under "Source columns not read", so a forgotten column is visible.
+
+### Wide warehouse blocks
+
+Some stock reports put every warehouse side by side: a first row names the warehouses, a second row is the header, and the per-warehouse column group (Quantity, Allocated, ...)
+repeats once per warehouse. `wide` reads such a file into ONE canonical record per source row and warehouse block.
+
+```json
+"stock-lots": {
+  "rowsAboveHeader": 1,
+  "columns": { "sku": "Sku", "unitCost": "Moving Average Cost" },
+  "constants": { "currency": "GBP" },
+  "wide": {
+    "blockStart": "after-label",
+    "warehouses": { "1 MIL1": "MIL1", "2 Cambridge Warehouse": "CAMBRIDGE" },
+    "blockColumns": { "qty": "Quantity" }
+  }
+}
+```
+
+- `columns` are per-row columns that come BEFORE the first block (the SKU, the moving average cost). `blockColumns` name the header that must appear **exactly once in every block**.
+- `blockStart` says where a block begins relative to its label: `"after-label"` (the block starts in the column after the label; the label sits above the last column of the previous group, as in the Qoblex stock report) or
+  `"at-label"` (the block starts under its label). A block runs to the column before the next block starts; the last one to the end of the row. Columns before the first block, such as the all-warehouses totals group the Qoblex report puts first, belong to no warehouse and are never read as one.
+- `warehouses` is a **closed** list from the label (trimmed) to the IMS warehouse code. Nothing is guessed, and the file is refused as a whole (exit 3, nothing written) when: a label appears twice; a label is not in `warehouses` (a new or renamed warehouse); a declared warehouse has no label (a block disappeared);
+  a block lacks a `blockColumns` header or has it twice (an incomplete block); the label row and the header row differ in width; a per-row column lies inside a block; two labels map to the same code; or `expectedHeaders` differs.
+- The records are numbered `L.0B`: source line L, warehouse block B (1-based, file order), so line 12 block 3 is `12.03`. `read` in the accounting counts these records (a 1,570-row, five-warehouse file is 7,850 records). A row refused before it is split (a ragged row, an unlisted row kind) is one record and keeps the plain line.
+- A zero quantity is a record that says "zero on hand" (excluded as `ZERO_ON_HAND`), exactly as in a long file. The wide layout is only allowed for a dataset that has a `warehouseCode` column.
+
+### Row kinds and grouped parents
+
+`rowSelect` makes the value of one source column decide whether a row belongs to the dataset. It is a **closed list**: a row whose value is in `keep` is read, one in `skip` is left out and **counted** (the report's "Rows skipped by the map"), and any other value is
+rejected as `UNLISTED_ROW_KIND`. That is how the Qoblex stock report's `Product Type` `Unknown` rows are refused rather than silently loaded or dropped.
+
+`parentFrom` is for files where a header row is followed by its component rows (the Qoblex bundles file: a `Bundle` or `BillOfMaterial` row, then its `Part` rows). A row whose `column` value is in `parentValues` sets the current parent to its `skuColumn`; every row that is read gets the current parent in the canonical column
+`into`. A row with no parent yet, or after an unreadable (ragged) row, is rejected as `ORPHAN_CHILD_ROW`, because a damaged row could have been the parent. The same file is read twice, by two map entries: the header rows as `products` (`keep` the parent kinds), the component rows as `recipe-lines` (`keep` `Part`).
+
+### Derived columns and dates
+
+`derived` fills a column from another canonical column of the same record through the derived column's own closed `valueMaps` (a value not in it rejects the row): Qoblex's open purchase order file has no currency, so the currency comes from the supplier and the exchange rate from the currency.
+`dateFormats` converts a source date with the tokens `YYYY`, `MMM` (Jan-Dec), `ddd` (Mon-Sun), `MM`, `M`, `DD`, `D`; the whole value must match, the day must exist, and a `ddd` must be the real weekday (`Thu, Sep 24 2026` reads as 2026-09-24; `Fri, Sep 24 2026` is rejected as `BAD_DATE`).
 
 ### How to write the column map from a sample
 
@@ -340,6 +395,35 @@ is then moved by the dispatch. Whether the source system's on-hand figure alread
 
 Either way the units are counted once: after the dispatch the warehouse holds the physical quantity and the transfer holds the in-transit quantity. The destination's reported on-hand is assumed to exclude in-transit units until received; the tool cannot verify that, so confirm it from the sample.
 Only the outstanding quantity (shipped minus received) of an IN_TRANSIT or PARTIALLY_RECEIVED transfer is emitted, as an IN_TRANSIT transfer. The importer stamps the dispatch at import time, not at the source's dispatch date.
+
+## Qoblex native exports
+
+Qoblex is read from four files. Their maps and a manifest are in `tests/first-load/fixtures/qoblex-native/` over **synthetic** data with the real headers (every file starts with a byte-order mark, as the real exports do, and `expectedHeaders` pins each header row).
+Copy the maps, keep `expectedHeaders` as they are, and point the manifest at the real files. Real exports, supplier names and customer data are never committed.
+
+| Qoblex export | Map | Datasets |
+| --- | --- | --- |
+| Stock on hand (wide report) | `qoblex-stock-on-hand.map.json` | `products` (first file), `stock-lots` |
+| Bundles | `qoblex-bundles.map.json` | `products` (second file, `supersedesEarlier`), `recipe-lines` |
+| Incoming stock | `qoblex-incoming-stock.map.json` | `purchase-order-lines` |
+| Contacts | `qoblex-contacts.map.json` | `suppliers` |
+
+How each fact the export states is read, and what is a decision for the owner:
+
+- **Products** come from the stock report: `Sku`, `Product`, `Product Type`, `Barcode`, `State`. `Product Type` is a closed list: `simple` is SIMPLE; `variable` is mapped to VARIANT; any other value (the real export has `Unknown`) is rejected for an owner decision.
+  **The stock report lists variants only, with no parent product**, so a VARIANT row is rejected as `VARIANT_WITHOUT_PARENT` until the VARIABLE parent products are supplied (in practice from WooCommerce, which holds the parents; the parent SKU is not a column of any Qoblex export we have). The map is shipped honestly blocked, rather than
+  loading variants as SIMPLE products and losing the parent link. To rehearse the rest of the load, a private copy of the map can read `variable` as SIMPLE; do not load that.
+- **Bundles and manufactured products** come from the bundles file. `Line Type` is a closed list: `Bundle` is a KIT, `BillOfMaterial` is a BOM, `Part` is a component line whose `Bundled Quantity` is the component quantity. The header rows become products (second file, which supersedes the stock report's SIMPLE row for the same SKU); the `Part` rows become recipe lines
+  under the header row above them. A product listed in more than one group (the real file does this) produces repeated or conflicting component lines, which are rejected (`DUPLICATE_RECIPE_LINE`) because the tool cannot know whether to add them. The bundles file's own stock columns are not read: opening stock comes only from the stock report.
+- **Opening stock** is the stock report read in wide warehouse blocks. Qoblex cannot export per-lot costs, only a `Moving Average Cost` per product, so each SKU and warehouse becomes **one synthetic lot** at that cost (currency is the base currency, a constant in the map); nothing is collapsed because there is nothing to collapse, and the multi-lot weighted average used for other sources is unchanged.
+  The cost is per product, not per warehouse, so a SKU held in two warehouses has the same cost in both. FIFO in IMS is date-based only. A positive quantity with a zero or blank cost is a `ZERO_COST_OPENING_STOCK` warning; a negative quantity is rejected; the all-warehouses totals group is never read.
+  The five warehouse labels are mapped to the codes `MIL1`, `CAMBRIDGE`, `RESTOCK`, `QUARANTINE-CAMBRIDGE` and `RXT2`; these codes must exist in IMS (apply-time check `warehouse-exists`). **Owner decision:** the quarantine warehouse is imported as its own warehouse by default, so quarantined units are on hand but not mixed into a sellable warehouse; say so if it should not be loaded.
+- **Transfers are not needed for Qoblex.** Qoblex has no in-transit status for transfers: a booked transfer is already at the destination and a draft transfer is still in the origin warehouse, so on-hand per warehouse is already the truth. The `transfers` dataset is simply not supplied (the report lists it under "Not supplied"), `inTransitConvention` is not set, and the in-transit section below does not apply to Qoblex.
+- **Open purchase orders** come from the incoming-stock file, one row per line. `Status` is a closed list: `Approved` and `PartiallyReceived` are open (OPEN); any other status is rejected until the owner says whether it is open. Outstanding quantity is `Ordered Quantity` minus `Received Quantity`, so a fully received line is excluded. The destination warehouse is a constant (`MIL1`; the report's `Incoming Quantity` appears only for that warehouse in the sample); confirm it.
+  The file has **no currency and no exchange rate**: the currency is derived from the supplier (`derived`, from the supplier's currency in the contact export) and the rate from the currency, both closed lists in the map. A supplier whose contact has no currency is rejected until the owner gives one; the rates in the shipped map are placeholders for the synthetic suppliers only. The `Discount (%)` column is not read (every value in the sample is 0): it shows under "Source columns not read", and a non-zero value would be lost, so check it.
+  `Due On` (`Thu, Oct 8 2026`) becomes `expectedDelivery`. The `Incoming Quantity` per warehouse in the stock report and these lines describe the same open orders: their per-SKU totals should agree, and a PO line for a SKU the catalogue lacks is rejected (`SKU_NOT_IN_CATALOGUE`).
+- **Suppliers** come from the contact export. **The export has no supplier/customer flag.** `Wholesale or Retail` is a closed list (`Wholesale` only): a `Retail` contact is rejected as `UNLISTED_ROW_KIND` for an owner decision. Every other contact is loaded as a supplier. Whether a contact is a supplier is read from its use: the suppliers named in the stock report's `Supplier` column and in the incoming-stock file's `Supplier` column should all be present (a purchase order line naming an absent supplier is rejected).
+  Payment terms are a closed list (`NONE` and blank are no terms, `30 days net` is 30). The shipping address columns feed the supplier address; the billing columns are not read.
 
 ## Output files and load order
 
@@ -420,6 +504,8 @@ The rules the tool does prove: required fields, quantity and cost signs and scal
 
 ## Known gaps
 
+- WooCommerce, Mintsoft and Xero have no file maps: they are read through the connectors in separate steps (see the scope above).
+- The Qoblex stock report has no parent products for its variants (see "Qoblex native exports"); the VARIABLE parents have to come from another source before variants can load.
 - Supplier product costs (`SupplierProduct`): there is no CSV importer, so nothing is produced. They are a backfill and may follow go-live.
 - Customers: no source is defined for them in this work; they are not read.
 - Warehouse codes, tax rate names and supplier names for suppliers that already exist in IMS cannot be checked without the database; the importers' own dry-run preview does that.
