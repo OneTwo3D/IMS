@@ -462,6 +462,16 @@ test('superseding: a later file fills what it lacks from the earlier row (barcod
   assert.equal(clash.recordsRead, stock.recordsRead + bundles.recordsRead, 'a conflict moves a row from rows to rejected; nothing is lost from the count')
 })
 
+test('superseding: a product listed in several groups of the later file replaces the earlier row ONCE (one disposition per record)', (t) => {
+  const stock = ingestDataset('products', read('stock-on-hand.csv'), 'stock-on-hand.csv', stockMap().datasets.products!)
+  const bundles = ingestDataset('products', read('bundles.csv'), 'bundles.csv', bundlesMap().datasets.products!)
+  const twice = { ...bundles, rows: [...bundles.rows, ...bundles.rows.filter((row) => row.values.sku === 'SYN-5001').map((row) => ({ ...row, line: row.line + 100 }))] }
+  const merged = mergeIngested([stock, twice], [false, true])
+  precondition(t, 'later rows for SYN-5001', twice.rows.filter((row) => row.values.sku === 'SYN-5001').length)
+  assert.equal(merged.superseded.filter((entry) => entry.key === 'SYN-5001').length, 1)
+  assert.equal(merged.rows.length + merged.rejected.length + merged.superseded.length, stock.rows.length + twice.rows.length + stock.rejected.length + twice.rejected.length, 'every record has exactly one place')
+})
+
 test('opening cost: zero cost with stock WARNS, a blank cost with stock is rejected (MISSING_UNIT_COST), a blank cost with no stock is just zero on hand', async (t) => {
   const dir = copyNative()
   dropLinesWith(dir, 'stock-on-hand.csv', ['"SYN-6001"', '"SYN-7001"', '"SYN-2000-01"'])

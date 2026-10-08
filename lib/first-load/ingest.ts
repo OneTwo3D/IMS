@@ -431,6 +431,8 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
         }
       }
       for (const match of list) {
+        // One earlier row can be matched by several later rows (a product listed in several groups): it is replaced, and booked, once.
+        if (replaced.has(match.row)) continue
         replaced.add(match.row)
         superseded.push({
           line: at(match.row.line, match.part),
