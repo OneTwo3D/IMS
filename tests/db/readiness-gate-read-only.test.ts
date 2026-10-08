@@ -34,10 +34,13 @@ if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
   )
 }
 
+let originalUrl = ''
+
 async function readOnlyDb() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
+  originalUrl = process.env.DATABASE_URL
   const url = new URL(process.env.DATABASE_URL)
   assert.equal(url.searchParams.has('options'), false, 'precondition: the test owns the options parameter of the URL')
   url.searchParams.set('options', '-c default_transaction_read_only=on')
@@ -86,7 +89,10 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
     const out: string[] = []
     const code = await runReadinessGate({
       argv: ['--phase', 'P0', '--report-dir', path.join(reportDir, 'reports'), '--rehearsal-dir', path.join(reportDir, 'no-rehearsals')],
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, DATABASE_URL: process.env.DATABASE_URL },
+      // The ORIGINAL url, not the read-only one: the schema commands are Prisma children, and Prisma's connection string
+      // grammar does not take an `options` parameter next to `?schema=` (CI's URL has one). The server-enforced proof is the
+      // direct collector calls above; this run's proof is that no file of the checkout changed and every check completed.
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, DATABASE_URL: originalUrl },
       stdout: (text) => out.push(text),
       stderr: () => undefined,
       disconnect: async () => undefined,
@@ -96,7 +102,9 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
     const record = JSON.parse(readFileSync(path.join(reportDir, 'reports', runId!, 'readiness-gate.json'), 'utf8')) as { checks: Array<{ id: string; status: string; summary: string }> }
     const status = Object.fromEntries(record.checks.map((row) => [row.id, row.status]))
     console.log(`precondition: collected ${record.checks.length} checks; schema-state=${status['schema-state']} invariant-preflight=${status['invariant-preflight']} outbound-status=${status['outbound-status']}`)
-    for (const id of ['schema-state', 'invariant-preflight', 'outbound-status']) assert.equal(status[id], 'PASS', `${id} ran to completion over the read-only connection`)
+    const summaries = Object.fromEntries(record.checks.map((row) => [row.id, row.summary]))
+    console.log(`schema-state: ${summaries['schema-state']}`)
+    for (const id of ['schema-state', 'invariant-preflight', 'outbound-status']) assert.equal(status[id], 'PASS', `${id} ran to completion: ${summaries[id]}`)
     assert.equal(record.checks.some((row) => /read-only transaction/.test(row.summary)), false, 'no check attempted a write')
   } finally {
     rmSync(reportDir, { recursive: true, force: true })
