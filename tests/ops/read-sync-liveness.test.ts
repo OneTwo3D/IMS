@@ -12,6 +12,7 @@ import {
   BINDING_STALE_FLOOR_MS,
   BINDING_STALE_INTERVALS,
   READ_SYNC_STATUS_EXIT_CODES,
+  READ_SYNC_STATUS_SCHEMA_VERSION,
   READ_SYNC_STREAMS,
   READ_SYNC_STREAM_IDS,
   bindingStaleAfterMs,
@@ -20,11 +21,12 @@ import {
 } from '../../lib/ops/read-sync-liveness-constants.ts'
 import {
   assembleReadSyncReport,
-  scheduledSlugsIn,
   readSyncStatusExitCode,
   renderReadSyncStatusText,
   type ReadSyncInputs,
 } from '../../lib/ops/read-sync-status.ts'
+import { buildOtiCrontabBlock, type CrontabJobDef } from '../../lib/crontab-sync.ts'
+import { verifyJobsScheduled } from '../../lib/ops/read-sync-scheduler.ts'
 import { isBindingSyncStale } from '../../lib/domain/wms/watchdog-sweep.ts'
 import { runReadSyncStatusCli } from '../../scripts/read-sync-status.ts'
 
@@ -41,6 +43,13 @@ const NOW = new Date('2026-10-08T12:00:00.000Z')
 const ago = (ms: number) => new Date(NOW.getTime() - ms)
 const HOUR = 3_600_000
 
+function registryDefs(): CrontabJobDef[] {
+  return getAllCronJobs().map((job) => ({
+    slug: job.slug, settingKey: job.settingKey, label: job.label, defaultSchedule: job.defaultSchedule,
+    defaultEnabled: job.defaultEnabled, legacyEnabledKey: job.legacyEnabledKey,
+  }))
+}
+
 function allOnInputs(overrides: Partial<ReadSyncInputs> = {}): ReadSyncInputs {
   const settings = new Map<string, string>([['wc_sync_enabled', 'true']])
   for (const def of READ_SYNC_STREAMS) {
@@ -49,6 +58,7 @@ function allOnInputs(overrides: Partial<ReadSyncInputs> = {}): ReadSyncInputs {
   const cronEnabled: Record<string, boolean> = {}
   for (const def of READ_SYNC_STREAMS) if (def.cronSlug) cronEnabled[def.cronSlug] = true
   cronEnabled['read-sync-liveness'] = true
+  cronEnabled['wms-watchdog'] = true
   return {
     settings,
     pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
@@ -56,6 +66,8 @@ function allOnInputs(overrides: Partial<ReadSyncInputs> = {}): ReadSyncInputs {
     cronEnabled,
     bindings: [{ id: 'b1', warehouseCode: 'MS1', syncFrequencyMinutes: 60, lastStockSyncSuccessAt: ago(HOUR / 2) }],
     lastDispatchSuccessAt: ago(HOUR / 2),
+    cronJobDefs: registryDefs(),
+    cronSchedules: {},
     ...overrides,
   }
 }
@@ -281,41 +293,103 @@ test('alert text says only what the stamp shows, names no unconditional action, 
   assert.match(future.message, /later than the clock/)
 })
 
-const BLOCK_START = '# --- OTI CRON START ---'
-const BLOCK_END = '# --- OTI CRON END ---'
-function crontabWith(slugs: string[], extra: string[] = []): string {
-  return [BLOCK_START, '# Managed by One Two Inventory', 'BASE_URL="http://localhost:3000/api/cron"', '',
-    ...slugs.flatMap((slug) => [`# ${slug}`, `0 * * * *  curl -sf -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${slug}" >> '/var/log/x' 2>&1`, '']),
-    BLOCK_END, ...extra, ''].join('\n')
+const NEEDED = ['read-sync-liveness', 'wc-reconcile', 'wms-order-status', 'account-balance-snapshot', 'xero-tax-rate-drift', 'mintsoft-stock-sync', 'wms-watchdog']
+const ENV_FILE = '/opt/ims/.env'
+// Assembled at run time: a fixture value, not a credential (and not a literal a secret scanner would flag).
+const LITERAL_CRON_SECRET = ['fixture', 'cron', 'value', String(NOW.getUTCFullYear())].join('_')
+
+/** A real block, written by the generator the in-app scheduler uses. */
+function generatedBlock(slugs: string[], opts: { secret?: 'env' | 'literal'; schedules?: Record<string, string> } = {}): string {
+  const jobs = registryDefs().filter((job) => slugs.includes(job.slug))
+  const settings = new Map<string, string>()
+  for (const job of jobs) {
+    settings.set(`cron_${job.settingKey}_enabled`, 'true')
+    const schedule = opts.schedules?.[job.slug]
+    if (schedule) settings.set(`cron_${job.settingKey}_schedule`, schedule)
+  }
+  const built = buildOtiCrontabBlock({
+    jobs, settings,
+    secretRef: opts.secret === 'literal' ? { kind: 'literal', secret: LITERAL_CRON_SECRET } : { kind: 'env-file', envFilePath: ENV_FILE },
+    baseUrl: 'https://ims.example.com',
+  })
+  assert.ok(built.ok)
+  return ['0 5 * * * /usr/local/bin/operator-job', ...built.lines, ''].join('\n')
 }
-const NEEDED = ['read-sync-liveness', 'wc-reconcile', 'wms-order-status', 'account-balance-snapshot', 'xero-tax-rate-drift', 'mintsoft-stock-sync']
 
 test('[scheduler] an enabled alarm job with no crontab entry is reported, and exits 6', () => {
   const base = allOnInputs()
-  const missing = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: crontabWith(NEEDED.filter((slug) => slug !== 'read-sync-liveness')) } }, NOW)
+  const missing = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: generatedBlock(NEEDED.filter((slug) => slug !== 'read-sync-liveness')) } }, NOW)
   console.log(`precondition: scheduler=${JSON.stringify(missing.scheduler)} counts=${JSON.stringify(missing.counts)}`)
   assert.deepEqual(missing.scheduler.unscheduled, ['read-sync-liveness'])
   assert.equal(missing.counts.fresh, missing.entries.length, 'every feed is fresh: only the scheduler is wrong')
   assert.equal(readSyncStatusExitCode(missing), 6)
-  assert.match(renderReadSyncStatusText(missing), /UNSCHEDULED: read-sync-liveness is enabled but not in the managed crontab/)
+  assert.match(renderReadSyncStatusText(missing), /UNSCHEDULED: read-sync-liveness is enabled but has no active entry/)
   assert.doesNotMatch(renderReadSyncStatusText(missing), /^CURRENT:/)
 
-  const all = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: crontabWith(NEEDED) } }, NOW)
-  assert.deepEqual(all.scheduler, { examined: true, unreadable: null, unscheduled: [] })
+  const all = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: generatedBlock(NEEDED) } }, NOW)
+  console.log(`precondition (complete block): ${JSON.stringify(all.scheduler)}`)
+  assert.deepEqual(all.scheduler, { examined: true, unreadable: null, blockProblem: null, unscheduled: [], disabled: [] })
   assert.equal(readSyncStatusExitCode(all), 0)
+  // literal-secret blocks verify too, and so does a stored non-default schedule.
+  const lit = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: generatedBlock(NEEDED, { secret: 'literal' }) } }, NOW)
+  assert.equal(readSyncStatusExitCode(lit), 0)
+  const custom = assembleReadSyncReport({ ...base, cronSchedules: { 'wc-reconcile': '30 2 * * *' }, crontab: { resolved: true, text: generatedBlock(NEEDED, { schedules: { 'wc-reconcile': '30 2 * * *' } }) } }, NOW)
+  assert.equal(readSyncStatusExitCode(custom), 0)
 })
 
-test('[scheduler] a stream job that is enabled but unscheduled counts; a disabled one does not; a commented or unmanaged line is not a schedule', () => {
+test('[scheduler] the stock sync needs the WMS watchdog on AND scheduled; without stock sync it is not required', () => {
   const base = allOnInputs()
-  const noWc = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: crontabWith(NEEDED.filter((slug) => slug !== 'wc-reconcile')) } }, NOW)
-  assert.deepEqual(noWc.scheduler.unscheduled, ['wc-reconcile'])
-  const disabled = assembleReadSyncReport({ ...base, cronEnabled: { ...base.cronEnabled, 'wc-reconcile': false }, crontab: { resolved: true, text: crontabWith(NEEDED.filter((slug) => slug !== 'wc-reconcile')) } }, NOW)
-  assert.deepEqual(disabled.scheduler.unscheduled, [])
-  const commented = [BLOCK_START, '# 0 * * * *  curl "$BASE_URL/read-sync-liveness"', BLOCK_END].join('\n')
-  assert.equal(scheduledSlugsIn(commented).has('read-sync-liveness'), false)
-  const outside = `0 * * * * curl "$BASE_URL/read-sync-liveness"\n${crontabWith([])}`
-  assert.equal(scheduledSlugsIn(outside).has('read-sync-liveness'), false)
-  assert.equal(scheduledSlugsIn(crontabWith(['a-b', 'c'])).size, 2)
+  const noWatchdog = assembleReadSyncReport({ ...base, crontab: { resolved: true, text: generatedBlock(NEEDED.filter((slug) => slug !== 'wms-watchdog')) } }, NOW)
+  console.log(`precondition: ${JSON.stringify(noWatchdog.scheduler)}`)
+  assert.deepEqual(noWatchdog.scheduler.unscheduled, ['wms-watchdog'])
+  assert.equal(readSyncStatusExitCode(noWatchdog), 6)
+  assert.match(renderReadSyncStatusText(noWatchdog), /wms-watchdog is enabled but has no active entry/)
+
+  const off = assembleReadSyncReport({ ...base, cronEnabled: { ...base.cronEnabled, 'wms-watchdog': false }, crontab: { resolved: true, text: generatedBlock(NEEDED) } }, NOW)
+  assert.deepEqual(off.scheduler.disabled, ['wms-watchdog'])
+  assert.equal(readSyncStatusExitCode(off), 6)
+  assert.match(renderReadSyncStatusText(off), /DISABLED: wms-watchdog is switched off/)
+
+  const noStock = assembleReadSyncReport({ ...base, bindings: [], cronEnabled: { ...base.cronEnabled, 'wms-watchdog': false }, crontab: { resolved: true, text: generatedBlock(NEEDED.filter((slug) => slug !== 'wms-watchdog' && slug !== 'mintsoft-stock-sync')) } }, NOW)
+  assert.deepEqual(noStock.scheduler.disabled, [], 'no binding, no stock sync, no watchdog requirement')
+})
+
+test('[scheduler] a switched-off alarm job is reported; a stream job that is off is not required', () => {
+  const base = allOnInputs()
+  const alarmOff = assembleReadSyncReport({ ...base, cronEnabled: { ...base.cronEnabled, 'read-sync-liveness': false }, crontab: { resolved: true, text: generatedBlock(NEEDED) } }, NOW)
+  assert.deepEqual(alarmOff.scheduler.disabled, ['read-sync-liveness'])
+  assert.equal(readSyncStatusExitCode(alarmOff), 6)
+  const wcOff = assembleReadSyncReport({ ...base, cronEnabled: { ...base.cronEnabled, 'wc-reconcile': false }, crontab: { resolved: true, text: generatedBlock(NEEDED.filter((slug) => slug !== 'wc-reconcile')) } }, NOW)
+  assert.deepEqual(wcOff.scheduler.unscheduled, [])
+})
+
+test('[scheduler] lines that cannot run the job do not count: commented, outside the block, wrong schedule, edited, partial', () => {
+  const defs = registryDefs()
+  const wanted = defs.filter((job) => job.slug === 'read-sync-liveness')
+  const good = generatedBlock(['read-sync-liveness'])
+  const verdict = (text: string) => verifyJobsScheduled(text, wanted, {})
+  assert.deepEqual(verdict(good), { blockProblem: null, missing: [] }, 'control: the generated block verifies')
+
+  const lines = good.split('\n')
+  const jobLine = lines.findIndex((line) => line.includes('$BASE_URL/read-sync-liveness'))
+  const mutate = (fn: (copy: string[]) => void) => { const copy = [...lines]; fn(copy); return copy.join('\n') }
+  const cases: Array<[string, string, 'missing' | 'block']> = [
+    ['commented out', mutate((c) => { c[jobLine] = `# ${c[jobLine]}` }), 'missing'],
+    ['schedule cron would reject', mutate((c) => { c[jobLine] = c[jobLine]!.replace(/^\S+ \S+ \S+ \S+ \S+/, '99 99 99 99 99') }), 'missing'],
+    ['different schedule than the one stored', mutate((c) => { c[jobLine] = c[jobLine]!.replace(/^\S+/, '*/7') }), 'missing'],
+    ['curl command damaged', mutate((c) => { c[jobLine] = c[jobLine]!.replace('curl -sf', 'echo') }), 'missing'],
+    ['label line removed', mutate((c) => { c.splice(jobLine - 1, 1) }), 'missing'],
+    ['only outside the markers', ['0 * * * * curl -sf "$BASE_URL/read-sync-liveness"'].join('\n') + '\n', 'block'],
+    ['END marker missing (partial block)', mutate((c) => { c.splice(c.findIndex((line) => line.includes('OTI CRON END')), 1) }), 'block'],
+    ['BASE_URL assignment removed', mutate((c) => { c.splice(c.findIndex((line) => line.startsWith('BASE_URL=')), 1) }), 'block'],
+    ['secret source edited out', mutate((c) => { const i = c.findIndex((line) => line.startsWith('# CRON_SECRET is read from')); c[i] = '# nothing' }), 'block'],
+  ]
+  for (const [name, text, expect] of cases) {
+    const result = verdict(text)
+    console.log(`precondition (${name}): ${JSON.stringify(result)}`)
+    assert.deepEqual(result.missing, ['read-sync-liveness'], name)
+    assert.equal(result.blockProblem !== null, expect === 'block', name)
+  }
 })
 
 test('[scheduler] an unreadable crontab is not a pass; precedence is stale > unscheduled > never > off', () => {
@@ -325,9 +399,26 @@ test('[scheduler] an unreadable crontab is not a pass; precedence is stale > uns
   assert.match(renderReadSyncStatusText(unreadable), /SCHEDULER NOT CHECKED: .*timed out/)
 
   const noStamp = new Map(base.settings); noStamp.delete('xero_balance_snapshot_last_success_at')
-  const unscheduledAndNever = assembleReadSyncReport({ ...base, settings: noStamp, crontab: { resolved: true, text: crontabWith([]) } }, NOW)
+  const empty = { resolved: true as const, text: generatedBlock([]) }
+  const unscheduledAndNever = assembleReadSyncReport({ ...base, settings: noStamp, crontab: empty }, NOW)
   assert.ok(unscheduledAndNever.counts.never > 0 && unscheduledAndNever.scheduler.unscheduled.length > 0)
   assert.equal(readSyncStatusExitCode(unscheduledAndNever), 6)
-  const staleToo = assembleReadSyncReport({ ...base, lastDispatchSuccessAt: ago(5 * HOUR), crontab: { resolved: true, text: crontabWith([]) } }, NOW)
+  const staleToo = assembleReadSyncReport({ ...base, lastDispatchSuccessAt: ago(5 * HOUR), crontab: empty }, NOW)
   assert.equal(readSyncStatusExitCode(staleToo), 1)
+})
+
+test('[json] the status document carries schemaVersion 1 and generatedAt, and the old fields unchanged', async () => {
+  const report = assembleReadSyncReport(allOnInputs(), NOW)
+  const lines: string[] = []
+  const code = await runReadSyncStatusCli({ argv: ['--json'], build: async () => report, stdout: { log: (m: string) => { lines.push(m) } }, stderr: { error: () => undefined }, disconnect: async () => undefined })
+  const doc = JSON.parse(lines[0]!) as Record<string, unknown> & { entries: Array<Record<string, unknown>> }
+  console.log(`precondition: keys=${Object.keys(doc).join(',')} schemaVersion=${String(doc.schemaVersion)} generatedAt=${String(doc.generatedAt)}`)
+  assert.equal(doc.schemaVersion, 1)
+  assert.equal(doc.schemaVersion, READ_SYNC_STATUS_SCHEMA_VERSION)
+  assert.equal(doc.generatedAt, NOW.toISOString())
+  for (const key of ['entries', 'counts', 'scheduler', 'exitCode']) assert.ok(key in doc, key)
+  assert.equal(doc.exitCode, code)
+  for (const key of ['stream', 'label', 'instance', 'state', 'lastSuccessAt', 'ageMs', 'maxAgeMs', 'futureTimestamp', 'detail', 'cadence']) {
+    assert.ok(key in doc.entries[0]!, `entry field ${key} is unchanged`)
+  }
 })

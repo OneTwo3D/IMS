@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/registry'
@@ -64,6 +65,29 @@ export const WMS_LOOKUP_AMBIGUOUS = 'WMS lookup ambiguous — several orders mat
  */
 export const WMS_LOOKUP_PRESENT_NO_STATUS = 'WMS holds this order but its status could not be read'
 
+/**
+ * A snapshot row whose lookup did NOT resolve: it carries a `lastError` that is not one of the two
+ * answers the warehouse itself gave about a missing order (confirmed absent, ambiguous). That covers a
+ * presence probe that failed or could not run, a present order whose status was unreadable, a thrown
+ * lookup, and the legacy "Order not found" literal (which never distinguished absence from ambiguity).
+ *
+ * The state is PERSISTED in the row on purpose. A snapshot written with a fresh `fetchedAt` otherwise
+ * makes the order look resolved to the 30-minute exclusion in the next sweep, and a later sweep that
+ * selects nothing else would then stamp the read-sync last-success time over an order nobody has been
+ * able to read. So such rows are (a) selected on EVERY sweep regardless of age and (b) counted before the
+ * stamp is written.
+ */
+export const WMS_RESOLVED_LOOKUP_ERRORS: readonly string[] = [WMS_LOOKUP_CONFIRMED_ABSENT, WMS_LOOKUP_AMBIGUOUS]
+
+export function isUnresolvedLookupError(lastError: string | null | undefined): boolean {
+  return lastError !== null && lastError !== undefined && !WMS_RESOLVED_LOOKUP_ERRORS.includes(lastError)
+}
+
+/** Prisma filter for `wmsOrderStatus: { is: ... }` matching the same rows as isUnresolvedLookupError. */
+export const UNRESOLVED_SNAPSHOT_WHERE: Prisma.WmsOrderStatusSnapshotWhereInput = {
+  AND: [{ lastError: { not: null } }, { lastError: { notIn: [...WMS_RESOLVED_LOOKUP_ERRORS] } }],
+}
+
 export async function runWmsOrderStatusSweep(
   options?: { batchSize?: number; staleMinutes?: number },
 ): Promise<WmsOrderStatusSweepResult> {
@@ -96,13 +120,18 @@ export async function runWmsOrderStatusSweep(
   const staleBefore = new Date(Date.now() - staleMinutes * 60_000)
   const connectorLabel = getWmsConnectorDef(connectorId).label
 
+  const inScope = {
+    status: { notIn: [...TERMINAL_SALES_STATUSES] },
+    shoppingLinks: { some: { connector: lookupConnector, externalOrderNumber: { not: null } } },
+  }
   const orders = await db.salesOrder.findMany({
     where: {
-      status: { notIn: [...TERMINAL_SALES_STATUSES] },
-      shoppingLinks: { some: { connector: lookupConnector, externalOrderNumber: { not: null } } },
+      ...inScope,
       OR: [
         { wmsOrderStatus: { is: null } },
         { wmsOrderStatus: { fetchedAt: { lt: staleBefore } } },
+        // An unresolved lookup is retried on every sweep, not once per staleness window.
+        { wmsOrderStatus: { is: UNRESOLVED_SNAPSHOT_WHERE } },
       ],
     },
     select: {
@@ -298,7 +327,12 @@ export async function runWmsOrderStatusSweep(
   // none were stale counts - that is a sweep that legitimately found nothing to refresh. A run with any
   // failure does not, so one order that keeps failing keeps the stamp from advancing, which is the
   // honest reading: the cache is not being kept current for it.
-  if (failed === 0 && unresolvedReads === 0) {
+  // Orders in scope whose stored snapshot is still unresolved - including any this run did not reach
+  // (batch limit) - keep the stamp where it was.
+  const outstandingUnresolved = failed === 0 && unresolvedReads === 0
+    ? await db.salesOrder.count({ where: { ...inScope, wmsOrderStatus: { is: UNRESOLVED_SNAPSHOT_WHERE } } })
+    : 0
+  if (failed === 0 && unresolvedReads === 0 && outstandingUnresolved === 0) {
     const stampedAt = new Date().toISOString()
     await db.setting.upsert({
       where: { key: WMS_ORDER_STATUS_LAST_SUCCESS_SETTING },

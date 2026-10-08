@@ -187,6 +187,8 @@ export function fixedMaxAgeMs(stream: ReadSyncStreamDef): number | null {
 // The status command
 // ---------------------------------------------------------------------------------------------
 
+/** Version of the `read-sync:status --json` document. Consumers (the go/no-go gate) require it. */
+export const READ_SYNC_STATUS_SCHEMA_VERSION = 1
 export const READ_SYNC_STATUS_COMMAND = 'npm run read-sync:status'
 export const READ_SYNC_ALARM_CRON_SLUG = 'read-sync-liveness'
 export const READ_SYNC_ALERT_ACTION = 'read_sync_stream_stale'
@@ -198,7 +200,7 @@ export const READ_SYNC_STATUS_EXIT_CODES: readonly ReadSyncStatusExitCode[] = [
   { code: 5, name: 'failed', meaning: 'the report could not be produced because of an unexpected error; no stream was evaluated' },
   { code: 3, name: 'usage', meaning: 'an unknown argument was given; nothing was evaluated' },
   { code: 1, name: 'stale', meaning: 'at least one stream that is switched on last succeeded longer ago than its limit (or has a last-success time in the future, which is not believed)' },
-  { code: 6, name: 'unscheduled', meaning: 'the read-sync-liveness alarm job, or the scheduled job behind a stream that is switched on, is enabled but has no entry in the managed crontab (a newly registered job is only scheduled by Settings > System > Scheduler > Save & Apply), or the crontab could not be read, so an alarm may never run; no stream is stale' },
+  { code: 6, name: 'unscheduled', meaning: 'a job this report depends on is switched off, or enabled but without an active entry the scheduler would write in a complete managed crontab block (the alarm job, the job behind a stream that is switched on, and the wms-watchdog job while the stock sync is in play), or the crontab could not be read; a newly registered job is only scheduled by Settings > System > Scheduler > Save & Apply; no stream is stale' },
   { code: 2, name: 'never', meaning: 'at least one stream that is switched on has no successful run recorded; no stream is stale' },
   { code: 4, name: 'off', meaning: 'at least one stream is switched off or cannot run (plugin disabled, scheduled job disabled, not connected, no active binding), so it is not keeping IMS current; no stream that is switched on is stale, without a success or unscheduled' },
   { code: 0, name: 'ok', meaning: 'every stream is switched on and last succeeded within its limit' },
@@ -289,7 +291,7 @@ export const READ_SYNC_DOC_BLOCKS: Record<ReadSyncDocBlockId, string> = {
     ...STREAM_ROWS,
   ].join('\n'),
   'status-command': [
-    `\`${READ_SYNC_STATUS_COMMAND}\` prints every feed with its state (fresh, stale, never succeeded, or off), the time of its last recorded success, its age and its limit. It reads the database only, makes no network call and writes nothing. It also checks that the scheduled jobs it depends on are in the managed crontab of the user it runs as (run it as the application user): a newly registered job, including the alarm job itself on an upgraded installation, is only scheduled once Settings > System > Scheduler > Save & Apply has been used, and an alarm job that is not scheduled can never alarm. Pass \`--json\` for a machine-readable report. A feed is "off" when its plugin or scheduled job is disabled, the connector is not connected, or there is no active binding; an off feed is not keeping IMS current, so it is reported rather than hidden.`,
+    `\`${READ_SYNC_STATUS_COMMAND}\` prints every feed with its state (fresh, stale, never succeeded, or off), the time of its last recorded success, its age and its limit. It reads the database only, makes no network call and writes nothing. It also checks that the scheduled jobs it depends on are switched on and have an active entry, exactly as the scheduler would write it, in a complete managed crontab block of the user it runs as (run it as the application user). That covers the alarm job, the job behind each feed that is switched on, and the WMS watchdog while the Mintsoft stock sync is in play. A newly registered job, including the alarm job itself on an upgraded installation, is only scheduled once Settings > System > Scheduler > Save & Apply has been used, and an alarm job that is not scheduled can never alarm. Pass \`--json\` for a machine-readable report: a JSON object whose \`schemaVersion\` is ${READ_SYNC_STATUS_SCHEMA_VERSION} and whose \`generatedAt\` is the ISO time the report was made, followed by the entries (each with \`ageMs\`, \`lastSuccessAt\`, \`futureTimestamp\`), the \`counts\`, the \`scheduler\` check and the \`exitCode\`. A feed is "off" when its plugin or scheduled job is disabled, the connector is not connected, or there is no active binding; an off feed is not keeping IMS current, so it is reported rather than hidden.`,
     '',
     renderReadSyncStatusExitCodeTable(),
   ].join('\n'),

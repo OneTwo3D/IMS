@@ -31,7 +31,7 @@ import { parseReadSyncStamp } from './read-sync-liveness'
 import { assembleReadSyncReport, type ReadSyncInputs } from './read-sync-status'
 
 export type ReadSyncAlarmLogEntry = {
-  stream: ReadSyncStreamId
+  stream: ReadSyncStreamId | 'scheduler'
   title: string
   description: string
   metadata: Record<string, unknown>
@@ -77,6 +77,30 @@ export type ReadSyncAlarmResult = {
 const ALARMED_ELSEWHERE: ReadonlySet<ReadSyncStreamId> = new Set<ReadSyncStreamId>(
   READ_SYNC_STREAMS.filter((def) => def.alarm !== 'read-sync-liveness').map((def) => def.id),
 )
+
+/**
+ * CLAIM, DELIVER AND RECORD IN ONE TRANSACTION, AND DELIVER ONLY IF THIS TRANSACTION WON THE CLAIM.
+ * The claim is a conditional write against the value read earlier: an insert-if-absent when no breach
+ * was recorded, otherwise an update that matches only if the row still holds what was read. Two runs
+ * racing over the same breach take the row's lock in turn; the second finds the first's value (or its
+ * row) and its write matches nothing, so it delivers nothing. The activity entry is written in the same
+ * transaction, so a failed write rolls the claim back and the breach is retried rather than being
+ * marked alerted with no record of it. Returns whether this call delivered.
+ */
+export async function claimBreachAndDeliver(
+  deps: Pick<ReadSyncAlarmDeps, 'db' | 'notifyAdmins' | 'logWarning'>,
+  claim: { stampKey: string; prior: string | undefined; breachKey: string; alert: { title: string; message: string }; logEntry: ReadSyncAlarmLogEntry },
+): Promise<boolean> {
+  return deps.db.$transaction(async (tx) => {
+    const claimed = claim.prior === undefined
+      ? await tx.setting.createMany({ data: [{ key: claim.stampKey, value: claim.breachKey }], skipDuplicates: true })
+      : await tx.setting.updateMany({ where: { key: claim.stampKey, value: claim.prior }, data: { value: claim.breachKey } })
+    if (claimed.count !== 1) return false
+    await deps.notifyAdmins(tx, claim.alert.title, claim.alert.message, '/sync')
+    await deps.logWarning(tx, claim.logEntry)
+    return true
+  })
+}
 
 export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise<ReadSyncAlarmResult> {
   const { db, now } = deps
@@ -142,17 +166,8 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
     // value (or its row) and its write matches nothing, so it delivers nothing. The activity entry is
     // written in the same transaction, so a failed write rolls the claim back and the breach is retried
     // rather than being marked alerted with no record of it.
-    const prior = stored.get(stampKey)
     try {
-      const won = await db.$transaction(async (tx) => {
-        const claimed = prior === undefined
-          ? await tx.setting.createMany({ data: [{ key: stampKey, value: breachKey }], skipDuplicates: true })
-          : await tx.setting.updateMany({ where: { key: stampKey, value: prior }, data: { value: breachKey } })
-        if (claimed.count !== 1) return false
-        await deps.notifyAdmins(tx, alert.title, alert.message, '/sync')
-        await deps.logWarning(tx, logEntry)
-        return true
-      })
+      const won = await claimBreachAndDeliver(deps, { stampKey, prior: stored.get(stampKey), breachKey, alert, logEntry })
       if (won) alerted.push(entry.stream)
     } catch (error) {
       deliveryFailures += 1
@@ -166,15 +181,12 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
   return { status: 'SUCCEEDED', evaluated: entries.length, alerted, deliveryFailures }
 }
 
-/** The real wiring: the shared database, the watchdog's own delivery, the activity log. */
-export async function runReadSyncLivenessAlarmLive(now: Date = new Date()): Promise<ReadSyncAlarmResult> {
+/** The real delivery wiring, shared with the scheduler guard: the watchdog's own notify, and a transactional activity write. */
+export async function liveAlarmDelivery(): Promise<Pick<ReadSyncAlarmDeps, 'db' | 'notifyAdmins' | 'logWarning'>> {
   const { db } = await import('@/lib/db')
   const { notifyActiveAdmins } = await import('@/lib/domain/wms/watchdog-sweep')
-  const { readReadSyncInputs } = await import('./read-sync-status')
-  return runReadSyncLivenessAlarm({
+  return {
     db: db as unknown as ReadSyncAlarmDb,
-    now,
-    readInputs: readReadSyncInputs,
     notifyAdmins: (tx, title, message, actionUrl) => notifyActiveAdmins(tx as never, title, message, actionUrl),
     logWarning: async (tx, entry) => {
       // Not logActivity(): that swallows its own failures, and a swallowed failure here would mark the
@@ -191,5 +203,11 @@ export async function runReadSyncLivenessAlarmLive(now: Date = new Date()): Prom
         },
       })
     },
-  })
+  }
+}
+
+/** The real wiring of the alarm job. */
+export async function runReadSyncLivenessAlarmLive(now: Date = new Date()): Promise<ReadSyncAlarmResult> {
+  const { readReadSyncInputs } = await import('./read-sync-status')
+  return runReadSyncLivenessAlarm({ ...(await liveAlarmDelivery()), now, readInputs: readReadSyncInputs })
 }

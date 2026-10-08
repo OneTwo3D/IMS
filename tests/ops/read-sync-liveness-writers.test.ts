@@ -42,14 +42,33 @@ let pages: Record<string, Array<Record<string, unknown>>> = {}
 let wcError: string | null = null
 // ---- order-status sweep rig --------------------------------------------------------------------
 let statusOrders: Array<Record<string, unknown>> = []
+const snapshots = new Map<string, { lastError: string | null; externalOrderId: string }>()
+const findManyWheres: unknown[] = []
 let fetchOrderStatusImpl: (reference: string) => Promise<unknown> = async () => null
 let resolution: { kind: string; id?: string } = { kind: 'one', id: 'mintsoft' }
 let probeImpl: ((reference: string) => Promise<string>) | null = async () => 'ABSENT'
 
 const orderDb: Record<string, unknown> = {
   setting: { findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { key: where.key, value: settings.get(where.key) } : null), upsert },
-  salesOrder: { findFirst: async () => ({ id: 'so-1' }), findMany: async () => statusOrders },
-  wmsOrderStatusSnapshot: { findUnique: async () => null, upsert: async () => ({}), update: async () => ({}) },
+  salesOrder: {
+    findFirst: async () => ({ id: 'so-1' }),
+    findMany: async (args: unknown) => { findManyWheres.push(args); return statusOrders },
+    // Orders in scope whose STORED snapshot is unresolved: counted from the fake snapshot store with the
+    // sweep's own predicate, so the persisted state is what the stamp decision reads.
+    count: async () => {
+      const { isUnresolvedLookupError } = await import('@/lib/domain/wms/order-status-sweep')
+      return [...snapshots.values()].filter((row) => isUnresolvedLookupError(row.lastError)).length
+    },
+  },
+  wmsOrderStatusSnapshot: {
+    findUnique: async ({ where }: { where: { orderId: string } }) => snapshots.get(where.orderId) ?? null,
+    upsert: async ({ where, create, update }: { where: { orderId: string }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+      const merged = { ...(snapshots.get(where.orderId) ?? create), ...(snapshots.has(where.orderId) ? update : {}) } as { lastError: string | null; externalOrderId: string }
+      snapshots.set(where.orderId, merged)
+      return merged
+    },
+    update: async () => ({}),
+  },
   wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
   $transaction: async (ops: Array<Promise<unknown>>) => {
     // The statements are already built when $transaction receives them; what it was handed is what
@@ -107,6 +126,8 @@ function reset() {
   activity.length = 0
   wcError = null
   statusOrders = []
+  snapshots.clear()
+  findManyWheres.length = 0
   fetchOrderStatusImpl = async () => null
   resolution = { kind: 'one', id: 'mintsoft' }
   probeImpl = async () => 'ABSENT'
@@ -262,4 +283,40 @@ test('[order-status] every null fetch the presence probe cannot settle withholds
     assert.equal(result.failed, 0, `${c.name}: the returned counters keep their meaning`)
     assert.equal(moved, c.advances, c.name)
   }
+})
+
+test('[order-status] an unresolved order keeps the stamp withheld on LATER sweeps that select nothing else', async () => {
+  const { runWmsOrderStatusSweep } = await import('@/lib/domain/wms/order-status-sweep')
+  const order = (id: string) => ({ id, shoppingLinks: [{ externalOrderNumber: `W-${id}` }], wmsOrderStatus: null })
+  reset()
+  const previous = '2026-10-01T00:00:00.000Z'
+  settings.set(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING, previous)
+
+  // Run 1: the probe fails. The snapshot is written (fresh fetchedAt) but marked unresolved by its lastError.
+  statusOrders = [order('a')]
+  probeImpl = async () => { throw new Error('Mintsoft HTTP 503') }
+  const run1 = await runWmsOrderStatusSweep()
+  console.log(`precondition run1: ${JSON.stringify(run1)} snapshot=${JSON.stringify(snapshots.get('a'))} stamp=${settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING)}`)
+  assert.match(snapshots.get('a')?.lastError ?? '', /presence probe failed/)
+  assert.equal(settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING), previous)
+
+  // The selection predicate keeps unresolved snapshots eligible regardless of age.
+  const where = JSON.stringify(findManyWheres[0])
+  assert.match(where, /"notIn":\["Order confirmed absent in WMS \(presence-probed\)"/, 'unresolved snapshots are selected on every sweep')
+
+  // Run 2: the 30-minute window excludes the order and nothing else is selected. failed and
+  // unresolvedReads are both 0 in THIS run, yet the persisted unresolved snapshot must hold the stamp.
+  statusOrders = []
+  probeImpl = async () => 'ABSENT'
+  const run2 = await runWmsOrderStatusSweep()
+  console.log(`precondition run2: ${JSON.stringify(run2)} unresolved snapshots=${[...snapshots.values()].length} stamp=${settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING)}`)
+  assert.deepEqual(run2, { scanned: 0, updated: 0, failed: 0 })
+  assert.equal(settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING), previous, 'a persistently unreadable order must not keep the feed looking fresh')
+
+  // Run 3: the order is retried (it is selected again), resolves, and only then does the stamp move.
+  statusOrders = [order('a')]
+  const run3 = await runWmsOrderStatusSweep()
+  assert.equal(run3.failed, 0)
+  assert.equal(snapshots.get('a')?.lastError, 'Order confirmed absent in WMS (presence-probed)')
+  assert.notEqual(settings.get(WMS_ORDER_STATUS_LAST_SUCCESS_SETTING), previous, 'resolved: the stamp advances')
 })

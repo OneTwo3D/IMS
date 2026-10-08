@@ -87,6 +87,7 @@ mock.module('@/lib/db', {
         },
       },
       salesOrder: {
+        count: async () => 0,
         findMany: async () => {
           dbCalls.push('salesOrder.findMany')
           return [{

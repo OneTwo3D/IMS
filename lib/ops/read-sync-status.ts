@@ -12,11 +12,13 @@
  */
 
 import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
-import { extractOtiBlock } from '@/lib/crontab-sync'
+import type { CrontabJobDef } from '@/lib/crontab-sync'
+import { verifyJobsScheduled } from './read-sync-scheduler'
 
 import {
   READ_SYNC_ALARM_CRON_SLUG,
   READ_SYNC_STATUS_EXIT_CODES,
+  READ_SYNC_STATUS_SCHEMA_VERSION,
   READ_SYNC_STREAMS,
   bindingStaleAfterMs,
   formatReadSyncAge,
@@ -50,14 +52,21 @@ export type ReadSyncInputs = {
    * examined (tests that are about freshness alone).
    */
   crontab?: { resolved: true; text: string } | { resolved: false; reason: string }
+  /** The registered jobs as the crontab generator takes them, and the stored schedule overrides by slug. */
+  cronJobDefs?: readonly CrontabJobDef[]
+  cronSchedules?: Readonly<Record<string, string | undefined>>
 }
 
 export type ReadSyncSchedulerCheck = {
   examined: boolean
   /** Why the crontab could not be read, when it could not. */
   unreadable: string | null
-  /** Enabled jobs this report depends on that have no managed crontab entry. */
+  /** Why the managed block as a whole cannot be trusted (malformed, partial or absent). */
+  blockProblem: string | null
+  /** Jobs this report depends on that are enabled but have no active, generator-equal crontab entry. */
   unscheduled: string[]
+  /** Jobs this report depends on that are switched off. */
+  disabled: string[]
 }
 
 export type ReadSyncEntry = {
@@ -76,6 +85,7 @@ export type ReadSyncEntry = {
 }
 
 export type ReadSyncReport = {
+  schemaVersion: typeof READ_SYNC_STATUS_SCHEMA_VERSION
   generatedAt: string
   entries: ReadSyncEntry[]
   counts: Record<ReadSyncState, number>
@@ -122,32 +132,42 @@ function evaluatedEntry(
 
 const PLUGIN_NAME = { woocommerce: 'WooCommerce', mintsoft: 'Mintsoft', xero: 'Xero' } as const
 
-/** The slugs the managed crontab block calls. Pure. */
-export function scheduledSlugsIn(crontabText: string): Set<string> {
-  const slugs = new Set<string>()
-  for (const line of extractOtiBlock(crontabText)) {
-    if (line.trim().startsWith('#')) continue
-    const match = line.match(/\$BASE_URL\/([a-z0-9-]+)"/)
-    if (match) slugs.add(match[1]!)
-  }
-  return slugs
-}
+/** The warehouse stock sync's alarm is raised by this job, so it must be on and scheduled too. */
+export const STOCK_SYNC_WATCHDOG_CRON_SLUG = 'wms-watchdog'
 
 /**
- * Which enabled jobs does this report depend on, and are they in the crontab? The alarm job itself is
- * included: registering a job does not schedule it on an installation that already has a managed block,
- * and an alarm that is never called can never fire. Pure.
+ * Which jobs does this report depend on, are they on, and are they really in the crontab? The alarm job
+ * itself is included: registering a job does not schedule it on an installation that already has a
+ * managed block, and an alarm that is never called can never fire. When the stock sync is in play its
+ * alert belongs to the WMS watchdog, so that job is required as well. Pure.
  */
 export function checkScheduler(inputs: ReadSyncInputs): ReadSyncSchedulerCheck {
-  if (!inputs.crontab) return { examined: false, unreadable: null, unscheduled: [] }
-  if (!inputs.crontab.resolved) return { examined: true, unreadable: inputs.crontab.reason, unscheduled: [] }
-  const present = scheduledSlugsIn(inputs.crontab.text)
-  const wanted = new Set<string>()
-  if (inputs.cronEnabled[READ_SYNC_ALARM_CRON_SLUG] === true) wanted.add(READ_SYNC_ALARM_CRON_SLUG)
+  const none = { examined: false, unreadable: null, blockProblem: null, unscheduled: [], disabled: [] }
+  if (!inputs.crontab) return none
+  if (!inputs.crontab.resolved) return { ...none, examined: true, unreadable: inputs.crontab.reason }
+
+  const required = new Set<string>([READ_SYNC_ALARM_CRON_SLUG])
   for (const def of READ_SYNC_STREAMS) {
-    if (def.cronSlug && inputs.cronEnabled[def.cronSlug] === true && inputs.pluginEnabled[def.plugin]) wanted.add(def.cronSlug)
+    if (def.cronSlug && inputs.cronEnabled[def.cronSlug] === true && inputs.pluginEnabled[def.plugin]) required.add(def.cronSlug)
   }
-  return { examined: true, unreadable: null, unscheduled: [...wanted].filter((slug) => !present.has(slug)).sort() }
+  const stockSyncActive = inputs.pluginEnabled.mintsoft
+    && inputs.cronEnabled['mintsoft-stock-sync'] === true
+    && inputs.bindings.length > 0
+  if (stockSyncActive) required.add(STOCK_SYNC_WATCHDOG_CRON_SLUG)
+
+  const disabled = [...required].filter((slug) => inputs.cronEnabled[slug] !== true).sort()
+  const enabled = [...required].filter((slug) => inputs.cronEnabled[slug] === true)
+  const defs = (inputs.cronJobDefs ?? []).filter((job) => enabled.includes(job.slug))
+  // A required job the registry does not know cannot be rendered, so it cannot be shown to be scheduled.
+  const unknown = enabled.filter((slug) => !defs.some((job) => job.slug === slug))
+  const verdict = verifyJobsScheduled(inputs.crontab.text, defs, inputs.cronSchedules ?? {})
+  return {
+    examined: true,
+    unreadable: null,
+    blockProblem: verdict.blockProblem,
+    unscheduled: [...new Set([...verdict.missing, ...unknown])].sort(),
+    disabled,
+  }
 }
 
 /** Pure. Every stream in READ_SYNC_STREAMS yields at least one entry. */
@@ -199,7 +219,11 @@ export function assembleReadSyncReport(inputs: ReadSyncInputs, now: Date): ReadS
 
   const counts: Record<ReadSyncState, number> = { fresh: 0, stale: 0, never: 0, off: 0 }
   for (const entry of entries) counts[entry.state] += 1
-  return { generatedAt: now.toISOString(), entries, counts, scheduler: checkScheduler(inputs) }
+  return { schemaVersion: READ_SYNC_STATUS_SCHEMA_VERSION, generatedAt: now.toISOString(), entries, counts, scheduler: checkScheduler(inputs) }
+}
+
+export function schedulerProblem(check: ReadSyncSchedulerCheck): boolean {
+  return check.unscheduled.length > 0 || check.disabled.length > 0 || check.unreadable !== null || check.blockProblem !== null
 }
 
 function exitCode(name: string): number {
@@ -212,7 +236,7 @@ function exitCode(name: string): number {
 export function readSyncStatusExitCode(report: ReadSyncReport): number {
   for (const row of READ_SYNC_STATUS_EXIT_CODES) {
     if (row.name === 'stale' && report.counts.stale > 0) return row.code
-    if (row.name === 'unscheduled' && (report.scheduler.unscheduled.length > 0 || report.scheduler.unreadable !== null)) return row.code
+    if (row.name === 'unscheduled' && schedulerProblem(report.scheduler)) return row.code
     if (row.name === 'never' && report.counts.never > 0) return row.code
     if (row.name === 'off' && report.counts.off > 0) return row.code
   }
@@ -221,7 +245,7 @@ export function readSyncStatusExitCode(report: ReadSyncReport): number {
 
 export function renderReadSyncStatusText(report: ReadSyncReport): string {
   const lines: string[] = []
-  const bad = report.counts.stale + report.counts.never + report.counts.off + report.scheduler.unscheduled.length + (report.scheduler.unreadable !== null ? 1 : 0)
+  const bad = report.counts.stale + report.counts.never + report.counts.off + (schedulerProblem(report.scheduler) ? 1 : 0)
   lines.push(
     bad === 0
       ? `CURRENT: all ${report.entries.length} read feeds last succeeded within their limits.`
@@ -245,8 +269,14 @@ export function renderReadSyncStatusText(report: ReadSyncReport): string {
   if (report.scheduler.unreadable !== null) {
     lines.push(`SCHEDULER NOT CHECKED: the crontab could not be read (${report.scheduler.unreadable}). Run this as the application user. Until it is read, whether the alarm job runs is not proven.`)
   }
+  if (report.scheduler.blockProblem !== null) {
+    lines.push(`UNSCHEDULED: the managed crontab block cannot be trusted - ${report.scheduler.blockProblem}. Settings > System > Scheduler > Save & Apply rewrites it.`)
+  }
   if (report.scheduler.unscheduled.length > 0) {
-    lines.push(`UNSCHEDULED: ${report.scheduler.unscheduled.join(', ')} ${report.scheduler.unscheduled.length === 1 ? 'is' : 'are'} enabled but not in the managed crontab, so nothing calls ${report.scheduler.unscheduled.length === 1 ? 'it' : 'them'}. A job registered by an upgrade is only scheduled by Settings > System > Scheduler > Save & Apply.`)
+    lines.push(`UNSCHEDULED: ${report.scheduler.unscheduled.join(', ')} ${report.scheduler.unscheduled.length === 1 ? 'is' : 'are'} enabled but ${report.scheduler.unscheduled.length === 1 ? 'has' : 'have'} no active entry in the managed crontab that the scheduler would write, so nothing may be calling ${report.scheduler.unscheduled.length === 1 ? 'it' : 'them'}. A job registered by an upgrade is only scheduled by Settings > System > Scheduler > Save & Apply.`)
+  }
+  if (report.scheduler.disabled.length > 0) {
+    lines.push(`DISABLED: ${report.scheduler.disabled.join(', ')} ${report.scheduler.disabled.length === 1 ? 'is' : 'are'} switched off, and this report depends on ${report.scheduler.disabled.length === 1 ? 'it' : 'them'} to raise or schedule an alarm. Switch ${report.scheduler.disabled.length === 1 ? 'it' : 'them'} on in Settings > System > Scheduler.`)
   }
   lines.push('A stale or never-succeeded feed means the data IMS holds from that source may be old. It does not show that any record is wrong.')
   return lines.join('\n')
@@ -268,6 +298,8 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
   const wantedKeys = new Set<string>(['wc_sync_enabled'])
   const alarmJob = jobs.find((candidate) => candidate.slug === READ_SYNC_ALARM_CRON_SLUG)
   if (alarmJob) wantedKeys.add(`cron_${alarmJob.settingKey}_enabled`)
+  const watchdogJobForKeys = jobs.find((candidate) => candidate.slug === 'wms-watchdog')
+  if (watchdogJobForKeys) wantedKeys.add(`cron_${watchdogJobForKeys.settingKey}_enabled`)
   for (const def of READ_SYNC_STREAMS) {
     if (def.source.kind === 'setting') wantedKeys.add(def.source.key)
     const job = def.cronSlug ? jobs.find((candidate) => candidate.slug === def.cronSlug) : undefined
@@ -294,6 +326,15 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
       : false
   }
 
+  const watchdogJob = jobs.find((candidate) => candidate.slug === STOCK_SYNC_WATCHDOG_CRON_SLUG)
+  cronEnabled[STOCK_SYNC_WATCHDOG_CRON_SLUG] = watchdogJob
+    ? resolveCronEnablement({
+        canonical: settings.get(`cron_${watchdogJob.settingKey}_enabled`),
+        legacy: undefined,
+        hasLegacyKey: false,
+        defaultEnabled: watchdogJob.defaultEnabled,
+      })
+    : false
   cronEnabled[READ_SYNC_ALARM_CRON_SLUG] = alarmJob
     ? resolveCronEnablement({
         canonical: settings.get(`cron_${alarmJob.settingKey}_enabled`),
@@ -311,6 +352,18 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
   // Under tsx a CommonJS-interop load exposes the exports on `default`; the bundled server has them named.
   const readOwnCrontabResult = reconcileModule.readOwnCrontabResult ?? reconcileModule.default!.readOwnCrontabResult
   const crontab = await readOwnCrontabResult()
+
+  const cronJobDefs = jobs.map((job) => ({
+    slug: job.slug, settingKey: job.settingKey, label: job.label,
+    defaultSchedule: job.defaultSchedule, defaultEnabled: job.defaultEnabled, legacyEnabledKey: job.legacyEnabledKey,
+  }))
+  const scheduleRows = await db.setting.findMany({
+    where: { key: { in: jobs.map((job) => `cron_${job.settingKey}_schedule`) } },
+    select: { key: true, value: true },
+  })
+  const scheduleByKey = new Map(scheduleRows.map((row) => [row.key, row.value]))
+  const cronSchedules: Record<string, string | undefined> = {}
+  for (const job of jobs) cronSchedules[job.slug] = scheduleByKey.get(`cron_${job.settingKey}_schedule`)
 
   const state = await getIntegrationPluginState()
   const pluginEnabled = {
@@ -343,6 +396,8 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
       lastStockSyncSuccessAt: binding.lastStockSyncSuccessAt,
     })),
     lastDispatchSuccessAt: lastDispatch?.finishedAt ?? null,
+    cronJobDefs,
+    cronSchedules,
     crontab: crontab.resolved ? { resolved: true, text: crontab.text } : { resolved: false, reason: crontab.reason },
   }
 }

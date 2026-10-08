@@ -34,7 +34,7 @@ const ago = (ms: number) => new Date(NOW.getTime() - ms)
 class Harness {
   settings = new Map<string, string>()
   delivered: Array<{ title: string; message: string; actionUrl: string }> = []
-  warnings: Array<{ stream: ReadSyncStreamId; description: string }> = []
+  warnings: Array<{ stream: ReadSyncStreamId | 'scheduler'; description: string }> = []
   failDelivery = false
   failActivityWrite = false
   /** Called inside the claim transaction after the claim won and before delivery: lets a test interleave a rival run. */

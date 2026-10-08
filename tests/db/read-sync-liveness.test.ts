@@ -135,3 +135,19 @@ test('the alarm fires against real tables: stamp and notification commit togethe
   assert.equal(await db.setting.findUnique({ where: { key: readSyncAlertedSettingKey('xero-tax-rates') } }), null)
   await db.$disconnect()
 })
+
+test('the order-status sweep\'s unresolved-snapshot filters are valid against the real schema', { skip }, async () => {
+  const db = await getDb()
+  const { UNRESOLVED_SNAPSHOT_WHERE } = await import('../../lib/domain/wms/order-status-sweep')
+  const snapshots = await db.wmsOrderStatusSnapshot.count({ where: UNRESOLVED_SNAPSHOT_WHERE })
+  const orders = await db.salesOrder.count({
+    where: {
+      status: { notIn: ['COMPLETED', 'DELIVERED', 'CANCELLED'] },
+      shoppingLinks: { some: { externalOrderNumber: { not: null } } },
+      wmsOrderStatus: { is: UNRESOLVED_SNAPSHOT_WHERE },
+    },
+  })
+  console.log(`precondition: the sweep's selection and stamp-guard queries ran on the real schema (snapshots=${snapshots}, orders=${orders})`)
+  assert.ok(Number.isInteger(snapshots) && Number.isInteger(orders))
+  await db.$disconnect()
+})
