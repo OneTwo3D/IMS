@@ -189,3 +189,60 @@ test('FIXTURES: the set covers each shape the rehearsal claims (statuses, refund
   // ids are unique
   assert.equal(new Set(all.map((o) => o.id)).size, all.length)
 })
+
+// ---------------------------------------------------------------------------------------------
+// The connector's own read path against the fake: the seam the rehearsal depends on, and the proof
+// that the import path needs no write grant.
+// ---------------------------------------------------------------------------------------------
+
+import { wcFetch, wcPost } from '@/lib/connectors/woocommerce/api'
+
+async function withEnv<T>(env: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const saved: Record<string, string | undefined> = {}
+  for (const key of Object.keys(env)) {
+    saved[key] = process.env[key]
+    if (env[key] === undefined) delete process.env[key]
+    else process.env[key] = env[key]
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const key of Object.keys(env)) {
+      if (saved[key] === undefined) delete process.env[key]
+      else process.env[key] = saved[key]
+    }
+  }
+}
+
+const NO_GRANTS = { WC_WRITEBACK_ALLOWED_ORIGIN: undefined, MINTSOFT_WRITE_ALLOWED: undefined, XERO_WRITE_ALLOWED_TENANT: undefined }
+
+test('wcFetch reads from a loopback store only under E2E_TEST_MODE=1 and a non-production NODE_ENV; wcPost to it is held with NO grant and nothing reaches the store', async () => {
+  const fake = await startFakeWooCommerce({ orders: [order(1, 'processing', 1), order(2, 'completed', 2)], key: KEY, secret: SECRET })
+  const creds = { url: fake.url, key: KEY, secret: SECRET }
+  try {
+    // The control: with the allowance, the real connector read path gets the order list.
+    const ok = await withEnv({ E2E_TEST_MODE: '1', NODE_ENV: 'test', ...NO_GRANTS }, () => wcFetch('/orders', { status: 'processing', per_page: '100', page: '1' }, creds))
+    console.log(`precondition: wcFetch error=${ok.error ?? 'none'} rows=${Array.isArray(ok.data) ? ok.data.length : 'n/a'} totalItems=${ok.totalItems}`)
+    assert.equal(ok.error, undefined)
+    assert.equal((ok.data as Array<{ id: number }>).map((o) => o.id).join(','), '1')
+    assert.equal(ok.totalItems, 1)
+    assert.equal(fake.requests.at(-1)!.authenticated, true, 'the connector sent the store credentials')
+
+    // Without E2E_TEST_MODE, or in production, the loopback http store is refused: the allowance opens nothing by default.
+    const before = fake.requests.length
+    const off = await withEnv({ E2E_TEST_MODE: undefined, NODE_ENV: 'test', ...NO_GRANTS }, () => wcFetch('/orders', {}, creds))
+    const prod = await withEnv({ E2E_TEST_MODE: '1', NODE_ENV: 'production', ...NO_GRANTS }, () => wcFetch('/orders', {}, creds))
+    assert.match(off.error ?? '', /https|loopback|localhost/i)
+    assert.match(prod.error ?? '', /https|loopback|localhost/i)
+    assert.equal(fake.requests.length, before, 'neither refused call reached the store')
+
+    // The write path: no grant exists, so the write is held in-process; the store sees nothing.
+    const post = await withEnv({ E2E_TEST_MODE: '1', NODE_ENV: 'test', ...NO_GRANTS }, () => wcPost('/webhooks', { name: 'x' }, creds))
+    console.log(`control: wcPost held=${String(post.held)} error=${(post.error ?? '').slice(0, 80)}`)
+    assert.ok(post.held === true || post.error, 'the write did not succeed')
+    assert.equal(fake.writeViolations().length, 0, 'no write reached the store')
+    assert.equal(fake.requests.length, before, 'and no request of any kind was sent for it')
+  } finally {
+    await fake.close()
+  }
+})
