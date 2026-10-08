@@ -574,6 +574,7 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{} are NOT accounting documents', verdict: 'DESCRIPTION', why: 'states what the listed items are' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'IMS could not establish whether credit note', verdict: 'DESCRIPTION', why: 'states why IMS refused' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'Credit note {} is already in the ledger as', verdict: 'DESCRIPTION', why: 'states a ledger fact' },
+  { file: 'lib/domain/sales/refund-manual-resolution.ts', prefix: 'To clear it: open Sync → Exceptions', verdict: 'CHECKS_FIRST', why: 'directs to the IMS inbox action "Record manually", which posts the credit note through the queue (idempotent, claim-aware); the operator posts nothing by hand. Kept unwrapped because the WMS connector-boundary guard must evaluate this constant statically' },
 ]
 
 test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by construction or declared per sentence (verdict + justification), exactly (shrink-only)', () => {

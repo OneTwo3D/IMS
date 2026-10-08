@@ -1,4 +1,3 @@
-import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 /**
  * o3d-w00 (Codex r1 #3): the completion path for a refund that was QUARANTINED because IMS could not
  * determine, on its own, how to record it.
@@ -29,10 +28,10 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
  * thing an operator will be following.
  */
 export const REFUND_PARK_MANUAL_RESOLUTION_HINT =
-  withLedgerCheck('To clear it: open Sync → Exceptions, find this row and use "Record manually" — allocate the refunded ' +
+  'To clear it: open Sync → Exceptions, find this row and use "Record manually" — allocate the refunded ' +
   'amount across the order lines (and the shipping charge) it actually covers, entering GROSS ' +
   '(tax-inclusive) amounts that add up to the refund the storefront made. Each is converted to net at ' +
   'the VAT rate its credit will be posted at. You will need the storefront refund breakdown to do that: ' +
   'which items, which shipping, and which tax rates the refunded amount covered. That raises the IMS ' +
   'credit note against those parts of the order and resolves this row. Retry cannot clear it — retrying ' +
-  're-runs the same conversion against the same order.')
+  're-runs the same conversion against the same order.'
