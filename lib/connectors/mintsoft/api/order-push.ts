@@ -1,3 +1,4 @@
+import { isOutboundMaybeSentRefusalText, isOutboundWriteHeldText, outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import type {
   WmsOrderCancelResult,
   WmsOrderPushInput,
@@ -196,7 +197,51 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     : input.courierService ? { kind: 'name' }
     : defaultId != null ? { kind: 'defaultId', courierServiceId: defaultId }
     : { kind: 'name' }
-  let created = await createOrder(buildPushPayload(input, initialCourier))
+  // A create refused on a REDIRECT HOP (the outbound-write hold) has ALREADY been sent: the first
+  // request may have created the order. It must not be answered by a blind second PUT. It goes down the
+  // maybe-sent path instead: look the order up (a scoped READ) and bind it ONLY if it is provably this
+  // order (below). If it cannot be proven the error is re-thrown unchanged (an attempt is spent, as for a
+  // timeout, and the link parks AMBIGUOUS_CREATE for an operator).
+  // Whether ANY create request in this push has been handed to the WMS. A hold that arrives on a LATER
+  // request (the courier-fallback PUT) after an earlier one was sent is not "nothing sent": the earlier
+  // PUT may have created the order. Its text is converted so nothing downstream reads it as a hold.
+  let anyCreateSent = false
+  const createOrReconcile = async (payload: Record<string, unknown>) => {
+    try {
+      const result = await createOrder(payload)
+      anyCreateSent = true
+      return result
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      if (isOutboundWriteHeldText(text)) {
+        // A hop-0 hold: THIS request sent nothing. Only if an earlier one did is it maybe-sent overall.
+        if (anyCreateSent) throw new Error(outboundTextAfterEarlierSend(text, 'Mintsoft'))
+        throw error
+      }
+      anyCreateSent = true // any other failure of a create may have reached the WMS
+      if (!isOutboundMaybeSentRefusalText(text)) throw error
+      // A failed RECONCILIATION never replaces the maybe-sent outcome: if this lookup itself throws (a held
+      // login, a transport fault, a malformed body) the ORIGINAL maybe-sent error is what the caller sees.
+      // Otherwise a held lookup would surface as a pre-send hold and clear the create dispatch stamp over a
+      // PUT that may have created the order.
+      const existing = await findExistingByReference(input, clientId).catch(() => 'lookup-failed' as const)
+      if (existing === 'lookup-failed') throw error
+      // PROVABLY OURS OR NOT AT ALL. The scoped search matches the order number OR the external reference,
+      // so a single hit can be ANOTHER order of ours that shares a number. Only a row carrying THIS order's
+      // stable external reference (and the ClientId the search already asserts) may be bound; anything else
+      // leaves the create unresolved (the maybe-sent error is re-thrown, an attempt is spent, the link
+      // parks AMBIGUOUS_CREATE for an operator).
+      const existingId = existing
+        && input.externalReference != null && input.externalReference !== ''
+        && toStr(existing.ExternalOrderReference) === input.externalReference
+        ? toStr(existing.ID ?? existing.Id ?? existing.id)
+        : null
+      if (!existing || !existingId) throw error
+      // Bound as a MINTED-BUT-UNVERIFIED id (PENDING_VERIFY): the scoped verification read still runs.
+      return { ok: true, data: { Success: true, OrderId: existingId, OrderNumber: toStr(existing.OrderNumber) } as RawOrder, message: null }
+    }
+  }
+  let created = await createOrReconcile(buildPushPayload(input, initialCourier))
 
   // Courier the WMS couldn't resolve → retry with the configured default id
   // (unless we already used it). Mintsoft requires a resolvable courier. A default id
@@ -208,7 +253,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     && defaultId != null && initialCourier.kind !== 'defaultId'
   ) {
     courierFallback = true
-    created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
+    created = await createOrReconcile(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
   }
 
   // A create that unambiguously succeeded binds the id Mintsoft minted for it —
@@ -239,7 +284,12 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // the branch that binds our link to a pre-existing order chosen by a collidable
   // number, so the ClientId scope + per-row assertion inside are essential.
   if (created.message && /already exists/i.test(created.message)) {
-    const existing = await findExistingByReference(input, clientId)
+    // This lookup follows a create that WAS sent (the PUT answered "already exists"). A hold on the lookup
+    // is therefore not "nothing sent": re-word it so no queue reads it as a hold that clears the stamp.
+    const existing = await findExistingByReference(input, clientId).catch((error: unknown) => {
+      const text = error instanceof Error ? error.message : String(error)
+      throw isOutboundWriteHeldText(text) ? new Error(outboundTextAfterEarlierSend(text, 'Mintsoft')) : error
+    })
     const externalOrderId = existing ? toStr(existing.ID ?? existing.Id ?? existing.id) : null
     if (existing && externalOrderId) {
       return {

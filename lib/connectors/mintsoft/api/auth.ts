@@ -154,6 +154,7 @@ async function requestMintsoftAuthSession(
   baseUrl: string,
   username: string,
   password: string,
+  clientId: string,
 ): Promise<{ token: string; expiresAt: Date }> {
   const response = await connectorFetch(buildMintsoftRequestUrl('/api/Auth', baseUrl), {
     method: 'POST',
@@ -166,6 +167,9 @@ async function requestMintsoftAuthSession(
   }, {
     connectorName: 'Mintsoft',
     allowE2eLocalHttp: true,
+    // Key minting is held like every other Mintsoft write, and is bound to the granted ClientId: the
+    // ClientId this installation is configured with must equal the one the grant names.
+    outboundWriteContext: { writeScopeId: clientId },
   })
 
   const bodyText = await response.text()
@@ -202,7 +206,8 @@ export async function testMintsoftConnectionSettings(
   username: string,
   password: string,
 ): Promise<{ expiresAt: Date }> {
-  const session = await requestMintsoftAuthSession(baseUrl, username, password)
+  const configuredClientId = (await getMintsoftApiConfiguration()).clientId ?? ''
+  const session = await requestMintsoftAuthSession(baseUrl, username, password, configuredClientId)
   return { expiresAt: session.expiresAt }
 }
 
@@ -258,7 +263,23 @@ export async function getMintsoftConnectionRecord() {
   })
 }
 
-export async function getMintsoftApiConfiguration() {
+export type MintsoftApiConfiguration = {
+  baseUrl: string
+  authMode: MintsoftAuthMode
+  staticApiKey: string
+  username: string
+  password: string
+  webhookSecret: string
+  /**
+   * The configured ClientId, handed to the outbound-write hold so it can compare it with the granted
+   * one. Optional on purpose: absent or blank means "not established", which the hold treats as a
+   * refusal for any write, never as permission.
+   */
+  clientId?: string
+  orderLookupConnector: string | null
+}
+
+export async function getMintsoftApiConfiguration(): Promise<MintsoftApiConfiguration> {
   const [connection, settings] = await Promise.all([
     getMintsoftConnectionRecord(),
     getMintsoftSettings(),
@@ -277,6 +298,7 @@ export async function getMintsoftApiConfiguration() {
     username: settings.mintsoft_username.trim(),
     password: settings.mintsoft_password.trim(),
     webhookSecret: settings.mintsoft_webhook_secret.trim(),
+    clientId: (settings.mintsoft_client_id ?? '').trim(),
     orderLookupConnector: connection?.orderLookupConnector ?? null,
   }
 }
@@ -373,7 +395,7 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
       // enough: if the lease lapsed, a mode transition may already be running,
       // and this request would rotate the key out from under it.
       await assertHeld()
-      const session = await requestMintsoftAuthSession(modeNow.baseUrl, modeNow.username, modeNow.password)
+      const session = await requestMintsoftAuthSession(modeNow.baseUrl, modeNow.username, modeNow.password, modeNow.clientId ?? '')
       await persistMintsoftAuthSession(session.token, session.expiresAt)
       return session.token
     })

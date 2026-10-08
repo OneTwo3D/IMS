@@ -32,6 +32,7 @@
     "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",
     "preflight:production": "tsx scripts/preflight-production.ts",
     "invariant-check:preflight": "tsx scripts/invariant-check-preflight.ts",
+    "outbound:status": "tsx scripts/outbound-status.ts",
     "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",
     "inventory:snapshots:backfill": "tsx scripts/backfill-inventory-snapshots.ts",
     "wc:coupon-discount:backfill": "tsx scripts/backfill-wc-coupon-order-discount.ts",

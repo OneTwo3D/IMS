@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto'
+import { guardedExternalFetch } from '../lib/security/guarded-external-fetch'
 import { execFileSync } from 'node:child_process'
 import { expect, test } from '@playwright/test'
 import type { Page } from '@playwright/test'
@@ -92,14 +93,14 @@ async function wcRequest(
   if (!wcUrl || !wcKey || !wcSecret) throw new Error('WooCommerce credentials are not configured in settings')
 
   const auth = Buffer.from(`${wcKey}:${wcSecret}`).toString('base64')
-  const res = await fetch(`${wcUrl.replace(/\/$/, '')}/wp-json/wc/v3${path}`, {
+  const res = await guardedExternalFetch(`${wcUrl.replace(/\/$/, '')}/wp-json/wc/v3${path}`, {
     ...init,
     headers: {
       Authorization: `Basic ${auth}`,
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
     },
-  })
+  }, { connectorName: 'WooCommerce' })
 
   const text = await res.text()
   if (!res.ok) {

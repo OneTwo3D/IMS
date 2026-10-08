@@ -1,3 +1,4 @@
+import { grantXeroWrites } from '../helpers/outbound-grants'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -154,8 +155,11 @@ mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
     getGrantedScopes: async () => null,
     getStoredTenantBlockReason: async () => null,
-    getAccessToken: async () =>
-      state.authTenantId === null ? null : { accessToken: 'access-token', tenantId: state.authTenantId },
+    getAccessToken: async () => {
+      if (state.authTenantId === null) return null
+      grantXeroWrites(state.authTenantId)
+      return { accessToken: 'access-token', tenantId: state.authTenantId }
+    },
   },
 })
 // The wire. Anything reaching here was SENT.

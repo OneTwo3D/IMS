@@ -43,6 +43,7 @@ import { createInterface } from 'node:readline'
 import { createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { Client } from 'pg'
+import { guardedExternalFetch } from '@/lib/security/guarded-external-fetch'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
@@ -266,16 +267,21 @@ async function xero<T>(token: Token, method: 'GET' | 'POST' | 'DELETE', path: st
   if (wait > 0) await sleep(wait)
   callCount++; lastCallAt = Date.now()
 
-  const res = await fetch(`${XERO_API_BASE}/${path}`, {
+  const requestUrl = `${XERO_API_BASE}/${path}`
+  const requestHeaders = {
+    'Authorization': `Bearer ${token.accessToken}`,
+    'Xero-Tenant-Id': token.tenantId,
+    'Accept': 'application/json',
+    ...(body ? { 'Content-Type': 'application/json' } : {}),
+  }
+  // THE OUTBOUND-WRITE HOLD applies to this script like any other IMS process, on EVERY hop: a POST or DELETE
+  // is sent only if XERO_WRITE_ALLOWED_TENANT in THIS process's environment names the tenant being written to,
+  // and a redirect cannot carry it to another origin (redirects are followed by hand, each re-checked).
+  const res = await guardedExternalFetch(requestUrl, {
     method,
-    headers: {
-      'Authorization': `Bearer ${token.accessToken}`,
-      'Xero-Tenant-Id': token.tenantId,
-      'Accept': 'application/json',
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
+    headers: requestHeaders,
     ...(body ? { body: JSON.stringify(body) } : {}),
-  })
+  }, { connectorName: 'Xero' })
 
   if (res.status === 429) {
     const retryAfter = Number(res.headers.get('Retry-After') ?? '0')

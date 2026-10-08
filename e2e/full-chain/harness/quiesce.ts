@@ -52,6 +52,7 @@
  * recovered immediately rather than after the TTL.
  */
 import { randomUUID } from 'node:crypto'
+import { guardedExternalFetch } from '../../../lib/security/guarded-external-fetch'
 import { readFileSync } from 'node:fs'
 import { hostname } from 'node:os'
 
@@ -637,10 +638,10 @@ async function wcRequest<T>(
   init?: RequestInit,
 ): Promise<T> {
   const auth = Buffer.from(`${c.key}:${c.secret}`).toString('base64')
-  const res = await fetch(`${c.url}/wp-json/wc/v3${path}`, {
+  const res = await guardedExternalFetch(`${c.url}/wp-json/wc/v3${path}`, {
     ...init,
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
-  })
+  }, { connectorName: 'WooCommerce' })
   const text = await res.text()
   if (!res.ok) throw new Error(`WC ${init?.method ?? 'GET'} ${path} -> ${res.status} ${res.statusText}: ${text.slice(0, 300)}`)
   return JSON.parse(text) as T

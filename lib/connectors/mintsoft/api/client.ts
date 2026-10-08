@@ -8,7 +8,10 @@ import {
 } from './asn-creation-rule'
 import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
-import { connectorFetch } from '@/lib/security/connector-fetch'
+import { classifyMintsoftRequest } from './read-allowlist'
+import * as connectorTransport from '@/lib/security/connector-fetch'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
+import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
   extractMintsoftArrayPayload,
@@ -25,6 +28,16 @@ export type MintsoftRequestResult<T> = {
   data: T | null
   error?: string
   status: number
+  /**
+   * Redirect hops followed to produce this response; null when unknown. A response that followed a redirect
+   * proves nothing about the ORIGINAL request, so it is never used as proof that a request was not processed.
+   */
+  redirectsFollowed?: number | null
+  /**
+   * True when the outbound-write hold refused the request before it left IMS (error carries the hold's
+   * text). Mintsoft did not see it, so it is neither a Mintsoft rejection nor a network fault.
+   */
+  held?: true
 }
 
 function buildMintsoftRequestUrl(path: string, baseUrl: string): URL {
@@ -52,8 +65,9 @@ async function sendMintsoftRequest<T>(
   baseUrl: string,
   apiKey: string,
   init: RequestInit | undefined,
+  clientId: string,
 ): Promise<MintsoftRequestResult<T>> {
-  const response = await connectorFetch(buildMintsoftRequestUrl(path, baseUrl), {
+  const response = await connectorTransport.connectorFetch(buildMintsoftRequestUrl(path, baseUrl), {
     ...init,
     headers: {
       ...buildMintsoftRequestHeaders(baseUrl, init),
@@ -63,13 +77,21 @@ async function sendMintsoftRequest<T>(
   }, {
     connectorName: 'Mintsoft',
     allowE2eLocalHttp: true,
+    outboundWriteContext: { writeScopeId: clientId },
   })
+
+  // Hop provenance, or null when the transport does not provide it (a stand-in transport, a response that did not
+  // come from connectorFetch): unknown is treated as NOT proof (see mintsoftRequest).
+  const redirectsFollowed = typeof connectorTransport.connectorFetchRedirectsFollowed === 'function'
+    ? connectorTransport.connectorFetchRedirectsFollowed(response)
+    : null
 
   if (!response.ok) {
     return {
       data: null,
       error: `Mintsoft request failed with status ${response.status}`,
       status: response.status,
+      redirectsFollowed,
     }
   }
 
@@ -77,12 +99,14 @@ async function sendMintsoftRequest<T>(
     return {
       data: null,
       status: response.status,
+      redirectsFollowed,
     }
   }
 
   return {
     data: (await response.json()) as T,
     status: response.status,
+    redirectsFollowed,
   }
 }
 
@@ -99,12 +123,27 @@ export async function mintsoftRequest<T>(
     }
   }
 
+  // Set when a 401 was seen that does NOT prove the request unprocessed (see below).
+  let earlierResponseUnproven = false
   try {
     const apiKey = await getMintsoftAccessToken()
-    const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init)
+    const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init, config.clientId ?? '')
+    // ONLY AN HTTP 401 REACHES THE REFRESH STEP. A 401 is treated as proof the request was NOT processed only
+    // under the settled rule below; every other outcome (403, 404, 409, 422, 5xx, a timeout, a transport error)
+    // proves nothing, is returned as an ordinary failure, and never reaches the refresh step.
+    //
+    // THE RULE: a 401 is proof of non-processing ONLY if it came straight back from the ORIGINAL request with
+    // ZERO redirect hops followed (Mintsoft refuses an unauthenticated request before its handler runs, so a
+    // create that drew that 401 created nothing). A 401 after a followed redirect, or with an unknown hop count,
+    // may have come from a later hop after an earlier one processed the request, so it is NOT proof.
+    //
+    // RESIDUAL, accepted by the owner's rule as an inter-system limit: a gateway or proxy in front of Mintsoft
+    // that answers 401 AFTER the origin processed the request cannot be told apart from Mintsoft itself.
+    const provenUnprocessed = firstAttempt.status === 401 && firstAttempt.redirectsFollowed === 0
     if (firstAttempt.status !== 401) {
       return firstAttempt
     }
+    earlierResponseUnproven = !provenUnprocessed
 
     // o3d-092: in fixed-key mode a 401 means the operator's key is wrong or was
     // rotated out from under us by something else. There is nothing to refresh
@@ -122,10 +161,36 @@ export async function mintsoftRequest<T>(
       }
     }
 
+    // AN UNPROVEN 401 ON A MUTATING REQUEST IS NEVER REFRESHED-AND-REPLAYED. If the 401 came after a followed
+    // redirect (or with an unknown hop count) the original request may already have taken effect at an earlier
+    // hop; replaying the same PUT/POST could duplicate it. Stop and report a maybe-sent outcome so the caller
+    // parks/reconciles. A proven zero-hop 401 (nothing processed) may refresh and replay, and a READ (the
+    // allow-list) may always refresh and replay, since repeating a read cannot duplicate anything.
+    if (earlierResponseUnproven && classifyMintsoftRequest(init?.method ?? 'GET', path.split('?')[0] ?? path).class === 'write') {
+      return {
+        data: null,
+        error: outboundTextAfterEarlierSend(
+          'refusal (Mintsoft): the response was a 401 that came after a followed redirect or with unknown provenance, so it does not prove the request was not processed; IMS did not refresh the key and replay it.',
+          'Mintsoft',
+        ),
+        status: 500,
+      }
+    }
+
     await invalidateMintsoftAccessToken()
     const refreshedApiKey = await getMintsoftAccessToken({ forceRefresh: true })
-    return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init)
+    return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init, config.clientId ?? '')
   } catch (error) {
+    if (isOutboundWriteHeldError(error) && error.nothingSent && earlierResponseUnproven) {
+      // A hold on the key refresh that followed a 401 which is NOT proof of non-processing (it came after a
+      // followed redirect, or its hop count is unknown): the original request may have taken effect.
+      return { data: null, error: outboundTextAfterEarlierSend(error.message, 'Mintsoft'), status: 500 }
+    }
+    if (isOutboundWriteHeldError(error)) {
+      return error.nothingSent
+        ? { data: null, error: error.message, status: 500, held: true }
+        : { data: null, error: error.message, status: 500 }
+    }
     return {
       data: null,
       error: error instanceof Error ? error.message : 'Mintsoft request failed',

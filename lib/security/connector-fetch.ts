@@ -11,6 +11,8 @@ import {
   validateExternalResolvedAddress,
 } from './external-url-safety'
 import { parsePositiveIntegerEnv } from '@/lib/env'
+import { OutboundWriteHeldError, outboundWriteRefusal } from './outbound-write-grant'
+import { recordOutboundWriteRefusal } from './outbound-write-refusal-log'
 
 export type ConnectorDnsLookup = (hostname: string) => Promise<LookupAddress[]>
 
@@ -19,9 +21,28 @@ export type ConnectorFetchOptions = Pick<
   'connectorName' | 'allowE2eLocalHttp' | 'privateIpAllowlist' | 'env'
 > & {
   lookup?: ConnectorDnsLookup
+  /**
+   * Facts the outbound-write hold needs that the request itself does not carry. A connector whose writes
+   * are scoped by an account-like id (a 3PL client id) passes the id it is configured with so the hold can
+   * compare it with the granted one. Absent means "not established", which the hold treats as a refusal
+   * for any scoped write except the one that mints credentials.
+   */
+  outboundWriteContext?: { writeScopeId?: string | number | null }
 }
 
 const MAX_REDIRECTS = 5
+
+/**
+ * How many redirect hops were FOLLOWED to produce a response returned by connectorFetch. A caller that wants to
+ * reason about what an early response proves (a 401 on the ORIGINAL request vs a 401 from a later hop) reads it
+ * with {@link connectorFetchRedirectsFollowed}. Kept off the Response object itself so the type is unchanged.
+ */
+const redirectsFollowedByResponse = new WeakMap<Response, number>()
+
+/** Redirect hops followed for `response`, or null when it did not come from connectorFetch (unknown). */
+export function connectorFetchRedirectsFollowed(response: Response): number | null {
+  return redirectsFollowedByResponse.get(response) ?? null
+}
 export const DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS = 30_000
 export const DEFAULT_CONNECTOR_FETCH_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
@@ -384,18 +405,44 @@ export async function connectorFetch(
   let url = input instanceof URL ? input : new URL(input)
   let method = init.method ?? 'GET'
   let headers = headersFromInit(init.headers)
+  // The transport NEVER modifies a request body: what the caller built (and may have signed) is what is sent.
   let body = bodyFromInit(init.body)
   const timeoutMs = getConnectorFetchTimeoutMs(options)
   const abortSignal = createConnectorAbortSignal(init.signal, timeoutMs, options.connectorName)
+  // Only when the e2e loopback allowance applies to the FIRST hop: the origin a redirect must stay on.
+  const firstHopLoopbackOrigin = allowsE2eLocalHttp(url, options) ? url.origin : undefined
 
   try {
     // One wall-clock timeout budget covers connection, response, and all
     // redirect hops. Caller-supplied cancellation is composed with that budget
     // so it cannot accidentally disable the connector safety net.
     for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+      // THE OUTBOUND-WRITE HOLD (lib/security/outbound-write-grant.ts). Evaluated for THIS hop's method,
+      // URL, headers and body, on every pass of the loop, and it is the last decision before the request
+      // is sent: nothing is awaited between it and `sendConnectorRequest`, so what it judged is what
+      // leaves. A permission checked once before the loop would be spent on a different request after a
+      // redirect. Synchronous and pure; only the refusal path awaits (to record it).
+      const heldRefusal = outboundWriteRefusal({
+        connectorName: options.connectorName,
+        method,
+        url,
+        headers,
+        body,
+        writeScopeId: options.outboundWriteContext?.writeScopeId,
+        pinnedOrigin: firstHopLoopbackOrigin,
+        env: options.env,
+      })
+      if (heldRefusal) {
+        const held = new OutboundWriteHeldError(heldRefusal, redirectCount)
+        await recordOutboundWriteRefusal(held)
+        throw held
+      }
       const response = await sendConnectorRequest(url, method, headers, body, abortSignal.signal, options)
       const nextUrl = redirectLocation(response, url)
-      if (!nextUrl) return response
+      if (!nextUrl) {
+        redirectsFollowedByResponse.set(response, redirectCount)
+        return response
+      }
       if (redirectCount === MAX_REDIRECTS) {
         throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
       }

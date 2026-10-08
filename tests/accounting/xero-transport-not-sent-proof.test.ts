@@ -1,3 +1,4 @@
+import { grantXeroWrites, setOutboundGrant } from '../helpers/outbound-grants'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
@@ -39,6 +40,8 @@ import {
 
 let auth: { accessToken: string; tenantId: string } | null = { accessToken: 'tok', tenantId: 'tenant-1' }
 let intentRefusal: string | null = null
+/** When true the installation has declared NO Xero tenant: the outbound-write hold must refuse the post. */
+let suppressGrant = false
 let egressRefusal: string | null = null
 /**
  * ...AND THE OTHER WAY EACH OF THEM CAN LEAVE (o3d-2w2j r2, Codex HIGH).
@@ -61,6 +64,9 @@ mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
     getAccessToken: async () => {
       if (authThrows) throw authThrows
+      // The test's tenant is the tenant the request will carry; declare it, as an installation would.
+      if (suppressGrant) setOutboundGrant('XERO_WRITE_ALLOWED_TENANT', undefined)
+      else if (auth) grantXeroWrites(auth.tenantId)
       return auth
     },
     getStoredTenantBlockReason: async () => null,
@@ -131,6 +137,7 @@ function reset() {
   // let one test's spend decide another's budget verdict.
   auth = { accessToken: 'tok', tenantId: `tenant-${Math.random()}` }
   intentRefusal = null
+  suppressGrant = false
   egressRefusal = null
   authThrows = null
   intentThrows = null
@@ -155,6 +162,9 @@ test('o3d-gvzu: each pre-egress refusal names ITSELF, and each releases the mark
       () => { intentRefusal = 'Xero posting is paused for this organisation' }],
     ['egress authorisation refused', 'egress-unauthorised',
       () => { egressRefusal = 'This connection is not authorised to write' }],
+    // The outbound-write hold: the installation declared no Xero tenant. Refused above the retry loop,
+    // before any budget is spent, so it is provably not sent and releases the marker.
+    ['outbound write held (no grant)', 'outbound-write-held', () => { suppressGrant = true }],
   ]
 
   for (const [name, expected, arrange] of refusals) {
@@ -507,7 +517,9 @@ test('o3d-gvzu: the tag is written at the refusal sites and never inferred downs
   const journals = readFileSync('lib/connectors/xero/journals.ts', 'utf8')
   const processor = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
 
-  // Exactly nine members, so adding a tenth is a deliberate act that has to be argued for. FOUR
+  // Exactly ten members, so adding an eleventh is a deliberate act that has to be argued for (the tenth,
+  // 'outbound-write-held', is the outbound-write hold: a refusal above the retry loop, before any budget
+  // is spent or any request built for the socket). FOUR
   // RETURNS and FIVE THROWS, and the pairing is the argument (o3d-2w2j r2): every pre-request
   // statement that can hand back a refusal can also leave by throwing, and the first round counted
   // only the first kind. Any new member has to name the statement it is written at and say where
@@ -516,7 +528,7 @@ test('o3d-gvzu: the tag is written at the refusal sites and never inferred downs
     .slice(api.indexOf('export type XeroNotSentReason ='), api.indexOf('const XERO_NOT_SENT_REASON'))
     .match(/'[a-z-]+'/g) ?? []
   assert.deepEqual(members, [
-    "'no-connection'", "'posting-intent-refused'", "'egress-unauthorised'", "'rate-budget-refused'",
+    "'no-connection'", "'posting-intent-refused'", "'egress-unauthorised'", "'outbound-write-held'", "'rate-budget-refused'",
     "'connection-unresolvable'", "'request-unbuildable'", "'posting-intent-unavailable'",
     "'rate-budget-unavailable'", "'egress-authorisation-unavailable'",
   ])

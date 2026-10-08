@@ -1,3 +1,4 @@
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -2421,6 +2422,16 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       return { parked: true }
     },
     async recordDispatchError(candidate, reason) {
+      // A held write (outbound-write hold) is not a reconcile failure: nothing is wrong with the order,
+      // this installation has not been granted the storefront. Record the reason, spend no failure, and
+      // never dead-letter for it - however long the hold lasts.
+      if (isOutboundWriteHeldText(reason)) {
+        await db.wmsOrderPushLink.update({
+          where: { id: candidate.linkId },
+          data: { dispatchLastError: reason },
+        })
+        return { deadLettered: false }
+      }
       const link = await db.wmsOrderPushLink.update({
         where: { id: candidate.linkId },
         data: {
