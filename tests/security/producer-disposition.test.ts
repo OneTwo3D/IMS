@@ -421,3 +421,48 @@ test('arm j: an unreadable clock or obligationAt can never pass a time gate (non
   console.log(`# arm j: ${examined} cells examined`)
   assert.equal(examined, FAKE_ANSWERS.length * 2 + 10)
 })
+
+test('arm k: a patched Date.prototype.getTime (installed AFTER import) cannot move the clock, the cut-off or the obligation time', () => {
+  const original = Date.prototype.getTime
+  const op = OPERATION.xero.IMS
+  const env2099 = envFor('xero', 'ok', '2099-01-01T00:00:00Z')
+  const envPast = envFor('xero', 'ok', '2026-01-01T00:00:00Z')
+  const results: string[] = []
+  try {
+    Date.prototype.getTime = function patched(this: Date) { return 4_102_444_800_000 } // 2100-01-01, always finite
+    assert.equal(new Date(NOW).getTime(), 4_102_444_800_000, 'precondition: the patch is in force')
+    const clock = explainProducerDisposition('xero', op as never, LATE, { env: env2099, now: NOW })
+    const obligation = explainProducerDisposition('xero', op as never, new Date('2025-01-01T00:00:00Z'), { env: envPast, now: NOW })
+    const live = explainProducerDisposition('xero', op as never, LATE, { env: envPast, now: NOW })
+    results.push(`clock=${clock.disposition}/${clock.reason}`, `obligation=${obligation.disposition}/${obligation.reason}`, `control=${live.disposition}`)
+    assert.deepEqual([clock.disposition, clock.reason], ['SHADOW', 'before_cutoff'])
+    assert.deepEqual([obligation.disposition, obligation.reason], ['SHADOW', 'obligation_before_cutoff'])
+    assert.equal(live.disposition, 'LIVE', 'isolating arm: the intrinsic still reads real values, so a past cut-off is LIVE')
+  } finally {
+    Date.prototype.getTime = original
+  }
+  console.log(`# arm k: ${results.join(' ')}`)
+  assert.equal(Date.prototype.getTime, original, 'the patch was restored')
+})
+
+test('arm l: only an ABSENT clock defaults to the current time; null, NaN, numbers, strings and objects are SHADOW unreadable', () => {
+  const op = OPERATION.xero.IMS
+  const env = envFor('xero', 'ok', '2020-01-01T00:00:00Z') // far in the past: a real clock would be LIVE
+  const cases: Array<[string, unknown, string, string]> = [
+    ['absent (key missing)', 'ABSENT', 'LIVE', 'live'],
+    ['undefined', undefined, 'LIVE', 'live'],
+    ['null', null, 'SHADOW', 'unreadable'],
+    ['Invalid Date', new Date(NaN), 'SHADOW', 'unreadable'],
+    ['number', 1_800_000_000_000, 'SHADOW', 'unreadable'],
+    ['string', '2026-06-01T12:00:00Z', 'SHADOW', 'unreadable'],
+    ['zero', 0, 'SHADOW', 'unreadable'],
+    ['empty string', '', 'SHADOW', 'unreadable'],
+    ['plain object', {}, 'SHADOW', 'unreadable'],
+  ]
+  for (const [label, now, disposition, reason] of cases) {
+    const context = now === 'ABSENT' ? { env } : { env, now: now as Date }
+    const decision = explainProducerDisposition('xero', op as never, LATE, context)
+    console.log(`# arm l ${label}: ${decision.disposition}/${decision.reason}`)
+    assert.deepEqual([decision.disposition, decision.reason], [disposition, reason], label)
+  }
+})

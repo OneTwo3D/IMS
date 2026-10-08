@@ -2,8 +2,9 @@
  * THE ONE PLACE THE PRODUCER-SIDE HOLD'S WORDS AND NAMES LIVE.
  *
  * The outbound-write hold (outbound-write-hold-constants.ts) refuses a request at the HTTP boundary.
- * The producer-side hold decides, one step earlier, whether a piece of IMS work should be QUEUED FOR
- * DELIVERY at all or only RECORDED AS A SHADOW (what IMS would have written, never delivered). This
+ * The producer-side hold is a decision, to be consulted by producers in later changes, between a unit of IMS
+ * work being LIVE (produced for delivery) and being a SHADOW (what IMS would have written, never delivered).
+ * Nothing consults it yet. This
  * module carries the environment variable names, the formats, the reason texts and the documentation
  * blocks of that decision. lib/security/producer-disposition.ts imports them; docs/installation.md
  * carries marked blocks whose body must equal the text below byte for byte, and

@@ -96,3 +96,32 @@ test('operator text for the unwired producer hold says it is not enforced, claim
   // No text claims outbound:status reports the inconsistency today.
   for (const text of texts) assert.ok(!/outbound:status` (reports|shows|prints)/.test(text))
 })
+
+test('the .env.example comment for the producer-side hold is true today: not enforced, and no present-effect claims', () => {
+  const lines = readFileSync(join(ROOT, '.env.example'), 'utf8').split('\n')
+  const start = lines.findIndex((line) => line.startsWith('# PRODUCER-SIDE HOLD'))
+  assert.ok(start > 0, 'precondition: the comment block exists')
+  let end = start
+  while (end < lines.length && lines[end]!.startsWith('#')) end += 1
+  const block = lines.slice(start, end).map((line) => line.replace(/^#\s?/, '')).join(' ')
+  console.log(`# env.example: ${end - start} comment lines examined`)
+  assert.match(block, /NOT YET ENFORCED/)
+  assert.match(block, /grant alone permits the existing outbound writes/)
+  for (const pattern of [/records shadows/i, /queues nothing/i, /needs BOTH/i, /nothing is delivered/i, /sends nothing/i]) assert.ok(!pattern.test(block), `forbidden claim ${pattern}`)
+  for (const sentence of block.split(/(?<=[.;])\s+/)) {
+    if (/\bwill\b/i.test(sentence)) assert.match(sentence, /later (change|slice)/i, sentence.slice(0, 100))
+  }
+})
+
+test('no source comment or constant outside the docs claims the producer-side hold is enforced today', () => {
+  const files = ['lib/security/producer-disposition.ts', 'lib/security/producer-disposition-constants.ts', 'lib/security/writer-ownership-map.ts']
+  const forbidden = [/\bis the only place that decides whether a unit of IMS work\b[^.]*\bis (queued|produced)\b/i, /decides, one step earlier, whether a piece of IMS work should be queued/i, /it produces LIVE work only/i]
+  let examined = 0
+  for (const file of files) {
+    const text = readFileSync(join(ROOT, file), 'utf8')
+    examined += 1
+    for (const pattern of forbidden) assert.ok(!pattern.test(text), `${file}: ${pattern}`)
+  }
+  console.log(`# source wording: ${examined} files`)
+  assert.equal(examined, 3)
+})

@@ -9,8 +9,8 @@
  *   P1  IMS is built but held: it records shadows; the incumbent writes.
  *   P2  IMS is live for the operations it owns; the others stay with their owner.
  *
- * `producerDisposition` (producer-disposition.ts) is the only reader that decides anything: it produces
- * LIVE work only for an operation whose owner in the installation's phase is IMS. Every other owner,
+ * `producerDisposition` (producer-disposition.ts) is the only reader that decides anything: it returns
+ * LIVE only for an operation whose owner in the installation's phase is IMS. Every other owner,
  * including `unknown`, resolves to SHADOW. `unknown` means exactly that nobody has established the
  * owner yet; it is a decision to be made, not a default, and it can never be LIVE.
  *

@@ -54,10 +54,27 @@ export type ProducerDecision = {
 }
 
 type CutoffRead =
-  | { ok: true; at: Date }
+  | { ok: true; at: Date; ms: number }
   | { ok: false; reason: 'absent' | 'unreadable' }
 
 const ISO_UTC_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?Z$/
+
+/**
+ * INTRINSICS CAPTURED ONCE, AT MODULE LOAD. The decision must not change because other code later patched a
+ * built-in it relies on (Date.prototype.getTime, Number.isFinite, Date.UTC, RegExp.prototype.exec), so none of
+ * them is looked up again at call time.
+ */
+const dateGetTime = Date.prototype.getTime
+const dateUTC = Date.UTC
+const DateCtor = Date
+const NumberCtor = Number
+const numberIsFinite = Number.isFinite
+const regexExec = RegExp.prototype.exec
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31
+}
 
 /**
  * One UTC instant in ISO-8601 with an explicit Z, to at most a millisecond. No lenient Date.parse, and NO trimming:
@@ -67,30 +84,30 @@ const ISO_UTC_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{
  */
 export function parseProducerCutoff(raw: string | undefined): CutoffRead {
   if (raw === undefined || raw === '') return { ok: false, reason: 'absent' }
-  const match = ISO_UTC_RE.exec(raw)
+  const match = regexExec.call(ISO_UTC_RE, raw) as RegExpExecArray | null
   if (!match) return { ok: false, reason: 'unreadable' }
-  const [year, month, day, hour, minute] = [match[1], match[2], match[3], match[4], match[5]].map(Number) as [number, number, number, number, number]
-  const second = match[6] === undefined ? 0 : Number(match[6])
-  const millis = match[7] === undefined ? 0 : Number(match[7].padEnd(3, '0'))
-  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return { ok: false, reason: 'unreadable' }
-  const at = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millis))
-  // A day that does not exist (2026-02-30) rolls over in Date.UTC; reject any roll-over.
-  if (Number.isNaN(at.getTime()) || at.getUTCFullYear() !== year || at.getUTCMonth() !== month - 1 || at.getUTCDate() !== day) {
+  const year = NumberCtor(match[1]), month = NumberCtor(match[2]), day = NumberCtor(match[3])
+  const hour = NumberCtor(match[4]), minute = NumberCtor(match[5])
+  const second = match[6] === undefined ? 0 : NumberCtor(match[6])
+  const millis = match[7] === undefined ? 0 : NumberCtor(match[7]) * 10 ** (3 - match[7].length)
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month) || hour > 23 || minute > 59 || second > 59) {
     return { ok: false, reason: 'unreadable' }
   }
-  return { ok: true, at }
+  const ms = dateUTC(year, month - 1, day, hour, minute, second, millis)
+  if (!numberIsFinite(ms)) return { ok: false, reason: 'unreadable' }
+  return { ok: true, at: new DateCtor(ms), ms }
 }
 
 /**
- * A timestamp as a FINITE epoch-millisecond number, read once, or null. Only a real Date is accepted, and its
- * time value is read through Date.prototype.getTime so that a subclass or an injected object cannot answer
- * with Infinity, undefined, a string or an exception of its own choosing; anything else is unreadable.
+ * A timestamp as a FINITE epoch-millisecond number, read once, or null. The time value is read through the
+ * intrinsic Date.prototype.getTime captured at load, which throws for anything that is not a genuine Date (a
+ * plain object, a Proxy), so a subclass or injected object cannot answer with Infinity, undefined, a string or
+ * an exception of its own choosing; anything unreadable is null.
  */
 function readInstant(value: unknown): number | null {
   try {
-    if (!(value instanceof Date)) return null
-    const ms: unknown = Date.prototype.getTime.call(value)
-    return typeof ms === 'number' && Number.isFinite(ms) ? ms : null
+    const ms: unknown = dateGetTime.call(value)
+    return typeof ms === 'number' && numberIsFinite(ms) ? ms : null
   } catch {
     return null
   }
@@ -110,7 +127,8 @@ function evaluate<D extends OutboundConnector>(
   context: ProducerDecisionContext,
 ): ProducerDecision {
   const env = context.env ?? process.env
-  const now = context.now ?? new Date()
+  // Only an ABSENT clock defaults to the current time. Anything supplied, null included, must be readable.
+  const now: unknown = context.now === undefined ? new DateCtor() : context.now
   const row = ownershipRowFor(destination, operation)
   const unreadableBase = { owner: 'unknown' as WriterOwner, phase: 'P1' as const, cutoff: null, grant: 'unreadable' as const }
   if (!(OUTBOUND_CONNECTORS as readonly string[]).includes(destination)) return shadow('unreadable', unreadableBase)
@@ -128,8 +146,7 @@ function evaluate<D extends OutboundConnector>(
   }
   const nowMs = readInstant(now)
   if (nowMs === null) return shadow('unreadable', { owner: p1Owner, phase: 'P1', cutoff: cutoff.at, grant: 'granted' })
-  const cutoffMs = readInstant(cutoff.at)
-  if (cutoffMs === null) return shadow('unreadable_cutoff', { owner: p1Owner, phase: 'P1', cutoff: null, grant: 'granted' })
+  const cutoffMs = cutoff.ms
   if (nowMs < cutoffMs) return shadow('before_cutoff', { owner: p1Owner, phase: 'P1', cutoff: cutoff.at, grant: 'granted' })
 
   // Phase P2 for this destination from here on.
