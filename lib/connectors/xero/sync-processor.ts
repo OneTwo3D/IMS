@@ -3718,8 +3718,8 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   },
   TAX_RATE_SYNC: {
     effect: 'CREATED or UPDATED a tax rate in Xero',
-    remedy: 'NO ledger document was created and no money moved, but the tax rate is now live and documents posted '
-      + 'after it will use it. Correct or archive the tax rate in Xero if it should not exist.',
+    remedy: withLedgerCheck('NO ledger document was created and no money moved, but the tax rate is now live and documents posted '
+      + 'after it will use it. Correct or archive the tax rate in Xero if it should not exist.'),
   },
 }
 
@@ -7050,8 +7050,8 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
             + `records the credit note ${item.creditNoteId} as ${creditNoteConnector ?? 'no connector'}'s and the bill `
             + `${item.accountingInvoiceId} as ${billConnector ?? 'no connector'}'s, and a Xero allocation may only carry `
             + 'Xero document ids. An accounting document id is kept when the connector selection changes, so it '
-            + 'cannot be assumed to be Xero\'s. The allocation is still OUTSTANDING: allocate the credit to the bill '
-            + 'in the accounting system that holds both, or re-post them so their connector is recorded.',
+            + 'cannot be assumed to be Xero\'s. The allocation is still OUTSTANDING. Locate the existing credit note and bill in the '
+            + 'accounting system and allocate the credit to the bill only in the ledger that holds BOTH documents; do not re-post either document.',
           metadata: {
             supplierCreditNoteId: item.supplierCreditNoteId,
             creditNoteId: item.creditNoteId,

@@ -4524,10 +4524,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         tag: 'accounting',
         level: 'WARNING',
         description:
-          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} is recorded as POSTED in `
+          withLedgerCheck(`Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} is recorded as POSTED in `
           + `IMS but was NOT sent to ${settings.connector ?? 'the accounting connector'}: IMS has no supplier `
           + 'credit-note poster for it. Payables in the ledger do NOT reflect this credit — enter it there by '
-          + 'hand if the ledger should show it.',
+          + 'hand if the ledger should show it.'),
         metadata: { creditNoteId: cn.id, reference: cn.po.reference, chartConnector: settings.connector },
       }).catch(() => { /* the post itself is unaffected */ })
     }

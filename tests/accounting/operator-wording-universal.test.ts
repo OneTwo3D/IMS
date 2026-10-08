@@ -18,7 +18,7 @@ import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/fo
 import { accountingSyncRowPostedAnEarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
 import { dailyBatchAssertedRefusal, dailyBatchUnprovedRefusal } from '@/lib/connectors/xero/daily-sync'
-import { DESCRIPTION, PROHIBITION, instructionSites, remedyCorpus, unsafeInstructionSentences, walkSources } from '../helpers/hand-post-census'
+import { DESCRIPTION, PROHIBITION, IMPERATIVE_FORM, isInstructionSentence, instructionSites, remedyCorpus, unsafeInstructionSentences, walkSources } from '../helpers/hand-post-census'
 import { AFTER_DECLINE_STEP, HAND_POST_INSTRUCTION_PATTERN, HAND_POST_SAFETY, LEDGER_CHECK_FIRST, MARK_REMEDY_TAIL, OTHER_OPERATOR_CLAIM_OUTCOME, claimLogDescription, markLogDescription, markNotice, releaseLogDescription, releaseNotice, withHandPostSafety, withLedgerCheck, LEDGER_CHECK_PREAMBLE, HAND_POST_INSTRUCTION_DOC_BEGIN, HAND_POST_INSTRUCTION_DOC_END, HAND_POST_SETTLEMENT_DOC_BEGIN, HAND_POST_SETTLEMENT_DOC_END, renderHandPostSettlementDoc } from '@/lib/domain/accounting/hand-post-instruction'
 import { REUSED_POSTING_KEY_TYPES } from '@/lib/accounting/posting-key'
 import { GENERIC_HAND_POST_STEP, PAYMENT_POSTING_TYPES, UPDATE_POSTING_TYPES, handPostStepFor, NOT_LOADED_HAND_POST_INPUT, handPostInputOf, renderHandPostInstructionDoc, claimWarningFor, handPostInstruction, handPostOrderFor, markHandledWarningFor, releaseWarningFor } from '@/lib/domain/accounting/hand-post-instruction'
@@ -517,7 +517,7 @@ test('[o3d-1e7sl Codex r16] the sink guard is wired at BOTH sinks every refusing
  *   CHECKS_FIRST   - an instruction that is itself the ledger check, or sits behind the ledger check in the same builder (typed step).
  *   NON_ACCOUNTING - not an accounting posting at all (WMS, WooCommerce settings, scheduler, backup, inventory, BOM).
  */
-type SiteVerdict = 'DESCRIPTION' | 'CHECKS_FIRST' | 'NON_ACCOUNTING'
+type SiteVerdict = 'DESCRIPTION' | 'CHECKS_FIRST' | 'NON_ACCOUNTING' | 'MEMO'
 const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdict; why: string; count?: number }> = [
   { file: 'app/(dashboard)/settings/system/page.tsx', prefix: 'Restart the service after rotating the secret', verdict: 'NON_ACCOUNTING', why: 'scheduler secret rotation, no ledger involved' },
   { file: 'app/(dashboard)/stock-control/stock-counts/stock-counts-client.tsx', prefix: 'Post this stock count?', verdict: 'NON_ACCOUNTING', why: 'inventory stock-count confirmation dialog' },
@@ -530,18 +530,15 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'There is nothing that would stop a re-post.', verdict: 'DESCRIPTION', why: 'states a hazard; the instruction beside it is CHECK XERO first' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'CHECK XERO before re-queueing', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check, before any re-queue' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'NOTHING WAS SENT; the worker that holds the row now will post it.', verdict: 'DESCRIPTION', why: 'states what IMS did' },
-  { file: 'lib/cost-layers.ts', prefix: 'Reverse and repost shipment COGS after cost-layer revaluation', verdict: 'DESCRIPTION', why: 'journal memo text, not an instruction' },
+  { file: 'lib/cost-layers.ts', prefix: 'Reverse and repost shipment COGS after cost-layer revaluation', verdict: 'MEMO', why: 'persisted journal narration, verified to be a narration property; never shown as an operator instruction' },
   { file: 'lib/cost-layers.ts', prefix: 'IMS cannot post a negative shipment COGS', verdict: 'DESCRIPTION', why: 'states a limitation' },
-  { file: 'lib/domain/accounting/invoice-number-ownership.ts', prefix: 'Refusing to post {} as invoice number {}', verdict: 'DESCRIPTION', why: 'states why IMS refused; the remedy sentence is guarded' },
   { file: 'lib/domain/accounting/posting-mark-handled.ts', prefix: 'Check the ledger and settle that row in the accounting sync log first', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check' },
   { file: 'lib/domain/accounting/posting-refusal-copy.ts', prefix: 'IMS does not post this.', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
-  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'Retry refund accounting queues it again', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind', count: 3 },
-  { file: 'lib/domain/accounting/posting-suppression.ts', prefix: 'IMS did NOT post {} for {} {}', verdict: 'DESCRIPTION', why: 'states what IMS did' },
+  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The Retry button on refund accounting queues it again', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind', count: 3 },
   { file: 'lib/domain/accounting/sync-row-settlement.ts', prefix: 'Without it the row records a post that nothing can be reconciled against.', verdict: 'DESCRIPTION', why: 'states a consequence' },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'REMEDY: {lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'the sentence opens with the lookup of the document in the ledger; nothing is posted, the options are keep, void or reverse', count: 2 },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{Lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'opens with the lookup in the ledger' },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'THIS OPERATION RETURNS NO IDENTIFIER', verdict: 'DESCRIPTION', why: 'states why the document cannot be recorded' },
-  { file: 'lib/domain/sales/allocation-service.ts', prefix: 'The declared set holds quantity nothing has accounted', verdict: 'DESCRIPTION', why: 'states why the hand-back was refused' },
   { file: 'lib/domain/sales/allocation-service.ts', prefix: 'Group A2 will not re-post this order', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
   { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} carries no VAT rate of its own', verdict: 'DESCRIPTION', why: 'states why no identity exists (credit note "posts under")' },
   { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} has no accounting tax code', verdict: 'DESCRIPTION', why: 'states why no identity exists' },
@@ -553,28 +550,38 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/products/bom-recipe.ts', prefix: 'An older BOM recipe for a different product', verdict: 'NON_ACCOUNTING', why: 'manufacturing BOM recipe' },
   { file: 'components/settings/backup-restore.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button', count: 2 },
   { file: 'components/settings/database-reset.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button' },
-  { file: 'app/(dashboard)/sync/settle-sync-row-control.tsx', prefix: 'Settle this row — record what actually happened', verdict: 'DESCRIPTION', why: 'heading of the settle control: it records on the IMS row what the operator saw in the ledger and posts nothing' },
   { file: 'app/actions/sales.ts', prefix: 'Reconcile the reservation manually', verdict: 'NON_ACCOUNTING', why: 'stock reservation release, no ledger posting' },
   { file: 'lib/domain/sales/refund-reservation-release-outbox.ts', prefix: 'Reconcile the reservation manually', verdict: 'NON_ACCOUNTING', why: 'stock reservation release, no ledger posting' },
   { file: 'lib/accounting-fx-revaluation.ts', prefix: 'Check the journal in the accounting system.', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'credit note(s) {} in the ledger', verdict: 'DESCRIPTION', why: 'states which credit notes the ledger holds' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'no credit note of theirs recorded in the ledger', verdict: 'DESCRIPTION', why: 'states a fact about the ledger' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'IMS records refund(s) {}', verdict: 'DESCRIPTION', why: 'states what IMS holds' },
-  { file: 'lib/connectors/woocommerce/sync/refund-sync.ts', prefix: 'This refund also returned {} unit(s)', verdict: 'DESCRIPTION', why: 'states a stock consequence; the instruction sentence is guarded' },
   { file: 'lib/connectors/xero/credit-notes.ts', prefix: 'Credit note not found in Xero for allocation', verdict: 'DESCRIPTION', why: 'error label' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the activity row for the lost claim could not be written', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the single-statement fallback write failed', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'created a DRAFT manual journal in Xero', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'ALLOCATED an existing supplier credit note', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },
-  { file: 'lib/domain/accounting/allocation-debit-posting-proof.ts', prefix: 'the A2 journal this order was staged into is', verdict: 'DESCRIPTION', why: 'states why the proof failed' },
   { file: 'lib/domain/accounting/ledger-settlement-evidence.ts', prefix: 'this row does not record the amount and date', verdict: 'DESCRIPTION', why: 'states why evidence cannot be matched' },
   { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The FX revaluation raises this journal only', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind' },
-  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The journal is queued once, with the stock movement', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
-  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The journal is queued once, with the receipt', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{} are NOT accounting documents', verdict: 'DESCRIPTION', why: 'states what the listed items are' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'IMS could not establish whether credit note', verdict: 'DESCRIPTION', why: 'states why IMS refused' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'Credit note {} is already in the ledger as', verdict: 'DESCRIPTION', why: 'states a ledger fact' },
   { file: 'lib/domain/sales/refund-manual-resolution.ts', prefix: 'To clear it: open Sync → Exceptions', verdict: 'CHECKS_FIRST', why: 'directs to the IMS inbox action "Record manually", which posts the credit note through the queue (idempotent, claim-aware); the operator posts nothing by hand. Kept unwrapped because the WMS connector-boundary guard must evaluate this constant statically' },
+  { file: 'app/(dashboard)/sync/exceptions/exceptions-client.tsx', prefix: 'Refund recorded manually', verdict: 'DESCRIPTION', why: 'toast stating the outcome of the completed operator action' },
+  { file: 'app/actions/sync-exceptions.ts', prefix: 'WooCommerce refund {} could not be converted automatically', verdict: 'DESCRIPTION', why: 'activity text stating what the operator did' },
+  { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'CONFIRM IN {} THAT THEY ARE STILL POSTED', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check; it asks for confirmation in the ledger and instructs no posting' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'Locate the existing credit note and bill', verdict: 'CHECKS_FIRST', why: 'locates the existing documents first, allocates only in the ledger holding both, and forbids re-posting either' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the external id was recorded by the single-statement fallback', verdict: 'DESCRIPTION', why: 'states what IMS recorded and that it will not re-post' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the supplier credit note {} is posted in the ledger', verdict: 'DESCRIPTION', why: 'states a ledger fact' },
+  { file: 'lib/domain/accounting/allocation-debit-posting-proof.ts', prefix: 'the A2 journal this order was staged into was settled as posted', verdict: 'CHECKS_FIRST', why: 'states how the journal came to be claimed and instructs only to confirm it in the accounting system' },
+  { file: 'lib/domain/accounting/payment-ledger-hold.ts', prefix: 'IMS tried to register this receipt', verdict: 'DESCRIPTION', why: 'states what IMS attempted and its outcome' },
+  { file: 'lib/domain/accounting/posting-refusal-copy.ts', prefix: 'Postings an operator has taken to settle BY HAND.', verdict: 'DESCRIPTION', why: 'section label naming claimed postings' },
+  { file: 'lib/domain/accounting/posting-refusal-copy.ts', prefix: 'Waiting for the accounting sync run to settle whether this posting is owed', verdict: 'DESCRIPTION', why: 'states that no action is offered yet' },
+  { file: 'lib/domain/accounting/posting-refusal-inbox.ts', prefix: 'A queued {} for {} {} did NOT close its refused-posting row', verdict: 'DESCRIPTION', why: 'states what happened to a claimed row' },
+  { file: 'lib/domain/accounting/posting-suppression.ts', prefix: 'IMS did NOT queue {} for {} {}', verdict: 'DESCRIPTION', why: 'states why IMS did not queue' },
+  { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'An operator has taken this posting to settle it BY HAND', verdict: 'DESCRIPTION', why: 'states the claim state and the enqueue result' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'Compare it against IMS and correct it in Xero', verdict: 'CHECKS_FIRST', why: 'compares the Xero document with IMS first and alters nothing posted by IMS', count: 2 },
+  { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'Only if it is absent: correct the invoice by hand', verdict: 'CHECKS_FIRST', why: 'conditional on the ledger check and forbids a re-post' },
 ]
 
 test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by construction or declared per sentence (verdict + justification), exactly (shrink-only)', () => {
@@ -593,6 +600,25 @@ test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by con
   const stale = UNGUARDED_SITES.filter((e, i) => (used.get(i) ?? 0) !== (e.count ?? 1)).map((e) => `${e.file}: ${e.prefix}`)
   assert.deepEqual(stale, [], 'shrink-only: remove / lower these entries (the instruction was removed or guarded)')
   for (const e of UNGUARDED_SITES) assert.ok(e.why.length > 10, `${e.file}: ${e.prefix} needs a justification`)
+  // Codex r19: the verdicts are VERIFIED against each declared sentence, never taken on trust.
+  const ACT = /\b(post|re-?post|repost|re-?send|resend|retry|re-?save|raise|enter|register|record|book|apply|allocate|settle|reconcile|void|reverse|correct|link)\b/i
+  const CHECK = /\b(check|confirm|open|look ?up|locate|inspect|compare)\b|{lookup}/i
+  const LEDGERISH = /ledger|accounting|Xero|QuickBooks|journal|credit note/i
+  const violations: string[] = []
+  for (const site of unguarded) {
+    const e = UNGUARDED_SITES.find((x) => x.file === site.file && site.sentence.startsWith(x.prefix))!
+    const where = `${site.file}: ${site.sentence.slice(0, 110)}`
+    if (e.verdict === 'DESCRIPTION' && IMPERATIVE_FORM.test(site.sentence)) violations.push(`DESCRIPTION but it has an imperative form: ${where}`)
+    if (e.verdict === 'CHECKS_FIRST') {
+      const c = site.sentence.search(CHECK)
+      const a = site.sentence.search(ACT)
+      const conditionalOnEarlierCheck = /^(Only if it is absent|If it is absent)/.test(site.sentence) && read(site.file).includes('LEDGER_CHECK_FIRST')
+      if (!conditionalOnEarlierCheck && (c < 0 || (a >= 0 && a < c))) violations.push(`CHECKS_FIRST but no check precedes the action: ${where}`)
+    }
+    if (e.verdict === 'MEMO' && !/narration:\s*`Reverse and repost shipment COGS/.test(read(site.file))) violations.push(`MEMO but not a narration property: ${where}`)
+    if (e.verdict === 'NON_ACCOUNTING' && LEDGERISH.test(site.sentence)) violations.push(`NON_ACCOUNTING but it names the ledger: ${where}`)
+  }
+  assert.deepEqual(violations, [], 'a declared verdict that its own sentence contradicts')
   if (process.env.PRINT_INSTRUCTION_AUDIT === '1') {
     for (const s of sites) {
       const e = s.guard === null ? UNGUARDED_SITES.find((x) => x.file === s.file && s.sentence.startsWith(x.prefix)) : null
@@ -633,4 +659,20 @@ test('[o3d-1e7sl Codex r18] "record" and the other ledger verbs are instruction 
   assert.ok(m, 'the returned enqueue-failure error is wrapped in withLedgerCheck')
   const rendered = withLedgerCheck('The payment could not be queued for the accounting connector, so the bill was not marked paid. Nothing was changed — try again, or record the payment in the ledger by hand.')
   assert.ok(rendered.indexOf('check whether the current version is already in the accounting system') < rendered.indexOf('try again'), 'the check comes BEFORE either action')
+})
+
+test('[o3d-1e7sl Codex r19] the xero allocation refusal directs the operator to LOCATE the existing documents and forbids re-posting either', () => {
+  const src = read('lib/connectors/xero/sync-processor.ts').replace(/'\s*\+\s*'/g, '').replace(/`\s*\+\s*`/g, '')
+  assert.match(src, /Locate the existing credit note and bill in the accounting system and allocate the credit to the bill only in the ledger that holds BOTH documents; do not re-post either document\./)
+  assert.doesNotMatch(src, /or re-post them so their connector is recorded/, 'the re-post option is gone')
+})
+
+test('[o3d-1e7sl Codex r19] the classifier: a descriptive phrase never exempts an imperative in the same sentence; DESCRIPTION entries have no imperative form', () => {
+  assert.equal(isInstructionSentence('IMS records the connector as quickbooks, which are recorded separately. Re-post the invoice from this order.'.split('. ')[0] + '; re-post the invoice from this order'), true, 'control: "are recorded" does not exempt a later re-post')
+  assert.equal(isInstructionSentence('The invoices are recorded in the ledger; re-post the invoice from this order to fix it.'), true)
+  assert.equal(isInstructionSentence('Do not re-post it by hand.'), false, 'a prohibition clause is not an instruction')
+  assert.equal(isInstructionSentence('This was posted by hand and the invoices are recorded in the ledger.'), false)
+  assert.ok(IMPERATIVE_FORM.test('then re-post the invoice'), 'control: imperative form detected')
+  assert.ok(!IMPERATIVE_FORM.test('IMS records the credit note as posted'), 'control: description has none')
+  for (const e of UNGUARDED_SITES.filter((x) => x.verdict === 'DESCRIPTION')) assert.ok(!IMPERATIVE_FORM.test(e.prefix), `DESCRIPTION prefix has no imperative form: ${e.prefix}`)
 })

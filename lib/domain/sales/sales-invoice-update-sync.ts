@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
 import { AFTER_DECLINE_STEP, CHECK_AFTERWARDS, LEDGER_CHECK_FIRST, MARK_REMEDY_TAIL } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -187,8 +188,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
         + 'a document id in the accounting system\'s own database and IMS keeps it when the connector '
         + 'selection changes, so it must not be assumed to belong to whichever connector is active now — '
         + 'the update would rewrite a document this connector does not hold. The update is still '
-        + 'OUTSTANDING: re-post the invoice from this order so the document and its connector are recorded '
-        + 'together, or correct the invoice by hand in the books that hold it.',
+        + 'OUTSTANDING. ' + LEDGER_CHECK_FIRST + 'correct the invoice by hand in the books that hold it; do not re-post the invoice from this order, which would create a second document.',
       metadata: {
         accountingInvoiceId: params.accountingInvoiceId,
         orderNumber: params.orderNumber,
@@ -207,8 +207,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy:
         // o3d-j625 r7 (review H-A): r5 said "re-post the invoice from this order", which IMS does not offer.
-        'IMS cannot show which accounting connector holds this invoice, so it will not update it. Correct the '
-        + 'invoice by hand in the ledger that holds it, then mark this row handled. ' + MARK_REMEDY_TAIL,
+        withLedgerCheck('IMS cannot show which accounting connector holds this invoice, so it will not update it. Correct the '
+        + 'invoice by hand in the ledger that holds it, then mark this row handled. ' + MARK_REMEDY_TAIL),
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector },
     })
     return

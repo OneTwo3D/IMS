@@ -900,13 +900,13 @@ export const BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE =
  * provenance have to agree before this payment can be routed at all.
  */
 export const BILL_PAYMENT_ENQUEUE_REFUSED_MESSAGE =
-  'This bill has already been posted to an accounting connector, and IMS cannot establish that the '
+  withLedgerCheck('This bill has already been posted to an accounting connector, and IMS cannot establish that the '
   + 'connector now selected is the one holding it. An accounting invoice id is a document id in the '
   + 'accounting system\'s own database and IMS keeps it when the connector selection changes, so paying '
   + 'against the wrong one would either fail or settle an unrelated document. Nothing was changed and '
   + 'the bill is NOT marked paid. Either switch back to the connector that holds this bill, or re-post '
   + 'the bill to the connector now in use so the document and its connector are recorded together — or '
-  + 'settle it by hand in the books that hold it.'
+  + 'settle it by hand in the books that hold it.')
 
 /** Which of the two messages a decline warrants. */
 export function billPaymentEnqueueDeclinedMessage(reason: BillPaymentEnqueueDeclined['reason']): string {

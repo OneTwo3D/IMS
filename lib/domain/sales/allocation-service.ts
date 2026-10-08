@@ -1761,7 +1761,7 @@ export async function resetAllocationAccountingIfStaged(
             `Allocations changed on an order whose Group A2 posting still stands, so the A2 stamp and its `
             + `recorded debit were KEPT rather than cleared: ${stagedDebit.reason}. The declared set holds `
             + `quantity nothing has accounted, but NO allocation row records what A2 already accounted, so `
-            + `handing this order back would re-value and re-post every unit on it rather than the new ones. `
+            + `handing this order back would cause every unit on it to be re-valued and re-posted rather than the new ones. `
             + `The newly allocated quantity is NOT reclassified — reclassify it by hand, or re-run the `
             + `change once the rows carry their posted records.`,
         },

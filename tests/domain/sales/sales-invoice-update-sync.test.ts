@@ -322,3 +322,15 @@ test('[Codex r18] the claim-held log states only the known enqueue result and cl
   assert.match(logged.description, /inspect its current version in the accounting system before deciding what remains owed/, 'and tells the operator to inspect the current ledger version')
   assert.match(logged.description, /An operator has taken this posting to settle it BY HAND and still holds it/, 'the known claim state is stated')
 })
+
+test('[Codex r19] the unattributable-document refusal never advises a re-post: it requires the ledger check and forbids the re-post', async () => {
+  for (const documentConnector of [undefined, 'quickbooks'] as const) {
+    const { deps, activity } = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true })
+    await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, documentConnector: documentConnector as never }, deps)
+    const logged = activity.find((a) => (a as { action: string }).action === 'sales_invoice_update_refused_unattributable_document') as { description: string }
+    assert.ok(logged, `PRECONDITION: refused for documentConnector=${String(documentConnector)}`)
+    assert.doesNotMatch(logged.description, /re-post the invoice from this order so/, 'the re-post advice is gone')
+    assert.match(logged.description, /Check whether the current version is already in the accounting system\. Only if it is absent: correct the invoice by hand/, 'the ledger check comes first')
+    assert.match(logged.description, /do not re-post the invoice from this order, which would create a second document/, 'and the duplicate-creating option is forbidden')
+  }
+})

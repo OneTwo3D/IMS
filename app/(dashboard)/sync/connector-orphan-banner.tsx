@@ -1,5 +1,6 @@
 'use client'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { AlertTriangle, Loader2 } from 'lucide-react'
@@ -257,9 +258,9 @@ export function ConnectorOrphanBanner({
                   + ' whose reply was lost can still commit after any render. Treat them as newer, not as'
                   + ' authoritative — check the activity log before retrying.'
                 // The honest report of an unobservable completion.
-                : ' A reload of the rows below was requested but has NOT been confirmed — it reports no completion, it can'
+                : withLedgerCheck(' A reload of the rows below was requested but has NOT been confirmed — it reports no completion, it can'
                   + ' be served from cache, and it can fail. Do NOT treat the rows below as authoritative: reload this page'
-                  + ' yourself, and check the activity log, before retrying.'}
+                  + ' yourself, and check the activity log, before retrying.')}
             </p>
           )}
           {notice && <p className="text-xs font-medium">{notice}</p>}

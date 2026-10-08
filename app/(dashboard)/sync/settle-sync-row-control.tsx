@@ -102,7 +102,7 @@ export function SettleSyncRowControl(props: SettleSyncRowProps) {
         variant="ghost"
         size="sm"
         className="h-7 w-7 p-0"
-        title={`Settle this row — record what actually happened in the accounting system (attempt ${attemptRevision}, currently ${status})`}
+        title={`Settling this row records what actually happened in the accounting system (attempt ${attemptRevision}, currently ${status})`}
         onClick={() => setOpen(true)}
       >
         <Gavel className="h-3 w-3" />

@@ -113,9 +113,9 @@ export function describeCancelledSaleRelease(
   if (externalId === '') {
     return {
       release: false,
-      reason: 'This row names no document in the accounting system, so nothing was posted from it and there is '
+      reason: withLedgerCheck('This row names no document in the accounting system, so nothing was posted from it and there is '
         + 'nothing to link. Raise the invoice again from the sales order rather than releasing this row — releasing '
-        + 'it would record a post that never happened.',
+        + 'it would record a post that never happened.'),
     }
   }
 

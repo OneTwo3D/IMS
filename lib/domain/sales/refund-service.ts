@@ -5319,12 +5319,12 @@ export async function retrySalesOrderRefundAccounting(
         if (recordVerdict === 'undecidable') {
           return {
             success: false,
-            error: 'This refund predates the record of whether its accounting reversals were staged, so '
+            error: withLedgerCheck('This refund predates the record of whether its accounting reversals were staged, so '
               + 'nothing here can tell a reversal that was staged and lost from one that was never owed — '
               + 'and the order\'s revenue deferral is already gone either way, so no retry can derive it. '
               + 'Check whether a COGS/unearned/allocated-inventory reversal was posted for this refund: if '
               + 'it was not and one was due, raise it manually from the refund\'s own cost snapshots; if '
-              + 'nothing was owed, clear this flag by hand. Retrying cannot decide it.',
+              + 'nothing was owed, clear this flag by hand. Retrying cannot decide it.'),
           }
         }
         return {

@@ -1034,14 +1034,14 @@ async function processDeltaChunk(
             // order from the poller's window — so it states the clear as the step that follows, not as
             // one that already happened. An entry with no matching clear is a run that did not finish,
             // and the next poll repeats the whole decision.
-            description: (chargebackManualReason
+            description: withLedgerCheck((chargebackManualReason
               ? `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — clearing paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
               : wcHandled
                 ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); clearing paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
                 : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — clearing paidAt. Review whether the order status should revert.`)
               + (registeredPaymentGone
                 ? ` The payment IMS registered (${salesResidual.provenGone.get(o.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, but the invoice still carries another payment or an amount Xero did not state — so NO chargeback credit note was raised automatically. Unwind revenue by hand if that is what the removal means.`
-                : ''),
+                : '')),
             resolveUser: false,
           }),
         })

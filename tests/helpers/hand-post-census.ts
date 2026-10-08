@@ -22,6 +22,16 @@ export const CLAIM_PHRASE = /\b(take|hold|holding|under)\b[^.]{0,40}\bclaim\b(?!
 export const LEDGER_CHECK_PHRASE = /check whether the current version is already in the accounting system|check the ledger|check for that document|check the accounting system|identify the posting type before any ledger work/i
 export const PROHIBITION = /\b(do not|don't|never|must not|not to|not going to|nothing here authorises|is not offered)\b/i
 // a sentence that DESCRIBES a state ("an operator is settling this by hand", "posted by hand") is not an instruction
+/** Clauses of a sentence (conservative split): a prohibition applies to ITS clause only, never to a later imperative in the same sentence. */
+export function clausesOf(sentence: string): string[] {
+  return sentence.split(/;|:| [—–-] |, then |, or |, and |\. | and then /i).map((c) => c.trim()).filter(Boolean)
+}
+/** Codex r19: an INSTRUCTION SITE is a sentence in which ANY clause matches the instruction pattern and is not itself prohibited. Descriptive words elsewhere in the sentence never exempt it. */
+export function isInstructionSentence(sentence: string): boolean {
+  return clausesOf(sentence).some((clause) => HAND_POST_INSTRUCTION_PATTERN.test(clause) && !PROHIBITION.test(clause))
+}
+/** Codex r19: the IMPERATIVE FORM: a base-form verb opening a clause, or following to / must / should / can / may / then / or / and / please / yourself-style modals. A DESCRIPTION entry may not match this. */
+export const IMPERATIVE_FORM = /(^|[;:,—–]\s*|\s-\s|\b(then|and|or|please|must|should|can|may|need to|needs to)\s+)(post|re-?post|repost|re-?send|resend|retry|reset|re-?save|resave|raise|re-?raise|enter|register|record|book|apply|allocate|settle|reconcile|journal|credit|refund|void|reverse|correct|link|take|turn|switch|reload|confirm|locate)\b(?!\s+(notes?\b|recorded|accounting|document|was\b)|\(s\))|\byourself\b/i
 export const DESCRIPTION = /\b(are|is|was|were|been|being) (settling|settled|posted|entered|typed|raised|recorded)\b|\b(took|taken|take) (this|it|a refused)|\bposted by hand\b|\bsettled BY HAND\b|\bBY HAND\b\./
 
 /** The sentences of `text` that are instructions with no ledger check AND hand-post claim before them (preamble sentences carry both themselves). */
@@ -29,7 +39,7 @@ export function unsafeInstructionSentences(text: string): string[] {
   const sentences = text.replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)
   const out: string[] = []
   sentences.forEach((sentence, i) => {
-    if (!HAND_POST_INSTRUCTION_PATTERN.test(sentence) || PROHIBITION.test(sentence) || DESCRIPTION.test(sentence)) return
+    if (!isInstructionSentence(sentence)) return
     if (/^(Take this posting|Took a refused accounting posting) to settle it by hand\.?$/i.test(sentence.trim())) return // the CLAIM itself (the step that makes the later steps safe)
     const before = `${sentences.slice(Math.max(0, i - 3), i).join(' ')} ${sentence}`
     if (CLAIM_PHRASE.test(before) && LEDGER_CHECK_PHRASE.test(before)) return
@@ -150,7 +160,7 @@ export function instructionSites(): InstructionSite[] {
       if (isText && !parentIsConcat && !parentIsParenConcat) {
         const guard = guardOf(node)
         for (const sentence of flatText(node).replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)) {
-          if (HAND_POST_INSTRUCTION_PATTERN.test(sentence) && !PROHIBITION.test(sentence) && !DESCRIPTION.test(sentence)) out.push({ file, sentence: sentence.trim(), guard })
+          if (isInstructionSentence(sentence)) out.push({ file, sentence: sentence.trim(), guard })
         }
         if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return
       }
