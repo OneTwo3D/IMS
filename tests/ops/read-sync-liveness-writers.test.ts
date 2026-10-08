@@ -5,7 +5,6 @@ import { MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '@/lib/co
 import {
   WC_ORDER_SWEEP_LAST_SUCCESS_SETTING,
   WMS_ORDER_STATUS_LAST_SUCCESS_SETTING,
-  XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING,
 } from '@/lib/ops/read-sync-liveness-constants'
 
 /**
@@ -41,14 +40,12 @@ async function upsert({ where, create, update }: { where: { key: string }; creat
 // ---- WooCommerce order sweep rig --------------------------------------------------------------
 let pages: Record<string, Array<Record<string, unknown>>> = {}
 let wcError: string | null = null
-let orderDb: Record<string, unknown>
-
 // ---- order-status sweep rig --------------------------------------------------------------------
 let statusOrders: Array<Record<string, unknown>> = []
 let fetchOrderStatusImpl: (reference: string) => Promise<unknown> = async () => null
 let resolution: { kind: string; id?: string } = { kind: 'one', id: 'mintsoft' }
 
-orderDb = {
+const orderDb: Record<string, unknown> = {
   setting: { findUnique: async ({ where }: { where: { key: string } }) => (settings.has(where.key) ? { key: where.key, value: settings.get(where.key) } : null), upsert },
   salesOrder: { findFirst: async () => ({ id: 'so-1' }), findMany: async () => statusOrders },
   wmsOrderStatusSnapshot: { findUnique: async () => null, upsert: async () => ({}), update: async () => ({}) },
