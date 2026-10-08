@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
@@ -158,8 +159,6 @@ const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
  * this worker's lease had expired.
  */
 const CLAIM_STALE_MS = INTEGRATION_OUTBOX_DRAIN_LEASES_MS.xeroAccountingEntry
-const RATE_LIMIT_BACKOFF_BASE_MS = 60_000
-const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000
 const XERO_CONNECTOR = 'xero'
 const XERO_ACCOUNTING_WORKER_ID = 'xero-accounting-sync'
 
@@ -339,17 +338,6 @@ export function buildXeroIdempotencyKey(entryId: string, operation: string, payl
  */
 function followUpIdempotencySource(entryId: string, payload: SyncPayload): string {
   return readFollowUpIdempotencyKey(payload) ?? entryId
-}
-
-function getRateLimitBackoffMs(retryCount: number, message: string): number {
-  const hinted = message.match(/retry after (\d+)ms/i)
-  const hintedMs = hinted ? Number.parseInt(hinted[1] ?? '0', 10) : 0
-  const exponential = Math.min(RATE_LIMIT_BACKOFF_BASE_MS * 2 ** retryCount, RATE_LIMIT_BACKOFF_MAX_MS)
-  return Math.max(hintedMs, exponential)
-}
-
-function isRateLimitError(message: string): boolean {
-  return /rate limit|rate limited|http 429|status 429/i.test(message)
 }
 
 async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>, params: {

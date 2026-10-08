@@ -1,3 +1,4 @@
+import { OUTBOUND_HELD_RETRY_DELAY_MS, isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { db } from '@/lib/db'
 import {
   INTEGRATION_OUTBOX_DRAIN_LEASES_MS,
@@ -528,6 +529,27 @@ export async function markIntegrationOutboxRetryableFailure(
 ): Promise<IntegrationOutboxRow> {
   const client = getClient(options.client)
   const now = options.now ?? new Date()
+
+  // A HELD WRITE IS NOT A FAILURE OF THE WORK (outbound-write hold). The installation has not been
+  // granted the destination, so the job did not run; spending an attempt would march it towards
+  // PERMANENT_FAILED - a dead letter that reads as "the destination rejected this" - merely because the
+  // hold lasted longer than the retry budget. The job stays retryable, keeps its attempt count, and is
+  // offered again after OUTBOUND_HELD_RETRY_DELAY_MS, for as long as the hold lasts.
+  if (isOutboundWriteHeldText(errorMessage(options.error))) {
+    return updateClaimedOutboxRow(client, {
+      id: options.id,
+      workerId: options.workerId,
+      lockedAt: options.lockedAt,
+      data: {
+        status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
+        nextAttemptAt: new Date(now.getTime() + normalizeDelayMs(options.retryDelayMs ?? OUTBOUND_HELD_RETRY_DELAY_MS)),
+        lastError: truncateError(options.error),
+        lockedAt: null,
+        lockedBy: null,
+      },
+    })
+  }
+
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)
   const retryDelayMs = options.retryDelayMs === undefined
     ? calculateIntegrationOutboxRetryDelayMs({
