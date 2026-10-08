@@ -1817,10 +1817,10 @@
   },
   {
    "file": "scripts/update.sh",
-   "line": "pg_dump \"${MIGRATION_DATABASE_URL}\" | gzip >&\"${IMS_PRIVATE_FILE_FD}\" || { backup_rc=$?; rm -f \"${BACKUP_PARTIAL}\"; }",
+   "line": "db_pg_dump_through_url \"${MIGRATION_DATABASE_URL}\" | gzip >&\"${IMS_PRIVATE_FILE_FD}\" || { backup_rc=$?; rm -f \"${BACKUP_PARTIAL}\"; }",
    "count": 1,
    "class": "single-inode",
-   "reason": "non-recursive rm -f on one named path (the dump partial, named under the descriptor the ancestry walk pinned); the dump is written into ${IMS_PRIVATE_FILE_FD}, the descriptor open_private_new_file() created at mode 0600 and read the achieved mode back off before a byte went into it (o3d-noka r2). There is no umask on this statement any more: POSIX default-ACL inheritance ignores the umask, which is the defect r2 closes"
+   "reason": "non-recursive rm -f on one named path (the dump partial, named under the descriptor the ancestry walk pinned); the dump is written into ${IMS_PRIVATE_FILE_FD}, the descriptor open_private_new_file() created at mode 0600 and read the achieved mode back off before a byte went into it (o3d-noka r2). There is no umask on this statement any more: POSIX default-ACL inheritance ignores the umask, which is the defect r2 closes. The dump runs through db_pg_dump_through_url(), which puts the connection string in a mode-0600 libpq service file instead of on pg_dump's command line"
   },
   {
    "file": "scripts/update.sh",
@@ -2560,7 +2560,7 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
-   "line": "actual=\"$(cd \"${protected_dir}\" 2>/dev/null && find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum)\"",
+   "line": "actual=\"$(cd \"${resolved}\" 2>/dev/null && find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum)\"",
    "count": 1,
    "class": "read-only",
    "reason": "read-only: find | xargs with no action that writes"
@@ -3914,6 +3914,13 @@
    "count": 1,
    "class": "text",
    "reason": "not run: `setfacl -k` is quoted inside the refusal message as the remedy an operator applies by hand"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -f -- \"${dir}/service.conf\"; rmdir -- \"${dir}\" 2>/dev/null || true",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path, inside the directory db_pg_dump_through_url() made itself with mktemp -d a few lines above (the libpq service file that stands in for a connection string on a command line); the directory is then removed with rmdir, which refuses a directory that is not empty"
   }
  ]
 }

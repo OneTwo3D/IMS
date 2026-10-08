@@ -6,7 +6,7 @@
 // worth stating the failure it exists for rather than only what it does.
 //
 // The connection fence revokes CONNECT from the application role, so the migration has to
-// run through DEPLOY_ADMIN_DATABASE_URL. scripts/install.sh makes the APPLICATION role the
+// run through a login that survives it (until owner decision C3 that was the deploy admin; it is now a migration role with no privilege of its own). scripts/install.sh makes the APPLICATION role the
 // database owner, and the fence REFUSES when the admin role is the application role — so the
 // only fenceable configuration is a separate SUPERUSER admin. Every CREATE TABLE, INDEX and
 // SEQUENCE a migration made through it was then owned by that superuser, with no grant to the
@@ -336,17 +336,40 @@ export function readStateFileRole(stateFile, readFile = (path) => readFileSync(p
  *
  * @returns {string} the reason to refuse, or '' to proceed
  */
-export function objectionToResolvedRole({ role, source, adminRole }) {
+export function objectionToResolvedRole({ role, source, loginRole = '', migrationWindow = false }) {
   if (!role) return ''
   if (source !== 'DATABASE_URL') return ''
-  if (!adminRole) return ''
-  if (adminRole !== role) return ''
+  // Outside a fenced window DATABASE_URL is the application's own URL and its login IS the role.
+  if (!migrationWindow) return ''
+  if (loginRole !== role) return ''
   return (
-    `the only role available was ${role}, read from DATABASE_URL — and that is the same role as ` +
-    'DEPLOY_ADMIN_DATABASE_URL, i.e. the deploy admin. Asking whether the admin can use the objects ' +
-    'the admin just created answers yes for every one of them, which is the defect this check exists ' +
-    'to find. Pass --app-role=<application role>, or point --state-file at the fence state file.'
+    `the only role available was ${role}, read from DATABASE_URL — and that is the migration LOGIN of a ` +
+    'fenced window (the URL carries the migration stamp and no role option), not the application role. ' +
+    'Asking whether the login can use what it just created answers yes for every one of them, which is ' +
+    'the defect this check exists to find. Pass --app-role=<application role>, or point --state-file at ' +
+    'the fence state file.'
   )
+}
+
+/** Pure: is this the URL a fenced window hands its consumers? It wears the migration stamp. */
+export function isMigrationWindowUrl(connectionString) {
+  if (!connectionString) return false
+  try {
+    return (new URL(connectionString).searchParams.get('application_name') ?? '').startsWith('ims-migration-')
+  } catch {
+    return false
+  }
+}
+
+/** Pure: the login a connection string authenticates as (the username, never the role option). */
+export function loginFromConnectionString(connectionString) {
+  if (!connectionString) return ''
+  try {
+    const url = new URL(connectionString)
+    return url.username ? decodeURIComponent(url.username) : ''
+  } catch {
+    return ''
+  }
 }
 
 async function main() {
@@ -355,11 +378,11 @@ async function main() {
 
   const options = parseArgs(process.argv.slice(2))
 
-  // The application role has no CONNECT while the fence is up, so this must go through the
-  // privileged connection when there is one — the same rule scripts/check-db-writers.mjs and
-  // scripts/run-migration-verifications.mjs follow (o3d-2sm1.5, Codex r4 HIGH).
-  const connectionString =
-    process.env.DEPLOY_ADMIN_DATABASE_URL || process.env.DIRECT_URL || process.env.DATABASE_URL
+  // The application role has no CONNECT while the fence is up, so inside the window DATABASE_URL is
+  // the MIGRATION URL (a login that survives the fence and has no privilege of its own), and that is
+  // the only connection this reads. It never reads the deploy admin credential (owner decision C3),
+  // and `.env` is loaded below for DATABASE_URL alone: nothing privileged is kept there.
+  const connectionString = process.env.DATABASE_URL
   if (!connectionString) {
     console.error('DATABASE_URL is not set — cannot check what the application role can use.')
     process.exit(EXIT_ERROR)
@@ -368,7 +391,7 @@ async function main() {
   const stateFile = readStateFileRole(options.stateFile)
   if (!options.appRole && stateFile.error) {
     console.error(`The connection fence state file cannot be trusted to name the application role: ${stateFile.error}`)
-    console.error('Falling back to DATABASE_URL here would ask about the DEPLOY ADMIN during a fenced window,')
+    console.error('Falling back to DATABASE_URL here could ask about the MIGRATION LOGIN during a fenced window,')
     console.error('which answers yes for every object the migration just created. Refusing instead.')
     process.exit(EXIT_ERROR)
   }
@@ -387,7 +410,8 @@ async function main() {
   const objection = objectionToResolvedRole({
     role: appRole,
     source,
-    adminRole: roleFromConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL),
+    loginRole: loginFromConnectionString(process.env.DATABASE_URL),
+    migrationWindow: isMigrationWindowUrl(process.env.DATABASE_URL),
   })
   if (objection) {
     console.error(`Refusing to check the wrong role: ${objection}`)
@@ -410,10 +434,10 @@ async function main() {
     console.error(`THE MIGRATION LEFT OBJECTS THE APPLICATION CANNOT USE. ${summary.failures} of ${summary.inspected} inspected:`)
     for (const line of summary.lines) console.error(`  - ${line}`)
     console.error('')
-    console.error(`The usual cause is a migration that ran as the deploy admin instead of as ${appRole}:`)
-    console.error('the fenced window runs `prisma migrate deploy` through DEPLOY_ADMIN_DATABASE_URL, and that')
+    console.error(`The usual cause is a migration that ran as its own login instead of as ${appRole}:`)
+    console.error('the fenced window runs `prisma migrate deploy` through the migration URL, and that')
     console.error(`connection carries \`options=-c role=${appRole}\` so the objects are owned by the application.`)
-    console.error('If that option did not reach Postgres, everything created in this run is owned by the admin.')
+    console.error('If that option did not reach Postgres, everything created in this run is owned by the migration login.')
     console.error('The new build must NOT be started: it would fail with "permission denied" on every one of these.')
     process.exitCode = EXIT_ERROR
   } finally {

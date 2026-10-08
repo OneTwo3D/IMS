@@ -8,6 +8,47 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### The deploy admin database credential is root's alone (o3d-1bgr, o3d-bpbv)
+
+- **The application account no longer holds, inherits or can read the admin database credential.** It used to
+  sit in the application's own `.env`, was handed to the account on `runuser ... env VAR=secret` command lines
+  (readable in `ps`), was inherited by every command started as that account whenever it was typed on
+  `sudo env ...`, and the fence helper itself ran as that account. The credential now lives in
+  `/etc/ims-db-admin/deploy-admin.env` (root:root 0600 in a root:root 0700 directory) or on the root
+  invocation; the fence helper runs as root with a scrubbed environment and nothing secret on any command line;
+  the exported variable is un-exported at once. **A copy left in the application `.env` is refused before
+  anything is stopped**, naming the file to move it to.
+- **The migration no longer connects as the admin.** `options=-c role=<app>` is a session default, so
+  `SET ROLE NONE` on that connection was the superuser admin, handed to application-owned bytes (prisma, the
+  migration SQL, package scripts) for the whole window. The migration now logs in as a role with no privilege of
+  its own (`<application role>_migrator`, created by `install.sh` for a local server; for an external database
+  `fence-db-connections.mjs --ensure-migration-role`, or the three statements in docs/installation.md), with a
+  fresh random password minted for each window and sent as a SCRAM verifier, and closed again by the release.
+  The server is asked, not the configuration: a migration role that is a superuser, holds CREATEROLE/CREATEDB/
+  REPLICATION/BYPASSRLS, reaches a role the application cannot, cannot `SET ROLE` to the application role, has no
+  `CONNECT` of its own or cannot be altered by the admin is refused by `--preflight` before anything is stopped.
+- **A migration role this tool did not create is never adopted** (marker comment; refused before any grant, in one
+  transaction), a marked role that owns or is granted anything of its own anywhere in the cluster, carries per-role
+  settings or reaches a role the application cannot is refused by `--preflight`, the minted URL keeps only
+  transport-trust query parameters from the admin URL (an admin URL carrying `password=`, `user=`, `host=` and the
+  like is refused) and is opened once to prove it authenticates as the migration role, and a release whose login the
+  server cannot confirm closed now FAILS (retryable) instead of reporting success, **before any CONNECT is
+  restored** (the login is closed first; a failure leaves the fence standing). The audit also refuses a marked role
+  holding anything beyond CONNECT on the application database, and any direct membership besides the application
+  role (PostgreSQL 16+ INHERIT/SET options are not trusted to compare).
+  A release that fails after its grants may have committed now reports `FENCE_STATE=held|restored|unknown` read from
+  the ACL on a fresh connection, and the three entrypoints and the wrapper clear their "fence is up" state on
+  anything but `held`; `--preflight` and `--fence` (again at the end of the drain) refuse a migration login that is
+  already open (LOGIN or a stored password). The fresh state read must be on the same server as the release (else
+  `unknown`), and the password check no longer requires a superuser admin (separate `pg_authid` statement, only when
+  the admin may read it). An unreadable system identifier never matches in the release probe (`unknown`). The
+  single-cutover-host assumption is documented.
+- **The operator recovery wrappers** read the root file, run the helper as root, and (o3d-bpbv) take the cutover
+  lock first, resolve the documented pointer once, hash that directory and execute the helper by the resolved
+  path, so a publication landing between the hash and the exec can no longer substitute a different release.
+- **Operator action on upgrade:** move `DEPLOY_ADMIN_DATABASE_URL` out of `.env` into the root file, and make sure
+  the migration role exists. A fresh installation needs neither step. No migration.
+
 ### First-load preparation tool: validates and prepares the incumbent exports for the existing importers (o3d-zjsb5)
 
 - **New command `npm run first-load:prepare`, file in and file out (no database, no network).** It reads Qoblex, 3PL and

@@ -245,8 +245,9 @@ to the application role — see the next section.
 cannot weaken the proof: pointing it at another cluster does not produce an exemption, it produces
 the refusal above — which is what that suite asserts.
 
-**Everything unproven is fenced**, which is every case below. Each requires
-`DEPLOY_ADMIN_DATABASE_URL` and a protected fence artefact, exactly as an upgrade does:
+**Everything unproven is fenced**, which is every case below. Each requires the deploy admin
+credential (`DEPLOY_ADMIN_DATABASE_URL`, held by root: see [Database identities](#database-identities))
+and a protected fence artefact, exactly as an upgrade does:
 
 | case | why |
 | --- | --- |
@@ -293,7 +294,7 @@ application role and its password, decide whether the database was new, then `GR
 database's **owner** — all of it before the run had classified the cutover, and long before
 `require_fenceable_database()` had established that a window could be held closed. On a fresh
 application host pointed at a **pre-existing, live** database, a missing
-`DEPLOY_ADMIN_DATABASE_URL` or a missing fence artefact then aborted the run with *"nothing has
+admin credential or a missing fence artefact then aborted the run with *"nothing has
 been stopped and nothing has been migrated"* — over a database whose application role had already
 lost the password its clients were using and whose ownership had already moved.
 
@@ -2103,7 +2104,7 @@ supply the values:
   those same variables; nothing is parsed anywhere. Reached before the database exists (an exit
   trap on an early failure), the values are still empty and the fence is **refused**;
 * **`scripts/update.sh` and `scripts/deploy.sh` split them out of `DATABASE_URL`** — the file they
-  already read `DEPLOY_ADMIN_DATABASE_URL` from — with a strict reader (`resolve_db_identity`,
+  already read it from — with a strict reader (`resolve_db_identity`,
   the same twenty lines in both) that **accepts only a URL stating all four**. No port, no path,
   more than one path segment, a `?host=`/`?port=`/`?user=`/`?dbname=`/`?database=` query
   parameter, a percent-escape **anywhere in the query string**, whitespace: each one is a
@@ -2261,7 +2262,7 @@ was no boundary at all.
 
 Both `source` calls are gone. `update.sh` now reads the six names it needs out of the two files
 by name, with the same non-evaluating dotenv reader `install.sh` and `deploy.sh` have always used
-— `DATABASE_URL`, `DEPLOY_ADMIN_DATABASE_URL` and `APP_PORT` from `.env`; `GIT_REPO_URL`,
+— `DATABASE_URL` and `APP_PORT` from `.env` (the admin credential is **not** read from it: see [Database identities](#database-identities)); `GIT_REPO_URL`,
 `GIT_BRANCH` and `GIT_DEPLOY_KEY_ENABLED` from `.deploy-meta`. A line the reader is not asked for is never looked
 at, and a line it is asked for becomes a string and nothing else. The `set -a` that exported the
 whole of `.env` into the update shell and every child process went with it: every child that
@@ -2492,7 +2493,7 @@ So the precedence is inverted, and it is one rule for every privileged artefact:
 | --- | --- | --- |
 | the four identity values | `db-fence-identity.env` whenever it exists | read only to be **compared**; a mismatch is a refusal at **both** adoption call sites |
 | the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** — since o3d-xi3w that name is a symbolic link into the versioned directory one publication commits | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
-| `DEPLOY_ADMIN_DATABASE_URL` | the **root invocation** | fills in only when the invocation is silent; a disagreement is announced |
+| `DEPLOY_ADMIN_DATABASE_URL` | the **root invocation**, then the **root credential file** `/etc/ims-db-admin/deploy-admin.env` | **never consulted**: a copy left in it is refused before anything is stopped (owner decision C3, see [Database identities](#database-identities)) |
 | the environment snapshot | the root-owned `zz-` drop-in, which systemd loads **last** | overridden by it for the length of one cutover |
 | the fence state file | the database itself, cross-checked against the record | app-writable by necessity — `--fence` refuses to re-apply a state whose `database` is not the one the connection is attached to |
 
@@ -2507,9 +2508,10 @@ manufacture: `/etc/ims-cutover-recovery` is root-owned, so "no record and no pro
 no fence these scripts ever recorded. There is nothing to be substituted *for*, and the checkout's
 script is published into the protected path and run from there — never in place.
 
-The directory is root-owned and **0755**, not the snapshot directory's 0700, because the fence runs
-**as the application user** — a root-owned state file is one it cannot release — and neither file
-holds a secret. It is a **literal**, for the same reason `DB_ENV_SNAPSHOT_DIR` is. It is
+The directory is root-owned and **0755**, not the snapshot directory's 0700, because the object-access
+check (an application-account step) reads the application role out of the state record and
+neither file holds a secret. The fence itself runs **as root** since owner decision C3, so nothing
+needs the application account to be able to release or write the record, and it can do neither. It is a **literal**, for the same reason `DB_ENV_SNAPSHOT_DIR` is. It is
 deliberately **not** the fence marker: `CUTOVER_STATE_DIR` is the application's own data directory
 and therefore writable by the application user, so putting the identity there would hand the
 account this recovers *from* the ability to aim the recovery re-fence at a database of its
@@ -2965,12 +2967,16 @@ already published a release on one host uses to require byte-identity on the nex
   leave a mechanism that cannot start; the premise was that the digest can only come from a prior
   publication, and it can also
   [ship with the release](#artefact-digest-first-install), which is where it comes from now.
-* **The process it runs as.** The helper is executed **as the application user** on every in-script
-  path, by design — the fence state file has to be releasable by that account — so
-  `DEPLOY_ADMIN_DATABASE_URL` is reachable from that account through `/proc` and `ptrace` whatever
-  bytes run. Vendoring does not change that and does not claim to. What it closes is the ability to
-  **lie**: to report a raised fence over an open database, or to hand back a migration URL that
-  points somewhere else.
+* **The process it runs as.** The helper is executed **as root** on every path (owner decision C3),
+  through one library function, `db_fence_exec_root()`: a subshell that un-exports every variable
+  but `PATH`, `LANG` and `LC_ALL` (so `NODE_OPTIONS`, `NODE_PATH` and `PG*` from the invoking shell
+  never reach it), exports the credential **by name** into that clean process (with the
+  application's own `DATABASE_URL`, which the record-less `--release` connects with to prove the application
+  can get in), runs from `/` and
+  `exec`s `node` with nothing secret on any command line. Until then it ran as the application
+  user with `DEPLOY_ADMIN_DATABASE_URL` in its environment, which handed the account the fence
+  defends against the credential it defends with. `HOME` is unset in that process, so `pg` resolves
+  `~` from root's passwd entry: a `.pgpass` it consults is **root's own**.
 * **The interpreter.** `node` is taken from root's `PATH`. A root `PATH` containing an
   application-writable directory defeats this and every other protection here; that is a
   host-hardening property, not one these scripts can assert.
@@ -3050,10 +3056,13 @@ operator, once, only when an automatic path has refused an authority carrying no
 by no banner and no cutover — see *An unstamped record is ambiguous* below.
 
 Each one is root-owned and `0700`, **never sources anything from the checkout**, carries this run's
-state file and four identity values baked in, re-verifies the artefact digest before `exec`, takes
-`DEPLOY_ADMIN_DATABASE_URL` from its own environment or from `APP_DIR/.env` with the same one-key
-reader the entrypoints use, and runs the helper **as the application user**. There is nothing to
-fill in. Since **o3d-secops r23** they must be run **as root** and no longer accept being run by
+state file and four identity values baked in, **takes the cutover lock, resolves the documented
+pointer once and hashes that directory against the digest baked at publication before it executes
+the helper by the resolved path** (o3d-bpbv: it used to hash the name, then lock, then execute
+through the name, so a publication landing in between made it run a different release's helper),
+takes `DEPLOY_ADMIN_DATABASE_URL` from its own environment or from the root credential file (never
+from `APP_DIR/.env`) through the same provenance-checking reader the entrypoints use, and runs the
+helper **as root** with the scrubbed environment above. There is nothing to fill in. Since **o3d-secops r23** they must be run **as root** and no longer accept being run by
 the application account: they publish and remove the connection-fence authority, which lives in a
 root-owned directory — see below.
 
@@ -3287,13 +3296,19 @@ nothing revoked or granted. That is the safe direction and it is not a dead end:
 there and still readable by root. If a fence really was standing, read it, run the `GRANT CONNECT`
 statements for every role in its `revoked` list by hand as a superuser, remove it, and re-run.
 
-**What this does not close, said plainly.** The helper runs with `DEPLOY_ADMIN_DATABASE_URL` in its
-environment for the length of a cutover, so during that window the application account can issue any
-SQL the admin can — this record included. What the split closes is the **persistent** half, which is
-the half that matters: a file planted at any time, by an account holding no credential at all, that
-makes some later privileged release grant `CONNECT` to roles of its choosing. Closing the window
-itself means not handing that account the credential, which is a larger change to how the fence is
-executed than this round makes.
+**What this closes now, and what it does not (owner decision C3).** Until C3 this paragraph said the
+helper ran with `DEPLOY_ADMIN_DATABASE_URL` in its environment for the length of a cutover, so that
+the application account could issue any SQL the admin could, and described only the *persistent*
+half (a planted file causing a later privileged grant) as closed. It was worse than that sentence:
+the credential also sat in the application's own `.env` all the time, was readable in `ps` on every
+`runuser ... env VAR=secret` line, was inherited by every command started as the application user
+whenever it was typed on `sudo env ...`, and the **migration connection was the admin login with
+`options=-c role=<app>`**, which is a session default and not a boundary (`SET ROLE NONE` on that
+connection is the admin). All of that is closed: see [Database identities](#database-identities).
+What is **not** closed: a `.pgpass` or `PG*` setting in **root's** own environment is root's to
+control; `hidepid` on `/proc` is not required by this design (nothing secret is on an argv any more)
+but is still worth having; and an operator who runs the helper by hand with the credential on a
+command line has put it there.
 
 **r33: the banners print the `sudo`, and that is not decoration.** r32 asked of every printed line
 "would it run if pasted?" and answered yes for these — correctly for root, and wrongly for the
@@ -3321,20 +3336,19 @@ bare assignment form is the one that has just been shown to be `Permission denie
 
 Two printed instructions whose answer does **not** differ by account, for completeness: the
 artefact-mismatch message's `cd /etc/ims-cutover-recovery/app && sha256sum -c …` runs for either
-reader — the recovery directory is `0755` and the artefact tree world-readable, because the fence
-itself runs as the application user — and the recovery invocation that re-runs an entrypoint now
+reader — the recovery directory is `0755` and the artefact tree world-readable, so the check needs
+no privilege — and the recovery invocation that re-runs an entrypoint now
 carries the same transition (`sudo env DEPLOY_ADMIN_DATABASE_URL=… bash …`), since those scripts
 refuse to run as anything but root.
 
 **The credential is the part no record may hold.** `DEPLOY_ADMIN_DATABASE_URL` carries a password
-and is written nowhere by these scripts. On a recovery where `APP_DIR/.env` is gone it can only
-come from the **root invocation**, and a recovery without it refuses, naming the variable and
-giving the invocation that supplies it. For the same reason the **invocation's value wins** over
-the file's since r30: the refusal tells an operator to type the variable on the command line
-precisely because that file cannot be relied on at that moment, so a file that could silently
-substitute a different privileged connection would make the instruction meaningless. Nothing
-changes on an ordinary run — `sudo scripts/update.sh` carries no such variable, so `.env` answers,
-exactly as before — and when both are set and differ, the disagreement is printed.
+and is written nowhere by these scripts' records. It comes from the **root invocation** or from the
+**root credential file** (see [Database identities](#database-identities)), the invocation first, and
+**never** from `APP_DIR/.env`: that file is owned by the application account, so a value in it is a
+value that account chose. A copy left in it is **refused** before anything is stopped, with the
+path to move it to, and is never used or moved by the scripts (adopting an application-owned value
+as a root credential is the trust inversion r30 removed). A recovery with no credential anywhere
+refuses, naming the file and the invocation that supply it.
 
 **r29: the shape guard classified physical lines while bash reads logical ones.** This was its
 fourth escape and the first three had disguised the cause. The operator-message shape explicitly
@@ -3562,9 +3576,12 @@ deliberate operator statement producing a different program, not an exemption.
 helper they invoke — `check-db-writers.mjs`, `check-prisma-drift.mjs`,
 `check-app-db-object-access.mjs`, `run-migration-verifications.mjs`, `check-wms-push-state-enum.mjs`,
 `provision-instance.mjs` — runs **as the application user** (`run_as_user "$APP_USER"` in
-`install.sh` and `update.sh`, `as_app_user` / `as_app_user_db` in `deploy.sh`), so no privilege is
-crossed however those bytes got there. `fence-db-connections.mjs` runs as the application user *and*
-out of the protected root-owned artefact at `/etc/ims-cutover-recovery/app`. `npm`, `npx prisma` and
+`install.sh` and `update.sh`, `as_app_user` / `as_app_user_db` in `deploy.sh`, and `run_as_user_db`
+for the steps that need the migration connection), so no privilege is crossed however those bytes
+got there — and since owner decision C3 none of them is given the admin credential: they read
+`DATABASE_URL` (the **migration URL** inside a window) and nothing else, handed over in the
+environment and never on a command line. `fence-db-connections.mjs` runs **as root**, out of the
+protected root-owned artefact at `/etc/ims-cutover-recovery/app`. `npm`, `npx prisma` and
 `next` likewise run as the application user. The five `source`s at the top of each entrypoint are
 read at startup, in the same instant as the entrypoint's own body, so they add no window the operator
 did not already accept — **in a tree only root can write**. Out of a tree another account can write that is false, because bash reads the entrypoint incrementally and each library later still, and root running out of such a tree is refused and not supported (o3d-z5be r5; see *Which invocations are supported*). That refusal reads ownership and modes, so it is **best-effort**: it cannot tell a tree that was relabelled with `chown`/`chmod` from one root created — see *[The supported bootstrap](#supported-bootstrap)*.
@@ -3893,14 +3910,126 @@ does not exist.
 A re-run **adopts** a held fence rather than releasing it: it re-applies the revoke (which re-drains
 anything that attached in between, while keeping the *original* recorded grants so the eventual
 release restores the truth) and runs every database-touching recovery step — the rebuild included —
-through `DEPLOY_ADMIN_DATABASE_URL`. Adopting a held fence without that variable set is fatal: the
-application role has no `CONNECT` and the run would have no connection to recover through.
+through the root-held admin credential. Adopting a held fence without one is fatal: the application
+role has no `CONNECT` and the run would have no connection to recover through.
 
-That fence needs a privileged connection of its own, `DEPLOY_ADMIN_DATABASE_URL`:
+#### Database identities
 
-| Variable | Purpose |
-| --- | --- |
-| `DEPLOY_ADMIN_DATABASE_URL` | A superuser or database-owner connection, as a **different role** from `DATABASE_URL`. Used only by the deploy scripts, and only for the migration window. No ACL can tell "the migration" apart from "the application" when both log in as one role, so without a separate role there is no fence to install. |
+*(owner decision C3, o3d-1bgr.)* A cutover uses three database identities and keeps them apart:
+
+| identity | power | who holds it | where |
+| --- | --- | --- | --- |
+| **application role** (`DATABASE_URL`) | the database owner (unchanged) | the application account | `APP_DIR/.env`, unchanged |
+| **migration role** (`<application role>_migrator`, unless the credential file names another) | `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`; a member of the application role (`INHERIT`, `SET`) and of nothing the application role is not; `CONNECT` of its own, which the fence never revokes | nobody persistently: it is `NOLOGIN` until a cutover window opens it with a **fresh random password** | in the **environment** of the application-account steps for the length of one window, never on a command line; closed again by `--release` |
+| **deploy admin** (`DEPLOY_ADMIN_DATABASE_URL`) | a superuser, or the database owner with `CREATEROLE` (and, from PostgreSQL 16, `ADMIN OPTION` on the migration role), as a **different role** from the application's | **root only** | `/etc/ims-db-admin/deploy-admin.env` (`root:root`, mode `0600`, in a `root:root` `0700` directory), or `sudo env DEPLOY_ADMIN_DATABASE_URL=… <command>` on the root invocation |
+
+**Why three.** The migration runs application-owned bytes — `prisma` out of the application's
+`node_modules`, the migration SQL in the checkout, package scripts — over a connection. That
+connection used to log in as the deploy admin with `options=-c role=<app>`, which is a session
+default and **not a boundary**: `SET ROLE NONE` on it is the admin (and for a superuser admin,
+`SET SESSION AUTHORIZATION` too; plain `RESET ROLE` only returns to the `role=` default, which is
+why the escape is `SET ROLE NONE`). Anything running inside the window therefore held superuser.
+The migration now logs in as a role worth nothing: after `SET ROLE NONE` it is the migration
+role, which can do what the application can do and no more, and the objects it creates are owned
+by the application role exactly as an unfenced migration's would be.
+
+**What the operator does.**
+
+* **Fresh install.** Supply the admin URL on the invocation (`sudo env DEPLOY_ADMIN_DATABASE_URL=… bash install.sh`) or
+  put it in the credential file first. `install.sh` records it in the root file (`root:root` `0600`;
+  an existing directory with another owner or mode is refused, not repaired), creates the migration
+  role when it manages the PostgreSQL server, and never writes the admin URL into `APP_DIR/.env`.
+  On an **external** database it neither creates nor checks the role: it prints the three
+  statements below, and `--preflight` refuses a cutover until the role exists and holds nothing of
+  its own. A **first install** performs no fenced cutover and needs no admin connection at all.
+* **Upgrade.** `sudo bash scripts/update.sh` (or `deploy.sh`) reads the root file. There is no `.env` editing.
+  An admin URL **left in the application's `.env`** is **refused before anything is stopped**: the
+  message names the root file; the scripts never use or move that value, because adopting an
+  application-owned value as a root credential is the inversion this closes. Remove the line from
+  `.env` and put it in the root file.
+* **Recovery.** `sudo /etc/ims-cutover-recovery/release-db-fence` (or `refence-db`) reads the root
+  file; or `sudo env DEPLOY_ADMIN_DATABASE_URL=… <wrapper|entrypoint>`. **Prefer the file.** A value
+  typed after `sudo env` is on the command line of the `sudo` that wraps the command for the length
+  of the run, readable by every local account unless `/proc` is mounted with `hidepid`; the file is
+  not on any command line. In both cases the entrypoint un-exports the variable at once, so
+  nothing it starts as the application account inherits it.
+
+**The credential file.** Two keys, read as data (never sourced): `DEPLOY_ADMIN_DATABASE_URL` and
+`IMS_MIGRATION_ROLE` (a name, not a secret). The reader refuses, naming the file and the fault, a
+file that is a symbolic link, is not owned by root, is readable by anyone but root, or sits under a
+directory root does not own or another account can write; and it judges the file **again off the
+open descriptor**, so a name swapped between the check and the read cannot supply the value.
+
+**The migration role, by hand** (what `install.sh` runs for a local server, and what an external
+database needs once, as a superuser of that server):
+
+```sql
+CREATE ROLE "imsuser_migrator" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+GRANT "imsuser" TO "imsuser_migrator" WITH INHERIT TRUE, SET TRUE;   -- PostgreSQL 16+; before it: GRANT "imsuser" TO "imsuser_migrator";
+GRANT CONNECT ON DATABASE "onetwoinventory" TO "imsuser_migrator";
+COMMENT ON ROLE "imsuser_migrator" IS 'ims migration login: created by the IMS installer, holds nothing of its own';
+```
+
+**A role that already exists is never adopted.** The comment above is the marker: `install.sh`,
+`provision-ims-tenant.sh` and `--ensure-migration-role` refuse (before granting or altering anything,
+in one transaction) a role under that name that does not carry it, because such a role may be a login
+with a known password and the grants would hand it the application's privileges. `--preflight`
+additionally refuses a marked role that owns or is granted anything of its own anywhere in the
+cluster (owned objects, direct grants, default privileges), that carries `ALTER ROLE ... SET`
+settings, or that reaches a role the application cannot (for example `pg_read_server_files`).
+
+or, as root with the admin credential in the file or on the invocation,
+`node /etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs --ensure-migration-role --app-host=… --app-port=… --app-user=… --app-database=… --migration-role=…`,
+which creates the role only if it is absent and **refuses**, by name, one that exists with a
+privilege it must not have (it never demotes a role somebody else made).
+
+**How the window's login is opened and closed.** `--print-migration-url` connects as the admin
+once, reads **from the server** (not from configuration) that the migration role is not a
+superuser, holds none of `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`, is a member of
+nothing the application role is not, can `SET ROLE` to the application role, has `CONNECT` of its
+own, and can be altered by the admin; then sets `ALTER ROLE … LOGIN PASSWORD '<verifier>'` with 256
+random bits sent as a client-computed **SCRAM-SHA-256 verifier**, so the plaintext is in no server
+log (a `log_statement = 'all'` log carries the verifier, which is not the password), and prints a URL
+for the migration role with the same host, port and database as the admin URL, only its transport-trust
+query parameters (`sslmode`, `sslrootcert`, `sslcrl`, `sslsni`, `uselibpqcompat`, `connect_timeout`), plus
+`options=-c role=<app>` and the window's binding stamp. The admin login and password are never in
+that URL. `--release` ends with `ALTER ROLE … NOLOGIN PASSWORD NULL` and then **asks the server** (`rolcanlogin`
+false and, where the admin may read it, a null password). A login that cannot be confirmed closed
+(retried once) makes the **release fail** *before any `CONNECT` is restored*: the login is closed and
+confirmed first, so on failure the application role still has no `CONNECT`, the fence stands and the record
+is untouched. The message gives the one statement that closes the login by hand; re-running the release is
+idempotent and retries it. After **any** release that did not succeed, the helper reads the ACL again on a **fresh
+connection** and prints one machine line, `FENCE_STATE=held|restored|unknown`; the entrypoints and the recovery
+wrapper treat only `held` as a fence that is still standing (a failed release can have committed its grants: the
+verification read failed, or the `COMMIT` acknowledgement was lost), so on `restored` or `unknown` the entrypoint
+clears its own "fence is up" flag, says so, and re-fences on the way out. `--preflight` and `--fence` also refuse a
+migration login that is **already open** (`LOGIN`, or a stored password) with the statement that closes it, and
+`--fence` asks again at the end of the drain. The stored password is read only where the admin may read
+`pg_authid` (a database-owner admin with `CREATEROLE` may not: then only `LOGIN` decides). The fresh
+`FENCE_STATE` read is **bound to the server the release ran on** (postmaster start time, database OID and, where
+readable, the system identifier, compared with the ones the release connection reported before it granted
+anything); a connection that lands anywhere else prints `FENCE_STATE=unknown`. An unreadable system identifier
+never matches: where it cannot be read on both connections the state is `unknown` after a failed release, and the
+entrypoint re-fences, which is the safe direction.
+
+**One cutover host per database.** The cutover lock that serialises fence, migration and release is a file on the
+host running the entrypoint. It does not exclude a cutover started from a second host against the same database:
+both can pass the ACL check, both fence (the second revoke is a no-op) and both enter a window, and the first
+release then restores `CONNECT` under the other's migration. IMS is a single-application-host install, so this is
+an operator-error case, but it is not detected. Never run two cutovers against one database. If a second cutover is
+suspected, stop both, run `SELECT datacl FROM pg_database WHERE datname = current_database();` and
+`SELECT pid, usename, application_name, backend_start FROM pg_stat_activity WHERE datname = current_database();` to
+see what is attached, re-run a single `update.sh` from one host (it re-fences from the record), and check the
+migration with `prisma migrate status`. A database-wide lease is tracked as a follow-up. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
+as the application role, or it is not printed and the login is closed again. A window that is
+**interrupted** leaves a password nobody holds; the next window mints another.
+
+**What is not done here.** A password-less admin through local peer authentication for a
+`postgres` OS user (no stored admin password at all) is a separate change. `pg_dump`, which takes a
+connection only as an argument, is given the migration URL through a mode-`0600` libpq service
+file that exists for the length of the dump, so the URL is never on its command line. Production's
+PostgreSQL topology and major version were not available when this was written: the `WITH SET`
+syntax needs 16+, and the plain `GRANT` is used below that.
 
 **Who the migration runs as, which is not who it connects as** (o3d-2sm1.5). This table used to
 end with *"objects a migration creates are owned by this role — point it at the role that owns the
@@ -3915,16 +4044,19 @@ hook and `pg_dump` all use **the same admin connection**, which owns the new obj
 them perfectly; the health check hits a route that touches no database. The deploy reported
 success and every request touching the new table failed with `permission denied`.
 
-So the migration **connects as the admin and runs as the application role**: the deploy composes
-the migration URL with `options=-c role=<app role>`, which Postgres applies at connection start.
-Authentication — and therefore the `CONNECT` check the fence revokes — is still the admin's, so
-the fence still holds; ownership is the application's, so the fenced path leaves the database in
-exactly the state an unfenced migration would.
+So the migration **connects as the migration role and runs as the application role** (until owner
+decision C3 it connected as the admin, which is a session default away from being the admin: see
+[Database identities](#database-identities)): the deploy composes the migration URL with
+`options=-c role=<app role>`, which Postgres applies at connection start. Authentication — and
+therefore the `CONNECT` check the fence revokes — is the migration role's own, which the fence
+exempts, so the fence still holds; ownership is the application's, so the fenced path leaves the
+database in exactly the state an unfenced migration would.
 
 It is not taken on trust:
 
 * `scripts/fence-db-connections.mjs --preflight` **refuses before anything is stopped** if the
-  admin cannot `SET ROLE` to the application role, naming the `GRANT` that fixes it;
+  migration role is missing, holds a privilege, cannot `SET ROLE` to the application role or lacks a
+  `CONNECT` of its own, or if the admin cannot alter it, naming the statement that fixes it;
 * `scripts/check-app-db-object-access.mjs` runs after **every** migration, before the new build
   starts, and asks the database — about the **application** role, which is the one question none
   of the other steps ask — whether it can `SELECT`, `INSERT`, `UPDATE` and `DELETE` every table,

@@ -3445,9 +3445,9 @@ db_fence_clear_authority() {
 # not passed in separately: a second parameter could drift from the argument, and then root would
 # be checking the request against the request.
 #
-# db_fence_helper() is the one thing each entrypoint supplies for itself -- the three of them drop
-# to ${APP_USER} in three different ways, with three different environments -- and it is the only
-# part of raising a fence that is not written down once.
+# db_fence_helper() is still supplied by each entrypoint, but since owner decision C3 it is a
+# one-line call to db_fence_exec_root() below: the helper runs as ROOT, never as ${APP_USER}, and
+# the three entrypoints no longer spell three different privilege drops.
 # ---------------------------------------------------------------------------
 # THE CONNECTION WITNESS (o3d-secops r31, Codex HIGH 1)
 #
@@ -3565,6 +3565,17 @@ db_fence_machine_field() {
   [[ "${hits}" -eq 1 ]] || return 1
   [[ "${value}" =~ ${shape} ]] || return 1
   printf '%s\n' "${value}"
+}
+
+# WHAT A RELEASE THAT DID NOT SUCCEED LEFT STANDING, READ FROM THE DATABASE'S OWN ANSWER (Codex round 3,
+# HIGH). The helper reads the ACL again on a fresh connection after any failed release and prints one whole
+# line, FENCE_STATE=held|restored|unknown. This returns that word, and `unknown` for anything else: no line,
+# two lines, a value that is not one of the three. Callers treat only `held` as a fence that is standing;
+# an exit status or a flag is never the evidence, because the GRANT may have committed before the failure.
+db_fence_state_after_release() {
+  local state=""
+  state="$(db_fence_machine_field "$1" FENCE_STATE '^(held|restored|unknown)$')" || state="unknown"
+  printf '%s\n' "${state}"
 }
 
 db_fence_machine_verdict() {
@@ -4133,6 +4144,368 @@ db_fence_raise() {
 }
 
 # ---------------------------------------------------------------------------
+# WHERE THE DEPLOY ADMIN CREDENTIAL LIVES, AND WHO RUNS WITH IT (owner decision C3, o3d-1bgr)
+#
+# THE DEFECT THIS REPLACES. The admin database credential (DEPLOY_ADMIN_DATABASE_URL) used to sit
+# in the application's own `.env`, and every fence mode ran AS the application account with it in
+# the environment. So the account the fence exists to hold out of the database could issue any SQL
+# the admin could, all the time (the file) and for the whole window (the helper), and the
+# `ps`/environment exposure of `runuser ... env VAR=secret` made it readable by every local
+# account besides. Rounds 13-34 of the cutover work hardened what that account could PLANT; none of
+# them removed what it could READ.
+#
+# THE RULE NOW, in three parts:
+#   1. THE CREDENTIAL IS ROOT'S. It is read from the invocation (`sudo env DEPLOY_ADMIN_DATABASE_URL=... `)
+#      or from ${DB_ADMIN_CREDENTIAL_FILE}, a root-owned 0600 file in a root-owned 0700 directory,
+#      and from nowhere else. The application's `.env` is never consulted for it.
+#   2. THE HELPER IS ROOT'S TOO. Every mode of the sealed fence artefact runs through
+#      db_fence_exec_root(), as root, with a scrubbed environment, from `/`, with nothing secret on
+#      any argv. The application account is never handed the admin credential.
+#   3. THE MIGRATION CONNECTS AS A ROLE WORTH NOTHING (see fence-db-connections.mjs). Application-owned
+#      bytes get a login that can do what the application can do and nothing more, with a password
+#      minted for the window.
+#
+# WHAT THE ROOT CREDENTIAL FILE HOLDS: DEPLOY_ADMIN_DATABASE_URL, and IMS_MIGRATION_ROLE (a name, not
+# a secret). It is read as DATA, one key at a time, never sourced.
+# ---------------------------------------------------------------------------
+readonly DB_ADMIN_CREDENTIAL_DIR="/etc/ims-db-admin"
+readonly DB_ADMIN_CREDENTIAL_FILE="${DB_ADMIN_CREDENTIAL_DIR}/deploy-admin.env"
+# THE DIRECTORY THE OWNERSHIP WALK UP FROM THE CREDENTIAL FILE STOPS AT, and a literal for the reason
+# every other root here is: `/` on a host (every component up to it must be root's and unwritable by
+# anyone else), a scratch directory in the harnesses that rewrite this one line.
+readonly DB_ADMIN_CREDENTIAL_TRUST_ROOT="/"
+
+# THE ONE SENTENCE ABOUT WHERE THE CREDENTIAL LIVES. Every refusal, banner and wrapper message about
+# it is this function's output, and the recovery wrappers bake it in (declare -f), so there is one
+# text and no copy to drift. The wording is conditional on what was actually found:
+#   where    the plain statement, for a message that only needs to say where to look
+#   absent   nothing was supplied and no file exists: how to supply one
+#   refused  a file exists and was NOT read, and why that is the operator's to fix
+#   env-copy the application's own .env still holds a copy (${2} is that file)
+#   nonroot  this account cannot read the root-only location
+db_admin_credential_instruction() {
+  local situation="${1:-where}" detail="${2:-}" file="${DB_ADMIN_CREDENTIAL_FILE}" dir="${DB_ADMIN_CREDENTIAL_DIR}"
+  case "${situation}" in
+    absent)
+      printf '%s' "DEPLOY_ADMIN_DATABASE_URL was not supplied on this invocation and there is no ${file}. It is the root-only credential of a superuser or database-owner login that is a DIFFERENT role from the application's, and it lives in that file (root:root, mode 0600, in ${dir}, mode 0700) -- never in the application's environment file, which the application account can write. Supply it for this run with: sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' <this command> (that puts it on a command line for the length of the run; the file does not). To keep it, create ${dir} as root (owned by root, mode 0700) and put DEPLOY_ADMIN_DATABASE_URL=postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE in ${file} with an editor as root under umask 077, so the password is never on a command line. See docs/installation.md."
+      ;;
+    refused)
+      printf '%s' "${file} exists but was NOT used: ${detail}. It must be a regular file (not a link) owned by root, readable by nobody else (mode 0600), inside directories only root can write. Fix that as root (the file must belong to root:root with mode 0600, and ${dir} to root:root with mode 0700); nothing is taken from it until it is right."
+      ;;
+    env-copy)
+      printf '%s' "${detail} still defines DEPLOY_ADMIN_DATABASE_URL. That file belongs to the application account, which must never hold the admin credential, and this run will not use or move it (it would be adopting an application-owned value as a root credential). Remove the line from ${detail} and put it in ${file} instead (root:root, mode 0600, in ${dir}, mode 0700, written as root under umask 077), or supply it for this run with: sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' <this command>. Nothing has been stopped and nothing has been changed."
+      ;;
+    nonroot)
+      printf '%s' "the admin credential is root-only (${file}, or sudo env DEPLOY_ADMIN_DATABASE_URL=... on the invocation) and this account is not root, so this run cannot use or even inspect it. Re-run as root."
+      ;;
+    *)
+      printf '%s' "DEPLOY_ADMIN_DATABASE_URL is taken from the root-owned credential file ${file} (root:root, mode 0600, in ${dir}, mode 0700), or from the invocation (sudo env DEPLOY_ADMIN_DATABASE_URL=... <command>), which takes precedence. It is never taken from the application's environment file."
+      ;;
+  esac
+}
+
+# ONE KEY OUT OF DOTENV-STYLE TEXT ON STDIN, WITHOUT `source`, which would execute it. The rules are
+# dotenv's own and match env_file_value() in the entrypoints: a quoted value ends at its closing
+# quote, an unquoted one at the first whitespace-preceded `#`, and later definitions win.
+db_admin_env_text_value() {
+  local key="$1" line value="" seen=0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=(.*)$ ]]; then
+      value="${BASH_REMATCH[2]}"
+      seen=1
+    fi
+  done
+  [[ "${seen}" -eq 1 ]] || return 0
+  value="${value#"${value%%[![:space:]]*}"}"
+  case "${value}" in
+    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
+    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
+    *)
+      value="${value%%[[:space:]]#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+      ;;
+  esac
+  printf '%s' "${value}"
+}
+
+# IS THIS FILE ONE A ROOT CREDENTIAL MAY BE READ FROM? Prints the reason on stdout and returns 1 when
+# it is not; returns 2 when there is nothing at the path. ${2} is the uid it must belong to (0 on
+# an installed host; a parameter so the tests can run unprivileged, for the reason
+# publish_durable_file() asks `id -u`) and ${3} the directory the walk up stops at (/ on a host).
+# Every component from the file's directory up to and including ${3} must belong to that uid and be
+# writable by neither group nor other: a root-owned file inside a directory somebody else may write
+# can simply be replaced.
+db_admin_credential_check() {
+  local file="$1" want_uid="${2:-0}" stop_dir="${3:-${DB_ADMIN_CREDENTIAL_TRUST_ROOT}}" meta kind owner mode dir
+  if [[ ! -e "${file}" && ! -L "${file}" ]]; then
+    return 2
+  fi
+  if [[ -L "${file}" ]]; then
+    printf 'it is a symbolic link'
+    return 1
+  fi
+  meta="$(LC_ALL=C stat -c '%F|%u|%a' -- "${file}" 2>/dev/null)" || { printf 'it could not be examined (%s)' "${file}"; return 1; }
+  IFS='|' read -r kind owner mode <<<"${meta}"
+  if [[ "${kind}" != "regular file" && "${kind}" != "regular empty file" ]]; then
+    printf 'it is a %s, not a regular file' "${kind}"
+    return 1
+  fi
+  if [[ "${owner}" != "${want_uid}" ]]; then
+    printf 'it is owned by uid %s, not %s' "${owner}" "${want_uid}"
+    return 1
+  fi
+  if (( (8#${mode} & 0077) != 0 )); then
+    printf 'its mode is %s: anything but 0600 or stricter lets another account see the credential' "${mode}"
+    return 1
+  fi
+  dir="${file%/*}"
+  while :; do
+    [[ -n "${dir}" ]] || dir="/"
+    # A COMPONENT THAT IS A LINK IS JUDGED BY ITS TARGET'S OWNER AND NOT BY THE DIRECTORY IT SITS IN,
+    # so a root-owned target reached through a link placed in a directory somebody else may write
+    # would pass every test below while the NAME stayed theirs to re-point. No component may be one.
+    if [[ -L "${dir}" ]]; then
+      printf 'the path component %s is a symbolic link' "${dir}"
+      return 1
+    fi
+    meta="$(LC_ALL=C stat -c '%u|%a' -- "${dir}" 2>/dev/null)" || { printf 'the directory %s could not be examined' "${dir}"; return 1; }
+    IFS='|' read -r owner mode <<<"${meta}"
+    if [[ "${owner}" != "${want_uid}" ]]; then
+      printf 'the directory %s is owned by uid %s, not %s' "${dir}" "${owner}" "${want_uid}"
+      return 1
+    fi
+    if (( (8#${mode} & 0022) != 0 )); then
+      printf 'the directory %s is writable by group or other (mode %s), so the file could be replaced' "${dir}" "${mode}"
+      return 1
+    fi
+    [[ "${dir}" == "${stop_dir}" || "${dir}" == "/" ]] && break
+    dir="${dir%/*}"
+  done
+  return 0
+}
+
+# ONE KEY FROM THE ROOT CREDENTIAL FILE. Prints the value; prints NOTHING and returns 2 when the
+# file is simply absent (the caller decides what that means) and returns 1, naming the file and the
+# fault on stderr, when it exists and may not be read. The file is judged BEFORE it is opened and
+# again off the DESCRIPTOR it is read from (same inode, a regular file, the right owner, no group or
+# other access), so a name swapped between the check and the read cannot supply the value.
+db_admin_credential_read() {
+  local key="$1" file="${2:-${DB_ADMIN_CREDENTIAL_FILE}}" want_uid="${3:-0}" stop_dir="${4:-${DB_ADMIN_CREDENTIAL_TRUST_ROOT}}"
+  local why rc=0 before after fd content
+  why="$(db_admin_credential_check "${file}" "${want_uid}" "${stop_dir}")" || rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
+    return 2
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "REFUSING to use ${file}: ${why}. $(db_admin_credential_instruction refused "${why}")" >&2
+    return 1
+  fi
+  before="$(LC_ALL=C stat -c '%i' -- "${file}" 2>/dev/null)" || before=""
+  # A failed `exec` redirection can end a non-interactive shell (and a refusal that kills the caller is
+  # not the refusal this function owes it), so readability is asked first.
+  if [[ ! -r "${file}" ]] || ! exec {fd}<"${file}"; then
+    echo "REFUSING to use ${file}: it could not be opened. $(db_admin_credential_instruction refused "it could not be opened")" >&2
+    return 1
+  fi
+  after="$(LC_ALL=C stat -L -c '%F|%u|%a|%i' "/proc/self/fd/${fd}" 2>/dev/null)" || after=""
+  local fkind fowner fmode finode
+  IFS='|' read -r fkind fowner fmode finode <<<"${after}"
+  if [[ ( "${fkind}" != "regular file" && "${fkind}" != "regular empty file" ) || "${fowner}" != "${want_uid}" || -z "${fmode}" ]] \
+     || (( (8#${fmode} & 0077) != 0 )) || [[ -z "${before}" || "${finode}" != "${before}" ]]; then
+    exec {fd}<&-
+    echo "REFUSING to use ${file}: the file opened is not the one that was checked (${after:-unreadable}). $(db_admin_credential_instruction refused "it changed between the check and the open")" >&2
+    return 1
+  fi
+  content="$(cat <&"${fd}")"
+  exec {fd}<&-
+  printf '%s\n' "${content}" | db_admin_env_text_value "${key}"
+}
+
+# D2: A LEFTOVER ADMIN KEY IN THE APPLICATION'S .env IS REFUSED, NOT MOVED. ${1} is that file. It is
+# read as data; a non-empty value is a refusal whose message is the one source of text, and nothing
+# is done with the value. Called by deploy.sh and update.sh before anything is stopped, and by
+# install.sh before it rewrites the file.
+db_admin_credential_refuse_env_copy() {
+  local app_env_file="$1" copy=""
+  [[ -f "${app_env_file}" ]] || return 0
+  copy="$(db_admin_env_text_value DEPLOY_ADMIN_DATABASE_URL < "${app_env_file}")" || copy=""
+  [[ -n "${copy}" ]] || return 0
+  echo "REFUSING: $(db_admin_credential_instruction env-copy "${app_env_file}")" >&2
+  return 1
+}
+
+# THE CREDENTIAL AN ENTRYPOINT RUNS WITH. Precedence: the root invocation, then the root file; the
+# application's .env never. Sets DEPLOY_ADMIN_DATABASE_URL and DB_MIGRATION_ROLE and UN-EXPORTS both
+# (L6): bash keeps an inherited variable exported when it is reassigned, and every child run as
+# the application account would otherwise inherit the credential an operator typed on `sudo env`.
+# ${1} is the application's .env, only to refuse a copy of the credential in it. Returns 1 (message
+# on stderr) when the .env holds a copy or the file exists and may not be read. An absent credential
+# is NOT a failure here: each entrypoint refuses, in the place and words that suit it, when it needs one.
+# (DB_MIGRATION_ROLE, which this sets, is deliberately NOT declared at script scope here: it reaches an
+# argument of a root `node`, so it may not be a mutable library-scope name, and every reader of it
+# defaults it with ${DB_MIGRATION_ROLE:-}.)
+db_admin_credential_load() {
+  # ${2}-${4} are the file, the uid it must belong to and the directory the ancestry walk stops at:
+  # the installed defaults, and parameters only so a test can run the real code unprivileged.
+  local app_env_file="${1:-}" file="${2:-${DB_ADMIN_CREDENTIAL_FILE}}" want_uid="${3:-0}" stop_dir="${4:-${DB_ADMIN_CREDENTIAL_TRUST_ROOT}}" invocation="" role="" rc=0
+  export -n DEPLOY_ADMIN_DATABASE_URL IMS_MIGRATION_ROLE 2>/dev/null || true
+  invocation="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  role="${IMS_MIGRATION_ROLE:-}"
+  DEPLOY_ADMIN_DATABASE_URL=""
+  if [[ -n "${app_env_file}" ]]; then
+    db_admin_credential_refuse_env_copy "${app_env_file}" || return 1
+  fi
+  local file_url="" file_role=""
+  file_url="$(db_admin_credential_read DEPLOY_ADMIN_DATABASE_URL "${file}" "${want_uid}" "${stop_dir}")" || rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    file_role="$(db_admin_credential_read IMS_MIGRATION_ROLE "${file}" "${want_uid}" "${stop_dir}")" || file_role=""
+  elif [[ "${rc}" -eq 1 && -z "${invocation}" ]]; then
+    return 1
+  fi
+  DEPLOY_ADMIN_DATABASE_URL="${invocation:-${file_url}}"
+  DB_MIGRATION_ROLE="${role:-${file_role}}"
+  export -n DEPLOY_ADMIN_DATABASE_URL IMS_MIGRATION_ROLE 2>/dev/null || true
+  return 0
+}
+
+# THE MIGRATION ROLE'S NAME, from the first of: the role recorded with the credential, the one named
+# in an --app-user argument plus `_migrator`. A name that is not a plain identifier is refused, so
+# nothing that reaches an argument can be anything but a role name. With neither there is no name and
+# nothing is printed (status 0): the helper itself refuses every mode that needs the application's
+# identity without one, and the modes that need a migration role refuse without --migration-role.
+db_migration_role_for() {
+  local role="${DB_MIGRATION_ROLE:-}" arg
+  if [[ -z "${role}" ]]; then
+    for arg in "$@"; do
+      case "${arg}" in
+        --app-user=*) printf -v role '%s_migrator' "${arg#--app-user=}" ;;
+      esac
+    done
+  fi
+  [[ -n "${role}" ]] || return 0
+  [[ "${role}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || return 1
+  printf '%s' "${role}"
+}
+
+# THE ONE WAY THE FENCE HELPER IS EXECUTED, AS ROOT, WITH THE ADMIN CREDENTIAL (owner decision C3).
+#
+#   db_fence_exec_root <script> <helper arguments...>
+#
+# Replaces the three per-entrypoint `run_as_user APP_USER env DEPLOY_ADMIN_DATABASE_URL=...`
+# spellings and the wrappers' `runuser`. Run in a SUBSHELL; nothing here changes the caller:
+#   * every exported variable except PATH, LANG and LC_ALL is UNSET first -- NODE_OPTIONS and
+#     NODE_PATH would run the invoker's code inside the process holding the credential, and PG* and
+#     HOME would steer which server and which .pgpass it uses -- and so is every exported function;
+#   * the credential and the migration role are then exported by NAME into that clean process, so
+#     no secret is on any argv (an `env VAR=secret cmd` is readable in `ps` by every local account);
+#   * it runs from `/`, with `exec`, so there is no shell between this and node.
+# HOME is therefore unset and node resolves ~ from the passwd entry: the .pgpass pg would consult is
+# ROOT'S OWN, which is the account holding the credential in any case.
+_db_fence_scrub_environment() {
+  local name
+  for name in $(compgen -e); do
+    case "${name}" in
+      PATH|LANG|LC_ALL) ;;
+      *) unset -v "${name}" 2>/dev/null || true ;;
+    esac
+  done
+  # Captured with its status taken (a process substitution reports its producer's failure to nobody),
+  # then read from a here-string.
+  local exported_functions=""
+  exported_functions="$(declare -Fx)" || exported_functions=""
+  while read -r _ _ name; do
+    [[ -n "${name}" ]] && unset -f "${name}" 2>/dev/null || true
+  done <<<"${exported_functions}"
+}
+
+db_fence_exec_root() {
+  # The APPLICATION's own DATABASE_URL travels too (empty when the caller has none): `--release` with no
+  # record connects AS THE APPLICATION to prove it can get in, and it did that with this value when the
+  # helper ran as the application account. It is the application's credential, which root already holds
+  # (the entrypoints read it out of .env), and it is not the admin's.
+  local fence_script="$1" role admin="${DEPLOY_ADMIN_DATABASE_URL:-}" app_url="${DATABASE_URL:-}"
+  shift
+  role="$(db_migration_role_for "$@")" || {
+    echo "The migration role name could not be determined or is not a plain identifier, so the fence helper was not run. Nothing has been changed." >&2
+    return 1
+  }
+  (
+    _db_fence_scrub_environment
+    export DEPLOY_ADMIN_DATABASE_URL="${admin}"
+    if [[ -n "${app_url}" ]]; then export DATABASE_URL="${app_url}"; fi
+    cd / || exit 1
+    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"}
+  )
+}
+
+# THE SAME, FOR THE MODES THAT OPEN THE MIGRATION'S OWN URL (--bind-migration): its credential is
+# the migration URL in ${DB_FENCE_EXEC_DATABASE_URL}, which is all that is exported -- the admin
+# credential is not given to a process that has no use for it.
+db_fence_exec_root_with_database_url() {
+  local fence_script="$1" role url="${DB_FENCE_EXEC_DATABASE_URL:-}"
+  shift
+  role="$(db_migration_role_for "$@")" || return 1
+  (
+    _db_fence_scrub_environment
+    export DATABASE_URL="${url}"
+    cd / || exit 1
+    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"}
+  )
+}
+
+# `pg_dump` THROUGH A CONNECTION URL, WITHOUT THE URL ON ANY COMMAND LINE. libpq takes a connection
+# string only as an argument, and an argument is readable by every local account for as long as the
+# process lives. The URL is therefore turned into a libpq SERVICE FILE (a mode-0600 file in a
+# directory this call makes and removes), and `pg_dump service=ims_migration` is the whole of what
+# is on the command line. Every query parameter of the URL (`options`, `application_name` -- the
+# window's binding stamp -- `sslmode` and the rest) becomes a service keyword, so the dump connects
+# exactly as every other consumer of that string does. The dump goes to stdout.
+db_pg_dump_through_url() {
+  local url="$1" dir rc=0
+  dir="$(mktemp -d)" || return 1
+  if ! ( umask 077; export DB_PG_SERVICE_URL="${url}"; env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e '
+const fs = require("node:fs")
+const u = new URL(process.env.DB_PG_SERVICE_URL)
+const kv = {}
+const host = decodeURIComponent(u.hostname).replace(/^\[|\]$/g, "")
+if (host) kv.host = host
+if (u.port) kv.port = u.port
+if (u.username) kv.user = decodeURIComponent(u.username)
+if (u.password) kv.password = decodeURIComponent(u.password)
+const db = decodeURIComponent(u.pathname.replace(/^\//, ""))
+if (db) kv.dbname = db
+for (const [k, v] of u.searchParams) kv[k] = v
+const lines = ["[ims_migration]"]
+for (const [k, v] of Object.entries(kv)) {
+  if (/[\r\n]/.test(v)) { console.error("a connection parameter contains a line break"); process.exit(1) }
+  lines.push(k + "=" + v)
+}
+fs.writeFileSync(process.argv[1], lines.join("\n") + "\n", { mode: 0o600, flag: "wx" })
+' "${dir}/service.conf" ); then
+    rm -f -- "${dir}/service.conf"; rmdir -- "${dir}" 2>/dev/null || true
+    return 1
+  fi
+  PGSERVICEFILE="${dir}/service.conf" pg_dump "service=ims_migration" || rc=$?
+  rm -f -- "${dir}/service.conf"; rmdir -- "${dir}" 2>/dev/null || true
+  return "${rc}"
+}
+
+# RUN A COMMAND AS THE APPLICATION ACCOUNT WITH WHAT THE CALLER HAS EXPORTED, never what is written
+# on a command line. `runuser -u` keeps the environment; `sudo -u` resets it (the step would silently
+# lose its DATABASE_URL) and `su -c` would put the values on argv. So it REFUSES, rather than
+# falling back, when runuser is missing.
+db_run_as_user_inheriting_env() {
+  local user="$1"
+  shift
+  if ! command -v runuser >/dev/null 2>&1; then
+    echo "runuser is not available, and the fallbacks (sudo -u resets the environment, su -c puts values on the command line) would either lose the connection string or expose it. Install util-linux's runuser." >&2
+    return 1
+  fi
+  runuser -u "${user}" -- "$@"
+}
+
+# ---------------------------------------------------------------------------
 # THE TWO COMMANDS AN OPERATOR IS EVER GIVEN (o3d-2sm1.5 r32, Codex HIGH x2)
 #
 # Both findings were the same defect: the code was fixed and the operator-facing text still
@@ -4197,7 +4570,9 @@ db_fence_publish_operator_wrappers() {
   # step with /etc/ims-cutover-state, and a wrapper locking a DIFFERENT file from the one deploy.sh
   # locks would report an exclusion it does not have -- which is the shape of the finding, not a
   # fix for it.
-  local app_user="$1" env_file="$2" state_file="$3" cutover_lock="$4" artefact_digest
+  # ${2} is the ROOT CREDENTIAL FILE the wrappers read the admin URL from (owner decision C3). It
+  # used to be the application's .env; nothing a wrapper does reads that file any more.
+  local app_user="$1" credential_file="$2" state_file="$3" cutover_lock="$4" artefact_digest
   shift 4
   if [[ -z "${cutover_lock}" ]]; then
     echo "The operator wrappers were not told which file the shared cutover lock lives at. They open a fence record, ask the database about it and then write or remove it, and a sequence that is not serialised against a running cutover can act on a record that changed underneath it. Refusing to publish them." >&2
@@ -4258,6 +4633,13 @@ db_fence_publish_operator_wrappers() {
     esac
   done
   [[ -n "${expected_app_role}" ]] || expected_app_role="${expected_app_user}"
+  # THE MIGRATION ROLE THE WRAPPERS EXEMPT FROM A FENCE AND CLOSE AT A RELEASE, baked from the same
+  # rule the entrypoints use (the role recorded with the credential, else <app user>_migrator).
+  local baked_migration_role
+  baked_migration_role="$(db_migration_role_for "$@")" || {
+    echo "The migration role name could not be determined or is not a plain identifier, so the operator wrappers were not published." >&2
+    return 1
+  }
 
   # LOWERCASE NAMES INSIDE THE GENERATED SCRIPT, deliberately. The wrapper body below is a
   # QUOTED heredoc — bash writes it out, it does not expand it — but the repository's `set -u`
@@ -4274,11 +4656,23 @@ db_fence_publish_operator_wrappers() {
     {
       printf '#!/bin/bash\n'
       printf '# GENERATED BY scripts/lib/db-fence-protected.sh. Root-owned, and deliberately\n'
-      printf '# self-contained: it reads nothing out of the application checkout except the\n'
-      printf '# credential in %s, which is where the deploy reads it from too.\n' "${env_file}"
+      printf '# self-contained: it reads nothing out of the application checkout, and the admin\n'
+      printf '# credential only from the invocation or from the root-owned file %s.\n' "${credential_file}"
       printf 'set -uo pipefail\n'
-      printf 'app_env_file=%q\n' "${env_file}"
+      printf 'credential_file=%q\n' "${credential_file}"
+      # The uid that file must belong to, asked at publication for the reason the state owner is
+      # (publish_durable_file asks `id -u`): the property is "the privileged account that owns this
+      # install", and asking is what lets the regressions run unprivileged.
+      printf 'credential_uid=%q\n' "$(id -u)"
+      printf 'migration_role=%q\n' "${baked_migration_role}"
       printf 'app_account=%q\n' "${app_user}"
+      printf 'DB_ADMIN_CREDENTIAL_TRUST_ROOT=%q\n' "${DB_ADMIN_CREDENTIAL_TRUST_ROOT}"
+      printf 'DB_ADMIN_CREDENTIAL_FILE=%q\n' "${credential_file}"
+      printf 'DB_ADMIN_CREDENTIAL_DIR=%q\n' "${credential_file%/*}"
+      # ONE TEXT, AND ONE READER, FROM THE LIBRARY'S SINGLE COPY: the functions are written out of
+      # this shell's own definitions, so a wrapper carries what the entrypoints run and not a
+      # second version somebody typed.
+      declare -f db_admin_credential_instruction db_admin_env_text_value db_admin_credential_check db_admin_credential_read _db_fence_scrub_environment
       printf 'protected_dir=%q\n' "${DB_FENCE_PROTECTED_APP_DIR}"
       printf 'helper=%q\n' "${DB_FENCE_SCRIPT_COPY}"
       printf 'state_file=%q\n' "${state_file}"
@@ -4311,9 +4705,9 @@ db_fence_publish_operator_wrappers() {
       printf '%s\n' 'sudo_prefix=""'
       printf '%s\n' 'if command -v sudo >/dev/null 2>&1; then sudo_prefix="sudo "; fi' 
       cat <<'WRAPPER_EOF'
-# Root, because switching to the application account needs it — or the application account
-# itself, which needs no switch and is who the helper runs as on every path anyway. Anyone else
-# would fail at runuser with a less useful message.
+# Root: the account that owns the authority directory, and the only one that may hold the admin
+# credential this wrapper runs the helper with. Anyone else is refused here, with a message that
+# says so, rather than failing later with a less useful one.
 #
 # In practice this file is 0700 and root-owned, so a reader who is not root does not reach this
 # line at all: they get EACCES from the kernel first, which is why every banner that names this
@@ -4329,52 +4723,79 @@ db_fence_publish_operator_wrappers() {
 authority_dir="${state_file%/*}"
 if [[ -z "${authority_dir}" || ! -d "${authority_dir}" || ! -O "${authority_dir}" ]]; then
   echo "Run this as the account that owns ${authority_dir} — on an installed host that is root: ${sudo_prefix}${self}" >&2
-  echo "This wrapper PUBLISHES and REMOVES the connection-fence authority in that directory, and drops to ${app_account} to run the protected helper. Until o3d-secops r23 it also accepted being run BY ${app_account}, because the record was that account's to write; it is not any more, and a wrapper that account could usefully run is one that could write the record." >&2
+  echo "This wrapper PUBLISHES and REMOVES the connection-fence authority in that directory, and runs the protected helper as root, with the admin credential only root holds. Until o3d-secops r23 it also accepted being run BY ${app_account}, because the record was that account's to write; it is not any more, and a wrapper that account could usefully run is one that could write the record." >&2
   exit 1
 fi
-# The tree this is about to execute must still be the tree this wrapper was written for.
-actual="$(cd "${protected_dir}" 2>/dev/null && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum)"
-actual="${actual%% *}"
-if [[ "${actual}" != "${expected_artefact}" ]]; then
-  echo "REFUSING: ${protected_dir} hashes to ${actual:-nothing} but this wrapper was written for ${expected_artefact}." >&2
-  echo "The protected fence artefact has changed since the fence was raised. Do not run it." >&2
-  exit 1
-fi
-if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]] && [[ -f "${app_env_file}" ]]; then
-  # The same one-key reader the entrypoints use: a quoted value ends at its closing quote, an
-  # unquoted one at the first whitespace-preceded '#', and later definitions win. `source` is not
-  # used, because that executes whatever is in the file.
-  line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?DEPLOY_ADMIN_DATABASE_URL[[:space:]]*=' "${app_env_file}" 2>/dev/null | tail -1 || true)"
-  if [[ -n "${line}" ]]; then
-    value="${line#*=}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    case "${value}" in
-      \"*) value="${value#\"}"; value="${value%%\"*}" ;;
-      \'*) value="${value#\'}"; value="${value%%\'*}" ;;
-      *)   value="${value%%[[:space:]]#*}"; value="${value%"${value##*[![:space:]]}"}" ;;
-    esac
-    DEPLOY_ADMIN_DATABASE_URL="${value}"
+# THE CREDENTIAL: THE INVOCATION, THEN THE ROOT FILE, AND NOTHING THE APPLICATION CAN WRITE
+# (owner decision C3). The application's own environment file is not consulted and neither is anything
+# else: a value that account could have planted is not a credential this wrapper will run a privileged
+# helper with.
+# `sudo env DEPLOY_ADMIN_DATABASE_URL=... <wrapper>` wins over the file. It is then UN-EXPORTED, and
+# the helper below is started with a scrubbed environment, so nothing the application account runs
+# can inherit it from here.
+admin_url="${DEPLOY_ADMIN_DATABASE_URL:-}"
+export -n DEPLOY_ADMIN_DATABASE_URL 2>/dev/null || true
+if [[ -z "${admin_url}" ]]; then
+  credential_rc=0
+  admin_url="$(db_admin_credential_read DEPLOY_ADMIN_DATABASE_URL "${credential_file}" "${credential_uid}" "${DB_ADMIN_CREDENTIAL_TRUST_ROOT}")" || credential_rc=$?
+  if [[ "${credential_rc}" -eq 1 ]]; then
+    exit 1
   fi
 fi
-if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]]; then
-  echo "DEPLOY_ADMIN_DATABASE_URL is not set and ${app_env_file} does not define it, so there is" >&2
-  echo "no privileged connection to ${mode} with. Re-run supplying it:" >&2
+unset DEPLOY_ADMIN_DATABASE_URL
+if [[ -z "${admin_url}" ]]; then
+  echo "There is no privileged connection to ${mode} with. $(db_admin_credential_instruction absent)" >&2
   echo "" >&2
-  # `env`, and the whole line prefixed rather than the assignment: `sudo VAR=x /path` is not a
-  # thing sudo accepts, and a bare `VAR=x /path` is EACCES for the non-root shell this is most
-  # likely being read in. The prefix is empty where sudo is not installed, which is a box the
-  # reader can only have reached as root anyway.
+  # THIS WRAPPER'S OWN ABSOLUTE PATH, in the invocation that supplies the credential, so that pasting
+  # the line works: `env`, and the whole line prefixed, because `sudo VAR=x /path` is not a thing sudo
+  # accepts and a bare `VAR=x /path` is EACCES for the non-root shell this is most likely read in.
   echo "  ${sudo_prefix}env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${self}" >&2
   echo "" >&2
   echo "It must be a superuser or database-owner connection as a DIFFERENT role from the one the" >&2
   echo "fence revoked CONNECT from; see docs/installation.md." >&2
   exit 1
 fi
-# `runuser` needs root; where this is already running AS the application account there is no
-# switch to make. The branch is about the switch and never about the gate above, which is what
-# decides whether this wrapper may run at all.
+# THE HELPER RUNS AS ROOT, NEVER AS THE APPLICATION ACCOUNT, WITH A SCRUBBED ENVIRONMENT AND THE
+# CREDENTIAL ONLY IN ITS ENVIRONMENT BY NAME. `run_helper <script> <arguments...>` is the whole of how
+# this wrapper executes it; there is no privilege drop to take.
 run_helper() {
-  if [[ "$(id -un)" == "${app_account}" ]]; then env "$@"; else runuser -u "${app_account}" -- env "$@"; fi
+  local script="$1"
+  shift
+  (
+    _db_fence_scrub_environment
+    export DEPLOY_ADMIN_DATABASE_URL="${admin_url}"
+    cd / || exit 1
+    exec node "${script}" "$@" ${migration_role:+"--migration-role=${migration_role}"}
+  )
+}
+# THE TREE THAT RUNS IS THE TREE THAT WAS HASHED (o3d-bpbv). The documented name is a pointer, and the
+# old order hashed it, then took the cutover lock, then executed THROUGH THE SAME NAME -- so a
+# publication that flipped the pointer in between made the wrapper run a different release's helper
+# than the one it had verified. Now the cutover lock is taken FIRST (publications hold the same
+# lock), the pointer is resolved ONCE, THAT directory is hashed against the digest baked in at
+# publication, and the helper is executed by the resolved path. The documented name is still where
+# it starts, which is what keeps the route from evaporating when a newer release is published.
+# Sets ${helper_run}. Called after take_cutover_lock, before anything is executed.
+resolve_and_verify_artefact() {
+  local resolved actual
+  resolved="$(readlink -f -- "${protected_dir}" 2>/dev/null)" || resolved=""
+  if [[ -z "${resolved}" || ! -d "${resolved}" ]]; then
+    echo "REFUSING: ${protected_dir} does not resolve to a directory, so there is no protected fence artefact to run. ${self} has examined nothing and changed nothing." >&2
+    return 1
+  fi
+  actual="$(cd "${resolved}" 2>/dev/null && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum)"
+  actual="${actual%% *}"
+  if [[ "${actual}" != "${expected_artefact}" ]]; then
+    echo "REFUSING: ${protected_dir} (${resolved}) hashes to ${actual:-nothing} but this wrapper was written for ${expected_artefact}." >&2
+    echo "The protected fence artefact has changed since the fence was raised. Do not run it." >&2
+    return 1
+  fi
+  helper_run="${resolved}${helper#"${protected_dir}"}"
+  if [[ ! -f "${helper_run}" ]]; then
+    echo "REFUSING: the verified artefact ${resolved} has no ${helper_run##*/}. ${self} has examined nothing and changed nothing." >&2
+    return 1
+  fi
+  return 0
 }
 # ONE VALUE FOR ONE KEY, ON A WHOLE LINE, OF A STATED SHAPE, OR NOTHING AT ALL
 # (o3d-secops r32, Codex HIGH 1 -- the "check the other machine lines" half).
@@ -4534,7 +4955,8 @@ raise_the_fence() {
   # root stamps into fence_mode, and it says whether the authority published below is this run's
   # own and therefore the only one this run may remove.
   if [[ -e "${state_file}" || -L "${state_file}" ]]; then had_authority=1; fi
-  plan="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --plan --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || return 1
+  resolve_and_verify_artefact || return 1
+  plan="$(run_helper "${helper_run}" --plan --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || return 1
   # o3d-secops r25: the publication's own failures are the sibling r24 missed. The validator's last
   # barrier is the directory fsync, which runs after the rename and leaves the record visible when
   # it fails, so a failed publication is a publication that may well have published.
@@ -4548,7 +4970,7 @@ raise_the_fence() {
     fi
     return 1
   fi
-  run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || rc=$?
+  run_helper "${helper_run}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || rc=$?
   # o3d-secops r25: and the record is told the fence went up. Exit 0 is a fence this run watched
   # rise, exit 5 is one that may be standing with a lost acknowledgement; both mean CONNECT may be
   # revoked, and both must therefore be readable as a standing fence by whatever runs next.
@@ -4609,12 +5031,21 @@ release_the_fence() {
   take_cutover_lock || return 1
   # Its stdout is captured for the machine line below and printed straight back afterwards; the
   # prose an operator reads is on stderr and is never captured, so it still streams live.
-  released="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --release --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
+  resolve_and_verify_artefact || return 1
+  released="$(run_helper "${helper_run}" --release --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
   [[ -z "${released}" ]] || printf '%s\n' "${released}"
   # 0 is a release this run performed. 6 is EXIT_ALREADY_RELEASED -- a record stamped applied whose
   # every grantee already holds CONNECT, which is what a crash between the grants and this step
   # leaves. Both mean the same thing about the database: there is nothing left to grant here.
   if [[ "${rc}" -ne 0 && "${rc}" -ne 6 ]]; then
+    # THE DATABASE'S ANSWER, NOT THE STATUS (Codex round 3, HIGH): a failed release can have committed its grants.
+    local fence_state=""
+    fence_state="$(machine_field "${released}" FENCE_STATE '^(held|restored|unknown)$')" || fence_state="unknown"
+    if [[ "${fence_state}" == "held" ]]; then
+      echo "The release failed and the database reports the fence STILL STANDING (FENCE_STATE=held); nothing was restored. The record is untouched; run this again." >&2
+    else
+      echo "THE RELEASE FAILED BUT THE FENCE IS NOT NECESSARILY STANDING (FENCE_STATE=${fence_state}): CONNECT may already be restored to the application. The record is untouched and a re-run is safe. Do NOT start or stop anything on the belief that the database is still closed." >&2
+    fi
     return 1
   fi
   if [[ ! -e "${state_file}" && ! -L "${state_file}" ]]; then
@@ -4758,7 +5189,8 @@ resolve_legacy_fence() {
   # 3. UNPRIVILEGED: the live ACL, read through the protected helper as the application account.
   #    Read-only -- it issues no REVOKE, no GRANT and no BEGIN, and writes no file. Its stdout is
   #    the verdict, the cluster verdict and the cluster identity; its stderr is the prose.
-  audited="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --audit-authority --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
+  resolve_and_verify_artefact || return 1
+  audited="$(run_helper "${helper_run}" --audit-authority --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
   verdict="$(machine_field "${audited}" legacy_fence_verdict '^(absent|stands|ambiguous)$')" || verdict=""
   cluster="$(machine_field "${audited}" legacy_fence_cluster '^(proven|mismatch|no-fingerprint-recorded|fingerprint-unverifiable)$')" || cluster=""
   identity="$(machine_field "${audited}" legacy_fence_cluster_identity "${CLUSTER_IDENTITY_SHAPE}")" || identity=""
@@ -5060,16 +5492,17 @@ db_fence_probe_report() {
 
 # RESOLVE AND EXECUTE, IN ONE FUNCTION, WITH THE ANSWER NEVER LEAVING IT.
 #
-#   db_fence_preflight <notice> -- <runner> [<runner arg>...]
+#   db_fence_preflight <notice>
 #
 # <notice> is a command the CALLER supplies that prints one line. The entrypoints pass their own
 # warn(), so the explanation of what is about to be run still arrives in the caller's voice and
 # ahead of the helper's own output — which is where it has to be, because it is the line an
 # operator reads while the preflight is still opening its connection.
 #
-# <runner> is the command prefix that drops privilege and carries DEPLOY_ADMIN_DATABASE_URL. The
-# two entrypoints spell it differently (`as_app_user env …` and `run_as_user "${APP_USER}" env …`)
-# and neither spelling belongs in this file. `--` separates them so neither list has to be guessed.
+# THE HELPER IS RUN THROUGH db_fence_exec_root(): as root, with a scrubbed environment and the
+# credential held only by that process (owner decision C3). Until then this took a <runner> prefix
+# that dropped privilege to the application account and carried DEPLOY_ADMIN_DATABASE_URL, which
+# is the arrangement that handed the account the credential; there is no runner to choose now.
 #
 # RETURNS the helper's own exit status when the helper ran, and 1 with ${DB_FENCE_PROBE_REASON} set
 # when nothing on this box was authenticated enough to be handed the credential. A non-empty
@@ -5080,10 +5513,6 @@ db_fence_preflight() {
   local _fence_probe_dir="" _fence_probe_sha="" _fence_standing_sha="" _fence_standing_base="" _fence_standing_reason=""
   DB_FENCE_PROBE_REASON=""
   [[ -n "${notice}" ]] || return 1
-  shift
-  [[ "${1:-}" == "--" ]] || return 1
-  shift
-  [[ "$#" -gt 0 ]] || return 1
 
   # THE STANDING ARTEFACT FIRST: it is the only thing on the box that has been through the
   # publication gate.
@@ -5129,7 +5558,7 @@ db_fence_preflight() {
     return 1
   fi
 
-  "$@" node "${probe}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+  db_fence_exec_root "${probe}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   [[ -z "${_fence_probe_dir}" ]] || { _fence_require_owned_tree "${_fence_probe_dir}" "the fence probe directory" "${_fence_probe_dir}"; rm -rf "${_fence_probe_dir}"; }
   return "${rc}"
 }

@@ -7017,9 +7017,10 @@ const UNCHECKED_BUT_FAIL_CLOSED: Record<string, string> = {
   'scripts/install.sh:publish_durable_dropin» dir="$(dirname "$target")"': 'an empty result fails the mkdir below, which is checked',
   'scripts/install.sh:publish_durable_dropin» parent="$(dirname "$dir")"': 'an empty result fails the mkdir below, which is checked',
 
-  // `printf %q` is a shell builtin operating on this script's own argv. It has no failure mode
-  // that leaves the shell running.
-  'scripts/install.sh:run_as_user» su -s /bin/bash -c "$(printf \'%q \' "$@")" "$user"': 'printf is a builtin over our own argv',
+  // (The `su -s /bin/bash -c "$(printf '%q ' "$@")"` fallback of install.sh's run_as_user used to be on
+  // this roster, because that function was reached from a `|| ...` context. Owner decision C3 moved
+  // every `|| ...`-guarded application-account step onto run_as_user_db, which refuses rather than
+  // falling back to `su -c`, so the line is no longer in a suspended body and its entry was deleted.)
 
   // MARKER CONTENT, not marker publication. These compose the text of the cutover marker; the
   // marker is then published through publish_durable_file, which fsyncs and reads it back and

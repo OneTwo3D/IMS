@@ -466,6 +466,28 @@ END
 SELECT 'CREATE DATABASE ${DB_NAME}' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='${DB_NAME}') \gexec
 GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
 ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
+-- THE MIGRATION ROLE the cutover's fence preflight asks for (owner decision C3): a login worth
+-- nothing, that the migration window connects as in place of this admin. NOLOGIN until a window
+-- opens it; a member of the application role only; CONNECT of its own, which the fence exempts.
+DO \$\$
+BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}_migrator') THEN
+    -- Never adopt a role this tool did not make: it may be a login with a known password.
+    IF shobj_description((SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}_migrator'), 'pg_authid') IS DISTINCT FROM 'ims migration login: created by the IMS installer, holds nothing of its own' THEN
+      RAISE EXCEPTION 'role %_migrator exists and was not created by this tool', '${DB_USER}';
+    END IF;
+  ELSE
+    CREATE ROLE "${DB_USER}_migrator" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    COMMENT ON ROLE "${DB_USER}_migrator" IS 'ims migration login: created by the IMS installer, holds nothing of its own';
+  END IF;
+  IF current_setting('server_version_num')::int >= 160000 THEN
+    EXECUTE 'GRANT "${DB_USER}" TO "${DB_USER}_migrator" WITH INHERIT TRUE, SET TRUE';
+  ELSE
+    EXECUTE 'GRANT "${DB_USER}" TO "${DB_USER}_migrator"';
+  END IF;
+END
+\$\$;
+GRANT CONNECT ON DATABASE "${DB_NAME}" TO "${DB_USER}_migrator";
 EOSQL
   success "External PostgreSQL database is ready."
 fi

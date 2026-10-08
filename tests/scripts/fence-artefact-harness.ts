@@ -13,7 +13,7 @@
  */
 import { execFileSync } from 'node:child_process'
 import { lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { createTempDirSync } from './temp-dir.ts'
 
 /** Where the fake checkout's helper lives, relative to a scratch root. */
@@ -190,6 +190,21 @@ export function protectedLibraryTextAt(recovery: string): string {
     )
   }
   lines[at[0]] = `readonly DB_FENCE_RECOVERY_DIR=${shellSingleQuote(recovery)}`
+  // THE CREDENTIAL FILE'S OWNERSHIP WALK STOPS AT THE SCRATCH ROOT (owner decision C3), for the same
+  // reason: on a host the walk goes up to `/` and every component must be root's and unwritable by
+  // anybody else, which /tmp (sticky, world-writable) can never be. The scratch root is the parent of
+  // the recovery directory, which is where these harnesses put a `cred/` directory of their own.
+  const trust = lines.reduce<number[]>((found, line, index) => {
+    if (/^readonly DB_ADMIN_CREDENTIAL_TRUST_ROOT="\/"$/.test(line)) found.push(index)
+    return found
+  }, [])
+  if (trust.length !== 1) {
+    throw new Error(
+      `${LIBRARY_RELATIVE_PATH}: the harness must find exactly one \`readonly DB_ADMIN_CREDENTIAL_TRUST_ROOT="/"\` `
+      + `declaration to point at a scratch directory; it found ${trust.length}.`,
+    )
+  }
+  lines[trust[0]] = `readonly DB_ADMIN_CREDENTIAL_TRUST_ROOT=${shellSingleQuote(dirname(recovery))}`
   return lines.join('\n')
 }
 

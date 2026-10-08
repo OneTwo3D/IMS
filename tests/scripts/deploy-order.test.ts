@@ -573,7 +573,7 @@ for (const [name, lines] of [
     const source = lines.filter(isCode).join('\n')
     assert.match(
       source,
-      /DEPLOY_ADMIN_DATABASE_URL is not set/,
+      /has no admin credential, so it has no connection that survives it/,
       'adopting a held fence without a privileged connection must fail loudly, not proceed',
     )
     assert.match(
@@ -1848,7 +1848,7 @@ for (const entry of FENCE_HARNESS) {
 
       assert.notEqual(status, 0, 'a migration URL that cannot be composed must abort the cutover')
       assert.ok(!output.includes('REACHED THE MIGRATION'), 'and nothing after it may run')
-      assert.match(output, /application cannot use|produced nothing/, 'and it must say why')
+      assert.match(output, /no migration login to run the migration as|produced nothing/, 'and it must say why')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -1947,6 +1947,23 @@ function WITNESS_STUB_LINES(
     // for a verdict; an empty list is the ordinary cutover and changes nothing.
     ...extraStdout,
   ]
+}
+
+/**
+ * THE ROOT CREDENTIAL FILE THE OPERATOR WRAPPERS READ (owner decision C3): `<dir>/cred/deploy-admin.env`,
+ * mode 0600 in a 0700 directory, inside the scratch root the harness points the ownership walk at.
+ * Until C3 these fixtures wrote the admin URL into the application's `app/.env`.
+ */
+function credentialFile(dir: string): string {
+  return join(dir, 'cred', 'deploy-admin.env')
+}
+function writeRootCredential(dir: string, content: string): string {
+  mkdirSync(join(dir, 'cred'), { recursive: true, mode: 0o700 })
+  chmodSync(join(dir, 'cred'), 0o700)
+  const file = credentialFile(dir)
+  writeFileSync(file, content)
+  chmodSync(file, 0o600)
+  return file
 }
 
 function runShell(program: string): { status: number; output: string } {
@@ -6287,7 +6304,8 @@ test('nothing in the application-owned .env is EXECUTED by update.sh, and the va
       join(dir, '.env'),
       [
         'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims',
-        'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/ims"  # the privileged one',
+        // (The privileged connection is NOT in this file any more: since owner decision C3 a copy of it
+        // here is REFUSED, which its own test below asserts. It arrives on the root invocation.)
         `EVIL_SUBSTITUTION=$(touch ${JSON.stringify(marker('EXECUTED-substitution'))})`,
         `touch ${JSON.stringify(marker('EXECUTED-command'))}`,
         `run_as_user() { touch ${JSON.stringify(marker('EXECUTED-function'))}; }`,
@@ -6318,7 +6336,7 @@ test('nothing in the application-owned .env is EXECUTED by update.sh, and the va
       'DB_ENV_SNAPSHOT_DROPIN_FILE',
       'CUTOVER_STATE_DIR',
       'LEGACY_CUTOVER_STATE_DIR',
-    ])
+    ], 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/ims"')
 
     assert.equal(result.status, 0, `the prelude must run cleanly:\n${result.output}`)
 
@@ -6332,7 +6350,7 @@ test('nothing in the application-owned .env is EXECUTED by update.sh, and the va
     assert.match(
       result.output,
       /^DEPLOY_ADMIN_DATABASE_URL=postgresql:\/\/admin:pw@127\.0\.0\.1:5432\/ims$/m,
-      'and the privileged connection arrived unquoted and without its trailing comment',
+      'and the privileged connection arrived from the root invocation',
     )
 
     // NOT EXECUTED. Three shapes of shell code, three files that do not exist.
@@ -6657,22 +6675,15 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
       why: 'passed by path to env_file_is_sole_database_url_source(), which reads the UNIT',
       match: `env_file_is_sole_database_url_source "(${APP_OWNED_PATH})" "[^"]*"`,
     },
-    // The second named helper of that kind (o3d-2sm1.5 r32). It writes the path INTO a root-owned
-    // recovery wrapper as a literal and never opens it here; the wrapper reads it at recovery
-    // time, with the same one-key reader env_file_value() uses and no `source`. Spelled out in
-    // full — helper name, argument order and the warning tail — so a call that started passing
-    // the file's CONTENTS, or a different helper, is not covered by this.
+    // THE ADMIN CREDENTIAL LOADER (owner decision C3, replacing the wrapper-publication shape that
+    // used to stand here). It is handed the path to REFUSE A COPY of the admin credential left in
+    // the application's file, which it reads as data through the library's own one-key reader and
+    // whose value it never uses. The wrappers are no longer handed this path at all: they take the
+    // credential from the root file, so the old shape that allowed it is gone. Spelled out whole-line,
+    // so a call that started taking a VALUE out of the file is not covered by this.
     {
-      why: 'passed by path to db_fence_publish_operator_wrappers(), which writes it into a root-owned wrapper',
-      match:
-        `db_fence_publish_operator_wrappers "\\$\\{APP_USER\\}" "(${APP_OWNED_PATH})" ` +
-        // o3d-secops r28: ${LOCK_FILE} joined the call, between the state file and the identity.
-        // The wrappers read the fence record, ask the database about it and then write or remove
-        // it, and that sequence is now excluded against every cutover and every other wrapper on
-        // the entrypoint's own lock. Spelt out here for the reason the rest of this shape is: a
-        // call that started passing something ELSE in that position is not covered by this.
-        '"\\$\\{DB_FENCE_STATE\\}" "\\$\\{LOCK_FILE\\}" "\\$\\{DB_FENCE_IDENTITY_ARGS\\[@\\]:-\\}"' +
-        '( \\|\\| echo "[^"]*" >&2)?',
+      why: 'passed by path to db_admin_credential_load(), which reads it only to refuse a copy of the admin credential',
+      match: `db_admin_credential_load "(${APP_OWNED_PATH})" \\|\\| die "[^"]*"`,
     },
     // install.sh OWNS these two files: it writes them, then locks them down.
     { why: 'install.sh writing the file it owns', match: `cat > "(${APP_OWNED_PATH})" <<EOF` },
@@ -7337,6 +7348,12 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     '  esac',
     '  return 0',
     '}',
+    // Since owner decision C3 the shipped code reaches node through the library's root exec, not
+    // through `run_as_user`; the stub above is still where the process boundary is recorded, so the
+    // two exec functions the shipped helpers call are routed into it, with the first argument it
+    // drops standing in for the account that no longer exists on this path.
+    'db_fence_exec_root(){ run_as_user root-no-longer-drops node "$@"; }',
+    'db_fence_exec_root_with_database_url(){ run_as_user root-no-longer-drops node "$@"; }',
     'FENCE_EXIT=0',
     shellFunction(source, 'env_file_value'),
     shellFunction(source, 'valid_tcp_port'),
@@ -7490,7 +7507,7 @@ test('a recovery with no privileged credential refuses, naming the argument that
     )
     assert.notEqual(result.status, 0, `a recovery with no privileged connection must refuse:\n${result.output}`)
     assert.ok(!/PAST=yes/.test(result.output), 'and nothing after it may run')
-    assert.match(result.output, /DEPLOY_ADMIN_DATABASE_URL is not set/, `naming the argument:\n${result.output}`)
+    assert.match(result.output, /has no admin credential, so it has no connection that survives it/, `naming the argument:\n${result.output}`)
     assert.match(
       result.output,
       /DEPLOY_ADMIN_DATABASE_URL='postgresql:\/\/ADMIN:PASSWORD@HOST:PORT\/DATABASE' bash \/\S+\/scripts\/update\.sh/,
@@ -7768,45 +7785,40 @@ test('a protected fence script that is not the one the record names is refused',
   }
 })
 
-test('the privileged connection comes from the root invocation, not from the application-owned file', () => {
-  // FOUND BY THE SWEEP the CRITICAL asked for, and it is the same shape a third time:
-  // DEPLOY_ADMIN_DATABASE_URL was resolved as "${_env_file_admin_url:-${DEPLOY_ADMIN_DATABASE_URL}}"
-  // — the application-owned file first, root's own invocation only as a fallback. The recovery
-  // refusal tells an operator to supply this variable on the command line precisely because
-  // ${APP_DIR}/.env cannot be relied on at that moment, and a file that could then silently
-  // substitute a different privileged connection makes that instruction meaningless.
+test('the privileged connection comes from the root invocation or the root file, and a copy in the application-owned file is REFUSED (owner decision C3)', () => {
+  // THE OLD RULE, AND WHAT REPLACED IT. This test used to assert that the root invocation WINS over
+  // the application-owned .env (o3d-2sm1.5 r30: a file the application can rewrite must not silently
+  // substitute a different privileged connection). C3 removes the file from the picture entirely: the
+  // credential lives in a root-owned file, and a copy in the application's .env is refused before
+  // anything is stopped, naming the root path and never using the value.
   //
-  // MUTATION ROUTE: swap the two halves of the `:-` back and the first case below reports the
-  // file's URL.
+  // MUTATION ROUTE: read the value out of the file when the invocation is silent (the pre-C3 shape)
+  // and the first case below reports the file's URL instead of refusing.
   const dir = mkdtempSync(join(tmpdir(), 'ims-r30-admin-'))
   try {
     writeFileSync(
       join(dir, '.env'),
       'DATABASE_URL=postgresql://imsapp:pw@127.0.0.1:5432/imsdb\nDEPLOY_ADMIN_DATABASE_URL=postgresql://filesays:pw@127.0.0.1:5432/otherdb\n',
     )
+    const refused = runUpdatePrelude(dir, ['DEPLOY_ADMIN_DATABASE_URL'])
+    assert.notEqual(refused.status, 0, `a copy of the admin credential in the application .env must refuse the run:\n${refused.output}`)
+    assert.match(refused.output, /still defines DEPLOY_ADMIN_DATABASE_URL/, `and say which file holds it:\n${refused.output}`)
+    assert.match(refused.output, /\/etc\/ims-db-admin\/deploy-admin\.env/, `and name the root file to move it to:\n${refused.output}`)
+    assert.ok(!/filesays/.test(refused.output.replace(/^.*still defines.*$/gm, '')), 'the value is never echoed or used')
 
-    const both = runUpdatePrelude(
-      dir,
-      ['DEPLOY_ADMIN_DATABASE_URL'],
-      'DEPLOY_ADMIN_DATABASE_URL=postgresql://roottyped:pw@127.0.0.1:5432/imsdb',
-    )
-    assert.equal(both.status, 0, `the prelude must run:\n${both.output}`)
-    assert.match(
-      both.output,
-      /^DEPLOY_ADMIN_DATABASE_URL=postgresql:\/\/roottyped:pw@127\.0\.0\.1:5432\/imsdb$/m,
-      `the invocation's value must win:\n${both.output}`,
-    )
-    assert.match(both.output, /set BOTH on this invocation and in/, `and the disagreement must be announced:\n${both.output}`)
+    // The invocation does not excuse the copy: the file is refused whatever else was typed.
+    const both = runUpdatePrelude(dir, ['DEPLOY_ADMIN_DATABASE_URL'], 'DEPLOY_ADMIN_DATABASE_URL=postgresql://roottyped:pw@127.0.0.1:5432/imsdb')
+    assert.notEqual(both.status, 0, 'typing the credential on the invocation does not make a leftover copy acceptable')
 
-    // AND NOTHING CHANGES ON AN ORDINARY RUN, which is the case that matters operationally:
-    // `sudo scripts/update.sh` carries no such variable, so the file still answers.
-    const fileOnly = runUpdatePrelude(dir, ['DEPLOY_ADMIN_DATABASE_URL'])
-    assert.match(
-      fileOnly.output,
-      /^DEPLOY_ADMIN_DATABASE_URL=postgresql:\/\/filesays:pw@127\.0\.0\.1:5432\/otherdb$/m,
-      `with nothing on the invocation the file answers, exactly as before:\n${fileOnly.output}`,
-    )
-    assert.ok(!/set BOTH on this invocation/.test(fileOnly.output), 'and there is nothing to announce')
+    // CONTROL: with the copy removed (an EMPTY key is not a copy) the invocation is the credential.
+    writeFileSync(join(dir, '.env'), 'DATABASE_URL=postgresql://imsapp:pw@127.0.0.1:5432/imsdb\nDEPLOY_ADMIN_DATABASE_URL=\n')
+    const clean = runUpdatePrelude(dir, ['DEPLOY_ADMIN_DATABASE_URL'], 'DEPLOY_ADMIN_DATABASE_URL=postgresql://roottyped:pw@127.0.0.1:5432/imsdb')
+    assert.equal(clean.status, 0, `the prelude must run:\n${clean.output}`)
+    assert.match(clean.output, /^DEPLOY_ADMIN_DATABASE_URL=postgresql:\/\/roottyped:pw@127\.0\.0\.1:5432\/imsdb$/m, `the invocation's value is the credential:\n${clean.output}`)
+    // And nothing on an ordinary run: no invocation, no root file, an empty key -- empty, not an error.
+    const none = runUpdatePrelude(dir, ['DEPLOY_ADMIN_DATABASE_URL'])
+    assert.equal(none.status, 0, `an absent credential is the entrypoint's refusal to make later, not the loader's:\n${none.output}`)
+    assert.match(none.output, /^DEPLOY_ADMIN_DATABASE_URL=$/m)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -7862,7 +7874,7 @@ test('no entrypoint executes the application-owned fence script from its own pat
     'update.sh must never execute the application-owned fence script in place; resolve it through db_fence_script_in_use() first',
   )
   // PRECONDITION: it really does invoke the helper, so the assertion above is not vacuous.
-  const resolved = UPDATE_LINES.filter((line) => isCode(line) && /node "\$\{(fence|preflight|dry|release)_script\}"/.test(line))
+  const resolved = UPDATE_LINES.filter((line) => isCode(line) && /(?:node|db_fence_exec_root|db_fence_helper) "\$\{(fence|preflight|dry|release)_script\}"/.test(line))
   assert.ok(resolved.length >= 4, `precondition: update.sh invokes the fence helper through a resolved path (${resolved.length})`)
 })
 
@@ -9193,8 +9205,10 @@ function rotationHarness(
  * observed instead is the ARGV — strictly stronger, because it is the bytes root would actually
  * have executed rather than a variable somebody hoped named them.
  *
- * `runner` stands in for the entrypoints' `as_app_user env …`; db_fence_preflight() hands it
- * `node <path> --preflight [identity args]`, so ${2} is the file. `notice` stands in for warn().
+ * Since owner decision C3 the helper is run through db_fence_exec_root(), so THAT is what is spied:
+ * db_fence_preflight() hands it `<path> --preflight [identity args]`, so ${1} is the file. (Until
+ * then it took a `runner` prefix that dropped privilege to the application account.) `notice`
+ * stands in for warn().
  *
  * ${TMPDIR} is redirected at a scratch directory so that "no throwaway tree survives" is asked of
  * the FILESYSTEM. The assertion it replaces was `TEMP=[]` — a variable being empty, which is
@@ -9207,11 +9221,11 @@ function preflightSpies(scratch: string): string[] {
     `PROBE_PATH_FILE=${JSON.stringify(`${scratch}.probe-path`)}`,
     ':> "${PROBE_PATH_FILE}"',
     'notice() { echo "NOTICE=[$*]"; }',
-    'runner() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}";'
-      + ' echo "CONTENT=[$(cat "${2:-/dev/null}" 2>/dev/null)]"; }',
+    'db_fence_exec_root() { echo "EXEC=[node $*]"; printf "%s" "${1:-}" > "${PROBE_PATH_FILE}";'
+      + ' echo "CONTENT=[$(cat "${1:-/dev/null}" 2>/dev/null)]"; }',
     // The same recording, but it really EXECUTES what it was handed — for the cases whose claim is
-    // "the credential reached nothing", where a runner that only records would prove the recording.
-    'exec_runner() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}"; env "$@"; }',
+    // "the credential reached nothing", where a spy that only records would prove the recording.
+    'exec_runner() { db_fence_exec_root() { echo "EXEC=[node $*]"; printf "%s" "${1:-}" > "${PROBE_PATH_FILE}"; node "$@"; }; }',
     'report_probe() { echo "PROBE=[$(cat "${PROBE_PATH_FILE}")]";'
       + ' echo "TMPLEFT=[$(ls -A "${TMPDIR}" 2>/dev/null | tr "\\n" " ")]"; }',
   ]
@@ -9370,7 +9384,7 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
         'db_fence_probe_digests; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
         'echo "STANDING=[${DB_FENCE_PROBE_STANDING_SHA256}]"',
-        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'db_fence_preflight notice; echo "RC=$?"',
         'echo "REASON=[${DB_FENCE_PROBE_REASON}]"',
         'report_probe',
       ]),
@@ -9403,7 +9417,7 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     const pinned = runShell(
       rotationHarness(dirs, [
         ...preflightSpies(join(dirs.app, '..', 'scratch-2')),
-        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'db_fence_preflight notice; echo "RC=$?"',
         'report_probe',
       ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
@@ -9424,7 +9438,7 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     const wrong = runShell(
       rotationHarness(dirs, [
         ...preflightSpies(join(dirs.app, '..', 'scratch-3')),
-        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'db_fence_preflight notice; echo "RC=$?"',
         'report_probe',
       ], [`IMS_FENCE_ARTEFACT_SHA256=${'0'.repeat(64)}`]),
     )
@@ -9484,7 +9498,7 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
         // _fence_vendor_into(), _fence_source_paths() and _fence_source_trust().
         'db_fence_script_in_use >/dev/null; echo "PUBLISHED=$?"',
         // AND THE PREFLIGHT PATH, for real — it is the one that resolves and executes.
-        'db_fence_preflight notice -- runner >/dev/null; echo "PREFLIGHT=$?"',
+        'db_fence_preflight notice >/dev/null; echo "PREFLIGHT=$?"',
         ...probeGlobals,
         'report_probe',
       ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
@@ -9518,7 +9532,7 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
     const fromCandidate = runShell(
       rotationHarness(dirs, [
         ...preflightSpies(join(dirs.app, '..', 'scratch-candidate')),
-        'db_fence_preflight notice -- runner >/dev/null; echo "PREFLIGHT=$?"',
+        'db_fence_preflight notice >/dev/null; echo "PREFLIGHT=$?"',
         ...probeGlobals,
         'report_probe',
       ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
@@ -9548,7 +9562,9 @@ test('o3d-secops r3: each entrypoint\'s own preflight line runs the standing art
   // which are silent until a cutover.
   //
   // So the LINE IS LIFTED OUT OF THE SHIPPED FILE and executed against the real library, with the
-  // entrypoint's own warn() and its own privilege-dropping helper stubbed to report their argv.
+  // entrypoint's own warn() and the library's root exec stubbed to report its argv. (Since owner
+  // decision C3 there is no per-entrypoint runner: the call is `db_fence_preflight warn` and the
+  // library runs the helper as root through db_fence_exec_root().)
   //
   // MUTATION ROUTE (each verified locally): drop the `--` from either call and the invocation
   // returns 1 with nothing executed, so EXEC never appears; swap the notice for a name no function
@@ -9576,15 +9592,14 @@ test('o3d-secops r3: each entrypoint\'s own preflight line runs the standing art
         call.push(lines[i])
         if (!/\\$/.test(lines[i].trimEnd())) break
       }
-      assert.ok(call.join('\n').includes(' -- '), `${script}: precondition: the lifted call must be complete:\n${call.join('\n')}`)
+      assert.match(call.join('\n'), /^\s*db_fence_preflight warn( \|\| dry_rc=\$\?)?$/, `${script}: precondition: the lifted call must be complete and hand the library no runner:\n${call.join('\n')}`)
 
       const run = runShell(
         rotationHarness(dirs, [
           ...preflightSpies(join(dirs.app, '..', `scratch-${script.replace(/\W/g, '-')}`)),
           'warn() { echo "WARN: $*"; }',
-          // The two spellings, each reporting exactly what the library handed it.
-          'as_app_user() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}"; }',
-          'run_as_user() { local who="$1"; shift; echo "AS=${who}"; echo "EXEC=[$*]"; }',
+          // The root exec, reporting exactly what the library handed it.
+          'db_fence_exec_root() { echo "EXEC=[node $*]"; printf "%s" "${1:-}" > "${PROBE_PATH_FILE}"; }',
           'APP_USER=ims-app',
           'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/imsdb',
           'DEPLOY_ADMIN_DATABASE_URL=postgresql://admin:pw@127.0.0.1:5432/imsdb',
@@ -9600,13 +9615,9 @@ test('o3d-secops r3: each entrypoint\'s own preflight line runs the standing art
       assert.match(run.output, /^WARN: This dry run probes with the root-owned artefact at /m,
         `${script}: and the announcement must come back through the entrypoint's own warn():\n${run.output}`)
       const exec = /^EXEC=\[(.*)\]$/m.exec(run.output)?.[1] ?? ''
-      // The entrypoint's own environment comes FIRST (it is the runner it wrote), then the
-      // library's `node <artefact> --preflight`. The two scripts set different variables, so what
-      // is asserted is the shape and the boundary between them, not one script's spelling.
-      assert.match(exec, /^env (?:[A-Z_]+=\S+ )+node /,
-        `${script}: the runner must be handed its own environment first: ${exec}`)
-      assert.match(exec, /\bDEPLOY_ADMIN_DATABASE_URL=\S+/,
-        `${script}: including the credential the preflight needs: ${exec}`)
+      // Nothing but the library's own `node <artefact> --preflight`: the credential is NOT on the
+      // call at all (it travels in the root process's environment, by name), which is the point.
+      assert.ok(!/DEPLOY_ADMIN_DATABASE_URL|DATABASE_URL=/.test(exec), `${script}: no credential on the call: ${exec}`)
       assert.ok(
         exec.endsWith(`node ${standingHelperPath(dirs.recovery)} --preflight `),
         `${script}: and then the STANDING artefact, appended by the library: ${exec}`,
@@ -10101,13 +10112,13 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     )
     // The credential where the deploy reads it from — quoted, with a trailing comment, which is
     // the shape env_file_value() exists for and the shape a naive `grep | cut` gets wrong.
-    writeFileSync(join(dir, 'app', '.env'), 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"  # deploy admin\n')
+    writeRootCredential(dir, 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"  # deploy admin\n')
 
     const paths = protectedPaths(dir)
     const publish = runShell(
       artefactHarness(dir, [
         'db_fence_script_in_use >/dev/null || exit 1',
-        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(credentialFile(dir))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
       ]),
     )
     assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
@@ -10121,19 +10132,22 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     const bare = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
     assert.equal(bare.status, 0, `the wrapper must run with nothing supplied:\n${bare.stdout}${bare.stderr}`)
     const invocation = JSON.parse(readFileSync(log, 'utf8'))
-    assert.equal(invocation.ran, paths.helper, 'and the file it ran is the PROTECTED one, not the checkout')
+    // o3d-bpbv: the wrapper resolves the documented pointer ONCE, under the cutover lock, hashes THAT
+    // directory and executes the helper by the RESOLVED path -- so what ran is the versioned
+    // publication the pointer named, and still the protected one, never the checkout's.
+    assert.equal(invocation.ran, standingHelperPath(paths.recovery), 'and the file it ran is the PROTECTED one (by its resolved path), not the checkout')
     assert.deepEqual(
       invocation.argv,
       // o3d-secops r23: and the uid the authority must belong to. Baked as `id -u` rather than a
       // literal 0, for the reason publish_durable_file() asks it — the property is "the privileged
       // account that owns this install", and asking is what lets this regression run unprivileged.
-      ['--release', '--state-file=' + join(dir, 'state.json'), `--state-owner=${process.getuid?.() ?? 0}`, '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb'],
-      'with this run\'s state file, the uid that publishes the authority, and the four identity values already filled in',
+      ['--release', '--state-file=' + join(dir, 'state.json'), `--state-owner=${process.getuid?.() ?? 0}`, '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb', '--migration-role=imsapp_migrator'],
+      'with this run\'s state file, the uid that publishes the authority, the four identity values already filled in, and the migration role the helper exempts from the fence and closes at the release',
     )
     assert.equal(
       invocation.admin,
       'postgresql://admin:pw@127.0.0.1:5432/imsdb',
-      'and the admin credential read out of the same .env the deploy reads',
+      'and the admin credential read out of the root credential file',
     )
 
     // The re-fence wrapper is the same instruction in the other direction — Codex's third finding,
@@ -10197,11 +10211,11 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     // PHASE 2 — NO CREDENTIAL ANYWHERE. It refuses, names the variable, and prints its OWN path
     // in the command that would supply it, so the next paste works too.
     rmSync(log)
-    renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
+    renameSync(credentialFile(dir), `${credentialFile(dir)}.away`)
     const noCredential = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
     assert.equal(noCredential.status, 1, 'a wrapper with no credential must refuse')
     assert.ok(!existsSync(log), 'and must not reach the helper at all')
-    assert.match(noCredential.stderr, /DEPLOY_ADMIN_DATABASE_URL is not set/, noCredential.stderr)
+    assert.match(noCredential.stderr, /was not supplied on this invocation and there is no/, noCredential.stderr)
     assert.match(
       noCredential.stderr,
       new RegExp(`${sudoPrefixOn(process.env.PATH ?? '')}env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${paths.releaseWrapper}`),
@@ -10214,7 +10228,7 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     })
     assert.equal(supplied.status, 0, `${supplied.stdout}${supplied.stderr}`)
     assert.equal(JSON.parse(readFileSync(log, 'utf8')).admin, 'postgresql://typed:in@127.0.0.1:5432/imsdb')
-    renameSync(join(dir, 'app', '.env.away'), join(dir, 'app', '.env'))
+    renameSync(`${credentialFile(dir)}.away`, credentialFile(dir))
 
     // PHASE 3 — THE ARTEFACT MOVED UNDER IT. A wrapper is a file with a digest baked in; if the
     // tree it was written for is not the tree on disk, it refuses rather than handing the
@@ -10421,9 +10435,9 @@ test('r26/r27/r28: the operator resolution acts only on a reading it can attribu
     fixture({})
     writeFenceCheckout(dir, auditingHelper(dir, fixtureFile))
     // THE ADMIN URL NAMES THE SERVER THE IDENTITY ARGV NAMES (o3d-secops r27).
-    const envFile = join(dir, 'app', '.env')
+    const envFile = credentialFile(dir)
     const adminUrlNaming = (server: string) =>
-      writeFileSync(envFile, `DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@${server}/imsdb"\n`)
+      writeRootCredential(dir, `DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@${server}/imsdb"\n`)
     adminUrlNaming('db.internal:6432')
     const paths = protectedPaths(dir)
     const wrapperEnv = { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv
@@ -11202,12 +11216,12 @@ test('r33: every printed recovery instruction carries the privilege the account 
         '',
       ].join('\n'),
     )
-    writeFileSync(join(dir, 'app', '.env'), 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"  # deploy admin\n')
+    writeRootCredential(dir, 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"  # deploy admin\n')
     const paths = protectedPaths(dir)
     const publish = runShell(
       artefactHarness(dir, [
         'db_fence_script_in_use >/dev/null || exit 1',
-        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-user=imsapp || exit 1`,
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(credentialFile(dir))} ${JSON.stringify(join(dir, 'state.json'))} ${JSON.stringify(join(dir, 'cutover.lock'))} --app-user=imsapp || exit 1`,
       ]),
     )
     assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
@@ -11241,10 +11255,10 @@ test('r33: every printed recovery instruction carries the privilege the account 
     // 2. THE CREDENTIAL-MISSING FORM, which is the one Codex named. Read what the wrapper prints
     //    for the shell it is being read in, then paste that line back.
     rmSync(log)
-    renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
+    renameSync(credentialFile(dir), `${credentialFile(dir)}.away`)
     const refused = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: sudoPath } as unknown as NodeJS.ProcessEnv })
     assert.equal(refused.status, 1, 'a wrapper with no credential must refuse')
-    const printed = refused.stderr.split('\n').find((line) => line.includes('DEPLOY_ADMIN_DATABASE_URL='))
+    const printed = refused.stderr.split('\n').find((line) => /^\s*(sudo )?env DEPLOY_ADMIN_DATABASE_URL=/.test(line))
     assert.ok(printed, `it must print a command that supplies it:\n${refused.stderr}`)
     assert.equal(
       printed!.trim(),
@@ -11259,13 +11273,13 @@ test('r33: every printed recovery instruction carries the privilege the account 
       'postgresql://typed:in@127.0.0.1:5432/imsdb',
       'with the credential it told the operator to type',
     )
-    renameSync(join(dir, 'app', '.env.away'), join(dir, 'app', '.env'))
+    renameSync(`${credentialFile(dir)}.away`, credentialFile(dir))
 
     // 3. WITHOUT SUDO ON THE BOX the same message is the bare form, and that is correct rather
     //    than a fallback: the entrypoints refuse to run as anything but root, so a box with no
     //    sudo is one whose banner can only be being read by root.
     rmSync(log)
-    renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
+    renameSync(credentialFile(dir), `${credentialFile(dir)}.away`)
     // A PATH that still has coreutils and no sudo — the wrapper needs `id`, `find`, `sort`,
     // `xargs` and `sha256sum` to reach the message at all, and stripping everything would have
     // tested the wrong refusal.
@@ -11309,13 +11323,13 @@ test('r33: every printed recovery instruction carries the privilege the account 
     )
     assert.equal(sudoPrefixOn(noSudoPath), '', 'precondition: and no sudo on it')
     const noSudo = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: noSudoPath } as unknown as NodeJS.ProcessEnv })
-    const bareLine = noSudo.stderr.split('\n').find((line) => line.includes('DEPLOY_ADMIN_DATABASE_URL='))
+    const bareLine = noSudo.stderr.split('\n').find((line) => /^\s*(sudo )?env DEPLOY_ADMIN_DATABASE_URL=/.test(line))
     assert.equal(
       bareLine?.trim(),
       `env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${paths.releaseWrapper}`,
       `a box with no sudo must not be told to run one:\n${noSudo.stderr}`,
     )
-    renameSync(join(dir, 'app', '.env.away'), join(dir, 'app', '.env'))
+    renameSync(`${credentialFile(dir)}.away`, credentialFile(dir))
 
     // ---- PHASE D: the one printed instruction whose answer does NOT differ by account. The
     // artefact-mismatch message tells an operator to run `sha256sum -c` inside the protected tree;
@@ -11738,7 +11752,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
         'db_fence_probe_digests; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
         'echo "STANDING=[${DB_FENCE_PROBE_STANDING_SHA256}]"',
-        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'db_fence_preflight notice; echo "RC=$?"',
         'report_probe',
       ]),
     )
@@ -11813,7 +11827,8 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
         // THE REAL RUNNER, not a spy: if the library nominates anything at all here, node runs it
         // with the credential in its environment and the two witnesses appear.
-        'db_fence_preflight notice -- exec_runner; echo "RC=$?"',
+        'exec_runner',
+        'db_fence_preflight notice; echo "RC=$?"',
         'report_probe',
       ]),
     )
@@ -15031,7 +15046,7 @@ test('a consumer moved into a helper is still in the census, through the call si
 // `rm -f "${BACKUP_PARTIAL}"` in update.sh.
 for (const [name, lines, consumer, diagnostic] of [
   ['deploy.sh', DEPLOY_LINES, /as_app_user_db npm run build /, 'tail -40 "$BUILD_LOG"'],
-  ['update.sh', UPDATE_LINES, /pg_dump "\$\{MIGRATION_DATABASE_URL\}"/, 'rm -f "${BACKUP_PARTIAL}"'],
+  ['update.sh', UPDATE_LINES, /db_pg_dump_through_url "\$\{MIGRATION_DATABASE_URL\}"/, 'rm -f "${BACKUP_PARTIAL}"'],
 ] as ReadonlyArray<[string, string[], RegExp, string]>) {
   test(`${name}: the diagnostic belonging to a failed consumer is inside its own statement, not below the placement (o3d-secops r34)`, () => {
     const call = realCodeLine(lines, consumer)

@@ -8,6 +8,8 @@ import { test } from 'node:test'
 import {
   OBJECT_ACCESS_QUERY,
   objectionToResolvedRole,
+  isMigrationWindowUrl,
+  loginFromConnectionString,
   readStateFileRole,
   resolveAppRole,
   roleFromConnectionString,
@@ -345,16 +347,21 @@ test('a fence state file that EXISTS but names no role is fatal, and an absent o
   assert.deepEqual(readStateFileRole(''), { role: '', absent: true, error: '' })
 })
 
-test('it refuses to ask the deploy admin whether the deploy admin can use what it created', () => {
+test('it refuses to ask the migration login whether the migration login can use what it created', () => {
+  const stamped = 'postgresql://imsapp_migrator:pw@127.0.0.1:5432/ims?application_name=ims-migration-' + 'a'.repeat(32)
+  assert.equal(isMigrationWindowUrl(stamped), true, 'precondition: the window URL wears the migration stamp')
+  assert.equal(loginFromConnectionString(stamped), 'imsapp_migrator')
   assert.match(
-    objectionToResolvedRole({ role: 'deployadmin', source: 'DATABASE_URL', adminRole: 'deployadmin' }),
-    /the same role as DEPLOY_ADMIN_DATABASE_URL/,
+    objectionToResolvedRole({ role: 'imsapp_migrator', source: 'DATABASE_URL', loginRole: 'imsapp_migrator', migrationWindow: true }),
+    /migration LOGIN of a fenced window/,
   )
-  // An unfenced deploy: DATABASE_URL is the application's own URL and there is no admin.
-  assert.equal(objectionToResolvedRole({ role: 'imsapp', source: 'DATABASE_URL', adminRole: '' }), '')
-  assert.equal(objectionToResolvedRole({ role: 'imsapp', source: 'DATABASE_URL', adminRole: 'deployadmin' }), '')
+  // An unfenced deploy: DATABASE_URL is the application's own URL and its login IS the role.
+  assert.equal(objectionToResolvedRole({ role: 'imsapp', source: 'DATABASE_URL', loginRole: 'imsapp', migrationWindow: false }), '')
+  // A window URL that carries the role option resolves to the application role, not the login.
+  assert.equal(roleFromConnectionString(`${stamped}&options=${encodeURIComponent('-c role=imsapp')}`), 'imsapp')
+  assert.equal(objectionToResolvedRole({ role: 'imsapp', source: 'DATABASE_URL', loginRole: 'imsapp_migrator', migrationWindow: true }), '')
   // An explicitly named role is the operator's assertion, not a fall-through.
-  assert.equal(objectionToResolvedRole({ role: 'deployadmin', source: '--app-role', adminRole: 'deployadmin' }), '')
+  assert.equal(objectionToResolvedRole({ role: 'imsapp_migrator', source: '--app-role', loginRole: 'imsapp_migrator', migrationWindow: true }), '')
 })
 
 // ---------------------------------------------------------------------------
@@ -420,16 +427,18 @@ test('the fence script runs its imports and refuses without a privileged connect
   assert.ok(!/Cannot find module/.test(result.output), 'and it must have got far enough to say so')
 })
 
-test('--print-migration-url composes the URL the migration runs through, and opens no connection', () => {
-  const result = runScript(['scripts/fence-db-connections.mjs', '--print-migration-url'], {
-    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin:pw@127.0.0.1:5432/ims',
+test('--print-migration-url needs a connection as the admin and never prints the admin URL when it cannot open one', () => {
+  // 127.0.0.1:5432 is not listening in this test. Until owner decision C3 this mode composed a URL
+  // from two strings and opened nothing; it now opens the admin connection to mint the migration
+  // login's password, so an unreachable admin is a failure with nothing on stdout.
+  const result = runScript(['scripts/fence-db-connections.mjs', '--print-migration-url', '--migration-role=imsapp_migrator'], {
+    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin:pw@127.0.0.1:59011/ims',
     DATABASE_URL: 'postgresql://imsapp:pw@127.0.0.1:5432/ims',
     DIRECT_URL: '',
   })
-  assert.equal(result.status, 0, '127.0.0.1:5432 is not listening in this test, so a connection attempt would fail')
-  const url = new URL(result.output.trim())
-  assert.equal(url.username, 'deployadmin')
-  assert.equal(url.searchParams.get('options'), '-c role=imsapp')
+  assert.notEqual(result.status, 0, 'a connection attempt to a port nothing listens on must fail')
+  assert.match(result.output, /59011|ECONNREFUSED/, 'precondition: it did try the admin connection')
+  assert.ok(!result.output.includes('deployadmin:pw'), 'and the admin credential is not echoed')
 })
 
 test('--print-migration-url refuses rather than emitting a URL that would create admin-owned objects', () => {
@@ -480,14 +489,12 @@ test('the object-access script refuses when it cannot tell which role to ask abo
   }
 })
 
-test('the object-access script refuses when the only role it could find is the deploy admin', () => {
-  // The fenced window sets DATABASE_URL to the PRIVILEGED url. With no state file and no
-  // flag, the fall-back names the admin — and every object the migration just created is
-  // owned by the admin, so the check would pass unconditionally. That is the CRITICAL
-  // wearing a green tick, so it exits non-zero instead.
+test('the object-access script refuses when the only role it could find is the migration login', () => {
+  // A fenced window sets DATABASE_URL to the MIGRATION url. With no state file, no flag and no role
+  // option on it, the fall-back names the migration login -- which owns whatever it created, so the
+  // check would pass unconditionally. That is the CRITICAL wearing a green tick, so it exits non-zero.
   const result = runScript(['scripts/check-app-db-object-access.mjs', '--state-file=/nonexistent/state.json'], {
-    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:59004/ims',
-    DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:59004/ims',
+    DATABASE_URL: 'postgresql://imsapp_migrator@127.0.0.1:59004/ims?application_name=ims-migration-' + 'b'.repeat(32),
     DIRECT_URL: '',
   })
   assert.notEqual(result.status, 0)
@@ -513,19 +520,23 @@ for (const script of [
   'scripts/run-migration-verifications.mjs',
   'scripts/check-app-db-object-access.mjs',
 ] as const) {
-  test(`${script.split('/')[1]} connects through the admin URL, not through DIRECT_URL`, () => {
+  test(`${script.split('/')[1]} connects through DATABASE_URL only: an admin URL in its environment is never tried`, () => {
     const result = runScript([script, '--app-role=imsapp'], {
       DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:59001/ims',
       DIRECT_URL: 'postgresql://imsapp@127.0.0.1:59002/ims',
-      DATABASE_URL: 'postgresql://imsapp@127.0.0.1:59003/ims',
+      DATABASE_URL: 'postgresql://imsapp_migrator@127.0.0.1:59003/ims',
       PRISMA_MIGRATIONS_DIR: join(process.cwd(), 'prisma/migrations'),
     })
     assert.notEqual(result.status, 0, 'nothing is listening on any of those ports')
-    assert.match(
-      result.output,
-      /59001/,
-      'it must have tried the privileged connection — DIRECT_URL is the role the fence just shut out',
-    )
-    assert.ok(!/59002/.test(result.output), 'and must not have fallen back to DIRECT_URL')
+    assert.match(result.output, /59003/, 'it must have tried DATABASE_URL, the migration URL of the window')
+    assert.ok(!/59001/.test(result.output), 'and must never have tried the admin canary')
+    assert.ok(!/59002/.test(result.output), 'nor DIRECT_URL, which is the role the fence just shut out')
+  })
+
+  test(`${script.split('/')[1]} names no admin credential anywhere in its source (universal absence)`, () => {
+    const source = readFileSync(join(process.cwd(), script), 'utf8')
+    const hits = source.split('\n').filter((line) => line.includes('DEPLOY_ADMIN_DATABASE_URL'))
+    console.log(`${script}: ${source.split('\n').length} lines scanned, ${hits.length} mention(s) of the admin variable`)
+    assert.deepEqual(hits, [], 'application-owned helper scripts must not read the admin credential')
   })
 }
