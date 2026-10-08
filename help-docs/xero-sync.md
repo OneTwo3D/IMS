@@ -2410,9 +2410,9 @@ Three things about those rows:
 | `unrealised_fx_journal` (UNREALISED_FX_JOURNAL / FxRevaluation) | The FX revaluation raises this journal only for the date it runs for; the daily run values today, so a refused journal for an earlier date is not raised again unless that date is re-run. |
 | `landed_cost_cogs_journal` (COGS_JOURNAL / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
 | `landed_cost_transit_journal` (STOCK_IN_TRANSIT / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
-| `refund_credit_note` (CREDIT_NOTE / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
-| `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
-| `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_credit_note` (CREDIT_NOTE / SalesOrderRefund) | The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | The Retry button on refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 
 **Nothing in IMS posts it again** — press *Take for hand posting* first, then identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type, then *Mark as handled* (which also stops IMS ever posting it).
 
