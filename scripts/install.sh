@@ -6848,7 +6848,7 @@ release_db_connections() {
   # nothing ever clears it -- so it cannot skip a release on a run that raised one: on every
   # upgrade, adoption and recovery path the flag is false and the release below runs unchanged.
   if ${FIRST_INSTALL_NO_CREDENTIALED_FENCE}; then
-    info "No database connection was fenced by this first install, so there is no fence to lift before the application starts."
+    info "This run created the database itself and fenced nothing, so there is no connection fence to lift before the application starts."
     return 0
   fi
   local rc=0 fence_script

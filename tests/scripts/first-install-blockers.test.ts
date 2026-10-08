@@ -93,7 +93,7 @@ test('F5: on a first install the shipped release succeeds without reaching the f
   console.log(`  F5 first-install arm: ${JSON.stringify(r.out.trim().split('\n').map((l) => l.slice(0, 110)))}`)
   assert.match(r.out, /RELEASE_RC=0/, `the release must succeed on a first install:\n${r.out}`)
   assert.doesNotMatch(r.out, /Cannot release|performs NO credentialed fence/, 'and print no refusal')
-  assert.match(r.out, /INFO: No database connection was fenced by this first install/, 'and say why nothing was lifted')
+  assert.match(r.out, /INFO: This run created the database itself and fenced nothing/, 'and say why nothing was lifted')
   // Isolating arm: with the resolver replaced by a recorder, a first install must never call it.
   const iso = asked(releaseProgram('true', 'stub'))
   assert.doesNotMatch(iso.out, /RESOLVER_CALLED/, `the helper is never asked on a first install:\n${iso.out}`)
@@ -105,7 +105,7 @@ test('F5: when no first-install exemption was taken the release still reaches th
   console.log(`  F5 update arm: ${JSON.stringify(r.out.trim().split('\n').map((l) => l.slice(0, 110)))}`)
   assert.match(r.out, /RESOLVER_CALLED/, `the release must reach the helper when the flag is false:\n${r.out}`)
   assert.match(r.out, /RELEASE_RC=1/, 'and a refusal must remain a failed release')
-  assert.doesNotMatch(r.out, /No database connection was fenced by this first install/, 'and must not claim there was nothing to lift')
+  assert.doesNotMatch(r.out, /This run created the database itself and fenced nothing/, 'and must not claim there was nothing to lift')
 })
 
 test('F5: the flag is armed in exactly one place, and the start step still demands a successful release', () => {
