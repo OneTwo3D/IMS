@@ -6698,8 +6698,16 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     {
       why: 'install.sh publishing the file it owns, by rename, from bytes it rendered itself',
       match:
-        `printf '%s\\\\n' "\\$\\{rendered\\}" \\| publish_durable_file "(${APP_OWNED_PATH})" ` +
+        `printf '%s\\\\n%s' "\\$\\{rendered\\}" "\\$\\{ENV_PRESERVED_BLOCK\\}" \\| publish_durable_file "(${APP_OWNED_PATH})" ` +
         '"\\$\\{APP_USER\\}:\\$\\{APP_USER\\}" 600 \\|\\| return 1',
+    },
+    // AND THE BACKUP OF WHAT IT IS ABOUT TO REPLACE (re-run preservation). Only the NAME of the backup is
+    // composed here, beside the file: the bytes published there are the lines this run read at its start
+    // (write_env_backup()), handed to the same publisher with the same owner and mode, and the path is
+    // never opened by this script. Spelled out whole-line so a different destination is not covered.
+    {
+      why: 'the name of the timestamped backup written beside the file install.sh owns',
+      match: 'ENV_BACKUP_FILE="\\$\\{APP_DIR\\}/\\.env\\.bak-\\$\\{stamp\\}"',
     },
     // The rotation journal write, which mentions the environment file only in the sentence it
     // refuses with. Its arguments are TWO PASSWORDS AND A DATABASE NAME, all BY VALUE — no path is
