@@ -30,7 +30,7 @@ function deps(overrides: Partial<GateDeps> = {}): GateDeps {
 }
 
 type Run = { code: number; out: string[]; err: string[]; reportDir: string }
-async function run(argv: string[], depsOverride: Partial<GateDeps> = {}, extra: { env?: NodeJS.ProcessEnv; publishHooks?: Parameters<typeof runReadinessGate>[0]['publishHooks']; reportDir?: string } = {}): Promise<Run> {
+async function run(argv: string[], depsOverride: Partial<GateDeps> = {}, extra: { env?: Record<string, string | undefined>; publishHooks?: Parameters<typeof runReadinessGate>[0]['publishHooks']; reportDir?: string } = {}): Promise<Run> {
   const base = mkdtempSync(path.join(tmpdir(), 'ims-gate-cli-'))
   const reportDir = extra.reportDir ?? path.join(base, 'reports')
   const out: string[] = []
@@ -192,7 +192,7 @@ test('an unsafe report directory is refused (exit 2) before any check runs', asy
 })
 
 test('the real command line: no arguments exits 2 and prints the exit-code table; --help exits 0', () => {
-  const env = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp' }
+  const env = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp' } as unknown as NodeJS.ProcessEnv
   const bare = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/readiness-gate.ts'], { cwd: ROOT, env, encoding: 'utf8' })
   assert.equal(bare.status, 2, bare.stderr)
   assert.match(bare.stderr, /--phase is required/)

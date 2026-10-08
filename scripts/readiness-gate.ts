@@ -143,7 +143,7 @@ export function loadAcceptances(args: Pick<GateCliArgs, 'acceptances'>, repoRoot
   }
 }
 
-function defaultDeps(env: NodeJS.ProcessEnv): GateDeps {
+function defaultDeps(env: Record<string, string | undefined>): GateDeps {
   const now = () => new Date()
   return {
     now,
@@ -173,7 +173,7 @@ async function disconnectDb(): Promise<void> {
 
 export type GateRunOptions = {
   argv: readonly string[]
-  env?: NodeJS.ProcessEnv
+  env?: Record<string, string | undefined>
   deps?: GateDeps
   stdout?: (text: string) => void
   stderr?: (text: string) => void
