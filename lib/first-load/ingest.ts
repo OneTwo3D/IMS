@@ -457,8 +457,11 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
     kept[index] = rows
     for (let earlier = 0; earlier < index; earlier++) kept[earlier] = kept[earlier].filter((row) => !replaced.has(row))
   })
-  // A wide report is one row per key ACROSS FILES too: a key present in more than one file refuses every source row that carries it, in every file.
+  // A wide report is one row per key ACROSS FILES too: a key present in more than one file refuses EVERY source row that carries it, in every
+  // file, whether that row was accepted (its block records are replaced by one rejection) or already refused (its existing rejection is
+  // extended to name the other files and lines). One disposition per source row either way.
   const crossRejected: IngestRejection[] = []
+  const rejectedOf: IngestRejection[][] = parts.map((part) => [...part.rejected])
   let removedRecords = 0
   const keyColumn = parts.find((part) => part.wideKey)?.wideKey?.column
   if (keyColumn) {
@@ -469,22 +472,31 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
     const spread = new Map([...where].filter(([, list]) => new Set(list.map((entry) => entry.part)).size > 1))
     if (spread.size > 0) {
       parts.forEach((part, index) => {
-        const bySource = new Map<number, CanonRow[]>()
+        if (!part.wideKey) return
+        const accepted = new Map<number, CanonRow[]>()
         const stay: CanonRow[] = []
         for (const row of kept[index]) {
-          const key = (row.values[keyColumn] ?? '').toUpperCase()
-          if (part.wideKey && spread.has(key)) bySource.set(Math.floor(row.line), [...(bySource.get(Math.floor(row.line)) ?? []), row])
+          if (spread.has((row.values[keyColumn] ?? '').toUpperCase())) accepted.set(Math.floor(row.line), [...(accepted.get(Math.floor(row.line)) ?? []), row])
           else stay.push(row)
         }
-        for (const [line, removed] of bySource) {
-          const key = (removed[0].values[keyColumn] ?? '').toUpperCase()
-          const others = spread.get(key)!.filter((entry) => entry.part !== index).map((entry) => `${parts[entry.part].file} line ${entry.line}`)
-          removedRecords += removed.length
-          crossRejected.push({
-            line: at(line, index),
-            code: 'DUPLICATE_SOURCE_ROW',
-            reason: `${keyColumn} ${JSON.stringify(removed[0].values[keyColumn])} is also on ${others.join(', ')}; a one-row-per-key report must not repeat a key across files, and warehouse quantities of two rows are never added together. Fix it in the source`,
-          })
+        const seenLines = new Set<number>()
+        for (const entry of part.wideKey.keys) {
+          const list = spread.get(entry.key)
+          if (!list || seenLines.has(entry.line)) continue
+          seenLines.add(entry.line)
+          const others = list.filter((other) => other.part !== index).map((other) => `${parts[other.part].file} line ${other.line}`)
+          const removed = accepted.get(entry.line)
+          if (removed) {
+            removedRecords += removed.length
+            crossRejected.push({
+              line: at(entry.line, index),
+              code: 'DUPLICATE_SOURCE_ROW',
+              reason: `${keyColumn} ${JSON.stringify(removed[0].values[keyColumn])} is also on ${others.join(', ')}; a one-row-per-key report must not repeat a key across files, and warehouse quantities of two rows are never added together. Fix it in the source`,
+            })
+          } else {
+            // Already refused inside its own file: say where else the key is, so no offending row is left unexplained.
+            rejectedOf[index] = rejectedOf[index].map((rejection) => (rejection.line === entry.line && !rejection.reason.includes(' Also on ') ? { ...rejection, reason: `${rejection.reason}. Also on ${others.join(', ')} (the key repeats across files)` } : rejection))
+          }
         }
         kept[index] = stay
       })
@@ -506,7 +518,7 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
     hadBom: parts.some((part) => part.hadBom),
     blankRows: parts.reduce((total, part) => total + part.blankRows, 0),
     rows: kept.flatMap((rows, index) => rows.map((row) => ({ ...row, line: shifted(row.line, index) }))),
-    rejected: [...parts.flatMap((part, index) => part.rejected.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))), ...conflicts, ...crossRejected],
+    rejected: [...rejectedOf.flatMap((list, index) => list.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))), ...conflicts, ...crossRejected],
     unmappedHeaders: unmapped,
     recordsRead: parts.reduce((total, part) => total + part.recordsRead, 0) - removedRecords + crossRejected.length,
     superseded,
@@ -724,6 +736,9 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     if (keyAt !== undefined) {
       for (const record of records) {
         if (record.cells.length !== header.length) continue
+        // A row the map deliberately SKIPS is not part of this dataset, so its key is not a key of the dataset (rows that are kept, or refused
+        // later, still count: a refused row is still a row that said something about that key).
+        if (mapping.rowSelect && selectIndex >= 0 && mapping.rowSelect.skip.includes(clean(record.cells[selectIndex]))) continue
         const key = clean(record.cells[keyAt]).toUpperCase()
         if (key !== '') {
           seen.set(key, (seen.get(key) ?? 0) + 1)

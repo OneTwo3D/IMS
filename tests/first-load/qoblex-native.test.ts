@@ -12,7 +12,7 @@ import { REPORT_JSON_NAME, runCli } from '../../lib/first-load/cli.ts'
 import { parseDateByFormat } from '../../lib/first-load/dates.ts'
 import { InputError, ingestDataset, mergeIngested, parseColumnMap } from '../../lib/first-load/ingest.ts'
 import { EXIT_CODES } from '../../lib/first-load/spec.ts'
-import { precondition } from './helpers.ts'
+import { ds, lot, precondition, product, rowsOf, run } from './helpers.ts'
 
 const NATIVE = path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures', 'qoblex-native')
 const scratch = mkdtempSync(path.join(tmpdir(), 'first-load-native-'))
@@ -538,4 +538,83 @@ test('wide map: every block column needs a report total (omitting qty is refused
   precondition(t, 'maps', 2)
   assert.throws(() => parseColumnMap(wideMapText(two), 'm.json'), (e) => e instanceof InputError && /block column "qty" has no total header/.test(e.message))
   assert.doesNotThrow(() => parseColumnMap(wideMapText({ ...two, totals: { qty: 'Total Quantity', unitCost: 'Total Quantity' } }), 'm.json'))
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review round 3: mixed layouts, several files, skipped rows, every offending row named
+// ---------------------------------------------------------------------------------------------------------------------
+
+const KIND_HEADER = ['Sku', 'Kind', 'Total Quantity', 'Quantity', 'Other', 'Quantity', 'Other']
+const KIND_LABELS = ['', '', 'W one', '', 'W two', '', '']
+const kindMap = () =>
+  parseColumnMap(
+    JSON.stringify({
+      formatVersion: 1,
+      source: 'qoblex',
+      datasets: { 'stock-lots': { rowsAboveHeader: 1, columns: { sku: 'Sku' }, constants: { currency: 'GBP' }, rowSelect: { column: 'Kind', keep: ['K'], skip: ['S'] }, wide: WIDE } },
+    }),
+    'm.json',
+  ).datasets['stock-lots']!
+const kindFile = (file: string, rows: string[][]) => ingestDataset('stock-lots', wideFile(KIND_LABELS, KIND_HEADER, rows), file, kindMap())
+
+test('a manifest that lists one dataset as wide AND as a canonical file is a usage error (exit 2), and nothing is read', async (t) => {
+  const dir = copyNative()
+  writeFileSync(path.join(dir, 'canonical-stock.csv'), 'sku,warehouseCode,qty,unitCost,currency\r\nSYN-1001,MIL1,3,9.99,GBP\r\n')
+  const manifest = JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
+  manifest.inputs.push({ dataset: 'stock-lots', file: 'canonical-stock.csv' })
+  writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest))
+  const out = fresh('mixed')
+  const run = await cli(['--manifest', path.join(dir, 'manifest.json'), '--out', out])
+  precondition(t, 'stderr bytes', run.stderr.length)
+  assert.equal(run.code, EXIT_CODES.USAGE)
+  assert.match(run.stderr, /dataset stock-lots is listed with a mix of wide-warehouse-block files and other files/)
+  assert.equal(readdirSync(path.join(dir)).includes('01-suppliers-001-of-001.csv'), false)
+  // Control: the same manifest without the canonical file is not a usage error.
+  const clean = await cli(['--manifest', path.join(NATIVE, 'manifest.json'), '--dry-run'])
+  assert.notEqual(clean.code, EXIT_CODES.USAGE)
+})
+
+test('the same SKU and warehouse from two input files is never added together unless every row carries its own lot reference', (t) => {
+  const products = ds('products', [product('S1')])
+  const a = ds('stock-lots', [lot('S1', '10', '1.5')], 'a.csv')
+  const b = ds('stock-lots', [lot('S1', '4', '9.25')], 'b.csv') // asymmetric quantity and cost, no lot reference
+  const result = run({ products, 'stock-lots': mergeIngested([a, b]) })
+  precondition(t, 'stock records', result.report.accounting.find((row) => row.dataset === 'stock-lots')!.recordsRead)
+  assert.deepEqual(result.report.accountingByCode.filter((row) => row.dataset === 'stock-lots').map((row) => [row.code, row.count]), [['STOCK_FROM_SEVERAL_FILES', 2]])
+  assert.equal(rowsOf(result, 'opening-stock').length, 0, 'no balance of 14 reaches the opening stock file')
+  // Controls: distinct lot references in both files are separate lots and may be added; one file with two lots is the old rule.
+  const refs = run({ products, 'stock-lots': mergeIngested([ds('stock-lots', [lot('S1', '10', '1.5', { lotRef: 'L1' })], 'a.csv'), ds('stock-lots', [lot('S1', '4', '9.25', { lotRef: 'L2' })], 'b.csv')]) })
+  assert.equal(rowsOf(refs, 'opening-stock')[0].qty, '14')
+  const other = run({ products: ds('products', [product('S1'), product('S2')]), 'stock-lots': mergeIngested([a, ds('stock-lots', [lot('S2', '4', '9.25')], 'b.csv')]) })
+  assert.equal(rowsOf(other, 'opening-stock').length, 2, 'different SKUs in different files are fine')
+})
+
+test('wide keys: a key only in a row the map deliberately SKIPS in one file does not refuse the kept row in another', (t) => {
+  const a = kindFile('a.csv', [['A1', 'S', '7', '3', 'y', '4', 'z'], ['B1', 'K', '7', '3', 'y', '4', 'z']])
+  const b = kindFile('b.csv', [['A1', 'K', '5', '2', 'y', '3', 'z']])
+  const merged = mergeIngested([a, b])
+  precondition(t, 'skipped rows', Object.values(a.rowsSkipped).reduce((x, y) => x + y, 0))
+  assert.equal(merged.rejected.length, 0)
+  assert.deepEqual(merged.rows.filter((row) => row.values.sku === 'A1').map((row) => row.values.qty), ['2', '3'])
+  // Control: when the first file KEEPS its A1 row, the collision is real.
+  const kept = mergeIngested([kindFile('a.csv', [['A1', 'K', '7', '3', 'y', '4', 'z']]), b])
+  assert.equal(kept.rejected.length, 2)
+})
+
+test('cross-file duplicates name every offending source row: rows already refused in their own file, and rows refused for a total, included', (t) => {
+  // File A: A1 twice (refused inside A) and M1 whose total is wrong (refused inside A); file B: A1 and M1 once; file C: nothing in common.
+  const a = kindFile('a.csv', [['A1', 'K', '7', '3', 'y', '4', 'z'], ['A1', 'K', '9', '5', 'y', '4', 'z'], ['M1', 'K', '99', '3', 'y', '4', 'z']])
+  const b = kindFile('b.csv', [['A1', 'K', '5', '2', 'y', '3', 'z'], ['M1', 'K', '5', '2', 'y', '3', 'z']])
+  const c = kindFile('c.csv', [['C1', 'K', '5', '2', 'y', '3', 'z']])
+  const merged = mergeIngested([a, b, c])
+  precondition(t, 'records', merged.recordsRead)
+  assert.equal(merged.rows.length + merged.rejected.length, merged.recordsRead, 'one disposition per record')
+  assert.deepEqual([...new Set(merged.rows.map((row) => row.values.sku))], ['C1'])
+  const text = (line: number) => merged.rejected.filter((r) => r.line === line).map((r) => r.reason).join(' | ')
+  assert.match(text(3), /b\.csv line 3/, 'A line 3 (first A1) names B')
+  assert.match(text(4), /b\.csv line 3/, 'A line 4 (second A1) names B')
+  assert.match(text(5), /b\.csv line 4/, 'A line 5 (M1, refused for its total) names B')
+  assert.match(text(1_000_000 + 3), /a\.csv line 3, a\.csv line 4/, 'B A1 names both A rows')
+  assert.match(text(1_000_000 + 4), /a\.csv line 5/, 'B M1 names the A row')
+  assert.equal(merged.rejected.filter((r) => r.line === 3).length, 1, 'still one rejection per source row')
 })

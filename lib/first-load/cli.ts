@@ -167,6 +167,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
 
   const resolve = (file: string) => path.resolve(manifestDir, file)
   const parts: Partial<Record<DatasetName, Array<{ ingested: IngestedDataset; supersedes: boolean }>>> = {}
+  const layouts = new Map<DatasetName, Set<string>>()
   const maps = new Map<string, ColumnMap>()
   const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
   try {
@@ -201,6 +202,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
           continue
         }
       }
+      layouts.set(input.dataset, (layouts.get(input.dataset) ?? new Set()).add(mapping?.wide ? 'wide' : 'canonical-or-long'))
       let bytes: Buffer
       try {
         bytes = readFileSync(resolve(input.file))
@@ -216,6 +218,12 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
       }
     }
     if (problems.length > 0) throw new InputError(problems)
+    for (const [name, kinds] of layouts) {
+      if (kinds.size > 1) {
+        io.stderr(`first-load-prepare: dataset ${name} is listed with a mix of wide-warehouse-block files and other files; one run reads a dataset either entirely wide or entirely not wide, because rows of the same SKU and warehouse in two layouts could not be told apart and would be added together\n\n${usageText()}`)
+        return EXIT_CODES.USAGE
+      }
+    }
     for (const name of Object.keys(parts) as DatasetName[]) datasets[name] = mergeIngested(parts[name]!.map((part) => part.ingested), parts[name]!.map((part) => part.supersedes))
   } catch (error) {
     if (error instanceof InputError) {

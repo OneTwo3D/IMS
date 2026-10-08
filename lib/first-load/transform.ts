@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { parseCsv } from '@/lib/csv'
 import { parseCsvStrict, serializeCsv } from './csv'
-import type { CanonRow, IngestedDataset } from './ingest'
+import { PART_LINE_STRIDE, type CanonRow, type IngestedDataset } from './ingest'
 import { D, fmt, fmtFixed, parseDecimal, roundTo, sum, type Dec } from './money'
 import {
   APPLY_TIME_CHECKS,
@@ -915,6 +915,21 @@ function loadStock(run: Run): void {
     for (const lot of list) {
       refused.add(lot)
       run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'DUPLICATE_LOT_ROW', `${list.length} lot rows with the same SKU, warehouse, quantity and cost, and at least one has no lot reference to tell it apart; they could be one lot exported twice (stock would be doubled) or genuinely separate lots. Add a lot reference column to the export`)
+    }
+  }
+  // Rows of one SKU and warehouse that arrive from MORE THAN ONE input file are never added together unless every one of them carries its own
+  // non-blank lot reference: without that, the same stock could be in both files (a re-export, a second layout) and would be counted twice.
+  // (An input file's part number is the multiple of 1,000,000 in its line numbers: see PART_LINE_STRIDE.)
+  const byGroup = new Map<string, Lot[]>()
+  for (const lot of lots) if (!refused.has(lot)) byGroup.set(stockGroupKey(lot.key, lot.warehouse), [...(byGroup.get(stockGroupKey(lot.key, lot.warehouse)) ?? []), lot])
+  for (const list of byGroup.values()) {
+    const partsSeen = new Set(list.map((lot) => Math.floor(lot.row.line / PART_LINE_STRIDE)))
+    if (partsSeen.size < 2) continue
+    const tokens = list.map((lot) => idToken(lot.lotRef))
+    if (tokens.every((token) => token !== '') && new Set(tokens).size === tokens.length) continue
+    for (const lot of list) {
+      refused.add(lot)
+      run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'STOCK_FROM_SEVERAL_FILES', `${lot.sku} in ${lot.warehouse} is stocked by rows from ${partsSeen.size} different input files and they do not all carry their own lot reference; they could be the same stock exported twice, so they are not added together. Give each lot a reference or supply the stock in one file`)
     }
   }
   const groups = new Map<string, Lot[]>()
