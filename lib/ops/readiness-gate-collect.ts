@@ -108,8 +108,12 @@ async function guarded(label: string, collect: () => Promise<CheckResult> | Chec
 // The child environment: a short whitelist, never the caller's whole environment.
 // ---------------------------------------------------------------------------------------------
 
-/** The only variables of this process a child may inherit. NOT a connector credential, an outbound grant, SMTP, NODE_OPTIONS or PG*. */
-export const CHILD_ENV_WHITELIST = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'npm_config_cache', 'DATABASE_URL'] as const
+/**
+ * The only variables of this process a child may inherit. PRISMA_DEV_DB_CONFIRM is the operator's own opt-in for the
+ * schema commands (scripts/prisma-dev-db.sh refuses a DATABASE_URL that is not on this host without it); the gate never
+ * sets it, so a database on another host makes the schema check fail with that script's refusal until the operator exports it.
+ * NOT a connector credential, an outbound grant, SMTP, NODE_OPTIONS or PG*. */
+export const CHILD_ENV_WHITELIST = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'npm_config_cache', 'DATABASE_URL', 'PRISMA_DEV_DB_CONFIRM'] as const
 
 /** Fixed additions: do not source the checkout's .env over the database URL, and make no telemetry request. */
 export const CHILD_ENV_FIXED: Record<string, string> = {

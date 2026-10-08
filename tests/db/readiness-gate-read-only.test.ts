@@ -89,10 +89,11 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
     const out: string[] = []
     const code = await runReadinessGate({
       argv: ['--phase', 'P0', '--report-dir', path.join(reportDir, 'reports'), '--rehearsal-dir', path.join(reportDir, 'no-rehearsals')],
-      // The ORIGINAL url, not the read-only one: the schema commands are Prisma children, and Prisma's connection string
+      // PRISMA_DEV_DB_CONFIRM: CI's database is on another host (a service container), and the schema scripts refuse that without it;
+      // it is the operator's opt-in and the gate only passes it through. The ORIGINAL url, not the read-only one: the schema commands are Prisma children, and Prisma's connection string
       // grammar does not take an `options` parameter next to `?schema=` (CI's URL has one). The server-enforced proof is the
       // direct collector calls above; this run's proof is that no file of the checkout changed and every check completed.
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, DATABASE_URL: originalUrl },
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, DATABASE_URL: originalUrl, PRISMA_DEV_DB_CONFIRM: '1' },
       stdout: (text) => out.push(text),
       stderr: () => undefined,
       disconnect: async () => undefined,

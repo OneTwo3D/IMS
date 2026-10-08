@@ -357,3 +357,12 @@ test('absence: the code that RUNS things never names validate:db or a generate s
   assert.match("npm run validate:db", pattern, 'control: the pattern finds the forbidden call')
   assert.deepEqual([...SCHEMA_STATE_SCRIPTS], ['db:migrate:status', 'db:schema:diff', 'db:schema:drift'])
 })
+
+test('PRISMA_DEV_DB_CONFIRM is passed to the children only if the operator set it (the gate never sets it)', async () => {
+  const without = deps()
+  await collectGateResults(OPTIONS, without)
+  assert.equal('PRISMA_DEV_DB_CONFIRM' in without.spawned[0]!.env, false)
+  const withIt = deps({ env: { ...deps().env, PRISMA_DEV_DB_CONFIRM: '1' } })
+  await collectGateResults(OPTIONS, withIt)
+  assert.equal(withIt.spawned[0]!.env.PRISMA_DEV_DB_CONFIRM, '1')
+})
