@@ -41,6 +41,7 @@ import {
 } from '../lib/ops/readiness-gate-constants.ts'
 import {
   collectGateResults,
+  defaultReadInstalledConstraints,
   defaultReadOutbound,
   defaultReadReconciliation,
   defaultRunInvariant,
@@ -51,7 +52,7 @@ import {
 } from '../lib/ops/readiness-gate-collect.ts'
 import { readBuildIdentity } from '../lib/ops/build-identity.ts'
 import { publishGateReport } from '../lib/ops/readiness-gate-publish.ts'
-import { checkAncestors, verifyPublishedReport } from '../lib/ops/published-report.ts'
+import { UntrustedPathError, checkAncestors, readTrustedRegularFile, verifyPublishedReport } from '../lib/ops/published-report.ts'
 import { OUTBOUND_CONNECTORS } from '../lib/security/outbound-write-hold-constants.ts'
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
@@ -112,36 +113,13 @@ export function parseGateArgs(argv: readonly string[]): GateCliArgs | { error: s
 }
 
 /**
- * The acceptance file is a DECISION, so who could have written it matters. It is used only if it is a regular
- * file (opened O_NOFOLLOW) owned by root or the running account and not writable by group or others, and its
- * directory and every ancestor pass the gate's own ancestor policy (lib/ops/published-report.ts). Otherwise
- * the whole file is rejected and accepts nothing: a file another account can edit could turn a blocking
- * warning into a GO.
+ * The acceptance file is a DECISION, so who could have written it matters: it is read with the same trust
+ * policy as the rehearsal reports (lib/ops/published-report.ts readTrustedRegularFile). Otherwise the whole
+ * file is rejected and accepts nothing.
  */
-export class UntrustedAcceptanceFile extends Error {}
-
+const UntrustedAcceptanceFile = UntrustedPathError
 function readAcceptanceText(file: string): string {
-  const fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
-  try {
-    const info = fstatSync(fd)
-    if (!info.isFile()) throw new UntrustedAcceptanceFile(`${file} is not a regular file`)
-    const me = typeof process.getuid === 'function' ? process.getuid() : 0
-    if (info.uid !== 0 && info.uid !== me) throw new UntrustedAcceptanceFile(`${file} is owned by uid ${info.uid}, neither root nor the running account`)
-    if ((info.mode & 0o022) !== 0) throw new UntrustedAcceptanceFile(`${file} is writable by group or others`)
-    const ancestors = checkAncestors(path.dirname(file), 'acceptance file directory')
-    if (ancestors) throw new UntrustedAcceptanceFile(ancestors)
-    if (info.size > MAX_ACCEPTANCE_BYTES) throw new Error(`${file} is larger than ${MAX_ACCEPTANCE_BYTES} bytes`)
-    const buffer = Buffer.alloc(info.size)
-    let read = 0
-    while (read < info.size) {
-      const n = readSync(fd, buffer, read, info.size - read, read)
-      if (n === 0) break
-      read += n
-    }
-    return buffer.subarray(0, read).toString('utf8')
-  } finally {
-    closeSync(fd)
-  }
+  return readTrustedRegularFile(file, MAX_ACCEPTANCE_BYTES)
 }
 
 /** The acceptance file. A DEFAULT path that does not exist means none; a NAMED path that does not exist is a refusal. */
@@ -169,6 +147,7 @@ function defaultDeps(env: Record<string, string | undefined>): GateDeps {
     runScript: runNpmScript,
     readPackageScripts: () => readPackageScriptsFrom(REPO_ROOT),
     readBuildIdentity: () => readBuildIdentity(REPO_ROOT),
+    readInstalledConstraints: defaultReadInstalledConstraints,
     readNewestRehearsal: (dir) => readNewestRehearsal(dir, verifyPublishedReport),
     env,
     repoRoot: REPO_ROOT,

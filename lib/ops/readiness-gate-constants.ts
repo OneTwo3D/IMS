@@ -73,7 +73,8 @@ export const ACCEPTANCES_DEFAULT_FILE = 'ops/readiness-warning-acceptances.json'
 
 /** The package.json script the read-sync liveness check runs once it exists (see READ_SYNC_CONTRACT). */
 export const READ_SYNC_STATUS_SCRIPT = 'read-sync:status'
-export const READ_SYNC_CONTRACT_VERSION = 'read-sync status v1 (as built in the WP8 branch at 4e7df144; UNPROVEN until that merges: if its JSON changes, this and assessReadSyncStatus change with it)'
+export const READ_SYNC_SCHEMA_VERSION = 1
+export const READ_SYNC_CONTRACT_VERSION = 'read-sync status schemaVersion 1 (the WP8 producer at 4e7df144 does not emit schemaVersion yet and is being asked to add it; until it does this check fails closed against it; UNPROVEN until that merges)'
 /** The streams that must all be reported, each fresh. Mirrors that status API's stream list. */
 export const REQUIRED_READ_SYNC_STREAMS = [
   'woocommerce-order-sweep',
@@ -83,7 +84,28 @@ export const REQUIRED_READ_SYNC_STREAMS = [
   'xero-balance-snapshots',
   'xero-tax-rates',
 ] as const
-export const READ_SYNC_CONTRACT = `${READ_SYNC_CONTRACT_VERSION}: \`npm run --silent read-sync:status\` exits 0 and prints one JSON object with an \`entries\` list (one per stream, or per binding for the stock sync) carrying \`stream\`, \`state\` (must be fresh), \`lastSuccessAt\` (a valid ISO time, not in the future), \`maxAgeMs\` and \`ageMs\`, covering all of ${REQUIRED_READ_SYNC_STREAMS.join(', ')}, and a \`scheduler\` object that was examined, readable, with nothing unscheduled`
+export const READ_SYNC_CONTRACT = `${READ_SYNC_CONTRACT_VERSION}: \`npm run --silent read-sync:status\` exits 0 and prints one JSON object with \`schemaVersion\` 1, \`generatedAt\`, \`counts\` that equal the tally of its entries, and an \`entries\` list (one per stream, or per binding for the stock sync) carrying \`stream\`, \`state\` (must be fresh), \`lastSuccessAt\` (a valid ISO time, not in the future), \`futureTimestamp\`, \`ageMs\` (consistent with the two times) and \`maxAgeMs\`, covering all of ${REQUIRED_READ_SYNC_STREAMS.join(', ')}, and a \`scheduler\` object that was examined, readable, with nothing unscheduled`
+
+/** What the build identity covers, said in every GO and in the docs. */
+export const BUILD_SCOPE_TEXT = 'The rehearsal is tied to this build by source commit and source tree only; it is NOT tied to the build artefact (.next/BUILD_ID) and NOT to the .env configuration.'
+
+/** Why a rehearsal report location was not read. */
+export const REHEARSAL_TRUST_TEXT = (reason: string) => `the rehearsal report location is not trusted (${reason}); a report that another account could have written proves nothing, so it was not read`
+
+/**
+ * What the gate runs in place of validate:db. Each is read-only (migrate status and migrate diff only read the
+ * schema and the migration table, and the drift check wraps migrate diff); none of them regenerates the client.
+ */
+export const SCHEMA_STATE_SCRIPTS = ['db:migrate:status', 'db:schema:diff', 'db:schema:drift'] as const
+/** The CHECK constraints validate:db's probe makes fire (scripts/check-stock-quantity-constraints.mjs). The gate only verifies they are installed and validated. */
+export const REQUIRED_CHECK_CONSTRAINTS = [
+  'stock_levels_quantity_nonnegative',
+  'stock_levels_reserved_nonnegative',
+  'cost_layers_received_nonnegative',
+  'cost_layers_remaining_qty_non_negative',
+  'cost_layers_remaining_qty_lte_received_qty',
+  'stock_movements_qty_nonnegative',
+] as const
 
 export const DEFAULT_REPORT_DIR = '/var/tmp/ims-readiness-gate-reports'
 export const DEFAULT_REHEARSAL_DIR = '/var/tmp/ims-rehearsal-reports'
@@ -104,7 +126,7 @@ export type Requirement = (typeof REQUIREMENTS)[number]
 
 export type FixedCheckId =
   | 'invariant-preflight'
-  | 'validate-db'
+  | 'schema-state'
   | 'outbound-status'
   | 'first-install-rehearsal'
   | 'reconciliation-completeness'
@@ -152,10 +174,10 @@ export const CHECK_CATALOGUE: readonly CheckDefinition[] = [
     expectation: ALL_PHASES('All three invariant reports completed, none was truncated, and no finding is critical. Each warning finding is listed and must be accepted in writing.'),
   },
   {
-    id: 'validate-db',
-    title: 'npm run validate:db passes',
+    id: 'schema-state',
+    title: 'Database schema is applied, has not drifted, and the CHECK constraints are installed (read-only)',
     requirement: ALL_PHASES('required'),
-    expectation: ALL_PHASES('The command exits 0: migrations are applied, the schema has not drifted, and the CHECK constraints are installed and fire.'),
+    expectation: ALL_PHASES('prisma migrate status says the schema is up to date, the schema diff and the drift check find no difference, and the six stock CHECK constraints exist and are validated. These only read; npm run validate:db (which makes the constraints fire with a rolled-back probe and regenerates the client) is not run by the gate.'),
   },
   {
     id: 'outbound-status',
@@ -220,9 +242,11 @@ const PHASE_ROWS = READINESS_PHASES.map((phase) => `| ${phase} | ${READINESS_PHA
 
 export const READINESS_GATE_DOC_BLOCKS: Record<ReadinessGateDocBlockId, string> = {
   overview: [
-    `\`${READINESS_GATE_COMMAND}\` collects the checks that decide whether an installation may go on to the next phase of the switchover and reduces them to one verdict: GO, GO-WITH-ACCEPTED-WARNINGS or NO-GO. It is read-only against the database it is pointed at, makes no call to WooCommerce, Mintsoft or Xero, and writes only its own report. One exception is stated plainly: \`npm run validate:db\`, which the gate runs, starts a transaction that inserts a probe product and warehouse to prove the CHECK constraints fire and then rolls it back, so it leaves no rows but does move the database's statistics counters and leaves dead tuples for vacuum to clear; it also regenerates the Prisma client in the checkout.`,
+    `\`${READINESS_GATE_COMMAND}\` collects the checks that decide whether an installation may go on to the next phase of the switchover and reduces them to one verdict: GO, GO-WITH-ACCEPTED-WARNINGS or NO-GO. It performs no database write and no write to the checkout, makes no call to WooCommerce, Mintsoft or Xero, and writes only its own report. Its schema check runs \`prisma migrate status\`, the schema diff and the drift check, which only read, and reads the constraint catalogue; it does not run \`npm run validate:db\`.`,
     '',
-    'The verdict is only as wide as the checks that ran. A GO says that every check listed as required for the phase passed on the database and environment the gate was run against, at the time stated in the report. It does not inspect the environment of any running service (the outbound check reads the environment of the gate process, so run the gate with the environment the services use), it does not say the data matches Qoblex, Mintsoft, WooCommerce or Xero unless a reconciliation pack item for that comparison is listed in the report as run and passed, and every item the report lists as NOT YET AVAILABLE was not checked at all. A check that is missing, unreadable or unknown is a NO-GO, never a skipped check; the only checks that may be absent are the ones the report names as optional until they exist.',
+    `The verdict is only as wide as the checks that ran. A GO says that every check listed as required for the phase passed on the database and environment the gate was run against, at the time stated in the report. ${BUILD_SCOPE_TEXT} It does not inspect the environment of any running service (the outbound check reads the environment of the gate process, so run the gate with the environment the services use), and it does not say the data matches Qoblex, Mintsoft, WooCommerce or Xero unless a reconciliation pack item for that comparison is listed in the report as run and passed. A check that is missing, unreadable or unknown is a NO-GO, never a skipped check; the only checks that may be absent are the ones the report names as optional until they exist.`,
+    '',
+    'Not checked by the gate: that the CHECK constraints actually fire, and that the Prisma client is generated. Both belong to `npm run validate:db`, which inserts probe rows in a transaction it rolls back and regenerates the client, so it is an operator pre-step run on a scratch database (the fresh-install rehearsal runs it on its own cluster). Also not checked: the build artefact, the `.env` configuration, every item the report lists as NOT YET AVAILABLE, and the authenticity of the rehearsal report beyond who could have written it (see the rehearsal section).',
   ].join('\n'),
   usage: [
     `\`${READINESS_GATE_COMMAND} -- --phase <P0|P1|P2> [--expect-granted <connector[,connector]|none>] [--acceptances <file>] [--rehearsal-dir <dir>] [--report-dir <dir>] [--json]\``,

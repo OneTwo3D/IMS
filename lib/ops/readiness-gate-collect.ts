@@ -8,7 +8,9 @@
  *
  *  - invariant report       lib/cron/invariant-check-preflight (the function behind
  *                           `npm run invariant-check:preflight`, with its no-op writers), in process
- *  - validate:db            `npm run validate:db` as a child: no shell, a whitelisted environment, the
+ *  - schema state          `npm run db:migrate:status`, `db:schema:diff`, `db:schema:drift` as children (read-only;
+ *                           NOT validate:db, which inserts probe rows and regenerates the client) plus a read of
+ *                           pg_constraint; no shell, a whitelisted environment, the
  *                           database URL in that environment and never on a command line
  *  - outbound status        lib/ops/outbound-status (the function behind `npm run outbound:status`), in
  *                           process: it reads the ENVIRONMENT OF THIS PROCESS and the activity log
@@ -22,13 +24,17 @@
  */
 
 import { spawn } from 'node:child_process'
-import { constants as fsConstants, closeSync, fstatSync, lstatSync, openSync, readFileSync, readSync, readdirSync } from 'node:fs'
+import { lstatSync, readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 
+import { UntrustedPathError, checkAncestors, readTrustedRegularFile } from '@/lib/ops/published-report'
 import {
   CHECK_CATALOGUE,
   PACK_ITEMS,
   READ_SYNC_STATUS_SCRIPT,
+  REQUIRED_CHECK_CONSTRAINTS,
+  REHEARSAL_TRUST_TEXT,
+  SCHEMA_STATE_SCRIPTS,
   type PackItemId,
   type ReadinessPhase,
 } from '@/lib/ops/readiness-gate-constants'
@@ -70,8 +76,10 @@ export type GateDeps = {
   readPackageScripts: () => Record<string, string>
   /** The commit and tree of the checkout the gate runs from. Throws when git cannot say. */
   readBuildIdentity: () => BuildIdentity
+  /** Names of the CHECK constraints that exist and are validated (a read of pg_constraint). */
+  readInstalledConstraints: () => Promise<string[]>
   /** The newest rehearsal report in `dir`, or a reason there is none. Throws when the directory cannot be read. */
-  readNewestRehearsal: (dir: string, now: Date) => RehearsalEvidence | { none: string }
+  readNewestRehearsal: (dir: string, now: Date) => RehearsalEvidence | { none: string } | { untrusted: string }
   /** The environment of this process, read only by name. */
   env: Record<string, string | undefined>
   repoRoot: string
@@ -151,7 +159,7 @@ export function runNpmScript(spec: ChildSpec): Promise<ChildResult> {
   })
 }
 
-export const VALIDATE_DB_TIMEOUT_MS = 20 * 60 * 1000
+export const SCHEMA_SCRIPT_TIMEOUT_MS = 5 * 60 * 1000
 export const READ_SYNC_TIMEOUT_MS = 2 * 60 * 1000
 
 // ---------------------------------------------------------------------------------------------
@@ -159,51 +167,50 @@ export const READ_SYNC_TIMEOUT_MS = 2 * 60 * 1000
 // ---------------------------------------------------------------------------------------------
 
 const REHEARSAL_JSON = 'readiness-report.json'
+const REHEARSAL_MARKDOWN = 'readiness-report.md'
 const MAX_REPORT_BYTES = 5 * 1024 * 1024
-
-function readRegularFile(file: string, maxBytes: number): string {
-  const fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
-  try {
-    const info = fstatSync(fd)
-    if (!info.isFile()) throw new Error(`${file} is not a regular file`)
-    if (info.size > maxBytes) throw new Error(`${file} is larger than ${maxBytes} bytes`)
-    const buffer = Buffer.alloc(info.size)
-    let read = 0
-    while (read < info.size) {
-      const n = readSync(fd, buffer, read, info.size - read, read)
-      if (n === 0) break
-      read += n
-    }
-    return buffer.subarray(0, read).toString('utf8')
-  } finally {
-    closeSync(fd)
-  }
-}
 
 /**
  * The NEWEST rehearsal report, by the time it says it finished (or its file's modification time when it
  * says nothing readable). The newest is judged on its own: an older GREEN report is never a fallback for a
- * newer one that is RED, corrupt or fails its digest, because "the latest rehearsal" is a statement about
- * the latest. Entries that are not real directories are ignored; a directory with no report JSON (a
- * crashed publication leaves only temporary files) is not a report.
+ * newer one that is RED, corrupt or fails its digest.
+ *
+ * TRUST, BEFORE ANYTHING IS READ. The digest only binds the Markdown to the JSON that names it; both sit in the
+ * same directory, so whoever can write one can write the other. What makes a report worth reading is therefore
+ * WHO COULD HAVE WRITTEN IT: the report directory and its ancestors, EVERY run directory, and both report files
+ * of each must be real (never symlinks), owned by root or the running account, and not writable by group or
+ * others (the ancestor policy of lib/ops/published-report.ts). Any violation anywhere refuses the whole
+ * location, even in a run directory that is not the newest: a directory somebody else can populate is not
+ * evidence. A process running as the same account or as root is out of scope; this proves nothing about
+ * authenticity beyond ownership and mode.
  */
 export function readNewestRehearsal(
   dir: string,
   verify: (jsonFile: string) => { ok: true } | { ok: false; reason: string },
-): RehearsalEvidence | { none: string } {
+): RehearsalEvidence | { none: string } | { untrusted: string } {
+  const refuse = (reason: string) => ({ untrusted: REHEARSAL_TRUST_TEXT(reason) })
   let names: string[]
   try {
+    const rootProblem = checkAncestors(dir, 'rehearsal report directory')
+    if (rootProblem) {
+      try { lstatSync(dir) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { none: `the rehearsal report directory ${dir} does not exist` } }
+      return refuse(rootProblem)
+    }
     names = readdirSync(dir)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { none: `the rehearsal report directory ${dir} does not exist` }
     throw error
   }
-  const candidates: Array<{ json: string; text: string | null; parsed: unknown; sortKey: number }> = []
+  const candidates: Array<{ json: string; parsed: unknown; sortKey: number }> = []
   for (const name of names) {
     const sub = path.join(dir, name)
     const info = lstatSync(sub)
-    if (info.isSymbolicLink() || !info.isDirectory()) continue
+    if (info.isSymbolicLink()) return refuse(`${sub} is a symlink`)
+    if (!info.isDirectory()) continue // a stray file in the directory is not a run and is never read
+    const subProblem = checkAncestors(sub, 'run directory')
+    if (subProblem) return refuse(subProblem)
     const json = path.join(sub, REHEARSAL_JSON)
+    const markdown = path.join(sub, REHEARSAL_MARKDOWN)
     let jsonInfo
     try {
       jsonInfo = lstatSync(json)
@@ -211,16 +218,30 @@ export function readNewestRehearsal(
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
       throw error
     }
-    let text: string | null = null
+    let text: string
     let parsed: unknown = null
     try {
-      text = readRegularFile(json, MAX_REPORT_BYTES)
+      text = readTrustedRegularFile(json, MAX_REPORT_BYTES)
+    } catch (error) {
+      if (error instanceof UntrustedPathError) return refuse(error.message)
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') return refuse(`${json} is a symlink`)
+      throw error
+    }
+    try {
+      readTrustedRegularFile(markdown, MAX_REPORT_BYTES)
+    } catch (error) {
+      if (error instanceof UntrustedPathError) return refuse(error.message)
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') return refuse(`${markdown} is a symlink`)
+      // A missing Markdown is left for the digest check to report (the pair does not verify).
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    try {
       parsed = JSON.parse(text)
     } catch {
       parsed = null
     }
     const finished = typeof (parsed as { finishedAt?: unknown } | null)?.finishedAt === 'string' ? Date.parse((parsed as { finishedAt: string }).finishedAt) : Number.NaN
-    candidates.push({ json, text, parsed, sortKey: Number.isFinite(finished) ? finished : jsonInfo.mtimeMs })
+    candidates.push({ json, parsed, sortKey: Number.isFinite(finished) ? finished : jsonInfo.mtimeMs })
   }
   if (candidates.length === 0) return { none: `no rehearsal report was found under ${dir}` }
   candidates.sort((left, right) => right.sortKey - left.sortKey || right.json.localeCompare(left.json))
@@ -286,16 +307,21 @@ export async function collectGateResults(options: CollectOptions, deps: GateDeps
     return assessInvariantReport(invariantEvidence)
   })
 
-  // 2. validate:db
-  results['validate-db'] = await guarded('npm run validate:db', async () => {
-    const run = await deps.runScript({ script: 'validate:db', silent: false, env: childEnv, cwd: deps.repoRoot, timeoutMs: VALIDATE_DB_TIMEOUT_MS })
-    if (run.timedOut) return { kind: 'unreadable', reason: `npm run validate:db did not finish within ${VALIDATE_DB_TIMEOUT_MS / 60000} minutes and was stopped` } as CheckResult
-    if (run.exitCode === null) return { kind: 'unreadable', reason: `npm run validate:db could not be run: ${tail(run.stderr).slice(-300)}` } as CheckResult
-    const skipped = /SKIPPED: npm run test:concurrency/.test(run.stdout)
-    if (run.exitCode !== 0) {
-      return { kind: 'fail', reasons: [`npm run validate:db exited ${run.exitCode}: ${tail(run.stdout + run.stderr).slice(-600).replace(/\s+/g, ' ')}`] } as CheckResult
+  // 2. Schema state: read-only equivalents of validate:db. NOT validate:db itself: its constraint probe inserts rows
+  // (in a transaction it rolls back) and it regenerates the Prisma client in the checkout, and the gate writes neither.
+  results['schema-state'] = await guarded('the schema state', async () => {
+    const problems: string[] = []
+    for (const script of SCHEMA_STATE_SCRIPTS) {
+      const run = await deps.runScript({ script, silent: false, env: childEnv, cwd: deps.repoRoot, timeoutMs: SCHEMA_SCRIPT_TIMEOUT_MS })
+      if (run.timedOut || run.exitCode === null) return { kind: 'unreadable', reason: `npm run ${script} did not complete${run.timedOut ? ' within the time allowed' : `: ${tail(run.stderr).slice(-300)}`}` } as CheckResult
+      if (run.exitCode !== 0) problems.push(`npm run ${script} exited ${run.exitCode}: ${tail(run.stdout + run.stderr).slice(-400).replace(/\s+/g, ' ')}`)
     }
-    return { kind: 'pass', summary: 'npm run validate:db exited 0', detail: { concurrencyTierSkipped: skipped } } as CheckResult
+    const installed = new Set(await deps.readInstalledConstraints())
+    const missing = REQUIRED_CHECK_CONSTRAINTS.filter((name) => !installed.has(name))
+    if (missing.length > 0) problems.push(`CHECK constraint(s) not installed or not validated: ${missing.join(', ')}`)
+    return problems.length > 0
+      ? { kind: 'fail', reasons: problems } as CheckResult
+      : { kind: 'pass', summary: `schema up to date, no drift, ${REQUIRED_CHECK_CONSTRAINTS.length} CHECK constraints installed`, detail: { scripts: [...SCHEMA_STATE_SCRIPTS], constraints: [...REQUIRED_CHECK_CONSTRAINTS] } } as CheckResult
   })
 
   // 3. Outbound status.
@@ -311,6 +337,7 @@ export async function collectGateResults(options: CollectOptions, deps: GateDeps
     }
     const found = deps.readNewestRehearsal(options.rehearsalDir, now)
     if ('none' in found) return { kind: 'fail', reasons: [found.none] } as CheckResult
+    if ('untrusted' in found) return { kind: 'fail', reasons: [found.untrusted] } as CheckResult
     return assessRehearsalReport(found, now, gateBuild)
   })
 
@@ -371,4 +398,13 @@ export function readPackageScriptsFrom(repoRoot: string): Record<string, string>
   const parsed = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as { scripts?: Record<string, string> }
   if (parsed === null || typeof parsed !== 'object' || typeof parsed.scripts !== 'object' || parsed.scripts === null) throw new Error('package.json has no scripts object')
   return parsed.scripts
+}
+
+export async function defaultReadInstalledConstraints(): Promise<string[]> {
+  const { db } = await import('@/lib/db')
+  const names = [...REQUIRED_CHECK_CONSTRAINTS]
+  const rows = await db.$queryRaw<Array<{ conname: string }>>`
+    SELECT c.conname FROM pg_constraint c
+    WHERE c.contype = 'c' AND c.convalidated AND c.conname = ANY(${names}::text[])`
+  return rows.map((row) => row.conname)
 }

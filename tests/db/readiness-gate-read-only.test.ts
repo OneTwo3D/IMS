@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import path from 'node:path'
 import { config } from 'dotenv'
 
 /**
@@ -19,8 +21,9 @@ import { config } from 'dotenv'
  *
  * Mutation (recorded in the PR): make a collector write (an activity-log insert) => red.
  *
- * `validate:db` is NOT covered by this proof and cannot be: it opens a transaction, inserts a probe product
- * and warehouse to make the CHECK constraints fire, and rolls it back. That is stated in the operator docs.
+ * The gate does not run `validate:db` (its constraint probe inserts rows in a rolled-back transaction and it regenerates the
+ * client); it runs `db:migrate:status`, `db:schema:diff`, `db:schema:drift` and reads `pg_constraint` instead. The whole-gate part
+ * of this test would go red if a write reached the database (the URL is read-only) or the checkout (the snapshot).
  */
 
 const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
@@ -61,7 +64,7 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
     'precondition: a write over this connection is refused',
   )
 
-  const { defaultReadOutbound, defaultReadReconciliation, defaultRunInvariant, collectGateResults } = await import('../../lib/ops/readiness-gate-collect')
+  const { defaultReadOutbound, defaultReadReconciliation, defaultRunInvariant } = await import('../../lib/ops/readiness-gate-collect')
 
   // The collectors, called directly: a write would throw here.
   const invariant = await defaultRunInvariant()
@@ -72,27 +75,58 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
   const reconciliation = await defaultReadReconciliation(new Date())
   assert.ok('blockers' in reconciliation && 'warnings' in reconciliation, 'precondition: the reconciliation readiness was evaluated')
 
-  // The whole collection with the real default collectors (validate:db and the pack are not database reads).
-  const { results } = await collectGateResults(
-    { phase: 'P0', expectGranted: null, rehearsalDir: '/var/tmp/ims-readiness-gate-nonexistent' },
-    {
-      now: () => new Date(),
-      runInvariant: defaultRunInvariant,
-      readOutbound: () => defaultReadOutbound(new Date()),
-      readReconciliation: defaultReadReconciliation,
-      runScript: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
-      readPackageScripts: () => ({}),
-      readBuildIdentity: () => ({ commit: 'a'.repeat(40), tree: 'b'.repeat(40), clean: true }),
-      readNewestRehearsal: () => ({ none: 'not under test' }),
-      env: { PATH: process.env.PATH, DATABASE_URL: process.env.DATABASE_URL },
-      repoRoot: process.cwd(),
-    },
-  )
-  const readOnlyRefusals = Object.entries(results).filter(([, result]) => JSON.stringify(result).includes('read-only transaction'))
-  console.log(`precondition: ${Object.keys(results).length} results collected; ${readOnlyRefusals.length} mention a read-only refusal`)
-  assert.equal(Object.keys(results).length, 21)
-  assert.deepEqual(readOnlyRefusals, [], 'no collector attempted a write')
-  for (const id of ['invariant-preflight', 'outbound-status', 'reconciliation-completeness']) {
-    assert.notEqual(results[id]!.kind, 'unreadable', `${id} was readable over the read-only connection`)
+  // THE WHOLE GATE, real default collectors and real children (migrate status, schema diff, drift check), over the
+  // read-only URL, with a snapshot of every file of the checkout before and after.
+  const { runReadinessGate } = await import('../../scripts/readiness-gate')
+  const before = snapshotCheckout(process.cwd())
+  console.log(`precondition: ${before.size} checkout files snapshotted (generated client, schema, lib, scripts, manifests)`)
+  assert.ok(before.size > 500,  'precondition: the snapshot saw the checkout')
+  const reportDir = mkdtempSync(path.join('/var/tmp', 'ims-gate-ro-'))
+  try {
+    const out: string[] = []
+    const code = await runReadinessGate({
+      argv: ['--phase', 'P0', '--report-dir', path.join(reportDir, 'reports'), '--rehearsal-dir', path.join(reportDir, 'no-rehearsals')],
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, DATABASE_URL: process.env.DATABASE_URL },
+      stdout: (text) => out.push(text),
+      stderr: () => undefined,
+      disconnect: async () => undefined,
+    })
+    assert.equal(code, 1, 'no rehearsal and no reconciliation run exist, so NO-GO; any other code means the gate broke')
+    const [runId] = readdirSync(path.join(reportDir, 'reports'))
+    const record = JSON.parse(readFileSync(path.join(reportDir, 'reports', runId!, 'readiness-gate.json'), 'utf8')) as { checks: Array<{ id: string; status: string; summary: string }> }
+    const status = Object.fromEntries(record.checks.map((row) => [row.id, row.status]))
+    console.log(`precondition: collected ${record.checks.length} checks; schema-state=${status['schema-state']} invariant-preflight=${status['invariant-preflight']} outbound-status=${status['outbound-status']}`)
+    for (const id of ['schema-state', 'invariant-preflight', 'outbound-status']) assert.equal(status[id], 'PASS', `${id} ran to completion over the read-only connection`)
+    assert.equal(record.checks.some((row) => /read-only transaction/.test(row.summary)), false, 'no check attempted a write')
+  } finally {
+    rmSync(reportDir, { recursive: true, force: true })
   }
+  const after = snapshotCheckout(process.cwd())
+  const changed = [...after].filter(([file, stamp]) => before.get(file) !== stamp).map(([file]) => file)
+  const removed = [...before.keys()].filter((file) => !after.has(file))
+  assert.deepEqual([...changed, ...removed], [], 'the gate wrote nothing into the checkout')
 })
+
+/** The places a stray write would land (the generated client, the schema, the code, the manifests); path -> "mtimeMs:size". */
+const SNAPSHOT_ROOTS = ['app/generated', 'prisma', 'lib', 'scripts', 'package.json', 'prisma.config.ts']
+function snapshotCheckout(root: string): Map<string, string> {
+  const out = new Map<string, string>()
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === '.next') continue
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(full)
+      else if (entry.isFile()) {
+        const info = statSync(full)
+        out.set(full, `${info.mtimeMs}:${info.size}`)
+      }
+    }
+  }
+  for (const entry of SNAPSHOT_ROOTS) {
+    const full = path.join(root, entry)
+    const info = statSync(full)
+    if (info.isDirectory()) walk(full)
+    else out.set(full, `${info.mtimeMs}:${info.size}`)
+  }
+  return out
+}

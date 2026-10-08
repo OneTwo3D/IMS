@@ -24,8 +24,10 @@ import {
   ACCEPTANCE_REASON_MIN_LENGTH,
   ACCEPTANCE_SCHEMA_VERSION,
   CHECK_CATALOGUE,
+  BUILD_SCOPE_TEXT,
   READINESS_GATE_EXIT_CODES,
   READINESS_PHASES,
+  READ_SYNC_SCHEMA_VERSION,
   REQUIRED_READ_SYNC_STREAMS,
   REHEARSAL_CLOCK_SKEW_MS,
   REHEARSAL_MAX_AGE_DAYS,
@@ -456,6 +458,7 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date, ga
   const report = evidence.parsed as Partial<RehearsalReport> | null
   if (report === null || typeof report !== 'object') return unreadable(`the newest rehearsal report ${evidence.location} is not a JSON object`)
   if (report.tool !== 'rehearse-first-install') failures.push(`the report's tool is ${JSON.stringify(report.tool)}, not rehearse-first-install`)
+  const buildWarnings: GateWarning[] = []
   const version = report.schemaVersion as unknown
   if (version === 1) failures.push(BUILD_IDENTITY_TEXT.absent)
   else if (version !== 2) failures.push(`the report's schemaVersion is ${JSON.stringify(version)}, not 2`)
@@ -463,6 +466,7 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date, ga
   if (version === 2) {
     const build = compareBuildIdentity((report as { build?: unknown }).build, gateBuild)
     if (!build.ok) failures.push(build.message)
+    else buildWarnings.push(...build.warnings)
   }
   if (report.verdict !== 'GREEN') failures.push(`the rehearsal verdict is ${JSON.stringify(report.verdict)}, not GREEN`)
   if (report.exitCode !== 0) failures.push(`the rehearsal exit code is ${JSON.stringify(report.exitCode)}, not 0`)
@@ -497,14 +501,16 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date, ga
   }
   const detail = { location: evidence.location, runId: report.runId ?? null, finishedAt: report.finishedAt ?? null, ageDays, steps: steps?.length ?? null }
   return failures.length === 0
-    ? pass(`GREEN, all ${STEP_CATALOGUE.length} steps required and passed, finished ${ageDays} days ago`, detail)
-    : fail(failures, detail)
+    ? pass(`GREEN, all ${STEP_CATALOGUE.length} steps required and passed, finished ${ageDays} days ago. ${BUILD_SCOPE_TEXT}`, detail, buildWarnings)
+    : fail(failures, detail, buildWarnings)
 }
 
 // ---- read-sync liveness ------------------------------------------------------------------------
 
 /** How far ahead of the gate's clock a recorded success may be before it is not believed (clock skew). */
 export const READ_SYNC_FUTURE_TOLERANCE_MS = 5 * 60_000
+export const READ_SYNC_GENERATED_TOLERANCE_MS = 10 * 60_000
+export const READ_SYNC_AGE_TOLERANCE_MS = 1_000
 
 /**
  * Strict reading of `npm run --silent read-sync:status` under READ_SYNC_CONTRACT_VERSION. A stream passes only
@@ -521,17 +527,26 @@ export function assessReadSyncStatus(run: { exitCode: number | null; stdout: str
   } catch {
     return unreadable('the read-sync status output is not one JSON object')
   }
-  const root = parsed as { entries?: unknown; scheduler?: { examined?: unknown; unreadable?: unknown; unscheduled?: unknown } } | null
-  if (root === null || typeof root !== 'object' || !Array.isArray(root.entries) || root.entries.length === 0) {
+  const root = parsed as { schemaVersion?: unknown; generatedAt?: unknown; counts?: unknown; entries?: unknown; scheduler?: { examined?: unknown; unreadable?: unknown; unscheduled?: unknown } } | null
+  if (root === null || typeof root !== 'object' || root.schemaVersion !== READ_SYNC_SCHEMA_VERSION) {
+    return unreadable(`the read-sync status output does not declare schemaVersion ${READ_SYNC_SCHEMA_VERSION}, so this gate cannot tell whether the meaning of its fields is the one it was written against`)
+  }
+  if (!Array.isArray(root.entries) || root.entries.length === 0) {
     return unreadable('the read-sync status output has no entries list, or it is empty (an empty list proves nothing is fresh)')
   }
+  const generated = typeof root.generatedAt === 'string' && ISO_RE.test(root.generatedAt) ? Date.parse(root.generatedAt) : Number.NaN
+  if (!Number.isFinite(generated)) return unreadable('the read-sync status output has no valid generatedAt')
   const problems: string[] = []
+  if (Math.abs(now.getTime() - generated) > READ_SYNC_GENERATED_TOLERANCE_MS) problems.push(`the read-sync status says it was generated at ${root.generatedAt}, which is not now`)
   const seen = new Set<string>()
   const streams = new Set<string>()
+  const tally: Record<string, number> = { fresh: 0, stale: 0, never: 0, off: 0 }
   for (const [index, raw] of root.entries.entries()) {
-    const entry = raw as { stream?: unknown; instance?: unknown; state?: unknown; lastSuccessAt?: unknown; ageMs?: unknown; maxAgeMs?: unknown } | null
+    const entry = raw as { stream?: unknown; instance?: unknown; state?: unknown; lastSuccessAt?: unknown; ageMs?: unknown; maxAgeMs?: unknown; futureTimestamp?: unknown } | null
     if (entry === null || typeof entry !== 'object' || typeof entry.stream !== 'string' || entry.stream === '') return unreadable(`read-sync entry #${index} has no stream name`)
     const name = entry.stream
+    if (typeof entry.state !== 'string' || !(entry.state in tally)) { problems.push(`stream ${name} has an unrecognised state ${JSON.stringify(entry.state)}`); continue }
+    tally[entry.state] = (tally[entry.state] ?? 0) + 1
     if (!(REQUIRED_READ_SYNC_STREAMS as readonly string[]).includes(name)) { problems.push(`read-sync reports a stream ${name} that is not in the required catalogue`); continue }
     const key = `${name}/${typeof entry.instance === 'string' ? entry.instance : ''}`
     if (seen.has(key)) return unreadable(`read-sync entry ${key} is listed twice`)
@@ -540,9 +555,16 @@ export function assessReadSyncStatus(run: { exitCode: number | null; stdout: str
     if (entry.state !== 'fresh') { problems.push(`stream ${key} is ${JSON.stringify(entry.state)}, not fresh`); continue }
     const at = typeof entry.lastSuccessAt === 'string' && ISO_RE.test(entry.lastSuccessAt) ? Date.parse(entry.lastSuccessAt) : Number.NaN
     if (!Number.isFinite(at)) { problems.push(`stream ${key} is marked fresh but has no valid lastSuccessAt`); continue }
-    if (at > now.getTime() + READ_SYNC_FUTURE_TOLERANCE_MS) { problems.push(`stream ${key} has a lastSuccessAt in the future (${entry.lastSuccessAt})`); continue }
+    if (typeof entry.futureTimestamp !== 'boolean') { problems.push(`stream ${key} does not say whether its last success is in the future`); continue }
+    const future = at > generated + READ_SYNC_FUTURE_TOLERANCE_MS
+    if (future || entry.futureTimestamp) { problems.push(`stream ${key} has a lastSuccessAt later than the clock (${entry.lastSuccessAt})`); continue }
+    if (typeof entry.ageMs !== 'number' || Math.abs(entry.ageMs - (generated - at)) > READ_SYNC_AGE_TOLERANCE_MS) { problems.push(`stream ${key} reports an age that does not match its lastSuccessAt and the report time`); continue }
     if (typeof entry.maxAgeMs !== 'number' || !(entry.maxAgeMs > 0)) { problems.push(`stream ${key} reports no age limit`); continue }
-    if (now.getTime() - at >= entry.maxAgeMs) problems.push(`stream ${key} last succeeded at ${entry.lastSuccessAt}, older than its limit`)
+    if (generated - at >= entry.maxAgeMs) problems.push(`stream ${key} last succeeded at ${entry.lastSuccessAt}, older than its limit`)
+  }
+  const counts = root.counts as Record<string, unknown> | null
+  if (counts === null || typeof counts !== 'object' || Object.keys(tally).some((state) => counts[state] !== tally[state])) {
+    problems.push('the read-sync counts do not match the entries they summarise')
   }
   for (const required of REQUIRED_READ_SYNC_STREAMS) {
     if (!streams.has(required)) problems.push(`required stream ${required} is missing from the read-sync status output`)
@@ -632,9 +654,9 @@ export function verdictStatement(report: Pick<GateReport, 'verdict' | 'phase' | 
     case 'NO-GO':
       return `NO-GO for ${report.phase}: at least one reason below stops it. The gate changes no data in the database; its validate:db step runs a probe inside a transaction that is rolled back.${unavailable}`
     case 'GO':
-      return `GO for ${report.phase}: every check this gate defines as required for ${report.phase} passed against the database and environment it was run with, at the time stated. It says nothing about checks that are not listed as passed.${unavailable}`
+      return `GO for ${report.phase}: every check this gate defines as required for ${report.phase} passed against the database and environment it was run with, at the time stated. It says nothing about checks that are not listed as passed. ${BUILD_SCOPE_TEXT}${unavailable}`
     case 'GO-WITH-ACCEPTED-WARNINGS':
-      return `GO-WITH-ACCEPTED-WARNINGS for ${report.phase}: every required check passed and each warning below is covered by a current written acceptance, which is a person's decision recorded in the acceptance file, not a finding that the warning is harmless.${unavailable}`
+      return `GO-WITH-ACCEPTED-WARNINGS for ${report.phase}: every required check passed and each warning below is covered by a current written acceptance, which is a person's decision recorded in the acceptance file, not a finding that the warning is harmless. ${BUILD_SCOPE_TEXT}${unavailable}`
     default: {
       const never: never = report.verdict
       return never

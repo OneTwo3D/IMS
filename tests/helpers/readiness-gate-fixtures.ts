@@ -1,6 +1,7 @@
 import { STEP_CATALOGUE, type RehearsalReport, type StepResult, type TeardownResult } from '../../lib/ops/first-install-rehearsal.ts'
 import {
   CHECK_CATALOGUE,
+  REQUIRED_CHECK_CONSTRAINTS,
   type ReadinessPhase,
 } from '../../lib/ops/readiness-gate-constants.ts'
 import type { BuildIdentity } from '../../lib/ops/build-identity.ts'
@@ -15,7 +16,7 @@ export const NOW = new Date('2026-10-08T12:00:00.000Z')
 export const DAY = 24 * 60 * 60 * 1000
 export const NO_ACCEPTANCES: AcceptanceFile = { status: 'absent', problems: [], entries: [] }
 
-export const GATE_BUILD: BuildIdentity = { commit: 'a'.repeat(40), tree: 'b'.repeat(40), clean: true }
+export const GATE_BUILD: BuildIdentity = { commit: 'a'.repeat(40), tree: 'b'.repeat(40), clean: true, path: '/opt/ims/app' }
 
 export const PASS: CheckResult = { kind: 'pass', summary: 'ok' }
 
@@ -130,3 +131,5 @@ export function acceptanceText(entries: Array<Record<string, unknown>>): string 
 }
 
 export const PHASES: ReadinessPhase[] = ['P0', 'P1', 'P2']
+
+export const ALL_CONSTRAINTS = async (): Promise<string[]> => [...REQUIRED_CHECK_CONSTRAINTS]

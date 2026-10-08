@@ -12,10 +12,12 @@ import { createHash } from 'node:crypto'
 import {
   closeSync,
   constants as fsConstants,
+  fstatSync,
   fsyncSync,
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   writeSync,
 } from 'node:fs'
 import path from 'node:path'
@@ -103,3 +105,43 @@ export function verifyPublishedReport(jsonFile: string): { ok: true } | { ok: fa
   }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Trusting a file or directory somebody else might have written (the readiness gate reads decisions
+// and evidence from disk, so WHO COULD HAVE WRITTEN THEM matters).
+// ---------------------------------------------------------------------------------------------
+
+export class UntrustedPathError extends Error {}
+
+/**
+ * Open `file` as a regular file that only root or the running account could have written: opened
+ * O_NOFOLLOW (a symlink is never followed), a regular file by fstat on the open descriptor, owned by root
+ * or the running account, not writable by group or others, and in a directory whose every ancestor passes
+ * `checkAncestors`. Throws UntrustedPathError with the reason; any other failure (ENOENT, EACCES) propagates.
+ *
+ * WHAT THIS DOES NOT DEFEND: a process running as the same account (or as root) can still write the file;
+ * that is out of scope and the callers say so. Ownership and mode are what is checked, not authenticity.
+ */
+export function readTrustedRegularFile(file: string, maxBytes: number): string {
+  const fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
+  try {
+    const info = fstatSync(fd)
+    if (!info.isFile()) throw new UntrustedPathError(`${file} is not a regular file`)
+    const me = typeof process.getuid === 'function' ? process.getuid() : 0
+    if (info.uid !== 0 && info.uid !== me) throw new UntrustedPathError(`${file} is owned by uid ${info.uid}, neither root nor the running account`)
+    if ((info.mode & 0o022) !== 0) throw new UntrustedPathError(`${file} is writable by group or others`)
+    const ancestors = checkAncestors(path.dirname(file), 'directory of a trusted file')
+    if (ancestors) throw new UntrustedPathError(ancestors)
+    if (info.size > maxBytes) throw new Error(`${file} is larger than ${maxBytes} bytes`)
+    const buffer = Buffer.alloc(info.size)
+    let read = 0
+    while (read < info.size) {
+      const n = readSync(fd, buffer, read, info.size - read, read)
+      if (n === 0) break
+      read += n
+    }
+    return buffer.subarray(0, read).toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
+}

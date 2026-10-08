@@ -8,7 +8,7 @@ import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import { READINESS_GATE_EXIT_CODES } from '../../lib/ops/readiness-gate-constants.ts'
 import type { GateDeps } from '../../lib/ops/readiness-gate-collect.ts'
 import { parseGateArgs, runReadinessGate } from '../../scripts/readiness-gate.ts'
-import { GATE_BUILD, NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance } from '../helpers/readiness-gate-fixtures.ts'
+import { ALL_CONSTRAINTS, GATE_BUILD, NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance } from '../helpers/readiness-gate-fixtures.ts'
 
 const ROOT = process.cwd()
 
@@ -33,6 +33,7 @@ function deps(overrides: Partial<GateDeps> = {}): GateDeps {
     runScript: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
     readPackageScripts: () => ({}),
     readBuildIdentity: () => GATE_BUILD,
+    readInstalledConstraints: ALL_CONSTRAINTS,
     readNewestRehearsal: () => ({ digest: { ok: true }, parsed: greenRehearsal(), location: '/r' }),
     env: URL_ENV,
     repoRoot: ROOT,
@@ -237,8 +238,8 @@ test('an acceptance file another account could have written is NOT used [mutatio
   const shapes: Array<[string, (dir: string, file: string) => string, RegExp]> = [
     ['group-writable file', (_d, f) => { chmodSync(f, 0o660); return f }, /writable by group or others/],
     ['world-writable file', (_d, f) => { chmodSync(f, 0o666); return f }, /writable by group or others/],
-    ['group-writable directory', (d, f) => { chmodSync(d, 0o770); return f }, /acceptance file directory/],
-    ['world-writable directory', (d, f) => { chmodSync(d, 0o777); return f }, /acceptance file directory/],
+    ['group-writable directory', (d, f) => { chmodSync(d, 0o770); return f }, /directory of a trusted file/],
+    ['world-writable directory', (d, f) => { chmodSync(d, 0o777); return f }, /directory of a trusted file/],
   ]
   for (const [label, prepare, message] of shapes) {
     const result = await attempt(prepare)

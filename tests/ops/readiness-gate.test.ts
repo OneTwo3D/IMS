@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { realpathSync } from 'node:fs'
 import { compareBuildIdentity, readBuildIdentity, type BuildIdentity } from '../../lib/ops/build-identity.ts'
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import {
   ACCEPTANCE_MAX_DAYS,
   CHECK_CATALOGUE,
   PACK_ITEMS,
+  BUILD_SCOPE_TEXT,
   READINESS_GATE_EXIT_CODES,
   REHEARSAL_MAX_AGE_DAYS,
   REQUIRED_READ_SYNC_STREAMS,
@@ -238,7 +240,7 @@ test('a malformed entry does not reject its neighbours; an unknown field rejects
 })
 
 test('acceptances apply only to warnings: a failing check stays NO-GO however many warnings are accepted', () => {
-  const results = { ...withWarning(), 'validate-db': { kind: 'fail', reasons: ['exit 1'], warnings: [{ id: WARNING_ID, message: 'm' }] } as CheckResult }
+  const results = { ...withWarning(), 'schema-state': { kind: 'fail', reasons: ['exit 1'], warnings: [{ id: WARNING_ID, message: 'm' }] } as CheckResult }
   const verdict = verdictOf('P0', results, accepted())
   assert.equal(verdict.verdict, 'NO-GO')
 })
@@ -343,14 +345,20 @@ test('pack items R3, R4 and R15 are read from the same invariant report', () => 
 })
 
 const RS_NOW = NOW
-const rsEntry = (stream: string, over: Record<string, unknown> = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: new Date(RS_NOW.getTime() - 3600_000).toISOString(), ageMs: 3600_000, maxAgeMs: 72 * 3600_000, ...over })
+const rsEntry = (stream: string, over: Record<string, unknown> = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: new Date(RS_NOW.getTime() - 3600_000).toISOString(), ageMs: 3600_000, maxAgeMs: 72 * 3600_000, futureTimestamp: false, ...over })
 const rsAll = () => REQUIRED_READ_SYNC_STREAMS.map((stream) => rsEntry(stream))
-const rsOut = (over: Record<string, unknown> = {}) => JSON.stringify({ entries: rsAll(), scheduler: { examined: true, unreadable: null, unscheduled: [] }, ...over })
+const counts = (entries: Array<{ state: unknown }>) => ({ fresh: entries.filter((e) => e.state === 'fresh').length, stale: entries.filter((e) => e.state === 'stale').length, never: entries.filter((e) => e.state === 'never').length, off: entries.filter((e) => e.state === 'off').length })
+const rsOut = (over: Record<string, unknown> = {}) => {
+  const entries = (over.entries as Array<{ state: unknown }> | undefined) ?? rsAll()
+  return JSON.stringify({ schemaVersion: 1, generatedAt: RS_NOW.toISOString(), counts: counts(entries), entries, scheduler: { examined: true, unreadable: null, unscheduled: [] }, ...over })
+}
 
 test('read-sync status: strict contract; every required stream fresh WITH a valid recent last success [mutation: fresh without timestamp passes / catalogue not compared]', () => {
   const run = (stdout: string, exitCode: number | null = 0) => assessReadSyncStatus({ exitCode, stdout }, RS_NOW)
   assert.equal(run(rsOut()).kind, 'pass', 'control: the full catalogue, all fresh, passes')
   const with_ = (mut: (e: ReturnType<typeof rsAll>) => unknown[]) => rsOut({ entries: mut(rsAll()) })
+  const noVersion = JSON.parse(rsOut()) as Record<string, unknown>
+  delete noVersion.schemaVersion
   const cases: Array<[string, string, 'fail' | 'unreadable']> = [
     ['one fresh stream with null timestamp (the reported false GO)', rsOut({ entries: [rsEntry('woocommerce-order-sweep', { lastSuccessAt: null })] }), 'fail'],
     ['one fresh stream only: the rest of the catalogue missing', rsOut({ entries: [rsEntry('woocommerce-order-sweep')] }), 'fail'],
@@ -367,10 +375,21 @@ test('read-sync status: strict contract; every required stream fresh WITH a vali
     ['scheduler not examined', rsOut({ scheduler: { examined: false, unreadable: null, unscheduled: [] } }), 'fail'],
     ['job unscheduled', rsOut({ scheduler: { examined: true, unreadable: null, unscheduled: ['wc-reconcile'] } }), 'fail'],
     ['crontab unreadable', rsOut({ scheduler: { examined: true, unreadable: 'EACCES', unscheduled: [] } }), 'fail'],
-    ['no scheduler object', JSON.stringify({ entries: rsAll() }), 'fail'],
+    ['no scheduler object', JSON.stringify({ schemaVersion: 1, generatedAt: RS_NOW.toISOString(), counts: counts(rsAll()), entries: rsAll() }), 'fail'],
+    ['no schemaVersion (a producer that does not declare its contract)', JSON.stringify(noVersion), 'unreadable'],
+    ['a different schemaVersion', rsOut({ schemaVersion: 2 }), 'unreadable'],
+    ['no generatedAt', rsOut({ generatedAt: undefined }), 'unreadable'],
+    ['generated long ago (a stale capture)', rsOut({ generatedAt: new Date(RS_NOW.getTime() - 3600_000).toISOString() }), 'fail'],
+    ['counts that do not match the entries', rsOut({ counts: { fresh: 5, stale: 1, never: 0, off: 0 } }), 'fail'],
+    ['no counts', rsOut({ counts: undefined }), 'fail'],
+    ['ageMs inconsistent with lastSuccessAt (reports young, is old)', with_((e) => [{ ...e[0], ageMs: 5 }, ...e.slice(1)]), 'fail'],
+    ['ageMs missing', with_((e) => [{ ...e[0], ageMs: null }, ...e.slice(1)]), 'fail'],
+    ['futureTimestamp flag true', with_((e) => [{ ...e[0], futureTimestamp: true }, ...e.slice(1)]), 'fail'],
+    ['futureTimestamp flag absent', with_((e) => [{ ...e[0], futureTimestamp: undefined }, ...e.slice(1)]), 'fail'],
+    ['unrecognised state value', with_((e) => [{ ...e[0], state: 'degraded' }, ...e.slice(1)]), 'fail'],
     ['empty entries', rsOut({ entries: [] }), 'unreadable'],
     ['not json', 'banner\n{}', 'unreadable'],
-    ['old streams-shaped output', JSON.stringify({ streams: [{ stream: 'wc', state: 'fresh' }] }), 'unreadable'],
+    ['old streams-shaped output', JSON.stringify({ schemaVersion: 1, generatedAt: RS_NOW.toISOString(), streams: [{ stream: 'wc', state: 'fresh' }] }), 'unreadable'],
     ['duplicate instance', with_((e) => [...e, e[0]]), 'unreadable'],
     ['unnamed entry', with_((e) => [{ state: 'fresh' }, ...e]), 'unreadable'],
   ]
@@ -412,12 +431,13 @@ test('the report states what a GO does and does not cover, and lists NOT YET AVA
 })
 
 test('the rehearsal must be about THIS build: match / mismatch / absent / malformed / older schema / dirty [mutation: build comparison removed]', () => {
-  const other = { commit: 'c'.repeat(40), tree: 'b'.repeat(40), clean: true }
-  const otherTree = { commit: 'a'.repeat(40), tree: 'd'.repeat(40), clean: true }
+  const other = { ...GATE_BUILD, commit: 'c'.repeat(40) }
+  const otherTree = { ...GATE_BUILD, tree: 'd'.repeat(40) }
   const cases: Array<[string, unknown, BuildIdentity | { unreadable: string }, 'pass' | 'fail' | 'unreadable', RegExp | null]> = [
     ['match', { ...GATE_BUILD }, GATE_BUILD, 'pass', null],
     ['different commit', other, GATE_BUILD, 'fail', /run on commit c+, not on this build/],
     ['same commit, different tree', otherTree, GATE_BUILD, 'fail', /source tree/],
+    ['no path recorded', { commit: GATE_BUILD.commit, tree: GATE_BUILD.tree, clean: true }, GATE_BUILD, 'fail', /cannot read/],
     ['absent', undefined, GATE_BUILD, 'fail', /carries no build identifier/],
     ['null (git could not say)', null, GATE_BUILD, 'fail', /carries no build identifier/],
     ['malformed commit', { ...GATE_BUILD, commit: 'abc' }, GATE_BUILD, 'fail', /build identifier this gate cannot read/],
@@ -442,11 +462,12 @@ test('the rehearsal must be about THIS build: match / mismatch / absent / malfor
 })
 
 test('build identity: reading git, and the pure comparison', () => {
+  process.chdir(process.cwd())
   const answers: Record<string, string> = { 'rev-parse HEAD': `${'a'.repeat(40)}\n`, 'rev-parse HEAD^{tree}': `${'b'.repeat(40)}\n`, 'status --porcelain': '' }
-  assert.deepEqual(readBuildIdentity('/x', (args) => answers[args.join(' ')]!), GATE_BUILD)
-  assert.equal(readBuildIdentity('/x', (args) => (args[0] === 'status' ? ' M lib/a.ts\n' : answers[args.join(' ')]!)).clean, false)
-  assert.throws(() => readBuildIdentity('/x', () => 'not an id'), /commit and tree/)
-  assert.throws(() => readBuildIdentity('/x', () => { throw new Error('not a git repository') }), /not a git repository/)
+  assert.deepEqual(readBuildIdentity(process.cwd(), (args) => answers[args.join(' ')]!), { ...GATE_BUILD, path: realpathSync(process.cwd()) })
+  assert.equal(readBuildIdentity(process.cwd(), (args) => (args[0] === 'status' ? ' M lib/a.ts\n' : answers[args.join(' ')]!)).clean, false)
+  assert.throws(() => readBuildIdentity(process.cwd(), () => 'not an id'), /commit and tree/)
+  assert.throws(() => readBuildIdentity(process.cwd(), () => { throw new Error('not a git repository') }), /not a git repository/)
   assert.equal(compareBuildIdentity(GATE_BUILD, GATE_BUILD).ok, true)
 })
 
@@ -460,4 +481,30 @@ test('the rehearsal report format records the build it rehearsed (schema 2) and 
   assert.deepEqual(report.build, GATE_BUILD)
   assert.match(renderMarkdown(report), new RegExp(`commit ${'a'.repeat(40)}, source tree ${'b'.repeat(40)}, clean checkout`))
   assert.match(renderMarkdown({ ...report, build: null }), /not identified/)
+})
+
+test('the same commit and tree in a DIFFERENT checkout is a WARNING needing a written acceptance, not a silent pass [mutation: path comparison removed]', () => {
+  const elsewhere = { ...GATE_BUILD, path: '/var/tmp/rehearsal-copy' }
+  const result = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal({ build: elsewhere }), location: '/x' }, NOW, GATE_BUILD)
+  assert.equal(result.kind, 'pass')
+  const warningId = 'rehearsal-different-checkout-path:/var/tmp/rehearsal-copy->/opt/ims/app'
+  assert.deepEqual(result.kind === 'pass' ? result.warnings?.map((w) => w.id) : null, [warningId])
+  assert.match(JSON.stringify(result), /rehearsal ran on a different checkout path/)
+  const unaccepted = verdictOf('P0', { ...allPassing(), 'first-install-rehearsal': result })
+  assert.equal(unaccepted.verdict, 'NO-GO')
+  const accepted = verdictOf('P0', { ...allPassing(), 'first-install-rehearsal': result }, parseAcceptanceFile(acceptanceText([validAcceptance(warningId)])))
+  assert.equal(accepted.verdict, 'GO-WITH-ACCEPTED-WARNINGS')
+  const same = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal(), location: '/x' }, NOW, GATE_BUILD)
+  assert.deepEqual(same.kind === 'pass' ? same.warnings ?? [] : null, [], 'control: the same path raises no warning')
+})
+
+test('every GO says what the build identity does NOT cover', () => {
+  for (const results of [allPassing(), withWarning()]) {
+    const verdict = verdictOf('P0', results, results === allPassing() ? NO_ACCEPTANCES : accepted())
+    const md = renderGateMarkdown(buildGateReport({ runId: 'r', now: NOW, phase: 'P0', expectGranted: null, verdict, acceptances: NO_ACCEPTANCES, acceptancePath: null }))
+    if (verdict.verdict !== 'NO-GO') assert.ok(md.includes(BUILD_SCOPE_TEXT), verdict.verdict)
+  }
+  assert.match(BUILD_SCOPE_TEXT, /NOT tied to the build artefact \(\.next\/BUILD_ID\) and NOT to the \.env configuration/)
+  const pass = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal(), location: '/x' }, NOW, GATE_BUILD)
+  assert.ok(pass.kind === 'pass' && pass.summary.includes(BUILD_SCOPE_TEXT))
 })

@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import test, { after } from 'node:test'
 
+import { chmodSync } from 'node:fs'
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import {
   CHILD_ENV_FIXED,
@@ -17,10 +17,10 @@ import {
   type GateDeps,
 } from '../../lib/ops/readiness-gate-collect.ts'
 import { FORBIDDEN_ENV_PATTERNS } from '../../lib/ops/first-install-rehearsal.ts'
-import { READ_SYNC_STATUS_SCRIPT, REQUIRED_READ_SYNC_STREAMS } from '../../lib/ops/readiness-gate-constants.ts'
+import { READ_SYNC_STATUS_SCRIPT, REQUIRED_CHECK_CONSTRAINTS, REQUIRED_READ_SYNC_STREAMS, SCHEMA_STATE_SCRIPTS } from '../../lib/ops/readiness-gate-constants.ts'
 import { decideVerdict } from '../../lib/ops/readiness-gate.ts'
 import type { AccountingReconciliationReadiness } from '../../lib/ops/rollout-readiness.ts'
-import { DAY, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal } from '../helpers/readiness-gate-fixtures.ts'
+import { ALL_CONSTRAINTS, DAY, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal } from '../helpers/readiness-gate-fixtures.ts'
 
 /**
  * COLLECTION: every dependency failing is `unreadable`, never silence; the child environment is a
@@ -28,6 +28,16 @@ import { DAY, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, gr
  */
 
 const ROOT = process.cwd()
+
+// Rehearsal report locations must pass the gate's trust policy, and the unit runner's private TMPDIR is
+// group/other-writable, so these live under /var/tmp (root-owned, sticky, on disk) and are removed afterwards.
+const bases: string[] = []
+function scratchBase(prefix: string): string {
+  const dir = mkdtempSync(path.join('/var/tmp', prefix))
+  bases.push(dir)
+  return dir
+}
+after(() => { for (const dir of bases) rmSync(dir, { recursive: true, force: true }) })
 
 function goodReconciliation(overrides: Partial<AccountingReconciliationReadiness> = {}): AccountingReconciliationReadiness {
   return {
@@ -50,6 +60,7 @@ function deps(overrides: Partial<GateDeps> = {}, scripts: Record<string, string>
     runScript: async (spec) => { spawned.push(spec); return { exitCode: 0, stdout: 'SKIPPED: npm run test:concurrency', stderr: '', timedOut: false } },
     readPackageScripts: () => scripts,
     readBuildIdentity: () => GATE_BUILD,
+    readInstalledConstraints: ALL_CONSTRAINTS,
     readNewestRehearsal: () => ({ digest: { ok: true }, parsed: greenRehearsal(), location: '/r/readiness-report.json' }),
     env: { PATH: '/usr/bin', HOME: '/home/x', DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/db', SMTP_PASSWORD: 'secret', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example', MINTSOFT_API_KEY: 'k', NODE_OPTIONS: '--require /evil.js', IMS_CONCURRENCY_SCRATCH_DB: 'x' },
     repoRoot: ROOT,
@@ -64,8 +75,8 @@ test('with healthy dependencies the collection yields a GO on this tree (the con
   const { results } = await collectGateResults(OPTIONS, d)
   const verdict = decideVerdict({ phase: 'P0', results, acceptances: NO_ACCEPTANCES, now: NOW })
   assert.equal(verdict.verdict, 'GO', verdict.blockingReasons.join('; '))
-  assert.equal(d.spawned.length, 1, 'only validate:db is spawned when there is no read-sync script')
-  assert.equal(d.spawned[0]!.script, 'validate:db')
+  assert.deepEqual(d.spawned.map((spec) => spec.script), [...SCHEMA_STATE_SCRIPTS], 'only the read-only schema scripts are spawned when there is no read-sync script')
+  assert.equal(d.spawned.some((spec) => spec.script === 'validate:db' || /generate/.test(spec.script)), false, 'validate:db and any generate script are never run')
   assert.equal(Object.keys(results).length, 21)
 })
 
@@ -75,9 +86,11 @@ test('every dependency that throws, rejects or returns garbage becomes NO-GO, ne
     ['invariant throws', { runInvariant: boom }, 'invariant-preflight'],
     ['outbound throws', { readOutbound: boom }, 'outbound-status'],
     ['reconciliation throws', { readReconciliation: boom }, 'reconciliation-completeness'],
-    ['validate:db cannot start', { runScript: async () => ({ exitCode: null, stdout: '', stderr: 'ENOENT', timedOut: false }) }, 'validate-db'],
-    ['validate:db times out', { runScript: async () => ({ exitCode: null, stdout: '', stderr: '', timedOut: true }) }, 'validate-db'],
-    ['validate:db exits 1', { runScript: async () => ({ exitCode: 1, stdout: 'drift', stderr: '', timedOut: false }) }, 'validate-db'],
+    ['a schema script cannot start', { runScript: async () => ({ exitCode: null, stdout: '', stderr: 'ENOENT', timedOut: false }) }, 'schema-state'],
+    ['a schema script times out', { runScript: async () => ({ exitCode: null, stdout: '', stderr: '', timedOut: true }) }, 'schema-state'],
+    ['a schema script reports drift (exit 1)', { runScript: async () => ({ exitCode: 1, stdout: 'drift', stderr: '', timedOut: false }) }, 'schema-state'],
+    ['a CHECK constraint is not installed', { readInstalledConstraints: async () => REQUIRED_CHECK_CONSTRAINTS.slice(1) as unknown as string[] }, 'schema-state'],
+    ['the constraint catalogue cannot be read', { readInstalledConstraints: async () => { throw new Error('permission denied') } }, 'schema-state'],
     ['rehearsal dir unreadable', { readNewestRehearsal: () => { throw new Error('EACCES') } }, 'first-install-rehearsal'],
     ['no rehearsal', { readNewestRehearsal: () => ({ none: 'no rehearsal report was found' }) }, 'first-install-rehearsal'],
     ['package.json unreadable', { readPackageScripts: () => { throw new Error('ENOENT') } }, 'read-sync-liveness'],
@@ -101,16 +114,16 @@ test('an unreadable invariant report also makes R3, R4 and R15 unreadable (they 
 test('read-sync liveness is optional until the script exists, then required and strictly read', async () => {
   const absent = deps()
   assert.equal((await collectGateResults(OPTIONS, absent)).results['read-sync-liveness']!.kind, 'not-available')
-  const entry = (stream: string, over: object = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: '2026-10-08T11:00:00Z', ageMs: 3600000, maxAgeMs: 259200000, ...over })
-  const stdout = JSON.stringify({ entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name)), scheduler: { examined: true, unreadable: null, unscheduled: [] } })
+  const entry = (stream: string, over: object = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: '2026-10-08T11:00:00.000Z', ageMs: 3600000, maxAgeMs: 259200000, futureTimestamp: false, ...over })
+  const stdout = JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 6, stale: 0, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name)), scheduler: { examined: true, unreadable: null, unscheduled: [] } })
   const present = deps({}, { [READ_SYNC_STATUS_SCRIPT]: 'tsx scripts/read-sync-status.ts' })
   present.runScript = async (spec) => { present.spawned.push(spec); return { exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? stdout : '', stderr: '', timedOut: false } }
   assert.equal((await collectGateResults(OPTIONS, present)).results['read-sync-liveness']!.kind, 'pass')
-  const stale = deps({ runScript: async (spec) => ({ exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? JSON.stringify({ entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name, { state: 'stale' })), scheduler: { examined: true, unreadable: null, unscheduled: [] } }) : '', stderr: '', timedOut: false }) }, { [READ_SYNC_STATUS_SCRIPT]: 'x' })
+  const stale = deps({ runScript: async (spec) => ({ exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? JSON.stringify({ schemaVersion: 1, generatedAt: NOW.toISOString(), counts: { fresh: 0, stale: 6, never: 0, off: 0 }, entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name, { state: 'stale' })), scheduler: { examined: true, unreadable: null, unscheduled: [] } }) : '', stderr: '', timedOut: false }) }, { [READ_SYNC_STATUS_SCRIPT]: 'x' })
   assert.equal((await collectGateResults(OPTIONS, stale)).results['read-sync-liveness']!.kind, 'fail')
   const spawnedPresent = present.spawned.map((spec) => `${spec.script}:${spec.silent}`)
-  assert.deepEqual(spawnedPresent, ['validate:db:false', `${READ_SYNC_STATUS_SCRIPT}:true`])
-  assert.deepEqual(present.spawned[1]!.args, ['--json'], 'the status script is asked for its JSON form')
+  assert.deepEqual(spawnedPresent, [...SCHEMA_STATE_SCRIPTS.map((name) => `${name}:false`), `${READ_SYNC_STATUS_SCRIPT}:true`])
+  assert.deepEqual(present.spawned[3]!.args, ['--json'], 'the status script is asked for its JSON form')
 })
 
 test('children get a whitelisted environment: no credential, no grant, no SMTP, no NODE_OPTIONS, no scratch-DB switch', async () => {
@@ -184,7 +197,7 @@ function publish(dir: string, name: string, report: object, mtimeSeconds?: numbe
 }
 
 test('the NEWEST rehearsal decides: a newer RED, corrupt or digest-failing report is never replaced by an older GREEN one', () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'ims-gate-reh-'))
+  const dir = scratchBase('ims-gate-reh-')
   try {
     const old = greenRehearsal({ runId: 'old', finishedAt: new Date(NOW.getTime() - 5 * DAY).toISOString() })
     const newer = (extra: object) => ({ ...greenRehearsal({ runId: 'new', finishedAt: new Date(NOW.getTime() - DAY).toISOString() }), ...extra })
@@ -215,7 +228,7 @@ test('the NEWEST rehearsal decides: a newer RED, corrupt or digest-failing repor
 })
 
 test('rehearsal directory: missing, empty, symlinked entries, report-less directories and non-directories', () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'ims-gate-reh-'))
+  const dir = scratchBase('ims-gate-reh-')
   try {
     assert.deepEqual(readNewestRehearsal(path.join(dir, 'nope'), verifyPublishedReport), { none: `the rehearsal report directory ${path.join(dir, 'nope')} does not exist` })
     assert.ok('none' in readNewestRehearsal(dir, verifyPublishedReport), 'empty directory')
@@ -223,15 +236,17 @@ test('rehearsal directory: missing, empty, symlinked entries, report-less direct
     writeFileSync(path.join(dir, 'crashed', '.readiness-report.json.abc.tmp'), 'x')
     writeFileSync(path.join(dir, 'stray-file'), 'x')
     assert.ok('none' in readNewestRehearsal(dir, verifyPublishedReport), 'a crashed publication and a stray file are not reports')
-    const outside = mkdtempSync(path.join(tmpdir(), 'ims-gate-out-'))
+    const outside = scratchBase('ims-gate-out-')
     publish(outside, 'elsewhere', greenRehearsal())
     symlinkSync(path.join(outside, 'elsewhere'), path.join(dir, 'link'))
-    assert.ok('none' in readNewestRehearsal(dir, verifyPublishedReport), 'a symlinked report directory is ignored, not followed')
+    const linked = readNewestRehearsal(dir, verifyPublishedReport)
+    assert.ok('untrusted' in linked && /is a symlink/.test(linked.untrusted), 'a symlinked run directory is refused, never followed')
+    rmSync(path.join(dir, 'link'))
     rmSync(outside, { recursive: true, force: true })
     publish(dir, 'real', greenRehearsal())
     const found = readNewestRehearsal(dir, verifyPublishedReport)
     assert.ok('digest' in found && found.digest.ok)
-    assert.deepEqual(readdirSync(dir).sort(), ['crashed', 'link', 'real', 'stray-file'])
+    assert.deepEqual(readdirSync(dir).sort(), ['crashed', 'real', 'stray-file'])
     assert.equal(statSync(path.join(dir, 'real')).isDirectory(), true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -284,4 +299,61 @@ test('the only program the gate runs is npm run <script>, with no shell', () => 
   assert.equal(spawns.length, 1)
   assert.match(spawns[0]!, /^'npm', args/)
   assert.match(text, /shell: false/)
+})
+
+test('a rehearsal location another account could have written is NOT read, anywhere in it [mutation: trust check removed]', () => {
+  const plant = (label: string, prepare: (dir: string) => void): ReturnType<typeof readNewestRehearsal> => {
+    const dir = scratchBase('ims-gate-trustreh-')
+    publish(dir, 'run-good', greenRehearsal({ runId: 'good' }))
+    publish(dir, 'run-other', greenRehearsal({ runId: 'other', finishedAt: new Date(NOW.getTime() - 3 * DAY).toISOString() }))
+    prepare(dir)
+    void label
+    return readNewestRehearsal(dir, verifyPublishedReport)
+  }
+  const control = plant('control', () => undefined)
+  assert.ok('digest' in control && control.digest.ok, 'control: an untouched location is read')
+  console.log('precondition: the control location was read; now planting writable shapes')
+  const shapes: Array<[string, (dir: string) => void, RegExp]> = [
+    ['report directory group-writable', (d) => chmodSync(d, 0o770), /rehearsal report directory/],
+    ['report directory world-writable', (d) => chmodSync(d, 0o777), /rehearsal report directory/],
+    ['the OLDER run directory world-writable (not the newest)', (d) => chmodSync(path.join(d, 'run-other'), 0o777), /run directory/],
+    ['the newest run directory group-writable', (d) => chmodSync(path.join(d, 'run-good'), 0o770), /run directory/],
+    ['report JSON group-writable', (d) => chmodSync(path.join(d, 'run-good', 'readiness-report.json'), 0o664), /writable by group or others/],
+    ['report Markdown world-writable', (d) => chmodSync(path.join(d, 'run-good', 'readiness-report.md'), 0o666), /writable by group or others/],
+    ['the older report JSON world-writable', (d) => chmodSync(path.join(d, 'run-other', 'readiness-report.json'), 0o666), /writable by group or others/],
+    ['report Markdown is a symlink', (d) => { const md = path.join(d, 'run-good', 'readiness-report.md'); rmSync(md); symlinkSync(path.join(d, 'run-other', 'readiness-report.md'), md) }, /symlink/],
+    ['report JSON is a symlink', (d) => { const js = path.join(d, 'run-good', 'readiness-report.json'); rmSync(js); symlinkSync(path.join(d, 'run-other', 'readiness-report.json'), js) }, /symlink/],
+  ]
+  for (const [label, prepare, message] of shapes) {
+    const found = plant(label, prepare)
+    assert.ok('untrusted' in found, `${label}: refused`)
+    assert.match(found.untrusted, message, label)
+    assert.match(found.untrusted, /proves nothing, so it was not read/, label)
+  }
+  // The refusal reaches the verdict as a failure of the rehearsal check.
+  console.log(`precondition: ${shapes.length} untrusted shapes refused`)
+})
+
+test('the default rehearsal location is refused too when it fails the checks (same policy, no special case)', async () => {
+  const dir = scratchBase('ims-gate-trustdefault-')
+  publish(dir, 'run', greenRehearsal())
+  chmodSync(dir, 0o777)
+  const { results } = await collectGateResults({ phase: 'P0', expectGranted: null, rehearsalDir: dir }, { ...deps(), readNewestRehearsal: (d) => readNewestRehearsal(d, verifyPublishedReport) })
+  assert.equal(results['first-install-rehearsal']!.kind, 'fail')
+  assert.match(JSON.stringify(results['first-install-rehearsal']), /not trusted/)
+})
+
+test('absence: the code that RUNS things never names validate:db or a generate script (the gate writes nothing to the checkout)', () => {
+  const files = ['lib/ops/readiness-gate-collect.ts', 'scripts/readiness-gate.ts', 'lib/ops/readiness-gate-publish.ts']
+  const pattern = /validate:db|db:generate|prisma generate|prisma migrate (deploy|dev|reset)|db push/
+  let scanned = 0
+  for (const file of files) {
+    const text = readFileSync(path.join(ROOT, file), 'utf8')
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    scanned += 1
+    assert.doesNotMatch(code, pattern, file)
+  }
+  console.log(`precondition: ${scanned} files scanned`)
+  assert.match("npm run validate:db", pattern, 'control: the pattern finds the forbidden call')
+  assert.deepEqual([...SCHEMA_STATE_SCRIPTS], ['db:migrate:status', 'db:schema:diff', 'db:schema:drift'])
 })
