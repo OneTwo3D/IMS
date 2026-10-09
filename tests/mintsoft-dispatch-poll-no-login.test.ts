@@ -199,3 +199,11 @@ test('[token guard alone] inside the poll scope a request on an EXPIRED key fail
   assert.deepEqual(requests, [])
   assert.equal(result.error, MINTSOFT_POLL_NEEDS_KEY_TEXT)
 })
+
+test('[route] the cron route reaches the sweep ONLY through the poll function (absence check: it imports the sweep nowhere)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const route = readFileSync(`${process.cwd()}/app/api/cron/mintsoft-dispatch-sync/route.ts`, 'utf8')
+  console.log(`precondition: route is ${route.split('\n').length} lines; mentions the poll function=${route.includes('runMintsoftDispatchPoll')}`)
+  assert.match(route, /runMintsoftDispatchPoll\(\)/)
+  assert.doesNotMatch(route, /dispatch-sweep|runWmsDispatchSweep/)
+})
