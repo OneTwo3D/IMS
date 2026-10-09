@@ -682,6 +682,8 @@ model Product {
 
   // Media
   imageUrl        String?     // primary image URL (can be imported from WooCommerce)
+  /// Content authored in WooCommerce and held here as the hub copy (descriptions, image references).
+  content         ProductContent?
 
   // WooCommerce mapping — resolved once via SKU lookup then persisted for O(1) sync.
   // BigInt because WooCommerce/WordPress object IDs are unbounded by the
@@ -3671,6 +3673,8 @@ enum WmsSyncLogAction {
   error
   asn_line_reconciled
   asn_line_mapped
+  /// A write IMS WOULD have sent but, by the producer disposition, only recorded (nothing was sent).
+  shadow
 }
 
 model WmsConnection {
@@ -3743,6 +3747,10 @@ model WmsProductLink {
   metadata          Json?
   lastSyncedAt      DateTime?
   lastError         String?
+  /// Per-field state of the CONTENT push (description, short description, image), apart from payloadHash,
+  /// which covers only the product meta. `{ pushed: { <field>: <hash> }, shadowed: { <field>: <hash> } }`:
+  /// `pushed` is what the connector last accepted, `shadowed` what was last recorded without sending.
+  contentSyncState  Json?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
@@ -3752,6 +3760,31 @@ model WmsProductLink {
   @@unique([connector, productId])
   @@index([productId])
   @@map("wms_product_links")
+}
+
+/// The hub copy of a product's CONTENT, authored in WooCommerce (descriptions and picture references).
+/// Plain text, normalised on the way in; pictures are URL references with a checksum of the reference and the
+/// source's last-modified stamp, never binary. A field WooCommerce sends empty is NOT cleared here (the stored
+/// value is kept), so an empty source never propagates onward as an erasure.
+model ProductContent {
+  id                        String    @id @default(cuid())
+  productId                 String    @unique
+  shortDescription          String?
+  longDescription           String?
+  /// `[{ url, externalImageId, altText, sourceModifiedAt, checksum }]`, in the source's order.
+  images                    Json      @default("[]")
+  sourceSystem              String    @default("woocommerce")
+  /// The source product's own last-modified stamp (UTC) when it supplied one.
+  sourceModifiedAt          DateTime?
+  shortDescriptionChangedAt DateTime?
+  longDescriptionChangedAt  DateTime?
+  imagesChangedAt           DateTime?
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @updatedAt
+
+  product                   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("product_contents")
 }
 
 /// AI HS-code classification proposal awaiting human review (6igm.3). A proposal is only

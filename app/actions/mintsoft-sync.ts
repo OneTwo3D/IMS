@@ -50,6 +50,7 @@ import {
   runStockSyncForBinding,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
+import { describeContentRun } from '@/lib/connectors/mintsoft/sync/product-content-sync'
 import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
 import {
   listKeptBundleClaims,
@@ -2585,7 +2586,7 @@ export async function runMintsoftProductVerifyNow(): Promise<{
   return {
     success: true,
     jobId: result.jobId,
-    message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors.`,
+    message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors. ${describeContentRun(result.content)}`,
   }
 }
 

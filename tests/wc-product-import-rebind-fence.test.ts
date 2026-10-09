@@ -3,6 +3,7 @@ import test, { mock } from 'node:test'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
+import { createProductContentDelegate } from './helpers/product-content-delegate.ts'
 
 /**
  * o3d-mlc7: the WC → IMS product IMPORT must participate in the credential-rebind fence.
@@ -200,6 +201,7 @@ const CREDENTIAL_ROWS = [
 
 const txClient = {
   product: productDelegate,
+  productContent: createProductContentDelegate(),
   productOption: {
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })

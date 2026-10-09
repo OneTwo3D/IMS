@@ -1743,7 +1743,17 @@ r5 a root `--dry-run` — and a root `update.sh --print-fence-digest` — publis
 `helpers` snapshot and swept older publications at startup; both modes now publish nothing, as root or
 not. Both work unprivileged, and unprivileged they may also be run out of a checkout, because an
 unprivileged run executes nothing as root; as root, the tree rule above applies to them like any other
-run.
+run. Unprivileged, `update.sh --dry-run` runs its git probes as the account that typed it (it does not
+try `runuser`, which only root may use), so it needs no `--no-git`; it still reports that the fence
+preflight was not run, because the admin credential is root-only. **A dry run writes nothing, including on an
+installation that has no `.git` directory** (the clone / `rsync --delete` / `chown -R` replacement of the
+application directory is printed as a plan, not performed; `update.sh --dry-run` was measured in a
+disposable container to leave every file, the crontab and the unit state untouched). **A dry run that fails says so and
+says nothing else**: it prints `DRY RUN FAILED — NOTHING WAS CHANGED` with the step it reached and exits
+non-zero. It never prints the post-stop banner (`FAILED AFTER THE STOP`, service stopped, cron fenced),
+because nothing was stopped or fenced. The check that the loaded unit configuration binds the service
+to this run's database snapshot is not run in a dry run (a dry run publishes no snapshot, so the check
+could only fail); it is listed as a step the real run performs.
 
 ### Deploy order, and what happens on a rollback
 
@@ -4162,7 +4172,9 @@ connection fence and removes the reboot marker *before* `systemctl start` and th
 because the new build cannot serve a database it may not connect to. If either then fails, the
 failure path re-stops the service, withdraws the environment snapshot it published,
 **re-establishes the connection fence**, and prints — and records
-in the marker as `db_connect_fence=held|released` — which of the two is actually true. If it cannot
+in the marker as `db_connect_fence=held|released` — which of the two is actually true.
+
+**What the marker may claim about the connection fence** (`db_connect_fence=`, one shared definition, `db_connect_fence_claim` in `scripts/lib/db-fence-protected.sh`, used by all three writers). The marker is a claim about the moment it was written by a process that can be killed, so it only says what that process had *seen*: `held` (this run's fence is standing), `released` (this run raised or adopted a fence and **the database confirmed its release** -- the helper's exit 0; a release that lost its record (exit 4), one that failed with the ACL not showing the fence, and a re-fence that failed part-way are *not* confirmed releases and read `unknown`, because none of them proves the revoked grants came back), `not-raised` (nothing has been stopped yet, or this is a first install, which takes no fence by policy), and `unknown` (a fence was raised and its release was never confirmed, or the stop has been requested but no fence has been seen raised: a fence may be raised at any instant after the line is written). It used to print `released` for everything that was not `held`, so a `SIGKILL` between the stop and the first rewrite left a marker saying `released` over a database with `CONNECT` revoked and the migration login open. Treat the word as a hint to a person: the database (`datacl`), `db-connect-fence.json` and `release-db-fence` decide, and every recovery path already reads those, never this field. If it cannot
 put the fence back it says `THE CONNECTION FENCE IS NOT IN PLACE` rather than describing one that
 does not exist.
 
@@ -4240,7 +4252,24 @@ settings, or that reaches a role the application cannot (for example `pg_read_se
 or, as root with the admin credential in the file or on the invocation,
 `node /etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs --ensure-migration-role --app-host=… --app-port=… --app-user=… --app-database=… --migration-role=…`,
 which creates the role only if it is absent and **refuses**, by name, one that exists with a
-privilege it must not have (it never demotes a role somebody else made).
+privilege it must not have (it never demotes a role somebody else made). The path through the `app`
+symlink works, **and an entry path the helper cannot vouch for fails instead of passing**: `fence-db-connections.mjs`,
+`check-app-db-object-access.mjs` and `run-migration-verifications.mjs` exit **70** (with a message naming the problem) when
+their own start path cannot be resolved or resolves to some other file while being named like themselves; they used to
+treat that as "imported", run nothing and exit 0, which every shell caller reads as a passed check. The shell
+entrypoints start the verification and object-access helpers with `--require-entry`, so for them any case where the
+helper is not the entry point is exit 70 too.
+The symlink resolution itself: the helper compares its own resolved location with the resolved `argv[1]`, where it used
+to compare it with the path as typed, which made `main()` skip and the command exit `0` having done
+nothing (the same guard was fixed in `check-app-db-object-access.mjs` and `run-migration-verifications.mjs`).
+
+**A record-less `release-db-fence` closes the migration login and still exits `1`, by design.** With no
+connection-fence record there is no baseline of who held `CONNECT`, so a release cannot certify the
+database is open to the application; the root wrapper holds only the admin credential and has no
+application `DATABASE_URL` to prove it with. It says so (`the second question was not asked`) instead of
+reporting that two answers disagree: the line above it reports whether the migration login was closed,
+and that stands on its own. If a refusal told you to run the wrapper only to close that login, it did that;
+to certify the application can connect, re-run `update.sh`/`install.sh` or audit `datacl`.
 
 **How the window's login is opened and closed.** `--print-migration-url` connects as the admin
 once, reads **from the server** (not from configuration) that the migration role is not a

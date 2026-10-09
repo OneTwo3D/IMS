@@ -160,6 +160,7 @@ export type WcFullProduct = {
   permalink: string
   date_created: string
   date_modified: string
+  date_modified_gmt?: string
   type: string // simple, grouped, external, variable
   status: string // draft, pending, private, publish
   featured: boolean
@@ -185,7 +186,7 @@ export type WcFullProduct = {
   dimensions: { length: string; width: string; height: string }
   categories: { id: number; name: string; slug: string }[]
   tags: { id: number; name: string; slug: string }[]
-  images: { id: number; src: string; name: string; alt: string }[]
+  images: { id: number; src: string; name: string; alt: string; date_modified_gmt?: string }[]
   attributes: { id: number; name: string; position: number; visible: boolean; variation: boolean; options: string[] }[]
   variations: number[]
   meta_data: WcMeta[]
@@ -207,7 +208,8 @@ export type WcVariation = {
   stock_status: string
   weight: string
   dimensions: { length: string; width: string; height: string }
-  images: { id: number; src: string; name: string; alt: string }[]  // WC variation: single-element array
+  images: { id: number; src: string; name: string; alt: string; date_modified_gmt?: string }[]  // WC variation: single-element array
+  date_modified_gmt?: string
   attributes: { id: number; name: string; option: string }[]
   meta_data: WcMeta[]
   parent_id: number
