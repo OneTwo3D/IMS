@@ -1223,22 +1223,25 @@ run_as_user() {
 
 github_api() {
   local method="$1" path="$2" payload="${3:-}"
-  local response_file status
+  local response_file status auth_config
+  # THE TOKEN IS READ BY curl FROM ITS STANDARD INPUT AS A CONFIG LINE, not given as `-H "Authorization: ..."`: a header
+  # argument is on curl's command line, readable by every local account for as long as the request lasts (o3d-kb3dq).
+  auth_config="header = \"Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN//[\\\"]/}\""
   response_file="$(mktemp -t ims-github.XXXXXX)"
   if [[ -n "${payload}" ]]; then
     status="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+      -K - \
       -X "${method}" \
-      -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \
       -H "Accept: application/vnd.github+json" \
       -H "Content-Type: application/json" \
       --data "${payload}" \
-      "https://api.github.com${path}")"
+      "https://api.github.com${path}" <<< "${auth_config}")"
   else
     status="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+      -K - \
       -X "${method}" \
-      -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \
       -H "Accept: application/vnd.github+json" \
-      "https://api.github.com${path}")"
+      "https://api.github.com${path}" <<< "${auth_config}")"
   fi
   if [[ ! "${status}" =~ ^2 ]]; then
     cat "${response_file}" >&2
@@ -10187,25 +10190,31 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
   BOOTSTRAP_SCRIPT="${APP_DIR}/scripts/provision-instance.mjs"
   [[ -f "${BOOTSTRAP_SCRIPT}" ]] || BOOTSTRAP_SCRIPT="/root/provision-instance.mjs"
 
-  run_as_user_db env \
-    DEFAULT_ADMIN_NAME="${DEFAULT_ADMIN_NAME}" \
-    DEFAULT_ADMIN_EMAIL="${DEFAULT_ADMIN_EMAIL}" \
-    DEFAULT_ADMIN_PASSWORD="${DEFAULT_ADMIN_PASSWORD}" \
-    NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}" \
-    APP_DOMAIN="${APP_DOMAIN}" \
-    PUBLIC_APP_URL="https://${APP_DOMAIN}" \
-    SMTP_HOST="${SMTP_HOST}" \
-    SMTP_PORT="${SMTP_PORT}" \
-    SMTP_USER="${SMTP_USER}" \
-    SMTP_PASS="${SMTP_PASS}" \
-    SMTP_SECURE="${SMTP_SECURE}" \
-    SMTP_FROM_NAME="${SMTP_FROM_NAME}" \
-    SMTP_FROM_EMAIL="${SMTP_FROM_EMAIL}" \
-    SMTP_REPLY_TO="${SMTP_REPLY_TO}" \
-    WC_STORE_URL="${WC_STORE_URL}" \
-    WC_CONSUMER_KEY="${WC_CONSUMER_KEY}" \
-    WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}" \
-    node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?
+  # THE VALUES TRAVEL IN THE ENVIRONMENT, NEVER ON A COMMAND LINE (o3d-kb3dq). `run_as_user_db env NAME=value ... node`
+  # puts every value in the argv of the runuser/env processes, which any local account can read out of `ps` for the
+  # life of the step: the default administrator's password, the SMTP password and the WooCommerce secret. Exporting
+  # them inside a subshell puts them in the environment instead (readable by root and the owner only), and runuser
+  # hands that environment to the application account, which is how DATABASE_URL already travels.
+  (
+    export DEFAULT_ADMIN_NAME="${DEFAULT_ADMIN_NAME}"
+    export DEFAULT_ADMIN_EMAIL="${DEFAULT_ADMIN_EMAIL}"
+    export DEFAULT_ADMIN_PASSWORD="${DEFAULT_ADMIN_PASSWORD}"
+    export NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
+    export APP_DOMAIN="${APP_DOMAIN}"
+    export PUBLIC_APP_URL="https://${APP_DOMAIN}"
+    export SMTP_HOST="${SMTP_HOST}"
+    export SMTP_PORT="${SMTP_PORT}"
+    export SMTP_USER="${SMTP_USER}"
+    export SMTP_PASS="${SMTP_PASS}"
+    export SMTP_SECURE="${SMTP_SECURE}"
+    export SMTP_FROM_NAME="${SMTP_FROM_NAME}"
+    export SMTP_FROM_EMAIL="${SMTP_FROM_EMAIL}"
+    export SMTP_REPLY_TO="${SMTP_REPLY_TO}"
+    export WC_STORE_URL="${WC_STORE_URL}"
+    export WC_CONSUMER_KEY="${WC_CONSUMER_KEY}"
+    export WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}"
+    run_as_user_db node "${BOOTSTRAP_SCRIPT}"
+  ) || bootstrap_rc=$?
   # ITS PLACEMENT IS THE CLOSING GATE BELOW (o3d-secops r34, Codex HIGH 2), so the status is
   # carried past the `fi` and BOTH the refusal and the success line come after it: a
   # bootstrap the gate is about to refuse must not have been reported complete first.

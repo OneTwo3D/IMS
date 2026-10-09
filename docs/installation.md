@@ -864,6 +864,10 @@ order exists to remove. A **first** install fences nothing, deliberately: there 
 crontab and no data, so there is no writer to stop.
 
 
+### Secrets are never on a command line
+
+`ps` shows the command line of every process to every local account, so the installer hands secrets to the programs it starts through the environment (readable by root and the owner only) or through a mode-600 file, never as an argument. The bootstrap step exports the default administrator's password, the SMTP password and the WooCommerce key and secret inside a subshell and lets `runuser` pass them to the application account's `provision-instance.mjs` (it used to be `env NAME=value ... node`, which put all of them on the command line for the life of the step). The GitHub deploy-key token (`install.sh`) and the Cloudflare token (`provision-ims-tenant.sh`) reach `curl` on its standard input as a `-K -` config line instead of a `-H "Authorization: ..."` argument. A test (`tests/scripts/installer-secrets-argv.test.ts`) runs the shipped bootstrap block with stand-ins that record every command line, and scans every shell script under `scripts/` for the shapes that put a secret on an argument; it fails on any new one. Two sites remain and are listed in that test with their reasons: `pct create --password` in `provision-ims-tenant.sh` (the Proxmox tool has no other form; it is an operator tool, not the installer) and the unwired legacy `scripts/backup.sh`.
+
 ## Configuration Prompts
 
 The installer asks for the following values during setup. Press Enter to accept the default shown in brackets.
