@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Mintsoft: the despatch poll is scheduled, and a bundle create is not repeated after an uncertain send
+
+- **The `mintsoft-dispatch-sync` job is now a registered scheduled job (every 15 minutes, on by default).** The installation guide always listed it as automatic, but nothing scheduled it, so a despatch in Mintsoft did not progress the IMS shipment unless someone added a crontab line by hand. **Upgrade step: open Settings > System > Scheduler and use Save & Apply once** so the new job reaches an existing crontab. The poll only reads from Mintsoft and does nothing while the Mintsoft plugin is off. The read-sync liveness check now names the job and reports the poll as off when the job is switched off.
+- **Fixed: a Mintsoft bundle create that may have been sent no longer releases its claim.** A timeout, a dropped connection or an unusable answer used to delete the claim, so the next run could send the create again. The claim is now kept, the bundle is looked up straight away (a read) and linked only if it matches IMS, and no further create is sent until the claim has expired and a fresh lookup has found nothing. A create the outbound-write hold refused before it left still releases its claim. Adds no environment variables.
+
 ### Readiness gate (`npm run readiness:gate`) and a stricter rollout-readiness endpoint
 
 - **New: `npm run readiness:gate -- --phase P0|P1|P2`** reduces the switchover checks to one verdict (GO, GO-WITH-ACCEPTED-WARNINGS, NO-GO) with a JSON and Markdown report. It performs no database or checkout write. Documented in docs/installation.md, "Readiness gate".

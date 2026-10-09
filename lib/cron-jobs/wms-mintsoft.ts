@@ -42,6 +42,21 @@ registerCronJobs([
     defaultEnabled: false,
   },
   {
+    slug: 'mintsoft-dispatch-sync',
+    settingKey: 'mintsoft_dispatch_sync',
+    module: 'mintsoft',
+    moduleLabel: 'Mintsoft',
+    label: 'Mintsoft Despatch Poll',
+    description: 'Poll Mintsoft for despatches of orders IMS has pushed and progress the IMS shipment, tracking and stock. Read-only towards Mintsoft.',
+    defaultSchedule: '*/15 * * * *',
+    // On by default, as docs/installation.md has always said. The poll only READS Mintsoft (the order list
+    // and order detail endpoints on the outbound read allow-list), the route does nothing while the Mintsoft
+    // plugin is off, and it has no candidates until IMS has pushed an order, so enabling it cannot create
+    // anything in Mintsoft. Left off, a pushed order never progresses and the read-sync liveness check
+    // reports the despatch poll as off.
+    defaultEnabled: true,
+  },
+  {
     slug: 'mintsoft-webhook-sweeper',
     settingKey: 'mintsoft_webhook_sweeper',
     module: 'mintsoft',
