@@ -79,7 +79,7 @@ const asInput = (rows: Array<{ id: string; description: string; amountForeign: u
 test('control: a partial bill of the vatable line of a mixed freight order records VAT 20 (the order rate), not the blended 10', SKIP, async () => {
   const { db, poId, lines } = await seedMixedFreight()
   const { createInvoice } = await import('@/app/actions/purchase-orders')
-  const result = await createInvoice(poId, { invoiceDate: '2026-10-01', lines: [{ kind: 'cost', costLineId: lines[0]!.id, amountForeign: 100 }] })
+  const result = await createInvoice(poId, { invoiceDate: '2026-10-01', lines: [{ kind: 'cost', costLineId: lines[0]!.id, description: 'Duty', amountForeign: 100 }] })
   const invoices = await db.purchaseInvoice.findMany({ where: { poId }, select: { taxForeign: true, totalForeign: true } })
   console.log(`control PRECONDITION: success=${result.success} ${result.error ?? ''}; invoices=${invoices.length}; tax=${invoices[0]?.taxForeign}, total=${invoices[0]?.totalForeign}`)
   assert.equal(result.success, true, String(result.error))
@@ -97,7 +97,7 @@ for (let round = 1; round <= 3; round += 1) {
       // The Duty line stops being vatable: same ids, new VAT (20 -> 0).
       editResult = await updateFreightPoCosts(poId, asInput(lines).map((l) => (l.id === lines[0]!.id ? { ...l, vatable: false } : l)))
     }
-    const result = await createInvoice(poId, { invoiceDate: '2026-10-01', lines: [{ kind: 'cost', costLineId: lines[0]!.id, amountForeign: 100 }] })
+    const result = await createInvoice(poId, { invoiceDate: '2026-10-01', lines: [{ kind: 'cost', costLineId: lines[0]!.id, description: 'Duty', amountForeign: 100 }] })
     const after = await db.purchaseOrder.findUniqueOrThrow({ where: { id: poId }, select: { taxForeign: true } })
     const invoices = await db.purchaseInvoice.count({ where: { poId } })
     console.log(`race PRECONDITION (round ${round}): hook ran=${editResult !== null} edit.success=${(editResult as { success: boolean } | null)?.success}; order tax now ${after.taxForeign}; bill result success=${result.success}; invoices=${invoices}`)
