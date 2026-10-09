@@ -38,7 +38,11 @@ export type ReadSyncAlarmLogEntry = {
 }
 
 export type ReadSyncAlarmTx = {
+  /** Present on a real transaction client; used to bound statements server-side. */
+  $executeRawUnsafe?: (sql: string) => Promise<unknown>
   setting: {
+    findMany(args: { where: { key: { in: string[] } }; select: { key: true; value: true } }): Promise<Array<{ key: string; value: string }>>
+    deleteMany(args: { where: { key: string } }): Promise<unknown>
     /** Insert-if-absent: `count` is 1 only for the transaction whose insert took effect. */
     createMany(args: { data: Array<{ key: string; value: string }>; skipDuplicates: true }): Promise<{ count: number }>
     /** Conditional write: `count` is 1 only if the row still held `where.value` when this transaction took its lock. */
@@ -92,9 +96,7 @@ export async function claimBreachAndDeliver(
   deps: Pick<ReadSyncAlarmDeps, 'db' | 'notifyAdmins' | 'logWarning'>,
   claim: { stampKey: string; prior: string | undefined; breachKey: string; alert: { title: string; message: string }; logEntry: ReadSyncAlarmLogEntry },
 ): Promise<boolean> {
-  return deps.db.$transaction(async (tx) => {
-    // A stalled statement is cancelled by the server rather than abandoned by the caller.
-    await (tx as unknown as { $executeRawUnsafe?: (sql: string) => Promise<unknown> }).$executeRawUnsafe?.(`SET LOCAL statement_timeout = ${ALARM_STATEMENT_TIMEOUT_MS}`)
+  return withStatementTimeout(deps.db, ALARM_STATEMENT_TIMEOUT_MS, async (tx) => {
     const claimed = claim.prior === undefined
       ? await tx.setting.createMany({ data: [{ key: claim.stampKey, value: claim.breachKey }], skipDuplicates: true })
       : await tx.setting.updateMany({ where: { key: claim.stampKey, value: claim.prior }, data: { value: claim.breachKey } })
@@ -102,6 +104,18 @@ export async function claimBreachAndDeliver(
     await deps.notifyAdmins(tx, claim.alert.title, claim.alert.message, '/sync')
     await deps.logWarning(tx, claim.logEntry)
     return true
+  })
+}
+
+/**
+ * Run `fn` in a short transaction whose statements the SERVER cancels after `timeoutMs`
+ * (`SET LOCAL statement_timeout`), with a bounded wait for a connection and a bounded transaction. An
+ * unresponsive dependency therefore errors out instead of holding a connection indefinitely.
+ */
+export async function withStatementTimeout<T>(db: ReadSyncAlarmDb, timeoutMs: number, fn: (tx: ReadSyncAlarmTx) => Promise<T>): Promise<T> {
+  return db.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe?.(`SET LOCAL statement_timeout = ${Math.trunc(timeoutMs)}`)
+    return fn(tx)
   }, ALARM_TRANSACTION_BOUNDS)
 }
 

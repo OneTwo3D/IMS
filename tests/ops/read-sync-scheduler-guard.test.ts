@@ -45,30 +45,35 @@ function rig() {
   const settings = new Map<string, string>()
   const delivered: Array<{ title: string; message: string }> = []
   const logged: string[] = []
+  const sql: string[] = []
+  const order: string[] = []
+  const makeTx = (): ReadSyncAlarmTx => ({
+    $executeRawUnsafe: async (statement: string) => { sql.push(statement); order.push('sql') },
+    setting: {
+      findMany: async ({ where }) => { order.push('read'); return where.key.in.filter((k) => settings.has(k)).map((key) => ({ key, value: settings.get(key)! })) },
+      deleteMany: async ({ where }) => { settings.delete(where.key) },
+      createMany: async ({ data }) => { let count = 0; for (const r of data) if (!settings.has(r.key)) { settings.set(r.key, r.value); count += 1 } return { count } },
+      updateMany: async ({ where, data }) => { if (settings.get(where.key) !== where.value) return { count: 0 }; settings.set(where.key, data.value); return { count: 1 } },
+    },
+  })
   const deps = {
     db: {
       setting: {
-        findMany: async ({ where }: { where: { key: { in: string[] } } }) => where.key.in.filter((k) => settings.has(k)).map((key) => ({ key, value: settings.get(key)! })),
+        findMany: async () => { throw new Error('the guard must not read outside a bounded transaction') },
         upsert: async () => undefined,
         updateMany: async () => ({ count: 0 }),
-        deleteMany: async ({ where }: { where: { key: string } }) => { settings.delete(where.key) },
+        deleteMany: async () => { throw new Error('the guard must not write outside a bounded transaction') },
       },
       $transaction: async <T>(fn: (tx: ReadSyncAlarmTx) => Promise<T>) => {
         const snapshot = new Map(settings)
-        try {
-          return await fn({
-            setting: {
-              createMany: async ({ data }: { data: Array<{ key: string; value: string }> }) => { let count = 0; for (const r of data) if (!settings.has(r.key)) { settings.set(r.key, r.value); count += 1 } return { count } },
-              updateMany: async ({ where, data }: { where: { key: string; value: string }; data: { value: string } }) => { if (settings.get(where.key) !== where.value) return { count: 0 }; settings.set(where.key, data.value); return { count: 1 } },
-            },
-          })
-        } catch (e) { settings.clear(); for (const [k, v] of snapshot) settings.set(k, v); throw e }
+        try { return await fn(makeTx()) } catch (e) { settings.clear(); for (const [k, v] of snapshot) settings.set(k, v); throw e }
       },
     },
+    readCrontab: async () => ({ resolved: true as const, text: '' }),
     notifyAdmins: async (_tx: ReadSyncAlarmTx, title: string, message: string) => { delivered.push({ title, message }) },
     logWarning: async (_tx: ReadSyncAlarmTx, entry: { description: string }) => { logged.push(entry.description) },
   }
-  return { settings, delivered, logged, deps }
+  return { settings, delivered, logged, sql, order, deps }
 }
 
 test('[guard] an upgraded installation (block present, alarm job missing) raises one notification naming the remedy', async () => {
@@ -113,6 +118,56 @@ test('[guard] once per distinct problem; a changed problem alerts again', async 
   assert.equal(r.delivered.length, 1)
   assert.equal((await runSchedulerCoverageGuard({ ...r.deps, readInputs: async () => inputs(block(NEEDED.filter((s) => s !== 'read-sync-liveness' && s !== 'wc-reconcile'))) })).status, 'ALERTED')
   assert.equal(r.delivered.length, 2)
+})
+
+test('[bounded] every database read of the guard runs after SET LOCAL statement_timeout, inside a transaction; the crontab is read outside it', async () => {
+  const r = rig()
+  r.deps.readCrontab = async () => { r.order.push('crontab'); return { resolved: true as const, text: '' } }
+  const readInputs = async (client: ReadSyncAlarmTx) => {
+    assert.equal(typeof client.$executeRawUnsafe, 'function', 'readInputs is handed the bounded client')
+    r.order.push('readInputs')
+    return inputs(block(NEEDED))
+  }
+  const result = await runSchedulerCoverageGuard({ ...r.deps, readInputs })
+  console.log(`precondition: ${JSON.stringify(result)} order=${JSON.stringify(r.order)} sql=${JSON.stringify(r.sql)}`)
+  assert.equal(result.status, 'OK')
+  assert.deepEqual(r.order.slice(0, 3), ['crontab', 'sql', 'readInputs'], 'crontab first, outside; then the timeout is set; then the reads')
+  assert.ok(r.sql.every((statement) => /^SET LOCAL statement_timeout = 5000$/.test(statement)), 'the single-sourced 5000 ms bound')
+  assert.ok(r.sql.length >= 1)
+})
+
+test('[observers] two observers alternating healthy and unreadable raise at most one notice each per UTC day, and never clear one another', async () => {
+  const r = rig()
+  const clock = new Date('2026-10-08T10:00:00Z')
+  const as = (observer: string, readable: boolean) => runSchedulerCoverageGuard({
+    ...r.deps, observer, now: () => clock,
+    readInputs: async () => inputs(readable ? block(NEEDED) : null),
+  })
+  // A cannot read, B can; they alternate through the day.
+  const outcomes: string[] = []
+  for (let i = 0; i < 4; i += 1) {
+    outcomes.push(`A:${(await as('aaaaaaaa', false)).status}`)
+    outcomes.push(`B:${(await as('bbbbbbbb', true)).status}`)
+  }
+  console.log(`precondition: ${JSON.stringify(outcomes)} notifications=${r.delivered.length}`)
+  assert.equal(r.delivered.length, 1, 'A alerted once; B (healthy) neither alerts nor clears A')
+  assert.equal(outcomes.filter((o) => o === 'A:ALERTED').length, 1)
+  assert.equal(r.settings.get('read_sync_scheduler_alerted_unverified_aaaaaaaa'), 'unverified:2026-10-08', "B never deleted A's reminder state")
+  // Now B loses its crontab too: one notice for B; A stays quiet the same day.
+  for (let i = 0; i < 3; i += 1) { await as('bbbbbbbb', false); await as('aaaaaaaa', false) }
+  assert.equal(r.delivered.length, 2, 'one per observer per UTC day')
+  assert.notEqual(r.delivered[0]!.message, undefined)
+})
+
+test('[suppression] the documented setting silences the unverifiable reminder for a known structural limitation, and only that', async () => {
+  const r = rig()
+  r.settings.set('read_sync_scheduler_guard_expect_unreadable', 'true')
+  const quiet = await runSchedulerCoverageGuard({ ...r.deps, observer: 'cccccccc', readInputs: async () => inputs(null) })
+  assert.equal(quiet.status, 'NOT_EXAMINED')
+  assert.equal(r.delivered.length, 0)
+  // A readable crontab with a real problem is still raised.
+  const real = await runSchedulerCoverageGuard({ ...r.deps, observer: 'cccccccc', readInputs: async () => inputs(block(NEEDED.filter((slug) => slug !== 'read-sync-liveness'))) })
+  assert.equal(real.status, 'ALERTED')
 })
 
 // ---- the route: the job that is scheduled everywhere starts the guard FIRST and cannot be delayed by it ----
@@ -192,4 +247,5 @@ test('[guard] an unreadable crontab raises ONE distinct "could not be verified" 
   const ok = await runSchedulerCoverageGuard({ ...r.deps, now: () => clock, readInputs: async () => inputs(block(NEEDED)) })
   assert.equal(ok.status, 'OK')
   assert.equal(r.settings.has(READ_SYNC_SCHEDULER_ALERTED_SETTING), false)
+  assert.equal([...r.settings.keys()].some((key) => key.includes('_unverified_')), false, 'this observer\'s own reminder state was forgotten')
 })

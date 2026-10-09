@@ -286,13 +286,28 @@ export function renderReadSyncStatusText(report: ReadSyncReport): string {
 // The one reader that touches the database
 // ---------------------------------------------------------------------------------------------
 
-export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
-  const { db } = await import('@/lib/db')
+export async function readCrontabForReport(): Promise<{ resolved: true; text: string } | { resolved: false; reason: string }> {
+  const reconcileModule = await import('@/lib/crontab-reconcile') as unknown as {
+    readOwnCrontabResult?: () => Promise<{ resolved: true; text: string } | { resolved: false; reason: string }>
+    default?: { readOwnCrontabResult: () => Promise<{ resolved: true; text: string } | { resolved: false; reason: string }> }
+  }
+  // Under tsx a CommonJS-interop load exposes the exports on `default`; the bundled server has them named.
+  const read = reconcileModule.readOwnCrontabResult ?? reconcileModule.default!.readOwnCrontabResult
+  const result = await read()
+  return result.resolved ? { resolved: true, text: result.text } : { resolved: false, reason: result.reason }
+}
+
+/**
+ * `options.client` lets a caller run every read on a transaction it has bounded (statement timeout), and
+ * `options.crontab` lets it read the crontab (a child process) OUTSIDE that transaction.
+ */
+export async function readReadSyncInputs(options: { client?: unknown; crontab?: { resolved: true; text: string } | { resolved: false; reason: string } } = {}): Promise<ReadSyncInputs> {
+  const { db: globalDb } = await import('@/lib/db')
+  const db = (options.client ?? globalDb) as typeof globalDb
   // Importing the registry module registers every job; the enablement of each is read from settings.
   await import('@/lib/cron-jobs')
   const { getAllCronJobs } = await import('@/lib/cron-registry')
-  const { getIntegrationPluginState } = await import('@/lib/integration-plugins')
-  const { isAccountingConnectorConnected } = await import('@/lib/accounting')
+  const keys = await import('@/lib/integration-plugin-keys')
 
   const jobs = getAllCronJobs()
   const wantedKeys = new Set<string>(['wc_sync_enabled'])
@@ -345,13 +360,7 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
     : false
 
   // Read-only: `crontab -l` of the user this runs as. Nothing is written.
-  const reconcileModule = await import('@/lib/crontab-reconcile') as unknown as {
-    readOwnCrontabResult?: () => Promise<{ resolved: true; text: string } | { resolved: false; reason: string }>
-    default?: { readOwnCrontabResult: () => Promise<{ resolved: true; text: string } | { resolved: false; reason: string }> }
-  }
-  // Under tsx a CommonJS-interop load exposes the exports on `default`; the bundled server has them named.
-  const readOwnCrontabResult = reconcileModule.readOwnCrontabResult ?? reconcileModule.default!.readOwnCrontabResult
-  const crontab = await readOwnCrontabResult()
+  const crontab = options.crontab ?? await readCrontabForReport()
 
   const cronJobDefs = jobs.map((job) => ({
     slug: job.slug, settingKey: job.settingKey, label: job.label,
@@ -365,7 +374,10 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
   const cronSchedules: Record<string, string | undefined> = {}
   for (const job of jobs) cronSchedules[job.slug] = scheduleByKey.get(`cron_${job.settingKey}_schedule`)
 
-  const state = await getIntegrationPluginState()
+  // The plugin switches, read on THIS client (the same keys and parser getIntegrationPluginState uses).
+  const pluginRows = await db.setting.findMany({ where: { key: { in: Object.values(keys.INTEGRATION_PLUGIN_SETTING_KEYS) } }, select: { key: true, value: true } })
+  const pluginValues = new Map(pluginRows.map((row) => [row.key, row.value]))
+  const state = keys.buildIntegrationPluginState((id) => keys.parseIntegrationPluginEnabled(pluginValues.get(keys.INTEGRATION_PLUGIN_SETTING_KEYS[id])))
   const pluginEnabled = {
     woocommerce: state.woocommerce === true,
     mintsoft: state.mintsoft === true,
@@ -387,7 +399,7 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
   return {
     settings,
     pluginEnabled,
-    xeroConnected: pluginEnabled.xero ? await isAccountingConnectorConnected('xero') : false,
+    xeroConnected: pluginEnabled.xero ? (await db.accountingToken.findFirst({ where: { connector: 'xero' }, select: { id: true } })) !== null : false,
     cronEnabled,
     bindings: bindings.map((binding) => ({
       id: binding.id,
@@ -398,7 +410,7 @@ export async function readReadSyncInputs(): Promise<ReadSyncInputs> {
     lastDispatchSuccessAt: lastDispatch?.finishedAt ?? null,
     cronJobDefs,
     cronSchedules,
-    crontab: crontab.resolved ? { resolved: true, text: crontab.text } : { resolved: false, reason: crontab.reason },
+    crontab,
   }
 }
 

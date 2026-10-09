@@ -69,6 +69,8 @@ class Harness {
       this.pendingWarnings = []
       const tx: ReadSyncAlarmTx = {
         setting: {
+          findMany: async ({ where }) => where.key.in.filter((key) => this.settings.has(key)).map((key) => ({ key, value: this.settings.get(key)! })),
+          deleteMany: async ({ where }) => { this.settings.delete(where.key) },
           createMany: async ({ data }) => {
             let count = 0
             for (const row of data) if (!this.settings.has(row.key)) { this.settings.set(row.key, row.value); count += 1 }
