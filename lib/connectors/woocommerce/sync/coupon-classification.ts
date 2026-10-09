@@ -332,7 +332,7 @@ export function checkWcStoreCreditReconciles(input: {
   storeCreditForeign: Decimal
   orderTotalForeign: Decimal
   currency: string
-  /** How many components (lines + shipping) each contribute a possible half-minor-unit of rounding. */
+  /** How many components (lines + shipping) each contribute a possible half-minor-unit of rounding; the total allowance is capped at two minor units whatever this is. */
   componentCount: number
 }): { ok: true } | { ok: false; difference: Decimal; tolerance: Decimal } {
   const expected = input.subtotalForeign
@@ -343,7 +343,11 @@ export function checkWcStoreCreditReconciles(input: {
   const difference = roundQuantity(expected.sub(input.orderTotalForeign), 4)
   const minor = toDecimal(10).pow(-currencyMinorUnits(input.currency))
   const rounding = halfMinorUnit(input.currency).mul(Math.max(1, input.componentCount))
-  const tolerance = maxDecimal(minor, rounding)
+  // CAPPED, independently of the line count. The allowance used to grow by half a minor unit per component,
+  // so an order of 201 lines tolerated more than a pound and a GBP 1 credit already reduced into the lines
+  // (then subtracted again) was accepted. Rounding that matters is a couple of minor units however many
+  // lines there are; anything bigger than that could be a whole credit.
+  const tolerance = maxDecimal(minor, rounding.gt(minor.mul(2)) ? minor.mul(2) : rounding)
   return difference.abs().lte(tolerance) ? { ok: true } : { ok: false, difference, tolerance }
 }
 

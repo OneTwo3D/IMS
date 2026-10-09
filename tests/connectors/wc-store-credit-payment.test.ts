@@ -250,3 +250,32 @@ test('importWcOrder: classifies before it writes, refuses before the create, and
   assert.match(body, /totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit/)
   assert.match(body, /action: STORE_CREDIT_INVOICE_WITHHELD_ACTION/)
 })
+
+// ---------------------------------------------------------------------------------------------------
+// The reconciliation tolerance must not grow with the number of lines (Codex round 1, HIGH).
+// ---------------------------------------------------------------------------------------------------
+
+test('MANY LINES: a GBP 1 credit already reduced into 201 lines and subtracted again is REFUSED', () => {
+  // Lines already carry the credit (goods 199.00 + VAT 39.80 = 238.80, which IS the Woo total). Counting the
+  // 1.00 credit as a payment as well expects 237.80 against 238.80. A tolerance of half a penny per line
+  // (201 lines + shipping = 1.01) used to wave this through.
+  const result = checkWcStoreCreditReconciles({
+    subtotalForeign: toDecimal(199), taxForeign: toDecimal(39.8), shippingForeign: toDecimal(0),
+    orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(1), orderTotalForeign: toDecimal(238.8),
+    currency: 'GBP', componentCount: 202,
+  })
+  precondition('201 lines, credit inside the lines', { components: 202, difference: result.ok ? 0 : num(result.difference), tolerance: result.ok ? null : num(result.tolerance) })
+  assert.equal(result.ok, false)
+  assert.equal(result.ok === false && num(result.difference), -1)
+  assert.equal(result.ok === false && num(result.tolerance), 0.02, 'the allowance is capped at two minor units however many lines there are')
+})
+
+test('MANY LINES: an honest 201-line credit order that is a penny out from rounding is accepted', () => {
+  const result = checkWcStoreCreditReconciles({
+    subtotalForeign: toDecimal(200), taxForeign: toDecimal(40), shippingForeign: toDecimal(0),
+    orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(1), orderTotalForeign: toDecimal(239.01),
+    currency: 'GBP', componentCount: 202,
+  })
+  precondition('201 lines, honest, 0.01 out', { components: 202, difference: -0.01 })
+  assert.deepEqual(result, { ok: true })
+})

@@ -71,6 +71,16 @@ export function storeCreditCreditNotePosterError(): string {
     + 'the matching credit note by hand.')
 }
 
+/**
+ * The follow-ups that hang off the invoice (its payment registration, the invoice email, the WooCommerce
+ * invoice note). They are refused for the same reason and from the same fact, at the posting boundary, so a
+ * revived or manually queued entry cannot reach the remote call. The refusal is taken before any request is
+ * built, so "nothing was sent" is true.
+ */
+export function storeCreditFollowUpPosterError(what: 'payment registration' | 'invoice email' | 'WooCommerce invoice note'): string {
+  return `NOTHING WAS SENT. This ${what} belongs to an order paid in part with store credit. ${storeCreditInvoiceRefusalReason()}`
+}
+
 /** The importer's entry, written when the invoice is queued: it says what WILL happen, not what has. */
 export function storeCreditInvoiceQueuedNotice(orderNumber: string, creditText: string): string {
   return `WooCommerce order ${orderNumber} carries ${creditText} of store credit. `

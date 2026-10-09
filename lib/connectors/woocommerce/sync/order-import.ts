@@ -15,7 +15,7 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
-import { checkWcStoreCreditReconciles, describeWcCouponRefusal, planWcOrderCoupons } from './coupon-classification'
+import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons } from './coupon-classification'
 import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, storeCreditInvoiceQueuedNotice } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
 import {
@@ -781,7 +781,21 @@ export async function updateExistingWcOrderFromPayload(
   orderId: string,
   wcOrder: WcFullOrder,
 ): Promise<void> {
+  // STORE CREDIT ON AN ORDER IMS ALREADY HOLDS. This path never classifies coupons, so an order imported
+  // before credit was recorded separately (credit stored as a discount, `storeCreditForeign` 0) would
+  // otherwise sail through the invoice refusal. Classified here from the payload, and recorded ONLY while
+  // the stored credit is zero: that makes the poster refuse its invoice and credit note and the push-time
+  // total check expect it. Nothing is restated (no retrospective data fixes): `discountAmount` is left as
+  // it was and the ERROR entry below says so.
+  const payloadCredit = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data).creditGross
+  let legacyCreditRecorded = false
   await db.$transaction(async (tx) => {
+    let recordCredit: Decimal | null = null
+    if (payloadCredit.gt(0)) {
+      const stored = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { storeCreditForeign: true } })
+      if (stored && toDecimal(stored.storeCreditForeign).isZero()) recordCredit = roundQuantity(payloadCredit, 4)
+    }
+    legacyCreditRecorded = recordCredit !== null
     await tx.shoppingOrderLink.updateMany({
       where: {
         connector: 'woocommerce',
@@ -797,6 +811,7 @@ export async function updateExistingWcOrderFromPayload(
     await tx.salesOrder.update({
       where: { id: orderId },
       data: {
+        ...(recordCredit ? { storeCreditForeign: recordCredit } : {}),
         externalOrderNumber: wcOrder.number,
         customerVatNumber: readWcCustomerVat(wcOrder),
         billingAddress: mapWcAddress(wcOrder.billing),
@@ -820,6 +835,20 @@ export async function updateExistingWcOrderFromPayload(
       },
     })
   })
+
+  if (legacyCreditRecorded) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'wc_store_credit_recorded_on_update',
+      tag: 'sync',
+      level: 'ERROR',
+      description: `WooCommerce order ${wcOrder.number} carries store credit but was imported before IMS recorded it separately. `
+        + 'The credit is now recorded on the order, so IMS will not post a sales invoice or credit note for it. '
+        + 'The order was NOT restated: its discount may still include the credit, and the warehouse may already hold the order with that discount.',
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number },
+    })
+  }
 
   // o3d-k26m.1: capture WooCommerce's invoice number the first time it appears. An order can
   // legitimately be imported before WooCommerce PDF Invoices has numbered its invoice, and a later
