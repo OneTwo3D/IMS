@@ -49,6 +49,8 @@ function claimRows(where: ClaimWhere): LinkRow[] {
 }
 let auditFails = false
 
+// The double is self-referential (its transaction hands itself back), which a precise type cannot express.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const dbDouble: Record<string, any> = {
   externalWmsBinding: {
     findMany: async () => [{ warehouseId: 'wh-1', bundleSyncDirection: 'IMS_TO_WMS', warehouse: { code: 'W1' } }],
