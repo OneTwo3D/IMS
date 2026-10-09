@@ -46,7 +46,7 @@ const SECRET_NAMES = ['DEFAULT_ADMIN_PASSWORD', 'SMTP_PASS', 'WC_CONSUMER_KEY', 
 function shippedBlock(source: string): string {
   const start = source.indexOf('  # THE VALUES TRAVEL IN THE ENVIRONMENT')
   assert.notEqual(start, -1, 'precondition: the bootstrap block is present')
-  const endMarker = '  ) || bootstrap_rc=$?\n'
+  const endMarker = '  bootstrap_with_env run_as_user_db node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?\n'
   const end = source.indexOf(endMarker, start)
   assert.notEqual(end, -1, 'precondition: the block ends at its status capture')
   return source.slice(start, end + endMarker.length)
@@ -78,7 +78,7 @@ function runBlock(dir: string, block: string): { argv: string; nodeEnv: string; 
     block,
     'echo "rc=${bootstrap_rc}"',
   ].join('\n')
-  const r = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { PATH: `${bin}:${process.env.PATH}`, HOME: dir } })
+  const r = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, HOME: dir } })
   const read = (f: string) => { try { return readFileSync(f, 'utf8') } catch { return '' } }
   if (process.env.RIG_DEBUG) console.log(`  rig status ${r.status}\n${r.stdout}\n${r.stderr}`)
   return { argv: read(argvLog), nodeEnv: read(envLog), status: r.status ?? -1 }

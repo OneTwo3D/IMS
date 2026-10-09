@@ -10195,6 +10195,7 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
   # life of the step: the default administrator's password, the SMTP password and the WooCommerce secret. Exporting
   # them inside a subshell puts them in the environment instead (readable by root and the owner only), and runuser
   # hands that environment to the application account, which is how DATABASE_URL already travels.
+  bootstrap_with_env() {
   (
     export DEFAULT_ADMIN_NAME="${DEFAULT_ADMIN_NAME}"
     export DEFAULT_ADMIN_EMAIL="${DEFAULT_ADMIN_EMAIL}"
@@ -10213,8 +10214,10 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     export WC_STORE_URL="${WC_STORE_URL}"
     export WC_CONSUMER_KEY="${WC_CONSUMER_KEY}"
     export WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}"
-    run_as_user_db node "${BOOTSTRAP_SCRIPT}"
-  ) || bootstrap_rc=$?
+    "$@"
+  )
+  }
+  bootstrap_with_env run_as_user_db node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?
   # ITS PLACEMENT IS THE CLOSING GATE BELOW (o3d-secops r34, Codex HIGH 2), so the status is
   # carried past the `fi` and BOTH the refusal and the success line come after it: a
   # bootstrap the gate is about to refuse must not have been reported complete first.
