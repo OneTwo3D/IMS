@@ -136,6 +136,17 @@ function shadow(
   return { disposition: 'SHADOW', reason, ...base }
 }
 
+/**
+ * Why an owner in the installation's phase keeps IMS from producing live, or null when the owner is IMS.
+ * Only `IMS` is null: `unknown` is a decision nobody has made, and every other owner (an incumbent plugin,
+ * Xeroom, Qoblex's native integration, Aelia, WooCommerce itself, an operator working by hand, `nobody`)
+ * is a writer IMS must not duplicate. Exported so the rule is testable for every owner kind.
+ */
+export function ownerShadowReason(owner: WriterOwner): 'owner_unknown' | 'not_ims_owned' | null {
+  if (owner === 'IMS') return null
+  return owner === 'unknown' ? 'owner_unknown' : 'not_ims_owned'
+}
+
 function evaluate<D extends OutboundConnector>(
   destination: D,
   operation: MappedOperation<D>,
@@ -174,8 +185,8 @@ function evaluate<D extends OutboundConnector>(
   // Phase P2 for this destination from here on.
   const owner: WriterOwner = row?.owners.P2 ?? 'unknown'
   const base = { owner, phase: 'P2' as const, cutoff: cutoff.at, grant: 'granted' as const }
-  if (owner === 'unknown') return shadow('owner_unknown', base)
-  if (owner !== 'IMS') return shadow('not_ims_owned', base)
+  const ownerReason = ownerShadowReason(owner)
+  if (ownerReason !== null) return shadow(ownerReason, base)
 
   if (obligationAt === undefined) {
     // A row that says the business-event time is required cannot be LIVE without it: an omitted time would
