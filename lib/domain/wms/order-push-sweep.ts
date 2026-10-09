@@ -1,4 +1,5 @@
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
+import { STORE_CREDIT_PUSH_WITHHELD_REASON, storeCreditPushMustBeWithheld } from '@/lib/domain/wms/store-credit-push-guard'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -347,6 +348,8 @@ type OrderForPush = {
   discountAmount: unknown
   /** Store credit, GROSS: a payment, so it is in the order total's gap but never in the pushed discount. */
   storeCreditForeign?: unknown
+  /** Stamped by the importer in the write that computes `discountAmount`; proves it holds no store credit. */
+  discountModel?: unknown
   totalForeign: unknown
   lines: CandidateLine[]
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
@@ -470,6 +473,7 @@ const ORDER_PUSH_SELECT = {
   pricesIncludeVat: true,
   discountAmount: true,
   storeCreditForeign: true,
+  discountModel: true,
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
@@ -493,6 +497,8 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
   const recipient = resolvePushRecipient(order)
   // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
   if (!recipient.address.address1) throw new Error(NO_DELIVERY_STREET_REASON)
+  // Refuse too when the discount may still contain store credit (a payment, never a discount): see the guard.
+  if (storeCreditPushMustBeWithheld(order)) throw new Error(STORE_CREDIT_PUSH_WITHHELD_REASON)
   return {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,

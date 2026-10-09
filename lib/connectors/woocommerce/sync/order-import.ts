@@ -785,17 +785,23 @@ export async function updateExistingWcOrderFromPayload(
   // before credit was recorded separately (credit stored as a discount, `storeCreditForeign` 0) would
   // otherwise sail through the invoice refusal. Classified here from the payload, and recorded ONLY while
   // the stored credit is zero: that makes the poster refuse its invoice and credit note and the push-time
-  // total check expect it. Nothing is restated (no retrospective data fixes): `discountAmount` is left as
+  // total check expect it, and withholds the warehouse push (its discount may still contain the credit). Nothing is restated (no retrospective data fixes): `discountAmount` is left as
   // it was and the ERROR entry below says so.
   const payloadCredit = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data).creditGross
   let legacyCreditRecorded = false
   await db.$transaction(async (tx) => {
-    let recordCredit: Decimal | null = null
+    // The order's row lock first, and a CONDITIONAL write: two deliveries of the same order (a webhook and a
+    // poll, or two webhooks) with different amounts must not overwrite a credit one of them already recorded.
+    // `WHERE storeCreditForeign = 0` makes the write itself the arbiter, and the entry below is written only
+    // by the delivery that actually wrote.
     if (payloadCredit.gt(0)) {
-      const stored = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { storeCreditForeign: true } })
-      if (stored && toDecimal(stored.storeCreditForeign).isZero()) recordCredit = roundQuantity(payloadCredit, 4)
+      await lockSalesOrder(tx, orderId)
+      const recorded = await tx.salesOrder.updateMany({
+        where: { id: orderId, storeCreditForeign: 0 },
+        data: { storeCreditForeign: roundQuantity(payloadCredit, 4) },
+      })
+      legacyCreditRecorded = recorded.count === 1
     }
-    legacyCreditRecorded = recordCredit !== null
     await tx.shoppingOrderLink.updateMany({
       where: {
         connector: 'woocommerce',
@@ -811,7 +817,6 @@ export async function updateExistingWcOrderFromPayload(
     await tx.salesOrder.update({
       where: { id: orderId },
       data: {
-        ...(recordCredit ? { storeCreditForeign: recordCredit } : {}),
         externalOrderNumber: wcOrder.number,
         customerVatNumber: readWcCustomerVat(wcOrder),
         billingAddress: mapWcAddress(wcOrder.billing),
@@ -2137,7 +2142,6 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         storeCreditForeign,
         orderTotalForeign: totalForeign,
         currency,
-        componentCount: mappedLines.length + 1,
       })
       if (!reconciled.ok) {
         const refusal = {

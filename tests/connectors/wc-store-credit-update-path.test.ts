@@ -16,13 +16,24 @@ const state = {
   stored: { storeCreditForeign: '0.0000' } as { storeCreditForeign: unknown } | null,
   reads: 0,
   updates: [] as Array<Record<string, unknown>>,
+  statements: [] as string[],
   activity: [] as Array<Record<string, unknown>>,
 }
 
 const tx = {
+  $queryRaw: async (sql: { sql?: string; strings?: string[] }) => { state.statements.push(`LOCK ${(sql.sql ?? sql.strings?.join('?') ?? '').replace(/\s+/g, ' ').trim()}`); return [] },
   shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
   salesOrder: {
-    findUnique: async () => { state.reads += 1; return state.stored },
+    // The conditional write: honours `storeCreditForeign: 0`, like the database would.
+    updateMany: async ({ where, data }: { where: { storeCreditForeign?: number }; data: Record<string, unknown> }) => {
+      state.statements.push('CONDITIONAL credit write')
+      state.reads += 1
+      const stored = Number(state.stored?.storeCreditForeign ?? 0)
+      if (where.storeCreditForeign !== undefined && stored !== where.storeCreditForeign) return { count: 0 }
+      state.updates.push(data)
+      if (state.stored) state.stored.storeCreditForeign = String(data.storeCreditForeign)
+      return { count: 1 }
+    },
     update: async ({ data }: { data: Record<string, unknown> }) => { state.updates.push(data); return {} },
   },
 }
@@ -44,6 +55,7 @@ test.beforeEach(() => {
   state.stored = { storeCreditForeign: '0.0000' }
   state.reads = 0
   state.updates = []
+  state.statements = []
   state.activity = []
 })
 
@@ -59,9 +71,11 @@ function precondition(name: string, facts: Record<string, unknown>): void {
 test('a re-read order with store credit and a stored credit of 0 RECORDS the credit (gross) and says it was not restated', async () => {
   await run(order(credit))
   precondition('legacy credit order', { payloadCredit: 12, stored: 0, updates: state.updates.length })
-  assert.equal(state.updates.length, 1, 'precondition: the order update ran')
+  assert.equal(state.updates.length, 2, 'precondition: the credit write and the order update both ran')
   assert.equal(String(state.updates[0].storeCreditForeign), '12')
-  assert.ok(!('discountAmount' in state.updates[0]), 'the discount is NOT restated')
+  assert.ok(state.updates.every((u) => !('discountAmount' in u)), 'the discount is NOT restated')
+  assert.match(state.statements[0], /^LOCK SELECT id FROM "sales_orders"/, 'the order row lock is the FIRST statement')
+  assert.equal(state.statements[1], 'CONDITIONAL credit write')
   const entry = state.activity.find((a) => a.action === 'wc_store_credit_recorded_on_update')
   assert.ok(entry, 'an ERROR entry names it')
   assert.equal(entry!.level, 'ERROR')
@@ -72,8 +86,8 @@ test('an order whose credit is already recorded is left alone (the stored credit
   state.stored = { storeCreditForeign: '12.0000' }
   await run(order(credit))
   precondition('already recorded', { stored: 12 })
-  assert.equal(state.reads, 1, 'precondition: the stored credit was read')
-  assert.ok(!('storeCreditForeign' in state.updates[0]))
+  assert.equal(state.reads, 1, 'precondition: the conditional write was attempted')
+  assert.ok(state.updates.every((u) => !('storeCreditForeign' in u)), 'and it matched nothing')
   assert.equal(state.activity.length, 0)
 })
 
@@ -91,4 +105,20 @@ test('the credit is also found from the order-level contribution record', async 
   await run(order(lines, [{ id: 3, key: 'smart_coupons_contribution', value: { x: 5 } }] as unknown as WcFullOrder['meta_data']))
   precondition('contribution', { updates: state.updates.length })
   assert.equal(String(state.updates[0].storeCreditForeign), '5')
+})
+
+test('TWO deliveries with different amounts: the first credit wins, the second writes nothing and logs nothing (repeated)', async () => {
+  for (let round = 0; round < 40; round++) {
+    state.stored = { storeCreditForeign: '0.0000' }
+    state.updates = []
+    state.activity = []
+    const small = [{ id: 1, code: 'sc', discount: '5.00', discount_tax: '0.00', meta_data: [{ id: 9, key: 'coupon_info', value: '[1,"sc","smart_coupon","50"]' }] }] as unknown as WcFullOrder['coupon_lines']
+    const deliveries = round % 2 ? [order(credit), order(small)] : [order(small), order(credit)]
+    await Promise.all(deliveries.map((d) => run(d)))
+    const creditWrites = state.updates.filter((u) => 'storeCreditForeign' in u)
+    assert.equal(creditWrites.length, 1, `round ${round}: exactly one delivery wrote the credit`)
+    assert.equal(state.activity.filter((a) => a.action === 'wc_store_credit_recorded_on_update').length, 1, `round ${round}: and only that one logged`)
+    assert.equal(String(state.stored!.storeCreditForeign), String(creditWrites[0].storeCreditForeign))
+  }
+  precondition('race', { rounds: 40 })
 })

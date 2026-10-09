@@ -60,6 +60,12 @@ export type ClassifiedWcCoupon = {
   tax: Decimal
   /** Why the line is UNKNOWN; null otherwise. */
   unknownReason: string | null
+  /**
+   * TRUE when one source calls the coupon store credit and another does not (or could not be read). Such a
+   * coupon is refused whatever the allocation residual: credit that was also applied to the lines would
+   * otherwise import as a discount.
+   */
+  creditConflict: boolean
 }
 
 export type ClassifiedWcCoupons = {
@@ -152,9 +158,28 @@ function classifyOne(line: WcCouponLine, contributionCodes: Set<string>): Classi
     net: net ?? toDecimal(0),
     tax: tax ?? toDecimal(0),
   }
-  const unknown = (discountType: string | null, unknownReason: string): ClassifiedWcCoupon => ({
-    ...base, kind: 'UNKNOWN', discountType, unknownReason,
+  const unknown = (discountType: string | null, unknownReason: string, creditConflict = false): ClassifiedWcCoupon => ({
+    ...base, kind: 'UNKNOWN', discountType, unknownReason, creditConflict,
   })
+
+  // EVERY DISAGREEMENT INVOLVING A CREDIT SIGNAL IS REFUSED, three sources: coupon_info, coupon_data and the
+  // order's smart_coupons_contribution record. If any one calls the coupon store credit and another calls it
+  // something else (or is unreadable), the allocation residual cannot be trusted to expose it: credit that
+  // was applied to the lines too matches the line discounts exactly, and would import as a discount.
+  const creditSignal = info.type === WC_STORE_CREDIT_DISCOUNT_TYPE || data.type === WC_STORE_CREDIT_DISCOUNT_TYPE || inContribution
+  const otherSignal =
+    (info.type !== null && info.type !== WC_STORE_CREDIT_DISCOUNT_TYPE)
+    || (data.type !== null && data.type !== WC_STORE_CREDIT_DISCOUNT_TYPE)
+    || (info.present && !info.type)
+    || (data.present && !data.type)
+  if (creditSignal && otherSignal) {
+    return unknown(
+      info.type ?? data.type,
+      `the sources disagree about whether "${code}" is store credit (coupon_info: ${info.present ? info.type ?? 'unreadable' : 'absent'}, `
+      + `coupon_data: ${data.present ? data.type ?? 'unreadable' : 'absent'}, smart_coupons_contribution: ${inContribution ? 'lists it' : 'does not list it'})`,
+      true,
+    )
+  }
 
   // Two item-level records that name different types: do not pick one.
   if (info.type && data.type && info.type !== data.type) {
@@ -168,14 +193,14 @@ function classifyOne(line: WcCouponLine, contributionCodes: Set<string>): Classi
     if (net === null || tax === null || net.isNegative() || tax.isNegative()) {
       return unknown(type, CREDIT_AMOUNT_UNREADABLE)
     }
-    return { ...base, kind: 'STORE_CREDIT', discountType: type, unknownReason: null }
+    return { ...base, kind: 'STORE_CREDIT', discountType: type, unknownReason: null, creditConflict: false }
   }
   if (type !== null) {
     if (inContribution) {
       return unknown(type, `the order records "${code}" as a store-credit contribution but its type is "${type}"`)
     }
     if (WC_GENUINE_DISCOUNT_TYPES.has(type)) {
-      return { ...base, kind: 'DISCOUNT', discountType: type, unknownReason: null }
+      return { ...base, kind: 'DISCOUNT', discountType: type, unknownReason: null, creditConflict: false }
     }
     return unknown(type, `the coupon type "${type}" is not one IMS recognises`)
   }
@@ -210,6 +235,7 @@ export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: W
 export type WcCouponPlanRefusal =
   | { kind: 'UNKNOWN_COUPON_TYPE'; reason: string; coupons: Array<{ code: string; discountType: string | null; why: string }> }
   | { kind: 'CREDIT_NOT_RECONCILED'; reason: string }
+  | { kind: 'CREDIT_SIGNAL_CONFLICT'; reason: string; coupons: Array<{ code: string; discountType: string | null; why: string }> }
   | { kind: 'CREDIT_UNREADABLE'; reason: string; coupons: Array<{ code: string; discountType: string | null; why: string }> }
 
 /**
@@ -240,14 +266,6 @@ export type WcCouponPlan = {
   storeCreditForeign: Decimal
   storeCreditCodes: string[]
   refusal: WcCouponPlanRefusal | null
-}
-
-/**
- * Half a minor unit of the order currency: the same allocation tolerance `resolveWcOrderLevelDiscount`
- * uses, restated here because this module is pure and must not import the db-bound field-mapping.
- */
-function halfMinorUnit(currency: string): Decimal {
-  return toDecimal(10).pow(-currencyMinorUnits(currency)).div(2)
 }
 
 /**
@@ -292,6 +310,17 @@ export function planWcOrderCoupons(input: {
   const asList = (lines: ClassifiedWcCoupon[]) =>
     lines.map((l) => ({ code: l.code, discountType: l.discountType, why: l.unknownReason ?? '' }))
 
+  // A coupon the sources disagree about is refused whatever the residual (see classifyOne).
+  const conflicted = classified.lines.filter((l) => l.creditConflict)
+  if (conflicted.length > 0) {
+    plan.refusal = {
+      kind: 'CREDIT_SIGNAL_CONFLICT',
+      reason: 'the records WooCommerce keeps disagree about whether a coupon is store credit, so IMS cannot tell whether it is a payment or a discount and will not choose.',
+      coupons: asList(conflicted),
+    }
+    return plan
+  }
+
   // An unreadable store-credit amount is an UNKNOWN line that WAS recognised as credit: it can never be
   // allowed through as a discount, whether or not any residual shows.
   const unreadableCredit = classified.unknown.filter((l) => l.unknownReason === CREDIT_AMOUNT_UNREADABLE)
@@ -332,8 +361,6 @@ export function checkWcStoreCreditReconciles(input: {
   storeCreditForeign: Decimal
   orderTotalForeign: Decimal
   currency: string
-  /** How many components (lines + shipping) each contribute a possible half-minor-unit of rounding; the total allowance is capped at two minor units whatever this is. */
-  componentCount: number
 }): { ok: true } | { ok: false; difference: Decimal; tolerance: Decimal } {
   const expected = input.subtotalForeign
     .add(input.taxForeign)
@@ -341,16 +368,12 @@ export function checkWcStoreCreditReconciles(input: {
     .sub(input.orderLevelDiscountForeign)
     .sub(input.storeCreditForeign)
   const difference = roundQuantity(expected.sub(input.orderTotalForeign), 4)
-  const minor = toDecimal(10).pow(-currencyMinorUnits(input.currency))
-  const rounding = halfMinorUnit(input.currency).mul(Math.max(1, input.componentCount))
-  // CAPPED, independently of the line count. The allowance used to grow by half a minor unit per component,
-  // so an order of 201 lines tolerated more than a pound and a GBP 1 credit already reduced into the lines
-  // (then subtracted again) was accepted. Rounding that matters is a couple of minor units however many
-  // lines there are; anything bigger than that could be a whole credit.
-  const tolerance = maxDecimal(minor, rounding.gt(minor.mul(2)) ? minor.mul(2) : rounding)
-  return difference.abs().lte(tolerance) ? { ok: true } : { ok: false, difference, tolerance }
-}
-
-function maxDecimal(a: Decimal, b: Decimal): Decimal {
-  return a.gte(b) ? a : b
+  // EXACT, to well below one minor unit. The tolerance is a QUARTER of a minor unit and strict, which only
+  // absorbs the four-decimal storage of the figures: every figure here is a sum of amounts WooCommerce itself
+  // rounded to the currency's minor unit, so honest data reconciles to the digit. Any allowance of a whole
+  // minor unit could not be told apart from a credit of one or two minor units that is ALSO already in the
+  // line totals (it would be subtracted twice and land inside the allowance), which sends the warehouse a
+  // reduced goods value. An order that is genuinely a minor unit out is refused for an operator to look at.
+  const tolerance = toDecimal(10).pow(-currencyMinorUnits(input.currency)).div(4)
+  return difference.abs().lt(tolerance) ? { ok: true } : { ok: false, difference, tolerance }
 }

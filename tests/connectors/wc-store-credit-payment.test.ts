@@ -156,7 +156,7 @@ test('the legacy coupon_data record is read, and a disagreement between records 
   const c = classifyWcCouponLines([conflicted]).lines[0]
   precondition('legacy/conflict', { legacy: 'coupon_data=smart_coupon', conflict: 'coupon_info=smart_coupon vs coupon_data=fixed_cart' })
   assert.equal(c.kind, 'UNKNOWN')
-  assert.match(c.unknownReason ?? '', /coupon_info says "smart_coupon" but coupon_data says "fixed_cart"/)
+  assert.match(c.unknownReason ?? '', /the sources disagree about whether "both" is store credit \(coupon_info: smart_coupon, coupon_data: fixed_cart/)
 })
 
 test('the order-level smart_coupons_contribution map (what the production plugin reads) identifies credit when the item has no type', () => {
@@ -168,7 +168,7 @@ test('the order-level smart_coupons_contribution map (what the production plugin
   assert.equal(result.refusal, null)
   // ...and the same code recorded as a contribution while the item says it is a fixed_cart is a conflict.
   const clash = plan([coupon('nr5zg9hl5zs3d', '36.46', 'fixed_cart')], 0, orderMeta)
-  assert.equal(clash.refusal?.kind, 'UNKNOWN_COUPON_TYPE')
+  assert.equal(clash.refusal?.kind, 'CREDIT_SIGNAL_CONFLICT')
 })
 
 test('a store-credit amount that cannot be read is refused even when it would look allocated', () => {
@@ -191,7 +191,6 @@ const reconcile = (overrides: Partial<Parameters<typeof checkWcStoreCreditReconc
     storeCreditForeign: toDecimal(30),
     orderTotalForeign: toDecimal(90),
     currency: 'GBP',
-    componentCount: 2,
     ...overrides,
   })
 
@@ -209,10 +208,72 @@ test('credit that ALSO reduced the lines does not reconcile (it would be taken o
   assert.equal(result.ok === false && num(result.difference), -30, 'expected 54 from the lines less the credit, Woo says 84')
 })
 
-test('rounding inside the tolerance does not refuse an honest credit order', () => {
-  const result = reconcile({ orderTotalForeign: toDecimal(90.01) })
-  precondition('rounding', { difference: -0.01, componentCount: 2 })
-  assert.equal(result.ok, true)
+test('a store-credit order reconciles EXACTLY: sub-minor-unit storage noise passes, a whole minor unit is refused for review', () => {
+  const rows = [0, 0.002, 0.004, 0.01, -0.01].map((drift) => {
+    const r = reconcile({ orderTotalForeign: toDecimal(90 + drift) })
+    return { drift, accepted: r.ok }
+  })
+  // eslint-disable-next-line no-console
+  console.log(`PRECONDITION drift table (GBP, exact reconciliation): ${JSON.stringify(rows)}`)
+  assert.deepEqual(rows.map((r) => r.accepted), [true, true, false, false, false])
+})
+
+test('a credit of 1 or 2 minor units that is ALSO already in the line totals is REFUSED (it cannot hide in an allowance)', () => {
+  for (const minor of [0.01, 0.02]) {
+    // Lines already reduced by the credit: goods 99.99 / 99.98, VAT 20, total = lines + VAT (Woo did not deduct it again).
+    const lines = 100 - minor
+    const result = reconcile({
+      subtotalForeign: toDecimal(lines), taxForeign: toDecimal(20), storeCreditForeign: toDecimal(minor),
+      orderTotalForeign: toDecimal(lines + 20),
+    })
+    precondition(`credit of ${minor} already in the lines`, { lines, credit: minor, total: lines + 20, ok: result.ok })
+    assert.equal(result.ok, false)
+    assert.equal(result.ok === false && num(result.difference), -minor)
+  }
+})
+
+test('SIGNAL MATRIX: every disagreement involving a credit signal is refused whatever the allocation residual', () => {
+  const T = 'smart_coupon', D = 'fixed_cart'
+  type Cell = { info: string | null | 'bad'; data: string | null | 'bad'; contribution: boolean; expect: 'CREDIT' | 'DISCOUNT' | 'UNKNOWN' | 'CONFLICT' }
+  const cells: Cell[] = [
+    { info: T, data: null, contribution: false, expect: 'CREDIT' },
+    { info: null, data: T, contribution: false, expect: 'CREDIT' },
+    { info: null, data: null, contribution: true, expect: 'CREDIT' },
+    { info: T, data: T, contribution: true, expect: 'CREDIT' },
+    { info: D, data: null, contribution: false, expect: 'DISCOUNT' },
+    { info: D, data: D, contribution: false, expect: 'DISCOUNT' },
+    { info: null, data: null, contribution: false, expect: 'UNKNOWN' },
+    { info: T, data: D, contribution: false, expect: 'CONFLICT' },
+    { info: D, data: T, contribution: false, expect: 'CONFLICT' },
+    { info: D, data: null, contribution: true, expect: 'CONFLICT' },
+    { info: null, data: D, contribution: true, expect: 'CONFLICT' },
+    { info: T, data: 'bad', contribution: false, expect: 'CONFLICT' },
+    { info: 'bad', data: null, contribution: true, expect: 'CONFLICT' },
+    { info: 'acme', data: null, contribution: true, expect: 'CONFLICT' },
+    { info: T, data: null, contribution: true, expect: 'CREDIT' },
+  ]
+  const table: string[] = []
+  for (const c of cells) {
+    const meta_data: WcMeta[] = []
+    if (c.info === 'bad') meta_data.push(meta('coupon_info', 'not json')); else if (c.info) meta_data.push(info(c.info, 'k'))
+    if (c.data === 'bad') meta_data.push(meta('coupon_data', 'not json')); else if (c.data) meta_data.push(meta('coupon_data', { discount_type: c.data }))
+    const orderMeta = c.contribution ? [meta('smart_coupons_contribution', { k: 5 })] : []
+    // Lines carry the whole coupon (residual 0): the case where the allocation check cannot expose a conflict.
+    const allocated = plan([{ id: 1, code: 'k', discount: '5.00', discount_tax: '0.00', meta_data }], 5, orderMeta)
+    const unallocated = plan([{ id: 1, code: 'k', discount: '5.00', discount_tax: '0.00', meta_data }], 0, orderMeta)
+    const kind = classifyWcCouponLines([{ id: 1, code: 'k', discount: '5.00', discount_tax: '0.00', meta_data }], orderMeta).lines[0]
+    const got = kind.creditConflict ? 'CONFLICT' : kind.kind === 'STORE_CREDIT' ? 'CREDIT' : kind.kind === 'DISCOUNT' ? 'DISCOUNT' : 'UNKNOWN'
+    table.push(`info=${c.info} data=${c.data} contribution=${c.contribution} -> ${got} (allocated: ${allocated.refusal?.kind ?? 'import'}, unallocated: ${unallocated.refusal?.kind ?? 'import'})`)
+    assert.equal(got, c.expect, table[table.length - 1])
+    if (c.expect === 'CONFLICT') {
+      assert.equal(allocated.refusal?.kind, 'CREDIT_SIGNAL_CONFLICT', `fully allocated must STILL refuse: ${table[table.length - 1]}`)
+      assert.equal(unallocated.refusal?.kind, 'CREDIT_SIGNAL_CONFLICT')
+    }
+    if (c.expect === 'CREDIT') assert.equal(allocated.refusal, null)
+  }
+  // eslint-disable-next-line no-console
+  console.log(`PRECONDITION signal matrix (${table.length} rows):\n  ${table.join('\n  ')}`)
+  assert.equal(table.length, cells.length)
 })
 
 // ---------------------------------------------------------------------------------------------------
@@ -256,26 +317,31 @@ test('importWcOrder: classifies before it writes, refuses before the create, and
 // ---------------------------------------------------------------------------------------------------
 
 test('MANY LINES: a GBP 1 credit already reduced into 201 lines and subtracted again is REFUSED', () => {
-  // Lines already carry the credit (goods 199.00 + VAT 39.80 = 238.80, which IS the Woo total). Counting the
-  // 1.00 credit as a payment as well expects 237.80 against 238.80. A tolerance of half a penny per line
-  // (201 lines + shipping = 1.01) used to wave this through.
   const result = checkWcStoreCreditReconciles({
     subtotalForeign: toDecimal(199), taxForeign: toDecimal(39.8), shippingForeign: toDecimal(0),
     orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(1), orderTotalForeign: toDecimal(238.8),
-    currency: 'GBP', componentCount: 202,
+    currency: 'GBP',
   })
-  precondition('201 lines, credit inside the lines', { components: 202, difference: result.ok ? 0 : num(result.difference), tolerance: result.ok ? null : num(result.tolerance) })
+  precondition('201 lines, credit inside the lines', { difference: result.ok ? 0 : num(result.difference) })
   assert.equal(result.ok, false)
   assert.equal(result.ok === false && num(result.difference), -1)
-  assert.equal(result.ok === false && num(result.tolerance), 0.02, 'the allowance is capped at two minor units however many lines there are')
 })
 
-test('MANY LINES: an honest 201-line credit order that is a penny out from rounding is accepted', () => {
+test('MANY LINES: an honest 201-line credit order that reconciles to the digit is accepted', () => {
+  const result = checkWcStoreCreditReconciles({
+    subtotalForeign: toDecimal(200), taxForeign: toDecimal(40), shippingForeign: toDecimal(0),
+    orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(1), orderTotalForeign: toDecimal(239),
+    currency: 'GBP',
+  })
+  precondition('201 lines, honest, exact', { difference: 0 })
+  assert.deepEqual(result, { ok: true })
+})
+
+test('MANY LINES: the same honest order a whole penny out is REFUSED for operator review (no per-line allowance)', () => {
   const result = checkWcStoreCreditReconciles({
     subtotalForeign: toDecimal(200), taxForeign: toDecimal(40), shippingForeign: toDecimal(0),
     orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(1), orderTotalForeign: toDecimal(239.01),
-    currency: 'GBP', componentCount: 202,
+    currency: 'GBP',
   })
-  precondition('201 lines, honest, 0.01 out', { components: 202, difference: -0.01 })
-  assert.deepEqual(result, { ok: true })
+  assert.equal(result.ok, false)
 })

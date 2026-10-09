@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import { runWmsOrderPushSweepCore, type WmsOrderPushPort, type WmsPushCandidate } from '../lib/domain/wms/order-push-sweep.ts'
 import type { WmsOrderPushInput, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
+import { STORE_CREDIT_PUSH_WITHHELD_REASON } from '../lib/domain/wms/store-credit-push-guard.ts'
 import { buildPushPayload } from '../lib/connectors/mintsoft/api/order-push.ts'
 
 /**
@@ -33,6 +34,8 @@ function candidate(overrides: Partial<WmsPushCandidate> = {}): WmsPushCandidate 
     pricesIncludeVat: false,
     discountAmount: 0,
     storeCreditForeign: 30,
+    // Stamped by the importer in the write that computes discountAmount: proves the discount holds no credit.
+    discountModel: 'LINE_ALLOCATED',
     totalForeign: 90,
     shipFromWarehouseId: 'wh-1',
     pushAttempts: 0,
@@ -41,7 +44,8 @@ function candidate(overrides: Partial<WmsPushCandidate> = {}): WmsPushCandidate 
   }
 }
 
-async function pushOnce(order: WmsPushCandidate): Promise<{ input: WmsOrderPushInput; totalMismatchPence: unknown }> {
+async function sweep(order: WmsPushCandidate): Promise<{ pushed: WmsOrderPushInput[]; upserts: Array<Record<string, unknown>>; validationFailures: Array<{ orderId: string; error: string }> }> {
+  const validationFailures: Array<{ orderId: string; error: string }> = []
   const pushed: WmsOrderPushInput[] = []
   const upserts: Array<Record<string, unknown>> = []
   const never = async () => []
@@ -50,7 +54,7 @@ async function pushOnce(order: WmsPushCandidate): Promise<{ input: WmsOrderPushI
     releasableHeldOrders: never,
     createCandidates: async () => [order],
     revalidatableLinks: async () => ({ links: [], total: 0 }),
-    recordValidationFailure: async () => true,
+    recordValidationFailure: async (orderId: string, _c: string, error: string) => { validationFailures.push({ orderId, error }); return true },
     claimForCreate: async () => 'CLAIMED',
     verifiableLinks: never,
     updatableLinks: never,
@@ -72,6 +76,11 @@ async function pushOnce(order: WmsPushCandidate): Promise<{ input: WmsOrderPushI
     addOrderComment: undefined,
   }
   await runWmsOrderPushSweepCore(connector as never, 'mintsoft', port, { now: NOW })
+  return { pushed, upserts, validationFailures }
+}
+
+async function pushOnce(order: WmsPushCandidate): Promise<{ input: WmsOrderPushInput; totalMismatchPence: unknown }> {
+  const { pushed, upserts } = await sweep(order)
   assert.equal(pushed.length, 1, 'precondition: exactly one order was pushed, so the input below was actually examined')
   const created = upserts.find((u) => 'totalMismatchPence' in u)
   assert.ok(created, 'precondition: the link write that records the drift verdict happened')
@@ -115,4 +124,33 @@ test('the Mintsoft payload carries no credit/payment field: the credit settles t
   assert.ok(keys.includes('DiscountTotalExVat'), 'precondition: the discount field exists to be checked')
   assert.equal(payload.DiscountTotalExVat, 0)
   assert.deepEqual(keys.filter((k) => /credit|paid|payment/i.test(k)), [])
+})
+
+test('WITHHELD: a credit order whose discount is not proven credit-free (recorded on update) is parked, never pushed', async () => {
+  const { pushed, upserts, validationFailures } = await sweep(candidate({ discountModel: null, discountAmount: 12 }))
+  precondition('legacy credit order', { storeCreditForeign: 30, discountModel: null, discountAmount: 12, pushed: pushed.length, parked: validationFailures.length })
+  assert.equal(pushed.length, 0, 'nothing is sent to the warehouse')
+  assert.equal(upserts.length, 0, 'and no push link is claimed')
+  assert.equal(validationFailures.length, 1, 'precondition: the order was reached and parked with a reason the operator sees')
+  assert.equal(validationFailures[0].error, STORE_CREDIT_PUSH_WITHHELD_REASON, 'single-sourced text')
+  assert.match(validationFailures[0].error, /nothing was sent\./)
+})
+
+test('WITHHELD matrix: only a provably credit-free discount (or no credit) is pushed', async () => {
+  const cases: Array<[string, Partial<WmsPushCandidate>, boolean]> = [
+    ['credit, LINE_ALLOCATED', { storeCreditForeign: 30, discountModel: 'LINE_ALLOCATED' }, true],
+    ['credit, model null', { storeCreditForeign: 30, discountModel: null }, false],
+    ['credit, model other', { storeCreditForeign: 30, discountModel: 'SOMETHING_ELSE' }, false],
+    ['credit unreadable', { storeCreditForeign: 'garbage', discountModel: null }, false],
+    ['no credit, model null (control)', { storeCreditForeign: 0, discountModel: null, totalForeign: 120 }, true],
+    ['credit field absent (control)', { storeCreditForeign: undefined, discountModel: null, totalForeign: 120 }, true],
+  ]
+  const rows: string[] = []
+  for (const [name, over, expectPushed] of cases) {
+    const r = await sweep(candidate(over))
+    rows.push(`${name}: pushed=${r.pushed.length}`)
+    assert.equal(r.pushed.length === 1, expectPushed, name)
+  }
+  // eslint-disable-next-line no-console
+  console.log(`PRECONDITION push withhold matrix: ${rows.join(' | ')}`)
 })
