@@ -2,6 +2,7 @@ import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-cons
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { reconcilePushTotals, withheldGoodsGross } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
@@ -398,6 +399,32 @@ export function orderTotalDriftPence(order: {
  */
 const TOTAL_DRIFT_TOLERANCE_PENCE = 1
 
+/**
+ * Advisory payload-total check for the create pass (see push-total-guard.ts). Returns the drift to
+ * record on the push link, or null when the figures sent add up (or the check could not run).
+ *
+ * It runs AFTER the warehouse accepted the order, where an exception would be caught by the create path's
+ * generic handler and put the link back in the create queue: a re-create of an order that already exists.
+ * It therefore never throws; a failure to evaluate is logged and reads as "no finding".
+ */
+export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPushInput): number | null {
+  try {
+    const verdict = reconcilePushTotals({
+      currency: order.currency,
+      orderTotal: order.totalForeign as Parameters<typeof reconcilePushTotals>[0]['orderTotal'],
+      withheldGoodsGross: withheldGoodsGross(order.lines, refundedQtyByLine(order)),
+      payload: input,
+      pricesIncludeVat: order.pricesIncludeVat,
+    })
+    if (verdict.status !== 'MISMATCH') return null
+    console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} payload total mismatch (${verdict.cause}): ${verdict.reason}`)
+    return Math.max(1, verdict.driftMinorUnits)
+  } catch (error) {
+    console.error(`[wms-order-push] payload total check could not run for ${order.orderNumber ?? order.id}: ${scrubWmsError(error, 'check failed')}`)
+    return null
+  }
+}
+
 export function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
   const a = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
   const str = (...keys: string[]): string => {
@@ -498,7 +525,7 @@ export function wmsPushOrderReference(
   return order.orderNumber ?? order.externalOrderNumber ?? order.id
 }
 
-function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
+export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
   return {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,
@@ -1604,7 +1631,7 @@ export async function runWmsOrderPushSweepCore(
         // Penny-precision guard (G6): record (never block) when the order's own totals
         // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
         const driftPence = orderTotalDriftPence(order)
-        const totalMismatchPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? driftPence : null
+        const totalMismatchPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? driftPence : payloadTotalMismatchPence(order, input)
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: ${totalMismatchPence}p drift vs derived total (pushed, flagged for review)`)
         }

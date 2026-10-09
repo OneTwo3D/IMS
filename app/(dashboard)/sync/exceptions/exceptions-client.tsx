@@ -1,5 +1,6 @@
 'use client'
 
+import { PUSH_TOTAL_MISMATCH_OPERATOR_NOTE } from '@/lib/domain/wms/push-total-mismatch-note'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Fragment, useState, useTransition } from 'react'
 import {
@@ -1000,7 +1001,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WMS pushes — order-total mismatches (${data.summary.pennyMismatches})`}
-            detail="Advisory: these orders pushed successfully but the IMS and WMS totals drifted by more than a penny. Review the order, then clear the flag."
+            detail={PUSH_TOTAL_MISMATCH_OPERATOR_NOTE}
             shown={data.pennyMismatches.length}
             total={data.summary.pennyMismatches}
           />

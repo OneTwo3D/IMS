@@ -4,6 +4,7 @@ import {
   AMBIGUOUS_ATTEMPTS,
   decideCreateClaim,
   mayDisposeCreateClaim,
+  orderTotalDriftPence,
   runWmsOrderPushSweepCore,
   shouldGrantCreateClaim,
   type WmsOrderPushPort,
@@ -245,6 +246,46 @@ test('create: a mis-totalled order is pushed but flagged for review (G6, non-blo
   assert.equal(r.created, 1)
   assert.equal(upserts[0].create.state, 'SYNCED')
   assert.equal(upserts[0].create.totalMismatchPence, 200)
+})
+
+test('create: an order whose own components reconcile but whose PAYLOAD does not add up is flagged, still SYNCED', async () => {
+  // VAT-inclusive order, gross order-level discount 12 (embedded VAT 2): the order reconciles against its own
+  // components (orderTotalDriftPence adds the VAT back) so the first check is silent, but the payload carries
+  // the discount as one ex-VAT figure with no VAT part, so the figures sent add up to 106, not 108.
+  const order = candidate({
+    subtotalForeign: 100, taxForeign: 18, discountAmount: 12, taxRatePercent: 0.2, pricesIncludeVat: true, totalForeign: 108,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  assert.equal(orderTotalDriftPence(order), 0, 'precondition: the order-components check is silent for this order')
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  console.log(`# precondition: created=${r.created} recorded=${String(upserts[0]?.create.totalMismatchPence)}`)
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.totalMismatchPence, 200)
+})
+
+test('create: a payload check that cannot evaluate never disturbs the SYNCED link (no re-create of an existing order)', async () => {
+  const order = candidate({ subtotalForeign: 0, totalForeign: 'not-a-number' as unknown as number })
+  assert.equal(orderTotalDriftPence(order), 0, 'precondition: the order-components check is silent, so the payload check is reached')
+  const errors: string[] = []
+  const original = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  let r
+  let upserts
+  try {
+    const made = makePort({ createCandidates: [order] })
+    upserts = made.upserts
+    r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', made.port, { now: NOW })
+  } finally {
+    console.error = original
+  }
+  console.log(`# precondition: swallowed=${errors.filter((e) => e.includes('payload total check could not run')).length} created=${r.created}`)
+  assert.equal(errors.filter((e) => e.includes('payload total check could not run')).length, 1)
+  assert.equal(r.created, 1)
+  assert.equal(upserts.length, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.totalMismatchPence, null)
 })
 
 test('create: a normal (no-fallback) push posts no courier comment', async () => {
