@@ -127,10 +127,10 @@ export const WRITER_OWNERSHIP_MAP = [
     ],
     note: 'Owner answer 2026-10-09: Qoblex does the daily batches natively in Xero today; IMS owns from P2. The obligation time is the batch date. Whether IMS\'s batches are correct on top of invoices posted by Xeroom is an open accountant question.',
   }),
-  row('xero', 'tax-rate', { P1: 'operator-manual', P2: 'unknown' }, {
+  row('xero', 'tax-rate', { P1: 'operator-manual', P2: 'nobody' }, {
     obligationTime: 'not-applicable',
     accountingSyncTypes: ['TAX_RATE_SYNC'],
-    note: 'Owner answer 2026-10-09: an operator maintains tax rates by hand today (P1). The owner wants ONE MASTER for tax rates synced into the other systems; that is a separate feature (bead tax-rate master), so P2 stays unknown and IMS shadows.',
+    note: 'Owner answer 2026-10-09: Xero is the MASTER for tax rates. P1: an operator maintains them by hand in Xero. P2: no component writes tax rates to Xero; IMS only reads them and syncs onward, so nobody is the writer and IMS shadows if asked. The IMS write path (generateMissingXeroTaxRates / provisioning) stays declared in the producer census until it is retired; its behaviour is unchanged here.',
   }),
   row('xero', 'fx-journal', { P1: 'nobody', P2: 'nobody' }, {
     obligationTime: 'not-applicable',
@@ -146,9 +146,9 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'required',
     note: 'IMS creates only orders paid from the live-from instant; it never creates an order the bridge created (the obligation time is the paid time).',
   }),
-  row('mintsoft', 'order.amend', { P1: 'woo-mintsoft-plugin', P2: 'unknown' }, {
+  row('mintsoft', 'order.amend', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'required',
-    note: 'Unresolved (still unanswered on 2026-10-09): whether IMS may amend an order the bridge created (decision D8 settles cancel and hold only). Unknown resolves to SHADOW until decided.',
+    note: 'Owner answer 2026-10-09: IMS amends orders in P2, including ones the bridge created (decision D8 separately settles cancel and hold).',
   }),
   row('mintsoft', 'order.cancel', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
@@ -235,17 +235,17 @@ export const WRITER_OWNERSHIP_MAP = [
     note: 'No webhooks are registered on the live store in P1; an operator registers them through IMS at P2.',
   }),
   // ---- Customer e-mail: mapped only (decision D7); enforcement stays the existing settings ---------------------
-  row('customer-email', 'despatch', { P1: 'woocommerce-native', P2: 'unknown' }, {
+  row('customer-email', 'despatch', { P1: 'woocommerce-native', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
-    note: 'Mapped only. Owner answer 2026-10-09: WooCommerce sends the despatch e-mail today (P1). Whether IMS sends it later is undecided (it depends on which other e-mails remain in WooCommerce and on matching their look and feel), so P2 stays unknown. Enforced by its existing setting, not by the producer hold.',
+    note: 'Mapped only. Owner answers 2026-10-09: WooCommerce sends the despatch e-mail today (P1); long term every customer e-mail comes from IMS (P2). Enforced by its existing setting, not by the producer hold.',
   }),
-  row('customer-email', 'order-confirmation', { P1: 'woocommerce-native', P2: 'unknown' }, {
+  row('customer-email', 'order-confirmation', { P1: 'woocommerce-native', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
-    note: 'Mapped only (as despatch): WooCommerce sends it in P1 (owner answer 2026-10-09); P2 undecided.',
+    note: 'Mapped only (as despatch): WooCommerce in P1, IMS in P2 (owner answers 2026-10-09).',
   }),
-  row('customer-email', 'invoice', { P1: 'woocommerce-native', P2: 'unknown' }, {
+  row('customer-email', 'invoice', { P1: 'woocommerce-native', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
-    note: 'Mapped only (as despatch): WooCommerce sends it in P1 (owner answer 2026-10-09); P2 undecided.',
+    note: 'Mapped only (as despatch): WooCommerce in P1, IMS in P2 (owner answers 2026-10-09).',
   }),
 ] as const satisfies readonly OwnershipRow[]
 

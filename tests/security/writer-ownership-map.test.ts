@@ -64,7 +64,7 @@ test('owner answers of 2026-10-08 are in the map', () => {
   assert.equal(owner('woocommerce.order.trackship-reconcile', 'P2'), 'woo-mintsoft-plugin')
   assert.equal(owner('mintsoft.product.upsert', 'P2'), 'IMS')
   assert.equal(owner('mintsoft.order.cancel', 'P2'), 'IMS')
-  assert.equal(owner('mintsoft.order.amend', 'P2'), 'unknown', 'amending a bridge-created order is not settled, so it stays in shadow')
+  assert.equal(owner('mintsoft.order.amend', 'P2'), 'IMS', 'owner answer 2026-10-09')
   assert.equal(owner('mintsoft.order.create', 'P2'), 'IMS')
 })
 
@@ -80,11 +80,11 @@ test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation
     ['xero.purchase.bill-payment', 'qoblex-native', 'IMS'],
     ['xero.purchase.bill-attachment', 'qoblex-native', 'IMS'],
     ['xero.purchase.supplier-credit', 'qoblex-native', 'IMS'],
-    ['customer-email.despatch', 'woocommerce-native', 'unknown'],
-    ['customer-email.order-confirmation', 'woocommerce-native', 'unknown'],
-    ['customer-email.invoice', 'woocommerce-native', 'unknown'],
-    ['xero.tax-rate', 'operator-manual', 'unknown'],
-    ['mintsoft.order.amend', 'woo-mintsoft-plugin', 'unknown'],
+    ['customer-email.despatch', 'woocommerce-native', 'IMS'],
+    ['customer-email.order-confirmation', 'woocommerce-native', 'IMS'],
+    ['customer-email.invoice', 'woocommerce-native', 'IMS'],
+    ['xero.tax-rate', 'operator-manual', 'nobody'],
+    ['mintsoft.order.amend', 'woo-mintsoft-plugin', 'IMS'],
   ]
   let checked = 0
   for (const [key, p1, p2] of rulings) {
@@ -97,8 +97,7 @@ test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation
   }
   console.log(`# rulings checked: ${checked}`)
   assert.equal(checked, 15)
-  // No unknown P1 owner is left anywhere: P1 is fully decided.
-  assert.equal(rows.filter((row) => row.owners.P1 === 'unknown').length, 0)
+  assert.equal(rows.filter((row) => row.owners.P1 === 'unknown' || row.owners.P2 === 'unknown').length, 0)
   // Each new owner kind is used (no dead kinds) and none appears at P2 (a new kind is an incumbent, never the end state).
   for (const kind of ['operator-manual', 'qoblex-native', 'aelia', 'woocommerce-native'] as const) {
     const users = rows.filter((row) => row.owners.P1 === kind || row.owners.P2 === kind)
@@ -108,19 +107,13 @@ test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation
   }
 })
 
-test('unknown owners are exactly the listed set (a change here is a decision, not an accident)', () => {
+test('unknown owners are exactly the listed set, now EMPTY (a change here is a decision, not an accident)', () => {
   const unknowns = rows
     .flatMap((row) => (['P1', 'P2'] as const).filter((phase) => row.owners[phase] === 'unknown').map((phase) => `${row.destination}.${row.operation}@${phase}`))
     .sort()
   console.log(`# unknown owners: ${unknowns.length}`)
-  assert.equal(unknowns.length, 5, 'five undecided operation-phases remain, all at P2')
-  assert.deepEqual(unknowns, [
-    'customer-email.despatch@P2',
-    'customer-email.invoice@P2',
-    'customer-email.order-confirmation@P2',
-    'mintsoft.order.amend@P2',
-    'xero.tax-rate@P2',
-  ])
+  assert.equal(unknowns.length, 0, 'every operation-phase has a decided owner; a new unknown needs a deliberate edit of this list')
+  assert.deepEqual(unknowns, [])
 })
 
 test('every AccountingSyncType member is in exactly one map row or an explicit exclusion; the exclusions only shrink', () => {

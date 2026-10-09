@@ -267,8 +267,8 @@ test('arm d: an operation IMS does not own is SHADOW even when fully granted and
   const unmapped = explainProducerDisposition('xero', 'no-such-operation' as never, undefined, { env, now: NOW })
   assert.equal(unmapped.reason, 'owner_unknown')
   const tax = explainProducerDisposition('xero', 'tax-rate', undefined, { env, now: NOW })
-  assert.equal(tax.owner, 'unknown')
-  assert.equal(tax.reason, 'owner_unknown')
+  assert.equal(tax.owner, 'nobody', 'Xero is the tax-rate master: no writer at P2')
+  assert.equal(tax.reason, 'not_ims_owned')
   // Isolating arm: the same environment IS live for an IMS-owned operation.
   assert.equal(call('xero', 'purchase.bill', LATE, env), 'LIVE')
 })
