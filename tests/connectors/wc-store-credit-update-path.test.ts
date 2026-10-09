@@ -4,18 +4,17 @@ import test, { mock } from 'node:test'
 import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 
 /**
- * An order IMS already holds is re-read on every webhook redelivery and poll, and `updateExistingWcOrderFromPayload`
- * used to return before any coupon was classified. An order imported before store credit was recorded separately
- * (credit stored as a discount, `storeCreditForeign` 0) would therefore sail through the invoice refusal.
- *
- * Owner ruling: no retrospective data fixes. So the update path only RECORDS the credit while the stored credit is
- * zero (which makes the poster refuse the invoice / credit note / payment) and says so; it never restates the discount.
+ * Store credit is NEVER recorded after an order is created. `storeCreditForeign` and the discount are set once, by
+ * the credit-aware import. A later delivery (webhook redelivery, poll) is re-classified and compared with the row:
+ * credit, or a conflict about credit, that the row does not account for puts the order in REVIEW_REQUIRED, which
+ * every posting boundary and the warehouse push refuse. Nothing is restated and no credit is written.
  */
 
+type Stored = { storeCreditForeign: string; storeCreditAssessment: 'ASSESSED' | 'REVIEW_REQUIRED' | null }
 const state = {
-  stored: { storeCreditForeign: '0.0000' } as { storeCreditForeign: unknown } | null,
+  stored: { storeCreditForeign: '0.0000', storeCreditAssessment: null } as Stored | null,
   reads: 0,
-  updates: [] as Array<Record<string, unknown>>,
+  writes: [] as Array<Record<string, unknown>>,
   statements: [] as string[],
   activity: [] as Array<Record<string, unknown>>,
 }
@@ -24,17 +23,17 @@ const tx = {
   $queryRaw: async (sql: { sql?: string; strings?: string[] }) => { state.statements.push(`LOCK ${(sql.sql ?? sql.strings?.join('?') ?? '').replace(/\s+/g, ' ').trim()}`); return [] },
   shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
   salesOrder: {
-    // The conditional write: honours `storeCreditForeign: 0`, like the database would.
-    updateMany: async ({ where, data }: { where: { storeCreditForeign?: number }; data: Record<string, unknown> }) => {
-      state.statements.push('CONDITIONAL credit write')
-      state.reads += 1
-      const stored = Number(state.stored?.storeCreditForeign ?? 0)
-      if (where.storeCreditForeign !== undefined && stored !== where.storeCreditForeign) return { count: 0 }
-      state.updates.push(data)
-      if (state.stored) state.stored.storeCreditForeign = String(data.storeCreditForeign)
+    findUnique: async () => { state.reads += 1; return state.stored ? { ...state.stored } : null },
+    // Honours the OR on the current assessment, like the database: REVIEW_REQUIRED never matches again.
+    updateMany: async ({ where, data }: { where: { OR: Array<{ storeCreditAssessment: string | null }> }; data: Record<string, unknown> }) => {
+      state.statements.push('CONDITIONAL review write')
+      const current = state.stored?.storeCreditAssessment ?? null
+      if (!where.OR.some((c) => c.storeCreditAssessment === current)) return { count: 0 }
+      state.writes.push(data)
+      if (state.stored) state.stored.storeCreditAssessment = data.storeCreditAssessment as Stored['storeCreditAssessment']
       return { count: 1 }
     },
-    update: async ({ data }: { data: Record<string, unknown> }) => { state.updates.push(data); return {} },
+    update: async ({ data }: { data: Record<string, unknown> }) => { state.writes.push(data); return {} },
   },
 }
 mock.module('@/lib/db', { namedExports: { db: { $transaction: async (fn: (t: unknown) => Promise<unknown>) => fn(tx) } } })
@@ -48,13 +47,15 @@ function order(coupons: WcFullOrder['coupon_lines'], meta: WcFullOrder['meta_dat
     meta_data: meta, coupon_lines: coupons, line_items: [], shipping_lines: [], fee_lines: [],
   } as unknown as WcFullOrder
 }
-const credit = [{ id: 1, code: 'sc', discount: '10.00', discount_tax: '2.00', meta_data: [{ id: 9, key: 'coupon_info', value: '[1,"sc","smart_coupon","50"]' }] }] as unknown as WcFullOrder['coupon_lines']
-const percent = [{ id: 1, code: 'p', discount: '10.00', discount_tax: '2.00', meta_data: [{ id: 9, key: 'coupon_info', value: '[1,"p","percent","10"]' }] }] as unknown as WcFullOrder['coupon_lines']
+const info = (type: string) => [{ id: 9, key: 'coupon_info', value: `[1,"sc","${type}","50"]` }]
+const credit = (net = '10.00', tax = '2.00') => [{ id: 1, code: 'sc', discount: net, discount_tax: tax, meta_data: info('smart_coupon') }] as unknown as WcFullOrder['coupon_lines']
+const percent = [{ id: 1, code: 'p', discount: '10.00', discount_tax: '2.00', meta_data: info('percent') }] as unknown as WcFullOrder['coupon_lines']
+const conflict = [{ id: 1, code: 'sc', discount: '10.00', discount_tax: '0.00', meta_data: [...info('smart_coupon'), { id: 10, key: 'coupon_data', value: { discount_type: 'fixed_cart' } }] }] as unknown as WcFullOrder['coupon_lines']
 
 test.beforeEach(() => {
-  state.stored = { storeCreditForeign: '0.0000' }
+  state.stored = { storeCreditForeign: '0.0000', storeCreditAssessment: null }
   state.reads = 0
-  state.updates = []
+  state.writes = []
   state.statements = []
   state.activity = []
 })
@@ -67,58 +68,71 @@ function precondition(name: string, facts: Record<string, unknown>): void {
   // eslint-disable-next-line no-console
   console.log(`PRECONDITION ${name}: ${JSON.stringify(facts)}`)
 }
+const reviewEntries = () => state.activity.filter((a) => a.action === 'wc_store_credit_review_required')
+const creditWrites = () => state.writes.filter((w) => 'storeCreditForeign' in w || 'discountAmount' in w)
 
-test('a re-read order with store credit and a stored credit of 0 RECORDS the credit (gross) and says it was not restated', async () => {
-  await run(order(credit))
-  precondition('legacy credit order', { payloadCredit: 12, stored: 0, updates: state.updates.length })
-  assert.equal(state.updates.length, 2, 'precondition: the credit write and the order update both ran')
-  assert.equal(String(state.updates[0].storeCreditForeign), '12')
-  assert.ok(state.updates.every((u) => !('discountAmount' in u)), 'the discount is NOT restated')
-  assert.match(state.statements[0], /^LOCK SELECT id FROM "sales_orders"/, 'the order row lock is the FIRST statement')
-  assert.equal(state.statements[1], 'CONDITIONAL credit write')
-  const entry = state.activity.find((a) => a.action === 'wc_store_credit_recorded_on_update')
-  assert.ok(entry, 'an ERROR entry names it')
-  assert.equal(entry!.level, 'ERROR')
-  assert.match(String(entry!.description), /was NOT restated/)
+test('credit appears on an order the row does not account for (not assessed): REVIEW_REQUIRED, credit is NOT recorded, one ERROR entry', async () => {
+  await run(order(credit()))
+  precondition('unassessed order, credit in payload', { stored: state.stored, writes: state.writes.length, entries: reviewEntries().length })
+  assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
+  assert.equal(state.stored!.storeCreditForeign, '0.0000', 'the credit is never written after creation')
+  assert.equal(creditWrites().length, 0, 'and neither is the discount')
+  assert.match(state.statements[0], /^LOCK SELECT id FROM "sales_orders"/, 'the order row lock is taken first')
+  assert.equal(reviewEntries().length, 1)
+  assert.equal(reviewEntries()[0].level, 'ERROR')
+  assert.match(String(reviewEntries()[0].description), /HELD for store-credit review/)
 })
 
-test('an order whose credit is already recorded is left alone (the stored credit is never overwritten)', async () => {
-  state.stored = { storeCreditForeign: '12.0000' }
-  await run(order(credit))
-  precondition('already recorded', { stored: 12 })
-  assert.equal(state.reads, 1, 'precondition: the conditional write was attempted')
-  assert.ok(state.updates.every((u) => !('storeCreditForeign' in u)), 'and it matched nothing')
-  assert.equal(state.activity.length, 0)
+test('an ASSESSED order whose credit is unchanged is left alone', async () => {
+  state.stored = { storeCreditForeign: '12.0000', storeCreditAssessment: 'ASSESSED' }
+  await run(order(credit()))
+  precondition('assessed, same credit', { reads: state.reads })
+  assert.equal(state.reads, 1, 'precondition: the row was compared')
+  assert.equal(state.stored!.storeCreditAssessment, 'ASSESSED')
+  assert.equal(reviewEntries().length, 0)
 })
 
-test('an order with only a genuine coupon, or none, reads nothing and records nothing', async () => {
+test('an ASSESSED order whose credit CHANGED in WooCommerce is held for review', async () => {
+  state.stored = { storeCreditForeign: '12.0000', storeCreditAssessment: 'ASSESSED' }
+  await run(order(credit('20.00', '4.00')))
+  precondition('assessed, credit changed', { stored: 12, payload: 24 })
+  assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
+  assert.equal(state.stored!.storeCreditForeign, '12.0000')
+})
+
+test('a CONFLICT about credit on a later delivery holds the order, even with no credit amount', async () => {
+  state.stored = { storeCreditForeign: '0.0000', storeCreditAssessment: 'ASSESSED' }
+  await run(order(conflict))
+  precondition('conflict on update', { stored: state.stored })
+  assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
+})
+
+test('no credit and no conflict: nothing is read, nothing is written', async () => {
   await run(order(percent))
   await run(order([]))
-  precondition('no credit', { reads: state.reads, updates: state.updates.length })
-  assert.equal(state.updates.length, 2, 'precondition: both updates ran')
+  precondition('no credit', { reads: state.reads, reviewWrites: state.statements.filter((s) => s.startsWith('CONDITIONAL')).length })
+  assert.equal(state.writes.length, 2, 'precondition: both order updates ran')
   assert.equal(state.reads, 0)
-  assert.ok(state.updates.every((u) => !('storeCreditForeign' in u)))
+  assert.equal(state.stored!.storeCreditAssessment, null)
 })
 
 test('the credit is also found from the order-level contribution record', async () => {
   const lines = [{ id: 1, code: 'x', discount: '5.00', discount_tax: '0.00', meta_data: [] }] as unknown as WcFullOrder['coupon_lines']
   await run(order(lines, [{ id: 3, key: 'smart_coupons_contribution', value: { x: 5 } }] as unknown as WcFullOrder['meta_data']))
-  precondition('contribution', { updates: state.updates.length })
-  assert.equal(String(state.updates[0].storeCreditForeign), '5')
+  assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
 })
 
-test('TWO deliveries with different amounts: the first credit wins, the second writes nothing and logs nothing (repeated)', async () => {
+test('an order already in review is not written or logged again; two concurrent deliveries log once (repeated)', async () => {
+  state.stored = { storeCreditForeign: '0.0000', storeCreditAssessment: 'REVIEW_REQUIRED' }
+  await run(order(credit()))
+  assert.equal(reviewEntries().length, 0, 'already in review: nothing to say again')
   for (let round = 0; round < 40; round++) {
-    state.stored = { storeCreditForeign: '0.0000' }
-    state.updates = []
+    state.stored = { storeCreditForeign: '0.0000', storeCreditAssessment: null }
     state.activity = []
-    const small = [{ id: 1, code: 'sc', discount: '5.00', discount_tax: '0.00', meta_data: [{ id: 9, key: 'coupon_info', value: '[1,"sc","smart_coupon","50"]' }] }] as unknown as WcFullOrder['coupon_lines']
-    const deliveries = round % 2 ? [order(credit), order(small)] : [order(small), order(credit)]
-    await Promise.all(deliveries.map((d) => run(d)))
-    const creditWrites = state.updates.filter((u) => 'storeCreditForeign' in u)
-    assert.equal(creditWrites.length, 1, `round ${round}: exactly one delivery wrote the credit`)
-    assert.equal(state.activity.filter((a) => a.action === 'wc_store_credit_recorded_on_update').length, 1, `round ${round}: and only that one logged`)
-    assert.equal(String(state.stored!.storeCreditForeign), String(creditWrites[0].storeCreditForeign))
+    await Promise.all([run(order(credit())), run(order(credit('9.00', '1.00')))])
+    assert.equal(reviewEntries().length, 1, `round ${round}: exactly one delivery flagged and logged`)
+    assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
+    assert.equal(state.stored!.storeCreditForeign, '0.0000')
   }
   precondition('race', { rounds: 40 })
 })

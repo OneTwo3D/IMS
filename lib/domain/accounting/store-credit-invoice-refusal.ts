@@ -21,6 +21,9 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
+/** ActivityLog action written when a later delivery of an imported order puts it in store-credit review. */
+export const STORE_CREDIT_REVIEW_ACTION = 'wc_store_credit_review_required'
+
 /** ActivityLog action written by the importer when it queues the invoice for a store-credit order. */
 export const STORE_CREDIT_INVOICE_WITHHELD_ACTION = 'wc_store_credit_invoice_withheld'
 
@@ -39,11 +42,30 @@ export function orderCarriesStoreCredit(storeCreditForeign: unknown): boolean {
   }
 }
 
+/** Why posting is blocked: the order carries credit, or it is held for review because its coupons changed or conflict after import. */
+export type StoreCreditBlock = 'CREDIT' | 'REVIEW'
+
+/**
+ * Does store credit block posting for this order? REVIEW_REQUIRED (written when a later delivery shows credit,
+ * or a conflict about credit, that the stored row does not account for) blocks like credit does. Fails closed on
+ * an unreadable credit amount.
+ */
+export function storeCreditBlock(order: { storeCreditForeign?: unknown; storeCreditAssessment?: unknown }): StoreCreditBlock | null {
+  if (order.storeCreditAssessment === 'REVIEW_REQUIRED') return 'REVIEW'
+  return orderCarriesStoreCredit(order.storeCreditForeign) ? 'CREDIT' : null
+}
+
 /**
  * The reason a store-credit order's sales invoice is withheld. Describes the WITHHOLDING and why, never
  * a ledger fact: whether anything was sent is stated by the caller, who knows its stage.
  */
-export function storeCreditInvoiceRefusalReason(): string {
+export function storeCreditInvoiceRefusalReason(block: StoreCreditBlock = 'CREDIT'): string {
+  if (block === 'REVIEW') {
+    return withLedgerCheck('This order is held for store-credit review: after it was imported, WooCommerce reported store credit, or coupon '
+      + 'records that disagree about store credit, which the order as imported does not account for. IMS cannot tell how it '
+      + 'was paid, so it does not post a sales invoice, credit note or payment for it. If this order must be invoiced now, '
+      + 'first check the ledger for an invoice already raised for it, then raise it by hand with any store credit applied as a payment.')
+  }
   // Wrapped in the ledger check like every other operator text that tells someone to raise a document by hand.
   return withLedgerCheck('This order was paid in part with store credit. IMS records store credit as a PAYMENT, not a discount, '
     + 'so the sales invoice would be stated at the full goods value and the credit would have to be applied to '
@@ -54,8 +76,8 @@ export function storeCreditInvoiceRefusalReason(): string {
 }
 
 /** The poster's error: the refusal happens before any request is built, so "nothing was sent" is true. */
-export function storeCreditInvoicePosterError(): string {
-  return `NOTHING WAS SENT. ${storeCreditInvoiceRefusalReason()}`
+export function storeCreditInvoicePosterError(block: StoreCreditBlock = 'CREDIT'): string {
+  return `NOTHING WAS SENT. ${storeCreditInvoiceRefusalReason(block)}`
 }
 
 /**
@@ -63,8 +85,8 @@ export function storeCreditInvoicePosterError(): string {
  * invoice IMS has not posted, so it is refused for the same reason and from the same fact. Describes the
  * withholding only; "nothing was sent" holds because the refusal is taken before any request is built.
  */
-export function storeCreditCreditNotePosterError(): string {
-  return withLedgerCheck('NOTHING WAS SENT. This refund belongs to an order paid in part with store credit. IMS does not '
+export function storeCreditCreditNotePosterError(block: StoreCreditBlock = 'CREDIT'): string {
+  return withLedgerCheck(`NOTHING WAS SENT. This refund belongs to an order ${block === 'REVIEW' ? 'held for store-credit review' : 'paid in part with store credit'}. IMS does not `
     + 'post a sales invoice for such an order yet (store credit is a payment that has to be applied to the '
     + 'invoice against the 813 or 816 liability account, and that posting is not built), so it does not post '
     + 'a credit note for it either. If the order was invoiced by hand, check the ledger first, then raise '
@@ -77,8 +99,8 @@ export function storeCreditCreditNotePosterError(): string {
  * revived or manually queued entry cannot reach the remote call. The refusal is taken before any request is
  * built, so "nothing was sent" is true.
  */
-export function storeCreditFollowUpPosterError(what: 'payment registration' | 'invoice email' | 'WooCommerce invoice note'): string {
-  return `NOTHING WAS SENT. This ${what} belongs to an order paid in part with store credit. ${storeCreditInvoiceRefusalReason()}`
+export function storeCreditFollowUpPosterError(what: 'payment registration' | 'invoice email' | 'WooCommerce invoice note', block: StoreCreditBlock = 'CREDIT'): string {
+  return `NOTHING WAS SENT. This ${what} belongs to an order ${block === 'REVIEW' ? 'held for store-credit review' : 'paid in part with store credit'}. ${storeCreditInvoiceRefusalReason(block)}`
 }
 
 /** The importer's entry, written when the invoice is queued: it says what WILL happen, not what has. */

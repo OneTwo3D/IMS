@@ -34,8 +34,8 @@ function candidate(overrides: Partial<WmsPushCandidate> = {}): WmsPushCandidate 
     pricesIncludeVat: false,
     discountAmount: 0,
     storeCreditForeign: 30,
-    // Stamped by the importer in the write that computes discountAmount: proves the discount holds no credit.
-    discountModel: 'LINE_ALLOCATED',
+    // Written only by the credit-aware import's creating write: the discount is proven credit-free.
+    storeCreditAssessment: 'ASSESSED',
     totalForeign: 90,
     shipFromWarehouseId: 'wh-1',
     pushAttempts: 0,
@@ -126,9 +126,9 @@ test('the Mintsoft payload carries no credit/payment field: the credit settles t
   assert.deepEqual(keys.filter((k) => /credit|paid|payment/i.test(k)), [])
 })
 
-test('WITHHELD: a credit order whose discount is not proven credit-free (recorded on update) is parked, never pushed', async () => {
-  const { pushed, upserts, validationFailures } = await sweep(candidate({ discountModel: null, discountAmount: 12 }))
-  precondition('legacy credit order', { storeCreditForeign: 30, discountModel: null, discountAmount: 12, pushed: pushed.length, parked: validationFailures.length })
+test('WITHHELD: a credit order that is not provably credit-free (not created by the credit-aware import) is parked, never pushed', async () => {
+  const { pushed, upserts, validationFailures } = await sweep(candidate({ storeCreditAssessment: null, discountAmount: 12 }))
+  precondition('unassessed credit order', { storeCreditForeign: 30, storeCreditAssessment: null, discountAmount: 12, pushed: pushed.length, parked: validationFailures.length })
   assert.equal(pushed.length, 0, 'nothing is sent to the warehouse')
   assert.equal(upserts.length, 0, 'and no push link is claimed')
   assert.equal(validationFailures.length, 1, 'precondition: the order was reached and parked with a reason the operator sees')
@@ -136,14 +136,16 @@ test('WITHHELD: a credit order whose discount is not proven credit-free (recorde
   assert.match(validationFailures[0].error, /nothing was sent\./)
 })
 
-test('WITHHELD matrix: only a provably credit-free discount (or no credit) is pushed', async () => {
+test('WITHHELD matrix: only an ASSESSED credit order (or an order with no credit that is not in review) is pushed', async () => {
   const cases: Array<[string, Partial<WmsPushCandidate>, boolean]> = [
-    ['credit, LINE_ALLOCATED', { storeCreditForeign: 30, discountModel: 'LINE_ALLOCATED' }, true],
-    ['credit, model null', { storeCreditForeign: 30, discountModel: null }, false],
-    ['credit, model other', { storeCreditForeign: 30, discountModel: 'SOMETHING_ELSE' }, false],
-    ['credit unreadable', { storeCreditForeign: 'garbage', discountModel: null }, false],
-    ['no credit, model null (control)', { storeCreditForeign: 0, discountModel: null, totalForeign: 120 }, true],
-    ['credit field absent (control)', { storeCreditForeign: undefined, discountModel: null, totalForeign: 120 }, true],
+    ['credit, ASSESSED', { storeCreditForeign: 30, storeCreditAssessment: 'ASSESSED' }, true],
+    ['credit, not assessed (legacy NULL)', { storeCreditForeign: 30, storeCreditAssessment: null }, false],
+    ['credit, REVIEW_REQUIRED', { storeCreditForeign: 30, storeCreditAssessment: 'REVIEW_REQUIRED' }, false],
+    ['NO credit, REVIEW_REQUIRED (credit appeared / conflict on update)', { storeCreditForeign: 0, storeCreditAssessment: 'REVIEW_REQUIRED', totalForeign: 120 }, false],
+    ['credit unreadable', { storeCreditForeign: 'garbage', storeCreditAssessment: 'ASSESSED' }, false],
+    ['no credit, ASSESSED (control)', { storeCreditForeign: 0, storeCreditAssessment: 'ASSESSED', totalForeign: 120 }, true],
+    ['no credit, NULL (control)', { storeCreditForeign: 0, storeCreditAssessment: null, totalForeign: 120 }, true],
+    ['credit field absent (control)', { storeCreditForeign: undefined, storeCreditAssessment: null, totalForeign: 120 }, true],
   ]
   const rows: string[] = []
   for (const [name, over, expectPushed] of cases) {
@@ -152,5 +154,5 @@ test('WITHHELD matrix: only a provably credit-free discount (or no credit) is pu
     assert.equal(r.pushed.length === 1, expectPushed, name)
   }
   // eslint-disable-next-line no-console
-  console.log(`PRECONDITION push withhold matrix: ${rows.join(' | ')}`)
+  console.log(`PRECONDITION push withhold matrix:\n  ${rows.join('\n  ')}`)
 })

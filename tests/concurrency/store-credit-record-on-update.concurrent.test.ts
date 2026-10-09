@@ -5,10 +5,11 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 /**
- * Two deliveries of the same WooCommerce order (a webhook and a poll, or two webhooks) reach
- * `updateExistingWcOrderFromPayload` together, each carrying a DIFFERENT store-credit amount for an order IMS
- * holds with a stored credit of 0. Exactly one may record its credit and log; the other must neither overwrite
- * it nor log. Repeated, because a race that passes once proves little.
+ * Store credit is never recorded after creation. A later delivery that shows credit the stored row does not
+ * account for puts the order in REVIEW_REQUIRED. Two deliveries of the same WooCommerce order (a webhook and a
+ * poll, or two webhooks), carrying DIFFERENT credit amounts, reach `updateExistingWcOrderFromPayload` together
+ * for an order IMS holds with no assessment: exactly one may flag and log, the credit column must stay 0, and
+ * the order must end in REVIEW_REQUIRED. Repeated, because a race that passes once proves little.
  */
 
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
@@ -32,7 +33,7 @@ function payload(externalId: number, creditNet: string) {
 }
 
 test(
-  '[store credit] two concurrent deliveries with different credit amounts: one records, none overwrites, one entry',
+  '[store credit] two concurrent deliveries with different credit amounts: one flags the order for review, one entry, no credit written',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const db = await loadDb()
@@ -56,13 +57,14 @@ test(
       const b = payload(externalId, '9.00')
       await Promise.all(round % 2 ? [updateExistingWcOrderFromPayload(id, a as never), updateExistingWcOrderFromPayload(id, b as never)]
         : [updateExistingWcOrderFromPayload(id, b as never), updateExistingWcOrderFromPayload(id, a as never)])
-      const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { storeCreditForeign: true } })
-      const entries = await db.activityLog.count({ where: { entityId: id, action: 'wc_store_credit_recorded_on_update' } })
-      seen.add(row.storeCreditForeign.toString())
-      assert.ok(['5', '9'].includes(row.storeCreditForeign.toString()), `round ${round}: the stored credit is one delivery's amount, got ${row.storeCreditForeign}`)
+      const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { storeCreditForeign: true, storeCreditAssessment: true } })
+      const entries = await db.activityLog.count({ where: { entityId: id, action: 'wc_store_credit_review_required' } })
+      assert.equal(row.storeCreditAssessment, 'REVIEW_REQUIRED', `round ${round}: the order ends in review`)
+      assert.equal(row.storeCreditForeign.toString(), '0', `round ${round}: no credit is ever written after creation`)
       assert.equal(entries, 1, `round ${round}: exactly one delivery logged`)
+      seen.add(`${round % 2}`)
     }
     // eslint-disable-next-line no-console
-    console.log(`PRECONDITION store-credit race: ${ROUNDS} rounds, winners seen: ${[...seen].join(',')}`)
+    console.log(`PRECONDITION store-credit race: ${ROUNDS} rounds, delivery orders seen: ${[...seen].join(',')}`)
   },
 )

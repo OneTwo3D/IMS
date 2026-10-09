@@ -348,8 +348,8 @@ type OrderForPush = {
   discountAmount: unknown
   /** Store credit, GROSS: a payment, so it is in the order total's gap but never in the pushed discount. */
   storeCreditForeign?: unknown
-  /** Stamped by the importer in the write that computes `discountAmount`; proves it holds no store credit. */
-  discountModel?: unknown
+  /** ASSESSED only from the credit-aware import's creating write; REVIEW_REQUIRED holds the push. */
+  storeCreditAssessment?: unknown
   totalForeign: unknown
   lines: CandidateLine[]
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
@@ -473,7 +473,7 @@ const ORDER_PUSH_SELECT = {
   pricesIncludeVat: true,
   discountAmount: true,
   storeCreditForeign: true,
-  discountModel: true,
+  storeCreditAssessment: true,
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },

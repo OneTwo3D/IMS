@@ -9,3 +9,9 @@
 -- recorded), and the application is not live against a production database yet, so there is nothing to
 -- backfill. A constant default is a metadata-only change on PostgreSQL 11+: no table rewrite.
 ALTER TABLE "sales_orders" ADD COLUMN "storeCreditForeign" DECIMAL(18,4) NOT NULL DEFAULT 0;
+
+-- Provenance / review marker (see SalesOrder.storeCreditAssessment). Nullable with no default: NULL means "not
+-- assessed", which every reader treats as unproven wherever store credit is present. No backfill (the application
+-- is not live against a production database yet), and an additive nullable column is metadata-only.
+CREATE TYPE "StoreCreditAssessment" AS ENUM ('ASSESSED', 'REVIEW_REQUIRED');
+ALTER TABLE "sales_orders" ADD COLUMN "storeCreditAssessment" "StoreCreditAssessment";

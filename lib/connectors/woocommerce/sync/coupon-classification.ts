@@ -30,7 +30,7 @@
 
 import { addMoney, currencyMinorUnits, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
-import type { WcCouponLine, WcMeta } from './types'
+import type { WcCouponLine, WcFullOrder, WcMeta } from './types'
 
 /** The discount types that are GENUINE discounts: Woo has already reduced the line totals by them. */
 export const WC_GENUINE_DISCOUNT_TYPES: ReadonlySet<string> = new Set([
@@ -376,4 +376,36 @@ export function checkWcStoreCreditReconciles(input: {
   // reduced goods value. An order that is genuinely a minor unit out is refused for an operator to look at.
   const tolerance = toDecimal(10).pow(-currencyMinorUnits(input.currency)).div(4)
   return difference.abs().lt(tolerance) ? { ok: true } : { ok: false, difference, tolerance }
+}
+
+/**
+ * The amounts WooCommerce itself reports for the order, summed from its OWN line fields (line totals, fee
+ * totals, shipping totals and their tax), not from IMS's reconstruction. IMS rebuilds a line as
+ * `quantity x unit price` where the unit price is `subtotal / quantity` rounded to six decimals, so a
+ * high-quantity line carries a rounding error that is IMS's, not WooCommerce's. The store-credit
+ * reconciliation is a statement about WooCommerce's arithmetic, so it uses WooCommerce's figures.
+ */
+export function wcReportedOrderAmounts(order: Pick<WcFullOrder, 'line_items' | 'fee_lines' | 'shipping_lines'>): {
+  goodsNet: Decimal
+  tax: Decimal
+  shipping: Decimal
+} {
+  const zero = toDecimal(0)
+  const money = (v: unknown): Decimal => parseMoney(v) ?? zero
+  let goodsNet = zero
+  let tax = zero
+  let shipping = zero
+  for (const l of order.line_items ?? []) {
+    goodsNet = addMoney(goodsNet, money(l.total))
+    tax = addMoney(tax, money(l.total_tax))
+  }
+  for (const f of order.fee_lines ?? []) {
+    goodsNet = addMoney(goodsNet, money(f.total))
+    tax = addMoney(tax, money(f.total_tax))
+  }
+  for (const sh of order.shipping_lines ?? []) {
+    shipping = addMoney(shipping, money(sh.total))
+    tax = addMoney(tax, money(sh.total_tax))
+  }
+  return { goodsNet, tax, shipping }
 }

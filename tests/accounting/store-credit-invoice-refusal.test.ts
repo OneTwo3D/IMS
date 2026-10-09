@@ -18,8 +18,8 @@ import {
  * poster's own guard, so it covers every producer (import, held release, manual re-queue, update).
  */
 
-type Row = { customerId: string | null; status: string; storeCreditForeign: unknown }
-const state: { row: Row | null; refundRow: { order: { storeCreditForeign: unknown } } | null | 'throw'; retired: number } = {
+type Row = { customerId: string | null; status: string; storeCreditForeign: unknown; storeCreditAssessment?: unknown }
+const state: { row: Row | null; refundRow: { order: { storeCreditForeign: unknown; storeCreditAssessment?: unknown } } | null | 'throw'; retired: number } = {
   row: null, refundRow: null, retired: 0,
 }
 
@@ -78,6 +78,21 @@ test('an order that carries store credit is REFUSED before posting, as an ordina
   assert.equal(result.post === false && result.result.success, false, 'a failure the row shows, not a skip')
   assert.equal(result.post === false && result.result.error, storeCreditInvoicePosterError(), 'the single-sourced text')
   assert.equal(state.retired, 0, 'it does not retire the row: the posting is still owed')
+})
+
+test('an order HELD FOR REVIEW (credit appeared / conflict after import) is refused even with a stored credit of 0, with its own text', async () => {
+  const { guardCancelledSalesOrderInvoice, guardStoreCreditCreditNote } = await processor()
+  state.row = { customerId: 'cust-1', status: 'PROCESSING', storeCreditForeign: '0.0000', storeCreditAssessment: 'REVIEW_REQUIRED' }
+  const result = await guardCancelledSalesOrderInvoice(ATTEMPT, 'SalesOrder', 'order-1', HELD)
+  precondition('review order', { storeCreditForeign: '0.0000', storeCreditAssessment: 'REVIEW_REQUIRED' })
+  assert.equal(result.post, false)
+  assert.equal(result.post === false && result.result.error, storeCreditInvoicePosterError('REVIEW'))
+  assert.match(storeCreditInvoicePosterError('REVIEW'), /held for store-credit review/)
+  state.refundRow = { order: { storeCreditForeign: '0.0000', storeCreditAssessment: 'REVIEW_REQUIRED' } }
+  assert.equal((await guardStoreCreditCreditNote('SalesOrderRefund', 'refund-1'))?.error, storeCreditCreditNotePosterError('REVIEW'))
+  // ASSESSED with no credit is the ordinary order: it posts.
+  state.row = { customerId: 'cust-1', status: 'PROCESSING', storeCreditForeign: '0.0000', storeCreditAssessment: 'ASSESSED' }
+  assert.equal((await guardCancelledSalesOrderInvoice(ATTEMPT, 'SalesOrder', 'order-1', HELD)).post, true)
 })
 
 test('a CANCELLED credit order is still just retired (cancellation wins over the refusal)', async () => {

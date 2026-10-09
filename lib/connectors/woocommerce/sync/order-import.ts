@@ -15,8 +15,8 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
-import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons } from './coupon-classification'
-import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, storeCreditInvoiceQueuedNotice } from '@/lib/domain/accounting/store-credit-invoice-refusal'
+import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts } from './coupon-classification'
+import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, STORE_CREDIT_REVIEW_ACTION, storeCreditInvoiceQueuedNotice } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
 import {
   buildHeldSalesInvoicePayload,
@@ -781,26 +781,36 @@ export async function updateExistingWcOrderFromPayload(
   orderId: string,
   wcOrder: WcFullOrder,
 ): Promise<void> {
-  // STORE CREDIT ON AN ORDER IMS ALREADY HOLDS. This path never classifies coupons, so an order imported
-  // before credit was recorded separately (credit stored as a discount, `storeCreditForeign` 0) would
-  // otherwise sail through the invoice refusal. Classified here from the payload, and recorded ONLY while
-  // the stored credit is zero: that makes the poster refuse its invoice and credit note and the push-time
-  // total check expect it, and withholds the warehouse push (its discount may still contain the credit). Nothing is restated (no retrospective data fixes): `discountAmount` is left as
-  // it was and the ERROR entry below says so.
-  const payloadCredit = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data).creditGross
-  let legacyCreditRecorded = false
+  // STORE CREDIT ON AN ORDER IMS ALREADY HOLDS is NEVER recorded after creation: `storeCreditForeign` and the
+  // discount are set once, by the credit-aware import, from one classification. A later delivery is
+  // re-classified and compared with what the row holds; if the payload shows credit, or a conflict about
+  // credit, that the row does not account for (an order older than the credit-aware import, a coupon changed
+  // in WooCommerce after import), the order is put in REVIEW_REQUIRED, which every posting boundary and the
+  // warehouse push refuse. Nothing is restated.
+  const reclassified = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data)
+  const payloadCredit = reclassified.creditGross
+  const payloadHasCreditConflict = reclassified.lines.some((l) => l.creditConflict)
+  let reviewFlagged = false
   await db.$transaction(async (tx) => {
-    // The order's row lock first, and a CONDITIONAL write: two deliveries of the same order (a webhook and a
-    // poll, or two webhooks) with different amounts must not overwrite a credit one of them already recorded.
-    // `WHERE storeCreditForeign = 0` makes the write itself the arbiter, and the entry below is written only
-    // by the delivery that actually wrote.
-    if (payloadCredit.gt(0)) {
-      await lockSalesOrder(tx, orderId)
-      const recorded = await tx.salesOrder.updateMany({
-        where: { id: orderId, storeCreditForeign: 0 },
-        data: { storeCreditForeign: roundQuantity(payloadCredit, 4) },
+    if (payloadCredit.gt(0) || payloadHasCreditConflict) {
+      const stored = await tx.salesOrder.findUnique({
+        where: { id: orderId },
+        select: { storeCreditForeign: true, storeCreditAssessment: true },
       })
-      legacyCreditRecorded = recorded.count === 1
+      const accountedFor = stored !== null
+        && stored.storeCreditAssessment === 'ASSESSED'
+        && !payloadHasCreditConflict
+        && roundQuantity(payloadCredit, 4).eq(toDecimal(stored.storeCreditForeign))
+      if (stored && !accountedFor && stored.storeCreditAssessment !== 'REVIEW_REQUIRED') {
+        // The order row lock first, then a CONDITIONAL write that only ever moves to REVIEW_REQUIRED: idempotent,
+        // so concurrent deliveries agree, and only the one that wrote logs.
+        await lockSalesOrder(tx, orderId)
+        const flagged = await tx.salesOrder.updateMany({
+          where: { id: orderId, OR: [{ storeCreditAssessment: null }, { storeCreditAssessment: 'ASSESSED' }] },
+          data: { storeCreditAssessment: 'REVIEW_REQUIRED' },
+        })
+        reviewFlagged = flagged.count === 1
+      }
     }
     await tx.shoppingOrderLink.updateMany({
       where: {
@@ -841,17 +851,17 @@ export async function updateExistingWcOrderFromPayload(
     })
   })
 
-  if (legacyCreditRecorded) {
+  if (reviewFlagged) {
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
-      action: 'wc_store_credit_recorded_on_update',
+      action: STORE_CREDIT_REVIEW_ACTION,
       tag: 'sync',
       level: 'ERROR',
-      description: `WooCommerce order ${wcOrder.number} carries store credit but was imported before IMS recorded it separately. `
-        + 'The credit is now recorded on the order, so IMS will not post a sales invoice or credit note for it. '
-        + 'The order was NOT restated: its discount may still include the credit, and the warehouse may already hold the order with that discount.',
-      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number },
+      description: `WooCommerce order ${wcOrder.number} now shows ${payloadHasCreditConflict ? 'coupon records that disagree about store credit' : 'store credit'} `
+        + 'that the order as imported does not account for. The order is HELD for store-credit review: IMS posts no sales invoice, credit '
+        + 'note or payment for it and does not push it to the warehouse until an operator resolves it. Nothing was restated.',
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number, payloadCreditForeign: payloadCredit.toNumber(), conflict: payloadHasCreditConflict },
     })
   }
 
@@ -2134,10 +2144,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // before tax" mode reduces the lines too, or the order carries an amount nobody modelled), counting
     // the credit as a payment would take it off twice, so the order is refused rather than guessed at.
     if (storeCreditForeign.gt(0)) {
+      // Against WooCommerce's OWN line, fee and shipping figures, not IMS's reconstruction (quantity x a unit price
+      // rounded to six decimals), which carries a rounding error of its own on high-quantity lines.
+      const reported = wcReportedOrderAmounts(wcOrder)
       const reconciled = checkWcStoreCreditReconciles({
-        subtotalForeign,
-        taxForeign,
-        shippingForeign: toDecimal(shippingForeign),
+        subtotalForeign: reported.goodsNet,
+        taxForeign: reported.tax,
+        shippingForeign: reported.shipping,
         orderLevelDiscountForeign: toDecimal(orderLevelDiscountForeign),
         storeCreditForeign,
         orderTotalForeign: totalForeign,
@@ -2325,6 +2338,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           discountAmount: orderLevelDiscountForeign,
           // Store credit is a PAYMENT: kept out of discountAmount above and recorded here, gross.
           storeCreditForeign,
+          // Written ONLY here, in the creating write: the coupons of this order were classified and the credit and
+          // the discount set from that. Never changed afterwards (a later delivery that disagrees sets REVIEW_REQUIRED).
+          storeCreditAssessment: 'ASSESSED',
           // o3d-9te: say WHICH meaning the amount above carries, in the same write that
           // computes it. Without this the only evidence of import provenance is a
           // timestamp, and this row's `createdAt` is BACKDATED to the Woo order date by

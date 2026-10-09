@@ -6,6 +6,7 @@ import {
   classifyWcCouponLines,
   describeWcCouponRefusal,
   planWcOrderCoupons,
+  wcReportedOrderAmounts,
   type WcCouponPlan,
 } from '@/lib/connectors/woocommerce/sync/coupon-classification'
 import { mapWcOrderDiscount, resolveWcOrderLevelDiscount } from '@/lib/connectors/woocommerce/sync/field-mapping'
@@ -310,6 +311,9 @@ test('importWcOrder: classifies before it writes, refuses before the create, and
   assert.match(body, /_registerPayment: !!wcOrder\.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit/)
   assert.match(body, /totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit/)
   assert.match(body, /action: STORE_CREDIT_INVOICE_WITHHELD_ACTION/)
+  assert.match(body, /subtotalForeign: reported\.goodsNet,\s*taxForeign: reported\.tax,\s*shippingForeign: reported\.shipping,/, 'the reconciliation is fed WooCommerce\'s own reported amounts')
+  assert.match(body, /storeCreditAssessment: 'ASSESSED',/, 'the creating write is the only place the credit-aware provenance is written')
+  assert.equal((body.match(/storeCreditAssessment: 'ASSESSED'/g) ?? []).length, 1, 'and it is written exactly once in the importer')
 })
 
 // ---------------------------------------------------------------------------------------------------
@@ -344,4 +348,33 @@ test('MANY LINES: the same honest order a whole penny out is REFUSED for operato
     currency: 'GBP',
   })
   assert.equal(result.ok, false)
+})
+
+// ---------------------------------------------------------------------------------------------------
+// The reconciliation uses WooCommerce's OWN line figures, not IMS's reconstruction (Codex round 3).
+// ---------------------------------------------------------------------------------------------------
+
+test('HIGH-QUANTITY lines: Woo\'s own totals reconcile, IMS\'s 6dp unit-price reconstruction does not (so the reported figures are the right ones)', () => {
+  // Three lines of quantity 997. Woo: subtotal/total are exact 2dp amounts. IMS rebuilds unit = subtotal / 997
+  // rounded to six decimals, so qty x unit differs from Woo's line total by up to 997 x 0.0000005 = 0.0005 per line.
+  const lines = [
+    { subtotal: '123.45', tax: '24.69' },
+    { subtotal: '77.77', tax: '15.55' },
+    { subtotal: '901.01', tax: '180.20' },
+  ]
+  const order = {
+    line_items: lines.map((l) => ({ total: l.subtotal, total_tax: l.tax, subtotal: l.subtotal, quantity: 997 })),
+    fee_lines: [], shipping_lines: [],
+  } as unknown as Parameters<typeof wcReportedOrderAmounts>[0]
+  const reported = wcReportedOrderAmounts(order)
+  const rebuilt = lines.reduce((sum, l) => sum.add(toDecimal(997).mul(toDecimal(toDecimal(l.subtotal).div(997).toDecimalPlaces(6)))), toDecimal(0))
+  const goods = lines.reduce((s, l) => s.add(toDecimal(l.subtotal)), toDecimal(0))
+  const tax = lines.reduce((s, l) => s.add(toDecimal(l.tax)), toDecimal(0))
+  const credit = toDecimal(10)
+  const total = goods.add(tax).sub(credit)
+  const viaReported = checkWcStoreCreditReconciles({ subtotalForeign: reported.goodsNet, taxForeign: reported.tax, shippingForeign: reported.shipping, orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: credit, orderTotalForeign: total, currency: 'GBP' })
+  precondition('qty 997 x 3 lines', { wooGoods: num(goods), rebuiltGoods: num(rebuilt), rebuildError: num(rebuilt.sub(goods)), reportedGoods: num(reported.goodsNet), accepted: viaReported.ok })
+  assert.ok(!rebuilt.eq(goods), 'precondition: the 6dp reconstruction really does drift from Woo\'s figures')
+  assert.equal(num(reported.goodsNet), num(goods))
+  assert.deepEqual(viaReported, { ok: true })
 })

@@ -53,7 +53,7 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
-import { orderCarriesStoreCredit, storeCreditCreditNotePosterError, storeCreditFollowUpPosterError, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
+import { storeCreditBlock, type StoreCreditBlock, storeCreditCreditNotePosterError, storeCreditFollowUpPosterError, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
@@ -5029,14 +5029,14 @@ export async function guardCancelledSalesOrderInvoice(
   let outcome:
     | { kind: 'missing' }
     | { kind: 'cancelled' }
-    | { kind: 'storeCredit' }
+    | { kind: 'storeCredit'; block: StoreCreditBlock }
     | { kind: 'live'; customerId?: string }
   try {
     outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, referenceId)
       const so = await tx.salesOrder.findUnique({
         where: { id: referenceId },
-        select: { customerId: true, status: true, storeCreditForeign: true },
+        select: { customerId: true, status: true, storeCreditForeign: true, storeCreditAssessment: true },
       })
       if (!so) return { kind: 'missing' as const }
       if (so.status === 'CANCELLED') {
@@ -5051,7 +5051,8 @@ export async function guardCancelledSalesOrderInvoice(
       // the document rather than post one that exceeds what the customer was charged. Read from the
       // order itself, under the same lock, so it covers every producer (import, hold release, manual
       // re-queue, update) and not just payloads that happen to carry a marker.
-      if (orderCarriesStoreCredit(so.storeCreditForeign)) return { kind: 'storeCredit' as const }
+      const creditBlock = storeCreditBlock(so)
+      if (creditBlock) return { kind: 'storeCredit' as const, block: creditBlock }
       return { kind: 'live' as const, customerId: so.customerId ?? undefined }
     })
   } catch (error) {
@@ -5064,7 +5065,7 @@ export async function guardCancelledSalesOrderInvoice(
     return { post: false, result: { success: true, skipped: true } }
   }
   if (outcome.kind === 'storeCredit') {
-    return { post: false, result: { success: false, error: storeCreditInvoicePosterError() } }
+    return { post: false, result: { success: false, error: storeCreditInvoicePosterError(outcome.block) } }
   }
   return { post: true, customerId: outcome.customerId }
 }
@@ -5080,18 +5081,19 @@ export async function guardStoreCreditCreditNote(
   referenceId: string,
 ): Promise<EntryResult | null> {
   if (referenceType !== 'SalesOrderRefund') return null
-  let credit: unknown
+  let orderRow: { storeCreditForeign: unknown; storeCreditAssessment: unknown }
   try {
     const refund = await db.salesOrderRefund.findUnique({
       where: { id: referenceId },
-      select: { order: { select: { storeCreditForeign: true } } },
+      select: { order: { select: { storeCreditForeign: true, storeCreditAssessment: true } } },
     })
     if (!refund) return { success: false, error: `Refund ${referenceId} not found before posting its credit note` }
-    credit = refund.order.storeCreditForeign
+    orderRow = refund.order
   } catch (error) {
     return { success: false, error: `Could not read the order of refund ${referenceId} before posting its credit note: ${String(error)}` }
   }
-  return orderCarriesStoreCredit(credit) ? { success: false, error: storeCreditCreditNotePosterError() } : null
+  const block = storeCreditBlock(orderRow)
+  return block ? { success: false, error: storeCreditCreditNotePosterError(block) } : null
 }
 
 /**
@@ -5106,15 +5108,16 @@ export async function guardStoreCreditFollowUp(
   what: 'payment registration' | 'invoice email' | 'WooCommerce invoice note',
 ): Promise<EntryResult | null> {
   if (!orderId) return { success: false, error: `Missing order reference for the ${what}` }
-  let credit: unknown
+  let credit: { storeCreditForeign: unknown; storeCreditAssessment: unknown }
   try {
-    const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { storeCreditForeign: true } })
+    const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { storeCreditForeign: true, storeCreditAssessment: true } })
     if (!order) return { success: false, error: `Sales order ${orderId} not found before its ${what}` }
-    credit = order.storeCreditForeign
+    credit = order
   } catch (error) {
     return { success: false, error: `Could not read sales order ${orderId} before its ${what}: ${String(error)}` }
   }
-  return orderCarriesStoreCredit(credit) ? { success: false, error: storeCreditFollowUpPosterError(what) } : null
+  const block = storeCreditBlock(credit)
+  return block ? { success: false, error: storeCreditFollowUpPosterError(what, block) } : null
 }
 
 // o3d-k26m.5 round 4 added a SECOND `heldClaimWhere` here, with a note saying it was deliberately

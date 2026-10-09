@@ -132,6 +132,11 @@ enum OrderDiscountModel {
   LINE_ALLOCATED
 }
 
+enum StoreCreditAssessment {
+  ASSESSED
+  REVIEW_REQUIRED
+}
+
 enum ShipmentStatus {
   PENDING
   PICKING
@@ -1769,6 +1774,13 @@ model SalesOrder {
   // understated. Nonzero means no sales invoice is posted for the order until the 813/816 payment
   // posting exists (lib/domain/accounting/store-credit-invoice-refusal.ts).
   storeCreditForeign Decimal   @db.Decimal(18, 4) @default(0)
+  // Provenance and review of the store-credit treatment. ASSESSED is written ONLY by the credit-aware WooCommerce
+  // import, in the same write that creates the order, so it says "the coupons of this order were classified and
+  // storeCreditForeign / discountAmount were set from that classification". REVIEW_REQUIRED is written when a
+  // later delivery of the order shows credit (or a conflict about credit) that the stored row does not account
+  // for: every posting boundary and the warehouse push refuse it until an operator resolves it. NULL = not
+  // assessed (a row older than this column, a native order): fails CLOSED wherever store credit is present.
+  storeCreditAssessment StoreCreditAssessment?
   // o3d-9te: what discountAmount above MEANS, stamped in the same write that computes it.
   // NULL = not recorded (pre-column rows, native orders); see OrderDiscountModel.
   discountModel     OrderDiscountModel? @map("discount_model")

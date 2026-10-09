@@ -91,7 +91,7 @@ test('INVOICE_PAYMENT is refused before the capacity guard, whichever way it was
   assert.ok(region.indexOf('guardStoreCreditFollowUp(') < region.indexOf('moneyPostDateToSend('))
 })
 
-const state: { row: { storeCreditForeign: unknown } | null | 'throw' } = { row: null }
+const state: { row: { storeCreditForeign: unknown; storeCreditAssessment?: unknown } | null | 'throw' } = { row: null }
 mock.module('@/lib/db', {
   namedExports: {
     db: {
@@ -109,6 +109,7 @@ test('the follow-up guard: credit refuses, none passes, unreadable / missing / u
   const { guardStoreCreditFollowUp } = await import('@/lib/connectors/xero/sync-processor')
   const cases: Array<[string, typeof state.row, 'refused' | 'pass', RegExp | null]> = [
     ['credit', { storeCreditForeign: '12.0000' }, 'refused', /belongs to an order paid in part with store credit/],
+    ['held for review, credit 0', { storeCreditForeign: '0.0000', storeCreditAssessment: 'REVIEW_REQUIRED' }, 'refused', /held for store-credit review/],
     ['no credit (control)', { storeCreditForeign: '0.0000' }, 'pass', null],
     ['unreadable amount', { storeCreditForeign: 'garbage' }, 'refused', /store credit/],
     ['order missing', null, 'refused', /not found/],
@@ -123,6 +124,7 @@ test('the follow-up guard: credit refuses, none passes, unreadable / missing / u
       assert.equal(result ? 'refused' : 'pass', verdict, `${what} / ${name}`)
       if (text) assert.match(result?.error ?? '', text)
       if (name === 'credit') assert.equal(result?.error, storeCreditFollowUpPosterError(what), 'single-sourced text')
+      if (name.startsWith('held for review')) assert.equal(result?.error, storeCreditFollowUpPosterError(what, 'REVIEW'))
     }
   }
   assert.equal((await guardStoreCreditFollowUp(undefined, 'payment registration'))?.success, false, 'no order reference fails closed')
