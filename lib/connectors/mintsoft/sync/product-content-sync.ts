@@ -83,10 +83,13 @@ export function readContentSyncState(raw: unknown): ContentSyncState {
 export function projectContentForMintsoft(content: ProductContentSnapshot | null): MintsoftContentProjection {
   const projection: MintsoftContentProjection = {}
   if (!content) return projection
-  if (content.longDescription) projection.description = content.longDescription
-  if (content.shortDescription) projection.shortDescription = content.shortDescription
+  // `.trim() !== ''`, not truthiness: the hub normalises on the way in, but this is the last place before the wire and
+  // a whitespace-only value is as empty as ''.
+  const present = (value: string | null | undefined): value is string => typeof value === 'string' && value.trim() !== ''
+  if (present(content.longDescription)) projection.description = content.longDescription
+  if (present(content.shortDescription)) projection.shortDescription = content.shortDescription
   const primary = content.images[0]?.url
-  if (primary) projection.imageUrl = primary
+  if (present(primary)) projection.imageUrl = primary
   return projection
 }
 
@@ -134,9 +137,13 @@ export type ContentSyncInput = {
   connector: Pick<WmsConnector, 'updateProductContent'>
   /** Environment and clock for the disposition; defaults to the process. Tests pass their own. */
   context?: ProducerDecisionContext
+  /** Where the per-field state is kept; defaults to the product link row. Tests pass a recorder. */
+  saveState?: (linkId: string, state: ContentSyncState) => Promise<void>
+  /** Which fields are verified on the wire; defaults to the connector's own contract. */
+  wireContract?: Readonly<Record<MintsoftContentField, { verified: boolean }>>
 }
 
-async function saveState(linkId: string, state: ContentSyncState): Promise<void> {
+async function saveStateToLink(linkId: string, state: ContentSyncState): Promise<void> {
   await db.wmsProductLink.update({
     where: { id: linkId },
     data: { contentSyncState: state as unknown as Prisma.InputJsonValue },
@@ -161,7 +168,8 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
 
   const decision = explainProducerDisposition('mintsoft', 'product.content', undefined, input.context ?? {})
   const live = decision.disposition === 'LIVE' && typeof input.connector.updateProductContent === 'function'
-  const sendable = live ? changed.filter((field) => MINTSOFT_CONTENT_WIRE[field].verified) : []
+  const contract = input.wireContract ?? MINTSOFT_CONTENT_WIRE
+  const sendable = live ? changed.filter((field) => contract[field].verified) : []
   const toShadow = changed.filter((field) => !sendable.includes(field))
 
   let sentFields: MintsoftContentField[] = []
@@ -187,7 +195,7 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
   const heldFields = held ? sendable : []
   const newShadows = toShadow.filter((field) => state.shadowed[field] !== contentValueHash(projection[field]!))
   for (const field of newShadows) state.shadowed[field] = contentValueHash(projection[field]!)
-  if (sentFields.length > 0 || newShadows.length > 0) await saveState(input.link.id, state)
+  if (sentFields.length > 0 || newShadows.length > 0) await (input.saveState ?? saveStateToLink)(input.link.id, state)
 
   const why = PRODUCER_REASON_TEXT[decision.reason]
   const shadowDetail = live
