@@ -6,3 +6,5 @@ a9b95f858ff43001af527147f8812bbe70612ab7:tests/domain/accounting/accounting-even
 7a5e92d878a80bcd0e7f49e529d0342c9fd2ef76:tests/domain/accounting/accounting-event.test.ts:generic-api-key:41
 # o3d-6ldlj: a test variable named completionKey2 (an outbox idempotency key built from a fake order id), not a credential.
 90a3d71134be9aed3fcaefcedb599be0f48d5b32:tests/concurrency/wc-order-status-jobs.concurrent.test.ts:generic-api-key:1096
+# o3d-31qrv: a placeholder multi-line value in a re-run test fixture (armor-header-shaped words around fake text), not a key; the fixture no longer contains it.
+04e46121af939da1790ed5c05e26b5432ac6682c:tests/scripts/env-rewrite-preservation.test.ts:private-key:176

@@ -899,9 +899,66 @@ window — see *The database password is preserved, and a rotation waits for the
 
 The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: Enter keeps the pair already in `.env` (type `none`, or export `none`, to clear one -- a blank answer does not clear it), and an existing `INVOICE_PDF_STORAGE_DIR` is kept as is (it must be absolute; outside `/var/lib/one-two-inventory` it must already exist, be a real directory and be writable by the application account, or the run stops before `.env` is written).
 
-Prompts NOT preserved across a re-run: the WooCommerce, Xero and SMTP values, and the
-database host, port, name and user. Supply them again (or as environment variables) on an upgrade
-run, or the re-written `.env` will blank them.
+**What a re-run does to `.env`.** The file is rewritten, but nothing in it is discarded silently:
+
+* **Defaults come from the installed file** (Enter keeps them): the domain (from `NEXT_PUBLIC_APP_URL`), the
+  port, the WooCommerce store URL, consumer key, consumer secret and **webhook secret** (a fresh webhook secret
+  would break the signature check of every webhook WooCommerce is already sending), the Turnstile pair, and
+  `INVOICE_PDF_STORAGE_DIR`. Typing a value changes it. **Only the WooCommerce four and the Turnstile pair can be
+  cleared at the prompt**, by typing `none` (or exporting `none` for `--non-interactive`); a blank answer or blank
+  export keeps the existing value. The domain and port are required, so they have no clearing form. The upload
+  scanner settings (`FILE_SCAN_*`) and `INVOICE_PDF_STORAGE_DIR` are not prompted: the installer keeps what is in
+  the file, and you change them by editing `.env` and restarting the service.
+* **Only a short list of other settings is carried over, and only when the value looks like that setting.** A
+  key of the old file that the installer does not set itself is copied into a `# Kept from the previous .env`
+  block only if it is named on the list in `install.sh` (`ENV_PRESERVE_SHAPES`, one place) -- the non-secret
+  settings this guide tells you to add by hand: `TRUSTED_PROXY_IPS`, `TRUSTED_PROXY_CIDRS`,
+  `REQUIRE_TRUSTED_PROXY_CONFIG`, `BEHIND_PROXY`, `RATE_LIMIT_BACKEND`, `CSP_MODE`, `ALLOW_DATABASE_RESTORE`,
+  `ALLOW_DATABASE_RESTORE_UPLOAD`, `PREFLIGHT_DB_CONNECT`, the `XERO_*` tenant and write-window settings,
+  `WC_WRITES_LIVE_FROM`, `WC_WRITEBACK_ALLOWED_ORIGIN`, the `MINTSOFT_*` write and sweep settings, the
+  `OUTBOX_RETRY_*`, `CONNECTOR_FETCH_*`, `FRESH_AUTH_MAX_AGE_SECONDS`, `INVOICE_PDF_TOKEN_*` and
+  `DATABASE_RESTORE_MAX_FILE_BYTES` limits -- (exact, case-sensitive names) **and** its value has the shape that
+  setting can have -- the format the application itself parses that setting from: a switch (`1 true yes on 0 false no off`, any
+  case, as the application reads them), a number, a comma-separated list of IP addresses or CIDRs, a comma-separated list of
+  Xero tenant ids (UUIDs), organisation names, an origin, an ISO-8601 UTC instant with a `Z`, the `<base URL>|<ClientId>`
+  Mintsoft grant, `memory`/`redis`, `enforce`/`report-only`/`off`; bounded length, closed character set, one line, **and** it passes the admin-secret
+  screen below. The WooCommerce credentials and webhook secret, the Turnstile pair, the scanner settings, the
+  domain, the port and the invoice directory are the installer's own keys and are kept by their prompts.
+* **Everything else is dropped from the new file, and said so.** Any other key -- an unlisted name, a listed
+  name with a value that does not fit, a secret, a database URL, a base64, hex or layered-percent-encoded blob,
+  `export KEY=v` spellings of any of these -- is not written to the new `.env`. The summary lists each dropped
+  key by name, line number and reason (never the value). Nothing is lost: the whole old file is in the backup
+  below. An operator who needs a dropped setting copies the line back by hand, or asks for the name to be added
+  to the list. `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` keys are refused outright, before anything is changed
+  (they belong in `/etc/ims-db-admin/deploy-admin.env`).
+* **A security setting that cannot be carried stops the run.** The listed settings that tighten behaviour --
+  the trusted-proxy settings, `REQUIRE_TRUSTED_PROXY_CONFIG`, `RATE_LIMIT_BACKEND`, `CSP_MODE`, the database-restore
+  switches, `PREFLIGHT_DB_CONNECT` (without it the production preflight skips the database and schema checks), the connector, restore and shopping-webhook size and time limits, `XERO_ACCOUNTING_OUTBOX_ENABLED`, the `XERO_*` tenant allowlists and write grants, `MINTSOFT_WRITE_ALLOWED` and the connector write windows,
+  `WC_WRITEBACK_ALLOWED_ORIGIN`, the fresh-auth and invoice-token lifetimes -- are never dropped silently, because
+  dropping one loosens a control (a proxied production would get a preflight warning where it used to get a failure).
+  If one is present and its value is not in a form that setting accepts, or fails the admin-secret screen, the run stops
+  in the configuration phase, before anything is changed, naming the key and never the value: *`<KEY>` is a security
+  setting that this installer cannot carry across to the new file ...*. Correct or remove it and re-run. The value is read
+  the way the application's dotenv loader reads it (CRLF removed, one pair of surrounding single or double quotes
+  stripped, an inline `# comment` ignored, `export` accepted) and is written to the new file in one canonical unquoted
+  form that means the same.
+* **The in-tree `.env.bak*` files of earlier installer versions are left alone** by the source sync.
+* **A file the installer cannot reproduce is not rewritten.** A line that is not `KEY=VALUE` (also read: `export
+  KEY=value`, `KEY = value`, and quoted values that span several lines), or a quoted value that is never closed,
+  stops the run in the configuration phase, before any package, account or file is touched, naming the line
+  numbers.
+* **A backup is written first, and it is root-only**: `/etc/ims-db-admin/previous-app-env-<UTC timestamp>-<pid>-<n>`,
+  mode 600, owned by root, in the directory (root, 0700) that already holds the admin credential, and therefore
+  outside the application tree where the application account can neither read nor replace it. It is the old file
+  verbatim, made from the lines the run read at its start. The name is created exclusively, so two runs in the same
+  second cannot replace each other's backup and a name planted by another account is skipped, never written
+  through. The installer never prunes backups: they hold secrets, so delete old ones yourself.
+* **It says what it did**, by key name only (never a value): the backup path, the keys kept, the values this
+  run changed, the keys it added, and every key that was not carried over and why.
+* **The screen needs a password worth screening against.** If the deploy admin password is shorter than 8 characters and the old file holds settings the installer does not set, the run stops in the configuration phase, before anything is changed, with: *the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run.* For the listed settings the screen runs a bounded fixed-point decoder: every decoder (percent, `+` as a space, hex, base64, base64url, padded or not) is applied to the value, to each comma/space/semicolon/pipe-separated token of it, and to every result, in any order, to a depth of 10 layers and 64 KiB of decoded output; the decoded admin password (and its percent-encoded forms) is searched for in every layer. A value that is still decodable when a bound is reached is refused (for a security setting that stops the run), as is a value that still contains a percent-escape after the passes or is longer than 4096 bytes. Because an encoding can also sit INSIDE longer text, every layer is also searched (case-insensitively) for the admin password under any composition, up to three deep, of percent (unreserved characters kept, or every byte), plus-for-space, hex, base64 and base64url at all three byte alignments (only the characters wholly inside the password are used), a set of a few hundred strings of at least 8 characters and bounded at 2000 (a value that would need more is refused). Organisation-name lists are also limited to 120 characters in total. Ordinary names such as `OneTwo3D Ltd` or `Acme-Widgets` are carried; the name, URL and role rules apply whatever the password's length.
+
+Not preserved across a re-run, because they are not in `.env`: the SMTP values (they seed the settings
+table once) and the database host, port, name and user (supply them again, or as environment variables).
 
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)

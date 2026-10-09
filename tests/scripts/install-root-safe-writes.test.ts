@@ -1711,7 +1711,7 @@ const ENTRYPOINTS = ['scripts/install.sh', 'scripts/deploy.sh', 'scripts/update.
  *  root. */
 const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number, readonly targets: readonly string[] }>> = {
   'scripts/install.sh': {
-    callSites: 10,
+    callSites: 11,
     targets: [
       // owner decision C3: the root credential file install.sh records the admin URL in, root:root 0600.
       '${DB_ADMIN_CREDENTIAL_FILE}',
@@ -1722,6 +1722,8 @@ const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number
       '${DEPLOY_SSH_KNOWN_HOSTS}',
       '${DEPLOY_META_FILE}',
       '${APP_DIR}/.env',
+      // The timestamped backup of the previous .env: root-owned, mode 600, in the root-only credential directory.
+      '${DB_ADMIN_CREDENTIAL_DIR}/previous-app-env-20261008T120000Z-1234-0',
       // `$canonical`
       '${DB_FENCE_STATE}', '${CRON_BACKUP}', '${FENCE_FILE}',
     ],

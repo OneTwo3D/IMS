@@ -69,7 +69,26 @@ export const SHIPPED = [
   'pg_endpoint_psql',
   'unquote_env_value',
   'existing_env',
+  'env_value_closes_quote',
   'load_existing_env',
+  'env_percent_decode',
+  'env_percent_encode',
+  'env_b64_encode',
+  'env_encode_variants',
+  'env_admin_needles',
+  'env_layers_contain_needle',
+  'env_token_decode',
+  'env_decode_children',
+  'env_decode_seen',
+  'env_value_decode_layers',
+  'env_value_leaks_secret',
+  'env_value_has_shape',
+  'env_value_has_residual_escape',
+  'env_effective_value',
+  'env_canonical_value',
+  'env_key_carry_check',
+  'env_preserve_decision',
+  'env_key_is_security_control',
   'mask_secret',
   'prompt',
   // r39 (Codex HIGH): the two grammars the one password travels through, and the composer both
@@ -172,6 +191,10 @@ export const SHIPPED = [
   'classify_database_credential_rotation',
   'provision_database_role_and_privileges',
   'render_app_env_file',
+  // The re-run preservation (backup, kept keys) that write_app_env_file() now calls.
+  'env_key_is_admin_credential',
+  'render_preserved_env_keys',
+  'write_env_backup',
   'write_app_env_file',
   'rotate_database_password_in_fenced_window',
 ]
@@ -238,6 +261,25 @@ export const DB_CA_ASSIGNMENTS = [
   .map((name) => shellConstant(INSTALL_SOURCE, name, 'scripts/install.sh'))
   .join('\n')
 
+/** The allowlist of carried settings, lifted verbatim so a rig cannot drift from the shipped list. */
+export const ENV_PRESERVE_SHAPES_BLOCK = (() => {
+  const parts = [
+    /^declare -A ENV_PRESERVE_SHAPES=\([\s\S]*?^\)$/m,
+    /^ENV_PRESERVE_SECURITY_KEYS=\([\s\S]*?^\)$/m,
+    /^ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE=".*"$/m,
+    /^ENV_DECODE_MAX_DEPTH=\d+$/m,
+    /^ENV_DECODE_MAX_WORK=\d+$/m,
+    /^ENV_NEEDLE_MAX=\d+$/m,
+    /^ENV_NEEDLE_MIN_LENGTH=\d+$/m,
+  ].map((re) => {
+    const match = re.exec(INSTALL_SOURCE)
+    assert.ok(match, `precondition: scripts/install.sh must define ${re}`)
+    return match[0]
+  })
+  return `${parts.join('\n')}\nENV_PRESERVE_VALUE=''\ndeclare -A ENV_PRESERVED_EFFECTIVE=()\nENV_DECODE_LAYERS=(); ENV_DECODE_CHILDREN=(); ENV_DECODE_UNBOUNDED=0\nENV_NEEDLES=(); ENV_NEEDLES_SECRET=''; ENV_NEEDLES_READY=0; ENV_NEEDLES_OVERFLOW=0; ENV_ENC_OUT=()`
+})()
+
+
 export const ENV_HEREDOC_DEFAULTS = [
   ...new Set(
     [...shippedFunction(INSTALL_SOURCE, 'render_app_env_file').matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}/g)]
@@ -245,6 +287,16 @@ export const ENV_HEREDOC_DEFAULTS = [
   ),
 ]
   .map((name) => `${name}="\${${name}-}"`)
+  .concat([
+    // What write_app_env_file() reads that is not part of the heredoc: the re-run bookkeeping.
+    'ENV_BACKUP_FILE="${ENV_BACKUP_FILE-}"',
+    'ENV_PRESERVED_BLOCK="${ENV_PRESERVED_BLOCK-}"',
+    'ENV_LAST_RENDERED="${ENV_LAST_RENDERED-}"',
+    'DB_ADMIN_CREDENTIAL_FILE="${DB_ADMIN_CREDENTIAL_FILE-}"',
+    'ENV_ADMIN_PASSWORD_MIN_LENGTH=8',
+    '[[ -v ENV_KEPT_KEYS ]] || declare -a ENV_KEPT_KEYS=()',
+    '[[ -v EXISTING_ENV_RAW ]] || declare -a EXISTING_ENV_RAW=()',
+  ])
   .join('\n')
 
 export interface Run {
@@ -379,6 +431,12 @@ on_route() {
   return "\${status}"
 }
 declare -A EXISTING_ENV=()
+declare -A EXISTING_ENV_LINENO=()
+${ENV_PRESERVE_SHAPES_BLOCK}
+ENV_PRESERVE_MAX_LENGTH=4096
+declare -a EXISTING_ENV_UNCLASSIFIED=()
+declare -a ENV_REFUSED_KEYS=()
+ENV_REFUSAL_REASON=''
 ${assignments}
 # r39: the interrupted-rotation journal, resolved AFTER the caller's assignments because it hangs
 # off APP_DIR. In the shipped script it lives under /etc/ims-cutover — root-owned and 0700, because
@@ -386,6 +444,11 @@ ${assignments}
 # directory of this run's own, for the same reason the clusters get one. Every test therefore has a
 # WORKING journal path without asking for it, which is what production has: a rotation that cannot
 # journal REFUSES, so a rig with no path would quietly be testing that refusal instead.
+# And the root-only directory the backup of the previous .env goes to: private to this run, mode 0700, owned by
+# this run's own user (a rig is not root), as install.sh judges it.
+DB_ADMIN_CREDENTIAL_DIR="\${DB_ADMIN_CREDENTIAL_DIR:-\${APP_DIR}/admin-private}"
+ENV_BACKUP_OWNER="$(id -un):$(id -gn)"
+mkdir -p "\${DB_ADMIN_CREDENTIAL_DIR}" && chmod 700 "\${DB_ADMIN_CREDENTIAL_DIR}"
 DB_ENV_SNAPSHOT_DIR="\${DB_ENV_SNAPSHOT_DIR:-\${APP_DIR}/cutover-private}"
 DB_ROLE_ROTATION_JOURNAL="\${DB_ROLE_ROTATION_JOURNAL:-\${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal}"
 # r46 (Codex MEDIUM): and the published trust root, for the same reason and in the same shape. In
@@ -660,9 +723,14 @@ export function writeInstalledEnv(appDir: string, port: number, password: string
     '',
     `DATABASE_URL=postgresql://imsuser:${password}@127.0.0.1:${port}/one_two_inventory`,
     // IN THE SAME FILE ON PURPOSE. It ends in the same fourteen characters as the line above, so
-    // an unanchored match rewrites the deploy admin's credential too — and that is the connection
-    // the fence itself is held with.
-    `DEPLOY_ADMIN_DATABASE_URL=postgresql://deployadmin:admin-password@127.0.0.1:${port}/one_two_inventory`,
+    // an unanchored match rewrites that connection too.
+    // (A hand-added reporting connection. It was DEPLOY_ADMIN_DATABASE_URL until a re-run began to refuse
+    // that key outright -- an application .env may never carry the admin credential -- and a
+    // re-run now carries unowned keys across, so it is the trap for an unanchored match, and the re-run refuses to CARRY it (its name looks like a
+    // database connection) -- the rotation tests prove the one line that moves; the carry-over has its own.)
+    `ANALYTICS_DATABASE_URL=postgresql://reporting:report-password@127.0.0.1:${port}/one_two_inventory`,
+    // And a hand-added key on the carry list, which the re-run keeps (any other would be dropped to the backup).
+    'TRUSTED_PROXY_IPS=10.0.0.9',
     'NEXT_PUBLIC_APP_URL=https://ims.example.test',
     '',
   ].join('\n')
@@ -701,7 +769,7 @@ export const REINSTALL_BODY = `
   ensure_database_role_exists
   classify_database_credential_rotation
   provision_database_role_and_privileges
-  write_app_env_file
+  write_app_env_file || exit 9
   echo "COMPOSED_URL=\${DATABASE_URL}"
   echo "ROLE_PREEXISTED=\${DB_ROLE_PREEXISTED}"
   echo "ROTATION_PENDING=\${DB_PASSWORD_ROTATION_PENDING}"

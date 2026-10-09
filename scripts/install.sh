@@ -389,6 +389,12 @@ mask_secret() {
 # is written by an UNQUOTED heredoc, so `KEY=VALUE` to end of line is exactly what a
 # previous run wrote and reading it back the same way round-trips byte for byte.
 declare -A EXISTING_ENV=()
+# The previous .env verbatim (for the backup written before it is replaced) and the 1-based numbers
+# of its non-comment lines this reader could not classify as KEY=VALUE (`export KEY=v`, `KEY = v`):
+# those are not carried into the new file, and the summary says how many there were.
+declare -a EXISTING_ENV_RAW=()
+declare -a EXISTING_ENV_UNCLASSIFIED=()
+declare -A EXISTING_ENV_LINENO=()
 
 # o3d-l89a r4 (Codex r3 finding 2) — A FILE WE CANNOT READ IS NOT A FILE WITH NO SECRETS.
 #
@@ -405,6 +411,17 @@ declare -A EXISTING_ENV=()
 #   read   — the file was opened and read to the end, and EXISTING_ENV is what it held.
 #   (the third is not a value: an unreadable path REFUSES, because there is nothing safe to assume.)
 ENV_FILE_STATE=absent
+
+# Does this text contain the quote that closes a quoted dotenv value opened with ${2}? A double quote
+# closes at the first one not escaped by a backslash; a single quote at the first one.
+env_value_closes_quote() {
+  if [[ "$2" == '"' ]]; then
+    local re='^([^"\\]|\\.)*"'
+    [[ "$1" =~ $re ]]
+  else
+    [[ "$1" == *"'"* ]]
+  fi
+}
 
 load_existing_env() {
   local file="$1" line key value
@@ -429,13 +446,46 @@ load_existing_env() {
     die "${file} could not be read to the end, so the secrets a previous install committed to are unknown. Refusing to continue rather than minting new ones over a live database."
   fi
 
-  for line in "${lines[@]}"; do
+  # KEY=VALUE, also `export KEY=VALUE` and `KEY = VALUE` (dotenv reads all three the same way), and a
+  # quoted value that runs over several lines is ONE value: its continuation lines are part of it and
+  # are not parsed as keys of their own. A line that is none of these, or a quoted value that never
+  # closes, is recorded and the run refuses before anything is changed (see the caller).
+  local lineno=0 n=${#lines[@]} i=0 lead quote j closed
+  EXISTING_ENV_RAW=("${lines[@]}")
+  EXISTING_ENV_UNCLASSIFIED=()
+  EXISTING_ENV_LINENO=()
+  while ((i < n)); do
+    line="${lines[i]}"
+    lineno=$((i + 1))
+    i=$((i + 1))
     [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
-    [[ "${line}" == *=* ]] || continue
-    key="${line%%=*}"
-    value="${line#*=}"
-    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ ! "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+      EXISTING_ENV_UNCLASSIFIED+=("${lineno}")
+      continue
+    fi
+    key="${BASH_REMATCH[2]}"
+    value="${BASH_REMATCH[3]}"
+    lead="${value#"${value%%[![:space:]]*}"}"
+    quote="${lead:0:1}"
+    if [[ ("${quote}" == '"' || "${quote}" == "'") ]] && ! env_value_closes_quote "${lead:1}" "${quote}"; then
+      closed=false
+      j=${i}
+      while ((j < n)); do
+        value+=$'\n'"${lines[j]}"
+        j=$((j + 1))
+        if env_value_closes_quote "${lines[j - 1]}" "${quote}"; then
+          closed=true
+          break
+        fi
+      done
+      if ! ${closed}; then
+        EXISTING_ENV_UNCLASSIFIED+=("${lineno}")
+        continue
+      fi
+      i=${j}
+    fi
     EXISTING_ENV["${key}"]="${value}"
+    EXISTING_ENV_LINENO["${key}"]="${lineno}"
   done
   ENV_FILE_STATE="read"
 }
@@ -573,6 +623,590 @@ existing_env() {
   else
     printf '%s' "${fallback}"
   fi
+}
+
+# Percent-decoding and -encoding in bash itself, into a named variable (no subshell: this runs inside a
+# body whose command substitutions are not allowed to fail silently).
+env_percent_decode() {
+  local s="${1//\\/\\\\}"
+  s="${s//%/\\x}"
+  printf -v "$2" '%b' "${s}"
+}
+env_percent_encode() {
+  local in="$1" c h hl out="" outl="" i
+  for ((i = 0; i < ${#in}; i++)); do
+    c="${in:i:1}"
+    if [[ "${c}" =~ [A-Za-z0-9._~-] ]]; then
+      out+="${c}"
+      outl+="${c}"
+    else
+      printf -v h '%%%02X' "'${c}"
+      printf -v hl '%%%02x' "'${c}"
+      out+="${h}"
+      outl+="${hl}"
+    fi
+  done
+  printf -v "$2" '%s' "${out}"
+  [[ -z "${3:-}" ]] || printf -v "$3" '%s' "${outl}"
+}
+
+# A token that is pure hex, or pure base64/base64url, is a reversible encoding of something. Decode it (bash only,
+# into the variable named by ${2}) so the admin-secret screen can look INSIDE it: the shapes keep such tokens out
+# of the settings that cannot have them, and this closes the class for the shapes that admit digits or letters.
+env_token_decode() {
+  local t="$1" out="" h i c pre idx bits=0 nbits=0 byte
+  local alpha=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+  if [[ "${t}" =~ ^([0-9A-Fa-f]{2}){4,}$ ]]; then
+    for ((i = 0; i < ${#t}; i += 2)); do out+="\\x${t:i:2}"; done
+  elif [[ "${t}" =~ ^[A-Za-z0-9+/_-]{8,}={0,2}$ ]]; then
+    t="${t//-/+}"; t="${t//_//}"; t="${t%%=*}"
+    for ((i = 0; i < ${#t}; i++)); do
+      c="${t:i:1}"
+      pre="${alpha%%"${c}"*}"
+      idx=${#pre}
+      bits=$(((bits << 6) | idx))
+      nbits=$((nbits + 6))
+      if ((nbits >= 8)); then
+        nbits=$((nbits - 8))
+        byte=$(((bits >> nbits) & 255))
+        bits=$((bits & ((1 << nbits) - 1)))
+        printf -v h '\\x%02x' "${byte}"
+        out+="${h}"
+      fi
+    done
+  fi
+  printf -v "$2" '%b' "${out}"
+}
+
+# THE FIXED-POINT DECODER. One value can hide a credential under any chain of reversible encodings (percent,
+# plus-for-space, hex, base64, base64url, in any order, any depth), so the screen does not enumerate chains:
+# it applies EVERY decoder to the value, to each token of it, and to every result, breadth-first, until nothing
+# new appears. Bounded: at most ENV_DECODE_MAX_DEPTH layers and ENV_DECODE_MAX_WORK characters of decoded
+# output in total. If either bound is hit while the value is STILL decodable, ENV_DECODE_UNBOUNDED is set and
+# the caller refuses (a value that cannot be looked through is not passed on the strength of finding nothing).
+ENV_DECODE_MAX_DEPTH=10
+ENV_DECODE_MAX_WORK=65536
+ENV_DECODE_LAYERS=()
+ENV_DECODE_CHILDREN=()
+ENV_DECODE_UNBOUNDED=0
+
+# Every one-step decoding of ${1} that differs from it, into ENV_DECODE_CHILDREN.
+env_decode_children() {
+  local s="$1" t d
+  local -a tokens=()
+  ENV_DECODE_CHILDREN=()
+  env_percent_decode "${s}" d
+  [[ "${d}" == "${s}" ]] || ENV_DECODE_CHILDREN+=("${d}")
+  env_percent_decode "${s//+/ }" d
+  [[ "${d}" == "${s}" ]] || ENV_DECODE_CHILDREN+=("${d}")
+  IFS=$',; \t|\n' read -r -d '' -a tokens <<< "${s}" || true
+  for t in "${s}" "${tokens[@]}"; do
+    [[ -n "${t}" ]] || continue
+    env_token_decode "${t}" d
+    [[ -z "${d}" || "${d}" == "${s}" ]] || ENV_DECODE_CHILDREN+=("${d}")
+  done
+}
+
+# Is ${1} already one of the layers collected so far? (Linear scan: associative keys cannot safely hold
+# arbitrary decoded bytes.)
+env_decode_seen() {
+  local x
+  for x in "${ENV_DECODE_LAYERS[@]}"; do
+    [[ "${x}" != "$1" ]] || return 0
+  done
+  return 1
+}
+
+# Collect every layer of ${1} into ENV_DECODE_LAYERS (the value itself first).
+env_value_decode_layers() {
+  local depth work=${#1} layer_in child
+  local -a frontier=("$1") next=()
+  ENV_DECODE_LAYERS=("$1")
+  ENV_DECODE_UNBOUNDED=0
+  for ((depth = 0; depth < ENV_DECODE_MAX_DEPTH; depth++)); do
+    next=()
+    for layer_in in "${frontier[@]}"; do
+      env_decode_children "${layer_in}"
+      for child in "${ENV_DECODE_CHILDREN[@]}"; do
+        [[ -n "${child}" ]] || continue
+        if env_decode_seen "${child}"; then continue; fi
+        work=$((work + ${#child}))
+        if ((work > ENV_DECODE_MAX_WORK)); then
+          ENV_DECODE_UNBOUNDED=1
+          return 0
+        fi
+        ENV_DECODE_LAYERS+=("${child}")
+        next+=("${child}")
+      done
+    done
+    ((${#next[@]} > 0)) || return 0
+    frontier=("${next[@]}")
+  done
+  # The depth bound is reached with layers still pending: refuse if any of them decodes further.
+  for layer_in in "${frontier[@]}"; do
+    env_decode_children "${layer_in}"
+    for child in "${ENV_DECODE_CHILDREN[@]}"; do
+      [[ -n "${child}" ]] || continue
+      if env_decode_seen "${child}"; then continue; fi
+      ENV_DECODE_UNBOUNDED=1
+      return 0
+    done
+  done
+  return 0
+}
+
+# Does ${1}, at any layer of the fixed-point decoding, contain ${2}? Returns 0 when it does (or when the value
+# cannot be looked through, ENV_DECODE_UNBOUNDED=1: the caller treats that as a refusal too).
+env_value_leaks_secret() {
+  local layer
+  env_value_decode_layers "$1"
+  for layer in "${ENV_DECODE_LAYERS[@]}"; do
+    [[ "${layer}" != *"$2"* ]] || return 0
+  done
+  ((ENV_DECODE_UNBOUNDED == 0)) || return 0
+  return 1
+}
+
+# THE EMBEDDED-NEEDLE SEARCH. The decoder above sees a value whose WHOLE token is an encoding; an encoding
+# embedded inside longer text (a prefix, a suffix, a separator) is a different string and decodes to nothing
+# useful. So the screen also searches every layer for the admin password as it would appear under any
+# composition (depth up to 3) of: percent (unreserved kept, or every byte), plus-for-space, hex, base64 and
+# base64url -- the last two at all THREE byte alignments, keeping only the characters whose six bits lie
+# wholly inside the password (an embedded copy starts at an unknown offset) -- plus the raw password. A needle is
+# at least 8 characters, matching is case-insensitive (hex in either case, mixed), and the set is bounded:
+# if it would exceed ENV_NEEDLE_MAX the value cannot be screened and is refused.
+ENV_NEEDLE_MAX=2000
+ENV_NEEDLE_MIN_LENGTH=8
+ENV_NEEDLES=()
+ENV_NEEDLES_SECRET=""
+ENV_NEEDLES_READY=0
+ENV_NEEDLES_OVERFLOW=0
+ENV_ENC_OUT=()
+
+# Standard base64 of ${1} preceded by ${2} zero bytes, whole six-bit groups only, into the variable ${3}.
+env_b64_encode() {
+  local LC_ALL=C s="$1" i b bits=0 nbits=0 out=""
+  local alpha=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+  for ((i = 0; i < $2; i++)); do
+    bits=$((bits << 8))
+    nbits=$((nbits + 8))
+    while ((nbits >= 6)); do
+      nbits=$((nbits - 6))
+      out+="${alpha:$(((bits >> nbits) & 63)):1}"
+      bits=$((bits & ((1 << nbits) - 1)))
+    done
+  done
+  for ((i = 0; i < ${#s}; i++)); do
+    printf -v b '%d' "'${s:i:1}"
+    bits=$(((bits << 8) | b))
+    nbits=$((nbits + 8))
+    while ((nbits >= 6)); do
+      nbits=$((nbits - 6))
+      out+="${alpha:$(((bits >> nbits) & 63)):1}"
+      bits=$((bits & ((1 << nbits) - 1)))
+    done
+  done
+  printf -v "$3" '%s' "${out}"
+}
+
+# Every stable encoding of ${1} (hex digits in BOTH cases, and in their own case: each is encoded again at the next level) into ENV_ENC_OUT.
+env_encode_variants() {
+  local LC_ALL=C s="$1" i h hu pct_up pct_low pct_all="" pct_all_up="" hex="" hex_up="" full a start end frag n=${#1}
+  ENV_ENC_OUT=()
+  env_percent_encode "${s}" pct_up pct_low
+  ENV_ENC_OUT+=("${pct_up}" "${pct_low}" "${pct_up//%20/+}" "${pct_low//%20/+}")
+  for ((i = 0; i < n; i++)); do
+    printf -v h '%02x' "'${s:i:1}"
+    printf -v hu '%02X' "'${s:i:1}"
+    hex+="${h}"
+    hex_up+="${hu}"
+    pct_all+="%${h}"
+    pct_all_up+="%${hu}"
+  done
+  ENV_ENC_OUT+=("${pct_all}" "${pct_all_up}" "${hex}" "${hex_up}")
+  for a in 0 1 2; do
+    env_b64_encode "${s}" "${a}" full
+    start=$(((8 * a + 5) / 6))
+    end=$((8 * (a + n) / 6))
+    frag="${full:start:end-start}"
+    h="${frag//+/-}"
+    ENV_ENC_OUT+=("${frag}" "${h//\//_}")
+  done
+}
+
+# Build ENV_NEEDLES for the decoded admin password ${1} (cached for the run).
+env_admin_needles() {
+  local secret="$1" d n v
+  local -A seen=() seen_low=()
+  local -a level=() next=()
+  if ((ENV_NEEDLES_READY == 1)) && [[ "${ENV_NEEDLES_SECRET}" == "${secret}" ]]; then
+    return 0
+  fi
+  ENV_NEEDLES=("${secret,,}")
+  ENV_NEEDLES_OVERFLOW=0
+  level=("${secret}")
+  for ((d = 0; d < 3; d++)); do
+    next=()
+    for n in "${level[@]}"; do
+      env_encode_variants "${n}"
+      for v in "${ENV_ENC_OUT[@]}"; do
+        ((${#v} >= ENV_NEEDLE_MIN_LENGTH)) || continue
+        [[ -z "${seen[${v}]+x}" ]] || continue
+        seen["${v}"]=1
+        next+=("${v}")
+        [[ -z "${seen_low[${v,,}]+x}" ]] || continue
+        seen_low["${v,,}"]=1
+        ENV_NEEDLES+=("${v,,}")
+        if ((${#ENV_NEEDLES[@]} > ENV_NEEDLE_MAX)); then
+          ENV_NEEDLES_OVERFLOW=1
+          break 3
+        fi
+      done
+    done
+    level=("${next[@]}")
+  done
+  ENV_NEEDLES_SECRET="${secret}"
+  ENV_NEEDLES_READY=1
+}
+
+# Does any collected decode layer contain a needle (case-insensitively)? Returns 0 when it does.
+env_layers_contain_needle() {
+  local layer low n
+  for layer in "${ENV_DECODE_LAYERS[@]}"; do
+    low="${layer,,}"
+    for n in "${ENV_NEEDLES[@]}"; do
+      [[ "${low}" != *"${n}"* ]] || return 0
+    done
+  done
+  return 1
+}
+
+# The deploy admin's password, percent-decoded once (the form the server knows), or empty when the run holds
+# no admin URL or the URL carries no password. Sets ENV_ADMIN_PASSWORD_DECODED.
+ENV_ADMIN_PASSWORD_DECODED=""
+env_admin_password_decoded() {
+  local url="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  ENV_ADMIN_PASSWORD_DECODED=""
+  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+)(:([^@]*))?@ ]]; then
+    env_percent_decode "${BASH_REMATCH[3]}" ENV_ADMIN_PASSWORD_DECODED
+  fi
+}
+
+# THE FLOOR BELOW WHICH A PRESERVED SETTING CANNOT BE SCREENED FOR THE ADMIN PASSWORD. With `x` as the
+# password, "the value contains it" is true of almost everything and false of the one thing that matters, so
+# the screen is meaningless and the honest answer is not to pretend: the re-run stops, in the configuration
+# phase, while nothing has been changed, when there ARE settings to screen and the password is too short to
+# screen them against. (Name, URL and role rules apply in every case.) One sentence, quoted by the docs.
+ENV_ADMIN_PASSWORD_MIN_LENGTH=8
+ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE="the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run."
+
+# THE ONLY SETTINGS A RE-RUN CARRIES OVER THAT THE TEMPLATE DOES NOT SET -- AND THE SHAPE EACH MUST HAVE.
+#
+# The carry-over used to be "everything except what looks dangerous", and every review round found one more
+# way to dress a credential up as something innocuous (percent-encoding in layers, base64, hex of the whole
+# admin URL). Enumerating disguises cannot end, so the policy is structural: a key of the previous .env that
+# this installer does not set is carried ONLY if it is named below (exact, case-sensitive) AND its value has
+# the shape its setting can have AND it passes the admin-secret screen. Everything else is DROPPED from the new
+# file, written verbatim to the root-only backup (see write_env_backup), and reported by name.
+#
+# The list is the non-secret, non-connection settings docs/installation.md and .env.example tell an operator
+# to set by hand. WooCommerce credentials and the webhook secret, the Turnstile pair, the scanner settings, the
+# domain, the port and the invoice directory are the template's own keys and are preserved by their prompts.
+# Secrets (API keys, SMTP passwords, token paths), database URLs and anything not named here are NOT carried: an
+# operator who needs one back copies it from the backup. A shape is a name understood by env_value_has_shape.
+declare -A ENV_PRESERVE_SHAPES=(
+  [TRUSTED_PROXY_IPS]=iplist
+  [TRUSTED_PROXY_CIDRS]=iplist
+  [REQUIRE_TRUSTED_PROXY_CONFIG]=bool
+  [BEHIND_PROXY]=bool
+  [RATE_LIMIT_BACKEND]=rate_limit_backend
+  [CSP_MODE]=csp_mode
+  [ALLOW_DATABASE_RESTORE]=bool
+  [ALLOW_DATABASE_RESTORE_UPLOAD]=bool
+  [PREFLIGHT_DB_CONNECT]=bool
+  [XERO_ALLOWED_TENANT_IDS]=uuidlist
+  [XERO_BLOCKED_TENANT_IDS]=uuidlist
+  [XERO_ALLOWED_TENANT_NAMES]=names
+  [XERO_REQUIRE_DEMO_ORG]=bool
+  [XERO_TENANT_ID]=uuidlist
+  [XERO_WRITE_ALLOWED_TENANT]=uuid
+  [XERO_DAILY_BATCH_LIMIT]=number
+  [XERO_WRITES_LIVE_FROM]=iso_utc
+  [WC_WRITES_LIVE_FROM]=iso_utc
+  [MINTSOFT_WRITES_LIVE_FROM]=iso_utc
+  [MINTSOFT_WRITE_ALLOWED]=mintsoft_grant
+  [MINTSOFT_USE_BULK_ASN_LOOKUP]=bool
+  [MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE]=int
+  [WC_WRITEBACK_ALLOWED_ORIGIN]=origin
+  [OUTBOX_RETRY_BASE_MS]=int
+  [OUTBOX_RETRY_JITTER_MS]=int
+  [OUTBOX_RETRY_MAX_MS]=int
+  [CONNECTOR_FETCH_TIMEOUT_MS]=int
+  [CONNECTOR_FETCH_MAX_RESPONSE_BYTES]=int
+  [FRESH_AUTH_MAX_AGE_SECONDS]=int
+  [INVOICE_PDF_TOKEN_TTL_SECONDS]=int
+  [INVOICE_PDF_TOKEN_MAX_TTL_SECONDS]=int
+  [DATABASE_RESTORE_MAX_FILE_BYTES]=int
+  [SHOPPING_WEBHOOK_MAX_BODY_BYTES]=int
+  [SHOPPING_WEBHOOK_READ_TIMEOUT_MS]=int
+  [WC_WEBHOOK_INBOX_MAX_ATTEMPTS]=int
+  [WC_WEBHOOK_INBOX_PROCESS_PAGE_SIZE]=int
+  [WC_WEBHOOK_INBOX_STALE_PROCESSING_MS]=int
+  [WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD]=int
+  [XERO_ACCOUNTING_OUTBOX_ENABLED]=bool
+)
+ENV_PRESERVE_MAX_LENGTH=4096
+
+# THE LISTED SETTINGS THAT TIGHTEN BEHAVIOUR. Dropping one of these does not lose a convenience, it silently
+# loosens a control: a proxied production that loses REQUIRE_TRUSTED_PROXY_CONFIG gets a preflight warning where it
+# used to get a failure; a lost tenant allowlist or write grant changes what the connectors may touch. So for these a
+# value that cannot be carried is not "dropped and reported": the re-run REFUSES, in the configuration phase, before
+# anything is changed (see the gate after load_existing_env). Every name here must also be a key of
+# ENV_PRESERVE_SHAPES (a test enforces it).
+ENV_PRESERVE_SECURITY_KEYS=(
+  TRUSTED_PROXY_IPS TRUSTED_PROXY_CIDRS REQUIRE_TRUSTED_PROXY_CONFIG BEHIND_PROXY
+  RATE_LIMIT_BACKEND CSP_MODE ALLOW_DATABASE_RESTORE ALLOW_DATABASE_RESTORE_UPLOAD
+  XERO_ALLOWED_TENANT_IDS XERO_BLOCKED_TENANT_IDS XERO_ALLOWED_TENANT_NAMES XERO_REQUIRE_DEMO_ORG
+  XERO_TENANT_ID XERO_WRITE_ALLOWED_TENANT XERO_WRITES_LIVE_FROM WC_WRITES_LIVE_FROM
+  MINTSOFT_WRITES_LIVE_FROM MINTSOFT_WRITE_ALLOWED WC_WRITEBACK_ALLOWED_ORIGIN
+  FRESH_AUTH_MAX_AGE_SECONDS INVOICE_PDF_TOKEN_TTL_SECONDS INVOICE_PDF_TOKEN_MAX_TTL_SECONDS
+  PREFLIGHT_DB_CONNECT XERO_DAILY_BATCH_LIMIT CONNECTOR_FETCH_TIMEOUT_MS CONNECTOR_FETCH_MAX_RESPONSE_BYTES
+  DATABASE_RESTORE_MAX_FILE_BYTES
+  SHOPPING_WEBHOOK_MAX_BODY_BYTES SHOPPING_WEBHOOK_READ_TIMEOUT_MS XERO_ACCOUNTING_OUTBOX_ENABLED
+)
+ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE="is a security setting that this installer cannot carry across to the new file (its value is not in a form that setting accepts, or it failed the screen against the deploy admin credential). Correct or remove it and re-run. Nothing has been changed."
+
+# The value the application's dotenv loader would see for a raw value as stored (everything after the first
+# '='): CRLF removed, surrounding whitespace trimmed, ONE matching pair of single or double quotes stripped
+# (whatever follows the closing quote, such as an inline comment, is ignored), and for an unquoted value an
+# inline comment (whitespace then '#') and trailing whitespace removed. Into the variable named by ${2}.
+env_effective_value() {
+  local v="$1" q rest re='^(([^"\\]|\\.)*)"'
+  v="${v%$'\r'}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  q="${v:0:1}"
+  if [[ "${q}" == '"' ]]; then
+    rest="${v:1}"
+    if [[ "${rest}" =~ ${re} ]]; then v="${BASH_REMATCH[1]}"; v="${v//\\\"/\"}"; else v="${rest}"; fi
+  elif [[ "${q}" == "'" ]]; then
+    rest="${v:1}"
+    if [[ "${rest}" == *"'"* ]]; then v="${rest%%\'*}"; else v="${rest}"; fi
+  else
+    v="${v%%[[:space:]]#*}"
+    [[ "${v}" == \#* ]] && v=""
+    v="${v%"${v##*[![:space:]]}"}"
+  fi
+  printf -v "$2" '%s' "${v}"
+}
+
+# A carried value is written in one canonical form that means the same thing to the loader: bare when it is made of
+# characters that need no quoting, otherwise inside double quotes (the shapes never admit a double quote, backslash,
+# dollar sign or hash, so the quoting is lossless).
+env_canonical_value() {
+  if [[ "$1" =~ ^[A-Za-z0-9._:/,@+=-]*$ ]]; then
+    printf -v "$2" '%s' "$1"
+  else
+    printf -v "$2" '"%s"' "$1"
+  fi
+}
+
+# May the old file's key ${1} (raw stored value ${2}) be carried? 0 = yes, with the effective value in
+# ENV_PRESERVE_VALUE; 1 = no, with ENV_REFUSAL_REASON. The ONE decision, used by the up-front gate and the writer.
+ENV_PRESERVE_VALUE=""
+env_preserve_decision() {
+  local key="$1" raw="$2" shape
+  ENV_PRESERVE_VALUE=""
+  ENV_REFUSAL_REASON=""
+  shape="${ENV_PRESERVE_SHAPES[${key}]-}"
+  if [[ -z "${shape}" ]]; then
+    ENV_REFUSAL_REASON="not on the list of settings a re-run carries over"
+    return 1
+  fi
+  env_effective_value "${raw}" ENV_PRESERVE_VALUE
+  if ! env_value_has_shape "${shape}" "${ENV_PRESERVE_VALUE}"; then
+    ENV_REFUSAL_REASON="the value does not have the shape of a ${shape} setting"
+    return 1
+  fi
+  if env_value_has_residual_escape "${ENV_PRESERVE_VALUE}"; then
+    ENV_REFUSAL_REASON="the value still contains a percent-escape after the decode passes"
+    return 1
+  fi
+  env_key_carry_check "${key}" "${ENV_PRESERVE_VALUE}"
+}
+
+# Who owns the backup of the previous .env: root. A top-level assignment (not a parameter) so a test rig, which
+# is not root, can give the file to its own user the same way DB_CA_PUBLISH_OWNER is handled.
+ENV_BACKUP_OWNER="root:root"
+
+# Does ${2} have the shape ${1}? Each shape is the REAL format the application parses that setting from (read from
+# the code that reads it, lib/ and app/, not guessed), as a closed character set with a bounded length. A generic
+# "identifier" shape would admit any hex or base64 token, which is how a reversible encoding of a credential could
+# ride in a tenant list; a UUID list admits only UUIDs. The application trims list entries and reads switches
+# case-insensitively, and so does this.
+#   bool                1 true yes on 0 false no off (any case), or empty        [isTruthy / readEnvSwitch]
+#   iplist              comma-separated IPv4/IPv6 (optional [..], :port, /bits) [request-ip.ts parseEnvList]
+#   uuid / uuidlist     one UUID / comma-separated UUIDs (Xero tenant ids)       [tenant-guard.ts, grant]
+#   names               comma-separated organisation names                        [tenant-guard.ts]
+#   int / number        digits / digits with an optional fraction                 [parsePositiveIntegerEnv etc.]
+#   iso_utc             ISO-8601 UTC instant with an explicit Z                   [producer-disposition.ts]
+#   origin              http(s)://host[:port][/]                                  [outbound-write-grant.ts]
+#   mintsoft_grant      <base URL>|<ClientId>[|login=<user>]                      [outbound-write-grant.ts]
+#   rate_limit_backend  memory | redis (or empty)                                 [rate-limit.ts]
+#   csp_mode            enforce | report-only | off (or empty)                    [csp.ts]
+env_value_has_shape() {
+  local shape="$1" value="$2" re entry n=0
+  local -a entries=()
+  local uuid='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+  [[ ${#value} -le ${ENV_PRESERVE_MAX_LENGTH} ]] || return 1
+  # An empty value means "not set" to the application for every one of these; it is carried (and harmless).
+  [[ -n "${value}" ]] || return 0
+  case "${shape}" in
+    bool) re='^(1|true|yes|on|0|false|no|off)?$'; [[ "${value,,}" =~ ${re} ]] ;;
+    rate_limit_backend) re='^(memory|redis)?$'; [[ "${value,,}" =~ ${re} ]] ;;
+    csp_mode) re='^(enforce|report-only|off)?$'; [[ "${value,,}" =~ ${re} ]] ;;
+    int) re='^[0-9]{1,16}$'; [[ "${value}" =~ ${re} ]] ;;
+    number) re='^[0-9]{1,16}(\.[0-9]{1,6})?$'; [[ "${value}" =~ ${re} ]] ;;
+    uuid) re="^${uuid}\$"; [[ "${value}" =~ ${re} ]] ;;
+    uuidlist | iplist | names)
+      IFS=, read -r -a entries <<< "${value}"
+      [[ ${#entries[@]} -ge 1 && ${#entries[@]} -le 64 ]] || return 1
+      for entry in "${entries[@]}"; do
+        entry="${entry#"${entry%%[![:space:]]*}"}"
+        entry="${entry%"${entry##*[![:space:]]}"}"
+        case "${shape}" in
+          uuidlist) re="^${uuid}\$" ;;
+          names) re="^[A-Za-z0-9][A-Za-z0-9 ._&'()/+-]{0,99}\$"; [[ ${#value} -le 120 ]] || return 1 ;;
+          iplist)
+            [[ -n "${entry}" ]] || continue
+            [[ "${entry}" == *.* || "${entry}" == *:* ]] || return 1
+            re='^\[?[0-9A-Fa-f:.]{2,45}\]?(:[0-9]{1,5})?(/[0-9]{1,3})?$'
+            ;;
+        esac
+        [[ "${entry}" =~ ${re} ]] || return 1
+        n=$((n + 1))
+      done
+      [[ "${shape}" == iplist ]] || [[ ${n} -ge 1 ]]
+      ;;
+    iso_utc) re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]{1,3})?)?Z$'; [[ "${value}" =~ ${re} ]] ;;
+    origin) re='^https?://(\[[0-9A-Fa-f:]{2,45}\]|[A-Za-z0-9.-]{1,253})(:[0-9]{1,5})?/?$'; [[ "${value}" =~ ${re} ]] ;;
+    mintsoft_grant)
+      re='^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)? ?\| ?[1-9][0-9]{0,9}( ?\| ?login=[A-Za-z0-9._@+-]{1,128})?$'
+      [[ "${value}" =~ ${re} ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# After the decode passes env_value_leaks_secret() makes, does the value STILL contain a percent-escape? Then
+# it is encoded more deeply than the screen looks, and it is refused rather than passed on the strength of
+# having found nothing.
+env_value_has_residual_escape() {
+  local v="$1" next pass
+  for ((pass = 0; pass < 4; pass++)); do
+    env_percent_decode "${v}" next
+    [[ "${next}" != "${v}" ]] || break
+    v="${next}"
+  done
+  [[ "${v}" =~ %[0-9A-Fa-f]{2} ]]
+}
+
+# The keys render_app_env_file() writes. Listed here because the gate that needs them runs long before that
+# function is defined; tests/scripts/env-rewrite-preservation.test.ts fails if this list and the template
+# ever disagree.
+ENV_TEMPLATE_KEYS=(NODE_ENV IMS_INSTANCE_ROLE APP_PORT AUTH_SECRET SETTINGS_ENCRYPTION_KEY DATABASE_URL NEXT_PUBLIC_APP_URL AUTH_URL REDIS_URL REDIS_PASSWORD REDIS_KEY_PREFIX WC_STORE_URL WC_CONSUMER_KEY WC_CONSUMER_SECRET WC_WEBHOOK_SECRET CRON_SECRET NEXT_PUBLIC_TURNSTILE_SITE_KEY TURNSTILE_SECRET_KEY BACKUP_DIR UPLOAD_STORAGE_DIR PUBLIC_UPLOAD_STORAGE_DIR INVOICE_PDF_STORAGE_DIR FILE_SCAN_MODE FILE_SCAN_COMMAND_ARGV FILE_SCAN_COMMAND FILE_SCAN_NAME FILE_SCAN_ENV_ALLOWLIST FILE_SCAN_TIMEOUT_MS)
+
+# The keys of the previous .env that this installer does not set: the ones that would be carried.
+ENV_UNOWNED_EXISTING_KEYS=()
+env_unowned_existing_keys() {
+  local key owned t
+  ENV_UNOWNED_EXISTING_KEYS=()
+  for key in "${!EXISTING_ENV[@]}"; do
+    owned=false
+    for t in "${ENV_TEMPLATE_KEYS[@]}"; do
+      [[ "${t}" == "${key}" ]] && owned=true
+    done
+    # Only a key that COULD be carried needs screening against the admin password; the rest is dropped.
+    ${owned} || [[ -z "${ENV_PRESERVE_SHAPES[${key}]-}" ]] || ENV_UNOWNED_EXISTING_KEYS+=("${key}")
+  done
+}
+
+ENV_REFUSAL_REASON=""
+env_key_carry_check() {
+  local key="$1" value="$2" upper admin_user="" admin_pass="" url="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  local lower_value="${value,,}" form layer
+  local -a pass_forms=() user_forms=()
+  upper="${key^^}"
+  ENV_REFUSAL_REASON=""
+  case "${upper}" in
+    DIRECT_URL | *DATABASE*URL* | *DB_URL* | *_DB_*URL* | *MIGRATION* | *ADMIN* | *SUPERUSER* | *POSTGRES* | PG*)
+      ENV_REFUSAL_REASON="the name looks like a database connection setting"
+      return 1
+      ;;
+  esac
+  if [[ "${lower_value}" == *postgres://* || "${lower_value}" == *postgresql://* ]]; then
+    ENV_REFUSAL_REASON="the value is a PostgreSQL connection URL"
+    return 1
+  fi
+  if [[ "${value}" =~ ://[^/@[:space:]]*:[^/@[:space:]]+@ ]]; then
+    ENV_REFUSAL_REASON="the value is a URL with a password in it"
+    return 1
+  fi
+  # A libpq keyword/value connection string (`host=db user=x password=y`), quoted or not, spaced or not.
+  # A password setting in a hand-added variable is a credential whatever role it belongs to.
+  if [[ "${lower_value}" =~ (^|[[:space:]\'\"])password[[:space:]]*= ]]; then
+    ENV_REFUSAL_REASON="the value is a connection string with a password setting"
+    return 1
+  fi
+  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+)(:([^@]*))?@ ]]; then
+    admin_user="${BASH_REMATCH[1]}"
+    admin_pass="${BASH_REMATCH[3]}"
+    # The credential as it appears in the URL (percent-encoded), decoded, and re-encoded in both hex
+    # cases: a copy may have been written in any of them.
+    local decoded_user decoded_pass enc_up enc_low
+    env_percent_decode "${admin_user}" decoded_user
+    env_percent_decode "${admin_pass}" decoded_pass
+    user_forms=("${admin_user}" "${decoded_user}")
+    pass_forms=("${admin_pass}" "${decoded_pass}")
+    env_percent_encode "${decoded_pass}" enc_up enc_low
+    pass_forms+=("${enc_up}" "${enc_low}")
+    env_percent_encode "${decoded_user}" enc_up enc_low
+    user_forms+=("${enc_up}" "${enc_low}")
+    # Screened only when long enough for a substring match to mean something; a shorter password with
+    # settings to screen is refused up front by the caller (ENV_ADMIN_PASSWORD_MIN_LENGTH).
+    if [[ ${#decoded_pass} -ge ${ENV_ADMIN_PASSWORD_MIN_LENGTH} ]]; then
+      env_value_decode_layers "${value}"
+      if ((ENV_DECODE_UNBOUNDED != 0)); then
+        ENV_REFUSAL_REASON="the value is encoded too deeply to screen for the deploy admin's password"
+        return 1
+      fi
+      env_admin_needles "${decoded_pass}"
+      if ((ENV_NEEDLES_OVERFLOW != 0)); then
+        ENV_REFUSAL_REASON="the value cannot be screened for the deploy admin's password (too many encodings to search)"
+        return 1
+      fi
+      if env_layers_contain_needle; then
+        ENV_REFUSAL_REASON="the value contains the deploy admin's password"
+        return 1
+      fi
+      for form in "${pass_forms[@]}"; do
+        for layer in "${ENV_DECODE_LAYERS[@]}"; do
+          if [[ "${layer}" == *"${form}"* ]]; then
+            ENV_REFUSAL_REASON="the value contains the deploy admin's password"
+            return 1
+          fi
+        done
+      done
+    fi
+    for form in "${user_forms[@]}"; do
+      [[ -n "${form}" ]] || continue
+      if [[ "${value}" == *"://${form}:"* || "${value}" == *"://${form}@"* ]] \
+        || [[ "${lower_value}" =~ (^|[[:space:]\'\"])user[[:space:]]*=[[:space:]]*[\'\"]?"${form,,}"([[:space:]\'\"]|$) ]]; then
+        ENV_REFUSAL_REASON="the value names the deploy admin role as a connection user"
+        return 1
+      fi
+    done
+  fi
+  return 0
 }
 
 run_as_user() {
@@ -7686,6 +8320,31 @@ header "Configuration"
 # permanently undecryptable.
 load_existing_env "${APP_DIR}/.env"
 
+# A FILE THIS RUN CANNOT REPRODUCE IS NOT REWRITTEN. The rewrite carries every key across, so a line
+# it cannot read as KEY=VALUE (or a quoted value that never closes) would be silently lost; stopping
+# here, before a package, account, directory or file has been touched, costs a re-run.
+if ((${#EXISTING_ENV_UNCLASSIFIED[@]} > 0)); then
+  die "${APP_DIR}/.env has ${#EXISTING_ENV_UNCLASSIFIED[@]} line(s) this installer cannot carry across to the file it is about to write (line numbers: ${EXISTING_ENV_UNCLASSIFIED[*]}): not KEY=VALUE, or a quoted value that is never closed. Rewrite them as KEY=VALUE (a quoted value may span lines if it closes), or remove them, and re-run. Nothing has been changed."
+fi
+
+# A password too short to screen preserved settings against ends the run here, before anything is changed.
+env_admin_password_decoded
+if [[ -n "${ENV_ADMIN_PASSWORD_DECODED}" && ${#ENV_ADMIN_PASSWORD_DECODED} -lt ${ENV_ADMIN_PASSWORD_MIN_LENGTH} ]]; then
+  env_unowned_existing_keys
+  if ((${#ENV_UNOWNED_EXISTING_KEYS[@]} > 0)); then
+    die "${APP_DIR}/.env holds ${#ENV_UNOWNED_EXISTING_KEYS[@]} setting(s) this installer does not set, and ${ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE} Nothing has been changed."
+  fi
+fi
+
+# A SECURITY SETTING THAT CANNOT BE CARRIED ENDS THE RUN HERE, before anything is changed: dropping it would
+# loosen a control without a word.
+for _sec_key in "${ENV_PRESERVE_SECURITY_KEYS[@]}"; do
+  if [[ -n "${EXISTING_ENV[${_sec_key}]+x}" ]] && ! env_preserve_decision "${_sec_key}" "${EXISTING_ENV[${_sec_key}]}"; then
+    die "${APP_DIR}/.env: ${_sec_key} ${ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE}"
+  fi
+done
+unset _sec_key
+
 # THE INVOICE PDF DIRECTORY IS WHERE THE PREVIOUS RUN PUT IT. The default assigned among the other
 # path defaults is only the answer for a host with no .env: a re-run that rewrote .env with that
 # default would silently repoint a live installation away from the PDFs it has already stored.
@@ -7760,8 +8419,13 @@ fi
 
 echo ""
 info "--- Application ---"
-prompt APP_DOMAIN      "Domain name (e.g. ims.yourdomain.com)" "ims.localhost"
-prompt APP_PORT        "Internal port the app listens on"       "3000"
+# A re-run's defaults are what the installed .env already says: the public URL's host and the port.
+# Defaulting to the factory values would repoint a live installation on the first Enter.
+EXISTING_APP_DOMAIN="$(existing_env NEXT_PUBLIC_APP_URL)"
+EXISTING_APP_DOMAIN="${EXISTING_APP_DOMAIN#*://}"
+EXISTING_APP_DOMAIN="${EXISTING_APP_DOMAIN%%/*}"
+prompt APP_DOMAIN      "Domain name (e.g. ims.yourdomain.com)" "${EXISTING_APP_DOMAIN:-ims.localhost}"
+prompt APP_PORT        "Internal port the app listens on"       "$(existing_env APP_PORT 3000)"
 # The same shape check update.sh applies to the value it reads back out of .env (o3d-2sm1.5 r26,
 # Codex HIGH). Here it is not a parsing question — the value came from a prompt or, under
 # --non-interactive, from the invocation's own environment — but it lands in exactly the same
@@ -8165,10 +8829,19 @@ fi
 
 echo ""
 info "--- WooCommerce (optional — can be configured later in Settings) ---"
-prompt WC_STORE_URL       "WooCommerce store URL"      ""
-prompt WC_CONSUMER_KEY    "WooCommerce consumer key"   ""
-prompt WC_CONSUMER_SECRET "WooCommerce consumer secret" "" "secret"
-prompt WC_WEBHOOK_SECRET  "WooCommerce webhook secret"  "$(openssl rand -hex 16)" "secret"
+# A re-run keeps what the previous .env had (Enter accepts it); clearing a value is an explicit
+# choice -- type `none` (or export `none` for --non-interactive) -- because a blank answer used to
+# be indistinguishable from "I did not notice this question" and silently blanked a working
+# WooCommerce connection. The webhook secret is the sharper case: a fresh random one breaks the
+# signature check of every webhook WooCommerce is already sending with the old one.
+prompt WC_STORE_URL       "WooCommerce store URL (type none to clear)"      "$(existing_env WC_STORE_URL)"
+prompt WC_CONSUMER_KEY    "WooCommerce consumer key (type none to clear)"   "$(existing_env WC_CONSUMER_KEY)"
+prompt WC_CONSUMER_SECRET "WooCommerce consumer secret (type none to clear)" "$(existing_env WC_CONSUMER_SECRET)" "secret" "$([[ -n "$(existing_env WC_CONSUMER_SECRET)" ]] && printf 'kept from the existing .env' || true)"
+prompt WC_WEBHOOK_SECRET  "WooCommerce webhook secret (type none to clear)"  "$(existing_env WC_WEBHOOK_SECRET "$(openssl rand -hex 16)")" "secret" "$([[ -n "$(existing_env WC_WEBHOOK_SECRET)" ]] && printf 'kept from the existing .env' || printf 'generated')"
+for _wc_name in WC_STORE_URL WC_CONSUMER_KEY WC_CONSUMER_SECRET WC_WEBHOOK_SECRET; do
+  [[ "${!_wc_name}" != "none" ]] || printf -v "${_wc_name}" '%s' ""
+done
+unset _wc_name
 
 # Xero is configured entirely in the app: the client id/secret are stored in the
 # settings table and connecting requires the interactive OAuth consent round
@@ -8765,6 +9438,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='.deploy-meta' \
       --exclude='.env' \
       --exclude='.env.local' \
+      --exclude='.env.bak*' \
       --exclude='backups' \
       --exclude='uploads' \
       --exclude='public/uploads' \
@@ -8792,6 +9466,7 @@ else
     --exclude='.next' \
     --exclude='.env' \
     --exclude='.env.local' \
+    --exclude='.env.bak*' \
     --exclude='backups' \
     --exclude='uploads' \
     --exclude='public/uploads' \
@@ -8913,6 +9588,15 @@ ENV_FILE_GENERATED_AT="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
 # reach the publication at all — a pipeline would have renamed whatever bytes it had received
 # before the producer died. Command substitution strips trailing newlines and `printf '%s\n'`
 # restores the single one the heredoc ends with, so the published bytes are the rendered bytes.
+# The upload scanner settings are written as constants by a first install and are the operator's to
+# tune afterwards (a re-run used to put them all back to `disabled`).
+FILE_SCAN_MODE="$(existing_env FILE_SCAN_MODE disabled)"
+FILE_SCAN_COMMAND_ARGV="$(existing_env FILE_SCAN_COMMAND_ARGV)"
+FILE_SCAN_COMMAND="$(existing_env FILE_SCAN_COMMAND)"
+FILE_SCAN_NAME="$(existing_env FILE_SCAN_NAME)"
+FILE_SCAN_ENV_ALLOWLIST="$(existing_env FILE_SCAN_ENV_ALLOWLIST PATH,HOME,TMPDIR,TEMP,TMP,LANG,LC_ALL)"
+FILE_SCAN_TIMEOUT_MS="$(existing_env FILE_SCAN_TIMEOUT_MS 30000)"
+
 render_app_env_file() {
 cat <<EOF
 # One Two Inventory — generated by install.sh on ${ENV_FILE_GENERATED_AT}
@@ -8970,12 +9654,12 @@ BACKUP_DIR=${BACKUP_DIR}
 UPLOAD_STORAGE_DIR=${UPLOAD_STORAGE_DIR}
 PUBLIC_UPLOAD_STORAGE_DIR=${PUBLIC_UPLOAD_STORAGE_DIR}
 INVOICE_PDF_STORAGE_DIR=${INVOICE_PDF_STORAGE_DIR}
-FILE_SCAN_MODE=disabled
-FILE_SCAN_COMMAND_ARGV=
-FILE_SCAN_COMMAND=
-FILE_SCAN_NAME=
-FILE_SCAN_ENV_ALLOWLIST=PATH,HOME,TMPDIR,TEMP,TMP,LANG,LC_ALL
-FILE_SCAN_TIMEOUT_MS=30000
+FILE_SCAN_MODE=${FILE_SCAN_MODE}
+FILE_SCAN_COMMAND_ARGV=${FILE_SCAN_COMMAND_ARGV}
+FILE_SCAN_COMMAND=${FILE_SCAN_COMMAND}
+FILE_SCAN_NAME=${FILE_SCAN_NAME}
+FILE_SCAN_ENV_ALLOWLIST=${FILE_SCAN_ENV_ALLOWLIST}
+FILE_SCAN_TIMEOUT_MS=${FILE_SCAN_TIMEOUT_MS}
 EOF
 }
 
@@ -8987,16 +9671,171 @@ EOF
 # under `set -e` aborted the script from wherever it stood, and the `chown` and `chmod` after it
 # were not checked at all, so a refused chown left the trap claiming the file agreed with the
 # server.
+# EVERY KEY THE PREVIOUS .env HAD AND THIS TEMPLATE DOES NOT OWN IS CARRIED OVER (D4 re-run).
+# The file used to be rewritten from the template alone, so a hand-added TRUSTED_PROXY_IPS (which
+# preflight:production asks for) or XERO_ALLOWED_TENANT_IDS vanished on the next re-run with no
+# word said. Prints, for the keys the rendered text does not set, `KEY=value` exactly as read.
+#
+# THE ADMIN CREDENTIAL IS THE ONE THING THAT IS NEVER CARRIED. db_admin_credential_load() already
+# refuses a run whose application .env defines DEPLOY_ADMIN_DATABASE_URL, long before this point;
+# this is the second lock on the same door, so a future change to that load cannot turn the
+# preservation into a way of copying the credential forward.
+env_key_is_admin_credential() {
+  [[ "$1" == DEPLOY_ADMIN* || "$1" == *ADMIN_DATABASE_URL* ]]
+}
+
+# WHICH UNOWNED KEYS MAY BE CARRIED INTO THE APPLICATION'S .env AT ALL (review of the re-run preservation).
+# Naming the deploy admin variable was not enough: a hand-added DIRECT_URL, MIGRATION_DATABASE_URL or
+# PGPASSWORD holding the admin connection would have gone through. The rule is generic and errs toward
+# not carrying: a key whose NAME looks like a database connection, or whose VALUE is a PostgreSQL URL, a
+# URL with a password in it, or contains the deploy admin's password or role, is NOT carried over. That
+# is reported by key name, line number and reason (never the value) and the old file is in the backup, so
+# the cost of a false positive is one line copied back by hand. Sets ENV_REFUSAL_REASON; returns 0 when
+# the key may be carried.
+
+ENV_REFUSED_KEYS=()
+declare -A ENV_PRESERVED_EFFECTIVE=()
+env_key_is_security_control() {
+  local k
+  for k in "${ENV_PRESERVE_SECURITY_KEYS[@]}"; do
+    [[ "${k}" == "$1" ]] && return 0
+  done
+  return 1
+}
+render_preserved_env_keys() {
+  local rendered="$1" key line i j
+  local -A owned=()
+  local -a kept=()
+  ENV_KEPT_KEYS=()
+  ENV_REFUSED_KEYS=()
+  ENV_PRESERVED_EFFECTIVE=()
+  ENV_PRESERVED_BLOCK=""
+  while IFS= read -r line; do
+    [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] && owned["${BASH_REMATCH[1]}"]=1
+  done <<< "${rendered}"
+  for key in "${!EXISTING_ENV[@]}"; do
+    [[ -z "${owned[${key}]-}" ]] || continue
+    if env_key_is_admin_credential "${key}"; then
+      error "${APP_DIR}/.env defines ${key}. That file belongs to the application account and must never hold the deploy admin credential, so it is not carried into the new file; move it to ${DB_ADMIN_CREDENTIAL_FILE}."
+      return 1
+    fi
+    # (1) named on the list of settings a re-run carries; (2) a value (as the loader reads it) of the shape that setting
+    # can have; (3) no admin material, no escape deeper than the screen looks. Anything else is dropped and reported -- except
+    # a security setting, which the up-front gate has already refused the run over, so reaching here with one is a defect.
+    if ! env_preserve_decision "${key}" "${EXISTING_ENV[${key}]}"; then
+      if env_key_is_security_control "${key}"; then
+        error "${key} ${ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE}"
+        return 1
+      fi
+      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): ${ENV_REFUSAL_REASON}")
+      continue
+    fi
+    ENV_PRESERVED_EFFECTIVE["${key}"]="${ENV_PRESERVE_VALUE}"
+    kept+=("${key}")
+  done
+  ((${#kept[@]} == 0)) && return 0
+  # Sorted in bash itself (insertion sort over a handful of names): no subprocess whose failure this
+  # errexit-suspended body could not see.
+  for ((i = 0; i < ${#kept[@]}; i++)); do
+    key="${kept[i]}"
+    for ((j = i - 1; j >= 0; j--)); do
+      [[ "${ENV_KEPT_KEYS[j]}" > "${key}" ]] || break
+      ENV_KEPT_KEYS[j + 1]="${ENV_KEPT_KEYS[j]}"
+    done
+    ENV_KEPT_KEYS[j + 1]="${key}"
+  done
+  ENV_PRESERVED_BLOCK=$'\n# Kept from the previous .env by install.sh (not set by the installer)\n'
+  local canonical
+  for key in "${ENV_KEPT_KEYS[@]}"; do
+    env_canonical_value "${ENV_PRESERVED_EFFECTIVE[${key}]}" canonical
+    ENV_PRESERVED_BLOCK+="${key}=${canonical}"$'\n'
+  done
+}
+
+# A TIMESTAMPED, MODE-600, ROOT-OWNED COPY OF WHAT IS ABOUT TO BE REPLACED, in the root-only directory the admin
+# credential already lives in (${DB_ADMIN_CREDENTIAL_DIR}, root, 0700) and NOT under the application tree: it
+# holds every key the rewrite drops, secrets included, and the application account must not be able to read
+# it, replace it, or point its name somewhere else. It is written from the lines this run read at the start
+# (not re-read from a path the application account can swap) with the same publication primitive as .env.
+# Never pruned by this script: deleting an operator's backup is not the installer's call.
+#
+# THE NAME IS RESERVED BEFORE ANYTHING IS PUBLISHED TO IT. Second-resolution names collided inside one second
+# (two runs, or a retry) and the second publication replaced the first run's backup. The candidate carries the
+# second, this process id and a counter, and is created exclusively (noclobber is O_EXCL: it also refuses a
+# symlink planted at the name); the first name that is free is the backup.
+ENV_BACKUP_FILE=""
+write_env_backup() {
+  [[ "${ENV_FILE_STATE}" == "read" && "${#EXISTING_ENV_RAW[@]}" -gt 0 ]] || return 0
+  local stamp candidate n=0
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)" || return 1
+  # Created by this root process under umask 077; an EXISTING directory is judged, never re-moded, and a wrong
+  # one is refused rather than repaired (the same rule write_admin_credential_file applies to it).
+  if [[ ! -d "${DB_ADMIN_CREDENTIAL_DIR}" ]]; then
+    ( umask 077; mkdir -p "${DB_ADMIN_CREDENTIAL_DIR}" ) || return 1
+  fi
+  [[ "$(LC_ALL=C stat -c '%u:%a' -- "${DB_ADMIN_CREDENTIAL_DIR}" 2> /dev/null)" == "$(id -u):700" ]] || {
+    error "${DB_ADMIN_CREDENTIAL_DIR} must be owned by root with mode 0700 and is not, so the backup of the previous .env cannot be kept there. Fix its owner and mode as root and re-run."
+    return 1
+  }
+  ENV_BACKUP_FILE=""
+  while ((n < 1000)); do
+    candidate="${DB_ADMIN_CREDENTIAL_DIR}/previous-app-env-${stamp}-$$-${n}"
+    if (set -o noclobber; : > "${candidate}") 2> /dev/null; then
+      ENV_BACKUP_FILE="${candidate}"
+      break
+    fi
+    n=$((n + 1))
+  done
+  [[ -n "${ENV_BACKUP_FILE}" ]] || return 1
+  printf '%s\n' "${EXISTING_ENV_RAW[@]}" | publish_durable_file "${ENV_BACKUP_FILE}" "${ENV_BACKUP_OWNER}" 600 || { ENV_BACKUP_FILE=""; return 1; }
+}
+
+# WHAT THE REWRITE KEPT AND CHANGED, by NAME ONLY: a value can be a secret.
+print_env_rewrite_summary() {
+  local rendered="$1" line key entry
+  local -a changed=() added=()
+  [[ "${ENV_FILE_STATE}" == "read" ]] || return 0
+  while IFS= read -r line; do
+    [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    if [[ -z "${EXISTING_ENV[${key}]+x}" ]]; then
+      added+=("${key}")
+    elif [[ "${EXISTING_ENV[${key}]}" != "${BASH_REMATCH[2]}" ]]; then
+      changed+=("${key}")
+    fi
+  done <<< "${rendered}"
+  info "The previous ${APP_DIR}/.env was replaced. Backup (root-only, mode 600): ${ENV_BACKUP_FILE:-<none>}"
+  info "  kept as it was, not set by the installer (${#ENV_KEPT_KEYS[@]}): ${ENV_KEPT_KEYS[*]:-none}"
+  info "  values this run changed (${#changed[@]}): ${changed[*]:-none}"
+  info "  keys this run added (${#added[@]}): ${added[*]:-none}"
+  if ((${#ENV_REFUSED_KEYS[@]} > 0)); then
+    warn "  ${#ENV_REFUSED_KEYS[@]} key(s) were NOT carried into the new file; they are in the root-only backup, verbatim (values are never printed):"
+    for entry in "${ENV_REFUSED_KEYS[@]}"; do
+      warn "    ${entry}"
+    done
+  fi
+  if ((${#EXISTING_ENV_UNCLASSIFIED[@]} > 0)); then
+    warn "  ${#EXISTING_ENV_UNCLASSIFIED[@]} line(s) of the previous file are not plain KEY=VALUE (line numbers: ${EXISTING_ENV_UNCLASSIFIED[*]}) and were NOT carried over; they are in the backup."
+  fi
+}
+
+ENV_KEPT_KEYS=()
+ENV_PRESERVED_BLOCK=""
+ENV_LAST_RENDERED=""
 write_app_env_file() {
   local rendered
   rendered="$(render_app_env_file)" || return 1
   [[ -n "${rendered}" ]] || return 1
-  printf '%s\n' "${rendered}" | publish_durable_file "${APP_DIR}/.env" "${APP_USER}:${APP_USER}" 600 || return 1
+  render_preserved_env_keys "${rendered}" || return 1
+  write_env_backup || return 1
+  printf '%s\n%s' "${rendered}" "${ENV_PRESERVED_BLOCK}" | publish_durable_file "${APP_DIR}/.env" "${APP_USER}:${APP_USER}" 600 || return 1
+  ENV_LAST_RENDERED="${rendered}"
   return 0
 }
 
 write_app_env_file || die "${APP_DIR}/.env could not be written. Nothing has been stopped and nothing has been migrated; the file at that path is whatever the previous run left there, complete and unchanged — it is published by rename, so there is no half-written state to clean up."
 success ".env written to ${APP_DIR}/.env"
+print_env_rewrite_summary "${ENV_LAST_RENDERED}"
 write_admin_credential_file || die "${DB_ADMIN_CREDENTIAL_FILE} could not be written. Nothing has been stopped and nothing has been migrated; the admin credential stays where it was, with root."
 # The publication the interrupted-rotation journal was waiting for has now happened, and it named
 # DB_PASSWORD_EFFECTIVE — which reconcile_interrupted_role_rotation() has already set to the
