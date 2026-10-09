@@ -242,12 +242,13 @@ test('DISPOSE renames the entry first: a symlink to the stand-in repo swapped in
 test('a directory merely NAMED with two leading dots is inside, not a traversal (creation check and deletion guard)', () => {
   const world = makeScratchRoot('safe-root-dots-')
   try {
-    const repo = join(world.root, '..scratch') // a checkout whose directory name begins with two dots
-    mkdirSync(join(repo, 'lib'), { recursive: true })
-    console.log('precondition (..scratch): the stand-in checkout directory is literally named "..scratch"')
-    assert.throws(() => makeScratchRoot('probe-', { tmpBase: join(repo, 'lib'), repoRoot: repo }), /refusing to create a scratch root/, 'creation: tmp base inside the ..scratch checkout is refused')
-    const inside = join(repo, 'lib', 'x'); mkdirSync(inside)
-    assert.throws(() => assertSafeToDelete(inside, inside, { tmpBase: repo, repoRoot: repo }), /refusing to delete/, 'deletion: a directory inside the ..scratch checkout is refused')
+    const repo = join(world.root, 'checkout')
+    const dotted = join(repo, '..scratch') // a directory INSIDE the checkout whose name begins with two dots
+    mkdirSync(dotted, { recursive: true })
+    console.log('precondition (..scratch): a directory named "..scratch" inside the stand-in checkout')
+    assert.throws(() => makeScratchRoot('probe-', { tmpBase: dotted, repoRoot: repo }), /refusing to create a scratch root/, 'creation: a tmp base named ..scratch inside the checkout is refused')
+    const inside = join(dotted, 'x'); mkdirSync(inside)
+    assert.throws(() => assertSafeToDelete(inside, inside, { tmpBase: repo, repoRoot: repo }), /refusing to delete/, 'deletion: a directory under a ..scratch directory inside the checkout is refused')
     assert.ok(existsSync(inside))
   } finally { world.dispose() }
 })
