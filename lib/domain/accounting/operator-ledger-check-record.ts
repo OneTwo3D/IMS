@@ -280,7 +280,7 @@ export async function recordOperatorLedgerCheck(
       code: 'LEDGER_CHANGED',
       error: `The ledger now shows ${assessed.records.length === 1 ? 'a different unreadable settlement' : 'a different set of unreadable settlements'} `
         + `for this document (${assessed.records.map((record) => record.id).join(', ')}) from the ones this check names. `
-        + 'Nothing was recorded. Reopen the check, look at every settlement it lists, and record it again.',
+        + 'Nothing was recorded. Reopen the check and look at every settlement it now lists; it can be submitted again once you have.',
     }
   }
   const note = typeof input.note === 'string' && input.note.trim() !== '' ? input.note.trim().slice(0, NOTE_LIMIT) : null
