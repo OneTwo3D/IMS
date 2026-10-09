@@ -9,6 +9,7 @@ import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
 import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
+import { XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 
 const XERO_CONNECTOR = 'xero'
 
@@ -49,6 +50,12 @@ type SyncXeroAccountBalanceSnapshotsOptions = {
   balanceDate?: Date | string
   accountCodes?: string[]
   syncRunId?: string
+  /**
+   * Set ONLY by the scheduled pull. Records the read-sync last-success stamp, in the same transaction
+   * as the snapshots, when the pull stored a snapshot for every configured account without an error.
+   * An on-demand refresh (one date, one account) is a different thing and never sets it.
+   */
+  recordScheduledPullSuccess?: boolean
 }
 
 type MatchedAccount = {
@@ -260,7 +267,27 @@ export async function syncXeroAccountBalanceSnapshots(
     syncRunId: options.syncRunId ?? null,
   })
 
-  const fenced = await withXeroConnectionFence(connection, (tx) => persistAccountingAccountBalanceSnapshots(snapshots, tx as never))
+  const fenced = await withXeroConnectionFence(connection, async (tx) => {
+    const stored = await persistAccountingAccountBalanceSnapshots(snapshots, tx as never)
+    // The last-success stamp is written in THIS transaction, after the snapshots, and only for a clean
+    // scheduled pull that stored a snapshot for every distinct account it was configured to fetch. A
+    // pull that fetched but matched no configured account in the chart (nothing to store), one that
+    // stored only some of them, or one that collected any error never advances it.
+    if (
+      options.recordScheduledPullSuccess === true
+      && errors.length === 0
+      && stored.persisted > 0
+      && stored.persisted === new Set(requestedCodes).size
+    ) {
+      const stampedAt = new Date().toISOString()
+      await tx.setting.upsert({
+        where: { key: XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING },
+        create: { key: XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING, value: stampedAt },
+        update: { value: stampedAt },
+      })
+    }
+    return stored
+  })
   if (!fenced.ok) return { fetched: parsedRows.length, persisted: 0, skipped: accounts.length, errors: [fenced.error] }
   const persisted = fenced.value
   return {
