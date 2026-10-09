@@ -421,6 +421,9 @@ test('the same incomplete answer on an ORDINARY pre-create lookup binds nothing 
   extraMalformedComponent = false
 })
 
+function withinSeconds(promise: Promise<void>, what: string): Promise<void> {
+  return Promise.race([promise, new Promise<void>((_, reject) => setTimeout(() => reject(new Error(what)), 8000))])
+}
 const AGE = (ms: number) => new Date(Date.now() - ms)
 
 test('operator path: LINK binds the claim to the Mintsoft id the operator found; a stale page and a bad id change nothing', async () => {
@@ -608,7 +611,7 @@ test('A PAUSED WORKER CANNOT SEND OVER A RELEASE: paused after its sent mark, cl
   const reached = new Promise<void>((resolve) => { fenceReached = resolve })
   putMode = 'drop-unseen'
   const paused = runSync() // worker A: marks the claim SENT, then freezes at the fence, before any PUT
-  await reached
+  await withinSeconds(reached, 'the worker never reached its pre-send fence')
   const claim = sentRows()[0]!
   assert.equal(puts(), 0, 'precondition: worker A has sent nothing yet')
   claim.updatedAt = AGE(60 * 60 * 1000) // an hour passes
@@ -644,7 +647,7 @@ test('A LATE FINISH NEVER OVERWRITES AN OPERATOR\'S LINK: the create succeeds, t
   const reached = new Promise<void>((resolve) => { finalizeReached = resolve })
   putMode = 'ok' // Mintsoft creates bundle 900 and answers
   const worker = runSync()
-  await reached
+  await withinSeconds(reached, 'the worker never reached its finalize')
   const claim = sentRows()[0]!
   assert.equal(puts(), 1, 'precondition: the create was sent and answered; the worker is parked before writing the link')
   const linked = await resolveKeptBundleClaim({ claimId: claim.id, claimValue: claim.externalBundleId, resolution: { kind: 'link', externalBundleId: '777' }, userId: 'u1' })
