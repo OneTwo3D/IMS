@@ -4992,7 +4992,7 @@ if ! $SKIP_MIGRATE; then
     echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/run-migration-verifications.mjs  (as ${APP_USER})"
   else
     verify_hook_rc=0
-    as_app_user_db node scripts/run-migration-verifications.mjs || verify_hook_rc=$?
+    as_app_user_db node scripts/run-migration-verifications.mjs --require-entry || verify_hook_rc=$?
     # AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
     # Here rather than after `prisma migrate deploy`, because every one of the five consumers above
     # -- the drain probe, prisma, the drift check, the object-access check and this verification

@@ -4143,7 +4143,13 @@ or, as root with the admin credential in the file or on the invocation,
 `node /etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs --ensure-migration-role --app-host=… --app-port=… --app-user=… --app-database=… --migration-role=…`,
 which creates the role only if it is absent and **refuses**, by name, one that exists with a
 privilege it must not have (it never demotes a role somebody else made). The path through the `app`
-symlink works: the helper compares its own resolved location with the resolved `argv[1]`, where it used
+symlink works, **and an entry path the helper cannot vouch for fails instead of passing**: `fence-db-connections.mjs`,
+`check-app-db-object-access.mjs` and `run-migration-verifications.mjs` exit **70** (with a message naming the problem) when
+their own start path cannot be resolved or resolves to some other file while being named like themselves; they used to
+treat that as "imported", run nothing and exit 0, which every shell caller reads as a passed check. The shell
+entrypoints start the verification and object-access helpers with `--require-entry`, so for them any case where the
+helper is not the entry point is exit 70 too.
+The symlink resolution itself: the helper compares its own resolved location with the resolved `argv[1]`, where it used
 to compare it with the path as typed, which made `main()` skip and the command exit `0` having done
 nothing (the same guard was fixed in `check-app-db-object-access.mjs` and `run-migration-verifications.mjs`).
 

@@ -14,9 +14,10 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
+import { pathToFileURL } from 'node:url'
 
 import { EXIT_ERROR, assessUnrecordedRelease, STATE_ABSENT } from '@/scripts/fence-db-connections.mjs'
 
@@ -362,3 +363,95 @@ for (const [name, source] of [['install.sh', INSTALL], ['update.sh', UPDATE], ['
     assert.equal(trues.length, 1, `${name}: exactly one statement can set the verified state`)
   })
 }
+
+// ---------------------------------------------------------------------------
+// entry guard -- a program that cannot tell it is the entry point must FAIL, never exit 0 having done nothing
+// ---------------------------------------------------------------------------
+
+const GUARD_HELPERS = ['fence-db-connections.mjs', 'check-app-db-object-access.mjs', 'run-migration-verifications.mjs'] as const
+
+type Guard = (o: { entry?: string; resolve?: (p: string) => string; url?: string; exit?: (c: number) => never; say?: (m: string) => void }) => boolean
+
+async function guardOf(helper: string): Promise<Guard> {
+  const mod = (await import(`../../scripts/${helper}`)) as { isMainModule: Guard }
+  assert.equal(typeof mod.isMainModule, 'function', `${helper} must export isMainModule`)
+  return mod.isMainModule
+}
+
+for (const helper of GUARD_HELPERS) {
+  test(`entry guard: ${helper} fails closed when it cannot establish whether it is the entry point`, async () => {
+    const isMainModule = await guardOf(helper)
+    const url = pathToFileURL(join(REPO, 'scripts', helper)).href
+    class Exited extends Error {
+      constructor(readonly code: number) { super(`exit ${code}`) }
+    }
+    const exit = (code: number): never => { throw new Exited(code) }
+    const said: string[] = []
+    const run = (o: Parameters<Guard>[0]): string => {
+      try { return String(isMainModule({ url, exit, say: (m) => said.push(m), ...o })) } catch (e) { return e instanceof Exited ? `EXIT ${e.code}` : `THROW ${e}` }
+    }
+    const missing = (): string => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) }
+    const table: Array<[string, Parameters<Guard>[0], string]> = [
+      ['no entry script (node -e, REPL)', { entry: '' }, 'false'],
+      ['entry resolves to this file', { entry: `/x/${helper}`, resolve: () => join(REPO, 'scripts', helper) }, 'true'],
+      ['entry path cannot be resolved (removed after start)', { entry: `/x/${helper}`, resolve: missing }, 'EXIT 70'],
+      ['entry named like this file now resolves elsewhere (swapped)', { entry: `/x/${helper}`, resolve: () => '/tmp/some-other-file.mjs' }, 'EXIT 70'],
+      ['a different program that imports this module', { entry: '/x/a-test.test.ts', resolve: () => '/x/a-test.test.ts' }, 'false'],
+      ['a different program whose own path cannot be resolved', { entry: '/x/a-test.test.ts', resolve: missing }, 'EXIT 70'],
+    ]
+    for (const [label, o, want] of table) {
+      const got = run(o)
+      console.log(`  ${helper}: ${label} -> ${got}`)
+      assert.equal(got, want, label)
+    }
+    assert.ok(said.some((m) => /cannot resolve the path it was started with/.test(m) && /Exit 70/.test(m)), 'the unresolved case names the problem and the status')
+    assert.ok(said.some((m) => /resolves to/.test(m) && /not to this file/.test(m)), 'the swapped case names the problem')
+  })
+
+  test(`entry guard: ${helper} started with --require-entry runs when it is the entry and fails when it is not`, async () => {
+    await withTempDir('ims-entry-guard-', async (root) => {
+      const importer = join(root, 'importer.mjs')
+      writeFileSync(importer, `import { isMainModule } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', helper)).href)}\nconsole.log('GUARD=' + isMainModule())\n`)
+      const run = (file: string, args: string[]) => {
+        const r = spawnSync(process.execPath, [file, ...args], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
+        return { status: r.status, out: `${r.stdout}${r.stderr}` }
+      }
+      const plain = run(importer, [])
+      const required = run(importer, ['--require-entry'])
+      console.log(`  ${helper}: imported without the flag -> ${JSON.stringify(plain.out.trim())}; with the flag -> rc=${required.status} ${JSON.stringify(required.out.trim().slice(0, 90))}`)
+      assert.match(plain.out, /GUARD=false/, 'precondition: an importer is not the entry')
+      assert.equal(required.status, 70, 'but a caller that said --require-entry gets a failure, not a silent skip')
+      assert.match(required.out, /not to this file/)
+      // And as the real entry, the flag is accepted and removed before the option parser sees it.
+      const direct = run(join(REPO, 'scripts', helper), ['--require-entry'])
+      console.log(`  ${helper}: run as the entry with the flag -> rc=${direct.status} ${JSON.stringify(direct.out.trim().slice(0, 80))}`)
+      assert.ok(direct.out.length > 0, 'the helper ran (it speaks)')
+      assert.doesNotMatch(direct.out, /require-entry/, 'and its argument parser never saw the flag')
+    })
+  })
+}
+
+test('entry guard: the three copies are byte-identical, and every shell caller of the two simple helpers says --require-entry', () => {
+  const copy = (helper: string): string => {
+    const s = read(`scripts/${helper}`)
+    const start = s.indexOf('// Exit status when this file cannot establish')
+    const end = s.indexOf('\nif (isMainModule())', start)
+    assert.ok(start > 0 && end > start, `precondition: guard found in ${helper}`)
+    return s.slice(start, end)
+  }
+  const [a, b, c] = GUARD_HELPERS.map(copy)
+  console.log(`  guard source: ${a.split('\n').length} lines in each of ${GUARD_HELPERS.length} helpers`)
+  assert.equal(b, a)
+  assert.equal(c, a)
+  let sites = 0
+  for (const [name, source] of [['install.sh', INSTALL], ['update.sh', UPDATE], ['deploy.sh', DEPLOY]] as const) {
+    const calls = source.split('\n').filter((l) => !/^\s*#/.test(l) && !/\[DRY\]|echo|^\s*\[\[|die|warn|info/.test(l) &&
+      (/\bnode "\$\{APP_DIR\}\/scripts\/run-migration-verifications\.mjs"/.test(l) || /\bnode scripts\/run-migration-verifications\.mjs/.test(l) || /\bnode "\$\{DB_OBJECT_ACCESS_SCRIPT\}"/.test(l)))
+    for (const l of calls) {
+      sites++
+      assert.match(l, /--require-entry/, `${name}: ${l.trim()}`)
+    }
+  }
+  console.log(`  shell call sites of the verification and object-access helpers: ${sites}`)
+  assert.equal(sites, 5, 'precondition: 3 verification call sites + 2 object-access call sites were found')
+})

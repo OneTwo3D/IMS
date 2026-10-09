@@ -9302,7 +9302,7 @@ header "Checking the application role can use what the migration created"
 
 object_access_rc=0
 run_as_user_db \
-  node "${DB_OBJECT_ACCESS_SCRIPT}" --state-file="${DB_FENCE_STATE}" \
+  node "${DB_OBJECT_ACCESS_SCRIPT}" --require-entry --state-file="${DB_FENCE_STATE}" \
   || object_access_rc=$?
 # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The object-access check"
@@ -9322,7 +9322,7 @@ header "Running the migrations' own verification checks"
 
 verify_hook_rc=0
 run_as_user_db \
-  node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
+  node "${APP_DIR}/scripts/run-migration-verifications.mjs" --require-entry \
   || verify_hook_rc=$?
 # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The verification hook"

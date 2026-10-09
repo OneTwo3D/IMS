@@ -171,8 +171,8 @@
 
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
-import { dirname } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { dirname, basename } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // THE ONLY BARE SPECIFIER LEFT, AND THAT IS THE POINT (o3d-2sm1.5 r32, Codex CRITICAL).
 //
@@ -4373,16 +4373,51 @@ async function main() {
   }
 }
 
+// Exit status when this file cannot establish whether it is the program that was started (see
+// isMainModule). Distinct from the helper's own refusal codes, and the same in all three helpers.
+const EXIT_ENTRY_UNVERIFIED = 70
+
+// IS THIS FILE THE PROGRAM BEING RUN, OR IS IT BEING IMPORTED?
+//
 // process.argv[1] is the path the command was TYPED with, and import.meta.url is the path Node
-// RESOLVED (symlinks followed). Invoked through a symlink -- the documented
-// /etc/ims-cutover-recovery/app/... path is one -- the two differed, main() never ran and the command
-// exited 0 having done nothing. Compare like with like.
-function isMainModule() {
+// RESOLVED (symlinks followed): invoked through the documented `app` symlink the two differ, so the
+// comparison is against the realpath of argv[1].
+//
+// AND A DOUBT IS NEVER "IMPORTED". An earlier version of this guard returned false whenever the path
+// could not be resolved, so a program whose entry path had disappeared or been swapped between the
+// start of the run and this line skipped main(), ran nothing, and exited 0 -- which every shell caller
+// reads as "the check passed". The only silent `false` left is the one that is true: there is no entry
+// script (`node -e`, a REPL), or the entry script is some OTHER file (a test importing this module).
+// Everything else fails closed with EXIT_ENTRY_UNVERIFIED:
+//   * argv[1] is set and cannot be resolved;
+//   * argv[1] resolves to a different file but is NAMED like this one (the shape of a swapped path);
+//   * the caller said `--require-entry` (the shell entrypoints do) and this is not the entry.
+// `--require-entry` is removed from process.argv here so the option parser never sees it.
+// The parameters exist so a test can stub the resolver and the exit.
+export function isMainModule({
+  entry = process.argv[1],
+  resolve = realpathSync,
+  url = import.meta.url,
+  exit = process.exit,
+  say = console.error,
+} = {}) {
+  if (!entry) return false
+  const required = entry === process.argv[1] && process.argv.includes('--require-entry')
+  if (required) process.argv.splice(process.argv.indexOf('--require-entry'), 1)
+  const here = fileURLToPath(url)
+  let resolved
   try {
-    return import.meta.url === pathToFileURL(realpathSync(process.argv[1] ?? '')).href
-  } catch {
-    return false
+    resolved = resolve(entry)
+  } catch (error) {
+    say(`${basename(here)}: cannot resolve the path it was started with (${JSON.stringify(entry)}: ${error?.code ?? error}). Refusing to continue: a program that cannot tell whether it is the entry point would run nothing and exit 0. Exit ${EXIT_ENTRY_UNVERIFIED}.`)
+    return exit(EXIT_ENTRY_UNVERIFIED)
   }
+  if (url === pathToFileURL(resolved).href) return true
+  if (required || basename(entry) === basename(here)) {
+    say(`${basename(here)}: it was started as ${JSON.stringify(entry)}, which resolves to ${JSON.stringify(resolved)}, not to this file. Refusing to continue rather than run nothing and exit 0. Exit ${EXIT_ENTRY_UNVERIFIED}.`)
+    return exit(EXIT_ENTRY_UNVERIFIED)
+  }
+  return false
 }
 
 if (isMainModule()) {

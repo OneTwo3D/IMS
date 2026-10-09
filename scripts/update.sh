@@ -5666,7 +5666,7 @@ success "Database schema matches prisma/schema.prisma."
 header "Checking the application role can use what the migration created"
 object_access_rc=0
 run run_as_user_db \
-  node "${DB_OBJECT_ACCESS_SCRIPT}" --state-file="${DB_FENCE_STATE}" \
+  node "${DB_OBJECT_ACCESS_SCRIPT}" --require-entry --state-file="${DB_FENCE_STATE}" \
   || object_access_rc=$?
 # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
 pin_migration_window "The object-access check"
@@ -5688,7 +5688,7 @@ if $DRY_RUN; then
 else
   verify_hook_rc=0
   run_as_user_db \
-    node "${APP_DIR}/scripts/run-migration-verifications.mjs" \
+    node "${APP_DIR}/scripts/run-migration-verifications.mjs" --require-entry \
     || verify_hook_rc=$?
   # AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
   # Here rather than after `prisma migrate deploy`, because every consumer above -- the drain
