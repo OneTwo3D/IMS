@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Readiness gate (`npm run readiness:gate`) and a stricter rollout-readiness endpoint
+
+- **New: `npm run readiness:gate -- --phase P0|P1|P2`** reduces the switchover checks to one verdict (GO, GO-WITH-ACCEPTED-WARNINGS, NO-GO) with a JSON and Markdown report. It performs no database or checkout write. Documented in docs/installation.md, "Readiness gate".
+- **Changed behaviour of `/api/admin/rollout-readiness`: a PARTIAL newest accounting reconciliation run now BLOCKS (HTTP 412, including with `?allowWarnings=true`).** It used to be a warning that `allowWarnings=true` turned into 200. A FAILED newest run, or one with a status the check does not recognise, also cannot prove completeness; only a COMPLETED run can clear an earlier truncation; an unreadable newest-run read is a blocker instead of a warning; a truncated newest run is a blocker; runs created at the same instant are read together and judged as the worst of them, and never clear each other's truncations.
+
 ### WooCommerce initial-import rehearsal (`npm run rehearse:woo-import`)
 
 - **The real initial order import can now be rehearsed against a local fake WooCommerce store.** It runs the

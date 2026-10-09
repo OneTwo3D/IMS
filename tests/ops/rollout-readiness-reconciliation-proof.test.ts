@@ -516,3 +516,63 @@ test('[o3d-6e4v] a newest run that did not COMPLETE never proves completeness, w
     assert.equal(proof.state === 'not-proven' ? proof.newestNotCompleted : null, true)
   }
 })
+
+// ---------------------------------------------------------------------------------------------------
+// THE TIE RULE: runs with the same createdAt have no provable order.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-6e4v] tie rule, pure: the newest group is assessed as its WORST member with the UNION of truncations', async () => {
+  const { mergeTiedNewestRuns, runIsStrictlyLater } = await import('../../lib/ops/reconciliation-proof.ts')
+  const m = (id: string, status: string, truncations: unknown) => ({ id, status, truncations })
+  const table: Array<[string, ReturnType<typeof m>[], { id: string; status: string; truncations: unknown }]> = [
+    ['one run', [m('a', 'COMPLETED', [])], { id: 'a', status: 'COMPLETED', truncations: [] }],
+    ['completed + partial', [m('a', 'COMPLETED', []), m('b', 'PARTIAL', [])], { id: 'b', status: 'PARTIAL', truncations: [] }],
+    ['partial + completed (order of input is irrelevant)', [m('b', 'PARTIAL', []), m('a', 'COMPLETED', [])], { id: 'b', status: 'PARTIAL', truncations: [] }],
+    ['completed + failed + partial', [m('a', 'COMPLETED', []), m('c', 'PARTIAL', []), m('b', 'FAILED', [])], { id: 'b', status: 'FAILED', truncations: [] }],
+    ['an unknown status is the worst', [m('a', 'FAILED', []), m('z', 'ODD', [])], { id: 'z', status: 'ODD', truncations: [] }],
+    ['completed + completed, one truncated', [m('a', 'COMPLETED', []), m('b', 'COMPLETED', [{ code: 'x' }])], { id: 'a', status: 'COMPLETED', truncations: [{ code: 'x' }] }],
+    ['two truncated: union', [m('a', 'COMPLETED', [{ code: 'x' }]), m('b', 'COMPLETED', [{ code: 'y' }])], { id: 'a', status: 'COMPLETED', truncations: [{ code: 'x' }, { code: 'y' }] }],
+    ['one unreadable dominates', [m('a', 'COMPLETED', [{ code: 'x' }]), m('b', 'COMPLETED', { unreadable: 'json-null' })], { id: 'a', status: 'COMPLETED', truncations: { unreadable: 'json-null' } }],
+    ['a NULL member leaves the group not recorded', [m('a', 'COMPLETED', []), m('b', 'COMPLETED', null)], { id: 'a', status: 'COMPLETED', truncations: null }],
+    ['a recorded truncation outranks a NULL member', [m('a', 'COMPLETED', null), m('b', 'COMPLETED', [{ code: 'x' }])], { id: 'a', status: 'COMPLETED', truncations: [{ code: 'x' }] }],
+  ]
+  for (const [label, members, want] of table) {
+    const got = mergeTiedNewestRuns(members)
+    assert.deepEqual({ id: got.id, status: got.status, truncations: got.truncations }, want, label)
+    assert.deepEqual(got.tiedRunIds, members.map((x) => x.id).sort(), label)
+  }
+  console.log(`precondition: ${table.length} tie shapes merged`)
+  assert.throws(() => mergeTiedNewestRuns([]))
+  assert.equal(runIsStrictlyLater({ createdAt: iso(1) }, { createdAt: iso(2) }), true)
+  assert.equal(runIsStrictlyLater({ createdAt: iso(2) }, { createdAt: iso(2) }), false, 'equal timestamps are not "later"')
+})
+
+test('[o3d-6e4v] tie rule, history: equal-createdAt runs never cover each other, whatever their ids [mutation: ties ordered by id]', () => {
+  const T = { ...run('a-truncated', 3, 90, [truncation(ROW_CAP)]) }
+  const cover = { ...run('b-complete', 3, 200, []) } // SAME createdAt as T, a window that contains T's, id sorts after
+  const sameInstant = evaluateReconciliationProof({ id: 'b-complete', status: 'COMPLETED', truncations: [] }, { runs: [T, cover], overflow: false, recordedBeforeNewest: true })
+  assert.equal(sameInstant.state, 'not-proven')
+  assert.deepEqual(sameInstant.state === 'not-proven' ? sameInstant.unresolved.map((u) => u.runId) : null, ['a-truncated'])
+  // Control: the same cover created one millisecond later DOES clear it.
+  const later = { ...cover, createdAt: new Date(Date.parse(T.createdAt) + 1).toISOString() }
+  assert.equal(evaluateReconciliationProof({ id: 'b-complete', status: 'COMPLETED', truncations: [] }, { runs: [T, later], overflow: false, recordedBeforeNewest: true }).state, 'proven')
+})
+
+test('[o3d-6e4v] tie rule, endpoint: a COMPLETED/PARTIAL tie blocks; a COMPLETED/COMPLETED tie with a truncation in one is not proven', async () => {
+  // The reader hands the merged worst member; the endpoint must block on it.
+  const { mergeTiedNewestRuns } = await import('../../lib/ops/reconciliation-proof.ts')
+  const members = [
+    { id: 'a-completed', status: 'COMPLETED', truncations: [] as unknown },
+    { id: 'b-partial', status: 'PARTIAL', truncations: [] as unknown },
+  ]
+  const merged = mergeTiedNewestRuns(members)
+  const { status, blockers } = await verdict({ ...newestRun({ id: merged.id, status: merged.status as 'PARTIAL', truncations: merged.truncations }), tiedRunIds: merged.tiedRunIds }, noHistory)
+  assert.equal(status, 'blocked')
+  assert.ok(blockers.includes('accounting-reconciliation:newest-run-not-completed'))
+  // Completed + completed, one truncated, same instant: the merged group carries the truncation and nothing later clears it.
+  const tied = mergeTiedNewestRuns([{ id: 'a', status: 'COMPLETED', truncations: [truncation(ROW_CAP)] }, { id: 'b', status: 'COMPLETED', truncations: [] }])
+  const history: ReconciliationHistory = { runs: [run('a', 0, 90, [truncation(ROW_CAP)]), run('b', 0, 200, [])], overflow: false, recordedBeforeNewest: true }
+  const second = await verdict(newestRun({ id: tied.id, truncations: tied.truncations }), history)
+  assert.equal(second.status, 'blocked')
+  assert.ok(second.blockers.includes('accounting-reconciliation:truncation-unresolved'))
+})

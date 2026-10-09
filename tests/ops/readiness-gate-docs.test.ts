@@ -135,3 +135,14 @@ test('package.json defines the command the docs name', () => {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
   assert.equal(pkg.scripts['readiness:gate'], 'tsx scripts/readiness-gate.ts')
 })
+
+test('the changed endpoint behaviour is stated in the docs block AND the changelog: a PARTIAL newest run blocks, allowWarnings or not', () => {
+  const doc = readFileSync(join(ROOT, 'docs/installation.md'), 'utf8')
+  const block = blocksIn(doc).find((b) => b.id === 'endpoint')
+  assert.ok(block, 'precondition: the endpoint block is in the docs')
+  for (const phrase of ['HTTP 412', '?allowWarnings=true', 'PARTIAL', 'FAILED', 'Changed behaviour', 'same instant']) assert.ok(block.body.includes(phrase), `docs block names ${phrase}`)
+  const changelog = readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8')
+  const unreleased = changelog.slice(changelog.indexOf('## Unreleased'), changelog.indexOf('\n## ', changelog.indexOf('## Unreleased') + 5) === -1 ? undefined : changelog.indexOf('\n## ', changelog.indexOf('## Unreleased') + 5))
+  console.log(`precondition: changelog Unreleased section is ${unreleased.length} characters`)
+  for (const phrase of ['/api/admin/rollout-readiness', 'PARTIAL', 'BLOCKS', '412', 'allowWarnings=true']) assert.ok(unreleased.includes(phrase), `changelog names ${phrase}`)
+})

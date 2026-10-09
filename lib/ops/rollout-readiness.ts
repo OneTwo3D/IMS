@@ -16,6 +16,7 @@ import {
 } from '@/lib/ops/production-preflight'
 import {
   evaluateReconciliationProof,
+  mergeTiedNewestRuns,
   type ReconciliationHistory,
   type ReconciliationProof,
 } from '@/lib/ops/reconciliation-proof'
@@ -87,6 +88,8 @@ export type LatestAccountingReconciliationRun = {
   fromDate?: string | null
   toDate?: string | null
   truncations?: unknown
+  /** Every run that shares this run's createdAt (it is the worst of them); more than one means the order is unprovable. */
+  tiedRunIds?: string[]
 }
 
 export type RolloutReadinessResponse = {
@@ -329,37 +332,44 @@ export function createRolloutReadinessHandler({
   }
 }
 
-type ReconciliationRunReader = Pick<typeof db, 'accountingReconciliationRun'>
+type ReconciliationRunReader = ReconciliationHistoryClient
 
+/**
+ * The newest run. When several terminal runs share the greatest createdAt they are ALL read and merged as their worst
+ * member (lib/ops/reconciliation-proof.ts, THE TIE RULE): `findFirst ... orderBy createdAt` picks one of them arbitrarily,
+ * and a COMPLETED pick over a PARTIAL tie reads as ready without assessing the run that should block.
+ * Raw SQL so the JSON `null` / SQL NULL distinction of `truncations` survives, as in the history reader.
+ */
 async function readLatestAccountingReconciliationRun(client: ReconciliationRunReader): Promise<LatestAccountingReconciliationRun | null> {
-  const latest = await client.accountingReconciliationRun.findFirst({
-    where: {
-      status: {
-        in: [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES],
-      },
-    },
-    orderBy: { createdAt: 'desc' },
-    select: {
-      id: true,
-      status: true,
-      totalCount: true,
-      warningCount: true,
-      criticalCount: true,
-      createdAt: true,
-      fromDate: true,
-      toDate: true,
-      truncations: true,
-    },
-  })
-
-  if (!latest) return null
+  const statuses = [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES]
+  const rows = await client.$queryRaw<Array<{
+    id: string; status: string; totalCount: number; warningCount: number; criticalCount: number
+    createdAt: Date; fromDate: Date | null; toDate: Date | null; truncations: unknown; payloadType: string | null
+  }>>`
+    SELECT "id", "status", "totalCount", "warningCount", "criticalCount", "createdAt", "fromDate", "toDate", "truncations",
+           jsonb_typeof("truncations") AS "payloadType"
+    FROM "accounting_reconciliation_runs"
+    WHERE "status" = ANY(${statuses}::text[])
+      AND "createdAt" = (SELECT MAX("createdAt") FROM "accounting_reconciliation_runs" WHERE "status" = ANY(${statuses}::text[]))
+    ORDER BY "id" ASC
+  `
+  if (rows.length === 0) return null
+  const members = rows.map((row) => ({
+    ...row,
+    truncations: row.payloadType === 'null' ? { unreadable: 'json-null' } : row.truncations,
+  }))
+  const merged = mergeTiedNewestRuns(members)
   return {
-    ...latest,
-    status: latest.status as AccountingReconciliationRunStatus,
-    createdAt: latest.createdAt.toISOString(),
-    fromDate: latest.fromDate?.toISOString() ?? null,
-    toDate: latest.toDate?.toISOString() ?? null,
-    truncations: latest.truncations,
+    id: merged.id,
+    status: merged.status as AccountingReconciliationRunStatus,
+    totalCount: members.reduce((sum, member) => sum + Number(member.totalCount), 0),
+    warningCount: members.reduce((sum, member) => sum + Number(member.warningCount), 0),
+    criticalCount: members.reduce((sum, member) => sum + Number(member.criticalCount), 0),
+    createdAt: merged.createdAt.toISOString(),
+    fromDate: merged.fromDate?.toISOString() ?? null,
+    toDate: merged.toDate?.toISOString() ?? null,
+    truncations: merged.truncations,
+    tiedRunIds: merged.tiedRunIds,
   }
 }
 

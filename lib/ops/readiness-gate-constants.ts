@@ -249,7 +249,7 @@ function renderChecksTable(): string {
 export const READINESS_GATE_DOC_BLOCK_OPEN = (id: string) => `<!-- readiness-gate:${id} -->`
 export const READINESS_GATE_DOC_BLOCK_CLOSE = (id: string) => `<!-- /readiness-gate:${id} -->`
 
-export type ReadinessGateDocBlockId = 'overview' | 'usage' | 'phases' | 'acceptances' | 'exit-codes'
+export type ReadinessGateDocBlockId = 'overview' | 'usage' | 'phases' | 'acceptances' | 'exit-codes' | 'endpoint'
 
 const PHASE_ROWS = READINESS_PHASES.map((phase) => `| ${phase} | ${READINESS_PHASE_MEANING[phase]} |`)
 
@@ -279,10 +279,13 @@ export const READINESS_GATE_DOC_BLOCKS: Record<ReadinessGateDocBlockId, string> 
     'A warning is not a failure, and it is not a pass either: it must be accepted in writing, one warning at a time, or the verdict is NO-GO. The acceptance file is JSON with `schemaVersion` 1 and an `acceptances` list. Every entry names exactly one warning by its `warningId` (no patterns, no wildcards) and carries `acceptedBy` (who), `acceptedAt` (when, an ISO time not in the future), `reason` (why, at least 15 characters), `expiresAt` (an ISO time after `acceptedAt`, no more than 90 days later) and `phases` (the phases it applies to, a non-empty list of P0, P1, P2). An entry that has expired, that is not yet in effect, that does not list the phase being asked about, or that is malformed does not accept anything; a file that cannot be read, has an unknown field, or names the same warning twice is rejected as a whole and nothing is accepted. A failure is never acceptable: only findings the report labels as warnings can be covered. An acceptance for a warning that no longer occurs is listed as unused and does no harm. Because an acceptance is a decision, the file is used only if it is a regular file (a symlink is never followed) owned by root or the account running the gate, not writable by group or others, in a directory whose every ancestor only root or that account can modify; otherwise the whole file is rejected, the report says why, and nothing is accepted.',
   ].join('\n'),
   'exit-codes': renderReadinessGateExitCodeTable(),
+  endpoint: [
+    'The `/api/admin/rollout-readiness` endpoint reads the same reconciliation findings as the gate. These are blockers there: the endpoint answers HTTP 412 and `?allowWarnings=true` does NOT turn them into 200, because that override records no reason: an unresolved truncation, an unreadable completeness record, a run history that could not be evaluated, a newest-run read that failed, a newest run whose own report recorded a truncation, and a newest run that did not complete. **Changed behaviour:** a newest run with status PARTIAL used to be only a warning that `?allowWarnings=true` accepted; a PARTIAL or FAILED newest run (and any status the check does not recognise) is now a blocker, and only a COMPLETED run can ever clear an earlier truncation. Several runs created at the same instant are read together and judged as their worst member, and runs created at the same instant never clear each other\'s truncations, because their order cannot be proven.',
+  ].join('\n'),
 }
 
 export const READINESS_GATE_DOC_PLACEMENTS: ReadonlyArray<{ file: string; blocks: readonly ReadinessGateDocBlockId[] }> = [
-  { file: 'docs/installation.md', blocks: ['overview', 'usage', 'phases', 'acceptances', 'exit-codes'] },
+  { file: 'docs/installation.md', blocks: ['overview', 'usage', 'phases', 'acceptances', 'exit-codes', 'endpoint'] },
 ]
 
 export function renderReadinessGateDocBlock(id: ReadinessGateDocBlockId): string {

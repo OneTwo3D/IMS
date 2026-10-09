@@ -160,3 +160,44 @@ test('[o3d-6e4v] DB: a complete run committed BETWEEN the newest-run read and th
     await db.$executeRawUnsafe(`DELETE FROM "accounting_reconciliation_runs" WHERE "id" LIKE $1`, `${prefix}%`)
   }
 })
+
+// ---------------------------------------------------------------------------------------------------
+// TIES, through the SQL reader: two rows with the IDENTICAL createdAt (set explicitly).
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-6e4v] DB: tied newest runs are read as a GROUP: COMPLETED + PARTIAL blocks; COMPLETED + COMPLETED with a truncation in one is not proven', { skip }, async () => {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  const { db } = await import('../../lib/db')
+  const { getAccountingReconciliationSnapshot, collectAccountingReconciliationReadiness } = await import('../../lib/ops/rollout-readiness')
+  const prefix = `rrtie-${Date.now().toString(36)}-`
+  const AT = '2099-06-01T00:00:00'
+  const insert = (id: string, status: string, from: string, truncations: string) => db.$executeRawUnsafe(
+    `INSERT INTO "accounting_reconciliation_runs"
+       ("id", "fromDate", "toDate", "status", "totalCount", "warningCount", "criticalCount", "createdAt", "truncations")
+     VALUES ($1, $2::timestamp, $3::timestamp, $4, 0, 0, 0, $5::timestamp, $6::jsonb)`,
+    id, from, AT, status, AT, truncations,
+  )
+  const readiness = async () => collectAccountingReconciliationReadiness({ accountingReconciliationSnapshot: () => getAccountingReconciliationSnapshot() }, new Date('2099-06-02T00:00:00Z'))
+  try {
+    // Shape 1: COMPLETED (id sorts first) and PARTIAL at the same instant.
+    await insert(`${prefix}a`, 'COMPLETED', '2099-03-01T00:00:00', '[]')
+    await insert(`${prefix}b`, 'PARTIAL', '2099-03-01T00:00:00', '[]')
+    const snapshot = await getAccountingReconciliationSnapshot()
+    console.log(`precondition: newest group ${JSON.stringify(snapshot.latest?.tiedRunIds)} status ${snapshot.latest?.status}`)
+    assert.deepEqual(snapshot.latest?.tiedRunIds, [`${prefix}a`, `${prefix}b`], 'both tied rows were read')
+    assert.equal(snapshot.latest?.status, 'PARTIAL', 'the group is assessed as its worst member')
+    const first = await readiness()
+    assert.ok(first.blockers.some((b) => b.id === 'accounting-reconciliation:newest-run-not-completed'), 'COMPLETED/PARTIAL tie blocks')
+
+    // Shape 2: COMPLETED + COMPLETED at the same instant, one truncated, the OTHER one's window containing it.
+    await db.$executeRawUnsafe(`DELETE FROM "accounting_reconciliation_runs" WHERE "id" LIKE $1`, `${prefix}%`)
+    await insert(`${prefix}a`, 'COMPLETED', '2099-03-01T00:00:00', TRUNCATED)
+    await insert(`${prefix}b`, 'COMPLETED', '2098-01-01T00:00:00', '[]')
+    const second = await readiness()
+    assert.ok(second.blockers.some((b) => b.id === 'accounting-reconciliation:truncation-unresolved'), 'a tied member cannot clear its sibling: not proven, blocked')
+    assert.notEqual(second.proof?.state, 'proven')
+  } finally {
+    await db.$executeRawUnsafe(`DELETE FROM "accounting_reconciliation_runs" WHERE "id" LIKE $1`, `${prefix}%`)
+  }
+})

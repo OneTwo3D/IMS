@@ -56,6 +56,43 @@ import {
  */
 export const COVERING_RUN_STATUSES: readonly string[] = ['COMPLETED']
 
+/**
+ * THE TIE RULE. `createdAt` is a millisecond timestamp (the column is timestamp(3)); two runs that carry the same value
+ * have no order the database can prove, and ordering them by id would be inventing one. So:
+ *  - one run covers another only if it was created STRICTLY later (runIsStrictlyLater);
+ *  - the "newest run" is the whole group of runs sharing the greatest createdAt, assessed as its WORST member
+ *    (mergeTiedNewestRuns): any member that did not COMPLETE makes the newest run not completed, and the members'
+ *    truncation records are unioned.
+ */
+export function runIsStrictlyLater(candidate: { createdAt: string }, earlier: { createdAt: string }): boolean {
+  return Date.parse(candidate.createdAt) > Date.parse(earlier.createdAt)
+}
+
+const STATUS_BADNESS: Record<string, number> = { COMPLETED: 0, PARTIAL: 1, FAILED: 2 }
+const badness = (status: string): number => STATUS_BADNESS[status] ?? 3 // an unknown status is the worst
+
+export type TiedRun = { id: string; status: string; truncations: unknown }
+
+/**
+ * The newest run, when several runs share the greatest createdAt: the worst member (greatest badness, then smallest id for
+ * determinism), carrying the UNION of the members' truncation records. A member that cannot be read dominates (the group
+ * is then unreadable); otherwise any recorded truncation is kept; otherwise a NULL member leaves the group not-recorded;
+ * otherwise the group recorded `[]`. Returns the member list so callers can say which runs tied.
+ */
+export function mergeTiedNewestRuns<T extends TiedRun>(members: readonly T[]): T & { tiedRunIds: string[] } {
+  if (members.length === 0) throw new Error('mergeTiedNewestRuns needs at least one run')
+  const sorted = [...members].sort((a, b) => badness(b.status) - badness(a.status) || a.id.localeCompare(b.id))
+  const worst = sorted[0]!
+  const unreadable = members.find((member) => member.truncations !== null && !Array.isArray(member.truncations))
+  const recorded = members.flatMap((member) => (Array.isArray(member.truncations) ? member.truncations : []))
+  let truncations: unknown
+  if (unreadable) truncations = unreadable.truncations
+  else if (recorded.length > 0) truncations = recorded
+  else if (members.some((member) => member.truncations === null)) truncations = null
+  else truncations = []
+  return { ...worst, truncations, tiedRunIds: members.map((member) => member.id).sort() }
+}
+
 export type ReconciliationHistoryRun = {
   id: string
   /** The run's status as recorded. Only COVERING_RUN_STATUSES may cover. */
@@ -158,7 +195,9 @@ export function evaluateReconciliationProof(
     if (codes === 'not-recorded') return
     const lost = codes === 'unreadable' ? [EVERY_CHECK] : codes
     if (lost.length === 0) return
-    const later = read.slice(index + 1)
+    // THE TIE RULE (single-sourced here; the newest-run reader groups by the same equality): runs with the SAME createdAt
+    // have no provable order, so they never cover each other. Only a run created STRICTLY later can clear a truncation.
+    const later = read.filter(({ run: candidate }) => runIsStrictlyLater(candidate, run))
     for (const code of lost) {
       const coveringRuns = later.filter(({ run: laterRun, codes: laterCodes }) => {
         // A run that did not COMPLETE covers nothing, whatever its truncations array says.
