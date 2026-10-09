@@ -73,6 +73,8 @@ export const SHIPPED = [
   'load_existing_env',
   'env_percent_decode',
   'env_percent_encode',
+  'env_token_decode',
+  'env_value_token_leaks_secret',
   'env_value_leaks_secret',
   'env_value_has_shape',
   'env_value_has_residual_escape',

@@ -918,8 +918,10 @@ The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: 
   `WC_WRITES_LIVE_FROM`, `WC_WRITEBACK_ALLOWED_ORIGIN`, the `MINTSOFT_*` write and sweep settings, the
   `OUTBOX_RETRY_*`, `CONNECTOR_FETCH_*`, `FRESH_AUTH_MAX_AGE_SECONDS`, `INVOICE_PDF_TOKEN_*` and
   `DATABASE_RESTORE_MAX_FILE_BYTES` limits -- (exact, case-sensitive names) **and** its value has the shape that
-  setting can have (a boolean, a number, a comma-separated list of hosts or CIDRs, a list of tenant ids, an
-  origin, a timestamp; bounded length, closed character set, one line), **and** it passes the admin-secret
+  setting can have -- the format the application itself parses that setting from: a switch (`1 true yes on 0 false no off`, any
+  case, as the application reads them), a number, a comma-separated list of IP addresses or CIDRs, a comma-separated list of
+  Xero tenant ids (UUIDs), organisation names, an origin, an ISO-8601 UTC instant with a `Z`, the `<base URL>|<ClientId>`
+  Mintsoft grant, `memory`/`redis`, `enforce`/`report-only`/`off`; bounded length, closed character set, one line, **and** it passes the admin-secret
   screen below. The WooCommerce credentials and webhook secret, the Turnstile pair, the scanner settings, the
   domain, the port and the invoice directory are the installer's own keys and are kept by their prompts.
 * **Everything else is dropped from the new file, and said so.** Any other key -- an unlisted name, a listed
@@ -931,7 +933,7 @@ The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: 
   (they belong in `/etc/ims-db-admin/deploy-admin.env`).
 * **A security setting that cannot be carried stops the run.** The listed settings that tighten behaviour --
   the trusted-proxy settings, `REQUIRE_TRUSTED_PROXY_CONFIG`, `RATE_LIMIT_BACKEND`, `CSP_MODE`, the database-restore
-  switches, the `XERO_*` tenant allowlists and write grants, `MINTSOFT_WRITE_ALLOWED` and the connector write windows,
+  switches, `PREFLIGHT_DB_CONNECT` (without it the production preflight skips the database and schema checks), the connector and restore size caps, the `XERO_*` tenant allowlists and write grants, `MINTSOFT_WRITE_ALLOWED` and the connector write windows,
   `WC_WRITEBACK_ALLOWED_ORIGIN`, the fresh-auth and invoice-token lifetimes -- are never dropped silently, because
   dropping one loosens a control (a proxied production would get a preflight warning where it used to get a failure).
   If one is present and its value is not in a form that setting accepts, or fails the admin-secret screen, the run stops

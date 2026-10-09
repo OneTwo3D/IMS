@@ -39,7 +39,7 @@ const OLD_ENV = [
   'WC_WEBHOOK_SECRET=whsec_old',
   'TRUSTED_PROXY_IPS=10.0.0.1,10.0.0.2',
   'REQUIRE_TRUSTED_PROXY_CONFIG=true',
-  'XERO_ALLOWED_TENANT_IDS=tenant-a,tenant-b',
+  'XERO_ALLOWED_TENANT_IDS=123e4567-e89b-12d3-a456-426614174000,123e4567-e89b-12d3-a456-426614174001',
   'MY_FEATURE_FLAG=on',
   'FILE_SCAN_MODE=clamav',
   '',
@@ -79,6 +79,8 @@ const LIB = [
   shippedFunction(INSTALL, 'env_canonical_value'),
   shippedFunction(INSTALL, 'env_preserve_decision'),
   shippedFunction(INSTALL, 'env_key_is_security_control'),
+  shippedFunction(INSTALL, 'env_token_decode'),
+  shippedFunction(INSTALL, 'env_value_token_leaks_secret'),
   shippedFunction(INSTALL, 'env_value_leaks_secret'),
   shippedFunction(INSTALL, 'env_admin_password_decoded'),
   shippedFunction(INSTALL, 'env_unowned_existing_keys'),
@@ -104,7 +106,7 @@ test('re-run: only keys on the carry list are carried, verbatim; every other uno
     assert.match(r.out, /RC=0/)
     assert.match(r.out, /KEPT=REQUIRE_TRUSTED_PROXY_CONFIG TRUSTED_PROXY_IPS XERO_ALLOWED_TENANT_IDS\n/)
     assert.match(r.out, /^TRUSTED_PROXY_IPS=10\.0\.0\.1,10\.0\.0\.2$/m)
-    assert.match(r.out, /^XERO_ALLOWED_TENANT_IDS=tenant-a,tenant-b$/m)
+    assert.match(r.out, /^XERO_ALLOWED_TENANT_IDS=123e4567-e89b-12d3-a456-426614174000,123e4567-e89b-12d3-a456-426614174001$/m)
     const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
     assert.doesNotMatch(block, /^APP_PORT=/m, 'a key the template sets is not written twice')
     // THE ALLOWLIST IS THE ONLY PATH: an unknown key with an innocuous value is dropped, and says so.
@@ -294,8 +296,8 @@ test('re-run: nothing outside the carry list reaches the new file, whatever it i
       `REPORTING_LAYERS=${layered}`,
       // ...and the same disguises under key names that ARE on the list: the shape rejects them.
       `OUTBOX_RETRY_BASE_MS=${b64}`,
-      `PREFLIGHT_DB_CONNECT=${hex}`,
-      `DATABASE_RESTORE_MAX_FILE_BYTES=${layered}`,
+      `OUTBOX_RETRY_JITTER_MS=${hex.slice(0, 3)}x`,
+      `OUTBOX_RETRY_MAX_MS=${layered}`,
       'TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.0.0/16',
       'REQUIRE_TRUSTED_PROXY_CONFIG=true',
       '',
@@ -312,7 +314,7 @@ test('re-run: nothing outside the carry list reaches the new file, whatever it i
     for (const gone of ['DIRECT_URL', 'MIGRATION_DATABASE_URL', 'PGPASSWORD', 'direct_url', 'SHADOW_DATABASE_URL', 'REPORTING_CONN', 'PROXYISH', 'INNOCUOUS_NOTE', 'REPORTING_CONFIG', 'REPORTING_HEX', 'REPORTING_LAYERS']) {
       assert.match(r.out, new RegExp(`WARN:     ${gone} \\(line \\d+\\): not on the list of settings a re-run carries over`), `${gone} must be listed as dropped`)
     }
-    for (const listed of ['OUTBOX_RETRY_BASE_MS', 'PREFLIGHT_DB_CONNECT', 'DATABASE_RESTORE_MAX_FILE_BYTES']) {
+    for (const listed of ['OUTBOX_RETRY_BASE_MS', 'OUTBOX_RETRY_JITTER_MS', 'OUTBOX_RETRY_MAX_MS']) {
       assert.match(r.out, new RegExp(`WARN:     ${listed} \\(line \\d+\\): the value does not have the shape`), `${listed} with an encoded blob must fail its shape`)
     }
     for (const secret of ['Adm1nPassw0rd', 'readerpw', 'secretpw', b64, hex]) assert.doesNotMatch(r.out.replace(/BLOCK<<[\s\S]*?>>/, ''), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'no value is ever printed')
@@ -328,15 +330,24 @@ test('re-run: the carry list is the ONLY path — property check over many innoc
   assert.match(r.out, new RegExp(`N=${names.length}$`))
   // The shapes: accepted and rejected examples per shape, so a loosened class is red.
   const ok: Record<string, string[]> = {
-    bool: ['true', 'false', '1', '0'], int: ['0', '5000', '123456789012'], word: ['redis', 'memory', 'report-only'],
-    hostlist: ['10.0.0.1', '10.0.0.0/8,192.168.1.1', '::1,fe80::1', 'proxy.example.test'],
-    idlist: ['tenant-a', 'a,b,c'], names: ["Acme Ltd,O'Neil & Sons"], origin: ['https://shop.example.test', 'http://localhost:3000'],
-    timestamp: ['2026-10-01', '2026-10-01T09:00:00Z', '2026-10-01T09:00:00.000+01:00'],
+    bool: ['true', 'false', '1', '0', 'yes', 'no', 'on', 'off', 'Yes', 'TRUE', ''], int: ['0', '5000', '1234567890123456'], number: ['1000', '1000.5'],
+    rate_limit_backend: ['memory', 'redis', 'Redis', ''], csp_mode: ['enforce', 'report-only', 'off', 'Enforce', ''],
+    iplist: ['10.0.0.1', '10.0.0.0/8,192.168.1.1', '10.0.0.1, 10.0.0.2', '::1,fe80::1/64', '[::1]:8080', '::ffff:10.0.0.1'],
+    uuid: ['123e4567-e89b-12d3-a456-426614174000', '123E4567-E89B-12D3-A456-426614174000'],
+    uuidlist: ['123e4567-e89b-12d3-a456-426614174000', '123e4567-e89b-12d3-a456-426614174000, 123e4567-e89b-12d3-a456-426614174001'],
+    names: ["Acme Ltd,O'Neil & Sons", 'Demo Company (UK)'], origin: ['https://shop.example.test', 'https://shop.example.test/', 'http://localhost:3000', 'http://[::1]:3000'],
+    iso_utc: ['2026-10-01T09:00Z', '2026-10-01T09:00:00Z', '2026-10-01T09:00:00.123Z'],
+    mintsoft_grant: ['https://api.mintsoft.co.uk|89', 'https://x.test/base | 5', 'https://x.test|5|login=a.b@c'],
   }
   const bad: Record<string, string[]> = {
-    bool: ['yes', 'TRUE', ''], int: ['12a', '-1', '1234567890123'], word: ['9x', 'a b', 'redis;rm', 'x'.repeat(40)],
-    hostlist: ['10.0.0.1 10.0.0.2', 'a=b', 'a%2Fb', 'QWxhZGRpbjpvcGVu==', 'x'.repeat(65)], idlist: ['a b', 'a;b', 'postgres://x'], names: ['a%2Fb', 'a=b'],
-    origin: ['ftp://x', 'https://u:p@h', 'https://h/path'], timestamp: ['yesterday', '2026-10-01 09:00'],
+    bool: ['maybe', 'definitely-maybe', '2'], int: ['12a', '-1', '1e3', '12345678901234567'], number: ['1e3', '-1'],
+    rate_limit_backend: ['memcached', 'redis;rm'], csp_mode: ['enforcee', 'report only'],
+    iplist: ['10.0.0.1 10.0.0.2', 'a=b', 'a%2Fb', 'QWxhZGRpbjpvcGVu==', 'x'.repeat(65), '4142434445464748', 'proxy.example.test', 'QUJDREVGR0g'],
+    uuid: ['tenant-a', '4142434445464748', 'QUJDREVGR0g', '123e4567-e89b-12d3-a456-42661417400'],
+    uuidlist: ['tenant-a', 'a b', 'postgres://x', '4142434445464748', 'QUJDREVGR0g', '123e4567-e89b-12d3-a456-426614174000,tenant-b', '123e4567e89b12d3a456426614174000'],
+    names: ['a%2Fb', 'a=b', 'a\\b'], origin: ['ftp://x', 'https://u:p@h', 'https://h/path', 'https://h?x=1'],
+    iso_utc: ['yesterday', '2026-10-01 09:00', '2026-10-01', '2026-10-01T09:00:00+01:00'],
+    mintsoft_grant: ['https://x.test', 'https://x.test|0', 'https://x.test|05', 'ftp://x|5', 'https://x.test|5|logon=a'],
   }
   let checks = 0
   for (const shape of Object.keys(ok)) {
@@ -581,7 +592,7 @@ test('re-run: a security setting written with quotes, export, CRLF or an inline 
       ['CRLF line ending', (k, v) => `${k}=${v}\r`],
       ['CRLF + double-quoted', (k, v) => `${k}="${v}"\r`],
     ]
-    const wants: Array<[string, string]> = [['REQUIRE_TRUSTED_PROXY_CONFIG', 'true'], ['TRUSTED_PROXY_IPS', '10.0.0.1,10.0.0.2'], ['XERO_ALLOWED_TENANT_IDS', 'tenant-a,tenant-b']]
+    const wants: Array<[string, string]> = [['REQUIRE_TRUSTED_PROXY_CONFIG', 'true'], ['TRUSTED_PROXY_IPS', '10.0.0.1,10.0.0.2'], ['XERO_ALLOWED_TENANT_IDS', '123e4567-e89b-12d3-a456-426614174000,123e4567-e89b-12d3-a456-426614174001']]
     let checked = 0
     for (const [label, form] of variants) {
       const old = join(dir, `${checked}.env`)
@@ -695,4 +706,120 @@ test('re-run: the source sync spares in-tree .env.bak* files left by earlier ins
       }
     }
   })
+})
+
+// ---------------------------------------------------------------------------
+// review round 6: real formats per setting, and the reversible-encoding screen
+// ---------------------------------------------------------------------------
+
+test('re-run: a reversible encoding of the admin password cannot ride in ANY carried setting (the exact review examples)', () => {
+  const admin = 'postgresql://deployadmin:ABCDEFGH@127.0.0.1:5432/db'
+  const hex = Buffer.from('ABCDEFGH').toString('hex')          // 4142434445464748
+  const b64url = Buffer.from('ABCDEFGH').toString('base64url') // QUJDREVGR0g
+  const b64 = Buffer.from('ABCDEFGH').toString('base64')       // QUJDREVGR0g=
+  console.log(`  examples: hex=${hex} base64url=${b64url} base64=${b64}`)
+  const decide = (key: string, value: string) =>
+    bash([LIB, `DEPLOY_ADMIN_DATABASE_URL='${admin}'`, `env_preserve_decision '${key}' '${value}'; echo "RC=$? REASON=[$ENV_REFUSAL_REASON]"`].join('\n')).out.trim().split('\n').pop() ?? ''
+  // The class: under keys whose shape admits digits or letters, the token is refused by the screen itself.
+  for (const [key, value] of [['OUTBOX_RETRY_BASE_MS', hex], ['XERO_DAILY_BATCH_LIMIT', hex], ['XERO_ALLOWED_TENANT_NAMES', b64url], ['XERO_ALLOWED_TENANT_NAMES', hex]] as const) {
+    const got = decide(key, value)
+    console.log(`  ${key}=${value}: ${got}`)
+    assert.match(got, /^RC=1 REASON=\[the value contains the deploy admin's password\]$/, `${key}`)
+  }
+  // A padded base64 is outside the names alphabet altogether.
+  assert.match(decide('XERO_ALLOWED_TENANT_NAMES', b64), /^RC=1 /)
+  // And the UUID-only tenant lists refuse them on shape alone.
+  for (const value of [hex, b64url, b64]) {
+    const got = decide('XERO_ALLOWED_TENANT_IDS', value)
+    console.log(`  XERO_ALLOWED_TENANT_IDS=${value}: ${got}`)
+    assert.match(got, /^RC=1 REASON=\[the value does not have the shape of a uuidlist setting\]$/)
+  }
+  // The same two values as a run: the security setting refuses the whole re-run.
+  const lines = INSTALL.split('\n')
+  const start = lines.findIndex((l) => l === 'for _sec_key in "${ENV_PRESERVE_SECURITY_KEYS[@]}"; do')
+  const end = lines.findIndex((l, i) => i > start && l === 'unset _sec_key')
+  const gate = lines.slice(start, end + 1).join('\n')
+  for (const value of [hex, b64url]) {
+    const r = bash([LIB, 'APP_DIR=/opt/app', `DEPLOY_ADMIN_DATABASE_URL='${admin}'`, 'EXISTING_ENV[XERO_ALLOWED_TENANT_IDS]=' + value, gate, 'echo CONTINUED'].join('\n'))
+    assert.equal(r.status, 9, value)
+    assert.doesNotMatch(r.out, new RegExp(value), 'and the value is not printed')
+  }
+  // Isolating: a real UUID list under the same key is carried.
+  const good = decide('XERO_ALLOWED_TENANT_IDS', '123e4567-e89b-12d3-a456-426614174000, 123e4567-e89b-12d3-a456-426614174001')
+  assert.equal(good, 'RC=0 REASON=[]')
+})
+
+test('re-run: PREFLIGHT_DB_CONNECT=yes is kept (the application treats yes as true), and the setting is a security setting', async () => {
+  await withTempDir('ims-env-pf-', async (dir) => {
+    const old = join(dir, '.env')
+    writeFileSync(old, 'APP_PORT=3000\nPREFLIGHT_DB_CONNECT=yes\nXERO_REQUIRE_DEMO_ORG=On\nBEHIND_PROXY="Yes" # proxied\n')
+    const r = bash([LIB, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; echo "RC=$?"; printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"'].join('\n'))
+    const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
+    console.log(`  carried: ${JSON.stringify(block.split('\n').filter((l) => l && !l.startsWith('#')))}`)
+    assert.match(r.out, /RC=0/)
+    assert.deepEqual(block.split('\n').filter((l) => l && !l.startsWith('#')).sort(), ['BEHIND_PROXY=Yes', 'PREFLIGHT_DB_CONNECT=yes', 'XERO_REQUIRE_DEMO_ORG=On'])
+  })
+  assert.ok((/^ENV_PRESERVE_SECURITY_KEYS=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').split(/\s+/).includes('PREFLIGHT_DB_CONNECT'))
+})
+
+test('re-run: AUDIT — every value the application accepts for a listed setting passes its shape, and every setting whose absence loosens a guard is a security setting', () => {
+  // Read from the code that parses each key (file in the comment). A row is [key, values the app accepts].
+  const U = '123e4567-e89b-12d3-a456-426614174000'
+  const accepted: Array<[string, string, string[]]> = [
+    ['TRUSTED_PROXY_IPS', 'lib/request-ip.ts parseEnvList (split , / trim / isIP)', ['10.0.0.1', '10.0.0.1, 10.0.0.2', '::1', '[::1]:443']],
+    ['TRUSTED_PROXY_CIDRS', 'lib/request-ip.ts parseTrustedProxyRange', ['10.0.0.0/8', '10.0.0.1', 'fe80::/10', '10.0.0.0/8, 192.168.0.0/16']],
+    ['REQUIRE_TRUSTED_PROXY_CONFIG', 'lib/ops/production-preflight.ts isTruthy', ['1', 'true', 'yes', 'on', 'YES', ' ', '0', 'false']],
+    ['BEHIND_PROXY', 'lib/ops/production-preflight.ts isTruthy', ['1', 'true', 'yes', 'on', 'On']],
+    ['RATE_LIMIT_BACKEND', 'lib/security/rate-limit.ts (trim, lower; memory|redis|empty)', ['memory', 'redis', 'Redis', '']],
+    ['CSP_MODE', 'lib/security/csp.ts getCspMode (enforce|off|else report-only)', ['enforce', 'off', 'report-only', 'ENFORCE']],
+    ['ALLOW_DATABASE_RESTORE', 'app/api/backup/restore/route.ts isTruthy', ['true', 'false', 'yes', '1']],
+    ['ALLOW_DATABASE_RESTORE_UPLOAD', 'app/api/backup/restore/route.ts isTruthy', ['true', 'false', 'yes', '1']],
+    ['PREFLIGHT_DB_CONNECT', 'lib/ops/production-preflight.ts isTruthy', ['1', 'true', 'yes', 'on', 'Yes']],
+    ['XERO_ALLOWED_TENANT_IDS', 'lib/connectors/xero/tenant-guard.ts splitEnvList (Xero tenant ids are UUIDs)', [U, `${U}, ${U.replace(/0$/, '1')}`]],
+    ['XERO_BLOCKED_TENANT_IDS', 'lib/connectors/xero/tenant-guard.ts splitEnvList', [U]],
+    ['XERO_ALLOWED_TENANT_NAMES', 'lib/connectors/xero/tenant-guard.ts splitEnvList (organisation names)', ['Demo Company (UK)', 'Acme Ltd, Beta & Co']],
+    ['XERO_REQUIRE_DEMO_ORG', 'lib/connectors/xero/tenant-guard.ts readEnvSwitch', ['1', 'true', 'yes', 'on', '0', 'false', 'no', 'off']],
+    ['XERO_TENANT_ID', 'lib/connectors/xero/tenant-guard.ts (deprecated single id)', [U]],
+    ['XERO_WRITE_ALLOWED_TENANT', 'lib/security/outbound-write-grant.ts readXeroGrant (one tenant id, a UUID)', [U, U.toUpperCase()]],
+    ['XERO_DAILY_BATCH_LIMIT', 'lib/connectors/xero/daily-sync.ts resolveXeroDailyBatchLimit (Number, > 0)', ['1000', '250.5']],
+    ['XERO_WRITES_LIVE_FROM', 'lib/security/producer-disposition.ts ISO_UTC_RE', ['2026-12-01T00:00Z', '2026-12-01T00:00:00Z', '2026-12-01T00:00:00.5Z']],
+    ['WC_WRITES_LIVE_FROM', 'lib/security/producer-disposition.ts ISO_UTC_RE', ['2026-12-01T00:00:00Z']],
+    ['MINTSOFT_WRITES_LIVE_FROM', 'lib/security/producer-disposition.ts ISO_UTC_RE', ['2026-12-01T00:00:00Z']],
+    ['MINTSOFT_WRITE_ALLOWED', 'lib/security/outbound-write-grant.ts readMintsoftGrant', ['https://api.mintsoft.co.uk|89', 'https://api.mintsoft.co.uk/v1 | 89', 'https://api.mintsoft.co.uk|89|login=ops@example.test']],
+    ['MINTSOFT_USE_BULK_ASN_LOOKUP', 'lib/jobs/wms/process-mintsoft-booked-in-event.ts', ['1', 'true', 'yes', 'on', 'TRUE']],
+    ['MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE', 'lib/jobs/wms/process-mintsoft-booked-in-event.ts parseInt > 0', ['100', '25']],
+    ['WC_WRITEBACK_ALLOWED_ORIGIN', 'lib/security/outbound-write-grant.ts parseDestinationUrl (bare origin, https, http for loopback)', ['https://shop.example.test', 'https://shop.example.test/', 'http://localhost:3000', 'http://[::1]:3000']],
+    ['OUTBOX_RETRY_BASE_MS', 'lib/domain/integrations/outbox.ts configuredPositiveMs', ['1000']],
+    ['OUTBOX_RETRY_JITTER_MS', 'lib/domain/integrations/outbox.ts configuredNonNegativeMs', ['0', '250']],
+    ['OUTBOX_RETRY_MAX_MS', 'lib/domain/integrations/outbox.ts configuredPositiveMs', ['600000']],
+    ['CONNECTOR_FETCH_TIMEOUT_MS', 'lib/security/connector-fetch.ts', ['30000']],
+    ['CONNECTOR_FETCH_MAX_RESPONSE_BYTES', 'lib/security/connector-fetch.ts', ['10485760']],
+    ['FRESH_AUTH_MAX_AGE_SECONDS', 'lib/auth/session-state.ts', ['900', '86400']],
+    ['INVOICE_PDF_TOKEN_TTL_SECONDS', 'lib/invoice-pdf.ts', ['600']],
+    ['INVOICE_PDF_TOKEN_MAX_TTL_SECONDS', 'lib/invoice-pdf.ts', ['2592000']],
+    ['DATABASE_RESTORE_MAX_FILE_BYTES', 'app/api/backup/restore/route.ts parsePositiveIntegerEnv', ['52428800']],
+  ]
+  const shapes = new Map([...(/^declare -A ENV_PRESERVE_SHAPES=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').matchAll(/\[([A-Z0-9_]+)\]=(\w+)/g)].map((m) => [m[1], m[2]]))
+  const security = new Set((/^ENV_PRESERVE_SECURITY_KEYS=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').split(/\s+/).filter(Boolean))
+  console.log(`  audit: ${accepted.length} keys audited of ${shapes.size} listed`)
+  assert.deepEqual([...shapes.keys()].filter((k) => !accepted.some(([key]) => key === k)).sort(), [], 'every listed key is in the audit table')
+  let values = 0
+  for (const [key, source, vals] of accepted) {
+    const shape = shapes.get(key)
+    assert.ok(shape, `${key} is on the carry list`)
+    for (const v of vals) {
+      const out = bash([LIB, `env_value_has_shape '${shape}' '${v.replace(/'/g, "'\\''")}'; echo "RC=$?"`].join('\n')).out.trim().split('\n').pop()
+      // surrounding whitespace is trimmed by the loader before the shape runs, so audit the effective value
+      const eff = bash([LIB, `env_effective_value '${v.replace(/'/g, "'\\''")}' e; env_value_has_shape '${shape}' "$e"; echo "RC=$?"`].join('\n')).out.trim().split('\n').pop()
+      assert.ok(eff === 'RC=0' && (out === 'RC=0' || v !== v.trim()), `${key} (${source}) accepts ${JSON.stringify(v)}: shape ${shape}`)
+      values++
+    }
+    console.log(`  ${key.padEnd(36)} ${shape.padEnd(18)} ${security.has(key) ? 'SECURITY' : '        '} <- ${source}`)
+  }
+  console.log(`  ${values} application-accepted values pass their shapes`)
+  // A setting whose ABSENCE loosens a verification or a guard (a switch that turns a check on, an allowlist, a cap, a policy mode).
+  const loosensWhenAbsent = ['REQUIRE_TRUSTED_PROXY_CONFIG', 'BEHIND_PROXY', 'PREFLIGHT_DB_CONNECT', 'TRUSTED_PROXY_IPS', 'TRUSTED_PROXY_CIDRS', 'RATE_LIMIT_BACKEND', 'CSP_MODE',
+    'XERO_ALLOWED_TENANT_IDS', 'XERO_BLOCKED_TENANT_IDS', 'XERO_ALLOWED_TENANT_NAMES', 'XERO_REQUIRE_DEMO_ORG', 'XERO_TENANT_ID', 'XERO_DAILY_BATCH_LIMIT',
+    'CONNECTOR_FETCH_TIMEOUT_MS', 'CONNECTOR_FETCH_MAX_RESPONSE_BYTES', 'DATABASE_RESTORE_MAX_FILE_BYTES', 'FRESH_AUTH_MAX_AGE_SECONDS', 'INVOICE_PDF_TOKEN_TTL_SECONDS', 'INVOICE_PDF_TOKEN_MAX_TTL_SECONDS']
+  assert.deepEqual(loosensWhenAbsent.filter((k) => !security.has(k)), [], 'every guard whose absence loosens it is a security setting')
 })

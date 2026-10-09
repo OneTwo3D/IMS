@@ -650,6 +650,48 @@ env_percent_encode() {
   [[ -z "${3:-}" ]] || printf -v "$3" '%s' "${outl}"
 }
 
+# A token that is pure hex, or pure base64/base64url, is a reversible encoding of something. Decode it (bash only,
+# into the variable named by ${2}) so the admin-secret screen can look INSIDE it: the shapes keep such tokens out
+# of the settings that cannot have them, and this closes the class for the shapes that admit digits or letters.
+env_token_decode() {
+  local t="$1" out="" h i c pre idx bits=0 nbits=0 byte
+  local alpha=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+  if [[ "${t}" =~ ^([0-9A-Fa-f]{2}){4,}$ ]]; then
+    for ((i = 0; i < ${#t}; i += 2)); do out+="\\x${t:i:2}"; done
+  elif [[ "${t}" =~ ^[A-Za-z0-9+/_-]{8,}={0,2}$ ]]; then
+    t="${t//-/+}"; t="${t//_//}"; t="${t%%=*}"
+    for ((i = 0; i < ${#t}; i++)); do
+      c="${t:i:1}"
+      pre="${alpha%%"${c}"*}"
+      idx=${#pre}
+      bits=$(((bits << 6) | idx))
+      nbits=$((nbits + 6))
+      if ((nbits >= 8)); then
+        nbits=$((nbits - 8))
+        byte=$(((bits >> nbits) & 255))
+        bits=$((bits & ((1 << nbits) - 1)))
+        printf -v h '\\x%02x' "${byte}"
+        out+="${h}"
+      fi
+    done
+  fi
+  printf -v "$2" '%b' "${out}"
+}
+
+# Does any comma/space/semicolon/pipe-separated token of ${1} decode (hex or base64/base64url) to something
+# containing ${2}? Returns 0 when it does.
+env_value_token_leaks_secret() {
+  local value="$1" secret="$2" token decoded
+  local -a tokens=()
+  IFS=$',; \t|' read -r -a tokens <<< "${value}"
+  for token in "${value}" "${tokens[@]}"; do
+    [[ -n "${token}" ]] || continue
+    env_token_decode "${token}" decoded
+    [[ -z "${decoded}" ]] || [[ "${decoded}" != *"${secret}"* ]] || return 0
+  done
+  return 1
+}
+
 # Does ${1} contain ${2}, or any copy of it that has been percent-encoded 1-4 times (hex digits in either
 # case) or written with '+' for a space? The candidate is DECODED repeatedly until it stops changing
 # (at most four passes), and every pass is searched; decoding is canonical because the hex digits are read
@@ -661,6 +703,7 @@ env_value_leaks_secret() {
     v="${value}"
     for ((pass = 0; pass < 5; pass++)); do
       [[ "${v}" == *"${secret}"* ]] && return 0
+      env_value_token_leaks_secret "${v}" "${secret}" && return 0
       if [[ "${variant}" == plus ]]; then
         env_percent_decode "${v//+/ }" next
       else
@@ -707,26 +750,26 @@ ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE="the deploy admin password is too short to 
 # Secrets (API keys, SMTP passwords, token paths), database URLs and anything not named here are NOT carried: an
 # operator who needs one back copies it from the backup. A shape is a name understood by env_value_has_shape.
 declare -A ENV_PRESERVE_SHAPES=(
-  [TRUSTED_PROXY_IPS]=hostlist
-  [TRUSTED_PROXY_CIDRS]=hostlist
+  [TRUSTED_PROXY_IPS]=iplist
+  [TRUSTED_PROXY_CIDRS]=iplist
   [REQUIRE_TRUSTED_PROXY_CONFIG]=bool
   [BEHIND_PROXY]=bool
-  [RATE_LIMIT_BACKEND]=word
-  [CSP_MODE]=word
+  [RATE_LIMIT_BACKEND]=rate_limit_backend
+  [CSP_MODE]=csp_mode
   [ALLOW_DATABASE_RESTORE]=bool
   [ALLOW_DATABASE_RESTORE_UPLOAD]=bool
   [PREFLIGHT_DB_CONNECT]=bool
-  [XERO_ALLOWED_TENANT_IDS]=idlist
-  [XERO_BLOCKED_TENANT_IDS]=idlist
+  [XERO_ALLOWED_TENANT_IDS]=uuidlist
+  [XERO_BLOCKED_TENANT_IDS]=uuidlist
   [XERO_ALLOWED_TENANT_NAMES]=names
   [XERO_REQUIRE_DEMO_ORG]=bool
-  [XERO_TENANT_ID]=idlist
-  [XERO_WRITE_ALLOWED_TENANT]=idlist
-  [XERO_DAILY_BATCH_LIMIT]=int
-  [XERO_WRITES_LIVE_FROM]=timestamp
-  [WC_WRITES_LIVE_FROM]=timestamp
-  [MINTSOFT_WRITES_LIVE_FROM]=timestamp
-  [MINTSOFT_WRITE_ALLOWED]=bool
+  [XERO_TENANT_ID]=uuidlist
+  [XERO_WRITE_ALLOWED_TENANT]=uuid
+  [XERO_DAILY_BATCH_LIMIT]=number
+  [XERO_WRITES_LIVE_FROM]=iso_utc
+  [WC_WRITES_LIVE_FROM]=iso_utc
+  [MINTSOFT_WRITES_LIVE_FROM]=iso_utc
+  [MINTSOFT_WRITE_ALLOWED]=mintsoft_grant
   [MINTSOFT_USE_BULK_ASN_LOOKUP]=bool
   [MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE]=int
   [WC_WRITEBACK_ALLOWED_ORIGIN]=origin
@@ -755,6 +798,8 @@ ENV_PRESERVE_SECURITY_KEYS=(
   XERO_TENANT_ID XERO_WRITE_ALLOWED_TENANT XERO_WRITES_LIVE_FROM WC_WRITES_LIVE_FROM
   MINTSOFT_WRITES_LIVE_FROM MINTSOFT_WRITE_ALLOWED WC_WRITEBACK_ALLOWED_ORIGIN
   FRESH_AUTH_MAX_AGE_SECONDS INVOICE_PDF_TOKEN_TTL_SECONDS INVOICE_PDF_TOKEN_MAX_TTL_SECONDS
+  PREFLIGHT_DB_CONNECT XERO_DAILY_BATCH_LIMIT CONNECTOR_FETCH_TIMEOUT_MS CONNECTOR_FETCH_MAX_RESPONSE_BYTES
+  DATABASE_RESTORE_MAX_FILE_BYTES
 )
 ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE="is a security setting that this installer cannot carry across to the new file (its value is not in a form that setting accepts, or it failed the screen against the deploy admin credential). Correct or remove it and re-run. Nothing has been changed."
 
@@ -820,23 +865,63 @@ env_preserve_decision() {
 # is not root, can give the file to its own user the same way DB_CA_PUBLISH_OWNER is handled.
 ENV_BACKUP_OWNER="root:root"
 
-# Does ${2} have the shape ${1}? Every shape is a closed character class with a bounded length, so a value that
-# is an encoded blob, a URL with a password, a multi-line string or anything else outside the setting's own
-# vocabulary does not have one.
+# Does ${2} have the shape ${1}? Each shape is the REAL format the application parses that setting from (read from
+# the code that reads it, lib/ and app/, not guessed), as a closed character set with a bounded length. A generic
+# "identifier" shape would admit any hex or base64 token, which is how a reversible encoding of a credential could
+# ride in a tenant list; a UUID list admits only UUIDs. The application trims list entries and reads switches
+# case-insensitively, and so does this.
+#   bool                1 true yes on 0 false no off (any case), or empty        [isTruthy / readEnvSwitch]
+#   iplist              comma-separated IPv4/IPv6 (optional [..], :port, /bits) [request-ip.ts parseEnvList]
+#   uuid / uuidlist     one UUID / comma-separated UUIDs (Xero tenant ids)       [tenant-guard.ts, grant]
+#   names               comma-separated organisation names                        [tenant-guard.ts]
+#   int / number        digits / digits with an optional fraction                 [parsePositiveIntegerEnv etc.]
+#   iso_utc             ISO-8601 UTC instant with an explicit Z                   [producer-disposition.ts]
+#   origin              http(s)://host[:port][/]                                  [outbound-write-grant.ts]
+#   mintsoft_grant      <base URL>|<ClientId>[|login=<user>]                      [outbound-write-grant.ts]
+#   rate_limit_backend  memory | redis (or empty)                                 [rate-limit.ts]
+#   csp_mode            enforce | report-only | off (or empty)                    [csp.ts]
 env_value_has_shape() {
-  local shape="$1" value="$2" re
+  local shape="$1" value="$2" re entry n=0
+  local -a entries=()
+  local uuid='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+  [[ ${#value} -le ${ENV_PRESERVE_MAX_LENGTH} ]] || return 1
+  # An empty value means "not set" to the application for every one of these; it is carried (and harmless).
+  [[ -n "${value}" ]] || return 0
   case "${shape}" in
-    bool) re='^(true|false|1|0)$' ;;
-    int) re='^[0-9]{1,12}$' ;;
-    word) re='^[A-Za-z][A-Za-z0-9_-]{0,31}$' ;;
-    hostlist) re='^[A-Za-z0-9.:/_-]{1,64}(,[A-Za-z0-9.:/_-]{1,64}){0,63}$' ;;
-    idlist) re='^[A-Za-z0-9._-]{1,64}(,[A-Za-z0-9._-]{1,64}){0,31}$' ;;
-    names) re="^[A-Za-z0-9 ._&'-]{1,100}(,[A-Za-z0-9 ._&'-]{1,100}){0,15}\$" ;;
-    origin) re='^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$' ;;
-    timestamp) re='^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9:.]{1,16}(Z|[+-][0-9:]{2,5})?)?$' ;;
+    bool) re='^(1|true|yes|on|0|false|no|off)?$'; [[ "${value,,}" =~ ${re} ]] ;;
+    rate_limit_backend) re='^(memory|redis)?$'; [[ "${value,,}" =~ ${re} ]] ;;
+    csp_mode) re='^(enforce|report-only|off)?$'; [[ "${value,,}" =~ ${re} ]] ;;
+    int) re='^[0-9]{1,16}$'; [[ "${value}" =~ ${re} ]] ;;
+    number) re='^[0-9]{1,16}(\.[0-9]{1,6})?$'; [[ "${value}" =~ ${re} ]] ;;
+    uuid) re="^${uuid}\$"; [[ "${value}" =~ ${re} ]] ;;
+    uuidlist | iplist | names)
+      IFS=, read -r -a entries <<< "${value}"
+      [[ ${#entries[@]} -ge 1 && ${#entries[@]} -le 64 ]] || return 1
+      for entry in "${entries[@]}"; do
+        entry="${entry#"${entry%%[![:space:]]*}"}"
+        entry="${entry%"${entry##*[![:space:]]}"}"
+        case "${shape}" in
+          uuidlist) re="^${uuid}\$" ;;
+          names) re="^[A-Za-z0-9][A-Za-z0-9 ._&'()/+-]{0,99}\$" ;;
+          iplist)
+            [[ -n "${entry}" ]] || continue
+            [[ "${entry}" == *.* || "${entry}" == *:* ]] || return 1
+            re='^\[?[0-9A-Fa-f:.]{2,45}\]?(:[0-9]{1,5})?(/[0-9]{1,3})?$'
+            ;;
+        esac
+        [[ "${entry}" =~ ${re} ]] || return 1
+        n=$((n + 1))
+      done
+      [[ "${shape}" == iplist ]] || [[ ${n} -ge 1 ]]
+      ;;
+    iso_utc) re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]{1,3})?)?Z$'; [[ "${value}" =~ ${re} ]] ;;
+    origin) re='^https?://(\[[0-9A-Fa-f:]{2,45}\]|[A-Za-z0-9.-]{1,253})(:[0-9]{1,5})?/?$'; [[ "${value}" =~ ${re} ]] ;;
+    mintsoft_grant)
+      re='^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)? ?\| ?[1-9][0-9]{0,9}( ?\| ?login=[A-Za-z0-9._@+-]{1,128})?$'
+      [[ "${value}" =~ ${re} ]]
+      ;;
     *) return 1 ;;
   esac
-  [[ ${#value} -le ${ENV_PRESERVE_MAX_LENGTH} && "${value}" =~ ${re} ]]
 }
 
 # After the decode passes env_value_leaks_secret() makes, does the value STILL contain a percent-escape? Then
