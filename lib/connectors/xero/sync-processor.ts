@@ -6084,7 +6084,7 @@ async function processClaimedEntry(
         // the fence must authorise against the very day the call below creates, and a second
         // wall-clock read here is a second day whenever the two straddle a UTC midnight.
         postingDate: paymentDate,
-      }, async () => {
+      }, async ({ requireConnection }) => {
         try {
           // BOTH FENCES, AND THE CLAIM FENCE IS LAST (o3d-0m56 + o3d-550x/o3d-xl63).
           //
@@ -6107,7 +6107,12 @@ async function processClaimedEntry(
             // amount or date has since been corrected in Xero. Derived from the same token the
             // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
             Reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
-          }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
+          }, {
+            idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment'),
+            // o3d-llyw: when the fence's authorisation rested on an operator ledger check, the POST must be
+            // built from the connection that check was validated against, or it is not sent.
+            ...(requireConnection ? { requireConnection } : {}),
+          })
           if (!paymentRes.ok) {
             return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
           }

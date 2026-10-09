@@ -97,6 +97,12 @@ const XERO_NOT_SENT_STATUS = 0
  *                               WRITE the database, so this is the likeliest throw of the five. Same
  *                               statement as `egress-unauthorised`, and `connectorFetch` is the next
  *                               statement but one.
+ *  • `connection-changed`       (o3d-llyw) the caller required the connection an earlier read was
+ *                               served by (`requireConnection`) and the auth THIS request resolved —
+ *                               after any refresh — names a different tenant or generation. Checked in
+ *                               `xeroFetch` straight after `getAccessToken()` answered, before the
+ *                               request object is built: no token is used, nothing reaches the
+ *                               transport, and the caller's attempt counter does not move.
  *
  * WHERE THE LINE IS DRAWN, AND IT IS DRAWN AT THE SOCKET, NOT AT THE FUNCTION BOUNDARY. Every catch
  * above ends BEFORE the statement that can send. `performRequest` is called outside the
@@ -126,6 +132,15 @@ export type XeroNotSentReason =
   | 'posting-intent-unavailable'
   | 'rate-budget-unavailable'
   | 'egress-authorisation-unavailable'
+  | 'connection-changed'
+
+/**
+ * The Xero connection a caller's earlier READ was served by, which a later WRITE must be built from or
+ * not be sent at all (o3d-llyw: the post fence lifts a hold on an operator ledger check bound to the
+ * connection that answered its probe). Compared with the auth THIS request resolved, before anything is
+ * built — see `connection-changed`.
+ */
+export type RequiredXeroConnection = { tenantId: string; connectionGeneration: string }
 
 /**
  * How the reason travels from `performRequest` (which returns a `Response`) to `xeroFetchWithAuth`
@@ -750,7 +765,7 @@ async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
-  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
+  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string; requireConnection?: RequiredXeroConnection },
 ): Promise<XeroResponse<T>> {
   let auth: Awaited<ReturnType<typeof getAccessToken>>
   try {
@@ -771,6 +786,25 @@ async function xeroFetch<T = unknown>(
     return connectionUnresolvableResponse(error)
   }
   if (!auth) return await notConnectedResponse()
+  // o3d-llyw — A WRITE THAT AN EARLIER READ AUTHORISED IS BUILT FROM THAT READ'S CONNECTION, OR NOT AT ALL.
+  // `getAccessToken()` resolves the connection afresh for every request, and a reconnect (or a refresh
+  // that lands on a rebound row) between the read and this write would otherwise send it under a
+  // different organisation or consent than the one the authorisation was about. Compared here, on the
+  // auth this request will use, and refused before the request object exists.
+  const required = opts?.requireConnection
+  if (required && (auth.tenantId !== required.tenantId || (auth.connectionGeneration ?? null) !== required.connectionGeneration)) {
+    return {
+      ok: false,
+      status: XERO_NOT_SENT_STATUS,
+      error: `The Xero connection changed after this payment was checked against the ledger (checked under `
+        + `organisation ${required.tenantId}, connection ${required.connectionGeneration}; now ${auth.tenantId}, `
+        + `connection ${auth.connectionGeneration ?? '(none)'}). NOTHING WAS SENT — the request was never built. `
+        + 'It is checked again on its next attempt.',
+      notSent: 'connection-changed',
+      tenantId: auth.tenantId,
+      connectionGeneration: auth.connectionGeneration ?? null,
+    }
+  }
   return xeroFetchWithAuth<T>(auth, method, path, body, opts)
 }
 
@@ -979,7 +1013,7 @@ export async function xeroGet<T = unknown>(
 export async function xeroPost<T = unknown>(
   path: string,
   body: unknown,
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; requireConnection?: RequiredXeroConnection },
 ): Promise<XeroResponse<T>> {
   return xeroFetch<T>('POST', path, body, opts)
 }
@@ -987,7 +1021,7 @@ export async function xeroPost<T = unknown>(
 export async function xeroPut<T = unknown>(
   path: string,
   body: unknown,
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; requireConnection?: RequiredXeroConnection },
 ): Promise<XeroResponse<T>> {
   return xeroFetch<T>('PUT', path, body, opts)
 }

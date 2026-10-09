@@ -110,7 +110,7 @@ test('[o3d-llyw] fence: a check for that contender and THIS receipt, under the s
   const scopes: unknown[] = []
   const verdict = await postN({ loader: async (scope) => { scopes.push(scope); return [CHECK] } })
   precondition('check in scope', verdict)
-  assert.deepEqual(verdict, { proceed: true })
+  assert.deepEqual(verdict, { proceed: true, requireConnection: BOUND })
   assert.deepEqual(scopes, [{ attemptSyncLogId: 'log-f', paymentId: 'pay-new', connector: 'xero', ledgerDocumentId: 'INV-1' }],
     'the loader is asked about exactly that contender and the receipt being posted')
 })
@@ -241,7 +241,7 @@ test('[o3d-llyw] fence, headline shape: a SYNCED rival whose OWN payment is the 
     connector: 'xero',
   })
   const onlyF = await postN({ loader })
-  assert.deepEqual(onlyF, { proceed: true }, 'precondition: with F the only contender, F\'s check lets the post through')
+  assert.deepEqual(onlyF, { proceed: true, requireConnection: BOUND }, 'precondition: with F the only contender, F\'s check lets the post through')
   const verdict = await postN({
     rows: [
       { id: 'log-n', remoteAttemptedAt: null, payload: N_PAYLOAD },
@@ -265,6 +265,11 @@ test('[o3d-llyw] wiring: the Xero processor hands the store loader to the INVOIC
   const invoiceBranch = source.slice(source.indexOf("case 'INVOICE_PAYMENT': {"), source.indexOf("case 'BILL_PAYMENT': {"))
   assert.ok(invoiceBranch.includes('loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {'),
     'the receipt branch passes the loader to its fence')
+  // (Codex r4) ...and hands the connection the fence bound to the POST, so the transport can refuse a reconnect.
+  assert.ok(invoiceBranch.includes('}, async ({ requireConnection }) => {'), 'the receipt branch takes the fence context')
+  const postAt = invoiceBranch.indexOf("xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments'")
+  assert.ok(postAt > 0 && invoiceBranch.indexOf('...(requireConnection ? { requireConnection } : {}),', postAt) > postAt,
+    'and passes it to the Payments POST')
   const revival = source.slice(source.indexOf('const evidence = await ledgerClearsFollowUpRevival({'))
   assert.ok(revival.slice(0, 900).includes('loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {'),
     'and the revival gate passes it too')
@@ -274,7 +279,7 @@ test('[o3d-llyw] fence and revival: a payment EDITED IN PLACE under the same id 
   const { ledgerClearsFollowUpRevival } = await probeModule()
   xeroAnswer = { data: invoice([UNREADABLE_HAND_PAYMENT]), ...BOUND }
   const unchanged = await postN({ loader: async () => [CHECK] })
-  assert.deepEqual(unchanged, { proceed: true }, 'precondition: the check lifts the record as confirmed')
+  assert.deepEqual(unchanged, { proceed: true, requireConnection: BOUND }, 'precondition: the check lifts the record as confirmed')
   for (const [label, edited] of [
     ['amount', { ...UNREADABLE_HAND_PAYMENT, Amount: 41.005 }],
     ['date', { ...UNREADABLE_HAND_PAYMENT, Date: '2026-08-03' }],

@@ -523,7 +523,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     const fenceUnchanged = await fenceOn('fence-same', 40.005)
     const fenceEdited = await fenceOn('fence-edit', 41.005)
     console.log(`[precondition] fence unchanged=${JSON.stringify(fenceUnchanged)} edited=${fenceEdited.proceed}`)
-    assert.deepEqual(fenceUnchanged, { proceed: true }, 'fence: the record as confirmed is lifted')
+    assert.deepEqual(fenceUnchanged, { proceed: true, requireConnection: { tenantId: TENANT, connectionGeneration: `${RUN_ID}-gen-1` } }, 'fence: the record as confirmed is lifted, and the POST is bound to the connection the check was validated against')
     assert.equal(fenceEdited.proceed, false, 'fence: the edited record is not covered')
 
     // (d) revival of F itself, with a check recorded for F's own receipt

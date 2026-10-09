@@ -120,6 +120,8 @@ export type LedgerCheckUnavailableReason =
   | 'scope-unnamed'
   /** An unreadable record carries the very ledger id the attempt row records as its own. */
   | 'record-is-the-attempts-own'
+  /** The ledger returned two or more unreadable settlements under the same id. */
+  | 'duplicate-record-ids'
 
 /** What would lift a withheld attempt, for the operator text. */
 export type LedgerCheckRemedy =
@@ -256,6 +258,13 @@ export function classifyLedgerSettlementWithOperatorChecks(
   if (recordIds.some((id) => id === null)) {
     return { verdict: first, liftedByCheckIds: [], remedy: { liftable: false, reason: 'record-without-id' } }
   }
+  // (Codex r4 on #757) TWO UNREADABLE RECORDS UNDER ONE ID ARE NOT TWO STATES OF ONE PAYMENT IMS CAN TELL
+  // APART BY ID. A check names records by id and pins each by fingerprint; with a duplicate id, which
+  // entry the stored fingerprint speaks for is ambiguous, and treating the id as covered would set a NEW
+  // record aside on the strength of a check about a different one. Fail closed before any check is read.
+  if (new Set(recordIds).size !== recordIds.length) {
+    return { verdict: first, liftedByCheckIds: [], remedy: { liftable: false, reason: 'duplicate-record-ids' } }
+  }
   const ownId = normaliseLedgerId(scope.attemptRecordedLedgerId)
   if (ownId !== null && recordIds.includes(ownId)) {
     return { verdict: first, liftedByCheckIds: [], remedy: { liftable: false, reason: 'record-is-the-attempts-own' } }
@@ -356,6 +365,10 @@ export function describeLedgerCheckRemedy(
         return 'An operator ledger check cannot lift this hold: one of those settlements carries the very ledger id '
           + 'the earlier entry records as its own payment. If that payment should not be there, deal with it in the '
           + 'accounting system first; IMS will not set it aside on anyone\'s word.'
+      case 'duplicate-record-ids':
+        return 'An operator ledger check cannot lift this hold: the accounting connector returned more than one '
+          + 'unreadable settlement under the same ledger id, so a check cannot say which of them was looked at. '
+          + 'Resolve it in the accounting system and ESCALATE.'
       case 'scope-unnamed':
         return 'An operator ledger check cannot lift this hold: the entry being cleared names no receipt or no '
           + 'ledger document, so a check could not be tied to it. ESCALATE.'

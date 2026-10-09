@@ -290,3 +290,20 @@ test('[o3d-llyw] registration: a payment EDITED IN PLACE under the same id is no
   const bare = decide({ operatorLedgerChecks: [{ ...CHECK, ledgerRecordFingerprints: undefined }] })
   assert.equal(bare.register, false)
 })
+
+test('[o3d-llyw Codex r4] two unreadable settlements under ONE id never take the check — in either order, and whatever the id case', () => {
+  const unchanged = decide({ operatorLedgerChecks: [CHECK] })
+  assert.equal(unchanged.register, true, 'precondition: the checked record on its own is lifted')
+  const newcomer = { ...UNREADABLE_H, unreadableAmount: '75.005', date: '2026-08-07' }
+  for (const [label, records] of [
+    ['new record BEFORE the checked one', [newcomer, UNREADABLE_H]],
+    ['new record AFTER the checked one', [UNREADABLE_H, newcomer]],
+    ['the checked record twice', [UNREADABLE_H, UNREADABLE_H]],
+    ['same id in another case', [{ ...newcomer, id: 'pay-h' }, UNREADABLE_H]],
+  ] as const) {
+    const d = decide({ operatorLedgerChecks: [CHECK], ledgerSettlements: probe([...records]) })
+    precondition(label, d)
+    assert.equal(d.register, false, `${label}: refused`)
+    assert.match(d.register === false ? d.ledgerCheckRemedy ?? '' : '', /more than one unreadable settlement under the same ledger id/)
+  }
+})

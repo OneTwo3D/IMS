@@ -37,6 +37,7 @@ import { readSingleXeroDocument } from '@/lib/connectors/xero/single-document'
 import { formatLedgerMoney } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import type { OperatorLedgerCheck, OperatorLedgerCheckScope } from '@/lib/domain/accounting/operator-ledger-check'
+import type { RequiredXeroConnection } from '@/lib/connectors/xero/api'
 import {
   addMoney,
   compareDecimal,
@@ -2429,7 +2430,7 @@ export type MoneyPostFenceParams = {
 
 export async function authoriseMoneyPost(
   params: MoneyPostFenceParams,
-): Promise<{ proceed: true } | { proceed: false; error: string }> {
+): Promise<{ proceed: true; requireConnection?: RequiredXeroConnection } | { proceed: false; error: string }> {
   const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
   if (!isMoneyMovingSyncType(params.type)) return { proceed: true }
 
@@ -2659,6 +2660,13 @@ export async function authoriseMoneyPost(
     return { proceed: true }
   }
 
+  // o3d-llyw (Codex r4 on #757) — A POST AUTHORISED BY AN OPERATOR LEDGER CHECK IS BOUND TO THE CONNECTION
+  // THE CHECK WAS VALIDATED AGAINST. The check matched the tenant and generation that served THIS probe;
+  // the POST resolves auth again, and a reconnect in between would send it under a consent the check
+  // says nothing about. So when any contender's hold was lifted by a check, the probe's connection is
+  // handed to the post callback, and the transport refuses before egress unless the POST's own auth is
+  // exactly that connection (`requireConnection`, notSent `connection-changed`).
+  let requireConnection: RequiredXeroConnection | undefined
   for (const contender of contenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
     // o3d-r948 r6 — THIS LOOP NEVER NEEDED THE EXCLUSION, AND NOW NOBODY HAS IT.
@@ -2694,7 +2702,16 @@ export async function authoriseMoneyPost(
       params.loadOperatorLedgerChecks,
     )
     const verdict = judged.verdict
-    if (verdict.outcome === 'clear') continue
+    if (verdict.outcome === 'clear') {
+      if (judged.liftedByCheckIds.length > 0) {
+        // A lift is only ever granted on a bound probe (the rule refuses `answeredBy` null), so this is set.
+        if (!probe.ok || !probe.answeredBy) {
+          return { proceed: false, error: 'Not sent: an operator ledger check applied but the reading it was checked against names no connection.' }
+        }
+        requireConnection = probe.answeredBy
+      }
+      continue
+    }
     if (verdict.outcome === 'present') {
       return {
         proceed: false,
@@ -2720,7 +2737,7 @@ export async function authoriseMoneyPost(
           : ''),
     }
   }
-  return { proceed: true }
+  return requireConnection ? { proceed: true, requireConnection } : { proceed: true }
 }
 
 /** What a money branch returns to its processor. Structurally the two connectors' `EntryResult`. */
@@ -2851,12 +2868,16 @@ async function reportLostMoneyPostExclusion(
  */
 export async function postMoneyUnderLedgerFence(
   params: MoneyPostFenceParams & { lock?: MoneyPostLock },
-  post: () => Promise<MoneyPostOutcome>,
+  /**
+   * The remote call. o3d-llyw: receives the connection it MUST be sent under when the authorisation
+   * rested on an operator ledger check (pass it to the transport as `requireConnection`); absent otherwise.
+   */
+  post: (context: { requireConnection?: RequiredXeroConnection }) => Promise<MoneyPostOutcome>,
 ): Promise<MoneyPostOutcome> {
   const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
   // Non-money types take neither the lock nor the fence, exactly as before: the ordinary queue
   // traffic must not queue behind a payment.
-  if (!isMoneyMovingSyncType(params.type)) return post()
+  if (!isMoneyMovingSyncType(params.type)) return post({})
 
   const lock = params.lock
     ?? (await import('@/lib/domain/accounting/money-post-lock')).withMoneyPostLock
@@ -2879,7 +2900,7 @@ export async function postMoneyUnderLedgerFence(
     held.assertHeld('posting money to the accounting connector')
     let outcome: MoneyPostOutcome
     try {
-      outcome = await post()
+      outcome = await post(authorised.requireConnection ? { requireConnection: authorised.requireConnection } : {})
     } catch (error) {
       if (!held.lost) throw error
       const incident = await reportLostMoneyPostExclusion(params, 'threw')
