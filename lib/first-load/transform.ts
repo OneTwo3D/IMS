@@ -34,6 +34,7 @@ import {
   type InTransitConvention,
   type ProductType,
 } from './spec'
+import { joinVariantParents, type CatalogueView } from './variant-parents'
 import {
   accountRows,
   assertWithinImporterLimits,
@@ -168,6 +169,8 @@ export interface PrepareReport {
     excludedAccepted: string[]
   }
   recipes: { cycles: string[][] }
+  /** The join of Qoblex variants to WooCommerce variation parents (dataset `variant-parents`); `supplied` is false when it was not given. */
+  variantParents: { supplied: boolean; rowsRead: number; variantsJoined: number; parentsEmitted: number; parentsWithoutQoblexVariant: number }
   purchaseOrders: { orders: number; ordersNothingOutstanding: number; linesEmitted: number }
   transfers: { transfers: number; linesEmitted: number }
   /** Every warehouse code the import files use. The importers refuse a code that does not exist in IMS; the tool cannot check that. */
@@ -322,6 +325,10 @@ class Run {
   wmsQty = new Map<string, Dec>()
   wmsSkus = new Map<string, string>()
   wooSkus = new Map<string, string>()
+  /** VARIABLE parents created from the variant-parents dataset (they are output rows without a products-dataset record). */
+  syntheticParents = new Set<string>()
+  variantParentKeys = new Set<string>()
+  variantParentSummary = { supplied: false, rowsRead: 0, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
 
   constructor(readonly input: PrepareInput) {}
 
@@ -579,13 +586,19 @@ function loadCatalogue(run: Run): void {
   if (merged.length > 0) run.find('WARNING', 'CATEGORY_SPELLINGS_MERGED', 'category spellings that differ only by case, accents or whitespace are ONE category to the importer: they will be merged into whichever it creates first', 'products', merged)
   if (entityCategories.length > 0) run.find('WARNING', 'CATEGORY_HTML_ENTITY', 'the importer decodes HTML entities in a category name, so the stored name will differ from this text', 'products', entityCategories)
 
-  const typeOf = new Map(remaining.map((c) => [c.entry.key, c.entry.type]))
+  joinVariantParentsInto(run, remaining.map((c) => c.entry))
+
+  const typeOf = new Map<string, ProductType>([...remaining.map((c) => [c.entry.key, c.entry.type] as const), ...[...run.syntheticParents].map((key) => [key, 'VARIABLE' as const] as const)])
+  const unjoined: string[] = []
   for (const c of remaining) {
     const { entry } = c
     if (entry.type === 'VARIANT') {
       if (entry.parentSku === '') {
-        run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_WITHOUT_PARENT', 'a VARIANT needs a parentSku')
+        run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_WITHOUT_PARENT', run.variantParentSummary.supplied
+          ? 'a VARIANT needs a parentSku, and no WooCommerce variation has this SKU (the join is by exact SKU; it is never guessed from the SKU\'s shape, and the variant is never loaded as a simple product)'
+          : 'a VARIANT needs a parentSku (the variant-parents dataset, read from WooCommerce, supplies it)')
         run.catStatus.set(entry.key, 'rejected')
+        unjoined.push(entry.sku)
         continue
       }
       const parentKey = skuKey(entry.parentSku)
@@ -604,6 +617,55 @@ function loadCatalogue(run: Run): void {
     run.catStatus.set(entry.key, 'ok')
     run.add('products', c.row.line, entry.sku, 'EMITTED', 'PRODUCT', 'in the products import file')
   }
+  if (unjoined.length > 0) {
+    run.find('ERROR', 'VARIANT_WITHOUT_PARENT', `${unjoined.length} VARIANT product(s) have no parent: ${run.variantParentSummary.supplied ? 'no WooCommerce variation has their SKU' : 'no variant-parents dataset was supplied'}. Fix the SKU in Qoblex or WooCommerce, or put each on the exclusion list with a reason. They are never loaded as simple products.`, 'products', unjoined)
+  }
+}
+
+/**
+ * Joins the Qoblex VARIANT rows that have no parent to the WooCommerce variation with the same SKU (exact), assigns the variation's parent SKU
+ * to the variant, and adds each parent reached to the catalogue ONCE as a VARIABLE product named by WooCommerce.
+ */
+function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
+  if (!run.has('variant-parents')) return
+  if (!run.has('products')) {
+    for (const row of run.rows('variant-parents')) run.add('variant-parents', row.line, row.values.variantSku, 'EXCLUDED', 'NO_CATALOGUE_TO_JOIN', 'the Qoblex products dataset was not supplied, so there is nothing to join')
+    run.find('ERROR', 'VARIANT_PARENTS_NEED_CATALOGUE', 'the variant-parents dataset was supplied but the Qoblex products dataset was not: variants cannot be joined to their parents', 'variant-parents')
+    run.variantParentSummary = { supplied: true, rowsRead: run.rows('variant-parents').length, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
+    return
+  }
+  const byKey = new Map(candidates.map((entry) => [entry.key, entry]))
+  const catalogue = (key: string): CatalogueView => {
+    const entry = byKey.get(key)
+    if (entry) return { state: 'candidate', sku: entry.sku, type: entry.type, parentSku: entry.parentSku }
+    const status = run.catStatus.get(key)
+    if (status === 'rejected') return { state: 'rejected' }
+    if (status === 'excluded') return { state: 'excluded' }
+    return { state: 'absent' }
+  }
+  const result = joinVariantParents({
+    rows: run.rows('variant-parents'),
+    catalogue,
+    imsKeys: new Set(run.ims.keys()),
+    exclusions: new Map([...run.exclusions.entries()].map(([key, value]) => [key, value.reason])),
+  })
+  for (const d of result.dispositions) run.add('variant-parents', d.line, d.key, d.outcome, d.code, d.reason)
+  for (const f of result.findings) run.find(f.severity, f.code, f.message, 'variant-parents', f.keys)
+  for (const [variantKey, parentSku] of result.assignments) {
+    const entry = byKey.get(variantKey)
+    if (entry) entry.parentSku = parentSku
+  }
+  for (const parent of result.parents) {
+    const entry: CatEntry = {
+      sku: parent.sku, key: parent.key, name: parent.name, type: 'VARIABLE', parentSku: '',
+      cells: { lifecycleStatus: parent.lifecycle }, lifecycle: parent.lifecycle,
+    }
+    run.cat.set(entry.key, entry)
+    run.catStatus.set(entry.key, 'ok')
+    run.syntheticParents.add(entry.key)
+  }
+  for (const key of result.namedKeys) run.variantParentKeys.add(key)
+  run.variantParentSummary = { supplied: true, ...result.summary }
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,7 +1454,7 @@ function checkCoverage(run: Run): CoverageResult | null {
   if (result.notLoaded.length > 0) {
     run.find('ERROR', 'R14_SKU_NOT_LOADED', `${result.notLoaded.length} SKU(s) exist in Qoblex, the 3PL (WMS) or WooCommerce but will not exist in IMS and are not on the exclusion list (R14 must have zero one-sided SKUs). Fix the data or add a reasoned exclusion.`, undefined, result.notLoaded)
   }
-  const everything = new Set<string>([...run.catAnyParsed.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys(), ...run.ims.keys()])
+  const everything = new Set<string>([...run.catAnyParsed.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys(), ...run.ims.keys(), ...run.variantParentKeys])
   const stale = [...run.exclusions.entries()].filter(([key]) => !everything.has(key)).map(([, v]) => v.sku)
   if (stale.length > 0) run.find('WARNING', 'STALE_EXCLUSION', 'SKU(s) on the exclusion list appear in no input: the exclusion does nothing', 'sku-exclusions', stale)
   const sourceKeys = new Set<string>([...run.catAnyParsed.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys()])
@@ -1650,7 +1712,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   const expectOut = (target: ImporterTarget, expected: number, label: string) => {
     if (emittedByTarget[target] !== expected) run.selfCheck.push(`${label}: ${emittedByTarget[target]} output rows but ${expected} emitted dispositions`)
   }
-  if (run.has('products')) expectOut('products', run.disp.filter((d) => d.dataset === 'products' && d.outcome === 'EMITTED').length, 'products')
+  if (run.has('products')) expectOut('products', run.disp.filter((d) => d.dataset === 'products' && d.outcome === 'EMITTED').length + run.syntheticParents.size, 'products (emitted records plus VARIABLE parents created from the variant-parents dataset)')
   if (run.has('suppliers')) expectOut('suppliers', run.disp.filter((d) => d.dataset === 'suppliers' && d.outcome === 'EMITTED').length, 'suppliers')
   if (run.has('stock-lots')) expectOut('opening-stock', run.stockGroups.size, 'opening-stock')
   if (run.has('transfers')) expectOut('transfers', run.disp.filter((d) => d.dataset === 'transfers' && d.outcome === 'EMITTED').length, 'transfers')
@@ -1675,6 +1737,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     split ? { check: 'zero on-hand versus missing from extract', status: 'RAN', note: 'stock-lots and products supplied' } : { check: 'zero on-hand versus missing from extract', status: 'NOT RUN', note: 'needs the products and stock-lots datasets' },
     coverage ? { check: 'R14 four-way SKU coverage', status: 'RAN', note: `sides supplied: ${['products', 'wms', 'woo', 'ims'].filter((s) => (s === 'products' ? run.has('products') : s === 'wms' ? run.has('wms-products') || run.has('wms-stock') : s === 'woo' ? run.has('woo-products') : run.has('ims-skus'))).join(', ')}` } : { check: 'R14 four-way SKU coverage', status: 'NOT RUN', note: 'needs the products dataset' },
     run.has('ims-suppliers') ? { check: 'new supplier names versus suppliers already in IMS', status: 'RAN', note: 'under both importer matching rules' } : { check: 'new supplier names versus suppliers already in IMS', status: 'NOT RUN', note: 'no ims-suppliers list supplied: a collision with an existing IMS supplier is NOT checked (apply-time check lookup-keys-unique-in-ims)' },
+    run.has('variant-parents') ? { check: 'variants joined to WooCommerce parents by exact SKU', status: 'RAN', note: 'the parent is the one WooCommerce gives the variation; a SKU stem is only compared, never used' } : { check: 'variants joined to WooCommerce parents by exact SKU', status: 'NOT RUN', note: 'variant-parents not supplied: every Qoblex variant is rejected as VARIANT_WITHOUT_PARENT' },
     run.has('recipe-lines') ? { check: 'recipe graph is acyclic', status: 'RAN', note: 'detectBomItemCycleInEdges over every valid recipe line' } : { check: 'recipe graph is acyclic', status: 'NOT RUN', note: 'recipe-lines not supplied' },
     run.has('stock-lots') ? { check: 'multi-lot collapse to one weighted average', status: 'RAN', note: 'exact decimal arithmetic, rounded once to 6 dp' } : { check: 'multi-lot collapse to one weighted average', status: 'NOT RUN', note: 'stock-lots not supplied' },
     run.has('transfers') ? { check: 'in-transit quantity counted once', status: 'RAN', note: `convention ${config.inTransitConvention}` } : { check: 'in-transit quantity counted once', status: 'NOT RUN', note: 'transfers not supplied' },
@@ -1749,6 +1812,7 @@ export function prepare(input: PrepareInput): PrepareResult {
       excludedAccepted: coverage?.excludedAccepted ?? [],
     },
     recipes: { cycles: run.recipeCycles },
+    variantParents: run.variantParentSummary,
     purchaseOrders: { orders: run.poOutputs.length, ordersNothingOutstanding: run.poOrdersNothingOutstanding, linesEmitted: emittedByTarget['purchase-orders'] },
     transfers: { transfers: run.transferOutputs.length, linesEmitted: emittedByTarget.transfers },
     warehouseCodesUsed: [...run.warehouses].sort(cmp),

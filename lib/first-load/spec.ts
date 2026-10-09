@@ -222,6 +222,7 @@ export const DATASET_NAMES = [
   'wms-products',
   'wms-stock',
   'woo-products',
+  'variant-parents',
   'sku-exclusions',
   'ims-skus',
   'ims-suppliers',
@@ -306,6 +307,14 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     sources: ['woocommerce'],
     purpose: 'WooCommerce product export. Used only for the four-way SKU coverage check (R14). Never a source for recipes.',
   },
+  'variant-parents': {
+    columns: ['variantSku', 'wooVariationId', 'parentSku', 'parentName', 'parentStatus', 'wooParentId'],
+    required: ['variantSku', 'parentSku', 'parentName', 'parentStatus'],
+    sources: ['woocommerce'],
+    purpose:
+      'One row per WooCommerce variation: the variation SKU and the VARIABLE parent it belongs to. Written by the read-only WooCommerce snapshot command '
+      + '(first-load:woo-snapshot). Qoblex variants are joined to it by EXACT variation SKU; each parent reached is emitted once as a VARIABLE product.',
+  },
   'sku-exclusions': {
     columns: ['sku', 'reason'],
     required: ['sku', 'reason'],
@@ -328,8 +337,69 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
 
 /** Datasets whose rows end up in an importer file. The others only feed checks. */
 export const LOADING_DATASETS: ReadonlySet<DatasetName> = new Set([
-  'products', 'recipe-lines', 'stock-lots', 'suppliers', 'purchase-order-lines', 'transfers',
+  'products', 'recipe-lines', 'stock-lots', 'suppliers', 'purchase-order-lines', 'transfers', 'variant-parents',
 ])
+
+/**
+ * How a WooCommerce parent's post status becomes the IMS lifecycle status of the VARIABLE parent. A CLOSED list: a status that is not
+ * here (`trash`, `future`, an unknown plugin status) rejects the parent's rows, it is never guessed. `private` and `pending` are not
+ * published, so they load as DRAFT; the owner confirms this mapping before the real load (see docs/first-load-input-spec.md).
+ */
+export const VARIANT_PARENT_STATUS_LIFECYCLE: Readonly<Record<string, 'ACTIVE' | 'DRAFT'>> = {
+  publish: 'ACTIVE',
+  draft: 'DRAFT',
+  pending: 'DRAFT',
+  private: 'DRAFT',
+}
+
+// ---------------------------------------------------------------------------
+// The read-only WooCommerce snapshot command: exit codes and file names (one table; the document repeats it)
+// ---------------------------------------------------------------------------
+
+export const SNAPSHOT_EXIT_CODES = {
+  OK: 0,
+  INCONSISTENT: 1,
+  USAGE: 2,
+  REFUSED: 3,
+  FETCH_FAILED: 4,
+  OUTPUT_FAILED: 5,
+  INTERNAL: 6,
+} as const
+
+export type SnapshotExitCodeName = keyof typeof SNAPSHOT_EXIT_CODES
+
+export const SNAPSHOT_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: SnapshotExitCodeName; meaning: string }> = [
+  { code: SNAPSHOT_EXIT_CODES.OK, name: 'OK', meaning: 'The snapshot is complete: every count matches the store\'s own totals. The snapshot, provenance and variant-parents files were written.' },
+  {
+    code: SNAPSHOT_EXIT_CODES.INCONSISTENT,
+    name: 'INCONSISTENT',
+    meaning:
+      'The store answered, but what it returned cannot be trusted as a complete, consistent catalogue (a count does not match its total header, a parent is not variable or has no SKU, a variation SKU repeats, '
+      + 'the store changed during the walk) or --verify found a damaged snapshot. No final file was written.',
+  },
+  { code: SNAPSHOT_EXIT_CODES.USAGE, name: 'USAGE', meaning: 'Bad command line. Nothing was read, requested or written.' },
+  {
+    code: SNAPSHOT_EXIT_CODES.REFUSED,
+    name: 'REFUSED',
+    meaning:
+      'A precondition refused the run before any request left the machine: the store origin is not on the allowlist (and --allow-any-origin was not given), the credentials file is missing, unreadable, '
+      + 'or readable by group or others, or it does not hold the three required values.',
+  },
+  {
+    code: SNAPSHOT_EXIT_CODES.FETCH_FAILED,
+    name: 'FETCH_FAILED',
+    meaning: 'A request failed after its retries (network, HTTP error, unreadable response). What was read so far is kept in the output directory; run again with --resume to continue from it.',
+  },
+  { code: SNAPSHOT_EXIT_CODES.OUTPUT_FAILED, name: 'OUTPUT_FAILED', meaning: 'The output directory is unusable (it exists and is not empty, or a write failed). Files this run had created were removed again.' },
+  { code: SNAPSHOT_EXIT_CODES.INTERNAL, name: 'INTERNAL', meaning: 'A self-check of this command failed. This is a defect in the tool, not in the store\'s data.' },
+]
+
+export const SNAPSHOT_FILE_NAMES = {
+  snapshot: 'woo-snapshot.json',
+  provenance: 'woo-snapshot.provenance.json',
+  variantParents: 'variant-parents.csv',
+  partial: 'woo-snapshot.partial.json',
+} as const
 
 export const IN_TRANSIT_CONVENTIONS = ['counted-in-source', 'excluded-from-source'] as const
 export type InTransitConvention = (typeof IN_TRANSIT_CONVENTIONS)[number]
