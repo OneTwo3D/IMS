@@ -9,9 +9,11 @@ import type { WmsOrderAddress } from '@/lib/connectors/wms/types'
  * The rules follow the woo-mintsoft plugin (`_build_payload` in wc_mintsoft_orders.py), with the two
  * deliberate differences listed after them.
  *
- *  1. The delivery address is the shipping address if it names a recipient (a first name or a street
- *     line). A shipping address with neither (blank, or company-only) is NOT a usable destination, so
- *     the whole billing address is used instead — name, company and street all come from ONE address;
+ *  1. The delivery address is the shipping address if it has a street line. A shipping address without
+ *     one (blank, name-only or company-only) is NOT a usable destination, so the whole billing address is
+ *     used instead (the plugin accepts a first name alone; IMS does not, because the warehouse cannot
+ *     deliver to a name). If NEITHER address has a street line the push is refused, see
+ *     NO_DELIVERY_STREET_REASON — name, company and street all come from ONE address;
  *     the two are never mixed field-by-field.
  *  2. Every text value is trimmed; a blank value counts as absent.
  *  3. Phone numbers and emails are passed through verbatim apart from trimming: international formats
@@ -55,9 +57,9 @@ function streetLine(record: AddressRecord): string {
   return isPartsShape(record) ? text(record, 'address1') : text(record, 'address1', 'line1', 'address_1')
 }
 
-/** Does this address name someone or somewhere to deliver to? (A company alone does not.) */
+/** Is this address somewhere a parcel can be delivered to? That REQUIRES a street line; a name or company alone is not a destination. */
 function namesARecipient(record: AddressRecord): boolean {
-  return text(record, 'firstName') !== '' || streetLine(record) !== ''
+  return streetLine(record) !== ''
 }
 
 function addressFrom(record: AddressRecord, fallbackName: string | null): WmsOrderAddress {
@@ -80,6 +82,16 @@ function addressFrom(record: AddressRecord, fallbackName: string | null): WmsOrd
     country: text(record, 'country'),
   }
 }
+
+/**
+ * Why an order with no street line on either address cannot be pushed. Single-sourced: thrown by the push
+ * input builder and shown wherever the validation failure is shown. It states only what is known (the
+ * stored addresses have no street line), not what was or was not sent.
+ */
+export const NO_DELIVERY_STREET_REASON =
+  'Neither the shipping address nor the billing address on this order has a street line, so there is no '
+  + 'address to deliver it to and the order cannot be pushed to the warehouse as it stands. Add a street '
+  + 'line to the order\'s shipping address.'
 
 export type PushRecipient = {
   address: WmsOrderAddress

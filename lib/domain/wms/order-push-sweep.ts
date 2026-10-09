@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { resolvePushRecipient } from './push-recipient'
+import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from './push-recipient'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere } from './create-eligibility'
@@ -485,6 +485,8 @@ export function wmsPushOrderReference(
 
 export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
   const recipient = resolvePushRecipient(order)
+  // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
+  if (!recipient.address.address1) throw new Error(NO_DELIVERY_STREET_REASON)
   return {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,

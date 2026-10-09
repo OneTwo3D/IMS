@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { resolvePushRecipient } from '../lib/domain/wms/push-recipient.ts'
+import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from '../lib/domain/wms/push-recipient.ts'
 import { buildPushInput } from '../lib/domain/wms/order-push-sweep.ts'
 import { buildPushPayload } from '../lib/connectors/mintsoft/api/order-push.ts'
 
@@ -64,10 +64,30 @@ const CASES: Case[] = [
     expect: { source: 'billing', name: ['Bea', 'Buyer'], company: 'Buyer Ltd', address1: '9 Billing Rd', phone: '020 7946 0000', email: 'bea@example.com' },
   },
   {
-    name: 'first name but no street still counts as a recipient (plugin: first_name OR address_1)',
+    name: 'first name but NO street is not a destination: billing (which has a street) is used',
     shipping: stored({ firstName: 'Gina', city: 'Leeds' }),
     billing,
-    expect: { source: 'shipping', name: ['Gina', ''], company: '', address1: '', phone: '020 7946 0000', email: 'bea@example.com' },
+    expect: { source: 'billing', name: ['Bea', 'Buyer'], company: 'Buyer Ltd', address1: '9 Billing Rd', phone: '020 7946 0000', email: 'bea@example.com' },
+  },
+  {
+    name: 'street only (no name, no company) is a destination',
+    shipping: stored({ address1: '3 Only St' }),
+    billing,
+    customerName: 'Cy Customer',
+    expect: { source: 'shipping', name: ['Cy', 'Customer'], company: '', address1: '3 Only St', phone: '020 7946 0000', email: 'bea@example.com' },
+  },
+  {
+    name: 'first name only on BOTH addresses: no street anywhere, resolver reports an empty street (the push refuses it)',
+    shipping: stored({ firstName: 'Gina' }),
+    billing: stored({ firstName: 'Bea' }),
+    expect: { source: 'shipping', name: ['Gina', ''], company: '', address1: '', phone: null, email: null },
+  },
+  {
+    name: 'company only on both addresses: no street anywhere',
+    shipping: stored({ company: 'Gift Co' }),
+    billing: stored({ company: 'Buyer Ltd' }),
+    customerName: 'Pat Q',
+    expect: { source: 'shipping', name: ['Pat', 'Q'], company: 'Gift Co', address1: '', phone: null, email: null },
   },
   {
     name: 'street but no name: shipping is used and the customer name fills the name',
@@ -142,7 +162,7 @@ for (const c of CASES) {
 test('table ran every case (match count printed)', () => {
   console.log(`# precondition: ${reached} of ${CASES.length} recipient cases executed`)
   assert.equal(reached, CASES.length)
-  assert.ok(CASES.length >= 13)
+  assert.ok(CASES.length >= 15)
 })
 
 test('Mintsoft payload for an order whose shipping address differs from billing (snapshot)', () => {
@@ -179,4 +199,30 @@ test('Mintsoft payload for an order whose shipping address differs from billing 
   assert.ok(!serialised.includes('Buyer'), 'billing name/company must not appear')
   assert.ok(!serialised.includes('9 Billing Rd'), 'billing street must not appear')
   assert.ok(!serialised.includes('020 7946 0000'), 'billing phone must not appear when shipping has one')
+})
+
+test('buildPushInput refuses an order with no street line on either address, with the single-sourced reason', () => {
+  const base = {
+    id: 'order-2', orderNumber: 'SO-2002', externalOrderNumber: null, currency: 'GBP',
+    customerName: 'Bea Buyer', customerEmail: null, customerVatNumber: null,
+    shippingService: null, subtotalForeign: 10, shippingForeign: 0, taxForeign: 2,
+    taxRatePercent: 0.2, pricesIncludeVat: false, discountAmount: 0, totalForeign: 12,
+    lines: [{ sku: 'SKU1', qty: 1, taxForeign: 2, totalForeign: 10, description: 'Widget' }],
+  }
+  const attempts = [
+    { shipping: stored({ firstName: 'Gina' }), billing: stored({ firstName: 'Bea' }), refused: true },
+    { shipping: stored({ company: 'Gift Co' }), billing: null, refused: true },
+    { shipping: stored({}), billing: stored({ address1: ' ' }), refused: true },
+    { shipping: stored({ firstName: 'Gina' }), billing: stored({ address1: '9 Billing Rd' }), refused: false },
+    { shipping: stored({ address1: '1 Recipient St' }), billing: null, refused: false },
+  ]
+  let refusals = 0
+  for (const a of attempts) {
+    let thrown: unknown = null
+    try { buildPushInput({ ...base, shippingAddress: a.shipping, billingAddress: a.billing }, '301') } catch (e) { thrown = e }
+    if (a.refused) { refusals += 1; assert.equal((thrown as Error | null)?.message, NO_DELIVERY_STREET_REASON) } else assert.equal(thrown, null)
+  }
+  console.log(`# precondition: ${refusals} of ${attempts.length} attempts refused`)
+  assert.equal(refusals, 3)
+  assert.ok(!/nothing was sent|never sent/i.test(NO_DELIVERY_STREET_REASON))
 })
