@@ -53,6 +53,7 @@ import {
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
 import type { Prisma, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
+import { storeWcProductContent } from './product-content'
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 const MANUAL_PRODUCT_SYNC_JOB_KEY = 'manual_wc_product_sync_job'
@@ -1291,6 +1292,10 @@ export async function syncWcProductToIms(
           conflicts: structureConflicts,
         })
 
+        // The hub copy of the product's content (descriptions, picture references), written beside the row it
+        // describes and only when a field really changed. Read-side: nothing here reaches WooCommerce.
+        await storeWcProductContent(tx, productId, wcProduct)
+
         // LAST, so it sees as much of the concurrent world as this transaction ever can.
         await assertTransformedRowsStillTransformable(tx, structurallyTransformed)
 
@@ -1990,6 +1995,7 @@ async function applyVariations(
       // The adoption landed; same rule as the parent branch (r4).
       if (adoptionTransformsRow) structurallyTransformed.set(existing.id, existing.sku)
       await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
+      await storeWcProductContent(tx, existing.id, v)
       // Reflect the FULL applied update, not just the new mapping. A later sibling sharing this
       // SKU builds its `?? existing.x` fallbacks from this row; caching the pre-update values
       // would write the first sibling's fresh description/image straight back out again.
@@ -2023,6 +2029,7 @@ async function applyVariations(
       // has no children, and nothing may re-derive it from the type. Stating it is also what
       // keeps `imsRowHasChildren` free to throw on a row that was never asked (r5).
       existingBySku.set(sku, { ...created, hasChildren: false })
+      await storeWcProductContent(tx, created.id, v)
     }
   }
 
