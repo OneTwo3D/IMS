@@ -4,6 +4,7 @@ import {
   OPERATOR_ASSERTION_POST_BASIS,
 } from '@/lib/domain/accounting/accounting-event-post-basis'
 import {
+  HELD_SHADOW_SETTLEMENT_BASIS,
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   OPERATOR_RELEASE_SETTLEMENT_BASIS,
   VERIFIED_REVERSAL_SETTLEMENT_BASIS,
@@ -57,6 +58,11 @@ import {
 //       CANCELLED cancelled-sale settlement)                                     -> ASSERTED_POSTED
 //    4  CANCELLED + OPERATOR_ASSERTION + no id (the NOT_POSTED settlement)       -> ASSERTED_NOT_POSTED
 //    5  CANCELLED + VERIFIED_REVERSAL (id or not)                                -> PROVEN_NOT_POSTED
+//    5a CANCELLED + HELD_SHADOW + no id                                          -> PROVEN_NOT_POSTED
+//       (a shadow: IMS would have queued this posting and the producer-side hold said SHADOW, so no outbox job
+//       existed, the row was never claimable and no request can have been made for it. A statement about IMS
+//       only: it says nothing about whether the owner of the operation posted the document. HELD_SHADOW on any
+//       other row - a document id, or a status other than CANCELLED - is not a row this build writes: UNKNOWN.)
 //    6  any + (NULL | OPERATOR_RELEASE) + id                                     -> CONFIRMED_POSTED
 //    7  SYNCED + (NULL | OPERATOR_RELEASE) + no id (id-less types)               -> CONFIRMED_POSTED
 //    8  CANCELLED + NULL + no id + abandonedBeforeRemoteCall === true            -> PROVEN_NOT_POSTED
@@ -155,6 +161,7 @@ export function ledgerStanding(row: LedgerStandingRow, options: LedgerStandingOp
     && basis !== OPERATOR_ASSERTION_SETTLEMENT_BASIS
     && basis !== OPERATOR_RELEASE_SETTLEMENT_BASIS
     && basis !== VERIFIED_REVERSAL_SETTLEMENT_BASIS
+    && basis !== HELD_SHADOW_SETTLEMENT_BASIS
   ) return 'UNKNOWN'
   // 2: an assertion on unfinished work has no writer.
   if (live && basis === OPERATOR_ASSERTION_SETTLEMENT_BASIS) return 'UNKNOWN'
@@ -166,6 +173,8 @@ export function ledgerStanding(row: LedgerStandingRow, options: LedgerStandingOp
   }
   // 5: IMS asked the ledger and it said the payment is gone.
   if (status === 'CANCELLED' && basis === VERIFIED_REVERSAL_SETTLEMENT_BASIS) return 'PROVEN_NOT_POSTED'
+  // 5a: a shadow IMS recorded instead of queuing. Anything but CANCELLED with no id is not a row this build writes.
+  if (basis === HELD_SHADOW_SETTLEMENT_BASIS) return status === 'CANCELLED' && !id ? 'PROVEN_NOT_POSTED' : 'UNKNOWN'
   // 6 / 7: the connector's own writeback (or an operator release of a connector-issued id).
   if (connectorOrRelease && (id || status === 'SYNCED')) return 'CONFIRMED_POSTED'
   // 8 / 9: a cancellation proves nothing unless the canceller recorded the proof.
@@ -232,6 +241,26 @@ export function isProvenLedgerFact(row: LedgerStandingRow): boolean {
  */
 export function namesADocument(row: { externalTransactionId: string | null }): boolean {
   return typeof row.externalTransactionId === 'string' && row.externalTransactionId.trim().length > 0
+}
+
+/**
+ * Is this row a SHADOW IMS recorded instead of queuing a posting (row 5a)? CANCELLED, the HELD_SHADOW basis and no
+ * document id: the one shape `createAccountingSyncLogRow` writes. A reader that must not read a shadow as a missing
+ * posting (reconciliation, the invariants) or as a posting (everything that counts documents) asks this. It is a
+ * statement about IMS only; whether the operation's owner wrote the document is not recorded here.
+ */
+export function isShadowedObligation(row: LedgerStandingRow): boolean {
+  return row.settlementBasis === HELD_SHADOW_SETTLEMENT_BASIS && row.status === 'CANCELLED' && !hasId(row)
+}
+
+/** Rendering of {@link isShadowedObligation}, null-total. */
+export const SHADOWED_OBLIGATION_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  AND: [
+    { status: 'CANCELLED' },
+    { settlementBasis: { not: null } },
+    { settlementBasis: HELD_SHADOW_SETTLEMENT_BASIS },
+    { OR: [{ externalTransactionId: null }, { externalTransactionId: '' }] },
+  ],
 }
 
 /**
@@ -359,6 +388,8 @@ export const UNPROVEN_CANCELLED_WHERE: Prisma.AccountingSyncLogWhereInput = {
         ID_ABSENT,
         { settlementBasis: { not: null } },
         { settlementBasis: { not: VERIFIED_REVERSAL_SETTLEMENT_BASIS } },
+        // Row 5a: a shadow with no id is proven not posted BY IMS.
+        { settlementBasis: { not: HELD_SHADOW_SETTLEMENT_BASIS } },
       ],
     },
     // (c)

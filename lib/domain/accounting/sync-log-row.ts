@@ -1,6 +1,9 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { HELD_SHADOW_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
+import { xeroProducerSeamVerdict, type XeroSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { attachShadowSyncLog, recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
 import { clearAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import {
   HandPostDeferralUnrecordableError,
@@ -65,8 +68,16 @@ export type SyncLogRowClient = {
  * third answer rather than a `row: null`: nothing is written, nothing is asserted, and the caller may retry.
  */
 export type CreateAccountingSyncLogRowResult<T> =
-  | { row: T; suppressed: null }
-  | { row: null; suppressed: 'handled_by_hand' | 'hand_post_claim' }
+  | { row: T; suppressed: null; shadowed?: undefined }
+  | { row: null; suppressed: 'handled_by_hand' | 'hand_post_claim'; shadowed?: undefined }
+  /**
+   * THE PRODUCER-SIDE HOLD SAID SHADOW (lib/security/producer-disposition.ts): the posting is recorded as a shadow and
+   * NOTHING IS QUEUED. `shadowed` is the CANCELLED shadow row that carries it (an existing one when the same work was
+   * produced before). `row` is null on purpose: a caller that goes on to schedule an outbox job or mirror an event for
+   * `row` does not compile, and every caller must say what a shadow means to it. A shadow has no outbox job, no
+   * accounting event and no live claim on the posting.
+   */
+  | { row: null; suppressed: null; shadowed: T }
 
 export async function createAccountingSyncLogRow<T extends { id: string }>(
   client: SyncLogRowClient,
@@ -117,6 +128,10 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
       return { row: null, suppressed: 'handled_by_hand' }
     }
   }
+  // THE PRODUCER SEAM. After the suppression read on purpose: a posting marked handled by hand, or held by an operator's
+  // claim, is answered above whatever the hold says, so a shadow can never discharge or postpone a claim.
+  const verdict = xeroProducerSeamVerdict({ connector: String(data.connector), type: String(data.type), payload: data.payload })
+  if (verdict.kind === 'shadow') return recordShadowRow<T>(client, data, verdict, options)
   const create = () => client.accountingSyncLog.create({ data }) as Promise<T>
   const row = options?.createInSavepoint ? await withSavepoint(client, create) : await create()
   await clearAccountingPostingRefusal(
@@ -125,4 +140,60 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
     { withSavepoint: <R,>(fn: () => Promise<R>) => withSavepoint(client, fn) },
   )
   return { row, suppressed: null }
+}
+
+/**
+ * The shadow of a posting IMS would have queued: a CANCELLED row, basis HELD_SHADOW, no document id, created in
+ * stamping custody with no remote attempt (so it reads PROVEN_NOT_POSTED by IMS, ledger-standing.ts row 5a), carrying
+ * the single-sourced operator sentence as its error message; plus the `outbound_shadow_writes` row that counts repeats.
+ *
+ * REPEATS DO NOT MAKE ROWS. The shadow table's unique key (destination, operation, subject, payload digest) decides:
+ * the same work produced again, which the recreate sweeps and a retried action do every tick while the hold is on,
+ * counts an occurrence and returns the sync-log row that already carries it. If that row has been deleted by
+ * retention, a new one is written and the shadow points at it.
+ *
+ * A shadow write that FAILS is lost evidence, never lost work: it is rolled back to its savepoint and the sync-log row
+ * (the durable shadow) is still written, so the caller's transaction is never aborted by the record-keeping. The only
+ * thing lost is the dedupe for that one call.
+ */
+async function recordShadowRow<T extends { id: string }>(
+  client: SyncLogRowClient,
+  data: Prisma.AccountingSyncLogUncheckedCreateInput,
+  verdict: Extract<XeroSeamVerdict, { kind: 'shadow' }>,
+  options?: { createInSavepoint?: boolean },
+): Promise<CreateAccountingSyncLogRowResult<T>> {
+  let recorded: Awaited<ReturnType<typeof recordOutboundShadow>> | null = null
+  try {
+    recorded = await withSavepoint(client, () => recordOutboundShadow(client, {
+      destination: verdict.destination,
+      operation: verdict.operation,
+      subjectType: String(data.referenceType),
+      subjectId: String(data.referenceId),
+      payload: { type: String(data.type), payload: data.payload },
+      summary: { type: String(data.type), connector: String(data.connector) },
+      decision: verdict.decision,
+    }))
+  } catch (error) {
+    console.error(`[producer-hold] could not record the shadow of ${String(data.type)} ${String(data.referenceType)} ${String(data.referenceId)}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (recorded?.accountingSyncLogId) return { row: null, suppressed: null, shadowed: { id: recorded.accountingSyncLogId } as T }
+  const create = () => client.accountingSyncLog.create({
+    data: {
+      ...data,
+      status: 'CANCELLED',
+      settlementBasis: HELD_SHADOW_SETTLEMENT_BASIS,
+      abandonedBeforeRemoteCall: true,
+      externalTransactionId: null,
+      errorMessage: verdict.notice,
+    },
+  }) as Promise<T>
+  const row = options?.createInSavepoint ? await withSavepoint(client, create) : await create()
+  if (recorded) {
+    try {
+      await withSavepoint(client, () => attachShadowSyncLog(client, recorded.id, row.id))
+    } catch (error) {
+      console.error(`[producer-hold] could not link shadow ${recorded.id} to sync row ${row.id}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return { row: null, suppressed: null, shadowed: row }
 }

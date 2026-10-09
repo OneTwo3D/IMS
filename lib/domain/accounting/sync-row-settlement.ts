@@ -288,11 +288,27 @@ export const OPERATOR_RELEASE_SETTLEMENT_BASIS = 'OPERATOR_RELEASE'
  */
 export const VERIFIED_REVERSAL_SETTLEMENT_BASIS = 'VERIFIED_REVERSAL'
 
+/**
+ * THE BASIS OF A ROW THAT IS A SHADOW (lib/security/producer-disposition.ts): IMS WOULD HAVE QUEUED THIS POSTING AND DID NOT.
+ *
+ * Written, at CREATE, together with status CANCELLED, no document id and `abandonedBeforeRemoteCall` true, by the one
+ * writer that makes such a row (`createAccountingSyncLogRow`, when the producer-side hold says SHADOW). It is a
+ * statement about IMS ONLY: no outbox job ever existed for it, it was never claimable, and no transport call can have
+ * been made for it. It says nothing about whether the owner of the operation (Xeroom, Qoblex's own integration, an
+ * operator) posted the document.
+ *
+ * It is NOT an operator claim and NOT a connector confirmation, so it is its own basis: a reader that sees it reads the
+ * row as PROVEN_NOT_POSTED by IMS (ledger-standing.ts) and never as a posting. A HELD_SHADOW row with a document id, or
+ * with any status other than CANCELLED, is not a shadow this build wrote and reads UNKNOWN.
+ */
+export const HELD_SHADOW_SETTLEMENT_BASIS = 'HELD_SHADOW'
+
 export type SettlementBasis =
   | 'CONNECTOR_CONFIRMED'
   | 'OPERATOR_ASSERTION'
   | 'OPERATOR_RELEASE'
   | 'VERIFIED_REVERSAL'
+  | 'HELD_SHADOW'
   /** A non-null value this build does not recognise. FAILS CLOSED: never read as a confirmation. */
   | 'UNKNOWN'
 
@@ -312,6 +328,7 @@ export function settlementBasisOf(settlementBasis: string | null | undefined): S
   if (settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS) return 'OPERATOR_ASSERTION'
   if (settlementBasis === OPERATOR_RELEASE_SETTLEMENT_BASIS) return 'OPERATOR_RELEASE'
   if (settlementBasis === VERIFIED_REVERSAL_SETTLEMENT_BASIS) return 'VERIFIED_REVERSAL'
+  if (settlementBasis === HELD_SHADOW_SETTLEMENT_BASIS) return 'HELD_SHADOW'
   return 'UNKNOWN'
 }
 
@@ -327,6 +344,11 @@ export function isOperatorReleasedSettlement(settlementBasis: string | null | un
 /** Whether IMS verified this row's cancellation against the ledger (see VERIFIED_REVERSAL_SETTLEMENT_BASIS). */
 export function isVerifiedReversalSettlement(settlementBasis: string | null | undefined): boolean {
   return settlementBasisOf(settlementBasis) === 'VERIFIED_REVERSAL'
+}
+
+/** Whether this row is a shadow IMS recorded instead of queuing the posting (see HELD_SHADOW_SETTLEMENT_BASIS). */
+export function isHeldShadowSettlement(settlementBasis: string | null | undefined): boolean {
+  return settlementBasisOf(settlementBasis) === 'HELD_SHADOW'
 }
 
 export type SettlementOutcome = 'POSTED' | 'NOT_POSTED'

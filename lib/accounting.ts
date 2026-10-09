@@ -329,11 +329,19 @@ export type ConnectorEnqueueOutcome = {
    * still going to post, and rolling back an empty transaction while telling the operator "nothing
    * was sent" is the one message that guarantees nobody goes looking for it.
    */
-  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred'
+  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred' | 'shadowed'
   /*
    * `handled-by-hand` (o3d-j625 r7) — `queued: true` WITHOUT A WRITE, like `already-queued`: someone
    * marked this exact posting handled after posting it BY HAND, so IMS did not post it and never will
    * (posting-suppression.ts). A counterpart exists in the ledger; it is not owed; it was not IMS's.
+   */
+  /*
+   * `shadowed` (producer-side hold) — `queued: true` WITHOUT A QUEUED POSTING: the producer-side hold said SHADOW for this
+   * posting (lib/security/producer-disposition.ts), so IMS recorded a shadow and created no outbox job and no accounting
+   * event. `queued: true` is the answer the business flows need - the purchase is received, the payment is registered,
+   * the batch ran - and `postingIsOwed` is false: IMS owes the ledger nothing here, because in the current phase another
+   * writer owns the operation (or none does). It is NOT a statement that the document exists in the ledger, and no caller
+   * may read it as one; the ledger standing of the shadow row is PROVEN_NOT_POSTED by IMS and says nothing more.
    */
   /*
    * `hand-post-deferred` (o3d-j625 r18, Codex round 17 HIGH 1) — `queued: FALSE`, and the difference from
@@ -1661,6 +1669,10 @@ export async function queueAccountingSyncTx(
       if (created.suppressed === 'handled_by_hand') return answer({ queued: true, reason: 'handled-by-hand' }, context.connector)
       return answer({ queued: false, reason: 'hand-post-deferred' }, context.connector)
     }
+    // THE PRODUCER-SIDE HOLD SAID SHADOW: the posting is recorded as a shadow and nothing is queued - no outbox job and no
+    // accounting event (a shadow must not count as an IMS ledger fact). `queued: true`, with its own reason, because the
+    // posting is recorded and nothing is owed to IMS's queue; see 'shadowed' on ConnectorEnqueueOutcome.
+    if (created.shadowed) return answer({ queued: true, reason: 'shadowed' }, context.connector)
     const log = created.row
     if (context.connector === 'xero') {
       const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')

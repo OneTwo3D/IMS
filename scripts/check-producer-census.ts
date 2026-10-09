@@ -25,6 +25,7 @@ function main(): number {
     excludedOperations: EXCLUDED_OPERATIONS,
     noProducer: NO_PRODUCER,
     filesScanned: scan.filesScanned,
+    sources: scan.sources,
   })
   console.log(formatCounts(report))
   if (report.failures.length > 0) {

@@ -462,6 +462,10 @@ async function createPendingSyncLog(
       + 'daily-batch posting can be: no refusal kind names one, so nothing can claim or mark it.',
     )
   }
+  // The producer-side hold said SHADOW: the journal is recorded as a shadow and NOTHING is queued - no outbox job and no
+  // accounting event. The shadow row's own id is returned (status CANCELLED, never posted by IMS), so the batch stamps
+  // the rows it was built from with an id whose status says what happened to it, exactly as for a queued journal.
+  if (created.shadowed) return created.shadowed.id
   const log = created.row
   await scheduleXeroAccountingOutbox(tx, {
     accountingSyncLogId: log.id,

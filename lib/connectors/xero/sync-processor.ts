@@ -1510,6 +1510,9 @@ export async function enqueueFollowUpSyncLog(
         if (created.suppressed === 'handled_by_hand') return 'done' as const
         return 'hand-post-claim-held' as const
       }
+      // The producer-side hold said SHADOW: the follow-up is recorded as a shadow and nothing is queued. Done in the only
+      // sense a follow-up can be under the hold: IMS will not raise it, and the shadow is its record.
+      if (created.shadowed) return 'done' as const
       const log = created.row
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
