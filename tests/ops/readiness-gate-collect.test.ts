@@ -164,6 +164,7 @@ test('reconciliation: proven passes; every unproven or unreadable shape fails; "
     ['newest run unreadable', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'unreadable', notRecordedAfterRecording: false, newestNotCompleted: false } })],
     ['history overflow', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: true, newest: 'complete', notRecordedAfterRecording: false, newestNotCompleted: false } })],
     ['not recorded after recording began', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'not-recorded', notRecordedAfterRecording: true, newestNotCompleted: false } })],
+    ['newest run did not complete (NO blocker raised: the proof alone must stop it)', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'not-recorded', notRecordedAfterRecording: false, newestNotCompleted: true } }), ],
     ['failed run', goodReconciliation({ blockers: [{ id: 'accounting-reconciliation:failed', severity: 'blocker', source: 's', message: 'failed' }] })],
   ]
   for (const [label, readiness] of cases) assert.equal(assessReconciliationReadiness(readiness).kind, 'fail', label)
