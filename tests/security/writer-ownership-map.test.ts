@@ -11,6 +11,7 @@ import {
   WRITER_OWNERSHIP_MAP,
   outboxOperationIsMapped,
   type OwnershipRow,
+  type WriterOwner,
 } from '../../lib/security/writer-ownership-map.ts'
 
 /**
@@ -63,36 +64,56 @@ test('owner answers of 2026-10-08 are in the map', () => {
   assert.equal(owner('woocommerce.order.trackship-reconcile', 'P2'), 'woo-mintsoft-plugin')
   assert.equal(owner('mintsoft.product.upsert', 'P2'), 'IMS')
   assert.equal(owner('mintsoft.order.cancel', 'P2'), 'IMS')
-  assert.equal(owner('mintsoft.order.amend', 'P2'), 'unknown', 'amending a bridge-created order is not settled, so it stays in shadow')
+  assert.equal(owner('mintsoft.order.amend', 'P2'), 'IMS', 'owner answer 2026-10-09')
   assert.equal(owner('mintsoft.order.create', 'P2'), 'IMS')
 })
 
-test('unknown owners are exactly the listed set (a change here is a decision, not an accident)', () => {
+test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation, and P2 is unchanged', () => {
+  const rulings: Array<[string, WriterOwner, WriterOwner]> = [
+    ['mintsoft.asn.create', 'operator-manual', 'IMS'],
+    ['mintsoft.order.comment', 'operator-manual', 'IMS'],
+    ['woocommerce.fx-rates', 'aelia', 'IMS'],
+    ['woocommerce.stock', 'qoblex-native', 'IMS'],
+    ['xero.daily-batch', 'qoblex-native', 'IMS'],
+    ['xero.inventory.journals', 'qoblex-native', 'IMS'],
+    ['xero.purchase.bill', 'qoblex-native', 'IMS'],
+    ['xero.purchase.bill-payment', 'qoblex-native', 'IMS'],
+    ['xero.purchase.bill-attachment', 'qoblex-native', 'IMS'],
+    ['xero.purchase.supplier-credit', 'qoblex-native', 'IMS'],
+    ['customer-email.despatch', 'woocommerce-native', 'IMS'],
+    ['customer-email.order-confirmation', 'woocommerce-native', 'IMS'],
+    ['customer-email.invoice', 'woocommerce-native', 'IMS'],
+    ['xero.tax-rate', 'operator-manual', 'nobody'],
+    ['mintsoft.order.amend', 'woo-mintsoft-plugin', 'IMS'],
+  ]
+  let checked = 0
+  for (const [key, p1, p2] of rulings) {
+    const row = rows.find((candidate) => `${candidate.destination}.${candidate.operation}` === key)
+    assert.ok(row, `${key} is mapped`)
+    assert.equal(row.owners.P1, p1, `${key} P1`)
+    assert.equal(row.owners.P2, p2, `${key} P2`)
+    assert.ok(row.note.includes('2026-10-09'), `${key}: the note cites the owner answer and its date`)
+    checked += 1
+  }
+  console.log(`# rulings checked: ${checked}`)
+  assert.equal(checked, 15)
+  assert.equal(rows.filter((row) => row.owners.P1 === 'unknown' || row.owners.P2 === 'unknown').length, 0)
+  // Each new owner kind is used (no dead kinds) and none appears at P2 (a new kind is an incumbent, never the end state).
+  for (const kind of ['operator-manual', 'qoblex-native', 'aelia', 'woocommerce-native'] as const) {
+    const users = rows.filter((row) => row.owners.P1 === kind || row.owners.P2 === kind)
+    console.log(`# owner kind ${kind}: rows=${users.length}`)
+    assert.ok(users.length > 0, `${kind} is used by a row`)
+    assert.ok(!/o3d-[a-z0-9]{3,}/.test(kind), 'no tracker ids in identifiers')
+  }
+})
+
+test('unknown owners are exactly the listed set, now EMPTY (a change here is a decision, not an accident)', () => {
   const unknowns = rows
     .flatMap((row) => (['P1', 'P2'] as const).filter((phase) => row.owners[phase] === 'unknown').map((phase) => `${row.destination}.${row.operation}@${phase}`))
     .sort()
   console.log(`# unknown owners: ${unknowns.length}`)
-  assert.deepEqual(unknowns, [
-    'customer-email.despatch@P1',
-    'customer-email.despatch@P2',
-    'customer-email.invoice@P1',
-    'customer-email.invoice@P2',
-    'customer-email.order-confirmation@P1',
-    'customer-email.order-confirmation@P2',
-    'mintsoft.asn.create@P1',
-    'mintsoft.order.amend@P2',
-    'mintsoft.order.comment@P1',
-    'woocommerce.fx-rates@P1',
-    'woocommerce.stock@P1',
-    'xero.daily-batch@P1',
-    'xero.inventory.journals@P1',
-    'xero.purchase.bill-attachment@P1',
-    'xero.purchase.bill-payment@P1',
-    'xero.purchase.bill@P1',
-    'xero.purchase.supplier-credit@P1',
-    'xero.tax-rate@P1',
-    'xero.tax-rate@P2',
-  ])
+  assert.equal(unknowns.length, 0, 'every operation-phase has a decided owner; a new unknown needs a deliberate edit of this list')
+  assert.deepEqual(unknowns, [])
 })
 
 test('every AccountingSyncType member is in exactly one map row or an explicit exclusion; the exclusions only shrink', () => {
