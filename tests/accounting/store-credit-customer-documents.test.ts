@@ -94,7 +94,7 @@ test('the on-the-fly invoice download refuses AFTER the stored accounting PDF br
   const render = route.indexOf('createPdfDocument(')
   precondition('invoice route order', { stored, refuse, render })
   assert.ok(stored > 0 && refuse > stored && render > refuse)
-  assert.match(route, /status: 409/)
+  assert.match(route, /if \(creditBlock\) \{\s*return NextResponse\.json\(\{ error: storeCreditInvoiceDocumentRefusal\(creditBlock\) \}, \{ status: 409 \}\)/, 'the refusal is unconditional on the block and returns 409')
 })
 
 test('the order documents show the credit beside the Total, so their figures add up', () => {
@@ -104,6 +104,7 @@ test('the order documents show the credit beside the Total, so their figures add
     const total = src.indexOf("'Total:'", row)
     precondition(`credit row ${file}`, { row, total })
     assert.ok(row > 0 && total > row, `${file}: a Store credit row precedes the Total row`)
+    assert.match(src, /if \(Number\(so\.storeCreditForeign \?\? 0\) > 0\) \{\s*doc\.text\('Store credit:'/, `${file}: the row is drawn whenever the order has credit`)
   }
 })
 
