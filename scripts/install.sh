@@ -625,6 +625,92 @@ existing_env() {
   fi
 }
 
+# Percent-decoding and -encoding in bash itself, into a named variable (no subshell: this runs inside a
+# body whose command substitutions are not allowed to fail silently).
+env_percent_decode() {
+  local s="${1//\\/\\\\}"
+  s="${s//%/\\x}"
+  printf -v "$2" '%b' "${s}"
+}
+env_percent_encode() {
+  local in="$1" c h hl out="" outl="" i
+  for ((i = 0; i < ${#in}; i++)); do
+    c="${in:i:1}"
+    if [[ "${c}" =~ [A-Za-z0-9._~-] ]]; then
+      out+="${c}"
+      outl+="${c}"
+    else
+      printf -v h '%%%02X' "'${c}"
+      printf -v hl '%%%02x' "'${c}"
+      out+="${h}"
+      outl+="${hl}"
+    fi
+  done
+  printf -v "$2" '%s' "${out}"
+  [[ -z "${3:-}" ]] || printf -v "$3" '%s' "${outl}"
+}
+
+# Does ${1} contain ${2}, or any copy of it that has been percent-encoded 1-4 times (hex digits in either
+# case) or written with '+' for a space? The candidate is DECODED repeatedly until it stops changing
+# (at most four passes), and every pass is searched; decoding is canonical because the hex digits are read
+# case-insensitively by the decoder. A substring match, not equality: the secret may sit inside a longer
+# setting. Returns 0 when it does.
+env_value_leaks_secret() {
+  local value="$1" secret="$2" variant v next pass
+  for variant in plain plus; do
+    v="${value}"
+    for ((pass = 0; pass < 5; pass++)); do
+      [[ "${v}" == *"${secret}"* ]] && return 0
+      if [[ "${variant}" == plus ]]; then
+        env_percent_decode "${v//+/ }" next
+      else
+        env_percent_decode "${v}" next
+      fi
+      [[ "${next}" != "${v}" ]] || break
+      v="${next}"
+    done
+  done
+  return 1
+}
+
+# The deploy admin's password, percent-decoded once (the form the server knows), or empty when the run holds
+# no admin URL or the URL carries no password. Sets ENV_ADMIN_PASSWORD_DECODED.
+ENV_ADMIN_PASSWORD_DECODED=""
+env_admin_password_decoded() {
+  local url="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  ENV_ADMIN_PASSWORD_DECODED=""
+  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+)(:([^@]*))?@ ]]; then
+    env_percent_decode "${BASH_REMATCH[3]}" ENV_ADMIN_PASSWORD_DECODED
+  fi
+}
+
+# THE FLOOR BELOW WHICH A PRESERVED SETTING CANNOT BE SCREENED FOR THE ADMIN PASSWORD. With `x` as the
+# password, "the value contains it" is true of almost everything and false of the one thing that matters, so
+# the screen is meaningless and the honest answer is not to pretend: the re-run stops, in the configuration
+# phase, while nothing has been changed, when there ARE settings to screen and the password is too short to
+# screen them against. (Name, URL and role rules apply in every case.) One sentence, quoted by the docs.
+ENV_ADMIN_PASSWORD_MIN_LENGTH=8
+ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE="the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run."
+
+# The keys render_app_env_file() writes. Listed here because the gate that needs them runs long before that
+# function is defined; tests/scripts/env-rewrite-preservation.test.ts fails if this list and the template
+# ever disagree.
+ENV_TEMPLATE_KEYS=(NODE_ENV IMS_INSTANCE_ROLE APP_PORT AUTH_SECRET SETTINGS_ENCRYPTION_KEY DATABASE_URL NEXT_PUBLIC_APP_URL AUTH_URL REDIS_URL REDIS_PASSWORD REDIS_KEY_PREFIX WC_STORE_URL WC_CONSUMER_KEY WC_CONSUMER_SECRET WC_WEBHOOK_SECRET CRON_SECRET NEXT_PUBLIC_TURNSTILE_SITE_KEY TURNSTILE_SECRET_KEY BACKUP_DIR UPLOAD_STORAGE_DIR PUBLIC_UPLOAD_STORAGE_DIR INVOICE_PDF_STORAGE_DIR FILE_SCAN_MODE FILE_SCAN_COMMAND_ARGV FILE_SCAN_COMMAND FILE_SCAN_NAME FILE_SCAN_ENV_ALLOWLIST FILE_SCAN_TIMEOUT_MS)
+
+# The keys of the previous .env that this installer does not set: the ones that would be carried.
+ENV_UNOWNED_EXISTING_KEYS=()
+env_unowned_existing_keys() {
+  local key owned t
+  ENV_UNOWNED_EXISTING_KEYS=()
+  for key in "${!EXISTING_ENV[@]}"; do
+    owned=false
+    for t in "${ENV_TEMPLATE_KEYS[@]}"; do
+      [[ "${t}" == "${key}" ]] && owned=true
+    done
+    ${owned} || ENV_UNOWNED_EXISTING_KEYS+=("${key}")
+  done
+}
+
 run_as_user() {
   local user="$1"
   shift
@@ -7727,6 +7813,15 @@ if ((${#EXISTING_ENV_UNCLASSIFIED[@]} > 0)); then
   die "${APP_DIR}/.env has ${#EXISTING_ENV_UNCLASSIFIED[@]} line(s) this installer cannot carry across to the file it is about to write (line numbers: ${EXISTING_ENV_UNCLASSIFIED[*]}): not KEY=VALUE, or a quoted value that is never closed. Rewrite them as KEY=VALUE (a quoted value may span lines if it closes), or remove them, and re-run. Nothing has been changed."
 fi
 
+# A password too short to screen preserved settings against ends the run here, before anything is changed.
+env_admin_password_decoded
+if [[ -n "${ENV_ADMIN_PASSWORD_DECODED}" && ${#ENV_ADMIN_PASSWORD_DECODED} -lt ${ENV_ADMIN_PASSWORD_MIN_LENGTH} ]]; then
+  env_unowned_existing_keys
+  if ((${#ENV_UNOWNED_EXISTING_KEYS[@]} > 0)); then
+    die "${APP_DIR}/.env holds ${#ENV_UNOWNED_EXISTING_KEYS[@]} setting(s) this installer does not set, and ${ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE} Nothing has been changed."
+  fi
+fi
+
 # THE INVOICE PDF DIRECTORY IS WHERE THE PREVIOUS RUN PUT IT. The default assigned among the other
 # path defaults is only the answer for a host with no .env: a re-run that rewrote .env with that
 # default would silently repoint a live installation away from the PDFs it has already stored.
@@ -9075,31 +9170,6 @@ env_key_is_admin_credential() {
 # the cost of a false positive is one line copied back by hand. Sets ENV_REFUSAL_REASON; returns 0 when
 # the key may be carried.
 ENV_REFUSAL_REASON=""
-# Percent-decoding and -encoding in bash itself, into a named variable (no subshell: this runs inside a
-# body whose command substitutions are not allowed to fail silently).
-env_percent_decode() {
-  local s="${1//\\/\\\\}"
-  s="${s//%/\\x}"
-  printf -v "$2" '%b' "${s}"
-}
-env_percent_encode() {
-  local in="$1" c h hl out="" outl="" i
-  for ((i = 0; i < ${#in}; i++)); do
-    c="${in:i:1}"
-    if [[ "${c}" =~ [A-Za-z0-9._~-] ]]; then
-      out+="${c}"
-      outl+="${c}"
-    else
-      printf -v h '%%%02X' "'${c}"
-      printf -v hl '%%%02x' "'${c}"
-      out+="${h}"
-      outl+="${hl}"
-    fi
-  done
-  printf -v "$2" '%s' "${out}"
-  [[ -z "${3:-}" ]] || printf -v "$3" '%s' "${outl}"
-}
-
 env_key_carry_check() {
   local key="$1" value="$2" upper admin_user="" admin_pass="" url="${DEPLOY_ADMIN_DATABASE_URL:-}"
   local lower_value="${value,,}" form
@@ -9140,12 +9210,16 @@ env_key_carry_check() {
     pass_forms+=("${enc_up}" "${enc_low}")
     env_percent_encode "${decoded_user}" enc_up enc_low
     user_forms+=("${enc_up}" "${enc_low}")
-    for form in "${pass_forms[@]}"; do
-      if [[ ${#form} -ge 4 && "${value}" == *"${form}"* ]]; then
-        ENV_REFUSAL_REASON="the value contains the deploy admin's password"
-        return 1
-      fi
-    done
+    # Screened only when long enough for a substring match to mean something; a shorter password with
+    # settings to screen is refused up front by the caller (ENV_ADMIN_PASSWORD_MIN_LENGTH).
+    if [[ ${#decoded_pass} -ge ${ENV_ADMIN_PASSWORD_MIN_LENGTH} ]]; then
+      for form in "${pass_forms[@]}"; do
+        if [[ "${value}" == *"${form}"* ]] || env_value_leaks_secret "${value}" "${form}"; then
+          ENV_REFUSAL_REASON="the value contains the deploy admin's password"
+          return 1
+        fi
+      done
+    fi
     for form in "${user_forms[@]}"; do
       [[ -n "${form}" ]] || continue
       if [[ "${value}" == *"://${form}:"* || "${value}" == *"://${form}@"* ]] \

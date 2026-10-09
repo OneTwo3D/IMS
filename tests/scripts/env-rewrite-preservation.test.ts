@@ -18,6 +18,7 @@ import { withTempDir } from './temp-dir.ts'
 
 const REPO = process.cwd()
 const INSTALL = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+const read = (rel: string): string => readFileSync(join(REPO, rel), 'utf8')
 
 function bash(program: string): { status: number; out: string } {
   const r = spawnSync('bash', ['-c', program], {
@@ -43,6 +44,8 @@ const OLD_ENV = [
   '',
 ].join('\n')
 
+const TOO_SHORT_MESSAGE = /^ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE="(.*)"$/m.exec(INSTALL)?.[1] ?? ''
+
 const LIB = [
   'set -uo pipefail',
   'exec 2>&1',
@@ -53,6 +56,10 @@ const LIB = [
   'declare -a EXISTING_ENV_RAW=() EXISTING_ENV_UNCLASSIFIED=() ENV_REFUSED_KEYS=()',
   'declare -A EXISTING_ENV_LINENO=()',
   'ENV_REFUSAL_REASON=""',
+  /^ENV_ADMIN_PASSWORD_MIN_LENGTH=\d+$/m.exec(INSTALL)?.[0] ?? 'ENV_ADMIN_PASSWORD_MIN_LENGTH=UNSET',
+  'ENV_ADMIN_PASSWORD_DECODED=""; ENV_UNOWNED_EXISTING_KEYS=()',
+  `ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE=${JSON.stringify(TOO_SHORT_MESSAGE)}`,
+  /^ENV_TEMPLATE_KEYS=.*$/m.exec(INSTALL)?.[0] ?? 'ENV_TEMPLATE_KEYS=()',
   'ENV_FILE_STATE=absent',
   'ENV_BACKUP_FILE=""; ENV_KEPT_KEYS=(); ENV_PRESERVED_BLOCK=""',
   shippedFunction(INSTALL, 'existing_env'),
@@ -60,6 +67,9 @@ const LIB = [
   shippedFunction(INSTALL, 'load_existing_env'),
   shippedFunction(INSTALL, 'env_percent_decode'),
   shippedFunction(INSTALL, 'env_percent_encode'),
+  shippedFunction(INSTALL, 'env_value_leaks_secret'),
+  shippedFunction(INSTALL, 'env_admin_password_decoded'),
+  shippedFunction(INSTALL, 'env_unowned_existing_keys'),
   shippedFunction(INSTALL, 'env_key_carry_check'),
   shippedFunction(INSTALL, 'env_key_is_admin_credential'),
   shippedFunction(INSTALL, 'render_preserved_env_keys'),
@@ -380,4 +390,84 @@ test('re-run: an ENCODED admin password or a libpq keyword/value string cannot s
   const rt = bash([LIB, "env_percent_decode 'A%40B-Pass%2Fw0rd' d; env_percent_encode \"$d\" e; echo \"$d|$e\""].join('\n')).out.trim()
   console.log(`  decode/encode: ${rt}`)
   assert.equal(rt, 'A@B-Pass/w0rd|A%40B-Pass%2Fw0rd')
+})
+
+// ---------------------------------------------------------------------------
+// review round 3: encoded variants, and the short-password policy
+// ---------------------------------------------------------------------------
+
+const leaks = (value: string, adminUrl: string): string =>
+  bash([LIB, `DEPLOY_ADMIN_DATABASE_URL='${adminUrl}'`, `env_key_carry_check 'REPORTING_NOTE' '${value}'; echo "RC=$? REASON=[$ENV_REFUSAL_REASON]"`].join('\n')).out.trim().split('\n').pop() ?? ''
+
+test('re-run: mixed-case hex, double-, triple-encoded and plus-for-space copies of the admin password are all refused', () => {
+  const admin = 'postgresql://deployadmin:A%2FB%3ASecret@127.0.0.1:5432/db' // decoded: A/B:Secret
+  const refused: Array<[string, string]> = [
+    ['as written (upper-case hex)', 'x A%2FB%3ASecret y'],
+    ['mixed-case hex (the review case)', 'x A%2fB%3ASecret y'],
+    ['all lower-case hex', 'x A%2fb%3asecret y'.replace('b%3asecret', 'B%3aSecret')],
+    ['double-encoded (the review case)', 'x A%252FB%253ASecret y'],
+    ['double-encoded, mixed case', 'x A%252fB%253aSecret y'],
+    ['triple-encoded', 'x A%25252FB%25253ASecret y'],
+    ['decoded', 'x A/B:Secret y'],
+    ['inside a longer setting', 'cache=redis;token=A%252FB%253ASecret;ttl=5'],
+  ]
+  for (const [label, value] of refused) {
+    const got = leaks(value, admin)
+    console.log(`  ${label}: ${got}`)
+    assert.equal(got, "RC=1 REASON=[the value contains the deploy admin's password]", label)
+  }
+  // plus-for-space: a password with a space, written with '+' in a form-encoded copy.
+  const spaced = 'postgresql://deployadmin:pass%20word-9@127.0.0.1:5432/db'
+  for (const value of ['x pass+word-9 y', 'x pass%20word-9 y', 'x pass word-9 y', 'x pass%2520word-9 y']) {
+    const got = leaks(value, spaced)
+    console.log(`  space variant ${JSON.stringify(value)}: ${got}`)
+    assert.match(got, /^RC=1 /, value)
+  }
+  // Isolating: an unrelated value is not refused, so the arms above are not vacuous.
+  assert.equal(leaks('x something-else y', admin), 'RC=0 REASON=[]')
+})
+
+test('re-run: the password-length floor is 8 — 7 characters ends the run when there are settings to screen, 8 is screened', async () => {
+  await withTempDir('ims-env-floor-', async (dir) => {
+    const lines = INSTALL.split('\n')
+    const start = lines.findIndex((l) => l === 'env_admin_password_decoded')
+    const end = lines.findIndex((l, i) => i > start && l === 'fi')
+    assert.ok(start > 0 && end > start, 'precondition: the gate block exists')
+    // the block ends with TWO nested fi lines; take through the outer one
+    const gate = lines.slice(start, end + 2).join('\n')
+    const old = join(dir, '.env')
+    writeFileSync(old, 'APP_PORT=3000\nAUTH_SECRET=a\nTRUSTED_PROXY_IPS=10.0.0.1\n')
+    const bareOld = join(dir, 'bare.env')
+    writeFileSync(bareOld, 'APP_PORT=3000\nAUTH_SECRET=a\n')
+    const run = (file: string, adminUrl: string) => bash([LIB, `DEPLOY_ADMIN_DATABASE_URL='${adminUrl}'`, `load_existing_env '${file}'`, gate, 'echo CONTINUED'].join('\n'))
+    const cases: Array<[string, string, string, boolean]> = [
+      ['7 characters, settings to screen', old, 'postgresql://deployadmin:abcdefg@h/db', true],
+      ['the exact review case: password x', old, 'postgresql://deployadmin:x@db/app', true],
+      ['8 characters, settings to screen', old, 'postgresql://deployadmin:abcdefgh@h/db', false],
+      ['7 characters but an encoded 8-char form decodes to 7', old, 'postgresql://deployadmin:abc%64efg@h/db', true],
+      ['7 characters, NOTHING to screen', bareOld, 'postgresql://deployadmin:abcdefg@h/db', false],
+      ['no password in the admin URL', old, 'postgresql://deployadmin@h/db', false],
+    ]
+    for (const [label, file, url, refusedRun] of cases) {
+      const r = run(file, url)
+      console.log(`  ${label}: ${refusedRun ? 'refused' : 'continues'} -> rc=${r.status}`)
+      assert.equal(r.status, refusedRun ? 9 : 0, `${label}\n${r.out}`)
+      if (refusedRun) {
+        assert.ok(r.out.includes(TOO_SHORT_MESSAGE), 'the diagnostic is the single-sourced sentence')
+        assert.match(r.out, /Nothing has been changed\./)
+        assert.doesNotMatch(r.out, /CONTINUED/)
+      } else assert.match(r.out, /CONTINUED/)
+    }
+    assert.equal(TOO_SHORT_MESSAGE, 'the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run.')
+    assert.ok(read('docs/installation.md').includes(TOO_SHORT_MESSAGE), 'and the docs quote the same sentence')
+  })
+})
+
+test('re-run: the template key list the early gate uses is exactly the keys render_app_env_file writes', () => {
+  const body = shippedFunction(INSTALL, 'render_app_env_file')
+  const written = [...new Set(body.split('\n').map((l) => /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(l)?.[1]).filter((k): k is string => Boolean(k)))].sort()
+  const listed = (/^ENV_TEMPLATE_KEYS=\((.*)\)$/m.exec(INSTALL)?.[1] ?? '').split(/\s+/).filter(Boolean).sort()
+  console.log(`  template keys written: ${written.length}; listed: ${listed.length}`)
+  assert.ok(written.length >= 25, 'precondition: the template was parsed')
+  assert.deepEqual(listed, written)
 })

@@ -73,6 +73,7 @@ export const SHIPPED = [
   'load_existing_env',
   'env_percent_decode',
   'env_percent_encode',
+  'env_value_leaks_secret',
   'env_key_carry_check',
   'mask_secret',
   'prompt',
@@ -259,6 +260,7 @@ export const ENV_HEREDOC_DEFAULTS = [
     'ENV_PRESERVED_BLOCK="${ENV_PRESERVED_BLOCK-}"',
     'ENV_LAST_RENDERED="${ENV_LAST_RENDERED-}"',
     'DB_ADMIN_CREDENTIAL_FILE="${DB_ADMIN_CREDENTIAL_FILE-}"',
+    'ENV_ADMIN_PASSWORD_MIN_LENGTH=8',
     '[[ -v ENV_KEPT_KEYS ]] || declare -a ENV_KEPT_KEYS=()',
     '[[ -v EXISTING_ENV_RAW ]] || declare -a EXISTING_ENV_RAW=()',
   ])

@@ -921,6 +921,7 @@ The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: 
   number and reason (never the value) and the old file is in the backup, so a false positive costs one line copied
   back by hand. A `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` key is refused outright, before anything is changed
   (it belongs in `/etc/ims-db-admin/deploy-admin.env`).
+* **The screen needs a password worth screening against.** If the deploy admin password is shorter than 8 characters and the old file holds settings the installer does not set, the run stops in the configuration phase, before anything is changed, with: *the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run.* The screen decodes a candidate value repeatedly (up to four passes, hex digits in either case, `+` as a space) and refuses any value containing the decoded admin password at any pass; the name, URL and role rules apply whatever the password's length.
 * **A file the installer cannot reproduce is not rewritten.** A line that is not `KEY=VALUE` (in one of the forms
   above), or a quoted value that is never closed, stops the run in the configuration phase, before any package,
   account or file is touched, naming the line numbers.
