@@ -166,17 +166,19 @@ test('the checkout root is the TOPMOST marker, so a nested package.json cannot n
     writeFileSync(join(checkout, '.git'), 'gitdir: elsewhere') // a worktree has a .git FILE
     writeFileSync(join(checkout, 'tests', 'package.json'), '{}') // a nested package
     const nestedHelperDir = join(checkout, 'tests', 'helpers')
+    const helperFile = join(nestedHelperDir, 'safe-temp-root.ts') // the stand-in checkout's own copy of the helper
+    writeFileSync(helperFile, '// stand-in')
     console.log('precondition (nested package): stand-in checkout with .git, lib/, and a package.json nested under tests/')
-    assert.equal(findRepoRoot(nestedHelperDir), realpathSync(checkout), 'the topmost marker wins, not the nearest package.json')
+    assert.equal(findRepoRoot(nestedHelperDir, helperFile), realpathSync(checkout), 'the topmost marker wins, not the nearest package.json')
     // isolating the two rules: an OUTER package.json without .git (above the checkout) must not widen it, and a
     // nested package that has its own .git (a submodule) must not narrow it
     writeFileSync(join(scratch.root, 'package.json'), '{}')
     mkdirSync(join(checkout, 'tests', 'pkg'))
     writeFileSync(join(checkout, 'tests', 'pkg', 'package.json'), '{}')
     writeFileSync(join(checkout, 'tests', 'pkg', '.git'), 'gitdir: nested')
-    assert.equal(findRepoRoot(join(checkout, 'tests', 'pkg')), realpathSync(checkout), 'a nested package with its own .git does not narrow it; an outer package.json without .git does not widen it')
+    assert.equal(findRepoRoot(join(checkout, 'tests', 'pkg'), helperFile), realpathSync(checkout), 'a nested package with its own .git does not narrow it; an outer package.json without .git does not widen it')
     // TMPDIR at the sibling lib/ is refused because the repo root is the checkout, not tests/
-    assert.throws(() => makeScratchRoot('probe-', { tmpBase: join(checkout, 'lib'), repoRoot: findRepoRoot(nestedHelperDir) }), /refusing to create a scratch root/)
+    assert.throws(() => makeScratchRoot('probe-', { tmpBase: join(checkout, 'lib'), repoRoot: findRepoRoot(nestedHelperDir, helperFile) }), /refusing to create a scratch root/)
     assert.deepEqual(readdirSync(join(checkout, 'lib')), [])
     // a source export with no .git: the fallback needs package.json AND app/lib/tests
     const exported = join(scratch.root, 'export')
@@ -184,10 +186,12 @@ test('the checkout root is the TOPMOST marker, so a nested package.json cannot n
     mkdirSync(join(exported, 'lib')); mkdirSync(join(exported, 'app'))
     writeFileSync(join(exported, 'package.json'), '{}')
     writeFileSync(join(exported, 'tests', 'package.json'), '{}')
-    assert.equal(findRepoRoot(join(exported, 'tests', 'helpers')), realpathSync(exported))
+    const exportedHelper = join(exported, 'tests', 'helpers', 'safe-temp-root.ts')
+    writeFileSync(exportedHelper, '// stand-in')
+    assert.equal(findRepoRoot(join(exported, 'tests', 'helpers'), exportedHelper), realpathSync(exported))
     // no marker at all: refuses to guess
     const bare = join(scratch.root, 'bare'); mkdirSync(bare)
-    assert.throws(() => findRepoRoot(bare), /cannot locate the repository root/)
+    assert.throws(() => findRepoRoot(bare, helperFile), /cannot locate the repository root/)
   } finally { scratch.dispose() }
 })
 
@@ -201,4 +205,67 @@ test('a prefix cannot steer the new directory out of the checked base', () => {
     assert.equal(readdirSync(w.cleanTmp).join(','), before, 'nothing was created')
     assert.equal(existsSync(join(w.world, 'escape-')), false)
   } finally { w.dispose() }
+})
+
+test('DISPOSE renames the entry first: a symlink to the stand-in repo swapped in is never followed, and a stranger directory is refused by identity', () => {
+  const w = fakeWorld()
+  try {
+    // (a) swapped BEFORE dispose: refused by the pre-check, the repo is untouched
+    const a = makeScratchRoot('probe-', w.options)
+    rmSync(a.root, { recursive: true }); symlinkSync(w.repo, a.root)
+    assert.throws(() => a.dispose(), /symlink/)
+    assert.ok(existsSync(join(w.repo, 'precious.txt')))
+    // (b) swapped in the window AFTER the pre-check and BEFORE the rename: the rename moves the SYMLINK itself,
+    //     the post-rename check rejects it, nothing is deleted, and the repo behind it is intact
+    const hook = makeScratchRoot('probe-', { ...w.options, beforeRename: (path) => { rmSync(path, { recursive: true }); symlinkSync(w.repo, path) } })
+    console.log('precondition (rename-first): a symlink to the stand-in repo is swapped in between the last check and the rename')
+    assert.throws(() => hook.dispose(), /symlink/)
+    assert.ok(existsSync(join(w.repo, 'precious.txt')) && existsSync(join(w.repo, 'precious.txt')), 'the symlink was not followed')
+    const leftovers = readdirSync(w.cleanTmp).filter((name) => name.startsWith('.dispose-'))
+    assert.equal(leftovers.length, 1, 'the renamed entry is left in place for inspection, not deleted')
+    // (c) a different real directory swapped in the window: refused by device+inode, left intact
+    const stranger = join(w.cleanTmp, 'stranger'); mkdirSync(stranger); writeFileSync(join(stranger, 'keep.txt'), 'k')
+    const c = makeScratchRoot('probe-', { ...w.options, beforeRename: (path) => { rmSync(path, { recursive: true }); renameSync(stranger, path) } })
+    assert.throws(() => c.dispose(), /device\/inode changed/)
+    const kept = readdirSync(w.cleanTmp).filter((name) => name.startsWith('.dispose-'))
+    assert.equal(kept.length, 2)
+    assert.ok(kept.some((name) => existsSync(join(w.cleanTmp, name, 'keep.txt'))), 'the stranger directory is intact')
+    // (d) normal dispose still works and leaves no .dispose- entry of its own
+    const d = makeScratchRoot('probe-', w.options)
+    writeFileSync(join(d.root, 'f'), 'x')
+    d.dispose()
+    assert.equal(existsSync(d.root), false)
+    assert.equal(readdirSync(w.cleanTmp).filter((name) => name.startsWith('.dispose-')).length, 2)
+  } finally { w.dispose() }
+})
+
+test('a directory merely NAMED with two leading dots is inside, not a traversal (creation check and deletion guard)', () => {
+  const world = makeScratchRoot('safe-root-dots-')
+  try {
+    const repo = join(world.root, '..scratch') // a checkout whose directory name begins with two dots
+    mkdirSync(join(repo, 'lib'), { recursive: true })
+    console.log('precondition (..scratch): the stand-in checkout directory is literally named "..scratch"')
+    assert.throws(() => makeScratchRoot('probe-', { tmpBase: join(repo, 'lib'), repoRoot: repo }), /refusing to create a scratch root/, 'creation: tmp base inside the ..scratch checkout is refused')
+    const inside = join(repo, 'lib', 'x'); mkdirSync(inside)
+    assert.throws(() => assertSafeToDelete(inside, inside, { tmpBase: repo, repoRoot: repo }), /refusing to delete/, 'deletion: a directory inside the ..scratch checkout is refused')
+    assert.ok(existsSync(inside))
+  } finally { world.dispose() }
+})
+
+test('an ENCLOSING checkout never disqualifies a valid temp base: the project root must be the one whose helper is this file', () => {
+  const scratch = makeScratchRoot('safe-root-outer-')
+  try {
+    const outer = join(scratch.root, 'outer')
+    const inner = join(outer, 'vendor', 'project')
+    mkdirSync(join(inner, 'tests', 'helpers'), { recursive: true }); mkdirSync(join(inner, 'lib')); mkdirSync(join(inner, 'app'))
+    mkdirSync(join(outer, 'tmpdir')) // a sibling of vendor/ inside the OUTER repo
+    for (const dir of [outer, inner]) { writeFileSync(join(dir, 'package.json'), '{}'); writeFileSync(join(dir, '.git'), 'gitdir: x') }
+    const helperFile = join(inner, 'tests', 'helpers', 'safe-temp-root.ts')
+    writeFileSync(helperFile, '// stand-in')
+    console.log('precondition (enclosing checkout): a project checked out inside another repo; TMPDIR in a sibling directory of the outer repo')
+    const root = findRepoRoot(join(inner, 'tests', 'helpers'), helperFile)
+    assert.equal(root, realpathSync(inner), 'the project root is the inner checkout, not the enclosing repo')
+    const ok = makeScratchRoot('probe-', { tmpBase: join(outer, 'tmpdir'), repoRoot: root })
+    ok.dispose()
+  } finally { scratch.dispose() }
 })
