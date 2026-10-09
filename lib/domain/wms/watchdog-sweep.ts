@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
+import { bindingStaleAfterMs } from '@/lib/ops/read-sync-liveness-constants'
 
 
 /**
@@ -58,10 +59,9 @@ export function describeAsnRecheckRemedy(sourceType: string): { remedy: string; 
 export const ASN_OVERDUE_GRACE_MS = 24 * 60 * 60 * 1000
 /** Without an ETA, an open ASN with NO callback at all is overdue after this age. */
 export const ASN_NO_ETA_FALLBACK_AGE_MS = 7 * 24 * 60 * 60 * 1000
-/** A binding is stale after this many of its own sync intervals... */
-export const BINDING_STALE_INTERVALS = 3
-/** ...but never sooner than this floor. */
-export const BINDING_STALE_FLOOR_MS = 60 * 60 * 1000
+// The staleness rule for a stock-sync binding is stated ONCE, in the read-sync liveness constants, so the
+// watchdog's alert and the `read-sync:status` report cannot disagree about when a binding is stale.
+export { BINDING_STALE_INTERVALS, BINDING_STALE_FLOOR_MS } from '@/lib/ops/read-sync-liveness-constants'
 
 /**
  * Pure: is an open ASN overdue for its booked-in callback?
@@ -96,8 +96,7 @@ export function isBindingSyncStale(
   binding: { lastStockSyncSuccessAt: Date | null; syncFrequencyMinutes: number; createdAt: Date },
   now: Date,
 ): boolean {
-  const interval = Math.max(binding.syncFrequencyMinutes, 1) * 60_000
-  const staleAfter = Math.max(interval * BINDING_STALE_INTERVALS, BINDING_STALE_FLOOR_MS)
+  const staleAfter = bindingStaleAfterMs(binding.syncFrequencyMinutes)
   const anchor = binding.lastStockSyncSuccessAt ?? binding.createdAt
   return now.getTime() - anchor.getTime() >= staleAfter
 }
@@ -122,7 +121,7 @@ class NoActiveAdminsError extends Error {}
  * deactivated mid-sweep) and zero recipients THROWS so the transaction rolls
  * the claim back for retry.
  */
-async function notifyActiveAdmins(
+export async function notifyActiveAdmins(
   tx: Pick<typeof db, 'user' | 'notification'>,
   title: string,
   message: string,

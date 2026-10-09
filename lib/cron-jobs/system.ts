@@ -2,6 +2,16 @@ import { registerCronJobs } from '@/lib/cron-registry'
 
 registerCronJobs([
   {
+    slug: 'read-sync-liveness',
+    settingKey: 'read_sync_liveness',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Read-Sync Liveness Alarm',
+    description: 'Hourly check that every read feed that keeps IMS current (storefront order sweep, warehouse despatch poll and order-status refresh, accounting balance snapshots and tax rates) has recorded a successful run within its limit. Alerts admins once per breach. Read-only: it only reads IMS\'s own database and writes dedupe stamps and notifications.',
+    defaultSchedule: '25 * * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'backup',
     settingKey: 'backup',
     module: 'system',

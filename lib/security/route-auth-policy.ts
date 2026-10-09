@@ -218,6 +218,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/read-sync-liveness': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
   '/api/cron/wc-reconcile': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
