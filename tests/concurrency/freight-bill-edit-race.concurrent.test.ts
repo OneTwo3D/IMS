@@ -30,7 +30,8 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 let betweenReadAndLock: (() => Promise<void>) | null = null
 if (RUN) {
   loadEnv()
-  const realBaseCurrency = await import('@/lib/base-currency')
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const realBaseCurrency = require('@/lib/base-currency') as typeof import('@/lib/base-currency')
   mock.module('@/lib/base-currency', {
     namedExports: {
       ...realBaseCurrency,

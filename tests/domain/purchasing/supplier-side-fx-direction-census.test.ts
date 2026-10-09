@@ -56,3 +56,12 @@ test('cancellation gate: a legacy credit note whose stored base was multiplied i
   assert.equal(legacy, 85.4701)
   assert.equal(creditNoteBaseForGate({ amountBase: '7.5', amountForeign: '10', fxRateToBase: '0' }), 7.5)
 })
+
+test('cancellation gate: the credit total goes through creditNoteBaseForGate, never the stored amountBase', () => {
+  const source = readFileSync('lib/domain/purchasing/cancellation-service.ts', 'utf8')
+  const viaGate = source.match(/\+ creditNoteBaseForGate\(cn\)/g) ?? []
+  const viaStored = source.match(/Number\(cn\.amountBase\)/g) ?? []
+  console.log(`gate source PRECONDITION: summed via creditNoteBaseForGate=${viaGate.length}, via stored amountBase (outside the helper's fallback)=${viaStored.length}`)
+  assert.equal(viaGate.length, 1)
+  assert.equal(viaStored.length, 1, 'the only read of the stored base is the helper fallback for an unusable rate')
+})

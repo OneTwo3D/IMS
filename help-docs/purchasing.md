@@ -225,6 +225,16 @@ If a freight PO is added or updated after goods have already been received, the 
   foreign units per one base unit, so a credit note of EUR 100.00 at 1.17 is recorded as 85.47 in base currency, the
   same conversion a purchase order uses. The bill's rate is used when the credit note is against a bill, otherwise the
   order's rate.
+  Credit notes drafted automatically from a goods return convert the same way. Credit notes recorded before this
+  was corrected keep their stored base amount (nothing is rewritten), but the freight-order cancellation check no
+  longer trusts it: it recomputes each credit note's base amount from its foreign amount and rate.
+- **A bill against a freight order charges VAT at the order's recorded rate on the vatable cost lines billed.** An
+  order with 100 vatable and 100 exempt lines at 20% therefore bills 20 VAT for the vatable 100 (it used to bill 10,
+  the blend over the whole order). Goods orders, and freight orders created before the rate was recorded, are
+  unchanged.
+- **A bill is not saved if its order was edited while the bill was being prepared.** The order and its cost lines are
+  re-read under the bill's locks; if the rate, VAT, or any cost line's amount, description or VAT flag differs from what
+  the bill was calculated from, you are told to reload and create the bill again, and nothing is saved.
 - **A safeguard remains underneath.** Revaluing an already-journaled shipment below zero is still refused (nothing is
   changed and an **ERROR** entry, `landed_cost_revaluation_refused_journaled_shipment`, is written to the activity
   log) because IMS cannot post a negative COGS. Landed cost can no longer cause it on a purchase order's own layers; it remains the safeguard for manufactured outputs and any other source.
