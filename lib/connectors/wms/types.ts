@@ -251,6 +251,11 @@ export type WmsBundleRef = {
   sku: string
   name: string | null
   components: WmsBundleComponent[]
+  /**
+   * How many component entries the response carried that could not be read and were left out of
+   * `components`. A bundle with any is INCOMPLETE: it must never be compared with IMS or bound.
+   */
+  unreadableComponentCount?: number
   raw: Record<string, unknown> | null
 }
 
@@ -457,7 +462,11 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   createAsn(input: WmsAsnInput): Promise<WmsAsnRef>
   fetchAsnById?(externalAsnId: string): Promise<WmsAsnRef | null>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
-  createBundle?(input: WmsBundleDto): Promise<WmsBundleRef>
+  /**
+   * `beforeSend` is awaited immediately before the create request is handed to the WMS; resolving false means the
+   * caller no longer holds its claim, and the connector must throw (nothing sent) instead of sending.
+   */
+  createBundle?(input: WmsBundleDto, options?: { beforeSend?: () => Promise<boolean> }): Promise<WmsBundleRef>
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
   /** Resolve the live order status for a storefront order number, if supported. */
   fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>

@@ -106,7 +106,7 @@ import {
 import { refundedOrderLineId } from '@/lib/connectors/woocommerce/sync/refund-line-link'
 import type { WcRefundLineItem } from '@/lib/connectors/woocommerce/sync/types'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   buildTaxTypeRateIndex,
   chargedRateFromLineSnapshot,
@@ -365,6 +365,10 @@ export type PennyMismatchRow = {
   orderNumber: string | null
   connector: string
   totalMismatchPence: number
+  /** ISO currency of the order: totalMismatchPence is in MINOR units of THIS currency. */
+  currency: string
+  /** Decimal places of that currency (2 for GBP, 0 for JPY, 3 for KWD), so the page can scale the figure. */
+  minorUnits: number
   externalOrderNumber: string | null
 }
 
@@ -1253,7 +1257,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         connector: true,
         totalMismatchPence: true,
         externalOrderNumber: true,
-        order: { select: { orderNumber: true } },
+        order: { select: { orderNumber: true, currency: true } },
       },
     }),
     loadOrderReconcileDrift(),
@@ -1603,6 +1607,8 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       orderNumber: link.order.orderNumber,
       connector: link.connector,
       totalMismatchPence: link.totalMismatchPence ?? 0,
+      currency: link.order.currency,
+      minorUnits: currencyMinorUnits(link.order.currency),
       externalOrderNumber: link.externalOrderNumber,
     })),
     orderReconcileDrift,

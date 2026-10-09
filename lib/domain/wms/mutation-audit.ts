@@ -90,6 +90,11 @@ function toJson(value: unknown): object | undefined {
   }
 }
 
+/** The row `recordWmsMutationEvent` writes, for a caller that must write it INSIDE its own transaction and fail with it. */
+export function buildWmsMutationEventRow(input: WmsMutationEventInput) {
+  return toRow(input)
+}
+
 function toRow(input: WmsMutationEventInput) {
   return {
     connector: input.connector,
