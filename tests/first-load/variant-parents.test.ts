@@ -55,6 +55,15 @@ test('arm (b): a parent shared by several variants is emitted once, as VARIABLE,
   assert.deepEqual(rows.filter((r) => r.type === 'VARIANT').map((r) => r.name), ['Qoblex name one', 'Qoblex name two', 'Qoblex name three'])
   assert.ok(rows.findIndex((r) => r.sku === 'P') < rows.findIndex((r) => r.sku === 'P-01'), 'the parent comes before its children in the file')
   assert.deepEqual(result.report.variantParents, { supplied: true, rowsRead: 3, variantsJoined: 3, parentsEmitted: 1, parentsWithoutQoblexVariant: 0 })
+  // The join itself emits one parent (the products file's own key map would hide a second copy, so ask the join directly).
+  const join = joinVariantParents({
+    rows: ds('variant-parents', [vp('P-01', 'P'), vp('P-02', 'P'), vp('P-03', 'P')]).rows,
+    catalogue: (key) => (key.startsWith('P-') ? { state: 'candidate', sku: key, type: 'VARIANT', parentSku: '' } : { state: 'absent' }),
+    imsKeys: new Set(),
+    exclusions: new Map(),
+  })
+  assert.equal(join.parents.length, 1)
+  assert.deepEqual(join.parents[0].variants, ['P-01', 'P-02', 'P-03'])
 })
 
 test('arm (c): a variant no WooCommerce variation matches stays VARIANT_WITHOUT_PARENT and is never loaded as a simple product', (t) => {
@@ -97,7 +106,7 @@ test('arm (e): a parent SKU that collides with a Qoblex SKU rejects the parent a
 
 test('arm (e2): a parent SKU that is also a variation SKU, or already exists in IMS, is rejected', (t) => {
   const asVariation = run({
-    products: ds('products', [variant('X-01'), variant('Y-01')]),
+    products: ds('products', [variant('X-01')]),
     'variant-parents': ds('variant-parents', [vp('X-01', 'Y-01'), vp('Y-01', 'OTHER')]),
   })
   const inIms = run({
