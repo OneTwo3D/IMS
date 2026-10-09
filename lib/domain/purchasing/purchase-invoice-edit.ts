@@ -147,6 +147,13 @@ export function calculatePurchaseInvoice(params: {
   poReference: string
   poSubtotalForeign: number
   poTaxForeign: number
+  /**
+   * A FREIGHT order's recorded VAT rate (a fraction). When given for a freight order the bill's VAT is this rate on the
+   * vatable cost lines billed, NOT the blended `poTax / wholePoSubtotal` (which understates VAT whenever the order mixes
+   * vatable and exempt lines: 100 vatable + 100 exempt at 20% has a blended 10%). Goods orders keep the blended rate.
+   */
+  poType?: string
+  poTaxRatePercent?: number | string | null
   transitAccount: string
   fallbackTaxType?: string
   /**
@@ -243,9 +250,12 @@ export function calculatePurchaseInvoice(params: {
     })
   }
 
-  const taxRate = params.poSubtotalForeign > 0
+  const freightRecordedRate = params.poType === 'FREIGHT' && params.poTaxRatePercent != null
+    ? toDecimal(params.poTaxRatePercent)
+    : null
+  const taxRate = freightRecordedRate ?? (params.poSubtotalForeign > 0
     ? toDecimal(params.poTaxForeign).div(params.poSubtotalForeign)
-    : toDecimal(0)
+    : toDecimal(0))
   const taxForeign = rounded4(multiplyMoney(taxBaseForeign, taxRate))
   const taxBase = rounded4(toDecimal(taxForeign).div(params.fxRateToBase))
 
@@ -432,4 +442,52 @@ export function buildPurchaseInvoiceUpdateIdempotencyKey(params: {
     `purchase-invoice-update:${params.invoiceId}:${params.accountingInvoiceId}`,
     params.payload,
   )
+}
+
+
+// ---------------------------------------------------------------------------
+// The order changed between reading it and locking it
+// ---------------------------------------------------------------------------
+
+/** Shown to the operator when `createInvoice` finds the order or its cost lines edited after it read them. Nothing was saved. */
+export const PURCHASE_INVOICE_INPUTS_CHANGED_MESSAGE =
+  'This purchase order or its cost lines were changed while the bill was being prepared, so the bill was not saved. Reload the order and create the bill again.'
+
+export class PurchaseInvoiceInputsChangedError extends Error {
+  constructor() {
+    super(PURCHASE_INVOICE_INPUTS_CHANGED_MESSAGE)
+    this.name = 'PurchaseInvoiceInputsChangedError'
+  }
+}
+
+type Numeric = number | string | { toString(): string }
+export type PurchaseInvoiceTaxInputs = {
+  fxRateToBase: Numeric
+  type: string
+  taxRatePercent: Numeric | null
+  taxForeign: Numeric
+  subtotalForeign: Numeric
+  costLines: Array<{ id: string; description: string; amountForeign: Numeric; vatable: boolean }>
+}
+
+const sameNumber = (a: Numeric | null, b: Numeric | null) =>
+  a === null || b === null ? a === b : toDecimal(a.toString()).eq(toDecimal(b.toString()))
+
+/**
+ * Whether anything `calculatePurchaseInvoice` consumed differs between the unlocked read the bill was calculated
+ * from and the same rows re-read under the invoice transaction's locks: the order's rate, VAT figures and recorded
+ * rate, and each cost line's amount, description and vatable flag (a cost line that appeared or vanished counts).
+ */
+export function purchaseInvoiceInputsChanged(before: PurchaseInvoiceTaxInputs, locked: PurchaseInvoiceTaxInputs): boolean {
+  if (before.type !== locked.type) return true
+  if (!sameNumber(before.fxRateToBase, locked.fxRateToBase)) return true
+  if (!sameNumber(before.taxRatePercent, locked.taxRatePercent)) return true
+  if (!sameNumber(before.taxForeign, locked.taxForeign)) return true
+  if (!sameNumber(before.subtotalForeign, locked.subtotalForeign)) return true
+  if (before.costLines.length !== locked.costLines.length) return true
+  const lockedById = new Map(locked.costLines.map((line) => [line.id, line]))
+  return before.costLines.some((line) => {
+    const now = lockedById.get(line.id)
+    return !now || now.vatable !== line.vatable || now.description !== line.description || !sameNumber(line.amountForeign, now.amountForeign)
+  })
 }

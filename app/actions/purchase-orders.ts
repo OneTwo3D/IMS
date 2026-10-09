@@ -65,6 +65,8 @@ import {
   buildPurchaseInvoiceAccountingPayload,
   buildPurchaseInvoiceUpdateIdempotencyKey,
   calculatePurchaseInvoice,
+  PurchaseInvoiceInputsChangedError,
+  purchaseInvoiceInputsChanged,
   dateKey,
   hasPurchaseInvoiceEditChanges,
   optionalText,
@@ -3111,6 +3113,8 @@ export async function createInvoice(
         status: true,
         currency: true,
         fxRateToBase: true,
+        type: true,
+        taxRatePercent: true,
         taxForeign: true,
         subtotalForeign: true,
         lines: {
@@ -3205,6 +3209,8 @@ export async function createInvoice(
       poReference: po.reference,
       poSubtotalForeign: Number(po.subtotalForeign),
       poTaxForeign: Number(po.taxForeign),
+      poType: po.type,
+      poTaxRatePercent: po.taxRatePercent != null ? po.taxRatePercent.toString() : null,
       transitAccount: accountingSettings.transitAccount,
       fallbackTaxType,
       reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
@@ -3249,6 +3255,11 @@ export async function createInvoice(
       const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
         where: { id: poId },
         select: {
+          fxRateToBase: true,
+          type: true,
+          taxRatePercent: true,
+          taxForeign: true,
+          subtotalForeign: true,
           supplier: { select: { prepaid: true } },
           lines: {
             select: {
@@ -3264,6 +3275,28 @@ export async function createInvoice(
           },
         },
       })
+      // The tax and the accounting payload above were computed BEFORE this lock from the order and its cost lines as
+      // they were then. A freight edit that committed in between keeps the cost-line ids, so the id checks alone pass
+      // while the VAT is the old order's. Re-validate what the calculation consumed against the locked rows and abort.
+      const changedSinceRead = purchaseInvoiceInputsChanged(
+        {
+          fxRateToBase: po.fxRateToBase,
+          type: po.type,
+          taxRatePercent: po.taxRatePercent,
+          taxForeign: po.taxForeign,
+          subtotalForeign: po.subtotalForeign,
+          costLines: po.freightCostLines,
+        },
+        {
+          fxRateToBase: lockedPo.fxRateToBase,
+          type: lockedPo.type,
+          taxRatePercent: lockedPo.taxRatePercent,
+          taxForeign: lockedPo.taxForeign,
+          subtotalForeign: lockedPo.subtotalForeign,
+          costLines: lockedPo.freightCostLines,
+        },
+      )
+      if (changedSinceRead) throw new PurchaseInvoiceInputsChangedError()
       validatePurchaseInvoiceLineLimits({
         lineData: invoiceCalculation.lineData,
         alreadyBilledLines: existing,
@@ -3431,6 +3464,7 @@ export async function createInvoice(
       description: `Failed to create invoice for PO ${poId}: ${String(e)}`,
       metadata: null,
     })
+    if (e instanceof PurchaseInvoiceInputsChangedError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }
@@ -3471,6 +3505,8 @@ export async function updateInvoice(
             reference: true,
             currency: true,
             fxRateToBase: true,
+            type: true,
+            taxRatePercent: true,
             taxForeign: true,
             subtotalForeign: true,
             supplier: {
@@ -3592,6 +3628,8 @@ export async function updateInvoice(
         poReference: invoice.po.reference,
         poSubtotalForeign: Number(invoice.po.subtotalForeign),
         poTaxForeign: Number(invoice.po.taxForeign),
+        poType: invoice.po.type,
+        poTaxRatePercent: invoice.po.taxRatePercent != null ? invoice.po.taxRatePercent.toString() : null,
         transitAccount: accountingSettings.transitAccount,
         fallbackTaxType,
         reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
