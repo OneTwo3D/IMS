@@ -530,7 +530,7 @@ test('EVERY kept claim is reachable: 120 claims page through completely and a SK
   const seen = new Set<string>()
   let page = 0
   let total = 0
-  for (;;) {
+  for (let guard = 0; guard < 20; guard += 1) {
     const result = await listKeptBundleClaims({ page })
     total = result.total
     result.claims.forEach((claim) => seen.add(claim.id))
