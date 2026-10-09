@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
@@ -72,6 +72,13 @@ const LIB = [
   'ENV_PRESERVE_MAX_LENGTH=4096; ENV_BACKUP_OWNER="$(id -un):$(id -gn)"',
   shippedFunction(INSTALL, 'env_value_has_shape'),
   shippedFunction(INSTALL, 'env_value_has_residual_escape'),
+  /^ENV_PRESERVE_SECURITY_KEYS=\([\s\S]*?^\)$/m.exec(INSTALL)?.[0] ?? 'ENV_PRESERVE_SECURITY_KEYS=()',
+  /^ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE=".*"$/m.exec(INSTALL)?.[0] ?? 'ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE=x',
+  "ENV_PRESERVE_VALUE=''; declare -A ENV_PRESERVED_EFFECTIVE=()",
+  shippedFunction(INSTALL, 'env_effective_value'),
+  shippedFunction(INSTALL, 'env_canonical_value'),
+  shippedFunction(INSTALL, 'env_preserve_decision'),
+  shippedFunction(INSTALL, 'env_key_is_security_control'),
   shippedFunction(INSTALL, 'env_value_leaks_secret'),
   shippedFunction(INSTALL, 'env_admin_password_decoded'),
   shippedFunction(INSTALL, 'env_unowned_existing_keys'),
@@ -252,14 +259,14 @@ test('re-run: export/spaced forms and multi-line quoted values are read whole; a
 test('re-run: a multi-line value under an unlisted key is dropped from the new file and kept whole in the backup', async () => {
   await withTempDir('ims-env-mlc-', async (dir) => {
     const old = join(dir, '.env')
-    writeFileSync(old, 'APP_PORT=3000\nCERT_PEM="first\nsecond=\nthird"\nTAIL=1\nTRUSTED_PROXY_IPS="a\nb"\n')
+    writeFileSync(old, 'APP_PORT=3000\nCERT_PEM="first\nsecond=\nthird"\nTAIL=1\nOUTBOX_RETRY_BASE_MS="1\n2"\n')
     const r = bash([LIB, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"; printf "DROPPED:%s\\n" "${ENV_REFUSED_KEYS[@]}"; printf "RAW<<%s>>" "$(printf "%s\\n" "${EXISTING_ENV_RAW[@]}")"'].join('\n'))
     console.log(`  multi-line: ${JSON.stringify(r.out.split('\n').filter((l) => /^DROPPED:/.test(l)))}`)
     const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
     assert.doesNotMatch(block, /CERT_PEM/, 'the unlisted multi-line value is not carried')
-    assert.doesNotMatch(block, /TRUSTED_PROXY_IPS/, 'and a listed key whose value spans lines does not have the shape of a host list')
+    assert.doesNotMatch(block, /OUTBOX_RETRY_BASE_MS/, 'and a listed key whose value spans lines does not have the shape of a number')
     assert.match(r.out, /DROPPED:CERT_PEM .*not on the list/)
-    assert.match(r.out, /DROPPED:TRUSTED_PROXY_IPS .*does not have the shape of a hostlist setting/)
+    assert.match(r.out, /DROPPED:OUTBOX_RETRY_BASE_MS .*does not have the shape of a int setting/)
     assert.match(r.out, /RAW<<[\s\S]*CERT_PEM="first\nsecond=\nthird"/, 'the backup lines still hold the whole value')
   })
 })
@@ -286,9 +293,9 @@ test('re-run: nothing outside the carry list reaches the new file, whatever it i
       `REPORTING_HEX=${hex}`,
       `REPORTING_LAYERS=${layered}`,
       // ...and the same disguises under key names that ARE on the list: the shape rejects them.
-      `TRUSTED_PROXY_IPS=${b64}`,
-      `XERO_ALLOWED_TENANT_IDS=${hex}`,
-      `RATE_LIMIT_BACKEND=${layered}`,
+      `OUTBOX_RETRY_BASE_MS=${b64}`,
+      `PREFLIGHT_DB_CONNECT=${hex}`,
+      `DATABASE_RESTORE_MAX_FILE_BYTES=${layered}`,
       'TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.0.0/16',
       'REQUIRE_TRUSTED_PROXY_CONFIG=true',
       '',
@@ -305,7 +312,7 @@ test('re-run: nothing outside the carry list reaches the new file, whatever it i
     for (const gone of ['DIRECT_URL', 'MIGRATION_DATABASE_URL', 'PGPASSWORD', 'direct_url', 'SHADOW_DATABASE_URL', 'REPORTING_CONN', 'PROXYISH', 'INNOCUOUS_NOTE', 'REPORTING_CONFIG', 'REPORTING_HEX', 'REPORTING_LAYERS']) {
       assert.match(r.out, new RegExp(`WARN:     ${gone} \\(line \\d+\\): not on the list of settings a re-run carries over`), `${gone} must be listed as dropped`)
     }
-    for (const listed of ['TRUSTED_PROXY_IPS', 'XERO_ALLOWED_TENANT_IDS', 'RATE_LIMIT_BACKEND']) {
+    for (const listed of ['OUTBOX_RETRY_BASE_MS', 'PREFLIGHT_DB_CONNECT', 'DATABASE_RESTORE_MAX_FILE_BYTES']) {
       assert.match(r.out, new RegExp(`WARN:     ${listed} \\(line \\d+\\): the value does not have the shape`), `${listed} with an encoded blob must fail its shape`)
     }
     for (const secret of ['Adm1nPassw0rd', 'readerpw', 'secretpw', b64, hex]) assert.doesNotMatch(r.out.replace(/BLOCK<<[\s\S]*?>>/, ''), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'no value is ever printed')
@@ -421,7 +428,7 @@ test('re-run: the domain, port and upload-scanner settings default to what is in
   assert.match(factory.out, /MODE=\[disabled\] CMD=\[\] TIMEOUT=\[30000\]/)
 })
 
-test('re-run: the .env write backs up and keeps before it replaces; the backup is outside the tree so the source sync needs no exception', () => {
+test('re-run: the .env write backs up and keeps before it replaces; the backup is outside the tree', () => {
   const body = shippedFunction(INSTALL, 'write_app_env_file')
   const order = ['render_app_env_file', 'render_preserved_env_keys', 'write_env_backup', 'publish_durable_file'].map((n) => body.indexOf(n))
   console.log(`  write_app_env_file call order offsets: ${order.join(' < ')}`)
@@ -431,7 +438,7 @@ test('re-run: the .env write backs up and keeps before it replaces; the backup i
   assert.doesNotMatch(backup, /APP_DIR/, 'and nowhere in the application tree')
   assert.match(backup, /publish_durable_file "\$\{ENV_BACKUP_FILE\}" "\$\{ENV_BACKUP_OWNER\}" 600/)
   assert.match(INSTALL, /^ENV_BACKUP_OWNER="root:root"$/m, 'owned by root')
-  assert.equal(INSTALL.split('\n').filter((l) => l.includes('.env.bak')).length, 0, 'no leftover in-tree backup name or sync exception')
+  assert.ok(!/\.env\.bak-\$\{/.test(backup), 'the installer no longer WRITES an in-tree backup name')
   assert.match(INSTALL, /^print_env_rewrite_summary "\$\{ENV_LAST_RENDERED\}"$/m, 'and the summary is printed after the write')
 })
 
@@ -544,4 +551,148 @@ test('re-run: the template key list the early gate uses is exactly the keys rend
   console.log(`  template keys written: ${written.length}; listed: ${listed.length}`)
   assert.ok(written.length >= 25, 'precondition: the template was parsed')
   assert.deepEqual(listed, written)
+})
+
+// ---------------------------------------------------------------------------
+// review round 5: the loader's QUOTES, security settings, and the in-tree backups of earlier versions
+// ---------------------------------------------------------------------------
+
+const GATE_START = 'for _sec_key in "${ENV_PRESERVE_SECURITY_KEYS[@]}"; do'
+const securityGate = (): string => {
+  const lines = INSTALL.split('\n')
+  const start = lines.findIndex((l) => l === GATE_START)
+  const end = lines.findIndex((l, i) => i > start && l === 'unset _sec_key')
+  assert.ok(start > 0 && end > start, 'precondition: the security-setting gate exists')
+  return lines.slice(start, end + 1).join('\n')
+}
+
+test('re-run: a security setting written with quotes, export, CRLF or an inline comment is carried with the same effective meaning, in one canonical form', async () => {
+  await withTempDir('ims-env-eff-', async (dir) => {
+    const variants: Array<[string, (k: string, v: string) => string]> = [
+      ['bare', (k, v) => `${k}=${v}`],
+      ['double-quoted', (k, v) => `${k}="${v}"`],
+      ['single-quoted', (k, v) => `${k}='${v}'`],
+      ['export-prefixed', (k, v) => `export ${k}=${v}`],
+      ['export + double-quoted', (k, v) => `export ${k}="${v}"`],
+      ['spaces around the value', (k, v) => `${k}=  ${v}   `],
+      ['inline comment', (k, v) => `${k}=${v} # why`],
+      ['double-quoted + inline comment', (k, v) => `${k}="${v}" # why`],
+      ['single-quoted + inline comment', (k, v) => `${k}='${v}'   # why`],
+      ['CRLF line ending', (k, v) => `${k}=${v}\r`],
+      ['CRLF + double-quoted', (k, v) => `${k}="${v}"\r`],
+    ]
+    const wants: Array<[string, string]> = [['REQUIRE_TRUSTED_PROXY_CONFIG', 'true'], ['TRUSTED_PROXY_IPS', '10.0.0.1,10.0.0.2'], ['XERO_ALLOWED_TENANT_IDS', 'tenant-a,tenant-b']]
+    let checked = 0
+    for (const [label, form] of variants) {
+      const old = join(dir, `${checked}.env`)
+      writeFileSync(old, ['APP_PORT=3000', ...wants.map(([k, v]) => form(k, v)), ''].join(label.includes('CRLF') ? '\r\n'.replace('\r', '') : '\n'))
+      const r = bash([LIB, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; echo "RC=$?"', 'printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"', 'printf "DROPPED=%s" "${#ENV_REFUSED_KEYS[@]}"'].join('\n'))
+      const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
+      console.log(`  ${label}: ${JSON.stringify(block.split('\n').filter((l) => l && !l.startsWith('#')))} dropped=${/DROPPED=(\d+)/.exec(r.out)?.[1]}`)
+      assert.match(r.out, /RC=0/, label)
+      assert.deepEqual(block.split('\n').filter((l) => l && !l.startsWith('#')).sort(), wants.map(([k, v]) => `${k}=${v}`).sort(), `${label}: carried unquoted with the same effective value`)
+      assert.match(r.out, /DROPPED=0/, label)
+      checked++
+    }
+    assert.equal(checked, variants.length)
+    // The canonical form is lossless for a value that needs quoting, and the loader would read it back the same.
+    const canon = bash([LIB, "env_canonical_value \"Acme Ltd,O'Neil & Sons\" c; echo \"$c\"; env_effective_value \"$c\" e; echo \"$e\"", "env_canonical_value 10.0.0.1,10.0.0.2 d; echo \"$d\""].join('\n')).out.trim().split('\n')
+    console.log(`  canonical forms: ${JSON.stringify(canon)}`)
+    assert.deepEqual(canon, ['"Acme Ltd,O\'Neil & Sons"', "Acme Ltd,O'Neil & Sons", '10.0.0.1,10.0.0.2'])
+  })
+})
+
+test('re-run: a security setting that cannot be carried REFUSES the run before anything is changed, naming the key and never the value; a non-security one is dropped and reported', async () => {
+  await withTempDir('ims-env-sec-', async (dir) => {
+    const gate = securityGate()
+    const run = (content: string, admin = '') => {
+      const old = join(dir, `s${Math.random().toString(36).slice(2)}.env`)
+      writeFileSync(old, content)
+      return bash([LIB, 'APP_DIR=/opt/app', admin ? `DEPLOY_ADMIN_DATABASE_URL='${admin}'` : 'DEPLOY_ADMIN_DATABASE_URL=""', `load_existing_env '${old}'`, gate, 'echo CONTINUED', "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; echo "RC=$?"; printf "DROPPED:%s\\n" "${ENV_REFUSED_KEYS[@]}"'].join('\n'))
+    }
+    const cases: Array<[string, string, boolean]> = [
+      ['REQUIRE_TRUSTED_PROXY_CONFIG not a boolean', 'REQUIRE_TRUSTED_PROXY_CONFIG=definitely-maybe\n', true],
+      ['TRUSTED_PROXY_IPS holds an encoded blob', `TRUSTED_PROXY_IPS=${Buffer.from('postgresql://a:b@h/d').toString('base64')}\n`, true],
+      ['XERO tenant allowlist with a space-separated list', 'XERO_ALLOWED_TENANT_IDS=a b\n', true],
+      ['a write grant that is not a timestamp', 'MINTSOFT_WRITES_LIVE_FROM=whenever\n', true],
+      ['TRUSTED_PROXY_IPS carries the admin password', `TRUSTED_PROXY_IPS=10.0.0.1,Adm1nPassw0rd\n`, true],
+      ['a well-formed quoted security setting', 'REQUIRE_TRUSTED_PROXY_CONFIG="true"\nTRUSTED_PROXY_IPS=\'10.0.0.1\'\n', false],
+      ['a NON-security setting that does not fit', 'OUTBOX_RETRY_BASE_MS=abc\n', false],
+      ['an unlisted key', 'MY_FEATURE_FLAG=on\n', false],
+    ]
+    for (const [label, content, refused] of cases) {
+      const r = run(`APP_PORT=3000\n${content}`, 'postgresql://deployadmin:Adm1nPassw0rd@h/db')
+      console.log(`  ${label}: ${refused ? 'refused' : 'continues'} rc=${r.status}`)
+      if (refused) {
+        assert.equal(r.status, 9, label)
+        assert.match(r.out, /DIE: .*\/\.env: [A-Z_]+ is a security setting that this installer cannot carry across/)
+        assert.match(r.out, /Nothing has been changed\./)
+        assert.doesNotMatch(r.out, /CONTINUED/)
+        assert.doesNotMatch(r.out, /Adm1nPassw0rd|definitely-maybe|a b|whenever/, 'the value is never printed')
+      } else {
+        assert.equal(r.status, 0, `${label}\n${r.out}`)
+        assert.match(r.out, /CONTINUED/)
+      }
+    }
+    // Non-security keys that do not fit are dropped AND reported.
+    const dropped = run('APP_PORT=3000\nOUTBOX_RETRY_BASE_MS=abc\nMY_FEATURE_FLAG=on\n')
+    assert.match(dropped.out, /DROPPED:OUTBOX_RETRY_BASE_MS .*does not have the shape of a int setting/)
+    assert.match(dropped.out, /DROPPED:MY_FEATURE_FLAG .*not on the list/)
+  })
+})
+
+test('re-run: every security setting is on the carry list, and the sentence that refuses is single-sourced', () => {
+  const security = (/^ENV_PRESERVE_SECURITY_KEYS=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').split(/\s+/).filter(Boolean)
+  const shapes = [...(/^declare -A ENV_PRESERVE_SHAPES=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').matchAll(/\[([A-Z0-9_]+)\]=/g)].map((m) => m[1])
+  console.log(`  ${security.length} security settings, all among the ${shapes.length} listed`)
+  assert.ok(security.length >= 15 && shapes.length >= 30, 'precondition: both lists were parsed')
+  assert.deepEqual(security.filter((k) => !shapes.includes(k)), [])
+  for (const must of ['REQUIRE_TRUSTED_PROXY_CONFIG', 'TRUSTED_PROXY_IPS', 'XERO_ALLOWED_TENANT_IDS', 'XERO_WRITE_ALLOWED_TENANT', 'MINTSOFT_WRITE_ALLOWED', 'WC_WRITES_LIVE_FROM', 'ALLOW_DATABASE_RESTORE']) assert.ok(security.includes(must), must)
+  const message = /^ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE="(.*)"$/m.exec(INSTALL)?.[1] ?? ''
+  assert.ok(message.length > 40 && read('docs/installation.md').includes('security setting'), 'the docs name the refusal')
+})
+
+test('re-run: the source sync spares in-tree .env.bak* files left by earlier installer versions (both rsync paths)', async () => {
+  const lines = INSTALL.split('\n')
+  const statements: string[] = []
+  lines.forEach((l, i) => {
+    if (!/^\s*rsync -a --delete \\$/.test(l)) return
+    let end = i
+    while (lines[end].endsWith('\\')) end++
+    statements.push(lines.slice(i, end + 1).join('\n'))
+  })
+  console.log(`  rsync --delete statements: ${statements.length}`)
+  assert.equal(statements.length, 2, 'precondition: the two source-sync paths were found')
+  const synced = statements.filter((st) => /\.env'/.test(st))
+  assert.equal(synced.length, 2)
+  for (const st of statements) assert.match(st, /--exclude='\.env\.bak\*'/, 'each sync excludes the in-tree backups')
+  // The statements are RUN: with the real rsync when the machine has one (the --delete is then observed to spare the
+  // files), and always with a recording stand-in that proves what rsync would have been asked to spare.
+  const haveRsync = bash('command -v rsync').status === 0
+  console.log(`  real rsync available: ${haveRsync}`)
+  await withTempDir('ims-env-rsync-', async (dir) => {
+    const src = join(dir, 'src')
+    const app = join(dir, 'app')
+    mkdirSync(src); mkdirSync(app)
+    writeFileSync(join(src, 'package.json'), '{}')
+    writeFileSync(join(app, '.env.bak.20250101'), 'OLD BACKUP')
+    writeFileSync(join(app, '.env.bak-20250102T000000Z'), 'OLD BACKUP 2')
+    writeFileSync(join(app, '.env'), 'KEEP')
+    for (const [i, statement] of statements.entries()) {
+      const st = statement.replace(/"\$\{[A-Z_]+%\/\}\/"/, `"${src}/"`).replace(/"\$\{APP_DIR\}\/"/, `"${app}/"`)
+      const recorded = bash(`rsync() { printf 'ARG %s\\n' "$@"; }\n${st}`)
+      const args = recorded.out.split('\n').filter((l) => l.startsWith('ARG ')).map((l) => l.slice(4))
+      console.log(`  sync path ${i + 1} asks rsync to spare: ${JSON.stringify(args.filter((a) => a.startsWith('--exclude')))}`)
+      assert.ok(args.includes('--delete') && args.includes('--exclude=.env.bak*') && args.includes('--exclude=.env'), 'the sync deletes, and spares .env and .env.bak*')
+      if (haveRsync) {
+        writeFileSync(join(app, 'stale.txt'), 'delete me')
+        const r = bash(st)
+        assert.equal(r.status, 0, r.out)
+        assert.ok(!readdirSync(app).includes('stale.txt'), 'precondition: --delete really ran')
+        assert.equal(readFileSync(join(app, '.env.bak.20250101'), 'utf8'), 'OLD BACKUP')
+        assert.equal(readFileSync(join(app, '.env.bak-20250102T000000Z'), 'utf8'), 'OLD BACKUP 2')
+        assert.equal(readFileSync(join(app, '.env'), 'utf8'), 'KEEP')
+      }
+    }
+  })
 })

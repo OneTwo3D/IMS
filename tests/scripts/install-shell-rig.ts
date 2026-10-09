@@ -76,7 +76,11 @@ export const SHIPPED = [
   'env_value_leaks_secret',
   'env_value_has_shape',
   'env_value_has_residual_escape',
+  'env_effective_value',
+  'env_canonical_value',
   'env_key_carry_check',
+  'env_preserve_decision',
+  'env_key_is_security_control',
   'mask_secret',
   'prompt',
   // r39 (Codex HIGH): the two grammars the one password travels through, and the composer both
@@ -251,10 +255,18 @@ export const DB_CA_ASSIGNMENTS = [
 
 /** The allowlist of carried settings, lifted verbatim so a rig cannot drift from the shipped list. */
 export const ENV_PRESERVE_SHAPES_BLOCK = (() => {
-  const match = /^declare -A ENV_PRESERVE_SHAPES=\([\s\S]*?^\)$/m.exec(INSTALL_SOURCE)
-  assert.ok(match, 'precondition: scripts/install.sh must define ENV_PRESERVE_SHAPES')
-  return match[0]
+  const parts = [
+    /^declare -A ENV_PRESERVE_SHAPES=\([\s\S]*?^\)$/m,
+    /^ENV_PRESERVE_SECURITY_KEYS=\([\s\S]*?^\)$/m,
+    /^ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE=".*"$/m,
+  ].map((re) => {
+    const match = re.exec(INSTALL_SOURCE)
+    assert.ok(match, `precondition: scripts/install.sh must define ${re}`)
+    return match[0]
+  })
+  return `${parts.join('\n')}\nENV_PRESERVE_VALUE=''\ndeclare -A ENV_PRESERVED_EFFECTIVE=()`
 })()
+
 
 export const ENV_HEREDOC_DEFAULTS = [
   ...new Set(

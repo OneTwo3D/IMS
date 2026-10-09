@@ -929,6 +929,18 @@ The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: 
   below. An operator who needs a dropped setting copies the line back by hand, or asks for the name to be added
   to the list. `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` keys are refused outright, before anything is changed
   (they belong in `/etc/ims-db-admin/deploy-admin.env`).
+* **A security setting that cannot be carried stops the run.** The listed settings that tighten behaviour --
+  the trusted-proxy settings, `REQUIRE_TRUSTED_PROXY_CONFIG`, `RATE_LIMIT_BACKEND`, `CSP_MODE`, the database-restore
+  switches, the `XERO_*` tenant allowlists and write grants, `MINTSOFT_WRITE_ALLOWED` and the connector write windows,
+  `WC_WRITEBACK_ALLOWED_ORIGIN`, the fresh-auth and invoice-token lifetimes -- are never dropped silently, because
+  dropping one loosens a control (a proxied production would get a preflight warning where it used to get a failure).
+  If one is present and its value is not in a form that setting accepts, or fails the admin-secret screen, the run stops
+  in the configuration phase, before anything is changed, naming the key and never the value: *`<KEY>` is a security
+  setting that this installer cannot carry across to the new file ...*. Correct or remove it and re-run. The value is read
+  the way the application's dotenv loader reads it (CRLF removed, one pair of surrounding single or double quotes
+  stripped, an inline `# comment` ignored, `export` accepted) and is written to the new file in one canonical unquoted
+  form that means the same.
+* **The in-tree `.env.bak*` files of earlier installer versions are left alone** by the source sync.
 * **A file the installer cannot reproduce is not rewritten.** A line that is not `KEY=VALUE` (also read: `export
   KEY=value`, `KEY = value`, and quoted values that span several lines), or a quoted value that is never closed,
   stops the run in the configuration phase, before any package, account or file is touched, naming the line

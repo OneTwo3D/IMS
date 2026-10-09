@@ -742,6 +742,80 @@ declare -A ENV_PRESERVE_SHAPES=(
 )
 ENV_PRESERVE_MAX_LENGTH=4096
 
+# THE LISTED SETTINGS THAT TIGHTEN BEHAVIOUR. Dropping one of these does not lose a convenience, it silently
+# loosens a control: a proxied production that loses REQUIRE_TRUSTED_PROXY_CONFIG gets a preflight warning where it
+# used to get a failure; a lost tenant allowlist or write grant changes what the connectors may touch. So for these a
+# value that cannot be carried is not "dropped and reported": the re-run REFUSES, in the configuration phase, before
+# anything is changed (see the gate after load_existing_env). Every name here must also be a key of
+# ENV_PRESERVE_SHAPES (a test enforces it).
+ENV_PRESERVE_SECURITY_KEYS=(
+  TRUSTED_PROXY_IPS TRUSTED_PROXY_CIDRS REQUIRE_TRUSTED_PROXY_CONFIG BEHIND_PROXY
+  RATE_LIMIT_BACKEND CSP_MODE ALLOW_DATABASE_RESTORE ALLOW_DATABASE_RESTORE_UPLOAD
+  XERO_ALLOWED_TENANT_IDS XERO_BLOCKED_TENANT_IDS XERO_ALLOWED_TENANT_NAMES XERO_REQUIRE_DEMO_ORG
+  XERO_TENANT_ID XERO_WRITE_ALLOWED_TENANT XERO_WRITES_LIVE_FROM WC_WRITES_LIVE_FROM
+  MINTSOFT_WRITES_LIVE_FROM MINTSOFT_WRITE_ALLOWED WC_WRITEBACK_ALLOWED_ORIGIN
+  FRESH_AUTH_MAX_AGE_SECONDS INVOICE_PDF_TOKEN_TTL_SECONDS INVOICE_PDF_TOKEN_MAX_TTL_SECONDS
+)
+ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE="is a security setting that this installer cannot carry across to the new file (its value is not in a form that setting accepts, or it failed the screen against the deploy admin credential). Correct or remove it and re-run. Nothing has been changed."
+
+# The value the application's dotenv loader would see for a raw value as stored (everything after the first
+# '='): CRLF removed, surrounding whitespace trimmed, ONE matching pair of single or double quotes stripped
+# (whatever follows the closing quote, such as an inline comment, is ignored), and for an unquoted value an
+# inline comment (whitespace then '#') and trailing whitespace removed. Into the variable named by ${2}.
+env_effective_value() {
+  local v="$1" q rest re='^(([^"\\]|\\.)*)"'
+  v="${v%$'\r'}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  q="${v:0:1}"
+  if [[ "${q}" == '"' ]]; then
+    rest="${v:1}"
+    if [[ "${rest}" =~ ${re} ]]; then v="${BASH_REMATCH[1]}"; v="${v//\\\"/\"}"; else v="${rest}"; fi
+  elif [[ "${q}" == "'" ]]; then
+    rest="${v:1}"
+    if [[ "${rest}" == *"'"* ]]; then v="${rest%%\'*}"; else v="${rest}"; fi
+  else
+    v="${v%%[[:space:]]#*}"
+    [[ "${v}" == \#* ]] && v=""
+    v="${v%"${v##*[![:space:]]}"}"
+  fi
+  printf -v "$2" '%s' "${v}"
+}
+
+# A carried value is written in one canonical form that means the same thing to the loader: bare when it is made of
+# characters that need no quoting, otherwise inside double quotes (the shapes never admit a double quote, backslash,
+# dollar sign or hash, so the quoting is lossless).
+env_canonical_value() {
+  if [[ "$1" =~ ^[A-Za-z0-9._:/,@+=-]*$ ]]; then
+    printf -v "$2" '%s' "$1"
+  else
+    printf -v "$2" '"%s"' "$1"
+  fi
+}
+
+# May the old file's key ${1} (raw stored value ${2}) be carried? 0 = yes, with the effective value in
+# ENV_PRESERVE_VALUE; 1 = no, with ENV_REFUSAL_REASON. The ONE decision, used by the up-front gate and the writer.
+ENV_PRESERVE_VALUE=""
+env_preserve_decision() {
+  local key="$1" raw="$2" shape
+  ENV_PRESERVE_VALUE=""
+  ENV_REFUSAL_REASON=""
+  shape="${ENV_PRESERVE_SHAPES[${key}]-}"
+  if [[ -z "${shape}" ]]; then
+    ENV_REFUSAL_REASON="not on the list of settings a re-run carries over"
+    return 1
+  fi
+  env_effective_value "${raw}" ENV_PRESERVE_VALUE
+  if ! env_value_has_shape "${shape}" "${ENV_PRESERVE_VALUE}"; then
+    ENV_REFUSAL_REASON="the value does not have the shape of a ${shape} setting"
+    return 1
+  fi
+  if env_value_has_residual_escape "${ENV_PRESERVE_VALUE}"; then
+    ENV_REFUSAL_REASON="the value still contains a percent-escape after the decode passes"
+    return 1
+  fi
+  env_key_carry_check "${key}" "${ENV_PRESERVE_VALUE}"
+}
+
 # Who owns the backup of the previous .env: root. A top-level assignment (not a parameter) so a test rig, which
 # is not root, can give the file to its own user the same way DB_CA_PUBLISH_OWNER is handled.
 ENV_BACKUP_OWNER="root:root"
@@ -796,6 +870,69 @@ env_unowned_existing_keys() {
     # Only a key that COULD be carried needs screening against the admin password; the rest is dropped.
     ${owned} || [[ -z "${ENV_PRESERVE_SHAPES[${key}]-}" ]] || ENV_UNOWNED_EXISTING_KEYS+=("${key}")
   done
+}
+
+ENV_REFUSAL_REASON=""
+env_key_carry_check() {
+  local key="$1" value="$2" upper admin_user="" admin_pass="" url="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  local lower_value="${value,,}" form
+  local -a pass_forms=() user_forms=()
+  upper="${key^^}"
+  ENV_REFUSAL_REASON=""
+  case "${upper}" in
+    DIRECT_URL | *DATABASE*URL* | *DB_URL* | *_DB_*URL* | *MIGRATION* | *ADMIN* | *SUPERUSER* | *POSTGRES* | PG*)
+      ENV_REFUSAL_REASON="the name looks like a database connection setting"
+      return 1
+      ;;
+  esac
+  if [[ "${lower_value}" == *postgres://* || "${lower_value}" == *postgresql://* ]]; then
+    ENV_REFUSAL_REASON="the value is a PostgreSQL connection URL"
+    return 1
+  fi
+  if [[ "${value}" =~ ://[^/@[:space:]]*:[^/@[:space:]]+@ ]]; then
+    ENV_REFUSAL_REASON="the value is a URL with a password in it"
+    return 1
+  fi
+  # A libpq keyword/value connection string (`host=db user=x password=y`), quoted or not, spaced or not.
+  # A password setting in a hand-added variable is a credential whatever role it belongs to.
+  if [[ "${lower_value}" =~ (^|[[:space:]\'\"])password[[:space:]]*= ]]; then
+    ENV_REFUSAL_REASON="the value is a connection string with a password setting"
+    return 1
+  fi
+  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+)(:([^@]*))?@ ]]; then
+    admin_user="${BASH_REMATCH[1]}"
+    admin_pass="${BASH_REMATCH[3]}"
+    # The credential as it appears in the URL (percent-encoded), decoded, and re-encoded in both hex
+    # cases: a copy may have been written in any of them.
+    local decoded_user decoded_pass enc_up enc_low
+    env_percent_decode "${admin_user}" decoded_user
+    env_percent_decode "${admin_pass}" decoded_pass
+    user_forms=("${admin_user}" "${decoded_user}")
+    pass_forms=("${admin_pass}" "${decoded_pass}")
+    env_percent_encode "${decoded_pass}" enc_up enc_low
+    pass_forms+=("${enc_up}" "${enc_low}")
+    env_percent_encode "${decoded_user}" enc_up enc_low
+    user_forms+=("${enc_up}" "${enc_low}")
+    # Screened only when long enough for a substring match to mean something; a shorter password with
+    # settings to screen is refused up front by the caller (ENV_ADMIN_PASSWORD_MIN_LENGTH).
+    if [[ ${#decoded_pass} -ge ${ENV_ADMIN_PASSWORD_MIN_LENGTH} ]]; then
+      for form in "${pass_forms[@]}"; do
+        if [[ "${value}" == *"${form}"* ]] || env_value_leaks_secret "${value}" "${form}"; then
+          ENV_REFUSAL_REASON="the value contains the deploy admin's password"
+          return 1
+        fi
+      done
+    fi
+    for form in "${user_forms[@]}"; do
+      [[ -n "${form}" ]] || continue
+      if [[ "${value}" == *"://${form}:"* || "${value}" == *"://${form}@"* ]] \
+        || [[ "${lower_value}" =~ (^|[[:space:]\'\"])user[[:space:]]*=[[:space:]]*[\'\"]?"${form,,}"([[:space:]\'\"]|$) ]]; then
+        ENV_REFUSAL_REASON="the value names the deploy admin role as a connection user"
+        return 1
+      fi
+    done
+  fi
+  return 0
 }
 
 run_as_user() {
@@ -7909,6 +8046,15 @@ if [[ -n "${ENV_ADMIN_PASSWORD_DECODED}" && ${#ENV_ADMIN_PASSWORD_DECODED} -lt $
   fi
 fi
 
+# A SECURITY SETTING THAT CANNOT BE CARRIED ENDS THE RUN HERE, before anything is changed: dropping it would
+# loosen a control without a word.
+for _sec_key in "${ENV_PRESERVE_SECURITY_KEYS[@]}"; do
+  if [[ -n "${EXISTING_ENV[${_sec_key}]+x}" ]] && ! env_preserve_decision "${_sec_key}" "${EXISTING_ENV[${_sec_key}]}"; then
+    die "${APP_DIR}/.env: ${_sec_key} ${ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE}"
+  fi
+done
+unset _sec_key
+
 # THE INVOICE PDF DIRECTORY IS WHERE THE PREVIOUS RUN PUT IT. The default assigned among the other
 # path defaults is only the answer for a host with no .env: a re-run that rewrote .env with that
 # default would silently repoint a live installation away from the PDFs it has already stored.
@@ -9002,6 +9148,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='.deploy-meta' \
       --exclude='.env' \
       --exclude='.env.local' \
+      --exclude='.env.bak*' \
       --exclude='backups' \
       --exclude='uploads' \
       --exclude='public/uploads' \
@@ -9029,6 +9176,7 @@ else
     --exclude='.next' \
     --exclude='.env' \
     --exclude='.env.local' \
+    --exclude='.env.bak*' \
     --exclude='backups' \
     --exclude='uploads' \
     --exclude='public/uploads' \
@@ -9254,76 +9402,23 @@ env_key_is_admin_credential() {
 # is reported by key name, line number and reason (never the value) and the old file is in the backup, so
 # the cost of a false positive is one line copied back by hand. Sets ENV_REFUSAL_REASON; returns 0 when
 # the key may be carried.
-ENV_REFUSAL_REASON=""
-env_key_carry_check() {
-  local key="$1" value="$2" upper admin_user="" admin_pass="" url="${DEPLOY_ADMIN_DATABASE_URL:-}"
-  local lower_value="${value,,}" form
-  local -a pass_forms=() user_forms=()
-  upper="${key^^}"
-  ENV_REFUSAL_REASON=""
-  case "${upper}" in
-    DIRECT_URL | *DATABASE*URL* | *DB_URL* | *_DB_*URL* | *MIGRATION* | *ADMIN* | *SUPERUSER* | *POSTGRES* | PG*)
-      ENV_REFUSAL_REASON="the name looks like a database connection setting"
-      return 1
-      ;;
-  esac
-  if [[ "${lower_value}" == *postgres://* || "${lower_value}" == *postgresql://* ]]; then
-    ENV_REFUSAL_REASON="the value is a PostgreSQL connection URL"
-    return 1
-  fi
-  if [[ "${value}" =~ ://[^/@[:space:]]*:[^/@[:space:]]+@ ]]; then
-    ENV_REFUSAL_REASON="the value is a URL with a password in it"
-    return 1
-  fi
-  # A libpq keyword/value connection string (`host=db user=x password=y`), quoted or not, spaced or not.
-  # A password setting in a hand-added variable is a credential whatever role it belongs to.
-  if [[ "${lower_value}" =~ (^|[[:space:]\'\"])password[[:space:]]*= ]]; then
-    ENV_REFUSAL_REASON="the value is a connection string with a password setting"
-    return 1
-  fi
-  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+)(:([^@]*))?@ ]]; then
-    admin_user="${BASH_REMATCH[1]}"
-    admin_pass="${BASH_REMATCH[3]}"
-    # The credential as it appears in the URL (percent-encoded), decoded, and re-encoded in both hex
-    # cases: a copy may have been written in any of them.
-    local decoded_user decoded_pass enc_up enc_low
-    env_percent_decode "${admin_user}" decoded_user
-    env_percent_decode "${admin_pass}" decoded_pass
-    user_forms=("${admin_user}" "${decoded_user}")
-    pass_forms=("${admin_pass}" "${decoded_pass}")
-    env_percent_encode "${decoded_pass}" enc_up enc_low
-    pass_forms+=("${enc_up}" "${enc_low}")
-    env_percent_encode "${decoded_user}" enc_up enc_low
-    user_forms+=("${enc_up}" "${enc_low}")
-    # Screened only when long enough for a substring match to mean something; a shorter password with
-    # settings to screen is refused up front by the caller (ENV_ADMIN_PASSWORD_MIN_LENGTH).
-    if [[ ${#decoded_pass} -ge ${ENV_ADMIN_PASSWORD_MIN_LENGTH} ]]; then
-      for form in "${pass_forms[@]}"; do
-        if [[ "${value}" == *"${form}"* ]] || env_value_leaks_secret "${value}" "${form}"; then
-          ENV_REFUSAL_REASON="the value contains the deploy admin's password"
-          return 1
-        fi
-      done
-    fi
-    for form in "${user_forms[@]}"; do
-      [[ -n "${form}" ]] || continue
-      if [[ "${value}" == *"://${form}:"* || "${value}" == *"://${form}@"* ]] \
-        || [[ "${lower_value}" =~ (^|[[:space:]\'\"])user[[:space:]]*=[[:space:]]*[\'\"]?"${form,,}"([[:space:]\'\"]|$) ]]; then
-        ENV_REFUSAL_REASON="the value names the deploy admin role as a connection user"
-        return 1
-      fi
-    done
-  fi
-  return 0
-}
 
 ENV_REFUSED_KEYS=()
+declare -A ENV_PRESERVED_EFFECTIVE=()
+env_key_is_security_control() {
+  local k
+  for k in "${ENV_PRESERVE_SECURITY_KEYS[@]}"; do
+    [[ "${k}" == "$1" ]] && return 0
+  done
+  return 1
+}
 render_preserved_env_keys() {
-  local rendered="$1" key line i j shape
+  local rendered="$1" key line i j
   local -A owned=()
   local -a kept=()
   ENV_KEPT_KEYS=()
   ENV_REFUSED_KEYS=()
+  ENV_PRESERVED_EFFECTIVE=()
   ENV_PRESERVED_BLOCK=""
   while IFS= read -r line; do
     [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] && owned["${BASH_REMATCH[1]}"]=1
@@ -9334,25 +9429,18 @@ render_preserved_env_keys() {
       error "${APP_DIR}/.env defines ${key}. That file belongs to the application account and must never hold the deploy admin credential, so it is not carried into the new file; move it to ${DB_ADMIN_CREDENTIAL_FILE}."
       return 1
     fi
-    # (1) named on the list of settings a re-run carries; (2) a value of the shape that setting can have; (3) no
-    # admin material, no escape deeper than the screen looks. Anything else is dropped and reported.
-    shape="${ENV_PRESERVE_SHAPES[${key}]-}"
-    if [[ -z "${shape}" ]]; then
-      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): not on the list of settings a re-run carries over")
-      continue
-    fi
-    if ! env_value_has_shape "${shape}" "${EXISTING_ENV[${key}]}"; then
-      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): the value does not have the shape of a ${shape} setting")
-      continue
-    fi
-    if env_value_has_residual_escape "${EXISTING_ENV[${key}]}"; then
-      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): the value still contains a percent-escape after the decode passes")
-      continue
-    fi
-    if ! env_key_carry_check "${key}" "${EXISTING_ENV[${key}]}"; then
+    # (1) named on the list of settings a re-run carries; (2) a value (as the loader reads it) of the shape that setting
+    # can have; (3) no admin material, no escape deeper than the screen looks. Anything else is dropped and reported -- except
+    # a security setting, which the up-front gate has already refused the run over, so reaching here with one is a defect.
+    if ! env_preserve_decision "${key}" "${EXISTING_ENV[${key}]}"; then
+      if env_key_is_security_control "${key}"; then
+        error "${key} ${ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE}"
+        return 1
+      fi
       ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): ${ENV_REFUSAL_REASON}")
       continue
     fi
+    ENV_PRESERVED_EFFECTIVE["${key}"]="${ENV_PRESERVE_VALUE}"
     kept+=("${key}")
   done
   ((${#kept[@]} == 0)) && return 0
@@ -9367,8 +9455,10 @@ render_preserved_env_keys() {
     ENV_KEPT_KEYS[j + 1]="${key}"
   done
   ENV_PRESERVED_BLOCK=$'\n# Kept from the previous .env by install.sh (not set by the installer)\n'
+  local canonical
   for key in "${ENV_KEPT_KEYS[@]}"; do
-    ENV_PRESERVED_BLOCK+="${key}=${EXISTING_ENV[${key}]}"$'\n'
+    env_canonical_value "${ENV_PRESERVED_EFFECTIVE[${key}]}" canonical
+    ENV_PRESERVED_BLOCK+="${key}=${canonical}"$'\n'
   done
 }
 
