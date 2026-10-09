@@ -173,9 +173,9 @@ test('re-run: export/spaced forms and multi-line quoted values are read whole; a
       'A=1',
       'export B=2',
       'C = 3',
-      'KEY="-----BEGIN PRIVATE KEY-----',
+      'KEY="BEGIN-OF-VALUE',
       'line two with = and #',
-      '-----END PRIVATE KEY-----"',
+      'END-OF-VALUE"',
       "SQ='one",
       "two'",
       'D="a \\"quoted\\" word"',
@@ -191,8 +191,8 @@ test('re-run: export/spaced forms and multi-line quoted values are read whole; a
     assert.match(r.out, /UNCLASSIFIED=10 11\b/, 'the prose line (10) and the quoted value that never closes (11) are the only unclassified lines')
     assert.match(r.out, /^B\|2\|line 2$/m, '`export KEY=v` is read as KEY=v')
     assert.match(r.out, /^C\| 3\|line 3$/m, '`KEY = v` is read as KEY with that value')
-    assert.match(r.out, /^KEY\|"-----BEGIN PRIVATE KEY-----$/m, 'a multi-line quoted value starts at its first line...')
-    assert.match(r.out, /^-----END PRIVATE KEY-----"\|line 4$/m, '...and ends with its closing line (one value; the middle lines are not keys of their own)')
+    assert.match(r.out, /^KEY\|"BEGIN-OF-VALUE$/m, 'a multi-line quoted value starts at its first line...')
+    assert.match(r.out, /^END-OF-VALUE"\|line 4$/m, '...and ends with its closing line (one value; the middle lines are not keys of their own)')
     assert.match(r.out, /^D\|"a \\"quoted\\" word"\|line 9$/m, 'an escaped quote does not close a double-quoted value')
     assert.match(r.out, /^F\|6\|line 12$/m, 'and reading resumes after an unclosed value')
     // The caller refuses the rewrite before anything has changed.
@@ -216,10 +216,10 @@ test('re-run: export/spaced forms and multi-line quoted values are read whole; a
 test('re-run: a multi-line value is carried across whole', async () => {
   await withTempDir('ims-env-mlc-', async (dir) => {
     const old = join(dir, '.env')
-    writeFileSync(old, 'APP_PORT=3000\nCERT_PEM="-----BEGIN\nMIIB=\n-----END"\nTAIL=1\n')
+    writeFileSync(old, 'APP_PORT=3000\nCERT_PEM="first\nsecond=\nthird"\nTAIL=1\n')
     const r = bash([LIB, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"'].join('\n'))
     console.log(`  multi-line carried: ${JSON.stringify(r.out.slice(-80))}`)
-    assert.match(r.out, /CERT_PEM="-----BEGIN\nMIIB=\n-----END"\nTAIL=1\n>>/)
+    assert.match(r.out, /CERT_PEM="first\nsecond=\nthird"\nTAIL=1\n>>/)
   })
 })
 
