@@ -5,6 +5,7 @@ import {
   resolveMintsoftAuthMode,
   type MintsoftAuthMode,
 } from '@/lib/connectors/mintsoft/settings/schema'
+import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { withMintsoftAuthLock } from '@/lib/connectors/mintsoft/api/auth-lock'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
@@ -20,6 +21,7 @@ const AUTH_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
 const AUTH_TOKEN_REFRESH_BUFFER_MS = 15 * 60 * 1000
 
 let mintsoftAuthRefreshInFlight: Promise<string> | null = null
+
 
 function normalizeSignatureValue(signature: string): string {
   return signature.trim().replace(/^sha256=/i, '')
@@ -314,6 +316,27 @@ export async function isMintsoftFixedKeyMode(): Promise<boolean> {
   return config.authMode === 'api_key'
 }
 
+/**
+ * Whether a scheduled poll can authenticate WITHOUT logging in: a fixed key, a fresh stored key, or a stored key
+ * with no credentials to renew it. Mirrors getMintsoftAccessToken's branches and has none of its side effects.
+ */
+export async function getMintsoftPollAuthStatus(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const [connection, config, storedToken] = await Promise.all([
+    getMintsoftConnectionRecord(),
+    getMintsoftApiConfiguration(),
+    getSettingValue(MINTSOFT_AUTH_TOKEN_KEY),
+  ])
+  if (!config.baseUrl) return { ok: false, reason: 'Mintsoft connection is not configured' }
+  if (config.authMode === 'api_key') {
+    return config.staticApiKey ? { ok: true } : { ok: false, reason: 'Mintsoft is set to a fixed API key but no key is configured' }
+  }
+  if (isMintsoftAuthTokenFresh(storedToken, connection?.tokenExpiresAt ?? null)) return { ok: true }
+  if (!(config.username && config.password)) {
+    return storedToken ? { ok: true } : { ok: false, reason: 'Mintsoft username and password are not configured' }
+  }
+  return { ok: false, reason: MINTSOFT_POLL_NEEDS_KEY_TEXT }
+}
+
 export async function invalidateMintsoftAccessToken(): Promise<void> {
   mintsoftAuthRefreshInFlight = null
 
@@ -371,6 +394,9 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
     if (storedToken) return storedToken
     throw new Error('Mintsoft username and password are not configured')
   }
+
+  // Never a login from a scheduled poll (see withMintsoftNoLogin). Checked before the single-flight login below.
+  if (isMintsoftLoginForbidden()) throw new Error(MINTSOFT_POLL_NEEDS_KEY_TEXT)
 
   if (!mintsoftAuthRefreshInFlight) {
     const tracked = withMintsoftAuthLock('credentials-refresh', async ({ assertHeld }) => {
