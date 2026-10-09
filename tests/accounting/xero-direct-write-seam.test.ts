@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
 
 /**
@@ -83,4 +84,18 @@ test('LOST EVIDENCE IS NEVER A THROWN ACTION: a failed shadow record still retur
     assert.ok(answer)
     assert.equal(upserts.length, 1, 'PRECONDITION: the record was attempted and failed')
   } finally { console.error = originalError; failUpserts = false }
+})
+
+test('STRUCTURAL: generateMissingXeroTaxRates returns the refusal BEFORE it fetches rates or calls putXeroTaxRate (the census proves the call is there and ordered; this proves its answer is acted on)', () => {
+  const source = readFileSync('app/actions/settings.ts', 'utf8')
+  const start = source.indexOf('export async function generateMissingXeroTaxRates')
+  assert.ok(start > 0, 'PRECONDITION: the action was found')
+  const body = source.slice(start, source.indexOf('\n}\n', start))
+  const ask = body.indexOf('xeroTaxRateWriteShadow(')
+  const refuse = body.indexOf('if (shadow) return')
+  const fetch = body.indexOf('getXeroTaxRates()')
+  const write = body.indexOf('putXeroTaxRate(')
+  console.log(`# action offsets: ask=${ask} refuse=${refuse} fetch=${fetch} write=${write}`)
+  assert.ok(ask > 0 && refuse > ask && fetch > refuse && write > refuse, 'ask, then refuse, then fetch and write')
+  assert.match(body.slice(refuse, refuse + 200), /error: shadow\.notice/, 'the refusal carries the single-sourced notice')
 })

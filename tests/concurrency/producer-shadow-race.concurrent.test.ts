@@ -62,7 +62,7 @@ test('[producer hold] two producers of the same shadowed posting: one CANCELLED 
   } as const
   let firstDone!: (pid: number) => void
   const firstHasWritten = new Promise<number>((resolve) => { firstDone = resolve })
-  let parkedSeen: { pid: number; observedAfterMs: number } | null = null
+  let parkedSeen = null as { pid: number; observedAfterMs: number } | null
   let firstReleasedAt = 0
   let secondDoneAt = 0
   let secondResult: Awaited<ReturnType<typeof createAccountingSyncLogRow>> | null = null
@@ -108,7 +108,7 @@ test('[producer hold] two producers of the same work digest on the shadow store 
 
   let firstDone!: (pid: number) => void
   const firstHasInserted = new Promise<number>((resolve) => { firstDone = resolve })
-  let parkedSeen: { pid: number; observedAfterMs: number } | null = null
+  let parkedSeen = null as { pid: number; observedAfterMs: number } | null
   let firstResult: Awaited<ReturnType<typeof recordOutboundShadow>> | null = null
   let secondResult: Awaited<ReturnType<typeof recordOutboundShadow>> | null = null
 

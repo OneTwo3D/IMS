@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { ledgerStanding, isShadowedObligation } from '@/lib/domain/accounting/ledger-standing'
+import { ledgerStanding, isShadowedObligation, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
+import { classifyPriorAttempts } from '@/lib/domain/accounting/prior-posting-evidence'
 import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
 import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
 
@@ -191,4 +192,15 @@ test('a shadow does not clear an outstanding refusal (it is not a posting): no r
     await createAccountingSyncLogRow(client as never, row() as never)
     assert.equal(refusalWrites, 0)
   })
+})
+
+test('A SHADOW NEVER BLOCKS THE LIVE POSTING THAT FOLLOWS IT: the prior-attempt verdict over a shadow row is "none", so a later LIVE enqueue for the same key is queued, not suppressed as already-queued', () => {
+  const shadow = { id: 'row-shadow', status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true, settlementBasis: 'HELD_SHADOW' }
+  assert.equal(workSlotStanding(shadow).slot, 'FREE', 'PRECONDITION: a shadow does not occupy the work slot')
+  assert.deepEqual(classifyPriorAttempts([shadow]), { kind: 'none' })
+  // The control: the same row WITHOUT the basis is an orphan-sweep cancellation and also frees the key, and a real queued row does not.
+  assert.deepEqual(classifyPriorAttempts([{ ...shadow, settlementBasis: null }]), { kind: 'none' })
+  assert.equal(classifyPriorAttempts([{ ...shadow, status: 'PENDING', settlementBasis: null, abandonedBeforeRemoteCall: null }]).kind, 'live')
+  // A shadow beside a queued row changes nothing about the queued row's verdict.
+  assert.equal(classifyPriorAttempts([shadow, { id: 'row-live', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null }]).kind, 'live')
 })

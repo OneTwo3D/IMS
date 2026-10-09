@@ -390,12 +390,14 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
   const queuedAnswers = [...body.matchAll(/return answer\(\{ queued: true[^}]*\}, ([^)]*)\)/g)]
   assert.equal(
     queuedAnswers.length,
-    4,
-    'the idempotency hit, the create, the unique-key collision and (o3d-j625 r7) a posting marked handled '
-    + 'by hand, found by the row-creating primitive under its lock, are the four queued exits',
+    5,
+    'the idempotency hit, the create, the unique-key collision, (o3d-j625 r7) a posting marked handled '
+    + 'by hand, found by the row-creating primitive under its lock, and a SHADOW the producer-side hold recorded instead of '
+    + 'queuing (reason shadowed) are the five queued exits',
   )
   // o3d-j625 r7: the handled-by-hand exit writes nothing either, and says so.
   assert.equal(queuedAnswers.filter((answer) => answer[0].includes("reason: 'handled-by-hand'")).length, 1)
+  assert.equal(queuedAnswers.filter((answer) => answer[0].includes("reason: 'shadowed'")).length, 1, 'and exactly one exit is the shadow')
   /**
    * o3d-j625 r18 (Codex round 17, HIGH 1) — AND THE FIFTH SUPPRESSION EXIT IS NOT A QUEUED ONE.
    *

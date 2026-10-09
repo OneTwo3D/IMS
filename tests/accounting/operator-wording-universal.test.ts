@@ -81,6 +81,8 @@ const PROVEN_ROWS: Array<[string, LedgerStandingRow, RegExp, { couldHaveReachedL
   ['RECORDED_PRE_CALL', row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true } as never), /never sent|before the remote call|before any request was made/i, {}],
   ['VERIFIED_REVERSAL', row({ status: 'CANCELLED', settlementBasis: 'VERIFIED_REVERSAL' } as never), /verified reversed|never made/i, {}],
   ['REJECTED_BEFORE_POSTING', row({ status: 'FAILED', errorMessage: 'missing field' } as never), /before posting|before any request/i, { couldHaveReachedLedger: false }],
+  // The shadow may say what IMS did (it did not send it) and nothing about the destination; the checker holds every other clause to that.
+  ['HELD_SHADOW', row({ status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true } as never), /did not send it|shadow/i, {}],
 ]
 for (const [cause, provenRow, allowed, opts] of PROVEN_ROWS) {
   assert.equal(ledgerStanding(provenRow, opts), 'PROVEN_NOT_POSTED', `precondition: ${cause} row is proven`)
