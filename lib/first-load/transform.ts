@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { parseCsv } from '@/lib/csv'
 import { parseCsvStrict, serializeCsv } from './csv'
-import type { CanonRow, IngestedDataset } from './ingest'
+import { PART_LINE_STRIDE, type CanonRow, type IngestedDataset } from './ingest'
 import { D, fmt, fmtFixed, parseDecimal, roundTo, sum, type Dec } from './money'
 import {
   APPLY_TIME_CHECKS,
@@ -142,6 +142,8 @@ export interface PrepareReport {
     hadBom: boolean
     blankRows: number
     recordsRead: number
+    rowsSkipped: number
+    parts: Array<{ file: string; sha256: string; bytes: number }>
     unmappedHeaders: string[]
   }>
   notSupplied: DatasetName[]
@@ -915,6 +917,26 @@ function loadStock(run: Run): void {
       run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'DUPLICATE_LOT_ROW', `${list.length} lot rows with the same SKU, warehouse, quantity and cost, and at least one has no lot reference to tell it apart; they could be one lot exported twice (stock would be doubled) or genuinely separate lots. Add a lot reference column to the export`)
     }
   }
+  // Rows of one SKU and warehouse that arrive from MORE THAN ONE input file are never added together unless every one of them carries its own
+  // non-blank lot reference: without that, the same stock could be in both files (a re-export, a second layout) and would be counted twice.
+  // (An input file's part number is the multiple of 1,000,000 in its line numbers: see PART_LINE_STRIDE.)
+  const byGroup = new Map<string, Lot[]>()
+  for (const lot of lots) if (!refused.has(lot)) byGroup.set(stockGroupKey(lot.key, lot.warehouse), [...(byGroup.get(stockGroupKey(lot.key, lot.warehouse)) ?? []), lot])
+  for (const list of byGroup.values()) {
+    if (list.length < 2) continue
+    const partsSeen = new Set(list.map((lot) => Math.floor(lot.row.line / PART_LINE_STRIDE)))
+    // A row of a wide report has a fractional line number (L.0B): such a report states ONE balance per SKU and warehouse, so a second row for
+    // the same SKU and warehouse (two source spellings of one SKU, the loader's own normalisation catching what the reader's did not) is a repeat.
+    const wideRows = list.some((lot) => !Number.isInteger(lot.row.line))
+    if (partsSeen.size < 2 && !wideRows) continue
+    const tokens = list.map((lot) => idToken(lot.lotRef))
+    if (tokens.every((token) => token !== '') && new Set(tokens).size === tokens.length) continue
+    for (const lot of list) {
+      refused.add(lot)
+      if (partsSeen.size >= 2) run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'STOCK_FROM_SEVERAL_FILES', `${lot.sku} in ${lot.warehouse} is stocked by rows from ${partsSeen.size} different input files and they do not all carry their own lot reference; they could be the same stock exported twice, so they are not added together. Give each lot a reference or supply the stock in one file`)
+      else run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'REPEATED_WIDE_STOCK_ROW', `${list.length} rows of a one-row-per-SKU report state ${lot.sku} in ${lot.warehouse} (two spellings of one SKU?) and they have no lot references to tell them apart; they are not added together. Fix the source`)
+    }
+  }
   const groups = new Map<string, Lot[]>()
   for (const lot of lots) if (!refused.has(lot)) groups.set(stockGroupKey(lot.key, lot.warehouse), [...(groups.get(stockGroupKey(lot.key, lot.warehouse)) ?? []), lot])
   for (const [gk, list] of [...groups.entries()]) {
@@ -1585,6 +1607,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     for (const rejection of dataset.rejected) {
       run.add(name, rejection.line, `line ${rejection.line}`, 'REJECTED', rejection.code, rejection.reason)
     }
+    for (const replaced of dataset.superseded) run.add(name, replaced.line, replaced.key, 'EXCLUDED', 'SUPERSEDED_BY_LATER_FILE', replaced.reason)
   }
 
   loadExclusions(run)
@@ -1678,7 +1701,7 @@ export function prepare(input: PrepareInput): PrepareResult {
       .filter((name) => input.datasets[name])
       .map((name) => {
         const d = input.datasets[name]!
-        return { dataset: name, file: d.file, sha256: d.sha256, bytes: d.bytes, hadBom: d.hadBom, blankRows: d.blankRows, recordsRead: d.recordsRead, unmappedHeaders: d.unmappedHeaders }
+        return { dataset: name, file: d.file, sha256: d.sha256, bytes: d.bytes, hadBom: d.hadBom, blankRows: d.blankRows, recordsRead: d.recordsRead, rowsSkipped: Object.values(d.rowsSkipped).reduce((a, b) => a + b, 0), parts: d.parts, unmappedHeaders: d.unmappedHeaders }
       }),
     notSupplied,
     checks,
