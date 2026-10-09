@@ -5,6 +5,9 @@ import {
   decideCreateClaim,
   mayDisposeCreateClaim,
   orderTotalDriftPence,
+  buildPushInput,
+  MAX_ADVISORY_PENCE,
+  payloadTotalMismatchPence,
   runWmsOrderPushSweepCore,
   shouldGrantCreateClaim,
   type WmsOrderPushPort,
@@ -15,6 +18,7 @@ import {
   type WmsPushRevalidateLink,
   type WmsPushVerifyLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
+import { reconcilePushTotals } from '../lib/domain/wms/push-total-guard.ts'
 import type { WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
@@ -286,6 +290,42 @@ test('create: a payload check that cannot evaluate never disturbs the SYNCED lin
   assert.equal(upserts.length, 1)
   assert.equal(upserts[0].create.state, 'SYNCED')
   assert.equal(upserts[0].create.totalMismatchPence, null)
+})
+
+test('create: an advisory drift beyond the 32-bit column is clamped BEFORE the link write; link stays SYNCED with its external id', async () => {
+  // VAT-inclusive, gross order-level discount, scaled so the payload is 24,000,000.00 out (2.4e9 minor units > Int max).
+  const order = candidate({
+    subtotalForeign: 1_200_000_000, taxForeign: 216_000_000, discountAmount: 144_000_000, taxRatePercent: 0.2,
+    pricesIncludeVat: true, totalForeign: 1_296_000_000,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 240_000_000, totalForeign: 1_200_000_000, description: 'Widget' }],
+  })
+  assert.equal(orderTotalDriftPence(order), 0, 'precondition: the order-components check is silent')
+  const unclamped = reconcilePushTotals({
+    currency: 'GBP', orderTotal: order.totalForeign as number,
+    payload: buildPushInput(order, '301'), pricesIncludeVat: true,
+  })
+  console.log(`# precondition: unclamped drift=${unclamped.driftMinorUnits} int max=${MAX_ADVISORY_PENCE}`)
+  assert.ok(unclamped.driftMinorUnits > MAX_ADVISORY_PENCE)
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+  assert.equal(upserts[0].create.totalMismatchPence, MAX_ADVISORY_PENCE)
+  assert.equal(upserts[0].update.totalMismatchPence, MAX_ADVISORY_PENCE)
+  assert.equal(payloadTotalMismatchPence(order, buildPushInput(order, '301')), MAX_ADVISORY_PENCE)
+})
+
+test('create: the order-components drift is clamped to the column too', async () => {
+  const order = candidate({ subtotalForeign: 10, taxForeign: 0, totalForeign: 30_000_000, lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }] })
+  const raw = orderTotalDriftPence(order)
+  console.log(`# precondition: raw component drift=${raw}`)
+  assert.ok(raw > MAX_ADVISORY_PENCE)
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.totalMismatchPence, MAX_ADVISORY_PENCE)
 })
 
 test('create: a normal (no-fallback) push posts no courier comment', async () => {

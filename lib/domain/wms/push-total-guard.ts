@@ -19,8 +19,9 @@ import { currencyMinorUnits, roundMoney, roundQuantity, toDecimal, type Decimal,
  *
  * TOLERANCE follows the plugin's `_drift_bound`: WooCommerce stores each line/shipping/fee amount rounded
  * to the minor unit but computes the order total from unrounded figures, so the rounding of independent
- * amounts ACCUMULATES. Every stored amount may sit half a minor unit from the truth: net and VAT of each
- * line, the shipping and discount figures, plus the order total itself. The bound is that sum, capped at
+ * amounts ACCUMULATES. Every stored amount that appears in the comparison may sit half a minor unit from
+ * the truth: the net of each line, the shipping and discount ex-VAT figures, the VAT total and the order
+ * total (plus net and VAT of any refunded line). VAT amounts that are NOT in the comparison add no slack. The bound is that sum, capped at
  * MAX_ROUNDING_BOUND_MINOR_UNITS (the plugin's observed worst real case, 13p). A guard that flagged
  * ordinary rounding would train operators to ignore it, so a drift inside the bound is WITHIN_ROUNDING and
  * is not surfaced.
@@ -39,6 +40,8 @@ export type PushTotalsInput = {
   orderTotal: DecimalInput
   /** Gross value of line quantity deliberately left OUT of the payload (refunded units). */
   withheldGoodsGross?: DecimalInput
+  /** How many lines contribute to withheldGoodsGross (each adds a stored net and a stored VAT to the expected side). */
+  withheldLineCount?: number
   /** The figures as the payload builder produced them. */
   payload: {
     lines: Array<{ quantity: number; unitPriceExVat: number; unitPriceVat: number }>
@@ -105,13 +108,17 @@ export function reconcilePushTotals(input: PushTotalsInput): PushTotalsVerdict {
   const itemisedVat = goodsVat.add(shippingVat).sub(discountVat)
   const vatItemisationGap = totalVat.sub(itemisedVat)
 
-  // Independently rounded operands: net and VAT per line, each of shipping and discount that is present
-  // (net and VAT), and the order total itself.
+  // Independently rounded amounts that APPEAR IN THE COMPARISON, and only those: the net of each pushed
+  // line, the shipping and discount ex-VAT figures when present, the VAT total (one aggregate figure; the
+  // per-line and shipping/discount VAT amounts are not part of pushedGross), the order total, and the net
+  // and VAT of each line whose refunded units are subtracted from the expected side.
   const operands =
-    payload.lines.length * 2
-    + (shippingExVat.isZero() && shippingVat.isZero() ? 0 : 2)
-    + (discountExVat.isZero() && discountVat.isZero() ? 0 : 2)
-    + 1
+    payload.lines.length
+    + (shippingExVat.isZero() ? 0 : 1)
+    + (discountExVat.isZero() ? 0 : 1)
+    + 1 // totalVat
+    + 1 // order total
+    + 2 * (input.withheldLineCount ?? 0)
   const bound = roundingBoundMinorUnits(operands)
   const driftMinor = drift.abs().div(unit)
 
@@ -178,4 +185,12 @@ export function withheldGoodsGross(
     sum = sum.add(withheldQty.div(orderedQty).mul(toDecimal(line.totalForeign as DecimalInput).add(toDecimal(line.taxForeign as DecimalInput))))
   }
   return sum
+}
+
+/** Number of lines whose refunded units are subtracted by withheldGoodsGross. */
+export function withheldLineCount(
+  lines: Array<{ id?: string }>,
+  refundedByLine: Map<string, number> | undefined,
+): number {
+  return lines.filter((line) => ((line.id && refundedByLine?.get(line.id)) || 0) > 0).length
 }

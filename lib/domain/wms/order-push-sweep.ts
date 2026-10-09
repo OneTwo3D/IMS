@@ -2,7 +2,7 @@ import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-cons
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { reconcilePushTotals, withheldGoodsGross } from './push-total-guard'
+import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
@@ -407,18 +407,25 @@ const TOTAL_DRIFT_TOLERANCE_PENCE = 1
  * generic handler and put the link back in the create queue: a re-create of an order that already exists.
  * It therefore never throws; a failure to evaluate is logged and reads as "no finding".
  */
+/** The push-link column is a 32-bit Int. An advisory figure must never be the reason the link write fails. */
+export const MAX_ADVISORY_PENCE = 2_147_483_647
+export function clampAdvisoryPence(value: number): number {
+  return Number.isFinite(value) ? Math.min(MAX_ADVISORY_PENCE, Math.max(0, Math.trunc(value))) : MAX_ADVISORY_PENCE
+}
+
 export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPushInput): number | null {
   try {
     const verdict = reconcilePushTotals({
       currency: order.currency,
       orderTotal: order.totalForeign as Parameters<typeof reconcilePushTotals>[0]['orderTotal'],
       withheldGoodsGross: withheldGoodsGross(order.lines, refundedQtyByLine(order)),
+      withheldLineCount: withheldLineCount(order.lines, refundedQtyByLine(order)),
       payload: input,
       pricesIncludeVat: order.pricesIncludeVat,
     })
     if (verdict.status !== 'MISMATCH') return null
     console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} payload total mismatch (${verdict.cause}): ${verdict.reason}`)
-    return Math.max(1, verdict.driftMinorUnits)
+    return clampAdvisoryPence(Math.max(1, verdict.driftMinorUnits))
   } catch (error) {
     console.error(`[wms-order-push] payload total check could not run for ${order.orderNumber ?? order.id}: ${scrubWmsError(error, 'check failed')}`)
     return null
@@ -1631,7 +1638,7 @@ export async function runWmsOrderPushSweepCore(
         // Penny-precision guard (G6): record (never block) when the order's own totals
         // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
         const driftPence = orderTotalDriftPence(order)
-        const totalMismatchPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? driftPence : payloadTotalMismatchPence(order, input)
+        const totalMismatchPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? clampAdvisoryPence(driftPence) : payloadTotalMismatchPence(order, input)
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: ${totalMismatchPence}p drift vs derived total (pushed, flagged for review)`)
         }
