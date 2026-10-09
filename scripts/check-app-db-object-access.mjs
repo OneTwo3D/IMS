@@ -487,7 +487,7 @@ export function isMainModule({
   }
   if (url === pathToFileURL(resolved).href) return true
   if (required || basename(entry) === basename(here)) {
-    say(`${basename(here)}: it was started as ${JSON.stringify(entry)}, which resolves to ${JSON.stringify(resolved)}, not to this file. Refusing to continue rather than run nothing and exit 0. Exit ${EXIT_ENTRY_UNVERIFIED}.`)
+    say(`${basename(here)}: it was started as ${JSON.stringify(entry)}, which resolves to ${JSON.stringify(resolved)}, not to this file (${JSON.stringify(here)}). Refusing to continue rather than run nothing and exit 0. Exit ${EXIT_ENTRY_UNVERIFIED}.`)
     return exit(EXIT_ENTRY_UNVERIFIED)
   }
   return false

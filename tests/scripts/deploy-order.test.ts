@@ -10263,7 +10263,13 @@ function auditingHelper(dir: string, fixtureFile: string): string {
   const shipped = `file://${join(process.cwd(), 'scripts', 'fence-db-connections.mjs')}`
   return [
     "import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'",
-    `import { doAuditAuthority } from ${JSON.stringify(shipped)}`,
+    // This stand-in IS the entry point and imports the shipped module as a LIBRARY. The shipped module's
+    // entry guard fails closed on a doubtful entry path (an entry named like it that resolves elsewhere),
+    // so the stand-in says what it is for the length of the import.
+    'const standInEntry = process.argv[1]',
+    'process.argv[1] = process.execPath',
+    `const { doAuditAuthority } = await import(${JSON.stringify(shipped)})`,
+    'process.argv[1] = standInEntry',
     `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
     'const arg = (name) => {',
     '  const hit = process.argv.find((a) => a.startsWith(`--${name}=`))',
