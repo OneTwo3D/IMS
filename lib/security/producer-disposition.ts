@@ -152,7 +152,7 @@ function evaluate<D extends OutboundConnector>(
   const now: unknown = suppliedNow === undefined ? new DateCtor() : suppliedNow
   const row = ownershipRowFor(destination, operation)
   const unreadableBase = { owner: 'unknown' as WriterOwner, phase: 'P1' as const, cutoff: null, grant: 'unreadable' as const }
-  if (destination !== 'xero' && destination !== 'mintsoft' && destination !== 'woocommerce') return shadow('unreadable', unreadableBase)
+  if (!hasOwn.call(OUTBOUND_GRANT_ENV, destination)) return shadow('unreadable', unreadableBase)
   const env = ownEnvironment(suppliedEnv === undefined ? process.env : (suppliedEnv as object), destination)
 
   const p1Owner = row?.owners.P1 ?? 'unknown'
