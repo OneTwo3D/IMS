@@ -51,6 +51,11 @@ import {
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
+import {
+  listKeptBundleClaims,
+  resolveKeptBundleClaim,
+  type KeptBundleClaim,
+} from '@/lib/connectors/mintsoft/sync/bundle-claim-resolution'
 import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
 import { parseDefaultCourierId } from '@/lib/connectors/mintsoft/api/order-push'
 import {
@@ -423,6 +428,8 @@ export type MintsoftDashboardData = {
   recentStockSyncJobs: MintsoftSyncJobRow[]
   openDiscrepancies: MintsoftDiscrepancyRow[]
   bundleLinks: MintsoftBundleLinkRow[]
+  /** Bundle creates that may have reached Mintsoft and are waiting for an operator (see bundle-create-outcome.ts). */
+  keptBundleClaims: KeptBundleClaim[]
   returnsInbox: MintsoftReturnsInboxRow[]
   receiptReviewEvents: MintsoftReceiptReviewEventRow[]
   receiptReviewEventCount: number
@@ -1319,6 +1326,7 @@ async function getMintsoftExternalWarehouses(
 
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
+  const keptBundleClaims = await listKeptBundleClaims()
 
   const receiptReviewWhere = {
     connector: 'mintsoft',
@@ -1577,6 +1585,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       checksum: link.checksum,
       lastSyncedAt: link.lastSyncedAt?.toISOString() ?? null,
     })),
+    keptBundleClaims,
     returnsInbox: returnsInbox.map(mapMintsoftReturnsInboxRow),
     receiptReviewEvents: receiptReviewEvents.map(mapMintsoftReceiptReviewEvent),
     receiptReviewEventCount,
@@ -2578,6 +2587,29 @@ export async function runMintsoftProductVerifyNow(): Promise<{
     jobId: result.jobId,
     message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors.`,
   }
+}
+
+/**
+ * Resolve a bundle create that may have reached Mintsoft (see lib/connectors/mintsoft/sync/bundle-create-outcome.ts).
+ * `link` binds the claim to a bundle the operator found in Mintsoft; `absent` is the operator's statement that
+ * none exists, which IMS cannot check.
+ */
+export async function resolveMintsoftKeptBundleClaim(input: {
+  claimId: string
+  claimValue: string
+  resolution: { kind: 'link'; externalBundleId: string } | { kind: 'absent' }
+}): Promise<{ success: boolean; error?: string; message?: string }> {
+  const session = await requireMintsoftWriteAccess()
+  const result = await resolveKeptBundleClaim({
+    claimId: String(input.claimId ?? ''),
+    claimValue: String(input.claimValue ?? ''),
+    resolution: input.resolution?.kind === 'link'
+      ? { kind: 'link', externalBundleId: String(input.resolution.externalBundleId ?? '') }
+      : { kind: 'absent' },
+    userId: session.user.id,
+  })
+  revalidatePath('/sync')
+  return result.success ? { success: true, message: result.message } : { success: false, error: result.error }
 }
 
 export async function runMintsoftBundleVerifyNow(): Promise<{

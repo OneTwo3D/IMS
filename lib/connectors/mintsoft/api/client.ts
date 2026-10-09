@@ -1,4 +1,5 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
+import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from './auth-no-login'
 import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   readMintsoftAsnItemExpectedQuantity,
@@ -175,6 +176,12 @@ export async function mintsoftRequest<T>(
         ),
         status: 500,
       }
+    }
+
+    // A scheduled poll never renews the key (a login replaces the tenant's key): report the 401 and stop. The stored
+    // key is left alone, so nothing is deleted behind the operator's back.
+    if (isMintsoftLoginForbidden()) {
+      return { ...firstAttempt, error: `${firstAttempt.error ?? 'Mintsoft rejected the API key (401).'} ${MINTSOFT_POLL_NEEDS_KEY_TEXT}` }
     }
 
     await invalidateMintsoftAccessToken()

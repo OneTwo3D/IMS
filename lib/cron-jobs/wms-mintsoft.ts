@@ -47,12 +47,13 @@ registerCronJobs([
     module: 'mintsoft',
     moduleLabel: 'Mintsoft',
     label: 'Mintsoft Despatch Poll',
-    description: 'Poll Mintsoft for despatches of orders IMS has pushed and progress the IMS shipment, tracking and stock. Read-only towards Mintsoft.',
+    description: 'Poll Mintsoft for despatches of orders IMS has pushed and progress the IMS shipment, tracking and stock. Read-only towards Mintsoft: it never logs in, so it needs a fixed API key or an unexpired stored key.',
     defaultSchedule: '*/15 * * * *',
     // On by default, as docs/installation.md has always said. The poll only READS Mintsoft (the order list
-    // and order detail endpoints on the outbound read allow-list), the route does nothing while the Mintsoft
-    // plugin is off, and it has no candidates until IMS has pushed an order, so enabling it cannot create
-    // anything in Mintsoft. Left off, a pushed order never progresses and the read-sync liveness check
+    // and order detail endpoints on the outbound read allow-list) and never logs in (lib/connectors/mintsoft/
+    // sync/dispatch-poll.ts: a login would replace the tenant API key), the route does nothing while the
+    // Mintsoft plugin is off, and it has no candidates until IMS has pushed an order, so enabling it cannot
+    // create anything in Mintsoft. Left off, a pushed order never progresses and the read-sync liveness check
     // reports the despatch poll as off.
     defaultEnabled: true,
   },

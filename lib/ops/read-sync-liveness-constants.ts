@@ -129,7 +129,7 @@ export const READ_SYNC_STREAMS: readonly ReadSyncStreamDef[] = [
     cronSlug: 'mintsoft-dispatch-sync',
     source: { kind: 'sync-job', connector: 'mintsoft', jobType: 'DISPATCH_SYNC' },
     maxAge: { kind: 'fixed', ms: 2 * HOUR_MS },
-    cadence: 'every 15 minutes (the mintsoft-dispatch-sync job; on by default)',
+    cadence: 'every 15 minutes (the mintsoft-dispatch-sync job; on by default). With a fixed API key it always runs; in username and password mode it declines to run once the stored key has expired, because logging in would replace the tenant key for every integration that shares it',
     successMeans: 'the poll finished with job status SUCCEEDED, which excludes a poll that degraded (a failed delta read, unresolved orders, an unreadable withdrawal screen); a poll with nothing to check counts',
     rationale: 'eight missed 15 minute polls, long enough to ride out a short Mintsoft outage and short enough to matter on a day of trading',
     alarm: 'read-sync-liveness',

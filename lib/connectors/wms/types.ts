@@ -236,6 +236,11 @@ export type WmsBundleRef = {
   sku: string
   name: string | null
   components: WmsBundleComponent[]
+  /**
+   * How many component entries the response carried that could not be read and were left out of
+   * `components`. A bundle with any is INCOMPLETE: it must never be compared with IMS or bound.
+   */
+  unreadableComponentCount?: number
   raw: Record<string, unknown> | null
 }
 

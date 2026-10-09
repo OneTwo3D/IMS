@@ -162,3 +162,15 @@ test('buildMintsoftBundleCreateRequest targets PUT /api/Product/Bundle with nume
   assert.equal(body.Components[0].ProductId, 1001)
   assert.equal(body.Components[1].ProductId, undefined)
 })
+
+test('normalizeMintsoftBundle counts the component entries it could not read, so a caller can refuse an incomplete bundle', () => {
+  const complete = normalizers.normalizeMintsoftBundle({ ID: 42, SKU: 'KIT-AA', Components: [{ ProductId: 100, SKU: 'A', Quantity: 2 }] })
+  const withMalformed = normalizers.normalizeMintsoftBundle({
+    ID: 42, SKU: 'KIT-AA',
+    Components: [{ ProductId: 100, SKU: 'A', Quantity: 2 }, { ProductId: 7, SKU: '', Quantity: 'many' }, { SKU: 'B', Quantity: 0 }],
+  })
+  console.log(`precondition: complete=${complete?.unreadableComponentCount} malformed=${withMalformed?.unreadableComponentCount} readable=${withMalformed?.components.length}`)
+  assert.equal(complete?.unreadableComponentCount, 0)
+  assert.equal(withMalformed?.components.length, 1)
+  assert.equal(withMalformed?.unreadableComponentCount, 2)
+})

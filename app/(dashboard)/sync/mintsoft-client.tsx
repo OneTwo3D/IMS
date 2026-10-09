@@ -6,6 +6,7 @@ import { AlertTriangle, Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } fro
 import {
   confirmMintsoftAlignmentMode,
   deleteMintsoftBinding,
+  resolveMintsoftKeptBundleClaim,
   restockMintsoftReturnInboxItem,
   runMintsoftBundleVerifyNow,
   runMintsoftProductVerifyNow,
@@ -18,6 +19,7 @@ import {
   type MintsoftBindingRow,
   type MintsoftDashboardData,
 } from '@/app/actions/mintsoft-sync'
+import { bundleAbsentConfirmationText, BUNDLE_CLAIM_RESOLUTION_PLACE } from '@/lib/connectors/mintsoft/sync/bundle-create-outcome'
 import { ProductLink } from '@/components/inventory/product-link'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { Button } from '@/components/ui/button'
@@ -427,6 +429,23 @@ export function MintsoftClient({ data, configured }: Props) {
     })
   }
 
+  function handleResolveKeptClaim(
+    claim: { id: string; claimValue: string; sku: string },
+    resolution: { kind: 'link'; externalBundleId: string } | { kind: 'absent' },
+  ) {
+    if (resolution.kind === 'absent' && !window.confirm(bundleAbsentConfirmationText(claim.sku))) return
+    setError('')
+    startTransition(async () => {
+      const result = await resolveMintsoftKeptBundleClaim({ claimId: claim.id, claimValue: claim.claimValue, resolution })
+      if (!result.success) {
+        setError(result.error ?? 'Failed to resolve the bundle claim')
+        return
+      }
+      flashSaved(result.message ?? 'Bundle claim resolved')
+      router.refresh()
+    })
+  }
+
   function handleRunReturnsSync() {
     setError('')
     startTransition(async () => {
@@ -785,6 +804,18 @@ export function MintsoftClient({ data, configured }: Props) {
             <code className="rounded bg-muted px-1">BUNDLE_DERIVATION_CONFLICT</code> — Mintsoft has no bundle update API, so changes after the first push must be resolved manually.
           </p>
         </div>
+
+        {data.keptBundleClaims.length > 0 && (
+          <div className="space-y-3 rounded-lg border border-amber-500/50 p-4" data-testid="kept-bundle-claims">
+            <p className="text-sm font-medium">Bundle creates waiting for you ({BUNDLE_CLAIM_RESOLUTION_PLACE})</p>
+            <p className="text-sm text-muted-foreground">
+              A create for each product below may have reached Mintsoft and its outcome is unknown. IMS will not send another until you resolve it. Look for the bundle in Mintsoft first.
+            </p>
+            {data.keptBundleClaims.map((claim) => (
+              <KeptBundleClaimRow key={claim.id} claim={claim} disabled={isPending} onResolve={handleResolveKeptClaim} formatDateTime={formatDateTime} />
+            ))}
+          </div>
+        )}
 
         <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[720px]">
           <TableHeader className="bg-muted/40">
@@ -1315,6 +1346,43 @@ export function MintsoftClient({ data, configured }: Props) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  )
+}
+
+function KeptBundleClaimRow({
+  claim,
+  disabled,
+  onResolve,
+  formatDateTime,
+}: {
+  claim: MintsoftDashboardData['keptBundleClaims'][number]
+  disabled: boolean
+  onResolve: (
+    claim: { id: string; claimValue: string; sku: string },
+    resolution: { kind: 'link'; externalBundleId: string } | { kind: 'absent' },
+  ) => void
+  formatDateTime: (value: string) => string
+}) {
+  const [bundleId, setBundleId] = useState('')
+  return (
+    <div className="flex flex-wrap items-end gap-3 text-sm">
+      <div className="min-w-[14rem]">
+        <ProductLink productId={claim.productId} sku={claim.sku} name={claim.name} />
+        <div className="text-xs text-muted-foreground">Sent {formatDateTime(claim.claimedAt)}</div>
+      </div>
+      <div className="flex items-end gap-2">
+        <div>
+          <Label htmlFor={`bundle-id-${claim.id}`} className="text-xs">Mintsoft bundle ID (if it exists)</Label>
+          <Input id={`bundle-id-${claim.id}`} value={bundleId} onChange={(event) => setBundleId(event.target.value)} className="h-8 w-40" inputMode="numeric" />
+        </div>
+        <Button size="sm" variant="outline" disabled={disabled || !bundleId.trim()} onClick={() => onResolve(claim, { kind: 'link', externalBundleId: bundleId })}>
+          Link to this bundle
+        </Button>
+      </div>
+      <Button size="sm" variant="outline" disabled={disabled} onClick={() => onResolve(claim, { kind: 'absent' })}>
+        I searched Mintsoft: no bundle
+      </Button>
     </div>
   )
 }

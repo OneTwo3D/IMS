@@ -7,14 +7,18 @@ import type { WmsBundleComponent, WmsBundleDto, WmsBundleRef } from '@/lib/conne
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import {
   BUNDLE_CLAIM_LEASE_MS,
+  BUNDLE_CLAIM_PREFIX,
+  buildBundleSentClaimValue,
   bundleCreateMaybeSentText,
+  bundleStuckClaimText,
   classifyBundleCreateFailure,
+  isBundleSentClaimValue,
   type BundleReconciliation,
 } from './bundle-create-outcome'
 
 const BUNDLE_CONCURRENCY = 4
 const CONNECTOR = 'mintsoft' as const
-const BUNDLE_SENTINEL_PREFIX = 'pending:'
+const BUNDLE_SENTINEL_PREFIX = BUNDLE_CLAIM_PREFIX
 const BUNDLE_SENTINEL_STALE_MS = BUNDLE_CLAIM_LEASE_MS
 
 function buildBundleSentinel(): string {
@@ -293,20 +297,22 @@ async function resolveBundleConflict(scopes: BundleSyncScope[], productId: strin
 }
 
 async function claimBundleCreateSlot(productId: string): Promise<
-  | { kind: 'claimed'; linkId: string }
+  | { kind: 'claimed'; linkId: string; claimValue: string }
+  | { kind: 'stuck' }
   | { kind: 'conflict'; reason: string }
 > {
   try {
+    const claimValue = buildBundleSentinel()
     const created = await db.wmsBundleLink.create({
       data: {
         connector: CONNECTOR,
         productId,
-        externalBundleId: buildBundleSentinel(),
+        externalBundleId: claimValue,
         checksum: null,
       },
       select: { id: true },
     })
-    return { kind: 'claimed', linkId: created.id }
+    return { kind: 'claimed', linkId: created.id, claimValue }
   } catch (error) {
     if (!isUniqueConstraintError(error)) throw error
   }
@@ -321,25 +327,42 @@ async function claimBundleCreateSlot(productId: string): Promise<
     return { kind: 'conflict', reason: 'Bundle link already exists; follow the existing-link path.' }
   }
 
+  // A claim whose create may have reached Mintsoft is never taken over by the clock: see bundle-create-outcome.ts.
+  if (isBundleSentClaimValue(existing.externalBundleId)) return { kind: 'stuck' }
+
   const ageMs = Date.now() - existing.updatedAt.getTime()
   if (ageMs < BUNDLE_SENTINEL_STALE_MS) {
     return { kind: 'conflict', reason: 'Bundle sync already in progress for this product.' }
   }
 
+  // An UNSENT claim (its worker stopped before the request was handed over) may be taken over once its lease has expired.
+  const claimValue = buildBundleSentinel()
   const stolen = await db.wmsBundleLink.updateMany({
     where: {
       id: existing.id,
       externalBundleId: existing.externalBundleId,
     },
     data: {
-      externalBundleId: buildBundleSentinel(),
+      externalBundleId: claimValue,
       checksum: null,
     },
   })
   if (stolen.count === 0) {
     return { kind: 'conflict', reason: 'Another worker reclaimed the stale bundle sentinel first.' }
   }
-  return { kind: 'claimed', linkId: existing.id }
+  return { kind: 'claimed', linkId: existing.id, claimValue }
+}
+
+/**
+ * Mark the claim SENT immediately before the create request is handed over. If this cannot be recorded the
+ * request is not sent: an unmarked claim must mean that nothing was sent.
+ */
+async function markBundleClaimSent(claim: { linkId: string; claimValue: string }): Promise<boolean> {
+  const marked = await db.wmsBundleLink.updateMany({
+    where: { id: claim.linkId, externalBundleId: claim.claimValue },
+    data: { externalBundleId: buildBundleSentClaimValue() },
+  })
+  return marked.count === 1
 }
 
 async function releaseBundleCreateSlot(linkId: string): Promise<void> {
@@ -572,6 +595,18 @@ async function syncBundleInternal(
     }
   }
 
+  if (remote && (remote.unreadableComponentCount ?? 0) > 0) {
+    // An INCOMPLETE answer is not a bundle IMS can compare: entries left out could be the ones that differ.
+    return {
+      status: 'ERROR',
+      action: 'conflict',
+      reason: `Mintsoft returned the bundle for ${candidate.sku} with ${remote.unreadableComponentCount} component entr${remote.unreadableComponentCount === 1 ? 'y' : 'ies'} IMS could not read, so it was not compared, linked or created again.`,
+      productId,
+      sku: candidate.sku,
+      checksum,
+    }
+  }
+
   if (remote) {
     const remoteComponents = normalizeRemoteComponents(remote)
 
@@ -680,6 +715,39 @@ async function syncBundleInternal(
     }
   }
 
+  if (claim.kind === 'stuck') {
+    // An earlier create may have reached Mintsoft and the lookup above found no bundle. That proves nothing, and
+    // neither does the time that has passed: keep the claim, send nothing, and put it where an operator resolves it.
+    const stuckText = bundleStuckClaimText(candidate.sku, { kind: 'not-found' })
+    await upsertBundleConflict({
+      scopes: pushScopes,
+      productId,
+      sku: candidate.sku,
+      imsValue: summariseComponents(imsComponents),
+      wmsValue: null,
+      message: stuckText,
+    })
+    return {
+      status: 'CONFLICT',
+      action: 'conflict',
+      reason: stuckText,
+      productId,
+      sku: candidate.sku,
+      checksum,
+    }
+  }
+
+  if (!(await markBundleClaimSent(claim))) {
+    return {
+      status: 'SKIPPED',
+      action: 'noop',
+      reason: 'The bundle claim changed hands before the create was sent; nothing was sent.',
+      productId,
+      sku: candidate.sku,
+      checksum,
+    }
+  }
+
   let created: WmsBundleRef
   try {
     created = await connector.createBundle(dto)
@@ -713,6 +781,8 @@ async function syncBundleInternal(
       found = await connector.fetchBundle?.(wmsProductLink.externalProductId) ?? null
       if (!found) {
         reconciliation = { kind: 'not-found' }
+      } else if ((found.unreadableComponentCount ?? 0) > 0) {
+        reconciliation = { kind: 'incomplete', detail: `${found.unreadableComponentCount} component entr${found.unreadableComponentCount === 1 ? 'y' : 'ies'} could not be read` }
       } else {
         reconciliation = componentsEqual(normalizeRemoteComponents(found), imsComponents) ? { kind: 'bound' } : { kind: 'differs' }
       }
@@ -761,16 +831,17 @@ async function syncBundleInternal(
       after: { sku: candidate.sku, checksum, claimKept: true, lookup: reconciliation.kind },
       error: text,
     })
-    if (reconciliation.kind === 'differs' && found) {
-      await upsertBundleConflict({
-        scopes: pushScopes,
-        productId,
-        sku: candidate.sku,
-        imsValue: summariseComponents(imsComponents),
-        wmsValue: summariseComponents(normalizeRemoteComponents(found)),
-        message: 'Mintsoft bundle composition differs from IMS and cannot be updated via the Mintsoft API.',
-      })
-    }
+    // Surface it where operators resolve bundle problems, with the one sentence that says what to do.
+    await upsertBundleConflict({
+      scopes: pushScopes,
+      productId,
+      sku: candidate.sku,
+      imsValue: summariseComponents(imsComponents),
+      wmsValue: reconciliation.kind === 'differs' && found ? summariseComponents(normalizeRemoteComponents(found)) : null,
+      message: reconciliation.kind === 'differs' && found
+        ? 'Mintsoft bundle composition differs from IMS and cannot be updated via the Mintsoft API.'
+        : text,
+    })
     return {
       status: reconciliation.kind === 'differs' ? 'CONFLICT' : 'ERROR',
       action: 'conflict',

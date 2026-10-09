@@ -116,6 +116,16 @@ test('[docs] no document, and no operator text in the code, still says the despa
   assert.equal(read, files.length)
 })
 
+test('[docs] the guide says the poll never logs in, and the stream and the job description say the same', () => {
+  const guide = readFileSync(join(ROOT, 'docs/installation.md'), 'utf8')
+  const row = guide.split('\n').find((line) => line.includes('`/api/cron/mintsoft-dispatch-sync`'))
+  console.log(`precondition: guide row found=${Boolean(row)}`)
+  assert.ok(row)
+  assert.match(row!, /never logs in/)
+  assert.match(getAllCronJobs().find((job) => job.slug === SLUG)!.description, /never logs in/)
+  assert.match(READ_SYNC_STREAMS.find((def) => def.id === 'mintsoft-dispatch-poll')!.cadence, /fixed API key it always runs/)
+})
+
 test('[liveness] the despatch-poll stream names the job: switched off it reports OFF naming the job, on it is required in the crontab', () => {
   const stream = READ_SYNC_STREAMS.find((def) => def.id === 'mintsoft-dispatch-poll')
   assert.equal(stream?.cronSlug, SLUG)
