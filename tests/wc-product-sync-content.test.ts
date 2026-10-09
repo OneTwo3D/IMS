@@ -429,3 +429,26 @@ test('loop safety: the IMS -> WooCommerce product push carries no content key, f
     assert.equal(content in payload, false, `${content} must never be pushed to WooCommerce`)
   }
 })
+
+test('inbound: a variation that ALREADY exists in IMS (the update branch, not the create branch) gets its content too', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  failVariationsPage = 0
+  const base = { description: null, imageUrl: null, weight: null, depthCm: null, widthCm: null, heightCm: null, barcode: null, lifecycleStatus: 'ACTIVE' }
+  state.products.push({ id: 'ims-parent-1', sku: 'PARENT-SKU', name: 'Old Parent', type: 'VARIABLE', ...base, hsCode: null, countryOfOrigin: null, customsDescription: null })
+  state.products.push({ id: 'ims-var-1', sku: 'VAR-1', name: 'Old Variant', type: 'VARIANT', parentId: 'ims-parent-1', salesPriceBase: 5, ...base })
+  const page = VARIATION_PAGES['1']![0]!
+  page.description = '<p>Existing variant text</p>'
+  page.images = [{ id: 41, src: 'https://shop.example.test/existing.jpg', name: 'e', alt: '' }]
+  try {
+    const result = await syncWcProductToIms(variableProduct())
+    const variantContent = state.contents.find((row) => row.productId === 'ims-var-1')
+    console.log(`precondition: VAR-1 pre-exists as ims-var-1 (update branch); sync ok=${result.success}; variant content=${JSON.stringify(variantContent?.longDescription)}`)
+    assert.equal(result.success, true, `sync should succeed, got: ${result.error}`)
+    assert.equal(state.products.filter((row) => row.sku === 'VAR-1').length, 1, 'the existing row was updated, not duplicated')
+    assert.equal(variantContent?.longDescription, 'Existing variant text')
+  } finally {
+    page.description = ''
+    page.images = []
+  }
+})
