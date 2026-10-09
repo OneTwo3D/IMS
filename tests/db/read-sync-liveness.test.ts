@@ -151,3 +151,32 @@ test('the order-status sweep\'s unresolved-snapshot filters are valid against th
   assert.ok(Number.isInteger(snapshots) && Number.isInteger(orders))
   await db.$disconnect()
 })
+
+test('the guard\'s bounded reads work on a real transaction client, and the server cancels a stalled statement', { skip }, async () => {
+  const db = await getDb()
+  const { withStatementTimeout } = await import('../../lib/ops/read-sync-liveness-alarm')
+  const { SCHEDULER_GUARD_READ_STATEMENT_TIMEOUT_MS } = await import('../../lib/ops/read-sync-scheduler-guard')
+  assert.equal(SCHEDULER_GUARD_READ_STATEMENT_TIMEOUT_MS, 5_000)
+
+  // 1. every read of readReadSyncInputs runs on the transaction client it is handed.
+  const inputs = await withStatementTimeout(db as never, 5_000, async (tx) => {
+    const shown = await (tx as unknown as { $queryRawUnsafe: (sql: string) => Promise<Array<{ statement_timeout: string }>> }).$queryRawUnsafe('SHOW statement_timeout')
+    assert.equal(shown[0]!.statement_timeout, '5s', 'SET LOCAL took effect on this transaction')
+    return readReadSyncInputs({ client: tx, crontab: { resolved: true, text: '' } })
+  })
+  console.log(`precondition: bounded read returned ${inputs.cronJobDefs?.length ?? 0} job defs, plugins=${JSON.stringify(inputs.pluginEnabled)}`)
+  assert.ok((inputs.cronJobDefs?.length ?? 0) > 0)
+
+  // 2. a statement that outlives the bound is cancelled BY THE SERVER, not abandoned by the caller.
+  const startedAt = Date.now()
+  await assert.rejects(
+    withStatementTimeout(db as never, 200, async (tx) => {
+      await (tx as unknown as { $queryRawUnsafe: (sql: string) => Promise<unknown> }).$queryRawUnsafe('SELECT pg_sleep(5)')
+    }),
+    /statement timeout|canceling statement/i,
+  )
+  const elapsed = Date.now() - startedAt
+  console.log(`precondition: pg_sleep(5) cancelled by the server after ${elapsed}ms against a 200ms bound`)
+  assert.ok(elapsed < 3_000)
+  await db.$disconnect()
+})
