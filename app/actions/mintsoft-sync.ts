@@ -55,7 +55,7 @@ import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-s
 import {
   listKeptBundleClaims,
   resolveKeptBundleClaim,
-  type KeptBundleClaim,
+  type KeptBundleClaimPage,
 } from '@/lib/connectors/mintsoft/sync/bundle-claim-resolution'
 import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
 import { parseDefaultCourierId } from '@/lib/connectors/mintsoft/api/order-push'
@@ -430,7 +430,7 @@ export type MintsoftDashboardData = {
   openDiscrepancies: MintsoftDiscrepancyRow[]
   bundleLinks: MintsoftBundleLinkRow[]
   /** Bundle creates that may have reached Mintsoft and are waiting for an operator (see bundle-create-outcome.ts). */
-  keptBundleClaims: KeptBundleClaim[]
+  keptBundleClaims: KeptBundleClaimPage
   returnsInbox: MintsoftReturnsInboxRow[]
   receiptReviewEvents: MintsoftReceiptReviewEventRow[]
   receiptReviewEventCount: number
@@ -2595,6 +2595,12 @@ export async function runMintsoftProductVerifyNow(): Promise<{
  * `link` binds the claim to a bundle the operator found in Mintsoft; `absent` is the operator's statement that
  * none exists, which IMS cannot check.
  */
+/** One page of the kept bundle claims, optionally filtered by SKU, so every claim is reachable. */
+export async function listMintsoftKeptBundleClaims(input: { page?: number; query?: string }): Promise<KeptBundleClaimPage> {
+  await requireMintsoftReadAccess()
+  return listKeptBundleClaims({ page: Number(input?.page) || 0, query: String(input?.query ?? '') })
+}
+
 export async function resolveMintsoftKeptBundleClaim(input: {
   claimId: string
   claimValue: string

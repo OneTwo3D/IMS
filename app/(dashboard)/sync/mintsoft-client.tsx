@@ -6,6 +6,7 @@ import { AlertTriangle, Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } fro
 import {
   confirmMintsoftAlignmentMode,
   deleteMintsoftBinding,
+  listMintsoftKeptBundleClaims,
   resolveMintsoftKeptBundleClaim,
   restockMintsoftReturnInboxItem,
   runMintsoftBundleVerifyNow,
@@ -805,16 +806,8 @@ export function MintsoftClient({ data, configured }: Props) {
           </p>
         </div>
 
-        {data.keptBundleClaims.length > 0 && (
-          <div className="space-y-3 rounded-lg border border-amber-500/50 p-4" data-testid="kept-bundle-claims">
-            <p className="text-sm font-medium">Bundle creates waiting for you ({BUNDLE_CLAIM_RESOLUTION_PLACE})</p>
-            <p className="text-sm text-muted-foreground">
-              A create for each product below may have reached Mintsoft and its outcome is unknown. IMS will not send another until you resolve it. Look for the bundle in Mintsoft first.
-            </p>
-            {data.keptBundleClaims.map((claim) => (
-              <KeptBundleClaimRow key={claim.id} claim={claim} disabled={isPending} onResolve={handleResolveKeptClaim} formatDateTime={formatDateTime} />
-            ))}
-          </div>
+        {(data.keptBundleClaims.total > 0 || data.keptBundleClaims.query) && (
+          <KeptBundleClaimsPanel initial={data.keptBundleClaims} disabled={isPending} onResolve={handleResolveKeptClaim} formatDateTime={formatDateTime} />
         )}
 
         <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[720px]">
@@ -1350,13 +1343,68 @@ export function MintsoftClient({ data, configured }: Props) {
   )
 }
 
+function KeptBundleClaimsPanel({
+  initial,
+  disabled,
+  onResolve,
+  formatDateTime,
+}: {
+  initial: MintsoftDashboardData['keptBundleClaims']
+  disabled: boolean
+  onResolve: (
+    claim: { id: string; claimValue: string; sku: string },
+    resolution: { kind: 'link'; externalBundleId: string } | { kind: 'absent' },
+  ) => void
+  formatDateTime: (value: string) => string
+}) {
+  const [view, setView] = useState(initial)
+  const [query, setQuery] = useState(initial.query)
+  const [loading, startLoading] = useTransition()
+  // A refresh of the page (after a resolution) hands in new data: show it.
+  useEffect(() => { setView(initial) }, [initial])
+
+  function load(page: number, nextQuery: string) {
+    startLoading(async () => {
+      setView(await listMintsoftKeptBundleClaims({ page, query: nextQuery }))
+    })
+  }
+  const pages = Math.max(1, Math.ceil(view.total / view.pageSize))
+
+  return (
+    <div className="space-y-3 rounded-lg border border-amber-500/50 p-4" data-testid="kept-bundle-claims">
+      <p className="text-sm font-medium">Bundle creates waiting for you ({BUNDLE_CLAIM_RESOLUTION_PLACE}): {view.total}</p>
+      <p className="text-sm text-muted-foreground">
+        A create for each product below may have reached Mintsoft and its outcome is unknown. IMS will not send another until you resolve it. Look for the bundle in Mintsoft first.
+      </p>
+      <div className="flex items-end gap-2">
+        <div>
+          <Label htmlFor="kept-claims-search" className="text-xs">Find by SKU</Label>
+          <Input id="kept-claims-search" value={query} onChange={(event) => setQuery(event.target.value)} className="h-8 w-48" />
+        </div>
+        <Button size="sm" variant="outline" disabled={loading} onClick={() => load(0, query)}>Search</Button>
+      </div>
+      {view.claims.map((claim) => (
+        <KeptBundleClaimRow key={claim.id} claim={claim} disabled={disabled || loading} onResolve={onResolve} formatDateTime={formatDateTime} />
+      ))}
+      {view.claims.length === 0 && <p className="text-sm text-muted-foreground">No waiting bundle creates match.</p>}
+      {pages > 1 && (
+        <div className="flex items-center gap-2 text-sm">
+          <Button size="sm" variant="outline" disabled={loading || view.page === 0} onClick={() => load(view.page - 1, view.query)}>Previous</Button>
+          <span>Page {view.page + 1} of {pages}</span>
+          <Button size="sm" variant="outline" disabled={loading || view.page + 1 >= pages} onClick={() => load(view.page + 1, view.query)}>Next</Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function KeptBundleClaimRow({
   claim,
   disabled,
   onResolve,
   formatDateTime,
 }: {
-  claim: MintsoftDashboardData['keptBundleClaims'][number]
+  claim: MintsoftDashboardData['keptBundleClaims']['claims'][number]
   disabled: boolean
   onResolve: (
     claim: { id: string; claimValue: string; sku: string },
@@ -1380,9 +1428,12 @@ function KeptBundleClaimRow({
           Link to this bundle
         </Button>
       </div>
-      <Button size="sm" variant="outline" disabled={disabled} onClick={() => onResolve(claim, { kind: 'absent' })}>
-        I searched Mintsoft: no bundle
-      </Button>
+      <div>
+        <Button size="sm" variant="outline" disabled={disabled || claim.releaseBlockedReason !== null} onClick={() => onResolve(claim, { kind: 'absent' })}>
+          I searched Mintsoft: no bundle
+        </Button>
+        {claim.releaseBlockedReason && <div className="max-w-sm text-xs text-muted-foreground">{claim.releaseBlockedReason}</div>}
+      </div>
     </div>
   )
 }

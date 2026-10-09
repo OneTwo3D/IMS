@@ -671,6 +671,34 @@ export async function createMintsoftBundle(input: WmsBundleDto): Promise<WmsBund
   return fetched
 }
 
+export type MintsoftBundleLookup =
+  | { kind: 'found'; bundle: WmsBundleRef }
+  /** Mintsoft answered, readably, that this product has no bundle (a 404, or a 200 carrying nothing). */
+  | { kind: 'absent' }
+  /** A 200 that is neither a bundle nor empty: no verdict. */
+  | { kind: 'unreadable' }
+
+/**
+ * A lookup that tells "Mintsoft says there is no bundle" from "Mintsoft said something IMS cannot read".
+ * fetchMintsoftBundle folds both into null, which is fine for a sync that merely tries again, and not fine for
+ * the one decision that releases a possibly-sent create. Throws on a failed request.
+ */
+export async function lookupMintsoftBundle(externalProductId: string): Promise<MintsoftBundleLookup> {
+  const normalized = externalProductId.trim()
+  if (!normalized) return { kind: 'unreadable' }
+  const result = await mintsoftRequest<unknown>(`/api/Product/${encodeURIComponent(normalized)}/Bundle`)
+  if (result.status === 404) return { kind: 'absent' }
+  if (result.error) throw new Error(result.error)
+  const data = result.data
+  const empty = data === null || data === undefined || data === ''
+    || (Array.isArray(data) && data.length === 0)
+    || (typeof data === 'object' && !Array.isArray(data) && Object.keys(data as object).length === 0)
+  if (empty) return { kind: 'absent' }
+  const bundle = normalizeMintsoftBundle(data)
+  if (!bundle) return { kind: 'unreadable' }
+  return { kind: 'found', bundle: { ...bundle, externalBundleId: bundle.externalBundleId || normalized } }
+}
+
 export async function fetchMintsoftBundle(externalProductId: string): Promise<WmsBundleRef | null> {
   const normalized = externalProductId.trim()
   if (!normalized) return null

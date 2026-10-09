@@ -25,20 +25,76 @@ import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-cons
 export const BUNDLE_CLAIM_LEASE_MS = 10 * 60 * 1000
 
 export const BUNDLE_CLAIM_PREFIX = 'pending:'
-/** A claim whose create request has been handed to Mintsoft (or was about to be). Starts with the claim prefix. */
+/**
+ * A claim created under the two-step format whose create request has NOT been handed over yet. This is the
+ * ONLY claim shape that provably sent nothing, so the only one that may be retaken after its lease.
+ */
+export const BUNDLE_UNSENT_CLAIM_PREFIX = 'pending:unsent:'
+/** A claim whose create request has been handed to Mintsoft (or was about to be). */
 export const BUNDLE_SENT_CLAIM_PREFIX = 'pending:sent:'
 
 export function isBundleClaimValue(value: string | null | undefined): boolean {
   return typeof value === 'string' && value.startsWith(BUNDLE_CLAIM_PREFIX)
 }
 
-/** True for a claim whose create may have reached Mintsoft: stuck until a complete lookup or an operator resolves it. */
+/**
+ * True for every claim that is NOT provably unsent: a `pending:sent:` claim, and a LEGACY `pending:<time>` claim
+ * written before the two-step format existed (a crash after a successful PUT left exactly that shape). Stuck until a
+ * complete lookup or an operator resolves it.
+ */
 export function isBundleSentClaimValue(value: string | null | undefined): boolean {
-  return typeof value === 'string' && value.startsWith(BUNDLE_SENT_CLAIM_PREFIX)
+  return isBundleClaimValue(value) && !(value as string).startsWith(BUNDLE_UNSENT_CLAIM_PREFIX)
+}
+
+export function buildBundleUnsentClaimValue(now = Date.now()): string {
+  return `${BUNDLE_UNSENT_CLAIM_PREFIX}${now}`
 }
 
 export function buildBundleSentClaimValue(now = Date.now()): string {
   return `${BUNDLE_SENT_CLAIM_PREFIX}${now}`
+}
+
+/**
+ * The longest a create request can still be in flight after IMS handed it over, derived from the connector's own
+ * limits: each request may take the fetch timeout on each of its (MAX_REDIRECTS + 1 = 6) hops, a proven-unprocessed
+ * 401 may replay it once (x2), and the key refresh in between adds up to two more timed requests: 14 timed requests.
+ * Plus a margin for the surrounding database work. A process that is stopped rather than dead (SIGSTOP, a paused
+ * VM) can exceed any bound; that residual is not closed by a number.
+ */
+export const BUNDLE_CREATE_MAX_TIMED_REQUESTS = 14
+export const BUNDLE_CREATE_IN_FLIGHT_MARGIN_MS = 5 * 60 * 1000
+export const DEFAULT_CONNECTOR_FETCH_TIMEOUT_FOR_BUNDLES_MS = 30_000
+
+export function bundleCreateInFlightWindowMs(fetchTimeoutMs: number = DEFAULT_CONNECTOR_FETCH_TIMEOUT_FOR_BUNDLES_MS): number {
+  const timeout = Number.isFinite(fetchTimeoutMs) && fetchTimeoutMs > 0 ? fetchTimeoutMs : DEFAULT_CONNECTOR_FETCH_TIMEOUT_FOR_BUNDLES_MS
+  return timeout * BUNDLE_CREATE_MAX_TIMED_REQUESTS + BUNDLE_CREATE_IN_FLIGHT_MARGIN_MS
+}
+
+/** The window in force for this process (reads the same environment variable the connector transport reads). */
+export function currentBundleCreateInFlightWindowMs(env: Record<string, string | undefined> = process.env): number {
+  return bundleCreateInFlightWindowMs(Number(env.CONNECTOR_FETCH_TIMEOUT_MS))
+}
+
+export function bundleReleaseWindowMinutes(windowMs: number): number {
+  return Math.ceil(windowMs / 60_000)
+}
+
+/** Why "no bundle" cannot be confirmed yet. Shown on the page and returned by the action: one sentence. */
+export function bundleReleaseTooSoonText(minutes: number): string {
+  return `Cannot release yet: this create was sent less than ${minutes} minutes ago, and a request can stay in flight that long before it lands in Mintsoft. Releasing now could let a second create go out over the first. Try again later.`
+}
+
+export function bundleReleaseLookupRefusalText(kind: 'found' | 'unreadable' | 'failed' | 'no-product-link', detail?: string): string {
+  switch (kind) {
+    case 'found':
+      return `Not released: Mintsoft now returns a bundle for this product${detail ? ` (id ${detail})` : ''}. Link it instead.`
+    case 'unreadable':
+      return 'Not released: IMS checked Mintsoft just now and could not read the answer, so it cannot tell whether a bundle exists. Nothing was changed.'
+    case 'failed':
+      return `Not released: IMS could not check Mintsoft just now (${detail ?? 'the lookup failed'}). Nothing was changed.`
+    case 'no-product-link':
+      return 'Not released: this product has no Mintsoft product link, so IMS cannot check Mintsoft for its bundle. Nothing was changed.'
+  }
 }
 
 export type BundleCreateFailureKind = 'not-sent' | 'maybe-sent'

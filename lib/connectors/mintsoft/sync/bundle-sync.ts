@@ -9,6 +9,7 @@ import {
   BUNDLE_CLAIM_LEASE_MS,
   BUNDLE_CLAIM_PREFIX,
   buildBundleSentClaimValue,
+  buildBundleUnsentClaimValue,
   bundleCreateMaybeSentText,
   bundleStuckClaimText,
   classifyBundleCreateFailure,
@@ -22,7 +23,7 @@ const BUNDLE_SENTINEL_PREFIX = BUNDLE_CLAIM_PREFIX
 const BUNDLE_SENTINEL_STALE_MS = BUNDLE_CLAIM_LEASE_MS
 
 function buildBundleSentinel(): string {
-  return `${BUNDLE_SENTINEL_PREFIX}${Date.now()}`
+  return buildBundleUnsentClaimValue()
 }
 
 function isBundleSentinel(externalBundleId: string | null | undefined): boolean {
