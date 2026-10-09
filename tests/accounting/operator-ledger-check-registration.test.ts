@@ -259,3 +259,14 @@ test('[o3d-llyw] the HEADLINE shape — the unreadable payment is a SYNCED sibli
   assert.deepEqual(unconditionalMoneySentences(remedy), [])
   assert.deepEqual(unlicensedHistoryClaims(remedy, null), [])
 })
+
+test('[o3d-llyw] a check never sets aside the ledger id the attempt row records as its OWN payment', () => {
+  // A swept or retired attempt that still records `PAY-H` as its ledger id: by its own account PAY-H is
+  // its payment, so "PAY-H is not this attempt's payment" is not a check anyone can make.
+  const ownsIt = row({ id: 'log-f', status: 'CANCELLED', amount: 100, paymentId: 'pay-f', accountingInvoiceId: 'INV-1', paymentDate: '2026-08-01', settlementMarker: F_MARKER, externalTransactionId: 'PAY-H' })
+  const d = decide({ operatorLedgerChecks: [CHECK], existing: [ownsIt] })
+  precondition('attempt records PAY-H as its own', d)
+  assert.equal(d.register, false)
+  assert.match(d.register === false ? d.ledgerCheckRemedy ?? '' : '', /carries the very ledger id the earlier entry records as its own/,
+    'refused BY THIS RULE — the posted-registration refusal would also refuse, with a different sentence')
+})

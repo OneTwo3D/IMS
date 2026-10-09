@@ -240,3 +240,18 @@ test('[o3d-llyw] fence, headline shape: a SYNCED rival whose OWN payment is the 
   assert.equal(verdict.proceed, false, 'S claims to have posted, so no check speaks for it')
   assert.match(verdict.proceed ? '' : verdict.error, /log-s/)
 })
+
+test('[o3d-llyw] wiring: the Xero processor hands the store loader to the INVOICE_PAYMENT fence and to the revival gate, and to nothing else', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
+  const wired = source.split('loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {').length - 1
+  console.log(`[precondition] loader wiring sites in the Xero processor: ${wired}`)
+  assert.equal(wired, 2, 'exactly the INVOICE_PAYMENT fence call and the revival gate')
+  // The fence call that carries it is the INVOICE_PAYMENT branch's — not BILL_PAYMENT's or an allocation's.
+  const invoiceBranch = source.slice(source.indexOf("case 'INVOICE_PAYMENT': {"), source.indexOf("case 'BILL_PAYMENT': {"))
+  assert.ok(invoiceBranch.includes('loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {'),
+    'the receipt branch passes the loader to its fence')
+  const revival = source.slice(source.indexOf('const evidence = await ledgerClearsFollowUpRevival({'))
+  assert.ok(revival.slice(0, 900).includes('loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {'),
+    'and the revival gate passes it too')
+})
