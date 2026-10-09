@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
+import { SYSTEM_IMPORT, withSystemActor, withSystemOutcome, type SystemImportContext } from '@/lib/first-load/apply/system-import-capability'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
@@ -281,10 +282,12 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
   }
 }
 
-export async function importSuppliersCsv(formData: FormData): Promise<CsvImportActionResult> {
+export async function importSuppliersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
-  await requirePermission('purchasing.create')
+  // A system-actor context (the first-load apply runner, a CLI with no session) replaces the session check; anything
+  // that is not the real capability takes the permission check, so a forged argument fails closed.
+  if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
   try {
     const baseCurrency = await getBaseCurrencyCode()
     const file = formData.get('file') as File
@@ -315,6 +318,8 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
     let created = 0
     let updated = 0
     let skipped = 0
+    const createdSupplierIds: string[] = []
+    const updatedSupplierIds: string[] = []
     const errors: string[] = []
     if (dropped > 0) {
       errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
@@ -363,10 +368,12 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
               },
             })
           }
+          if (!preview) updatedSupplierIds.push(existing.id)
           updated++
         } else {
           if (!preview) {
-            await db.supplier.create({
+            const createdSupplier = await db.supplier.create({
+              select: { id: true },
               data: {
                 name,
                 contactName: r.contactName?.trim() || null,
@@ -385,6 +392,7 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
                 notes: r.notes?.trim() || null,
               },
             })
+            createdSupplierIds.push(createdSupplier.id)
           }
           created++
         }
@@ -402,8 +410,8 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
         errors,
       })
     }
-    revalidatePath('/purchase-orders/suppliers')
-    await logActivity({
+    if (system?.systemImportToken !== SYSTEM_IMPORT) revalidatePath('/purchase-orders/suppliers')
+    await logActivity(withSystemActor({
       entityType: 'IMPORT',
       tag: 'import',
       action: 'imported',
@@ -411,17 +419,18 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
       description: errors.length
         ? `Imported ${created} suppliers, updated ${updated} from CSV with warnings: ${errors[0]}`
         : `Imported ${created} suppliers, updated ${updated} from CSV`,
-    })
-    return createCsvImportExecutionResult({
+    }, system))
+    const execution = createCsvImportExecutionResult({
       created,
       updated,
       skipped,
       errors,
       error: created === 0 && updated === 0 && errors.length > 0 ? errors[0] : undefined,
     })
+    return withSystemOutcome(execution, system, { created: createdSupplierIds, updated: updatedSupplierIds })
   } catch (e) {
     const error = String(e)
-    await runCsvImportMutation(mode, () => logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import suppliers from CSV: ${error}` }))
+    await runCsvImportMutation(mode, () => logActivity(withSystemActor({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import suppliers from CSV: ${error}` }, system)))
     return preview
       ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: [error], error })
       : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })

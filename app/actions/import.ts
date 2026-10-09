@@ -6,6 +6,12 @@ import { parseCsv } from '@/lib/csv'
 import { ProductType, type Prisma, type ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import {
+  SYSTEM_IMPORT,
+  withSystemActor,
+  withSystemOutcome,
+  type SystemImportContext,
+} from '@/lib/first-load/apply/system-import-capability'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
 import { validateProductStructureChange } from '@/lib/products/type-transforms'
@@ -70,8 +76,11 @@ const MAX_IMPORT_ROWS = 10_000
 async function validateImportFile(
   formData: FormData,
   permission: Permission,
+  system?: SystemImportContext,
 ): Promise<{ file: File } | { error: string }> {
-  await requirePermission(permission)
+  // A system-actor context (the first-load apply runner, a CLI with no session) replaces the session check.
+  // Anything that is not the real capability falls through to the permission check, so a forged argument fails closed.
+  if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission(permission)
   const file = formData.get('file') as File | null
   if (!file) return { error: 'No file provided' }
   if (file.size > MAX_IMPORT_BYTES) {
@@ -231,10 +240,10 @@ function scheduleProductImportShoppingSync(
   }, 0)
 }
 
-export async function importProductsCsv(formData: FormData): Promise<CsvImportActionResult> {
+export async function importProductsCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
-  const validated = await validateImportFile(formData, 'inventory.edit')
+  const validated = await validateImportFile(formData, 'inventory.edit', system)
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
     return preview
@@ -276,6 +285,8 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
   // which then passed both the sku and type checks, and had its component list replaced.
   const componentRows: { lineNum: number; sku: string; productId: string; components: string }[] = []
   const touchedProducts: Array<{ id: string; lifecycleStatus: ProductLifecycleStatus }> = []
+  const createdProductIds = new Set<string>()
+  const updatedProductIds = new Set<string>()
   const categoryIdCache = new Map<string, string>()
   type ProductCategoryResolverClient = Pick<Prisma.TransactionClient, 'productCategory'> | Pick<typeof db, 'productCategory'>
 
@@ -682,6 +693,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           lifecycleStatus,
         })
         touchedProducts.push({ id: existingProduct.id, lifecycleStatus })
+        updatedProductIds.add(existingProduct.id)
         result.updated++
       } else {
         const createData = {
@@ -831,6 +843,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           result.errors.push(`Row ${lineNum} (${sku}): unrecognised countryOfOrigin "${csvOriginRaw}" — imported without an origin`)
         }
         touchedProducts.push({ id: created.id, lifecycleStatus })
+        createdProductIds.add(created.id)
         result.created++
       }
 
@@ -1096,15 +1109,24 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     return buildImportPreviewResult(rows.length + dropped, result, dropped)
   }
 
-  scheduleProductImportShoppingSync(touchedProducts)
-
-  revalidatePath('/inventory')
-  if (result.errors.length > 0 && result.created === 0 && result.updated === 0) {
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import products from CSV: ${result.errors[0]}` })
-  } else {
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} products, updated ${result.updated} from CSV` })
+  // The web path queues the WooCommerce push and stock sync and revalidates the page. A system-actor import does
+  // none of that: it reports the products those effects would have covered and leaves them unqueued.
+  if (system?.systemImportToken !== SYSTEM_IMPORT) {
+    scheduleProductImportShoppingSync(touchedProducts)
+    revalidatePath('/inventory')
   }
-  return createCsvImportExecutionResult(result)
+  if (result.errors.length > 0 && result.created === 0 && result.updated === 0) {
+    await logActivity(withSystemActor({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import products from CSV: ${result.errors[0]}` }, system))
+  } else {
+    await logActivity(withSystemActor({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} products, updated ${result.updated} from CSV` }, system))
+  }
+  const touchedProductIds = [...new Set(touchedProducts.map((entry) => entry.id))]
+  return withSystemOutcome(createCsvImportExecutionResult(result), system, {
+    created: [...createdProductIds],
+    updated: [...updatedProductIds],
+    shoppingMetadataPush: touchedProductIds,
+    stockSync: touchedProductIds,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,10 +1235,10 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
 // Opening stock CSV import
 // ---------------------------------------------------------------------------
 
-export async function importOpeningStockCsv(formData: FormData): Promise<CsvImportActionResult> {
+export async function importOpeningStockCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
-  const validated = await validateImportFile(formData, 'stock_control.adjust')
+  const validated = await validateImportFile(formData, 'stock_control.adjust', system)
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
     return preview
@@ -1416,36 +1438,50 @@ export async function importOpeningStockCsv(formData: FormData): Promise<CsvImpo
     return buildImportPreviewResult(rows.length + dropped, result, dropped)
   }
 
-  revalidatePath('/stock-control')
-  revalidatePath('/inventory')
-  if (touchedProductIds.size > 0) {
-    try {
-      await enqueueStockSync(Array.from(touchedProductIds), 'IMS_CHANGE')
-    } catch (syncError) {
-      console.error(syncError)
+  // A system-actor import neither revalidates nor queues the stock sync: it reports the products the sync would have covered.
+  if (system?.systemImportToken !== SYSTEM_IMPORT) {
+    revalidatePath('/stock-control')
+    revalidatePath('/inventory')
+    if (touchedProductIds.size > 0) {
+      try {
+        await enqueueStockSync(Array.from(touchedProductIds), 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+      }
     }
   }
   if (result.created > 0) {
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} opening stock row(s) from CSV` })
+    await logActivity(withSystemActor({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} opening stock row(s) from CSV` }, system))
   } else if (result.errors.length > 0) {
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import opening stock from CSV: ${result.errors[0]}` })
+    await logActivity(withSystemActor({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import opening stock from CSV: ${result.errors[0]}` }, system))
   }
-  return createCsvImportExecutionResult(result)
+  return withSystemOutcome(createCsvImportExecutionResult(result), system, {
+    created: Array.from(touchedProductIds),
+    updated: [],
+    stockSync: Array.from(touchedProductIds),
+  })
 }
 
 // ---------------------------------------------------------------------------
 // Warehouse Transfers CSV import
 // ---------------------------------------------------------------------------
 
-export async function importTransfersCsv(formData: FormData): Promise<CsvImportActionResult> {
+export async function importTransfersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
-  const validated = await validateImportFile(formData, 'stock_control.transfer')
+  const validated = await validateImportFile(formData, 'stock_control.transfer', system)
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
     return preview
       ? buildImportPreviewResult(0, result, 0, validated.error)
       : createCsvImportExecutionResult({ ...result, error: validated.error, success: false })
+  }
+
+  // Transfers are built by calling the createTransfer / dispatchTransfer / receiveTransfer Server Actions, which carry their
+  // own permission checks and queue stock syncs, and this seam does not reach them. Refuse BEFORE reading a row, so nothing is written.
+  if (system?.systemImportToken === SYSTEM_IMPORT && !preview) {
+    const error = 'Transfers cannot be imported by the system actor. Nothing was written.'
+    return createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
   }
 
   const parsed = parseCsv(await validated.file.text())
@@ -1824,10 +1860,10 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
 // Purchase Orders CSV import
 // ---------------------------------------------------------------------------
 
-export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvImportActionResult> {
+export async function importPurchaseOrdersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
-  const validated = await validateImportFile(formData, 'purchasing.create')
+  const validated = await validateImportFile(formData, 'purchasing.create', system)
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
     return preview
@@ -1973,6 +2009,7 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
     })
   }
 
+  const createdPurchaseOrderIds: string[] = []
   const explicitPoKeys = Array.from(
     new Set(
       Array.from(groups.entries())
@@ -2021,10 +2058,11 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
             ...line,
             sortOrder: index,
           })),
-        })
+        }, system)
         if (!created.success || !created.po) {
           throw new Error(created.error || 'Failed to create purchase order')
         }
+        createdPurchaseOrderIds.push(created.po.id)
       }
       result.created += g.lines.length
       if (importKey) existingPoRefs.add(importKey)
@@ -2038,11 +2076,11 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
     return buildImportPreviewResult(rows.length + dropped, result, dropped)
   }
 
-  revalidatePath('/purchase-orders')
+  if (system?.systemImportToken !== SYSTEM_IMPORT) revalidatePath('/purchase-orders')
   if (result.created > 0) {
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} purchase orders from CSV` })
+    await logActivity(withSystemActor({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} purchase orders from CSV` }, system))
   } else if (result.errors.length > 0) {
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import purchase orders from CSV: ${result.errors[0]}` })
+    await logActivity(withSystemActor({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import purchase orders from CSV: ${result.errors[0]}` }, system))
   }
-  return createCsvImportExecutionResult(result)
+  return withSystemOutcome(createCsvImportExecutionResult(result), system, { created: createdPurchaseOrderIds, updated: [] })
 }
