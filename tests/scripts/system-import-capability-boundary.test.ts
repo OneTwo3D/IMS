@@ -120,6 +120,6 @@ test('the production tree passes, and the census saw exactly the importers it sh
   const { violations, importers } = runCensus({ root: process.cwd() })
   console.log(`production census: ${importers.length} importer file(s)`)
   for (const module of Object.keys(IMPORTERS)) assert.ok(importers.includes(module), `precondition: ${module} imports the capability`)
-  assert.ok(importers.includes('tests/first-load/system-import-importers.test.ts'), 'precondition: the importers spike test is among them')
+  assert.ok(importers.includes('tests/first-load/system-import-driver.ts'), 'precondition: the importers spike driver is among them')
   assert.deepEqual(violations, [])
 })
