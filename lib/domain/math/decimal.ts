@@ -66,7 +66,7 @@ function assertValidPrecision(precision: number): void {
  * bound a hundred times too tight. That is the same number, so it stays ONE exported function rather
  * than a second name for it.
  */
-export function currencyMinorUnits(currency: string): number {
+export function currencyMinorUnits(currency: string | null | undefined): number {
   return currencyPrecision(currency)
 }
 
@@ -218,7 +218,10 @@ export function isLedgerMinorUnitQuantized(value: Decimal, currency: string | nu
   return value.decimalPlaces() <= ledgerMinorUnits(currency)
 }
 
-function currencyPrecision(currency: string): number {
+function currencyPrecision(currency: unknown): number {
+  // TOTAL: a null/undefined/non-string currency (a row that reached runtime without one) reads as the
+  // default 2 minor units rather than throwing on .trim().
+  if (typeof currency !== 'string') return 2
   const normalizedCurrency = currency.trim().toUpperCase()
   if (!normalizedCurrency) return 2
   return CURRENCY_MINOR_UNITS[normalizedCurrency] ?? 2

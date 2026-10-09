@@ -1,5 +1,6 @@
 'use client'
 
+import { formatMismatchAmount, PUSH_TOTAL_MISMATCH_OPERATOR_NOTE } from '@/lib/domain/wms/push-total-mismatch-note'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Fragment, useState, useTransition } from 'react'
 import {
@@ -1000,7 +1001,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WMS pushes — order-total mismatches (${data.summary.pennyMismatches})`}
-            detail="Advisory: these orders pushed successfully but the IMS and WMS totals drifted by more than a penny. Review the order, then clear the flag."
+            detail={PUSH_TOTAL_MISMATCH_OPERATOR_NOTE}
             shown={data.pennyMismatches.length}
             total={data.summary.pennyMismatches}
           />
@@ -1020,7 +1021,7 @@ export function ExceptionsClient({ data }: Props) {
                     <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                   </TableCell>
                   <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
-                  <TableCell className="text-xs">{(row.totalMismatchPence / 100).toLocaleString(undefined, { style: 'currency', currency: 'GBP' })}</TableCell>
+                  <TableCell className="text-xs">{formatMismatchAmount(row.totalMismatchPence, row.currency, row.minorUnits)}</TableCell>
                   <TableCell className="text-right">
                     <Button
                       type="button"
