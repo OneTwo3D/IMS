@@ -395,18 +395,22 @@ The **Products** tab controls bidirectional product synchronisation.
 ### Direction
 
 - **WC to IMS** — product changes in WooCommerce are imported into inventory (name, description, images, weight, dimensions, GTIN, HS code, country of origin)
-- **IMS to WC** — product changes in One Two Inventory are pushed to WooCommerce (name, description, prices)
+- **IMS to WC** — product changes in One Two Inventory are pushed to WooCommerce (name, status, prices, barcode). **Never descriptions or pictures:** those are written in WooCommerce and flow one way, WooCommerce to IMS to the warehouse (see *Product content* below). An earlier version also pushed the description, and because IMS fills it from the storefront's short description that overwrote the storefront's long description; that is removed
 - **Both** — sync runs in both directions
 
 ### What Syncs
 
 **WooCommerce to IMS:**
 - Product name, description (HTML stripped), image URL
+- **Product content** (see below): short description, long description and the picture references
 - Weight and dimensions (length, width, height)
 - GTIN/barcode from WooCommerce's `global_unique_id` field (only written if the IMS barcode field is empty)
 - HS code and country of origin from WC product attributes (only written if the IMS fields are empty)
 - **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). The product is linked to its **deepest** WC category. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable — or the category list cannot be read to its end — the product's existing category link is left alone rather than wiped or linked to a partial tree.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
+
+**Product content.** The short description, the long description and the pictures are kept in a separate hub copy beside each product (one row per product or variation), as plain text and as picture *references* — an address, the picture's WooCommerce id and last-modified stamp, and a checksum of the reference; the picture bytes are never copied. A re-import of unchanged content writes nothing, and a change is detected field by field. **A field WooCommerce sends empty is kept, not cleared**, so an emptied description in the store does not erase the copy IMS holds (the same rule as the trade fields); removing a description on purpose has to be done in IMS's copy once the editing screen exists. A WooCommerce variation has only a description and one picture, so its short description stays empty. From the hub copy the content goes on to Mintsoft; see [Product content to Mintsoft](mintsoft.md#product-content-to-mintsoft).
+
 - Variation attributes are synced for the options panel
 
 **There is a supported size for a variable product: 1,000 variations.** A product's variations are

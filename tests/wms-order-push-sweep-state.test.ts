@@ -393,6 +393,22 @@ test('o3d-92fu create: a line with no SKU parks VALIDATION_FAILED — no claim, 
   assert.deepEqual((audited[0].after as { remoteCallMade: boolean }).remoteCallMade, false)
 })
 
+test('create: an order with no street line on either address parks VALIDATION_FAILED with the single-sourced reason, no remote call', async () => {
+  let pushed = 0
+  const { port, claims, validationFailures } = makePort({
+    createCandidates: [candidate({ shippingAddress: { firstName: 'Gina' }, billingAddress: { firstName: 'Bea' } })],
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ pushOrder: async () => { pushed += 1; return okPush() } }),
+    'mintsoft', port, { now: NOW },
+  )
+  console.log(`# precondition: validationFailed=${r.validationFailed} pushed=${pushed}`)
+  assert.equal(r.validationFailed, 1)
+  assert.equal(pushed, 0)
+  assert.deepEqual(claims, [])
+  assert.match(validationFailures[0].error, /street line/)
+})
+
 test('o3d-92fu create: a disposition REFUSED under the lock is skipped, not audited', async () => {
   // recordValidationFailure returns false when the order was deleted or the link has moved on
   // (another worker claimed and pushed it between the candidate read and here). Recording an

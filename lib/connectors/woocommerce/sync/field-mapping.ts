@@ -17,8 +17,24 @@ function roundDecimalNumber(value: DecimalInput, precision: number): number {
 // Address mapping
 // ---------------------------------------------------------------------------
 
+/** A WooCommerce address string, trimmed; anything that is not a string becomes ''. */
+function wcText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
 export function mapWcAddress(a: WcAddress) {
   return {
+    // `line1` keeps its historical composite (street + company) because documents and the
+    // order screens already render it. The fields below it are the SEPARATE parts the
+    // warehouse push needs: the recipient's name, company, plain street line and contact
+    // details. `address1` is always present (possibly '') on an address stored by this
+    // mapper, which is how readers tell this shape from a legacy row that has only `line1`.
+    firstName: wcText(a.first_name) || undefined,
+    lastName: wcText(a.last_name) || undefined,
+    company: wcText(a.company) || undefined,
+    address1: wcText(a.address_1),
+    phone: wcText(a.phone) || undefined,
+    email: wcText(a.email) || undefined,
     line1: [a.address_1, a.company].filter(Boolean).join(', ') || undefined,
     line2: a.address_2 || undefined,
     city: a.city || undefined,

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
+import { createProductContentDelegate } from './helpers/product-content-delegate.ts'
 import {
   resolveWcProductWriteLockIds,
   wcProductWriteLockKeys,
@@ -369,6 +370,7 @@ const txClient = {
       )].map((productId) => ({ productId }))
     },
   },
+  productContent: createProductContentDelegate(),
   productOption: {
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })
