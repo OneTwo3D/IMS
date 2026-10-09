@@ -31,7 +31,6 @@ const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TEN
 const LIVE_ENV = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: TENANT, XERO_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z' }
 const SETTINGS = [['plugin_xero_enabled', 'true'], ['xero_sync_enabled', 'true']] as const
 
-class RollbackProbe extends Error {}
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Tx = any
 

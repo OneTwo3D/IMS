@@ -24,8 +24,8 @@ import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants
 // The activity log would otherwise reach for a real database from the suppression report and the refusal clear.
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined, logActivityPersisted: async () => true } })
 async function createAccountingSyncLogRow(client: never, data: never) {
-  const module = await import('@/lib/domain/accounting/sync-log-row')
-  return module.createAccountingSyncLogRow(client, data)
+  const primitive = await import('@/lib/domain/accounting/sync-log-row')
+  return primitive.createAccountingSyncLogRow(client, data)
 }
 
 const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
