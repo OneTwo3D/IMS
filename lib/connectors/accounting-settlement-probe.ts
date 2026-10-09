@@ -2324,7 +2324,7 @@ export async function ledgerClearsFollowUpRevival(params: {
         currency: attempt.currency,
         date: attempt.date,
         marker,
-      }))}`
+      }), 'revival')}`
       : reason,
   }
 }
@@ -2716,7 +2716,7 @@ export async function authoriseMoneyPost(
             currency: contenderAttempt.currency,
             date: contenderAttempt.date,
             marker,
-          }))}`
+          }), 'post')}`
           : ''),
     }
   }

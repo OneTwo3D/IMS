@@ -271,7 +271,25 @@ export { LEDGER_CHECK_CONTROL_NAME, offersOperatorLedgerCheck } from './operator
  * `attemptLabel` describes the attempt the operator must compare against (amount, date, reference),
  * built by the caller from the attempt description it already holds.
  */
-export function describeLedgerCheckRemedy(remedy: LedgerCheckRemedy, attemptLabel: string): string {
+/**
+ * Where the hold was met, which decides what happens after a check is recorded:
+ *   registration — the recorder re-runs the receipt's guarded registration itself;
+ *   post         — the entry's next automatic attempt reads the check (the manual Retry does not yet);
+ *   revival      — the next automatic enqueue of this follow-up reads it.
+ */
+export type LedgerCheckContext = 'registration' | 'post' | 'revival'
+
+const AFTER_CHECK: Record<LedgerCheckContext, string> = {
+  registration: 'IMS then registers this receipt again through the same checks.',
+  post: 'This entry\'s next automatic attempt reads the check; Retry on the Sync Dashboard does not read ledger checks yet.',
+  revival: 'The next automatic enqueue of this entry reads the check.',
+}
+
+export function describeLedgerCheckRemedy(
+  remedy: LedgerCheckRemedy,
+  attemptLabel: string,
+  context: LedgerCheckContext = 'registration',
+): string {
   if (!remedy.liftable) {
     switch (remedy.reason) {
       case 'record-without-id':
@@ -300,7 +318,7 @@ export function describeLedgerCheckRemedy(remedy: LedgerCheckRemedy, attemptLabe
       ? 'Only if it is not that attempt\'s payment, and not a payment for this receipt already entered by hand, '
       : 'Only if none of them is that attempt\'s payment, and none is a payment for this receipt already entered by hand, ')
     + `record that on the Accounting Sync page: entry ${remedy.attemptSyncLogId}, "${LEDGER_CHECK_CONTROL_NAME}", `
-    + `for receipt ${remedy.paymentId}. IMS then registers this receipt again through the same checks. The check is `
+    + `for receipt ${remedy.paymentId}. ${AFTER_CHECK[context]} The check is `
     + 'your assertion and is logged against your account; it covers only those payment ids, it lapses after any '
     + 'Xero reconnect, a payment that appears later holds the receipt again, and it never overrides a payment IMS '
     + `can match to the attempt. If ${one ? 'it' : 'one of them'} IS that attempt's payment, do not record a check: `

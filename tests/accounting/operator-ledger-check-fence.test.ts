@@ -90,6 +90,9 @@ test('[o3d-llyw] fence precondition: a FAILED contender cannot be ruled out agai
   assert.match(error, /log-f/)
   assert.match(error, /WHAT LIFTS THIS HOLD: open payment PAY-H on document INV-1/)
   assert.match(error, /for receipt pay-new/)
+  assert.match(error, /next automatic attempt reads the check; Retry on the Sync Dashboard does not read ledger checks yet/,
+    'and it says truthfully what happens after a check at THIS gate')
+  assert.doesNotMatch(error, /registers this receipt again/)
 })
 
 test('[o3d-llyw] fence: a check for that contender and THIS receipt, under the serving connection, lets the post proceed', async () => {
@@ -166,6 +169,7 @@ test('[o3d-llyw] revival: the revived row\'s own check (for its own receipt) cle
   assert.equal(held.clear, false)
   assert.match(held.clear ? '' : held.reason, /WHAT LIFTS THIS HOLD: open payment PAY-H/)
   assert.match(held.clear ? '' : held.reason, /for receipt pay-f/, 'a revival re-posts the row\'s OWN receipt, so that is the receipt a check must name')
+  assert.match(held.clear ? '' : held.reason, /next automatic enqueue of this entry reads the check/)
 
   const own = { ...CHECK, paymentId: 'pay-f' }
   const lifted = await ledgerClearsFollowUpRevival({ ...base, loadOperatorLedgerChecks: async () => [own] })
