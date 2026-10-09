@@ -344,6 +344,12 @@ const ALLOWLIST = [
   'lib/security/producer-disposition-constants.ts',
   'lib/security/writer-ownership-map.ts',
   'lib/ops/outbound-status.ts',
+  // The read-sync liveness registry IS a per-connector inventory of the read feeds that keep IMS current
+  // (one row and one limit per feed, so it necessarily names each connector), exactly as the outbound hold
+  // names each destination. The alarm and the status script are generic: they iterate this registry and
+  // spell no connector themselves.
+  'lib/ops/read-sync-liveness-constants.ts',
+  'lib/ops/read-sync-status.ts',
   // The readiness gate's operator text and its reconciliation-pack titles (R1 against Mintsoft, R9 against
   // WooCommerce, ...) name the systems the checks compare, exactly as the outbound registry does. Constants and
   // text only: no connector flow, import or call lives in this file.

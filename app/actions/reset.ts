@@ -10,6 +10,7 @@ import {
   ACCOUNTING_BINDING_WITNESS_SETTING_KEYS,
   runOrderedAccountingBindingWrites,
 } from '@/lib/connectors/accounting-binding-lock-order'
+import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 import {
@@ -24,6 +25,7 @@ const WC_ORDER_SYNC_STATE_KEYS = [
   'wc_initial_import_completed',
   'last_wc_order_sync_at',
   'last_wc_order_reconcile_at',
+  WC_ORDER_SWEEP_LAST_SUCCESS_SETTING,
   'wc_order_webhook_last_received_at',
   'wc_webhook_last_received_at',
 ] as const

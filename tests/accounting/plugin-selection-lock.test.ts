@@ -1109,6 +1109,8 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // itself is parameterised. It touches only `activity_logs` marker rows — never `settings`, so it
   // cannot move a plugin key — and runs in its own transaction rather than the sweep's.
   'lib/fulfillment/pre-fulfilment-reallocation.ts': 'runtime-assembled-sql',
+  // The read-sync alarm bounds its claim transaction with a constant `SET LOCAL statement_timeout`; it names no plugin key.
+  'lib/ops/read-sync-liveness-alarm.ts': 'runtime-assembled-sql',
   'lib/db/savepoint.ts': 'runtime-assembled-sql',
   // o3d-zjsb5.9 r13. The duplicate-recipe repair's logic, discovered here because `readServerIdentity`
   // issues raw SELECTs. Read to classify: it constructs NO client of its own -- every statement runs on

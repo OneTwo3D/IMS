@@ -65,7 +65,7 @@ export async function handleAccountBalanceSnapshotCron(
       const balanceDate = previousAccountBalanceSnapshotDate(now())
       return {
         balanceDate,
-        ...await syncSnapshots({ balanceDate, syncRunId: runId }),
+        ...await syncSnapshots({ balanceDate, syncRunId: runId, recordScheduledPullSuccess: true }),
       }
     },
     getOutcome: (result) => ({

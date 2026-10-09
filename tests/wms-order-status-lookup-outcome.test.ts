@@ -54,7 +54,10 @@ mock.module('@/lib/connectors/wms/registry', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The sweep stamps its read-sync last-success time when it finishes without a failed order.
+      setting: { upsert: async () => ({}) },
       salesOrder: {
+        count: async () => 0,
         findMany: async () => [{
           id: 'order-1',
           orderNumber: 'SO-1',

@@ -37,6 +37,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { addMoney, currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
+import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import {
   UNRECONCILED_TAX_PAYLOAD_KEY, buildUnreconciledTaxMarker,
 } from '@/lib/domain/accounting/document-tax-reconciliation'
@@ -3086,6 +3087,17 @@ export async function syncNewWcOrders(
         where: { key: cursorStatusesKey },
         create: { key: cursorStatusesKey, value: fingerprint },
         update: { value: fingerprint },
+      }),
+      // The sweep's LAST-SUCCESS stamp (read-sync liveness), in the SAME transaction as the cursor: it
+      // exists only because this branch is reached - the walk ended on an empty page with no error -
+      // so a sweep that failed, or ran out of ceiling, or fetched nothing because of an error, can
+      // never advance it. It is separate from the cursor on purpose: an admitted webhook delivery
+      // also advances `last_wc_order_sync_at` (advanceWcOrderSyncCursor), so the cursor cannot say
+      // whether the SWEEP is alive. A clean sweep that found no new orders reaches here and counts.
+      db.setting.upsert({
+        where: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING },
+        create: { key: WC_ORDER_SWEEP_LAST_SUCCESS_SETTING, value: now },
+        update: { value: now },
       }),
     ])
   }
