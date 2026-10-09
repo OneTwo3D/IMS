@@ -410,3 +410,22 @@ test('inbound: content rolls back with a failed write (no content row for a prod
   assert.equal(state.contents.length, 0, 'no content survives a rolled-back import')
   failVariationsPage = 0
 })
+
+test('loop safety: the IMS -> WooCommerce product push carries no content key, for any product', async () => {
+  const { buildImsToWcProductPayload } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  const payload = buildImsToWcProductPayload({
+    name: 'Widget',
+    lifecycleStatus: 'ACTIVE',
+    salesPriceBase: 12.5,
+    salePriceBase: null,
+    barcode: '5012345678900',
+    // A caller that still hands over the old shape must not be able to smuggle content through.
+    ...({ description: 'Short copy', short_description: 'Short', images: [{ src: 'https://x.test/a.jpg' }] } as object),
+  } as Parameters<typeof buildImsToWcProductPayload>[0])
+  const keys = Object.keys(payload).sort()
+  console.log(`precondition: payload keys=${keys.join(',')}`)
+  assert.deepEqual(keys, ['global_unique_id', 'name', 'regular_price', 'sale_price', 'status'])
+  for (const content of ['description', 'short_description', 'images']) {
+    assert.equal(content in payload, false, `${content} must never be pushed to WooCommerce`)
+  }
+})

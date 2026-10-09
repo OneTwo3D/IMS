@@ -51,7 +51,7 @@ import {
   PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE,
 } from '@/lib/products/type-transforms'
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
-import type { Prisma, ProductType } from '@/app/generated/prisma/client'
+import type { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 import { storeWcProductContent } from './product-content'
 
@@ -2068,6 +2068,34 @@ async function applyProductOptions(
 // IMS → WC product push
 // ---------------------------------------------------------------------------
 
+/**
+ * What IMS sends WooCommerce when a product is pushed: name, status, prices and barcode. NEVER content.
+ *
+ * Descriptions and pictures are authored in WooCommerce and flow Woo -> IMS -> the warehouse; IMS holds a copy and
+ * must not answer the storefront with it. This payload used to carry `description`, which IMS fills from the
+ * storefront's SHORT description (falling back to the long one) and WooCommerce takes as the LONG one, so an
+ * operator's product edit overwrote the storefront's long description with its short text. It is gone; a test pins
+ * that no content key can come back.
+ */
+export function buildImsToWcProductPayload(product: {
+  name: string
+  lifecycleStatus: ProductLifecycleStatus
+  salesPriceBase: Prisma.Decimal | number | null
+  salePriceBase: Prisma.Decimal | number | null
+  barcode: string | null
+}): Record<string, unknown> {
+  const updateData: Record<string, unknown> = { name: product.name }
+  updateData.status = deriveWooStatusFromLifecycleStatus(product.lifecycleStatus)
+  if (product.salesPriceBase) updateData.regular_price = String(Number(product.salesPriceBase))
+  updateData.sale_price = product.salePriceBase ? String(Number(product.salePriceBase)) : ''
+
+  // Only send global_unique_id if barcode is purely numeric (WC only accepts numbers)
+  if (product.barcode && /^\d+$/.test(product.barcode)) {
+    updateData.global_unique_id = product.barcode
+  }
+  return updateData
+}
+
 export async function pushImsProductToWc(productId: string): Promise<{ success: boolean; error?: string }> {
   try {
     const { creds, syncVersion } = await snapshotProductSyncContext()
@@ -2080,7 +2108,6 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
         id: true,
         sku: true,
         name: true,
-        description: true,
         salesPriceBase: true,
         salePriceBase: true,
         barcode: true,
@@ -2092,17 +2119,7 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
     })
     if (!product?.sku) return { success: false, error: 'Product has no SKU' }
 
-    // Push updates
-    const updateData: Record<string, unknown> = { name: product.name }
-    updateData.status = deriveWooStatusFromLifecycleStatus(product.lifecycleStatus)
-    if (product.description) updateData.description = product.description
-    if (product.salesPriceBase) updateData.regular_price = String(Number(product.salesPriceBase))
-    updateData.sale_price = product.salePriceBase ? String(Number(product.salePriceBase)) : ''
-
-    // Only send global_unique_id if barcode is purely numeric (WC only accepts numbers)
-    if (product.barcode && /^\d+$/.test(product.barcode)) {
-      updateData.global_unique_id = product.barcode
-    }
+    const updateData = buildImsToWcProductPayload(product)
 
     let externalProductId: number
     let putPath: string
