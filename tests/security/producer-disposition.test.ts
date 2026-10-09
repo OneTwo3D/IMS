@@ -292,7 +292,7 @@ test('arm e: obligationAt before the cut-off is SHADOW; at the cut-off is LIVE; 
 })
 
 test('arm f: a throwing environment, clock or obligationAt is SHADOW, and nothing propagates', () => {
-  const throwingEnv = new Proxy({}, { get() { throw new Error('env read failed') }, has() { throw new Error('env read failed') }, ownKeys() { throw new Error('env read failed') } }) as Record<string, string | undefined>
+  const throwingEnv = new Proxy({}, { get() { throw new Error('env read failed') }, has() { throw new Error('env read failed') }, getOwnPropertyDescriptor() { throw new Error('env read failed') }, ownKeys() { throw new Error('env read failed') } }) as Record<string, string | undefined>
   assert.throws(() => throwingEnv.ANYTHING, /env read failed/, 'precondition: the environment really throws')
   const throwingContext = (env: Record<string, string | undefined>) => ({ env, get now(): Date { throw new Error('clock failed') } })
   assert.throws(() => throwingContext({}).now, /clock failed/, 'precondition: the clock really throws')
@@ -465,4 +465,102 @@ test('arm l: only an ABSENT clock defaults to the current time; null, NaN, numbe
     console.log(`# arm l ${label}: ${decision.disposition}/${decision.reason}`)
     assert.deepEqual([decision.disposition, decision.reason], [disposition, reason], label)
   }
+})
+
+const TENANT_ENV = (destination: OutboundConnector) => envFor(destination, 'ok', '2026-01-01T00:00:00Z')
+
+test('arm m: an INHERITED env (polluted Object.prototype, or a context whose prototype carries one) cannot change SHADOW to LIVE', () => {
+  const op = OPERATION.xero.IMS
+  const liveEnv = TENANT_ENV('xero')
+  const names = [OUTBOUND_GRANT_ENV.xero, PRODUCER_CUTOFF_ENV.xero]
+  const results: string[] = []
+  try {
+    ;(Object.prototype as Record<string, unknown>).env = liveEnv
+    // The inherited property is really visible, so the guard below proves something.
+    assert.equal(({} as { env?: unknown }).env, liveEnv, 'precondition: Object.prototype.env is polluted')
+    const a = explainProducerDisposition('xero', op as never, LATE, { now: NOW })
+    const b = explainProducerDisposition('xero', op as never, LATE, Object.create({ env: liveEnv, now: NOW }))
+    results.push(`proto.env=${a.reason}`, `inherited context env=${b.reason}`)
+    assert.deepEqual([a.disposition, b.disposition], ['SHADOW', 'SHADOW'])
+  } finally {
+    delete (Object.prototype as Record<string, unknown>).env
+  }
+  try {
+    for (const name of names) (Object.prototype as Record<string, unknown>)[name] = liveEnv[name]
+    assert.equal((process.env as Record<string, unknown>)[names[0]!], liveEnv[names[0]!], 'precondition: process.env sees the polluted prototype variable')
+    const fromProcessEnv = explainProducerDisposition('xero', op as never, LATE, { now: NOW })
+    const fromSuppliedEnv = explainProducerDisposition('xero', op as never, LATE, { env: {}, now: NOW })
+    results.push(`process.env=${fromProcessEnv.reason}`, `supplied {}=${fromSuppliedEnv.reason}`)
+    assert.deepEqual([fromProcessEnv.disposition, fromSuppliedEnv.disposition], ['SHADOW', 'SHADOW'])
+    assert.equal(producerGrantCutoffAgreement('xero', {}).state, 'agreed_held', 'the agreement reader is not fooled either')
+  } finally {
+    for (const name of names) delete (Object.prototype as Record<string, unknown>)[name]
+  }
+  console.log(`# arm m: ${results.join(' ')}`)
+  assert.equal(({} as { env?: unknown }).env, undefined, 'the pollution was removed')
+  assert.equal(explainProducerDisposition('xero', op as never, LATE, { env: liveEnv, now: NOW }).disposition, 'LIVE', 'isolating arm: an OWN env is honoured')
+})
+
+test('arm n: an INHERITED clock is ignored; the real clock is used', () => {
+  const op = OPERATION.xero.IMS
+  const env2099 = envFor('xero', 'ok', '2099-01-01T00:00:00Z')
+  const future = new Date('2100-01-01T00:00:00Z')
+  try {
+    ;(Object.prototype as Record<string, unknown>).now = future
+    assert.equal(({} as { now?: unknown }).now, future, 'precondition: Object.prototype.now is polluted')
+    const a = explainProducerDisposition('xero', op as never, LATE, { env: env2099 })
+    const b = explainProducerDisposition('xero', op as never, LATE, Object.create({ now: future, env: env2099 }))
+    console.log(`# arm n: ${a.disposition}/${a.reason} ${b.disposition}/${b.reason}`)
+    assert.deepEqual([a.disposition, a.reason], ['SHADOW', 'before_cutoff'])
+    assert.equal(b.disposition, 'SHADOW')
+    assert.equal(explainProducerDisposition('xero', op as never, new Date('2101-01-01T00:00:00Z'), { env: env2099, now: future }).disposition, 'LIVE', 'isolating arm: an OWN clock in 2100 is LIVE')
+  } finally {
+    delete (Object.prototype as Record<string, unknown>).now
+  }
+})
+
+test('arm o: only primitive strings are names and cut-offs; objects that coerce to valid ones are SHADOW invalid_input', () => {
+  const coercing = (value: string) => ({ toString: () => value, valueOf: () => value, [Symbol.toPrimitive]: () => value })
+  const env = envFor('xero', 'ok', '2026-01-01T00:00:00Z')
+  const cases: Array<[string, unknown, unknown]> = [
+    ['destination object', coercing('xero'), 'purchase.bill'],
+    ['operation object', 'xero', coercing('purchase.bill')],
+    ['destination array', ['xero'], 'purchase.bill'],
+    ['operation array', 'xero', ['purchase.bill']],
+    ['String object', new String('xero'), 'purchase.bill'],
+    ['operation String object', 'xero', new String('purchase.bill')],
+    ['number', 5, 6],
+  ]
+  for (const [label, destination, operation] of cases) {
+    const decision = explainProducerDisposition(destination as never, operation as never, LATE, { env, now: NOW })
+    console.log(`# arm o ${label}: ${decision.disposition}/${decision.reason}`)
+    assert.deepEqual([decision.disposition, decision.reason], ['SHADOW', 'invalid_input'], label)
+  }
+  const objectCutoff = { ...env, [PRODUCER_CUTOFF_ENV.xero]: coercing('2026-01-01T00:00:00Z') as unknown as string }
+  const cutoffDecision = explainProducerDisposition('xero', 'purchase.bill', LATE, { env: objectCutoff, now: NOW })
+  console.log(`# arm o cut-off object: ${cutoffDecision.disposition}/${cutoffDecision.reason}`)
+  assert.equal(cutoffDecision.disposition, 'SHADOW')
+  assert.equal(parseProducerCutoff(coercing('2026-01-01T00:00:00Z') as unknown as string).ok, false)
+  assert.equal(parseProducerCutoff(new String('2026-01-01T00:00:00Z') as unknown as string).ok, false)
+  assert.equal(producerDisposition('xero', 'purchase.bill', LATE, { env, now: NOW }), 'LIVE', 'isolating arm: the same names as primitive strings are LIVE')
+})
+
+test('arm p: patching Map.prototype.get AFTER import cannot forge an ownership row', async () => {
+  const { ownershipRowFor } = await import('../../lib/security/writer-ownership-map.ts')
+  const original = Map.prototype.get
+  const env = envFor('xero', 'ok', '2026-01-01T00:00:00Z')
+  try {
+    Map.prototype.get = function forged() { return { destination: 'xero', operation: 'x', owners: { P0: 'nobody', P1: 'IMS', P2: 'IMS' }, obligationTime: 'not-applicable', note: 'forged' } } as never
+    assert.ok(new Map().get('anything'), 'precondition: the patch is in force')
+    const unmapped = explainProducerDisposition('xero', 'no-such-operation' as never, undefined, { env, now: NOW })
+    const invoice = explainProducerDisposition('xero', 'sales.invoice', LATE, { env, now: NOW })
+    console.log(`# arm p: unmapped=${unmapped.disposition}/${unmapped.reason} sales.invoice=${invoice.disposition}/${invoice.reason} row=${String(ownershipRowFor('xero', 'no-such-operation'))}`)
+    assert.deepEqual([unmapped.disposition, unmapped.reason], ['SHADOW', 'owner_unknown'])
+    assert.deepEqual([invoice.disposition, invoice.reason], ['SHADOW', 'not_ims_owned'])
+    assert.equal(ownershipRowFor('xero', 'no-such-operation'), null)
+  } finally {
+    Map.prototype.get = original
+  }
+  assert.equal(Map.prototype.get, original)
+  assert.equal(producerDisposition('xero', 'purchase.bill', LATE, { env, now: NOW }), 'LIVE', 'isolating arm: restored, an IMS row is LIVE')
 })

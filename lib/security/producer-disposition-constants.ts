@@ -49,6 +49,7 @@ export const PRODUCER_REASONS = [
   'unreadable_obligation',
   'obligation_time_required',
   'obligation_before_cutoff',
+  'invalid_input',
   'unreadable',
 ] as const
 export type ProducerReason = (typeof PRODUCER_REASONS)[number]
@@ -65,6 +66,7 @@ export const PRODUCER_REASON_TEXT: Record<ProducerReason, string> = {
   unreadable_obligation: 'the business-event time of this work could not be read',
   obligation_time_required: 'this operation needs the time of its business event and the producer did not supply it',
   obligation_before_cutoff: 'the business event happened before the live-from instant, so it belongs to the writer that owned it then',
+  invalid_input: 'the destination or operation is not a plain string',
   unreadable: 'the decision could not be evaluated',
 }
 

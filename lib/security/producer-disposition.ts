@@ -29,7 +29,7 @@ import {
   type ProducerAgreementState,
   type ProducerReason,
 } from './producer-disposition-constants'
-import { OUTBOUND_CONNECTORS, type OutboundConnector } from './outbound-write-hold-constants'
+import { OUTBOUND_GRANT_ENV, type OutboundConnector } from './outbound-write-hold-constants'
 import { readOutboundGrantStates, type OutboundEnv } from './outbound-write-grant'
 import { ownershipRowFor, type MappedOperation, type WriterOwner } from './writer-ownership-map'
 
@@ -70,6 +70,9 @@ const DateCtor = Date
 const NumberCtor = Number
 const numberIsFinite = Number.isFinite
 const regexExec = RegExp.prototype.exec
+const hasOwn = Object.prototype.hasOwnProperty
+
+const INVALID_BASE = { owner: 'unknown' as WriterOwner, phase: 'P1' as const, cutoff: null, grant: 'unreadable' as const }
 
 function daysInMonth(year: number, month: number): number {
   if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28
@@ -84,6 +87,7 @@ function daysInMonth(year: number, month: number): number {
  */
 export function parseProducerCutoff(raw: string | undefined): CutoffRead {
   if (raw === undefined || raw === '') return { ok: false, reason: 'absent' }
+  if (typeof raw !== 'string') return { ok: false, reason: 'unreadable' }
   const match = regexExec.call(ISO_UTC_RE, raw) as RegExpExecArray | null
   if (!match) return { ok: false, reason: 'unreadable' }
   const year = NumberCtor(match[1]), month = NumberCtor(match[2]), day = NumberCtor(match[3])
@@ -113,6 +117,18 @@ function readInstant(value: unknown): number | null {
   }
 }
 
+/** The two variables the decision reads for a destination, each copied only if it is an OWN string property. */
+function ownEnvironment(source: object, connector: OutboundConnector): Record<string, string> {
+  const env: Record<string, string> = Object.create(null)
+  for (const name of [OUTBOUND_GRANT_ENV[connector], PRODUCER_CUTOFF_ENV[connector]]) {
+    if (hasOwn.call(source, name)) {
+      const value: unknown = (source as Record<string, unknown>)[name]
+      if (typeof value === 'string') env[name] = value
+    }
+  }
+  return env
+}
+
 function shadow(
   reason: ProducerReason,
   base: Pick<ProducerDecision, 'owner' | 'phase' | 'cutoff' | 'grant'>,
@@ -126,12 +142,18 @@ function evaluate<D extends OutboundConnector>(
   obligationAt: Date | undefined,
   context: ProducerDecisionContext,
 ): ProducerDecision {
-  const env = context.env ?? process.env
-  // Only an ABSENT clock defaults to the current time. Anything supplied, null included, must be readable.
-  const now: unknown = context.now === undefined ? new DateCtor() : context.now
+  // Names are primitive strings or the input is invalid: an object that COERCES to a valid name is not one.
+  if (typeof destination !== 'string' || typeof operation !== 'string') return shadow('invalid_input', INVALID_BASE)
+  // Only OWN properties of the context count: an inherited env or clock (a polluted Object.prototype, a context
+  // created with a prototype) is ignored. Only an ABSENT clock defaults to the current time; anything supplied,
+  // null included, must be readable.
+  const suppliedEnv: unknown = hasOwn.call(context, 'env') ? context.env : undefined
+  const suppliedNow: unknown = hasOwn.call(context, 'now') ? context.now : undefined
+  const now: unknown = suppliedNow === undefined ? new DateCtor() : suppliedNow
   const row = ownershipRowFor(destination, operation)
   const unreadableBase = { owner: 'unknown' as WriterOwner, phase: 'P1' as const, cutoff: null, grant: 'unreadable' as const }
-  if (!(OUTBOUND_CONNECTORS as readonly string[]).includes(destination)) return shadow('unreadable', unreadableBase)
+  if (destination !== 'xero' && destination !== 'mintsoft' && destination !== 'woocommerce') return shadow('unreadable', unreadableBase)
+  const env = ownEnvironment(suppliedEnv === undefined ? process.env : (suppliedEnv as object), destination)
 
   const p1Owner = row?.owners.P1 ?? 'unknown'
 
@@ -209,9 +231,10 @@ export function producerGrantCutoffAgreement(
   env: OutboundEnv = process.env,
 ): ProducerAgreement {
   try {
-    const state = readOutboundGrantStates(env).find((candidate) => candidate.connector === connector)
+    const own = ownEnvironment(env, connector)
+    const state = readOutboundGrantStates(own).find((candidate) => candidate.connector === connector)
     if (!state) throw new Error(`no grant state for ${connector}`)
-    const cutoff = parseProducerCutoff(env[PRODUCER_CUTOFF_ENV[connector]])
+    const cutoff = parseProducerCutoff(own[PRODUCER_CUTOFF_ENV[connector]])
     const make = (agreement: ProducerAgreementState, detail: Parameters<typeof producerAgreementText>[1]): ProducerAgreement => ({
       connector, state: agreement, text: producerAgreementText(connector, detail),
     })

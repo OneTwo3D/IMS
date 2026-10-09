@@ -247,8 +247,12 @@ const BY_KEY: ReadonlyMap<string, OwnershipRow> = new Map(
   WRITER_OWNERSHIP_MAP.map((entry) => [`${entry.destination}.${entry.operation}`, entry as OwnershipRow]),
 )
 
+/** Captured at load: a later patch of Map.prototype.get cannot forge a row. */
+const mapGet = Map.prototype.get
+
 export function ownershipRowFor(destination: string, operation: string): OwnershipRow | null {
-  return BY_KEY.get(`${destination}.${operation}`) ?? null
+  if (typeof destination !== 'string' || typeof operation !== 'string') return null
+  return (mapGet.call(BY_KEY, `${destination}.${operation}`) as OwnershipRow | undefined) ?? null
 }
 
 /**
