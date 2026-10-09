@@ -909,29 +909,39 @@ The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: 
   export keeps the existing value. The domain and port are required, so they have no clearing form. The upload
   scanner settings (`FILE_SCAN_*`) and `INVOICE_PDF_STORAGE_DIR` are not prompted: the installer keeps what is in
   the file, and you change them by editing `.env` and restarting the service.
-* **Every other key already in the file is carried over verbatim** into a `# Kept from the previous .env`
-  block at the end -- hand-added variables such as `TRUSTED_PROXY_IPS`, `REQUIRE_TRUSTED_PROXY_CONFIG` or
-  `XERO_ALLOWED_TENANT_IDS`. `export KEY=value`, `KEY = value` and quoted values that span several lines are read
-  as the single entries they are.
-* **Database connection settings are never carried, because the application's `.env` is not where they may
-  come from.** A key whose *name* looks like a database connection (`DIRECT_URL`, anything with `DATABASE`..`URL`,
-  `DB_URL`, `MIGRATION`, `ADMIN`, `SUPERUSER`, `POSTGRES`, or a `PG...` variable such as `PGPASSWORD`), or whose
-  *value* is a PostgreSQL URL, a URL with a password in it, or contains the deploy admin's password or names the
-  deploy admin role as a connection user, is **not** copied to the new file. The summary lists it by key name, line
-  number and reason (never the value) and the old file is in the backup, so a false positive costs one line copied
-  back by hand. A `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` key is refused outright, before anything is changed
-  (it belongs in `/etc/ims-db-admin/deploy-admin.env`).
-* **The screen needs a password worth screening against.** If the deploy admin password is shorter than 8 characters and the old file holds settings the installer does not set, the run stops in the configuration phase, before anything is changed, with: *the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run.* The screen decodes a candidate value repeatedly (up to four passes, hex digits in either case, `+` as a space) and refuses any value containing the decoded admin password at any pass; the name, URL and role rules apply whatever the password's length.
-* **A file the installer cannot reproduce is not rewritten.** A line that is not `KEY=VALUE` (in one of the forms
-  above), or a quoted value that is never closed, stops the run in the configuration phase, before any package,
-  account or file is touched, naming the line numbers.
-* **A backup is written first**: `${APP_DIR}/.env.bak-<UTC timestamp>-<pid>-<n>`, mode 600, owned by the
-  application account, made from the lines the run read at its start (not re-read). The name is created
-  exclusively, so two runs in the same second cannot replace each other's backup and a name planted by another
-  account is skipped, never written through. The source sync (`rsync --delete`) excludes `.env.bak*`, and the
-  installer never prunes backups: they hold secrets, so delete old ones yourself.
+* **Only a short list of other settings is carried over, and only when the value looks like that setting.** A
+  key of the old file that the installer does not set itself is copied into a `# Kept from the previous .env`
+  block only if it is named on the list in `install.sh` (`ENV_PRESERVE_SHAPES`, one place) -- the non-secret
+  settings this guide tells you to add by hand: `TRUSTED_PROXY_IPS`, `TRUSTED_PROXY_CIDRS`,
+  `REQUIRE_TRUSTED_PROXY_CONFIG`, `BEHIND_PROXY`, `RATE_LIMIT_BACKEND`, `CSP_MODE`, `ALLOW_DATABASE_RESTORE`,
+  `ALLOW_DATABASE_RESTORE_UPLOAD`, `PREFLIGHT_DB_CONNECT`, the `XERO_*` tenant and write-window settings,
+  `WC_WRITES_LIVE_FROM`, `WC_WRITEBACK_ALLOWED_ORIGIN`, the `MINTSOFT_*` write and sweep settings, the
+  `OUTBOX_RETRY_*`, `CONNECTOR_FETCH_*`, `FRESH_AUTH_MAX_AGE_SECONDS`, `INVOICE_PDF_TOKEN_*` and
+  `DATABASE_RESTORE_MAX_FILE_BYTES` limits -- (exact, case-sensitive names) **and** its value has the shape that
+  setting can have (a boolean, a number, a comma-separated list of hosts or CIDRs, a list of tenant ids, an
+  origin, a timestamp; bounded length, closed character set, one line), **and** it passes the admin-secret
+  screen below. The WooCommerce credentials and webhook secret, the Turnstile pair, the scanner settings, the
+  domain, the port and the invoice directory are the installer's own keys and are kept by their prompts.
+* **Everything else is dropped from the new file, and said so.** Any other key -- an unlisted name, a listed
+  name with a value that does not fit, a secret, a database URL, a base64, hex or layered-percent-encoded blob,
+  `export KEY=v` spellings of any of these -- is not written to the new `.env`. The summary lists each dropped
+  key by name, line number and reason (never the value). Nothing is lost: the whole old file is in the backup
+  below. An operator who needs a dropped setting copies the line back by hand, or asks for the name to be added
+  to the list. `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` keys are refused outright, before anything is changed
+  (they belong in `/etc/ims-db-admin/deploy-admin.env`).
+* **A file the installer cannot reproduce is not rewritten.** A line that is not `KEY=VALUE` (also read: `export
+  KEY=value`, `KEY = value`, and quoted values that span several lines), or a quoted value that is never closed,
+  stops the run in the configuration phase, before any package, account or file is touched, naming the line
+  numbers.
+* **A backup is written first, and it is root-only**: `/etc/ims-db-admin/previous-app-env-<UTC timestamp>-<pid>-<n>`,
+  mode 600, owned by root, in the directory (root, 0700) that already holds the admin credential, and therefore
+  outside the application tree where the application account can neither read nor replace it. It is the old file
+  verbatim, made from the lines the run read at its start. The name is created exclusively, so two runs in the same
+  second cannot replace each other's backup and a name planted by another account is skipped, never written
+  through. The installer never prunes backups: they hold secrets, so delete old ones yourself.
 * **It says what it did**, by key name only (never a value): the backup path, the keys kept, the values this
-  run changed, the keys it added, and any key that was not carried over and why.
+  run changed, the keys it added, and every key that was not carried over and why.
+* **The screen needs a password worth screening against.** If the deploy admin password is shorter than 8 characters and the old file holds settings the installer does not set, the run stops in the configuration phase, before anything is changed, with: *the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run.* For the listed settings the screen decodes a candidate value repeatedly (up to four passes, hex digits in either case, `+` as a space), refuses any value containing the decoded admin password at any pass, and refuses a value that still contains a percent-escape after the passes or is longer than 4096 bytes; the name, URL and role rules apply whatever the password's length.
 
 Not preserved across a re-run, because they are not in `.env`: the SMTP values (they seed the settings
 table once) and the database host, port, name and user (supply them again, or as environment variables).

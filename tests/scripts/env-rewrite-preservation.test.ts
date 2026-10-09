@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
@@ -39,7 +39,8 @@ const OLD_ENV = [
   'WC_WEBHOOK_SECRET=whsec_old',
   'TRUSTED_PROXY_IPS=10.0.0.1,10.0.0.2',
   'REQUIRE_TRUSTED_PROXY_CONFIG=true',
-  'XERO_ALLOWED_TENANT_IDS=tenant-a=b#c',
+  'XERO_ALLOWED_TENANT_IDS=tenant-a,tenant-b',
+  'MY_FEATURE_FLAG=on',
   'FILE_SCAN_MODE=clamav',
   '',
 ].join('\n')
@@ -67,6 +68,10 @@ const LIB = [
   shippedFunction(INSTALL, 'load_existing_env'),
   shippedFunction(INSTALL, 'env_percent_decode'),
   shippedFunction(INSTALL, 'env_percent_encode'),
+  /^declare -A ENV_PRESERVE_SHAPES=\([\s\S]*?^\)$/m.exec(INSTALL)?.[0] ?? 'declare -A ENV_PRESERVE_SHAPES=()',
+  'ENV_PRESERVE_MAX_LENGTH=4096; ENV_BACKUP_OWNER="$(id -un):$(id -gn)"',
+  shippedFunction(INSTALL, 'env_value_has_shape'),
+  shippedFunction(INSTALL, 'env_value_has_residual_escape'),
   shippedFunction(INSTALL, 'env_value_leaks_secret'),
   shippedFunction(INSTALL, 'env_admin_password_decoded'),
   shippedFunction(INSTALL, 'env_unowned_existing_keys'),
@@ -78,21 +83,26 @@ const LIB = [
 ].join('\n')
 
 /** The template output of a re-run, reduced to the keys the arms care about. */
-const RENDERED = ['APP_PORT=3000', 'AUTH_SECRET=old-auth', 'WC_STORE_URL=https://shop.example.test', 'FILE_SCAN_MODE=clamav', 'NEW_KEY=1'].join('\n')
+const RENDERED = ['APP_PORT=3000', 'AUTH_SECRET=old-auth', 'WC_STORE_URL=https://shop.example.test', 'WC_CONSUMER_KEY=ck_old', 'WC_CONSUMER_SECRET=cs_old', 'WC_WEBHOOK_SECRET=whsec_old', 'FILE_SCAN_MODE=clamav', 'NEW_KEY=1'].join('\n')
 
-test('re-run: keys the installer does not own are carried over verbatim; owned ones are not duplicated', async () => {
+test('re-run: only keys on the carry list are carried, verbatim; every other unowned key is dropped and reported', async () => {
   await withTempDir('ims-env-keep-', async (dir) => {
     const old = join(dir, '.env')
     writeFileSync(old, OLD_ENV)
     const r = bash([LIB, `load_existing_env '${old}'`, `rendered='${RENDERED}'`,
-      'render_preserved_env_keys "${rendered}"; echo "RC=$?"', 'printf "%s" "${ENV_PRESERVED_BLOCK}"', 'echo "KEPT=${ENV_KEPT_KEYS[*]}"'].join('\n'))
+      'render_preserved_env_keys "${rendered}"; echo "RC=$?"', 'printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"', 'echo "KEPT=${ENV_KEPT_KEYS[*]}"',
+      'printf "DROPPED:%s\\n" "${ENV_REFUSED_KEYS[@]}"'].join('\n'))
     console.log(`  precondition: previous file read; kept -> ${JSON.stringify(r.out.split('\n').filter((l) => /^(KEPT|RC)=/.test(l)))}`)
+    console.log(`  dropped -> ${JSON.stringify(r.out.split('\n').filter((l) => /^DROPPED:/.test(l)))}`)
     assert.match(r.out, /RC=0/)
-    assert.match(r.out, /KEPT=REQUIRE_TRUSTED_PROXY_CONFIG TRUSTED_PROXY_IPS WC_CONSUMER_KEY WC_CONSUMER_SECRET WC_WEBHOOK_SECRET XERO_ALLOWED_TENANT_IDS/)
+    assert.match(r.out, /KEPT=REQUIRE_TRUSTED_PROXY_CONFIG TRUSTED_PROXY_IPS XERO_ALLOWED_TENANT_IDS\n/)
     assert.match(r.out, /^TRUSTED_PROXY_IPS=10\.0\.0\.1,10\.0\.0\.2$/m)
-    assert.match(r.out, /^XERO_ALLOWED_TENANT_IDS=tenant-a=b#c$/m, 'a value containing = and # is carried byte for byte')
-    assert.doesNotMatch(r.out, /^APP_PORT=/m, 'a key the template sets is not written twice')
-    assert.doesNotMatch(r.out, /^FILE_SCAN_MODE=/m)
+    assert.match(r.out, /^XERO_ALLOWED_TENANT_IDS=tenant-a,tenant-b$/m)
+    const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
+    assert.doesNotMatch(block, /^APP_PORT=/m, 'a key the template sets is not written twice')
+    // THE ALLOWLIST IS THE ONLY PATH: an unknown key with an innocuous value is dropped, and says so.
+    assert.doesNotMatch(block, /MY_FEATURE_FLAG/, 'an unknown key with a harmless value is NOT carried')
+    assert.match(r.out, /DROPPED:MY_FEATURE_FLAG \(line \d+\): not on the list of settings a re-run carries over/)
   })
 })
 
@@ -110,22 +120,37 @@ test('re-run: a deploy admin credential left in the application .env is REFUSED,
   })
 })
 
-test('re-run: a timestamped mode-600 backup of the old file is written from what was read, before anything is replaced', async () => {
+const adminDir = (dir: string): string => {
+  const d = join(dir, 'admin-private')
+  mkdirSync(d, { mode: 0o700 })
+  chmodSync(d, 0o700)
+  return d
+}
+
+test('re-run: the backup of the old file is root-only, outside the application tree, written from what was read, before anything is replaced', async () => {
   await withTempDir('ims-env-bak-', async (dir) => {
     const old = join(dir, '.env.src')
     writeFileSync(old, OLD_ENV)
-    const appDir = join(dir, 'app')
-    mkdirSync(appDir)
+    const credDir = adminDir(dir)
     const target = join(dir, 'captured')
     const r = bash([LIB, 'date() { echo 20261008T120000Z; }',
       // publish_durable_file replaced by a recorder: arguments + stdin.
       `publish_durable_file() { echo "PUBLISH $1 $2 $3" > '${target}.args'; cat > '${target}.body'; }`,
-      `load_existing_env '${old}'`, `APP_DIR='${appDir}'`, 'write_env_backup; echo "RC=$?"', 'echo "FILE=${ENV_BACKUP_FILE}"'].join('\n'))
+      `load_existing_env '${old}'`, `APP_DIR='/opt/app-not-used'`, `DB_ADMIN_CREDENTIAL_DIR='${credDir}'`, 'write_env_backup; echo "RC=$?"', 'echo "FILE=${ENV_BACKUP_FILE}"'].join('\n'))
     const args = readFileSync(`${target}.args`, 'utf8').trim()
     console.log(`  backup: ${args.replace(dir, '<tmp>')}`)
     assert.match(r.out, /RC=0/)
-    assert.match(args, new RegExp(`^PUBLISH ${appDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.env\\.bak-20261008T120000Z-\\d+-0 app:app 600$`))
-    assert.equal(readFileSync(`${target}.body`, 'utf8'), OLD_ENV, 'the backup is the old file byte for byte')
+    assert.match(args, new RegExp(`^PUBLISH ${credDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/previous-app-env-20261008T120000Z-\\d+-0 \\S+:\\S+ 600$`))
+    assert.doesNotMatch(args, /opt\/app-not-used/, 'and it is not under the application directory')
+    assert.equal(readFileSync(`${target}.body`, 'utf8'), OLD_ENV, 'the backup is the old file byte for byte (every dropped key is in it)')
+    // The directory is judged: wrong mode refused, nothing published.
+    chmodSync(credDir, 0o755)
+    const loose = bash([LIB, 'publish_durable_file() { echo CALLED; }', `load_existing_env '${old}'`, `DB_ADMIN_CREDENTIAL_DIR='${credDir}'`, 'write_env_backup; echo "RC=$?"'].join('\n'))
+    console.log(`  directory mode 0755: ${JSON.stringify(loose.out.trim().split('\n').map((l) => l.slice(0, 100)))}`)
+    assert.match(loose.out, /RC=1/)
+    assert.match(loose.out, /must be owned by root with mode 0700/)
+    assert.doesNotMatch(loose.out, /CALLED/)
+    chmodSync(credDir, 0o700)
     // First install: nothing to back up, nothing published.
     const first = bash([LIB, 'publish_durable_file() { echo CALLED; }', 'write_env_backup; echo "RC=$? FILE=[${ENV_BACKUP_FILE}]"'].join('\n'))
     assert.match(first.out, /RC=0 FILE=\[\]/)
@@ -137,24 +162,23 @@ test('re-run: two backups in the same second get different names, and a planted 
   await withTempDir('ims-env-bak2-', async (dir) => {
     const old = join(dir, '.env.src')
     writeFileSync(old, OLD_ENV)
-    const appDir = join(dir, 'app')
-    mkdirSync(appDir)
+    const credDir = adminDir(dir)
     const program = (extra: string) => [LIB, 'date() { echo 20261008T120000Z; }',
       // The recorder publishes for real into the reserved name, as publish_durable_file renames over it.
       'publish_durable_file() { cat > "$1"; }',
-      `load_existing_env '${old}'`, `APP_DIR='${appDir}'`, extra,
+      `load_existing_env '${old}'`, `DB_ADMIN_CREDENTIAL_DIR='${credDir}'`, extra,
       'write_env_backup; echo "FIRST=${ENV_BACKUP_FILE##*/}"', 'write_env_backup; echo "SECOND=${ENV_BACKUP_FILE##*/}"'].join('\n')
     const r = bash(program(''))
     const first = /FIRST=(\S+)/.exec(r.out)?.[1]
     const second = /SECOND=(\S+)/.exec(r.out)?.[1]
     console.log(`  same-second names: ${first} / ${second}`)
     assert.ok(first && second && first !== second, 'precondition: two names were handed out')
-    assert.equal(readFileSync(join(appDir, first), 'utf8'), OLD_ENV, 'and the first backup is still there, intact')
-    assert.equal(readFileSync(join(appDir, second), 'utf8'), OLD_ENV)
+    assert.equal(readFileSync(join(credDir, first), 'utf8'), OLD_ENV, 'and the first backup is still there, intact')
+    assert.equal(readFileSync(join(credDir, second), 'utf8'), OLD_ENV)
     // A name already taken (here a symlink planted at the first candidate) is skipped, not followed.
     const victim = join(dir, 'victim')
     writeFileSync(victim, 'DO NOT TOUCH\n')
-    const planted = bash(program(`ln -s '${victim}' "${appDir}/.env.bak-20261008T120000Z-$$-0"`))
+    const planted = bash(program(`ln -s '${victim}' "${credDir}/previous-app-env-20261008T120000Z-$$-0"`))
     const pf = /FIRST=(\S+)/.exec(planted.out)?.[1]
     console.log(`  with a planted symlink at -0: ${pf}; victim intact: ${readFileSync(victim, 'utf8') === 'DO NOT TOUCH\n'}`)
     assert.match(pf ?? '', /-1$/, 'the planted name was skipped')
@@ -170,7 +194,7 @@ test('re-run: the summary names what was kept, changed and added, and never prin
     const r = bash([LIB, `load_existing_env '${old}'`, 'ENV_BACKUP_FILE=/opt/app/.env.bak-x', `rendered='${now}'`,
       'render_preserved_env_keys "${rendered}" > /dev/null', 'print_env_rewrite_summary "${rendered}"'].join('\n'))
     console.log(`  summary: ${JSON.stringify(r.out.split('\n').map((l) => l.slice(0, 110)))}`)
-    assert.match(r.out, /Backup \(mode 600\): \/opt\/app\/\.env\.bak-x/)
+    assert.match(r.out, /Backup \(root-only, mode 600\): \/opt\/app\/\.env\.bak-x/)
     assert.match(r.out, /kept as it was.*TRUSTED_PROXY_IPS/)
     assert.match(r.out, /values this run changed \(1\): APP_PORT/)
     assert.match(r.out, /keys this run added \(1\): NEW_KEY/)
@@ -225,55 +249,102 @@ test('re-run: export/spaced forms and multi-line quoted values are read whole; a
   })
 })
 
-test('re-run: a multi-line value is carried across whole', async () => {
+test('re-run: a multi-line value under an unlisted key is dropped from the new file and kept whole in the backup', async () => {
   await withTempDir('ims-env-mlc-', async (dir) => {
     const old = join(dir, '.env')
-    writeFileSync(old, 'APP_PORT=3000\nCERT_PEM="first\nsecond=\nthird"\nTAIL=1\n')
-    const r = bash([LIB, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"'].join('\n'))
-    console.log(`  multi-line carried: ${JSON.stringify(r.out.slice(-80))}`)
-    assert.match(r.out, /CERT_PEM="first\nsecond=\nthird"\nTAIL=1\n>>/)
+    writeFileSync(old, 'APP_PORT=3000\nCERT_PEM="first\nsecond=\nthird"\nTAIL=1\nTRUSTED_PROXY_IPS="a\nb"\n')
+    const r = bash([LIB, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"; printf "DROPPED:%s\\n" "${ENV_REFUSED_KEYS[@]}"; printf "RAW<<%s>>" "$(printf "%s\\n" "${EXISTING_ENV_RAW[@]}")"'].join('\n'))
+    console.log(`  multi-line: ${JSON.stringify(r.out.split('\n').filter((l) => /^DROPPED:/.test(l)))}`)
+    const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
+    assert.doesNotMatch(block, /CERT_PEM/, 'the unlisted multi-line value is not carried')
+    assert.doesNotMatch(block, /TRUSTED_PROXY_IPS/, 'and a listed key whose value spans lines does not have the shape of a host list')
+    assert.match(r.out, /DROPPED:CERT_PEM .*not on the list/)
+    assert.match(r.out, /DROPPED:TRUSTED_PROXY_IPS .*does not have the shape of a hostlist setting/)
+    assert.match(r.out, /RAW<<[\s\S]*CERT_PEM="first\nsecond=\nthird"/, 'the backup lines still hold the whole value')
   })
 })
 
 const CARRY_ADMIN = 'postgresql://deployadmin:Adm1nPassw0rd@127.0.0.1:5432/db'
 
-test('re-run: a database-connection-like key or value is NOT carried into the application .env; the reason is listed, the value never printed', async () => {
+test('re-run: nothing outside the carry list reaches the new file, whatever it is called or encoded as; the reason is listed, the value never printed', async () => {
   await withTempDir('ims-env-carry-', async (dir) => {
     const old = join(dir, '.env')
+    const b64 = Buffer.from(CARRY_ADMIN).toString('base64')
+    const hex = Buffer.from(CARRY_ADMIN).toString('hex')
+    const layered = [...Array(6)].reduce((acc: string) => encodeURIComponent(acc), 'x/Adm1nPassw0rd') // six layers
     writeFileSync(old, [
       'APP_PORT=3000',
       `DIRECT_URL=${CARRY_ADMIN}`,
       `MIGRATION_DATABASE_URL=${CARRY_ADMIN}`,
       'PGPASSWORD=Adm1nPassw0rd',
-      'PGUSER=deployadmin',
       `direct_url=${CARRY_ADMIN}`,
       `export SHADOW_DATABASE_URL=${CARRY_ADMIN}`,
       'REPORTING_CONN=postgres://reader:readerpw@db.example.test/reports',
       'PROXYISH=http://user:secretpw@proxy.example.test:3128',
       'INNOCUOUS_NOTE=copied from the admin file: Adm1nPassw0rd',
-      'ROLE_NOTE=connect as deployadmin: postgres://deployadmin@h/db',
-      'TRUSTED_PROXY_IPS=10.0.0.1',
-      'XERO_ALLOWED_TENANT_IDS=tenant-a',
+      `REPORTING_CONFIG=${b64}`,
+      `REPORTING_HEX=${hex}`,
+      `REPORTING_LAYERS=${layered}`,
+      // ...and the same disguises under key names that ARE on the list: the shape rejects them.
+      `TRUSTED_PROXY_IPS=${b64}`,
+      `XERO_ALLOWED_TENANT_IDS=${hex}`,
+      `RATE_LIMIT_BACKEND=${layered}`,
+      'TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.0.0/16',
+      'REQUIRE_TRUSTED_PROXY_CONFIG=true',
       '',
     ].join('\n'))
     const r = bash([LIB, `DEPLOY_ADMIN_DATABASE_URL='${CARRY_ADMIN}'`, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'",
       'render_preserved_env_keys "${rendered}"; echo "RC=$?"', 'printf "BLOCK<<%s>>\\n" "${ENV_PRESERVED_BLOCK}"',
       'ENV_BACKUP_FILE=/b; print_env_rewrite_summary "${rendered}"'].join('\n'))
-    console.log(`  carried block: ${JSON.stringify(/BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1])}`)
-    console.log(`  refused: ${JSON.stringify(r.out.split('\n').filter((l) => /^WARN:     /.test(l)).map((l) => l.slice(0, 110)))}`)
-    assert.match(r.out, /RC=0/)
     const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
-    assert.match(block, /^TRUSTED_PROXY_IPS=10\.0\.0\.1$/m, 'precondition: ordinary hand-added keys are still carried')
-    assert.match(block, /^XERO_ALLOWED_TENANT_IDS=tenant-a$/m)
-    for (const gone of ['DIRECT_URL', 'MIGRATION_DATABASE_URL', 'PGPASSWORD', 'PGUSER', 'direct_url', 'SHADOW_DATABASE_URL', 'REPORTING_CONN', 'PROXYISH', 'INNOCUOUS_NOTE', 'ROLE_NOTE']) {
-      assert.doesNotMatch(block, new RegExp(`^${gone}=`, 'm'), `${gone} must not be carried`)
-      assert.match(r.out, new RegExp(`WARN:     ${gone} \\(line \\d+\\): `), `${gone} must be listed with its line and a reason`)
+    console.log(`  carried block: ${JSON.stringify(block)}`)
+    console.log(`  dropped: ${JSON.stringify(r.out.split('\n').filter((l) => /^WARN:     /.test(l)).map((l) => l.slice(10, 120)))}`)
+    assert.match(r.out, /RC=0/)
+    assert.deepEqual(block.split('\n').filter((l) => l && !l.startsWith('#')).sort(),
+      ['REQUIRE_TRUSTED_PROXY_CONFIG=true', 'TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.0.0/16'], 'ONLY the two well-formed listed keys are carried')
+    for (const gone of ['DIRECT_URL', 'MIGRATION_DATABASE_URL', 'PGPASSWORD', 'direct_url', 'SHADOW_DATABASE_URL', 'REPORTING_CONN', 'PROXYISH', 'INNOCUOUS_NOTE', 'REPORTING_CONFIG', 'REPORTING_HEX', 'REPORTING_LAYERS']) {
+      assert.match(r.out, new RegExp(`WARN:     ${gone} \\(line \\d+\\): not on the list of settings a re-run carries over`), `${gone} must be listed as dropped`)
     }
-    assert.match(r.out, /WARN:     INNOCUOUS_NOTE \(line \d+\): the value contains the deploy admin's password/, 'a value-only match under an innocuous name is caught')
-    assert.match(r.out, /WARN:     ROLE_NOTE .*PostgreSQL connection URL/)
-    assert.match(r.out, /WARN:     PROXYISH .*URL with a password/)
-    for (const secret of ['Adm1nPassw0rd', 'readerpw', 'secretpw']) assert.doesNotMatch(r.out, new RegExp(secret), `${secret} must never be printed`)
+    for (const listed of ['TRUSTED_PROXY_IPS', 'XERO_ALLOWED_TENANT_IDS', 'RATE_LIMIT_BACKEND']) {
+      assert.match(r.out, new RegExp(`WARN:     ${listed} \\(line \\d+\\): the value does not have the shape`), `${listed} with an encoded blob must fail its shape`)
+    }
+    for (const secret of ['Adm1nPassw0rd', 'readerpw', 'secretpw', b64, hex]) assert.doesNotMatch(r.out.replace(/BLOCK<<[\s\S]*?>>/, ''), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'no value is ever printed')
   })
+})
+
+test('re-run: the carry list is the ONLY path — property check over many innocuous unknown keys, and over the shapes', () => {
+  const names = ['MY_FEATURE_FLAG', 'LOG_LEVEL', 'SENTRY_ENVIRONMENT', 'TZ', 'lowercase_key', 'trusted_proxy_ips', 'Trusted_Proxy_Ips', 'X', 'A_B_C_D', 'XERO_UNLISTED', 'WC_UNLISTED', 'REQUIRE_TRUSTED_PROXY_CONFIG_X']
+  const body = names.map((n) => `EXISTING_ENV[${n}]=on`).join('; ')
+  const r = bash([LIB, 'declare -A EXISTING_ENV_LINENO=()', body, 'render_preserved_env_keys "APP_PORT=3000"; printf "KEPT<<%s>>" "${ENV_KEPT_KEYS[*]-}"; printf "N=%s" "${#ENV_REFUSED_KEYS[@]}"'].join('\n'))
+  console.log(`  ${names.length} innocuous unknown keys: ${r.out.trim().split('\n').pop()}`)
+  assert.match(r.out, /KEPT<<>>/, 'not one innocuous unknown key is carried')
+  assert.match(r.out, new RegExp(`N=${names.length}$`))
+  // The shapes: accepted and rejected examples per shape, so a loosened class is red.
+  const ok: Record<string, string[]> = {
+    bool: ['true', 'false', '1', '0'], int: ['0', '5000', '123456789012'], word: ['redis', 'memory', 'report-only'],
+    hostlist: ['10.0.0.1', '10.0.0.0/8,192.168.1.1', '::1,fe80::1', 'proxy.example.test'],
+    idlist: ['tenant-a', 'a,b,c'], names: ["Acme Ltd,O'Neil & Sons"], origin: ['https://shop.example.test', 'http://localhost:3000'],
+    timestamp: ['2026-10-01', '2026-10-01T09:00:00Z', '2026-10-01T09:00:00.000+01:00'],
+  }
+  const bad: Record<string, string[]> = {
+    bool: ['yes', 'TRUE', ''], int: ['12a', '-1', '1234567890123'], word: ['9x', 'a b', 'redis;rm', 'x'.repeat(40)],
+    hostlist: ['10.0.0.1 10.0.0.2', 'a=b', 'a%2Fb', 'QWxhZGRpbjpvcGVu==', 'x'.repeat(65)], idlist: ['a b', 'a;b', 'postgres://x'], names: ['a%2Fb', 'a=b'],
+    origin: ['ftp://x', 'https://u:p@h', 'https://h/path'], timestamp: ['yesterday', '2026-10-01 09:00'],
+  }
+  let checks = 0
+  for (const shape of Object.keys(ok)) {
+    for (const v of ok[shape]) { assert.equal(bash([LIB, `env_value_has_shape '${shape}' '${v.replace(/'/g, "'\\''")}'; echo "RC=$?"`].join('\n')).out.trim().split('\n').pop(), 'RC=0', `${shape} accepts ${v}`); checks++ }
+    for (const v of bad[shape]) { assert.equal(bash([LIB, `env_value_has_shape '${shape}' '${v}'; echo "RC=$?"`].join('\n')).out.trim().split('\n').pop(), 'RC=1', `${shape} rejects ${v}`); checks++ }
+  }
+  console.log(`  shape table: ${checks} accept/reject checks`)
+  // Length cap and residual escapes.
+  assert.equal(bash([LIB, `env_value_has_shape int "${'1'.repeat(5000)}"; echo "RC=$?"`].join('\n')).out.trim().split('\n').pop(), 'RC=1')
+  const six = 'a%252525252525252F'
+  const esc = (v: string) => bash([LIB, `env_value_has_residual_escape '${v}'; echo "RC=$?"`].join('\n')).out.trim().split('\n').pop()
+  console.log(`  residual escape: 6-layer ${esc(six)}, plain ${esc('plain-value')}, one layer ${esc('a%2Fb')}`)
+  assert.equal(esc(six), 'RC=0', 'a value encoded more deeply than the decode passes is refused, not passed')
+  assert.equal(esc('plain-value'), 'RC=1')
+  assert.equal(esc('a%2Fb'), 'RC=1', 'what the decode passes fully resolve is not "residual"')
 })
 
 test('re-run: the admin-material checks need the admin credential to be known, and ordinary keys pass without it', async () => {
@@ -350,14 +421,17 @@ test('re-run: the domain, port and upload-scanner settings default to what is in
   assert.match(factory.out, /MODE=\[disabled\] CMD=\[\] TIMEOUT=\[30000\]/)
 })
 
-test('re-run: the .env write backs up and keeps before it replaces, and the source sync does not delete backups', () => {
+test('re-run: the .env write backs up and keeps before it replaces; the backup is outside the tree so the source sync needs no exception', () => {
   const body = shippedFunction(INSTALL, 'write_app_env_file')
   const order = ['render_app_env_file', 'render_preserved_env_keys', 'write_env_backup', 'publish_durable_file'].map((n) => body.indexOf(n))
   console.log(`  write_app_env_file call order offsets: ${order.join(' < ')}`)
   assert.ok(order.every((o) => o > 0) && order.every((o, i) => i === 0 || o > order[i - 1]), 'render, preserve, back up, then publish')
-  const excludes = INSTALL.split('\n').filter((l) => l.trim() === "--exclude='.env.bak*' \\")
-  console.log(`  rsync .env.bak* excludes: ${excludes.length}`)
-  assert.equal(excludes.length, 2, 'both rsync --delete calls spare the backups')
+  const backup = shippedFunction(INSTALL, 'write_env_backup')
+  assert.match(backup, /candidate="\$\{DB_ADMIN_CREDENTIAL_DIR\}\/previous-app-env-/, 'the backup is made in the root-only directory')
+  assert.doesNotMatch(backup, /APP_DIR/, 'and nowhere in the application tree')
+  assert.match(backup, /publish_durable_file "\$\{ENV_BACKUP_FILE\}" "\$\{ENV_BACKUP_OWNER\}" 600/)
+  assert.match(INSTALL, /^ENV_BACKUP_OWNER="root:root"$/m, 'owned by root')
+  assert.equal(INSTALL.split('\n').filter((l) => l.includes('.env.bak')).length, 0, 'no leftover in-tree backup name or sync exception')
   assert.match(INSTALL, /^print_env_rewrite_summary "\$\{ENV_LAST_RENDERED\}"$/m, 'and the summary is printed after the write')
 })
 

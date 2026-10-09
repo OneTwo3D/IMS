@@ -1722,8 +1722,8 @@ const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number
       '${DEPLOY_SSH_KNOWN_HOSTS}',
       '${DEPLOY_META_FILE}',
       '${APP_DIR}/.env',
-      // The timestamped backup of the previous .env, written beside it (mode 600, the application account).
-      '${APP_DIR}/.env.bak-20261008T120000Z',
+      // The timestamped backup of the previous .env: root-owned, mode 600, in the root-only credential directory.
+      '${DB_ADMIN_CREDENTIAL_DIR}/previous-app-env-20261008T120000Z-1234-0',
       // `$canonical`
       '${DB_FENCE_STATE}', '${CRON_BACKUP}', '${FENCE_FILE}',
     ],

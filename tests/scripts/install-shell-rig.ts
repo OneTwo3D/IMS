@@ -74,6 +74,8 @@ export const SHIPPED = [
   'env_percent_decode',
   'env_percent_encode',
   'env_value_leaks_secret',
+  'env_value_has_shape',
+  'env_value_has_residual_escape',
   'env_key_carry_check',
   'mask_secret',
   'prompt',
@@ -247,6 +249,13 @@ export const DB_CA_ASSIGNMENTS = [
   .map((name) => shellConstant(INSTALL_SOURCE, name, 'scripts/install.sh'))
   .join('\n')
 
+/** The allowlist of carried settings, lifted verbatim so a rig cannot drift from the shipped list. */
+export const ENV_PRESERVE_SHAPES_BLOCK = (() => {
+  const match = /^declare -A ENV_PRESERVE_SHAPES=\([\s\S]*?^\)$/m.exec(INSTALL_SOURCE)
+  assert.ok(match, 'precondition: scripts/install.sh must define ENV_PRESERVE_SHAPES')
+  return match[0]
+})()
+
 export const ENV_HEREDOC_DEFAULTS = [
   ...new Set(
     [...shippedFunction(INSTALL_SOURCE, 'render_app_env_file').matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}/g)]
@@ -399,6 +408,8 @@ on_route() {
 }
 declare -A EXISTING_ENV=()
 declare -A EXISTING_ENV_LINENO=()
+${ENV_PRESERVE_SHAPES_BLOCK}
+ENV_PRESERVE_MAX_LENGTH=4096
 declare -a EXISTING_ENV_UNCLASSIFIED=()
 declare -a ENV_REFUSED_KEYS=()
 ENV_REFUSAL_REASON=''
@@ -409,6 +420,11 @@ ${assignments}
 # directory of this run's own, for the same reason the clusters get one. Every test therefore has a
 # WORKING journal path without asking for it, which is what production has: a rotation that cannot
 # journal REFUSES, so a rig with no path would quietly be testing that refusal instead.
+# And the root-only directory the backup of the previous .env goes to: private to this run, mode 0700, owned by
+# this run's own user (a rig is not root), as install.sh judges it.
+DB_ADMIN_CREDENTIAL_DIR="\${DB_ADMIN_CREDENTIAL_DIR:-\${APP_DIR}/admin-private}"
+ENV_BACKUP_OWNER="$(id -un):$(id -gn)"
+mkdir -p "\${DB_ADMIN_CREDENTIAL_DIR}" && chmod 700 "\${DB_ADMIN_CREDENTIAL_DIR}"
 DB_ENV_SNAPSHOT_DIR="\${DB_ENV_SNAPSHOT_DIR:-\${APP_DIR}/cutover-private}"
 DB_ROLE_ROTATION_JOURNAL="\${DB_ROLE_ROTATION_JOURNAL:-\${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal}"
 # r46 (Codex MEDIUM): and the published trust root, for the same reason and in the same shape. In
@@ -689,8 +705,8 @@ export function writeInstalledEnv(appDir: string, port: number, password: string
     // re-run now carries unowned keys across, so it is the trap for an unanchored match, and the re-run refuses to CARRY it (its name looks like a
     // database connection) -- the rotation tests prove the one line that moves; the carry-over has its own.)
     `ANALYTICS_DATABASE_URL=postgresql://reporting:report-password@127.0.0.1:${port}/one_two_inventory`,
-    // And an ordinary hand-added key, which the re-run carries across.
-    'REPORTING_TIMEOUT_MS=5000',
+    // And a hand-added key on the carry list, which the re-run keeps (any other would be dropped to the backup).
+    'TRUSTED_PROXY_IPS=10.0.0.9',
     'NEXT_PUBLIC_APP_URL=https://ims.example.test',
     '',
   ].join('\n')

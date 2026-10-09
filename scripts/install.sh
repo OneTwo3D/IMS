@@ -692,6 +692,92 @@ env_admin_password_decoded() {
 ENV_ADMIN_PASSWORD_MIN_LENGTH=8
 ENV_ADMIN_PASSWORD_TOO_SHORT_MESSAGE="the deploy admin password is too short to screen preserved settings against; set a password of at least 8 characters or remove the extra settings and re-run."
 
+# THE ONLY SETTINGS A RE-RUN CARRIES OVER THAT THE TEMPLATE DOES NOT SET -- AND THE SHAPE EACH MUST HAVE.
+#
+# The carry-over used to be "everything except what looks dangerous", and every review round found one more
+# way to dress a credential up as something innocuous (percent-encoding in layers, base64, hex of the whole
+# admin URL). Enumerating disguises cannot end, so the policy is structural: a key of the previous .env that
+# this installer does not set is carried ONLY if it is named below (exact, case-sensitive) AND its value has
+# the shape its setting can have AND it passes the admin-secret screen. Everything else is DROPPED from the new
+# file, written verbatim to the root-only backup (see write_env_backup), and reported by name.
+#
+# The list is the non-secret, non-connection settings docs/installation.md and .env.example tell an operator
+# to set by hand. WooCommerce credentials and the webhook secret, the Turnstile pair, the scanner settings, the
+# domain, the port and the invoice directory are the template's own keys and are preserved by their prompts.
+# Secrets (API keys, SMTP passwords, token paths), database URLs and anything not named here are NOT carried: an
+# operator who needs one back copies it from the backup. A shape is a name understood by env_value_has_shape.
+declare -A ENV_PRESERVE_SHAPES=(
+  [TRUSTED_PROXY_IPS]=hostlist
+  [TRUSTED_PROXY_CIDRS]=hostlist
+  [REQUIRE_TRUSTED_PROXY_CONFIG]=bool
+  [BEHIND_PROXY]=bool
+  [RATE_LIMIT_BACKEND]=word
+  [CSP_MODE]=word
+  [ALLOW_DATABASE_RESTORE]=bool
+  [ALLOW_DATABASE_RESTORE_UPLOAD]=bool
+  [PREFLIGHT_DB_CONNECT]=bool
+  [XERO_ALLOWED_TENANT_IDS]=idlist
+  [XERO_BLOCKED_TENANT_IDS]=idlist
+  [XERO_ALLOWED_TENANT_NAMES]=names
+  [XERO_REQUIRE_DEMO_ORG]=bool
+  [XERO_TENANT_ID]=idlist
+  [XERO_WRITE_ALLOWED_TENANT]=idlist
+  [XERO_DAILY_BATCH_LIMIT]=int
+  [XERO_WRITES_LIVE_FROM]=timestamp
+  [WC_WRITES_LIVE_FROM]=timestamp
+  [MINTSOFT_WRITES_LIVE_FROM]=timestamp
+  [MINTSOFT_WRITE_ALLOWED]=bool
+  [MINTSOFT_USE_BULK_ASN_LOOKUP]=bool
+  [MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE]=int
+  [WC_WRITEBACK_ALLOWED_ORIGIN]=origin
+  [OUTBOX_RETRY_BASE_MS]=int
+  [OUTBOX_RETRY_JITTER_MS]=int
+  [OUTBOX_RETRY_MAX_MS]=int
+  [CONNECTOR_FETCH_TIMEOUT_MS]=int
+  [CONNECTOR_FETCH_MAX_RESPONSE_BYTES]=int
+  [FRESH_AUTH_MAX_AGE_SECONDS]=int
+  [INVOICE_PDF_TOKEN_TTL_SECONDS]=int
+  [INVOICE_PDF_TOKEN_MAX_TTL_SECONDS]=int
+  [DATABASE_RESTORE_MAX_FILE_BYTES]=int
+)
+ENV_PRESERVE_MAX_LENGTH=4096
+
+# Who owns the backup of the previous .env: root. A top-level assignment (not a parameter) so a test rig, which
+# is not root, can give the file to its own user the same way DB_CA_PUBLISH_OWNER is handled.
+ENV_BACKUP_OWNER="root:root"
+
+# Does ${2} have the shape ${1}? Every shape is a closed character class with a bounded length, so a value that
+# is an encoded blob, a URL with a password, a multi-line string or anything else outside the setting's own
+# vocabulary does not have one.
+env_value_has_shape() {
+  local shape="$1" value="$2" re
+  case "${shape}" in
+    bool) re='^(true|false|1|0)$' ;;
+    int) re='^[0-9]{1,12}$' ;;
+    word) re='^[A-Za-z][A-Za-z0-9_-]{0,31}$' ;;
+    hostlist) re='^[A-Za-z0-9.:/_-]{1,64}(,[A-Za-z0-9.:/_-]{1,64}){0,63}$' ;;
+    idlist) re='^[A-Za-z0-9._-]{1,64}(,[A-Za-z0-9._-]{1,64}){0,31}$' ;;
+    names) re="^[A-Za-z0-9 ._&'-]{1,100}(,[A-Za-z0-9 ._&'-]{1,100}){0,15}\$" ;;
+    origin) re='^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$' ;;
+    timestamp) re='^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9:.]{1,16}(Z|[+-][0-9:]{2,5})?)?$' ;;
+    *) return 1 ;;
+  esac
+  [[ ${#value} -le ${ENV_PRESERVE_MAX_LENGTH} && "${value}" =~ ${re} ]]
+}
+
+# After the decode passes env_value_leaks_secret() makes, does the value STILL contain a percent-escape? Then
+# it is encoded more deeply than the screen looks, and it is refused rather than passed on the strength of
+# having found nothing.
+env_value_has_residual_escape() {
+  local v="$1" next pass
+  for ((pass = 0; pass < 4; pass++)); do
+    env_percent_decode "${v}" next
+    [[ "${next}" != "${v}" ]] || break
+    v="${next}"
+  done
+  [[ "${v}" =~ %[0-9A-Fa-f]{2} ]]
+}
+
 # The keys render_app_env_file() writes. Listed here because the gate that needs them runs long before that
 # function is defined; tests/scripts/env-rewrite-preservation.test.ts fails if this list and the template
 # ever disagree.
@@ -707,7 +793,8 @@ env_unowned_existing_keys() {
     for t in "${ENV_TEMPLATE_KEYS[@]}"; do
       [[ "${t}" == "${key}" ]] && owned=true
     done
-    ${owned} || ENV_UNOWNED_EXISTING_KEYS+=("${key}")
+    # Only a key that COULD be carried needs screening against the admin password; the rest is dropped.
+    ${owned} || [[ -z "${ENV_PRESERVE_SHAPES[${key}]-}" ]] || ENV_UNOWNED_EXISTING_KEYS+=("${key}")
   done
 }
 
@@ -8915,7 +9002,6 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='.deploy-meta' \
       --exclude='.env' \
       --exclude='.env.local' \
-      --exclude='.env.bak*' \
       --exclude='backups' \
       --exclude='uploads' \
       --exclude='public/uploads' \
@@ -8943,7 +9029,6 @@ else
     --exclude='.next' \
     --exclude='.env' \
     --exclude='.env.local' \
-    --exclude='.env.bak*' \
     --exclude='backups' \
     --exclude='uploads' \
     --exclude='public/uploads' \
@@ -9234,7 +9319,7 @@ env_key_carry_check() {
 
 ENV_REFUSED_KEYS=()
 render_preserved_env_keys() {
-  local rendered="$1" key line i j
+  local rendered="$1" key line i j shape
   local -A owned=()
   local -a kept=()
   ENV_KEPT_KEYS=()
@@ -9248,6 +9333,21 @@ render_preserved_env_keys() {
     if env_key_is_admin_credential "${key}"; then
       error "${APP_DIR}/.env defines ${key}. That file belongs to the application account and must never hold the deploy admin credential, so it is not carried into the new file; move it to ${DB_ADMIN_CREDENTIAL_FILE}."
       return 1
+    fi
+    # (1) named on the list of settings a re-run carries; (2) a value of the shape that setting can have; (3) no
+    # admin material, no escape deeper than the screen looks. Anything else is dropped and reported.
+    shape="${ENV_PRESERVE_SHAPES[${key}]-}"
+    if [[ -z "${shape}" ]]; then
+      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): not on the list of settings a re-run carries over")
+      continue
+    fi
+    if ! env_value_has_shape "${shape}" "${EXISTING_ENV[${key}]}"; then
+      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): the value does not have the shape of a ${shape} setting")
+      continue
+    fi
+    if env_value_has_residual_escape "${EXISTING_ENV[${key}]}"; then
+      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): the value still contains a percent-escape after the decode passes")
+      continue
     fi
     if ! env_key_carry_check "${key}" "${EXISTING_ENV[${key}]}"; then
       ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): ${ENV_REFUSAL_REASON}")
@@ -9272,23 +9372,34 @@ render_preserved_env_keys() {
   done
 }
 
-# A TIMESTAMPED, MODE-600 COPY OF WHAT IS ABOUT TO BE REPLACED, written from the lines this run read
-# at the start (not re-read from a path the application account can swap). Same publication
-# primitive and owner as .env itself. Never pruned by this script: they hold secrets, and deleting
-# an operator's backup is not the installer's call.
+# A TIMESTAMPED, MODE-600, ROOT-OWNED COPY OF WHAT IS ABOUT TO BE REPLACED, in the root-only directory the admin
+# credential already lives in (${DB_ADMIN_CREDENTIAL_DIR}, root, 0700) and NOT under the application tree: it
+# holds every key the rewrite drops, secrets included, and the application account must not be able to read
+# it, replace it, or point its name somewhere else. It is written from the lines this run read at the start
+# (not re-read from a path the application account can swap) with the same publication primitive as .env.
+# Never pruned by this script: deleting an operator's backup is not the installer's call.
 #
-# THE NAME IS RESERVED BEFORE ANYTHING IS PUBLISHED TO IT. Second-resolution names collided inside one
-# second (two runs, or a retry) and the second publication replaced the first run's backup. The
-# candidate carries the second, this process id and a counter, and is created exclusively (noclobber is
-# O_EXCL: it also refuses a symlink planted at the name); the first name that is free is the backup.
+# THE NAME IS RESERVED BEFORE ANYTHING IS PUBLISHED TO IT. Second-resolution names collided inside one second
+# (two runs, or a retry) and the second publication replaced the first run's backup. The candidate carries the
+# second, this process id and a counter, and is created exclusively (noclobber is O_EXCL: it also refuses a
+# symlink planted at the name); the first name that is free is the backup.
 ENV_BACKUP_FILE=""
 write_env_backup() {
   [[ "${ENV_FILE_STATE}" == "read" && "${#EXISTING_ENV_RAW[@]}" -gt 0 ]] || return 0
   local stamp candidate n=0
   stamp="$(date -u +%Y%m%dT%H%M%SZ)" || return 1
+  # Created by this root process under umask 077; an EXISTING directory is judged, never re-moded, and a wrong
+  # one is refused rather than repaired (the same rule write_admin_credential_file applies to it).
+  if [[ ! -d "${DB_ADMIN_CREDENTIAL_DIR}" ]]; then
+    ( umask 077; mkdir -p "${DB_ADMIN_CREDENTIAL_DIR}" ) || return 1
+  fi
+  [[ "$(LC_ALL=C stat -c '%u:%a' -- "${DB_ADMIN_CREDENTIAL_DIR}" 2> /dev/null)" == "$(id -u):700" ]] || {
+    error "${DB_ADMIN_CREDENTIAL_DIR} must be owned by root with mode 0700 and is not, so the backup of the previous .env cannot be kept there. Fix its owner and mode as root and re-run."
+    return 1
+  }
   ENV_BACKUP_FILE=""
   while ((n < 1000)); do
-    candidate="${APP_DIR}/.env.bak-${stamp}-$$-${n}"
+    candidate="${DB_ADMIN_CREDENTIAL_DIR}/previous-app-env-${stamp}-$$-${n}"
     if (set -o noclobber; : > "${candidate}") 2> /dev/null; then
       ENV_BACKUP_FILE="${candidate}"
       break
@@ -9296,7 +9407,7 @@ write_env_backup() {
     n=$((n + 1))
   done
   [[ -n "${ENV_BACKUP_FILE}" ]] || return 1
-  printf '%s\n' "${EXISTING_ENV_RAW[@]}" | publish_durable_file "${ENV_BACKUP_FILE}" "${APP_USER}:${APP_USER}" 600 || { ENV_BACKUP_FILE=""; return 1; }
+  printf '%s\n' "${EXISTING_ENV_RAW[@]}" | publish_durable_file "${ENV_BACKUP_FILE}" "${ENV_BACKUP_OWNER}" 600 || { ENV_BACKUP_FILE=""; return 1; }
 }
 
 # WHAT THE REWRITE KEPT AND CHANGED, by NAME ONLY: a value can be a secret.
@@ -9313,12 +9424,12 @@ print_env_rewrite_summary() {
       changed+=("${key}")
     fi
   done <<< "${rendered}"
-  info "The previous ${APP_DIR}/.env was replaced. Backup (mode 600): ${ENV_BACKUP_FILE:-<none>}"
+  info "The previous ${APP_DIR}/.env was replaced. Backup (root-only, mode 600): ${ENV_BACKUP_FILE:-<none>}"
   info "  kept as it was, not set by the installer (${#ENV_KEPT_KEYS[@]}): ${ENV_KEPT_KEYS[*]:-none}"
   info "  values this run changed (${#changed[@]}): ${changed[*]:-none}"
   info "  keys this run added (${#added[@]}): ${added[*]:-none}"
   if ((${#ENV_REFUSED_KEYS[@]} > 0)); then
-    warn "  ${#ENV_REFUSED_KEYS[@]} key(s) were NOT carried over because they look like database connection settings; they are in the backup (values are never printed):"
+    warn "  ${#ENV_REFUSED_KEYS[@]} key(s) were NOT carried into the new file; they are in the root-only backup, verbatim (values are never printed):"
     for entry in "${ENV_REFUSED_KEYS[@]}"; do
       warn "    ${entry}"
     done
