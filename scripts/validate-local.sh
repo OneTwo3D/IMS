@@ -90,6 +90,9 @@ run_step 'fulfillment requirement seam'   npm run check:fulfillment-requirement-
 # reader is declared. Needs the generated Prisma client (the scan is type-aware), which the surrounding
 # `validate` job has already produced.
 run_step 'ledger standing readers'        npm run check:ledger-standing-readers
+# WP2 S2: every call that creates outbound work or writes to a vendor directly is declared against the
+# writer ownership map (scripts/producer-census-declarations.ts). A syntactic scan: no Prisma client needed.
+run_step 'producer census'                npm run check:producer-census
 run_step 'wms connector boundary'         npm run check:wms-connector-boundary
 # o3d-hic9: the Server Action authorization guards were in check:all but in no CI workflow, so they
 # only ran when someone remembered to type check:all locally. validate-local.sh exists so local and
@@ -99,6 +102,8 @@ run_step 'wms connector boundary'         npm run check:wms-connector-boundary
 # skippable. o3d-amy8 finished that argument: they were skippable anyway, by any lint error, until
 # this script stopped aborting.
 run_step 'server action guards'           npm run check:server-action-guards
+# The first-load apply runner's system-actor import capability: a closed list of importers (static-guards.yml runs it ungated).
+run_step 'system import capability'       npm run check:system-import-capability
 run_step 'unit tests'                     npm run test:unit
 run_step 'workflow docs'                  npm run docs:workflows:check
 # o3d-bddq: archive/ is excluded from tsconfig, eslint, the test glob and every check:* SCAN_ROOT, so
