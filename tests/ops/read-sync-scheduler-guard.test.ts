@@ -20,7 +20,7 @@ import type { ReadSyncAlarmTx } from '../../lib/ops/read-sync-liveness-alarm.ts'
  */
 
 const defs = getAllCronJobs().map((job) => ({ slug: job.slug, settingKey: job.settingKey, label: job.label, defaultSchedule: job.defaultSchedule, defaultEnabled: job.defaultEnabled, legacyEnabledKey: job.legacyEnabledKey }))
-const NEEDED = ['read-sync-liveness', 'wc-reconcile', 'wms-order-status', 'account-balance-snapshot', 'xero-tax-rate-drift', 'mintsoft-stock-sync', 'wms-watchdog']
+const NEEDED = ['read-sync-liveness', 'wc-reconcile', 'mintsoft-dispatch-sync', 'wms-order-status', 'account-balance-snapshot', 'xero-tax-rate-drift', 'mintsoft-stock-sync', 'wms-watchdog']
 
 function block(slugs: string[]): string {
   const jobs = defs.filter((job) => slugs.includes(job.slug))

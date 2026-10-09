@@ -6,6 +6,7 @@ import type {
   WmsOrderPushResult,
   WmsOrderUpdateResult,
 } from '@/lib/connectors/wms/types'
+import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
 import { assertMintsoftOrderClient, requireMintsoftClientId } from './orders'
@@ -33,9 +34,8 @@ function toStr(value: unknown): string | null {
   return null
 }
 
-function round2(value: number): number {
-  return Math.round((value + Number.EPSILON) * 100) / 100
-}
+// One shared implementation with the payload total guard (see transmitted-money.ts).
+const round2 = roundTransmittedMoney
 
 type CourierOption =
   | { kind: 'name' }
