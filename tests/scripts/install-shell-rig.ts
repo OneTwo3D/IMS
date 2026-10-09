@@ -73,6 +73,10 @@ export const SHIPPED = [
   'load_existing_env',
   'env_percent_decode',
   'env_percent_encode',
+  'env_b64_encode',
+  'env_encode_variants',
+  'env_admin_needles',
+  'env_layers_contain_needle',
   'env_token_decode',
   'env_decode_children',
   'env_decode_seen',
@@ -265,12 +269,14 @@ export const ENV_PRESERVE_SHAPES_BLOCK = (() => {
     /^ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE=".*"$/m,
     /^ENV_DECODE_MAX_DEPTH=\d+$/m,
     /^ENV_DECODE_MAX_WORK=\d+$/m,
+    /^ENV_NEEDLE_MAX=\d+$/m,
+    /^ENV_NEEDLE_MIN_LENGTH=\d+$/m,
   ].map((re) => {
     const match = re.exec(INSTALL_SOURCE)
     assert.ok(match, `precondition: scripts/install.sh must define ${re}`)
     return match[0]
   })
-  return `${parts.join('\n')}\nENV_PRESERVE_VALUE=''\ndeclare -A ENV_PRESERVED_EFFECTIVE=()\nENV_DECODE_LAYERS=(); ENV_DECODE_CHILDREN=(); ENV_DECODE_UNBOUNDED=0`
+  return `${parts.join('\n')}\nENV_PRESERVE_VALUE=''\ndeclare -A ENV_PRESERVED_EFFECTIVE=()\nENV_DECODE_LAYERS=(); ENV_DECODE_CHILDREN=(); ENV_DECODE_UNBOUNDED=0\nENV_NEEDLES=(); ENV_NEEDLES_SECRET=''; ENV_NEEDLES_READY=0; ENV_NEEDLES_OVERFLOW=0; ENV_ENC_OUT=()`
 })()
 
 

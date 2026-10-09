@@ -767,6 +767,120 @@ env_value_leaks_secret() {
   return 1
 }
 
+# THE EMBEDDED-NEEDLE SEARCH. The decoder above sees a value whose WHOLE token is an encoding; an encoding
+# embedded inside longer text (a prefix, a suffix, a separator) is a different string and decodes to nothing
+# useful. So the screen also searches every layer for the admin password as it would appear under any
+# composition (depth up to 3) of: percent (unreserved kept, or every byte), plus-for-space, hex, base64 and
+# base64url -- the last two at all THREE byte alignments, keeping only the characters whose six bits lie
+# wholly inside the password (an embedded copy starts at an unknown offset) -- plus the raw password. A needle is
+# at least 8 characters, matching is case-insensitive (hex in either case, mixed), and the set is bounded:
+# if it would exceed ENV_NEEDLE_MAX the value cannot be screened and is refused.
+ENV_NEEDLE_MAX=2000
+ENV_NEEDLE_MIN_LENGTH=8
+ENV_NEEDLES=()
+ENV_NEEDLES_SECRET=""
+ENV_NEEDLES_READY=0
+ENV_NEEDLES_OVERFLOW=0
+ENV_ENC_OUT=()
+
+# Standard base64 of ${1} preceded by ${2} zero bytes, whole six-bit groups only, into the variable ${3}.
+env_b64_encode() {
+  local LC_ALL=C s="$1" i b bits=0 nbits=0 out=""
+  local alpha=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+  for ((i = 0; i < $2; i++)); do
+    bits=$((bits << 8))
+    nbits=$((nbits + 8))
+    while ((nbits >= 6)); do
+      nbits=$((nbits - 6))
+      out+="${alpha:$(((bits >> nbits) & 63)):1}"
+      bits=$((bits & ((1 << nbits) - 1)))
+    done
+  done
+  for ((i = 0; i < ${#s}; i++)); do
+    printf -v b '%d' "'${s:i:1}"
+    bits=$(((bits << 8) | b))
+    nbits=$((nbits + 8))
+    while ((nbits >= 6)); do
+      nbits=$((nbits - 6))
+      out+="${alpha:$(((bits >> nbits) & 63)):1}"
+      bits=$((bits & ((1 << nbits) - 1)))
+    done
+  done
+  printf -v "$3" '%s' "${out}"
+}
+
+# Every stable encoding of ${1} (hex digits in BOTH cases, and in their own case: each is encoded again at the next level) into ENV_ENC_OUT.
+env_encode_variants() {
+  local LC_ALL=C s="$1" i h hu pct_up pct_low pct_all="" pct_all_up="" hex="" hex_up="" full a start end frag n=${#1}
+  ENV_ENC_OUT=()
+  env_percent_encode "${s}" pct_up pct_low
+  ENV_ENC_OUT+=("${pct_up}" "${pct_low}" "${pct_up//%20/+}" "${pct_low//%20/+}")
+  for ((i = 0; i < n; i++)); do
+    printf -v h '%02x' "'${s:i:1}"
+    printf -v hu '%02X' "'${s:i:1}"
+    hex+="${h}"
+    hex_up+="${hu}"
+    pct_all+="%${h}"
+    pct_all_up+="%${hu}"
+  done
+  ENV_ENC_OUT+=("${pct_all}" "${pct_all_up}" "${hex}" "${hex_up}")
+  for a in 0 1 2; do
+    env_b64_encode "${s}" "${a}" full
+    start=$(((8 * a + 5) / 6))
+    end=$((8 * (a + n) / 6))
+    frag="${full:start:end-start}"
+    h="${frag//+/-}"
+    ENV_ENC_OUT+=("${frag}" "${h//\//_}")
+  done
+}
+
+# Build ENV_NEEDLES for the decoded admin password ${1} (cached for the run).
+env_admin_needles() {
+  local secret="$1" d n v
+  local -A seen=() seen_low=()
+  local -a level=() next=()
+  if ((ENV_NEEDLES_READY == 1)) && [[ "${ENV_NEEDLES_SECRET}" == "${secret}" ]]; then
+    return 0
+  fi
+  ENV_NEEDLES=("${secret,,}")
+  ENV_NEEDLES_OVERFLOW=0
+  level=("${secret}")
+  for ((d = 0; d < 3; d++)); do
+    next=()
+    for n in "${level[@]}"; do
+      env_encode_variants "${n}"
+      for v in "${ENV_ENC_OUT[@]}"; do
+        ((${#v} >= ENV_NEEDLE_MIN_LENGTH)) || continue
+        [[ -z "${seen[${v}]+x}" ]] || continue
+        seen["${v}"]=1
+        next+=("${v}")
+        [[ -z "${seen_low[${v,,}]+x}" ]] || continue
+        seen_low["${v,,}"]=1
+        ENV_NEEDLES+=("${v,,}")
+        if ((${#ENV_NEEDLES[@]} > ENV_NEEDLE_MAX)); then
+          ENV_NEEDLES_OVERFLOW=1
+          break 3
+        fi
+      done
+    done
+    level=("${next[@]}")
+  done
+  ENV_NEEDLES_SECRET="${secret}"
+  ENV_NEEDLES_READY=1
+}
+
+# Does any collected decode layer contain a needle (case-insensitively)? Returns 0 when it does.
+env_layers_contain_needle() {
+  local layer low n
+  for layer in "${ENV_DECODE_LAYERS[@]}"; do
+    low="${layer,,}"
+    for n in "${ENV_NEEDLES[@]}"; do
+      [[ "${low}" != *"${n}"* ]] || return 0
+    done
+  done
+  return 1
+}
+
 # The deploy admin's password, percent-decoded once (the form the server knows), or empty when the run holds
 # no admin URL or the URL carries no password. Sets ENV_ADMIN_PASSWORD_DECODED.
 ENV_ADMIN_PASSWORD_DECODED=""
@@ -961,7 +1075,7 @@ env_value_has_shape() {
         entry="${entry%"${entry##*[![:space:]]}"}"
         case "${shape}" in
           uuidlist) re="^${uuid}\$" ;;
-          names) re="^[A-Za-z0-9][A-Za-z0-9 ._&'()/+-]{0,99}\$" ;;
+          names) re="^[A-Za-z0-9][A-Za-z0-9 ._&'()/+-]{0,99}\$"; [[ ${#value} -le 120 ]] || return 1 ;;
           iplist)
             [[ -n "${entry}" ]] || continue
             [[ "${entry}" == *.* || "${entry}" == *:* ]] || return 1
@@ -1063,6 +1177,15 @@ env_key_carry_check() {
       env_value_decode_layers "${value}"
       if ((ENV_DECODE_UNBOUNDED != 0)); then
         ENV_REFUSAL_REASON="the value is encoded too deeply to screen for the deploy admin's password"
+        return 1
+      fi
+      env_admin_needles "${decoded_pass}"
+      if ((ENV_NEEDLES_OVERFLOW != 0)); then
+        ENV_REFUSAL_REASON="the value cannot be screened for the deploy admin's password (too many encodings to search)"
+        return 1
+      fi
+      if env_layers_contain_needle; then
+        ENV_REFUSAL_REASON="the value contains the deploy admin's password"
         return 1
       fi
       for form in "${pass_forms[@]}"; do

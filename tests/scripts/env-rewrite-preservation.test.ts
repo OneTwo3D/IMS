@@ -82,6 +82,13 @@ const LIB = [
   /^ENV_DECODE_MAX_DEPTH=\d+$/m.exec(INSTALL)?.[0] ?? 'ENV_DECODE_MAX_DEPTH=UNSET',
   /^ENV_DECODE_MAX_WORK=\d+$/m.exec(INSTALL)?.[0] ?? 'ENV_DECODE_MAX_WORK=UNSET',
   'ENV_DECODE_LAYERS=(); ENV_DECODE_CHILDREN=(); ENV_DECODE_UNBOUNDED=0',
+  /^ENV_NEEDLE_MAX=\d+$/m.exec(INSTALL)?.[0] ?? 'ENV_NEEDLE_MAX=UNSET',
+  /^ENV_NEEDLE_MIN_LENGTH=\d+$/m.exec(INSTALL)?.[0] ?? 'ENV_NEEDLE_MIN_LENGTH=UNSET',
+  'ENV_NEEDLES=(); ENV_NEEDLES_SECRET=""; ENV_NEEDLES_READY=0; ENV_NEEDLES_OVERFLOW=0; ENV_ENC_OUT=()',
+  shippedFunction(INSTALL, 'env_b64_encode'),
+  shippedFunction(INSTALL, 'env_encode_variants'),
+  shippedFunction(INSTALL, 'env_admin_needles'),
+  shippedFunction(INSTALL, 'env_layers_contain_needle'),
   shippedFunction(INSTALL, 'env_token_decode'),
   shippedFunction(INSTALL, 'env_decode_children'),
   shippedFunction(INSTALL, 'env_decode_seen'),
@@ -851,8 +858,9 @@ function seeded(seed: number): () => number {
   }
 }
 const ENCODERS: Record<string, (s: string, rnd: () => number) => string> = {
-  percent: (s, rnd) => [...Buffer.from(s)].map((b) => '%' + (rnd() < 0.5 ? b.toString(16).padStart(2, '0') : b.toString(16).toUpperCase().padStart(2, '0'))).join(''),
-  hex: (s) => Buffer.from(s).toString('hex'),
+  // one hex-digit case per encoded string (a layer written by a tool is consistent; the screen covers both)
+  percent: (s, rnd) => { const up = rnd() < 0.5; return [...Buffer.from(s)].map((b) => '%' + (up ? b.toString(16).toUpperCase().padStart(2, '0') : b.toString(16).padStart(2, '0'))).join('') },
+  hex: (s, rnd) => (rnd() < 0.5 ? Buffer.from(s).toString('hex') : Buffer.from(s).toString('hex').toUpperCase()),
   base64: (s) => Buffer.from(s).toString('base64'),
   base64url: (s) => Buffer.from(s).toString('base64url'),
   base64nopad: (s) => Buffer.from(s).toString('base64').replace(/=+$/, ''),
@@ -974,4 +982,76 @@ test('re-run: CENSUS — every environment variable the code reads is set by the
   assert.deepEqual(unclassified, [], 'a variable read in code is on none of: the template, the carry list, NOT_CARRIED (decide, with a reason)')
   assert.deepEqual(stale, [], 'NOT_CARRIED lists a name nothing reads any more')
   // (A carried name may be read through a helper this pattern does not see, so the reverse direction is not asserted.)
+})
+
+// ---------------------------------------------------------------------------
+// review round 8: an encoding EMBEDDED in longer text
+// ---------------------------------------------------------------------------
+
+const ENC2: Record<string, (s: string, rnd: () => number) => string> = {
+  ...ENCODERS,
+  percentmin: (s, rnd) => { const up = rnd() < 0.5; return [...Buffer.from(s)].map((b) => (/[A-Za-z0-9._~-]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : '%' + (up ? b.toString(16).toUpperCase().padStart(2, '0') : b.toString(16).padStart(2, '0')))).join('') },
+  plusmin: (s, rnd) => ENC2.percentmin(s, rnd).replace(/%20/g, '+'),
+}
+
+test('re-run: an encoding of the admin password EMBEDDED in longer text (prefix, suffix, separators) is refused -- the exact example and a generated census over compositions up to depth 3', () => {
+  const ADMIN = 'postgresql://deployadmin:Admin1234@127.0.0.1:5432/db'
+  const decideOne = (key: string, v: string) => bash([LIB, `DEPLOY_ADMIN_DATABASE_URL=${shq(ADMIN)}`, `env_preserve_decision ${key} ${shq(v)}; echo "RC=$? [$ENV_REFUSAL_REASON]"`].join('\n')).out.trim().split('\n').pop()
+  assert.equal(Buffer.from('xQWRtaW4xMjM0').length > 0, true)
+  assert.equal(decideOne('XERO_ALLOWED_TENANT_NAMES', 'xQWRtaW4xMjM0'), "RC=1 [the value contains the deploy admin's password]")
+
+  const passwords = ['Admin1234', 'ABCDEFGH', 'Zx9#kLm2', 'p@ss w0rd!', 'correct-horse-battery', '>>??>>??>>']
+  const rnd = seeded(20261010)
+  const names = Object.keys(ENC2)
+  const filler = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ,;|.-_/+'
+  const pad = () => Array.from({ length: Math.floor(rnd() * 7) }, () => filler[Math.floor(rnd() * filler.length)]).join('')
+  const cases: Array<{ pw: string; chain: string[]; value: string }> = []
+  const build = (pw: string, chain: string[]) => {
+    // The password may itself sit inside longer text at ANY level before an encoding (that shifts the base64 alignment),
+    // and the final encoding sits inside longer text too.
+    const padAt = Math.floor(rnd() * (chain.length + 1))
+    let v = pw
+    chain.forEach((e, i) => {
+      if (i === padAt) v = pad() + v + pad()
+      v = ENC2[e](v, rnd)
+    })
+    if (padAt === chain.length) v = pad() + v + pad()
+    cases.push({ pw, chain: [...chain, `pad@${padAt}`], value: pad() + v + pad() })
+  }
+  for (const pw of passwords) {
+    for (const a of names) build(pw, [a])
+    for (const a of names) for (const b of names) build(pw, [a, b])
+    for (let n = 0; n < 40; n++) build(pw, [0, 1, 2].map(() => names[Math.floor(rnd() * names.length)]))
+  }
+  const lines = [LIB]
+  let current = ''
+  cases.forEach((c, i) => {
+    if (c.pw !== current) {
+      current = c.pw
+      lines.push(`DEPLOY_ADMIN_DATABASE_URL=${shq(`postgresql://deployadmin:${c.pw.replace(/[^A-Za-z0-9]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))}@127.0.0.1:5432/db`)}`)
+    }
+    lines.push(`env_key_carry_check XERO_ALLOWED_TENANT_NAMES ${shq(c.value)}; echo "${i} RC=$? $ENV_REFUSAL_REASON"`)
+  })
+  const r = bash(lines.join('\n'))
+  const results = new Map(r.out.split('\n').filter((l) => /^\d+ RC=/.test(l)).map((l) => [Number(l.split(' ')[0]), l.slice(l.indexOf(' ') + 1)]))
+  const miss = cases.filter((c, i) => results.get(i) !== "RC=1 the value contains the deploy admin's password")
+  console.log(`  ${cases.length} embedded compositions (depth 1-3, random 0-6 character prefix/suffix) over ${passwords.length} passwords: ${cases.length - miss.length} refused, ${miss.length} passed`)
+  assert.deepEqual(miss.slice(0, 12).map((c) => [c.pw, c.chain.join('>'), c.value, results.get(cases.indexOf(c))]), [])
+  assert.equal(results.size, cases.length)
+})
+
+test('re-run: the needle set is bounded, small, and the name shape stays closed', () => {
+  const run = (setup: string, key: string, value: string, pw = 'p@ss w0rd!#Zx') => bash([LIB, `DEPLOY_ADMIN_DATABASE_URL='postgresql://deployadmin:${pw.replace(/[^A-Za-z0-9]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))}@127.0.0.1:5432/db'`, setup, `env_preserve_decision ${key} ${shq(value)}; echo "RC=$? [$ENV_REFUSAL_REASON] N=\${#ENV_NEEDLES[@]} O=$ENV_NEEDLES_OVERFLOW"`].join('\n')).out.trim().split('\n').pop() ?? ''
+  const worst = run(':', 'XERO_ALLOWED_TENANT_NAMES', 'OneTwo3D Ltd')
+  const n = Number(/N=(\d+)/.exec(worst)?.[1])
+  console.log(`  needle count for a punctuation-and-space password: ${n} (bound ${/^ENV_NEEDLE_MAX=(\d+)/m.exec(INSTALL)?.[1]})`)
+  assert.ok(n > 100 && n < 2000)
+  assert.match(worst, /^RC=0 \[\]/)
+  assert.match(run('ENV_NEEDLE_MAX=20', 'XERO_ALLOWED_TENANT_NAMES', 'OneTwo3D Ltd'), /^RC=1 \[the value cannot be screened for the deploy admin's password .*O=1$/)
+  for (const name of ['OneTwo3D Ltd', 'Acme-Widgets', 'Demo Company (UK)', "Smith & Sons, O'Neil Trading", 'Production Warehouse', 'Acme-Widgets, OneTwo3D Ltd']) {
+    assert.match(run(':', 'XERO_ALLOWED_TENANT_NAMES', name), /^RC=0 \[\]/, name)
+  }
+  assert.match(run(':', 'XERO_ALLOWED_TENANT_NAMES', 'A'.repeat(60) + ',' + 'B'.repeat(61)), /^RC=1 \[the value does not have the shape of a names setting\]/)
+  assert.match(run(':', 'XERO_ALLOWED_TENANT_NAMES', 'A'.repeat(59) + ',' + 'B'.repeat(60)), /^RC=0 /)
+  for (const bad of ['Acme!Widgets', 'Acme@Widgets', 'Acme=1', 'Acme%41']) assert.match(run(':', 'XERO_ALLOWED_TENANT_NAMES', bad), /^RC=1 /, bad)
 })
