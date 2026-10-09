@@ -931,6 +931,7 @@ declare -A ENV_PRESERVE_SHAPES=(
   [XERO_TENANT_ID]=uuidlist
   [XERO_WRITE_ALLOWED_TENANT]=uuid
   [XERO_DAILY_BATCH_LIMIT]=number
+  [PRODUCER_HOLD_ENFORCED_DESTINATIONS]=destination_list
   [XERO_WRITES_LIVE_FROM]=iso_utc
   [WC_WRITES_LIVE_FROM]=iso_utc
   [MINTSOFT_WRITES_LIVE_FROM]=iso_utc
@@ -967,7 +968,7 @@ ENV_PRESERVE_SECURITY_KEYS=(
   TRUSTED_PROXY_IPS TRUSTED_PROXY_CIDRS REQUIRE_TRUSTED_PROXY_CONFIG BEHIND_PROXY
   RATE_LIMIT_BACKEND CSP_MODE ALLOW_DATABASE_RESTORE ALLOW_DATABASE_RESTORE_UPLOAD
   XERO_ALLOWED_TENANT_IDS XERO_BLOCKED_TENANT_IDS XERO_ALLOWED_TENANT_NAMES XERO_REQUIRE_DEMO_ORG
-  XERO_TENANT_ID XERO_WRITE_ALLOWED_TENANT XERO_WRITES_LIVE_FROM WC_WRITES_LIVE_FROM
+  XERO_TENANT_ID XERO_WRITE_ALLOWED_TENANT XERO_WRITES_LIVE_FROM WC_WRITES_LIVE_FROM PRODUCER_HOLD_ENFORCED_DESTINATIONS
   MINTSOFT_WRITES_LIVE_FROM MINTSOFT_WRITE_ALLOWED WC_WRITEBACK_ALLOWED_ORIGIN
   FRESH_AUTH_MAX_AGE_SECONDS INVOICE_PDF_TOKEN_TTL_SECONDS INVOICE_PDF_TOKEN_MAX_TTL_SECONDS
   PREFLIGHT_DB_CONNECT XERO_DAILY_BATCH_LIMIT CONNECTOR_FETCH_TIMEOUT_MS CONNECTOR_FETCH_MAX_RESPONSE_BYTES
@@ -1049,6 +1050,7 @@ ENV_BACKUP_OWNER="root:root"
 #   names               comma-separated organisation names                        [tenant-guard.ts]
 #   int / number        digits / digits with an optional fraction                 [parsePositiveIntegerEnv etc.]
 #   iso_utc             ISO-8601 UTC instant with an explicit Z                   [producer-disposition.ts]
+#   destination_list    comma-separated xero | mintsoft | woocommerce, or all     [producer-seam.ts]
 #   origin              http(s)://host[:port][/]                                  [outbound-write-grant.ts]
 #   mintsoft_grant      <base URL>|<ClientId>[|login=<user>]                      [outbound-write-grant.ts]
 #   rate_limit_backend  memory | redis (or empty)                                 [rate-limit.ts]
@@ -1086,6 +1088,10 @@ env_value_has_shape() {
         n=$((n + 1))
       done
       [[ "${shape}" == iplist ]] || [[ ${n} -ge 1 ]]
+      ;;
+    destination_list)
+      re='^ ?(all|xero|mintsoft|woocommerce)( ?, ?(all|xero|mintsoft|woocommerce))* ?$'
+      [[ "${value}" =~ ${re} ]]
       ;;
     iso_utc) re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]{1,3})?)?Z$'; [[ "${value}" =~ ${re} ]] ;;
     origin) re='^https?://(\[[0-9A-Fa-f:]{2,45}\]|[A-Za-z0-9.-]{1,253})(:[0-9]{1,5})?/?$'; [[ "${value}" =~ ${re} ]] ;;

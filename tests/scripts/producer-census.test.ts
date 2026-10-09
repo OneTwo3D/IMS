@@ -12,6 +12,7 @@ import {
   reconcile,
   scanSource,
   scanTree,
+  seamFindings,
   type CensusInputs,
   type Declaration,
   type Site,
@@ -40,6 +41,7 @@ function realInputs(overrides: Partial<CensusInputs> = {}): CensusInputs & { fil
     excludedOperations: EXCLUDED_OPERATIONS,
     noProducer: NO_PRODUCER,
     filesScanned: scan.filesScanned,
+    sources: scan.sources,
     ...overrides,
   }
 }
@@ -327,4 +329,135 @@ test('MUTATION (new call site in a real file): one extra wcPut in a real file is
   const extra = scanSource(`import { wcPut } from '../api'\nexport async function pushWmsOrderStatusToWc() {\n await wcPut('/a', {})\n await wcPut('/b', {})\n}`, file)
   const report = reconcile({ ...inputs, sites: [...inputs.sites.filter((s) => s.file !== file), ...extra] })
   assert.ok(report.failures.some((f) => f.includes(`NEW PRODUCER SITE ${file}::pushWmsOrderStatusToWc::wcPut#2`)))
+})
+
+
+// ───────────────────────────── part 4: the Xero seam checks ─────────────────────────────
+
+const seamDecl = (key: string, mechanism: Declaration['mechanism'] = 'seam'): Declaration => ({
+  key, destination: 'xero', operation: 'type-generic-queue-seam', mechanism, obligationTime: 'not-applicable', note: 'A fixture declaration for the seam checks.',
+})
+
+function seamRun(file: string, source: string, declarations: Declaration[] = []) {
+  const sites = scanSource(source, file)
+  const result = seamFindings(new Map([[file, source]]), sites, declarations)
+  return { sites, ...result }
+}
+
+const GOOD_CALLER = `
+  import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
+  import { scheduleXeroAccountingOutbox } from './outbox'
+  export async function enqueue(tx: unknown) {
+    const created = await createAccountingSyncLogRow(tx, {})
+    if (created.suppressed !== null) return
+    if (created.shadowed) return
+    await scheduleXeroAccountingOutbox(tx, { accountingSyncLogId: created.row.id })
+  }`
+
+test('SEAM-2 PRECONDITION: the real tree has sync-log create sites and seam sites, every create site handles the shadow answer, and every seam site consults the hold first', () => {
+  const inputs = realInputs()
+  const report = reconcile(inputs)
+  const seam = report.counts.seam!
+  console.log(`# seam checks (real tree): ${seam.seamSitesConsulting}/${seam.seamSites} seam sites consult the hold; ${seam.rowSitesHandlingShadow}/${seam.rowSites} create sites handle the shadow`)
+  assert.ok(seam.seamSites >= 3, 'PRECONDITION: seam sites were examined')
+  assert.ok(seam.rowSites >= 4, 'PRECONDITION: the four create callers were examined')
+  assert.equal(seam.seamSitesConsulting, seam.seamSites)
+  assert.equal(seam.rowSitesHandlingShadow, seam.rowSites)
+  assert.deepEqual(report.failures, [])
+})
+
+test('SEAM-2: a caller that reads `.shadowed` between the create and the outbox schedule is accepted', () => {
+  const result = seamRun('lib/connectors/xero/fixture.ts', GOOD_CALLER)
+  assert.equal(result.counts.rowSites, 1)
+  assert.deepEqual(result.failures, [])
+})
+
+test('SEAM-2 MUTATION (one caller schedules a job for a shadow): dropping the shadow answer before the schedule is red, naming the site', () => {
+  const mutated = GOOD_CALLER.replace('    if (created.shadowed) return\n', '')
+  assert.notEqual(mutated, GOOD_CALLER, 'precondition: the mutation changed the fixture')
+  const result = seamRun('lib/connectors/xero/fixture.ts', mutated)
+  assert.equal(result.counts.rowSites, 1)
+  assert.equal(result.failures.length, 1)
+  assert.match(result.failures[0]!, /SEAM-2 lib\/connectors\/xero\/fixture\.ts::enqueue::createAccountingSyncLogRow#1/)
+})
+
+test('SEAM-2 MUTATION (the shadow check sits AFTER the schedule): reading `.shadowed` too late is red', () => {
+  const late = `
+    export async function enqueue(tx: unknown) {
+      const created = await createAccountingSyncLogRow(tx, {})
+      await scheduleXeroAccountingOutbox(tx, { accountingSyncLogId: created.row.id })
+      if (created.shadowed) return
+    }`
+  assert.equal(seamRun('lib/connectors/xero/late.ts', late).failures.length, 1)
+})
+
+test('SEAM-2: a `.shadowed` read in ANOTHER function does not count (the check is per declaration)', () => {
+  const split = `
+    function other(created: { shadowed?: unknown }) { return created.shadowed }
+    export async function enqueue(tx: unknown) {
+      const created = await createAccountingSyncLogRow(tx, {})
+      await scheduleXeroAccountingOutbox(tx, { accountingSyncLogId: created.row.id })
+    }`
+  assert.equal(seamRun('lib/connectors/xero/split.ts', split).failures.length, 1)
+})
+
+test('SEAM-2: a call of the primitive inside the primitive\'s own file is exempt (it is the seam)', () => {
+  const result = seamRun('lib/domain/accounting/sync-log-row.ts', `export async function wrapper(tx: unknown) { return createAccountingSyncLogRow(tx, {}) }`)
+  assert.equal(result.counts.rowSites, 0)
+})
+
+test('SEAM-1: a declared seam must call a consultation BEFORE the site; after it, or not at all, is red', () => {
+  const ok = `export async function act() { const v = xeroProducerSeamVerdict({}); await putXeroTaxRate({}) }`
+  const okRun = seamRun('app/actions/fixture.ts', ok, [seamDecl('app/actions/fixture.ts::act::putXeroTaxRate#1')])
+  assert.equal(okRun.counts.seamSites, 1)
+  assert.equal(okRun.counts.seamSitesConsulting, 1)
+  assert.deepEqual(okRun.failures, [])
+  for (const [label, source] of [
+    ['no consultation', `export async function act() { await putXeroTaxRate({}) }`],
+    ['consulted after', `export async function act() { await putXeroTaxRate({}); xeroProducerSeamVerdict({}) }`],
+    ['consulted in another function', `function ask() { return xeroProducerSeamVerdict({}) }\nexport async function act() { await putXeroTaxRate({}) }`],
+  ] as const) {
+    const run = seamRun('app/actions/fixture.ts', source, [seamDecl('app/actions/fixture.ts::act::putXeroTaxRate#1')])
+    console.log(`# SEAM-1 ${label}: ${run.failures.length} finding(s)`)
+    assert.equal(run.failures.length, 1, label)
+    assert.match(run.failures[0]!, /SEAM-1 .* is declared a seam but act calls none of/)
+  }
+})
+
+test('SEAM-1 over the real tree, MUTATED: a seam declaration on a site whose function never consults the hold is red', () => {
+  const inputs = realInputs()
+  // queueXeroSync never calls the consultation itself (it relies on the primitive), so declaring it a seam must fail.
+  const key = 'lib/connectors/xero/queue.ts::queueXeroSync::createAccountingSyncLogRow#1'
+  const declarations = inputs.declarations.map((d) => (d.key === key ? { ...d, mechanism: 'seam' as const } : d))
+  assert.ok(declarations.some((d) => d.key === key && d.mechanism === 'seam'), 'precondition: the mutation applied')
+  const report = reconcile({ ...inputs, declarations })
+  assert.ok(report.failures.some((f) => f.includes(`SEAM-1 ${key}`)), report.failures.join('\n'))
+})
+
+test('SEAM-2 over the real tree, MUTATED: removing the shadow read from the daily-batch caller is red with that site named', () => {
+  const inputs = realInputs()
+  const file = 'lib/connectors/xero/daily-sync.ts'
+  const text = inputs.sources!.get(file)!
+  const mutated = text.replace('if (created.shadowed) return created.shadowed.id', '/* removed */')
+  assert.notEqual(mutated, text, 'precondition: the shadow read was found and removed')
+  const sources = new Map(inputs.sources!)
+  sources.set(file, mutated)
+  const report = reconcile({ ...inputs, sources })
+  assert.ok(report.failures.some((f) => f.includes(`SEAM-2 ${file}::createPendingSyncLog::createAccountingSyncLogRow#1`)), report.failures.join('\n'))
+})
+
+test('SEAM-3: a direct Xero write declared "direct-write" is red; as a seam or as the transport behind one it is green', () => {
+  const inputs = realInputs()
+  const key = 'app/actions/settings.ts::generateMissingXeroTaxRates::putXeroTaxRate#1'
+  const direct = inputs.declarations.map((d) => (d.key === key ? { ...d, mechanism: 'direct-write' as const } : d))
+  const report = reconcile({ ...inputs, declarations: direct })
+  assert.ok(report.failures.some((f) => f.startsWith(`SEAM-3 ${key}`)), report.failures.join('\n'))
+  assert.ok(report.failures.some((f) => f.includes(`SEAM-1 ${key}`)) === false, 'the SEAM-1 check applies only to a declared seam')
+  assert.deepEqual(reconcile(inputs).failures, [])
+})
+
+test('the seam checks cannot pass by examining nothing: with the tree reached and no seam or create site in the sources, the census says "subject not reached"', () => {
+  const inputs = realInputs()
+  const report = reconcile({ ...inputs, sources: new Map() })
+  assert.ok(report.failures.some((f) => /SUBJECT NOT REACHED: the seam checks saw 0 seam site/.test(f)) || report.failures.some((f) => f.startsWith('SEAM ')), report.failures.join('\n'))
 })

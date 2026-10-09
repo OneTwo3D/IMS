@@ -131,15 +131,38 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
   // THE PRODUCER SEAM. After the suppression read on purpose: a posting marked handled by hand, or held by an operator's
   // claim, is answered above whatever the hold says, so a shadow can never discharge or postpone a claim.
   const verdict = xeroProducerSeamVerdict({ connector: String(data.connector), type: String(data.type), payload: data.payload })
-  if (verdict.kind === 'shadow') return recordShadowRow<T>(client, data, verdict, options)
-  const create = () => client.accountingSyncLog.create({ data }) as Promise<T>
+  let rowData = data
+  let shadow: PreparedShadow | null = null
+  if (verdict.kind === 'shadow') {
+    const prepared = await prepareShadow(client, data, verdict)
+    // The same work was shadowed before and its row still stands: count the repeat, write nothing.
+    if (prepared.existingSyncLogId) return { row: null, suppressed: null, shadowed: { id: prepared.existingSyncLogId } as T }
+    shadow = prepared
+    rowData = prepared.data
+  }
+  // THE ONE INSERT of an accounting sync row (tests/accounting/sync-log-row-primitive.test.ts holds this file to exactly one):
+  // a live row, or the shadow row prepared above.
+  const create = () => client.accountingSyncLog.create({ data: rowData }) as Promise<T>
   const row = options?.createInSavepoint ? await withSavepoint(client, create) : await create()
+  if (shadow) {
+    await linkShadow(client, shadow.recordId, row.id)
+    // A shadow discharges no refusal: it is not a posting, and an outstanding refusal still describes a debt IMS has not paid.
+    return { row: null, suppressed: null, shadowed: row }
+  }
   await clearAccountingPostingRefusal(
     client as unknown as PostingRefusalClient,
     key,
     { withSavepoint: <R,>(fn: () => Promise<R>) => withSavepoint(client, fn) },
   )
   return { row, suppressed: null }
+}
+
+type PreparedShadow = {
+  /** The CANCELLED / HELD_SHADOW row to INSERT in place of the live one. */
+  data: Prisma.AccountingSyncLogUncheckedCreateInput
+  /** The `outbound_shadow_writes` row counting this work, or null when recording it failed. */
+  recordId: string | null
+  existingSyncLogId: string | null
 }
 
 /**
@@ -149,19 +172,18 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
  *
  * REPEATS DO NOT MAKE ROWS. The shadow table's unique key (destination, operation, subject, payload digest) decides:
  * the same work produced again, which the recreate sweeps and a retried action do every tick while the hold is on,
- * counts an occurrence and returns the sync-log row that already carries it. If that row has been deleted by
+ * counts an occurrence and names the sync-log row that already carries it. If that row has been deleted by
  * retention, a new one is written and the shadow points at it.
  *
  * A shadow write that FAILS is lost evidence, never lost work: it is rolled back to its savepoint and the sync-log row
  * (the durable shadow) is still written, so the caller's transaction is never aborted by the record-keeping. The only
  * thing lost is the dedupe for that one call.
  */
-async function recordShadowRow<T extends { id: string }>(
+async function prepareShadow(
   client: SyncLogRowClient,
   data: Prisma.AccountingSyncLogUncheckedCreateInput,
   verdict: Extract<XeroSeamVerdict, { kind: 'shadow' }>,
-  options?: { createInSavepoint?: boolean },
-): Promise<CreateAccountingSyncLogRowResult<T>> {
+): Promise<PreparedShadow> {
   let recorded: Awaited<ReturnType<typeof recordOutboundShadow>> | null = null
   try {
     recorded = await withSavepoint(client, () => recordOutboundShadow(client, {
@@ -176,8 +198,7 @@ async function recordShadowRow<T extends { id: string }>(
   } catch (error) {
     console.error(`[producer-hold] could not record the shadow of ${String(data.type)} ${String(data.referenceType)} ${String(data.referenceId)}: ${error instanceof Error ? error.message : String(error)}`)
   }
-  if (recorded?.accountingSyncLogId) return { row: null, suppressed: null, shadowed: { id: recorded.accountingSyncLogId } as T }
-  const create = () => client.accountingSyncLog.create({
+  return {
     data: {
       ...data,
       status: 'CANCELLED',
@@ -186,14 +207,16 @@ async function recordShadowRow<T extends { id: string }>(
       externalTransactionId: null,
       errorMessage: verdict.notice,
     },
-  }) as Promise<T>
-  const row = options?.createInSavepoint ? await withSavepoint(client, create) : await create()
-  if (recorded) {
-    try {
-      await withSavepoint(client, () => attachShadowSyncLog(client, recorded.id, row.id))
-    } catch (error) {
-      console.error(`[producer-hold] could not link shadow ${recorded.id} to sync row ${row.id}: ${error instanceof Error ? error.message : String(error)}`)
-    }
+    recordId: recorded?.id ?? null,
+    existingSyncLogId: recorded?.accountingSyncLogId ?? null,
   }
-  return { row: null, suppressed: null, shadowed: row }
+}
+
+async function linkShadow(client: SyncLogRowClient, recordId: string | null, syncLogId: string): Promise<void> {
+  if (recordId === null) return
+  try {
+    await withSavepoint(client, () => attachShadowSyncLog(client, recordId, syncLogId))
+  } catch (error) {
+    console.error(`[producer-hold] could not link shadow ${recordId} to sync row ${syncLogId}: ${error instanceof Error ? error.message : String(error)}`)
+  }
 }
