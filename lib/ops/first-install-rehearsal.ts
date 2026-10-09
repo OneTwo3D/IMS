@@ -15,6 +15,7 @@
  *   - the verdict, and the JSON and Markdown renderings of the report.
  */
 
+import type { BuildIdentity } from '@/lib/ops/build-identity'
 import { INSTANCE_ROLE_ENV_VAR } from '@/lib/ops/instance-identity'
 
 /** The rehearsal's exit codes. docs/installation.md documents this table once; a test compares them. */
@@ -104,7 +105,8 @@ export type TeardownResult = {
 }
 
 export type RehearsalReport = {
-  schemaVersion: 1
+  /** 2 since reports record the build they rehearsed (`build`). A version-1 report carries no build identifier. */
+  schemaVersion: 2
   tool: 'rehearse-first-install'
   runId: string
   verdict: 'GREEN' | 'RED'
@@ -122,6 +124,8 @@ export type RehearsalReport = {
     sourceDatabase: string
     restoreDatabase: string
   }
+  /** The commit and source tree rehearsed; null when git could not say (the gate refuses such a report). */
+  build: BuildIdentity | null
   steps: StepResult[]
   teardown: TeardownResult | null
   notes: string[]
@@ -497,7 +501,7 @@ export function buildReport(input: Omit<RehearsalReport, 'schemaVersion' | 'tool
   const exitCode = rehearsalExitCode(input.steps, input.teardown, input.interrupted)
   const red = isRed(input.steps) || input.interrupted !== null || exitCode !== REHEARSAL_EXIT.OK
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     tool: 'rehearse-first-install',
     verdict: red ? 'RED' : 'GREEN',
     exitCode,
@@ -525,6 +529,7 @@ export function renderMarkdown(report: RehearsalReport): string {
   lines.push(`- Run: \`${report.runId}\``)
   lines.push(`- Started: ${report.startedAt}; finished: ${report.finishedAt} (${Math.round(report.durationMs / 1000)}s)`)
   lines.push(`- Exit code: ${report.exitCode} (${REHEARSAL_EXIT_MEANING[report.exitCode]})`)
+  lines.push(`- Build rehearsed: ${report.build ? `commit ${report.build.commit}, source tree ${report.build.tree}, ${report.build.clean ? 'clean checkout' : 'checkout WITH uncommitted changes'}` : 'not identified (git could not say)'}`)
   lines.push(`- Node ${report.host.node}; PostgreSQL ${report.host.postgresServer ?? 'not started'}`)
   lines.push(`- Throwaway cluster: port ${report.cluster.port ?? 'none'}, role \`${report.cluster.role ?? 'none'}\`, scram verified: ${report.cluster.scramVerified}`)
   lines.push(`- system_identifier: ${report.cluster.systemIdentifier ?? 'not read'}`)
