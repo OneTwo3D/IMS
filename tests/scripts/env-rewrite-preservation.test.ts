@@ -79,8 +79,13 @@ const LIB = [
   shippedFunction(INSTALL, 'env_canonical_value'),
   shippedFunction(INSTALL, 'env_preserve_decision'),
   shippedFunction(INSTALL, 'env_key_is_security_control'),
+  /^ENV_DECODE_MAX_DEPTH=\d+$/m.exec(INSTALL)?.[0] ?? 'ENV_DECODE_MAX_DEPTH=UNSET',
+  /^ENV_DECODE_MAX_WORK=\d+$/m.exec(INSTALL)?.[0] ?? 'ENV_DECODE_MAX_WORK=UNSET',
+  'ENV_DECODE_LAYERS=(); ENV_DECODE_CHILDREN=(); ENV_DECODE_UNBOUNDED=0',
   shippedFunction(INSTALL, 'env_token_decode'),
-  shippedFunction(INSTALL, 'env_value_token_leaks_secret'),
+  shippedFunction(INSTALL, 'env_decode_children'),
+  shippedFunction(INSTALL, 'env_decode_seen'),
+  shippedFunction(INSTALL, 'env_value_decode_layers'),
   shippedFunction(INSTALL, 'env_value_leaks_secret'),
   shippedFunction(INSTALL, 'env_admin_password_decoded'),
   shippedFunction(INSTALL, 'env_unowned_existing_keys'),
@@ -798,6 +803,13 @@ test('re-run: AUDIT — every value the application accepts for a listed setting
     ['INVOICE_PDF_TOKEN_TTL_SECONDS', 'lib/invoice-pdf.ts', ['600']],
     ['INVOICE_PDF_TOKEN_MAX_TTL_SECONDS', 'lib/invoice-pdf.ts', ['2592000']],
     ['DATABASE_RESTORE_MAX_FILE_BYTES', 'app/api/backup/restore/route.ts parsePositiveIntegerEnv', ['52428800']],
+    ['SHOPPING_WEBHOOK_MAX_BODY_BYTES', 'app/api/webhooks/shopping/[connector]/[resource]/route.ts parsePositiveIntegerEnv (default 262144)', ['262144', '1048576']],
+    ['SHOPPING_WEBHOOK_READ_TIMEOUT_MS', 'app/api/webhooks/shopping/[connector]/[resource]/route.ts parsePositiveIntegerEnv (default 30000)', ['30000', '5000']],
+    ['WC_WEBHOOK_INBOX_MAX_ATTEMPTS', 'lib/connectors/shopping-webhook-inbox.ts parsePositiveIntegerEnv', ['5']],
+    ['WC_WEBHOOK_INBOX_PROCESS_PAGE_SIZE', 'lib/connectors/shopping-webhook-inbox.ts parsePositiveIntegerEnv', ['50']],
+    ['WC_WEBHOOK_INBOX_STALE_PROCESSING_MS', 'lib/connectors/shopping-webhook-inbox.ts parsePositiveIntegerEnv', ['300000']],
+    ['WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD', 'lib/connectors/woocommerce/sync/order-import.ts parsePositiveIntegerEnv', ['25']],
+    ['XERO_ACCOUNTING_OUTBOX_ENABLED', 'lib/connectors/xero/sync-processor.ts isXeroAccountingOutboxEnabled (false|0|off disable)', ['false', '0', 'off', 'true', 'FALSE']],
   ]
   const shapes = new Map([...(/^declare -A ENV_PRESERVE_SHAPES=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').matchAll(/\[([A-Z0-9_]+)\]=(\w+)/g)].map((m) => [m[1], m[2]]))
   const security = new Set((/^ENV_PRESERVE_SECURITY_KEYS=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').split(/\s+/).filter(Boolean))
@@ -820,6 +832,146 @@ test('re-run: AUDIT — every value the application accepts for a listed setting
   // A setting whose ABSENCE loosens a verification or a guard (a switch that turns a check on, an allowlist, a cap, a policy mode).
   const loosensWhenAbsent = ['REQUIRE_TRUSTED_PROXY_CONFIG', 'BEHIND_PROXY', 'PREFLIGHT_DB_CONNECT', 'TRUSTED_PROXY_IPS', 'TRUSTED_PROXY_CIDRS', 'RATE_LIMIT_BACKEND', 'CSP_MODE',
     'XERO_ALLOWED_TENANT_IDS', 'XERO_BLOCKED_TENANT_IDS', 'XERO_ALLOWED_TENANT_NAMES', 'XERO_REQUIRE_DEMO_ORG', 'XERO_TENANT_ID', 'XERO_DAILY_BATCH_LIMIT',
-    'CONNECTOR_FETCH_TIMEOUT_MS', 'CONNECTOR_FETCH_MAX_RESPONSE_BYTES', 'DATABASE_RESTORE_MAX_FILE_BYTES', 'FRESH_AUTH_MAX_AGE_SECONDS', 'INVOICE_PDF_TOKEN_TTL_SECONDS', 'INVOICE_PDF_TOKEN_MAX_TTL_SECONDS']
+    'CONNECTOR_FETCH_TIMEOUT_MS', 'CONNECTOR_FETCH_MAX_RESPONSE_BYTES', 'DATABASE_RESTORE_MAX_FILE_BYTES', 'SHOPPING_WEBHOOK_MAX_BODY_BYTES', 'SHOPPING_WEBHOOK_READ_TIMEOUT_MS', 'XERO_ACCOUNTING_OUTBOX_ENABLED', 'FRESH_AUTH_MAX_AGE_SECONDS', 'INVOICE_PDF_TOKEN_TTL_SECONDS', 'INVOICE_PDF_TOKEN_MAX_TTL_SECONDS']
   assert.deepEqual(loosensWhenAbsent.filter((k) => !security.has(k)), [], 'every guard whose absence loosens it is a security setting')
+})
+
+// ---------------------------------------------------------------------------
+// review round 7: the screen looks through ANY chain of reversible encodings
+// ---------------------------------------------------------------------------
+
+function seeded(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+const ENCODERS: Record<string, (s: string, rnd: () => number) => string> = {
+  percent: (s, rnd) => [...Buffer.from(s)].map((b) => '%' + (rnd() < 0.5 ? b.toString(16).padStart(2, '0') : b.toString(16).toUpperCase().padStart(2, '0'))).join(''),
+  hex: (s) => Buffer.from(s).toString('hex'),
+  base64: (s) => Buffer.from(s).toString('base64'),
+  base64url: (s) => Buffer.from(s).toString('base64url'),
+  base64nopad: (s) => Buffer.from(s).toString('base64').replace(/=+$/, ''),
+}
+const shq = (v: string) => `'${v.replace(/'/g, "'\\''")}'`
+
+test('re-run: PROPERTY — a chain of 1-6 random layers (percent, hex, base64, base64url, unpadded) over the admin password is refused, whatever the order', () => {
+  const passwords = ['Admin1234', 'ABCDEFGH', 'Zx9#kLm2', 'p@ss w0rd!', 'correct-horse-battery']
+  const rnd = seeded(20261009)
+  const names = Object.keys(ENCODERS)
+  const cases: Array<{ pw: string; chain: string[]; value: string }> = []
+  for (const pw of passwords) {
+    for (let n = 0; n < 48; n++) {
+      const depth = 1 + (n % 6)
+      const chain: string[] = []
+      let v = pw
+      for (let d = 0; d < depth; d++) {
+        const enc = names[Math.floor(rnd() * names.length)]
+        chain.push(enc)
+        v = ENCODERS[enc](v, rnd)
+      }
+      cases.push({ pw, chain, value: v })
+    }
+  }
+  const lines = [LIB]
+  cases.forEach((c, i) => {
+    lines.push(`DEPLOY_ADMIN_DATABASE_URL=${shq(`postgresql://deployadmin:${c.pw.replace(/[^A-Za-z0-9]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))}@127.0.0.1:5432/db`)}`)
+    lines.push(`env_key_carry_check XERO_ALLOWED_TENANT_NAMES ${shq(c.value)}; echo "${i} RC=$? $ENV_REFUSAL_REASON"`)
+  })
+  const r = bash(lines.join('\n'))
+  const results = new Map(r.out.split('\n').filter((l) => /^\d+ RC=/.test(l)).map((l) => [Number(l.split(' ')[0]), l.slice(l.indexOf(' ') + 1)]))
+  const miss = cases.filter((c, i) => results.get(i) !== "RC=1 the value contains the deploy admin's password")
+  console.log(`  ${cases.length} generated chains over ${passwords.length} passwords (depth 1-6): ${cases.length - miss.length} refused, ${miss.length} passed`)
+  assert.deepEqual(miss.slice(0, 3).map((c) => [c.pw, c.chain.join('>')]), [])
+  assert.equal(results.size, cases.length)
+})
+
+test('re-run: the exact review example (double base64 of Admin1234) is refused, and real organisation names are carried', () => {
+  const dbl = Buffer.from(Buffer.from('Admin1234').toString('base64')).toString('base64')
+  assert.equal(dbl, 'UVdSdGFXNHhNak0w')
+  const decide = (v: string) => bash([LIB, "DEPLOY_ADMIN_DATABASE_URL='postgresql://deployadmin:Admin1234@127.0.0.1:5432/db'", `env_preserve_decision XERO_ALLOWED_TENANT_NAMES ${shq(v)}; echo "RC=$? [$ENV_REFUSAL_REASON]"`].join('\n')).out.trim().split('\n').pop()
+  assert.equal(decide(dbl), "RC=1 [the value contains the deploy admin's password]")
+  for (const name of ['OneTwo3D Ltd', 'Acme-Widgets', 'Demo Company (UK)', "Smith & Sons, O'Neil Trading", 'Acme-Widgets, OneTwo3D Ltd', 'Production Warehouse']) {
+    assert.equal(decide(name), 'RC=0 []', name)
+  }
+})
+
+test('re-run: the decoder is bounded, and a value still decodable at the bound is refused rather than passed', () => {
+  const run = (setup: string, value: string) => bash([LIB, "DEPLOY_ADMIN_DATABASE_URL='postgresql://deployadmin:Admin1234@127.0.0.1:5432/db'", setup, `env_key_carry_check XERO_ALLOWED_TENANT_NAMES ${shq(value)}; echo "RC=$? [$ENV_REFUSAL_REASON] U=$ENV_DECODE_UNBOUNDED"`].join('\n')).out.trim().split('\n').pop()
+  let v = 'Admin1234'
+  for (let i = 0; i < 12; i++) v = Buffer.from(v).toString('base64')
+  // twelve layers: beyond the shipped depth of 10
+  assert.match(String(run(':', v)), /^RC=1 \[the value is encoded too deeply to screen for the deploy admin's password\] U=1$/)
+  // inside the depth bound the same construction is found as the password
+  let w = 'Admin1234'
+  for (let i = 0; i < 6; i++) w = Buffer.from(w).toString('base64')
+  assert.match(String(run(':', w)), /^RC=1 \[the value contains the deploy admin's password\]/)
+  // the total-work bound: a tiny budget refuses a chain that fits the depth
+  assert.match(String(run('ENV_DECODE_MAX_WORK=40', w)), /encoded too deeply.*U=1$/)
+  // an ordinary value is never "too deep"
+  assert.match(String(run('ENV_DECODE_MAX_DEPTH=2', 'OneTwo3D Ltd')), /^RC=0 \[\] U=0$/)
+  console.log(`  limits: depth 10 / work ${/^ENV_DECODE_MAX_WORK=(\d+)/m.exec(INSTALL)?.[1]} decoded characters`)
+})
+
+// ---------------------------------------------------------------------------
+// the closed census: every environment variable the code reads is either set by the template, carried, or
+// deliberately not carried with a reason
+// ---------------------------------------------------------------------------
+
+/** Environment variables read by the code that a re-run deliberately does NOT carry, each with the reason. */
+const NOT_CARRIED: Record<string, string> = {
+  // secrets and credentials: copied from the root-only backup by an operator who needs them
+  ANTHROPIC_API_KEY: 'secret',
+  ENCRYPTION_KEY: 'secret',
+  NEXTAUTH_SECRET: 'secret (legacy name)',
+  INTEGRATION_CONNECTION_FINGERPRINT_KEY: 'secret',
+  XERO_AUDIT_CLIENT_ID: 'credential of a one-off audit script',
+  XERO_AUDIT_CLIENT_SECRET: 'secret of a one-off audit script',
+  // database connection settings: never carried (admin-credential rule)
+  DEPLOY_ADMIN_DATABASE_URL: 'admin credential, never written to .env',
+  DIRECT_URL: 'database connection setting',
+  SOURCE_DATABASE_URL: 'database connection of a one-off copy script',
+  STAGE_DATABASE_URL: 'database connection of a one-off stage script',
+  // set by the platform, the shell or CI, not by .env
+  CI: 'CI', GITHUB_BASE_REF: 'CI', GITHUB_EVENT_NAME: 'CI', GITHUB_EVENT_PATH: 'CI',
+  HOME: 'ambient', PATH: 'ambient', USER: 'ambient', SUDO_USER: 'ambient', NODE_OPTIONS: 'ambient', STATE_DIRECTORY: 'systemd',
+  NEXT_RUNTIME: 'set by Next.js',
+  COMMIT_SHA: 'build identity, set at build/deploy', GIT_COMMIT_SHA: 'build identity', SOURCE_VERSION: 'build identity', VERCEL_GIT_COMMIT_SHA: 'build identity',
+  // development and repository tooling, not read by an installed instance
+  ARCHIVE_SEAL_BASE_REF: 'repo tooling', ARCHIVE_SEAL_MANIFEST: 'repo tooling', ARCHIVE_SEAL_REF: 'repo tooling', ARCHIVE_SEAL_REWRITE: 'repo tooling',
+  MIGRATION_CONVENTION_BASE_REF: 'repo tooling', MIGRATION_CONVENTION_HEAD_REF: 'repo tooling', SCHEMA_CHECK_BASE_REF: 'repo tooling', SCHEMA_CHECK_HEAD_REF: 'repo tooling',
+  SCHEMA_SCOPE_BASE_REF: 'repo tooling', SCHEMA_SCOPE_HEAD_REF: 'repo tooling', PRISMA_DRIFT_ALLOWLIST: 'repo tooling', PRISMA_MIGRATIONS_DIR: 'repo tooling', PRISMA_SCHEMA_PATH: 'repo tooling',
+  IMS_VERIFY_COVERAGE_STRICT: 'CI strictness flag of the verification runner', IMS_CHOWN_TREE_ROOT: 'test seam of the installer helper',
+  RUN_DB_CONCURRENCY_TESTS: 'test switch', E2E_BASE_URL: 'test', E2E_CRON_RATE_LIMIT_MAX: 'test', E2E_ROUTE_SECRET: 'test', E2E_TEST_MODE: 'test (must never be on in production)',
+  REHEARSAL_SEED_USD_RATE: 'rehearsal tooling',
+  // cutover tooling paths: written by the cutover scripts, not by an operator
+  OTI_CRONTAB_LOCK_PATH: 'cutover tooling path', OTI_CRONTAB_LOCK_WAIT_MS: 'cutover tooling', OTI_CRON_LOG_PATH: 'cutover tooling path', OTI_CUTOVER_STATE_ROOT: 'cutover tooling path',
+  // loosening settings whose absence TIGHTENS: dropping is fail-closed, the value stays in the backup
+  CONNECTOR_PRIVATE_IP_ALLOWLIST: 'allows connector calls to private addresses; absent = stricter, so a drop is fail-closed',
+}
+
+test('re-run: CENSUS — every environment variable the code reads is set by the template, on the carry list, or deliberately not carried (and the table is not stale)', () => {
+  const read = new Set<string>()
+  const re = /process\.env\.([A-Z][A-Z0-9_]+)|process\.env\[['"]([A-Z][A-Z0-9_]+)['"]\]|\benv\.([A-Z][A-Z0-9_]{3,})\b/g
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === 'node_modules' || e.name === '.next' || e.name.startsWith('.')) continue
+      const full = join(dir, e.name)
+      if (e.isDirectory()) walk(full)
+      else if (/\.(ts|tsx|mjs|js)$/.test(e.name)) for (const m of readFileSync(full, 'utf8').matchAll(re)) read.add(m[1] ?? m[2] ?? m[3])
+    }
+  }
+  for (const d of ['lib', 'app', 'scripts']) walk(join(process.cwd(), d))
+  const template = new Set((/^ENV_TEMPLATE_KEYS=\((.*)\)$/m.exec(INSTALL)?.[1] ?? '').split(/\s+/).filter(Boolean))
+  const carried = new Set([...(/^declare -A ENV_PRESERVE_SHAPES=\(([\s\S]*?)^\)$/m.exec(INSTALL)?.[1] ?? '').matchAll(/\[([A-Z0-9_]+)\]=/g)].map((m) => m[1]))
+  const unclassified = [...read].filter((n) => !template.has(n) && !carried.has(n) && !(n in NOT_CARRIED)).sort()
+  const stale = Object.keys(NOT_CARRIED).filter((n) => !read.has(n)).sort()
+  console.log(`  census: ${read.size} environment variables read in lib/ app/ scripts/; ${[...read].filter((n) => template.has(n)).length} set by the template, ${[...read].filter((n) => carried.has(n)).length} carried, ${[...read].filter((n) => n in NOT_CARRIED).length} deliberately not carried`)
+  assert.deepEqual(unclassified, [], 'a variable read in code is on none of: the template, the carry list, NOT_CARRIED (decide, with a reason)')
+  assert.deepEqual(stale, [], 'NOT_CARRIED lists a name nothing reads any more')
+  // (A carried name may be read through a helper this pattern does not see, so the reverse direction is not asserted.)
 })

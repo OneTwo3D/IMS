@@ -74,7 +74,9 @@ export const SHIPPED = [
   'env_percent_decode',
   'env_percent_encode',
   'env_token_decode',
-  'env_value_token_leaks_secret',
+  'env_decode_children',
+  'env_decode_seen',
+  'env_value_decode_layers',
   'env_value_leaks_secret',
   'env_value_has_shape',
   'env_value_has_residual_escape',
@@ -261,12 +263,14 @@ export const ENV_PRESERVE_SHAPES_BLOCK = (() => {
     /^declare -A ENV_PRESERVE_SHAPES=\([\s\S]*?^\)$/m,
     /^ENV_PRESERVE_SECURITY_KEYS=\([\s\S]*?^\)$/m,
     /^ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE=".*"$/m,
+    /^ENV_DECODE_MAX_DEPTH=\d+$/m,
+    /^ENV_DECODE_MAX_WORK=\d+$/m,
   ].map((re) => {
     const match = re.exec(INSTALL_SOURCE)
     assert.ok(match, `precondition: scripts/install.sh must define ${re}`)
     return match[0]
   })
-  return `${parts.join('\n')}\nENV_PRESERVE_VALUE=''\ndeclare -A ENV_PRESERVED_EFFECTIVE=()`
+  return `${parts.join('\n')}\nENV_PRESERVE_VALUE=''\ndeclare -A ENV_PRESERVED_EFFECTIVE=()\nENV_DECODE_LAYERS=(); ENV_DECODE_CHILDREN=(); ENV_DECODE_UNBOUNDED=0`
 })()
 
 

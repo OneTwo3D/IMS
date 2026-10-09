@@ -678,41 +678,92 @@ env_token_decode() {
   printf -v "$2" '%b' "${out}"
 }
 
-# Does any comma/space/semicolon/pipe-separated token of ${1} decode (hex or base64/base64url) to something
-# containing ${2}? Returns 0 when it does.
-env_value_token_leaks_secret() {
-  local value="$1" secret="$2" token decoded
+# THE FIXED-POINT DECODER. One value can hide a credential under any chain of reversible encodings (percent,
+# plus-for-space, hex, base64, base64url, in any order, any depth), so the screen does not enumerate chains:
+# it applies EVERY decoder to the value, to each token of it, and to every result, breadth-first, until nothing
+# new appears. Bounded: at most ENV_DECODE_MAX_DEPTH layers and ENV_DECODE_MAX_WORK characters of decoded
+# output in total. If either bound is hit while the value is STILL decodable, ENV_DECODE_UNBOUNDED is set and
+# the caller refuses (a value that cannot be looked through is not passed on the strength of finding nothing).
+ENV_DECODE_MAX_DEPTH=10
+ENV_DECODE_MAX_WORK=65536
+ENV_DECODE_LAYERS=()
+ENV_DECODE_CHILDREN=()
+ENV_DECODE_UNBOUNDED=0
+
+# Every one-step decoding of ${1} that differs from it, into ENV_DECODE_CHILDREN.
+env_decode_children() {
+  local s="$1" t d
   local -a tokens=()
-  IFS=$',; \t|' read -r -a tokens <<< "${value}"
-  for token in "${value}" "${tokens[@]}"; do
-    [[ -n "${token}" ]] || continue
-    env_token_decode "${token}" decoded
-    [[ -z "${decoded}" ]] || [[ "${decoded}" != *"${secret}"* ]] || return 0
+  ENV_DECODE_CHILDREN=()
+  env_percent_decode "${s}" d
+  [[ "${d}" == "${s}" ]] || ENV_DECODE_CHILDREN+=("${d}")
+  env_percent_decode "${s//+/ }" d
+  [[ "${d}" == "${s}" ]] || ENV_DECODE_CHILDREN+=("${d}")
+  IFS=$',; \t|\n' read -r -d '' -a tokens <<< "${s}" || true
+  for t in "${s}" "${tokens[@]}"; do
+    [[ -n "${t}" ]] || continue
+    env_token_decode "${t}" d
+    [[ -z "${d}" || "${d}" == "${s}" ]] || ENV_DECODE_CHILDREN+=("${d}")
+  done
+}
+
+# Is ${1} already one of the layers collected so far? (Linear scan: associative keys cannot safely hold
+# arbitrary decoded bytes.)
+env_decode_seen() {
+  local x
+  for x in "${ENV_DECODE_LAYERS[@]}"; do
+    [[ "${x}" != "$1" ]] || return 0
   done
   return 1
 }
 
-# Does ${1} contain ${2}, or any copy of it that has been percent-encoded 1-4 times (hex digits in either
-# case) or written with '+' for a space? The candidate is DECODED repeatedly until it stops changing
-# (at most four passes), and every pass is searched; decoding is canonical because the hex digits are read
-# case-insensitively by the decoder. A substring match, not equality: the secret may sit inside a longer
-# setting. Returns 0 when it does.
-env_value_leaks_secret() {
-  local value="$1" secret="$2" variant v next pass
-  for variant in plain plus; do
-    v="${value}"
-    for ((pass = 0; pass < 5; pass++)); do
-      [[ "${v}" == *"${secret}"* ]] && return 0
-      env_value_token_leaks_secret "${v}" "${secret}" && return 0
-      if [[ "${variant}" == plus ]]; then
-        env_percent_decode "${v//+/ }" next
-      else
-        env_percent_decode "${v}" next
-      fi
-      [[ "${next}" != "${v}" ]] || break
-      v="${next}"
+# Collect every layer of ${1} into ENV_DECODE_LAYERS (the value itself first).
+env_value_decode_layers() {
+  local depth work=${#1} node child
+  local -a frontier=("$1") next=()
+  ENV_DECODE_LAYERS=("$1")
+  ENV_DECODE_UNBOUNDED=0
+  for ((depth = 0; depth < ENV_DECODE_MAX_DEPTH; depth++)); do
+    next=()
+    for node in "${frontier[@]}"; do
+      env_decode_children "${node}"
+      for child in "${ENV_DECODE_CHILDREN[@]}"; do
+        [[ -n "${child}" ]] || continue
+        if env_decode_seen "${child}"; then continue; fi
+        work=$((work + ${#child}))
+        if ((work > ENV_DECODE_MAX_WORK)); then
+          ENV_DECODE_UNBOUNDED=1
+          return 0
+        fi
+        ENV_DECODE_LAYERS+=("${child}")
+        next+=("${child}")
+      done
+    done
+    ((${#next[@]} > 0)) || return 0
+    frontier=("${next[@]}")
+  done
+  # The depth bound is reached with layers still pending: refuse if any of them decodes further.
+  for node in "${frontier[@]}"; do
+    env_decode_children "${node}"
+    for child in "${ENV_DECODE_CHILDREN[@]}"; do
+      [[ -n "${child}" ]] || continue
+      if env_decode_seen "${child}"; then continue; fi
+      ENV_DECODE_UNBOUNDED=1
+      return 0
     done
   done
+  return 0
+}
+
+# Does ${1}, at any layer of the fixed-point decoding, contain ${2}? Returns 0 when it does (or when the value
+# cannot be looked through, ENV_DECODE_UNBOUNDED=1: the caller treats that as a refusal too).
+env_value_leaks_secret() {
+  local layer
+  env_value_decode_layers "$1"
+  for layer in "${ENV_DECODE_LAYERS[@]}"; do
+    [[ "${layer}" != *"$2"* ]] || return 0
+  done
+  ((ENV_DECODE_UNBOUNDED == 0)) || return 0
   return 1
 }
 
@@ -782,6 +833,13 @@ declare -A ENV_PRESERVE_SHAPES=(
   [INVOICE_PDF_TOKEN_TTL_SECONDS]=int
   [INVOICE_PDF_TOKEN_MAX_TTL_SECONDS]=int
   [DATABASE_RESTORE_MAX_FILE_BYTES]=int
+  [SHOPPING_WEBHOOK_MAX_BODY_BYTES]=int
+  [SHOPPING_WEBHOOK_READ_TIMEOUT_MS]=int
+  [WC_WEBHOOK_INBOX_MAX_ATTEMPTS]=int
+  [WC_WEBHOOK_INBOX_PROCESS_PAGE_SIZE]=int
+  [WC_WEBHOOK_INBOX_STALE_PROCESSING_MS]=int
+  [WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD]=int
+  [XERO_ACCOUNTING_OUTBOX_ENABLED]=bool
 )
 ENV_PRESERVE_MAX_LENGTH=4096
 
@@ -800,6 +858,7 @@ ENV_PRESERVE_SECURITY_KEYS=(
   FRESH_AUTH_MAX_AGE_SECONDS INVOICE_PDF_TOKEN_TTL_SECONDS INVOICE_PDF_TOKEN_MAX_TTL_SECONDS
   PREFLIGHT_DB_CONNECT XERO_DAILY_BATCH_LIMIT CONNECTOR_FETCH_TIMEOUT_MS CONNECTOR_FETCH_MAX_RESPONSE_BYTES
   DATABASE_RESTORE_MAX_FILE_BYTES
+  SHOPPING_WEBHOOK_MAX_BODY_BYTES SHOPPING_WEBHOOK_READ_TIMEOUT_MS XERO_ACCOUNTING_OUTBOX_ENABLED
 )
 ENV_SECURITY_KEY_UNCARRIABLE_MESSAGE="is a security setting that this installer cannot carry across to the new file (its value is not in a form that setting accepts, or it failed the screen against the deploy admin credential). Correct or remove it and re-run. Nothing has been changed."
 
@@ -960,7 +1019,7 @@ env_unowned_existing_keys() {
 ENV_REFUSAL_REASON=""
 env_key_carry_check() {
   local key="$1" value="$2" upper admin_user="" admin_pass="" url="${DEPLOY_ADMIN_DATABASE_URL:-}"
-  local lower_value="${value,,}" form
+  local lower_value="${value,,}" form layer
   local -a pass_forms=() user_forms=()
   upper="${key^^}"
   ENV_REFUSAL_REASON=""
@@ -1001,11 +1060,18 @@ env_key_carry_check() {
     # Screened only when long enough for a substring match to mean something; a shorter password with
     # settings to screen is refused up front by the caller (ENV_ADMIN_PASSWORD_MIN_LENGTH).
     if [[ ${#decoded_pass} -ge ${ENV_ADMIN_PASSWORD_MIN_LENGTH} ]]; then
+      env_value_decode_layers "${value}"
+      if ((ENV_DECODE_UNBOUNDED != 0)); then
+        ENV_REFUSAL_REASON="the value is encoded too deeply to screen for the deploy admin's password"
+        return 1
+      fi
       for form in "${pass_forms[@]}"; do
-        if [[ "${value}" == *"${form}"* ]] || env_value_leaks_secret "${value}" "${form}"; then
-          ENV_REFUSAL_REASON="the value contains the deploy admin's password"
-          return 1
-        fi
+        for layer in "${ENV_DECODE_LAYERS[@]}"; do
+          if [[ "${layer}" == *"${form}"* ]]; then
+            ENV_REFUSAL_REASON="the value contains the deploy admin's password"
+            return 1
+          fi
+        done
       done
     fi
     for form in "${user_forms[@]}"; do
