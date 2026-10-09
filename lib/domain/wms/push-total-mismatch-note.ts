@@ -17,7 +17,22 @@ export const PUSH_TOTAL_MISMATCH_OPERATOR_NOTE =
  * currency's own decimal places: 200 GBP minor units is 2.00, 200 JPY is 200, 2000 KWD (3dp) is 2.000.
  */
 export function formatMismatchAmount(minorUnitsAmount: number, currency: string, decimals: number): string {
-  return (minorUnitsAmount / 10 ** decimals).toLocaleString('en-GB', {
-    style: 'currency', currency, minimumFractionDigits: decimals, maximumFractionDigits: decimals,
-  })
+  const text = formatExact(minorUnitsAmount, currency, decimals)
+  // A value at the column cap was clamped: the real difference is at least this much, not exactly this much.
+  return minorUnitsAmount >= MAX_ADVISORY_PENCE ? `at least ${text}` : text
 }
+
+function formatExact(minorUnitsAmount: number, currency: string, decimals: number): string {
+  const scaled = minorUnitsAmount / 10 ** decimals
+  try {
+    return scaled.toLocaleString('en-GB', {
+      style: 'currency', currency, minimumFractionDigits: decimals, maximumFractionDigits: decimals,
+    })
+  } catch {
+    // An order row with no usable currency code must not break the whole exceptions page.
+    return `${scaled.toFixed(decimals)} (currency unknown)`
+  }
+}
+
+/** The push-link column is a 32-bit Int; a recorded figure at this value was CLAMPED and is a lower bound. */
+export const MAX_ADVISORY_PENCE = 2_147_483_647

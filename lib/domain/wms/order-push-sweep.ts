@@ -3,6 +3,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { currencyMinorUnits, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
@@ -422,7 +423,7 @@ const TOTAL_DRIFT_TOLERANCE_PENCE = 1
  * It therefore never throws; a failure to evaluate is logged and reads as "no finding".
  */
 /** The push-link column is a 32-bit Int. An advisory figure must never be the reason the link write fails. */
-export const MAX_ADVISORY_PENCE = 2_147_483_647
+export { MAX_ADVISORY_PENCE }
 export function clampAdvisoryPence(value: number): number {
   return Number.isFinite(value) ? Math.min(MAX_ADVISORY_PENCE, Math.max(0, Math.trunc(value))) : MAX_ADVISORY_PENCE
 }
@@ -1643,8 +1644,16 @@ export async function runWmsOrderPushSweepCore(
           : null
         // Penny-precision guard (G6): record (never block) when the order's own totals
         // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
-        const driftPence = orderTotalDriftPence(order, order.currency)
-        const componentPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? clampAdvisoryPence(driftPence) : null
+        // Each advisory check has its OWN catch: this runs after the warehouse accepted the order, and an
+        // exception here would reach the create path's handler, which writes a failure state for an order that
+        // exists. An unevaluable check reads as "no finding" and the SYNCED link write below still happens.
+        let componentPence: number | null = null
+        try {
+          const driftPence = orderTotalDriftPence(order, order.currency)
+          componentPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? clampAdvisoryPence(driftPence) : null
+        } catch (error) {
+          console.error(`[wms-order-push] component total check could not run for ${order.orderNumber ?? order.id}: ${scrubWmsError(error, 'check failed')}`)
+        }
         // BOTH checks always run: a small component error must not hide a larger payload discrepancy.
         const payloadPence = payloadTotalMismatchPence(order, input)
         const totalMismatchPence = largerAdvisoryPence(componentPence, payloadPence)

@@ -10,7 +10,7 @@ import {
   MAX_ROUNDING_BOUND_MINOR_UNITS,
   type PushTotalsVerdict,
 } from '../lib/domain/wms/push-total-guard.ts'
-import { formatMismatchAmount } from '../lib/domain/wms/push-total-mismatch-note.ts'
+import { formatMismatchAmount, MAX_ADVISORY_PENCE } from '../lib/domain/wms/push-total-mismatch-note.ts'
 import { unconditionalMoneySentences, unlicensedHistoryClaims } from './helpers/unconditional-instruction.ts'
 
 type Line = { id: string; sku: string; qty: number; totalForeign: number; taxForeign: number; description: string }
@@ -43,6 +43,21 @@ const FIXTURES: Fixture[] = [
   { name: 'VAT-inclusive order with a GROSS order-level discount (sent with no VAT part)', lines: [L('a', 1, 100, 20)], taxForeign: 18, discountAmount: 12, pricesIncludeVat: true, totalForeign: 108, expectStatus: 'MISMATCH', expectDriftMinor: 200, expectCause: 'DISCOUNT_VAT_NOT_SPLIT' },
   { name: 'partial refund: one unit of a 3-unit line withheld, TotalVat not reduced', lines: [L('a', 3, 30, 6), L('b', 1, 10, 2)], taxForeign: 8, totalForeign: 48, refunded: { a: 1 }, expectStatus: 'MISMATCH', expectDriftMinor: 200, expectCause: 'UNEXPLAINED' },
   { name: 'fully refunded line dropped from the payload, TotalVat not reduced', lines: [L('a', 1, 30, 6), L('b', 1, 10, 2)], taxForeign: 8, totalForeign: 48, refunded: { b: 1 }, expectStatus: 'MISMATCH', expectDriftMinor: 200, expectCause: 'UNEXPLAINED' },
+  // HAND-DERIVED refund boundary cases (plugin _drift_bound: half a minor unit per independently rounded amount
+  // that enters the comparison; derived here by counting, NOT by the guard's or the oracle's formula).
+  // Partial refund, lines a (qty 3, net 30, VAT 6) and b (qty 1, net 10, VAT 2), one unit of a refunded,
+  // order VAT 6 (what the payload sends). Pushed = 20 + 10 + 6 = 36.00. Withheld = 1/3 x (30+6) = 12.00.
+  // Amounts in the comparison: net a, net b, VAT total, order total (4) + net and VAT of refunded line a (2) = 6
+  // => bound 3 pence. Order total 48.03 => expected 36.03, drift 3p = AT the bound: WITHIN_ROUNDING.
+  { name: 'HAND partial refund: drift exactly AT the 3p bound', lines: [L('a', 3, 30, 6), L('b', 1, 10, 2)], taxForeign: 6, totalForeign: 48.03, refunded: { a: 1 }, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 3 },
+  // Total 48.04 => drift 4p, one above the 3p bound: MISMATCH.
+  { name: 'HAND partial refund: one pence ABOVE the 3p bound', lines: [L('a', 3, 30, 6), L('b', 1, 10, 2)], taxForeign: 6, totalForeign: 48.04, refunded: { a: 1 }, expectStatus: 'MISMATCH', expectDriftMinor: 4, expectCause: 'UNEXPLAINED' },
+  // Full refund of b (qty 1, net 10, VAT 2); a (net 30, VAT 6) kept; order VAT 6. Pushed = 30 + 6 = 36.00. Withheld = 12.00.
+  // Amounts: net a, VAT total, order total (3) + net and VAT of refunded b (2) = 5 => bound 2.5 pence.
+  // Total 48.02 => drift 2p <= 2.5: WITHIN_ROUNDING.
+  { name: 'HAND full refund: 2p, inside the 2.5p bound', lines: [L('a', 1, 30, 6), L('b', 1, 10, 2)], taxForeign: 6, totalForeign: 48.02, refunded: { b: 1 }, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 2 },
+  // Total 48.03 => drift 3p > 2.5: MISMATCH (one pence above the nearest whole-pence bound).
+  { name: 'HAND full refund: 3p, above the 2.5p bound', lines: [L('a', 1, 30, 6), L('b', 1, 10, 2)], taxForeign: 6, totalForeign: 48.03, refunded: { b: 1 }, expectStatus: 'MISMATCH', expectDriftMinor: 3, expectCause: 'UNEXPLAINED' },
   { name: '3dp unit price (13.498 x 3) with WC totals rounded to 2dp', lines: [L('a', 3, 40.494, 8.0988)], taxForeign: 8.1, totalForeign: 48.59, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
   { name: 'unit price that does not divide (10.00 / 3)', lines: [L('a', 3, 10, 2)], taxForeign: 2, totalForeign: 12, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
   { name: '9 lines: independent penny rounding accumulates to 4p, inside the 5.5p bound', lines: nineLines, taxForeign: 3, totalForeign: 17.99, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 4 },
@@ -130,7 +145,7 @@ for (const f of FIXTURES) {
 test('census: every fixture ran, and each accepted fixture honours sum(lines)+shipping-discount+VAT == total within its bound', () => {
   console.log(`# census (${ran}/${FIXTURES.length} fixtures):\n# ${census.join('\n# ')}`)
   assert.equal(ran, FIXTURES.length)
-  assert.ok(FIXTURES.length >= 12)
+  assert.ok(FIXTURES.length >= 16)
   const flagged = FIXTURES.filter((f) => f.expectStatus === 'MISMATCH').length
   const accepted = FIXTURES.length - flagged
   console.log(`# precondition: ${accepted} accepted fixtures, ${flagged} flagged fixtures`)
@@ -205,4 +220,13 @@ test('exceptions page amount is scaled by the ORDER currency, not /100 GBP', () 
   assert.match(gbp, /2\.00$/)
   assert.match(jpy, /200$/)
   assert.match(kwd, /2\.000$/)
+})
+
+test('a clamped figure is shown as a lower bound, an exact one is not', () => {
+  const clamped = formatMismatchAmount(MAX_ADVISORY_PENCE, 'GBP', 2)
+  const exact = formatMismatchAmount(MAX_ADVISORY_PENCE - 1, 'GBP', 2)
+  console.log(`# precondition: ${clamped} | ${exact} | ${formatMismatchAmount(5, 'XXX?', 2)}`)
+  assert.match(clamped, /^at least /)
+  assert.ok(!/^at least /.test(exact))
+  assert.ok(formatMismatchAmount(5, 'not a currency', 2).includes('currency unknown'))
 })

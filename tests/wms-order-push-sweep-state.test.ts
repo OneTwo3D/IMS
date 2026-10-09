@@ -361,6 +361,44 @@ test('orderTotalDriftPence is exact Decimal arithmetic and scales by the order c
   assert.equal(orderTotalDriftPence({ ...o, subtotalForeign: 1, taxForeign: 0, totalForeign: 1.002 }, 'KWD'), 2)
 })
 
+test('create: an order with a NULL currency still ends SYNCED after the warehouse accepted it', async () => {
+  const order = candidate({ currency: null as unknown as string })
+  let pushed = 0
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { pushed += 1; return okPush() } }), 'mintsoft', port, { now: NOW })
+  console.log(`# precondition: pushed=${pushed} created=${r.created} state=${upserts[0]?.create.state}`)
+  assert.equal(pushed, 1)
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+})
+
+test('create: a component check that THROWS is contained locally; the payload check still runs and the link is SYNCED', async () => {
+  // A getter that throws only on subtotalForeign, which only the component check reads.
+  const order = candidate({
+    taxForeign: 18, discountAmount: 12, taxRatePercent: 0.2, pricesIncludeVat: true, totalForeign: 108,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  Object.defineProperty(order, 'subtotalForeign', { get() { throw new Error('boom') } })
+  const errors: string[] = []
+  const original = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  let upserts
+  try {
+    const made = makePort({ createCandidates: [order] })
+    upserts = made.upserts
+    const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', made.port, { now: NOW })
+    assert.equal(r.created, 1)
+  } finally {
+    console.error = original
+  }
+  console.log(`# precondition: component errors=${errors.filter((e) => e.includes('component total check could not run')).length} recorded=${String(upserts?.[0]?.create.totalMismatchPence)}`)
+  assert.equal(errors.filter((e) => e.includes('component total check could not run')).length, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+  assert.equal(upserts[0].create.totalMismatchPence, 200, 'the payload check still ran')
+})
+
 test('create: a normal (no-fallback) push posts no courier comment', async () => {
   const comments: Array<{ externalOrderId: string; comment: string }> = []
   const { port } = makePort({ createCandidates: [candidate()] })
