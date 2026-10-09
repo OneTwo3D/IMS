@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
-import { logActivity } from '@/lib/activity-log'
+import { logActivityInTransaction } from '@/lib/activity-log'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
   describeRecordedOperatorLedgerCheck,
@@ -94,32 +94,36 @@ export async function recordLedgerCheck(input: {
         : {},
       note: typeof input.note === 'string' ? input.note : null,
       userId: session.user.id,
-    }, { client: db, probe: probeLedgerSettlement })
-    if (!recorded.ok) return recorded
-
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: recorded.orderId,
-      action: 'operator_ledger_check_recorded',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: describeRecordedOperatorLedgerCheck({
-        ...recorded,
-        syncLogId: input.syncLogId,
-        actor: session.user.name ?? session.user.email ?? session.user.id,
+    }, {
+      client: db,
+      probe: probeLedgerSettlement,
+      // THE AUDIT ROW COMMITS WITH THE CHECK (Codex r3 on #757): the transactional logger throws on
+      // failure, which rolls the check back — a check that lifts a money hold never exists unaudited.
+      audit: (tx, rec) => logActivityInTransaction(tx, {
+        entityType: 'SALES_ORDER',
+        entityId: rec.orderId,
+        action: 'operator_ledger_check_recorded',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: describeRecordedOperatorLedgerCheck({
+          ...rec,
+          syncLogId: String(input.syncLogId ?? ''),
+          actor: session.user.name ?? session.user.email ?? session.user.id,
+        }),
+        metadata: {
+          operatorLedgerCheckId: rec.checkId,
+          syncLogId: String(input.syncLogId ?? ''),
+          paymentId: rec.paymentId,
+          ledgerDocumentId: rec.ledgerDocumentId,
+          ledgerRecordIds: rec.recordIds,
+          tenantId: rec.binding.tenantId,
+          connectionGeneration: rec.binding.connectionGeneration,
+          basis: 'OPERATOR_ASSERTION',
+        },
+        userId: session.user.id,
       }),
-      metadata: {
-        operatorLedgerCheckId: recorded.checkId,
-        syncLogId: input.syncLogId,
-        paymentId: recorded.paymentId,
-        ledgerDocumentId: recorded.ledgerDocumentId,
-        ledgerRecordIds: recorded.recordIds,
-        tenantId: recorded.binding.tenantId,
-        connectionGeneration: recorded.binding.connectionGeneration,
-        basis: 'OPERATOR_ASSERTION',
-      },
-      userId: session.user.id,
     })
+    if (!recorded.ok) return recorded
 
     // RE-RUN THE SAME GUARDED REGISTRATION addPayment runs. Nothing else would come back for a refused
     // receipt, and a second, laxer copy of the decision is exactly what this codebase refuses to grow.

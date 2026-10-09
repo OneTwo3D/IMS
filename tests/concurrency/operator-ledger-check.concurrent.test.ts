@@ -64,6 +64,19 @@ mock.module('@/lib/connectors/xero/api', {
   },
 })
 
+// o3d-llyw (Codex r3 on #757): the settlement and reconcile SERVER ACTIONS are driven directly in subtest 12,
+// so their session gate is replaced by an admin session and `revalidatePath` (which needs a Next request
+// context) by a no-op. Nothing else about either action is replaced.
+mock.module('@/lib/auth/server', {
+  namedExports: {
+    requireFreshPermission: async () => ({ user: { id: `op-${process.pid}`, role: 'ADMIN', name: 'operator', email: null } }),
+    requirePermission: async () => ({ user: { id: `op-${process.pid}`, role: 'ADMIN', name: 'operator', email: null } }),
+    requireAuth: async () => ({ user: { id: `op-${process.pid}`, role: 'ADMIN', name: 'operator', email: null } }),
+    freshAuthFailureResult: () => null,
+  },
+})
+mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
+
 function loadEnv(): void {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
@@ -73,13 +86,14 @@ function loadEnv(): void {
 
 async function deps() {
   loadEnv()
-  const [{ db }, enqueue, record, probe] = await Promise.all([
+  const [{ db }, enqueue, record, probe, activity] = await Promise.all([
     import('../../lib/db/index.ts'),
     import('../../lib/domain/accounting/invoice-payment-enqueue.ts'),
     import('../../lib/domain/accounting/operator-ledger-check-record.ts'),
     import('../../lib/connectors/accounting-settlement-probe.ts'),
+    import('../../lib/activity-log.ts'),
   ])
-  return { db, ...enqueue, ...record, probeLedgerSettlement: probe.probeLedgerSettlement }
+  return { db, ...enqueue, ...record, probeLedgerSettlement: probe.probeLedgerSettlement, logActivityInTransaction: activity.logActivityInTransaction }
 }
 type Deps = Awaited<ReturnType<typeof deps>>
 
@@ -138,7 +152,7 @@ type Order = { orderId: string; invoiceId: string; syncedId: string | null; fail
  * cannot read. In the LIFTABLE shape it is a payment entered by hand in Xero (`PAY-H-…`); in the HEADLINE
  * shape (`withPostedSibling`) it is the own payment of a SYNCED registration of 40 on the same invoice.
  */
-async function seedOrder(d: Deps, label: string, options: { withPostedSibling?: boolean } = {}): Promise<Order> {
+async function seedOrder(d: Deps, label: string, options: { withPostedSibling?: boolean; failedAttemptRevision?: number } = {}): Promise<Order> {
   const orderId = `${RUN_ID}-${label}-${randomUUID().slice(0, 6)}`
   const invoiceId = `INV-${orderId}`
   await d.db.salesOrder.create({
@@ -165,6 +179,7 @@ async function seedOrder(d: Deps, label: string, options: { withPostedSibling?: 
     data: {
       connector: 'xero', type: 'INVOICE_PAYMENT', status: 'FAILED', referenceType: 'SalesOrder', referenceId: orderId,
       remoteAttemptedAt: new Date('2026-08-01T09:00:00Z'), errorMessage: 'socket hang up',
+      attemptRevision: options.failedAttemptRevision ?? 0,
       payload: { accountingInvoiceId: invoiceId, bankAccountId: BANK, amount: 100, amountDecimal: '100', currency: 'GBP', paymentDate: '2026-08-01', paymentId: `pay-f-${orderId}` },
     },
     select: { id: true },
@@ -198,7 +213,15 @@ async function lastWarning(d: Deps, orderId: string, action: string): Promise<st
 /** A well-formed fingerprint for hand-written rows that only exercise the table's own constraints. */
 const FP = `v1:${'a'.repeat(64)}`
 
-const recordDeps = (d: Deps) => ({ client: d.db, probe: d.probeLedgerSettlement })
+/** What the server action passes: the real probe, and the audit row written by the NON-swallowing logger in the check's transaction. */
+const recordDeps = (d: Deps) => ({
+  client: d.db,
+  probe: d.probeLedgerSettlement,
+  audit: async (tx: Parameters<typeof d.logActivityInTransaction>[0], rec: { orderId: string; checkId: string }) => d.logActivityInTransaction(tx, {
+    entityType: 'SALES_ORDER', entityId: rec.orderId, action: 'operator_ledger_check_recorded', tag: 'accounting', level: 'WARNING',
+    description: `test audit for ${rec.checkId}`, metadata: { operatorLedgerCheckId: rec.checkId }, userId: null,
+  }),
+})
 
 /**
  * Record a check the way the dialog does: preview first, then submit the record ids AND everything else the
@@ -516,5 +539,90 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     console.log(`[precondition] revival unchanged=${same.clear} edited=${changed.clear}`)
     assert.equal(same.clear, true, 'revival: the record as confirmed is lifted')
     assert.equal(changed.clear, false, 'revival: the edited record is not covered')
+  })
+
+  await t.test('11. the check and its audit row commit together: a failing audit records nothing', async () => {
+    const o = await seedOrder(d, 'audit')
+    orders.push(o.orderId)
+    const receipt = await addReceipt(d, o.orderId, 60)
+    const preview = await d.previewOperatorLedgerCheck(o.failedId, recordDeps(d))
+    assert.equal(preview.ok, true)
+    if (!preview.ok) return
+    const input = {
+      syncLogId: o.failedId, paymentId: receipt, recordIds: preview.records.map((r) => r.id), userId,
+      expectedTenantId: preview.binding.tenantId, expectedConnectionGeneration: preview.binding.connectionGeneration,
+      expectedLedgerDocumentId: preview.ledgerDocumentId, expectedAttemptLabel: preview.attemptLabel,
+      expectedRecordFingerprints: Object.fromEntries(preview.records.map((r) => [r.id, r.fingerprint])),
+    }
+    const failing = await d.recordOperatorLedgerCheck(input, {
+      ...recordDeps(d),
+      // The audit insert fails INSIDE the transaction, as a real write failure would.
+      audit: async (tx) => { await tx.activityLog.create({ data: { entityType: 'SALES_ORDER', action: 'x'.repeat(1), tag: 'accounting', level: 'NOT_A_LEVEL' as never, description: 'boom' } }) },
+    })
+    console.log(`[precondition] record with a failing audit: ${JSON.stringify(failing).slice(0, 200)}`)
+    assert.equal(!failing.ok && failing.code, 'NOT_RECORDED')
+    assert.equal(await d.db.accountingOperatorLedgerCheck.count({ where: { syncLogId: o.failedId } }), 0, 'no check without its audit')
+    const ok = await d.recordOperatorLedgerCheck(input, recordDeps(d))
+    assert.equal(ok.ok, true, 'and with a working audit it records')
+    const audit = await d.db.activityLog.count({ where: { entityId: o.orderId, action: 'operator_ledger_check_recorded' } })
+    assert.equal(audit, 1, 'exactly one audit row, committed with the check')
+  })
+
+  await t.test('12. a writer that marks the checked attempt posted cannot commit between the fence reading the check and the POST (3 rounds each)', async () => {
+    const { postMoneyUnderLedgerFence } = await import('../../lib/connectors/accounting-settlement-probe.ts')
+    const { loadOperatorLedgerChecks } = await import('../../lib/domain/accounting/operator-ledger-check-store.ts')
+    const { settleAccountingSyncRow } = await import('../../app/actions/accounting-settlement.ts')
+    const { reconcileSettledAccountingSyncRow } = await import('../../app/actions/accounting-sync.ts')
+    const { settlementMarkerFor } = await import('../../lib/domain/accounting/ledger-settlement-evidence.ts')
+    const { effectiveTokenFor } = await import('../../lib/domain/accounting/followup-retry-guard.ts')
+
+    for (const writer of ['settle POSTED', 'reconcile'] as const) {
+      for (let round = 0; round < 3; round++) {
+        const o = await seedOrder(d, `interleave-${writer === 'reconcile' ? 'rec' : 'set'}-${round}`, { failedAttemptRevision: 1 })
+        orders.push(o.orderId)
+        const receipt = await addReceipt(d, o.orderId, 60)
+        assert.equal((await recordShown(d, { syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId })).ok, true)
+        await register(d, o.orderId, receipt, 60)
+        const rows = await d.loadInvoicePaymentSyncRows(o.orderId, 'xero', 'GBP')
+        const n = rows.find((row) => row.paymentId === receipt && row.status === 'PENDING')
+        assert.ok(n, 'precondition: the receipt is queued')
+        const nRow = await d.db.accountingSyncLog.findUnique({ where: { id: n!.id }, select: { payload: true } })
+        const fRow = await d.db.accountingSyncLog.findUnique({ where: { id: o.failedId }, select: { payload: true } })
+
+        let writerOutcome: unknown = 'not run'
+        let checksSeen = -1
+        // THE INTERLEAVING: the writer runs at the exact point the fence has READ F's checks and has not
+        // yet POSTed — inside the fence's lock scope, which is the window the finding names.
+        const loader = async (scope: { attemptSyncLogId: string; paymentId: string | null; connector: string }) => {
+          const checks = await loadOperatorLedgerChecks(d.db, { syncLogIds: [scope.attemptSyncLogId], paymentId: scope.paymentId, connector: scope.connector })
+          if (scope.attemptSyncLogId === o.failedId && writerOutcome === 'not run') {
+            checksSeen = checks.length
+            if (writer === 'settle POSTED') {
+              writerOutcome = await settleAccountingSyncRow(o.failedId, {
+                observedStatus: 'FAILED', observedAttemptRevision: 1, outcome: 'POSTED', externalTransactionId: o.unreadableId,
+              })
+            } else {
+              // The ledger now shows a readable payment carrying F's own mark, which the reconcile can match.
+              const mark = settlementMarkerFor(effectiveTokenFor('xero', { id: o.failedId, payload: fRow!.payload }))
+              ledger.set(o.invoiceId, [...(ledger.get(o.invoiceId) ?? []), { PaymentID: `PAY-F-${o.orderId}`, Date: '2026-08-01', Amount: 100, Reference: mark }])
+              writerOutcome = await reconcileSettledAccountingSyncRow(o.failedId)
+            }
+          }
+          return checks
+        }
+        let posted = false
+        const outcome = await postMoneyUnderLedgerFence({
+          connector: 'xero', entryId: n!.id, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: o.orderId,
+          payload: nRow!.payload, postingDate: '2026-08-09', db: d.db as never, loadOperatorLedgerChecks: loader as never,
+        }, async () => { posted = true; return { success: true, externalId: `PAY-N-${o.orderId}` } })
+        const f = await d.db.accountingSyncLog.findUnique({ where: { id: o.failedId }, select: { status: true, externalTransactionId: true } })
+        console.log(`[precondition] ${writer} round ${round}: checksSeen=${checksSeen} writer=${JSON.stringify(writerOutcome).slice(0, 140)} fence=${JSON.stringify(outcome)} posted=${posted} F=${JSON.stringify(f)}`)
+        assert.equal(checksSeen, 1, 'precondition: the fence read the check for F inside its lock')
+        assert.deepEqual(f, { status: 'FAILED', externalTransactionId: null },
+          `${writer}: F did not change inside the window — the writer could not commit while the send held the document`)
+        assert.match(JSON.stringify(writerOutcome), /being checked and sent to the accounting system right now/, `${writer} was refused with the in-flight reason`)
+        assert.equal(posted, true, 'and the post the check authorised went out on a standing nothing contradicted')
+      }
+    }
   })
 })

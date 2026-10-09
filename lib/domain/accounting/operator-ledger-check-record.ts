@@ -44,14 +44,26 @@ import {
 import { OPERATOR_ASSERTION_SETTLEMENT_BASIS } from './sync-row-settlement'
 import { claimsToHavePosted } from './ledger-standing'
 
-export type OperatorLedgerCheckClient = Pick<
+export type OperatorLedgerCheckTx = Pick<
   Prisma.TransactionClient,
-  'accountingSyncLog' | 'salesOrder' | 'payment' | 'accountingOperatorLedgerCheck'
+  'accountingSyncLog' | 'salesOrder' | 'payment' | 'accountingOperatorLedgerCheck' | 'activityLog'
 >
+
+export type OperatorLedgerCheckClient = OperatorLedgerCheckTx & {
+  $transaction: <T>(fn: (tx: Prisma.TransactionClient) => Promise<T>) => Promise<T>
+}
 
 export type OperatorLedgerCheckDeps = {
   client: OperatorLedgerCheckClient
   probe: (connector: AccountingConnectorId, target: SettlementProbeTarget) => Promise<LedgerSettlementProbe>
+  /**
+   * o3d-llyw (Codex r3 on #757) — THE AUDIT ROW, WRITTEN IN THE SAME TRANSACTION AS THE CHECK, AND
+   * ALLOWED TO FAIL IT. Required: a check lifts a money hold on a person's word, so a check whose audit
+   * entry did not commit must not exist either. Use the NON-swallowing transactional logger
+   * (`logActivityInTransaction`); anything it throws rolls the check back and the recorder refuses.
+   * Only `recordOperatorLedgerCheck` calls it; the preview never writes.
+   */
+  audit: (tx: Prisma.TransactionClient, recorded: RecordedOperatorLedgerCheck) => Promise<void>
 }
 
 export type LedgerCheckRefusalCode =
@@ -62,6 +74,7 @@ export type LedgerCheckRefusalCode =
   | 'NOT_LIFTABLE'
   | 'RECEIPT_INVALID'
   | 'LEDGER_CHANGED'
+  | 'NOT_RECORDED'
 
 export type LedgerCheckRefusal = { ok: false; code: LedgerCheckRefusalCode; error: string }
 
@@ -90,7 +103,7 @@ export type LedgerCheckPreview = {
 /** Read and judge the attempt; the shared first half of preview and record. */
 async function assessAttempt(
   syncLogId: string,
-  deps: OperatorLedgerCheckDeps,
+  deps: Pick<OperatorLedgerCheckDeps, 'client' | 'probe'>,
 ): Promise<LedgerCheckRefusal | Omit<LedgerCheckPreview, 'receipts'>> {
   const row = await deps.client.accountingSyncLog.findUnique({
     where: { id: syncLogId },
@@ -207,7 +220,7 @@ async function assessAttempt(
 /** PREVIEW: what a check for this entry would have to cover, read from the ledger now. */
 export async function previewOperatorLedgerCheck(
   syncLogId: string,
-  deps: OperatorLedgerCheckDeps,
+  deps: Pick<OperatorLedgerCheckDeps, 'client' | 'probe'>,
 ): Promise<LedgerCheckRefusal | LedgerCheckPreview> {
   const assessed = await assessAttempt(syncLogId, deps)
   if (!assessed.ok) return assessed
@@ -328,31 +341,45 @@ export async function recordOperatorLedgerCheck(
   const note = typeof input.note === 'string' && input.note.trim() !== '' ? input.note.trim().slice(0, NOTE_LIMIT) : null
   const recordIds = assessed.records.map((record) => record.id)
   const recordFingerprints = assessed.records.map((record) => record.fingerprint)
-  const created = await deps.client.accountingOperatorLedgerCheck.create({
-    data: {
-      syncLogId: assessed.syncLogId,
-      paymentId: receipt.id,
-      connector: assessed.connector,
-      ledgerDocumentId: assessed.ledgerDocumentId,
-      ledgerRecordIds: recordIds,
-      ledgerRecordFingerprints: recordFingerprints,
-      tenantId: assessed.binding.tenantId,
-      connectionGeneration: assessed.binding.connectionGeneration,
-      basis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
-      checkedByUserId: input.userId,
-      note,
-    },
-    select: { id: true },
-  })
-  return {
-    ok: true,
-    checkId: created.id,
-    orderId: assessed.orderId,
-    paymentId: receipt.id,
-    connector: assessed.connector,
-    ledgerDocumentId: assessed.ledgerDocumentId,
-    recordIds,
-    binding: assessed.binding,
+  // THE CHECK AND ITS AUDIT ROW COMMIT TOGETHER OR NOT AT ALL.
+  try {
+    return await deps.client.$transaction(async (tx) => {
+      const created = await tx.accountingOperatorLedgerCheck.create({
+        data: {
+          syncLogId: assessed.syncLogId,
+          paymentId: receipt.id,
+          connector: assessed.connector,
+          ledgerDocumentId: assessed.ledgerDocumentId,
+          ledgerRecordIds: recordIds,
+          ledgerRecordFingerprints: recordFingerprints,
+          tenantId: assessed.binding.tenantId,
+          connectionGeneration: assessed.binding.connectionGeneration,
+          basis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+          checkedByUserId: input.userId,
+          note,
+        },
+        select: { id: true },
+      })
+      const recorded: RecordedOperatorLedgerCheck = {
+        ok: true,
+        checkId: created.id,
+        orderId: assessed.orderId,
+        paymentId: receipt.id,
+        connector: assessed.connector,
+        ledgerDocumentId: assessed.ledgerDocumentId,
+        recordIds,
+        binding: assessed.binding,
+      }
+      await deps.audit(tx, recorded)
+      return recorded
+    })
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'NOT_RECORDED',
+      error: 'The check could not be recorded together with its audit entry, so nothing was recorded '
+        + `(${error instanceof Error ? error.message : String(error)}). The receipt is still held.`,
+    }
   }
 }
 
