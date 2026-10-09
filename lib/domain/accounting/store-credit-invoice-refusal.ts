@@ -56,6 +56,19 @@ export function storeCreditInvoicePosterError(): string {
   return `NOTHING WAS SENT. ${storeCreditInvoiceRefusalReason()}`
 }
 
+/**
+ * The credit-note counterpart. A refund of a store-credit order would post a credit note against an
+ * invoice IMS has not posted, so it is refused for the same reason and from the same fact. Describes the
+ * withholding only; "nothing was sent" holds because the refusal is taken before any request is built.
+ */
+export function storeCreditCreditNotePosterError(): string {
+  return 'NOTHING WAS SENT. This refund belongs to an order paid in part with store credit. IMS does not '
+    + 'post a sales invoice for such an order yet (store credit is a payment that has to be applied to the '
+    + 'invoice against the 813 or 816 liability account, and that posting is not built), so it does not post '
+    + 'a credit note for it either. If the order was invoiced by hand, check the ledger first, then raise '
+    + 'the matching credit note by hand.'
+}
+
 /** The importer's entry, written when the invoice is queued: it says what WILL happen, not what has. */
 export function storeCreditInvoiceQueuedNotice(orderNumber: string, creditText: string): string {
   return `WooCommerce order ${orderNumber} carries ${creditText} of store credit. `

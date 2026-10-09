@@ -53,7 +53,7 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
-import { orderCarriesStoreCredit, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
+import { orderCarriesStoreCredit, storeCreditCreditNotePosterError, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
@@ -5069,6 +5069,31 @@ export async function guardCancelledSalesOrderInvoice(
   return { post: true, customerId: outcome.customerId }
 }
 
+/**
+ * A refund of a store-credit order credits an invoice IMS refuses to post (see
+ * lib/domain/accounting/store-credit-invoice-refusal.ts), so its credit note is refused too. Returns the
+ * failure to hand back, or null to post. Fails CLOSED: an order that cannot be read is not "no store
+ * credit". Only a refund-keyed credit note is checked; any other reference is not this guard's business.
+ */
+export async function guardStoreCreditCreditNote(
+  referenceType: string,
+  referenceId: string,
+): Promise<EntryResult | null> {
+  if (referenceType !== 'SalesOrderRefund') return null
+  let credit: unknown
+  try {
+    const refund = await db.salesOrderRefund.findUnique({
+      where: { id: referenceId },
+      select: { order: { select: { storeCreditForeign: true } } },
+    })
+    if (!refund) return { success: false, error: `Refund ${referenceId} not found before posting its credit note` }
+    credit = refund.order.storeCreditForeign
+  } catch (error) {
+    return { success: false, error: `Could not read the order of refund ${referenceId} before posting its credit note: ${String(error)}` }
+  }
+  return orderCarriesStoreCredit(credit) ? { success: false, error: storeCreditCreditNotePosterError() } : null
+}
+
 // o3d-k26m.5 round 4 added a SECOND `heldClaimWhere` here, with a note saying it was deliberately
 // identical to the sibling branch's and that "if both land, keep one definition". Both have landed,
 // so this is that collapse: the definition is the one in `@/lib/domain/accounting/sync-claim-fence`,
@@ -6280,6 +6305,8 @@ async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE': {
+      const storeCreditRefusal = await guardStoreCreditCreditNote(referenceType, referenceId)
+      if (storeCreditRefusal) return storeCreditRefusal
       const creditCustomerId = referenceType === 'SalesOrderRefund'
         ? (await db.salesOrderRefund.findUnique({
             where: { id: referenceId },

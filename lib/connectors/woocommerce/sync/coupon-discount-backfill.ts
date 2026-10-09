@@ -9,6 +9,13 @@
  * totals block. The importer is fixed going forward (`resolveWcOrderLevelDiscount`); this corrects the
  * rows written before that.
  *
+ * STORE CREDIT. This reads only STORED columns and never the WooCommerce payload, so it cannot tell a
+ * Smart Coupons store-credit coupon from a discount. It does not need to: it only ever CLEARS order-level
+ * discount that the lines also carry, so it can never restate store credit back into a discount. Orders
+ * imported since the importer started classifying coupons carry the credit in `storeCreditForeign` and a
+ * `discountModel` stamp, so they are POST_FIX and are never candidates. A LEGACY row whose credit was
+ * stored as discount stays exactly as it was (nothing is duplicated on its lines); it is not restated here.
+ *
  * IT MUTATES HISTORICAL FINANCIAL DATA, so the governing rule is that it must never make a CORRECT row
  * wrong. Skipping a row it could have fixed is recoverable — re-run it. Overwriting a correct value
  * with a reconstructed one destroys the truth and nothing downstream can tell. Everything below is

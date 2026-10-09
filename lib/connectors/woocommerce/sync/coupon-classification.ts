@@ -137,6 +137,8 @@ function parseMoney(value: unknown): Decimal | null {
   }
 }
 
+const CREDIT_AMOUNT_UNREADABLE = 'the store-credit amount could not be read as a non-negative number'
+
 function classifyOne(line: WcCouponLine, contributionCodes: Set<string>): ClassifiedWcCoupon {
   const code = (line.code ?? '').trim()
   const net = parseMoney(line.discount)
@@ -164,7 +166,7 @@ function classifyOne(line: WcCouponLine, contributionCodes: Set<string>): Classi
 
   if (type === WC_STORE_CREDIT_DISCOUNT_TYPE || (type === null && !unreadable && inContribution)) {
     if (net === null || tax === null || net.isNegative() || tax.isNegative()) {
-      return unknown(type, 'the store-credit amount could not be read as a non-negative number')
+      return unknown(type, CREDIT_AMOUNT_UNREADABLE)
     }
     return { ...base, kind: 'STORE_CREDIT', discountType: type, unknownReason: null }
   }
@@ -292,9 +294,7 @@ export function planWcOrderCoupons(input: {
 
   // An unreadable store-credit amount is an UNKNOWN line that WAS recognised as credit: it can never be
   // allowed through as a discount, whether or not any residual shows.
-  const unreadableCredit = classified.unknown.filter(
-    (l) => l.discountType === WC_STORE_CREDIT_DISCOUNT_TYPE || (l.unknownReason ?? '').includes('store-credit'),
-  )
+  const unreadableCredit = classified.unknown.filter((l) => l.unknownReason === CREDIT_AMOUNT_UNREADABLE)
   if (unreadableCredit.length > 0) {
     plan.refusal = {
       kind: 'CREDIT_UNREADABLE',
