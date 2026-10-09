@@ -1763,6 +1763,12 @@ model SalesOrder {
   trackingNumber    String?
   discountStr       String?    // order-level discount input e.g. "10%" or "5.00"
   discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
+  // Store credit (Smart Coupons) applied to the order, GROSS, in the order currency. A PAYMENT that
+  // settles part of an invoice stated at the full goods value, never a discount: it is kept OUT of
+  // discountAmount so Mintsoft sees the full goods value (customs / IOSS) and the revenue is not
+  // understated. Nonzero means no sales invoice is posted for the order until the 813/816 payment
+  // posting exists (lib/domain/accounting/store-credit-invoice-refusal.ts).
+  storeCreditForeign Decimal   @db.Decimal(18, 4) @default(0)
   // o3d-9te: what discountAmount above MEANS, stamped in the same write that computes it.
   // NULL = not recorded (pre-column rows, native orders); see OrderDiscountModel.
   discountModel     OrderDiscountModel? @map("discount_model")

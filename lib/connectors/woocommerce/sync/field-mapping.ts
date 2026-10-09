@@ -6,7 +6,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { TaxCategory } from '@/app/generated/prisma/client'
-import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine } from './types'
+import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine, WcMeta } from './types'
+import { classifyWcCouponLines } from './coupon-classification'
 
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
@@ -257,18 +258,19 @@ export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {
 // Order-level discount (from WC coupon_lines)
 // ---------------------------------------------------------------------------
 
-export function mapWcOrderDiscount(couponLines: WcCouponLine[]): {
+export function mapWcOrderDiscount(couponLines: WcCouponLine[], orderMeta?: WcMeta[]): {
   discountStr: string | null
   discountAmount: number
 } {
   if (!couponLines.length) return { discountStr: null, discountAmount: 0 }
 
-  const totalDiscount = couponLines.reduce((s, c) => s + (parseFloat(c.discount) || 0), 0)
-  const codes = couponLines.map((c) => c.code).join(', ')
-
+  // GENUINE coupons only. Store credit (Smart Coupons `smart_coupon`) is a PAYMENT, not a discount, so it
+  // is never part of the sum this returns; an unrecognised type stays in it (its money is carried only
+  // while Woo put it on the lines, and `planWcOrderCoupons` refuses the order otherwise).
+  const classified = classifyWcCouponLines(couponLines, orderMeta)
   return {
-    discountStr: codes,
-    discountAmount: roundDecimalNumber(totalDiscount, 4),
+    discountStr: classified.codes,
+    discountAmount: roundDecimalNumber(classified.genuineNet, 4),
   }
 }
 
