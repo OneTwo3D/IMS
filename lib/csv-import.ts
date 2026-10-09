@@ -23,6 +23,21 @@ export type CsvImportPreviewResult = ImportDryRunResult & {
   error?: string
 }
 
+/**
+ * What a system-actor import (the first-load apply runner; lib/first-load/apply/system-import-capability.ts) returns
+ * beside the importer's own counters. Present ONLY when the call carried the capability.
+ */
+export type SystemImportOutcome = {
+  actor: { runId: string; operator: string }
+  /** Entity ids the import created or updated (products, suppliers or purchase orders, whichever the importer writes). */
+  touchedIds: { created: string[]; updated: string[] }
+  /**
+   * Product ids the web path would have queued an outbound effect for, and this path did NOT queue. Empty means
+   * there was nothing to suppress, not that suppression is off.
+   */
+  deferredEffects: { shoppingMetadataPush: string[]; stockSync: string[] }
+}
+
 export type CsvImportExecutionResult = {
   preview?: false
   success?: boolean
@@ -33,6 +48,7 @@ export type CsvImportExecutionResult = {
   errors: string[]
   error?: string
   message?: string
+  system?: SystemImportOutcome
 }
 
 export type CsvImportActionResult = CsvImportPreviewResult | CsvImportExecutionResult

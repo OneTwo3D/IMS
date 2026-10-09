@@ -750,6 +750,29 @@ when every changed path matches `*.md`, `docs/*`, `.gitignore` or `CHANGELOG.md`
 Markdown skipped the seal entirely. `paths-ignore: ["**/*.md"]` is deliberately *not* used here for
 the same reason.
 
+## System-actor import capability boundary
+
+The first-load apply runner loads the first data into an empty installation by calling the application's own CSV importers
+(`importSuppliersCsv`, `importProductsCsv`, `importOpeningStockCsv`, `importPurchaseOrdersCsv`, `createPurchaseOrder`). A call that
+carries a context minted by `lib/first-load/apply/system-import-capability.ts` skips the session permission check and
+`revalidatePath`, does NOT queue the WooCommerce push or stock sync (the product ids it would have covered come back in the
+result's `system.deferredEffects`), and records the run id and operator label in the activity log. A call without the context
+behaves as it always did. `importTransfersCsv` accepts the context but refuses to apply under it.
+
+The context carries a `symbol`, which a Server Action argument cannot transport, so a client cannot present it. The set of files
+that may import the capability is a closed list, enforced by:
+
+```bash
+npm run check:system-import-capability
+```
+
+`mintSystemImportContext` may be imported only by `lib/first-load/apply/**`, `scripts/first-load-apply.ts` and tests. The three
+importer modules may import only `SYSTEM_IMPORT` (they compare it inline, which is the only shape the Server Action guard scan credits),
+`isSystemImportContext`, `withSystemActor`, `withSystemOutcome` and types. Type-only imports, namespace imports, re-exports,
+dynamic `import()` and `require()` of anything under `lib/first-load/apply/` count as importing it. The guard prints how many files
+import the module and fails on a missing module or a stale allowlist entry. It runs in `npm run check:all`, `npm run validate` and,
+unconditionally, in `.github/workflows/static-guards.yml`.
+
 ## Producer Census
 
 `lib/security/writer-ownership-map.ts` says, per destination (Xero, Mintsoft, WooCommerce, customer e-mail) and per operation, which writer owns it in each phase. `npm run check:producer-census` makes the set of IMS **producers** of those operations declared and complete: it reads every `.ts` and `.tsx` file under `app/`, `lib/`, `scripts/` and `components/` with the TypeScript parser and finds every call of a write primitive (the `PRIMITIVES` table in `scripts/producer-census.ts`: the sync-log and outbox enqueue functions, the `lib/shopping.ts` facade, the WooCommerce, Mintsoft and Xero write helpers, the operator buttons that re-arm or trigger a write, and customer e-mail). Each call site must have one line in `scripts/producer-census-declarations.ts` naming the `(destination, operation)` it produces, its mechanism, whether the work has a business-event time (`obligationTime`, which must equal the ownership map's) and a note. The check runs in `npm run check:all`, in `npm run validate` and, unconditionally, in the `Producer Census Guard` workflow (job `producer-census`). It prints how many sites it found, declared and excluded.
