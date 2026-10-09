@@ -11,3 +11,13 @@ export const PUSH_TOTAL_MISMATCH_OPERATOR_NOTE =
   + 'its total, or the figures sent to the warehouse (lines, shipping, discount and VAT) do not add up '
   + 'to the order total IMS holds. Compare the order with the warehouse order before relying on either '
   + 'total; once they agree, the flag can be cleared.'
+
+/**
+ * Format a recorded mismatch (whole MINOR units of the order currency) for the exceptions page, scaled by that
+ * currency's own decimal places: 200 GBP minor units is 2.00, 200 JPY is 200, 2000 KWD (3dp) is 2.000.
+ */
+export function formatMismatchAmount(minorUnitsAmount: number, currency: string, decimals: number): string {
+  return (minorUnitsAmount / 10 ** decimals).toLocaleString('en-GB', {
+    style: 'currency', currency, minimumFractionDigits: decimals, maximumFractionDigits: decimals,
+  })
+}

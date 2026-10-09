@@ -328,6 +328,39 @@ test('create: the order-components drift is clamped to the column too', async ()
   assert.equal(upserts[0].create.totalMismatchPence, MAX_ADVISORY_PENCE)
 })
 
+test('create: a small component drift does NOT hide a larger payload discrepancy (and the reverse)', async () => {
+  // VAT-inclusive, gross discount 30 (embedded VAT 5.00); components off by 2p, payload off by 502p.
+  const both = candidate({
+    subtotalForeign: 100, taxForeign: 15, discountAmount: 30, taxRatePercent: 0.2, pricesIncludeVat: true, totalForeign: 90.02,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  console.log(`# precondition A: component=${orderTotalDriftPence(both)}p payload=${payloadTotalMismatchPence(both, buildPushInput(both, '301'))}p`)
+  assert.equal(orderTotalDriftPence(both), 2)
+  assert.equal(payloadTotalMismatchPence(both, buildPushInput(both, '301')), 502)
+  const a = makePort({ createCandidates: [both] })
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', a.port, { now: NOW })
+  assert.equal(a.upserts[0].create.totalMismatchPence, 502)
+  // Reverse: payload reconciles (lines add up to the total) but the subtotal field is wrong by 300p.
+  const reverse = candidate({
+    subtotalForeign: 103, taxForeign: 20, totalForeign: 120,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  console.log(`# precondition B: component=${orderTotalDriftPence(reverse)}p payload=${String(payloadTotalMismatchPence(reverse, buildPushInput(reverse, '301')))}`)
+  assert.equal(orderTotalDriftPence(reverse), 300)
+  assert.equal(payloadTotalMismatchPence(reverse, buildPushInput(reverse, '301')), null)
+  const b = makePort({ createCandidates: [reverse] })
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', b.port, { now: NOW })
+  assert.equal(b.upserts[0].create.totalMismatchPence, 300)
+  assert.equal(b.upserts[0].create.state, 'SYNCED')
+})
+
+test('orderTotalDriftPence is exact Decimal arithmetic and scales by the order currency', () => {
+  const o = { subtotalForeign: '0.1', taxForeign: '0.2', taxRatePercent: null, shippingForeign: 0, discountAmount: 0, totalForeign: '0.31', pricesIncludeVat: false }
+  assert.equal(orderTotalDriftPence(o), 1) // 0.1 + 0.2 is exactly 0.3, one penny from 0.31
+  assert.equal(orderTotalDriftPence({ ...o, subtotalForeign: 1000, taxForeign: 0, totalForeign: 1002 }, 'JPY'), 2)
+  assert.equal(orderTotalDriftPence({ ...o, subtotalForeign: 1, taxForeign: 0, totalForeign: 1.002 }, 'KWD'), 2)
+})
+
 test('create: a normal (no-fallback) push posts no courier comment', async () => {
   const comments: Array<{ externalOrderId: string; comment: string }> = []
   const { port } = makePort({ createCandidates: [candidate()] })

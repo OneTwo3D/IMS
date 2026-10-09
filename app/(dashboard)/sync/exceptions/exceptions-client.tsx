@@ -1,6 +1,6 @@
 'use client'
 
-import { PUSH_TOTAL_MISMATCH_OPERATOR_NOTE } from '@/lib/domain/wms/push-total-mismatch-note'
+import { formatMismatchAmount, PUSH_TOTAL_MISMATCH_OPERATOR_NOTE } from '@/lib/domain/wms/push-total-mismatch-note'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Fragment, useState, useTransition } from 'react'
 import {
@@ -1021,7 +1021,7 @@ export function ExceptionsClient({ data }: Props) {
                     <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                   </TableCell>
                   <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
-                  <TableCell className="text-xs">{(row.totalMismatchPence / 100).toLocaleString(undefined, { style: 'currency', currency: 'GBP' })}</TableCell>
+                  <TableCell className="text-xs">{formatMismatchAmount(row.totalMismatchPence, row.currency, row.minorUnits)}</TableCell>
                   <TableCell className="text-right">
                     <Button
                       type="button"

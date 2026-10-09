@@ -10,6 +10,7 @@ import {
   MAX_ROUNDING_BOUND_MINOR_UNITS,
   type PushTotalsVerdict,
 } from '../lib/domain/wms/push-total-guard.ts'
+import { formatMismatchAmount } from '../lib/domain/wms/push-total-mismatch-note.ts'
 import { unconditionalMoneySentences, unlicensedHistoryClaims } from './helpers/unconditional-instruction.ts'
 
 type Line = { id: string; sku: string; qty: number; totalForeign: number; taxForeign: number; description: string }
@@ -194,4 +195,14 @@ test('operator text: reasons and the page note are conditional, name no history,
   const split = reasons.filter((r) => r.includes('no VAT part'))
   assert.equal(split.length, 1)
   assert.ok(reasons.filter((r) => !r.includes('no VAT part')).length === reasons.length - 1)
+})
+
+test('exceptions page amount is scaled by the ORDER currency, not /100 GBP', () => {
+  const gbp = formatMismatchAmount(200, 'GBP', 2)
+  const jpy = formatMismatchAmount(200, 'JPY', 0)
+  const kwd = formatMismatchAmount(2000, 'KWD', 3)
+  console.log(`# precondition: ${gbp} | ${jpy} | ${kwd}`)
+  assert.match(gbp, /2\.00$/)
+  assert.match(jpy, /200$/)
+  assert.match(kwd, /2\.000$/)
 })
