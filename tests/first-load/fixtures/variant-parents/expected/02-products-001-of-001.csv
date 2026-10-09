@@ -1,0 +1,10 @@
+productId,parentProductId,sku,name,description,type,parentSku,barcode,mpn,countryOfOrigin,preferredSupplierId,preferredSupplierName,preferredSupplierLocked,weight,widthCm,heightCm,depthCm,salesPriceBase,salePriceBase,salesPriceTaxInclusive,stockUnit,oversellAllowed,imageUrl,active,lifecycleStatus,components,category
+,,2002,Gadget,,VARIABLE,,,,,,,,,,,,,,,,,,,DRAFT,,
+,,4004,Plain Thing,,SIMPLE,,,,,,,,,,,,,,,,,,,,,Things
+,,6006,Not A Variant In Qoblex,,SIMPLE,,,,,,,,,,,,,,,,,,,,,Things
+,,GIZ-PARENT,Gizmo,,VARIABLE,,,,,,,,,,,,,,,,,,,DRAFT,,
+,,WIDGET,Widget,,VARIABLE,,,,,,,,,,,,,,,,,,,ACTIVE,,
+,,1001-01,Widget Red,,VARIANT,WIDGET,,,,,,,,,,,,,,,,,,,,Widgets
+,,1001-02,Widget Blue,,VARIANT,WIDGET,,,,,,,,,,,,,,,,,,,,Widgets
+,,2002-01,Gadget Small,,VARIANT,2002,,,,,,,,,,,,,,,,,,,,Gadgets
+,,3003-07,Gizmo Large,,VARIANT,GIZ-PARENT,,,,,,,,,,,,,,,,,,,,Gadgets

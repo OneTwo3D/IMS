@@ -126,7 +126,8 @@ export async function walkStore(state: WalkState, deps: WalkDeps): Promise<WalkR
     const page = parents.pagesDone + 1
     const res = await get('/products', parentParams(page))
     if (!Array.isArray(res.data)) throw new SnapshotInconsistentError(`GET /products page ${page} did not return a list`)
-    if (!Number.isSafeInteger(res.totalItems) || res.totalItems < 0 || !Number.isSafeInteger(res.totalPages) || res.totalPages < 1) {
+    // The connector reports an ABSENT total as 0 items / 1 page, so rows with a total of 0 mean the store sent none.
+    if (!Number.isSafeInteger(res.totalItems) || res.totalItems < 0 || (res.totalItems === 0 && res.data.length > 0) || !Number.isSafeInteger(res.totalPages) || res.totalPages < 1) {
       throw new SnapshotInconsistentError(`GET /products page ${page} came without a readable X-WP-Total / X-WP-TotalPages (${res.totalItems} / ${res.totalPages}): completeness cannot be proved`)
     }
     if (parents.totalPages >= 0 && (res.totalItems !== parents.total || res.totalPages !== parents.totalPages)) {

@@ -6,7 +6,11 @@
  * The data here is synthetic. No real SKU, title or customer value appears in this repository.
  */
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import test, { after } from 'node:test'
+import { runCli } from '../../lib/first-load/cli.ts'
 import { renderJson } from '../../lib/first-load/report.ts'
 import { joinVariantParents, skuStem } from '../../lib/first-load/variant-parents.ts'
 import { dispositionCodes, ds, findingCodes, precondition, product, rowsOf, run, shuffleCsvText } from './helpers.ts'
@@ -251,4 +255,28 @@ test('arm (o): the join function alone: it never reads a stem to assign a parent
   precondition(t, 'assignments', result.assignments.size)
   assert.equal(result.assignments.get('AAA-01'), 'REAL-PARENT')
   assert.notEqual(result.assignments.get('AAA-01'), skuStem('AAA-01'))
+})
+
+const scratch = mkdtempSync(path.join(tmpdir(), 'first-load-variant-parents-'))
+after(() => rmSync(scratch, { recursive: true, force: true }))
+
+test('arm (p): the synthetic fixture run through the command line equals the golden products file byte for byte, twice', async (t) => {
+  const dir = path.join(process.cwd(), 'tests', 'first-load', 'fixtures', 'variant-parents')
+  const golden = readFileSync(path.join(dir, 'expected', '02-products-001-of-001.csv'), 'utf8')
+  let compared = 0
+  for (const label of ['first', 'second']) {
+    const out = path.join(scratch, label)
+    let stderr = ''
+    const code = await runCli(['--manifest', path.join(dir, 'manifest.json'), '--out', out, '--run-id', 'fixture'], { stdout: () => {}, stderr: (s) => (stderr += s) })
+    assert.equal(code, 0, stderr)
+    assert.deepEqual(readdirSync(out).sort(), ['02-products-001-of-001.csv', 'validation-report.json', 'validation-report.md'])
+    assert.equal(readFileSync(path.join(out, '02-products-001-of-001.csv'), 'utf8'), golden, label)
+    compared++
+  }
+  precondition(t, 'runs compared with the golden file', compared)
+  const rows = golden.split('\r\n').filter(Boolean)
+  precondition(t, 'golden data rows', rows.length - 1)
+  const types = rows.slice(1).map((line) => line.split(',')[5])
+  assert.ok(types.lastIndexOf('VARIABLE') < types.indexOf('VARIANT'), 'every VARIABLE parent precedes the first VARIANT in the file')
+  assert.equal(types.filter((type) => type === 'VARIABLE').length, 3, 'three parents for four variants')
 })
