@@ -86,8 +86,11 @@ import {
   buildFreightCostLineRows,
   CreateFreightPoInputSchema,
   FREIGHT_NET_CREDIT_MESSAGE,
+  FreightEditRefusedError,
   FreightNetCreditError,
   freightTotalIsNegative,
+  planFreightCostLineEdit,
+  resolveFreightEditTaxRate,
   FreightCostLinesSchema,
   type CreateFreightPoInput as CreateFreightPoInputShape,
   type FreightCostLineInput as FreightCostLineInputShape,
@@ -113,6 +116,7 @@ import {
 } from '@/lib/accounting-fx'
 import { Prisma } from '@/app/generated/prisma/client'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
 import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromConsumed,
@@ -4359,7 +4363,8 @@ export async function recordSupplierFreightCreditNote(input: {
     if (validationError) return { success: false, error: validationError }
 
     const fxRateToBase = Number(selectedInvoice?.fxRateToBase ?? po.fxRateToBase ?? 1)
-    const amountBase = roundQuantity(toDecimal(input.amountForeign).mul(fxRateToBase), 4).toNumber()
+    // fxRateToBase is foreign units per ONE base unit: DIVIDE, as every purchase-order conversion does.
+    const amountBase = supplierCreditNoteAmountBase(roundQuantity(input.amountForeign, 4).toString(), fxRateToBase).toNumber()
 
     const creditNote = await db.supplierCreditNote.create({
       data: {
@@ -4606,7 +4611,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // decision, bcz9.4). Net is derived from the offset bill's VAT ratio.
         if (queued) {
           const transitNetBase = resolveSupplierCreditNoteTransitBase({
-            grossBase: Number(cn.amountForeign) * Number(cn.fxRateToBase),
+            grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
             billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
             billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
           })
@@ -4727,6 +4732,8 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
             totalBase,
             directFreightForeign: subtotalForeign,
             directFreightBase: subtotalBase,
+            // The VAT rate the order was charged at (a fraction), so a later edit keeps it and a change is an edit.
+            taxRatePercent: (input.taxRateValue ?? 0) > 0 ? input.taxRateValue : null,
             supplierRef: input.supplierRef || null,
             notes: input.notes || null,
             freightCostLines: { create: costLineData },
@@ -4924,23 +4931,68 @@ export async function updateFreightPoCosts(
 
       const po = await tx.purchaseOrder.findUnique({
         where: { id: freightPoId },
-        select: { id: true, reference: true, type: true, fxRateToBase: true },
+        select: { id: true, reference: true, type: true, fxRateToBase: true, taxRatePercent: true, taxForeign: true },
       })
       if (!po) throw new Error('PO not found')
       if (po.type !== 'FREIGHT') throw new Error('Not a freight PO')
 
-      // The ONE row builder, shared with createFreightPo: the same input persists the same rows. Edit semantics
-      // are unchanged from before the landed-cost sign change: the order's lines are REPLACED by the submitted
-      // ones and the tax rate is the one passed (none = no VAT), exactly as it always was.
-      const built = buildFreightCostLineRows(costLines, new Prisma.Decimal(po.fxRateToBase), taxRateValue ?? 0)
+      const storedLines = await tx.freightCostLine.findMany({
+        where: { poId: freightPoId },
+        orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+        select: {
+          id: true, description: true, amountForeign: true, vatable: true, distributionMethod: true,
+          invoiceLines: { select: { id: true }, take: 1 },
+        },
+      })
+      // THE TAX RATE (a fraction, 0.2). Not passing one means KEEP the stored rate, never zero it. An order that
+      // never recorded a rate is NOT inferred from what was charged: if it was charged VAT the caller must say
+      // the rate (see resolveFreightEditTaxRate).
+      const { effectiveRate, taxChanged } = resolveFreightEditTaxRate({
+        requested: taxRateValue,
+        storedRate: po.taxRatePercent,
+        storedTaxForeign: po.taxForeign,
+      })
+
+      // The ONE row builder, shared with createFreightPo: the same input persists the same rows.
+      const built = buildFreightCostLineRows(costLines, new Prisma.Decimal(po.fxRateToBase), effectiveRate)
       // The payable total (net plus VAT), computed from the SAME rounded amounts that are persisted, must not
       // be negative: refused before anything is written.
       assertFreightTotalNotNegative(built)
       const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
 
-      await tx.freightCostLine.deleteMany({ where: { poId: freightPoId } })
-      if (built.rows.length > 0) {
-        await tx.freightCostLine.createMany({ data: built.rows.map((row) => ({ ...row, poId: freightPoId })) })
+      // See planFreightCostLineEdit: rows are matched by id, billed rows are never touched, and an edit that
+      // changes nothing (lines AND tax rate) is a no-op: no write, no recalculation, no journal.
+      const plan = planFreightCostLineEdit(
+        storedLines.map((row) => ({
+          id: row.id,
+          description: row.description,
+          amountForeign: new Prisma.Decimal(row.amountForeign),
+          vatable: row.vatable,
+          distributionMethod: row.distributionMethod,
+          billed: row.invoiceLines.length > 0,
+        })),
+        costLines,
+        built.rows,
+        taxChanged,
+      )
+      if (plan.kind === 'noop') return { reference: po.reference, landedResult: null }
+
+      for (const update of plan.updates) {
+        await tx.freightCostLine.update({
+          where: { id: update.id },
+          data: {
+            description: update.row.description,
+            amountForeign: update.row.amountForeign,
+            amountBase: update.row.amountBase,
+            vatable: update.row.vatable,
+            distributionMethod: update.row.distributionMethod,
+            sortOrder: update.row.sortOrder,
+          },
+        })
+      }
+      if (plan.deletes.length > 0) await tx.freightCostLine.deleteMany({ where: { id: { in: plan.deletes } } })
+      if (plan.creates.length > 0) {
+        await tx.freightCostLine.createMany({ data: plan.creates.map((row) => ({ ...row, poId: freightPoId })) })
       }
 
       await tx.purchaseOrder.update({
@@ -4954,6 +5006,7 @@ export async function updateFreightPoCosts(
           totalBase,
           directFreightForeign: subtotalForeign,
           directFreightBase: subtotalBase,
+          taxRatePercent: effectiveRate.gt(0) ? effectiveRate : null,
         },
       })
 
@@ -4964,6 +5017,9 @@ export async function updateFreightPoCosts(
       })
       return { reference: po.reference, landedResult }
     }, STOCK_TX_OPTIONS)
+
+    // Nothing changed (same lines, same tax rate): nothing was written and nothing needs recalculating.
+    if (!landedResult) return { success: true }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${freightPoId}`)
@@ -5009,7 +5065,7 @@ export async function updateFreightPoCosts(
       metadata: null,
     })
     // o3d-nrl4 PR A: a scope race is an instruction to retry, not a crash: nothing was written.
-    if (e instanceof FreightNetCreditError) return { success: false, error: e.message }
+    if (e instanceof FreightNetCreditError || e instanceof FreightEditRefusedError) return { success: false, error: e.message }
     return { success: false, error: e instanceof LandedCostScopeRacedError ? e.message : String(e) }
   }
 }
