@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { assertNoStoreCreditInvoiceDocument } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { renderEmailHtml } from '@/lib/email-template'
 import { loadInvoicePdf } from '@/lib/invoice-pdf'
 import { formatCountryDisplay } from '@/lib/countries'
@@ -40,6 +41,9 @@ type SoForPdf = {
   totalBase: unknown
   taxBase: unknown
   discountAmount: unknown
+  /** Store credit, GROSS: a payment. Shown beside the Total on an order document, never on an invoice. */
+  storeCreditForeign?: unknown
+  storeCreditAssessment?: unknown
   invoiceNumber: string | null
   invoicedAt: Date | null
   paidAt: Date | null
@@ -273,6 +277,11 @@ function drawTotals(doc: PDFKit.PDFDocument, so: SoForPdf, sym: string, symPos: 
     doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
     doc.text(money(Number(so.taxForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
+  // Store credit is a payment: shown as its own line so the figures above add up to the Total below.
+  if (Number(so.storeCreditForeign ?? 0) > 0) {
+    doc.text('Store credit:', lX, doc.y, { width: lW, align: 'right' })
+    doc.text(`-${money(Number(so.storeCreditForeign))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  }
   doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
   doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
   doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
@@ -313,6 +322,8 @@ async function buildSalesOrderConfirmationEmail(orderId: string): Promise<Prepar
 async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: boolean }): Promise<PreparedEmail> {
   const so = await getSalesOrderEmailOrder(orderId)
   if (!so) throw new Error('Order not found')
+  // At the OUTBOX preparation step too, so a row queued before the order was held, or retried later, is refused as well.
+  assertNoStoreCreditInvoiceDocument(so)
   if (!so.customerEmail) throw new Error('No customer email address')
 
   const branding = await getBranding()
@@ -437,9 +448,10 @@ export async function getSalesOrderConfirmationQueueData(orderId: string): Promi
 export async function getInvoiceQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, invoiceNumber: true, customerEmail: true },
+    select: { id: true, invoiceNumber: true, customerEmail: true, storeCreditForeign: true, storeCreditAssessment: true },
   })
   if (!so) throw new Error('Order not found')
+  assertNoStoreCreditInvoiceDocument(so)
   if (!so.customerEmail) throw new Error('No customer email address')
   if (!so.invoiceNumber) throw new Error('No invoice generated yet')
   return { to: so.customerEmail, subject: `Invoice ${so.invoiceNumber}`, reference: so.invoiceNumber }
@@ -448,9 +460,10 @@ export async function getInvoiceQueueData(orderId: string): Promise<QueueEmailDa
 export async function getAccountingInvoiceQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerEmail: true, invoicePdfPath: true },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerEmail: true, invoicePdfPath: true, storeCreditForeign: true, storeCreditAssessment: true },
   })
   if (!so) throw new Error('Order not found')
+  assertNoStoreCreditInvoiceDocument(so)
   if (!so.customerEmail) throw new Error('No customer email address')
   if (!so.invoicePdfPath) throw new Error('No invoice PDF available')
   const ref = so.invoiceNumber ?? so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8)

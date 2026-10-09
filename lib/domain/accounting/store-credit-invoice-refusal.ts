@@ -108,3 +108,22 @@ export function storeCreditInvoiceQueuedNotice(orderNumber: string, creditText: 
   return `WooCommerce order ${orderNumber} carries ${creditText} of store credit. `
     + `IMS will refuse the sales invoice queued for it when that invoice comes up for posting. ${storeCreditInvoiceRefusalReason()}`
 }
+
+/**
+ * The customer-facing INVOICE document (the local invoice PDF, the invoice email in either flavour, the on-the-fly
+ * invoice download) is refused for an order that carries store credit or is held for review. The document would
+ * have to state the full goods value and show the credit as a payment; the local renderers print
+ * `SalesOrder.totalForeign` (what WooCommerce charged AFTER the credit) as the invoice Total, which would send the
+ * customer an invoice reduced by the credit. Raised before anything is rendered or queued, so nothing was sent.
+ */
+export function storeCreditInvoiceDocumentRefusal(block: StoreCreditBlock = 'CREDIT'): string {
+  return `NOTHING WAS GENERATED OR SENT. This order ${block === 'REVIEW' ? 'is held for store-credit review' : 'was paid in part with store credit'}, `
+    + 'and IMS does not produce an invoice document for such an order yet: it would have to state the full goods value and show the '
+    + 'credit as a payment, and that is not built. The order confirmation is unaffected.'
+}
+
+/** Throws the refusal when the order must not be given an invoice document; returns otherwise. */
+export function assertNoStoreCreditInvoiceDocument(order: { storeCreditForeign?: unknown; storeCreditAssessment?: unknown }): void {
+  const block = storeCreditBlock(order)
+  if (block) throw new Error(storeCreditInvoiceDocumentRefusal(block))
+}

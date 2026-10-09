@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { runWmsOrderPushSweepCore, type WmsOrderPushPort, type WmsPushCandidate } from '../lib/domain/wms/order-push-sweep.ts'
+import { buildPushInput, payloadTotalMismatchPence, runWmsOrderPushSweepCore, type WmsOrderPushPort, type WmsPushCandidate } from '../lib/domain/wms/order-push-sweep.ts'
 import type { WmsOrderPushInput, WmsOrderPushResult } from '../lib/connectors/wms/types.ts'
 import { STORE_CREDIT_PUSH_WITHHELD_REASON } from '../lib/domain/wms/store-credit-push-guard.ts'
 import { buildPushPayload } from '../lib/connectors/mintsoft/api/order-push.ts'
@@ -155,4 +155,15 @@ test('WITHHELD matrix: only an ASSESSED credit order (or an order with no credit
   }
   // eslint-disable-next-line no-console
   console.log(`PRECONDITION push withhold matrix:\n  ${rows.join('\n  ')}`)
+})
+
+test('the pushed-PAYLOAD total check (push-total-guard) expects the credit: full goods value pushed, order total lower by exactly the credit', () => {
+  const order = candidate()
+  const input = buildPushInput(order, '301')
+  const honest = payloadTotalMismatchPence(order, input)
+  const blind = payloadTotalMismatchPence({ ...order, storeCreditForeign: 0 }, input)
+  precondition('payload total check', { goodsNet: 100, vat: 20, credit: 30, orderTotal: 90, withCredit: honest, creditUnknown: blind, discountExVat: input.discountExVat })
+  assert.equal(input.discountExVat, 0, 'precondition: the payload carries the full goods value')
+  assert.equal(honest, null, 'an honest credit order is not a mismatch')
+  assert.ok(blind !== null && blind >= 3000, 'with the credit unknown the same payload reads as 30.00 of drift (the check can fire on this fixture)')
 })

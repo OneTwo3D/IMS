@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { storeCreditBlock, storeCreditInvoiceDocumentRefusal } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
@@ -44,6 +45,13 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Invoice-${safeInvoiceFilenamePart(invNum)}.pdf"` },
       })
     }
+  }
+
+  // The invoice rendered here prints SalesOrder.totalForeign (AFTER store credit) as its Total: refused for an order with
+  // store credit or one held for review. The stored PDF branch above is the accounting system's own document.
+  const creditBlock = storeCreditBlock(so)
+  if (creditBlock) {
+    return NextResponse.json({ error: storeCreditInvoiceDocumentRefusal(creditBlock) }, { status: 409 })
   }
 
   const branding = await getBranding()
