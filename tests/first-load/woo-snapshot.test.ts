@@ -13,7 +13,7 @@ import test, { after, before } from 'node:test'
 import { outboundWriteRefusal } from '../../lib/security/outbound-write-grant.ts'
 import { runCli as runPrepare } from '../../lib/first-load/cli.ts'
 import { SNAPSHOT_EXIT_CODES, SNAPSHOT_FILE_NAMES } from '../../lib/first-load/spec.ts'
-import { parseSnapshotFile, renderVariantParentsCsv } from '../../lib/first-load/snapshot.ts'
+import { parseSnapshotFile, payloadSha256, renderSnapshotFile, renderVariantParentsCsv } from '../../lib/first-load/snapshot.ts'
 import { runSnapshotCli, type SnapshotCliDeps } from '../../lib/first-load/woo-snapshot/cli.ts'
 import { startFakeCatalogue, type FakeCatalogue, type FakeCatalogueOptions, type FakeParent } from '../helpers/fake-woocommerce-catalogue.ts'
 import { precondition } from './helpers.ts'
@@ -475,6 +475,25 @@ test('arm (m): the same store gives the same bytes whatever page size it grants 
     assert.notEqual(a.server.requests.length, b.server.requests.length, 'the two walks really did differ in how they paged')
     assert.ok(!readFileSync(path.join(a.out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8').includes(a.server.origin), 'the snapshot itself carries no host (the provenance does)')
   } finally { await a.server.close(); await b.server.close() }
+})
+
+test('arm (m2): the canonical form sorts by id whatever order it is given (the sort in the snapshot module itself, isolated from the walk)', (t) => {
+  const sorted = { source: 'woocommerce' as const, parents: [
+    { id: 1, sku: 'A', name: 'A', status: 'publish', variationIds: [11, 12] },
+    { id: 2, sku: 'B', name: 'B', status: 'publish', variationIds: [21] },
+  ], variations: [
+    { id: 11, parentId: 1, sku: 'A-1', status: 'publish', attributes: [{ name: 'a', option: '1' }, { name: 'b', option: '2' }] },
+    { id: 12, parentId: 1, sku: 'A-2', status: 'publish', attributes: [] },
+    { id: 21, parentId: 2, sku: 'B-1', status: 'publish', attributes: [] },
+  ] }
+  const shuffled = {
+    source: 'woocommerce' as const,
+    parents: [sorted.parents[1], { ...sorted.parents[0], variationIds: [12, 11] }],
+    variations: [sorted.variations[2], { ...sorted.variations[0], attributes: [{ name: 'b', option: '2' }, { name: 'a', option: '1' }] }, sorted.variations[1]],
+  }
+  precondition(t, 'orderings compared', 2)
+  assert.equal(renderSnapshotFile(shuffled), renderSnapshotFile(sorted))
+  assert.equal(payloadSha256(shuffled), payloadSha256(sorted))
 })
 
 test('arm (n): --verify recomputes the checksum: an edited snapshot is refused, an untouched one passes, and --verify takes no other option', async (t) => {

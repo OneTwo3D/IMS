@@ -241,7 +241,7 @@ One row per WooCommerce variation: the variation's SKU and the VARIABLE parent i
 | `wooVariationId` | no | WooCommerce's id for the variation (digits). Informational; carried so the connector link step can use it later. |
 | `parentSku` | yes | The parent's SKU. It must not be the SKU of any Qoblex product (other than a VARIABLE product the products file itself carries), of any variation, or of any product already in IMS (`PARENT_SKU_COLLIDES`). |
 | `parentName` | yes | The parent's WooCommerce title: it becomes the VARIABLE product's name. Variants keep the Qoblex name. |
-| `parentStatus` | yes | WooCommerce post status: `publish` loads as ACTIVE; `draft`, `pending` and `private` load as DRAFT. A closed list: any other status rejects its rows (`UNMAPPED_PARENT_STATUS`). The owner confirms this mapping before the real load. |
+| `parentStatus` | yes | WooCommerce post status, mapped to the parent's lifecycle status by a closed list (status = lifecycle): `publish` = ACTIVE, `draft` = DRAFT, `pending` = DRAFT, `private` = DRAFT. Any other status rejects its rows (`UNMAPPED_PARENT_STATUS`). The owner confirms this mapping before the real load. |
 | `wooParentId` | no | WooCommerce's id for the parent (digits). All variations of one parent must agree on the parent's SKU spelling, title, status and id, or the parent is rejected with all of them (`PARENT_ATTRIBUTE_CONFLICT`). |
 
 How a row ends: `VARIATION_JOINED` (emitted) when a Qoblex VARIANT has that SKU. Excluded, with a reason: `NO_QOBLEX_PRODUCT` (WooCommerce has a variation Qoblex does not; the R14 coverage check lists it unless it is on `sku-exclusions`),

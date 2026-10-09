@@ -111,17 +111,13 @@ test('the snapshot command section documents exactly the environment variables t
   assert.ok(body.includes(SNAPSHOT_FILE_NAMES.partial), 'the resume file is documented')
 })
 
-test('the parentStatus row documents every status in the closed mapping, with the lifecycle it maps to', (t) => {
+test('the parentStatus row documents exactly the closed status mapping (every pair, both directions)', (t) => {
   const rows = tableRows(section('### Dataset: variant-parents'))
   const row = rows.find((r) => r[0] === '`parentStatus`')
   assert.ok(row, 'the parentStatus row exists')
-  const entries = Object.entries(VARIANT_PARENT_STATUS_LIFECYCLE)
-  precondition(t, 'statuses in the closed mapping', entries.length)
-  const text = row![2]
-  for (const [status, lifecycle] of entries) {
-    const mentioned = new RegExp(`\\x60${status}\\x60[^;.]*?(?:${lifecycle})|${lifecycle}[^.]*\\x60${status}\\x60`).test(text)
-    assert.ok(mentioned, `${status} -> ${lifecycle} is documented`)
-  }
+  const documented = Object.fromEntries([...row![2].matchAll(/`([a-z]+)` = (ACTIVE|DRAFT)/g)].map((m) => [m[1], m[2]]))
+  precondition(t, 'statuses in the closed mapping', Object.keys(VARIANT_PARENT_STATUS_LIFECYCLE).length)
+  assert.deepEqual(documented, { ...VARIANT_PARENT_STATUS_LIFECYCLE })
 })
 
 test('the document no longer says variants wait for parents from "another source" or that the stock report alone leaves them blocked', (t) => {
