@@ -58,6 +58,8 @@ const LIB = [
   shippedFunction(INSTALL, 'existing_env'),
   shippedFunction(INSTALL, 'env_value_closes_quote'),
   shippedFunction(INSTALL, 'load_existing_env'),
+  shippedFunction(INSTALL, 'env_percent_decode'),
+  shippedFunction(INSTALL, 'env_percent_encode'),
   shippedFunction(INSTALL, 'env_key_carry_check'),
   shippedFunction(INSTALL, 'env_key_is_admin_credential'),
   shippedFunction(INSTALL, 'render_preserved_env_keys'),
@@ -347,4 +349,35 @@ test('re-run: the .env write backs up and keeps before it replaces, and the sour
   console.log(`  rsync .env.bak* excludes: ${excludes.length}`)
   assert.equal(excludes.length, 2, 'both rsync --delete calls spare the backups')
   assert.match(INSTALL, /^print_env_rewrite_summary "\$\{ENV_LAST_RENDERED\}"$/m, 'and the summary is printed after the write')
+})
+
+test('re-run: an ENCODED admin password or a libpq keyword/value string cannot slip through under an innocuous key', () => {
+  const ENC_ADMIN = 'postgresql://deployadmin:A%40B-Pass%2Fw0rd@127.0.0.1:5432/db'
+  const check = (value: string, admin = ENC_ADMIN) =>
+    bash([LIB, `DEPLOY_ADMIN_DATABASE_URL='${admin}'`, `env_key_carry_check 'REPORTING_DSN' '${value}'; echo "RC=$? REASON=[$ENV_REFUSAL_REASON]"`].join('\n')).out.trim().split('\n').pop() ?? ''
+  const refused: Array<[string, string]> = [
+    ['the exact review case: decoded password in a libpq string', 'host=db.example user=deployadmin password=A@B-Pass/w0rd dbname=app'],
+    ['decoded password alone', 'x A@B-Pass/w0rd y'],
+    ['encoded as written in the URL', 'x A%40B-Pass%2Fw0rd y'],
+    ['encoded with lowercase hex', 'x A%40B-Pass%2fw0rd y'],
+    ["single-quoted password setting", "host=db password='other secret' dbname=app"],
+    ['double-quoted, spaced password setting', 'host=db password = "other" dbname=app'],
+    ['user setting naming the admin role', 'host=db user=deployadmin dbname=app'],
+    ['quoted user setting naming the admin role', "host=db user='deployadmin' dbname=app"],
+    ['spaced, double-quoted user setting', 'host=db user = "deployadmin"'],
+    ['postgres URL without a password naming the admin', 'ssh://deployadmin@host/x'],
+  ]
+  for (const [label, value] of refused) {
+    const got = check(value)
+    console.log(`  ${label}: ${got}`)
+    assert.match(got, /^RC=1 REASON=\[.+\]$/, `${label} must be refused`)
+  }
+  // Isolating: with the admin credential UNKNOWN, a plain keyword string with no password and another role passes.
+  const ok = bash([LIB, 'DEPLOY_ADMIN_DATABASE_URL=""', "env_key_carry_check 'REPORTING_DSN' 'host=db user=reader dbname=app'; echo \"RC=$? REASON=[$ENV_REFUSAL_REASON]\""].join('\n')).out.trim().split('\n').pop()
+  console.log(`  innocuous keyword string, admin unknown: ${ok}`)
+  assert.equal(ok, 'RC=0 REASON=[]')
+  // The decoder and encoder agree on the review's password.
+  const rt = bash([LIB, "env_percent_decode 'A%40B-Pass%2Fw0rd' d; env_percent_encode \"$d\" e; echo \"$d|$e\""].join('\n')).out.trim()
+  console.log(`  decode/encode: ${rt}`)
+  assert.equal(rt, 'A@B-Pass/w0rd|A%40B-Pass%2Fw0rd')
 })

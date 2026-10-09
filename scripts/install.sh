@@ -9075,8 +9075,35 @@ env_key_is_admin_credential() {
 # the cost of a false positive is one line copied back by hand. Sets ENV_REFUSAL_REASON; returns 0 when
 # the key may be carried.
 ENV_REFUSAL_REASON=""
+# Percent-decoding and -encoding in bash itself, into a named variable (no subshell: this runs inside a
+# body whose command substitutions are not allowed to fail silently).
+env_percent_decode() {
+  local s="${1//\\/\\\\}"
+  s="${s//%/\\x}"
+  printf -v "$2" '%b' "${s}"
+}
+env_percent_encode() {
+  local in="$1" c h hl out="" outl="" i
+  for ((i = 0; i < ${#in}; i++)); do
+    c="${in:i:1}"
+    if [[ "${c}" =~ [A-Za-z0-9._~-] ]]; then
+      out+="${c}"
+      outl+="${c}"
+    else
+      printf -v h '%%%02X' "'${c}"
+      printf -v hl '%%%02x' "'${c}"
+      out+="${h}"
+      outl+="${hl}"
+    fi
+  done
+  printf -v "$2" '%s' "${out}"
+  [[ -z "${3:-}" ]] || printf -v "$3" '%s' "${outl}"
+}
+
 env_key_carry_check() {
   local key="$1" value="$2" upper admin_user="" admin_pass="" url="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  local lower_value="${value,,}" form
+  local -a pass_forms=() user_forms=()
   upper="${key^^}"
   ENV_REFUSAL_REASON=""
   case "${upper}" in
@@ -9085,7 +9112,7 @@ env_key_carry_check() {
       return 1
       ;;
   esac
-  if [[ "${value,,}" == *postgres://* || "${value,,}" == *postgresql://* ]]; then
+  if [[ "${lower_value}" == *postgres://* || "${lower_value}" == *postgresql://* ]]; then
     ENV_REFUSAL_REASON="the value is a PostgreSQL connection URL"
     return 1
   fi
@@ -9093,17 +9120,40 @@ env_key_carry_check() {
     ENV_REFUSAL_REASON="the value is a URL with a password in it"
     return 1
   fi
-  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+):([^@]+)@ ]]; then
+  # A libpq keyword/value connection string (`host=db user=x password=y`), quoted or not, spaced or not.
+  # A password setting in a hand-added variable is a credential whatever role it belongs to.
+  if [[ "${lower_value}" =~ (^|[[:space:]\'\"])password[[:space:]]*= ]]; then
+    ENV_REFUSAL_REASON="the value is a connection string with a password setting"
+    return 1
+  fi
+  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+)(:([^@]*))?@ ]]; then
     admin_user="${BASH_REMATCH[1]}"
-    admin_pass="${BASH_REMATCH[2]}"
-    if [[ ${#admin_pass} -ge 4 && "${value}" == *"${admin_pass}"* ]]; then
-      ENV_REFUSAL_REASON="the value contains the deploy admin's password"
-      return 1
-    fi
-    if [[ "${value}" == *"://${admin_user}:"* || "${value}" == *"://${admin_user}@"* ]]; then
-      ENV_REFUSAL_REASON="the value names the deploy admin role as a connection user"
-      return 1
-    fi
+    admin_pass="${BASH_REMATCH[3]}"
+    # The credential as it appears in the URL (percent-encoded), decoded, and re-encoded in both hex
+    # cases: a copy may have been written in any of them.
+    local decoded_user decoded_pass enc_up enc_low
+    env_percent_decode "${admin_user}" decoded_user
+    env_percent_decode "${admin_pass}" decoded_pass
+    user_forms=("${admin_user}" "${decoded_user}")
+    pass_forms=("${admin_pass}" "${decoded_pass}")
+    env_percent_encode "${decoded_pass}" enc_up enc_low
+    pass_forms+=("${enc_up}" "${enc_low}")
+    env_percent_encode "${decoded_user}" enc_up enc_low
+    user_forms+=("${enc_up}" "${enc_low}")
+    for form in "${pass_forms[@]}"; do
+      if [[ ${#form} -ge 4 && "${value}" == *"${form}"* ]]; then
+        ENV_REFUSAL_REASON="the value contains the deploy admin's password"
+        return 1
+      fi
+    done
+    for form in "${user_forms[@]}"; do
+      [[ -n "${form}" ]] || continue
+      if [[ "${value}" == *"://${form}:"* || "${value}" == *"://${form}@"* ]] \
+        || [[ "${lower_value}" =~ (^|[[:space:]\'\"])user[[:space:]]*=[[:space:]]*[\'\"]?"${form,,}"([[:space:]\'\"]|$) ]]; then
+        ENV_REFUSAL_REASON="the value names the deploy admin role as a connection user"
+        return 1
+      fi
+    done
   fi
   return 0
 }

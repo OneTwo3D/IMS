@@ -71,6 +71,8 @@ export const SHIPPED = [
   'existing_env',
   'env_value_closes_quote',
   'load_existing_env',
+  'env_percent_decode',
+  'env_percent_encode',
   'env_key_carry_check',
   'mask_secret',
   'prompt',
