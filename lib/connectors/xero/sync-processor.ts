@@ -113,6 +113,7 @@ import {
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
+import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import {
@@ -1412,6 +1413,10 @@ export async function enqueueFollowUpSyncLog(
     payload: plan.payload,
     tokenDisposition: plan.action === 'reuse' ? plan.tokenDisposition : 'rotated',
     syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+    // o3d-llyw: the revived row's own operator ledger checks (operator-ledger-check.ts).
+    loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {
+      syncLogIds: [scope.attemptSyncLogId], paymentId: scope.paymentId, connector: scope.connector,
+    }),
   })
   if (!evidence.clear) {
     const message = `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: `
@@ -6070,6 +6075,11 @@ async function processClaimedEntry(
       // exactly that reason.
       return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // o3d-llyw: a receipt's post honours an operator ledger check recorded for a contender and THIS
+        // receipt (operator-ledger-check.ts). Read only when a check could change a verdict.
+        loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {
+          syncLogIds: [scope.attemptSyncLogId], paymentId: scope.paymentId, connector: scope.connector,
+        }),
         // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
         // the fence must authorise against the very day the call below creates, and a second
         // wall-clock read here is a second day whenever the two straddle a UTC midnight.

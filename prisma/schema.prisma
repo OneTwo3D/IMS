@@ -3113,6 +3113,46 @@ model AccountingPostingRefusal {
   @@map("accounting_posting_refusals")
 }
 
+/// An operator's LEDGER CHECK (owner decision C4): "I opened these payment records in the ledger and
+/// none of them is the payment this attempt made, nor a hand-entered payment for this receipt." The
+/// only thing that can lift a hold an UNMEASURABLE ledger settlement puts on a receipt — and only under
+/// the rule in lib/domain/accounting/operator-ledger-check.ts (same attempt, same receipt, same
+/// document, every unmeasurable record id named, same Xero organisation AND connection generation).
+///
+/// INSERT-ONLY. A database trigger refuses every UPDATE and DELETE, so a later check never rewrites an
+/// earlier one and the record of who asserted what survives. It is an OPERATOR ASSERTION (`basis`, held
+/// to that one value by a CHECK constraint): it never changes the attempt row or its ledger standing.
+///
+/// No foreign keys, deliberately: retention and the admin reset delete sync rows and receipts, and a
+/// cascade into an insert-only table would make those deletes fail. A check whose attempt or receipt is
+/// gone can never match again (ids are never reused), so it is inert rather than wrong.
+model AccountingOperatorLedgerCheck {
+  id                   String   @id @default(cuid())
+  /// The unresolved attempt (AccountingSyncLog id) the check speaks about.
+  syncLogId            String
+  /// The receipt (Payment id) whose registration or post the check lets through.
+  paymentId            String
+  connector            String
+  /// The ledger document the checked records settle — the document the probe read.
+  ledgerDocumentId     String
+  /// The EXACT unmeasurable ledger record ids the probe showed when the check was recorded. Non-empty.
+  ledgerRecordIds      String[]
+  /// The organisation that served that probe.
+  tenantId             String
+  /// The connection generation that served that probe (AccountingToken.connectionGeneration). Any
+  /// reconnect mints a new one and so voids the check.
+  connectionGeneration String
+  /// Always OPERATOR_ASSERTION: this row is a person's word, never a ledger fact.
+  basis                String   @default("OPERATOR_ASSERTION")
+  checkedByUserId      String
+  checkedAt            DateTime @default(now())
+  /// What the operator says they looked at. Optional, plain text.
+  note                 String?
+
+  @@index([syncLogId, paymentId])
+  @@map("accounting_operator_ledger_checks")
+}
+
 model AccountingToken {
   id           String   @id @default(cuid())
   connector    String   @default("xero")

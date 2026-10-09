@@ -249,6 +249,18 @@ export type XeroResponse<T = unknown> = {
    * failure. Present on failures too, deliberately: a failed read is still a fact about one org.
    */
   tenantId?: string
+  /**
+   * o3d-llyw (operator ledger check) — THE CONNECTION GENERATION of the token this request was built
+   * from, read in the SAME row read as `tenantId` (`getAccessToken`). Re-minted at every Xero binding
+   * and carried unchanged through refreshes, so two responses naming the same tenant AND generation
+   * were served by one consent, with no reconnect between them — which two tenant ids alone cannot
+   * show (A->B->A). Request-bound for the reason `tenantId` is: a database read after the call is a
+   * resample, not a record.
+   *
+   * `null` when the stored connection predates the column; `undefined` when no request was made.
+   * Read by the settlement probe's connection binding only, which treats both as "cannot say".
+   */
+  connectionGeneration?: string | null
 }
 
 function sleep(ms: number) {
@@ -767,7 +779,7 @@ async function xeroFetch<T = unknown>(
 // concurrent reconnect between two getAccessToken() calls could store one tenant's response under
 // another tenant's key (o3d-e2j).
 async function xeroFetchWithAuth<T = unknown>(
-  auth: { accessToken: string; tenantId: string },
+  auth: { accessToken: string; tenantId: string; connectionGeneration?: string | null },
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
@@ -818,7 +830,7 @@ async function xeroFetchWithAuth<T = unknown>(
   // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
   if (res.status === XERO_NOT_SENT_STATUS) {
     return {
-      ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId,
+      ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null,
       notSent: xeroNotSentReason(res),
     }
   }
@@ -827,7 +839,7 @@ async function xeroFetchWithAuth<T = unknown>(
     // the fence report it without sending, and Xero itself answers it after a real send. So the tag
     // is what separates them, never the status (o3d-gvzu).
     return {
-      ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId,
+      ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null,
       notSent: xeroNotSentReason(res),
     }
   }
@@ -863,11 +875,11 @@ async function xeroFetchWithAuth<T = unknown>(
     } catch {
       errorMessage += ': ' + (rawBody.slice(0, 1000) || 'Unknown error (empty response body)')
     }
-    return { ok: false, status: res.status, error: errorMessage, tenantId: auth.tenantId }
+    return { ok: false, status: res.status, error: errorMessage, tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null }
   }
 
   const data = await res.json() as T
-  return { ok: true, status: res.status, data, tenantId: auth.tenantId }
+  return { ok: true, status: res.status, data, tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null }
 }
 
 /**

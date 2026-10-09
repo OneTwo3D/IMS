@@ -18,9 +18,16 @@ import {
   type LedgerStandingRow,
 } from './ledger-standing'
 import {
-  classifyLedgerSettlement,
+  formatLedgerMoney,
+  type AttemptDescription,
   type LedgerSettlementProbe,
 } from './ledger-settlement-evidence'
+import {
+  classifyLedgerSettlementWithOperatorChecks,
+  describeAttemptForLedgerCheck,
+  describeLedgerCheckRemedy,
+  type OperatorLedgerCheck,
+} from './operator-ledger-check'
 import { LEDGER_HELD_REGISTRATION_STATUSES } from './payment-ledger-hold'
 import {
   exactAmountReadingOrLegacy,
@@ -102,7 +109,16 @@ export type InvoicePaymentRegistrationRefusal =
   | 'PAYMENT_ACCOUNT_NOT_IN_LEDGER'
 
 export type InvoicePaymentRegistrationDecision =
-  | { register: true; bankAccountId: string }
+  | {
+      register: true
+      bankAccountId: string
+      /**
+       * o3d-llyw — the operator ledger checks that lifted an unmeasurable-record hold on the way here
+       * (operator-ledger-check.ts). Empty/absent when none was needed. The caller records them against
+       * the registration, so a payment let through on a person's word is always traceable to the word.
+       */
+      liftedByCheckIds?: string[]
+    }
   | {
       register: false
       refusal: InvoicePaymentRegistrationRefusal
@@ -110,6 +126,12 @@ export type InvoicePaymentRegistrationDecision =
       ledgerTotal?: Decimal
       /** Why an unresolved attempt could not be cleared, for the operator warning. */
       detail?: string
+      /**
+       * o3d-llyw — WHAT LIFTS THIS HOLD, when it is an unmeasurable-record hold: the one sentence from
+       * `describeLedgerCheckRemedy`, naming the records, the entry and the receipt — or saying why no
+       * ledger check can lift it. Absent for every other refusal.
+       */
+      ledgerCheckRemedy?: string
     }
 
 /**
@@ -131,6 +153,12 @@ export type InvoicePaymentRegistrationDecision =
  * than a fifth guard that checks the loader remembered.
  */
 export type ExistingInvoicePaymentSync = LedgerStandingRow & {
+  /**
+   * o3d-llyw — the sync row's own id, which an operator ledger check is recorded against. Optional so
+   * the many callers that judge rows built in memory keep compiling; a row without one can never be
+   * matched by a check, which is the withholding answer.
+   */
+  id?: string
   status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
   /**
    * WHAT WAS SENT, as the JSON number the connector put on the wire and the ledger therefore holds.
@@ -351,6 +379,28 @@ export function retiredDocumentInvoicePaymentAttempts(
  * they still cannot round differently, and they are now right in every currency instead of in one.
  */
 
+/**
+ * WHAT AN UNRESOLVED ATTEMPT SENT, as the settlement classifier compares it — the one description, used
+ * by the decision below and by the operator ledger check (which must judge the attempt exactly as the
+ * decision does, or a check could be recorded against a verdict the decision never reaches).
+ */
+export function describeUnresolvedAttempt(
+  attempt: ExistingInvoicePaymentSync,
+  orderCurrency: string,
+): AttemptDescription {
+  return {
+    // o3d-r948 r2 (Codex HIGH 2) — AND THE FALLBACK IS THE TRI-STATE'S, NOT `??`'s. `??` reads
+    // "no exact figure was stated" out of a value that also means "one was and IMS refused it",
+    // and then spends the very number the refusal is about. `exactAmountReadingOrLegacy` is the
+    // one place allowed to substitute the number, and it substitutes for a silence only — a
+    // refused attempt describes itself as undescribable, which withholds.
+    amount: statedAmountOnly(exactAmountReadingOrLegacy(attempt.registeredAmount, attempt.amount)),
+    currency: orderCurrency,
+    date: attempt.paymentDate ?? null,
+    marker: attempt.settlementMarker ?? null,
+  }
+}
+
 export function decideInvoicePaymentRegistration(input: {
   syncEnabled: boolean
   /** The ledger's id for the invoice, or null if it has not posted. */
@@ -393,6 +443,16 @@ export function decideInvoicePaymentRegistration(input: {
    * reproduction collapses; the other is the sum below.
    */
   ledgerTotal: Decimal
+  /**
+   * o3d-llyw — the connector the probe and the rows are for, which a check must name. Absent = no
+   * check can apply.
+   */
+  connector?: string | null
+  /**
+   * o3d-llyw — operator ledger checks recorded for the unresolved attempts and THIS receipt. Read
+   * under the rule in operator-ledger-check.ts and nowhere else; absent = none, which withholds.
+   */
+  operatorLedgerChecks?: readonly OperatorLedgerCheck[]
 }): InvoicePaymentRegistrationDecision {
   if (!input.syncEnabled) return { register: false, refusal: 'SYNC_DISABLED' }
   if (!input.accountingInvoiceId) return { register: false, refusal: 'DOCUMENT_NOT_POSTED' }
@@ -438,6 +498,7 @@ export function decideInvoicePaymentRegistration(input: {
    * its columns (`mayHoldLedgerPayment`), or this probe. Anything else is counted.
    */
   const provedAbsent = new Set<ExistingInvoicePaymentSync>()
+  const liftedByCheckIds = new Set<string>()
   const unresolved = unresolvedInvoicePaymentAttempts(input.existing, input.paymentId)
   if (unresolved.length > 0) {
     if (input.ledgerSettlements === null) {
@@ -449,78 +510,89 @@ export function decideInvoicePaymentRegistration(input: {
       }
     }
     for (const attempt of unresolved) {
-      const verdict = classifyLedgerSettlement(
-        // o3d-78rq — `registeredAmount` NOW, AND THE NUMBER'S OWN DECIMAL READING WHERE THERE IS NONE.
-        //
-        // o3d-6abj chose `amount` here with the reason "this compares against a figure the LEDGER
-        // reported, which is the JSON number that went on the wire". That reason held while the ledger
-        // side was a wire number too. It no longer is: the probe now reads each settlement through
-        // `readLedgerStatedAmount` and the record carries the ledger's exact stated figure, so the
-        // operand that meets it must be exact as well or the band is spent on a double subtraction
-        // again. The fallback is the same one `payloadExactAmount` takes for a row written before
-        // `amountDecimal` existed — `toDecimal(theNumber)`, the number's own decimal reading — so this
-        // site describes no attempt it could not describe before and withholds nothing extra.
-        //
-        // o3d-6yho: and the ORDER's currency, which is the currency this attempt was raised in — the
-        // decision has already refused a receipt whose currency differs from the order's, so there is
-        // no second answer to give here.
-        {
-          // o3d-r948 r2 (Codex HIGH 2) — AND THE FALLBACK IS THE TRI-STATE'S, NOT `??`'s. `??` reads
-          // "no exact figure was stated" out of a value that also means "one was and IMS refused it",
-          // and then spends the very number the refusal is about. `exactAmountReadingOrLegacy` is the
-          // one place allowed to substitute the number, and it substitutes for a silence only — a
-          // refused attempt describes itself as undescribable, which withholds.
-          amount: statedAmountOnly(exactAmountReadingOrLegacy(attempt.registeredAmount, attempt.amount)),
-          currency: input.orderCurrency,
-          date: attempt.paymentDate ?? null,
-          marker: attempt.settlementMarker ?? null,
-        },
-        // o3d-obyd r31: the probe AS THE PROBE ANSWERED IT. This used to rebuild one around the
-        // records, which is where the collection's proved-completeness would have been invented
-        // rather than carried — see the `ledgerSettlements` field.
+      // o3d-78rq — `registeredAmount` NOW, AND THE NUMBER'S OWN DECIMAL READING WHERE THERE IS NONE.
+      //
+      // o3d-6abj chose `amount` here with the reason "this compares against a figure the LEDGER
+      // reported, which is the JSON number that went on the wire". That reason held while the ledger
+      // side was a wire number too. It no longer is: the probe now reads each settlement through
+      // `readLedgerStatedAmount` and the record carries the ledger's exact stated figure, so the
+      // operand that meets it must be exact as well or the band is spent on a double subtraction
+      // again. The fallback is the same one `payloadExactAmount` takes for a row written before
+      // `amountDecimal` existed — `toDecimal(theNumber)`, the number's own decimal reading — so this
+      // site describes no attempt it could not describe before and withholds nothing extra.
+      //
+      // o3d-6yho: and the ORDER's currency, which is the currency this attempt was raised in — the
+      // decision has already refused a receipt whose currency differs from the order's, so there is
+      // no second answer to give here.
+      const description = describeUnresolvedAttempt(attempt, input.orderCurrency)
+      // o3d-obyd r31: the probe AS THE PROBE ANSWERED IT. This used to rebuild one around the
+      // records, which is where the collection's proved-completeness would have been invented
+      // rather than carried — see the `ledgerSettlements` field.
+      //
+      // o3d-r948 r6 — THE EXCLUSION SET WAS A THIRD ARGUMENT HERE, AND IS GONE.
+      //
+      // WHAT IT DID AND WHY IT WAS BUILT. `classifyLedgerSettlement` withholds on a settlement it
+      // cannot measure, and when that settlement belongs to a DIFFERENT row that already posted
+      // the withhold is PERMANENT: `unresolvedInvoicePaymentAttempts` judges only FAILED and
+      // CANCELLED rows, so a SYNCED row's payment is never matched to its own attempt here — it
+      // can only block, and it blocks every future receipt on the order for good. The set handed
+      // over the ledger ids IMS had recorded against this order's OTHER rows so those records
+      // could be skipped, and the permanent hold lifted.
+      //
+      // WHY IT IS NOT HERE ANY MORE. Four rounds narrowed it — immutable ids only (r3), never an
+      // operator-asserted id (r4), and only from a row raised against the organisation the probe
+      // answered from (r5) — and the fifth found two gaps that are not looseness in the reasoning
+      // but FACTS NOTHING IN THIS SYSTEM RECORDS:
+      //
+      //   • `row.origin` is stamped at ENQUEUE and `externalTransactionId` is minted at POST. A
+      //     reconnect between them detaches one from the other, and on QuickBooks nothing stops
+      //     it: that connector has no post-time realm enforcement at all (o3d-8prh, OPEN), and
+      //     `QboResponse` discards the `realmId` its own request resolved, so there is no issuer
+      //     to record even if this branch wanted to.
+      //   • The probe's organisation was read from two token snapshots either side of the fetch,
+      //     which cannot see an A→B→A reconnect across it.
+      //
+      // AND A THIRD, FOUND WHILE WEIGHING THOSE TWO, WHICH SHOWS THE SHAPE IS NOT QUICKBOOKS-ONLY:
+      // `buildAssertedReversalData` (payment-ledger-hold.ts, called from app/actions/sales.ts)
+      // writes an operator-supplied `externalTransactionId` onto an undecided row and leaves
+      // `settlementBasis` NULL — so r4's `isOperatorAssertedSettlement` filter reads it as
+      // connector-backed. That id IS verified against the ledger by a live read, but against
+      // whatever tenant is connected at VERIFICATION time, while the row's origin still names
+      // enqueue time. Same detachment, a Xero door, and one that landing o3d-8prh would not shut.
+      //
+      // SO THE ROUND-2 BEHAVIOUR IS RESTORED: AN UNMEASURABLE SETTLEMENT WITHHOLDS, WHATEVER ID
+      // ANY ROW OF OURS RECORDS. The trade is the one `classifyLedgerSettlement` has always stated:
+      // the cost of holding a genuine payment back is a visible refusal with a nameable remedy, and
+      // the cost of the alternative is a second payment on somebody's ledger, which is neither
+      // visible nor remediable.
+      //
+      // o3d-llyw (owner decision C4) — AND THE NAMEABLE REMEDY NOW EXISTS, AND IT IS NOT THAT SET.
+      // Nothing is excluded on any identity IMS recorded about ITSELF. The one thing that can set an
+      // unmeasurable record aside is an operator ledger check: a person, shown the record ids, asserting
+      // that none of them is this attempt's payment (nor a hand-entered copy of this receipt). The rule
+      // that reads it (operator-ledger-check.ts) lifts ONLY an unmeasurable-record hold, only when every
+      // such record is named by a check for THIS attempt and THIS receipt on THIS document under the
+      // Xero connection (tenant AND generation) that served this probe, and only if the attempt then
+      // judges `clear` with those records set aside. It never clears `present`. With no check this is
+      // exactly `classifyLedgerSettlement`.
+      const judged = classifyLedgerSettlementWithOperatorChecks(
+        description,
         input.ledgerSettlements,
-        // o3d-r948 r6 — THE EXCLUSION SET WAS THE THIRD ARGUMENT HERE, AND IS GONE.
-        //
-        // WHAT IT DID AND WHY IT WAS BUILT. `classifyLedgerSettlement` withholds on a settlement it
-        // cannot measure, and when that settlement belongs to a DIFFERENT row that already posted
-        // the withhold is PERMANENT: `unresolvedInvoicePaymentAttempts` judges only FAILED and
-        // CANCELLED rows, so a SYNCED row's payment is never matched to its own attempt here — it
-        // can only block, and it blocks every future receipt on the order for good. The set handed
-        // over the ledger ids IMS had recorded against this order's OTHER rows so those records
-        // could be skipped, and the permanent hold lifted.
-        //
-        // WHY IT IS NOT HERE ANY MORE. Four rounds narrowed it — immutable ids only (r3), never an
-        // operator-asserted id (r4), and only from a row raised against the organisation the probe
-        // answered from (r5) — and the fifth found two gaps that are not looseness in the reasoning
-        // but FACTS NOTHING IN THIS SYSTEM RECORDS:
-        //
-        //   • `row.origin` is stamped at ENQUEUE and `externalTransactionId` is minted at POST. A
-        //     reconnect between them detaches one from the other, and on QuickBooks nothing stops
-        //     it: that connector has no post-time realm enforcement at all (o3d-8prh, OPEN), and
-        //     `QboResponse` discards the `realmId` its own request resolved, so there is no issuer
-        //     to record even if this branch wanted to.
-        //   • The probe's organisation was read from two token snapshots either side of the fetch,
-        //     which cannot see an A→B→A reconnect across it.
-        //
-        // AND A THIRD, FOUND WHILE WEIGHING THOSE TWO, WHICH SHOWS THE SHAPE IS NOT QUICKBOOKS-ONLY:
-        // `buildAssertedReversalData` (payment-ledger-hold.ts, called from app/actions/sales.ts)
-        // writes an operator-supplied `externalTransactionId` onto an undecided row and leaves
-        // `settlementBasis` NULL — so r4's `isOperatorAssertedSettlement` filter reads it as
-        // connector-backed. That id IS verified against the ledger by a live read, but against
-        // whatever tenant is connected at VERIFICATION time, while the row's origin still names
-        // enqueue time. Same detachment, a Xero door, and one that landing o3d-8prh would not shut.
-        //
-        // SO THE ROUND-2 BEHAVIOUR IS RESTORED: AN UNMEASURABLE SETTLEMENT WITHHOLDS, WHATEVER ID
-        // ANY ROW OF OURS RECORDS. The permanent hold is real and is now tracked as its own problem
-        // (bd o3d-llyw) with the full cost of a sound exclusion written down. The trade is the one
-        // `classifyLedgerSettlement` has always stated: the cost of holding a genuine payment back
-        // is a visible refusal with a nameable remedy, and the cost of the alternative is a second
-        // payment on somebody's ledger, which is neither visible nor remediable.
+        {
+          attemptSyncLogId: attempt.id ?? '',
+          paymentId: input.paymentId,
+          connector: input.connector ?? '',
+          ledgerDocumentId: input.accountingInvoiceId,
+        },
+        input.operatorLedgerChecks ?? [],
       )
+      const verdict = judged.verdict
       if (verdict.outcome === 'clear') {
-        // The ledger was asked and does not hold this attempt. That — and not its status — is what
-        // frees the capacity it would otherwise consume.
+        // The ledger was asked and does not hold this attempt — or, where an unmeasurable record stood
+        // in the way, a person checked those records under the rule above. That — and not its status —
+        // is what frees the capacity it would otherwise consume.
         provedAbsent.add(attempt)
+        for (const id of judged.liftedByCheckIds) liftedByCheckIds.add(id)
         continue
       }
       return {
@@ -530,6 +602,18 @@ export function decideInvoicePaymentRegistration(input: {
         detail: verdict.outcome === 'present'
           ? `the ledger already holds ${verdict.detail}, which matches an earlier ${attempt.status} attempt`
           : verdict.reason,
+        ...(judged.remedy
+          ? {
+              ledgerCheckRemedy: describeLedgerCheckRemedy(judged.remedy, describeAttemptForLedgerCheck({
+                syncLogId: attempt.id ?? '(unidentified entry)',
+                status: attempt.status,
+                amount: description.amount === null ? null : formatLedgerMoney(description.amount),
+                currency: description.currency,
+                date: description.date,
+                marker: description.marker,
+              })),
+            }
+          : {}),
       }
     }
   }
@@ -652,7 +736,9 @@ export function decideInvoicePaymentRegistration(input: {
   if (compareDecimal(input.paymentAmount, addMoney(remaining, ledgerAmountEpsilon(input.orderCurrency))) > 0) {
     return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered, ledgerTotal: input.ledgerTotal }
   }
-  return { register: true, bankAccountId: input.bankAccountId }
+  return liftedByCheckIds.size > 0
+    ? { register: true, bankAccountId: input.bankAccountId, liftedByCheckIds: [...liftedByCheckIds].sort() }
+    : { register: true, bankAccountId: input.bankAccountId }
 }
 
 /**
