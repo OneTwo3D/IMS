@@ -261,7 +261,7 @@ function runCronCommand(dir: string, command: string, env: Record<string, string
   const stdinLog = join(dir, 'curl-stdin.log')
   writeFileSync(join(bin, 'curl'), ['#!/bin/sh', `echo "curl $*" >> ${JSON.stringify(argvLog)}`, `cat >> ${JSON.stringify(stdinLog)}`].join('\n') + '\n')
   chmodSync(join(bin, 'curl'), 0o755)
-  const sh = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8', env: { PATH: `${bin}:/usr/bin:/bin`, BASE_URL: 'http://localhost:3000/api/cron', ...env } })
+  const sh = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, BASE_URL: 'http://localhost:3000/api/cron', CRON_SECRET: '', ...env } })
   const read = (f: string) => { try { return readFileSync(f, 'utf8') } catch { return '' } }
   void sh
   return { argv: read(argvLog), stdin: read(stdinLog), log: read(join(dir, 'cron.log')), ran: read(argvLog) !== '' }
