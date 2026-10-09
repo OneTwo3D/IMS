@@ -1,3 +1,4 @@
+import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
@@ -29,12 +30,10 @@ import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type Decima
  * The guard is ADVISORY by owner decision (measure first): it never changes or blocks a payload.
  */
 
-/** Decimals the push payload rounds its shipping, discount and VAT totals to, regardless of currency. */
-export const PAYLOAD_TOTALS_DECIMALS = 2
-
 /** The plugin's absolute ceiling on accumulated rounding drift, in minor units (13p for GBP). */
 export const MAX_ROUNDING_BOUND_MINOR_UNITS = 13
 
+export { PAYLOAD_TOTALS_DECIMALS } from '@/lib/connectors/wms/transmitted-money'
 export { PUSH_TOTAL_MISMATCH_OPERATOR_NOTE } from './push-total-mismatch-note'
 
 export type PushTotalsInput = {
@@ -94,10 +93,10 @@ export function reconcilePushTotals(input: PushTotalsInput): PushTotalsVerdict {
   const { currency, payload } = input
   const precision = currencyMinorUnits(currency)
   const unit = toDecimal(10).pow(-precision)
-  // The warehouse push payload rounds its shipping, discount and VAT totals to TWO decimals whatever the order
-  // currency (as the plugin it mirrors does), so a 3dp VAT of 0.004 is transmitted as 0.00. The guard compares
-  // what is TRANSMITTED, not what the order holds; tests tie this constant to the real payload builder.
-  const money = (v: DecimalInput) => roundQuantity(v, PAYLOAD_TOTALS_DECIMALS)
+  // The payload rounds its shipping, discount and VAT totals with the connector's own function (shared, so
+  // the two cannot diverge): float Math.round to 2dp whatever the order currency. The guard takes the OUTPUT of
+  // that function and does its arithmetic on it in Decimal; it never re-rounds the input itself.
+  const money = (v: number) => toDecimal(roundTransmittedMoney(v))
 
   const goodsNet = sumDecimals(payload.lines.map((l) => toDecimal(l.quantity).mul(toDecimal(l.unitPriceExVat))))
   const goodsVat = sumDecimals(payload.lines.map((l) => toDecimal(l.quantity).mul(toDecimal(l.unitPriceVat))))

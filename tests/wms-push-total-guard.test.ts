@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { roundQuantity } from '../lib/domain/math/decimal.ts'
 import { buildPushPayload } from '../lib/connectors/mintsoft/api/order-push.ts'
 import { buildPushInput, payloadTotalMismatchPence } from '../lib/domain/wms/order-push-sweep.ts'
 import {
@@ -80,6 +81,22 @@ const FIXTURES: Fixture[] = [
   // JPY with a fractional shipping figure the connector would transmit as 0.50: 1000 + 0.50 + 100 = 1100.50
   // against 1101: 0.50 yen => driftMinor rounds to 1 (HALF_UP), inside the 2.5 bound => WITHIN_ROUNDING.
   { name: 'JPY (0dp): fractional shipping 0.5 sent as 0.50, half a yen short', currency: 'JPY', lines: [L('a', 1, 1000, 100)], shippingForeign: 0.5, taxForeign: 100, totalForeign: 1101, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 1 },
+  // FLOAT-BOUNDARY shipping. The payload rounds with float Math.round: 4.015 is stored just below the half, so it
+  // SENDS 4.01 (exact decimal half-up would say 4.02). One 10.00 line, no VAT, order total = 10 + half-up shipping.
+  // Hand derivation: sent = 10.00 + 4.01 = 14.01 against 14.02 => 1p out; amounts in the comparison: line net,
+  // shipping, VAT total, order total = 4 => bound 2p => 1p is WITHIN_ROUNDING (not RECONCILED).
+  { name: 'FLOAT shipping 4.015 is SENT as 4.01 (half-up would say 4.02): 1p short', lines: [L('a', 1, 10, 0)], shippingForeign: 4.015, taxForeign: 0, totalForeign: 14.02, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 1 },
+  // 2.135 -> sent 2.13 (half-up 2.14): 10 + 2.13 = 12.13 vs 12.14.
+  { name: 'FLOAT shipping 2.135 is SENT as 2.13 (half-up would say 2.14): 1p short', lines: [L('a', 1, 10, 0)], shippingForeign: 2.135, taxForeign: 0, totalForeign: 12.14, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 1 },
+  // 4.145 -> sent 4.14 (half-up 4.15): 10 + 4.14 = 14.14 vs 14.15.
+  { name: 'FLOAT shipping 4.145 is SENT as 4.14 (half-up would say 4.15): 1p short', lines: [L('a', 1, 10, 0)], shippingForeign: 4.145, taxForeign: 0, totalForeign: 14.15, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 1 },
+  // 4.025 and 1.005 are the boundary values where the float rounding AGREES with half-up (Number.EPSILON nudges
+  // them over the half): sent 4.03 / 1.01, so the order totals 14.03 / 11.01 reconcile.
+  { name: 'FLOAT shipping 4.025 is sent as 4.03, agreeing with half-up: reconciles', lines: [L('a', 1, 10, 0)], shippingForeign: 4.025, taxForeign: 0, totalForeign: 14.03, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
+  { name: 'FLOAT shipping 1.005 is sent as 1.01, agreeing with half-up: reconciles', lines: [L('a', 1, 10, 0)], shippingForeign: 1.005, taxForeign: 0, totalForeign: 11.01, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
+  // 0.005 -> float 0.5 exactly => Math.round gives 1 => sent 0.01, AGREEING with half-up: 10 + 0.01 = 10.01.
+  { name: 'FLOAT shipping 0.005 is sent as 0.01, agreeing with half-up: reconciles', lines: [L('a', 1, 10, 0)], shippingForeign: 0.005, taxForeign: 0, totalForeign: 10.01, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
+  { name: 'shipping 4.01 (no rounding needed) reconciles', lines: [L('a', 1, 10, 0)], shippingForeign: 4.01, taxForeign: 0, totalForeign: 14.01, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
 ]
 
 /**
@@ -160,7 +177,7 @@ for (const f of FIXTURES) {
 test('census: every fixture ran, and each accepted fixture honours sum(lines)+shipping-discount+VAT == total within its bound', () => {
   console.log(`# census (${ran}/${FIXTURES.length} fixtures):\n# ${census.join('\n# ')}`)
   assert.equal(ran, FIXTURES.length)
-  assert.ok(FIXTURES.length >= 20)
+  assert.ok(FIXTURES.length >= 27)
   const flagged = FIXTURES.filter((f) => f.expectStatus === 'MISMATCH').length
   const accepted = FIXTURES.length - flagged
   console.log(`# precondition: ${accepted} accepted fixtures, ${flagged} flagged fixtures`)
@@ -255,4 +272,19 @@ test('the guard\'s transmitted-precision constant matches what the real payload 
   assert.equal(sent.ShippingTotalExVat, 0)
   assert.equal(sent.DiscountTotalExVat, 0)
   assert.equal(buildPushPayload({ ...input, totalVat: 0.005 }, { kind: 'name' }).TotalVat, 0.01)
+})
+
+test('the float-boundary fixtures DISCRIMINATE: exact decimal half-up and the transmitted rounding disagree on them', () => {
+  const cases: Array<[number, number]> = [[4.015, 4.01], [2.135, 2.13], [4.145, 4.14]]
+  for (const [stored, sent] of cases) {
+    const payloadValue = buildPushPayload({ ...buildPushInput(runFixture(FIXTURES[0]).order, '301'), shippingExVat: stored }, { kind: 'name' }).ShippingTotalExVat
+    const halfUp = roundQuantity(stored, 2).toNumber()
+    console.log(`# precondition: stored ${stored} sent ${String(payloadValue)} half-up ${halfUp}`)
+    assert.equal(payloadValue, sent)
+    assert.notEqual(halfUp, payloadValue)
+  }
+  for (const stored of [0.005, 4.025, 1.005]) {
+    const agree = buildPushPayload({ ...buildPushInput(runFixture(FIXTURES[0]).order, '301'), shippingExVat: stored }, { kind: 'name' }).ShippingTotalExVat
+    assert.equal(agree, roundQuantity(stored, 2).toNumber(), `control: ${stored} agrees`)
+  }
 })
