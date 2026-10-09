@@ -36,6 +36,7 @@
     "rehearse:woo-import": "tsx scripts/rehearse-woo-import.ts",
     "outbound:status": "tsx scripts/outbound-status.ts",
     "read-sync:status": "tsx scripts/read-sync-status.ts",
+    "readiness:gate": "tsx scripts/readiness-gate.ts",
     "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",
     "inventory:snapshots:backfill": "tsx scripts/backfill-inventory-snapshots.ts",
     "wc:coupon-discount:backfill": "tsx scripts/backfill-wc-coupon-order-discount.ts",

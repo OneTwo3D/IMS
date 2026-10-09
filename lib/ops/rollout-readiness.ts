@@ -1,3 +1,4 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import {
   HEALTH_NO_STORE_HEADERS,
@@ -13,6 +14,12 @@ import {
   type PreflightResult,
   type PreflightStatus,
 } from '@/lib/ops/production-preflight'
+import {
+  evaluateReconciliationProof,
+  mergeTiedNewestRuns,
+  type ReconciliationHistory,
+  type ReconciliationProof,
+} from '@/lib/ops/reconciliation-proof'
 
 type JsonPrimitive = string | number | boolean | null
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
@@ -21,6 +28,20 @@ const ROLLOUT_READINESS_RESPONSE_VERSION = 1 as const
 const DEFAULT_READINESS_TIMEOUT_MS = 10_000
 const DEFAULT_READINESS_CACHE_TTL_MS = 30_000
 const TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES = ['COMPLETED', 'FAILED', 'PARTIAL'] as const
+/**
+ * o3d-6e4v — HOW OLD THE NEWEST RECONCILIATION RUN MAY BE BEFORE ITS ANSWER IS NOT TODAY'S ANSWER.
+ *
+ * Reconciliation is run by an operator (POST /api/admin/accounting/reconciliation), not on a schedule, so
+ * there is no cadence to derive this from. Seven days is a CHOSEN default, stated here as one: it is the
+ * longest a clean answer is read as current. A run older than this is a WARNING, not a blocker — the
+ * remedy is simply to run reconciliation — and it is reported with its age so the choice is visible.
+ */
+export const ROLLOUT_RECONCILIATION_MAX_AGE_DAYS = 7
+/**
+ * How many recorded runs the completeness reader will evaluate after the oldest unresolved truncation.
+ * Past it the history is reported as UNEVALUATED (a blocker) rather than read partially as clean.
+ */
+export const RECONCILIATION_HISTORY_READ_LIMIT = 5_000
 const BLOCKING_CRON_JOBS = new Set([
   'account-balance-snapshot',
   'accounting-daily-batch',
@@ -50,7 +71,9 @@ export type RolloutReadinessFinding = {
   details?: Record<string, JsonValue>
 }
 
-export type AccountingReconciliationRunStatus = typeof TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES[number]
+/** The statuses this build writes. A run row may carry ANY string (RUNNING, QUEUED, a future status): everything but COMPLETED blocks. */
+export type AccountingReconciliationRunStatus = string
+export const KNOWN_ACCOUNTING_RECONCILIATION_RUN_STATUSES = TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES
 
 export type LatestAccountingReconciliationRun = {
   id: string
@@ -59,6 +82,16 @@ export type LatestAccountingReconciliationRun = {
   warningCount: number
   criticalCount: number
   createdAt: string
+  /**
+   * o3d-6e4v: the run's interval and its RAW truncation record. The gate never reads `truncations` itself —
+   * it hands it to evaluateReconciliationProof, which interprets it only through
+   * readReconciliationCompleteness. Absent (undefined) is read as NULL: not recorded.
+   */
+  fromDate?: string | null
+  toDate?: string | null
+  truncations?: unknown
+  /** Every run that shares this run's createdAt (it is the worst of them); more than one means the order is unprovable. */
+  tiedRunIds?: string[]
 }
 
 export type RolloutReadinessResponse = {
@@ -85,6 +118,8 @@ export type RolloutReadinessResponse = {
     }
     adminHealth: AdminHealthResponse
     latestAccountingReconciliationRun: LatestAccountingReconciliationRun | null
+    /** o3d-6e4v: whether the reconciliation is PROVEN complete across its history, and if not, why. */
+    accountingReconciliationProof: ReconciliationProof | null
   }
 }
 
@@ -92,7 +127,12 @@ export type RolloutReadinessAdapters = {
   now: () => Date
   runPreflight: () => Promise<PreflightResult>
   collectAdminHealth: () => Promise<AdminHealthResponse>
-  latestAccountingReconciliationRun: () => Promise<LatestAccountingReconciliationRun | null>
+  /**
+   * o3d-6e4v: the newest run AND the history its completeness proof quantifies over, read in ONE consistent snapshot
+   * (see getAccountingReconciliationSnapshot). Two separate reads let a reconciliation that lands between them
+   * cover the run the first read called newest, which then reads as proven-incomplete with nothing to say why.
+   */
+  accountingReconciliationSnapshot: () => Promise<AccountingReconciliationSnapshot>
 }
 
 export type CollectRolloutReadinessOptions = {
@@ -112,7 +152,7 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
     now: () => new Date(),
     runPreflight: () => runProductionPreflight(),
     collectAdminHealth: () => collectAdminHealth(),
-    latestAccountingReconciliationRun: getLatestAccountingReconciliationRun,
+    accountingReconciliationSnapshot: () => getAccountingReconciliationSnapshot(),
   }
 }
 
@@ -152,10 +192,10 @@ export async function collectRolloutReadiness(
   const timeoutMs = options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS
   const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_READINESS_CACHE_TTL_MS
   const staleAfter = new Date(now.getTime() + cacheTtlMs).toISOString()
-  const [preflightResult, adminHealthResult, reconciliationResult] = await Promise.all([
+  const [preflightResult, adminHealthResult, reconciliation] = await Promise.all([
     settleReadinessAdapter('production-preflight', adapters.runPreflight(), timeoutMs),
     settleReadinessAdapter('admin-health', adapters.collectAdminHealth(), timeoutMs),
-    settleReadinessAdapter('accounting-reconciliation', adapters.latestAccountingReconciliationRun(), timeoutMs),
+    collectAccountingReconciliationReadiness(adapters, now, timeoutMs),
   ])
 
   const blockers: RolloutReadinessFinding[] = []
@@ -166,23 +206,13 @@ export async function collectRolloutReadiness(
   const adminHealth = adminHealthResult.ok
     ? adminHealthResult.value
     : unavailableAdminHealth(checkedAt, adminHealthResult.error)
-  const latestAccountingReconciliationRun = reconciliationResult.ok
-    ? reconciliationResult.value
-    : null
-
-  if (!reconciliationResult.ok) {
-    warnings.push({
-      id: 'readiness-adapter:accounting-reconciliation',
-      severity: 'warning',
-      source: 'rollout-readiness',
-      message: 'Accounting reconciliation readiness check failed or timed out.',
-      details: { error: summarizeReadinessError(reconciliationResult.error) },
-    })
-  }
 
   classifyPreflight(preflight, blockers, warnings)
   classifyAdminHealth(adminHealth, blockers, warnings)
-  classifyAccountingReconciliation(latestAccountingReconciliationRun, blockers, warnings)
+  blockers.push(...reconciliation.blockers)
+  warnings.push(...reconciliation.warnings)
+  const latestAccountingReconciliationRun = reconciliation.latest
+  const accountingReconciliationProof = reconciliation.proof
 
   const status: RolloutReadinessStatus = blockers.length > 0
     ? 'blocked'
@@ -214,8 +244,73 @@ export async function collectRolloutReadiness(
       },
       adminHealth,
       latestAccountingReconciliationRun,
+      accountingReconciliationProof,
     },
   })
+}
+
+export type AccountingReconciliationSnapshot = {
+  latest: LatestAccountingReconciliationRun | null
+  /** The history read in the SAME snapshot as `latest`, or why it could not be read. */
+  history: ReconciliationHistory | { unreadable: string }
+}
+
+export type AccountingReconciliationReadiness = {
+  latest: LatestAccountingReconciliationRun | null
+  proof: ReconciliationProof | null
+  blockers: RolloutReadinessFinding[]
+  warnings: RolloutReadinessFinding[]
+}
+
+/**
+ * o3d-6e4v: EVERYTHING THE READINESS VERDICT SAYS ABOUT THE ACCOUNTING RECONCILIATION, in one place so the
+ * HTTP endpoint and the executable go/no-go gate (lib/ops/readiness-gate-collect.ts) read the same answer
+ * from the same code instead of two copies of it.
+ *
+ * Completeness is a question about the HISTORY, asked separately from the newest run's status and counts.
+ * An adapter that fails is never read as "no run" or "clean": the newest run being unreadable and the
+ * history being unreadable are both blockers, because the only thing this establishes is a proof and there
+ * is none. (Before o3d-6e4v an unreadable newest-run read was a WARNING, which `?allowWarnings=true`
+ * converts to HTTP 200.)
+ */
+export async function collectAccountingReconciliationReadiness(
+  adapters: Pick<RolloutReadinessAdapters, 'accountingReconciliationSnapshot'>,
+  now: Date,
+  timeoutMs: number = DEFAULT_READINESS_TIMEOUT_MS,
+): Promise<AccountingReconciliationReadiness> {
+  const blockers: RolloutReadinessFinding[] = []
+  const warnings: RolloutReadinessFinding[] = []
+  const snapshotResult = await settleReadinessAdapter('accounting-reconciliation', adapters.accountingReconciliationSnapshot(), timeoutMs)
+  if (!snapshotResult.ok) {
+    blockers.push({
+      id: 'readiness-adapter:accounting-reconciliation',
+      severity: 'blocker',
+      source: 'rollout-readiness',
+      message: 'Accounting reconciliation readiness check failed or timed out, so whether the reconciliation is complete was not established.',
+      details: { error: summarizeReadinessError(snapshotResult.error) },
+    })
+    return { latest: null, proof: null, blockers, warnings }
+  }
+  const { latest, history } = snapshotResult.value
+  classifyAccountingReconciliation(latest, blockers, warnings)
+
+  let proof: ReconciliationProof | null = null
+  if (latest) {
+    if ('unreadable' in history) {
+      blockers.push({
+        id: 'accounting-reconciliation:completeness-unevaluated',
+        severity: 'blocker',
+        source: 'accounting-reconciliation',
+        message: 'Whether the accounting reconciliation is complete could not be established: its run history could not be read.',
+        details: { error: history.unreadable },
+      })
+    } else {
+      proof = evaluateReconciliationProof(latest, history)
+      classifyReconciliationProof(proof, blockers, warnings)
+    }
+    classifyReconciliationAge(latest, now, warnings)
+  }
+  return { latest, proof, blockers, warnings }
 }
 
 export function createRolloutReadinessHandler({
@@ -239,29 +334,134 @@ export function createRolloutReadinessHandler({
   }
 }
 
-async function getLatestAccountingReconciliationRun(): Promise<LatestAccountingReconciliationRun | null> {
-  const latest = await db.accountingReconciliationRun.findFirst({
-    where: {
-      status: {
-        in: [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES],
-      },
-    },
-    orderBy: { createdAt: 'desc' },
-    select: {
-      id: true,
-      status: true,
-      totalCount: true,
-      warningCount: true,
-      criticalCount: true,
-      createdAt: true,
-    },
-  })
+type ReconciliationRunReader = ReconciliationHistoryClient
 
-  if (!latest) return null
+/**
+ * The newest run, of ANY status: a RUNNING, queued or unrecognised row newer than the newest finished run is the newest
+ * run, and blocks (it is not skipped to find an older clean one). When several runs share the greatest createdAt they are ALL read and merged as their worst
+ * member (lib/ops/reconciliation-proof.ts, THE TIE RULE): `findFirst ... orderBy createdAt` picks one of them arbitrarily,
+ * and a COMPLETED pick over a PARTIAL tie reads as ready without assessing the run that should block.
+ * Raw SQL so the JSON `null` / SQL NULL distinction of `truncations` survives, as in the history reader.
+ */
+async function readLatestAccountingReconciliationRun(client: ReconciliationRunReader): Promise<LatestAccountingReconciliationRun | null> {
+  const rows = await client.$queryRaw<Array<{
+    id: string; status: string; totalCount: number; warningCount: number; criticalCount: number
+    createdAt: Date; fromDate: Date | null; toDate: Date | null; truncations: unknown; payloadType: string | null
+  }>>`
+    SELECT "id", "status", "totalCount", "warningCount", "criticalCount", "createdAt", "fromDate", "toDate", "truncations",
+           jsonb_typeof("truncations") AS "payloadType"
+    FROM "accounting_reconciliation_runs"
+    WHERE "createdAt" = (SELECT MAX("createdAt") FROM "accounting_reconciliation_runs")
+    ORDER BY "id" ASC
+  `
+  if (rows.length === 0) return null
+  const members = rows.map((row) => ({
+    ...row,
+    truncations: row.payloadType === 'null' ? { unreadable: 'json-null' } : row.truncations,
+  }))
+  const merged = mergeTiedNewestRuns(members)
   return {
-    ...latest,
-    status: latest.status as AccountingReconciliationRunStatus,
-    createdAt: latest.createdAt.toISOString(),
+    id: merged.id,
+    status: merged.status as AccountingReconciliationRunStatus,
+    totalCount: members.reduce((sum, member) => sum + Number(member.totalCount), 0),
+    warningCount: members.reduce((sum, member) => sum + Number(member.warningCount), 0),
+    criticalCount: members.reduce((sum, member) => sum + Number(member.criticalCount), 0),
+    createdAt: merged.createdAt.toISOString(),
+    fromDate: merged.fromDate?.toISOString() ?? null,
+    toDate: merged.toDate?.toISOString() ?? null,
+    truncations: merged.truncations,
+    tiedRunIds: merged.tiedRunIds,
+  }
+}
+
+/**
+ * o3d-6e4v: THE NEWEST RUN AND ITS HISTORY IN ONE SNAPSHOT. A single REPEATABLE READ transaction whose first statement
+ * reads the newest run, so the history is read from the same point in time. Read separately, a reconciliation that
+ * completes between the two reads can cover the run the first read called newest: the proof then says "not proven,
+ * newest run truncated" with no unresolved entry, and (before every not-proven state became a blocker) no finding.
+ * `afterLatestRead` is a seam for the interleaving test: it runs between the two reads.
+ */
+export async function getAccountingReconciliationSnapshot(
+  options: { afterLatestRead?: () => Promise<void>; client?: { $transaction: typeof db.$transaction } } = {},
+): Promise<AccountingReconciliationSnapshot> {
+  const client = options.client ?? db
+  return client.$transaction(async (tx) => {
+    const latest = await readLatestAccountingReconciliationRun(tx)
+    await options.afterLatestRead?.()
+    if (!latest) return { latest: null, history: { runs: [], overflow: false, recordedBeforeNewest: false } }
+    try {
+      return { latest, history: await getAccountingReconciliationHistory(latest, tx) }
+    } catch (error) {
+      return { latest, history: { unreadable: summarizeReadinessError(error) } }
+    }
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, maxWait: 10_000, timeout: 30_000 })
+}
+
+/**
+ * o3d-6e4v — THE RUNS THE COMPLETENESS PROOF QUANTIFIES OVER.
+ *
+ * 1. The OLDEST run whose record is truncated (a non-empty array) or unreadable (non-NULL and not an
+ *    array). If none exists, no truncation needs covering and only the newest run's own record matters.
+ * 2. Every run with a non-NULL record created at or after it, oldest first — the only runs that can cover
+ *    it. NULL rows are left out: they make no statement, and cannot cover anything.
+ * One statement, so no timestamp crosses the driver between them (`createdAt` is a zone-less timestamp,
+ * and a round-tripped Date could be re-read in the session's zone).
+ * Bounded by RECONCILIATION_HISTORY_READ_LIMIT; one more is read so that overflow is detected, never
+ * guessed. Rows of EVERY status are read (only COMPLETED may cover; see COVERING_RUN_STATUSES).
+ */
+export type ReconciliationHistoryClient = {
+  $queryRaw: typeof db.$queryRaw
+}
+
+export async function getAccountingReconciliationHistory(
+  newest: LatestAccountingReconciliationRun,
+  client: ReconciliationHistoryClient = db,
+): Promise<ReconciliationHistory> {
+  const recordedBefore = await client.$queryRaw<Array<{ found: boolean }>>`
+    SELECT EXISTS (
+      SELECT 1 FROM "accounting_reconciliation_runs"
+      WHERE "truncations" IS NOT NULL
+        AND "createdAt" < (SELECT "createdAt" FROM "accounting_reconciliation_runs" WHERE "id" = ${newest.id})
+    ) AS "found"
+  `
+  const recordedBeforeNewest = recordedBefore[0]?.found === true
+
+  // Raw SQL rather than findMany: Prisma hands back a JSON `null` payload as JS `null`, which is exactly
+  // what an SQL NULL looks like — and the two mean different things here. SQL NULL is "not recorded"; a
+  // JSON null is a non-NULL record that is not an array, i.e. UNREADABLE. `jsonb_typeof` tells them apart,
+  // and a JSON null is passed on as a value readReconciliationCompleteness reads as unreadable.
+  const rows = await client.$queryRaw<Array<{
+    id: string; status: string; createdAt: Date; fromDate: Date | null; toDate: Date | null; truncations: unknown; payloadType: string
+  }>>`
+    WITH "oldestUnproven" AS (
+      SELECT "createdAt"
+      FROM "accounting_reconciliation_runs"
+      WHERE "truncations" IS NOT NULL
+        -- CASE, not OR: SQL does not promise to short-circuit, and jsonb_array_length ERRORS on a
+        -- non-array, which is precisely the unreadable row this must find.
+        AND CASE WHEN jsonb_typeof("truncations") = 'array' THEN jsonb_array_length("truncations") > 0 ELSE true END
+      ORDER BY "createdAt" ASC, "id" ASC
+      LIMIT 1
+    )
+    SELECT "id", "status", "createdAt", "fromDate", "toDate", "truncations", jsonb_typeof("truncations") AS "payloadType"
+    FROM "accounting_reconciliation_runs"
+    WHERE "truncations" IS NOT NULL
+      -- No unproven run: the subquery is empty, the comparison is NULL, and nothing is returned.
+      AND "createdAt" >= (SELECT "createdAt" FROM "oldestUnproven")
+    ORDER BY "createdAt" ASC, "id" ASC
+    LIMIT ${RECONCILIATION_HISTORY_READ_LIMIT + 1}
+  `
+  return {
+    runs: rows.slice(0, RECONCILIATION_HISTORY_READ_LIMIT).map((row) => ({
+      id: row.id,
+      status: row.status,
+      createdAt: row.createdAt.toISOString(),
+      fromDate: row.fromDate?.toISOString() ?? null,
+      toDate: row.toDate?.toISOString() ?? null,
+      truncations: row.payloadType === 'null' ? { unreadable: 'json-null' } : row.truncations,
+    })),
+    overflow: rows.length > RECONCILIATION_HISTORY_READ_LIMIT,
+    recordedBeforeNewest,
   }
 }
 
@@ -776,6 +976,136 @@ function classifyAccountingReconciliation(
           details,
         })
       }
+      return
+    default:
+      blockers.push({
+        id: 'accounting-reconciliation:in-progress-or-unrecognised',
+        severity: 'blocker',
+        source: 'accounting-reconciliation',
+        message: latest.status === 'RUNNING' || latest.status === 'QUEUED' || latest.status === 'PENDING'
+          ? 'A reconciliation run is in progress (or was left unfinished), so the newest run does not yet prove anything. Wait for it to finish or run reconciliation again.'
+          : `The newest accounting reconciliation run has a status this check does not recognise (${JSON.stringify(latest.status)}), so it cannot prove the reconciliation complete.`,
+        details,
+      })
+  }
+}
+
+/**
+ * o3d-6e4v — WHAT THE COMPLETENESS PROOF COSTS THE VERDICT. See lib/ops/reconciliation-proof.ts for why each
+ * state has the severity it has; in short, the two that are the data's own statement of loss (truncated,
+ * unreadable) are blockers, because `?allowWarnings=true` makes any warning HTTP 200 without a record.
+ */
+export function classifyReconciliationProof(
+  proof: ReconciliationProof,
+  blockers: RolloutReadinessFinding[],
+  warnings: RolloutReadinessFinding[],
+): void {
+  if (proof.state === 'proven') return
+  const blockersBefore = blockers.length
+  const shown = proof.unresolved.slice(0, 20).map((entry) => ({
+    runId: entry.runId,
+    createdAt: entry.createdAt,
+    fromDate: entry.fromDate,
+    toDate: entry.toDate,
+    code: entry.code,
+  }))
+  const truncated = proof.unresolved.filter((entry) => entry.code !== '*')
+  const unreadable = proof.unresolved.filter((entry) => entry.code === '*')
+  if (truncated.length > 0) {
+    blockers.push({
+      id: 'accounting-reconciliation:truncation-unresolved',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message:
+        `${truncated.length} accounting reconciliation truncation(s) are not covered by a later complete run: a run `
+        + 'reported that it omitted findings, and no later run that completed that check has examined the same '
+        + 'period. Run reconciliation with a lookback that reaches back past the earliest one listed.',
+      details: { unresolved: shown.filter((entry) => entry.code !== '*'), total: truncated.length },
+    })
+  }
+  if (unreadable.length > 0) {
+    blockers.push({
+      id: 'accounting-reconciliation:completeness-unreadable',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message:
+        `${unreadable.length} accounting reconciliation run(s) carry a completeness record this build cannot read, `
+        + 'and no later complete run covers their period.',
+      details: { unresolved: shown.filter((entry) => entry.code === '*'), total: unreadable.length },
+    })
+  }
+  if (proof.overflow) {
+    blockers.push({
+      id: 'accounting-reconciliation:completeness-unevaluated',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message:
+        `The accounting reconciliation history after the oldest unresolved truncation holds more than `
+        + `${RECONCILIATION_HISTORY_READ_LIMIT} runs, so whether it is complete was not established.`,
+    })
+  }
+  if (proof.newest === 'not-recorded') {
+    const finding: RolloutReadinessFinding = {
+      id: 'accounting-reconciliation:completeness-not-recorded',
+      severity: proof.notRecordedAfterRecording ? 'blocker' : 'warning',
+      source: 'accounting-reconciliation',
+      message: proof.notRecordedAfterRecording
+        ? 'The newest accounting reconciliation run did not record whether it was complete, although earlier runs '
+          + 'did: the build that wrote it is not recording completeness. Run reconciliation again on this build.'
+        : 'The newest accounting reconciliation run predates completeness recording, so whether it was complete '
+          + 'is unknown. Run reconciliation again on this build.',
+    }
+    ;(proof.notRecordedAfterRecording ? blockers : warnings).push(finding)
+  }
+  if (proof.newestNotCompleted) {
+    blockers.push({
+      id: 'accounting-reconciliation:newest-run-not-completed',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message: 'The newest accounting reconciliation run did not complete (it failed, is partial, is still running or has a status this build does not know), so it does not prove the reconciliation complete.',
+    })
+  }
+  // The newest run's OWN record says it omitted findings (or cannot be read) and nothing above named it, so say so.
+  if ((proof.newest === 'truncated' || proof.newest === 'unreadable') && proof.unresolved.length === 0) {
+    blockers.push({
+      id: 'accounting-reconciliation:newest-run-incomplete',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message: `The newest accounting reconciliation run recorded that its report is ${proof.newest === 'truncated' ? 'truncated' : 'unreadable'}, so it does not prove the reconciliation complete.`,
+    })
+  }
+  // CLOSED TABLE. A not-proven proof is acceptable WITHOUT a blocker in exactly one shape: the newest run predates
+  // completeness recording and nothing else is wrong (a warning, above). Every other not-proven state that has not
+  // already produced a blocker in this call is itself a blocker, so a state this function does not know how to explain
+  // can never read as ready.
+  const onlyNotRecorded = proof.newest === 'not-recorded' && proof.unresolved.length === 0 && !proof.overflow && !proof.notRecordedAfterRecording && !proof.newestNotCompleted
+  if (!onlyNotRecorded && blockers.length === blockersBefore) {
+    blockers.push({
+      id: 'accounting-reconciliation:completeness-unclassified',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message: 'The accounting reconciliation is not proven complete, for a reason this check does not classify. It is treated as a blocker.',
+      details: { newest: proof.newest, unresolved: proof.unresolved.length, overflow: proof.overflow, notRecordedAfterRecording: proof.notRecordedAfterRecording, newestNotCompleted: proof.newestNotCompleted },
+    })
+  }
+}
+
+/** o3d-6e4v: the newest run's answer is today's only if it is recent (ROLLOUT_RECONCILIATION_MAX_AGE_DAYS). */
+function classifyReconciliationAge(
+  latest: LatestAccountingReconciliationRun,
+  now: Date,
+  warnings: RolloutReadinessFinding[],
+): void {
+  const ageMs = now.getTime() - Date.parse(latest.createdAt)
+  const maxAgeMs = ROLLOUT_RECONCILIATION_MAX_AGE_DAYS * 24 * 60 * 60 * 1000
+  if (!Number.isFinite(ageMs) || ageMs > maxAgeMs) {
+    warnings.push({
+      id: 'accounting-reconciliation:stale',
+      severity: 'warning',
+      source: 'accounting-reconciliation',
+      message: `The newest accounting reconciliation run is older than ${ROLLOUT_RECONCILIATION_MAX_AGE_DAYS} days. Run reconciliation again.`,
+      details: { id: latest.id, createdAt: latest.createdAt, maxAgeDays: ROLLOUT_RECONCILIATION_MAX_AGE_DAYS },
+    })
   }
 }
 

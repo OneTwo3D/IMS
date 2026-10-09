@@ -1402,7 +1402,7 @@ This table is the only place the codes are documented; `REHEARSAL_EXIT` in `lib/
 
 ### The readiness report
 
-Two files per run, `readiness-report.json` and `readiness-report.md`, under `<report-dir>/<run id>/` (the Markdown is also printed). Both are written under temporary names and renamed into place with the JSON last; if either write fails, everything is removed and an amended RED pair is attempted, so no GREEN file ever sits beside a failed one. A run interrupted by SIGINT/SIGTERM is RED even if every step that ran passed. The JSON carries `verdict`, `exitCode`, one entry per step (`id`, `item`, `required`, `status`, `reason`, `detail`) and the `teardown` record; a consumer needs only `verdict === "GREEN"` and, for the detail, `steps[].status`.
+Two files per run, `readiness-report.json` and `readiness-report.md`, under `<report-dir>/<run id>/` (the Markdown is also printed). Both are written under temporary names and renamed into place with the JSON last; if either write fails, everything is removed and an amended RED pair is attempted, so no GREEN file ever sits beside a failed one. A run interrupted by SIGINT/SIGTERM is RED even if every step that ran passed. The JSON carries `schemaVersion` (2: the report records the build it rehearsed), `build` (the git `commit`, source `tree` and whether the checkout was `clean`; null when git could not say, which the readiness gate refuses), `verdict`, `exitCode`, one entry per step (`id`, `item`, `required`, `status`, `reason`, `detail`) and the `teardown` record; a consumer needs only `verdict === "GREEN"` and, for the detail, `steps[].status`.
 
 | Item | Step | What a PASS means |
 | --- | --- | --- |
@@ -1432,7 +1432,116 @@ It runs in a `finally`, whether a step failed, a step threw, or the cluster neve
 
 ### How it feeds the go/no-go gate
 
-The go/no-go gate (o3d-zjsb5.18) wants evidence that a fresh install of **this build** provisions cleanly and that a backup taken before any load restores to an identical database. A GREEN report from the commit being deployed is that evidence for items 1–7 and 9; item 8 joins it once the outbound hold exists. Attach the JSON, not a paraphrase of it. The rehearsal does not replace the gate's data checks (the invariant preflight against the **real** database, the reconciliation pack) and says nothing about the real host: `install.sh`, the service account, nginx and the production `.env` are outside it.
+The go/no-go gate (`npm run readiness:gate`, next section) wants evidence that a fresh install of **this build** provisions cleanly and that a backup taken before any load restores to an identical database. A GREEN report from the commit being deployed is that evidence for items 1-7, 8 and 9. The gate reads the **newest** report in the rehearsal report directory, checks that its JSON and Markdown still match (the digest the JSON records), recomputes the verdict from the steps and the teardown instead of trusting the `verdict` field, requires every one of the twelve steps to be present, required and passed (a rehearsal made before `outbound:status` existed, whose item 8 was skipped, does not satisfy it) and requires the report to have finished within 14 days. The report must also be about THIS build, and about nothing wider than that: since report format 2 the rehearsal records the git commit and source tree it ran from (and whether the checkout had uncommitted changes), and the gate requires both to equal those of the checkout it runs from, and both checkouts to be clean. A report of another commit, a report of a dirty checkout and a version-1 report (which records no build) are refused, each with its own message, so a GREEN rehearsal of last week's code cannot stand in for this build. The identifier is the source commit, the source tree and the real path of the checkout, not the `next build` id (`.next/BUILD_ID`), the `.env` configuration or the cut-over driver digest, because none of those exists in, or is built from, the source tree a rehearsal runs on; every GO says so. If the commit and tree match but the rehearsal ran in a different checkout path (a copy under `/var/tmp`, say, while the gate runs in the deployed tree), the gate raises a warning, `rehearsal-different-checkout-path:<rehearsal path>-><this path>`, that needs a written acceptance: ignored files such as `.env` and `.next` can differ between two checkouts of the same commit. **What the gate trusts about a rehearsal report.** The digest only ties the Markdown to the JSON that names it; both sit in the same directory, so whoever can write one can write the other, and the digest authenticates nothing. What makes a report worth reading is who could have written it. Before reading anything the gate checks the report directory and every ancestor, EVERY run directory (not only the newest) and both report files of each: they must be real (never symlinks), owned by root or the account running the gate, and not writable by group or others, with the directory rules of the rehearsal's own `--report-dir` check. Any violation refuses the whole location with "the rehearsal report location is not trusted" and the check fails; the default `/var/tmp/ims-rehearsal-reports` is held to the same rules. A process running as the same account, or as root, can still forge a report; that is outside what this defends. A newer RED or unverifiable report is never replaced by an older GREEN one. Attach the JSON, not a paraphrase of it. The rehearsal does not replace the gate's data checks (the invariant preflight against the **real** database, the reconciliation pack) and says nothing about the real host: `install.sh`, the service account, nginx and the production `.env` are outside it.
+
+### Readiness gate
+
+<!-- readiness-gate:overview -->
+`npm run readiness:gate` collects the checks that decide whether an installation may go on to the next phase of the switchover and reduces them to one verdict: GO, GO-WITH-ACCEPTED-WARNINGS or NO-GO. It performs no database write and no write to the checkout, makes no call to WooCommerce, Mintsoft or Xero, and writes only its own report. Its schema check runs `prisma migrate status`, the schema diff and the drift check, which only read, and reads the constraint catalogue; it does not run `npm run validate:db`.
+
+The verdict is only as wide as the checks that ran. A GO says that every check listed as required for the phase passed on the database and environment the gate was run against, at the time stated in the report. The rehearsal is tied to this build by source commit and source tree only; it is NOT tied to the build artefact (.next/BUILD_ID) and NOT to the .env configuration. It does not inspect the environment of any running service (the outbound check reads the environment of the gate process, so run the gate with the environment the services use), and it does not say the data matches Qoblex, Mintsoft, WooCommerce or Xero unless a reconciliation pack item for that comparison is listed in the report as run and passed. A check that is missing, unreadable or unknown is a NO-GO, never a skipped check; the only checks that may be absent are the ones the report names as optional until they exist.
+
+Not checked by the gate: that the CHECK constraints actually fire, and that the Prisma client is generated. Both belong to `npm run validate:db`, which inserts probe rows in a transaction it rolls back and regenerates the client, so it is an operator pre-step run on a scratch database (the fresh-install rehearsal runs it on its own cluster). Also not checked: the build artefact, the `.env` configuration, every item the report lists as NOT YET AVAILABLE, and the authenticity of the rehearsal report beyond who could have written it (see the rehearsal section).
+<!-- /readiness-gate:overview -->
+
+#### Running it
+
+<!-- readiness-gate:usage -->
+`npm run readiness:gate -- --phase <P0|P1|P2> [--expect-granted <connector[,connector]|none>] [--acceptances <file>] [--rehearsal-dir <dir>] [--report-dir <dir>] [--json]`
+
+The phase is required; there is no default, because the same installation can be ready for one phase and not for the next. `DATABASE_URL` must be set in the environment of the gate: it does not read `.env` files, and it never puts a credential on a command line. `--expect-granted` is required for P2 and refused for P0 and P1: it names the connectors (woocommerce, mintsoft, xero) that are meant to be able to write at P2, or `none`, and the outbound check then requires exactly those to be granted and the others held. `--acceptances` names the written warning-acceptance file (default `ops/readiness-warning-acceptances.json` in the checkout; absent means no warning is accepted). `--rehearsal-dir` is where `npm run rehearse:first-install` publishes its reports. `--json` prints the JSON report on standard output and nothing else; progress and the Markdown go to standard error. The report is published as `readiness-gate.json` and `readiness-gate.md` under `<report-dir>/<run id>/`, Markdown first and the JSON last; the JSON names the Markdown by its sha256 and is the commit record.
+<!-- /readiness-gate:usage -->
+
+The gate collects, in order: the invariant report, the schema state (migrate status, schema diff, drift check and the CHECK constraint catalogue), the outbound status, the newest rehearsal report, the accounting reconciliation completeness proof, the read-sync status (only when the tree defines `read-sync:status`) and the reconciliation pack slots. A check that throws, times out or cannot be read is recorded as unreadable and is a NO-GO; it is never recorded as empty or skipped.
+
+#### What each phase requires
+
+<!-- readiness-gate:phases -->
+What each phase requires. Every row is collected on every run; a required check that is missing, unreadable, unavailable or failed is a NO-GO, and so is an optional-until-present check whose signal exists but cannot be read. A reconciliation pack item that is not yet available is listed, and blocks only at P2.
+
+| Phase | Meaning |
+|---|---|
+| P0 | the first load: IMS has been loaded and nothing outside IMS may be written |
+| P1 | the parallel run: IMS reads and reconciles, every write to WooCommerce, Mintsoft and Xero stays held |
+| P2 | the switch of writers: exactly the declared writers may write, and the reconciliation pack must be available |
+
+| Check | P0 | P1 | P2 |
+|---|---|---|---|
+| Invariant report complete, with zero critical findings | required | required | required |
+| Database schema is applied, has not drifted, and the CHECK constraints are installed (read-only) | required | required | required |
+| Outbound writes are in the state this phase expects | required | required | required |
+| Latest first-install rehearsal is present, GREEN and fresh | required | required | required |
+| Accounting reconciliation is proven complete | required | required | required |
+| Read-sync streams are fresh | optional until present | optional until present | optional until present |
+| R1: Stock on hand, IMS against Mintsoft, per SKU per warehouse | listed only | listed only | required |
+| R2: Stock on hand, IMS against Qoblex, per SKU per warehouse | listed only | listed only | required |
+| R3: StockLevel.quantity against the sum of CostLayer.remainingQty | listed only | listed only | required |
+| R4: StockLevel.reservedQty against the sum of OrderAllocation.qty | listed only | listed only | required |
+| R5: Inventory valuation, IMS against Qoblex | listed only | listed only | required |
+| R6: Inventory subledger against Xero Inventory plus Allocated Inventory | listed only | listed only | required |
+| R7: Open purchase-order commitment | listed only | listed only | required |
+| R8: Part-received purchase-order outstanding quantity, per line | listed only | listed only | required |
+| R9: Open sales orders, IMS against WooCommerce | listed only | listed only | required |
+| R10: Xero control accounts (Inventory, Allocated, Transit, COGS, Unearned Revenue) | listed only | listed only | required |
+| R11: Stock in Transit against the open-PO goods-in-transit schedule | listed only | listed only | required |
+| R12: VAT by country and reporting category, IMS against Xero and WooCommerce | listed only | listed only | required |
+| R13: Tax-rate mapping coverage | listed only | listed only | required |
+| R14: SKU coverage across Qoblex, WooCommerce, Mintsoft and IMS | listed only | listed only | required |
+| R15: The invariant report: zero critical findings, every warning accepted | listed only | listed only | required |
+<!-- /readiness-gate:phases -->
+
+The outbound check reads the grant variables (`WC_WRITEBACK_ALLOWED_ORIGIN`, `MINTSOFT_WRITE_ALLOWED`, `XERO_WRITE_ALLOWED_TENANT`) of the process that runs the gate and the activity log of the database `DATABASE_URL` names. If the gate is run from a shell whose environment differs from the services', its answer describes the shell, not the services. The children the gate runs (`npm run db:migrate:status`, `db:schema:diff`, `db:schema:drift` and, when the tree defines it, `read-sync:status`) receive a short whitelist of the gate's environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR`, `npm_config_cache`, `DATABASE_URL` and, only if you set it, `PRISMA_DEV_DB_CONFIRM`, plus fixed switches that stop them sourcing a `.env` file over `DATABASE_URL`): no connector credential, write grant, SMTP setting or `NODE_OPTIONS`. The schema commands refuse a `DATABASE_URL` that is not on the host the gate runs on unless `PRISMA_DEV_DB_CONFIRM=1` is exported (that refusal is a failure of the schema check, quoted in the report); the gate never sets it for you. The three schema commands were checked to be read-only by running them against a scratch database (no table statistics moved and no file of the checkout changed); the gate's test also runs the whole gate over connections that refuse writes, and fails if any file of the generated client, schema, code or manifests changes.
+
+The read-sync check reads `npm run --silent read-sync:status -- --json` and requires it to declare `schemaVersion` 1 and to be internally consistent (the report time, each entry's age against its last success and the report time, the future-timestamp flag, and the counts against the entries). That is the output of the WP8 producer at commit e6eb79b2 (the branch of the read-sync liveness work, not yet merged), which this reading was matched against by running its report assembly and feeding the result to the gate's parser; the contract is unproven until that branch merges, and a change to its JSON must change the gate with it. The scheduler object must be present with `examined` true, `unreadable` and `blockProblem` exactly null, and `unscheduled` and `disabled` empty lists. Every field the gate relies on must be present with its type: a producer that omits or renames one makes the output unreadable (a NO-GO), never fresh by default. It is optional only while the tree has no `read-sync:status` script. Once the script exists it is required in full: all six streams must be reported, each fresh with a valid last-success time that is not in the future and within the age limit the status reports.
+
+The reconciliation pack (R1-R15, see the pack definition for each item) is a set of slots. On this tree R3 and R4 are read from the invariant report the gate already holds (the invariant codes `stock_cost_layer_quantity_mismatch` and `stock_reserved_source_mismatch`) and R15 is the invariant check itself. Every other item has no runner yet: the report lists it as NOT YET AVAILABLE, with what exists on the tree to build it from, and it was not checked. That does not block P0 or P1 and does block P2. A pack item that is available and fails is reported at P0 and P1 and blocks at P2.
+
+The reconciliation completeness check is the same code the rollout-readiness endpoint uses. It passes only when a reconciliation run exists, the run history shows no truncation that a later complete run over the same period has not covered, no run record is unreadable, and the check could read the history at all. A newest run that predates completeness recording is reported as a warning (its completeness is unknown, not shown to be incomplete) and needs a written acceptance; a partial run, a missing run, or an unreadable history is a failure. For an unresolved truncation the way to clear it is a later accounting reconciliation run, recorded as complete for that check, whose period contains the truncated one (several later runs together can cover it); for a missing or partial run it is a new run. The gate does not start a reconciliation.
+
+<!-- readiness-gate:endpoint -->
+The `/api/admin/rollout-readiness` endpoint reads the same reconciliation findings as the gate. These are blockers there: the endpoint answers HTTP 412 and `?allowWarnings=true` does NOT turn them into 200, because that override records no reason: an unresolved truncation, an unreadable completeness record, a run history that could not be evaluated, a newest-run read that failed, a newest run whose own report recorded a truncation, and a newest run that did not complete. **Changed behaviour:** a newest run with status PARTIAL used to be only a warning that `?allowWarnings=true` accepted; a PARTIAL or FAILED newest run is now a blocker, and so is a RUNNING, queued or otherwise unrecognised one (the newest run is the newest row of ANY status, never an older finished row chosen because a newer one is unfinished; the message says a reconciliation run is in progress or was left unfinished). Today the database only accepts COMPLETED, FAILED and PARTIAL (a check constraint), and this build writes a run row once, in one transaction, so an unfinished row cannot appear unless a later migration allows one; the check is fail-closed so that such a row could never be skipped. Only a COMPLETED run can ever clear an earlier truncation. Several runs created at the same instant are read together and judged as their worst member, and runs created at the same instant never clear each other's truncations, because their order cannot be proven.
+<!-- /readiness-gate:endpoint -->
+
+#### Written warning acceptance
+
+<!-- readiness-gate:acceptances -->
+A warning is not a failure, and it is not a pass either: it must be accepted in writing, one warning at a time, or the verdict is NO-GO. The acceptance file is JSON with `schemaVersion` 1 and an `acceptances` list. Every entry names exactly one warning by its `warningId` (no patterns, no wildcards) and carries `acceptedBy` (who), `acceptedAt` (when, an ISO time not in the future), `reason` (why, at least 15 characters), `expiresAt` (an ISO time after `acceptedAt`, no more than 90 days later) and `phases` (the phases it applies to, a non-empty list of P0, P1, P2). An entry that has expired, that is not yet in effect, that does not list the phase being asked about, or that is malformed does not accept anything; a file that cannot be read, has an unknown field, or names the same warning twice is rejected as a whole and nothing is accepted. A failure is never acceptable: only findings the report labels as warnings can be covered. An acceptance for a warning that no longer occurs is listed as unused and does no harm. Because an acceptance is a decision, the file is used only if it is a regular file (a symlink is never followed) owned by root or the account running the gate, not writable by group or others, in a directory whose every ancestor only root or that account can modify; otherwise the whole file is rejected, the report says why, and nothing is accepted.
+<!-- /readiness-gate:acceptances -->
+
+An example of the file (`ops/readiness-warning-acceptances.json` in the checkout, or any path given with `--acceptances`). The warning ids come from the report; invariant warnings are named `invariant:<domain>:<code>:<subject>`.
+
+```json
+{
+  "schemaVersion": 1,
+  "acceptances": [
+    {
+      "warningId": "accounting-reconciliation:completeness-not-recorded",
+      "acceptedBy": "Name of the person who read the finding",
+      "acceptedAt": "2026-10-08T09:30:00Z",
+      "reason": "Why this is acceptable for the phases named, in a sentence someone else can check.",
+      "expiresAt": "2026-11-08T09:30:00Z",
+      "phases": ["P0"]
+    }
+  ]
+}
+```
+
+A written acceptance is a person's recorded decision that a warning does not stop the phase. It is not evidence that the warning is harmless, and the gate does not judge the reason.
+
+#### Exit codes
+
+<!-- readiness-gate:exit-codes -->
+| Exit code | Name | Meaning |
+|---|---|---|
+| 0 | go | GO: every check for the phase passed and there are no warnings; the report was published |
+| 1 | no-go | NO-GO: at least one check failed, was unreadable, was missing, was not available where it is required, or raised a warning with no current written acceptance. The report names each |
+| 2 | refused | the gate refused to run (bad or missing arguments, no DATABASE_URL, an unsafe report directory); no check was run and nothing was written |
+| 3 | report-not-published | a GO verdict was reached but the report could not be durably published; the verdict is printed but is not a GO, because a verdict nobody can read back is not evidence |
+| 4 | failed | the gate itself failed unexpectedly before it could reach a verdict; treat as NO-GO |
+| 10 | go-with-accepted-warnings | GO-WITH-ACCEPTED-WARNINGS: every check passed and every warning is covered by a current written acceptance; the report was published. Deliberately not 0, so a script that wants a clean GO cannot mistake this for one |
+<!-- /readiness-gate:exit-codes -->
+
+The same table is printed by `npm run readiness:gate -- --help`.
 
 ## WooCommerce initial-import rehearsal
 

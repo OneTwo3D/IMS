@@ -1230,6 +1230,11 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
   'lib/ops/production-preflight.ts': 'pinned-lock-session',
+  // The readiness gate's operator text (docs source) names `prisma migrate status` and `prisma migrate diff` while
+  // saying what the gate runs INSTEAD of validate:db. It executes nothing: the commands are run by the three
+  // `npm run db:*` children of lib/ops/readiness-gate-collect.ts, which this scan does not flag, and the one query the
+  // gate issues itself is a parameterised SELECT over pg_constraint through the app's own client.
+  'lib/ops/readiness-gate-constants.ts': 'names-the-tools-only',
   // Discovered when `scripts` joined CLIENT_CONSTRUCTION_ROOTS (o3d-zzgp r7, review MEDIUM-4).
   // Each was read to decide which of the three it is, not guessed from its name.
   'scripts/audit-xero-live-contamination.ts': 'operator-run-read',
