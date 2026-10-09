@@ -211,9 +211,20 @@ If a freight PO is added or updated after goods have already been received, the 
   less than zero, or whose total including VAT is less than zero (VAT is charged on a negative vatable line too), is
   refused with a message that a net credit from the supplier belongs on a supplier credit note. A zero line, a zero
   total, and a negative line inside a non-negative total are accepted. The cost-line forms themselves still accept
-  positive amounts only. Saving a freight order's costs replaces its lines with the ones submitted, as before; the edit dialog lists
-  credit and zero lines read-only and submits them back unchanged, so saving does not delete them. Receiving goods and
-  then saving the same freight costs again changes nothing, because receipt and recalculation compute the same cost.
+  positive amounts only. Saving a freight order's costs matches each line to the stored one by its id and edits it in
+  place, so a saved line keeps its id; a line left out is removed and a new line is added. A line that has already been
+  **billed** (a purchase invoice line points at it) can be neither changed nor removed, and the save is refused with a
+  message naming the line. The edit dialog lists credit and zero lines read-only and submits them back unchanged, so
+  saving does not delete them. Receiving goods and then saving the same freight costs again changes nothing, because
+  receipt and recalculation compute the same cost.
+- **A freight order records the VAT rate it was created with, and the edit dialog shows and sends it.** Saving the costs
+  keeps that rate (it is never reset to 0%), and choosing a different rate in the dialog is an edit in its own right,
+  even when no line changed. An order created before the rate was recorded that was charged VAT is not guessed at: the
+  dialog asks you to choose the rate, and a save without one is refused with that explanation.
+- **A supplier credit note converts to your base currency by dividing by the exchange rate.** The rate is stored as
+  foreign units per one base unit, so a credit note of EUR 100.00 at 1.17 is recorded as 85.47 in base currency, the
+  same conversion a purchase order uses. The bill's rate is used when the credit note is against a bill, otherwise the
+  order's rate.
 - **A safeguard remains underneath.** Revaluing an already-journaled shipment below zero is still refused (nothing is
   changed and an **ERROR** entry, `landed_cost_revaluation_refused_journaled_shipment`, is written to the activity
   log) because IMS cannot post a negative COGS. Landed cost can no longer cause it on a purchase order's own layers; it remains the safeguard for manufactured outputs and any other source.

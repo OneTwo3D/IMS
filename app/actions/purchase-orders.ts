@@ -4961,7 +4961,7 @@ export async function updateFreightPoCosts(
       const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
 
       // See planFreightCostLineEdit: rows are matched by id, billed rows are never touched, and an edit that
-      // changes nothing (lines AND tax rate) is a no-op: no write, no recalculation, no journal.
+      // changes no cost line (and not the tax rate) is a 'noop': no row is deleted, recreated or renumbered.
       const plan = planFreightCostLineEdit(
         storedLines.map((row) => ({
           id: row.id,
@@ -4975,9 +4975,11 @@ export async function updateFreightPoCosts(
         built.rows,
         taxChanged,
       )
-      if (plan.kind === 'noop') return { reference: po.reference, landedResult: null }
+      // A 'noop' plan changes no cost line (same ids, same amounts); the order's totals and the recalculation below
+      // still run, exactly as a re-save always did, but no row is deleted, recreated or renumbered.
+      const edits = plan.kind === 'apply' ? plan : { updates: [], deletes: [] as string[], creates: [] }
 
-      for (const update of plan.updates) {
+      for (const update of edits.updates) {
         await tx.freightCostLine.update({
           where: { id: update.id },
           data: {
@@ -4990,9 +4992,9 @@ export async function updateFreightPoCosts(
           },
         })
       }
-      if (plan.deletes.length > 0) await tx.freightCostLine.deleteMany({ where: { id: { in: plan.deletes } } })
-      if (plan.creates.length > 0) {
-        await tx.freightCostLine.createMany({ data: plan.creates.map((row) => ({ ...row, poId: freightPoId })) })
+      if (edits.deletes.length > 0) await tx.freightCostLine.deleteMany({ where: { id: { in: edits.deletes } } })
+      if (edits.creates.length > 0) {
+        await tx.freightCostLine.createMany({ data: edits.creates.map((row) => ({ ...row, poId: freightPoId })) })
       }
 
       await tx.purchaseOrder.update({
@@ -5017,9 +5019,6 @@ export async function updateFreightPoCosts(
       })
       return { reference: po.reference, landedResult }
     }, STOCK_TX_OPTIONS)
-
-    // Nothing changed (same lines, same tax rate): nothing was written and nothing needs recalculating.
-    if (!landedResult) return { success: true }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${freightPoId}`)

@@ -12,6 +12,11 @@ import {
   CreateFreightPoInputSchema,
   FREIGHT_NET_CREDIT_MESSAGE,
   FreightCostLinesSchema,
+  FreightEditRefusedError,
+  FREIGHT_TAX_RATE_UNKNOWN_MESSAGE,
+  planFreightCostLineEdit,
+  resolveFreightEditTaxRate,
+  type StoredFreightCostLine,
   type FreightCostLineInput,
 } from '@/lib/domain/purchasing/freight-cost-lines'
 
@@ -246,5 +251,76 @@ test('UI census: the freight dialog sends credit/zero lines back instead of drop
   console.log(`UI PRECONDITION: dialog source ${dialog.length} chars; lockedLines mentions: ${(dialog.match(/lockedLines/g) ?? []).length}`)
   assert.ok(dialog.length > 500)
   assert.ok((dialog.match(/lockedLines/g) ?? []).length >= 4, 'locked (credit/zero) lines are kept, shown and sent back')
-  assert.match(dialog, /\.\.\.lockedLines\.map\(\(cl\) => \(\{\s+description: cl\.description,/, 'locked lines are sent back to the server')
+  assert.match(dialog, /\.\.\.lockedLines\.map\(\(cl\) => \(\{\s+id: cl\.id,\s+description: cl\.description,/, 'locked lines are sent back to the server, by id')
+  assert.match(dialog, /\.\.\.\(cl\.id \? \{ id: cl\.id \} : \{\}\),/, 'edited stored lines are sent with their stored id')
+  // The VAT rate is an input of the save: the dialog passes the chosen rate as the third argument (none for a legacy
+  // order it must not guess for), so a save is never left at two arguments.
+  assert.match(dialog, /taxRateId === '__recorded' \|\| taxRateId === '__unset'\s+\? undefined\s+: \(purchaseTaxRates\.find\(\(t\) => t\.id === taxRateId\)\?\.rate \?\? 0\)/, 'the dialog passes the chosen VAT rate as the third argument')
+})
+
+
+// ─── Editing stored lines: matched by id, billed rows untouchable ────────────────────────────────────────
+
+const stored = (id: string, amount: string, over: Partial<StoredFreightCostLine> = {}): StoredFreightCostLine => ({
+  id, description: `line ${id}`, amountForeign: new Prisma.Decimal(amount), vatable: false, distributionMethod: 'BY_VALUE', billed: false, ...over,
+})
+const submit = (id: string | undefined, amount: number, over: Partial<FreightCostLineInput> = {}): FreightCostLineInput =>
+  ({ ...(id ? { id } : {}), description: `line ${id}`, amountForeign: amount, vatable: false, distributionMethod: 'BY_VALUE', ...over })
+const plan = (storedRows: StoredFreightCostLine[], submitted: FreightCostLineInput[], taxChanged = false) =>
+  planFreightCostLineEdit(storedRows, submitted, buildFreightCostLineRows(submitted, 1).rows, taxChanged)
+
+test('edit plan: a billed row cannot be changed, removed, or replaced by an id-less save; an unbilled one can', () => {
+  const rows = [stored('a', '30', { billed: true }), stored('b', '20')]
+  console.log(`plan PRECONDITION: ${rows.length} stored rows, billed=${rows.filter((r) => r.billed).map((r) => r.id).join(',')}`)
+  assert.throws(() => plan(rows, [submit('a', 31), submit('b', 20)]), (e: unknown) => e instanceof FreightEditRefusedError && /billed and cannot be changed/.test(e.message))
+  assert.throws(() => plan(rows, [submit('b', 20)]), (e: unknown) => e instanceof FreightEditRefusedError && /billed and cannot be removed/.test(e.message))
+  assert.throws(() => plan(rows, [submit(undefined, 99)]), (e: unknown) => e instanceof FreightEditRefusedError && /billed and cannot be replaced/.test(e.message))
+  const ok = plan(rows, [submit('a', 30), submit('b', 21)])
+  assert.equal(ok.kind, 'apply')
+  assert.deepEqual(ok.kind === 'apply' ? ok.updates.map((u) => u.id) : [], ['b'])
+  // Reordered, unchanged, billed row present: a no-op, not a refusal.
+  assert.equal(plan(rows, [submit('b', 20), submit('a', 30)]).kind, 'noop')
+})
+
+test('edit plan: matched by id not position; unknown or repeated ids refused; new rows created; omitted unbilled rows deleted', () => {
+  const rows = [stored('a', '30'), stored('b', '20')]
+  const swapped = plan(rows, [submit('b', 25), submit('a', 30)])
+  assert.equal(swapped.kind, 'apply')
+  assert.deepEqual(swapped.kind === 'apply' ? swapped.updates.map((u) => u.id) : [], ['b'])
+  assert.throws(() => plan(rows, [submit('zzz', 1)]), FreightEditRefusedError)
+  assert.throws(() => plan(rows, [submit('a', 30), submit('a', 30)]), FreightEditRefusedError)
+  const mixed = plan(rows, [submit('a', 30), submit(undefined, 5)])
+  assert.equal(mixed.kind === 'apply' ? mixed.creates.length : -1, 1)
+  assert.deepEqual(mixed.kind === 'apply' ? mixed.deletes : [], ['b'])
+})
+
+test('edit plan: a tax-only change is an edit, the same lines and tax are a no-op', () => {
+  const rows = [stored('a', '30')]
+  assert.equal(plan(rows, [submit('a', 30)], false).kind, 'noop')
+  assert.equal(plan(rows, [submit('a', 30)], true).kind, 'apply')
+})
+
+// ─── Which VAT rate an edit saves at ─────────────────────────────────────────────────────────────────────
+
+test('edit tax rate: none sent keeps the stored rate; a different one is a tax change; an unrecorded rate on a charged order is refused, never inferred', () => {
+  const kept = resolveFreightEditTaxRate({ requested: undefined, storedRate: '0.2', storedTaxForeign: '20' })
+  console.log(`rate PRECONDITION: none sent, stored 0.2 -> ${kept.effectiveRate} changed=${kept.taxChanged}`)
+  assert.equal(kept.effectiveRate.toString(), '0.2')
+  assert.equal(kept.taxChanged, false)
+  const changed = resolveFreightEditTaxRate({ requested: 0.1, storedRate: '0.2', storedTaxForeign: '20' })
+  assert.equal(changed.effectiveRate.toString(), '0.1')
+  assert.equal(changed.taxChanged, true)
+  const sameRate = resolveFreightEditTaxRate({ requested: 0.2, storedRate: '0.2000', storedTaxForeign: '20' })
+  assert.equal(sameRate.taxChanged, false)
+  // Unrecorded rate, no VAT charged: zero, unchanged.
+  const none = resolveFreightEditTaxRate({ requested: undefined, storedRate: null, storedTaxForeign: '0' })
+  assert.equal(none.effectiveRate.toString(), '0')
+  assert.equal(none.taxChanged, false)
+  // Unrecorded rate but VAT was charged (legacy row): refused with the single-sourced text; supplying a rate resolves it.
+  assert.throws(
+    () => resolveFreightEditTaxRate({ requested: undefined, storedRate: null, storedTaxForeign: '20' }),
+    (e: unknown) => e instanceof FreightEditRefusedError && e.message === FREIGHT_TAX_RATE_UNKNOWN_MESSAGE,
+  )
+  const supplied = resolveFreightEditTaxRate({ requested: 0.2, storedRate: null, storedTaxForeign: '20' })
+  assert.equal(supplied.effectiveRate.toString(), '0.2')
 })
