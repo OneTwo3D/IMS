@@ -279,7 +279,8 @@ export function normalizeMintsoftBundle(value: unknown): WmsBundleRef | null {
   const externalBundleId = getFirstString(record, BUNDLE_ID_KEYS)
   if (!sku || !externalBundleId) return null
 
-  const components = extractMintsoftArrayPayloadWithKeys(record, BUNDLE_COMPONENT_KEYS)
+  const rawComponents = extractMintsoftArrayPayloadWithKeys(record, BUNDLE_COMPONENT_KEYS)
+  const components = rawComponents
     .map((item) => normalizeMintsoftBundleItem(item))
     .filter((item): item is WmsBundleComponent => Boolean(item))
 
@@ -288,6 +289,7 @@ export function normalizeMintsoftBundle(value: unknown): WmsBundleRef | null {
     sku,
     name: getFirstString(record, BUNDLE_NAME_KEYS),
     components,
+    unreadableComponentCount: rawComponents.length - components.length,
     raw: record,
   }
 }
