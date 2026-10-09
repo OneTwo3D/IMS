@@ -431,10 +431,10 @@ export function MintsoftClient({ data, configured }: Props) {
   }
 
   function handleResolveKeptClaim(
-    claim: { id: string; claimValue: string; sku: string },
+    claim: { id: string; claimValue: string; sku: string; releaseWindowMinutes: number },
     resolution: { kind: 'link'; externalBundleId: string } | { kind: 'absent' },
   ) {
-    if (resolution.kind === 'absent' && !window.confirm(bundleAbsentConfirmationText(claim.sku))) return
+    if (resolution.kind === 'absent' && !window.confirm(bundleAbsentConfirmationText(claim.sku, claim.releaseWindowMinutes))) return
     setError('')
     startTransition(async () => {
       const result = await resolveMintsoftKeptBundleClaim({ claimId: claim.id, claimValue: claim.claimValue, resolution })
@@ -1352,7 +1352,7 @@ function KeptBundleClaimsPanel({
   initial: MintsoftDashboardData['keptBundleClaims']
   disabled: boolean
   onResolve: (
-    claim: { id: string; claimValue: string; sku: string },
+    claim: { id: string; claimValue: string; sku: string; releaseWindowMinutes: number },
     resolution: { kind: 'link'; externalBundleId: string } | { kind: 'absent' },
   ) => void
   formatDateTime: (value: string) => string
@@ -1407,7 +1407,7 @@ function KeptBundleClaimRow({
   claim: MintsoftDashboardData['keptBundleClaims']['claims'][number]
   disabled: boolean
   onResolve: (
-    claim: { id: string; claimValue: string; sku: string },
+    claim: { id: string; claimValue: string; sku: string; releaseWindowMinutes: number },
     resolution: { kind: 'link'; externalBundleId: string } | { kind: 'absent' },
   ) => void
   formatDateTime: (value: string) => string

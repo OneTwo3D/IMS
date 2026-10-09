@@ -6,7 +6,9 @@ import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsBundleComponent, WmsBundleDto, WmsBundleRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import {
+  BUNDLE_CLAIM_CHANGED_TEXT,
   BUNDLE_CLAIM_LEASE_MS,
+  bundleLateResultText,
   BUNDLE_CLAIM_PREFIX,
   buildBundleSentClaimValue,
   buildBundleUnsentClaimValue,
@@ -358,41 +360,60 @@ async function claimBundleCreateSlot(productId: string): Promise<
  * Mark the claim SENT immediately before the create request is handed over. If this cannot be recorded the
  * request is not sent: an unmarked claim must mean that nothing was sent.
  */
-async function markBundleClaimSent(claim: { linkId: string; claimValue: string }): Promise<boolean> {
+async function markBundleClaimSent(claim: { linkId: string; claimValue: string }): Promise<string | null> {
+  const sentValue = buildBundleSentClaimValue()
   const marked = await db.wmsBundleLink.updateMany({
     where: { id: claim.linkId, externalBundleId: claim.claimValue },
-    data: { externalBundleId: buildBundleSentClaimValue() },
+    data: { externalBundleId: sentValue },
   })
-  return marked.count === 1
+  return marked.count === 1 ? sentValue : null
 }
 
-async function releaseBundleCreateSlot(linkId: string): Promise<void> {
+/**
+ * THE FENCE, immediately before the request: one conditional update that succeeds only if the claim still exists with
+ * exactly the value this worker wrote, and that refreshes its updatedAt (which is what an operator's release compares
+ * with the in-flight window). A worker that was paused past a release, and a retry that has claimed the product since,
+ * fails here and sends nothing.
+ */
+async function reverifyBundleClaim(claim: { linkId: string }, sentValue: string): Promise<boolean> {
+  const held = await db.wmsBundleLink.updateMany({
+    where: { id: claim.linkId, externalBundleId: sentValue },
+    data: { externalBundleId: sentValue },
+  })
+  return held.count === 1
+}
+
+async function releaseBundleCreateSlot(linkId: string, claimValue: string): Promise<void> {
+  // Only THIS worker's own claim: a row an operator has resolved or another run has taken is not ours to delete.
   await db.wmsBundleLink.deleteMany({
     where: {
       id: linkId,
-      externalBundleId: { startsWith: BUNDLE_SENTINEL_PREFIX },
+      externalBundleId: claimValue,
     },
   }).catch((error) => {
     console.error('[mintsoft bundle sync] failed to release sentinel', linkId, error)
   })
 }
 
-async function finalizeBundleLink(linkId: string, params: {
+async function finalizeBundleLink(linkId: string, expectedClaimValue: string, params: {
   externalBundleId: string
   checksum: string
-}): Promise<{ success: boolean; lastError: Error | null }> {
+}): Promise<{ success: boolean; stale: boolean; lastError: Error | null }> {
   let lastError: Error | null = null
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await db.wmsBundleLink.update({
-        where: { id: linkId },
+      // Conditional on THIS worker's own claim value: a row that has changed (an operator linked it, another run
+      // took it) is not overwritten by a late finish.
+      const written = await db.wmsBundleLink.updateMany({
+        where: { id: linkId, externalBundleId: expectedClaimValue },
         data: {
           externalBundleId: params.externalBundleId,
           checksum: params.checksum,
           lastSyncedAt: new Date(),
         },
       })
-      return { success: true, lastError: null }
+      if (written.count !== 1) return { success: false, stale: true, lastError: null }
+      return { success: true, stale: false, lastError: null }
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
       if (attempt < 2) {
@@ -400,7 +421,7 @@ async function finalizeBundleLink(linkId: string, params: {
       }
     }
   }
-  return { success: false, lastError }
+  return { success: false, stale: false, lastError }
 }
 
 async function persistBundleLink(params: {
@@ -738,7 +759,8 @@ async function syncBundleInternal(
     }
   }
 
-  if (!(await markBundleClaimSent(claim))) {
+  const sentValue = await markBundleClaimSent(claim)
+  if (!sentValue) {
     return {
       status: 'SKIPPED',
       action: 'noop',
@@ -751,13 +773,24 @@ async function syncBundleInternal(
 
   let created: WmsBundleRef
   try {
-    created = await connector.createBundle(dto)
+    created = await connector.createBundle(dto, { beforeSend: () => reverifyBundleClaim(claim, sentValue) })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft bundle create failed.'
-    if (classifyBundleCreateFailure(message) === 'not-sent') {
+    const failureKind = classifyBundleCreateFailure(message)
+    if (failureKind === 'claim-changed') {
+      await recordWmsMutationEvent({
+        connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'FAILED',
+        entityType: 'PRODUCT', entityId: productId,
+        summary: `Mintsoft bundle create for ${candidate.sku}: claim changed, create not sent`,
+        after: { sku: candidate.sku, claimId: claim.linkId, sent: false },
+        error: BUNDLE_CLAIM_CHANGED_TEXT,
+      })
+      return { status: 'SKIPPED', action: 'noop', reason: BUNDLE_CLAIM_CHANGED_TEXT, productId, sku: candidate.sku, checksum }
+    }
+    if (failureKind === 'not-sent') {
       // The installation's own hold refused the request before it left: Mintsoft received nothing, so
       // the claim is released and the next run is free to try.
-      await releaseBundleCreateSlot(claim.linkId)
+      await releaseBundleCreateSlot(claim.linkId, sentValue)
       await recordWmsMutationEvent({
         connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'FAILED',
         entityType: 'PRODUCT', entityId: productId,
@@ -793,7 +826,7 @@ async function syncBundleInternal(
     const text = bundleCreateMaybeSentText(candidate.sku, message, reconciliation)
 
     if (reconciliation.kind === 'bound' && found) {
-      const finalizeFound = await finalizeBundleLink(claim.linkId, { externalBundleId: found.externalBundleId, checksum })
+      const finalizeFound = await finalizeBundleLink(claim.linkId, sentValue, { externalBundleId: found.externalBundleId, checksum })
       await recordWmsMutationEvent({
         connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: finalizeFound.success ? 'SUCCEEDED' : 'FAILED',
         entityType: 'PRODUCT', entityId: productId, externalId: found.externalBundleId,
@@ -801,6 +834,10 @@ async function syncBundleInternal(
         after: { externalBundleId: found.externalBundleId, sku: candidate.sku, checksum },
         error: finalizeFound.success ? null : (finalizeFound.lastError?.message ?? 'bundle link finalize failed'),
       })
+      if (finalizeFound.stale) {
+        const lateText = bundleLateResultText(candidate.sku, found.externalBundleId)
+        return { status: 'ERROR', action: 'conflict', reason: lateText, productId, sku: candidate.sku, checksum, externalBundleId: found.externalBundleId }
+      }
       if (finalizeFound.success) {
         await resolveBundleConflict(scopes, productId)
         return {
@@ -854,7 +891,7 @@ async function syncBundleInternal(
     }
   }
 
-  const finalize = await finalizeBundleLink(claim.linkId, {
+  const finalize = await finalizeBundleLink(claim.linkId, sentValue, {
     externalBundleId: created.externalBundleId,
     checksum,
   })
@@ -863,12 +900,30 @@ async function syncBundleInternal(
   await recordWmsMutationEvent({
     connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'SUCCEEDED',
     entityType: 'PRODUCT', entityId: productId, externalId: created.externalBundleId,
-    summary: finalize.success
+    summary: finalize.stale
+      ? bundleLateResultText(candidate.sku, created.externalBundleId)
+      : finalize.success
       ? `Mintsoft bundle created for ${candidate.sku}`
       : `Mintsoft bundle created for ${candidate.sku}, but the local link finalize failed — manual recovery required`,
     after: { externalBundleId: created.externalBundleId, sku: candidate.sku, checksum, ...(finalize.success ? {} : { linkPersistFailed: true }) },
     error: finalize.success ? null : (finalize.lastError?.message ?? 'bundle link finalize failed'),
   })
+  if (finalize.stale) {
+    // The claim changed hands while the request was out: do not write over whatever is there now. The bundle Mintsoft
+    // returned is recorded for reconciliation.
+    const lateText = bundleLateResultText(candidate.sku, created.externalBundleId)
+    await logActivity({
+      entityType: 'SYSTEM',
+      entityId: productId,
+      tag: 'sync',
+      action: 'mintsoft_bundle_create_late_result',
+      description: lateText,
+      metadata: { productId, sku: candidate.sku, externalBundleId: created.externalBundleId, checksum, triggeredBy, linkId: claim.linkId },
+      level: 'ERROR',
+      resolveUser: false,
+    })
+    return { status: 'ERROR', action: 'conflict', reason: lateText, productId, sku: candidate.sku, checksum, externalBundleId: created.externalBundleId }
+  }
   if (!finalize.success) {
     await logActivity({
       entityType: 'SYSTEM',

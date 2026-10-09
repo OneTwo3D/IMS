@@ -43,6 +43,8 @@ export type KeptBundleClaim = {
   claimedAt: string
   /** When "no bundle" may be stated: before this the action refuses. */
   releasableAt: string
+  /** The in-flight window, in minutes, for the confirmation text. */
+  releaseWindowMinutes: number
   /** Set while a release would be refused for being too early; the one sentence the page shows. */
   releaseBlockedReason: string | null
 }
@@ -88,6 +90,7 @@ export async function listKeptBundleClaims(options: { page?: number; query?: str
         claimValue: row.externalBundleId,
         claimedAt: row.updatedAt.toISOString(),
         releasableAt: new Date(releasableAt).toISOString(),
+        releaseWindowMinutes: minutes,
         releaseBlockedReason: releasableAt > now ? bundleReleaseTooSoonText(minutes) : null,
       }
     }),

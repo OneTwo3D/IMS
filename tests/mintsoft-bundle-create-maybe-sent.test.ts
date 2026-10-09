@@ -48,6 +48,10 @@ function claimRows(where: ClaimWhere): LinkRow[] {
     && (!where.product || (row.sku ?? 'KIT-1').toLowerCase().includes(where.product.sku.contains.toLowerCase())))
 }
 let auditFails = false
+let fenceGate: Promise<void> | null = null
+let fenceReached: (() => void) | null = null
+let finalizeGate: Promise<void> | null = null
+let finalizeReached: (() => void) | null = null
 
 // The double is self-referential (its transaction hands itself back), which a precise type cannot express.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -97,8 +101,13 @@ const dbDouble: Record<string, any> = {
         .map((row) => ({ ...row, product: { sku: row.sku ?? 'KIT-1', id: row.productId, name: 'Starter Kit' } })),
     count: async (args: { where: ClaimWhere }) => claimRows(args.where).length,
     updateMany: async ({ where, data }: { where: { id: string; externalBundleId: string }; data: Partial<LinkRow> }) => {
+      // Test hooks: park a worker at its pre-send fence (a same-value refresh) or at its finalize (a write carrying a checksum).
+      const isFence = data.externalBundleId === where.externalBundleId && where.externalBundleId.startsWith('pending:sent:')
+      if (isFence && fenceGate) { const gate = fenceGate; fenceGate = null; fenceReached?.(); await gate }
+      if (typeof data.checksum === 'string' && finalizeGate) { const gate = finalizeGate; finalizeGate = null; finalizeReached?.(); await gate }
       const row = links.get(where.id)
-      if (!row || row.externalBundleId !== where.externalBundleId) return { count: 0 }
+      // An omitted condition matches anything, as in Prisma.
+      if (!row || (where.externalBundleId !== undefined && row.externalBundleId !== where.externalBundleId)) return { count: 0 }
       Object.assign(row, data, { updatedAt: new Date() })
       return { count: 1 }
     },
@@ -244,6 +253,7 @@ after(async () => {
 })
 beforeEach(() => {
   auditFails = false
+  fenceGate = null; finalizeGate = null; fenceReached = null; finalizeReached = null
   links.clear(); discrepancies.length = 0; mutationEvents.length = 0; activities.length = 0
   requestLog.length = 0
   registered = null
@@ -589,4 +599,73 @@ test('operator text: one wording for the result and the audit row, true for ever
   const detail = texts[0]!.match(/answer was not usable \((.*?)\)\./)?.[1]
   assert.ok(detail, 'the failure detail is carried')
   assert.equal(texts[0], bundleCreateMaybeSentText('KIT-1', detail!, { kind: 'not-found' }), 'the result is the single-sourced sentence')
+})
+
+test('A PAUSED WORKER CANNOT SEND OVER A RELEASE: paused after its sent mark, claim released by the operator, a later sync PUTs; the resumed worker\'s fence fails and it sends nothing', async () => {
+  const { resolveKeptBundleClaim } = await import('../lib/connectors/mintsoft/sync/bundle-claim-resolution')
+  let open!: () => void
+  fenceGate = new Promise<void>((resolve) => { open = resolve })
+  const reached = new Promise<void>((resolve) => { fenceReached = resolve })
+  putMode = 'drop-unseen'
+  const paused = runSync() // worker A: marks the claim SENT, then freezes at the fence, before any PUT
+  await reached
+  const claim = sentRows()[0]!
+  assert.equal(puts(), 0, 'precondition: worker A has sent nothing yet')
+  claim.updatedAt = AGE(60 * 60 * 1000) // an hour passes
+  const released = await resolveKeptBundleClaim({ claimId: claim.id, claimValue: claim.externalBundleId, resolution: { kind: 'absent' }, userId: 'u1' })
+  assert.equal(released.success, true, 'precondition: the operator released the claim (window passed, lookup absent)')
+  const second = await runSync() // worker B: claims, marks, fences, PUTs
+  assert.equal(puts(), 1, 'precondition: worker B sent the one PUT')
+  assert.equal(second.status, 'ERROR')
+  const events = mutationEvents.length
+  open() // worker A resumes
+  const resumed = await paused
+  console.log(`precondition: PUTs after A resumed=${puts()}; A result=${resumed.status}; A reason=${resumed.reason.slice(0, 70)}`)
+  assert.equal(puts(), 1, 'the resumed worker sent NO second PUT')
+  assert.equal(resumed.status, 'SKIPPED')
+  assert.match(resumed.reason, /claim changed, create not sent/)
+  assert.ok(mutationEvents.slice(events).some((event) => /claim changed, create not sent/.test(String(event.summary))), 'recorded')
+  assert.equal(sentRows().length, 1, 'worker B\'s claim is untouched by A')
+})
+
+test('the fence REFRESHES the claim: the release window runs from the moment just before the request', async () => {
+  putMode = 'drop-unseen'
+  const before = Date.now()
+  await runSync()
+  const claim = sentRows()[0]!
+  console.log(`precondition: claim updatedAt - start = ${claim.updatedAt.getTime() - before} ms`)
+  assert.ok(claim.updatedAt.getTime() >= before)
+})
+
+test('A LATE FINISH NEVER OVERWRITES AN OPERATOR\'S LINK: the create succeeds, the operator links another id while the worker is parked at finalize, the worker\'s write is refused and recorded', async () => {
+  const { resolveKeptBundleClaim } = await import('../lib/connectors/mintsoft/sync/bundle-claim-resolution')
+  let open!: () => void
+  finalizeGate = new Promise<void>((resolve) => { open = resolve })
+  const reached = new Promise<void>((resolve) => { finalizeReached = resolve })
+  putMode = 'ok' // Mintsoft creates bundle 900 and answers
+  const worker = runSync()
+  await reached
+  const claim = sentRows()[0]!
+  assert.equal(puts(), 1, 'precondition: the create was sent and answered; the worker is parked before writing the link')
+  const linked = await resolveKeptBundleClaim({ claimId: claim.id, claimValue: claim.externalBundleId, resolution: { kind: 'link', externalBundleId: '777' }, userId: 'u1' })
+  assert.equal(linked.success, true, 'precondition: the operator linked 777')
+  open()
+  const result = await worker
+  const row = links.get(claim.id)!
+  console.log(`precondition: link after the late finish = ${row.externalBundleId} / checksum ${row.checksum}; worker result=${result.status}`)
+  assert.equal(row.externalBundleId, '777', 'the operator\'s id stands')
+  assert.equal(row.checksum, null, 'and so does its empty checksum')
+  assert.equal(result.status, 'ERROR')
+  assert.match(result.reason, /finished after its claim had changed hands/)
+  assert.match(result.reason, /bundle 900/)
+  assert.ok(activities.some((entry) => entry.action === 'mintsoft_bundle_create_late_result'), 'recorded for reconciliation')
+})
+
+test('the operator confirmation states the paused-process residual in plain words, with the window', async () => {
+  const { bundleAbsentConfirmationText, bundlePausedWorkerResidualText } = await import('../lib/connectors/mintsoft/sync/bundle-create-outcome')
+  const text = bundleAbsentConfirmationText('KIT-1', 12)
+  console.log(`precondition: ${text.slice(-160)}`)
+  assert.ok(text.includes(bundlePausedWorkerResidualText(12)))
+  assert.match(text, /paused or frozen for longer than 12 minutes/)
+  assert.match(text, /Mintsoft offers no idempotency/)
 })

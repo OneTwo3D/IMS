@@ -97,11 +97,28 @@ export function bundleReleaseLookupRefusalText(kind: 'found' | 'unreadable' | 'f
   }
 }
 
-export type BundleCreateFailureKind = 'not-sent' | 'maybe-sent'
+/**
+ * What the create step throws when the worker's claim was no longer exactly the one it recorded, checked and
+ * refreshed immediately before the request: the request was NOT sent and the claim belongs to someone else now.
+ */
+export const BUNDLE_CLAIM_CHANGED_TEXT = 'Mintsoft bundle claim changed, create not sent: this run no longer holds the claim (an operator resolved it or another run took over), so it sent nothing.'
 
-/** `not-sent` only for the hold; everything else may have reached Mintsoft. */
+export type BundleCreateFailureKind = 'not-sent' | 'claim-changed' | 'maybe-sent'
+
+/** `not-sent` only for the hold; `claim-changed` for the fence; everything else may have reached Mintsoft. */
 export function classifyBundleCreateFailure(message: string | null | undefined): BundleCreateFailureKind {
+  if (typeof message === 'string' && message.includes(BUNDLE_CLAIM_CHANGED_TEXT)) return 'claim-changed'
   return isOutboundWriteHeldText(message) ? 'not-sent' : 'maybe-sent'
+}
+
+/** A create that finished after its claim had changed hands: its result is recorded, never written over the link. */
+export function bundleLateResultText(sku: string, externalBundleId: string): string {
+  return `A Mintsoft bundle create for ${sku} finished after its claim had changed hands (an operator resolved it or another run took over). Mintsoft returned bundle ${externalBundleId}; IMS did not overwrite the link. If that bundle is not the one now linked for ${sku}, it may be a duplicate: check ${BUNDLE_CLAIM_RESOLUTION_PLACE} and Mintsoft.`
+}
+
+/** The limit no number closes, stated wherever an operator is asked to rely on the window. */
+export function bundlePausedWorkerResidualText(minutes: number): string {
+  return `A sync process that was paused or frozen for longer than ${minutes} minutes after sending could still complete after a release; IMS checks its claim immediately before sending and refuses to overwrite a link afterwards, but Mintsoft offers no idempotency, so a duplicate in that case cannot be ruled out.`
 }
 
 /** What a lookup after a possibly-sent create found. Only `bound` and `differs` are answers. */
@@ -152,8 +169,8 @@ export function bundleStuckClaimText(sku: string, reconciliation: BundleReconcil
 }
 
 /** Text for the confirmation next to the operator's "none found" action: it is the operator's statement, not evidence. */
-export function bundleAbsentConfirmationText(sku: string): string {
-  return `Confirm only if you have searched Mintsoft for a bundle with SKU ${sku} and found none. IMS cannot check this for you: if one exists, the next bundle sync will create a second.`
+export function bundleAbsentConfirmationText(sku: string, windowMinutes: number): string {
+  return `Confirm only if you have searched Mintsoft for a bundle with SKU ${sku} and found none. IMS cannot check this for you: if one exists, the next bundle sync will create a second. ${bundlePausedWorkerResidualText(windowMinutes)}`
 }
 
 /** Audit wording for the operator's statement. It records who said what, never that it is true. */

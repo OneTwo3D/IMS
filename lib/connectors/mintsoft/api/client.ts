@@ -1,5 +1,6 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from './auth-no-login'
+import { BUNDLE_CLAIM_CHANGED_TEXT } from '../sync/bundle-create-outcome'
 import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   readMintsoftAsnItemExpectedQuantity,
@@ -633,8 +634,11 @@ export function buildMintsoftBundleCreateRequest(
   }
 }
 
-export async function createMintsoftBundle(input: WmsBundleDto): Promise<WmsBundleRef> {
+export async function createMintsoftBundle(input: WmsBundleDto, options?: { beforeSend?: () => Promise<boolean> }): Promise<WmsBundleRef> {
   const request = buildMintsoftBundleCreateRequest(input)
+  // The fence: the caller re-verifies its claim in one conditional update, as close to the send as this function can
+  // put it, and a false answer means nothing is sent.
+  if (options?.beforeSend && !(await options.beforeSend())) throw new Error(BUNDLE_CLAIM_CHANGED_TEXT)
   const result = await mintsoftRequest<unknown>(request.path, {
     method: request.method,
     body: request.body,
