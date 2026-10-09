@@ -10878,7 +10878,22 @@ header "Setting up cron jobs"
 # Runtime-read secret + [ -n ] guard + managed LOG_DIR log path.
 CRON_ENV_FILE="${APP_DIR}/.env"
 CRON_LOG_FILE="${LOG_DIR}/cron.log"
-CRON_CURL_PREFIX="CRON_SECRET=\$(grep -m1 '^CRON_SECRET=' '${CRON_ENV_FILE}' | cut -d= -f2- | tr -d '\"') && [ -n \"\$CRON_SECRET\" ] && curl -sf -o /dev/null -H \"Authorization: Bearer \$CRON_SECRET\""
+# THE JOB COMMAND, WITH THE BEARER OFF THE COMMAND LINE (o3d-kb3dq). It used to be `curl -H "Authorization: Bearer
+# $CRON_SECRET"`, which expands the secret into curl's argv for as long as a job runs, readable by every local account
+# through `ps`. The header is now written by the shell's builtin echo into a pipe and read by curl as a config line
+# (-K -): no process has the secret in its arguments and no file holds it. An empty secret, or one holding a backslash,
+# runs nothing and says so in the job log (fails closed). This is the SAME text lib/crontab-sync.ts renders for the
+# in-app scheduler (tests/scripts/installer-secrets-argv.test.ts renders both and compares them byte for byte).
+cron_job_command() {
+  local slug="$1" logfile="$2" envfile="$3" command
+  IFS= read -r -d '' command <<'EOF' || true
+case "$CRON_SECRET" in ''|*\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); @SLUG@ was not run" ;; *) echo "header = \"Authorization: Bearer $CRON_SECRET\"" | curl -sf -o /dev/null -K - "$BASE_URL/@SLUG@" ;; esac >> '@LOG@' 2>&1
+EOF
+  command="${command%$'\n'}"
+  command="${command//@SLUG@/${slug}}"
+  command="${command//@LOG@/${logfile}}"
+  printf '%s%s' "CRON_SECRET=\$(grep -m1 '^CRON_SECRET=' '${envfile}' | cut -d= -f2- | tr -d '\"'); " "${command}"
+}
 CRON_BASE="http://localhost:${APP_PORT}/api/cron"
 
 # schedule|slug|label pairs for the bootstrap set
@@ -10909,7 +10924,7 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
   for job in "${CRON_JOBS[@]}"; do
     IFS='|' read -r sched slug label <<< "$job"
     echo "# ${label}"
-    echo "${sched}  ${CRON_CURL_PREFIX} \"\$BASE_URL/${slug}\" >> '${CRON_LOG_FILE}' 2>&1"
+    echo "${sched}  $(cron_job_command "${slug}" "${CRON_LOG_FILE}" "${CRON_ENV_FILE}")"
     echo ""
   done
   echo "# --- OTI CRON END ---"

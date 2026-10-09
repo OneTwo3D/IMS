@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from '
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import { buildOtiCrontabBlock, renderCronJobCommand, type CrontabJobDef } from '../../lib/crontab-sync.ts'
 import { shippedFunction } from './real-postgres-cluster.ts'
 import { withTempDir } from './temp-dir.ts'
 
@@ -135,7 +136,7 @@ const RULES: Array<[string, RegExp]> = [
   // R1: a secret handed to a command as an `env NAME=value` / runuser argument (the value is on argv).
   ['R1 env-assignment argument', new RegExp(`(?:^|[\\s(;&|\`])(?:env|run_as_user|run_as_user_db|as_app_user|as_app_user_db|runuser|sudo)\\s[^#]*\\b[A-Z0-9_]*${SECRET_WORD}[A-Z0-9_]*=["']?\\$`)],
   // R2: a bearer token / credential in a curl header or -u argument.
-  ['R2 curl credential argument', /curl\b[^#]*(?:-H\s+["']?Authorization:[^"']*\$|\s-u\s+["']?[^\s"']*\$|--user\s)/],
+  ['R2 curl credential argument', /curl\b[^#]*(?:-H\s+\\?["']?Authorization:[^"']*\\?\$|\s-u\s+\\?["']?[^\s"']*\\?\$|--user\s)/],
   // R3: a connection string with a password as a positional / --dbname argument.
   ['R3 connection URL argument', /\b(?:pg_dump|pg_dumpall|psql|pg_restore|redis-cli)\s[^#|]*["']?\$\{?[A-Z_]*DATABASE_URL\}?["']?/],
   // R4: a password option.
@@ -222,5 +223,131 @@ test('[o3d-kb3dq] the API tokens reach curl on its standard input as a config li
       assert.ok(l.text.includes('-K -') && l.text.includes('<<<'), `${file}:${l.line} reads its credential from stdin`)
       assert.ok(!l.text.includes(token), `${file}:${l.line} does not name the token on the command line`)
     }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// the cron jobs: the secret is on NO command line (rendered text AND the running process)
+// ---------------------------------------------------------------------------
+
+const JOB: CrontabJobDef = { slug: 'backup', settingKey: 'backup', label: 'Database Backup', defaultSchedule: '0 2 * * *', defaultEnabled: true }
+const CRON_CANARY = 'cron-canary-9f31c0de77aa'
+
+/** What install.sh's cron block writes for one job: the shipped function, run. */
+function installerJobLine(envFile: string, logFile: string): string {
+  const r = spawnSync('bash', ['-c', `${shippedFunction(INSTALL, 'cron_job_command')}\ncron_job_command backup ${JSON.stringify(logFile)} ${JSON.stringify(envFile)}`], { encoding: 'utf8' })
+  assert.equal(r.status, 0, r.stderr)
+  return `0 2 * * *  ${r.stdout}`
+}
+
+/** What the in-app scheduler writes (Save & Apply), in each of its two secret modes. */
+function appBlock(mode: 'env-file' | 'literal', envFile: string, logFile: string): string[] {
+  const result = buildOtiCrontabBlock({
+    jobs: [JOB],
+    settings: new Map([['cron_backup_enabled', 'true']]),
+    secretRef: mode === 'env-file' ? { kind: 'env-file', envFilePath: envFile } : { kind: 'literal', secret: CRON_CANARY },
+    baseUrl: 'http://localhost:3000',
+    logPath: logFile,
+  })
+  assert.ok(result.ok)
+  return result.lines
+}
+
+/** Run one rendered crontab command the way cron does (`sh -c`), with a curl that records its argv and its stdin. */
+function runCronCommand(dir: string, command: string, env: Record<string, string>): { argv: string; stdin: string; log: string; ran: boolean } {
+  const bin = join(dir, 'bin')
+  mkdirSync(bin, { recursive: true })
+  const argvLog = join(dir, 'curl-argv.log')
+  const stdinLog = join(dir, 'curl-stdin.log')
+  writeFileSync(join(bin, 'curl'), ['#!/bin/sh', `echo "curl $*" >> ${JSON.stringify(argvLog)}`, `cat >> ${JSON.stringify(stdinLog)}`].join('\n') + '\n')
+  chmodSync(join(bin, 'curl'), 0o755)
+  const sh = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8', env: { PATH: `${bin}:/usr/bin:/bin`, BASE_URL: 'http://localhost:3000/api/cron', ...env } })
+  const read = (f: string) => { try { return readFileSync(f, 'utf8') } catch { return '' } }
+  void sh
+  return { argv: read(argvLog), stdin: read(stdinLog), log: read(join(dir, 'cron.log')), ran: read(argvLog) !== '' }
+}
+
+const commandOf = (line: string) => line.replace(/^\S+(?:\s+\S+){4}\s+/, '')
+
+test('[o3d-kb3dq] the cron jobs: the installer and the app render the SAME line, and it carries no secret', async () => {
+  await withTempDir('ims-cron-', async (dir) => {
+    const envFile = join(dir, '.env')
+    const logFile = join(dir, 'cron.log')
+    writeFileSync(envFile, `NODE_ENV=production\nCRON_SECRET=${CRON_CANARY}\n`)
+    const fromInstaller = installerJobLine(envFile, logFile)
+    const runtimeBlock = appBlock('env-file', envFile, logFile)
+    const fromApp = runtimeBlock.find((l) => l.includes('$BASE_URL/backup')) ?? ''
+    const literalBlock = appBlock('literal', envFile, logFile)
+    console.log(`  installer line: ${fromInstaller.slice(0, 150)}...`)
+    assert.equal(fromInstaller, fromApp, 'the installer and the in-app scheduler write byte-identical job lines')
+    assert.equal(commandOf(fromApp).split('case "$CRON_SECRET"')[1], renderCronJobCommand({ prefix: '', slug: 'backup', logPath: logFile }).split('case "$CRON_SECRET"')[1], 'and both are the shared command text')
+    // no secret in any rendered crontab LINE of the runtime modes; in the literal mode only the one env-assignment line holds it
+    assert.ok(![fromInstaller, ...runtimeBlock].some((l) => l.includes(CRON_CANARY)), 'runtime mode: the secret is in no crontab line')
+    const withSecret = literalBlock.filter((l) => l.includes(CRON_CANARY))
+    assert.deepEqual(withSecret, [`CRON_SECRET="${CRON_CANARY}"`], 'literal mode: only the env-assignment line (the crontab spool is mode 600), never a job line')
+    assert.ok(!literalBlock.filter((l) => l.includes('$BASE_URL/backup')).some((l) => l.includes(CRON_CANARY)))
+  })
+})
+
+test('[o3d-kb3dq] RUNNING the rendered cron command: the secret is on no process command line, it reaches curl on stdin, and a bad secret fails closed with a log line', async () => {
+  for (const [label, makeCommand, env] of [
+    ['installer, runtime .env', (dir: string) => commandOf(installerJobLine(join(dir, '.env'), join(dir, 'cron.log'))), {} as Record<string, string>],
+    ['app, runtime .env', (dir: string) => commandOf(appBlock('env-file', join(dir, '.env'), join(dir, 'cron.log')).find((l) => l.includes('$BASE_URL/backup')) ?? ''), {} as Record<string, string>],
+    ['app, embedded literal', (dir: string) => commandOf(appBlock('literal', join(dir, '.env'), join(dir, 'cron.log')).find((l) => l.includes('$BASE_URL/backup')) ?? ''), { CRON_SECRET: CRON_CANARY }],
+  ] as const) {
+    await withTempDir('ims-cron-run-', async (dir) => {
+      writeFileSync(join(dir, '.env'), `CRON_SECRET="${CRON_CANARY}"\n`)
+      const r = runCronCommand(dir, makeCommand(dir), env)
+      console.log(`  ${label}: curl argv=[${r.argv.trim()}] stdin=[${r.stdin.trim().replace(CRON_CANARY, '<canary>')}]`)
+      assert.ok(r.ran, `${label}: the job ran`)
+      assert.ok(!r.argv.includes(CRON_CANARY), `${label}: no secret on curl's command line`)
+      assert.equal(r.stdin, `header = "Authorization: Bearer ${CRON_CANARY}"\n`, `${label}: the header arrives as a config line on stdin`)
+    })
+    // fail closed: no CRON_SECRET line (runtime) / empty value / a backslash in it -> curl never runs, the log says why, nothing leaks
+    for (const [why, envText, extraEnv] of [['missing', 'NODE_ENV=production\n', {}], ['empty', 'CRON_SECRET=\n', {}], ['backslash', 'CRON_SECRET=ab\\cd\n', {}]] as const) {
+      if (label.endsWith('literal') && why !== 'empty') continue
+      await withTempDir('ims-cron-closed-', async (dir) => {
+        writeFileSync(join(dir, '.env'), envText)
+        const r = runCronCommand(dir, makeCommand(dir), label.endsWith('literal') ? { CRON_SECRET: '' } : extraEnv)
+        assert.equal(r.ran, false, `${label}/${why}: curl was not run (no unauthenticated request)`)
+        assert.match(r.log, /^cron-auth: CRON_SECRET is missing or unusable .*backup was not run$/m, `${label}/${why}: a clear log line`)
+      })
+    }
+  }
+})
+
+test('[o3d-kb3dq] MUTATION: the legacy line (bearer as a curl -H argument) puts the secret on curl\'s command line, so the assertions above CAN fail', async () => {
+  await withTempDir('ims-cron-legacy-', async (dir) => {
+    writeFileSync(join(dir, '.env'), `CRON_SECRET=${CRON_CANARY}\n`)
+    const legacy = `CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${join(dir, '.env')}' | cut -d= -f2- | tr -d '"') && [ -n "$CRON_SECRET" ] && curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/backup" >> '${join(dir, 'cron.log')}' 2>&1`
+    const r = runCronCommand(dir, legacy, {})
+    console.log(`  legacy: curl argv=[${r.argv.trim().replace(CRON_CANARY, '<canary>')}]`)
+    assert.ok(r.argv.includes(CRON_CANARY), 'the legacy shape is visible on curl\'s command line')
+    // and the census sees that shape in RENDERED text, escaped or not
+    assert.ok(census({ 'rendered-legacy.cron': `0 2 * * *  ${legacy}` }).findings.some((f) => f.rule.startsWith('R2')))
+    const escaped = 'CRON_CURL_PREFIX="... && curl -sf -o /dev/null -H \\"Authorization: Bearer \\$CRON_SECRET\\""'
+    assert.ok(census({ 'escaped.sh': escaped }).findings.some((f) => f.rule.startsWith('R2')), 'the escaped/generated form in source is seen too')
+  })
+})
+
+test('[o3d-kb3dq] CENSUS OF THE RENDERED OUTPUT: what install.sh and the app renderer write is scanned, not only the source text', async () => {
+  await withTempDir('ims-cron-census-', async (dir) => {
+    const envFile = join(dir, '.env')
+    const logFile = join(dir, 'cron.log')
+    const rendered = {
+      'rendered:install.sh cron block': installerJobLine(envFile, logFile),
+      'rendered:app env-file block': appBlock('env-file', envFile, logFile).join('\n'),
+      'rendered:app literal block': appBlock('literal', envFile, logFile).join('\n'),
+    }
+    const { scanned, findings } = census(rendered)
+    console.log(`  rendered texts scanned: ${scanned} logical lines in ${Object.keys(rendered).length} outputs; findings ${findings.length}`)
+    assert.ok(scanned >= 6)
+    assert.deepEqual(findings, [])
+  })
+  // and the source files that WRITE cron lines contain no -H bearer text at all
+  const sources: Record<string, string> = { 'scripts/install.sh': INSTALL, 'lib/crontab-sync.ts': readFileSync(join(ROOT, 'lib/crontab-sync.ts'), 'utf8') }
+  for (const [file, text] of Object.entries(sources)) {
+    const hits = text.split('\n').filter((l) => /-H\s+\\?"Authorization: Bearer \\?\$CRON_SECRET/.test(l) && !l.trim().startsWith('#') && !l.trim().startsWith('*') && !l.includes('LEGACY') && !l.includes('MANAGED_JOB_LINE_SIGNATURE'))
+    assert.deepEqual(hits, [], `${file} writes no bearer header argument`)
   }
 })
