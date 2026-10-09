@@ -6,6 +6,7 @@ import { currencyMinorUnits, roundQuantity, toDecimal, type DecimalInput } from 
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from './push-recipient'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere } from './create-eligibility'
@@ -337,6 +338,8 @@ type OrderForPush = {
   customerEmail: string | null
   customerVatNumber: string | null
   shippingAddress: unknown
+  /** Fallback destination and contact details when the shipping address names no recipient. */
+  billingAddress?: unknown
   shippingService: string | null
   subtotalForeign: unknown
   shippingForeign: unknown
@@ -451,26 +454,7 @@ export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPu
 }
 
 export function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
-  const a = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
-  const str = (...keys: string[]): string => {
-    for (const key of keys) {
-      const v = a[key]
-      if (typeof v === 'string' && v.trim()) return v.trim()
-    }
-    return ''
-  }
-  const [firstName, ...rest] = (customerName ?? '').trim().split(/\s+/).filter(Boolean)
-  return {
-    firstName: firstName ?? '',
-    lastName: rest.join(' '),
-    company: str('company'),
-    address1: str('line1', 'address1', 'address_1'),
-    address2: str('line2', 'address2', 'address_2'),
-    town: str('city', 'town'),
-    county: str('county', 'state'),
-    postCode: str('postcode', 'postCode', 'postal_code'),
-    country: str('country'),
-  }
+  return resolvePushRecipient({ shippingAddress: raw, customerName, customerEmail: null }).address
 }
 
 type CandidateLine = {
@@ -524,6 +508,7 @@ const ORDER_PUSH_SELECT = {
   customerEmail: true,
   customerVatNumber: true,
   shippingAddress: true,
+  billingAddress: true,
   shippingService: true,
   subtotalForeign: true,
   shippingForeign: true,
@@ -551,14 +536,17 @@ export function wmsPushOrderReference(
 }
 
 export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
+  const recipient = resolvePushRecipient(order)
+  // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
+  if (!recipient.address.address1) throw new Error(NO_DELIVERY_STREET_REASON)
   return {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,
     externalWarehouseId,
     currency: order.currency,
-    shippingAddress: readAddress(order.shippingAddress, order.customerName),
-    email: order.customerEmail,
-    phone: null,
+    shippingAddress: recipient.address,
+    email: recipient.email,
+    phone: recipient.phone,
     vatNumber: order.customerVatNumber,
     comments: null,
     courierService: order.shippingService,
