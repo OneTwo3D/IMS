@@ -5,9 +5,10 @@
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
+import { claimsToHavePosted, LEDGER_STANDING_SELECT } from './ledger-standing'
 import type { OperatorLedgerCheck } from './operator-ledger-check'
 
-export type OperatorLedgerCheckReader = Pick<Prisma.TransactionClient, 'accountingOperatorLedgerCheck'>
+export type OperatorLedgerCheckReader = Pick<Prisma.TransactionClient, 'accountingOperatorLedgerCheck' | 'accountingSyncLog'>
 
 /** The columns the rule reads. Spread into every select, so no reader can load fewer. */
 export const OPERATOR_LEDGER_CHECK_SELECT = {
@@ -33,8 +34,20 @@ export async function loadOperatorLedgerChecks(
   client: OperatorLedgerCheckReader,
   scope: { syncLogIds: readonly string[]; paymentId: string | null; connector: string },
 ): Promise<OperatorLedgerCheck[]> {
-  const syncLogIds = [...new Set(scope.syncLogIds.filter((id) => typeof id === 'string' && id !== ''))]
-  if (scope.paymentId === null || scope.paymentId === '' || syncLogIds.length === 0) return []
+  const requested = [...new Set(scope.syncLogIds.filter((id) => typeof id === 'string' && id !== ''))]
+  if (scope.paymentId === null || scope.paymentId === '' || requested.length === 0) return []
+  // A CHECK NEVER SPEAKS FOR AN ATTEMPT THAT NOW CLAIMS TO HAVE POSTED. The recorder only writes checks
+  // for unresolved attempts, but an attempt moves on: retried and posted, or settled by an operator as
+  // posted. Its payment is then in the ledger by its own account, and "this record is not that attempt's
+  // payment" is no longer a statement anyone checked against that payment. So the attempt's CURRENT
+  // standing is read here, at every gate that loads checks (the registration decision, the post fence,
+  // the revival gate), and a posted claim drops its checks. A row that no longer exists keeps none either.
+  const attempts = await client.accountingSyncLog.findMany({
+    where: { id: { in: requested } },
+    select: { id: true, ...LEDGER_STANDING_SELECT },
+  })
+  const syncLogIds = attempts.filter((row) => !claimsToHavePosted(row)).map((row) => row.id)
+  if (syncLogIds.length === 0) return []
   const rows = await client.accountingOperatorLedgerCheck.findMany({
     where: { syncLogId: { in: syncLogIds }, paymentId: scope.paymentId, connector: scope.connector },
     select: OPERATOR_LEDGER_CHECK_SELECT,

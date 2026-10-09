@@ -58,6 +58,7 @@ import {
   type ProbeConnectionBinding,
   type SettlementVerdict,
 } from './ledger-settlement-evidence'
+import { LEDGER_CHECK_CONTROL_NAME } from './operator-ledger-check-offer'
 
 /** One recorded check, as the rule reads it. Mirrors the insert-only table's columns. */
 export type OperatorLedgerCheck = {
@@ -90,6 +91,12 @@ export type OperatorLedgerCheckScope = {
   connector: string
   /** The document the probe read. Null = unknown, and no check applies. */
   ledgerDocumentId: string | null
+  /**
+   * The ledger id the attempt row ITSELF records (`externalTransactionId`), when the caller holds it. A
+   * record carrying that id is the attempt's own payment by the row's own account, so no check may set
+   * it aside, whatever a person asserted.
+   */
+  attemptRecordedLedgerId?: string | null
 }
 
 /**
@@ -103,6 +110,8 @@ export type LedgerCheckUnavailableReason =
   | 'connection-unbound'
   /** The row being cleared names no receipt, or the probe read no named document. */
   | 'scope-unnamed'
+  /** An unreadable record carries the very ledger id the attempt row records as its own. */
+  | 'record-is-the-attempts-own'
 
 /** What would lift a withheld attempt, for the operator text. */
 export type LedgerCheckRemedy =
@@ -203,6 +212,10 @@ export function classifyLedgerSettlementWithOperatorChecks(
   if (recordIds.some((id) => id === null)) {
     return { verdict: first, liftedByCheckIds: [], remedy: { liftable: false, reason: 'record-without-id' } }
   }
+  const ownId = normaliseLedgerId(scope.attemptRecordedLedgerId)
+  if (ownId !== null && recordIds.includes(ownId)) {
+    return { verdict: first, liftedByCheckIds: [], remedy: { liftable: false, reason: 'record-is-the-attempts-own' } }
+  }
   // (iii)/(iv) need a probe that can say which connection served it.
   const binding = probe.answeredBy ?? null
   if (binding === null) {
@@ -248,8 +261,7 @@ export function classifyLedgerSettlementWithOperatorChecks(
  * OPERATOR TEXT — single-sourced here, and CONDITIONAL on what the remedy can actually do.
  * ------------------------------------------------------------------------------------------- */
 
-/** The page and control the remedy names. One place, so the refusal and the help text agree. */
-export const LEDGER_CHECK_CONTROL_NAME = 'Checked the ledger'
+export { LEDGER_CHECK_CONTROL_NAME, offersOperatorLedgerCheck } from './operator-ledger-check-offer'
 
 /**
  * THE SENTENCE THAT TELLS AN OPERATOR WHAT LIFTS AN UNMEASURABLE-RECORD HOLD — or why nothing they
@@ -269,6 +281,10 @@ export function describeLedgerCheckRemedy(remedy: LedgerCheckRemedy, attemptLabe
         return 'An operator ledger check cannot lift this hold yet: IMS could not establish which Xero connection '
           + 'answered the reading (the stored connection records no generation, or it changed while the reading '
           + 'ran). Reconnect Xero from Settings, then look at this refusal again.'
+      case 'record-is-the-attempts-own':
+        return 'An operator ledger check cannot lift this hold: one of those settlements carries the very ledger id '
+          + 'the earlier entry records as its own payment. If that payment should not be there, deal with it in the '
+          + 'accounting system first; IMS will not set it aside on anyone\'s word.'
       case 'scope-unnamed':
         return 'An operator ledger check cannot lift this hold: the entry being cleared names no receipt or no '
           + 'ledger document, so a check could not be tied to it. ESCALATE.'
@@ -277,15 +293,31 @@ export function describeLedgerCheckRemedy(remedy: LedgerCheckRemedy, attemptLabe
   const unchecked = remedy.uncheckedRecordIds.length === remedy.recordIds.length
     ? remedy.recordIds
     : remedy.uncheckedRecordIds
-  return `WHAT LIFTS THIS HOLD: open ${unchecked.length === 1 ? 'payment' : 'each of the payments'} `
-    + `${unchecked.join(', ')} on document ${remedy.ledgerDocumentId} in Xero and compare it with ${attemptLabel}. `
-    + `Only if none of them is that attempt's payment, and none is a payment for this receipt already entered by `
-    + `hand, record it on the Accounting Sync page: entry ${remedy.attemptSyncLogId}, "${LEDGER_CHECK_CONTROL_NAME}", `
+  const one = unchecked.length === 1
+  return `WHAT LIFTS THIS HOLD: open ${one ? 'payment' : 'each of the payments'} `
+    + `${unchecked.join(', ')} on document ${remedy.ledgerDocumentId} in Xero and compare ${one ? 'it' : 'each'} with ${attemptLabel}. `
+    + (one
+      ? 'Only if it is not that attempt\'s payment, and not a payment for this receipt already entered by hand, '
+      : 'Only if none of them is that attempt\'s payment, and none is a payment for this receipt already entered by hand, ')
+    + `record that on the Accounting Sync page: entry ${remedy.attemptSyncLogId}, "${LEDGER_CHECK_CONTROL_NAME}", `
     + `for receipt ${remedy.paymentId}. IMS then registers this receipt again through the same checks. The check is `
-    + 'your assertion and is logged against your account; it covers only those payment ids, it is void after any '
+    + 'your assertion and is logged against your account; it covers only those payment ids, it lapses after any '
     + 'Xero reconnect, a payment that appears later holds the receipt again, and it never overrides a payment IMS '
-    + 'can match to the attempt. If one of them IS that attempt\'s payment, do not record a check: settle the '
-    + 'entry as posted instead.'
+    + `can match to the attempt. If ${one ? 'it' : 'one of them'} IS that attempt's payment, do not record a check: `
+    + 'settle the entry as posted instead.'
+}
+
+/**
+ * Why a check that covers every unreadable record still does not get a receipt sent: another
+ * registration on the same invoice has already posted, and the post fence refuses a second payment beside
+ * one IMS posted itself (the documented part-payment limit). No lever is offered, because none exists in
+ * the product; the sentence exists so nobody records checks that cannot work.
+ */
+export function describeLedgerCheckBlockedByPostedRegistration(entryIds: readonly string[]): string {
+  return `An operator ledger check cannot get this receipt sent: ${entryIds.length === 1 ? 'entry' : 'entries'} `
+    + `${entryIds.join(', ')} already posted a payment against this invoice, and the check IMS makes immediately `
+    + 'before sending money refuses a payment beside one IMS has already posted on the same invoice (a known limit '
+    + 'for part payments). A check here would only queue a payment that is then refused. ESCALATE.'
 }
 
 /**
@@ -359,3 +391,4 @@ export async function judgeAttemptWithOperatorChecks(
   }
   return classifyLedgerSettlementWithOperatorChecks(attempt, probe, scope, checks)
 }
+

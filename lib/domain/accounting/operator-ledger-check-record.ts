@@ -29,16 +29,19 @@ import {
 } from './ledger-settlement-evidence'
 import {
   describeUnresolvedAttempt,
+  postedRegistrationsOnDocument,
   unresolvedInvoicePaymentAttempts,
 } from './invoice-payment-registration'
 import { loadInvoicePaymentSyncRows } from './invoice-payment-enqueue'
 import {
   classifyLedgerSettlementWithOperatorChecks,
   describeAttemptForLedgerCheck,
+  describeLedgerCheckBlockedByPostedRegistration,
   describeLedgerCheckRemedy,
   normaliseLedgerId,
 } from './operator-ledger-check'
 import { OPERATOR_ASSERTION_SETTLEMENT_BASIS } from './sync-row-settlement'
+import { claimsToHavePosted } from './ledger-standing'
 
 export type OperatorLedgerCheckClient = Pick<
   Prisma.TransactionClient,
@@ -113,7 +116,10 @@ async function assessAttempt(
   // a check can only be recorded for an attempt that actually holds a receipt back.
   const rows = await loadInvoicePaymentSyncRows(order.id, connector, order.currency, deps.client)
   const attempt = rows.find((candidate) => candidate.id === row.id)
-  if (!attempt || unresolvedInvoicePaymentAttempts([attempt], '').length === 0) {
+  // ...and never one that CLAIMS TO HAVE POSTED (a swept or retired row that still records a ledger id):
+  // its own payment is in the ledger by its own account, so "this record is not its payment" is not a
+  // check anyone can make. The loader drops checks for such rows at every gate as well.
+  if (!attempt || unresolvedInvoicePaymentAttempts([attempt], '').length === 0 || claimsToHavePosted(attempt)) {
     return {
       ok: false,
       code: 'NOT_UNRESOLVED',
@@ -137,7 +143,13 @@ async function assessAttempt(
   const judged = classifyLedgerSettlementWithOperatorChecks(
     description,
     probe,
-    { attemptSyncLogId: row.id, paymentId: '(receipt)', connector, ledgerDocumentId: order.accountingInvoiceId },
+    {
+      attemptSyncLogId: row.id,
+      paymentId: '(receipt)',
+      connector,
+      ledgerDocumentId: order.accountingInvoiceId,
+      attemptRecordedLedgerId: attempt.externalTransactionId,
+    },
     [],
   )
   const verdict = judged.verdict
@@ -151,6 +163,17 @@ async function assessAttempt(
   }
   if (!judged.remedy.liftable) {
     return { ok: false, code: 'NOT_LIFTABLE', error: `${describeLedgerCheckRemedy(judged.remedy, attemptLabel)} Nothing was recorded.` }
+  }
+  // The registration decision would not grant a lift here anyway (see `postedRegistrationsOnDocument`):
+  // a registration on this invoice has posted, and the post fence refuses a payment beside it. Asked of
+  // EVERY posted row (no receipt is chosen yet), which can only refuse more, never less.
+  const posted = postedRegistrationsOnDocument(rows, '', order.accountingInvoiceId)
+  if (posted.length > 0) {
+    return {
+      ok: false,
+      code: 'NOT_LIFTABLE',
+      error: `${describeLedgerCheckBlockedByPostedRegistration(posted.map((r) => r.id ?? '(unidentified entry)'))} Nothing was recorded.`,
+    }
   }
   const records = probe.records
     .filter(isUnmeasurableSettlementRecord)

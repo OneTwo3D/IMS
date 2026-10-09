@@ -14,6 +14,7 @@
  */
 
 import {
+  claimsToHavePosted,
   mayHaveReachedLedger,
   type LedgerStandingRow,
 } from './ledger-standing'
@@ -25,7 +26,9 @@ import {
 import {
   classifyLedgerSettlementWithOperatorChecks,
   describeAttemptForLedgerCheck,
+  describeLedgerCheckBlockedByPostedRegistration,
   describeLedgerCheckRemedy,
+  sameLedgerId,
   type OperatorLedgerCheck,
 } from './operator-ledger-check'
 import { LEDGER_HELD_REGISTRATION_STATUSES } from './payment-ledger-hold'
@@ -380,6 +383,23 @@ export function retiredDocumentInvoicePaymentAttempts(
  */
 
 /**
+ * o3d-llyw — REGISTRATIONS ON THIS INVOICE THAT CLAIM TO HAVE POSTED, other than this receipt's own: the
+ * entries the post fence will judge as contenders whose payment is in the ledger. Read through
+ * `claimsToHavePosted` (ledger-standing.ts). A row naming no document counts — unknown reads as
+ * "possibly this one", the direction that withholds.
+ */
+export function postedRegistrationsOnDocument(
+  existing: ExistingInvoicePaymentSync[],
+  paymentId: string,
+  accountingInvoiceId: string,
+): ExistingInvoicePaymentSync[] {
+  return existing.filter((r) =>
+    claimsToHavePosted(r)
+    && (r.paymentId == null || r.paymentId !== paymentId)
+    && (r.accountingInvoiceId == null || sameLedgerId(r.accountingInvoiceId, accountingInvoiceId)))
+}
+
+/**
  * WHAT AN UNRESOLVED ATTEMPT SENT, as the settlement classifier compares it — the one description, used
  * by the decision below and by the operator ledger check (which must judge the attempt exactly as the
  * decision does, or a check could be recorded against a verdict the decision never reaches).
@@ -583,6 +603,7 @@ export function decideInvoicePaymentRegistration(input: {
           paymentId: input.paymentId,
           connector: input.connector ?? '',
           ledgerDocumentId: input.accountingInvoiceId,
+          attemptRecordedLedgerId: attempt.externalTransactionId,
         },
         input.operatorLedgerChecks ?? [],
       )
@@ -614,6 +635,30 @@ export function decideInvoicePaymentRegistration(input: {
               })),
             }
           : {}),
+      }
+    }
+  }
+
+  // o3d-llyw — A LIFT THE POST FENCE WOULD UNDO IS NOT GRANTED HERE.
+  //
+  // `authoriseMoneyPost` judges EVERY previously-attempted entry on this document immediately before the
+  // money moves, and an entry that has POSTED is one of them: its own payment is in the ledger, so its
+  // turn answers `present` (or, if that payment is the unreadable record, `unknown`) and the post is
+  // refused — the documented part-payment limit of that fence (followup-retry-guard.ts, "WHAT THIS STILL
+  // COSTS"). A check can never lift that turn: the record IS that entry's payment, and the recorder
+  // refuses a check against a posted row. So when a check lifted this decision but a posted registration
+  // sits on the same invoice, registering would only queue a payment the fence then refuses — and that
+  // refused row would itself become a FAILED attempt holding the next receipt back. Refuse here instead,
+  // and say why, so the operator is not sent to record a check that cannot get the money sent.
+  if (liftedByCheckIds.size > 0) {
+    const posted = postedRegistrationsOnDocument(input.existing, input.paymentId, input.accountingInvoiceId)
+    if (posted.length > 0) {
+      return {
+        register: false,
+        refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
+        ledgerTotal: input.ledgerTotal,
+        detail: 'an operator ledger check covers the earlier attempt, but another registration on this invoice has already posted',
+        ledgerCheckRemedy: describeLedgerCheckBlockedByPostedRegistration(posted.map((r) => r.id ?? '(unidentified entry)')),
       }
     }
   }

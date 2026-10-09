@@ -1228,7 +1228,9 @@ payment in Xero is manual work, and nobody is told it happened.
 
 Recording a **second receipt** against an order with an unresolved failed attempt is refused on the
 same grounds, with a warning on the order: the receipt stays recorded in IMS, and nothing is sent
-to Xero until the earlier attempt is resolved.
+to Xero until the earlier attempt is resolved. When the reason is a settlement in Xero that IMS
+**cannot read**, the warning says so and names the one thing that lifts it — see
+[When Xero holds a payment IMS cannot read](#when-xero-holds-a-payment-ims-cannot-read-checked-the-ledger).
 
 ### Closing a Payment That Is Already in the Ledger
 
@@ -1248,6 +1250,42 @@ outcomes:
 | It could not be read | Refused. Try again when the connector responds |
 
 Only a `FAILED` payment row can be closed this way, and every use is written to the activity log.
+
+### When Xero holds a payment IMS cannot read ("Checked the ledger")
+
+Sometimes Xero reports a payment on an invoice with a figure or a date IMS will not read — for example
+an amount with more decimal places than the currency has. IMS cannot tell whether that payment is the
+one an earlier, unresolved attempt made, so it refuses every later receipt on the order (*an earlier
+payment attempt on this order did not resolve and could not be ruled out*). Nothing that happens later
+makes Xero's figure readable, so without a person the hold would never lift.
+
+The warning on the order names exactly what lifts it: the Xero payment id(s), the document, the
+earlier entry (with the amount, date and `IMS-…` reference it sent), and the receipt. On the
+**Sync Dashboard**, a `FAILED` or `CANCELLED` customer-receipt entry carries a **Checked the ledger**
+action. It reads Xero again, lists the unreadable payments, and asks you to choose the receipt and
+confirm:
+
+> I opened every settlement listed above in Xero. None of them is the payment that earlier attempt
+> made, and none is a payment for the chosen receipt that was already entered by hand.
+
+Only record it if that is true. If one of them **is** the earlier attempt's payment, do not record a
+check — settle that entry as posted instead. A recorded check is **your assertion**, not something IMS
+verified, and it is logged against your account. IMS then registers the receipt again through the same
+checks, and checks the ledger once more immediately before the payment is sent.
+
+What a check does **not** do, by design:
+
+| Situation | What happens |
+| --- | --- |
+| Xero shows a payment IMS **can** match to the earlier attempt | The receipt stays refused. A check never overrides a payment IMS can see is that attempt's |
+| A new unreadable payment appears after the check | The receipt is held again until that payment is checked too |
+| Xero is **reconnected** (to any organisation, including the same one) | Every earlier check lapses; record it again under the new connection |
+| The list Xero returned changed between opening the dialog and recording | Nothing is recorded; reopen the dialog and look again |
+| An unreadable payment carries **no id**, or IMS cannot tell which Xero connection answered | No check can be recorded; the warning says which |
+| The unreadable payment belongs to **another receipt that already posted** on the same invoice | No check can help, and the warning says so: IMS's last check before sending refuses a second payment beside one it has already posted on the same invoice (a known limit for part payments) |
+
+Checks are kept permanently and cannot be edited or deleted. Each one records the entry, the receipt,
+the Xero payment ids, the Xero organisation and connection it was made under, who made it and when.
 #### Retrying is not protected by idempotency — check Xero first
 
 IMS derives every `Idempotency-Key` deterministically from the sync entry id, so a re-post sends the
@@ -1471,7 +1509,7 @@ A payment recorded on a sales order (**Add Payment**) is registered against the 
 
 If any of those does not hold, the receipt is still recorded in the IMS, nothing is sent, and a warning naming the order appears in the activity log — the order then shows **NOT SENT TO LEDGER** until it is registered.
 
-**Part payments.** Each receipt gets its own Xero payment, so a deposit followed by a balance settles the invoice in two steps without anyone touching Xero. The IMS keeps a running total instead of a one-at-a-time rule: the receipt that would take the total past the invoice is the one refused, and the warning names both figures. If a registration already on the invoice does not record its amount, the IMS cannot work out the room left and refuses rather than guess.
+**Part payments.** Each receipt gets its own Xero payment, so a deposit followed by a balance settles the invoice in two steps without anyone touching Xero. The IMS keeps a running total instead of a one-at-a-time rule: the receipt that would take the total past the invoice is the one refused, and the warning names both figures. If a registration already on the invoice does not record its amount, the IMS cannot work out the room left and refuses rather than guess. **Known limit:** the last check made immediately before a payment is sent judges every payment IMS has already sent against the same invoice, and it currently refuses a payment beside one IMS has already *posted* there — so a balance recorded after a posted deposit is queued and then refused at that point, with the reason on the entry.
 
 **Imported orders.** A paid WooCommerce order registers its payment automatically without creating a payment row in the IMS. That registration cannot be matched to any particular receipt, so while it is there the IMS will not register a hand-recorded one on the same order — recording "the" payment afterwards would pay the Xero invoice twice.
 
