@@ -13,6 +13,9 @@
  */
 import { createHash } from 'node:crypto'
 import { CsvFormatError, parseCsvStrict } from './csv'
+import { dateFormatProblem, parseDateByFormat } from './dates'
+import { D, parseDecimal } from './money'
+import { idToken } from './validate'
 import { DATASETS, SOURCES, type DatasetName, type SourceName } from './spec'
 
 export class InputError extends Error {
@@ -34,6 +37,47 @@ export interface DatasetMapping {
   /** When present, the file's header row must equal this list exactly (pins the sample's header against export drift). */
   expectedHeaders: string[] | null
   delimiter: string
+  /** 1 when the header row is preceded by one row of labels (the 'wide warehouse blocks' layout, or a file that has one and is read without it). */
+  rowsAboveHeader: 0 | 1
+  /** The 'wide warehouse blocks' layout: one source row becomes one canonical row per warehouse block. */
+  wide: WideLayout | null
+  /** A closed list of the values of one column that decide whether a source row belongs to this dataset. */
+  rowSelect: RowSelect | null
+  /** Rows that follow a parent row inherit its SKU as their parent (grouped layouts such as bundle files). */
+  parentFrom: ParentFrom | null
+  /** canonical column -> another canonical column of the same row it is derived from (then run through its own valueMaps). */
+  derived: Record<string, string>
+  /** canonical column -> source date format (see dates.ts); the value is converted to YYYY-MM-DD. */
+  dateFormats: Record<string, string>
+}
+
+export interface WideLayout {
+  blockStart: 'after-label' | 'at-label'
+  /** label in the row above the header (trimmed) -> warehouse code. A closed list. */
+  warehouses: Record<string, string>
+  /** canonical column -> header that must appear exactly once in every block */
+  blockColumns: Record<string, string>
+  /**
+   * canonical column (one of blockColumns) -> header of the report's all-warehouses total for it, which must appear exactly once before the
+   * first block. Every source row must have the total equal to the exact sum of its blocks, or the row is rejected (a misaligned, missing or
+   * edited warehouse cell cannot pass).
+   */
+  totals: Record<string, string>
+  /** canonical column that must be unique across the source rows: a wide file is ONE row per key, and a repeated key rejects every row that carries it (rows are never summed). */
+  uniqueBy: string
+}
+
+export interface RowSelect {
+  column: string
+  keep: string[]
+  skip: string[]
+}
+
+export interface ParentFrom {
+  column: string
+  parentValues: string[]
+  skuColumn: string
+  into: string
 }
 
 export interface ColumnMap {
@@ -42,7 +86,7 @@ export interface ColumnMap {
 }
 
 const MAP_KEYS = new Set(['formatVersion', 'source', 'datasets'])
-const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator'])
+const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats'])
 const DELIMITERS = new Set([',', ';', '\t', '|'])
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -60,6 +104,179 @@ function stringRecord(value: unknown, where: string, problems: string[]): Record
     else out[key] = entry
   }
   return out
+}
+
+/**
+ * The key of a source row of a wide file: the CANONICAL value of the key column (after the map's valueMaps) normalised like the loader's
+ * identifiers (NFKC, no spaces, control or zero-width characters, upper-case). Two source values that become the same canonical SKU are one key.
+ */
+function wideKeyOf(mapping: DatasetMapping, cell: string): string {
+  let value = clean(cell)
+  const valueMap = mapping.valueMaps[mapping.wide!.uniqueBy]
+  if (valueMap && Object.prototype.hasOwnProperty.call(valueMap, value)) value = clean(valueMap[value])
+  return idToken(value)
+}
+
+const WIDE_KEYS = new Set(['blockStart', 'warehouses', 'blockColumns', 'totals', 'uniqueBy'])
+const ROW_SELECT_KEYS = new Set(['column', 'keep', 'skip'])
+const PARENT_FROM_KEYS = new Set(['column', 'parentValues', 'skuColumn', 'into'])
+
+function stringList(value: unknown, where: string, problems: string[], allowEmpty: boolean): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    problems.push(`${where} must be an array of strings`)
+    return []
+  }
+  if (!allowEmpty && value.length === 0) problems.push(`${where} must not be empty`)
+  return value as string[]
+}
+
+/**
+ * The layout keys of one dataset entry (wide warehouse blocks, row selection, grouped parents, derived columns, date formats),
+ * every one of them closed and strict, plus the "required column is supplied" check, which has to know about all of them.
+ */
+function parseLayoutKeys(
+  entry: Record<string, unknown>,
+  where: string,
+  name: string,
+  spec: (typeof DATASETS)[DatasetName],
+  parts: { columns: Record<string, string>; constants: Record<string, string>; valueMaps: Record<string, Record<string, string>> },
+  problems: string[],
+): Pick<DatasetMapping, 'rowsAboveHeader' | 'wide' | 'rowSelect' | 'parentFrom' | 'derived' | 'dateFormats'> {
+  const { columns, constants, valueMaps } = parts
+  const canonical = new Set(spec.columns)
+  const supplied = new Set<string>([...Object.keys(columns), ...Object.keys(constants)])
+
+  let rowsAboveHeader: 0 | 1 = 0
+  if (entry.rowsAboveHeader !== undefined) {
+    if (entry.rowsAboveHeader === 0 || entry.rowsAboveHeader === 1) rowsAboveHeader = entry.rowsAboveHeader
+    else problems.push(`${where}.rowsAboveHeader must be 0 or 1 (1 = one row of labels above the header row)`)
+  }
+
+  let wide: WideLayout | null = null
+  if (entry.wide !== undefined) {
+    const w = entry.wide
+    if (!isPlainObject(w)) problems.push(`${where}.wide must be an object`)
+    else {
+      for (const key of Object.keys(w)) if (!WIDE_KEYS.has(key)) problems.push(`${where}.wide: unknown key "${key}"`)
+      if (!canonical.has('warehouseCode')) problems.push(`${where}.wide: dataset ${name} has no warehouseCode column, so it cannot be read in warehouse blocks`)
+      if (rowsAboveHeader !== 1) problems.push(`${where}.wide needs "rowsAboveHeader": 1 (the warehouse labels are the row above the header row)`)
+      if (w.blockStart !== 'after-label' && w.blockStart !== 'at-label') problems.push(`${where}.wide.blockStart must be "after-label" (a block starts in the column after its label) or "at-label" (in the label's own column)`)
+      const warehouses = stringRecord(w.warehouses ?? {}, `${where}.wide.warehouses`, problems)
+      if (Object.keys(warehouses).length === 0) problems.push(`${where}.wide.warehouses must name at least one warehouse label`)
+      if (Object.keys(warehouses).length > 99) problems.push(`${where}.wide.warehouses names more than 99 warehouses; a block is numbered with two digits in the report`)
+      const codes = new Map<string, string>()
+      for (const [label, code] of Object.entries(warehouses)) {
+        if (label !== label.trim() || label === '') problems.push(`${where}.wide.warehouses: label ${JSON.stringify(label)} must be non-empty and trimmed (labels are trimmed before they are matched)`)
+        if (code.trim() === '' || /\s/.test(code)) problems.push(`${where}.wide.warehouses: the code for ${JSON.stringify(label)} must be non-empty and contain no whitespace`)
+        const upper = code.toUpperCase()
+        const other = codes.get(upper)
+        if (other !== undefined) problems.push(`${where}.wide.warehouses: labels ${JSON.stringify(other)} and ${JSON.stringify(label)} map to the same warehouse code ${JSON.stringify(code)}; two blocks would be merged into one warehouse`)
+        codes.set(upper, label)
+      }
+      const blockColumns = stringRecord(w.blockColumns ?? {}, `${where}.wide.blockColumns`, problems)
+      const headers = new Map<string, string>()
+      for (const [column, header] of Object.entries(blockColumns)) {
+        if (!canonical.has(column)) problems.push(`${where}.wide.blockColumns: "${column}" is not a canonical column of ${name}`)
+        if (column === 'warehouseCode') problems.push(`${where}.wide.blockColumns: warehouseCode comes from the label, not from a column`)
+        if (column in columns || column in constants) problems.push(`${where}: "${column}" is read from a warehouse block and is also mapped or given a constant`)
+        if (header.trim() === '') problems.push(`${where}.wide.blockColumns.${column}: the block header is empty`)
+        const clash = headers.get(header)
+        if (clash !== undefined) problems.push(`${where}.wide.blockColumns: header "${header}" is used for both ${clash} and ${column}`)
+        headers.set(header, column)
+        supplied.add(column)
+      }
+      if (Object.keys(blockColumns).length === 0) problems.push(`${where}.wide.blockColumns must name at least one column read from each block`)
+      for (const column of ['warehouseCode']) {
+        if (column in columns || column in constants || column in valueMaps) problems.push(`${where}: warehouseCode is set by the wide layout's labels and cannot also be mapped, given a constant or value-mapped`)
+      }
+      supplied.add('warehouseCode')
+      const totals = stringRecord(w.totals ?? {}, `${where}.wide.totals`, problems)
+      if (Object.keys(totals).length === 0) problems.push(`${where}.wide.totals is required: name the report's all-warehouses total header for each block column, so every row can be reconciled`)
+      for (const column of Object.keys(blockColumns)) {
+        if (!(column in totals)) problems.push(`${where}.wide.totals: block column "${column}" has no total header; every column read from the blocks must be reconciled to the report's total (omitting one would let a changed warehouse cell pass)`)
+      }
+      for (const [column, header] of Object.entries(totals)) {
+        if (!(column in blockColumns)) problems.push(`${where}.wide.totals: "${column}" is not one of wide.blockColumns`)
+        if (header.trim() === '') problems.push(`${where}.wide.totals.${column}: the total header is empty`)
+      }
+      if (w.uniqueBy !== 'sku') problems.push(`${where}.wide.uniqueBy must be "sku": the key of a wide file is the column mapped to the canonical sku, because that is what makes two rows the same stock (any other column would let two rows of one SKU through)`)
+      else if (!('sku' in columns)) problems.push(`${where}.wide.uniqueBy is "sku", so sku must be mapped to a source column`)
+      if (typeof w.uniqueBy !== 'string' || !(w.uniqueBy in columns)) problems.push(`${where}.wide.uniqueBy must name a mapped per-row canonical column (for example sku): a wide file is one row per key`)
+      if ((w.blockStart === 'after-label' || w.blockStart === 'at-label') && Object.keys(warehouses).length > 0) {
+        wide = { blockStart: w.blockStart, warehouses, blockColumns, totals, uniqueBy: typeof w.uniqueBy === 'string' ? w.uniqueBy : '' }
+      }
+    }
+  }
+
+  let rowSelect: RowSelect | null = null
+  if (entry.rowSelect !== undefined) {
+    const r = entry.rowSelect
+    if (!isPlainObject(r)) problems.push(`${where}.rowSelect must be an object`)
+    else {
+      for (const key of Object.keys(r)) if (!ROW_SELECT_KEYS.has(key)) problems.push(`${where}.rowSelect: unknown key "${key}"`)
+      if (typeof r.column !== 'string' || r.column.trim() === '') problems.push(`${where}.rowSelect.column must be a source header`)
+      const keep = stringList(r.keep, `${where}.rowSelect.keep`, problems, false)
+      const skip = r.skip === undefined ? [] : stringList(r.skip, `${where}.rowSelect.skip`, problems, true)
+      for (const value of keep) if (skip.includes(value)) problems.push(`${where}.rowSelect: value ${JSON.stringify(value)} is in both keep and skip`)
+      if (typeof r.column === 'string') rowSelect = { column: r.column, keep, skip }
+    }
+  }
+
+  let parentFrom: ParentFrom | null = null
+  if (entry.parentFrom !== undefined) {
+    const r = entry.parentFrom
+    if (!isPlainObject(r)) problems.push(`${where}.parentFrom must be an object`)
+    else {
+      for (const key of Object.keys(r)) if (!PARENT_FROM_KEYS.has(key)) problems.push(`${where}.parentFrom: unknown key "${key}"`)
+      if (typeof r.column !== 'string' || r.column.trim() === '') problems.push(`${where}.parentFrom.column must be a source header`)
+      if (typeof r.skuColumn !== 'string' || r.skuColumn.trim() === '') problems.push(`${where}.parentFrom.skuColumn must be a source header`)
+      if (typeof r.into !== 'string' || !canonical.has(r.into)) problems.push(`${where}.parentFrom.into must be a canonical column of ${name}`)
+      else {
+        if (r.into in columns || r.into in constants) problems.push(`${where}: "${r.into}" is taken from the parent row and is also mapped or given a constant`)
+        supplied.add(r.into)
+      }
+      const parentValues = stringList(r.parentValues, `${where}.parentFrom.parentValues`, problems, false)
+      if (typeof r.column === 'string' && typeof r.skuColumn === 'string' && typeof r.into === 'string') {
+        parentFrom = { column: r.column, parentValues, skuColumn: r.skuColumn, into: r.into }
+      }
+      if (rowSelect && parentFrom && rowSelect.column !== parentFrom.column) problems.push(`${where}: rowSelect.column and parentFrom.column must be the same source header`)
+    }
+  }
+
+  const derived: Record<string, string> = {}
+  if (entry.derived !== undefined) {
+    const d = stringRecord(entry.derived, `${where}.derived`, problems)
+    const order = Object.keys(d)
+    order.forEach((column, index) => {
+      const from = d[column]
+      if (!canonical.has(column)) problems.push(`${where}.derived: "${column}" is not a canonical column of ${name}`)
+      else if (!canonical.has(from)) problems.push(`${where}.derived.${column}: "${from}" is not a canonical column of ${name}`)
+      else if (column === from) problems.push(`${where}.derived.${column}: a column cannot be derived from itself`)
+      else if (order.indexOf(from) >= index) problems.push(`${where}.derived.${column}: "${from}" is derived later (or is circular); list a derived column after the one it reads`)
+      if (column in columns || column in constants) problems.push(`${where}: "${column}" is derived and is also mapped or given a constant`)
+      if (!(column in valueMaps)) problems.push(`${where}.derived.${column}: a derived column needs a valueMaps.${column} (a closed list from the source column's value)`)
+      derived[column] = from
+      supplied.add(column)
+    })
+  }
+
+  const dateFormats: Record<string, string> = {}
+  if (entry.dateFormats !== undefined) {
+    const f = stringRecord(entry.dateFormats, `${where}.dateFormats`, problems)
+    for (const [column, format] of Object.entries(f)) {
+      if (!canonical.has(column)) problems.push(`${where}.dateFormats: "${column}" is not a canonical column of ${name}`)
+      else if (!(column in columns)) problems.push(`${where}.dateFormats.${column}: only a column that is mapped to a source column can have a date format`)
+      const bad = dateFormatProblem(format)
+      if (bad) problems.push(`${where}.dateFormats.${column}: ${bad}`)
+      if (column in valueMaps) problems.push(`${where}.dateFormats.${column}: a date column cannot also have valueMaps`)
+      dateFormats[column] = format
+    }
+  }
+
+  for (const required of spec.required) {
+    if (!supplied.has(required)) problems.push(`${where}: required canonical column "${required}" is neither mapped nor given a constant`)
+  }
+  return { rowsAboveHeader, wide, rowSelect, parentFrom, derived, dateFormats }
 }
 
 export function parseColumnMap(jsonText: string, label: string): ColumnMap {
@@ -130,10 +347,8 @@ export function parseColumnMap(jsonText: string, label: string): ColumnMap {
       for (const [header, mapped] of bySource) {
         if (mapped.length > 1) problems.push(`${where}.columns: source header "${header}" is mapped to more than one canonical column (${mapped.join(', ')}); that is ambiguous`)
       }
-      for (const required of spec.required) {
-        if (!(required in columns) && !(required in constants)) problems.push(`${where}: required canonical column "${required}" is neither mapped nor given a constant`)
-      }
-      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, delimiter: typeof delimiter === 'string' ? delimiter : ',' }
+      const layout = parseLayoutKeys(entry, where, name, spec, { columns, constants, valueMaps }, problems)
+      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
     }
   }
   if (problems.length > 0) throw new InputError(problems)
@@ -166,8 +381,165 @@ export interface IngestedDataset {
   rejected: IngestRejection[]
   /** Source columns no canonical column reads. Listed in the report so a forgotten column is visible. */
   unmappedHeaders: string[]
-  /** Data records read (rows + rejected). Blank lines are not data records. */
+  /**
+   * Canonical records read (rows + rejected). Blank lines are not data records, and neither are rows the map's `rowSelect`
+   * skipped. In a wide-warehouse-blocks file one source row is one record PER warehouse block.
+   */
   recordsRead: number
+  /** Rows the map's closed `rowSelect.skip` list deliberately left out, by the value that skipped them. Not records. */
+  rowsSkipped: Record<string, number>
+  /**
+   * Rows a LATER file of the same dataset deliberately replaced (manifest `supersedesEarlier`), with the line they were on.
+   * They are records read, and the transform books each as EXCLUDED, so the accounting still reconciles.
+   */
+  superseded: Array<{ line: number; key: string; reason: string }>
+  /**
+   * Wide files only: the per-row key (canonical column) and every source row's key with its line, including rows that were later rejected.
+   * mergeIngested uses it to refuse a key that appears in more than one file.
+   */
+  wideKey: { column: string; keys: Array<{ key: string; line: number }> } | null
+  /** One entry per file read into this dataset (several when a manifest lists the dataset more than once). */
+  parts: Array<{ file: string; sha256: string; bytes: number }>
+}
+
+/** A dataset read from several files: line numbers of part N are reported as N * PART_LINE_STRIDE + the physical line (part 0 is the first file listed). */
+export const PART_LINE_STRIDE = 1_000_000
+
+/**
+ * Merge the files of one dataset. A part flagged `supersedesEarlier` (products only) replaces rows of EARLIER parts that have the same SKU
+ * (compared upper-case, as the importers do); the replaced rows are kept in `superseded`, never silently dropped.
+ */
+export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = parts.map(() => false)): IngestedDataset {
+  if (parts.length === 1 && !supersedes[0]) return parts[0]
+  const first = parts[0]
+  const superseded: IngestedDataset['superseded'] = parts.flatMap((part, index) => part.superseded.map((entry) => ({ ...entry, line: Number((entry.line + index * PART_LINE_STRIDE).toFixed(2)) })))
+  const kept: CanonRow[][] = parts.map((part) => [...part.rows])
+  const conflicts: IngestRejection[] = []
+  const at = (line: number, index: number) => Number((line + index * PART_LINE_STRIDE).toFixed(2))
+  parts.forEach((part, index) => {
+    if (!supersedes[index]) return
+    // Earlier rows with the same SKU are MERGED into the later row, never just dropped: a field the later file does not read (or leaves blank)
+    // keeps the earlier value; a non-blank field that disagrees rejects the later row; the type may only change SIMPLE -> KIT/BOM.
+    const matches = new Map<string, Array<{ row: CanonRow; part: number }>>()
+    for (let earlier = 0; earlier < index; earlier++) {
+      for (const row of kept[earlier]) {
+        const key = row.values.sku.toUpperCase()
+        if (key !== '') matches.set(key, [...(matches.get(key) ?? []), { row, part: earlier }])
+      }
+    }
+    const replaced = new Set<CanonRow>()
+    const rows: CanonRow[] = []
+    for (const row of kept[index]) {
+      const list = matches.get(row.values.sku.toUpperCase())
+      if (!list) {
+        rows.push(row)
+        continue
+      }
+      const values = { ...row.values }
+      const filled: string[] = []
+      const problems: string[] = []
+      for (const column of Object.keys(values)) {
+        const earlierValues = [...new Set(list.map((match) => match.row.values[column] ?? '').filter((value) => value !== ''))]
+        if (column === 'type') {
+          const ok = earlierValues.every((value) => value === values.type || (value === 'SIMPLE' && (values.type === 'KIT' || values.type === 'BOM')))
+          if (!ok) problems.push(`type ${JSON.stringify(earlierValues)} -> ${JSON.stringify(values.type)} (only SIMPLE -> KIT or BOM may change)`)
+          continue
+        }
+        const all = [...new Set([...earlierValues, ...(values[column] !== '' ? [values[column]] : [])])]
+        if (all.length > 1) problems.push(`${column} differs (${all.map((value) => JSON.stringify(value)).join(' vs ')})`)
+        else if (values[column] === '' && all.length === 1) {
+          values[column] = all[0]
+          filled.push(column)
+        }
+      }
+      for (const match of list) {
+        // One earlier row can be matched by several later rows (a product listed in several groups): it is replaced, and booked, once.
+        if (replaced.has(match.row)) continue
+        replaced.add(match.row)
+        superseded.push({
+          line: at(match.row.line, match.part),
+          key: match.row.values.sku,
+          reason: problems.length > 0
+            ? `replaced by the row for the same SKU in ${part.file}, which was then rejected for a conflict`
+            : `replaced by the row for the same SKU in ${part.file} (the manifest says that file supersedes earlier ones)${filled.length > 0 ? `; kept from this row: ${filled.join(', ')}` : ''}`,
+        })
+      }
+      if (problems.length > 0) {
+        conflicts.push({ line: at(row.line, index), code: 'SUPERSEDE_CONFLICT', reason: `the earlier row(s) for this SKU disagree with this one: ${problems.join('; ')}. Nothing is overwritten silently; fix the data or make the exports agree` })
+      } else rows.push({ line: row.line, values })
+    }
+    kept[index] = rows
+    for (let earlier = 0; earlier < index; earlier++) kept[earlier] = kept[earlier].filter((row) => !replaced.has(row))
+  })
+  // A wide report is one row per key ACROSS FILES too: a key present in more than one file refuses EVERY source row that carries it, in every
+  // file, whether that row was accepted (its block records are replaced by one rejection) or already refused (its existing rejection is
+  // extended to name the other files and lines). One disposition per source row either way.
+  const crossRejected: IngestRejection[] = []
+  const rejectedOf: IngestRejection[][] = parts.map((part) => [...part.rejected])
+  let removedRecords = 0
+  const keyColumn = parts.find((part) => part.wideKey)?.wideKey?.column
+  if (keyColumn) {
+    const where = new Map<string, Array<{ part: number; line: number }>>()
+    parts.forEach((part, index) => {
+      for (const entry of part.wideKey?.keys ?? []) where.set(entry.key, [...(where.get(entry.key) ?? []), { part: index, line: entry.line }])
+    })
+    const spread = new Map([...where].filter(([, list]) => new Set(list.map((entry) => entry.part)).size > 1))
+    if (spread.size > 0) {
+      parts.forEach((part, index) => {
+        if (!part.wideKey) return
+        const accepted = new Map<number, CanonRow[]>()
+        const stay: CanonRow[] = []
+        for (const row of kept[index]) {
+          if (spread.has(idToken(row.values[keyColumn] ?? ''))) accepted.set(Math.floor(row.line), [...(accepted.get(Math.floor(row.line)) ?? []), row])
+          else stay.push(row)
+        }
+        const seenLines = new Set<number>()
+        for (const entry of part.wideKey.keys) {
+          const list = spread.get(entry.key)
+          if (!list || seenLines.has(entry.line)) continue
+          seenLines.add(entry.line)
+          const others = list.filter((other) => other.part !== index).map((other) => `${parts[other.part].file} line ${other.line}`)
+          const removed = accepted.get(entry.line)
+          if (removed) {
+            removedRecords += removed.length
+            crossRejected.push({
+              line: at(entry.line, index),
+              code: 'DUPLICATE_SOURCE_ROW',
+              reason: `${keyColumn} ${JSON.stringify(removed[0].values[keyColumn])} is also on ${others.join(', ')}; a one-row-per-key report must not repeat a key across files, and warehouse quantities of two rows are never added together. Fix it in the source`,
+            })
+          } else {
+            // Already refused inside its own file: say where else the key is, so no offending row is left unexplained.
+            rejectedOf[index] = rejectedOf[index].map((rejection) => (rejection.line === entry.line && !rejection.reason.includes(' Also on ') ? { ...rejection, reason: `${rejection.reason}. Also on ${others.join(', ')} (the key repeats across files)` } : rejection))
+          }
+        }
+        kept[index] = stay
+      })
+    }
+  }
+  const rowsSkipped: Record<string, number> = {}
+  const unmapped: string[] = []
+  for (const part of parts) {
+    for (const [key, count] of Object.entries(part.rowsSkipped)) rowsSkipped[key] = (rowsSkipped[key] ?? 0) + count
+    for (const name of part.unmappedHeaders) if (!unmapped.includes(name)) unmapped.push(name)
+  }
+  const offset = (index: number) => index * PART_LINE_STRIDE
+  const shifted = (line: number, index: number) => Number((line + offset(index)).toFixed(2))
+  return {
+    dataset: first.dataset,
+    file: parts.map((part) => part.file).join(' + '),
+    sha256: createHash('sha256').update(parts.map((part) => part.sha256).join('\n')).digest('hex'),
+    bytes: parts.reduce((total, part) => total + part.bytes, 0),
+    hadBom: parts.some((part) => part.hadBom),
+    blankRows: parts.reduce((total, part) => total + part.blankRows, 0),
+    rows: kept.flatMap((rows, index) => rows.map((row) => ({ ...row, line: shifted(row.line, index) }))),
+    rejected: [...rejectedOf.flatMap((list, index) => list.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))), ...conflicts, ...crossRejected],
+    unmappedHeaders: unmapped,
+    recordsRead: parts.reduce((total, part) => total + part.recordsRead, 0) - removedRecords + crossRejected.length,
+    superseded,
+    wideKey: null,
+    rowsSkipped,
+    parts: parts.flatMap((part) => part.parts),
+  }
 }
 
 /**
@@ -184,12 +556,82 @@ function hint(wanted: string, headers: string[]): string {
   return near.length > 0 ? ` A similar header exists (${near.map((h) => JSON.stringify(h)).join(', ')}); it was NOT used, correct the column map if it is the right one.` : ''
 }
 
+/**
+ * The identity of one canonical record from a wide-warehouse-blocks file: source line L, warehouse block B (1-based, file order)
+ * is reported as L.0B (line 12, block 3 = 12.03), so every record has its own number and its own disposition.
+ * A row refused before it is split into blocks (ragged, unlisted row kind) is one record, reported as the plain line.
+ */
+export function slotLine(line: number, position: number): number {
+  return Number((line + (position + 1) / 100).toFixed(2))
+}
+
+interface Block {
+  label: string
+  code: string
+  start: number
+  end: number
+  /** canonical column -> index in the header row */
+  index: Map<string, number>
+}
+
+/** Lay out the warehouse blocks of a wide file, or say precisely why the file does not fit the declared layout. */
+function layoutBlocks(wide: WideLayout, labelRow: string[], header: string[], file: string, problems: string[]): Block[] {
+  const labelCount = new Map<string, number>()
+  const found: Array<{ label: string; at: number }> = []
+  labelRow.forEach((cell, at) => {
+    const label = cell.trim()
+    if (label === '') return
+    labelCount.set(label, (labelCount.get(label) ?? 0) + 1)
+    found.push({ label, at })
+  })
+  if (labelRow.length !== header.length) {
+    problems.push(`${file}: the label row has ${labelRow.length} cell(s) but the header row has ${header.length}; the blocks cannot be laid out`)
+    return []
+  }
+  let ok = true
+  for (const [label, count] of labelCount) {
+    if (count > 1) {
+      problems.push(`${file}: warehouse label ${JSON.stringify(label)} appears ${count} times in the label row; every label must be unique`)
+      ok = false
+    }
+    if (!Object.prototype.hasOwnProperty.call(wide.warehouses, label)) {
+      problems.push(`${file}: warehouse label ${JSON.stringify(label)} is not in the column map's wide.warehouses (declared: ${JSON.stringify(Object.keys(wide.warehouses))}); a new or renamed warehouse is never guessed`)
+      ok = false
+    }
+  }
+  for (const label of Object.keys(wide.warehouses)) {
+    if (!labelCount.has(label)) {
+      problems.push(`${file}: the column map declares warehouse ${JSON.stringify(label)} but the file's label row has no such label (found ${JSON.stringify(found.map((entry) => entry.label))})`)
+      ok = false
+    }
+  }
+  if (!ok) return []
+  const starts = found.map((entry) => ({ ...entry, start: wide.blockStart === 'after-label' ? entry.at + 1 : entry.at }))
+  const blocks: Block[] = []
+  starts.forEach((entry, position) => {
+    const end = position + 1 < starts.length ? starts[position + 1].start - 1 : header.length - 1
+    const index = new Map<string, number>()
+    for (const [column, wanted] of Object.entries(wide.blockColumns)) {
+      const at: number[] = []
+      for (let i = entry.start; i <= end; i++) if (header[i] === wanted) at.push(i)
+      if (at.length === 1) index.set(column, at[0])
+      else {
+        problems.push(
+          `${file}: warehouse block ${JSON.stringify(entry.label)} (columns ${entry.start + 1}-${Math.max(entry.start, end) + 1}) has header ${JSON.stringify(wanted)} ${at.length} time(s); each block must contain it exactly once, so the block is incomplete or the export changed`,
+        )
+      }
+    }
+    blocks.push({ label: entry.label, code: wide.warehouses[entry.label], start: entry.start, end, index })
+  })
+  return blocks
+}
+
 export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: string, mapping: DatasetMapping | null): IngestedDataset {
   const spec = DATASETS[dataset]
   const sha256 = createHash('sha256').update(bytes).digest('hex')
   let text: string
   try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch {
     throw new InputError([`${file}: not valid UTF-8 (re-export as UTF-8; the tool does not guess another encoding)`])
   }
@@ -200,16 +642,31 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     if (error instanceof CsvFormatError) throw new InputError([`${file}: ${error.message}`])
     throw error
   }
-  const header = parsed.header
   const problems: string[] = []
-  if (header.some((value) => value.includes('\ufeff'))) problems.push(`${file}: a header contains a byte-order mark in the middle of the row`)
+  let header = parsed.header
+  let records = parsed.rows
+  let labelRow: string[] | null = null
+  if (mapping && mapping.rowsAboveHeader === 1) {
+    labelRow = parsed.header
+    if (records.length === 0) throw new InputError([`${file}: the column map expects a label row above the header row, but the file has only one row`])
+    header = records[0].cells.map((value) => value.trim())
+    records = records.slice(1)
+  }
+  if ((labelRow ?? header).some((value) => value.includes('\ufeff')) || header.some((value) => value.includes('\ufeff'))) {
+    problems.push(`${file}: a header contains a byte-order mark in the middle of the row`)
+  }
 
   const headerCount = new Map<string, number>()
   for (const name of header) headerCount.set(name, (headerCount.get(name) ?? 0) + 1)
 
   // canonical column -> index in the source file
   const indexOf = new Map<string, number>()
-  const readHeaders = new Set<string>()
+  const readIndexes = new Set<number>()
+  let blocks: Block[] = []
+  const totalIndex = new Map<string, number>()
+  let selectIndex = -1
+  let parentKindIndex = -1
+  let parentSkuIndex = -1
   if (mapping === null) {
     const canonical = new Set(spec.columns)
     for (const name of header) {
@@ -220,22 +677,59 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     header.forEach((name, index) => {
       if (canonical.has(name)) {
         indexOf.set(name, index)
-        readHeaders.add(name)
+        readIndexes.add(index)
       }
     })
   } else {
     if (mapping.expectedHeaders && JSON.stringify(mapping.expectedHeaders) !== JSON.stringify(header)) {
       problems.push(`${file}: the header row differs from expectedHeaders in the column map (the export format may have changed). Expected ${JSON.stringify(mapping.expectedHeaders)}, found ${JSON.stringify(header)}`)
     }
-    for (const [column, source] of Object.entries(mapping.columns)) {
+    const locate = (source: string, what: string): number => {
       const count = headerCount.get(source) ?? 0
       if (count === 0) {
-        problems.push(`${file}: mapped header ${JSON.stringify(source)} (for ${column}) is not in the file. The file's headers are ${JSON.stringify(header)}.${hint(source, header)}`)
-      } else if (count > 1) {
-        problems.push(`${file}: mapped header ${JSON.stringify(source)} (for ${column}) appears ${count} times; which column is meant is ambiguous`)
-      } else {
-        indexOf.set(column, header.indexOf(source))
-        readHeaders.add(source)
+        problems.push(`${file}: mapped header ${JSON.stringify(source)} (for ${what}) is not in the file. The file's headers are ${JSON.stringify(header)}.${hint(source, header)}`)
+        return -1
+      }
+      if (count > 1) {
+        problems.push(`${file}: mapped header ${JSON.stringify(source)} (for ${what}) appears ${count} times; which column is meant is ambiguous`)
+        return -1
+      }
+      return header.indexOf(source)
+    }
+    for (const [column, source] of Object.entries(mapping.columns)) {
+      const at = locate(source, column)
+      if (at >= 0) {
+        indexOf.set(column, at)
+        readIndexes.add(at)
+      }
+    }
+    if (mapping.rowSelect) {
+      selectIndex = locate(mapping.rowSelect.column, 'rowSelect')
+      if (selectIndex >= 0) readIndexes.add(selectIndex)
+    }
+    if (mapping.parentFrom) {
+      parentKindIndex = locate(mapping.parentFrom.column, 'parentFrom.column')
+      parentSkuIndex = locate(mapping.parentFrom.skuColumn, 'parentFrom.skuColumn')
+      if (parentKindIndex >= 0) readIndexes.add(parentKindIndex)
+      if (parentSkuIndex >= 0) readIndexes.add(parentSkuIndex)
+    }
+    if (mapping.wide && labelRow) {
+      const before = problems.length
+      blocks = layoutBlocks(mapping.wide, labelRow, header, file, problems)
+      if (blocks.length > 0 && problems.length === before) {
+        for (const [column, at] of indexOf) {
+          if (at >= blocks[0].start) problems.push(`${file}: column ${JSON.stringify(header[at])} (for ${column}) lies inside a warehouse block (it starts at column ${blocks[0].start + 1}); a per-row column must come before the first block`)
+        }
+        for (const block of blocks) for (const at of block.index.values()) readIndexes.add(at)
+        for (const [column, wanted] of Object.entries(mapping.wide.totals)) {
+          const at: number[] = []
+          for (let i = 0; i < blocks[0].start; i++) if (header[i] === wanted) at.push(i)
+          if (at.length !== 1) problems.push(`${file}: the total header ${JSON.stringify(wanted)} (for ${column}) appears ${at.length} time(s) before the first warehouse block; it must appear exactly once, or the rows cannot be reconciled`)
+          else {
+            totalIndex.set(column, at[0])
+            readIndexes.add(at[0])
+          }
+        }
       }
     }
   }
@@ -243,40 +737,144 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
 
   const rows: CanonRow[] = []
   const rejected: IngestRejection[] = []
-  for (const record of parsed.rows) {
+  const rowsSkipped: Record<string, number> = {}
+  const emissions = blocks.length > 0 ? blocks : [null]
+  // A wide file is one row per key: every row that shares its key with another row is refused, whatever else it says, because the
+  // warehouse quantities of two rows are never to be added together (the report cannot say whether it repeated a row or listed a second one).
+  const repeated = new Set<string>()
+  let wideKeys: Array<{ key: string; line: number }> | null = null
+  if (mapping?.wide) {
+    const keyAt = indexOf.get(mapping.wide.uniqueBy)
+    const seen = new Map<string, number>()
+    wideKeys = []
+    if (keyAt !== undefined) {
+      for (const record of records) {
+        if (record.cells.length !== header.length) continue
+        // A row the map deliberately SKIPS is not part of this dataset, so its key is not a key of the dataset (rows that are kept, or refused
+        // later, still count: a refused row is still a row that said something about that key).
+        if (mapping.rowSelect && selectIndex >= 0 && mapping.rowSelect.skip.includes(clean(record.cells[selectIndex]))) continue
+        const key = wideKeyOf(mapping, record.cells[keyAt])
+        if (key !== '') {
+          seen.set(key, (seen.get(key) ?? 0) + 1)
+          wideKeys.push({ key, line: record.line })
+        }
+      }
+      for (const [key, count] of seen) if (count > 1) repeated.add(key)
+    }
+  }
+  // The SKU of the latest parent row. null = unknown (nothing seen yet, or the latest parent row was unreadable): children are refused.
+  let parent: string | null = null
+  const dateFormats = mapping?.dateFormats ?? {}
+  const derived = mapping?.derived ?? {}
+
+  for (const record of records) {
     if (record.cells.length !== header.length) {
       rejected.push({
         line: record.line,
         code: 'RAGGED_ROW',
         reason: `the row has ${record.cells.length} cell(s) but the header has ${header.length}; a short or long row is never padded or truncated`,
       })
+      if (mapping?.parentFrom) parent = null
       continue
     }
-    const values: Record<string, string> = {}
-    let bad: IngestRejection | null = null
-    for (const column of spec.columns) {
-      let value = ''
-      const index = indexOf.get(column)
-      if (index !== undefined) value = clean(record.cells[index])
-      else if (mapping && column in mapping.constants) value = clean(mapping.constants[column])
-      const valueMap = mapping?.valueMaps[column]
-      if (valueMap && !(column in (mapping?.constants ?? {}))) {
-        if (Object.prototype.hasOwnProperty.call(valueMap, value)) value = clean(valueMap[value])
-        else if (bad === null) {
-          bad = {
-            line: record.line,
-            code: 'UNMAPPED_VALUE',
-            reason: `${column} value ${JSON.stringify(value)} is not in the column map's valueMaps.${column} (a value map is a closed list; add it deliberately or fix the data)`,
-          }
+    if (mapping?.wide) {
+      const keyAt = indexOf.get(mapping.wide.uniqueBy)!
+      const key = clean(record.cells[keyAt])
+      if (repeated.has(wideKeyOf(mapping, record.cells[keyAt]))) {
+        rejected.push({
+          line: record.line,
+          code: 'DUPLICATE_SOURCE_ROW',
+          reason: `${mapping.wide.uniqueBy} ${JSON.stringify(key)} appears on more than one row of this one-row-per-key report; every row carrying it is refused because their warehouse quantities must never be added together. Fix it in the source`,
+        })
+        if (mapping.parentFrom) parent = null
+        continue
+      }
+      let mismatch: string | null = null
+      for (const [column, totalAt] of totalIndex) {
+        const total = parseDecimal(clean(record.cells[totalAt]), column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
+        let blockSum = new D(0)
+        let readable = total.ok
+        for (const block of blocks) {
+          const cell = parseDecimal(clean(record.cells[block.index.get(column)!]), column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
+          if (cell.ok) blockSum = blockSum.plus(cell.value)
+          else readable = false
+        }
+        if (!readable) mismatch = `the all-warehouses ${column} or a warehouse ${column} cell is blank or not a plain number, so the row cannot be reconciled`
+        else if (total.ok && !total.value.eq(blockSum)) mismatch = `the all-warehouses ${column} is ${total.value.toFixed()} but the warehouse blocks add up to ${blockSum.toFixed()}; a warehouse cell is missing, changed or misaligned (negative balances count)`
+      }
+      if (mismatch !== null) {
+        rejected.push({ line: record.line, code: 'WIDE_TOTAL_MISMATCH', reason: mismatch })
+        if (mapping.parentFrom) parent = null
+        continue
+      }
+    }
+    if (mapping?.parentFrom && parentKindIndex >= 0 && mapping.parentFrom.parentValues.includes(clean(record.cells[parentKindIndex]))) {
+      const sku = clean(record.cells[parentSkuIndex])
+      parent = sku === '' ? null : sku
+    }
+    if (mapping?.rowSelect && selectIndex >= 0) {
+      const kind = clean(record.cells[selectIndex])
+      if (mapping.rowSelect.skip.includes(kind)) {
+        rowsSkipped[kind] = (rowsSkipped[kind] ?? 0) + 1
+        continue
+      }
+      if (!mapping.rowSelect.keep.includes(kind)) {
+        rejected.push({
+          line: record.line,
+          code: 'UNLISTED_ROW_KIND',
+          reason: `${mapping.rowSelect.column} value ${JSON.stringify(kind)} is in neither rowSelect.keep nor rowSelect.skip of the column map (a row kind is never guessed; list it deliberately)`,
+        })
+        continue
+      }
+    }
+    for (const [position, block] of emissions.entries()) {
+      const line = block ? slotLine(record.line, position) : record.line
+      const values: Record<string, string> = {}
+      let bad: IngestRejection | null = null
+      const fail = (code: string, reason: string) => {
+        if (bad === null) bad = { line, code, reason }
+      }
+      for (const column of spec.columns) {
+        if (column in derived) continue
+        let value = ''
+        const index = indexOf.get(column) ?? block?.index.get(column)
+        if (block && column === 'warehouseCode') value = clean(block.code)
+        else if (mapping?.parentFrom && column === mapping.parentFrom.into) {
+          if (parent === null) fail('ORPHAN_CHILD_ROW', `this row has no parent: no ${mapping.parentFrom.column} row of ${mapping.parentFrom.parentValues.join('/')} with a SKU precedes it (or the latest one was unreadable)`)
+          else value = parent
+        } else if (index !== undefined) value = clean(record.cells[index])
+        else if (mapping && column in mapping.constants) value = clean(mapping.constants[column])
+        const valueMap = mapping?.valueMaps[column]
+        if (valueMap && !(column in (mapping?.constants ?? {}))) {
+          if (Object.prototype.hasOwnProperty.call(valueMap, value)) value = clean(valueMap[value])
+          else fail('UNMAPPED_VALUE', `${column} value ${JSON.stringify(value)} is not in the column map's valueMaps.${column} (a value map is a closed list; add it deliberately or fix the data)`)
+        }
+        const format = dateFormats[column]
+        if (format !== undefined && value !== '') {
+          const iso = parseDateByFormat(format, value)
+          if (iso === null) fail('BAD_DATE', `${column} value ${JSON.stringify(value)} does not match the declared date format ${JSON.stringify(format)} (or is not a real date, or its weekday is wrong)`)
+          else value = iso
+        }
+        values[column] = value
+      }
+      for (const [column, from] of Object.entries(derived)) {
+        const source = values[from] ?? ''
+        const valueMap = mapping?.valueMaps[column] ?? {}
+        if (Object.prototype.hasOwnProperty.call(valueMap, source)) values[column] = clean(valueMap[source])
+        else {
+          values[column] = ''
+          fail('UNMAPPED_VALUE', `${column} is derived from ${from} = ${JSON.stringify(source)}, which is not in the column map's valueMaps.${column} (a derived value is a closed list; add it deliberately or fix the data)`)
         }
       }
-      values[column] = value
+      if (bad) rejected.push(bad)
+      else rows.push({ line, values })
     }
-    if (bad) rejected.push(bad)
-    else rows.push({ line: record.line, values })
   }
 
-  const unmappedHeaders = header.filter((name) => !readHeaders.has(name))
+  const unmappedHeaders: string[] = []
+  header.forEach((name, index) => {
+    if (!readIndexes.has(index) && !unmappedHeaders.includes(name)) unmappedHeaders.push(name)
+  })
   return {
     dataset,
     file,
@@ -288,5 +886,9 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     rejected,
     unmappedHeaders,
     recordsRead: rows.length + rejected.length,
+    superseded: [],
+    wideKey: mapping?.wide && wideKeys ? { column: mapping.wide.uniqueBy, keys: wideKeys } : null,
+    rowsSkipped,
+    parts: [{ file, sha256, bytes: bytes.length }],
   }
 }

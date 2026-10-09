@@ -65,7 +65,7 @@ export function renderMarkdown(report: PrepareReport, mode: { dryRun: boolean })
   }
 
   out.push('## Inputs', '')
-  out.push(...table(['Dataset', 'File', 'SHA-256', 'Bytes', 'Records read', 'Blank lines', 'BOM', 'Source columns not read'], report.inputs.map((i) => [i.dataset, i.file, i.sha256, i.bytes, i.recordsRead, i.blankRows, i.hadBom ? 'yes (stripped)' : 'no', i.unmappedHeaders.join(', ') || '-'])), '')
+  out.push(...table(['Dataset', 'File', 'SHA-256', 'Bytes', 'Records read', 'Rows skipped by the map', 'Blank lines', 'BOM', 'Source columns not read'], report.inputs.map((i) => [i.dataset, i.file, i.sha256, i.bytes, i.recordsRead, i.rowsSkipped, i.blankRows, i.hadBom ? 'yes (stripped)' : 'no', i.unmappedHeaders.join(', ') || '-'])), '')
   out.push('## Not supplied', '')
   out.push(report.notSupplied.length === 0 ? 'Every dataset was supplied.' : `These datasets were NOT supplied, so nothing about them was checked: ${report.notSupplied.join(', ')}.`, '')
   out.push('## Checks', '', ...table(['Check', 'Status', 'Note'], report.checks.map((c) => [c.check, c.status, c.note])), '')

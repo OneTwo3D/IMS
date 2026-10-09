@@ -4879,6 +4879,26 @@ A refused login after an HTTP 401 is a pure hold only when that 401 came straigh
 | 5 | failed | the report could not be produced because of an unexpected error |
 <!-- /outbound-write-hold:status-command -->
 
+### Producer-side hold: LIVE or SHADOW for each unit of work
+
+<!-- producer-disposition:overview -->
+THE PRODUCER-SIDE HOLD IS NOT YET ENFORCED. In this version it is a decision module only: nothing in IMS calls it, `npm run outbound:status` does not report on it, and every producer still queues work exactly as before. The only barrier is the outbound-write hold above, which reads a grant on its own: a destination whose grant is set permits the existing outbound writes through the transport whether or not the live-from variable below is set. The places that will consult the decision arrive in later changes, and the paragraphs below describe what the decision returns, not what IMS does today.
+
+For each destination and operation the decision is LIVE or SHADOW. A SHADOW is the record of what IMS would have written, which a later change will keep instead of queuing the work; it is never to be delivered later. The decision reads the environment only: no database and no network call. It is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is SHADOW when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it.
+
+A grant without a live-from instant, or a live-from instant without a grant, is inconsistent: the decision is SHADOW, while today the transport still allows the writes of a granted destination. A later change will report the inconsistency in `npm run outbound:status`. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination.
+<!-- /producer-disposition:overview -->
+
+<!-- producer-disposition:cutoffs -->
+| Variable | Destination | Value |
+|---|---|---|
+| `WC_WRITES_LIVE_FROM` | WooCommerce | one UTC instant in ISO-8601 with an explicit Z, for example 2026-12-01T00:00:00Z |
+| `MINTSOFT_WRITES_LIVE_FROM` | Mintsoft | one UTC instant in ISO-8601 with an explicit Z, for example 2026-12-01T00:00:00Z |
+| `XERO_WRITES_LIVE_FROM` | Xero | one UTC instant in ISO-8601 with an explicit Z, for example 2026-12-01T00:00:00Z |
+
+Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable, and the decision for that destination is SHADOW. Setting a variable changes nothing in this version, because nothing consults it yet; in later changes, once the producers consult the decision, each destination will need its outbound-write grant as well, and the ownership map will decide which operations IMS may produce.
+<!-- /producer-disposition:cutoffs -->
+
 
 ### Connection pooling in front of `DATABASE_URL` is not supported
 
