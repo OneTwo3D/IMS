@@ -93,7 +93,7 @@ jobs:
       # defect for the PR to fix, not a reason to refuse to start a built and migrated
       # application. Until o3d-2sm1.2 this hook exited 0 having executed nothing at all.
       - name: Run the migrations' post-migration verification checks
-        run: node scripts/run-migration-verifications.mjs --strict
+        run: node scripts/run-migration-verifications.mjs --require-entry --strict
       # The check that closes o3d-2sm1.5, exercised against a REAL migrated database rather
       # than only against its own source text. `has_table_privilege(role, oid, 'SELECT,
       # INSERT, UPDATE, DELETE')` is ANY and not ALL, so a comma-separated list answers TRUE

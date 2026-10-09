@@ -170,9 +170,9 @@
 // =============================================================================
 
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from 'node:crypto'
-import { lstatSync, readFileSync } from 'node:fs'
-import { dirname } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { dirname, basename } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // THE ONLY BARE SPECIFIER LEFT, AND THAT IS THE POINT (o3d-2sm1.5 r32, Codex CRITICAL).
 //
@@ -3205,7 +3205,36 @@ export function assessUnrecordedRelease({
     // the application's own URL reaching it. When the two disagree, the disagreement is the
     // finding, and it is fatal: the caller is about to start an application on the strength of
     // the weaker of the two answers.
-    if (!appConnection || !appConnection.connected) {
+    // THE SECOND QUESTION WAS NOT ASKED, WHICH IS NOT THE SAME AS ITS ANSWER BEING "NO" (D4
+    // rehearsal). The operator wrappers run as root with the admin credential only -- by design they
+    // read nothing out of the application's .env -- so a record-less release run through one has no
+    // DATABASE_URL to connect with. The branch below would then report two ANSWERS that DISAGREE, and
+    // that DATABASE_URL "CANNOT CONNECT", about a connection nobody attempted, to an operator who had
+    // come only to close the migration login that update.sh's refusal told them to close. It is still
+    // a refusal (nothing here can certify the application can get in, and a privilege read alone is
+    // not that proof), but it says what is actually the case.
+    if (!appConnection || appConnection.attempted === false) {
+      return {
+        exitCode: EXIT_ERROR,
+        fenceProvenAbsent: false,
+        appRoleConnects: false,
+        lines: [
+          `No usable connection-fence record (${what}) at ${where}.`,
+          `The connection this run opened${connectedDatabase ? ` (attached to "${connectedDatabase}")` : ''} says ${appRole} holds CONNECT.`,
+          'This run could not ALSO connect as the application: no DATABASE_URL reached it (the operator wrappers',
+          'run as root with the admin credential only, and read nothing from the application\'s .env). That is not',
+          'a disagreement between two answers; the second question was not asked, so this is not a verdict on',
+          'DATABASE_URL and it is not evidence that a fence is standing.',
+          'It is still not a release: with no record there is no baseline of who held CONNECT, so a privilege read',
+          'alone cannot certify the database is open. Anything printed above about the migration login stands',
+          'on its own (it was closed or it was not). To certify the application can connect, re-run from',
+          'update.sh or install.sh (which hold DATABASE_URL), or connect as the application yourself; to audit',
+          'the grants:',
+          '  SELECT datacl FROM pg_database WHERE datname = current_database();',
+        ],
+      }
+    }
+    if (!appConnection.connected) {
       return {
         exitCode: EXIT_ERROR,
         fenceProvenAbsent: false,
@@ -4344,7 +4373,54 @@ async function main() {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+// Exit status when this file cannot establish whether it is the program that was started (see
+// isMainModule). Distinct from the helper's own refusal codes, and the same in all three helpers.
+const EXIT_ENTRY_UNVERIFIED = 70
+
+// IS THIS FILE THE PROGRAM BEING RUN, OR IS IT BEING IMPORTED?
+//
+// process.argv[1] is the path the command was TYPED with, and import.meta.url is the path Node
+// RESOLVED (symlinks followed): invoked through the documented `app` symlink the two differ, so the
+// comparison is against the realpath of argv[1].
+//
+// AND A DOUBT IS NEVER "IMPORTED". An earlier version of this guard returned false whenever the path
+// could not be resolved, so a program whose entry path had disappeared or been swapped between the
+// start of the run and this line skipped main(), ran nothing, and exited 0 -- which every shell caller
+// reads as "the check passed". The only silent `false` left is the one that is true: there is no entry
+// script (`node -e`, a REPL), or the entry script is some OTHER file (a test importing this module).
+// Everything else fails closed with EXIT_ENTRY_UNVERIFIED:
+//   * argv[1] is set and cannot be resolved;
+//   * argv[1] resolves to a different file but is NAMED like this one (the shape of a swapped path);
+//   * the caller said `--require-entry` (the shell entrypoints do) and this is not the entry.
+// `--require-entry` is removed from process.argv here so the option parser never sees it.
+// The parameters exist so a test can stub the resolver and the exit.
+export function isMainModule({
+  entry = process.argv[1],
+  resolve = realpathSync,
+  url = import.meta.url,
+  exit = process.exit,
+  say = console.error,
+} = {}) {
+  if (!entry) return false
+  const required = entry === process.argv[1] && process.argv.includes('--require-entry')
+  if (required) process.argv.splice(process.argv.indexOf('--require-entry'), 1)
+  const here = fileURLToPath(url)
+  let resolved
+  try {
+    resolved = resolve(entry)
+  } catch (error) {
+    say(`${basename(here)}: cannot resolve the path it was started with (${JSON.stringify(entry)}: ${error?.code ?? error}). Refusing to continue: a program that cannot tell whether it is the entry point would run nothing and exit 0. Exit ${EXIT_ENTRY_UNVERIFIED}.`)
+    return exit(EXIT_ENTRY_UNVERIFIED)
+  }
+  if (url === pathToFileURL(resolved).href) return true
+  if (required || basename(entry) === basename(here)) {
+    say(`${basename(here)}: it was started as ${JSON.stringify(entry)}, which resolves to ${JSON.stringify(resolved)}, not to this file (${JSON.stringify(here)}). Refusing to continue rather than run nothing and exit 0. Exit ${EXIT_ENTRY_UNVERIFIED}.`)
+    return exit(EXIT_ENTRY_UNVERIFIED)
+  }
+  return false
+}
+
+if (isMainModule()) {
   main().catch((error) => {
     console.error(`Connection fence failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(EXIT_ERROR)

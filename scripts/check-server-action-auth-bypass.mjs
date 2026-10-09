@@ -62,7 +62,7 @@ const DEFAULT_SCAN_ROOTS = ['app', 'lib', 'components']
  * Property names that gate AUTHORIZATION rather than behaviour.
  * Matched whole and case-insensitively.
  */
-const AUTH_BYPASS_NAME = /^(skipPermissionChecks?|skipPermissions?|skipAuthz?|skipAuthorization|skipAuthentication|bypassPermissions?|bypassAuthz?|bypassAuthorization|allowUnauthenticated|allowAnonymous|asSystem|asAdmin|isInternal|internalCall|trusted|isTrusted)$/i
+const AUTH_BYPASS_NAME = /^(skipPermissionChecks?|skipPermissions?|skipAuthz?|skipAuthorization|skipAuthentication|bypassPermissions?|bypassAuthz?|bypassAuthorization|allowUnauthenticated|allowAnonymous|asSystem|asAdmin|isInternal|internalCall|trusted|isTrusted|systemImportToken)$/i
 
 const WAIVER = /server-action-auth-bypass-ok:/
 
