@@ -11,6 +11,7 @@ import {
   WRITER_OWNERSHIP_MAP,
   outboxOperationIsMapped,
   type OwnershipRow,
+  type WriterOwner,
 } from '../../lib/security/writer-ownership-map.ts'
 
 /**
@@ -67,30 +68,57 @@ test('owner answers of 2026-10-08 are in the map', () => {
   assert.equal(owner('mintsoft.order.create', 'P2'), 'IMS')
 })
 
+test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation, and P2 is unchanged', () => {
+  const rulings: Array<[string, WriterOwner, WriterOwner]> = [
+    ['mintsoft.asn.create', 'operator-manual', 'IMS'],
+    ['mintsoft.order.comment', 'operator-manual', 'IMS'],
+    ['woocommerce.fx-rates', 'aelia', 'IMS'],
+    ['woocommerce.stock', 'qoblex-native', 'IMS'],
+    ['xero.daily-batch', 'qoblex-native', 'IMS'],
+    ['xero.inventory.journals', 'qoblex-native', 'IMS'],
+    ['xero.purchase.bill', 'qoblex-native', 'IMS'],
+    ['xero.purchase.bill-payment', 'qoblex-native', 'IMS'],
+    ['xero.purchase.bill-attachment', 'qoblex-native', 'IMS'],
+    ['xero.purchase.supplier-credit', 'qoblex-native', 'IMS'],
+    ['customer-email.despatch', 'woocommerce-native', 'unknown'],
+    ['customer-email.order-confirmation', 'woocommerce-native', 'unknown'],
+    ['customer-email.invoice', 'woocommerce-native', 'unknown'],
+    ['xero.tax-rate', 'operator-manual', 'unknown'],
+    ['mintsoft.order.amend', 'woo-mintsoft-plugin', 'unknown'],
+  ]
+  let checked = 0
+  for (const [key, p1, p2] of rulings) {
+    const row = rows.find((candidate) => `${candidate.destination}.${candidate.operation}` === key)
+    assert.ok(row, `${key} is mapped`)
+    assert.equal(row.owners.P1, p1, `${key} P1`)
+    assert.equal(row.owners.P2, p2, `${key} P2`)
+    assert.ok(row.note.includes('2026-10-09'), `${key}: the note cites the owner answer and its date`)
+    checked += 1
+  }
+  console.log(`# rulings checked: ${checked}`)
+  assert.equal(checked, 15)
+  // No unknown P1 owner is left anywhere: P1 is fully decided.
+  assert.equal(rows.filter((row) => row.owners.P1 === 'unknown').length, 0)
+  // Each new owner kind is used (no dead kinds) and none appears at P2 (a new kind is an incumbent, never the end state).
+  for (const kind of ['operator-manual', 'qoblex-native', 'aelia', 'woocommerce-native'] as const) {
+    const users = rows.filter((row) => row.owners.P1 === kind || row.owners.P2 === kind)
+    console.log(`# owner kind ${kind}: rows=${users.length}`)
+    assert.ok(users.length > 0, `${kind} is used by a row`)
+    assert.ok(!/o3d-[a-z0-9]{3,}/.test(kind), 'no tracker ids in identifiers')
+  }
+})
+
 test('unknown owners are exactly the listed set (a change here is a decision, not an accident)', () => {
   const unknowns = rows
     .flatMap((row) => (['P1', 'P2'] as const).filter((phase) => row.owners[phase] === 'unknown').map((phase) => `${row.destination}.${row.operation}@${phase}`))
     .sort()
   console.log(`# unknown owners: ${unknowns.length}`)
+  assert.equal(unknowns.length, 5, 'five undecided operation-phases remain, all at P2')
   assert.deepEqual(unknowns, [
-    'customer-email.despatch@P1',
     'customer-email.despatch@P2',
-    'customer-email.invoice@P1',
     'customer-email.invoice@P2',
-    'customer-email.order-confirmation@P1',
     'customer-email.order-confirmation@P2',
-    'mintsoft.asn.create@P1',
     'mintsoft.order.amend@P2',
-    'mintsoft.order.comment@P1',
-    'woocommerce.fx-rates@P1',
-    'woocommerce.stock@P1',
-    'xero.daily-batch@P1',
-    'xero.inventory.journals@P1',
-    'xero.purchase.bill-attachment@P1',
-    'xero.purchase.bill-payment@P1',
-    'xero.purchase.bill@P1',
-    'xero.purchase.supplier-credit@P1',
-    'xero.tax-rate@P1',
     'xero.tax-rate@P2',
   ])
 })

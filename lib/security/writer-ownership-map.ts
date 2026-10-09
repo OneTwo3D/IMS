@@ -11,11 +11,11 @@
  *
  * `producerDisposition` (producer-disposition.ts) is the only reader that decides anything: it returns
  * LIVE only for an operation whose owner in the installation's phase is IMS. Every other owner,
- * including `unknown`, resolves to SHADOW. `unknown` means exactly that nobody has established the
+ * including `unknown`, `operator-manual`, `qoblex-native`, `aelia` and `woocommerce-native`, resolves to SHADOW. `unknown` means exactly that nobody has established the
  * owner yet; it is a decision to be made, not a default, and it can never be LIVE.
  *
  * Sources: the producer-side hold plan (inventory of producers and incumbents) and the owner decisions
- * of 2026-10-08. A row's `note` says which answer settled it or why it is `unknown`.
+ * of 2026-10-08 and 2026-10-09. A row's `note` says which answer settled it or why it is `unknown`.
  */
 
 import type { OutboundConnector } from './outbound-write-hold-constants'
@@ -26,6 +26,14 @@ export const WRITER_OWNERS = [
   'o3d-ioss-xero',
   'woo-mintsoft-plugin',
   'mintsoft-native',
+  /** A person doing it by hand in the destination's own screens (no automation anywhere). */
+  'operator-manual',
+  /** Qoblex's own integration with the destination (Xero journals and bills, the WooCommerce stock push). */
+  'qoblex-native',
+  /** The Aelia currency switcher plugin on the WooCommerce store. */
+  'aelia',
+  /** WooCommerce itself (its own customer e-mails). */
+  'woocommerce-native',
   'nobody',
   'unknown',
 ] as const
@@ -83,46 +91,46 @@ export const WRITER_OWNERSHIP_MAP = [
     note: 'Owner answer 5: payment postings are disabled in Xeroom (payments are only logged in Xero at bank reconciliation), so there is no incumbent; shadow in P1, IMS owns from P2, matching by payment system and currency.',
   }),
   // ---- Xero: purchasing, inventory, daily batches ---------------------------------------------------
-  row('xero', 'purchase.bill', { P1: 'unknown', P2: 'IMS' }, {
+  row('xero', 'purchase.bill', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE'],
-    note: 'P1 owner unknown: whether Qoblex writes bills into Xero is unverified.',
+    note: 'Owner answer 2026-10-09: Qoblex writes bills into Xero natively (its own Xero integration) today; IMS owns from P2.',
   }),
-  row('xero', 'purchase.bill-payment', { P1: 'unknown', P2: 'IMS' }, {
+  row('xero', 'purchase.bill-payment', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['BILL_PAYMENT'],
-    note: 'P1 owner unknown (as purchase.bill).',
+    note: 'Owner answer 2026-10-09: as purchase.bill (native Qoblex in P1).',
   }),
-  row('xero', 'purchase.bill-attachment', { P1: 'unknown', P2: 'IMS' }, {
+  row('xero', 'purchase.bill-attachment', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['BILL_ATTACHMENT'],
-    note: 'P1 owner unknown (as purchase.bill).',
+    note: 'Owner answer 2026-10-09: as purchase.bill (native Qoblex in P1).',
   }),
-  row('xero', 'purchase.supplier-credit', { P1: 'unknown', P2: 'IMS' }, {
+  row('xero', 'purchase.supplier-credit', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['PURCHASE_CREDIT_NOTE', 'PURCHASE_CREDIT_NOTE_ALLOCATION'],
-    note: 'P1 owner unknown (as purchase.bill).',
+    note: 'Owner answer 2026-10-09: as purchase.bill (native Qoblex in P1).',
   }),
-  row('xero', 'inventory.journals', { P1: 'unknown', P2: 'IMS' }, {
+  row('xero', 'inventory.journals', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: [
       'STOCK_RECEIPT', 'INVENTORY_ADJUSTMENT', 'COGS_JOURNAL', 'COGS_REVERSAL', 'STOCK_IN_TRANSIT', 'STOCK_ALLOCATION',
       'UNEARNED_REV_REVERSAL', 'ALLOCATION_REVERSAL', 'MANUFACTURING_JOURNAL', 'MANUFACTURING_RECLASS',
     ],
-    note: 'P1 owner unknown: Qoblex\'s Xero write set is unverified.',
+    note: 'Owner answer 2026-10-09: Qoblex posts these journals natively in Xero today; IMS owns from P2.',
   }),
-  row('xero', 'daily-batch', { P1: 'unknown', P2: 'IMS' }, {
+  row('xero', 'daily-batch', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: [
       'DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B',
       'DAILY_BATCH_INVENTORY_RECONCILIATION', 'DAILY_BATCH_COGS_RECONCILIATION', 'DAILY_BATCH_TRANSIT_RECONCILIATION',
     ],
-    note: 'P1 owner unknown (as inventory.journals). The obligation time is the batch date. Whether IMS\'s batches are correct on top of invoices posted by Xeroom is an open accountant question.',
+    note: 'Owner answer 2026-10-09: Qoblex does the daily batches natively in Xero today; IMS owns from P2. The obligation time is the batch date. Whether IMS\'s batches are correct on top of invoices posted by Xeroom is an open accountant question.',
   }),
-  row('xero', 'tax-rate', { P1: 'unknown', P2: 'unknown' }, {
+  row('xero', 'tax-rate', { P1: 'operator-manual', P2: 'unknown' }, {
     obligationTime: 'not-applicable',
     accountingSyncTypes: ['TAX_RATE_SYNC'],
-    note: 'Unresolved: the recommendation is that an operator maintains tax rates by hand, which is not an owner IMS may be replaced by; until decided IMS shadows.',
+    note: 'Owner answer 2026-10-09: an operator maintains tax rates by hand today (P1). The owner wants ONE MASTER for tax rates synced into the other systems; that is a separate feature (bead tax-rate master), so P2 stays unknown and IMS shadows.',
   }),
   row('xero', 'fx-journal', { P1: 'nobody', P2: 'nobody' }, {
     obligationTime: 'not-applicable',
@@ -140,7 +148,7 @@ export const WRITER_OWNERSHIP_MAP = [
   }),
   row('mintsoft', 'order.amend', { P1: 'woo-mintsoft-plugin', P2: 'unknown' }, {
     obligationTime: 'required',
-    note: 'Unresolved: whether IMS may amend an order the bridge created (decision D8 settles cancel and hold only). Unknown resolves to SHADOW until decided.',
+    note: 'Unresolved (still unanswered on 2026-10-09): whether IMS may amend an order the bridge created (decision D8 settles cancel and hold only). Unknown resolves to SHADOW until decided.',
   }),
   row('mintsoft', 'order.cancel', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
@@ -150,9 +158,9 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'As order.cancel (D8).',
   }),
-  row('mintsoft', 'order.comment', { P1: 'unknown', P2: 'IMS' }, {
+  row('mintsoft', 'order.comment', { P1: 'operator-manual', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
-    note: 'P1 owner unknown.',
+    note: 'Owner answer 2026-10-09: order comments are added by hand in Mintsoft today, no automation; IMS owns from P2.',
   }),
   row('mintsoft', 'product.upsert', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
@@ -166,19 +174,19 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'As product.upsert.',
   }),
-  row('mintsoft', 'asn.create', { P1: 'unknown', P2: 'IMS' }, {
+  row('mintsoft', 'asn.create', { P1: 'operator-manual', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
-    note: 'P1 owner unknown: Qoblex or an operator in Mintsoft\'s own screens.',
+    note: 'Owner answer 2026-10-09: ASNs are created by hand in Mintsoft today, no automation; IMS owns from P2.',
   }),
   row('mintsoft', 'auth.login', { P1: 'nobody', P2: 'nobody' }, {
     obligationTime: 'not-applicable',
     note: 'Key minting is not a business write; the login grant of the transport hold governs it and the producer hold is never consulted for it.',
   }),
   // ---- WooCommerce ----------------------------------------------------------------------------------------
-  row('woocommerce', 'stock', { P1: 'unknown', P2: 'IMS' }, {
+  row('woocommerce', 'stock', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
     outboxOperations: ['woocommerce/stock.push'],
-    note: 'P1 owner unknown: the bridge, Qoblex or Mintsoft\'s native channel. An absolute state push, so no obligation time.',
+    note: 'Owner answer 2026-10-09: Qoblex pushes stock to WooCommerce today; IMS owns from P2. An absolute state push, so no obligation time.',
   }),
   row('woocommerce', 'product.meta', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
@@ -218,26 +226,26 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'required',
     note: 'Owner answer 4: IMS puts the one invoice (generated in Xero) into the customer\'s My Account, replacing what Xeroom and the PDF-invoices plugin do today.',
   }),
-  row('woocommerce', 'fx-rates', { P1: 'unknown', P2: 'IMS' }, {
+  row('woocommerce', 'fx-rates', { P1: 'aelia', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
-    note: 'P1 owner unknown.',
+    note: 'Owner answer 2026-10-09: exchange rates come from the Aelia currency plugin in P1; IMS owns from P2.',
   }),
   row('woocommerce', 'webhooks', { P1: 'nobody', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
     note: 'No webhooks are registered on the live store in P1; an operator registers them through IMS at P2.',
   }),
   // ---- Customer e-mail: mapped only (decision D7); enforcement stays the existing settings ---------------------
-  row('customer-email', 'despatch', { P1: 'unknown', P2: 'unknown' }, {
+  row('customer-email', 'despatch', { P1: 'woocommerce-native', P2: 'unknown' }, {
     obligationTime: 'not-applicable',
-    note: 'Mapped only. Would duplicate the WooCommerce despatch e-mail; enforced by its existing setting, not by the producer hold.',
+    note: 'Mapped only. Owner answer 2026-10-09: WooCommerce sends the despatch e-mail today (P1). Whether IMS sends it later is undecided (it depends on which other e-mails remain in WooCommerce and on matching their look and feel), so P2 stays unknown. Enforced by its existing setting, not by the producer hold.',
   }),
-  row('customer-email', 'order-confirmation', { P1: 'unknown', P2: 'unknown' }, {
+  row('customer-email', 'order-confirmation', { P1: 'woocommerce-native', P2: 'unknown' }, {
     obligationTime: 'not-applicable',
-    note: 'Mapped only (as despatch).',
+    note: 'Mapped only (as despatch): WooCommerce sends it in P1 (owner answer 2026-10-09); P2 undecided.',
   }),
-  row('customer-email', 'invoice', { P1: 'unknown', P2: 'unknown' }, {
+  row('customer-email', 'invoice', { P1: 'woocommerce-native', P2: 'unknown' }, {
     obligationTime: 'not-applicable',
-    note: 'Mapped only (as despatch).',
+    note: 'Mapped only (as despatch): WooCommerce sends it in P1 (owner answer 2026-10-09); P2 undecided.',
   }),
 ] as const satisfies readonly OwnershipRow[]
 
