@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
@@ -431,6 +431,56 @@ for (const helper of GUARD_HELPERS) {
   })
 }
 
+const HELPER_NAMES = /(check-app-db-object-access|run-migration-verifications|fence-db-connections)\.mjs/
+const HELPER_VARS = /\bnode\s+"?\$\{?(DB_OBJECT_ACCESS_SCRIPT|DB_FENCE_SCRIPT|DB_FENCE_SCRIPT_COPY)\}?"?/
+const HELPER_EXEC = /\bexec node "\$\{(fence_script|script)\}"/
+
+/** Callers of the FENCE helper that intentionally do not say --require-entry, each with its reason. */
+const FLAG_ALLOWLIST: Array<{ file: string; match: RegExp; why: string }> = [
+  { file: 'scripts/lib/db-fence-protected.sh', match: /exec node "\$\{fence_script\}"/, why: 'fence helper started by the library with the verb\'s own arguments; it relies on the guard\'s unresolved/swapped-path exits (70). Adding the flag here needs every stand-in helper fixture to be changed in step; tracked as a follow-up' },
+  { file: 'scripts/lib/db-fence-protected.sh', match: /exec node "\$\{script\}"/, why: 'the same, for the operator wrappers\' helper run' },
+  { file: 'docs/installation.md', match: /node \$\{DB_FENCE_SCRIPT\} --fence/, why: 'prose describing a RETIRED banner that used to print this command; nothing runs it' },
+  { file: 'docs/installation.md', match: /fence-db-connections\.mjs --ensure-migration-role/, why: 'an operator-typed command in the runbook for the fence helper; same reasoning, and an operator can see a silent no-op' },
+]
+
+function scanHelperInvocations(): Array<{ file: string; line: number; text: string; flag: boolean }> {
+  const out: Array<{ file: string; line: number; text: string; flag: boolean }> = []
+  const seen = new Set<string>()
+  const files: string[] = []
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(join(REPO, dir))) {
+      const rel = `${dir}/${name}`
+      let st
+      try { st = statSync(join(REPO, rel)) } catch { continue }
+      if (st.isDirectory()) { if (!['node_modules', '.git', '.next'].includes(name)) walk(rel) } else files.push(rel)
+    }
+  }
+  for (const d of ['scripts', '.github/workflows', 'docs', 'help-docs']) walk(d)
+  files.push('package.json', 'CHANGELOG.md', 'CLAUDE.md')
+  for (const rel of files) {
+    if (!/\.(sh|yml|yaml|md|json)$/.test(rel)) continue
+    let real
+    try { real = realpathSync(join(REPO, rel)) } catch { continue }
+    if (seen.has(real)) continue
+    seen.add(real)
+    const isShell = rel.endsWith('.sh')
+    readFileSync(join(REPO, rel), 'utf8').split('\n').forEach((text, i) => {
+      const t = text.trim()
+      if (isShell && t.startsWith('#')) return
+      if (isShell && /\[DRY\]|\becho\b|\bwarn\b|\binfo\b|\berror\b|\bprintf\b/.test(text)) return
+      const prose = rel.endsWith('.md')
+      // In prose a command is a backticked `node <helper path or variable> ...`; a sentence that merely has the words node and the
+      // file name in it is not an invocation.
+      const invokes = prose
+        ? /`node\s+("?\$\{?[A-Za-z_]+\}?"?|\S*(check-app-db-object-access|run-migration-verifications|fence-db-connections)\.mjs)[^`]*`/.test(text)
+        : /\bnode\b[^|;&)]*/.test(text) && (HELPER_NAMES.test(text) || HELPER_VARS.test(text)) || (isShell && HELPER_EXEC.test(text))
+      const inManifest = (rel.endsWith('.yml') || rel === 'package.json') && HELPER_NAMES.test(text) && /node /.test(text)
+      if (invokes || inManifest) out.push({ file: rel, line: i + 1, text: t, flag: text.includes('--require-entry') })
+    })
+  }
+  return out
+}
+
 test('entry guard: the three copies are byte-identical, and every shell caller of the two simple helpers says --require-entry', () => {
   const copy = (helper: string): string => {
     const s = read(`scripts/${helper}`)
@@ -443,15 +493,16 @@ test('entry guard: the three copies are byte-identical, and every shell caller o
   console.log(`  guard source: ${a.split('\n').length} lines in each of ${GUARD_HELPERS.length} helpers`)
   assert.equal(b, a)
   assert.equal(c, a)
-  let sites = 0
-  for (const [name, source] of [['install.sh', INSTALL], ['update.sh', UPDATE], ['deploy.sh', DEPLOY]] as const) {
-    const calls = source.split('\n').filter((l) => !/^\s*#/.test(l) && !/\[DRY\]|echo|^\s*\[\[|die|warn|info/.test(l) &&
-      (/\bnode "\$\{APP_DIR\}\/scripts\/run-migration-verifications\.mjs"/.test(l) || /\bnode scripts\/run-migration-verifications\.mjs/.test(l) || /\bnode "\$\{DB_OBJECT_ACCESS_SCRIPT\}"/.test(l)))
-    for (const l of calls) {
-      sites++
-      assert.match(l, /--require-entry/, `${name}: ${l.trim()}`)
-    }
-  }
-  console.log(`  shell call sites of the verification and object-access helpers: ${sites}`)
-  assert.equal(sites, 5, 'precondition: 3 verification call sites + 2 object-access call sites were found')
+  // EVERY invocation in the repository, found by a scan and not by a fixed pattern list.
+  const found = scanHelperInvocations()
+  console.log(`  repo-wide scan: ${found.length} invocation(s) of the three helpers`)
+  for (const f of found) console.log(`    ${f.file}:${f.line} ${f.flag ? '[--require-entry]' : '[no flag]'} ${f.text.slice(0, 90)}`)
+  assert.ok(found.length >= 10, 'precondition: the scan reached the shell entrypoints, the library, the workflow and the docs')
+  assert.ok(found.some((f) => f.file === 'scripts/deploy.sh' && /check-app-db-object-access/.test(f.text)), 'precondition: the deploy.sh object-access call (the one a review caught) is among them')
+  const unflagged = found.filter((f) => !f.flag)
+  const stale = FLAG_ALLOWLIST.filter((a) => !unflagged.some((f) => f.file === a.file && a.match.test(f.text)))
+  const unexplained = unflagged.filter((f) => !FLAG_ALLOWLIST.some((a) => a.file === f.file && a.match.test(f.text)))
+  console.log(`  without the flag: ${unflagged.length}, all on the justified allowlist: ${unexplained.length === 0}`)
+  assert.deepEqual(unexplained.map((f) => `${f.file}:${f.line} ${f.text}`), [], 'every invocation either says --require-entry or is on the allowlist with a reason')
+  assert.deepEqual(stale.map((a) => a.file + ' ' + a.match), [], 'and no allowlist entry is stale')
 })

@@ -4962,7 +4962,7 @@ if ! $SKIP_MIGRATE; then
     # database about the APPLICATION role, which is the one question none of the others ask.
     info "Checking that the application role can use every table, view and sequence..."
     object_access_rc=0
-    as_app_user_db node scripts/check-app-db-object-access.mjs --state-file="$DB_FENCE_STATE" \
+    as_app_user_db node scripts/check-app-db-object-access.mjs --require-entry --state-file="$DB_FENCE_STATE" \
       || object_access_rc=$?
     # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
     pin_migration_window "The object-access check"
