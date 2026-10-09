@@ -6,7 +6,9 @@ import {
   parseProducerCutoff,
   producerDisposition,
   producerGrantCutoffAgreement,
+  ownerShadowReason,
 } from '../../lib/security/producer-disposition.ts'
+import { WRITER_OWNERS, WRITER_OWNERSHIP_MAP, type OwnershipRow } from '../../lib/security/writer-ownership-map.ts'
 import { PRODUCER_CUTOFF_ENV } from '../../lib/security/producer-disposition-constants.ts'
 import { OUTBOUND_CONNECTORS, OUTBOUND_GRANT_ENV, type OutboundConnector } from '../../lib/security/outbound-write-hold-constants.ts'
 
@@ -265,8 +267,8 @@ test('arm d: an operation IMS does not own is SHADOW even when fully granted and
   const unmapped = explainProducerDisposition('xero', 'no-such-operation' as never, undefined, { env, now: NOW })
   assert.equal(unmapped.reason, 'owner_unknown')
   const tax = explainProducerDisposition('xero', 'tax-rate', undefined, { env, now: NOW })
-  assert.equal(tax.owner, 'unknown')
-  assert.equal(tax.reason, 'owner_unknown')
+  assert.equal(tax.owner, 'nobody', 'Xero is the tax-rate master: no writer at P2')
+  assert.equal(tax.reason, 'not_ims_owned')
   // Isolating arm: the same environment IS live for an IMS-owned operation.
   assert.equal(call('xero', 'purchase.bill', LATE, env), 'LIVE')
 })
@@ -563,4 +565,58 @@ test('arm p: patching Map.prototype.get AFTER import cannot forge an ownership r
   }
   assert.equal(Map.prototype.get, original)
   assert.equal(producerDisposition('xero', 'purchase.bill', LATE, { env, now: NOW }), 'LIVE', 'isolating arm: restored, an IMS row is LIVE')
+})
+
+/**
+ * EVERY OWNER KIND RESOLVES THE SAME WAY: ONLY `IMS` CAN BE LIVE.
+ * Named mutation (PR): treat one non-IMS owner kind (qoblex-native) as IMS in ownerShadowReason => red.
+ */
+test('every owner kind: only IMS may produce live; unknown is owner_unknown; every other kind is not_ims_owned', () => {
+  const resolved = WRITER_OWNERS.map((owner) => `${owner}=${String(ownerShadowReason(owner))}`)
+  console.log(`# owner kinds: ${WRITER_OWNERS.length}: ${resolved.join(' ')}`)
+  assert.ok(WRITER_OWNERS.length >= 11, 'precondition: the owner list was read')
+  let imsKinds = 0
+  let notImsOwned = 0
+  for (const owner of WRITER_OWNERS) {
+    const reason = ownerShadowReason(owner)
+    if (owner === 'IMS') { assert.equal(reason, null); imsKinds += 1 } else if (owner === 'unknown') assert.equal(reason, 'owner_unknown')
+    else { assert.equal(reason, 'not_ims_owned', owner); notImsOwned += 1 }
+  }
+  console.log(`# owner kinds: ims=${imsKinds} unknown=1 not_ims_owned=${notImsOwned}`)
+  assert.equal(imsKinds, 1)
+  assert.equal(notImsOwned, WRITER_OWNERS.length - 2)
+  for (const kind of ['operator-manual', 'qoblex-native', 'aelia', 'woocommerce-native']) {
+    assert.equal(ownerShadowReason(kind as never), 'not_ims_owned', `${kind} is a writer IMS must not duplicate`)
+  }
+})
+
+test('every connector row, every phase: the decision reports that phase\'s owner and is LIVE only where P2 is IMS', () => {
+  const rows = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).filter((row) => (OUTBOUND_CONNECTORS as readonly string[]).includes(row.destination))
+  const seenKinds = new Set<string>()
+  let cells = 0
+  let live = 0
+  for (const row of rows) {
+    const destination = row.destination as OutboundConnector
+    const operation = row.operation as never
+    const held = explainProducerDisposition(destination, operation, LATE, { env: envFor(destination, 'absent', undefined), now: NOW })
+    const beforeCutoff = explainProducerDisposition(destination, operation, LATE, { env: envFor(destination, 'ok', '2026-12-01T00:00:00Z'), now: NOW })
+    const p2 = explainProducerDisposition(destination, operation, LATE, { env: envFor(destination, 'ok', '2026-01-01T00:00:00Z'), now: NOW })
+    for (const decision of [held, beforeCutoff]) {
+      assert.equal(decision.disposition, 'SHADOW', `${destination}.${row.operation} P1`)
+      assert.equal(decision.phase, 'P1')
+      assert.equal(decision.owner, row.owners.P1, `${destination}.${row.operation} P1 owner`)
+    }
+    assert.equal(p2.phase, 'P2')
+    assert.equal(p2.owner, row.owners.P2)
+    const expectedLive = row.owners.P2 === 'IMS'
+    assert.equal(p2.disposition, expectedLive ? 'LIVE' : 'SHADOW', `${destination}.${row.operation} P2`)
+    if (!expectedLive) assert.equal(p2.reason, ownerShadowReason(row.owners.P2))
+    seenKinds.add(row.owners.P1); seenKinds.add(row.owners.P2)
+    cells += 3
+    if (p2.disposition === 'LIVE') live += 1
+  }
+  console.log(`# rows=${rows.length} cells=${cells} live=${live} owner kinds in use: ${[...seenKinds].sort().join(',')}`)
+  assert.ok(rows.length > 25, 'precondition: connector rows were read')
+  for (const kind of ['operator-manual', 'qoblex-native', 'aelia']) assert.ok(seenKinds.has(kind), `${kind} is used by a connector row`)
+  assert.equal(live, rows.filter((row) => row.owners.P2 === 'IMS').length)
 })
