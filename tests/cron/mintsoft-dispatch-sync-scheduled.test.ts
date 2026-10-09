@@ -18,8 +18,8 @@ import { assembleReadSyncReport, type ReadSyncInputs } from '../../lib/ops/read-
  *
  * Mutations (each verified red, see the PR): (1) delete the registration in lib/cron-jobs/wms-mintsoft.ts
  * => the registry, crontab and universal-docs tests fail; (2) defaultEnabled true -> false => the crontab
- * block test fails (the line is absent by default) and the "[isolating]" arm still passes, so the line in
- * the default block comes from the default and from nothing else; (3) put the stale "neither a registered"
+ * block test fails (the line is absent by default) and the "[isolating]" arm still passes (it sets the
+ * switch itself), so the line in the default block comes from the default and from nothing else; (3) put the stale "neither a registered"
  * sentence back into the constants or the guide => the absence test fails.
  */
 
@@ -70,7 +70,7 @@ test('[crontab] the block the in-app scheduler generates carries an ACTIVE line 
 test('[isolating] the line comes from the default and nothing else: switched off in settings it is absent, a custom schedule is honoured', () => {
   const off = block(new Map([['cron_mintsoft_dispatch_sync_enabled', 'false']]))
   assert.equal(activeLines(off).length, 0, 'switched off => no line')
-  const custom = activeLines(block(new Map([['cron_mintsoft_dispatch_sync_schedule', '*/30 * * * *']])))
+  const custom = activeLines(block(new Map([['cron_mintsoft_dispatch_sync_enabled', 'true'], ['cron_mintsoft_dispatch_sync_schedule', '*/30 * * * *']])))
   console.log(`precondition: custom-schedule lines ${JSON.stringify(custom.map((line) => line.slice(0, 20)))}`)
   assert.equal(custom.length, 1)
   assert.match(custom[0]!, /^\*\/30 \* \* \* \* {2}/)
