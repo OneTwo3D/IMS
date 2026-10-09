@@ -576,6 +576,15 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     const { settlementMarkerFor } = await import('../../lib/domain/accounting/ledger-settlement-evidence.ts')
     const { effectiveTokenFor } = await import('../../lib/domain/accounting/followup-retry-guard.ts')
 
+    // The actions write audit rows naming the session user, which must exist. A deactivated user with an
+    // unusable hash, unique to this run, DELETED again at the end (audit rows are SET NULL): a scratch
+    // database holding user rows is refused by the scratch-database guard on the next run.
+    t.after(async () => { await d.db.user.deleteMany({ where: { id: `op-${process.pid}` } }) })
+    await d.db.user.upsert({
+      where: { id: `op-${process.pid}` },
+      create: { id: `op-${process.pid}`, email: `op-${process.pid}-${RUN_ID}@ledger-check.invalid`, name: 'ledger check test operator', passwordHash: '!', active: false },
+      update: {},
+    })
     for (const writer of ['settle POSTED', 'reconcile'] as const) {
       for (let round = 0; round < 3; round++) {
         const o = await seedOrder(d, `interleave-${writer === 'reconcile' ? 'rec' : 'set'}-${round}`, { failedAttemptRevision: 1 })
