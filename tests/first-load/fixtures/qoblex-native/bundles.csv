@@ -1,0 +1,6 @@
+﻿"Product Name","SKU","Bundled Quantity","Total in Stock","Allocated","Available","Cost","Weight","Line Type"
+"Synthetic kit","SYN-4001","","0.000000","","0.000000","1.0","0","Bundle"
+"Synthetic part one","SYN-3001","2","100.000000","","100.000000","1.0","0","Part"
+"Synthetic part two","SYN-3002","1","200.000000","","200.000000","1.0","0","Part"
+"Synthetic bom item","SYN-5001","","12.000000","","12.000000","1.0","0","BillOfMaterial"
+"Synthetic part one","SYN-3001","5","100.000000","","100.000000","1.0","0","Part"

@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { ledgerStanding, namesADocument, ownsMirroredEvent, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import {
   DAILY_BATCH_SYNC_TYPE_PREFIX,
   SETTLEABLE_ACCOUNTING_SYNC_STATUSES,
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   buildCancelledSaleSettlementData,
   buildSettlementData,
+  describeMirrorOwnershipSkip,
   describeSettlementCaveat,
   describeSettlementUniqueConflict,
   describeSyncRowSettleability,
@@ -164,7 +166,11 @@ test('NOT_POSTED cancels the row and NEVER touches externalTransactionId', () =>
   // untouched leaves it NULL — and leaves it free for the connector's fence-loss evidence write.
   assert.equal('externalTransactionId' in data, false)
   assert.equal(data.processingStartedAt, null)
-  assert.match(String(data.errorMessage), /verified NOT POSTED/)
+  // o3d-1e7sl (C1): the note is what the operator reads beside the row for ever, and it must not say
+  // "nothing reached the accounting system" in IMS's voice - a person's NOT_POSTED is a claim, not proof.
+  assert.match(String(data.errorMessage), /recorded as NOT POSTED/)
+  assert.match(String(data.errorMessage), /UNPROVEN/)
+  assert.doesNotMatch(String(data.errorMessage), /nothing reached|verified NOT POSTED/i)
 })
 
 test('POSTED records the document id, stamps syncedAt and clears the claim', () => {
@@ -186,10 +192,10 @@ test('the patch never carries attemptRevision — the fence owns it', () => {
 
 test('the settlement note records WHOSE claim it is, and any reason given', () => {
   assert.match(settlementNote(POSTED), /^Settled by operator: verified POSTED as INV-9001\./)
-  assert.equal(
-    settlementNote({ outcome: 'NOT_POSTED', reason: 'no matching invoice in the org' }),
-    'Settled by operator: verified NOT POSTED — nothing reached the accounting system. no matching invoice in the org',
-  )
+  const note = settlementNote({ outcome: 'NOT_POSTED', reason: 'no matching invoice in the org' })
+  assert.match(note, /^Settled by operator: recorded as NOT POSTED - an operator's assertion; IMS did not check the accounting system/)
+  assert.match(note, /UNPROVEN\. no matching invoice in the org$/)
+  assert.doesNotMatch(note, /nothing reached the accounting system/)
 })
 
 // ---------------------------------------------------------------------------
@@ -212,42 +218,60 @@ test('the mirror write is compare-and-swapped, so a sibling that posts first kee
   assert.equal(guard.requireExternalIdNull, true)
 })
 
+/**
+ * o3d-1e7sl (G11): `findMirrorOwnershipConflict` no longer reads a status or an id: the CALLER decides whether
+ * a sibling owns the mirror (`ownsMirroredEvent`, ledger-standing.ts) and hands the answer over, because this
+ * module is the settlement LEAF and cannot import the standing module. So the table is driven through the
+ * real `ownsMirroredEvent` over one row per standing - the same composition `settleAccountingSyncRow` runs.
+ */
+function candidate(row: Partial<LedgerStandingRow> & { id?: string }, mirrorKeys: string[]): {
+  id: string; status: string; ownsMirror: boolean; posted: boolean; assertedDocument: boolean; mirrorKeys: string[]
+} {
+  const full: LedgerStandingRow = {
+    status: 'PENDING', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, ...row,
+  }
+  return {
+    id: row.id ?? 'other', status: full.status, ownsMirror: ownsMirroredEvent(full), posted: namesADocument(full),
+    assertedDocument: ledgerStanding(full) === 'ASSERTED_POSTED', mirrorKeys,
+  }
+}
+
 test('a live or already-posted sibling sharing a mirror key OWNS the mirror', () => {
   const mine = ['key-a', 'key-legacy']
-  assert.equal(
-    findMirrorOwnershipConflict(mine, [
-      { id: 'other', status: 'PENDING', externalTransactionId: null, mirrorKeys: ['key-a'] },
-    ])?.syncLogId,
-    'other',
-  )
+  assert.equal(findMirrorOwnershipConflict(mine, [candidate({ status: 'PENDING' }, ['key-a'])])?.syncLogId, 'other')
   // A FAILED sibling with a document id is a document that exists (o3d-ju8t) — it owns its mirror.
   assert.equal(
-    findMirrorOwnershipConflict(mine, [
-      { id: 'other', status: 'FAILED', externalTransactionId: 'INV-7', mirrorKeys: ['key-legacy'] },
-    ])?.posted,
+    findMirrorOwnershipConflict(mine, [candidate({ status: 'FAILED', externalTransactionId: 'INV-7' }, ['key-legacy'])])?.posted,
     true,
   )
   // A dead sibling with no evidence owns nothing.
-  assert.equal(
-    findMirrorOwnershipConflict(mine, [
-      { id: 'other', status: 'CANCELLED', externalTransactionId: null, mirrorKeys: ['key-a'] },
-    ]),
-    null,
-  )
+  assert.equal(findMirrorOwnershipConflict(mine, [candidate({ status: 'CANCELLED' }, ['key-a'])]), null)
   // No shared key means no conflict, whatever the sibling's status.
-  assert.equal(
-    findMirrorOwnershipConflict(mine, [
-      { id: 'other', status: 'PENDING', externalTransactionId: null, mirrorKeys: ['key-z'] },
-    ]),
-    null,
-  )
+  assert.equal(findMirrorOwnershipConflict(mine, [candidate({ status: 'PENDING' }, ['key-z'])]), null)
   // Nothing to own when this row is not mirrored at all.
-  assert.equal(
-    findMirrorOwnershipConflict([], [
-      { id: 'other', status: 'PENDING', externalTransactionId: null, mirrorKeys: ['key-a'] },
-    ]),
-    null,
-  )
+  assert.equal(findMirrorOwnershipConflict([], [candidate({ status: 'PENDING' }, ['key-a'])]), null)
+})
+
+test('[o3d-1e7sl G11] mirror ownership, one sibling per standing (existence: an asserted document owns its mirror too)', () => {
+  const mine = ['key-a']
+  const cases: Array<{ standing: string; row: Partial<LedgerStandingRow>; owns: boolean }> = [
+    { standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-1' }, owns: true },
+    { standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'TYPED', settlementBasis: 'OPERATOR_ASSERTION' }, owns: true },
+    { standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }, owns: false },
+    { standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', abandonedBeforeRemoteCall: true }, owns: false },
+    { standing: 'UNKNOWN', row: { status: 'FAILED' }, owns: false },
+    { standing: 'LIVE_WORK', row: { status: 'PROCESSING' }, owns: true },
+  ]
+  let owning = 0
+  for (const c of cases) {
+    const full: LedgerStandingRow = { status: 'PENDING', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, ...c.row }
+    assert.equal(ledgerStanding(full), c.standing, `precondition: ${c.standing}`)
+    const conflict = findMirrorOwnershipConflict(mine, [candidate(c.row, ['key-a'])])
+    assert.equal(conflict !== null, c.owns, c.standing)
+    if (c.owns) owning += 1
+  }
+  console.log(`# G11 cases: ${cases.length}; sibling owns the mirror in ${owning}`)
+  assert.ok(owning > 0 && owning < cases.length)
 })
 
 // ---------------------------------------------------------------------------
@@ -408,7 +432,7 @@ test('asserting POSTED as one document over a mirror naming a DIFFERENT one is r
   assert.match(refusal?.message ?? '', /already names document INV-7777/)
   assert.match(refusal?.message ?? '', /asserts INV-9001/)
   // A refusal needs a remedy the operator can perform.
-  assert.match(refusal?.message ?? '', /reverse it there before recording the other/)
+  assert.match(refusal?.message ?? '', /Reverse it there ONLY if it exists and is the wrong document, before recording the other/)
 })
 
 test('re-asserting the SAME document over the mirror is idempotent, not a contradiction', () => {
@@ -427,7 +451,7 @@ test('asserting NOT_POSTED over a mirror that NAMES a document is refused as a c
   const refusal = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'POSTED', externalId: 'INV-9001' })
   assert.equal(refusal?.code, 'contradicts_mirrored_document')
   assert.match(refusal?.message ?? '', /already names document INV-9001/)
-  assert.match(refusal?.message ?? '', /Settle this row as POSTED with that id/)
+  assert.match(refusal?.message ?? '', /[Ss]ettle this row as POSTED with that id/)
 })
 
 test('asserting NOT_POSTED over a mirror recorded POSTED with no id is still refused', () => {
@@ -522,4 +546,62 @@ test('adoption never overrides the STATUS gate — a PENDING stranded row is sti
   })
   assert.equal(s.settleable, false)
   assert.match(s.notSettleableReason ?? '', /nothing has been sent/)
+})
+
+test('[o3d-1e7sl AE4] a NOT_POSTED assertion against a POSTED mirror says whose word the mirror rests on', () => {
+  // The mirror carries `postBasis`: CONNECTOR/SYNC_LOG_BACKFILL = the ledger answered; OPERATOR_ASSERTION = a
+  // person typed the id; NULL = nobody recorded. "evidence it DID post" and "a posting IMS has already
+  // written down" are true of the first only. Each still REFUSES (two assertions cannot both stand).
+  const cases: Array<{ name: string; postBasis: string | null | undefined; says: RegExp; never: RegExp }> = [
+    { name: 'CONNECTOR', postBasis: 'CONNECTOR', says: /which is evidence it DID post/, never: /assertion IMS did not verify/ },
+    { name: 'SYNC_LOG_BACKFILL', postBasis: 'SYNC_LOG_BACKFILL', says: /which is evidence it DID post/, never: /assertion IMS did not verify/ },
+    { name: 'OPERATOR_ASSERTION', postBasis: 'OPERATOR_ASSERTION', says: /an OPERATOR earlier recorded as posted \(an assertion IMS did not verify against the ledger, not a confirmation\)/, never: /evidence it DID post/ },
+    { name: 'NULL (unrecorded)', postBasis: null, says: /basis was never recorded/, never: /evidence it DID post/ },
+    { name: 'absent (caller did not say)', postBasis: undefined, says: /basis was never recorded/, never: /evidence it DID post/ },
+  ]
+  for (const c of cases) {
+    const view = { status: 'POSTED', externalId: 'INV-9001', ...(c.postBasis === undefined ? {} : { postBasis: c.postBasis }) }
+    const refusal = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, view)
+    console.log(`# AE4 precondition: ${c.name}: refused=${refusal !== null}`)
+    assert.equal(refusal?.code, 'contradicts_mirrored_document', c.name)
+    assert.match(refusal!.message, c.says, c.name)
+    assert.doesNotMatch(refusal!.message, c.never, c.name)
+  }
+  // The id-less POSTED mirror: the sentence must not claim IMS "wrote down" a posting when a person told it.
+  const asserted = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'POSTED', externalId: null, postBasis: 'OPERATOR_ASSERTION' })
+  assert.match(asserted!.message, /on an operator's earlier assertion/)
+  assert.doesNotMatch(asserted!.message, /a posting IMS has already written down/)
+  const confirmed = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'POSTED', externalId: null, postBasis: 'CONNECTOR' })
+  assert.match(confirmed!.message, /already recorded as POSTED, so asserting that nothing posted contradicts that record/)
+})
+
+test('[o3d-1e7sl D11] the mirror-ownership audit note says whose id the owning sibling carries', () => {
+  const mine = ['key-a']
+  const confirmed = findMirrorOwnershipConflict(mine, [candidate({ status: 'SYNCED', externalTransactionId: 'INV-1' }, ['key-a'])])!
+  const asserted = findMirrorOwnershipConflict(mine, [candidate({ status: 'SYNCED', externalTransactionId: 'TYPED', settlementBasis: 'OPERATOR_ASSERTION' }, ['key-a'])])!
+  const live = findMirrorOwnershipConflict(mine, [candidate({ status: 'PENDING' }, ['key-a'])])!
+  assert.equal(confirmed.assertedDocument, false)
+  assert.equal(asserted.assertedDocument, true)
+  assert.match(describeMirrorOwnershipSkip(confirmed), /\(SYNCED, carries post evidence\) maps to the same mirrored event/)
+  assert.match(describeMirrorOwnershipSkip(asserted), /\(SYNCED, names a document an operator typed in - an assertion, not verified against the ledger\) maps to the same mirrored event/)
+  assert.doesNotMatch(describeMirrorOwnershipSkip(asserted), /carries post evidence/)
+  assert.match(describeMirrorOwnershipSkip(live), /\(PENDING\) maps to the same mirrored event/)
+})
+
+test('[o3d-1e7sl Codex r2] a mirror contradiction advises "reverse" unconditionally only for a CONNECTOR-confirmed mirror', () => {
+  for (const [name, postBasis, conditional] of [['CONNECTOR', 'CONNECTOR', false], ['OPERATOR_ASSERTION', 'OPERATOR_ASSERTION', true], ['unrecorded', null, true]] as const) {
+    for (const view of [{ status: 'POSTED', externalId: 'INV-1', postBasis }, { status: 'POSTED', externalId: null, postBasis }]) {
+      const refusal = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, view)
+      assert.ok(refusal, name)
+      const m = refusal!.message
+      console.log(`# r2 mirror precondition: ${name} id=${view.externalId} conditional=${conditional}`)
+      if (conditional) {
+        assert.match(m, /otherwise there is nothing to undo|if there is none, there is nothing to undo/, name)
+        assert.doesNotMatch(m, /or reverse the document in the accounting system first and settle it afterwards\.$|or reverse it there first\.$/, name)
+      } else {
+        assert.match(m, /reverse (the document in the accounting system|it there) first/, name)
+        assert.doesNotMatch(m, /nothing to (reverse|undo)/, name)
+      }
+    }
+  }
 })

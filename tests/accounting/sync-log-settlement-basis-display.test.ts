@@ -60,15 +60,77 @@ test('[o3d-anu8] both connectors CARRY the basis out of their sync-log read', as
   assert.match(registry.slice(getAt, getAt + 900), /settlementBasis: row\.settlementBasis/)
 })
 
-test('[o3d-anu8] the sync page marks an asserted row rather than showing a bare id', async () => {
+test('[o3d-anu8 / o3d-1e7sl] the sync page marks a row by its STANDING rather than showing a bare status and id', async () => {
   const client = await source('app/(dashboard)/sync/xero-client.tsx')
   assert.match(client, /const assertedBasis = isOperatorAssertedSettlement\(log\.settlementBasis\)/,
     'the basis is read from the COLUMN, never parsed out of the settlement note in errorMessage')
-  // The marker sits with the STATUS, which is the thing being qualified, and the external id cell
-  // says whose id it is.
+  // o3d-1e7sl (D2): the badge is the standing's, asked of ONE function, from all four columns the standing reads.
   const rowAt = client.indexOf('const assertedBasis =')
-  const rowBody = client.slice(rowAt, rowAt + 3000)
-  assert.match(rowBody, /assertedBasis && \(/)
-  assert.match(rowBody, /asserted/)
+  const rowBody = client.slice(rowAt, rowAt + 5200)
+  assert.match(rowBody, /describeLedgerStanding\(standingRow\)/)
+  assert.match(rowBody, /abandonedBeforeRemoteCall: log\.abandonedBeforeRemoteCall/,
+    'the pre-call proof reaches the page: without it a proven-unsent row would badge as unproven')
+  assert.match(rowBody, /standing\.label !== null && \(/)
+  assert.match(rowBody, /data-standing=\{standing\.standing\}/)
+  // the external id cell still says whose id it is.
   assert.match(rowBody, /asserted by an operator, not confirmed by Xero/)
+  assert.match(rowBody, /describeDocumentIdClaim\(standingRow\)/)
+  // and the page no longer reads the id or the status by hand to decide what to say about the ledger.
+  assert.doesNotMatch(rowBody, /log\.externalTransactionId\?\./)
+})
+
+test('[o3d-1e7sl D2] the connector-agnostic row, the Xero reader and the registry mapper CARRY the pre-call proof', async () => {
+  const registry = await source('lib/connectors/accounting-registry.ts')
+  const at = registry.indexOf('export type AccountingSyncLogRow = {')
+  assert.match(registry.slice(at, registry.indexOf('}', at)), /\n\s*abandonedBeforeRemoteCall: boolean \| null\n/)
+  assert.doesNotMatch(registry.slice(at, registry.indexOf('}', at)), /abandonedBeforeRemoteCall\?/)
+  const getAt = registry.indexOf('async getSyncLogs(limit = 50) {')
+  assert.match(registry.slice(getAt, getAt + 1100), /abandonedBeforeRemoteCall: row\.abandonedBeforeRemoteCall/)
+  const xero = await source('app/actions/xero-sync.ts')
+  const xeroAt = xero.indexOf('export async function getXeroSyncLogs')
+  assert.match(xero.slice(xeroAt, xeroAt + 1500), /abandonedBeforeRemoteCall: r\.abandonedBeforeRemoteCall/)
+  const action = await source('app/actions/accounting-sync.ts')
+  const actionAt = action.indexOf('export type AccountingSyncLogRow = {')
+  assert.match(action.slice(actionAt, action.indexOf('\n}\n', actionAt)), /\n\s*abandonedBeforeRemoteCall: boolean \| null\n/)
+})
+
+test('[o3d-1e7sl D3/D4] the orphan banner names an id by standing and the stranded loader selects the columns', async () => {
+  const banner = await source('app/(dashboard)/sync/connector-orphan-banner.tsx')
+  assert.match(banner, /describeDocumentIdClaim\(row\)/)
+  assert.match(banner, /describeLedgerStanding\(row\)\.label !== null && \(/)
+  assert.doesNotMatch(banner, /posted as \{row\.externalTransactionId\}/, 'the unqualified "posted as <id>" sentence is gone')
+  const loader = await source('app/actions/accounting-stranded-rows.ts')
+  const at = loader.indexOf('export async function getStrandedAccountingSyncRows')
+  assert.match(loader.slice(at, at + 2600), /settlementBasis: true/)
+  assert.match(loader.slice(at, at + 2600), /abandonedBeforeRemoteCall: true/)
+})
+
+test('[o3d-1e7sl Codex r1] the sync log, the orphan banner and the stranded-row source pass the WHOLE row (basis + flag + id) so a verified reversal is never badged "never sent"', async () => {
+  const client = await source('app/(dashboard)/sync/xero-client.tsx')
+  const at = client.indexOf('const standingRow = {')
+  const block = client.slice(at, at + 700)
+  for (const column of ['status: log.status', 'externalTransactionId: log.externalTransactionId', 'settlementBasis: log.settlementBasis', 'abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall']) {
+    assert.ok(block.includes(column), `sync log passes ${column}`)
+  }
+  assert.match(client, /standing\.tone === 'proven'/)
+  assert.doesNotMatch(client, /['"`]\s*(proven unsent|never sent)/, 'the page hardcodes no "never sent" wording: it all comes from the display module')
+  const banner = await source('app/(dashboard)/sync/connector-orphan-banner.tsx')
+  assert.match(banner, /describeLedgerStanding\(row\)/)
+  assert.doesNotMatch(banner, /['"`]\s*never sent/)
+  const display = await source('lib/domain/accounting/ledger-standing-display.ts')
+  assert.equal((display.match(/'never sent'/g) ?? []).length, 1, 'exactly one label says "never sent": the recorded pre-call proof')
+})
+
+test('[o3d-1e7sl Codex r2] operator instruction strings never advise an unconditional re-post / reversal on a non-confirmed standing', async () => {
+  const dialog = await source('app/(dashboard)/sync/settle-sync-row-control.tsx')
+  assert.match(dialog, /check the accounting system, and ONLY if the document is not there hand-post it/)
+  assert.doesNotMatch(dialog, /hand-post it in the accounting system and mark the posting handled\. If a document turns up/)
+  const handled = await source('lib/domain/accounting/hand-post-instruction.ts')
+  assert.match(handled, /FACTUAL ONLY[\s\S]*has no proof that the CURRENT version is not already in the ledger/, 'the retired sentence is facts only; the action is the typed step')
+  const docs = await source('help-docs/xero-sync.md')
+  assert.match(docs, /check Xero first and, only if the document is not there, record it in\s+Xero by hand/)
+  assert.doesNotMatch(docs, /To get the posting into the ledger, \*\*record it in/)
+  const sales = await source('help-docs/sales.md')
+  assert.match(sales, /check the accounting system for that journal and reverse it only if it exists there/)
+  assert.doesNotMatch(sales, /\| Daily batch \| \*\*Finance reverses the batch entry\.\*\*/)
 })

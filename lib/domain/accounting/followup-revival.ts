@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { readFollowUpIdempotencyKey, type FollowUpEnqueuePlan, type FollowUpPayload } from './followup-idempotency'
@@ -158,9 +159,9 @@ export async function resolveLostFollowUpRevival(
     // unique index gives it the slot — and silently accepting it would be the duplicate we
     // are guarding against, so surface it instead of guessing.
     throw new Error(
-      `Cannot enqueue ${connector} ${type} for ${referenceType} ${referenceId}: a live follow-up already owns this `
+      withLedgerCheck(`Cannot enqueue ${connector} ${type} for ${referenceType} ${referenceId}: a live follow-up already owns this `
       + `reference under a different idempotency token (rows ${live.map((row) => row.id).join(', ')}; expected `
-      + `${pinnedToken ?? 'none'}). Reconcile in the ledger before retrying.`,
+      + `${pinnedToken ?? 'none'}). Reconcile in the ledger before retrying.`),
     )
   }
 

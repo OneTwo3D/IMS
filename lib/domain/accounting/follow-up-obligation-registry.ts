@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { describeLedgerStanding } from '@/lib/domain/accounting/ledger-standing-display'
 import type { FollowUpObligationRecovery } from '@/lib/domain/accounting/back-reference'
 
 // ---------------------------------------------------------------------------
@@ -349,6 +350,9 @@ export type FollowUpObligationBacklogSource = {
   referenceType: string
   referenceId: string
   externalTransactionId: string | null
+  /** Codex round 6: what the id RESTS ON, so the backlog does not present an operator-typed id as the ledger's. */
+  settlementBasis?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
   /** Read for its NULL-ness only — it is a generation, not a time. */
   backReferenceFollowUpsPendingAt: Date | null
   /** The DATABASE-STAMPED times. `owedSince` below is one of these, never the marker and never `syncedAt`. */
@@ -365,6 +369,8 @@ export type FollowUpObligationBacklogRow = {
   referenceType: string
   referenceId: string
   externalTransactionId: string | null
+  /** Codex round 6: null for a confirmed / queued row; 'asserted' / 'unproven' for a row whose id an operator typed in. */
+  standingLabel: string | null
   /**
    * When the obligation was CLAIMED, as the database stamped it — else `createdAt`. NOT the
    * obligation marker (a generation, and displaying it as a time is the r7 defect) and NOT
@@ -395,6 +401,7 @@ export function describeFollowUpObligationBacklogRow(row: FollowUpObligationBack
     referenceType: row.referenceType,
     referenceId: row.referenceId,
     externalTransactionId: row.externalTransactionId,
+    standingLabel: describeLedgerStanding({ ...row, settlementBasis: row.settlementBasis ?? null, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null }).label,
     owedSince: row.backReferenceFollowUpsClaimedAtDatabaseClock ?? row.createdAt,
     blockedBy: recovery.consumer === 'none'
       ? recovery.blockedBy

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { config } from 'dotenv'
+import { OWNS_MIRRORED_EVENT_WHERE, namesADocument, ownsMirroredEvent } from '@/lib/domain/accounting/ledger-standing'
 
 /**
  * o3d-11rf r2 — THE MIRROR'S END STATE UNDER *BOTH* SETTLEMENT/ENQUEUE LOCK ORDERS.
@@ -105,7 +106,7 @@ async function setup(orderId: string, key: string) {
 /**
  * The SETTLEMENT half of `settleAccountingSyncRow`, driven through the very policy objects the
  * action uses — `settlementMirrorStatus`, `settlementMirrorVoidBasis`, `settlementMirrorGuard`,
- * `findMirrorOwnershipConflict` and the sibling `where` it filters on — so a change of policy in the
+ * `findMirrorOwnershipConflict` and the sibling `where` it filters on (`OWNS_MIRRORED_EVENT_WHERE`) — so a change of policy in the
  * action changes this probe rather than being copied past it.
  */
 async function runSettlement(ctx: Ctx, onLocked?: () => void, holdMs = 0) {
@@ -128,19 +129,21 @@ async function runSettlement(ctx: Ctx, onLocked?: () => void, holdMs = 0) {
         type: ctx.scope.type as never,
         referenceType: ctx.scope.referenceType,
         referenceId: ctx.scope.referenceId,
-        OR: [
-          { status: { in: [...ctx.settlement.MIRROR_OWNING_SYNC_STATUSES] as never } },
-          { externalTransactionId: { not: null } },
-        ],
+        // o3d-1e7sl: the module's own wording of "owns the mirror" - the very fragment the action spreads.
+        ...OWNS_MIRRORED_EVENT_WHERE,
       },
-      select: { id: true, status: true, externalTransactionId: true, payload: true },
+      select: {
+        id: true, status: true, externalTransactionId: true, payload: true,
+        settlementBasis: true, abandonedBeforeRemoteCall: true,
+      },
     })
     const conflict = ctx.settlement.findMirrorOwnershipConflict(
       mirrorKeys,
       siblings.map((sibling) => ({
         id: sibling.id,
         status: sibling.status,
-        externalTransactionId: sibling.externalTransactionId,
+        ownsMirror: ownsMirroredEvent(sibling),
+        posted: namesADocument(sibling),
         mirrorKeys: ctx.mirror.mirroredAccountingEventIdempotencyKeys({
           ...ctx.scope, syncLogId: sibling.id, payload: sibling.payload,
         }),

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import test, { mock } from 'node:test'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 
@@ -109,7 +110,8 @@ test('[o3d-j625 r10] a contended in-transaction refusal is PERSISTED as a provis
   const payload = AccountingPostingRefusalProvisionalPayloadSchema.parse(claim.payloadJson)
   assert.deepEqual(payload.key, KEY, 'keyed on the posting, so the replay clears and is cleared by the same thing')
   assert.equal(payload.record.reason, RECORD.reason)
-  assert.equal(payload.record.remedy, RECORD.remedy)
+  // Codex round 16: the sink guard runs at the entry of recordAccountingPostingRefusal, so the persisted provisional remedy carries the claim-and-ledger-check preamble too
+  assert.equal(payload.record.remedy, withHandPostSafety(RECORD.remedy))
   assert.equal(payload.record.kind, 'manufacturing_journal')
   assert.equal(payload.mergeOnly, true, 'the merge shape survives, or the replay would overwrite the enqueue\'s own reason')
   assert.equal(payload.decidedAt, decidedAt.toISOString(),
@@ -399,13 +401,37 @@ test('[o3d-j625 r10] the accounting-sync cron reconciles claims BEFORE any conne
  * oldest row for the key would discharge the debt, which is the r10 finding with an extra step. These two
  * tests differ in exactly one field.
  */
-function grantedCallerTransaction(liveSyncRows: Array<{ id: string; createdAt: Date }>) {
+type BaselineSyncRow = {
+  id: string
+  createdAt: Date
+  /**
+   * o3d-1e7sl (G6): the columns the ledger-standing module reads to say whether a row is a posting that can
+   * still post / has posted (LIVE) or a retired one. Default: a PENDING row on the connector's own record, which
+   * is what every fixture in this file has always meant by "a live row".
+   */
+  status?: string
+  settlementBasis?: string | null
+  externalTransactionId?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
+}
+
+function grantedCallerTransaction(liveSyncRows: BaselineSyncRow[]) {
   const writes: unknown[] = []
   const client = {
     // `got: true` — the key was granted, so the arms that decide whether the refusal is stale run.
     $queryRaw: async () => [{ got: true }],
     accountingSyncLog: {
-      findMany: async () => liveSyncRows.map((row) => ({ id: row.id, payload: {}, createdAt: row.createdAt })),
+      // EVERY row for the key is returned whatever its status (the read no longer excludes CANCELLED in the
+      // database), so `live` is decided by what the code does with the rows - which is the subject.
+      findMany: async () => liveSyncRows.map((row) => ({
+        id: row.id,
+        payload: {},
+        createdAt: row.createdAt,
+        status: row.status ?? 'PENDING',
+        settlementBasis: row.settlementBasis ?? null,
+        externalTransactionId: row.externalTransactionId ?? null,
+        abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+      })),
     },
     accountingPostingRefusal: {
       findUnique: async () => null,
@@ -432,6 +458,52 @@ test('[o3d-j625 r11] a COMPLETE baseline that did not know this row discharges t
   assert.equal(outcome.recorded === false ? outcome.because : null, 'queued',
     'the row was not in the baseline, so it was queued while this refusal was shut out of the key')
   assert.deepEqual(world.writes, [], 'and nothing is recorded as outstanding')
+})
+
+test('[o3d-1e7sl G6] only a row that can still post or holds the slot DISCHARGES a refusal - one row per standing; a retired one keeps the debt', async () => {
+  // The refusal is discharged when a LIVE row it did not know about appears (a posting was queued while it was shut
+  // out of the key). A RETIRED row - an operator's NOT_POSTED, a cancellation with no proof, a swept pre-call row -
+  // is not a queued posting: it can never post, so it does not clear a debt that is still owed. Same baseline in every
+  // case (empty, complete); only the standing of the row the replay finds differs.
+  const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const cases: Array<{ name: string; standing: string; row: Partial<BaselineSyncRow>; discharges: boolean }> = [
+    { name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK', row: { status: 'PENDING' }, discharges: true },
+    { name: 'LIVE_WORK (PROCESSING)', standing: 'LIVE_WORK', row: { status: 'PROCESSING' }, discharges: true },
+    { name: 'CONFIRMED_POSTED (SYNCED, connector id)', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-1' }, discharges: true },
+    { name: 'ASSERTED_POSTED (SYNCED, typed id)', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-T', settlementBasis: 'OPERATOR_ASSERTION' }, discharges: true },
+    { name: 'UNKNOWN (FAILED can still be retried)', standing: 'UNKNOWN', row: { status: 'FAILED' }, discharges: true },
+    { name: 'ASSERTED_NOT_POSTED (retired)', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }, discharges: false },
+    { name: 'PROVEN_NOT_POSTED (retired, pre-call proof)', standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', abandonedBeforeRemoteCall: true }, discharges: false },
+    { name: 'UNKNOWN (retired, no proof)', standing: 'UNKNOWN', row: { status: 'CANCELLED' }, discharges: false },
+  ]
+  let discharged = 0
+  for (const c of cases) {
+    const row: BaselineSyncRow = { id: 'sync-new', createdAt: new Date('2026-09-24T11:00:00.000Z'), ...c.row }
+    const standing = ledgerStanding({
+      status: row.status ?? 'PENDING', externalTransactionId: row.externalTransactionId ?? null,
+      settlementBasis: row.settlementBasis ?? null, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# G6 replay precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const world = grantedCallerTransaction([row])
+    const outcome = await recordAccountingPostingRefusal(world.client as never, KEY, RECORD, {
+      withSavepoint: async (fn) => fn(),
+      decidedAt: DECIDED_AT,
+      queuedWhenShutOut: { ids: [], complete: true },
+    })
+    assert.equal(outcome.recorded === false, c.discharges, c.name)
+    if (c.discharges) {
+      discharged += 1
+      assert.equal(outcome.recorded === false ? outcome.because : null, 'queued', c.name)
+      assert.deepEqual(world.writes, [], `${c.name}: nothing is recorded as outstanding`)
+    } else {
+      assert.equal(outcome.recorded, true, `${c.name}: the debt is kept and recorded`)
+      assert.ok(world.writes.length > 0, `${c.name}: and the refusal row is written`)
+    }
+  }
+  console.log(`# G6 replay cases: ${cases.length}; discharging ${discharged}`)
+  assert.ok(discharged > 0 && discharged < cases.length)
 })
 
 test('[o3d-j625 r11] an INCOMPLETE baseline discharges nothing — the debt is kept', async () => {

@@ -19,6 +19,8 @@ type Refusal = {
 type SyncRow = {
   id: string; connector: string; type: string; referenceType: string; referenceId: string; status: string
   attemptRevision: number; externalTransactionId: string | null; payload: unknown; errorMessage?: string | null
+  /** o3d-1e7sl: absent = NULL (the connector's own writeback), as the double's `findMany` fills in. */
+  settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null
 }
 const refusals: Refusal[] = []
 const syncRows: SyncRow[] = []
@@ -158,7 +160,11 @@ let onSyncRead: (() => void) | null = null
 const syncTable = {
   findMany: async ({ where }: { where: Record<string, unknown> }) => {
     onSyncRead?.()
-    return syncRows.filter((row) => matches(row as unknown as Record<string, unknown>, where))
+    // o3d-1e7sl: the standing columns default to the connector's own writeback (NULL basis, no flag) - what
+    // every row in this file has always meant - so a fixture that does not say reads as confirmed/unflagged.
+    return syncRows
+      .filter((row) => matches(row as unknown as Record<string, unknown>, where))
+      .map((row) => ({ settlementBasis: null, abandonedBeforeRemoteCall: null, ...row }))
   },
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const hits = syncRows.filter((row) => matches(row as unknown as Record<string, unknown>, where))
@@ -317,6 +323,85 @@ for (const [label, overrides] of [
     assert.equal(syncRows[0]!.status, overrides.status, 'and the sync row is untouched')
   })
 }
+
+/**
+ * o3d-1e7sl (G5, slice 1c of o3d-f709) - THE MARK-HANDLED GUARD READS THE LEDGER-STANDING MODULE, ONE ROW PER STANDING.
+ *
+ * "May IMS already have posted this, or be posting it now?" is asked of every sync row under the posting key.
+ * A row that can still post (PENDING / PROCESSING / FAILED) or holds the slot (SYNCED) is a CANDIDATE; a
+ * RETIRED row (CANCELLED) can never post again, so it does not block - hand-posting and marking the posting
+ * handled is the remedy for an asserted-not-posted or unresolved attempt (D1), and refusing it would be a
+ * dead end. But a retired row that is not PROVEN unsent is not "nothing": the claim REPORTS it, so the
+ * operator is told to look in the ledger first. Each case asserts the row's standing before its decision.
+ */
+test('[o3d-1e7sl G5] the claim decides per STANDING of the row under the key, and reports an unproven retirement', async () => {
+  const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  type Case = {
+    name: string
+    standing: string
+    row: Partial<SyncRow>
+    claims: boolean
+    cancelled?: boolean
+    reports?: RegExp
+    refuses?: RegExp
+  }
+  const cases: Case[] = [
+    { name: 'LIVE_WORK: PENDING never claimed (provably unsent) is CANCELLED by the claim', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 0 }, claims: true, cancelled: true },
+    { name: 'LIVE_WORK: PENDING already claimed once may have been sent', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 2 }, claims: false, refuses: /is PENDING \(queued or in flight\)/ },
+    // THE ISOLATING ARM for "provably unsent" going through the module: a PENDING, never-claimed row with NO id
+    // that carries an operator basis is UNKNOWN (truth-table row 2: no writer produces it). A test that only had
+    // a null-basis row could not tell the module's LIVE_WORK from the old `!externalTransactionId`.
+    { name: 'UNKNOWN: PENDING never claimed but carrying an operator basis is NOT provably unsent', standing: 'UNKNOWN', row: { status: 'PENDING', attemptRevision: 0, settlementBasis: 'OPERATOR_ASSERTION' }, claims: false, refuses: /nothing on the row says whether it reached the ledger/ },
+    { name: 'LIVE_WORK: PROCESSING', standing: 'LIVE_WORK', row: { status: 'PROCESSING', attemptRevision: 1 }, claims: false, refuses: /is PROCESSING \(queued or in flight\)/ },
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-C', attemptRevision: 1 }, claims: false, refuses: /is SYNCED with document DOC-C \(confirmed by the connector\)/ },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-T', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, claims: false, refuses: /TYPED IN BY AN OPERATOR/ },
+    { name: 'UNKNOWN: FAILED, nothing else', standing: 'UNKNOWN', row: { status: 'FAILED', attemptRevision: 1 }, claims: false, refuses: /nothing on the row says whether it reached the ledger/ },
+    { name: 'ASSERTED_NOT_POSTED: retired, does not block, REPORTED', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, claims: true, reports: /settled by an operator as NOT posted \(an assertion, not proof that it did not post\)/ },
+    { name: 'UNKNOWN: retired with no proof, does not block, REPORTED', standing: 'UNKNOWN', row: { status: 'CANCELLED', attemptRevision: 1 }, claims: true, reports: /nothing on the row says whether it reached the ledger/ },
+    { name: 'PROVEN_NOT_POSTED: retired with its pre-call proof, nothing to report', standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', abandonedBeforeRemoteCall: true, attemptRevision: 0 }, claims: true },
+  ]
+  let claimed = 0
+  let refused = 0
+  let reported = 0
+  for (const [i, c] of cases.entries()) {
+    refusals.length = 0
+    syncRows.length = 0
+    activity.length = 0
+    refusals.push(refusal(`g5-${i}`, 'stock_receipt_journal'))
+    const row = sync(`s-${i}`, refusals[0]!, c.row)
+    syncRows.push(row)
+    const standing = ledgerStanding({
+      status: row.status, externalTransactionId: row.externalTransactionId,
+      settlementBasis: row.settlementBasis ?? null, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# G5 precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+    const result = await claimAccountingPostingRefusalForHandPostingAction(`g5-${i}`)
+    assert.equal(ok(result), c.claims, c.name)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting')
+    if (c.claims) {
+      claimed += 1
+      assert.equal(syncRows[0]!.status === 'CANCELLED', c.cancelled === true || c.row.status === 'CANCELLED', `${c.name}: only a provably unsent row is cancelled by the claim`)
+      const retired = (note?.metadata?.retiredUnproven ?? []) as string[]
+      if (c.reports) {
+        reported += 1
+        assert.equal(retired.length, 1, c.name)
+        assert.match(retired[0]!, c.reports, c.name)
+        assert.match(String((note as unknown as { description?: string }).description), /Earlier attempt\(s\) at this posting were retired without proof[\s\S]*Instruction shown, to follow under the claim just taken: check the ledger for that document first; post it ONLY if it is absent/, c.name)
+      } else {
+        assert.deepEqual(retired, [], `${c.name}: nothing unproven to report`)
+      }
+    } else {
+      refused += 1
+      assert.match(errorOf(result), c.refuses!, c.name)
+      assert.equal(syncRows[0]!.status, c.row.status, `${c.name}: a refused claim writes nothing`)
+    }
+  }
+  console.log(`# G5 cases: ${cases.length}; claimed ${claimed}; refused ${refused}; reported-unproven ${reported}`)
+  assert.ok(claimed > 0 && refused > 0 && reported === 2)
+  assert.equal(cases.length, 10)
+})
 
 test('[o3d-j625 r7] a processor claiming the row between the read and the cancel makes the mark fail, not cancel a row in flight', async () => {
   const row = refusal('r4', 'landed_cost_cogs_journal', { type: 'COGS_JOURNAL' })
@@ -973,3 +1058,242 @@ function seedFiftyOnePlusAnOlderUnclaimed(): { shownOnPageOne: string[]; olderUn
   }
   return { shownOnPageOne: [], olderUnclaimedId: 'a-older-unclaimed' }
 }
+
+test('[o3d-1e7sl Codex r6] the claim log carries the STANDING of an earlier posting: an operator-typed earlier document is "NOT verified", never an unconditional "replaces"', async () => {
+  const cases = [
+    { name: 'ASSERTED_POSTED earlier', row: { status: 'SYNCED', externalTransactionId: 'INV-TYPED', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, unverified: true },
+    { name: 'CONFIRMED earlier', row: { status: 'SYNCED', externalTransactionId: 'INV-REAL', attemptRevision: 1 }, unverified: false },
+  ]
+  for (const [i, c] of cases.entries()) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r6-${i}`, 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: `so-r6-${i}`, scope: '' }))
+    syncRows.push(sync(`s-r6-${i}`, refusals[0]!, c.row as never))
+    const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+    const result = await claimAccountingPostingRefusalForHandPostingAction(`r6-${i}`)
+    assert.equal(ok(result), true, `${c.name}: the claim goes through (an earlier completed posting does not block)`)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string; metadata?: Record<string, unknown> }
+    assert.ok(note, c.name)
+    if (c.unverified) {
+      assert.match(note.description, /INV-TYPED \(an id an operator typed in\) as posted/, c.name)
+      assert.match(note.description, /has NOT verified it\./, c.name)
+      assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version/, c.name)
+      assert.doesNotMatch(note.description, /already holds|REPLACES|post it in the ledger now/i, c.name)
+    } else {
+      assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, c.name)
+      assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version/, c.name)
+      assert.doesNotMatch(note.description, /post it in the ledger now/i, `${c.name}: Codex r9 - an earlier document exists, so the plain wording is unreachable`)
+    }
+    assert.deepEqual(note.metadata?.earlierPostingDetails, [{ ref: c.unverified ? 'INV-TYPED' : 'INV-REAL', standing: c.unverified ? 'ASSERTED_POSTED' : 'CONFIRMED_POSTED' }], `${c.name}: the standing is in the log metadata too`)
+  }
+})
+
+test('[o3d-1e7sl Codex r7] the claim log for a COMBINED state (a retired unproven attempt AND a confirmed earlier invoice): the earlier invoice does not satisfy the retired attempt\'s check', async () => {
+  refusals.length = 0; syncRows.length = 0; activity.length = 0
+  refusals.push(refusal('r7-1', 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-r7', scope: '' }))
+  syncRows.push(sync('s-r7-earlier', refusals[0]!, { status: 'SYNCED', externalTransactionId: 'INV-REAL', attemptRevision: 1 } as never))
+  syncRows.push(sync('s-r7-retired', refusals[0]!, { status: 'CANCELLED', attemptRevision: 1 } as never))
+  const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+  const result = await claimAccountingPostingRefusalForHandPostingAction('r7-1')
+  assert.equal(ok(result), true)
+  const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
+  assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed standing')
+  assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\): if the current version is there, do not post again; if only an earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
+  assert.match(note.description, /IMS has no proof that the CURRENT version is not already in the ledger \(an earlier version being there does not show it\)/, 'the retired attempt is described against the CURRENT version, not the earlier one (facts only)')
+})
+
+test('[o3d-1e7sl Codex r9] a REPEATED Take by the claim holder reloads the standing: the second log entry carries it for every earlier standing x retired', async () => {
+  const earlierRows = [
+    ['no earlier', null],
+    ['confirmed earlier', { status: 'SYNCED', externalTransactionId: 'INV-REAL', attemptRevision: 1 }],
+    ['asserted earlier', { status: 'SYNCED', externalTransactionId: 'INV-TYPED', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }],
+  ] as const
+  let n = 0
+  for (const [earlierName, earlierRow] of earlierRows) {
+    for (const retired of [false, true]) {
+      n += 1
+      refusals.length = 0; syncRows.length = 0; activity.length = 0
+      refusals.push(refusal(`r9-${n}`, 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: `so-r9-${n}`, scope: '' }))
+      if (earlierRow) syncRows.push(sync(`s-r9-e-${n}`, refusals[0]!, earlierRow as never))
+      if (retired) syncRows.push(sync(`s-r9-r-${n}`, refusals[0]!, { status: 'CANCELLED', attemptRevision: 1 } as never))
+      const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+      const where = `${earlierName} / retired=${retired}`
+      assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r9-${n}`)), true, `${where}: first take`)
+      activity.length = 0
+      assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r9-${n}`)), true, `${where}: the repeated take is idempotent`)
+      const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string } | undefined
+      assert.ok(note, `${where}: the repeated take writes a fresh operator-facing log entry (so the entry must carry the standing)`)
+      if (earlierRow) {
+        assert.doesNotMatch(note!.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over an earlier document`)
+        assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version/, `${where}: carries the current-version instruction`)
+        assert.match(note.description, (earlierRow as { settlementBasis?: string }).settlementBasis ? /INV-TYPED \(an id an operator typed in\) as posted/ : /The ledger holds INV-REAL/, `${where}: carries the earlier row's standing`)
+      } else if (retired) {
+        assert.doesNotMatch(note.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over a retired attempt`)
+        assert.match(note.description, /IMS has no proof that the CURRENT version is not already in the ledger/, `${where}: carries the retired-attempt fact`)
+      } else {
+        assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\)/, `${where}: an UPDATE posting always gets the CURRENT-version instruction, whatever was loaded`)
+      }
+    }
+  }
+})
+
+test('[o3d-1e7sl Codex r10] the claim log for a BILL_PAYMENT is the PAYMENT instruction in every state: register THIS payment as NEW, never alter the earlier one', async () => {
+  for (const [name, rows] of [
+    ['nothing loaded', []],
+    ['confirmed earlier payment', [{ status: 'SYNCED', externalTransactionId: 'PAY-REAL', attemptRevision: 1 }]],
+    ['retired only', [{ status: 'CANCELLED', attemptRevision: 1 }]],
+  ] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal('r10-bp', 'realised_fx_bill_payment', { type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'bill-r10', scope: '' }))
+    rows.forEach((r, i) => syncRows.push(sync(`s-r10-${i}`, refusals[0]!, r as never)))
+    const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+    assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction('r10-bp')), true, name)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
+    assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT payment \(the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one\): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment/, `${name}: the payment step`)
+    assert.doesNotMatch(note.description, /apply the update|update it/i, `${name}: never the update wording on a payment`)
+  }
+})
+
+test('[o3d-1e7sl Codex r11/r14] the server suppresses only on a one-posting key, and NO dialog predicts it: the dialog states what marking does now and sends the operator to the list', async () => {
+  const { CHECK_AFTERWARDS, MARK_ACTION_NOW, markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const cases: Array<[string, string, boolean]> = [
+    ['SALES_INVOICE_UPDATE', 'sales_invoice_update', false],
+    ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update', false],
+    ['BILL_PAYMENT', 'realised_fx_bill_payment', false],
+    ['STOCK_RECEIPT', 'stock_receipt_journal', true],
+  ]
+  for (const [type, kind, suppresses] of cases) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r11-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await mark(`r11-${type}`)), true, `${type}: the mark goes through`)
+    assert.equal(refusals[0]!.suppressedAt instanceof Date, suppresses, `${type}: the server ${suppresses ? 'writes' : 'does NOT write'} the durable suppression`)
+    const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
+    assert.ok(dialog.includes(MARK_ACTION_NOW) && dialog.includes(CHECK_AFTERWARDS), `${type}: the dialog states the action now and sends the operator to the list`)
+    assert.doesNotMatch(dialog, /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: the dialog predicts nothing, in either direction`)
+  }
+})
+
+
+test('[o3d-1e7sl Codex r12/r14] the deferred-edit (keepOutstanding) branch leaves the refusal OPEN and the real action says so at that moment; the dialog predicts nothing about it', async () => {
+  const { CHECK_AFTERWARDS, markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction } = await import('@/app/actions/sync-exceptions')
+  for (const [type, kind] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update'], ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update'], ['BILL_PAYMENT', 'realised_fx_bill_payment']] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r12-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r12-${type}`)), true, `${type}: claim`)
+    ;(refusals[0] as unknown as Record<string, unknown>).handPostDeferredCount = 2
+    const result = await markAccountingPostingRefusalHandledAction(`r12-${type}`, 'posted by hand')
+    assert.equal(refusals[0]!.resolvedAt, null, `${type}: the refusal is OPEN when a later posting was declined during the claim`)
+    assert.equal(refusals[0]!.handPostClaimedAt, null, `${type}: and the claim is released`)
+    assert.equal(refusals[0]!.suppressedAt, null, `${type}: and nothing is suppressed`)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string } | undefined
+    assert.match(String(note?.description), /This row is STILL OUTSTANDING\. While the claim was held IMS declined 2 posting\(s\) for this document\./, `${type}: the log states the state at that moment`)
+    assert.match(String((result as { notice?: string }).notice), /STILL OUTSTANDING/, `${type}: and so does the notice the operator is shown`)
+    assert.ok(String((result as { notice?: string }).notice).includes(CHECK_AFTERWARDS), `${type}: with the pointer to the list`)
+    const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
+    assert.doesNotMatch(dialog, /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: the dialog predicts nothing`)
+  }
+})
+
+test('[o3d-1e7sl Codex r12/r14] after a real mark, a refused-again posting is listed again on a reused key and not on a one-posting key (server behaviour); no text predicts either', async () => {
+  const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const record = { chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r' } as const
+  for (const [type, kind, reused] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update', true], ['STOCK_RECEIPT', 'stock_receipt_journal', false]] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r12b-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await mark(`r12b-${type}`)), true, `${type}: marked handled`)
+    assert.ok(refusals[0]!.resolvedAt instanceof Date, `${type}: PRECONDITION: the refusal closed`)
+    await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }, { kind, ...record })
+    assert.equal(refusals[0]!.resolvedAt === null, reused, `${type}: a refused-again posting ${reused ? 'IS listed again (nothing was suppressed)' : 'is NOT listed again (the key is suppressed)'}`)
+    assert.doesNotMatch(markHandledWarningFor({ type, state: 'not-loaded' }), /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: the dialog predicts neither`)
+  }
+})
+
+test('[o3d-1e7sl Codex r13/r14] ANOTHER operator holding the claim: the refusal and the inbox row carry the shared present-tense sentence and no closure promise', async () => {
+  const { OTHER_OPERATOR_CLAIM_OUTCOME, handPostOrderFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  refusals.length = 0; syncRows.length = 0; activity.length = 0
+  refusals.push(refusal('r13-other', 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-r13', scope: '', handPostClaimedAt: new Date('2026-10-01T10:00:00Z'), handPostClaimedBy: 'user-9' }))
+  const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction } = await import('@/app/actions/sync-exceptions')
+  for (const result of [await claimAccountingPostingRefusalForHandPostingAction('r13-other'), await markAccountingPostingRefusalHandledAction('r13-other', 'x')]) {
+    assert.equal(ok(result), false, 'the other operator\'s claim refuses both')
+    assert.ok(errorOf(result).includes(OTHER_OPERATOR_CLAIM_OUTCOME), 'the refusal carries the shared outcome sentence')
+  }
+  const row = handPostOrderFor({ type: 'SALES_INVOICE_UPDATE', state: 'not-loaded', queuedRow: null, claim: { at: 'now', byName: 'Sam', mine: false } })
+  assert.ok(row.includes(OTHER_OPERATOR_CLAIM_OUTCOME), 'and so does the inbox row')
+})
+
+test('[o3d-1e7sl Codex r13/r14] the mark activity log states the action at that moment and sends the operator to the list; it matches what the server wrote', async () => {
+  const { CHECK_AFTERWARDS, MARK_ACTION_NOW } = await import('@/lib/domain/accounting/hand-post-instruction')
+  for (const [type, kind, reused] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update', true], ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update', true], ['STOCK_RECEIPT', 'stock_receipt_journal', false]] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r13-log-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await mark(`r13-log-${type}`)), true, type)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string }
+    assert.ok(note.description.includes(MARK_ACTION_NOW) && note.description.includes(CHECK_AFTERWARDS), `${type}: the log carries the shared action sentence and the pointer`)
+    assert.doesNotMatch(note.description, /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: and predicts nothing`)
+    assert.equal(refusals[0]!.suppressedAt instanceof Date, !reused, `${type}: server behaviour is unchanged`)
+  }
+})
+
+test('[o3d-1e7sl Codex r13] the kinds help text says "Mark as handled also stops IMS ever posting it" only for kinds whose key names ONE posting for ever', async () => {
+  const { POSTING_REFUSAL_KINDS } = await import('@/lib/domain/accounting/posting-refusal-kinds')
+  const { postingKeyIsReusedAcrossPostings } = await import('@/lib/accounting/posting-key')
+  for (const [kind, def] of Object.entries(POSTING_REFUSAL_KINDS) as Array<[string, { type: string; clearing: string }]>) {
+    if (def.clearing === 'manual') assert.equal(postingKeyIsReusedAcrossPostings(def.type), false, `${kind}: a manual kind promised "stops IMS ever posting it" must not be a reused-key type`)
+  }
+})
+
+test('[o3d-1e7sl Codex r15] a deferred edit the operator ALREADY posted by hand before the Mark: the notice, the log and the release notice carry the ledger check, never an unconditional re-save or post', async () => {
+  const { AFTER_DECLINE_STEP, CHECK_AFTERWARDS } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction, releaseAccountingPostingRefusalHandPostClaimAction } = await import('@/app/actions/sync-exceptions')
+  for (const [mode, deferred, unaccounted] of [['counted', 2, false], ['unaccounted', 0, true]] as const) {
+    for (const [type, kind] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update'], ['BILL_PAYMENT', 'realised_fx_bill_payment']] as const) {
+      refusals.length = 0; syncRows.length = 0; activity.length = 0
+      refusals.push(refusal(`r15-${mode}-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${mode}-${type}`, scope: '' }))
+      assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r15-${mode}-${type}`)), true, 'claim')
+      // the operator posts the CURRENT version by hand while holding the claim; IMS meanwhile declines a later enqueue
+      ;(refusals[0] as unknown as Record<string, unknown>).handPostDeferredCount = deferred
+      ;(refusals[0] as unknown as Record<string, unknown>).handPostDeclineUncountedAt = unaccounted ? new Date() : null
+      const result = await markAccountingPostingRefusalHandledAction(`r15-${mode}-${type}`, 'posted the current version by hand')
+      const notice = String((result as { notice?: string }).notice)
+      const log = String((activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string })?.description)
+      for (const [name, text] of [['notice', notice], ['activity log', log]] as const) {
+        assert.ok(text.includes(AFTER_DECLINE_STEP), `${mode}/${type}: the ${name} carries the conditional ledger check`)
+        assert.ok(text.includes(CHECK_AFTERWARDS), `${mode}/${type}: and the pointer to the list`)
+        // the ledger check PRECEDES any re-save / post-by-hand instruction in the same text
+        assert.ok(text.indexOf('Check whether the current version is already in the accounting system') < text.search(/post the current version by hand/), `${mode}/${type}: ${name}: the check comes first`)
+        assert.match(text, /If it is absent, EITHER take a fresh claim first[^.]*check the ledger again under that claim, and only then post the current version by hand, OR - holding NO claim[^.]*re-save the document\./, `${mode}/${type}: ${name}: the post needs a FRESH CLAIM and a re-check, and the re-save is its own branch with no claim held`)
+        assert.doesNotMatch(text, /(^|\. )Re-save it|Compare the document with the ledger; re-save/i, `${mode}/${type}: ${name}: no unconditional re-save`)
+      }
+    }
+  }
+})
+
+test('[o3d-1e7sl Codex r16] THE SINK GUARD ACTS: every refusing site\'s RAW remedy, fed through the real recordAccountingPostingRefusal, is stored with the claim-and-ledger-check preamble in front of any post / re-save / by-hand instruction', async () => {
+  const { remedyCorpus, unsafeInstructionSentences } = await import('../helpers/hand-post-census')
+  const { HAND_POST_SAFETY, HAND_POST_INSTRUCTION_PATTERN } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const raw = remedyCorpus({ sink: false })
+  assert.ok(raw.length >= 25, `PRECONDITION: the raw remedies of the refusing sites are extracted (${raw.length})`)
+  let stored = 0
+  let guarded = 0
+  for (const [i, r] of raw.entries()) {
+    refusals.length = 0
+    await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type: 'SALES_INVOICE_UPDATE', referenceType: 'Doc', referenceId: `d-${i}`, scope: '' },
+      { kind: 'sales_invoice_update', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: r.text })
+    const row = refusals[0] as unknown as { remedy?: string } | undefined
+    if (!row) continue
+    stored += 1
+    assert.deepEqual(unsafeInstructionSentences(String(row.remedy)), [], `${r.source}: the STORED remedy is safe: ${r.text.slice(0, 80)}`)
+    if (HAND_POST_INSTRUCTION_PATTERN.test(r.text) && !/\b(do not|don't|never)\b/i.test(r.text)) { guarded += 1; assert.ok(String(row.remedy).startsWith(HAND_POST_SAFETY) || String(row.remedy).includes(HAND_POST_SAFETY), `${r.source}: the preamble is in the stored remedy`) }
+  }
+  console.log(`# r16 sink: ${raw.length} raw remedies, ${stored} stored, ${guarded} carried an instruction and got the preamble`)
+  assert.ok(stored >= 25 && guarded >= 5, 'the sink really stored and guarded them')
+  // and the named unsafe strings the reviews found
+  for (const unsafe of ['Post it yourself in the ledger that holds that document, then mark this row handled.', 'Post the reversal by hand.', 'post the reclass by hand and mark this row handled']) {
+    refusals.length = 0
+    await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type: 'STOCK_RECEIPT', referenceType: 'Doc', referenceId: 'd-unsafe', scope: '' },
+      { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: unsafe })
+    assert.ok(String((refusals[0] as unknown as { remedy: string }).remedy).startsWith(HAND_POST_SAFETY), `stored with the preamble first: ${unsafe}`)
+  }
+})

@@ -2,6 +2,7 @@
  * Generic accounting facade — core code imports ONLY from here, never from connector modules.
  */
 
+import { handPostStepFor, MARK_REMEDY_TAIL, withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -597,9 +598,9 @@ async function refuseUnattributableChart(params: {
         + 'document or account id is a primary key in the accounting system\'s own database and it '
         + 'SURVIVES a connector switch, so it cannot be assumed to belong to whichever connector is '
         + 'active now: queueing this would send a payment or correction against a document '
-        + `${params.chartConnector} does not hold. This posting is still OUTSTANDING: re-raise it from `
-        + 'the source document once the connector selection has settled, or record the posting by hand '
-        + 'in the books that actually hold the document.',
+        + `${params.chartConnector} does not hold. This posting is still OUTSTANDING. `
+        + withHandPostSafety('Once the connector selection has settled, re-raise it from the source document, or record the posting by hand '
+        + 'in the books that actually hold the document.'),
       metadata: {
         chartConnector: params.chartConnector,
         documentConnector: params.documentConnector ?? null,
@@ -622,9 +623,9 @@ async function refuseUnattributableChart(params: {
       // action IMS does not offer for most documents. What is true: the document's connector is not recorded,
       // and a retry of this posting (where one exists) refuses for the same reason until it is.
       remedy:
-        'IMS cannot show which accounting connector holds the document this posting names, so it will not post '
-        + 'it. Post it yourself in the ledger that holds that document, then mark this row handled — that '
-        + 'cancels IMS\'s own attempt at it, so it is not posted twice.',
+        'IMS cannot show which accounting connector holds the document this posting names, so it did not post '
+        + `it. In the ledger that holds that document: ${handPostStepFor(params.type)}. Then mark this row handled. `
+        + MARK_REMEDY_TAIL,
       detail: {
         documentConnector: params.documentConnector ?? null,
         connectorNativePayloadKeys: nativeIdKeys,
@@ -653,9 +654,9 @@ async function refuseUnattributableChart(params: {
       `NOTHING WAS QUEUED. The ${params.type} for ${params.referenceType} ${params.referenceId} was `
       + `built from ${params.chartConnector}'s chart of accounts, and the active accounting connector `
       + `is now ${activeLabel}, so queueing it would write a row no scheduled sync `
-      + 'reads. This posting is still OUTSTANDING: switching back to '
-      + `${params.chartConnector} lets IMS's own retry of it (where it has one) post it; otherwise post it by `
-      + 'hand in the ledger it belongs to and mark it handled in the exception inbox.',
+      + 'reads. This posting is still OUTSTANDING. '
+      + withHandPostSafety(`Switching back to ${params.chartConnector} lets IMS's own retry of it (where it has one) post it; otherwise ${handPostStepFor(params.type)} `
+        + 'in the ledger it belongs to, then mark it handled in the exception inbox.'),
     metadata: {
       chartConnector: params.chartConnector,
       // The other end of the switch. Without it this record says a posting was refused and cannot say
@@ -678,8 +679,8 @@ async function refuseUnattributableChart(params: {
     // posting is closed by marking the row handled (which stops IMS posting it too).
     remedy:
       `Switch the accounting connector back to ${params.chartConnector} so IMS's own retry of this posting (where `
-      + 'it has one) can post it. Otherwise post it by hand in the ledger it belongs to and mark this row handled — '
-      + 'that cancels IMS\'s retry, so it is not posted twice.',
+      + `it has one) can post it. Otherwise ${handPostStepFor(params.type)} in the ledger it belongs to, then mark this row handled. `
+      + MARK_REMEDY_TAIL,
   })
   return {
     queued: false,

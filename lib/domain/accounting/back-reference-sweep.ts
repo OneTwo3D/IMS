@@ -1513,8 +1513,8 @@ export async function repairAccountingBackReferences(
     await warnAndDefer(row, () => ({
       action: `${prefix}_backreference_unverified_assertion`,
       description: `Refused ${refused} for ${row.referenceType} ${row.referenceId}: this ${connectorLabel} sync row's outcome was `
-        + 'recorded by an OPERATOR ASSERTION, not by the connector. Nobody called '
-        + `${connectorLabel} for it, nobody read the document and nobody compared an amount — document id `
+        + 'recorded by an OPERATOR ASSERTION, not by the connector, and IMS '
+        + `did not verify it against ${connectorLabel}: it read no document and compared no amount when it was recorded — document id `
         + `${documentId} is a string a person typed after looking at a screen. `
         + (refused === 'the back-reference'
           ? 'Writing it onto the record would make it the ledger link everything downstream trusts, and an unverified '

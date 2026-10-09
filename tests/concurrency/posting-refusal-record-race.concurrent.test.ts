@@ -1,4 +1,5 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
@@ -564,8 +565,9 @@ test(
     assert.equal(rows.length, 1,
       `the posting was never queued — the transaction that held its key rolled back — so the refusal is `
       + `outstanding work. ${describe(rows)}`)
-    assert.equal(rows[0]!.remedy, refusalRecord('retired_chart').remedy,
-      'and it carries the refusing site\'s own remedy, so the operator is told what to do')
+    // Codex round 16: the sink guard puts the claim-and-ledger-check preamble in front of a remedy that carries a hand-post instruction
+    assert.equal(rows[0]!.remedy, withHandPostSafety(refusalRecord('retired_chart').remedy),
+      'and it carries the refusing site\'s own remedy (behind the sink guard\'s preamble), so the operator is told what to do')
   },
 )
 

@@ -431,14 +431,20 @@ test('o3d-f709: the shipped declarations are unique, classed, argued and name be
   const classes = new Map<string, number>()
   for (const d of DECLARATIONS as Array<{ class: string }>) classes.set(d.class, (classes.get(d.class) ?? 0) + 1)
   console.log(`# declarations: ${keys.size}; by class ${JSON.stringify(Object.fromEntries(classes))}`)
-  assert.ok(keys.size >= 90, `precondition: the declarations are present (${keys.size})`)
+  assert.ok(keys.size >= 60, `precondition: the declarations are present (${keys.size})`)
   const pending = [...classes.keys()].filter((c) => c.startsWith('PENDING_CONVERSION:'))
-  assert.ok(pending.length >= 1, 'slice 1c is named')
+  assert.ok(pending.length >= 1, 'the re-settleability authority (o3d-2by1) is named')
   const text = readFileSync(path.join(ROOT, 'scripts/ledger-standing-reader-declarations.mjs'), 'utf8')
-  assert.ok(text.includes('PENDING_CONVERSION:o3d-1e7sl'), 'o3d-1e7sl is used')
-  // o3d-djemh converted M17 and deleted its ten declarations: none may be left pending on it.
-  console.log(`# pending beads: ${JSON.stringify(pending)}`)
+  assert.ok(text.includes('PENDING_CONVERSION:o3d-2by1'), 'o3d-2by1 is used')
+  // o3d-djemh converted M17 and deleted its declarations: none may be left pending on it.
   assert.equal(text.includes('PENDING_CONVERSION:o3d-djemh'), false, 'no declaration is pending on o3d-djemh')
+  // o3d-1e7sl (slice 1c) converted every reader it owned and re-declared the ones whose reading holds as
+  // GUARD / DISPLAY with a reason; a leftover PENDING_CONVERSION naming it would be an allowlist entry for work
+  // that is done.
+  assert.equal(text.includes('PENDING_CONVERSION:o3d-1e7sl'), false, 'slice 1c left no conversion pending')
+  const pendingCount = (DECLARATIONS as Array<{ class: string }>).filter((d) => d.class.startsWith('PENDING_CONVERSION:')).length
+  console.log(`# pending conversions after slice 1c: ${pendingCount} (${pending.join(', ')})`)
+  assert.equal(pendingCount, 2, 'o3d-2by1 x2 - nothing else is pending')
 })
 
 test('o3d-f709: package.json, validate-local.sh and the workflow all name the guard, and the old guard is gone', () => {

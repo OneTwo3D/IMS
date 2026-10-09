@@ -1,4 +1,5 @@
 import type { ActivityEntityType } from '@/app/generated/prisma/client'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import { logActivity } from '@/lib/activity-log'
 import {
   clearAccountingPostingRefusal,
@@ -142,7 +143,7 @@ export async function reportPostingNotQueued(params: {
     level: 'ERROR',
     description:
       `NOTHING WAS QUEUED for ${params.posting}, but ${params.committed}. The accounting connector was `
-      + `not told, nothing retries this on its own, and the ledger and IMS now disagree. ${params.remedy}`,
+      + `not told, nothing retries this on its own, and the ledger and IMS now disagree. ${withHandPostSafety(params.remedy)}`,
     metadata: {
       ...params.metadata,
       enqueueQueued: params.outcome.queued,

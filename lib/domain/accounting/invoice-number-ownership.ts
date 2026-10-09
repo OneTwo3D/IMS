@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 /**
  * WHO OWNS THE NUMBER WE ARE ABOUT TO POST UNDER (o3d-k26m.5).
  *
@@ -308,11 +309,11 @@ export function decideInvoiceNumberPost(params: {
       code: 'NUMBER_NOT_ASKABLE',
       retryable: false,
       reason:
-        `Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger cannot be asked who `
+        withLedgerCheck(`Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger cannot be asked who `
         + `holds that number — ${params.lookup.error}. NOTHING WAS SENT. The create is update-or-create on the `
         + 'number, so posting without a trustworthy answer risks silently replacing a document that already '
         + 'carries it. Renumber the invoice in WooCommerce (the number is taken verbatim from '
-        + '_wcpdf_invoice_number) and re-queue this order, or post it by hand and link the document to the order.',
+        + '_wcpdf_invoice_number) and re-queue this order, or post it by hand and link the document to the order.'),
     }
   }
 
@@ -403,12 +404,12 @@ export function decideInvoiceNumberPost(params: {
     code: 'NUMBER_HELD_BY_FOREIGN_DOCUMENT',
     retryable: false,
     reason:
-      `Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger ALREADY HOLDS that `
+      withLedgerCheck(`Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger ALREADY HOLDS that `
       + `number (${describeClaim(holder)}) and IMS does not own that document. The sales-invoice create is `
       + 'update-or-create on the invoice number, so this post would not duplicate — it would silently REPLACE '
       + 'that invoice. The expected cause during cutover is that the WooCommerce PDF/xeroom plugin already '
       + 'posted this order. If the existing document is the right one, leave it and cancel this sync row; if '
       + 'this order genuinely has no ledger document yet, link the correct one to the order (or void the wrong '
-      + `one in the accounting system) and re-queue.${attemptedNote}${describeAlsoHeldBy(dead)}`,
+      + `one in the accounting system) and re-queue.${attemptedNote}${describeAlsoHeldBy(dead)}`),
   }
 }

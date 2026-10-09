@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { db } from '@/lib/db'
@@ -423,7 +424,7 @@ export function detectPaymentReversals<T extends ReversalCandidate>(
  * o3d-f709 / C1: CANCELLED IS NO LONGER "HARMLESS". This paragraph used to end "every writer of that
  * status in this tree asserts it only where 'nothing was sent' is TRUE" - false for three of the
  * seven cancellers, and false for an operator's NOT_POSTED settlement, which is a person's word about
- * a ledger IMS never read. The planner below asks `ledgerStanding` (ledger-standing.ts): a CANCELLED
+ * a ledger IMS did not check. The planner below asks `ledgerStanding` (ledger-standing.ts): a CANCELLED
  * row blocks unless it PROVES its abandonment (the orphan sweep's `abandonedBeforeRemoteCall`, or a
  * VERIFIED_REVERSAL the poller wrote after reading the ledger). The supersession's own CANCEL below
  * therefore writes that proof, so a superseded row does not lock the bill for ever.
@@ -887,11 +888,11 @@ export class BillPaymentEnqueueDeclined extends Error {
 }
 
 export const BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE =
-  'This bill has already been posted to the accounting connector, but the connector would not accept '
+  withLedgerCheck('This bill has already been posted to the accounting connector, but the connector would not accept '
   + 'a payment for it — accounting sync, or bill-payment posting specifically, is switched off. '
   + 'Marking the bill paid now would leave the ledger showing it outstanding with nothing queued to '
   + 'correct that, so nothing was changed. Turn bill-payment posting back on and try again, or record '
-  + 'the payment in the ledger by hand.'
+  + 'the payment in the ledger by hand.')
 
 /**
  * o3d-j625 r3 (Codex HIGH 2) — the message for a REFUSED bill payment, as opposed to an unconfigured
@@ -899,13 +900,13 @@ export const BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE =
  * provenance have to agree before this payment can be routed at all.
  */
 export const BILL_PAYMENT_ENQUEUE_REFUSED_MESSAGE =
-  'This bill has already been posted to an accounting connector, and IMS cannot establish that the '
+  withLedgerCheck('This bill has already been posted to an accounting connector, and IMS cannot establish that the '
   + 'connector now selected is the one holding it. An accounting invoice id is a document id in the '
   + 'accounting system\'s own database and IMS keeps it when the connector selection changes, so paying '
   + 'against the wrong one would either fail or settle an unrelated document. Nothing was changed and '
   + 'the bill is NOT marked paid. Either switch back to the connector that holds this bill, or re-post '
   + 'the bill to the connector now in use so the document and its connector are recorded together — or '
-  + 'settle it by hand in the books that hold it.'
+  + 'settle it by hand in the books that hold it.')
 
 /** Which of the two messages a decline warrants. */
 export function billPaymentEnqueueDeclinedMessage(reason: BillPaymentEnqueueDeclined['reason']): string {
@@ -936,7 +937,7 @@ export function billPaymentRefusalMessage(refusal: BillPaymentSupersessionRefusa
       return 'A payment registration for this bill FAILED, or was cancelled without proof that nothing '
         + 'was sent, and that is NOT proof that nothing reached the accounting connector - the payment '
         + 'may have been created and the response lost. (An operator marking the entry "not posted" '
-        + 'is a person\'s word about a ledger IMS never read, so it does not clear this either.) IMS '
+        + 'is a person\'s word about a ledger IMS did not check, so it does not clear this either.) IMS '
         + 'therefore cannot tell whether this bill is already settled, and will not guess with a '
         + 'supplier payment. Nothing was changed. Open the bill in the connector: if the payment is '
         + 'there, the bill is settled and nothing more is needed; if it is not, pay the bill in the '

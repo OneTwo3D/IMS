@@ -28,6 +28,7 @@ import {
   type AccountingReconciliationTruncation,
 } from '@/lib/domain/accounting/reconciliation'
 import { MIRRORED_ACCOUNTING_SYNC_TYPES } from '@/lib/domain/accounting/mirrored-sync-types'
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 
 const A1_DATE = new Date('2026-04-24T10:00:00.000Z')
 const A2_DATE = new Date('2026-04-24T11:00:00.000Z')
@@ -1543,6 +1544,79 @@ test('[o3d-anu8] the identical row written back by the connector still silences 
   const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
 
   assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), false)
+})
+
+test('[o3d-1e7sl D6] a missing-evidence finding is silenced ONLY by a sync row the connector put there - one row per standing', () => {
+  // The reading is `workSlotStanding`: the row must hold the slot (PENDING / PROCESSING / SYNCED) AND not be an
+  // operator's claim. Over-reporting is the safe direction for this report: a spurious "check this" costs a look.
+  type Case = { name: string; standing: string; over: Record<string, unknown>; silences: boolean }
+  const cases: Case[] = [
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', over: { status: 'SYNCED', externalTransactionId: 'cn-1', settlementBasis: null }, silences: true },
+    { name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK', over: { status: 'PENDING', externalTransactionId: null, settlementBasis: null }, silences: true },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', over: { status: 'SYNCED', externalTransactionId: 'cn-typed', settlementBasis: 'OPERATOR_ASSERTION' }, silences: false },
+    { name: 'UNKNOWN (FAILED)', standing: 'UNKNOWN', over: { status: 'FAILED', externalTransactionId: null, settlementBasis: null }, silences: false },
+    { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, silences: false },
+    { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: true }, silences: false },
+  ]
+  let silenced = 0
+  for (const c of cases) {
+    const rows = cleanRows()
+    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED', refundStatus: 'FULL' }]
+    rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
+    rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
+    rows.accountingEvents = rows.accountingEvents.filter(
+      (event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE',
+    )
+    const log = {
+      id: 'sync-refund-cn', connector: 'xero', type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: 'refund-1',
+      abandonedBeforeRemoteCall: null as boolean | null,
+      payload: { _idempotencyKey: 'sales-order-refund:refund-1:credit-note:x' },
+      ...c.over,
+    } as AccountingReconciliationRows['syncLogs'][number]
+    rows.syncLogs.push(log)
+    const standing = ledgerStanding({
+      status: log.status, externalTransactionId: log.externalTransactionId,
+      settlementBasis: log.settlementBasis, abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# D6 precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+    assert.equal(!codes.includes('terminal_refunded_order_missing_credit_note_evidence'), c.silences, c.name)
+    if (c.silences) silenced += 1
+  }
+  console.log(`# D6 cases: ${cases.length}; silencing: ${silenced}`)
+  assert.ok(silenced > 0 && silenced < cases.length)
+})
+
+test('[o3d-1e7sl D6] "Posted event has no external ID" says whose POST it was - one case per mirror standing', () => {
+  const cases: Array<{ name: string; postBasis: string | null | undefined; standing: string; suffix: RegExp | null }> = [
+    { name: 'CONNECTOR', postBasis: 'CONNECTOR', standing: 'CONFIRMED', suffix: null },
+    { name: 'SYNC_LOG_BACKFILL', postBasis: 'SYNC_LOG_BACKFILL', standing: 'CONFIRMED', suffix: null },
+    { name: 'OPERATOR_ASSERTION', postBasis: 'OPERATOR_ASSERTION', standing: 'ASSERTED', suffix: /marked POSTED on an operator's assertion, not verified against the ledger/ },
+    { name: 'NULL (unrecorded)', postBasis: null, standing: 'UNRECORDED', suffix: /how it came to be POSTED was never recorded/ },
+    { name: 'absent (fixture predates the column)', postBasis: undefined, standing: 'UNRECORDED', suffix: /never recorded/ },
+  ]
+  for (const c of cases) {
+    const rows = cleanRows()
+    rows.accountingEvents.push({
+      id: 'event-no-id', type: 'DAILY_BATCH_GROUP_B', sourceEntityType: 'DailyBatch', sourceEntityId: 'B-2026-04-25',
+      businessDate: B_DATE, status: 'POSTED', idempotencyKey: 'event-no-id-key', externalSystem: 'xero', externalId: null,
+      ...(c.postBasis === undefined ? {} : { postBasis: c.postBasis }),
+    })
+    const finding = evaluateAccountingReconciliationRows(rows).find((f) => f.code === 'posted_event_without_external_id')
+    assert.ok(finding, c.name)
+    assert.equal((finding.details as { postStanding?: string }).postStanding, c.standing, c.name)
+    assert.match(finding.message, /^Posted accounting event event-no-id has no external ID/)
+    if (c.suffix) assert.match(finding.message, c.suffix, c.name)
+    else assert.equal(finding.message, 'Posted accounting event event-no-id has no external ID', `${c.name}: a confirmed post needs no qualifier`)
+  }
+  // And a non-POSTED event with no id is not this finding at all.
+  const rows = cleanRows()
+  rows.accountingEvents.push({
+    id: 'event-pending', type: 'DAILY_BATCH_GROUP_B', sourceEntityType: 'DailyBatch', sourceEntityId: 'B-2026-04-26',
+    businessDate: B_DATE, status: 'PENDING', idempotencyKey: 'event-pending-key', externalSystem: 'xero', externalId: null,
+  })
+  assert.equal(evaluateAccountingReconciliationRows(rows).some((f) => f.accountingEventId === 'event-pending' && f.code === 'posted_event_without_external_id'), false)
 })
 
 // --- o3d-11rf r4: the VOID mirrors nobody can classify, ASKED FOR RATHER THAN SIFTED OUT ---

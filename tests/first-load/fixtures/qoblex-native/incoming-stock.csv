@@ -1,0 +1,5 @@
+﻿"Product variant","SKU","Created on","Received on","Due On","Purchase Order","Status","Ordered Quantity","Received Quantity","Price","Discount (%)","Supplier","Supplier Reference"
+"Synthetic SYN-1001","SYN-1001","Thu, Sep 24 2026","","Thu, Oct 8 2026","PO900","Approved","16","0","18.5","0","Supplier Alpha","REF-1"
+"Synthetic SYN-1002","SYN-1002","Thu, Sep 24 2026","","Thu, Oct 8 2026","PO900","Approved","20","0","7.93","0","Supplier Alpha","REF-1"
+"Synthetic SYN-3001","SYN-3001","Wed, Apr 22 2026","Sat, Sep 19 2026","Wed, Oct 14 2026","PO901","PartiallyReceived","10","4","0.4","0","Supplier Gamma",""
+"Synthetic SYN-3002","SYN-3002","Wed, Apr 22 2026","Sat, Sep 19 2026","Wed, Oct 14 2026","PO901","PartiallyReceived","5","5","0.2","0","Supplier Gamma",""

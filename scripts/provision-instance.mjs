@@ -153,10 +153,12 @@ async function provisionDefaultAdmin(db, options) {
   return { created: true }
 }
 
-async function sendProvisioningEmail(options) {
+// Returns true only when a message was handed to the SMTP server, so the caller can say "sent"
+// only when it was; false when the details were incomplete and nothing was attempted.
+export async function sendProvisioningEmail(options) {
   if (!options.smtp.host || !options.smtp.fromEmail || !options.notificationEmail) {
     console.log('[WARN] Skipping provisioning email because SMTP or notification details are incomplete.')
-    return
+    return false
   }
 
   const transport = nodemailer.createTransport({
@@ -192,6 +194,7 @@ async function sendProvisioningEmail(options) {
     subject,
     html,
   })
+  return true
 }
 
 async function main() {
@@ -310,7 +313,7 @@ async function main() {
       `[INFO] Default admin ${adminResult.created ? 'created' : 'updated'}: ${maskEmail(defaultAdminEmail)}.`,
     )
 
-    await sendProvisioningEmail({
+    const emailSent = await sendProvisioningEmail({
       smtp,
       notificationEmail,
       publicAppUrl,
@@ -322,7 +325,7 @@ async function main() {
       },
     })
 
-    if (notificationEmail) {
+    if (emailSent) {
       console.log(`[INFO] Provisioning email sent to ${maskEmail(notificationEmail)}.`)
     }
   } finally {

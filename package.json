@@ -33,6 +33,7 @@
     "preflight:production": "tsx scripts/preflight-production.ts",
     "invariant-check:preflight": "tsx scripts/invariant-check-preflight.ts",
     "rehearse:first-install": "tsx scripts/rehearse-first-install.ts",
+    "rehearse:woo-import": "tsx scripts/rehearse-woo-import.ts",
     "outbound:status": "tsx scripts/outbound-status.ts",
     "read-sync:status": "tsx scripts/read-sync-status.ts",
     "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",

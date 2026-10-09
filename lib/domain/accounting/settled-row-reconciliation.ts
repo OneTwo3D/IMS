@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 /**
  * o3d-0m56 round 3 (Codex) — the way OUT of a correctly-refused money row.
  *
@@ -63,9 +64,9 @@ export function decideSettledRowReconciliation(params: {
       // The important refusal. "It failed, just close it" is exactly what an operator wants to do
       // here, and doing it would leave an invoice outstanding in the ledger with nothing in IMS
       // still asking anyone to look at it.
-      reason: 'The accounting connector does NOT hold a payment matching this entry, so there is '
+      reason: withLedgerCheck('The accounting connector does NOT hold a payment matching this entry, so there is '
         + 'nothing to reconcile — closing it would leave the document unpaid with nothing tracking '
-        + 'it. Retry the entry instead, or record the payment in the ledger by hand first.',
+        + 'it. Retry the entry instead, or record the payment in the ledger by hand first.'),
     }
   }
   return { resolve: true, externalTransactionId: settlement.matchedId, detail: settlement.detail }

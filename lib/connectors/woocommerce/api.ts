@@ -230,6 +230,12 @@ export async function wcFetch(
     signal: wcRequestSignal(),
   }, {
     connectorName: 'WooCommerce',
+    // READS ONLY. Lets the order-import rehearsal (scripts/rehearse-woo-import.ts) point this very code
+    // path at a fake store on 127.0.0.1. It is the same switch `validateWooCommerceBaseUrl` already
+    // honours for the stored URL and it opens nothing in production: it requires E2E_TEST_MODE=1 AND
+    // NODE_ENV other than production AND an http loopback URL. `wcPost`/`wcPut` deliberately do not
+    // carry it, so a write to a loopback store is still refused at the transport.
+    allowE2eLocalHttp: true,
   })
 
   if (!res.ok) {

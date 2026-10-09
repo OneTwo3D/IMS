@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
+
+import { makeScratchRoot } from '../helpers/safe-temp-root'
 import ts from 'typescript'
 
 /**
@@ -61,6 +63,11 @@ function identifiersIn(node: ts.Node): ts.Identifier[] {
   }
   visit(node)
   return found
+}
+
+/** Every scanned source file under `root` (default: the repo), as paths relative to `root`. */
+function listFiles(root: string = process.cwd()): string[] {
+  return ROOTS.flatMap((dir) => walk(join(root, dir))).map((full) => full.slice(root.length + 1))
 }
 
 export function scanFile(file: string, text: string): { callSites: number; properties: number; findings: Finding[] } {
@@ -143,7 +150,7 @@ export function scanFile(file: string, text: string): { callSites: number; prope
 }
 
 test('no destination free-text writer anywhere under lib/ or app/ is given text derived from a caught error or failure message', () => {
-  const files = ROOTS.flatMap((root) => walk(join(process.cwd(), root))).map((full) => full.slice(process.cwd().length + 1))
+  const files = listFiles()
   let callSites = 0
   let properties = 0
   const findings: Finding[] = []
@@ -190,17 +197,23 @@ test('the census can fail: it flags a new file, an alias const, a member message
 })
 
 test('a NEW file with a failing writer is found by the whole-tree scan (it does not depend on a file list)', () => {
-  const dir = join(process.cwd(), 'lib', 'zz-text-census-probe')
-  mkdirSync(dir, { recursive: true })
+  // The probe tree is PRIVATE and outside the repo: tests that scan the real tree run in parallel with this one,
+  // so nothing here may create or remove a file inside lib/, app/ or tests/. The same scanner is pointed at a
+  // temp root that mimics lib/.
+  const scratch = makeScratchRoot('census-probe-')
+  const root = scratch.root
+  const realBefore = listFiles()
   try {
-    const file = join(dir, 'writer.ts')
-    writeFileSync(file, "export async function w(postConflictComment: (a: string, b: string) => Promise<void>, error: unknown) { await postConflictComment('1', `boom ${String(error)}`) }\n")
-    const files = ROOTS.flatMap((root) => walk(join(process.cwd(), root))).map((full) => full.slice(process.cwd().length + 1))
-    assert.ok(files.includes('lib/zz-text-census-probe/writer.ts'), 'the scan lists the new file')
-    const findings = files.flatMap((f) => scanFile(f, readFileSync(join(process.cwd(), f), 'utf8')).findings)
+    mkdirSync(join(root, 'lib', 'zz-text-census-probe'), { recursive: true })
+    mkdirSync(join(root, 'app'), { recursive: true })
+    writeFileSync(join(root, 'lib', 'zz-text-census-probe', 'writer.ts'), "export async function w(postConflictComment: (a: string, b: string) => Promise<void>, error: unknown) { await postConflictComment('1', `boom ${String(error)}`) }\n")
+    const files = listFiles(root)
+    assert.deepEqual(files, ['lib/zz-text-census-probe/writer.ts'], 'the scan lists the new file')
+    const findings = files.flatMap((f) => scanFile(f, readFileSync(join(root, f), 'utf8')).findings)
     assert.ok(findings.some((f) => f.where.startsWith('lib/zz-text-census-probe/writer.ts')), 'and flags it')
-    console.log('precondition (new file): a fresh lib/zz-text-census-probe/writer.ts was written, scanned and flagged')
+    console.log('precondition (new file): a fresh file in a private temp root mimicking lib/ was listed and flagged')
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    scratch.dispose()
   }
+  assert.deepEqual(listFiles(), realBefore, 'the real scanned tree is byte-for-byte the same file list before and after: the probe never touched it')
 })

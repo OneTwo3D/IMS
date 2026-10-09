@@ -83,6 +83,13 @@ export type StrandedSyncRowSource = {
   errorMessage: string | null
   createdAt: Date
   attemptRevision: number
+  /**
+   * o3d-1e7sl (D4): the two columns that, with `status` and the document id, say what the row is allowed to
+   * claim about the ledger. REQUIRED, so a loader that forgot them fails `tsc` and does not quietly show an
+   * operator's typed id or an unproven retirement as a plain "posted as X".
+   */
+  settlementBasis: string | null
+  abandonedBeforeRemoteCall: boolean | null
 }
 
 /** The row as the UI receives it: identifying detail, plus how long it has been stuck. */
@@ -105,6 +112,9 @@ export type StrandedSyncRow = {
    * predating the fence.
    */
   attemptRevision: number
+  /** o3d-1e7sl: carried so the banner can show the row's STANDING (see `describeLedgerStanding`). */
+  settlementBasis: string | null
+  abandonedBeforeRemoteCall: boolean | null
   /** Whether the per-row settlement control applies. See the module comment: an affordance, not a guarantee. */
   settleable: boolean
   /**
@@ -159,6 +169,8 @@ export function describeStrandedSyncRow(
     createdAt: row.createdAt.toISOString(),
     ageDays: Math.floor(ageMs / 86_400_000),
     attemptRevision: row.attemptRevision,
+    settlementBasis: row.settlementBasis,
+    abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall,
     // ONE implementation of "which rows get a control", shared with the active connector's sync log.
     //
     // `unclaimable` IS ASKED PER CONNECTOR, and rounds 3 and 4 got this wrong (round 5, Codex

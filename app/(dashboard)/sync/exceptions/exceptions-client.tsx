@@ -1,11 +1,9 @@
 'use client'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Fragment, useState, useTransition } from 'react'
 import {
-  ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING,
   ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL,
-  ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
-  ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_LONGEST_HELD_DETAIL,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT,
@@ -13,6 +11,18 @@ import {
   ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
   ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL,
 } from '@/lib/domain/accounting/posting-refusal-copy'
+import {
+  claimWarningFor,
+  handPostInputOf,
+  INCOMPLETE_HISTORY_BANNER,
+  MARKED_TOAST,
+  RELEASE_TOAST,
+  TAKE_TOAST,
+  markHandledWarningFor,
+  releaseWarningFor,
+  NOT_LOADED_HAND_POST_INPUT,
+  type HandPostInput,
+} from '@/lib/domain/accounting/hand-post-instruction'
 import { POSTING_REFUSAL_NOTE_MAX_LENGTH } from '@/lib/domain/accounting/posting-refusal-kinds'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
@@ -93,14 +103,14 @@ export function ExceptionsClient({ data }: Props) {
   // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
   const [recordingPark, setRecordingPark] = useState<RefundSyncParkRow | null>(null)
   // o3d-j625 r6 (review H4): the MANUAL-ONLY refusal being marked handled, and the operator's note.
-  const [markingRefusal, setMarkingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [markingRefusal, setMarkingRefusal] = useState<{ id: string; label: string; input: HandPostInput } | null>(null)
   const [markingNote, setMarkingNote] = useState('')
   /**
    * o3d-j625 r16 (Codex round 15, HIGH 1): the two halves of settling a posting by hand that are NOT the
    * acknowledgement — taking it (which is what stops IMS queueing it) and giving it back.
    */
-  const [claimingRefusal, setClaimingRefusal] = useState<{ id: string; label: string } | null>(null)
-  const [releasingRefusal, setReleasingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [claimingRefusal, setClaimingRefusal] = useState<{ id: string; label: string; input: HandPostInput } | null>(null)
+  const [releasingRefusal, setReleasingRefusal] = useState<{ id: string; label: string; input: HandPostInput } | null>(null)
   /**
    * o3d-j625 r20 (Codex round 19, HIGH) — THE CLAIMS SECTION IS A WALK, NOT A CAP.
    *
@@ -209,7 +219,7 @@ export function ExceptionsClient({ data }: Props) {
             <DialogHeader>
               <DialogTitle>Take {claimingRefusal.label} for hand posting</DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING}</p>
+            <p className="text-sm text-muted-foreground">{claimWarningFor(claimingRefusal.input)}</p>
             <DialogFooter>
               <Button type="button" variant="outline" disabled={isPending} onClick={() => setClaimingRefusal(null)}>Cancel</Button>
               <Button
@@ -219,7 +229,7 @@ export function ExceptionsClient({ data }: Props) {
                   const target = claimingRefusal
                   runAction(
                     () => claimAccountingPostingRefusalForHandPostingAction(target.id),
-                    'Taken for hand posting — IMS will not queue this posting while you hold it.',
+                    TAKE_TOAST,
                   )
                   setClaimingRefusal(null)
                 }}
@@ -236,7 +246,7 @@ export function ExceptionsClient({ data }: Props) {
             <DialogHeader>
               <DialogTitle>Release {releasingRefusal.label}</DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING}</p>
+            <p className="text-sm text-muted-foreground">{releaseWarningFor(releasingRefusal.input)}</p>
             <DialogFooter>
               <Button type="button" variant="outline" disabled={isPending} onClick={() => setReleasingRefusal(null)}>Cancel</Button>
               <Button
@@ -247,7 +257,7 @@ export function ExceptionsClient({ data }: Props) {
                   const target = releasingRefusal
                   runAction(
                     () => releaseAccountingPostingRefusalHandPostClaimAction(target.id),
-                    'Released — IMS may queue this posting again.',
+                    RELEASE_TOAST,
                   )
                   setReleasingRefusal(null)
                 }}
@@ -264,7 +274,7 @@ export function ExceptionsClient({ data }: Props) {
             <DialogHeader>
               <DialogTitle>Mark {markingRefusal.label} as handled</DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING}</p>
+            <p className="text-sm text-muted-foreground">{markHandledWarningFor(markingRefusal.input)}</p>
             <div className="space-y-1">
               <Label htmlFor="refusal-handled-note">Note (optional) — e.g. the ledger journal number</Label>
               <Input
@@ -283,7 +293,7 @@ export function ExceptionsClient({ data }: Props) {
                   const target = markingRefusal
                   runAction(
                     () => markAccountingPostingRefusalHandledAction(target.id, markingNote),
-                    'Marked as handled.',
+                    MARKED_TOAST,
                   )
                   setMarkingRefusal(null)
                   setMarkingNote('')
@@ -573,7 +583,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WooCommerce refunds — parked (${data.summary.refundSyncParks})`}
-            detail="Refunds that could not be applied. The refund/restock/credit-note has NOT posted, but the money HAS left WooCommerce. Retry re-fetches the order's refunds fresh from WooCommerce — use it for an amount mismatch fixed at the store. A QUARANTINED row was refused deliberately (its VAT could not be determined) and retry cannot clear it: record it manually against the order lines it covers."
+            detail={withLedgerCheck("Refunds that could not be applied. The refund/restock/credit-note has NOT posted, but the money HAS left WooCommerce. Retry re-fetches the order's refunds fresh from WooCommerce — use it for an amount mismatch fixed at the store. A QUARANTINED row was refused deliberately (its VAT could not be determined) and retry cannot clear it: record it manually against the order lines it covers.")}
             shown={data.refundSyncParks.length}
             total={data.summary.refundSyncParks}
           />
@@ -1072,7 +1082,7 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs">{row.connector}</TableCell>
                   <TableCell className="text-xs">{row.type} <span className="text-muted-foreground">({row.status})</span></TableCell>
                   <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
-                  <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}{row.standingLabel ? <span className="ml-1 text-amber-700 dark:text-amber-400" data-testid="backlog-standing">({row.standingLabel})</span> : null}</TableCell>
                   <TableCell className="text-xs">{row.owedSince ? new Date(row.owedSince).toLocaleString() : '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.blockedBy} — {row.operatorRemedy}</TableCell>
                 </TableRow>
@@ -1118,7 +1128,7 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}` })}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: NOT_LOADED_HAND_POST_INPUT })}
                     >
                       <XCircle className="h-3 w-3 mr-1" />Release
                     </Button>
@@ -1194,7 +1204,7 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}` })}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: NOT_LOADED_HAND_POST_INPUT })}
                     >
                       <XCircle className="h-3 w-3 mr-1" />Release
                     </Button>
@@ -1282,10 +1292,7 @@ export function ExceptionsClient({ data }: Props) {
                         whenever this is set, so no count on this row can carry the fact. */}
                     {row.handPostDeclineUnaccounted ? (
                       <div className="font-medium text-amber-700">
-                        Incomplete history: while this was held by hand, IMS declined at least one posting for it and
-                        could not record how many. Treat the ledger as possibly behind — compare this document with
-                        the ledger, then re-save it to queue the current version. Releasing or marking it handled
-                        will NOT clear this debt.
+                        {INCOMPLETE_HISTORY_BANNER}
                       </div>
                     ) : null}
                     {/* o3d-j625 r16: settling by hand is a two-step ACT. Until the posting is taken there is
@@ -1297,7 +1304,7 @@ export function ExceptionsClient({ data }: Props) {
                         variant="outline"
                         size="sm"
                         disabled={isPending}
-                        onClick={() => setClaimingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                        onClick={() => setClaimingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}`, input: handPostInputOf(row) })}
                       >
                         <PencilLine className="h-3 w-3 mr-1" />Take for hand posting
                       </Button>
@@ -1313,7 +1320,7 @@ export function ExceptionsClient({ data }: Props) {
                         variant="outline"
                         size="sm"
                         disabled={isPending}
-                        onClick={() => { setMarkingNote(''); setMarkingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` }) }}
+                        onClick={() => { setMarkingNote(''); setMarkingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}`, input: handPostInputOf(row) }) }}
                       >
                         <CheckCircle2 className="h-3 w-3 mr-1" />Mark as handled
                       </Button>
@@ -1324,7 +1331,7 @@ export function ExceptionsClient({ data }: Props) {
                         variant="outline"
                         size="sm"
                         disabled={isPending}
-                        onClick={() => setReleasingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                        onClick={() => setReleasingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}`, input: handPostInputOf(row) })}
                       >
                         <XCircle className="h-3 w-3 mr-1" />Release
                       </Button>
