@@ -8,6 +8,8 @@ import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { snapshotFromRow } from '@/lib/domain/product-content/store'
+import { describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
 const ELIGIBLE_PRODUCT_TYPES = [
   ProductType.SIMPLE,
@@ -37,6 +39,7 @@ const PRODUCT_SYNC_CANDIDATE_SELECT = {
   imageUrl: true,
   type: true,
   lifecycleStatus: true,
+  content: { select: { shortDescription: true, longDescription: true, images: true } },
   wmsProductLinks: {
     where: { connector: 'mintsoft' },
     select: {
@@ -46,6 +49,7 @@ const PRODUCT_SYNC_CANDIDATE_SELECT = {
       lastKnownBarcode: true,
       lastSyncedAt: true,
       lastError: true,
+      contentSyncState: true,
     },
     take: 1,
   },
@@ -71,6 +75,7 @@ type ProductSyncCandidate = {
   imageUrl: string | null
   type: ProductType
   lifecycleStatus: ProductLifecycleStatus
+  content?: { shortDescription: string | null; longDescription: string | null; images: Prisma.JsonValue } | null
   wmsProductLinks: Array<{
     id: string
     externalProductId: string
@@ -78,6 +83,7 @@ type ProductSyncCandidate = {
     lastKnownBarcode: string | null
     lastSyncedAt: Date | null
     lastError: string | null
+    contentSyncState?: Prisma.JsonValue | null
   }>
 }
 
@@ -104,6 +110,18 @@ export type MintsoftProductSyncResult = {
   skipped: number
   errors: number
   skippedReason?: string
+  /** What the content step did in this run (descriptions and picture; see product-content-sync.ts). */
+  content?: MintsoftContentCounters
+}
+
+export type MintsoftContentCounters = {
+  /** Fields accepted by Mintsoft. */
+  sent: number
+  /** Products whose content was recorded as a shadow this run (nothing was sent). */
+  shadowed: number
+  /** Products whose live send the outbound-write hold refused (nothing left IMS). */
+  held: number
+  errors: number
 }
 
 type ProductSyncLineResult = {
@@ -874,6 +892,7 @@ function emptyProductSyncCounters(): Omit<MintsoftProductSyncResult, 'jobId' | '
     corrected: 0,
     skipped: 0,
     errors: 0,
+    content: { sent: 0, shadowed: 0, held: 0, errors: 0 },
   }
 }
 
@@ -906,10 +925,30 @@ async function processMintsoftProductChunk(params: {
           connector: params.connector,
         })
 
+        // The content step runs only for a product the meta step accepted, and its failure is its OWN line: it can
+        // neither undo nor hide the meta result above.
+        let content: ContentLineResult | null = null
+        let contentError: string | null = null
+        if (line.action !== 'skip') {
+          try {
+            const link = product.wmsProductLinks[0] ?? null
+            content = await syncMintsoftProductContent({
+              product: { id: product.id, sku: product.sku },
+              link: link ? { id: link.id, externalProductId: link.externalProductId, contentSyncState: link.contentSyncState ?? null } : null,
+              content: snapshotFromRow(product.content ?? null),
+              connector: params.connector,
+            })
+          } catch (error) {
+            contentError = error instanceof Error ? error.message : 'Mintsoft product content sync failed'
+          }
+        }
+
         return {
           product,
           line,
           error: null,
+          content,
+          contentError,
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Mintsoft product sync failed'
@@ -918,11 +957,14 @@ async function processMintsoftProductChunk(params: {
           product,
           line: null,
           error: message,
+          content: null,
+          contentError: null,
         }
       }
     }),
   )
 
+  const contentCounters = (params.counters.content ??= { sent: 0, shadowed: 0, held: 0, errors: 0 })
   for (const result of chunkResults) {
     params.counters.totalChecked += 1
 
@@ -936,6 +978,40 @@ async function processMintsoftProductChunk(params: {
         reason: result.line.reason,
         payload: result.line.payload,
       })
+      if (result.content) {
+        const logAction = result.content.kind === 'sent'
+          ? 'updated'
+          : result.content.kind === 'shadow'
+            ? 'shadow'
+            : result.content.kind === 'held'
+              ? 'skip'
+              : null
+        if (result.content.kind === 'sent') contentCounters.sent += result.content.fields.length
+        if (result.content.kind === 'shadow') contentCounters.shadowed += 1
+        if (result.content.kind === 'held') contentCounters.held += 1
+        if (logAction) {
+          params.logs.push({
+            jobId: params.jobId,
+            sku: result.product.sku,
+            productId: result.product.id,
+            action: logAction,
+            reason: result.content.reason,
+            payload: result.content.payload,
+          })
+        }
+      }
+      if (result.contentError) {
+        contentCounters.errors += 1
+        params.counters.errors += 1
+        params.logs.push({
+          jobId: params.jobId,
+          sku: result.product.sku,
+          productId: result.product.id,
+          action: 'error',
+          reason: `Content sync failed: ${result.contentError}`,
+          payload: toJsonPayload(null),
+        })
+      }
       continue
     }
 
@@ -1008,13 +1084,14 @@ async function runMintsoftProductSyncJob(
       warehouseScopes: warehouseScopeSummary,
       concurrency: PRODUCT_SYNC_CONCURRENCY,
       totalCandidates,
+      content: { ...counters.content },
     })
 
     await logActivity({
       entityType: 'SYSTEM',
       tag: 'sync',
       action: type === 'PRODUCT_VERIFY' ? 'mintsoft_product_verify' : 'mintsoft_product_sync',
-      description: `Mintsoft ${type === 'PRODUCT_VERIFY' ? 'product verify' : 'product sync'} completed: ${counters.totalChecked} checked, ${counters.corrected} changed, ${counters.mismatched} conflicts, ${counters.errors} errors.`,
+      description: `Mintsoft ${type === 'PRODUCT_VERIFY' ? 'product verify' : 'product sync'} completed: ${counters.totalChecked} checked, ${counters.corrected} changed, ${counters.mismatched} conflicts, ${counters.errors} errors. ${describeContentRun(counters.content)}`,
       metadata: {
         jobId: job.id,
         warehouseScopes: warehouseScopeSummary,

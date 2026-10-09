@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
+import { createProductContentDelegate } from './helpers/product-content-delegate.ts'
 
 // o3d-uh2: parent + variation + option + SYNCED-log writes must be ATOMIC.
 //
@@ -179,6 +180,7 @@ const shoppingSyncLogDelegate = {
 
 const txClient = {
   product: productDelegate,
+  productContent: createProductContentDelegate(),
   productOption: productOptionDelegate,
   shoppingSyncLog: shoppingSyncLogDelegate,
   // The credential-rebind fence (o3d-mlc7) snapshots settings before any remote read and
