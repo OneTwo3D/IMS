@@ -50,6 +50,8 @@
  * Pure. The I/O — loading checks, recording one — lives in operator-ledger-check-store.ts.
  */
 
+import { createHash } from 'node:crypto'
+
 import {
   classifyLedgerSettlement,
   isUnmeasurableSettlementRecord,
@@ -72,6 +74,12 @@ export type OperatorLedgerCheck = {
   ledgerDocumentId: string
   /** The EXACT unmeasurable record ids the probe showed when the check was recorded. */
   ledgerRecordIds: readonly string[]
+  /**
+   * {@link settlementRecordFingerprint} of each of those records AS CONFIRMED, index-aligned with
+   * `ledgerRecordIds`. Optional only so the type can describe a row built in memory; a check without
+   * them covers nothing.
+   */
+  ledgerRecordFingerprints?: readonly string[]
   /** The organisation and consent generation that served the probe the operator was shown. */
   tenantId: string
   connectionGeneration: string
@@ -135,6 +143,42 @@ export type CheckedSettlementVerdict = {
   liftedByCheckIds: string[]
   /** Set when the verdict is an unmeasurable-record hold: what would (or why nothing can) lift it. */
   remedy: LedgerCheckRemedy | null
+}
+
+/**
+ * The version of {@link settlementRecordFingerprint}'s canonical serialisation, carried as the prefix of
+ * every fingerprint so a stored check can never be compared against a differently-built one: a version
+ * this build does not produce simply never matches, which is the withholding answer.
+ */
+export const SETTLEMENT_RECORD_FINGERPRINT_VERSION = 'v1'
+
+/**
+ * WHAT THE OPERATOR WAS SHOWN ABOUT ONE SETTLEMENT, as one comparable string.
+ *
+ * A check names records by their immutable ledger id, but the operator's judgement was made on what the
+ * record SAID: its (unreadable) amount, its date, its reference. A payment edited in place in Xero keeps
+ * its id and can stay unmeasurable, so an id alone would let a check made about one state of the record
+ * set aside a different one. Every field the preview shows and the rule reads is in here, in a fixed
+ * order, as the exact text the probe produced: the id (folded the way ids are compared), the readable
+ * amount's exact digits, the unreadable figure as Xero stated it, the date and the reference. A check
+ * applies to a record only while the record still produces the fingerprint stored with the check.
+ */
+export function settlementRecordFingerprint(record: {
+  id?: string | null
+  amount: { toFixed(): string } | null
+  unreadableAmount?: string | null
+  date: string | null
+  reference?: string | null
+}): string {
+  const canonical = JSON.stringify([
+    SETTLEMENT_RECORD_FINGERPRINT_VERSION,
+    normaliseLedgerId(record.id),
+    record.amount === null ? null : record.amount.toFixed(),
+    record.unreadableAmount ?? null,
+    record.date ?? null,
+    record.reference ?? null,
+  ])
+  return `${SETTLEMENT_RECORD_FINGERPRINT_VERSION}:${createHash('sha256').update(canonical).digest('hex')}`
 }
 
 /** Ledger ids are compared case-insensitively and trimmed: Xero GUIDs come back in either case. */
@@ -227,7 +271,16 @@ export function classifyLedgerSettlementWithOperatorChecks(
   const named = { ...scope, paymentId: scope.paymentId, ledgerDocumentId: scope.ledgerDocumentId as string }
   const ids = recordIds as string[]
   const eligible = checksInScope(checks, named, binding)
-  const coveredBy = (id: string) => eligible.filter((check) => check.ledgerRecordIds.some((checked) => sameLedgerId(checked, id)))
+  // A check covers a record only AS IT WAS CONFIRMED: the fingerprint stored beside the record id in the
+  // check must equal the fingerprint of the record the probe returned NOW. A payment edited in place in
+  // Xero (same immutable id, a different amount, date or reference, still unreadable) is therefore not
+  // covered by a check made about its earlier state, at every gate that applies this rule.
+  const currentFingerprint = new Map<string, string>()
+  for (const record of unmeasurable) currentFingerprint.set(normaliseLedgerId(record.id) as string, settlementRecordFingerprint(record))
+  const coveredBy = (id: string) => eligible.filter((check) => check.ledgerRecordIds.some((checked, index) =>
+    sameLedgerId(checked, id)
+    && typeof check.ledgerRecordFingerprints?.[index] === 'string'
+    && check.ledgerRecordFingerprints[index] === currentFingerprint.get(id)))
   const unchecked = ids.filter((id) => coveredBy(id).length === 0)
   const remedy: LedgerCheckRemedy = {
     liftable: true,

@@ -1,7 +1,8 @@
 -- OPERATOR LEDGER CHECKS (owner decision C4; the remedy for the permanent hold an unmeasurable ledger
 -- settlement puts on later receipts).
 --
--- One row = one operator's assertion: "I opened these payment records (ledgerRecordIds) on this ledger
+-- One row = one operator's assertion: "I opened these payment records (ledgerRecordIds, each in the state
+-- recorded by ledgerRecordFingerprints) on this ledger
 -- document in this Xero organisation, and none of them is the payment attempt syncLogId made, nor a
 -- hand-entered payment for receipt paymentId." The rule that decides what such a row may lift is in
 -- lib/domain/accounting/operator-ledger-check.ts; this migration only makes the record durable and
@@ -31,6 +32,7 @@ CREATE TABLE "accounting_operator_ledger_checks" (
     "connector" TEXT NOT NULL,
     "ledgerDocumentId" TEXT NOT NULL,
     "ledgerRecordIds" TEXT[],
+    "ledgerRecordFingerprints" TEXT[],
     "tenantId" TEXT NOT NULL,
     "connectionGeneration" TEXT NOT NULL,
     "basis" TEXT NOT NULL DEFAULT 'OPERATOR_ASSERTION',
@@ -57,6 +59,16 @@ ALTER TABLE "accounting_operator_ledger_checks"
     AND cardinality("ledgerRecordIds") > 0
     AND array_position("ledgerRecordIds", NULL) IS NULL
     AND NOT ('' = ANY ("ledgerRecordIds"))
+  ),
+  -- What the operator confirmed about each record, not only its id: one fingerprint per record id, in
+  -- the same order, each `v<version>:<sha256 hex>` (lib/domain/accounting/operator-ledger-check.ts,
+  -- settlementRecordFingerprint). A check without them would cover a payment edited in place.
+  ADD CONSTRAINT "accounting_operator_ledger_checks_records_fingerprinted"
+  CHECK (
+    "ledgerRecordFingerprints" IS NOT NULL
+    AND cardinality("ledgerRecordFingerprints") = cardinality("ledgerRecordIds")
+    AND array_position("ledgerRecordFingerprints", NULL) IS NULL
+    AND array_to_string("ledgerRecordFingerprints", ',') ~ '^v[0-9]+:[0-9a-f]{64}(,v[0-9]+:[0-9a-f]{64})*$'
   ),
   ADD CONSTRAINT "accounting_operator_ledger_checks_identity_named"
   CHECK (

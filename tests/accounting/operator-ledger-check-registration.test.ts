@@ -9,6 +9,7 @@ import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain
 import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { describeInvoicePaymentRefusal } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import { settlementRecordFingerprint } from '@/lib/domain/accounting/operator-ledger-check'
 import { unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
 
 /**
@@ -68,6 +69,7 @@ const CHECK = {
   connector: 'xero',
   ledgerDocumentId: 'INV-1',
   ledgerRecordIds: ['PAY-H'],
+  ledgerRecordFingerprints: [settlementRecordFingerprint(UNREADABLE_H)],
   tenantId: 'tenant-A',
   connectionGeneration: 'gen-1',
 }
@@ -247,7 +249,7 @@ test('[o3d-llyw] a hold that is NOT an unmeasurable record does not offer a ledg
 })
 
 test('[o3d-llyw] the HEADLINE shape — the unreadable payment is a SYNCED sibling\'s own — is refused with the reason, not lifted', () => {
-  const sCheck = { ...CHECK, ledgerRecordIds: ['PAY-S'] }
+  const sCheck = { ...CHECK, ledgerRecordIds: ['PAY-S'], ledgerRecordFingerprints: [settlementRecordFingerprint(UNREADABLE_S)] }
   const withoutSibling = decide({ operatorLedgerChecks: [sCheck], existing: [F], ledgerSettlements: probe([UNREADABLE_S]) })
   assert.equal(withoutSibling.register, true, 'precondition: the same check lifts F when no registration has posted on the invoice')
   const d = decide({ operatorLedgerChecks: [sCheck], existing: [S, F], ledgerSettlements: probe([UNREADABLE_S]) })
@@ -269,4 +271,22 @@ test('[o3d-llyw] a check never sets aside the ledger id the attempt row records 
   assert.equal(d.register, false)
   assert.match(d.register === false ? d.ledgerCheckRemedy ?? '' : '', /carries the very ledger id the earlier entry records as its own/,
     'refused BY THIS RULE — the posted-registration refusal would also refuse, with a different sentence')
+})
+
+test('[o3d-llyw] registration: a payment EDITED IN PLACE under the same id is no longer covered (amount, date or reference)', () => {
+  const unchanged = decide({ operatorLedgerChecks: [CHECK] })
+  assert.equal(unchanged.register, true, 'precondition: the record as confirmed is lifted')
+  for (const [label, edited] of [
+    ['amount', { ...UNREADABLE_H, unreadableAmount: '41.005' }],
+    ['date', { ...UNREADABLE_H, date: '2026-08-03' }],
+    ['reference', { ...UNREADABLE_H, reference: 'edited in Xero' }],
+  ] as const) {
+    const d = decide({ operatorLedgerChecks: [CHECK], ledgerSettlements: probe([edited]) })
+    precondition(`${label} edited under PAY-H`, d)
+    assert.equal(d.register, false, `an edited ${label} is not what the operator confirmed`)
+    assert.match(d.register === false ? d.ledgerCheckRemedy ?? '' : '', /PAY-H/, 'and the remedy asks for that record to be looked at again')
+  }
+  // A check carrying no fingerprints (a row from before they existed, or a hand-written one) covers nothing.
+  const bare = decide({ operatorLedgerChecks: [{ ...CHECK, ledgerRecordFingerprints: undefined }] })
+  assert.equal(bare.register, false)
 })

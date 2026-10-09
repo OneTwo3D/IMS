@@ -66,6 +66,8 @@ export async function recordLedgerCheck(input: {
   expectedConnectionGeneration: string
   expectedLedgerDocumentId: string
   expectedAttemptLabel: string
+  /** Echoed from the preview: each record's fingerprint as shown, keyed by record id. */
+  expectedRecordFingerprints: Record<string, string>
   note?: string | null
   /** The operator ticked the statement of what they checked. Required. */
   confirmed: boolean
@@ -87,6 +89,9 @@ export async function recordLedgerCheck(input: {
       expectedConnectionGeneration: String(input.expectedConnectionGeneration ?? ''),
       expectedLedgerDocumentId: String(input.expectedLedgerDocumentId ?? ''),
       expectedAttemptLabel: String(input.expectedAttemptLabel ?? ''),
+      expectedRecordFingerprints: input.expectedRecordFingerprints && typeof input.expectedRecordFingerprints === 'object'
+        ? Object.fromEntries(Object.entries(input.expectedRecordFingerprints).map(([id, fp]) => [String(id), String(fp)]))
+        : {},
       note: typeof input.note === 'string' ? input.note : null,
       userId: session.user.id,
     }, { client: db, probe: probeLedgerSettlement })

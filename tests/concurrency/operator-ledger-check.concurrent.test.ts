@@ -195,6 +195,9 @@ async function lastWarning(d: Deps, orderId: string, action: string): Promise<st
   return row?.description ?? null
 }
 
+/** A well-formed fingerprint for hand-written rows that only exercise the table's own constraints. */
+const FP = `v1:${'a'.repeat(64)}`
+
 const recordDeps = (d: Deps) => ({ client: d.db, probe: d.probeLedgerSettlement })
 
 /**
@@ -210,7 +213,8 @@ async function recordShown(d: Deps, input: { syncLogId: string; paymentId: strin
     expectedConnectionGeneration: preview.ok ? preview.binding.connectionGeneration : '',
     expectedLedgerDocumentId: preview.ok ? preview.ledgerDocumentId : '',
     expectedAttemptLabel: preview.ok ? preview.attemptLabel : '',
-  }, recordDeps(d))
+    expectedRecordFingerprints: preview.ok ? Object.fromEntries(preview.records.map((r) => [r.id, (r as { fingerprint?: string }).fingerprint ?? ''])) : {},
+  } as never, recordDeps(d))
 }
 
 test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
@@ -262,7 +266,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     orders.push(o.orderId)
     const created = await d.db.accountingOperatorLedgerCheck.create({
       data: {
-        syncLogId: o.failedId, paymentId: 'p', connector: 'xero', ledgerDocumentId: o.invoiceId, ledgerRecordIds: ['R1'],
+        syncLogId: o.failedId, paymentId: 'p', connector: 'xero', ledgerDocumentId: o.invoiceId, ledgerRecordIds: ['R1'], ledgerRecordFingerprints: [FP],
         tenantId: TENANT, connectionGeneration: 'g', checkedByUserId: userId,
       },
     })
@@ -270,9 +274,12 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     await assert.rejects(d.db.accountingOperatorLedgerCheck.update({ where: { id: created.id }, data: { ledgerRecordIds: ['R1', 'R2'] } }), /insert-only: UPDATE refused/)
     await assert.rejects(d.db.accountingOperatorLedgerCheck.delete({ where: { id: created.id } }), /insert-only: DELETE refused/)
     await assert.rejects(d.db.$executeRaw`UPDATE accounting_operator_ledger_checks SET "connectionGeneration" = 'x' WHERE id = ${created.id}`, /insert-only/)
-    const base = { syncLogId: o.failedId, paymentId: 'p', connector: 'xero', ledgerDocumentId: o.invoiceId, tenantId: TENANT, connectionGeneration: 'g', checkedByUserId: userId }
-    await assert.rejects(d.db.accountingOperatorLedgerCheck.create({ data: { ...base, ledgerRecordIds: [] } }), /accounting_operator_ledger_checks_records_named/)
+    const base = { syncLogId: o.failedId, paymentId: 'p', connector: 'xero', ledgerDocumentId: o.invoiceId, tenantId: TENANT, connectionGeneration: 'g', checkedByUserId: userId, ledgerRecordFingerprints: [FP] }
+    await assert.rejects(d.db.accountingOperatorLedgerCheck.create({ data: { ...base, ledgerRecordIds: [], ledgerRecordFingerprints: [] } }), /accounting_operator_ledger_checks_records_(named|fingerprinted)/)
     await assert.rejects(d.db.accountingOperatorLedgerCheck.create({ data: { ...base, ledgerRecordIds: [''] } }), /accounting_operator_ledger_checks_records_named/)
+    // A check of a record id with no fingerprint (or a malformed one) is a check of nothing in particular.
+    await assert.rejects(d.db.accountingOperatorLedgerCheck.create({ data: { ...base, ledgerRecordIds: ['R1', 'R2'] } }), /accounting_operator_ledger_checks_records_fingerprinted/)
+    await assert.rejects(d.db.accountingOperatorLedgerCheck.create({ data: { ...base, ledgerRecordIds: ['R1'], ledgerRecordFingerprints: ['not-a-fingerprint'] } }), /accounting_operator_ledger_checks_records_fingerprinted/)
     await assert.rejects(d.db.accountingOperatorLedgerCheck.create({ data: { ...base, ledgerRecordIds: ['R1'], connectionGeneration: ' ' } }), /accounting_operator_ledger_checks_identity_named/)
     await assert.rejects(d.db.accountingOperatorLedgerCheck.create({ data: { ...base, ledgerRecordIds: ['R1'], basis: 'CONNECTOR' } }), /accounting_operator_ledger_checks_basis_is_assertion/)
     const still = await d.db.accountingOperatorLedgerCheck.findUnique({ where: { id: created.id } })
@@ -372,6 +379,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     await d.db.accountingOperatorLedgerCheck.create({
       data: {
         syncLogId: o.failedId, paymentId: receipt, connector: 'xero', ledgerDocumentId: o.invoiceId, ledgerRecordIds: [o.unreadableId],
+        ledgerRecordFingerprints: [(await import('../../lib/domain/accounting/operator-ledger-check.ts')).settlementRecordFingerprint({ id: o.unreadableId, amount: null, unreadableAmount: '40.005', date: '2026-08-02', reference: null })],
         tenantId: TENANT, connectionGeneration: `${RUN_ID}-gen-1`, checkedByUserId: userId,
       },
     })
@@ -389,6 +397,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     assert.equal(preview.ok, true, 'precondition: a preview under gen-1')
     if (!preview.ok) return
     const shown = {
+      expectedRecordFingerprints: Object.fromEntries(preview.records.map((r) => [r.id, (r as { fingerprint?: string }).fingerprint ?? ''])),
       expectedTenantId: preview.binding.tenantId,
       expectedConnectionGeneration: preview.binding.connectionGeneration,
       expectedLedgerDocumentId: preview.ledgerDocumentId,
@@ -410,7 +419,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
       ['tenant', { expectedTenantId: 'tenant-other' }],
       ['document', { expectedLedgerDocumentId: 'INV-other' }],
       ['attempt description', { expectedAttemptLabel: 'the FAILED attempt x (GBP 1.00)' }],
-      ['nothing echoed', { expectedTenantId: undefined, expectedConnectionGeneration: undefined, expectedLedgerDocumentId: undefined, expectedAttemptLabel: undefined }],
+      ['nothing echoed', { expectedTenantId: undefined, expectedConnectionGeneration: undefined, expectedLedgerDocumentId: undefined, expectedAttemptLabel: undefined, expectedRecordFingerprints: undefined }],
     ] as const) {
       const r = await d.recordOperatorLedgerCheck({ ...input, ...shown, ...tamper } as never, recordDeps(d))
       assert.equal(!r.ok && r.code, 'LEDGER_CHANGED', `${label} differing from what was shown refuses`)
@@ -424,12 +433,88 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     const o = await seedOrder(d, 'truncate')
     orders.push(o.orderId)
     await d.db.accountingOperatorLedgerCheck.create({
-      data: { syncLogId: o.failedId, paymentId: 'p', connector: 'xero', ledgerDocumentId: o.invoiceId, ledgerRecordIds: ['R1'], tenantId: TENANT, connectionGeneration: 'g', checkedByUserId: userId },
+      data: { syncLogId: o.failedId, paymentId: 'p', connector: 'xero', ledgerDocumentId: o.invoiceId, ledgerRecordIds: ['R1'], ledgerRecordFingerprints: [FP], tenantId: TENANT, connectionGeneration: 'g', checkedByUserId: userId },
     })
     const before = await d.db.accountingOperatorLedgerCheck.count()
     console.log(`[precondition] ${before} check rows before TRUNCATE`)
     assert.ok(before > 0)
     await assert.rejects(d.db.$executeRawUnsafe('TRUNCATE accounting_operator_ledger_checks'), /insert-only: TRUNCATE refused/)
     assert.equal(await d.db.accountingOperatorLedgerCheck.count(), before, 'every row survives')
+  })
+
+  await t.test('10. a settlement EDITED IN PLACE under the same id: refused between preview and submit, and a stored check no longer applies at registration, at the post fence or at revival', async () => {
+    const { authoriseMoneyPost, ledgerClearsFollowUpRevival } = await import('../../lib/connectors/accounting-settlement-probe.ts')
+    const { loadOperatorLedgerChecks } = await import('../../lib/domain/accounting/operator-ledger-check-store.ts')
+    const loader = (scope: { attemptSyncLogId: string; paymentId: string | null; connector: string }) =>
+      loadOperatorLedgerChecks(d.db, { syncLogIds: [scope.attemptSyncLogId], paymentId: scope.paymentId, connector: scope.connector })
+    const edit = (o: Order, amount: number) => ledger.set(o.invoiceId, [{ PaymentID: o.unreadableId, Date: '2026-08-02', Amount: amount }])
+
+    // (a) between preview and submit
+    const a = await seedOrder(d, 'edit-submit')
+    orders.push(a.orderId)
+    const ra = await addReceipt(d, a.orderId, 60)
+    const preview = await d.previewOperatorLedgerCheck(a.failedId, recordDeps(d))
+    assert.equal(preview.ok, true, 'precondition: a preview')
+    if (!preview.ok) return
+    edit(a, 41.005)
+    const submitted = await d.recordOperatorLedgerCheck({
+      syncLogId: a.failedId, paymentId: ra, recordIds: preview.records.map((r) => r.id), userId,
+      expectedTenantId: preview.binding.tenantId, expectedConnectionGeneration: preview.binding.connectionGeneration,
+      expectedLedgerDocumentId: preview.ledgerDocumentId, expectedAttemptLabel: preview.attemptLabel,
+      expectedRecordFingerprints: Object.fromEntries(preview.records.map((r) => [r.id, (r as { fingerprint?: string }).fingerprint ?? ''])),
+    } as never, recordDeps(d))
+    console.log(`[precondition] submit after an in-place edit (same id): ${JSON.stringify(submitted).slice(0, 160)}`)
+    assert.equal(!submitted.ok && submitted.code, 'LEDGER_CHANGED')
+    assert.equal(await d.db.accountingOperatorLedgerCheck.count({ where: { syncLogId: a.failedId } }), 0, 'nothing inserted')
+
+    // (b) registration: check recorded on the confirmed state, then the payment is edited in place
+    const b = await seedOrder(d, 'edit-register')
+    orders.push(b.orderId)
+    const rb = await addReceipt(d, b.orderId, 60)
+    assert.equal((await recordShown(d, { syncLogId: b.failedId, paymentId: rb, recordIds: [b.unreadableId], userId })).ok, true, 'precondition: check recorded')
+    edit(b, 41.005)
+    await register(d, b.orderId, rb, 60)
+    console.log(`[precondition] registration after edit: queued=${await queuedFor(d, b.orderId, rb)}`)
+    assert.equal(await queuedFor(d, b.orderId, rb), false, 'registration: the edited payment is not covered')
+    edit(b, 40.005)
+    await register(d, b.orderId, rb, 60)
+    assert.equal(await queuedFor(d, b.orderId, rb), true, 'and with the payment back as confirmed, the check still lifts')
+
+    // (c) the post fence, on the real database, one fresh order per verdict (the first call claims the stamp)
+    const fenceOn = async (label: string, amount: number) => {
+      const o = await seedOrder(d, label)
+      orders.push(o.orderId)
+      const r = await addReceipt(d, o.orderId, 60)
+      assert.equal((await recordShown(d, { syncLogId: o.failedId, paymentId: r, recordIds: [o.unreadableId], userId })).ok, true)
+      await register(d, o.orderId, r, 60)
+      const rows = await d.loadInvoicePaymentSyncRows(o.orderId, 'xero', 'GBP')
+      const n = rows.find((row) => row.paymentId === r && row.status === 'PENDING')
+      assert.ok(n, `precondition (${label}): the receipt was queued`)
+      const nRow = await d.db.accountingSyncLog.findUnique({ where: { id: n!.id }, select: { payload: true } })
+      edit(o, amount)
+      return authoriseMoneyPost({
+        connector: 'xero', entryId: n!.id, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: o.orderId,
+        payload: nRow!.payload, postingDate: '2026-08-09', db: d.db as never, loadOperatorLedgerChecks: loader as never,
+      })
+    }
+    const fenceUnchanged = await fenceOn('fence-same', 40.005)
+    const fenceEdited = await fenceOn('fence-edit', 41.005)
+    console.log(`[precondition] fence unchanged=${JSON.stringify(fenceUnchanged)} edited=${fenceEdited.proceed}`)
+    assert.deepEqual(fenceUnchanged, { proceed: true }, 'fence: the record as confirmed is lifted')
+    assert.equal(fenceEdited.proceed, false, 'fence: the edited record is not covered')
+
+    // (d) revival of F itself, with a check recorded for F's own receipt
+    const c = await seedOrder(d, 'edit-revival')
+    orders.push(c.orderId)
+    const fRow = await d.db.accountingSyncLog.findUnique({ where: { id: c.failedId }, select: { payload: true } })
+    await d.db.payment.create({ data: { id: `pay-f-${c.orderId}`, orderId: c.orderId, amount: 100, currency: 'GBP', method: METHOD, paidAt: new Date('2026-08-01T12:00:00Z') } })
+    assert.equal((await recordShown(d, { syncLogId: c.failedId, paymentId: `pay-f-${c.orderId}`, recordIds: [c.unreadableId], userId })).ok, true)
+    const revive = () => ledgerClearsFollowUpRevival({ connector: 'xero', type: 'INVOICE_PAYMENT', payload: fRow!.payload, tokenDisposition: 'pinned', syncLogId: c.failedId, loadOperatorLedgerChecks: loader as never })
+    const same = await revive()
+    edit(c, 41.005)
+    const changed = await revive()
+    console.log(`[precondition] revival unchanged=${same.clear} edited=${changed.clear}`)
+    assert.equal(same.clear, true, 'revival: the record as confirmed is lifted')
+    assert.equal(changed.clear, false, 'revival: the edited record is not covered')
   })
 })

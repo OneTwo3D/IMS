@@ -86,6 +86,7 @@ function LedgerCheckDialog({ syncLogId, onRecorded, onClose }: { syncLogId: stri
       expectedConnectionGeneration: preview.binding.connectionGeneration,
       expectedLedgerDocumentId: preview.ledgerDocumentId,
       expectedAttemptLabel: preview.attemptLabel,
+      expectedRecordFingerprints: Object.fromEntries(preview.records.map((record) => [record.id, record.fingerprint])),
       note: note.trim() || null,
       confirmed,
     })

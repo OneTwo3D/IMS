@@ -39,6 +39,7 @@ import {
   describeLedgerCheckBlockedByPostedRegistration,
   describeLedgerCheckRemedy,
   normaliseLedgerId,
+  settlementRecordFingerprint,
 } from './operator-ledger-check'
 import { OPERATOR_ASSERTION_SETTLEMENT_BASIS } from './sync-row-settlement'
 import { claimsToHavePosted } from './ledger-standing'
@@ -73,7 +74,14 @@ export type LedgerCheckPreview = {
   /** What the operator compares each record with. */
   attemptLabel: string
   /** The unmeasurable records, as the ledger reported them, in its order. */
-  records: Array<{ id: string; date: string | null; unreadableAmount: string | null; reference: string | null }>
+  records: Array<{
+    id: string
+    date: string | null
+    unreadableAmount: string | null
+    reference: string | null
+    /** `settlementRecordFingerprint` of the record exactly as shown; submitted back and stored with the check. */
+    fingerprint: string
+  }>
   binding: ProbeConnectionBinding
   /** The receipts on the order a check could be recorded for (receipts, not refund payments). */
   receipts: Array<{ id: string; amount: string; currency: string; paidAt: string; method: string | null }>
@@ -182,6 +190,7 @@ async function assessAttempt(
       date: record.date,
       unreadableAmount: record.unreadableAmount ?? null,
       reference: record.reference ?? null,
+      fingerprint: settlementRecordFingerprint(record),
     }))
   return {
     ok: true,
@@ -237,6 +246,12 @@ export type RecordOperatorLedgerCheckInput = {
   expectedConnectionGeneration: string
   expectedLedgerDocumentId: string
   expectedAttemptLabel: string
+  /**
+   * The fingerprint of each record AS SHOWN, keyed by record id (from the preview). Every record the ledger
+   * shows now must carry exactly the fingerprint the operator was shown: a payment edited in place under the
+   * same id is not the payment they looked at.
+   */
+  expectedRecordFingerprints: Readonly<Record<string, string>>
   note?: string | null
   userId: string
 }
@@ -300,17 +315,19 @@ export async function recordOperatorLedgerCheck(
     && typeof input.expectedConnectionGeneration === 'string' && input.expectedConnectionGeneration === assessed.binding.connectionGeneration
     && typeof input.expectedLedgerDocumentId === 'string' && input.expectedLedgerDocumentId === assessed.ledgerDocumentId
     && typeof input.expectedAttemptLabel === 'string' && input.expectedAttemptLabel === assessed.attemptLabel
+    && recordsMatchAsShown(assessed.records, input.expectedRecordFingerprints)
   if (!shownMatches) {
     return {
       ok: false,
       code: 'LEDGER_CHANGED',
       error: 'What this check was confirmed against has changed since the dialog was opened (the Xero connection, the '
-        + 'document or the earlier attempt it describes). Nothing was recorded. Reopen the check and look at every '
+        + 'document, the earlier attempt it describes, or a listed settlement itself). Nothing was recorded. Reopen the check and look at every '
         + 'settlement it now lists; it can be submitted again once you have.',
     }
   }
   const note = typeof input.note === 'string' && input.note.trim() !== '' ? input.note.trim().slice(0, NOTE_LIMIT) : null
   const recordIds = assessed.records.map((record) => record.id)
+  const recordFingerprints = assessed.records.map((record) => record.fingerprint)
   const created = await deps.client.accountingOperatorLedgerCheck.create({
     data: {
       syncLogId: assessed.syncLogId,
@@ -318,6 +335,7 @@ export async function recordOperatorLedgerCheck(
       connector: assessed.connector,
       ledgerDocumentId: assessed.ledgerDocumentId,
       ledgerRecordIds: recordIds,
+      ledgerRecordFingerprints: recordFingerprints,
       tenantId: assessed.binding.tenantId,
       connectionGeneration: assessed.binding.connectionGeneration,
       basis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
@@ -336,6 +354,22 @@ export async function recordOperatorLedgerCheck(
     recordIds,
     binding: assessed.binding,
   }
+}
+
+/** Every record read now carries exactly the fingerprint the operator was shown for its id. */
+function recordsMatchAsShown(
+  records: ReadonlyArray<{ id: string; fingerprint: string }>,
+  shown: Readonly<Record<string, string>> | null | undefined,
+): boolean {
+  if (!shown || typeof shown !== 'object') return false
+  const byId = new Map<string, string>()
+  for (const [id, fingerprint] of Object.entries(shown)) {
+    const key = normaliseLedgerId(id)
+    if (key === null || typeof fingerprint !== 'string') return false
+    byId.set(key, fingerprint)
+  }
+  return byId.size === records.length
+    && records.every((record) => byId.get(normaliseLedgerId(record.id) as string) === record.fingerprint)
 }
 
 /** The activity-log sentence for a recorded check. An assertion, attributed; no claim about the ledger. */

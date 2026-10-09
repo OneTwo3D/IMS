@@ -43,10 +43,20 @@ function invoice(payments: unknown[]) {
 
 const BOUND = { tenantId: 'tenant-A', connectionGeneration: 'gen-1' }
 
+/** What the probe reads off `UNREADABLE_HAND_PAYMENT` — the state the operator confirmed. */
+const H_AS_SHOWN = { id: 'PAY-H', amount: null, unreadableAmount: '40.005', date: '2026-08-02', reference: null }
+const S_AS_SHOWN = { id: 'PAY-S', amount: null, unreadableAmount: '40.005', date: '2026-08-02', reference: null }
+let fp: (record: typeof H_AS_SHOWN) => string
+
 const CHECK = {
   id: 'chk-1', syncLogId: 'log-f', paymentId: 'pay-new', connector: 'xero', ledgerDocumentId: 'INV-1',
   ledgerRecordIds: ['PAY-H'], tenantId: 'tenant-A', connectionGeneration: 'gen-1',
+  get ledgerRecordFingerprints() { return [fp(H_AS_SHOWN)] },
 }
+
+test.before(async () => {
+  fp = (await import('@/lib/domain/accounting/operator-ledger-check')).settlementRecordFingerprint
+})
 
 type Row = { id: string; remoteAttemptedAt: Date | null; payload: unknown }
 function fenceDb(rows: Row[]) {
@@ -209,7 +219,7 @@ test('[o3d-llyw] fence, headline shape: a SYNCED rival whose OWN payment is the 
   xeroAnswer = { data: invoice([{ PaymentID: 'PAY-S', Date: '2026-08-02', Amount: 40.005 }]), ...BOUND }
   // A check row exists for EVERY contender — including one somebody wrote for S by hand (psql), which
   // the recorder would have refused. The store is what the processor wires in.
-  const stored = ['log-f', 'log-s'].map((syncLogId) => ({ ...CHECK, id: `chk-${syncLogId}`, syncLogId, ledgerRecordIds: ['PAY-S'] }))
+  const stored = ['log-f', 'log-s'].map((syncLogId) => ({ ...CHECK, id: `chk-${syncLogId}`, syncLogId, ledgerRecordIds: ['PAY-S'], ledgerRecordFingerprints: [fp(S_AS_SHOWN)] }))
   const standing: Record<string, { status: string; externalTransactionId: string | null }> = {
     'log-f': { status: 'FAILED', externalTransactionId: null },
     'log-s': { status: 'SYNCED', externalTransactionId: 'PAY-S' },
@@ -258,4 +268,26 @@ test('[o3d-llyw] wiring: the Xero processor hands the store loader to the INVOIC
   const revival = source.slice(source.indexOf('const evidence = await ledgerClearsFollowUpRevival({'))
   assert.ok(revival.slice(0, 900).includes('loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {'),
     'and the revival gate passes it too')
+})
+
+test('[o3d-llyw] fence and revival: a payment EDITED IN PLACE under the same id is no longer covered by the check made about its earlier state', async () => {
+  const { ledgerClearsFollowUpRevival } = await probeModule()
+  xeroAnswer = { data: invoice([UNREADABLE_HAND_PAYMENT]), ...BOUND }
+  const unchanged = await postN({ loader: async () => [CHECK] })
+  assert.deepEqual(unchanged, { proceed: true }, 'precondition: the check lifts the record as confirmed')
+  for (const [label, edited] of [
+    ['amount', { ...UNREADABLE_HAND_PAYMENT, Amount: 41.005 }],
+    ['date', { ...UNREADABLE_HAND_PAYMENT, Date: '2026-08-03' }],
+    ['reference', { ...UNREADABLE_HAND_PAYMENT, Reference: 'edited in Xero' }],
+  ] as const) {
+    xeroAnswer = { data: invoice([edited]), ...BOUND }
+    const verdict = await postN({ loader: async () => [CHECK] })
+    console.log(`[precondition] fence, ${label} edited under PAY-H: ${verdict.proceed ? 'PROCEED' : 'REFUSED'}`)
+    assert.equal(verdict.proceed, false, `fence: an edited ${label} is not what the operator confirmed`)
+    const revival = await ledgerClearsFollowUpRevival({
+      connector: 'xero', type: 'INVOICE_PAYMENT', payload: F_PAYLOAD, tokenDisposition: 'pinned', syncLogId: 'log-f',
+      loadOperatorLedgerChecks: async () => [{ ...CHECK, paymentId: 'pay-f' }],
+    })
+    assert.equal(revival.clear, false, `revival: an edited ${label} is not what the operator confirmed`)
+  }
 })

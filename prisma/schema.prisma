@@ -3139,6 +3139,10 @@ model AccountingOperatorLedgerCheck {
   ledgerDocumentId     String
   /// The EXACT unmeasurable ledger record ids the probe showed when the check was recorded. Non-empty.
   ledgerRecordIds      String[]
+  /// `settlementRecordFingerprint` of each of those records AS CONFIRMED (amount, unreadable figure, date,
+  /// reference), index-aligned with ledgerRecordIds, prefixed with the serialisation version. A record
+  /// edited in place under the same id no longer matches, so the check no longer covers it.
+  ledgerRecordFingerprints String[]
   /// The organisation that served that probe.
   tenantId             String
   /// The connection generation that served that probe (AccountingToken.connectionGeneration). Any

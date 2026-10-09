@@ -18,6 +18,7 @@ export const OPERATOR_LEDGER_CHECK_SELECT = {
   connector: true,
   ledgerDocumentId: true,
   ledgerRecordIds: true,
+  ledgerRecordFingerprints: true,
   tenantId: true,
   connectionGeneration: true,
 } as const
@@ -53,5 +54,5 @@ export async function loadOperatorLedgerChecks(
     select: OPERATOR_LEDGER_CHECK_SELECT,
     orderBy: { checkedAt: 'asc' },
   })
-  return rows.map((row) => ({ ...row, ledgerRecordIds: [...row.ledgerRecordIds] }))
+  return rows.map((row) => ({ ...row, ledgerRecordIds: [...row.ledgerRecordIds], ledgerRecordFingerprints: [...row.ledgerRecordFingerprints] }))
 }
