@@ -576,3 +576,33 @@ test('[o3d-6e4v] tie rule, endpoint: a COMPLETED/PARTIAL tie blocks; a COMPLETED
   assert.equal(second.status, 'blocked')
   assert.ok(second.blockers.includes('accounting-reconciliation:truncation-unresolved'))
 })
+
+// ---------------------------------------------------------------------------------------------------
+// THE NEWEST RUN OF ANY STATUS: only COMPLETED is a pass.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-6e4v] a newest run that is RUNNING, queued or of an unrecognised status BLOCKS with its own message (closed table: only COMPLETED passes)', async () => {
+  const noHist: ReconciliationHistory = { runs: [], overflow: false, recordedBeforeNewest: false }
+  const table: Array<[string, 'ready' | 'blocked', RegExp | null]> = [
+    ['COMPLETED', 'ready', null],
+    ['PARTIAL', 'blocked', null],
+    ['FAILED', 'blocked', null],
+    ['RUNNING', 'blocked', /in progress/],
+    ['QUEUED', 'blocked', /in progress/],
+    ['PENDING', 'blocked', /in progress/],
+    ['weird', 'blocked', /does not recognise/],
+    ['completed', 'blocked', /does not recognise/],
+    ['', 'blocked', /does not recognise/],
+  ]
+  for (const [status, want, message] of table) {
+    const result = await verdict(newestRun({ status: status as never }), noHist)
+    assert.equal(result.status, want, JSON.stringify(status))
+    if (want === 'blocked') assert.ok(result.blockers.length > 0, JSON.stringify(status))
+    if (message) {
+      const finding = result.report.blockers.find((f) => f.id === 'accounting-reconciliation:in-progress-or-unrecognised')
+      assert.ok(finding, `${JSON.stringify(status)} has the in-progress/unrecognised blocker`)
+      assert.match(finding.message, message, status)
+    }
+  }
+  console.log(`precondition: ${table.length} newest-run statuses examined`)
+})

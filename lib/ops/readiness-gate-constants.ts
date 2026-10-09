@@ -89,6 +89,9 @@ export const READ_SYNC_CONTRACT = `${READ_SYNC_CONTRACT_VERSION}: \`npm run --si
 /** What the build identity covers, said in every GO and in the docs. */
 export const BUILD_SCOPE_TEXT = 'The rehearsal is tied to this build by source commit and source tree only; it is NOT tied to the build artefact (.next/BUILD_ID) and NOT to the .env configuration.'
 
+/** What the gate's schema check ran, and what it did not. Said in every NO-GO report so the report cannot imply a probe that did not happen. */
+export const SCHEMA_CHECKS_RAN_TEXT = `The gate changes no data in the database. Its schema check ran ${'`'}prisma migrate status${'`'}, the schema diff, the drift check and a read of the catalogue for the required CHECK constraints; ${'`'}npm run validate:db${'`'} and its rolled-back probe were NOT run.`
+
 /** Why a rehearsal report location was not read. */
 export const REHEARSAL_TRUST_TEXT = (reason: string) => `the rehearsal report location is not trusted (${reason}); a report that another account could have written proves nothing, so it was not read`
 
@@ -280,7 +283,7 @@ export const READINESS_GATE_DOC_BLOCKS: Record<ReadinessGateDocBlockId, string> 
   ].join('\n'),
   'exit-codes': renderReadinessGateExitCodeTable(),
   endpoint: [
-    'The `/api/admin/rollout-readiness` endpoint reads the same reconciliation findings as the gate. These are blockers there: the endpoint answers HTTP 412 and `?allowWarnings=true` does NOT turn them into 200, because that override records no reason: an unresolved truncation, an unreadable completeness record, a run history that could not be evaluated, a newest-run read that failed, a newest run whose own report recorded a truncation, and a newest run that did not complete. **Changed behaviour:** a newest run with status PARTIAL used to be only a warning that `?allowWarnings=true` accepted; a PARTIAL or FAILED newest run (and any status the check does not recognise) is now a blocker, and only a COMPLETED run can ever clear an earlier truncation. Several runs created at the same instant are read together and judged as their worst member, and runs created at the same instant never clear each other\'s truncations, because their order cannot be proven.',
+    'The `/api/admin/rollout-readiness` endpoint reads the same reconciliation findings as the gate. These are blockers there: the endpoint answers HTTP 412 and `?allowWarnings=true` does NOT turn them into 200, because that override records no reason: an unresolved truncation, an unreadable completeness record, a run history that could not be evaluated, a newest-run read that failed, a newest run whose own report recorded a truncation, and a newest run that did not complete. **Changed behaviour:** a newest run with status PARTIAL used to be only a warning that `?allowWarnings=true` accepted; a PARTIAL or FAILED newest run is now a blocker, and so is a RUNNING, queued or otherwise unrecognised one (the newest run is the newest row of ANY status, never an older finished row chosen because a newer one is unfinished; the message says a reconciliation run is in progress or was left unfinished). Today the database only accepts COMPLETED, FAILED and PARTIAL (a check constraint), and this build writes a run row once, in one transaction, so an unfinished row cannot appear unless a later migration allows one; the check is fail-closed so that such a row could never be skipped. Only a COMPLETED run can ever clear an earlier truncation. Several runs created at the same instant are read together and judged as their worst member, and runs created at the same instant never clear each other\'s truncations, because their order cannot be proven.',
   ].join('\n'),
 }
 

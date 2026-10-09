@@ -25,6 +25,7 @@ import {
   ACCEPTANCE_SCHEMA_VERSION,
   CHECK_CATALOGUE,
   BUILD_SCOPE_TEXT,
+  SCHEMA_CHECKS_RAN_TEXT,
   READINESS_GATE_EXIT_CODES,
   READINESS_PHASES,
   READ_SYNC_SCHEMA_VERSION,
@@ -679,7 +680,7 @@ export function verdictStatement(report: Pick<GateReport, 'verdict' | 'phase' | 
     : ''
   switch (report.verdict) {
     case 'NO-GO':
-      return `NO-GO for ${report.phase}: at least one reason below stops it. The gate changes no data in the database; its validate:db step runs a probe inside a transaction that is rolled back.${unavailable}`
+      return `NO-GO for ${report.phase}: at least one reason below stops it. ${SCHEMA_CHECKS_RAN_TEXT}${unavailable}`
     case 'GO':
       return `GO for ${report.phase}: every check this gate defines as required for ${report.phase} passed against the database and environment it was run with, at the time stated. It says nothing about checks that are not listed as passed. ${BUILD_SCOPE_TEXT}${unavailable}`
     case 'GO-WITH-ACCEPTED-WARNINGS':

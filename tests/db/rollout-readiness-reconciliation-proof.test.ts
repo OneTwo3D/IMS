@@ -201,3 +201,69 @@ test('[o3d-6e4v] DB: tied newest runs are read as a GROUP: COMPLETED + PARTIAL b
     await db.$executeRawUnsafe(`DELETE FROM "accounting_reconciliation_runs" WHERE "id" LIKE $1`, `${prefix}%`)
   }
 })
+
+// ---------------------------------------------------------------------------------------------------
+// THE NEWEST RUN OF ANY STATUS, through the SQL reader.
+//
+// accounting_reconciliation_runs_status_check (20260517153500) lets only COMPLETED, FAILED and PARTIAL exist today, so a
+// RUNNING or unrecognised row is impossible in this schema. The reader must still never SKIP such a row (a future migration
+// widening the check would otherwise make an unfinished run invisible), so this test drops the constraint INSIDE a
+// transaction that is always rolled back, inserts the rows, reads them through the real reader and rolls back. Nothing
+// is committed; the table is locked for the few milliseconds the transaction lives.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-6e4v] DB: a RUNNING or unrecognised-status row NEWER than (or tied with) a clean COMPLETED row is the newest run and BLOCKS', { skip }, async () => {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  const { db } = await import('../../lib/db')
+  const { getAccountingReconciliationSnapshot, collectAccountingReconciliationReadiness } = await import('../../lib/ops/rollout-readiness')
+  const readiness = (tx: unknown) => collectAccountingReconciliationReadiness(
+    { accountingReconciliationSnapshot: () => getAccountingReconciliationSnapshot({ client: { $transaction: (async (fn: (t: unknown) => Promise<unknown>) => fn(tx)) as never } }) },
+    new Date('2099-09-02T00:00:00Z'),
+  )
+  const shapes: Array<[string, Array<[string, string, string]>, string]> = [
+    ['COMPLETED then a NEWER RUNNING row', [['a', 'COMPLETED', '2099-09-01T00:00:00'], ['b', 'RUNNING', '2099-09-01T00:00:01']], 'RUNNING'],
+    ['COMPLETED then a NEWER row of an unrecognised status', [['a', 'COMPLETED', '2099-09-01T00:00:00'], ['b', 'weird', '2099-09-01T00:00:01']], 'weird'],
+    ['COMPLETED and a RUNNING row at the SAME instant', [['a', 'COMPLETED', '2099-09-01T00:00:00'], ['b', 'RUNNING', '2099-09-01T00:00:00']], 'RUNNING'],
+    ['COMPLETED and an unrecognised row at the SAME instant', [['a', 'COMPLETED', '2099-09-01T00:00:00'], ['b', 'weird', '2099-09-01T00:00:00']], 'weird'],
+  ]
+  let examined = 0
+  class RollbackProbe extends Error {}
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`)
+      await tx.$executeRawUnsafe(`ALTER TABLE "accounting_reconciliation_runs" DROP CONSTRAINT "accounting_reconciliation_runs_status_check"`)
+      await tx.$executeRawUnsafe('DELETE FROM "accounting_reconciliation_runs"')
+      const insert = (id: string, status: string, createdAt: string) => tx.$executeRawUnsafe(
+        `INSERT INTO "accounting_reconciliation_runs"
+           ("id", "fromDate", "toDate", "status", "totalCount", "warningCount", "criticalCount", "createdAt", "truncations")
+         VALUES ($1, '2098-01-01'::timestamp, $2::timestamp, $3, 0, 0, 0, $2::timestamp, '[]'::jsonb)`,
+        id, createdAt, status,
+      )
+      // Control: a lone clean COMPLETED row is proven (so the blockers below are the shapes', not the rig's).
+      await insert('rrany-a', 'COMPLETED', '2099-09-01T00:00:00')
+      const control = await readiness(tx)
+      assert.equal(control.blockers.length, 0, `control: a clean COMPLETED newest run does not block (${control.blockers.map((b) => b.id).join(',')})`)
+      assert.equal(control.proof?.state, 'proven')
+      console.log('precondition: the control (lone COMPLETED row) is proven; now the any-status shapes')
+      for (const [label, rows, worst] of shapes) {
+        await tx.$executeRawUnsafe('DELETE FROM "accounting_reconciliation_runs"')
+        for (const [suffix, status, at] of rows) await insert(`rrany-${suffix}`, status, at)
+        const snapshot = await getAccountingReconciliationSnapshot({ client: { $transaction: (async (fn: (t: unknown) => Promise<unknown>) => fn(tx)) as never } })
+        assert.equal(snapshot.latest?.status, worst, `${label}: the newest run is the ${worst} row`)
+        const result = await readiness(tx)
+        assert.ok(result.blockers.some((b) => b.id === 'accounting-reconciliation:in-progress-or-unrecognised'), `${label}: blocked as in progress / unrecognised`)
+        assert.ok(result.blockers.some((b) => b.id === 'accounting-reconciliation:newest-run-not-completed'), `${label}: the proof refuses it too`)
+        examined += 1
+      }
+      throw new RollbackProbe()
+    }, { timeout: 60_000, maxWait: 30_000 })
+  } catch (error) {
+    if (!(error instanceof RollbackProbe)) throw error
+  }
+  console.log(`precondition: ${examined} any-status shapes examined`)
+  assert.equal(examined, shapes.length)
+  // Nothing was committed: the constraint is still there.
+  const [still] = await db.$queryRawUnsafe<Array<{ n: number }>>(`SELECT count(*)::int AS n FROM pg_constraint WHERE conname = 'accounting_reconciliation_runs_status_check'`)
+  assert.equal(still!.n, 1, 'the rolled-back transaction left the status check in place')
+})

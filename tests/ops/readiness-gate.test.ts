@@ -9,6 +9,7 @@ import {
   CHECK_CATALOGUE,
   PACK_ITEMS,
   BUILD_SCOPE_TEXT,
+  SCHEMA_CHECKS_RAN_TEXT,
   READINESS_GATE_EXIT_CODES,
   REHEARSAL_MAX_AGE_DAYS,
   REQUIRED_READ_SYNC_STREAMS,
@@ -522,4 +523,21 @@ test('every GO says what the build identity does NOT cover', () => {
   assert.match(BUILD_SCOPE_TEXT, /NOT tied to the build artefact \(\.next\/BUILD_ID\) and NOT to the \.env configuration/)
   const pass = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal(), location: '/x' }, NOW, GATE_BUILD)
   assert.ok(pass.kind === 'pass' && pass.summary.includes(BUILD_SCOPE_TEXT))
+})
+
+test('the NO-GO report states which schema checks ran and that validate:db did NOT; no text says it ran', () => {
+  const noGo = renderGateMarkdown(buildGateReport({ runId: 'r', now: NOW, phase: 'P0', expectGranted: null, verdict: verdictOf('P0', {}), acceptances: NO_ACCEPTANCES, acceptancePath: null }))
+  assert.ok(noGo.includes(SCHEMA_CHECKS_RAN_TEXT), 'the NO-GO report carries the single-sourced sentence')
+  assert.match(SCHEMA_CHECKS_RAN_TEXT, /validate:db.* and its rolled-back probe were NOT run/)
+  let reports = 0
+  for (const results of [{}, allPassing(), withWarning()]) {
+    for (const acceptances of [NO_ACCEPTANCES, accepted()]) {
+      const md = renderGateMarkdown(buildGateReport({ runId: 'r', now: NOW, phase: 'P0', expectGranted: null, verdict: verdictOf('P0', results, acceptances), acceptances, acceptancePath: null }))
+      reports += 1
+      // Universal: every mention of validate:db in any report sits in a sentence that says it was NOT run.
+      for (const sentence of md.split(/(?<=\.)\s/).filter((part) => part.includes('validate:db'))) assert.match(sentence, /NOT run/, sentence)
+      assert.doesNotMatch(md, /its validate:db step|step runs a probe/)
+    }
+  }
+  console.log(`precondition: ${reports} reports checked`)
 })

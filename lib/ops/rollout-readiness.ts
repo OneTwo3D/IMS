@@ -71,7 +71,9 @@ export type RolloutReadinessFinding = {
   details?: Record<string, JsonValue>
 }
 
-export type AccountingReconciliationRunStatus = typeof TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES[number]
+/** The statuses this build writes. A run row may carry ANY string (RUNNING, QUEUED, a future status): everything but COMPLETED blocks. */
+export type AccountingReconciliationRunStatus = string
+export const KNOWN_ACCOUNTING_RECONCILIATION_RUN_STATUSES = TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES
 
 export type LatestAccountingReconciliationRun = {
   id: string
@@ -335,13 +337,13 @@ export function createRolloutReadinessHandler({
 type ReconciliationRunReader = ReconciliationHistoryClient
 
 /**
- * The newest run. When several terminal runs share the greatest createdAt they are ALL read and merged as their worst
+ * The newest run, of ANY status: a RUNNING, queued or unrecognised row newer than the newest finished run is the newest
+ * run, and blocks (it is not skipped to find an older clean one). When several runs share the greatest createdAt they are ALL read and merged as their worst
  * member (lib/ops/reconciliation-proof.ts, THE TIE RULE): `findFirst ... orderBy createdAt` picks one of them arbitrarily,
  * and a COMPLETED pick over a PARTIAL tie reads as ready without assessing the run that should block.
  * Raw SQL so the JSON `null` / SQL NULL distinction of `truncations` survives, as in the history reader.
  */
 async function readLatestAccountingReconciliationRun(client: ReconciliationRunReader): Promise<LatestAccountingReconciliationRun | null> {
-  const statuses = [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES]
   const rows = await client.$queryRaw<Array<{
     id: string; status: string; totalCount: number; warningCount: number; criticalCount: number
     createdAt: Date; fromDate: Date | null; toDate: Date | null; truncations: unknown; payloadType: string | null
@@ -349,8 +351,7 @@ async function readLatestAccountingReconciliationRun(client: ReconciliationRunRe
     SELECT "id", "status", "totalCount", "warningCount", "criticalCount", "createdAt", "fromDate", "toDate", "truncations",
            jsonb_typeof("truncations") AS "payloadType"
     FROM "accounting_reconciliation_runs"
-    WHERE "status" = ANY(${statuses}::text[])
-      AND "createdAt" = (SELECT MAX("createdAt") FROM "accounting_reconciliation_runs" WHERE "status" = ANY(${statuses}::text[]))
+    WHERE "createdAt" = (SELECT MAX("createdAt") FROM "accounting_reconciliation_runs")
     ORDER BY "id" ASC
   `
   if (rows.length === 0) return null
@@ -406,7 +407,7 @@ export async function getAccountingReconciliationSnapshot(
  * One statement, so no timestamp crosses the driver between them (`createdAt` is a zone-less timestamp,
  * and a round-tripped Date could be re-read in the session's zone).
  * Bounded by RECONCILIATION_HISTORY_READ_LIMIT; one more is read so that overflow is detected, never
- * guessed. Terminal statuses only, as for the newest run.
+ * guessed. Rows of EVERY status are read (only COMPLETED may cover; see COVERING_RUN_STATUSES).
  */
 export type ReconciliationHistoryClient = {
   $queryRaw: typeof db.$queryRaw
@@ -416,12 +417,10 @@ export async function getAccountingReconciliationHistory(
   newest: LatestAccountingReconciliationRun,
   client: ReconciliationHistoryClient = db,
 ): Promise<ReconciliationHistory> {
-  const statuses = [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES]
   const recordedBefore = await client.$queryRaw<Array<{ found: boolean }>>`
     SELECT EXISTS (
       SELECT 1 FROM "accounting_reconciliation_runs"
-      WHERE "status" = ANY(${statuses}::text[])
-        AND "truncations" IS NOT NULL
+      WHERE "truncations" IS NOT NULL
         AND "createdAt" < (SELECT "createdAt" FROM "accounting_reconciliation_runs" WHERE "id" = ${newest.id})
     ) AS "found"
   `
@@ -437,8 +436,7 @@ export async function getAccountingReconciliationHistory(
     WITH "oldestUnproven" AS (
       SELECT "createdAt"
       FROM "accounting_reconciliation_runs"
-      WHERE "status" = ANY(${statuses}::text[])
-        AND "truncations" IS NOT NULL
+      WHERE "truncations" IS NOT NULL
         -- CASE, not OR: SQL does not promise to short-circuit, and jsonb_array_length ERRORS on a
         -- non-array, which is precisely the unreadable row this must find.
         AND CASE WHEN jsonb_typeof("truncations") = 'array' THEN jsonb_array_length("truncations") > 0 ELSE true END
@@ -447,8 +445,7 @@ export async function getAccountingReconciliationHistory(
     )
     SELECT "id", "status", "createdAt", "fromDate", "toDate", "truncations", jsonb_typeof("truncations") AS "payloadType"
     FROM "accounting_reconciliation_runs"
-    WHERE "status" = ANY(${statuses}::text[])
-      AND "truncations" IS NOT NULL
+    WHERE "truncations" IS NOT NULL
       -- No unproven run: the subquery is empty, the comparison is NULL, and nothing is returned.
       AND "createdAt" >= (SELECT "createdAt" FROM "oldestUnproven")
     ORDER BY "createdAt" ASC, "id" ASC
@@ -979,6 +976,17 @@ function classifyAccountingReconciliation(
           details,
         })
       }
+      return
+    default:
+      blockers.push({
+        id: 'accounting-reconciliation:in-progress-or-unrecognised',
+        severity: 'blocker',
+        source: 'accounting-reconciliation',
+        message: latest.status === 'RUNNING' || latest.status === 'QUEUED' || latest.status === 'PENDING'
+          ? 'A reconciliation run is in progress (or was left unfinished), so the newest run does not yet prove anything. Wait for it to finish or run reconciliation again.'
+          : `The newest accounting reconciliation run has a status this check does not recognise (${JSON.stringify(latest.status)}), so it cannot prove the reconciliation complete.`,
+        details,
+      })
   }
 }
 
