@@ -719,14 +719,14 @@ env_decode_seen() {
 
 # Collect every layer of ${1} into ENV_DECODE_LAYERS (the value itself first).
 env_value_decode_layers() {
-  local depth work=${#1} node child
+  local depth work=${#1} layer_in child
   local -a frontier=("$1") next=()
   ENV_DECODE_LAYERS=("$1")
   ENV_DECODE_UNBOUNDED=0
   for ((depth = 0; depth < ENV_DECODE_MAX_DEPTH; depth++)); do
     next=()
-    for node in "${frontier[@]}"; do
-      env_decode_children "${node}"
+    for layer_in in "${frontier[@]}"; do
+      env_decode_children "${layer_in}"
       for child in "${ENV_DECODE_CHILDREN[@]}"; do
         [[ -n "${child}" ]] || continue
         if env_decode_seen "${child}"; then continue; fi
@@ -743,8 +743,8 @@ env_value_decode_layers() {
     frontier=("${next[@]}")
   done
   # The depth bound is reached with layers still pending: refuse if any of them decodes further.
-  for node in "${frontier[@]}"; do
-    env_decode_children "${node}"
+  for layer_in in "${frontier[@]}"; do
+    env_decode_children "${layer_in}"
     for child in "${ENV_DECODE_CHILDREN[@]}"; do
       [[ -n "${child}" ]] || continue
       if env_decode_seen "${child}"; then continue; fi
