@@ -99,6 +99,8 @@ run_step 'wms connector boundary'         npm run check:wms-connector-boundary
 # skippable. o3d-amy8 finished that argument: they were skippable anyway, by any lint error, until
 # this script stopped aborting.
 run_step 'server action guards'           npm run check:server-action-guards
+# The first-load apply runner's system-actor import capability: a closed list of importers (static-guards.yml runs it ungated).
+run_step 'system import capability'       npm run check:system-import-capability
 run_step 'unit tests'                     npm run test:unit
 run_step 'workflow docs'                  npm run docs:workflows:check
 # o3d-bddq: archive/ is excluded from tsconfig, eslint, the test glob and every check:* SCAN_ROOT, so
