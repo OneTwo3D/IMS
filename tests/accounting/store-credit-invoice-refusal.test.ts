@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
 
+import { LEDGER_CHECK_PREAMBLE } from '@/lib/domain/accounting/hand-post-instruction'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 import {
   orderCarriesStoreCredit,
@@ -152,7 +153,7 @@ test('operator text is single-sourced, conditional, and states nothing the evide
   assert.ok(notice.includes(reason), 'the import notice carries the same reason, verbatim')
   // The queued notice is written before any attempt, so it must not claim anything was or was not sent.
   assert.doesNotMatch(notice, /NOTHING WAS SENT|was not sent|nothing was sent/i)
-  assert.match(notice, /will be refused when IMS tries to post it/)
+  assert.match(notice, /IMS will refuse the sales invoice queued for it when that invoice comes up for posting/)
   // The only instruction in the reason is conditional and names the check first.
   const instructions = reason.split(/(?<=[.!?])\s+/).filter((s) => /\braise\b/i.test(s))
   assert.equal(instructions.length, 1)
@@ -161,4 +162,8 @@ test('operator text is single-sourced, conditional, and states nothing the evide
     assert.doesNotMatch(text, /\b(reverse|void|re-?post|delete)\b/i, 'no destructive money instruction')
   }
   assert.match(storeCreditCreditNotePosterError(), /check the ledger first, then raise/)
+  // Both hand-post instructions carry the repo's ledger-check preamble in front, by construction.
+  for (const text of [reason, storeCreditCreditNotePosterError()]) {
+    assert.ok(text.includes(LEDGER_CHECK_PREAMBLE), 'the ledger-check preamble is in front of the hand-post instruction')
+  }
 })

@@ -18,6 +18,7 @@
  * all use `storeCreditInvoiceRefusalReason`, so the text cannot drift between them.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
 /** ActivityLog action written by the importer when it queues the invoice for a store-credit order. */
@@ -43,12 +44,13 @@ export function orderCarriesStoreCredit(storeCreditForeign: unknown): boolean {
  * a ledger fact: whether anything was sent is stated by the caller, who knows its stage.
  */
 export function storeCreditInvoiceRefusalReason(): string {
-  return 'This order was paid in part with store credit. IMS records store credit as a PAYMENT, not a discount, '
+  // Wrapped in the ledger check like every other operator text that tells someone to raise a document by hand.
+  return withLedgerCheck('This order was paid in part with store credit. IMS records store credit as a PAYMENT, not a discount, '
     + 'so the sales invoice would be stated at the full goods value and the credit would have to be applied to '
     + 'it as a payment against the store-credit liability account (813 or 816). That posting is not built yet, '
     + 'so IMS does not post a sales invoice, or register a payment, for an order that carries store credit. '
     + 'If this order must be invoiced now, first check the ledger for an invoice already raised for it, then '
-    + 'raise it by hand with the credit applied as a payment.'
+    + 'raise it by hand with the credit applied as a payment.')
 }
 
 /** The poster's error: the refusal happens before any request is built, so "nothing was sent" is true. */
@@ -62,15 +64,15 @@ export function storeCreditInvoicePosterError(): string {
  * withholding only; "nothing was sent" holds because the refusal is taken before any request is built.
  */
 export function storeCreditCreditNotePosterError(): string {
-  return 'NOTHING WAS SENT. This refund belongs to an order paid in part with store credit. IMS does not '
+  return withLedgerCheck('NOTHING WAS SENT. This refund belongs to an order paid in part with store credit. IMS does not '
     + 'post a sales invoice for such an order yet (store credit is a payment that has to be applied to the '
     + 'invoice against the 813 or 816 liability account, and that posting is not built), so it does not post '
     + 'a credit note for it either. If the order was invoiced by hand, check the ledger first, then raise '
-    + 'the matching credit note by hand.'
+    + 'the matching credit note by hand.')
 }
 
 /** The importer's entry, written when the invoice is queued: it says what WILL happen, not what has. */
 export function storeCreditInvoiceQueuedNotice(orderNumber: string, creditText: string): string {
   return `WooCommerce order ${orderNumber} carries ${creditText} of store credit. `
-    + `The sales invoice queued for it will be refused when IMS tries to post it. ${storeCreditInvoiceRefusalReason()}`
+    + `IMS will refuse the sales invoice queued for it when that invoice comes up for posting. ${storeCreditInvoiceRefusalReason()}`
 }
