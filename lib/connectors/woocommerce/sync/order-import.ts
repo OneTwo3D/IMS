@@ -2008,7 +2008,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // STORE CREDIT IS A PAYMENT, NOT A DISCOUNT. Smart Coupons store credit reaches `coupon_lines[]`
     // like any coupon but Woo takes it off `order.total` WITHOUT reducing a line, so summing every
     // coupon (as this used to) made the whole credit the "unallocated residual" and stored it as an
-    // order-level discount: Mintsoft was then pushed a reduced goods value and the invoice understated
+    // order-level discount: the warehouse was then pushed a reduced goods value and the invoice understated
     // revenue and VAT. Each coupon is classified from the type Woo recorded on the order item (never by
     // loading the coupon, which Smart Coupons consumes); credit is kept apart in `storeCreditForeign`,
     // and a coupon of unknown type that left money off the lines REFUSES the order instead of being

@@ -6,7 +6,7 @@
  * product coupon, because Woo has already taken the money OFF the line totals. It is wrong for Smart
  * Coupons STORE CREDIT (`discount_type = smart_coupon`): Woo subtracts it from `order.total` WITHOUT
  * reducing any line, so it is a means of payment that settles part of a full-value invoice. Folding it
- * into the discount understates the goods value (what Mintsoft sees for picking, customs and IOSS) and
+ * into the discount understates the goods value (what the warehouse sees for picking, customs and IOSS) and
  * the revenue and VAT of the invoice.
  *
  * WHAT THE TYPE IS READ FROM, and why not from the coupon. Smart Coupons CONSUMES a store-credit
@@ -17,7 +17,7 @@
  *   - `coupon_data`  (legacy): an object carrying `discount_type`;
  *   - the ORDER meta `smart_coupons_contribution`: a `{coupon_code: amount}` map that Smart Coupons
  *     writes whenever a store-credit coupon is applied. This is the signal the production
- *     woo-mintsoft sync plugin identifies store credit by (it never reads `discount_type`), so it is
+ *     legacy WooCommerce-to-warehouse sync plugin identifies store credit by (it never reads `discount_type`), so it is
  *     honoured too, and a disagreement between the two is a conflict rather than a guess.
  *
  * AN UNRECOGNISED OR ABSENT TYPE IS NEVER GUESSED. It is classified UNKNOWN. UNKNOWN money that Woo
@@ -215,7 +215,7 @@ export type WcCouponPlanRefusal =
 /**
  * Operator-facing sentence for a refused order, single-sourced here so the activity log, the returned
  * import error and the docs cannot drift. It states only what is true at this point: the import was
- * stopped BEFORE any order row was written, so nothing exists in IMS, Mintsoft or the ledger for it.
+ * stopped BEFORE any order row was written, so nothing exists in IMS, the warehouse or the ledger for it.
  */
 export function describeWcCouponRefusal(orderNumber: string, refusal: WcCouponPlanRefusal): string {
   const lead = `WooCommerce order ${orderNumber} was NOT imported: `
