@@ -67,7 +67,7 @@ ALTER TABLE "accounting_operator_ledger_checks"
   ADD CONSTRAINT "accounting_operator_ledger_checks_basis_is_assertion"
   CHECK ("basis" = 'OPERATOR_ASSERTION');
 
--- INSERT-ONLY. Every UPDATE and DELETE is refused, row by row, whoever issues it. A check is evidence of
+-- INSERT-ONLY. Every UPDATE, DELETE and TRUNCATE is refused, whoever issues it. A check is evidence of
 -- what a named person asserted at a named time; letting it be edited would let a later hand widen what
 -- an earlier one said (add a record id, move it to another generation), which is exactly the
 -- stretching the rule exists to prevent. A wrong check is answered by NOT relying on it — any reconnect
@@ -87,4 +87,26 @@ DROP TRIGGER IF EXISTS accounting_operator_ledger_checks_insert_only ON "account
 CREATE TRIGGER accounting_operator_ledger_checks_insert_only
 BEFORE UPDATE OR DELETE ON "accounting_operator_ledger_checks"
 FOR EACH ROW
+EXECUTE FUNCTION accounting_operator_ledger_checks_insert_only();
+
+-- TRUNCATE fires no ROW trigger, so a role allowed to TRUNCATE would otherwise erase every check in one
+-- statement. A STATEMENT-level BEFORE TRUNCATE trigger closes that, with the same function (it raises
+-- before returning, so the missing NEW/OLD of a statement trigger is never reached).
+--
+-- No REVOKE: this repository has no other insert-only table and no migration that manages privileges
+-- (none REVOKEs or GRANTs; the application role is created by scripts/install.sh, not by a migration), so
+-- there is no convention to mirror and no role name a migration could name portably. The trigger binds
+-- every role that can write the table.
+--
+-- THE LIMIT, STATED. Nothing in-database binds the table's OWNER or a SUPERUSER absolutely: either can
+-- `ALTER TABLE ... DISABLE TRIGGER`, and a superuser can `SET session_replication_role = replica`, under
+-- which ordinary triggers do not fire, or DROP the table. Those are deliberate administrative acts outside
+-- what the application can do; the trigger protects the record against the application, repair scripts
+-- and ordinary writers, which is the threat the rule needs (a check that can be widened or erased by
+-- accident is the stretching the rule exists to prevent).
+DROP TRIGGER IF EXISTS accounting_operator_ledger_checks_no_truncate ON "accounting_operator_ledger_checks";
+
+CREATE TRIGGER accounting_operator_ledger_checks_no_truncate
+BEFORE TRUNCATE ON "accounting_operator_ledger_checks"
+FOR EACH STATEMENT
 EXECUTE FUNCTION accounting_operator_ledger_checks_insert_only();

@@ -226,6 +226,17 @@ export type RecordOperatorLedgerCheckInput = {
   paymentId: string
   /** The record ids the operator was shown and says they opened. Must equal the ledger's set NOW. */
   recordIds: readonly string[]
+  /**
+   * EVERYTHING ELSE THE OPERATOR WAS SHOWN AND CONFIRMED, echoed back from the preview: the Xero
+   * organisation and connection generation that served it, the document, and the attempt description
+   * they compared against. Each must equal the fresh read, or nothing is recorded — a check is bound to
+   * the connection the operator looked under, never to whichever one is bound when they press the button
+   * (identical record ids after a reconnect are not the same records looked at under the same consent).
+   */
+  expectedTenantId: string
+  expectedConnectionGeneration: string
+  expectedLedgerDocumentId: string
+  expectedAttemptLabel: string
   note?: string | null
   userId: string
 }
@@ -281,6 +292,21 @@ export async function recordOperatorLedgerCheck(
       error: `The ledger now shows ${assessed.records.length === 1 ? 'a different unreadable settlement' : 'a different set of unreadable settlements'} `
         + `for this document (${assessed.records.map((record) => record.id).join(', ')}) from the ones this check names. `
         + 'Nothing was recorded. Reopen the check and look at every settlement it now lists; it can be submitted again once you have.',
+    }
+  }
+  // ...and the connection, document and attempt the operator confirmed are the ones read now. Any
+  // difference — a Xero reconnect between preview and submit above all — refuses with nothing inserted.
+  const shownMatches = typeof input.expectedTenantId === 'string' && input.expectedTenantId === assessed.binding.tenantId
+    && typeof input.expectedConnectionGeneration === 'string' && input.expectedConnectionGeneration === assessed.binding.connectionGeneration
+    && typeof input.expectedLedgerDocumentId === 'string' && input.expectedLedgerDocumentId === assessed.ledgerDocumentId
+    && typeof input.expectedAttemptLabel === 'string' && input.expectedAttemptLabel === assessed.attemptLabel
+  if (!shownMatches) {
+    return {
+      ok: false,
+      code: 'LEDGER_CHANGED',
+      error: 'What this check was confirmed against has changed since the dialog was opened (the Xero connection, the '
+        + 'document or the earlier attempt it describes). Nothing was recorded. Reopen the check and look at every '
+        + 'settlement it now lists; it can be submitted again once you have.',
     }
   }
   const note = typeof input.note === 'string' && input.note.trim() !== '' ? input.note.trim().slice(0, NOTE_LIMIT) : null

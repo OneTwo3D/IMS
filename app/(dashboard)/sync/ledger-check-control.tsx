@@ -81,6 +81,11 @@ function LedgerCheckDialog({ syncLogId, onRecorded, onClose }: { syncLogId: stri
       syncLogId,
       paymentId,
       recordIds: preview.records.map((record) => record.id),
+      // Everything else the operator is confirming: the server refuses if any of it moved.
+      expectedTenantId: preview.binding.tenantId,
+      expectedConnectionGeneration: preview.binding.connectionGeneration,
+      expectedLedgerDocumentId: preview.ledgerDocumentId,
+      expectedAttemptLabel: preview.attemptLabel,
       note: note.trim() || null,
       confirmed,
     })

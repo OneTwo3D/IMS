@@ -1284,7 +1284,7 @@ What a check does **not** do, by design:
 | An unreadable payment carries **no id**, or IMS cannot tell which Xero connection answered | No check can be recorded; the warning says which |
 | The unreadable payment belongs to **another receipt that already posted** on the same invoice | No check can help, and the warning says so: IMS's last check before sending refuses a second payment beside one it has already posted on the same invoice (a known limit for part payments) |
 
-Checks are kept permanently and cannot be edited or deleted. Each one records the entry, the receipt,
+Checks are kept permanently and cannot be edited, deleted or truncated. Each one records the entry, the receipt,
 the Xero payment ids, the Xero organisation and connection it was made under, who made it and when.
 #### Retrying is not protected by idempotency — check Xero first
 

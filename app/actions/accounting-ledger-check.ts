@@ -61,6 +61,11 @@ export async function recordLedgerCheck(input: {
   syncLogId: string
   paymentId: string
   recordIds: string[]
+  /** Echoed from the preview: the connection, document and attempt description the operator confirmed. */
+  expectedTenantId: string
+  expectedConnectionGeneration: string
+  expectedLedgerDocumentId: string
+  expectedAttemptLabel: string
   note?: string | null
   /** The operator ticked the statement of what they checked. Required. */
   confirmed: boolean
@@ -78,6 +83,10 @@ export async function recordLedgerCheck(input: {
       syncLogId: String(input.syncLogId ?? ''),
       paymentId: String(input.paymentId ?? ''),
       recordIds: Array.isArray(input.recordIds) ? input.recordIds.map(String) : [],
+      expectedTenantId: String(input.expectedTenantId ?? ''),
+      expectedConnectionGeneration: String(input.expectedConnectionGeneration ?? ''),
+      expectedLedgerDocumentId: String(input.expectedLedgerDocumentId ?? ''),
+      expectedAttemptLabel: String(input.expectedAttemptLabel ?? ''),
       note: typeof input.note === 'string' ? input.note : null,
       userId: session.user.id,
     }, { client: db, probe: probeLedgerSettlement })

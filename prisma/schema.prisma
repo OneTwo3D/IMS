@@ -3121,7 +3121,7 @@ model AccountingPostingRefusal {
 /// the rule in lib/domain/accounting/operator-ledger-check.ts (same attempt, same receipt, same
 /// document, every unmeasurable record id named, same Xero organisation AND connection generation).
 ///
-/// INSERT-ONLY. A database trigger refuses every UPDATE and DELETE, so a later check never rewrites an
+/// INSERT-ONLY. Database triggers refuse every UPDATE, DELETE and TRUNCATE, so a later check never rewrites an
 /// earlier one and the record of who asserted what survives. It is an OPERATOR ASSERTION (`basis`, held
 /// to that one value by a CHECK constraint): it never changes the attempt row or its ledger standing.
 ///

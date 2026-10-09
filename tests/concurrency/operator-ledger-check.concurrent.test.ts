@@ -197,6 +197,22 @@ async function lastWarning(d: Deps, orderId: string, action: string): Promise<st
 
 const recordDeps = (d: Deps) => ({ client: d.db, probe: d.probeLedgerSettlement })
 
+/**
+ * Record a check the way the dialog does: preview first, then submit the record ids AND everything else the
+ * preview showed (connection, document, attempt description). A refused preview submits blanks, which the
+ * recorder refuses before anything is compared.
+ */
+async function recordShown(d: Deps, input: { syncLogId: string; paymentId: string; recordIds: string[]; userId: string }) {
+  const preview = await d.previewOperatorLedgerCheck(input.syncLogId, recordDeps(d))
+  return d.recordOperatorLedgerCheck({
+    ...input,
+    expectedTenantId: preview.ok ? preview.binding.tenantId : '',
+    expectedConnectionGeneration: preview.ok ? preview.binding.connectionGeneration : '',
+    expectedLedgerDocumentId: preview.ok ? preview.ledgerDocumentId : '',
+    expectedAttemptLabel: preview.ok ? preview.attemptLabel : '',
+  }, recordDeps(d))
+}
+
 test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
   const d = await deps()
   const current = await d.db.$queryRaw<Array<{ db: string }>>`SELECT current_database() AS db`
@@ -225,7 +241,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     assert.match(refusal ?? '', /WHAT LIFTS THIS HOLD: open payment PAY-H-/, 'and the warning names what lifts it')
     assert.ok((refusal ?? '').includes(o.failedId) && (refusal ?? '').includes(receipt), 'naming the entry and the receipt')
 
-    const recorded = await d.recordOperatorLedgerCheck({ syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId }, recordDeps(d))
+    const recorded = await recordShown(d, {syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId})
     console.log(`[precondition] recorder: ${JSON.stringify(recorded)}`)
     assert.equal(recorded.ok, true)
     const row = await d.db.accountingOperatorLedgerCheck.findUnique({ where: { id: recorded.ok ? recorded.checkId : '' } })
@@ -268,13 +284,13 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     orders.push(o.orderId)
     const receipt = await addReceipt(d, o.orderId, 60)
     await setGeneration(d, 'gen-1')
-    const first = await d.recordOperatorLedgerCheck({ syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId }, recordDeps(d))
+    const first = await recordShown(d, {syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId})
     assert.equal(first.ok, true, 'precondition: a check recorded under gen-1')
     await setGeneration(d, 'gen-2')
     await register(d, o.orderId, receipt, 60)
     console.log(`[precondition] after reconnect: queued=${await queuedFor(d, o.orderId, receipt)}`)
     assert.equal(await queuedFor(d, o.orderId, receipt), false, 'the gen-1 check does not apply under gen-2')
-    const again = await d.recordOperatorLedgerCheck({ syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId }, recordDeps(d))
+    const again = await recordShown(d, {syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId})
     assert.equal(again.ok && again.binding.connectionGeneration, `${RUN_ID}-gen-2`)
     await register(d, o.orderId, receipt, 60)
     assert.equal(await queuedFor(d, o.orderId, receipt), true, 'a check under the serving generation lifts it')
@@ -292,13 +308,13 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     const second = { PaymentID: `PAY-X-${o.orderId}`, Date: '2026-08-05', Amount: 7.0001 }
     ledger.set(o.invoiceId, [...(ledger.get(o.invoiceId) ?? []), second])
     const before = await d.db.accountingOperatorLedgerCheck.count({ where: { syncLogId: o.failedId } })
-    const stale = await d.recordOperatorLedgerCheck({ syncLogId: o.failedId, paymentId: receipt, recordIds: preview.ok ? preview.records.map((r) => r.id) : [], userId }, recordDeps(d))
+    const stale = await recordShown(d, {syncLogId: o.failedId, paymentId: receipt, recordIds: preview.ok ? preview.records.map((r) => r.id) : [], userId})
     assert.equal(stale.ok, false)
     assert.equal(!stale.ok && stale.code, 'LEDGER_CHANGED')
     assert.equal(await d.db.accountingOperatorLedgerCheck.count({ where: { syncLogId: o.failedId } }), before, 'and nothing was inserted')
 
     // Now record against both, then a THIRD lands before the registration runs.
-    const both = await d.recordOperatorLedgerCheck({ syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId, `PAY-X-${o.orderId}`], userId }, recordDeps(d))
+    const both = await recordShown(d, { syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId, `PAY-X-${o.orderId}`], userId })
     assert.equal(both.ok, true, 'precondition: a check covering the two current records')
     ledger.set(o.invoiceId, [...(ledger.get(o.invoiceId) ?? []), { PaymentID: `PAY-Y-${o.orderId}`, Date: '2026-08-06', Amount: 1.0001 }])
     await register(d, o.orderId, receipt, 60)
@@ -314,7 +330,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
       const a = await addReceipt(d, o.orderId, 120)
       const b = await addReceipt(d, o.orderId, 120)
       for (const receipt of [a, b]) {
-        const r = await d.recordOperatorLedgerCheck({ syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId }, recordDeps(d))
+        const r = await recordShown(d, {syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId})
         assert.equal(r.ok, true, 'precondition: each receipt has its own valid check')
       }
       await Promise.all([register(d, o.orderId, a, 120), register(d, o.orderId, b, 120)])
@@ -333,10 +349,10 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     orders.push(other.orderId)
     const receipt = await addReceipt(d, o.orderId, 60)
     const foreign = await addReceipt(d, other.orderId, 60)
-    const synced = await d.recordOperatorLedgerCheck({ syncLogId: o.syncedId ?? '', paymentId: receipt, recordIds: [o.unreadableId], userId }, recordDeps(d))
+    const synced = await recordShown(d, {syncLogId: o.syncedId ?? '', paymentId: receipt, recordIds: [o.unreadableId], userId})
     console.log(`[precondition] SYNCED row: ${JSON.stringify(synced)}`)
     assert.equal(!synced.ok && synced.code, 'NOT_UNRESOLVED', 'a SYNCED row\'s unreadable payment is its OWN: no check may be recorded against it')
-    const wrongOrder = await d.recordOperatorLedgerCheck({ syncLogId: other.failedId, paymentId: receipt, recordIds: [other.unreadableId], userId }, recordDeps(d))
+    const wrongOrder = await recordShown(d, {syncLogId: other.failedId, paymentId: receipt, recordIds: [other.unreadableId], userId})
     assert.equal(!wrongOrder.ok && wrongOrder.code, 'RECEIPT_INVALID')
     void foreign
     assert.ok(fetches > 0, `the probe was really asked (${fetches} fetches this run)`)
@@ -348,7 +364,7 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     const receipt = await addReceipt(d, o.orderId, 60)
     await register(d, o.orderId, receipt, 60)
     assert.equal(await queuedFor(d, o.orderId, receipt), false, 'precondition: the receipt is held')
-    const refused = await d.recordOperatorLedgerCheck({ syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId }, recordDeps(d))
+    const refused = await recordShown(d, {syncLogId: o.failedId, paymentId: receipt, recordIds: [o.unreadableId], userId})
     console.log(`[precondition] recorder on the headline shape: ${JSON.stringify(refused)}`)
     assert.equal(!refused.ok && refused.code, 'NOT_LIFTABLE')
     assert.match(!refused.ok ? refused.error : '', new RegExp(`entry ${o.syncedId} already posted a payment against this invoice`))
@@ -362,5 +378,58 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     await register(d, o.orderId, receipt, 60)
     assert.equal(await queuedFor(d, o.orderId, receipt), false)
     assert.match(await lastWarning(d, o.orderId, 'invoice_payment_not_registered') ?? '', /cannot get this receipt sent/)
+  })
+
+  await t.test('8. the operator confirmed under ONE connection: a reconnect (or any other change to what was shown) between preview and submit refuses, even with identical record ids', async () => {
+    const o = await seedOrder(d, 'confirmed')
+    orders.push(o.orderId)
+    const receipt = await addReceipt(d, o.orderId, 60)
+    await setGeneration(d, 'gen-1')
+    const preview = await d.previewOperatorLedgerCheck(o.failedId, recordDeps(d))
+    assert.equal(preview.ok, true, 'precondition: a preview under gen-1')
+    if (!preview.ok) return
+    const shown = {
+      expectedTenantId: preview.binding.tenantId,
+      expectedConnectionGeneration: preview.binding.connectionGeneration,
+      expectedLedgerDocumentId: preview.ledgerDocumentId,
+      expectedAttemptLabel: preview.attemptLabel,
+    }
+    console.log(`[precondition] preview binding ${JSON.stringify(preview.binding)} records ${preview.records.map((r) => r.id).join(',')}`)
+    const before = await d.db.accountingOperatorLedgerCheck.count({ where: { syncLogId: o.failedId } })
+    // Xero is reconnected between the preview and the submit. The ledger still shows the SAME record ids.
+    await setGeneration(d, 'gen-2')
+    const input = { syncLogId: o.failedId, paymentId: receipt, recordIds: preview.records.map((r) => r.id), userId }
+    const reconnected = await d.recordOperatorLedgerCheck({ ...input, ...shown } as never, recordDeps(d))
+    console.log(`[precondition] submit after reconnect: ${JSON.stringify(reconnected)}`)
+    assert.equal(reconnected.ok, false, 'the operator never confirmed anything under gen-2')
+    assert.equal(!reconnected.ok && reconnected.code, 'LEDGER_CHANGED')
+    assert.equal(await d.db.accountingOperatorLedgerCheck.count({ where: { syncLogId: o.failedId } }), before, 'nothing was inserted')
+    // Every other field the confirmation text implies is bound the same way.
+    await setGeneration(d, 'gen-1')
+    for (const [label, tamper] of [
+      ['tenant', { expectedTenantId: 'tenant-other' }],
+      ['document', { expectedLedgerDocumentId: 'INV-other' }],
+      ['attempt description', { expectedAttemptLabel: 'the FAILED attempt x (GBP 1.00)' }],
+      ['nothing echoed', { expectedTenantId: undefined, expectedConnectionGeneration: undefined, expectedLedgerDocumentId: undefined, expectedAttemptLabel: undefined }],
+    ] as const) {
+      const r = await d.recordOperatorLedgerCheck({ ...input, ...shown, ...tamper } as never, recordDeps(d))
+      assert.equal(!r.ok && r.code, 'LEDGER_CHANGED', `${label} differing from what was shown refuses`)
+    }
+    assert.equal(await d.db.accountingOperatorLedgerCheck.count({ where: { syncLogId: o.failedId } }), before, 'still nothing inserted')
+    const same = await d.recordOperatorLedgerCheck({ ...input, ...shown } as never, recordDeps(d))
+    assert.equal(same.ok, true, 'and the unchanged submission under the connection it was shown is accepted')
+  })
+
+  await t.test('9. TRUNCATE cannot erase the checks', async () => {
+    const o = await seedOrder(d, 'truncate')
+    orders.push(o.orderId)
+    await d.db.accountingOperatorLedgerCheck.create({
+      data: { syncLogId: o.failedId, paymentId: 'p', connector: 'xero', ledgerDocumentId: o.invoiceId, ledgerRecordIds: ['R1'], tenantId: TENANT, connectionGeneration: 'g', checkedByUserId: userId },
+    })
+    const before = await d.db.accountingOperatorLedgerCheck.count()
+    console.log(`[precondition] ${before} check rows before TRUNCATE`)
+    assert.ok(before > 0)
+    await assert.rejects(d.db.$executeRawUnsafe('TRUNCATE accounting_operator_ledger_checks'), /insert-only: TRUNCATE refused/)
+    assert.equal(await d.db.accountingOperatorLedgerCheck.count(), before, 'every row survives')
   })
 })
