@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { buildPushPayload } from '../lib/connectors/mintsoft/api/order-push.ts'
 import { buildPushInput, payloadTotalMismatchPence } from '../lib/domain/wms/order-push-sweep.ts'
 import {
   PUSH_TOTAL_MISMATCH_OPERATOR_NOTE,
@@ -8,6 +9,7 @@ import {
   withheldGoodsGross,
   withheldLineCount,
   MAX_ROUNDING_BOUND_MINOR_UNITS,
+  PAYLOAD_TOTALS_DECIMALS,
   type PushTotalsVerdict,
 } from '../lib/domain/wms/push-total-guard.ts'
 import { formatMismatchAmount, MAX_ADVISORY_PENCE } from '../lib/domain/wms/push-total-mismatch-note.ts'
@@ -67,18 +69,31 @@ const FIXTURES: Fixture[] = [
   { name: 'one line, 1p gap: inside the 1.5p bound', lines: [L('a', 1, 10, 2)], taxForeign: 2, totalForeign: 12.01, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 1 },
   { name: 'JPY (0dp): 1 yen gap on one line is inside 1.5, 2 yen is not', currency: 'JPY', lines: [L('a', 1, 1000, 100)], taxForeign: 100, totalForeign: 1101, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 1 },
   { name: 'JPY (0dp): 2 yen gap', currency: 'JPY', lines: [L('a', 1, 1000, 100)], taxForeign: 100, totalForeign: 1102, expectStatus: 'MISMATCH', expectDriftMinor: 2, expectCause: 'UNEXPLAINED' },
+  // KWD (3dp). The payload transmits VAT/shipping/discount rounded to 2dp, so VAT 0.004 goes out as 0.00.
+  // Goods net 1.000 + transmitted VAT 0.00 = 1.000 against an order total of 1.004: 4 fils out, bound
+  // (1 line net + VAT total + order total = 3 amounts) / 2 = 1.5 fils => MISMATCH.
+  { name: 'KWD (3dp): VAT 0.004 is transmitted as 0.00, so the figures sent fall 4 fils short', currency: 'KWD', lines: [L('a', 1, 1.0, 0.004)], taxForeign: 0.004, totalForeign: 1.004, expectStatus: 'MISMATCH', expectDriftMinor: 4, expectCause: 'UNEXPLAINED' },
+  // KWD where the transmitted figures agree: VAT 0.100 transmits exactly; 1.000 + 0.10 = 1.100 = order total.
+  { name: 'KWD (3dp): VAT 0.100 transmits exactly and reconciles', currency: 'KWD', lines: [L('a', 1, 1.0, 0.1)], taxForeign: 0.1, totalForeign: 1.1, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
+  // JPY (0dp): 2dp transmission is harmless for whole-yen amounts: 1000 + 100 = 1100.
+  { name: 'JPY (0dp): whole-yen VAT transmits exactly and reconciles', currency: 'JPY', lines: [L('a', 1, 1000, 100)], taxForeign: 100, totalForeign: 1100, expectStatus: 'RECONCILED', expectDriftMinor: 0 },
+  // JPY with a fractional shipping figure the connector would transmit as 0.50: 1000 + 0.50 + 100 = 1100.50
+  // against 1101: 0.50 yen => driftMinor rounds to 1 (HALF_UP), inside the 2.5 bound => WITHIN_ROUNDING.
+  { name: 'JPY (0dp): fractional shipping 0.5 sent as 0.50, half a yen short', currency: 'JPY', lines: [L('a', 1, 1000, 100)], shippingForeign: 0.5, taxForeign: 100, totalForeign: 1101, expectStatus: 'WITHIN_ROUNDING', expectDriftMinor: 1 },
 ]
 
 /**
  * An INDEPENDENT oracle: integer ten-thousandths, no Decimal. If the guard's Decimal arithmetic and this
  * agree on the status for every fixture, the status was not produced by one shared mistake.
  */
-function oracleStatus(f: Fixture, payload: { lines: Array<{ quantity: number; unitPriceExVat: number }>; totalVat: number; shippingExVat: number; discountExVat: number }): PushTotalsVerdict['status'] {
-  const dp = f.currency === 'JPY' ? 0 : 2
-  const scale = 10 ** (dp + 4) // ten-thousandths of a minor unit... as integer
+function oracleStatus(f: Fixture, sent: Record<string, unknown>): PushTotalsVerdict['status'] {
+  // Works from the TRANSMITTED payload (the real connector's output), not from the guard's inputs.
+  const dp = f.currency === 'JPY' ? 0 : f.currency === 'KWD' ? 3 : 2
+  const scale = 10 ** (dp + 4) // integer ten-thousandths of a minor unit
   const toInt = (x: number) => Math.round(x * scale)
-  const goods = payload.lines.reduce((s, l) => s + toInt(l.quantity * l.unitPriceExVat), 0)
-  const pushed = goods + toInt(payload.shippingExVat) - toInt(payload.discountExVat) + toInt(Number(payload.totalVat.toFixed(dp)))
+  const items = sent.OrderItems as Array<{ Quantity: number; UnitPrice: number }>
+  const goods = items.reduce((s, l) => s + toInt(l.Quantity * l.UnitPrice), 0)
+  const pushed = goods + toInt(sent.ShippingTotalExVat as number) - toInt(sent.DiscountTotalExVat as number) + toInt(sent.TotalVat as number)
   const withheld = Object.entries(f.refunded ?? {}).reduce((s, [id, q]) => {
     const line = f.lines.find((x) => x.id === id)!
     return s + Math.round(Math.min(q, line.qty) / line.qty * toInt(line.totalForeign + line.taxForeign))
@@ -132,7 +147,7 @@ for (const f of FIXTURES) {
     if (f.expectVatGap !== undefined) assert.equal(verdict.vatItemisationGap, f.expectVatGap)
     assert.equal(verdict.cause, f.expectCause ?? null)
     // Independent mechanism agrees on the status.
-    assert.equal(oracleStatus(f, input), verdict.status)
+    assert.equal(oracleStatus(f, buildPushPayload(input, { kind: 'name' })), verdict.status)
     // The reason exists exactly when the verdict is a mismatch.
     assert.equal(verdict.reason !== null, verdict.status === 'MISMATCH')
     // What the sweep records: a finding only for a mismatch, and never 0.
@@ -145,7 +160,7 @@ for (const f of FIXTURES) {
 test('census: every fixture ran, and each accepted fixture honours sum(lines)+shipping-discount+VAT == total within its bound', () => {
   console.log(`# census (${ran}/${FIXTURES.length} fixtures):\n# ${census.join('\n# ')}`)
   assert.equal(ran, FIXTURES.length)
-  assert.ok(FIXTURES.length >= 16)
+  assert.ok(FIXTURES.length >= 20)
   const flagged = FIXTURES.filter((f) => f.expectStatus === 'MISMATCH').length
   const accepted = FIXTURES.length - flagged
   console.log(`# precondition: ${accepted} accepted fixtures, ${flagged} flagged fixtures`)
@@ -229,4 +244,15 @@ test('a clamped figure is shown as a lower bound, an exact one is not', () => {
   assert.match(clamped, /^at least /)
   assert.ok(!/^at least /.test(exact))
   assert.ok(formatMismatchAmount(5, 'not a currency', 2).includes('currency unknown'))
+})
+
+test('the guard\'s transmitted-precision constant matches what the real payload builder sends', () => {
+  const input = buildPushInput(runFixture(FIXTURES[0]).order, '301')
+  const sent = buildPushPayload({ ...input, totalVat: 0.004, shippingExVat: 0.004, discountExVat: 0.004 }, { kind: 'name' })
+  console.log(`# precondition: sent TotalVat=${String(sent.TotalVat)} shipping=${String(sent.ShippingTotalExVat)} (constant ${PAYLOAD_TOTALS_DECIMALS}dp)`)
+  assert.equal(PAYLOAD_TOTALS_DECIMALS, 2)
+  assert.equal(sent.TotalVat, 0)
+  assert.equal(sent.ShippingTotalExVat, 0)
+  assert.equal(sent.DiscountTotalExVat, 0)
+  assert.equal(buildPushPayload({ ...input, totalVat: 0.005 }, { kind: 'name' }).TotalVat, 0.01)
 })

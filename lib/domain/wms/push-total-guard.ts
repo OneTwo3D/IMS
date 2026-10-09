@@ -1,4 +1,4 @@
-import { currencyMinorUnits, roundMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
  * Penny-precision guard on the warehouse order PAYLOAD (pure, Decimal arithmetic).
@@ -28,6 +28,9 @@ import { currencyMinorUnits, roundMoney, roundQuantity, toDecimal, type Decimal,
  *
  * The guard is ADVISORY by owner decision (measure first): it never changes or blocks a payload.
  */
+
+/** Decimals the push payload rounds its shipping, discount and VAT totals to, regardless of currency. */
+export const PAYLOAD_TOTALS_DECIMALS = 2
 
 /** The plugin's absolute ceiling on accumulated rounding drift, in minor units (13p for GBP). */
 export const MAX_ROUNDING_BOUND_MINOR_UNITS = 13
@@ -91,7 +94,10 @@ export function reconcilePushTotals(input: PushTotalsInput): PushTotalsVerdict {
   const { currency, payload } = input
   const precision = currencyMinorUnits(currency)
   const unit = toDecimal(10).pow(-precision)
-  const money = (v: DecimalInput) => roundMoney(v, currency)
+  // The warehouse push payload rounds its shipping, discount and VAT totals to TWO decimals whatever the order
+  // currency (as the plugin it mirrors does), so a 3dp VAT of 0.004 is transmitted as 0.00. The guard compares
+  // what is TRANSMITTED, not what the order holds; tests tie this constant to the real payload builder.
+  const money = (v: DecimalInput) => roundQuantity(v, PAYLOAD_TOTALS_DECIMALS)
 
   const goodsNet = sumDecimals(payload.lines.map((l) => toDecimal(l.quantity).mul(toDecimal(l.unitPriceExVat))))
   const goodsVat = sumDecimals(payload.lines.map((l) => toDecimal(l.quantity).mul(toDecimal(l.unitPriceVat))))
