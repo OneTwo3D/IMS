@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
+import { createProductContentDelegate } from './helpers/product-content-delegate.ts'
 
 // o3d-gtk: a product-sync failure must be classified PERMANENT (acknowledge + report) or
 // TRANSIENT (retry). The dangerous mistake is calling a concurrent-create race permanent, which
@@ -173,6 +174,7 @@ const txClient = {
       return row
     },
   },
+  productContent: createProductContentDelegate(),
   productOption: { upsert: async () => ({}) },
   shoppingSyncLog: {
     // `connector` is @default("woocommerce"); production never sets it and the delete below

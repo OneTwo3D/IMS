@@ -158,6 +158,10 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'Owner answer 3: product content is authored in WooCommerce and flows Woo -> IMS -> Mintsoft; the plugin\'s Python product sync is retired at P2.',
   }),
+  row('mintsoft', 'product.content', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
+    obligationTime: 'not-applicable',
+    note: 'Owner answer 3: description, short description and pictures are authored in WooCommerce and flow Woo -> IMS -> Mintsoft (IMS is the hub). Distinct from product.upsert, which is product META. Whether the bridge pushes descriptions today is unverified, so P1 is treated as plugin-owned and IMS shadows. An absolute state push of changed fields, so no obligation time.',
+  }),
   row('mintsoft', 'product.bundle', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
     note: 'As product.upsert.',
