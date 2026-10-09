@@ -53,6 +53,7 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
+import { orderCarriesStoreCredit, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
@@ -5028,13 +5029,14 @@ export async function guardCancelledSalesOrderInvoice(
   let outcome:
     | { kind: 'missing' }
     | { kind: 'cancelled' }
+    | { kind: 'storeCredit' }
     | { kind: 'live'; customerId?: string }
   try {
     outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, referenceId)
       const so = await tx.salesOrder.findUnique({
         where: { id: referenceId },
-        select: { customerId: true, status: true },
+        select: { customerId: true, status: true, storeCreditForeign: true },
       })
       if (!so) return { kind: 'missing' as const }
       if (so.status === 'CANCELLED') {
@@ -5045,6 +5047,11 @@ export async function guardCancelledSalesOrderInvoice(
         await retireSalesInvoiceForCancelledOrder(tx, attempt, referenceId, held)
         return { kind: 'cancelled' as const }
       }
+      // Store credit is a PAYMENT the invoice must be settled by, and that posting is not built: refuse
+      // the document rather than post one that exceeds what the customer was charged. Read from the
+      // order itself, under the same lock, so it covers every producer (import, hold release, manual
+      // re-queue, update) and not just payloads that happen to carry a marker.
+      if (orderCarriesStoreCredit(so.storeCreditForeign)) return { kind: 'storeCredit' as const }
       return { kind: 'live' as const, customerId: so.customerId ?? undefined }
     })
   } catch (error) {
@@ -5055,6 +5062,9 @@ export async function guardCancelledSalesOrderInvoice(
   }
   if (outcome.kind === 'cancelled') {
     return { post: false, result: { success: true, skipped: true } }
+  }
+  if (outcome.kind === 'storeCredit') {
+    return { post: false, result: { success: false, error: storeCreditInvoicePosterError() } }
   }
   return { post: true, customerId: outcome.customerId }
 }

@@ -11,10 +11,12 @@ import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
-  mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
+  mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
+import { checkWcStoreCreditReconciles, describeWcCouponRefusal, planWcOrderCoupons } from './coupon-classification'
+import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, storeCreditInvoiceQueuedNotice } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
 import {
   buildHeldSalesInvoicePayload,
@@ -2002,19 +2004,55 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // NOT in the lines — so it must carry only the residual, normally zero. Storing the coupon in
     // both places made every consumer deduct it twice (o3d-y14): the Xero/QuickBooks builders send
     // the per-line figure as a DiscountRate AND append the order-level figure as a negative line.
-    const orderDiscount = mapWcOrderDiscount(wcOrder.coupon_lines)
+    //
+    // STORE CREDIT IS A PAYMENT, NOT A DISCOUNT. Smart Coupons store credit reaches `coupon_lines[]`
+    // like any coupon but Woo takes it off `order.total` WITHOUT reducing a line, so summing every
+    // coupon (as this used to) made the whole credit the "unallocated residual" and stored it as an
+    // order-level discount: Mintsoft was then pushed a reduced goods value and the invoice understated
+    // revenue and VAT. Each coupon is classified from the type Woo recorded on the order item (never by
+    // loading the coupon, which Smart Coupons consumes); credit is kept apart in `storeCreditForeign`,
+    // and a coupon of unknown type that left money off the lines REFUSES the order instead of being
+    // guessed at. See ./coupon-classification.ts.
     const lineDiscountTotalForeign = mappedLines.reduce(
       (sum, line) => addMoney(sum, toDecimal(line.discountAmount)),
       toDecimal(0),
     )
-    const { orderLevelDiscount: orderLevelDiscountForeign, unallocated: unallocatedCouponForeign } =
-      resolveWcOrderLevelDiscount({
-        couponTotalForeign: orderDiscount.discountAmount,
-        lineDiscountTotalForeign,
-        // o3d-5tf: the allocation tolerance is half a MINOR UNIT of this order's currency, not a
-        // hard-coded half-penny — a WooCommerce store can run a 0- or 3-decimal currency.
-        currency,
+    const couponPlan = planWcOrderCoupons({
+      couponLines: wcOrder.coupon_lines,
+      orderMeta: wcOrder.meta_data,
+      lineDiscountTotalForeign,
+      // o3d-5tf: the allocation tolerance is half a MINOR UNIT of this order's currency, not a
+      // hard-coded half-penny — a WooCommerce store can run a 0- or 3-decimal currency.
+      currency,
+      resolveResidual: ({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }) =>
+        resolveWcOrderLevelDiscount({ couponTotalForeign, lineDiscountTotalForeign: lineTotal, currency: cur }),
+    })
+    const orderDiscount = { discountStr: couponPlan.discountStr, discountAmount: couponPlan.genuineCouponNet.toNumber() }
+    const orderLevelDiscountForeign = couponPlan.orderLevelDiscount
+    const unallocatedCouponForeign = couponPlan.unallocated
+    const storeCreditForeign = couponPlan.storeCreditForeign
+    if (couponPlan.refusal) {
+      const description = describeWcCouponRefusal(String(wcOrder.number), couponPlan.refusal)
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: null,
+        action: 'wc_coupon_import_refused',
+        tag: 'sync',
+        level: 'ERROR',
+        description,
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+          externalOrderNumber: wcOrder.number,
+          refusal: couponPlan.refusal.kind,
+          coupons: couponPlan.refusal.kind === 'CREDIT_NOT_RECONCILED' ? [] : couponPlan.refusal.coupons,
+          genuineCouponNetForeign: couponPlan.genuineCouponNet.toNumber(),
+          lineDiscountTotalForeign: roundDecimalNumber(lineDiscountTotalForeign, 4),
+          unallocatedForeign: unallocatedCouponForeign,
+        },
       })
+      return { success: false, error: description }
+    }
     if (unallocatedCouponForeign > 0) {
       // A coupon shape we do not model. The residual is kept (dropping it would overstate the
       // invoice by money the customer was never charged) but it is worth knowing about, because
@@ -2055,6 +2093,52 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       shippingTaxForeign: wcOrder.shipping_lines.map((line) => line.total_tax),
       orderTotal: wcOrder.total,
     })
+
+    // A store-credit order is only treated as "credit paid for part of a full-value invoice" once the
+    // arithmetic PROVES the credit is not also inside the lines: lines + tax + shipping - genuine
+    // order-level discount - credit must be the total Woo reports. If it is not (Smart Coupons' "apply
+    // before tax" mode reduces the lines too, or the order carries an amount nobody modelled), counting
+    // the credit as a payment would take it off twice, so the order is refused rather than guessed at.
+    if (storeCreditForeign.gt(0)) {
+      const reconciled = checkWcStoreCreditReconciles({
+        subtotalForeign,
+        taxForeign,
+        shippingForeign: toDecimal(shippingForeign),
+        orderLevelDiscountForeign: toDecimal(orderLevelDiscountForeign),
+        storeCreditForeign,
+        orderTotalForeign: totalForeign,
+        currency,
+        componentCount: mappedLines.length + 1,
+      })
+      if (!reconciled.ok) {
+        const refusal = {
+          kind: 'CREDIT_NOT_RECONCILED' as const,
+          reason:
+            `it carries ${storeCreditForeign.toFixed(currencyMinorUnits(currency))} of store credit but its lines, tax and shipping less `
+            + `that credit differ from the order total ${totalForeign.toFixed(currencyMinorUnits(currency))} by `
+            + `${reconciled.difference.toFixed(currencyMinorUnits(currency))}, so the credit is not the only thing between the goods and the total.`,
+        }
+        const description = describeWcCouponRefusal(String(wcOrder.number), refusal)
+        await logActivity({
+          entityType: 'SYNC',
+          entityId: null,
+          action: 'wc_coupon_import_refused',
+          tag: 'sync',
+          level: 'ERROR',
+          description,
+          metadata: {
+            connector: 'woocommerce',
+            externalOrderId: String(wcOrder.id),
+            externalOrderNumber: wcOrder.number,
+            refusal: refusal.kind,
+            storeCreditForeign: storeCreditForeign.toNumber(),
+            differenceForeign: reconciled.difference.toNumber(),
+            toleranceForeign: reconciled.tolerance.toNumber(),
+          },
+        })
+        return { success: false, error: description }
+      }
+    }
 
     // o3d-cyn r2: shipping need not carry the goods' rate, and a document that will not produce
     // Woo's own tax must not be claimed as settled by a payment for the order total.
@@ -2206,6 +2290,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // Coupon CODES are kept for display; the money lives on the lines (o3d-y14).
           discountStr: orderDiscount.discountStr,
           discountAmount: orderLevelDiscountForeign,
+          // Store credit is a PAYMENT: kept out of discountAmount above and recorded here, gross.
+          storeCreditForeign,
           // o3d-9te: say WHICH meaning the amount above carries, in the same write that
           // computes it. Without this the only evidence of import provenance is a
           // timestamp, and this row's `createdAt` is BACKDATED to the Woo order date by
@@ -2398,6 +2484,27 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // NO LONGER GATED ON THE ORDER BEING PAID. An unpaid order's document is just as wrong, it
       // posts just as immediately, and it is paid later — at which point the fault is already in the
       // ledger and nothing was ever logged about it.
+      const hasStoreCredit = storeCreditForeign.gt(0)
+      if (hasStoreCredit) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: STORE_CREDIT_INVOICE_WITHHELD_ACTION,
+          tag: 'accounting',
+          level: 'WARNING',
+          description: storeCreditInvoiceQueuedNotice(
+            String(wcOrder.number),
+            `${currency} ${storeCreditForeign.toFixed(orderMoneyDigits)}`,
+          ),
+          metadata: {
+            connector: 'woocommerce',
+            externalOrderId: String(wcOrder.id),
+            externalOrderNumber: wcOrder.number,
+            storeCreditForeign: storeCreditForeign.toNumber(),
+            storeCreditCodes: couponPlan.storeCreditCodes,
+          },
+        })
+      }
       const unreconciledReason = !documentTotalsToTheOrder
         ? `The tax the accounting document would produce does not match the tax WooCommerce charged on order `
           + `${wcOrder.number}, so the invoice would not total the order's ${wcOrder.total}. `
@@ -2495,8 +2602,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // Carried onto the HELD payload too (development's invoice-number branch below): a document
           // that does not total to the order must not register a payment whether it is queued now or
           // released later.
-          _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder,
-          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: documentTotalsToTheOrder }),
+          //
+          // A store-credit order's document is at the FULL goods value, so it does not total to
+          // `wcOrder.total` either: no payment is registered for it (the invoice is refused anyway; see
+          // lib/domain/accounting/store-credit-invoice-refusal.ts).
+          _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit,
+          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit }),
           // o3d-cyn r3: the stamp that stops this document at the poster. Present ONLY when the
           // document will not total to the order — an ordinary order's payload is byte-for-byte what
           // it was. The row is still queued deliberately: a refusal that leaves a FAILED sync row

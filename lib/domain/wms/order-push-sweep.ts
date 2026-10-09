@@ -342,6 +342,8 @@ type OrderForPush = {
   taxRatePercent: unknown
   pricesIncludeVat: boolean
   discountAmount: unknown
+  /** Store credit, GROSS: a payment, so it is in the order total's gap but never in the pushed discount. */
+  storeCreditForeign?: unknown
   totalForeign: unknown
   lines: CandidateLine[]
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
@@ -370,6 +372,8 @@ export function orderTotalDriftPence(order: {
   taxRatePercent: unknown
   shippingForeign: unknown
   discountAmount: unknown
+  /** Store credit (a payment): the order total is lower than goods + tax + shipping by exactly this. */
+  storeCreditForeign?: unknown
   totalForeign: unknown
   pricesIncludeVat: boolean
 }): number {
@@ -377,6 +381,7 @@ export function orderTotalDriftPence(order: {
   const tax = num(order.taxForeign)
   const shipping = num(order.shippingForeign)
   const discount = num(order.discountAmount)
+  const storeCredit = num(order.storeCreditForeign)
   const total = num(order.totalForeign)
 
   let discountVat = 0
@@ -386,7 +391,7 @@ export function orderTotalDriftPence(order: {
     if (rate > 0) discountVat = (discount * rate) / (1 + rate)
   }
 
-  const computed = subtotal + tax + shipping - discount + discountVat
+  const computed = subtotal + tax + shipping - discount + discountVat - storeCredit
   return Math.round(Math.abs(computed - total) * 100)
 }
 
@@ -479,6 +484,7 @@ const ORDER_PUSH_SELECT = {
   taxRatePercent: true,
   pricesIncludeVat: true,
   discountAmount: true,
+  storeCreditForeign: true,
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
