@@ -218,6 +218,21 @@ export type WmsUpsertProductOptions = {
   omitBarcode?: boolean
 }
 
+/**
+ * A content update for a product the WMS already holds: only the fields that CHANGED, each non-empty.
+ * An empty value is not representable on purpose: content is never erased in a warehouse by an empty source.
+ */
+export type WmsProductContentUpdate = {
+  externalProductId: string
+  sku: string
+  description?: string
+  shortDescription?: string
+  imageUrl?: string
+}
+
+/** `sent: false, held: true` is the outbound-write hold refusing BEFORE the request left IMS: nothing was sent. */
+export type WmsProductContentResult = { sent: true } | { sent: false; held: true; message: string }
+
 export type WmsBundleComponent = {
   externalProductId: string | null
   sku: string
@@ -437,6 +452,8 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   fetchProduct(externalProductId: string): Promise<WmsProductRef | null>
   fetchProductBySku(sku: string): Promise<WmsProductRef | null>
   upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef>
+  /** Update a linked product's content (description, short description, picture). Absent: the WMS takes no content. */
+  updateProductContent?(update: WmsProductContentUpdate): Promise<WmsProductContentResult>
   createAsn(input: WmsAsnInput): Promise<WmsAsnRef>
   fetchAsnById?(externalAsnId: string): Promise<WmsAsnRef | null>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>

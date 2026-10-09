@@ -136,6 +136,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   cancelMintsoftOrder: { family: 'mintsoft-write' },
   addMintsoftOrderComment: { family: 'mintsoft-write' },
   upsertMintsoftProduct: { family: 'mintsoft-write' },
+  updateMintsoftProductContent: { family: 'mintsoft-write' },
   createMintsoftAsn: { family: 'mintsoft-write' },
   createMintsoftBundle: { family: 'mintsoft-write' },
   requestMintsoftAuthSession: { family: 'mintsoft-write' },
@@ -148,6 +149,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   cancelOrder: { family: 'mintsoft-write', memberOnly: true },
   addOrderComment: { family: 'mintsoft-write', memberOnly: true },
   upsertProduct: { family: 'mintsoft-write', memberOnly: true },
+  updateProductContent: { family: 'mintsoft-write', memberOnly: true },
   createAsn: { family: 'mintsoft-write', memberOnly: true },
   createBundle: { family: 'mintsoft-write', memberOnly: true },
   // ---- Operator buttons that re-arm or trigger a write ------------------------------------------------------------
