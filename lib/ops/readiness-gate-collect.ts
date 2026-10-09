@@ -282,8 +282,8 @@ export function assessReconciliationReadiness(readiness: AccountingReconciliatio
     // predates completeness recording, and nothing else is wrong" (a warning). Anything else is a failure
     // even if a blocker was somehow not raised.
     const proof = readiness.proof
-    const onlyNotRecorded = proof.newest === 'not-recorded' && proof.unresolved.length === 0 && !proof.overflow && !proof.notRecordedAfterRecording
-    if (!onlyNotRecorded) failures.push(`reconciliation completeness is not proven (newest run ${proof.newest}; ${proof.unresolved.length} unresolved truncation(s); history overflow: ${proof.overflow})`)
+    const onlyNotRecorded = proof.newest === 'not-recorded' && proof.unresolved.length === 0 && !proof.overflow && !proof.notRecordedAfterRecording && !proof.newestNotCompleted
+    if (!onlyNotRecorded) failures.push(`reconciliation completeness is not proven (newest run ${proof.newest}; ${proof.unresolved.length} unresolved truncation(s); history overflow: ${proof.overflow}; newest run completed: ${!proof.newestNotCompleted})`)
   }
   const detail = {
     latestRunId: readiness.latest?.id ?? null,

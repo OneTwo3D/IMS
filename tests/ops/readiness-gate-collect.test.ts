@@ -158,12 +158,12 @@ test('reconciliation: proven passes; every unproven or unreadable shape fails; "
     ['latest read failed', goodReconciliation({ latest: null, proof: null, blockers: [{ id: 'readiness-adapter:accounting-reconciliation', severity: 'blocker', source: 's', message: 'failed' }] })],
     ['proof not evaluated', goodReconciliation({ proof: null })],
     ['partial run', goodReconciliation({ warnings: [{ id: 'accounting-reconciliation:partial', severity: 'warning', source: 's', message: 'partial' }] })],
-    ['unresolved truncation (blocker raised)', goodReconciliation({ proof: { state: 'not-proven', unresolved: [unresolved], overflow: false, newest: 'complete', notRecordedAfterRecording: false }, blockers: [{ id: 'accounting-reconciliation:truncation-unresolved', severity: 'blocker', source: 's', message: 'x' }] })],
-    ['unresolved truncation (NO blocker raised: the proof alone must stop it)', goodReconciliation({ proof: { state: 'not-proven', unresolved: [unresolved], overflow: false, newest: 'complete', notRecordedAfterRecording: false } })],
-    ['newest run truncated', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'truncated', notRecordedAfterRecording: false } })],
-    ['newest run unreadable', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'unreadable', notRecordedAfterRecording: false } })],
-    ['history overflow', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: true, newest: 'complete', notRecordedAfterRecording: false } })],
-    ['not recorded after recording began', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'not-recorded', notRecordedAfterRecording: true } })],
+    ['unresolved truncation (blocker raised)', goodReconciliation({ proof: { state: 'not-proven', unresolved: [unresolved], overflow: false, newest: 'complete', notRecordedAfterRecording: false, newestNotCompleted: false }, blockers: [{ id: 'accounting-reconciliation:truncation-unresolved', severity: 'blocker', source: 's', message: 'x' }] })],
+    ['unresolved truncation (NO blocker raised: the proof alone must stop it)', goodReconciliation({ proof: { state: 'not-proven', unresolved: [unresolved], overflow: false, newest: 'complete', notRecordedAfterRecording: false, newestNotCompleted: false } })],
+    ['newest run truncated', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'truncated', notRecordedAfterRecording: false, newestNotCompleted: false } })],
+    ['newest run unreadable', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'unreadable', notRecordedAfterRecording: false, newestNotCompleted: false } })],
+    ['history overflow', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: true, newest: 'complete', notRecordedAfterRecording: false, newestNotCompleted: false } })],
+    ['not recorded after recording began', goodReconciliation({ proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'not-recorded', notRecordedAfterRecording: true, newestNotCompleted: false } })],
     ['failed run', goodReconciliation({ blockers: [{ id: 'accounting-reconciliation:failed', severity: 'blocker', source: 's', message: 'failed' }] })],
   ]
   for (const [label, readiness] of cases) assert.equal(assessReconciliationReadiness(readiness).kind, 'fail', label)
@@ -172,7 +172,7 @@ test('reconciliation: proven passes; every unproven or unreadable shape fails; "
 
 test('reconciliation: the newest run predating completeness recording is a WARNING (not a failure) that needs written acceptance', () => {
   const readiness = goodReconciliation({
-    proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'not-recorded', notRecordedAfterRecording: false },
+    proof: { state: 'not-proven', unresolved: [], overflow: false, newest: 'not-recorded', notRecordedAfterRecording: false, newestNotCompleted: false },
     warnings: [{ id: 'accounting-reconciliation:completeness-not-recorded', severity: 'warning', source: 's', message: 'predates recording' }],
   })
   const result = assessReconciliationReadiness(readiness)

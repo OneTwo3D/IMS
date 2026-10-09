@@ -49,8 +49,17 @@ import {
  *   complete                the only positive statement.
  */
 
+/**
+ * The ONLY run status whose record can clear a truncation or prove completeness. A FAILED or PARTIAL run did not finish
+ * the reconciliation, so an empty `truncations` array on it says nothing about what it did not examine; RUNNING and any
+ * status this build does not know are the same. Closed: a status not listed here covers nothing.
+ */
+export const COVERING_RUN_STATUSES: readonly string[] = ['COMPLETED']
+
 export type ReconciliationHistoryRun = {
   id: string
+  /** The run's status as recorded. Only COVERING_RUN_STATUSES may cover. */
+  status: string
   createdAt: string
   fromDate: string | null
   toDate: string | null
@@ -96,6 +105,8 @@ export type ReconciliationProof =
     newest: 'complete' | 'truncated' | 'not-recorded' | 'unreadable'
     /** The newest run is NULL although recording had already begun before it. A blocker. */
     notRecordedAfterRecording: boolean
+    /** The newest run did not COMPLETE (failed, partial, running or unknown): it proves nothing. A blocker. */
+    newestNotCompleted: boolean
   }
 
 type Interval = { from: number; to: number }
@@ -136,7 +147,7 @@ function truncatedCodes(truncations: unknown): string[] | 'unreadable' | 'not-re
 }
 
 export function evaluateReconciliationProof(
-  newest: { id: string; truncations?: unknown },
+  newest: { id: string; status: string; truncations?: unknown },
   history: ReconciliationHistory,
 ): ReconciliationProof {
   const runs = [...history.runs].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id))
@@ -149,7 +160,9 @@ export function evaluateReconciliationProof(
     if (lost.length === 0) return
     const later = read.slice(index + 1)
     for (const code of lost) {
-      const coveringRuns = later.filter(({ codes: laterCodes }) => {
+      const coveringRuns = later.filter(({ run: laterRun, codes: laterCodes }) => {
+        // A run that did not COMPLETE covers nothing, whatever its truncations array says.
+        if (!COVERING_RUN_STATUSES.includes(laterRun.status)) return false
         if (laterCodes === 'not-recorded' || laterCodes === 'unreadable') return false
         return code === EVERY_CHECK ? laterCodes.length === 0 : !laterCodes.includes(code)
       }).map(({ run: laterRun }) => laterRun)
@@ -177,6 +190,7 @@ export function evaluateReconciliationProof(
   }
   const notRecordedAfterRecording = newestState === 'not-recorded' && history.recordedBeforeNewest
 
-  if (unresolved.length === 0 && !history.overflow && newestState === 'complete') return { state: 'proven' }
-  return { state: 'not-proven', unresolved, overflow: history.overflow, newest: newestState, notRecordedAfterRecording }
+  const newestNotCompleted = !COVERING_RUN_STATUSES.includes(newest.status)
+  if (unresolved.length === 0 && !history.overflow && newestState === 'complete' && !newestNotCompleted) return { state: 'proven' }
+  return { state: 'not-proven', unresolved, overflow: history.overflow, newest: newestState, notRecordedAfterRecording, newestNotCompleted }
 }

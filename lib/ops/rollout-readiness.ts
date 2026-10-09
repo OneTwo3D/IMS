@@ -422,7 +422,7 @@ export async function getAccountingReconciliationHistory(
   // JSON null is a non-NULL record that is not an array, i.e. UNREADABLE. `jsonb_typeof` tells them apart,
   // and a JSON null is passed on as a value readReconciliationCompleteness reads as unreadable.
   const rows = await client.$queryRaw<Array<{
-    id: string; createdAt: Date; fromDate: Date | null; toDate: Date | null; truncations: unknown; payloadType: string
+    id: string; status: string; createdAt: Date; fromDate: Date | null; toDate: Date | null; truncations: unknown; payloadType: string
   }>>`
     WITH "oldestUnproven" AS (
       SELECT "createdAt"
@@ -435,7 +435,7 @@ export async function getAccountingReconciliationHistory(
       ORDER BY "createdAt" ASC, "id" ASC
       LIMIT 1
     )
-    SELECT "id", "createdAt", "fromDate", "toDate", "truncations", jsonb_typeof("truncations") AS "payloadType"
+    SELECT "id", "status", "createdAt", "fromDate", "toDate", "truncations", jsonb_typeof("truncations") AS "payloadType"
     FROM "accounting_reconciliation_runs"
     WHERE "status" = ANY(${statuses}::text[])
       AND "truncations" IS NOT NULL
@@ -447,6 +447,7 @@ export async function getAccountingReconciliationHistory(
   return {
     runs: rows.slice(0, RECONCILIATION_HISTORY_READ_LIMIT).map((row) => ({
       id: row.id,
+      status: row.status,
       createdAt: row.createdAt.toISOString(),
       fromDate: row.fromDate?.toISOString() ?? null,
       toDate: row.toDate?.toISOString() ?? null,
@@ -1038,6 +1039,14 @@ export function classifyReconciliationProof(
     }
     ;(proof.notRecordedAfterRecording ? blockers : warnings).push(finding)
   }
+  if (proof.newestNotCompleted) {
+    blockers.push({
+      id: 'accounting-reconciliation:newest-run-not-completed',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message: 'The newest accounting reconciliation run did not complete (it failed, is partial, is still running or has a status this build does not know), so it does not prove the reconciliation complete.',
+    })
+  }
   // The newest run's OWN record says it omitted findings (or cannot be read) and nothing above named it, so say so.
   if ((proof.newest === 'truncated' || proof.newest === 'unreadable') && proof.unresolved.length === 0) {
     blockers.push({
@@ -1051,14 +1060,14 @@ export function classifyReconciliationProof(
   // completeness recording and nothing else is wrong (a warning, above). Every other not-proven state that has not
   // already produced a blocker in this call is itself a blocker, so a state this function does not know how to explain
   // can never read as ready.
-  const onlyNotRecorded = proof.newest === 'not-recorded' && proof.unresolved.length === 0 && !proof.overflow && !proof.notRecordedAfterRecording
+  const onlyNotRecorded = proof.newest === 'not-recorded' && proof.unresolved.length === 0 && !proof.overflow && !proof.notRecordedAfterRecording && !proof.newestNotCompleted
   if (!onlyNotRecorded && blockers.length === blockersBefore) {
     blockers.push({
       id: 'accounting-reconciliation:completeness-unclassified',
       severity: 'blocker',
       source: 'accounting-reconciliation',
       message: 'The accounting reconciliation is not proven complete, for a reason this check does not classify. It is treated as a blocker.',
-      details: { newest: proof.newest, unresolved: proof.unresolved.length, overflow: proof.overflow, notRecordedAfterRecording: proof.notRecordedAfterRecording },
+      details: { newest: proof.newest, unresolved: proof.unresolved.length, overflow: proof.overflow, notRecordedAfterRecording: proof.notRecordedAfterRecording, newestNotCompleted: proof.newestNotCompleted },
     })
   }
 }

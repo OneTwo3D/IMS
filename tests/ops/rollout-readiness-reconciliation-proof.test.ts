@@ -35,9 +35,10 @@ const VOID_MIRROR = 'void_mirror_basis_unknown_contradictions_truncated'
 const UNMIRRORED = 'old_sync_log_without_mirrored_event_truncated'
 const truncation = (code: string) => ({ code, message: `${code} — more exist than were listed`, details: { total: 900 } })
 
-function run(id: string, createdDaysAgo: number, windowDays: number, truncations: unknown): ReconciliationHistoryRun {
+function run(id: string, createdDaysAgo: number, windowDays: number, truncations: unknown, status = 'COMPLETED'): ReconciliationHistoryRun {
   return {
     id,
+    status,
     createdAt: iso(createdDaysAgo),
     fromDate: iso(createdDaysAgo + windowDays),
     toDate: iso(createdDaysAgo),
@@ -136,8 +137,8 @@ test('[o3d-6e4v] coverage composes: two later clean runs that together span the 
   const composed: ReconciliationHistory = {
     runs: [
       truncated,
-      { id: 'a', createdAt: iso(10), fromDate: iso(200), toDate: iso(130), truncations: [] },
-      { id: 'b', createdAt: iso(5), fromDate: iso(140), toDate: iso(60), truncations: [] },
+      { id: 'a', status: 'COMPLETED', createdAt: iso(10), fromDate: iso(200), toDate: iso(130), truncations: [] },
+      { id: 'b', status: 'COMPLETED', createdAt: iso(5), fromDate: iso(140), toDate: iso(60), truncations: [] },
       run('newest', 0, 90, []),
     ],
     overflow: false,
@@ -149,8 +150,8 @@ test('[o3d-6e4v] coverage composes: two later clean runs that together span the 
     ...composed,
     runs: [
       truncated,
-      { id: 'a', createdAt: iso(10), fromDate: iso(200), toDate: iso(130), truncations: [] },
-      { id: 'b', createdAt: iso(5), fromDate: iso(120), toDate: iso(60), truncations: [] }, // 130→120 uncovered
+      { id: 'a', status: 'COMPLETED', createdAt: iso(10), fromDate: iso(200), toDate: iso(130), truncations: [] },
+      { id: 'b', status: 'COMPLETED', createdAt: iso(5), fromDate: iso(120), toDate: iso(60), truncations: [] }, // 130→120 uncovered
       run('newest', 0, 90, []),
     ],
   }
@@ -160,7 +161,7 @@ test('[o3d-6e4v] coverage composes: two later clean runs that together span the 
 test('[o3d-6e4v] an EARLIER clean run covers nothing: coverage must come after the truncation', async () => {
   const history: ReconciliationHistory = {
     runs: [
-      { id: 'before', createdAt: iso(100), fromDate: iso(400), toDate: iso(100), truncations: [] },
+      { id: 'before', status: 'COMPLETED', createdAt: iso(100), fromDate: iso(400), toDate: iso(100), truncations: [] },
       run('old-truncated', 90, 90, [truncation(ROW_CAP)]),
       run('newest', 0, 90, []),
     ],
@@ -176,7 +177,7 @@ test('[o3d-6e4v] per check: a later run that truncated the SAME check does not c
     overflow: false,
     recordedBeforeNewest: true,
   }
-  const sameProof = evaluateReconciliationProof({ id: 'newest', truncations: [truncation(UNMIRRORED)] }, same)
+  const sameProof = evaluateReconciliationProof({ id: 'newest', status: 'COMPLETED', truncations: [truncation(UNMIRRORED)] }, same)
   assert.equal(sameProof.state, 'not-proven')
   assert.deepEqual(sameProof.state === 'not-proven' ? sameProof.unresolved.map((u) => u.runId) : [], ['old', 'newest'])
 
@@ -185,7 +186,7 @@ test('[o3d-6e4v] per check: a later run that truncated the SAME check does not c
     overflow: false,
     recordedBeforeNewest: true,
   }
-  const otherProof = evaluateReconciliationProof({ id: 'newest', truncations: [] }, other)
+  const otherProof = evaluateReconciliationProof({ id: 'newest', status: 'COMPLETED', truncations: [] }, other)
   // 'old' is covered by 'later' (which completed the unmirrored check over a containing window), but
   // 'later' itself truncated the row cap and nothing after it contains ITS window.
   assert.deepEqual(otherProof.state === 'not-proven' ? otherProof.unresolved.map((u) => [u.runId, u.code]) : [], [['later', ROW_CAP]])
@@ -202,13 +203,13 @@ test('[o3d-6e4v] a WHOLE-TABLE check is re-asked by any later recorded run, what
 
 test('[o3d-6e4v] a later run with NO completeness record (NULL) covers nothing', async () => {
   const proof = evaluateReconciliationProof(
-    { id: 'newest', truncations: [] },
+    { id: 'newest', status: 'COMPLETED', truncations: [] },
     { runs: [run('old', 90, 90, [truncation(VOID_MIRROR)]), run('null-run', 5, 400, null), run('newest', 0, 1, [])], overflow: false, recordedBeforeNewest: true },
   )
   // 'newest' is a recorded run after 'old' and covers the whole-table check; the NULL run is not counted.
   assert.equal(proof.state, 'proven')
   const withoutNewest = evaluateReconciliationProof(
-    { id: 'null-run', truncations: null },
+    { id: 'null-run', status: 'COMPLETED', truncations: null },
     { runs: [run('old', 90, 90, [truncation(VOID_MIRROR)]), run('null-run', 5, 400, null)], overflow: false, recordedBeforeNewest: true },
   )
   assert.equal(withoutNewest.state === 'not-proven' && withoutNewest.unresolved.length, 1)
@@ -224,13 +225,13 @@ test('[o3d-6e4v] an UNREADABLE record blocks, under its own finding, until a lat
   assert.equal(status, 'blocked')
   assert.deepEqual(blockers, ['accounting-reconciliation:completeness-unreadable'])
 
-  const coveredOnlyByTruncatedRun = evaluateReconciliationProof({ id: 'n', truncations: [truncation(ROW_CAP)] }, {
+  const coveredOnlyByTruncatedRun = evaluateReconciliationProof({ id: 'n', status: 'COMPLETED', truncations: [truncation(ROW_CAP)] }, {
     runs: [run('bad', 90, 90, 'garbage'), run('n', 0, 400, [truncation(ROW_CAP)])], overflow: false, recordedBeforeNewest: true,
   })
   assert.ok(coveredOnlyByTruncatedRun.state === 'not-proven' && coveredOnlyByTruncatedRun.unresolved.some((u) => u.runId === 'bad'),
     'a run that truncated anything cannot vouch for a run whose record does not say what it lost')
 
-  const covered = evaluateReconciliationProof({ id: 'n', truncations: [] }, {
+  const covered = evaluateReconciliationProof({ id: 'n', status: 'COMPLETED', truncations: [] }, {
     runs: [run('bad', 90, 90, 'garbage'), run('n', 0, 400, [])], overflow: false, recordedBeforeNewest: true,
   })
   assert.equal(covered.state, 'proven')
@@ -412,22 +413,24 @@ test('[o3d-6e4v] every not-proven proof state yields a blocker, except the one c
     for (const unresolvedCount of [0, 1]) {
       for (const overflow of [false, true]) {
         for (const notRecordedAfterRecording of [false, true]) {
-          // 'complete' with nothing unresolved, no overflow is the PROVEN shape; it is not a not-proven state.
-          if (newest === 'complete' && unresolvedCount === 0 && !overflow) continue
+         for (const newestNotCompleted of [false, true]) {
+          // 'complete' with nothing unresolved, no overflow, a COMPLETED newest run is the PROVEN shape.
+          if (newest === 'complete' && unresolvedCount === 0 && !overflow && !newestNotCompleted) continue
           // notRecordedAfterRecording is only meaningful for a not-recorded newest run.
           if (notRecordedAfterRecording && newest !== 'not-recorded') continue
-          const proof = { state: 'not-proven' as const, unresolved: unresolvedCount ? [unresolved] : [], overflow, newest, notRecordedAfterRecording }
+          const proof = { state: 'not-proven' as const, unresolved: unresolvedCount ? [unresolved] : [], overflow, newest, notRecordedAfterRecording, newestNotCompleted }
           const blockers: Parameters<typeof classifyReconciliationProof>[1] = []
           const warnings: Parameters<typeof classifyReconciliationProof>[2] = []
           classifyReconciliationProof(proof, blockers, warnings)
           cases += 1
-          const onlyNotRecorded = newest === 'not-recorded' && unresolvedCount === 0 && !overflow && !notRecordedAfterRecording
+          const onlyNotRecorded = newest === 'not-recorded' && unresolvedCount === 0 && !overflow && !notRecordedAfterRecording && !newestNotCompleted
           if (onlyNotRecorded) {
             warningOnly += 1
             assert.deepEqual([blockers.length, warnings.map((w) => w.id)], [0, ['accounting-reconciliation:completeness-not-recorded']])
           } else {
-            assert.ok(blockers.length > 0, `not-proven ${JSON.stringify({ newest, unresolvedCount, overflow, notRecordedAfterRecording })} must block`)
+            assert.ok(blockers.length > 0, `not-proven ${JSON.stringify({ newest, unresolvedCount, overflow, notRecordedAfterRecording, newestNotCompleted })} must block`)
           }
+         }
         }
       }
     }
@@ -436,11 +439,11 @@ test('[o3d-6e4v] every not-proven proof state yields a blocker, except the one c
   assert.equal(warningOnly, 1)
   // The shape that read as ready before: newest truncated, nothing unresolved (a later run covered it), no other finding.
   const blockers: Parameters<typeof classifyReconciliationProof>[1] = []
-  classifyReconciliationProof({ state: 'not-proven', unresolved: [], overflow: false, newest: 'truncated', notRecordedAfterRecording: false }, blockers, [])
+  classifyReconciliationProof({ state: 'not-proven', unresolved: [], overflow: false, newest: 'truncated', notRecordedAfterRecording: false, newestNotCompleted: false }, blockers, [])
   assert.deepEqual(blockers.map((b) => b.id), ['accounting-reconciliation:newest-run-incomplete'])
   // Isolating arm for the fallback: a state no rule above knows (a future newest-run state) is still a blocker.
   const unknown: Parameters<typeof classifyReconciliationProof>[1] = []
-  classifyReconciliationProof({ state: 'not-proven', unresolved: [], overflow: false, newest: 'something-new' as never, notRecordedAfterRecording: false }, unknown, [])
+  classifyReconciliationProof({ state: 'not-proven', unresolved: [], overflow: false, newest: 'something-new' as never, notRecordedAfterRecording: false, newestNotCompleted: false }, unknown, [])
   assert.deepEqual(unknown.map((b) => b.id), ['accounting-reconciliation:completeness-unclassified'])
   // A proven proof adds nothing.
   const none: Parameters<typeof classifyReconciliationProof>[1] = []
@@ -459,4 +462,57 @@ test('[o3d-6e4v] the endpoint cannot be ready for a not-proven proof whose histo
   const { status, blockers } = await verdict(truncatedNewest, history)
   assert.equal(status, 'blocked')
   assert.deepEqual(blockers, ['accounting-reconciliation:newest-run-incomplete'])
+})
+
+// ---------------------------------------------------------------------------------------------------
+// WHICH RUNS MAY COVER, AND WHICH MAY PROVE: only COMPLETED ones.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-6e4v] only a COMPLETED later run can clear a truncation: failed, partial, running and unknown statuses cover nothing [mutation: status ignored]', () => {
+  // T truncated three months ago over days [180..90]; later rows have empty truncations over a window that CONTAINS it.
+  const truncated = run('T', 90, 90, [truncation(ROW_CAP)])
+  const newest = run('N', 0, 1, []) // clean but covering only yesterday: it does not contain T
+  let cases = 0
+  for (const [status, covers] of [['COMPLETED', true], ['FAILED', false], ['PARTIAL', false], ['RUNNING', false], ['CANCELLED', false], ['completed', false], ['', false], ['SOME_FUTURE_STATUS', false]] as const) {
+    const cover = run('C', 10, 200, [], status)
+    const proof = evaluateReconciliationProof({ id: 'N', status: 'COMPLETED', truncations: [] }, { runs: [truncated, cover, newest], overflow: false, recordedBeforeNewest: true })
+    cases += 1
+    assert.equal(proof.state === 'proven', covers, `a ${JSON.stringify(status)} run with an empty truncations array ${covers ? 'covers' : 'does not cover'} the truncation`)
+    if (!covers) assert.deepEqual(proof.state === 'not-proven' ? proof.unresolved.map((u) => u.runId) : null, ['T'], `${JSON.stringify(status)}: T stays unresolved`)
+  }
+  console.log(`precondition: ${cases} cover statuses examined`)
+  // Composition cannot launder it either: a COMPLETED half plus a FAILED half is not a cover.
+  const half1 = run('H1', 10, 140, [], 'COMPLETED')
+  const half2 = { ...run('H2', 5, 100, [], 'FAILED'), fromDate: iso(100), toDate: iso(60) }
+  const composed = evaluateReconciliationProof({ id: 'N', status: 'COMPLETED', truncations: [] }, { runs: [truncated, half1, half2, newest], overflow: false, recordedBeforeNewest: true })
+  assert.equal(composed.state, 'not-proven')
+})
+
+test('[o3d-6e4v] the exact reported case: a FAILED or PARTIAL later run is the only apparent cover => not proven => the endpoint is blocked', async () => {
+  for (const status of ['FAILED', 'PARTIAL']) {
+    const history: ReconciliationHistory = {
+      runs: [run('T', 90, 90, [truncation(ROW_CAP)]), run('X', 10, 200, [], status), run('N', 0, 1, [])],
+      overflow: false,
+      recordedBeforeNewest: true,
+    }
+    const { status: verdictStatus, blockers } = await verdict(newestRun({ id: 'N', fromDate: iso(1) }), history)
+    assert.equal(verdictStatus, 'blocked', `${status}: not ready`)
+    assert.deepEqual(blockers, ['accounting-reconciliation:truncation-unresolved'], status)
+  }
+})
+
+test('[o3d-6e4v] a newest run that did not COMPLETE never proves completeness, whatever its truncations array says', async () => {
+  const noHistory2: ReconciliationHistory = { runs: [], overflow: false, recordedBeforeNewest: false }
+  const table: Array<[string, 'blocked' | 'ready']> = [['COMPLETED', 'ready'], ['FAILED', 'blocked'], ['PARTIAL', 'blocked']]
+  for (const [status, want] of table) {
+    const { status: got, blockers } = await verdict(newestRun({ status: status as 'COMPLETED' }), noHistory2)
+    assert.equal(got, want, `${status} newest run`)
+    if (want === 'blocked') assert.ok(blockers.includes('accounting-reconciliation:newest-run-not-completed'), `${status}: the proof itself says the newest run did not complete`)
+  }
+  // And directly on the proof, for statuses the reader never returns but the function must not trust.
+  for (const status of ['RUNNING', 'SOMETHING_ELSE', '']) {
+    const proof = evaluateReconciliationProof({ id: 'N', status, truncations: [] }, { runs: [], overflow: false, recordedBeforeNewest: false })
+    assert.equal(proof.state, 'not-proven', JSON.stringify(status))
+    assert.equal(proof.state === 'not-proven' ? proof.newestNotCompleted : null, true)
+  }
 })

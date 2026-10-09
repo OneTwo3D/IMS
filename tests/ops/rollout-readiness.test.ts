@@ -192,6 +192,8 @@ test('rollout readiness reports blockers for active P0 rollout conditions', asyn
     'wms-webhook-queue:dead',
     'accounting-events:failed',
     'accounting-reconciliation:failed',
+    // A FAILED newest run is also refused as proof of completeness (o3d-6e4v): it never counts as a complete run.
+    'accounting-reconciliation:newest-run-not-completed',
   ]
   assert.equal(blockerIds.size, expectedBlockerIds.length)
   for (const expectedId of expectedBlockerIds) {

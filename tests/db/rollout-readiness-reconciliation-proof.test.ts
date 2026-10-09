@@ -70,7 +70,7 @@ test('[o3d-6e4v] DB: a clean newest run over an uncovered earlier truncation rea
     assert.deepEqual(history.runs.map((r) => r.id), ['p6e4v-old', 'p6e4v-new'],
       'the reader starts at the oldest truncated run and leaves NULL rows out')
     assert.equal(history.recordedBeforeNewest, true)
-    return evaluateReconciliationProof({ id: 'p6e4v-new', truncations: [] }, history)
+    return evaluateReconciliationProof({ id: 'p6e4v-new', status: 'COMPLETED', truncations: [] }, history)
   })
   assert.equal(proof.state, 'not-proven')
   assert.deepEqual(proof.state === 'not-proven' ? proof.unresolved.map((u) => u.runId) : [], ['p6e4v-old'])
@@ -81,7 +81,7 @@ test('[o3d-6e4v] DB: a later run whose window contains the truncated one proves 
     await tx.$executeRawUnsafe('DELETE FROM "accounting_reconciliation_runs"')
     await insertRun(tx, 'p6e4v-old', 90, 90, TRUNCATED)
     await insertRun(tx, 'p6e4v-new', 0, 200, '[]')
-    return evaluateReconciliationProof({ id: 'p6e4v-new', truncations: [] }, await getAccountingReconciliationHistory(newest('p6e4v-new', []), tx))
+    return evaluateReconciliationProof({ id: 'p6e4v-new', status: 'COMPLETED', truncations: [] }, await getAccountingReconciliationHistory(newest('p6e4v-new', []), tx))
   })
   assert.deepEqual(proof, { state: 'proven' })
 })
@@ -93,7 +93,7 @@ test('[o3d-6e4v] DB: a JSON payload that is not an array is read as UNREADABLE, 
     await insertRun(tx, 'p6e4v-jsonnull', 20, 90, 'null')
     await insertRun(tx, 'p6e4v-new', 0, 90, '[]')
     const history = await getAccountingReconciliationHistory(newest('p6e4v-new', []), tx)
-    return { ids: history.runs.map((r) => r.id), proof: evaluateReconciliationProof({ id: 'p6e4v-new', truncations: [] }, history) }
+    return { ids: history.runs.map((r) => r.id), proof: evaluateReconciliationProof({ id: 'p6e4v-new', status: 'COMPLETED', truncations: [] }, history) }
   })
   assert.deepEqual(result.ids, ['p6e4v-object', 'p6e4v-jsonnull', 'p6e4v-new'],
     'the object and the JSON null are both non-NULL records, so both are read')
