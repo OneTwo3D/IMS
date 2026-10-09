@@ -18,6 +18,7 @@ import {
   type WmsPushRevalidateLink,
   type WmsPushVerifyLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
+import { currencyMinorUnits } from '../lib/domain/math/decimal.ts'
 import { reconcilePushTotals } from '../lib/domain/wms/push-total-guard.ts'
 import type { WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
@@ -365,8 +366,21 @@ test('create: an order with a NULL currency still ends SYNCED after the warehous
   const order = candidate({ currency: null as unknown as string })
   let pushed = 0
   const { port, upserts } = makePort({ createCandidates: [order] })
-  const r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { pushed += 1; return okPush() } }), 'mintsoft', port, { now: NOW })
-  console.log(`# precondition: pushed=${pushed} created=${r.created} state=${upserts[0]?.create.state}`)
+  const errors: string[] = []
+  const original = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  let r
+  try {
+    r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { pushed += 1; return okPush() } }), 'mintsoft', port, { now: NOW })
+  } finally {
+    console.error = original
+  }
+  console.log(`# precondition: pushed=${pushed} created=${r.created} state=${upserts[0]?.create.state} checkErrors=${errors.length}`)
+  // Isolating arm: currency precision is TOTAL, so the checks actually EVALUATE (nothing needed catching).
+  assert.deepEqual(errors, [])
+  assert.equal(currencyMinorUnits(null), 2)
+  assert.equal(currencyMinorUnits(undefined), 2)
+  assert.equal(currencyMinorUnits(42 as unknown as string), 2)
   assert.equal(pushed, 1)
   assert.equal(r.created, 1)
   assert.equal(upserts[0].create.state, 'SYNCED')
