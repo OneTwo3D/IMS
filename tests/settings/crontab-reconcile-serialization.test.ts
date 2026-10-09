@@ -7030,11 +7030,11 @@ const UNCHECKED_BUT_FAIL_CLOSED: Record<string, string> = {
   'scripts/install.sh:write_cutover_marker» echo "fenced_at=$(date -Iseconds)"': 'marker text; publication is checked, and readers fail closed on a missing field',
   'scripts/install.sh:write_cutover_marker» echo "phase=$(if ${FENCE_ARMED}; then echo stopping; elif ${CUTOVER_ARMING}; then echo arming; else echo none; fi)"': 'marker text; a shell `if` with no external command',
   'scripts/install.sh:write_cutover_marker» echo "reboot_fence=$(${REBOOT_FENCE_INSTALLED} && echo installed || echo absent)"': 'marker text; a shell boolean with no external command',
-  'scripts/install.sh:write_cutover_marker» echo "db_connect_fence=$(${DB_FENCE_UP} && echo held || echo released)"': 'marker text; a shell boolean with no external command',
+  'scripts/install.sh:write_cutover_marker» echo "db_connect_fence=$(db_connect_fence_claim)"': 'marker text; a shell function over shell booleans, no external command',
   'scripts/update.sh:write_fence_marker» echo "fenced_at=$(date -Iseconds)"': 'marker text; publication is checked, and readers fail closed on a missing field',
   'scripts/update.sh:write_fence_marker» echo "phase=$(if $FENCE_ARMED; then echo stopping; elif $CUTOVER_ARMING; then echo arming; else echo none; fi)"': 'marker text; a shell `if` with no external command',
   'scripts/update.sh:write_fence_marker» echo "reboot_fence=$($REBOOT_FENCE_INSTALLED && echo installed || echo absent)"': 'marker text; a shell boolean with no external command',
-  'scripts/update.sh:write_fence_marker» echo "db_connect_fence=$($DB_FENCE_UP && echo held || echo released)"': 'marker text; a shell boolean with no external command',
+  'scripts/update.sh:write_fence_marker» echo "db_connect_fence=$(db_connect_fence_claim)"': 'marker text; a shell function over shell booleans, no external command',
   'scripts/update.sh:publish_fence_recovery_record» printf \'recorded_at=%s\\n\' "$(date -Iseconds)"': 'record text; publication is checked, and readers fail closed on a missing field',
 }
 
