@@ -1,0 +1,48 @@
+# PRODUCER CENSUS, RUN UNCONDITIONALLY.
+#
+# Every call that creates outbound work (a queued Xero sync-log row, an integration-outbox row, a
+# WooCommerce or Mintsoft write, a manual operator button) must be DECLARED in
+# scripts/producer-census-declarations.ts against an operation of lib/security/writer-ownership-map.ts.
+# `scripts/check-producer-census.ts` fails the build on a new undeclared call, on a declaration nothing
+# matches, on a declared operation the map does not know, and on a map operation with neither a producer
+# nor a "no producer in this repo" note. It is a syntactic scan (see scripts/producer-census.ts for the
+# blind spots, stated plainly).
+#
+# NO `paths:` FILTER, NO classifier, NO `needs:`, NO `if:`, NO `continue-on-error`: the declarations file
+# is itself a thing a change can edit, and producers are scattered across app/, lib/ and scripts/, so a
+# hand-kept path list would be a second thing that can go stale, and a guard a change classifier can switch
+# off is not a guard (the same argument ledger-standing-guard.yml and archive-seal.yml settled).
+# tests/scripts/ci-guard-coverage.test.ts parses this file and fails if any of those appears, or if the one
+# `npm run check:*` step below is not a single bare line.
+#
+# `npm ci` because the scan imports `typescript` and runs under `tsx`. No Prisma client, database or build
+# is involved: the scan reads syntax only.
+name: Producer Census Guard
+
+on:
+  pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: producer-census-guard-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  producer-census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:producer-census

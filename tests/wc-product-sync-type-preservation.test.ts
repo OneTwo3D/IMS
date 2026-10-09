@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
 import { describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
+import { createProductContentDelegate } from './helpers/product-content-delegate.ts'
 
 // o3d-y89x: the WooCommerce product sync is the THIRD writer of Product.type (after the
 // editor and the CSV import) and was the only unguarded one. It computed
@@ -711,6 +712,7 @@ const txClient = {
       return { count: before - state.components.length }
     },
   },
+  productContent: createProductContentDelegate(),
   productOption: {
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })

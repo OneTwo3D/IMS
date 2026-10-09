@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
+import { createProductContentDelegate } from './helpers/product-content-delegate.ts'
 
 // o3d-jcx: the variations prefetch was unbounded and it INFERRED ITS ENDING FROM WHAT THE HEADERS
 // SAID, and the write transaction then applied whatever it produced inside a 60-second budget.
@@ -139,6 +140,7 @@ const productDelegate = {
 
 const txClient = {
   product: productDelegate,
+  productContent: createProductContentDelegate(),
   productOption: {
     upsert: async ({ where, create, update }: {
       where: { productId_name: { productId: string; name: string } }

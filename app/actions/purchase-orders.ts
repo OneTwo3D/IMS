@@ -34,6 +34,7 @@ import {
   requirePoLineOutstandingQty,
 } from '@/lib/domain/inventory/po-line-landed-quantity'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
+import { SYSTEM_IMPORT, withSystemActor, type SystemImportContext } from '@/lib/first-load/apply/system-import-capability'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
 import { applyHeaderOrderDiscount } from '@/lib/domain/purchasing/order-discount'
 import {
@@ -1128,9 +1129,11 @@ async function resolvePurchaseLineTaxRates(
   })
 }
 
-export async function createPurchaseOrder(input: CreatePoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
+export async function createPurchaseOrder(input: CreatePoInput, system?: SystemImportContext): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
-    await requirePermission('purchasing.create')
+    // A system-actor context (the first-load apply runner) replaces the session check; anything that is not the real
+    // capability takes the permission check, so a forged argument fails closed.
+    if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
     if (input.reference?.trim()) {
       const existing = await db.purchaseOrder.findUnique({
@@ -1362,9 +1365,9 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       })
     }
 
-    revalidatePath('/purchase-orders')
+    if (system?.systemImportToken !== SYSTEM_IMPORT) revalidatePath('/purchase-orders')
     const mapped = mapPoRow(po)
-    await logActivity({
+    await logActivity(withSystemActor({
       entityType: 'PURCHASE_ORDER',
       entityId: mapped.id,
       action: 'created',
@@ -1372,11 +1375,11 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       level: 'INFO',
       description: `Created PO ${mapped.reference} for ${mapped.supplierName}`,
       metadata: { reference: mapped.reference, supplierId: input.supplierId, currency: input.currency, lineCount: input.lines.length },
-    })
+    }, system))
 
     return { success: true, po: mapped }
   } catch (e) {
-    await logActivity({
+    await logActivity(withSystemActor({
       entityType: 'PURCHASE_ORDER',
       entityId: null,
       action: 'created',
@@ -1384,7 +1387,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       level: 'ERROR',
       description: `Failed to create PO: ${String(e)}`,
       metadata: null,
-    })
+    }, system))
     return { success: false, error: String(e) }
   }
 }
