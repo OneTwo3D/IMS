@@ -6700,7 +6700,7 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     {
       why: 'install.sh publishing the file it owns, by rename, from bytes it rendered itself',
       match:
-        `printf '%s\\\\n' "\\$\\{rendered\\}" \\| publish_durable_file "(${APP_OWNED_PATH})" ` +
+        `printf '%s\\\\n%s' "\\$\\{rendered\\}" "\\$\\{ENV_PRESERVED_BLOCK\\}" \\| publish_durable_file "(${APP_OWNED_PATH})" ` +
         '"\\$\\{APP_USER\\}:\\$\\{APP_USER\\}" 600 \\|\\| return 1',
     },
     // The rotation journal write, which mentions the environment file only in the sentence it

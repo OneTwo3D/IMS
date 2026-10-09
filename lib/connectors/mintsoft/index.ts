@@ -87,8 +87,8 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftReturns(since)
   }
 
-  async createBundle(input: WmsBundleDto): Promise<WmsBundleRef> {
-    return createMintsoftBundle(input)
+  async createBundle(input: WmsBundleDto, options?: { beforeSend?: () => Promise<boolean> }): Promise<WmsBundleRef> {
+    return createMintsoftBundle(input, options)
   }
 
   async fetchBundle(externalProductId: string): Promise<WmsBundleRef | null> {
