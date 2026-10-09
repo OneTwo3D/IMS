@@ -52,7 +52,6 @@ export function mintSystemImportContext(args: { runId: string; operator: string 
     throw new Error('A system import context needs a run id of 1-64 letters, digits, dots, dashes or underscores.')
   }
   const operator = args.operator.trim()
-  // eslint-disable-next-line no-control-regex
   if (operator.length === 0 || operator.length > OPERATOR_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(operator)) {
     throw new Error(`A system import context needs an operator label of 1-${OPERATOR_MAX_LENGTH} printable characters.`)
   }

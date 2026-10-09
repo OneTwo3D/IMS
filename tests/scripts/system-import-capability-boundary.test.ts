@@ -113,13 +113,13 @@ test('a missing capability module and a stale importer entry fail (the census ca
   console.log(`importers=${importers.length}, violations=${violations.length}`)
   assert.equal(importers.length, 0)
   assert.ok(violations.some((v) => v.includes('does not exist')))
-  for (const module of Object.keys(IMPORTERS)) assert.ok(violations.some((v) => v.startsWith(`${module}:`) && v.includes('stale allowlist entry')), module)
+  for (const importer of Object.keys(IMPORTERS)) assert.ok(violations.some((v) => v.startsWith(`${importer}:`) && v.includes('stale allowlist entry')), importer)
 })
 
 test('the production tree passes, and the census saw exactly the importers it should', () => {
   const { violations, importers } = runCensus({ root: process.cwd() })
   console.log(`production census: ${importers.length} importer file(s)`)
-  for (const module of Object.keys(IMPORTERS)) assert.ok(importers.includes(module), `precondition: ${module} imports the capability`)
+  for (const importer of Object.keys(IMPORTERS)) assert.ok(importers.includes(importer), `precondition: ${importer} imports the capability`)
   assert.ok(importers.includes('tests/first-load/system-import-driver.ts'), 'precondition: the importers spike driver is among them')
   assert.deepEqual(violations, [])
 })

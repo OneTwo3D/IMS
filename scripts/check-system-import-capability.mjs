@@ -26,7 +26,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs'
-import { dirname, join, posix, relative, sep } from 'node:path'
+import { join, posix, relative, sep } from 'node:path'
 import { createRequire } from 'node:module'
 
 const ts = createRequire(import.meta.url)('typescript')
@@ -156,8 +156,8 @@ export function runCensus({ root = process.cwd() } = {}) {
   }
 
   // A stale exemption is an invitation: every allowlisted importer module must really import the module.
-  for (const module of IMPORTER_MODULES) {
-    if (!importers.includes(module)) violations.push(`${module}: listed as an importer but does not import the capability module (stale allowlist entry)`)
+  for (const importer of IMPORTER_MODULES) {
+    if (!importers.includes(importer)) violations.push(`${importer}: listed as an importer but does not import the capability module (stale allowlist entry)`)
   }
   return { violations: violations.sort(), importers: importers.sort() }
 }
