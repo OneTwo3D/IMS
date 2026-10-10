@@ -391,7 +391,7 @@ test('ORPHAN SIGNALS: a contribution without its coupon line, a wallet record, a
     { name: 'contribution 12, NO coupon line', lines: [], orderMeta: contribution({ sc: 12 }), expect: 'REFUSED' },
     { name: 'contribution 12, only an unrelated percent line', lines: [coupon('p', '5.00', 'percent')], orderMeta: contribution({ sc: 12 }), expect: 'REFUSED' },
     { name: 'contribution matches its line (case/whitespace differ)', lines: [scLine('sc')], orderMeta: contribution({ ' SC ': 12 }), expect: 'CREDIT' },
-    { name: 'UNTYPED line identified only by a contribution whose key differs in case/whitespace', lines: [coupon('sc', '10.00', null, { discount_tax: '2.00' })], orderMeta: contribution({ ' SC ': 12 }), expect: 'CREDIT' },
+    { name: 'UNTYPED line identified only by a contribution whose key differs in case/whitespace', lines: [coupon('SC', '10.00', null, { discount_tax: '2.00' })], orderMeta: contribution({ ' sc ': 12 }), expect: 'CREDIT' },
     { name: 'two codes, one has a line, the other is an orphan', lines: [scLine('sc')], orderMeta: contribution({ sc: 12, gift: 20 }), expect: 'REFUSED' },
     { name: 'orphan with a zero amount is no credit', lines: [], orderMeta: contribution({ sc: 0 }), expect: 'NOTHING' },
     { name: 'orphan with an unreadable amount', lines: [], orderMeta: contribution({ sc: 'lots' }), expect: 'REFUSED' },
