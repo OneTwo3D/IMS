@@ -47,6 +47,8 @@ import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
 import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
+import { invoicePaymentReceiptId } from '@/lib/domain/accounting/operator-ledger-check'
+import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
@@ -86,6 +88,8 @@ export type InvoicePaymentSyncRow = PaymentSyncRow & LedgerStandingRow & {
    * the two sites that hold a lossy number beside it. See {@link ExactAmountReading}.
    */
   registeredAmount: ExactAmountReading
+  /** o3d-llyw: the row's own id — what an operator ledger check is recorded against. */
+  id: string
   paymentId: string | null
   /** The ledger document this row settles — null on rows queued before the payload carried it. */
   accountingInvoiceId: string | null
@@ -149,6 +153,7 @@ export async function loadInvoicePaymentSyncRows(
   return rows.map((r) => {
     const payload = (r.payload && typeof r.payload === 'object' ? r.payload : {}) as Record<string, unknown>
     return {
+      id: r.id,
       status: r.status,
       externalTransactionId: r.externalTransactionId,
       errorMessage: r.errorMessage,
@@ -187,8 +192,8 @@ export async function loadInvoicePaymentSyncRows(
 
 /** The local Payment row an INVOICE_PAYMENT was queued for, when the payload records one. */
 export function payloadPaymentId(payload: unknown): string | null {
-  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
-  return typeof p.paymentId === 'string' ? p.paymentId : null
+  // o3d-llyw: one reading of the field, shared with the operator-ledger-check scope.
+  return invoicePaymentReceiptId(payload)
 }
 
 /**
@@ -880,6 +885,16 @@ export function invoicePaymentRedriveFor(
  * redrive states rather than judging a sentence somebody re-typed into a test. `null` is
  * SYNC_DISABLED, which reports nothing at all: nothing was expected to post.
  */
+/**
+ * o3d-llyw — the remedy for an UNRESOLVED_PAYMENT_ATTEMPT hold that is NOT an unmeasurable ledger record
+ * (the connector could not be asked, the attempt does not record what it sent, the ledger did not prove
+ * its list complete, or a ledger payment matches the earlier attempt). It names no lever, because none of
+ * those has one in the product; it says which remedy does NOT apply so nobody records a check for it.
+ */
+export const UNRESOLVED_ATTEMPT_GENERIC_REMEDY =
+  'Compare the earlier attempt on the Accounting Sync page with what the ledger holds. An operator ledger '
+  + 'check cannot lift this kind of hold: it applies only when the ledger holds settlements IMS cannot read.'
+
 export function describeInvoicePaymentRefusal(params: {
   refused: InvoicePaymentRegistrationDecision & { register: false }
   orderReference: string
@@ -967,14 +982,21 @@ export function describeInvoicePaymentRefusal(params: {
     // consumes no capacity — so without this arm the receipt would look like it fits and a second
     // payment would post. `detail` says which of the two it was: the ledger was unreachable, or it
     // answered and the answer matched the earlier attempt.
+    //
+    // o3d-llyw — AND THE REMEDY IS NAMED BY WHAT CAN ACTUALLY LIFT IT. This used to end "Resolve the
+    // earlier attempt on the Accounting Sync page first", which since C1 lifts nothing (an operator's
+    // NOT_POSTED settlement no longer clears the row). When the hold is an unmeasurable ledger record,
+    // the decision now carries the one sentence that says which records to open, which entry and which
+    // receipt to record the check for — or why no check can lift it. Every other cause gets a sentence
+    // that offers no lever, because none exists for it in the product (UNRESOLVED_ATTEMPT_GENERIC_REMEDY).
     case 'UNRESOLVED_PAYMENT_ATTEMPT':
       return {
         description:
           `Recorded ${amount} against ${params.orderReference}, but an earlier payment attempt on this `
           + `order did not resolve and could not be ruled out in the accounting connector `
           + `(${refused.detail ?? 'no detail'}). Sending this one could pay the invoice twice, so it was `
-          + `not sent. Resolve the earlier attempt on the Accounting Sync page first. ${remedy}`,
-        metadata: withLedger,
+          + `not sent. ${refused.ledgerCheckRemedy ?? UNRESOLVED_ATTEMPT_GENERIC_REMEDY} ${remedy}`,
+        metadata: { ...withLedger, ledgerCheckRemedy: refused.ledgerCheckRemedy ?? null },
       }
     // o3d-ekn8 r4: a LIVE row for this receipt settles a document the order no longer points at —
     // the invoice was deleted and re-posted. Every document-scoped filter drops that row, which is
@@ -1050,6 +1072,25 @@ export function describeInvoicePaymentRefusal(params: {
  * — this branch told an operator to re-run the sync and register by hand in front of a re-drive the
  * retained marker guarantees.
  */
+/**
+ * o3d-llyw — a receipt queued because an operator ledger check lifted an unmeasurable-record hold. States
+ * what the check is (a person's assertion) and that the post is still fenced; it says nothing about what
+ * the ledger holds, because IMS could not read the records the check was about.
+ */
+export function invoicePaymentRegisteredUnderLedgerCheckDescription(params: {
+  orderReference: string
+  amount: number
+  currency: string
+  checkIds: readonly string[]
+}): string {
+  return `Queued ${params.currency} ${params.amount.toFixed(2)} for registration against ${params.orderReference} `
+    + `on the strength of operator ledger check${params.checkIds.length === 1 ? '' : 's'} ${params.checkIds.join(', ')}: `
+    + 'an earlier attempt on this order could not be ruled out by IMS because the ledger held settlements it '
+    + 'cannot read, and a person recorded that those settlements are not that attempt. That is an assertion, '
+    + 'not something IMS verified. The payment is still re-checked against the ledger immediately before it '
+    + 'is sent, and a settlement that has appeared since, or a Xero reconnect, holds it again.'
+}
+
 export function invoicePaymentDocumentMovedDescription(params: {
   phase: 'before-queue' | 'while-queueing'
   orderReference: string
@@ -1432,6 +1473,22 @@ export async function registerInvoicePaymentWithLedger(params: {
       })()
       : null
 
+    // o3d-llyw — THE OPERATOR LEDGER CHECKS FOR THE UNRESOLVED ATTEMPTS AND THIS RECEIPT, read only when
+    // the ledger was asked (no probe, no unmeasurable-record hold to lift). Read ONCE, here, and carried
+    // into both evaluations of the decision exactly as the probe is: a check is insert-only and can only
+    // ever ADD coverage, so re-reading it under the lock against the same pre-lock probe could only make
+    // the second evaluation more permissive than the first, never safer. The post fence re-probes the
+    // ledger and re-reads the checks immediately before the money moves, which is where a record that
+    // appeared since, or a reconnect, is caught.
+    const operatorLedgerChecks = ledgerSettlements && probeConnector
+      ? await loadOperatorLedgerChecks(db, {
+        syncLogIds: unresolvedInvoicePaymentAttempts(existing, params.paymentId)
+          .map((row) => row.id).filter((id): id is string => typeof id === 'string'),
+        paymentId: params.paymentId,
+        connector: probeConnector,
+      })
+      : []
+
     // Hoisted so the re-check under the order lock re-runs the IDENTICAL decision with only `existing`
     // refreshed — anything else diverging between the two would make the second a different guard.
     //
@@ -1508,6 +1565,9 @@ export async function registerInvoicePaymentWithLedger(params: {
       bankAccountId: mappedBankAccountId,
       existing,
       ledgerSettlements,
+      // o3d-llyw: the connector a check must name, and the checks themselves (see above).
+      connector: probeConnector,
+      operatorLedgerChecks,
       ledgerTotal: ledgerSalesInvoiceTotalForeign({
         // o3d-6abj: the stored `Decimal`s. `Number(so.totalForeign)` was the enqueue half of the
         // same collapse Codex found at the post site.
@@ -1620,6 +1680,8 @@ export async function registerInvoicePaymentWithLedger(params: {
     // deletePayment takes the same per-order lock, so serialising on it closes the window in both
     // directions: either we find the payment gone and do nothing, or we queue first and the delete finds
     // our row and retracts it.
+    // o3d-llyw: the operator ledger checks the UNDER-LOCK decision relied on, for the record below.
+    let liftedByCheckIdsUnderLock: string[] = []
     const runEnqueue = () => db.$transaction(async (tx) => {
       await lockSalesOrder(tx, params.orderId)
       // o3d-0m56: AND the follow-up scope lock, taken before the rows are re-read.
@@ -1666,6 +1728,7 @@ export async function registerInvoicePaymentWithLedger(params: {
         existing: await loadInvoicePaymentSyncRows(params.orderId, connectorId, so.currency, tx),
       })
       if (!underLock.register) return { refused: underLock } as const
+      liftedByCheckIdsUnderLock = underLock.liftedByCheckIds ?? []
       const enqueued = await queueAccountingSyncTxWithOutcome(tx, {
         // o3d-j625 r5 (review HIGH 4) — THE RECEIPT IS ALREADY COMMITTED, so a refusal here leaves money
         // recorded in IMS and the invoice unpaid in the ledger. r4 wrote no row on this path at all (its
@@ -1786,6 +1849,20 @@ export async function registerInvoicePaymentWithLedger(params: {
           postedInvoiceId: pinned?.accountingInvoiceId ?? null,
         })
       return registeredFor.connector
+    }
+    // o3d-llyw — A RECEIPT LET THROUGH ON AN OPERATOR'S LEDGER CHECK IS RECORDED AS SUCH. The check was
+    // a person's assertion, not a ledger fact, so the registration it permitted is traceable to it from
+    // the order's own history: which checks, by id, and that the queued row is still subject to the post
+    // fence (which re-reads the ledger and the checks before anything is sent).
+    if (outcome === 'queued' && liftedByCheckIdsUnderLock.length > 0) {
+      await warn('invoice_payment_registered_under_ledger_check',
+        invoicePaymentRegisteredUnderLedgerCheckDescription({
+          orderReference: params.orderReference,
+          amount: amountNumber,
+          currency: params.currency,
+          checkIds: liftedByCheckIdsUnderLock,
+        }),
+        { amount: amountNumber, currency: params.currency, operatorLedgerCheckIds: liftedByCheckIdsUnderLock })
     }
     if (outcome === 'context-changed') {
       await warn('invoice_payment_not_registered',
