@@ -15,7 +15,7 @@
 import { createHash } from 'node:crypto'
 import { serializeCsv } from './csv'
 import { DATASETS } from './spec'
-import { skuKey } from './validate'
+import { FORMULA_LEADING, skuKey } from './validate'
 
 export const SNAPSHOT_FORMAT_VERSION = 1
 
@@ -96,6 +96,12 @@ export function renderSnapshotFile(payload: SnapshotPayload): string {
 // Reading what the store returned (untrusted) into the snapshot shapes
 // ---------------------------------------------------------------------------
 
+/** An upstream value, bounded, for an error message: a store's own text must not be able to flood or smuggle anything into an output. */
+export function short(value: unknown): string {
+  const text = JSON.stringify(value) ?? 'undefined'
+  return text.length > 60 ? `${text.slice(0, 60)}...` : text
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -108,8 +114,8 @@ function wholeId(value: unknown): number | null {
 export function reduceParent(raw: unknown): { ok: true; parent: SnapshotParent } | { ok: false; problem: string } {
   if (!isRecord(raw)) return { ok: false, problem: 'a product in the response is not an object' }
   const id = wholeId(raw.id)
-  if (id === null) return { ok: false, problem: `a product has no usable id (${JSON.stringify(raw.id)})` }
-  if (raw.type !== 'variable') return { ok: false, problem: `product ${id} has type ${JSON.stringify(raw.type)}, not "variable"` }
+  if (id === null) return { ok: false, problem: `a product has no usable id (${short(raw.id)})` }
+  if (raw.type !== 'variable') return { ok: false, problem: `product ${id} has type ${short(raw.type)}, not "variable"` }
   if (typeof raw.sku !== 'string') return { ok: false, problem: `product ${id} has no sku field` }
   if (typeof raw.name !== 'string') return { ok: false, problem: `product ${id} has no name field` }
   if (typeof raw.status !== 'string' || raw.status === '') return { ok: false, problem: `product ${id} has no status field` }
@@ -117,7 +123,7 @@ export function reduceParent(raw: unknown): { ok: true; parent: SnapshotParent }
   const variationIds: number[] = []
   for (const entry of raw.variations) {
     const variationId = wholeId(entry)
-    if (variationId === null) return { ok: false, problem: `product ${id} lists a variation id that is not a whole number (${JSON.stringify(entry)})` }
+    if (variationId === null) return { ok: false, problem: `product ${id} lists a variation id that is not a whole number (${short(entry)})` }
     variationIds.push(variationId)
   }
   return { ok: true, parent: { id, sku: raw.sku.trim(), name: raw.name, status: raw.status, variationIds: variationIds.sort((a, b) => a - b) } }
@@ -127,9 +133,9 @@ export function reduceParent(raw: unknown): { ok: true; parent: SnapshotParent }
 export function reduceVariation(raw: unknown, parentId: number): { ok: true; variation: SnapshotVariation } | { ok: false; problem: string } {
   if (!isRecord(raw)) return { ok: false, problem: `a variation of product ${parentId} is not an object` }
   const id = wholeId(raw.id)
-  if (id === null) return { ok: false, problem: `a variation of product ${parentId} has no usable id (${JSON.stringify(raw.id)})` }
+  if (id === null) return { ok: false, problem: `a variation of product ${parentId} has no usable id (${short(raw.id)})` }
   if (raw.parent_id !== undefined && raw.parent_id !== parentId) {
-    return { ok: false, problem: `variation ${id} says its parent is ${JSON.stringify(raw.parent_id)} but it was listed under product ${parentId}` }
+    return { ok: false, problem: `variation ${id} says its parent is ${short(raw.parent_id)} but it was listed under product ${parentId}` }
   }
   if (typeof raw.sku !== 'string') return { ok: false, problem: `variation ${id} has no sku field` }
   if (typeof raw.status !== 'string' || raw.status === '') return { ok: false, problem: `variation ${id} has no status field` }
@@ -246,4 +252,17 @@ export function variantParentRows(payload: SnapshotPayload): string[][] {
 
 export function renderVariantParentsCsv(payload: SnapshotPayload): string {
   return serializeCsv(DATASETS['variant-parents'].columns, variantParentRows(payload))
+}
+
+/** The cells of variant-parents.csv that a spreadsheet would read as a formula (WooCommerce text is untrusted). */
+export function formulaLeadingCells(payload: SnapshotPayload): number {
+  return variantParentRows(payload).reduce((n, row) => n + row.filter((cell) => FORMULA_LEADING.test(cell)).length, 0)
+}
+
+/**
+ * An INSPECTION copy for a person to open in a spreadsheet: the same rows, with a leading apostrophe on every cell a spreadsheet would read as a
+ * formula. It is NOT an input: variant-parents.csv is the data file and is never altered, because the join must see the text as WooCommerce has it.
+ */
+export function renderVariantParentsInspectionCsv(payload: SnapshotPayload): string {
+  return serializeCsv(DATASETS['variant-parents'].columns, variantParentRows(payload).map((row) => row.map((cell) => (FORMULA_LEADING.test(cell) ? `'${cell}` : cell))))
 }

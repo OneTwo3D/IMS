@@ -41,6 +41,7 @@ import {
   chunkUnits,
   dispositionAnomalies,
   findRecipeCycles,
+  FORMULA_LEADING,
   hasInvisibleKeyChars,
   idToken,
   parseSku,
@@ -77,6 +78,11 @@ export interface PrepareConfig {
    * resolves by NAME (or the supplier's default), which this DB-free tool cannot read, so every order is bounded with this rate.
    */
   maxPurchaseTaxRate: string | null
+  /**
+   * When true, EVERY emitted VARIANT must have an accepted exact-SKU WooCommerce variation (even one whose parentSku the products file already names).
+   * Supplying the variant-parents dataset implies it. Default false.
+   */
+  requireVariantParents?: boolean
   chunkLimits?: ChunkLimits
 }
 
@@ -327,6 +333,7 @@ class Run {
   wooSkus = new Map<string, string>()
   /** VARIABLE parents created from the variant-parents dataset (they are output rows without a products-dataset record). */
   syntheticParents = new Set<string>()
+  variantConfirmed = new Set<string>()
   variantParentKeys = new Set<string>()
   variantParentSummary = { supplied: false, rowsRead: 0, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
 
@@ -590,6 +597,8 @@ function loadCatalogue(run: Run): void {
 
   const typeOf = new Map<string, ProductType>([...remaining.map((c) => [c.entry.key, c.entry.type] as const), ...[...run.syntheticParents].map((key) => [key, 'VARIABLE' as const] as const)])
   const unjoined: string[] = []
+  const unconfirmed: string[] = []
+  const required = run.config.requireVariantParents === true || run.has('variant-parents')
   for (const c of remaining) {
     const { entry } = c
     if (entry.type === 'VARIANT') {
@@ -608,6 +617,14 @@ function loadCatalogue(run: Run): void {
         run.catStatus.set(entry.key, 'rejected')
         continue
       }
+      if (required && !run.variantConfirmed.has(entry.key)) {
+        run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_PARENT_UNCONFIRMED', run.has('variant-parents')
+          ? `parent SKU ${JSON.stringify(entry.parentSku)} is named by the products file but no accepted WooCommerce variation has this SKU, so the parent is unconfirmed`
+          : 'the WooCommerce join is required (requireVariantParents) but no variant-parents dataset was supplied, so the parent is unconfirmed')
+        run.catStatus.set(entry.key, 'rejected')
+        unconfirmed.push(entry.sku)
+        continue
+      }
     } else if (entry.parentSku !== '') {
       run.add('products', c.row.line, entry.sku, 'REJECTED', 'PARENT_ON_NON_VARIANT', `parentSku is only valid on a VARIANT; this product is ${entry.type}`)
       run.catStatus.set(entry.key, 'rejected')
@@ -616,6 +633,9 @@ function loadCatalogue(run: Run): void {
     run.cat.set(entry.key, entry)
     run.catStatus.set(entry.key, 'ok')
     run.add('products', c.row.line, entry.sku, 'EMITTED', 'PRODUCT', 'in the products import file')
+  }
+  if (unconfirmed.length > 0) {
+    run.find('ERROR', 'VARIANT_PARENT_UNCONFIRMED', `${unconfirmed.length} VARIANT product(s) name a parent but WooCommerce does not confirm it by exact SKU (the join is required: a prefilled parentSku is not enough). Fix the SKU or exclude each with a reason.`, 'products', unconfirmed)
   }
   if (unjoined.length > 0) {
     run.find('ERROR', 'VARIANT_WITHOUT_PARENT', `${unjoined.length} VARIANT product(s) have no parent: ${run.variantParentSummary.supplied ? 'no WooCommerce variation has their SKU' : 'no variant-parents dataset was supplied'}. Fix the SKU in Qoblex or WooCommerce, or put each on the exclusion list with a reason. They are never loaded as simple products.`, 'products', unjoined)
@@ -664,6 +684,18 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
     run.catStatus.set(entry.key, 'ok')
     run.syntheticParents.add(entry.key)
   }
+  for (const key of result.confirmed) run.variantConfirmed.add(key)
+  // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title and lifecycle (the parent title comes from WooCommerce).
+  const differing: string[] = []
+  for (const p of result.providedParents) {
+    const entry = run.cat.get(p.key) ?? byKey.get(p.key)
+    if (!entry) continue
+    if (entry.name !== p.name || entry.lifecycle !== p.lifecycle) differing.push(`${entry.sku}: ${JSON.stringify(entry.name)}/${entry.lifecycle} -> ${JSON.stringify(p.name)}/${p.lifecycle}`)
+    entry.name = p.name
+    entry.cells.lifecycleStatus = p.lifecycle
+    entry.lifecycle = p.lifecycle
+  }
+  if (differing.length > 0) run.find('INFO', 'PARENT_ATTRIBUTES_FROM_WOO', `${differing.length} VARIABLE product(s) in the products file carry a title or lifecycle that differs from WooCommerce: WooCommerce's title and mapped status are written`, 'variant-parents', differing)
   for (const key of result.namedKeys) run.variantParentKeys.add(key)
   run.variantParentSummary = { supplied: true, ...result.summary }
 }
@@ -1548,6 +1580,20 @@ function emitProducts(run: Run): string[][] {
   return rows
 }
 
+/** Reports spreadsheet-formula-looking cells in an import file; the file itself is never altered (see FORMULA_LEADING). */
+function flagFormulaCells(run: Run, label: string, headers: readonly string[], rows: string[][], keyColumn: string): void {
+  const keyAt = headers.indexOf(keyColumn)
+  const hits: string[] = []
+  for (const row of rows) {
+    row.forEach((cell, index) => {
+      if (FORMULA_LEADING.test(cell)) hits.push(`${label}:${headers[index]}:${row[keyAt]}`)
+    })
+  }
+  if (hits.length > 0) {
+    run.find('WARNING', 'FORMULA_LEADING_CELL', `${hits.length} cell(s) in the ${label} import file start with a character a spreadsheet reads as a formula (= + - @, tab, carriage return). The file is written exactly as the data is, because the importer must read it unchanged: do not open the import files in a spreadsheet and save them`, undefined, hits)
+  }
+}
+
 function emitOpeningStock(run: Run): string[][] {
   const groups = [...run.stockGroups.values()].sort((a, b) => cmp(a.key, b.key) || cmp(a.warehouseCode, b.warehouseCode))
   return groups.map((g) => {
@@ -1691,9 +1737,14 @@ export function prepare(input: PrepareInput): PrepareResult {
   const outputs: OutputFile[] = []
   if (run.has('suppliers')) {
     const rows = [...run.suppliers.entries()].sort((a, b) => cmp(a[0], b[0])).map(([, s]) => IMPORT_TARGETS.suppliers.headers.map((h) => s.cells[h] ?? ''))
+    flagFormulaCells(run, 'suppliers', IMPORT_TARGETS.suppliers.headers, rows, 'name')
     outputs.push(...emitUnits('suppliers', rows.map((r) => [r]), limits, run))
   }
-  if (run.has('products')) outputs.push(...emitUnits('products', emitProducts(run).map((r) => [r]), limits, run))
+  if (run.has('products')) {
+    const productRows = emitProducts(run)
+    flagFormulaCells(run, 'products', IMPORT_TARGETS.products.headers, productRows, 'sku')
+    outputs.push(...emitUnits('products', productRows.map((r) => [r]), limits, run))
+  }
   if (run.has('stock-lots')) outputs.push(...emitUnits('opening-stock', emitOpeningStock(run).map((r) => [r]), limits, run))
   if (run.has('transfers')) outputs.push(...emitUnits('transfers', run.transferOutputs.map((t) => t.rows), limits, run))
   if (run.has('purchase-order-lines')) outputs.push(...emitUnits('purchase-orders', run.poOutputs.map((o) => o.rows), limits, run))

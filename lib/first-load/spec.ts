@@ -398,6 +398,7 @@ export const SNAPSHOT_FILE_NAMES = {
   snapshot: 'woo-snapshot.json',
   provenance: 'woo-snapshot.provenance.json',
   variantParents: 'variant-parents.csv',
+  variantParentsInspection: 'variant-parents.inspect.csv',
   partial: 'woo-snapshot.partial.json',
 } as const
 

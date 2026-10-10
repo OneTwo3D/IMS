@@ -62,6 +62,10 @@ export interface VariantJoinResult {
   /** Qoblex variant key -> parent SKU, for variants that had no parent. */
   assignments: Map<string, string>
   parents: SyntheticParent[]
+  /** Qoblex variant keys with an accepted exact-SKU WooCommerce match (their parent is confirmed). */
+  confirmed: Set<string>
+  /** Parents the products file itself carries as VARIABLE, with what WooCommerce says about them (WooCommerce wins for title and lifecycle). */
+  providedParents: Array<{ key: string; sku: string; name: string; lifecycle: 'ACTIVE' | 'DRAFT' }>
   /** Every SKU key the dataset names (variations and parents), so an exclusion on one of them is not reported as stale. */
   namedKeys: Set<string>
   summary: { rowsRead: number; variantsJoined: number; parentsEmitted: number; parentsWithoutQoblexVariant: number }
@@ -166,6 +170,8 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
   // 4. Dispositions per variation row, and the parents to emit.
   const assignments = new Map<string, string>()
   const parents = new Map<string, SyntheticParent>()
+  const confirmed = new Set<string>()
+  const provided = new Map<string, { key: string; sku: string; name: string; lifecycle: 'ACTIVE' | 'DRAFT' }>()
   const typeNotVariant: string[] = []
   const stemMismatch: string[] = []
   const joinedParentKeys = new Set<string>()
@@ -208,10 +214,14 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
         continue
       }
       variantsJoined++
+      confirmed.add(i.variantKey)
       add(i.row, i.variantSku, 'EMITTED', 'VARIATION_JOINED', `joined by exact SKU to WooCommerce parent ${i.parentSku}`)
       joinedParentKeys.add(parentKey)
       if (skuStem(i.variantSku) !== parentKey) stemMismatch.push(`${i.variantSku} -> ${i.parentSku}`)
-      if (providedByProducts(parentKey)) continue
+      if (providedByProducts(parentKey)) {
+        provided.set(parentKey, { key: parentKey, sku: head.parentSku, name: head.parentName, lifecycle: head.lifecycle })
+        continue
+      }
       const parent = parents.get(parentKey) ?? { sku: head.parentSku, key: parentKey, name: head.parentName, lifecycle: head.lifecycle, wooParentId: head.wooParentId, variants: [] }
       parent.variants.push(i.variantSku)
       parents.set(parentKey, parent)
@@ -254,6 +264,8 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
     dispositions,
     findings,
     assignments,
+    confirmed,
+    providedParents: [...provided.values()].sort((a, b) => cmp(a.key, b.key)),
     parents: emitted,
     namedKeys,
     summary: { rowsRead: input.rows.length, variantsJoined, parentsEmitted: emitted.length, parentsWithoutQoblexVariant: orphanParents.length },

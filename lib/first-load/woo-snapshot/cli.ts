@@ -15,7 +15,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { SNAPSHOT_EXIT_CODES, SNAPSHOT_EXIT_CODE_TABLE, SNAPSHOT_FILE_NAMES } from '../spec'
-import { SNAPSHOT_FORMAT_VERSION, parseSnapshotFile, renderSnapshotFile, renderVariantParentsCsv, sha256Hex } from '../snapshot'
+import { SNAPSHOT_FORMAT_VERSION, formulaLeadingCells, parseSnapshotFile, renderSnapshotFile, renderVariantParentsCsv, renderVariantParentsInspectionCsv, sha256Hex } from '../snapshot'
 import { WALK_MAX_ATTEMPTS, SnapshotFetchError, SnapshotInconsistentError, freshState, walkStore, type PageResult, type WalkState } from './walk'
 
 export interface CliIo {
@@ -38,6 +38,7 @@ export const ENV_KEYS = {
 } as const
 
 export const DEFAULT_MIN_INTERVAL_MS = 500
+export const DEFAULT_MAX_RESUME_AGE_MINUTES = 60
 
 export function usageText(): string {
   return [
@@ -53,6 +54,7 @@ export function usageText(): string {
     '  --allow-any-origin     contact the store even though its origin is not on the allowlist',
     '  --resume               continue an unfinished walk kept in --out (same store only)',
     `  --min-interval-ms <n>  minimum milliseconds between two requests (default ${DEFAULT_MIN_INTERVAL_MS})`,
+    `  --max-resume-age-minutes <n>  an unfinished walk older than this is not resumed (default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`,
     '  --verify <file>        offline: recompute the checksum of a snapshot and re-run its consistency rules; no request, no credentials',
     '  --help                 this text',
     '',
@@ -72,12 +74,13 @@ interface Args {
   allowAnyOrigin: boolean
   resume: boolean
   minIntervalMs: number
+  maxResumeAgeMinutes: number
   verify: string | null
   help: boolean
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { envFile: null, out: null, allowOrigins: [], allowAnyOrigin: false, resume: false, minIntervalMs: DEFAULT_MIN_INTERVAL_MS, verify: null, help: false }
+  const args: Args = { envFile: null, out: null, allowOrigins: [], allowAnyOrigin: false, resume: false, minIntervalMs: DEFAULT_MIN_INTERVAL_MS, maxResumeAgeMinutes: DEFAULT_MAX_RESUME_AGE_MINUTES, verify: null, help: false }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     const value = () => {
@@ -95,6 +98,10 @@ function parseArgs(argv: string[]): Args {
       const raw = value()
       if (!/^\d{1,6}$/.test(raw)) throw new UsageError('--min-interval-ms must be a whole number of milliseconds (0 to 999999)')
       args.minIntervalMs = Number(raw)
+    } else if (arg === '--max-resume-age-minutes') {
+      const raw = value()
+      if (!/^\d{1,6}$/.test(raw)) throw new UsageError('--max-resume-age-minutes must be a whole number of minutes')
+      args.maxResumeAgeMinutes = Number(raw)
     } else if (arg === '--verify') args.verify = value()
     else throw new UsageError(`unknown argument ${JSON.stringify(arg)} (credentials are never accepted on the command line: put them in the --env-file)`)
   }
@@ -151,6 +158,16 @@ function originOf(raw: string, where: string, fail: (message: string) => Error):
   }
 }
 
+/**
+ * BACKSTOP: no output path may carry a credential. Every message a later step prints goes through this, whatever its source (the walk already
+ * reports upstream failures as a status and a code only). It removes the key, the secret, the base64 Basic token and the `Basic <token>` header.
+ */
+export function redactor(credentials: { key: string; secret: string }): (text: string) => string {
+  const token = Buffer.from(`${credentials.key}:${credentials.secret}`).toString('base64')
+  const secrets = [token, credentials.secret, credentials.key].filter((v) => v.length > 0).sort((a, b) => b.length - a.length)
+  return (text) => secrets.reduce((t, v) => t.split(v).join('[redacted]'), text)
+}
+
 function writeAtomic(target: string, content: string): void {
   const tmp = `${target}.tmp`
   writeFileSync(tmp, content, { flag: 'w', encoding: 'utf8', mode: 0o600 })
@@ -174,7 +191,9 @@ function runVerify(file: string, io: CliIo): number {
   return SNAPSHOT_EXIT_CODES.OK
 }
 
-export async function runSnapshotCli(argv: string[], io: CliIo, deps: SnapshotCliDeps = {}): Promise<number> {
+export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: SnapshotCliDeps = {}): Promise<number> {
+  let io: CliIo = rawIo
+  let redact: (text: string) => string = (text) => text
   let args: Args
   try {
     args = parseArgs(argv)
@@ -197,6 +216,8 @@ export async function runSnapshotCli(argv: string[], io: CliIo, deps: SnapshotCl
   let baseUrl: string
   try {
     credentials = readCredentials(args.envFile!)
+    redact = redactor(credentials)
+    io = { stdout: (t) => rawIo.stdout(redact(t)), stderr: (t) => rawIo.stderr(redact(t)) }
     const { validateWooCommerceBaseUrl } = await import('@/lib/connectors/woocommerce/url-safety')
     const validated = validateWooCommerceBaseUrl(credentials.url)
     if (!validated.ok) throw new RefusedError(`the store URL in the credentials file is not usable: ${validated.error}`)
@@ -252,6 +273,11 @@ export async function runSnapshotCli(argv: string[], io: CliIo, deps: SnapshotCl
           io.stderr(`first-load-woo-snapshot: refused: the unfinished walk in ${args.out} belongs to ${candidate.origin}, not ${origin}; nothing was requested\n`)
           return SNAPSHOT_EXIT_CODES.REFUSED
         }
+        const ageMs = deps.now ? deps.now() - (candidate.savedAt ?? 0) : Date.now() - (candidate.savedAt ?? 0)
+        if (!(candidate.savedAt !== undefined && ageMs >= 0 && ageMs <= args.maxResumeAgeMinutes * 60_000)) {
+          io.stderr(`first-load-woo-snapshot: refused: the unfinished walk in ${args.out} is older than ${args.maxResumeAgeMinutes} minute(s) (or has no time), so the store may have changed since: delete it and run again without --resume, or raise --max-resume-age-minutes. Nothing was requested.\n`)
+          return SNAPSHOT_EXIT_CODES.REFUSED
+        }
         state = candidate
         resumed = true
       }
@@ -270,14 +296,14 @@ export async function runSnapshotCli(argv: string[], io: CliIo, deps: SnapshotCl
   const makeFetchPage = deps.makeFetchPage ?? (async (creds) => {
     const { wcFetch } = await import('@/lib/connectors/woocommerce/api')
     // wcFetch is the connector's GET-only reader: it takes no method and no body, and with explicit credentials it never reads the IMS database.
-    return (p, params) => wcFetch(p, params, { url: creds.url, key: creds.key, secret: creds.secret })
+    return (p, params) => wcFetch(p, params, { url: creds.url, key: creds.key, secret: creds.secret }, { refuseRedirects: true })
   })
   let result
   try {
     const fetchPage = await makeFetchPage({ url: baseUrl, key: credentials.key, secret: credentials.secret })
     result = await walkStore(state, {
       fetchPage, sleep, now, minIntervalMs: args.minIntervalMs,
-      onProgress: (s) => writeAtomic(partialPath, JSON.stringify(s)),
+      onProgress: (s) => { s.savedAt = now(); writeAtomic(partialPath, JSON.stringify(s)) },
     })
   } catch (error) {
     if (error instanceof SnapshotInconsistentError) {
@@ -302,24 +328,28 @@ export async function runSnapshotCli(argv: string[], io: CliIo, deps: SnapshotCl
     return SNAPSHOT_EXIT_CODES.INTERNAL
   }
   const csv = renderVariantParentsCsv(reread.payload)
+  const inspection = renderVariantParentsInspectionCsv(reread.payload)
   const provenance = {
     formatVersion: SNAPSHOT_FORMAT_VERSION,
     source: 'woocommerce',
     origin,
     fetchedAt: new Date(now()).toISOString(),
     resumed,
+    verificationRounds: result.verificationRounds,
     minIntervalMs: args.minIntervalMs,
     requests: result.requests,
     proof: result.proof,
     snapshotFile: { name: SNAPSHOT_FILE_NAMES.snapshot, sha256: sha256Hex(snapshotText), bytes: Buffer.byteLength(snapshotText, 'utf8'), payloadSha256: reread.payloadSha256 },
+    formulaLeadingCells: formulaLeadingCells(reread.payload),
     variantParentsFile: { name: SNAPSHOT_FILE_NAMES.variantParents, sha256: sha256Hex(csv), rows: csv.split('\r\n').filter((l) => l !== '').length - 1 },
   }
   const created: string[] = []
   try {
     for (const [name, content] of [
       [SNAPSHOT_FILE_NAMES.snapshot, snapshotText],
-      [SNAPSHOT_FILE_NAMES.provenance, `${JSON.stringify(provenance, null, 2)}\n`],
+      [SNAPSHOT_FILE_NAMES.provenance, redact(`${JSON.stringify(provenance, null, 2)}\n`)],
       [SNAPSHOT_FILE_NAMES.variantParents, csv],
+      [SNAPSHOT_FILE_NAMES.variantParentsInspection, inspection],
     ] as const) {
       const target = path.join(outDir, name)
       writeFileSync(target, content, { flag: 'wx', encoding: 'utf8', mode: 0o600 })
@@ -338,7 +368,7 @@ export async function runSnapshotCli(argv: string[], io: CliIo, deps: SnapshotCl
     `  variable products: ${p.parents.rowsRead} read = ${p.parents.totalHeader} (X-WP-Total) in ${p.parents.pages} page(s)`,
     `  variations: ${p.variations.rowsRead} read = ${p.variations.totalHeaderSum} (sum of X-WP-Total over ${p.variations.parentsWithVariations} product(s)) and equal to the ids the products list`,
     `  variations without a SKU (cannot be joined, not in ${SNAPSHOT_FILE_NAMES.variantParents}): ${p.variationsWithoutSku}`,
-    `  requests this run: ${result.requests}; payload SHA-256 ${reread.payloadSha256}`,
+    `  verified by a second complete walk (round ${result.verificationRounds}); requests this run: ${result.requests}; payload SHA-256 ${reread.payloadSha256}`,
     '  every request was a GET.',
     '',
   ].join('\n'))

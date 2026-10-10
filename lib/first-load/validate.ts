@@ -186,3 +186,10 @@ export function dispositionAnomalies(dispositions: RowDisposition[]): string[] {
   }
   return [...seen.entries()].filter(([, count]) => count !== 1).map(([id, count]) => `${id} has ${count} dispositions`)
 }
+
+/**
+ * A spreadsheet treats a cell that starts with `=`, `@`, a tab or a carriage return, or with `+` / `-` followed by anything but a digit or a point,
+ * as a formula. Data files are never altered for that reason; the risk is reported, and an escaped inspection copy is offered where a file is meant
+ * to be looked at by a person.
+ */
+export const FORMULA_LEADING = /^(?:[=@\t\r]|[+-](?![0-9.]))/

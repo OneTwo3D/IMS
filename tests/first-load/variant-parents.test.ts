@@ -289,3 +289,64 @@ test('arm (p): the synthetic fixture run through the command line equals the gol
   assert.ok(types.lastIndexOf('VARIABLE') < types.indexOf('VARIANT'), 'every VARIABLE parent precedes the first VARIANT in the file')
   assert.equal(types.filter((type) => type === 'VARIABLE').length, 3, 'three parents for four variants')
 })
+
+test('arm (q): when the join is required, a variant whose parent the products file names but WooCommerce does not confirm is rejected', (t) => {
+  const result = run({
+    products: ds('products', [product('M', 'VARIABLE'), variant('M-01', { parentSku: 'M' }), variant('M-02', { parentSku: 'M' })]),
+    'variant-parents': ds('variant-parents', [vp('M-01', 'M')]),
+  })
+  precondition(t, 'variants named in the products file', 2)
+  assert.deepEqual(dispositionCodes(result, 'products', 'REJECTED'), ['VARIANT_PARENT_UNCONFIRMED'])
+  assert.equal(result.report.findings.find((f) => f.code === 'VARIANT_PARENT_UNCONFIRMED')?.severity, 'ERROR')
+  assert.deepEqual(result.report.findings.find((f) => f.code === 'VARIANT_PARENT_UNCONFIRMED')?.keys, ['M-02'])
+  assert.equal(result.blocking, true)
+})
+
+test('arm (q2): requireVariantParents with no dataset rejects every variant; without the flag the same input loads as before', (t) => {
+  const products = ds('products', [product('M', 'VARIABLE'), variant('M-01', { parentSku: 'M' }), variant('M-02', { parentSku: 'M' })])
+  const required = run({ products }, { requireVariantParents: true })
+  const optional = run({ products })
+  precondition(t, 'variants', 2)
+  assert.deepEqual(dispositionCodes(required, 'products', 'REJECTED'), ['VARIANT_PARENT_UNCONFIRMED', 'VARIANT_PARENT_UNCONFIRMED'])
+  assert.match(required.report.dispositions[0].reason, /no variant-parents dataset was supplied/)
+  assert.equal(optional.blocking, false, 'the default is unchanged')
+  assert.deepEqual(rowsOf(optional, 'products').filter((r) => r.type === 'VARIANT').map((r) => r.parentSku), ['M', 'M'])
+})
+
+test('arm (q3): a prefilled parent that disagrees with WooCommerce rejects the variation row AND the variant', (t) => {
+  const result = run({
+    products: ds('products', [product('M', 'VARIABLE'), product('N', 'VARIABLE'), variant('M-01', { parentSku: 'M' })]),
+    'variant-parents': ds('variant-parents', [vp('M-01', 'N')]),
+  })
+  precondition(t, 'disagreements', 1)
+  assert.deepEqual(dispositionCodes(result, 'variant-parents', 'REJECTED'), ['PARENT_CONFLICT'])
+  assert.deepEqual(dispositionCodes(result, 'products', 'REJECTED'), ['VARIANT_PARENT_UNCONFIRMED'])
+})
+
+test('arm (r): a VARIABLE parent the products file carries takes WooCommerce\'s title and mapped lifecycle, and the difference is reported', (t) => {
+  const result = run({
+    products: ds('products', [product('M', 'VARIABLE', { name: 'Qoblex title' }), variant('M-01', { parentSku: 'M' })]),
+    'variant-parents': ds('variant-parents', [vp('M-01', 'M', { parentName: 'Woo title', parentStatus: 'draft' })]),
+  })
+  const parent = rowsOf(result, 'products').find((r) => r.sku === 'M')!
+  precondition(t, 'parents carried by the products file', 1)
+  assert.equal(parent.name, 'Woo title')
+  assert.equal(parent.lifecycleStatus, 'DRAFT')
+  const info = result.report.findings.find((f) => f.code === 'PARENT_ATTRIBUTES_FROM_WOO')
+  assert.equal(info?.severity, 'INFO')
+  assert.equal(info?.keys?.length, 1)
+  assert.equal(result.blocking, false)
+})
+
+test('arm (s): formula-looking cells in an import file are reported and the file is not altered', (t) => {
+  const result = run({
+    products: ds('products', [product('F-1', 'SIMPLE', { name: '=1+1' }), product('F-2', 'SIMPLE', { name: '- Spacer' }), product('F-3', 'SIMPLE', { name: '-5V cable' }), product('F-4', 'SIMPLE', { name: '@home' })]),
+  })
+  const finding = result.report.findings.find((f) => f.code === 'FORMULA_LEADING_CELL')
+  precondition(t, 'formula-looking cells', finding?.keys?.length ?? 0)
+  assert.deepEqual(finding?.keys, ['products:name:F-1', 'products:name:F-2', 'products:name:F-4'])
+  assert.equal(finding?.severity, 'WARNING')
+  assert.equal(result.blocking, false)
+  const names = rowsOf(result, 'products').map((r) => r.name)
+  assert.deepEqual(names, ['=1+1', '- Spacer', '-5V cable', '@home'], 'the importer reads exactly what the source said')
+})

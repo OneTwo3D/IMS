@@ -10,7 +10,7 @@ import test from 'node:test'
 import {
   APPLY_TIME_CHECKS, DATASETS, DATASET_NAMES, EXIT_CODE_TABLE, SNAPSHOT_EXIT_CODE_TABLE, SNAPSHOT_FILE_NAMES, VARIANT_PARENT_STATUS_LIFECYCLE, IMPORTER_MAX_BYTES, IMPORTER_MAX_ROWS, IMPORT_TARGETS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE, type ImporterTarget,
 } from '../../lib/first-load/spec.ts'
-import { ENV_KEYS, DEFAULT_MIN_INTERVAL_MS } from '../../lib/first-load/woo-snapshot/cli.ts'
+import { ENV_KEYS, DEFAULT_MIN_INTERVAL_MS, DEFAULT_MAX_RESUME_AGE_MINUTES } from '../../lib/first-load/woo-snapshot/cli.ts'
 import { WALK_MAX_ATTEMPTS } from '../../lib/first-load/woo-snapshot/walk.ts'
 import { precondition } from './helpers.ts'
 
@@ -104,8 +104,9 @@ test('the snapshot command section documents exactly the environment variables t
   assert.deepEqual([...documented].sort(), Object.values(ENV_KEYS).sort(), 'every variable the command reads is documented, and none that it does not')
   const files = tableRows(body.slice(body.indexOf('| File |'), body.indexOf('**Completeness is proved')))
   precondition(t, 'documented output files', files.length)
-  assert.deepEqual(files.map((row) => row[0].replace(/`/g, '')).sort(), [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.variantParents].sort())
+  assert.deepEqual(files.map((row) => row[0].replace(/`/g, '')).sort(), [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection].sort())
   assert.ok(body.includes(`(default ${DEFAULT_MIN_INTERVAL_MS})`), 'the documented default interval is the real one')
+  assert.ok(body.includes(`(default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`), 'the documented resume age is the real one')
   assert.equal(WALK_MAX_ATTEMPTS, 3)
   assert.ok(body.includes('retried up to three times'), 'the documented retry count is the real one')
   assert.ok(body.includes(SNAPSHOT_FILE_NAMES.partial), 'the resume file is documented')

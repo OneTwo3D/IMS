@@ -92,7 +92,7 @@ test('arm (a): a complete walk over several pages writes the snapshot, its prove
     precondition(t, 'requests served', r.server.requests.length)
     precondition(t, 'product pages walked', r.server.requests.filter((q) => q.path.endsWith('/products')).length)
     assert.ok(r.server.requests.filter((q) => q.path.endsWith('/products')).length >= 2, 'the store granted 2 rows a page, so the walk must page')
-    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents].sort())
+    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection].sort())
     const parsed = parseSnapshotFile(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8'))
     assert.ok(parsed.ok)
     if (!parsed.ok) return
@@ -399,8 +399,8 @@ test('arm (j): a walk that failed part-way resumes without asking for a finished
     failing = false
     const resumed = await snapshot(r, ['--resume'])
     assert.equal(resumed.code, SNAPSHOT_EXIT_CODES.OK, resumed.stderr)
-    assert.equal(requestsTo(r.server, '/products', 1), page1Before, 'page 1 was not requested again')
-    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents].sort(), 'the partial walk is removed once the snapshot is complete')
+    assert.equal(requestsTo(r.server, '/products', 1), page1Before + 1, 'page 1 was not requested again by the resumed walk; the one extra request is the verifying second walk')
+    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection].sort(), 'the partial walk is removed once the snapshot is complete')
     for (const name of [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents]) {
       assert.equal(readFileSync(path.join(r.out, name), 'utf8'), readFileSync(path.join(clean.out, name), 'utf8'), name)
     }
@@ -545,5 +545,155 @@ test('arm (o): end to end: the snapshot\'s variant-parents.csv, fed to first-loa
     assert.equal(bySku['W-01'][6], 'WIDGET')
     assert.equal(bySku.BIG[5], 'VARIABLE')
     assert.ok(!('EMPTY' in bySku), 'a WooCommerce parent without variations is not loaded')
+  } finally { await r.server.close() }
+})
+
+// ---------------------------------------------------------------------------
+// Review round 1: stability, redirects, error text, resume age, formula cells
+// ---------------------------------------------------------------------------
+
+test('arm (q): a stable store is confirmed by a second complete walk (round 1)', async (t) => {
+  const r = await rig({ pageSizeCap: 2 })
+  try {
+    const ran = await snapshot(r)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.OK, ran.stderr)
+    precondition(t, 'page-1 product requests (one per walk)', requestsTo(r.server, '/products', 1))
+    assert.equal(requestsTo(r.server, '/products', 1), 2, 'the walk and the verifying walk')
+    assert.equal(JSON.parse(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.provenance), 'utf8')).verificationRounds, 1)
+    assert.ok(r.server.requests.every((q) => q.query.orderby === 'id' && q.query.order === 'asc'), 'the ordering is explicit on every request')
+  } finally { await r.server.close() }
+})
+
+test('arm (q2): a product deleted on page 1 and another added at the end before page 2 (total unchanged, a survivor skipped) is detected, and the next round reads the real catalogue', async (t) => {
+  const parents = catalogue()
+  let fired = 0
+  const r = await rig({
+    pageSizeCap: 2,
+    intercept: (c, res) => {
+      if (c.route === 'products' && c.page === 1 && fired === 0) {
+        fired++
+        parents.splice(0, 1) // delete id 100, which page 1 already carries
+        parents.push({ id: 500, sku: 'NEWEST', name: 'Added meanwhile', variations: [{ id: 5001, sku: 'N-01' }] })
+      }
+      return res
+    },
+  }, parents)
+  try {
+    const ran = await snapshot(r)
+    precondition(t, 'mutations the store made between pages', fired)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.OK, ran.stderr)
+    const parsed = parseSnapshotFile(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8'))
+    assert.ok(parsed.ok)
+    if (!parsed.ok) return
+    assert.deepEqual(parsed.payload.parents.map((p) => p.id), [200, 300, 400, 500], 'the survivor 300 is not skipped, the deleted 100 is gone')
+    assert.equal(JSON.parse(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.provenance), 'utf8')).verificationRounds, 2)
+  } finally { await r.server.close() }
+})
+
+test('arm (q3): a store that never stops changing is refused after the bounded rounds, and nothing is written', async (t) => {
+  const parents = catalogue()
+  let next = 600
+  let fired = 0
+  const r = await rig({
+    pageSizeCap: 2,
+    intercept: (c, res) => {
+      if (c.route === 'products' && c.page === 1) {
+        fired++
+        parents.splice(0, 1)
+        parents.push({ id: next, sku: `CHURN${next}`, name: 'churn', variations: [{ id: next + 1, sku: `C-${next}` }] })
+        next += 10
+      }
+      return res
+    },
+  }, parents)
+  try {
+    const ran = await snapshot(r)
+    precondition(t, 'mutations the store made', fired)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, ran.stderr)
+    assert.match(ran.stderr, /not stable enough/)
+    assert.deepEqual(listFiles(r.out), [])
+  } finally { await r.server.close() }
+})
+
+test('arm (r): a redirect is refused and its target is never requested (cross-origin, and same-origin as the isolating case)', async (t) => {
+  const other = await startFakeCatalogue({ key: KEY, secret: SECRET, parents: catalogue() })
+  let crossed = 0
+  const r = await rig({ intercept: (c, res) => (c.route === 'products' ? (crossed++, { status: 302, headers: { location: `${other.origin}/wp-json/wc/v3/products?type=variable` }, body: {} }) : res) })
+  let again = 0
+  const same = await rig({ intercept: (c, res) => (c.route === 'products' && c.attempt === 1 && again++ === 0 ? { status: 302, headers: { location: `${same_origin()}/wp-json/wc/v3/products?type=variable&status=any&per_page=100&page=1&orderby=id&order=asc` }, body: {} } : res) })
+  function same_origin(): string { return same.server.origin }
+  try {
+    const ran = await snapshot(r)
+    precondition(t, 'redirects the store answered with', crossed)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.FETCH_FAILED, ran.stderr)
+    assert.match(ran.stderr, /redirect, which is refused/)
+    assert.equal(other.requests.length, 0, 'NOT ONE request reached the other origin')
+    const ranSame = await snapshot(same)
+    assert.equal(ranSame.code, SNAPSHOT_EXIT_CODES.FETCH_FAILED, ranSame.stderr)
+    assert.equal(same.server.requests.length, 1, 'the same-origin Location was not followed either')
+  } finally { await r.server.close(); await same.server.close(); await other.close() }
+})
+
+test('arm (s): an upstream error body that echoes the credentials never reaches any output: status and code only', async (t) => {
+  const token = Buffer.from(`${KEY}:${SECRET}`).toString('base64')
+  let served = 0
+  const r = await rig({ intercept: (c, res) => (c.route === 'products' ? (served++, { status: 500, headers: {}, body: { code: 'internal_error', message: `Authorization: Basic ${token} key=${KEY} secret=${SECRET}` } }) : res) })
+  try {
+    const ran = await snapshot(r)
+    precondition(t, 'error responses carrying the credentials', served)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.FETCH_FAILED)
+    assert.match(ran.stderr, /HTTP 500 \(internal_error\)/)
+    const all = [ran.stdout, ran.stderr, ...(existsSync(r.out) ? readdirSync(r.out).map((n) => readFileSync(path.join(r.out, n), 'utf8')) : [])]
+    precondition(t, 'output texts searched', all.length)
+    for (const text of all) assert.ok(!text.includes(token) && !text.includes(SECRET) && !text.includes(KEY), 'a credential reached an output')
+  } finally { await r.server.close() }
+})
+
+test('arm (s2): the redaction backstop alone: a credential that arrives as store data (a product type) is removed from the message', async (t) => {
+  const parents = catalogue()
+  parents[2].type = SECRET
+  const r = await rig({}, parents)
+  try {
+    const ran = await snapshot(r)
+    precondition(t, 'messages that quote store data', 1)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
+    assert.ok(!ran.stderr.includes(SECRET))
+    assert.match(ran.stderr, /\[redacted\]/)
+  } finally { await r.server.close() }
+})
+
+test('arm (t): an unfinished walk older than the allowed age is not resumed, and a young one is', async (t) => {
+  let failing = true
+  const r = await rig({ pageSizeCap: 2, intercept: (c, res) => (failing && c.route === 'products' && c.page === 2 ? { status: 500, headers: {}, body: {} } : res) })
+  try {
+    assert.equal((await snapshot(r)).code, SNAPSHOT_EXIT_CODES.FETCH_FAILED)
+    failing = false
+    const before = r.server.requests.length
+    const old = await snapshot(r, ['--resume'], { now: () => FIXED_NOW + 2 * 3_600_000 })
+    precondition(t, 'resumes of a walk two hours old', 1)
+    assert.equal(old.code, SNAPSHOT_EXIT_CODES.REFUSED, old.stderr)
+    assert.match(old.stderr, /older than 60 minute/)
+    assert.equal(r.server.requests.length, before, 'nothing was requested')
+    const young = await snapshot(r, ['--resume'], { now: () => FIXED_NOW + 5 * 60_000 })
+    assert.equal(young.code, SNAPSHOT_EXIT_CODES.OK, young.stderr)
+  } finally { await r.server.close() }
+})
+
+test('arm (u): formula-leading WooCommerce text: the data file keeps it exactly, the inspection copy neutralises it, the provenance counts it', async (t) => {
+  const parents = catalogue()
+  parents[0].name = '=HYPERLINK("http://example.invalid","x")'
+  parents[1].name = '-Spacer kit'
+  parents[3].name = '-5V cable'
+  const r = await rig({}, parents)
+  try {
+    assert.equal((await snapshot(r)).code, SNAPSHOT_EXIT_CODES.OK)
+    const data = readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.variantParents), 'utf8')
+    const inspect = readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.variantParentsInspection), 'utf8')
+    const provenance = JSON.parse(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.provenance), 'utf8'))
+    precondition(t, 'formula-leading cells counted', provenance.formulaLeadingCells)
+    assert.equal(provenance.formulaLeadingCells, 4, 'three WIDGET rows carry the = title and the one GADGET row with a SKU carries -Spacer; the BIG rows with -5V are not formulas')
+    assert.ok(data.includes('=HYPERLINK') && !data.includes("'=HYPERLINK"), 'the data file is untouched')
+    assert.ok(inspect.includes("'=HYPERLINK") && inspect.includes("'-Spacer kit"), 'the inspection copy is neutralised')
+    assert.ok(inspect.includes(',-5V cable,') && !inspect.includes("'-5V"), 'a name that merely starts with "-5" is not a formula')
   } finally { await r.server.close() }
 })

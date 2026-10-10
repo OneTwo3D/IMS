@@ -28,6 +28,11 @@ export type ConnectorFetchOptions = Pick<
    * for any scoped write except the one that mints credentials.
    */
   outboundWriteContext?: { writeScopeId?: string | number | null }
+  /**
+   * When true, a redirect response is an ERROR and the Location is never requested. For callers that must prove every request went to the one
+   * origin they named (a credentialed read of a store): the default follows up to MAX_REDIRECTS hops, each revalidated.
+   */
+  refuseRedirects?: boolean
 }
 
 const MAX_REDIRECTS = 5
@@ -442,6 +447,9 @@ export async function connectorFetch(
       if (!nextUrl) {
         redirectsFollowedByResponse.set(response, redirectCount)
         return response
+      }
+      if (options.refuseRedirects) {
+        throw new Error(`${options.connectorName} answered with a redirect (HTTP ${response.status}); redirects are refused for this request and the target was not requested.`)
       }
       if (redirectCount === MAX_REDIRECTS) {
         throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
