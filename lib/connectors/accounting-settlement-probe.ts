@@ -36,6 +36,8 @@ import {
 import { readSingleXeroDocument } from '@/lib/connectors/xero/single-document'
 import { formatLedgerMoney } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import type { OperatorLedgerCheck, OperatorLedgerCheckScope } from '@/lib/domain/accounting/operator-ledger-check'
+import type { RequiredXeroConnection } from '@/lib/connectors/xero/api'
 import {
   addMoney,
   compareDecimal,
@@ -2207,7 +2209,21 @@ export async function probeLedgerSettlement(
     switch (connector) {
       case 'xero': {
         const { xeroGet } = await import('./xero/api')
-        return await probeXeroSettlement(target, xeroGet as XeroFetcher)
+        // o3d-llyw — WHICH CONNECTION SERVED THIS ANSWER, FROM THE RESPONSES THEMSELVES. Every fetch the
+        // probe makes is recorded with the tenant and connection generation its request was BUILT from
+        // (request-bound; see `XeroResponse.connectionGeneration`), and the answer states a binding only
+        // when all of them agree. The r5 snapshot pair this replaces read the token row before and after;
+        // nothing here reads the database. Only the operator-ledger-check rule reads `answeredBy`.
+        const served: Array<{ tenantId?: string | null; connectionGeneration?: string | null }> = []
+        const fetcher: XeroFetcher = async <T>(path: string) => {
+          const res = await xeroGet<T>(path)
+          served.push({ tenantId: res.tenantId ?? null, connectionGeneration: res.connectionGeneration ?? null })
+          return res
+        }
+        const probe = await probeXeroSettlement(target, fetcher)
+        if (!probe.ok) return probe
+        const { bindProbeToConnection } = await import('@/lib/domain/accounting/operator-ledger-check')
+        return { ...probe, answeredBy: bindProbeToConnection(served) }
       }
       default:
         // A connector with no probe REFUSES, it does not answer "nothing found". `connector` is
@@ -2255,7 +2271,13 @@ export async function ledgerClearsFollowUpRevival(params: {
   tokenDisposition: 'pinned' | 'rotated'
   /** The row being revived, so its own mark can be looked for. */
   syncLogId?: string
-}): Promise<{ clear: true } | { clear: false; reason: string }> {
+  /**
+   * o3d-llyw — reads the operator ledger checks recorded for the row being revived (see
+   * operator-ledger-check.ts). Only asked when a check could change the verdict; absent = no check
+   * applies, which is the withholding answer.
+   */
+  loadOperatorLedgerChecks?: (scope: OperatorLedgerCheckScope) => Promise<readonly OperatorLedgerCheck[]>
+}): Promise<{ clear: true; liftedByCheckIds?: string[] } | { clear: false; reason: string }> {
   const { isMoneyMovingSyncType, effectiveTokenFor } = await import('@/lib/domain/accounting/followup-retry-guard')
   if (params.tokenDisposition !== 'pinned' || !isMoneyMovingSyncType(params.type)) return { clear: true }
 
@@ -2270,13 +2292,41 @@ export async function ledgerClearsFollowUpRevival(params: {
   // (see `classifyLedgerSettlement`), so every caller is now in the position this one was always in
   // — and the note is kept only so the next reader knows the omission here was deliberate before it
   // was mandatory.
-  const verdict = classifyLedgerSettlement(describeAttempt(params.type, params.payload, marker), probe)
-  if (verdict.outcome === 'clear') return { clear: true }
+  //
+  // o3d-llyw — AND THE OPERATOR LEDGER CHECK IS HONOURED HERE, under the same rule as at the enqueue
+  // decision and the post fence (operator-ledger-check.ts): the row being revived IS the attempt, and the
+  // receipt its money would settle is its own. Nothing is excluded on any identity IMS recorded about
+  // itself; only records a person named, under the connection that served this probe.
+  const { judgeAttemptWithOperatorChecks, ledgerCheckScopeForPost, describeLedgerCheckRemedy, describeAttemptForLedgerCheck } =
+    await import('@/lib/domain/accounting/operator-ledger-check')
+  const attempt = describeAttempt(params.type, params.payload, marker)
+  const judged = params.syncLogId
+    ? await judgeAttemptWithOperatorChecks(
+      attempt,
+      probe,
+      ledgerCheckScopeForPost({ type: params.type, connector: params.connector, attemptSyncLogId: params.syncLogId, postingPayload: params.payload }),
+      params.loadOperatorLedgerChecks,
+    )
+    : { verdict: classifyLedgerSettlement(attempt, probe), liftedByCheckIds: [] as string[], remedy: null }
+  const verdict = judged.verdict
+  if (verdict.outcome === 'clear') {
+    return judged.liftedByCheckIds.length > 0 ? { clear: true, liftedByCheckIds: judged.liftedByCheckIds } : { clear: true }
+  }
+  const reason = verdict.outcome === 'present'
+    ? `the ledger already holds a settlement of ${verdict.detail} matching this attempt`
+    : verdict.reason
   return {
     clear: false,
-    reason: verdict.outcome === 'present'
-      ? `the ledger already holds a settlement of ${verdict.detail} matching this attempt`
-      : verdict.reason,
+    reason: judged.remedy && params.syncLogId
+      ? `${reason}. ${describeLedgerCheckRemedy(judged.remedy, describeAttemptForLedgerCheck({
+        syncLogId: params.syncLogId,
+        status: 'FAILED',
+        amount: attempt.amount === null ? null : formatLedgerMoney(attempt.amount),
+        currency: attempt.currency,
+        date: attempt.date,
+        marker,
+      }), 'revival')}`
+      : reason,
   }
 }
 
@@ -2363,6 +2413,12 @@ export type MoneyPostFenceParams = {
     }
   }
   /**
+   * o3d-llyw — reads the operator ledger checks recorded for one contender (see operator-ledger-check.ts).
+   * Only asked when a check could change that contender's verdict. ABSENT = no check applies at this
+   * fence, which is the withholding answer: a call site that forgets to pass it keeps today's refusal.
+   */
+  loadOperatorLedgerChecks?: (scope: OperatorLedgerCheckScope) => Promise<readonly OperatorLedgerCheck[]>
+  /**
    * The clock for the ATTEMPT STAMP only, injected so the write is testable.
    *
    * Deliberately NOT the source of the posting date any more (round 7, Codex HIGH #1) — that
@@ -2374,7 +2430,7 @@ export type MoneyPostFenceParams = {
 
 export async function authoriseMoneyPost(
   params: MoneyPostFenceParams,
-): Promise<{ proceed: true } | { proceed: false; error: string }> {
+): Promise<{ proceed: true; requireConnection?: RequiredXeroConnection } | { proceed: false; error: string }> {
   const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
   if (!isMoneyMovingSyncType(params.type)) return { proceed: true }
 
@@ -2457,6 +2513,8 @@ export async function authoriseMoneyPost(
   })
   const { classifyLedgerSettlement, comparableAttemptDate, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const { effectiveTokenFor, attemptCouldHaveReachedTheLedger, attemptCouldBeTheSameDocument } = await import('@/lib/domain/accounting/followup-retry-guard')
+  const { judgeAttemptWithOperatorChecks, ledgerCheckScopeForPost, describeLedgerCheckRemedy, describeAttemptForLedgerCheck } =
+    await import('@/lib/domain/accounting/operator-ledger-check')
 
   // EVERY CONTENDER, EACH BY ITS OWN MARK — this row and every rival that could have settled the
   // same document (Codex round 3 follow-up). Judging only this row's own attempt was the hole the
@@ -2602,6 +2660,13 @@ export async function authoriseMoneyPost(
     return { proceed: true }
   }
 
+  // o3d-llyw (Codex r4 on #757) — A POST AUTHORISED BY AN OPERATOR LEDGER CHECK IS BOUND TO THE CONNECTION
+  // THE CHECK WAS VALIDATED AGAINST. The check matched the tenant and generation that served THIS probe;
+  // the POST resolves auth again, and a reconnect in between would send it under a consent the check
+  // says nothing about. So when any contender's hold was lifted by a check, the probe's connection is
+  // handed to the post callback, and the transport refuses before egress unless the POST's own auth is
+  // exactly that connection (`requireConnection`, notSent `connection-changed`).
+  let requireConnection: RequiredXeroConnection | undefined
   for (const contender of contenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
     // o3d-r948 r6 — THIS LOOP NEVER NEEDED THE EXCLUSION, AND NOW NOBODY HAS IT.
@@ -2622,8 +2687,31 @@ export async function authoriseMoneyPost(
     //   document.
     //
     // What changed in r6 is only that there is no option to omit. See `classifyLedgerSettlement`.
-    const verdict = classifyLedgerSettlement(describeAttempt(params.type, contender.payload, marker), probe)
-    if (verdict.outcome === 'clear') continue
+    //
+    // o3d-llyw — THE ONE THING THAT MAY NOW SET A RECORD ASIDE ON A CONTENDER'S TURN is an operator
+    // ledger check recorded for THIS contender and the receipt THIS post would settle, under the
+    // connection that served this very probe (operator-ledger-check.ts). The argument above is untouched
+    // for everything else: a contender's own unmeasurable record cannot be checked away by a person who
+    // knows it is that contender's (the recorder refuses a check for a SYNCED row, and the rule never
+    // clears `present`), and a SYNCED rival whose payment IMS can match still refuses here.
+    const contenderAttempt = describeAttempt(params.type, contender.payload, marker)
+    const judged = await judgeAttemptWithOperatorChecks(
+      contenderAttempt,
+      probe,
+      ledgerCheckScopeForPost({ type: params.type, connector: params.connector, attemptSyncLogId: contender.id, postingPayload: params.payload }),
+      params.loadOperatorLedgerChecks,
+    )
+    const verdict = judged.verdict
+    if (verdict.outcome === 'clear') {
+      if (judged.liftedByCheckIds.length > 0) {
+        // A lift is only ever granted on a bound probe (the rule refuses `answeredBy` null), so this is set.
+        if (!probe.ok || !probe.answeredBy) {
+          return { proceed: false, error: 'Not sent: an operator ledger check applied but the reading it was checked against names no connection.' }
+        }
+        requireConnection = probe.answeredBy
+      }
+      continue
+    }
     if (verdict.outcome === 'present') {
       return {
         proceed: false,
@@ -2636,10 +2724,20 @@ export async function authoriseMoneyPost(
       proceed: false,
       error: `Not sent: ${contender.own ? 'this entry has been attempted before' : `another entry for this document has been attempted (${contender.id})`} `
         + `and IMS could not establish whether that attempt reached the ledger (${verdict.reason}). `
-        + 'Re-posting could pay the document twice.',
+        + 'Re-posting could pay the document twice.'
+        + (judged.remedy
+          ? ` ${describeLedgerCheckRemedy(judged.remedy, describeAttemptForLedgerCheck({
+            syncLogId: contender.id,
+            status: contender.own ? 'earlier' : 'rival',
+            amount: contenderAttempt.amount === null ? null : formatLedgerMoney(contenderAttempt.amount),
+            currency: contenderAttempt.currency,
+            date: contenderAttempt.date,
+            marker,
+          }), 'post')}`
+          : ''),
     }
   }
-  return { proceed: true }
+  return requireConnection ? { proceed: true, requireConnection } : { proceed: true }
 }
 
 /** What a money branch returns to its processor. Structurally the two connectors' `EntryResult`. */
@@ -2770,12 +2868,16 @@ async function reportLostMoneyPostExclusion(
  */
 export async function postMoneyUnderLedgerFence(
   params: MoneyPostFenceParams & { lock?: MoneyPostLock },
-  post: () => Promise<MoneyPostOutcome>,
+  /**
+   * The remote call. o3d-llyw: receives the connection it MUST be sent under when the authorisation
+   * rested on an operator ledger check (pass it to the transport as `requireConnection`); absent otherwise.
+   */
+  post: (context: { requireConnection?: RequiredXeroConnection }) => Promise<MoneyPostOutcome>,
 ): Promise<MoneyPostOutcome> {
   const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
   // Non-money types take neither the lock nor the fence, exactly as before: the ordinary queue
   // traffic must not queue behind a payment.
-  if (!isMoneyMovingSyncType(params.type)) return post()
+  if (!isMoneyMovingSyncType(params.type)) return post({})
 
   const lock = params.lock
     ?? (await import('@/lib/domain/accounting/money-post-lock')).withMoneyPostLock
@@ -2798,7 +2900,7 @@ export async function postMoneyUnderLedgerFence(
     held.assertHeld('posting money to the accounting connector')
     let outcome: MoneyPostOutcome
     try {
-      outcome = await post()
+      outcome = await post(authorised.requireConnection ? { requireConnection: authorised.requireConnection } : {})
     } catch (error) {
       if (!held.lost) throw error
       const incident = await reportLostMoneyPostExclusion(params, 'threw')
