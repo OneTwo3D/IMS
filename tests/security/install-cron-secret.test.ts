@@ -15,7 +15,9 @@ test('installer cron entries read the secret at runtime and never embed it', asy
   // unusable secret runs nothing (the empty-secret guard).
   assert.match(installScript, /case "\$CRON_SECRET" in ''\|\*\\\\\*\) echo "cron-auth: CRON_SECRET is missing or unusable/)
   assert.match(installScript, /curl -sf -o \/dev\/null -K - "\$BASE_URL\/@SLUG@"/)
-  assert.doesNotMatch(installScript, /-H \\?"Authorization: Bearer \\?\$CRON_SECRET/)
+  // (the lines that RECOGNISE the old form so they can be rewritten name it, and are the only ones that may)
+  const withoutRecognisers = installScript.split('\n').filter((l) => !/re_(runtime|literal)=|CRON_LEGACY_SIGNATURE=/.test(l)).join('\n')
+  assert.doesNotMatch(withoutRecognisers, /-H \\?"Authorization: Bearer \\?\$CRON_SECRET/)
 
   // Bootstrap jobs are written INSIDE the OTI markers so the first in-app sync
   // replaces the block in place (no unmanaged duplicate lines that drift).

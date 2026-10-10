@@ -5912,7 +5912,8 @@ test('[o3d-batch-ret] no `*_locked` body writes the crontab except through the o
   assert.equal(ALL_LOCKED_BODIES.length, 15)
   const writes = ALL_LOCKED_BODIES.flatMap((b) => b.lines.filter(
     (l) => !isComment(l) && /\bwrite_crontab_for\b/.test(l)))
-  assert.equal(writes.length, 13,
+  // 14: the installer's bootstrap now has a second write (the in-place rewrite of legacy cron job lines, o3d-kb3dq)
+  assert.equal(writes.length, 14,
     'every crontab write in the three entrypoints must be one of these; a count that drifted '
     + 'means a site was added or removed without this test being read')
 

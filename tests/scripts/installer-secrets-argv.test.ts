@@ -130,18 +130,29 @@ function logicalLines(text: string): Array<{ line: number; text: string }> {
   return out
 }
 
-const SECRET_WORD = '(?:PASSWORD|PASS|SECRET|TOKEN|API_KEY|CONSUMER_KEY|PRIVATE_KEY|DATABASE_URL|_URL)'
+const SECRET_WORD = '(?:PASSWORD|PASS|SECRET|TOKEN|API_KEY|APIKEY|CONSUMER_KEY|PRIVATE_KEY|DATABASE_URL|_URL|_KEY)'
+/** A variable expansion (plain, braced, or escaped for a generated string) whose NAME says it is a secret. */
+const SECRET_EXPANSION = String.raw`\\?\$\{?[A-Za-z0-9_]*(?:PASSWORD|PASS|SECRET|TOKEN|API_?KEY|CONSUMER_KEY|PRIVATE_KEY|_KEY|DATABASE_URL)[A-Za-z0-9_]*`
 /** [rule, pattern]: a line matching puts a secret where `ps` shows it. */
 const RULES: Array<[string, RegExp]> = [
   // R1: a secret handed to a command as an `env NAME=value` / runuser argument (the value is on argv).
   ['R1 env-assignment argument', new RegExp(`(?:^|[\\s(;&|\`])(?:env|run_as_user|run_as_user_db|as_app_user|as_app_user_db|runuser|sudo)\\s[^#]*\\b[A-Z0-9_]*${SECRET_WORD}[A-Z0-9_]*=["']?\\$`)],
-  // R2: a bearer token / credential in a curl header or -u argument.
-  ['R2 curl credential argument', /curl\b[^#]*(?:-H\s+\\?["']?Authorization:[^"']*\\?\$|\s-u\s+\\?["']?[^\s"']*\\?\$|--user\s)/],
-  // R3: a connection string with a password as a positional / --dbname argument.
-  ['R3 connection URL argument', /\b(?:pg_dump|pg_dumpall|psql|pg_restore|redis-cli)\s[^#|]*["']?\$\{?[A-Z_]*DATABASE_URL\}?["']?/],
-  // R4: a password option.
-  ['R4 password option', /\s--password(?:=|\s+)["']?\$/],
-  ['R5 redis -a', /redis-cli\b[^#]*\s-a\s+["']?\$/],
+  // R2: a credential-bearing curl argument: ANY header (-H / --header) whose value expands a secret or says Bearer/Basic,
+  // a -u / --user argument, a --oauth2-bearer / --proxy-user argument.
+  ['R2 curl credential argument', new RegExp(String.raw`curl\b[^#]*(?:(?:-H|--header)\s+\\?["']?[A-Za-z][A-Za-z0-9-]*:[^"']*(?:${SECRET_EXPANSION}|\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9_.=-]{8,})|\s(?:-u|--user|--proxy-user)[\s=]+\\?["']?[^\s"']*(?:\\?\$|:[^\s"'@]+)|--oauth2-bearer\s)`)],
+  // R3: a connection string with a password as an argument of a database / cache client.
+  ['R3 connection URL argument', new RegExp(String.raw`\b(?:pg_dump|pg_dumpall|psql|pg_restore|redis-cli|mongosh?|mongodump|mongorestore)\s[^#|]*(?:["']?\$\{?[A-Z_]*(?:DATABASE_URL|_URL)\}?["']?|(?:postgres(?:ql)?|redis|rediss|mongodb(?:\+srv)?)://[^\s/@:"']+:[^\s@"']+@)`)],
+  // R4: a password option (pct, mysql, mysqladmin, mysqldump, sshpass, ftp-style tools).
+  ['R4 password option', new RegExp(String.raw`\s--(?:password|http-password|ftp-password|proxy-password|passwd)(?:=|\s+)\\?["']?(?:\\?\$|[^\s"'$-][^\s]*)`)],
+  ['R5 redis -a', /redis-cli\b[^#]*\s-a\s+\\?["']?\$/],
+  // R6: mysql-family `-p<password>` (attached) or `-p $VAR`, and sshpass `-p`.
+  ['R6 mysql/sshpass -p', new RegExp(String.raw`\b(?:mysql|mysqladmin|mysqldump|mariadb|mariadb-dump)\b[^#|]*\s-p(?:\\?["']?\\?\$|[^\s-][^\s]*)|\bsshpass\b[^#|]*\s-p\s*\\?["']?[^\s"']+`)],
+  // R7: openssl password sources on the command line (pass:, -k).
+  ['R7 openssl pass:', /\bopenssl\b[^#|]*(?:-pass(?:in|out)?\s+\\?["']?pass:|-k\s+\\?["']?[^\s"']+)/],
+  // R8: wget credentials / headers.
+  ['R8 wget credential', new RegExp(String.raw`\bwget\b[^#|]*(?:--header[=\s]+\\?["']?[A-Za-z][A-Za-z0-9-]*:[^"']*(?:${SECRET_EXPANSION}|\b(?:Bearer|Basic)\s+\S{8,})|--(?:user|password|http-user|http-password)[=\s])`)],
+  // R9: a container started with a secret in an -e / --env argument (the value is on the docker CLI's argv).
+  ['R9 docker -e secret', new RegExp(String.raw`\bdocker\b[^#|]*\s(?:-e|--env)[\s=]+\\?["']?[A-Za-z0-9_]*${SECRET_WORD}[A-Za-z0-9_]*=`)],
 ]
 
 interface Finding { rule: string; file: string; line: number; text: string }
@@ -168,6 +179,16 @@ function shellSources(): Record<string, string> {
 /** The sites that remain, with the reason each cannot (or need not) change. A new finding fails the test. */
 const ALLOWED: Array<{ file: string; match: string; reason: string }> = [
   {
+    file: 'scripts/install.sh',
+    match: 're_runtime="^${sched}CRON_SECRET=',
+    reason: 'a REGEX that recognises the legacy cron line so it can be rewritten (migrate_legacy_cron_lines); it is parsing text, not running a command.',
+  },
+  {
+    file: 'scripts/install.sh',
+    match: 're_literal="^${sched}curl -sf -o /dev/n',
+    reason: 'the same: the regex for the legacy embedded-literal form.',
+  },
+  {
     file: 'scripts/provision-ims-tenant.sh',
     match: '--password "${PASSWORD}"',
     reason: '`pct create --password` has no stdin/env form; it runs on the Proxmox host (an operator-run tenant provisioning tool, not the installer) inside an ssh script whose only readers are that host\'s own administrators. Not changed.',
@@ -193,18 +214,50 @@ test('[o3d-kb3dq] CENSUS: every shell script under scripts/ -- no secret reaches
 })
 
 test('[o3d-kb3dq] MUTATION census: each rule fires on its trunk shape (the census CAN fail)', () => {
-  const shapes: Record<string, string> = {
-    'R1 env-assignment argument': 'run_as_user_db env \\\n  SMTP_PASS="${SMTP_PASS}" \\\n  node x.mjs',
-    'R2 curl credential argument': 'curl -sS \\\n  -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \\\n  https://api.github.com/x',
-    'R3 connection URL argument': 'pg_dump "${DATABASE_URL}" --format=plain',
-    'R4 password option': 'pct create 100 tpl --password "${PASSWORD}"',
-    'R5 redis -a': 'redis-cli -a "${REDIS_PASSWORD}" ping',
+  const shapes: Record<string, string[]> = {
+    'R1 env-assignment argument': ['run_as_user_db env \\\n  SMTP_PASS="${SMTP_PASS}" \\\n  node x.mjs'],
+    'R2 curl credential argument': [
+      'curl -sS \\\n  -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \\\n  https://api.github.com/x',
+      'curl --header "Authorization: Bearer ${TOKEN}" https://x.test',
+      "curl -H 'X-API-Key: ${VENDOR_API_KEY}' https://x.test",
+      'curl -H "X-Auth-Token: $SERVICE_TOKEN" https://x.test',
+      'curl -u admin:s3cretpass https://x.test',
+      'curl -u "${USER}:${PASSWORD}" https://x.test',
+      'curl --user $CREDS https://x.test',
+      'x="curl -sf -H \\"Authorization: Bearer \\$CRON_SECRET\\" url"',
+    ],
+    'R3 connection URL argument': ['pg_dump "${DATABASE_URL}" --format=plain', 'psql postgresql://app:hunter2pw@db.example.test/ims -c "select 1"', 'redis-cli -u redis://default:hunter2pw@cache:6379 ping', 'pg_restore "$MIGRATION_URL" x.dump'],
+    'R4 password option': ['pct create 100 tpl --password "${PASSWORD}"', 'mysqldump --password=hunter2pw db', 'wget --http-password=hunter2pw https://x.test'],
+    'R5 redis -a': ['redis-cli -a "${REDIS_PASSWORD}" ping'],
+    'R6 mysql/sshpass -p': ['mysql -u root -p"$DB_PASSWORD" db', 'mysql -uroot -phunter2pw db', 'mysqladmin -p$ROOT_PASS status', 'sshpass -p "$SSH_PASSWORD" ssh host', 'sshpass -p hunter2pw ssh host'],
+    'R7 openssl pass:': ['openssl enc -aes-256-cbc -pass pass:"$KEY_PASSPHRASE" -in a -out b', 'openssl enc -d -passin pass:hunter2pw -in b', 'openssl rsa -k hunter2pw -in k.pem'],
+    'R8 wget credential': ['wget --header="Authorization: Bearer ${API_TOKEN}" https://x.test', 'wget --user=admin --password=hunter2pw https://x.test', "wget --header 'X-API-Key: $VENDOR_API_KEY' https://x.test"],
+    'R9 docker -e secret': ['docker run -e DB_PASSWORD=hunter2pw img', 'docker run --env API_TOKEN="${API_TOKEN}" img', 'docker exec -e MY_SECRET=$S ctr cmd'],
   }
-  for (const [rule, text] of Object.entries(shapes)) {
-    const { findings } = census({ 'sample.sh': text })
-    console.log(`  ${rule}: ${findings.map((f) => f.rule.split(' ')[0]).join(',') || 'NOT FOUND'}`)
-    assert.ok(findings.some((f) => f.rule === rule), rule)
+  // forms that are NOT leaks: the credential comes from the environment / a file / stdin, or is not a credential
+  const benign = [
+    'curl -sS -K - -X GET https://api.github.com/x <<< "${auth_config}"',
+    'curl -H "Content-Type: application/json" -H "Accept: application/json" https://x.test',
+    'curl -sf --max-time 10 "$HEALTH_URL"',
+    'mysql --defaults-extra-file="$CNF" db',
+    'sshpass -f "$PASSFILE" ssh host',
+    'openssl rand -hex 32',
+    'openssl enc -aes-256-cbc -pass env:KEY_PASSPHRASE -in a -out b',
+    'docker run -e DB_PASSWORD img',
+    'docker run --env-file "$ENVFILE" img',
+    'wget -q https://x.test/file',
+    'psql -h /run/postgresql -d postgres -c "select 1"',
+    'redis-cli -h localhost ping',
+  ]
+  for (const [rule, texts] of Object.entries(shapes)) {
+    for (const text of texts) {
+      const { findings } = census({ 'sample.sh': text })
+      assert.ok(findings.some((f) => f.rule === rule), `${rule} must fire on: ${text}`)
+    }
+    console.log(`  ${rule.padEnd(32)} fires on ${texts.length}/${texts.length} canary shapes`)
   }
+  for (const text of benign) assert.deepEqual(census({ 'benign.sh': text }).findings.map((f) => f.rule), [], `must NOT fire on: ${text}`)
+  console.log(`  ${benign.length} benign shapes: no finding`)
   // and the shipped fixed forms are NOT flagged
   const fixed = shippedBlock(INSTALL) + '\ncurl -sS -K - -X GET https://api.github.com/x <<< "${auth_config}"\n'
   assert.deepEqual(census({ 'fixed.sh': fixed }).findings, [])
@@ -235,7 +288,7 @@ const CRON_CANARY = 'cron-canary-9f31c0de77aa'
 
 /** What install.sh's cron block writes for one job: the shipped function, run. */
 function installerJobLine(envFile: string, logFile: string): string {
-  const r = spawnSync('bash', ['-c', `${shippedFunction(INSTALL, 'cron_job_command')}\ncron_job_command backup ${JSON.stringify(logFile)} ${JSON.stringify(envFile)}`], { encoding: 'utf8' })
+  const r = spawnSync('bash', ['-c', `${shippedFunction(INSTALL, 'cron_job_command_into') + '\n' + shippedFunction(INSTALL, 'cron_job_command')}\ncron_job_command backup ${JSON.stringify(logFile)} ${JSON.stringify(envFile)}`], { encoding: 'utf8' })
   assert.equal(r.status, 0, r.stderr)
   return `0 2 * * *  ${r.stdout}`
 }
@@ -350,4 +403,156 @@ test('[o3d-kb3dq] CENSUS OF THE RENDERED OUTPUT: what install.sh and the app ren
     const hits = text.split('\n').filter((l) => /-H\s+\\?"Authorization: Bearer \\?\$CRON_SECRET/.test(l) && !l.trim().startsWith('#') && !l.trim().startsWith('*') && !l.includes('LEGACY') && !l.includes('MANAGED_JOB_LINE_SIGNATURE'))
     assert.deepEqual(hits, [], `${file} writes no bearer header argument`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// an existing managed block with the OLD lines is rewritten by the installer (Codex round 2)
+// ---------------------------------------------------------------------------
+
+const LEGACY_RUNTIME = (sched: string, slug: string, env: string, log: string) =>
+  `${sched}  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${env}' | cut -d= -f2- | tr -d '"') && [ -n "$CRON_SECRET" ] && curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${slug}" >> '${log}' 2>&1`
+const LEGACY_LITERAL = (sched: string, slug: string, log: string) =>
+  `${sched}   curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${slug}" >> '${log}' 2>&1`
+
+function legacyCrontab(mode: 'runtime' | 'literal', extra: { before?: string[]; after?: string[] } = {}): string {
+  const env = '/opt/one-two-inventory/.env'
+  const log = '/var/log/one-two-inventory/cron.log'
+  const jobs = mode === 'runtime'
+    ? [LEGACY_RUNTIME('0 2 * * *', 'backup', env, log), LEGACY_RUNTIME('*/7 * * * *', 'delivery-status', env, log), LEGACY_RUNTIME('30 4 * * 1', 'wc-reconcile', env, log)]
+    : [LEGACY_LITERAL('0 2 * * *', 'backup', log), LEGACY_LITERAL('*/7 * * * *', 'delivery-status', log), LEGACY_LITERAL('30 4 * * 1', 'wc-reconcile', log)]
+  return [
+    ...(extra.before ?? []),
+    '# --- OTI CRON START ---',
+    '# Managed by One Two Inventory — do not edit manually',
+    ...(mode === 'literal' ? ['CRON_SECRET="legacy-literal-secret"'] : [`# CRON_SECRET is read from ${env} at runtime — rotating it needs no crontab re-sync.`]),
+    'BASE_URL="http://localhost:3000/api/cron"',
+    '',
+    '# Database Backup', jobs[0], '',
+    '# Delivery Status Check', jobs[1], '',
+    '# WooCommerce Reconciliation', jobs[2], '',
+    '# --- OTI CRON END ---',
+    ...(extra.after ?? []),
+  ].join('\n') + '\n'
+}
+
+/** Run the SHIPPED bootstrap function against a fake crontab file; returns the file afterwards and the function's status. */
+function runBootstrap(dir: string, crontab: string, opts: { failWrite?: boolean; ignoreWrite?: boolean } = {}): { after: string; rc: number; out: string; state: string } {
+  const fake = join(dir, 'crontab.txt')
+  writeFileSync(fake, crontab)
+  const lib = readFileSync(join(ROOT, 'scripts/lib/crontab-lock.sh'), 'utf8')
+  const awk = /^CRONTAB_MANAGED_BLOCK_AWK='[\s\S]*?\n'$/m.exec(lib)?.[0]
+  assert.ok(awk, 'precondition: the shared managed-block awk is present')
+  const script = [
+    'set -uo pipefail',
+    awk,
+    `FAKE=${JSON.stringify(fake)}; APP_USER=ims; APP_PORT=3000; CRON_BLOCK_FILE=${JSON.stringify(join(dir, 'block.txt'))}; : > "$CRON_BLOCK_FILE"`,
+    'CRON_BOOTSTRAP_WRITTEN=no; CRON_LEGACY_COUNT=0; CRON_LEGACY_STATE=none; CRONTAB_WRITE_REASON=""; CRONTAB_READ_TEXT=""; CRON_MIGRATED_TEXT=""',
+    'info() { echo "info: $*"; }; success() { echo "success: $*"; }',
+    'read_crontab_for() { CRONTAB_READ_TEXT="$(cat "$FAKE")"; }',
+    opts.ignoreWrite ? 'write_crontab_for() { return 0; }' : opts.failWrite ? 'write_crontab_for() { CRONTAB_WRITE_REASON="the crontab client rejected the write"; return 1; }' : 'write_crontab_for() { printf \'%s\\n\' "$2" > "$FAKE"; }',
+    "CRON_LEGACY_SIGNATURE='-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/'; CRON_LEGACY_LEFT=0",
+    shippedFunction(INSTALL, 'cron_job_command_into') + '\n' + shippedFunction(INSTALL, 'cron_job_command'),
+    shippedFunction(INSTALL, 'migrate_legacy_cron_lines'),
+    shippedFunction(INSTALL, 'count_legacy_cron_lines'),
+    shippedFunction(INSTALL, 'bootstrap_managed_crontab_block_locked'),
+    'bootstrap_managed_crontab_block_locked; rc=$?',
+    'echo "rc=${rc} state=${CRON_LEGACY_STATE}"',
+  ].join('\n')
+  const r = spawnSync('bash', ['-c', script], { encoding: 'utf8' })
+  const out = r.stdout + r.stderr
+  return { after: readFileSync(fake, 'utf8'), rc: Number(/rc=(\d+)/.exec(out)?.[1] ?? -1), out, state: /state=(\w+)/.exec(out)?.[1] ?? '' }
+}
+
+const scheduleOf = (crontab: string, slug: string) => (crontab.split('\n').find((l) => l.includes(`$BASE_URL/${slug}"`) ?? false) ?? '').match(/^(\S+(?:\s+\S+){4})\s/)?.[1]
+
+test('[o3d-kb3dq] an existing managed block with the old `-H` lines is rewritten in place: schedules kept, verified, unrelated lines untouched, idempotent', async () => {
+  for (const mode of ['runtime', 'literal'] as const) {
+    await withTempDir('ims-cron-migrate-', async (dir) => {
+      const unrelated = ['MAILTO=ops@example.test', '17 3 * * * /usr/local/bin/operator-job --keep']
+      const before = legacyCrontab(mode, { before: [unrelated[0]], after: [unrelated[1]] })
+      const r = runBootstrap(dir, before)
+      console.log(`  ${mode}: rc=${r.rc} state=${r.state}; legacy lines before ${before.split('-H "Authorization').length - 1}, after ${r.after.split('-H "Authorization').length - 1}`)
+      assert.equal(r.rc, 0, r.out)
+      assert.equal(r.state, 'migrated')
+      assert.ok(!r.after.includes('-H "Authorization'), `${mode}: no legacy bearer argument is left`)
+      assert.ok(!r.after.includes('legacy-literal-secret') || mode === 'literal')
+      // every schedule (including the customised ones) is preserved, as is each job's slug
+      for (const [slug, sched] of [['backup', '0 2 * * *'], ['delivery-status', '*/7 * * * *'], ['wc-reconcile', '30 4 * * 1']] as const) {
+        assert.equal(scheduleOf(r.after, slug), sched, `${mode}: the schedule of ${slug} is kept`)
+      }
+      // the unrelated lines and the header/BASE_URL/literal assignment are untouched, in place
+      for (const line of unrelated) assert.ok(r.after.split('\n').includes(line), `${mode}: ${line} is preserved`)
+      assert.ok(r.after.includes('BASE_URL="http://localhost:3000/api/cron"'))
+      if (mode === 'literal') assert.ok(r.after.split('\n').includes('CRON_SECRET="legacy-literal-secret"'), 'the literal assignment is kept (the app owns it)')
+      // the new lines are exactly what the shipped generator writes
+      const expected = installerJobLine('/opt/one-two-inventory/.env', '/var/log/one-two-inventory/cron.log').replace(/^0 2 \* \* \*  /, '')
+      if (mode === 'runtime') assert.ok(r.after.includes(`0 2 * * *  ${expected}`.replace('backup', 'backup')), 'the backup line is the generator\'s own text')
+      // running the installer again changes nothing
+      const second = runBootstrap(dir, r.after)
+      assert.equal(second.after, r.after, `${mode}: idempotent`)
+      assert.equal(second.state, 'none')
+    })
+  }
+})
+
+test('[o3d-kb3dq] a write that fails, or a block shape the rewrite cannot handle, is a refusal: state=failed', async () => {
+  await withTempDir('ims-cron-migrate-fail-', async (dir) => {
+    const failed = runBootstrap(dir, legacyCrontab('runtime'), { failWrite: true })
+    assert.notEqual(failed.rc, 0)
+    assert.equal(failed.state, 'failed')
+  })
+  await withTempDir('ims-cron-migrate-ignored-', async (dir) => {
+    // a write the crontab client ACCEPTED but that did not take effect (a writer outside the lock, the wrong client): the
+    // read-back is what notices
+    const r = runBootstrap(dir, legacyCrontab('runtime'), { ignoreWrite: true })
+    assert.notEqual(r.rc, 0)
+    assert.equal(r.state, 'failed', 'the verification re-read finds the old lines still there')
+  })
+  await withTempDir('ims-cron-migrate-odd-', async (dir) => {
+    const odd = legacyCrontab('runtime').replace('"$BASE_URL/backup" >>', '"$BASE_URL/backup" --max-time 5 >>')
+    const r = runBootstrap(dir, odd)
+    assert.notEqual(r.rc, 0, 'a legacy line of a shape the rewrite does not know is not silently left')
+    assert.equal(r.state, 'failed')
+    assert.equal(r.after, odd, 'and the crontab is untouched')
+  })
+  // the caller acts on it: the run dies with an operator-visible message instead of warning
+  const text = INSTALL
+  const gateStart = text.indexOf('if [[ "${CRON_LEGACY_STATE}" != "migrated" && "${CRON_BOOTSTRAP_WRITTEN}" != "yes" ]]; then')
+  assert.notEqual(gateStart, -1)
+  const gateEnd = text.indexOf('\nfi\n', gateStart) + 4
+  const gate = text.slice(gateStart, gateEnd)
+  const runGate = (state: string, written: string, read: string) => spawnSync('bash', ['-c', [
+    'die() { echo "DIE: $*"; exit 9; }',
+    `CRON_LEGACY_STATE=${state}; CRON_BOOTSTRAP_WRITTEN=${written}; APP_USER=ims; CRONTAB_WRITE_REASON="why"`,
+    'read_crontab_for() { CRONTAB_READ_TEXT="${READTEXT}"; }',
+    "CRON_LEGACY_SIGNATURE='-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/'",
+    'CRON_LEGACY_COUNT=0',
+    shippedFunction(INSTALL, 'count_legacy_cron_lines'),
+    gate, 'echo CONTINUED'].join('\n')], { encoding: 'utf8', env: { ...process.env, READTEXT: read } })
+  assert.equal(runGate('failed', 'no', '').status, 9, 'a failed rewrite stops the run')
+  assert.equal(runGate('none', 'no', legacyCrontab('runtime')).status, 9, 'a lock conflict that left the old lines stops the run')
+  assert.match(runGate('failed', 'no', '').stdout, /secret on curl's command line/)
+  assert.equal(runGate('none', 'no', '').status, 0, 'a crontab with nothing legacy continues')
+  assert.equal(runGate('none', 'yes', legacyCrontab('runtime')).status, 0, 'a block this run wrote fresh is not re-checked')
+})
+
+test('[o3d-kb3dq] MUTATION: skipping the block whenever one exists (trunk behaviour) leaves the old lines, so the rewrite test CAN fail', async () => {
+  const mutated = INSTALL.replace('if [[ "${CRON_LEGACY_COUNT}" -gt 0 ]]; then', 'if false; then')
+  assert.notEqual(mutated, INSTALL)
+  await withTempDir('ims-cron-migrate-mut-', async (dir) => {
+    const fake = join(dir, 'crontab.txt')
+    writeFileSync(fake, legacyCrontab('runtime'))
+    // the same rig, with the function lifted from the mutated text
+    const lib = readFileSync(join(ROOT, 'scripts/lib/crontab-lock.sh'), 'utf8')
+    const awk = /^CRONTAB_MANAGED_BLOCK_AWK='[\s\S]*?\n'$/m.exec(lib)?.[0] ?? ''
+    const script = ['set -uo pipefail', awk, `FAKE=${JSON.stringify(fake)}; APP_USER=ims; APP_PORT=3000; CRON_BOOTSTRAP_WRITTEN=no; CRON_LEGACY_STATE=none; CRON_LEGACY_COUNT=0`,
+      'info() { :; }; success() { :; }', 'read_crontab_for() { CRONTAB_READ_TEXT="$(cat "$FAKE")"; }', 'write_crontab_for() { printf \'%s\\n\' "$2" > "$FAKE"; }',
+      "CRON_LEGACY_SIGNATURE='-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/'; CRON_LEGACY_LEFT=0",
+      shippedFunction(INSTALL, 'cron_job_command_into') + '\n' + shippedFunction(INSTALL, 'cron_job_command_into'), shippedFunction(INSTALL, 'cron_job_command'), shippedFunction(INSTALL, 'migrate_legacy_cron_lines'), shippedFunction(INSTALL, 'count_legacy_cron_lines'),
+      shippedFunction(mutated, 'bootstrap_managed_crontab_block_locked'), 'bootstrap_managed_crontab_block_locked'].join('\n')
+    spawnSync('bash', ['-c', script], { encoding: 'utf8' })
+    const after = readFileSync(fake, 'utf8')
+    console.log(`  mutated bootstrap: legacy lines left in the crontab: ${after.split('-H "Authorization').length - 1}`)
+    assert.equal(after.split('-H "Authorization').length - 1, 3, 'the old lines stay when the block is skipped')
+  })
 })
