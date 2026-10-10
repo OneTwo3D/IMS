@@ -96,3 +96,34 @@ export const withMoneyPostLock: MoneyPostLock = async (document, run) => {
     await lock.release()
   }
 }
+
+/**
+ * o3d-llyw (Codex r3 on #757) — WRITERS THAT CAN MAKE A MONEY ROW CLAIM IT POSTED TAKE THIS DOCUMENT'S
+ * LOCK TOO, FOR THE LENGTH OF THEIR TRANSACTION, WITHOUT WAITING.
+ *
+ * The post fence holds the session lock above from its ledger read to the remote POST, and inside that
+ * window it reads each contender's standing (the operator-ledger-check loader drops a check for an
+ * attempt that claims to have posted). An operator settling that attempt POSTED, or the "already paid"
+ * reconcile, writes a ledger id onto it; if that commit lands between the fence's read and its POST, the
+ * fence can still set a record aside on a check the new standing contradicts. Taking the SAME key here,
+ * as a transaction-scoped TRY lock, makes the two mutually exclusive: while a payment for this document
+ * is being authorised and sent the writer refuses, and while the writer's transaction is open the fence
+ * cannot take the lock and refuses its post (the row retries). `pg_try_advisory_xact_lock(ns, key)`
+ * shares the lock space with the fence's `pg_try_advisory_lock(ns, key)`.
+ *
+ * TRY, NEVER WAIT: the holder may be in the middle of an HTTP call, and a transaction parked behind it is
+ * how a connection pool dies (see the header). The writer reports `false` and its caller refuses.
+ */
+export async function holdMoneyPostDocumentForTransaction(
+  tx: { $queryRaw: <T = unknown>(query: TemplateStringsArray, ...values: unknown[]) => Promise<T> },
+  document: MoneyPostDocument,
+): Promise<boolean> {
+  const rows = await tx.$queryRaw<Array<{ locked: boolean }>>`
+    SELECT pg_try_advisory_xact_lock(${ACCOUNTING_MONEY_POST_LOCK_NAMESPACE}::int, ${moneyPostDocumentLockId(document)}::int) AS locked`
+  return rows[0]?.locked === true
+}
+
+/** The operator-facing refusal when a writer meets a payment in flight for the same document. */
+export const MONEY_POST_IN_FLIGHT_REFUSAL =
+  'A payment for this document is being checked and sent to the accounting system right now, so nothing '
+  + 'was recorded. Look at the entry again in a minute, once that send has finished.'

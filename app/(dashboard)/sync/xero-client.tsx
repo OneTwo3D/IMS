@@ -52,6 +52,8 @@ import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { describeSyncRowSettleability, isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { describeDocumentIdClaim, describeLedgerStanding, documentIdText } from '@/lib/domain/accounting/ledger-standing-display'
 import { SettleSyncRowControl } from './settle-sync-row-control'
+import { LedgerCheckControl } from './ledger-check-control'
+import { offersOperatorLedgerCheck } from '@/lib/domain/accounting/operator-ledger-check-offer'
 
 type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
 
@@ -1302,6 +1304,14 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                 0, and the component then shows the reason instead. A DAILY_BATCH row is
                                 settleable POSTED only — see settleableSettlementOutcomes.
                               */}
+                              {/*
+                                o3d-llyw (owner decision C4) — "Checked the ledger". Offered on a receipt
+                                attempt that can hold later receipts back (FAILED or CANCELLED). The server
+                                re-reads the ledger and refuses unless the hold is one a check can lift.
+                              */}
+                              {offersOperatorLedgerCheck(log) && (
+                                <LedgerCheckControl syncLogId={log.id} onRecorded={() => router.refresh()} />
+                              )}
                               {settlementApplies && (
                                 <SettleSyncRowControl
                                   syncLogId={log.id}
