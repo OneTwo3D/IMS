@@ -64,6 +64,8 @@ export interface FakeCatalogueOptions {
   /** The most rows the store grants per page whatever `per_page` asks for. */
   pageSizeCap?: number
   omitPaginationHeaders?: boolean
+  /** Products no longer listed whose variations endpoint still answers (a store that deletes lazily). */
+  ghosts?: readonly FakeParent[]
   intercept?: (context: InterceptContext, response: FakeResponse) => FakeResponse
 }
 
@@ -129,7 +131,7 @@ export async function startFakeCatalogue(options: FakeCatalogueOptions): Promise
     }
     const match = /^\/products\/(\d+)\/variations$/.exec(route)
     if (match) {
-      const parent = options.parents.find((p) => p.id === Number(match[1]))
+      const parent = [...options.parents, ...(options.ghosts ?? [])].find((p) => p.id === Number(match[1]))
       if (!parent) return error(404, 'woocommerce_rest_product_invalid_id')
       const sorted = [...parent.variations].sort((a, b) => a.id - b.id)
       return paged(sorted.map((v) => ({

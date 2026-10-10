@@ -566,13 +566,15 @@ test('arm (q): a stable store is confirmed by a second complete walk (round 1)',
 
 test('arm (q2): a product deleted on page 1 and another added at the end before page 2 (total unchanged, a survivor skipped) is detected, and the next round reads the real catalogue', async (t) => {
   const parents = catalogue()
+  const ghosts: FakeParent[] = []
   let fired = 0
   const r = await rig({
     pageSizeCap: 2,
+    ghosts,
     intercept: (c, res) => {
       if (c.route === 'products' && c.page === 1 && fired === 0) {
         fired++
-        parents.splice(0, 1) // delete id 100, which page 1 already carries
+        ghosts.push(...parents.splice(0, 1)) // delete id 100, which page 1 already carries (its variations still answer, so only the second walk can see it)
         parents.push({ id: 500, sku: 'NEWEST', name: 'Added meanwhile', variations: [{ id: 5001, sku: 'N-01' }] })
       }
       return res
@@ -695,5 +697,23 @@ test('arm (u): formula-leading WooCommerce text: the data file keeps it exactly,
     assert.ok(data.includes('=HYPERLINK') && !data.includes("'=HYPERLINK"), 'the data file is untouched')
     assert.ok(inspect.includes("'=HYPERLINK") && inspect.includes("'-Spacer kit"), 'the inspection copy is neutralised')
     assert.ok(inspect.includes(',-5V cable,') && !inspect.includes("'-5V"), 'a name that merely starts with "-5" is not a formula')
+  } finally { await r.server.close() }
+})
+
+test('arm (q4): a product listed but already gone (404 on its variations) abandons the round and the next round reads the real catalogue', async (t) => {
+  const parents = catalogue()
+  let fired = 0
+  const r = await rig({
+    pageSizeCap: 2,
+    intercept: (c, res) => {
+      if (c.route === 'products' && c.page === 1 && fired === 0) { fired++; parents.splice(0, 1); parents.push({ id: 500, sku: 'NEWEST', name: 'Added meanwhile', variations: [{ id: 5001, sku: 'N-01' }] }) }
+      return res
+    },
+  }, parents)
+  try {
+    const ran = await snapshot(r)
+    precondition(t, 'products deleted after being listed', fired)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.OK, ran.stderr)
+    assert.ok(r.server.requests.some((q) => q.status === 404), 'the walk really met the 404')
   } finally { await r.server.close() }
 })
