@@ -109,3 +109,43 @@ for (let round = 1; round <= 3; round += 1) {
     assert.equal(invoices, 0, 'no bill was saved from the old order')
   })
 }
+
+test('control (edit path): updateInvoice on a mixed freight bill with no concurrent edit succeeds and keeps VAT 20', SKIP, async () => {
+  const { db, poId, lines } = await seedMixedFreight()
+  const { createInvoice, updateInvoice } = await import('@/app/actions/purchase-orders')
+  const created = await createInvoice(poId, { invoiceDate: '2026-10-01', lines: [{ kind: 'cost', costLineId: lines[0]!.id, description: 'Duty', amountForeign: 100 }] })
+  assert.equal(created.success, true, String(created.error))
+  const bill = await db.purchaseInvoice.findFirstOrThrow({ where: { poId }, select: { id: true, lines: { select: { id: true } } } })
+  const result = await updateInvoice(bill.id, { invoiceDate: '2026-10-02', lines: [{ id: bill.lines[0]!.id, amountForeign: 100 }] })
+  const after = await db.purchaseInvoice.findUniqueOrThrow({ where: { id: bill.id }, select: { taxForeign: true } })
+  console.log(`edit-control PRECONDITION: success=${result.success} ${result.error ?? ''}; bill tax ${after.taxForeign}`)
+  assert.equal(result.success, true, String(result.error))
+  assert.equal(after.taxForeign.toString(), '20')
+})
+
+for (let round = 1; round <= 3; round += 1) {
+  test(`race on the EDIT path (round ${round}/3): a freight edit committing between updateInvoice's read and its lock aborts the edit and leaves the bill as it was`, SKIP, async () => {
+    const { db, poId, lines } = await seedMixedFreight()
+    const { createInvoice, updateInvoice, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+    const created = await createInvoice(poId, { invoiceDate: '2026-10-01', lines: [{ kind: 'cost', costLineId: lines[0]!.id, description: 'Duty', amountForeign: 100 }] })
+    assert.equal(created.success, true, String(created.error))
+    const bill = await db.purchaseInvoice.findFirstOrThrow({ where: { poId }, select: { id: true, taxForeign: true, totalForeign: true, lines: { select: { id: true } } } })
+    // A real freight edit of the UNBILLED Handling line (100 -> 150) commits between the read and the lock. A billed order
+    // refuses VAT changes, so this is the kind of edit that can still race: the order subtotal and a cost line move.
+    let hookRan = false
+    let hookResult: { success: boolean; error?: string } | null = null
+    betweenReadAndLock = async () => {
+      hookRan = true
+      hookResult = await updateFreightPoCosts(poId, asInput(lines).map((l) => (l.id === lines[1]!.id ? { ...l, amountForeign: 150 } : l)))
+    }
+    const result = await updateInvoice(bill.id, { invoiceDate: '2026-10-02', lines: [{ id: bill.lines[0]!.id, amountForeign: 100 }] })
+    const after = await db.purchaseInvoice.findUniqueOrThrow({ where: { id: bill.id }, select: { taxForeign: true, totalForeign: true, invoiceDate: true } })
+    console.log(`edit-race PRECONDITION (round ${round}): hook ran=${hookRan} (edit success=${(hookResult as { success: boolean } | null)?.success}); result success=${result.success}; bill tax ${bill.taxForeign} -> ${after.taxForeign}; invoiceDate ${after.invoiceDate.toISOString().slice(0, 10)}`)
+    assert.equal(hookRan, true, 'the freight edit really ran between the read and the lock')
+    assert.equal((hookResult as { success: boolean } | null)?.success, true)
+    assert.equal(result.success, false)
+    assert.match(String(result.error), /changed while the bill was being prepared/)
+    assert.equal(after.taxForeign.toString(), bill.taxForeign.toString())
+    assert.equal(after.invoiceDate.toISOString().slice(0, 10), '2026-10-01', 'the edit was not applied')
+  })
+}

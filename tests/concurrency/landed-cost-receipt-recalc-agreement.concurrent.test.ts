@@ -504,3 +504,67 @@ test('billed cost lines: a reordered, removed or id-less submission can neither 
   const link = await db.purchaseInvoiceLine.findUniqueOrThrow({ where: { id: invoice.lines[0]!.id }, select: { costLineId: true } })
   assert.equal(link.costLineId, rows[0]!.id)
 })
+
+test('billed order: a VAT-rate change is refused and leaves the order VAT and the bill untouched; the same edit on an unbilled order is allowed', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { createFreightPo, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+  const { FREIGHT_BILLED_VAT_CHANGE_MESSAGE } = await import('@/lib/domain/purchasing/freight-cost-lines')
+  const make = async (label: string) => {
+    const goods = await seedGoodsPo(label, 4, 10)
+    const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [{ description: 'freight', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' }] })
+    assert.equal(created.success, true, String(created.error))
+    const poId = created.po!.id
+    const line = await db.freightCostLine.findFirstOrThrow({ where: { poId }, select: { id: true } })
+    return { poId, lineId: line.id }
+  }
+  const payload = (lineId: string) => [{ id: lineId, description: 'freight', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' }]
+
+  const billed = await make('bvat1')
+  await db.purchaseInvoice.create({
+    data: {
+      poId: billed.poId, invoiceDate: new Date(), subtotalForeign: 100, subtotalBase: 100, taxForeign: 20, taxBase: 20, totalForeign: 120, totalBase: 120, fxRateToBase: 1,
+      lines: { create: [{ costLineId: billed.lineId, description: 'freight', qtyBilled: 1, unitCostForeign: 100, totalForeign: 100, totalBase: 100 }] },
+    },
+  })
+  const refused = await updateFreightPoCosts(billed.poId, payload(billed.lineId), 0)
+  const po = await db.purchaseOrder.findUniqueOrThrow({ where: { id: billed.poId }, select: { taxForeign: true, totalForeign: true, taxRatePercent: true } })
+  console.log(`billed-vat PRECONDITION: billed order 20% -> 0%: success=${refused.success}; order tax ${po.taxForeign}, total ${po.totalForeign}, rate ${po.taxRatePercent}`)
+  assert.equal(refused.success, false)
+  assert.equal(refused.error, FREIGHT_BILLED_VAT_CHANGE_MESSAGE)
+  assert.equal(po.taxForeign.toString(), '20')
+  assert.equal(po.totalForeign.toString(), '120')
+  assert.equal(po.taxRatePercent?.toString(), '0.2')
+
+  const open = await make('bvat2')
+  const allowed = await updateFreightPoCosts(open.poId, payload(open.lineId), 0)
+  const openPo = await db.purchaseOrder.findUniqueOrThrow({ where: { id: open.poId }, select: { taxForeign: true } })
+  console.log(`billed-vat PRECONDITION: UNBILLED order 20% -> 0%: success=${allowed.success}; tax ${openPo.taxForeign}`)
+  assert.equal(allowed.success, true, String(allowed.error))
+  assert.equal(openPo.taxForeign.toString(), '0')
+})
+
+test('draft order edit: a DRAFT order that already has a bill refuses a VAT/lines/rate edit and keeps its figures; a header-only edit and an unbilled order are allowed', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const { PO_BILLED_FIGURES_EDIT_MESSAGE } = await import('@/lib/domain/purchasing/purchase-invoice-edit')
+  const billed = await seedGoodsPo('drbill', 4, 10)
+  const unbilled = await seedGoodsPo('drfree', 4, 10)
+  for (const po of [billed, unbilled]) await db.purchaseOrder.update({ where: { id: po.poId }, data: { status: 'DRAFT' } })
+  await db.purchaseInvoice.create({ data: { poId: billed.poId, invoiceDate: new Date(), subtotalForeign: 40, subtotalBase: 40, totalForeign: 40, totalBase: 40, fxRateToBase: 1 } })
+  const before = await db.purchaseOrder.findUniqueOrThrow({ where: { id: billed.poId }, select: { taxForeign: true, taxRatePercent: true, notes: true } })
+  const refused = await updatePurchaseOrder(billed.poId, { taxRateValue: 0.2, taxRateName: 'Std' })
+  const afterRefusal = await db.purchaseOrder.findUniqueOrThrow({ where: { id: billed.poId }, select: { taxForeign: true, taxRatePercent: true } })
+  console.log(`draft-billed PRECONDITION: billed DRAFT order VAT edit: success=${refused.success} error=${JSON.stringify(refused.error)}; tax ${before.taxForeign} -> ${afterRefusal.taxForeign}`)
+  assert.equal(refused.success, false)
+  assert.equal(refused.error, PO_BILLED_FIGURES_EDIT_MESSAGE)
+  assert.equal(afterRefusal.taxForeign.toString(), before.taxForeign.toString())
+  assert.equal(afterRefusal.taxRatePercent, before.taxRatePercent)
+  const header = await updatePurchaseOrder(billed.poId, { notes: 'note only' })
+  console.log(`draft-billed PRECONDITION: header-only edit success=${header.success}`)
+  assert.equal(header.success, true, String(header.error))
+  const free = await updatePurchaseOrder(unbilled.poId, { taxRateValue: 0.2, taxRateName: 'Std' })
+  console.log(`draft-billed PRECONDITION: UNBILLED draft VAT edit success=${free.success} ${free.error ?? ''}`)
+  assert.equal(free.success, true, String(free.error))
+})

@@ -181,6 +181,10 @@ export type StoredFreightCostLine = {
   billed: boolean
 }
 
+/** Refusal for a VAT-rate or vatable-flag change on a freight order that already has a billed cost line. Single-sourced. */
+export const FREIGHT_BILLED_VAT_CHANGE_MESSAGE =
+  'This freight order already has a billed cost line, so its VAT rate or the VAT flag of its lines cannot be changed: the bill would keep the old VAT while the order showed the new. Correct or credit the bill first.'
+
 export class FreightEditRefusedError extends Error {
   constructor(message: string) {
     super(message)
@@ -228,6 +232,8 @@ export function planFreightCostLineEdit(
   rows: FreightCostLineRow[],
   taxChanged: boolean,
 ): FreightCostLinePlan {
+  const anyBilled = stored.some((row) => row.billed)
+  if (anyBilled && taxChanged) throw new FreightEditRefusedError(FREIGHT_BILLED_VAT_CHANGE_MESSAGE)
   if (!submitted.some((line) => line.id)) {
     const identical = stored.length === rows.length && rows.every((row, index) => sameLine(stored[index]!, row))
     if (identical && !taxChanged) return { kind: 'noop' }
@@ -253,6 +259,7 @@ export function planFreightCostLineEdit(
     if (seen.has(line.id)) throw new FreightEditRefusedError(`Cost line ${line.id} was submitted twice.`)
     seen.add(line.id)
     if (sameLine(existing, row)) return
+    if (anyBilled && existing.vatable !== row.vatable) throw new FreightEditRefusedError(FREIGHT_BILLED_VAT_CHANGE_MESSAGE)
     if (existing.billed) {
       throw new FreightEditRefusedError(`Cost line ${existing.id} has already been billed and cannot be changed.`)
     }

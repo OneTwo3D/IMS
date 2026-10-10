@@ -66,7 +66,8 @@ import {
   buildPurchaseInvoiceUpdateIdempotencyKey,
   calculatePurchaseInvoice,
   PurchaseInvoiceInputsChangedError,
-  purchaseInvoiceInputsChanged,
+  assertPurchaseInvoiceInputsUnchanged,
+  PO_BILLED_FIGURES_EDIT_MESSAGE,
   dateKey,
   hasPurchaseInvoiceEditChanges,
   optionalText,
@@ -1450,6 +1451,13 @@ export async function updatePurchaseOrder(
       })
       if (!locked) return { refused: 'PO not found' }
       if (locked.status !== 'DRAFT') return { refused: 'Only DRAFT POs can be edited' }
+      // A bill already exists: this edit would recompute the order's totals, VAT or exchange rate and leave the bill
+      // on the old figures. Header-only edits (notes, delivery date, references) are unaffected.
+      const changesBilledFigures = input.lines !== undefined || input.additionalCosts !== undefined || input.taxRateId !== undefined
+        || input.taxRateName !== undefined || input.taxRateValue !== undefined || input.currency !== undefined || input.fxRateToBase !== undefined
+      if (changesBilledFigures && (await tx.purchaseInvoice.count({ where: { poId: id } })) > 0) {
+        return { refused: PO_BILLED_FIGURES_EDIT_MESSAGE }
+      }
       const shouldRefreshFxRate = input.currency !== undefined || input.fxRateToBase !== undefined
       const rateOnlyFxRefresh = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
       const baseCurrency = shouldRefreshFxRate ? await resolveBaseCurrencyCode(tx) : null
@@ -3278,7 +3286,7 @@ export async function createInvoice(
       // The tax and the accounting payload above were computed BEFORE this lock from the order and its cost lines as
       // they were then. A freight edit that committed in between keeps the cost-line ids, so the id checks alone pass
       // while the VAT is the old order's. Re-validate what the calculation consumed against the locked rows and abort.
-      const changedSinceRead = purchaseInvoiceInputsChanged(
+      assertPurchaseInvoiceInputsUnchanged(
         {
           fxRateToBase: po.fxRateToBase,
           type: po.type,
@@ -3296,7 +3304,6 @@ export async function createInvoice(
           costLines: lockedPo.freightCostLines,
         },
       )
-      if (changedSinceRead) throw new PurchaseInvoiceInputsChangedError()
       validatePurchaseInvoiceLineLimits({
         lineData: invoiceCalculation.lineData,
         alreadyBilledLines: existing,
@@ -3727,6 +3734,11 @@ export async function updateInvoice(
       const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
         where: { id: invoice.poId },
         select: {
+          fxRateToBase: true,
+          type: true,
+          taxRatePercent: true,
+          taxForeign: true,
+          subtotalForeign: true,
           supplier: { select: { prepaid: true } },
           lines: {
             select: {
@@ -3742,6 +3754,26 @@ export async function updateInvoice(
           },
         },
       })
+      // The tax above was calculated from the order read BEFORE these locks: the same re-read-and-compare as
+      // createInvoice (one shared check), or a freight edit committed in between leaves a bill with the old VAT.
+      assertPurchaseInvoiceInputsUnchanged(
+        {
+          fxRateToBase: invoice.po.fxRateToBase,
+          type: invoice.po.type,
+          taxRatePercent: invoice.po.taxRatePercent,
+          taxForeign: invoice.po.taxForeign,
+          subtotalForeign: invoice.po.subtotalForeign,
+          costLines: invoice.po.freightCostLines,
+        },
+        {
+          fxRateToBase: lockedPo.fxRateToBase,
+          type: lockedPo.type,
+          taxRatePercent: lockedPo.taxRatePercent,
+          taxForeign: lockedPo.taxForeign,
+          subtotalForeign: lockedPo.subtotalForeign,
+          costLines: lockedPo.freightCostLines,
+        },
+      )
       // Grandfather this invoice's current quantities: lines billed under the
       // policy in force at creation (prepaid then, or returns landed after
       // billing) stay editable at their existing level; only increases must
@@ -3920,6 +3952,7 @@ export async function updateInvoice(
       description: `Failed to update bill ${invoiceId}: ${String(e)}`,
       metadata: { invoiceId },
     })
+    if (e instanceof PurchaseInvoiceInputsChangedError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }

@@ -491,3 +491,12 @@ export function purchaseInvoiceInputsChanged(before: PurchaseInvoiceTaxInputs, l
     return !now || now.vatable !== line.vatable || now.description !== line.description || !sameNumber(line.amountForeign, now.amountForeign)
   })
 }
+
+/** The SHARED check for `createInvoice` and `updateInvoice`: throws `PurchaseInvoiceInputsChangedError` if the locked re-read differs. */
+export function assertPurchaseInvoiceInputsUnchanged(before: PurchaseInvoiceTaxInputs, locked: PurchaseInvoiceTaxInputs): void {
+  if (purchaseInvoiceInputsChanged(before, locked)) throw new PurchaseInvoiceInputsChangedError()
+}
+
+/** Refusal for an edit that would recompute an order's lines, totals, VAT or exchange rate while a bill exists against it. */
+export const PO_BILLED_FIGURES_EDIT_MESSAGE =
+  'This purchase order already has a bill, so its lines, costs, VAT or exchange rate cannot be changed: the bill would keep the old figures. Correct or credit the bill first.'

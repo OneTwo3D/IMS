@@ -14,6 +14,7 @@ import {
   FreightCostLinesSchema,
   FreightEditRefusedError,
   FREIGHT_TAX_RATE_UNKNOWN_MESSAGE,
+  FREIGHT_BILLED_VAT_CHANGE_MESSAGE,
   planFreightCostLineEdit,
   resolveFreightEditTaxRate,
   type StoredFreightCostLine,
@@ -323,4 +324,22 @@ test('edit tax rate: none sent keeps the stored rate; a different one is a tax c
   )
   const supplied = resolveFreightEditTaxRate({ requested: 0.2, storedRate: null, storedTaxForeign: '20' })
   assert.equal(supplied.effectiveRate.toString(), '0.2')
+})
+
+
+test('edit plan: on an order with ANY billed line a VAT-rate or vatable-flag change is refused (even when every line is billed and unchanged); on an unbilled order it is allowed', () => {
+  const allBilled = [stored('a', '30', { billed: true }), stored('b', '20', { billed: true })]
+  const someBilled = [stored('a', '30', { billed: true }), stored('b', '20')]
+  const unbilled = [stored('a', '30'), stored('b', '20')]
+  const unchangedLines = [submit('a', 30), submit('b', 20)]
+  const refusal = (e: unknown) => e instanceof FreightEditRefusedError && e.message === FREIGHT_BILLED_VAT_CHANGE_MESSAGE
+  console.log('billed-vat PRECONDITION: tax-only edit with every line billed / one billed / none billed')
+  assert.throws(() => plan(allBilled, unchangedLines, true), refusal)
+  assert.throws(() => plan(someBilled, unchangedLines, true), refusal)
+  assert.equal(plan(unbilled, unchangedLines, true).kind, 'apply')
+  // Flipping the vatable flag of an UNBILLED line on an order that has a billed line changes the order VAT too.
+  assert.throws(() => plan(someBilled, [submit('a', 30), submit('b', 20, { vatable: true })], false), refusal)
+  assert.equal(plan(unbilled, [submit('a', 30), submit('b', 20, { vatable: true })], false).kind, 'apply')
+  // An unchanged save of a fully billed order is still fine.
+  assert.equal(plan(allBilled, unchangedLines, false).kind, 'noop')
 })
