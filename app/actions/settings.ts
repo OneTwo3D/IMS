@@ -679,6 +679,11 @@ export async function generateMissingXeroTaxRates(
   reportTypeOverrides?: Record<string, string>,
 ): Promise<MissingTaxRateGenerateResult> {
   await requirePermission('settings.company')
+  // THE PRODUCER-SIDE HOLD, before anything is sent to Xero: this action writes straight to Xero with no queue row, so
+  // it asks here. A SHADOW is recorded and nothing is created (lib/domain/accounting/xero-direct-write-seam.ts).
+  const { xeroTaxRateWriteShadow } = await import('@/lib/domain/accounting/xero-direct-write-seam')
+  const shadow = await xeroTaxRateWriteShadow({ taxRateIds, reportTypeOverrides })
+  if (shadow) return { success: false, created: 0, failed: [], externalRatesCount: 0, supported: true, error: shadow.notice }
   try {
     const { getXeroTaxRates } = await import('@/lib/connectors/xero/accounts')
     const { putXeroTaxRate } = await import('@/lib/connectors/xero/tax-rates')

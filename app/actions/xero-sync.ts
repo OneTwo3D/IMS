@@ -1,5 +1,6 @@
 'use server'
 
+import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
@@ -857,6 +858,13 @@ export async function retryFailedXeroSync(
         const allowed: typeof scopeCandidates = []
         const refused: Array<{ id: string; reason: string; tokenCount: number }> = []
         for (const candidate of scopeCandidates) {
+          // THE PRODUCER-SIDE HOLD AT THE RE-QUEUE: a row whose decision is SHADOW is not made claimable again. (The claim
+          // boundary in the processor would refuse to send it anyway; this stops the row cycling back to PENDING.)
+          const hold = xeroProducerSeamVerdict({ connector: 'xero', type: String(candidate.type), payload: candidate.payload })
+          if (hold.kind === 'shadow') {
+            refused.push({ id: candidate.id, reason: hold.notice, tokenCount: 1 })
+            continue
+          }
           const plan = planManualRetry({
             type: candidate.type,
             reference: `${candidate.referenceType} ${candidate.referenceId}`,

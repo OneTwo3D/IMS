@@ -500,7 +500,7 @@ export async function findSalesOrderDeleteBlocker(
     if (standing === 'ASSERTED_POSTED') return 1
     if (standing === 'ASSERTED_NOT_POSTED') return 2
     // UNKNOWN covers a FAILED row and a CANCELLED row nobody proved pre-call.
-    if (standing === 'UNKNOWN' || standing === 'PROVEN_NOT_POSTED') return 3
+    if (standing === 'UNKNOWN' || standing === 'PROVEN_NOT_POSTED' || standing === 'SHADOW_NOT_SENT_BY_IMS') return 3
     return status === 'PROCESSING' ? 4 : 5
   }
   const standings = candidateDocuments.map((row) => ({ row, standing: ledgerStanding(row) }))
@@ -541,6 +541,12 @@ export async function findSalesOrderDeleteBlocker(
               + 'UNPROVEN. Check the accounting system for it. If it exists there, it needs an explicit reversal or credit note. '
               + 'If it does not exist, this order still cannot be hard-deleted from here (nothing records that check yet): cancel '
               + 'the order instead, which keeps the record.'
+            : documentStanding === 'SHADOW_NOT_SENT_BY_IMS'
+              // A shadow: IMS did not send it, but the owner of the operation may have. Unproven, and it blocks.
+              ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) IMS recorded as a SHADOW instead of sending. `
+                + 'That says nothing about whether the document exists: the writer that owns this operation in the current phase may have posted it, so its '
+                + 'presence in the accounting system is UNPROVEN. Check the accounting system for it. If it exists there, it needs an explicit reversal or '
+                + 'credit note; either way cancel the order instead of deleting it, which keeps the record.'
             : liveDocument.status === 'FAILED'
               ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
                 + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
@@ -718,7 +724,7 @@ export async function findSalesOrderDeleteBlocker(
         // finance to reverse an entry that does not exist creates an erroneous one - so it is conditional on existence.
         (batchStanding === 'CONFIRMED_POSTED'
           ? 'The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.'
-          : (batchStanding === 'ASSERTED_NOT_POSTED' || batchStanding === 'UNKNOWN'
+          : (batchStanding === 'ASSERTED_NOT_POSTED' || batchStanding === 'UNKNOWN' || batchStanding === 'SHADOW_NOT_SENT_BY_IMS'
             ? 'Whether this batch journal reached the accounting system is UNPROVEN (an operator settled it as not posted, '
               + 'or it was retired with no recorded pre-call proof). '
             : batchStanding === 'ASSERTED_POSTED'

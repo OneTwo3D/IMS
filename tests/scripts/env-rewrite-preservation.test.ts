@@ -638,6 +638,8 @@ test('re-run: a security setting that cannot be carried REFUSES the run before a
       ['TRUSTED_PROXY_IPS holds an encoded blob', `TRUSTED_PROXY_IPS=${Buffer.from('postgresql://a:b@h/d').toString('base64')}\n`, true],
       ['XERO tenant allowlist with a space-separated list', 'XERO_ALLOWED_TENANT_IDS=a b\n', true],
       ['a write grant that is not a timestamp', 'MINTSOFT_WRITES_LIVE_FROM=whenever\n', true],
+      ['a producer-hold list with a misspelt destination', 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=xerro\n', true],
+      ['a well-formed producer-hold list', 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero, woocommerce\n', false],
       ['TRUSTED_PROXY_IPS carries the admin password', `TRUSTED_PROXY_IPS=10.0.0.1,Adm1nPassw0rd\n`, true],
       ['a well-formed quoted security setting', 'REQUIRE_TRUSTED_PROXY_CONFIG="true"\nTRUSTED_PROXY_IPS=\'10.0.0.1\'\n', false],
       ['a NON-security setting that does not fit', 'OUTBOX_RETRY_BASE_MS=abc\n', false],
@@ -794,6 +796,7 @@ test('re-run: AUDIT — every value the application accepts for a listed setting
     ['XERO_TENANT_ID', 'lib/connectors/xero/tenant-guard.ts (deprecated single id)', [U]],
     ['XERO_WRITE_ALLOWED_TENANT', 'lib/security/outbound-write-grant.ts readXeroGrant (one tenant id, a UUID)', [U, U.toUpperCase()]],
     ['XERO_DAILY_BATCH_LIMIT', 'lib/connectors/xero/daily-sync.ts resolveXeroDailyBatchLimit (Number, > 0)', ['1000', '250.5']],
+    ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'lib/security/producer-seam.ts readProducerEnforcement (comma list of xero|mintsoft|woocommerce, or all; entries trimmed)', ['xero', 'xero, woocommerce', 'all', 'xero,mintsoft,woocommerce']],
     ['XERO_WRITES_LIVE_FROM', 'lib/security/producer-disposition.ts ISO_UTC_RE', ['2026-12-01T00:00Z', '2026-12-01T00:00:00Z', '2026-12-01T00:00:00.5Z']],
     ['WC_WRITES_LIVE_FROM', 'lib/security/producer-disposition.ts ISO_UTC_RE', ['2026-12-01T00:00:00Z']],
     ['MINTSOFT_WRITES_LIVE_FROM', 'lib/security/producer-disposition.ts ISO_UTC_RE', ['2026-12-01T00:00:00Z']],
@@ -838,7 +841,7 @@ test('re-run: AUDIT — every value the application accepts for a listed setting
   console.log(`  ${values} application-accepted values pass their shapes`)
   // A setting whose ABSENCE loosens a verification or a guard (a switch that turns a check on, an allowlist, a cap, a policy mode).
   const loosensWhenAbsent = ['REQUIRE_TRUSTED_PROXY_CONFIG', 'BEHIND_PROXY', 'PREFLIGHT_DB_CONNECT', 'TRUSTED_PROXY_IPS', 'TRUSTED_PROXY_CIDRS', 'RATE_LIMIT_BACKEND', 'CSP_MODE',
-    'XERO_ALLOWED_TENANT_IDS', 'XERO_BLOCKED_TENANT_IDS', 'XERO_ALLOWED_TENANT_NAMES', 'XERO_REQUIRE_DEMO_ORG', 'XERO_TENANT_ID', 'XERO_DAILY_BATCH_LIMIT',
+    'XERO_ALLOWED_TENANT_IDS', 'XERO_BLOCKED_TENANT_IDS', 'XERO_ALLOWED_TENANT_NAMES', 'XERO_REQUIRE_DEMO_ORG', 'XERO_TENANT_ID', 'XERO_DAILY_BATCH_LIMIT', 'PRODUCER_HOLD_ENFORCED_DESTINATIONS',
     'CONNECTOR_FETCH_TIMEOUT_MS', 'CONNECTOR_FETCH_MAX_RESPONSE_BYTES', 'DATABASE_RESTORE_MAX_FILE_BYTES', 'SHOPPING_WEBHOOK_MAX_BODY_BYTES', 'SHOPPING_WEBHOOK_READ_TIMEOUT_MS', 'XERO_ACCOUNTING_OUTBOX_ENABLED', 'FRESH_AUTH_MAX_AGE_SECONDS', 'INVOICE_PDF_TOKEN_TTL_SECONDS', 'INVOICE_PDF_TOKEN_MAX_TTL_SECONDS']
   assert.deepEqual(loosensWhenAbsent.filter((k) => !security.has(k)), [], 'every guard whose absence loosens it is a security setting')
 })

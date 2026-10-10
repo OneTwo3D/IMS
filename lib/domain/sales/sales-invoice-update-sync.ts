@@ -73,7 +73,7 @@ type QueueAccountingSync = (params: {
   // The DOCUMENT connector stays the stored form: the facade compares it against the chart and refuses a
   // mismatch, which is exactly how a link naming an archived connector is caught.
   documentConnector: StoredAccountingConnector | null
-}) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred'; connector: string | null }>
+}) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred' | 'shadowed'; connector: string | null }>
 
 type LogActivity = (params: {
   entityType: 'SALES_ORDER'

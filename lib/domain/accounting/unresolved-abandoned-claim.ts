@@ -1,5 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { UNPROVEN_CANCELLED_WHERE, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { UNPROVEN_CANCELLED_EXCEPT_SHADOWS_WHERE, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 
 // ---------------------------------------------------------------------------
 // o3d-nepa — AN UNRESOLVED ABANDONED CLAIM, AND WHY AGE IS NOT EVIDENCE THAT IT IS FINISHED.
@@ -117,4 +117,4 @@ export function cancelledClaimIsResolved(row: {
  * claim" names a claimed row: every canceller NULLS `processingStartedAt` as it retires the row, so
  * the evidence that it was ever claimed is destroyed by the very write that abandons it.
  */
-export const UNRESOLVED_ABANDONED_CLAIM_WHERE: Prisma.AccountingSyncLogWhereInput = UNPROVEN_CANCELLED_WHERE
+export const UNRESOLVED_ABANDONED_CLAIM_WHERE: Prisma.AccountingSyncLogWhereInput = UNPROVEN_CANCELLED_EXCEPT_SHADOWS_WHERE

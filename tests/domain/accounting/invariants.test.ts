@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { SHADOWED_OBLIGATION_WHERE, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import {
   collectAccountingInvariantRows,
   evaluateAccountingInvariantRows,
@@ -176,6 +176,10 @@ test('[o3d-1e7sl D5] the Group-B evidence check and the operator-asserted report
     { name: 'UNKNOWN (FAILED)', standing: 'UNKNOWN', over: { status: 'FAILED', externalTransactionId: null }, evidenced: false, reported: false },
     { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, evidenced: false, reported: false },
     { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }, evidenced: false, reported: false },
+    // THE PRODUCER-SIDE HOLD'S SHADOW: the same standing as the row above and the opposite answer. The batch was shadowed,
+    // not lost: the shadow is the record that the obligation was seen and deliberately not produced, so the shipment is
+    // not "posted with nothing behind it". The two rows differ only in settlementBasis, which isolates the rule.
+    { name: 'SHADOW (HELD_SHADOW)', standing: 'SHADOW_NOT_SENT_BY_IMS', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }, evidenced: true, reported: false },
   ]
   let reported = 0
   for (const c of cases) {
@@ -760,6 +764,7 @@ test('accounting row collection selects staged orders, posted shipments, and syn
       OR: [
         { status: 'FAILED' },
         { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+        SHADOWED_OBLIGATION_WHERE,
       ],
     },
   )

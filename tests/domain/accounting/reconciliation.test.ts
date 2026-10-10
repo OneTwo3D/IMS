@@ -1557,6 +1557,10 @@ test('[o3d-1e7sl D6] a missing-evidence finding is silenced ONLY by a sync row t
     { name: 'UNKNOWN (FAILED)', standing: 'UNKNOWN', over: { status: 'FAILED', externalTransactionId: null, settlementBasis: null }, silences: false },
     { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, silences: false },
     { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: true }, silences: false },
+    // THE PRODUCER-SIDE HOLD'S SHADOW is a DIFFERENT standing from the orphan-sweep row above (PROVEN_NOT_POSTED) and gets the OPPOSITE
+    // answer here: the shadow is the record that IMS saw the obligation and deliberately did not produce it (another writer owns the
+    // operation in this phase), so it is not "missing". The two rows differ only in settlementBasis, which isolates the rule.
+    { name: 'SHADOW (HELD_SHADOW)', standing: 'SHADOW_NOT_SENT_BY_IMS', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }, silences: true },
   ]
   let silenced = 0
   for (const c of cases) {

@@ -48,6 +48,16 @@ export type StandingDisplay = {
 }
 
 const DETAILS: Record<Exclude<LedgerStanding, 'PROVEN_NOT_POSTED'>, StandingDisplay> = {
+  SHADOW_NOT_SENT_BY_IMS: {
+    standing: 'SHADOW_NOT_SENT_BY_IMS',
+    cause: null,
+    tone: 'unproven',
+    label: 'shadow',
+    detail:
+      'A shadow: the producer-side hold said SHADOW for this posting, so IMS recorded what it would have written and queued '
+      + 'nothing. IMS did not send it. This is NOT proof that the document is absent from the accounting system: the owner of this '
+      + 'operation may have written it. UNPROVEN - check the accounting system itself before deleting, reversing or re-posting.',
+  },
   CONFIRMED_POSTED: {
     standing: 'CONFIRMED_POSTED',
     cause: null,

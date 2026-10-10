@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
-import { ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
+import { SHADOWED_OBLIGATION_WHERE, isShadowedObligation, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
@@ -354,7 +354,10 @@ function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): LiveSyncLogInd
   const exact = new Set<string>()
   const digestBridged = new Set<string>()
   for (const log of syncLogs) {
-    if (!rowHoldsWorkSlot(log)) continue
+    // A shadow (the producer-side hold recorded it instead of queuing the posting) is evidence that the obligation was
+    // seen and deliberately not produced: the batch it belongs to is not "stamped with nothing behind it". It is not a
+    // live row and is indexed for this question only.
+    if (!rowHoldsWorkSlot(log) && !isShadowedObligation(log)) continue
     const key = liveSyncLogIndexKey(log.type, log.referenceId, log.referenceType)
     exact.add(key)
     digestBridged.add(key)
@@ -1056,12 +1059,14 @@ export async function collectAccountingInvariantRows(
         OR: [
           { status: 'FAILED' },
           { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+          SHADOWED_OBLIGATION_WHERE,
         ],
       }
     : {
         OR: [
           { status: 'FAILED' },
           { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+          SHADOWED_OBLIGATION_WHERE,
         ],
       }
   const [salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds] = await Promise.all([

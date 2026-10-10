@@ -3831,6 +3831,44 @@ model ProductContent {
   @@map("product_contents")
 }
 
+/// What IMS WOULD HAVE written to a destination while the producer-side hold said SHADOW (lib/security/producer-disposition.ts).
+/// One row per distinct unit of work: repeats of the same work (same destination, operation, subject and payload digest) add
+/// to `occurrences` instead of adding rows, so a sweep that re-produces the same obligation every tick costs one row. A
+/// shadow is a RECORD, never work: nothing reads this table to deliver anything, and nothing may.
+/// The payload itself is NOT stored here (only its digest and a small summary); a Xero shadow's payload lives on its
+/// AccountingSyncLog row (`accountingSyncLogId`), subject to that table's retention.
+model OutboundShadowWrite {
+  id                   String   @id @default(cuid())
+  /// 'xero' | 'mintsoft' | 'woocommerce' (an OutboundConnector).
+  destination          String
+  /// The ownership-map operation, for example 'purchase.bill'.
+  operation            String
+  /// The kind of document the work is about ('PurchaseOrder', 'DailyBatch', ...) and its id.
+  subjectType          String   @map("subject_type")
+  subjectId            String   @map("subject_id")
+  /// sha256 (hex) of the canonical JSON of what would have been sent, bookkeeping stamps removed.
+  payloadDigest        String   @map("payload_digest") @db.Char(64)
+  /// Small and never secret: document ids, amounts, dates, the sync type.
+  summary              Json     @default("{}")
+  /// The first failing reason of the decision (producer-disposition-constants.ts).
+  reason               String
+  /// The owner of the operation in the phase the decision found.
+  owner                String
+  phase                String
+  /// The live-from instant that was in force, when one was readable.
+  cutoff               DateTime?
+  grantState           String   @map("grant_state")
+  /// Xero: the CANCELLED sync-log row that carries this shadow's standing. Not a foreign key: retention may delete it.
+  accountingSyncLogId  String?  @map("accounting_sync_log_id")
+  firstProducedAt      DateTime @default(now()) @map("first_produced_at")
+  lastProducedAt       DateTime @default(now()) @map("last_produced_at")
+  occurrences          Int      @default(1)
+
+  @@unique([destination, operation, subjectType, subjectId, payloadDigest], map: "outbound_shadow_writes_work_key")
+  @@index([destination, lastProducedAt], map: "outbound_shadow_writes_destination_last_idx")
+  @@map("outbound_shadow_writes")
+}
+
 /// AI HS-code classification proposal awaiting human review (6igm.3). A proposal is only
 /// authoritative once APPROVED, at which point its code is written to the product. Carries both
 /// the classifier's self-report (modelConfidence, source) and the deterministic validator output

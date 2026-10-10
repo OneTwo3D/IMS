@@ -258,6 +258,8 @@ export function describeSyncRowStanding(sync: LedgerStandingRow): string {
         : provenCauseOf(sync) === 'REJECTED_BEFORE_POSTING'
           ? `${sync.status}, rejected before posting`
           : `${sync.status}, never sent (recorded before the remote call)`
+    case 'SHADOW_NOT_SENT_BY_IMS':
+      return `${sync.status}, recorded as a shadow (IMS did not send it; whether the operation's owner posted it is not known)`
     case 'LIVE_WORK':
       return `${sync.status} (queued or in flight)`
     default:

@@ -54,7 +54,7 @@ import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal
  */
 export type EnqueueOutcomeLike = {
   queued: boolean
-  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred'
+  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred' | 'shadowed'
   connector?: string | null
   /**
    * o3d-j625 r5 (review HIGH 1/2/3) — THE POSTING KEY, FROM THE ENQUEUE'S OWN PARAMS.
@@ -76,6 +76,10 @@ export type EnqueueOutcomeLike = {
  * Is this posting STILL OWED?
  *
  * `queued: true`                 no — a sync row is durable (this call wrote it, or found one standing).
+ * `queued: true, shadowed`      no — the producer-side hold said SHADOW: IMS recorded a shadow and created no outbox
+ *                                job and no accounting event. IMS owes the ledger nothing for it in the current phase
+ *                                (another writer owns the operation, or none does). NOT a statement that the document
+ *                                is in the ledger.
  * `queued: false, not-configured` no — there is no connector, or it does not post this type, so no GL
  *                                counterpart will ever exist and nothing is outstanding.
  * `queued: false, refused`       YES.

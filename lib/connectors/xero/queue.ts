@@ -145,6 +145,8 @@ export async function queueXeroSync(params: {
     // o3d-j625 r18: an operator holds the hand-posting CLAIM — declined, and still OWED. See the note at the
     // primitive's answer below for why this cannot share `handledByHand`.
     let handPostDeferred = false
+    // The producer-side hold said SHADOW: a shadow was recorded and no posting was queued.
+    let shadowed = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     let priorVerdict: ReturnType<typeof classifyPriorAttempts> | null = null
     await db.$transaction(async (tx) => {
@@ -273,6 +275,11 @@ export async function queueXeroSync(params: {
         else handPostDeferred = true
         return
       }
+      // The producer-side hold said SHADOW: recorded, nothing queued (no outbox job, no accounting event).
+      if (created.shadowed) {
+        shadowed = true
+        return
+      }
       const log = created.row
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
@@ -376,6 +383,8 @@ export async function queueXeroSync(params: {
     if (handledByHand) return { queued: true, reason: 'handled-by-hand' }
     // OWED, not settled: nothing is in the ledger yet and IMS wrote no row. See the r18 note above.
     if (handPostDeferred) return { queued: false, reason: 'hand-post-deferred' }
+    // Recorded as a shadow, not queued: IMS owes the ledger nothing here (see 'shadowed' on ConnectorEnqueueOutcome).
+    if (shadowed) return { queued: true, reason: 'shadowed' }
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.
