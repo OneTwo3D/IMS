@@ -167,7 +167,8 @@ test('o3d-f709: UNPROVEN_CANCELLED_WHERE (retention) is exactly CANCELLED and ma
   for (const r of population()) {
     const ts = r.status === 'CANCELLED' && mayHaveReachedLedger(r)
     assert.equal(where(r, UNPROVEN_CANCELLED_WHERE), ts, JSON.stringify(r))
-    assert.equal(where(r, UNRESOLVED_ABANDONED_CLAIM_WHERE), ts, `retention's name for it: ${JSON.stringify(r)}`)
+    // Retention's name for it keeps everything the general reading keeps EXCEPT a shadow, which holds no ledger claim.
+    assert.equal(where(r, UNRESOLVED_ABANDONED_CLAIM_WHERE), ts && !isShadowedObligation(r), `retention's name for it: ${JSON.stringify(r)}`)
     if (ts) matched += 1
   }
   console.log(`# cross product: retention keeps ${matched} CANCELLED rows`)

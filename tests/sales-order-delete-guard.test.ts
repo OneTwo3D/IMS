@@ -1564,7 +1564,7 @@ const STANDING_CASES: StandingCase[] = [
     // THE PRODUCER-SIDE HOLD'S SHADOW: IMS did not send it, the operation's real owner may have. It blocks, and says it is unproven.
     name: 'SHADOW_NOT_SENT_BY_IMS (a shadow: CANCELLED + HELD_SHADOW, no id)', standing: 'SHADOW_NOT_SENT_BY_IMS',
     row: { status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }, blocks: true,
-    says: /recorded as a SHADOW instead of sending[\s\S]*proves only that IMS did not send it[\s\S]*UNPROVEN/, neverSays: NOT_A_FACT,
+    says: /recorded as a SHADOW instead of sending[\s\S]*says nothing about whether the document exists[\s\S]*UNPROVEN/, neverSays: NOT_A_FACT,
   },
   {
     name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK',

@@ -544,8 +544,8 @@ export async function findSalesOrderDeleteBlocker(
             : documentStanding === 'SHADOW_NOT_SENT_BY_IMS'
               // A shadow: IMS did not send it, but the owner of the operation may have. Unproven, and it blocks.
               ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) IMS recorded as a SHADOW instead of sending. `
-                + 'That proves only that IMS did not send it: the writer that owns this operation in the current phase may have posted it, so whether the '
-                + 'document exists in the accounting system is UNPROVEN. Check the accounting system for it. If it exists there, it needs an explicit reversal or '
+                + 'That says nothing about whether the document exists: the writer that owns this operation in the current phase may have posted it, so its '
+                + 'presence in the accounting system is UNPROVEN. Check the accounting system for it. If it exists there, it needs an explicit reversal or '
                 + 'credit note; either way cancel the order instead of deleting it, which keeps the record.'
             : liveDocument.status === 'FAILED'
               ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `

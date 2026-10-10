@@ -418,7 +418,7 @@ export const UNPROVEN_CANCELLED_WHERE: Prisma.AccountingSyncLogWhereInput = {
 export const UNPROVEN_CANCELLED_EXCEPT_SHADOWS_WHERE: Prisma.AccountingSyncLogWhereInput = {
   AND: [
     UNPROVEN_CANCELLED_WHERE,
-    { OR: [{ settlementBasis: null }, { settlementBasis: { not: HELD_SHADOW_SETTLEMENT_BASIS } }, { externalTransactionId: { not: null } }] },
+    { OR: [{ settlementBasis: null }, { settlementBasis: { not: HELD_SHADOW_SETTLEMENT_BASIS } }, ID_PRESENT] },
   ],
 }
 

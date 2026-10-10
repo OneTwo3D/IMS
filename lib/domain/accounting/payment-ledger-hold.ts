@@ -374,7 +374,7 @@ export function describeAttemptUndecidedRefusal(
   if (shadowed.length > 0 && shadowed.length === undecided.length) {
     return {
       code: 'registration_attempt_undecided',
-      message:
+      message: withLedgerCheck(
         `IMS did not register this receipt against the invoice for ${orderReference} in the accounting system: the producer-side `
         + 'hold recorded the registration as a SHADOW instead of sending it (entry '
         + `${entries}). That proves only that IMS did not send it. The writer that owns payment registration in the current `
@@ -385,7 +385,7 @@ export function describeAttemptUndecidedRefusal(
         + 'below — IMS will ask the accounting system about that exact payment, check it belongs to this invoice and matches this '
         + 'receipt, and confirm it really is gone before removing anything here.\n'
         + '• If there is NO payment, IMS still cannot settle this on its own: an invoice showing nothing looks the same whether a '
-        + 'payment was removed or never arrived, so this receipt stays until a reference is supplied or the hold is lifted.',
+        + 'payment was removed or never arrived, so this receipt stays until a reference is supplied or the hold is lifted.'),
     }
   }
   return {
