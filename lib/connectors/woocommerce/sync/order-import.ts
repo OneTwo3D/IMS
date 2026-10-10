@@ -15,7 +15,7 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
-import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts } from './coupon-classification'
+import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts, wcUpdateNeedsStoreCreditReview } from './coupon-classification'
 import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, STORE_CREDIT_REVIEW_ACTION, storeCreditInvoiceQueuedNotice } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
 import {
@@ -789,19 +789,16 @@ export async function updateExistingWcOrderFromPayload(
   // warehouse push refuse. Nothing is restated.
   const reclassified = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data)
   const payloadCredit = reclassified.creditGross
-  const payloadHasCreditConflict = reclassified.lines.some((l) => l.creditConflict) || reclassified.signalProblems.length > 0
+  const payloadHasCreditConflict = reclassified.signalProblems.length > 0
   let reviewFlagged = false
   await db.$transaction(async (tx) => {
+    // Only a payload that shows credit or any credit-evidence problem can need a review; the steady state reads nothing.
     if (payloadCredit.gt(0) || payloadHasCreditConflict) {
       const stored = await tx.salesOrder.findUnique({
         where: { id: orderId },
         select: { storeCreditForeign: true, storeCreditAssessment: true },
       })
-      const accountedFor = stored !== null
-        && stored.storeCreditAssessment === 'ASSESSED'
-        && !payloadHasCreditConflict
-        && roundQuantity(payloadCredit, 4).eq(toDecimal(stored.storeCreditForeign))
-      if (stored && !accountedFor && stored.storeCreditAssessment !== 'REVIEW_REQUIRED') {
+      if (stored && wcUpdateNeedsStoreCreditReview(wcOrder, stored)) {
         // The order row lock first, then a CONDITIONAL write that only ever moves to REVIEW_REQUIRED: idempotent,
         // so concurrent deliveries agree, and only the one that wrote logs.
         await lockSalesOrder(tx, orderId)

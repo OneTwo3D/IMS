@@ -98,25 +98,59 @@ function parseJsonMaybe(value: unknown): unknown {
   }
 }
 
-type TypeRead = { present: boolean; type: string | null }
+/**
+ * THE ONE INVARIANT (Codex rounds 1-6 all found instances of breaking it):
+ *
+ *   ANY evidence of store credit that is not a clean, fully parsed, fully reconciled credit is REFUSED on
+ *   import and puts the order in REVIEW on update. "Clean" is the only positive path: a whitelist of exact
+ *   shapes. Everything else - missing, malformed, unreadable, conflicting, orphaned, or merely suspicious -
+ *   falls through to a PROBLEM.
+ *
+ * EVIDENCE is any of: the order's `smart_coupons_contribution` key present in ANY value shape; a coupon line
+ * whose type (`coupon_info`, `coupon_data`), code or meta says smart_coupon / store credit / gift card / wallet;
+ * a wallet / gift-card order meta key (list below); a coupon line amount that cannot be read; a missing
+ * `discount_type`; sources that disagree.
+ *
+ * THE CLEAN SHAPES (nothing else is positive):
+ *   - credit line: every readable source says `smart_coupon` (item `coupon_info` and/or `coupon_data`, or, when
+ *     the item carries no type at all, the contribution map lists its code), no source disagrees or is
+ *     unreadable, and both `discount` and `discount_tax` are present, finite and non-negative.
+ *   - contribution record: a NON-EMPTY `{code: amount}` map, every amount finite and non-negative, every code
+ *     matched (case / whitespace normalised) by a coupon line.
+ *   - genuine discount line: every readable source names the same known genuine type, none says anything
+ *     credit-like, the code / meta contain no credit words, the amount is readable.
+ *   - wallet / gift-card meta: absent, or a readable zero.
+ *   - a coupon line of an unrecognised type string with no credit evidence keeps its allocation-based handling
+ *     (carried as a discount when Woo put it on the lines; refused when it did not).
+ */
+
+type TypeRead = { present: boolean; type: string | null; unreadable: boolean }
 
 function readCouponInfoType(meta: WcMeta[] | undefined): TypeRead {
-  const entry = (meta ?? []).find((m) => m.key === 'coupon_info')
-  if (!entry) return { present: false, type: null }
-  const parsed = parseJsonMaybe(entry.value)
-  const type = Array.isArray(parsed) && typeof parsed[2] === 'string' ? parsed[2].trim() : ''
-  return { present: true, type: type || null }
+  const entries = (meta ?? []).filter((m) => m.key === 'coupon_info')
+  if (entries.length === 0) return { present: false, type: null, unreadable: false }
+  const types = entries.map((entry) => {
+    const parsed = parseJsonMaybe(entry.value)
+    return Array.isArray(parsed) && typeof parsed[2] === 'string' && parsed[2].trim() ? parsed[2].trim() : null
+  })
+  const first = types[0]
+  const consistent = first !== null && types.every((t) => t === first)
+  return { present: true, type: consistent ? first : null, unreadable: !consistent }
 }
 
 function readCouponDataType(meta: WcMeta[] | undefined): TypeRead {
-  const entry = (meta ?? []).find((m) => m.key === 'coupon_data')
-  if (!entry) return { present: false, type: null }
-  const parsed = parseJsonMaybe(entry.value)
-  const raw = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-    ? (parsed as Record<string, unknown>).discount_type
-    : undefined
-  const type = typeof raw === 'string' ? raw.trim() : ''
-  return { present: true, type: type || null }
+  const entries = (meta ?? []).filter((m) => m.key === 'coupon_data')
+  if (entries.length === 0) return { present: false, type: null, unreadable: false }
+  const types = entries.map((entry) => {
+    const parsed = parseJsonMaybe(entry.value)
+    const raw = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>).discount_type
+      : undefined
+    return typeof raw === 'string' && raw.trim() ? raw.trim() : null
+  })
+  const first = types[0]
+  const consistent = first !== null && types.every((t) => t === first)
+  return { present: true, type: consistent ? first : null, unreadable: !consistent }
 }
 
 /** Matching key for a coupon code: WooCommerce lower-cases codes, so case and surrounding whitespace never distinguish two. */
@@ -124,42 +158,71 @@ export function normaliseWcCouponCode(code: unknown): string {
   return String(code ?? '').trim().toLowerCase()
 }
 
+/** A finite, non-negative money amount, or null. Strict: junk, NaN, infinities and negatives are all null. */
+function parseStrictMoney(value: unknown): Decimal | null {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value < 0) return null
+    return toDecimal(value)
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!/^\d+(\.\d+)?$/.test(trimmed)) return null
+    return toDecimal(trimmed)
+  }
+  return null
+}
+
 export type WcContribution = { code: string; amount: Decimal | null }
 
-/**
- * What Smart Coupons recorded as store-credit contributions on the order (`smart_coupons_contribution`):
- * one entry per code with its amount, or `null` when the amount could not be read. The list form carries no
- * amounts, so every entry in it is unreadable.
- */
-export function readStoreCreditContributions(orderMeta: WcMeta[] | undefined): WcContribution[] {
+type ContributionRead = {
+  /** Any `smart_coupons_contribution` entry exists, whatever its value. */
+  present: boolean
+  entries: WcContribution[]
+  /** Why the record is not a clean non-empty `{code: amount}` map; empty when it is. */
+  malformed: string[]
+}
+
+/** Read the contribution record without ever concluding "nothing" from a record that is present. */
+function readStoreCreditContributionRecord(orderMeta: WcMeta[] | undefined): ContributionRead {
   const out = new Map<string, WcContribution>()
-  for (const entry of orderMeta ?? []) {
-    if (entry.key !== WC_STORE_CREDIT_CONTRIBUTION_META_KEY) continue
-    const parsed = parseJsonMaybe(entry.value)
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      for (const [rawCode, rawAmount] of Object.entries(parsed as Record<string, unknown>)) {
-        const code = normaliseWcCouponCode(rawCode)
-        if (code) out.set(code, { code, amount: parseMoney(rawAmount) })
+  const malformed: string[] = []
+  const records = (orderMeta ?? []).filter((m) => m.key === WC_STORE_CREDIT_CONTRIBUTION_META_KEY)
+  for (const entry of records) {
+    let value: unknown = entry.value
+    if (typeof value === 'string') {
+      const trimmed = value.trim()
+      try { value = trimmed ? JSON.parse(trimmed) : null } catch { value = undefined }
+    }
+    if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) {
+      malformed.push('smart_coupons_contribution is present but is not a {coupon code: amount} map')
+      continue
+    }
+    const pairs = Object.entries(value as Record<string, unknown>)
+    if (pairs.length === 0) {
+      malformed.push('smart_coupons_contribution is present but empty')
+      continue
+    }
+    for (const [rawCode, rawAmount] of pairs) {
+      const code = normaliseWcCouponCode(rawCode)
+      if (!code) {
+        malformed.push('smart_coupons_contribution has an entry with no coupon code')
+        continue
       }
-    } else if (Array.isArray(parsed)) {
-      for (const raw of parsed) {
-        const code = normaliseWcCouponCode(raw)
-        if (typeof raw === 'string' && code) out.set(code, { code, amount: null })
-      }
+      out.set(code, { code, amount: parseStrictMoney(rawAmount) })
     }
   }
-  return [...out.values()]
+  return { present: records.length > 0, entries: [...out.values()], malformed }
 }
 
 /** The (normalised) codes Smart Coupons recorded as store-credit contributions on the order. */
 export function readStoreCreditContributionCodes(orderMeta: WcMeta[] | undefined): Set<string> {
-  return new Set(readStoreCreditContributions(orderMeta).map((c) => c.code))
+  return new Set(readStoreCreditContributionRecord(orderMeta).entries.map((c) => c.code))
 }
 
 /**
  * Order meta keys other store-credit / wallet / gift-card plugins record a redeemed amount under, with NO coupon
  * line (the legacy WooCommerce-to-warehouse sync plugin's default list). Such credit reduces `order.total` exactly as
- * Smart Coupons credit does, and IMS does not model it: a non-zero (or unreadable) value is refused, never ignored.
+ * Smart Coupons credit does, and IMS does not model it: anything but an absent key or a readable zero is refused.
  */
 export const WC_UNMODELLED_CREDIT_META_KEYS: readonly string[] = [
   '_wc_store_credit_used', '_store_credit_used', '_store_credit_applied',
@@ -167,6 +230,9 @@ export const WC_UNMODELLED_CREDIT_META_KEYS: readonly string[] = [
   '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total',
   '_smart_coupon_credit_used',
 ]
+
+/** Words that mean store credit, wherever they appear on a coupon line that is not a cleanly typed genuine discount. */
+const CREDIT_WORDS = /smart[_ -]?coupon|store[_ -]?credit|gift[_ -]?(?:card|cert)|giftcard|wallet/i
 
 function parseMoney(value: unknown): Decimal | null {
   if (value === null || value === undefined || value === '') return toDecimal(0)
@@ -178,107 +244,94 @@ function parseMoney(value: unknown): Decimal | null {
   }
 }
 
-const CREDIT_AMOUNT_UNREADABLE = 'the store-credit amount could not be read as a non-negative number'
+type Problem = { code: string; why: string }
 
-function classifyOne(line: WcCouponLine, contributionCodes: Set<string>): ClassifiedWcCoupon {
+function classifyOne(line: WcCouponLine, contributionCodes: Set<string>, problems: Problem[]): ClassifiedWcCoupon {
   const code = (line.code ?? '').trim()
-  const net = parseMoney(line.discount)
-  const tax = parseMoney(line.discount_tax)
   const info = readCouponInfoType(line.meta_data)
   const data = readCouponDataType(line.meta_data)
   const inContribution = contributionCodes.has(normaliseWcCouponCode(code))
+  const netStrict = parseStrictMoney(line.discount)
+  const taxStrict = parseStrictMoney(line.discount_tax)
+  const netLenient = parseMoney(line.discount)
+  const taxLenient = parseMoney(line.discount_tax)
 
-  const base = {
-    code,
-    net: net ?? toDecimal(0),
-    tax: tax ?? toDecimal(0),
-  }
-  const unknown = (discountType: string | null, unknownReason: string, creditConflict = false): ClassifiedWcCoupon => ({
-    ...base, kind: 'UNKNOWN', discountType, unknownReason, creditConflict,
-  })
-
-  // EVERY DISAGREEMENT INVOLVING A CREDIT SIGNAL IS REFUSED, three sources: coupon_info, coupon_data and the
-  // order's smart_coupons_contribution record. If any one calls the coupon store credit and another calls it
-  // something else (or is unreadable), the allocation residual cannot be trusted to expose it: credit that
-  // was applied to the lines too matches the line discounts exactly, and would import as a discount.
-  const creditSignal = info.type === WC_STORE_CREDIT_DISCOUNT_TYPE || data.type === WC_STORE_CREDIT_DISCOUNT_TYPE || inContribution
-  const otherSignal =
-    (info.type !== null && info.type !== WC_STORE_CREDIT_DISCOUNT_TYPE)
-    || (data.type !== null && data.type !== WC_STORE_CREDIT_DISCOUNT_TYPE)
-    || (info.present && !info.type)
-    || (data.present && !data.type)
-  if (creditSignal && otherSignal) {
-    return unknown(
-      info.type ?? data.type,
-      `the sources disagree about whether "${code}" is store credit (coupon_info: ${info.present ? info.type ?? 'unreadable' : 'absent'}, `
-      + `coupon_data: ${data.present ? data.type ?? 'unreadable' : 'absent'}, smart_coupons_contribution: ${inContribution ? 'lists it' : 'does not list it'})`,
-      true,
-    )
+  const base = { code, net: netLenient ?? toDecimal(0), tax: taxLenient ?? toDecimal(0) }
+  const problem = (why: string, discountType: string | null): ClassifiedWcCoupon => {
+    problems.push({ code: code || '(no code)', why })
+    return { ...base, kind: 'UNKNOWN', discountType, unknownReason: why, creditConflict: true }
   }
 
-  // Two item-level records that name different types: do not pick one.
-  if (info.type && data.type && info.type !== data.type) {
-    return unknown(null, `coupon_info says "${info.type}" but coupon_data says "${data.type}"`)
-  }
-  const type = info.type ?? data.type
-  // A record that exists but could not be read is not the same as no record: say so.
-  const unreadable = (info.present && !info.type) || (data.present && !data.type)
+  const types = [info.type, data.type].filter((t): t is string => t !== null)
+  const sawCreditType = types.includes(WC_STORE_CREDIT_DISCOUNT_TYPE)
+  const sawOtherType = types.some((t) => t !== WC_STORE_CREDIT_DISCOUNT_TYPE)
+  const unreadableRecord = info.unreadable || data.unreadable
+  const typeLabel = types[0] ?? null
+  const describeSources = `coupon_info: ${info.present ? info.type ?? 'unreadable' : 'absent'}, coupon_data: ${data.present ? data.type ?? 'unreadable' : 'absent'}, `
+    + `smart_coupons_contribution: ${inContribution ? 'lists it' : 'does not list it'}`
 
-  if (type === WC_STORE_CREDIT_DISCOUNT_TYPE || (type === null && !unreadable && inContribution)) {
-    if (net === null || tax === null || net.isNegative() || tax.isNegative()) {
-      return unknown(type, CREDIT_AMOUNT_UNREADABLE)
+  // 1. A type record that is present but cannot be read is never "no information".
+  if (unreadableRecord) return problem(`a coupon type record for "${code}" is present but unreadable or inconsistent (${describeSources})`, typeLabel)
+
+  const creditSignal = sawCreditType || inContribution
+  // 2. Any disagreement involving a credit signal.
+  if (creditSignal && sawOtherType) return problem(`the sources disagree about whether "${code}" is store credit (${describeSources})`, typeLabel)
+
+  // 3. THE CLEAN CREDIT SHAPE.
+  if (creditSignal) {
+    if (netStrict === null || taxStrict === null) {
+      return problem(`the store-credit amount of "${code}" is missing, unreadable or negative (discount: ${JSON.stringify(line.discount)}, discount_tax: ${JSON.stringify(line.discount_tax)})`, typeLabel)
     }
-    return { ...base, kind: 'STORE_CREDIT', discountType: type, unknownReason: null, creditConflict: false }
+    return { code, net: netStrict, tax: taxStrict, kind: 'STORE_CREDIT', discountType: typeLabel, unknownReason: null, creditConflict: false }
   }
-  if (type !== null) {
-    if (inContribution) {
-      return unknown(type, `the order records "${code}" as a store-credit contribution but its type is "${type}"`)
-    }
-    if (WC_GENUINE_DISCOUNT_TYPES.has(type)) {
-      return { ...base, kind: 'DISCOUNT', discountType: type, unknownReason: null, creditConflict: false }
-    }
-    return unknown(type, `the coupon type "${type}" is not one IMS recognises`)
+
+  // From here the line has NO credit signal from a type or the contribution record.
+  // 4. A cleanly typed genuine discount.
+  const distinct = new Set(types)
+  if (types.length > 0 && distinct.size === 1 && WC_GENUINE_DISCOUNT_TYPES.has(types[0])) {
+    if (line.discount !== undefined && line.discount !== '' && netLenient === null) return problem(`the discount amount of "${code}" cannot be read`, typeLabel)
+    return { ...base, kind: 'DISCOUNT', discountType: typeLabel, unknownReason: null, creditConflict: false }
   }
-  return unknown(
-    null,
-    unreadable
-      ? 'the coupon type record is present but unreadable'
-      : 'WooCommerce recorded no coupon type for it',
-  )
+  // 5. Not a cleanly typed genuine discount: credit words anywhere on the line are evidence.
+  const text = `${code} ${JSON.stringify(line.meta_data ?? [])}`
+  if (CREDIT_WORDS.test(text)) return problem(`the code or records of "${code}" say store credit / gift card / wallet, but its type does not (${describeSources})`, typeLabel)
+  // 6. No type at all is a missing discount_type: not provably a discount.
+  if (types.length === 0) return problem(`WooCommerce recorded no coupon type for "${code}" (${describeSources})`, null)
+  // 7. A type IMS does not recognise, with no credit evidence: allocation-based handling.
+  if (distinct.size > 1) return problem(`the coupon type records for "${code}" disagree (${describeSources})`, typeLabel)
+  return { ...base, kind: 'UNKNOWN', discountType: typeLabel, unknownReason: `the coupon type "${typeLabel}" is not one IMS recognises`, creditConflict: false }
 }
 
 /**
- * Classify every coupon line of an order. `orderMeta` is the ORDER's `meta_data` (for the Smart Coupons
- * contribution map); omit it when only item-level evidence is available.
+ * Classify every coupon line of an order and collect EVERY credit-evidence problem. `orderMeta` is the ORDER's
+ * `meta_data`. A non-empty `signalProblems` means the order is not cleanly assessable: refuse it on import, hold it
+ * for review on update.
  */
 export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: WcMeta[]): ClassifiedWcCoupons {
-  const contributions = readStoreCreditContributions(orderMeta)
-  const contributionCodes = new Set(contributions.map((c) => c.code))
-  const lines = (couponLines ?? []).map((line) => classifyOne(line, contributionCodes))
+  const problems: Problem[] = []
+  const record = readStoreCreditContributionRecord(orderMeta)
+  const contributionCodes = new Set(record.entries.map((c) => c.code))
+  const lines = (couponLines ?? []).map((line) => classifyOne(line, contributionCodes, problems))
   const lineCodes = new Set((couponLines ?? []).map((l) => normaliseWcCouponCode(l.code)))
-  const signalProblems: Array<{ code: string; why: string }> = []
-  for (const c of contributions) {
-    if (lineCodes.has(c.code)) continue
-    if (c.amount !== null && c.amount.isZero()) continue
-    signalProblems.push({
-      code: c.code,
-      why: c.amount === null
-        ? 'smart_coupons_contribution lists it with an amount IMS cannot read, and the order has no coupon line for it'
-        : `smart_coupons_contribution lists ${c.amount.toString()} for it, but the order has no coupon line for it`,
-    })
+
+  for (const why of record.malformed) problems.push({ code: WC_STORE_CREDIT_CONTRIBUTION_META_KEY, why })
+  for (const c of record.entries) {
+    if (c.amount === null) problems.push({ code: c.code, why: 'smart_coupons_contribution lists it with an amount IMS cannot read' })
+    if (!lineCodes.has(c.code)) problems.push({ code: c.code, why: 'smart_coupons_contribution lists it, but the order has no coupon line for it' })
   }
   for (const key of WC_UNMODELLED_CREDIT_META_KEYS) {
     for (const entry of (orderMeta ?? []).filter((m) => m.key === key)) {
-      const amount = typeof entry.value === 'object' && entry.value !== null ? null : parseMoney(entry.value)
-      if (amount !== null && amount.isZero()) continue
-      signalProblems.push({
+      const readable = parseStrictMoney(entry.value === '' ? 0 : entry.value)
+      if (readable !== null && readable.isZero()) continue
+      problems.push({
         code: key,
-        why: amount === null
+        why: readable === null
           ? 'a store-credit / wallet / gift-card record with a value IMS cannot read'
-          : `a store-credit / wallet / gift-card record of ${amount.toString()} that reduces the order total without a coupon line, which IMS does not model`,
+          : `a store-credit / wallet / gift-card record of ${readable.toString()} that reduces the order total without a coupon line, which IMS does not model`,
       })
     }
   }
+
   const credit = lines.filter((l) => l.kind === 'STORE_CREDIT')
   const rest = lines.filter((l) => l.kind !== 'STORE_CREDIT')
   const zero = toDecimal(0)
@@ -288,16 +341,34 @@ export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: W
     creditNet: credit.reduce((s, l) => addMoney(s, l.net), zero),
     creditGross: credit.reduce((s, l) => addMoney(s, addMoney(l.net, l.tax)), zero),
     genuineNet: rest.reduce((s, l) => addMoney(s, l.net), zero),
-    unknown: lines.filter((l) => l.kind === 'UNKNOWN'),
-    signalProblems,
+    unknown: lines.filter((l) => l.kind === 'UNKNOWN' && !l.creditConflict),
+    signalProblems: problems,
   }
+}
+
+/**
+ * Does a later delivery of an order IMS already holds put it in store-credit review? TRUE when the payload has any
+ * credit-evidence problem, or shows credit the stored row does not account for (not assessed, or a different
+ * amount). The stored credit itself is never changed.
+ */
+export function wcUpdateNeedsStoreCreditReview(
+  payload: { coupon_lines?: WcCouponLine[]; meta_data?: WcMeta[] },
+  stored: { storeCreditForeign: unknown; storeCreditAssessment: unknown },
+): boolean {
+  if (stored.storeCreditAssessment === 'REVIEW_REQUIRED') return false // already held
+  const classified = classifyWcCouponLines(payload.coupon_lines ?? [], payload.meta_data)
+  if (classified.signalProblems.length > 0) return true
+  const credit = roundQuantity(classified.creditGross, 4)
+  if (!credit.gt(0)) return false
+  let storedCredit: Decimal
+  try { storedCredit = toDecimal(stored.storeCreditForeign as string | number) } catch { return true }
+  return !(stored.storeCreditAssessment === 'ASSESSED' && credit.eq(storedCredit))
 }
 
 export type WcCouponPlanRefusal =
   | { kind: 'UNKNOWN_COUPON_TYPE'; reason: string; coupons: Array<{ code: string; discountType: string | null; why: string }> }
   | { kind: 'CREDIT_NOT_RECONCILED'; reason: string }
   | { kind: 'CREDIT_SIGNAL_CONFLICT'; reason: string; coupons: Array<{ code: string; discountType: string | null; why: string }> }
-  | { kind: 'CREDIT_UNREADABLE'; reason: string; coupons: Array<{ code: string; discountType: string | null; why: string }> }
 
 /**
  * Operator-facing sentence for a refused order, single-sourced here so the activity log, the returned
@@ -378,29 +449,6 @@ export function planWcOrderCoupons(input: {
       kind: 'CREDIT_SIGNAL_CONFLICT',
       reason: 'WooCommerce records store credit for this order that no coupon line accounts for, so IMS cannot tell what was paid and will not guess.',
       coupons: classified.signalProblems.map((p) => ({ code: p.code, discountType: null, why: p.why })),
-    }
-    return plan
-  }
-
-  // A coupon the sources disagree about is refused whatever the residual (see classifyOne).
-  const conflicted = classified.lines.filter((l) => l.creditConflict)
-  if (conflicted.length > 0) {
-    plan.refusal = {
-      kind: 'CREDIT_SIGNAL_CONFLICT',
-      reason: 'the records WooCommerce keeps disagree about whether a coupon is store credit, so IMS cannot tell whether it is a payment or a discount and will not choose.',
-      coupons: asList(conflicted),
-    }
-    return plan
-  }
-
-  // An unreadable store-credit amount is an UNKNOWN line that WAS recognised as credit: it can never be
-  // allowed through as a discount, whether or not any residual shows.
-  const unreadableCredit = classified.unknown.filter((l) => l.unknownReason === CREDIT_AMOUNT_UNREADABLE)
-  if (unreadableCredit.length > 0) {
-    plan.refusal = {
-      kind: 'CREDIT_UNREADABLE',
-      reason: 'a store-credit coupon carries an amount IMS cannot read, so it cannot be treated as a payment or as a discount.',
-      coupons: asList(unreadableCredit),
     }
     return plan
   }

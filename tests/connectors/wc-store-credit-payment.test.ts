@@ -129,7 +129,7 @@ test('UNKNOWN coupon type with money NOT on the lines REFUSES instead of guessin
 test('a coupon with NO recorded type and money off the lines also refuses (absence is not "discount")', () => {
   const result = plan([coupon('legacy', '10.00', null)], 0)
   precondition('no type', { metaEntries: 0, unallocated: result.unallocated })
-  assert.equal(result.refusal?.kind, 'UNKNOWN_COUPON_TYPE')
+  assert.equal(result.refusal?.kind, 'CREDIT_SIGNAL_CONFLICT', 'a missing discount_type is not provably a discount, allocated or not')
   assert.match(describeWcCouponRefusal('1002', result.refusal!), /WooCommerce recorded no coupon type/)
 })
 
@@ -175,7 +175,7 @@ test('the order-level smart_coupons_contribution map (what the production plugin
 test('a store-credit amount that cannot be read is refused even when it would look allocated', () => {
   const result = plan([coupon('storecredit', 'not-a-number', 'smart_coupon')], 0)
   precondition('unreadable credit', { discount: 'not-a-number' })
-  assert.equal(result.refusal?.kind, 'CREDIT_UNREADABLE')
+  assert.equal(result.refusal?.kind, 'CREDIT_SIGNAL_CONFLICT')
   assert.equal(num(result.storeCreditForeign), 0)
 })
 
@@ -243,7 +243,7 @@ test('SIGNAL MATRIX: every disagreement involving a credit signal is refused wha
     { info: T, data: T, contribution: true, expect: 'CREDIT' },
     { info: D, data: null, contribution: false, expect: 'DISCOUNT' },
     { info: D, data: D, contribution: false, expect: 'DISCOUNT' },
-    { info: null, data: null, contribution: false, expect: 'UNKNOWN' },
+    { info: null, data: null, contribution: false, expect: 'CONFLICT' },
     { info: T, data: D, contribution: false, expect: 'CONFLICT' },
     { info: D, data: T, contribution: false, expect: 'CONFLICT' },
     { info: D, data: null, contribution: true, expect: 'CONFLICT' },
@@ -393,7 +393,7 @@ test('ORPHAN SIGNALS: a contribution without its coupon line, a wallet record, a
     { name: 'contribution matches its line (case/whitespace differ)', lines: [scLine('sc')], orderMeta: contribution({ ' SC ': 12 }), expect: 'CREDIT' },
     { name: 'UNTYPED line identified only by a contribution whose key differs in case/whitespace', lines: [coupon('SC', '10.00', null, { discount_tax: '2.00' })], orderMeta: contribution({ ' sc ': 12 }), expect: 'CREDIT' },
     { name: 'two codes, one has a line, the other is an orphan', lines: [scLine('sc')], orderMeta: contribution({ sc: 12, gift: 20 }), expect: 'REFUSED' },
-    { name: 'orphan with a zero amount is no credit', lines: [], orderMeta: contribution({ sc: 0 }), expect: 'NOTHING' },
+    { name: 'orphan with a zero amount is still evidence (the record is present, its line is not)', lines: [], orderMeta: contribution({ sc: 0 }), expect: 'REFUSED' },
     { name: 'orphan with an unreadable amount', lines: [], orderMeta: contribution({ sc: 'lots' }), expect: 'REFUSED' },
     { name: 'list form (no amounts) orphan', lines: [], orderMeta: contribution(['sc']), expect: 'REFUSED' },
     { name: 'extra credit line WITHOUT a contribution (unchanged)', lines: [scLine('sc')], orderMeta: [], expect: 'CREDIT' },
