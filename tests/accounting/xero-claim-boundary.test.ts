@@ -104,4 +104,5 @@ test('STRUCTURAL: the manual retry asks the decision before it plans the revival
   const plan = source.indexOf('const plan = planManualRetry({', ask)
   console.log(`# retry offsets: ask=${ask} refuse=${refuse} plan=${plan}`)
   assert.ok(ask > 0 && refuse > ask && plan > refuse, 'ask, then refuse, then plan the revival')
+  assert.match(source.slice(ask, refuse), /if \(hold\.kind === 'shadow'\) \{\s*$/, 'and the refusal is conditioned on the SHADOW verdict itself')
 })
