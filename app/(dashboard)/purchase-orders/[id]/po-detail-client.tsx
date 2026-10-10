@@ -1646,6 +1646,8 @@ function PayBillDialog({
 
 type FreightCostEditLine = {
   key: string
+  /** The stored cost line this row edits (absent for a line added in this dialog). The server matches by it. */
+  id?: string
   description: string
   amountForeign: number
   vatable: boolean
@@ -1655,10 +1657,12 @@ type FreightCostEditLine = {
 function EditFreightCostsDialog({
   po,
   currencies,
+  taxRates,
   onClose,
 }: {
   po: PoDetail
   currencies: CurrencyRow[]
+  taxRates: TaxRateRow[]
   onClose: () => void
 }) {
   const baseCurrency = useBaseCurrency()
@@ -1687,6 +1691,7 @@ function EditFreightCostsDialog({
     if (po.freightCostLines.length > 0) {
       return po.freightCostLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
         key: Math.random().toString(36).slice(2),
+        id: cl.id,
         description: cl.description,
         amountForeign: cl.amountForeign,
         vatable: cl.vatable,
@@ -1699,6 +1704,16 @@ function EditFreightCostsDialog({
     return []
   })
 
+  // The order's VAT rate. Starts at the rate the order recorded; an order that was charged no VAT starts at "No VAT".
+  // An order that was charged VAT but never recorded the rate starts UNSET and sends nothing: the server refuses it
+  // and says why, rather than this dialog guessing a rate or zeroing the VAT.
+  const purchaseTaxRates = taxRates.filter((t) => t.usedFor === 'PURCHASE' || t.usedFor === 'BOTH')
+  const rateUnrecorded = po.taxRatePercent == null && po.taxForeign > 0
+  const [taxRateId, setTaxRateId] = useState(() => {
+    if (po.taxRatePercent == null) return rateUnrecorded ? '__unset' : ''
+    return purchaseTaxRates.find((t) => Math.abs(t.rate - (po.taxRatePercent ?? 0)) < 0.00005)?.id ?? '__recorded'
+  })
+
   const subtotal = costLines.reduce((s, cl) => s + cl.amountForeign, 0) + lockedLines.reduce((s, cl) => s + cl.amountForeign, 0)
 
   function handleSave() {
@@ -1709,18 +1724,24 @@ function EditFreightCostsDialog({
         po.id,
         [
           ...costLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
+            ...(cl.id ? { id: cl.id } : {}),
             description: cl.description,
             amountForeign: cl.amountForeign,
             vatable: cl.vatable,
             distributionMethod: cl.distributionMethod,
           })),
           ...lockedLines.map((cl) => ({
+            id: cl.id,
             description: cl.description,
             amountForeign: cl.amountForeign,
             vatable: cl.vatable,
             distributionMethod: cl.distributionMethod,
           })),
         ],
+        // '__recorded' = keep the stored rate (no matching tax-rate row); '__unset' = nothing chosen.
+        taxRateId === '__recorded' || taxRateId === '__unset'
+          ? undefined
+          : (purchaseTaxRates.find((t) => t.id === taxRateId)?.rate ?? 0),
       )
       if (result.success) {
         router.refresh()
@@ -1793,6 +1814,22 @@ function EditFreightCostsDialog({
           >
             <Plus className="h-3 w-3 mr-1" />Add Cost Line
           </Button>
+
+          <div className="space-y-1.5">
+            <Label>VAT Rate</Label>
+            <select
+              value={taxRateId}
+              onChange={(e) => setTaxRateId(e.target.value)}
+              className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+            >
+              {taxRateId === '__unset' && <option value="__unset">Choose a VAT rate…</option>}
+              {taxRateId === '__recorded' && <option value="__recorded">Recorded rate ({((po.taxRatePercent ?? 0) * 100).toFixed(2)}%)</option>}
+              <option value="">No VAT</option>
+              {purchaseTaxRates.map((t) => (
+                <option key={t.id} value={t.id}>{t.name} ({(t.rate * 100).toFixed(0)}%)</option>
+              ))}
+            </select>
+          </div>
 
           {lockedLines.length > 0 && (
             <div className="rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
@@ -2740,7 +2777,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {/* Edit Freight Costs dialog */}
       {showEditFreight && (
-        <EditFreightCostsDialog po={po} currencies={currencies} onClose={() => setShowEditFreight(false)} />
+        <EditFreightCostsDialog po={po} currencies={currencies} taxRates={taxRates} onClose={() => setShowEditFreight(false)} />
       )}
 
       {/* Invoices / Bills history */}

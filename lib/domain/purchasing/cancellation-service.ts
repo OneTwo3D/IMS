@@ -23,6 +23,7 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import { lockLandedCostRevaluationScope } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
 
 const PURCHASE_ORDER_CANCELLATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -101,6 +102,20 @@ async function logPurchaseOrderCancellationNoop(
   })
 }
 
+/**
+ * A credit note's base amount for the cancellation gate. Credit notes recorded before the exchange-rate direction fix
+ * stored `amountBase` MULTIPLIED by the rate (foreign x rate instead of foreign / rate) and are not corrected
+ * retrospectively, so the gate does not trust the stored base: it recomputes it from the stored foreign amount and
+ * rate (divide) whenever both are usable, and falls back to the stored base only when the rate is unusable.
+ */
+export function creditNoteBaseForGate(cn: { amountBase: unknown; amountForeign: unknown; fxRateToBase: unknown }): number {
+  try {
+    return supplierCreditNoteAmountBase(String(cn.amountForeign), String(cn.fxRateToBase)).toNumber()
+  } catch {
+    return Number(cn.amountBase)
+  }
+}
+
 export async function cancelPurchaseOrderService(
   id: string,
   deps: CancelPurchaseOrderServiceDeps = defaultCancelPurchaseOrderServiceDeps,
@@ -151,7 +166,7 @@ export async function cancelPurchaseOrderService(
           // Base-currency totals are the GL predicate; per-bill credit attribution
           // prevents a credit for one bill satisfying another (Codex review).
           invoices: { select: { id: true, totalBase: true } },
-          supplierCreditNotes: { where: { status: 'POSTED' }, select: { purchaseInvoiceId: true, amountBase: true } },
+          supplierCreditNotes: { where: { status: 'POSTED' }, select: { purchaseInvoiceId: true, amountBase: true, amountForeign: true, fxRateToBase: true } },
         },
       })
       if (!existing) throw new Error('PO not found')
@@ -168,7 +183,7 @@ export async function cancelPurchaseOrderService(
       const creditedBaseByInvoice = new Map<string, number>()
       for (const cn of existing.supplierCreditNotes) {
         if (!cn.purchaseInvoiceId) continue // unattributed credits don't offset a specific bill
-        creditedBaseByInvoice.set(cn.purchaseInvoiceId, (creditedBaseByInvoice.get(cn.purchaseInvoiceId) ?? 0) + Number(cn.amountBase))
+        creditedBaseByInvoice.set(cn.purchaseInvoiceId, (creditedBaseByInvoice.get(cn.purchaseInvoiceId) ?? 0) + creditNoteBaseForGate(cn))
       }
       const invoiceGate = evaluatePurchaseOrderCancellationInvoiceGate({
         isFreight: existing.type === 'FREIGHT',
