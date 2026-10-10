@@ -789,7 +789,7 @@ export async function updateExistingWcOrderFromPayload(
   // warehouse push refuse. Nothing is restated.
   const reclassified = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data)
   const payloadCredit = reclassified.creditGross
-  const payloadHasCreditConflict = reclassified.lines.some((l) => l.creditConflict)
+  const payloadHasCreditConflict = reclassified.lines.some((l) => l.creditConflict) || reclassified.signalProblems.length > 0
   let reviewFlagged = false
   await db.$transaction(async (tx) => {
     if (payloadCredit.gt(0) || payloadHasCreditConflict) {

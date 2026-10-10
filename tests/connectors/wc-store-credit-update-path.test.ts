@@ -107,6 +107,16 @@ test('a CONFLICT about credit on a later delivery holds the order, even with no 
   assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
 })
 
+test('a contribution whose coupon line is MISSING on a later delivery holds the order, as does a wallet record', async () => {
+  state.stored = { storeCreditForeign: '0.0000', storeCreditAssessment: 'ASSESSED' }
+  await run(order([], [{ id: 3, key: 'smart_coupons_contribution', value: { sc: 12 } }] as unknown as WcFullOrder['meta_data']))
+  precondition('orphan contribution on update', { stored: state.stored })
+  assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
+  state.stored = { storeCreditForeign: '0.0000', storeCreditAssessment: 'ASSESSED' }
+  await run(order([], [{ id: 4, key: '_used_wallet_amount', value: '10.00' }] as unknown as WcFullOrder['meta_data']))
+  assert.equal(state.stored!.storeCreditAssessment, 'REVIEW_REQUIRED')
+})
+
 test('no credit and no conflict: nothing is read, nothing is written', async () => {
   await run(order(percent))
   await run(order([]))

@@ -79,6 +79,12 @@ export type ClassifiedWcCoupons = {
   /** Ex-tax total of every non-credit line (DISCOUNT and UNKNOWN): the money that should be in the lines. */
   genuineNet: Decimal
   unknown: ClassifiedWcCoupon[]
+  /**
+   * Credit signals that match NO coupon line and so would be silently dropped: a non-zero (or unreadable)
+   * `smart_coupons_contribution` entry whose coupon line is absent, and a non-zero (or unreadable) wallet /
+   * gift-card order meta value. Any of them is refused, on import and (as a review hold) on update.
+   */
+  signalProblems: Array<{ code: string; why: string }>
 }
 
 function parseJsonMaybe(value: unknown): unknown {
@@ -113,25 +119,54 @@ function readCouponDataType(meta: WcMeta[] | undefined): TypeRead {
   return { present: true, type: type || null }
 }
 
-/** The codes Smart Coupons recorded as store-credit contributions on the order. */
-export function readStoreCreditContributionCodes(orderMeta: WcMeta[] | undefined): Set<string> {
-  const codes = new Set<string>()
+/** Matching key for a coupon code: WooCommerce lower-cases codes, so case and surrounding whitespace never distinguish two. */
+export function normaliseWcCouponCode(code: unknown): string {
+  return String(code ?? '').trim().toLowerCase()
+}
+
+export type WcContribution = { code: string; amount: Decimal | null }
+
+/**
+ * What Smart Coupons recorded as store-credit contributions on the order (`smart_coupons_contribution`):
+ * one entry per code with its amount, or `null` when the amount could not be read. The list form carries no
+ * amounts, so every entry in it is unreadable.
+ */
+export function readStoreCreditContributions(orderMeta: WcMeta[] | undefined): WcContribution[] {
+  const out = new Map<string, WcContribution>()
   for (const entry of orderMeta ?? []) {
     if (entry.key !== WC_STORE_CREDIT_CONTRIBUTION_META_KEY) continue
     const parsed = parseJsonMaybe(entry.value)
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      for (const code of Object.keys(parsed as Record<string, unknown>)) {
-        const trimmed = code.trim()
-        if (trimmed) codes.add(trimmed)
+      for (const [rawCode, rawAmount] of Object.entries(parsed as Record<string, unknown>)) {
+        const code = normaliseWcCouponCode(rawCode)
+        if (code) out.set(code, { code, amount: parseMoney(rawAmount) })
       }
     } else if (Array.isArray(parsed)) {
-      for (const code of parsed) {
-        if (typeof code === 'string' && code.trim()) codes.add(code.trim())
+      for (const raw of parsed) {
+        const code = normaliseWcCouponCode(raw)
+        if (typeof raw === 'string' && code) out.set(code, { code, amount: null })
       }
     }
   }
-  return codes
+  return [...out.values()]
 }
+
+/** The (normalised) codes Smart Coupons recorded as store-credit contributions on the order. */
+export function readStoreCreditContributionCodes(orderMeta: WcMeta[] | undefined): Set<string> {
+  return new Set(readStoreCreditContributions(orderMeta).map((c) => c.code))
+}
+
+/**
+ * Order meta keys other store-credit / wallet / gift-card plugins record a redeemed amount under, with NO coupon
+ * line (the legacy WooCommerce-to-warehouse sync plugin's default list). Such credit reduces `order.total` exactly as
+ * Smart Coupons credit does, and IMS does not model it: a non-zero (or unreadable) value is refused, never ignored.
+ */
+export const WC_UNMODELLED_CREDIT_META_KEYS: readonly string[] = [
+  '_wc_store_credit_used', '_store_credit_used', '_store_credit_applied',
+  '_used_wallet_amount', '_woo_wallet_used', '_partial_pay_through_wallet_amount',
+  '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total',
+  '_smart_coupon_credit_used',
+]
 
 function parseMoney(value: unknown): Decimal | null {
   if (value === null || value === undefined || value === '') return toDecimal(0)
@@ -151,7 +186,7 @@ function classifyOne(line: WcCouponLine, contributionCodes: Set<string>): Classi
   const tax = parseMoney(line.discount_tax)
   const info = readCouponInfoType(line.meta_data)
   const data = readCouponDataType(line.meta_data)
-  const inContribution = contributionCodes.has(code)
+  const inContribution = contributionCodes.has(normaliseWcCouponCode(code))
 
   const base = {
     code,
@@ -217,8 +252,33 @@ function classifyOne(line: WcCouponLine, contributionCodes: Set<string>): Classi
  * contribution map); omit it when only item-level evidence is available.
  */
 export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: WcMeta[]): ClassifiedWcCoupons {
-  const contributionCodes = readStoreCreditContributionCodes(orderMeta)
+  const contributions = readStoreCreditContributions(orderMeta)
+  const contributionCodes = new Set(contributions.map((c) => c.code))
   const lines = (couponLines ?? []).map((line) => classifyOne(line, contributionCodes))
+  const lineCodes = new Set((couponLines ?? []).map((l) => normaliseWcCouponCode(l.code)))
+  const signalProblems: Array<{ code: string; why: string }> = []
+  for (const c of contributions) {
+    if (lineCodes.has(c.code)) continue
+    if (c.amount !== null && c.amount.isZero()) continue
+    signalProblems.push({
+      code: c.code,
+      why: c.amount === null
+        ? 'smart_coupons_contribution lists it with an amount IMS cannot read, and the order has no coupon line for it'
+        : `smart_coupons_contribution lists ${c.amount.toString()} for it, but the order has no coupon line for it`,
+    })
+  }
+  for (const key of WC_UNMODELLED_CREDIT_META_KEYS) {
+    for (const entry of (orderMeta ?? []).filter((m) => m.key === key)) {
+      const amount = typeof entry.value === 'object' && entry.value !== null ? null : parseMoney(entry.value)
+      if (amount !== null && amount.isZero()) continue
+      signalProblems.push({
+        code: key,
+        why: amount === null
+          ? 'a store-credit / wallet / gift-card record with a value IMS cannot read'
+          : `a store-credit / wallet / gift-card record of ${amount.toString()} that reduces the order total without a coupon line, which IMS does not model`,
+      })
+    }
+  }
   const credit = lines.filter((l) => l.kind === 'STORE_CREDIT')
   const rest = lines.filter((l) => l.kind !== 'STORE_CREDIT')
   const zero = toDecimal(0)
@@ -229,6 +289,7 @@ export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: W
     creditGross: credit.reduce((s, l) => addMoney(s, addMoney(l.net, l.tax)), zero),
     genuineNet: rest.reduce((s, l) => addMoney(s, l.net), zero),
     unknown: lines.filter((l) => l.kind === 'UNKNOWN'),
+    signalProblems,
   }
 }
 
@@ -309,6 +370,17 @@ export function planWcOrderCoupons(input: {
 
   const asList = (lines: ClassifiedWcCoupon[]) =>
     lines.map((l) => ({ code: l.code, discountType: l.discountType, why: l.unknownReason ?? '' }))
+
+  // A credit signal that matches no coupon line would be silently dropped (the order would import with a total
+  // lower than its goods value and no credit recorded): refused outright.
+  if (classified.signalProblems.length > 0) {
+    plan.refusal = {
+      kind: 'CREDIT_SIGNAL_CONFLICT',
+      reason: 'WooCommerce records store credit for this order that no coupon line accounts for, so IMS cannot tell what was paid and will not guess.',
+      coupons: classified.signalProblems.map((p) => ({ code: p.code, discountType: null, why: p.why })),
+    }
+    return plan
+  }
 
   // A coupon the sources disagree about is refused whatever the residual (see classifyOne).
   const conflicted = classified.lines.filter((l) => l.creditConflict)

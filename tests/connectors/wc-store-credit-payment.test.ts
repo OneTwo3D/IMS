@@ -378,3 +378,39 @@ test('HIGH-QUANTITY lines: Woo\'s own totals reconcile, IMS\'s 6dp unit-price re
   assert.equal(num(reported.goodsNet), num(goods))
   assert.deepEqual(viaReported, { ok: true })
 })
+
+// ---------------------------------------------------------------------------------------------------
+// A credit signal that matches no coupon line must never be silently dropped (Codex round 5).
+// ---------------------------------------------------------------------------------------------------
+
+test('ORPHAN SIGNALS: a contribution without its coupon line, a wallet record, an unreadable amount: all refused; matches and plain coupons unchanged', () => {
+  const contribution = (value: unknown) => [meta('smart_coupons_contribution', value)]
+  const scLine = (code: string) => coupon(code, '10.00', 'smart_coupon', { discount_tax: '2.00' })
+  type Row = { name: string; lines: WcCouponLine[]; orderMeta: WcMeta[]; expect: 'REFUSED' | 'CREDIT' | 'DISCOUNT_ONLY' | 'NOTHING' }
+  const rows: Row[] = [
+    { name: 'contribution 12, NO coupon line', lines: [], orderMeta: contribution({ sc: 12 }), expect: 'REFUSED' },
+    { name: 'contribution 12, only an unrelated percent line', lines: [coupon('p', '5.00', 'percent')], orderMeta: contribution({ sc: 12 }), expect: 'REFUSED' },
+    { name: 'contribution matches its line (case/whitespace differ)', lines: [scLine('sc')], orderMeta: contribution({ ' SC ': 12 }), expect: 'CREDIT' },
+    { name: 'two codes, one has a line, the other is an orphan', lines: [scLine('sc')], orderMeta: contribution({ sc: 12, gift: 20 }), expect: 'REFUSED' },
+    { name: 'orphan with a zero amount is no credit', lines: [], orderMeta: contribution({ sc: 0 }), expect: 'NOTHING' },
+    { name: 'orphan with an unreadable amount', lines: [], orderMeta: contribution({ sc: 'lots' }), expect: 'REFUSED' },
+    { name: 'list form (no amounts) orphan', lines: [], orderMeta: contribution(['sc']), expect: 'REFUSED' },
+    { name: 'extra credit line WITHOUT a contribution (unchanged)', lines: [scLine('sc')], orderMeta: [], expect: 'CREDIT' },
+    { name: 'plain percent coupon, no contribution (unchanged)', lines: [coupon('p', '10.00', 'percent')], orderMeta: [], expect: 'DISCOUNT_ONLY' },
+    { name: 'wallet meta 10.00, no coupon line', lines: [], orderMeta: [meta('_used_wallet_amount', '10.00')], expect: 'REFUSED' },
+    { name: 'wallet meta 0.00', lines: [], orderMeta: [meta('_used_wallet_amount', '0.00')], expect: 'NOTHING' },
+    { name: 'gift-card meta that is an object', lines: [], orderMeta: [meta('_ywgc_applied_gift_cards_total', { a: 1 })], expect: 'REFUSED' },
+  ]
+  const table: string[] = []
+  for (const row of rows) {
+    const lineDiscount = row.expect === 'DISCOUNT_ONLY' ? 10 : 0
+    const result = plan(row.lines, lineDiscount, row.orderMeta)
+    const got = result.refusal ? 'REFUSED' : result.storeCreditForeign.gt(0) ? 'CREDIT' : row.lines.length ? 'DISCOUNT_ONLY' : 'NOTHING'
+    table.push(`${row.name} -> ${got}${result.refusal ? ` (${result.refusal.kind})` : ''}`)
+    assert.equal(got, row.expect, table[table.length - 1])
+    if (row.expect === 'REFUSED') assert.equal(result.refusal?.kind, 'CREDIT_SIGNAL_CONFLICT')
+  }
+  // eslint-disable-next-line no-console
+  console.log(`PRECONDITION orphan-signal table (${table.length} rows):\n  ${table.join('\n  ')}`)
+  assert.equal(table.length, rows.length)
+})
