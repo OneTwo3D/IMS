@@ -235,6 +235,12 @@ If a freight PO is added or updated after goods have already been received, the 
 - **A bill is not saved if its order was edited while the bill was being prepared.** The order and its cost lines are
   re-read under the bill's locks; if the rate, VAT, or any cost line's amount, description or VAT flag differs from what
   the bill was calculated from, you are told to reload and create the bill again, and nothing is saved.
+  Editing an existing bill does the same check.
+- **Once any cost line of a freight order has been billed, its VAT rate and the VAT flag of its lines cannot be changed.**
+  The bill would keep the old VAT while the order showed the new, so the save is refused and tells you to correct or
+  credit the bill first. Orders with no billed line can still change their rate.
+- **A draft purchase order that already has a bill cannot have its lines, costs, VAT or exchange rate edited**, for the
+  same reason; header-only edits (notes, references, delivery date) are still allowed.
 - **A safeguard remains underneath.** Revaluing an already-journaled shipment below zero is still refused (nothing is
   changed and an **ERROR** entry, `landed_cost_revaluation_refused_journaled_shipment`, is written to the activity
   log) because IMS cannot post a negative COGS. Landed cost can no longer cause it on a purchase order's own layers; it remains the safeguard for manufactured outputs and any other source.
