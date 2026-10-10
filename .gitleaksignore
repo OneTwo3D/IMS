@@ -8,3 +8,5 @@ a9b95f858ff43001af527147f8812bbe70612ab7:tests/domain/accounting/accounting-even
 90a3d71134be9aed3fcaefcedb599be0f48d5b32:tests/concurrency/wc-order-status-jobs.concurrent.test.ts:generic-api-key:1096
 # o3d-31qrv: a placeholder multi-line value in a re-run test fixture (armor-header-shaped words around fake text), not a key; the fixture no longer contains it.
 04e46121af939da1790ed5c05e26b5432ac6682c:tests/scripts/env-rewrite-preservation.test.ts:private-key:176
+# o3d-kb3dq: a canary SAMPLE of the shape `curl -u user:pass` in the argv census's own rule test (the census exists to catch that shape); no real credential. The line no longer has the literal form.
+1afaaa1b3aa026b4d8920142793c10c58fd0ff13:tests/scripts/installer-secrets-argv.test.ts:curl-auth-user:219

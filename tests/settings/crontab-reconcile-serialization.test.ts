@@ -5566,7 +5566,7 @@ test('[o3d-batch-ret] the shell and TypeScript managed-job signatures are the sa
   //
   // The subject goes in through the environment and comes back through ENVIRON[], so no quoting
   // layer between TypeScript, bash and awk can alter the bytes being compared.
-  const { MANAGED_JOB_LINE_SIGNATURE } = await crontabSync()
+  const { MANAGED_JOB_LINE_SIGNATURE, LEGACY_MANAGED_JOB_LINE_SIGNATURE } = await crontabSync()
   const isRemnant = (subject: string) => sh([
     'set -uo pipefail',
     `source '${CRONTAB_LOCK_LIB}'`,
@@ -5591,9 +5591,16 @@ test('[o3d-batch-ret] the shell and TypeScript managed-job signatures are the sa
 
   // …and a single altered byte in the signature is enough to stop matching, which is what makes
   // the equality above a real comparison rather than a substring that happens to be short.
-  const drifted = await isRemnant(`0 2 * * * curl -s ${MANAGED_JOB_LINE_SIGNATURE.replace('Bearer', 'Bearer ')}api/cron/backup"`)
+  const drifted = await isRemnant(`0 2 * * * curl -s ${MANAGED_JOB_LINE_SIGNATURE.replace('-K', '-K ')}api/cron/backup"`)
   assert.match(drifted.stdout, /DIFFERS/,
     `a drifted signature must stop matching:\n${drifted.stdout}${drifted.stderr}`)
+
+  // THE LINES AN EARLIER VERSION WROTE (the bearer as a curl -H argument) are still ours to drop on an upgrade,
+  // and a drifted copy of THAT signature stops matching too.
+  const legacy = await isRemnant(`0 2 * * * curl -s ${LEGACY_MANAGED_JOB_LINE_SIGNATURE}api/cron/backup"`)
+  assert.match(legacy.stdout, /MATCHES/, `the legacy signature is still recognised:\n${legacy.stdout}${legacy.stderr}`)
+  const legacyDrifted = await isRemnant(`0 2 * * * curl -s ${LEGACY_MANAGED_JOB_LINE_SIGNATURE.replace('Bearer', 'Bearer ')}api/cron/backup"`)
+  assert.match(legacyDrifted.stdout, /DIFFERS/, 'a drifted legacy signature stops matching')
 })
 
 // ---------------------------------------------------------------------------
@@ -5905,7 +5912,8 @@ test('[o3d-batch-ret] no `*_locked` body writes the crontab except through the o
   assert.equal(ALL_LOCKED_BODIES.length, 15)
   const writes = ALL_LOCKED_BODIES.flatMap((b) => b.lines.filter(
     (l) => !isComment(l) && /\bwrite_crontab_for\b/.test(l)))
-  assert.equal(writes.length, 13,
+  // 14: the installer's bootstrap now has a second write (the in-place rewrite of legacy cron job lines, o3d-kb3dq)
+  assert.equal(writes.length, 14,
     'every crontab write in the three entrypoints must be one of these; a count that drifted '
     + 'means a site was added or removed without this test being read')
 

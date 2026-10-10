@@ -9,9 +9,15 @@ test('installer cron entries read the secret at runtime and never embed it', asy
   // Runtime read of the secret from .env (grep|cut|tr), matching the in-app
   // managed format (onetwo3d-ims-ryxy): no embedded literal, tr-stripped
   // quotes, and an empty-secret guard.
-  assert.match(installScript, /grep -m1 '\^CRON_SECRET=' '\$\{CRON_ENV_FILE\}' \| cut -d= -f2- \| tr -d/)
-  assert.match(installScript, /\[ -n \\"\\\$CRON_SECRET\\" \]/)
-  assert.match(installScript, /Authorization: Bearer \\\$CRON_SECRET/)
+  assert.match(installScript, /grep -m1 '\^CRON_SECRET=' '\$\{envfile\}' \| cut -d= -f2- \| tr -d/)
+  assert.match(installScript, /cron_job_command "\$\{slug\}" "\$\{CRON_LOG_FILE\}" "\$\{CRON_ENV_FILE\}"/)
+  // The bearer reaches curl as a config line on stdin, never as a -H argument (o3d-kb3dq), and an empty or
+  // unusable secret runs nothing (the empty-secret guard).
+  assert.match(installScript, /case "\$CRON_SECRET" in ''\|\*\\\\\*\) echo "cron-auth: CRON_SECRET is missing or unusable/)
+  assert.match(installScript, /curl -sf -o \/dev\/null -K - "\$BASE_URL\/@SLUG@"/)
+  // (the lines that RECOGNISE the old form so they can be rewritten name it, and are the only ones that may)
+  const withoutRecognisers = installScript.split('\n').filter((l) => !/re_(runtime|literal)=|CRON_LEGACY_SIGNATURE=/.test(l)).join('\n')
+  assert.doesNotMatch(withoutRecognisers, /-H \\?"Authorization: Bearer \\?\$CRON_SECRET/)
 
   // Bootstrap jobs are written INSIDE the OTI markers so the first in-app sync
   // replaces the block in place (no unmanaged duplicate lines that drift).

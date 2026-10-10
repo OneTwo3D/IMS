@@ -135,15 +135,16 @@ git_repo_uses_ssh() {
 }
 
 cf_request() {
-  local method="$1" path="$2" data="${3:-}"
+  local method="$1" path="$2" data="${3:-}" auth_config
+  # The token goes to curl on its standard input as a config line, never as a -H argument (which is on the command
+  # line, readable by every local account while the request runs).
+  auth_config="header = \"Authorization: Bearer ${CLOUDFLARE_API_TOKEN//[\\\"]/}\""
   if [[ -n "$data" ]]; then
-    curl -fsS -X "$method" "https://api.cloudflare.com/client/v4${path}" \
-      -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    curl -fsS -K - -X "$method" "https://api.cloudflare.com/client/v4${path}" \
       -H "Content-Type: application/json" \
-      --data "$data"
+      --data "$data" <<< "${auth_config}"
   else
-    curl -fsS -X "$method" "https://api.cloudflare.com/client/v4${path}" \
-      -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+    curl -fsS -K - -X "$method" "https://api.cloudflare.com/client/v4${path}" <<< "${auth_config}"
   fi
 }
 

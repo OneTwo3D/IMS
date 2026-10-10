@@ -28,12 +28,18 @@ const END_MARKER_RE = /^# --- OTI CRON END ---[ \t\r]*$/
  * The exact substring EVERY job line this builder generates contains — a curl
  * sending `Authorization: Bearer $CRON_SECRET` to `$BASE_URL/<slug>` (both
  * runtime and embedded modes; the runtime prefix differs but this tail is
- * identical). The installer's awk uses the IDENTICAL literal via index(), so
+ * identical). The installer's awk uses the IDENTICAL literals via index(), so
  * the two agree exactly (Codex r7). It references our own shell variables, so
  * a coincidental operator match is implausible — but the sweep below is still
  * BOUNDED to a malformed block's region, never global (Codex r7).
  */
-export const MANAGED_JOB_LINE_SIGNATURE = '-H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/'
+export const MANAGED_JOB_LINE_SIGNATURE = '-K - "$BASE_URL/'
+/**
+ * The signature of the lines this builder wrote BEFORE the bearer left the command line (o3d-kb3dq): a curl with the
+ * header as an argument, which `ps` shows to every local account while a job runs. No new line is written this way, but
+ * an upgrade still has to recognise and replace the old ones, so both signatures mark a managed line.
+ */
+export const LEGACY_MANAGED_JOB_LINE_SIGNATURE = '-H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/'
 /** Lines the builder emits inside a block besides job lines (header/BASE_URL) — swept in a malformed tail. */
 const MANAGED_META_RE = /^(?:# CRON_SECRET is read from .* at runtime|# Managed by One Two Inventory|BASE_URL=")/
 
@@ -41,7 +47,7 @@ const MANAGED_META_RE = /^(?:# CRON_SECRET is read from .* at runtime|# Managed 
 const RUNTIME_HEADER_RE = /^# CRON_SECRET is read from (.+?) at runtime/m
 
 function isManagedRemnant(line: string): boolean {
-  return line.includes(MANAGED_JOB_LINE_SIGNATURE) || MANAGED_META_RE.test(line)
+  return line.includes(MANAGED_JOB_LINE_SIGNATURE) || line.includes(LEGACY_MANAGED_JOB_LINE_SIGNATURE) || MANAGED_META_RE.test(line)
 }
 
 /**
@@ -216,7 +222,22 @@ export function isCrontabEmbeddableSecret(secret: string): boolean {
  * empty bearer would otherwise still be sent).
  */
 function runtimeSecretPrefix(envFilePath: string): string {
-  return `CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${envFilePath}' | cut -d= -f2- | tr -d '"') && [ -n "$CRON_SECRET" ] && `
+  return `CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${envFilePath}' | cut -d= -f2- | tr -d '"'); `
+}
+
+/**
+ * THE JOB COMMAND, WITH THE BEARER OFF THE COMMAND LINE (o3d-kb3dq).
+ *
+ * `curl -H "Authorization: Bearer $CRON_SECRET"` expands the secret into curl's argv, which `ps` shows to every local
+ * account for as long as the request runs. The header is instead written by the shell's builtin `echo` into a pipe and
+ * read by curl as a config line (`-K -`): no process has the secret in its arguments, no file holds it, and a rotation
+ * needs nothing beyond the .env edit (runtime mode) or a re-sync (literal mode). A secret that is empty, or holds a
+ * backslash (which would corrupt the config line), runs nothing and says so in the job log: it fails closed, never as an
+ * unauthenticated request. The text is the same in both secret modes; the installer renders the identical line.
+ */
+export function renderCronJobCommand(params: { prefix: string; slug: string; logPath: string }): string {
+  const { prefix, slug, logPath } = params
+  return String.raw`${prefix}case "$CRON_SECRET" in ''|*\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); ${slug} was not run" ;; *) echo "header = \"Authorization: Bearer $CRON_SECRET\"" | curl -sf -o /dev/null -K - "$BASE_URL/${slug}" ;; esac >> '${logPath}' 2>&1`
 }
 
 export function buildOtiCrontabBlock(params: {
@@ -275,7 +296,7 @@ export function buildOtiCrontabBlock(params: {
       // logPath is single-quoted (Codex r3: unquoted, a log path with a space
       // or shell operator ran arbitrary commands via the redirect); the ' and
       // % and control chars it can't survive are already rejected above.
-      `${schedule}  ${commandPrefix}curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${job.slug}" >> '${logPath}' 2>&1`,
+      `${schedule}  ${renderCronJobCommand({ prefix: commandPrefix, slug: job.slug, logPath })}`,
       '',
     )
   }

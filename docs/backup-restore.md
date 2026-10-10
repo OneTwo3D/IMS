@@ -308,11 +308,13 @@ Scheduled backups are triggered via a cron endpoint:
 /api/cron/backup
 ```
 
-Configure your server's cron scheduler to call this endpoint at your preferred time. Cron endpoints require the `CRON_SECRET` bearer header in production, and production startup fails fast if `CRON_SECRET` is unset, blank, or shorter than 32 characters. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header. Rotating `CRON_SECRET` requires updating both `.env` and any external cron scheduler invocations in the same maintenance window because the application reads the environment value on restart. For example, to run backups daily at 02:00:
+Configure your server's cron scheduler to call this endpoint at your preferred time. Cron endpoints require the `CRON_SECRET` bearer header in production, and production startup fails fast if `CRON_SECRET` is unset, blank, or shorter than 32 characters. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header. Rotating `CRON_SECRET` requires updating both `.env` and any external cron scheduler invocations in the same maintenance window because the application reads the environment value on restart. The installer and the Scheduler page already write the right line for you. If you must write one by hand, do not put the secret in curl's arguments (`curl -H "Authorization: Bearer $CRON_SECRET"` shows it to every local account in `ps` while the job runs); hand it over on standard input as a curl config line. For example, to run backups daily at 02:00:
 
 ```
-0 2 * * * curl -s -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/backup
+0 2 * * * echo "header = \"Authorization: Bearer $CRON_SECRET\"" | curl -s -K - http://localhost:3000/api/cron/backup
 ```
+
+(`CRON_SECRET` must be set in the crontab or read from `.env` first, as the installer's lines do; and `%` must never appear unescaped in a crontab line.)
 
 ## Activity Log
 
