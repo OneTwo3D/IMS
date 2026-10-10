@@ -209,6 +209,7 @@ export async function wcFetch(
   path: string,
   params: Record<string, string> = {},
   creds?: ConnectorCredentials | null,
+  readOptions: { refuseRedirects?: boolean } = {},
 ): Promise<{ data: unknown; totalPages: number; totalItems: number; error?: string }> {
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
@@ -236,6 +237,7 @@ export async function wcFetch(
     // NODE_ENV other than production AND an http loopback URL. `wcPost`/`wcPut` deliberately do not
     // carry it, so a write to a loopback store is still refused at the transport.
     allowE2eLocalHttp: true,
+    refuseRedirects: readOptions.refuseRedirects,
   })
 
   if (!res.ok) {

@@ -1,0 +1,9 @@
+{
+  "formatVersion": 1,
+  "baseCurrency": "GBP",
+  "inputs": [
+    { "dataset": "products", "file": "products.csv" },
+    { "dataset": "variant-parents", "file": "variant-parents.csv" },
+    { "dataset": "sku-exclusions", "file": "sku-exclusions.csv" }
+  ]
+}

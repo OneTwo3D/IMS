@@ -3,8 +3,9 @@
 This is the technical reference for `scripts/first-load-prepare.ts` (`npm run first-load:prepare`), the file-in, file-out step that turns the
 incumbent systems' exports into files the **existing** CSV importers can load, and says in a report what it did to every row.
 
-It is pure: **no database, no network**. It reads the files named in a run manifest and writes into an output directory. It never loads anything
-anywhere; uploading the files through the importers (dry-run preview first) is a separate, deliberate step.
+`first-load:prepare` is pure: **no database, no network**. It reads the files named in a run manifest and writes into an output directory. It never loads anything
+anywhere; uploading the files through the importers (dry-run preview first) is a separate, deliberate step. The one command that makes requests is the separate, read-only
+`first-load:woo-snapshot` (see "WooCommerce snapshot command"), which only produces an input file for it.
 
 Scope of this tool and what is still open:
 
@@ -15,6 +16,9 @@ Scope of this tool and what is still open:
   connectors, as separate steps**; this tool has no column maps for them and none are planned. The `wms-*` and `woo-products` datasets stay in the tool only so the R14
   coverage check can be rehearsed offline from files (the maps under `tests/first-load/fixtures/maps/` use **invented headers** to prove the mechanism; do not copy a
   header from them into a real map). In a real run the coverage inputs come from the connectors.
+- **Variant parents come from WooCommerce, through a read-only command.** Qoblex exports variants with no parent. `npm run first-load:woo-snapshot` reads WooCommerce's variable products and
+  their variations (GET requests only) and writes `variant-parents.csv`; this tool joins each Qoblex variant to the variation with the **same SKU** and emits the parent once as a VARIABLE
+  product. See "WooCommerce snapshot command" and "Dataset: variant-parents".
 - **Not built here:** the apply runner that drives the importers (a later work package).
 - Not covered by an importer, so not produced: supplier product costs (`SupplierProduct` has no CSV importer) and customers (no source is defined for them
   in this work). Both are reported as gaps in the summary at the end of this page.
@@ -66,6 +70,7 @@ A JSON file. Relative paths are relative to the manifest. Unknown keys are refus
 - `baseCurrency` is required and never assumed. It must be the organisation's base currency in IMS; the tool cannot read IMS, so the apply step must check it.
 - `asOf` is optional (YYYY-MM-DD). It is only used to date-check transfers. The tool never reads a clock.
 - `maxPurchaseTaxRate` is required when a purchase-order-lines dataset is supplied: the highest purchase tax rate, as a fraction (`"0.25"`), that any IMS tax rate or supplier default could apply. The importer resolves tax rates by name inside IMS, which this tool cannot read, so every order's total is bounded with this rate and a line whose `taxRateValue` is above it is rejected. It is an assertion the apply step must check against IMS.
+- `requireVariantParents` (optional, `true` or `false`, default `false`) makes the WooCommerce join mandatory: **every emitted VARIANT, including one whose `parentSku` the products file already names, needs an accepted exact-SKU WooCommerce variation**, or it is rejected as `VARIANT_PARENT_UNCONFIRMED` (with no `variant-parents` dataset supplied that is every variant). Supplying the `variant-parents` dataset implies `true`. A prefilled `parentSku` that disagrees with WooCommerce is rejected on both sides.
 - `inTransitConvention` is required when a `transfers` dataset is supplied (see "In-transit stock").
 - `purchaseOrderKeyPrefix` and `transferKeyPrefix` are required when the matching dataset is supplied. They are prefixed to every order or transfer key so a loaded
   reference cannot collide with a reference IMS generates later.
@@ -226,6 +231,29 @@ Used only for the four-way SKU coverage check. WooCommerce is never a source for
 | `sku` | yes | A row without a SKU is excluded (and reported). |
 | `wooProductId` | no | Passed through as given (trimmed). |
 | `type` | no | Passed through as given (trimmed). |
+
+### Dataset: variant-parents
+
+One row per WooCommerce variation: the variation's SKU and the VARIABLE parent it belongs to. Written by `first-load:woo-snapshot` (see "WooCommerce snapshot command"); read as a canonical file. Qoblex variants are joined to it by **exact variation SKU** (letter case ignored); each parent reached becomes one VARIABLE row in the products file.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `variantSku` | yes | The variation's SKU. A repeat (letter case ignored) with different data rejects every row that carries it. |
+| `wooVariationId` | no | WooCommerce's id for the variation (digits). Informational; carried so the connector link step can use it later. |
+| `parentSku` | yes | The parent's SKU. It must not be the SKU of any Qoblex product (other than a VARIABLE product the products file itself carries), of any variation, or of any product already in IMS (`PARENT_SKU_COLLIDES`). |
+| `parentName` | yes | The parent's WooCommerce title: it becomes the VARIABLE product's name. Variants keep the Qoblex name. |
+| `parentStatus` | yes | WooCommerce post status, mapped to the parent's lifecycle status by a closed list (status = lifecycle): `publish` = ACTIVE, `draft` = DRAFT, `pending` = DRAFT, `private` = DRAFT. Any other status rejects its rows (`UNMAPPED_PARENT_STATUS`). The owner confirms this mapping before the real load. |
+| `wooParentId` | no | WooCommerce's id for the parent (digits). All variations of one parent must agree on the parent's SKU spelling, title, status and id, or the parent is rejected with all of them (`PARENT_ATTRIBUTE_CONFLICT`). |
+
+How a row ends: `VARIATION_JOINED` (emitted) when a Qoblex VARIANT has that SKU. Excluded, with a reason: `NO_QOBLEX_PRODUCT` (WooCommerce has a variation Qoblex does not; the R14 coverage check lists it unless it is on `sku-exclusions`),
+`QOBLEX_TYPE_NOT_VARIANT` (Qoblex types the SKU as a bundle, a manufactured or a simple product: it loads with that type and no parent, and the connector link step relates it to the variation later; this is an INFO finding, not an error),
+`QOBLEX_ROW_REJECTED`, `EXCLUDED_BY_LIST` and `PARENT_EXCLUDED_BY_LIST`.
+
+A VARIABLE product the products file itself carries keeps its row, but **WooCommerce's title and mapped lifecycle are written** (INFO `PARENT_ATTRIBUTES_FROM_WOO` lists any that differed).
+
+Findings: `VARIANT_PARENT_UNCONFIRMED` (ERROR: the join is required and a variant has no accepted WooCommerce variation), `FORMULA_LEADING_CELL` (WARNING, on the products and suppliers import files: a cell starts with a character a spreadsheet reads as a formula; the import files are never altered for that, so do not open and re-save them in a spreadsheet), `VARIANT_WITHOUT_PARENT` (ERROR: a Qoblex variant no WooCommerce variation matches; it is never loaded as a simple product, so fix the SKU in Qoblex or WooCommerce or exclude it with a reason),
+`WOO_PARENT_WITHOUT_QOBLEX_VARIANT` (WARNING: a WooCommerce variable product none of whose variations is a Qoblex variant; it is **not** loaded, so exclude it with a reason or load it later through the connector link step; a parent that is on the exclusion list, or all of whose variations are, is not reported),
+and `PARENT_STEM_MISMATCH` (WARNING: a variant whose "-NN" SKU stem is not its real parent's SKU; **the stem is only compared, never used to assign a parent**).
 
 ### Dataset: sku-exclusions
 
@@ -416,8 +444,8 @@ Copy the maps, keep `expectedHeaders` as they are, and point the manifest at the
 How each fact the export states is read, and what is a decision for the owner:
 
 - **Products** come from the stock report: `Sku`, `Product`, `Product Type`, `Barcode`, `State`. `Product Type` is a closed list: `simple` is SIMPLE; `variable` is mapped to VARIANT; any other value (the real export has `Unknown`) is rejected for an owner decision.
-  **The stock report lists variants only, with no parent product**, so a VARIANT row is rejected as `VARIANT_WITHOUT_PARENT` until the VARIABLE parent products are supplied (in practice from WooCommerce, which holds the parents; the parent SKU is not a column of any Qoblex export we have). The map is shipped honestly blocked, rather than
-  loading variants as SIMPLE products and losing the parent link. To rehearse the rest of the load, a private copy of the map can read `variable` as SIMPLE; do not load that.
+  **The stock report lists variants only, with no parent product**, so a VARIANT row is rejected as `VARIANT_WITHOUT_PARENT` unless the `variant-parents` dataset (read from WooCommerce, which holds the parents) supplies its parent: see "Dataset: variant-parents". The map is shipped honestly blocked, rather than
+  loading variants as SIMPLE products and losing the parent link. To rehearse the rest of the load without WooCommerce, a private copy of the map can read `variable` as SIMPLE; do not load that.
 - **Bundles and manufactured products** come from the bundles file. `Line Type` is a closed list: `Bundle` is a KIT, `BillOfMaterial` is a BOM, `Part` is a component line whose `Bundled Quantity` is the component quantity. The header rows become products (second file, which supersedes the stock report's SIMPLE row for the same SKU); the `Part` rows become recipe lines
   under the header row above them. A product listed in more than one group (the real file does this) produces repeated or conflicting component lines, which are rejected (`DUPLICATE_RECIPE_LINE`) because the tool cannot know whether to add them. The bundles file's own stock columns are not read: opening stock comes only from the stock report.
 - **Opening stock** is the stock report read in wide warehouse blocks. Qoblex cannot export per-lot costs, only a `Moving Average Cost` per product, so each SKU and warehouse becomes **one synthetic lot** at that cost (currency is the base currency, a constant in the map); nothing is collapsed because there is nothing to collapse, and the multi-lot weighted average used for other sources is unchanged.
@@ -429,6 +457,60 @@ How each fact the export states is read, and what is a decision for the owner:
   `Due On` (`Thu, Oct 8 2026`) becomes `expectedDelivery`. The `Incoming Quantity` per warehouse in the stock report and these lines describe the same open orders: their per-SKU totals should agree, and a PO line for a SKU the catalogue lacks is rejected (`SKU_NOT_IN_CATALOGUE`).
 - **Suppliers** come from the contact export. **The export has no supplier/customer flag.** `Wholesale or Retail` is a closed list (`Wholesale` only): a `Retail` contact is rejected as `UNLISTED_ROW_KIND` for an owner decision. Every other contact is loaded as a supplier. Whether a contact is a supplier is read from its use: the suppliers named in the stock report's `Supplier` column and in the incoming-stock file's `Supplier` column should all be present (a purchase order line naming an absent supplier is rejected).
   Payment terms are a closed list (`NONE` and blank are no terms, `30 days net` is 30). The shipping address columns feed the supplier address; the billing columns are not read.
+
+## WooCommerce snapshot command
+
+`npm run first-load:woo-snapshot` (`scripts/first-load-woo-snapshot.ts`) is the only part of the first-load tooling that talks to a store, and it is **read-only**: it reads the store's variable products and each one's variations through the connector's own read function (`GET` only, through the connector transport and its outbound-write hold, which classifies a GET as a read), and writes three files into a new directory. It writes nothing to the store, to the IMS database or to any setting.
+
+```bash
+npm run first-load:woo-snapshot -- --env-file path/to/woo-readonly.env --out path/to/new-dir --allow-origin https://shop.example
+npm run first-load:woo-snapshot -- --verify path/to/new-dir/woo-snapshot.json
+npm run first-load:woo-snapshot -- --help
+```
+
+**Credentials** are read from the file named by `--env-file` and from nowhere else: never from the command line (a credential flag is a usage error), never from the IMS database (putting a store key into the target IMS would make its stock-sync paths live). The file must be a regular file readable by its owner only (`chmod 600`), with `KEY=VALUE` lines:
+
+| Variable | Meaning |
+| --- | --- |
+| `FIRST_LOAD_WOO_URL` | The store's base URL (the same checks as the connector's own store URL apply: https, no credentials, no private address). |
+| `FIRST_LOAD_WOO_KEY` | A **read-only** WooCommerce REST consumer key. |
+| `FIRST_LOAD_WOO_SECRET` | Its consumer secret. |
+| `FIRST_LOAD_WOO_ALLOWED_ORIGINS` | Optional: comma-separated origins the command may contact (the same as repeating `--allow-origin`). |
+
+An unknown variable in the file is refused, so a typo cannot silently leave one out. No credential is ever printed or written to an output file.
+
+**Origin allowlist.** The store's origin must be named by `--allow-origin` (repeatable) or `FIRST_LOAD_WOO_ALLOWED_ORIGINS`, or the run is refused (exit 3) **before any request leaves the machine and before anything is written**. `--allow-any-origin` overrides that, out loud.
+
+**Files written** (mode 600, into `--out`, which must not exist or be empty):
+
+| File | Content |
+| --- | --- |
+| `woo-snapshot.json` | Every variable product (id, SKU, title, status, variation ids) and every variation (id, parent id, SKU, status, attributes), sorted by id, with the SHA-256 of its canonical payload. Deterministic: the same store gives the same bytes whatever page size it grants or order it answers in. |
+| `woo-snapshot.provenance.json` | The store origin, the time, the number of requests, the completeness proof, and the checksums of the other files. This is the only file that carries a time or a host. |
+| `variant-parents.csv` | The canonical `variant-parents` dataset (one row per variation that has a SKU), ready to list in a run manifest. Never altered. |
+| `variant-parents.inspect.csv` | The same rows for a person to open in a spreadsheet: every cell a spreadsheet would read as a formula (`=`, `@`, tab, carriage return, or `+`/`-` not followed by a digit) gets a leading apostrophe. NOT an input. |
+
+**Completeness is proved, not assumed, and confirmed by a second walk.** The variable products read must equal the store's own `X-WP-Total`; for every product the variations read must equal that call's `X-WP-Total` **and** the list of variation ids the product itself carries. A page the store did not serve, a store that sends no readable total, or a store whose totals change during the walk is an error (exit 1) and nothing is written. The snapshot is also refused when a variable product has no SKU or is not of type `variable`, when a variation SKU repeats (letter case ignored), when a SKU is both a parent and a variation, or when no variable product is returned at all. Offset paging over a store that is being edited can skip a surviving product while every total and row count still agree (one product deleted on page 1 and one added at the end before page 2), so after a complete walk the command **walks the whole catalogue a second time (from scratch) and the two canonical payloads must be byte-identical**; if they differ it starts again, up to three rounds, and then reports the store as too unstable to snapshot (exit 1). Pagination is explicitly ordered by id ascending. `--verify <woo-snapshot.json>` recomputes the checksum and re-runs these rules offline.
+
+**Redirects are refused.** A redirect response is an error and its target is never requested, so the credentials cannot be sent to another origin. **Error text is bounded:** a failed request is reported as its HTTP status and, when the body carries one, a lower-case error code, never the body, a URL or a stack (a plugin or proxy can echo the Authorization header into an error body); as a backstop, the key, the secret and the base64 Basic token are removed from every line the command prints and from the provenance file.
+
+**Rate limiting and retries.** Each request waits `--min-interval-ms` (default 500) after the previous one. A throttled or failed request (HTTP 429, 5xx, a network error) is retried up to three times with a growing wait; a client error (400, 401, 403, 404) is not retried.
+
+**Resumable.** After every page the walk is saved to `woo-snapshot.partial.json` in `--out`. If the walk stops (exit 4), run the same command with `--resume` to continue from the last whole page; a walk of one store is never resumed against another, and an unfinished walk older than `--max-resume-age-minutes` (default 60) is refused, because the store may have changed since. The partial file is removed when the snapshot is complete, and also when the store's answer turns out to be inconsistent (resuming cannot fix that).
+
+### Snapshot exit codes
+
+One table, defined once in `lib/first-load/spec.ts` (`SNAPSHOT_EXIT_CODE_TABLE`) and printed by `--help`.
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 0 | OK | The snapshot is complete: every count matches the store's own totals. The snapshot, provenance and variant-parents files were written. |
+| 1 | INCONSISTENT | The store answered, but what it returned cannot be trusted as a complete, consistent catalogue (a count does not match its total header, a parent is not variable or has no SKU, a variation SKU repeats, the store changed during the walk) or --verify found a damaged snapshot. No final file was written. |
+| 2 | USAGE | Bad command line. Nothing was read, requested or written. |
+| 3 | REFUSED | A precondition refused the run before any request left the machine: the store origin is not on the allowlist (and --allow-any-origin was not given), the credentials file is missing, unreadable, or readable by group or others, or it does not hold the three required values. |
+| 4 | FETCH_FAILED | A request failed after its retries (network, HTTP error, unreadable response). What was read so far is kept in the output directory; run again with --resume to continue from it. |
+| 5 | OUTPUT_FAILED | The output directory is unusable (it exists and is not empty, or a write failed). Files this run had created were removed again. |
+| 6 | INTERNAL | A self-check of this command failed. This is a defect in the tool, not in the store's data. |
 
 ## Output files and load order
 
@@ -510,7 +592,8 @@ The rules the tool does prove: required fields, quantity and cost signs and scal
 ## Known gaps
 
 - WooCommerce, Mintsoft and Xero have no file maps: they are read through the connectors in separate steps (see the scope above).
-- The Qoblex stock report has no parent products for its variants (see "Qoblex native exports"); the VARIABLE parents have to come from another source before variants can load.
+- The Qoblex stock report has no parent products for its variants (see "Qoblex native exports"); the VARIABLE parents come from WooCommerce through `first-load:woo-snapshot`. Until the owner has run it against the real store, no variant can load. Variants that match no WooCommerce variation, and WooCommerce variable products with no Qoblex variant, are reported and never guessed. Whether a read-only key can list the variations of private and draft products is not yet established: the completeness proof would refuse the snapshot if it could not.
+- `externalProductId` (the WooCommerce link) is not set by the products import file; the connector link step does that after the first load.
 - Supplier product costs (`SupplierProduct`): there is no CSV importer, so nothing is produced. They are a backfill and may follow go-live.
 - Customers: no source is defined for them in this work; they are not read.
 - Warehouse codes, tax rate names and supplier names for suppliers that already exist in IMS cannot be checked without the database; the importers' own dry-run preview does that.

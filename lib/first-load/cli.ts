@@ -45,10 +45,11 @@ interface Manifest {
   purchaseOrderKeyPrefix: string | null
   transferKeyPrefix: string | null
   maxPurchaseTaxRate: string | null
+  requireVariantParents: boolean
   inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null; supersedesEarlier: boolean }>
 }
 
-const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'inputs'])
+const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'requireVariantParents', 'inputs'])
 const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap', 'supersedesEarlier'])
 
 function parseManifest(text: string): Manifest {
@@ -73,6 +74,8 @@ function parseManifest(text: string): Manifest {
   if (convention !== null && !(IN_TRANSIT_CONVENTIONS as readonly string[]).includes(convention)) {
     throw new UsageError(`manifest inTransitConvention must be one of ${IN_TRANSIT_CONVENTIONS.join(', ')}`)
   }
+  if (m.requireVariantParents !== undefined && typeof m.requireVariantParents !== 'boolean') throw new UsageError('manifest requireVariantParents must be true or false')
+  const requireFlag = m.requireVariantParents === true
   if (!Array.isArray(m.inputs) || m.inputs.length === 0) throw new UsageError('manifest inputs must be a non-empty array')
   const seen = new Set<string>()
   const inputs: Manifest['inputs'] = []
@@ -98,6 +101,7 @@ function parseManifest(text: string): Manifest {
     purchaseOrderKeyPrefix: optionalString('purchaseOrderKeyPrefix'),
     transferKeyPrefix: optionalString('transferKeyPrefix'),
     maxPurchaseTaxRate: optionalString('maxPurchaseTaxRate'),
+    requireVariantParents: requireFlag,
     inputs,
   }
 }
@@ -248,6 +252,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
     purchaseOrderKeyPrefix: manifest.purchaseOrderKeyPrefix,
     transferKeyPrefix: manifest.transferKeyPrefix,
     maxPurchaseTaxRate: manifest.maxPurchaseTaxRate,
+    requireVariantParents: manifest.requireVariantParents,
   }
   let result
   try {
