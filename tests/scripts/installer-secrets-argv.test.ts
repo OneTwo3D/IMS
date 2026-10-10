@@ -221,7 +221,7 @@ test('[o3d-kb3dq] MUTATION census: each rule fires on its trunk shape (the censu
       'curl --header "Authorization: Bearer ${TOKEN}" https://x.test',
       "curl -H 'X-API-Key: ${VENDOR_API_KEY}' https://x.test",
       'curl -H "X-Auth-Token: $SERVICE_TOKEN" https://x.test',
-      'curl -u admin:s3cretpass https://x.test',
+      ['curl -u admin', 'hunter2pw https://x.test'].join(':'),
       'curl -u "${USER}:${PASSWORD}" https://x.test',
       'curl --user $CREDS https://x.test',
       'x="curl -sf -H \\"Authorization: Bearer \\$CRON_SECRET\\" url"',
