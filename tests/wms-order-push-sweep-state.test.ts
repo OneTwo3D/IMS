@@ -4,6 +4,10 @@ import {
   AMBIGUOUS_ATTEMPTS,
   decideCreateClaim,
   mayDisposeCreateClaim,
+  orderTotalDriftPence,
+  buildPushInput,
+  MAX_ADVISORY_PENCE,
+  payloadTotalMismatchPence,
   runWmsOrderPushSweepCore,
   shouldGrantCreateClaim,
   type WmsOrderPushPort,
@@ -14,6 +18,8 @@ import {
   type WmsPushRevalidateLink,
   type WmsPushVerifyLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
+import { currencyMinorUnits } from '../lib/domain/math/decimal.ts'
+import { reconcilePushTotals } from '../lib/domain/wms/push-total-guard.ts'
 import type { WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
 
@@ -245,6 +251,166 @@ test('create: a mis-totalled order is pushed but flagged for review (G6, non-blo
   assert.equal(r.created, 1)
   assert.equal(upserts[0].create.state, 'SYNCED')
   assert.equal(upserts[0].create.totalMismatchPence, 200)
+})
+
+test('create: an order whose own components reconcile but whose PAYLOAD does not add up is flagged, still SYNCED', async () => {
+  // VAT-inclusive order, gross order-level discount 12 (embedded VAT 2): the order reconciles against its own
+  // components (orderTotalDriftPence adds the VAT back) so the first check is silent, but the payload carries
+  // the discount as one ex-VAT figure with no VAT part, so the figures sent add up to 106, not 108.
+  const order = candidate({
+    subtotalForeign: 100, taxForeign: 18, discountAmount: 12, taxRatePercent: 0.2, pricesIncludeVat: true, totalForeign: 108,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  assert.equal(orderTotalDriftPence(order), 0, 'precondition: the order-components check is silent for this order')
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  console.log(`# precondition: created=${r.created} recorded=${String(upserts[0]?.create.totalMismatchPence)}`)
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.totalMismatchPence, 200)
+})
+
+test('create: a payload check that cannot evaluate never disturbs the SYNCED link (no re-create of an existing order)', async () => {
+  const order = candidate({ subtotalForeign: 0, totalForeign: 'not-a-number' as unknown as number })
+  assert.equal(orderTotalDriftPence(order), 0, 'precondition: the order-components check is silent, so the payload check is reached')
+  const errors: string[] = []
+  const original = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  let r
+  let upserts
+  try {
+    const made = makePort({ createCandidates: [order] })
+    upserts = made.upserts
+    r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', made.port, { now: NOW })
+  } finally {
+    console.error = original
+  }
+  console.log(`# precondition: swallowed=${errors.filter((e) => e.includes('payload total check could not run')).length} created=${r.created}`)
+  assert.equal(errors.filter((e) => e.includes('payload total check could not run')).length, 1)
+  assert.equal(r.created, 1)
+  assert.equal(upserts.length, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.totalMismatchPence, null)
+})
+
+test('create: an advisory drift beyond the 32-bit column is clamped BEFORE the link write; link stays SYNCED with its external id', async () => {
+  // VAT-inclusive, gross order-level discount, scaled so the payload is 24,000,000.00 out (2.4e9 minor units > Int max).
+  const order = candidate({
+    subtotalForeign: 1_200_000_000, taxForeign: 216_000_000, discountAmount: 144_000_000, taxRatePercent: 0.2,
+    pricesIncludeVat: true, totalForeign: 1_296_000_000,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 240_000_000, totalForeign: 1_200_000_000, description: 'Widget' }],
+  })
+  assert.equal(orderTotalDriftPence(order), 0, 'precondition: the order-components check is silent')
+  const unclamped = reconcilePushTotals({
+    currency: 'GBP', orderTotal: order.totalForeign as number,
+    payload: buildPushInput(order, '301'), pricesIncludeVat: true,
+  })
+  console.log(`# precondition: unclamped drift=${unclamped.driftMinorUnits} int max=${MAX_ADVISORY_PENCE}`)
+  assert.ok(unclamped.driftMinorUnits > MAX_ADVISORY_PENCE)
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+  assert.equal(upserts[0].create.totalMismatchPence, MAX_ADVISORY_PENCE)
+  assert.equal(upserts[0].update.totalMismatchPence, MAX_ADVISORY_PENCE)
+  assert.equal(payloadTotalMismatchPence(order, buildPushInput(order, '301')), MAX_ADVISORY_PENCE)
+})
+
+test('create: the order-components drift is clamped to the column too', async () => {
+  const order = candidate({ subtotalForeign: 10, taxForeign: 0, totalForeign: 30_000_000, lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }] })
+  const raw = orderTotalDriftPence(order)
+  console.log(`# precondition: raw component drift=${raw}`)
+  assert.ok(raw > MAX_ADVISORY_PENCE)
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.totalMismatchPence, MAX_ADVISORY_PENCE)
+})
+
+test('create: a small component drift does NOT hide a larger payload discrepancy (and the reverse)', async () => {
+  // VAT-inclusive, gross discount 30 (embedded VAT 5.00); components off by 2p, payload off by 502p.
+  const both = candidate({
+    subtotalForeign: 100, taxForeign: 15, discountAmount: 30, taxRatePercent: 0.2, pricesIncludeVat: true, totalForeign: 90.02,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  console.log(`# precondition A: component=${orderTotalDriftPence(both)}p payload=${payloadTotalMismatchPence(both, buildPushInput(both, '301'))}p`)
+  assert.equal(orderTotalDriftPence(both), 2)
+  assert.equal(payloadTotalMismatchPence(both, buildPushInput(both, '301')), 502)
+  const a = makePort({ createCandidates: [both] })
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', a.port, { now: NOW })
+  assert.equal(a.upserts[0].create.totalMismatchPence, 502)
+  // Reverse: payload reconciles (lines add up to the total) but the subtotal field is wrong by 300p.
+  const reverse = candidate({
+    subtotalForeign: 103, taxForeign: 20, totalForeign: 120,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  console.log(`# precondition B: component=${orderTotalDriftPence(reverse)}p payload=${String(payloadTotalMismatchPence(reverse, buildPushInput(reverse, '301')))}`)
+  assert.equal(orderTotalDriftPence(reverse), 300)
+  assert.equal(payloadTotalMismatchPence(reverse, buildPushInput(reverse, '301')), null)
+  const b = makePort({ createCandidates: [reverse] })
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', b.port, { now: NOW })
+  assert.equal(b.upserts[0].create.totalMismatchPence, 300)
+  assert.equal(b.upserts[0].create.state, 'SYNCED')
+})
+
+test('orderTotalDriftPence is exact Decimal arithmetic and scales by the order currency', () => {
+  const o = { subtotalForeign: '0.1', taxForeign: '0.2', taxRatePercent: null, shippingForeign: 0, discountAmount: 0, totalForeign: '0.31', pricesIncludeVat: false }
+  assert.equal(orderTotalDriftPence(o), 1) // 0.1 + 0.2 is exactly 0.3, one penny from 0.31
+  assert.equal(orderTotalDriftPence({ ...o, subtotalForeign: 1000, taxForeign: 0, totalForeign: 1002 }, 'JPY'), 2)
+  assert.equal(orderTotalDriftPence({ ...o, subtotalForeign: 1, taxForeign: 0, totalForeign: 1.002 }, 'KWD'), 2)
+})
+
+test('create: an order with a NULL currency still ends SYNCED after the warehouse accepted it', async () => {
+  const order = candidate({ currency: null as unknown as string })
+  let pushed = 0
+  const { port, upserts } = makePort({ createCandidates: [order] })
+  const errors: string[] = []
+  const original = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  let r
+  try {
+    r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { pushed += 1; return okPush() } }), 'mintsoft', port, { now: NOW })
+  } finally {
+    console.error = original
+  }
+  console.log(`# precondition: pushed=${pushed} created=${r.created} state=${upserts[0]?.create.state} checkErrors=${errors.length}`)
+  // Isolating arm: currency precision is TOTAL, so the checks actually EVALUATE (nothing needed catching).
+  assert.deepEqual(errors, [])
+  assert.equal(currencyMinorUnits(null), 2)
+  assert.equal(currencyMinorUnits(undefined), 2)
+  assert.equal(currencyMinorUnits(42 as unknown as string), 2)
+  assert.equal(pushed, 1)
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+})
+
+test('create: a component check that THROWS is contained locally; the payload check still runs and the link is SYNCED', async () => {
+  // A getter that throws only on subtotalForeign, which only the component check reads.
+  const order = candidate({
+    taxForeign: 18, discountAmount: 12, taxRatePercent: 0.2, pricesIncludeVat: true, totalForeign: 108,
+    lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }],
+  })
+  Object.defineProperty(order, 'subtotalForeign', { get() { throw new Error('boom') } })
+  const errors: string[] = []
+  const original = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  let upserts
+  try {
+    const made = makePort({ createCandidates: [order] })
+    upserts = made.upserts
+    const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', made.port, { now: NOW })
+    assert.equal(r.created, 1)
+  } finally {
+    console.error = original
+  }
+  console.log(`# precondition: component errors=${errors.filter((e) => e.includes('component total check could not run')).length} recorded=${String(upserts?.[0]?.create.totalMismatchPence)}`)
+  assert.equal(errors.filter((e) => e.includes('component total check could not run')).length, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+  assert.equal(upserts[0].create.totalMismatchPence, 200, 'the payload check still ran')
 })
 
 test('create: a normal (no-fallback) push posts no courier comment', async () => {

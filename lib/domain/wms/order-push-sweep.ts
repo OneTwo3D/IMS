@@ -2,6 +2,9 @@ import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-cons
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { currencyMinorUnits, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
+import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from './push-recipient'
@@ -350,6 +353,15 @@ type OrderForPush = {
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
 }
 
+/** Decimal money from a stored value; anything non-numeric reads as 0, as num() does. */
+function dec(value: unknown) {
+  try {
+    return toDecimal(value as DecimalInput)
+  } catch {
+    return toDecimal(0)
+  }
+}
+
 function num(value: unknown): number {
   const n = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(n) ? n : 0
@@ -375,22 +387,23 @@ export function orderTotalDriftPence(order: {
   discountAmount: unknown
   totalForeign: unknown
   pricesIncludeVat: boolean
-}): number {
-  const subtotal = num(order.subtotalForeign)
-  const tax = num(order.taxForeign)
-  const shipping = num(order.shippingForeign)
-  const discount = num(order.discountAmount)
-  const total = num(order.totalForeign)
+}, currency = 'GBP'): number {
+  const subtotal = dec(order.subtotalForeign)
+  const tax = dec(order.taxForeign)
+  const shipping = dec(order.shippingForeign)
+  const discount = dec(order.discountAmount)
+  const total = dec(order.totalForeign)
 
-  let discountVat = 0
-  if (order.pricesIncludeVat && discount > 0) {
-    const named = num(order.taxRatePercent)
-    const rate = named > 0 ? named : total > tax ? tax / (total - tax) : 0
-    if (rate > 0) discountVat = (discount * rate) / (1 + rate)
+  let discountVat = toDecimal(0)
+  if (order.pricesIncludeVat && discount.gt(0)) {
+    const named = dec(order.taxRatePercent)
+    const rate = named.gt(0) ? named : total.gt(tax) ? tax.div(total.sub(tax)) : toDecimal(0)
+    if (rate.gt(0)) discountVat = discount.mul(rate).div(rate.add(1))
   }
 
-  const computed = subtotal + tax + shipping - discount + discountVat
-  return Math.round(Math.abs(computed - total) * 100)
+  const computed = subtotal.add(tax).add(shipping).sub(discount).add(discountVat)
+  // Whole MINOR UNITS of the order currency (pence for GBP), half-up, exact decimal arithmetic.
+  return roundQuantity(computed.sub(total).abs().mul(toDecimal(10).pow(currencyMinorUnits(currency))), 0).toNumber()
 }
 
 /**
@@ -400,6 +413,46 @@ export function orderTotalDriftPence(order: {
  * flag so ordinary sub-penny VAT rounding never trips it.
  */
 const TOTAL_DRIFT_TOLERANCE_PENCE = 1
+
+/**
+ * Advisory payload-total check for the create pass (see push-total-guard.ts). Returns the drift to
+ * record on the push link, or null when the figures sent add up (or the check could not run).
+ *
+ * It runs AFTER the warehouse accepted the order, where an exception would be caught by the create path's
+ * generic handler and put the link back in the create queue: a re-create of an order that already exists.
+ * It therefore never throws; a failure to evaluate is logged and reads as "no finding".
+ */
+/** The push-link column is a 32-bit Int. An advisory figure must never be the reason the link write fails. */
+export { MAX_ADVISORY_PENCE }
+export function clampAdvisoryPence(value: number): number {
+  return Number.isFinite(value) ? Math.min(MAX_ADVISORY_PENCE, Math.max(0, Math.trunc(value))) : MAX_ADVISORY_PENCE
+}
+
+/** The larger of two advisory figures (either may be absent); null when neither check found anything. */
+export function largerAdvisoryPence(a: number | null, b: number | null): number | null {
+  if (a === null) return b
+  if (b === null) return a
+  return Math.max(a, b)
+}
+
+export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPushInput): number | null {
+  try {
+    const verdict = reconcilePushTotals({
+      currency: order.currency,
+      orderTotal: order.totalForeign as Parameters<typeof reconcilePushTotals>[0]['orderTotal'],
+      withheldGoodsGross: withheldGoodsGross(order.lines, refundedQtyByLine(order)),
+      withheldLineCount: withheldLineCount(order.lines, refundedQtyByLine(order)),
+      payload: input,
+      pricesIncludeVat: order.pricesIncludeVat,
+    })
+    if (verdict.status !== 'MISMATCH') return null
+    console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} payload total mismatch (${verdict.cause}): ${verdict.reason}`)
+    return clampAdvisoryPence(Math.max(1, verdict.driftMinorUnits))
+  } catch (error) {
+    console.error(`[wms-order-push] payload total check could not run for ${order.orderNumber ?? order.id}: ${scrubWmsError(error, 'check failed')}`)
+    return null
+  }
+}
 
 export function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
   return resolvePushRecipient({ shippingAddress: raw, customerName, customerEmail: null }).address
@@ -1591,10 +1644,21 @@ export async function runWmsOrderPushSweepCore(
           : null
         // Penny-precision guard (G6): record (never block) when the order's own totals
         // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
-        const driftPence = orderTotalDriftPence(order)
-        const totalMismatchPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? driftPence : null
+        // Each advisory check has its OWN catch: this runs after the warehouse accepted the order, and an
+        // exception here would reach the create path's handler, which writes a failure state for an order that
+        // exists. An unevaluable check reads as "no finding" and the SYNCED link write below still happens.
+        let componentPence: number | null = null
+        try {
+          const driftPence = orderTotalDriftPence(order, order.currency)
+          componentPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? clampAdvisoryPence(driftPence) : null
+        } catch (error) {
+          console.error(`[wms-order-push] component total check could not run for ${order.orderNumber ?? order.id}: ${scrubWmsError(error, 'check failed')}`)
+        }
+        // BOTH checks always run: a small component error must not hide a larger payload discrepancy.
+        const payloadPence = payloadTotalMismatchPence(order, input)
+        const totalMismatchPence = largerAdvisoryPence(componentPence, payloadPence)
         if (totalMismatchPence !== null) {
-          console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: ${totalMismatchPence}p drift vs derived total (pushed, flagged for review)`)
+          console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: components=${componentPence ?? 'ok'} payload=${payloadPence ?? 'ok'} (recording ${totalMismatchPence}; pushed, flagged for review)`)
         }
         await port.upsertByOrder(
           order.id,
