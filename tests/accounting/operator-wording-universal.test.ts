@@ -70,6 +70,12 @@ for (const c of NON_CONFIRMED) {
 for (const [name, id] of [['asserted-not-posted', 'OPERATOR_ASSERTION'], ['unknown', null]] as const) {
   void name; void id
 }
+// THE PRODUCER-SIDE HOLD'S SHADOW (SHADOW_NOT_SENT_BY_IMS): it may say what IMS did (it did not send it) and nothing about the
+// ledger beyond "unproven"; the history checker holds every other clause to that.
+const SHADOW_ROW = row({ status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true })
+assert.equal(ledgerStanding(SHADOW_ROW), 'SHADOW_NOT_SENT_BY_IMS', 'precondition: the fixture is the shadow standing')
+add('display badge: SHADOW_NOT_SENT_BY_IMS', describeLedgerStanding(SHADOW_ROW).detail, /IMS did not send it/i)
+add('mark-handled row: SHADOW_NOT_SENT_BY_IMS', describeSyncRowStanding(SHADOW_ROW), /IMS did not send it/i)
 // Codex round 5: the sync-page tooltips for a FAILED attempt whose remote outcome is unknown, and every PROVEN cause with the history it alone licenses.
 add('display badge: ASSERTED_POSTED on a FAILED-then-settled attempt', describeLedgerStanding(row({ status: 'SYNCED', externalTransactionId: 'T-9', settlementBasis: 'OPERATOR_ASSERTION', errorMessage: 'socket hang up' } as never)).detail)
 add('display badge: ASSERTED_NOT_POSTED on a FAILED-then-settled attempt', describeLedgerStanding(row({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION', errorMessage: 'socket hang up' } as never)).detail)
@@ -81,8 +87,6 @@ const PROVEN_ROWS: Array<[string, LedgerStandingRow, RegExp, { couldHaveReachedL
   ['RECORDED_PRE_CALL', row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true } as never), /never sent|before the remote call|before any request was made/i, {}],
   ['VERIFIED_REVERSAL', row({ status: 'CANCELLED', settlementBasis: 'VERIFIED_REVERSAL' } as never), /verified reversed|never made/i, {}],
   ['REJECTED_BEFORE_POSTING', row({ status: 'FAILED', errorMessage: 'missing field' } as never), /before posting|before any request/i, { couldHaveReachedLedger: false }],
-  // The shadow may say what IMS did (it did not send it) and nothing about the destination; the checker holds every other clause to that.
-  ['HELD_SHADOW', row({ status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true } as never), /did not send it|shadow/i, {}],
 ]
 for (const [cause, provenRow, allowed, opts] of PROVEN_ROWS) {
   assert.equal(ledgerStanding(provenRow, opts), 'PROVEN_NOT_POSTED', `precondition: ${cause} row is proven`)

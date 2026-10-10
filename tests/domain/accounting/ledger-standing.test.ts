@@ -59,9 +59,9 @@ const TABLE: Case[] = [
   { n: 4, name: 'CANCELLED NOT_POSTED settlement: OPERATOR_ASSERTION, no id', row: row({ status: 'CANCELLED', settlementBasis: OA }), expect: 'ASSERTED_NOT_POSTED' },
   { n: 5, name: 'CANCELLED + VERIFIED_REVERSAL, id kept', row: row({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: VR }), expect: 'PROVEN_NOT_POSTED' },
   { n: 5, name: 'CANCELLED + VERIFIED_REVERSAL, no id', row: row({ status: 'CANCELLED', settlementBasis: VR }), expect: 'PROVEN_NOT_POSTED' },
-  // Row 5a: a shadow IMS recorded instead of queuing. PROVEN_NOT_POSTED by IMS only when it is exactly the shape the one writer makes.
-  { n: 5, name: '5a: CANCELLED + HELD_SHADOW, no id (a shadow, with the sweep flag the writer sets)', row: row({ status: 'CANCELLED', settlementBasis: HS, abandonedBeforeRemoteCall: true }), expect: 'PROVEN_NOT_POSTED' },
-  { n: 5, name: '5a: CANCELLED + HELD_SHADOW, no id and NO flag (the basis alone proves it, not the flag)', row: row({ status: 'CANCELLED', settlementBasis: HS, abandonedBeforeRemoteCall: null }), expect: 'PROVEN_NOT_POSTED' },
+  // Row 5a: a shadow IMS recorded instead of queuing. SHADOW_NOT_SENT_BY_IMS only when it is exactly the shape the one writer makes.
+  { n: 5, name: '5a: CANCELLED + HELD_SHADOW, no id (a shadow, with the sweep flag the writer sets)', row: row({ status: 'CANCELLED', settlementBasis: HS, abandonedBeforeRemoteCall: true }), expect: 'SHADOW_NOT_SENT_BY_IMS' },
+  { n: 5, name: '5a: CANCELLED + HELD_SHADOW, no id and NO flag (the basis alone decides, not the flag)', row: row({ status: 'CANCELLED', settlementBasis: HS, abandonedBeforeRemoteCall: null }), expect: 'SHADOW_NOT_SENT_BY_IMS' },
   { n: 5, name: '5a: CANCELLED + HELD_SHADOW WITH an id is not a shadow this build writes', row: row({ status: 'CANCELLED', externalTransactionId: 'DOC-1', settlementBasis: HS, abandonedBeforeRemoteCall: true }), expect: 'UNKNOWN' },
   { n: 5, name: '5a: SYNCED + HELD_SHADOW is not a shadow this build writes', row: row({ status: 'SYNCED', settlementBasis: HS }), expect: 'UNKNOWN' },
   { n: 5, name: '5a: PENDING + HELD_SHADOW is not a shadow this build writes', row: row({ status: 'PENDING', settlementBasis: HS }), expect: 'UNKNOWN' },
@@ -94,7 +94,7 @@ test('o3d-f709: every one of the twelve rows is exercised, and the table is not 
   const rows = new Set(TABLE.map((c) => c.n))
   assert.deepEqual([...rows].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
   const standings = new Set(TABLE.map((c) => c.expect))
-  assert.equal(standings.size, 6, 'all six standings are produced')
+  assert.equal(standings.size, 7, 'all seven standings are produced')
   console.log(`# table cases: ${TABLE.length}; rows covered: ${rows.size}; standings covered: ${standings.size}`)
 })
 
@@ -271,7 +271,7 @@ test('o3d-f709: the select constant names exactly the columns the row type requi
 // ROW 5a: THE SHADOW. A statement about IMS only; it never occupies the work slot and never owns a mirror.
 // ---------------------------------------------------------------------------
 
-test('row 5a: SHADOWED_OBLIGATION_WHERE agrees with isShadowedObligation on EVERY row, and a shadow is proven not posted, FREE of the work slot and owns no mirror', () => {
+test('row 5a: SHADOWED_OBLIGATION_WHERE agrees with isShadowedObligation on EVERY row, and a shadow is its own standing (not proof of absence), FREE of the work slot and owns no mirror', () => {
   let shadows = 0
   let nonShadowsWithTheBasis = 0
   for (const r of population()) {
@@ -280,11 +280,13 @@ test('row 5a: SHADOWED_OBLIGATION_WHERE agrees with isShadowedObligation on EVER
     if (r.settlementBasis === HS && !ts) nonShadowsWithTheBasis += 1
     if (!ts) continue
     shadows += 1
-    assert.equal(ledgerStanding(r), 'PROVEN_NOT_POSTED', JSON.stringify(r))
-    assert.equal(mayHaveReachedLedger(r), false, JSON.stringify(r))
+    assert.equal(ledgerStanding(r), 'SHADOW_NOT_SENT_BY_IMS', JSON.stringify(r))
+    assert.equal(mayHaveReachedLedger(r), true, `a shadow is NOT proof of absence: ${JSON.stringify(r)}`)
+    assert.equal(where(r, MAY_HAVE_REACHED_LEDGER_WHERE), true, `the query reading agrees: ${JSON.stringify(r)}`)
     assert.equal(workSlotStanding(r).slot, 'FREE', `a shadow must not occupy a posting's work slot: ${JSON.stringify(r)}`)
     assert.equal(ownsMirroredEvent(r), false, `a shadow has no accounting event to own: ${JSON.stringify(r)}`)
-    assert.equal(where(r, UNPROVEN_CANCELLED_WHERE), false, `retention may expire a shadow: ${JSON.stringify(r)}`)
+    assert.equal(where(r, UNPROVEN_CANCELLED_WHERE), true, `every reader but retention keeps a shadow in the unproven set: ${JSON.stringify(r)}`)
+    assert.equal(where(r, UNRESOLVED_ABANDONED_CLAIM_WHERE), false, `retention may expire a shadow (it holds no ledger claim): ${JSON.stringify(r)}`)
   }
   console.log(`# cross product: ${shadows} shadow rows (CANCELLED + HELD_SHADOW + no id); ${nonShadowsWithTheBasis} rows carry the basis without being one`)
   assert.equal(shadows, 3 * 2, 'precondition: 3 flag values x 2 absent-id forms (null, empty string)')
@@ -294,5 +296,6 @@ test('row 5a: SHADOWED_OBLIGATION_WHERE agrees with isShadowedObligation on EVER
 test('row 5a: a HELD_SHADOW row with an id stays in retention\'s keep-set (UNKNOWN, may have reached the ledger)', () => {
   const odd = row({ status: 'CANCELLED', externalTransactionId: 'DOC-1', settlementBasis: HS, abandonedBeforeRemoteCall: true })
   assert.equal(where(odd, UNPROVEN_CANCELLED_WHERE), true)
+  assert.equal(where(odd, UNRESOLVED_ABANDONED_CLAIM_WHERE), true, 'retention keeps it: it names a document')
   assert.equal(mayHaveReachedLedger(odd), true)
 })

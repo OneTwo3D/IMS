@@ -298,7 +298,7 @@ export const VERIFIED_REVERSAL_SETTLEMENT_BASIS = 'VERIFIED_REVERSAL'
  * operator) posted the document.
  *
  * It is NOT an operator claim and NOT a connector confirmation, so it is its own basis: a reader that sees it reads the
- * row as PROVEN_NOT_POSTED by IMS (ledger-standing.ts) and never as a posting. A HELD_SHADOW row with a document id, or
+ * row as SHADOW_NOT_SENT_BY_IMS (ledger-standing.ts: not sent by IMS, not proof of absence) and never as a posting. A HELD_SHADOW row with a document id, or
  * with any status other than CANCELLED, is not a shadow this build wrote and reads UNKNOWN.
  */
 export const HELD_SHADOW_SETTLEMENT_BASIS = 'HELD_SHADOW'

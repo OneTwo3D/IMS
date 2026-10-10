@@ -179,7 +179,7 @@ test('[o3d-1e7sl D5] the Group-B evidence check and the operator-asserted report
     // THE PRODUCER-SIDE HOLD'S SHADOW: the same standing as the row above and the opposite answer. The batch was shadowed,
     // not lost: the shadow is the record that the obligation was seen and deliberately not produced, so the shipment is
     // not "posted with nothing behind it". The two rows differ only in settlementBasis, which isolates the rule.
-    { name: 'SHADOW (HELD_SHADOW)', standing: 'PROVEN_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }, evidenced: true, reported: false },
+    { name: 'SHADOW (HELD_SHADOW)', standing: 'SHADOW_NOT_SENT_BY_IMS', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }, evidenced: true, reported: false },
   ]
   let reported = 0
   for (const c of cases) {

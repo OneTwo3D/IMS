@@ -19,6 +19,9 @@ const created: Array<{ type: string; referenceId: string; payload: Record<string
 const outboxCalls: string[] = []
 const mirrorCalls: string[] = []
 let shadowUpserts = 0
+/** FAILED batch journals the daily run finds, and the ids it puts back to PENDING. */
+let failedBatchLogs: Array<{ id: string; type: string; referenceId: string; payload: Record<string, unknown> }> = []
+const requeued: string[] = []
 const activity: Array<Record<string, unknown>> = []
 
 const SHIPMENT = {
@@ -58,8 +61,11 @@ const tx = {
   salesOrder: { findMany: async () => [], update: async () => ({}) },
   costLayer: { update: async () => ({}) },
   accountingSyncLog: {
-    findMany: async () => [],
-    updateMany: async () => ({ count: 0 }),
+    findMany: async (args?: { where?: { status?: string } }) => (args?.where?.status === 'FAILED' ? failedBatchLogs : []),
+    updateMany: async (args: { where: { id?: { in: string[] }; status?: string }; data: { status?: string } }) => {
+      if (args.data?.status === 'PENDING') requeued.push(...(args.where.id?.in ?? []))
+      return { count: 0 }
+    },
     create: async ({ data }: { data: { type: string; referenceId: string; payload: Record<string, unknown>; status?: string; settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null; errorMessage?: string | null } }) => {
       created.push({ type: data.type, referenceId: data.referenceId, payload: data.payload, status: data.status, settlementBasis: data.settlementBasis, abandonedBeforeRemoteCall: data.abandonedBeforeRemoteCall, errorMessage: data.errorMessage })
       return { id: `log-${created.length}` }
@@ -142,6 +148,7 @@ async function runBatch(env: Record<string, string>): Promise<void> {
   created.length = 0
   outboxCalls.length = 0
   mirrorCalls.length = 0
+  requeued.length = 0
   shadowUpserts = 0
   const saved = ENV_KEYS.map((key) => [key, process.env[key]] as const)
   for (const key of ENV_KEYS) delete process.env[key]
@@ -199,4 +206,20 @@ test('DIFFERENTIAL, switch ON and fully granted with the batch dated after the c
   assert.deepEqual(on, off)
   assert.deepEqual([outboxCalls.length, mirrorCalls.length], offCalls)
   assert.equal(shadowUpserts, 0)
+})
+
+test('THE RE-QUEUE: the daily run puts a FAILED batch journal back to PENDING when the hold is off or the decision is LIVE, and does NOT when the decision is SHADOW', async () => {
+  failedBatchLogs = [{ id: 'failed-1', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-01-01-abcd1234', payload: { date: '2026-01-01' } }]
+  try {
+    await runBatch({})
+    const off = [...requeued]
+    await runBatch({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' })
+    const held = [...requeued]
+    await runBatch({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: TENANT, XERO_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z' })
+    const granted = [...requeued]
+    console.log(`# re-queue: off=${JSON.stringify(off)} enforced-ungranted=${JSON.stringify(held)} granted=${JSON.stringify(granted)}`)
+    assert.deepEqual(off, ['failed-1'], 'PRECONDITION: with the hold off the failed journal IS re-queued, so "not re-queued" below is not vacuous')
+    assert.deepEqual(held, [], 'a held batch is not made claimable again')
+    assert.deepEqual(granted, ['failed-1'], 'granted, IMS-owned and dated after the cut-off: LIVE, so it is re-queued exactly as with the hold off')
+  } finally { failedBatchLogs = [] }
 })

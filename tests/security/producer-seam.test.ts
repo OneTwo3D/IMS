@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { readProducerEnforcement, producerSeamVerdict } from '../../lib/security/producer-seam.ts'
-import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV, PRODUCER_REASONS, WRITER_OWNER_LABEL, producerShadowNotice } from '../../lib/security/producer-disposition-constants.ts'
+import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV, PRODUCER_REASONS, WRITER_OWNER_LABEL, producerHeldNotice, producerShadowNotice } from '../../lib/security/producer-disposition-constants.ts'
 import { OUTBOUND_CONNECTORS, OUTBOUND_GRANT_ENV } from '../../lib/security/outbound-write-hold-constants.ts'
 import { WRITER_OWNERS } from '../../lib/security/writer-ownership-map.ts'
 import { unconditionalMoneySentences } from '../helpers/unconditional-instruction.ts'
@@ -129,6 +129,11 @@ test('OPERATOR TEXT is single-sourced, names the destination, owner and reason, 
     if (reason === 'live') continue
     const text = producerShadowNotice({ connector, reason, owner })
     texts += 1
+    // The claim boundary's sentence (a queued row handed back unsent) obeys the same rules and claims no shadow was kept.
+    const held = producerHeldNotice({ connector, reason, owner })
+    assert.deepEqual(unconditionalMoneySentences(held), [], held)
+    assert.doesNotMatch(held, /shadow record/)
+    assert.match(held, /handed back unsent and is not sent while the hold stands/)
     assert.match(text, /^Not sent by IMS: writes to \w+ are held on this installation \(/)
     assert.ok(text.includes(WRITER_OWNER_LABEL[owner]), `${owner} is named`)
     assert.deepEqual(unconditionalMoneySentences(text), [], `${connector}/${owner}/${reason}: ${text}`)

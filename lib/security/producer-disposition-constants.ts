@@ -111,6 +111,19 @@ export function producerShadowNotice(input: { connector: OutboundConnector; reas
     + `This does not say whether ${input.owner === 'unknown' || input.owner === 'nobody' ? 'anything' : owner} has written it to ${label}: check ${label} before acting.`
 }
 
+/**
+ * THE SENTENCE FOR A ROW THAT ALREADY EXISTS AND IS NOT SENT: the claim boundary found a queued row whose decision is not
+ * LIVE and handed it back unsent. Unlike {@link producerShadowNotice} it records no shadow (the row is the queued work itself),
+ * so it does not say one was kept. It claims only what IMS knows: IMS did not send it, and will not while the hold says so.
+ */
+export function producerHeldNotice(input: { connector: OutboundConnector; reason: ProducerReason; owner: WriterOwner }): string {
+  const label = OUTBOUND_CONNECTOR_LABEL[input.connector]
+  const owner = WRITER_OWNER_LABEL[input.owner]
+  return `Not sent by IMS: writes to ${label} are held on this installation (${PRODUCER_REASON_TEXT[input.reason]}). `
+    + `Owner of this operation in the current phase: ${owner}. This queued entry was handed back unsent and is not sent while the hold stands. `
+    + `This does not say whether ${input.owner === 'unknown' || input.owner === 'nobody' ? 'anything' : owner} has written it to ${label}: check ${label} before acting.`
+}
+
 /** The state of the agreement between a destination's grant and its live-from instant. */
 export const PRODUCER_AGREEMENT_STATES = ['agreed_held', 'agreed_live', 'inconsistent', 'unreadable'] as const
 export type ProducerAgreementState = (typeof PRODUCER_AGREEMENT_STATES)[number]
@@ -152,9 +165,9 @@ export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
     '',
     'For each destination and operation the decision is LIVE or SHADOW. It is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is SHADOW when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it. The decision itself reads the environment only: no database and no network call.',
     '',
-    'A SHADOW is the record of what IMS would have written, kept instead of queuing the work; it is never delivered later. For Xero a shadow is a row in the accounting sync log that is CANCELLED with the settlement basis `HELD_SHADOW`, plus a row in `outbound_shadow_writes` (one per distinct piece of work, counting repeats). A shadow has no outbox job, is never given an accounting event, and reads as "not posted by IMS" in the ledger standing; it says nothing about whether the owner of the operation wrote it to Xero. A destination whose enforcement is on and whose grant and live-from instant are both unset therefore queues nothing new: every Xero write IMS would have produced becomes a shadow.',
+    'A SHADOW is the record of what IMS would have written, kept instead of queuing the work; it is never delivered later. For Xero a shadow is a row in the accounting sync log that is CANCELLED with the settlement basis `HELD_SHADOW`, plus a row in `outbound_shadow_writes` (one per distinct piece of work, counting repeats). A shadow has no outbox job, is never given an accounting event, and has its own ledger standing (shadow, not sent by IMS) that is NOT proof the document is absent from Xero: it says nothing about whether the owner of the operation wrote it, so deleting, reversing or refunding over it is refused as unproven. A destination whose enforcement is on and whose grant and live-from instant are both unset therefore queues nothing new: every Xero write IMS would have produced becomes a shadow.',
     '',
-    'A grant without a live-from instant, or a live-from instant without a grant, is inconsistent: the decision is SHADOW, while the transport still allows the writes of a granted destination. A later change will report the inconsistency in `npm run outbound:status`. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination. Rows queued before enforcement was switched on are not touched by it, and a later change will refuse to deliver a row created before the live-from instant.',
+    'A grant without a live-from instant, or a live-from instant without a grant, is inconsistent: the decision is SHADOW, while the transport still allows the writes of a granted destination. A later change will report the inconsistency in `npm run outbound:status`. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination. Rows already queued when enforcement is switched on are not changed, but the Xero queue processor asks the same decision immediately before it sends: a row whose decision is not LIVE is handed back unsent with the operator text (no retry is spent) and is never posted, and a manual retry or the daily-batch reset does not make such a row claimable again. A later change will also refuse to deliver a row created before the live-from instant and retire the backlog.',
   ].join('\n'),
   cutoffs: [
     '| Variable | Destination | Value |',

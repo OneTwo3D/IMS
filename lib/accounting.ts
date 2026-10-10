@@ -341,7 +341,7 @@ export type ConnectorEnqueueOutcome = {
    * event. `queued: true` is the answer the business flows need - the purchase is received, the payment is registered,
    * the batch ran - and `postingIsOwed` is false: IMS owes the ledger nothing here, because in the current phase another
    * writer owns the operation (or none does). It is NOT a statement that the document exists in the ledger, and no caller
-   * may read it as one; the ledger standing of the shadow row is PROVEN_NOT_POSTED by IMS and says nothing more.
+   * may read it as one; the ledger standing of the shadow row is SHADOW_NOT_SENT_BY_IMS: IMS did not send it, and that is not proof of absence.
    */
   /*
    * `hand-post-deferred` (o3d-j625 r18, Codex round 17 HIGH 1) — `queued: FALSE`, and the difference from

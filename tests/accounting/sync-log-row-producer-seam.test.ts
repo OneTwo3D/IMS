@@ -96,7 +96,7 @@ test('DIFFERENTIAL, switch OFF: with no grants set the row is created exactly as
   })
 })
 
-test('DIFFERENTIAL, switch ON and no grant (the P0/P1 posture): NO queued row is created; a CANCELLED / HELD_SHADOW row is, and it reads proven-not-posted by IMS', async () => {
+test('DIFFERENTIAL, switch ON and no grant (the P0/P1 posture): NO queued row is created; a CANCELLED / HELD_SHADOW row is, and it reads as a shadow (not proof of absence)', async () => {
   await withEnv({ [PRODUCER_HOLD_ENFORCED_ENV]: 'xero' }, async () => {
     const { client, recorded } = recordingClient()
     const result = await createAccountingSyncLogRow(client as never, row() as never)
@@ -115,7 +115,7 @@ test('DIFFERENTIAL, switch ON and no grant (the P0/P1 posture): NO queued row is
     assert.ok(result.shadowed, 'the caller is told it is a shadow')
     assert.equal(result.suppressed, null)
     const standing = { status: String(written.status), externalTransactionId: null, abandonedBeforeRemoteCall: true, settlementBasis: String(written.settlementBasis) }
-    assert.equal(ledgerStanding(standing), 'PROVEN_NOT_POSTED')
+    assert.equal(ledgerStanding(standing), 'SHADOW_NOT_SENT_BY_IMS')
     assert.equal(isShadowedObligation(standing), true)
   })
 })

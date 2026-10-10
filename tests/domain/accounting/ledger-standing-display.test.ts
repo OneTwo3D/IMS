@@ -57,6 +57,10 @@ const CASES: Array<{
     tone: 'unproven', label: 'unproven', detail: /UNPROVEN/, idClaim: /how this id got here is not recognised/,
   },
   {
+    name: 'SHADOW_NOT_SENT_BY_IMS (the producer-side hold recorded it instead of queuing it)', standing: 'SHADOW_NOT_SENT_BY_IMS', row: row({ status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }),
+    tone: 'unproven', label: 'shadow', detail: /IMS did not send it[\s\S]*NOT proof that the document is absent[\s\S]*UNPROVEN/, idClaim: null,
+  },
+  {
     name: 'LIVE_WORK', standing: 'LIVE_WORK', row: row({ status: 'PENDING' }),
     tone: 'work', label: null, detail: /Queued or in flight/, idClaim: null,
   },
@@ -87,7 +91,7 @@ test('[o3d-1e7sl D1-D4] every standing is described by its basis, and only a rec
   console.log(`# display cases: ${CASES.length}; labelled: ${labelled}`)
   assert.deepEqual(
     [...new Set(CASES.map((c) => c.standing))].sort(),
-    ['ASSERTED_NOT_POSTED', 'ASSERTED_POSTED', 'CONFIRMED_POSTED', 'LIVE_WORK', 'PROVEN_NOT_POSTED', 'UNKNOWN'],
+    ['ASSERTED_NOT_POSTED', 'ASSERTED_POSTED', 'CONFIRMED_POSTED', 'LIVE_WORK', 'PROVEN_NOT_POSTED', 'SHADOW_NOT_SENT_BY_IMS', 'UNKNOWN'],
     'every standing is exercised',
   )
 })
@@ -113,7 +117,6 @@ const CAUSES: Array<{ name: string; cause: string; row: LedgerStandingRow; opts?
   { name: 'VERIFIED_REVERSAL, no id', cause: 'VERIFIED_REVERSAL', row: row({ settlementBasis: 'VERIFIED_REVERSAL' }), label: 'verified reversed', detail: /may have been posted earlier/, neverSent: false },
   { name: 'VERIFIED_REVERSAL keeping a CONNECTOR-issued id (a payment that did reach the ledger)', cause: 'VERIFIED_REVERSAL', row: row({ externalTransactionId: 'PAY-REAL-7', settlementBasis: 'VERIFIED_REVERSAL', abandonedBeforeRemoteCall: null }), label: 'verified reversed', detail: /audit trail/, neverSent: false },
   { name: 'VERIFIED_REVERSAL that also carries the sweep flag (both proofs present: the reversal wins, the id is real)', cause: 'VERIFIED_REVERSAL', row: row({ externalTransactionId: 'PAY-REAL-8', settlementBasis: 'VERIFIED_REVERSAL', abandonedBeforeRemoteCall: true }), label: 'verified reversed', detail: /may have been posted earlier/, neverSent: false },
-  { name: 'a SHADOW the producer-side hold recorded (CANCELLED + HELD_SHADOW, no id)', cause: 'HELD_SHADOW', row: row({ settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }), label: 'shadow', detail: /IMS did not send it[\s\S]*does NOT say whether the owner/, neverSent: false },
   { name: 'FAILED whose own body proves rejection before any request (row 10)', cause: 'REJECTED_BEFORE_POSTING', row: row({ status: 'FAILED' }), opts: { couldHaveReachedLedger: false }, label: 'rejected before posting', detail: /Rejected before posting/, neverSent: false },
 ]
 

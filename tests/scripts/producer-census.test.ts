@@ -408,7 +408,7 @@ test('SEAM-2: a call of the primitive inside the primitive\'s own file is exempt
 
 test('SEAM-1: a declared seam must call a consultation BEFORE the site; after it, or not at all, is red', () => {
   const ok = `export async function act() { const v = xeroProducerSeamVerdict({}); await putXeroTaxRate({}) }`
-  const okRun = seamRun('app/actions/fixture.ts', ok, [seamDecl('app/actions/fixture.ts::act::putXeroTaxRate#1')])
+  const okRun = seamRun('app/actions/settings.ts', ok, [seamDecl('app/actions/settings.ts::act::putXeroTaxRate#1')])
   assert.equal(okRun.counts.seamSites, 1)
   assert.equal(okRun.counts.seamSitesConsulting, 1)
   assert.deepEqual(okRun.failures, [])
@@ -417,7 +417,8 @@ test('SEAM-1: a declared seam must call a consultation BEFORE the site; after it
     ['consulted after', `export async function act() { await putXeroTaxRate({}); xeroProducerSeamVerdict({}) }`],
     ['consulted in another function', `function ask() { return xeroProducerSeamVerdict({}) }\nexport async function act() { await putXeroTaxRate({}) }`],
   ] as const) {
-    const run = seamRun('app/actions/fixture.ts', source, [seamDecl('app/actions/fixture.ts::act::putXeroTaxRate#1')])
+    const run = seamRun('app/actions/settings.ts', source, [seamDecl('app/actions/settings.ts::act::putXeroTaxRate#1')])
+    run.failures = run.failures.filter((f) => f.startsWith('SEAM-1'))
     console.log(`# SEAM-1 ${label}: ${run.failures.length} finding(s)`)
     assert.equal(run.failures.length, 1, label)
     assert.match(run.failures[0]!, /SEAM-1 .* is declared a seam but act calls none of/)
@@ -460,4 +461,58 @@ test('the seam checks cannot pass by examining nothing: with the tree reached an
   const inputs = realInputs()
   const report = reconcile({ ...inputs, sources: new Map() })
   assert.ok(report.failures.some((f) => /SUBJECT NOT REACHED: the seam checks saw 0 seam site/.test(f)) || report.failures.some((f) => f.startsWith('SEAM ')), report.failures.join('\n'))
+})
+
+// ───────────────────────────── part 5: the claim boundary (SEAM-4) ─────────────────────────────
+
+test('SEAM-4 PRECONDITION: every Xero transport call in the real tree is behind the claim boundary, and there are some', () => {
+  const report = reconcile(realInputs())
+  const seam = report.counts.seam!
+  console.log(`# SEAM-4 (real tree): ${seam.egressSitesBehindBoundary}/${seam.egressSites} Xero transport calls behind the claim boundary`)
+  assert.ok(seam.egressSites >= 15, 'PRECONDITION: the egress sites were examined')
+  assert.equal(seam.egressSitesBehindBoundary, seam.egressSites)
+  assert.deepEqual(report.failures, [])
+})
+
+test('SEAM-4 MUTATION (the claim-boundary check removed from processClaimedEntry): red, naming the transport site', () => {
+  const inputs = realInputs()
+  const file = 'lib/connectors/xero/sync-processor.ts'
+  const text = inputs.sources!.get(file)!
+  const mutated = text.replace('const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })', 'const held = { kind: \'legacy\' as const }')
+  assert.notEqual(mutated, text, 'precondition: the check was found and removed')
+  const sources = new Map(inputs.sources!)
+  sources.set(file, mutated)
+  const report = reconcile({ ...inputs, sources })
+  assert.ok(report.failures.some((f) => /SEAM-4 .*processClaimedEntry::xero(Post|Upload)/.test(f) || /SEAM-4 .*processClaimedEntry::putXeroTaxRate/.test(f)), report.failures.join('\n'))
+})
+
+test('SEAM-4 MUTATION (the check moved AFTER the first transport call): red', () => {
+  const inputs = realInputs()
+  const file = 'lib/connectors/xero/sync-processor.ts'
+  const text = inputs.sources!.get(file)!
+  const gateLine = 'const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })'
+  assert.ok(text.includes(gateLine), 'precondition: the gate is there')
+  // Remove the gate at the top and put an equivalent call in the LAST case of the switch, after the earlier transport calls.
+  const withoutGate = text.replace(gateLine, 'const held = { kind: \'legacy\' as const }')
+  const lastCase = withoutGate.indexOf("case 'TAX_RATE_SYNC'")
+  assert.ok(lastCase > 0, 'precondition: the tax-rate case was found')
+  const open = withoutGate.indexOf('{', lastCase) + 1
+  const mutated = withoutGate.slice(0, open) + '\n      void xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })\n' + withoutGate.slice(open)
+  const sources = new Map(inputs.sources!)
+  sources.set(file, mutated)
+  const report = reconcile({ ...inputs, sources })
+  console.log(`# moved-gate findings: ${report.failures.filter((f) => f.startsWith('SEAM-4')).length}`)
+  assert.ok(report.failures.some((f) => f.startsWith('SEAM-4')), 'a gate that does not come first is not a boundary')
+})
+
+test('SEAM-4: a Xero transport call in a NEW file is an egress outside the boundary', () => {
+  const inputs = realInputs()
+  const file = 'lib/connectors/xero/new-egress.ts'
+  const source = `import { xeroPost } from './client'\nexport async function sneak() { return xeroPost('/Invoices', {}) }`
+  const extra = scanSource(source, file)
+  assert.equal(extra.length, 1)
+  const sources = new Map(inputs.sources!)
+  sources.set(file, source)
+  const report = reconcile({ ...inputs, sites: [...inputs.sites, ...extra], sources })
+  assert.ok(report.failures.some((f) => /SEAM-4 lib\/connectors\/xero\/new-egress\.ts::sneak::xeroPost#1/.test(f)), report.failures.join('\n'))
 })

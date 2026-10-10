@@ -167,7 +167,7 @@ type PreparedShadow = {
 
 /**
  * The shadow of a posting IMS would have queued: a CANCELLED row, basis HELD_SHADOW, no document id, created in
- * stamping custody with no remote attempt (so it reads PROVEN_NOT_POSTED by IMS, ledger-standing.ts row 5a), carrying
+ * stamping custody with no remote attempt (so it reads SHADOW_NOT_SENT_BY_IMS, ledger-standing.ts row 5a: not sent by IMS, and NOT proof of absence), carrying
  * the single-sourced operator sentence as its error message; plus the `outbound_shadow_writes` row that counts repeats.
  *
  * REPEATS DO NOT MAKE ROWS. The shadow table's unique key (destination, operation, subject, payload digest) decides:

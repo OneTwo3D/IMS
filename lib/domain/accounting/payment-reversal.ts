@@ -807,6 +807,7 @@ export type BillPaymentSupersessionPlan<T> =
  *                                     still naming the document the ledger issued)
  *   ASSERTED_POSTED                   an operator typed the id in                   -> ASSERTED_POSTED
  *   ASSERTED_NOT_POSTED | UNKNOWN     a person's word / nothing on the row can say  -> MAY_HAVE_POSTED
+ *   | SHADOW_NOT_SENT_BY_IMS          (a shadow: IMS did not send it, the owner may have)
  *                                     - THE HEADLINE SCENARIO: a FAILED BILL_PAYMENT an operator
  *                                     settled NOT_POSTED is CANCELLED, matched none of the old status
  *                                     sets, and let Mark Paid queue a SECOND supplier payment.
@@ -828,7 +829,7 @@ export function planBillPaymentSupersession<T extends BillPaymentSupersessionRow
   const asserted = standings.filter((s) => s.standing === 'ASSERTED_POSTED').map((s) => s.row)
   if (asserted.length > 0) return { proceed: false, refusal: 'PAYMENT_ASSERTED_POSTED', blocking: asserted }
   const ambiguous = standings
-    .filter((s) => s.standing === 'ASSERTED_NOT_POSTED' || s.standing === 'UNKNOWN')
+    .filter((s) => s.standing === 'ASSERTED_NOT_POSTED' || s.standing === 'UNKNOWN' || s.standing === 'SHADOW_NOT_SENT_BY_IMS')
     .map((s) => s.row)
   if (ambiguous.length > 0) return { proceed: false, refusal: 'PAYMENT_MAY_HAVE_POSTED', blocking: ambiguous }
   return {

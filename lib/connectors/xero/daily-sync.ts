@@ -15,6 +15,7 @@
 
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
+import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { createHash } from 'node:crypto'
 
 import { db } from '@/lib/db'
@@ -564,21 +565,19 @@ async function lockAllocationRecords(
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
   await db.$transaction(async (tx) => {
-    const failedLogs = await tx.accountingSyncLog.findMany({
+    const failed = await tx.accountingSyncLog.findMany({
       where: {
         connector: XERO_CONNECTOR,
         type: { in: [...DAILY_BATCH_TYPES] },
         status: 'FAILED',
       },
-      select: { referenceId: true },
+      select: { id: true, type: true, referenceId: true, payload: true },
     })
+    // THE PRODUCER-SIDE HOLD AT THE RE-QUEUE: a failed batch whose decision is SHADOW is not made claimable again.
+    const failedLogs = failed.filter((log) => xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type: String(log.type), payload: log.payload }).kind !== 'shadow')
 
     await tx.accountingSyncLog.updateMany({
-      where: {
-        connector: XERO_CONNECTOR,
-        type: { in: [...DAILY_BATCH_TYPES] },
-        status: 'FAILED',
-      },
+      where: { id: { in: failedLogs.map((log) => log.id) }, status: 'FAILED' },
       data: {
         status: 'PENDING',
         retryCount: 0,

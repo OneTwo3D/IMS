@@ -6,6 +6,8 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
+import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
@@ -2730,7 +2732,9 @@ function unsentPostEvidence(
         // before they go hunting in the ledger.
         : notPosted.reason === 'transport-refused'
           ? 'xero_sync_transport_refused_before_post'
-          : 'xero_sync_claim_lost_before_post',
+          : notPosted.reason === 'producer-held'
+            ? 'xero_sync_producer_held_before_post'
+            : 'xero_sync_claim_lost_before_post',
     tag: 'sync',
     level: 'WARNING' as const,
     description: notPosted.message,
@@ -4979,7 +4983,7 @@ type EntryResult = {
      * minted — the fence sent nothing because the transport would not. The row is handed back exactly
      * like the other three, and the marker it left behind is a known, named residual (o3d-gvzu).
      */
-    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused'
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held'
     operation: string
     message: string
     /**
@@ -5800,7 +5804,7 @@ async function processEntry(
   )
 }
 
-async function processClaimedEntry(
+export async function processClaimedEntry(
   entryId: string,
   type: AccountingSyncType,
   referenceType: string,
@@ -5815,6 +5819,21 @@ async function processClaimedEntry(
   attempt: AttemptRef,
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
+
+  // THE CLAIM BOUNDARY OF THE PRODUCER-SIDE HOLD: EVERY REMOTE WRITE TO XERO FROM THE QUEUE IS BELOW THIS LINE.
+  //
+  // The seam at row creation only governs rows made after it was switched on. A row that already exists (queued before
+  // the hold was enforced, revived by a retry or a sweep, or whose outbox job predates it) reaches this function through
+  // the claim like any other, so the decision is asked HERE too, immediately before anything can be sent. A row whose
+  // decision is not LIVE is handed back unsent with the single-sourced operator text and no retry is spent; it is never
+  // posted. When the hold is not enforced for Xero this is a no-op (verdict `legacy`). Nothing below can be reached
+  // without passing it: the census (SEAM-4) holds every Xero transport call in this file to this function and this check
+  // to come before the first of them.
+  const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload })
+  if (held.kind === 'shadow') {
+    const message = producerHeldNotice({ connector: held.destination, reason: held.decision.reason, owner: held.decision.owner })
+    return { success: false, error: message, notPosted: { reason: 'producer-held', operation: type, message } }
+  }
 
   // THE CONNECTION CHECK USED TO BE HERE, and removing it is the fix rather than a regression.
   //

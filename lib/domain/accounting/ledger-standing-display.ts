@@ -4,7 +4,7 @@ import {
   type LedgerStandingOptions,
   type LedgerStandingRow,
 } from '@/lib/domain/accounting/ledger-standing'
-import { HELD_SHADOW_SETTLEMENT_BASIS, VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 
 // ---------------------------------------------------------------------------
 // o3d-1e7sl (slice 1c of o3d-f709) - WHAT THE OPERATOR IS TOLD ABOUT A SYNC ROW'S STANDING.
@@ -33,11 +33,8 @@ export type StandingTone = 'confirmed' | 'asserted' | 'unproven' | 'proven' | 'w
  *                         earlier, the id is kept for the audit trail.
  *   REJECTED_BEFORE_POSTING  a FAILED row whose own stored body proves the connector rejected it before any request
  *                         (truth-table row 10, the caller's proof).
- *   HELD_SHADOW           the producer-side hold said SHADOW: IMS recorded what it would have written and queued nothing
- *                         (truth-table row 5a). A statement about IMS only - it says nothing about whether the operation's
- *                         owner wrote the document, so it is worded apart from "never sent".
  */
-export type ProvenCause = 'RECORDED_PRE_CALL' | 'VERIFIED_REVERSAL' | 'REJECTED_BEFORE_POSTING' | 'HELD_SHADOW'
+export type ProvenCause = 'RECORDED_PRE_CALL' | 'VERIFIED_REVERSAL' | 'REJECTED_BEFORE_POSTING'
 
 export type StandingDisplay = {
   standing: LedgerStanding
@@ -51,6 +48,16 @@ export type StandingDisplay = {
 }
 
 const DETAILS: Record<Exclude<LedgerStanding, 'PROVEN_NOT_POSTED'>, StandingDisplay> = {
+  SHADOW_NOT_SENT_BY_IMS: {
+    standing: 'SHADOW_NOT_SENT_BY_IMS',
+    cause: null,
+    tone: 'unproven',
+    label: 'shadow',
+    detail:
+      'A shadow: the producer-side hold said SHADOW for this posting, so IMS recorded what it would have written and queued '
+      + 'nothing. IMS did not send it. This is NOT proof that the document is absent from the accounting system: the owner of this '
+      + 'operation may have written it. UNPROVEN - check the accounting system itself before deleting, reversing or re-posting.',
+  },
   CONFIRMED_POSTED: {
     standing: 'CONFIRMED_POSTED',
     cause: null,
@@ -124,21 +131,10 @@ const PROVEN_DISPLAYS: Record<ProvenCause, StandingDisplay> = {
       'Rejected before posting: the row\'s own stored request is missing something the connector requires, so it was '
       + 'refused before any request could have been accepted.',
   },
-  HELD_SHADOW: {
-    standing: 'PROVEN_NOT_POSTED',
-    cause: 'HELD_SHADOW',
-    tone: 'proven',
-    label: 'shadow',
-    detail:
-      'A shadow: the producer-side hold said SHADOW for this posting, so IMS recorded what it would have written and queued '
-      + 'nothing. IMS did not send it. This does NOT say whether the owner of this operation has written the document to the '
-      + 'accounting system: check the accounting system itself before acting.',
-  },
 }
 
 /** WHY a PROVEN_NOT_POSTED row is proven, from the evidence on the row itself. */
 export function provenCauseOf(row: LedgerStandingRow): ProvenCause {
-  if (row.settlementBasis === HELD_SHADOW_SETTLEMENT_BASIS) return 'HELD_SHADOW'
   if (row.settlementBasis === VERIFIED_REVERSAL_SETTLEMENT_BASIS) return 'VERIFIED_REVERSAL'
   if (row.status === 'FAILED') return 'REJECTED_BEFORE_POSTING'
   return 'RECORDED_PRE_CALL'

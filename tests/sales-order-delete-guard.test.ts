@@ -1561,6 +1561,12 @@ const STANDING_CASES: StandingCase[] = [
     row: { status: 'SYNCED', externalTransactionId: 'INV-N', settlementBasis: 'SOMETHING_NEWER' }, blocks: true, says: /UNPROVEN/, neverSays: /is already POSTED as/,
   },
   {
+    // THE PRODUCER-SIDE HOLD'S SHADOW: IMS did not send it, the operation's real owner may have. It blocks, and says it is unproven.
+    name: 'SHADOW_NOT_SENT_BY_IMS (a shadow: CANCELLED + HELD_SHADOW, no id)', standing: 'SHADOW_NOT_SENT_BY_IMS',
+    row: { status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }, blocks: true,
+    says: /recorded as a SHADOW instead of sending[\s\S]*proves only that IMS did not send it[\s\S]*UNPROVEN/, neverSays: NOT_A_FACT,
+  },
+  {
     name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK',
     row: { status: 'PENDING' }, blocks: true, says: /queued to xero/,
   },
@@ -1590,7 +1596,7 @@ test('[o3d-1e7sl G1] the document query: one case per standing, the standing ass
   assert.ok(blocking > 0 && free > 0, 'the decision splits both ways, so the agreement is not vacuous')
   assert.deepEqual(
     [...new Set(STANDING_CASES.map((c) => c.standing))].sort(),
-    ['ASSERTED_NOT_POSTED', 'ASSERTED_POSTED', 'CONFIRMED_POSTED', 'LIVE_WORK', 'PROVEN_NOT_POSTED', 'UNKNOWN'],
+    ['ASSERTED_NOT_POSTED', 'ASSERTED_POSTED', 'CONFIRMED_POSTED', 'LIVE_WORK', 'PROVEN_NOT_POSTED', 'SHADOW_NOT_SENT_BY_IMS', 'UNKNOWN'],
     'every standing is exercised',
   )
 })
@@ -1613,7 +1619,7 @@ test('[o3d-1e7sl G1] the daily-batch query: the same standings decide the same w
     blocking += 1
     assert.equal(blocker!.code, 'daily_batch_staged', c.name)
     // A batch row that is neither confirmed nor queued is an unproven claim and must say so.
-    if (c.standing === 'ASSERTED_NOT_POSTED' || (c.standing === 'UNKNOWN' && c.row.status === 'CANCELLED')) {
+    if (c.standing === 'ASSERTED_NOT_POSTED' || c.standing === 'SHADOW_NOT_SENT_BY_IMS' || (c.standing === 'UNKNOWN' && c.row.status === 'CANCELLED')) {
       assert.match(blocker!.message, /UNPROVEN/, c.name)
     }
     assert.doesNotMatch(blocker!.message, NOT_A_FACT, c.name)

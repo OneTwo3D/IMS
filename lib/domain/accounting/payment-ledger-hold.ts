@@ -31,7 +31,7 @@
  */
 
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
-import { ledgerStanding } from './ledger-standing'
+import { isShadowedObligation, ledgerStanding } from './ledger-standing'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from './sync-row-settlement'
 
 /** The sync type that registers a locally-recorded sales receipt against the ledger invoice. */
@@ -225,6 +225,10 @@ export function registrationLedgerStanding(
       return 'HELD'
     case 'ASSERTED_NOT_POSTED':
       return 'UNDECIDED'
+    // A shadow proves only that IMS did not send it; the operation's real owner may have posted the payment, so it is
+    // never NOTHING: deleting the local receipt over it could erase the only record of a payment that stands in the ledger.
+    case 'SHADOW_NOT_SENT_BY_IMS':
+      return 'UNDECIDED'
     case 'UNKNOWN':
       break
   }
@@ -359,6 +363,31 @@ export function describeAttemptUndecidedRefusal(
       + 'accounting system IMS did not check, not proof - the payment may still be there - so it does not '
       + 'free this receipt for deletion.'
     : ''
+  // THE PRODUCER-SIDE HOLD: a SHADOW is not an attempt by IMS at all, so "IMS tried ... FAILED" would be untrue of it. It gets
+  // its own account: IMS did not send the registration, and the writer that owns payment registration may have.
+  const shadowed = undecided.filter((row) => isShadowedObligation({
+    status: row.status,
+    externalTransactionId: row.externalTransactionId ?? null,
+    settlementBasis: row.settlementBasis ?? null,
+    abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+  }))
+  if (shadowed.length > 0 && shadowed.length === undecided.length) {
+    return {
+      code: 'registration_attempt_undecided',
+      message:
+        `IMS did not register this receipt against the invoice for ${orderReference} in the accounting system: the producer-side `
+        + 'hold recorded the registration as a SHADOW instead of sending it (entry '
+        + `${entries}). That proves only that IMS did not send it. The writer that owns payment registration in the current `
+        + 'phase may have posted a payment for this receipt, so deleting it here could erase the sole local copy of a payment that '
+        + 'stands in the accounting system. Nothing was deleted.\n\n'
+        + `Open the invoice for ${orderReference} in the accounting system and look at the payments on it.\n`
+        + '• Only if a payment is there: reverse it in the accounting system, then copy its payment reference and use "Check that payment and delete" '
+        + 'below — IMS will ask the accounting system about that exact payment, check it belongs to this invoice and matches this '
+        + 'receipt, and confirm it really is gone before removing anything here.\n'
+        + '• If there is NO payment, IMS still cannot settle this on its own: an invoice showing nothing looks the same whether a '
+        + 'payment was removed or never arrived, so this receipt stays until a reference is supplied or the hold is lifted.',
+    }
+  }
   return {
     code: 'registration_attempt_undecided',
     message:
