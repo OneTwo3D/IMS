@@ -151,6 +151,10 @@ for (const key of ['_used_wallet_amount', '_ywgc_applied_gift_cards_total', '_st
 add('line code', "untyped line named 'storecredit' (allocated)", (p) => { p.coupon_lines.push({ id: id++, code: 'storecredit', discount: '1.00', discount_tax: '0.00', meta_data: [] } as WcCouponLine) }, () => false)
 add('line code', "percent-typed line named 'GIFTCARD10' (cleanly typed genuine)", (p) => { p.coupon_lines.push({ id: id++, code: 'giftcard10', discount: '1.00', discount_tax: '0.00', meta_data: [meta('coupon_info', '[3,"giftcard10","percent","10"]')] } as WcCouponLine) }, () => true)
 
+add('line code', "unrecognised-type line named 'wallet-credit' (allocated)", (p) => { p.coupon_lines.push({ id: id++, code: 'wallet-credit', discount: '1.00', discount_tax: '0.00', meta_data: [meta('coupon_info', '[4,"wallet-credit","acme","10"]')] } as WcCouponLine) }, () => false)
+add('line type', 'two unrecognised, disagreeing type records (allocated)', (p) => { p.coupon_lines.push({ id: id++, code: 'mystery', discount: '1.00', discount_tax: '0.00', meta_data: [meta('coupon_info', '[5,"mystery","acme","10"]'), meta('coupon_data', { discount_type: 'zeta' })] } as WcCouponLine) }, () => false)
+add('line type', 'one unrecognised type, no credit evidence (allocated) is carried as a discount', (p) => { p.coupon_lines.push({ id: id++, code: 'mystery', discount: '1.00', discount_tax: '0.00', meta_data: [meta('coupon_info', '[5,"mystery","acme","10"]')] } as WcCouponLine) }, () => true)
+
 function importOutcome(b: Baseline, payload: Payload): { refused: boolean; credit: number } {
   const lineDiscount = payload.coupon_lines.reduce((s, l) => s + (Number.isFinite(Number(l.discount)) ? Number(l.discount) : 0) * 0, 0)
   const result = planWcOrderCoupons({
