@@ -335,7 +335,10 @@ for (const target of MONEY_POSTS) {
       assert.notEqual(guardAt, -1, `${branch} must post under the fence`)
 
       // ...and the request must be INSIDE the callback, not merely after the call.
-      const callbackAt = body.indexOf('}, async () => {', guardAt)
+      // o3d-llyw: the callback may take the fence's context (`{ requireConnection }`), which the receipt
+      // branch hands to the transport.
+      const callbackMatch = /\}, async \((?:\{ requireConnection \})?\) => \{/.exec(body.slice(guardAt))
+      const callbackAt = callbackMatch ? guardAt + callbackMatch.index : -1
       assert.notEqual(callbackAt, -1, `${branch} must pass its post as the fence's callback`)
       const postAt = body.search(/xeroPost<|qboPostIdempotent<|allocatePurchaseCreditNote\(/)
       assert.ok(postAt > callbackAt, `${branch} must post inside the fence, not after it`)

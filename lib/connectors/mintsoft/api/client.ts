@@ -1,4 +1,6 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
+import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from './auth-no-login'
+import { BUNDLE_CLAIM_CHANGED_TEXT } from '../sync/bundle-create-outcome'
 import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   readMintsoftAsnItemExpectedQuantity,
@@ -175,6 +177,12 @@ export async function mintsoftRequest<T>(
         ),
         status: 500,
       }
+    }
+
+    // A scheduled poll never renews the key (a login replaces the tenant's key): report the 401 and stop. The stored
+    // key is left alone, so nothing is deleted behind the operator's back.
+    if (isMintsoftLoginForbidden()) {
+      return { ...firstAttempt, error: `${firstAttempt.error ?? 'Mintsoft rejected the API key (401).'} ${MINTSOFT_POLL_NEEDS_KEY_TEXT}` }
     }
 
     await invalidateMintsoftAccessToken()
@@ -626,8 +634,11 @@ export function buildMintsoftBundleCreateRequest(
   }
 }
 
-export async function createMintsoftBundle(input: WmsBundleDto): Promise<WmsBundleRef> {
+export async function createMintsoftBundle(input: WmsBundleDto, options?: { beforeSend?: () => Promise<boolean> }): Promise<WmsBundleRef> {
   const request = buildMintsoftBundleCreateRequest(input)
+  // The fence: the caller re-verifies its claim in one conditional update, as close to the send as this function can
+  // put it, and a false answer means nothing is sent.
+  if (options?.beforeSend && !(await options.beforeSend())) throw new Error(BUNDLE_CLAIM_CHANGED_TEXT)
   const result = await mintsoftRequest<unknown>(request.path, {
     method: request.method,
     body: request.body,
@@ -662,6 +673,34 @@ export async function createMintsoftBundle(input: WmsBundleDto): Promise<WmsBund
     }
   }
   return fetched
+}
+
+export type MintsoftBundleLookup =
+  | { kind: 'found'; bundle: WmsBundleRef }
+  /** Mintsoft answered, readably, that this product has no bundle (a 404, or a 200 carrying nothing). */
+  | { kind: 'absent' }
+  /** A 200 that is neither a bundle nor empty: no verdict. */
+  | { kind: 'unreadable' }
+
+/**
+ * A lookup that tells "Mintsoft says there is no bundle" from "Mintsoft said something IMS cannot read".
+ * fetchMintsoftBundle folds both into null, which is fine for a sync that merely tries again, and not fine for
+ * the one decision that releases a possibly-sent create. Throws on a failed request.
+ */
+export async function lookupMintsoftBundle(externalProductId: string): Promise<MintsoftBundleLookup> {
+  const normalized = externalProductId.trim()
+  if (!normalized) return { kind: 'unreadable' }
+  const result = await mintsoftRequest<unknown>(`/api/Product/${encodeURIComponent(normalized)}/Bundle`)
+  if (result.status === 404) return { kind: 'absent' }
+  if (result.error) throw new Error(result.error)
+  const data = result.data
+  const empty = data === null || data === undefined || data === ''
+    || (Array.isArray(data) && data.length === 0)
+    || (typeof data === 'object' && !Array.isArray(data) && Object.keys(data as object).length === 0)
+  if (empty) return { kind: 'absent' }
+  const bundle = normalizeMintsoftBundle(data)
+  if (!bundle) return { kind: 'unreadable' }
+  return { kind: 'found', bundle: { ...bundle, externalBundleId: bundle.externalBundleId || normalized } }
 }
 
 export async function fetchMintsoftBundle(externalProductId: string): Promise<WmsBundleRef | null> {
