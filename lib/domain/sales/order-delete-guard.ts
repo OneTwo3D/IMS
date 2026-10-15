@@ -1,6 +1,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { parseAllocationDebitPasses } from '@/lib/domain/accounting/allocation-debit-passes'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { findDurableShadowRecords, type ShadowSubjectQuery } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import {
@@ -97,6 +98,8 @@ export type SalesOrderDeleteBlocker = {
     | 'wms_order_status_snapshot'
     | 'committed_shipment'
     | 'accounting_sync_live'
+    // A durable shadow record (outbound_shadow_writes) for this order or its batch journals, read after the sync row itself has expired.
+    | 'accounting_shadow_recorded'
     | 'accounting_document_exists'
     | 'daily_batch_staged'
     | 'parked_refund'
@@ -213,6 +216,18 @@ export type SalesOrderDeleteStageStamps = {
    * it must fail to compile rather than silently fall back to the latest-pass path.
    */
   allocationBatchPasses: unknown
+}
+
+/**
+ * The sentence for a durable shadow record. Standing-accurate: a shadow says IMS did not send the posting, NOT that the document
+ * is absent, so it is UNPROVEN and the instruction about reversing is conditional on the document existing.
+ */
+function describeDurableShadowBlocker(operations: readonly string[], what = 'accounting document'): string {
+  const named = [...new Set(operations)].sort().join(', ')
+  return `Cannot delete an order whose ${what} IMS recorded as a SHADOW instead of sending (${named}). `
+    + 'The shadow record is kept after the sync log entry has expired, and it says nothing about whether the document exists: the writer that owns this '
+    + 'operation in the current phase may have posted it, so its presence in the accounting system is UNPROVEN. Check the accounting system for it. '
+    + 'If it exists there, it needs an explicit reversal or credit note; either way cancel the order instead of deleting it, which keeps the record.'
 }
 
 /**
@@ -488,6 +503,23 @@ export async function findSalesOrderDeleteBlocker(
     },
   })
 
+  // THE DURABLE SHADOW RECORD (outbound_shadow_writes), asked AFTER the sync rows. A shadowed posting leaves a CANCELLED /
+  // HELD_SHADOW sync row that expires with the retention window (it holds no ledger claim) and a shadow record that persists.
+  // A shadow does not say the document is absent from the ledger - the writer that owns the operation in this phase may have
+  // posted it - so once the sync row is gone THIS record is the only evidence left, and an irreversible delete must still
+  // refuse. Skipped only when a retained sync row already blocked as a shadow (same fact, one sentence).
+  const shadowQueries: ShadowSubjectQuery[] = [
+    { subjectType: SALES_ORDER_REFERENCE_TYPE, exactIds: [orderId] },
+    ...(shipmentIds.length > 0 ? [{ subjectType: SHIPMENT_REFERENCE_TYPE, exactIds: shipmentIds }] : []),
+  ]
+  const retainedShadowRow = candidateDocuments.some((row) => ledgerStanding(row) === 'SHADOW_NOT_SENT_BY_IMS')
+  if (!retainedShadowRow) {
+    const durable = await findDurableShadowRecords(tx, 'xero', shadowQueries)
+    if (durable.length > 0) {
+      blockers.push({ code: 'accounting_shadow_recorded', message: describeDurableShadowBlocker(durable.map((record) => record.operation)) })
+    }
+  }
+
   // Order matters: with several rows, findFirst could return a merely QUEUED one ahead of a
   // POSTED one and advise cancelling a document that is already in the ledger. Posted evidence
   // wins, then asserted claims, then unproven (FAILED / CANCELLED-without-proof), then in-flight,
@@ -711,7 +743,20 @@ export async function findSalesOrderDeleteBlocker(
         settlementBasis: true, abandonedBeforeRemoteCall: true,
       },
     })
-    if (!liveBatch) continue
+    if (!liveBatch) {
+      // The same durable fact for a batch journal: its sync row may be gone, its shadow record persists.
+      const key = dailyBatchDateKey(batch.stagedAt)
+      const bare = key ? `${batch.group}-${key}` : null
+      const durable = await findDurableShadowRecords(tx, 'xero', [{
+        subjectType: DAILY_BATCH_REFERENCE_TYPE,
+        exactIds: [...(batch.persistedRef ? [batch.persistedRef] : []), ...passRefs, ...(bare ? [bare] : [])],
+        idPrefixes: bare ? [`${bare}-`] : [],
+      }])
+      if (durable.length > 0) {
+        blockers.push({ code: 'accounting_shadow_recorded', message: describeDurableShadowBlocker(durable.map((record) => record.operation), `the ${batch.label} daily accounting batch journal`) })
+      }
+      continue
+    }
     const batchStanding = ledgerStanding(liveBatch)
     blockers.push({
       code: 'daily_batch_staged',
@@ -807,6 +852,7 @@ export async function findSalesOrderDeleteBlocker(
     accounting_document_exists: 3,
     daily_batch_staged: 4,
     accounting_sync_live: 5,
+    accounting_shadow_recorded: 5,
     // o3d-2y1c: ranks below the accounting blockers (whose remedies are a ledger reversal or
     // waiting on an in-flight call) and above the WMS ones. A dispatched shipment is a physical
     // fact about goods; a WMS record is a fact about a document, and cancelling resolves the

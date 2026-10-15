@@ -22,6 +22,8 @@ let shadowUpserts = 0
 /** FAILED batch journals the daily run finds, and the ids it puts back to PENDING. */
 let failedBatchLogs: Array<{ id: string; type: string; referenceId: string; payload: Record<string, unknown> }> = []
 const requeued: string[] = []
+/** Rows that become FAILED AFTER the run's read of the FAILED set and BEFORE its write (a concurrent worker). */
+let failedBetweenStatements: Array<{ id: string }> = []
 const activity: Array<Record<string, unknown>> = []
 
 const SHIPMENT = {
@@ -63,7 +65,14 @@ const tx = {
   accountingSyncLog: {
     findMany: async (args?: { where?: { status?: string } }) => (args?.where?.status === 'FAILED' ? failedBatchLogs : []),
     updateMany: async (args: { where: { id?: { in: string[] }; status?: string }; data: { status?: string } }) => {
-      if (args.data?.status === 'PENDING') requeued.push(...(args.where.id?.in ?? []))
+      if (args.data?.status === 'PENDING') {
+        // A statement keyed on ids resets only those ids that are still FAILED; a status-wide statement (no id clause)
+        // resets every row FAILED at the moment it executes, including the one that failed after the read.
+        const stillFailed = [...failedBatchLogs, ...failedBetweenStatements].map((log) => log.id)
+        const reset = args.where.id?.in ? args.where.id.in.filter((id) => stillFailed.includes(id)) : stillFailed
+        requeued.push(...reset)
+        return { count: reset.length }
+      }
       return { count: 0 }
     },
     create: async ({ data }: { data: { type: string; referenceId: string; payload: Record<string, unknown>; status?: string; settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null; errorMessage?: string | null } }) => {
@@ -222,4 +231,21 @@ test('THE RE-QUEUE: the daily run puts a FAILED batch journal back to PENDING wh
     assert.deepEqual(held, [], 'a held batch is not made claimable again')
     assert.deepEqual(granted, ['failed-1'], 'granted, IMS-owned and dated after the cut-off: LIVE, so it is re-queued exactly as with the hold off')
   } finally { failedBatchLogs = [] }
+})
+
+test('DIFFERENTIAL, THE RE-QUEUE UNDER A CONCURRENT WORKER: with the switch OFF a batch row that fails between the read and the write is still reset (the original status-wide statement); with it ON and no grant it is not', async () => {
+  failedBatchLogs = [{ id: 'failed-1', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-01-01-abcd1234', payload: { date: '2026-01-01' } }]
+  failedBetweenStatements = [{ id: 'late-1' }]
+  try {
+    await runBatch({})
+    const off = [...requeued]
+    await runBatch({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' })
+    const held = [...requeued]
+    await runBatch({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: TENANT, XERO_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z' })
+    const granted = [...requeued]
+    console.log(`# concurrent re-queue: precondition rows read=1 late=1; off=${JSON.stringify(off)} enforced-ungranted=${JSON.stringify(held)} granted=${JSON.stringify(granted)}`)
+    assert.deepEqual(off, ['failed-1', 'late-1'], 'switch OFF is byte-identical to before: the status-wide reset takes the row that failed after the read (PRECONDITION: the late row exists and is reset here)')
+    assert.deepEqual(held, [], 'switch ON, no grant: the late row is NOT reset, and neither is the decided-SHADOW row')
+    assert.deepEqual(granted, ['failed-1'], 'switch ON and granted: exactly the decided set is reset; the undecided late row is left for the next run')
+  } finally { failedBatchLogs = []; failedBetweenStatements = [] }
 })

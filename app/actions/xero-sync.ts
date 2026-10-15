@@ -747,6 +747,13 @@ export async function retryFailedXeroSync(
       // o3d-0m56 filter. The fence is run precisely to produce the reason: its CAS cannot match, and
       // it reads the row to say whether the STATUS or the ATTEMPT moved.
       if (entryId === undefined || expectedAttemptRevision === undefined) return { success: true, reset: 0 }
+      // THE PRODUCER-SIDE HOLD: this fence CAS can still land (the row may have failed since the candidate read above), and it
+      // writes PENDING, so the decision is asked on the row's own type and payload BEFORE the write. Held: the row stays FAILED.
+      const lateRow = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { type: true, payload: true } })
+      if (lateRow) {
+        const lateHold = xeroProducerSeamVerdict({ connector: 'xero', type: String(lateRow.type), payload: lateRow.payload })
+        if (lateHold.kind === 'shadow') return { success: false, reset: 0, error: lateHold.notice }
+      }
       const outcome = await applyFencedAttemptDecision(db, {
         id: entryId,
         expectedAttemptRevision,

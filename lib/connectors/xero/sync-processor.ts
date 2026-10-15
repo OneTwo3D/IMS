@@ -1451,7 +1451,14 @@ export async function enqueueFollowUpSyncLog(
       // Serializes this insert/revival against the manual retry's read-then-reset for the same
       // document (o3d-0m56). Money-moving types only; everything else pays nothing.
       await lockFollowUpScope(tx, { connector: XERO_CONNECTOR, type, referenceType, referenceId })
-      if (plan.action === 'reuse') {
+      // THE PRODUCER-SIDE HOLD AT THE REVIVAL. A revival turns a FAILED row PENDING and schedules an outbox job: claimable Xero
+      // work, the thing a SHADOW decision must never create. The decision is asked here, on the payload the revived row would
+      // carry, BEFORE the write. A held revival leaves the FAILED row exactly as it is and falls through to the create path below,
+      // whose primitive asks the same question, records the shadow (CANCELLED / HELD_SHADOW and its durable record) and queues
+      // nothing. The hold's answer is therefore the same whether the follow-up is created or revived.
+      const revivalHeld = plan.action === 'reuse'
+        && xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload: plan.payload }).kind === 'shadow'
+      if (plan.action === 'reuse' && !revivalHeld) {
         if (!reuseAttempt) throw new Error(`Xero follow-up revival for ${plan.syncLogId} reached its write with no attempt to fence on`)
         // Fenced on the ATTEMPT, not on the status: if another run revived the same row first, a
         // worker claimed it, or retention deleted it between the read and here (o3d-nepa), this

@@ -949,6 +949,74 @@ function censusMigrations(failures) {
   return seen.size
 }
 
+
+// ── THE DURABLE-SHADOW CENSUS (producer-side hold, S3) ────────────────────────────────────────────
+//
+// A shadowed posting leaves a CANCELLED / HELD_SHADOW sync row, which retention DELETES after its window (it holds no ledger claim),
+// and an `outbound_shadow_writes` record, which persists. A shadow is not proof that the document is absent from the ledger (the
+// writer that owns the operation in this phase may have posted it), so a reader that would DESTROY the local record of a document
+// must consult the durable record once the row is gone. Every use of a "may have reached the ledger" fragment outside the owning
+// module is therefore declared in SHADOW_READER_DECLARATIONS as one of
+//
+//   DURABLE_SHADOW             the enclosing top-level declaration also calls findDurableShadowRecords (checked on its source text);
+//   EXEMPT                     with a reason (report-only, acts on a row id the caller names, or it IS the retention predicate);
+//   PENDING_CONVERSION:<bead>  a destructive reader that cannot consult it yet, owned by the bead.
+//
+// The reconciliation is universal both ways (an undeclared use, or a declaration nothing matches, fails). Blind spot, plainly: a
+// reader that reaches the fragment through ANOTHER exported constant (UNRESOLVED_ABANDONED_CLAIM_WHERE is the one today, declared)
+// is seen at the constant, not at its users.
+export const SHADOW_FRAGMENTS = new Set(['MAY_HAVE_REACHED_LEDGER_WHERE', 'UNPROVEN_CANCELLED_WHERE', 'UNPROVEN_CANCELLED_EXCEPT_SHADOWS_WHERE'])
+const SHADOW_CLASSES = ['DURABLE_SHADOW', 'EXEMPT']
+const SHADOW_CONSULT = 'findDurableShadowRecords'
+
+export function scanShadowFragmentUses({ program, inScope }) {
+  const uses = []
+  program.getTypeChecker() // binds the tree, which is what sets every node's `parent`
+  for (const sf of program.getSourceFiles()) {
+    const rel = relative(ROOT, sf.fileName)
+    if (!inScope.has(rel) || rel === OWNING_MODULE) continue
+    const visit = (node) => {
+      if (ts.isIdentifier(node) && SHADOW_FRAGMENTS.has(node.text)
+        && !ts.isImportSpecifier(node.parent) && !ts.isExportSpecifier(node.parent)) {
+        let top = node
+        while (top.parent && top.parent !== sf) top = top.parent
+        uses.push({ key: `${rel}::${topLevelDeclName(node, sf)}::${node.text}`, file: rel, text: top.getText(sf) })
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sf)
+  }
+  return uses
+}
+
+export function reconcileShadowReaders(uses, declarations) {
+  const failures = []
+  const byKey = new Map()
+  for (const use of uses) if (!byKey.has(use.key)) byKey.set(use.key, use)
+  const declared = new Map()
+  for (const d of declarations) {
+    if (declared.has(d.key)) failures.push(`duplicate shadow-reader declaration ${d.key}`)
+    declared.set(d.key, d)
+    const known = SHADOW_CLASSES.includes(d.class) || /^PENDING_CONVERSION:o3d-[a-z0-9.]+$/.test(d.class)
+    if (!known) failures.push(`shadow-reader declaration ${d.key} has an unknown class ${JSON.stringify(d.class)}`)
+    if (typeof d.reason !== 'string' || d.reason.trim().length < 20) failures.push(`shadow-reader declaration ${d.key} needs a reason`)
+  }
+  for (const [key, use] of byKey) {
+    const d = declared.get(key)
+    if (!d) {
+      failures.push(
+        `${key} reads a "may have reached the ledger" fragment and is not declared in SHADOW_READER_DECLARATIONS.\n`
+        + `    A destructive reader must also call ${SHADOW_CONSULT} (the durable shadow record outlives the sync row);\n`
+        + `    a report-only or row-scoped one is declared EXEMPT with the reason. Declare this exact site in ${DECLARATIONS_PATH}.`,
+      )
+    } else if (d.class === 'DURABLE_SHADOW' && !use.text.includes(SHADOW_CONSULT)) {
+      failures.push(`${key} is declared DURABLE_SHADOW but its declaration does not call ${SHADOW_CONSULT}: after retention deletes the shadow's sync row it would allow what the shadow record forbids.`)
+    }
+  }
+  for (const key of declared.keys()) if (!byKey.has(key)) failures.push(`stale shadow-reader declaration ${key}: no such use exists`)
+  return failures
+}
+
 /** Sites counted per kind. */
 export function countByKind(sites) {
   const byKind = {}
@@ -1008,6 +1076,20 @@ async function main() {
   }
   if (!Array.isArray(declarations)) { console.error(`${DECLARATIONS_PATH} must export DECLARATIONS as an array`); process.exit(2) }
   failures.push(...reconcile(scan.sites, declarations))
+  // The durable-shadow census runs on any tree that contains the durable-evidence module (this one); a synthetic tree that does not
+  // is exercising the other detectors and has no shadow readers to census.
+  const shadowCensusApplies = inScope.has('lib/domain/outbound-shadow/durable-evidence.ts')
+  let shadowDeclarations = []
+  let shadowUses = []
+  if (shadowCensusApplies) {
+    try {
+      shadowDeclarations = (await import(pathToFileURL(join(ROOT, DECLARATIONS_PATH)).href)).SHADOW_READER_DECLARATIONS
+    } catch { shadowDeclarations = undefined }
+    if (!Array.isArray(shadowDeclarations)) { console.error(`${DECLARATIONS_PATH} must export SHADOW_READER_DECLARATIONS as an array`); process.exit(2) }
+    shadowUses = scanShadowFragmentUses({ program, inScope })
+    if (shadowUses.length < 3) failures.push(`subject not reached: found ${shadowUses.length} use(s) of a may-have-reached-the-ledger fragment and this tree is known to contain at least 3.`)
+    failures.push(...reconcileShadowReaders(shadowUses, shadowDeclarations))
+  }
   const migrations = censusMigrations(failures)
 
   if (failures.length > 0) {
@@ -1029,7 +1111,8 @@ async function main() {
     `OK ledger-standing readers: ${scan.sourceFileCount} source file(s) scanned; ${scan.sites.length} site(s) all declared `
     + `(${clauses} query clause(s), ${comparisons} status comparison(s), ${byKind['id-read'] ?? 0} document-id read(s), `
     + `${aeReads} AccountingEvent POSTED read(s)); ${migrations} migration(s) censused; `
-    + `${scan.reducedRowShapes.size} reduced row shape(s) followed.`,
+    + `${scan.reducedRowShapes.size} reduced row shape(s) followed; ${new Set(shadowUses.map((u) => u.key)).size} durable-shadow reader site(s) all declared (`
+    + `${shadowDeclarations.filter((d) => d.class === 'DURABLE_SHADOW').length} consult the durable record).`,
   )
   console.log(`    by kind: ${Object.entries(byKind).map(([k, v]) => `${k}=${v}`).join(' ')}`)
   console.log(`    by class: ${Object.entries(classes).map(([k, v]) => `${k}=${v}`).join(' ')}`)

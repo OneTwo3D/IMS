@@ -16,6 +16,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { readProducerEnforcement } from '@/lib/security/producer-seam'
 import { createHash } from 'node:crypto'
 
 import { db } from '@/lib/db'
@@ -564,6 +565,49 @@ async function lockAllocationRecords(
 }
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
+  // THE PRODUCER-SIDE HOLD AT THE RE-QUEUE. The verdict is decided FIRST, on the switch and the destination alone.
+  // Not enforced for Xero (the default): the ORIGINAL statements run unchanged - a status-wide reset that takes every
+  // batch row FAILED at execution time, including one that failed after any earlier read - so the switch-off
+  // behaviour is byte-identical to before the hold existed.
+  const enforcement = readProducerEnforcement(process.env)
+  if (!enforcement.enforced || !enforcement.destinations.has(XERO_CONNECTOR)) {
+    await db.$transaction(async (tx) => {
+      const failedLogs = await tx.accountingSyncLog.findMany({
+        where: {
+          connector: XERO_CONNECTOR,
+          type: { in: [...DAILY_BATCH_TYPES] },
+          status: 'FAILED',
+        },
+        select: { referenceId: true },
+      })
+
+      await tx.accountingSyncLog.updateMany({
+        where: {
+          connector: XERO_CONNECTOR,
+          type: { in: [...DAILY_BATCH_TYPES] },
+          status: 'FAILED',
+        },
+        data: {
+          status: 'PENDING',
+          retryCount: 0,
+          errorMessage: null,
+          processingStartedAt: null,
+        },
+      })
+
+      await resetMirroredAccountingEventsToPending(tx, {
+        connector: XERO_CONNECTOR,
+        types: [...DAILY_BATCH_TYPES],
+        referenceType: 'DailyBatch',
+        referenceIds: failedLogs.map((log) => log.referenceId),
+      })
+    })
+    return
+  }
+  // Enforced: each row is decided on its own type and payload, and ONLY the rows decided not-SHADOW are reset. The write
+  // is keyed on that decided set AND on the status still being FAILED (a compare-and-swap per row), so the set that is
+  // reset is exactly the set that was decided; a row that fails after the read is left FAILED for the next run, to be
+  // decided then, rather than reset undecided.
   await db.$transaction(async (tx) => {
     const failed = await tx.accountingSyncLog.findMany({
       where: {
@@ -573,7 +617,6 @@ async function resetFailedDailyBatchLogs(): Promise<void> {
       },
       select: { id: true, type: true, referenceId: true, payload: true },
     })
-    // THE PRODUCER-SIDE HOLD AT THE RE-QUEUE: a failed batch whose decision is SHADOW is not made claimable again.
     const failedLogs = failed.filter((log) => xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type: String(log.type), payload: log.payload }).kind !== 'shadow')
 
     await tx.accountingSyncLog.updateMany({
