@@ -7,6 +7,7 @@ import {
   type Decimal,
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
+import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
 
 // ---------------------------------------------------------------------------
 // Auto-draft supplier credit note for goods returned from a billed PO
@@ -181,7 +182,8 @@ export function computeReturnCreditNoteDraft(input: {
 
   const amountForeign = finalForeign.toNumber()
   const fxRateToBase = toDecimal(targetBill.fxRateToBase).toNumber()
-  const amountBase = roundQuantity(multiplyMoney(finalForeign, targetBill.fxRateToBase), 4).toNumber()
+  // fxRateToBase is foreign units per ONE base unit: DIVIDE (same helper as a manual supplier credit note).
+  const amountBase = supplierCreditNoteAmountBase(finalForeign.toString(), toDecimal(targetBill.fxRateToBase).toString()).toNumber()
 
   return {
     draft: { invoiceId: targetBill.invoiceId, amountForeign, amountBase, fxRateToBase },
