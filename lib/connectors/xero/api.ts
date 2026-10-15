@@ -97,6 +97,12 @@ const XERO_NOT_SENT_STATUS = 0
  *                               WRITE the database, so this is the likeliest throw of the five. Same
  *                               statement as `egress-unauthorised`, and `connectorFetch` is the next
  *                               statement but one.
+ *  • `connection-changed`       (o3d-llyw) the caller required the connection an earlier read was
+ *                               served by (`requireConnection`) and the auth THIS request resolved —
+ *                               after any refresh — names a different tenant or generation. Checked in
+ *                               `xeroFetch` straight after `getAccessToken()` answered, before the
+ *                               request object is built: no token is used, nothing reaches the
+ *                               transport, and the caller's attempt counter does not move.
  *
  * WHERE THE LINE IS DRAWN, AND IT IS DRAWN AT THE SOCKET, NOT AT THE FUNCTION BOUNDARY. Every catch
  * above ends BEFORE the statement that can send. `performRequest` is called outside the
@@ -126,6 +132,15 @@ export type XeroNotSentReason =
   | 'posting-intent-unavailable'
   | 'rate-budget-unavailable'
   | 'egress-authorisation-unavailable'
+  | 'connection-changed'
+
+/**
+ * The Xero connection a caller's earlier READ was served by, which a later WRITE must be built from or
+ * not be sent at all (o3d-llyw: the post fence lifts a hold on an operator ledger check bound to the
+ * connection that answered its probe). Compared with the auth THIS request resolved, before anything is
+ * built — see `connection-changed`.
+ */
+export type RequiredXeroConnection = { tenantId: string; connectionGeneration: string }
 
 /**
  * How the reason travels from `performRequest` (which returns a `Response`) to `xeroFetchWithAuth`
@@ -249,6 +264,18 @@ export type XeroResponse<T = unknown> = {
    * failure. Present on failures too, deliberately: a failed read is still a fact about one org.
    */
   tenantId?: string
+  /**
+   * o3d-llyw (operator ledger check) — THE CONNECTION GENERATION of the token this request was built
+   * from, read in the SAME row read as `tenantId` (`getAccessToken`). Re-minted at every Xero binding
+   * and carried unchanged through refreshes, so two responses naming the same tenant AND generation
+   * were served by one consent, with no reconnect between them — which two tenant ids alone cannot
+   * show (A->B->A). Request-bound for the reason `tenantId` is: a database read after the call is a
+   * resample, not a record.
+   *
+   * `null` when the stored connection predates the column; `undefined` when no request was made.
+   * Read by the settlement probe's connection binding only, which treats both as "cannot say".
+   */
+  connectionGeneration?: string | null
 }
 
 function sleep(ms: number) {
@@ -738,7 +765,7 @@ async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
-  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
+  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string; requireConnection?: RequiredXeroConnection },
 ): Promise<XeroResponse<T>> {
   let auth: Awaited<ReturnType<typeof getAccessToken>>
   try {
@@ -759,6 +786,25 @@ async function xeroFetch<T = unknown>(
     return connectionUnresolvableResponse(error)
   }
   if (!auth) return await notConnectedResponse()
+  // o3d-llyw — A WRITE THAT AN EARLIER READ AUTHORISED IS BUILT FROM THAT READ'S CONNECTION, OR NOT AT ALL.
+  // `getAccessToken()` resolves the connection afresh for every request, and a reconnect (or a refresh
+  // that lands on a rebound row) between the read and this write would otherwise send it under a
+  // different organisation or consent than the one the authorisation was about. Compared here, on the
+  // auth this request will use, and refused before the request object exists.
+  const required = opts?.requireConnection
+  if (required && (auth.tenantId !== required.tenantId || (auth.connectionGeneration ?? null) !== required.connectionGeneration)) {
+    return {
+      ok: false,
+      status: XERO_NOT_SENT_STATUS,
+      error: `The Xero connection changed after this payment was checked against the ledger (checked under `
+        + `organisation ${required.tenantId}, connection ${required.connectionGeneration}; now ${auth.tenantId}, `
+        + `connection ${auth.connectionGeneration ?? '(none)'}). NOTHING WAS SENT — the request was never built. `
+        + 'It is checked again on its next attempt.',
+      notSent: 'connection-changed',
+      tenantId: auth.tenantId,
+      connectionGeneration: auth.connectionGeneration ?? null,
+    }
+  }
   return xeroFetchWithAuth<T>(auth, method, path, body, opts)
 }
 
@@ -767,7 +813,7 @@ async function xeroFetch<T = unknown>(
 // concurrent reconnect between two getAccessToken() calls could store one tenant's response under
 // another tenant's key (o3d-e2j).
 async function xeroFetchWithAuth<T = unknown>(
-  auth: { accessToken: string; tenantId: string },
+  auth: { accessToken: string; tenantId: string; connectionGeneration?: string | null },
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
@@ -818,7 +864,7 @@ async function xeroFetchWithAuth<T = unknown>(
   // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
   if (res.status === XERO_NOT_SENT_STATUS) {
     return {
-      ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId,
+      ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null,
       notSent: xeroNotSentReason(res),
     }
   }
@@ -827,7 +873,7 @@ async function xeroFetchWithAuth<T = unknown>(
     // the fence report it without sending, and Xero itself answers it after a real send. So the tag
     // is what separates them, never the status (o3d-gvzu).
     return {
-      ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId,
+      ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null,
       notSent: xeroNotSentReason(res),
     }
   }
@@ -863,11 +909,11 @@ async function xeroFetchWithAuth<T = unknown>(
     } catch {
       errorMessage += ': ' + (rawBody.slice(0, 1000) || 'Unknown error (empty response body)')
     }
-    return { ok: false, status: res.status, error: errorMessage, tenantId: auth.tenantId }
+    return { ok: false, status: res.status, error: errorMessage, tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null }
   }
 
   const data = await res.json() as T
-  return { ok: true, status: res.status, data, tenantId: auth.tenantId }
+  return { ok: true, status: res.status, data, tenantId: auth.tenantId, connectionGeneration: auth.connectionGeneration ?? null }
 }
 
 /**
@@ -967,7 +1013,7 @@ export async function xeroGet<T = unknown>(
 export async function xeroPost<T = unknown>(
   path: string,
   body: unknown,
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; requireConnection?: RequiredXeroConnection },
 ): Promise<XeroResponse<T>> {
   return xeroFetch<T>('POST', path, body, opts)
 }
@@ -975,7 +1021,7 @@ export async function xeroPost<T = unknown>(
 export async function xeroPut<T = unknown>(
   path: string,
   body: unknown,
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; requireConnection?: RequiredXeroConnection },
 ): Promise<XeroResponse<T>> {
   return xeroFetch<T>('PUT', path, body, opts)
 }

@@ -26,6 +26,8 @@ import {
   settlementMarkerFor,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { effectiveTokenFor, isMoneyMovingSyncType } from '@/lib/domain/accounting/followup-retry-guard'
+import { holdMoneyPostDocumentForTransaction, MONEY_POST_IN_FLIGHT_REFUSAL } from '@/lib/domain/accounting/money-post-lock'
+import { settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { decideSettledRowReconciliation } from '@/lib/domain/accounting/settled-row-reconciliation'
 import {
@@ -812,6 +814,18 @@ export async function reconcileSettledAccountingSyncRow(
         referenceType: row.referenceType,
         referenceId: row.referenceId,
       })
+      // o3d-llyw (Codex r3 on #757): writing a ledger id onto a money row changes what the post fence
+      // reads about it, so this write takes the document's money-post lock without waiting and refuses
+      // while a send for the document is in flight. See holdMoneyPostDocumentForTransaction.
+      if (isMoneyMovingSyncType(row.type) && !(await holdMoneyPostDocumentForTransaction(tx, {
+        connector,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        documentKey: settlementDocumentKey(row.type, row.payload),
+      }))) {
+        return { count: -1 }
+      }
       return tx.accountingSyncLog.updateMany({
         where: { id: entryId, status: 'FAILED' },
         data: {
@@ -822,6 +836,7 @@ export async function reconcileSettledAccountingSyncRow(
         },
       })
     })
+    if (applied.count === -1) return { success: false, error: MONEY_POST_IN_FLIGHT_REFUSAL }
     if (applied.count === 0) {
       return { success: false, error: 'That entry changed while it was being reconciled. Reload and look again.' }
     }

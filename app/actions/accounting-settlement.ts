@@ -42,6 +42,9 @@ import {
   type SettlementUniqueConflictKind,
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { holdMoneyPostDocumentForTransaction, MONEY_POST_IN_FLIGHT_REFUSAL } from '@/lib/domain/accounting/money-post-lock'
+import { settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
+import { isMoneyMovingSyncType } from '@/lib/domain/accounting/followup-retry-guard'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import {
   accountingSyncEnabledSettingKey,
@@ -124,6 +127,8 @@ export type SettlementFailureCode =
    * settled per-attempt", which would be a second wrong absolute in an operator's hands.
    */
   | 'CONNECTOR_STILL_CLAIMABLE'
+  /** o3d-llyw: a payment for this row's document is being authorised and sent right now (money-post lock held). */
+  | 'MONEY_POST_IN_FLIGHT'
 
 export type SettleAccountingSyncRowResult =
   | {
@@ -572,6 +577,24 @@ export async function settleAccountingSyncRow(
           referenceType: row.referenceType,
           referenceId: row.referenceId,
         })
+
+        // 0b. o3d-llyw (Codex r3 on #757) — A MONEY ROW'S SETTLEMENT IS SERIALISED WITH THE POST FENCE.
+        //     Settling a payment row POSTED writes a ledger id onto it, which changes what the post
+        //     fence reads about that attempt (an operator ledger check stops applying to an attempt
+        //     that claims to have posted). The fence holds this document's money-post lock from its
+        //     ledger read to the remote POST; taking the same key here, without waiting, means this
+        //     write cannot commit inside that window. Refused, with nothing written, while a send for
+        //     the document is in flight. Taken before the fence so a refusal touches nothing.
+        if (isMoneyMovingSyncType(row.type)) {
+          const held = await holdMoneyPostDocumentForTransaction(tx, {
+            connector: row.connector,
+            type: row.type,
+            referenceType: row.referenceType,
+            referenceId: row.referenceId,
+            documentKey: settlementDocumentKey(row.type, row.payload),
+          })
+          if (!held) return { settled: false as const, error: MONEY_POST_IN_FLIGHT_REFUSAL, code: 'MONEY_POST_IN_FLIGHT' as const }
+        }
 
         // 1. THE FENCE. Nothing else in this transaction runs unless the decision landed on the
         //    exact attempt the operator judged. On refusal the fence's own message names what moved

@@ -130,7 +130,7 @@ const XERO_EXPECTED_TENANT_KEY = XERO_TENANT_PIN_SETTING_KEY
 const XERO_PIN_RELEASE_WITNESS_KEY = XERO_PIN_RELEASE_WITNESS_SETTING_KEY
 const REFRESH_EARLY_MS = 2 * 60 * 1000
 
-let refreshInFlight: Promise<{ accessToken: string; tenantId: string } | null> | null = null
+let refreshInFlight: Promise<XeroAccessGrant | null> | null = null
 
 function buildBasicAuth(clientId: string, clientSecret: string): string {
   return Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
@@ -810,7 +810,14 @@ async function logStaleRefreshDiscarded(token: StoredAccountingToken): Promise<v
  * Get a valid access token. Auto-refreshes if expired.
  * Returns null if not connected.
  */
-export async function getAccessToken(): Promise<{ accessToken: string; tenantId: string } | null> {
+/**
+ * What a Xero request is built from: the access token, the organisation it is addressed to, and the
+ * connection generation of the token row both came from (o3d-llyw — the settlement probe's connection
+ * binding reads the generation off each response; see `XeroResponse.connectionGeneration`).
+ */
+export type XeroAccessGrant = { accessToken: string; tenantId: string; connectionGeneration: string | null }
+
+export async function getAccessToken(): Promise<XeroAccessGrant | null> {
   const token = await readStoredToken()
   if (!token) return null
   if (!(await storedTenantAllowed(token))) return null
@@ -818,10 +825,10 @@ export async function getAccessToken(): Promise<{ accessToken: string; tenantId:
   if (token.expiresAt < new Date(Date.now() + REFRESH_EARLY_MS)) {
     const refreshed = await refreshToken()
     if (!refreshed) return null
-    return { accessToken: refreshed.accessToken, tenantId: refreshed.tenantId }
+    return { accessToken: refreshed.accessToken, tenantId: refreshed.tenantId, connectionGeneration: refreshed.connectionGeneration }
   }
 
-  return { accessToken: token.accessToken, tenantId: token.tenantId }
+  return { accessToken: token.accessToken, tenantId: token.tenantId, connectionGeneration: token.connectionGeneration }
 }
 
 /**
@@ -1028,7 +1035,7 @@ export async function exchangeCodeForTokens(
 /**
  * Refresh the access token using the refresh_token grant.
  */
-export async function refreshToken(): Promise<{ accessToken: string; tenantId: string } | null> {
+export async function refreshToken(): Promise<XeroAccessGrant | null> {
   if (refreshInFlight) return refreshInFlight
 
   refreshInFlight = (async () => {
@@ -1037,7 +1044,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
     if (!(await storedTenantAllowed(token))) return null
 
     if (token.expiresAt >= new Date(Date.now() + REFRESH_EARLY_MS)) {
-      return { accessToken: token.accessToken, tenantId: token.tenantId }
+      return { accessToken: token.accessToken, tenantId: token.tenantId, connectionGeneration: token.connectionGeneration }
     }
 
     const [clientId, clientSecret] = await Promise.all([
@@ -1099,7 +1106,9 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
         return null
       }
 
-      return { accessToken: data.access_token, tenantId: token.tenantId }
+      // The refresh UPDATE is conditioned on this row's generation (storeRefreshedToken), so the new
+      // token belongs to the same consent: its generation is carried, not re-read.
+      return { accessToken: data.access_token, tenantId: token.tenantId, connectionGeneration: token.connectionGeneration }
     } catch (error) {
       await logRefreshFailure(`Xero token refresh failed: ${String(error)}`)
       return null

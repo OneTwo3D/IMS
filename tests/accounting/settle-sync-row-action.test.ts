@@ -38,6 +38,8 @@ type SyncRow = {
 type EventRow = { id: string; idempotencyKey: string; status: string; externalId: string | null }
 
 const state = {
+  /** o3d-llyw: whether the document's money-post lock is free (a send in flight holds it). */
+  moneyPostFree: true,
   permissions: new Set<string>(['sync']),
   freshAuthFails: false,
   rows: [] as SyncRow[],
@@ -259,6 +261,21 @@ mock.module('@/lib/domain/accounting/followup-scope-lock', {
   },
 })
 
+// o3d-llyw (Codex r3 on #757): the REAL helper issues `pg_try_advisory_xact_lock` on the money-post
+// key (its key and lock space are tested on a real database in
+// tests/concurrency/operator-ledger-check.concurrent.test.ts). Here the double records the CALL and
+// answers whether the lock is free, which is what this action owns: a money row's settlement takes it
+// before the fence writes anything, and refuses while a send holds it.
+mock.module('@/lib/domain/accounting/money-post-lock', {
+  namedExports: {
+    holdMoneyPostDocumentForTransaction: async (_tx: unknown, document: { connector: string; type: string; documentKey: string }) => {
+      state.ops.push(`holdMoneyPost:${document.connector}:${document.type}:${document.documentKey}`)
+      return state.moneyPostFree
+    },
+    MONEY_POST_IN_FLIGHT_REFUSAL: 'A payment for this document is being checked and sent to the accounting system right now, so nothing was recorded.',
+  },
+})
+
 mock.module('@/lib/integration-plugins', {
   namedExports: {
     isIntegrationPluginEnabled: async (id: string) => state.activeConnector === id,
@@ -333,6 +350,7 @@ test.beforeEach(() => {
   // quiesced — which is what every adoption test below assumes. The tests that care set it.
   state.syncEnabled = new Set()
   state.ops = []
+  state.moneyPostFree = true
 })
 
 // ---------------------------------------------------------------------------
@@ -1330,4 +1348,22 @@ test('[archived] and the ONLY difference is whether THIS BUILD services the conn
   assert.equal(stored().status, 'FAILED', 'nothing was written')
   assert.equal(stored().attemptRevision, 0)
   assert.equal(settlementAudit().length, 0)
+})
+
+test('[o3d-llyw Codex r3] a money row\'s settlement takes the document\'s money-post lock BEFORE the fence, and refuses while a send holds it', async () => {
+  const settle = await loadAction()
+  const free = await settle('log-1', posted())
+  assert.equal(free.success, true, 'precondition: with the lock free the settlement lands')
+  assert.ok(state.ops.some((op) => op.startsWith('holdMoneyPost:xero:INVOICE_PAYMENT:')), `the lock is asked for (${state.ops.join(', ')})`)
+
+  state.rows = [syncRow()]
+  state.ops = []
+  state.moneyPostFree = false
+  const busy = await settle('log-1', posted())
+  console.log(`[precondition] settlement with a send in flight: ${JSON.stringify(busy)}`)
+  assert.equal(busy.success, false)
+  assert.equal('code' in busy ? busy.code : null, 'MONEY_POST_IN_FLIGHT')
+  const row = stored()
+  assert.equal(row.status, 'FAILED', 'nothing was written')
+  assert.equal(row.externalTransactionId ?? null, null)
 })

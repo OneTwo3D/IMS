@@ -150,8 +150,45 @@ export type LedgerSettlementProbe =
        * `tenantId` its request went out under, and QuickBooks resolves a `realmId` per request that
        * `QboResponse` currently discards. bd o3d-llyw carries that design.
        */
+      /**
+       * WHICH CONNECTION SERVED EVERY FETCH THIS ANSWER WAS BUILT FROM — or absent/null when that
+       * cannot be stated (an operator ledger check, lib/domain/accounting/operator-ledger-check.ts).
+       *
+       * REQUEST-BOUND, NOT SNAPSHOT-BOUND, which is the whole difference from the r5 field above. Each
+       * Xero response carries the tenant id AND the connection generation of the very token row its
+       * request was built from (`XeroResponse.tenantId` / `.connectionGeneration`, read in one SELECT
+       * by `getAccessToken`). The probe states a binding only when EVERY fetch it made reports the
+       * same non-null pair; a generation is re-minted at every binding, so an A->B->A reconnect
+       * between two fetches makes them disagree and the answer is null.
+       *
+       * It grants nothing by itself and nothing reads it except the operator-ledger-check rule, which
+       * reads absent and null alike as "no check applies" — the withholding direction. Optional so
+       * that every probe built without it (a test double, a future connector) withholds by default.
+       */
+      answeredBy?: ProbeConnectionBinding | null
     }
   | { ok: false; reason: string }
+
+/**
+ * The Xero connection (organisation + consent generation) a probe's fetches were all served by. Both
+ * halves non-empty; see `LedgerSettlementProbe.answeredBy`.
+ */
+export type ProbeConnectionBinding = { tenantId: string; connectionGeneration: string }
+
+/**
+ * A SETTLEMENT RECORD THIS MODULE CANNOT MEASURE: its amount or its date is unreadable, so nothing the
+ * record itself says can rule it out as a given attempt. ONE predicate, used by the classifier below
+ * and by the operator-ledger-check rule, so the set a check must cover is exactly the set that
+ * withholds.
+ */
+export function isUnmeasurableSettlementRecord(record: LedgerSettlementRecord): boolean {
+  return measuredSettlement(record) === null
+}
+
+/** The record's amount and date when BOTH are readable; null = unmeasurable. The one spelling of it. */
+function measuredSettlement(record: LedgerSettlementRecord): { amount: Decimal; date: string } | null {
+  return record.amount === null || record.date === null ? null : { amount: record.amount, date: record.date }
+}
 
 /** What a row's stored payload says its attempt sent. */
 export type AttemptDescription = {
@@ -604,7 +641,8 @@ export function classifyLedgerSettlement(
   // is gone; see the note above `classifyLedgerSettlement` for the four rounds that narrowed it and
   // the two pieces of evidence it turned out to need and never had.
   for (const record of probe.records) {
-    if (record.amount === null || record.date === null) {
+    const measured = measuredSettlement(record)
+    if (measured === null) {
       return {
         outcome: 'unknown',
         cause: 'record-unmeasurable',
@@ -633,12 +671,12 @@ export function classifyLedgerSettlement(
     // rule is the one that posts a second payment. Nothing is converted now: the attempt carries its
     // payload's exact decimal, the record carries the ledger's stated figure, and the band stays a
     // `Decimal` all the way into the comparison.
-    if (compareDecimal(subtractMoney(record.amount, attempt.amount).abs(), ledgerMatchEpsilon(attempt.currency)) <= 0
-      && record.date === attempt.date) {
+    if (compareDecimal(subtractMoney(measured.amount, attempt.amount).abs(), ledgerMatchEpsilon(attempt.currency)) <= 0
+      && measured.date === attempt.date) {
       return {
         outcome: 'present',
         matchedId: record.id ?? null,
-        detail: `${money(record.amount)} dated ${record.date}`
+        detail: `${money(measured.amount)} dated ${measured.date}`
           + (record.id ? ` (${record.id})` : ''),
       }
     }

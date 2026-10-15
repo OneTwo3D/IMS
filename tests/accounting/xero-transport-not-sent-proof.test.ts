@@ -517,7 +517,7 @@ test('o3d-gvzu: the tag is written at the refusal sites and never inferred downs
   const journals = readFileSync('lib/connectors/xero/journals.ts', 'utf8')
   const processor = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
 
-  // Exactly ten members, so adding an eleventh is a deliberate act that has to be argued for (the tenth,
+  // Exactly eleven members (o3d-llyw added the eleventh, below), so adding another is a deliberate act that has to be argued for (the tenth,
   // 'outbound-write-held', is the outbound-write hold: a refusal above the retry loop, before any budget
   // is spent or any request built for the socket). FOUR
   // RETURNS and FIVE THROWS, and the pairing is the argument (o3d-2w2j r2): every pre-request
@@ -531,7 +531,18 @@ test('o3d-gvzu: the tag is written at the refusal sites and never inferred downs
     "'no-connection'", "'posting-intent-refused'", "'egress-unauthorised'", "'outbound-write-held'", "'rate-budget-refused'",
     "'connection-unresolvable'", "'request-unbuildable'", "'posting-intent-unavailable'",
     "'rate-budget-unavailable'", "'egress-authorisation-unavailable'",
+    // o3d-llyw (Codex r4 on #757) — the ELEVENTH, argued: written at exactly ONE return, in `xeroFetch`,
+    // straight after `getAccessToken()` answered and BEFORE `xeroFetchWithAuth` builds anything. It refuses
+    // a write whose caller required the connection an earlier read was served by, when this request's
+    // own auth names another. Pinned below to that one site and that position.
+    "'connection-changed'",
   ])
+  const fetchFn = api.slice(api.indexOf('async function xeroFetch<'), api.indexOf('async function xeroFetchWithAuth<'))
+  assert.equal((api.match(/notSent: 'connection-changed'/g) ?? []).length, 1, 'connection-changed is written at ONE site')
+  assert.ok(fetchFn.indexOf("notSent: 'connection-changed'") > fetchFn.indexOf('auth = await getAccessToken()'),
+    'after the auth this request will use is resolved')
+  assert.ok(fetchFn.indexOf("notSent: 'connection-changed'") < fetchFn.indexOf('return xeroFetchWithAuth<T>(auth, method, path, body, opts)'),
+    'and before anything is built or sent')
   assert.ok(!/'timeout'|'reset'|'5xx'|'server-error'|'unknown'/.test(api),
     'there must be no member for a case where the request may have arrived')
 
