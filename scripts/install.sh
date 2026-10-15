@@ -11036,7 +11036,7 @@ bootstrap_managed_crontab_block_locked() {
     # service does not reconcile the crontab). So the legacy job lines are rewritten IN PLACE, under this lock, keeping
     # each job's schedule, slug, log path and secret source, and the result is re-read and verified. A block that cannot
     # be rewritten this way ends the run: CRON_LEGACY_STATE=failed, acted on by the caller.
-    rewrite_legacy_cron_block_in_hand "${existing}" || return 1
+    rewrite_legacy_cron_block_locked "${existing}" || return 1
     if [[ "${CRON_LEGACY_STATE}" == "migrated" ]]; then
       success "Rewrote the managed cron jobs so the secret is no longer on curl's command line (schedules unchanged)."
     fi

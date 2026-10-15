@@ -1822,7 +1822,7 @@ require_port_drained() {
 # rewrite ran in install.sh only, so a host upgraded through update.sh or deploy.sh kept every old `curl -H "Authorization:
 # Bearer $CRON_SECRET"` job, and each run showed the bearer to every local account in `ps`). The rewrite is done under
 # the crontab lock by migrate_legacy_cron_block_locked; update.sh and deploy.sh call ensure_cron_bearer_off_argv after
-# their cron restore, and install.sh calls rewrite_legacy_cron_block_in_hand from its bootstrap.
+# their cron restore, and install.sh calls rewrite_legacy_cron_block_locked from its bootstrap.
 
 # THE JOB COMMAND, WITH THE BEARER OFF THE COMMAND LINE (o3d-kb3dq). It used to be `curl -H "Authorization: Bearer
 # $CRON_SECRET"`, which expands the secret into curl's argv for as long as a job runs, readable by every local account
@@ -1832,8 +1832,10 @@ require_port_drained() {
 # in-app scheduler (tests/scripts/installer-secrets-argv.test.ts renders both and compares them byte for byte).
 cron_job_command_into() {
   local slug="$2" logfile="$3" envfile="$4" template command="" dollar='$'
-  IFS= read -r -d '' template <<'EOF' || true
-case "$CRON_SECRET" in ''|*\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); @SLUG@ was not run" ;; *) echo "header = \"Authorization: Bearer $CRON_SECRET\"" | curl -sf -o /dev/null -K - "$BASE_URL/@SLUG@" ;; esac >> '@LOG@' 2>&1
+  # An UNQUOTED heredoc, so that every dollar that must reach the crontab is written \$ (the deploy-order scan of what a
+  # script expands reads a bare $NAME as an expansion, and here none is one) and the doubled backslash is \\\\.
+  IFS= read -r -d '' template <<EOF || true
+case "\$CRON_SECRET" in ''|*\\\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); @SLUG@ was not run" ;; *) echo "header = \"Authorization: Bearer \$CRON_SECRET\"" | curl -sf -o /dev/null -K - "\$BASE_URL/@SLUG@" ;; esac >> '@LOG@' 2>&1
 EOF
   template="${template%$'\n'}"
   # NO PATTERN REPLACEMENT FOR A SUBSTITUTED VALUE (Codex round 3 HIGH). `${template//@LOG@/${logfile}}` treats the VALUE as a
@@ -1871,7 +1873,7 @@ cron_job_command() {
 # schedules alone), so without this a reinstall would complete with every old job still exposing the secret. The rewrite is
 # LINE-WISE: each legacy job keeps its schedule fields (with their spacing), its slug, its log path and its secret source;
 # only the command changes to the stdin form. Anything else in the block, and everything outside it, is untouched.
-CRON_LEGACY_SIGNATURE='-H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/'
+CRON_LEGACY_SIGNATURE='-H "Authorization: Bearer '\$'CRON_SECRET" "'\$'BASE_URL/'
 CRON_LEGACY_LEFT=0
 
 # Rewrite every legacy job line INSIDE a managed block of the crontab text ${1}, into CRON_MIGRATED_TEXT (a variable, not
@@ -1930,7 +1932,7 @@ CRON_LEGACY_STATE=none
 # Rewrite the legacy job lines of the managed block in the crontab text ${1} (which holds a START marker and was read
 # UNDER the crontab lock by the caller), write it, RE-READ and verify. Sets CRON_LEGACY_STATE; on failure also
 # CRONTAB_WRITE_REASON, and returns 1. Returns 0 with state none when there is nothing to rewrite.
-rewrite_legacy_cron_block_in_hand() {
+rewrite_legacy_cron_block_locked() {
   local existing="$1"
   count_legacy_cron_lines "${existing}"
   if [[ "${CRON_LEGACY_COUNT}" -gt 0 ]]; then
@@ -1970,7 +1972,7 @@ migrate_legacy_cron_block_locked() {
   }
   if ! ${CRONTAB_READ_PRESENT}; then return 0; fi
   grep -qE '^# --- OTI CRON START ---[ \t\r]*$' <<< "${CRONTAB_READ_TEXT}" || return 0
-  rewrite_legacy_cron_block_in_hand "${CRONTAB_READ_TEXT}"
+  rewrite_legacy_cron_block_locked "${CRONTAB_READ_TEXT}"
 }
 
 # Refuse to report completion while the managed block still holds the old lines. Unless the rewrite is known to have

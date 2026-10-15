@@ -456,7 +456,7 @@ function runBootstrap(dir: string, crontab: string, opts: { failWrite?: boolean;
     shippedFunction(CRONLIB, 'cron_job_command_into') + '\n' + shippedFunction(CRONLIB, 'cron_job_command'),
     shippedFunction(CRONLIB, 'migrate_legacy_cron_lines'),
     shippedFunction(CRONLIB, 'count_legacy_cron_lines'),
-    shippedFunction(CRONLIB, 'rewrite_legacy_cron_block_in_hand'),
+    shippedFunction(CRONLIB, 'rewrite_legacy_cron_block_locked'),
     shippedFunction(INSTALL, 'bootstrap_managed_crontab_block_locked'),
     'bootstrap_managed_crontab_block_locked; rc=$?',
     'echo "rc=${rc} state=${CRON_LEGACY_STATE}"',
@@ -550,7 +550,7 @@ test('[o3d-kb3dq] MUTATION: skipping the block whenever one exists (trunk behavi
       'info() { :; }; success() { :; }', 'read_crontab_for() { CRONTAB_READ_TEXT="$(cat "$FAKE")"; }', 'write_crontab_for() { printf \'%s\\n\' "$2" > "$FAKE"; }',
       "CRON_LEGACY_SIGNATURE='-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/'; CRON_LEGACY_LEFT=0",
       shippedFunction(CRONLIB, 'cron_job_command_into') + '\n' + shippedFunction(CRONLIB, 'cron_job_command_into'), shippedFunction(CRONLIB, 'cron_job_command'), shippedFunction(CRONLIB, 'migrate_legacy_cron_lines'), shippedFunction(CRONLIB, 'count_legacy_cron_lines'),
-      shippedFunction(mutated, 'rewrite_legacy_cron_block_in_hand'), shippedFunction(INSTALL, 'bootstrap_managed_crontab_block_locked'), 'bootstrap_managed_crontab_block_locked'].join('\n')
+      shippedFunction(mutated, 'rewrite_legacy_cron_block_locked'), shippedFunction(INSTALL, 'bootstrap_managed_crontab_block_locked'), 'bootstrap_managed_crontab_block_locked'].join('\n')
     spawnSync('bash', ['-c', script], { encoding: 'utf8' })
     const after = readFileSync(fake, 'utf8')
     console.log(`  mutated bootstrap: legacy lines left in the crontab: ${after.split('-H "Authorization').length - 1}`)

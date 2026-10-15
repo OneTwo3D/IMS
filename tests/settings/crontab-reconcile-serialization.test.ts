@@ -5884,6 +5884,8 @@ test('[o3d-batch-ret] the roster of bodies the lock wrapper disarms errexit for 
     'scripts/install.sh:restore_cron_from_backup_locked',
     'scripts/install.sh:resume_restore_cron_locked',
     'scripts/install.sh:unfence_cron_locked',
+    'scripts/lib/crontab-lock.sh:migrate_legacy_cron_block_locked',
+    'scripts/lib/crontab-lock.sh:rewrite_legacy_cron_block_locked',
     'scripts/update.sh:adopt_cron_fence_locked',
     'scripts/update.sh:fence_cron_locked',
     'scripts/update.sh:restore_cron_from_backup_locked',
@@ -5909,10 +5911,11 @@ test('[o3d-batch-ret] no `*_locked` body writes the crontab except through the o
     + 'so every call must take its status')
 
   // NOT VACUOUS. The walk reached the files, found the bodies, and found writes in them.
-  assert.equal(ALL_LOCKED_BODIES.length, 15)
+  assert.equal(ALL_LOCKED_BODIES.length, 17)
   const writes = ALL_LOCKED_BODIES.flatMap((b) => b.lines.filter(
     (l) => !isComment(l) && /\bwrite_crontab_for\b/.test(l)))
-  // 14: the installer's bootstrap now has a second write (the in-place rewrite of legacy cron job lines, o3d-kb3dq)
+  // 14: the in-place rewrite of legacy cron job lines (o3d-kb3dq) is a write too; it lives once in the shared library
+  // (rewrite_legacy_cron_block_locked, run under the lock by the installer's bootstrap, update.sh and deploy.sh)
   assert.equal(writes.length, 14,
     'every crontab write in the three entrypoints must be one of these; a count that drifted '
     + 'means a site was added or removed without this test being read')

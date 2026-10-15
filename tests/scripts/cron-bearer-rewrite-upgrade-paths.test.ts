@@ -239,11 +239,11 @@ test('[o3d-kb3dq] MUTATION (lib): the refusal turned into a pass leaves a comple
 })
 
 test('[o3d-kb3dq] install.sh keeps its own use of the shared functions (no private copy to drift)', () => {
-  for (const name of ['cron_job_command_into', 'migrate_legacy_cron_lines', 'count_legacy_cron_lines', 'rewrite_legacy_cron_block_in_hand', 'die_if_legacy_cron_lines_remain']) {
+  for (const name of ['cron_job_command_into', 'migrate_legacy_cron_lines', 'count_legacy_cron_lines', 'rewrite_legacy_cron_block_locked', 'die_if_legacy_cron_lines_remain']) {
     assert.ok(!INSTALL.includes(`\n${name}() {`), `install.sh does not define ${name}`)
     assert.equal(CRONLIB.split(`\n${name}() {`).length - 1, 1, `the lib defines ${name} once`)
   }
-  assert.ok(INSTALL.includes('rewrite_legacy_cron_block_in_hand "${existing}"'))
+  assert.ok(INSTALL.includes('rewrite_legacy_cron_block_locked "${existing}"'))
   assert.ok(INSTALL.includes('die_if_legacy_cron_lines_remain "this installer"'))
 })
 
