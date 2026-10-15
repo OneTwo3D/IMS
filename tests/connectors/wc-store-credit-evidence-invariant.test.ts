@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { planWcOrderCoupons, wcUpdateNeedsStoreCreditReview } from '@/lib/connectors/woocommerce/sync/coupon-classification'
+import { planWcOrderCoupons, WC_UNMODELLED_CREDIT_META_KEYS, wcUpdateNeedsStoreCreditReview } from '@/lib/connectors/woocommerce/sync/coupon-classification'
 import { resolveWcOrderLevelDiscount } from '@/lib/connectors/woocommerce/sync/field-mapping'
-import type { WcCouponLine, WcMeta } from '@/lib/connectors/woocommerce/sync/types'
+import type { WcCouponLine, WcFeeLine, WcMeta } from '@/lib/connectors/woocommerce/sync/types'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
@@ -24,7 +24,7 @@ const meta = (key: string, value: unknown): WcMeta => ({ id: id++, key, value } 
 const INFO_OK = '[1,"sc","smart_coupon","50"]'
 const DATA_OK = { id: 1, discount_type: 'smart_coupon' }
 
-type Payload = { coupon_lines: WcCouponLine[]; meta_data: WcMeta[] }
+type Payload = { coupon_lines: WcCouponLine[]; meta_data: WcMeta[]; fee_lines?: WcFeeLine[] }
 type Baseline = { name: string; credit: number; build: (mutate?: (p: Payload) => void) => Payload }
 
 function creditLine(over: Partial<WcCouponLine> & { discount?: unknown; discount_tax?: unknown } = {}, metaData?: WcMeta[]): WcCouponLine {
@@ -143,7 +143,8 @@ const WALLET_SHAPES: Array<[string, unknown, boolean]> = [
   ['null', null, false], ["'abc'", 'abc', false], ['[]', [], false], ['{}', {}, false], ['[1]', [1], false], ['-1', -1, false],
   ['NaN', Number.NaN, false], ['5', 5, false], ["'10.00'", '10.00', false], ['1e30', 1e30, false], ['object', { a: 1 }, false],
 ]
-for (const key of ['_used_wallet_amount', '_ywgc_applied_gift_cards_total', '_store_credit_used']) {
+// EVERY key the classifier lists, not a sample: a key dropped from the list is a red row.
+for (const key of WC_UNMODELLED_CREDIT_META_KEYS) {
   for (const [label, value, ok] of WALLET_SHAPES) add(key, label, setWallet(key, value), () => ok)
 }
 
@@ -189,11 +190,28 @@ const AMOUNT_CASES: Array<[string, Array<[string, string, string]>, Record<strin
 ]
 for (const [label, lines, contribution, clean, credit] of AMOUNT_CASES) add('amount', label, setAmounts(lines, contribution), (b) => b === CREDIT && clean, credit)
 
+// ---- F8: fee lines (wallet plugins apply credit as a NEGATIVE fee named for the wallet) ----
+const setFee = (name: string, total: unknown, total_tax: unknown) => (p: Payload) => { p.fee_lines = [{ id: id++, name, total, total_tax } as unknown as WcFeeLine] }
+const FEE_CASES: Array<[string, string, unknown, unknown, boolean]> = [
+  ['Store credit, -10.00', 'Store credit', '-10.00', '0.00', false],
+  ['Via wallet, -5 net, -1 tax', 'Via wallet', '-5.00', '-1.00', false],
+  ['Gift card, tax only negative', 'Gift Card', '0.00', '-1.00', false],
+  ['Partial payment (wallet), number -3', 'Partial payment (wallet)', -3, 0, false],
+  ['Wallet, unreadable total', 'Wallet', 'abc', '0.00', false],
+  ['Gift certificate, unreadable tax', 'Gift certificate', '-1.00', 'x', false],
+  ['Wallet, zero amounts', 'Wallet', '0.00', '0.00', true],
+  ['Wallet top-up fee, positive', 'Wallet top-up', '5.00', '1.00', true],
+  ['plain "Handling" negative adjustment', 'Handling adjustment', '-5.00', '-1.00', true],
+  ['plain "Packaging" positive', 'Packaging', '2.00', '0.40', true],
+]
+for (const [label, name, total, tax, clean] of FEE_CASES) add('fee_lines', label, setFee(name, total, tax), () => clean)
+
 function importOutcome(b: Baseline, payload: Payload): { refused: boolean; credit: number } {
   const lineDiscount = payload.coupon_lines.reduce((s, l) => s + (Number.isFinite(Number(l.discount)) ? Number(l.discount) : 0) * 0, 0)
   const result = planWcOrderCoupons({
     couponLines: payload.coupon_lines,
     orderMeta: payload.meta_data,
+    feeLines: payload.fee_lines,
     // Woo allocated every genuine coupon into the lines; the credit is NOT in them. The residual is therefore 0 for genuine coupons.
     lineDiscountTotalForeign: toDecimal(payload.coupon_lines.filter((l) => !/sc|storecredit/.test(String(l.code))).reduce((s, l) => s + (Number(l.discount) || 0), 0) + lineDiscount),
     currency: 'GBP',

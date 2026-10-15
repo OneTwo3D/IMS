@@ -415,3 +415,37 @@ test('ORPHAN SIGNALS: a contribution without its coupon line, a wallet record, a
   console.log(`PRECONDITION orphan-signal table (${table.length} rows):\n  ${table.join('\n  ')}`)
   assert.equal(table.length, rows.length)
 })
+
+// ---------------------------------------------------------------------------------------------------
+// An order with NO credit: a total BELOW lines + tax + shipping is money taken off by a means IMS cannot see.
+// ---------------------------------------------------------------------------------------------------
+
+test('NO-CREDIT order: a shortfall against the components is refused, an exact or higher total is not', () => {
+  const base = { subtotalForeign: toDecimal(100), taxForeign: toDecimal(20), shippingForeign: toDecimal(10), orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(0), currency: 'GBP', shortfallOnly: true }
+  const rows: string[] = []
+  const cases: Array<[string, number, boolean]> = [['exact 130.00', 130, true], ['storage noise 129.998', 129.998, true], ['a penny short 129.99', 129.99, false], ['10 short 120', 120, false], ['a penny over 130.01 (not credit-shaped)', 130.01, true], ['much higher 150', 150, true]]
+  for (const [label, total, ok] of cases) {
+    const r = checkWcStoreCreditReconciles({ ...base, orderTotalForeign: toDecimal(total) })
+    rows.push(`${label} => ${r.ok ? 'accepted' : 'REFUSED'}`)
+    assert.equal(r.ok, ok, label)
+  }
+  // eslint-disable-next-line no-console
+  console.log(`PRECONDITION no-credit shortfall table: ${JSON.stringify(rows)}`)
+  assert.equal(rows.length, 6)
+  // and the symmetric (credit) form is unchanged: a higher total IS refused when there is credit.
+  assert.equal(checkWcStoreCreditReconciles({ ...base, shortfallOnly: false, orderTotalForeign: toDecimal(150) }).ok, false)
+})
+
+test('importWcOrder: the total reconciliation also runs for an order with no credit (shortfall only), before the create', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  const body = src.slice(src.indexOf('export async function importWcOrder('))
+  const gate = body.indexOf('if (hasCredit || totalReported) {')
+  const create = body.indexOf('tx.salesOrder.create({')
+  // eslint-disable-next-line no-console
+  console.log(`PRECONDITION no-credit reconciliation wiring: ${JSON.stringify({ gate, create })}`)
+  assert.ok(gate > 0 && create > gate, 'the gate exists and precedes the order create')
+  assert.match(body, /shortfallOnly: !hasCredit,/)
+  assert.match(body, /feeLines: wcOrder\.fee_lines,/, 'fee lines reach the classifier on import')
+  assert.match(src, /classifyWcCouponLines\(wcOrder\.coupon_lines \?\? \[\], wcOrder\.meta_data, wcOrder\.fee_lines\)/, 'and on the update path')
+})

@@ -30,7 +30,7 @@
 
 import { addMoney, currencyMinorUnits, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
-import type { WcCouponLine, WcFullOrder, WcMeta } from './types'
+import type { WcCouponLine, WcFeeLine, WcFullOrder, WcMeta } from './types'
 
 /** The discount types that are GENUINE discounts: Woo has already reduced the line totals by them. */
 export const WC_GENUINE_DISCOUNT_TYPES: ReadonlySet<string> = new Set([
@@ -314,7 +314,7 @@ function classifyOne(line: WcCouponLine, contributionCodes: Set<string>, problem
  * `meta_data`. A non-empty `signalProblems` means the order is not cleanly assessable: refuse it on import, hold it
  * for review on update.
  */
-export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: WcMeta[]): ClassifiedWcCoupons {
+export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: WcMeta[], feeLines?: WcFeeLine[]): ClassifiedWcCoupons {
   const problems: Problem[] = []
   const record = readStoreCreditContributionRecord(orderMeta)
   const contributionCodes = new Set(record.entries.map((c) => c.code))
@@ -341,6 +341,24 @@ export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: W
       code: c.code,
       why: `smart_coupons_contribution records ${c.amount.toString()} for it but its coupon line(s) carry ${lineGross.toString()} (discount + discount_tax); IMS will not choose which is the amount paid by store credit`,
     })
+  }
+  // FEE LINES: wallet plugins (TeraWallet and the like) apply credit as a NEGATIVE fee line named for the wallet. A
+  // negative (or unreadable) fee that says store credit / gift card / wallet is credit under another field: refused.
+  // A plainly named negative fee (an ordinary adjustment) is not credit evidence and is carried as before.
+  for (const fee of feeLines ?? []) {
+    const name = String(fee?.name ?? '')
+    if (!CREDIT_WORDS.test(name)) continue
+    const total = parseMoney(fee.total)
+    const totalTax = parseMoney(fee.total_tax)
+    const unreadable = total === null || totalTax === null
+    if (unreadable || total.isNegative() || totalTax.isNegative()) {
+      problems.push({
+        code: name.trim() || '(fee line)',
+        why: unreadable
+          ? 'a fee line named for store credit / gift card / wallet has an amount IMS cannot read'
+          : `a fee line named for store credit / gift card / wallet reduces the order by ${total.add(totalTax).toString()}, which IMS does not model as a fee`,
+      })
+    }
   }
   for (const key of WC_UNMODELLED_CREDIT_META_KEYS) {
     for (const entry of (orderMeta ?? []).filter((m) => m.key === key)) {
@@ -375,11 +393,11 @@ export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: W
  * amount). The stored credit itself is never changed.
  */
 export function wcUpdateNeedsStoreCreditReview(
-  payload: { coupon_lines?: WcCouponLine[]; meta_data?: WcMeta[] },
+  payload: { coupon_lines?: WcCouponLine[]; meta_data?: WcMeta[]; fee_lines?: WcFeeLine[] },
   stored: { storeCreditForeign: unknown; storeCreditAssessment: unknown },
 ): boolean {
   if (stored.storeCreditAssessment === 'REVIEW_REQUIRED') return false // already held
-  const classified = classifyWcCouponLines(payload.coupon_lines ?? [], payload.meta_data)
+  const classified = classifyWcCouponLines(payload.coupon_lines ?? [], payload.meta_data, payload.fee_lines)
   if (classified.signalProblems.length > 0) return true
   const credit = roundQuantity(classified.creditGross, 4)
   if (!credit.gt(0)) return false
@@ -438,6 +456,7 @@ export type WcCouponPlan = {
 export function planWcOrderCoupons(input: {
   couponLines: WcCouponLine[]
   orderMeta: WcMeta[] | undefined
+  feeLines?: WcFeeLine[]
   lineDiscountTotalForeign: Decimal
   currency: string
   resolveResidual: (args: { couponTotalForeign: Decimal; lineDiscountTotalForeign: Decimal; currency: string }) => {
@@ -445,7 +464,7 @@ export function planWcOrderCoupons(input: {
     unallocated: number
   }
 }): WcCouponPlan {
-  const classified = classifyWcCouponLines(input.couponLines, input.orderMeta)
+  const classified = classifyWcCouponLines(input.couponLines, input.orderMeta, input.feeLines)
   const { orderLevelDiscount, unallocated } = input.resolveResidual({
     couponTotalForeign: classified.genuineNet,
     lineDiscountTotalForeign: input.lineDiscountTotalForeign,
@@ -504,6 +523,11 @@ export function checkWcStoreCreditReconciles(input: {
   storeCreditForeign: Decimal
   orderTotalForeign: Decimal
   currency: string
+  /**
+   * TRUE for an order with NO credit: only a total LOWER than the components (money taken off by a means IMS cannot
+   * see) fails; a higher total is not credit-shaped and is left to the existing document checks.
+   */
+  shortfallOnly?: boolean
 }): { ok: true } | { ok: false; difference: Decimal; tolerance: Decimal } {
   const expected = input.subtotalForeign
     .add(input.taxForeign)
@@ -518,7 +542,8 @@ export function checkWcStoreCreditReconciles(input: {
   // line totals (it would be subtracted twice and land inside the allowance), which sends the warehouse a
   // reduced goods value. An order that is genuinely a minor unit out is refused for an operator to look at.
   const tolerance = toDecimal(10).pow(-currencyMinorUnits(input.currency)).div(4)
-  return difference.abs().lt(tolerance) ? { ok: true } : { ok: false, difference, tolerance }
+  const within = input.shortfallOnly ? difference.lt(tolerance) : difference.abs().lt(tolerance)
+  return within ? { ok: true } : { ok: false, difference, tolerance }
 }
 
 /**

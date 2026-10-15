@@ -787,7 +787,7 @@ export async function updateExistingWcOrderFromPayload(
   // credit, that the row does not account for (an order older than the credit-aware import, a coupon changed
   // in WooCommerce after import), the order is put in REVIEW_REQUIRED, which every posting boundary and the
   // warehouse push refuse. Nothing is restated.
-  const reclassified = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data)
+  const reclassified = classifyWcCouponLines(wcOrder.coupon_lines ?? [], wcOrder.meta_data, wcOrder.fee_lines)
   const payloadCredit = reclassified.creditGross
   const payloadHasCreditConflict = reclassified.signalProblems.length > 0
   let reviewFlagged = false
@@ -2061,6 +2061,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const couponPlan = planWcOrderCoupons({
       couponLines: wcOrder.coupon_lines,
       orderMeta: wcOrder.meta_data,
+      feeLines: wcOrder.fee_lines,
       lineDiscountTotalForeign,
       // o3d-5tf: the allocation tolerance is half a MINOR UNIT of this order's currency, not a
       // hard-coded half-penny — a WooCommerce store can run a 0- or 3-decimal currency.
@@ -2140,7 +2141,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // order-level discount - credit must be the total Woo reports. If it is not (Smart Coupons' "apply
     // before tax" mode reduces the lines too, or the order carries an amount nobody modelled), counting
     // the credit as a payment would take it off twice, so the order is refused rather than guessed at.
-    if (storeCreditForeign.gt(0)) {
+    //
+    // THE SAME ARITHMETIC RUNS FOR AN ORDER WITH NO CREDIT, SHORTFALL ONLY: a total below lines + tax + shipping - the
+    // order-level discount, with no credit recorded, is money taken off the total by a means IMS has no signal for
+    // (a payment plugin, a hand-edited total). Only evaluated when WooCommerce reported a total at all.
+    const totalReported = String(wcOrder.total ?? '').trim() !== ''
+    const hasCredit = storeCreditForeign.gt(0)
+    if (hasCredit || totalReported) {
       // Against WooCommerce's OWN line, fee and shipping figures, not IMS's reconstruction (quantity x a unit price
       // rounded to six decimals), which carries a rounding error of its own on high-quantity lines.
       const reported = wcReportedOrderAmounts(wcOrder)
@@ -2152,12 +2159,16 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         storeCreditForeign,
         orderTotalForeign: totalForeign,
         currency,
+        shortfallOnly: !hasCredit,
       })
       if (!reconciled.ok) {
         const refusal = {
           kind: 'CREDIT_NOT_RECONCILED' as const,
-          reason:
-            `it carries ${storeCreditForeign.toFixed(currencyMinorUnits(currency))} of store credit but its lines, tax and shipping less `
+          reason: !hasCredit
+            ? `its lines, tax and shipping exceed the order total ${totalForeign.toFixed(currencyMinorUnits(currency))} by `
+              + `${reconciled.difference.toFixed(currencyMinorUnits(currency))} and no coupon, store credit, wallet or gift-card record explains it, `
+              + `so money may have been taken off the order total by a means IMS cannot see.`
+            : `it carries ${storeCreditForeign.toFixed(currencyMinorUnits(currency))} of store credit but its lines, tax and shipping less `
             + `that credit differ from the order total ${totalForeign.toFixed(currencyMinorUnits(currency))} by `
             + `${reconciled.difference.toFixed(currencyMinorUnits(currency))}, so the credit is not the only thing between the goods and the total.`,
         }
