@@ -26,7 +26,7 @@ const SETTINGS = [['plugin_xero_enabled', 'true'], ['xero_sync_enabled', 'true']
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Tx = any
 
-const STAMPS = {
+const STAMPS: Record<string, unknown> & Parameters<typeof import('../../lib/domain/sales/order-delete-guard.ts').findSalesOrderDeleteBlocker>[2] = {
   revenueDeferredDate: null, inventoryAllocatedDate: null, revenueDeferredBatchRef: null, inventoryAllocatedBatchRef: null,
   allocationBatchSyncLogId: null, allocationBatchPasses: null,
 }

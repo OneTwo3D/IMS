@@ -1777,7 +1777,7 @@ test('[durable shadow] the sync row is GONE but the shadow record remains => the
 test('[durable shadow] a retained shadow sync row and its record are ONE blocker (no second, redundant sentence)', async () => {
   const shadow = { destination: 'xero', operation: 'sales.invoice', subject_type: 'SalesOrder', subject_id: 'order-1' }
   const row = syncLog({ status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true })
-  assert.equal(ledgerStanding(row), 'SHADOW_NOT_SENT_BY_IMS', 'PRECONDITION: the retained row reads as a shadow')
+  assert.equal(ledgerStanding({ ...row, externalTransactionId: row.externalTransactionId ?? null, settlementBasis: row.settlementBasis ?? null, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null }), 'SHADOW_NOT_SENT_BY_IMS', 'PRECONDITION: the retained row reads as a shadow')
   const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row], shadows: [shadow] }), 'order-1', STAMPS)
   assert.equal(blocker?.code, 'accounting_sync_live')
 })
