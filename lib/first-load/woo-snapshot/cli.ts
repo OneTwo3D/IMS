@@ -40,10 +40,12 @@ export const ENV_KEYS = {
 export const DEFAULT_MIN_INTERVAL_MS = 500
 export const DEFAULT_MAX_RESUME_AGE_MINUTES = 60
 
+const statusLine = (totals: Record<string, number>): string => Object.entries(totals).map(([status, n]) => `${status} ${n}`).join(', ')
+
 export function usageText(): string {
   return [
     'Usage: first-load-woo-snapshot --env-file <credentials> --out <dir> (--allow-origin <origin> ... | --allow-any-origin) [--resume] [--min-interval-ms <n>]',
-    '       first-load-woo-snapshot --verify <woo-snapshot.json>',
+    '       first-load-woo-snapshot --verify <woo-snapshot.json> --expect-origin <origin>',
     '',
     'Reads a WooCommerce store\'s variable products and their variations (GET requests only) and writes the snapshot, its provenance and variant-parents.csv.',
     '',
@@ -56,6 +58,7 @@ export function usageText(): string {
     `  --min-interval-ms <n>  minimum milliseconds between two requests (default ${DEFAULT_MIN_INTERVAL_MS})`,
     `  --max-resume-age-minutes <n>  an unfinished walk older than this is not resumed (default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`,
     '  --verify <file>        offline: recompute the checksum of a snapshot, re-run its consistency rules, and require the provenance, variant-parents.csv and the inspection copy beside it to match (the CSV must equal the rows regenerated from the snapshot); no request, no credentials',
+    '  --expect-origin <o>    with --verify (required there): the WooCommerce origin YOU declare the snapshot must come from; the provenance\'s recorded origin must equal it. It is an expectation you state, checked against the recorded origin, not proof of provenance',
     '  --help                 this text',
     '',
     'Exit codes:',
@@ -76,11 +79,12 @@ interface Args {
   minIntervalMs: number
   maxResumeAgeMinutes: number
   verify: string | null
+  expectOrigin: string | null
   help: boolean
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { envFile: null, out: null, allowOrigins: [], allowAnyOrigin: false, resume: false, minIntervalMs: DEFAULT_MIN_INTERVAL_MS, maxResumeAgeMinutes: DEFAULT_MAX_RESUME_AGE_MINUTES, verify: null, help: false }
+  const args: Args = { envFile: null, out: null, allowOrigins: [], allowAnyOrigin: false, resume: false, minIntervalMs: DEFAULT_MIN_INTERVAL_MS, maxResumeAgeMinutes: DEFAULT_MAX_RESUME_AGE_MINUTES, verify: null, expectOrigin: null, help: false }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     const value = () => {
@@ -103,11 +107,13 @@ function parseArgs(argv: string[]): Args {
       if (!/^\d{1,6}$/.test(raw)) throw new UsageError('--max-resume-age-minutes must be a whole number of minutes')
       args.maxResumeAgeMinutes = Number(raw)
     } else if (arg === '--verify') args.verify = value()
+    else if (arg === '--expect-origin') args.expectOrigin = value()
     else throw new UsageError(`unknown argument ${JSON.stringify(arg)} (credentials are never accepted on the command line: put them in the --env-file)`)
   }
   if (args.help) return args
+  if (args.expectOrigin !== null && args.verify === null) throw new UsageError('--expect-origin is only used with --verify')
   if (args.verify !== null) {
-    if (args.envFile !== null || args.out !== null || args.resume || args.allowOrigins.length > 0 || args.allowAnyOrigin) throw new UsageError('--verify reads one file and takes no other option')
+    if (args.envFile !== null || args.out !== null || args.resume || args.allowOrigins.length > 0 || args.allowAnyOrigin) throw new UsageError('--verify reads one file and takes no other option except --expect-origin')
     return args
   }
   if (args.envFile === null) throw new UsageError('--env-file is required')
@@ -187,7 +193,7 @@ export function readBytesOrNull(file: string): Buffer | null {
  * --verify: the snapshot AND the files derived from it. The provenance, variant-parents.csv and the inspection copy are read from the snapshot's
  * own directory; the CSV must be byte-identical to the rows regenerated from the verified snapshot and every recorded hash must match.
  */
-function runVerify(file: string, io: CliIo): number {
+function runVerify(file: string, expectOrigin: string | null, io: CliIo): number {
   const dir = path.dirname(path.resolve(file))
   const verdict = verifyWooSnapshotBundle({
     snapshotBytes: readBytesOrNull(file),
@@ -195,6 +201,7 @@ function runVerify(file: string, io: CliIo): number {
     csvBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.variantParents)),
     inspectionBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.variantParentsInspection)),
     requireInspection: true,
+    expectedOrigin: expectOrigin,
   })
   if (!verdict.ok) {
     io.stderr(`first-load-woo-snapshot: the snapshot ${file} and the files derived from it cannot be trusted:\n${verdict.problems.map((p) => `  - ${p}`).join('\n')}\n`)
@@ -221,7 +228,7 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
     io.stdout(usageText())
     return SNAPSHOT_EXIT_CODES.OK
   }
-  if (args.verify !== null) return runVerify(args.verify, io)
+  if (args.verify !== null) return runVerify(args.verify, args.expectOrigin, io)
 
   // ---- preconditions: nothing has left the machine and nothing has been written ----
   let credentials: ReturnType<typeof readCredentials>
@@ -381,6 +388,7 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
     `Snapshot of ${origin} written to ${args.out}${resumed ? ' (resumed)' : ''}.`,
     `  variable products: ${p.parents.rowsRead} read = ${p.parents.totalHeader} (X-WP-Total) in ${p.parents.pages} page(s)`,
     `  variations: ${p.variations.rowsRead} read = ${p.variations.totalHeaderSum} (sum of X-WP-Total over ${p.variations.parentsWithVariations} product(s)) and equal to the ids the products list`,
+    `  by status (compare with the shop's own admin counts): products ${statusLine(p.parents.statusTotals)}; variations ${statusLine(p.variations.statusTotals)}`,
     `  variations without a SKU (cannot be joined, not in ${SNAPSHOT_FILE_NAMES.variantParents}): ${p.variationsWithoutSku}`,
     `  verified by a second complete walk (round ${result.verificationRounds}); requests this run: ${result.requests}; payload SHA-256 ${reread.payloadSha256}`,
     '  every request was a GET.',

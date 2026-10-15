@@ -82,7 +82,9 @@ async function snapshot(r: Rig, extra: string[] = [], deps: SnapshotCliDeps = {}
 }
 
 const listFiles = (dir: string) => (existsSync(dir) ? readdirSync(dir).sort() : [])
-const requestsTo = (server: FakeCatalogue, pathname: string, page?: number) => server.requests.filter((q) => q.path.endsWith(pathname) && (page === undefined || q.query.page === String(page))).length
+/** The per-status count requests (an explicit status, one row a page) are not the walk's own pages. */
+const isProbe = (q: { query: Record<string, string> }) => q.query.status !== undefined && q.query.status !== 'any'
+const requestsTo = (server: FakeCatalogue, pathname: string, page?: number) => server.requests.filter((q) => q.path.endsWith(pathname) && (page === undefined || q.query.page === String(page)) && !isProbe(q)).length
 
 test('arm (a): a complete walk over several pages writes the snapshot, its provenance and variant-parents.csv, and proves the counts', async (t) => {
   const r = await rig({ pageSizeCap: 2 })
@@ -196,7 +198,7 @@ test('arm (d): a page the store did not serve is an error: nothing is written (p
   const r = await rig({
     pageSizeCap: 2,
     intercept: (c, res) => {
-      if (c.route === 'products' && c.page === 2) { dropped++; return { ...res, body: [] } }
+      if (!c.probe && c.route === 'products' && c.page === 2) { dropped++; return { ...res, body: [] } }
       return res
     },
   })
@@ -215,7 +217,7 @@ test('arm (d2): a variation page that is short against the header total is an er
   const r = await rig({
     intercept: (c, res) => {
       // The store serves two of WIDGET's three variations but still says three, and the parent still lists three.
-      if (c.route === 'variations' && c.parentId === 100) { shorted++; return { ...res, body: (res.body as unknown[]).slice(0, 2) } }
+      if (!c.probe && c.route === 'variations' && c.parentId === 100) { shorted++; return { ...res, body: (res.body as unknown[]).slice(0, 2) } }
       return res
     },
   }, parents)
@@ -257,7 +259,7 @@ test('arm (f): a store whose product pagination changes during the walk is an er
     pageSizeCap: 2,
     intercept: (c, res) => {
       // Page 2 keeps the same X-WP-Total (4, so rows == total still holds) but claims three pages: only the page-to-page comparison sees it.
-      if (c.route === 'products' && c.page === 2) { changed++; return { ...res, headers: { ...res.headers, 'x-wp-totalpages': '3' } } }
+      if (!c.probe && c.route === 'products' && c.page === 2) { changed++; return { ...res, headers: { ...res.headers, 'x-wp-totalpages': '3' } } }
       return res
     },
   })
@@ -382,7 +384,7 @@ test('arm (j): a walk that failed part-way resumes without asking for a finished
   let failing = true
   const r = await rig({
     pageSizeCap: 2,
-    intercept: (c, res) => (failing && c.route === 'products' && c.page === 2 ? { status: 500, headers: {}, body: { code: 'boom', message: 'boom' } } : res),
+    intercept: (c, res) => (failing && !c.probe && c.route === 'products' && c.page === 2 ? { status: 500, headers: {}, body: { code: 'boom', message: 'boom' } } : res),
   })
   try {
     assert.equal((await snapshot(clean)).code, SNAPSHOT_EXIT_CODES.OK)
@@ -410,7 +412,7 @@ test('arm (j): a walk that failed part-way resumes without asking for a finished
 
 test('arm (j2): an unfinished walk of one store is not resumed against another', async (t) => {
   let failing = true
-  const a = await rig({ pageSizeCap: 2, intercept: (c, res) => (failing && c.route === 'products' && c.page === 2 ? { status: 500, headers: {}, body: {} } : res) })
+  const a = await rig({ pageSizeCap: 2, intercept: (c, res) => (failing && !c.probe && c.route === 'products' && c.page === 2 ? { status: 500, headers: {}, body: {} } : res) })
   const b = await rig()
   try {
     assert.equal((await snapshot(a)).code, SNAPSHOT_EXIT_CODES.FETCH_FAILED)
@@ -426,7 +428,7 @@ test('arm (j2): an unfinished walk of one store is not resumed against another',
 
 test('arm (k): a transient server error is retried with a growing wait, a client error is not', async (t) => {
   let flaky = 0
-  const r = await rig({ intercept: (c, res) => (c.route === 'products' && c.attempt === 1 && flaky++ === 0 ? { status: 503, headers: {}, body: { message: 'later' } } : res) })
+  const r = await rig({ intercept: (c, res) => (!c.probe && c.route === 'products' && c.attempt === 1 && flaky++ === 0 ? { status: 503, headers: {}, body: { message: 'later' } } : res) })
   const denied = await rig({ intercept: () => ({ status: 403, headers: {}, body: { code: 'woocommerce_rest_cannot_view', message: 'no' } }) })
   try {
     const ran = await snapshot(r, ['--min-interval-ms', '0'])
@@ -501,17 +503,17 @@ test('arm (n): --verify recomputes the checksum: an edited snapshot is refused, 
   try {
     assert.equal((await snapshot(r)).code, SNAPSHOT_EXIT_CODES.OK)
     const file = path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot)
-    const good = await snapshot(r, [], {}, ['--verify', file])
+    const good = await snapshot(r, [], {}, ['--verify', file, '--expect-origin', r.server.origin])
     precondition(t, 'verifications', 1)
     assert.equal(good.code, SNAPSHOT_EXIT_CODES.OK, good.stderr)
     assert.match(good.stdout, /4 variable product\(s\), 10 variation\(s\)/)
     const edited = fresh('edited.json')
     writeFileSync(edited, readFileSync(file, 'utf8').replace('"sku": "W-01"', '"sku": "W-99"'))
-    const bad = await snapshot(r, [], {}, ['--verify', edited])
+    const bad = await snapshot(r, [], {}, ['--verify', edited, '--expect-origin', r.server.origin])
     assert.equal(bad.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
     assert.match(bad.stderr, /checksum does not match/)
-    assert.equal((await snapshot(r, [], {}, ['--verify', file, '--out', 'x'])).code, SNAPSHOT_EXIT_CODES.USAGE)
-    assert.equal((await snapshot(r, [], {}, ['--verify', fresh('missing.json')])).code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
+    assert.equal((await snapshot(r, [], {}, ['--verify', file, '--expect-origin', r.server.origin, '--out', 'x'])).code, SNAPSHOT_EXIT_CODES.USAGE)
+    assert.equal((await snapshot(r, [], {}, ['--verify', fresh('missing.json'), '--expect-origin', r.server.origin])).code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
   } finally { await r.server.close() }
 })
 
@@ -527,7 +529,7 @@ test('arm (o): end to end: the snapshot\'s variant-parents.csv, fed to first-loa
     writeFileSync(path.join(dir, 'exclusions.csv'), 'sku,reason\nW-03,not loaded at first\nB-02,not loaded at first\nB-03,not loaded at first\nB-04,not loaded at first\nB-05,not loaded at first\n')
     writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
       formatVersion: 1, baseCurrency: 'GBP',
-      wooSnapshot: { snapshot: SNAPSHOT_FILE_NAMES.snapshot, provenance: SNAPSHOT_FILE_NAMES.provenance },
+      wooSnapshot: { snapshot: SNAPSHOT_FILE_NAMES.snapshot, provenance: SNAPSHOT_FILE_NAMES.provenance, origin: r.server.origin },
       inputs: [
         { dataset: 'products', file: 'products.csv' },
         { dataset: 'variant-parents', file: 'variant-parents.csv' },
@@ -574,7 +576,7 @@ test('arm (q2): a product deleted on page 1 and another added at the end before 
     pageSizeCap: 2,
     ghosts,
     intercept: (c, res) => {
-      if (c.route === 'products' && c.page === 1 && fired === 0) {
+      if (!c.probe && c.route === 'products' && c.page === 1 && fired === 0) {
         fired++
         ghosts.push(...parents.splice(0, 1)) // delete id 100, which page 1 already carries (its variations still answer, so only the second walk can see it)
         parents.push({ id: 500, sku: 'NEWEST', name: 'Added meanwhile', variations: [{ id: 5001, sku: 'N-01' }] })
@@ -601,7 +603,7 @@ test('arm (q3): a store that never stops changing is refused after the bounded r
   const r = await rig({
     pageSizeCap: 2,
     intercept: (c, res) => {
-      if (c.route === 'products' && c.page === 1) {
+      if (!c.probe && c.route === 'products' && c.page === 1) {
         fired++
         parents.splice(0, 1)
         parents.push({ id: next, sku: `CHURN${next}`, name: 'churn', variations: [{ id: next + 1, sku: `C-${next}` }] })
@@ -622,9 +624,9 @@ test('arm (q3): a store that never stops changing is refused after the bounded r
 test('arm (r): a redirect is refused and its target is never requested (cross-origin, and same-origin as the isolating case)', async (t) => {
   const other = await startFakeCatalogue({ key: KEY, secret: SECRET, parents: catalogue() })
   let crossed = 0
-  const r = await rig({ intercept: (c, res) => (c.route === 'products' ? (crossed++, { status: 302, headers: { location: `${other.origin}/wp-json/wc/v3/products?type=variable` }, body: {} }) : res) })
+  const r = await rig({ intercept: (c, res) => (!c.probe && c.route === 'products' ? (crossed++, { status: 302, headers: { location: `${other.origin}/wp-json/wc/v3/products?type=variable` }, body: {} }) : res) })
   let again = 0
-  const same = await rig({ intercept: (c, res) => (c.route === 'products' && c.attempt === 1 && again++ === 0 ? { status: 302, headers: { location: `${same_origin()}/wp-json/wc/v3/products?type=variable&status=any&per_page=100&page=1&orderby=id&order=asc` }, body: {} } : res) })
+  const same = await rig({ intercept: (c, res) => (!c.probe && c.route === 'products' && c.attempt === 1 && again++ === 0 ? { status: 302, headers: { location: `${same_origin()}/wp-json/wc/v3/products?type=variable&status=any&per_page=100&page=1&orderby=id&order=asc` }, body: {} } : res) })
   function same_origin(): string { return same.server.origin }
   try {
     const ran = await snapshot(r)
@@ -641,7 +643,7 @@ test('arm (r): a redirect is refused and its target is never requested (cross-or
 test('arm (s): an upstream error body that echoes the credentials never reaches any output: status and code only', async (t) => {
   const token = Buffer.from(`${KEY}:${SECRET}`).toString('base64')
   let served = 0
-  const r = await rig({ intercept: (c, res) => (c.route === 'products' ? (served++, { status: 500, headers: {}, body: { code: 'internal_error', message: `Authorization: Basic ${token} key=${KEY} secret=${SECRET}` } }) : res) })
+  const r = await rig({ intercept: (c, res) => (!c.probe && c.route === 'products' ? (served++, { status: 500, headers: {}, body: { code: 'internal_error', message: `Authorization: Basic ${token} key=${KEY} secret=${SECRET}` } }) : res) })
   try {
     const ran = await snapshot(r)
     precondition(t, 'error responses carrying the credentials', served)
@@ -668,7 +670,7 @@ test('arm (s2): the redaction backstop alone: a credential that arrives as store
 
 test('arm (t): an unfinished walk older than the allowed age is not resumed, and a young one is', async (t) => {
   let failing = true
-  const r = await rig({ pageSizeCap: 2, intercept: (c, res) => (failing && c.route === 'products' && c.page === 2 ? { status: 500, headers: {}, body: {} } : res) })
+  const r = await rig({ pageSizeCap: 2, intercept: (c, res) => (failing && !c.probe && c.route === 'products' && c.page === 2 ? { status: 500, headers: {}, body: {} } : res) })
   try {
     assert.equal((await snapshot(r)).code, SNAPSHOT_EXIT_CODES.FETCH_FAILED)
     failing = false
@@ -708,7 +710,7 @@ test('arm (q4): a product listed but already gone (404 on its variations) abando
   const r = await rig({
     pageSizeCap: 2,
     intercept: (c, res) => {
-      if (c.route === 'products' && c.page === 1 && fired === 0) { fired++; parents.splice(0, 1); parents.push({ id: 500, sku: 'NEWEST', name: 'Added meanwhile', variations: [{ id: 5001, sku: 'N-01' }] }) }
+      if (!c.probe && c.route === 'products' && c.page === 1 && fired === 0) { fired++; parents.splice(0, 1); parents.push({ id: 500, sku: 'NEWEST', name: 'Added meanwhile', variations: [{ id: 5001, sku: 'N-01' }] }) }
       return res
     },
   }, parents)
@@ -718,4 +720,65 @@ test('arm (q4): a product listed but already gone (404 on its variations) abando
     assert.equal(ran.code, SNAPSHOT_EXIT_CODES.OK, ran.stderr)
     assert.ok(r.server.requests.some((q) => q.status === 404), 'the walk really met the 404')
   } finally { await r.server.close() }
+})
+
+test('arm (w): the walk asks for each status BY NAME for the products and for the variations of every product, and records the per-status counts', async (t) => {
+  const r = await rig()
+  try {
+    const ran = await snapshot(r)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.OK, ran.stderr)
+    const probes = r.server.requests.filter(isProbe)
+    precondition(t, 'per-status requests the store received', probes.length)
+    for (const status of ['publish', 'draft', 'private', 'pending']) {
+      assert.ok(probes.some((q) => q.path.endsWith('/products') && q.query.status === status), `products asked for ${status}`)
+      assert.ok(probes.some((q) => /\/products\/100\/variations$/.test(q.path) && q.query.status === status), `variations of 100 asked for ${status}`)
+    }
+    assert.ok(r.server.requests.filter((q) => /variations$/.test(q.path) && !isProbe(q)).every((q) => q.query.status === 'any'), 'the variation pages carry an explicit status')
+    const proof = JSON.parse(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.provenance), 'utf8')).proof
+    assert.deepEqual(proof.parents.statusTotals, { publish: 2, draft: 1, private: 1, pending: 0 })
+    assert.deepEqual(proof.variations.statusTotals, { publish: 9, draft: 0, private: 1, pending: 0 })
+    assert.match(ran.stdout, /by status \(compare with the shop's own admin counts\): products publish 2, draft 1, private 1, pending 0; variations publish 9, draft 0, private 1, pending 0/)
+  } finally { await r.server.close() }
+})
+
+test('arm (x): a key that cannot read a status (rows silently dropped from status=any, explicit request refused) fails the walk and writes nothing', async (t) => {
+  const control = await rig({ pageSizeCap: 2 })
+  const blind = await rig({ pageSizeCap: 2, invisibleStatuses: ['private'] })
+  try {
+    assert.equal((await snapshot(control)).code, SNAPSHOT_EXIT_CODES.OK)
+    precondition(t, 'control (same catalogue, fully visible key) completed', 1)
+    // Isolation: the blind store really does serve a smaller catalogue under status=any that every total agrees with.
+    const any = await fetch(`${blind.server.url}/wp-json/wc/v3/products?type=variable&status=any&per_page=100`, { headers: { authorization: `Basic ${Buffer.from(`${KEY}:${SECRET}`).toString('base64')}` } })
+    precondition(t, 'products the blind key sees under status=any', Number(any.headers.get('x-wp-total')))
+    assert.equal(Number(any.headers.get('x-wp-total')), 3, 'the private product is silently missing and the total agrees with the rows')
+    const ran = await snapshot(blind)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, ran.stderr)
+    assert.match(ran.stderr, /the status "private" cannot be enumerated with this key \(GET \/products \(page 1\) failed: HTTP 403/)
+    assert.deepEqual(listFiles(blind.out), [], 'nothing was written')
+  } finally { await control.server.close(); await blind.server.close() }
+})
+
+test('arm (x2): a key that can read products but not the variations of a status is refused on the variation count, not only on the product count', async (t) => {
+  const r = await rig({ intercept: (c, res) => (c.route === 'variations' && c.probe && c.status === 'draft' ? { status: 403, headers: {}, body: { code: 'woocommerce_rest_cannot_view', message: 'no' } } : res) })
+  try {
+    const ran = await snapshot(r)
+    precondition(t, 'refused variation count requests', r.server.requests.filter((q) => q.status === 403).length)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, ran.stderr)
+    assert.match(ran.stderr, /the variations of product 100: the status "draft" cannot be enumerated/)
+  } finally { await r.server.close() }
+})
+
+test('arm (y): per-status counts that do not add up to the store total, and a row in a status outside the enumerated set, both refuse the snapshot', async (t) => {
+  const short = await rig({ statusTotalOverride: { publish: 1 } })
+  const future = await rig({}, [{ id: 100, sku: 'WIDGET', name: 'Widget', status: 'future', variations: [{ id: 1001, sku: 'W-01' }] }])
+  try {
+    const a = await snapshot(short)
+    precondition(t, 'refusals', a.code === SNAPSHOT_EXIT_CODES.INCONSISTENT ? 1 : 0)
+    assert.equal(a.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, a.stderr)
+    assert.match(a.stderr, /do not add up to the store's total/)
+    const b = await snapshot(future)
+    assert.equal(b.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, b.stderr)
+    assert.match(b.stderr, /product 100 has the status "future", which the snapshot cannot enumerate/)
+    assert.deepEqual([...listFiles(short.out), ...listFiles(future.out)], [])
+  } finally { await short.server.close(); await future.server.close() }
 })

@@ -3,7 +3,8 @@
   "baseCurrency": "GBP",
   "wooSnapshot": {
     "snapshot": "woo/woo-snapshot.json",
-    "provenance": "woo/woo-snapshot.provenance.json"
+    "provenance": "woo/woo-snapshot.provenance.json",
+    "origin": "https://synthetic.invalid"
   },
   "inputs": [
     {

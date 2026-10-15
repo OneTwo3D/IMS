@@ -3,8 +3,8 @@
  *
  * Binds 127.0.0.1 on an EPHEMERAL port, serves a fixed catalogue from memory and talks to nobody:
  *
- *   GET /wp-json/wc/v3/products?type=variable&status=any&per_page&page&orderby=id&order=asc
- *   GET /wp-json/wc/v3/products/{id}/variations?per_page&page
+ *   GET /wp-json/wc/v3/products?type=variable&status=any|publish|draft|private|pending&per_page&page&orderby=id&order=asc
+ *   GET /wp-json/wc/v3/products/{id}/variations?status&per_page&page
  *
  * with HTTP Basic auth against the key and secret it was started with, `X-WP-Total` / `X-WP-TotalPages` headers, and an empty list for a page past
  * the end. EVERY request is recorded; a request whose method is not GET or HEAD is a VIOLATION (recorded, answered 405), so a test can prove the
@@ -53,6 +53,10 @@ export interface InterceptContext {
   route: 'products' | 'variations'
   parentId: number | null
   page: number
+  /** True for the per-status count requests (an explicit status, one row per page); false for the walk's own pages. */
+  probe: boolean
+  /** The status filter the request carried (`any` when none). */
+  status: string
   /** How many times this exact route+page has been requested so far, counting this one. */
   attempt: number
 }
@@ -64,6 +68,13 @@ export interface FakeCatalogueOptions {
   /** The most rows the store grants per page whatever `per_page` asks for. */
   pageSizeCap?: number
   omitPaginationHeaders?: boolean
+  /**
+   * Models a key that cannot read these statuses (WooCommerce behaviour): rows of them are silently left out of `status=any` listings AND out of the
+   * variation ids a product advertises, while an explicit `status=<one of them>` request is refused with HTTP 403.
+   */
+  invisibleStatuses?: readonly string[]
+  /** Answers an explicit `status=<s>` request with this many instead of the real count (a store whose per-status totals do not add up). */
+  statusTotalOverride?: Readonly<Record<string, number>>
   /** Products no longer listed whose variations endpoint still answers (a store that deletes lazily). */
   ghosts?: readonly FakeParent[]
   intercept?: (context: InterceptContext, response: FakeResponse) => FakeResponse
@@ -108,32 +119,39 @@ export async function startFakeCatalogue(options: FakeCatalogueOptions): Promise
 
     const perPage = Math.min(Math.max(Number.parseInt(query.per_page ?? '10', 10) || 10, 1), options.pageSizeCap ?? 100)
     const page = Math.max(Number.parseInt(query.page ?? '1', 10) || 1, 1)
-    const paged = <T>(rows: T[], context: Omit<InterceptContext, 'attempt' | 'page'>) => {
+    const paged = <T>(rows: T[], context: Omit<InterceptContext, 'attempt' | 'page' | 'probe' | 'status'>) => {
       const totalPages = Math.max(Math.ceil(rows.length / perPage), 1)
-      const key = `${context.route}:${context.parentId ?? ''}:${page}`
+      const key = `${context.route}:${context.parentId ?? ''}:${page}:${query.status ?? 'any'}`
       const attempt = (attempts.get(key) ?? 0) + 1
       attempts.set(key, attempt)
       const built: FakeResponse = {
         status: 200,
-        headers: options.omitPaginationHeaders ? {} : { 'x-wp-total': String(rows.length), 'x-wp-totalpages': String(totalPages) },
+        headers: options.omitPaginationHeaders ? {} : { 'x-wp-total': String(override ?? rows.length), 'x-wp-totalpages': String(totalPages) },
         body: rows.slice((page - 1) * perPage, page * perPage),
       }
-      reply(options.intercept ? options.intercept({ ...context, page, attempt }, built) : built)
+      reply(options.intercept ? options.intercept({ ...context, page, attempt, probe: query.status !== undefined && query.status !== 'any', status: query.status ?? 'any' }, built) : built)
     }
+
+    const invisible = options.invisibleStatuses ?? []
+    const wanted = query.status ?? 'any'
+    if (!['any', 'publish', 'draft', 'private', 'pending'].includes(wanted)) return error(400, 'rest_invalid_param')
+    if (wanted !== 'any' && invisible.includes(wanted)) return error(403, 'woocommerce_rest_cannot_view')
+    const keep = (status: string): boolean => (wanted === 'any' ? !invisible.includes(status) : status === wanted)
+    const override = wanted !== 'any' ? options.statusTotalOverride?.[wanted] : undefined
 
     if (route === '/products') {
       if (query.type !== 'variable') return error(400, 'unexpected_type_filter')
-      const sorted = [...options.parents].sort((a, b) => a.id - b.id)
+      const sorted = [...options.parents].filter((p) => keep(p.status ?? 'publish')).sort((a, b) => a.id - b.id)
       return paged(sorted.map((p) => ({
         id: p.id, sku: p.sku, name: p.name, status: p.status ?? 'publish', type: p.type ?? 'variable',
-        variations: p.advertisedVariationIds ?? p.variations.map((v) => v.id),
+        variations: p.advertisedVariationIds ?? p.variations.filter((v) => !invisible.includes(v.status ?? 'publish')).map((v) => v.id),
       })), { route: 'products', parentId: null })
     }
     const match = /^\/products\/(\d+)\/variations$/.exec(route)
     if (match) {
       const parent = [...options.parents, ...(options.ghosts ?? [])].find((p) => p.id === Number(match[1]))
       if (!parent) return error(404, 'woocommerce_rest_product_invalid_id')
-      const sorted = [...parent.variations].sort((a, b) => a.id - b.id)
+      const sorted = parent.variations.filter((v) => keep(v.status ?? 'publish')).sort((a, b) => a.id - b.id)
       return paged(sorted.map((v) => ({
         id: v.id, sku: v.sku, status: v.status ?? 'publish', attributes: v.attributes ?? [],
         ...(v.parent_id === undefined ? {} : { parent_id: v.parent_id }),

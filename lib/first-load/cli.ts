@@ -10,7 +10,7 @@ import path from 'node:path'
 import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
-import { bindingFromVerification, verifyWooSnapshotBundle, type VariantParentsBinding } from './snapshot'
+import { bindingFromVerification, normaliseStoreOrigin, verifyWooSnapshotBundle, type VariantParentsBinding } from './snapshot'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
 
 export interface CliIo {
@@ -48,7 +48,7 @@ interface Manifest {
   maxPurchaseTaxRate: string | null
   requireVariantParents: boolean
   /** Where the snapshot and its provenance are, for the variant-parents binding. Relative to the manifest. */
-  wooSnapshot: { snapshot: string; provenance: string } | null
+  wooSnapshot: { snapshot: string; provenance: string; origin: string | null } | null
   inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null; supersedesEarlier: boolean }>
 }
 
@@ -82,11 +82,17 @@ function parseManifest(text: string): Manifest {
   let wooSnapshot: Manifest['wooSnapshot'] = null
   if (m.wooSnapshot !== undefined) {
     const w = m.wooSnapshot
-    if (typeof w !== 'object' || w === null || Array.isArray(w)) throw new UsageError('manifest wooSnapshot must be an object {"snapshot": <woo-snapshot.json>, "provenance": <woo-snapshot.provenance.json>}')
+    if (typeof w !== 'object' || w === null || Array.isArray(w)) throw new UsageError('manifest wooSnapshot must be an object {"snapshot": <woo-snapshot.json>, "provenance": <woo-snapshot.provenance.json>, "origin": <the WooCommerce store origin>}')
     const wo = w as Record<string, unknown>
-    for (const key of Object.keys(wo)) if (key !== 'snapshot' && key !== 'provenance') throw new UsageError(`unknown key "${key}" in manifest wooSnapshot`)
+    for (const key of Object.keys(wo)) if (key !== 'snapshot' && key !== 'provenance' && key !== 'origin') throw new UsageError(`unknown key "${key}" in manifest wooSnapshot`)
     if (typeof wo.snapshot !== 'string' || wo.snapshot === '' || typeof wo.provenance !== 'string' || wo.provenance === '') throw new UsageError('manifest wooSnapshot needs a snapshot path and a provenance path (both strings)')
-    wooSnapshot = { snapshot: wo.snapshot, provenance: wo.provenance }
+    // The origin is the operator's declaration of which store the snapshot must come from. Absent is accepted here and refused where the snapshot is bound (an ERROR finding).
+    let origin: string | null = null
+    if (wo.origin !== undefined) {
+      if (typeof wo.origin !== 'string' || normaliseStoreOrigin(wo.origin) === null) throw new UsageError('manifest wooSnapshot origin must be an http(s) origin such as https://shop.example')
+      origin = normaliseStoreOrigin(wo.origin)
+    }
+    wooSnapshot = { snapshot: wo.snapshot, provenance: wo.provenance, origin }
   }
   if (!Array.isArray(m.inputs) || m.inputs.length === 0) throw new UsageError('manifest inputs must be a non-empty array')
   const seen = new Set<string>()
@@ -287,6 +293,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         snapshotBytes: readOrNull(manifest.wooSnapshot.snapshot),
         provenanceBytes: readOrNull(manifest.wooSnapshot.provenance),
         csvBytes: readOrNull(listed[0].file),
+        expectedOrigin: manifest.wooSnapshot.origin,
       }))
     }
   }

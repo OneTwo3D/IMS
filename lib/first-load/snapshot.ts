@@ -296,6 +296,17 @@ export function boundProblems(problems: string[]): string[] {
 
 const hex12 = (hex: string) => hex.slice(0, 12)
 
+/** A store origin as the URL standard writes it (scheme://host[:port], lower-case host, default port dropped, no path), or null when it is not an http(s) origin. */
+export function normaliseStoreOrigin(raw: string): string | null {
+  try {
+    const url = new URL(raw.trim())
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+    return url.origin
+  } catch {
+    return null
+  }
+}
+
 /**
  * THE BINDING. A variant-parents.csv assigns a parent SKU to a Qoblex variant, so it is only as good as the snapshot it came from. This
  * regenerates the rows from the VERIFIED snapshot with the same pure builder that wrote them and requires:
@@ -312,6 +323,11 @@ export function verifyWooSnapshotBundle(input: {
   /** Offline `--verify` also checks the inspection copy; `first-load:prepare` does not read it. */
   inspectionBytes?: Uint8Array | null
   requireInspection?: boolean
+  /**
+   * The WooCommerce origin the OPERATOR declares this snapshot must come from (the manifest's wooSnapshot.origin, or --expect-origin offline).
+   * It is an expectation checked against the origin the provenance recorded, not proof of where the bytes came from. `null` (not declared) is a refusal.
+   */
+  expectedOrigin: string | null
 }): SnapshotBundleVerdict {
   const problems: string[] = []
   const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -351,6 +367,14 @@ export function verifyWooSnapshotBundle(input: {
     }
     const e = entry as Record<string, unknown>
     return { sha256: e.sha256 as string, payloadSha256: typeof e.payloadSha256 === 'string' ? e.payloadSha256 : null }
+  }
+  const expectedOrigin = input.expectedOrigin === null ? null : normaliseStoreOrigin(input.expectedOrigin)
+  if (input.expectedOrigin === null) problems.push('no expected WooCommerce store origin was declared (the manifest wooSnapshot.origin, or --expect-origin): a snapshot is only accepted from the store the operator names')
+  else if (expectedOrigin === null) problems.push('the declared expected store origin is not an http(s) origin')
+  if (provenance !== null) {
+    const recordedOrigin = typeof provenance.origin === 'string' ? normaliseStoreOrigin(provenance.origin) : null
+    if (recordedOrigin === null) problems.push('the provenance does not record a usable store origin')
+    else if (expectedOrigin !== null && recordedOrigin !== expectedOrigin) problems.push(`the snapshot was taken from ${recordedOrigin}, not from the declared store ${expectedOrigin}`)
   }
   const snapRec = recorded('snapshotFile', 'the snapshot file')
   const csvRec = recorded('variantParentsFile', 'variant-parents.csv')

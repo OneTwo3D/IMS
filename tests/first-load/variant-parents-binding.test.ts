@@ -45,6 +45,9 @@ function catalogue(variant: 'a' | 'b'): FakeParent[] {
 }
 
 /** Writes a real snapshot bundle (snapshot, provenance, variant-parents.csv, inspection copy) with the real command and returns its directory. */
+/** The origin the operator declares for each bundle written below (the fake store it was really read from). */
+const declaredOrigin = new Map<string, string>()
+
 async function bundle(variant: 'a' | 'b' = 'a'): Promise<string> {
   const server = await startFakeCatalogue({ key: KEY, secret: SECRET, parents: catalogue(variant) })
   try {
@@ -55,6 +58,7 @@ async function bundle(variant: 'a' | 'b' = 'a'): Promise<string> {
     let stderr = ''
     const code = await runSnapshotCli(['--env-file', envFile, '--out', out, '--allow-origin', server.origin, '--min-interval-ms', '0'], { stdout: () => {}, stderr: (s) => (stderr += s) })
     assert.equal(code, SNAPSHOT_EXIT_CODES.OK, stderr)
+    declaredOrigin.set(out, server.origin)
     return out
   } finally { await server.close() }
 }
@@ -62,6 +66,7 @@ async function bundle(variant: 'a' | 'b' = 'a'): Promise<string> {
 const copyBundle = (from: string) => {
   const to = fresh('copy')
   cpSync(from, to, { recursive: true })
+  declaredOrigin.set(to, declaredOrigin.get(from)!)
   return to
 }
 const file = (dir: string, name: string) => path.join(dir, name)
@@ -74,22 +79,22 @@ const edit = (target: string, change: (text: string) => string) => {
 interface Provenance { snapshotFile: { sha256: string; payloadSha256: string }; variantParentsFile?: { sha256: string } }
 const editProvenance = (dir: string, change: (p: Provenance) => void) => edit(file(dir, SNAPSHOT_FILE_NAMES.provenance), (text) => { const p = JSON.parse(text); change(p); return `${JSON.stringify(p, null, 2)}\n` })
 
-async function verify(dir: string): Promise<{ code: number; stdout: string; stderr: string }> {
+async function verify(dir: string, origin: string | null = declaredOrigin.get(dir) ?? null): Promise<{ code: number; stdout: string; stderr: string }> {
   let stdout = ''
   let stderr = ''
-  const code = await runSnapshotCli(['--verify', file(dir, SNAPSHOT_FILE_NAMES.snapshot)], { stdout: (s) => (stdout += s), stderr: (s) => (stderr += s) })
+  const code = await runSnapshotCli(['--verify', file(dir, SNAPSHOT_FILE_NAMES.snapshot), ...(origin === null ? [] : ['--expect-origin', origin])], { stdout: (s) => (stdout += s), stderr: (s) => (stderr += s) })
   return { code, stdout, stderr }
 }
 
 /** Runs first-load:prepare over products V-01..V-03 and the bundle's CSV; `csvFrom` is the directory whose variant-parents.csv is listed. */
-async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; wooSnapshot?: boolean }): Promise<{ code: number; stdout: string; stderr: string; out: string; written: string; report: PrepareReportShape }> {
+async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; wooSnapshot?: boolean; origin?: string | null }): Promise<{ code: number; stdout: string; stderr: string; out: string; written: string; report: PrepareReportShape }> {
   const dir = fresh('prepare')
   mkdirSync(dir)
   writeFileSync(path.join(dir, 'products.csv'), 'sku,name,type\nV-01,Variant one,VARIANT\nV-02,Variant two,VARIANT\nV-03,Variant three,VARIANT\n')
   cpSync(file(opts.csvFrom, SNAPSHOT_FILE_NAMES.variantParents), path.join(dir, 'variant-parents.csv'))
   const manifest: Record<string, unknown> = { formatVersion: 1, baseCurrency: 'GBP', inputs: [{ dataset: 'products', file: 'products.csv' }, { dataset: 'variant-parents', file: 'variant-parents.csv' }, { dataset: 'sku-exclusions', file: 'exclusions.csv' }] }
   writeFileSync(path.join(dir, 'exclusions.csv'), 'sku,reason\nV-33,not loaded at first\n')
-  if (opts.wooSnapshot !== false && opts.snapshotDir !== null) manifest.wooSnapshot = { snapshot: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.snapshot), provenance: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.provenance) }
+  if (opts.wooSnapshot !== false && opts.snapshotDir !== null) manifest.wooSnapshot = { snapshot: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.snapshot), provenance: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.provenance), ...((opts.origin === undefined ? declaredOrigin.get(opts.snapshotDir) : opts.origin) === null ? {} : { origin: opts.origin === undefined ? declaredOrigin.get(opts.snapshotDir) : opts.origin }) }
   writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest))
   let stdout = ''
   let stderr = ''
@@ -277,4 +282,60 @@ test('arm (l): prepare() called without a binding, or with a binding for other b
     assert.equal(result.report.variantParents.variantsJoined, 0, label)
     assert.equal(result.outputs.some((o) => o.content.includes(',P,')), false, `${label}: no parent in any output`)
   }
+})
+
+test('arm (m): a bundle from ANOTHER store is refused when the declared origin differs from the recorded one, by --verify and by prepare', async (t) => {
+  const b = await bundle()
+  const declared = declaredOrigin.get(b)!
+  const honest = await prepareWith({ snapshotDir: b, csvFrom: b })
+  precondition(t, 'honest control (declared = recorded origin) joined variants', honest.report.variantParents.variantsJoined)
+  assert.equal(honest.code, EXIT_CODES.OK, honest.stdout + honest.stderr)
+  assert.equal((await verify(b)).code, SNAPSHOT_EXIT_CODES.OK)
+  // Same bundle, but the operator declares the production shop: every checksum and the CSV comparison still pass, only the origin differs.
+  const other = 'https://shop.example'
+  assert.notEqual(other, declared)
+  const v = await verify(b, other)
+  assert.equal(v.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, v.stdout)
+  assert.match(v.stderr, /was taken from http:\/\/127\.0\.0\.1:\d+, not from the declared store https:\/\/shop\.example/)
+  const ran = await prepareWith({ snapshotDir: b, csvFrom: b, origin: other })
+  assert.match(ran.report.findings.find((f: FindingShape) => f.code === 'VARIANT_PARENTS_NOT_BOUND')?.message ?? '', /not from the declared store/)
+  assertRefused(t, ran, honest.written, 'origin differs')
+})
+
+test('arm (m2): an edited provenance origin is only as good as the declaration (the documented limit), and is still refused when the real store is declared', async (t) => {
+  const b = await bundle()
+  const forged = copyBundle(b)
+  editProvenance(forged, (p) => { (p as unknown as { origin: string }).origin = 'https://shop.example' })
+  const v = await verify(forged, 'https://shop.example')
+  precondition(t, 'forged bundle verified against the origin it now claims', v.code === SNAPSHOT_EXIT_CODES.OK ? 1 : 0)
+  // Editing provenance text does not change the snapshot/CSV hashes it records, so nothing else can notice: this is why the docs call the origin
+  // an operator-declared expectation checked against the recorded one, and not proof of acquisition.
+  assert.equal(v.code, SNAPSHOT_EXIT_CODES.OK, v.stderr)
+  // The same forged bundle is still refused when the operator declares the REAL store.
+  assert.equal((await verify(forged, declaredOrigin.get(b)!)).code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
+})
+
+test('arm (n): no declared origin is a refusal: the manifest without wooSnapshot.origin gets the ERROR finding, and --verify without --expect-origin fails', async (t) => {
+  const b = await bundle()
+  const honest = await prepareWith({ snapshotDir: b, csvFrom: b })
+  precondition(t, 'honest control joined variants', honest.report.variantParents.variantsJoined)
+  const ran = await prepareWith({ snapshotDir: b, csvFrom: b, origin: null })
+  assert.match(ran.report.findings.find((f: FindingShape) => f.code === 'VARIANT_PARENTS_NOT_BOUND')?.message ?? '', /no expected WooCommerce store origin was declared/)
+  assertRefused(t, ran, honest.written, 'no origin')
+  const v = await verify(b, null)
+  assert.equal(v.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
+  assert.match(v.stderr, /no expected WooCommerce store origin was declared/)
+})
+
+test('arm (o): the declared origin is normalised before it is compared (case, default port, trailing path), and a non-origin is a usage error', async (t) => {
+  const b = await bundle()
+  const recorded = declaredOrigin.get(b)!
+  const noisy = `${recorded.toUpperCase().replace('HTTP://', 'http://')}/shop/`
+  assert.notEqual(noisy, recorded)
+  precondition(t, 'noisy spelling differs from the recorded one', noisy === recorded ? 0 : 1)
+  assert.equal((await verify(b, noisy)).code, SNAPSHOT_EXIT_CODES.OK)
+  const ran = await prepareWith({ snapshotDir: b, csvFrom: b, origin: noisy })
+  assert.equal(ran.code, EXIT_CODES.OK, ran.stdout + ran.stderr)
+  const bad = await prepareWith({ snapshotDir: b, csvFrom: b, origin: 'not an origin' })
+  assert.equal(bad.code, EXIT_CODES.USAGE, bad.stdout + bad.stderr)
 })

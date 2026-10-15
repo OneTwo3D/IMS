@@ -670,7 +670,7 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
   if (bindingProblems.length > 0) {
     run.variantParentsRefused = true
     for (const row of run.rows('variant-parents')) run.add('variant-parents', row.line, row.values.variantSku, 'EXCLUDED', 'NOT_BOUND_TO_SNAPSHOT', 'the dataset is not bound to a verified WooCommerce snapshot, so no parent is taken from it')
-    run.find('ERROR', 'VARIANT_PARENTS_NOT_BOUND', `the variant-parents dataset was REFUSED: it is not bound to a verified WooCommerce snapshot, so no parent assignment was accepted from it. Problems: ${boundProblems(bindingProblems).join('; ')}. Re-run first-load:woo-snapshot (or --verify it) and name its snapshot and provenance in the manifest as wooSnapshot.`, 'variant-parents')
+    run.find('ERROR', 'VARIANT_PARENTS_NOT_BOUND', `the variant-parents dataset was REFUSED: it is not bound to a verified WooCommerce snapshot, so no parent assignment was accepted from it. Problems: ${boundProblems(bindingProblems).join('; ')}. Re-run first-load:woo-snapshot (or --verify it) and name its snapshot, provenance and the expected store origin in the manifest as wooSnapshot.`, 'variant-parents')
     run.variantParentSummary = { supplied: true, rowsRead: run.rows('variant-parents').length, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
     return
   }
