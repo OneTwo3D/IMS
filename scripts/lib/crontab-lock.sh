@@ -1925,8 +1925,8 @@ migrate_legacy_cron_lines() {
   local re_runtime re_literal re_hist
   re_runtime="^${sched}CRON_SECRET=\\\$\\(grep -m1 ${q}\\^CRON_SECRET=${q} ${q}([^${q}]+)${q} \\| cut -d= -f2- \\| tr -d ${q}\"${q}\\) && \\[ -n \"\\\$CRON_SECRET\" \\] && curl -sf -o /dev/null -H \"Authorization: Bearer \\\$CRON_SECRET\" \"\\\$BASE_URL/([A-Za-z0-9._-]+)\" >> ${q}([^${q}]+)${q} 2>&1\$"
   re_literal="^${sched}curl -sf -o /dev/null -H \"Authorization: Bearer \\\$CRON_SECRET\" \"\\\$BASE_URL/([A-Za-z0-9._-]+)\" >> ${q}([^${q}]+)${q} 2>&1\$"
-  # the unmarked shape of d3ebd53a..80bb3700: 4 = .env path, 8 = URL, 9 = the optional ` > /dev/null 2>&1`
-  re_hist="^${sched}CRON_SECRET=\\\$\\(grep -m ?1 ${q}\\^CRON_SECRET=${q} ${q}([^${q}]+)${q} \\| cut -d= -f2-( \\| tr -d ${q}\"${q})?\\) && (\\[ -n \"\\\$CRON_SECRET\" \\] && )?curl -[A-Za-z]+ -H \"Authorization: Bearer \\\$(\\{CRON_SECRET\\}|CRON_SECRET)\" ([^ ${q}\"\$\`\\\\]+)( > /dev/null 2>&1)?\$"
+  # the unmarked shape of d3ebd53a..80bb3700: 4 = .env path, 7 = URL, 8 = the optional ` > /dev/null 2>&1`
+  re_hist="^${sched}CRON_SECRET=\\\$\\(grep -m ?1 ${q}\\^CRON_SECRET=${q} ${q}([^${q}]+)${q} \\| cut -d= -f2-( \\| tr -d ${q}\"${q})?\\) && (\\[ -n \"\\\$CRON_SECRET\" \\] && )?curl -[A-Za-z]+ -H \"Authorization: Bearer \\\$\\{?CRON_SECRET\\}?\" ([^ ${q}\"\$\`\\\\]+)( > /dev/null 2>&1)?\$"
   CRON_LEGACY_LEFT=0
   CRON_LEGACY_LINENOS=""
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -1945,7 +1945,7 @@ migrate_legacy_cron_lines() {
         newline="${BASH_REMATCH[1]}${BASH_REMATCH[3]}${rewritten_command}"
       fi
     elif cron_line_exposes_bearer "${line}" && [[ "${line}" =~ ${re_hist} ]]; then
-      cron_historical_command_into rewritten_command "${BASH_REMATCH[8]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[9]}"
+      cron_historical_command_into rewritten_command "${BASH_REMATCH[7]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[8]}"
       newline="${BASH_REMATCH[1]}${BASH_REMATCH[3]}${rewritten_command}"
     fi
     # whatever is STILL a bearer-header job line, wherever it sits, is a line this cannot rewrite

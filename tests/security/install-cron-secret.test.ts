@@ -30,8 +30,9 @@ test('installer cron entries read the secret at runtime and never embed it', asy
     /\. '\$\{CRON_ENV_FILE\}'/,
     'generated crontab lines must not source the full .env file',
   )
+  // (comments quote the historical unmarked shape the rewrite recognises, so only code lines count)
   assert.doesNotMatch(
-    installScript,
+    installScript.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n'),
     /Authorization: Bearer \$\{CRON_SECRET\}/,
     'install-time CRON_SECRET interpolation must not appear in generated crontab lines',
   )
