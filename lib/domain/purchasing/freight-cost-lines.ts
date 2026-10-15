@@ -35,6 +35,12 @@ const finiteNumber = (label: string) => z
   .refine(Number.isFinite, `${label} must be a finite number`)
 
 export const FreightCostLineInputSchema = z.object({
+  /**
+   * The id of the STORED cost line this row edits. Optional: a row without one is a NEW line. `updateFreightPoCosts`
+   * matches by this id (never by position), so a reordered or removed row cannot change which stored row is
+   * updated, billed ones included.
+   */
+  id: z.string().min(1).optional(),
   description: z.string({ error: 'Each cost line needs a description' }),
   amountForeign: finiteNumber('Cost line amount'),
   vatable: z.boolean({ error: 'Cost line vatable must be true or false' }),
@@ -159,4 +165,142 @@ export function buildFreightCostLineRows(
     totalForeign: subtotalForeign.add(taxForeign),
     totalBase: subtotalBase.add(taxBase),
   }
+}
+
+// ---------------------------------------------------------------------------
+// Editing a freight order's stored lines
+// ---------------------------------------------------------------------------
+
+export type StoredFreightCostLine = {
+  id: string
+  description: string
+  amountForeign: Prisma.Decimal
+  vatable: boolean
+  distributionMethod: string
+  /** True when a purchase-invoice line points at this cost line: it has been billed and its money is fixed. */
+  billed: boolean
+}
+
+/** Refusal for a VAT-rate or vatable-flag change on a freight order that already has a billed cost line. Single-sourced. */
+export const FREIGHT_BILLED_VAT_CHANGE_MESSAGE =
+  'This freight order already has a billed cost line, so its VAT rate or the VAT flag of its lines cannot be changed: the bill would keep the old VAT while the order showed the new. Correct or credit the bill first.'
+
+export class FreightEditRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'FreightEditRefusedError'
+  }
+}
+
+export type FreightCostLinePlan =
+  | { kind: 'noop' }
+  | {
+    kind: 'apply'
+    /** Stored rows to edit IN PLACE, by id. */
+    updates: Array<{ id: string; row: FreightCostLineRow }>
+    deletes: string[]
+    creates: FreightCostLineRow[]
+  }
+
+function sameLine(stored: StoredFreightCostLine, row: FreightCostLineRow): boolean {
+  return stored.description === row.description
+    && stored.amountForeign.eq(row.amountForeign)
+    && stored.vatable === row.vatable
+    && stored.distributionMethod === row.distributionMethod
+}
+
+/**
+ * HOW A SAVE OF A FREIGHT ORDER'S LINES MAPS ONTO WHAT IS STORED. Pure, so it can be proved without a database.
+ *
+ *  - Rows are matched by STABLE ID, never by position: a reordered or removed row must not change which stored
+ *    row gets updated. A submitted row with an id edits that stored row; one without an id is a NEW line; a
+ *    stored row nobody submitted is DELETED. An id that is not one of this order's lines, or is repeated, is
+ *    refused.
+ *  - A row that has been BILLED (a purchase-invoice line points at it) is never modified and never deleted: the
+ *    bill's money is fixed and silently rewriting the cost under it would disagree with the document.
+ *  - A caller that supplies NO ids at all (the pre-id contract) is a full replacement: it is a no-op only when it
+ *    equals the stored lines exactly, position for position and tax unchanged; otherwise every stored row is
+ *    deleted and recreated (refused if any was billed). That is the previous behaviour for edits, kept so a
+ *    caller that never learned about ids is neither broken nor given a position-matching shortcut.
+ *  - Unchanged means: no field the operator controls differs (description, amount, vatable, method), nothing is
+ *    added or removed, and the tax rate did not change. The derived base amount is NOT compared, so a legacy
+ *    row stored by the old float builder is not read as an edit.
+ */
+export function planFreightCostLineEdit(
+  stored: StoredFreightCostLine[],
+  submitted: FreightCostLineInput[],
+  rows: FreightCostLineRow[],
+  taxChanged: boolean,
+): FreightCostLinePlan {
+  const anyBilled = stored.some((row) => row.billed)
+  if (anyBilled && taxChanged) throw new FreightEditRefusedError(FREIGHT_BILLED_VAT_CHANGE_MESSAGE)
+  if (!submitted.some((line) => line.id)) {
+    const identical = stored.length === rows.length && rows.every((row, index) => sameLine(stored[index]!, row))
+    if (identical && !taxChanged) return { kind: 'noop' }
+    const billed = stored.find((row) => row.billed)
+    if (billed) {
+      throw new FreightEditRefusedError(`Cost line ${billed.id} has already been billed and cannot be replaced or removed.`)
+    }
+    return { kind: 'apply', updates: [], deletes: stored.map((row) => row.id), creates: rows }
+  }
+
+  const storedById = new Map(stored.map((row) => [row.id, row]))
+  const seen = new Set<string>()
+  const updates: Array<{ id: string; row: FreightCostLineRow }> = []
+  const creates: FreightCostLineRow[] = []
+  submitted.forEach((line, index) => {
+    const row = rows[index]!
+    if (!line.id) {
+      creates.push(row)
+      return
+    }
+    const existing = storedById.get(line.id)
+    if (!existing) throw new FreightEditRefusedError(`Cost line ${line.id} is not a line of this freight order.`)
+    if (seen.has(line.id)) throw new FreightEditRefusedError(`Cost line ${line.id} was submitted twice.`)
+    seen.add(line.id)
+    if (sameLine(existing, row)) return
+    if (anyBilled && existing.vatable !== row.vatable) throw new FreightEditRefusedError(FREIGHT_BILLED_VAT_CHANGE_MESSAGE)
+    if (existing.billed) {
+      throw new FreightEditRefusedError(`Cost line ${existing.id} has already been billed and cannot be changed.`)
+    }
+    updates.push({ id: existing.id, row })
+  })
+  const deletes = stored.filter((row) => !seen.has(row.id)).map((row) => row.id)
+  const billedDelete = stored.find((row) => deletes.includes(row.id) && row.billed)
+  if (billedDelete) {
+    throw new FreightEditRefusedError(`Cost line ${billedDelete.id} has already been billed and cannot be removed.`)
+  }
+  if (updates.length === 0 && deletes.length === 0 && creates.length === 0 && !taxChanged) return { kind: 'noop' }
+  return { kind: 'apply', updates, deletes, creates }
+}
+
+// ---------------------------------------------------------------------------
+// The tax rate of an edit
+// ---------------------------------------------------------------------------
+
+/** The refusal for an order that was charged VAT but never recorded the rate. Single-sourced: action and dialog show it. */
+export const FREIGHT_TAX_RATE_UNKNOWN_MESSAGE =
+  'This freight order was charged VAT but its VAT rate was never recorded. Choose the VAT rate to save the order.'
+
+/**
+ * WHICH VAT RATE AN EDIT SAVES AT. `requested` is what the caller sent (a fraction, 0.2; undefined = nothing sent).
+ *
+ *  - Sent: that rate. A different rate from the stored one is an edit in its own right (`taxChanged`), even when
+ *    no line changed.
+ *  - Not sent: the STORED rate is kept, never zeroed.
+ *  - Not sent and the order has no recorded rate: 0 when it was charged no VAT. When it WAS charged VAT the rate is
+ *    NOT inferred from tax / vatable subtotal (that turns rounding residue into a new rate); the edit is refused and
+ *    the caller must say the rate.
+ */
+export function resolveFreightEditTaxRate(params: {
+  requested: number | undefined
+  storedRate: Prisma.Decimal | number | string | null
+  storedTaxForeign: Prisma.Decimal | number | string
+}): { effectiveRate: Prisma.Decimal; taxChanged: boolean } {
+  const storedRate = params.storedRate != null ? new Prisma.Decimal(params.storedRate) : null
+  if (params.requested === undefined && storedRate === null && !new Prisma.Decimal(params.storedTaxForeign).isZero()) {
+    throw new FreightEditRefusedError(FREIGHT_TAX_RATE_UNKNOWN_MESSAGE)
+  }
+  const effectiveRate = params.requested !== undefined ? new Prisma.Decimal(params.requested) : (storedRate ?? new Prisma.Decimal(0))
+  return { effectiveRate, taxChanged: !effectiveRate.eq(storedRate ?? new Prisma.Decimal(0)) }
 }

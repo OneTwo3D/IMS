@@ -53,13 +53,15 @@ test('a no-VAT bill is credited at the net value (gross-up ratio 1)', () => {
   assert.deepEqual(draft, { invoiceId: 'INV1', amountForeign: 30, amountBase: 30, fxRateToBase: 1 })
 })
 
-test('converts the credit to base currency via the bill fx rate', () => {
+test('converts the credit to base currency via the bill fx rate (divides)', () => {
   const { draft } = computeReturnCreditNoteDraft({
     poLines: [{ poLineId: 'L1', qtyReceived: 15, qtyReturned: 3 }],
     bills: [bill({ fxRateToBase: 1.1 })],
   })
   assert.equal(draft?.amountForeign, 36)
-  assert.equal(draft?.amountBase, 39.6)
+  // Rate 1.1 is foreign units per ONE base unit: base = 36 / 1.1 = 32.7273 (it used to multiply: 39.6).
+  console.log(`return credit PRECONDITION: amountForeign=${draft?.amountForeign} rate=1.1 -> amountBase=${draft?.amountBase}`)
+  assert.equal(draft?.amountBase, 32.7273)
 })
 
 test('nets out prior RETURN credit notes so repeated returns only top up', () => {
