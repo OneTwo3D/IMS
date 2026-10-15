@@ -21,6 +21,8 @@ import { prepare } from '../../lib/first-load/transform.ts'
 
 const KEY = 'ck_test_readonly_key_0000'
 const SECRET = 'cs_test_readonly_secret_1111'
+interface FindingShape { code: string; severity: string; message: string }
+interface PrepareReportShape { findings: FindingShape[]; variantParents: { variantsJoined: number; parentsEmitted: number } }
 const scratch = mkdtempSync(path.join(tmpdir(), 'first-load-binding-'))
 let counter = 0
 const fresh = (label: string) => path.join(scratch, `${label}-${++counter}`)
@@ -69,7 +71,8 @@ const edit = (target: string, change: (text: string) => string) => {
   assert.notEqual(after, before, 'the tampering changed nothing: the arm would examine an untouched file')
   writeFileSync(target, after)
 }
-const editProvenance = (dir: string, change: (p: Record<string, any>) => void) => edit(file(dir, SNAPSHOT_FILE_NAMES.provenance), (text) => { const p = JSON.parse(text); change(p); return `${JSON.stringify(p, null, 2)}\n` })
+interface Provenance { snapshotFile: { sha256: string; payloadSha256: string }; variantParentsFile?: { sha256: string } }
+const editProvenance = (dir: string, change: (p: Provenance) => void) => edit(file(dir, SNAPSHOT_FILE_NAMES.provenance), (text) => { const p = JSON.parse(text); change(p); return `${JSON.stringify(p, null, 2)}\n` })
 
 async function verify(dir: string): Promise<{ code: number; stdout: string; stderr: string }> {
   let stdout = ''
@@ -79,7 +82,7 @@ async function verify(dir: string): Promise<{ code: number; stdout: string; stde
 }
 
 /** Runs first-load:prepare over products V-01..V-03 and the bundle's CSV; `csvFrom` is the directory whose variant-parents.csv is listed. */
-async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; wooSnapshot?: boolean }): Promise<{ code: number; stdout: string; stderr: string; out: string; written: string; report: any }> {
+async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; wooSnapshot?: boolean }): Promise<{ code: number; stdout: string; stderr: string; out: string; written: string; report: PrepareReportShape }> {
   const dir = fresh('prepare')
   mkdirSync(dir)
   writeFileSync(path.join(dir, 'products.csv'), 'sku,name,type\nV-01,Variant one,VARIANT\nV-02,Variant two,VARIANT\nV-03,Variant three,VARIANT\n')
@@ -93,7 +96,7 @@ async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; 
   const out = fresh('prepared')
   const code = await runPrepare(['--manifest', path.join(dir, 'manifest.json'), '--out', out], { stdout: (s) => (stdout += s), stderr: (s) => (stderr += s) })
   let written = ''
-  let report: any = null
+  let report: PrepareReportShape = { findings: [], variantParents: { variantsJoined: 0, parentsEmitted: 0 } }
   try {
     for (const name of readdirSync(out)) written += `${name}\n${readFileSync(path.join(out, name), 'utf8')}\n`
     report = JSON.parse(readFileSync(path.join(out, 'validation-report.json'), 'utf8'))
@@ -105,8 +108,9 @@ async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; 
 function assertRefused(t: import('node:test').TestContext, ran: Awaited<ReturnType<typeof prepareWith>>, honestWritten: string, label: string): void {
   precondition(t, `${label}: honest control wrote the real parent`, honestWritten.includes(REAL_PARENT) ? 1 : 0)
   assert.equal(ran.code, EXIT_CODES.BLOCKING_FINDINGS, `${label}: ${ran.stdout}${ran.stderr}`)
-  const finding = ran.report?.findings?.find((f: any) => f.code === 'VARIANT_PARENTS_NOT_BOUND')
+  const finding = ran.report?.findings?.find((f: FindingShape) => f.code === 'VARIANT_PARENTS_NOT_BOUND')
   precondition(t, `${label}: VARIANT_PARENTS_NOT_BOUND findings`, finding ? 1 : 0)
+  assert.ok(finding)
   assert.equal(finding.severity, 'ERROR')
   assert.equal(ran.report.variantParents.variantsJoined, 0, `${label}: no variant was joined`)
   assert.equal(ran.report.variantParents.parentsEmitted, 0, `${label}: no parent was emitted`)
@@ -125,7 +129,7 @@ test('arm (a): an honest bundle is accepted by --verify and by first-load:prepar
   precondition(t, 'variants joined', ran.report.variantParents.variantsJoined)
   assert.equal(ran.report.variantParents.variantsJoined, 3)
   assert.ok(ran.written.includes(REAL_PARENT))
-  assert.ok(!ran.report.findings.some((f: any) => f.code === 'VARIANT_PARENTS_NOT_BOUND'))
+  assert.ok(!ran.report.findings.some((f: FindingShape) => f.code === 'VARIANT_PARENTS_NOT_BOUND'))
 })
 
 test('arm (b): a hand-edited CSV (a changed parent SKU) with the snapshot untouched is refused by --verify and by prepare', async (t) => {
@@ -209,7 +213,7 @@ test('arm (g) isolating: a different VALID snapshot swapped in beside the origin
   // The snapshot and CSV both come from the other store, and the provenance keeps the original's CSV hash made to match, so only the snapshot hash can refuse.
   cpSync(file(other, SNAPSHOT_FILE_NAMES.snapshot), file(b, SNAPSHOT_FILE_NAMES.snapshot))
   cpSync(file(other, SNAPSHOT_FILE_NAMES.variantParents), file(b, SNAPSHOT_FILE_NAMES.variantParents))
-  editProvenance(b, (p) => { p.variantParentsFile.sha256 = sha256Hex(readFileSync(file(b, SNAPSHOT_FILE_NAMES.variantParents))); p.snapshotFile.payloadSha256 = JSON.parse(readFileSync(file(other, SNAPSHOT_FILE_NAMES.snapshot), 'utf8')).payloadSha256 })
+  editProvenance(b, (p) => { p.variantParentsFile!.sha256 = sha256Hex(readFileSync(file(b, SNAPSHOT_FILE_NAMES.variantParents))); p.snapshotFile.payloadSha256 = JSON.parse(readFileSync(file(other, SNAPSHOT_FILE_NAMES.snapshot), 'utf8')).payloadSha256 })
   const v = await verify(b)
   precondition(t, 'verify problems', v.stderr.length)
   assert.match(v.stderr, /snapshot file .* is not the one the provenance recorded/)
@@ -220,7 +224,7 @@ test('arm (h) isolating: an edited CSV whose recorded hash was re-written to mat
   const honest = await prepareWith({ snapshotDir: await bundle(), csvFrom: await bundle() })
   const b = copyBundle(await bundle())
   edit(file(b, SNAPSHOT_FILE_NAMES.variantParents), (text) => text.replace(REAL_PARENT, EVIL_PARENT))
-  editProvenance(b, (p) => { p.variantParentsFile.sha256 = sha256Hex(readFileSync(file(b, SNAPSHOT_FILE_NAMES.variantParents))) })
+  editProvenance(b, (p) => { p.variantParentsFile!.sha256 = sha256Hex(readFileSync(file(b, SNAPSHOT_FILE_NAMES.variantParents))) })
   const v = await verify(b)
   precondition(t, 'verify problems', v.stderr.length)
   assert.match(v.stderr, /not the rows regenerated from the verified snapshot/)
@@ -231,7 +235,7 @@ test('arm (h) isolating: an edited CSV whose recorded hash was re-written to mat
 test('arm (i) isolating: an UNCHANGED CSV whose recorded hash was altered is refused by the hash alone', async (t) => {
   const honest = await prepareWith({ snapshotDir: await bundle(), csvFrom: await bundle() })
   const b = copyBundle(await bundle())
-  editProvenance(b, (p) => { p.variantParentsFile.sha256 = '0'.repeat(64) })
+  editProvenance(b, (p) => { p.variantParentsFile!.sha256 = '0'.repeat(64) })
   const v = await verify(b)
   precondition(t, 'verify problems', v.stderr.length)
   assert.match(v.stderr, /not the file the provenance recorded/)
@@ -256,7 +260,7 @@ test('arm (k): a manifest that lists variant-parents but names no wooSnapshot is
   const honest = await prepareWith({ snapshotDir: await bundle(), csvFrom: await bundle() })
   const b = await bundle()
   const ran = await prepareWith({ snapshotDir: b, csvFrom: b, wooSnapshot: false })
-  assert.match(ran.report.findings.find((f: any) => f.code === 'VARIANT_PARENTS_NOT_BOUND')?.message ?? '', /does not name wooSnapshot/)
+  assert.match(ran.report.findings.find((f: FindingShape) => f.code === 'VARIANT_PARENTS_NOT_BOUND')?.message ?? '', /does not name wooSnapshot/)
   assertRefused(t, ran, honest.written, 'no wooSnapshot')
 })
 
