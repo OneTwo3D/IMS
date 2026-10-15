@@ -61,8 +61,8 @@ export function canonicalJson(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`
 }
 
-export function sha256Hex(text: string): string {
-  return createHash('sha256').update(text, 'utf8').digest('hex')
+export function sha256Hex(content: string | Uint8Array): string {
+  return typeof content === 'string' ? createHash('sha256').update(content, 'utf8').digest('hex') : createHash('sha256').update(content).digest('hex')
 }
 
 /** Sorted copy: parents and variations by id, variation ids ascending, attributes by name then option. Nothing in a snapshot depends on the order the store answered in. */
@@ -265,4 +265,127 @@ export function formulaLeadingCells(payload: SnapshotPayload): number {
  */
 export function renderVariantParentsInspectionCsv(payload: SnapshotPayload): string {
   return serializeCsv(DATASETS['variant-parents'].columns, variantParentRows(payload).map((row) => row.map((cell) => (FORMULA_LEADING.test(cell) ? `'${cell}` : cell))))
+}
+
+// ---------------------------------------------------------------------------
+// The binding between the verified snapshot and the files derived from it
+// ---------------------------------------------------------------------------
+
+/**
+ * What `first-load:prepare` needs to know before it lets variant-parents.csv assign a parent. `verified: true` is only ever produced by
+ * `verifyWooSnapshotBundle` (through `bindingFromVerification`); `csvSha256` is the hash of the exact CSV bytes that were compared, so a later
+ * step can check it is looking at those bytes.
+ */
+export type VariantParentsBinding =
+  | { verified: true; csvSha256: string; snapshotPayloadSha256: string }
+  | { verified: false; problems: string[] }
+
+export type SnapshotBundleVerdict =
+  | { ok: true; payload: SnapshotPayload; payloadSha256: string; snapshotSha256: string; csvSha256: string }
+  | { ok: false; problems: string[] }
+
+const MAX_BUNDLE_PROBLEMS = 8
+const MAX_PROBLEM_CHARS = 300
+
+/** Messages stay short and never echo file content (a CSV cell is untrusted text). */
+export function boundProblems(problems: string[]): string[] {
+  const clipped = problems.slice(0, MAX_BUNDLE_PROBLEMS).map((p) => (p.length > MAX_PROBLEM_CHARS ? `${p.slice(0, MAX_PROBLEM_CHARS)}...` : p))
+  if (problems.length > MAX_BUNDLE_PROBLEMS) clipped.push(`... and ${problems.length - MAX_BUNDLE_PROBLEMS} more problem(s)`)
+  return clipped
+}
+
+const hex12 = (hex: string) => hex.slice(0, 12)
+
+/**
+ * THE BINDING. A variant-parents.csv assigns a parent SKU to a Qoblex variant, so it is only as good as the snapshot it came from. This
+ * regenerates the rows from the VERIFIED snapshot with the same pure builder that wrote them and requires:
+ *   1. the snapshot's own checksum and consistency rules to hold;
+ *   2. the provenance to record the SHA-256 of the snapshot file, of the CSV and (when `inspectionBytes` is given) of the inspection copy, and each to match
+ *      the bytes on disk;
+ *   3. the CSV on disk to be BYTE-IDENTICAL to the regenerated one (so an edited, stale or foreign CSV is refused even if every hash were forged).
+ * It returns problems, never throws, and never echoes file content.
+ */
+export function verifyWooSnapshotBundle(input: {
+  snapshotBytes: Uint8Array | null
+  provenanceBytes: Uint8Array | null
+  csvBytes: Uint8Array | null
+  /** Offline `--verify` also checks the inspection copy; `first-load:prepare` does not read it. */
+  inspectionBytes?: Uint8Array | null
+  requireInspection?: boolean
+}): SnapshotBundleVerdict {
+  const problems: string[] = []
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  const text = (bytes: Uint8Array | null, label: string): string | null => {
+    if (bytes === null) {
+      problems.push(`${label} could not be read`)
+      return null
+    }
+    try {
+      return decoder.decode(bytes)
+    } catch {
+      problems.push(`${label} is not valid UTF-8`)
+      return null
+    }
+  }
+  const snapshotText = text(input.snapshotBytes, 'the snapshot file')
+  const provenanceText = text(input.provenanceBytes, 'the provenance file')
+  const parsed = snapshotText === null ? null : parseSnapshotFile(snapshotText)
+  if (parsed !== null && !parsed.ok) problems.push(...parsed.problems.map((p) => `snapshot: ${p}`))
+
+  let provenance: Record<string, unknown> | null = null
+  if (provenanceText !== null) {
+    try {
+      const raw: unknown = JSON.parse(provenanceText)
+      if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) provenance = raw as Record<string, unknown>
+      else problems.push('the provenance file is not a JSON object')
+    } catch {
+      problems.push('the provenance file is not valid JSON')
+    }
+  }
+  const recorded = (key: string, label: string): { sha256: string | null; payloadSha256?: string | null } => {
+    const entry = provenance?.[key]
+    if (provenance === null) return { sha256: null }
+    if (typeof entry !== 'object' || entry === null || typeof (entry as Record<string, unknown>).sha256 !== 'string' || !/^[0-9a-f]{64}$/.test((entry as Record<string, string>).sha256)) {
+      problems.push(`the provenance does not record a SHA-256 for ${label}`)
+      return { sha256: null }
+    }
+    const e = entry as Record<string, unknown>
+    return { sha256: e.sha256 as string, payloadSha256: typeof e.payloadSha256 === 'string' ? e.payloadSha256 : null }
+  }
+  const snapRec = recorded('snapshotFile', 'the snapshot file')
+  const csvRec = recorded('variantParentsFile', 'variant-parents.csv')
+  const inspectRec = input.requireInspection ? recorded('variantParentsInspectionFile', 'the inspection copy') : { sha256: null }
+
+  let snapshotSha = ''
+  if (input.snapshotBytes !== null) {
+    snapshotSha = sha256Hex(input.snapshotBytes)
+    if (snapRec.sha256 !== null && snapRec.sha256 !== snapshotSha) problems.push(`the snapshot file (SHA-256 ${hex12(snapshotSha)}...) is not the one the provenance recorded (${hex12(snapRec.sha256)}...): it is a different or edited snapshot`)
+    if (parsed?.ok && snapRec.payloadSha256 != null && snapRec.payloadSha256 !== parsed.payloadSha256) problems.push('the snapshot payload checksum differs from the one the provenance recorded')
+  }
+  let csvSha = ''
+  if (input.csvBytes === null) problems.push('variant-parents.csv could not be read')
+  else {
+    csvSha = sha256Hex(input.csvBytes)
+    if (csvRec.sha256 !== null && csvRec.sha256 !== csvSha) problems.push(`variant-parents.csv (SHA-256 ${hex12(csvSha)}...) is not the file the provenance recorded (${hex12(csvRec.sha256)}...)`)
+  }
+  if (parsed?.ok) {
+    if (input.csvBytes !== null) {
+      const expected = Buffer.from(renderVariantParentsCsv(parsed.payload), 'utf8')
+      if (!expected.equals(Buffer.from(input.csvBytes))) problems.push(`variant-parents.csv is not the rows regenerated from the verified snapshot (${expected.length} byte(s) expected, ${input.csvBytes.length} found): it is stale, edited or from another snapshot`)
+    }
+    if (input.requireInspection) {
+      if (input.inspectionBytes == null) problems.push('the inspection copy could not be read')
+      else {
+        const inspectSha = sha256Hex(input.inspectionBytes)
+        if (inspectRec.sha256 !== null && inspectRec.sha256 !== inspectSha) problems.push(`the inspection copy (SHA-256 ${hex12(inspectSha)}...) is not the file the provenance recorded (${hex12(inspectRec.sha256)}...)`)
+        if (!Buffer.from(renderVariantParentsInspectionCsv(parsed.payload), 'utf8').equals(Buffer.from(input.inspectionBytes))) problems.push('the inspection copy is not the rows regenerated from the verified snapshot')
+      }
+    }
+  }
+  if (problems.length > 0 || parsed === null || !parsed.ok) return { ok: false, problems: boundProblems(problems.length > 0 ? problems : ['the snapshot could not be verified']) }
+  return { ok: true, payload: parsed.payload, payloadSha256: parsed.payloadSha256, snapshotSha256: snapshotSha, csvSha256: csvSha }
+}
+
+export function bindingFromVerification(verdict: SnapshotBundleVerdict): VariantParentsBinding {
+  return verdict.ok ? { verified: true, csvSha256: verdict.csvSha256, snapshotPayloadSha256: verdict.payloadSha256 } : { verified: false, problems: verdict.problems }
 }

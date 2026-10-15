@@ -1,9 +1,22 @@
 {
   "formatVersion": 1,
   "baseCurrency": "GBP",
+  "wooSnapshot": {
+    "snapshot": "woo/woo-snapshot.json",
+    "provenance": "woo/woo-snapshot.provenance.json"
+  },
   "inputs": [
-    { "dataset": "products", "file": "products.csv" },
-    { "dataset": "variant-parents", "file": "variant-parents.csv" },
-    { "dataset": "sku-exclusions", "file": "sku-exclusions.csv" }
+    {
+      "dataset": "products",
+      "file": "products.csv"
+    },
+    {
+      "dataset": "variant-parents",
+      "file": "variant-parents.csv"
+    },
+    {
+      "dataset": "sku-exclusions",
+      "file": "sku-exclusions.csv"
+    }
   ]
 }

@@ -35,6 +35,7 @@ import {
   type ProductType,
 } from './spec'
 import { joinVariantParents, type CatalogueView } from './variant-parents'
+import { boundProblems, type VariantParentsBinding } from './snapshot'
 import {
   accountRows,
   assertWithinImporterLimits,
@@ -89,6 +90,12 @@ export interface PrepareConfig {
 export interface PrepareInput {
   config: PrepareConfig
   datasets: Partial<Record<DatasetName, IngestedDataset>>
+  /**
+   * Proof that the variant-parents dataset is the one regenerated from a VERIFIED WooCommerce snapshot (see `verifyWooSnapshotBundle`). A variant-parents
+   * dataset is never trusted without it: when the dataset is supplied and this is absent, unverified or for other bytes, the dataset is refused (ERROR
+   * VARIANT_PARENTS_NOT_BOUND), no parent is assigned from it, and no parent is emitted.
+   */
+  variantParentsBinding?: VariantParentsBinding
 }
 
 export type Severity = 'ERROR' | 'WARNING' | 'INFO'
@@ -335,6 +342,8 @@ class Run {
   syntheticParents = new Set<string>()
   variantConfirmed = new Set<string>()
   variantParentKeys = new Set<string>()
+  /** True when the variant-parents dataset was supplied but refused because it is not bound to a verified snapshot. */
+  variantParentsRefused = false
   variantParentSummary = { supplied: false, rowsRead: 0, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
 
   constructor(readonly input: PrepareInput) {}
@@ -603,7 +612,9 @@ function loadCatalogue(run: Run): void {
     const { entry } = c
     if (entry.type === 'VARIANT') {
       if (entry.parentSku === '') {
-        run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_WITHOUT_PARENT', run.variantParentSummary.supplied
+        run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_WITHOUT_PARENT', run.variantParentsRefused
+          ? 'a VARIANT needs a parentSku, and the variant-parents dataset was refused because it is not bound to a verified WooCommerce snapshot'
+          : run.variantParentSummary.supplied
           ? 'a VARIANT needs a parentSku, and no WooCommerce variation has this SKU (the join is by exact SKU; it is never guessed from the SKU\'s shape, and the variant is never loaded as a simple product)'
           : 'a VARIANT needs a parentSku (the variant-parents dataset, read from WooCommerce, supplies it)')
         run.catStatus.set(entry.key, 'rejected')
@@ -618,7 +629,9 @@ function loadCatalogue(run: Run): void {
         continue
       }
       if (required && !run.variantConfirmed.has(entry.key)) {
-        run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_PARENT_UNCONFIRMED', run.has('variant-parents')
+        run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_PARENT_UNCONFIRMED', run.variantParentsRefused
+          ? `parent SKU ${JSON.stringify(entry.parentSku)} is named by the products file but the variant-parents dataset was refused (not bound to a verified WooCommerce snapshot), so the parent is unconfirmed`
+          : run.has('variant-parents')
           ? `parent SKU ${JSON.stringify(entry.parentSku)} is named by the products file but no accepted WooCommerce variation has this SKU, so the parent is unconfirmed`
           : 'the WooCommerce join is required (requireVariantParents) but no variant-parents dataset was supplied, so the parent is unconfirmed')
         run.catStatus.set(entry.key, 'rejected')
@@ -638,7 +651,7 @@ function loadCatalogue(run: Run): void {
     run.find('ERROR', 'VARIANT_PARENT_UNCONFIRMED', `${unconfirmed.length} VARIANT product(s) name a parent but WooCommerce does not confirm it by exact SKU (the join is required: a prefilled parentSku is not enough). Fix the SKU or exclude each with a reason.`, 'products', unconfirmed)
   }
   if (unjoined.length > 0) {
-    run.find('ERROR', 'VARIANT_WITHOUT_PARENT', `${unjoined.length} VARIANT product(s) have no parent: ${run.variantParentSummary.supplied ? 'no WooCommerce variation has their SKU' : 'no variant-parents dataset was supplied'}. Fix the SKU in Qoblex or WooCommerce, or put each on the exclusion list with a reason. They are never loaded as simple products.`, 'products', unjoined)
+    run.find('ERROR', 'VARIANT_WITHOUT_PARENT', `${unjoined.length} VARIANT product(s) have no parent: ${run.variantParentsRefused ? 'the variant-parents dataset was refused (not bound to a verified snapshot)' : run.variantParentSummary.supplied ? 'no WooCommerce variation has their SKU' : 'no variant-parents dataset was supplied'}. Fix the SKU in Qoblex or WooCommerce, or put each on the exclusion list with a reason. They are never loaded as simple products.`, 'products', unjoined)
   }
 }
 
@@ -648,6 +661,19 @@ function loadCatalogue(run: Run): void {
  */
 function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
   if (!run.has('variant-parents')) return
+  const dataset = run.input.datasets['variant-parents']!
+  const binding = run.input.variantParentsBinding
+  const bindingProblems: string[] = []
+  if (binding === undefined) bindingProblems.push('no proof was given that this dataset comes from a verified WooCommerce snapshot (the run manifest must name wooSnapshot)')
+  else if (!binding.verified) bindingProblems.push(...binding.problems)
+  else if (dataset.parts.length !== 1 || dataset.parts[0].sha256 !== binding.csvSha256) bindingProblems.push('the variant-parents bytes read are not the bytes that were verified against the snapshot')
+  if (bindingProblems.length > 0) {
+    run.variantParentsRefused = true
+    for (const row of run.rows('variant-parents')) run.add('variant-parents', row.line, row.values.variantSku, 'EXCLUDED', 'NOT_BOUND_TO_SNAPSHOT', 'the dataset is not bound to a verified WooCommerce snapshot, so no parent is taken from it')
+    run.find('ERROR', 'VARIANT_PARENTS_NOT_BOUND', `the variant-parents dataset was REFUSED: it is not bound to a verified WooCommerce snapshot, so no parent assignment was accepted from it. Problems: ${boundProblems(bindingProblems).join('; ')}. Re-run first-load:woo-snapshot (or --verify it) and name its snapshot and provenance in the manifest as wooSnapshot.`, 'variant-parents')
+    run.variantParentSummary = { supplied: true, rowsRead: run.rows('variant-parents').length, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
+    return
+  }
   if (!run.has('products')) {
     for (const row of run.rows('variant-parents')) run.add('variant-parents', row.line, row.values.variantSku, 'EXCLUDED', 'NO_CATALOGUE_TO_JOIN', 'the Qoblex products dataset was not supplied, so there is nothing to join')
     run.find('ERROR', 'VARIANT_PARENTS_NEED_CATALOGUE', 'the variant-parents dataset was supplied but the Qoblex products dataset was not: variants cannot be joined to their parents', 'variant-parents')

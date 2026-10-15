@@ -10,6 +10,7 @@ import path from 'node:path'
 import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
+import { bindingFromVerification, verifyWooSnapshotBundle, type VariantParentsBinding } from './snapshot'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
 
 export interface CliIo {
@@ -46,10 +47,12 @@ interface Manifest {
   transferKeyPrefix: string | null
   maxPurchaseTaxRate: string | null
   requireVariantParents: boolean
+  /** Where the snapshot and its provenance are, for the variant-parents binding. Relative to the manifest. */
+  wooSnapshot: { snapshot: string; provenance: string } | null
   inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null; supersedesEarlier: boolean }>
 }
 
-const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'requireVariantParents', 'inputs'])
+const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'requireVariantParents', 'wooSnapshot', 'inputs'])
 const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap', 'supersedesEarlier'])
 
 function parseManifest(text: string): Manifest {
@@ -76,6 +79,15 @@ function parseManifest(text: string): Manifest {
   }
   if (m.requireVariantParents !== undefined && typeof m.requireVariantParents !== 'boolean') throw new UsageError('manifest requireVariantParents must be true or false')
   const requireFlag = m.requireVariantParents === true
+  let wooSnapshot: Manifest['wooSnapshot'] = null
+  if (m.wooSnapshot !== undefined) {
+    const w = m.wooSnapshot
+    if (typeof w !== 'object' || w === null || Array.isArray(w)) throw new UsageError('manifest wooSnapshot must be an object {"snapshot": <woo-snapshot.json>, "provenance": <woo-snapshot.provenance.json>}')
+    const wo = w as Record<string, unknown>
+    for (const key of Object.keys(wo)) if (key !== 'snapshot' && key !== 'provenance') throw new UsageError(`unknown key "${key}" in manifest wooSnapshot`)
+    if (typeof wo.snapshot !== 'string' || wo.snapshot === '' || typeof wo.provenance !== 'string' || wo.provenance === '') throw new UsageError('manifest wooSnapshot needs a snapshot path and a provenance path (both strings)')
+    wooSnapshot = { snapshot: wo.snapshot, provenance: wo.provenance }
+  }
   if (!Array.isArray(m.inputs) || m.inputs.length === 0) throw new UsageError('manifest inputs must be a non-empty array')
   const seen = new Set<string>()
   const inputs: Manifest['inputs'] = []
@@ -102,6 +114,7 @@ function parseManifest(text: string): Manifest {
     transferKeyPrefix: optionalString('transferKeyPrefix'),
     maxPurchaseTaxRate: optionalString('maxPurchaseTaxRate'),
     requireVariantParents: requireFlag,
+    wooSnapshot,
     inputs,
   }
 }
@@ -254,9 +267,32 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
     maxPurchaseTaxRate: manifest.maxPurchaseTaxRate,
     requireVariantParents: manifest.requireVariantParents,
   }
+  // The variant-parents dataset assigns parents, so it is only accepted when it equals the rows regenerated from the verified snapshot named by the manifest.
+  let variantParentsBinding: VariantParentsBinding | undefined
+  if (datasets['variant-parents'] !== undefined) {
+    const listed = manifest.inputs.filter((i) => i.dataset === 'variant-parents')
+    const readOrNull = (file: string): Buffer | null => {
+      try {
+        return readFileSync(resolve(file))
+      } catch {
+        return null
+      }
+    }
+    if (listed.length !== 1 || listed[0].columnMap !== null) {
+      variantParentsBinding = { verified: false, problems: ['the variant-parents dataset must be exactly one canonical file written by first-load:woo-snapshot (no column map, listed once)'] }
+    } else if (manifest.wooSnapshot === null) {
+      variantParentsBinding = { verified: false, problems: ['the manifest does not name wooSnapshot (the snapshot and provenance variant-parents.csv was written with)'] }
+    } else {
+      variantParentsBinding = bindingFromVerification(verifyWooSnapshotBundle({
+        snapshotBytes: readOrNull(manifest.wooSnapshot.snapshot),
+        provenanceBytes: readOrNull(manifest.wooSnapshot.provenance),
+        csvBytes: readOrNull(listed[0].file),
+      }))
+    }
+  }
   let result
   try {
-    result = (deps.prepare ?? prepare)({ config, datasets })
+    result = (deps.prepare ?? prepare)({ config, datasets, variantParentsBinding })
   } catch (error) {
     if (error instanceof ConfigError) {
       io.stderr(`first-load-prepare: invalid run configuration: ${error.message}\n`)

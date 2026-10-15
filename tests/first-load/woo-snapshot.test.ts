@@ -523,9 +523,11 @@ test('arm (o): end to end: the snapshot\'s variant-parents.csv, fed to first-loa
     mkdirSync(dir)
     writeFileSync(path.join(dir, 'products.csv'), 'sku,name,type\nW-01,Qoblex widget red,VARIANT\nW-02,Qoblex widget blue,VARIANT\nG-01,Qoblex gadget,VARIANT\nB-01,Qoblex big,VARIANT\n')
     writeFileSync(path.join(dir, 'variant-parents.csv'), readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.variantParents)))
+    for (const name of [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.provenance]) writeFileSync(path.join(dir, name), readFileSync(path.join(r.out, name)))
     writeFileSync(path.join(dir, 'exclusions.csv'), 'sku,reason\nW-03,not loaded at first\nB-02,not loaded at first\nB-03,not loaded at first\nB-04,not loaded at first\nB-05,not loaded at first\n')
     writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
       formatVersion: 1, baseCurrency: 'GBP',
+      wooSnapshot: { snapshot: SNAPSHOT_FILE_NAMES.snapshot, provenance: SNAPSHOT_FILE_NAMES.provenance },
       inputs: [
         { dataset: 'products', file: 'products.csv' },
         { dataset: 'variant-parents', file: 'variant-parents.csv' },

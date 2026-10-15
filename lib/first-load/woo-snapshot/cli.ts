@@ -15,7 +15,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { SNAPSHOT_EXIT_CODES, SNAPSHOT_EXIT_CODE_TABLE, SNAPSHOT_FILE_NAMES } from '../spec'
-import { SNAPSHOT_FORMAT_VERSION, formulaLeadingCells, parseSnapshotFile, renderSnapshotFile, renderVariantParentsCsv, renderVariantParentsInspectionCsv, sha256Hex } from '../snapshot'
+import { SNAPSHOT_FORMAT_VERSION, formulaLeadingCells, parseSnapshotFile, renderSnapshotFile, renderVariantParentsCsv, renderVariantParentsInspectionCsv, sha256Hex, verifyWooSnapshotBundle } from '../snapshot'
 import { WALK_MAX_ATTEMPTS, SnapshotFetchError, SnapshotInconsistentError, freshState, walkStore, type PageResult, type WalkState } from './walk'
 
 export interface CliIo {
@@ -55,7 +55,7 @@ export function usageText(): string {
     '  --resume               continue an unfinished walk kept in --out (same store only)',
     `  --min-interval-ms <n>  minimum milliseconds between two requests (default ${DEFAULT_MIN_INTERVAL_MS})`,
     `  --max-resume-age-minutes <n>  an unfinished walk older than this is not resumed (default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`,
-    '  --verify <file>        offline: recompute the checksum of a snapshot and re-run its consistency rules; no request, no credentials',
+    '  --verify <file>        offline: recompute the checksum of a snapshot, re-run its consistency rules, and require the provenance, variant-parents.csv and the inspection copy beside it to match (the CSV must equal the rows regenerated from the snapshot); no request, no credentials',
     '  --help                 this text',
     '',
     'Exit codes:',
@@ -174,20 +174,33 @@ function writeAtomic(target: string, content: string): void {
   renameSync(tmp, target)
 }
 
-function runVerify(file: string, io: CliIo): number {
-  let text: string
+/** Reads a file for the offline check; an unreadable file is `null` (the verdict names it), and the error text is never echoed beyond its code. */
+export function readBytesOrNull(file: string): Buffer | null {
   try {
-    text = readFileSync(file, 'utf8')
-  } catch (error) {
-    io.stderr(`first-load-woo-snapshot: cannot read ${file}: ${error instanceof Error ? error.message : String(error)}\n`)
+    return readFileSync(file)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * --verify: the snapshot AND the files derived from it. The provenance, variant-parents.csv and the inspection copy are read from the snapshot's
+ * own directory; the CSV must be byte-identical to the rows regenerated from the verified snapshot and every recorded hash must match.
+ */
+function runVerify(file: string, io: CliIo): number {
+  const dir = path.dirname(path.resolve(file))
+  const verdict = verifyWooSnapshotBundle({
+    snapshotBytes: readBytesOrNull(file),
+    provenanceBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.provenance)),
+    csvBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.variantParents)),
+    inspectionBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.variantParentsInspection)),
+    requireInspection: true,
+  })
+  if (!verdict.ok) {
+    io.stderr(`first-load-woo-snapshot: the snapshot ${file} and the files derived from it cannot be trusted:\n${verdict.problems.map((p) => `  - ${p}`).join('\n')}\n`)
     return SNAPSHOT_EXIT_CODES.INCONSISTENT
   }
-  const parsed = parseSnapshotFile(text)
-  if (!parsed.ok) {
-    io.stderr(`first-load-woo-snapshot: the snapshot ${file} cannot be trusted:\n${parsed.problems.map((p) => `  - ${p}`).join('\n')}\n`)
-    return SNAPSHOT_EXIT_CODES.INCONSISTENT
-  }
-  io.stdout(`Snapshot verified: payload SHA-256 ${parsed.payloadSha256}; ${parsed.payload.parents.length} variable product(s), ${parsed.payload.variations.length} variation(s); no consistency problem.\n`)
+  io.stdout(`Snapshot verified: payload SHA-256 ${verdict.payloadSha256}; ${verdict.payload.parents.length} variable product(s), ${verdict.payload.variations.length} variation(s); no consistency problem. ${SNAPSHOT_FILE_NAMES.variantParents} is byte-identical to the rows regenerated from it and the provenance hashes match.\n`)
   return SNAPSHOT_EXIT_CODES.OK
 }
 
@@ -342,6 +355,7 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
     snapshotFile: { name: SNAPSHOT_FILE_NAMES.snapshot, sha256: sha256Hex(snapshotText), bytes: Buffer.byteLength(snapshotText, 'utf8'), payloadSha256: reread.payloadSha256 },
     formulaLeadingCells: formulaLeadingCells(reread.payload),
     variantParentsFile: { name: SNAPSHOT_FILE_NAMES.variantParents, sha256: sha256Hex(csv), rows: csv.split('\r\n').filter((l) => l !== '').length - 1 },
+    variantParentsInspectionFile: { name: SNAPSHOT_FILE_NAMES.variantParentsInspection, sha256: sha256Hex(inspection) },
   }
   const created: string[] = []
   try {

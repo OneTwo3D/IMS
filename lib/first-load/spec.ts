@@ -375,7 +375,7 @@ export const SNAPSHOT_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: Snaps
     name: 'INCONSISTENT',
     meaning:
       'The store answered, but what it returned cannot be trusted as a complete, consistent catalogue (a count does not match its total header, a parent is not variable or has no SKU, a variation SKU repeats, '
-      + 'the store changed during the walk) or --verify found a damaged snapshot. No final file was written.',
+      + 'the store changed during the walk) or --verify found a damaged snapshot or derived files (provenance, variant-parents.csv, inspection copy) that do not match it. No final file was written.',
   },
   { code: SNAPSHOT_EXIT_CODES.USAGE, name: 'USAGE', meaning: 'Bad command line. Nothing was read, requested or written.' },
   {
