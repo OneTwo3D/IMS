@@ -22,6 +22,8 @@ import { withTempDir } from './temp-dir.ts'
 const ROOT = process.cwd()
 const INSTALL = readFileSync(join(ROOT, 'scripts/install.sh'), 'utf8')
 const LIB = readFileSync(join(ROOT, 'scripts/lib/db-fence-protected.sh'), 'utf8')
+/** The cron line renderer and the legacy-line rewrite live in ONE shared library (install.sh, update.sh and deploy.sh all source it). */
+const CRONLIB = readFileSync(join(ROOT, 'scripts/lib/crontab-lock.sh'), 'utf8')
 
 const CANARIES: Record<string, string> = {
   DEFAULT_ADMIN_NAME: 'canary-name',
@@ -179,12 +181,12 @@ function shellSources(): Record<string, string> {
 /** The sites that remain, with the reason each cannot (or need not) change. A new finding fails the test. */
 const ALLOWED: Array<{ file: string; match: string; reason: string }> = [
   {
-    file: 'scripts/install.sh',
+    file: 'scripts/lib/crontab-lock.sh',
     match: 're_runtime="^${sched}CRON_SECRET=',
     reason: 'a REGEX that recognises the legacy cron line so it can be rewritten (migrate_legacy_cron_lines); it is parsing text, not running a command.',
   },
   {
-    file: 'scripts/install.sh',
+    file: 'scripts/lib/crontab-lock.sh',
     match: 're_literal="^${sched}curl -sf -o /dev/n',
     reason: 'the same: the regex for the legacy embedded-literal form.',
   },
@@ -288,7 +290,7 @@ const CRON_CANARY = 'cron-canary-9f31c0de77aa'
 
 /** What install.sh's cron block writes for one job: the shipped function, run. */
 function installerJobLine(envFile: string, logFile: string): string {
-  const r = spawnSync('bash', ['-c', `${shippedFunction(INSTALL, 'cron_job_command_into') + '\n' + shippedFunction(INSTALL, 'cron_job_command')}\ncron_job_command backup ${JSON.stringify(logFile)} ${JSON.stringify(envFile)}`], { encoding: 'utf8' })
+  const r = spawnSync('bash', ['-c', `${shippedFunction(CRONLIB, 'cron_job_command_into') + '\n' + shippedFunction(CRONLIB, 'cron_job_command')}\ncron_job_command backup ${JSON.stringify(logFile)} ${JSON.stringify(envFile)}`], { encoding: 'utf8' })
   assert.equal(r.status, 0, r.stderr)
   return `0 2 * * *  ${r.stdout}`
 }
@@ -451,9 +453,10 @@ function runBootstrap(dir: string, crontab: string, opts: { failWrite?: boolean;
     'read_crontab_for() { CRONTAB_READ_TEXT="$(cat "$FAKE")"; }',
     opts.ignoreWrite ? 'write_crontab_for() { return 0; }' : opts.failWrite ? 'write_crontab_for() { CRONTAB_WRITE_REASON="the crontab client rejected the write"; return 1; }' : 'write_crontab_for() { printf \'%s\\n\' "$2" > "$FAKE"; }',
     "CRON_LEGACY_SIGNATURE='-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/'; CRON_LEGACY_LEFT=0",
-    shippedFunction(INSTALL, 'cron_job_command_into') + '\n' + shippedFunction(INSTALL, 'cron_job_command'),
-    shippedFunction(INSTALL, 'migrate_legacy_cron_lines'),
-    shippedFunction(INSTALL, 'count_legacy_cron_lines'),
+    shippedFunction(CRONLIB, 'cron_job_command_into') + '\n' + shippedFunction(CRONLIB, 'cron_job_command'),
+    shippedFunction(CRONLIB, 'migrate_legacy_cron_lines'),
+    shippedFunction(CRONLIB, 'count_legacy_cron_lines'),
+    shippedFunction(CRONLIB, 'rewrite_legacy_cron_block_in_hand'),
     shippedFunction(INSTALL, 'bootstrap_managed_crontab_block_locked'),
     'bootstrap_managed_crontab_block_locked; rc=$?',
     'echo "rc=${rc} state=${CRON_LEGACY_STATE}"',
@@ -516,19 +519,17 @@ test('[o3d-kb3dq] a write that fails, or a block shape the rewrite cannot handle
     assert.equal(r.after, odd, 'and the crontab is untouched')
   })
   // the caller acts on it: the run dies with an operator-visible message instead of warning
-  const text = INSTALL
-  const gateStart = text.indexOf('if [[ "${CRON_LEGACY_STATE}" != "migrated" && "${CRON_BOOTSTRAP_WRITTEN}" != "yes" ]]; then')
-  assert.notEqual(gateStart, -1)
-  const gateEnd = text.indexOf('\nfi\n', gateStart) + 4
-  const gate = text.slice(gateStart, gateEnd)
+  const gate = 'die_if_legacy_cron_lines_remain "this installer"'
+  assert.ok(INSTALL.includes('if [[ "${CRON_BOOTSTRAP_WRITTEN}" != "yes" ]]; then\n  ' + gate + '\nfi\n'), 'precondition: install.sh calls the shared refusal unless it wrote the block fresh')
   const runGate = (state: string, written: string, read: string) => spawnSync('bash', ['-c', [
     'die() { echo "DIE: $*"; exit 9; }',
     `CRON_LEGACY_STATE=${state}; CRON_BOOTSTRAP_WRITTEN=${written}; APP_USER=ims; CRONTAB_WRITE_REASON="why"`,
     'read_crontab_for() { CRONTAB_READ_TEXT="${READTEXT}"; }',
     "CRON_LEGACY_SIGNATURE='-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/'",
     'CRON_LEGACY_COUNT=0',
-    shippedFunction(INSTALL, 'count_legacy_cron_lines'),
-    gate, 'echo CONTINUED'].join('\n')], { encoding: 'utf8', env: { ...process.env, READTEXT: read } })
+    shippedFunction(CRONLIB, 'count_legacy_cron_lines'),
+    shippedFunction(CRONLIB, 'die_if_legacy_cron_lines_remain'),
+    `if [[ "\${CRON_BOOTSTRAP_WRITTEN}" != "yes" ]]; then ${gate}; fi`, 'echo CONTINUED'].join('\n')], { encoding: 'utf8', env: { ...process.env, READTEXT: read } })
   assert.equal(runGate('failed', 'no', '').status, 9, 'a failed rewrite stops the run')
   assert.equal(runGate('none', 'no', legacyCrontab('runtime')).status, 9, 'a lock conflict that left the old lines stops the run')
   assert.match(runGate('failed', 'no', '').stdout, /secret on curl's command line/)
@@ -537,8 +538,8 @@ test('[o3d-kb3dq] a write that fails, or a block shape the rewrite cannot handle
 })
 
 test('[o3d-kb3dq] MUTATION: skipping the block whenever one exists (trunk behaviour) leaves the old lines, so the rewrite test CAN fail', async () => {
-  const mutated = INSTALL.replace('if [[ "${CRON_LEGACY_COUNT}" -gt 0 ]]; then', 'if false; then')
-  assert.notEqual(mutated, INSTALL)
+  const mutated = CRONLIB.replace('if [[ "${CRON_LEGACY_COUNT}" -gt 0 ]]; then\n    migrate_legacy_cron_lines', 'if false; then\n    migrate_legacy_cron_lines')
+  assert.notEqual(mutated, CRONLIB)
   await withTempDir('ims-cron-migrate-mut-', async (dir) => {
     const fake = join(dir, 'crontab.txt')
     writeFileSync(fake, legacyCrontab('runtime'))
@@ -548,8 +549,8 @@ test('[o3d-kb3dq] MUTATION: skipping the block whenever one exists (trunk behavi
     const script = ['set -uo pipefail', awk, `FAKE=${JSON.stringify(fake)}; APP_USER=ims; APP_PORT=3000; CRON_BOOTSTRAP_WRITTEN=no; CRON_LEGACY_STATE=none; CRON_LEGACY_COUNT=0`,
       'info() { :; }; success() { :; }', 'read_crontab_for() { CRONTAB_READ_TEXT="$(cat "$FAKE")"; }', 'write_crontab_for() { printf \'%s\\n\' "$2" > "$FAKE"; }',
       "CRON_LEGACY_SIGNATURE='-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/'; CRON_LEGACY_LEFT=0",
-      shippedFunction(INSTALL, 'cron_job_command_into') + '\n' + shippedFunction(INSTALL, 'cron_job_command_into'), shippedFunction(INSTALL, 'cron_job_command'), shippedFunction(INSTALL, 'migrate_legacy_cron_lines'), shippedFunction(INSTALL, 'count_legacy_cron_lines'),
-      shippedFunction(mutated, 'bootstrap_managed_crontab_block_locked'), 'bootstrap_managed_crontab_block_locked'].join('\n')
+      shippedFunction(CRONLIB, 'cron_job_command_into') + '\n' + shippedFunction(CRONLIB, 'cron_job_command_into'), shippedFunction(CRONLIB, 'cron_job_command'), shippedFunction(CRONLIB, 'migrate_legacy_cron_lines'), shippedFunction(CRONLIB, 'count_legacy_cron_lines'),
+      shippedFunction(mutated, 'rewrite_legacy_cron_block_in_hand'), shippedFunction(INSTALL, 'bootstrap_managed_crontab_block_locked'), 'bootstrap_managed_crontab_block_locked'].join('\n')
     spawnSync('bash', ['-c', script], { encoding: 'utf8' })
     const after = readFileSync(fake, 'utf8')
     console.log(`  mutated bootstrap: legacy lines left in the crontab: ${after.split('-H "Authorization').length - 1}`)
