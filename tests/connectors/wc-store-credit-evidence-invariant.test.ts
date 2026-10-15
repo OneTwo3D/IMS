@@ -143,8 +143,18 @@ const WALLET_SHAPES: Array<[string, unknown, boolean]> = [
   ['null', null, false], ["'abc'", 'abc', false], ['[]', [], false], ['{}', {}, false], ['[1]', [1], false], ['-1', -1, false],
   ['NaN', Number.NaN, false], ['5', 5, false], ["'10.00'", '10.00', false], ['1e30', 1e30, false], ['object', { a: 1 }, false],
 ]
-// EVERY key the classifier lists, not a sample: a key dropped from the list is a red row.
-for (const key of WC_UNMODELLED_CREDIT_META_KEYS) {
+// EVERY key of the legacy sync plugin's default list, written out HERE as the oracle (never read back from the code
+// under test, which would make dropping a key invisible).
+const ORACLE_WALLET_KEYS = [
+  '_wc_store_credit_used', '_store_credit_used', '_store_credit_applied',
+  '_used_wallet_amount', '_woo_wallet_used', '_partial_pay_through_wallet_amount',
+  '_ywgc_applied_gift_cards_total', '_gift_card_amount', '_giftcard_amount', 'wc_gift_cards_total',
+  '_smart_coupon_credit_used',
+]
+test('the classifier lists exactly the oracle wallet keys', () => {
+  assert.deepEqual([...WC_UNMODELLED_CREDIT_META_KEYS].sort(), [...ORACLE_WALLET_KEYS].sort())
+})
+for (const key of ORACLE_WALLET_KEYS) {
   for (const [label, value, ok] of WALLET_SHAPES) add(key, label, setWallet(key, value), () => ok)
 }
 
