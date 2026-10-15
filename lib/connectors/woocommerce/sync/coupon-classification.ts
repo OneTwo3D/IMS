@@ -172,7 +172,14 @@ function parseStrictMoney(value: unknown): Decimal | null {
   return null
 }
 
-export type WcContribution = { code: string; amount: Decimal | null }
+/**
+ * How far a contribution amount may differ from its coupon line's gross and still count as the same figure: a quarter
+ * of a minor unit of a two-decimal currency, i.e. only the four-decimal storage noise. Woo rounds both figures to the
+ * minor unit, so honest data is equal to the digit; a whole penny apart is a disagreement.
+ */
+export const WC_CONTRIBUTION_AMOUNT_TOLERANCE = toDecimal('0.0025')
+
+export type WcContribution ={ code: string; amount: Decimal | null }
 
 type ContributionRead = {
   /** Any `smart_coupons_contribution` entry exists, whatever its value. */
@@ -318,6 +325,22 @@ export function classifyWcCouponLines(couponLines: WcCouponLine[], orderMeta?: W
   for (const c of record.entries) {
     if (c.amount === null) problems.push({ code: c.code, why: 'smart_coupons_contribution lists it with an amount IMS cannot read' })
     if (!lineCodes.has(c.code)) problems.push({ code: c.code, why: 'smart_coupons_contribution lists it, but the order has no coupon line for it' })
+  }
+  // AMOUNT RULE: a contribution is the amount Smart Coupons took off the order total for that code, so it must be
+  // exactly the gross (discount + discount_tax) of the coupon line(s) the credit is taken from. Equal within the
+  // storage bound => the line's gross IS the credit (and the import reconciles it against Woo's total). Anything else
+  // - a zero line beside a positive contribution, a line larger or smaller than the contribution, a contribution of 0
+  // beside a positive line - means the credit amount is in dispute and is refused (review on update).
+  for (const c of record.entries) {
+    if (c.amount === null || !lineCodes.has(c.code)) continue // already a problem above
+    const matching = lines.filter((l) => normaliseWcCouponCode(l.code) === c.code)
+    if (matching.some((l) => l.kind !== 'STORE_CREDIT')) continue // already a problem (the line is not cleanly credit)
+    const lineGross = matching.reduce((s, l) => addMoney(s, addMoney(l.net, l.tax)), toDecimal(0))
+    if (roundQuantity(lineGross.sub(c.amount), 4).abs().lt(WC_CONTRIBUTION_AMOUNT_TOLERANCE)) continue
+    problems.push({
+      code: c.code,
+      why: `smart_coupons_contribution records ${c.amount.toString()} for it but its coupon line(s) carry ${lineGross.toString()} (discount + discount_tax); IMS will not choose which is the amount paid by store credit`,
+    })
   }
   for (const key of WC_UNMODELLED_CREDIT_META_KEYS) {
     for (const entry of (orderMeta ?? []).filter((m) => m.key === key)) {

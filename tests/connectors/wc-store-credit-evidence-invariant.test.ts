@@ -50,9 +50,9 @@ const NONE: Baseline = {
   },
 }
 
-type Variant = { field: string; label: string; apply: (p: Payload) => void; cleanFor: (b: Baseline) => boolean }
+type Variant = { field: string; label: string; apply: (p: Payload) => void; cleanFor: (b: Baseline) => boolean; credit?: number }
 const variants: Variant[] = []
-const add = (field: string, label: string, apply: Variant['apply'], cleanFor: (b: Baseline) => boolean) => variants.push({ field, label, apply, cleanFor })
+const add = (field: string, label: string, apply: Variant['apply'], cleanFor: (b: Baseline) => boolean, credit?: number) => variants.push({ field, label, apply, cleanFor, credit })
 
 // ---- F1: the order's smart_coupons_contribution value, every shape, with and without a matching coupon line ----
 const setContribution = (value: unknown) => (p: Payload) => {
@@ -155,6 +155,40 @@ add('line code', "unrecognised-type line named 'wallet-credit' (allocated)", (p)
 add('line type', 'two unrecognised, disagreeing type records (allocated)', (p) => { p.coupon_lines.push({ id: id++, code: 'mystery', discount: '1.00', discount_tax: '0.00', meta_data: [meta('coupon_info', '[5,"mystery","acme","10"]'), meta('coupon_data', { discount_type: 'zeta' })] } as WcCouponLine) }, () => false)
 add('line type', 'one unrecognised type, no credit evidence (allocated) is carried as a discount', (p) => { p.coupon_lines.push({ id: id++, code: 'mystery', discount: '1.00', discount_tax: '0.00', meta_data: [meta('coupon_info', '[5,"mystery","acme","10"]')] } as WcCouponLine) }, () => true)
 
+// ---- F7: the contribution AMOUNT versus the coupon line's gross (discount + discount_tax) ----
+// The oracle is the written rule: equal within 0.0025 => the credit is that amount; any other difference (including a
+// zero line beside a positive contribution) is a dispute about what was paid => refused / held. Credit-only baseline.
+const setAmounts = (lines: Array<[string, string, string]>, contribution: Record<string, unknown>) => (p: Payload) => {
+  p.coupon_lines = lines.map(([code, discount, discount_tax]) => creditLine({ code, discount, discount_tax }, [meta('coupon_info', `[1,"${code}","smart_coupon","50"]`)]))
+  p.meta_data = p.meta_data.filter((m) => m.key !== 'smart_coupons_contribution')
+  p.meta_data.push(meta('smart_coupons_contribution', contribution))
+}
+const AMOUNT_CASES: Array<[string, Array<[string, string, string]>, Record<string, unknown>, boolean, number]> = [
+  ['line 10+2, contribution 12 (equal)', [['sc', '10.00', '2.00']], { sc: 12 }, true, 12],
+  ['line 12+0, contribution 12 (all net)', [['sc', '12.00', '0.00']], { sc: '12.00' }, true, 12],
+  ['line 0+0, contribution 12 (THE HOLE: zero line, positive contribution)', [['sc', '0.00', '0.00']], { sc: 12 }, false, 0],
+  ['line 0+0, contribution 0.01', [['sc', '0.00', '0.00']], { sc: '0.01' }, false, 0],
+  ['line 0+0, contribution 0 (no credit at all)', [['sc', '0.00', '0.00']], { sc: 0 }, true, 0],
+  ['line 12, contribution 0 (positive line, zero contribution)', [['sc', '10.00', '2.00']], { sc: 0 }, false, 12],
+  ['line 12 > contribution 10', [['sc', '10.00', '2.00']], { sc: 10 }, false, 12],
+  ['line 12 < contribution 15', [['sc', '10.00', '2.00']], { sc: 15 }, false, 12],
+  ['line 12 vs contribution 12.01 (a penny up)', [['sc', '10.00', '2.00']], { sc: '12.01' }, false, 12],
+  ['line 12 vs contribution 11.99 (a penny down)', [['sc', '10.00', '2.00']], { sc: '11.99' }, false, 12],
+  ['line 12 vs contribution 12.002 (storage noise, inside 0.0025)', [['sc', '10.00', '2.00']], { sc: '12.002' }, true, 12],
+  ['line 12 vs contribution 11.998 (storage noise, inside 0.0025)', [['sc', '10.00', '2.00']], { sc: '11.998' }, true, 12],
+  ['line 12 vs contribution 12.0025 (exactly the bound: refused)', [['sc', '10.00', '2.00']], { sc: '12.0025' }, false, 12],
+  ['line 12 vs contribution 12.004 (rounding level, outside)', [['sc', '10.00', '2.00']], { sc: '12.004' }, false, 12],
+  ['line 12 vs contribution -12 (negative)', [['sc', '10.00', '2.00']], { sc: -12 }, false, 12],
+  ['two codes, both equal', [['sc', '10.00', '2.00'], ['sc2', '5.00', '0.00']], { sc: 12, sc2: 5 }, true, 17],
+  ['two codes, second contribution lower', [['sc', '10.00', '2.00'], ['sc2', '5.00', '0.00']], { sc: 12, sc2: 4 }, false, 17],
+  ['two codes, second line zero beside positive contribution', [['sc', '10.00', '2.00'], ['sc2', '0.00', '0.00']], { sc: 12, sc2: 5 }, false, 12],
+  ['two codes, totals equal but split differently (17 = 17)', [['sc', '10.00', '2.00'], ['sc2', '5.00', '0.00']], { sc: 17, sc2: 0 }, false, 17],
+  ['two codes, only one listed by the contribution (type-only line is clean)', [['sc', '10.00', '2.00'], ['sc2', '5.00', '0.00']], { sc: 12 }, true, 17],
+  ['same code on two lines, sum equals contribution', [['sc', '6.00', '1.00'], ['sc', '6.00', '1.00']], { sc: 14 }, true, 14],
+  ['same code on two lines, sum differs', [['sc', '6.00', '1.00'], ['sc', '6.00', '1.00']], { sc: 12 }, false, 14],
+]
+for (const [label, lines, contribution, clean, credit] of AMOUNT_CASES) add('amount', label, setAmounts(lines, contribution), (b) => b === CREDIT && clean, credit)
+
 function importOutcome(b: Baseline, payload: Payload): { refused: boolean; credit: number } {
   const lineDiscount = payload.coupon_lines.reduce((s, l) => s + (Number.isFinite(Number(l.discount)) ? Number(l.discount) : 0) * 0, 0)
   const result = planWcOrderCoupons({
@@ -178,17 +212,18 @@ test('INVARIANT: no shape of credit evidence yields an order created with credit
     for (const v of variants) {
       // Line-field variants only mean something for the baseline that HAS that line.
       if (baseline === NONE && ['discount', 'discount_tax', 'coupon_info', 'coupon_data'].includes(v.field) && v.label !== 'valid') continue
+      if (baseline === NONE && v.field === 'amount') continue
       const payload = baseline.build(v.apply)
       const clean = v.cleanFor(baseline)
       const imp = importOutcome(baseline, payload)
-      const storedCredit = baseline.credit
+      const storedCredit = v.credit ?? baseline.credit
       const needsReview = wcUpdateNeedsStoreCreditReview(payload, { storeCreditForeign: String(storedCredit), storeCreditAssessment: 'ASSESSED' })
       checked++
       rows.push(`${baseline.name} | ${v.field} = ${v.label} | oracle=${clean ? 'CLEAN' : 'EVIDENCE'} | import=${imp.refused ? 'REFUSED' : `created credit ${imp.credit}`} | update=${needsReview ? 'HELD' : 'no hold'}`)
       if (clean) {
         cleanCount++
         assert.equal(imp.refused, false, `clean shape refused: ${rows[rows.length - 1]}`)
-        assert.equal(imp.credit, baseline.credit, `clean shape lost its credit: ${rows[rows.length - 1]}`)
+        assert.equal(imp.credit, v.credit ?? baseline.credit, `clean shape lost its credit: ${rows[rows.length - 1]}`)
         assert.equal(needsReview, false, `clean shape held: ${rows[rows.length - 1]}`)
       } else {
         refusedCount++
@@ -199,6 +234,7 @@ test('INVARIANT: no shape of credit evidence yields an order created with credit
   }
   // eslint-disable-next-line no-console
   console.log(`PRECONDITION evidence invariant table (${checked} shapes: ${cleanCount} clean, ${refusedCount} evidence):\n  ${rows.join('\n  ')}`)
+  assert.equal(variants.filter((v) => v.field === 'amount').length, AMOUNT_CASES.length, 'precondition: the amount dimension is in the matrix')
   assert.ok(checked >= 150, 'precondition: the generator produced a real matrix')
   assert.ok(refusedCount >= 100 && cleanCount >= 20, 'and both outcomes are exercised, so the assertion can fail either way')
 })
