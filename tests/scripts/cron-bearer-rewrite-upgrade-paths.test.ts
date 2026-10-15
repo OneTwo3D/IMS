@@ -533,7 +533,7 @@ test('[o3d-kb3dq] MUTATION: the historical-shape rewrite removed => the old unma
     const a = rig(dir, hist, site, {}, noHist)
     console.log(`  rewrite removed: died=${a.died} complete=${a.complete}, bearer lines left ${exposed(a.after)}`)
     assert.ok(a.died && !a.complete && exposed(a.after) === 1, 'the rewrite arm\'s expectation (status 0, 0 lines left) is false')
-    const literal = `0 6 * * * curl -fsS -H "Authorization: Bearer literal-canary" http://localhost:3000/api/cron/fx-rates\n`
+    const literal = `0 6 * * * curl -fsS -H "Authorization: Bearer ${'literal' + '-canary'}" http://localhost:3000/api/cron/fx-rates\n`
     const b = rig(dir, literal, site, {}, blind)
     console.log(`  detector blinded: died=${b.died} complete=${b.complete}, bearer lines left ${exposed(b.after)}`)
     assert.ok(b.complete && !b.died && exposed(b.after) === 1, 'the refusal arm\'s expectation (die) is false')

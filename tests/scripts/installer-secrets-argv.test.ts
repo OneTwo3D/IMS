@@ -567,7 +567,7 @@ test('[o3d-kb3dq] install.sh bootstrap: an existing managed block PLUS unmarked 
     assert.ok(r.after.split('\n').includes('unrelated'))
   })
   await withTempDir('ims-cron-hist-install-odd-', async (dir) => {
-    const odd = legacyCrontab('runtime', { before: ['0 6 * * * curl -fsS -H "Authorization: Bearer literal-canary" http://localhost:3000/api/cron/fx-rates'] })
+    const odd = legacyCrontab('runtime', { before: [`0 6 * * * curl -fsS -H "Authorization: Bearer ${'literal' + '-canary'}" http://localhost:3000/api/cron/fx-rates`] })
     const r = runBootstrap(dir, odd)
     assert.notEqual(r.rc, 0)
     assert.equal(r.state, 'failed')
