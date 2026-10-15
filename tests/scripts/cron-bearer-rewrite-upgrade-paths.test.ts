@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
@@ -168,7 +168,7 @@ for (const s of SCRIPTS) {
       ['rejected write', legacyCrontab('runtime'), { failWrite: true }, 'the crontab client rejected the write'],
       ['accepted but not written (read-back catches it)', legacyCrontab('runtime'), { ignoreWrite: true }, 'still holds the old curl -H bearer lines'],
       ['unknown line shape', legacyCrontab('runtime').replace('"$BASE_URL/backup" >>', '"$BASE_URL/backup" --max-time 5 >>'), {}, 'cannot rewrite'],
-      ['lock conflict leaving old lines', legacyCrontab('runtime'), { lockConflict: true }, 'secret on curl'],
+      ['lock conflict leaving old lines', legacyCrontab('runtime'), { lockConflict: true }, 'Authorization/Bearer header as a curl argument'],
       ['unreadable crontab', legacyCrontab('runtime'), { readFail: true }, 'could not be read'],
     ]
     for (const [name, crontab, opts, reason] of cases) {
@@ -177,7 +177,7 @@ for (const s of SCRIPTS) {
         console.log(`  ${s.file} ${name}: status ${r.status} died=${r.died} complete=${r.complete}; legacy lines left ${legacyCount(r.after)}`)
         assert.equal(r.status, 9, `${name}: the run ends`)
         assert.ok(r.died && !r.complete, `${name}: completion is never reached`)
-        assert.match(r.out, /secret on curl's command line/)
+        assert.match(r.out, /Authorization\/Bearer header as a curl argument/)
         assert.ok(r.out.includes(reason), `${name}: the message says why (${reason})`)
         assert.match(r.out, /Save & Apply/, 'and names the way out')
         if (name === 'unknown line shape') assert.equal(r.after, crontab, 'a shape it cannot rewrite leaves the crontab untouched')
@@ -192,10 +192,10 @@ for (const s of SCRIPTS) {
         assert.ok(r.complete && r.status === 0, `${name}: continues\n${r.out}`)
         if (!('noCrontab' in opts)) assert.equal(r.after, crontab, `${name}: byte-identical`)
       }
-      // a legacy-looking line OUTSIDE the managed block is the operator's, not ours
+      // a managed-shape bearer line OUTSIDE the block is NOT rewritten (its $BASE_URL is undefined there) but it still exposes the secret: refused
       const outside = `${LEGACY_LITERAL('1 1 * * *', 'x', '/tmp/l')}\n# --- OTI CRON START ---\nBASE_URL="x"\n# --- OTI CRON END ---\n`
       const r = rig(dir, outside, site)
-      assert.ok(r.complete && r.after === outside, 'outside the block: untouched')
+      assert.ok(r.died && !r.complete && r.after === outside, 'outside the block: refused, untouched')
     })
   })
 
@@ -404,4 +404,138 @@ test('[o3d-kb3dq] MUTATION (audit): the rule flags the shapes that were wrong', 
   const good = replacementFindings({ 'y.sh': ['a="${a//-/_}"', 'b="${b//$\'\\n\'/\\\\n}"', 'c="${c//\\\\/\\\\\\\\}"', 'd="${e//[\\\\\\"]/}"'].join('\n') })
   assert.equal(good.total, 4)
   assert.deepEqual(good.unsafe, [])
+})
+
+// ---------------------------------------------------------------------------
+// 4. the UNMARKED jobs older installers wrote (Codex round 4), and the general detector
+// ---------------------------------------------------------------------------
+//
+// Shapes found in `git log -- scripts/install.sh` (every revision that wrote a cron line):
+//   47e4016e..0ff23a66, 1adfde71, ba14fecb, 3835651d  `<sched> curl -fsS http://localhost:<port>/api/cron/<slug> > /dev/null 2>&1`
+//                                       no Authorization header, no secret: nothing on argv. NOT a finding; left alone.
+//   80bb3700, d3ebd53a  (UNMARKED)       `<sched> CRON_SECRET=$(grep -m 1 '^CRON_SECRET=' '<env>' | cut -d= -f2-) && curl -fsS -H "Authorization: Bearer ${CRON_SECRET}" http://localhost:<port>/api/cron/<slug> > /dev/null 2>&1`
+//                                       REWRITTEN (also accepted with $CRON_SECRET, a `tr -d` and a `[ -n ]` guard).
+//   c831a8bc..d9007b1d  (MARKED)        `... && [ -n "$CRON_SECRET" ] && curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/<slug>" >> '<log>' 2>&1` (and the app's literal mode) REWRITTEN (rounds 2-3).
+//   anything else running curl with an Authorization/Bearer header argument, in or out of the block, a literal secret
+//   included: REFUSED by the general detector (the line number is named; the line is never printed).
+
+const HIST = (sched: string, slug: string, o: { env?: string; port?: number; braces?: boolean; redirect?: boolean } = {}) =>
+  `${sched} CRON_SECRET=$(grep -m 1 '^CRON_SECRET=' '${o.env ?? ENV_FILE}' | cut -d= -f2-) && curl -fsS -H "Authorization: Bearer ${o.braces === false ? '$CRON_SECRET' : '${CRON_SECRET}'}" http://localhost:${o.port ?? 3000}/api/cron/${slug}${o.redirect === false ? '' : ' > /dev/null 2>&1'}`
+const HIST_NOAUTH = (sched: string, slug: string) => `${sched} curl -fsS http://localhost:3000/api/cron/${slug} > /dev/null 2>&1`
+
+/** The stdin-form command the rewrite must produce for a historical line, built here independently of the shell. */
+const histExpected = (env: string, url: string, redirect: string) =>
+  `CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${env}' | cut -d= -f2- | tr -d '"'); case "$CRON_SECRET" in ''|*\\\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); ${url} was not run" ;; *) echo "header = \\"Authorization: Bearer $CRON_SECRET\\"" | curl -sf -o /dev/null -K - "${url}" ;; esac${redirect}`
+
+/** Run a crontab command the way cron does (`sh -c`) with a curl stand-in that records its argv and its stdin. */
+function runCronCommand(dir: string, command: string, env: Record<string, string>): { argv: string; stdin: string; ran: boolean } {
+  const bin = join(dir, 'bin')
+  mkdirSync(bin, { recursive: true })
+  const argvLog = join(dir, 'curl-argv.log')
+  const stdinLog = join(dir, 'curl-stdin.log')
+  writeFileSync(join(bin, 'curl'), ['#!/bin/sh', `echo "curl $*" >> ${JSON.stringify(argvLog)}`, `cat >> ${JSON.stringify(stdinLog)}`].join('\n') + '\n')
+  chmodSync(join(bin, 'curl'), 0o755)
+  spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, CRON_SECRET: '', ...env } })
+  const rd = (f: string) => { try { return readFileSync(f, 'utf8') } catch { return '' } }
+  return { argv: rd(argvLog), stdin: rd(stdinLog), ran: rd(argvLog) !== '' }
+}
+
+const exposed = (text: string) => text.split('\n').filter((l) => !l.trim().startsWith('#') && /curl.*\s(-H|--header)\b.*(Bearer|Authorization)/i.test(l)).length
+
+for (const s of SCRIPTS) {
+  test(`[o3d-kb3dq] ${s.file}: UNMARKED historical jobs (both secret spellings) are rewritten in place, inside and outside the block, with everything else kept`, async () => {
+    const site = callSite(s.source, s.file)
+    await withTempDir('ims-cron-hist-', async (dir) => {
+      const before = [
+        'MAILTO=ops@example.test',
+        HIST('0 6 * * *', 'fx-rates'),
+        HIST('*/15 * * * *', 'delivery-status', { braces: false, env: '/srv/ims one/.env'.replace(' ', '_'), port: 3100 }),
+        HIST_NOAUTH('0 3 * * *', 'activity-cleanup'),
+        '17 3 * * * /usr/local/bin/operator-job --keep',
+        '# curl -H "Authorization: Bearer old" http://x  (a comment is not a job)',
+        ...legacyCrontab('runtime').trimEnd().split('\n'),
+        HIST('5 5 * * 5', 'backup'),
+        '',
+      ].join('\n')
+      console.log(`  ${s.file}: precondition: ${exposed(before)} exposing lines in (4 unmarked/marked historical + managed legacy x3 = 6 expected)`)
+      assert.equal(exposed(before), 6)
+      const r = rig(dir, before, site)
+      assert.equal(r.status, 0, r.out)
+      assert.ok(r.complete)
+      assert.equal(exposed(r.after), 0, 'no bearer header argument remains anywhere')
+      const lines = r.after.split('\n')
+      assert.ok(lines.includes(`0 6 * * * ${histExpected(ENV_FILE, 'http://localhost:3000/api/cron/fx-rates', ' > /dev/null 2>&1')}`), 'schedule, env path, URL and redirect kept (${CRON_SECRET} form)')
+      assert.ok(lines.includes(`*/15 * * * * ${histExpected('/srv/ims_one/.env', 'http://localhost:3100/api/cron/delivery-status', ' > /dev/null 2>&1')}`), '$CRON_SECRET form, other port and env path')
+      assert.ok(lines.includes(`5 5 * * 5 ${histExpected(ENV_FILE, 'http://localhost:3000/api/cron/backup', ' > /dev/null 2>&1')}`), 'a historical job AFTER the managed block')
+      for (const keep of ['MAILTO=ops@example.test', HIST_NOAUTH('0 3 * * *', 'activity-cleanup'), '17 3 * * * /usr/local/bin/operator-job --keep', '# curl -H "Authorization: Bearer old" http://x  (a comment is not a job)', 'BASE_URL="http://localhost:3000/api/cron"']) {
+        assert.ok(lines.includes(keep), `kept: ${keep}`)
+      }
+      assert.equal(slugSchedule(r.after, 'backup'), '0 2 * * *', 'the managed legacy job is rewritten too, schedule kept')
+      const second = rig(dir, r.after, site)
+      assert.equal(second.after, r.after, 'idempotent')
+    })
+  })
+
+  test(`[o3d-kb3dq] ${s.file}: a rewritten historical job RUNS under sh with the secret on no command line`, async () => {
+    const site = callSite(s.source, s.file)
+    await withTempDir('ims-cron-hist-run-', async (dir) => {
+      const envFile = join(dir, '.env')
+      writeFileSync(envFile, `CRON_SECRET=${'hist-canary-71c2'}\n`)
+      const r = rig(dir, `${HIST('0 6 * * *', 'fx-rates', { env: envFile })}\n`, site)
+      assert.equal(r.status, 0, r.out)
+      const command = r.after.trim().replace(/^\S+(?:\s+\S+){4}\s+/, '')
+      const ran = runCronCommand(dir, command, {})
+      console.log(`  curl argv: ${JSON.stringify(ran.argv.trim())}; header on stdin: ${ran.stdin.includes('Authorization: Bearer hist-canary-71c2')}`)
+      assert.ok(ran.ran && !ran.argv.includes('hist-canary-71c2') && ran.stdin.includes('Authorization: Bearer hist-canary-71c2'))
+      assert.ok(ran.argv.includes('http://localhost:3000/api/cron/fx-rates'))
+    })
+  })
+
+  test(`[o3d-kb3dq] ${s.file}: any OTHER bearer-header curl line (literal secret, extra flag, single quotes, --header, wrong shape) is refused by line number, never printed`, async () => {
+    const site = callSite(s.source, s.file)
+    const SECRET = 'literal-canary-5e90aa'
+    const odd = [
+      `0 6 * * * curl -fsS -H "Authorization: Bearer ${SECRET}" http://localhost:3000/api/cron/fx-rates > /dev/null 2>&1`,
+      `0 3 * * * curl -fsS -H 'Authorization: Bearer ${SECRET}' http://localhost:3000/api/cron/backup`,
+      `0 2 * * * curl -fsS --header "Authorization: Bearer ${SECRET}" http://localhost:3000/api/cron/wc-reconcile`,
+      HIST('0 4 * * *', 'x').replace('curl -fsS', 'curl -fsS --max-time 5'),
+      `*/5 * * * * sh -c 'curl -H "Authorization: Bearer ${SECRET}" http://x'`,
+    ]
+    for (const [i, line] of odd.entries()) {
+      await withTempDir('ims-cron-hist-odd-', async (dir) => {
+        const before = ['MAILTO=a@b.test', HIST('0 6 * * *', 'fx-rates'), line, ''].join('\n')
+        const r = rig(dir, before, site)
+        console.log(`  ${s.file} odd shape ${i}: status ${r.status} died=${r.died}; message names line 3: ${/line\(s\) 3\b/.test(r.out)}; secret printed: ${r.out.includes(SECRET)}`)
+        assert.equal(r.status, 9)
+        assert.ok(r.died && !r.complete)
+        assert.match(r.out, /line\(s\) 3 /, 'the line number is named')
+        assert.ok(!r.out.includes(SECRET) && !r.out.includes('curl -fsS'), 'and the line content is not')
+        assert.equal(r.after, before, 'nothing is half-rewritten: the crontab is untouched')
+      })
+    }
+    // the detector does not fire on the stdin form, on a no-auth curl or on a comment
+    await withTempDir('ims-cron-hist-ok-', async (dir) => {
+      const fine = [HIST_NOAUTH('0 3 * * *', 'x'), `0 6 * * * ${histExpected(ENV_FILE, 'http://localhost:3000/api/cron/fx-rates', ' > /dev/null 2>&1')}`, `# 1 1 * * * curl -H "Authorization: Bearer ${SECRET}" http://x`, ''].join('\n')
+      const r = rig(dir, fine, site)
+      assert.ok(r.complete && r.after === fine)
+    })
+  })
+}
+
+test('[o3d-kb3dq] MUTATION: the historical-shape rewrite removed => the old unmarked jobs are REFUSED instead of rewritten (rewrite arm red); the general detector blinded => a literal-secret line completes', async () => {
+  const noHist = CRONLIB.replace('    elif cron_line_exposes_bearer "${line}" && [[ "${line}" =~ ${re_hist} ]]; then', '    elif false; then')
+  assert.notEqual(noHist, CRONLIB)
+  const blind = CRONLIB.replace('  [[ "${line}" =~ ${CRON_EXPOSURE_RE} ]]\n}', '  return 1\n}')
+  assert.notEqual(blind, CRONLIB)
+  const site = callSite(UPDATE, 'scripts/update.sh')
+  await withTempDir('ims-cron-hist-mut-', async (dir) => {
+    const hist = `${HIST('0 6 * * *', 'fx-rates')}\n`
+    const a = rig(dir, hist, site, {}, noHist)
+    console.log(`  rewrite removed: died=${a.died} complete=${a.complete}, bearer lines left ${exposed(a.after)}`)
+    assert.ok(a.died && !a.complete && exposed(a.after) === 1, 'the rewrite arm\'s expectation (status 0, 0 lines left) is false')
+    const literal = `0 6 * * * curl -fsS -H "Authorization: Bearer literal-canary" http://localhost:3000/api/cron/fx-rates\n`
+    const b = rig(dir, literal, site, {}, blind)
+    console.log(`  detector blinded: died=${b.died} complete=${b.complete}, bearer lines left ${exposed(b.after)}`)
+    assert.ok(b.complete && !b.died && exposed(b.after) === 1, 'the refusal arm\'s expectation (die) is false')
+  })
 })

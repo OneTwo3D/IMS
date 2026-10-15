@@ -11117,9 +11117,7 @@ trap - EXIT   # risky window over; drop the cleanup trap
 # holds the old `curl -H "Authorization: Bearer ..."` lines, the production reinstall would finish with the secret readable in
 # `ps` on every job run. Either the rewrite above did not happen (a lock conflict, a failed read or write, a shape it cannot
 # rewrite) or it could not be verified: look again, and refuse.
-if [[ "${CRON_BOOTSTRAP_WRITTEN}" != "yes" ]]; then
-  die_if_legacy_cron_lines_remain "this installer"
-fi
+die_if_legacy_cron_lines_remain "this installer"
 
 if [[ "${CRON_BOOTSTRAP_WRITTEN}" == "yes" ]]; then
   success "Cron jobs configured:"
