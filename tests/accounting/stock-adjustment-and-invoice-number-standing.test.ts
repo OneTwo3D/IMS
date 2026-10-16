@@ -5,6 +5,7 @@ import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/l
 import { countSalesInvoiceRowsThatMayHavePosted } from '@/lib/connectors/woocommerce/sync/invoice-number'
 import { adjustmentJournalMayHaveReachedLedger } from '@/lib/domain/inventory/stock-adjustment-edit'
 import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
+import { shadowEvidenceFake, type FakeShadowRecord } from '@/tests/helpers/shadow-evidence-fake'
 
 /**
  * o3d-1e7sl (G3 and G4, slice 1c of o3d-f709) - TWO GUARDS 1a CONVERTED, NOW PROVED PER STANDING.
@@ -20,8 +21,9 @@ import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
  */
 type Row = LedgerStandingRow & { referenceType: string; referenceId: string; type: string }
 
-function tx(rows: Row[]) {
+function tx(rows: Row[], shadows: FakeShadowRecord[] = []) {
   return {
+    $queryRaw: shadowEvidenceFake(shadows).queryRaw,
     accountingSyncLog: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
         rows.find((row) => matchesWhere(row as unknown as Record<string, unknown>, where)) ?? null,
@@ -97,4 +99,33 @@ test('[o3d-1e7sl G4] the count is scoped to this order and to the two sales-invo
     fixture(live, { referenceType: 'SalesOrderRefund', referenceId: 'so-1', type: 'SALES_INVOICE' }),
   ]
   assert.equal(await countSalesInvoiceRowsThatMayHavePosted(tx(rows), 'so-1'), 2)
+})
+
+// ---------------------------------------------------------------------------
+// THE DURABLE SHADOW RECORD. A shadowed posting leaves a CANCELLED / HELD_SHADOW sync row (expires with the retention window)
+// AND an outbound_shadow_writes record (persists). With the sync row GONE the record is the only evidence the owner of the
+// operation may have posted, so both destructive readers above must go on refusing on it. Named mutation `ignore-durable-shadow`:
+// the reader stops asking the shadow store; the "sync row gone, shadow remains" arms go red.
+// ---------------------------------------------------------------------------
+const SHADOW_INVENTORY: FakeShadowRecord = { destination: 'xero', operation: 'inventory.journals', subject_type: 'StockMovement', subject_id: 'mv-1' }
+const SHADOW_SALES: FakeShadowRecord = { destination: 'xero', operation: 'sales.invoice', subject_type: 'SalesOrder', subject_id: 'so-1' }
+
+test('[durable shadow] stock-adjustment edit: no sync row but a shadow record for this movement => REFUSED; the isolating arms stay allowed', async () => {
+  console.log('# precondition: sync rows = 0 in every arm below; only the shadow store differs')
+  assert.equal(await adjustmentJournalMayHaveReachedLedger(tx([], [SHADOW_INVENTORY]), 'mv-1'), true, 'the shadow record alone refuses the edit')
+  assert.equal(await adjustmentJournalMayHaveReachedLedger(tx([], []), 'mv-1'), false, 'ISOLATING: no shadow record and no sync row: the edit may proceed')
+  assert.equal(await adjustmentJournalMayHaveReachedLedger(tx([], [{ ...SHADOW_INVENTORY, subject_id: 'mv-OTHER' }]), 'mv-1'), false, "another movement's shadow does not block")
+  assert.equal(await adjustmentJournalMayHaveReachedLedger(tx([], [{ ...SHADOW_INVENTORY, destination: 'woocommerce' }]), 'mv-1'), false, "another destination's shadow does not block")
+  assert.equal(await adjustmentJournalMayHaveReachedLedger(tx([], [{ ...SHADOW_INVENTORY, operation: 'sales.invoice' }]), 'mv-1'), false, "another operation's shadow does not block")
+})
+
+test('[durable shadow] invoice-number correction: no sync row but a shadow record for this order => counted; others are not', async () => {
+  assert.equal(await countSalesInvoiceRowsThatMayHavePosted(tx([], [SHADOW_SALES]), 'so-1'), 1, 'the shadow record is counted as a row that may have posted')
+  assert.equal(await countSalesInvoiceRowsThatMayHavePosted(tx([], []), 'so-1'), 0, 'ISOLATING: nothing recorded: 0')
+  assert.equal(await countSalesInvoiceRowsThatMayHavePosted(tx([], [{ ...SHADOW_SALES, subject_id: 'so-2' }]), 'so-1'), 0)
+  assert.equal(await countSalesInvoiceRowsThatMayHavePosted(tx([], [{ ...SHADOW_SALES, operation: 'inventory.journals' }]), 'so-1'), 0)
+})
+
+test('[durable shadow] a client that cannot read the shadow store makes the reader THROW, never answer "none recorded"', async () => {
+  await assert.rejects(adjustmentJournalMayHaveReachedLedger({ accountingSyncLog: { findFirst: async () => null } } as never, 'mv-1'), /could not ask/)
 })

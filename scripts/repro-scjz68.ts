@@ -9,6 +9,7 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { pgConnectionConfig, prismaAdapterSchemaOptions } from '@/lib/db/database-url-schema.mjs'
 import { PrismaClient } from '../app/generated/prisma/client'
 import { runDailyBatchSync } from '../lib/connectors/xero/daily-sync'
+import { xeroProducerSeamVerdict } from '../lib/domain/accounting/xero-producer-seam'
 
 // Both halves of the schema, as prisma/seed.ts explains: the pool's search_path AND the
 // adapter's schemaName. A bare connectionString gives neither, so on a `?schema=` install this
@@ -90,6 +91,10 @@ async function seedScenario(s: Scenario, wh: { id: string }) {
       costLayerSnapshot: [{ costLayerId: layer.id, qty: s.refundedUnshippedQty, unitCostBase: '1.000000', source: 'allocation', orderAllocationId: allocation.id }],
     },
   })
+  // THIS SCRIPT WRITES A QUEUED ROW PAST THE PRODUCER SEAM, so it asks the same question first and refuses unless the hold
+  // is not enforced for Xero or the decision is LIVE: it must never plant queued work on an installation that is holding.
+  const hold = xeroProducerSeamVerdict({ connector: 'xero', type: 'UNEARNED_REV_REVERSAL', payload: { date: new Date().toISOString().slice(0, 10) } })
+  if (hold.kind === 'shadow') throw new Error(`Refusing to seed a queued Xero row: ${hold.notice}`)
   await db.accountingSyncLog.create({
     data: {
       connector: 'xero', type: 'UNEARNED_REV_REVERSAL', status: 'PENDING',

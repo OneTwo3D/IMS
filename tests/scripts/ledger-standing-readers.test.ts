@@ -15,9 +15,11 @@ import {
   OWNING_MODULE,
   floorFailures,
   reconcile,
+  reconcileShadowReaders,
   scanProgram,
+  scanShadowFragmentUses,
 } from '../../scripts/check-ledger-standing-readers.mjs'
-import { DECLARATIONS } from '../../scripts/ledger-standing-reader-declarations.mjs'
+import { DECLARATIONS, SHADOW_READER_DECLARATIONS } from '../../scripts/ledger-standing-reader-declarations.mjs'
 
 /**
  * o3d-f709 - THE CENSUS GUARD, PROVEN ABLE TO FAIL.
@@ -457,4 +459,38 @@ test('o3d-f709: package.json, validate-local.sh and the workflow all name the gu
   const workflow = readFileSync(path.join(ROOT, '.github/workflows/ledger-standing-guard.yml'), 'utf8')
   assert.match(workflow, /^\s+- run: npm run check:ledger-standing-readers$/m)
   assert.doesNotMatch(workflow, /^\s+(paths|paths-ignore|needs|if|continue-on-error):/m, 'ungated: no path filter, classifier, needs or if')
+})
+
+// ---------------------------------------------------------------------------
+// THE DURABLE-SHADOW CENSUS, PROVEN ABLE TO FAIL. Every use of a may-have-reached-the-ledger fragment outside the owning module is
+// declared DURABLE_SHADOW (and must call findDurableShadowRecords), EXEMPT (with a reason) or PENDING_CONVERSION.
+// ---------------------------------------------------------------------------
+function shadowUse(key: string, text: string) { return { key, file: key.split('::')[0]!, text } }
+
+test('[durable shadow census] an undeclared destructive reader, a DURABLE_SHADOW that stopped consulting, and a stale declaration each fail', () => {
+  const key = 'lib/x.ts::deleteThing::MAY_HAVE_REACHED_LEDGER_WHERE'
+  const consulting = shadowUse(key, 'async function deleteThing(tx) { const w = MAY_HAVE_REACHED_LEDGER_WHERE; await findDurableShadowRecords(tx, "xero", []) }')
+  const silent = shadowUse(key, 'async function deleteThing(tx) { const w = MAY_HAVE_REACHED_LEDGER_WHERE }')
+  const declared = [{ key, class: 'DURABLE_SHADOW', reason: 'consults the durable shadow record after retention' }]
+  console.log('# precondition: 1 use found in each arm')
+  assert.deepEqual(reconcileShadowReaders([consulting], declared), [], 'ISOLATING: declared and consulting passes')
+  assert.match(reconcileShadowReaders([consulting], []).join('\n'), /is not declared in SHADOW_READER_DECLARATIONS/)
+  assert.match(reconcileShadowReaders([silent], declared).join('\n'), /declared DURABLE_SHADOW but its declaration does not call findDurableShadowRecords/)
+  assert.match(reconcileShadowReaders([], declared).join('\n'), /stale shadow-reader declaration/)
+  assert.match(reconcileShadowReaders([consulting], [{ key, class: 'EXEMPT', reason: 'x' }]).join('\n'), /needs a reason/)
+  assert.match(reconcileShadowReaders([consulting], [{ key, class: 'BOGUS', reason: 'a long enough reason here' }]).join('\n'), /unknown class/)
+})
+
+test('[durable shadow census] the real tree: the scan reaches its subject, every use is declared, and the three destructive readers consult', () => {
+  const configPath = ts.findConfigFile(process.cwd(), ts.sys.fileExists, 'tsconfig.json')!
+  const parsed = ts.parseJsonConfigFileContent(ts.readConfigFile(configPath, ts.sys.readFile).config, ts.sys, process.cwd())
+  const program = ts.createProgram(parsed.fileNames, { ...parsed.options, noEmit: true })
+  const inScope = new Set(parsed.fileNames.map((f) => path.relative(process.cwd(), f)).filter((f) => /^(app|lib|scripts|components)\//.test(f)))
+  const uses = scanShadowFragmentUses({ program, inScope })
+  const keys = new Set(uses.map((u: { key: string }) => u.key))
+  console.log(`# durable-shadow census: ${uses.length} use(s) at ${keys.size} site(s); ${SHADOW_READER_DECLARATIONS.length} declared`)
+  assert.ok(keys.size >= 7, 'PRECONDITION: the known sites are reached')
+  assert.deepEqual(reconcileShadowReaders(uses, SHADOW_READER_DECLARATIONS), [])
+  const consulting = SHADOW_READER_DECLARATIONS.filter((d: { class: string }) => d.class === 'DURABLE_SHADOW')
+  assert.equal(consulting.length, 3)
 })
