@@ -2950,7 +2950,16 @@ async function reportLostMoneyPostExclusion(
  * it.
  */
 export async function postMoneyUnderLedgerFence(
-  params: MoneyPostFenceParams & { lock?: MoneyPostLock },
+  params: MoneyPostFenceParams & {
+    lock?: MoneyPostLock
+    /**
+     * A CHECK MADE UNDER THE LOCK, after the ledger fence authorised the post and immediately before the remote
+     * call. The fence sets a different receipt's payment aside and does not measure capacity, and a capacity
+     * check made BEFORE the lock can be passed by two receipts at once; this one sees what the first of them
+     * did while it held the lock. A refusal is returned as a failed outcome and nothing is sent.
+     */
+    recheckUnderLock?: () => Promise<{ ok: true } | { ok: false; error: string }>
+  },
   /**
    * The remote call. o3d-llyw: receives the connection it MUST be sent under when the authorisation
    * rested on an operator ledger check (pass it to the transport as `requireConnection`); absent otherwise.
@@ -2976,6 +2985,10 @@ export async function postMoneyUnderLedgerFence(
   }, async (held): Promise<MoneyPostOutcome> => {
     const authorised = await authoriseMoneyPost(params)
     if (!authorised.proceed) return { success: false, error: authorised.error }
+    if (params.recheckUnderLock) {
+      const rechecked = await params.recheckUnderLock()
+      if (!rechecked.ok) return { success: false, error: rechecked.error }
+    }
     // THE LAST THING CHECKED BEFORE THE CALL. PostgreSQL frees a session advisory lock the instant
     // its connection dies, so a pinned connection that failed during the ledger read means the
     // exclusion this verdict was taken under is already gone and another worker may be posting to

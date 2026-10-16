@@ -6122,6 +6122,16 @@ export async function processClaimedEntry(
         // the fence must authorise against the very day the call below creates, and a second
         // wall-clock read here is a second day whenever the two straddle a UTC midnight.
         postingDate: paymentDate,
+        // CAPACITY AGAIN, UNDER THE PER-DOCUMENT LOCK. The guard above ran before the lock, so two receipts for
+        // different payments can both pass it; the fence then sets the first one's payment aside and does not
+        // measure capacity. This reads the rows now - counting a payment that passed the fence and is still
+        // PROCESSING - so the second cannot reach Xero over the invoice's IMS total.
+        recheckUnderLock: async () => {
+          const again = await guardInvoicePaymentCapacity(db, {
+            connector: XERO_CONNECTOR, entryId, referenceType, referenceId, accountingInvoiceId, amount, payload, countInFlight: true,
+          })
+          return again.post ? { ok: true } : { ok: false, error: `Not sent: ${again.message}` }
+        },
       }, async ({ requireConnection }) => {
         try {
           // BOTH FENCES, AND THE CLAIM FENCE IS LAST (o3d-0m56 + o3d-550x/o3d-xl63).

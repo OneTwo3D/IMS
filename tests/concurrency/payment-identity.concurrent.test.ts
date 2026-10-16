@@ -167,6 +167,58 @@ test('payment identity on a real database', { skip: !RUN && 'set RUN_DB_CONCURRE
     assert.equal(counter.posted.length, 2)
   })
 
+  await t.test('5. capacity is rechecked UNDER the money-post lock: two receipts that both passed the unlocked guard cannot both reach the wire over the invoice total', async (tt) => {
+    const { guardInvoicePaymentCapacity } = await import('../../lib/domain/accounting/invoice-payment-capacity.ts')
+    for (const countInFlight of [true, false]) {
+      const s = await seedOrder(d, `cap-${countInFlight}`)
+      tt.after(s.cleanup)
+      // an invoice of 100, two DIFFERENT receipts of 60 each: only one fits.
+      const r1 = await receipt(d, s.orderId, 60)
+      const r2 = await receipt(d, s.orderId, 60)
+      const a = await queuedRow(d, s, r1, 60, '2026-08-09')
+      const b = await queuedRow(d, s, r2, 60, '2026-08-10')
+      const guard = (row: { id: string; payload: Record<string, unknown> }, inFlight: boolean) => guardInvoicePaymentCapacity(d.db as never, {
+        connector: 'xero', entryId: row.id, referenceType: 'SalesOrder', referenceId: s.orderId, accountingInvoiceId: s.invoiceId,
+        amount: Number(row.payload.amount), payload: row.payload, countInFlight: inFlight,
+      })
+      // Both pass the UNLOCKED look: nothing has posted yet. This is the window the finding names.
+      assert.equal((await guard(a, false)).post, true)
+      assert.equal((await guard(b, false)).post, true)
+      const counter = { posted: [] as string[] }
+      const run = (row: { id: string; payload: Record<string, unknown> }) => d.postMoneyUnderLedgerFence({
+        connector: 'xero', entryId: row.id, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: s.orderId,
+        payload: row.payload, postingDate: String(row.payload.paymentDate), db: d.db as never,
+        recheckUnderLock: async () => {
+          const again = await guard(row, countInFlight)
+          return again.post ? { ok: true } : { ok: false, error: `Not sent: ${again.message}` }
+        },
+      }, async () => {
+        counter.posted.push(row.id)
+        // The processor marks the row PROCESSING while it works and SYNCED only AFTER the fence returns:
+        // leave it PROCESSING, which is the window in which the next receipt takes the lock.
+        await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'PROCESSING' } })
+        ledger.get(s.invoiceId)!.push({ PaymentID: `PAY-${row.id}`, Date: row.payload.paymentDate, Amount: row.payload.amount,
+          Reference: d.settlementMarkerFor(d.effectiveTokenFor('xero', { id: row.id, payload: row.payload })) })
+        return { success: true, externalId: `PAY-${row.id}` }
+      })
+      // ORDER IS FORCED, NOT SLEPT FOR: B starts only after A's fence call has returned (lock released), while
+      // A's row is still PROCESSING and not yet SYNCED.
+      const first = await run(a)
+      const status = await d.db.accountingSyncLog.findUnique({ where: { id: a.id }, select: { status: true } })
+      const second = await run(b)
+      console.log(`[cap] countInFlight=${countInFlight}: A=${first.success} (A is ${status?.status}) B=${JSON.stringify(second).slice(0, 140)} posted=${counter.posted.length}`)
+      assert.equal(first.success, true)
+      assert.equal(status?.status, 'PROCESSING', 'precondition: A is on the wire/just returned but not SYNCED')
+      if (countInFlight) {
+        assert.equal(second.success, false, 'the second receipt is refused under the lock')
+        assert.equal(counter.posted.length, 1)
+      } else {
+        // the control: without counting the in-flight row the SAME state lets the over-cap payment through.
+        assert.equal(counter.posted.length, 2, 'control: the recheck counting in-flight rows is what stops the second')
+      }
+    }
+  })
+
   await t.test('4. cancelled_at is minted by the database clock, preserved, cleared on reopen, and NULL where it was never known', async (tt) => {
     const id = `${RUN_ID}-cancel`
     tt.after(async () => { await d.db.salesOrder.deleteMany({ where: { id } }) })

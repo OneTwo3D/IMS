@@ -199,6 +199,12 @@ export type PostedInvoicePaymentRegistration = {
    * selected — and the caller must treat both as possibly-posted. Only `true` is a proof.
    */
   provenNeverAttempted: boolean
+  /**
+   * PROCESSING with a recorded `remoteAttemptedAt`: the row has passed the money-post fence and its remote
+   * call is in flight or has just returned and not yet been written back. Only read when the caller asks
+   * for in-flight rows to be counted (the recheck made UNDER the money-post lock).
+   */
+  inFlightAuthorised?: boolean
 }
 
 export type InvoicePaymentPostRefusal =
@@ -267,6 +273,13 @@ export function decideInvoicePaymentPost(input: {
   currency: string
   /** Every INVOICE_PAYMENT sync row for this order on this connector, including this entry's own. */
   registrations: PostedInvoicePaymentRegistration[]
+  /**
+   * COUNT AUTHORISED IN-FLIGHT ROWS AS POSTED. Off for the first, unlocked look (a queued sibling must not
+   * refuse the first of a deposit and balance pair). ON for the recheck made under the per-document money-post
+   * lock: by then another receipt's payment may have passed the fence and be on the wire or just returned, not
+   * yet SYNCED, and the fence deliberately does not count capacity (it sets a different receipt's payment aside).
+   */
+  countInFlight?: boolean
 }): InvoicePaymentPostVerdict {
   // A PAYMENT ALREADY SENT FOR THIS RECEIPT, AGAINST A DOCUMENT THIS ORDER NO LONGER HAS
   // (o3d-ekn8 r4, Codex HIGH). Asked FIRST, and asked here rather than only at the enqueue, because
@@ -376,7 +389,8 @@ export function decideInvoicePaymentPost(input: {
 
   const posted = againstThisInvoice.filter(
     (row) => (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
-      || failedOfOtherReceipts.includes(row),
+      || failedOfOtherReceipts.includes(row)
+      || (input.countInFlight === true && row.inFlightAuthorised === true),
   )
 
   // A SYNCED ROW AN OPERATOR ASSERTED IS NOT A POSTED AMOUNT (o3d-anu8). SYNCED is the one status
@@ -500,6 +514,8 @@ export async function guardInvoicePaymentCapacity(
      * authorises.
      */
     payload: unknown
+    /** Count authorised in-flight rows as posted: the recheck under the money-post lock (see decideInvoicePaymentPost). */
+    countInFlight?: boolean
   },
 ): Promise<InvoicePaymentPostGuardResult> {
   // An INVOICE_PAYMENT is always order-scoped today. If one ever is not, its capacity cannot be
@@ -682,6 +698,7 @@ export async function guardInvoicePaymentCapacity(
     entryId: params.entryId,
     orderId: params.referenceId,
     liveReceipts: await loadLiveReceipts(client, params.referenceId),
+    countInFlight: params.countInFlight === true,
     accountingInvoiceId: params.accountingInvoiceId,
     amount,
     ledgerTotal,
@@ -699,6 +716,7 @@ export async function guardInvoicePaymentCapacity(
       paymentId: payloadString(row.payload, 'paymentId'),
       bodyCouldHavePosted: storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', row.payload),
       provenNeverAttempted: attemptProvenNeverMade(row),
+      inFlightAuthorised: row.status === 'PROCESSING' && row.remoteAttemptedAt !== null,
     })),
   })
   if (verdict.post) return { post: true }
