@@ -539,3 +539,81 @@ test('[o3d-kb3dq] MUTATION: the historical-shape rewrite removed => the old unma
     assert.ok(b.complete && !b.died && exposed(b.after) === 1, 'the refusal arm\'s expectation (die) is false')
   })
 })
+
+// ---------------------------------------------------------------------------
+// 5. first rollout: the documented update runs the PREDECESSOR driver (Codex round 5)
+// ---------------------------------------------------------------------------
+//
+// The standing root-owned driver is a copy of an OLDER update.sh. It deploys the new code but its tail has no
+// rewrite step, so nothing in the new release's scripts runs. The fix cannot be code in the new update.sh (the old
+// driver never executes it); it is the documented first-rollout path (run the release's own scripts from a
+// root-fetched directory) and a check that tells the operator whether the old lines are still scheduled. The test
+// simulates the predecessor tail (this release's script with the rewrite step removed, which is what the predecessor
+// is), shows it completes with the lines intact, runs the check taken FROM THE DOCS, then runs the documented remedy.
+
+const docsText = read('docs/installation.md')
+const ROLLOUT_HEADING = '### First rollout of the release that takes the cron bearer off the command line'
+const rolloutSection = (() => {
+  const i = docsText.indexOf(ROLLOUT_HEADING)
+  assert.notEqual(i, -1, 'precondition: the docs carry the first-rollout section')
+  const j = docsText.indexOf('\nTo see what is standing', i)
+  return docsText.slice(i, j)
+})()
+/** The documented check, lifted from the docs: the code line that starts with `sudo crontab`. */
+const checkCommand = (() => {
+  const m = rolloutSection.split('\n').find((l) => l.startsWith('sudo crontab -u imsapp -l | grep'))
+  assert.ok(m, 'precondition: the docs carry the check command')
+  return m!
+})()
+
+function runDocumentedCheck(dir: string, crontab: string): string {
+  const bin = join(dir, 'bin')
+  mkdirSync(bin, { recursive: true })
+  writeFileSync(join(dir, 'live-crontab.txt'), crontab)
+  // `sudo` and `crontab` stand-ins: the documented line is run as written
+  writeFileSync(join(bin, 'sudo'), '#!/bin/sh\nexec "$@"\n')
+  writeFileSync(join(bin, 'crontab'), `#!/bin/sh\ncat ${JSON.stringify(join(dir, 'live-crontab.txt'))}\n`)
+  chmodSync(join(bin, 'sudo'), 0o755)
+  chmodSync(join(bin, 'crontab'), 0o755)
+  const r = spawnSync('bash', ['-c', checkCommand], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:/usr/bin:/bin` } })
+  return r.stdout
+}
+
+for (const s of SCRIPTS) {
+  test(`[o3d-kb3dq] FIRST ROLLOUT (${s.file}): the predecessor driver leaves the old lines and reports success; the documented check sees them; the documented remedy clears them`, async () => {
+    const predecessorTail = s.source.replace(callSite(s.source, s.file), '')
+    assert.notEqual(predecessorTail, s.source, 'precondition: the predecessor is this script without the rewrite step')
+    assert.ok(!predecessorTail.includes('ensure_cron_bearer_off_argv "'), 'and it has no call to the rewrite')
+    await withTempDir('ims-cron-rollout-', async (dir) => {
+      const SECRET = 'rollout-canary-3b7d'
+      const legacy = legacyCrontab('runtime', { before: ['MAILTO=ops@example.test'] }) + `0 6 * * * curl -fsS -H "Authorization: Bearer ${SECRET}" http://localhost:3000/api/cron/fx-rates\n`
+      // 1. the standing (predecessor) driver: nothing in its tail touches the crontab
+      const predecessor = rig(dir, legacy, 'echo "(predecessor tail: no rewrite step)"')
+      assert.ok(predecessor.complete && predecessor.status === 0)
+      assert.equal(predecessor.after, legacy, 'the old driver completes with the crontab as it was')
+      // 2. the documented check, as printed in the docs, finds them and prints numbers only
+      const flagged = runDocumentedCheck(dir, predecessor.after)
+      console.log(`  ${s.file}: documented check after the predecessor run prints: ${JSON.stringify(flagged)}`)
+      assert.match(flagged, /^(\d+\n)+$/, 'only line numbers')
+      const expectedLines = legacy.split('\n').flatMap((l, i) => (!l.startsWith('#') && l.includes('Bearer') ? [i + 1] : []))
+      assert.equal(expectedLines.length, 4, 'precondition: three managed legacy jobs and one literal-secret job')
+      assert.deepEqual(flagged.trim().split('\n').map(Number), expectedLines)
+      assert.ok(!flagged.includes(SECRET))
+      // 3. the documented remedy: this release's own script (root-fetched copy), whose tail has the step
+      const remedy = rig(dir, predecessor.after, callSite(s.source, s.file))
+      assert.ok(remedy.died && !remedy.complete && remedy.status === 9, 'a literal-secret line it cannot rewrite is refused, naming it')
+      // and without the unrecognised line it completes and the check is empty
+      const clean = legacyCrontab('runtime', { before: ['MAILTO=ops@example.test'] })
+      const fixed = rig(dir, clean, callSite(s.source, s.file))
+      assert.ok(fixed.complete && fixed.status === 0)
+      assert.equal(runDocumentedCheck(dir, fixed.after), '', 'the documented check prints nothing once the lines are rewritten')
+    })
+  })
+}
+
+test('[o3d-kb3dq] the first-rollout docs name both ways out and the digest option', () => {
+  console.log(`  rollout section: ${rolloutSection.split('\n').length} lines`)
+  for (const needle of ['PREDECESSOR', 'install.sh', 'update.sh', 'IMS_DRIVER_SHA256', 'never the lines', '#supported-bootstrap']) {
+    assert.ok(rolloutSection.includes(needle), `the section mentions ${needle}`)
+  }
+})

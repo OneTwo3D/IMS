@@ -1713,6 +1713,36 @@ The one-release minimum is deliberate — a driver that re-executed code it had 
 earlier would be exactly the defect this arrangement closes. The unbounded part is a consequence of
 refusing to promote bytes nothing vouched for, and the remedy is the digest below, not a shorter lag.
 
+### First rollout of the release that takes the cron bearer off the command line
+
+Earlier releases scheduled their cron jobs as `curl -H "Authorization: Bearer $CRON_SECRET"`, which shows
+`CRON_SECRET` to every local account in `ps` each time a job runs. This release rewrites those lines
+(`update.sh`, `deploy.sh` and `install.sh` all run the same locked rewrite, and `update.sh`/`deploy.sh`
+refuse to report completion while any such line remains). **But the documented command runs the standing
+root-owned driver, and on the first rollout the standing driver is the PREDECESSOR: it deploys the new code
+and restores the old crontab untouched, because the rewrite exists only in this release's scripts.** An
+update run that way completes, reports success, and the old lines are still scheduled.
+
+For this release, run the release's own scripts instead of the standing driver. Fetch the release as root
+into a newly created directory (*[The supported bootstrap](#supported-bootstrap)*) and either run
+`install.sh` from there, or run its `update.sh` (root-owned trees are accepted; only trees another account
+can write are refused):
+
+```bash
+sudo bash /root/ims-release-NEW/scripts/update.sh        # add IMS_DRIVER_SHA256=<64 hex> to refresh the driver as well
+```
+
+Either way the rewrite runs before the run can report completion. If you did update through the standing
+driver, nothing flagged it: check, and then run one of the two commands above. The check prints only crontab
+line NUMBERS (never the lines, which may carry the secret), and nothing when the crontab is clean:
+
+```bash
+sudo crontab -u imsapp -l | grep -nE 'curl.*[[:space:]](-H|--header).*([Bb]earer|[Aa]uthorization)' | cut -d: -f1
+```
+
+Once the standing driver is this release or later (it is refreshed by `install.sh`, or by an update run
+with `IMS_DRIVER_SHA256`), the documented command carries the rewrite and no special step is needed.
+
 To see what is standing before deciding, read its record — which lives beside the tree the pointer
 names, so this always reports the copy that is actually in use:
 
