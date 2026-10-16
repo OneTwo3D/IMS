@@ -4,8 +4,8 @@
  * The outbound-write hold (outbound-write-hold-constants.ts) refuses a request at the HTTP boundary.
  * The producer-side hold is a decision, consulted by producers, between a unit of IMS work being LIVE
  * (produced for delivery) and being a SHADOW (what IMS would have written, never delivered). A destination is
- * consulted only when PRODUCER_HOLD_ENFORCED_ENV names it (see lib/security/producer-seam.ts); today the Xero
- * producers are wired and the others are not. This
+ * consulted only when PRODUCER_HOLD_ENFORCED_ENV names it (see lib/security/producer-seam.ts); today the Xero and
+ * WooCommerce producers are wired and the Mintsoft ones are not. This
  * module carries the environment variable names, the formats, the reason texts and the documentation
  * blocks of that decision. lib/security/producer-disposition.ts imports them; docs/installation.md
  * carries marked blocks whose body must equal the text below byte for byte, and

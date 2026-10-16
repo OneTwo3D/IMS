@@ -23,7 +23,7 @@ import {
   type ProducerDecision,
   type ProducerDecisionContext,
 } from './producer-disposition'
-import type { MappedOperation } from './writer-ownership-map'
+import { WRITER_OWNERSHIP_MAP, type MappedOperation } from './writer-ownership-map'
 
 export type ProducerEnforcement =
   | { enforced: false }
@@ -107,7 +107,9 @@ export function producerEgressVerdict(
     const enforcement = readProducerEnforcement(context.env ?? process.env)
     if (!enforcement.enforced || !enforcement.destinations.has(destination)) return { kind: 'legacy' }
     // The phase does not depend on the operation, so any mapped operation of the destination reads it.
-    const decision = explainProducerDisposition(destination, EGRESS_PROBE_OPERATION[destination] as never, undefined, context)
+    const probe = WRITER_OWNERSHIP_MAP.find((row) => row.destination === destination)
+    if (!probe) throw new Error(`no ownership-map row for ${destination}`)
+    const decision = explainProducerDisposition(destination, probe.operation as never, undefined, context)
     return decision.phase === 'P2' ? { kind: 'open', decision } : { kind: 'held', decision }
   } catch {
     return {
@@ -115,11 +117,4 @@ export function producerEgressVerdict(
       decision: { disposition: 'SHADOW', reason: 'unreadable', owner: 'unknown', phase: 'P1', cutoff: null, grant: 'unreadable' },
     }
   }
-}
-
-/** An operation of each destination's ownership-map rows, used only to read the destination's phase. */
-const EGRESS_PROBE_OPERATION: Record<OutboundConnector, string> = {
-  xero: 'tax-rate',
-  mintsoft: 'order.create',
-  woocommerce: 'stock',
 }
