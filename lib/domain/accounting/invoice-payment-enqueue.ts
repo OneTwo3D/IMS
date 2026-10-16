@@ -931,9 +931,8 @@ export function describeInvoicePaymentRefusal(params: {
           `Recorded ${amount} against ${params.orderReference}, but the receipt is dated after the order was `
           + `cancelled (${refused.detail ?? 'no detail'}). The invoice is void or credited, so the accounting `
           + `connector would refuse a payment against it: money received for a cancelled order is booked there as `
-          + `an overpayment, which IMS does not create yet. The payment was NOT registered. Record it in the `
-          + `accounting system by hand (as an overpayment on the customer) and refund it from there if it is `
-          + `owed back. ${remedy}`,
+          + `an overpayment, which IMS does not create yet. The payment was NOT registered and the ledger was told `
+          + `nothing. ${remedy}`,
         metadata: withLedger,
       }
     // Not a settlement fault — a payment cannot attach to an invoice the ledger has never seen, and

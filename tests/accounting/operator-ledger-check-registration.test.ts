@@ -75,6 +75,9 @@ const CHECK = {
 }
 
 const base = {
+  orderId: 'so-1',
+  liveReceipts: new Map<string, { orderId: string }>(),
+  cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
   syncEnabled: true,
   accountingInvoiceId: 'INV-1',
   orderCurrency: 'GBP',

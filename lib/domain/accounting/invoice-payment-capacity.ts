@@ -641,8 +641,7 @@ export async function guardInvoicePaymentCapacity(
         refusal: 'PAID_AFTER_CANCELLATION',
         message: `Refused to register a payment against invoice ${params.accountingInvoiceId}: the receipt is dated after the order `
           + 'was cancelled, so the invoice is void or credited and the accounting connector would refuse a payment against it. '
-          + 'Money received for a cancelled order is booked there as an overpayment, which IMS does not create yet. Nothing was sent. '
-          + 'Record it in the accounting system by hand, as an overpayment on the customer.',
+          + 'Money received for a cancelled order is booked there as an overpayment, which IMS does not create yet. Nothing was sent.',
         alreadyPosted: null,
         ledgerTotal,
         ambiguousIds: [],
