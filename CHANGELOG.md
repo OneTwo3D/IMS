@@ -8,6 +8,10 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### First load: the apply runner core (no database side yet)
+
+- **New (backend only, nothing runs yet): the core of the first-load apply runner** in `lib/first-load/apply/`. It reads and verifies a prepared run from bytes (every file against the prepared report's SHA-256, size, rows and the importer's header; unique keys; every parent, component, warehouse, FX rate and zero-cost pair backed by the files or refused; WooCommerce variant parents only from a re-verified snapshot), computes per step which rows are still to load, and drives plan, apply and resume through ports. The accounting is taken from the database, never from the importers' counters. It opens no database or network connection and adds no command yet. Documented in `docs/first-load-apply.md`.
+
 ### Payments: several payments on one invoice, told apart by the receipt
 
 - **Fixed: a balance recorded after a deposit that had already posted is no longer refused.** The last check before a payment is sent judged every payment already sent against the invoice, so a posted deposit blocked its own balance (and a failed one blocked the next receipt). IMS now identifies a payment by the receipt (payment row) it was recorded for. A *different* live receipt never blocks, a *repeat of the same receipt* is always refused, and a registration that cannot be shown to belong to a different receipt (imported before this change, or whose receipt was deleted) still blocks. One rule is shared by the registration decision, the final check, the over-settlement guard and the manual retry, so they cannot disagree. A deposit's payment in Xero is recognised by the reference IMS wrote on it, never by amount and date.
