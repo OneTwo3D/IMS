@@ -118,7 +118,7 @@ Rows may already be written to the database by this run.
 ### Operator text: restore-procedure
 
 ```text
-To undo this run, stop the application, restore the recorded restore point into an empty database with pg_restore, run the migrations and start again. The runner never restores by itself, and it never deletes rows.
+To undo this run, stop the application, restore the recorded restore point (a PostgreSQL custom-format dump) into an empty database, run the migrations and start again. The runner never restores by itself, and it never deletes rows.
 ```
 
 ### Operator text: transfers-refusal

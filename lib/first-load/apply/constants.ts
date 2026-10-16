@@ -110,7 +110,7 @@ export const ROWS_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitN
 export const NOTHING_WRITTEN_TEXT = 'This command wrote nothing to the database.'
 export const ROWS_WRITTEN_TEXT = 'Rows may already be written to the database by this run.'
 export const RESTORE_PROCEDURE_TEXT =
-  'To undo this run, stop the application, restore the recorded restore point into an empty database with pg_restore, run the migrations and start again. '
+  'To undo this run, stop the application, restore the recorded restore point (a PostgreSQL custom-format dump) into an empty database, run the migrations and start again. '
   + 'The runner never restores by itself, and it never deletes rows.'
 
 /** The sentence printed after a non-zero exit. Only the exits in NOTHING_WRITTEN_EXITS may say "nothing was written". */
