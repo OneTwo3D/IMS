@@ -30,7 +30,6 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { extname, join, relative } from 'node:path'
 import ts from 'typescript'
 
-import { INTEGRATION_OUTBOX_REGISTRY, type OutboxDestination } from '../lib/domain/integrations/outbox-registry'
 import { ownershipTargetForOutboxOperation, WRITER_OWNERSHIP_MAP, type OwnershipRow } from '../lib/security/writer-ownership-map'
 import type { Declaration } from './producer-census'
 
@@ -205,6 +204,49 @@ function callsIn(node: ts.Node, sf: ts.SourceFile): CallInfo[] {
   return out
 }
 
+// ───────────────────────── WOO-5: the outbox registry, read as syntax ─────────────────────────
+
+export const OUTBOX_REGISTRY_FILE = 'lib/domain/integrations/outbox-registry.ts'
+export const OUTBOX_DESTINATIONS: readonly string[] = ['woocommerce', 'mintsoft', 'xero', 'internal']
+
+/**
+ * `INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({ <connector>: { '<operation>': { name, destination, ... } } })`, read by syntax:
+ * connector -> operation -> its `destination` string literal (absent when the entry does not carry a literal one).
+ */
+export function scanOutboxRegistrySource(text: string): Record<string, Record<string, { destination?: string }>> {
+  const sf = parse(OUTBOX_REGISTRY_FILE, text)
+  const out: Record<string, Record<string, { destination?: string }>> = {}
+  const keyOf = (name: ts.PropertyName): string | null => (ts.isIdentifier(name) || ts.isStringLiteral(name) ? name.text : null)
+  const visit = (n: ts.Node) => {
+    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === 'INTEGRATION_OUTBOX_REGISTRY' && n.initializer) {
+      const call = unwrap(n.initializer)
+      const arg = ts.isCallExpression(call) ? call.arguments[0] : undefined
+      const connectors = arg ? unwrap(arg) : undefined
+      if (connectors && ts.isObjectLiteralExpression(connectors)) {
+        for (const connector of connectors.properties) {
+          if (!ts.isPropertyAssignment(connector)) continue
+          const connectorName = keyOf(connector.name)
+          const operations = unwrap(connector.initializer)
+          if (connectorName === null || !ts.isObjectLiteralExpression(operations)) continue
+          out[connectorName] = {}
+          for (const operation of operations.properties) {
+            if (!ts.isPropertyAssignment(operation)) continue
+            const operationName = keyOf(operation.name)
+            const entry = unwrap(operation.initializer)
+            if (operationName === null || !ts.isObjectLiteralExpression(entry)) continue
+            const destination = objectProperty(entry, 'destination')
+            const value = destination && ts.isPropertyAssignment(destination) ? literalString(destination.initializer) : null
+            out[connectorName]![operationName] = value === null ? {} : { destination: value }
+          }
+        }
+      }
+    }
+    ts.forEachChild(n, visit)
+  }
+  visit(sf)
+  return out
+}
+
 // ───────────────────────── WOO-3: the raw transport scan ─────────────────────────
 
 export type WooTransportSite = {
@@ -289,7 +331,7 @@ export type WooCensusInput = {
   noProducer: Readonly<Record<string, string>>
   seamFunctions?: readonly WooSeamFunction[]
   map?: readonly OwnershipRow[]
-  registry?: Record<string, Record<string, { destination: OutboxDestination }>>
+  registry?: Record<string, Record<string, { destination?: string }>>
   governedElsewhere?: Readonly<Record<string, string>>
 }
 
@@ -310,7 +352,11 @@ export function wooCensusFindings(input: WooCensusInput): { failures: string[]; 
   const failures: string[] = []
   const seamFunctions = input.seamFunctions ?? WOO_SEAM_FUNCTIONS
   const map = (input.map ?? (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])).filter((row) => row.destination === 'woocommerce')
-  const registry = input.registry ?? (INTEGRATION_OUTBOX_REGISTRY as unknown as Record<string, Record<string, { destination: OutboxDestination }>>)
+  // The registry is read as SYNTAX (not imported): the producer-census CI job has no generated Prisma client, and the registry module
+  // imports its enums.
+  const registryText = input.readSource(OUTBOX_REGISTRY_FILE)
+  const registry = input.registry ?? (registryText === undefined ? null : scanOutboxRegistrySource(registryText))
+  if (registry === null) failures.push(`WOO-5 ${OUTBOX_REGISTRY_FILE} could not be read, so the outbox registry destinations cannot be checked.`)
   const governedElsewhere = input.governedElsewhere ?? WOO_OPERATIONS_GOVERNED_ELSEWHERE
   const counts: WooCensusCounts = {
     seamFunctions: 0, seamFunctionsConsulting: 0, transportSites: input.transport.length, transportWrites: 0, transportWritesBehindBarrier: 0,
@@ -428,11 +474,15 @@ export function wooCensusFindings(input: WooCensusInput): { failures: string[]; 
   }
 
   // ---- WOO-5 ----
-  for (const [connector, operations] of Object.entries(registry)) {
+  for (const [connector, operations] of Object.entries(registry ?? {})) {
     for (const [operation, entry] of Object.entries(operations)) {
       counts.registryEntries++
-      const destination = (entry as { destination?: string }).destination
+      const destination = entry.destination
       if (typeof destination !== 'string') { failures.push(`WOO-5 outbox ${connector}/${operation} has no destination. Say where its effect lands (woocommerce, mintsoft, xero or internal).`); continue }
+      if (!OUTBOX_DESTINATIONS.includes(destination)) {
+        failures.push(`WOO-5 outbox ${connector}/${operation} has destination "${destination}", which is not one of ${OUTBOX_DESTINATIONS.join(', ')}.`)
+        continue
+      }
       if (destination === 'woocommerce' || destination === 'mintsoft') {
         const target = ownershipTargetForOutboxOperation(`${connector}/${operation}`)
         if (!target || target.destination !== destination) {

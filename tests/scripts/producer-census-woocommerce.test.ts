@@ -8,6 +8,7 @@ import { scanSource, scanTree, seamFindings } from '../../scripts/producer-censu
 import {
   WOO_SEAM_FUNCTIONS,
   scanWooTransport,
+  scanOutboxRegistrySource,
   scanWooTransportSource,
   wooCensusFindings,
   type WooCensusInput,
@@ -190,4 +191,20 @@ test('a direct call of a WooCommerce writer from a NEW file is an undeclared pro
   const sites = scanSource(fixture, 'lib/sneaky.ts')
   assert.deepEqual(sites.map((s) => s.key), ['lib/sneaky.ts::sneakyProductPush::pushImsProductToWc#1'])
   assert.equal(DECLARATIONS.some((d) => d.key === sites[0]!.key), false, 'it is not declared, so the census reports it')
+})
+
+test('WOO-5 reads the registry as SYNTAX: the real registry yields every entry with a destination, and removing or corrupting one is red', () => {
+  const real = scanOutboxRegistrySource(realText('lib/domain/integrations/outbox-registry.ts'))
+  const flat = Object.entries(real).flatMap(([connector, operations]) => Object.entries(operations).map(([operation, entry]) => `${connector}/${operation}=${entry.destination}`))
+  console.log(`# registry by syntax: ${flat.join(' ')}`)
+  assert.equal(flat.length, 10)
+  assert.ok(flat.includes('woocommerce/stock.push=woocommerce'))
+  assert.ok(flat.includes('xero/accounting.post=xero'))
+  assert.ok(flat.includes('mintsoft/inbound.booked-in=internal'))
+  const removed = wooCensusFindings(input({}, { 'lib/domain/integrations/outbox-registry.ts': (text) => text.replace("      name: 'stockSync',\n      destination: 'woocommerce',\n", "      name: 'stockSync',\n") }))
+  assert.equal(red(removed, 'WOO-5', 'woocommerce/stock.push').length, 1, JSON.stringify(removed.failures))
+  const corrupted = wooCensusFindings(input({}, { 'lib/domain/integrations/outbox-registry.ts': (text) => text.replace("      name: 'orderCancel',\n      destination: 'woocommerce',\n", "      name: 'orderCancel',\n      destination: 'elsewhere',\n") }))
+  assert.equal(red(corrupted, 'WOO-5', 'woocommerce/order.cancel').length, 1, JSON.stringify(corrupted.failures))
+  const unreadable = wooCensusFindings(input({ readSource: () => undefined }))
+  assert.ok(red(unreadable, 'WOO-5', 'could not be read').length >= 1)
 })
