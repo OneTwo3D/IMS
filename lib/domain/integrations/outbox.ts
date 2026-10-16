@@ -11,9 +11,18 @@ import {
 } from '@/lib/db/prisma-unique-violation'
 import {
   integrationOutboxStaleReclaimScope,
+  outboxDestinationOf,
   parseIntegrationOutboxPayload,
+  PRODUCER_SEAMED_OUTBOX_DESTINATIONS,
+  type OutboxConnectorWithoutShadow,
+  type ProducerSeamedOutboxDestination,
 } from '@/lib/domain/integrations/outbox-registry'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
+import { producerShadowNotice, type ProducerReason } from '@/lib/security/producer-disposition-constants'
+import type { ProducerDecision } from '@/lib/security/producer-disposition'
+import { producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { ownershipTargetForOutboxOperation, type MappedOperation } from '@/lib/security/writer-ownership-map'
 
 export const INTEGRATION_OUTBOX_STATUS = {
   PENDING: 'PENDING',
@@ -58,6 +67,50 @@ export type EnqueueIntegrationOutboxInput = {
   idempotencyKey: string
   payloadJson: unknown
   nextAttemptAt?: Date | null
+  /**
+   * What the producer-side hold needs for an operation whose effect is a vendor write (ignored for the others). `subject*`
+   * name the thing the work is about (default: the operation and the idempotency key); `obligationAt` is the business-event
+   * time an operation requires when its ownership-map row says so.
+   */
+  producer?: {
+    subjectType?: string
+    subjectId?: string
+    obligationAt?: Date
+    summary?: Record<string, string | number | boolean | null>
+  }
+}
+
+/**
+ * THE ANSWER OF AN ENQUEUE THAT THE PRODUCER-SIDE HOLD SHADOWED. NO ROW EXISTS: nothing is queued, nothing will be sent, and a
+ * shadow record was kept instead (outbound_shadow_writes, in the caller's own transaction). It is deliberately NOT shaped like an
+ * {@link IntegrationOutboxRow}, so a caller cannot read an id, a key or a status off it and carry on as if work were queued.
+ */
+export type OutboxEnqueueShadowed = {
+  shadowed: true
+  /** `<connector>/<operation>`. */
+  operation: string
+  notice: string
+  reason: ProducerReason
+  /** False when the shadow record itself could not be written: lost evidence, never lost work. */
+  recorded: boolean
+  occurrences: number | null
+}
+
+/** Narrows the result of an enqueue: true when the hold shadowed it and no row exists. */
+export function isOutboxEnqueueShadowed(result: IntegrationOutboxRow | OutboxEnqueueShadowed): result is OutboxEnqueueShadowed {
+  return (result as { shadowed?: unknown }).shadowed === true
+}
+
+/**
+ * For a caller whose connector is never a vendor (an internal ledger operation): the row, or a loud failure if the impossible
+ * happens. A shadow here would mean an internal operation was registered against a vendor destination without its caller being
+ * rewritten, which must not be silently read as "queued".
+ */
+export function requireEnqueuedOutboxRow(result: IntegrationOutboxRow | OutboxEnqueueShadowed): IntegrationOutboxRow {
+  if (isOutboxEnqueueShadowed(result)) {
+    throw new Error(`Integration outbox operation ${result.operation} was shadowed by the producer-side hold, but this caller expects a queued row`)
+  }
+  return result
 }
 
 export type ClaimIntegrationOutboxOptions = {
@@ -399,16 +452,86 @@ async function updateClaimedOutboxRow(
   return requireOutboxRow(client, options.id)
 }
 
-export async function enqueueIntegrationOutbox(
+type OutboxProducerVerdict =
+  | { kind: 'proceed' }
+  | { kind: 'shadow'; destination: ProducerSeamedOutboxDestination; operation: string; decision: ProducerDecision }
+
+/**
+ * Does the producer-side hold let this outbox operation be queued? Only an operation whose effect is a vendor write is asked
+ * (see OutboxRegistryEntry.destination). An operation of such a vendor that the ownership map does not name is SHADOW while the
+ * hold is enforced for that vendor: a job nobody classified is not produced.
+ */
+function outboxProducerVerdict(input: EnqueueIntegrationOutboxInput): OutboxProducerVerdict {
+  const destination = outboxDestinationOf(input.connector, input.operation)
+  if (!(PRODUCER_SEAMED_OUTBOX_DESTINATIONS as readonly string[]).includes(destination)) return { kind: 'proceed' }
+  const seamed = destination as ProducerSeamedOutboxDestination
+  const target = ownershipTargetForOutboxOperation(`${input.connector}/${input.operation}`)
+  if (!target || target.destination !== seamed) {
+    const enforcement = readProducerEnforcement()
+    if (!enforcement.enforced || !enforcement.destinations.has(seamed)) return { kind: 'proceed' }
+    return {
+      kind: 'shadow',
+      destination: seamed,
+      operation: `unmapped:${input.connector}/${input.operation}`,
+      decision: { disposition: 'SHADOW', reason: 'owner_unknown', owner: 'unknown', phase: 'P1', cutoff: null, grant: 'unreadable' },
+    }
+  }
+  const verdict = producerSeamVerdict(seamed, target.operation as MappedOperation<ProducerSeamedOutboxDestination>, input.producer?.obligationAt)
+  if (verdict.kind !== 'shadow') return { kind: 'proceed' }
+  return { kind: 'shadow', destination: seamed, operation: target.operation, decision: verdict.decision }
+}
+
+async function shadowOutboxEnqueue(
+  client: IntegrationOutboxClient,
   input: EnqueueIntegrationOutboxInput,
+  payloadJson: unknown,
+  verdict: Extract<OutboxProducerVerdict, { kind: 'shadow' }>,
+): Promise<OutboxEnqueueShadowed> {
+  let occurrences: number | null = null
+  let recorded = false
+  try {
+    const result = await withSavepoint(client, () => recordOutboundShadow(client, {
+      destination: verdict.destination,
+      operation: verdict.operation,
+      subjectType: input.producer?.subjectType ?? `${input.connector}/${input.operation}`,
+      subjectId: input.producer?.subjectId ?? input.idempotencyKey,
+      payload: { operation: `${input.connector}/${input.operation}`, payload: payloadJson },
+      summary: { outboxOperation: `${input.connector}/${input.operation}`, ...(input.producer?.summary ?? {}) },
+      decision: verdict.decision,
+    }))
+    occurrences = result.occurrences
+    recorded = true
+  } catch (error) {
+    console.error(`[producer-hold] could not record the shadow of ${input.connector}/${input.operation} (${input.idempotencyKey}): ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return {
+    shadowed: true,
+    operation: `${input.connector}/${input.operation}`,
+    notice: producerShadowNotice({ connector: verdict.destination, reason: verdict.decision.reason, owner: verdict.decision.owner }),
+    reason: verdict.decision.reason,
+    recorded,
+    occurrences,
+  }
+}
+
+/**
+ * Queue one integration job, or, when the producer-side hold shadows a job whose effect is a vendor write, queue NOTHING and
+ * answer {@link OutboxEnqueueShadowed}. The result type says which can happen: a connector that is a literal never-shadowed one
+ * ('xero', 'accounting', 'sales') gets a row; anything else gets the union, and the compiler makes the caller choose what a
+ * shadow means to it. A caller must never treat a shadow as queued work.
+ */
+export async function enqueueIntegrationOutbox<C extends string>(
+  input: EnqueueIntegrationOutboxInput & { connector: C },
   options: { client?: IntegrationOutboxClient } = {},
-): Promise<IntegrationOutboxRow> {
+): Promise<C extends OutboxConnectorWithoutShadow ? IntegrationOutboxRow : IntegrationOutboxRow | OutboxEnqueueShadowed> {
   const client = getClient(options.client)
   const payloadJson = parseIntegrationOutboxPayload({
     connector: input.connector,
     operation: input.operation,
     payloadJson: input.payloadJson,
   })
+  const producerVerdict = outboxProducerVerdict(input)
+  if (producerVerdict.kind === 'shadow') return await shadowOutboxEnqueue(client, input, payloadJson, producerVerdict) as never
   try {
     // o3d-slrn: this is called with a TRANSACTION client by scheduleXeroAccountingOutbox and
     // friends, and the catch below queries the same client to return the existing row. This path
@@ -427,13 +550,13 @@ export async function enqueueIntegrationOutbox(
         lockedAt: null,
         lockedBy: null,
       },
-    }))
+    })) as never
   } catch (error) {
     if (!isIdempotencyKeyConflict(error)) throw error
     const existing = await client.integrationOutbox.findUnique({
       where: { idempotencyKey: input.idempotencyKey },
     })
-    if (existing) return existing
+    if (existing) return existing as never
     throw error
   }
 }

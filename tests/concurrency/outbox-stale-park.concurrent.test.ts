@@ -678,7 +678,7 @@ test(
       idempotencyKey: key,
       payloadJson: { anything: 'this build cannot parse' },
     })
-    assert.equal(enqueued.status, 'PENDING')
+    assert.equal((enqueued as { status?: string }).status, 'PENDING')
 
     // (2) A WORKER CLAIMS IT — the claim path supports unknown operations too, which is how the row
     // reaches PROCESSING at all — and then the process dies. The crash is modelled by backdating the

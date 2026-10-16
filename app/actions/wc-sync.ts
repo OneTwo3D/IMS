@@ -890,6 +890,12 @@ export async function createWcWebhooks(): Promise<{
     return { success: false, created: 0, existing: 0, errors: ['Webhook secret not configured — generate one first'] }
   }
 
+  // The producer-side hold: registering webhooks is a write to the store, so with the hold enforced and the decision SHADOW
+  // nothing is listed, created or sent; a shadow record is kept and the operator is told why.
+  const { wooWebhookRegistrationShadow } = await import('@/lib/connectors/woocommerce/operator-action-seam')
+  const webhookShadow = await wooWebhookRegistrationShadow()
+  if (webhookShadow) return { success: false, created: 0, existing: 0, errors: [webhookShadow.notice] }
+
   const { wcFetch, wcPost } = await import('@/lib/connectors/woocommerce/api')
 
   // List existing webhooks to avoid duplicates
@@ -974,13 +980,21 @@ export async function probeFxHelperPluginAction(): Promise<{
   message: string
 }> {
   await requireSyncPermission()
+  // The probe is a POST to the store: the producer-side hold governs it like any other write.
+  const { wooFxHelperProbeShadow } = await import('@/lib/connectors/woocommerce/operator-action-seam')
+  const probeShadow = await wooFxHelperProbeShadow()
+  if (probeShadow) return { status: 'NOT_CONFIGURED', message: probeShadow.notice }
   const { probeFxHelperPlugin } = await import('@/lib/connectors/woocommerce/fx-rates')
   return probeFxHelperPlugin()
 }
 
-export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: number; supported: boolean; error?: string }> {
+export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: number; supported: boolean; error?: string; shadowed?: boolean }> {
   await requireSyncPermission()
   try {
+    // The producer-side hold: with it enforced and the decision SHADOW, nothing is sent and nothing is logged as pushed or failed.
+    const { wooFxRatePushShadow } = await import('@/lib/connectors/woocommerce/operator-action-seam')
+    const fxShadow = await wooFxRatePushShadow()
+    if (fxShadow) return { success: false, pushed: 0, supported: true, shadowed: true, error: fxShadow.notice }
     const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
     const result = await pushCurrentFxRatesToWc()
     if (!result.supported) {

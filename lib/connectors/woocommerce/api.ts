@@ -5,6 +5,7 @@ import type { ConnectorCredentials } from '../types'
 import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentials } from './credentials'
 import { validateWooCommerceBaseUrl } from './url-safety'
 import { currentWcAttemptSignal } from './attempt-fence'
+import { wooEgressHold } from './producer-egress'
 
 const GENERIC_WC_NOT_CONFIGURED_ERROR = 'WooCommerce integration is not configured.'
 
@@ -266,6 +267,10 @@ export async function wcPost(
   body: unknown,
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; error?: string; held?: true }> {
+  // The last barrier of the producer-side hold: with enforcement on and the destination not in its live phase, nothing leaves
+  // IMS, whatever asked. Reported in the same shape as the outbound-write hold (`held: true` means nothing was sent).
+  const egressHold = wooEgressHold()
+  if (egressHold.held) return { data: null, error: egressHold.notice, held: true }
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
     logMissingWooCommerceCredentials()
@@ -306,6 +311,10 @@ export async function wcPut(
   body: unknown,
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; error?: string; held?: true }> {
+  // The last barrier of the producer-side hold: with enforcement on and the destination not in its live phase, nothing leaves
+  // IMS, whatever asked. Reported in the same shape as the outbound-write hold (`held: true` means nothing was sent).
+  const egressHold = wooEgressHold()
+  if (egressHold.held) return { data: null, error: egressHold.notice, held: true }
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
     logMissingWooCommerceCredentials()

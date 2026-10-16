@@ -297,3 +297,16 @@ export function outboxOperationIsMapped(name: string): boolean {
   if (name === ACCOUNTING_POST_OUTBOX_OPERATION) return true
   return WRITER_OWNERSHIP_MAP.some((entry) => (entry as OwnershipRow).outboxOperations?.includes(name) === true)
 }
+
+/**
+ * The (destination, operation) of the map row that carries an integration outbox operation, named `<connector>/<operation>`
+ * as in `outboxOperations`. Null for an operation no row names (the Xero carrier is claimed by the xero rows through
+ * ACCOUNTING_POST_OUTBOX_OPERATION and is not an answer here: its seam is the sync-log row).
+ */
+export function ownershipTargetForOutboxOperation(name: string): { destination: Exclude<MappedDestination, 'customer-email'>; operation: string } | null {
+  for (const entry of WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]) {
+    if (entry.destination === 'customer-email') continue
+    if (entry.outboxOperations?.includes(name) === true) return { destination: entry.destination, operation: entry.operation }
+  }
+  return null
+}

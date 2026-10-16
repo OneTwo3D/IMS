@@ -23,6 +23,7 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getSettingValues } from '@/lib/settings-store'
 import type { FxRatePush, FxRatePushResult } from '../types'
 import { validateWooCommerceBaseUrl } from './url-safety'
+import { wooEgressHold } from './producer-egress'
 
 const HELPER_PATH = '/wp-json/oti/v1/fx-rates'
 const PUSH_TIMEOUT_MS = 15_000
@@ -48,6 +49,10 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
   }
 
   if (!rates.length) return { supported: true, pushed: 0, errors: [] }
+
+  // The last barrier of the producer-side hold (see ./producer-egress): nothing leaves while the destination is held.
+  const egressHold = wooEgressHold()
+  if (egressHold.held) return { supported: true, pushed: 0, errors: [egressHold.notice] }
 
   const body = JSON.stringify({ rates })
   const signature = createHmac('sha256', secret).update(body).digest('hex')
@@ -117,6 +122,10 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
   // Send a body the plugin will reject — empty rates list, deliberately
   // invalid HMAC. We're testing the plugin layer, not the rate logic.
   const body = JSON.stringify({ rates: [] })
+
+  // The probe is a POST: the same last barrier applies, and a held probe says so (it did not reach the store).
+  const egressHold = wooEgressHold()
+  if (egressHold.held) return { status: 'NOT_CONFIGURED', message: egressHold.notice }
 
   let res: Response | null = null
   try {

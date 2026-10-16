@@ -39,6 +39,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
+import { wooProducerSeam, type WooShadow } from '../producer-seam'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
@@ -480,12 +481,34 @@ function gateRefusalResult(message: string): StockSyncResult {
   }
 }
 
+// The producer-side hold kept this push as a shadow: nothing was sent. `aborted` makes any caller that does not know about
+// shadows read it as "not pushed" (never as a benign no-op or a success); `shadowed` lets the callers that do know say why.
+function shadowedStockResult(seam: WooShadow): StockSyncResult {
+  return { ...gateRefusalResult(seam.notice), shadowed: true }
+}
+
 export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
     return gateRefusalResult('Stock sync is disabled in settings')
   }
   const scopedProductIds = options?.productIds ? [...new Set(options.productIds)] : null
+  // THE PRODUCER SEAM of the stock writer. Every stock push reaches WooCommerce through this function (the queue drain, the
+  // daily reconcile, the manual push, a webhook correction), so asking here covers the paths below the enqueue as well. It sits
+  // after the setting check on purpose: a push the setting refuses is not one IMS would have written, so it is not a shadow.
+  const seam = await wooProducerSeam({
+    operation: 'stock',
+    subjectType: 'StockPush',
+    subjectId: scopedProductIds ? [...scopedProductIds].sort().join(',').slice(0, 400) || '(none)' : '(all products)',
+    payload: {
+      products: scopedProductIds ? [...scopedProductIds].sort() : 'all',
+      forceAll: options?.forceAll === true,
+      forceProductIds: [...(options?.forceProductIds ?? [])].sort(),
+      source: options?.source ?? null,
+    },
+    summary: { source: options?.source ?? null, forceAll: options?.forceAll === true, productCount: scopedProductIds ? scopedProductIds.length : null },
+  })
+  if (!seam.proceed) return shadowedStockResult(seam)
   const forceProductIds = new Set(options?.forceProductIds ?? [])
   const forceAll = options?.forceAll === true
 

@@ -10,6 +10,7 @@ import {
   calculateIntegrationOutboxRetryDelayMs,
   claimIntegrationOutboxWork,
   enqueueIntegrationOutbox,
+  requireEnqueuedOutboxRow,
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
@@ -243,16 +244,21 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
   }
 }
 
+/** The row of an enqueue that these tests expect to be queued: a shadow here would be a failure of the test setup. */
+async function enqueueRow(...args: Parameters<typeof enqueueIntegrationOutbox>) {
+  return requireEnqueuedOutboxRow(await enqueueIntegrationOutbox(...args))
+}
+
 test('integration outbox enqueue is idempotent by idempotency key', async () => {
   const { client, rows } = makeClient()
 
-  const first = await enqueueIntegrationOutbox({
+  const first = await enqueueRow({
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
     payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE' },
   }, { client })
-  const second = await enqueueIntegrationOutbox({
+  const second = await enqueueRow({
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
@@ -268,13 +274,13 @@ test('integration outbox enqueue is idempotent by idempotency key', async () => 
 test('integration outbox enqueue is idempotent under the query-engine meta.target shape too', async () => {
   const { client, rows } = makeClient([], { uniqueErrorShape: 'legacy' })
 
-  const first = await enqueueIntegrationOutbox({
+  const first = await enqueueRow({
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
     payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE' },
   }, { client })
-  const second = await enqueueIntegrationOutbox({
+  const second = await enqueueRow({
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
@@ -331,7 +337,7 @@ test('integration outbox validates registered payloads on enqueue', async () => 
 test('integration outbox preserves unknown operation payloads for backwards compatibility', async () => {
   const { client, rows } = makeClient()
 
-  const row = await enqueueIntegrationOutbox({
+  const row = await enqueueRow({
     connector: 'legacy-connector',
     operation: 'legacy.operation',
     idempotencyKey: 'legacy-connector:legacy.operation:job-1',
@@ -416,7 +422,7 @@ test('integration outbox enqueue treats a P2002 naming no constraint as idempote
     }),
   ], { uniqueErrorShape: 'bare-model' })
 
-  const row = await enqueueIntegrationOutbox({
+  const row = await enqueueRow({
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',

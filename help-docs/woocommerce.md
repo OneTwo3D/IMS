@@ -702,6 +702,18 @@ The **Sync Log** tab shows the last 100 synchronisation events. Each entry inclu
 
 Use this log to troubleshoot sync issues and verify that orders and products are flowing correctly.
 
+## When IMS is not allowed to write to WooCommerce (producer-side hold)
+
+On an installation where the producer-side hold is switched on for WooCommerce (`PRODUCER_HOLD_ENFORCED_DESTINATIONS` names `woocommerce`; see "Producer-side hold" in the installation guide) IMS reads from the store as usual but **writes nothing to it** until the store is granted and the live-from instant has passed. This is separate from, and in addition to, the outbound-write hold at the HTTP boundary.
+
+What you see while it is held:
+
+- **Stock.** Stock changes do not queue a push, and **Push Stock Now** and the daily reconcile do not send anything. Push Stock Now reports the single-sourced sentence beginning "Not sent by IMS: writes to WooCommerce are held on this installation" followed by "nothing was pushed". The daily reconcile does **not** record itself as done, so the first run once writes are allowed catches the store up. The setting "Push stock levels to WooCommerce" still has to be on for a push to happen at all: with it off you get the usual "Stock sync is disabled in settings" and no shadow is kept.
+- **Order status, tracking, partial shipments, the WMS-status note, product details, exchange rates and webhook registration.** None is sent. The buttons that trigger them (Register webhooks, Push exchange rates now, the helper-plugin check) show the same sentence. An order that ships, is cancelled or is put on hold in IMS still does so: it simply has no storefront job, and the storefront is not told.
+- **Nothing is queued for later.** What IMS would have sent is kept as a *shadow record* (what it was, which order or product, how many times it was produced) and is **never** delivered afterwards. Once writes are allowed, IMS starts from the current state rather than replaying what was held. A shadow is not a failure: nothing is retried, nothing dead-letters, and nothing appears in the sync exceptions list for it.
+- **Jobs that were already queued** before the hold was switched on stay exactly as they were. The stock, order-completion, cancel and hold queues stand down: they claim nothing and spend no attempt.
+- **A shadow does not say the storefront is unchanged.** The sentence names who owns the operation in the current phase (for example the WooCommerce-Mintsoft plugin, or Qoblex for stock). IMS did not send it; check WooCommerce before acting on the assumption that the store has, or has not, been updated.
+
 ## Cron Jobs
 
 WooCommerce is now webhook-first. Scheduled jobs exist for backup reconciliation and retry draining, not as the primary intake path.

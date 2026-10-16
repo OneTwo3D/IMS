@@ -19,6 +19,7 @@ import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getSettingValues } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '../url-safety'
+import { wooEgressHold } from '../producer-egress'
 
 const PUSH_TIMEOUT_MS = 15_000
 
@@ -45,6 +46,11 @@ export type WcPartialShipmentPush = {
   shipmentNum?: string | null
   /** Lines despatched in this part (SKU + integer qty). */
   items: WcPartialShipmentLine[]
+  /**
+   * When the WMS despatched this part, if it said. Not sent: it is the business-event time the producer-side hold judges the
+   * push by (a part despatched before the live-from instant belongs to the writer that owned the store then).
+   */
+  despatchedAt?: Date | null
 }
 
 export type PartialShipmentPushResult = {
@@ -53,6 +59,8 @@ export type PartialShipmentPushResult = {
   allDone?: boolean
   duplicate?: boolean
   skipped?: boolean
+  /** The producer-side hold kept this IMS did not send it: not a failure, not a success, not queued. */
+  shadowed?: boolean
   error?: string
 }
 
@@ -100,6 +108,10 @@ export async function pushPartialShipmentToWc(
   }
   const validatedUrl = validateWooCommerceBaseUrl(url)
   if (!validatedUrl.ok) return { supported: true, ok: false, error: validatedUrl.error }
+
+  // The last barrier of the producer-side hold (see ../producer-egress): nothing leaves while the destination is held.
+  const egressHold = wooEgressHold()
+  if (egressHold.held) return { supported: true, ok: false, shadowed: true, error: egressHold.notice }
 
   const body = buildPartialShipmentBody(input)
   const signature = createHmac('sha256', secret).update(body).digest('hex')

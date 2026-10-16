@@ -257,4 +257,9 @@ export type StockSyncResult = SyncResult & {
    * aborts must surface as a failure, and a queued job must be retained.
    */
   aborted?: boolean
+  /**
+   * The producer-side hold kept this push as a shadow instead of sending it. Always accompanies `aborted`. NOT a failure to
+   * retry, NOT queued, NOT pushed: nothing was sent and nothing is waiting.
+   */
+  shadowed?: boolean
 }
