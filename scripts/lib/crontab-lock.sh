@@ -1392,15 +1392,16 @@ CRONTAB_MANAGED_BLOCK_AWK='
   function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
   function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
   function isBlank(x) { return x ~ /^[[:space:]]*$/ }
-  function isRemnant(x,   managed) {
-    # The exact generated job signature (== MANAGED_JOB_LINE_SIGNATURE in lib/crontab-sync.ts),
+  function isRemnant(x,   managed, legacy) {
+    # The exact generated job signatures (== MANAGED_JOB_LINE_SIGNATURE and LEGACY_MANAGED_JOB_LINE_SIGNATURE in lib/crontab-sync.ts),
     # assembled from pieces so that the dollars never form a `$NAME` token. They are awk string
     # constants inside a single-quoted shell assignment and bash never expands them — but the
     # entrypoint scan in tests/scripts/deploy-order.test.ts reads this library line by line, and a
     # bare `$CRON_SECRET` here is indistinguishable to it from a variable the caller must supply.
     # awk concatenates adjacent constants, so the value is byte-identical to the TypeScript one.
-    managed = "-H \"Authorization: Bearer " "$" "CRON_SECRET\" \"" "$" "BASE_URL/"
-    return (index(x, managed) > 0 \
+    managed = "-K - \"" "$" "BASE_URL/"
+    legacy = "-H \"Authorization: Bearer " "$" "CRON_SECRET\" \"" "$" "BASE_URL/"
+    return (index(x, managed) > 0 || index(x, legacy) > 0 \
       || x ~ /^# CRON_SECRET is read from .* at runtime/ \
       || x ~ /^# Managed by One Two Inventory/ \
       || x ~ /^BASE_URL="/)
@@ -1811,4 +1812,246 @@ require_port_drained() {
   done
   PORT_DRAIN_REASON="${PORT_DRAIN_LISTENERS} socket(s) are still listening on :${port} ${PORT_DRAIN_WAIT_SECONDS}s after the stop, so something is still serving (ss -ltnp | grep :${port})"
   return 1
+}
+
+
+# =============================================================================
+# THE CRON JOB LINES, AND THE REWRITE OF AN EARLIER RELEASE'S (o3d-kb3dq)
+# =============================================================================
+# Shared by scripts/install.sh, scripts/update.sh and scripts/deploy.sh: one rule, stated once (Codex round 3 HIGH: the
+# rewrite ran in install.sh only, so a host upgraded through update.sh or deploy.sh kept every old `curl -H "Authorization:
+# Bearer $CRON_SECRET"` job, and each run showed the bearer to every local account in `ps`). The rewrite is done under
+# the crontab lock by migrate_legacy_cron_block_locked; update.sh and deploy.sh call ensure_cron_bearer_off_argv after
+# their cron restore, and install.sh calls rewrite_legacy_cron_block_locked from its bootstrap.
+
+# THE JOB COMMAND, WITH THE BEARER OFF THE COMMAND LINE (o3d-kb3dq). It used to be `curl -H "Authorization: Bearer
+# $CRON_SECRET"`, which expands the secret into curl's argv for as long as a job runs, readable by every local account
+# through `ps`. The header is now written by the shell's builtin echo into a pipe and read by curl as a config line
+# (-K -): no process has the secret in its arguments and no file holds it. An empty secret, or one holding a backslash,
+# runs nothing and says so in the job log (fails closed). This is the SAME text lib/crontab-sync.ts renders for the
+# in-app scheduler (tests/scripts/installer-secrets-argv.test.ts renders both and compares them byte for byte).
+cron_job_command_into() {
+  local slug="$2" logfile="$3" envfile="$4" template command="" dollar='$'
+  # An UNQUOTED heredoc, so that every dollar that must reach the crontab is written \$ (the deploy-order scan of what a
+  # script expands reads a bare $NAME as an expansion, and here none is one) and the doubled backslash is \\\\.
+  IFS= read -r -d '' template <<EOF || true
+case "\$CRON_SECRET" in ''|*\\\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); @SLUG@ was not run" ;; *) echo "header = \"Authorization: Bearer \$CRON_SECRET\"" | curl -sf -o /dev/null -K - "\$BASE_URL/@SLUG@" ;; esac >> '@LOG@' 2>&1
+EOF
+  template="${template%$'\n'}"
+  # NO PATTERN REPLACEMENT FOR A SUBSTITUTED VALUE (Codex round 3 HIGH). `${template//@LOG@/${logfile}}` treats the VALUE as a
+  # replacement string: with `patsub_replacement` (bash 5.2+, on by default) an `&` in it expands to the matched text, so
+  # `/var/log/acme&sons/cron.log` was written as `/var/log/acme@LOG@sons/cron.log`, and a backslash is an escape there too.
+  # The template is walked ONCE, left to right, and each value is APPENDED: a value is never a pattern, never a replacement
+  # and never rescanned, so no character in it (`&`, `\`, `%`, a space, a quote, a placeholder-looking `@LOG@`) is special.
+  while [[ -n "${template}" ]]; do
+    if [[ "${template}" == '@SLUG@'* ]]; then
+      command+="${slug}"
+      template="${template#'@SLUG@'}"
+    elif [[ "${template}" == '@LOG@'* ]]; then
+      command+="${logfile}"
+      template="${template#'@LOG@'}"
+    else
+      command+="${template:0:1}"
+      template="${template:1}"
+    fi
+  done
+  if [[ -n "${envfile}" ]]; then
+    # The runtime-read mode: the job extracts the secret from the .env when it fires. (An empty ${envfile} is the
+    # embedded-literal mode, where the crontab assigns CRON_SECRET itself and the job carries no extraction prefix.)
+    command="CRON_SECRET=${dollar}(grep -m1 '^CRON_SECRET=' '${envfile}' | cut -d= -f2- | tr -d '\"'); ${command}"
+  fi
+  printf -v "$1" '%s' "${command}"
+}
+cron_job_command() {
+  local rendered
+  cron_job_command_into rendered "$@"
+  printf '%s' "${rendered}"
+}
+
+# THE UNMARKED JOBS AN OLDER INSTALLER WROTE (Codex round 4 HIGH). Before the managed block existed (git d3ebd53a..80bb3700) the
+# installer appended plain lines, outside any OTI marker and with a literal URL:
+#   <sched> CRON_SECRET=$(grep -m 1 '^CRON_SECRET=' '<env>' | cut -d= -f2-) && curl -fsS -H "Authorization: Bearer ${CRON_SECRET}" http://localhost:<port>/api/cron/<slug> > /dev/null 2>&1
+# Rewritten here to the stdin form, keeping the schedule, the .env path, the URL and the redirect. The URL is placed
+# verbatim (same single walk of the template as cron_job_command_into, never a pattern replacement).
+cron_historical_command_into() {
+  local url="$2" envfile="$3" redir="$4" template command="" dollar='$'
+  IFS= read -r -d '' template <<EOF || true
+case "\$CRON_SECRET" in ''|*\\\\*) echo "cron-auth: CRON_SECRET is missing or unusable (empty, or holds a backslash); @URL@ was not run" ;; *) echo "header = \"Authorization: Bearer \$CRON_SECRET\"" | curl -sf -o /dev/null -K - "@URL@" ;; esac@REDIR@
+EOF
+  template="${template%$'\n'}"
+  while [[ -n "${template}" ]]; do
+    if [[ "${template}" == '@URL@'* ]]; then
+      command+="${url}"
+      template="${template#'@URL@'}"
+    elif [[ "${template}" == '@REDIR@'* ]]; then
+      command+="${redir}"
+      template="${template#'@REDIR@'}"
+    else
+      command+="${template:0:1}"
+      template="${template:1}"
+    fi
+  done
+  command="CRON_SECRET=${dollar}(grep -m1 '^CRON_SECRET=' '${envfile}' | cut -d= -f2- | tr -d '\"'); ${command}"
+  printf -v "$1" '%s' "${command}"
+}
+
+# THE GENERAL DETECTOR: does this crontab line run curl with an Authorization/Bearer HEADER ARGUMENT? Anywhere in the
+# crontab, in or out of the managed block, whatever the secret looks like (${CRON_SECRET}, $CRON_SECRET or a literal): the
+# argument is what `ps` shows. Comment lines are not jobs. The stdin form does not match (its header is written by echo
+# into a pipe and curl is given -K -).
+CRON_EXPOSURE_RE='curl.*[[:space:]](-H|--header)([[:space:]=]|$|["'\''\\])*.*([Bb]earer|[Aa]uthorization)'
+cron_line_exposes_bearer() {
+  local line="$1"
+  [[ "${line}" =~ ^[[:space:]]*# ]] && return 1
+  [[ "${line}" =~ ${CRON_EXPOSURE_RE} ]]
+}
+
+# THE LINES AN EARLIER RELEASE WROTE (o3d-kb3dq, Codex round 2). They carry the bearer as a curl `-H` argument, which `ps`
+# shows to every local account while a job runs. An existing managed block is the application's (the bootstrap leaves its
+# schedules alone), so without this a reinstall would complete with every old job still exposing the secret. The rewrite is
+# LINE-WISE: each legacy job keeps its schedule fields (with their spacing), its slug, its log path and its secret source;
+# only the command changes to the stdin form. Anything else in the block, and everything outside it, is untouched.
+CRON_LEGACY_SIGNATURE='-H "Authorization: Bearer '\$'CRON_SECRET" "'\$'BASE_URL/'
+CRON_LEGACY_LEFT=0
+
+# Rewrite every legacy job line INSIDE a managed block of the crontab text ${1}, into CRON_MIGRATED_TEXT (a variable, not
+# stdout, so the counter below survives: a command substitution would lose it). Sets CRON_LEGACY_LEFT to the number of
+# lines inside a block that still carry the legacy signature afterwards (lines of a shape this cannot rewrite).
+CRON_MIGRATED_TEXT=""
+CRON_LEGACY_LINENOS=""
+migrate_legacy_cron_lines() {
+  local text="$1" line in_block=0 q="'" newline rewritten="" rewritten_command lineno=0
+  local sched='([^[:space:]]+([[:space:]]+[^[:space:]]+){4})([[:space:]]+)'
+  local re_runtime re_literal re_hist
+  re_runtime="^${sched}CRON_SECRET=\\\$\\(grep -m1 ${q}\\^CRON_SECRET=${q} ${q}([^${q}]+)${q} \\| cut -d= -f2- \\| tr -d ${q}\"${q}\\) && \\[ -n \"\\\$CRON_SECRET\" \\] && curl -sf -o /dev/null -H \"Authorization: Bearer \\\$CRON_SECRET\" \"\\\$BASE_URL/([A-Za-z0-9._-]+)\" >> ${q}([^${q}]+)${q} 2>&1\$"
+  re_literal="^${sched}curl -sf -o /dev/null -H \"Authorization: Bearer \\\$CRON_SECRET\" \"\\\$BASE_URL/([A-Za-z0-9._-]+)\" >> ${q}([^${q}]+)${q} 2>&1\$"
+  # the unmarked shape of d3ebd53a..80bb3700: 4 = .env path, 7 = URL, 8 = the optional ` > /dev/null 2>&1`
+  re_hist="^${sched}CRON_SECRET=\\\$\\(grep -m ?1 ${q}\\^CRON_SECRET=${q} ${q}([^${q}]+)${q} \\| cut -d= -f2-( \\| tr -d ${q}\"${q})?\\) && (\\[ -n \"\\\$CRON_SECRET\" \\] && )?curl -[A-Za-z]+ -H \"Authorization: Bearer \\\$\\{?CRON_SECRET\\}?\" ([^ ${q}\"\$\`\\\\]+)( > /dev/null 2>&1)?\$"
+  CRON_LEGACY_LEFT=0
+  CRON_LEGACY_LINENOS=""
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    lineno=$((lineno + 1))
+    newline="${line}"
+    if [[ "${line}" =~ ^'# --- OTI CRON START ---'[[:space:]]*$ ]]; then
+      in_block=1
+    elif [[ "${line}" =~ ^'# --- OTI CRON END ---'[[:space:]]*$ ]]; then
+      in_block=0
+    elif [[ "${in_block}" -eq 1 && "${line}" == *"${CRON_LEGACY_SIGNATURE}"* ]]; then
+      if [[ "${line}" =~ ${re_runtime} ]]; then
+        cron_job_command_into rewritten_command "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}" "${BASH_REMATCH[4]}"
+        newline="${BASH_REMATCH[1]}${BASH_REMATCH[3]}${rewritten_command}"
+      elif [[ "${line}" =~ ${re_literal} ]]; then
+        cron_job_command_into rewritten_command "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" ""
+        newline="${BASH_REMATCH[1]}${BASH_REMATCH[3]}${rewritten_command}"
+      fi
+    elif cron_line_exposes_bearer "${line}" && [[ "${line}" =~ ${re_hist} ]]; then
+      cron_historical_command_into rewritten_command "${BASH_REMATCH[7]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[8]}"
+      newline="${BASH_REMATCH[1]}${BASH_REMATCH[3]}${rewritten_command}"
+    fi
+    # whatever is STILL a bearer-header job line, wherever it sits, is a line this cannot rewrite
+    if cron_line_exposes_bearer "${newline}"; then
+      CRON_LEGACY_LEFT=$((CRON_LEGACY_LEFT + 1))
+      CRON_LEGACY_LINENOS+="${lineno},"
+    fi
+    rewritten+="${newline}"$'\n'
+  done <<< "${text}"
+  CRON_MIGRATED_TEXT="${rewritten}"
+}
+
+# How many lines of the crontab (anywhere, comments excepted) run curl with an Authorization/Bearer header argument, and which
+# (CRON_LEGACY_LINENOS, 1-based, comma-terminated: the lines themselves are NEVER printed, they may carry the secret). The
+# verification after the write uses this on a fresh read of the crontab.
+CRON_LEGACY_COUNT=0
+count_legacy_cron_lines() {
+  local line n=0 lineno=0
+  CRON_LEGACY_LINENOS=""
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    lineno=$((lineno + 1))
+    if cron_line_exposes_bearer "${line}"; then
+      n=$((n + 1))
+      CRON_LEGACY_LINENOS+="${lineno},"
+    fi
+  done <<< "$1"
+  CRON_LEGACY_COUNT="${n}"
+}
+
+# The state of the rewrite, read by the callers: none (nothing legacy / no managed block), migrated (rewritten AND verified by
+# a fresh read), failed (could not rewrite, write rejected, read-back unreadable or still holding old lines).
+CRON_LEGACY_STATE=none
+
+# Rewrite the legacy job lines of the managed block in the crontab text ${1} (which holds a START marker and was read
+# UNDER the crontab lock by the caller), write it, RE-READ and verify. Sets CRON_LEGACY_STATE; on failure also
+# CRONTAB_WRITE_REASON, and returns 1. Returns 0 with state none when there is nothing to rewrite.
+rewrite_legacy_cron_block_locked() {
+  local existing="$1"
+  count_legacy_cron_lines "${existing}"
+  if [[ "${CRON_LEGACY_COUNT}" -gt 0 ]]; then
+    migrate_legacy_cron_lines "${existing}"
+    if [[ "${CRON_LEGACY_LEFT}" -gt 0 ]]; then
+      CRON_LEGACY_STATE=failed
+      CRONTAB_WRITE_REASON="${CRON_LEGACY_LEFT} crontab line(s) carry the bearer as a curl argument in a form this script cannot rewrite"
+      return 1
+    fi
+    write_crontab_for "${APP_USER}" "${CRON_MIGRATED_TEXT%$'\n'}" || {
+      CRON_LEGACY_STATE=failed
+      return 1
+    }
+    read_crontab_for "${APP_USER}" || {
+      CRON_LEGACY_STATE=failed
+      CRONTAB_WRITE_REASON="the crontab was rewritten but could not be read back to verify it"
+      return 1
+    }
+    count_legacy_cron_lines "${CRONTAB_READ_TEXT}"
+    if [[ "${CRON_LEGACY_COUNT}" -ne 0 ]]; then
+      CRON_LEGACY_STATE=failed
+      CRONTAB_WRITE_REASON="the crontab was rewritten but a fresh read of it still holds the old curl -H bearer lines"
+      return 1
+    fi
+    CRON_LEGACY_STATE=migrated
+  fi
+  return 0
+}
+
+# The body update.sh and deploy.sh run under with_crontab_lock: read the crontab once, and if a managed block holds legacy
+# lines rewrite them. A read that did not resolve is a failure (it is not an empty crontab).
+migrate_legacy_cron_block_locked() {
+  read_crontab_for "${APP_USER}" || {
+    CRON_LEGACY_STATE=failed
+    CRONTAB_WRITE_REASON="the crontab could not be read: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  if ! ${CRONTAB_READ_PRESENT}; then return 0; fi
+  rewrite_legacy_cron_block_locked "${CRONTAB_READ_TEXT}"
+}
+
+# Refuse to report completion while the managed block still holds the old lines. Unless the rewrite is known to have
+# succeeded, look again (a lock conflict or a failed read leaves the state unknown): old lines, or a crontab that cannot be
+# read, end the run. ${1} names what to re-run.
+die_if_legacy_cron_lines_remain() {
+  local rerun="${1:-this script}" legacy_left="unknown"
+  [[ "${CRON_LEGACY_STATE}" != "migrated" ]] || return 0
+  if [[ "${CRON_LEGACY_STATE}" != "failed" ]] && read_crontab_for "${APP_USER}"; then
+    count_legacy_cron_lines "${CRONTAB_READ_TEXT}"
+    legacy_left="${CRON_LEGACY_COUNT}"
+  fi
+  if [[ "${legacy_left}" != "0" ]]; then
+    die "The ${APP_USER} crontab still runs jobs with an Authorization/Bearer header as a curl argument (an earlier release's lines)${CRON_LEGACY_LINENOS:+, at crontab line(s) ${CRON_LEGACY_LINENOS%,} (not printed: they may carry the secret)}, and this run could not rewrite them: ${CRONTAB_WRITE_REASON:-${CRONTAB_READ_REASON:-no reason recorded}}. Every job run would show the secret to every local account in 'ps'. Nothing else rewrites those lines. Fix the cause above and re-run ${rerun}, or open Settings -> System -> Scheduler and press Save & Apply, then re-run ${rerun}."
+  fi
+}
+
+# update.sh and deploy.sh: rewrite and VERIFY, under the crontab lock, before the run reports completion. Called after the
+# cron restore (the crontab is live again, so the block it holds is the one that will run) and never in a dry run.
+ensure_cron_bearer_off_argv() {
+  local rerun="${1:-this script}" rc=0 crc=0
+  CRON_LEGACY_STATE=none
+  require_crontab_command "${APP_USER}" || crc=$?
+  if [[ "${crc}" -eq 1 ]]; then
+    die "The ${APP_USER} crontab could not be checked for jobs that put CRON_SECRET on curl's command line: ${CRONTAB_COMMAND_REASON}. Re-run ${rerun} once that is settled."
+  fi
+  [[ "${crc}" -ne 2 ]] || return 0   # no crontab client, no spooled schedule, no daemon: there is nothing to rewrite
+  with_crontab_lock migrate_legacy_cron_block_locked || rc=$?
+  if [[ "${rc}" -ne 0 && "${CRON_LEGACY_STATE}" == "none" ]]; then
+    CRONTAB_WRITE_REASON="${CRONTAB_WRITE_REASON:-the crontab lock could not be taken (status ${rc})}"
+  fi
+  die_if_legacy_cron_lines_remain "${rerun}"
 }

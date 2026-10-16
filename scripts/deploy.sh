@@ -5294,6 +5294,20 @@ run rm -f "$FENCE_FILE"
 # has been past this since the point of no return was armed.
 FENCE_ARMED=false
 
+# THE OLD CRON LINES (o3d-kb3dq, Codex round 3 HIGH). An earlier release scheduled its jobs as `curl -H "Authorization: Bearer
+# $CRON_SECRET"`, which shows the secret to every local account in `ps` on every job run. install.sh rewrites those lines, but
+# a host upgraded through THIS script never runs install.sh, and the cron restore above puts the old block back verbatim. So the
+# same locked rewrite (scripts/lib/crontab-lock.sh, one copy) runs here, on the live crontab, and the run refuses to report
+# completion if old lines remain. After the cron restore and with the fence state already stood down: a refusal here is an
+# operator-visible failure of a step AFTER the health check (the service keeps running), never a teardown.
+CURRENT_STEP="rewrite-legacy-cron"
+if ! $DRY_RUN; then
+  ensure_cron_bearer_off_argv "this deploy"
+  if [[ "${CRON_LEGACY_STATE}" == "migrated" ]]; then
+    ok "Rewrote the managed cron jobs so the secret is no longer on curl's command line (schedules unchanged)."
+  fi
+fi
+
 DEPLOY_OK=true
 
 END_TS=$(date +%s)
