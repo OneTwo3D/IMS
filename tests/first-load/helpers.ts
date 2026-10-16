@@ -5,6 +5,7 @@ import type { TestContext } from 'node:test'
 import { serializeCsv } from '../../lib/first-load/csv.ts'
 import { ingestDataset, parseColumnMap, type ColumnMap, type IngestedDataset } from '../../lib/first-load/ingest.ts'
 import { DATASETS, type DatasetName } from '../../lib/first-load/spec.ts'
+import type { VariantParentsBinding } from '../../lib/first-load/snapshot.ts'
 import { prepare, type PrepareConfig, type PrepareResult } from '../../lib/first-load/transform.ts'
 
 /** A canonical dataset built in memory. `rows` are objects keyed by canonical column; omitted columns are blank. */
@@ -29,7 +30,11 @@ export function config(overrides: Partial<PrepareConfig> = {}): PrepareConfig {
 }
 
 export function run(datasets: Partial<Record<DatasetName, IngestedDataset>>, overrides: Partial<PrepareConfig> = {}): PrepareResult {
-  return prepare({ config: config(overrides), datasets })
+  // These arms test the join and the transform, not the snapshot binding (tests/first-load/variant-parents-binding.test.ts does): a supplied
+  // variant-parents dataset gets a binding for exactly the bytes it was read from.
+  const vp = datasets['variant-parents']
+  const variantParentsBinding: VariantParentsBinding | undefined = vp ? { verified: true, csvSha256: vp.parts[0].sha256, snapshotPayloadSha256: 'test-stub' } : undefined
+  return prepare({ config: config(overrides), datasets, variantParentsBinding })
 }
 
 export function product(sku: string, type = 'SIMPLE', extra: Record<string, string> = {}): Record<string, string> {

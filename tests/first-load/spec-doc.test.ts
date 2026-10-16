@@ -8,8 +8,10 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import {
-  APPLY_TIME_CHECKS, DATASETS, DATASET_NAMES, EXIT_CODE_TABLE, IMPORTER_MAX_BYTES, IMPORTER_MAX_ROWS, IMPORT_TARGETS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE, type ImporterTarget,
+  APPLY_TIME_CHECKS, DATASETS, DATASET_NAMES, EXIT_CODE_TABLE, SNAPSHOT_EXIT_CODE_TABLE, SNAPSHOT_FILE_NAMES, VARIANT_PARENT_STATUS_LIFECYCLE, IMPORTER_MAX_BYTES, IMPORTER_MAX_ROWS, IMPORT_TARGETS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE, type ImporterTarget,
 } from '../../lib/first-load/spec.ts'
+import { ENV_KEYS, DEFAULT_MIN_INTERVAL_MS, DEFAULT_MAX_RESUME_AGE_MINUTES } from '../../lib/first-load/woo-snapshot/cli.ts'
+import { WALK_MAX_ATTEMPTS } from '../../lib/first-load/woo-snapshot/walk.ts'
 import { precondition } from './helpers.ts'
 
 const doc = readFileSync(path.join(process.cwd(), 'docs/first-load-input-spec.md'), 'utf8')
@@ -84,4 +86,43 @@ test('the apply-time checks in the document are exactly APPLY_TIME_CHECKS (every
   const rows = tableRows(section('## Apply-time checks this tool cannot prove'))
   precondition(t, 'document apply-time rows', rows.length)
   assert.deepEqual(rows, APPLY_TIME_CHECKS.map((c) => [c.id, c.area, c.check]))
+})
+
+test('the snapshot exit-code table in the document is exactly SNAPSHOT_EXIT_CODE_TABLE (every row, both directions)', (t) => {
+  const rows = tableRows(section('### Snapshot exit codes'))
+  precondition(t, 'document snapshot exit-code rows', rows.length)
+  assert.equal(rows.length, SNAPSHOT_EXIT_CODE_TABLE.length)
+  SNAPSHOT_EXIT_CODE_TABLE.forEach((expected, index) => {
+    assert.deepEqual(rows[index], [String(expected.code), expected.name, expected.meaning])
+  })
+})
+
+test('the snapshot command section documents exactly the environment variables the command reads, the files it writes and its defaults', (t) => {
+  const body = section('## WooCommerce snapshot command')
+  const documented = tableRows(body.slice(body.indexOf('| Variable |'), body.indexOf('An unknown variable'))).map((row) => row[0].replace(/`/g, ''))
+  precondition(t, 'documented environment variables', documented.length)
+  assert.deepEqual([...documented].sort(), Object.values(ENV_KEYS).sort(), 'every variable the command reads is documented, and none that it does not')
+  const files = tableRows(body.slice(body.indexOf('| File |'), body.indexOf('**Completeness is proved')))
+  precondition(t, 'documented output files', files.length)
+  assert.deepEqual(files.map((row) => row[0].replace(/`/g, '')).sort(), [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection].sort())
+  assert.ok(body.includes(`(default ${DEFAULT_MIN_INTERVAL_MS})`), 'the documented default interval is the real one')
+  assert.ok(body.includes(`(default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`), 'the documented resume age is the real one')
+  assert.equal(WALK_MAX_ATTEMPTS, 3)
+  assert.ok(body.includes('retried up to three times'), 'the documented retry count is the real one')
+  assert.ok(body.includes(SNAPSHOT_FILE_NAMES.partial), 'the resume file is documented')
+})
+
+test('the parentStatus row documents exactly the closed status mapping (every pair, both directions)', (t) => {
+  const rows = tableRows(section('### Dataset: variant-parents'))
+  const row = rows.find((r) => r[0] === '`parentStatus`')
+  assert.ok(row, 'the parentStatus row exists')
+  const documented = Object.fromEntries([...row![2].matchAll(/`([a-z]+)` = (ACTIVE|DRAFT)/g)].map((m) => [m[1], m[2]]))
+  precondition(t, 'statuses in the closed mapping', Object.keys(VARIANT_PARENT_STATUS_LIFECYCLE).length)
+  assert.deepEqual(documented, { ...VARIANT_PARENT_STATUS_LIFECYCLE })
+})
+
+test('the document no longer says variants wait for parents from "another source" or that the stock report alone leaves them blocked', (t) => {
+  precondition(t, 'absence checks', 2)
+  assert.ok(!/until the VARIABLE parent products are supplied/.test(doc))
+  assert.ok(!/have to come from another source before variants can load/.test(doc))
 })

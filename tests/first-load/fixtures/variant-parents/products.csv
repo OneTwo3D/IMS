@@ -1,0 +1,7 @@
+sku,name,type,category
+1001-01,Widget Red,VARIANT,Widgets
+1001-02,Widget Blue,VARIANT,Widgets
+2002-01,Gadget Small,VARIANT,Gadgets
+3003-07,Gizmo Large,VARIANT,Gadgets
+4004,Plain Thing,SIMPLE,Things
+6006,Not A Variant In Qoblex,SIMPLE,Things

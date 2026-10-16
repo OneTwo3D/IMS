@@ -1,0 +1,9 @@
+variantSku,wooVariationId,parentSku,parentName,parentStatus,wooParentId
+1001-01,9001,WIDGET,Widget,publish,9000
+1001-02,9002,WIDGET,Widget,publish,9000
+2002-01,9101,2002,Gadget,draft,9100
+3003-07,9201,GIZ-PARENT,Gizmo,private,9200
+6006,9301,OTHER-PARENT,Other,publish,9300
+7007-01,9401,SEVEN,Seven,publish,9400
+7007-02,9402,SEVEN,Seven,publish,9400
+8008-01,9501,EIGHT,Eight,publish,9500
