@@ -210,7 +210,7 @@ export async function wcFetch(
   params: Record<string, string> = {},
   creds?: ConnectorCredentials | null,
   readOptions: { refuseRedirects?: boolean } = {},
-): Promise<{ data: unknown; totalPages: number; totalItems: number; error?: string }> {
+): Promise<{ data: unknown; totalPages: number; totalItems: number; /** True only when the store actually sent an X-WP-Total header (an absent one reads as 0 in `totalItems`). */ totalItemsPresent?: boolean; error?: string }> {
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
     logMissingWooCommerceCredentials()
@@ -258,7 +258,7 @@ export async function wcFetch(
   const totalPages = readWcCountHeader(res.headers.get('x-wp-totalpages'), 1)
   const totalItems = readWcCountHeader(res.headers.get('x-wp-total'), 0)
   const data = await res.json()
-  return { data, totalPages, totalItems }
+  return { data, totalPages, totalItems, totalItemsPresent: res.headers.get('x-wp-total') !== null }
 }
 
 export async function wcPost(

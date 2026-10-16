@@ -503,17 +503,19 @@ test('arm (n): --verify recomputes the checksum: an edited snapshot is refused, 
   try {
     assert.equal((await snapshot(r)).code, SNAPSHOT_EXIT_CODES.OK)
     const file = path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot)
-    const good = await snapshot(r, [], {}, ['--verify', file, '--expect-origin', r.server.origin])
+    const attest = fresh('attest.json')
+    writeFileSync(attest, JSON.stringify({ products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } }))
+    const good = await snapshot(r, [], {}, ['--verify', file, '--expect-origin', r.server.origin, '--expect-visibility', attest])
     precondition(t, 'verifications', 1)
     assert.equal(good.code, SNAPSHOT_EXIT_CODES.OK, good.stderr)
     assert.match(good.stdout, /4 variable product\(s\), 10 variation\(s\)/)
     const edited = fresh('edited.json')
     writeFileSync(edited, readFileSync(file, 'utf8').replace('"sku": "W-01"', '"sku": "W-99"'))
-    const bad = await snapshot(r, [], {}, ['--verify', edited, '--expect-origin', r.server.origin])
+    const bad = await snapshot(r, [], {}, ['--verify', edited, '--expect-origin', r.server.origin, '--expect-visibility', attest])
     assert.equal(bad.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
     assert.match(bad.stderr, /checksum does not match/)
-    assert.equal((await snapshot(r, [], {}, ['--verify', file, '--expect-origin', r.server.origin, '--out', 'x'])).code, SNAPSHOT_EXIT_CODES.USAGE)
-    assert.equal((await snapshot(r, [], {}, ['--verify', fresh('missing.json'), '--expect-origin', r.server.origin])).code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
+    assert.equal((await snapshot(r, [], {}, ['--verify', file, '--expect-origin', r.server.origin, '--expect-visibility', attest, '--out', 'x'])).code, SNAPSHOT_EXIT_CODES.USAGE)
+    assert.equal((await snapshot(r, [], {}, ['--verify', fresh('missing.json'), '--expect-origin', r.server.origin, '--expect-visibility', attest])).code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
   } finally { await r.server.close() }
 })
 
@@ -529,7 +531,7 @@ test('arm (o): end to end: the snapshot\'s variant-parents.csv, fed to first-loa
     writeFileSync(path.join(dir, 'exclusions.csv'), 'sku,reason\nW-03,not loaded at first\nB-02,not loaded at first\nB-03,not loaded at first\nB-04,not loaded at first\nB-05,not loaded at first\n')
     writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
       formatVersion: 1, baseCurrency: 'GBP',
-      wooSnapshot: { snapshot: SNAPSHOT_FILE_NAMES.snapshot, provenance: SNAPSHOT_FILE_NAMES.provenance, origin: r.server.origin },
+      wooSnapshot: { snapshot: SNAPSHOT_FILE_NAMES.snapshot, provenance: SNAPSHOT_FILE_NAMES.provenance, origin: r.server.origin, visibilityChecked: { products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } } },
       inputs: [
         { dataset: 'products', file: 'products.csv' },
         { dataset: 'variant-parents', file: 'variant-parents.csv' },
@@ -781,4 +783,22 @@ test('arm (y): per-status counts that do not add up to the store total, and a ro
     assert.match(b.stderr, /product 100 has the status "future", which the snapshot cannot enumerate/)
     assert.deepEqual([...listFiles(short.out), ...listFiles(future.out)], [])
   } finally { await short.server.close(); await future.server.close() }
+})
+
+test('arm (z): a key that gets 200 and an EMPTY list for rows it may not read, with no X-WP-Total, is refused even though status=any and every count agree', async (t) => {
+  const control = await rig()
+  // The blind key: draft and private rows are absent from `any`, and the explicit requests for them answer 200 with an empty list and NO total header.
+  const blind = await rig({
+    invisibleStatuses: ['private', 'draft'],
+    silentInvisible: true,
+  })
+  try {
+    assert.equal((await snapshot(control)).code, SNAPSHOT_EXIT_CODES.OK)
+    precondition(t, 'control completed', 1)
+    const ran = await snapshot(blind)
+    precondition(t, 'empty, header-less status responses the blind store sent', blind.server.requests.filter((q) => isProbe(q) && ['private', 'draft'].includes(q.query.status)).length)
+    assert.equal(ran.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, ran.stderr)
+    assert.match(ran.stderr, /count of "draft" rows came without a readable X-WP-Total/)
+    assert.deepEqual(listFiles(blind.out), [])
+  } finally { await control.server.close(); await blind.server.close() }
 })

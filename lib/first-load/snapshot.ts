@@ -294,6 +294,41 @@ export function boundProblems(problems: string[]): string[] {
   return clipped
 }
 
+/** The statuses a snapshot enumerates, for the variable products and for their variations. */
+export const SNAPSHOT_STATUSES = ['publish', 'draft', 'private', 'pending'] as const
+export type SnapshotStatus = (typeof SNAPSHOT_STATUSES)[number]
+export type StatusCounts = Record<SnapshotStatus, number>
+export interface VisibilityAttestation { products: StatusCounts; variations: StatusCounts }
+
+/**
+ * The operator's attestation of what the REAL key should see: the counts per status that WooCommerce's own admin shows for variable products and for
+ * the variations of those products. Shape: {"products": {"publish": n, "draft": n, "private": n, "pending": n}, "variations": {...}}. Anything else is a problem.
+ */
+export function parseVisibilityAttestation(raw: unknown): { ok: true; value: VisibilityAttestation } | { ok: false; problem: string } {
+  const bad = (problem: string) => ({ ok: false as const, problem })
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return bad('the visibility attestation must be an object {"products": {...}, "variations": {...}}')
+  const o = raw as Record<string, unknown>
+  for (const key of Object.keys(o)) if (key !== 'products' && key !== 'variations') return bad(`unknown key "${key.slice(0, 40)}" in the visibility attestation`)
+  const counts = (name: string): StatusCounts | string => {
+    const c = o[name]
+    if (typeof c !== 'object' || c === null || Array.isArray(c)) return `the visibility attestation needs "${name}" as an object with a count for each of ${SNAPSHOT_STATUSES.join(', ')}`
+    const rec = c as Record<string, unknown>
+    for (const key of Object.keys(rec)) if (!(SNAPSHOT_STATUSES as readonly string[]).includes(key)) return `unknown status "${key.slice(0, 40)}" in the attestation's ${name}`
+    const out = {} as StatusCounts
+    for (const status of SNAPSHOT_STATUSES) {
+      const n = rec[status]
+      if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) return `the attestation's ${name}.${status} must be a whole number of rows, 0 or more`
+      out[status] = n
+    }
+    return out
+  }
+  const products = counts('products')
+  if (typeof products === 'string') return bad(products)
+  const variations = counts('variations')
+  if (typeof variations === 'string') return bad(variations)
+  return { ok: true, value: { products, variations } }
+}
+
 const hex12 = (hex: string) => hex.slice(0, 12)
 
 /** A store origin as the URL standard writes it (scheme://host[:port], lower-case host, default port dropped, no path), or null when it is not an http(s) origin. */
@@ -328,6 +363,12 @@ export function verifyWooSnapshotBundle(input: {
    * It is an expectation checked against the origin the provenance recorded, not proof of where the bytes came from. `null` (not declared) is a refusal.
    */
   expectedOrigin: string | null
+  /**
+   * What the operator read off the shop's own admin for the real key's visibility (see `parseVisibilityAttestation`). The provenance's recorded per-status
+   * counts must equal it, because a key that is silently shown less than the shop holds produces self-consistent counts that no check inside the walk can tell apart.
+   * `null` (not given) is a refusal.
+   */
+  visibilityChecked: VisibilityAttestation | null
 }): SnapshotBundleVerdict {
   const problems: string[] = []
   const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -375,6 +416,18 @@ export function verifyWooSnapshotBundle(input: {
     const recordedOrigin = typeof provenance.origin === 'string' ? normaliseStoreOrigin(provenance.origin) : null
     if (recordedOrigin === null) problems.push('the provenance does not record a usable store origin')
     else if (expectedOrigin !== null && recordedOrigin !== expectedOrigin) problems.push(`the snapshot was taken from ${recordedOrigin}, not from the declared store ${expectedOrigin}`)
+  }
+  if (input.visibilityChecked === null) problems.push('no visibility attestation was given (the manifest wooSnapshot.visibilityChecked, or --expect-visibility): the per-status counts the real key saw were not compared with the shop\'s own admin counts')
+  else if (provenance !== null) {
+    const proof = provenance.proof as { parents?: { statusTotals?: unknown }; variations?: { statusTotals?: unknown } } | undefined
+    for (const [name, attested, recordedCounts] of [['variable products', input.visibilityChecked.products, proof?.parents?.statusTotals], ['variations', input.visibilityChecked.variations, proof?.variations?.statusTotals]] as const) {
+      const rec = typeof recordedCounts === 'object' && recordedCounts !== null ? (recordedCounts as Record<string, unknown>) : null
+      if (rec === null) problems.push(`the provenance does not record per-status counts for the ${name}`)
+      else {
+        const diff = SNAPSHOT_STATUSES.filter((status) => rec[status] !== attested[status]).map((status) => `${status}: snapshot saw ${String(rec[status])}, attested ${attested[status]}`)
+        if (diff.length > 0) problems.push(`the key saw different ${name} than the shop's admin counts attested (${diff.join('; ')}): the key sees less (or more) than the shop holds`)
+      }
+    }
   }
   const snapRec = recorded('snapshotFile', 'the snapshot file')
   const csvRec = recorded('variantParentsFile', 'variant-parents.csv')

@@ -18,5 +18,23 @@
   "variantParentsInspectionFile": {
     "name": "variant-parents.inspect.csv",
     "sha256": "58aefad447fdcf3d24912f60654c58d805069aa111c8dbf02aef0ee7e7d6dde8"
+  },
+  "proof": {
+    "parents": {
+      "statusTotals": {
+        "publish": 4,
+        "draft": 1,
+        "private": 1,
+        "pending": 0
+      }
+    },
+    "variations": {
+      "statusTotals": {
+        "publish": 8,
+        "draft": 0,
+        "private": 0,
+        "pending": 0
+      }
+    }
   }
 }

@@ -10,7 +10,7 @@ import path from 'node:path'
 import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
-import { bindingFromVerification, normaliseStoreOrigin, verifyWooSnapshotBundle, type VariantParentsBinding } from './snapshot'
+import { bindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type VisibilityAttestation, type VariantParentsBinding } from './snapshot'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
 
 export interface CliIo {
@@ -48,7 +48,7 @@ interface Manifest {
   maxPurchaseTaxRate: string | null
   requireVariantParents: boolean
   /** Where the snapshot and its provenance are, for the variant-parents binding. Relative to the manifest. */
-  wooSnapshot: { snapshot: string; provenance: string; origin: string | null } | null
+  wooSnapshot: { snapshot: string; provenance: string; origin: string | null; visibilityChecked: VisibilityAttestation | null } | null
   inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null; supersedesEarlier: boolean }>
 }
 
@@ -82,9 +82,9 @@ function parseManifest(text: string): Manifest {
   let wooSnapshot: Manifest['wooSnapshot'] = null
   if (m.wooSnapshot !== undefined) {
     const w = m.wooSnapshot
-    if (typeof w !== 'object' || w === null || Array.isArray(w)) throw new UsageError('manifest wooSnapshot must be an object {"snapshot": <woo-snapshot.json>, "provenance": <woo-snapshot.provenance.json>, "origin": <the WooCommerce store origin>}')
+    if (typeof w !== 'object' || w === null || Array.isArray(w)) throw new UsageError('manifest wooSnapshot must be an object {"snapshot": <woo-snapshot.json>, "provenance": <woo-snapshot.provenance.json>, "origin": <the WooCommerce store origin>, "visibilityChecked": <per-status counts from the shop admin>}')
     const wo = w as Record<string, unknown>
-    for (const key of Object.keys(wo)) if (key !== 'snapshot' && key !== 'provenance' && key !== 'origin') throw new UsageError(`unknown key "${key}" in manifest wooSnapshot`)
+    for (const key of Object.keys(wo)) if (key !== 'snapshot' && key !== 'provenance' && key !== 'origin' && key !== 'visibilityChecked') throw new UsageError(`unknown key "${key}" in manifest wooSnapshot`)
     if (typeof wo.snapshot !== 'string' || wo.snapshot === '' || typeof wo.provenance !== 'string' || wo.provenance === '') throw new UsageError('manifest wooSnapshot needs a snapshot path and a provenance path (both strings)')
     // The origin is the operator's declaration of which store the snapshot must come from. Absent is accepted here and refused where the snapshot is bound (an ERROR finding).
     let origin: string | null = null
@@ -92,7 +92,14 @@ function parseManifest(text: string): Manifest {
       if (typeof wo.origin !== 'string' || normaliseStoreOrigin(wo.origin) === null) throw new UsageError('manifest wooSnapshot origin must be an http(s) origin such as https://shop.example')
       origin = normaliseStoreOrigin(wo.origin)
     }
-    wooSnapshot = { snapshot: wo.snapshot, provenance: wo.provenance, origin }
+    // The operator's attestation of what the real key should see (the shop admin's per-status counts). Absent is refused where the snapshot is bound.
+    let visibilityChecked: VisibilityAttestation | null = null
+    if (wo.visibilityChecked !== undefined) {
+      const parsedAttestation = parseVisibilityAttestation(wo.visibilityChecked)
+      if (!parsedAttestation.ok) throw new UsageError(`manifest wooSnapshot visibilityChecked: ${parsedAttestation.problem}`)
+      visibilityChecked = parsedAttestation.value
+    }
+    wooSnapshot = { snapshot: wo.snapshot, provenance: wo.provenance, origin, visibilityChecked }
   }
   if (!Array.isArray(m.inputs) || m.inputs.length === 0) throw new UsageError('manifest inputs must be a non-empty array')
   const seen = new Set<string>()
@@ -294,6 +301,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         provenanceBytes: readOrNull(manifest.wooSnapshot.provenance),
         csvBytes: readOrNull(listed[0].file),
         expectedOrigin: manifest.wooSnapshot.origin,
+        visibilityChecked: manifest.wooSnapshot.visibilityChecked,
       }))
     }
   }

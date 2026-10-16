@@ -47,6 +47,8 @@ function catalogue(variant: 'a' | 'b'): FakeParent[] {
 /** Writes a real snapshot bundle (snapshot, provenance, variant-parents.csv, inspection copy) with the real command and returns its directory. */
 /** The origin the operator declares for each bundle written below (the fake store it was really read from). */
 const declaredOrigin = new Map<string, string>()
+/** What the shop's admin shows for the bundle's catalogue (2 variable products, 3 variations, all published). */
+const ATTESTED = { products: { publish: 2, draft: 0, private: 0, pending: 0 }, variations: { publish: 3, draft: 0, private: 0, pending: 0 } }
 
 async function bundle(variant: 'a' | 'b' = 'a'): Promise<string> {
   const server = await startFakeCatalogue({ key: KEY, secret: SECRET, parents: catalogue(variant) })
@@ -79,22 +81,24 @@ const edit = (target: string, change: (text: string) => string) => {
 interface Provenance { snapshotFile: { sha256: string; payloadSha256: string }; variantParentsFile?: { sha256: string } }
 const editProvenance = (dir: string, change: (p: Provenance) => void) => edit(file(dir, SNAPSHOT_FILE_NAMES.provenance), (text) => { const p = JSON.parse(text); change(p); return `${JSON.stringify(p, null, 2)}\n` })
 
-async function verify(dir: string, origin: string | null = declaredOrigin.get(dir) ?? null): Promise<{ code: number; stdout: string; stderr: string }> {
+async function verify(dir: string, origin: string | null = declaredOrigin.get(dir) ?? null, visibility: unknown = ATTESTED): Promise<{ code: number; stdout: string; stderr: string }> {
+  const attestationFile = visibility === null ? null : fresh('attest.json')
+  if (attestationFile !== null) writeFileSync(attestationFile, JSON.stringify(visibility))
   let stdout = ''
   let stderr = ''
-  const code = await runSnapshotCli(['--verify', file(dir, SNAPSHOT_FILE_NAMES.snapshot), ...(origin === null ? [] : ['--expect-origin', origin])], { stdout: (s) => (stdout += s), stderr: (s) => (stderr += s) })
+  const code = await runSnapshotCli(['--verify', file(dir, SNAPSHOT_FILE_NAMES.snapshot), ...(origin === null ? [] : ['--expect-origin', origin]), ...(attestationFile === null ? [] : ['--expect-visibility', attestationFile])], { stdout: (s) => (stdout += s), stderr: (s) => (stderr += s) })
   return { code, stdout, stderr }
 }
 
 /** Runs first-load:prepare over products V-01..V-03 and the bundle's CSV; `csvFrom` is the directory whose variant-parents.csv is listed. */
-async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; wooSnapshot?: boolean; origin?: string | null }): Promise<{ code: number; stdout: string; stderr: string; out: string; written: string; report: PrepareReportShape }> {
+async function prepareWith(opts: { snapshotDir: string | null; csvFrom: string; wooSnapshot?: boolean; origin?: string | null; visibility?: unknown }): Promise<{ code: number; stdout: string; stderr: string; out: string; written: string; report: PrepareReportShape }> {
   const dir = fresh('prepare')
   mkdirSync(dir)
   writeFileSync(path.join(dir, 'products.csv'), 'sku,name,type\nV-01,Variant one,VARIANT\nV-02,Variant two,VARIANT\nV-03,Variant three,VARIANT\n')
   cpSync(file(opts.csvFrom, SNAPSHOT_FILE_NAMES.variantParents), path.join(dir, 'variant-parents.csv'))
   const manifest: Record<string, unknown> = { formatVersion: 1, baseCurrency: 'GBP', inputs: [{ dataset: 'products', file: 'products.csv' }, { dataset: 'variant-parents', file: 'variant-parents.csv' }, { dataset: 'sku-exclusions', file: 'exclusions.csv' }] }
   writeFileSync(path.join(dir, 'exclusions.csv'), 'sku,reason\nV-33,not loaded at first\n')
-  if (opts.wooSnapshot !== false && opts.snapshotDir !== null) manifest.wooSnapshot = { snapshot: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.snapshot), provenance: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.provenance), ...((opts.origin === undefined ? declaredOrigin.get(opts.snapshotDir) : opts.origin) === null ? {} : { origin: opts.origin === undefined ? declaredOrigin.get(opts.snapshotDir) : opts.origin }) }
+  if (opts.wooSnapshot !== false && opts.snapshotDir !== null) manifest.wooSnapshot = { snapshot: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.snapshot), provenance: file(opts.snapshotDir, SNAPSHOT_FILE_NAMES.provenance), ...((opts.visibility === undefined ? ATTESTED : opts.visibility) === null ? {} : { visibilityChecked: opts.visibility === undefined ? ATTESTED : opts.visibility }), ...((opts.origin === undefined ? declaredOrigin.get(opts.snapshotDir) : opts.origin) === null ? {} : { origin: opts.origin === undefined ? declaredOrigin.get(opts.snapshotDir) : opts.origin }) }
   writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest))
   let stdout = ''
   let stderr = ''
@@ -338,4 +342,29 @@ test('arm (o): the declared origin is normalised before it is compared (case, de
   assert.equal(ran.code, EXIT_CODES.OK, ran.stdout + ran.stderr)
   const bad = await prepareWith({ snapshotDir: b, csvFrom: b, origin: 'not an origin' })
   assert.equal(bad.code, EXIT_CODES.USAGE, bad.stdout + bad.stderr)
+})
+
+test('arm (p): the key must have seen what the shop admin shows: a wrong, missing or malformed attestation refuses the bundle, by --verify and by prepare', async (t) => {
+  const b = await bundle()
+  const honest = await prepareWith({ snapshotDir: b, csvFrom: b })
+  precondition(t, 'honest control (attestation equals the recorded counts) joined variants', honest.report.variantParents.variantsJoined)
+  assert.equal((await verify(b)).code, SNAPSHOT_EXIT_CODES.OK)
+  // The shop holds one more draft product than the key saw: every checksum and the CSV still agree, only the attestation does not.
+  const wrong = { ...ATTESTED, products: { ...ATTESTED.products, draft: 1 } }
+  const v = await verify(b, undefined, wrong)
+  assert.equal(v.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, v.stdout)
+  assert.match(v.stderr, /draft: snapshot saw 0, attested 1/)
+  const ran = await prepareWith({ snapshotDir: b, csvFrom: b, visibility: wrong })
+  assert.match(ran.report.findings.find((f: FindingShape) => f.code === 'VARIANT_PARENTS_NOT_BOUND')?.message ?? '', /different variable products than the shop's admin counts attested/)
+  assertRefused(t, ran, honest.written, 'attestation differs')
+  const wrongVariations = await verify(b, undefined, { ...ATTESTED, variations: { ...ATTESTED.variations, private: 2 } })
+  assert.match(wrongVariations.stderr, /different variations than the shop's admin counts attested/)
+  const none = await prepareWith({ snapshotDir: b, csvFrom: b, visibility: null })
+  assert.match(none.report.findings.find((f: FindingShape) => f.code === 'VARIANT_PARENTS_NOT_BOUND')?.message ?? '', /no visibility attestation was given/)
+  assertRefused(t, none, honest.written, 'no attestation')
+  assert.equal((await verify(b, undefined, null)).code, SNAPSHOT_EXIT_CODES.INCONSISTENT, '--verify without --expect-visibility')
+  for (const bad of [{ products: ATTESTED.products }, { ...ATTESTED, products: { ...ATTESTED.products, draft: -1 } }, { ...ATTESTED, products: { ...ATTESTED.products, extra: 1 } }, []]) {
+    assert.equal((await verify(b, undefined, bad)).code, SNAPSHOT_EXIT_CODES.USAGE, JSON.stringify(bad))
+    assert.equal((await prepareWith({ snapshotDir: b, csvFrom: b, visibility: bad })).code, EXIT_CODES.USAGE, JSON.stringify(bad))
+  }
 })

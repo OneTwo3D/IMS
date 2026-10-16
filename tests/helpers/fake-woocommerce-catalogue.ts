@@ -73,6 +73,8 @@ export interface FakeCatalogueOptions {
    * variation ids a product advertises, while an explicit `status=<one of them>` request is refused with HTTP 403.
    */
   invisibleStatuses?: readonly string[]
+  /** With `invisibleStatuses`: answer an explicit request for a hidden status with 200, an empty list and NO pagination headers instead of 403. */
+  silentInvisible?: boolean
   /** Answers an explicit `status=<s>` request with this many instead of the real count (a store whose per-status totals do not add up). */
   statusTotalOverride?: Readonly<Record<string, number>>
   /** Products no longer listed whose variations endpoint still answers (a store that deletes lazily). */
@@ -135,6 +137,7 @@ export async function startFakeCatalogue(options: FakeCatalogueOptions): Promise
     const invisible = options.invisibleStatuses ?? []
     const wanted = query.status ?? 'any'
     if (!['any', 'publish', 'draft', 'private', 'pending'].includes(wanted)) return error(400, 'rest_invalid_param')
+    if (wanted !== 'any' && invisible.includes(wanted) && options.silentInvisible) return reply({ status: 200, headers: {}, body: [] })
     if (wanted !== 'any' && invisible.includes(wanted)) return error(403, 'woocommerce_rest_cannot_view')
     const keep = (status: string): boolean => (wanted === 'any' ? !invisible.includes(status) : status === wanted)
     const override = wanted !== 'any' ? options.statusTotalOverride?.[wanted] : undefined

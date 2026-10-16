@@ -15,7 +15,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { SNAPSHOT_EXIT_CODES, SNAPSHOT_EXIT_CODE_TABLE, SNAPSHOT_FILE_NAMES } from '../spec'
-import { SNAPSHOT_FORMAT_VERSION, formulaLeadingCells, parseSnapshotFile, renderSnapshotFile, renderVariantParentsCsv, renderVariantParentsInspectionCsv, sha256Hex, verifyWooSnapshotBundle } from '../snapshot'
+import { SNAPSHOT_FORMAT_VERSION, formulaLeadingCells, parseSnapshotFile, parseVisibilityAttestation, renderSnapshotFile, renderVariantParentsCsv, renderVariantParentsInspectionCsv, sha256Hex, verifyWooSnapshotBundle, type VisibilityAttestation } from '../snapshot'
 import { WALK_MAX_ATTEMPTS, SnapshotFetchError, SnapshotInconsistentError, freshState, walkStore, type PageResult, type WalkState } from './walk'
 
 export interface CliIo {
@@ -45,7 +45,7 @@ const statusLine = (totals: Record<string, number>): string => Object.entries(to
 export function usageText(): string {
   return [
     'Usage: first-load-woo-snapshot --env-file <credentials> --out <dir> (--allow-origin <origin> ... | --allow-any-origin) [--resume] [--min-interval-ms <n>]',
-    '       first-load-woo-snapshot --verify <woo-snapshot.json> --expect-origin <origin>',
+    '       first-load-woo-snapshot --verify <woo-snapshot.json> --expect-origin <origin> --expect-visibility <counts.json>',
     '',
     'Reads a WooCommerce store\'s variable products and their variations (GET requests only) and writes the snapshot, its provenance and variant-parents.csv.',
     '',
@@ -59,6 +59,7 @@ export function usageText(): string {
     `  --max-resume-age-minutes <n>  an unfinished walk older than this is not resumed (default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`,
     '  --verify <file>        offline: recompute the checksum of a snapshot, re-run its consistency rules, and require the provenance, variant-parents.csv and the inspection copy beside it to match (the CSV must equal the rows regenerated from the snapshot); no request, no credentials',
     '  --expect-origin <o>    with --verify (required there): the WooCommerce origin YOU declare the snapshot must come from; the provenance\'s recorded origin must equal it. It is an expectation you state, checked against the recorded origin, not proof of provenance',
+    '  --expect-visibility <f>  with --verify (required there): a JSON file {"products": {"publish": n, "draft": n, "private": n, "pending": n}, "variations": {...}} holding the counts the shop\'s OWN ADMIN shows; the per-status counts the walk recorded must equal them',
     '  --help                 this text',
     '',
     'Exit codes:',
@@ -80,11 +81,12 @@ interface Args {
   maxResumeAgeMinutes: number
   verify: string | null
   expectOrigin: string | null
+  expectVisibility: string | null
   help: boolean
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { envFile: null, out: null, allowOrigins: [], allowAnyOrigin: false, resume: false, minIntervalMs: DEFAULT_MIN_INTERVAL_MS, maxResumeAgeMinutes: DEFAULT_MAX_RESUME_AGE_MINUTES, verify: null, expectOrigin: null, help: false }
+  const args: Args = { envFile: null, out: null, allowOrigins: [], allowAnyOrigin: false, resume: false, minIntervalMs: DEFAULT_MIN_INTERVAL_MS, maxResumeAgeMinutes: DEFAULT_MAX_RESUME_AGE_MINUTES, verify: null, expectOrigin: null, expectVisibility: null, help: false }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     const value = () => {
@@ -108,12 +110,13 @@ function parseArgs(argv: string[]): Args {
       args.maxResumeAgeMinutes = Number(raw)
     } else if (arg === '--verify') args.verify = value()
     else if (arg === '--expect-origin') args.expectOrigin = value()
+    else if (arg === '--expect-visibility') args.expectVisibility = value()
     else throw new UsageError(`unknown argument ${JSON.stringify(arg)} (credentials are never accepted on the command line: put them in the --env-file)`)
   }
   if (args.help) return args
-  if (args.expectOrigin !== null && args.verify === null) throw new UsageError('--expect-origin is only used with --verify')
+  if ((args.expectOrigin !== null || args.expectVisibility !== null) && args.verify === null) throw new UsageError('--expect-origin and --expect-visibility are only used with --verify')
   if (args.verify !== null) {
-    if (args.envFile !== null || args.out !== null || args.resume || args.allowOrigins.length > 0 || args.allowAnyOrigin) throw new UsageError('--verify reads one file and takes no other option except --expect-origin')
+    if (args.envFile !== null || args.out !== null || args.resume || args.allowOrigins.length > 0 || args.allowAnyOrigin) throw new UsageError('--verify reads one file and takes no other option except --expect-origin and --expect-visibility')
     return args
   }
   if (args.envFile === null) throw new UsageError('--env-file is required')
@@ -193,7 +196,20 @@ export function readBytesOrNull(file: string): Buffer | null {
  * --verify: the snapshot AND the files derived from it. The provenance, variant-parents.csv and the inspection copy are read from the snapshot's
  * own directory; the CSV must be byte-identical to the rows regenerated from the verified snapshot and every recorded hash must match.
  */
-function runVerify(file: string, expectOrigin: string | null, io: CliIo): number {
+function readAttestation(file: string | null): VisibilityAttestation | null {
+  if (file === null) return null
+  let raw: unknown
+  try {
+    raw = JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    throw new UsageError('--expect-visibility must name a readable JSON file')
+  }
+  const parsed = parseVisibilityAttestation(raw)
+  if (!parsed.ok) throw new UsageError(`--expect-visibility: ${parsed.problem}`)
+  return parsed.value
+}
+
+function runVerify(file: string, expectOrigin: string | null, attestation: VisibilityAttestation | null, io: CliIo): number {
   const dir = path.dirname(path.resolve(file))
   const verdict = verifyWooSnapshotBundle({
     snapshotBytes: readBytesOrNull(file),
@@ -202,6 +218,7 @@ function runVerify(file: string, expectOrigin: string | null, io: CliIo): number
     inspectionBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.variantParentsInspection)),
     requireInspection: true,
     expectedOrigin: expectOrigin,
+    visibilityChecked: attestation,
   })
   if (!verdict.ok) {
     io.stderr(`first-load-woo-snapshot: the snapshot ${file} and the files derived from it cannot be trusted:\n${verdict.problems.map((p) => `  - ${p}`).join('\n')}\n`)
@@ -228,7 +245,19 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
     io.stdout(usageText())
     return SNAPSHOT_EXIT_CODES.OK
   }
-  if (args.verify !== null) return runVerify(args.verify, args.expectOrigin, io)
+  if (args.verify !== null) {
+    let attestation: VisibilityAttestation | null
+    try {
+      attestation = readAttestation(args.expectVisibility)
+    } catch (error) {
+      if (error instanceof UsageError) {
+        io.stderr(`first-load-woo-snapshot: ${error.message}\n\n${usageText()}`)
+        return SNAPSHOT_EXIT_CODES.USAGE
+      }
+      throw error
+    }
+    return runVerify(args.verify, args.expectOrigin, attestation, io)
+  }
 
   // ---- preconditions: nothing has left the machine and nothing has been written ----
   let credentials: ReturnType<typeof readCredentials>

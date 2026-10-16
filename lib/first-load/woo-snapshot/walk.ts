@@ -14,7 +14,7 @@
  *   - a store that changes while it is being walked (its total moves between pages) is an error;
  *   - the walk is RESUMABLE: after every page the state is handed to `onProgress`, and a later run given that state continues after the last whole page.
  */
-import { SNAPSHOT_FORMAT_VERSION, payloadSha256, reduceParent, reduceVariation, snapshotProblems, normalizePayload, type SnapshotParent, type SnapshotPayload, type SnapshotVariation } from '../snapshot'
+import { SNAPSHOT_STATUSES, SNAPSHOT_FORMAT_VERSION, payloadSha256, reduceParent, reduceVariation, snapshotProblems, normalizePayload, type SnapshotParent, type SnapshotPayload, type SnapshotVariation } from '../snapshot'
 
 export const WALK_PAGE_SIZE = 100
 /** Attempts per request, including the first. */
@@ -34,7 +34,7 @@ export const WALK_MAX_ROUNDS = 3
  * catalogue whose totals all agree. WooCommerce refuses an explicit status the key may not read (HTTP 403), which is what makes this a proof: a status that
  * cannot be enumerated fails the walk, and the per-status counts must add up to the `any` total.
  */
-export const WALK_STATUSES = ['publish', 'draft', 'private', 'pending'] as const
+export const WALK_STATUSES = SNAPSHOT_STATUSES
 export type WalkStatus = (typeof WALK_STATUSES)[number]
 export type StatusTotals = Record<WalkStatus, number>
 const VARIATION_ORDER = { orderby: 'id', order: 'asc' }
@@ -68,6 +68,8 @@ export interface PageResult {
   data: unknown
   totalPages: number
   totalItems: number
+  /** True only when the store sent an X-WP-Total header; the connector reads an absent one as 0. */
+  totalItemsPresent?: boolean
   error?: string
 }
 
@@ -182,8 +184,8 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
         }
         throw error
       }
-      if (!Array.isArray(res.data) || !Number.isSafeInteger(res.totalItems) || res.totalItems < 0 || (res.totalItems === 0 && res.data.length > 0)) {
-        throw new SnapshotInconsistentError(`${what}: the count of "${status}" rows came without a readable X-WP-Total: completeness cannot be proved`)
+      if (!Array.isArray(res.data) || res.totalItemsPresent !== true || !Number.isSafeInteger(res.totalItems) || res.totalItems < 0 || (res.totalItems === 0 && res.data.length > 0)) {
+        throw new SnapshotInconsistentError(`${what}: the count of "${status}" rows came without a readable X-WP-Total (an empty list with no total is what a key sees for rows it may not read): completeness cannot be proved`)
       }
       totals[status] = res.totalItems
     }

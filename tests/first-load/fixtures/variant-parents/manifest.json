@@ -4,7 +4,11 @@
   "wooSnapshot": {
     "snapshot": "woo/woo-snapshot.json",
     "provenance": "woo/woo-snapshot.provenance.json",
-    "origin": "https://synthetic.invalid"
+    "origin": "https://synthetic.invalid",
+    "visibilityChecked": {
+      "products": { "publish": 4, "draft": 1, "private": 1, "pending": 0 },
+      "variations": { "publish": 8, "draft": 0, "private": 0, "pending": 0 }
+    }
   },
   "inputs": [
     {
