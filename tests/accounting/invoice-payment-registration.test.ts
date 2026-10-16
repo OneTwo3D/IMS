@@ -16,6 +16,7 @@ import {
   OPERATOR_RELEASE_SETTLEMENT_BASIS,
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import { NO_LIVE_RECEIPTS, liveReceiptsFrom } from '@/lib/domain/accounting/payment-identity'
 
 /**
  * o3d-lgo.15, decision recorded 2026-07-25: a manually-recorded sales receipt DOES register against the
@@ -91,6 +92,8 @@ const answered = (records: LedgerSettlementRecord[]): LedgerSettlementProbe =>
   ({ ok: true, records, provedComplete: true })
 
 const base = {
+  orderId: 'so-1',
+  liveReceipts: NO_LIVE_RECEIPTS,
   syncEnabled: true,
   accountingInvoiceId: 'INV-1',
   orderCurrency: 'GBP',
@@ -154,6 +157,7 @@ test('o3d-cjt8: a SECOND receipt that fits alongside the first IS registered', (
   // DOCUMENT; the index is now scoped that way, and what is left to check is arithmetic.
   const d = decideInvoicePaymentRegistration({
     ...base,
+    liveReceipts: liveReceiptsFrom([{ id: 'pay-old', orderId: 'so-1', refundId: null }, { id: 'pay-1', orderId: 'so-1', refundId: null }, { id: 'pay-2', orderId: 'so-1', refundId: null }]),
     paymentAmount: toDecimal(60),
     existing: [live({ status: 'SYNCED', amount: 40, paymentId: 'pay-old' })],
   })
@@ -420,6 +424,7 @@ test('[o3d-r948 r6] an ordinary first payment still posts — the removal withho
   // And with a settled sibling that leaves room: still no unresolved attempt, so still no probe.
   const alongside = decideInvoicePaymentRegistration({
     ...base,
+    liveReceipts: liveReceiptsFrom([{ id: 'pay-old', orderId: 'so-1', refundId: null }, { id: 'pay-1', orderId: 'so-1', refundId: null }, { id: 'pay-2', orderId: 'so-1', refundId: null }, { id: 'pay-other', orderId: 'so-1', refundId: null }]),
     paymentAmount: toDecimal(60),
     existing: [live({ status: 'SYNCED', amount: 40, paymentId: 'pay-other', accountingInvoiceId: 'INV-1', externalTransactionId: 'PAY-OTHER' })],
     ledgerSettlements: null,
@@ -687,6 +692,7 @@ test('[o3d-ekn8 r4] it is asked BEFORE the capacity arithmetic, which cannot see
 test('[o3d-ekn8 r4] a row on the CURRENT document is untouched by it — that is the capacity rule s business', () => {
   const d = decideInvoicePaymentRegistration({
     ...base,
+    liveReceipts: liveReceiptsFrom([{ id: 'pay-old', orderId: 'so-1', refundId: null }, { id: 'pay-1', orderId: 'so-1', refundId: null }, { id: 'pay-2', orderId: 'so-1', refundId: null }]),
     accountingInvoiceId: 'INV-2',
     paymentAmount: toDecimal(40),
     ledgerTotal: toDecimal(100),
@@ -1093,6 +1099,7 @@ test('[o3d-anu8] the identical row written back by the CONNECTOR still registers
   // refusing every ordinary deposit-plus-balance. Same numbers, settlementBasis NULL.
   const d = decideInvoicePaymentRegistration({
     ...base,
+    liveReceipts: liveReceiptsFrom([{ id: 'pay-old', orderId: 'so-1', refundId: null }, { id: 'pay-1', orderId: 'so-1', refundId: null }, { id: 'pay-2', orderId: 'so-1', refundId: null }]),
     paymentAmount: toDecimal(40),
     ledgerTotal: toDecimal(100),
     existing: [live({

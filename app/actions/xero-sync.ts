@@ -16,6 +16,7 @@ import {
 import type { LedgerSettlementProbe } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement, settlementProbeKey } from '@/lib/connectors/accounting-settlement-probe'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { NO_LIVE_RECEIPTS, loadLiveReceipts } from '@/lib/domain/accounting/payment-identity'
 import { getAuthorizationUrl, disconnect, isConnected, getGrantedScopes, missingScopes } from '@/lib/connectors/xero'
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
@@ -847,6 +848,11 @@ export async function retryFailedXeroSync(
           return planned
         })
         const siblingIds = siblingRows.map((row) => row.id)
+        // The receipts that still exist, read inside the scope lock: what tells a different payment's
+        // registration from a repeat of the candidate (payment-identity.ts).
+        const liveReceipts = scope.type === 'INVOICE_PAYMENT' && scope.referenceType === 'SalesOrder'
+          ? await loadLiveReceipts(tx, scope.referenceId)
+          : NO_LIVE_RECEIPTS
 
         // Planned PER CANDIDATE, against that candidate's own siblings. An earlier revision
         // planned once per SCOPE from an arbitrary rows[0] and then refused every sibling id: with
@@ -867,6 +873,7 @@ export async function retryFailedXeroSync(
               status: 'FAILED', // the candidate query selects only FAILED rows
             },
             siblings,
+            identity: { orderId: scope.referenceType === 'SalesOrder' ? scope.referenceId : null, liveReceipts },
             // Never an empty ledger by default. Unreachable today — the loop above probes for
             // exactly the types the guard reads a ledger for, both through isMoneyMovingSyncType
             // — so no mutation can make this branch fire, and it is deliberate defence rather

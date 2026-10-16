@@ -6,6 +6,12 @@ import {
 } from './followup-idempotency'
 import { couldBeTheSameDocument } from './money-post-document'
 import {
+  partitionByPaymentIdentity,
+  receiptIdOfPayload,
+  setAsideRecordsOfOtherPayments,
+  type LiveReceipts,
+} from './payment-identity'
+import {
   classifyLedgerSettlement,
   describeAttempt,
   settlementMarkerFor,
@@ -53,14 +59,15 @@ import {
  * `enqueueFollowUpSyncLog` revives a money-moving FAILED row under a pinned token, and now takes
  * the same evidence before it does.
  *
- * WHAT THIS STILL COSTS, stated because it is real. A part-payment history, and a payment
- * reversed in the ledger then legitimately re-posted, can both be refused — the first by a
- * settled sibling's token, the second by a settlement record that matches the amount and date of
- * the very payment being replaced. There is no per-row settlement action yet, so "resolve these
- * rows manually" means editing the ledger and leaving the row. That is the stranding direction:
- * an operator can act on a refusal they can read, and cannot act on a duplicate payment nobody
- * told them about.
- */
+ * WHAT THIS STILL COSTS, stated because it is real. A payment reversed in the ledger then legitimately
+ * re-posted can be refused by a settlement record that matches the amount and date of the very payment
+ * being replaced. There is no per-row settlement action yet, so "resolve these rows manually" means
+ * editing the ledger and leaving the row. That is the stranding direction: an operator can act on a
+ * refusal they can read, and cannot act on a duplicate payment nobody told them about.
+ *
+ * A PART-PAYMENT HISTORY IS NOT ONE OF THEM ANY MORE. Rows of a DIFFERENT payment (payment-identity.ts)
+ * are not contenders: a deposit that posted does not stop its balance being retried, and its ledger
+ * record is attributed to it by mark and set aside. */
 
 export type RetryCandidateRow = {
   id: string
@@ -249,13 +256,46 @@ export function planManualRetry(params: {
    * against them, not only the row being retried.
    */
   ledger: LedgerSettlementProbe
+  /**
+   * The order the target settles and the receipts of it that still exist. REQUIRED: this is what tells a
+   * different payment's registration from a repeat of the target (payment-identity.ts), and a caller that
+   * omitted it would silently keep today's refusal of every part payment — or, worse, be tempted to
+   * default it the other way. An empty map is valid and means every sibling is "possibly the same".
+   */
+  identity: { orderId: string | null; liveReceipts: LiveReceipts }
 }): ManualRetryPlan {
   const { type, reference, target, siblings, ledger } = params
   const moneyMoving = isMoneyMovingSyncType(type)
   // Each row is judged by ITS OWN mark: the token a row posted under is what it would have written
   // into the ledger, so a rival attempt is recognised by its own reference, not by this one's.
+  // WHO IS A DIFFERENT PAYMENT. Only INVOICE_PAYMENT rows carry a receipt identity; every other type
+  // reads null here and so keeps every sibling "possibly the same".
+  const identityOf = (row: RetryCandidateRow) => ({ ...row, paymentId: type === 'INVOICE_PAYMENT' ? receiptIdOfPayload(row.payload) : null })
+  const partition = partitionByPaymentIdentity(
+    { paymentId: type === 'INVOICE_PAYMENT' ? receiptIdOfPayload(target.payload) : null, orderId: params.identity.orderId },
+    siblings.filter((row) => row.id !== target.id).map(identityOf),
+    params.identity.liveReceipts,
+  )
+  const differentIds = new Set(partition.different.map((row) => row.id))
+  // The ledger as THIS payment sees it: other receipts' payments, found by their marks, set aside.
+  const attributed = setAsideRecordsOfOtherPayments(
+    ledger,
+    partition.different.map((row) => settlementMarkerFor(row.effectiveToken)),
+    settlementMarkerFor(target.effectiveToken),
+  )
+  if (attributed.ambiguous.length > 0) {
+    return {
+      action: 'refuse',
+      tokenCount: 1,
+      reason: `The accounting connector holds more than one payment carrying the reference of another receipt's payment `
+        + `against the document for ${reference}. IMS cannot tell which belongs to which receipt. Check the ledger and resolve the duplicate by hand.`,
+    }
+  }
+  const judgedLedger = attributed.probe
+  // Each row is judged by ITS OWN mark: the token a row posted under is what it would have written
+  // into the ledger, so a rival attempt is recognised by its own reference, not by this one's.
   const verdictFor = (row: RetryCandidateRow): SettlementVerdict =>
-    classifyLedgerSettlement(describeAttempt(type, row.payload, settlementMarkerFor(row.effectiveToken)), ledger)
+    classifyLedgerSettlement(describeAttempt(type, row.payload, settlementMarkerFor(row.effectiveToken)), judgedLedger)
 
   const contenders = siblings
     // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it
@@ -264,6 +304,9 @@ export function planManualRetry(params: {
     // available (Codex review).
     .filter((row) => couldHaveReachedTheLedger(type, row.payload))
     .filter((row) => couldBeTheSameDocument(type, row.payload, target.payload))
+    // A PROVEN-DIFFERENT payment is not a contender: whichever token it posted under, it did not post
+    // THIS payment.
+    .filter((row) => !differentIds.has(row.id))
   const tokens = new Set(contenders.map((row) => row.effectiveToken))
 
   if (moneyMoving && tokens.size > 1) {
@@ -298,6 +341,9 @@ export function planManualRetry(params: {
     const live = siblings.filter((row) =>
       row.id !== target.id
       && isLiveStatus(row.status)
+      // The live-unique index for an INVOICE_PAYMENT is per receipt, so a live row of a different
+      // payment does not occupy this one's slot.
+      && !differentIds.has(row.id)
       && (isLiveUniqueFollowUpType(type) || couldBeTheSameDocument(type, row.payload, target.payload)))
     if (live.length > 0) {
       return {

@@ -18,6 +18,7 @@
  * Network I/O (the probe) and database I/O are injected so the whole flow is testable without Xero.
  */
 
+import { NO_LIVE_RECEIPTS } from './payment-identity'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import type { SettlementProbeTarget } from '@/lib/connectors/accounting-settlement-probe'
@@ -187,8 +188,9 @@ async function assessAttempt(
   }
   // The registration decision would not grant a lift here anyway (see `postedRegistrationsOnDocument`):
   // a registration on this invoice has posted, and the post fence refuses a payment beside it. Asked of
-  // EVERY posted row (no receipt is chosen yet), which can only refuse more, never less.
-  const posted = postedRegistrationsOnDocument(rows, '', order.accountingInvoiceId)
+  // EVERY posted row (no receipt is chosen yet, so no row can be shown to be a different payment: an EMPTY
+  // receipt set), which can only refuse more, never less than the decision will.
+  const posted = postedRegistrationsOnDocument(rows, '', order.accountingInvoiceId, { orderId: order.id, liveReceipts: NO_LIVE_RECEIPTS })
   if (posted.length > 0) {
     return {
       ok: false,

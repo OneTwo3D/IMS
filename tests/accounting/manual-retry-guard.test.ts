@@ -13,6 +13,7 @@ import {
 } from '@/lib/domain/accounting/followup-retry-guard'
 import type { LedgerSettlementProbe } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import { NO_LIVE_RECEIPTS } from '@/lib/domain/accounting/payment-identity'
 
 /**
  * Most of this file is about the token/ambiguity rules, which are independent of the ledger, so
@@ -22,8 +23,8 @@ import { toDecimal } from '@/lib/domain/math/decimal'
  */
 const EMPTY_LEDGER: LedgerSettlementProbe = { ok: true, provedComplete: true, records: [] }
 const plan = (
-  args: Omit<Parameters<typeof planManualRetry>[0], 'ledger'> & { ledger?: LedgerSettlementProbe },
-) => planManualRetry({ ledger: EMPTY_LEDGER, ...args })
+  args: Omit<Parameters<typeof planManualRetry>[0], 'ledger' | 'identity'> & { ledger?: LedgerSettlementProbe; identity?: Parameters<typeof planManualRetry>[0]['identity'] },
+) => planManualRetry({ ledger: EMPTY_LEDGER, identity: { orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS }, ...args })
 
 /**
  * o3d-0m56: the manual retry must refuse what the automatic enqueue refuses.

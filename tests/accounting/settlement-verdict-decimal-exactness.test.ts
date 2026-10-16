@@ -15,6 +15,7 @@ import {
   statedAmountOnly,
 } from '@/lib/domain/accounting/registered-amount'
 import { ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
+import { NO_LIVE_RECEIPTS } from '@/lib/domain/accounting/payment-identity'
 
 /**
  * o3d-4ozd — THE SETTLEMENT VERDICT MEASURES MONEY, SO IT MEASURES IT EXACTLY.
@@ -451,7 +452,7 @@ test('[o3d-r948] an unresolved attempt with a refused figure is undescribable, n
     abandonedBeforeRemoteCall: null,
     settlementBasis: null,
   })
-  const decide = (exact: unknown) => decideInvoicePaymentRegistration({
+  const decide = (exact: unknown) => decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS,
     syncEnabled: true,
     accountingInvoiceId: 'INV-1',
     orderCurrency: 'GBP',

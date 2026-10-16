@@ -113,6 +113,7 @@ import {
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
+import { marksOfOtherPayments } from '@/lib/domain/accounting/payment-identity-marks'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -1407,6 +1408,13 @@ export async function enqueueFollowUpSyncLog(
     })
   }
 
+  // A DIFFERENT payment of this order (a deposit beside the balance being revived) is not this row's
+  // settlement: its ledger record is attributed to it by mark and set aside (payment-identity.ts).
+  const otherPaymentMarks = type === 'INVOICE_PAYMENT' && referenceType === 'SalesOrder' && plan.action === 'reuse'
+    ? await marksOfOtherPayments(db, {
+      connector: XERO_CONNECTOR, orderId: referenceId, target: { id: plan.syncLogId, payload: plan.payload },
+    })
+    : []
   const evidence = await ledgerClearsFollowUpRevival({
     connector: XERO_CONNECTOR,
     type,
@@ -1417,6 +1425,7 @@ export async function enqueueFollowUpSyncLog(
     loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {
       syncLogIds: [scope.attemptSyncLogId], paymentId: scope.paymentId, connector: scope.connector,
     }),
+    otherPaymentMarks,
   })
   if (!evidence.clear) {
     const message = `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: `

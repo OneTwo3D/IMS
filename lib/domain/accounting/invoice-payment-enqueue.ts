@@ -48,6 +48,7 @@ import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domai
 import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import { invoicePaymentReceiptId } from '@/lib/domain/accounting/operator-ledger-check'
+import { loadLiveReceipts } from '@/lib/domain/accounting/payment-identity'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
@@ -1561,6 +1562,10 @@ export async function registerInvoicePaymentWithLedger(params: {
       // go at all is done on the figure that cannot have moved.
       paymentAmount: params.amount,
       paymentId: params.paymentId,
+      // WHICH RECEIPTS STILL EXIST on this order, so a different live receipt's registration is not
+      // mistaken for a repeat of this one (payment-identity.ts). Re-read under the lock below.
+      orderId: params.orderId,
+      liveReceipts: await loadLiveReceipts(db, params.orderId),
       // o3d-j625 r3: resolved and CONFIRMED against the target connector's own chart above.
       bankAccountId: mappedBankAccountId,
       existing,
@@ -1726,6 +1731,7 @@ export async function registerInvoicePaymentWithLedger(params: {
       const underLock = decideInvoicePaymentRegistration({
         ...decisionInput,
         existing: await loadInvoicePaymentSyncRows(params.orderId, connectorId, so.currency, tx),
+        liveReceipts: await loadLiveReceipts(tx, params.orderId),
       })
       if (!underLock.register) return { refused: underLock } as const
       liftedByCheckIdsUnderLock = underLock.liftedByCheckIds ?? []

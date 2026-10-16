@@ -114,6 +114,7 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { loadLiveReceipts, partitionByPaymentIdentity, type LiveReceipts } from '@/lib/domain/accounting/payment-identity'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
@@ -240,6 +241,9 @@ export type InvoicePaymentPostVerdict =
 export function decideInvoicePaymentPost(input: {
   /** THIS entry's sync-log id. Its own row must never count against it. */
   entryId: string
+  /** The order, and the receipts of it that still exist: what tells a different payment from this one. */
+  orderId: string
+  liveReceipts: LiveReceipts
   accountingInvoiceId: string
   /** What this entry is about to send, EXACTLY (o3d-6abj). See `guardInvoicePaymentCapacity`. */
   amount: Decimal
@@ -337,11 +341,20 @@ export function decideInvoicePaymentPost(input: {
   // Everything undetermined still fails closed: `bodyCouldHavePosted` stays `true` for unknown and
   // compacted bodies, `provenNeverAttempted` stays `false` for a forfeited custody or an unselected
   // column, and a row that satisfies neither proof is still ambiguous.
-  const ambiguous = againstThisInvoice.filter(
+  // ONLY A FAILED ROW THAT MAY BE THIS PAYMENT makes the balance unknowable. A FAILED row of a DIFFERENT
+  // live receipt may or may not have posted, but whichever it did, its money is bounded by its own amount:
+  // it is COUNTED into what is already posted (below), which can only make this guard refuse earlier. This
+  // is the same partition the registration decision and the fence use.
+  const failedMayHavePosted = againstThisInvoice.filter(
     (row) =>
       (AMBIGUOUS_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
       && row.bodyCouldHavePosted
       && !row.provenNeverAttempted,
+  )
+  const { same: ambiguous, different: failedOfOtherReceipts } = partitionByPaymentIdentity(
+    { paymentId: entryPaymentId, orderId: input.orderId },
+    failedMayHavePosted,
+    input.liveReceipts,
   )
   if (ambiguous.length > 0) {
     return {
@@ -354,7 +367,8 @@ export function decideInvoicePaymentPost(input: {
   }
 
   const posted = againstThisInvoice.filter(
-    (row) => (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status),
+    (row) => (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
+      || failedOfOtherReceipts.includes(row),
   )
 
   // A SYNCED ROW AN OPERATOR ASSERTED IS NOT A POSTED AMOUNT (o3d-anu8). SYNCED is the one status
@@ -445,7 +459,7 @@ export type InvoicePaymentPostGuardResult =
   /** Could not be measured. Retryable, and NOT posted — fail closed. */
   | { post: false; kind: 'unmeasurable'; message: string }
 
-type CapacityClient = Pick<Prisma.TransactionClient, 'salesOrder' | 'accountingSyncLog'>
+type CapacityClient = Pick<Prisma.TransactionClient, 'salesOrder' | 'accountingSyncLog' | 'payment'>
 
 function payloadString(payload: unknown, field: string): string | null {
   const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
@@ -621,6 +635,8 @@ export async function guardInvoicePaymentCapacity(
 
   const verdict = decideInvoicePaymentPost({
     entryId: params.entryId,
+    orderId: params.referenceId,
+    liveReceipts: await loadLiveReceipts(client, params.referenceId),
     accountingInvoiceId: params.accountingInvoiceId,
     amount,
     ledgerTotal,
