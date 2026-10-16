@@ -2,6 +2,8 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { destinationAndOperationForSyncType } from '@/lib/domain/accounting/xero-producer-seam'
+import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
 
 const QUANTITY_EPSILON = 0.000001
 
@@ -174,7 +176,7 @@ export function assertAdjustmentEditFifoFeasible(
  * stock-level and FIFO machinery: the action calls this and refuses on `true`.
  */
 export async function adjustmentJournalMayHaveReachedLedger(
-  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | '$queryRaw'>,
   movementId: string,
 ): Promise<boolean> {
   const row = await tx.accountingSyncLog.findFirst({
@@ -186,5 +188,14 @@ export async function adjustmentJournalMayHaveReachedLedger(
     },
     select: { id: true },
   })
-  return row !== null
+  if (row !== null) return true
+  // A SHADOW instead of a posting (the producer-side hold) leaves a durable record that outlives the sync row: IMS did not send the
+  // journal, but the writer that owns it in this phase may have, so the edit is refused on the record alone.
+  const operation = destinationAndOperationForSyncType('INVENTORY_ADJUSTMENT')?.operation
+  const shadows = await findDurableShadowRecords(tx, 'xero', [{
+    subjectType: 'StockMovement',
+    exactIds: [movementId],
+    ...(operation ? { operations: [operation] } : {}),
+  }])
+  return shadows.length > 0
 }

@@ -187,6 +187,8 @@ export type Site = {
   kind: SiteKind
   /** How the primitive was named at the site when that is not the primitive's own name. */
   via?: string
+  /** Character offset of the site in its file; lets the seam checks ask what comes before and after it. */
+  pos?: number
 }
 
 const WRAP_KINDS = (n: ts.Node): ts.Node => {
@@ -288,7 +290,7 @@ export function scanSource(text: string, file: string): Site[] {
 
   const add = (node: ts.Node, primitive: string, kind: SiteKind, via?: string) => {
     const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf))
-    found.push({ file, line: line + 1, decl: topLevelDeclName(node, sf), primitive, kind, via })
+    found.push({ file, line: line + 1, decl: topLevelDeclName(node, sf), primitive, kind, via, pos: node.getStart(sf) })
   }
 
   /** Name of the thing a callee/expression denotes, when it is a plain or literal-keyed reference. */
@@ -386,25 +388,29 @@ function walk(dir: string, out: string[] = []): string[] {
   return out
 }
 
-export type TreeScan = { sites: Site[]; filesScanned: number }
+export type TreeScan = { sites: Site[]; filesScanned: number; /** Text of every file that holds a site, for the seam checks. */ sources: Map<string, string> }
 
 /** The scan of the whole tree: every .ts/.tsx under {@link SOURCE_ROOTS}. Never a diff, never a branch. */
 export function scanTree(root: string, roots: readonly string[] = SOURCE_ROOTS): TreeScan {
   const files = roots.flatMap((r) => walk(join(root, r)))
   const sites: Site[] = []
+  const sources = new Map<string, string>()
   for (const abs of files) {
     const rel = relative(root, abs).split('\\').join('/')
     const text = readFileSync(abs, 'utf8')
     // Cheap pre-filter: a file that never spells a primitive cannot hold a site.
     if (![...Object.keys(PRIMITIVES), ...Object.keys(RAW_QUEUE_TABLES)].some((n) => text.includes(n))) continue
-    sites.push(...scanSource(text, rel))
+    const found = scanSource(text, rel)
+    if (found.length > 0) sources.set(rel, text)
+    sites.push(...found)
   }
-  return { sites, filesScanned: files.length }
+  return { sites, filesScanned: files.length, sources }
 }
 
 // ───────────────────────── declarations and reconciliation ─────────────────────────
 
 export const MECHANISMS = [
+  'seam',             // a site that ASKS the producer-side hold before it produces (checked by seamFindings)
   'queue-seam',       // the one primitive that creates the queue row, or the entry point that reaches it
   'queue-producer',   // a business flow that asks for a queued write
   'drain',            // a processor/sweep that performs the write for work already queued
@@ -439,6 +445,8 @@ export type CensusInputs = {
   map?: readonly OwnershipRow[]
   filesScanned: number
   minSourceFiles?: number
+  /** Text of the files that hold sites; when given, the seam checks run over it. */
+  sources?: ReadonlyMap<string, string>
 }
 
 export type CensusReport = {
@@ -454,12 +462,162 @@ export type CensusReport = {
     mapOperations: number
     mapOperationsWithProducer: number
     mapOperationsNoProducer: number
+    seam: SeamCounts | null
   }
 }
 
 const MIN_REASON = 15
 const DECLARATIONS_FILE = 'scripts/producer-census-declarations.ts'
 const MAP_FILE = 'lib/security/writer-ownership-map.ts'
+
+
+// ───────────────────────── the seam checks ─────────────────────────
+
+/**
+ * THE PRODUCER SEAM, CHECKED. A declaration with mechanism 'seam' says "this function asks the producer-side hold before
+ * it produces"; this makes that checkable instead of a word:
+ *
+ *   SEAM-1  the top-level declaration holding a 'seam' site CALLS one of {@link SEAM_CONSULTATIONS} at a position BEFORE the site.
+ *   SEAM-2  every call of the sync-log row primitive outside its own file HANDLES THE SHADOW ANSWER: the same top-level
+ *           declaration reads `.shadowed` of the result after the call and before the next outbox schedule (or, with none,
+ *           anywhere after the call). A caller that queues an outbox job for a shadow is the defect this exists for.
+ *   SEAM-3  a destination-xero declaration with mechanism 'direct-write' is a finding: a direct Xero write is a seam or it is
+ *           declared as the transport behind one ('drain').
+ *
+ * Syntactic, like the rest of the census: it proves the consultation and the shadow read are THERE and ORDERED, not that
+ * they dominate every path. Its blind spots are the census's own (helpers, aliases through objects).
+ */
+export const SEAM_CONSULTATIONS = ['xeroProducerSeamVerdict', 'xeroTaxRateWriteShadow', 'producerSeamVerdict'] as const
+export const SYNC_ROW_PRIMITIVE = 'createAccountingSyncLogRow'
+export const SYNC_ROW_PRIMITIVE_FILE = 'lib/domain/accounting/sync-log-row.ts'
+export const SHADOW_RESULT_FIELD = 'shadowed'
+export const OUTBOX_SCHEDULE = 'scheduleXeroAccountingOutbox'
+
+export type SeamCounts = {
+  seamSites: number; seamSitesConsulting: number; rowSites: number; rowSitesHandlingShadow: number
+  /** SEAM-4: Xero transport call sites examined, and how many sit behind the claim boundary (or in a transport module / declared exception). */
+  egressSites: number; egressSitesBehindBoundary: number
+}
+
+/**
+ * SEAM-4, THE CLAIM BOUNDARY. Every call of a Xero transport primitive (xeroPost, xeroPut, xeroUploadAttachment,
+ * putXeroTaxRate) is in ONE of: a transport module (the functions the processor calls), app/actions/settings.ts (a declared
+ * seam, SEAM-1), the demo-provisioning script (declared exception), or sync-processor.ts::processClaimedEntry, which must call
+ * the producer decision BEFORE its first transport call and must hand a held row back as 'producer-held'. Any other file is a
+ * new egress that bypasses the boundary and is a finding.
+ */
+export const CLAIM_BOUNDARY_FILE = 'lib/connectors/xero/sync-processor.ts'
+export const CLAIM_BOUNDARY_DECL = 'processClaimedEntry'
+export const CLAIM_BOUNDARY_HANDBACK = 'producer-held'
+const TRANSPORT_MODULE_RE = /^lib\/connectors\/xero\/(bills|contacts|credit-notes|invoices|items|journals|tax-rates)\.ts$/
+const EGRESS_DECLARED_EXCEPTIONS = [/^scripts\/provision-xero-demo\.ts$/, /^app\/actions\/settings\.ts$/, /^lib\/connectors\/accounting-registry\.ts$/]
+
+function calleeName(call: ts.CallExpression): string | null {
+  const e = WRAP_KINDS(call.expression)
+  if (ts.isIdentifier(e)) return e.text
+  if (ts.isPropertyAccessExpression(e)) return e.name.text
+  return null
+}
+
+export function seamFindings(
+  sourceByFile: ReadonlyMap<string, string>,
+  sites: readonly Site[],
+  declarations: readonly Declaration[],
+): { failures: string[]; counts: SeamCounts } {
+  const failures: string[] = []
+  const counts: SeamCounts = { seamSites: 0, seamSitesConsulting: 0, rowSites: 0, rowSitesHandlingShadow: 0, egressSites: 0, egressSitesBehindBoundary: 0 }
+  const declByKey = new Map(declarations.map((d) => [d.key, d]))
+  const parsed = new Map<string, ts.SourceFile>()
+  const parse = (file: string): ts.SourceFile | null => {
+    const cached = parsed.get(file)
+    if (cached) return cached
+    const text = sourceByFile.get(file)
+    if (text === undefined) return null
+    const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
+    parsed.set(file, sf)
+    return sf
+  }
+  const topLevelContaining = (sf: ts.SourceFile, pos: number): ts.Node | null =>
+    sf.statements.find((statement) => statement.getStart(sf) <= pos && pos < statement.getEnd()) ?? null
+
+  for (const site of sites) {
+    if (site.pos === undefined) continue
+    const declared = declByKey.get(site.key)
+    const isSeam = declared?.mechanism === 'seam'
+    const isRowSite = site.primitive === SYNC_ROW_PRIMITIVE && site.kind === 'call' && site.file !== SYNC_ROW_PRIMITIVE_FILE
+    const isEgress = PRIMITIVES[site.primitive]?.family === 'xero-transport' && site.kind === 'call'
+    if (isEgress) {
+      counts.egressSites++
+      if (TRANSPORT_MODULE_RE.test(site.file) || EGRESS_DECLARED_EXCEPTIONS.some((re) => re.test(site.file))) counts.egressSitesBehindBoundary++
+      else if (site.file !== CLAIM_BOUNDARY_FILE || site.decl !== CLAIM_BOUNDARY_DECL) {
+        failures.push(`SEAM-4 ${site.key} (${site.file}:${site.line}) is a Xero egress outside the claim boundary. Xero transport is called only from the transport modules and ${CLAIM_BOUNDARY_FILE}::${CLAIM_BOUNDARY_DECL}, which asks the producer decision first.`)
+      } else {
+        const bsf = parse(site.file)
+        const container = bsf && site.pos !== undefined ? topLevelContaining(bsf, site.pos) : null
+        let consultedAt = Number.POSITIVE_INFINITY
+        let handsBack = false
+        const walk = (node: ts.Node) => {
+          if (bsf && ts.isCallExpression(node)) {
+            const name = calleeName(node)
+            if (name && (SEAM_CONSULTATIONS as readonly string[]).includes(name)) consultedAt = Math.min(consultedAt, node.getStart(bsf))
+          }
+          if (ts.isStringLiteral(node) && node.text === CLAIM_BOUNDARY_HANDBACK) handsBack = true
+          ts.forEachChild(node, walk)
+        }
+        if (container) walk(container)
+        // The FIRST transport site of the function, not just this one: the check is that nothing precedes the gate.
+        const first = sites.filter((other) => other.file === site.file && other.decl === site.decl && PRIMITIVES[other.primitive]?.family === 'xero-transport' && other.pos !== undefined).reduce((min, other) => Math.min(min, other.pos!), Number.POSITIVE_INFINITY)
+        if (consultedAt < first && handsBack) counts.egressSitesBehindBoundary++
+        else failures.push(`SEAM-4 ${site.key}: ${CLAIM_BOUNDARY_DECL} must call the producer decision before its first Xero transport call and hand a held row back as '${CLAIM_BOUNDARY_HANDBACK}' (consulted at ${consultedAt === Number.POSITIVE_INFINITY ? 'never' : consultedAt}, first transport at ${first}, hands back: ${handsBack}).`)
+      }
+    }
+    if (!isSeam && !isRowSite) continue
+    const sf = parse(site.file)
+    const container = sf ? topLevelContaining(sf, site.pos) : null
+    if (!sf || !container) {
+      failures.push(`SEAM ${site.key}: the source of ${site.file} could not be read back, so the seam check cannot run. Fix the census input.`)
+      continue
+    }
+    const calls: Array<{ name: string; pos: number }> = []
+    const shadowReads: number[] = []
+    const visit = (node: ts.Node) => {
+      if (ts.isCallExpression(node)) {
+        const name = calleeName(node)
+        if (name) calls.push({ name, pos: node.getStart(sf) })
+      }
+      if (ts.isPropertyAccessExpression(node) && node.name.text === SHADOW_RESULT_FIELD) shadowReads.push(node.name.getStart(sf))
+      ts.forEachChild(node, visit)
+    }
+    visit(container)
+
+    if (isSeam) {
+      counts.seamSites++
+      const consulted = calls.some((call) => (SEAM_CONSULTATIONS as readonly string[]).includes(call.name) && call.pos < site.pos!)
+      if (consulted) counts.seamSitesConsulting++
+      else {
+        failures.push(
+          `SEAM-1 ${site.key} (${site.file}:${site.line}) is declared a seam but ${site.decl} calls none of ${SEAM_CONSULTATIONS.join(', ')} before it. `
+          + 'Ask the producer-side hold before producing, or change the declaration to the mechanism it really is.',
+        )
+      }
+    }
+    if (isRowSite) {
+      counts.rowSites++
+      const nextSchedule = calls
+        .filter((call) => call.name === OUTBOX_SCHEDULE && call.pos > site.pos!)
+        .reduce((min, call) => Math.min(min, call.pos), Number.POSITIVE_INFINITY)
+      const handled = shadowReads.some((read) => read > site.pos! && read < nextSchedule)
+      if (handled) counts.rowSitesHandlingShadow++
+      else {
+        failures.push(
+          `SEAM-2 ${site.key} (${site.file}:${site.line}) creates a sync-log row but ${site.decl} never reads \`.${SHADOW_RESULT_FIELD}\` of the result `
+          + `between the call and the next ${OUTBOX_SCHEDULE}. A shadow must not be given an outbox job: handle the shadow answer before scheduling.`,
+        )
+      }
+    }
+  }
+  return { failures, counts }
+}
 
 export function reconcile(input: CensusInputs): CensusReport {
   const failures: string[] = []
@@ -569,6 +727,23 @@ export function reconcile(input: CensusInputs): CensusReport {
     }
   }
 
+  // ---- the seam checks (SEAM-1, SEAM-2 over the source text; SEAM-3 over the declarations) ----------------
+  for (const d of input.declarations) {
+    if (d.destination === 'xero' && d.mechanism === 'direct-write') {
+      failures.push(`SEAM-3 ${d.key} is a direct Xero write declared 'direct-write'. A direct write to Xero asks the producer-side hold ('seam'), or is the transport behind one ('drain').`)
+    }
+  }
+  let seamCounts: SeamCounts | null = null
+  if (input.sources) {
+    const seam = seamFindings(input.sources, input.sites, input.declarations)
+    failures.push(...seam.failures)
+    seamCounts = seam.counts
+    // A seam check that examined nothing proves nothing: with the tree reached, there must be seam sites and row sites.
+    if (input.filesScanned >= floor && (seam.counts.seamSites === 0 || seam.counts.rowSites === 0 || seam.counts.egressSites === 0)) {
+      failures.push(`SUBJECT NOT REACHED: the seam checks saw ${seam.counts.seamSites} seam site(s) and ${seam.counts.rowSites} sync-log create site(s); both must be above zero on this tree.`)
+    }
+  }
+
   // ---- precondition: every family this tree is known to contain was reached ----------------------------
   const byFamily: Record<string, number> = {}
   const byPrimitive: Record<string, number> = {}
@@ -612,6 +787,7 @@ export function reconcile(input: CensusInputs): CensusReport {
       mapOperations: mapByKey.size,
       mapOperationsWithProducer: withProducer,
       mapOperationsNoProducer: withNote,
+      seam: seamCounts,
     },
   }
 }
@@ -625,6 +801,7 @@ export function formatCounts(report: CensusReport): string {
     `producer census: sites by family ${JSON.stringify(c.byFamily)}`,
     `producer census: sites by destination ${JSON.stringify(c.byDestination)}`,
     `producer census: sites by primitive ${JSON.stringify(c.byPrimitive)}`,
+    `producer census: seam checks ${c.seam ? `${c.seam.seamSitesConsulting}/${c.seam.seamSites} seam sites consult the hold before producing; ${c.seam.rowSitesHandlingShadow}/${c.seam.rowSites} sync-log create sites handle the shadow answer; ${c.seam.egressSitesBehindBoundary}/${c.seam.egressSites} Xero transport calls are behind the claim boundary` : '(not run: no sources given)'}`,
     `producer census: primitives named but absent on this trunk (expected to find nothing): ${
       Object.entries(PRIMITIVES).filter(([, p]) => p.absentOnTrunk).map(([n]) => n).join(', ') || '(none)'}`,
   ]
