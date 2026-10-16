@@ -11,6 +11,7 @@ import {
 } from '@/lib/domain/accounting/invoice-payment-capacity'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { NO_LIVE_RECEIPTS } from '@/lib/domain/accounting/payment-identity'
 
 /**
  * o3d-cjt8, round 2 #2. Rescoping accounting_sync_logs_followup_live_unique to
@@ -77,7 +78,7 @@ type DecideOverrides =
 
 function decide(overrides: DecideOverrides = {}) {
   const { amount, ledgerTotal, ...rest } = overrides
-  return decideInvoicePaymentPost({
+  return decideInvoicePaymentPost({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS,
     entryId: ENTRY,
     accountingInvoiceId: 'INV-1',
     // o3d-6yho: the band is derived from THIS currency, so every fixture has to name one. GBP keeps

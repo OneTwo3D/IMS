@@ -19,6 +19,7 @@ import {
   toDecimal,
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
+import { NO_LIVE_RECEIPTS, liveReceiptsFrom } from '@/lib/domain/accounting/payment-identity'
 
 /**
  * o3d-6abj — THE CAPACITY GUARDS MEASURE MONEY, SO THEY MEASURE IT EXACTLY.
@@ -128,7 +129,7 @@ test('[o3d-6abj] the post-site decision REFUSES Codex s reproduction', () => {
   // ROUTE: decideInvoicePaymentPost's WOULD_OVERPAY test.
   // MUTATION: `compareDecimal(input.amount, ...)` -> the old `Number(...) > Number(...) + 0.005`,
   // or `ledgerTotal: toDecimal(Number(order.totalForeign))` at the guard — either returns post:true.
-  const verdict = decideInvoicePaymentPost({
+  const verdict = decideInvoicePaymentPost({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS,
     entryId: ENTRY,
     accountingInvoiceId: 'INV-1',
     currency: 'GBP',
@@ -190,7 +191,7 @@ test('[o3d-6abj] the ENQUEUE guard refuses the same pair, so the two guards stil
   // ROUTE: decideInvoicePaymentRegistration's WOULD_OVERPAY test.
   // MUTATION: `paymentAmount: amountNumber` / `ledgerTotal: Number(so.totalForeign)` at the caller,
   // or the Decimal comparison here -> register:true.
-  const decision = decideInvoicePaymentRegistration({
+  const decision = decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS, cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
     ...registrationBase,
     paymentAmount: toDecimal(REPRO_PAYMENT),
     ledgerTotal: toDecimal(REPRO_TOTAL),
@@ -200,7 +201,7 @@ test('[o3d-6abj] the ENQUEUE guard refuses the same pair, so the two guards stil
 })
 
 test('[o3d-6abj] the enqueue guard still registers an ordinary second receipt that fits', () => {
-  const decision = decideInvoicePaymentRegistration({
+  const decision = decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: liveReceiptsFrom([{ id: 'pay-old', orderId: 'so-1', refundId: null }]), cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
     ...registrationBase,
     paymentAmount: toDecimal('60.00'),
     ledgerTotal: toDecimal('100.00'),
@@ -230,7 +231,7 @@ test('[o3d-6abj] prior registrations are summed from the EXACT string, not the J
   //
   // ROUTE: decideInvoicePaymentPost's `alreadyPosted` reduce, via payloadRegisteredAmount.
   // MUTATION: read `payloadNumber(row.payload, 'amount')` again -> the sum becomes 1 and it posts.
-  const verdict = decideInvoicePaymentPost({
+  const verdict = decideInvoicePaymentPost({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS,
     entryId: ENTRY,
     accountingInvoiceId: 'INV-1',
     currency: 'GBP',
@@ -264,7 +265,7 @@ test('[o3d-6abj] the ENQUEUE sum reads the exact string too, not the number besi
   // The forms are made to disagree on purpose; production cannot produce such a row.
   // ROUTE: decideInvoicePaymentRegistration's `alreadyRegistered` reduce.
   // MUTATION: sum `r.amount` again -> the sum becomes 1 and a 50 registers against a full invoice.
-  const decision = decideInvoicePaymentRegistration({
+  const decision = decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: liveReceiptsFrom([{ id: 'pay-old', orderId: 'so-1', refundId: null }]), cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
     ...registrationBase,
     paymentAmount: toDecimal('50.00'),
     ledgerTotal: toDecimal('100.00'),
@@ -382,7 +383,7 @@ test('[o3d-6yho] the over-payment band is half one minor unit of the ORDER s cur
   assert.equal(gbp.post, true)
 
   // And the enqueue guard derives the same band from the same function.
-  const enqueueKwd = decideInvoicePaymentRegistration({
+  const enqueueKwd = decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS, cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
     ...registrationBase,
     orderCurrency: 'KWD',
     paymentCurrency: 'KWD',
@@ -391,7 +392,7 @@ test('[o3d-6yho] the over-payment band is half one minor unit of the ORDER s cur
   })
   assert.equal(enqueueKwd.register, false)
   assert.equal(enqueueKwd.register === false && enqueueKwd.refusal, 'WOULD_OVERPAY')
-  const enqueueGbp = decideInvoicePaymentRegistration({
+  const enqueueGbp = decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS, cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
     ...registrationBase,
     paymentAmount: toDecimal('100.002'),
     ledgerTotal: toDecimal('100.00'),

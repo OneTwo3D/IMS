@@ -114,6 +114,8 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { loadLiveReceipts, partitionByPaymentIdentity, type LiveReceipts } from '@/lib/domain/accounting/payment-identity'
+import { paymentTimingAgainstCancellation } from '@/lib/domain/accounting/payment-cancellation-timing'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
@@ -197,6 +199,12 @@ export type PostedInvoicePaymentRegistration = {
    * selected — and the caller must treat both as possibly-posted. Only `true` is a proof.
    */
   provenNeverAttempted: boolean
+  /**
+   * PROCESSING with a recorded `remoteAttemptedAt`: the row has passed the money-post fence and its remote
+   * call is in flight or has just returned and not yet been written back. Only read when the caller asks
+   * for in-flight rows to be counted (the recheck made UNDER the money-post lock).
+   */
+  inFlightAuthorised?: boolean
 }
 
 export type InvoicePaymentPostRefusal =
@@ -221,6 +229,13 @@ export type InvoicePaymentPostRefusal =
   | 'SETTLED_ON_RETIRED_DOCUMENT'
   /** This payment does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
+  /**
+   * The receipt behind this entry is dated AFTER its order was cancelled (payment-cancellation-timing.ts).
+   * The registration decision already refuses to queue it; this is the same rule at the one gate no enqueue
+   * path can skip, for rows queued some other way (an import, a row queued before the cancellation instant
+   * existed). Xero refuses a payment on a void invoice, and the overpayment path is not built.
+   */
+  | 'PAID_AFTER_CANCELLATION'
 
 export type InvoicePaymentPostVerdict =
   | { post: true; alreadyPosted: Decimal; ledgerTotal: Decimal }
@@ -240,6 +255,9 @@ export type InvoicePaymentPostVerdict =
 export function decideInvoicePaymentPost(input: {
   /** THIS entry's sync-log id. Its own row must never count against it. */
   entryId: string
+  /** The order, and the receipts of it that still exist: what tells a different payment from this one. */
+  orderId: string
+  liveReceipts: LiveReceipts
   accountingInvoiceId: string
   /** What this entry is about to send, EXACTLY (o3d-6abj). See `guardInvoicePaymentCapacity`. */
   amount: Decimal
@@ -255,6 +273,13 @@ export function decideInvoicePaymentPost(input: {
   currency: string
   /** Every INVOICE_PAYMENT sync row for this order on this connector, including this entry's own. */
   registrations: PostedInvoicePaymentRegistration[]
+  /**
+   * COUNT AUTHORISED IN-FLIGHT ROWS AS POSTED. Off for the first, unlocked look (a queued sibling must not
+   * refuse the first of a deposit and balance pair). ON for the recheck made under the per-document money-post
+   * lock: by then another receipt's payment may have passed the fence and be on the wire or just returned, not
+   * yet SYNCED, and the fence deliberately does not count capacity (it sets a different receipt's payment aside).
+   */
+  countInFlight?: boolean
 }): InvoicePaymentPostVerdict {
   // A PAYMENT ALREADY SENT FOR THIS RECEIPT, AGAINST A DOCUMENT THIS ORDER NO LONGER HAS
   // (o3d-ekn8 r4, Codex HIGH). Asked FIRST, and asked here rather than only at the enqueue, because
@@ -337,11 +362,20 @@ export function decideInvoicePaymentPost(input: {
   // Everything undetermined still fails closed: `bodyCouldHavePosted` stays `true` for unknown and
   // compacted bodies, `provenNeverAttempted` stays `false` for a forfeited custody or an unselected
   // column, and a row that satisfies neither proof is still ambiguous.
-  const ambiguous = againstThisInvoice.filter(
+  // ONLY A FAILED ROW THAT MAY BE THIS PAYMENT makes the balance unknowable. A FAILED row of a DIFFERENT
+  // live receipt may or may not have posted, but whichever it did, its money is bounded by its own amount:
+  // it is COUNTED into what is already posted (below), which can only make this guard refuse earlier. This
+  // is the same partition the registration decision and the fence use.
+  const failedMayHavePosted = againstThisInvoice.filter(
     (row) =>
       (AMBIGUOUS_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
       && row.bodyCouldHavePosted
       && !row.provenNeverAttempted,
+  )
+  const { same: ambiguous, different: failedOfOtherReceipts } = partitionByPaymentIdentity(
+    { paymentId: entryPaymentId, orderId: input.orderId },
+    failedMayHavePosted,
+    input.liveReceipts,
   )
   if (ambiguous.length > 0) {
     return {
@@ -354,7 +388,9 @@ export function decideInvoicePaymentPost(input: {
   }
 
   const posted = againstThisInvoice.filter(
-    (row) => (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status),
+    (row) => (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
+      || failedOfOtherReceipts.includes(row)
+      || (input.countInFlight === true && row.inFlightAuthorised === true),
   )
 
   // A SYNCED ROW AN OPERATOR ASSERTED IS NOT A POSTED AMOUNT (o3d-anu8). SYNCED is the one status
@@ -445,7 +481,7 @@ export type InvoicePaymentPostGuardResult =
   /** Could not be measured. Retryable, and NOT posted — fail closed. */
   | { post: false; kind: 'unmeasurable'; message: string }
 
-type CapacityClient = Pick<Prisma.TransactionClient, 'salesOrder' | 'accountingSyncLog'>
+type CapacityClient = Pick<Prisma.TransactionClient, 'salesOrder' | 'accountingSyncLog' | 'payment'>
 
 function payloadString(payload: unknown, field: string): string | null {
   const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
@@ -478,6 +514,8 @@ export async function guardInvoicePaymentCapacity(
      * authorises.
      */
     payload: unknown
+    /** Count authorised in-flight rows as posted: the recheck under the money-post lock (see decideInvoicePaymentPost). */
+    countInFlight?: boolean
   },
 ): Promise<InvoicePaymentPostGuardResult> {
   // An INVOICE_PAYMENT is always order-scoped today. If one ever is not, its capacity cannot be
@@ -499,6 +537,8 @@ export async function guardInvoicePaymentCapacity(
     taxForeign: Prisma.Decimal
     pricesIncludeVat: boolean
     shoppingLinks: { connector: string }[]
+    status: string
+    cancelledAt: Date | null
   } | null
   let registrations: {
     id: string
@@ -524,6 +564,8 @@ export async function guardInvoicePaymentCapacity(
           taxForeign: true,
           pricesIncludeVat: true,
           shoppingLinks: { select: { connector: true }, take: 1 },
+          status: true,
+          cancelledAt: true,
         },
       }),
       client.accountingSyncLog.findMany({
@@ -590,6 +632,39 @@ export async function guardInvoicePaymentCapacity(
     }
   }
 
+  // PAID AFTER THE ORDER WAS CANCELLED (payment-cancellation-timing.ts). Only a CANCELLED order can answer
+  // otherwise, so an active order pays nothing for this read. The receipt's time is read from the Payment row
+  // the payload names; an entry that names none, or whose receipt is gone, has no payment time and takes the
+  // ordinary path (unknown reads as "not provably after").
+  if (order.status === 'CANCELLED') {
+    const receiptId = payloadString(params.payload, 'paymentId')
+    let paidAt: Date | null = null
+    if (receiptId) {
+      try {
+        paidAt = (await client.payment.findUnique({ where: { id: receiptId }, select: { paidAt: true } }))?.paidAt ?? null
+      } catch (error) {
+        return {
+          post: false,
+          kind: 'unmeasurable',
+          message: `Could not read the receipt behind sync entry ${params.entryId} to tell whether it was paid after the order was cancelled: ${String(error)}`,
+        }
+      }
+    }
+    if (paymentTimingAgainstCancellation({ orderStatus: order.status, cancelledAt: order.cancelledAt, paidAt }) === 'AFTER_CANCELLATION') {
+      return {
+        post: false,
+        kind: 'refused',
+        refusal: 'PAID_AFTER_CANCELLATION',
+        message: `Refused to register a payment against invoice ${params.accountingInvoiceId}: the receipt is dated after the order `
+          + 'was cancelled, so the invoice is void or credited and the accounting connector would refuse a payment against it. '
+          + 'Money received for a cancelled order is booked there as an overpayment, which IMS does not create yet. Nothing was sent.',
+        alreadyPosted: null,
+        ledgerTotal,
+        ambiguousIds: [],
+      }
+    }
+  }
+
   // WHAT THIS ENTRY IS ABOUT TO SEND, EXACTLY — AND A PROOF THAT IT IS WHAT WILL GO ON THE WIRE
   // (o3d-6abj).
   //
@@ -621,6 +696,9 @@ export async function guardInvoicePaymentCapacity(
 
   const verdict = decideInvoicePaymentPost({
     entryId: params.entryId,
+    orderId: params.referenceId,
+    liveReceipts: await loadLiveReceipts(client, params.referenceId),
+    countInFlight: params.countInFlight === true,
     accountingInvoiceId: params.accountingInvoiceId,
     amount,
     ledgerTotal,
@@ -638,6 +716,7 @@ export async function guardInvoicePaymentCapacity(
       paymentId: payloadString(row.payload, 'paymentId'),
       bodyCouldHavePosted: storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', row.payload),
       provenNeverAttempted: attemptProvenNeverMade(row),
+      inFlightAuthorised: row.status === 'PROCESSING' && row.remoteAttemptedAt !== null,
     })),
   })
   if (verdict.post) return { post: true }
@@ -684,6 +763,9 @@ export async function guardInvoicePaymentCapacity(
           + `money. Nothing was sent. Open this invoice in the ledger: if the failed payment is not `
           + `there, resolve that sync entry and record the receipt again; if it IS there, the invoice `
           + `is already settled by it and no further payment should be registered.`)
+      case 'PAID_AFTER_CANCELLATION':
+        // Raised above, before the verdict; listed so this switch stays exhaustive over the refusal union.
+        return withLedgerCheck(head + 'the receipt is dated after the order was cancelled. Nothing was sent.')
       case 'WOULD_OVERPAY':
         return withLedgerCheck(head
           + `the ledger's copy of this invoice is for ${verdict.ledgerTotal.toFixed()} with `

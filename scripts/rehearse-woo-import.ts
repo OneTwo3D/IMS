@@ -600,6 +600,9 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
             stockSyncJobs: await one('select count(*)::int as n from stock_sync_jobs'),
             integrationOutbox: await one('select count(*)::int as n from integration_outbox'),
             emailOutbox: await one('select count(*)::int as n from email_outbox'),
+            paidOrders: await one('select count(*)::int as n from sales_orders where "paidAt" is not null'),
+            receiptsCreated: await one('select count(*)::int as n from payments where "refundId" is null'),
+            paidOrdersWithoutReceipt: await one('select count(*)::int as n from sales_orders o where o."paidAt" is not null and not exists (select 1 from payments p where p."orderId" = o.id and p."refundId" is null)'),
           }
         })
         fetchedFirstPass = fake!.requests.filter((r) => r.path.endsWith('/orders')).reduce((sum, r) => sum + (r.returned ?? 0), 0)

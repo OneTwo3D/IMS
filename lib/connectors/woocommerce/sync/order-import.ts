@@ -2302,6 +2302,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     })
     const wcDefaultWarehouseId = wcWarehouses[0]?.id ?? null
 
+    // Does this payload carry a receipt? Paid per WooCommerce, with a positive total the gateway charged.
+    const importedReceipt = Boolean(wcOrder.date_paid_gmt) && toDecimal(totalForeign).gt(0)
+    // A ref cell, not a bare `let`: the write happens inside the transaction callback and control-flow
+    // analysis would narrow a `let` to `null` at the read site below.
+    const importedReceiptRef = { id: null as string | null }
+
     // Create the sales order
     let so
     try {
@@ -2384,6 +2390,29 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           lines: { create: lineData },
         },
         })
+
+        // THE RECEIPT, as a local Payment row (the owner's ruling: an imported paid order has one, like any
+        // other paid order). Written in the SAME transaction as the order so there is no instant at which
+        // IMS holds the order as paid with no receipt to be read, and so the ledger registration has an
+        // IDENTITY (`Payment.id`, carried to the INVOICE_PAYMENT as `paymentId`) - which is what lets a
+        // deposit and a balance be told apart from a repeat of one payment (payment-identity.ts). Only when
+        // WooCommerce says the order is paid AND states a positive total; the amount is the order's own
+        // stored total, so the receipt covers the order exactly as the gateway reported it.
+        if (importedReceipt) {
+          const receipt = await tx.payment.create({
+            data: {
+              orderId: created.id,
+              amount: totalForeign,
+              currency,
+              method: wcOrder.payment_method_title || wcOrder.payment_method || null,
+              reference: wcOrder.transaction_id || null,
+              notes: 'Imported from WooCommerce (paid when the order was imported)',
+              paidAt: new Date(wcOrder.date_paid_gmt as string),
+            },
+            select: { id: true },
+          })
+          importedReceiptRef.id = receipt.id
+        }
 
         // o3d-z82a: the marker is written in the SAME transaction as the order, so it cannot be
         // lost. It carries the CREATION status as durable provenance — the retry path used to
@@ -2667,6 +2696,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // `wcOrder.total` either: no payment is registered for it (the invoice is refused anyway; see
           // lib/domain/accounting/store-credit-invoice-refusal.ts).
           _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit,
+          // The local receipt this payment is (see the Payment row written with the order). Present only
+          // where there is one; the poster carries it onto the INVOICE_PAYMENT as its identity.
+          ...(importedReceiptRef.id ? { _paymentId: importedReceiptRef.id } : {}),
           _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: documentTotalsToTheOrder && !hasStoreCredit }),
           // o3d-cyn r3: the stamp that stops this document at the poster. Present ONLY when the
           // document will not total to the order — an ordinary order's payload is byte-for-byte what

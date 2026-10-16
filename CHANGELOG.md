@@ -8,6 +8,13 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Payments: several payments on one invoice, told apart by the receipt
+
+- **Fixed: a balance recorded after a deposit that had already posted is no longer refused.** The last check before a payment is sent judged every payment already sent against the invoice, so a posted deposit blocked its own balance (and a failed one blocked the next receipt). IMS now identifies a payment by the receipt (payment row) it was recorded for. A *different* live receipt never blocks, a *repeat of the same receipt* is always refused, and a registration that cannot be shown to belong to a different receipt (imported before this change, or whose receipt was deleted) still blocks. One rule is shared by the registration decision, the final check, the over-settlement guard and the manual retry, so they cannot disagree. A deposit's payment in Xero is recognised by the reference IMS wrote on it, never by amount and date.
+- **Changed: a paid WooCommerce order is imported with a payment row**, and the payment registered in Xero carries that receipt's identity. A hand-recorded receipt on the same order therefore registers normally.
+- **New: `sales_orders.cancelled_at`** is stamped by the database when an order becomes cancelled. Receipts can now be recorded on a cancelled order; one dated after the cancellation is held (nothing sent, a warning says so) because Xero books that money as an overpayment, which IMS does not create yet. Paid before or at the cancellation, or with no known cancellation time, registers as before.
+- **Unchanged on purpose:** a payment above what is outstanding is still refused (Xero refuses it too), so no excess is ever posted as a payment.
+
 ### Mintsoft: the despatch poll is scheduled, and a bundle create is not repeated after an uncertain send
 
 - **The `mintsoft-dispatch-sync` job is now a registered scheduled job (every 15 minutes, on by default).** The installation guide always listed it as automatic, but nothing scheduled it, so a despatch in Mintsoft did not progress the IMS shipment unless someone added a crontab line by hand. **Upgrade step: open Settings > System > Scheduler and use Save & Apply once** so the new job reaches an existing crontab. The poll only reads from Mintsoft, does nothing while the Mintsoft plugin is off, and **never logs in**: a username/password login replaces the tenant API key for every integration that shares it, so with a fixed API key the poll runs, and in username/password mode it runs on the stored key and skips with a reason once that has expired. Use a fixed API key for an unattended poll. The read-sync liveness check now names the job and reports the poll as off when the job is switched off.

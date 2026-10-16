@@ -116,6 +116,7 @@ import {
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
+import { marksOfOtherPayments } from '@/lib/domain/accounting/payment-identity-marks'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -1410,6 +1411,13 @@ export async function enqueueFollowUpSyncLog(
     })
   }
 
+  // A DIFFERENT payment of this order (a deposit beside the balance being revived) is not this row's
+  // settlement: its ledger record is attributed to it by mark and set aside (payment-identity.ts).
+  const otherPaymentMarks = type === 'INVOICE_PAYMENT' && referenceType === 'SalesOrder' && plan.action === 'reuse'
+    ? await marksOfOtherPayments(db, {
+      connector: XERO_CONNECTOR, orderId: referenceId, target: { id: plan.syncLogId, payload: plan.payload },
+    })
+    : []
   const evidence = await ledgerClearsFollowUpRevival({
     connector: XERO_CONNECTOR,
     type,
@@ -1420,6 +1428,7 @@ export async function enqueueFollowUpSyncLog(
     loadOperatorLedgerChecks: (scope) => loadOperatorLedgerChecks(db, {
       syncLogIds: [scope.attemptSyncLogId], paymentId: scope.paymentId, connector: scope.connector,
     }),
+    otherPaymentMarks,
   })
   if (!evidence.clear) {
     const message = `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: `
@@ -6188,6 +6197,16 @@ export async function processClaimedEntry(
         // the fence must authorise against the very day the call below creates, and a second
         // wall-clock read here is a second day whenever the two straddle a UTC midnight.
         postingDate: paymentDate,
+        // CAPACITY AGAIN, UNDER THE PER-DOCUMENT LOCK. The guard above ran before the lock, so two receipts for
+        // different payments can both pass it; the fence then sets the first one's payment aside and does not
+        // measure capacity. This reads the rows now - counting a payment that passed the fence and is still
+        // PROCESSING - so the second cannot reach Xero over the invoice's IMS total.
+        recheckUnderLock: async () => {
+          const again = await guardInvoicePaymentCapacity(db, {
+            connector: XERO_CONNECTOR, entryId, referenceType, referenceId, accountingInvoiceId, amount, payload, countInFlight: true,
+          })
+          return again.post ? { ok: true } : { ok: false, error: `Not sent: ${again.message}` }
+        },
       }, async ({ requireConnection }) => {
         try {
           // BOTH FENCES, AND THE CLAIM FENCE IS LAST (o3d-0m56 + o3d-550x/o3d-xl63).
@@ -7635,6 +7654,12 @@ async function decideInvoicePaymentFollowUp(
         )
       }
 
+      // WHICH LOCAL RECEIPT THIS IS. An imported paid order now has a Payment row (the importer creates it),
+      // and its id travels here so the registration has an IDENTITY - the same one a deposit and a balance
+      // entered by hand carry (payment-identity.ts). Without it the registration reads as "possibly any
+      // payment" and blocks every later receipt on the order. Absent (a payload from before, or a payment
+      // flag with no receipt behind it) stays absent: unknown identity is never invented.
+      const receiptId = typeof payload._paymentId === 'string' && payload._paymentId !== '' ? payload._paymentId : undefined
       return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
         accountingInvoiceId: postedInvoiceId,
         bankAccountId: stored,
@@ -7642,6 +7667,7 @@ async function decideInvoicePaymentFollowUp(
         paymentDate,
         currency,
         method,
+        ...(receiptId ? { paymentId: receiptId } : {}),
         sourceEntryId: entryId,
       }, { from: 'postedRow', record: origin })
     },

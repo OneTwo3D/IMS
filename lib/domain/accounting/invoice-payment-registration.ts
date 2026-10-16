@@ -19,6 +19,7 @@ import {
   type LedgerStandingRow,
 } from './ledger-standing'
 import {
+  classifyLedgerSettlement,
   formatLedgerMoney,
   type AttemptDescription,
   type LedgerSettlementProbe,
@@ -32,6 +33,8 @@ import {
   type OperatorLedgerCheck,
 } from './operator-ledger-check'
 import { LEDGER_HELD_REGISTRATION_STATUSES } from './payment-ledger-hold'
+import { partitionByPaymentIdentity, type LiveReceipts } from './payment-identity'
+import { paymentTimingAgainstCancellation, type PaymentTiming } from './payment-cancellation-timing'
 import {
   exactAmountReadingOrLegacy,
   statedAmountOnly,
@@ -110,6 +113,12 @@ export type InvoicePaymentRegistrationRefusal =
    * being re-scoped). Sending it would name an account the ledger does not hold.
    */
   | 'PAYMENT_ACCOUNT_NOT_IN_LEDGER'
+  /**
+   * The receipt is dated AFTER the order was cancelled (payment-cancellation-timing.ts). The invoice is
+   * void/credited and the money is real: in Xero that is an overpayment, not a payment against the invoice,
+   * and that path is not built. Held visibly instead of posted - Xero would refuse it.
+   */
+  | 'PAID_AFTER_CANCELLATION'
 
 export type InvoicePaymentRegistrationDecision =
   | {
@@ -392,8 +401,12 @@ export function postedRegistrationsOnDocument(
   existing: ExistingInvoicePaymentSync[],
   paymentId: string,
   accountingInvoiceId: string,
+  identity: { orderId: string; liveReceipts: LiveReceipts },
 ): ExistingInvoicePaymentSync[] {
-  return existing.filter((r) =>
+  // ONLY A REGISTRATION THAT MAY BE THIS PAYMENT. A deposit that has posted does not make the balance's
+  // post impossible: the fence sets a different live receipt's payment aside (payment-identity.ts).
+  const { same } = partitionByPaymentIdentity({ paymentId, orderId: identity.orderId }, existing, identity.liveReceipts)
+  return same.filter((r) =>
     claimsToHavePosted(r)
     && (r.paymentId == null || r.paymentId !== paymentId)
     && (r.accountingInvoiceId == null || sameLedgerId(r.accountingInvoiceId, accountingInvoiceId)))
@@ -431,8 +444,21 @@ export function decideInvoicePaymentRegistration(input: {
   paymentAmount: Decimal
   /** The local Payment row being registered — its own sync row must not count against it. */
   paymentId: string
+  /** The order it settles; the identity partition only trusts a rival receipt of the SAME order. */
+  orderId: string
+  /**
+   * The receipts of this order that still exist. REQUIRED, so a caller that forgets it fails `tsc`: it is
+   * what lets a different live receipt's registration be told apart from a repeat of this one
+   * (payment-identity.ts). An empty map is a valid answer and means every rival is "possibly the same".
+   */
+  liveReceipts: LiveReceipts
   /** The bank account mapped for this method/currency, or null when none is. */
   bankAccountId: string | null
+  /**
+   * Order status, the database-minted cancellation instant and the receipt's own time. REQUIRED, so no call
+   * site can skip the cancelled-order question (payment-cancellation-timing.ts).
+   */
+  cancellation: { orderStatus: string; cancelledAt: Date | null; paidAt: Date | null }
   /** Every INVOICE_PAYMENT sync row already on this order. */
   existing: ExistingInvoicePaymentSync[]
   /**
@@ -478,6 +504,14 @@ export function decideInvoicePaymentRegistration(input: {
   if (!input.accountingInvoiceId) return { register: false, refusal: 'DOCUMENT_NOT_POSTED' }
   if (input.orderCurrency !== input.paymentCurrency) return { register: false, refusal: 'CURRENCY_MISMATCH' }
   if (!input.bankAccountId) return { register: false, refusal: 'NO_BANK_ACCOUNT' }
+  const timing: PaymentTiming = paymentTimingAgainstCancellation(input.cancellation)
+  if (timing === 'AFTER_CANCELLATION') {
+    return {
+      register: false,
+      refusal: 'PAID_AFTER_CANCELLATION',
+      detail: `the receipt is dated ${input.cancellation.paidAt?.toISOString()} and the order was cancelled at ${input.cancellation.cancelledAt?.toISOString()}`,
+    }
+  }
 
   // CAPACITY, NOT OCCUPANCY (o3d-cjt8). This used to refuse whenever ANY live INVOICE_PAYMENT row
   // existed, because accounting_sync_logs_followup_live_unique permitted exactly one live row per ORDER
@@ -519,7 +553,23 @@ export function decideInvoicePaymentRegistration(input: {
    */
   const provedAbsent = new Set<ExistingInvoicePaymentSync>()
   const liftedByCheckIds = new Set<string>()
-  const unresolved = unresolvedInvoicePaymentAttempts(input.existing, input.paymentId)
+  const unresolvedAll = unresolvedInvoicePaymentAttempts(input.existing, input.paymentId)
+  // SAME (or not provably different): refuses unless the ledger rules it out, exactly as before.
+  // DIFFERENT live receipt: never refuses this one — it only decides whether its money counts against the
+  // invoice's capacity. `present` and `unknown` leave it counted; only a ledger reading that is `clear`
+  // frees it (`provedAbsent`). The refusing set and the capacity set are the SAME partition the post
+  // fence and the capacity guard use, so the three cannot disagree.
+  const { same: unresolved, different: unresolvedDifferent } = partitionByPaymentIdentity(
+    { paymentId: input.paymentId, orderId: input.orderId },
+    unresolvedAll,
+    input.liveReceipts,
+  )
+  if (input.ledgerSettlements !== null) {
+    for (const attempt of unresolvedDifferent) {
+      const verdict = classifyLedgerSettlement(describeUnresolvedAttempt(attempt, input.orderCurrency), input.ledgerSettlements)
+      if (verdict.outcome === 'clear') provedAbsent.add(attempt)
+    }
+  }
   if (unresolved.length > 0) {
     if (input.ledgerSettlements === null) {
       return {
@@ -651,7 +701,10 @@ export function decideInvoicePaymentRegistration(input: {
   // refused row would itself become a FAILED attempt holding the next receipt back. Refuse here instead,
   // and say why, so the operator is not sent to record a check that cannot get the money sent.
   if (liftedByCheckIds.size > 0) {
-    const posted = postedRegistrationsOnDocument(input.existing, input.paymentId, input.accountingInvoiceId)
+    const posted = postedRegistrationsOnDocument(input.existing, input.paymentId, input.accountingInvoiceId, {
+      orderId: input.orderId,
+      liveReceipts: input.liveReceipts,
+    })
     if (posted.length > 0) {
       return {
         register: false,
@@ -781,6 +834,27 @@ export function decideInvoicePaymentRegistration(input: {
   if (compareDecimal(input.paymentAmount, addMoney(remaining, ledgerAmountEpsilon(input.orderCurrency))) > 0) {
     return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered, ledgerTotal: input.ledgerTotal }
   }
+  // REGISTRATION AND FENCE MUST AGREE (payment-identity.ts) - asked AFTER the capacity arithmetic, so a
+  // full invoice still reports WOULD_OVERPAY with its figures. The post fence refuses a payment while a
+  // registration that MAY BE THE SAME PAYMENT has posted on this invoice (its own mark is in the ledger).
+  // Queueing this receipt anyway only produces a row the fence refuses, which ends FAILED and then holds
+  // the next receipt back. A posted registration of a PROVEN-DIFFERENT live receipt is not in this set -
+  // that is the whole change - so a deposit never blocks its balance; what is left is a registration with
+  // no recorded receipt (an imported one) or whose receipt was deleted, which for money stays "possibly this one".
+  const postedPossiblySame = postedRegistrationsOnDocument(input.existing, input.paymentId, input.accountingInvoiceId, {
+    orderId: input.orderId,
+    liveReceipts: input.liveReceipts,
+  })
+  if (postedPossiblySame.length > 0) {
+    return {
+      register: false,
+      refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
+      ledgerTotal: input.ledgerTotal,
+      detail: 'another registration on this invoice that IMS cannot show to be a different payment has already posted '
+        + `(${postedPossiblySame.map((r) => r.id ?? '(unidentified entry)').join(', ')}), and sending this one could pay the same money twice`,
+    }
+  }
+
   return liftedByCheckIds.size > 0
     ? { register: true, bankAccountId: input.bankAccountId, liftedByCheckIds: [...liftedByCheckIds].sort() }
     : { register: true, bankAccountId: input.bankAccountId }

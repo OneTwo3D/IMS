@@ -48,6 +48,7 @@ import {
 } from '@/lib/domain/math/decimal'
 import { settlementDocumentAnchorFilters, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
+import type { ReceiptReader } from '@/lib/domain/accounting/payment-identity'
 
 export type SettlementProbeTarget = {
   type: string
@@ -2277,13 +2278,29 @@ export async function ledgerClearsFollowUpRevival(params: {
    * applies, which is the withholding answer.
    */
   loadOperatorLedgerChecks?: (scope: OperatorLedgerCheckScope) => Promise<readonly OperatorLedgerCheck[]>
+  /**
+   * The marks of the registrations of OTHER payments proven different from the row being revived
+   * (payment-identity.ts), computed by the caller from the order's rows. Their ledger records are set
+   * aside from this row's matching, so a deposit's payment is not read as the balance's own. Absent =
+   * nothing is attributed, which is today's (refusing) behaviour.
+   */
+  otherPaymentMarks?: readonly string[]
 }): Promise<{ clear: true; liftedByCheckIds?: string[] } | { clear: false; reason: string }> {
   const { isMoneyMovingSyncType, effectiveTokenFor } = await import('@/lib/domain/accounting/followup-retry-guard')
   if (params.tokenDisposition !== 'pinned' || !isMoneyMovingSyncType(params.type)) return { clear: true }
 
   const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
-  const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
+  const readProbe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
   const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.syncLogId ?? '', payload: params.payload }))
+  const { setAsideRecordsOfOtherPayments } = await import('@/lib/domain/accounting/payment-identity')
+  const attributed = setAsideRecordsOfOtherPayments(readProbe, params.otherPaymentMarks ?? [], marker)
+  if (attributed.ambiguous.length > 0) {
+    return {
+      clear: false,
+      reason: 'the ledger holds more than one payment carrying the reference of another receipt\'s payment, so IMS cannot tell which belongs to which receipt',
+    }
+  }
+  const probe = attributed.probe
   // o3d-r948 r6 — AN UNMEASURABLE SETTLEMENT HOLDS THIS REVIVAL BACK, AND NOW THAT IS THE ONLY RULE.
   //
   // r3 to r5 this gate carried a note explaining why it passed no `settlementsOfOtherAttempts`: it
@@ -2411,6 +2428,13 @@ export type MoneyPostFenceParams = {
         select: { id: true; payload: true }
       }) => Promise<Array<{ id: string; payload: unknown }>>
     }
+    /**
+     * THE RECEIPTS THAT STILL EXIST, read to tell a different payment from the same one
+     * (lib/domain/accounting/payment-identity.ts). REQUIRED so a call site that forgets it does not
+     * compile; a read that FAILS at runtime is treated as "no receipts are live", which keeps every
+     * rival "possibly the same payment" — the refusing direction.
+     */
+    payment: ReceiptReader['payment']
   }
   /**
    * o3d-llyw — reads the operator ledger checks recorded for one contender (see operator-ledger-check.ts).
@@ -2545,7 +2569,66 @@ export async function authoriseMoneyPost(
     // a ledger reading that says nothing about it.
     .filter((row) => attemptCouldBeTheSameDocument(params.type, row.payload, params.payload))
 
-  const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
+  const rawProbe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
+
+  // WHICH CONTENDERS ARE THE SAME PAYMENT AS THIS ONE, AND WHICH ARE PROVEN DIFFERENT ONES.
+  //
+  // An invoice may be settled by several payments (a deposit, then a balance), so a rival registration
+  // for a DIFFERENT receipt is not a reason to refuse this one — judging it by its own mark, as every
+  // contender used to be, refused a balance because the deposit beside it had posted. The partition is
+  // the one in payment-identity.ts, shared with the registration decision, the post-site capacity guard
+  // and the retry planner so the four cannot disagree:
+  //
+  //   SAME (or not provably different)  judged exactly as before, in the loop below.
+  //   PROVEN DIFFERENT                  never refuses on its own verdict. It is used ONLY to attribute
+  //                                     ledger records: a settlement carrying its MARK is its payment,
+  //                                     and is set aside from the matching of this one.
+  //
+  // ATTRIBUTION IS BY MARK, NEVER BY AMOUNT AND DATE OR BY A RECORDED LEDGER ID. A hand-entered payment
+  // the same size and day as this receipt is still a match and still refuses; an unmeasurable record
+  // that carries no mark of a different payment still withholds. A mark found on two records is a
+  // duplicate already in the ledger and withholds too.
+  //
+  // The receipts are read INSIDE the money-post lock the caller holds: one indexed read by order, and a
+  // read that fails leaves every rival "possibly the same" (refusing).
+  const { NO_LIVE_RECEIPTS, receiptIdOfPayload, loadLiveReceipts, partitionByPaymentIdentity, setAsideRecordsOfOtherPayments } =
+    await import('@/lib/domain/accounting/payment-identity')
+  const identityApplies = params.type === 'INVOICE_PAYMENT'
+  const identityOrderId = params.referenceType === 'SalesOrder' ? params.referenceId : null
+  const targetPaymentId = identityApplies ? receiptIdOfPayload(params.payload) : null
+  const rivalsWithIdentity = contenders
+    .filter((row) => !row.own)
+    .map((row) => ({ ...row, paymentId: identityApplies ? receiptIdOfPayload(row.payload) : null }))
+  const liveReceipts = targetPaymentId !== null && identityOrderId !== null && rivalsWithIdentity.length > 0
+    ? await loadLiveReceipts(params.db, identityOrderId)
+    : NO_LIVE_RECEIPTS
+  const { different: differentContenders } = partitionByPaymentIdentity(
+    { paymentId: targetPaymentId, orderId: identityOrderId },
+    rivalsWithIdentity,
+    liveReceipts,
+  )
+  const differentIds = new Set(differentContenders.map((row) => row.id))
+  const ownMarkForAttribution = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.entryId, payload: params.payload }))
+  const attribution = setAsideRecordsOfOtherPayments(
+    rawProbe,
+    differentContenders.map((row) => settlementMarkerFor(effectiveTokenFor(params.connector, row))),
+    ownMarkForAttribution,
+  )
+  if (attribution.ambiguous.length > 0) {
+    return {
+      proceed: false,
+      error: `Not sent: the accounting connector holds more than one payment carrying the reference of another receipt's payment on this document `
+        + `(${attribution.ambiguous.map((a) => `${a.mark} on ${a.count} payments`).join(', ')}). One payment cannot be on the ledger twice, `
+        + 'so IMS cannot tell which of them belongs to which receipt. Check the ledger and resolve the duplicate by hand.',
+    }
+  }
+  /**
+   * What THIS payment is matched against: the reading with other receipts' payments set aside. The
+   * undescribable-attempt arms below deliberately keep reading `rawProbe` — they are about what the
+   * ledger HOLDS, not about matching.
+   */
+  const probe = attribution.probe
+  const judgedContenders = contenders.filter((row) => !differentIds.has(row.id))
 
   /**
    * THE FIRST ROW IN A VIRGIN SCOPE — no longer a free pass (Codex round 4, finding 3).
@@ -2587,7 +2670,7 @@ export async function authoriseMoneyPost(
    * — the probe could not answer, or it returned a settlement it could not measure — refuse as
    * before.
    */
-  if (contenders.length === 0) {
+  if (judgedContenders.length === 0) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.entryId, payload: params.payload }))
     const attempt = describeAttempt(params.type, params.payload, marker, { postingOn: comparableAttemptDate(params.postingDate) })
     const verdict = classifyLedgerSettlement(attempt, probe)
@@ -2595,7 +2678,7 @@ export async function authoriseMoneyPost(
       return {
         proceed: false,
         error: `Not sent: the accounting connector already holds a settlement of ${verdict.detail} against `
-          + 'this document, and IMS has never sent one for it — so it was recorded outside IMS. '
+          + 'this document, and no IMS entry for this receipt has sent one — so it was recorded outside IMS. '
           + 'Sending this would pay it twice. Check the ledger and resolve this entry by hand.',
       }
     }
@@ -2637,7 +2720,7 @@ export async function authoriseMoneyPost(
       // So it is its own arm rather than a widened condition: the sentence below counts settlements,
       // and this shape has none to count. It is falsifiable — delete it and the credit-note excess
       // authorises the post.
-      if (probe.ok && !probe.provedComplete && probe.records.length === 0) {
+      if (rawProbe.ok && !rawProbe.provedComplete && rawProbe.records.length === 0) {
         return {
           proceed: false,
           error: 'Not sent: this entry does not record the amount its attempt would send, and the '
@@ -2647,12 +2730,12 @@ export async function authoriseMoneyPost(
             + 'this entry by hand.',
         }
       }
-      if (!probe.ok || probe.records.length > 0) {
+      if (!rawProbe.ok || rawProbe.records.length > 0) {
         return {
           proceed: false,
           error: 'Not sent: this entry does not record the amount its attempt would send, and the '
-            + `accounting connector already holds ${probe.ok ? probe.records.length : 'a'} settlement`
-            + `${probe.ok && probe.records.length === 1 ? '' : 's'} against this document. IMS cannot `
+            + `accounting connector already holds ${rawProbe.ok ? rawProbe.records.length : 'a'} settlement`
+            + `${rawProbe.ok && rawProbe.records.length === 1 ? '' : 's'} against this document. IMS cannot `
             + 'tell them apart, so sending could pay it twice. Resolve this entry by hand.',
         }
       }
@@ -2667,7 +2750,7 @@ export async function authoriseMoneyPost(
   // handed to the post callback, and the transport refuses before egress unless the POST's own auth is
   // exactly that connection (`requireConnection`, notSent `connection-changed`).
   let requireConnection: RequiredXeroConnection | undefined
-  for (const contender of contenders) {
+  for (const contender of judgedContenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
     // o3d-r948 r6 — THIS LOOP NEVER NEEDED THE EXCLUSION, AND NOW NOBODY HAS IT.
     //
@@ -2867,7 +2950,16 @@ async function reportLostMoneyPostExclusion(
  * it.
  */
 export async function postMoneyUnderLedgerFence(
-  params: MoneyPostFenceParams & { lock?: MoneyPostLock },
+  params: MoneyPostFenceParams & {
+    lock?: MoneyPostLock
+    /**
+     * A CHECK MADE UNDER THE LOCK, after the ledger fence authorised the post and immediately before the remote
+     * call. The fence sets a different receipt's payment aside and does not measure capacity, and a capacity
+     * check made BEFORE the lock can be passed by two receipts at once; this one sees what the first of them
+     * did while it held the lock. A refusal is returned as a failed outcome and nothing is sent.
+     */
+    recheckUnderLock?: () => Promise<{ ok: true } | { ok: false; error: string }>
+  },
   /**
    * The remote call. o3d-llyw: receives the connection it MUST be sent under when the authorisation
    * rested on an operator ledger check (pass it to the transport as `requireConnection`); absent otherwise.
@@ -2893,6 +2985,10 @@ export async function postMoneyUnderLedgerFence(
   }, async (held): Promise<MoneyPostOutcome> => {
     const authorised = await authoriseMoneyPost(params)
     if (!authorised.proceed) return { success: false, error: authorised.error }
+    if (params.recheckUnderLock) {
+      const rechecked = await params.recheckUnderLock()
+      if (!rechecked.ok) return { success: false, error: rechecked.error }
+    }
     // THE LAST THING CHECKED BEFORE THE CALL. PostgreSQL frees a session advisory lock the instant
     // its connection dies, so a pinned connection that failed during the ledger read means the
     // exclusion this verdict was taken under is already gone and another worker may be posting to

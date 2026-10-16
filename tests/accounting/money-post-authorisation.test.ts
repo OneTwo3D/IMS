@@ -135,6 +135,10 @@ function dbDouble(rows: Row[]) {
     rows,
     counts,
     db: {
+      // No receipt is live in these scenarios, so no rival is ever a PROVEN different payment: the
+      // fence judges every contender exactly as it always did. Identity has its own file
+      // (payment-identity-fence.test.ts).
+      payment: { findMany: async () => [] },
       accountingSyncLog: {
         findMany: async ({ where }: { where: Record<string, unknown>; select: { id: true; payload: true } }) => {
           counts.push(where)
@@ -285,6 +289,7 @@ test('losing the stamp race means taking the repeat path (o3d-0m56)', async () =
     // The row was claimed by another worker between this call reading and writing: the conditional
     // update matches nothing.
     accountingSyncLog: { updateMany: async () => ({ count: 0 }), findMany: async () => [] },
+    payment: { findMany: async () => [] },
   }
 
   const verdict = await authorise({ ...payment, entryId: 'log-1', db })
