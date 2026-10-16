@@ -310,7 +310,9 @@ export async function runWmsOrderStatusSweep(
               where: { orderId: order.id },
               data: { wcPushedStatus: status.status },
             }).catch(() => {})
-          } else if (!pushResult.skipped) {
+          } else if (!pushResult.skipped && pushResult.shadowed !== true) {
+            // A shadowed push (the producer-side hold) is neither pushed nor failed: wcPushedStatus stays unchanged so the
+            // live phase's first tick pushes the then-current status, and nothing is logged as a failure.
             console.warn(`[wms-order-status-sweep] storefront WMS-status push failed for order ${order.id}: ${pushResult.error}`)
           }
         } catch (pushError) {

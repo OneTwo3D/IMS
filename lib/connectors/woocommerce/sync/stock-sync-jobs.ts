@@ -13,11 +13,13 @@ import {
   claimIntegrationOutboxWork,
   enqueueIntegrationOutbox,
   INTEGRATION_OUTBOX_STATUS,
+  isOutboxEnqueueShadowed,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
+import { wooDrainHold } from '../producer-egress'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
@@ -217,7 +219,11 @@ async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100):
         { force: job.force, webhookQty: job.webhookQty },
       ),
       nextAttemptAt: job.availableAt,
+      producer: { subjectType: 'Product', subjectId: job.productId, summary: { reason: job.reason, legacyJob: true } },
     })
+    // The producer-side hold shadowed it: no outbox row exists, so the legacy job is NOT migrated and NOT deleted. It stays
+    // exactly where it was, and is never turned into queued work while the hold stands.
+    if (isOutboxEnqueueShadowed(row)) continue
     const migrated = await applyStockOutboxPayload({
       row,
       productId: job.productId,
@@ -250,6 +256,11 @@ async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100):
   return jobs.length
 }
 
+/**
+ * Queue the stock push for these products. Returns the product ids that now have a queued job: the ids the producer-side hold
+ * SHADOWED are not in it (nothing was queued for them, a shadow record was kept), so the immediate-processing caller processes
+ * nothing for them and no caller reads a shadow as queued work.
+ */
 export async function enqueueWcStockSyncJobs(
   productIds: string[],
   reason: StockSyncReason,
@@ -260,6 +271,7 @@ export async function enqueueWcStockSyncJobs(
   const now = new Date()
   await migrateLegacyWcStockSyncJobs(scope, Math.max(scope.length, 1))
 
+  const queuedScope: string[] = []
   for (const productId of scope) {
     const row = await enqueueIntegrationOutbox({
       connector: WC_STOCK_SYNC_CONNECTOR,
@@ -267,7 +279,9 @@ export async function enqueueWcStockSyncJobs(
       idempotencyKey: wcStockSyncIdempotencyKey(productId),
       payloadJson: buildWcStockSyncOutboxPayload(productId, reason, options),
       nextAttemptAt: now,
+      producer: { subjectType: 'Product', subjectId: productId, summary: { reason, force: options?.force === true } },
     })
+    if (isOutboxEnqueueShadowed(row)) continue
     const queued = await applyStockOutboxPayload({
       row,
       productId,
@@ -278,9 +292,10 @@ export async function enqueueWcStockSyncJobs(
       status: INTEGRATION_OUTBOX_STATUS.PENDING,
     })
     if (!queued) throw new Error(`WooCommerce stock outbox job for product ${productId} could not be queued`)
+    queuedScope.push(productId)
   }
 
-  return scope
+  return queuedScope
 }
 
 // d2jd (codex): retain on ANY error, not only when nothing synced. A single
@@ -308,11 +323,15 @@ export async function processQueuedWcStockSyncJobs(options?: {
   productIds?: string[]
   limit?: number
   migrateLegacy?: boolean
-}): Promise<{ processed: number; synced: number; failed: number; errors: string[] }> {
+}): Promise<{ processed: number; synced: number; failed: number; errors: string[]; held?: true }> {
   const limit = options?.limit ?? 25
   const productIds = options?.productIds !== undefined ? [...new Set(options.productIds)] : undefined
-  const summary = { processed: 0, synced: 0, failed: 0, errors: [] as string[] }
+  const summary: { processed: number; synced: number; failed: number; errors: string[]; held?: true } = { processed: 0, synced: 0, failed: 0, errors: [] }
   if (productIds?.length === 0) return summary
+
+  // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and migrate nothing. A job queued
+  // before the hold was switched on stays exactly as it is (no claim, no attempt spent) and is never sent while the hold stands.
+  if (wooDrainHold().held) return { ...summary, held: true }
 
   if (options?.migrateLegacy !== false) {
     await migrateLegacyWcStockSyncJobs(productIds, limit)

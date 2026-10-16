@@ -29,6 +29,7 @@ import {
   buildOutboxIdempotencyKey,
   claimIntegrationOutboxWork,
   enqueueIntegrationOutbox,
+  isOutboxEnqueueShadowed,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
@@ -36,6 +37,7 @@ import {
 } from '@/lib/domain/integrations/outbox'
 import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW, wcOrderStatusClaimGate } from './order-status-claim-gate'
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
+import { wooDrainHold } from '../producer-egress'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
   parseIntegrationOutboxPayload,
@@ -100,7 +102,8 @@ export function wcOrderStatusPushIdempotencyKey(
 
 /**
  * Enqueue the job on the TRANSACTION CLIENT of the transition that cancels / holds the order. Returns the job's
- * reference, or null when the order has no WooCommerce link. Must be called after the order lock is taken and
+ * reference, or null when no job exists: the order has no WooCommerce link, or the producer-side hold shadowed the job (a shadow
+ * record is written on the same transaction instead). Must be called after the order lock is taken and
  * before commit; it writes one outbox row and does no WooCommerce I/O and no pooled query. Whether a runnable
  * connector exists is decided when the job DRAINS, not here.
  */
@@ -115,13 +118,17 @@ async function scheduleWcOrderStatusPush(
   })
   if (!link) return null
   const key = wcOrderStatusPushIdempotencyKey(descriptor, input.orderId, input.flippedAt)
-  await enqueueIntegrationOutbox({
+  const enqueued = await enqueueIntegrationOutbox({
     connector: CONNECTOR,
     operation: descriptor.operation,
     idempotencyKey: key,
     payloadJson: { orderId: input.orderId } satisfies WcOrderStatusOutboxPayload,
     nextAttemptAt: null,
+    producer: { subjectType: 'SalesOrder', subjectId: input.orderId, obligationAt: input.flippedAt, summary: { status: descriptor.wcTarget } },
   }, { client: tx })
+  // Shadowed by the producer-side hold: a shadow record was written on this transaction and NO job exists, so there is no
+  // reference for a post-commit attempt. Null is the true answer ("no durable job"), and every caller already handles it.
+  if (isOutboxEnqueueShadowed(enqueued)) return null
   return { operation: descriptor.operation, key }
 }
 
@@ -312,6 +319,9 @@ export async function runFencedWcOrderJob(
 ): Promise<WcOrderStatusRunSummary> {
   const summary: WcOrderStatusRunSummary = { claimed: 0, succeeded: 0, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
   if (options.idempotencyKeys?.length === 0) return summary
+  // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and spend no attempt. A job queued
+  // before the hold was switched on stays exactly as it is and is never sent while the hold stands.
+  if (wooDrainHold().held) return summary
   const now = options.now
   const clock = options.clock ?? (() => new Date())
   const startedAt = clock().getTime()

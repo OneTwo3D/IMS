@@ -70,6 +70,20 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
 
     if (reconcileDue) {
       const stock = await pushStockToWc({ forceAll: true, source: 'DAILY_RECONCILIATION' })
+      // A push the producer-side hold shadowed did NOT reconcile anything: the daily stamp is what makes the next 24 hours
+      // "not due", so stamping it would tell the live phase's first run that stock was just reconciled. Leave the stamp alone,
+      // and say so in the result. (A push the setting or the gates refused is stamped as before: that is the unchanged path.)
+      if (stock.shadowed === true) {
+        results.stock = {
+          queued,
+          sync: stock,
+          skipped: true,
+          reason: 'producer_hold_shadowed',
+          reconciliationDue: true,
+          lastReconciledAt: lastReconcile?.value ?? null,
+        }
+        return results
+      }
       const now = new Date().toISOString()
       await db.setting.upsert({
         where: { key: 'last_wc_stock_daily_reconcile_at' },

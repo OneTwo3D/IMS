@@ -405,6 +405,8 @@ export type WmsDispatchPartialShipmentInput = {
   totalParts: number
   trackingNumber?: string | null
   items: Array<{ sku: string; qty: number }>
+  /** When the WMS despatched this part, if it said: the business-event time the storefront writeback is judged by. */
+  despatchedAt?: Date | null
 }
 
 export type WmsDispatchSweepDeps = {
@@ -425,7 +427,7 @@ export type WmsDispatchSweepDeps = {
   pushPartialShipment(
     orderId: string,
     input: WmsDispatchPartialShipmentInput,
-  ): Promise<{ ok: boolean; error?: string }>
+  ): Promise<{ ok: boolean; error?: string; shadowed?: boolean }>
   // Merge handling: repoint the push link to the surviving WMS order when this order was
   // merged into another (its own WMS order is destroyed).
   repointLink(linkId: string, to: { externalOrderId: string; externalOrderNumber: string }): Promise<void>
@@ -602,6 +604,18 @@ export type WmsDispatchSweepDeps = {
   countLinksByOrderNumber?(orderNumbers: string[]): Promise<Map<string, number>>
 }
 
+/** The latest despatch time among a part's tracking entries, or null when the WMS gave none that parses. */
+function latestDespatchTime(tracking: ReadonlyArray<{ despatchedAt?: string | null }>): Date | null {
+  let latest: Date | null = null
+  for (const entry of tracking) {
+    if (!entry.despatchedAt) continue
+    const at = new Date(entry.despatchedAt)
+    if (Number.isNaN(at.getTime())) continue
+    if (latest === null || at.getTime() > latest.getTime()) latest = at
+  }
+  return latest
+}
+
 /**
  * Reconcile a SPLIT WMS order: push each despatched part to the storefront as a partial
  * shipment (idempotent per part), and only mark the IMS order SHIPPED once every part has
@@ -655,8 +669,15 @@ async function reconcileSplitOrder(
         totalParts,
         trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
         items,
+        despatchedAt: latestDespatchTime(part.tracking),
       })
       if (!push.ok) {
+        // The producer-side hold kept this push as a shadow: NOT a failure (no failure is counted and the link is never
+        // dead-lettered for it, however long the hold lasts) and NOT a push (the part was not recorded at the storefront, so
+        // the order is not completed off it). It is a part we could not finish, so it is unresolved and holds the watermark.
+        if (push.shadowed === true) {
+          return { action: 'pending', reason: push.error ?? `Partial-shipment push for part ${part.partNumber} was kept as a shadow`, unresolved: requireResolution }
+        }
         return { action: 'error', reason: push.error ?? `Partial-shipment push failed for part ${part.partNumber}` }
       }
     }
@@ -2328,8 +2349,9 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         totalParts: input.totalParts,
         trackingNumber: input.trackingNumber,
         items: input.items,
+        despatchedAt: input.despatchedAt ?? null,
       })
-      return { ok: result.success, error: result.error }
+      return { ok: result.success, error: result.error, ...(result.shadowed === true ? { shadowed: true } : {}) }
     },
     async repointLink(linkId, to) {
       // Park as MERGED so the push-sweep's SYNCED-filtered passes skip it (no dual-sync

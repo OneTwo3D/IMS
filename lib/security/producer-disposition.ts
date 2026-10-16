@@ -3,8 +3,8 @@
  *
  * Pure and synchronous. No database, no network, no settings row. It is the only place that decides
  * whether a unit of IMS work for a destination is produced for delivery (LIVE) or only recorded as a
- * shadow of what IMS would have written (SHADOW). Nothing consults it yet; the seams that do come in
- * later changes, one per mechanism.
+ * shadow of what IMS would have written (SHADOW). It is consulted through the producer seams
+ * (lib/security/producer-seam.ts), one per mechanism: today the Xero and WooCommerce ones are wired.
  *
  * LIVE only when ALL of these hold; otherwise SHADOW, with the FIRST failing reason:
  *  1. the outbound-write grant for the destination reads ok (outbound-write-grant.ts decides what ok is);

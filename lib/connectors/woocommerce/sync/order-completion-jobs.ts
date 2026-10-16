@@ -23,6 +23,7 @@ import {
   buildOutboxIdempotencyKey,
   claimIntegrationOutboxWork,
   enqueueIntegrationOutbox,
+  isOutboxEnqueueShadowed,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
@@ -30,6 +31,7 @@ import {
 } from '@/lib/domain/integrations/outbox'
 import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW, wcOrderStatusClaimGate } from './order-status-claim-gate'
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
+import { wooDrainHold } from '../producer-egress'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
   parseIntegrationOutboxPayload,
@@ -51,8 +53,11 @@ export function wcOrderCompletionIdempotencyKey(orderId: string, shippedAt: Date
 
 /**
  * Enqueue the completion job on the TRANSACTION CLIENT of the shipment that completes the order. Returns the
- * idempotency key, or null when the order has no WooCommerce link (nothing to complete). Must be called
- * after the order lock is taken and before commit; it writes one outbox row and does no WooCommerce I/O.
+ * idempotency key, or null when no job exists: the order has no WooCommerce link (nothing to complete), or the producer-side
+ * hold SHADOWED the job (a shadow record was written on the same transaction instead, and nothing will be completed by IMS).
+ * Null is the TRUE answer for both, and every caller already treats it as "no durable job": it never reads a shadow as queued
+ * work. Must be called after the order lock is taken and before commit; it writes one outbox row (or one shadow record) and
+ * does no WooCommerce I/O.
  */
 export async function scheduleWcOrderCompletion(
   tx: CompletionTxClient,
@@ -64,13 +69,15 @@ export async function scheduleWcOrderCompletion(
   })
   if (!link) return null
   const key = wcOrderCompletionIdempotencyKey(input.orderId, input.shippedAt)
-  await enqueueIntegrationOutbox({
+  const enqueued = await enqueueIntegrationOutbox({
     connector: CONNECTOR,
     operation: OPERATION,
     idempotencyKey: key,
     payloadJson: { orderId: input.orderId } satisfies WcOrderCompletionOutboxPayload,
     nextAttemptAt: null,
+    producer: { subjectType: 'SalesOrder', subjectId: input.orderId, obligationAt: input.shippedAt, summary: { status: 'completed' } },
   }, { client: tx })
+  if (isOutboxEnqueueShadowed(enqueued)) return null
   return key
 }
 
@@ -148,6 +155,9 @@ export async function processWcOrderCompletionJobs(options?: {
   const now = options?.now
   // The cron drain (no explicit keys) also surfaces claims whose worker died.
   if (!options?.idempotencyKeys) summary.deadLettered += await parkStaleWcOrderCompletionClaims(now ?? new Date())
+  // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and spend no attempt. A job queued
+  // before the hold was switched on stays exactly as it is and is never sent while the hold stands.
+  if (wooDrainHold().held) return summary
   const clock = options?.clock ?? (() => new Date())
   const startedAt = clock().getTime()
   const budgetMs = options?.drainBudgetMs ?? WC_DRAIN_CLAIM_BUDGET_MS
@@ -241,7 +251,7 @@ export async function processWcOrderCompletionJobs(options?: {
         let trackingError: string | null = null
         try {
           const tracking = await pushOrderDeliveryMetadata(orderId)
-          if (!tracking.success && !tracking.skipped) trackingError = tracking.error ?? 'unknown error'
+          if (!tracking.success && !tracking.skipped) trackingError = tracking.error ?? (tracking.shadowed ? 'the producer-side hold kept the tracking push as a shadow' : 'unknown error')
         } catch (thrown) {
           trackingError = thrown instanceof Error ? thrown.message : String(thrown)
         }

@@ -26,13 +26,21 @@ export type { WcPartialShipmentPush, WcPartialShipmentLine } from '@/lib/connect
 import type { WmsOrderStatusMeta } from '@/lib/connectors/woocommerce/sync/wms-status'
 export type { WmsOrderStatusMeta } from '@/lib/connectors/woocommerce/sync/wms-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { wooDrainHold } from '@/lib/connectors/woocommerce/producer-egress'
+import { wooProducerSeam, type WooShadow } from '@/lib/connectors/woocommerce/producer-seam'
 import { getShoppingConnector, SHOPPING_CONNECTORS, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
-export type PushProductMetadataResult = { success: boolean; skipped?: boolean; error?: string }
-export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string }
+/**
+ * `shadowed` is the producer-side hold's answer and is NOT `success`, `skipped` or a failure to retry: the push was not sent and
+ * nothing is queued; a shadow record was kept and `error` carries the single-sourced operator sentence. A caller that stamps
+ * "pushed" on `success` is therefore never told a shadow was pushed, and a caller that logs failures can tell a shadow from one.
+ */
+export type PushProductMetadataResult = { success: boolean; skipped?: boolean; error?: string; shadowed?: boolean }
+export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string; shadowed?: boolean }
 export type PushOrderStatusResult = {
   success: boolean
   skipped?: boolean
+  shadowed?: boolean
   error?: string
   /** What the connector actually did (o3d-zvec.15). `success` is false only for read-failed / write-failed / error. */
   outcome?: import('@/lib/connectors/woocommerce/sync/order-status').WcStatusPushOutcome
@@ -42,6 +50,8 @@ export type FxRatePushConnectorResult = {
   supported: boolean
   pushed: number
   errors: string[]
+  /** The producer-side hold kept this push as a shadow: nothing was sent, and `errors` is empty (it is not a failure). */
+  shadowed?: boolean
 }
 export type ShoppingConnectorInfo = { id: ShoppingConnectorId; name: string }
 export type ShoppingWebhookResource = 'orders' | 'products' | 'refunds'
@@ -92,6 +102,18 @@ async function emitStockSyncSkipLog(
     description: `Stock sync ${pushedCount === 0 ? 'pushed nothing' : `pushed ${pushedCount} item(s)`}; skipped ${totalSkipped} to ${connector}`,
     metadata: { skipReasons, pushedCount, connector },
   })
+}
+
+/** The result every facade push returns for a unit of work the producer-side hold kept as a shadow. */
+function shadowedPush(seam: WooShadow): { success: false; shadowed: true; error: string } {
+  return { success: false, shadowed: true, error: seam.notice }
+}
+
+/** The business-event time of an order-level push: when the order shipped, else now. Read only when the hold is enforced. */
+async function orderEventTime(orderId: string): Promise<Date | undefined> {
+  const { db } = await import('@/lib/db')
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { shippedAt: true } })
+  return order?.shippedAt ?? new Date()
 }
 
 async function listConfiguredShoppingConnectorIds(): Promise<ShoppingConnectorId[]> {
@@ -186,19 +208,24 @@ export async function pushProductMetadata(productId: string): Promise<PushProduc
   const results = await Promise.all(connectors.map(async (connector) => {
     switch (connector) {
       case 'woocommerce': {
+        // The producer seam: with the hold enforced and the decision SHADOW, record it and send nothing.
+        const seam = await wooProducerSeam({ operation: 'product.meta', subjectType: 'Product', subjectId: productId, payload: { productId } })
+        if (!seam.proceed) return { connector, result: shadowedPush(seam) }
         const { pushImsProductToWc } = await import('@/lib/connectors/woocommerce/sync/product-sync')
         return { connector, result: await pushImsProductToWc(productId) }
       }
     }
   }))
 
-  const failures = results.filter((entry) => !entry.result.success && !('skipped' in entry.result && entry.result.skipped))
+  const failures = results.filter((entry) => !entry.result.success && !('skipped' in entry.result && entry.result.skipped) && !('shadowed' in entry.result && entry.result.shadowed))
   if (failures.length > 0) {
     return {
       success: false,
       error: failures.map((entry) => `${getShoppingConnector(entry.connector).label}: ${'error' in entry.result ? (entry.result.error ?? 'unknown error') : 'unknown error'}`).join('; '),
     }
   }
+  const shadowed = results.find((entry) => 'shadowed' in entry.result && entry.result.shadowed)
+  if (shadowed) return { success: false, shadowed: true, error: 'error' in shadowed.result ? shadowed.result.error : undefined }
 
   return { success: true }
 }
@@ -210,19 +237,29 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
   const results = await Promise.all(connectors.map(async (connector) => {
     switch (connector) {
       case 'woocommerce': {
+        const seam = await wooProducerSeam({
+          operation: 'order.tracking',
+          subjectType: 'SalesOrder',
+          subjectId: orderId,
+          payload: { orderId },
+          resolveObligationAt: () => orderEventTime(orderId),
+        })
+        if (!seam.proceed) return { connector, result: shadowedPush(seam) }
         const { pushImsTrackingToWc } = await import('@/lib/connectors/woocommerce/sync/tracking-sync')
         return { connector, result: await pushImsTrackingToWc(orderId) }
       }
     }
   }))
 
-  const failures = results.filter((entry) => !entry.result.success && !('skipped' in entry.result && entry.result.skipped))
+  const failures = results.filter((entry) => !entry.result.success && !('skipped' in entry.result && entry.result.skipped) && !('shadowed' in entry.result && entry.result.shadowed))
   if (failures.length > 0) {
     return {
       success: false,
       error: failures.map((entry) => `${getShoppingConnector(entry.connector).label}: ${'error' in entry.result ? (entry.result.error ?? 'unknown error') : 'unknown error'}`).join('; '),
     }
   }
+  const shadowed = results.find((entry) => 'shadowed' in entry.result && entry.result.shadowed)
+  if (shadowed) return { success: false, shadowed: true, error: 'error' in shadowed.result ? shadowed.result.error : undefined }
 
   return { success: true, skipped: results.every((entry) => 'skipped' in entry.result && !!entry.result.skipped) }
 }
@@ -243,12 +280,27 @@ export async function pushPartialShipmentToShopping(
   const results = await Promise.all(connectors.map(async (connector) => {
     switch (connector) {
       case 'woocommerce': {
+        const seam = await wooProducerSeam({
+          operation: 'order.partial-shipment',
+          subjectType: 'SalesOrder',
+          subjectId: `${orderId}:part-${Math.trunc(input.part)}`,
+          payload: { orderId, part: input.part, totalParts: input.totalParts, trackingNumber: input.trackingNumber ?? null, items: input.items },
+          summary: { part: Math.trunc(input.part), totalParts: Math.trunc(input.totalParts) },
+          // The part's despatch time when the WMS gave one, else the time of this reconcile: the event is the despatch.
+          obligationAt: input.despatchedAt ?? undefined,
+          resolveObligationAt: async () => new Date(),
+        })
+        if (!seam.proceed) {
+          return { connector, result: { supported: true, ok: false, shadowed: true, skipped: false, allDone: undefined, duplicate: undefined, error: seam.notice } }
+        }
         const { pushPartialShipmentToWc } = await import('@/lib/connectors/woocommerce/sync/partial-shipment')
         return { connector, result: await pushPartialShipmentToWc(orderId, input) }
       }
     }
   }))
 
+  const shadowedPart = results.find((entry) => entry.result.shadowed === true)
+  if (shadowedPart) return { success: false, shadowed: true, error: shadowedPart.result.error }
   const failures = results.filter((entry) => entry.result.supported && !entry.result.ok && !entry.result.skipped)
   if (failures.length > 0) {
     return {
@@ -278,12 +330,22 @@ export async function pushWmsOrderStatusToShopping(
   const results = await Promise.all(connectors.map(async (connector) => {
     switch (connector) {
       case 'woocommerce': {
+        const seam = await wooProducerSeam({
+          operation: 'order.wms-status-meta',
+          subjectType: 'SalesOrder',
+          subjectId: orderId,
+          payload: { orderId, status: input.status, statusLabel: input.statusLabel, connectorLabel: input.connectorLabel },
+          summary: { status: input.status },
+        })
+        if (!seam.proceed) return { connector, result: { ...shadowedPush(seam), skipped: false } }
         const { pushWmsOrderStatusToWc } = await import('@/lib/connectors/woocommerce/sync/wms-status')
         return { connector, result: await pushWmsOrderStatusToWc(orderId, input) }
       }
     }
   }))
 
+  const shadowedStatus = results.find((entry) => 'shadowed' in entry.result && entry.result.shadowed === true)
+  if (shadowedStatus) return { success: false, shadowed: true, error: shadowedStatus.result.error }
   const failures = results.filter((entry) => !entry.result.success && !entry.result.skipped)
   if (failures.length > 0) {
     return {
@@ -308,6 +370,11 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
   const results = await Promise.all(connectors.map(async (connector): Promise<{ connector: ShoppingConnectorId; result: PushOrderStatusResult }> => {
     switch (connector) {
       case 'woocommerce': {
+        // Only the queue drains reach this (a job produced under a LIVE decision), so it asks the destination-level gate
+        // and not a per-operation decision: a job found while the destination is held is handed back unsent, with no
+        // new shadow record (the queued row is the work, and it stays as it is).
+        const hold = wooDrainHold()
+        if (hold.held) return { connector, result: { success: false, shadowed: true, error: hold.queuedNotice } }
         const { pushImsStatusToWc } = await import('@/lib/connectors/woocommerce/sync/order-status')
         const outcome = await pushImsStatusToWc(orderId, status)
         // A failed read, a refused write and a thrown error are FAILURES (o3d-zvec.15): this used to report
@@ -321,6 +388,8 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
     }
   }))
 
+  const heldStatus = results.find((entry) => entry.result.shadowed === true)
+  if (heldStatus) return { success: false, shadowed: true, error: heldStatus.result.error }
   const failures = results.filter((entry) => !entry.result.success && !entry.result.skipped)
   if (failures.length > 0) {
     return {
@@ -393,6 +462,10 @@ export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResu
         const { db } = await import('@/lib/db')
         const { logActivity } = await import('@/lib/activity-log')
         try {
+          // The producer seam: with the hold enforced and the decision SHADOW, record it and send nothing. Not a failure, so no
+          // FAILED fxRatePushLog row and no WARNING: the log tells the operator what was sent, and nothing was.
+          const seam = await wooProducerSeam({ operation: 'fx-rates', subjectType: 'FxRates', subjectId: 'current', payload: { kind: 'current-rates' } })
+          if (!seam.proceed) return { connector, supported: true, pushed: 0, errors: [], shadowed: true }
           const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
           const pushResult = await pushCurrentFxRatesToWc()
           if (!pushResult.supported) return { connector, supported: false, pushed: 0, errors: [] }

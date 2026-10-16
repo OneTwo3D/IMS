@@ -9,6 +9,9 @@ import {
 
 const nonEmptyString = z.string().trim().min(1)
 
+/** Where an outbox operation's effect lands; see {@link INTEGRATION_OUTBOX_REGISTRY}. */
+export type OutboxDestination = 'woocommerce' | 'mintsoft' | 'xero' | 'internal'
+
 export const WcStockSyncOutboxPayloadSchema = z.object({
   productId: nonEmptyString,
   reason: z.nativeEnum(StockSyncReason),
@@ -159,7 +162,23 @@ export const LandedCostJournalOutboxPayloadSchema = z.object({
  * reclaimable verdict by describing only the part of its run that deserves one.
  */
 type OutboxRegistryEntry<Name extends string = string> =
-  & { name: Name; schema: z.ZodTypeAny }
+  & {
+    name: Name
+    schema: z.ZodTypeAny
+    /**
+     * WHERE THIS OPERATION'S EFFECT LANDS, and therefore which producer-side seam governs it. REQUIRED, so a new operation cannot
+     * be added without saying (tsc refuses it).
+     *
+     *   'woocommerce' / 'mintsoft'   the job IS the outbound write to that vendor. `enqueueIntegrationOutbox` asks the
+     *                                producer seam and, when the decision is SHADOW, writes a shadow record and NO row.
+     *   'xero'                       the row is the delivery half of an AccountingSyncLog row. Its seam is
+     *                                `createAccountingSyncLogRow`, one step earlier: a shadowed posting never gets an outbox
+     *                                row, so there is nothing for this primitive to decide.
+     *   'internal'                   the effect is local (a ledger row, a stock release, a warning). Its own effects reach a
+     *                                vendor only through another seam, never through this one. Never shadowed.
+     */
+    destination: OutboxDestination
+  }
   & (
     | { effects: { keyedBy: 'operation' }; replay: OutboxReplaySafety }
     | {
@@ -264,6 +283,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // like the fix. The real fix is the monotonic push generation named above.
     'stock.push': {
       name: 'stockSync',
+      destination: 'woocommerce',
       schema: WcStockSyncOutboxPayloadSchema,
       effects: ONE_EFFECT,
       replay: 'unsafe-to-replay',
@@ -293,6 +313,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // attempt began, long before the park could run, so a Replay's attempt never overlaps a live one.
     'order.complete': {
       name: 'orderComplete',
+      destination: 'woocommerce',
       schema: WcOrderCompletionOutboxPayloadSchema,
       effects: {
         keyedBy: 'effect-sequence',
@@ -326,6 +347,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // IMS still wants the write immediately before the PUT (attempt-fence.ts); the lease is 10 minutes.
     'order.cancel': {
       name: 'orderCancel',
+      destination: 'woocommerce',
       schema: WcOrderStatusOutboxPayloadSchema,
       effects: {
         keyedBy: 'effect-sequence',
@@ -342,6 +364,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // withdrawal status (those park immediately for an operator).
     'order.hold': {
       name: 'orderHold',
+      destination: 'woocommerce',
       schema: WcOrderStatusOutboxPayloadSchema,
       effects: {
         keyedBy: 'effect-sequence',
@@ -479,6 +502,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // reclaim predicate cannot discriminate between them.
     'accounting.post': {
       name: 'postAccountingEvent',
+      destination: 'xero',
       schema: XeroAccountingOutboxPayloadSchema,
       effects: {
         keyedBy: 'sub-operation',
@@ -533,6 +557,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // divergence warning to `logActivityInTransaction`.
     'inbound.booked-in': {
       name: 'processBookedInEvent',
+      destination: 'internal',
       schema: MintsoftBookedInOutboxPayloadSchema,
       effects: {
         keyedBy: 'effect-sequence',
@@ -564,6 +589,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // of effect, so one verdict covers both without averaging.
     'landed-cost.adjustment-journal': {
       name: 'processLandedCostAdjustmentJournal',
+      destination: 'internal',
       schema: LandedCostJournalOutboxPayloadSchema,
       effects: ONE_EFFECT,
       replay: 'local-only-guarded',
@@ -579,6 +605,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // two executions leave in the same state whichever order they land in.
     'posting-refusal.provisional': {
       name: 'reconcileProvisionalPostingRefusal',
+      destination: 'internal',
       schema: AccountingPostingRefusalProvisionalPayloadSchema,
       effects: ONE_EFFECT,
       replay: 'local-only-guarded',
@@ -600,6 +627,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // for a pause to fall into.
     'refund.reservation-release': {
       name: 'processRefundReservationRelease',
+      destination: 'internal',
       schema: SalesRefundReservationReleaseOutboxPayloadSchema,
       effects: ONE_EFFECT,
       replay: 'local-only-guarded',
@@ -615,6 +643,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // not an assignment, so a late arrival has no older value to impose.
     'refund.unmatched-warning': {
       name: 'processRefundUnmatchedWarning',
+      destination: 'internal',
       schema: SalesRefundUnmatchedWarningOutboxPayloadSchema,
       effects: ONE_EFFECT,
       replay: 'local-only-guarded',
@@ -757,4 +786,29 @@ export function parseIntegrationOutboxPayload<T = unknown>(input: {
     : `Integration outbox payload for ${input.connector}/${input.operation}`
   const details = parsed.error.issues.map((issue) => `${issue.path.join('.') || 'payload'}: ${issue.message}`).join('; ')
   throw new Error(`${label} is invalid: ${details}`)
+}
+
+/**
+ * The destinations whose outbox operations are decided by `enqueueIntegrationOutbox` itself. Xero is not here: its seam is the
+ * sync-log row that precedes the outbox row. Mintsoft has no outbox operation that writes to it today; it is listed so that the
+ * first one registered is governed from its first line.
+ */
+export const PRODUCER_SEAMED_OUTBOX_DESTINATIONS = ['woocommerce', 'mintsoft'] as const
+export type ProducerSeamedOutboxDestination = (typeof PRODUCER_SEAMED_OUTBOX_DESTINATIONS)[number]
+
+/**
+ * The connectors every one of whose registered operations is NOT decided by the enqueue primitive. A call with one of these as a
+ * literal `connector` is typed as always producing a row. Anything else (a woocommerce or mintsoft connector, or a connector that is
+ * not a literal) is typed as possibly shadowed, so the compiler makes the caller handle it.
+ */
+export type OutboxConnectorWithoutShadow = 'xero' | 'accounting' | 'sales'
+
+/**
+ * Where the effect of `connector/operation` lands. An operation this build does not know, on a connector that is a vendor, is
+ * governed as that vendor: an unregistered job must never be a way round the seam.
+ */
+export function outboxDestinationOf(connector: string, operation: string): OutboxDestination {
+  const entry = getOutboxRegistryEntry(connector, operation)
+  if (entry) return entry.destination
+  return connector === 'woocommerce' || connector === 'mintsoft' || connector === 'xero' ? connector : 'internal'
 }

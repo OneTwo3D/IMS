@@ -487,7 +487,11 @@ const MAP_FILE = 'lib/security/writer-ownership-map.ts'
  * Syntactic, like the rest of the census: it proves the consultation and the shadow read are THERE and ORDERED, not that
  * they dominate every path. Its blind spots are the census's own (helpers, aliases through objects).
  */
-export const SEAM_CONSULTATIONS = ['xeroProducerSeamVerdict', 'xeroTaxRateWriteShadow', 'producerSeamVerdict'] as const
+export const SEAM_CONSULTATIONS = [
+  'xeroProducerSeamVerdict', 'xeroTaxRateWriteShadow', 'producerSeamVerdict',
+  // WooCommerce: the producer seam, the destination-level drain gate, and the three operator-action seams (lib/connectors/woocommerce).
+  'wooProducerSeam', 'wooDrainHold', 'wooWebhookRegistrationShadow', 'wooFxRatePushShadow', 'wooFxHelperProbeShadow',
+] as const
 export const SYNC_ROW_PRIMITIVE = 'createAccountingSyncLogRow'
 export const SYNC_ROW_PRIMITIVE_FILE = 'lib/domain/accounting/sync-log-row.ts'
 export const SHADOW_RESULT_FIELD = 'shadowed'
