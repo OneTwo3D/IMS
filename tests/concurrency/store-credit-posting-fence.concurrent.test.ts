@@ -147,7 +147,8 @@ async function insertClaim(db: Db, c: ReturnType<ClaimArm['claim']>, over: { sta
       type: c.type as never, referenceType: c.referenceType, referenceId: c.referenceId,
       payload: (c.payload ?? {}) as never,
       status: over.status ?? 'PROCESSING',
-      processingStartedAt: (over.status ?? 'PROCESSING') === 'PROCESSING' ? new Date(Date.now() - (over.startedMinutesAgo ?? 0) * 60_000) : null,
+      // A SETTLED row keeps a fresh stamp here on purpose: only its status distinguishes it from a live claim (isolating arm).
+      processingStartedAt: new Date(Date.now() - (over.startedMinutesAgo ?? 0) * 60_000),
     },
   })
 }
