@@ -7,6 +7,7 @@ import {
   findSalesOrderDeleteBlocker,
 } from '@/lib/domain/sales/order-delete-guard'
 import { ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { shadowEvidenceFake, type FakeShadowRecord } from './helpers/shadow-evidence-fake'
 import { ROUND_2_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from './helpers/unconditional-instruction'
 import {
   matchesWhere as matches,
@@ -80,8 +81,11 @@ function makeTx(seed: {
    * the test would have passed unchanged.
    */
   shoppingSyncLogs?: ShoppingSyncLogRow[]
+  /** Durable shadow records (outbound_shadow_writes) that outlive the sync row. Default none. */
+  shadows?: FakeShadowRecord[]
 }) {
   return {
+    $queryRaw: shadowEvidenceFake(seed.shadows ?? []).queryRaw,
     wmsOrderStatusSnapshot: { findUnique: async () => seed.wmsSnapshot ?? null },
     shoppingSyncLog: shoppingSyncLogFake(seed.shoppingSyncLogs ?? []),
     salesOrder: {
@@ -1561,6 +1565,12 @@ const STANDING_CASES: StandingCase[] = [
     row: { status: 'SYNCED', externalTransactionId: 'INV-N', settlementBasis: 'SOMETHING_NEWER' }, blocks: true, says: /UNPROVEN/, neverSays: /is already POSTED as/,
   },
   {
+    // THE PRODUCER-SIDE HOLD'S SHADOW: IMS did not send it, the operation's real owner may have. It blocks, and says it is unproven.
+    name: 'SHADOW_NOT_SENT_BY_IMS (a shadow: CANCELLED + HELD_SHADOW, no id)', standing: 'SHADOW_NOT_SENT_BY_IMS',
+    row: { status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true }, blocks: true,
+    says: /recorded as a SHADOW instead of sending[\s\S]*says nothing about whether the document exists[\s\S]*UNPROVEN/, neverSays: NOT_A_FACT,
+  },
+  {
     name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK',
     row: { status: 'PENDING' }, blocks: true, says: /queued to xero/,
   },
@@ -1590,7 +1600,7 @@ test('[o3d-1e7sl G1] the document query: one case per standing, the standing ass
   assert.ok(blocking > 0 && free > 0, 'the decision splits both ways, so the agreement is not vacuous')
   assert.deepEqual(
     [...new Set(STANDING_CASES.map((c) => c.standing))].sort(),
-    ['ASSERTED_NOT_POSTED', 'ASSERTED_POSTED', 'CONFIRMED_POSTED', 'LIVE_WORK', 'PROVEN_NOT_POSTED', 'UNKNOWN'],
+    ['ASSERTED_NOT_POSTED', 'ASSERTED_POSTED', 'CONFIRMED_POSTED', 'LIVE_WORK', 'PROVEN_NOT_POSTED', 'SHADOW_NOT_SENT_BY_IMS', 'UNKNOWN'],
     'every standing is exercised',
   )
 })
@@ -1613,7 +1623,7 @@ test('[o3d-1e7sl G1] the daily-batch query: the same standings decide the same w
     blocking += 1
     assert.equal(blocker!.code, 'daily_batch_staged', c.name)
     // A batch row that is neither confirmed nor queued is an unproven claim and must say so.
-    if (c.standing === 'ASSERTED_NOT_POSTED' || (c.standing === 'UNKNOWN' && c.row.status === 'CANCELLED')) {
+    if (c.standing === 'ASSERTED_NOT_POSTED' || c.standing === 'SHADOW_NOT_SENT_BY_IMS' || (c.standing === 'UNKNOWN' && c.row.status === 'CANCELLED')) {
       assert.match(blocker!.message, /UNPROVEN/, c.name)
     }
     assert.doesNotMatch(blocker!.message, NOT_A_FACT, c.name)
@@ -1740,4 +1750,46 @@ test('[o3d-1e7sl Codex r3] no rendering for a non-CONFIRMED standing has an unco
   console.log(`# r3 universal: ${rendered} renderings, ${confirmed} confirmed`)
   assert.equal(confirmed, 2)
   assert.ok(rendered >= 16)
+})
+
+// ---------------------------------------------------------------------------
+// THE DURABLE SHADOW RECORD AT THE DELETE GUARD. Retention deletes the CANCELLED / HELD_SHADOW sync row (a shadow holds no ledger
+// claim) but outbound_shadow_writes persists, and a shadow is not proof the document is absent: the writer that owns the operation
+// in this phase may have posted it. With the sync row gone the record is the only evidence left. Named mutation
+// `ignore-durable-shadow`: the guard stops asking the shadow store; the "sync row gone, shadow remains" arms go red.
+// ---------------------------------------------------------------------------
+test('[durable shadow] the sync row is GONE but the shadow record remains => the order delete is BLOCKED, with an UNPROVEN, conditional sentence', async () => {
+  const shadow = { destination: 'xero', operation: 'sales.invoice', subject_type: 'SalesOrder', subject_id: 'order-1' }
+  const tx = makeTx({ syncLogs: [], shadows: [shadow] })
+  console.log('# precondition: sync rows = 0, shadow records = 1')
+  const blocker = await findSalesOrderDeleteBlocker(tx, 'order-1', STAMPS)
+  assert.equal(blocker?.code, 'accounting_shadow_recorded')
+  assert.match(blocker!.message, /UNPROVEN/)
+  assert.match(blocker!.message, /If it exists there/)
+  assert.deepEqual(unconditionalMoneySentences(blocker!.message), [], 'no unconditional reverse/credit instruction on an unproven standing')
+  // ISOLATING: the same order, no shadow record, no sync row: deletable.
+  assert.equal(await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [], shadows: [] }), 'order-1', STAMPS), null)
+  // Scoping: another order's shadow, another destination's shadow do not block.
+  assert.equal(await findSalesOrderDeleteBlocker(makeTx({ shadows: [{ ...shadow, subject_id: 'order-2' }] }), 'order-1', STAMPS), null)
+  assert.equal(await findSalesOrderDeleteBlocker(makeTx({ shadows: [{ ...shadow, destination: 'woocommerce' }] }), 'order-1', STAMPS), null)
+})
+
+test('[durable shadow] a retained shadow sync row and its record are ONE blocker (no second, redundant sentence)', async () => {
+  const shadow = { destination: 'xero', operation: 'sales.invoice', subject_type: 'SalesOrder', subject_id: 'order-1' }
+  const row = syncLog({ status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', abandonedBeforeRemoteCall: true })
+  assert.equal(ledgerStanding({ ...row, externalTransactionId: row.externalTransactionId ?? null, settlementBasis: row.settlementBasis ?? null, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null }), 'SHADOW_NOT_SENT_BY_IMS', 'PRECONDITION: the retained row reads as a shadow')
+  const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row], shadows: [shadow] }), 'order-1', STAMPS)
+  assert.equal(blocker?.code, 'accounting_sync_live')
+})
+
+test('[durable shadow] a shipment-keyed and a batch-keyed shadow record also block, the batch one by its staged reference', async () => {
+  const shipmentShadow = { destination: 'xero', operation: 'inventory.journals', subject_type: 'Shipment', subject_id: 'ship-9' }
+  const blockerShip = await findSalesOrderDeleteBlocker(makeTx({ shipments: ['ship-9'], shadows: [shipmentShadow] }), 'order-1', STAMPS)
+  assert.equal(blockerShip?.code, 'accounting_shadow_recorded')
+  const batchShadow = { destination: 'xero', operation: 'inventory.journals', subject_type: 'DailyBatch', subject_id: 'A2-2026-07-20-1a2b3c4d' }
+  const stamps = { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT, inventoryAllocatedBatchRef: 'A2-2026-07-20-1a2b3c4d' }
+  const blockerBatch = await findSalesOrderDeleteBlocker(makeTx({ shadows: [batchShadow] }), 'order-1', stamps)
+  assert.equal(blockerBatch?.code, 'accounting_shadow_recorded')
+  assert.match(blockerBatch!.message, /A2 inventory allocation/)
+  assert.equal(await findSalesOrderDeleteBlocker(makeTx({ shadows: [{ ...batchShadow, subject_id: 'A2-2026-07-19-ffff0000' }] }), 'order-1', stamps), null, 'ISOLATING: another day\'s batch shadow does not block')
 })

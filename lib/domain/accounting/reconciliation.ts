@@ -13,7 +13,7 @@ import {
 // `undefined`. A `text[]` parameter that silently became `undefined` would widen this query to every
 // sync type rather than fail.
 import { MIRRORED_ACCOUNTING_SYNC_TYPES } from './mirrored-sync-types'
-import { mirroredPostStanding, workSlotStanding } from './ledger-standing'
+import { SHADOWED_OBLIGATION_WHERE, isShadowedObligation, mirroredPostStanding, workSlotStanding } from './ledger-standing'
 
 /**
  * o3d-11rf r3 — the sync-row statuses that CONTRADICT a VOID mirror, i.e. work still owed.
@@ -830,6 +830,16 @@ function syncLogHasLiveEvidence(
       log.referenceType !== params.referenceType ||
       log.referenceId !== params.referenceId
     ) return false
+    // THE PRODUCER-SIDE HOLD: a shadow IMS recorded instead of queuing this posting is the record that the obligation was
+    // seen and deliberately not produced, because another writer owns the operation in the current phase. It is neither
+    // missing (nothing is owed to IMS's queue, so no "no evidence" finding and nothing to re-enqueue) nor posted (it is
+    // not a ledger fact and counts for no amount). Asked of the ledger-standing module, not re-derived from the basis.
+    if (isShadowedObligation({
+      status: log.status,
+      externalTransactionId: log.externalTransactionId,
+      settlementBasis: log.settlementBasis,
+      abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
+    })) return true
     // o3d-1e7sl (D6): ASKED OF THE LEDGER-STANDING MODULE. A row is evidence when it holds the work slot (PENDING /
     // PROCESSING / SYNCED) AND the claim is not an operator's: `asserted` is true exactly when the occupant's
     // standing rests on a typed id. The two halves used to be a hand-written status set beside a basis test.
@@ -2083,6 +2093,9 @@ export async function collectAccountingReconciliationRows(
         OR: [
           { status: { in: [...SYNC_LOG_WORK_OWED_STATUSES] } },
           { status: { in: [...SYNC_LOG_WINDOWED_STATUSES] }, createdAt: { gte: fromDate } },
+          // The shadows the producer-side hold recorded, inside the lookback: read so a shadowed document is not reported as
+          // missing (see syncLogHasLiveEvidence). The unmirrored-row question above does not take them: a shadow has no event.
+          { AND: [SHADOWED_OBLIGATION_WHERE, { createdAt: { gte: fromDate } }] },
         ],
       },
       orderBy: { createdAt: 'desc' },

@@ -521,3 +521,64 @@ test('[round 5] a CREATE is untouched — the refusal is about reviving a row, n
   assert.equal(store.rows[0].status, 'PENDING')
   assert.deepEqual(activity.filter((entry) => entry.action === 'xero_followup_enqueue_refused'), [])
 })
+
+// ---------------------------------------------------------------------------
+// THE PRODUCER-SIDE HOLD AT THE REVIVAL. A revival turns a FAILED row PENDING and schedules an outbox job, i.e. makes
+// claimable Xero work. With the hold enforced and nothing granted that must not happen: the FAILED row stays as it was,
+// nothing is scheduled, and the follow-up is recorded as a CANCELLED / HELD_SHADOW row. Switch off, or granted, the revival is
+// exactly what it was. Named mutation: `revival-ignores-hold` (the revival no longer asks the seam) turns the held arm red.
+// ---------------------------------------------------------------------------
+const HOLD_ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM']
+const HOLD_TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
+
+async function reviveUnder(env: Record<string, string>) {
+  const saved = HOLD_ENV_KEYS.map((key) => [key, process.env[key]] as const)
+  for (const key of HOLD_ENV_KEYS) delete process.env[key]
+  Object.assign(process.env, env)
+  const log = console.error
+  console.error = () => undefined
+  try {
+    reset([failedPaymentRow({ payload: { [FOLLOW_UP_IDEMPOTENCY_KEY]: PINNED_TOKEN, accountingInvoiceId: 'inv-9', amount: 120, paymentDate: '2026-07-20' } })])
+    const outcome = await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST, paymentDate: '2026-07-20' }, POSTED_ROW_ORIGIN)
+    return {
+      outcome,
+      original: store.get('log-pay'),
+      rows: store.rows.map((row) => ({ id: row.id, status: row.status, basis: (row as Record<string, unknown>).settlementBasis })),
+      scheduled: scheduled.length,
+    }
+  } finally {
+    console.error = log
+    for (const [key, value] of saved) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
+  }
+}
+
+test('THE HOLD AT THE REVIVAL: switch OFF revives the FAILED follow-up (PENDING, one outbox job) - the precondition for the arms below', async () => {
+  const off = await reviveUnder({})
+  console.log(`# revival hold, OFF: original=${off.original?.status}/rev ${off.original?.attemptRevision} rows=${off.rows.length} scheduled=${off.scheduled}`)
+  assert.equal(off.original?.status, 'PENDING')
+  assert.equal(off.original?.attemptRevision, 5)
+  assert.equal(off.scheduled, 1)
+  assert.equal(off.rows.length, 1)
+})
+
+test('THE HOLD AT THE REVIVAL: enforced and nothing granted - the FAILED row is NOT revived, nothing is scheduled, the shadow is recorded and no row is claimable', async () => {
+  const held = await reviveUnder({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' })
+  console.log(`# revival hold, ON/ungranted: original=${held.original?.status}/rev ${held.original?.attemptRevision} rows=${JSON.stringify(held.rows)} scheduled=${held.scheduled} outcome=${JSON.stringify((held.outcome as { enqueued?: boolean }).enqueued)}`)
+  assert.equal(held.original?.status, 'FAILED', 'the FAILED row is left exactly as it was')
+  assert.equal(held.original?.attemptRevision, 4)
+  assert.equal(held.scheduled, 0, 'no outbox job')
+  assert.deepEqual(held.rows.filter((row) => row.status === 'PENDING' || row.status === 'PROCESSING'), [], 'no claimable row exists')
+  const shadows = held.rows.filter((row) => row.basis === 'HELD_SHADOW')
+  assert.equal(shadows.length, 1, 'PRECONDITION: the shadow row recording the held follow-up exists')
+  assert.equal(shadows[0]!.status, 'CANCELLED')
+  assert.equal((held.outcome as { enqueued?: boolean }).enqueued, true, 'the hold is a recorded decision, as for a held create')
+})
+
+test('THE HOLD AT THE REVIVAL: enforced, granted and dated after the cut-off - LIVE, revived exactly as with the switch off', async () => {
+  const live = await reviveUnder({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: HOLD_TENANT, XERO_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z' })
+  console.log(`# revival hold, ON/granted: original=${live.original?.status}/rev ${live.original?.attemptRevision} rows=${live.rows.length} scheduled=${live.scheduled}`)
+  assert.equal(live.original?.status, 'PENDING')
+  assert.equal(live.original?.attemptRevision, 5)
+  assert.equal(live.scheduled, 1)
+  assert.equal(live.rows.length, 1)
+})
