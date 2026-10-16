@@ -388,6 +388,32 @@ test('[o3d-llyw] operator ledger check on a real database', { skip: !RUN && 'set
     assert.ok(fetches > 0, `the probe was really asked (${fetches} fetches this run)`)
   })
 
+  await t.test('7b. a posted DEPOSIT of a live different receipt beside an unresolved legacy attempt does not stop the balance\'s check being recorded, and the balance then registers', async () => {
+    const { settlementMarkerFor } = await import('../../lib/domain/accounting/ledger-settlement-evidence.ts')
+    const { effectiveTokenFor } = await import('../../lib/domain/accounting/followup-retry-guard.ts')
+    const o = await seedOrder(d, 'deposit-beside-unresolved')
+    orders.push(o.orderId)
+    const deposit = await addReceipt(d, o.orderId, 40)
+    const depPayload = { accountingInvoiceId: o.invoiceId, bankAccountId: BANK, amount: 40, amountDecimal: '40', currency: 'GBP', paymentDate: '2026-08-02', paymentId: deposit }
+    const depRow = await d.db.accountingSyncLog.create({
+      data: { connector: 'xero', type: 'INVOICE_PAYMENT', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: o.orderId,
+        externalTransactionId: `PAY-DEP-${o.orderId}`, remoteAttemptedAt: new Date('2026-08-02T09:00:00Z'), payload: depPayload },
+      select: { id: true },
+    })
+    ledger.set(o.invoiceId, [
+      ...(ledger.get(o.invoiceId) ?? []),
+      { PaymentID: `PAY-DEP-${o.orderId}`, Date: '2026-08-02', Amount: 40, Reference: settlementMarkerFor(effectiveTokenFor('xero', { id: depRow.id, payload: depPayload })) },
+    ])
+    const balance = await addReceipt(d, o.orderId, 60)
+    await register(d, o.orderId, balance, 60)
+    assert.equal(await queuedFor(d, o.orderId, balance), false, 'precondition: the balance is held by the unreadable record')
+    const recorded = await recordShown(d, { syncLogId: o.failedId, paymentId: balance, recordIds: [o.unreadableId], userId })
+    console.log(`[precondition] recorder beside a posted deposit: ${JSON.stringify(recorded).slice(0, 160)}`)
+    assert.equal(recorded.ok, true, 'the deposit is a different receipt, so it does not block the check')
+    await register(d, o.orderId, balance, 60)
+    assert.equal(await queuedFor(d, o.orderId, balance), true, 'and the balance registers')
+  })
+
   await t.test('7. the HEADLINE shape (the unreadable payment is a SYNCED sibling\'s own) is refused with the reason, at the recorder and at registration', async () => {
     const o = await seedOrder(d, 'headline', { withPostedSibling: true })
     orders.push(o.orderId)

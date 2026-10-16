@@ -18,7 +18,7 @@
  * Network I/O (the probe) and database I/O are injected so the whole flow is testable without Xero.
  */
 
-import { NO_LIVE_RECEIPTS } from './payment-identity'
+import { loadLiveReceipts } from './payment-identity'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import type { SettlementProbeTarget } from '@/lib/connectors/accounting-settlement-probe'
@@ -105,7 +105,7 @@ export type LedgerCheckPreview = {
 async function assessAttempt(
   syncLogId: string,
   deps: Pick<OperatorLedgerCheckDeps, 'client' | 'probe'>,
-): Promise<LedgerCheckRefusal | Omit<LedgerCheckPreview, 'receipts'>> {
+): Promise<LedgerCheckRefusal | (Omit<LedgerCheckPreview, 'receipts'> & { rows: Awaited<ReturnType<typeof loadInvoicePaymentSyncRows>> })> {
   const row = await deps.client.accountingSyncLog.findUnique({
     where: { id: syncLogId },
     select: { id: true, connector: true, type: true, referenceType: true, referenceId: true },
@@ -186,18 +186,11 @@ async function assessAttempt(
   if (!judged.remedy.liftable) {
     return { ok: false, code: 'NOT_LIFTABLE', error: `${describeLedgerCheckRemedy(judged.remedy, attemptLabel)} Nothing was recorded.` }
   }
-  // The registration decision would not grant a lift here anyway (see `postedRegistrationsOnDocument`):
-  // a registration on this invoice has posted, and the post fence refuses a payment beside it. Asked of
-  // EVERY posted row (no receipt is chosen yet, so no row can be shown to be a different payment: an EMPTY
-  // receipt set), which can only refuse more, never less than the decision will.
-  const posted = postedRegistrationsOnDocument(rows, '', order.accountingInvoiceId, { orderId: order.id, liveReceipts: NO_LIVE_RECEIPTS })
-  if (posted.length > 0) {
-    return {
-      ok: false,
-      code: 'NOT_LIFTABLE',
-      error: `${describeLedgerCheckBlockedByPostedRegistration(posted.map((r) => r.id ?? '(unidentified entry)'))} Nothing was recorded.`,
-    }
-  }
+  // THE POSTED-REGISTRATION GATE IS NOT ASKED HERE. It is a question about a RECEIPT (is the posted payment a
+  // different one from the receipt this check is for?), and no receipt is chosen at preview. Asking it with
+  // an empty receipt set refused whenever ANY payment had posted, which stranded a balance beside a posted
+  // deposit. It is asked at RECORD time against the chosen receipt, by the same partition the registration
+  // decision uses (`recordOperatorLedgerCheck`).
   const records = probe.records
     .filter(isUnmeasurableSettlementRecord)
     .map((record) => ({
@@ -216,6 +209,7 @@ async function assessAttempt(
     attemptLabel,
     records,
     binding: judged.remedy.binding,
+    rows,
   }
 }
 
@@ -231,8 +225,10 @@ export async function previewOperatorLedgerCheck(
     select: { id: true, amount: true, currency: true, paidAt: true, method: true },
     orderBy: { paidAt: 'asc' },
   })
+  const { rows: _rows, ...shown } = assessed
+  void _rows
   return {
-    ...assessed,
+    ...shown,
     receipts: receipts
       .filter((receipt) => receipt.amount.gt(0))
       .map((receipt) => ({
@@ -307,6 +303,19 @@ export async function recordOperatorLedgerCheck(
       ok: false,
       code: 'RECEIPT_INVALID',
       error: 'That receipt is not a customer receipt on this entry\'s sales order. Nothing was recorded.',
+    }
+  }
+  // The registration decision would not grant a lift if a registration that MAY BE THIS RECEIPT's payment has
+  // posted on the invoice: the post fence refuses a payment beside it. A posted payment of a PROVEN-DIFFERENT
+  // live receipt (the deposit before this balance) is not that, so it does not stop the check - the same
+  // partition and the same live-receipt read as `decideInvoicePaymentRegistration`.
+  const liveReceipts = await loadLiveReceipts(deps.client, assessed.orderId)
+  const posted = postedRegistrationsOnDocument(assessed.rows, receipt.id, assessed.ledgerDocumentId, { orderId: assessed.orderId, liveReceipts })
+  if (posted.length > 0) {
+    return {
+      ok: false,
+      code: 'NOT_LIFTABLE',
+      error: `${describeLedgerCheckBlockedByPostedRegistration(posted.map((r) => r.id ?? '(unidentified entry)'))} Nothing was recorded.`,
     }
   }
   // EXACTLY the set the ledger shows now — not a subset (a check of some records lifts nothing and
