@@ -1876,6 +1876,11 @@ model SalesOrder {
   /// NULL on rows written before this column existed. The migration backfills the population it can
   /// prove — shopping-linked, paid, no local receipt — and leaves the rest honest.
   unregisteredPaidAt DateTime? @map("unregistered_paid_at")
+  /// When the order became CANCELLED, minted by the DATABASE clock (trigger
+  /// `sales_order_stamp_cancelled_at_trigger`) so it can be compared with a receipt's time. NULL = not known
+  /// (an order cancelled before this column existed, or never cancelled); readers treat unknown as "not
+  /// provably before the payment". Cleared if a bypass moves the order out of CANCELLED.
+  cancelledAt       DateTime?  @map("cancelled_at")
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)
   paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
   paymentMethodTitle String?   // e.g. "Credit card", "PayPal"

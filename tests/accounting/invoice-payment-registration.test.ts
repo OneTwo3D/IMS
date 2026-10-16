@@ -94,6 +94,7 @@ const answered = (records: LedgerSettlementRecord[]): LedgerSettlementProbe =>
 const base = {
   orderId: 'so-1',
   liveReceipts: NO_LIVE_RECEIPTS,
+  cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
   syncEnabled: true,
   accountingInvoiceId: 'INV-1',
   orderCurrency: 'GBP',

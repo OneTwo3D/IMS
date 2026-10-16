@@ -544,6 +544,10 @@ export type SideEffects = {
   stockSyncJobs: number
   integrationOutbox: number
   emailOutbox: number
+  /** Imported orders WooCommerce says are paid, the local receipts the import wrote for them, and the paid orders with none. */
+  paidOrders: number
+  receiptsCreated: number
+  paidOrdersWithoutReceipt: number
 }
 
 export type WooImportReport = {
@@ -716,6 +720,8 @@ export function renderWooImportMarkdown(report: WooImportReport): string {
     lines.push('')
     lines.push(`Customers created: ${e.customersCreated} (links to WooCommerce customers: ${e.customerLinksCreated}); orders with no customer: ${e.ordersWithoutCustomer}. Lines linked to a product by SKU: ${e.linesLinkedToProduct}; lines with no product: ${e.linesWithoutProduct}. Orders that used the default tax rate because WooCommerce's rate id was not mapped: ${e.ordersWithTaxRateFallback}.`)
     lines.push(`Queued for connectors, never sent (the outbound-write hold refuses the send): accounting queue ${JSON.stringify(e.accountingQueue)}; stock-sync jobs ${e.stockSyncJobs}; integration outbox ${e.integrationOutbox}; email outbox ${e.emailOutbox}.`)
+    lines.push(`Receipts: ${e.paidOrders} paid order(s), ${e.receiptsCreated} local receipt(s) written, ${e.paidOrdersWithoutReceipt} paid order(s) with none.`)
+    lines.push(`Receipts: ${e.paidOrders} paid order(s), ${e.receiptsCreated} local receipt(s) written, ${e.paidOrdersWithoutReceipt} paid order(s) with none.`)
     lines.push('')
   }
   lines.push('## Stamp')

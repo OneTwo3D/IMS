@@ -182,6 +182,10 @@ test('GREEN: every step passes; counts are exact; the stamp appears only on the 
   // What the import left behind.
   assert.equal(report.sideEffects!.linesWithoutProduct, 3)
   assert.equal(report.sideEffects!.emailOutbox, 0)
+  // A paid WooCommerce order is imported WITH its receipt (a local Payment row), so it has a payment identity.
+  assert.ok(report.sideEffects!.paidOrders > 0, 'the fixtures contain paid orders, or this asserts nothing')
+  assert.equal(report.sideEffects!.paidOrdersWithoutReceipt, 0)
+  assert.equal(report.sideEffects!.receiptsCreated, report.sideEffects!.paidOrders)
   assert.ok(report.sideEffects!.customersCreated > 40)
 
   // Report files: a verified pair, and no secret in either.

@@ -7534,6 +7534,12 @@ async function decideInvoicePaymentFollowUp(
         )
       }
 
+      // WHICH LOCAL RECEIPT THIS IS. An imported paid order now has a Payment row (the importer creates it),
+      // and its id travels here so the registration has an IDENTITY - the same one a deposit and a balance
+      // entered by hand carry (payment-identity.ts). Without it the registration reads as "possibly any
+      // payment" and blocks every later receipt on the order. Absent (a payload from before, or a payment
+      // flag with no receipt behind it) stays absent: unknown identity is never invented.
+      const receiptId = typeof payload._paymentId === 'string' && payload._paymentId !== '' ? payload._paymentId : undefined
       return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
         accountingInvoiceId: postedInvoiceId,
         bankAccountId: stored,
@@ -7541,6 +7547,7 @@ async function decideInvoicePaymentFollowUp(
         paymentDate,
         currency,
         method,
+        ...(receiptId ? { paymentId: receiptId } : {}),
         sourceEntryId: entryId,
       }, { from: 'postedRow', record: origin })
     },

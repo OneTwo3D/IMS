@@ -115,6 +115,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 
 import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { loadLiveReceipts, partitionByPaymentIdentity, type LiveReceipts } from '@/lib/domain/accounting/payment-identity'
+import { paymentTimingAgainstCancellation } from '@/lib/domain/accounting/payment-cancellation-timing'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
@@ -222,6 +223,13 @@ export type InvoicePaymentPostRefusal =
   | 'SETTLED_ON_RETIRED_DOCUMENT'
   /** This payment does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
+  /**
+   * The receipt behind this entry is dated AFTER its order was cancelled (payment-cancellation-timing.ts).
+   * The registration decision already refuses to queue it; this is the same rule at the one gate no enqueue
+   * path can skip, for rows queued some other way (an import, a row queued before the cancellation instant
+   * existed). Xero refuses a payment on a void invoice, and the overpayment path is not built.
+   */
+  | 'PAID_AFTER_CANCELLATION'
 
 export type InvoicePaymentPostVerdict =
   | { post: true; alreadyPosted: Decimal; ledgerTotal: Decimal }
@@ -513,6 +521,8 @@ export async function guardInvoicePaymentCapacity(
     taxForeign: Prisma.Decimal
     pricesIncludeVat: boolean
     shoppingLinks: { connector: string }[]
+    status: string
+    cancelledAt: Date | null
   } | null
   let registrations: {
     id: string
@@ -538,6 +548,8 @@ export async function guardInvoicePaymentCapacity(
           taxForeign: true,
           pricesIncludeVat: true,
           shoppingLinks: { select: { connector: true }, take: 1 },
+          status: true,
+          cancelledAt: true,
         },
       }),
       client.accountingSyncLog.findMany({
@@ -601,6 +613,40 @@ export async function guardInvoicePaymentCapacity(
       message:
         `Sales order ${params.referenceId} has no readable invoice total, so IMS cannot tell whether `
         + `this payment would over-settle the invoice.`,
+    }
+  }
+
+  // PAID AFTER THE ORDER WAS CANCELLED (payment-cancellation-timing.ts). Only a CANCELLED order can answer
+  // otherwise, so an active order pays nothing for this read. The receipt's time is read from the Payment row
+  // the payload names; an entry that names none, or whose receipt is gone, has no payment time and takes the
+  // ordinary path (unknown reads as "not provably after").
+  if (order.status === 'CANCELLED') {
+    const receiptId = payloadString(params.payload, 'paymentId')
+    let paidAt: Date | null = null
+    if (receiptId) {
+      try {
+        paidAt = (await client.payment.findUnique({ where: { id: receiptId }, select: { paidAt: true } }))?.paidAt ?? null
+      } catch (error) {
+        return {
+          post: false,
+          kind: 'unmeasurable',
+          message: `Could not read the receipt behind sync entry ${params.entryId} to tell whether it was paid after the order was cancelled: ${String(error)}`,
+        }
+      }
+    }
+    if (paymentTimingAgainstCancellation({ orderStatus: order.status, cancelledAt: order.cancelledAt, paidAt }) === 'AFTER_CANCELLATION') {
+      return {
+        post: false,
+        kind: 'refused',
+        refusal: 'PAID_AFTER_CANCELLATION',
+        message: `Refused to register a payment against invoice ${params.accountingInvoiceId}: the receipt is dated after the order `
+          + 'was cancelled, so the invoice is void or credited and the accounting connector would refuse a payment against it. '
+          + 'Money received for a cancelled order is booked there as an overpayment, which IMS does not create yet. Nothing was sent. '
+          + 'Record it in the accounting system by hand, as an overpayment on the customer.',
+        alreadyPosted: null,
+        ledgerTotal,
+        ambiguousIds: [],
+      }
     }
   }
 
@@ -700,6 +746,9 @@ export async function guardInvoicePaymentCapacity(
           + `money. Nothing was sent. Open this invoice in the ledger: if the failed payment is not `
           + `there, resolve that sync entry and record the receipt again; if it IS there, the invoice `
           + `is already settled by it and no further payment should be registered.`)
+      case 'PAID_AFTER_CANCELLATION':
+        // Raised above, before the verdict; listed so this switch stays exhaustive over the refusal union.
+        return withLedgerCheck(head + 'the receipt is dated after the order was cancelled. Nothing was sent.')
       case 'WOULD_OVERPAY':
         return withLedgerCheck(head
           + `the ledger's copy of this invoice is for ${verdict.ledgerTotal.toFixed()} with `

@@ -89,6 +89,7 @@ function row(over: Partial<ExistingInvoicePaymentSync> & { status: ExistingInvoi
 }
 
 const regBase = {
+  cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
   orderId: ORDER,
   liveReceipts: LIVE,
   syncEnabled: true,
@@ -270,4 +271,70 @@ test('agreement: whatever the registration decision lets through, the post fence
   console.log(verdicts.join('\n'))
   assert.ok(verdicts.some((v) => v.includes('register=true proceed=true')), 'the table must contain a scenario that passes both gates, or the implication is vacuous')
   assert.ok(verdicts.some((v) => v.includes('register=false')), 'and one that refuses, so the table is not all-pass')
+})
+
+// ------------------------------------------------------------------------------------------- cancelled-order timing
+
+import { paymentTimingAgainstCancellation } from '@/lib/domain/accounting/payment-cancellation-timing'
+
+test('timing: only a payment STRICTLY after a known cancellation instant is "after"; ties and unknowns take the credit-note path', () => {
+  const cancelledAt = new Date('2026-08-10T12:00:00.000Z')
+  const t = (orderStatus: string, c: Date | null, paidAt: Date | null) => paymentTimingAgainstCancellation({ orderStatus, cancelledAt: c, paidAt })
+  assert.equal(t('PROCESSING', null, new Date()), 'ACTIVE', 'an order that is not cancelled has nothing to compare')
+  assert.equal(t('CANCELLED', cancelledAt, new Date('2026-08-10T12:00:00.001Z')), 'AFTER_CANCELLATION')
+  assert.equal(t('CANCELLED', cancelledAt, new Date('2026-08-10T12:00:00.000Z')), 'CREDIT_NOTE_PATH', 'a tie')
+  assert.equal(t('CANCELLED', cancelledAt, new Date('2026-08-09T00:00:00.000Z')), 'CREDIT_NOTE_PATH', 'paid while active')
+  assert.equal(t('CANCELLED', null, new Date('2030-01-01')), 'CREDIT_NOTE_PATH', 'cancellation instant unknown')
+  assert.equal(t('CANCELLED', cancelledAt, null), 'CREDIT_NOTE_PATH', 'payment time unknown')
+  assert.equal(t('CANCELLED', cancelledAt, new Date('nope')), 'CREDIT_NOTE_PATH', 'an unreadable instant is unknown, not "after"')
+})
+
+test('registration: a receipt dated after the cancellation is held (PAID_AFTER_CANCELLATION); a tie, an unknown instant and an active order register', () => {
+  const cancelledAt = new Date('2026-08-10T12:00:00.000Z')
+  const run = (cancellation: { orderStatus: string; cancelledAt: Date | null; paidAt: Date | null }) =>
+    decideInvoicePaymentRegistration({ ...regBase, paymentAmount: toDecimal(100), cancellation })
+  const after = run({ orderStatus: 'CANCELLED', cancelledAt, paidAt: new Date('2026-08-11T00:00:00Z') })
+  assert.equal(after.register === false && after.refusal, 'PAID_AFTER_CANCELLATION')
+  for (const [label, c] of [
+    ['tie', { orderStatus: 'CANCELLED', cancelledAt, paidAt: cancelledAt }],
+    ['paid while active', { orderStatus: 'CANCELLED', cancelledAt, paidAt: new Date('2026-08-01T00:00:00Z') }],
+    ['cancellation unknown', { orderStatus: 'CANCELLED', cancelledAt: null, paidAt: new Date('2026-08-11T00:00:00Z') }],
+    ['active', { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: new Date('2026-08-11T00:00:00Z') }],
+  ] as const) {
+    assert.equal(run(c).register, true, label)
+  }
+})
+
+import { guardInvoicePaymentCapacity } from '@/lib/domain/accounting/invoice-payment-capacity'
+
+function guardClient(order: { status: string; cancelledAt: Date | null }, paidAt: Date | null) {
+  return {
+    salesOrder: {
+      findUnique: async () => ({
+        currency: 'GBP', totalForeign: toDecimal(100), taxForeign: toDecimal(0), pricesIncludeVat: false,
+        shoppingLinks: [], status: order.status, cancelledAt: order.cancelledAt,
+      }),
+    },
+    accountingSyncLog: { findMany: async () => [] },
+    payment: {
+      findMany: async () => [{ id: 'pay-bal', orderId: ORDER, refundId: null }],
+      findUnique: async () => (paidAt ? { paidAt } : null),
+    },
+  }
+}
+const guardParams = {
+  connector: 'xero', entryId: 'log-bal', referenceType: 'SalesOrder', referenceId: ORDER, accountingInvoiceId: 'INV-1', amount: 60,
+  payload: { accountingInvoiceId: 'INV-1', amount: 60, currency: 'GBP', paymentId: 'pay-bal' },
+}
+
+test('post-site guard: a receipt dated after the cancellation is refused where no enqueue path can skip it; the credit-note path posts', async () => {
+  const cancelledAt = new Date('2026-08-10T12:00:00.000Z')
+  const after = await guardInvoicePaymentCapacity(guardClient({ status: 'CANCELLED', cancelledAt }, new Date('2026-08-11T00:00:00Z')) as never, guardParams)
+  assert.equal(after.post === false && after.kind === 'refused' && after.refusal, 'PAID_AFTER_CANCELLATION')
+  const whileActive = await guardInvoicePaymentCapacity(guardClient({ status: 'CANCELLED', cancelledAt }, new Date('2026-08-09T00:00:00Z')) as never, guardParams)
+  assert.deepEqual(whileActive, { post: true })
+  const unknown = await guardInvoicePaymentCapacity(guardClient({ status: 'CANCELLED', cancelledAt: null }, new Date('2026-08-11T00:00:00Z')) as never, guardParams)
+  assert.deepEqual(unknown, { post: true })
+  const active = await guardInvoicePaymentCapacity(guardClient({ status: 'PROCESSING', cancelledAt: null }, new Date('2026-08-11T00:00:00Z')) as never, guardParams)
+  assert.deepEqual(active, { post: true })
 })

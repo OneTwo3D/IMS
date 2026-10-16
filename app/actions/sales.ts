@@ -3640,8 +3640,14 @@ export async function addPayment(input: {
         },
       })
       if (!so) return { error: 'Order not found' }
-      if (so.status === 'CANCELLED' || so.refundStatus === 'FULL') {
-        return { error: `Cannot add payments to ${so.refundStatus === 'FULL' ? 'fully refunded' : so.status.toLowerCase()} orders` }
+      // A CANCELLED order can still receive a receipt: money really does arrive for orders that were
+      // cancelled (a bank transfer in flight, a customer who paid late), and an operator must be able to
+      // record it. What happens to it afterwards is decided by WHEN it was paid against the database-minted
+      // cancellation instant (lib/domain/accounting/payment-cancellation-timing.ts) - the ledger
+      // registration refuses a receipt dated after the cancellation, visibly, until the overpayment path
+      // exists. A fully refunded order still takes no further receipts.
+      if (so.refundStatus === 'FULL') {
+        return { error: 'Cannot add payments to fully refunded orders' }
       }
       if (input.currency !== so.currency) {
         return { error: `Payment currency must match order currency (${so.currency})` }
@@ -3810,7 +3816,8 @@ export async function addPayment(input: {
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
 
-    if (txResult.becamePaid) {
+    // A cancelled order does not get an invoice number because a late receipt covered it.
+    if (txResult.becamePaid && txResult.so.status !== 'CANCELLED') {
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
       if (trigger?.value === 'on_paid') {
         await generateInvoiceNumber(input.orderId, { skipLog: true })

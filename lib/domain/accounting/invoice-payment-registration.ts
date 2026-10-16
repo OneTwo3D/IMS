@@ -34,6 +34,7 @@ import {
 } from './operator-ledger-check'
 import { LEDGER_HELD_REGISTRATION_STATUSES } from './payment-ledger-hold'
 import { partitionByPaymentIdentity, type LiveReceipts } from './payment-identity'
+import { paymentTimingAgainstCancellation, type PaymentTiming } from './payment-cancellation-timing'
 import {
   exactAmountReadingOrLegacy,
   statedAmountOnly,
@@ -112,6 +113,12 @@ export type InvoicePaymentRegistrationRefusal =
    * being re-scoped). Sending it would name an account the ledger does not hold.
    */
   | 'PAYMENT_ACCOUNT_NOT_IN_LEDGER'
+  /**
+   * The receipt is dated AFTER the order was cancelled (payment-cancellation-timing.ts). The invoice is
+   * void/credited and the money is real: in Xero that is an overpayment, not a payment against the invoice,
+   * and that path is not built. Held visibly instead of posted - Xero would refuse it.
+   */
+  | 'PAID_AFTER_CANCELLATION'
 
 export type InvoicePaymentRegistrationDecision =
   | {
@@ -447,6 +454,11 @@ export function decideInvoicePaymentRegistration(input: {
   liveReceipts: LiveReceipts
   /** The bank account mapped for this method/currency, or null when none is. */
   bankAccountId: string | null
+  /**
+   * Order status, the database-minted cancellation instant and the receipt's own time. REQUIRED, so no call
+   * site can skip the cancelled-order question (payment-cancellation-timing.ts).
+   */
+  cancellation: { orderStatus: string; cancelledAt: Date | null; paidAt: Date | null }
   /** Every INVOICE_PAYMENT sync row already on this order. */
   existing: ExistingInvoicePaymentSync[]
   /**
@@ -492,6 +504,14 @@ export function decideInvoicePaymentRegistration(input: {
   if (!input.accountingInvoiceId) return { register: false, refusal: 'DOCUMENT_NOT_POSTED' }
   if (input.orderCurrency !== input.paymentCurrency) return { register: false, refusal: 'CURRENCY_MISMATCH' }
   if (!input.bankAccountId) return { register: false, refusal: 'NO_BANK_ACCOUNT' }
+  const timing: PaymentTiming = paymentTimingAgainstCancellation(input.cancellation)
+  if (timing === 'AFTER_CANCELLATION') {
+    return {
+      register: false,
+      refusal: 'PAID_AFTER_CANCELLATION',
+      detail: `the receipt is dated ${input.cancellation.paidAt?.toISOString()} and the order was cancelled at ${input.cancellation.cancelledAt?.toISOString()}`,
+    }
+  }
 
   // CAPACITY, NOT OCCUPANCY (o3d-cjt8). This used to refuse whenever ANY live INVOICE_PAYMENT row
   // existed, because accounting_sync_logs_followup_live_unique permitted exactly one live row per ORDER

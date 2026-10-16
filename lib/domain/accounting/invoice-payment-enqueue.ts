@@ -922,6 +922,20 @@ export function describeInvoicePaymentRefusal(params: {
     // Nothing is expected to post at all, so there is nothing to report.
     case 'SYNC_DISABLED':
       return null
+    // The receipt is dated after the order was cancelled: the invoice is void or credited and the money is
+    // real, which Xero books as an OVERPAYMENT (a bank transaction), not as a payment against the invoice.
+    // That path is not built, so the receipt stands in IMS and the ledger is told nothing - visibly.
+    case 'PAID_AFTER_CANCELLATION':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but the receipt is dated after the order was `
+          + `cancelled (${refused.detail ?? 'no detail'}). The invoice is void or credited, so the accounting `
+          + `connector would refuse a payment against it: money received for a cancelled order is booked there as `
+          + `an overpayment, which IMS does not create yet. The payment was NOT registered. Record it in the `
+          + `accounting system by hand (as an overpayment on the customer) and refund it from there if it is `
+          + `owed back. ${remedy}`,
+        metadata: withLedger,
+      }
     // Not a settlement fault — a payment cannot attach to an invoice the ledger has never seen, and
     // the DOCUMENT sync is what to chase. The receipt is NOT abandoned: it carries no sync row, so
     // the re-drive at the next SALES_INVOICE post is what registers it, which is why the remedy for
@@ -1398,6 +1412,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           // across a connector switch, so nothing else in this function establishes whose it is.
           accountingInvoiceConnector: true,
           shoppingLinks: { select: { connector: true }, take: 1 },
+          status: true, cancelledAt: true,
         },
       }),
     ])
@@ -1568,6 +1583,9 @@ export async function registerInvoicePaymentWithLedger(params: {
       liveReceipts: await loadLiveReceipts(db, params.orderId),
       // o3d-j625 r3: resolved and CONFIRMED against the target connector's own chart above.
       bankAccountId: mappedBankAccountId,
+      // Was the money paid after the order was cancelled? Read from the order row above (status, and the
+      // database-minted cancelled_at) and the receipt's own time.
+      cancellation: { orderStatus: so.status, cancelledAt: so.cancelledAt, paidAt: params.paidAt },
       existing,
       ledgerSettlements,
       // o3d-llyw: the connector a check must name, and the checks themselves (see above).

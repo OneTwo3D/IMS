@@ -452,7 +452,7 @@ test('[o3d-r948] an unresolved attempt with a refused figure is undescribable, n
     abandonedBeforeRemoteCall: null,
     settlementBasis: null,
   })
-  const decide = (exact: unknown) => decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS,
+  const decide = (exact: unknown) => decideInvoicePaymentRegistration({ orderId: 'so-1', liveReceipts: NO_LIVE_RECEIPTS, cancellation: { orderStatus: 'PROCESSING', cancelledAt: null, paidAt: null },
     syncEnabled: true,
     accountingInvoiceId: 'INV-1',
     orderCurrency: 'GBP',
