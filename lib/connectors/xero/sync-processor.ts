@@ -5088,12 +5088,16 @@ export async function guardStoreCreditCreditNote(
   if (referenceType !== 'SalesOrderRefund') return null
   let orderRow: { storeCreditForeign: unknown; storeCreditAssessment: unknown }
   try {
-    const refund = await db.salesOrderRefund.findUnique({
-      where: { id: referenceId },
-      select: { order: { select: { storeCreditForeign: true, storeCreditAssessment: true } } },
+    // Read UNDER THE ORDER'S ROW LOCK (the posting-time fence: see store-credit-posting-fence.ts), so a review
+    // transition either committed before this read or finds this entry's PROCESSING claim and defers.
+    const found = await db.$transaction(async (tx) => {
+      const refund = await tx.salesOrderRefund.findUnique({ where: { id: referenceId }, select: { orderId: true } })
+      if (!refund) return null
+      await lockSalesOrder(tx, refund.orderId)
+      return tx.salesOrder.findUnique({ where: { id: refund.orderId }, select: { storeCreditForeign: true, storeCreditAssessment: true } })
     })
-    if (!refund) return { success: false, error: `Refund ${referenceId} not found before posting its credit note` }
-    orderRow = refund.order
+    if (!found) return { success: false, error: `Refund ${referenceId} not found before posting its credit note` }
+    orderRow = found
   } catch (error) {
     return { success: false, error: `Could not read the order of refund ${referenceId} before posting its credit note: ${String(error)}` }
   }
@@ -5115,7 +5119,11 @@ export async function guardStoreCreditFollowUp(
   if (!orderId) return { success: false, error: `Missing order reference for the ${what}` }
   let credit: { storeCreditForeign: unknown; storeCreditAssessment: unknown }
   try {
-    const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { storeCreditForeign: true, storeCreditAssessment: true } })
+    // Under the order's row lock: the posting-time fence (see store-credit-posting-fence.ts).
+    const order = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      return tx.salesOrder.findUnique({ where: { id: orderId }, select: { storeCreditForeign: true, storeCreditAssessment: true } })
+    })
     if (!order) return { success: false, error: `Sales order ${orderId} not found before its ${what}` }
     credit = order
   } catch (error) {

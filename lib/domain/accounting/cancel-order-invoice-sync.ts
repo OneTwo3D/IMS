@@ -11,7 +11,7 @@ const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as co
  * worker may be mid-post, and clobbering it would race the external call. It leaves the live set on its
  * own once it finishes. Matches ORPHAN_CANCEL_STALE_PROCESSING_MS in app/actions/accounting-sync.ts.
  */
-const STALE_PROCESSING_MS = 15 * 60 * 1000
+export const STALE_PROCESSING_MS = 15 * 60 * 1000
 
 /**
  * A cancellation arrived while an invoice post for this order is ON THE WIRE (o3d-7o0).

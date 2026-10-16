@@ -17,10 +17,13 @@ const state = {
   writes: [] as Array<Record<string, unknown>>,
   statements: [] as string[],
   activity: [] as Array<Record<string, unknown>>,
+  liveClaim: null as { id: string; connector: string; type: string; processingStartedAt: Date } | null,
 }
 
 const tx = {
   $queryRaw: async (sql: { sql?: string; strings?: string[] }) => { state.statements.push(`LOCK ${(sql.sql ?? sql.strings?.join('?') ?? '').replace(/\s+/g, ' ').trim()}`); return [] },
+  accountingSyncLog: { findFirst: async () => { state.statements.push('READ live posting claim'); return state.liveClaim } },
+  salesOrderRefund: { findMany: async () => [] },
   shoppingOrderLink: { updateMany: async () => ({ count: 1 }) },
   salesOrder: {
     findUnique: async () => { state.reads += 1; return state.stored ? { ...state.stored } : null },
@@ -58,6 +61,7 @@ test.beforeEach(() => {
   state.writes = []
   state.statements = []
   state.activity = []
+  state.liveClaim = null
 })
 
 async function run(wc: WcFullOrder) {
@@ -145,4 +149,30 @@ test('an order already in review is not written or logged again; two concurrent 
     assert.equal(state.stored!.storeCreditForeign, '0.0000')
   }
   precondition('race', { rounds: 40 })
+})
+
+// ---------------------------------------------------------------------------------------------------
+// The posting-time fence (Codex round 8): a review is not committed in the middle of an order-scoped posting.
+// ---------------------------------------------------------------------------------------------------
+
+test('POSTING FENCE: with a live posting claim for the order the review DEFERS (nothing written, nothing logged); without one it commits', async () => {
+  const { StoreCreditReviewDeferredError } = await import('@/lib/domain/accounting/store-credit-posting-fence')
+  state.liveClaim = { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE', processingStartedAt: new Date() }
+  precondition('live claim', { claim: state.liveClaim.id, stored: state.stored })
+  await assert.rejects(() => run(order(credit())), (e: unknown) => e instanceof StoreCreditReviewDeferredError)
+  assert.deepEqual(state.writes, [], 'no review write and no order refresh: the whole update rolled back')
+  assert.deepEqual(state.activity, [], 'no review entry yet')
+  assert.ok(state.statements.findIndex((x) => x.startsWith('LOCK')) < state.statements.indexOf('READ live posting claim'), 'the order lock is taken BEFORE the claim is looked for')
+  state.liveClaim = null
+  state.statements = []
+  await run(order(credit()))
+  precondition('no live claim', { writes: state.writes.length })
+  assert.equal(state.activity.length, 1, 'once the posting has settled the review is recorded')
+})
+
+test('POSTING FENCE: a delivery that needs no review never looks for a claim', async () => {
+  state.liveClaim = { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE', processingStartedAt: new Date() }
+  await run(order(percent))
+  precondition('no review needed', { statements: state.statements })
+  assert.ok(!state.statements.includes('READ live posting claim'))
 })

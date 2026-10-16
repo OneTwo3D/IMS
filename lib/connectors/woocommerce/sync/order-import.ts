@@ -15,6 +15,7 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
+import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
 import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts, wcUpdateNeedsStoreCreditReview } from './coupon-classification'
 import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, STORE_CREDIT_REVIEW_ACTION, storeCreditInvoiceQueuedNotice } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
@@ -802,6 +803,8 @@ export async function updateExistingWcOrderFromPayload(
         // The order row lock first, then a CONDITIONAL write that only ever moves to REVIEW_REQUIRED: idempotent,
         // so concurrent deliveries agree, and only the one that wrote logs.
         await lockSalesOrder(tx, orderId)
+        // POSTING-TIME FENCE: not in the middle of an order-scoped posting that was authorised on the old state.
+        await assertNoOrderPostingInFlightForReview(tx, orderId, new Date())
         const flagged = await tx.salesOrder.updateMany({
           where: { id: orderId, OR: [{ storeCreditAssessment: null }, { storeCreditAssessment: 'ASSESSED' }] },
           data: { storeCreditAssessment: 'REVIEW_REQUIRED' },

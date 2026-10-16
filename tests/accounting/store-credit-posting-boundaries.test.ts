@@ -95,12 +95,15 @@ const state: { row: { storeCreditForeign: unknown; storeCreditAssessment?: unkno
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      salesOrder: {
-        findUnique: async () => {
-          if (state.row === 'throw') throw new Error('connection reset')
-          return state.row
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
+        $queryRaw: async () => [],
+        salesOrder: {
+          findUnique: async () => {
+            if (state.row === 'throw') throw new Error('connection reset')
+            return state.row
+          },
         },
-      },
+      }),
     },
   },
 })

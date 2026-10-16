@@ -29,17 +29,17 @@ mock.module('@/lib/db', {
       $transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
         fn({
           $queryRaw: async () => [],
-          salesOrder: { findUnique: async () => state.row },
+          salesOrder: { findUnique: async ({ where }: { where: { id: string } }) => (where.id === 'order-of-refund' ? (state.refundRow as { order: unknown }).order : state.row) },
+          salesOrderRefund: {
+            findUnique: async () => {
+              if (state.refundRow === 'throw') throw new Error('connection reset')
+              return state.refundRow ? { orderId: 'order-of-refund' } : null
+            },
+          },
           accountingSyncLog: { updateMany: async () => { state.retired += 1; return { count: 1 } } },
           accountingEvent: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
           accountingEventLog: { createMany: async () => ({ count: 0 }) },
         }),
-      salesOrderRefund: {
-        findUnique: async () => {
-          if (state.refundRow === 'throw') throw new Error('connection reset')
-          return state.refundRow
-        },
-      },
     },
   },
 })
