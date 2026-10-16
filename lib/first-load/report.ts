@@ -127,6 +127,11 @@ export function renderMarkdown(report: PrepareReport, mode: { dryRun: boolean })
   }
 
   out.push('## Recipes', '', report.recipes.cycles.length === 0 ? 'No cycle found.' : `${report.recipes.cycles.length} cycle(s) found: ${report.recipes.cycles.map((c) => c.join(' -> ')).join('; ')}`, '')
+  const vp = report.variantParents
+  out.push('## Variant parents (WooCommerce)', '')
+  out.push(vp.supplied
+    ? `- Variation rows read: ${vp.rowsRead}; Qoblex variants joined by exact SKU: ${vp.variantsJoined}; VARIABLE parents emitted (once each): ${vp.parentsEmitted}; WooCommerce parents with no Qoblex variant (not loaded): ${vp.parentsWithoutQoblexVariant}`
+    : 'Not supplied: no Qoblex variant can be given a parent.', '')
   out.push('## Purchase orders and transfers', '')
   out.push(`- Purchase orders emitted: ${report.purchaseOrders.orders} (${report.purchaseOrders.linesEmitted} line(s)); orders with nothing outstanding: ${report.purchaseOrders.ordersNothingOutstanding}`)
   out.push(`- Transfers emitted: ${report.transfers.transfers} (${report.transfers.linesEmitted} line(s))`, '')

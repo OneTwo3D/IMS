@@ -55,6 +55,7 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
+import { storeCreditBlock, type StoreCreditBlock, storeCreditCreditNotePosterError, storeCreditFollowUpPosterError, storeCreditInvoicePosterError } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
@@ -5056,13 +5057,14 @@ export async function guardCancelledSalesOrderInvoice(
   let outcome:
     | { kind: 'missing' }
     | { kind: 'cancelled' }
+    | { kind: 'storeCredit'; block: StoreCreditBlock }
     | { kind: 'live'; customerId?: string }
   try {
     outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, referenceId)
       const so = await tx.salesOrder.findUnique({
         where: { id: referenceId },
-        select: { customerId: true, status: true },
+        select: { customerId: true, status: true, storeCreditForeign: true, storeCreditAssessment: true },
       })
       if (!so) return { kind: 'missing' as const }
       if (so.status === 'CANCELLED') {
@@ -5073,6 +5075,12 @@ export async function guardCancelledSalesOrderInvoice(
         await retireSalesInvoiceForCancelledOrder(tx, attempt, referenceId, held)
         return { kind: 'cancelled' as const }
       }
+      // Store credit is a PAYMENT the invoice must be settled by, and that posting is not built: refuse
+      // the document rather than post one that exceeds what the customer was charged. Read from the
+      // order itself, under the same lock, so it covers every producer (import, hold release, manual
+      // re-queue, update) and not just payloads that happen to carry a marker.
+      const creditBlock = storeCreditBlock(so)
+      if (creditBlock) return { kind: 'storeCredit' as const, block: creditBlock }
       return { kind: 'live' as const, customerId: so.customerId ?? undefined }
     })
   } catch (error) {
@@ -5084,7 +5092,68 @@ export async function guardCancelledSalesOrderInvoice(
   if (outcome.kind === 'cancelled') {
     return { post: false, result: { success: true, skipped: true } }
   }
+  if (outcome.kind === 'storeCredit') {
+    return { post: false, result: { success: false, error: storeCreditInvoicePosterError(outcome.block) } }
+  }
   return { post: true, customerId: outcome.customerId }
+}
+
+/**
+ * A refund of a store-credit order credits an invoice IMS refuses to post (see
+ * lib/domain/accounting/store-credit-invoice-refusal.ts), so its credit note is refused too. Returns the
+ * failure to hand back, or null to post. Fails CLOSED: an order that cannot be read is not "no store
+ * credit". Only a refund-keyed credit note is checked; any other reference is not this guard's business.
+ */
+export async function guardStoreCreditCreditNote(
+  referenceType: string,
+  referenceId: string,
+): Promise<EntryResult | null> {
+  if (referenceType !== 'SalesOrderRefund') return null
+  let orderRow: { storeCreditForeign: unknown; storeCreditAssessment: unknown }
+  try {
+    // Read UNDER THE ORDER'S ROW LOCK (the posting-time fence: see store-credit-posting-fence.ts), so a review
+    // transition either committed before this read or finds this entry's PROCESSING claim and defers.
+    const found = await db.$transaction(async (tx) => {
+      const refund = await tx.salesOrderRefund.findUnique({ where: { id: referenceId }, select: { orderId: true } })
+      if (!refund) return null
+      await lockSalesOrder(tx, refund.orderId)
+      return tx.salesOrder.findUnique({ where: { id: refund.orderId }, select: { storeCreditForeign: true, storeCreditAssessment: true } })
+    })
+    if (!found) return { success: false, error: `Refund ${referenceId} not found before posting its credit note` }
+    orderRow = found
+  } catch (error) {
+    return { success: false, error: `Could not read the order of refund ${referenceId} before posting its credit note: ${String(error)}` }
+  }
+  const block = storeCreditBlock(orderRow)
+  return block ? { success: false, error: storeCreditCreditNotePosterError(block) } : null
+}
+
+/**
+ * The invoice's follow-ups (payment registration, invoice email, WooCommerce invoice note) for an order that
+ * carries store credit are refused for the same reason the invoice is (see
+ * lib/domain/accounting/store-credit-invoice-refusal.ts). Taken at the posting boundary, from the order, so
+ * a revived, retried or manually queued entry is refused too. Fails CLOSED: an order that cannot be read, or
+ * that cannot be found, is not "no store credit". Returns the failure to hand back, or null to proceed.
+ */
+export async function guardStoreCreditFollowUp(
+  orderId: string | undefined,
+  what: 'payment registration' | 'invoice email' | 'WooCommerce invoice note',
+): Promise<EntryResult | null> {
+  if (!orderId) return { success: false, error: `Missing order reference for the ${what}` }
+  let credit: { storeCreditForeign: unknown; storeCreditAssessment: unknown }
+  try {
+    // Under the order's row lock: the posting-time fence (see store-credit-posting-fence.ts).
+    const order = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      return tx.salesOrder.findUnique({ where: { id: orderId }, select: { storeCreditForeign: true, storeCreditAssessment: true } })
+    })
+    if (!order) return { success: false, error: `Sales order ${orderId} not found before its ${what}` }
+    credit = order
+  } catch (error) {
+    return { success: false, error: `Could not read sales order ${orderId} before its ${what}: ${String(error)}` }
+  }
+  const block = storeCreditBlock(credit)
+  return block ? { success: false, error: storeCreditFollowUpPosterError(what, block) } : null
 }
 
 // o3d-k26m.5 round 4 added a SECOND `heldClaimWhere` here, with a note saying it was deliberately
@@ -6026,6 +6095,12 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
+      // A store-credit order's invoice is never posted by IMS, so a payment against it is refused at the same
+      // boundary, whatever enqueued or revived it.
+      const creditRefusal = referenceType === 'SalesOrder'
+        ? await guardStoreCreditFollowUp(referenceId, 'payment registration')
+        : await guardStoreCreditFollowUp(payload.referenceId as string | undefined, 'payment registration')
+      if (creditRefusal) return creditRefusal
       // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
       // this document is already settled has to look for the settlement THIS call will create, and
       // the only way that can never drift is for both to ask one function. See moneyPostDate.
@@ -6233,6 +6308,8 @@ export async function processClaimedEntry(
     case 'INVOICE_EMAIL': {
       const orderId = payload.referenceId as string | undefined
       if (!orderId) return { success: false, error: 'Missing referenceId for INVOICE_EMAIL' }
+      const emailCreditRefusal = await guardStoreCreditFollowUp(orderId, 'invoice email')
+      if (emailCreditRefusal) return emailCreditRefusal
       const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
       // Not a Xero call, but an external side effect all the same — though a reclaiming worker here
       // does NOT by itself mail a further copy (Codex round 35, MEDIUM; this comment used to read
@@ -6254,6 +6331,8 @@ export async function processClaimedEntry(
     case 'WC_INVOICE_NOTE': {
       const orderId = payload.referenceId as string | undefined
       if (!orderId) return { success: false, error: 'Missing referenceId for WC_INVOICE_NOTE' }
+      const noteCreditRefusal = await guardStoreCreditFollowUp(orderId, 'WooCommerce invoice note')
+      if (noteCreditRefusal) return noteCreditRefusal
       const { pushInvoiceNoteToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-note')
       const fence = await lease.fenceBeforeRemoteWrite('wc-invoice-note')
       if (!fence.ok) return fence.result
@@ -6333,6 +6412,8 @@ export async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE': {
+      const storeCreditRefusal = await guardStoreCreditCreditNote(referenceType, referenceId)
+      if (storeCreditRefusal) return storeCreditRefusal
       const creditCustomerId = referenceType === 'SalesOrderRefund'
         ? (await db.salesOrderRefund.findUnique({
             where: { id: referenceId },

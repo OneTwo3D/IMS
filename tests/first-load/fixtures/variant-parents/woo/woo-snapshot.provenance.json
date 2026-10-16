@@ -1,0 +1,40 @@
+{
+  "formatVersion": 1,
+  "source": "woocommerce",
+  "origin": "https://synthetic.invalid",
+  "note": "SYNTHETIC fixture: no store was contacted",
+  "snapshotFile": {
+    "name": "woo-snapshot.json",
+    "sha256": "2c68f6a7cfdf23671091f2c23a7bc4cb7fcfd95f4e832fcf84870795ce0a4c95",
+    "bytes": 2434,
+    "payloadSha256": "527094e6a44983841eae2609221277227078440a8a2a91375757d53ddc3a0841"
+  },
+  "formulaLeadingCells": 0,
+  "variantParentsFile": {
+    "name": "variant-parents.csv",
+    "sha256": "58aefad447fdcf3d24912f60654c58d805069aa111c8dbf02aef0ee7e7d6dde8",
+    "rows": 8
+  },
+  "variantParentsInspectionFile": {
+    "name": "variant-parents.inspect.csv",
+    "sha256": "58aefad447fdcf3d24912f60654c58d805069aa111c8dbf02aef0ee7e7d6dde8"
+  },
+  "proof": {
+    "parents": {
+      "statusTotals": {
+        "publish": 4,
+        "draft": 1,
+        "private": 1,
+        "pending": 0
+      }
+    },
+    "variations": {
+      "statusTotals": {
+        "publish": 8,
+        "draft": 0,
+        "private": 0,
+        "pending": 0
+      }
+    }
+  }
+}

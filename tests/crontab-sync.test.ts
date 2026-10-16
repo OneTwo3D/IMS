@@ -34,7 +34,7 @@ test('build: env-file mode reads the secret at runtime — no embedded literal (
   assert.ok(result.ok)
   const text = result.lines.join('\n')
   assert.doesNotMatch(text, /^CRON_SECRET="/m)
-  assert.match(text, /CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '\/opt\/app\/\.env' \| cut -d= -f2- \| tr -d '"'\) && \[ -n "\$CRON_SECRET" \] && curl/)
+  assert.match(text, /CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '\/opt\/app\/\.env' \| cut -d= -f2- \| tr -d '"'\); case "\$CRON_SECRET" in/)
   assert.match(text, /"\$BASE_URL\/wms-watchdog"/)
 })
 
@@ -141,7 +141,7 @@ test('emulate: mirrors the shell pipeline for the formats it must handle', () =>
   assert.equal(emulateRuntimeSecretExtraction('OTHER=x\n'), null)
 })
 
-test('build: runtime job lines guard against empty extraction ([ -n ]) so no empty bearer is sent', () => {
+test('build: runtime job lines refuse an empty or unusable secret (fail closed, logged) and keep the bearer off curl\'s argv', () => {
   const result = buildOtiCrontabBlock({
     jobs: [JOB],
     settings: new Map([['cron_wms_watchdog_enabled', 'true']]),
@@ -149,7 +149,10 @@ test('build: runtime job lines guard against empty extraction ([ -n ]) so no emp
     baseUrl: BASE,
   })
   assert.ok(result.ok)
-  assert.match(result.lines.join('\n'), /\[ -n "\$CRON_SECRET" \] && curl/)
+  const text = result.lines.join('\n')
+  assert.match(text, /case "\$CRON_SECRET" in ''\|\*\\\\\*\) echo "cron-auth: CRON_SECRET is missing or unusable/)
+  assert.match(text, /\| curl -sf -o \/dev\/null -K - "\$BASE_URL\/wms-watchdog"/)
+  assert.doesNotMatch(text, /-H "Authorization/)
 })
 
 test('build: env paths with cron-special characters are rejected', () => {

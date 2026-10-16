@@ -19,6 +19,8 @@ process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
 let store: SyncLogStore = createSyncLogStore([])
 /** Runs once, on the next db.$transaction — i.e. between the claim and the writeback. */
 let interleave: (() => void) | null = null
+/** Transactions to let pass before `interleave` fires (a follow-up's store-credit guard now reads under the order lock in its own). */
+let interleaveSkip = 0
 const activity: Array<{ action: string; level?: string; description: string; metadata?: Record<string, unknown> }> = []
 
 const accountingSyncLog = new Proxy({}, {
@@ -81,6 +83,10 @@ const dbStub = {
     return []
   },
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
+    if (interleaveSkip > 0) {
+      interleaveSkip -= 1
+      return fn(dbStub)
+    }
     const hook = interleave
     interleave = null
     hook?.()
@@ -127,6 +133,7 @@ async function loadProcessor() {
 function reset(rows: Parameters<typeof createSyncLogStore>[0]) {
   store = createSyncLogStore(rows)
   interleave = null
+  interleaveSkip = 0
   activity.length = 0
   orderLockLog.length = 0
   queryRawFailures = 0
@@ -344,7 +351,8 @@ test('a follow-up failure from an attempt that was settled mid-flight does not r
  * Move the row onto a DIFFERENT attempt between the claim and the writeback — the fence loss the
  * escalation below reports on. (It stood beside the r1–r3 tests that have been replaced above.)
  */
-function fenceOutOnWriteback() {
+function fenceOutOnWriteback(skipTransactions = 0) {
+  interleaveSkip = skipTransactions
   interleave = () => {
     Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 9 })
   }
@@ -400,7 +408,7 @@ test('o3d-e2mz r4: a fence loss on a type that creates NO document says so, and 
     status: 'PENDING',
     attemptRevision: 3,
   })])
-  fenceOutOnWriteback()
+  fenceOutOnWriteback(1)
 
   await (await loadProcessor())()
 

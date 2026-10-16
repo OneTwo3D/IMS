@@ -1,0 +1,124 @@
+{
+  "formatVersion": 1,
+  "kind": "woocommerce-catalogue-snapshot",
+  "payload": {
+    "parents": [
+      {
+        "id": 9000,
+        "name": "Widget",
+        "sku": "WIDGET",
+        "status": "publish",
+        "variationIds": [
+          9001,
+          9002
+        ]
+      },
+      {
+        "id": 9100,
+        "name": "Gadget",
+        "sku": "2002",
+        "status": "draft",
+        "variationIds": [
+          9101
+        ]
+      },
+      {
+        "id": 9200,
+        "name": "Gizmo",
+        "sku": "GIZ-PARENT",
+        "status": "private",
+        "variationIds": [
+          9201
+        ]
+      },
+      {
+        "id": 9300,
+        "name": "Other",
+        "sku": "OTHER-PARENT",
+        "status": "publish",
+        "variationIds": [
+          9301
+        ]
+      },
+      {
+        "id": 9400,
+        "name": "Seven",
+        "sku": "SEVEN",
+        "status": "publish",
+        "variationIds": [
+          9401,
+          9402
+        ]
+      },
+      {
+        "id": 9500,
+        "name": "Eight",
+        "sku": "EIGHT",
+        "status": "publish",
+        "variationIds": [
+          9501
+        ]
+      }
+    ],
+    "source": "woocommerce",
+    "variations": [
+      {
+        "attributes": [],
+        "id": 9001,
+        "parentId": 9000,
+        "sku": "1001-01",
+        "status": "publish"
+      },
+      {
+        "attributes": [],
+        "id": 9002,
+        "parentId": 9000,
+        "sku": "1001-02",
+        "status": "publish"
+      },
+      {
+        "attributes": [],
+        "id": 9101,
+        "parentId": 9100,
+        "sku": "2002-01",
+        "status": "publish"
+      },
+      {
+        "attributes": [],
+        "id": 9201,
+        "parentId": 9200,
+        "sku": "3003-07",
+        "status": "publish"
+      },
+      {
+        "attributes": [],
+        "id": 9301,
+        "parentId": 9300,
+        "sku": "6006",
+        "status": "publish"
+      },
+      {
+        "attributes": [],
+        "id": 9401,
+        "parentId": 9400,
+        "sku": "7007-01",
+        "status": "publish"
+      },
+      {
+        "attributes": [],
+        "id": 9402,
+        "parentId": 9400,
+        "sku": "7007-02",
+        "status": "publish"
+      },
+      {
+        "attributes": [],
+        "id": 9501,
+        "parentId": 9500,
+        "sku": "8008-01",
+        "status": "publish"
+      }
+    ]
+  },
+  "payloadSha256": "527094e6a44983841eae2609221277227078440a8a2a91375757d53ddc3a0841"
+}

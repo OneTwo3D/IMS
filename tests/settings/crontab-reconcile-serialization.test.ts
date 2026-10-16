@@ -5566,7 +5566,7 @@ test('[o3d-batch-ret] the shell and TypeScript managed-job signatures are the sa
   //
   // The subject goes in through the environment and comes back through ENVIRON[], so no quoting
   // layer between TypeScript, bash and awk can alter the bytes being compared.
-  const { MANAGED_JOB_LINE_SIGNATURE } = await crontabSync()
+  const { MANAGED_JOB_LINE_SIGNATURE, LEGACY_MANAGED_JOB_LINE_SIGNATURE } = await crontabSync()
   const isRemnant = (subject: string) => sh([
     'set -uo pipefail',
     `source '${CRONTAB_LOCK_LIB}'`,
@@ -5591,9 +5591,16 @@ test('[o3d-batch-ret] the shell and TypeScript managed-job signatures are the sa
 
   // …and a single altered byte in the signature is enough to stop matching, which is what makes
   // the equality above a real comparison rather than a substring that happens to be short.
-  const drifted = await isRemnant(`0 2 * * * curl -s ${MANAGED_JOB_LINE_SIGNATURE.replace('Bearer', 'Bearer ')}api/cron/backup"`)
+  const drifted = await isRemnant(`0 2 * * * curl -s ${MANAGED_JOB_LINE_SIGNATURE.replace('-K', '-K ')}api/cron/backup"`)
   assert.match(drifted.stdout, /DIFFERS/,
     `a drifted signature must stop matching:\n${drifted.stdout}${drifted.stderr}`)
+
+  // THE LINES AN EARLIER VERSION WROTE (the bearer as a curl -H argument) are still ours to drop on an upgrade,
+  // and a drifted copy of THAT signature stops matching too.
+  const legacy = await isRemnant(`0 2 * * * curl -s ${LEGACY_MANAGED_JOB_LINE_SIGNATURE}api/cron/backup"`)
+  assert.match(legacy.stdout, /MATCHES/, `the legacy signature is still recognised:\n${legacy.stdout}${legacy.stderr}`)
+  const legacyDrifted = await isRemnant(`0 2 * * * curl -s ${LEGACY_MANAGED_JOB_LINE_SIGNATURE.replace('Bearer', 'Bearer ')}api/cron/backup"`)
+  assert.match(legacyDrifted.stdout, /DIFFERS/, 'a drifted legacy signature stops matching')
 })
 
 // ---------------------------------------------------------------------------
@@ -5877,6 +5884,8 @@ test('[o3d-batch-ret] the roster of bodies the lock wrapper disarms errexit for 
     'scripts/install.sh:restore_cron_from_backup_locked',
     'scripts/install.sh:resume_restore_cron_locked',
     'scripts/install.sh:unfence_cron_locked',
+    'scripts/lib/crontab-lock.sh:migrate_legacy_cron_block_locked',
+    'scripts/lib/crontab-lock.sh:rewrite_legacy_cron_block_locked',
     'scripts/update.sh:adopt_cron_fence_locked',
     'scripts/update.sh:fence_cron_locked',
     'scripts/update.sh:restore_cron_from_backup_locked',
@@ -5902,10 +5911,12 @@ test('[o3d-batch-ret] no `*_locked` body writes the crontab except through the o
     + 'so every call must take its status')
 
   // NOT VACUOUS. The walk reached the files, found the bodies, and found writes in them.
-  assert.equal(ALL_LOCKED_BODIES.length, 15)
+  assert.equal(ALL_LOCKED_BODIES.length, 17)
   const writes = ALL_LOCKED_BODIES.flatMap((b) => b.lines.filter(
     (l) => !isComment(l) && /\bwrite_crontab_for\b/.test(l)))
-  assert.equal(writes.length, 13,
+  // 14: the in-place rewrite of legacy cron job lines (o3d-kb3dq) is a write too; it lives once in the shared library
+  // (rewrite_legacy_cron_block_locked, run under the lock by the installer's bootstrap, update.sh and deploy.sh)
+  assert.equal(writes.length, 14,
     'every crontab write in the three entrypoints must be one of these; a count that drifted '
     + 'means a site was added or removed without this test being read')
 

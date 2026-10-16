@@ -1229,22 +1229,25 @@ run_as_user() {
 
 github_api() {
   local method="$1" path="$2" payload="${3:-}"
-  local response_file status
+  local response_file status auth_config
+  # THE TOKEN IS READ BY curl FROM ITS STANDARD INPUT AS A CONFIG LINE, not given as `-H "Authorization: ..."`: a header
+  # argument is on curl's command line, readable by every local account for as long as the request lasts (o3d-kb3dq).
+  auth_config="header = \"Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN//[\\\"]/}\""
   response_file="$(mktemp -t ims-github.XXXXXX)"
   if [[ -n "${payload}" ]]; then
     status="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+      -K - \
       -X "${method}" \
-      -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \
       -H "Accept: application/vnd.github+json" \
       -H "Content-Type: application/json" \
       --data "${payload}" \
-      "https://api.github.com${path}")"
+      "https://api.github.com${path}" <<< "${auth_config}")"
   else
     status="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+      -K - \
       -X "${method}" \
-      -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \
       -H "Accept: application/vnd.github+json" \
-      "https://api.github.com${path}")"
+      "https://api.github.com${path}" <<< "${auth_config}")"
   fi
   if [[ ! "${status}" =~ ^2 ]]; then
     cat "${response_file}" >&2
@@ -10193,25 +10196,34 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
   BOOTSTRAP_SCRIPT="${APP_DIR}/scripts/provision-instance.mjs"
   [[ -f "${BOOTSTRAP_SCRIPT}" ]] || BOOTSTRAP_SCRIPT="/root/provision-instance.mjs"
 
-  run_as_user_db env \
-    DEFAULT_ADMIN_NAME="${DEFAULT_ADMIN_NAME}" \
-    DEFAULT_ADMIN_EMAIL="${DEFAULT_ADMIN_EMAIL}" \
-    DEFAULT_ADMIN_PASSWORD="${DEFAULT_ADMIN_PASSWORD}" \
-    NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}" \
-    APP_DOMAIN="${APP_DOMAIN}" \
-    PUBLIC_APP_URL="https://${APP_DOMAIN}" \
-    SMTP_HOST="${SMTP_HOST}" \
-    SMTP_PORT="${SMTP_PORT}" \
-    SMTP_USER="${SMTP_USER}" \
-    SMTP_PASS="${SMTP_PASS}" \
-    SMTP_SECURE="${SMTP_SECURE}" \
-    SMTP_FROM_NAME="${SMTP_FROM_NAME}" \
-    SMTP_FROM_EMAIL="${SMTP_FROM_EMAIL}" \
-    SMTP_REPLY_TO="${SMTP_REPLY_TO}" \
-    WC_STORE_URL="${WC_STORE_URL}" \
-    WC_CONSUMER_KEY="${WC_CONSUMER_KEY}" \
-    WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}" \
-    node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?
+  # THE VALUES TRAVEL IN THE ENVIRONMENT, NEVER ON A COMMAND LINE (o3d-kb3dq). `run_as_user_db env NAME=value ... node`
+  # puts every value in the argv of the runuser/env processes, which any local account can read out of `ps` for the
+  # life of the step: the default administrator's password, the SMTP password and the WooCommerce secret. Exporting
+  # them inside a subshell puts them in the environment instead (readable by root and the owner only), and runuser
+  # hands that environment to the application account, which is how DATABASE_URL already travels.
+  bootstrap_with_env() {
+  (
+    export DEFAULT_ADMIN_NAME="${DEFAULT_ADMIN_NAME}"
+    export DEFAULT_ADMIN_EMAIL="${DEFAULT_ADMIN_EMAIL}"
+    export DEFAULT_ADMIN_PASSWORD="${DEFAULT_ADMIN_PASSWORD}"
+    export NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
+    export APP_DOMAIN="${APP_DOMAIN}"
+    export PUBLIC_APP_URL="https://${APP_DOMAIN}"
+    export SMTP_HOST="${SMTP_HOST}"
+    export SMTP_PORT="${SMTP_PORT}"
+    export SMTP_USER="${SMTP_USER}"
+    export SMTP_PASS="${SMTP_PASS}"
+    export SMTP_SECURE="${SMTP_SECURE}"
+    export SMTP_FROM_NAME="${SMTP_FROM_NAME}"
+    export SMTP_FROM_EMAIL="${SMTP_FROM_EMAIL}"
+    export SMTP_REPLY_TO="${SMTP_REPLY_TO}"
+    export WC_STORE_URL="${WC_STORE_URL}"
+    export WC_CONSUMER_KEY="${WC_CONSUMER_KEY}"
+    export WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}"
+    "$@"
+  )
+  }
+  bootstrap_with_env run_as_user_db node "${BOOTSTRAP_SCRIPT}" || bootstrap_rc=$?
   # ITS PLACEMENT IS THE CLOSING GATE BELOW (o3d-secops r34, Codex HIGH 2), so the status is
   # carried past the `fi` and BOTH the refusal and the success line come after it: a
   # bootstrap the gate is about to refuse must not have been reported complete first.
@@ -10872,7 +10884,6 @@ header "Setting up cron jobs"
 # Runtime-read secret + [ -n ] guard + managed LOG_DIR log path.
 CRON_ENV_FILE="${APP_DIR}/.env"
 CRON_LOG_FILE="${LOG_DIR}/cron.log"
-CRON_CURL_PREFIX="CRON_SECRET=\$(grep -m1 '^CRON_SECRET=' '${CRON_ENV_FILE}' | cut -d= -f2- | tr -d '\"') && [ -n \"\$CRON_SECRET\" ] && curl -sf -o /dev/null -H \"Authorization: Bearer \$CRON_SECRET\""
 CRON_BASE="http://localhost:${APP_PORT}/api/cron"
 
 # schedule|slug|label pairs for the bootstrap set
@@ -10903,7 +10914,7 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
   for job in "${CRON_JOBS[@]}"; do
     IFS='|' read -r sched slug label <<< "$job"
     echo "# ${label}"
-    echo "${sched}  ${CRON_CURL_PREFIX} \"\$BASE_URL/${slug}\" >> '${CRON_LOG_FILE}' 2>&1"
+    echo "${sched}  $(cron_job_command "${slug}" "${CRON_LOG_FILE}" "${CRON_ENV_FILE}")"
     echo ""
   done
   echo "# --- OTI CRON END ---"
@@ -10995,6 +11006,7 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
   "the application service was not proved to be running this run's build, under this run's unit, before the crontab section (APP_SERVICE_ON_NEW_BUILD='${APP_SERVICE_ON_NEW_BUILD:-unset}'). Taking the crontab lock now would serialise this script against nothing: a process still running the previous build locks a different file, and a process that is not the unit's own has no STATE_DIRECTORY at all and locks a file under its working directory instead — either way the two writers would silently overwrite each other's managed block. This is an ordering bug in the installer itself, not an operator error — the build and listener proofs are in section 12b and must precede this section."
 
 CRON_BOOTSTRAP_WRITTEN=no
+CRON_LEGACY_STATE=none
 
 # THE BOOTSTRAP WRITE, AS A FUNCTION, SO IT GOES THROUGH THE ONE HELPER EVERY OTHER SHELL CRONTAB
 # WRITE GOES THROUGH (o3d-p9dq). It used to be an inline `exec 9<lock; flock 9; …; exec 9>&-`, which
@@ -11024,6 +11036,16 @@ bootstrap_managed_crontab_block_locked() {
   if grep -qE '^# --- OTI CRON START ---[ \t\r]*$' <<< "${existing}"; then
     info "A managed crontab block already exists for ${APP_USER} — leaving the app's schedules alone."
     info "Newly registered jobs are scheduled by Settings -> System -> Scheduler -> Save & Apply."
+    # EXCEPT FOR THE ONE THING THAT IS NOT A SCHEDULE (o3d-kb3dq, Codex round 2): an earlier release wrote the bearer
+    # as a curl `-H` argument, which `ps` shows to every local account while a job runs. Leaving the block alone would
+    # complete an upgrade with every old job still exposing the secret, and nothing else rewrites it (starting the
+    # service does not reconcile the crontab). So the legacy job lines are rewritten IN PLACE, under this lock, keeping
+    # each job's schedule, slug, log path and secret source, and the result is re-read and verified. A block that cannot
+    # be rewritten this way ends the run: CRON_LEGACY_STATE=failed, acted on by the caller.
+    rewrite_legacy_cron_block_locked "${existing}" || return 1
+    if [[ "${CRON_LEGACY_STATE}" == "migrated" ]]; then
+      success "Rewrote the managed cron jobs so the secret is no longer on curl's command line (schedules unchanged)."
+    fi
   else
     # THE FIFTEENTH `*_locked` BODY, AND IT INHERITED THE SAME SUSPENDED ERREXIT AS THE OTHER
     # FOURTEEN (o3d-p9dq, Codex r30 CRITICAL). The projection below used to run straight into
@@ -11096,6 +11118,12 @@ if [[ "${CRON_BOOTSTRAP_RC}" -ne 0 ]]; then
 fi
 rm -f "${CRON_BLOCK_FILE}"
 trap - EXIT   # risky window over; drop the cleanup trap
+
+# THE ONE CRONTAB OUTCOME THIS RUN WILL NOT WARN ABOUT AND CARRY ON (o3d-kb3dq, Codex round 2). If the managed block still
+# holds the old `curl -H "Authorization: Bearer ..."` lines, the production reinstall would finish with the secret readable in
+# `ps` on every job run. Either the rewrite above did not happen (a lock conflict, a failed read or write, a shape it cannot
+# rewrite) or it could not be verified: look again, and refuse.
+die_if_legacy_cron_lines_remain "this installer"
 
 if [[ "${CRON_BOOTSTRAP_WRITTEN}" == "yes" ]]; then
   success "Cron jobs configured:"

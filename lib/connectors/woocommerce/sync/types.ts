@@ -47,6 +47,13 @@ export type WcCouponLine = {
   code: string
   discount: string      // discount amount
   discount_tax: string
+  /**
+   * Where WooCommerce records WHICH KIND of coupon this was: `coupon_info` (8.7+, a JSON string
+   * `[id, code, discount_type, amount]`) or the legacy `coupon_data` (an object carrying
+   * `discount_type`). Optional because older payloads and fixtures carry none; the classifier treats
+   * an absent type as "unknown", never as "discount".
+   */
+  meta_data?: WcMeta[]
 }
 
 export type WcFeeLine = {
