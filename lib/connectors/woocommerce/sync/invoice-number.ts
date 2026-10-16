@@ -28,6 +28,8 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { destinationAndOperationForSyncType } from '@/lib/domain/accounting/xero-producer-seam'
+import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
 import type { WcFullOrder, WcMeta } from './types'
 
 /** The meta key WooCommerce PDF Invoices & Packing Slips writes, and the one xeroom reads. */
@@ -230,10 +232,10 @@ export function decideStoredInvoiceNumberUpdate(params: {
  * (`MAY_HAVE_REACHED_LEDGER_WHERE`); this only names the question for the importer and its test.
  */
 export async function countSalesInvoiceRowsThatMayHavePosted(
-  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | '$queryRaw'>,
   orderId: string,
 ): Promise<number> {
-  return tx.accountingSyncLog.count({
+  const rows = await tx.accountingSyncLog.count({
     where: {
       referenceType: 'SalesOrder',
       referenceId: orderId,
@@ -241,4 +243,15 @@ export async function countSalesInvoiceRowsThatMayHavePosted(
       ...MAY_HAVE_REACHED_LEDGER_WHERE,
     },
   })
+  // A SHADOW instead of a posting leaves a durable record that outlives the sync row. The invoice may have been posted by the writer
+  // that owns the operation in this phase, so a number correction is refused on the record too: counted once per shadowed operation.
+  const operations = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE']
+    .map((type) => destinationAndOperationForSyncType(type)?.operation)
+    .filter((operation): operation is string => !!operation)
+  const shadows = await findDurableShadowRecords(tx, 'xero', [{
+    subjectType: 'SalesOrder',
+    exactIds: [orderId],
+    ...(operations.length > 0 ? { operations: [...new Set(operations)] } : {}),
+  }])
+  return rows + shadows.length
 }

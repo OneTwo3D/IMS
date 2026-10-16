@@ -2,9 +2,10 @@
  * THE ONE PLACE THE PRODUCER-SIDE HOLD'S WORDS AND NAMES LIVE.
  *
  * The outbound-write hold (outbound-write-hold-constants.ts) refuses a request at the HTTP boundary.
- * The producer-side hold is a decision, to be consulted by producers in later changes, between a unit of IMS
- * work being LIVE (produced for delivery) and being a SHADOW (what IMS would have written, never delivered).
- * Nothing consults it yet. This
+ * The producer-side hold is a decision, consulted by producers, between a unit of IMS work being LIVE
+ * (produced for delivery) and being a SHADOW (what IMS would have written, never delivered). A destination is
+ * consulted only when PRODUCER_HOLD_ENFORCED_ENV names it (see lib/security/producer-seam.ts); today the Xero
+ * producers are wired and the others are not. This
  * module carries the environment variable names, the formats, the reason texts and the documentation
  * blocks of that decision. lib/security/producer-disposition.ts imports them; docs/installation.md
  * carries marked blocks whose body must equal the text below byte for byte, and
@@ -14,12 +15,22 @@
  * none of them should need a database to read a sentence.
  */
 
+import type { WriterOwner } from './writer-ownership-map'
 import {
   OUTBOUND_CONNECTORS,
   OUTBOUND_CONNECTOR_LABEL,
   OUTBOUND_GRANT_ENV,
   type OutboundConnector,
 } from './outbound-write-hold-constants'
+
+/**
+ * Which destinations' producers obey the decision. Environment only, like the grants and the live-from
+ * instants. UNSET (the default) means no producer obeys it and every producer behaves exactly as it did before the
+ * decision existed; the outbound-write hold at the transport is then the only barrier.
+ */
+export const PRODUCER_HOLD_ENFORCED_ENV = 'PRODUCER_HOLD_ENFORCED_DESTINATIONS'
+
+export const PRODUCER_HOLD_ENFORCED_FORMAT = 'a comma-separated list of destinations from xero, mintsoft and woocommerce, or all; unset or empty enforces nothing'
 
 /** Where an installation is in the programme, derived per destination (never a setting of its own). */
 export type InstallationPhase = 'P0' | 'P1' | 'P2'
@@ -70,6 +81,49 @@ export const PRODUCER_REASON_TEXT: Record<ProducerReason, string> = {
   unreadable: 'the decision could not be evaluated',
 }
 
+/** How an operator reads an owner in a sentence. */
+export const WRITER_OWNER_LABEL: Record<WriterOwner, string> = {
+  IMS: 'IMS',
+  xeroom: 'Xeroom',
+  'o3d-ioss-xero': 'the IOSS filter for Xeroom',
+  'woo-mintsoft-plugin': 'the WooCommerce-Mintsoft plugin',
+  'mintsoft-native': 'Mintsoft itself',
+  'operator-manual': 'an operator working by hand',
+  'qoblex-native': 'Qoblex',
+  aelia: 'the Aelia currency plugin',
+  'woocommerce-native': 'WooCommerce itself',
+  nobody: 'no writer (the operation is not performed by any system)',
+  unknown: 'nobody has been established as the owner',
+}
+
+/**
+ * THE ONE SENTENCE AN OPERATOR SEES WHEN IMS KEPT A SHADOW INSTEAD OF PRODUCING THE WORK. Shown on the accounting sync
+ * log row, in a refused action's result and in the activity log; nothing else words it.
+ *
+ * It claims only what IMS knows: IMS did not send it. It says nothing about whether the owner did, and it tells the
+ * operator to look at the destination rather than to act, because a shadow is not evidence about the destination.
+ */
+export function producerShadowNotice(input: { connector: OutboundConnector; reason: ProducerReason; owner: WriterOwner }): string {
+  const label = OUTBOUND_CONNECTOR_LABEL[input.connector]
+  const owner = WRITER_OWNER_LABEL[input.owner]
+  return `Not sent by IMS: writes to ${label} are held on this installation (${PRODUCER_REASON_TEXT[input.reason]}). `
+    + `Owner of this operation in the current phase: ${owner}. IMS kept a shadow record of what it would have written and queued nothing. `
+    + `This does not say whether ${input.owner === 'unknown' || input.owner === 'nobody' ? 'anything' : owner} has written it to ${label}: check ${label} before acting.`
+}
+
+/**
+ * THE SENTENCE FOR A ROW THAT ALREADY EXISTS AND IS NOT SENT: the claim boundary found a queued row whose decision is not
+ * LIVE and handed it back unsent. Unlike {@link producerShadowNotice} it records no shadow (the row is the queued work itself),
+ * so it does not say one was kept. It claims only what IMS knows: IMS did not send it, and will not while the hold says so.
+ */
+export function producerHeldNotice(input: { connector: OutboundConnector; reason: ProducerReason; owner: WriterOwner }): string {
+  const label = OUTBOUND_CONNECTOR_LABEL[input.connector]
+  const owner = WRITER_OWNER_LABEL[input.owner]
+  return `Not sent by IMS: writes to ${label} are held on this installation (${PRODUCER_REASON_TEXT[input.reason]}). `
+    + `Owner of this operation in the current phase: ${owner}. This queued entry was handed back unsent and is not sent while the hold stands. `
+    + `This does not say whether ${input.owner === 'unknown' || input.owner === 'nobody' ? 'anything' : owner} has written it to ${label}: check ${label} before acting.`
+}
+
 /** The state of the agreement between a destination's grant and its live-from instant. */
 export const PRODUCER_AGREEMENT_STATES = ['agreed_held', 'agreed_live', 'inconsistent', 'unreadable'] as const
 export type ProducerAgreementState = (typeof PRODUCER_AGREEMENT_STATES)[number]
@@ -99,7 +153,7 @@ export function producerAgreementText(connector: OutboundConnector, detail: 'cut
 export const PRODUCER_DOC_BLOCK_OPEN = (id: string) => `<!-- producer-disposition:${id} -->`
 export const PRODUCER_DOC_BLOCK_CLOSE = (id: string) => `<!-- /producer-disposition:${id} -->`
 
-export type ProducerDocBlockId = 'overview' | 'cutoffs'
+export type ProducerDocBlockId = 'overview' | 'cutoffs' | 'enforcement'
 
 const CUTOFF_ROWS = OUTBOUND_CONNECTORS.map(
   (connector) => `| \`${PRODUCER_CUTOFF_ENV[connector]}\` | ${OUTBOUND_CONNECTOR_LABEL[connector]} | ${PRODUCER_CUTOFF_FORMAT} |`,
@@ -107,23 +161,32 @@ const CUTOFF_ROWS = OUTBOUND_CONNECTORS.map(
 
 export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
   overview: [
-    'THE PRODUCER-SIDE HOLD IS NOT YET ENFORCED. In this version it is a decision module only: nothing in IMS calls it, `npm run outbound:status` does not report on it, and every producer still queues work exactly as before. The only barrier is the outbound-write hold above, which reads a grant on its own: a destination whose grant is set permits the existing outbound writes through the transport whether or not the live-from variable below is set. The places that will consult the decision arrive in later changes, and the paragraphs below describe what the decision returns, not what IMS does today.',
+    `THE PRODUCER-SIDE HOLD IS ENFORCED ONLY FOR THE DESTINATIONS NAMED IN \`${PRODUCER_HOLD_ENFORCED_ENV}\`, WHICH IS UNSET BY DEFAULT. Unset, every producer queues work exactly as it did before the decision existed, and the only barrier is the outbound-write hold above, which reads a grant on its own: a destination whose grant is set permits the outbound writes through the transport whether or not the live-from variable below is set. Today only the Xero producers consult the decision (every place IMS creates an accounting sync log row, and the direct tax-rate creation from Settings; the one sync log type whose destination is WooCommerce, the invoice note, follows the WooCommerce setting); the WooCommerce and Mintsoft producers do not yet, so naming them in the variable changes nothing for them in this version, and \`npm run outbound:status\` does not report on the decision.`,
     '',
-    'For each destination and operation the decision is LIVE or SHADOW. A SHADOW is the record of what IMS would have written, which a later change will keep instead of queuing the work; it is never to be delivered later. The decision reads the environment only: no database and no network call. It is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is SHADOW when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it.',
+    'For each destination and operation the decision is LIVE or SHADOW. It is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is SHADOW when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it. The decision itself reads the environment only: no database and no network call.',
     '',
-    'A grant without a live-from instant, or a live-from instant without a grant, is inconsistent: the decision is SHADOW, while today the transport still allows the writes of a granted destination. A later change will report the inconsistency in `npm run outbound:status`. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination.',
+    'A SHADOW is the record of what IMS would have written, kept instead of queuing the work; it is never delivered later. For Xero a shadow is a row in the accounting sync log that is CANCELLED with the settlement basis `HELD_SHADOW`, plus a row in `outbound_shadow_writes` (one per distinct piece of work, counting repeats). A shadow has no outbox job, is never given an accounting event, and has its own ledger standing (shadow, not sent by IMS) that is NOT proof the document is absent from Xero: it says nothing about whether the owner of the operation wrote it, so deleting, reversing or refunding over it is refused as unproven. A destination whose enforcement is on and whose grant and live-from instant are both unset therefore queues nothing new: every Xero write IMS would have produced becomes a shadow.',
+    '',
+    'A grant without a live-from instant, or a live-from instant without a grant, is inconsistent: the decision is SHADOW, while the transport still allows the writes of a granted destination. A later change will report the inconsistency in `npm run outbound:status`. Never move a live-from instant earlier once work has been produced after it: that is the only change that lets work from before the move reach the destination. Rows already queued when enforcement is switched on are not changed, but the Xero queue processor asks the same decision immediately before it sends: a row whose decision is not LIVE is handed back unsent with the operator text (no retry is spent) and is never posted, and a manual re-queue or the daily-batch reset leaves such a row unclaimable. A later change will also refuse to deliver a row created before the live-from instant and retire the backlog.',
   ].join('\n'),
   cutoffs: [
     '| Variable | Destination | Value |',
     '|---|---|---|',
     ...CUTOFF_ROWS,
     '',
-    'Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable, and the decision for that destination is SHADOW. Setting a variable changes nothing in this version, because nothing consults it yet; in later changes, once the producers consult the decision, each destination will need its outbound-write grant as well, and the ownership map will decide which operations IMS may produce.',
+    `Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable, and the decision for that destination is SHADOW. A destination needs its outbound-write grant as well as its live-from instant before the decision can be LIVE, and the ownership map decides which operations IMS may produce. A variable has an effect only for a destination named in \`${PRODUCER_HOLD_ENFORCED_ENV}\`.`,
+  ].join('\n'),
+  enforcement: [
+    '| Variable | Value |',
+    '|---|---|',
+    `| \`${PRODUCER_HOLD_ENFORCED_ENV}\` | ${PRODUCER_HOLD_ENFORCED_FORMAT} |`,
+    '',
+    `Names the destinations whose producers obey the decision. A destination that is named obeys it for every operation; one that is not named is untouched. A value that is not a list of known destinations or \`all\` (a misspelling, a destination that does not exist) enforces EVERY destination, because a typo must not leave a hold off. Switching it on for Xero on an installation with no grant and no live-from instant makes every new Xero write a shadow and stops the Xero queue from receiving new work; switching it off again does not recover shadows, which are records and not queued work. Do not switch it on for WooCommerce or Mintsoft in this version: those producers do not consult the decision yet.`,
   ].join('\n'),
 }
 
 export const PRODUCER_DOC_PLACEMENTS: ReadonlyArray<{ file: string; blocks: readonly ProducerDocBlockId[] }> = [
-  { file: 'docs/installation.md', blocks: ['overview', 'cutoffs'] },
+  { file: 'docs/installation.md', blocks: ['overview', 'cutoffs', 'enforcement'] },
 ]
 
 export function renderProducerDocBlock(id: ProducerDocBlockId): string {

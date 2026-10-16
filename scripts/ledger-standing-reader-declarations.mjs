@@ -142,3 +142,24 @@ export const DECLARATIONS = [
   { key: "scripts/release-accounting-external-id-claim.ts::main::cmp-synced#1", class: "GUARD",
     reason: "Operator CLI: refuses to release another record's claim unless the row names an id and is in a repairable status; the dry run reads settlementBasis and refuses an operator-asserted row, and the transaction re-reads it." },
 ]
+
+// The durable-shadow census (scripts/check-ledger-standing-readers.mjs, producer-side hold S3). Every use of a "may have reached the
+// ledger" fragment outside ledger-standing.ts: a destructive reader consults the persistent shadow record (outbound_shadow_writes)
+// because the CANCELLED / HELD_SHADOW sync row expires with retention while the record does not, and a shadow is NOT proof the
+// document is absent (its real owner may have posted it).
+export const SHADOW_READER_DECLARATIONS = [
+  { key: "lib/domain/sales/order-delete-guard.ts::findSalesOrderDeleteBlocker::MAY_HAVE_REACHED_LEDGER_WHERE", class: "DURABLE_SHADOW",
+    reason: "Order hard-delete is irreversible. After retention deletes a shadow's sync row, the guard asks outbound_shadow_writes for the order, its shipments and its staged batch references and blocks (accounting_shadow_recorded) on an UNPROVEN, conditional sentence." },
+  { key: "lib/domain/inventory/stock-adjustment-edit.ts::adjustmentJournalMayHaveReachedLedger::MAY_HAVE_REACHED_LEDGER_WHERE", class: "DURABLE_SHADOW",
+    reason: "An in-place edit of a posted stock movement cannot revise a journal the owner may have posted. Refused on the sync row OR the durable shadow record for this movement and the inventory.journals operation." },
+  { key: "lib/connectors/woocommerce/sync/invoice-number.ts::countSalesInvoiceRowsThatMayHavePosted::MAY_HAVE_REACHED_LEDGER_WHERE", class: "DURABLE_SHADOW",
+    reason: "A stored invoice-number correction is refused when a sales-invoice row may have posted. A durable shadow record for the order (sales.invoice / sales.invoice-update) is counted too." },
+  { key: "lib/domain/accounting/unresolved-abandoned-claim.ts::UNRESOLVED_ABANDONED_CLAIM_WHERE::UNPROVEN_CANCELLED_EXCEPT_SHADOWS_WHERE", class: "EXEMPT",
+    reason: "This IS the retention predicate that deliberately lets a shadow's sync row expire (it holds no ledger claim). The compensating control is the durable record, which the destructive readers above consult; shadow retention itself is a separate bead." },
+  { key: "lib/domain/accounting/payment-reversal.ts::markBillPaidSupersedingStaleRegistrations::MAY_HAVE_REACHED_LEDGER_WHERE", class: "EXEMPT",
+    reason: "Re-reads only the PENDING registration row ids this call requested to supersede, to refuse if one moved; a shadow is CANCELLED from creation so it is never among them, and the answer never rests on the absence of a row." },
+  { key: "lib/domain/accounting/deferred-trueup.ts::UNEARNED_REVERSAL_NETTING_WHERE::UNPROVEN_CANCELLED_WHERE", class: "EXEMPT",
+    reason: "Report-only (o3d-3la07 D3): it widens the read so the true-up run SAYS which rows may have posted; it changes no arithmetic and deletes nothing." },
+  { key: "app/actions/sales.ts::readPaymentRegistrations::UNPROVEN_CANCELLED_WHERE", class: "PENDING_CONVERSION:o3d-zjsb5.26.10",
+    reason: "Reads INVOICE_PAYMENT rows by the payload's paymentId to decide whether a local payment may be retracted. The shadow record stores a payload digest only, so it cannot be matched to a payment today; after retention a shadowed payment reads as unregistered. Owned by o3d-zjsb5.26.10." },
+]

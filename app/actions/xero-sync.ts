@@ -1,5 +1,6 @@
 'use server'
 
+import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
@@ -746,6 +747,13 @@ export async function retryFailedXeroSync(
       // o3d-0m56 filter. The fence is run precisely to produce the reason: its CAS cannot match, and
       // it reads the row to say whether the STATUS or the ATTEMPT moved.
       if (entryId === undefined || expectedAttemptRevision === undefined) return { success: true, reset: 0 }
+      // THE PRODUCER-SIDE HOLD: this fence CAS can still land (the row may have failed since the candidate read above), and it
+      // writes PENDING, so the decision is asked on the row's own type and payload BEFORE the write. Held: the row stays FAILED.
+      const lateRow = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { type: true, payload: true } })
+      if (lateRow) {
+        const lateHold = xeroProducerSeamVerdict({ connector: 'xero', type: String(lateRow.type), payload: lateRow.payload })
+        if (lateHold.kind === 'shadow') return { success: false, reset: 0, error: lateHold.notice }
+      }
       const outcome = await applyFencedAttemptDecision(db, {
         id: entryId,
         expectedAttemptRevision,
@@ -857,6 +865,13 @@ export async function retryFailedXeroSync(
         const allowed: typeof scopeCandidates = []
         const refused: Array<{ id: string; reason: string; tokenCount: number }> = []
         for (const candidate of scopeCandidates) {
+          // THE PRODUCER-SIDE HOLD AT THE RE-QUEUE: a row whose decision is SHADOW is not made claimable again. (The claim
+          // boundary in the processor would refuse to send it anyway; this stops the row cycling back to PENDING.)
+          const hold = xeroProducerSeamVerdict({ connector: 'xero', type: String(candidate.type), payload: candidate.payload })
+          if (hold.kind === 'shadow') {
+            refused.push({ id: candidate.id, reason: hold.notice, tokenCount: 1 })
+            continue
+          }
           const plan = planManualRetry({
             type: candidate.type,
             reference: `${candidate.referenceType} ${candidate.referenceId}`,
