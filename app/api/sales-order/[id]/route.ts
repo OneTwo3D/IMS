@@ -122,6 +122,11 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       }
     }
   }
+  // Store credit is a payment: its own line, so the figures above add up to the Total below.
+  if (Number(so.storeCreditForeign ?? 0) > 0) {
+    doc.text('Store credit:', lX, doc.y, { width: lW, align: 'right' })
+    doc.text(`-${money(Number(so.storeCreditForeign))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  }
   doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
   doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
   doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })

@@ -242,6 +242,9 @@ export function buildWooOrder(spec: OrderSpec): WcFullOrder {
       code: coupon.code,
       discount: money(coupon.discountMinor),
       discount_tax: '0.00',
+      // As WooCommerce 8.7+ reports a redeemed coupon: the item records its type. A coupon with NO recorded type is
+      // refused by the import (it is not provably a discount), so a fixture without it would not be a real order.
+      meta_data: [{ id: spec.id * 10 + 7 + index, key: 'coupon_info', value: JSON.stringify([spec.id * 10 + 3 + index, coupon.code, 'fixed_cart', money(coupon.discountMinor)]) }],
     })),
     refunds: (spec.refundsMinor ?? []).map((minor, index) => ({ id: spec.id * 100 + index + 1, reason: 'Fixture partial refund', total: `-${money(minor)}` })),
   }

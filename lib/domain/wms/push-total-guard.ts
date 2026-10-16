@@ -44,6 +44,11 @@ export type PushTotalsInput = {
   withheldGoodsGross?: DecimalInput
   /** How many lines contribute to withheldGoodsGross (each adds a stored net and a stored VAT to the expected side). */
   withheldLineCount?: number
+  /**
+   * Store credit applied to the order, GROSS. A payment, so the order total is LOWER than the goods the
+   * payload states by exactly this: the payload carries the full goods value.
+   */
+  storeCreditGross?: DecimalInput
   /** The figures as the payload builder produced them. */
   payload: {
     lines: Array<{ quantity: number; unitPriceExVat: number; unitPriceVat: number }>
@@ -107,7 +112,7 @@ export function reconcilePushTotals(input: PushTotalsInput): PushTotalsVerdict {
   const totalVat = money(payload.totalVat)
 
   const pushedGross = goodsNet.add(shippingExVat).sub(discountExVat).add(totalVat)
-  const expectedGross = toDecimal(input.orderTotal).sub(toDecimal(input.withheldGoodsGross))
+  const expectedGross = toDecimal(input.orderTotal).add(toDecimal(input.storeCreditGross ?? 0)).sub(toDecimal(input.withheldGoodsGross))
   const drift = pushedGross.sub(expectedGross)
 
   const itemisedVat = goodsVat.add(shippingVat).sub(discountVat)

@@ -1,4 +1,5 @@
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
+import { STORE_CREDIT_PUSH_WITHHELD_REASON, storeCreditPushMustBeWithheld } from '@/lib/domain/wms/store-credit-push-guard'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -348,6 +349,10 @@ type OrderForPush = {
   taxRatePercent: unknown
   pricesIncludeVat: boolean
   discountAmount: unknown
+  /** Store credit, GROSS: a payment, so it is in the order total's gap but never in the pushed discount. */
+  storeCreditForeign?: unknown
+  /** ASSESSED only from the credit-aware import's creating write; REVIEW_REQUIRED holds the push. */
+  storeCreditAssessment?: unknown
   totalForeign: unknown
   lines: CandidateLine[]
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
@@ -385,6 +390,8 @@ export function orderTotalDriftPence(order: {
   taxRatePercent: unknown
   shippingForeign: unknown
   discountAmount: unknown
+  /** Store credit (a payment): the order total is lower than goods + tax + shipping by exactly this. */
+  storeCreditForeign?: unknown
   totalForeign: unknown
   pricesIncludeVat: boolean
 }, currency = 'GBP'): number {
@@ -392,6 +399,8 @@ export function orderTotalDriftPence(order: {
   const tax = dec(order.taxForeign)
   const shipping = dec(order.shippingForeign)
   const discount = dec(order.discountAmount)
+  // Store credit is a payment: the order total is lower than goods + tax + shipping by exactly this.
+  const storeCredit = dec(order.storeCreditForeign)
   const total = dec(order.totalForeign)
 
   let discountVat = toDecimal(0)
@@ -401,7 +410,7 @@ export function orderTotalDriftPence(order: {
     if (rate.gt(0)) discountVat = discount.mul(rate).div(rate.add(1))
   }
 
-  const computed = subtotal.add(tax).add(shipping).sub(discount).add(discountVat)
+  const computed = subtotal.add(tax).add(shipping).sub(discount).add(discountVat).sub(storeCredit)
   // Whole MINOR UNITS of the order currency (pence for GBP), half-up, exact decimal arithmetic.
   return roundQuantity(computed.sub(total).abs().mul(toDecimal(10).pow(currencyMinorUnits(currency))), 0).toNumber()
 }
@@ -440,6 +449,7 @@ export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPu
     const verdict = reconcilePushTotals({
       currency: order.currency,
       orderTotal: order.totalForeign as Parameters<typeof reconcilePushTotals>[0]['orderTotal'],
+      storeCreditGross: dec(order.storeCreditForeign),
       withheldGoodsGross: withheldGoodsGross(order.lines, refundedQtyByLine(order)),
       withheldLineCount: withheldLineCount(order.lines, refundedQtyByLine(order)),
       payload: input,
@@ -517,6 +527,8 @@ const ORDER_PUSH_SELECT = {
   taxRatePercent: true,
   pricesIncludeVat: true,
   discountAmount: true,
+  storeCreditForeign: true,
+  storeCreditAssessment: true,
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
@@ -540,6 +552,8 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
   const recipient = resolvePushRecipient(order)
   // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
   if (!recipient.address.address1) throw new Error(NO_DELIVERY_STREET_REASON)
+  // Refuse too when the discount may still contain store credit (a payment, never a discount): see the guard.
+  if (storeCreditPushMustBeWithheld(order)) throw new Error(STORE_CREDIT_PUSH_WITHHELD_REASON)
   return {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,
