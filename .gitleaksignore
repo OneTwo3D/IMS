@@ -13,3 +13,9 @@ a9b95f858ff43001af527147f8812bbe70612ab7:tests/domain/accounting/accounting-even
 # o3d-kb3dq round 4: a canary SAMPLE of an unrecognised bearer-header cron line in the rewrite's refusal tests (the rewrite exists to refuse that shape); no real credential. Later lines build it by concatenation.
 f592b26a762a25caf541b7b0bc1706005c847225:tests/scripts/installer-secrets-argv.test.ts:curl-auth-header:570
 f592b26a762a25caf541b7b0bc1706005c847225:tests/scripts/cron-bearer-rewrite-upgrade-paths.test.ts:curl-auth-header:536
+# First-load apply runner tests: fixture order references (`orderKey: 'ZQSENT-PO-...'`) and key comparisons in synthetic tests; invented values, no credential. Later commits use named constants.
+66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-helpers.ts:generic-api-key:56
+66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-helpers.ts:generic-api-key:57
+66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-helpers.ts:generic-api-key:58
+66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-fingerprint.test.ts:generic-api-key:67
+66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-fingerprint.test.ts:generic-api-key:95

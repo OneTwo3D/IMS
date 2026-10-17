@@ -1,0 +1,225 @@
+/**
+ * FIRST-LOAD APPLY RUNNER: every constant and every operator-facing sentence in one place.
+ *
+ * PURE: no database, no network, no clock, no filesystem. `docs/first-load-apply.md` carries marked blocks that must equal
+ * what is exported here, and `tests/first-load/apply-docs.test.ts` fails when the two disagree.
+ *
+ * WHAT THIS SLICE IS. The runner's FILE side and its orchestration: it loads and verifies a prepared run, computes natural
+ * keys and fingerprints, splits each step into the rows still to load, and drives the steps through ports (observe the
+ * database, run an importer, keep a journal). The ports are implemented by the database slice; nothing here talks to one.
+ */
+import type { ImporterTarget } from '../spec'
+
+// ---------------------------------------------------------------------------
+// Steps
+// ---------------------------------------------------------------------------
+
+/** The steps the runner can apply, in the only order it applies them. Transfers are refused outright (see TRANSFERS_REFUSAL). */
+export const APPLY_STEP_IDS = ['suppliers', 'products', 'opening-stock', 'purchase-orders'] as const
+export type ApplyStepId = (typeof APPLY_STEP_IDS)[number]
+
+/** A step's importer file kind. Each step id is its own target name. */
+export const STEP_TARGET: Readonly<Record<ApplyStepId, ImporterTarget>> = {
+  suppliers: 'suppliers',
+  products: 'products',
+  'opening-stock': 'opening-stock',
+  'purchase-orders': 'purchase-orders',
+}
+
+/** What must also be selected for a step to be loadable (a row refers to something an earlier step creates). */
+export const STEP_PREREQUISITES: Readonly<Record<ApplyStepId, readonly ApplyStepId[]>> = {
+  suppliers: [],
+  products: [],
+  'opening-stock': ['products'],
+  'purchase-orders': ['suppliers', 'products'],
+}
+
+export const PREPARED_REPORT_NAME = 'validation-report.json'
+export const PREPARED_REPORT_MARKDOWN_NAME = 'validation-report.md'
+
+/** The only base currency the first load supports (the one-way door in the plan). */
+export const SUPPORTED_BASE_CURRENCY = 'GBP'
+
+/** A rehearsal report older than this does not authorise an apply. */
+export const REHEARSAL_MAX_AGE_HOURS = 24
+
+export const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+// ---------------------------------------------------------------------------
+// Exit codes: ONE table. The document repeats it; the command and its --help read it from here.
+// ---------------------------------------------------------------------------
+
+export const APPLY_EXIT_CODES = {
+  OK: 0,
+  VERIFY_FAILED: 1,
+  USAGE: 2,
+  PRECONDITION_REFUSED: 3,
+  STEP_FAILED: 4,
+  CONFLICT: 5,
+  INTERNAL: 6,
+  REHEARSAL_TEARDOWN_INCOMPLETE: 7,
+} as const
+export type ApplyExitName = keyof typeof APPLY_EXIT_CODES
+
+export const APPLY_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: ApplyExitName; meaning: string }> = [
+  { code: APPLY_EXIT_CODES.OK, name: 'OK', meaning: 'The rehearsal or apply finished and every verification passed.' },
+  {
+    code: APPLY_EXIT_CODES.VERIFY_FAILED,
+    name: 'VERIFY_FAILED',
+    meaning: 'Applied, but the post-run verification found a difference. The report names it. Rows ARE written; the restore procedure is printed.',
+  },
+  {
+    code: APPLY_EXIT_CODES.USAGE,
+    name: 'USAGE',
+    meaning:
+      'Bad arguments, an apply manifest that cannot be used, or a prepared run that cannot be used (a digest, SHA-256, header, limit, key or cross-file check failed, an input is unbound or unverified, or a transfers file is present). This command wrote nothing.',
+  },
+  {
+    code: APPLY_EXIT_CODES.PRECONDITION_REFUSED,
+    name: 'PRECONDITION_REFUSED',
+    meaning: 'A rail or an apply-time check refused before the first write (including: no matching rehearsal, a run that already exists, or another runner holding the run). This command wrote nothing; an earlier run of the same load may have.',
+  },
+  {
+    code: APPLY_EXIT_CODES.STEP_FAILED,
+    name: 'STEP_FAILED',
+    meaning:
+      'A step failed after writes began. The database is partially loaded and the run is resumable with --resume (same digest) or restorable from the recorded restore point. Rows ARE written.',
+  },
+  {
+    code: APPLY_EXIT_CODES.CONFLICT,
+    name: 'CONFLICT',
+    meaning: 'The database holds a key with different data than the file (or a row nobody in this run created). Nothing further was written; rows from earlier steps ARE written.',
+  },
+  {
+    code: APPLY_EXIT_CODES.INTERNAL,
+    name: 'INTERNAL',
+    meaning: 'A self-check failed (the row accounting did not reconcile, or a report write failed). This is a defect in the runner. The database state is NOT assumed to be unchanged.',
+  },
+  {
+    code: APPLY_EXIT_CODES.REHEARSAL_TEARDOWN_INCOMPLETE,
+    name: 'REHEARSAL_TEARDOWN_INCOMPLETE',
+    meaning: 'Rehearsal only: the throwaway database could not be removed completely. The real target was not written.',
+  },
+]
+
+/** Exits for which the runner can PROVE that nothing was written: no write happens before the precondition phase ends. */
+export const NOTHING_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['USAGE', 'PRECONDITION_REFUSED'])
+/** Exits after which rows ARE (or may be) written and the restore procedure must be printed. */
+export const ROWS_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['VERIFY_FAILED', 'STEP_FAILED', 'CONFLICT', 'INTERNAL'])
+
+export const NOTHING_WRITTEN_TEXT = 'This command wrote nothing to the database.'
+export const ROWS_WRITTEN_TEXT = 'Rows may already be written to the database by this run.'
+export const RESTORE_PROCEDURE_TEXT =
+  'To undo this run, stop the application, restore the recorded restore point (a PostgreSQL custom-format dump) into an empty database, run the migrations and start again. '
+  + 'The runner never restores by itself, and it never deletes rows.'
+
+/** The sentence printed after a non-zero exit. Only the exits in NOTHING_WRITTEN_EXITS may say "nothing was written". */
+export function exitOperatorText(name: ApplyExitName): string {
+  if (name === 'OK') return ''
+  if (NOTHING_WRITTEN_EXITS.has(name)) return NOTHING_WRITTEN_TEXT
+  if (ROWS_WRITTEN_EXITS.has(name)) return `${ROWS_WRITTEN_TEXT} ${RESTORE_PROCEDURE_TEXT}`
+  return 'The real target database was not written by this rehearsal; remove the leftover throwaway database by hand.'
+}
+
+export const TRANSFERS_REFUSAL =
+  'the prepared run contains a transfers file; the runner cannot load transfers (they are Server Actions with their own permission checks and stock-sync effects). Remove the transfers from the run or load them by hand.'
+
+// ---------------------------------------------------------------------------
+// Row outcomes and conflict codes
+// ---------------------------------------------------------------------------
+
+export const UNIT_STATES = ['absent', 'present-matching', 'present-conflicting'] as const
+export type UnitState = (typeof UNIT_STATES)[number]
+
+export const ROW_OUTCOMES = ['created', 'updated', 'skipped-existing', 'failed', 'conflict', 'planned', 'would-skip-existing'] as const
+export type RowOutcome = (typeof ROW_OUTCOMES)[number]
+
+/** Why a key is in conflict. A closed list: the report and the docs name each one. */
+export const CONFLICT_CODES = [
+  'FIELDS_DIFFER',
+  'RECIPE_DIFFERS',
+  'CASE_COLLISION',
+  'FOREIGN_HISTORY',
+  'FOREIGN_ROW',
+  'DUPLICATE_IN_DATABASE',
+] as const
+export type ConflictCode = (typeof CONFLICT_CODES)[number]
+
+export const CONFLICT_CODE_MEANING: Readonly<Record<ConflictCode, string>> = {
+  FIELDS_DIFFER: 'The key exists in the database with different field values than the file.',
+  RECIPE_DIFFERS: 'The product exists and matches, but its recipe (components) is missing or different.',
+  CASE_COLLISION: 'A different key exists that is equal under the importers\' case-insensitive matching.',
+  FOREIGN_HISTORY: 'Opening stock: the product and warehouse already have stock, a cost layer or a movement that is not this run\'s opening layer.',
+  FOREIGN_ROW: 'The database holds a row of this step that this run did not emit.',
+  DUPLICATE_IN_DATABASE: 'The database holds the key more than once, so no single row can be compared.',
+}
+
+// ---------------------------------------------------------------------------
+// Journal and report
+// ---------------------------------------------------------------------------
+
+export const RUN_STATUSES = ['RUNNING', 'STEP_FAILED', 'CONFLICT', 'APPLIED', 'VERIFIED', 'VERIFY_FAILED'] as const
+export type RunStatus = (typeof RUN_STATUSES)[number]
+/** A resume is accepted only from these. */
+export const RESUMABLE_STATUSES: ReadonlySet<RunStatus> = new Set<RunStatus>(['RUNNING', 'STEP_FAILED', 'VERIFY_FAILED'])
+
+export const STEP_STATUSES = ['PENDING', 'RUNNING', 'DONE', 'FAILED', 'CONFLICT'] as const
+export type StepStatus = (typeof STEP_STATUSES)[number]
+
+export const APPLY_REPORT_FORMAT_VERSION = 1
+
+/**
+ * WHAT A REPORT ROW MAY CARRY (docs/first-load-apply.md, "What a report contains"). A report is a private operator artefact. Per unit it holds the
+ * unit key (a catalogue identifier the operator needs to act on a failure: supplier name, SKU, SKU|WAREHOUSE pair, purchase-order reference) and closed
+ * words; never another cell of a prepared file, an importer's text, an exception message or a credential. tests/first-load/apply-orchestrate.test.ts
+ * pins these field lists.
+ */
+export const REPORT_ROW_FIELDS = ['key', 'outcome', 'reason'] as const
+export const REPORT_CONFLICT_FIELDS = ['key', 'code', 'detail'] as const
+export const REPORT_IMPORTER_MESSAGE_FIELDS = ['code', 'row'] as const
+export const APPLY_REPORT_JSON_NAME = 'first-load-apply-report.json'
+export const APPLY_REPORT_MARKDOWN_NAME = 'first-load-apply-report.md'
+export const RESIDUAL_FILE_PREFIX = 'residual-'
+
+/** The rehearsal record `--apply` insists on (written by the rehearsal mode). */
+export const REHEARSAL_RECORD_FORMAT_VERSION = 1
+
+export const APPLY_MODES = ['plan', 'apply'] as const
+export type ApplyMode = (typeof APPLY_MODES)[number]
+
+/** The warehouse profile keys and the types a warehouse can have (prisma enum WarehouseType; a test keeps them equal). */
+export const WAREHOUSE_TYPES = ['STANDARD', 'QUARANTINE', 'RESTOCK'] as const
+export const WAREHOUSE_PROFILE_KEYS = ['type', 'availableForSale', 'syncToStore'] as const
+
+/** The apply manifest keys, a closed list. */
+export const APPLY_MANIFEST_KEYS = [
+  'formatVersion', 'runId', 'preparedDir', 'baseCurrency', 'steps', 'expectWarehouses', 'acceptZeroCost', 'fxRates', 'forbidSkus', 'restorePointDir', 'wooSnapshot',
+] as const
+export const APPLY_WOO_SNAPSHOT_KEYS = ['snapshot', 'provenance', 'variantParents', 'origin', 'visibilityChecked'] as const
+
+// ---------------------------------------------------------------------------
+// Which apply-time checks the runner core covers (every id of APPLY_TIME_CHECKS has exactly one entry)
+// ---------------------------------------------------------------------------
+
+export const CHECK_COVERAGE_STATUSES = ['file-side', 'partial', 'database', 'not-applicable'] as const
+export type CheckCoverageStatus = (typeof CHECK_COVERAGE_STATUSES)[number]
+
+/**
+ * `file-side`: proved from the prepared files alone by the core. `partial`: the file part is proved here and the part that needs IMS is
+ * the database slice's. `database`: only the database slice can prove it. `not-applicable`: the runner refuses the whole area.
+ */
+export const APPLY_CHECK_COVERAGE: Readonly<Record<string, { status: CheckCoverageStatus; core: string }>> = {
+  'warehouse-exists': { status: 'partial', core: 'The warehouse codes the files use must equal the codes declared in the apply manifest (expectWarehouses). That each exists in IMS with that profile is read from the database.' },
+  'base-currency': { status: 'partial', core: 'The apply manifest, the prepared report and the supported base currency (GBP) must agree. The organisation row is read from the database.' },
+  'opening-stock-empty': { status: 'partial', core: 'Stock history on a product and warehouse that is not this run\'s opening layer is a conflict (FOREIGN_HISTORY) and stops the run. Reading that history is the database slice\'s.' },
+  'po-supplier-exists': { status: 'partial', core: 'Every purchase-order supplier must be a supplier of the suppliers file, which the same run loads first.' },
+  'po-fx-rate': { status: 'partial', core: 'Every non-base order\'s fxRateToBase must equal the rate the apply manifest states for the currency, and every stated rate must be used. That IMS holds a rate within 2% is read from the database.' },
+  'po-tax-rate': { status: 'database', core: 'Needs the IMS tax rates.' },
+  'lookup-keys-unique-in-ims': { status: 'partial', core: 'Inside the files, no two suppliers, products, stock pairs or orders may differ only in letter case. A look-alike already in the database is a conflict (CASE_COLLISION).' },
+  'po-reference-free': { status: 'partial', core: 'An order whose reference already exists with the same content is skipped as existing; with different content it is a conflict. Reading the references is the database slice\'s.' },
+  'po-product-lifecycle': { status: 'database', core: 'Needs the lifecycle of products that are only in IMS.' },
+  'transfer-reference-free': { status: 'not-applicable', core: 'The runner refuses a prepared run that contains transfers.' },
+  'transfer-source-stock': { status: 'not-applicable', core: 'The runner refuses a prepared run that contains transfers.' },
+  'barcode-free': { status: 'database', core: 'Needs the barcodes already in IMS.' },
+  'product-parent-exists': { status: 'file-side', core: 'Every VARIANT\'s parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot.' },
+}
