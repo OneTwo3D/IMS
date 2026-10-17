@@ -604,8 +604,10 @@ test('OUTBOX HISTORY through the real functions: an attempted job that is REPLAY
   const d = await deps()
   const tag = tagOf()
   t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
-  const { outboxBeforeCutoffWhere: _unused, ...rest } = d.outbox as Record<string, unknown>
-  void _unused; void rest
+  // A hold text is recognised only with the installation's settings key (its reference is derived from it); the db tier may run without one.
+  const savedKey = process.env.SETTINGS_ENCRYPTION_KEY
+  if (!savedKey) process.env.SETTINGS_ENCRYPTION_KEY = 'prod_readiness_ci_settings_key__'
+  t.after(() => { if (!savedKey) delete process.env.SETTINGS_ENCRYPTION_KEY })
   const held = (await import('../../lib/security/outbound-write-hold-constants.ts')).outboundHeldMessage({
     connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/wp-json/x', hop: 0,
   })
