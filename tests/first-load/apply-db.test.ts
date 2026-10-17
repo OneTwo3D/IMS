@@ -722,6 +722,73 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.equal(cells, rows.length)
       })
 
+      it('same-named rates and the declared ceiling: the name must resolve to one purchase value, and no rate the importer could apply may exceed the prepared report\'s maximum', async () => {
+        // Mutations named: ambiguity check off; ceiling check off; "all same-named rates are purchase rates" off -> the matching arms below are green when they must be red.
+        await resetData()
+        const named = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME } })
+        const five = await m.db.taxRate.create({ data: { name: `${VAT_NAME} five`, rate: '0.05', usedFor: 'PURCHASE', active: true } })
+        const created: string[] = [five.id]
+        const add = async (data: { name: string; rate: string; usedFor: string; active?: boolean }) => { const r = await m.db.taxRate.create({ data: { ...data, active: data.active ?? true } }); created.push(r.id); return r }
+        const ceiling = prepared.report.config.maxPurchaseTaxRate
+        assert.equal(ceiling, '0.25', 'precondition: the synthetic prepared report declares 0.25')
+        const stubFor = (line: Record<string, string>) => {
+          const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', ...line }])
+          return { ...prepared, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }] } as unknown as PreparedRun
+        }
+        const problemsFor = async (line: Record<string, string>) => (await m.rails.evaluateRails(stubFor(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })).filter((p) => p.startsWith('purchase tax:'))
+        const setNamed = async (rate: string) => { await m.db.taxRate.update({ where: { id: named.id }, data: { rate } }) }
+        const LINE_NAMED = { taxRateName: VAT_NAME, orderTaxRateName: `${VAT_NAME} five`, orderTaxRateValue: '5' } // the order tax is valid, so only the LINE decides
+        const ORDER_ONLY = { orderTaxRateName: VAT_NAME } // an unnamed line: the order tax (and what lines inherit) decides
+        let cells = 0
+        const expect = async (label: string, line: Record<string, string>, refused: RegExp | null) => {
+          const problems = await problemsFor(line)
+          if (refused) assert.ok(problems.some((p) => refused.test(p)), `${label}: refused as ${refused} (got ${JSON.stringify(problems)})`)
+          else assert.deepEqual(problems, [], `${label}: accepted`)
+          assert.ok(!problems.join(';').includes(VAT_NAME), `${label}: no tax name in the sentence`)
+          cells++
+        }
+        try {
+          // ---- same-name duplicates ----
+          await expect('control: one eligible rate', ORDER_ONLY, null)
+          const salesDuplicate = await add({ name: VAT_NAME, rate: '0.2', usedFor: 'SALES' })
+          await expect('order name shared with a SALES-only rate, no stated value', ORDER_ONLY, /order\(s\) have an order-level tax name shared by active rates/)
+          await expect('line name: a SALES-only duplicate is NOT a candidate (the importer\'s line lookup filters it)', LINE_NAMED, null)
+          await m.db.taxRate.update({ where: { id: salesDuplicate.id }, data: { usedFor: 'PURCHASE' } })
+          await expect('identical eligible duplicates (same value): order', ORDER_ONLY, null)
+          await expect('identical eligible duplicates (same value): line', LINE_NAMED, null)
+          await m.db.taxRate.update({ where: { id: salesDuplicate.id }, data: { rate: '0.1' } })
+          await expect('two eligible same-name rates, different values: order', ORDER_ONLY, /order\(s\) have an order-level tax name shared by active rates/)
+          await expect('two eligible same-name rates, different values: line', LINE_NAMED, /line\(s\) resolve to more than one active purchase rate with different values/)
+          await m.db.taxRate.update({ where: { id: salesDuplicate.id }, data: { active: false } })
+          await expect('the differing duplicate is inactive: accepted', ORDER_ONLY, null)
+          // ---- the declared ceiling (0.25) ----
+          await setNamed('0.3')
+          await expect('named line above the ceiling', LINE_NAMED, /line\(s\) could be taxed above the maximum/)
+          await expect('inherited order rate above the ceiling (unnamed line)', ORDER_ONLY, /order\(s\) could be taxed above the maximum/)
+          const thirty = await add({ name: `${VAT_NAME} thirty`, rate: '0.3', usedFor: 'PURCHASE' })
+          void thirty
+          await expect('value-fallback match above the ceiling (a line with no name)', { taxRateValue: '30' }, /line\(s\) could be taxed above the maximum/)
+          await setNamed('0.25')
+          await expect('named line AT the ceiling', LINE_NAMED, null)
+          await expect('inherited order rate AT the ceiling', ORDER_ONLY, null)
+          await setNamed('0.2')
+          await expect('below the ceiling', LINE_NAMED, null)
+          await expect('value-only line below the ceiling', { taxRateValue: '5' }, null)
+          // ---- nothing is written on a refusal ----
+          await setNamed('0.3')
+          const stub = stubFor(LINE_NAMED)
+          const before = { runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }
+          const result = await runLoad(stub, m.ports.createDbPorts(stub, { operator: 'Apply Test' }), apply(stub))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED')
+          assert.deepEqual({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }, before)
+        } finally {
+          await setNamed('0.2')
+          await m.db.taxRate.deleteMany({ where: { id: { in: created } } }).catch(() => undefined)
+          await m.db.taxRate.deleteMany({ where: { id: { in: (await m.db.taxRate.findMany({ where: { name: { startsWith: `${VAT_NAME} ` } }, select: { id: true } })).map((r) => r.id) } } }).catch(() => undefined)
+        }
+        assert.ok(cells >= 14, `cells examined: ${cells}`)
+      })
+
       it('purchase orders: an FX rate outside the importer\'s 2%, and a currency with no stored rate, are refused', async () => {
         const row = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR' } })
         await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.30' } })
@@ -1071,5 +1138,5 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
 
 /** The odd purchase-order file as a stub prepared run, so the tax rail can read its tax cells. */
 async function loadWithTaxFile(): Promise<PreparedRun> {
-  return { manifest: prepared.manifest, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: ODD_FILES['purchase-orders'], units: keyStep('purchase-orders', ODD_FILES['purchase-orders']).units }] } as unknown as PreparedRun
+  return { manifest: prepared.manifest, report: prepared.report, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: ODD_FILES['purchase-orders'], units: keyStep('purchase-orders', ODD_FILES['purchase-orders']).units }] } as unknown as PreparedRun
 }

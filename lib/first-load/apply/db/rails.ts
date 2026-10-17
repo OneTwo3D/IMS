@@ -16,7 +16,7 @@
  */
 import { db } from '@/lib/db'
 import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
-import { D } from '../../money'
+import { D, type Dec } from '../../money'
 import type { ApplyStepId } from '../constants'
 import { normaliseTaxValue } from '../normal-form'
 import type { PreparedRun } from '../prepared'
@@ -115,46 +115,60 @@ async function taxRates(prepared: PreparedRun, problems: string[]): Promise<void
   if (!step) return
   const rates = await db.taxRate.findMany({ select: { name: true, rate: true, usedFor: true, active: true } })
   const active = rates.filter((r) => r.active)
-  const eligible = active.filter((r) => r.usedFor === 'PURCHASE' || r.usedFor === 'BOTH')
+  const isPurchase = (r: { usedFor: string }): boolean => r.usedFor === 'PURCHASE' || r.usedFor === 'BOTH'
+  const eligible = active.filter(isPurchase)
+  const value = (r: { rate: { toFixed(): string } }): Dec => new D(r.rate.toFixed())
+  const sameValue = (r: { rate: { toFixed(): string } }, stated: string): boolean => value(r).eq(new D(stated))
+  // The ceiling the prepare report declared and used to bound every order's totals. The tool refuses to run without one when orders are present, so an absent one fails closed.
+  const declaredMax = prepared.report.config.maxPurchaseTaxRate
+  const ceiling = declaredMax === null ? null : new D(declaredMax)
+  if (ceiling === null) problems.push('purchase tax: the prepared report declares no maximum purchase tax rate, so no rate can be shown to be within it')
+  /** More than one candidate with different values: which one the importer takes is not something to rely on. */
+  const ambiguous = (candidates: Array<{ rate: { toFixed(): string } }>): boolean => new Set(candidates.map((r) => value(r).toFixed(4))).size > 1
+  const aboveCeiling = (candidates: Array<{ rate: { toFixed(): string } }>): boolean => ceiling !== null && candidates.some((r) => value(r).gt(ceiling))
+
   const col = (name: string): number => step.data.header.indexOf(name)
-  const [nameIx, valueIx, orderNameIx, orderKeyIx] = [col('taxRateName'), col('taxRateValue'), col('orderTaxRateName'), col('orderKey')]
-  let unresolvedLines = 0
-  let unspelledOrders = 0
-  let valueMismatchLines = 0
-  let valueMismatchOrders = 0
-  const sameValue = (rate: { rate: { toFixed(): string } }, stated: string): boolean => new D(rate.rate.toFixed()).eq(new D(stated))
+  const [nameIx, valueIx, orderNameIx, orderKeyIx, orderValueIx] = [col('taxRateName'), col('taxRateValue'), col('orderTaxRateName'), col('orderKey'), col('orderTaxRateValue')]
+  const counts = { unresolvedLines: 0, unspelledOrders: 0, valueMismatchLines: 0, valueMismatchOrders: 0, ambiguousLines: 0, ambiguousOrders: 0, ceilingLines: 0, ceilingOrders: 0 }
   const firstRowOfOrder = new Set<string>()
   for (const row of step.data.rows) {
     const name = (nameIx < 0 ? '' : row.cells[nameIx] ?? '').trim()
     const valueText = valueIx < 0 ? '' : row.cells[valueIx] ?? ''
+    const stated = normaliseTaxValue(valueText)
     if (name !== '' || valueText.trim() !== '') {
-      const byName = name !== '' && eligible.some((r) => r.name.trim().toLowerCase() === name.toLowerCase())
-      const value = normaliseTaxValue(valueText)
-      const byValue = value !== '' && eligible.some((r) => new D(r.rate.toFixed()).minus(new D(value)).abs().lt(new D('0.00005')))
-      // EXACTLY the importer's resolveImportedTaxRateId: a stated NAME resolves by name among the active purchase rates, and only a line with NO name falls back to the value.
-      // (The importer also falls back to the value when a stated name matches nothing; that creates the order under a different tax, so the rail refuses it instead.)
-      if (name !== '' ? !byName : !byValue) unresolvedLines++
-      // The importer resolves BY NAME and ignores a stated value: when the file states both, the named rate must have that value.
-      const stated = normaliseTaxValue(valueText)
-      if (byName && stated !== '') {
-        // Every eligible rate of that name must have the stated value: which of two same-named rates the importer takes is not something to rely on.
-        const named = eligible.filter((r) => r.name.trim().toLowerCase() === name.toLowerCase())
-        if (named.some((r) => !sameValue(r, stated))) valueMismatchLines++
+      // EXACTLY the importer's resolveImportedTaxRateId, with the fallback it has for a name that matches nothing REFUSED: a stated NAME resolves by name among the
+      // active purchase rates; only a line with NO name resolves by value (within 0.00005).
+      const candidates = name !== ''
+        ? eligible.filter((r) => r.name.trim().toLowerCase() === name.toLowerCase())
+        : stated === '' ? [] : eligible.filter((r) => value(r).minus(new D(stated)).abs().lt(new D('0.00005')))
+      if (candidates.length === 0) counts.unresolvedLines++
+      else {
+        if (name !== '' && stated !== '' && candidates.some((r) => !sameValue(r, stated))) counts.valueMismatchLines++
+        if (ambiguous(candidates)) counts.ambiguousLines++
+        if (aboveCeiling(candidates)) counts.ceilingLines++
       }
     }
     const orderKey = orderKeyIx < 0 ? '' : row.cells[orderKeyIx] ?? ''
     if (firstRowOfOrder.has(orderKey)) continue
     firstRowOfOrder.add(orderKey)
     const orderName = ((orderNameIx < 0 ? '' : row.cells[orderNameIx] ?? '').trim()) || name
-    // The order-level lookup takes any active rate of exactly that name; a rate that is not a purchase rate is refused here as well.
-    if (orderName !== '' && !eligible.some((r) => r.name === orderName)) unspelledOrders++
-    const orderValueIx = col('orderTaxRateValue')
-    const orderStated = normaliseTaxValue(orderValueIx < 0 ? '' : row.cells[orderValueIx] ?? '') || normaliseTaxValue(valueText)
-    const orderRates = orderName === '' ? [] : active.filter((r) => r.name === orderName)
-    if (orderStated !== '' && orderRates.some((r) => !sameValue(r, orderStated))) valueMismatchOrders++
+    if (orderName === '') continue
+    // The importer's order-level lookup takes ANY active rate of exactly that name (no purchase filter) and names are not unique. Every active rate of that name must therefore
+    // be a purchase rate, and they must all have the same value; one that is not, or that differs, could be the one it takes.
+    const orderRates = active.filter((r) => r.name === orderName)
+    if (!orderRates.some(isPurchase)) { counts.unspelledOrders++; continue }
+    if (orderRates.some((r) => !isPurchase(r)) || ambiguous(orderRates)) counts.ambiguousOrders++
+    const orderStated = normaliseTaxValue(orderValueIx < 0 ? '' : row.cells[orderValueIx] ?? '') || stated
+    if (orderStated !== '' && orderRates.some((r) => !sameValue(r, orderStated))) counts.valueMismatchOrders++
+    if (aboveCeiling(orderRates)) counts.ceilingOrders++
   }
-  if (unresolvedLines > 0) problems.push(`purchase tax: ${unresolvedLines} line(s) name a tax that matches no active purchase rate`)
-  if (valueMismatchLines > 0) problems.push(`purchase tax: ${valueMismatchLines} line(s) state a tax value that is not the value of the active rate they name`)
-  if (valueMismatchOrders > 0) problems.push(`purchase tax: ${valueMismatchOrders} order(s) state a tax value that is not the value of the active rate they name`)
-  if (unspelledOrders > 0) problems.push(`purchase tax: ${unspelledOrders} order(s) have an order-level tax name with no active purchase rate of exactly that spelling`)
+  const say = (n: number, text: string): void => { if (n > 0) problems.push(`purchase tax: ${n} ${text}`) }
+  say(counts.unresolvedLines, 'line(s) name a tax that matches no active purchase rate')
+  say(counts.valueMismatchLines, 'line(s) state a tax value that is not the value of the active rate they name')
+  say(counts.valueMismatchOrders, 'order(s) state a tax value that is not the value of the active rate they name')
+  say(counts.unspelledOrders, 'order(s) have an order-level tax name with no active purchase rate of exactly that spelling')
+  say(counts.ambiguousLines, 'line(s) resolve to more than one active purchase rate with different values')
+  say(counts.ambiguousOrders, 'order(s) have an order-level tax name shared by active rates that are not all purchase rates or that differ in value')
+  say(counts.ceilingLines, 'line(s) could be taxed above the maximum purchase tax rate the prepared report declares')
+  say(counts.ceilingOrders, 'order(s) could be taxed above the maximum purchase tax rate the prepared report declares')
 }
