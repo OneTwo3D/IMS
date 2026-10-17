@@ -233,6 +233,27 @@ test('REAL ORDER-PUSH PORT, LIVE PHASE: an order paid BEFORE the live-from insta
   })
 })
 
+test('REAL ORDER-PUSH PORT, AMEND QUEUE: updatableLinks honours the live-from floor on the change time (a change before it is left out; no floor is the legacy answer)', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `msu${randomUUID().slice(0, 8)}`
+  const seeded = await seedOrder(d, tag, new Date('2026-05-01T00:00:00Z'))
+  t.after(() => cleanupOrder(d, seeded))
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const link = await d.db.wmsOrderPushLink.create({
+    data: { orderId: seeded.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: `wms-${tag}`, pushedAt: new Date('2026-04-01T00:00:00Z') },
+    select: { id: true },
+  })
+  const floor = new Date('2026-06-01T00:00:00Z')
+  const setChanged = (at: string) => d.db.$executeRawUnsafe(`UPDATE sales_orders SET "updatedAt" = '${at}'::timestamp WHERE id = '${seeded.orderId}'`)
+  const ids = async (changedNotBefore?: Date) => (await port.updatableLinks('mintsoft', 100000, changedNotBefore)).map((row: { id: string }) => row.id)
+
+  await setChanged('2026-05-15 00:00:00')
+  assert.ok((await ids()).includes(link.id), 'CONTROL: no floor is the legacy query, which offers a change made before the instant')
+  assert.equal((await ids(floor)).includes(link.id), false, 'a change before the floor is left out of the bounded batch')
+  await setChanged('2026-06-10 00:00:00')
+  assert.ok((await ids(floor)).includes(link.id), 'a change after the floor is offered')
+})
+
 // ───────────────────────── retention and evidence ─────────────────────────
 
 test('RETENTION: the shadow record of a Mintsoft write (its only evidence) survives the real retention sweep, aged far past every window', { skip }, async (t) => {

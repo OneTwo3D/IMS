@@ -785,7 +785,7 @@ export interface WmsOrderPushPort {
    * only the scoped verification is retried.
    */
   verifiableLinks?(connector: string, limit: number): Promise<WmsPushVerifyLink[]>
-  updatableLinks(connector: string, limit: number): Promise<WmsPushUpdateLink[]>
+  updatableLinks(connector: string, limit: number, changedNotBefore?: Date): Promise<WmsPushUpdateLink[]>
   /**
    * o3d-92fu — VALIDATION_FAILED links whose order is STILL create-eligible, so the
    * sweep can re-run the (purely local, zero-API-cost) payload build and put the order
@@ -2214,7 +2214,10 @@ export async function runWmsOrderPushSweepCore(
 
   // --- Update pass: amend already-pushed orders changed since the last push ---
   if (connector.updateOrder && externalWarehouseByWarehouse.size > 0) {
-    for (const link of await port.updatableLinks(connectorId, batchSize)) {
+    // Once the destination is live, a change made before the live-from instant is shadowed by the seam on every tick without changing the
+    // link, so it would sit at the head of this oldest-first bounded batch for ever. The query leaves it out (the same floor as the create
+    // query). No floor (not enforced, or not live): the legacy call.
+    for (const link of await (createFloor ? port.updatableLinks(connectorId, batchSize, createFloor) : port.updatableLinks(connectorId, batchSize))) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId || !link.externalOrderId) continue
 
@@ -2759,8 +2762,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         shippingService: row.order?.shippingService ?? null,
       }))
     },
-    async updatableLinks(connector, limit) {
+    async updatableLinks(connector, limit, changedNotBefore) {
       // "order changed since push" is a two-column comparison Prisma can't express.
+      const floorIso = changedNotBefore ? changedNotBefore.toISOString() : null
       const dueRows = await db.$queryRaw<Array<{ id: string }>>`
         SELECT l.id
         FROM wms_order_push_links l
@@ -2771,6 +2775,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           AND o.status::text IN ('PROCESSING', 'ALLOCATED')
           AND o."refundStatus"::text <> 'FULL'
           AND o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
+          AND (${floorIso}::text IS NULL OR o."updatedAt" >= (${floorIso}::timestamptz AT TIME ZONE 'UTC'))
         ORDER BY o."updatedAt" ASC
         LIMIT ${limit}
       `

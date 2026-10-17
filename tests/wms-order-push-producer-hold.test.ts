@@ -476,3 +476,19 @@ test('OFF: a pre-cutoff order in each recovery state is re-queued exactly as bef
     }
   })
 })
+
+test('STARVATION (amend queue): more shadowed pre-cutoff-changed links than the batch size do not stop a post-cutoff-changed one being amended', async () => {
+  await withEnv(LIVE, async () => {
+    const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+    const link = (id: string, updatedAt: Date) => updateLink({ id: `link-${id}`, externalOrderId: `wms-${id}`, order: { ...candidate({ id: `so-${id}`, orderNumber: id.toUpperCase(), paidAt: BEFORE_CUTOFF }), updatedAt, shipFromWarehouseId: 'wh-1' } })
+    const rows = [1, 2, 3].map((n) => link(`old-${n}`, BEFORE_CUTOFF)).concat(link('fresh', AFTER_CUTOFF))
+    const harness = makePort({})
+    // Oldest change first, bounded by the limit, honouring the floor when given: like the real query.
+    harness.port.updatableLinks = async (_connector, limit, changedNotBefore) =>
+      rows.filter((row) => !changedNotBefore || (row.order.updatedAt as Date) >= changedNotBefore).slice(0, limit)
+    const { connector, calls } = makeConnector()
+    const result = await runWmsOrderPushSweepCore(connector, 'mintsoft', harness.port, { now: NOW, batchSize: 2 })
+    assert.deepEqual(calls, ['updateOrder:wms-fresh'])
+    assert.equal(result.updated, 1)
+  })
+})
