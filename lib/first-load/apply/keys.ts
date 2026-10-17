@@ -188,6 +188,10 @@ export function keyStep(step: ApplyStepId, data: StepRows): KeyedStep {
     }
     units.sort((a, b) => a.rowIndexes[0] - b.rowIndexes[0])
   }
+  for (const unit of units) {
+    const chunks = new Set(unit.rowIndexes.map((i) => data.rows[i].chunk))
+    if (chunks.size > 1) problems.push(`${step}: ${JSON.stringify(unit.key)} has rows in ${chunks.size} different files (chunks ${[...chunks].join(', ')}); the importer creates it from the first file and skips the rest, so lines would be lost`)
+  }
   registerUnique(step, units, problems)
   return { units, problems }
 }

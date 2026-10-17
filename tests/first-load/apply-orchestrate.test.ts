@@ -99,6 +99,50 @@ test('rehearsal gate: --apply without a matching, recent, OK rehearsal of the sa
   assert.equal((await runLoad(prepared, db.ports(), options({ rehearsal: { ...rehearsal, finishedAt: '2026-10-19T12:00:00Z' } }))).exit, 'OK', 'exactly at the age limit is still accepted (the boundary control)')
 })
 
+test('rehearsal age: the 24 hour ceiling is fixed in the core; a larger, infinite, NaN, zero or negative limit and an invalid clock are refused', async (t) => {
+  const { prepared, db, rehearsal, options } = setup()
+  const old = { ...rehearsal, finishedAt: '2026-10-19T11:00:00Z' } // 25 hours old
+  const arms: Array<[string, Partial<ApplyOptions>]> = [
+    ['limit raised to 1000 h', { rehearsal: old, maxRehearsalAgeHours: 1000 }],
+    ['limit Infinity', { rehearsal: old, maxRehearsalAgeHours: Number.POSITIVE_INFINITY }],
+    ['limit NaN', { maxRehearsalAgeHours: Number.NaN }],
+    ['limit zero', { maxRehearsalAgeHours: 0 }],
+    ['limit negative', { maxRehearsalAgeHours: -5 }],
+    ['clock invalid', { now: new Date('not a date') }],
+  ]
+  precondition(t, 'age arms', arms.length)
+  for (const [label, over] of arms) {
+    const result = await runLoad(prepared, db.ports(), options(over))
+    assert.equal(result.exit, 'PRECONDITION_REFUSED', label)
+    untouched(db)
+  }
+  assert.equal((await runLoad(prepared, db.ports(), options({ maxRehearsalAgeHours: 1 }))).exit, 'OK', 'control: a tighter limit than the ceiling is honoured and a 1 hour old rehearsal passes it')
+})
+
+test('reports never carry importer error text or exception messages: only a code, a row number and the step', async (t) => {
+  const SECRET_FILE_VALUE = 'SENTINEL-FILE-VALUE-91'
+  const SECRET_EXCEPTION = 'SENTINEL-EXCEPTION-SECRET-77'
+  const runs: ApplyResult[] = []
+  const a = setup()
+  runs.push(await runLoad(a.prepared, a.db.ports({ execute: async (step, file) => { const r = await a.db.ports().execute(step, file); return step === 'suppliers' ? { ...r, errors: [`Row 7: order ${SECRET_FILE_VALUE} already exists`, `unexpected ${SECRET_EXCEPTION}`] } : r } }), a.options()))
+  const b = setup()
+  runs.push(await runLoad(b.prepared, b.db.ports({ execute: async () => { throw new Error(`password=${SECRET_EXCEPTION}`) } }), b.options()))
+  const c = setup()
+  c.db.unreadable = true
+  runs.push(await runLoad(c.prepared, c.db.ports({ observe: async () => { throw new ObservationError(`connect failed ${SECRET_EXCEPTION}`) } }), c.options()))
+  precondition(t, 'runs rendered', runs.length)
+  const first = runs[0].steps[0].importer[0].errors
+  assert.deepEqual(first, [{ code: 'ALREADY_EXISTS', row: 7 }, { code: 'OTHER', row: null }], 'control: the code and the row number survive')
+  for (const result of runs) {
+    const prepared = a.prepared
+    const report = buildApplyReport({ prepared, result })
+    for (const text of [renderApplyJson(report), renderApplyMarkdown(report), JSON.stringify(result.problems)]) {
+      assert.ok(!text.includes(SECRET_FILE_VALUE) && !text.includes(SECRET_EXCEPTION), 'no sentinel in the output')
+    }
+  }
+  assert.ok(renderApplyMarkdown(buildApplyReport({ prepared: a.prepared, result: runs[0] })).includes('ALREADY_EXISTS (row 7)'))
+})
+
 test('run record: a second load over an existing record, a resume with no record, a different digest and a finished run are each refused', async (t) => {
   const { prepared, db, options } = setup()
   assert.equal((await runLoad(prepared, db.ports(), options({ resume: true }))).exit, 'PRECONDITION_REFUSED', 'resume with no record')
@@ -161,7 +205,7 @@ test('crash in the middle of opening stock: the resume sends ONLY the rows that 
   assert.equal(stockAfterCrash.created, 2)
   assert.equal(stockAfterCrash.failed, 2)
   assert.equal(stockAfterCrash.emitted, stockAfterCrash.created + stockAfterCrash.skippedExisting + stockAfterCrash.failed + stockAfterCrash.updated)
-  assert.match(stockAfterCrash.importer[0].errors[0], /simulated crash/)
+  assert.deepEqual(stockAfterCrash.importer[0].errors, [{ code: 'EXCEPTION', row: null }])
   assert.ok(!crashed.steps.some((s) => s.step === 'purchase-orders'), 'later steps did not run')
   db.failAfterRows = null
   const executedBefore = db.executed.length
@@ -259,12 +303,12 @@ test('another runner moving the run record: the save is refused (compare-and-swa
   assert.equal(db.journalRecord?.version, 99, 'the other runner\'s record was not overwritten')
 })
 
-test('an importer that throws is recorded verbatim and ends the step as STEP_FAILED', async () => {
+test('an importer that throws is recorded as an EXCEPTION code (no message) and ends the step as STEP_FAILED', async () => {
   const { prepared, db, options } = setup()
   const ports = db.ports({ execute: async (step) => { if (step === 'suppliers') throw new Error('deadlock detected'); return { created: 0, updated: 0, skipped: 0, errors: [] } } })
   const result = await runLoad(prepared, ports, options())
   assert.equal(result.exit, 'STEP_FAILED')
-  assert.equal(result.steps[0].importer[0].errors[0], 'deadlock detected')
+  assert.deepEqual(result.steps[0].importer[0].errors, [{ code: 'EXCEPTION', row: null }])
   assert.equal(result.steps[0].failed, 2)
 })
 

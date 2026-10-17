@@ -93,8 +93,8 @@ export function renderApplyMarkdown(report: ApplyReport): string {
   for (const step of report.steps) {
     if (step.conflicts.length > 0) out.push(`### Conflicts in ${step.step}`, '', ...table(['Key', 'Code', 'Detail'], step.conflicts.slice(0, MAX_LISTED).map((c) => [c.key, c.code, c.detail])), '', ...(step.conflicts.length > MAX_LISTED ? [`${step.conflicts.length - MAX_LISTED} more: see the JSON report.`, ''] : []))
     if (step.counterFindings.length > 0) out.push(`### Counter cross-check in ${step.step}`, '', ...step.counterFindings.map((f) => `- ${f}`), '')
-    const errors = step.importer.flatMap((i) => i.errors.map((e) => `${i.file}: ${e}`))
-    if (errors.length > 0) out.push(`### Importer messages in ${step.step} (verbatim)`, '', ...errors.slice(0, MAX_LISTED).map((e) => `- ${e}`), '', ...(errors.length > MAX_LISTED ? [`${errors.length - MAX_LISTED} more: see the JSON report.`, ''] : []))
+    const errors = step.importer.flatMap((i) => i.errors.map((e) => `${i.file}: ${e.code}${e.row === null ? '' : ` (row ${e.row})`}`))
+    if (errors.length > 0) out.push(`### Importer messages in ${step.step} (codes and row numbers only; the importer's own text is not kept)`, '', ...errors.slice(0, MAX_LISTED).map((e) => `- ${e}`), '', ...(errors.length > MAX_LISTED ? [`${errors.length - MAX_LISTED} more: see the JSON report.`, ''] : []))
   }
   if (report.verification.length > 0) out.push('## Verification', '', ...table(['Check', 'Result', 'Expected', 'Actual'], report.verification.map((v) => [v.id, v.result, v.expected, v.actual])), '')
   if (report.preconditions.length > 0) out.push('## Preconditions', '', ...table(['Id', 'Result', 'Detail'], report.preconditions.map((p) => [p.id, p.result, p.detail])), '')

@@ -14,7 +14,7 @@
  * a cross-check that raises a finding (a product the importer counted created but whose recipe is missing is FAILED here).
  */
 import {
-  REHEARSAL_RECORD_FORMAT_VERSION, RESUMABLE_STATUSES, type ApplyExitName, type ApplyMode, type ApplyStepId, type RowOutcome, type RunStatus, type StepStatus,
+  REHEARSAL_MAX_AGE_HOURS, REHEARSAL_RECORD_FORMAT_VERSION, RESUMABLE_STATUSES, type ApplyExitName, type ApplyMode, type ApplyStepId, type RowOutcome, type RunStatus, type StepStatus,
 } from './constants'
 import type { PreparedRun, PreparedStep } from './prepared'
 import {
@@ -29,8 +29,27 @@ export interface ImporterResult {
   created: number
   updated: number
   skipped: number
-  /** The importer's errors[] verbatim (it mixes warnings with refusals). */
+  /** The importer's errors[]. Its text is NEVER stored or rendered (it can carry file values and exception text): only a bounded code and a row number survive. */
   errors: string[]
+}
+
+/** What survives of one importer message: a code from a closed list and, when the message names one, a row number. Never the text. */
+export interface ImporterMessage {
+  code: ImporterMessageCode
+  row: number | null
+}
+
+export const IMPORTER_MESSAGE_CODES = ['ALREADY_EXISTS', 'NOT_FOUND', 'INVALID', 'EXCEPTION', 'OTHER'] as const
+export type ImporterMessageCode = (typeof IMPORTER_MESSAGE_CODES)[number]
+const MAX_MESSAGES_PER_FILE = 200
+
+/** Reduce importer text to bounded codes and row numbers. The text itself is dropped here, before anything is stored. */
+export function summariseImporterErrors(errors: readonly string[]): ImporterMessage[] {
+  return errors.slice(0, MAX_MESSAGES_PER_FILE).map((text) => {
+    const rowMatch = /\b(?:row|line)\s+(\d{1,7})\b/i.exec(text)
+    const code: ImporterMessageCode = /already exists|duplicate|skipp/i.test(text) ? 'ALREADY_EXISTS' : /not found|unknown|missing/i.test(text) ? 'NOT_FOUND' : /invalid|must be|cannot|refus/i.test(text) ? 'INVALID' : 'OTHER'
+    return { code, row: rowMatch ? Number(rowMatch[1]) : null }
+  })
 }
 
 export interface StepJournal {
@@ -123,7 +142,7 @@ export interface StepResult {
   residual: Array<{ name: string; rows: number; sha256: string }>
   conflicts: ConflictReport[]
   rows: UnitOutcome[]
-  importer: Array<{ file: string; created: number; updated: number; skipped: number; errors: string[] }>
+  importer: Array<{ file: string; created: number; updated: number; skipped: number; errors: ImporterMessage[] }>
   counterFindings: string[]
   error: string | null
 }
@@ -143,6 +162,10 @@ export interface ApplyResult {
 
 /** What `--apply` requires first: a rehearsal of THIS load (same digest) that ended OK on a target with the same system id, recently. */
 export function checkRehearsalGate(record: unknown, expected: { manifestDigest: string; systemId: string | null; now: Date; maxAgeHours: number }): string[] {
+  // The ceiling is fixed here: a caller cannot widen it, and an unusable limit or clock is a refusal, not "no limit".
+  if (!Number.isFinite(expected.maxAgeHours) || expected.maxAgeHours <= 0) return ['the rehearsal age limit is not a positive finite number of hours']
+  if (!(expected.now instanceof Date) || !Number.isFinite(expected.now.getTime())) return ['the current time is not a valid date']
+  const maxAgeHours = Math.min(expected.maxAgeHours, REHEARSAL_MAX_AGE_HOURS)
   if (typeof record !== 'object' || record === null || Array.isArray(record)) return ['no rehearsal report was supplied: --apply needs a rehearsal of this exact load first']
   const r = record as Record<string, unknown>
   const problems: string[] = []
@@ -155,7 +178,7 @@ export function checkRehearsalGate(record: unknown, expected: { manifestDigest: 
   else {
     const ageMs = expected.now.getTime() - finished
     if (ageMs < 0) problems.push('the rehearsal report claims to have finished in the future')
-    else if (ageMs > expected.maxAgeHours * 3_600_000) problems.push(`the rehearsal is older than ${expected.maxAgeHours} hour(s)`)
+    else if (ageMs > maxAgeHours * 3_600_000) problems.push(`the rehearsal is older than ${maxAgeHours} hour(s)`)
   }
   return problems
 }
@@ -168,9 +191,9 @@ function emptyResult(step: ApplyStepId, status: StepStatus): StepResult {
   return { step, status, emitted: 0, created: 0, updated: 0, skippedExisting: 0, failed: 0, toLoad: 0, residual: [], conflicts: [], rows: [], importer: [], counterFindings: [], error: null }
 }
 
+/** The kind of failure and nothing else: an exception message can carry file values or secrets. */
 function describeError(error: unknown): string {
-  const text = error instanceof Error ? error.message : String(error)
-  return text.length > 300 ? `${text.slice(0, 300)}...` : text
+  return error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,40}$/.test(error.name) ? error.name : 'Error'
 }
 
 function rowsOf(classified: ClassifiedStep, outcome: (c: ClassifiedStep['units'][number]) => { outcome: RowOutcome; reason: string | null }): UnitOutcome[] {
@@ -335,10 +358,10 @@ async function runStep(
     for (const file of residual) {
       try {
         const answer = await ports.execute(id, file)
-        result.importer.push({ file: file.name, created: answer.created, updated: answer.updated, skipped: answer.skipped, errors: [...answer.errors] })
+        result.importer.push({ file: file.name, created: answer.created, updated: answer.updated, skipped: answer.skipped, errors: summariseImporterErrors(answer.errors) })
       } catch (error) {
         result.error = `the importer failed on ${file.name}: ${describeError(error)}`
-        result.importer.push({ file: file.name, created: 0, updated: 0, skipped: 0, errors: [describeError(error)] })
+        result.importer.push({ file: file.name, created: 0, updated: 0, skipped: 0, errors: [{ code: 'EXCEPTION', row: null }] })
         break
       }
     }

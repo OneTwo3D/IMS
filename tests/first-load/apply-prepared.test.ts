@@ -10,6 +10,7 @@ import { loadPreparedRun } from '../../lib/first-load/apply/prepared.ts'
 import { TRANSFERS_REFUSAL } from '../../lib/first-load/apply/constants.ts'
 import { IMPORT_TARGETS, MAX_ROWS_PER_FILE, MAX_BYTES_PER_FILE } from '../../lib/first-load/spec.ts'
 import { load, loadOk, manifest, manifestText, prepareSynthetic, preparedFiles, problemsOf, withConsistentFile, withFile, withReport, type EditableReport, type FileMap } from './apply-helpers.ts'
+import { sha256Hex } from '../../lib/first-load/snapshot.ts'
 import { precondition } from './helpers.ts'
 
 const honest: FileMap = preparedFiles(prepareSynthetic())
@@ -260,4 +261,37 @@ test('an input nothing uses is refused: a wooSnapshot for a run without variant 
   void text
   const loaded = loadPreparedRun({ manifest: { ...m, wooSnapshot: { snapshot: 's', provenance: 'p', variantParents: 'v', origin: 'https://shop.example', visibilityChecked: { products: { publish: 1, draft: 0, private: 0, pending: 0 }, variations: { publish: 1, draft: 0, private: 0, pending: 0 } } } }, files: honest, woo: null })
   assert.ok(!loaded.ok && loaded.problems.some((p) => /names a wooSnapshot but the prepared run used no variant parents/.test(p)))
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// A purchase order must be whole inside ONE file
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+function splitOrders(files: FileMap, firstFile: string[], secondFile: string[]): FileMap {
+  const lines = new TextDecoder().decode(files.get(ORDERS)!).split('\r\n').filter((l) => l !== '')
+  const header = lines[0]
+  const body = lines.slice(1)
+  const copy: FileMap = new Map([...files].filter(([n]) => n !== ORDERS))
+  const mk = (name: string, keep: string[]) => {
+    const text = `${[header, ...body.filter((l) => keep.some((k) => l.includes(k)))].join('\r\n')}\r\n`
+    const bytes = new TextEncoder().encode(text)
+    copy.set(name, bytes)
+    return { name, bytes, rows: body.filter((l) => keep.some((k) => l.includes(k))).length }
+  }
+  const one = mk('05-purchase-orders-001-of-002.csv', firstFile)
+  const two = mk('05-purchase-orders-002-of-002.csv', secondFile)
+  return withReport(copy, (r) => {
+    r.outputs = r.outputs.filter((o) => o.name !== ORDERS)
+    ;[one, two].forEach((f, i) => r.outputs.push({ name: f.name, target: 'purchase-orders', chunk: i + 1, chunks: 2, rows: f.rows, bytes: f.bytes.length, sha256: sha256Hex(f.bytes) }))
+    r.plannedOutputRows['purchase-orders'] = one.rows + two.rows
+  })
+}
+
+test('chunks: an order whole inside one file loads; an order whose lines span two files is refused (the importer would lose the later lines)', (t) => {
+  const whole = splitOrders(honest, ['QBX-PO-5001'], ['QBX-PO-5002'])
+  const control = load(whole)
+  assert.ok(control.ok, control.ok ? '' : control.problems.join('; '))
+  precondition(t, 'purchase-order chunks in the control', control.ok ? control.run.steps.find((s) => s.step === 'purchase-orders')!.files.length : 0)
+  const split = splitOrders(honest, ['QBX-PO-5001', 'TSHIRT-M'], ['TSHIRT-S'])
+  expectProblem(split, /"QBX-PO-5002" has rows in 2 different files/)
 })

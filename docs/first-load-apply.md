@@ -61,7 +61,7 @@ For each step, on the first run and on every resume, the runner reads the databa
 - **present-matching**: same key and same fingerprint (and the same recipe): skipped, not re-sent;
 - **present-conflicting**: the run stops and nothing more is written.
 
-The rows sent to the importer are the file of absent units only, in the original order. Correctness never depends on the run record: a crash between two row transactions leaves a database the next run reads correctly. The accounting is computed from the database, never from the importers' own counters (a product the importer counted as created whose recipe is missing is **failed**); the counters are kept as a cross-check finding.
+The rows sent to the importer are the file of absent units only, in the original order. Correctness never depends on the run record: a crash between two row transactions leaves a database the next run reads correctly. The accounting is computed from the database, never from the importers' own counters (a product the importer counted as created whose recipe is missing is **failed**); the counters are kept as a cross-check finding. The importers' own error text (and any exception message) is **never stored or rendered**, because it can carry file values or secrets: the report keeps a bounded code (`ALREADY_EXISTS`, `NOT_FOUND`, `INVALID`, `EXCEPTION`, `OTHER`), a row number when the message names one, and the step. The rehearsal ceiling is fixed at 24 hours in the core; a caller cannot widen it, and an unusable limit or clock is a refusal. A purchase order whose lines span more than one prepared file is refused (the importer would create it from the first file and skip the rest).
 
 ### Conflict codes
 
