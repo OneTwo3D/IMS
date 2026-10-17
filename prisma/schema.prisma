@@ -4631,6 +4631,8 @@ model FirstLoadApplyRun {
   currentStep    String?  @map("current_step")
   /// Per-step counts and residual hashes: bounded codes and numbers, never a prepared-file value.
   steps          Json     @default("{}")
+  /// Facts the runner records once and never rewrites (for example the accounting profile of the tax rates the purchase-order file resolves to, taken just before the first write).
+  facts          Json     @default("{}")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @default(now()) @map("updated_at")
 

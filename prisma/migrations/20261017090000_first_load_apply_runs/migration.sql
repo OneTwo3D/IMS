@@ -16,6 +16,7 @@ CREATE TABLE "first_load_apply_runs" (
     "status" TEXT NOT NULL,
     "current_step" TEXT,
     "steps" JSONB NOT NULL DEFAULT '{}',
+    "facts" JSONB NOT NULL DEFAULT '{}',
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 

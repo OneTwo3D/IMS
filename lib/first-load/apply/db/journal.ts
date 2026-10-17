@@ -24,6 +24,26 @@ function isStep(value: string | null): value is ApplyStepId {
   return value !== null && (APPLY_STEP_IDS as readonly string[]).includes(value)
 }
 
+/** Facts recorded once on the run record (never rewritten). Absent record: none. */
+export async function loadFacts(): Promise<Record<string, unknown>> {
+  try {
+    const row = await db.firstLoadApplyRun.findFirst({ select: { facts: true } })
+    return row === null || typeof row.facts !== 'object' || row.facts === null || Array.isArray(row.facts) ? {} : (row.facts as Record<string, unknown>)
+  } catch {
+    throw new ObservationError(DATABASE_READ_FAILED)
+  }
+}
+
+/** Record a fact only if it is not recorded yet: the first value is the one the orders were created under. Returns true when this call recorded it. */
+export async function setFactOnce(key: string, value: unknown): Promise<boolean> {
+  try {
+    const changed = await db.$executeRaw`UPDATE first_load_apply_runs SET facts = facts || jsonb_build_object(${key}::text, ${JSON.stringify(value)}::jsonb) WHERE singleton AND NOT jsonb_exists(facts, ${key}::text)`
+    return changed === 1
+  } catch {
+    throw new Error(JOURNAL_WRITE_FAILED)
+  }
+}
+
 export function createJournal(): ApplyPorts['journal'] {
   return {
     async load(): Promise<RunRecord | null> {

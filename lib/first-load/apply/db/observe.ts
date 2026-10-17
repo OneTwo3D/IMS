@@ -15,6 +15,8 @@ import {
   openingStockFingerprint, productCellsFromDb, productFingerprint, purchaseOrderFingerprintFromDb, recipeFromDb, supplierCellsFromDb, supplierFingerprint,
 } from '../normal-form'
 import type { PreparedRun } from '../prepared'
+import { loadFacts } from './journal'
+import { TAX_RATE_SELECT, effectiveRate, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import { ObservationError, type ObservedEntry, type StepObservation } from '../residual'
 
 export const DATABASE_READ_FAILED = 'the database could not be read'
@@ -155,7 +157,25 @@ async function observeOpeningStock(): Promise<StepObservation> {
   return { entries, foreignHistoryKeys }
 }
 
+/**
+ * Is the stored line tax what createPurchaseOrder computes from the line's stored total and the rate it holds NOW?
+ *   exclusive prices: tax = round4(total x effective rate);
+ *   VAT-inclusive prices (and a rate above zero): the total was gross / (1 + rate), so round4((total + tax) / (1 + rate)) is the total;
+ * within one unit in the 4th decimal place (the importer computes in floating point). No rate: no tax.
+ */
+function taxAmountConsistent(pricesIncludeVat: boolean, line: { totalForeign: { toFixed(): string }; taxForeign: { toFixed(): string }; taxRate: (TaxRateRow & { rate: { toFixed(): string } }) | null }): boolean {
+  const total = new D(line.totalForeign.toFixed())
+  const tax = new D(line.taxForeign.toFixed())
+  const rate = line.taxRate === null ? new D(0) : new D(effectiveRate(line.taxRate))
+  const tolerance = new D('0.0001')
+  if (rate.isZero()) return tax.isZero()
+  if (!pricesIncludeVat) return total.mul(rate).toDecimalPlaces(4, D.ROUND_HALF_UP).minus(tax).abs().lte(tolerance)
+  return total.plus(tax).div(rate.plus(1)).toDecimalPlaces(4, D.ROUND_HALF_UP).minus(total).abs().lte(tolerance)
+}
+
 async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObservation> {
+  const facts = await loadFacts()
+  const profiles = typeof facts.taxProfiles === 'object' && facts.taxProfiles !== null ? (facts.taxProfiles as Record<string, string>) : null
   const fileFingerprints = new Map((prepared.steps.find((s) => s.step === 'purchase-orders')?.units ?? []).map((u) => [u.key, u.fingerprint]))
   const rows = await db.purchaseOrder.findMany({
     select: {
@@ -164,7 +184,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
       supplier: { select: { name: true, currency: true } }, destinationWarehouse: { select: { code: true } },
       lines: {
         orderBy: { sortOrder: 'asc' },
-        select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true } } },
+        select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
       },
     },
   })
@@ -173,7 +193,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
     entries: rows.map((row): ObservedEntry => ({
       key: row.reference,
       collisionKey: row.reference.toUpperCase(),
-      fingerprint: purchaseOrderFingerprintFromDb(columns, row, fileFingerprints.get(row.reference) ?? null),
+      fingerprint: purchaseOrderFingerprintFromDb(columns, { ...row, lines: row.lines.map((l) => ({ ...l, taxRate: l.taxRate ? { name: l.taxRate.name, rate: l.taxRate.rate, profileDigest: signatureDigest(taxRateSignature(l.taxRate)) } : null, taxAmountConsistent: taxAmountConsistent(row.pricesIncludeVat, l) })) }, fileFingerprints.get(row.reference) ?? null, profiles),
       recipe: null,
     })),
   }

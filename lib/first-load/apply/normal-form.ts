@@ -315,7 +315,9 @@ export interface DbPurchaseOrder {
     taxForeign: DecimalLike
     discountAmount: DecimalLike
     discountStr: string | null
-    taxRate: { name: string; rate: DecimalLike } | null
+    taxRate: { name: string; rate: DecimalLike; /** Digest of the rate's accounting profile as it is now. */ profileDigest?: string } | null
+    /** The stored tax amount is what the rate's current effective rate gives for the stored total (computed by the reader; absent = not checked). */
+    taxAmountConsistent?: boolean
   }>
 }
 
@@ -324,7 +326,7 @@ export interface DbPurchaseOrder {
  * leaves BLANK takes a default the file cannot know (the supplier's currency; the tax a line inherits from the order), so it is compared only
  * where the file stated it. Without `file` (a foreign order) every column is shown as stored.
  */
-export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: DbPurchaseOrder, file: string | null): string {
+export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: DbPurchaseOrder, file: string | null, profiles: Readonly<Record<string, string>> | null = null): string {
   const parsedFile = file === null ? null : (JSON.parse(file) as { lines?: string[] } & Record<string, string>)
   const header: Record<string, string> = {}
   for (const column of columns) {
@@ -358,20 +360,30 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
     const amount = po.pricesIncludeVat ? total.plus(new D(line.taxForeign.toFixed())) : total
     const prefix = linePrefix({ sku: line.product.sku, qty: new D(line.qty.toFixed()), amount, discount: new D(line.discountAmount.toFixed()), discountStr: line.discountStr ?? '' })
     const name = line.taxRate ? line.taxRate.name.trim().toLowerCase() : null
+    const digest = line.taxRate?.profileDigest ?? null
+    const taxAmountConsistent = line.taxAmountConsistent !== false
     const rate4 = line.taxRate ? fmtFixed(new D(line.taxRate.rate.toFixed()), 4) : null
     // When the order states a value too (taxRatePercent), the order's rate must have that value.
     const sameAsOrderValue = rate4 !== null && (po.taxRatePercent === null || rate4 === fmtFixed(new D(po.taxRatePercent.toFixed()), 4))
     const inheritedOk = orderName === '' ? line.taxRate === null : line.taxRate !== null && line.taxRate.name.trim() === orderName && sameAsOrderValue
-    return { prefix, name, rate4, inheritedOk }
+    return { prefix, name, rate4, inheritedOk, digest, taxAmountConsistent }
   })
+  // The accounting profile the rate had when the orders were created is recorded on the run record (taxProfiles, by lookup key). A stored line whose rate's profile is not that one is
+  // not what the importer stored for that lookup, whatever its name and percentage say.
+  const profileHolds = (line: (typeof stored)[number], key: string): boolean => {
+    const recorded = profiles?.[key]
+    return recorded === undefined || line.digest === null || line.digest === recorded
+  }
   const satisfies = (line: (typeof stored)[number], fileLine: string): boolean => {
     if (!fileLine.startsWith(`${line.prefix}|`)) return false
+    // The stored tax amount must still be what the stored rate gives for the stored total: a rate edited after the load, or an amount edited by hand, is a difference.
+    if (!line.taxAmountConsistent) return false
     const token = fileLine.slice(line.prefix.length + 1)
-    if (token === '') return line.inheritedOk
-    if (token.startsWith('v:')) return line.rate4 !== null && token === `v:${line.rate4}`
+    if (token === '') return line.inheritedOk && profileHolds(line, `o:${orderName}`)
+    if (token.startsWith('v:')) return line.rate4 !== null && token === `v:${line.rate4}` && profileHolds(line, token)
     const named = /^n:(.*)@(\d+\.\d{4})$/.exec(token)
-    if (named) return line.name !== null && line.name === named[1] && line.rate4 === named[2]
-    return token.startsWith('n:') && line.name !== null && line.name === token.slice(2)
+    if (named) return line.name !== null && line.name === named[1] && line.rate4 === named[2] && profileHolds(line, `n:${named[1]}`)
+    return token.startsWith('n:') && line.name !== null && line.name === token.slice(2) && profileHolds(line, token)
   }
   const fileLines = parsedFile?.lines ?? []
   // Kuhn's augmenting-path matching: stored line -> file line.

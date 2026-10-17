@@ -79,6 +79,9 @@ const PO_FOUR = `${TAG}-PO-4`
 const PO_FIVE = `${TAG}-PO-5`
 const PO_SIX = `${TAG}-PO-6`
 const PO_SEVEN = `${TAG}-PO-7`
+const PO_EIGHT = `${TAG}-PO-8`
+const PO_NINE = `${TAG}-PO-9`
+const PO_TEN = `${TAG}-PO-10`
 const SUPPLIER_A = `${TAG} Odd Supplier`
 const SUPPLIER_B = `${TAG} Euro Supplier`
 const ODD_FILES: Record<ApplyStepId, StepRows> = {
@@ -454,6 +457,76 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       }
     })
 
+    it('the accounting profile of a stored line\'s rate is read back: a later change of its tax type, reverse charge, reporting category or components surfaces; and a zero-value line is neither a conflict nor a tax', async () => {
+      // Mutation named: leave the profile digest out of the satisfaction test -> the changed-settings arms are green when they must be red.
+      const execute = m.execute.createExecutor({ runId: 'profile', operator: 'Profile Test' })
+      const rate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME } })
+      const five = await m.db.taxRate.create({ data: { name: `${VAT_NAME} profile`, rate: '0.05', usedFor: 'PURCHASE', active: true } })
+      const loaded: Array<(typeof units)['purchase-orders'][number]> = []
+      const stub = { steps: [{ step: 'purchase-orders', get units() { return [...units['purchase-orders'], ...loaded] } }] } as unknown as PreparedRun
+      const rowsFor = (key: string, line: Record<string, string>) => stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: key, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', ...line }])
+      const prepStub = (data: ReturnType<typeof rowsFor>) => ({ ...prepared, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data, units: keyStep('purchase-orders', data).units }] }) as unknown as PreparedRun
+      const load = async (data: ReturnType<typeof rowsFor>) => {
+        const keyed = keyStep('purchase-orders', data)
+        assert.deepEqual(keyed.problems, [])
+        const answer = await execute('purchase-orders', buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!, NO_LOCK)
+        assert.deepEqual(answer.errors, [])
+        loaded.push(keyed.units[0]!)
+        return keyed.units[0]!
+      }
+      const entry = async (key: string) => (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!
+      const journal = m.journal.createJournal()
+      const cleanup = async () => {
+        for (const key of [PO_EIGHT, PO_NINE, PO_TEN]) { await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key]); await sql('delete from purchase_orders where reference = $1', [key]) }
+        await sql('delete from first_load_apply_runs')
+      }
+      try {
+        // The run record exists, and the profile of each tax lookup is recorded just before the first write (as the ports do).
+        await journal.save({ version: 1, manifestDigest: 'f'.repeat(64), runId: 'profile-run', status: 'RUNNING', currentStep: null, steps: {} }, null)
+        const named = rowsFor(PO_EIGHT, { taxRateName: VAT_NAME, orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' })
+        const inherits = rowsFor(PO_NINE, { orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' })
+        assert.equal(await m.journal.setFactOnce('taxProfiles', await m.rails.currentTaxProfiles(prepStub(named))), true)
+        assert.equal(await m.journal.setFactOnce('taxProfiles', { overwritten: 'no' }), false, 'a fact is recorded once and never rewritten')
+        const eight = await load(named)
+        const nine = await load(inherits)
+        assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), [], 'control: matches as loaded')
+        assert.deepEqual(differingColumns(nine.fingerprint, (await entry(PO_NINE)).fingerprint), [], 'control: the inheriting order matches as loaded')
+        const changes: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+          ['tax type', { accountingTaxType: 'INPUT9' }, { accountingTaxType: rate.accountingTaxType }],
+          ['reverse charge', { reverseCharge: !rate.reverseCharge }, { reverseCharge: rate.reverseCharge }],
+          ['reporting category', { reportingCategory: 'OSS' }, { reportingCategory: rate.reportingCategory }],
+          ['compound flag', { isCompound: !rate.isCompound }, { isCompound: rate.isCompound }],
+        ]
+        for (const [label, change, restore] of changes) {
+          await m.db.taxRate.update({ where: { id: rate.id }, data: change })
+          try {
+            assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['lines'], `${label}: the named line differs`)
+            assert.deepEqual(differingColumns(nine.fingerprint, (await entry(PO_NINE)).fingerprint), ['lines'], `${label}: the inheriting line differs`)
+          } finally { await m.db.taxRate.update({ where: { id: rate.id }, data: restore }) }
+          assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), [], `${label}: restored`)
+        }
+        // The stored tax AMOUNT is checked against the stored rate too: an amount edited by hand (or computed under a rate that has since changed) is a difference.
+        // Mutation named: drop taxAmountConsistent from the pairing -> this arm is green when it must be red.
+        const eightLine = await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_EIGHT } }, select: { id: true, taxForeign: true } })
+        await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: '21' } })
+        try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['lines'], 'a hand-edited tax amount') } finally { await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: eightLine.taxForeign } }) }
+        assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), [], 'restored')
+        const component = await m.db.taxRateComponent.create({ data: { taxRateId: rate.id, name: 'part', rate: '0.2', sortOrder: 0 } })
+        try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['lines'], 'a component added later') } finally { await m.db.taxRateComponent.delete({ where: { id: component.id } }) }
+        // ZERO: a line whose only tax cell is 0 states nothing. With no order tax it stores none; under a named order tax it takes the order\'s. Both match as loaded.
+        const zeroPlain = await load(rowsFor(PO_TEN, { taxRateValue: '0' }))
+        const stored = await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_TEN } }, select: { taxRateId: true, taxForeign: true } })
+        assert.deepEqual({ rate: stored.taxRateId, tax: stored.taxForeign.toFixed() }, { rate: null, tax: '0' }, 'the importer stored no tax for a zero value under no order tax')
+        assert.deepEqual(differingColumns(zeroPlain.fingerprint, (await entry(PO_TEN)).fingerprint), [], 'the zero-value line matches')
+        const zeroUnder = (await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_NINE } }, select: { taxRateId: true } })).taxRateId
+        assert.equal(zeroUnder, rate.id, 'precondition: an unnamed line under a named order tax takes the order\'s')
+        void five
+      } finally {
+        await cleanup()
+        await m.db.taxRate.delete({ where: { id: five.id } }).catch(() => undefined)
+      }
+    })
+
     it('a BOM whose manufacturing recipe is missing is NOT matching, although its component list is there', async () => {
       // Mutation named: drop the BOM branch in observeProducts -> the recipe equals the file's and this arm is green when it must be red.
       const bom = await m.db.product.findUniqueOrThrow({ where: { sku: `${TAG}-BOM` }, select: { id: true, manufacturingBom: { select: { id: true } } } })
@@ -826,6 +899,62 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           await m.db.taxRate.deleteMany({ where: { id: { in: (await m.db.taxRate.findMany({ where: { name: { startsWith: `${VAT_NAME} ` } }, select: { id: true } })).map((r) => r.id) } } }).catch(() => undefined)
         }
         assert.ok(cells >= 14, `cells examined: ${cells}`)
+      })
+
+      it('same name, same percentage, different ACCOUNTING settings (tax type, reverse charge, reporting category, a component) are different rates: refused; identical settings are accepted', async () => {
+        // Mutation named: compare only name and percentage between same-named rates (the old rule) -> the differing-settings arms are green when they must be red.
+        await resetData()
+        const named = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME } })
+        const five = await m.db.taxRate.create({ data: { name: `${VAT_NAME} five`, rate: '0.05', usedFor: 'PURCHASE', active: true } })
+        const dup = await m.db.taxRate.create({ data: { name: VAT_NAME, rate: '0.2', usedFor: 'PURCHASE', active: true, accountingTaxType: named.accountingTaxType, isCompound: named.isCompound, reverseCharge: named.reverseCharge, reportingCategory: named.reportingCategory } })
+        const stubFor = (line: Record<string, string>) => {
+          const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', ...line }])
+          return { ...prepared, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }] } as unknown as PreparedRun
+        }
+        const problemsFor = async (line: Record<string, string>) => (await m.rails.evaluateRails(stubFor(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })).filter((p) => p.startsWith('purchase tax:'))
+        const LINE = { taxRateName: VAT_NAME, orderTaxRateName: `${VAT_NAME} five`, orderTaxRateValue: '5' }
+        const ORDER = { orderTaxRateName: VAT_NAME }
+        let cells = 0
+        try {
+          assert.deepEqual(await problemsFor(LINE), [], 'identical settings: line accepted')
+          assert.deepEqual(await problemsFor(ORDER), [], 'identical settings: order accepted')
+          const arms: Array<[string, () => Promise<unknown>, () => Promise<unknown>]> = [
+            ['accounting tax type', () => m.db.taxRate.update({ where: { id: dup.id }, data: { accountingTaxType: 'INPUT2' } }), () => m.db.taxRate.update({ where: { id: dup.id }, data: { accountingTaxType: named.accountingTaxType } })],
+            ['reverse charge', () => m.db.taxRate.update({ where: { id: dup.id }, data: { reverseCharge: !named.reverseCharge } }), () => m.db.taxRate.update({ where: { id: dup.id }, data: { reverseCharge: named.reverseCharge } })],
+            ['reporting category', () => m.db.taxRate.update({ where: { id: dup.id }, data: { reportingCategory: 'EC_SALES' } }), () => m.db.taxRate.update({ where: { id: dup.id }, data: { reportingCategory: named.reportingCategory } })],
+            ['compound flag', () => m.db.taxRate.update({ where: { id: dup.id }, data: { isCompound: !named.isCompound } }), () => m.db.taxRate.update({ where: { id: dup.id }, data: { isCompound: named.isCompound } })],
+          ]
+          for (const [label, mutate, restore] of arms) {
+            await mutate()
+            try {
+              assert.ok((await problemsFor(LINE)).some((p) => /line\(s\) resolve to more than one active purchase rate with different values or accounting settings/.test(p)), `${label}: line refused`)
+              assert.ok((await problemsFor(ORDER)).some((p) => /order\(s\) have an order-level tax name shared by active rates/.test(p)), `${label}: order refused`)
+            } finally { await restore() }
+            assert.deepEqual(await problemsFor(LINE), [], `${label}: restored`)
+            cells++
+          }
+          // A component on one of them changes what the tax is computed from.
+          const component = await m.db.taxRateComponent.create({ data: { taxRateId: dup.id, name: 'part', rate: '0.2', sortOrder: 0 } })
+          try {
+            assert.ok((await problemsFor(LINE)).some((p) => /more than one active purchase rate/.test(p)), 'a component on one duplicate: refused')
+            await m.db.taxRateComponent.update({ where: { id: component.id }, data: { rate: '0.15' } })
+            assert.ok((await problemsFor(LINE)).some((p) => /more than one active purchase rate|components do not add up/.test(p)), 'components that do not add up to the rate: refused')
+          } finally { await m.db.taxRateComponent.delete({ where: { id: component.id } }) }
+          cells++
+          // A single rate whose components do not add up to its percentage: the importer matches the column and taxes at the components.
+          await m.db.taxRate.update({ where: { id: dup.id }, data: { active: false } })
+          const lone = await m.db.taxRateComponent.create({ data: { taxRateId: named.id, name: 'part', rate: '0.15', sortOrder: 0 } })
+          try { assert.ok((await problemsFor(LINE)).some((p) => /components do not add up to its rate/.test(p)), 'inconsistent single rate refused') } finally { await m.db.taxRateComponent.delete({ where: { id: lone.id } }) }
+          cells++
+          // Explicit zero on a line with no name is NOT a stated tax: accepted, with or without an order tax.
+          assert.deepEqual(await problemsFor({ taxRateValue: '0' }), [], 'value-only zero, no order tax')
+          assert.deepEqual(await problemsFor({ taxRateValue: '0', orderTaxRateName: VAT_NAME }), [], 'value-only zero under a named order tax')
+          assert.deepEqual(await problemsFor({ taxRateValue: '0.00' }), [], 'zero written 0.00')
+          cells++
+        } finally {
+          await m.db.taxRate.deleteMany({ where: { id: { in: [five.id, dup.id] } } }).catch(() => undefined)
+        }
+        assert.ok(cells >= 7)
       })
 
       it('purchase orders: an FX rate outside the importer\'s 2%, and a currency with no stored rate, are refused', async () => {

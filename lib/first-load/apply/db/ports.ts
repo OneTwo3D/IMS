@@ -15,12 +15,12 @@ import type { ApplyStepId } from '../constants'
 import type { ApplyPorts } from '../orchestrate'
 import type { PreparedRun } from '../prepared'
 import { createExecutor } from './execute'
-import { createJournal } from './journal'
+import { createJournal, setFactOnce } from './journal'
 import { db } from '@/lib/db'
 import { StepLockError, type StepLock } from '../orchestrate'
 import { withStepLock } from './lock'
 import { observeStep } from './observe'
-import { evaluateRails } from './rails'
+import { currentTaxProfiles, evaluateRails } from './rails'
 
 export interface DbPortsOptions {
   /** Who the activity log names for the rows the importers write. */
@@ -52,7 +52,12 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
     observe: (step) => observeStep(prepared, step),
     preflight: ({ resuming }) => evaluateRails(prepared, { phase: 'preflight', resuming, step: null }),
     // A recheck happens inside a run that holds a record, so the target is by definition not "fresh": emptiness is a preflight rail only.
-    recheckRails: (step) => evaluateRails(prepared, { phase: 'recheck', resuming: true, step }),
+    recheckRails: async (step, phase) => {
+      const problems = await evaluateRails(prepared, { phase: 'recheck', resuming: true, step })
+      // Just before the first purchase-order write, with every rail holding: record which accounting profile each tax lookup of the file resolves to. Only the first recording counts.
+      if (problems.length === 0 && step === 'purchase-orders' && phase === 'before-first-write') await setFactOnce('taxProfiles', await currentTaxProfiles(prepared))
+      return problems
+    },
     withStepLock,
     execute: createExecutor({ runId: prepared.manifest.runId, operator: options.operator, maxRowsPerCall: options.maxRowsPerCall, beforeCall: guardBeforeCall(prepared), afterCall: options.afterCall }),
   }
