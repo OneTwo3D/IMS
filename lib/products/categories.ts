@@ -8,7 +8,7 @@ import {
 export {
   PRODUCT_CATEGORY_NAME_MAX_LENGTH, PRODUCT_CATEGORY_PATH_DELIMITER, PRODUCT_CATEGORY_PATH_DISPLAY_SEPARATOR,
   buildProductCategoryPathNormalized, cleanProductCategoryName, decodeHtmlEntities, normalizeProductCategoryName, parseProductCategoryPath,
-}
+} from './category-name'
 
 
 export type ProductCategoryOption = {
