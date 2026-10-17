@@ -301,6 +301,34 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: { paymentTermsDays: 30 } })
     })
 
+    it('a stored order currency changed away from the supplier\'s is a CONFLICT in the currency column although the file left it blank; a line tax changed likewise', async () => {
+      // Mutation named: blank the database currency whenever the file's is blank (the old code) -> the currency arm is green when it must be red.
+      const stub = { steps: [{ step: 'purchase-orders', units: units['purchase-orders'] }] } as unknown as PreparedRun
+      const unit = units['purchase-orders'].find((u) => u.key === PO_ONE)!
+      assert.equal((JSON.parse(unit.fingerprint) as { currency: string }).currency, '', 'precondition: the file leaves this order\'s currency blank')
+      const entry = async (key: string) => (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!
+      assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), [], 'control: as loaded, the blank currency is the supplier\'s and matches')
+      await m.db.purchaseOrder.update({ where: { reference: PO_ONE }, data: { currency: 'EUR' } })
+      try {
+        assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), ['currency'])
+        const result = classifyStep('purchase-orders', [unit], { entries: [await entry(PO_ONE)] })
+        assert.equal(result.units[0]!.conflict?.code, 'FIELDS_DIFFER')
+      } finally {
+        await m.db.purchaseOrder.update({ where: { reference: PO_ONE }, data: { currency: 'GBP' } })
+      }
+      // The same for a line that named no tax: its stored tax must be the order's or the supplier's default.
+      const unitTwo = units['purchase-orders'].find((u) => u.key === PO_TWO)!
+      assert.deepEqual(differingColumns(unitTwo.fingerprint, (await entry(PO_TWO)).fingerprint), [], 'control')
+      const line = await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_TWO } }, select: { id: true } })
+      const rate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME }, select: { id: true } })
+      await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { taxRateId: rate.id } })
+      try {
+        assert.deepEqual(differingColumns(unitTwo.fingerprint, (await entry(PO_TWO)).fingerprint), ['lines'])
+      } finally {
+        await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { taxRateId: null } })
+      }
+    })
+
     it('a BOM whose manufacturing recipe is missing is NOT matching, although its component list is there', async () => {
       // Mutation named: drop the BOM branch in observeProducts -> the recipe equals the file's and this arm is green when it must be red.
       const bom = await m.db.product.findUniqueOrThrow({ where: { sku: `${TAG}-BOM` }, select: { id: true, manufacturingBom: { select: { id: true } } } })

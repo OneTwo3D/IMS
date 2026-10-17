@@ -294,7 +294,7 @@ export function purchaseOrderFingerprint(header: Record<string, string>, lines: 
 }
 
 export interface DbPurchaseOrder {
-  supplier: { name: string }
+  supplier: { name: string; currency: string; taxRate?: { name: string } | null }
   currency: string
   fxRateToBase: DecimalLike
   destinationWarehouse: { code: string } | null
@@ -328,7 +328,8 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
   for (const column of columns) {
     switch (column) {
       case 'supplierName': header[column] = po.supplier.name.toUpperCase(); break
-      case 'currency': header[column] = parsedFile && parsedFile.currency === '' ? '' : po.currency.toUpperCase(); break
+      // A blank file currency means "the supplier's": the stored currency is shown as blank ONLY when it really is the supplier's, so a changed stored currency still differs.
+      case 'currency': header[column] = parsedFile && parsedFile.currency === '' && po.currency.toUpperCase() === po.supplier.currency.toUpperCase() ? '' : po.currency.toUpperCase(); break
       case 'fxRateToBase': header[column] = normaliseNumber(po.fxRateToBase.toFixed()); break
       case 'destinationWarehouseCode': header[column] = (po.destinationWarehouse?.code ?? '').toUpperCase(); break
       case 'orderTaxRateName': header[column] = (po.taxRateName ?? '').trim(); break
@@ -353,7 +354,13 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
     const token = at === -1 ? null : remaining.splice(at, 1)[0].slice(prefix.length + 1)
     const byName = line.taxRate ? `n:${line.taxRate.name.trim().toLowerCase()}` : ''
     const byValue = line.taxRate ? `v:${fmtFixed(new D(line.taxRate.rate.toFixed()), 4)}` : ''
-    return `${prefix}|${token === null ? byName : token === '' ? '' : token.startsWith('v:') ? byValue : byName}`
+    // A line that names no tax inherits the order's (or the supplier's) default. It is shown as blank ONLY when its stored tax really is that default (or there is none),
+    // so a changed stored tax still differs.
+    const inherited = line.taxRate === null
+      || (po.taxRateName !== null && po.taxRateName.trim() !== '' && line.taxRate.name.trim().toLowerCase() === po.taxRateName.trim().toLowerCase())
+      || ((po.taxRateName === null || po.taxRateName.trim() === '') && po.supplier.taxRate != null && line.taxRate.name.trim().toLowerCase() === po.supplier.taxRate.name.trim().toLowerCase())
+    const shown = token === null ? byName : token === '' ? (inherited ? '' : byName) : token.startsWith('v:') ? byValue : byName
+    return `${prefix}|${shown}`
   })
   return JSON.stringify({ ...header, status: po.status, lines: lines.sort() })
 }
