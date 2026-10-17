@@ -138,7 +138,7 @@ test('o3d-1izw gate: the sweep asks it BEFORE it reads a candidate, and the clai
   const preflight = source.indexOf('await assertWmsPushStateSchemaReady()\n\n  return runWmsOrderPushSweepCore(')
   assert.notEqual(preflight, -1, 'the preflight runs immediately before the core sweep, not after it')
 
-  const claim = source.indexOf('async claimForCreate(orderId, connector, attemptedAt) {')
+  const claim = source.indexOf('async claimForCreate(orderId, connector, attemptedAt, paidNotBefore) {')
   assert.notEqual(claim, -1)
   const claimBody = source.slice(claim, source.indexOf('return db.$transaction', claim))
   assert.match(claimBody, /await assertWmsPushStateSchemaReady\(\)/, 'the write site guards itself before opening the transaction')
