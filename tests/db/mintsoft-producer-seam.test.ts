@@ -213,7 +213,7 @@ test('REAL ORDER-PUSH PORT: OFF claims and links the order (the control); ON lea
   })
 })
 
-test('REAL ORDER-PUSH PORT, LIVE PHASE: an order paid BEFORE the live-from instant is a shadow (never claimed); one paid AFTER it is pushed', { skip }, async (t) => {
+test('REAL ORDER-PUSH PORT, LIVE PHASE: an order paid BEFORE the live-from instant is left out of the create query (never claimed, no link); one paid AFTER it is pushed', { skip }, async (t) => {
   const d = await deps()
   const before = await seedOrder(d, `msb${randomUUID().slice(0, 8)}`, new Date('2026-05-01T00:00:00Z'))
   const after = await seedOrder(d, `msa${randomUUID().slice(0, 8)}`, new Date('2026-06-10T00:00:00Z'))
@@ -228,7 +228,7 @@ test('REAL ORDER-PUSH PORT, LIVE PHASE: an order paid BEFORE the live-from insta
     console.log(`# LIVE: before link=${linkBefore?.state ?? null} after link=${linkAfter?.state ?? null} shadow=${JSON.stringify(shadowBefore.map((s) => s.reason))}`)
     assert.equal(linkBefore, null, 'the pre-cutoff order was never claimed')
     assert.equal(linkAfter?.state, 'SYNCED', 'the post-cutoff order was pushed')
-    assert.deepEqual(shadowBefore.map((s) => s.reason), ['obligation_before_cutoff'])
+    assert.deepEqual(shadowBefore, [], 'the pre-cutoff order is not selected at all, so it cannot occupy a slot of the bounded batch')
     assert.equal((await shadowsFor(d, after.orderId)).length, 0)
   })
 })
