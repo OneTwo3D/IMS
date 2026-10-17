@@ -287,6 +287,22 @@ test('PRE-CUTOVER CONSUMERS (real queries): an order paid before the live-from i
   })
 })
 
+test('REAL CLAIM: the order\'s CURRENT paid time is re-proved under the claim lock: corrected to before the floor it is refused with no link written; unchanged it is claimed; no floor is the legacy claim', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `msq${randomUUID().slice(0, 8)}`
+  const seeded = await seedOrder(d, tag, new Date('2026-06-10T00:00:00Z'))
+  t.after(() => cleanupOrder(d, seeded))
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const floor = new Date('2026-06-01T00:00:00Z')
+  const linkOf = () => d.db.wmsOrderPushLink.findUnique({ where: { orderId: seeded.orderId } })
+  await d.db.salesOrder.update({ where: { id: seeded.orderId }, data: { paidAt: new Date('2026-05-01T00:00:00Z') } })
+  assert.equal(await port.claimForCreate(seeded.orderId, 'mintsoft', new Date(), floor), 'REFUSED_PRE_CUTOVER')
+  assert.equal(await linkOf(), null, 'refused before any write')
+  await d.db.salesOrder.update({ where: { id: seeded.orderId }, data: { paidAt: new Date('2026-06-10T00:00:00Z') } })
+  assert.equal(await port.claimForCreate(seeded.orderId, 'mintsoft', new Date(), floor), 'CLAIMED')
+  assert.equal((await linkOf())?.state, 'PENDING_CREATE')
+})
+
 // ───────────────────────── retention and evidence ─────────────────────────
 
 test('RETENTION: the shadow record of a Mintsoft write (its only evidence) survives the real retention sweep, aged far past every window', { skip }, async (t) => {

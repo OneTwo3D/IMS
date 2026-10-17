@@ -492,3 +492,31 @@ test('STARVATION (amend queue): more shadowed pre-cutoff-changed links than the 
     assert.equal(result.updated, 1)
   })
 })
+
+test('CLAIM-TIME RE-PROOF: paidAt corrected to before the live-from instant between the create decision and the claim: no claim write, no connector call, counted; unchanged still proceeds', async () => {
+  await withEnv(LIVE, async () => {
+    const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+    const { wmsPaidBeforeCreateFloor } = await import('../lib/domain/wms/create-eligibility.ts')
+    for (const changed of [true, false]) {
+      const harness = makePort({ createCandidates: [candidate({ id: 'so-1', paidAt: AFTER_CUTOFF })] })
+      // The real port re-reads the CURRENT paid time under the row lock and refuses before any write; this double does the same.
+      harness.port.claimForCreate = async (orderId, _connector, _at, paidNotBefore) => {
+        const current = changed ? BEFORE_CUTOFF : AFTER_CUTOFF
+        if (paidNotBefore && wmsPaidBeforeCreateFloor(current, paidNotBefore)) return 'REFUSED_PRE_CUTOVER'
+        harness.writes.push(`claimForCreate:${orderId}`)
+        return 'CLAIMED'
+      }
+      const { connector, calls } = makeConnector()
+      const result = await runWmsOrderPushSweepCore(connector, 'mintsoft', harness.port, { now: NOW })
+      if (changed) {
+        assert.deepEqual(calls, [], 'no create sent for the bridge-owned order')
+        assert.deepEqual(harness.writes, [], 'nothing claimed, link untouched')
+        assert.equal(result.created, 0)
+        assert.equal(result.recoveryRefusedPreCutoff, 1)
+      } else {
+        assert.deepEqual(calls, ['pushOrder:SO-1'])
+        assert.equal(result.created, 1)
+      }
+    }
+  })
+})

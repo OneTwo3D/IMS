@@ -722,6 +722,8 @@ export type WmsPushVerifyLink = WmsPushLinkRef & {
  * is precisely why the third answer never happened.
  */
 export type WmsCreateClaimOutcome = 'CLAIMED' | 'SKIPPED' | 'PARKED_AMBIGUOUS'
+  /** The order's CURRENT paid time, read under the claim lock, is before the producer floor: the bridge's order. Nothing was written. */
+  | 'REFUSED_PRE_CUTOVER'
 
 export interface WmsOrderPushPort {
   activeBindings(connector: string): Promise<Array<{ warehouseId: string; externalWarehouseId: string }>>
@@ -749,7 +751,7 @@ export interface WmsOrderPushPort {
    * that it is stale, under the row lock, so no second worker can reach the same conclusion and
    * push. The caller must not call the WMS for either non-`'CLAIMED'` answer.
    */
-  claimForCreate(orderId: string, connector: string, attemptedAt: Date): Promise<WmsCreateClaimOutcome>
+  claimForCreate(orderId: string, connector: string, attemptedAt: Date, paidNotBefore?: Date): Promise<WmsCreateClaimOutcome>
   /**
    * o3d-92fu — record a PRE-CALL payload-validation failure, under the order's row lock.
    *
@@ -1669,7 +1671,9 @@ export async function runWmsOrderPushSweepCore(
 
       let claim: WmsCreateClaimOutcome = 'SKIPPED'
       try {
-        claim = await port.claimForCreate(order.id, connectorId, ts)
+        // The producer floor is re-proved UNDER THE CLAIM LOCK on the order's current paid time: the decision above used the value read when
+        // the candidates were selected, and an import can correct paidAt in the gap. No floor: the legacy three-argument call.
+        claim = createFloor ? await port.claimForCreate(order.id, connectorId, ts, createFloor) : await port.claimForCreate(order.id, connectorId, ts)
       } catch (error) {
         console.error('[wms-order-push] create claim failed', order.id, error)
       }
@@ -1700,6 +1704,11 @@ export async function runWmsOrderPushSweepCore(
           after: { state: 'AMBIGUOUS_CREATE', attempts: Math.max(order.pushAttempts, AMBIGUOUS_ATTEMPTS), remoteOutcomeAmbiguous: true },
           error: wmsAmbiguousCreateRefusal(connectorId, reference, registry),
         })
+        continue
+      }
+      if (claim === 'REFUSED_PRE_CUTOVER') {
+        recoveryRefusedCount += 1
+        console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} is now paid before the live-from instant — NOT claimed or created; its link is untouched`)
         continue
       }
       if (claim !== 'CLAIMED') continue
@@ -2561,7 +2570,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       })
       return rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
     },
-    async claimForCreate(orderId, connector, attemptedAt) {
+    async claimForCreate(orderId, connector, attemptedAt, paidNotBefore) {
       // o3d-1izw — THE WRITE-SITE GUARD. This transaction is the one that mints AMBIGUOUS_CREATE,
       // and on a database without that enum value Postgres rejects it, rolls the transaction back
       // and leaves the order neither claimed nor parked — so the next sweep reaches the same link
@@ -2582,9 +2591,11 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           where: { id: orderId },
           // orderNumber/externalOrderNumber are read for the PARK's operator-facing refusal: it
           // names the reference a person will search the WMS for, and the sales order id is not it.
-          select: { withdrawalHoldAt: true, withdrawalApprovedAt: true, orderNumber: true, externalOrderNumber: true },
+          select: { withdrawalHoldAt: true, withdrawalApprovedAt: true, orderNumber: true, externalOrderNumber: true, paidAt: true },
         })
         if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return 'SKIPPED'
+        // The ownership boundary, re-proved on the CURRENT paid time under the lock (see the sweep). Before any write.
+        if (paidNotBefore && wmsPaidBeforeCreateFloor(fresh?.paidAt, paidNotBefore)) return 'REFUSED_PRE_CUTOVER'
 
         // o3d-d82p: a live WooCommerce withdrawal SUPPRESSION is a fulfilment
         // fence in its own right, not just an ingestion guard.

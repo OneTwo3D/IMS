@@ -49,6 +49,8 @@ const CLAIM_IS_A_WIN: Record<WmsCreateClaimOutcome, boolean> = {
   SKIPPED: false,
   // Someone else's LAPSED claim was parked as AMBIGUOUS_CREATE. Nothing is pushed for it either.
   PARKED_AMBIGUOUS: false,
+  // Refused on the order's current paid time (the bridge's order): nothing written, nothing pushed.
+  REFUSED_PRE_CUTOVER: false,
 }
 
 test(
