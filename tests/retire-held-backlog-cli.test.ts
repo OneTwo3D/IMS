@@ -120,3 +120,14 @@ test('the exit-code table is documented once: the docs carry exactly the rows of
   assert.equal(new Set(RETIRE_HELD_BACKLOG_EXIT_CODES.map((row) => row.code)).size, RETIRE_HELD_BACKLOG_EXIT_CODES.length)
   assert.match(body, /It changes nothing unless it is also given `--apply --confirm-database <name>`/)
 })
+
+test('--all-queued reports that a configured cut-off is ignored, and the JSON carries the effective (null) cut-offs', async () => {
+  const h = harness()
+  await h.run(['--all-queued'], { [PRODUCER_CUTOFF_ENV.xero]: '2026-12-01T00:00:00Z' })
+  assert.match(h.out.join('\n'), /xero: every queued row \(--all-queued; the configured cut-off 2026-12-01T00:00:00\.000Z is ignored\)/)
+  const j = harness()
+  await j.run(['--all-queued', '--json'], { [PRODUCER_CUTOFF_ENV.xero]: '2026-12-01T00:00:00Z' })
+  const parsed = JSON.parse(j.out.join('\n')) as { cutoffs: Record<string, string | null>; configuredCutoffsIgnored: boolean }
+  assert.equal(parsed.cutoffs.xero, null)
+  assert.equal(parsed.configuredCutoffsIgnored, true)
+})

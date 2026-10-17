@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url'
 
 import {
   applyHeldBacklogRetirement,
+  effectiveRetirementCutoff,
   planHeldBacklogRetirement,
   resolveRetirementCutoffs,
   RETIREMENT_DEFAULT_LIMIT,
@@ -127,7 +128,8 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
       stdout.log(JSON.stringify({
         mode: apply ? 'apply' : 'dry-run',
         generatedAt: plan.generatedAt.toISOString(),
-        cutoffs: Object.fromEntries(Object.entries(scope.cutoffs).map(([k, v]) => [k, v?.toISOString()])),
+        cutoffs: Object.fromEntries(destinations.map((d) => [d, effectiveRetirementCutoff(scope, d)?.toISOString() ?? null])),
+        configuredCutoffsIgnored: scope.allQueued && Object.keys(scope.cutoffs).length > 0,
         allQueued: scope.allQueued,
         unscoped: plan.unscoped,
         truncated: plan.truncated,
@@ -141,8 +143,8 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
     } else {
       stdout.log(apply ? 'APPLY (rows are changed, one transaction each)' : 'DRY RUN (nothing is changed)')
       for (const destination of destinations) {
-        const cutoff = scope.cutoffs[destination]
-        stdout.log(`${destination}: ${cutoff ? `queued before ${cutoff.toISOString()}` : scope.allQueued ? 'every queued row' : 'no cut-off given or readable: nothing selected'}`)
+        const cutoff = effectiveRetirementCutoff(scope, destination)
+        stdout.log(`${destination}: ${scope.allQueued ? `every queued row (--all-queued; ${scope.cutoffs[destination] ? `the configured cut-off ${scope.cutoffs[destination]!.toISOString()} is ignored` : 'no cut-off applies'})` : cutoff ? `queued before ${cutoff.toISOString()}` : 'no cut-off given or readable: nothing selected'}`)
       }
       for (const [key, count] of [...tally.entries()].sort()) stdout.log(`  ${key}: ${count}`)
       for (const item of plan.items) {

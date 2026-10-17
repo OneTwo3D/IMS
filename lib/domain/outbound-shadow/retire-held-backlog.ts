@@ -247,9 +247,27 @@ export function classifyWmsPushLink(link: WmsLinkRetirementRow): RetirementClass
 
 type RetirementClient = typeof db | Prisma.TransactionClient
 
+/**
+ * THE CUT-OFF THAT ACTUALLY SELECTS ROWS for a destination: none when `allQueued` (every queued row is in scope, so a configured cut-off must
+ * NOT narrow the plan or the apply and make a run look complete over a subset), otherwise the destination's own. The plan, the apply and the
+ * report all read this one function.
+ */
+export function effectiveRetirementCutoff(scope: RetirementScope, destination: OutboundConnector): Date | null {
+  return scope.allQueued ? null : scope.cutoffs[destination] ?? null
+}
+
+/** Is a row created (or, for a link, whose order was paid) at `at` still before the effective cut-off? No cut-off: every queued row is eligible. */
+function stillBeforeCutoff(at: Date | null | undefined, cutoff: Date | null, nullCounts = false): boolean {
+  if (cutoff === null) return true
+  if (!(at instanceof Date)) return nullCounts
+  return at.getTime() < cutoff.getTime()
+}
+
+const CHANGED_SINCE_PLANNING = 'changed since planning: it is no longer what was classified (re-dated, re-armed, attempted or moved), so it was left alone'
+
 function inScope(scope: RetirementScope, destination: OutboundConnector): { in: true; cutoff: Date | null } | { in: false } {
   if (!scope.destinations.includes(destination)) return { in: false }
-  const cutoff = scope.cutoffs[destination] ?? null
+  const cutoff = effectiveRetirementCutoff(scope, destination)
   if (cutoff === null && !scope.allQueued) return { in: false }
   return { in: true, cutoff }
 }
@@ -363,22 +381,25 @@ function retirementDecision(destination: OutboundConnector, operation: string, s
     reason: 'before_cutoff',
     owner: ownershipRowFor(destination, operation)?.owners.P1 ?? probe.owner,
     phase: probe.phase,
-    cutoff: scope.cutoffs[destination] ?? probe.cutoff,
+    cutoff: effectiveRetirementCutoff(scope, destination) ?? probe.cutoff,
     grant: probe.grant,
   }
 }
 
 async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementItem, scope: RetirementScope, now: Date): Promise<RetirementOutcome> {
+  // Under a row lock, and re-derived: the row must still be Xero's, still queued, and still created before the effective cut-off.
+  await tx.$queryRaw`SELECT id FROM accounting_sync_logs WHERE id = ${item.id} FOR UPDATE`
   const row = await tx.accountingSyncLog.findUnique({
     where: { id: item.id },
     select: {
-      id: true, type: true, status: true, referenceType: true, referenceId: true, payload: true, createdAt: true,
+      id: true, connector: true, type: true, status: true, referenceType: true, referenceId: true, payload: true, createdAt: true,
       externalTransactionId: true, createDispatchedAt: true, attemptRevision: true, retryCount: true,
       remoteAttemptedAt: true, attemptStampingCustodyAt: true, processingStartedAt: true,
     },
   })
-  if (!row || (row.status !== 'PENDING' && row.status !== 'PROCESSING')) {
-    return { item, result: 'changed_since_plan', detail: 'the row is gone or is no longer queued' }
+  const xeroCutoff = effectiveRetirementCutoff(scope, 'xero')
+  if (!row || row.connector !== 'xero' || (row.status !== 'PENDING' && row.status !== 'PROCESSING') || !stillBeforeCutoff(row.createdAt, xeroCutoff)) {
+    return { item, result: 'changed_since_plan', detail: CHANGED_SINCE_PLANNING }
   }
   const verdict = classifyXeroSyncRow(xeroRetirementRowOf(row), now)
   if (verdict.disposition === 'SKIP') return { item, result: 'left_alone', detail: verdict.reason }
@@ -389,6 +410,8 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
   // The compare-and-set: exactly the state that was classified. A claim, a retry or a settlement since the read changes one of these.
   const guard: Prisma.AccountingSyncLogWhereInput = {
     id: row.id,
+    connector: 'xero',
+    createdAt: row.createdAt,
     status: row.status,
     attemptRevision: row.attemptRevision,
     retryCount: row.retryCount,
@@ -457,15 +480,24 @@ async function voidMirrorUnlessAnotherAttemptIsLive(
 }
 
 async function retireOutboxJob(tx: Prisma.TransactionClient, item: RetirementItem, scope: RetirementScope, now: Date): Promise<RetirementOutcome> {
+  await tx.$queryRaw`SELECT id FROM integration_outbox WHERE id = ${item.id} FOR UPDATE`
   const job = await tx.integrationOutbox.findUnique({ where: { id: item.id } })
-  if (!job || ![INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED, INTEGRATION_OUTBOX_STATUS.PROCESSING].includes(job.status as never)) {
-    return { item, result: 'changed_since_plan', detail: 'the job is gone or is no longer queued' }
+  // Re-derived under the row lock from the CURRENT row: same destination, not a local operation, still queued, and STILL created before the
+  // effective cut-off. A product's stock job is re-dated and re-armed in place by a live producer; that row is new live work, never a backlog row.
+  if (
+    !job
+    || job.connector !== item.destination
+    || outboxInternalOperationsOf(item.destination).includes(job.operation)
+    || ![INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED, INTEGRATION_OUTBOX_STATUS.PROCESSING].includes(job.status as never)
+    || !stillBeforeCutoff(job.createdAt, effectiveRetirementCutoff(scope, item.destination))
+  ) {
+    return { item, result: 'changed_since_plan', detail: CHANGED_SINCE_PLANNING }
   }
   const verdict = classifyOutboxJob(job, now)
   if (verdict.disposition === 'SKIP') return { item, result: 'left_alone', detail: verdict.reason }
   const destination = item.destination
   const cleared = { nextAttemptAt: null, lockedAt: null, lockedBy: null }
-  const guard = { id: job.id, status: job.status, attempts: job.attempts, updatedAt: job.updatedAt }
+  const guard = { id: job.id, connector: job.connector, operation: job.operation, createdAt: job.createdAt, status: job.status, attempts: job.attempts, updatedAt: job.updatedAt }
   if (verdict.disposition === 'SHADOW') {
     // The Xero job is the delivery half of a sync row, whose own retirement records the shadow; every other job is the work itself.
     const target = destination === 'xero' ? null : ownershipTargetForOutboxOperation(`${job.connector}/${job.operation}`)
@@ -506,7 +538,13 @@ async function retireWmsPushLink(tx: Prisma.TransactionClient, item: RetirementI
   // The same row lock the claim and the hard-delete take, so the classification below is of a link nobody can be claiming.
   await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${peek.orderId} FOR UPDATE`
   const link = await tx.wmsOrderPushLink.findUnique({ where: { id: item.id } })
-  if (!link) return { item, result: 'changed_since_plan', detail: 'the link is gone' }
+  const order = await tx.salesOrder.findUnique({ where: { id: peek.orderId }, select: { paidAt: true } })
+  // Re-derived under the order lock: the destination's link, and its order still paid before the effective cut-off (or not paid at all).
+  if (!link || !wmsConnectorIdsFor(item.destination).includes(link.connector as never) || !order || !stillBeforeCutoff(order.paidAt, effectiveRetirementCutoff(scope, item.destination), true)) {
+    return { item, result: 'changed_since_plan', detail: CHANGED_SINCE_PLANNING }
+  }
+  const linkCutoff = effectiveRetirementCutoff(scope, item.destination)
+  const linkCutoffWhere = linkCutoff ? { order: { OR: [{ paidAt: null }, { paidAt: { lt: linkCutoff } }] } } : {}
   const verdict = classifyWmsPushLink(link)
   if (verdict.disposition === 'SKIP') return { item, result: 'left_alone', detail: verdict.reason }
   if (verdict.disposition === 'SHADOW') {
@@ -523,13 +561,14 @@ async function retireWmsPushLink(tx: Prisma.TransactionClient, item: RetirementI
       where: {
         id: link.id, state: 'PENDING_CREATE', attempts: 0, lastAttemptAt: null, lastError: null,
         externalOrderId: null, externalOrderNumber: null, pushedAt: null,
+        ...linkCutoffWhere,
       },
     })
     if (removed.count === 0) throw new RetirementConflict('the link changed while it was being retired')
     return { item, result: 'shadowed', detail: verdict.reason }
   }
   const parked = await tx.wmsOrderPushLink.updateMany({
-    where: { id: link.id, state: 'PENDING_CREATE', attempts: link.attempts, externalOrderId: null, pushedAt: null },
+    where: { id: link.id, state: 'PENDING_CREATE', attempts: link.attempts, externalOrderId: null, pushedAt: null, ...linkCutoffWhere },
     data: {
       state: 'AMBIGUOUS_CREATE',
       lastError: producerUnknownOutcomeNotice({ connector: item.destination, why: `The record does not show it was never sent: ${verdict.reason}.` }),

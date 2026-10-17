@@ -506,3 +506,91 @@ test('RETIREMENT of Mintsoft links queued before go-live: a bare PENDING_CREATE 
   assert.equal(parked?.attempts, 1, 'the evidence of the attempt is kept')
   assert.equal(await d.db.wmsOrderPushLink.count({ where: { id: later.linkId } }), 1, 'the later order\'s queued link is untouched')
 })
+
+// ───────────────── plan -> apply: every write is guarded by what justified the classification, re-derived under lock ─────────────────
+//
+// Named mutations (each shown red in the PR): t1 outbox apply drops the createdAt/cut-off re-check; t2 xero apply drops it; t3 link apply drops it;
+// t4 the plan applies a configured cut-off under --all-queued.
+
+test('PLAN -> APPLY (outbox): a stock job re-dated and re-armed after planning is NOT shadowed (live work); one attempted after planning is PARKED, never shadowed', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const redated = await seedJob(d, `woocommerce:stock.push:${tag}-redated`, BEFORE, { updatedAt: BEFORE })
+  const attempted = await seedJob(d, `woocommerce:stock.push:${tag}-attempted`, BEFORE, { updatedAt: BEFORE })
+  const control = await seedJob(d, `woocommerce:stock.push:${tag}-control`, BEFORE, { updatedAt: BEFORE })
+  const scope = { destinations: ['woocommerce' as const], cutoffs: { woocommerce: CUTOFF }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const ids = new Set([redated.id, attempted.id, control.id])
+  const mine = plan.items.filter((item: { id: string; classification: { disposition: string } }) => ids.has(item.id))
+  assert.deepEqual(mine.map((i: { classification: { disposition: string } }) => i.classification.disposition), ['SHADOW', 'SHADOW', 'SHADOW'], 'precondition: all three plan as SHADOW')
+  // After planning: a live producer re-dates and re-arms one; another is claimed and fails once.
+  await d.db.integrationOutbox.update({ where: { id: redated.id }, data: { createdAt: new Date(), updatedAt: new Date(), status: 'PENDING' } })
+  await d.db.integrationOutbox.update({ where: { id: attempted.id }, data: { attempts: 1, status: 'RETRYABLE_FAILED', lastError: 'boom' } })
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
+  const state = async (id: string) => (await d.db.integrationOutbox.findUnique({ where: { id }, select: { status: true } }))?.status
+  console.log(`# outbox plan->apply: ${JSON.stringify(applied.outcomes.map((o: { result: string }) => o.result))}`)
+  assert.equal(await state(redated.id), 'PENDING', 'the re-dated job is live work and is untouched')
+  assert.equal(applied.outcomes.find((o: { item: { id: string } }) => o.item.id === redated.id)?.result, 'changed_since_plan')
+  assert.equal(await state(attempted.id), 'PERMANENT_FAILED', 'an attempt after planning: parked, not shadowed')
+  assert.equal(await state(control.id), 'SHADOWED', 'CONTROL: an unchanged job is retired')
+})
+
+test('PLAN -> APPLY (Xero): a sync row re-dated after planning is left alone; one claimed or retried after planning is not shadowed', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupSync(d, tag))
+  const redated = await seedSyncLog(d, `${tag}-redated`, { createdAt: BEFORE })
+  const retried = await seedSyncLog(d, `${tag}-retried`, { createdAt: BEFORE })
+  const control = await seedSyncLog(d, `${tag}-control`, { createdAt: BEFORE })
+  const scope = { destinations: ['xero' as const], cutoffs: { xero: CUTOFF }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const ids = new Set([redated.id, retried.id, control.id])
+  const mine = plan.items.filter((item: { id: string }) => ids.has(item.id))
+  assert.equal(mine.filter((i: { classification: { disposition: string } }) => i.classification.disposition === 'SHADOW').length, 3, 'precondition')
+  await d.db.accountingSyncLog.update({ where: { id: redated.id }, data: { createdAt: AFTER } })
+  await d.db.accountingSyncLog.update({ where: { id: retried.id }, data: { attemptRevision: 1, retryCount: 1 } })
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
+  const row = (id: string) => d.db.accountingSyncLog.findUnique({ where: { id }, select: { status: true, settlementBasis: true } })
+  assert.deepEqual(await row(redated.id), { status: 'PENDING', settlementBasis: null })
+  assert.equal(applied.outcomes.find((o: { item: { id: string } }) => o.item.id === redated.id)?.result, 'changed_since_plan')
+  const retriedAfter = await row(retried.id)
+  assert.notEqual(retriedAfter?.settlementBasis, 'HELD_SHADOW')
+  assert.equal(retriedAfter?.status, 'FAILED')
+  assert.equal((await row(control.id))?.settlementBasis, 'HELD_SHADOW')
+})
+
+test('PLAN -> APPLY (warehouse link): an order paid after the cut-off since planning keeps its queued link; an attempted link is parked, not deleted', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  const repaid = await seedLinkedOrder(d, `${tag}a`, BEFORE, {})
+  const attempted = await seedLinkedOrder(d, `${tag}b`, BEFORE, {})
+  t.after(async () => { for (const s of [repaid, attempted]) await cleanupLinked(d, s) })
+  const scope = { destinations: ['mintsoft' as const], cutoffs: { mintsoft: CUTOFF }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const mine = plan.items.filter((item: { id: string }) => item.id === repaid.linkId || item.id === attempted.linkId)
+  assert.equal(mine.length, 2)
+  await d.db.salesOrder.update({ where: { id: repaid.orderId }, data: { paidAt: AFTER } })
+  await d.db.wmsOrderPushLink.update({ where: { id: attempted.linkId }, data: { attempts: 1, lastAttemptAt: new Date() } })
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
+  assert.equal(await d.db.wmsOrderPushLink.count({ where: { id: repaid.linkId } }), 1, 'the link of an order paid after the instant is IMS\'s own and stays')
+  assert.equal(applied.outcomes.find((o: { item: { id: string } }) => o.item.id === repaid.linkId)?.result, 'changed_since_plan')
+  assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { id: attempted.linkId }, select: { state: true } }))?.state, 'AMBIGUOUS_CREATE')
+})
+
+test('--all-queued ignores a configured cut-off in the plan AND the apply, and the scope it reports says so', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const old = await seedJob(d, `woocommerce:stock.push:${tag}-old`, BEFORE, { updatedAt: BEFORE })
+  const fresh = await seedJob(d, `woocommerce:stock.push:${tag}-fresh`, AFTER, { updatedAt: AFTER })
+  const base = { destinations: ['woocommerce' as const], cutoffs: { woocommerce: CUTOFF }, limit: 5000 }
+  const ids = (plan: { items: Array<{ id: string }> }) => plan.items.filter((i) => i.id === old.id || i.id === fresh.id).map((i) => i.id).sort()
+  assert.deepEqual(ids(await d.retire.planHeldBacklogRetirement({ ...base, allQueued: false })), [old.id], 'with a cut-off only the old job')
+  const all = { ...base, allQueued: true }
+  const plan = await d.retire.planHeldBacklogRetirement(all)
+  assert.deepEqual(ids(plan), [old.id, fresh.id].sort(), 'allQueued: the configured cut-off does not narrow the plan')
+  assert.equal(d.retire.effectiveRetirementCutoff(all, 'woocommerce'), null)
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: plan.items.filter((i: { id: string }) => i.id === fresh.id) }, all)
+  assert.equal(applied.counts.shadowed, 1, 'and the apply does not refuse the newer job on the ignored cut-off')
+})
