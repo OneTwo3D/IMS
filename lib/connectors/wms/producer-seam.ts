@@ -35,6 +35,15 @@ export const WMS_PRODUCER_DESTINATION = {
   mintsoft: 'mintsoft',
 } as const satisfies Record<WmsConnectorId, OutboundConnector>
 
+/**
+ * The WMS connector ids whose warehouse writes land at an outbound destination (empty for a destination that is not a warehouse). The one
+ * place generic code that must read "the push links of the warehouse destination" (the held-backlog retirement, `outbound:status`) learns
+ * which connector id that is, so it names no connector.
+ */
+export function wmsConnectorIdsFor(destination: OutboundConnector): WmsConnectorId[] {
+  return (Object.keys(WMS_PRODUCER_DESTINATION) as WmsConnectorId[]).filter((id) => WMS_PRODUCER_DESTINATION[id] === destination)
+}
+
 export type WmsShadow = MintsoftShadow
 
 export type WmsSeamInput<Op extends WmsWriteOperation> = MintsoftSeamInput<Op>

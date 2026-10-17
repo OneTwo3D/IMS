@@ -20,7 +20,7 @@ const outboxCalls: string[] = []
 const mirrorCalls: string[] = []
 let shadowUpserts = 0
 /** FAILED batch journals the daily run finds, and the ids it puts back to PENDING. */
-let failedBatchLogs: Array<{ id: string; type: string; referenceId: string; payload: Record<string, unknown> }> = []
+let failedBatchLogs: Array<{ id: string; type: string; referenceId: string; payload: Record<string, unknown>; createdAt?: Date }> = []
 const requeued: string[] = []
 /** Rows that become FAILED AFTER the run's read of the FAILED set and BEFORE its write (a concurrent worker). */
 let failedBetweenStatements: Array<{ id: string }> = []
@@ -63,7 +63,7 @@ const tx = {
   salesOrder: { findMany: async () => [], update: async () => ({}) },
   costLayer: { update: async () => ({}) },
   accountingSyncLog: {
-    findMany: async (args?: { where?: { status?: string } }) => (args?.where?.status === 'FAILED' ? failedBatchLogs : []),
+    findMany: async (args?: { where?: { status?: string } }) => (args?.where?.status === 'FAILED' ? failedBatchLogs.map((log) => ({ createdAt: new Date('2026-01-02T00:00:00Z'), ...log })) : []),
     updateMany: async (args: { where: { id?: { in: string[] }; status?: string }; data: { status?: string } }) => {
       if (args.data?.status === 'PENDING') {
         // A statement keyed on ids resets only those ids that are still FAILED; a status-wide statement (no id clause)
@@ -230,6 +230,24 @@ test('THE RE-QUEUE: the daily run puts a FAILED batch journal back to PENDING wh
     assert.deepEqual(off, ['failed-1'], 'PRECONDITION: with the hold off the failed journal IS re-queued, so "not re-queued" below is not vacuous')
     assert.deepEqual(held, [], 'a held batch is not made claimable again')
     assert.deepEqual(granted, ['failed-1'], 'granted, IMS-owned and dated after the cut-off: LIVE, so it is re-queued exactly as with the hold off')
+  } finally { failedBatchLogs = [] }
+})
+
+test('THE RE-QUEUE AND THE WRITER-SIDE CUT-OFF: a FAILED batch journal created BEFORE the live-from instant is not made claimable again even though its decision is LIVE; one created after is; with the hold off both are', async () => {
+  // Dated after the instant, so the DECISION is LIVE for both rows: only the cut-off can tell them apart.
+  const live = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: TENANT, XERO_WRITES_LIVE_FROM: '2026-03-01T00:00:00Z' }
+  failedBatchLogs = [
+    { id: 'failed-old', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-03-05-aaaa1111', payload: { date: '2026-03-05' }, createdAt: new Date('2026-02-01T00:00:00Z') },
+    { id: 'failed-new', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-03-06-bbbb2222', payload: { date: '2026-03-06' }, createdAt: new Date('2026-03-10T00:00:00Z') },
+  ]
+  try {
+    await runBatch({})
+    const off = [...requeued]
+    await runBatch(live)
+    const granted = [...requeued]
+    console.log(`# re-queue cut-off: off=${JSON.stringify(off)} live=${JSON.stringify(granted)}`)
+    assert.deepEqual(off, ['failed-old', 'failed-new'], 'PRECONDITION: with the hold off both are re-queued, so the refusal below is not vacuous')
+    assert.deepEqual(granted, ['failed-new'], 'only the row created after the live-from instant is made claimable again')
   } finally { failedBatchLogs = [] }
 })
 

@@ -1,6 +1,6 @@
 'use server'
 
-import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { xeroBeforeCutoffRefusal, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
@@ -750,10 +750,13 @@ export async function retryFailedXeroSync(
       if (entryId === undefined || expectedAttemptRevision === undefined) return { success: true, reset: 0 }
       // THE PRODUCER-SIDE HOLD: this fence CAS can still land (the row may have failed since the candidate read above), and it
       // writes PENDING, so the decision is asked on the row's own type and payload BEFORE the write. Held: the row stays FAILED.
-      const lateRow = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { type: true, payload: true } })
+      const lateRow = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { type: true, payload: true, createdAt: true } })
       if (lateRow) {
         const lateHold = xeroProducerSeamVerdict({ connector: 'xero', type: String(lateRow.type), payload: lateRow.payload })
         if (lateHold.kind === 'shadow') return { success: false, reset: 0, error: lateHold.notice }
+        // THE WRITER-SIDE CUT-OFF: a row queued before the live-from instant is never made claimable again, however it is re-queued.
+        const lateBeforeCutoff = xeroBeforeCutoffRefusal({ createdAt: lateRow.createdAt, type: String(lateRow.type) })
+        if (lateBeforeCutoff !== null) return { success: false, reset: 0, error: lateBeforeCutoff }
       }
       const outcome = await applyFencedAttemptDecision(db, {
         id: entryId,
@@ -876,6 +879,13 @@ export async function retryFailedXeroSync(
           const hold = xeroProducerSeamVerdict({ connector: 'xero', type: String(candidate.type), payload: candidate.payload })
           if (hold.kind === 'shadow') {
             refused.push({ id: candidate.id, reason: hold.notice, tokenCount: 1 })
+            continue
+          }
+          // THE WRITER-SIDE CUT-OFF AT THE RE-QUEUE: a row queued before the destination's live-from instant is not made claimable again
+          // (the claim would refuse it, and it would cycle). The floor is read here, inside the scope lock, at the moment of the write.
+          const beforeCutoff = xeroBeforeCutoffRefusal({ createdAt: candidate.createdAt, type: String(candidate.type) })
+          if (beforeCutoff !== null) {
+            refused.push({ id: candidate.id, reason: beforeCutoff, tokenCount: 1 })
             continue
           }
           const plan = planManualRetry({

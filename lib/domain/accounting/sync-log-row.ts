@@ -1,3 +1,4 @@
+import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -196,7 +197,7 @@ async function prepareShadow(
       decision: verdict.decision,
     }))
   } catch (error) {
-    console.error(`[producer-hold] could not record the shadow of ${String(data.type)} ${String(data.referenceType)} ${String(data.referenceId)}: ${error instanceof Error ? error.message : String(error)}`)
+    reportUnrecordedShadow({ destination: verdict.destination, operation: verdict.operation, subject: `${String(data.type)} ${String(data.referenceType)} ${String(data.referenceId)}`, error })
   }
   return {
     data: {
@@ -217,6 +218,6 @@ async function linkShadow(client: SyncLogRowClient, recordId: string | null, syn
   try {
     await withSavepoint(client, () => attachShadowSyncLog(client, recordId, syncLogId))
   } catch (error) {
-    console.error(`[producer-hold] could not link shadow ${recordId} to sync row ${syncLogId}: ${error instanceof Error ? error.message : String(error)}`)
+    reportUnrecordedShadow({ destination: 'xero', operation: 'link-shadow', subject: `shadow ${recordId} to sync row ${syncLogId}`, error })
   }
 }

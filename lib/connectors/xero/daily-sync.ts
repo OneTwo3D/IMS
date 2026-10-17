@@ -15,7 +15,7 @@
 
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
-import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { readProducerEnforcement } from '@/lib/security/producer-seam'
 import { createHash } from 'node:crypto'
 
@@ -78,7 +78,7 @@ import {
   type ForeignJournalState,
 } from '@/lib/domain/accounting/allocation-debit-passes'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
-import { recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
+import { clampRecreateWindowToCutoff, recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { cancelledClaimIsResolved } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
@@ -564,7 +564,7 @@ async function lockAllocationRecords(
   return new Map(rows.map((row) => [row.id, row.costLayerSnapshot ?? null]))
 }
 
-async function resetFailedDailyBatchLogs(): Promise<void> {
+export async function resetFailedDailyBatchLogs(): Promise<void> {
   // THE PRODUCER-SIDE HOLD AT THE RE-QUEUE. The verdict is decided FIRST, on the switch and the destination alone.
   // Not enforced for Xero (the default): the ORIGINAL statements run unchanged - a status-wide reset that takes every
   // batch row FAILED at execution time, including one that failed after any earlier read - so the switch-off
@@ -615,12 +615,17 @@ async function resetFailedDailyBatchLogs(): Promise<void> {
         type: { in: [...DAILY_BATCH_TYPES] },
         status: 'FAILED',
       },
-      select: { id: true, type: true, referenceId: true, payload: true },
+      select: { id: true, type: true, referenceId: true, payload: true, createdAt: true },
     })
-    const failedLogs = failed.filter((log) => xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type: String(log.type), payload: log.payload }).kind !== 'shadow')
+    // THE WRITER-SIDE CUT-OFF AT THE RE-QUEUE: a batch row queued before the live-from instant is not made claimable again (the claim
+    // would refuse it, and it would cycle between FAILED and PENDING every run). The floor is read here, at the moment of the write, and
+    // is also a clause of the write itself, so the set that is reset is exactly the set that passed it.
+    const cutoffFloor = xeroCutoffFloor()
+    const failedLogs = failed.filter((log) => xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type: String(log.type), payload: log.payload }).kind !== 'shadow'
+      && xeroBeforeCutoffRefusal({ createdAt: log.createdAt, type: String(log.type) }) === null)
 
     await tx.accountingSyncLog.updateMany({
-      where: { id: { in: failedLogs.map((log) => log.id) }, status: 'FAILED' },
+      where: { id: { in: failedLogs.map((log) => log.id) }, status: 'FAILED', ...xeroNotBeforeCutoffWhere(cutoffFloor) },
       data: {
         status: 'PENDING',
         retryCount: 0,
@@ -891,7 +896,8 @@ export async function recreateMissingDailyBatchLogs(
   // apart from one that already posted, and rebuilding would double-post the journal.
   // o3d-i0o6 r7: the cutoff as well as the filter. The filter bounds which ORDERS are read;
   // the cutoff bounds which of the batches their pass histories name may be rebuilt.
-  const { cutoff: retentionCutoff, dateFilter: journaledDateFilter } = await recreateRetentionWindow()
+  // THE WRITER-SIDE CUT-OFF: a batch dated before Xero's live-from instant is not this sweep's to rebuild (see clampRecreateWindowToCutoff).
+  const { cutoff: retentionCutoff, dateFilter: journaledDateFilter } = clampRecreateWindowToCutoff(await recreateRetentionWindow(), xeroCutoffFloor())
   const orphanA1Orders = await db.salesOrder.findMany({
     where: { revenueDeferredDate: journaledDateFilter },
     select: { revenueDeferredDate: true, revenueDeferredBatchRef: true, unearnedRevenueAmount: true },

@@ -78,8 +78,9 @@ test('the enforcement variable is documented exactly once, in a table row, and t
 /**
  * THE WIRED HOLD IS DESCRIBED TRUTHFULLY. The Xero, WooCommerce and Mintsoft producers consult the decision, and only where the
  * enforcement variable names the destination: operator text must say so, must not claim behaviour that only a later
- * change delivers (the outbound:status report, the writer-side cut-off, the other destinations), and may use "will"
- * only for a later change.
+ * change delivers (an enforcement that is not wired, a destination that is not), and may use "will"
+ * only for a later change. The outbound:status report, the writer-side cut-off and the retirement of the held backlog are delivered, and
+ * the text must say so (asserted below), because a doc that still called them "a later change" would be as wrong as one that overclaimed.
  */
 test('operator text for the producer hold says it is enforced only where named, is wired for Xero, WooCommerce and Mintsoft, claims no behaviour of a later change, and uses "will" only for later changes', () => {
   const texts = [...Object.values(PRODUCER_DOC_BLOCKS)]
@@ -89,7 +90,11 @@ test('operator text for the producer hold says it is enforced only where named, 
   assert.ok(PRODUCER_DOC_BLOCKS.overview.startsWith('THE PRODUCER-SIDE HOLD IS ENFORCED ONLY FOR THE DESTINATIONS NAMED IN'))
   assert.match(PRODUCER_DOC_BLOCKS.overview, /WHICH IS UNSET BY DEFAULT\. Unset, every producer queues work exactly as it did before/)
   assert.match(PRODUCER_DOC_BLOCKS.overview, /Today the Xero producers, the WooCommerce producers and the Mintsoft producers consult the decision/)
-  assert.match(PRODUCER_DOC_BLOCKS.overview, /`npm run outbound:status` does not report on the decision/)
+  assert.match(PRODUCER_DOC_BLOCKS.overview, /`npm run outbound:status` reports on it for every destination it is enforced for/)
+  assert.match(PRODUCER_DOC_BLOCKS.overview, /THE WRITER-SIDE CUT-OFF\. Work that already exists when a destination goes live/)
+  assert.match(PRODUCER_DOC_BLOCKS.overview, /`npm run retire:held-backlog` takes it out/)
+  assert.match(PRODUCER_DOC_BLOCKS.overview, /`outcome unknown: check <destination> before acting`/)
+  assert.doesNotMatch(PRODUCER_DOC_BLOCKS.overview, /A later change will (also )?(refuse|report)/, 'what this change delivers is no longer described as a later change')
   const forbidden = [/nothing is delivered/i, /both are reported/i, /cannot deliver/i, /is reported by/i, /sends nothing/i, /does not start any writer/i, /keeps the destination in shadow/i, /mintsoft (producers )?(queue|record|shadow)s? nothing/i]
   let sentences = 0
   let willSentences = 0
@@ -104,11 +109,14 @@ test('operator text for the producer hold says it is enforced only where named, 
     }
   }
   console.log(`# docs wording: texts=${texts.length} sentences=${sentences} will-sentences=${willSentences}`)
-  assert.ok(willSentences >= 2, 'precondition: the rule examined sentences that use "will"')
+  // Every "later change" the text once promised has been delivered, so no sentence needs "will" any more; the rule stays (a new promise must
+  // name its later change) and its precondition is that it examined the text, not that it found a promise.
+  assert.ok(sentences >= 40, 'precondition: the rule examined the text')
+  assert.equal(willSentences, 0, 'no operator text promises behaviour without naming the later change; today none promises any')
   // Rule can fail: an unconditional sentence is caught.
   assert.throws(() => assert.match('Nothing will be queued.', /later (change|slice)/i))
-  // No text claims outbound:status reports the inconsistency today.
-  for (const text of texts) assert.ok(!/outbound:status` (reports|shows|prints)/.test(text))
+  // The text that says outbound:status reports the inconsistency is true today: the exit code exists, and is the one the text names.
+  assert.match(PRODUCER_DOC_BLOCKS.overview, /`npm run outbound:status` reports it \(exit code `inconsistent`\)/)
 })
 
 test('the .env.example comment for the producer-side hold is true today: enforced only where named, wired for Xero, WooCommerce and Mintsoft, and no claims of a later change', () => {

@@ -1,3 +1,4 @@
+import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import { db } from '@/lib/db'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
@@ -96,7 +97,7 @@ export async function wooProducerSeam(input: WooSeamInput): Promise<WooSeamAnswe
     occurrences = result.occurrences
     recorded = true
   } catch (error) {
-    console.error(`[producer-hold] could not record the shadow of woocommerce.${input.operation} for ${input.subjectType} ${input.subjectId}: ${error instanceof Error ? error.message : String(error)}`)
+    reportUnrecordedShadow({ destination: 'woocommerce', operation: input.operation, subject: `${input.subjectType} ${input.subjectId}`, error })
   }
   return { proceed: false, shadowed: true, notice, reason: verdict.decision.reason, recorded, occurrences }
 }

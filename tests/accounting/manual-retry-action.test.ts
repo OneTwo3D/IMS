@@ -494,3 +494,72 @@ for (const action of ACTIONS) {
       'one reading of the document answers for every attempt against it')
   })
 }
+
+// ─────────────── WP2 S6: the writer-side cut-off at the re-queue ───────────────
+//
+// A FAILED row queued before the destination's live-from instant is never made claimable again by the manual retry, per row or in bulk. The
+// row types here are IMS-owned in the live phase (STOCK_RECEIPT is an inventory journal), so the producer DECISION says LIVE and only the
+// cut-off can refuse: that is what isolates this arm from the shadow refusal beside it.
+//
+// Named mutation (shown red in the PR, restored from a copy, md5-verified):
+//  b  retry-ignores-the-cutoff   the per-candidate cut-off check is removed from retryFailedXeroSync: both arms below go red
+
+const CUTOFF_ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM'] as const
+async function withLiveXero<T>(liveFrom: string | null, fn: () => Promise<T>): Promise<T> {
+  const saved = CUTOFF_ENV_KEYS.map((key) => [key, process.env[key]] as const)
+  for (const key of CUTOFF_ENV_KEYS) delete process.env[key]
+  if (liveFrom !== null) {
+    process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'xero'
+    process.env.XERO_WRITE_ALLOWED_TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
+    process.env.XERO_WRITES_LIVE_FROM = liveFrom
+  }
+  try { return await fn() } finally {
+    for (const key of CUTOFF_ENV_KEYS) delete process.env[key]
+    for (const [key, value] of saved) if (value !== undefined) process.env[key] = value
+  }
+}
+
+function seedCutoffRows(): void {
+  seed('xero')
+  // Two FAILED journals for different documents. s-old was created in Nov 2023; s-new is given a creation time after the instant used below.
+  state.rows.push(
+    row({ id: 's-old', connector: 'xero', type: 'STOCK_RECEIPT', referenceType: 'CogsEntry', referenceId: 'ce-old', status: 'FAILED', payload: { date: '2026-08-01' } }),
+    row({ id: 's-new', connector: 'xero', type: 'STOCK_RECEIPT', referenceType: 'CogsEntry', referenceId: 'ce-new', status: 'FAILED', payload: { date: '2026-08-01' } }),
+  )
+  state.rows.find((r) => r.id === 's-new')!.createdAt = new Date('2024-06-01T00:00:00Z')
+}
+
+test('xero: the per-row retry of a FAILED row queued before the live-from instant is REFUSED with the single-sourced sentence and the row stays FAILED; a later row is re-queued (control)', async () => {
+  seedCutoffRows()
+  const retry = await load(ACTIONS[0])
+  await withLiveXero('2024-01-01T00:00:00Z', async () => {
+    const refused = await retry('s-old')
+    console.log(`# retry pre-cutoff: ${JSON.stringify({ success: refused.success, reset: refused.reset, error: refused.error?.slice(0, 90) })}`)
+    assert.equal(refused.success, false)
+    assert.equal(refused.reset, 0)
+    assert.match(String(refused.error), /^Not sent by IMS: this was queued before writes to Xero went live on this installation \(2024-01-01T00:00:00\.000Z\)/)
+    assert.match(String(refused.error), /check Xero before acting/)
+    assert.equal(statusOf('s-old'), 'FAILED', 'the row was NOT made claimable again')
+    const allowed = await retry('s-new')
+    assert.equal(allowed.success, true, 'CONTROL: the identical action re-queues a row created after the instant')
+    assert.equal(allowed.reset, 1)
+    assert.equal(statusOf('s-new'), 'PENDING')
+  })
+})
+
+test('xero: "Retry All" re-queues only the rows created after the live-from instant; with the switch OFF it re-queues the old one too (the legacy behaviour, byte for byte)', async () => {
+  seedCutoffRows()
+  const retry = await load(ACTIONS[0])
+  await withLiveXero('2024-01-01T00:00:00Z', async () => {
+    const bulk = await retry()
+    console.log(`# bulk: reset=${bulk.reset} refused=${bulk.refused}; old=${statusOf('s-old')} new=${statusOf('s-new')}`)
+    assert.equal(statusOf('s-old'), 'FAILED', 'the pre-cut-off row stays FAILED')
+    assert.equal(statusOf('s-new'), 'PENDING')
+  })
+  seedCutoffRows()
+  await withLiveXero(null, async () => {
+    await retry()
+    assert.equal(statusOf('s-old'), 'PENDING', 'CONTROL: switch off, nothing is refused on account of its age')
+    assert.equal(statusOf('s-new'), 'PENDING')
+  })
+})
