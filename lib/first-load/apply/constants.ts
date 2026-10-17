@@ -167,6 +167,16 @@ export const STEP_STATUSES = ['PENDING', 'RUNNING', 'DONE', 'FAILED', 'CONFLICT'
 export type StepStatus = (typeof STEP_STATUSES)[number]
 
 export const APPLY_REPORT_FORMAT_VERSION = 1
+
+/**
+ * WHAT A REPORT ROW MAY CARRY (docs/first-load-apply.md, "What a report contains"). A report is a private operator artefact. Per unit it holds the
+ * unit key (a catalogue identifier the operator needs to act on a failure: supplier name, SKU, SKU|WAREHOUSE pair, purchase-order reference) and closed
+ * words; never another cell of a prepared file, an importer's text, an exception message or a credential. tests/first-load/apply-orchestrate.test.ts
+ * pins these field lists.
+ */
+export const REPORT_ROW_FIELDS = ['key', 'outcome', 'reason'] as const
+export const REPORT_CONFLICT_FIELDS = ['key', 'code', 'detail'] as const
+export const REPORT_IMPORTER_MESSAGE_FIELDS = ['code', 'row'] as const
 export const APPLY_REPORT_JSON_NAME = 'first-load-apply-report.json'
 export const APPLY_REPORT_MARKDOWN_NAME = 'first-load-apply-report.md'
 export const RESIDUAL_FILE_PREFIX = 'residual-'

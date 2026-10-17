@@ -61,7 +61,7 @@ For each step, on the first run and on every resume, the runner reads the databa
 - **present-matching**: same key and same fingerprint (and the same recipe): skipped, not re-sent;
 - **present-conflicting**: the run stops and nothing more is written.
 
-The rows sent to the importer are the file of absent units only, in the original order. Correctness never depends on the run record: a crash between two row transactions leaves a database the next run reads correctly. The accounting is computed from the database, never from the importers' own counters (a product the importer counted as created whose recipe is missing is **failed**); the counters are kept as a cross-check finding. The importers' own error text (and any exception message) is **never stored or rendered**, because it can carry file values or secrets: the report keeps a bounded code (`ALREADY_EXISTS`, `NOT_FOUND`, `INVALID`, `EXCEPTION`, `OTHER`), a row number when the message names one, and the step. The rehearsal ceiling is fixed at 24 hours in the core; a caller cannot widen it, and an unusable limit or clock is a refusal. A purchase order whose lines span more than one prepared file is refused (the importer would create it from the first file and skip the rest).
+The rows sent to the importer are the file of absent units only, in the original order. Correctness never depends on the run record: a crash between two row transactions leaves a database the next run reads correctly. The accounting is computed from the database, never from the importers' own counters (a product the importer counted as created whose recipe is missing is **failed**); the counters are kept as a cross-check finding. The importers' own error text (and any exception message) is **never stored or rendered**, because it can carry file values or exception text: the report keeps a bounded code (`ALREADY_EXISTS`, `NOT_FOUND`, `INVALID`, `EXCEPTION`, `OTHER`), a row number when the message names one, and the step. The rehearsal ceiling is fixed at 24 hours in the core; a caller cannot widen it, and an unusable limit or clock is a refusal. A purchase order whose lines span more than one prepared file is refused (the importer would create it from the first file and skip the rest).
 
 ### What is compared
 
@@ -69,7 +69,19 @@ Every column of every importer template is accounted for in one table (`FINGERPR
 
 ### Problem text
 
-A refusal names the step, the chunk and the line (or a column name, a count, or a closed reason), never a cell: problems reach logs and reports and a cell can hold anything. A test fills the fixtures with a sentinel and asserts it appears in no problem string.
+A refusal (a problem string) names the step, the chunk and the line, or a column name, a count, or a closed reason. It never carries a cell value: problems reach logs, and a cell can hold anything. A test fills the fixtures with a sentinel and asserts it appears in no problem string. (The unit keys that the report rows carry are a separate, declared exception: see "What a report contains".)
+
+## What a report contains
+
+The apply report (JSON and Markdown) is a **private operator artefact**: write it to a directory only the operator can read (the files are created 0600) and do not paste it into tickets or chat. It contains identifiers and counts, and nothing else from the prepared files:
+
+- the run id, the load digest, the prepared run's file names and SHA-256 hashes, counts, and the exit name with its operator sentence;
+- per step: counts, the residual files' names, row counts and hashes, and one row per unit with exactly these fields: `key` (the unit key: a supplier name in lower case, a product SKU, an `SKU|WAREHOUSE` pair or a purchase-order reference), `outcome` (a closed word) and `reason` (a closed word or null);
+- per conflict: `key`, `code` (a closed word) and `detail` (a fixed sentence);
+- per importer message: a bounded `code` and a row number. The importer's own text is **never** stored or rendered, because it can carry file values or exception text;
+- the problems of the run (the problem text rules above) and the verification items the verification slice supplies.
+
+The unit key is a catalogue identifier the operator needs in order to act on a failure, so it is in the report. **No other cell of a prepared file is, no exception message is, and no credential is.** The keys are catalogue data, not secrets, but a supplier name or a reference can still be commercially sensitive: keep the report directory private.
 
 ### Conflict codes
 

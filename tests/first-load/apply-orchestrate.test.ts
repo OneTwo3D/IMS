@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { REHEARSAL_RECORD_FORMAT_VERSION } from '../../lib/first-load/apply/constants.ts'
+import { CONFLICT_CODES, REHEARSAL_RECORD_FORMAT_VERSION, REPORT_CONFLICT_FIELDS, REPORT_IMPORTER_MESSAGE_FIELDS, REPORT_ROW_FIELDS, ROW_OUTCOMES } from '../../lib/first-load/apply/constants.ts'
 import { runLoad, type ApplyOptions, type ApplyResult, type RunRecord } from '../../lib/first-load/apply/orchestrate.ts'
 import { ObservationError } from '../../lib/first-load/apply/residual.ts'
 import { buildApplyReport, renderApplyJson, renderApplyMarkdown } from '../../lib/first-load/apply/report.ts'
@@ -141,6 +141,50 @@ test('reports never carry importer error text or exception messages: only a code
     }
   }
   assert.ok(renderApplyMarkdown(buildApplyReport({ prepared: a.prepared, result: runs[0] })).includes('ALREADY_EXISTS (row 7)'))
+})
+
+test('report rows carry only the declared identifier fields: unit key plus closed words; no other cell, importer text or exception text', async (t) => {
+  const { prepared, db, options } = setup()
+  db.dropRecipeFor.add('ZQSENT-GIFT-SET')
+  const failed = await runLoad(prepared, db.ports({ execute: async (step, file) => { const r = await db.ports().execute(step, file); return step === 'suppliers' ? { ...r, errors: ['Row 3: free text from the importer SENTINEL-IMPORTER-TEXT'] } : r } }), options())
+  const second = setup()
+  second.db.foreignHistory = ['ZQSENT-LEG-01|ZQSENT-MAIN']
+  const conflicted = await runLoad(second.prepared, second.db.ports(), second.options())
+  const third = setup()
+  third.db.seed('products', { ...third.prepared.steps[1].units[1], fingerprint: '{"x":1}', recipe: null })
+  third.db.seed('suppliers', { key: 'stranger', collisionKey: 'STRANGER', fingerprint: 'x', recipe: null })
+  const differing = await runLoad(third.prepared, third.db.ports(), third.options())
+  const reports = [failed, conflicted, differing].map((result) => JSON.parse(renderApplyJson(buildApplyReport({ prepared, result }))))
+  let rows = 0
+  let conflicts = 0
+  let messages = 0
+  for (const report of reports) {
+    for (const step of report.steps) {
+      const keys = new Set(prepared.steps.find((s) => s.step === step.step)!.units.map((u) => u.key))
+      for (const row of step.rows) {
+        assert.deepEqual(Object.keys(row).sort(), [...REPORT_ROW_FIELDS].sort())
+        assert.ok(keys.has(row.key), 'a row key is a unit key of the step')
+        assert.ok((ROW_OUTCOMES as readonly string[]).includes(row.outcome))
+        assert.ok(row.reason === null || (CONFLICT_CODES as readonly string[]).includes(row.reason) || ['not loaded', 'changed during the step'].includes(row.reason))
+        rows++
+      }
+      for (const c of step.conflicts) {
+        assert.deepEqual(Object.keys(c).sort(), [...REPORT_CONFLICT_FIELDS].sort())
+        assert.ok((CONFLICT_CODES as readonly string[]).includes(c.code))
+        assert.ok(/^[a-z0-9 ]{1,80}$/.test(c.detail) && ![...keys].some((k) => c.detail.includes(k)), 'a conflict detail is a short fixed sentence that names no key')
+        conflicts++
+      }
+      for (const i of step.importer) for (const e of i.errors) {
+        assert.deepEqual(Object.keys(e).sort(), [...REPORT_IMPORTER_MESSAGE_FIELDS].sort())
+        messages++
+      }
+    }
+    const text = JSON.stringify(report)
+    assert.ok(!text.includes('SENTINEL-IMPORTER-TEXT') && !text.includes('Name of '), 'no importer text and no other cell (a product name) is in the report')
+  }
+  precondition(t, 'report rows examined', rows)
+  precondition(t, 'conflicts examined', conflicts)
+  precondition(t, 'importer messages examined', messages)
 })
 
 test('run record: a second load over an existing record, a resume with no record, a different digest and a finished run are each refused', async (t) => {

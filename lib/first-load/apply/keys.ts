@@ -11,7 +11,8 @@
  * file and reported as a conflict against the database.
  *
  * PROBLEM TEXT NEVER CARRIES A FILE VALUE. A problem names the step, the chunk and the line (and a column name or a closed reason), never a cell,
- * because the problems reach logs and reports and a cell can hold anything.
+ * because the problems reach logs and reports and a cell can hold anything. (The unit KEYS in report rows are a declared, separate exception: see
+ * docs/first-load-apply.md, "What a report contains".)
  */
 import { NUMERIC_LIMITS } from '../spec'
 import { D, fmt, fmtFixed, parseDecimal } from '../money'
