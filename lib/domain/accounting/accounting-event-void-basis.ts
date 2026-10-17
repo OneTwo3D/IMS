@@ -78,6 +78,14 @@ export const SOURCE_CANCELLED_VOID_BASIS = 'source_cancelled'
 export const ATTEMPT_SETTLED_VOID_BASIS = 'attempt_settled_not_posted'
 
 /**
+ * The posting this event mirrored was RETIRED UNSENT as a shadow (the producer-side hold's backlog retirement): IMS had queued it before
+ * the destination's live-from instant and proved from the row itself that no attempt to send it was ever made. The document belongs to
+ * the writer that owned the destination then, so it is not owed by IMS and no later attempt may take this event back to PENDING. Not
+ * revivable: it is deliberately absent from REVIVABLE_VOID_BASES. Written by lib/domain/outbound-shadow/retire-held-backlog.ts only.
+ */
+export const HELD_SHADOW_VOID_BASIS = 'held_shadow'
+
+/**
  * May a NEW LIVE ATTEMPT take a VOID mirrored event back to PENDING?
  *
  * ONE DEFINITION, read two ways: the SQL predicate in `reviveMirroredEventForNewAttempt` is built

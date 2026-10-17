@@ -1,3 +1,4 @@
+import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import { db } from '@/lib/db'
 import { recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
 import { producerShadowNotice } from '@/lib/security/producer-disposition-constants'
@@ -34,7 +35,7 @@ export async function xeroTaxRateWriteShadow(input: {
       decision: verdict.decision,
     })
   } catch (error) {
-    console.error(`[producer-hold] could not record the shadow of a Xero tax-rate creation: ${error instanceof Error ? error.message : String(error)}`)
+    reportUnrecordedShadow({ destination: 'xero', operation: 'tax-rate', subject: 'a Xero tax-rate creation', error })
   }
   return { notice: producerShadowNotice({ connector: 'xero', reason: verdict.decision.reason, owner: verdict.decision.owner }) }
 }

@@ -16,6 +16,7 @@ import {
   isOutboxEnqueueShadowed,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
+  outboxRowBeforeCutoff,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
@@ -107,12 +108,20 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
 
     const resetAttempts = current.status === INTEGRATION_OUTBOX_STATUS.SUCCEEDED
       || current.status === INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED
+    // THE WRITER-SIDE CUT-OFF, AND WHY THIS ROW IS RE-DATED. A product has ONE stock job for ever (its key is the product), re-armed in
+    // place by every stock change. The cut-off keeps a job created before the live-from instant from ever being delivered, and a row
+    // re-armed here is not that job: it is a NEW push of the current stock, ordered by a LIVE producer decision that the enqueue above has
+    // just taken after the instant. Left with its old creation time it would be refused for ever and the product's stock would stop
+    // syncing. A stock push is an absolute state, so delivering it now is correct (the ownership map marks it as needing no business-event
+    // time). The re-dating happens only while a floor is in force, so with the switch off the update is exactly what it was.
+    const redate = outboxRowBeforeCutoff({ connector: current.connector, operation: current.operation, createdAt: current.createdAt }) !== null
     const updated = await db.integrationOutbox.updateMany({
       where: {
         id: current.id,
         status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING },
       },
       data: {
+        ...(redate ? { createdAt: new Date() } : {}),
         connector: WC_STOCK_SYNC_CONNECTOR,
         operation: WC_STOCK_SYNC_OPERATION,
         idempotencyKey: wcStockSyncIdempotencyKey(options.productId),

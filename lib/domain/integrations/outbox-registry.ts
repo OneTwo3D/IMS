@@ -757,6 +757,24 @@ export function integrationOutboxStaleReclaimScope(
   return perConnector.length > 0 ? { OR: perConnector } : null
 }
 
+/**
+ * The connectors whose queued work the WRITER-SIDE CUT-OFF governs: the three destinations the producer-side hold knows. A job of such a
+ * connector is a vendor write, EXCEPT the operations the registry declares `internal` (a local effect: a ledger row, a stock release),
+ * which no cut-off applies to. An operation of such a connector that the registry does not know is governed (fail closed), exactly as
+ * `outboxDestinationOf` governs it.
+ */
+export const OUTBOX_CUTOFF_CONNECTORS = ['woocommerce', 'mintsoft', 'xero'] as const
+export type OutboxCutoffConnector = (typeof OUTBOX_CUTOFF_CONNECTORS)[number]
+
+/** The registered operations of a cut-off connector whose effect is local (no cut-off applies to them). */
+export function outboxInternalOperationsOf(connector: OutboxCutoffConnector): string[] {
+  const connectorRegistry = INTEGRATION_OUTBOX_REGISTRY[connector as RegisteredOutboxConnector]
+  if (!connectorRegistry) return []
+  return Object.entries(connectorRegistry as Record<string, OutboxRegistryEntry>)
+    .filter(([, entry]) => entry.destination === 'internal')
+    .map(([operation]) => operation)
+}
+
 export function isRegisteredOutboxOperation(connector: string, operation: string): boolean {
   return getOutboxPayloadSchema(connector, operation) !== null
 }

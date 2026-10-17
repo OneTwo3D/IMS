@@ -1,3 +1,4 @@
+import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import { OUTBOUND_HELD_RETRY_DELAY_MS, isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { db } from '@/lib/db'
 import {
@@ -11,7 +12,9 @@ import {
 } from '@/lib/db/prisma-unique-violation'
 import {
   integrationOutboxStaleReclaimScope,
+  OUTBOX_CUTOFF_CONNECTORS,
   outboxDestinationOf,
+  outboxInternalOperationsOf,
   parseIntegrationOutboxPayload,
   PRODUCER_SEAMED_OUTBOX_DESTINATIONS,
   type OutboxConnectorWithoutShadow,
@@ -21,7 +24,7 @@ import { withSavepoint } from '@/lib/db/savepoint'
 import { recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
 import { producerShadowNotice, type ProducerReason } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecision } from '@/lib/security/producer-disposition'
-import { producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { createdBeforeCutoffFloor, producerCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
 import { ownershipTargetForOutboxOperation, type MappedOperation } from '@/lib/security/writer-ownership-map'
 
 export const INTEGRATION_OUTBOX_STATUS = {
@@ -30,6 +33,14 @@ export const INTEGRATION_OUTBOX_STATUS = {
   SUCCEEDED: 'SUCCEEDED',
   RETRYABLE_FAILED: 'RETRYABLE_FAILED',
   PERMANENT_FAILED: 'PERMANENT_FAILED',
+  /**
+   * RETIRED BY THE PRODUCER-SIDE HOLD AND KEPT AS A SHADOW: the job was queued before the destination's live-from instant (or while the
+   * hold stood), and the retirement PROVED from the row itself that no attempt to send it was ever made (attempts 0, or only a verified
+   * hold refusal). It is terminal: never claimed, never replayed, and not a failure (no operator action is owed). Written only by the
+   * retirement, and by the Xero drain for a job whose row it has proved never left; a job whose history cannot prove that is
+   * PERMANENT_FAILED with the unknown-outcome sentence instead, never this. See lib/domain/outbound-shadow/retire-held-backlog.ts.
+   */
+  SHADOWED: 'SHADOWED',
 } as const
 
 export type IntegrationOutboxStatus = typeof INTEGRATION_OUTBOX_STATUS[keyof typeof INTEGRATION_OUTBOX_STATUS]
@@ -48,6 +59,9 @@ export type IntegrationOutboxRow = {
   lockedBy: string | null
   createdAt: Date
   updatedAt: Date
+  /** Durable attempt history (see the schema): true only when this row's claims stamp `firstAttemptedAt`; absent / false = unknown. */
+  attemptHistoryTracked?: boolean
+  firstAttemptedAt?: Date | null
 }
 
 type IntegrationOutboxDelegate = {
@@ -327,6 +341,47 @@ function isIdempotencyKeyConflict(error: unknown): boolean {
     && (error as { meta?: { modelName?: unknown } }).meta?.modelName === 'IntegrationOutbox'
 }
 
+/**
+ * THE WRITER-SIDE CUT-OFF FOR QUEUED JOBS: the rows of a vendor connector that were created before that connector's live-from instant.
+ *
+ * A job queued before the instant (while the transport hold was the only barrier, or before the producer hold was enforced) belongs to
+ * the writer that owned the destination then, and IMS never delivers it, whatever its status and however it was re-armed. This is the
+ * fragment that MATCHES such rows; the claim negates it (NOT), so the oldest-first window never contains one and cannot be starved by
+ * them. Null when no connector has a floor: the switch is off, or the destination is not in its live phase. Then nothing is added and the
+ * legacy predicate is exact. A registered operation whose effect is local (`internal`) is never matched. Read at the moment it is asked
+ * for, from the environment, and cached nowhere.
+ */
+export function outboxBeforeCutoffWhere(context: { now?: Date } = {}): Record<string, unknown> | null {
+  const clauses: Array<Record<string, unknown>> = []
+  for (const connector of OUTBOX_CUTOFF_CONNECTORS) {
+    const floor = producerCutoffFloor(connector, context.now ? { now: context.now } : {})
+    if (floor === null) continue
+    const internal = outboxInternalOperationsOf(connector)
+    clauses.push({
+      connector,
+      createdAt: { lt: floor },
+      ...(internal.length > 0 ? { operation: { notIn: internal } } : {}),
+    })
+  }
+  return clauses.length > 0 ? { OR: clauses } : null
+}
+
+/** The floor that applies to ONE job (null when none), for a path that holds the row rather than a query. */
+export function outboxRowCutoffFloor(connector: string, operation: string, context: { now?: Date } = {}): Date | null {
+  if (!(OUTBOX_CUTOFF_CONNECTORS as readonly string[]).includes(connector)) return null
+  if (outboxInternalOperationsOf(connector as (typeof OUTBOX_CUTOFF_CONNECTORS)[number]).includes(operation)) return null
+  return producerCutoffFloor(connector as (typeof OUTBOX_CUTOFF_CONNECTORS)[number], context.now ? { now: context.now } : {})
+}
+
+/** True when this job predates the cut-off that applies to it. No floor: false. */
+export function outboxRowBeforeCutoff(
+  row: { connector: string; operation: string; createdAt: Date },
+  context: { now?: Date } = {},
+): Date | null {
+  const floor = outboxRowCutoffFloor(row.connector, row.operation, context)
+  return floor !== null && createdBeforeCutoffFloor(row.createdAt, floor) ? floor : null
+}
+
 function dueAtOrBefore(now: Date): unknown {
   return { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] }
 }
@@ -365,12 +420,14 @@ function claimableWhere(options: {
   staleReclaimScope: Record<string, unknown> | null
 }): unknown {
   const staleLockedBefore = new Date(options.now.getTime() - options.staleLockMs)
+  const beforeCutoff = outboxBeforeCutoffWhere({ now: options.now })
   return {
     ...(options.connector ? { connector: options.connector } : {}),
     ...(options.operation ? { operation: options.operation } : {}),
     ...(options.idempotencyKeys && options.idempotencyKeys.length > 0
       ? { idempotencyKey: { in: [...new Set(options.idempotencyKeys)] } }
       : {}),
+    ...(beforeCutoff ? { NOT: beforeCutoff } : {}),
     attempts: { lt: options.maxAttempts },
     OR: [
       {
@@ -392,8 +449,12 @@ function claimableWhere(options: {
 }
 
 function claimUpdateWhere(row: IntegrationOutboxRow, now: Date, maxAttempts: number): unknown {
+  // The writer-side cut-off, re-derived INSIDE the claim statement: the candidate was selected by a query that carried it, but the claim
+  // is the compare-and-set that takes the job, and what it decides must be the floor of that moment, not of the read before it.
+  const beforeCutoff = outboxBeforeCutoffWhere({ now })
   if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
     return {
+      ...(beforeCutoff ? { NOT: beforeCutoff } : {}),
       id: row.id,
       status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
       attempts: { lt: maxAttempts },
@@ -403,6 +464,7 @@ function claimUpdateWhere(row: IntegrationOutboxRow, now: Date, maxAttempts: num
   }
 
   return {
+    ...(beforeCutoff ? { NOT: beforeCutoff } : {}),
     id: row.id,
     status: { in: [...CLAIMABLE_STATUSES] },
     attempts: { lt: maxAttempts },
@@ -502,7 +564,7 @@ async function shadowOutboxEnqueue(
     occurrences = result.occurrences
     recorded = true
   } catch (error) {
-    console.error(`[producer-hold] could not record the shadow of ${input.connector}/${input.operation} (${input.idempotencyKey}): ${error instanceof Error ? error.message : String(error)}`)
+    reportUnrecordedShadow({ destination: verdict.destination, operation: verdict.operation, subject: `${input.connector}/${input.operation} (${input.idempotencyKey})`, error })
   }
   return {
     shadowed: true,
@@ -549,6 +611,8 @@ export async function enqueueIntegrationOutbox<C extends string>(
         lastError: null,
         lockedAt: null,
         lockedBy: null,
+        // This binary stamps the first claim, so for a row it creates "no first claim recorded" is a positive record of "never claimed".
+        attemptHistoryTracked: true,
       },
     })) as never
   } catch (error) {
@@ -603,6 +667,9 @@ export async function claimIntegrationOutboxWork(
             status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
             lockedAt: now,
             lockedBy: options.workerId,
+            // The durable attempt history: the FIRST claim is stamped here, before any request can leave, and nothing but a hold-refused claim that
+            // created the stamp itself ever clears it (markIntegrationOutboxRetryableFailure). A replay, a re-arm or a retry leave it alone.
+            ...(row.firstAttemptedAt ? {} : { firstAttemptedAt: now }),
           },
         })
         return result.count > 0
@@ -619,6 +686,7 @@ export async function claimIntegrationOutboxWork(
         status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         lockedAt: now,
         lockedBy: options.workerId,
+        ...(row.firstAttemptedAt ? {} : { firstAttemptedAt: now }),
       },
     })
     if (result.count === 0) continue
@@ -659,7 +727,7 @@ export async function markIntegrationOutboxRetryableFailure(
   // hold lasted longer than the retry budget. The job stays retryable, keeps its attempt count, and is
   // offered again after OUTBOUND_HELD_RETRY_DELAY_MS, for as long as the hold lasts.
   if (isOutboundWriteHeldText(errorMessage(options.error))) {
-    return updateClaimedOutboxRow(client, {
+    const heldRow = await updateClaimedOutboxRow(client, {
       id: options.id,
       workerId: options.workerId,
       lockedAt: options.lockedAt,
@@ -671,6 +739,13 @@ export async function markIntegrationOutboxRetryableFailure(
         lockedBy: null,
       },
     })
+    // A hold refuses a request before it leaves. If THIS claim is the one that created the first-attempt stamp (the stamp equals its own claim
+    // time), nothing has ever left for this job, so the stamp is withdrawn; a stamp from any earlier claim never equals this one and stays.
+    await client.integrationOutbox.updateMany({
+      where: { id: options.id, attemptHistoryTracked: true, firstAttemptedAt: options.lockedAt },
+      data: { firstAttemptedAt: null },
+    })
+    return heldRow
   }
 
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)

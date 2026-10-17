@@ -61,20 +61,23 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
     },
   })
   if (!link) {
-    // THE EVIDENCE STATE OF A SHADOW: no link exists because IMS kept the order's create as a shadow instead of pushing it. It is its
-    // own state, not a push state (nothing was claimed, sent or failed), and it offers no retry: the sweep offers the order again by
-    // itself once the warehouse may be written. Read only when the producer-side hold is enforced for the connector.
     const activeConnectorId = await getEnabledWmsConnectorId()
-    const shadow = activeConnectorId ? await wmsOrderCreateShadowEvidence(activeConnectorId, salesOrderId) : null
-    if (!shadow) {
-      // No link and no shadow: an order paid before the live-from instant is the bridge's, and the create query excludes it. Say so, rather
-      // than showing nothing for an order a person expects to see in the warehouse. Only when the hold is enforced and live (a floor exists).
-      const floor = activeConnectorId ? wmsCreateObligationFloor(activeConnectorId) : null
-      if (!floor) return null
+    // THE BOUNDARY COMES FIRST, AND SHADOW EVIDENCE NEVER OUTRANKS IT. Once the destination is live there is a floor, and an order paid before it
+    // belongs to the bridge and can never be created by IMS: that is what is true of it now, whatever IMS recorded about it while writes were held.
+    // Reading the shadow first let a held-phase record (written when this order was shown as "held") mask the pre-cutover disposition after go-live.
+    // So with a floor in force: an order paid before it is PRE_CUTOVER; and a shadow is not presented at all, because "writes are held on this
+    // installation" is no longer true of a live destination (an order paid after the floor is simply offered to the sweep, which writes its link).
+    const floor = activeConnectorId ? wmsCreateObligationFloor(activeConnectorId) : null
+    if (floor) {
       const order = await db.salesOrder.findUnique({ where: { id: salesOrderId }, select: { paidAt: true, status: true } })
       if (!order?.paidAt || !['PROCESSING', 'ALLOCATED'].includes(order.status) || !wmsPaidBeforeCreateFloor(order.paidAt, floor)) return null
       return { state: WMS_PRE_CUTOVER_PUSH_STATE, externalOrderNumber: null, attempts: 0, lastError: null, pushedAt: null, canRetry: false, retryRefusal: WMS_PRE_CUTOVER_NOTICE }
     }
+    // THE EVIDENCE STATE OF A SHADOW: no link exists because IMS kept the order's create as a shadow instead of pushing it. It is its own state, not a
+    // push state (nothing was claimed, sent or failed), and it offers no retry: the sweep offers the order again by itself once the warehouse may be
+    // written. Read only when the producer-side hold is enforced for the connector, and only while the destination is not live (no floor, above).
+    const shadow = activeConnectorId ? await wmsOrderCreateShadowEvidence(activeConnectorId, salesOrderId) : null
+    if (!shadow) return null
     return { state: 'SHADOWED', externalOrderNumber: null, attempts: 0, lastError: null, pushedAt: null, canRetry: false, retryRefusal: shadow.notice }
   }
   const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))

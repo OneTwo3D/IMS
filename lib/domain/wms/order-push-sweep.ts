@@ -2683,9 +2683,11 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         }
         await tx.wmsOrderPushLink.upsert({
           where: { orderId },
-          create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt },
+          // The durable claim history: this binary stamps the first claim (before any request can leave) and marks the row tracked at creation.
+          create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt, claimHistoryTracked: true, firstClaimedAt: attemptedAt },
           update: { lastAttemptAt: attemptedAt },
         })
+        await tx.wmsOrderPushLink.updateMany({ where: { orderId, firstClaimedAt: null }, data: { firstClaimedAt: attemptedAt } })
         return 'CLAIMED'
       })
     },
@@ -2727,7 +2729,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           // CREATED here = provably pre-call: no link existed, so no worker had claimed the order
           // and pushOrder cannot have been invoked. attempts 0 is the hard-delete guard's proof,
           // and this branch is the ONLY writer entitled to mint it (see provesNoRemoteWmsCall).
-          create: { orderId, connector, state: 'VALIDATION_FAILED', attempts: 0, lastError: error, lastAttemptAt: attemptedAt },
+          create: { orderId, connector, state: 'VALIDATION_FAILED', attempts: 0, lastError: error, lastAttemptAt: attemptedAt, claimHistoryTracked: true },
           // CONVERTED from an EXPIRED claim = AMBIGUOUS. The claim was written immediately before
           // a pushOrder call; the increment that would have recorded that call lives in a catch
           // whose own write is `.catch(() => {})` and which does not run at all if the worker was
