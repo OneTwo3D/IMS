@@ -1557,6 +1557,11 @@ export async function runWmsOrderPushSweepCore(
         shadowedCount += 1
         continue
       }
+      // The live withdrawal screen above ran (or was skipped) on the phase read at the start of the sweep. If that read said held
+      // but this order's own verdict is live, the live-from instant passed mid-sweep and this batch was never screened: an order
+      // whose first withdrawal webhook was missed has no suppression row, so creating it could push a withdrawn order. Nothing was
+      // claimed; the order is offered again, screened, on the next tick.
+      if (warehouseHeld) continue
 
       const ts = now()
 

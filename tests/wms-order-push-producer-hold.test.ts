@@ -387,3 +387,25 @@ test('ON: a connector id this build does not register has no ownership map: the 
     assert.equal(shadows.length, 0)
   })
 })
+
+test('PHASE CHANGES MID-SWEEP: the sweep starts held, the live-from instant passes before the create pass; an unscreened candidate with no suppression row is NOT created (deferred to the next tick)', async () => {
+  await withEnv(HELD, async () => {
+    const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+    const harness = makePort({ createCandidates: [candidate({ id: 'so-1' })] })
+    const inner = harness.port.createCandidates
+    harness.port.createCandidates = async (...args) => {
+      Object.assign(process.env, { [OUTBOUND_GRANT_ENV.mintsoft]: GRANT, [PRODUCER_CUTOFF_ENV.mintsoft]: CUTOFF })
+      return inner(...args)
+    }
+    const { connector, calls } = makeConnector()
+    const result = await runWmsOrderPushSweepCore(connector, 'mintsoft', harness.port, { now: NOW })
+    console.log(`# mid-sweep: calls=${JSON.stringify(calls)} writes=${JSON.stringify(harness.writes)} reads=${JSON.stringify(harness.reads)}`)
+    assert.deepEqual(calls, [], 'no warehouse order was created for an unscreened candidate')
+    assert.deepEqual(harness.writes, [], 'nothing claimed')
+    assert.equal(result.created, 0)
+    // the next tick (now live from its start) screens and creates
+    const next = await runWmsOrderPushSweepCore(connector, 'mintsoft', harness.port, { now: NOW })
+    assert.equal(next.created, 1)
+    assert.ok(harness.reads.includes('screenLiveWithdrawals'))
+  })
+})
