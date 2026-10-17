@@ -22,11 +22,12 @@
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
-import type { WmsConnector } from '@/lib/connectors/wms/types'
+import type { WmsConnector, WmsWriteClearance } from '@/lib/connectors/wms/types'
 import { contentValueHash, type ProductContentSnapshot } from '@/lib/domain/product-content/snapshot'
 import { explainProducerDisposition, type ProducerDecisionContext } from '@/lib/security/producer-disposition'
 import { PRODUCER_REASON_TEXT } from '@/lib/security/producer-disposition-constants'
 import { MINTSOFT_CONTENT_FIELDS, MINTSOFT_CONTENT_WIRE, type MintsoftContentField } from '../api/product-content'
+import { mintsoftProducerSeam } from '../producer-seam'
 
 export type ContentSyncState = {
   /** Field -> hash of the value Mintsoft last accepted. */
@@ -167,20 +168,35 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
   if (changed.length === 0) return result('unchanged', [])
 
   const decision = explainProducerDisposition('mintsoft', 'product.content', undefined, input.context ?? {})
-  const live = decision.disposition === 'LIVE' && typeof input.connector.updateProductContent === 'function'
   const contract = input.wireContract ?? MINTSOFT_CONTENT_WIRE
+  // THE PRODUCER SEAM, asked only when this decision is LIVE and a field could really be sent: it yields the clearance the connector
+  // write needs. It agrees with the decision above by construction (the seam adds only the enforcement switch), so it can only
+  // withhold a write the decision allowed in the instant between the two reads, and then the fields are kept as a shadow.
+  let cleared: { proceed: true; clearance: WmsWriteClearance<'product.content'> } | null = null
+  if (decision.disposition === 'LIVE' && typeof input.connector.updateProductContent === 'function' && changed.some((field) => contract[field].verified)) {
+    const seam = await mintsoftProducerSeam({
+      operation: 'product.content',
+      subjectType: 'Product',
+      subjectId: input.product.id,
+      payload: Object.fromEntries(changed.filter((field) => contract[field].verified).map((field) => [field, projection[field]])),
+      summary: { sku: input.product.sku },
+      context: input.context,
+    })
+    if (seam.proceed) cleared = seam
+  }
+  const live = cleared !== null
   const sendable = live ? changed.filter((field) => contract[field].verified) : []
   const toShadow = changed.filter((field) => !sendable.includes(field))
 
   let sentFields: MintsoftContentField[] = []
   let held: { message: string } | null = null
-  if (sendable.length > 0) {
+  if (sendable.length > 0 && cleared !== null) {
     const update: Parameters<NonNullable<ContentSyncInput['connector']['updateProductContent']>>[0] = {
       externalProductId: input.link.externalProductId,
       sku: input.product.sku,
     }
     for (const field of sendable) update[field] = projection[field]
-    const sent = await input.connector.updateProductContent!(update)
+    const sent = await input.connector.updateProductContent!(update, cleared.clearance)
     if (sent.sent) {
       sentFields = sendable
       for (const field of sendable) {

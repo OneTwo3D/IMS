@@ -9,7 +9,7 @@ The sales order list provides a searchable, sortable overview of all orders.
 - **Search** by order reference, customer name, or other fields
 - **Filter by status** to focus on orders at a specific stage
 - **Export to CSV** for reporting or use in external tools
-- **WMS status** — when an order ships from a warehouse bound to a WMS (e.g. Mintsoft), a chip shows the WMS's fulfilment state (e.g. new, picking, dispatched, cancelled). The order detail page refreshes it live and deep-links to the order in the WMS admin; the list shows the most recent cached value. An order only pushes to the WMS once it is paid and ready to fulfil and dispatch push is enabled (see Settings → System → Scheduler).
+- **WMS status** — when an order ships from a warehouse bound to a WMS (e.g. Mintsoft), a chip shows the WMS's fulfilment state (e.g. new, picking, dispatched, cancelled). The order detail page refreshes it live and deep-links to the order in the WMS admin; the list shows the most recent cached value. An order only pushes to the WMS once it is paid and ready to fulfil and dispatch push is enabled (see Settings → System → Scheduler). On an installation that is not yet allowed to write to the warehouse (the producer-side hold is switched on for it), nothing is pushed: the order stays as it is, the **Replay** and **Re-push** buttons say "Not sent by IMS: writes to Mintsoft are held on this installation" and change nothing, and IMS keeps only a record of what it would have sent. That record does not say whether the warehouse already holds the order (another system may have created it), so check the warehouse before acting.
 
 ## Creating a Sales Order
 

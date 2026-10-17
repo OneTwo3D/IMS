@@ -125,6 +125,7 @@ import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/di
 import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 import { releaseWithdrawalHold } from '@/app/actions/sales'
 import { getEnabledWmsConnectorId, resolveEnabledWmsConnectorSelection } from '@/lib/connectors/wms/active-connector'
+import { wmsOrderCreateReArmShadow } from '@/lib/connectors/wms/producer-seam'
 import {
   ambiguousWmsConnectorReason,
   enabledWmsConnectorId,
@@ -4075,6 +4076,11 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     if (!repush.repushable) {
       return { success: false, error: repush.guidance }
     }
+    // THE PRODUCER-SIDE HOLD, before the warehouse is asked anything. Re-pushing a missing order re-arms a create: with the hold
+    // enforced and the decision SHADOW it is refused with the single-sourced sentence, the finding stays open and the link is not
+    // reset. Nothing is queued for later.
+    const reArmShadow = await wmsOrderCreateReArmShadow(link.connector, orderId)
+    if (reArmShadow) return { success: false, error: reArmShadow.notice }
     const connector = getWmsConnector(activeConnectorId)
     if (!connector.probeOrderPresence) {
       return { success: false, error: 'The active WMS connector cannot verify order absence, so a safe re-push is not possible.' }

@@ -67,6 +67,8 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftProductBySku(sku)
   }
 
+  // The write methods of the WmsConnector contract take a producer-side clearance as their last argument (see WmsWriteClearance). It is a
+  // compile-time token that this class does not need: every caller holds a WmsConnector and the type checker requires the clearance there.
   async upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef> {
     return upsertMintsoftProduct(product, options)
   }

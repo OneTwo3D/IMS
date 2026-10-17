@@ -8,6 +8,7 @@ import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { mintsoftProducerSeam } from '../producer-seam'
 import { snapshotFromRow } from '@/lib/domain/product-content/store'
 import { describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
@@ -112,6 +113,12 @@ export type MintsoftProductSyncResult = {
   skippedReason?: string
   /** What the content step did in this run (descriptions and picture; see product-content-sync.ts). */
   content?: MintsoftContentCounters
+  /**
+   * Products whose upsert the producer-side hold kept as a shadow this run: nothing was sent and no link was stamped, so the
+   * next run offers them again. PRESENT ONLY WHEN NON-ZERO, so a run on an installation that does not enforce the hold returns
+   * exactly what it always did.
+   */
+  shadowed?: number
 }
 
 export type MintsoftContentCounters = {
@@ -127,7 +134,7 @@ export type MintsoftContentCounters = {
 type ProductSyncLineResult = {
   sku: string
   productId: string
-  action: 'noop' | 'sync' | 'backfill' | 'conflict' | 'skip' | 'error'
+  action: 'noop' | 'sync' | 'backfill' | 'conflict' | 'skip' | 'error' | 'shadow'
   reason: string
   payload: Prisma.WmsSyncLogCreateManyInput['payload']
   remoteUpdated: boolean
@@ -771,12 +778,33 @@ async function syncOneMintsoftProduct(
     }
   }
 
+  // THE PRODUCER SEAM of the product upsert, immediately before the only call that writes the product to Mintsoft. A shadow stamps
+  // nothing (no payload hash, no sync time, no link error), so the product is offered again until it is really sent, and it is
+  // kept as a record of what would have been written. The reads and the local reconciliation above are not writes to Mintsoft.
+  const upsertSeam = await mintsoftProducerSeam({
+    operation: 'product.upsert',
+    subjectType: 'Product',
+    subjectId: context.product.id,
+    payload: { product: dto, externalProductId: externalProductId ?? null, omitBarcode: barcodePlan.omitBarcode },
+    summary: { sku: context.product.sku, creating: !externalProductId },
+  })
+  if (!upsertSeam.proceed) {
+    return {
+      sku: context.product.sku,
+      productId: context.product.id,
+      action: 'shadow',
+      reason: upsertSeam.notice,
+      payload: toJsonPayload({ shadowed: true, reason: upsertSeam.reason }),
+      remoteUpdated: false,
+    }
+  }
+
   let synced: Awaited<ReturnType<typeof context.connector.upsertProduct>>
   try {
     synced = await context.connector.upsertProduct(dto, {
       externalProductId,
       omitBarcode: barcodePlan.omitBarcode,
-    })
+    }, upsertSeam.clearance)
   } catch (error) {
     await recordWmsMutationEvent({
       connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'FAILED',
@@ -901,6 +929,7 @@ function applyProductSyncLineCounters(
   line: ProductSyncLineResult,
 ) {
   if (line.action === 'skip') counters.skipped += 1
+  if (line.action === 'shadow') counters.shadowed = (counters.shadowed ?? 0) + 1
   if (line.action === 'noop') counters.matched += 1
   if (line.action === 'conflict') counters.mismatched += 1
   if (line.action === 'sync' || line.action === 'backfill' || line.remoteUpdated) {

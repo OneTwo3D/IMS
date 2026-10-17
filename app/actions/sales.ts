@@ -9,6 +9,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
 import { isWmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
@@ -143,6 +144,8 @@ import {
   releaseOrderAllocationsInTx,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
+import { wmsCreateObligationFloor } from '@/lib/connectors/wms/producer-seam'
+import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPushIsPreCutover } from '@/lib/domain/wms/create-eligibility'
 import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
@@ -532,7 +535,7 @@ const SO_SELECT = {
       carrier: true,
     },
   },
-  wmsOrderPush: { select: { state: true, lastError: true } },
+  wmsOrderPush: { select: { state: true, lastError: true, connector: true, attempts: true, externalOrderId: true } },
   _count: { select: { lines: true } },
   lines: { select: { cogsBase: true } },
 } as const
@@ -594,7 +597,7 @@ function mapSoRow(so: {
     trackingNumber: string | null
     carrier: string | null
   } | null
-  wmsOrderPush: { state: string; lastError: string | null } | null
+  wmsOrderPush: { state: string; lastError: string | null; connector?: string; attempts?: number; externalOrderId?: string | null } | null
 }): SoRow {
   const totalBase = Number(so.totalBase)
   const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
@@ -608,7 +611,15 @@ function mapSoRow(so: {
   const wms = so.wmsOrderStatus
   return {
     id: so.id,
-    wmsPush: so.wmsOrderPush ? { state: so.wmsOrderPush.state, lastError: so.wmsOrderPush.lastError } : null,
+    wmsPush: so.wmsOrderPush
+      ? (so.wmsOrderPush.connector !== undefined && wmsPushIsPreCutover(
+        { state: so.wmsOrderPush.state, attempts: so.wmsOrderPush.attempts ?? 0, externalOrderId: so.wmsOrderPush.externalOrderId ?? null },
+        { paidAt: so.paidAt },
+        wmsCreateObligationFloor(so.wmsOrderPush.connector),
+      )
+        ? { state: WMS_PRE_CUTOVER_PUSH_STATE, lastError: WMS_PRE_CUTOVER_NOTICE }
+        : { state: so.wmsOrderPush.state, lastError: so.wmsOrderPush.lastError })
+      : null,
     wmsStatus: wms
       ? {
           connectorLabel: wms.connectorLabel,
@@ -2620,10 +2631,21 @@ export async function createRefund(
                 const comment = isFull
                   ? `IMS: Order fully refunded (credit note ${creditNote}). If not yet dispatched it will be cancelled automatically; if already in progress please treat this as a cancellation request / raise a cancellation query.`
                   : `IMS: Partial refund (credit note ${creditNote}). Line quantities have been reduced — if the order is still amendable the items are updated automatically; otherwise please raise a line-item cancellation query for the refunded items.`
+                // The producer-side hold: the note is a write to the warehouse. Shadowed (hold enforced, decision SHADOW) it is kept as a
+                // record, nothing is sent, and the refund goes on exactly as it does when the note cannot be posted.
+                const noteSeam = await wmsProducerSeam(wmsLink.connector, {
+                  operation: 'order.comment',
+                  subjectType: 'SalesOrder',
+                  subjectId: orderId,
+                  payload: { externalOrderId: wmsLink.externalOrderId, comment },
+                })
+                if (!noteSeam.proceed) {
+                  console.warn(`[refund] warehouse note not sent: ${noteSeam.notice}`)
+                } else
                 // q66in.4.6 audit timeline (Codex r1): the refund note is a WMS
                 // mutation outside the order-push sweep, so it records here.
                 try {
-                  await connector.addOrderComment(wmsLink.externalOrderId, comment)
+                  await connector.addOrderComment(wmsLink.externalOrderId, comment, noteSeam.clearance)
                   await recordWmsMutationEvent({
                     connector: wmsLink.connector, direction: 'OUTBOUND', action: 'order_comment', outcome: 'SUCCEEDED',
                     entityType: 'SALES_ORDER', entityId: orderId, externalId: wmsLink.externalOrderId,

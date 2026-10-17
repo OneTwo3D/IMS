@@ -8,6 +8,7 @@
 import { DECLARATIONS, EXCLUDED_OPERATIONS, NO_PRODUCER } from './producer-census-declarations'
 import { formatCounts, reconcile, scanTree } from './producer-census'
 import { formatWooCounts, runWooCensus } from './producer-census-woocommerce'
+import { formatMintsoftCounts, runMintsoftCensus } from './producer-census-mintsoft'
 
 function main(): number {
   let scan
@@ -32,9 +33,15 @@ function main(): number {
   // The WooCommerce half: what each WooCommerce writer does about the producer-side hold, and every raw WooCommerce write found.
   const woo = runWooCensus(process.cwd(), DECLARATIONS, new Set(scan.sites.map((site) => site.key)), NO_PRODUCER)
   console.log(formatWooCounts(woo.counts))
-  const failures = [...report.failures, ...woo.failures]
+  // The Mintsoft half: what each Mintsoft writer does about the producer-side hold, the transport barrier, and the clearance every write carries.
+  const mint = runMintsoftCensus(process.cwd(), DECLARATIONS, new Set(scan.sites.map((site) => site.key)))
+  console.log(formatMintsoftCounts(mint.counts))
+  const failures = [...report.failures, ...woo.failures, ...mint.failures]
   if (scan.filesScanned >= 800 && (woo.counts.seamFunctions === 0 || woo.counts.transportWrites === 0 || woo.counts.outboxEnqueueSites === 0)) {
     failures.push(`SUBJECT NOT REACHED: the WooCommerce census saw ${woo.counts.seamFunctions} seam function(s), ${woo.counts.transportWrites} transport write(s) and ${woo.counts.outboxEnqueueSites} outbox enqueue site(s); each must be above zero on this tree.`)
+  }
+  if (scan.filesScanned >= 800 && (mint.counts.seamFunctions === 0 || mint.counts.transportSites === 0 || mint.counts.writeCalls === 0 || mint.counts.consultCalls === 0)) {
+    failures.push(`SUBJECT NOT REACHED: the Mintsoft census saw ${mint.counts.seamFunctions} seam function(s), ${mint.counts.transportSites} transport call(s), ${mint.counts.writeCalls} warehouse write call(s) and ${mint.counts.consultCalls} consultation(s); each must be above zero on this tree.`)
   }
   if (failures.length > 0) {
     console.error(`\nproducer census FAILED with ${failures.length} finding(s):\n`)

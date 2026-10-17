@@ -4,6 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { wmsCreateObligationFloor } from '@/lib/connectors/wms/producer-seam'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus } from '@/lib/connectors/wms/types'
 import { notify } from '@/lib/notifications'
 import { scrubWmsError } from './error-scrub'
@@ -96,6 +97,9 @@ export type WmsOrderReconcileDeps = {
    */
   probeOrderPresence: ((orderNumber: string) => Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'>) | null
 }
+
+/** The disposition written on a NOT_PUSHED finding closed because the order is out of IMS's scope (paid before the live-from instant). */
+export const WMS_RECONCILE_PRE_CUTOVER_DETAIL = 'Out of scope: this order was paid before the live-from instant, so it belongs to the bridge and IMS will not push it. Closed without a push link.'
 
 /** Testable core — pure orchestration over injected deps. */
 export async function runWmsOrderReconcileCore(
@@ -297,11 +301,16 @@ export function buildNotPushedDriftWhere(input: {
   boundWarehouseIds: string[]
   cutoff: Date
   orderIds?: string[]
+  /**
+   * The producer-side floor (wmsCreateObligationFloor): once the destination is live, an order paid before it belongs to the bridge and
+   * the push sweep's create query excludes it, so it can never be pushed and must not be reported as drift. Null: the legacy predicate.
+   */
+  paidNotBefore?: Date | null
 }) {
   return {
     ...(input.orderIds ? { id: { in: input.orderIds } } : {}),
     status: { in: ['PROCESSING' as const, 'ALLOCATED' as const] },
-    paidAt: { not: null, lt: input.cutoff },
+    paidAt: { not: null, lt: input.cutoff, ...(input.paidNotBefore ? { gte: input.paidNotBefore } : {}) },
     // Deliberately NO order.updatedAt condition (Codex r17 P1): storefront
     // refreshes touch busy orders far more often than the grace window, which
     // would permanently mask a dead push cron. The residual false positive — an
@@ -338,6 +347,53 @@ export function buildNotPushedDriftWhere(input: {
   }
 }
 
+/**
+ * Resolves the NOT_PUSHED findings in `rows` whose drift predicate no longer holds. Exported so the real queries can be tested against a
+ * database without running the whole reconcile. An order that drifts ONLY because of the producer floor (paid before the live-from
+ * instant, the bridge's order) is closed with an explicit out-of-scope disposition in `detail`, never left open and never closed silently.
+ */
+export async function resolveNotPushedChunk(input: {
+  connectorId: string
+  boundWarehouseIds: string[]
+  rows: Array<{ id: string; orderId: string }>
+  now: Date
+}): Promise<{ resolved: number; outOfScope: number }> {
+  const { rows } = input
+  const drifting = async (paidNotBefore: Date | null) => new Set(
+    input.boundWarehouseIds.length === 0
+      ? []
+      : (await db.salesOrder.findMany({
+          where: buildNotPushedDriftWhere({
+            connectorId: input.connectorId,
+            boundWarehouseIds: input.boundWarehouseIds,
+            cutoff: new Date(Date.now() - RECONCILE_UNPUSHED_GRACE_MS),
+            orderIds: rows.map((row) => row.orderId),
+            paidNotBefore,
+          }),
+          select: { id: true },
+        })).map((order) => order.id),
+  )
+  const floor = wmsCreateObligationFloor(input.connectorId)
+  const stillDrifting = await drifting(floor)
+  const preCutover = floor ? await drifting(null) : new Set<string>()
+  const outOfScopeIds = rows.filter((row) => !stillDrifting.has(row.orderId) && preCutover.has(row.orderId)).map((row) => row.id)
+  const outOfScope = new Set(outOfScopeIds)
+  if (outOfScopeIds.length > 0) {
+    await db.wmsOrderDiscrepancy.updateMany({
+      where: { id: { in: outOfScopeIds } },
+      data: { status: 'RESOLVED', resolvedAt: input.now, detail: WMS_RECONCILE_PRE_CUTOVER_DETAIL },
+    })
+  }
+  const resolvableIds = rows.filter((row) => !stillDrifting.has(row.orderId) && !outOfScope.has(row.id)).map((row) => row.id)
+  if (resolvableIds.length > 0) {
+    await db.wmsOrderDiscrepancy.updateMany({
+      where: { id: { in: resolvableIds } },
+      data: { status: 'RESOLVED', resolvedAt: input.now },
+    })
+  }
+  return { resolved: resolvableIds.length, outOfScope: outOfScopeIds.length }
+}
+
 /** Prisma + active-connector wiring, mirroring the other WMS sweeps. */
 export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector: WmsConnector): WmsOrderReconcileDeps {
   return {
@@ -351,7 +407,7 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
       const cutoff = new Date(Date.now() - RECONCILE_UNPUSHED_GRACE_MS)
       const orders = await db.salesOrder.findMany({
         where: {
-          ...buildNotPushedDriftWhere({ connectorId, boundWarehouseIds: bindings.map((b) => b.warehouseId), cutoff }),
+          ...buildNotPushedDriftWhere({ connectorId, boundWarehouseIds: bindings.map((b) => b.warehouseId), cutoff, paidNotBefore: wmsCreateObligationFloor(connectorId) }),
           // Rotation (Codex): findings are durable, so already-flagged orders
           // need no re-scan — every run's slots go to UNDISCOVERED drift, and a
           // backlog larger than the cap is fully reported across runs.
@@ -775,34 +831,8 @@ export async function runWmsOrderReconcileSweep(
       })
       if (openNotPushed.length === 0) break
       lastId = openNotPushed[openNotPushed.length - 1].id
-      await resolveNotPushedChunk(openNotPushed)
+      await resolveNotPushedChunk({ connectorId, boundWarehouseIds: resolutionBindings.map((b) => b.warehouseId), rows: openNotPushed, now })
       if (openNotPushed.length < RESOLUTION_CHUNK) break
-    }
-
-    async function resolveNotPushedChunk(openNotPushed: Array<{ id: string; orderId: string }>) {
-      const bindings = resolutionBindings
-      const stillDrifting = new Set(
-        bindings.length === 0
-          ? []
-          : (await db.salesOrder.findMany({
-              where: buildNotPushedDriftWhere({
-                // connectorId is narrowed by the early return above; TS can't
-                // carry that into a hoisted function declaration.
-                connectorId: connectorId!,
-                boundWarehouseIds: bindings.map((b) => b.warehouseId),
-                cutoff: new Date(Date.now() - RECONCILE_UNPUSHED_GRACE_MS),
-                orderIds: openNotPushed.map((row) => row.orderId),
-              }),
-              select: { id: true },
-            })).map((order) => order.id),
-      )
-      const resolvableIds = openNotPushed.filter((row) => !stillDrifting.has(row.orderId)).map((row) => row.id)
-      if (resolvableIds.length > 0) {
-        await db.wmsOrderDiscrepancy.updateMany({
-          where: { id: { in: resolvableIds } },
-          data: { status: 'RESOLVED', resolvedAt: now },
-        })
-      }
     }
 
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'

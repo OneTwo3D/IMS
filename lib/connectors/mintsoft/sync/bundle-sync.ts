@@ -5,6 +5,7 @@ import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsBundleComponent, WmsBundleDto, WmsBundleRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { mintsoftProducerSeam } from '../producer-seam'
 import {
   BUNDLE_CLAIM_CHANGED_TEXT,
   BUNDLE_CLAIM_LEASE_MS,
@@ -63,7 +64,7 @@ type BundleSyncCandidate = {
 
 export type MintsoftBundleSyncResult = {
   status: 'SKIPPED' | 'SYNCED' | 'CONFLICT' | 'SKIPPED_NOT_KIT' | 'ERROR'
-  action: 'noop' | 'created' | 'conflict' | 'verified' | 'no_wms_product_link'
+  action: 'noop' | 'created' | 'conflict' | 'verified' | 'no_wms_product_link' | 'shadowed'
   reason: string
   productId: string
   sku: string
@@ -79,6 +80,8 @@ export type MintsoftBundleVerifyResult = {
   skipped: number
   errors: number
   skippedReason?: string
+  /** Bundles the producer-side hold kept as a shadow (also counted in `skipped`). PRESENT ONLY WHEN NON-ZERO. */
+  shadowed?: number
 }
 
 const BUNDLE_CANDIDATE_SELECT = {
@@ -725,6 +728,27 @@ async function syncBundleInternal(
     }
   }
 
+  // THE PRODUCER SEAM of the bundle create, BEFORE the claim slot is taken: the claim is a state write that says "a create may be on
+  // its way", and a shadow must leave no such trace. A shadow is kept as a record and nothing else changes, so the bundle is
+  // offered again on every run until it is really created.
+  const bundleSeam = await mintsoftProducerSeam({
+    operation: 'product.bundle',
+    subjectType: 'Product',
+    subjectId: productId,
+    payload: dto,
+    summary: { sku: candidate.sku, components: imsComponents.length },
+  })
+  if (!bundleSeam.proceed) {
+    return {
+      status: 'SKIPPED',
+      action: 'shadowed',
+      reason: bundleSeam.notice,
+      productId,
+      sku: candidate.sku,
+      checksum,
+    }
+  }
+
   const claim = await claimBundleCreateSlot(productId)
   if (claim.kind === 'conflict') {
     return {
@@ -773,7 +797,7 @@ async function syncBundleInternal(
 
   let created: WmsBundleRef
   try {
-    created = await connector.createBundle(dto, { beforeSend: () => reverifyBundleClaim(claim, sentValue) })
+    created = await connector.createBundle(dto, { beforeSend: () => reverifyBundleClaim(claim, sentValue) }, bundleSeam.clearance)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft bundle create failed.'
     const failureKind = classifyBundleCreateFailure(message)
@@ -1019,6 +1043,7 @@ export async function runMintsoftBundleVerify(
   })
 
   const counters = { synced: 0, conflicts: 0, skipped: 0, errors: 0 }
+  let shadowedBundles = 0
   let index = 0
 
   async function worker(): Promise<void> {
@@ -1031,7 +1056,10 @@ export async function runMintsoftBundleVerify(
         if (result.status === 'SYNCED') counters.synced += 1
         else if (result.status === 'CONFLICT') counters.conflicts += 1
         else if (result.status === 'ERROR') counters.errors += 1
-        else counters.skipped += 1
+        else {
+          counters.skipped += 1
+          if (result.action === 'shadowed') shadowedBundles += 1
+        }
       } catch (error) {
         counters.errors += 1
         console.error('Mintsoft bundle verify failed', candidate.id, error)
@@ -1060,6 +1088,7 @@ export async function runMintsoftBundleVerify(
       triggeredBy,
       totalChecked,
       ...counters,
+      ...(shadowedBundles > 0 ? { shadowed: shadowedBundles } : {}),
     },
     resolveUser: false,
   })
@@ -1068,5 +1097,6 @@ export async function runMintsoftBundleVerify(
     status,
     totalChecked,
     ...counters,
+    ...(shadowedBundles > 0 ? { shadowed: shadowedBundles } : {}),
   }
 }

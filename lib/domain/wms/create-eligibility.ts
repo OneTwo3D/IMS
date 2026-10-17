@@ -61,8 +61,20 @@ export const WMS_CREATE_ELIGIBLE_ORDER_FENCES = {
  * warehouse this connector has none for, is not a create candidate and never will be until
  * somebody rebinds it.
  */
-export function wmsCreateEligibleOrderWhere(boundWarehouseIds: readonly string[]): Prisma.SalesOrderWhereInput {
-  return { ...WMS_CREATE_ELIGIBLE_ORDER_FENCES, shipFromWarehouseId: { in: [...boundWarehouseIds] } }
+export function wmsCreateEligibleOrderWhere(boundWarehouseIds: readonly string[], paidNotBefore?: Date | null): Prisma.SalesOrderWhereInput {
+  return {
+    ...WMS_CREATE_ELIGIBLE_ORDER_FENCES,
+    // The producer-side floor (see wmsCreateObligationFloor): once the destination is live an order paid before the live-from instant
+    // belongs to the writer that owned it then and IMS can never create it. No floor: the legacy predicate, exactly.
+    ...(paidNotBefore ? { paidAt: { not: null, gte: paidNotBefore } } : {}),
+    shipFromWarehouseId: { in: [...boundWarehouseIds] },
+  }
+}
+
+/** The same floor as {@link wmsCreateEligibleOrderWhere}, as a decision on one loaded order: true when IMS may NOT create (or re-queue) it. */
+export function wmsPaidBeforeCreateFloor(paidAt: Date | null | undefined, paidNotBefore: Date | null | undefined): boolean {
+  if (!paidNotBefore) return false
+  return !paidAt || paidAt.getTime() < paidNotBefore.getTime()
 }
 
 /**
@@ -81,4 +93,24 @@ export function wmsCreateIneligibleRefusal(reference: string): string {
     + 'binding or a ship-from warehouse the connector has none for — and the control becomes available. The '
     + 'finding stays open meanwhile.'
   )
+}
+
+/**
+ * The disposition shown for an order IMS can never create because it was paid before the destination's live-from instant (the bridge
+ * owns it). It is a display state only: no push link is written for it. See wmsCreateObligationFloor.
+ */
+export const WMS_PRE_CUTOVER_PUSH_STATE = 'PRE_CUTOVER'
+export const WMS_PRE_CUTOVER_NOTICE = 'Paid before the live-from instant: this order belongs to the bridge and IMS will not create it in the warehouse.'
+
+/**
+ * Whether a push link should be DISPLAYED as pre-cutover rather than queued: the create query now excludes the order, so "Queued" would
+ * be a promise nothing keeps. Only a never-attempted queue entry (no attempts, no warehouse id): anything else carries history the
+ * operator needs to see as it is. No floor (switch off, or not live): never.
+ */
+export function wmsPushIsPreCutover(
+  link: { state: string; attempts: number; externalOrderId: string | null },
+  order: { paidAt: Date | null | undefined },
+  paidNotBefore: Date | null | undefined,
+): boolean {
+  return link.state === 'PENDING_CREATE' && link.attempts === 0 && link.externalOrderId === null && wmsPaidBeforeCreateFloor(order.paidAt, paidNotBefore)
 }

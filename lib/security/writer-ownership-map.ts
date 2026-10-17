@@ -148,7 +148,7 @@ export const WRITER_OWNERSHIP_MAP = [
   }),
   row('mintsoft', 'order.amend', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'required',
-    note: 'Owner answer 2026-10-09: IMS amends orders in P2, including ones the bridge created (decision D8 separately settles cancel and hold).',
+    note: 'Owner answer 2026-10-09: IMS amends orders in P2, including ones the bridge created (decision D8 separately settles cancel and hold). The obligation time is the time of the CHANGE being propagated (the order\'s updatedAt, which is what makes the link due), never the paid time: the paid-time cut-off belongs to order.create alone.',
   }),
   row('mintsoft', 'order.cancel', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',

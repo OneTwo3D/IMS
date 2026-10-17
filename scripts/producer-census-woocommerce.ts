@@ -133,10 +133,10 @@ export const WOO_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>>
   'order.invoice-document': 'No IMS producer exists yet: the My Account invoice is a later build (producer census NO_PRODUCER).',
 }
 
-const SOURCE_ROOTS = ['app', 'lib', 'scripts', 'components'] as const
+export const SOURCE_ROOTS = ['app', 'lib', 'scripts', 'components'] as const
 const SKIPPED = new Set(['node_modules', '.next', 'generated', 'archive'])
 
-function walk(dir: string, out: string[] = []): string[] {
+export function walk(dir: string, out: string[] = []): string[] {
   let entries
   try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return out }
   for (const entry of entries) {
@@ -147,17 +147,17 @@ function walk(dir: string, out: string[] = []): string[] {
   return out
 }
 
-function parse(file: string, text: string): ts.SourceFile {
+export function parse(file: string, text: string): ts.SourceFile {
   return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
 }
 
-function unwrap(n: ts.Node): ts.Node {
+export function unwrap(n: ts.Node): ts.Node {
   let x = n
   while (ts.isParenthesizedExpression(x) || ts.isNonNullExpression(x) || ts.isAsExpression(x) || ts.isAwaitExpression(x)) x = x.expression
   return x
 }
 
-function calleeName(call: ts.CallExpression): string | null {
+export function calleeName(call: ts.CallExpression): string | null {
   const e = unwrap(call.expression)
   if (ts.isIdentifier(e)) return e.text
   if (ts.isPropertyAccessExpression(e)) return e.name.text
@@ -165,7 +165,7 @@ function calleeName(call: ts.CallExpression): string | null {
 }
 
 /** The top-level declaration of this name, or null. */
-function findTopLevel(sf: ts.SourceFile, name: string): ts.Node | null {
+export function findTopLevel(sf: ts.SourceFile, name: string): ts.Node | null {
   for (const statement of sf.statements) {
     if (ts.isFunctionDeclaration(statement) && statement.name?.text === name) return statement
     if (ts.isVariableStatement(statement)) {
@@ -177,7 +177,7 @@ function findTopLevel(sf: ts.SourceFile, name: string): ts.Node | null {
   return null
 }
 
-function topLevelNameOf(node: ts.Node, sf: ts.SourceFile): string {
+export function topLevelNameOf(node: ts.Node, sf: ts.SourceFile): string {
   let n: ts.Node = node
   while (n.parent && n.parent !== sf) n = n.parent
   if (ts.isFunctionDeclaration(n)) return n.name?.text ?? '<anonymous>'
@@ -190,8 +190,8 @@ function topLevelNameOf(node: ts.Node, sf: ts.SourceFile): string {
   return '<module>'
 }
 
-type CallInfo = { name: string; pos: number }
-function callsIn(node: ts.Node, sf: ts.SourceFile): CallInfo[] {
+export type CallInfo = { name: string; pos: number }
+export function callsIn(node: ts.Node, sf: ts.SourceFile): CallInfo[] {
   const out: CallInfo[] = []
   const visit = (n: ts.Node) => {
     if (ts.isCallExpression(n)) {
@@ -258,13 +258,13 @@ export type WooTransportSite = {
   write: boolean
 }
 
-function literalString(n: ts.Expression | undefined): string | null {
+export function literalString(n: ts.Expression | undefined): string | null {
   if (!n) return null
   const x = unwrap(n)
   return ts.isStringLiteral(x) || ts.isNoSubstitutionTemplateLiteral(x) ? x.text : null
 }
 
-function objectProperty(obj: ts.ObjectLiteralExpression, name: string): ts.ObjectLiteralElementLike | undefined {
+export function objectProperty(obj: ts.ObjectLiteralExpression, name: string): ts.ObjectLiteralElementLike | undefined {
   return obj.properties.find((p) => (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && ts.isIdentifier(p.name) && p.name.text === name)
 }
 

@@ -8,6 +8,7 @@ import {
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { withMintsoftAuthLock } from '@/lib/connectors/mintsoft/api/auth-lock'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { assertMintsoftKeyMintingAllowed, mintsoftHopGate, mintsoftProducerHoldEnforced } from '../producer-egress'
 import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
@@ -158,6 +159,9 @@ async function requestMintsoftAuthSession(
   password: string,
   clientId: string,
 ): Promise<{ token: string; expiresAt: Date }> {
+  // The producer hold applies to key minting itself, before anything is built or sent: a new key invalidates the one the other
+  // integrations use. Not enforced (the default): no-op, the legacy behaviour byte for byte.
+  assertMintsoftKeyMintingAllowed()
   const response = await connectorFetch(buildMintsoftRequestUrl('/api/Auth', baseUrl), {
     method: 'POST',
     headers: buildMintsoftAuthHeaders(baseUrl),
@@ -172,6 +176,10 @@ async function requestMintsoftAuthSession(
     // Key minting is held like every other Mintsoft write, and is bound to the granted ClientId: the
     // ClientId this installation is configured with must equal the one the grant names.
     outboundWriteContext: { writeScopeId: clientId },
+    // While the producer hold is enforced, key minting goes to exactly the origin named: a redirect is an error and its target is never
+    // requested (a 302 from POST /api/Auth onto a write-classified GET would otherwise be followed under the login grant). With the
+    // hold not enforced the legacy behaviour is unchanged: redirects are followed.
+    refuseRedirects: mintsoftProducerHoldEnforced(),
   })
 
   const bodyText = await response.text()
@@ -243,7 +251,8 @@ export async function testMintsoftFixedApiKey(
       headers: { ...buildMintsoftAuthHeaders(normalizedBaseUrl), 'ms-apikey': key },
       cache: 'no-store',
     },
-    { connectorName: 'Mintsoft', allowE2eLocalHttp: true },
+    // A read that may be redirected onto a write path (Mintsoft mutates through GET): judged per hop by the producer hold.
+    { connectorName: 'Mintsoft', allowE2eLocalHttp: true, hopGate: mintsoftHopGate },
   )
 
   if (response.status === 401 || response.status === 403) {

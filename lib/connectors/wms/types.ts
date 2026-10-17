@@ -62,6 +62,35 @@ export type WmsCreateReplayPolicy =
    */
   | 'client-side-dedupe-only'
 
+/**
+ * THE OPERATIONS A WMS WRITE METHOD IS CLEARED FOR, AND THE CLEARANCE ITSELF.
+ *
+ * Every method of {@link WmsConnector} that writes to the warehouse takes a {@link WmsWriteClearance} as its LAST argument.
+ * A clearance is a compile-time token with no runtime content, and the only place that mints one is
+ * lib/connectors/wms/producer-seam.ts, as the `proceed` arm of the answer to "may IMS produce this operation now?". A caller
+ * therefore cannot reach a write method without having asked, and cannot read the clearance off a shadowed answer: the
+ * shadow arm has no `clearance`, so the type checker makes every caller handle the shadow before it can write. The
+ * operation is part of the type, so a clearance for a comment cannot be used for a cancellation.
+ *
+ * The names are the ownership map's operation names for the warehouse destination
+ * (lib/security/writer-ownership-map.ts); lib/connectors/wms/producer-seam.ts checks that at compile time.
+ */
+export type WmsWriteOperation =
+  | 'order.create'
+  | 'order.amend'
+  | 'order.cancel'
+  | 'order.hold'
+  | 'order.comment'
+  | 'product.upsert'
+  | 'product.content'
+  | 'product.bundle'
+  | 'asn.create'
+
+declare const WMS_WRITE_CLEARANCE: unique symbol
+export type WmsWriteClearance<Op extends WmsWriteOperation = WmsWriteOperation> = {
+  readonly [WMS_WRITE_CLEARANCE]: Op
+}
+
 export type WmsConnectionSettings = {
   baseUrl: string
   apiKey: string
@@ -456,17 +485,17 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   fetchStockLevels(externalWarehouseId: string): Promise<WmsStockLine[]>
   fetchProduct(externalProductId: string): Promise<WmsProductRef | null>
   fetchProductBySku(sku: string): Promise<WmsProductRef | null>
-  upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef>
+  upsertProduct(product: WmsProductDto, options: WmsUpsertProductOptions | undefined, clearance: WmsWriteClearance<'product.upsert'>): Promise<WmsProductRef>
   /** Update a linked product's content (description, short description, picture). Absent: the WMS takes no content. */
-  updateProductContent?(update: WmsProductContentUpdate): Promise<WmsProductContentResult>
-  createAsn(input: WmsAsnInput): Promise<WmsAsnRef>
+  updateProductContent?(update: WmsProductContentUpdate, clearance: WmsWriteClearance<'product.content'>): Promise<WmsProductContentResult>
+  createAsn(input: WmsAsnInput, clearance: WmsWriteClearance<'asn.create'>): Promise<WmsAsnRef>
   fetchAsnById?(externalAsnId: string): Promise<WmsAsnRef | null>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
   /**
    * `beforeSend` is awaited immediately before the create request is handed to the WMS; resolving false means the
    * caller no longer holds its claim, and the connector must throw (nothing sent) instead of sending.
    */
-  createBundle?(input: WmsBundleDto, options?: { beforeSend?: () => Promise<boolean> }): Promise<WmsBundleRef>
+  createBundle?(input: WmsBundleDto, options: { beforeSend?: () => Promise<boolean> } | undefined, clearance: WmsWriteClearance<'product.bundle'>): Promise<WmsBundleRef>
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
   /** Resolve the live order status for a storefront order number, if supported. */
   fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>
@@ -514,7 +543,7 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   /** Line items (SKU + whole-unit qty) of a single order/part. */
   fetchOrderPartItems?(externalPartId: string): Promise<Array<{ sku: string; qty: number }>>
   /** Push (create) an order into the WMS for fulfilment; idempotent on re-push. */
-  pushOrder?(input: WmsOrderPushInput): Promise<WmsOrderPushResult>
+  pushOrder?(input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.create'>): Promise<WmsOrderPushResult>
   /**
    * o3d-bjc.8: prove that a minted id really is ours, without mutating anything.
    *
@@ -534,12 +563,12 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
     reference: { orderNumber: string | null; externalReference: string | null },
   ): Promise<'ours' | 'foreign' | 'unknown'>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
-  updateOrder?(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult>
+  updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
-  cancelOrder?(externalOrderId: string): Promise<WmsOrderCancelResult>
+  cancelOrder?(externalOrderId: string, clearance: WmsWriteClearance<'order.cancel' | 'order.hold'>): Promise<WmsOrderCancelResult>
   /** Post an operator-facing note onto the WMS order — e.g. to flag a refund to the
    *  warehouse when the API cannot auto-apply it (a past-NEW order). */
-  addOrderComment?(externalOrderId: string, comment: string): Promise<void>
+  addOrderComment?(externalOrderId: string, comment: string, clearance: WmsWriteClearance<'order.comment'>): Promise<void>
   verifyWebhookSignature?(
     rawBody: string,
     signatureHeader: string | null,
