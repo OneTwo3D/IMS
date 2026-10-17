@@ -315,7 +315,7 @@ function findContainer(sf: ts.SourceFile, node: ts.Node): ts.Node | null {
 
 // ───────────────────────── MINT-3: the raw transport scan ─────────────────────────
 
-export type MintTransportSite = { file: string; line: number; decl: string; callee: string; method: string }
+export type MintTransportSite = { file: string; line: number; decl: string; callee: string; method: string; gated?: boolean }
 
 /** Every `connectorFetch(…)` / `fetch(…)` call whose options name `connectorName: 'Mintsoft'` in this file. */
 export function scanMintsoftTransportSource(text: string, file: string): MintTransportSite[] {
@@ -328,9 +328,15 @@ export function scanMintsoftTransportSource(text: string, file: string): MintTra
       if (name === 'connectorFetch' || name === 'fetch') {
         const [, initArg, optionsArg] = n.arguments
         let aimed = false
+        let gated = false
         if (optionsArg && ts.isObjectLiteralExpression(unwrap(optionsArg))) {
           const prop = objectProperty(unwrap(optionsArg) as ts.ObjectLiteralExpression, 'connectorName')
           if (prop && ts.isPropertyAssignment(prop) && literalString(prop.initializer) === 'Mintsoft') aimed = true
+          // A hop gate, or a refusal of every redirect: either way no redirect hop is followed unjudged.
+          const opts = unwrap(optionsArg) as ts.ObjectLiteralExpression
+          if (objectProperty(opts, 'hopGate')) gated = true
+          const refuse = objectProperty(opts, 'refuseRedirects')
+          if (refuse && ts.isPropertyAssignment(refuse) && refuse.initializer.kind === ts.SyntaxKind.TrueKeyword) gated = true
         }
         if (aimed) {
           let method = 'GET'
@@ -346,7 +352,7 @@ export function scanMintsoftTransportSource(text: string, file: string): MintTra
               if (init.properties.some((p) => ts.isSpreadAssignment(p))) method = 'UNKNOWN'
             } else method = 'UNKNOWN'
           }
-          sites.push({ file, line: sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1, decl: topLevelNameOf(n, sf), callee: name, method })
+          sites.push({ file, line: sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1, decl: topLevelNameOf(n, sf), callee: name, method, gated })
         }
       }
     }
@@ -527,6 +533,9 @@ export function mintCensusFindings(input: MintCensusInput): { failures: string[]
   const loginSeen = new Set<string>()
   for (const site of input.transport) {
     const key = `${site.file}::${site.decl}`
+    if (site.gated === false) {
+      failures.push(`MINT-3 ${site.file}:${site.line} (${site.decl}) calls ${site.callee} on Mintsoft without \`hopGate\` or \`refuseRedirects: true\`. Mintsoft mutates through GET, so a followed redirect can land on a write path the producer hold never judged: pass mintsoftHopGate, or refuse redirects.`)
+    }
     if (site.file === MINT_BARRIER_FILE && site.decl === MINT_BARRIER_SEND) {
       if (sendOnlyInEntry) counts.transportSitesBehindBarrier++
       sendSeen.add(key)

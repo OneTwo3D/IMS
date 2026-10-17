@@ -11,7 +11,7 @@ import {
 import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { classifyMintsoftRequest } from './read-allowlist'
-import { mintsoftEgressHold, mintsoftEgressRefusalText } from '../producer-egress'
+import { mintsoftEgressHold, mintsoftEgressRefusalText, mintsoftHopGate } from '../producer-egress'
 import * as connectorTransport from '@/lib/security/connector-fetch'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
@@ -84,12 +84,7 @@ async function sendMintsoftRequest<T>(
     // The producer hold on EVERY hop: Mintsoft mutates through GET, so an allowed read can redirect to a write-classified path
     // (GET /api/Order/5 -> /api/Order/5/Cancel). The legacy outbound grant is judged per hop by the transport; this judges the producer
     // hold per hop. A redirect hop means the earlier request was sent, so the text is the maybe-sent one, never a pure hold.
-    hopGate: ({ method, url, redirectCount }) => {
-      const hold = mintsoftEgressHold()
-      if (!hold.held || classifyMintsoftRequest(method, url.pathname).class !== 'write') return null
-      const text = mintsoftEgressRefusalText(hold, { method: method.toUpperCase(), target: url.pathname })
-      return redirectCount > 0 ? outboundTextAfterEarlierSend(text, 'Mintsoft') : text
-    },
+    hopGate: mintsoftHopGate,
   })
 
   // Hop provenance, or null when the transport does not provide it (a stand-in transport, a response that did not

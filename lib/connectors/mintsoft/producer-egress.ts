@@ -6,6 +6,8 @@ import {
 import { PRODUCER_REASON_TEXT, producerHeldNotice, producerShadowNotice, type ProducerReason } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
 import { producerEgressVerdict } from '@/lib/security/producer-seam'
+import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
+import { classifyMintsoftRequest } from './api/read-allowlist'
 
 /**
  * The two operation-agnostic Mintsoft gates (see producer-seam.ts for the whole picture). They read the environment only:
@@ -49,4 +51,16 @@ export function mintsoftEgressRefusalText(hold: Extract<MintsoftHold, { held: tr
   const body = `${OUTBOUND_HELD_TEXT_PREFIX} (${label}): the producer-side hold is enforced for ${label} and this installation is not in its live phase (${PRODUCER_REASON_TEXT[hold.reason]}). `
     + `${request.method} ${request.target} was refused before it left IMS, so nothing was sent to ${label}. This is a hold on this installation, not a rejection by ${label}.`
   return `${body}${outboundHoldReferenceSuffix('held', body)}`
+}
+
+/**
+ * The per-hop gate every Mintsoft connectorFetch call passes (ConnectorFetchOptions.hopGate): Mintsoft mutates through GET, so an
+ * allowed read can redirect onto a write path. A write-classified hop is refused while the destination is not live; a redirect hop
+ * means the earlier request was sent, so its text is the maybe-sent one, never a pure hold.
+ */
+export function mintsoftHopGate(hop: { method: string; url: URL; redirectCount: number }): string | null {
+  const hold = mintsoftEgressHold()
+  if (!hold.held || classifyMintsoftRequest(hop.method, hop.url.pathname).class !== 'write') return null
+  const text = mintsoftEgressRefusalText(hold, { method: hop.method.toUpperCase(), target: hop.url.pathname })
+  return hop.redirectCount > 0 ? outboundTextAfterEarlierSend(text, 'Mintsoft') : text
 }

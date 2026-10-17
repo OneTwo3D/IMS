@@ -167,7 +167,7 @@ test('MUTATION MINT-2 (the answer of a consultation is thrown away, or never tes
 })
 
 test('MUTATION MINT-3 (a new raw Mintsoft call in a new file, any method): red with the file and line; a login helper and an unrelated call are not', () => {
-  const post = "import { connectorFetch } from '@/lib/security/connector-fetch'\nexport async function sneak(base: string) {\n  return connectorFetch(`${base}/api/Order/5/Cancel`, { method: 'GET' }, { connectorName: 'Mintsoft' })\n}\n"
+  const post = "import { connectorFetch } from '@/lib/security/connector-fetch'\nexport async function sneak(base: string) {\n  return connectorFetch(`${base}/api/Order/5/Cancel`, { method: 'GET' }, { connectorName: 'Mintsoft', hopGate: g })\n}\n"
   const sites = scanMintsoftTransportSource(post, 'lib/new-thing.ts')
   assert.deepEqual(sites.map((s) => [s.file, s.decl, s.method]), [['lib/new-thing.ts', 'sneak', 'GET']])
   const report = mintCensusFindings(input({ transport: [...transport, ...sites] }))
@@ -269,4 +269,17 @@ test('literalMembersOf reads the registered ids and the destination table as SYN
   assert.deepEqual(literalMembersOf(realText('lib/connectors/wms/types.ts'), 'WMS_CONNECTOR_IDS', 'array'), ['mintsoft'])
   assert.deepEqual(literalMembersOf(realText(DESTINATION_TABLE_FILE), 'WMS_PRODUCER_DESTINATION', 'object'), ['mintsoft'])
   assert.equal(literalMembersOf('export const X = computed()', 'X', 'array'), null)
+})
+
+test('MUTATION MINT-3 (a Mintsoft connectorFetch with no hop gate and no redirect refusal): red, naming the call; gated ones are not', () => {
+  const ungated = scanMintsoftTransportSource("export const a = (u: URL) => connectorFetch(u, { method: 'GET' }, { connectorName: 'Mintsoft' })\n", 'lib/a.ts')
+  assert.deepEqual(ungated.map((s) => s.gated), [false])
+  const gated = scanMintsoftTransportSource("export const b = (u: URL) => connectorFetch(u, { method: 'GET' }, { connectorName: 'Mintsoft', hopGate: g })\nexport const c = (u: URL) => connectorFetch(u, { method: 'POST' }, { connectorName: 'Mintsoft', refuseRedirects: true })\n", 'lib/b.ts')
+  assert.deepEqual(gated.map((s) => s.gated), [true, true])
+  const report = mintCensusFindings(input({ transport: [...transport, ...ungated] }))
+  assert.equal(red(report, 'MINT-3', 'without `hopGate`').length, 1, JSON.stringify(report.failures))
+  // and every real call is gated
+  assert.equal(transport.filter((s) => s.gated === false).length, 0)
+  const stripped = scanMintsoftTransportSource(realText('lib/connectors/mintsoft/api/auth.ts').replace('    refuseRedirects: true,', ''), 'lib/connectors/mintsoft/api/auth.ts')
+  assert.ok(stripped.some((s) => s.gated === false), 'removing the login refusal is seen')
 })

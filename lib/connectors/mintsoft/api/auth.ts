@@ -8,6 +8,7 @@ import {
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { withMintsoftAuthLock } from '@/lib/connectors/mintsoft/api/auth-lock'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { mintsoftHopGate } from '../producer-egress'
 import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
@@ -172,6 +173,9 @@ async function requestMintsoftAuthSession(
     // Key minting is held like every other Mintsoft write, and is bound to the granted ClientId: the
     // ClientId this installation is configured with must equal the one the grant names.
     outboundWriteContext: { writeScopeId: clientId },
+    // Key minting goes to exactly the origin named: a redirect is an error and its target is never requested (a 302 from POST /api/Auth
+    // onto a write-classified GET would otherwise be followed under the login grant).
+    refuseRedirects: true,
   })
 
   const bodyText = await response.text()
@@ -243,7 +247,8 @@ export async function testMintsoftFixedApiKey(
       headers: { ...buildMintsoftAuthHeaders(normalizedBaseUrl), 'ms-apikey': key },
       cache: 'no-store',
     },
-    { connectorName: 'Mintsoft', allowE2eLocalHttp: true },
+    // A read that may be redirected onto a write path (Mintsoft mutates through GET): judged per hop by the producer hold.
+    { connectorName: 'Mintsoft', allowE2eLocalHttp: true, hopGate: mintsoftHopGate },
   )
 
   if (response.status === 401 || response.status === 403) {
