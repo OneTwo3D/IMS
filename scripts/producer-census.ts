@@ -491,6 +491,8 @@ export const SEAM_CONSULTATIONS = [
   'xeroProducerSeamVerdict', 'xeroTaxRateWriteShadow', 'producerSeamVerdict',
   // WooCommerce: the producer seam, the destination-level drain gate, and the three operator-action seams (lib/connectors/woocommerce).
   'wooProducerSeam', 'wooDrainHold', 'wooWebhookRegistrationShadow', 'wooFxRatePushShadow', 'wooFxHelperProbeShadow',
+  // Mintsoft: the destination's producer seam, the generic warehouse seam in front of it, the pass-level hold and the operator re-arm.
+  'mintsoftProducerSeam', 'wmsProducerSeam', 'wmsProducerHold', 'wmsOrderCreateReArmShadow',
 ] as const
 export const SYNC_ROW_PRIMITIVE = 'createAccountingSyncLogRow'
 export const SYNC_ROW_PRIMITIVE_FILE = 'lib/domain/accounting/sync-log-row.ts'

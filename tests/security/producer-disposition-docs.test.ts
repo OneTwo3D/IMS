@@ -76,19 +76,19 @@ test('the enforcement variable is documented exactly once, in a table row, and t
 })
 
 /**
- * THE PARTLY WIRED HOLD IS DESCRIBED TRUTHFULLY. Only the Xero and WooCommerce producers consult the decision, and only where the
+ * THE WIRED HOLD IS DESCRIBED TRUTHFULLY. The Xero, WooCommerce and Mintsoft producers consult the decision, and only where the
  * enforcement variable names the destination: operator text must say so, must not claim behaviour that only a later
  * change delivers (the outbound:status report, the writer-side cut-off, the other destinations), and may use "will"
  * only for a later change.
  */
-test('operator text for the producer hold says it is enforced only where named and only for Xero and WooCommerce, claims no behaviour of a later change, and uses "will" only for later changes', () => {
+test('operator text for the producer hold says it is enforced only where named, is wired for Xero, WooCommerce and Mintsoft, claims no behaviour of a later change, and uses "will" only for later changes', () => {
   const texts = [...Object.values(PRODUCER_DOC_BLOCKS)]
   for (const connector of OUTBOUND_CONNECTORS) {
     for (const detail of ['agreed_held', 'agreed_live', 'cutoff_without_grant', 'grant_without_cutoff', 'unreadable'] as const) texts.push(producerAgreementText(connector, detail))
   }
   assert.ok(PRODUCER_DOC_BLOCKS.overview.startsWith('THE PRODUCER-SIDE HOLD IS ENFORCED ONLY FOR THE DESTINATIONS NAMED IN'))
   assert.match(PRODUCER_DOC_BLOCKS.overview, /WHICH IS UNSET BY DEFAULT\. Unset, every producer queues work exactly as it did before/)
-  assert.match(PRODUCER_DOC_BLOCKS.overview, /Today the Xero producers and the WooCommerce producers consult the decision; the Mintsoft producers do not yet/)
+  assert.match(PRODUCER_DOC_BLOCKS.overview, /Today the Xero producers, the WooCommerce producers and the Mintsoft producers consult the decision/)
   assert.match(PRODUCER_DOC_BLOCKS.overview, /`npm run outbound:status` does not report on the decision/)
   const forbidden = [/nothing is delivered/i, /both are reported/i, /cannot deliver/i, /is reported by/i, /sends nothing/i, /does not start any writer/i, /keeps the destination in shadow/i, /mintsoft (producers )?(queue|record|shadow)s? nothing/i]
   let sentences = 0
@@ -111,7 +111,7 @@ test('operator text for the producer hold says it is enforced only where named a
   for (const text of texts) assert.ok(!/outbound:status` (reports|shows|prints)/.test(text))
 })
 
-test('the .env.example comment for the producer-side hold is true today: enforced only where named, only for Xero and WooCommerce, and no claims of a later change', () => {
+test('the .env.example comment for the producer-side hold is true today: enforced only where named, wired for Xero, WooCommerce and Mintsoft, and no claims of a later change', () => {
   const lines = readFileSync(join(ROOT, '.env.example'), 'utf8').split('\n')
   const start = lines.findIndex((line) => line.startsWith('# PRODUCER-SIDE HOLD'))
   assert.ok(start > 0, 'precondition: the comment block exists')
@@ -121,7 +121,7 @@ test('the .env.example comment for the producer-side hold is true today: enforce
   console.log(`# env.example: ${end - start} comment lines examined`)
   assert.match(block, /ENFORCED ONLY FOR THE DESTINATIONS NAMED BELOW; UNSET BY DEFAULT/)
   assert.match(block, /a grant alone permits the outbound writes through the transport/)
-  assert.match(block, /Today the Xero and WooCommerce producers consult the decision/)
+  assert.match(block, /Today the Xero, WooCommerce and Mintsoft producers consult the decision/)
   assert.ok(block.includes(PRODUCER_HOLD_ENFORCED_ENV) || lines.some((line) => line.startsWith(`# ${PRODUCER_HOLD_ENFORCED_ENV}=`)), 'the enforcement variable is listed')
   for (const pattern of [/needs BOTH/i, /nothing is delivered/i, /sends nothing/i, /outbound:status/i]) assert.ok(!pattern.test(block), `forbidden claim ${pattern}`)
   for (const sentence of block.split(/(?<=[.;])\s+/)) {

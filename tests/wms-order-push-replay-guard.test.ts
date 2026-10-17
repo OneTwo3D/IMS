@@ -57,9 +57,21 @@ function matches(row: LinkRow, where: Record<string, unknown>): boolean {
   return true
 }
 
+const shadowRecords: Array<[string, string]> = []
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The producer-side hold's shadow store (outbound_shadow_writes) and the order read for the business-event time.
+      $queryRaw: async (query?: { strings?: readonly string[]; values?: readonly unknown[] }) => {
+        if ((query?.strings ?? []).join('?').includes('outbound_shadow_writes')) {
+          shadowRecords.push([String(query?.values?.[1]), String(query?.values?.[3])])
+          return [{ id: 'shadow-1', inserted: true, occurrences: shadowRecords.length, accounting_sync_log_id: null, sync_row_exists: false }]
+        }
+        return []
+      },
+      $executeRaw: async () => 1,
+      salesOrder: { findUnique: async () => ({ paidAt: new Date('2026-08-01T00:00:00.000Z'), createdAt: new Date('2026-08-01T00:00:00.000Z') }) },
       wmsOrderPushLink: {
         findUnique: async ({ where }: { where: { orderId: string } }) => {
           const row = state.links.find((l) => l.orderId === where.orderId)
@@ -332,4 +344,34 @@ test('o3d-2k5r r4 replay: a stale AMBIGUOUS_CREATE replay matches nothing and sa
   assert.match(result.error!, /changed while you were looking at it/i)
   assert.equal(state.links[0].state, 'SYNCED')
   assert.equal(state.links[0].externalOrderId, 'wms-9', 'the settled id survives')
+})
+
+test('producer hold ON: the replay is REFUSED with the shadow sentence — the dead letter stays a dead letter, nothing is probed or re-queued, one shadow is recorded; OFF it re-queues (the control)', async () => {
+  const saved = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  delete process.env.MINTSOFT_WRITE_ALLOWED
+  delete process.env.MINTSOFT_WRITES_LIVE_FROM
+  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'mintsoft'
+  try {
+    reset([deadLetter()])
+    shadowRecords.length = 0
+    const before = JSON.stringify(state.links)
+    const result = await (await loadAction())('so-1')
+    console.log(`# held replay: ${JSON.stringify(result)} shadows=${JSON.stringify(shadowRecords)}`)
+    assert.equal(result.success, false)
+    assert.match(result.error!, /^Not sent by IMS: writes to Mintsoft are held on this installation/)
+    assert.deepEqual(state.probedReferences, [], 'the warehouse was not asked anything')
+    assert.equal(JSON.stringify(state.links), before, 'the link is exactly as it was')
+    assert.deepEqual(state.activity, [], 'and a replay that changed nothing is not logged as one')
+    assert.deepEqual(shadowRecords, [['order.create', 'so-1']])
+    delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    reset([deadLetter()])
+    shadowRecords.length = 0
+    const control = await (await loadAction())('so-1')
+    assert.equal(control.success, true)
+    assert.equal(state.links[0]!.state, 'PENDING_CREATE')
+    assert.deepEqual(shadowRecords, [])
+  } finally {
+    if (saved === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = saved
+  }
 })

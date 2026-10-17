@@ -11,6 +11,7 @@ import {
 import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { classifyMintsoftRequest } from './read-allowlist'
+import { mintsoftEgressHold, mintsoftEgressRefusalText } from '../producer-egress'
 import * as connectorTransport from '@/lib/security/connector-fetch'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
@@ -116,6 +117,23 @@ export async function mintsoftRequest<T>(
   path: string,
   init?: RequestInit,
 ): Promise<MintsoftRequestResult<T>> {
+  // The last barrier of the producer-side hold: with enforcement on and Mintsoft not in its live phase, no WRITE leaves IMS,
+  // whatever asked (an order create, amend or cancel, a comment, a product, a bundle, an ASN). It sits BEFORE the configuration
+  // read and the key lookup, so a held write cannot even mint a key. Reads are never touched. Reported in the outbound-write
+  // hold's own shape and text (`held: true`), so every queue that already treats a hold as "nothing sent, no attempt spent"
+  // treats this the same way. Unenforced (the default), this is one pure environment read that answers "not held".
+  const egressHold = mintsoftEgressHold()
+  if (egressHold.held) {
+    const pathname = path.split('?')[0] ?? path
+    if (classifyMintsoftRequest(init?.method ?? 'GET', pathname).class === 'write') {
+      return {
+        data: null,
+        error: mintsoftEgressRefusalText(egressHold, { method: (init?.method ?? 'GET').toUpperCase(), target: pathname }),
+        status: 500,
+        held: true,
+      }
+    }
+  }
   const config = await getMintsoftApiConfiguration()
   if (!config.baseUrl) {
     return {

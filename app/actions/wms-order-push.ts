@@ -6,6 +6,8 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { wmsOrderCreateReArmShadow, wmsOrderCreateShadowEvidence } from '@/lib/connectors/wms/producer-seam'
+import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { decideWmsPushReplay } from '@/lib/domain/wms/push-recovery-affordance'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
@@ -57,7 +59,15 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
       order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
     },
   })
-  if (!link) return null
+  if (!link) {
+    // THE EVIDENCE STATE OF A SHADOW: no link exists because IMS kept the order's create as a shadow instead of pushing it. It is its
+    // own state, not a push state (nothing was claimed, sent or failed), and it offers no retry: the sweep offers the order again by
+    // itself once the warehouse may be written. Read only when the producer-side hold is enforced for the connector.
+    const activeConnectorId = await getEnabledWmsConnectorId()
+    const shadow = activeConnectorId ? await wmsOrderCreateShadowEvidence(activeConnectorId, salesOrderId) : null
+    if (!shadow) return null
+    return { state: 'SHADOWED', externalOrderNumber: null, attempts: 0, lastError: null, pushedAt: null, canRetry: false, retryRefusal: shadow.notice }
+  }
   const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
   return {
     state: link.state,
@@ -102,6 +112,12 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
   // cannot render where this refuses.
   const decision = decideWmsPushReplay(link, reference)
   if (!decision.replayable) return { success: false, error: decision.guidance }
+
+  // THE PRODUCER-SIDE HOLD. Re-arming a create is producing create work: with the hold enforced and the decision SHADOW, nothing is
+  // asked of the warehouse, the link is not re-queued, a shadow record is kept, and the operator is told why. It is refused, never
+  // queued for later, and it is not a failure of the push.
+  const reArmShadow = await wmsOrderCreateReArmShadow(link.connector, salesOrderId)
+  if (reArmShadow) return { success: false, error: reArmShadow.notice }
 
   // o3d-2k5r r3 — AUTHORITATIVE ABSENCE, on the same rule the sweep now applies.
   //

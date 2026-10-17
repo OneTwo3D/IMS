@@ -54,6 +54,8 @@ const state = {
   order: null as Row | null,
   /** Warehouses the ACTIVE connector currently has an active binding for. */
   bindings: [] as Array<{ warehouseId: string }>,
+  /** The producer-side hold's shadow records: [operation, subject id], one per call. */
+  shadows: [] as Array<[string, string]>,
 }
 
 /**
@@ -200,7 +202,13 @@ const client = {
     findMany: async () => state.bindings,
   },
   // The `SELECT ... FOR UPDATE` the in-transaction eligibility check takes on the sales order.
-  $queryRaw: async () => (state.order ? [{ id: state.order.id }] : []),
+  $queryRaw: async (query?: { strings?: readonly string[]; values?: readonly unknown[] }) => {
+    if ((query?.strings ?? []).join('?').includes('outbound_shadow_writes')) {
+      state.shadows.push([String(query?.values?.[1]), String(query?.values?.[3])])
+      return [{ id: 'shadow-1', inserted: true, occurrences: state.shadows.length, accounting_sync_log_id: null, sync_row_exists: false }]
+    }
+    return state.order ? [{ id: state.order.id }] : []
+  },
   wmsOrderPushLink: {
     findUnique: async () => state.link,
     updateMany: async ({ where, data }: { where: Row; data: Row }) => {
@@ -254,6 +262,7 @@ function reset(over: Row = {}, connector = 'mintsoft') {
   state.activity = []
   state.mutateBeforeWrite = null
   state.mutateInTransaction = null
+  state.shadows = []
   state.bindings = [{ warehouseId: 'wh-1' }]
   state.order = {
     id: 'so-1',
@@ -512,4 +521,36 @@ test('o3d-2k5r r6 repush: eligibility lost between the read and the write rolls 
   assert.match(result.error!, /ACTIVE binding/)
   assert.equal(state.finding!.status, 'OPEN', 'rolled back with the refusal')
   assert.equal(state.link!.state, 'SYNCED')
+})
+
+// --- the producer-side hold: a re-arm of a create is producing create work -------------------
+
+test('producer hold ON: the re-push is REFUSED with the shadow sentence before the warehouse is asked anything: no probe, no write, the finding stays OPEN, one shadow is recorded', async () => {
+  const saved = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  delete process.env.MINTSOFT_WRITE_ALLOWED
+  delete process.env.MINTSOFT_WRITES_LIVE_FROM
+  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'mintsoft'
+  try {
+    reset()
+    const before = JSON.stringify(state.link)
+    const result = await (await repush())('so-1')
+    console.log(`# held repush: ${JSON.stringify(result)} shadows=${JSON.stringify(state.shadows)}`)
+    assert.equal(result.success, false)
+    assert.match(result.error!, /^Not sent by IMS: writes to Mintsoft are held on this installation/)
+    assert.deepEqual(state.probed, [], 'the warehouse was not asked anything')
+    assert.equal(JSON.stringify(state.link), before, 'the link is exactly as it was: not reset, not stamped')
+    assert.equal(state.finding!.status, 'OPEN', 'the finding stays where a person can see it')
+    assert.deepEqual(state.activity, [])
+    assert.deepEqual(state.shadows, [['order.create', 'so-1']])
+    // CONTROL, same fixture, switch off: the same action re-queues (so the arm above is the hold, not the fixture).
+    delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    reset()
+    const control = await (await repush())('so-1')
+    assert.equal(control.success, true)
+    assert.equal(state.link!.state, 'PENDING_CREATE')
+    assert.deepEqual(state.shadows, [])
+  } finally {
+    if (saved === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = saved
+  }
 })

@@ -306,6 +306,10 @@ const ALLOWLIST = [
   'lib/connectors/mintsoft/',
   'lib/connectors/wms/types.ts',
   'lib/connectors/wms/registry.ts',
+  // The generic warehouse producer seam: it maps each registered WMS connector id to the destination the producer-side hold
+  // governs and imports that destination's seam, so it necessarily names the connector, exactly as the registry does. The
+  // flows that call it spell no connector.
+  'lib/connectors/wms/producer-seam.ts',
   'app/actions/mintsoft-sync.ts',
   'app/api/cron/mintsoft-',
   'app/api/webhooks/mintsoft/',

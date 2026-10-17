@@ -24,6 +24,8 @@ const STATE_TONE: Record<string, string> = {
   // the order is neither fulfilled nor deletable until a person or the connector's own duplicate
   // refusal settles it — that is not an amber "check when you get a moment".
   AMBIGUOUS_CREATE: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  // A shadow is neither a push nor a failure: the producer-side hold kept the order's create as a record and sent nothing.
+  SHADOWED: 'bg-muted text-muted-foreground',
 }
 
 const STATE_LABEL: Record<string, string> = {
@@ -35,6 +37,7 @@ const STATE_LABEL: Record<string, string> = {
   DEAD_LETTER: 'Push failed',
   VALIDATION_FAILED: 'Payload invalid',
   AMBIGUOUS_CREATE: 'Outcome unknown',
+  SHADOWED: 'Not sent (held)',
 }
 
 export function WmsOrderPushChip({ orderId, push }: { orderId: string; push: WmsOrderPushStateView }) {

@@ -49,8 +49,10 @@ import {
   createMintsoftBindingHandover,
   runStockSyncForBinding,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
+import { mintsoftProducerSeam } from '@/lib/connectors/mintsoft/producer-seam'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { describeContentRun } from '@/lib/connectors/mintsoft/sync/product-content-sync'
+import { describeShadowedBundles, describeShadowedProducts } from '@/lib/connectors/mintsoft/operator-action-seam'
 import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
 import {
   listKeptBundleClaims,
@@ -2586,7 +2588,7 @@ export async function runMintsoftProductVerifyNow(): Promise<{
   return {
     success: true,
     jobId: result.jobId,
-    message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors. ${describeContentRun(result.content)}`,
+    message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors. ${describeContentRun(result.content)}${describeShadowedProducts(result.shadowed)}`,
   }
 }
 
@@ -2645,7 +2647,7 @@ export async function runMintsoftBundleVerifyNow(): Promise<{
 
   return {
     success: true,
-    message: `Checked ${result.totalChecked} KIT products, synced ${result.synced}, ${result.conflicts} conflicts, ${result.errors} errors.`,
+    message: `Checked ${result.totalChecked} KIT products, synced ${result.synced}, ${result.conflicts} conflicts, ${result.errors} errors.${describeShadowedBundles(result.shadowed)}`,
   }
 }
 
@@ -2919,7 +2921,7 @@ async function readMintsoftAsnMapKnowledge(remoteAsns: readonly WmsAsnRef[]): Pr
 export async function createMintsoftPurchaseOrderAsn(
   poId: unknown,
   input: unknown,
-): Promise<{ success: boolean; error?: string; message?: string; externalAsnId?: string }> {
+): Promise<{ success: boolean; error?: string; message?: string; externalAsnId?: string; shadowed?: boolean }> {
   await requirePermission('purchasing.receive')
 
   const parsedId = MintsoftBindingDeleteSchema.safeParse(poId)
@@ -2934,6 +2936,21 @@ export async function createMintsoftPurchaseOrderAsn(
 
   if (!await isIntegrationPluginEnabled('mintsoft')) {
     return { success: false, error: 'Mintsoft is disabled.' }
+  }
+
+  // THE PRODUCER SEAM of the ASN create, before the sync job, the reservation or anything else is written. An ASN is one of the
+  // warehouse writes the ownership map hands to an operator by hand until the live phase. Shadowed (hold enforced, decision
+  // SHADOW) nothing is reserved, claimed or sent, no WmsAsnMap row is made, a shadow record is kept, and the operator is told
+  // that nothing was sent. It is a refusal with its own flag, never a failure and never a "created".
+  const asnSeam = await mintsoftProducerSeam({
+    operation: 'asn.create',
+    subjectType: 'PurchaseOrder',
+    subjectId: String(parsedId.data),
+    payload: { kind: 'PurchaseOrder', id: parsedId.data, input: parsedInput.data },
+    summary: { kind: 'PurchaseOrder' },
+  })
+  if (!asnSeam.proceed) {
+    return { success: false, shadowed: true, error: asnSeam.notice }
   }
 
   const data = parsedInput.data
@@ -3861,7 +3878,7 @@ export async function createMintsoftPurchaseOrderAsn(
             // expect (o3d-papk).
             quantity: line.outstanding.qtyNumber,
           })),
-        })
+        }, asnSeam.clearance)
 
         outcome = await finalizePendingAsn(reservation, createdAsn, 'created')
       }
@@ -4024,7 +4041,7 @@ export async function createMintsoftPurchaseOrderAsn(
 export async function createMintsoftTransferAsn(
   transferId: unknown,
   input: unknown,
-): Promise<{ success: boolean; error?: string; message?: string; externalAsnId?: string }> {
+): Promise<{ success: boolean; error?: string; message?: string; externalAsnId?: string; shadowed?: boolean }> {
   await requirePermission('stock_control.transfer')
 
   const parsedId = MintsoftBindingDeleteSchema.safeParse(transferId)
@@ -4039,6 +4056,21 @@ export async function createMintsoftTransferAsn(
 
   if (!await isIntegrationPluginEnabled('mintsoft')) {
     return { success: false, error: 'Mintsoft is disabled.' }
+  }
+
+  // THE PRODUCER SEAM of the ASN create, before the sync job, the reservation or anything else is written. An ASN is one of the
+  // warehouse writes the ownership map hands to an operator by hand until the live phase. Shadowed (hold enforced, decision
+  // SHADOW) nothing is reserved, claimed or sent, no WmsAsnMap row is made, a shadow record is kept, and the operator is told
+  // that nothing was sent. It is a refusal with its own flag, never a failure and never a "created".
+  const asnSeam = await mintsoftProducerSeam({
+    operation: 'asn.create',
+    subjectType: 'Transfer',
+    subjectId: String(parsedId.data),
+    payload: { kind: 'Transfer', id: parsedId.data, input: parsedInput.data },
+    summary: { kind: 'Transfer' },
+  })
+  if (!asnSeam.proceed) {
+    return { success: false, shadowed: true, error: asnSeam.notice }
   }
 
   const data = parsedInput.data
@@ -5044,7 +5076,7 @@ export async function createMintsoftTransferAsn(
             // warehouse is told to expect (o3d-zzgp).
             quantity: line.outstanding.qtyNumber,
           })),
-        })
+        }, asnSeam.clearance)
 
         outcome = await finalizePendingAsn(reservation, createdAsn, 'created')
       }
