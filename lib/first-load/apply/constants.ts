@@ -58,6 +58,7 @@ export const APPLY_EXIT_CODES = {
   CONFLICT: 5,
   INTERNAL: 6,
   REHEARSAL_TEARDOWN_INCOMPLETE: 7,
+  APPLIED_UNVERIFIED: 8,
 } as const
 export type ApplyExitName = keyof typeof APPLY_EXIT_CODES
 
@@ -100,12 +101,17 @@ export const APPLY_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: ApplyExi
     name: 'REHEARSAL_TEARDOWN_INCOMPLETE',
     meaning: 'Rehearsal only: the throwaway database could not be removed completely. The real target was not written.',
   },
+  {
+    code: APPLY_EXIT_CODES.APPLIED_UNVERIFIED,
+    name: 'APPLIED_UNVERIFIED',
+    meaning: 'Every step loaded and the row accounting reconciles, but NO post-run verification was run (this runner has no verification port yet). This is NOT a success: do not treat it as OK. Rows ARE written. A later --resume of the same load runs the verification when it exists.',
+  },
 ]
 
 /** Exits for which the runner can PROVE that nothing was written: no write happens before the precondition phase ends. */
 export const NOTHING_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['USAGE', 'PRECONDITION_REFUSED'])
 /** Exits after which rows ARE (or may be) written and the restore procedure must be printed. */
-export const ROWS_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['VERIFY_FAILED', 'STEP_FAILED', 'CONFLICT', 'INTERNAL'])
+export const ROWS_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['VERIFY_FAILED', 'STEP_FAILED', 'CONFLICT', 'INTERNAL', 'APPLIED_UNVERIFIED'])
 
 export const NOTHING_WRITTEN_TEXT = 'This command wrote nothing to the database.'
 export const ROWS_WRITTEN_TEXT = 'Rows may already be written to the database by this run.'

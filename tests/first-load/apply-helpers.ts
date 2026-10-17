@@ -220,6 +220,8 @@ export class FakeDatabase {
         return this.observeNow(step)
       },
       withStepLock: async (_step, body) => body(),
+      // The verification slice is not built; the in-memory ports stand in for it with a verification that passes, so the arms below test the orchestration. Tests of the absent-port behaviour pass `verify: undefined`.
+      verify: async () => [],
       recheckRails: async () => this.rails,
       execute: async (step, file) => {
         const ps = prepared.steps.find((s) => s.step === step)!

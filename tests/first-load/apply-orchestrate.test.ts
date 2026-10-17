@@ -41,7 +41,7 @@ test('control: a clean apply loads every unit of every step, the identity holds,
       assert.deepEqual(s.counterFindings, [], `${s.step}: the importer's counters agree with the database`)
     }
     assert.deepEqual(result.steps.map((s) => [s.step, s.created]), [['suppliers', 2], ['products', 8], ['opening-stock', 4], ['purchase-orders', 2]])
-    assert.equal(db.journalRecord?.status, 'APPLIED')
+    assert.equal(db.journalRecord?.status, 'VERIFIED')
     assert.deepEqual(db.executed.map((e) => e.step), ['suppliers', 'products', 'opening-stock', 'purchase-orders'], 'steps run in load order')
   })
 })
@@ -198,7 +198,7 @@ test('run record: a second load over an existing record, a resume with no record
   assert.match(second.problems[0], /run record already exists/)
   const finished = await runLoad(prepared, db.ports(), options({ resume: true }))
   assert.equal(finished.exit, 'PRECONDITION_REFUSED')
-  assert.match(finished.problems[0], /APPLIED, which is not resumable/)
+  assert.match(finished.problems[0], /VERIFIED, which is not resumable/)
   db.journalRecord = { ...(db.journalRecord as RunRecord), manifestDigest: 'e'.repeat(64), status: 'STEP_FAILED' }
   const other = await runLoad(prepared, db.ports(), options({ resume: true }))
   assert.equal(other.exit, 'PRECONDITION_REFUSED')
@@ -262,7 +262,7 @@ test('crash in the middle of opening stock: the resume sends ONLY the rows that 
   assert.deepEqual(stock.importer.map((i) => i.skipped), [0], 'the importer was never asked to re-load a row that exists')
   for (const s of resumed.steps.filter((x) => x.step === 'suppliers' || x.step === 'products')) assert.equal(s.skippedExisting, s.emitted)
   assert.equal(db.entries.get('opening-stock')!.length, 4, 'exactly one opening layer per pair')
-  assert.equal(db.journalRecord?.status, 'APPLIED')
+  assert.equal(db.journalRecord?.status, 'VERIFIED')
 })
 
 test('silent recipe loss: a product the importer counted as created but whose recipe is missing is FAILED, the run stops, and the counters are only a cross-check', async () => {
@@ -441,4 +441,66 @@ test('step lock: a step whose lock is busy, lost or unavailable stops the run as
     assert.equal(db.journalRecord?.version, 1, `${reason}: the record is as the run created it`)
     assert.equal(db.journalRecord?.status, 'RUNNING')
   }
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// No verification port: not a success; APPLIED is resumable for verification only
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+test('without a verification port a completed load is APPLIED_UNVERIFIED, never OK, and the record stays APPLIED', async () => {
+  // Mutation named: return 'OK' when ports.verify is absent (the old behaviour) -> this arm is red.
+  const { prepared, db, options } = setup()
+  const result = await runLoad(prepared, db.ports({ verify: undefined }), options())
+  assert.equal(result.exit, 'APPLIED_UNVERIFIED')
+  assert.notEqual(result.exit as string, 'OK')
+  assert.match(result.problems.join(' '), /no verification port/)
+  assert.equal(db.journalRecord?.status, 'APPLIED')
+  assert.equal(result.verification.length, 0)
+  assert.ok(result.steps.every((s) => s.status === 'DONE'), 'the load itself finished')
+})
+
+test('control: with a verification port the same load is OK and VERIFIED', async () => {
+  const { prepared, db, options } = setup()
+  const result = await runLoad(prepared, db.ports({ verify: async () => [{ id: 'x', result: 'pass', expected: 'a', actual: 'a' }] }), options())
+  assert.equal(result.exit, 'OK')
+  assert.equal(db.journalRecord?.status, 'VERIFIED')
+  assert.equal(result.verification.length, 1)
+})
+
+test('resume on an APPLIED run sends nothing and, without a verification port, writes nothing and says APPLIED_UNVERIFIED again', async () => {
+  // Mutation named: leave APPLIED out of the resumable path -> "not resumable" refusal; run the steps again -> importer calls here.
+  const { prepared, db, options } = setup()
+  await runLoad(prepared, db.ports({ verify: undefined }), options())
+  const calls = db.executed.length
+  const version = db.journalRecord!.version
+  const again = await runLoad(prepared, db.ports({ verify: undefined }), options({ resume: true }))
+  assert.equal(again.exit, 'APPLIED_UNVERIFIED')
+  assert.equal(db.executed.length, calls, 'no importer call')
+  assert.equal(db.journalRecord!.version, version, 'the run record was not written')
+  assert.equal(db.journalRecord!.status, 'APPLIED')
+})
+
+test('resume on an APPLIED run with a verification port runs ONLY the verification, and records the verdict', async () => {
+  for (const verdict of ['pass', 'fail'] as const) {
+    const { prepared, db, options } = setup()
+    await runLoad(prepared, db.ports({ verify: undefined }), options())
+    const calls = db.executed.length
+    let verified = 0
+    const resumed = await runLoad(prepared, db.ports({ verify: async () => { verified++; return [{ id: 'check', result: verdict, expected: 'a', actual: verdict === 'pass' ? 'a' : 'b' }] } }), options({ resume: true }))
+    assert.equal(verified, 1)
+    assert.equal(db.executed.length, calls, `${verdict}: no importer call`)
+    assert.equal(resumed.exit, verdict === 'pass' ? 'OK' : 'VERIFY_FAILED')
+    assert.equal(db.journalRecord!.status, verdict === 'pass' ? 'VERIFIED' : 'VERIFY_FAILED')
+  }
+})
+
+test('resume on an APPLIED run whose data has since changed is a CONFLICT and verifies nothing', async () => {
+  const { prepared, db, options } = setup()
+  await runLoad(prepared, db.ports({ verify: undefined }), options())
+  const supplier = db.entries.get('suppliers')![0]
+  supplier.fingerprint = '{"changed":true}'
+  let verified = 0
+  const resumed = await runLoad(prepared, db.ports({ verify: async () => { verified++; return [] } }), options({ resume: true }))
+  assert.equal(resumed.exit, 'CONFLICT')
+  assert.equal(verified, 0)
 })

@@ -100,7 +100,7 @@ The unit key is a catalogue identifier the operator needs in order to act on a f
 
 - **Plan** reads the database and the prepared run and writes nothing: no importer call, no run record. It lists, per step, how many units would be loaded and skipped, the residual files' hashes and every conflict. A conflict makes the plan refuse.
 - **Apply** needs a rehearsal record for the same digest, with verdict OK, finished within 24 hours (and not in the future), against a target with the same system id; otherwise it refuses before reading the database. It then creates the run record (compare-and-swap on a version, so a second runner is refused rather than overwriting it) and runs each step under the step lock: the rails are re-checked, the database is read again, the residual is computed from that read, the rails are re-checked just before the first write, the importer is called with each residual file, and the database is read once more to account for every unit. A failed or conflicting step stops the run.
-- **Resume** continues the same digest from a run record that is RUNNING, STEP_FAILED or VERIFY_FAILED. A different digest, a finished run, or no record is refused. An existing record without `--resume` is refused.
+- **Resume** continues the same digest from a run record that is RUNNING, STEP_FAILED or VERIFY_FAILED. A run record that is **APPLIED** is resumable for **verification only**: no step is run and no importer is called; with a verification port the verdict is recorded (VERIFIED or VERIFY_FAILED), and without one nothing is written and the result is APPLIED_UNVERIFIED again. A different digest, a VERIFIED run, or no record is refused. An existing record without `--resume` is refused.
 
 An unreadable database is never treated as an empty one: the read fails closed (refusal before the first write, or STEP_FAILED during the run).
 
@@ -118,6 +118,7 @@ An unreadable database is never treated as an empty one: the read fails closed (
 | 5 | CONFLICT | The database holds a key with different data than the file (or a row nobody in this run created). Nothing further was written; rows from earlier steps ARE written. |
 | 6 | INTERNAL | A self-check failed (the row accounting did not reconcile, or a report write failed). This is a defect in the runner. The database state is NOT assumed to be unchanged. |
 | 7 | REHEARSAL_TEARDOWN_INCOMPLETE | Rehearsal only: the throwaway database could not be removed completely. The real target was not written. |
+| 8 | APPLIED_UNVERIFIED | Every step loaded and the row accounting reconciles, but NO post-run verification was run (this runner has no verification port yet). This is NOT a success: do not treat it as OK. Rows ARE written. A later --resume of the same load runs the verification when it exists. |
 
 Only USAGE and PRECONDITION_REFUSED say that nothing was written, because no write happens before the precondition phase ends and a test proves it. Every other non-zero exit says that rows may be written and prints the restore procedure. The runner never restores by itself and never deletes rows.
 
@@ -226,7 +227,7 @@ Owner rulings, and where each is enforced: the accepted zero-cost pairs (the cor
 
 ### What the database side leaves to later slices
 
-The restore point; the rails that read the outbound-write hold, the connector and cron state and the producer cut-offs; the post-run verification and the write census (so `ports.verify` is not supplied and a finished run ends APPLIED, not VERIFIED); the command-line shell, target confirmation and rehearsal mode; the go/no-go check.
+The restore point; the rails that read the outbound-write hold, the connector and cron state and the producer cut-offs; the post-run verification and the write census (so `ports.verify` is not supplied: a finished load ends with the record APPLIED and the result APPLIED_UNVERIFIED, exit 8, which is not a success and must not be read as OK); the command-line shell, target confirmation and rehearsal mode; the go/no-go check.
 
 ## Not proven here
 

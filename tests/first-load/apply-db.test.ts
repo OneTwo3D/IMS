@@ -360,8 +360,9 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       const outbound = new Map<string, number>()
       for (const table of OUTBOUND_TABLES) outbound.set(table, await count(table))
       const result = await runLoad(prepared, ports(), apply(prepared))
-      assert.deepEqual(result.problems, [])
-      assert.equal(result.exit, 'OK')
+      // No verification port exists yet, so a completed load is NOT reported as OK.
+      assert.equal(result.exit, 'APPLIED_UNVERIFIED')
+      assert.deepEqual(result.problems, ['no post-run verification was run: this runner has no verification port'])
       let units = 0
       for (const step of result.steps) {
         assert.equal(step.status, 'DONE', step.step)
@@ -396,6 +397,13 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.equal(step.skippedExisting, step.emitted)
         assert.ok(step.rows.every((r) => r.outcome === 'would-skip-existing'))
       }
+    })
+
+    it('resume on the APPLIED run (no verification port) writes nothing: no importer call, no log row, the record untouched, and it is still not OK', async () => {
+      const before = { logs: await count('activity_logs'), version: (await m.journal.createJournal().load())!.version }
+      const result = await runLoad(prepared, ports(), apply(prepared, { resume: true }))
+      assert.equal(result.exit, 'APPLIED_UNVERIFIED')
+      assert.deepEqual({ logs: await count('activity_logs'), version: (await m.journal.createJournal().load())!.version }, before)
     })
 
     it('a run record exists, so a second apply without --resume is refused, and writes nothing', async () => {
@@ -678,7 +686,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         // The first runner stops either on the lost lock itself or, because the second runner has moved the record meanwhile, on the stale record; both are a stop.
         assert.match(result.problems.join(' '), /step lock was not available \(lost\)|run record changed under this runner/)
         assert.equal(firstCalls, 1, 'the first runner made exactly one importer call, then stopped')
-        assert.equal(resumed!.exit, 'OK', resumed!.problems.join('; '))
+        assert.equal(resumed!.exit, 'APPLIED_UNVERIFIED', resumed!.problems.join('; '))
         assert.equal(layersWhenSecondFinished, stockUnits, 'the second runner completed the step')
         assert.equal(await count('cost_layers'), stockUnits, 'the first runner wrote nothing after losing the lock')
         assert.equal(Number((await sql<{ n: string }>(`select count(*)::text as n from (select 1 from cost_layers group by "productId","warehouseId" having count(*) > 1) d`))[0]!.n), 0, 'no pair was written twice')
@@ -699,7 +707,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           },
         }
         const result = await runLoad(prepared, spying, apply(prepared))
-        assert.equal(result.exit, 'OK', result.problems.join('; '))
+        assert.equal(result.exit, 'APPLIED_UNVERIFIED', result.problems.join('; '))
         precondition(t, 'importer calls observed', order.length)
         assert.deepEqual(order.map((o) => o.step), prepared.steps.map((s) => s.step))
         for (const o of order) assert.deepEqual(o.held, [APPLY_STEP_IDS.indexOf(o.step) + 1], o.step)
@@ -756,7 +764,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const sent: Array<{ step: ApplyStepId; rows: number }> = []
         const spyReal = ports()
         const resumed = await runLoad(prepared, { ...spyReal, execute: async (step, file) => { sent.push({ step, rows: file.rows }); return spyReal.execute(step, file) } }, apply(prepared, { resume: true }))
-        assert.equal(resumed.exit, 'OK', resumed.problems.join('; '))
+        assert.equal(resumed.exit, 'APPLIED_UNVERIFIED', resumed.problems.join('; '))
         const stock = prepared.steps.find((s) => s.step === 'opening-stock')!
         assert.deepEqual(sent.filter((s) => s.step === 'opening-stock'), [{ step: 'opening-stock', rows: stock.units.length - loadedBefore }], 'only the pairs not yet written were sent')
         assert.deepEqual(sent.filter((s) => s.step === 'suppliers' || s.step === 'products'), [], 'earlier steps found their units present and sent nothing')

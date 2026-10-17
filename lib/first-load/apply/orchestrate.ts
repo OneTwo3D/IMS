@@ -273,10 +273,13 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   if (existing !== null) {
     if (!options.resume) return finish('PRECONDITION_REFUSED', ['a run record already exists in this database; this command refuses to start a second load over it (use --resume for the same load)'], planSteps, existing)
     if (existing.manifestDigest !== prepared.manifestDigest) return finish('PRECONDITION_REFUSED', [`the run record is for a different load (recorded digest ${existing.manifestDigest}, this load ${prepared.manifestDigest})`], planSteps, existing)
-    if (!RESUMABLE_STATUSES.has(existing.status)) return finish('PRECONDITION_REFUSED', [`the run record is ${existing.status}, which is not resumable`], planSteps, existing)
+    // An APPLIED run is resumable for VERIFICATION ONLY: no step is run and no importer is called.
+    if (!RESUMABLE_STATUSES.has(existing.status) && existing.status !== 'APPLIED') return finish('PRECONDITION_REFUSED', [`the run record is ${existing.status}, which is not resumable`], planSteps, existing)
   }
   // From here on a conflict means a fresh run found foreign data (nothing written yet), or a resume found it (earlier writes stand).
   if (anyConflict) return finish(existing === null ? 'PRECONDITION_REFUSED' : 'CONFLICT', ['the database holds data that conflicts with the files; see the conflicts per step'], planSteps, existing)
+
+  if (existing !== null && existing.status === 'APPLIED') return verifyApplied(prepared, ports, existing, planSteps, finish)
 
   let record: RunRecord
   try {
@@ -341,8 +344,42 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
     await persist({ status: 'VERIFY_FAILED' }).catch(() => undefined)
     return finish('VERIFY_FAILED', verification.filter((v) => v.result === 'fail').map((v) => `${v.id}: expected ${v.expected}, found ${v.actual}`), results, record, verification)
   }
-  await persist({ status: ports.verify ? 'VERIFIED' : 'APPLIED' })
+  if (!ports.verify) {
+    // Nothing verified the load, so it is NOT reported as a success: the record stays APPLIED and a later --resume verifies it.
+    await persist({ status: 'APPLIED' })
+    return finish('APPLIED_UNVERIFIED', ['no post-run verification was run: this runner has no verification port'], results, record, verification)
+  }
+  await persist({ status: 'VERIFIED' })
   return finish('OK', [], results, record, verification)
+}
+
+/**
+ * Resume of an APPLIED run: verification only. Nothing is loaded and no importer is called. Without a verification port nothing is written at all
+ * and the result is the same APPLIED_UNVERIFIED; with one, the verdict is recorded (VERIFIED or VERIFY_FAILED) by compare-and-swap.
+ */
+async function verifyApplied(
+  prepared: PreparedRun,
+  ports: ApplyPorts,
+  existing: RunRecord,
+  planSteps: StepResult[],
+  finish: (exit: ApplyExitName, problems: string[], steps: StepResult[], record: RunRecord | null, verification?: VerificationItem[]) => ApplyResult,
+): Promise<ApplyResult> {
+  if (!ports.verify) return finish('APPLIED_UNVERIFIED', ['no post-run verification was run: this runner has no verification port'], planSteps, existing)
+  let verification: VerificationItem[]
+  try {
+    verification = await ports.verify(prepared, planSteps)
+    const failed = verification.some((v) => v.result === 'fail')
+    const next: RunRecord = { ...existing, version: existing.version + 1, status: failed ? 'VERIFY_FAILED' : 'VERIFIED' }
+    await ports.journal.save(next, existing.version)
+    existing = next
+  } catch (error) {
+    if (error instanceof StaleJournalError) return finish('STEP_FAILED', [error.message], planSteps, existing)
+    throw error
+  }
+  if (verification.some((v) => v.result === 'fail')) {
+    return finish('VERIFY_FAILED', verification.filter((v) => v.result === 'fail').map((v) => `${v.id}: expected ${v.expected}, found ${v.actual}`), planSteps, existing, verification)
+  }
+  return finish('OK', [], planSteps, existing, verification)
 }
 
 interface StepOutcome {
