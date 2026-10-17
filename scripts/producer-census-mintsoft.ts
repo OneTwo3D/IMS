@@ -317,7 +317,13 @@ function findContainer(sf: ts.SourceFile, node: ts.Node): ts.Node | null {
 
 export type MintTransportSite = { file: string; line: number; decl: string; callee: string; method: string; gated?: boolean }
 
-/** Every `connectorFetch(…)` / `fetch(…)` call whose options name `connectorName: 'Mintsoft'` in this file. */
+/** \`mintsoftProducerHoldEnforced(…)\`: true exactly when the hold is enforced, so refusing redirects on it leaves only the legacy (switch-off) path following them. */
+function isEnforcementPredicateCall(expr: ts.Expression): boolean {
+  const e = unwrap(expr)
+  return ts.isCallExpression(e) && calleeName(e) === 'mintsoftProducerHoldEnforced'
+}
+
+/** Every \`connectorFetch(…)` / `fetch(…)` call whose options name `connectorName: 'Mintsoft'` in this file. */
 export function scanMintsoftTransportSource(text: string, file: string): MintTransportSite[] {
   if (!text.includes('Mintsoft')) return []
   const sf = parse(file, text)
@@ -336,7 +342,7 @@ export function scanMintsoftTransportSource(text: string, file: string): MintTra
           const opts = unwrap(optionsArg) as ts.ObjectLiteralExpression
           if (objectProperty(opts, 'hopGate')) gated = true
           const refuse = objectProperty(opts, 'refuseRedirects')
-          if (refuse && ts.isPropertyAssignment(refuse) && refuse.initializer.kind === ts.SyntaxKind.TrueKeyword) gated = true
+          if (refuse && ts.isPropertyAssignment(refuse) && (refuse.initializer.kind === ts.SyntaxKind.TrueKeyword || isEnforcementPredicateCall(refuse.initializer))) gated = true
         }
         if (aimed) {
           let method = 'GET'

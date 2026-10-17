@@ -21,6 +21,8 @@ async function listener() {
   const received: string[] = []
   const server = createServer((req, res) => {
     received.push(`${req.method} ${req.url}`)
+    if (req.url === '/api/Auth307') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('"key-after-redirect"'); return }
+    if (req.url === '/api/Auth' && process.env.AUTH_TEST_REDIRECT === '307') { res.writeHead(307, { Location: '/api/Auth307' }); res.end(); return }
     if (req.url === '/api/Auth' || req.url === '/api/Warehouse') { res.writeHead(302, { Location: '/api/Order/5/Cancel' }); res.end(); return }
     res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"Success":true}')
   })
@@ -41,6 +43,44 @@ test('login: a 302 from POST /api/Auth onto the Cancel path is never followed (e
     assert.deepEqual(received, ['POST /api/Auth'], 'the redirect target was never requested')
   } finally {
     delete process.env.MINTSOFT_WRITE_ALLOWED
+    delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    server.close()
+  }
+})
+
+test('login, producer hold NOT enforced (switch OFF, legacy): a 307 from POST /api/Auth is followed exactly as before', async () => {
+  const { server, received, base } = await listener()
+  process.env.E2E_TEST_MODE = '1'
+  process.env.SETTINGS_ENCRYPTION_KEY = 'a1'.repeat(32)
+  process.env.MINTSOFT_WRITE_ALLOWED = `${base}|89|login=u`
+  process.env.AUTH_TEST_REDIRECT = '307'
+  delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  try {
+    const { testMintsoftConnectionSettings } = await import('../lib/connectors/mintsoft/api/auth.ts')
+    await testMintsoftConnectionSettings(base, 'u', 'p')
+    console.log(`# OFF login requests: ${JSON.stringify(received)}`)
+    assert.deepEqual(received, ['POST /api/Auth', 'POST /api/Auth307'], 'the redirect was followed (legacy)')
+  } finally {
+    delete process.env.MINTSOFT_WRITE_ALLOWED
+    delete process.env.AUTH_TEST_REDIRECT
+    server.close()
+  }
+})
+
+test('login, producer hold enforced (switch ON): the same 307 is refused and no second hop is requested', async () => {
+  const { server, received, base } = await listener()
+  process.env.E2E_TEST_MODE = '1'
+  process.env.SETTINGS_ENCRYPTION_KEY = 'a1'.repeat(32)
+  process.env.MINTSOFT_WRITE_ALLOWED = `${base}|89|login=u`
+  process.env.AUTH_TEST_REDIRECT = '307'
+  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'mintsoft'
+  try {
+    const { testMintsoftConnectionSettings } = await import('../lib/connectors/mintsoft/api/auth.ts')
+    await assert.rejects(testMintsoftConnectionSettings(base, 'u', 'p'), /redirect/i)
+    assert.deepEqual(received, ['POST /api/Auth'], 'no second hop')
+  } finally {
+    delete process.env.MINTSOFT_WRITE_ALLOWED
+    delete process.env.AUTH_TEST_REDIRECT
     delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
     server.close()
   }

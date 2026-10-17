@@ -8,7 +8,7 @@ import {
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { withMintsoftAuthLock } from '@/lib/connectors/mintsoft/api/auth-lock'
 import { connectorFetch } from '@/lib/security/connector-fetch'
-import { mintsoftHopGate } from '../producer-egress'
+import { mintsoftHopGate, mintsoftProducerHoldEnforced } from '../producer-egress'
 import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
@@ -173,9 +173,10 @@ async function requestMintsoftAuthSession(
     // Key minting is held like every other Mintsoft write, and is bound to the granted ClientId: the
     // ClientId this installation is configured with must equal the one the grant names.
     outboundWriteContext: { writeScopeId: clientId },
-    // Key minting goes to exactly the origin named: a redirect is an error and its target is never requested (a 302 from POST /api/Auth
-    // onto a write-classified GET would otherwise be followed under the login grant).
-    refuseRedirects: true,
+    // While the producer hold is enforced, key minting goes to exactly the origin named: a redirect is an error and its target is never
+    // requested (a 302 from POST /api/Auth onto a write-classified GET would otherwise be followed under the login grant). With the
+    // hold not enforced the legacy behaviour is unchanged: redirects are followed.
+    refuseRedirects: mintsoftProducerHoldEnforced(),
   })
 
   const bodyText = await response.text()

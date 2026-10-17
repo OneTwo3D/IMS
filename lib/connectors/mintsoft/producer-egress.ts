@@ -24,6 +24,11 @@ export type MintsoftHold =
       reason: ProducerReason
     }
 
+/** Whether the producer-side hold is enforced for Mintsoft at all. Unset enforcement is the legacy behaviour, byte for byte. Pure; never throws. */
+export function mintsoftProducerHoldEnforced(context?: ProducerDecisionContext): boolean {
+  return producerEgressVerdict('mintsoft', context).kind !== 'legacy'
+}
+
 /** Whether a drain of already-queued Mintsoft work must stand down. Pure; never throws. */
 export function mintsoftDrainHold(context?: ProducerDecisionContext): MintsoftHold {
   const verdict = producerEgressVerdict('mintsoft', context)

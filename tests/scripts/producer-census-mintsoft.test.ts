@@ -274,12 +274,12 @@ test('literalMembersOf reads the registered ids and the destination table as SYN
 test('MUTATION MINT-3 (a Mintsoft connectorFetch with no hop gate and no redirect refusal): red, naming the call; gated ones are not', () => {
   const ungated = scanMintsoftTransportSource("export const a = (u: URL) => connectorFetch(u, { method: 'GET' }, { connectorName: 'Mintsoft' })\n", 'lib/a.ts')
   assert.deepEqual(ungated.map((s) => s.gated), [false])
-  const gated = scanMintsoftTransportSource("export const b = (u: URL) => connectorFetch(u, { method: 'GET' }, { connectorName: 'Mintsoft', hopGate: g })\nexport const c = (u: URL) => connectorFetch(u, { method: 'POST' }, { connectorName: 'Mintsoft', refuseRedirects: true })\n", 'lib/b.ts')
-  assert.deepEqual(gated.map((s) => s.gated), [true, true])
+  const gated = scanMintsoftTransportSource("export const b = (u: URL) => connectorFetch(u, { method: 'GET' }, { connectorName: 'Mintsoft', hopGate: g })\nexport const c = (u: URL) => connectorFetch(u, { method: 'POST' }, { connectorName: 'Mintsoft', refuseRedirects: true })\nexport const d = (u: URL) => connectorFetch(u, { method: 'POST' }, { connectorName: 'Mintsoft', refuseRedirects: mintsoftProducerHoldEnforced() })\nexport const e = (u: URL) => connectorFetch(u, { method: 'POST' }, { connectorName: 'Mintsoft', refuseRedirects: someOtherFlag() })\n", 'lib/b.ts')
+  assert.deepEqual(gated.map((s) => s.gated), [true, true, true, false])
   const report = mintCensusFindings(input({ transport: [...transport, ...ungated] }))
   assert.equal(red(report, 'MINT-3', 'without `hopGate`').length, 1, JSON.stringify(report.failures))
   // and every real call is gated
   assert.equal(transport.filter((s) => s.gated === false).length, 0)
-  const stripped = scanMintsoftTransportSource(realText('lib/connectors/mintsoft/api/auth.ts').replace('    refuseRedirects: true,', ''), 'lib/connectors/mintsoft/api/auth.ts')
+  const stripped = scanMintsoftTransportSource(realText('lib/connectors/mintsoft/api/auth.ts').replace('    refuseRedirects: mintsoftProducerHoldEnforced(),', ''), 'lib/connectors/mintsoft/api/auth.ts')
   assert.ok(stripped.some((s) => s.gated === false), 'removing the login refusal is seen')
 })
