@@ -427,3 +427,48 @@ test('STARVATION: more shadowed pre-cutoff candidates than the batch size do not
     assert.equal(result.created, 1)
   })
 })
+
+// ───────────────────────── 5. LIVE: no recovery pass re-queues an order the create query would exclude ─────────────────────────
+
+const recoveryOrder = (id: string, paidAt: Date) => ({ ...candidate({ id, orderNumber: id.toUpperCase(), paidAt, createdAt: paidAt }), shipFromWarehouseId: 'wh-1' })
+const recoveryCases = [
+  {
+    name: 'HELD release',
+    seed: (id: string, paidAt: Date): Seed => ({ releasable: [{ ...heldLink(), id: `link-${id}`, orderId: id, order: { id, orderNumber: id.toUpperCase(), externalOrderNumber: null, paidAt } }] }),
+    counter: 'released' as const,
+  },
+  {
+    name: 'VALIDATION_FAILED revalidation',
+    seed: (id: string, paidAt: Date): Seed => ({ revalidatable: { total: 1, links: [{ id: `link-${id}`, orderId: id, lastError: 'old error', attempts: 0, pushedAt: null, externalOrderId: null, order: recoveryOrder(id, paidAt) }] } }),
+    counter: 'revalidated' as const,
+  },
+  {
+    name: 'AMBIGUOUS_CREATE re-queue',
+    seed: (id: string, paidAt: Date): Seed => ({ ambiguous: { total: 1, links: [{ id: `link-${id}`, orderId: id, lastError: 'old error', attempts: 1, pushedAt: null, externalOrderId: null, order: recoveryOrder(id, paidAt) }] } }),
+    counter: 'ambiguousCreateRequeued' as const,
+  },
+]
+for (const recovery of recoveryCases) {
+  test(`LIVE, ${recovery.name}: an order paid BEFORE the live-from instant is NOT re-queued (link untouched, refusal counted); one paid AFTER still is`, async () => {
+    await withEnv(LIVE, async () => {
+      const pre = await sweep(recovery.seed('so-pre', BEFORE_CUTOFF))
+      console.log(`# ${recovery.name} pre-cutoff: writes=${JSON.stringify(pre.writes)} refused=${pre.result.recoveryRefusedPreCutoff}`)
+      assert.deepEqual(pre.writes.filter((write) => !write.startsWith('claimForCreate') && !write.startsWith('upsertByOrder')), [], 'no link write of any kind (no state, error, id or stamp changed)')
+      assert.equal(pre.result.recoveryRefusedPreCutoff, 1)
+      assert.equal(pre.result[recovery.counter], 0, 'and it is not reported as recovered')
+      const post = await sweep(recovery.seed('so-post', AFTER_CUTOFF))
+      assert.equal(post.result[recovery.counter], 1, 'a post-cutoff order is still re-queued')
+      assert.equal(post.result.recoveryRefusedPreCutoff, undefined, 'the key is absent when nothing was refused')
+    })
+  })
+}
+
+test('OFF: a pre-cutoff order in each recovery state is re-queued exactly as before (no floor, no refusal key)', async () => {
+  await withEnv(OFF, async () => {
+    for (const recovery of recoveryCases) {
+      const run = await sweep(recovery.seed('so-pre', BEFORE_CUTOFF))
+      assert.equal(run.result[recovery.counter], 1, recovery.name)
+      assert.equal('recoveryRefusedPreCutoff' in run.result, false)
+    }
+  })
+})

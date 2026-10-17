@@ -61,8 +61,20 @@ export const WMS_CREATE_ELIGIBLE_ORDER_FENCES = {
  * warehouse this connector has none for, is not a create candidate and never will be until
  * somebody rebinds it.
  */
-export function wmsCreateEligibleOrderWhere(boundWarehouseIds: readonly string[]): Prisma.SalesOrderWhereInput {
-  return { ...WMS_CREATE_ELIGIBLE_ORDER_FENCES, shipFromWarehouseId: { in: [...boundWarehouseIds] } }
+export function wmsCreateEligibleOrderWhere(boundWarehouseIds: readonly string[], paidNotBefore?: Date | null): Prisma.SalesOrderWhereInput {
+  return {
+    ...WMS_CREATE_ELIGIBLE_ORDER_FENCES,
+    // The producer-side floor (see wmsCreateObligationFloor): once the destination is live an order paid before the live-from instant
+    // belongs to the writer that owned it then and IMS can never create it. No floor: the legacy predicate, exactly.
+    ...(paidNotBefore ? { paidAt: { not: null, gte: paidNotBefore } } : {}),
+    shipFromWarehouseId: { in: [...boundWarehouseIds] },
+  }
+}
+
+/** The same floor as {@link wmsCreateEligibleOrderWhere}, as a decision on one loaded order: true when IMS may NOT create (or re-queue) it. */
+export function wmsPaidBeforeCreateFloor(paidAt: Date | null | undefined, paidNotBefore: Date | null | undefined): boolean {
+  if (!paidNotBefore) return false
+  return !paidAt || paidAt.getTime() < paidNotBefore.getTime()
 }
 
 /**

@@ -13,7 +13,7 @@ import type { ProducerDecisionContext } from '@/lib/security/producer-dispositio
 import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from './push-recipient'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 import { decideWmsHeldRelease, wmsAmbiguousCreateMayBeReplayed, wmsAmbiguousCreateRefusal, wmsCreateReplayPolicy, type WmsCreateReplayPolicySource } from './create-replay-policy'
-import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere } from './create-eligibility'
+import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidBeforeCreateFloor } from './create-eligibility'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 import {
@@ -338,6 +338,12 @@ export type WmsOrderPushSweepResult = {
    * nothing was sent and no link was touched.
    */
   shadowed?: number
+  /**
+   * Once the destination is live, a HELD, VALIDATION_FAILED or AMBIGUOUS_CREATE link whose order was paid before the live-from instant was
+   * NOT re-queued: the create query excludes such an order, so a re-queue would strand it in PENDING_CREATE and lose its prior error and
+   * WMS id. The link is left exactly as it was. PRESENT ONLY WHEN NON-ZERO.
+   */
+  recoveryRefusedPreCutoff?: number
 }
 
 type OrderForPush = {
@@ -688,7 +694,7 @@ export type WmsPushLinkRef = { id: string; orderId: string; externalOrderId: str
 export type WmsPushReleasableLink = WmsPushLinkRef & {
   /** Non-null ONLY where `cancelOrder` answered `cancelled: true`. The affirmative evidence. */
   cancelledAt: Date | null
-  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null }
+  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null; paidAt?: Date | null }
 }
 /**
  * o3d-bjc.8: a PENDING_VERIFY link, carrying OUR identifiers.
@@ -718,7 +724,7 @@ export type WmsCreateClaimOutcome = 'CLAIMED' | 'SKIPPED' | 'PARKED_AMBIGUOUS'
 export interface WmsOrderPushPort {
   activeBindings(connector: string): Promise<Array<{ warehouseId: string; externalWarehouseId: string }>>
   /** HELD links whose order is back in a ready+paid state, with the release evidence. */
-  releasableHeldOrders(connector: string, limit: number): Promise<WmsPushReleasableLink[]>
+  releasableHeldOrders(connector: string, limit: number, paidNotBefore?: Date): Promise<WmsPushReleasableLink[]>
   /** Ready+paid orders for bound warehouses with no link or a PENDING_CREATE link. */
   createCandidates(connector: string, boundWarehouseIds: string[], limit: number, paidNotBefore?: Date): Promise<WmsPushCandidate[]>
   /**
@@ -797,7 +803,7 @@ export interface WmsOrderPushPort {
    *
    * Optional so existing test ports keep compiling; when absent, the pass does not run.
    */
-  revalidatableLinks?(connector: string, boundWarehouseIds: string[], limit: number): Promise<{ links: WmsPushRevalidateLink[]; total: number }>
+  revalidatableLinks?(connector: string, boundWarehouseIds: string[], limit: number, paidNotBefore?: Date): Promise<{ links: WmsPushRevalidateLink[]; total: number }>
   /**
    * o3d-2k5r r4 — AMBIGUOUS_CREATE links whose order is STILL create-eligible.
    *
@@ -815,7 +821,7 @@ export interface WmsOrderPushPort {
    *
    * Optional so existing test ports keep compiling; when absent, the pass does not run.
    */
-  ambiguousCreateLinks?(connector: string, boundWarehouseIds: string[], limit: number): Promise<{ links: WmsPushAmbiguousCreateLink[]; total: number }>
+  ambiguousCreateLinks?(connector: string, boundWarehouseIds: string[], limit: number, paidNotBefore?: Date): Promise<{ links: WmsPushAmbiguousCreateLink[]; total: number }>
   /** SYNCED links whose order is ON_HOLD. */
   holdableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   /** SYNCED links whose order is CANCELLED in IMS. */
@@ -939,6 +945,15 @@ export async function runWmsOrderPushSweepCore(
   // the seam BEFORE it claims, records or calls anything, and a shadow answer changes no state: no claim, no link write, no
   // attempt, no failure. Unenforced (the default) every answer is `proceed` and nothing below differs from before.
   let shadowedCount = 0
+  let recoveryRefusedCount = 0
+  /** THE SINGLE FLOOR of this sweep: the create query and every re-queue into PENDING_CREATE read it, so they cannot disagree. Null: not enforced, or not live. */
+  const createFloor = wmsCreateObligationFloor(connectorId, producerContext)
+  const refuseRequeue = (link: { id: string; order: { paidAt?: Date | null } }, from: string): boolean => {
+    if (!wmsPaidBeforeCreateFloor(link.order.paidAt, createFloor)) return false
+    recoveryRefusedCount += 1
+    console.warn(`[wms-order-push] link ${link.id} (${from}) was NOT re-queued: its order was paid before the live-from instant, so IMS cannot create it; the link is left as it was`)
+    return true
+  }
   /** Whether this installation's warehouse is outside its live phase: the passes that only RE-OPEN creates stand down. */
   const warehouseHeld = wmsProducerHold(connectorId, producerContext).held
 
@@ -1039,7 +1054,8 @@ export async function runWmsOrderPushSweepCore(
   // down. Each of them only RE-OPENS a create (a HELD, VALIDATION_FAILED or AMBIGUOUS_CREATE link goes back to PENDING_CREATE),
   // so running them would revive held work into a queue that the moment the hold lifts is drained live. They read nothing and
   // change nothing; the links stay exactly as they are.
-  for (const link of warehouseHeld ? [] : await port.releasableHeldOrders(connectorId, batchSize)) {
+  for (const link of warehouseHeld ? [] : await (createFloor ? port.releasableHeldOrders(connectorId, batchSize, createFloor) : port.releasableHeldOrders(connectorId, batchSize))) {
+    if (refuseRequeue(link, 'HELD')) continue
     const reference = wmsPushOrderReference(link.order)
     // The persisted affirmative evidence: `cancelledAt` is stamped by the hold pass ONLY where
     // cancelOrder answered `cancelled: true`.
@@ -1149,7 +1165,7 @@ export async function runWmsOrderPushSweepCore(
   // It rotates least-recently-checked first and reports its own overflow: a bounded sweep
   // that only reports what it processed reads as "covered everything".
   if (externalWarehouseByWarehouse.size > 0 && port.revalidatableLinks && !warehouseHeld) {
-    const { links, total } = await port.revalidatableLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+    const { links, total } = await (createFloor ? port.revalidatableLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize, createFloor) : port.revalidatableLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize))
     if (total > links.length) {
       console.warn(
         `[wms-order-push] ${total} orders are parked VALIDATION_FAILED and eligible for revalidation; `
@@ -1160,6 +1176,7 @@ export async function runWmsOrderPushSweepCore(
     for (const link of links) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
+      if (refuseRequeue(link, 'VALIDATION_FAILED')) continue
       // o3d-2k5r r2/r3: THE RE-QUEUE READS THE SHARED RULE, not its own re-derivation of it.
       //
       // This pass's only outcome is "put the order back in createCandidates", and that query
@@ -1378,7 +1395,7 @@ export async function runWmsOrderPushSweepCore(
   // Runs BEFORE the create pass, like the revalidation pass and for the same reason: a link this
   // sweep re-queues is pushed on this tick rather than the next.
   if (externalWarehouseByWarehouse.size > 0 && port.ambiguousCreateLinks && !warehouseHeld) {
-    const { links, total } = await port.ambiguousCreateLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+    const { links, total } = await (createFloor ? port.ambiguousCreateLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize, createFloor) : port.ambiguousCreateLinks(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize))
     if (total > links.length) {
       console.warn(
         `[wms-order-push] ${total} orders are parked AMBIGUOUS_CREATE and still create-eligible; `
@@ -1390,6 +1407,7 @@ export async function runWmsOrderPushSweepCore(
     for (const link of links) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
+      if (refuseRequeue(link, 'AMBIGUOUS_CREATE')) continue
       const ts = now()
       // The same first gate the revalidation pass applies, from the same shared rule: a link that
       // positively records a warehouse order must never be re-opened, whatever the policy says.
@@ -1510,7 +1528,7 @@ export async function runWmsOrderPushSweepCore(
     // Orders paid before the live-from instant can never be created by IMS (the seam shadows them without changing their eligibility or
     // their place in the oldest-first queue), so a full batch of them would be reselected every sweep and starve the orders behind it.
     // They are left out of the query. No floor (the hold is not enforced, or not live): the legacy call, exactly.
-    const paidNotBefore = wmsCreateObligationFloor(connectorId, producerContext)
+    const paidNotBefore = createFloor
     const candidates = paidNotBefore
       ? await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize, paidNotBefore)
       : await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
@@ -2396,6 +2414,7 @@ export async function runWmsOrderPushSweepCore(
   }
 
   if (shadowedCount > 0) result.shadowed = shadowedCount
+  if (recoveryRefusedCount > 0) result.recoveryRefusedPreCutoff = recoveryRefusedCount
   return result
 }
 
@@ -2493,7 +2512,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         where: { connector, active: true, connection: { active: true } },
         select: { warehouseId: true, externalWarehouseId: true },
       }),
-    releasableHeldOrders: (connector, limit) =>
+    releasableHeldOrders: (connector, limit, paidNotBefore) =>
       db.wmsOrderPushLink.findMany({
         where: {
           connector,
@@ -2505,13 +2524,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           // goods back on the pick line. The bound-warehouse half is deliberately absent: the
           // create pass re-checks it, and an unbound warehouse is a reason not to CREATE, not a
           // reason to keep a cancelled warehouse order's id on the link.
-          order: WMS_CREATE_ELIGIBLE_ORDER_FENCES,
+          order: paidNotBefore ? { ...WMS_CREATE_ELIGIBLE_ORDER_FENCES, paidAt: { not: null, gte: paidNotBefore } } : WMS_CREATE_ELIGIBLE_ORDER_FENCES,
         },
         // cancelledAt is the affirmative remote-cancellation evidence and the order reference is
         // what the fallback probe is asked about — see WmsPushReleasableLink.
         select: {
           id: true, orderId: true, externalOrderId: true, cancelledAt: true,
-          order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
+          order: { select: { id: true, orderNumber: true, externalOrderNumber: true, paidAt: true } },
         },
         take: limit,
       }),
@@ -2521,8 +2540,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           // o3d-2k5r r6: THE predicate, from lib/domain/wms/create-eligibility.ts. This query is
           // the definition of "the sweep will create a warehouse order for this", and four other
           // readers have to agree with it; the last one written by hand agreed with half of it.
-          ...wmsCreateEligibleOrderWhere(boundWarehouseIds),
-          ...(paidNotBefore ? { paidAt: { not: null, gte: paidNotBefore } } : {}),
+          ...wmsCreateEligibleOrderWhere(boundWarehouseIds, paidNotBefore),
           OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
         },
         select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, wmsOrderPush: { select: { attempts: true } } },
@@ -2754,7 +2772,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } } },
       })
     },
-    async revalidatableLinks(connector, boundWarehouseIds, limit) {
+    async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
       // o3d-92fu. The order predicate is deliberately IDENTICAL to createCandidates', because
       // this pass's only outcome is "put it back in that queue": promoting an order that
       // createCandidates would not accept would park it in PENDING_CREATE, which the
@@ -2776,7 +2794,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         connector,
         state: 'VALIDATION_FAILED',
         ...NO_WMS_ORDER_COLUMNS,
-        order: wmsCreateEligibleOrderWhere(boundWarehouseIds),
+        order: wmsCreateEligibleOrderWhere(boundWarehouseIds, paidNotBefore),
       } satisfies Prisma.WmsOrderPushLinkWhereInput
       const [rows, total] = await Promise.all([
         db.wmsOrderPushLink.findMany({
@@ -2799,7 +2817,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       ])
       return { links: rows, total }
     },
-    async ambiguousCreateLinks(connector, boundWarehouseIds, limit) {
+    async ambiguousCreateLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
       // o3d-2k5r r4. Same order predicate as createCandidates', for the reason revalidatableLinks
       // states: this pass's only outcome is "put it back in that queue", so anything that query
       // would refuse must not be promoted into PENDING_CREATE here.
@@ -2813,7 +2831,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         connector,
         state: 'AMBIGUOUS_CREATE',
         ...NO_WMS_ORDER_COLUMNS,
-        order: wmsCreateEligibleOrderWhere(boundWarehouseIds),
+        order: wmsCreateEligibleOrderWhere(boundWarehouseIds, paidNotBefore),
       } satisfies Prisma.WmsOrderPushLinkWhereInput
       const [rows, total] = await Promise.all([
         db.wmsOrderPushLink.findMany({
