@@ -58,6 +58,20 @@ test('the table agrees with what each importer actually reads: persisted columns
   precondition(t, 'columns checked against the importer source', examined)
 })
 
+/**
+ * A change to a cell that the importer would store DIFFERENTLY. A blunt "append x" is not always a difference: the importers read any text that
+ * is not 1/true/yes/y as false, so "falsex" is false again (no difference), and an origin the importer cannot resolve is kept as written.
+ */
+const BOOLEAN_COLUMNS = new Set(['preferredSupplierLocked', 'salesPriceTaxInclusive', 'oversellAllowed', 'pricesIncludeVat'])
+function meaningfulChange(column: string, c: string): string {
+  if (BOOLEAN_COLUMNS.has(column)) return c.trim() === '' ? (column === 'oversellAllowed' ? 'false' : 'true') : /^(1|true|yes|y)$/i.test(c.trim()) ? 'false' : 'true'
+  if (column === 'lifecycleStatus') return c === 'DRAFT' ? 'ARCHIVED' : 'DRAFT'
+  if (column === 'active') return /^false$/i.test(c.trim()) ? 'TRUE' : 'FALSE'
+  if (column === 'taxRateValue' || column === 'orderTaxRateValue') return c === '' ? '0.2' : String(Number(c) + 0.05)
+  if (column === 'expectedDelivery') return c === '' ? '2027-01-01' : '2027-02-02'
+  return c === '' ? '7' : /^-?\d+(\.\d+)?$/.test(c) ? String(Number(c) + 3) : `${c}x`
+}
+
 /** A difference in EACH fingerprinted column of one unit is a conflict against an otherwise identical database row. */
 test('a difference in each fingerprinted column of each step is a conflict (and an identical row is not)', (t) => {
   let arms = 0
@@ -73,7 +87,7 @@ test('a difference in each fingerprinted column of each step is a conflict (and 
     for (const column of columns) {
       const index = data.header.indexOf(column)
       assert.ok(index >= 0, `${step}.${column} is a template column`)
-      const rows = data.rows.map((row, i) => (baseUnit.rowIndexes.includes(i) ? { ...row, cells: row.cells.map((c, ci) => (ci === index ? (c === '' ? '7' : /^-?\d+(\.\d+)?$/.test(c) ? String(Number(c) + 3) : `${c}x`) : c)) } : row))
+      const rows = data.rows.map((row, i) => (baseUnit.rowIndexes.includes(i) ? { ...row, cells: row.cells.map((c, ci) => (ci === index ? meaningfulChange(column, c) : c)) } : row))
       const changed = keyStep(step, { header: data.header, rows })
       const unit = changed.units.find((u) => u.key === baseUnit.key)
       assert.ok(unit, `${step}.${column}: the changed row still keys the same`)

@@ -193,6 +193,10 @@ export function boundLockAcquisition<C>(
 export function createSessionAdvisoryLockPool(purpose: string, max: number): Pool {
   const { config, reestablish } = sessionLockRoute(purpose)
   const pool = new Pool({ ...config, max })
+  // An IDLE connection that fails (the server restarted, a firewall dropped the socket) is reported on the POOL, and pg-pool throws an 'error' event that
+  // nobody listens to as an uncaught exception. Nothing is held on an idle connection, so the right response is to let pg-pool discard it. A CHECKED-OUT client
+  // (the one a lock lives on) has its own listener in pinned-advisory-lock.ts, which is what marks the lock lost.
+  pool.on('error', () => undefined)
   const discard = (client: PoolClient) => client.release(true)
   // The deadline is applied whether or not an override is set: the affinity proof runs on EVERY
   // session-lock connection, so every one of them can stall on it.

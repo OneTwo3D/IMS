@@ -257,6 +257,17 @@ export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
 export const ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE = 411_220_874
 
 /**
+ * Per-STEP single-runner lock of the first-load apply runner (suppliers, products, opening-stock, purchase-orders).
+ *
+ * Two-int form, `pg_try_advisory_lock(namespace, stepNumber)`, SESSION-scoped on a pinned connection and held for the
+ * whole step (the read, the importer calls and the accounting read-back), because a transaction-scoped lock cannot
+ * span the importers' own per-row transactions. Taken with the TRY form: a second runner is told it is not alone and
+ * stops, it does not queue behind a load that may take minutes. One step number per step, in the runner's load order
+ * (the numbers are the 1-based positions in APPLY_STEP_IDS and are asserted equal to it).
+ */
+export const FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE = 411_220_875
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -300,6 +311,7 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,
   ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
   ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE,
+  FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

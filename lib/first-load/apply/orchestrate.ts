@@ -80,6 +80,18 @@ export class StaleJournalError extends Error {
   }
 }
 
+/**
+ * Thrown by `withStepLock` when the step cannot be run under its lock: another runner holds it (`busy`), the lock's connection failed while the step ran
+ * (`lost`: the exclusion is gone, so the step must stop), or it could not be taken (`unavailable`). The run record is NOT touched on any of them: a runner
+ * that does not hold the lock has no business moving the record the holder is moving.
+ */
+export class StepLockError extends Error {
+  constructor(readonly reason: 'busy' | 'lost' | 'unavailable') {
+    super(`the step lock was not available (${reason})`)
+    this.name = 'StepLockError'
+  }
+}
+
 export interface VerificationItem {
   id: string
   result: 'pass' | 'fail'
@@ -94,6 +106,11 @@ export interface ApplyPorts {
     save(record: RunRecord, expectedVersion: number | null): Promise<void>
   }
   observe(step: ApplyStepId): Promise<StepObservation>
+  /**
+   * Rails evaluated once, before anything is written (plan and apply alike), with the facts the core knows: whether a run record already exists.
+   * Returns the problems found (empty = the target may be loaded). An unreadable database throws ObservationError.
+   */
+  preflight?(facts: { resuming: boolean }): Promise<string[]>
   withStepLock<T>(step: ApplyStepId, body: () => Promise<T>): Promise<T>
   /** Rails re-evaluated at the start of a step and again just before its first write. Returns the problems found (empty = still holds). */
   recheckRails?(step: ApplyStepId, phase: 'step-start' | 'before-first-write'): Promise<string[]>
@@ -234,12 +251,24 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   })
   const anyConflict = prepared.steps.some((s) => hasConflict(classified.get(s.step)!))
 
+  // The run record is read (never written) in both modes: the rails need to know whether this is a fresh load or a resume.
+  let existing: RunRecord | null
+  try {
+    existing = await ports.journal.load()
+    if (ports.preflight) {
+      const problems = await ports.preflight({ resuming: existing !== null })
+      if (problems.length > 0) return finish('PRECONDITION_REFUSED', problems, planSteps, existing)
+    }
+  } catch (error) {
+    if (error instanceof ObservationError) return finish('PRECONDITION_REFUSED', [`the database could not be read (${describeError(error)}); an unreadable state is never assumed to be empty`], planSteps, null)
+    throw error
+  }
+
   if (options.mode === 'plan') {
     return finish(anyConflict ? 'PRECONDITION_REFUSED' : 'OK', anyConflict ? ['the database holds data that conflicts with the files; see the conflicts per step (a plan writes nothing)'] : [], planSteps, null)
   }
 
   // ---- Run record: create, or resume the SAME load ----------------------------------------------------------------------------------
-  const existing = await ports.journal.load()
   if (existing === null && options.resume) return finish('PRECONDITION_REFUSED', ['--resume was given but no run record exists for this database'], planSteps, null)
   if (existing !== null) {
     if (!options.resume) return finish('PRECONDITION_REFUSED', ['a run record already exists in this database; this command refuses to start a second load over it (use --resume for the same load)'], planSteps, existing)
@@ -283,7 +312,7 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
     try {
       outcome = await ports.withStepLock(step.step, () => runStep(step, ports, persist))
     } catch (error) {
-      if (error instanceof StaleJournalError) return finish('STEP_FAILED', [error.message], results, record)
+      if (error instanceof StaleJournalError || error instanceof StepLockError) return finish('STEP_FAILED', [`${step.step}: ${error.message}`], results, record)
       if (error instanceof ObservationError) {
         const failed = { ...emptyResult(step.step, 'FAILED'), error: describeError(error) }
         results.push(failed)

@@ -2,9 +2,11 @@
 
 The first-load tool (`npm run first-load:prepare`, see [first-load-input-spec.md](first-load-input-spec.md)) turns the owner's exports into importer files and proves what it can without a database. The **apply runner** loads those files into an empty installation through the application's own importers. This page documents the part of the runner that exists today: **the core**, which reads and verifies a prepared run from bytes, works out which rows still have to be loaded, and drives the steps (plan, apply, resume) through ports.
 
-**What is not built yet:** the database side (reading the target, the importer calls with the system-actor capability, the run table, the single-runner lock, the restore point), the post-run verification and census, the command-line shell with its rehearsal mode, and the go/no-go check. Nothing in the core opens a database connection, a socket or a child process; it reads files and writes only its evidence files. Mintsoft, Xero and WooCommerce are never touched.
+**What exists today:** the **core**, which reads and verifies a prepared run from bytes, works out which rows still have to be loaded, and drives the steps (plan, apply, resume) through ports; and the **database side** (`lib/first-load/apply/db/`), the real implementations of those ports: reading the target, calling the application's own importers as a system actor, the durable run record, the per-step lock and the database rails. The core opens no database connection, socket or child process; the database side opens only the connections to the target it is pointed at (`DATABASE_URL`) and never touches the network. Mintsoft, Xero and WooCommerce are never touched.
 
-The code is in `lib/first-load/apply/`: `constants.ts` (every constant and operator sentence), `manifest.ts` (the operator's manifest), `prepared.ts` (load and verify), `keys.ts` (natural keys and fingerprints), `residual.ts` (what is still to load), `orchestrate.ts` (plan, apply, resume), `report.ts` and `io.ts`.
+**What is not built yet:** the restore point, the rails that read the outbound-write hold, the connectors and the crons, the post-run verification and census, the command-line shell with its rehearsal mode (which is what picks the target and confirms its name and system id), and the go/no-go check.
+
+The code is in `lib/first-load/apply/`: `constants.ts` (every constant and operator sentence), `manifest.ts` (the operator's manifest), `prepared.ts` (load and verify), `keys.ts` (natural keys and fingerprints), `normal-form.ts` (what "the same value" means, in one place), `residual.ts` (what is still to load), `import-calls.ts` (how a file is cut into importer calls), `orchestrate.ts` (plan, apply, resume), `report.ts` and `io.ts`; and in `lib/first-load/apply/db/`: `observe.ts`, `execute.ts`, `journal.ts`, `lock.ts`, `rails.ts` and `ports.ts`.
 
 ## What a load is
 
@@ -149,28 +151,89 @@ the prepared run contains a transfers file; the runner cannot load transfers (th
 
 ## Coverage of the apply-time checks
 
-Every id of `APPLY_TIME_CHECKS` (see [first-load-input-spec.md](first-load-input-spec.md)) has exactly one row. `file-side` is proved from the files by the core; `partial` has a file part proved by the core and a part that needs IMS, which is the database slice's; `database` is the database slice's alone; `not-applicable` means the runner refuses the whole area.
+Every id of `APPLY_TIME_CHECKS` (see [first-load-input-spec.md](first-load-input-spec.md)) has exactly one row. `file-side` is proved from the files by the core; `partial` has a file part proved by the core and a part that needs IMS, which the database side proves; `database` is the database side's alone; `not-applicable` means the runner refuses the whole area.
 
-| Id | Status | What the core does |
+| Id | Status | What the core does | What the database side does |
+| --- | --- | --- | --- |
+| warehouse-exists | partial | The warehouse codes the files use must equal the codes declared in the apply manifest (expectWarehouses). That each exists in IMS with that profile is read from the database. | Rail warehouses: each declared warehouse exists, is active, is unique under upper-casing and has exactly the declared type, availableForSale and syncToStore. Checked before the run, at the start of every step and before its first write. |
+| base-currency | partial | The apply manifest, the prepared report and the supported base currency (GBP) must agree. The organisation row is read from the database. | Rail base currency: the organisation's base currency (GBP when there is no row, as the importers read it) equals the manifest's. |
+| opening-stock-empty | partial | Stock history on a product and warehouse that is not this run's opening layer is a conflict (FOREIGN_HISTORY) and stops the run. Reading that history is the database slice's. | observe reads every stock level, cost layer and movement per product and warehouse. A pair that is not exactly one opening layer, its one opening movement and a matching stock level is FOREIGN_HISTORY. |
+| po-supplier-exists | partial | Every purchase-order supplier must be a supplier of the suppliers file, which the same run loads first. | Nothing more is needed: the supplier is loaded by the same run, and an order whose stored supplier differs from the file is FIELDS_DIFFER. |
+| po-fx-rate | partial | Every non-base order's fxRateToBase must equal the rate the apply manifest states for the currency, and every stated rate must be used. That IMS holds a rate within 2% is read from the database. | Rail FX rates: each stated rate has a stored base-to-currency rate on or before today and is within the importer's 2% tolerance of it. The runner never writes a rate. |
+| po-tax-rate | database | Needs the IMS tax rates. | Rail tax rates: every line tax resolves to an active purchase rate (by name, trimmed and case-insensitive, else by value within 0.00005), and every order-level tax name exists with exactly that spelling, because createPurchaseOrder looks it up case-exactly. |
+| lookup-keys-unique-in-ims | partial | Inside the files, no two suppliers, products, stock pairs or orders may differ only in letter case. A look-alike already in the database is a conflict (CASE_COLLISION). | observe keys every row by the importer's own key and its upper-case form. A different key with the same upper-case form is CASE_COLLISION, and a repeated key is DUPLICATE_IN_DATABASE. |
+| po-reference-free | partial | An order whose reference already exists with the same content is skipped as existing; with different content it is a conflict. Reading the references is the database slice's. | observe reads every order by reference. The same reference with the same content is skipped, and with different content (including any status other than DRAFT) is FIELDS_DIFFER. |
+| po-product-lifecycle | database | Needs the lifecycle of products that are only in IMS. | Covered by construction: the runner loads into an empty database, the products an order uses are the files' own, and a product nobody in this run emitted is FOREIGN_ROW. The importer itself refuses a product that is not active or draft, and the order then shows as not loaded. |
+| transfer-reference-free | not-applicable | The runner refuses a prepared run that contains transfers. | Not applicable. |
+| transfer-source-stock | not-applicable | The runner refuses a prepared run that contains transfers. | Not applicable. |
+| barcode-free | database | Needs the barcodes already in IMS. | The empty-target rail refuses a database that already holds products, and a product nobody in this run emitted is FOREIGN_ROW. The importer also refuses a barcode already in use. |
+| product-parent-exists | file-side | Every VARIANT's parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot. | The stored parent SKU of a variant is part of the product fingerprint. |
+
+## The database side
+
+`createDbPorts(prepared, { operator })` returns the ports the core is handed. The target is whatever `DATABASE_URL` names, because that is where the importers write; the command-line shell (not built yet) is what picks and confirms it, and refuses anything but an empty or rehearsal database. These ports add the data-level refusal: a first run needs an empty target (below).
+
+### Observe
+
+`observe(step)` reads what the database holds and reduces each row to the core's key and fingerprint strings. A database row is turned back into **the cells the importer would have read to write it** and run through the same functions as the file's cells (`normal-form.ts`), so no formatting rule lives in the reader. The rules, all in `normal-form.ts`:
+
+- a blank cell takes the importer's default (stock unit `pcs`, oversell allowed, lifecycle ACTIVE, base currency, product type SIMPLE, a purchase order's rate 1);
+- numbers are plain decimals without trailing zeros; booleans are the importers' own reading (1, true, yes, y);
+- a country is the ISO code the importer resolves (an origin it cannot resolve stays as written, so the stored row, which has none, is reported as different); a category is its normalised path; a supplier's preferred supplier is compared by lower-cased name;
+- the product's legacy `active` flag is derived from the lifecycle on the file side, and read as stored on the database side, so a stored row whose two disagree is reported;
+- a percentage tax value (20) and a fraction (0.2) are the same value, and a delivery date without a time is midnight UTC;
+- **a purchase order line carries the amount entered after its discount**, because the stored unit cost is the net of VAT and discount and cannot be turned back into the entered cost exactly. The amount is `quantity x unit cost - discount` to 4 decimal places on the file side, and the stored line total (plus the stored tax when prices include VAT) on the database side. A line names its tax by name, by value or not at all; the database side shows the same form (a line that names nothing inherits the order's tax, which the file does not state). The same applies to an order's currency when the file leaves it blank (the supplier's currency applies).
+
+What each step reads:
+
+| Step | Key | Notes |
 | --- | --- | --- |
-| warehouse-exists | partial | The warehouse codes the files use must equal the codes declared in the apply manifest (expectWarehouses). That each exists in IMS with that profile is read from the database. |
-| base-currency | partial | The apply manifest, the prepared report and the supported base currency (GBP) must agree. The organisation row is read from the database. |
-| opening-stock-empty | partial | Stock history on a product and warehouse that is not this run's opening layer is a conflict (FOREIGN_HISTORY) and stops the run. Reading that history is the database slice's. |
-| po-supplier-exists | partial | Every purchase-order supplier must be a supplier of the suppliers file, which the same run loads first. |
-| po-fx-rate | partial | Every non-base order's fxRateToBase must equal the rate the apply manifest states for the currency, and every stated rate must be used. That IMS holds a rate within 2% is read from the database. |
-| po-tax-rate | database | Needs the IMS tax rates. |
-| lookup-keys-unique-in-ims | partial | Inside the files, no two suppliers, products, stock pairs or orders may differ only in letter case. A look-alike already in the database is a conflict (CASE_COLLISION). |
-| po-reference-free | partial | An order whose reference already exists with the same content is skipped as existing; with different content it is a conflict. Reading the references is the database slice's. |
-| po-product-lifecycle | database | Needs the lifecycle of products that are only in IMS. |
-| transfer-reference-free | not-applicable | The runner refuses a prepared run that contains transfers. |
-| transfer-source-stock | not-applicable | The runner refuses a prepared run that contains transfers. |
-| barcode-free | database | Needs the barcodes already in IMS. |
-| product-parent-exists | file-side | Every VARIANT's parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot. |
+| suppliers | lower-cased, trimmed name | |
+| products | exact SKU | The recipe is the component list. For a BOM it is also the manufacturing BOM: a BOM is matching only when both representations say the same thing, so a recipe that exists in one only is RECIPE_DIFFERS. |
+| opening-stock | UPPER SKU and UPPER warehouse code | A pair is clean only when it holds exactly one opening layer, its one opening movement, and a stock level equal to the layer with nothing reserved. Anything else on a pair (another layer, another movement, a different quantity, a reservation) is FOREIGN_HISTORY. A stock level row of zero with nothing else is not history. |
+| purchase-orders | reference | Status is part of the fingerprint: an order that is not DRAFT is different. |
 
-## Rails the database slice adds
+A read that fails is an `ObservationError` with a fixed sentence (the driver's text can carry a connection string or a value and is dropped). It is never an empty observation. The unreadable cases are tested by making a table unreadable and by making the run record unreadable.
 
-The core takes these through ports and does not implement them: target identity, empty database, base-currency lock, outbound-write hold, connector and cron state, warehouse existence and profile, tax rates, FX rows, the restore point, the single-runner lock and the post-run verification and census. Each is re-checked inside the step lock; the core calls `recheckRails` at the start of every step and again just before its first write, and a rail that no longer holds ends the step as STEP_FAILED, resumable.
+### Execute
+
+`execute` calls the application's own importers (`importSuppliersCsv`, `importProductsCsv`, `importOpeningStockCsv`, `importPurchaseOrdersCsv`) with the system-import context (see `system-import-capability.ts`): no session check, no `revalidatePath`, no queued WooCommerce push or stock sync, and the activity-log row names the actor (kind `system`, the run id, the operator label). An importer must answer with the system outcome; an answer without it (the web path) is refused, and so is a preview. An importer that refuses the file itself (an error and no outcome) is recorded as an error to account for.
+
+Calls are cut by `planImportCalls`: independent rows (suppliers, opening stock) in calls of at most 2,000 rows; a purchase order is never split (calls are cut between orders); a products file is one call, because a variant needs its parent and a recipe needs its components in the same call. The row numbers in an importer's messages are shifted to the residual file's rows. The accounting is still from the database, not from the importers' counters.
+
+### The run record
+
+`first_load_apply_runs` has **one row per database**: a unique `singleton` column makes a second row impossible, so a second load into the same database loses the insert. The record moves by compare-and-swap: `save(record, n)` is one `UPDATE ... WHERE version = n AND manifest_digest = ... AND run_id = ...` and the affected-row count is the answer, so two runners that read the same version cannot both advance it (the loser gets `StaleJournalError`). A save must advance the version by exactly one. A status or step the table does not know is refused by a CHECK constraint, and a record this runner cannot read is an unreadable state (`ObservationError`), never an absent one. It is audit and identity only: correctness never depends on it.
+
+### The step lock
+
+`withStepLock(step, body)` takes the session advisory lock `(411220875, n)`, `n` being the step's position in the load order (1 to 4), on a pinned connection, with the try form: a second runner for the same step is refused (`StepLockError`, busy) rather than queued. The lock is held for the whole step and verified at the end; if its connection died during the step (`lost`), the step does not report success. A runner holds at most one step lock at a time and releases it before the next step starts, so two runners cannot deadlock. A runner that does not hold the lock does not touch the run record. The tests observe the lock in `pg_locks`: during each importer call exactly that step's lock is held, in load order, and nothing is held between or after steps.
+
+### Rails
+
+Evaluated once before anything is written (`preflight`, plan and apply alike) and again at the start of every step and just before its first write (`recheckRails`). An unreadable value is an `ObservationError`, never a pass. The problem text names a rail, a count, or the position of an entry in the operator's manifest; it never carries a value from a prepared file (a warehouse is named "warehouse 2 of 3 in expectWarehouses").
+
+| Rail | Refuses when |
+| --- | --- |
+| base currency | the organisation's base currency (GBP when there is no row, as the importers read it) is not the manifest's |
+| forbidden SKUs | a product the manifest forbids (any case) already exists in the database |
+| empty target (a first run only) | the product, supplier, customer, purchase order, sales order or stock movement table holds a row, or the base currency is already locked, and no run record says this runner loaded them. A resume is not asked for emptiness |
+| warehouses | a warehouse the manifest declares is missing, inactive, duplicated under upper-casing, or has another type, availableForSale or syncToStore (a quarantine warehouse is declared `QUARANTINE`, not for sale, not synced, and is checked like the rest) |
+| FX rates (purchase orders) | a stated rate has no stored base-to-currency rate on or before today, or differs from it by more than the importer's 2%. The runner never writes a rate |
+| tax rates (purchase orders) | a line's tax matches no active purchase rate, or an order-level tax name has no active rate of exactly that spelling |
+
+Owner rulings, and where each is enforced: the accepted zero-cost pairs (the core compares the manifest with the file; the database side then compares each stored layer to the file, a zero cost included); products that are not stock tracked (the core refuses stock rows for them; the tests check a loaded NON_INVENTORY product has no stock level, layer or movement); forbidden SKUs (the core refuses a file that carries one; the database rail refuses a database that holds one); the quarantine warehouse profile (the warehouses rail).
+
+### What the database side leaves to later slices
+
+The restore point; the rails that read the outbound-write hold, the connector and cron state and the producer cut-offs; the post-run verification and the write census (so `ports.verify` is not supplied and a finished run ends APPLIED, not VERIFIED); the command-line shell, target confirmation and rehearsal mode; the go/no-go check.
 
 ## Not proven here
 
-The fingerprints are string comparisons of a normal form (numbers without trailing zeros, booleans lower-case, currencies upper-case). The database slice must build the same normal form from database rows; until it does, "present-matching" has only been exercised against an in-memory database that uses the same functions.
+- **The purchase-order line amount is compared at 4 decimal places.** The importer computes the line in floating point and rounds to 4 places; the file side computes with exact decimals. They agree on the tested inputs (a discount, VAT-inclusive prices, a six-place unit cost), but a quantity times a unit cost that lands exactly on a half at the fifth place could round differently in the two engines and show as a difference. If it ever does, the effect is a CONFLICT that stops the run, never a silent pass.
+- **A purchase-order line that inherits its tax from the order is not compared on tax** (the file does not state it, so there is nothing to compare). A line that names a tax is compared by name or by value, as it named it.
+- **The importers' own behaviour on a refused row is exercised, not modelled, for the cases the tests reach** (an existing key, a conflicting key, a crash between calls). The importer paths that need a second writer (a row taken by another writer during the call, a parent renamed mid-call) are not exercised here.
+- **System-actor calls into the real actions are exercised against a real database** (the four importers and `createPurchaseOrder` through the purchase-order importer), with WooCommerce configured and enabled and a control showing the suppressed effect would have queued a row. The permission check and `revalidatePath` are skipped by the context; nothing here proves what a future change to an importer does with the context.
+- **The session advisory lock** is proved against a direct PostgreSQL connection. Behind a transaction pooler a session lock excludes nobody; the lock-pool factory measures that, but a pooled production deployment has not been exercised.
+- **Only a first run into an empty database is rail-checked for emptiness.** A resume trusts the run record's digest and then the row-by-row residual; it does not re-prove that nothing but this runner wrote since.
+- **The run record, the stock layers and the logs are written with the application's own clock**, so an opening layer is dated at the apply instant (the plan's ruling), not at the export time.
