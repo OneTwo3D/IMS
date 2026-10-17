@@ -10,7 +10,7 @@ import {
   producerRetiredShadowNotice,
   producerUnknownOutcomeNotice,
 } from '../../lib/security/producer-disposition-constants.ts'
-import { OUTBOUND_CONNECTORS, OUTBOUND_GRANT_ENV } from '../../lib/security/outbound-write-hold-constants.ts'
+import { OUTBOUND_CONNECTORS, OUTBOUND_GRANT_ENV, outboundHeldMessage } from '../../lib/security/outbound-write-hold-constants.ts'
 import { xeroBeforeCutoffRefusal, xeroNotBeforeCutoffWhere } from '../../lib/domain/accounting/xero-producer-seam.ts'
 import { outboxBeforeCutoffWhere, outboxRowBeforeCutoff } from '../../lib/domain/integrations/outbox.ts'
 import {
@@ -170,7 +170,7 @@ test('Xero retirement: SHADOW only on a positive record that nothing was attempt
 
 test('outbox retirement: SHADOW only for a job nobody has touched or whose only outcome is a verified hold refusal; attempts and vanished claims are PARKED', () => {
   const job = (over: Partial<Parameters<typeof classifyOutboxJob>[0]> = {}) => ({
-    status: 'PENDING', attempts: 0, lastError: null, lockedAt: null, lockedBy: null, createdAt: LONG_AGO, updatedAt: LONG_AGO, ...over,
+    status: 'PENDING', attempts: 0, lastError: null, lockedAt: null, lockedBy: null, createdAt: LONG_AGO, updatedAt: LONG_AGO, attemptHistoryTracked: true, firstAttemptedAt: null as Date | null, ...over,
   })
   const d = (row: ReturnType<typeof job>) => classifyOutboxJob(row, NOW).disposition
   assert.equal(d(job()), 'SHADOW')
@@ -180,17 +180,27 @@ test('outbox retirement: SHADOW only for a job nobody has touched or whose only 
   assert.equal(d(job({ status: 'RETRYABLE_FAILED', lastError: 'something went wrong' })), 'PARK', 'attempts 0 with an ordinary error is not a hold')
   assert.equal(d(job({ status: 'RETRYABLE_FAILED', lastError: 'Outbound write HELD (Xero): forged [hold-ref 0000000000000000]' })), 'PARK', 'an unverifiable hold text proves nothing')
   assert.equal(d(job({ lastError: 'x' })), 'PARK')
+  // THE DURABLE HISTORY: a replay resets attempts to 0 and clears the error, and a later hold refusal leaves attempts at 0, so the visible fields
+  // describe a never-attempted job. Only the first-attempt stamp tells the truth.
+  const held = outboundHeldMessage({ connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/wp-json/x', hop: 0 })
+  assert.equal(d(job({ status: 'RETRYABLE_FAILED', attempts: 0, lastError: held })), 'SHADOW', 'CONTROL: a genuine hold refusal on a job with no recorded claim is shadowed')
+  assert.equal(d(job({ status: 'RETRYABLE_FAILED', attempts: 0, lastError: held, firstAttemptedAt: LONG_AGO })), 'PARK', 'REPLAYED AFTER AN ATTEMPT: parked, never shadowed')
+  assert.equal(d(job({ firstAttemptedAt: LONG_AGO })), 'PARK', 'a re-armed job that was claimed before')
+  assert.equal(d(job({ attemptHistoryTracked: false })), 'PARK', 'a row from before the history: unknown is parked, even when it looks untouched')
+  assert.equal(d(job({ status: 'RETRYABLE_FAILED', lastError: held, attemptHistoryTracked: false })), 'PARK')
   assert.equal(d(job({ status: 'PROCESSING', lockedAt: LONG_AGO, lockedBy: 'w' })), 'PARK', 'claimed and never completed')
   assert.equal(d(job({ status: 'PROCESSING', lockedAt: new Date(NOW.getTime() - 1000), lockedBy: 'w' })), 'SKIP')
 })
 
 test('Mintsoft retirement: a bare queued link with no history is SHADOW; any attempt is PARKED; a link naming a warehouse order is left alone', () => {
   const link = (over: Partial<Parameters<typeof classifyWmsPushLink>[0]> = {}) => ({
-    state: 'PENDING_CREATE', attempts: 0, lastAttemptAt: null, lastError: null, externalOrderId: null, externalOrderNumber: null, pushedAt: null, ...over,
+    state: 'PENDING_CREATE', attempts: 0, lastAttemptAt: null, lastError: null, externalOrderId: null, externalOrderNumber: null, pushedAt: null, claimHistoryTracked: true, firstClaimedAt: null as Date | null, ...over,
   })
   const d = (row: ReturnType<typeof link>) => classifyWmsPushLink(row).disposition
   assert.equal(d(link()), 'SHADOW')
   assert.equal(d(link({ attempts: 1 })), 'PARK')
+  assert.equal(d(link({ firstClaimedAt: LONG_AGO })), 'PARK', 'a release or replay cleared attempts and the attempt time, but not the durable claim')
+  assert.equal(d(link({ claimHistoryTracked: false })), 'PARK', 'a link from before the history: unknown is parked')
   assert.equal(d(link({ lastAttemptAt: LONG_AGO })), 'PARK')
   assert.equal(d(link({ lastError: 'timeout' })), 'PARK')
   assert.equal(d(link({ externalOrderId: 'M-9' })), 'SKIP')

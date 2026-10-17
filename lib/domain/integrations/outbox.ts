@@ -59,6 +59,9 @@ export type IntegrationOutboxRow = {
   lockedBy: string | null
   createdAt: Date
   updatedAt: Date
+  /** Durable attempt history (see the schema): true only when this row's claims stamp `firstAttemptedAt`; absent / false = unknown. */
+  attemptHistoryTracked?: boolean
+  firstAttemptedAt?: Date | null
 }
 
 type IntegrationOutboxDelegate = {
@@ -608,6 +611,8 @@ export async function enqueueIntegrationOutbox<C extends string>(
         lastError: null,
         lockedAt: null,
         lockedBy: null,
+        // This binary stamps the first claim, so for a row it creates "no first claim recorded" is a positive record of "never claimed".
+        attemptHistoryTracked: true,
       },
     })) as never
   } catch (error) {
@@ -662,6 +667,9 @@ export async function claimIntegrationOutboxWork(
             status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
             lockedAt: now,
             lockedBy: options.workerId,
+            // The durable attempt history: the FIRST claim is stamped here, before any request can leave, and nothing but a hold-refused claim that
+            // created the stamp itself ever clears it (markIntegrationOutboxRetryableFailure). A replay, a re-arm or a retry leave it alone.
+            ...(row.firstAttemptedAt ? {} : { firstAttemptedAt: now }),
           },
         })
         return result.count > 0
@@ -678,6 +686,7 @@ export async function claimIntegrationOutboxWork(
         status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         lockedAt: now,
         lockedBy: options.workerId,
+        ...(row.firstAttemptedAt ? {} : { firstAttemptedAt: now }),
       },
     })
     if (result.count === 0) continue
@@ -718,7 +727,7 @@ export async function markIntegrationOutboxRetryableFailure(
   // hold lasted longer than the retry budget. The job stays retryable, keeps its attempt count, and is
   // offered again after OUTBOUND_HELD_RETRY_DELAY_MS, for as long as the hold lasts.
   if (isOutboundWriteHeldText(errorMessage(options.error))) {
-    return updateClaimedOutboxRow(client, {
+    const heldRow = await updateClaimedOutboxRow(client, {
       id: options.id,
       workerId: options.workerId,
       lockedAt: options.lockedAt,
@@ -730,6 +739,13 @@ export async function markIntegrationOutboxRetryableFailure(
         lockedBy: null,
       },
     })
+    // A hold refuses a request before it leaves. If THIS claim is the one that created the first-attempt stamp (the stamp equals its own claim
+    // time), nothing has ever left for this job, so the stamp is withdrawn; a stamp from any earlier claim never equals this one and stays.
+    await client.integrationOutbox.updateMany({
+      where: { id: options.id, attemptHistoryTracked: true, firstAttemptedAt: options.lockedAt },
+      data: { firstAttemptedAt: null },
+    })
+    return heldRow
   }
 
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)

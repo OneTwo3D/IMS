@@ -172,6 +172,9 @@ export type OutboxRetirementRow = {
   lockedBy: string | null
   createdAt: Date
   updatedAt: Date
+  /** The durable attempt history: shadowing needs `attemptHistoryTracked` and an empty `firstAttemptedAt`. Unknown is never "never sent". */
+  attemptHistoryTracked: boolean
+  firstAttemptedAt: Date | null
 }
 
 /** A job nobody has touched since it was inserted differs from its creation by at most this much (two clocks, one statement). */
@@ -199,6 +202,15 @@ export function classifyOutboxJob(row: OutboxRetirementRow, now: Date): Retireme
   if (row.attempts > 0) {
     return { disposition: 'PARK', reason: `${row.attempts} attempt(s) were counted against it and it was not completed` }
   }
+  // THE DURABLE HISTORY. `attempts` and `lastError` are reset by an operator replay and by a re-arm, so a job that was attempted, replayed
+  // and then refused by the hold looks exactly like one never attempted. Only the first-attempt stamp survives those, and only a row created
+  // by a binary that writes it can vouch for itself: a row from before the column (or created by an older binary) is UNKNOWN, and unknown is parked.
+  if (!row.attemptHistoryTracked) {
+    return { disposition: 'PARK', reason: 'its attempt history was not recorded (it predates the history), so an earlier attempt cannot be ruled out' }
+  }
+  if (row.firstAttemptedAt !== null) {
+    return { disposition: 'PARK', reason: 'a worker has claimed it before, and the claim is not known to have been refused before anything left' }
+  }
   if (row.status === INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED && isOutboundWriteHeldText(row.lastError)) {
     return { disposition: 'SHADOW', reason: 'its only recorded outcome is a refusal by the outbound-write hold, which is made before anything leaves' }
   }
@@ -220,6 +232,9 @@ export type WmsLinkRetirementRow = {
   externalOrderId: string | null
   externalOrderNumber: string | null
   pushedAt: Date | null
+  /** The durable claim history: shadowing needs `claimHistoryTracked` and an empty `firstClaimedAt`. Resets never touch either. */
+  claimHistoryTracked: boolean
+  firstClaimedAt: Date | null
 }
 
 /**
@@ -235,10 +250,10 @@ export function classifyWmsPushLink(link: WmsLinkRetirementRow): RetirementClass
   if (link.externalOrderId || link.externalOrderNumber || link.pushedAt) {
     return { disposition: 'SKIP', reason: 'the link names a warehouse order, so it is not an unsent create' }
   }
-  if (link.attempts === 0 && link.lastAttemptAt === null && link.lastError === null) {
-    return { disposition: 'SHADOW', reason: 'the link records no attempt, no attempt time and no error' }
+  if (link.attempts === 0 && link.lastAttemptAt === null && link.lastError === null && link.claimHistoryTracked && link.firstClaimedAt === null) {
+    return { disposition: 'SHADOW', reason: 'the link records no attempt, no attempt time and no error, and its durable claim history shows it was never claimed' }
   }
-  return { disposition: 'PARK', reason: `the link records ${link.attempts} attempt(s)${link.lastAttemptAt ? ' and an attempt time' : ''}, so a create may have left` }
+  return { disposition: 'PARK', reason: `a create may have left: the link records ${link.attempts} attempt(s)${link.lastAttemptAt ? ' and an attempt time' : ''}, and its claim history ${link.claimHistoryTracked ? (link.firstClaimedAt ? 'shows it was claimed' : 'shows no claim, but the other record above does not rule one out') : 'was not recorded (a release or replay may have cleared the attempt fields)'}` }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -323,7 +338,7 @@ export async function planHeldBacklogRetirement(
       },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       take,
-      select: { id: true, connector: true, operation: true, status: true, attempts: true, lastError: true, lockedAt: true, lockedBy: true, createdAt: true, updatedAt: true },
+      select: { id: true, connector: true, operation: true, status: true, attempts: true, lastError: true, lockedAt: true, lockedBy: true, createdAt: true, updatedAt: true, attemptHistoryTracked: true, firstAttemptedAt: true },
     })
     if (jobs.length === take) truncated.push({ destination, kind: 'outbox_job' })
     for (const job of jobs.slice(0, take - 1)) {
@@ -345,7 +360,7 @@ export async function planHeldBacklogRetirement(
         take,
         select: {
           id: true, state: true, attempts: true, lastAttemptAt: true, lastError: true, externalOrderId: true,
-          externalOrderNumber: true, pushedAt: true, orderId: true,
+          externalOrderNumber: true, pushedAt: true, orderId: true, claimHistoryTracked: true, firstClaimedAt: true,
           order: { select: { orderNumber: true, externalOrderNumber: true, createdAt: true } },
         },
       })
@@ -415,9 +430,11 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
     status: row.status,
     attemptRevision: row.attemptRevision,
     retryCount: row.retryCount,
-    externalTransactionId: null,
-    createDispatchedAt: null,
-    ...(verdict.disposition === 'SHADOW' ? { remoteAttemptedAt: row.remoteAttemptedAt, attemptStampingCustodyAt: { not: null } } : {}),
+    // SHADOW needs the send evidence to be ABSENT. PARK is for a row WITH send evidence (a document id, a create-dispatch marker): its guard is
+    // that evidence unchanged since it was classified, never "null", or the park of exactly the rows that need it could never land.
+    ...(verdict.disposition === 'SHADOW'
+      ? { externalTransactionId: null, createDispatchedAt: null, remoteAttemptedAt: row.remoteAttemptedAt, attemptStampingCustodyAt: { not: null } }
+      : { externalTransactionId: row.externalTransactionId, createDispatchedAt: row.createDispatchedAt, remoteAttemptedAt: row.remoteAttemptedAt }),
   }
   if (verdict.disposition === 'SHADOW') {
     const target = destinationAndOperationForSyncType(row.type)
@@ -497,7 +514,7 @@ async function retireOutboxJob(tx: Prisma.TransactionClient, item: RetirementIte
   if (verdict.disposition === 'SKIP') return { item, result: 'left_alone', detail: verdict.reason }
   const destination = item.destination
   const cleared = { nextAttemptAt: null, lockedAt: null, lockedBy: null }
-  const guard = { id: job.id, connector: job.connector, operation: job.operation, createdAt: job.createdAt, status: job.status, attempts: job.attempts, updatedAt: job.updatedAt }
+  const guard = { id: job.id, connector: job.connector, operation: job.operation, createdAt: job.createdAt, status: job.status, attempts: job.attempts, updatedAt: job.updatedAt, attemptHistoryTracked: job.attemptHistoryTracked, firstAttemptedAt: job.firstAttemptedAt }
   if (verdict.disposition === 'SHADOW') {
     // The Xero job is the delivery half of a sync row, whose own retirement records the shadow; every other job is the work itself.
     const target = destination === 'xero' ? null : ownershipTargetForOutboxOperation(`${job.connector}/${job.operation}`)
@@ -560,7 +577,7 @@ async function retireWmsPushLink(tx: Prisma.TransactionClient, item: RetirementI
     const removed = await tx.wmsOrderPushLink.deleteMany({
       where: {
         id: link.id, state: 'PENDING_CREATE', attempts: 0, lastAttemptAt: null, lastError: null,
-        externalOrderId: null, externalOrderNumber: null, pushedAt: null,
+        externalOrderId: null, externalOrderNumber: null, pushedAt: null, claimHistoryTracked: true, firstClaimedAt: null,
         ...linkCutoffWhere,
       },
     })
@@ -568,7 +585,7 @@ async function retireWmsPushLink(tx: Prisma.TransactionClient, item: RetirementI
     return { item, result: 'shadowed', detail: verdict.reason }
   }
   const parked = await tx.wmsOrderPushLink.updateMany({
-    where: { id: link.id, state: 'PENDING_CREATE', attempts: link.attempts, externalOrderId: null, pushedAt: null, ...linkCutoffWhere },
+    where: { id: link.id, state: 'PENDING_CREATE', attempts: link.attempts, lastAttemptAt: link.lastAttemptAt, firstClaimedAt: link.firstClaimedAt, externalOrderId: null, pushedAt: null, ...linkCutoffWhere },
     data: {
       state: 'AMBIGUOUS_CREATE',
       lastError: producerUnknownOutcomeNotice({ connector: item.destination, why: `The record does not show it was never sent: ${verdict.reason}.` }),

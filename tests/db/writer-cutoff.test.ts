@@ -223,7 +223,7 @@ async function seedJob(d: Deps, key: string, createdAt: Date, over: Record<strin
   return d.db.integrationOutbox.create({
     data: {
       connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false },
-      status: 'PENDING', attempts: 0, createdAt, ...over,
+      status: 'PENDING', attempts: 0, createdAt, attemptHistoryTracked: true, ...over,
     } as never,
     select: { id: true, idempotencyKey: true },
   })
@@ -467,7 +467,7 @@ async function seedLinkedOrder(d: Deps, tag: string, paidAt: Date, link: Record<
     },
     select: { id: true },
   })
-  const created = await d.db.wmsOrderPushLink.create({ data: { orderId: order.id, connector: 'mintsoft', state: 'PENDING_CREATE', ...link } as never, select: { id: true } })
+  const created = await d.db.wmsOrderPushLink.create({ data: { orderId: order.id, connector: 'mintsoft', state: 'PENDING_CREATE', claimHistoryTracked: true, ...link } as never, select: { id: true } })
   return { warehouseId: warehouse.id, orderId: order.id, linkId: created.id }
 }
 async function cleanupLinked(d: Deps, seeded: { warehouseId: string; orderId: string }) {
@@ -593,4 +593,108 @@ test('--all-queued ignores a configured cut-off in the plan AND the apply, and t
   assert.equal(d.retire.effectiveRetirementCutoff(all, 'woocommerce'), null)
   const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: plan.items.filter((i: { id: string }) => i.id === fresh.id) }, all)
   assert.equal(applied.counts.shadowed, 1, 'and the apply does not refuse the newer job on the ignored cut-off')
+})
+
+// ───────────────── the durable attempt history: a replay or release must not make an attempted unit look unsent ─────────────────
+//
+// Named mutations (each shown red in the PR): h1 the classifier ignores firstAttemptedAt; h2 the hold branch withdraws the stamp unconditionally;
+// h3 the link classifier ignores firstClaimedAt; h4 the Xero PARK guard demands null send evidence.
+
+test('OUTBOX HISTORY through the real functions: an attempted job that is REPLAYED (attempts reset, error cleared) and then refused by the hold is PARKED; a job only ever refused by the hold is SHADOWED', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const { outboxBeforeCutoffWhere: _unused, ...rest } = d.outbox as Record<string, unknown>
+  void _unused; void rest
+  const held = (await import('../../lib/security/outbound-write-hold-constants.ts')).outboundHeldMessage({
+    connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/wp-json/x', hop: 0,
+  })
+  const make = async (name: string) => {
+    const key = `woocommerce:stock.push:${tag}-${name}`
+    const row = await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false } })
+    await d.db.integrationOutbox.update({ where: { id: (row as { id: string }).id }, data: { createdAt: BEFORE } })
+    return { key, id: (row as { id: string }).id }
+  }
+  const claim = async (key: string, worker: string) => (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: worker }))[0]!
+  const refuse = (row: { id: string; lockedAt: Date | null }, worker: string, error: string) => d.outbox.markIntegrationOutboxRetryableFailure({
+    id: row.id, workerId: worker, lockedAt: row.lockedAt!, error, attemptsBeforeFailure: 0, retryDelayMs: 1000,
+  })
+  const stamp = async (id: string) => d.db.integrationOutbox.findUnique({ where: { id }, select: { firstAttemptedAt: true, attemptHistoryTracked: true, attempts: true, status: true } })
+
+  const heldOnly = await make('held-only')
+  assert.deepEqual(await stamp(heldOnly.id).then((r: { firstAttemptedAt: Date | null; attemptHistoryTracked: boolean } | null) => [r?.attemptHistoryTracked, r?.firstAttemptedAt]), [true, null], 'a new row is tracked and unclaimed')
+  const c1 = await claim(heldOnly.key, 'w1')
+  assert.notEqual((await stamp(heldOnly.id))?.firstAttemptedAt, null, 'the claim stamps the first attempt')
+  await refuse(c1, 'w1', held)
+  const afterHold = await stamp(heldOnly.id)
+  assert.deepEqual([afterHold?.firstAttemptedAt, afterHold?.attempts], [null, 0], 'a hold refusal that created the stamp withdraws it, and spends no attempt')
+
+  const replayed = await make('replayed')
+  const r1 = await claim(replayed.key, 'w2')
+  await refuse(r1, 'w2', 'connect ECONNRESET while sending')           // a real failure: the request may have left
+  assert.equal((await stamp(replayed.id))?.attempts, 1)
+  await d.db.integrationOutbox.update({ where: { id: replayed.id }, data: { status: 'PERMANENT_FAILED', nextAttemptAt: null } })
+  await withEnv({}, async () => { await d.admin.replayIntegrationOutboxAdminRow({ id: replayed.id }) })   // attempts -> 0, lastError -> null
+  const r2 = await claim(replayed.key, 'w3')
+  await refuse(r2, 'w3', held)                                        // and now only a hold refusal is left on the row
+  const afterReplay = await d.db.integrationOutbox.findUnique({ where: { id: replayed.id }, select: { attempts: true, lastError: true, firstAttemptedAt: true, status: true } })
+  console.log(`# replayed row: attempts=${afterReplay?.attempts} stamp=${afterReplay?.firstAttemptedAt ? 'kept' : 'cleared'} status=${afterReplay?.status}`)
+  assert.equal(afterReplay?.attempts, 0, 'precondition: the visible fields now look exactly like a never-attempted job')
+  assert.notEqual(afterReplay?.firstAttemptedAt, null, 'the stamp survived the replay and the later hold')
+
+  const scope = { destinations: ['woocommerce' as const], cutoffs: { woocommerce: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const mine = plan.items.filter((item: { id: string }) => item.id === heldOnly.id || item.id === replayed.id)
+  const by = (id: string) => mine.find((i: { id: string }) => i.id === id)?.classification.disposition
+  assert.equal(by(heldOnly.id), 'SHADOW', 'CONTROL: only ever refused by the hold')
+  assert.equal(by(replayed.id), 'PARK', 'attempted, replayed, then held: PARKED, never shadowed')
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
+  assert.equal((await stamp(replayed.id))?.status, 'PERMANENT_FAILED')
+  assert.equal((await stamp(heldOnly.id))?.status, 'SHADOWED')
+  assert.equal(applied.counts.parked, 1)
+})
+
+test('XERO PARK with send evidence: a row naming a document id, and a row with a create-dispatch marker, are each PARKED with the unknown-outcome text (the guard is the OBSERVED evidence, not null)', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupSync(d, tag))
+  const withId = await seedSyncLog(d, `${tag}-id`, { createdAt: BEFORE, externalTransactionId: `X-${tag}` })
+  const dispatched = await seedSyncLog(d, `${tag}-dispatch`, { createdAt: BEFORE })
+  // The database refuses the pair on INSERT and makes it write-once on UPDATE: mint it the way the dispatch does, with an UPDATE.
+  await d.db.accountingSyncLog.update({ where: { id: dispatched.id }, data: { createDispatchedAt: new Date(Date.now() - 3600_000), createDispatchIdempotencyKey: `dispatch-${tag}` } })
+  const scope = { destinations: ['xero' as const], cutoffs: { xero: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const mine = plan.items.filter((item: { id: string }) => item.id === withId.id || item.id === dispatched.id)
+  assert.deepEqual(mine.map((i: { classification: { disposition: string } }) => i.classification.disposition), ['PARK', 'PARK'])
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
+  assert.deepEqual([applied.counts.parked, applied.counts.changed_since_plan], [2, 0], 'both land: neither is reported as changed since planning')
+  for (const row of [withId, dispatched]) {
+    const after = await d.db.accountingSyncLog.findUnique({ where: { id: row.id }, select: { status: true, errorMessage: true, settlementBasis: true } })
+    assert.equal(after?.status, 'FAILED')
+    assert.match(String(after?.errorMessage), /outcome unknown: check Xero before acting/)
+    assert.notEqual(after?.settlementBasis, 'HELD_SHADOW')
+  }
+})
+
+test('LINK HISTORY: a link that was claimed and then reset (attempts and attempt time cleared, as a release or replay does) is PARKED; the real claim stamps the history', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  const reset = await seedLinkedOrder(d, `${tag}r`, BEFORE, { firstClaimedAt: new Date(Date.now() - 86_400_000) })
+  const claimed = await seedLinkedOrder(d, `${tag}c`, BEFORE, {})
+  t.after(async () => { for (const s of [reset, claimed]) await cleanupLinked(d, s) })
+  // The real claim on a link that has none: it stamps firstClaimedAt, then a release-style reset clears everything else.
+  await d.db.wmsOrderPushLink.delete({ where: { id: claimed.linkId } })
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const outcome = await port.claimForCreate(claimed.orderId, 'mintsoft', new Date())
+  assert.equal(outcome, 'CLAIMED')
+  const stamped = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: claimed.orderId }, select: { id: true, firstClaimedAt: true, claimHistoryTracked: true } })
+  assert.deepEqual([stamped?.claimHistoryTracked, stamped?.firstClaimedAt !== null], [true, true])
+  await d.db.wmsOrderPushLink.update({ where: { id: stamped!.id }, data: { attempts: 0, lastAttemptAt: null, lastError: null, state: 'PENDING_CREATE' } })
+  const scope = { destinations: ['mintsoft' as const], cutoffs: { mintsoft: CUTOFF }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const ids = new Set([reset.linkId, stamped!.id])
+  const mine = plan.items.filter((item: { id: string }) => ids.has(item.id))
+  assert.deepEqual(mine.map((i: { classification: { disposition: string } }) => i.classification.disposition), ['PARK', 'PARK'])
+  await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
+  for (const id of ids) assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { id }, select: { state: true } }))?.state, 'AMBIGUOUS_CREATE')
 })

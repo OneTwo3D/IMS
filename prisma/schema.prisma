@@ -3392,6 +3392,11 @@ model IntegrationOutbox {
   lockedBy       String?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+  /// Durable attempt history for the held-backlog retirement. `attemptHistoryTracked` is true only for rows created by a binary that writes
+  /// `firstAttemptedAt` at claim time; false = unknown (every row that existed before the column), and unknown is never "never sent".
+  /// `firstAttemptedAt` is never cleared by a replay or a re-arm.
+  attemptHistoryTracked Boolean   @default(false) @map("attempt_history_tracked")
+  firstAttemptedAt      DateTime? @map("first_attempted_at")
 
   @@index([status, nextAttemptAt])
   @@index([connector, operation, status, nextAttemptAt])
@@ -3608,6 +3613,11 @@ model WmsOrderPushLink {
   /// q66in.4.4: when the order reconcile last verified this link against the
   /// WMS — the capped daily sweep rotates least-recently-checked first.
   reconcileCheckedAt     DateTime?
+  /// Durable claim history for the held-backlog retirement: `claimHistoryTracked` true only for links created by a binary that stamps
+  /// `firstClaimedAt` when the create is first claimed (before any request can leave); false = unknown. Resets (release, revalidation,
+  /// replay) clear `lastAttemptAt` and `attempts` but never this.
+  claimHistoryTracked    Boolean   @default(false) @map("claim_history_tracked")
+  firstClaimedAt         DateTime? @map("first_claimed_at")
   /// o3d-bjc: when the DISPATCH sweep last verified this link's WMS state
   /// (via the Order/List delta OR the throttled per-order reconcile). The
   /// batched reconcile pass orders by this (nulls first) so links beyond the
