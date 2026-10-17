@@ -344,34 +344,51 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
       default: header[column] = ''
     }
   }
-  // Lines: the non-tax part is exact; the tax token takes the form the matching FILE line used (name, value or none).
-  const remaining = [...(parsedFile?.lines ?? [])]
-  const lines = po.lines.map((line) => {
+  // Lines. A stored line is compared with the FILE's lines as a MULTISET: each stored line is paired with a file line it satisfies, by a complete matching, so two lines that
+  // are identical except for their tax can be paired either way round and a valid order is never reported different because of the order the lines were tried in.
+  //
+  // WHAT THE IMPORTER STORES (resolvePurchaseLineTaxRates, with no tax id from the importer):
+  //   line names a tax                 -> that rate (resolved by name, then value);
+  //   line names none, order tax named -> the active rate of EXACTLY the order's name (the order's effective name: the order column, else the first row's line name);
+  //   line names none, order tax none  -> NO rate. (The supplier's default rate is not used.)
+  // A stored line SATISFIES a file line when it holds exactly what the importer would have stored for it.
+  const orderName = (po.taxRateName ?? '').trim()
+  const stored = po.lines.map((line) => {
     const total = new D(line.totalForeign.toFixed())
     const amount = po.pricesIncludeVat ? total.plus(new D(line.taxForeign.toFixed())) : total
-    const prefix = linePrefix({
-      sku: line.product.sku, qty: new D(line.qty.toFixed()), amount, discount: new D(line.discountAmount.toFixed()), discountStr: line.discountStr ?? '',
-    })
-    const at = remaining.findIndex((candidate) => candidate.startsWith(`${prefix}|`))
-    const token = at === -1 ? null : remaining.splice(at, 1)[0].slice(prefix.length + 1)
-    const byName = line.taxRate ? `n:${line.taxRate.name.trim().toLowerCase()}` : ''
-    const byValue = line.taxRate ? `v:${fmtFixed(new D(line.taxRate.rate.toFixed()), 4)}` : ''
-    // WHAT THE IMPORTER STORES (resolvePurchaseLineTaxRates, with no tax id from the importer):
-    //   line names a tax                -> that rate (resolved by name, then value);
-    //   line names none, order tax named -> the active rate of EXACTLY the order's name (the order's name is its effective name: the order column, else the first row's line name);
-    //   line names none, order tax none  -> NO rate. (The supplier's default rate is not used.)
-    // So a blank file token is blank on the database side ONLY when the stored line tax is exactly that; anything else (a missing tax where the order names one,
-    // a tax where there should be none, another rate) is shown and is a difference.
-    const orderName = (po.taxRateName ?? '').trim()
+    const prefix = linePrefix({ sku: line.product.sku, qty: new D(line.qty.toFixed()), amount, discount: new D(line.discountAmount.toFixed()), discountStr: line.discountStr ?? '' })
+    const name = line.taxRate ? line.taxRate.name.trim().toLowerCase() : null
+    const rate4 = line.taxRate ? fmtFixed(new D(line.taxRate.rate.toFixed()), 4) : null
     // When the order states a value too (taxRatePercent), the order's rate must have that value.
-    const sameAsOrderValue = line.taxRate !== null && (po.taxRatePercent === null || fmtFixed(new D(line.taxRate.rate.toFixed()), 4) === fmtFixed(new D(po.taxRatePercent.toFixed()), 4))
+    const sameAsOrderValue = rate4 !== null && (po.taxRatePercent === null || rate4 === fmtFixed(new D(po.taxRatePercent.toFixed()), 4))
     const inheritedOk = orderName === '' ? line.taxRate === null : line.taxRate !== null && line.taxRate.name.trim() === orderName && sameAsOrderValue
-    const byNameAndValue = line.taxRate ? `${byName}@${fmtFixed(new D(line.taxRate.rate.toFixed()), 4)}` : ''
-    const shown = token === null ? byName
-      : token === '' ? (inheritedOk ? '' : (line.taxRate === null ? 'missing' : byNameAndValue))
-        : token.startsWith('v:') ? byValue
-          : token.includes('@') ? byNameAndValue : byName
-    return `${prefix}|${shown}`
+    return { prefix, name, rate4, inheritedOk }
   })
+  const satisfies = (line: (typeof stored)[number], fileLine: string): boolean => {
+    if (!fileLine.startsWith(`${line.prefix}|`)) return false
+    const token = fileLine.slice(line.prefix.length + 1)
+    if (token === '') return line.inheritedOk
+    if (token.startsWith('v:')) return line.rate4 !== null && token === `v:${line.rate4}`
+    const named = /^n:(.*)@(\d+\.\d{4})$/.exec(token)
+    if (named) return line.name !== null && line.name === named[1] && line.rate4 === named[2]
+    return token.startsWith('n:') && line.name !== null && line.name === token.slice(2)
+  }
+  const fileLines = parsedFile?.lines ?? []
+  // Kuhn's augmenting-path matching: stored line -> file line.
+  const owner = new Array<number>(fileLines.length).fill(-1)
+  const tryPair = (i: number, seen: boolean[]): boolean => {
+    for (let j = 0; j < fileLines.length; j++) {
+      if (seen[j] || !satisfies(stored[i], fileLines[j])) continue
+      seen[j] = true
+      if (owner[j] === -1 || tryPair(owner[j], seen)) { owner[j] = i; return true }
+    }
+    return false
+  }
+  let paired = 0
+  for (let i = 0; i < stored.length; i++) if (tryPair(i, new Array<boolean>(fileLines.length).fill(false))) paired++
+  const lines = paired === stored.length && stored.length === fileLines.length
+    ? [...fileLines]
+    // No complete pairing: show what is stored, marked so that it can never equal a file's line.
+    : stored.map((line) => `${line.prefix}|!${line.name === null ? 'none' : `n:${line.name}@${line.rate4}`}`)
   return JSON.stringify({ ...header, status: po.status, lines: lines.sort() })
 }

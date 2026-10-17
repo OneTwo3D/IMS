@@ -3,6 +3,7 @@ import { describe, it, mock } from 'node:test'
 
 import type { CsvImportActionResult } from '../../lib/csv-import'
 import type { ResidualFile } from '../../lib/first-load/apply/residual'
+import { NO_LOCK } from './apply-helpers'
 import { precondition } from './helpers'
 
 /**
@@ -36,7 +37,7 @@ describe('the executor', () => {
     calls.length = 0
     respond = () => ({ created: 2, updated: 0, skipped: 1, errors: [], system: outcome })
     const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
-    const result = await createExecutor({ runId: 'run-1', operator: 'Op', maxRowsPerCall: 2 })('suppliers', residual(5))
+    const result = await createExecutor({ runId: 'run-1', operator: 'Op', maxRowsPerCall: 2 })('suppliers', residual(5), NO_LOCK)
     assert.deepEqual({ c: result.created, s: result.skipped }, { c: 6, s: 3 })
     assert.deepEqual(calls.map((c) => c.rows), [2, 2, 1])
     assert.ok(calls.every((c) => c.systemPresent))
@@ -48,14 +49,14 @@ describe('the executor', () => {
     calls.length = 0
     respond = () => ({ created: 1, updated: 0, skipped: 0, errors: [] })
     const { createExecutor, IMPORTER_RETURNED_NO_SYSTEM_OUTCOME } = await import('../../lib/first-load/apply/db/execute')
-    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1)), new Error(IMPORTER_RETURNED_NO_SYSTEM_OUTCOME))
+    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1), NO_LOCK), new Error(IMPORTER_RETURNED_NO_SYSTEM_OUTCOME))
   })
 
   it('an importer that refuses the file itself (an error, no outcome) is an error to account for, not a thrown web-path call', async () => {
     calls.length = 0
     respond = () => ({ created: 0, updated: 0, skipped: 0, errors: [], error: 'File exceeds maximum size', success: false })
     const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
-    const result = await createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1))
+    const result = await createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1), NO_LOCK)
     assert.deepEqual(result.errors, ['File exceeds maximum size'])
     assert.equal(result.created, 0)
   })
@@ -64,14 +65,14 @@ describe('the executor', () => {
     calls.length = 0
     respond = () => ({ preview: true, dryRun: true, validRows: 1, invalidRows: 0, warnings: [], errors: [], proposedChanges: { created: 1, updated: 0, skipped: 0 } })
     const { createExecutor, IMPORTER_RETURNED_A_PREVIEW } = await import('../../lib/first-load/apply/db/execute')
-    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1)), new Error(IMPORTER_RETURNED_A_PREVIEW))
+    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1), NO_LOCK), new Error(IMPORTER_RETURNED_A_PREVIEW))
   })
 
   it('a row number in a later call\'s message is shifted by the rows sent before it', async () => {
     calls.length = 0
     respond = () => ({ created: 0, updated: 0, skipped: 1, errors: [`Row 2: supplier name matches multiple suppliers`], system: outcome })
     const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
-    const result = await createExecutor({ runId: 'run-1', operator: 'Op', maxRowsPerCall: 3 })('suppliers', residual(6))
+    const result = await createExecutor({ runId: 'run-1', operator: 'Op', maxRowsPerCall: 3 })('suppliers', residual(6), NO_LOCK)
     assert.deepEqual(result.errors, ['Row 2: supplier name matches multiple suppliers', 'Row 5: supplier name matches multiple suppliers'])
   })
 

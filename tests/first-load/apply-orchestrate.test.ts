@@ -9,7 +9,7 @@ import { CONFLICT_CODES, REHEARSAL_RECORD_FORMAT_VERSION, REPORT_CONFLICT_FIELDS
 import { StepLockError, runLoad, type ApplyOptions, type ApplyResult, type RunRecord } from '../../lib/first-load/apply/orchestrate.ts'
 import { ObservationError } from '../../lib/first-load/apply/residual.ts'
 import { buildApplyReport, renderApplyJson, renderApplyMarkdown } from '../../lib/first-load/apply/report.ts'
-import { FakeDatabase, loadOk, prepareSynthetic, preparedFiles } from './apply-helpers.ts'
+import { FakeDatabase, NO_LOCK, loadOk, prepareSynthetic, preparedFiles } from './apply-helpers.ts'
 import { precondition } from './helpers.ts'
 
 const files = preparedFiles(prepareSynthetic())
@@ -124,7 +124,7 @@ test('reports never carry importer error text or exception messages: only a code
   const SECRET_EXCEPTION = 'SENTINEL-EXCEPTION-SECRET-77'
   const runs: ApplyResult[] = []
   const a = setup()
-  runs.push(await runLoad(a.prepared, a.db.ports({ execute: async (step, file) => { const r = await a.db.ports().execute(step, file); return step === 'suppliers' ? { ...r, errors: [`Row 7: order ${SECRET_FILE_VALUE} already exists`, `unexpected ${SECRET_EXCEPTION}`] } : r } }), a.options()))
+  runs.push(await runLoad(a.prepared, a.db.ports({ execute: async (step, file, lock) => { const r = await a.db.ports().execute(step, file, lock); return step === 'suppliers' ? { ...r, errors: [`Row 7: order ${SECRET_FILE_VALUE} already exists`, `unexpected ${SECRET_EXCEPTION}`] } : r } }), a.options()))
   const b = setup()
   runs.push(await runLoad(b.prepared, b.db.ports({ execute: async () => { throw new Error(`password=${SECRET_EXCEPTION}`) } }), b.options()))
   const c = setup()
@@ -146,7 +146,7 @@ test('reports never carry importer error text or exception messages: only a code
 test('report rows carry only the declared identifier fields: unit key plus closed words; no other cell, importer text or exception text', async (t) => {
   const { prepared, db, options } = setup()
   db.dropRecipeFor.add('ZQSENT-GIFT-SET')
-  const failed = await runLoad(prepared, db.ports({ execute: async (step, file) => { const r = await db.ports().execute(step, file); return step === 'suppliers' ? { ...r, errors: ['Row 3: free text from the importer SENTINEL-IMPORTER-TEXT'] } : r } }), options())
+  const failed = await runLoad(prepared, db.ports({ execute: async (step, file, lock) => { const r = await db.ports().execute(step, file, lock); return step === 'suppliers' ? { ...r, errors: ['Row 3: free text from the importer SENTINEL-IMPORTER-TEXT'] } : r } }), options())
   const second = setup()
   second.db.foreignHistory = ['ZQSENT-LEG-01|ZQSENT-MAIN']
   const conflicted = await runLoad(second.prepared, second.db.ports(), second.options())
@@ -323,7 +323,7 @@ test('an unreadable database in the middle of the run is a resumable STEP_FAILED
   const { prepared, db, options } = setup()
   const ports = db.ports({
     execute: async (step, file) => {
-      const answer = await db.ports().execute(step, file)
+      const answer = await db.ports().execute(step, file, NO_LOCK)
       if (step === 'products') db.unreadable = true
       return answer
     },

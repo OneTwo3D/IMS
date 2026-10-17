@@ -12,7 +12,7 @@ import { StaleJournalError, StepLockError, runLoad, type ApplyOptions, type Appl
 import { planImportCalls } from '../../lib/first-load/apply/import-calls'
 import { buildResidual, classifyStep, ObservationError } from '../../lib/first-load/apply/residual'
 import type { PreparedRun } from '../../lib/first-load/apply/prepared'
-import { loadOk, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
+import { loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
 import { precondition } from './helpers'
 
 /**
@@ -78,6 +78,7 @@ const PO_THREE = `${TAG}-PO-3`
 const PO_FOUR = `${TAG}-PO-4`
 const PO_FIVE = `${TAG}-PO-5`
 const PO_SIX = `${TAG}-PO-6`
+const PO_SEVEN = `${TAG}-PO-7`
 const SUPPLIER_A = `${TAG} Odd Supplier`
 const SUPPLIER_B = `${TAG} Euro Supplier`
 const ODD_FILES: Record<ApplyStepId, StepRows> = {
@@ -224,7 +225,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const files = buildResidual(step, ODD_FILES[step], classified)
         assert.ok(files.length > 0, `${step}: there is something to load`)
         for (const file of files) {
-          const answer = await execute(step, file)
+          const answer = await execute(step, file, NO_LOCK)
           assert.deepEqual(answer.errors.filter((e) => !/already exists/.test(e)), [], `${step}: the real importer accepted every row`)
         }
       }
@@ -390,7 +391,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const keyed = keyStep('purchase-orders', data)
         assert.deepEqual(keyed.problems, [])
         const file = buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!
-        const answer = await execute('purchase-orders', file)
+        const answer = await execute('purchase-orders', file, NO_LOCK)
         assert.deepEqual(answer.errors, [], 'the importer accepted the order')
         loaded.push(keyed.units[0]!)
         return keyed.units[0]!
@@ -413,6 +414,44 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.equal(classifyStep('purchase-orders', [six], { entries: [await entry(PO_SIX)] }).units[0]!.conflict?.code, 'FIELDS_DIFFER')
         } finally { await m.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.2' } }) }
       } finally { await cleanup(PO_FIVE, PO_SIX) }
+    })
+
+    it('two lines identical except for their tax (one names a tax, one inherits the order\'s different tax) are matched as a multiset, in either order, and are not a false conflict', async () => {
+      // The old greedy pairing took the first file line with the same prefix for the first stored line and derived the tax from THAT one; with the lines the other way round it
+      // reported a valid order as different for ever.
+      const execute = m.execute.createExecutor({ runId: 'multiset', operator: 'Multiset Test' })
+      const orderTax = await m.db.taxRate.create({ data: { name: `${VAT_NAME} multiset`, rate: '0.05', usedFor: 'PURCHASE', active: true } })
+      const loaded: Array<(typeof units)['purchase-orders'][number]> = []
+      const stub = { steps: [{ step: 'purchase-orders', get units() { return [...units['purchase-orders'], ...loaded] } }] } as unknown as PreparedRun
+      try {
+        for (const rowsInOrder of [['explicit', 'inherit'], ['inherit', 'explicit']] as const) {
+          const key = rowsInOrder[0] === 'explicit' ? PO_SEVEN : `${PO_SEVEN}-B`
+          const common = { orderKey: key, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '2', unitCostForeign: '3', orderTaxRateName: orderTax.name, orderTaxRateValue: '5' }
+          const data = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, rowsInOrder.map((kind) => (kind === 'explicit' ? { ...common, taxRateName: VAT_NAME } : common)))
+          const keyed = keyStep('purchase-orders', data)
+          assert.deepEqual(keyed.problems, [])
+          const answer = await execute('purchase-orders', buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!, NO_LOCK)
+          assert.deepEqual(answer.errors, [])
+          loaded.push(keyed.units[0]!)
+          const entry = (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!
+          assert.deepEqual(differingColumns(keyed.units[0]!.fingerprint, entry.fingerprint), [], `rows ${rowsInOrder.join(' then ')}: matches`)
+          // And a real difference is still seen: the inheriting line stored with the explicit rate instead.
+          const lines = await m.db.purchaseOrderLine.findMany({ where: { po: { reference: key } }, select: { id: true, taxRateId: true } })
+          const vat = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME }, select: { id: true } })
+          const inheriting = lines.find((l) => l.taxRateId === orderTax.id)!
+          await m.db.purchaseOrderLine.update({ where: { id: inheriting.id }, data: { taxRateId: vat.id } })
+          try {
+            const changed = (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!
+            assert.deepEqual(differingColumns(keyed.units[0]!.fingerprint, changed.fingerprint), ['lines'])
+          } finally { await m.db.purchaseOrderLine.update({ where: { id: inheriting.id }, data: { taxRateId: orderTax.id } }) }
+        }
+      } finally {
+        for (const key of [PO_SEVEN, `${PO_SEVEN}-B`]) {
+          await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key])
+          await sql('delete from purchase_orders where reference = $1', [key])
+        }
+        await m.db.taxRate.delete({ where: { id: orderTax.id } }).catch(() => undefined)
+      }
     })
 
     it('a BOM whose manufacturing recipe is missing is NOT matching, although its component list is there', async () => {
@@ -917,6 +956,35 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual(await held(), [])
       })
 
+      it('two runners in ONE process on the SAME step: the first one\'s dead connection is not vouched for by the second one\'s live lock', async () => {
+        // Mutation named: check the lock by namespace and step only (not by this handle\'s own backend) and ignore the handle\'s own lost flag -> A passes on B\'s lock and keeps writing.
+        let aHandle!: { assertLive(): Promise<void> }
+        let releaseA!: () => void
+        const aGate = new Promise<void>((resolve) => { releaseA = resolve })
+        let aEntered!: () => void
+        const aInside = new Promise<void>((resolve) => { aEntered = resolve })
+        const a = m.lock.withStepLock('products', async (lock) => { aHandle = lock; aEntered(); await aGate; return 'a' })
+        await aInside
+        await aHandle.assertLive() // control: A's lock is live
+        // Kill A's connection; wait until the server has released the lock.
+        await sql(`select pg_terminate_backend(pid) from pg_locks where locktype = 'advisory' and classid = $1 and objsubid = 2`, [LOCK_NAMESPACE])
+        for (let i = 0; i < 100 && (await held()).length > 0; i++) await new Promise((r) => setTimeout(r, 50))
+        // B takes the same step's lock and holds it.
+        let releaseB!: () => void
+        const bGate = new Promise<void>((resolve) => { releaseB = resolve })
+        let bEntered!: () => void
+        const bInside = new Promise<void>((resolve) => { bEntered = resolve })
+        const b = m.lock.withStepLock('products', async (lock) => { await lock.assertLive(); bEntered(); await bGate; return 'b' })
+        await bInside
+        assert.deepEqual((await held()).map((r) => r.objid), [2], 'precondition: B holds the products lock')
+        await assert.rejects(aHandle.assertLive(), (e: unknown) => e instanceof StepLockError && e.reason === 'lost')
+        releaseA()
+        await assert.rejects(a, (e: unknown) => e instanceof StepLockError && e.reason === 'lost')
+        releaseB()
+        assert.equal(await b, 'b')
+        assert.deepEqual(await held(), [])
+      })
+
       it('a lock whose connection dies mid-step is reported as LOST, never as a finished step', async () => {
         // Mutation named: drop the assertHeld after the body -> the step reports success although another runner may have started.
         let kill!: () => Promise<void>
@@ -974,10 +1042,10 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const real = ports()
         const spying: ApplyPorts = {
           ...real,
-          execute: async (step, file) => {
+          execute: async (step, file, lock) => {
             const rows = await sql<{ objid: number }>('select objid from pg_locks where locktype = $1 and classid = $2 and objsubid = 2 and granted order by objid', ['advisory', LOCK_NAMESPACE])
             order.push({ step, held: rows.map((r) => r.objid) })
-            return real.execute(step, file)
+            return real.execute(step, file, lock)
           },
         }
         const result = await runLoad(prepared, spying, apply(prepared))
@@ -1021,12 +1089,12 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
               let sent = 0
               for (const call of calls_) {
                 if (++calls > 2) throw new Error('simulated crash between importer calls')
-                await small(step, { ...file, bytes: call.bytes, rows: call.rows })
+                await small(step, { ...file, bytes: call.bytes, rows: call.rows }, NO_LOCK)
                 sent++
               }
               return { created: sent, updated: 0, skipped: 0, errors: [] }
             }
-            return small(step, file)
+            return small(step, file, NO_LOCK)
           },
         }
         const first = await runLoad(prepared, crashing, apply(prepared))
@@ -1037,7 +1105,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
 
         const sent: Array<{ step: ApplyStepId; rows: number }> = []
         const spyReal = ports()
-        const resumed = await runLoad(prepared, { ...spyReal, execute: async (step, file) => { sent.push({ step, rows: file.rows }); return spyReal.execute(step, file) } }, apply(prepared, { resume: true }))
+        const resumed = await runLoad(prepared, { ...spyReal, execute: async (step, file, lock) => { sent.push({ step, rows: file.rows }); return spyReal.execute(step, file, lock) } }, apply(prepared, { resume: true }))
         assert.equal(resumed.exit, 'APPLIED_UNVERIFIED', resumed.problems.join('; '))
         const stock = prepared.steps.find((s) => s.step === 'opening-stock')!
         assert.deepEqual(sent.filter((s) => s.step === 'opening-stock'), [{ step: 'opening-stock', rows: stock.units.length - loadedBefore }], 'only the pairs not yet written were sent')
@@ -1086,7 +1154,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const file = buildResidual('suppliers', ODD_FILES.suppliers, classifyStep('suppliers', keyed.units, { entries: [] }))[0]!
         const before = await count('activity_logs')
         // The second supplier is a duplicate name of the first in another case: its call reports a row-level message for ITS file's row 2.
-        const result = await execute('suppliers', file)
+        const result = await execute('suppliers', file, NO_LOCK)
         const logged = (await count('activity_logs')) - before
         assert.equal(logged, 2, 'one activity row per importer call: two calls')
         assert.equal(result.created, 2)
@@ -1094,7 +1162,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         // A row-level message from the second call is shifted by the first call's rows.
         await m.db.supplier.create({ data: { name: SUPPLIER_B.toUpperCase() } })
         await m.db.supplier.create({ data: { name: SUPPLIER_B.toLowerCase() } })
-        const again = await execute('suppliers', file)
+        const again = await execute('suppliers', file, NO_LOCK)
         assert.ok(again.errors.some((e) => /Row 3\b/.test(e)), `the second call's row 2 is reported as row 3 of the residual file: ${again.errors.join(' | ')}`)
       })
     })

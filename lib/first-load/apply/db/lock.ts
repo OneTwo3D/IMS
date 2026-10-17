@@ -12,43 +12,39 @@ import { FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { db } from '@/lib/db'
 import { AdvisoryLockLostError, acquirePinnedAdvisoryLockOrNull, type PinnedAdvisoryLock } from '@/lib/db/pinned-advisory-lock'
 import { APPLY_STEP_IDS, type ApplyStepId } from '../constants'
-import { StepLockError } from '../orchestrate'
+import { StepLockError, type StepLock } from '../orchestrate'
 
 /** The lock number of a step: its 1-based position in APPLY_STEP_IDS. */
 export function stepLockNumber(step: ApplyStepId): number {
   return APPLY_STEP_IDS.indexOf(step) + 1
 }
 
-/** The locks this process holds, by step: a lock is registered and cleared under its own step, so concurrent steps cannot overwrite each other. */
-const held = new Map<ApplyStepId, PinnedAdvisoryLock>()
-
 /**
- * Called before EVERY bounded importer call: the step lock must still be ours. Two proofs, because a dead connection is only noticed by the
- * pinned client when the socket error arrives: the client's own flag, and the server's view (`pg_locks`: the lock is granted to the backend we
- * took it on). Anything else throws StepLockError('lost') and no further rows are written.
- *
- * RESIDUAL, stated plainly: this is a check BEFORE a call, not a fence inside the importer's own transactions. A call already in flight when the
- * lock is lost runs to its end (at most one bounded call: IMPORT_CALL_MAX_ROWS rows, or a whole products file).
+ * The handle `withStepLock` gives its body: it proves THIS acquisition's lock is still ours, and nothing else. There is no module-level state: two runners in one
+ * process, even on the same step, each hold their own handle, so one runner's live lock can never vouch for another's dead one.
  */
-export async function assertStepLockLive(step: ApplyStepId): Promise<void> {
-  const lock = held.get(step)
-  if (lock === undefined) throw new StepLockError('lost')
-  try {
-    lock.assertHeld(`an importer call of the ${step} step`)
-  } catch {
-    throw new StepLockError('lost')
+function liveCheck(step: ApplyStepId, lock: PinnedAdvisoryLock): StepLock {
+  return {
+    async assertLive(): Promise<void> {
+      try {
+        lock.assertHeld(`an importer call of the ${step} step`)
+      } catch {
+        throw new StepLockError('lost')
+      }
+      if (lock.backendPid === null) throw new StepLockError('lost')
+      let rows: Array<{ n: bigint }>
+      try {
+        // The server's view: the lock is granted to the very backend this handle took it on.
+        rows = await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND classid = ${FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE}::oid AND objid = ${stepLockNumber(step)}::oid AND objsubid = 2 AND granted AND pid = ${lock.backendPid}`
+      } catch {
+        throw new StepLockError('unavailable')
+      }
+      if (Number(rows[0]?.n ?? 0) !== 1) throw new StepLockError('lost')
+    },
   }
-  if (lock.backendPid === null) throw new StepLockError('lost')
-  let rows: Array<{ n: bigint }>
-  try {
-    rows = await db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND classid = ${FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE}::oid AND objid = ${stepLockNumber(step)}::oid AND objsubid = 2 AND granted AND pid = ${lock.backendPid}`
-  } catch {
-    throw new StepLockError('unavailable')
-  }
-  if (Number(rows[0]?.n ?? 0) !== 1) throw new StepLockError('lost')
 }
 
-export async function withStepLock<T>(step: ApplyStepId, body: () => Promise<T>): Promise<T> {
+export async function withStepLock<T>(step: ApplyStepId, body: (lock: StepLock) => Promise<T>): Promise<T> {
   let lock
   try {
     lock = await acquirePinnedAdvisoryLockOrNull(stepLockNumber(step), FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE)
@@ -56,10 +52,9 @@ export async function withStepLock<T>(step: ApplyStepId, body: () => Promise<T>)
     throw new StepLockError('unavailable')
   }
   if (lock === null) throw new StepLockError('busy')
-  held.set(step, lock)
   try {
     lock.assertHeld(`the ${step} step`)
-    const result = await body()
+    const result = await body(liveCheck(step, lock))
     // The exclusion is only as good as its connection: if it failed during the step, another runner may have started, and this step must not report success.
     lock.assertHeld(`finishing the ${step} step`)
     return result
@@ -67,7 +62,6 @@ export async function withStepLock<T>(step: ApplyStepId, body: () => Promise<T>)
     if (error instanceof AdvisoryLockLostError) throw new StepLockError('lost')
     throw error
   } finally {
-    if (held.get(step) === lock) held.delete(step)
     await lock.release()
   }
 }

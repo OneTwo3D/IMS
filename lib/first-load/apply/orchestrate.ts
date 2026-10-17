@@ -92,6 +92,11 @@ export class StepLockError extends Error {
   }
 }
 
+/** What a step lock lends the step's body: a check, bound to THAT acquisition, that the lock is still held. Importer calls are made only after it passes. */
+export interface StepLock {
+  assertLive(): Promise<void>
+}
+
 export interface VerificationItem {
   id: string
   result: 'pass' | 'fail'
@@ -111,12 +116,13 @@ export interface ApplyPorts {
    * Returns the problems found (empty = the target may be loaded). An unreadable database throws ObservationError.
    */
   preflight?(facts: { resuming: boolean }): Promise<string[]>
-  withStepLock<T>(step: ApplyStepId, body: () => Promise<T>): Promise<T>
+  withStepLock<T>(step: ApplyStepId, body: (lock: StepLock) => Promise<T>): Promise<T>
   /** Rails re-evaluated at the start of a step and again just before its first write. Returns the problems found (empty = still holds). */
   recheckRails?(step: ApplyStepId, phase: 'step-start' | 'before-first-write'): Promise<string[]>
   /** Persist a residual file exclusively (the file is evidence); optional. */
   storeResidual?(file: ResidualFile): Promise<void>
-  execute(step: ApplyStepId, file: ResidualFile): Promise<ImporterResult>
+  /** `lock` is the handle of the step lock this call runs under; an executor that makes several importer calls checks it before each. */
+  execute(step: ApplyStepId, file: ResidualFile, lock: StepLock): Promise<ImporterResult>
   verify?(run: PreparedRun, steps: StepResult[]): Promise<VerificationItem[]>
 }
 
@@ -313,7 +319,7 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   for (const step of prepared.steps) {
     let outcome: StepOutcome
     try {
-      outcome = await ports.withStepLock(step.step, () => runStep(step, ports, persist))
+      outcome = await ports.withStepLock(step.step, (lock) => runStep(step, ports, persist, lock))
     } catch (error) {
       if (error instanceof StaleJournalError || error instanceof StepLockError) return finish('STEP_FAILED', [`${step.step}: ${error.message}`], results, record)
       if (error instanceof ObservationError) {
@@ -392,6 +398,7 @@ async function runStep(
   step: PreparedStep,
   ports: ApplyPorts,
   persist: (patch: Partial<RunRecord>, step?: { id: ApplyStepId; journal: StepJournal }) => Promise<void>,
+  lock: StepLock,
 ): Promise<StepOutcome> {
   const id = step.step
   const fail = (exit: ApplyExitName, problems: string[], result: StepResult): StepOutcome => ({ result, halt: { exit, problems } })
@@ -423,7 +430,7 @@ async function runStep(
     await persist({ currentStep: id }, { id, journal: { status: 'RUNNING', emitted: result.emitted, created: 0, updated: 0, skippedExisting: 0, failed: 0, residualSha256: residual.map((r) => r.sha256) } })
     for (const file of residual) {
       try {
-        const answer = await ports.execute(id, file)
+        const answer = await ports.execute(id, file, lock)
         result.importer.push({ file: file.name, created: answer.created, updated: answer.updated, skipped: answer.skipped, errors: summariseImporterErrors(answer.errors) })
       } catch (error) {
         result.error = `the importer failed on ${file.name}: ${describeError(error)}`

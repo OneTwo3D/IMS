@@ -17,8 +17,8 @@ import type { PreparedRun } from '../prepared'
 import { createExecutor } from './execute'
 import { createJournal } from './journal'
 import { db } from '@/lib/db'
-import { StepLockError } from '../orchestrate'
-import { assertStepLockLive, withStepLock } from './lock'
+import { StepLockError, type StepLock } from '../orchestrate'
+import { withStepLock } from './lock'
 import { observeStep } from './observe'
 import { evaluateRails } from './rails'
 
@@ -33,8 +33,9 @@ export interface DbPortsOptions {
 
 /** Before every importer call: the step lock is live (pg_locks), and the run record is still this load's and still running. */
 function guardBeforeCall(prepared: PreparedRun) {
-  return async (step: ApplyStepId): Promise<void> => {
-    await assertStepLockLive(step)
+  return async (_step: ApplyStepId, lock: StepLock): Promise<void> => {
+    if (!lock) throw new StepLockError('lost')
+    await lock.assertLive()
     let row
     try {
       row = await db.firstLoadApplyRun.findFirst({ select: { manifestDigest: true, runId: true, status: true } })
