@@ -76,6 +76,8 @@ const PO_ONE = `${TAG}-PO-1`
 const PO_TWO = `${TAG}-PO-2`
 const PO_THREE = `${TAG}-PO-3`
 const PO_FOUR = `${TAG}-PO-4`
+const PO_FIVE = `${TAG}-PO-5`
+const PO_SIX = `${TAG}-PO-6`
 const SUPPLIER_A = `${TAG} Odd Supplier`
 const SUPPLIER_B = `${TAG} Euro Supplier`
 const ODD_FILES: Record<ApplyStepId, StepRows> = {
@@ -376,6 +378,43 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       }
     })
 
+    it('a line that names a tax AND states its value: the named rate\'s value is what is stored and compared, so a rate of another value, now or later, is a difference', async () => {
+      // Mutation named: drop the "@value" from the line token (the old fingerprint) -> the changed-later arm and the stored-at-10% arm are green when they must be red.
+      const execute = m.execute.createExecutor({ runId: 'tax-value', operator: 'Tax Value Test' })
+      const loaded: Array<(typeof units)['purchase-orders'][number]> = []
+      const stub = { steps: [{ step: 'purchase-orders', get units() { return [...units['purchase-orders'], ...loaded] } }] } as unknown as PreparedRun
+      const rate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME }, select: { id: true } })
+      const orderRows = (key: string) => stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: key, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', taxRateName: VAT_NAME, taxRateValue: '20', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' }])
+      const load = async (key: string) => {
+        const data = orderRows(key)
+        const keyed = keyStep('purchase-orders', data)
+        assert.deepEqual(keyed.problems, [])
+        const file = buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!
+        const answer = await execute('purchase-orders', file)
+        assert.deepEqual(answer.errors, [], 'the importer accepted the order')
+        loaded.push(keyed.units[0]!)
+        return keyed.units[0]!
+      }
+      const entry = async (key: string) => (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!
+      const storedTax = async (key: string) => (await sql<{ tax: string }>(`select l."taxForeign"::text as tax from purchase_order_lines l join purchase_orders p on p.id = l."poId" where p.reference = $1`, [key]))[0]!.tax
+      const cleanup = async (...keys: string[]) => { for (const key of keys) { await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key]); await sql('delete from purchase_orders where reference = $1', [key]) } }
+      try {
+        // (a) loaded while the rate IS 20%: matches; the rate then changes to 10%: that surfaces.
+        const five = await load(PO_FIVE)
+        assert.equal(Number(await storedTax(PO_FIVE)), 20, 'control: 20% of 100')
+        assert.deepEqual(differingColumns(five.fingerprint, (await entry(PO_FIVE)).fingerprint), [], 'control: matches as loaded')
+        await m.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.1' } })
+        try {
+          assert.deepEqual(differingColumns(five.fingerprint, (await entry(PO_FIVE)).fingerprint), ['lines'], 'a later change of the named rate\'s value surfaces')
+          // (b) loaded while the rate is 10% although the file states 20: the importer takes the NAME, stores 10%, and the load is reported as different.
+          const six = await load(PO_SIX)
+          assert.equal(Number(await storedTax(PO_SIX)), 10, 'the importer applied the named rate (10%), not the stated 20')
+          assert.deepEqual(differingColumns(six.fingerprint, (await entry(PO_SIX)).fingerprint), ['lines'])
+          assert.equal(classifyStep('purchase-orders', [six], { entries: [await entry(PO_SIX)] }).units[0]!.conflict?.code, 'FIELDS_DIFFER')
+        } finally { await m.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.2' } }) }
+      } finally { await cleanup(PO_FIVE, PO_SIX) }
+    })
+
     it('a BOM whose manufacturing recipe is missing is NOT matching, although its component list is there', async () => {
       // Mutation named: drop the BOM branch in observeProducts -> the recipe equals the file's and this arm is green when it must be red.
       const bom = await m.db.product.findUniqueOrThrow({ where: { sku: `${TAG}-BOM` }, select: { id: true, manufacturingBom: { select: { id: true } } } })
@@ -588,6 +627,31 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual(await check(), [], 'control: no such product')
         await m.db.product.create({ data: { sku: 'zqsent-ghost', name: 'ruled out' } })
         try { assert.match((await check()).join(';'), /forbidden SKUs: 1 product\(s\) the manifest forbids already exist/) } finally { await m.db.product.delete({ where: { sku: 'zqsent-ghost' } }) }
+      })
+
+      it('purchase orders: a line that names VAT and states 20 while the active rate of that name is 10% is refused before anything is written', async () => {
+        // Mutation named: drop the value comparison from the tax rail -> the run proceeds and stores 10% under a file that says 20: red.
+        await resetData()
+        const taxRate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME } })
+        const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', taxRateName: VAT_NAME, taxRateValue: '20', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' }])
+        const stepOf = { step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }
+        const stub = { ...prepared, steps: [stepOf] } as unknown as PreparedRun
+        const rail = () => m.rails.evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'purchase-orders' })
+        assert.deepEqual(await rail(), [], 'control: the stated 20 is the rate\'s value')
+        await m.db.taxRate.update({ where: { id: taxRate.id }, data: { rate: '0.1' } })
+        try {
+          const problems = (await rail()).join(';')
+          assert.match(problems, /1 line\(s\) state a tax value that is not the value of the active rate they name/)
+          assert.match(problems, /1 order\(s\) state a tax value that is not the value of the active rate they name/)
+          assert.ok(!/20|VAT/.test(problems.replace(/\d+ (line|order)\(s\)/g, '')), 'the sentence carries no value')
+          // The preflight refuses the whole run, and nothing is written.
+          const before = { runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }
+          const result = await runLoad(stub, m.ports.createDbPorts(stub, { operator: 'Apply Test' }), apply(stub))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED')
+          assert.match(result.problems.join(';'), /state a tax value that is not the value of the active rate they name/)
+          assert.deepEqual({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }, before)
+        } finally { await m.db.taxRate.update({ where: { id: taxRate.id }, data: { rate: '0.2' } }) }
+        assert.deepEqual(await rail(), [], 'restored')
       })
 
       it('purchase orders: an FX rate outside the importer\'s 2%, and a currency with no stored rate, are refused', async () => {

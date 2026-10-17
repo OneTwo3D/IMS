@@ -265,8 +265,10 @@ export function purchaseOrderHeader(columns: readonly string[], first: CellRecor
 /** How a line names its tax: by name, by value, or not at all. The importer resolves a rate by name first, then by value. */
 function fileLineTaxToken(cells: CellRecord): string {
   const name = cell(cells, 'taxRateName')
-  if (name !== '') return `n:${name.toLowerCase()}`
   const value = normaliseTaxValue(cell(cells, 'taxRateValue'))
+  // The importer resolves a line's tax BY NAME and ignores a stated value. When the file states both, the token carries the stated value too, so the
+  // database side has to show a rate of that value: a rate whose value is not the one the file states is a difference (and the rail refuses it before the load).
+  if (name !== '') return value === '' ? `n:${name.toLowerCase()}` : `n:${name.toLowerCase()}@${fmtFixed(new D(value), 4)}`
   return value === '' ? '' : `v:${fmtFixed(new D(value), 4)}`
 }
 
@@ -361,8 +363,14 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
     // So a blank file token is blank on the database side ONLY when the stored line tax is exactly that; anything else (a missing tax where the order names one,
     // a tax where there should be none, another rate) is shown and is a difference.
     const orderName = (po.taxRateName ?? '').trim()
-    const inheritedOk = orderName === '' ? line.taxRate === null : line.taxRate !== null && line.taxRate.name.trim() === orderName
-    const shown = token === null ? byName : token === '' ? (inheritedOk ? '' : (line.taxRate === null ? 'missing' : byName)) : token.startsWith('v:') ? byValue : byName
+    // When the order states a value too (taxRatePercent), the order's rate must have that value.
+    const sameAsOrderValue = line.taxRate !== null && (po.taxRatePercent === null || fmtFixed(new D(line.taxRate.rate.toFixed()), 4) === fmtFixed(new D(po.taxRatePercent.toFixed()), 4))
+    const inheritedOk = orderName === '' ? line.taxRate === null : line.taxRate !== null && line.taxRate.name.trim() === orderName && sameAsOrderValue
+    const byNameAndValue = line.taxRate ? `${byName}@${fmtFixed(new D(line.taxRate.rate.toFixed()), 4)}` : ''
+    const shown = token === null ? byName
+      : token === '' ? (inheritedOk ? '' : (line.taxRate === null ? 'missing' : byNameAndValue))
+        : token.startsWith('v:') ? byValue
+          : token.includes('@') ? byNameAndValue : byName
     return `${prefix}|${shown}`
   })
   return JSON.stringify({ ...header, status: po.status, lines: lines.sort() })

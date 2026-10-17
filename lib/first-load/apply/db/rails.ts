@@ -120,6 +120,9 @@ async function taxRates(prepared: PreparedRun, problems: string[]): Promise<void
   const [nameIx, valueIx, orderNameIx, orderKeyIx] = [col('taxRateName'), col('taxRateValue'), col('orderTaxRateName'), col('orderKey')]
   let unresolvedLines = 0
   let unspelledOrders = 0
+  let valueMismatchLines = 0
+  let valueMismatchOrders = 0
+  const sameValue = (rate: { rate: { toFixed(): string } }, stated: string): boolean => new D(rate.rate.toFixed()).eq(new D(stated))
   const firstRowOfOrder = new Set<string>()
   for (const row of step.data.rows) {
     const name = (nameIx < 0 ? '' : row.cells[nameIx] ?? '').trim()
@@ -129,13 +132,25 @@ async function taxRates(prepared: PreparedRun, problems: string[]): Promise<void
       const value = normaliseTaxValue(valueText)
       const byValue = value !== '' && eligible.some((r) => new D(r.rate.toFixed()).minus(new D(value)).abs().lt(new D('0.00005')))
       if (!byName && !byValue) unresolvedLines++
+      // The importer resolves BY NAME and ignores a stated value: when the file states both, the named rate must have that value.
+      const stated = normaliseTaxValue(valueText)
+      if (byName && stated !== '') {
+        const rate = eligible.find((r) => r.name.trim().toLowerCase() === name.toLowerCase())
+        if (rate && !sameValue(rate, stated)) valueMismatchLines++
+      }
     }
     const orderKey = orderKeyIx < 0 ? '' : row.cells[orderKeyIx] ?? ''
     if (firstRowOfOrder.has(orderKey)) continue
     firstRowOfOrder.add(orderKey)
     const orderName = ((orderNameIx < 0 ? '' : row.cells[orderNameIx] ?? '').trim()) || name
     if (orderName !== '' && !active.some((r) => r.name === orderName)) unspelledOrders++
+    const orderValueIx = col('orderTaxRateValue')
+    const orderStated = normaliseTaxValue(orderValueIx < 0 ? '' : row.cells[orderValueIx] ?? '') || normaliseTaxValue(valueText)
+    const orderRate = orderName === '' ? undefined : active.find((r) => r.name === orderName)
+    if (orderRate && orderStated !== '' && !sameValue(orderRate, orderStated)) valueMismatchOrders++
   }
   if (unresolvedLines > 0) problems.push(`purchase tax: ${unresolvedLines} line(s) name a tax that matches no active purchase rate`)
+  if (valueMismatchLines > 0) problems.push(`purchase tax: ${valueMismatchLines} line(s) state a tax value that is not the value of the active rate they name`)
+  if (valueMismatchOrders > 0) problems.push(`purchase tax: ${valueMismatchOrders} order(s) state a tax value that is not the value of the active rate they name`)
   if (unspelledOrders > 0) problems.push(`purchase tax: ${unspelledOrders} order(s) have an order-level tax name with no active rate of exactly that spelling`)
 }
