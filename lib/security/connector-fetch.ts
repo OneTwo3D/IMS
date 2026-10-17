@@ -33,6 +33,12 @@ export type ConnectorFetchOptions = Pick<
    * origin they named (a credentialed read of a store): the default follows up to MAX_REDIRECTS hops, each revalidated.
    */
   refuseRedirects?: boolean
+  /**
+   * A caller's own decision about each hop, asked for the hop's method and URL immediately before it is sent (the first hop and every
+   * redirect). A string refuses the hop: it is thrown as an Error and nothing is sent. For a destination that mutates through GET, where a
+   * read can redirect to a write, so a check of the first request alone is not a check of what leaves.
+   */
+  hopGate?: (hop: { method: string; url: URL; redirectCount: number }) => string | null
 }
 
 const MAX_REDIRECTS = 5
@@ -442,6 +448,8 @@ export async function connectorFetch(
         await recordOutboundWriteRefusal(held)
         throw held
       }
+      const gateRefusal = options.hopGate?.({ method, url, redirectCount })
+      if (gateRefusal) throw new Error(gateRefusal)
       const response = await sendConnectorRequest(url, method, headers, body, abortSignal.signal, options)
       const nextUrl = redirectLocation(response, url)
       if (!nextUrl) {
