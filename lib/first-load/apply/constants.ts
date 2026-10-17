@@ -229,3 +229,9 @@ export const APPLY_CHECK_COVERAGE: Readonly<Record<string, { status: CheckCovera
   'barcode-free': { status: 'database', core: 'Needs the barcodes already in IMS.', database: 'The empty-target rail refuses a database that already holds products, and a product nobody in this run emitted is FOREIGN_ROW. The importer also refuses a barcode already in use.' },
   'product-parent-exists': { status: 'file-side', core: 'Every VARIANT\'s parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot.', database: 'The stored parent SKU of a variant is part of the product fingerprint.' },
 }
+
+/**
+ * The application_name every connection of the runner carries (the database pool, the lock pool, the run-record writes: all one process). The command sets PGAPPNAME to this
+ * BEFORE it opens any connection, and the quiesce rail refuses to run if its own session does not report it, so the runner's sessions are told apart from everybody else's.
+ */
+export const RUNNER_APPLICATION_NAME = 'ims-first-load-apply'

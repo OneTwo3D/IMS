@@ -17,7 +17,7 @@
 import { db } from '@/lib/db'
 import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
 import { D, fmtFixed, type Dec } from '../../money'
-import type { ApplyStepId } from '../constants'
+import { RUNNER_APPLICATION_NAME, type ApplyStepId } from '../constants'
 import { normaliseTaxValue } from '../normal-form'
 import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import type { PreparedRun } from '../prepared'
@@ -26,6 +26,12 @@ import { DATABASE_READ_FAILED } from './observe'
 
 /** The tables the base currency locks on (lib/base-currency.ts isBaseCurrencyLocked): any row in one of them means the target is not empty. */
 const LOCKING_COUNTS = ['product', 'supplier', 'customer', 'purchaseOrder', 'salesOrder', 'stockMovement'] as const
+
+/** How long a session that is closing is given to leave before it counts as another writer. A real one does not leave. */
+const QUIESCE_GRACE_ATTEMPTS = 10
+const QUIESCE_GRACE_MS = 100
+
+export { RUNNER_APPLICATION_NAME }
 
 export interface RailScope {
   /** 'preflight' also checks emptiness (a fresh run only); a step recheck does not, because the run's own rows are there by then. */
@@ -41,6 +47,7 @@ export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Pr
     const selected = new Set(prepared.steps.map((s) => s.step))
     const relevant = (step: ApplyStepId): boolean => selected.has(step) && (scope.step === null || scope.step === step)
 
+    await quiesced(problems)
     await baseCurrency(prepared, problems)
     await forbiddenSkus(prepared, problems)
     if (scope.phase === 'preflight' && !scope.resuming) await emptyTarget(problems)
@@ -54,6 +61,34 @@ export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Pr
     if (error instanceof ObservationError) throw error
     throw new ObservationError(DATABASE_READ_FAILED)
   }
+}
+
+/**
+ * THE QUIESCE RAIL. The first load runs against a database that NO other writer is connected to: the application, its workers and its cron jobs are stopped first. The step lock
+ * only excludes other first-load runners; an ordinary request could create or change a row between the read and the import, and the importer would update it from the file,
+ * which the read-back would then report as "created". The rail proves what it can: no other client session is connected to this database right now.
+ *
+ * Every other client backend of the current database is another writer (a psql session counts: it can write). Background and system backends (autovacuum, WAL, statistics) are
+ * not client backends and are ignored. Sessions of this runner are recognised by their application_name; the rail refuses to run if its own session does not carry it, and if the
+ * role cannot see other sessions' details (it needs superuser or pg_read_all_stats), because a blind count is not a count. An unreadable view is a refusal.
+ */
+async function quiesced(problems: string[]): Promise<void> {
+  const me = (await db.$queryRaw<Array<{ app: string; seesAll: boolean }>>`
+    SELECT current_setting('application_name') AS app,
+           (COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) OR pg_has_role(current_user, 'pg_read_all_stats', 'member')) AS "seesAll"`)[0]
+  if (!me || me.app !== RUNNER_APPLICATION_NAME) { problems.push('quiesce: the runner\'s own database connections are not tagged, so they cannot be told from another writer\'s (set PGAPPNAME before the first connection)'); return }
+  if (!me.seesAll) { problems.push('quiesce: this role cannot see other sessions (it needs superuser or pg_read_all_stats), so it cannot prove there are none'); return }
+  let foreign = 0
+  for (let attempt = 0; attempt < QUIESCE_GRACE_ATTEMPTS; attempt++) {
+    const row = (await db.$queryRaw<Array<{ n: bigint }>>`
+      SELECT count(*) AS n FROM pg_stat_activity
+       WHERE datname = current_database() AND backend_type = 'client backend' AND pid <> pg_backend_pid()
+         AND COALESCE(application_name, '') <> ${RUNNER_APPLICATION_NAME}`)[0]
+    foreign = Number(row?.n ?? 0)
+    if (foreign === 0) return
+    await new Promise((resolve) => setTimeout(resolve, QUIESCE_GRACE_MS))
+  }
+  problems.push(`quiesce: ${foreign} other client session(s) are connected to this database; stop the application, its workers and its cron jobs before the load`)
 }
 
 async function baseCurrency(prepared: PreparedRun, problems: string[]): Promise<void> {

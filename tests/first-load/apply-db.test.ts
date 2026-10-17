@@ -2,11 +2,12 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
+import pg from 'pg'
 
 import { freePort, startCluster, type Cluster } from '../scripts/real-postgres-cluster'
 import { databaseUrl, ident, inheritedEnv, randomHex, runChild, socketPsql, tail, withClient } from '../../scripts/rehearse-first-install'
 import { OPENING_STOCK_IMPORT_HEADERS, PRODUCTS_IMPORT_HEADERS, PURCHASE_ORDERS_IMPORT_HEADERS, SUPPLIERS_IMPORT_HEADERS } from '../../lib/first-load/spec'
-import { APPLY_STEP_IDS, RUN_STATUSES, REHEARSAL_RECORD_FORMAT_VERSION, type ApplyStepId } from '../../lib/first-load/apply/constants'
+import { APPLY_STEP_IDS, RUN_STATUSES, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME, type ApplyStepId } from '../../lib/first-load/apply/constants'
 import { FINGERPRINT_SPECS, keyStep, type StepRows } from '../../lib/first-load/apply/keys'
 import { StaleJournalError, StepLockError, runLoad, type ApplyOptions, type ApplyPorts, type RunRecord } from '../../lib/first-load/apply/orchestrate'
 import { planImportCalls } from '../../lib/first-load/apply/import-calls'
@@ -27,6 +28,9 @@ import { precondition } from './helpers'
  * Each arm names, in a comment, the one change to the subject that makes it red; the change was made, the arm went red and the change was reverted
  * (the pull request body has the table). Controls come first: an arm that cannot fail proves nothing.
  */
+
+// Every connection of the runner (the application's pool, the lock pool) carries this application_name; the quiesce rail tells them from anybody else's by it. The command sets it before its first connection.
+process.env.PGAPPNAME = RUNNER_APPLICATION_NAME
 
 const REPO = process.cwd()
 const TAG = 'ZQDB'
@@ -679,6 +683,85 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         } finally {
           await m.db.setting.delete({ where: { key: 'base_currency_locked' } })
         }
+      })
+    })
+
+    describe('the quiesce rail: no other writer is connected to the database', () => {
+      const foreignClient = async (applicationName = 'psql'): Promise<pg.Client> => {
+        const client = new pg.Client({ connectionString: url, application_name: applicationName })
+        await client.connect()
+        return client
+      }
+      const counts = async () => ({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), suppliers: await count('suppliers') })
+
+      it('CONTROL: the runner\'s own sessions (the pool and the lock pool, tagged) are not counted: the rail passes while they are open', async (t) => {
+        await resetData()
+        await m.lock.withStepLock('suppliers', async () => undefined) // opens a lock-pool connection that stays pooled
+        const own = Number((await sql<{ n: string }>(`select count(*)::text as n from pg_stat_activity where datname = current_database() and backend_type = 'client backend' and application_name = $1`, [RUNNER_APPLICATION_NAME]))[0]!.n)
+        precondition(t, 'tagged sessions open', own)
+        assert.ok(own >= 2, `the pool and the lock pool are both open (${own})`)
+        assert.deepEqual((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('quiesce:')), [])
+      })
+
+      it('another client session on the database (here a psql-like one) refuses the preflight, and nothing is written', async () => {
+        // Mutation named: drop the quiesce call from evaluateRails -> the load goes ahead over a connected writer: red.
+        await resetData()
+        const other = await foreignClient()
+        try {
+          const before = await counts()
+          const problems = await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })
+          assert.ok(problems.some((p) => /^quiesce: 1 other client session\(s\) are connected to this database/.test(p)), JSON.stringify(problems))
+          const planned = await runLoad(prepared, ports(), plan())
+          assert.equal(planned.exit, 'PRECONDITION_REFUSED')
+          const result = await runLoad(prepared, ports(), apply(prepared))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED')
+          assert.match(result.problems.join(';'), /quiesce: 1 other client session/)
+          assert.deepEqual(await counts(), before, 'nothing was written')
+        } finally { await other.end() }
+        assert.deepEqual((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('quiesce:')), [], 'gone: accepted again')
+      })
+
+      it('a session that connects BETWEEN steps refuses the next step (its start rail), and the earlier step stays done', async () => {
+        await resetData()
+        const holder: { client: pg.Client | null } = { client: null }
+        const real = ports()
+        const connecting: ApplyPorts = {
+          ...real,
+          execute: async (step, file, lock) => {
+            const answer = await real.execute(step, file, lock)
+            if (step === 'suppliers' && holder.client === null) holder.client = await foreignClient('app-server')
+            return answer
+          },
+        }
+        try {
+          const result = await runLoad(prepared, connecting, apply(prepared))
+          assert.equal(result.exit, 'STEP_FAILED')
+          assert.match(result.problems.join(';'), /products: a rail no longer holds: quiesce: 1 other client session/)
+          assert.equal(result.steps[0]!.step, 'suppliers')
+          assert.equal(result.steps[0]!.status, 'DONE')
+          assert.equal(await count('products'), 0, 'the next step wrote nothing')
+        } finally { await holder.client?.end() }
+      })
+
+      it('a session that appears after the step-start check but before the first write refuses the write (the third check)', async () => {
+        await resetData()
+        const holder: { client: pg.Client | null } = { client: null }
+        const real = ports()
+        let startChecks = 0
+        const connecting: ApplyPorts = {
+          ...real,
+          recheckRails: async (step, phase) => {
+            const problems = await real.recheckRails!(step, phase)
+            if (step === 'products' && phase === 'step-start' && ++startChecks === 1 && holder.client === null) holder.client = await foreignClient('cron-worker')
+            return problems
+          },
+        }
+        try {
+          const result = await runLoad(prepared, connecting, apply(prepared))
+          assert.equal(result.exit, 'STEP_FAILED')
+          assert.match(result.problems.join(';'), /products: a rail no longer holds: quiesce: 1 other client session/)
+          assert.equal(await count('products'), 0)
+        } finally { await holder.client?.end() }
       })
     })
 
