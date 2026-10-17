@@ -19,8 +19,8 @@ export function stepLockNumber(step: ApplyStepId): number {
   return APPLY_STEP_IDS.indexOf(step) + 1
 }
 
-/** The lock this process holds for the step now running (one at a time, by construction). */
-let current: { step: ApplyStepId; lock: PinnedAdvisoryLock } | null = null
+/** The locks this process holds, by step: a lock is registered and cleared under its own step, so concurrent steps cannot overwrite each other. */
+const held = new Map<ApplyStepId, PinnedAdvisoryLock>()
 
 /**
  * Called before EVERY bounded importer call: the step lock must still be ours. Two proofs, because a dead connection is only noticed by the
@@ -31,8 +31,8 @@ let current: { step: ApplyStepId; lock: PinnedAdvisoryLock } | null = null
  * lock is lost runs to its end (at most one bounded call: IMPORT_CALL_MAX_ROWS rows, or a whole products file).
  */
 export async function assertStepLockLive(step: ApplyStepId): Promise<void> {
-  if (current === null || current.step !== step) throw new StepLockError('lost')
-  const { lock } = current
+  const lock = held.get(step)
+  if (lock === undefined) throw new StepLockError('lost')
   try {
     lock.assertHeld(`an importer call of the ${step} step`)
   } catch {
@@ -56,7 +56,7 @@ export async function withStepLock<T>(step: ApplyStepId, body: () => Promise<T>)
     throw new StepLockError('unavailable')
   }
   if (lock === null) throw new StepLockError('busy')
-  current = { step, lock }
+  held.set(step, lock)
   try {
     lock.assertHeld(`the ${step} step`)
     const result = await body()
@@ -67,7 +67,7 @@ export async function withStepLock<T>(step: ApplyStepId, body: () => Promise<T>)
     if (error instanceof AdvisoryLockLostError) throw new StepLockError('lost')
     throw error
   } finally {
-    current = null
+    if (held.get(step) === lock) held.delete(step)
     await lock.release()
   }
 }

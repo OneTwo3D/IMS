@@ -131,26 +131,30 @@ async function taxRates(prepared: PreparedRun, problems: string[]): Promise<void
       const byName = name !== '' && eligible.some((r) => r.name.trim().toLowerCase() === name.toLowerCase())
       const value = normaliseTaxValue(valueText)
       const byValue = value !== '' && eligible.some((r) => new D(r.rate.toFixed()).minus(new D(value)).abs().lt(new D('0.00005')))
-      if (!byName && !byValue) unresolvedLines++
+      // EXACTLY the importer's resolveImportedTaxRateId: a stated NAME resolves by name among the active purchase rates, and only a line with NO name falls back to the value.
+      // (The importer also falls back to the value when a stated name matches nothing; that creates the order under a different tax, so the rail refuses it instead.)
+      if (name !== '' ? !byName : !byValue) unresolvedLines++
       // The importer resolves BY NAME and ignores a stated value: when the file states both, the named rate must have that value.
       const stated = normaliseTaxValue(valueText)
       if (byName && stated !== '') {
-        const rate = eligible.find((r) => r.name.trim().toLowerCase() === name.toLowerCase())
-        if (rate && !sameValue(rate, stated)) valueMismatchLines++
+        // Every eligible rate of that name must have the stated value: which of two same-named rates the importer takes is not something to rely on.
+        const named = eligible.filter((r) => r.name.trim().toLowerCase() === name.toLowerCase())
+        if (named.some((r) => !sameValue(r, stated))) valueMismatchLines++
       }
     }
     const orderKey = orderKeyIx < 0 ? '' : row.cells[orderKeyIx] ?? ''
     if (firstRowOfOrder.has(orderKey)) continue
     firstRowOfOrder.add(orderKey)
     const orderName = ((orderNameIx < 0 ? '' : row.cells[orderNameIx] ?? '').trim()) || name
-    if (orderName !== '' && !active.some((r) => r.name === orderName)) unspelledOrders++
+    // The order-level lookup takes any active rate of exactly that name; a rate that is not a purchase rate is refused here as well.
+    if (orderName !== '' && !eligible.some((r) => r.name === orderName)) unspelledOrders++
     const orderValueIx = col('orderTaxRateValue')
     const orderStated = normaliseTaxValue(orderValueIx < 0 ? '' : row.cells[orderValueIx] ?? '') || normaliseTaxValue(valueText)
-    const orderRate = orderName === '' ? undefined : active.find((r) => r.name === orderName)
-    if (orderRate && orderStated !== '' && !sameValue(orderRate, orderStated)) valueMismatchOrders++
+    const orderRates = orderName === '' ? [] : active.filter((r) => r.name === orderName)
+    if (orderStated !== '' && orderRates.some((r) => !sameValue(r, orderStated))) valueMismatchOrders++
   }
   if (unresolvedLines > 0) problems.push(`purchase tax: ${unresolvedLines} line(s) name a tax that matches no active purchase rate`)
   if (valueMismatchLines > 0) problems.push(`purchase tax: ${valueMismatchLines} line(s) state a tax value that is not the value of the active rate they name`)
   if (valueMismatchOrders > 0) problems.push(`purchase tax: ${valueMismatchOrders} order(s) state a tax value that is not the value of the active rate they name`)
-  if (unspelledOrders > 0) problems.push(`purchase tax: ${unspelledOrders} order(s) have an order-level tax name with no active rate of exactly that spelling`)
+  if (unspelledOrders > 0) problems.push(`purchase tax: ${unspelledOrders} order(s) have an order-level tax name with no active purchase rate of exactly that spelling`)
 }

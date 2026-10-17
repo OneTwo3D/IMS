@@ -654,6 +654,74 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual(await rail(), [], 'restored')
       })
 
+      it('every cell of the tax-resolution table (name present/absent x named rate eligible/ineligible/inactive/absent x value stated/absent/wrong/matching ANOTHER rate): the rail decides exactly "the importer would resolve to the named rate"', async () => {
+        // Mutation named: let a rate matching by VALUE satisfy a line that states a NAME (the old rail, and the importer's own fallback) -> the "another rate matches" arms are green when they must be red.
+        await resetData()
+        const named = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME } })
+        const five = await m.db.taxRate.create({ data: { name: `${VAT_NAME} five`, rate: '0.05', usedFor: 'PURCHASE', active: true } })
+        const orderFile = (line: Record<string, string>) => {
+          const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', ...line }])
+          return { ...prepared, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }] } as unknown as PreparedRun
+        }
+        const problemsFor = (line: Record<string, string>) => m.rails.evaluateRails(orderFile(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })
+        const setNamed = async (data: { usedFor?: string; active?: boolean }) => { await m.db.taxRate.update({ where: { id: named.id }, data }) }
+        const rows: Array<{ label: string; line: Record<string, string>; state?: { usedFor?: string; active?: boolean }; refused: boolean }> = [
+          // name present, named rate eligible
+          { label: 'name, eligible, no value', line: { taxRateName: VAT_NAME, orderTaxRateName: VAT_NAME }, refused: false },
+          { label: 'name, eligible, matching value', line: { taxRateName: VAT_NAME, taxRateValue: '20', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' }, refused: false },
+          { label: 'name, eligible, wrong value', line: { taxRateName: VAT_NAME, taxRateValue: '5', orderTaxRateName: VAT_NAME }, refused: true },
+          { label: 'name, eligible (BOTH), matching value', line: { taxRateName: VAT_NAME, taxRateValue: '20', orderTaxRateName: VAT_NAME }, state: { usedFor: 'BOTH' }, refused: false },
+          // name present, named rate ineligible: SALES only / inactive
+          { label: 'name, SALES-only, no value', line: { taxRateName: VAT_NAME, orderTaxRateName: VAT_NAME }, state: { usedFor: 'SALES' }, refused: true },
+          { label: 'name, SALES-only, value of ANOTHER purchase rate', line: { taxRateName: VAT_NAME, taxRateValue: '5', orderTaxRateName: VAT_NAME }, state: { usedFor: 'SALES' }, refused: true },
+          { label: 'name, SALES-only, value 20 (the seeded 20% purchase rate matches)', line: { taxRateName: VAT_NAME, taxRateValue: '20', orderTaxRateName: VAT_NAME }, state: { usedFor: 'SALES' }, refused: true },
+          { label: 'name, inactive, value of another rate', line: { taxRateName: VAT_NAME, taxRateValue: '5', orderTaxRateName: VAT_NAME }, state: { active: false }, refused: true },
+          // name present, no such rate at all
+          { label: 'name, absent, no value', line: { taxRateName: 'ZQDB NO SUCH', orderTaxRateName: 'ZQDB NO SUCH' }, refused: true },
+          { label: 'name, absent, value of another rate', line: { taxRateName: 'ZQDB NO SUCH', taxRateValue: '5', orderTaxRateName: 'ZQDB NO SUCH' }, refused: true },
+          // The order-level tax is VALID in these, so only the line-level decision can refuse them (otherwise the order-level refusal would mask a weak line rule).
+          { label: 'name, absent, value of another rate; the order tax is valid', line: { taxRateName: 'ZQDB NO SUCH', taxRateValue: '5', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' }, refused: true },
+          { label: 'name, SALES-only, value of another rate; the order tax is valid', line: { taxRateName: VAT_NAME, taxRateValue: '5', orderTaxRateName: `${VAT_NAME} five`, orderTaxRateValue: '5' }, state: { usedFor: 'SALES' }, refused: true },
+          { label: 'name, inactive, value of another rate; the order tax is valid', line: { taxRateName: VAT_NAME, taxRateValue: '5', orderTaxRateName: `${VAT_NAME} five`, orderTaxRateValue: '5' }, state: { active: false }, refused: true },
+          // no name: value only
+          { label: 'no name, value of a purchase rate', line: { taxRateValue: '5' }, refused: false },
+          { label: 'no name, value of NO rate', line: { taxRateValue: '7' }, refused: true },
+          { label: 'no name, no value', line: {}, refused: false },
+          // order-level name only
+          { label: 'order name only, eligible', line: { orderTaxRateName: VAT_NAME }, refused: false },
+          { label: 'order name only, SALES-only', line: { orderTaxRateName: VAT_NAME }, state: { usedFor: 'SALES' }, refused: true },
+          { label: 'order name only, wrong spelling', line: { orderTaxRateName: VAT_NAME.toLowerCase() }, refused: true },
+        ]
+        let cells = 0
+        try {
+          for (const row of rows) {
+            if (row.state) await setNamed(row.state)
+            try {
+              const problems = await problemsFor(row.line)
+              if (row.refused) assert.ok(problems.some((p) => p.startsWith('purchase tax:')), `${row.label}: the rail refuses (got ${JSON.stringify(problems)})`)
+              else assert.deepEqual(problems, [], `${row.label}: the rail passes`)
+              assert.ok(!problems.join(';').includes(VAT_NAME), `${row.label}: the sentence carries no tax name`)
+            } finally {
+              if (row.state) await setNamed({ usedFor: 'PURCHASE', active: true })
+            }
+            cells++
+          }
+          // The refused cells write nothing, whole-run: the preflight stops the run.
+          const refusedLine = { taxRateName: VAT_NAME, taxRateValue: '5', orderTaxRateName: VAT_NAME }
+          await setNamed({ usedFor: 'SALES' })
+          try {
+            const stub = orderFile(refusedLine)
+            const before = { runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }
+            const result = await runLoad(stub, m.ports.createDbPorts(stub, { operator: 'Apply Test' }), apply(stub))
+            assert.equal(result.exit, 'PRECONDITION_REFUSED')
+            assert.deepEqual({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }, before)
+          } finally { await setNamed({ usedFor: 'PURCHASE', active: true }) }
+        } finally {
+          await m.db.taxRate.delete({ where: { id: five.id } }).catch(() => undefined)
+        }
+        assert.equal(cells, rows.length)
+      })
+
       it('purchase orders: an FX rate outside the importer\'s 2%, and a currency with no stored rate, are refused', async () => {
         const row = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR' } })
         await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.30' } })
@@ -674,7 +742,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         await m.db.taxRate.update({ where: { id: taxRate.id }, data: { name: VAT_NAME.toLowerCase() } })
         try {
           const problems = (await check()).join(';')
-          assert.match(problems, /order\(s\) have an order-level tax name with no active rate of exactly that spelling/)
+          assert.match(problems, /order\(s\) have an order-level tax name with no active purchase rate of exactly that spelling/)
           assert.ok(!/matches no active purchase rate/.test(problems), 'the lines still resolve case-insensitively: only the order-level lookup is case-exact')
         } finally { await m.db.taxRate.update({ where: { id: taxRate.id }, data: { name: VAT_NAME } }) }
       })
