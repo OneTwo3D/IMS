@@ -262,19 +262,22 @@ test('PRE-CUTOVER CONSUMERS (real queries): an order paid before the live-from i
   const reconcile = await import('../../lib/domain/wms/order-reconcile-sweep.ts')
   const deps2 = reconcile.createPrismaReconcileDeps('mintsoft', {} as never)
   const listed = async () => (await deps2.listUnpushedIntentOrders(1_000_000)).some((row: { orderId: string }) => row.orderId === seeded.orderId)
-  const finding = await d.db.wmsOrderDiscrepancy.create({ data: { connector: 'mintsoft', orderId: seeded.orderId, category: 'NOT_PUSHED', status: 'OPEN', detail: 'old' }, select: { id: true } })
-  const resolve = () => reconcile.resolveNotPushedChunk({ connectorId: 'mintsoft', boundWarehouseIds: [seeded.warehouseId], rows: [{ id: finding.id, orderId: seeded.orderId }], now: new Date() })
-
+  // Detection first, BEFORE any finding exists: an open finding would itself hide the order from the detection scan (the rotation rule).
   await withEnv({}, async () => {
-    // CONTROL: no floor, the legacy answer. (A finding with no new drift would resolve here only if the order stopped drifting; it still drifts.)
     assert.equal(await listed(), true, 'CONTROL: detection finds the unlinked paid order')
     assert.equal((await d.sweep.wmsCreateEligibleOrderIds('mintsoft', [seeded.orderId])).has(seeded.orderId), true)
-    const outcome = await resolve()
-    assert.deepEqual([outcome.resolved, outcome.outOfScope], [0, 0], 'CONTROL: the finding stays open while the order still drifts')
   })
   await withEnv(LIVE, async () => {
     assert.equal(await listed(), false, 'detection leaves out the bridge-owned order')
     assert.equal((await d.sweep.wmsCreateEligibleOrderIds('mintsoft', [seeded.orderId])).has(seeded.orderId), false, 'the inbox does not offer a control for it')
+  })
+  const finding = await d.db.wmsOrderDiscrepancy.create({ data: { connector: 'mintsoft', orderId: seeded.orderId, category: 'NOT_PUSHED', status: 'OPEN', detail: 'old' }, select: { id: true } })
+  const resolve = () => reconcile.resolveNotPushedChunk({ connectorId: 'mintsoft', boundWarehouseIds: [seeded.warehouseId], rows: [{ id: finding.id, orderId: seeded.orderId }], now: new Date() })
+  await withEnv({}, async () => {
+    const outcome = await resolve()
+    assert.deepEqual([outcome.resolved, outcome.outOfScope], [0, 0], 'CONTROL: the finding stays open while the order still drifts')
+  })
+  await withEnv(LIVE, async () => {
     const outcome = await resolve()
     const row = await d.db.wmsOrderDiscrepancy.findUnique({ where: { id: finding.id } })
     assert.equal(outcome.outOfScope, 1)
