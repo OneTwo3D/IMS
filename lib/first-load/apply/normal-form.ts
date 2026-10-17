@@ -294,7 +294,7 @@ export function purchaseOrderFingerprint(header: Record<string, string>, lines: 
 }
 
 export interface DbPurchaseOrder {
-  supplier: { name: string; currency: string; taxRate?: { name: string } | null }
+  supplier: { name: string; currency: string }
   currency: string
   fxRateToBase: DecimalLike
   destinationWarehouse: { code: string } | null
@@ -354,12 +354,15 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
     const token = at === -1 ? null : remaining.splice(at, 1)[0].slice(prefix.length + 1)
     const byName = line.taxRate ? `n:${line.taxRate.name.trim().toLowerCase()}` : ''
     const byValue = line.taxRate ? `v:${fmtFixed(new D(line.taxRate.rate.toFixed()), 4)}` : ''
-    // A line that names no tax inherits the order's (or the supplier's) default. It is shown as blank ONLY when its stored tax really is that default (or there is none),
-    // so a changed stored tax still differs.
-    const inherited = line.taxRate === null
-      || (po.taxRateName !== null && po.taxRateName.trim() !== '' && line.taxRate.name.trim().toLowerCase() === po.taxRateName.trim().toLowerCase())
-      || ((po.taxRateName === null || po.taxRateName.trim() === '') && po.supplier.taxRate != null && line.taxRate.name.trim().toLowerCase() === po.supplier.taxRate.name.trim().toLowerCase())
-    const shown = token === null ? byName : token === '' ? (inherited ? '' : byName) : token.startsWith('v:') ? byValue : byName
+    // WHAT THE IMPORTER STORES (resolvePurchaseLineTaxRates, with no tax id from the importer):
+    //   line names a tax                -> that rate (resolved by name, then value);
+    //   line names none, order tax named -> the active rate of EXACTLY the order's name (the order's name is its effective name: the order column, else the first row's line name);
+    //   line names none, order tax none  -> NO rate. (The supplier's default rate is not used.)
+    // So a blank file token is blank on the database side ONLY when the stored line tax is exactly that; anything else (a missing tax where the order names one,
+    // a tax where there should be none, another rate) is shown and is a difference.
+    const orderName = (po.taxRateName ?? '').trim()
+    const inheritedOk = orderName === '' ? line.taxRate === null : line.taxRate !== null && line.taxRate.name.trim() === orderName
+    const shown = token === null ? byName : token === '' ? (inheritedOk ? '' : (line.taxRate === null ? 'missing' : byName)) : token.startsWith('v:') ? byValue : byName
     return `${prefix}|${shown}`
   })
   return JSON.stringify({ ...header, status: po.status, lines: lines.sort() })

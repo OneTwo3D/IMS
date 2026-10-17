@@ -74,6 +74,8 @@ const stepRows = (header: readonly string[], rows: Array<Record<string, string>>
 /** Order references (named constants: an inline `orderKey: '...'` literal reads as a credential to the secret scanner). */
 const PO_ONE = `${TAG}-PO-1`
 const PO_TWO = `${TAG}-PO-2`
+const PO_THREE = `${TAG}-PO-3`
+const PO_FOUR = `${TAG}-PO-4`
 const SUPPLIER_A = `${TAG} Odd Supplier`
 const SUPPLIER_B = `${TAG} Euro Supplier`
 const ODD_FILES: Record<ApplyStepId, StepRows> = {
@@ -99,6 +101,12 @@ const ODD_FILES: Record<ApplyStepId, StepRows> = {
     { orderKey: PO_ONE, supplierName: SUPPLIER_A.toLowerCase(), currency: '', destinationWarehouseCode: 'zqsent-main', sku: `${TAG}-SIMPLE`, qty: '3', unitCostForeign: '1.10', lineDiscountForeign: '0.30', lineDiscountStr: '10%', taxRateName: VAT_NAME.toLowerCase(), orderTaxRateName: VAT_NAME, orderTaxRateValue: '20', pricesIncludeVat: 'yes', supplierRef: ' REF-1 ', expectedDelivery: '2027-03-01', orderDiscountForeign: '0.50', notes: 'note' },
     { orderKey: PO_ONE, supplierName: SUPPLIER_A.toLowerCase(), currency: '', destinationWarehouseCode: 'zqsent-main', sku: `${TAG}-BOM`, qty: '1.5', unitCostForeign: '2.333333', taxRateValue: '20', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20', pricesIncludeVat: 'yes', supplierRef: ' REF-1 ', expectedDelivery: '2027-03-01', orderDiscountForeign: '0.50', notes: 'note' },
     { orderKey: PO_TWO, supplierName: SUPPLIER_B, currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-OVER', sku: `${TAG}-VARIANT`, qty: '20', unitCostForeign: '0.5' },
+    // PO_THREE: the order names a tax; one line names none (the importer gives it the order's), one names it.
+    { orderKey: PO_THREE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '2', unitCostForeign: '3', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' },
+    { orderKey: PO_THREE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-BOM`, qty: '1', unitCostForeign: '4', taxRateName: VAT_NAME, orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' },
+    // PO_FOUR: the order names no tax and neither does its line. (A line that names a tax while the order names none cannot be loaded: the importer\n    // takes the order's tax from the rows and refuses a group whose rows disagree, so that cell of the table is unreachable.)
+    { orderKey: PO_FOUR, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '2', unitCostForeign: '3' },
+
   ]),
 }
 
@@ -326,6 +334,45 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual(differingColumns(unitTwo.fingerprint, (await entry(PO_TWO)).fingerprint), ['lines'])
       } finally {
         await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { taxRateId: null } })
+      }
+    })
+
+    it('every cell of the line-tax table: (line names a tax?) x (order names a tax?) -> what the importer stores, and any other stored tax is a difference in `lines`', async () => {
+      // Mutation named: treat a missing stored tax as "inherited" whatever the order says (the old rule) -> the order-names-a-tax null arm is green when it must be red.
+      const stub = { steps: [{ step: 'purchase-orders', units: units['purchase-orders'] }] } as unknown as PreparedRun
+      const observed = async (key: string) => (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!
+      const unitOf = (key: string) => units['purchase-orders'].find((u) => u.key === key)!
+      const diff = async (key: string) => differingColumns(unitOf(key).fingerprint, (await observed(key)).fingerprint)
+      const other = await m.db.taxRate.create({ data: { name: `${VAT_NAME} other`, rate: '0.05', usedFor: 'PURCHASE', active: true } })
+      const vat = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME }, select: { id: true } })
+      const lineOf = async (key: string, sku: string) => m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: key }, product: { sku } }, select: { id: true, taxRateId: true } })
+      const setTax = async (lineId: string, taxRateId: string | null) => { await m.db.purchaseOrderLine.update({ where: { id: lineId }, data: { taxRateId } }) }
+      let arms = 0
+      try {
+        // Stored as the importer stores them: all four orders match.
+        for (const key of [PO_ONE, PO_TWO, PO_THREE, PO_FOUR]) assert.deepEqual(await diff(key), [], `control ${key}`)
+        const stored = async (key: string, sku: string) => (await lineOf(key, sku)).taxRateId
+        assert.equal(await stored(PO_THREE, `${TAG}-SIMPLE`), vat.id, 'precondition: an unnamed line under a named order tax was given the order\'s')
+        assert.equal(await stored(PO_FOUR, `${TAG}-SIMPLE`), null, 'precondition: an unnamed line under an order with no tax has none')
+        // For each cell: the line, and every other value its stored tax could hold, must differ.
+        const cells: Array<[string, string, string | null, Array<string | null>]> = [
+          // [order, sku, what the importer stored, alternatives that must each be a difference]
+          [PO_THREE, `${TAG}-SIMPLE`, vat.id, [null, other.id]], // line names none, order names one
+          [PO_THREE, `${TAG}-BOM`, vat.id, [null, other.id]], // line names it, order names it
+          [PO_FOUR, `${TAG}-SIMPLE`, null, [vat.id, other.id]], // line names none, order names none
+        ]
+        for (const [key, sku, original, alternatives] of cells) {
+          const line = await lineOf(key, sku)
+          for (const alternative of alternatives) {
+            await setTax(line.id, alternative)
+            try { assert.deepEqual(await diff(key), ['lines'], `${key} ${sku}: stored ${alternative === null ? 'none' : alternative === other.id ? 'another rate' : 'the order rate'} instead of ${original === null ? 'none' : 'the order rate'}`) } finally { await setTax(line.id, original) }
+            arms++
+          }
+          assert.deepEqual(await diff(key), [], `${key} ${sku}: restored`)
+        }
+        assert.equal(arms, 6)
+      } finally {
+        await m.db.taxRate.delete({ where: { id: other.id } }).catch(() => undefined)
       }
     })
 
@@ -559,7 +606,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual(await check(), [], 'control: the odd file\'s taxes resolve (by name in another case, by value as a percentage, and the order-level name exactly)')
         // With the rate no longer a purchase rate, the line that names it resolves nowhere; the line that gives only 20 still finds the seeded 20% rate.
         await m.db.taxRate.update({ where: { id: taxRate.id }, data: { usedFor: 'SALES' } })
-        try { assert.match((await check()).join(';'), /purchase tax: 1 line\(s\) name a tax that matches no active purchase rate/) } finally { await m.db.taxRate.update({ where: { id: taxRate.id }, data: { usedFor: 'PURCHASE' } }) }
+        try { assert.match((await check()).join(';'), /purchase tax: 2 line\(s\) name a tax that matches no active purchase rate/) } finally { await m.db.taxRate.update({ where: { id: taxRate.id }, data: { usedFor: 'PURCHASE' } }) }
         await m.db.taxRate.update({ where: { id: taxRate.id }, data: { name: VAT_NAME.toLowerCase() } })
         try {
           const problems = (await check()).join(';')

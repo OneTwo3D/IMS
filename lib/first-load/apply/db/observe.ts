@@ -161,7 +161,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
     select: {
       reference: true, currency: true, fxRateToBase: true, taxRateName: true, taxRatePercent: true, pricesIncludeVat: true, supplierRef: true,
       expectedDelivery: true, discountAmount: true, notes: true, status: true,
-      supplier: { select: { name: true, currency: true, taxRate: { select: { name: true } } } }, destinationWarehouse: { select: { code: true } },
+      supplier: { select: { name: true, currency: true } }, destinationWarehouse: { select: { code: true } },
       lines: {
         orderBy: { sortOrder: 'asc' },
         select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true } } },
