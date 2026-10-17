@@ -96,9 +96,10 @@ const WMS_PUSH_TONE: Record<string, string> = {
   HELD: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
   CANCELLED: 'bg-muted text-muted-foreground',
   DEAD_LETTER: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  PRE_CUTOVER: 'bg-muted text-muted-foreground',
 }
 const WMS_PUSH_LABEL: Record<string, string> = {
-  SYNCED: 'Pushed', PENDING_CREATE: 'Queued', PENDING_CANCEL: 'Cancelling', HELD: 'Held', CANCELLED: 'Cancelled', DEAD_LETTER: 'Failed',
+  SYNCED: 'Pushed', PENDING_CREATE: 'Queued', PENDING_CANCEL: 'Cancelling', HELD: 'Held', CANCELLED: 'Cancelled', DEAD_LETTER: 'Failed', PRE_CUTOVER: 'Pre-cutover (bridge)',
   // o3d-92fu: the payload could not be built from this order's own data — no push was attempted.
   VALIDATION_FAILED: 'Payload invalid',
 }

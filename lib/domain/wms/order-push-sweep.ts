@@ -2485,7 +2485,7 @@ export async function wmsCreateEligibleOrderIds(connectorId: string, orderIds: r
   // binding list would be the same absence-as-an-answer mistake in miniature.
   if (bindings.length === 0) return new Set()
   const rows = await db.salesOrder.findMany({
-    where: { id: { in: [...orderIds] }, ...wmsCreateEligibleOrderWhere(bindings.map((b) => b.warehouseId)) },
+    where: { id: { in: [...orderIds] }, ...wmsCreateEligibleOrderWhere(bindings.map((b) => b.warehouseId), wmsCreateObligationFloor(connectorId)) },
     select: { id: true },
   })
   return new Set(rows.map((row) => row.id))
@@ -2510,7 +2510,7 @@ export async function isWmsCreateEligibleForUpdate(
   const bindings = await activeBoundWarehouseIds(tx, connectorId)
   if (bindings.length === 0) return false
   const row = await tx.salesOrder.findFirst({
-    where: { id: orderId, ...wmsCreateEligibleOrderWhere(bindings.map((b) => b.warehouseId)) },
+    where: { id: orderId, ...wmsCreateEligibleOrderWhere(bindings.map((b) => b.warehouseId), wmsCreateObligationFloor(connectorId)) },
     select: { id: true },
   })
   return row !== null

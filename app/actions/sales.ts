@@ -144,6 +144,8 @@ import {
   releaseOrderAllocationsInTx,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
+import { wmsCreateObligationFloor } from '@/lib/connectors/wms/producer-seam'
+import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPushIsPreCutover } from '@/lib/domain/wms/create-eligibility'
 import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
@@ -533,7 +535,7 @@ const SO_SELECT = {
       carrier: true,
     },
   },
-  wmsOrderPush: { select: { state: true, lastError: true } },
+  wmsOrderPush: { select: { state: true, lastError: true, connector: true, attempts: true, externalOrderId: true } },
   _count: { select: { lines: true } },
   lines: { select: { cogsBase: true } },
 } as const
@@ -595,7 +597,7 @@ function mapSoRow(so: {
     trackingNumber: string | null
     carrier: string | null
   } | null
-  wmsOrderPush: { state: string; lastError: string | null } | null
+  wmsOrderPush: { state: string; lastError: string | null; connector?: string; attempts?: number; externalOrderId?: string | null } | null
 }): SoRow {
   const totalBase = Number(so.totalBase)
   const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
@@ -609,7 +611,15 @@ function mapSoRow(so: {
   const wms = so.wmsOrderStatus
   return {
     id: so.id,
-    wmsPush: so.wmsOrderPush ? { state: so.wmsOrderPush.state, lastError: so.wmsOrderPush.lastError } : null,
+    wmsPush: so.wmsOrderPush
+      ? (so.wmsOrderPush.connector !== undefined && wmsPushIsPreCutover(
+        { state: so.wmsOrderPush.state, attempts: so.wmsOrderPush.attempts ?? 0, externalOrderId: so.wmsOrderPush.externalOrderId ?? null },
+        { paidAt: so.paidAt },
+        wmsCreateObligationFloor(so.wmsOrderPush.connector),
+      )
+        ? { state: WMS_PRE_CUTOVER_PUSH_STATE, lastError: WMS_PRE_CUTOVER_NOTICE }
+        : { state: so.wmsOrderPush.state, lastError: so.wmsOrderPush.lastError })
+      : null,
     wmsStatus: wms
       ? {
           connectorLabel: wms.connectorLabel,

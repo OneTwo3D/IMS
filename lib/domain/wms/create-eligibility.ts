@@ -94,3 +94,23 @@ export function wmsCreateIneligibleRefusal(reference: string): string {
     + 'finding stays open meanwhile.'
   )
 }
+
+/**
+ * The disposition shown for an order IMS can never create because it was paid before the destination's live-from instant (the bridge
+ * owns it). It is a display state only: no push link is written for it. See wmsCreateObligationFloor.
+ */
+export const WMS_PRE_CUTOVER_PUSH_STATE = 'PRE_CUTOVER'
+export const WMS_PRE_CUTOVER_NOTICE = 'Paid before the live-from instant: this order belongs to the bridge and IMS will not create it in the warehouse.'
+
+/**
+ * Whether a push link should be DISPLAYED as pre-cutover rather than queued: the create query now excludes the order, so "Queued" would
+ * be a promise nothing keeps. Only a never-attempted queue entry (no attempts, no warehouse id): anything else carries history the
+ * operator needs to see as it is. No floor (switch off, or not live): never.
+ */
+export function wmsPushIsPreCutover(
+  link: { state: string; attempts: number; externalOrderId: string | null },
+  order: { paidAt: Date | null | undefined },
+  paidNotBefore: Date | null | undefined,
+): boolean {
+  return link.state === 'PENDING_CREATE' && link.attempts === 0 && link.externalOrderId === null && wmsPaidBeforeCreateFloor(order.paidAt, paidNotBefore)
+}

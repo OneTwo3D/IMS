@@ -26,6 +26,8 @@ const STATE_TONE: Record<string, string> = {
   AMBIGUOUS_CREATE: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
   // A shadow is neither a push nor a failure: the producer-side hold kept the order's create as a record and sent nothing.
   SHADOWED: 'bg-muted text-muted-foreground',
+  // Paid before the live-from instant: the bridge's order, never created by IMS. A disposition, not a queue entry.
+  PRE_CUTOVER: 'bg-muted text-muted-foreground',
 }
 
 const STATE_LABEL: Record<string, string> = {
@@ -38,6 +40,7 @@ const STATE_LABEL: Record<string, string> = {
   VALIDATION_FAILED: 'Payload invalid',
   AMBIGUOUS_CREATE: 'Outcome unknown',
   SHADOWED: 'Not sent (held)',
+  PRE_CUTOVER: 'Pre-cutover (bridge)',
 }
 
 export function WmsOrderPushChip({ orderId, push }: { orderId: string; push: WmsOrderPushStateView }) {

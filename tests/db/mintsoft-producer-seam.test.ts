@@ -254,6 +254,36 @@ test('REAL ORDER-PUSH PORT, AMEND QUEUE: updatableLinks honours the live-from fl
   assert.ok((await ids(floor)).includes(link.id), 'a change after the floor is offered')
 })
 
+test('PRE-CUTOVER CONSUMERS (real queries): an order paid before the live-from instant is not NOT_PUSHED drift, its open finding is closed with an out-of-scope disposition, and the inbox eligibility excludes it; switch OFF is the legacy answer', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `msn${randomUUID().slice(0, 8)}`
+  const seeded = await seedOrder(d, tag, new Date('2026-05-01T00:00:00Z'))
+  t.after(() => cleanupOrder(d, seeded))
+  const reconcile = await import('../../lib/domain/wms/order-reconcile-sweep.ts')
+  const deps2 = reconcile.createPrismaReconcileDeps('mintsoft', {} as never)
+  const listed = async () => (await deps2.listUnpushedIntentOrders(1_000_000)).some((row: { orderId: string }) => row.orderId === seeded.orderId)
+  const finding = await d.db.wmsOrderDiscrepancy.create({ data: { connector: 'mintsoft', orderId: seeded.orderId, category: 'NOT_PUSHED', status: 'OPEN', detail: 'old' }, select: { id: true } })
+  const resolve = () => reconcile.resolveNotPushedChunk({ connectorId: 'mintsoft', boundWarehouseIds: [seeded.warehouseId], rows: [{ id: finding.id, orderId: seeded.orderId }], now: new Date() })
+
+  await withEnv({}, async () => {
+    // CONTROL: no floor, the legacy answer. (A finding with no new drift would resolve here only if the order stopped drifting; it still drifts.)
+    assert.equal(await listed(), true, 'CONTROL: detection finds the unlinked paid order')
+    assert.equal((await d.sweep.wmsCreateEligibleOrderIds('mintsoft', [seeded.orderId])).has(seeded.orderId), true)
+    const outcome = await resolve()
+    assert.deepEqual([outcome.resolved, outcome.outOfScope], [0, 0], 'CONTROL: the finding stays open while the order still drifts')
+  })
+  await withEnv(LIVE, async () => {
+    assert.equal(await listed(), false, 'detection leaves out the bridge-owned order')
+    assert.equal((await d.sweep.wmsCreateEligibleOrderIds('mintsoft', [seeded.orderId])).has(seeded.orderId), false, 'the inbox does not offer a control for it')
+    const outcome = await resolve()
+    const row = await d.db.wmsOrderDiscrepancy.findUnique({ where: { id: finding.id } })
+    assert.equal(outcome.outOfScope, 1)
+    assert.equal(row?.status, 'RESOLVED')
+    assert.match(row?.detail ?? '', /^Out of scope: .*paid before the live-from instant/)
+    assert.equal(await d.db.wmsOrderPushLink.findUnique({ where: { orderId: seeded.orderId } }), null, 'closed without a push link')
+  })
+})
+
 // ───────────────────────── retention and evidence ─────────────────────────
 
 test('RETENTION: the shadow record of a Mintsoft write (its only evidence) survives the real retention sweep, aged far past every window', { skip }, async (t) => {

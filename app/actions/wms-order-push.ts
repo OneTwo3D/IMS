@@ -6,7 +6,8 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { wmsOrderCreateReArmShadow, wmsOrderCreateShadowEvidence } from '@/lib/connectors/wms/producer-seam'
+import { wmsCreateObligationFloor, wmsOrderCreateReArmShadow, wmsOrderCreateShadowEvidence } from '@/lib/connectors/wms/producer-seam'
+import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPaidBeforeCreateFloor, wmsPushIsPreCutover } from '@/lib/domain/wms/create-eligibility'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { decideWmsPushReplay } from '@/lib/domain/wms/push-recovery-affordance'
@@ -56,7 +57,7 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
       attempts: true,
       lastError: true,
       pushedAt: true,
-      order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, paidAt: true } },
     },
   })
   if (!link) {
@@ -65,10 +66,22 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
     // itself once the warehouse may be written. Read only when the producer-side hold is enforced for the connector.
     const activeConnectorId = await getEnabledWmsConnectorId()
     const shadow = activeConnectorId ? await wmsOrderCreateShadowEvidence(activeConnectorId, salesOrderId) : null
-    if (!shadow) return null
+    if (!shadow) {
+      // No link and no shadow: an order paid before the live-from instant is the bridge's, and the create query excludes it. Say so, rather
+      // than showing nothing for an order a person expects to see in the warehouse. Only when the hold is enforced and live (a floor exists).
+      const floor = activeConnectorId ? wmsCreateObligationFloor(activeConnectorId) : null
+      if (!floor) return null
+      const order = await db.salesOrder.findUnique({ where: { id: salesOrderId }, select: { paidAt: true, status: true } })
+      if (!order?.paidAt || !['PROCESSING', 'ALLOCATED'].includes(order.status) || !wmsPaidBeforeCreateFloor(order.paidAt, floor)) return null
+      return { state: WMS_PRE_CUTOVER_PUSH_STATE, externalOrderNumber: null, attempts: 0, lastError: null, pushedAt: null, canRetry: false, retryRefusal: WMS_PRE_CUTOVER_NOTICE }
+    }
     return { state: 'SHADOWED', externalOrderNumber: null, attempts: 0, lastError: null, pushedAt: null, canRetry: false, retryRefusal: shadow.notice }
   }
   const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
+  // A never-attempted queue entry the create query now excludes (paid before the live-from instant): not "Queued", which nothing would keep.
+  if (wmsPushIsPreCutover(link, link.order, wmsCreateObligationFloor(link.connector))) {
+    return { state: WMS_PRE_CUTOVER_PUSH_STATE, externalOrderNumber: null, attempts: 0, lastError: link.lastError, pushedAt: null, canRetry: false, retryRefusal: WMS_PRE_CUTOVER_NOTICE }
+  }
   return {
     state: link.state,
     externalOrderNumber: link.externalOrderNumber,
