@@ -1,4 +1,4 @@
-import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef, WmsWriteClearance } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
@@ -67,17 +67,17 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftProductBySku(sku)
   }
 
-  // Every write method takes the producer-side clearance as its last argument (see WmsWriteClearance): it is a compile-time token
-  // and is not used here. Asking happens at the producer; this class only makes it impossible to write without having asked.
-  async upsertProduct(product: WmsProductDto, options: WmsUpsertProductOptions | undefined, _clearance: WmsWriteClearance<'product.upsert'>): Promise<WmsProductRef> {
+  // The write methods of the WmsConnector contract take a producer-side clearance as their last argument (see WmsWriteClearance). It is a
+  // compile-time token that this class does not need: every caller holds a WmsConnector and the type checker requires the clearance there.
+  async upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef> {
     return upsertMintsoftProduct(product, options)
   }
 
-  async updateProductContent(update: WmsProductContentUpdate, _clearance: WmsWriteClearance<'product.content'>): Promise<WmsProductContentResult> {
+  async updateProductContent(update: WmsProductContentUpdate): Promise<WmsProductContentResult> {
     return updateMintsoftProductContent(update)
   }
 
-  async createAsn(input: WmsAsnInput, _clearance: WmsWriteClearance<'asn.create'>): Promise<WmsAsnRef> {
+  async createAsn(input: WmsAsnInput): Promise<WmsAsnRef> {
     return createMintsoftAsn(input)
   }
 
@@ -89,7 +89,7 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftReturns(since)
   }
 
-  async createBundle(input: WmsBundleDto, options: { beforeSend?: () => Promise<boolean> } | undefined, _clearance: WmsWriteClearance<'product.bundle'>): Promise<WmsBundleRef> {
+  async createBundle(input: WmsBundleDto, options?: { beforeSend?: () => Promise<boolean> }): Promise<WmsBundleRef> {
     return createMintsoftBundle(input, options)
   }
 
@@ -149,7 +149,7 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftPartItems(externalPartId, await getRequiredMintsoftClientId())
   }
 
-  async pushOrder(input: WmsOrderPushInput, _clearance: WmsWriteClearance<'order.create'>): Promise<WmsOrderPushResult> {
+  async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
     return pushMintsoftOrder(input)
   }
 
@@ -161,15 +161,15 @@ export class MintsoftConnector implements WmsConnector {
     return verifyMintsoftPushedOrder(externalOrderId, reference)
   }
 
-  async updateOrder(externalOrderId: string, input: WmsOrderPushInput, _clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult> {
+  async updateOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
     return updateMintsoftOrder(externalOrderId, input)
   }
 
-  async cancelOrder(externalOrderId: string, _clearance: WmsWriteClearance<'order.cancel' | 'order.hold'>): Promise<WmsOrderCancelResult> {
+  async cancelOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
     return cancelMintsoftOrder(externalOrderId)
   }
 
-  async addOrderComment(externalOrderId: string, comment: string, _clearance: WmsWriteClearance<'order.comment'>): Promise<void> {
+  async addOrderComment(externalOrderId: string, comment: string): Promise<void> {
     return addMintsoftOrderComment(externalOrderId, comment)
   }
 

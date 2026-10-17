@@ -6,7 +6,6 @@ import test from 'node:test'
 import { DECLARATIONS } from '../../scripts/producer-census-declarations.ts'
 import { scanSource, scanTree, seamFindings } from '../../scripts/producer-census.ts'
 import {
-  CLEARANCE_MINT_FILE,
   DESTINATION_TABLE_FILE,
   MINT_SEAM_FUNCTIONS,
   literalMembersOf,
