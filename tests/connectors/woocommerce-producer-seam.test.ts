@@ -227,6 +227,9 @@ test('DIFFERENTIAL, outbox, switch OFF: the row is created exactly as before and
       connector: 'woocommerce', operation: 'stock.push', idempotencyKey: 'woocommerce:stock.push:p-1',
       payloadJson: { productId: 'p-1', reason: 'IMS_CHANGE', force: false, webhookQty: null },
       status: 'PENDING', attempts: 0, nextAttemptAt: null, lastError: null, lockedAt: null, lockedBy: null,
+      // The one addition: the durable attempt history marker (recorded whether or not the hold is enforced, because the history must exist BEFORE
+      // enforcement is switched on). It changes no behaviour of the queue.
+      attemptHistoryTracked: true,
     })
     assert.equal(calls.queries, 0)
   })
