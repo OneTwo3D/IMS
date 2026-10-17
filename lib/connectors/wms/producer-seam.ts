@@ -3,7 +3,7 @@ import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-e
 import { mintsoftDrainHold, mintsoftProducerSeam, type MintsoftSeamInput, type MintsoftShadow } from '@/lib/connectors/mintsoft/producer-seam'
 import type { MintsoftHold } from '@/lib/connectors/mintsoft/producer-egress'
 import type { OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
-import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
+import { explainProducerDisposition, type ProducerDecisionContext } from '@/lib/security/producer-disposition'
 import { readProducerEnforcement } from '@/lib/security/producer-seam'
 import { mintWmsWriteClearance } from './clearance'
 import { isWmsConnectorId, type WmsConnectorId, type WmsWriteClearance, type WmsWriteOperation } from './types'
@@ -58,6 +58,25 @@ export async function wmsProducerSeam<Op extends WmsWriteOperation>(
 export function wmsProducerHold(connectorId: string, context?: ProducerDecisionContext): WmsProducerHold {
   if (!isWmsConnectorId(connectorId)) return { held: false }
   return mintsoftDrainHold(context)
+}
+
+/**
+ * The earliest business-event (paid) time at which IMS may create a warehouse order, or null when there is no such floor to apply
+ * (the hold is not enforced, the destination is not live yet, or anything is unreadable). An order paid before the floor belongs to the
+ * writer that owned it then and can never be created by IMS, so the create query leaves it out instead of reselecting it every sweep
+ * (a bounded batch of them would starve every later order). Not enforced: null, and the query is the legacy one.
+ */
+export function wmsCreateObligationFloor(connectorId: string, context?: ProducerDecisionContext): Date | null {
+  if (!isWmsConnectorId(connectorId)) return null
+  try {
+    const enforcement = readProducerEnforcement(context?.env ?? process.env)
+    if (!enforcement.enforced || !enforcement.destinations.has(WMS_PRODUCER_DESTINATION[connectorId as WmsConnectorId])) return null
+    // Asked with an obligation time that is never before any cut-off: LIVE then means the destination is live and IMS owns creates.
+    const decision = explainProducerDisposition(WMS_PRODUCER_DESTINATION[connectorId as WmsConnectorId], 'order.create', new Date(8.64e15), context)
+    return decision.disposition === 'LIVE' && decision.phase === 'P2' ? decision.cutoff : null
+  } catch {
+    return null
+  }
 }
 
 /**

@@ -8,7 +8,7 @@ import {
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { withMintsoftAuthLock } from '@/lib/connectors/mintsoft/api/auth-lock'
 import { connectorFetch } from '@/lib/security/connector-fetch'
-import { mintsoftHopGate, mintsoftProducerHoldEnforced } from '../producer-egress'
+import { assertMintsoftKeyMintingAllowed, mintsoftHopGate, mintsoftProducerHoldEnforced } from '../producer-egress'
 import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
@@ -159,6 +159,9 @@ async function requestMintsoftAuthSession(
   password: string,
   clientId: string,
 ): Promise<{ token: string; expiresAt: Date }> {
+  // The producer hold applies to key minting itself, before anything is built or sent: a new key invalidates the one the other
+  // integrations use. Not enforced (the default): no-op, the legacy behaviour byte for byte.
+  assertMintsoftKeyMintingAllowed()
   const response = await connectorFetch(buildMintsoftRequestUrl('/api/Auth', baseUrl), {
     method: 'POST',
     headers: buildMintsoftAuthHeaders(baseUrl),

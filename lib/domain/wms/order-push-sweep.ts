@@ -8,7 +8,7 @@ import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { wmsProducerHold, wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
+import { wmsCreateObligationFloor, wmsProducerHold, wmsProducerSeam } from '@/lib/connectors/wms/producer-seam'
 import type { ProducerDecisionContext } from '@/lib/security/producer-disposition'
 import { NO_DELIVERY_STREET_REASON, resolvePushRecipient } from './push-recipient'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
@@ -720,7 +720,7 @@ export interface WmsOrderPushPort {
   /** HELD links whose order is back in a ready+paid state, with the release evidence. */
   releasableHeldOrders(connector: string, limit: number): Promise<WmsPushReleasableLink[]>
   /** Ready+paid orders for bound warehouses with no link or a PENDING_CREATE link. */
-  createCandidates(connector: string, boundWarehouseIds: string[], limit: number): Promise<WmsPushCandidate[]>
+  createCandidates(connector: string, boundWarehouseIds: string[], limit: number, paidNotBefore?: Date): Promise<WmsPushCandidate[]>
   /**
    * o3d-5r8 — claim a candidate for the remote create, under the order's row lock.
    *
@@ -1507,7 +1507,13 @@ export async function runWmsOrderPushSweepCore(
 
   // --- Create pass ---
   if (externalWarehouseByWarehouse.size > 0) {
-    const candidates = await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+    // Orders paid before the live-from instant can never be created by IMS (the seam shadows them without changing their eligibility or
+    // their place in the oldest-first queue), so a full batch of them would be reselected every sweep and starve the orders behind it.
+    // They are left out of the query. No floor (the hold is not enforced, or not live): the legacy call, exactly.
+    const paidNotBefore = wmsCreateObligationFloor(connectorId, producerContext)
+    const candidates = paidNotBefore
+      ? await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize, paidNotBefore)
+      : await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
 
     // o3d-rbyg: screen the WHOLE batch against the live storefront before pushing any of it.
     //
@@ -2509,13 +2515,14 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         },
         take: limit,
       }),
-    async createCandidates(connector, boundWarehouseIds, limit) {
+    async createCandidates(connector, boundWarehouseIds, limit, paidNotBefore) {
       const rows = await db.salesOrder.findMany({
         where: {
           // o3d-2k5r r6: THE predicate, from lib/domain/wms/create-eligibility.ts. This query is
           // the definition of "the sweep will create a warehouse order for this", and four other
           // readers have to agree with it; the last one written by hand agreed with half of it.
           ...wmsCreateEligibleOrderWhere(boundWarehouseIds),
+          ...(paidNotBefore ? { paidAt: { not: null, gte: paidNotBefore } } : {}),
           OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
         },
         select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, wmsOrderPush: { select: { attempts: true } } },

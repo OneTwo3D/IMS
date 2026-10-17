@@ -409,3 +409,21 @@ test('PHASE CHANGES MID-SWEEP: the sweep starts held, the live-from instant pass
     assert.ok(harness.reads.includes('screenLiveWithdrawals'))
   })
 })
+
+test('STARVATION: more shadowed pre-cutoff candidates than the batch size do not stop a post-cutoff candidate being created (the query leaves them out)', async () => {
+  await withEnv(LIVE, async () => {
+    const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+    const old = [1, 2, 3].map((n) => candidate({ id: `old-${n}`, orderNumber: `OLD-${n}`, paidAt: BEFORE_CUTOFF, createdAt: BEFORE_CUTOFF }))
+    const fresh = candidate({ id: 'new-1', orderNumber: 'NEW-1' })
+    const harness = makePort({})
+    // A port that behaves like the real query: oldest first, bounded by the limit, and honouring the floor when it is given.
+    harness.port.createCandidates = async (_connector, _bound, limit, paidNotBefore) => {
+      return [...old, fresh].filter((row) => !paidNotBefore || (row.paidAt !== null && row.paidAt !== undefined && row.paidAt >= paidNotBefore)).slice(0, limit)
+    }
+    const { connector, calls } = makeConnector()
+    const result = await runWmsOrderPushSweepCore(connector, 'mintsoft', harness.port, { now: NOW, batchSize: 2 })
+    console.log(`# starvation: calls=${JSON.stringify(calls)} shadowed=${result.shadowed ?? 0}`)
+    assert.deepEqual(calls, ['pushOrder:NEW-1'])
+    assert.equal(result.created, 1)
+  })
+})

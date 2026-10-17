@@ -168,12 +168,12 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
  * the reason; an entry that no longer matches a map row is red.
  */
 export const MINT_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>> = {
-  'auth.login': 'Key minting is not a business write (map owner nobody): the producer hold is never consulted for it, and the outbound-write hold\'s login grant governs it.',
+  'auth.login': 'Key minting is not a business write (map owner nobody) and has no seam: requestMintsoftAuthSession refuses it itself (assertMintsoftKeyMintingAllowed) while the producer hold is enforced and the installation is not live; the outbound-write hold\'s login grant governs it as well.',
 }
 
 /** The only places a Mintsoft transport call may sit, besides the barrier's own sendMintsoftRequest. */
 export const MINT_LOGIN_TRANSPORT: Readonly<Record<string, string>> = {
-  'lib/connectors/mintsoft/api/auth.ts::requestMintsoftAuthSession': 'POST /api/Auth mints a key: not a business write; the outbound-write hold\'s login grant governs it (ownership-map row auth.login).',
+  'lib/connectors/mintsoft/api/auth.ts::requestMintsoftAuthSession': 'POST /api/Auth mints a key: not a business write; it is refused before sending while the producer hold is enforced and not live (assertMintsoftKeyMintingAllowed), and the outbound-write hold\'s login grant governs it (ownership-map row auth.login).',
   'lib/connectors/mintsoft/api/auth.ts::testMintsoftFixedApiKey': 'A literal GET /api/Warehouse that only tests a key: a read.',
 }
 export const MINT_BARRIER_FILE = 'lib/connectors/mintsoft/api/client.ts'

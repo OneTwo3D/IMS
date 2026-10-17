@@ -30,6 +30,8 @@ Set the mode under Integrations → Mintsoft → Edit Mintsoft Connection:
 | **Username & password** (default) | Logs in and auto-renews the 24-hour key. **Regenerates the tenant key on every renewal.** |
 | **Fixed API key** | Uses the configured key verbatim and **never** calls `/api/Auth` — not on a cache miss, not on expiry, not on a 401. A blank key is a hard error, never a fall back to logging in. |
 
+While `PRODUCER_HOLD_ENFORCED_DESTINATIONS` names Mintsoft and the installation is not in its live phase, username & password mode does not log in at all: a renewal or connection test is refused before anything is sent (`MintsoftKeyMintingHeldError`, a hold text with no credential in it), because a new key would invalidate the one the other integrations use. Reads continue on a stored unexpired key or a fixed key. With the variable unset nothing changes.
+
 Storage notes:
 
 - The fixed key lives in its own setting, `mintsoft_static_api_key`. It is

@@ -69,3 +69,22 @@ export function mintsoftHopGate(hop: { method: string; url: URL; redirectCount: 
   const text = mintsoftEgressRefusalText(hold, { method: hop.method.toUpperCase(), target: hop.url.pathname })
   return hop.redirectCount > 0 ? outboundTextAfterEarlierSend(text, 'Mintsoft') : text
 }
+
+/**
+ * Key minting (POST /api/Auth) issues a NEW tenant API key and invalidates the one every other integration uses, so while the
+ * producer hold is enforced and this installation is not in its live phase it is refused before anything is sent. The text is a
+ * complete outbound-write-hold text and carries no credential, username or key. Reads keep working on the stored or fixed key.
+ */
+export class MintsoftKeyMintingHeldError extends Error {
+  readonly code = 'MINTSOFT_KEY_MINTING_HELD'
+  constructor(text: string) {
+    super(text)
+    this.name = 'MintsoftKeyMintingHeldError'
+  }
+}
+
+/** Throws {@link MintsoftKeyMintingHeldError} when key minting must stand down. Pure on the environment; never touches the network. */
+export function assertMintsoftKeyMintingAllowed(context?: ProducerDecisionContext): void {
+  const hold = mintsoftEgressHold(context)
+  if (hold.held) throw new MintsoftKeyMintingHeldError(mintsoftEgressRefusalText(hold, { method: 'POST', target: '/api/Auth' }))
+}
