@@ -43,6 +43,10 @@ export interface ExecutorOptions {
   operator: string
   /** Test seam: call sizes. Defaults to the planner's own limit. */
   maxRowsPerCall?: number
+  /** Awaited before EVERY importer call; throws to stop the file (the step lock and the run record must still be ours). */
+  beforeCall?: (step: ApplyStepId) => Promise<void>
+  /** Test seam: awaited after each importer call returns, with the 1-based call number. */
+  afterCall?: (step: ApplyStepId, call: number) => Promise<void>
 }
 
 export function createExecutor(options: ExecutorOptions): ApplyPorts['execute'] {
@@ -51,6 +55,7 @@ export function createExecutor(options: ExecutorOptions): ApplyPorts['execute'] 
     const importer = await importerFor(step)
     const total: ImporterResult = { created: 0, updated: 0, skipped: 0, errors: [] }
     for (const call of planImportCalls(step, file.bytes, options.maxRowsPerCall)) {
+      if (options.beforeCall) await options.beforeCall(step)
       const form = new FormData()
       form.set('file', new File([new TextDecoder().decode(call.bytes)], file.name, { type: 'text/csv' }))
       form.set('mode', 'execute')
@@ -61,6 +66,7 @@ export function createExecutor(options: ExecutorOptions): ApplyPorts['execute'] 
       total.created += result.created
       total.updated += result.updated
       total.skipped += result.skipped
+      if (options.afterCall) await options.afterCall(step, call.index)
       const errors = result.error !== undefined && !result.errors.includes(result.error) ? [...result.errors, result.error] : result.errors
       for (const message of errors) total.errors.push(shiftRows(message, call.rowOffset))
     }

@@ -63,6 +63,7 @@ async function resetData(): Promise<void> {
   await sql('truncate products, suppliers, product_categories, purchase_orders, stock_movements, first_load_apply_runs, activity_logs, integration_outbox, accounting_sync_logs, email_outbox restart identity cascade')
 }
 
+const held = () => sql<{ objid: number; granted: boolean }>('select objid, granted from pg_locks where locktype = $1 and classid = $2 and objsubid = 2 order by objid', ['advisory', LOCK_NAMESPACE])
 const cellsOf = (header: readonly string[], row: Record<string, string>): string[] => header.map((c) => row[c] ?? '')
 const stepRows = (header: readonly string[], rows: Array<Record<string, string>>): StepRows => ({ header: [...header], rows: rows.map((row, i) => ({ chunk: 1, line: i + 2, cells: cellsOf(header, row) })) })
 
@@ -597,7 +598,6 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
     })
 
     describe('the step lock', () => {
-      const held = () => sql<{ objid: number; granted: boolean }>('select objid, granted from pg_locks where locktype = $1 and classid = $2 and objsubid = 2 order by objid', ['advisory', LOCK_NAMESPACE])
 
       it('CONTROL: a step lock is held in pg_locks while its body runs and gone after, and the lock number is the step\'s position in the load order', async () => {
         assert.deepEqual(await held(), [])
@@ -648,6 +648,40 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         })
         await assert.rejects(m.lock.withStepLock('purchase-orders', async () => { await kill(); await killed; return 'finished' }), (e: unknown) => e instanceof StepLockError && e.reason === 'lost')
         assert.deepEqual(await held(), [])
+      })
+    })
+
+    describe('losing the step lock stops the writes', () => {
+      it('the lock connection is killed after the first importer call: the first runner makes no further call, a resumed runner takes over, and nothing overlaps', async () => {
+        // Mutation named: drop the beforeCall guard (the old code verified the lock only before and after the whole step) -> the first runner writes all four layers itself.
+        await resetData()
+        const stockUnits = prepared.steps.find((s) => s.step === 'opening-stock')!.units.length
+        let resumed: Awaited<ReturnType<typeof runLoad>> | null = null
+        let layersWhenSecondFinished = -1
+        let firstCalls = 0
+        const killing = m.ports.createDbPorts(prepared, {
+          operator: 'Apply Test',
+          maxRowsPerCall: 1,
+          afterCall: async (step, call) => {
+            if (step !== 'opening-stock') return
+            firstCalls = call
+            if (call !== 1) return
+            await sql(`select pg_terminate_backend(pid) from pg_locks where locktype = 'advisory' and classid = $1 and objsubid = 2`, [LOCK_NAMESPACE])
+            for (let i = 0; i < 100 && (await held()).length > 0; i++) await new Promise((r) => setTimeout(r, 50))
+            // While the first runner is still inside this step, a second runner resumes the same load and finishes it.
+            resumed = await runLoad(prepared, ports(), apply(prepared, { resume: true }))
+            layersWhenSecondFinished = await count('cost_layers')
+          },
+        })
+        const result = await runLoad(prepared, killing, apply(prepared))
+        assert.equal(result.exit, 'STEP_FAILED')
+        // The first runner stops either on the lost lock itself or, because the second runner has moved the record meanwhile, on the stale record; both are a stop.
+        assert.match(result.problems.join(' '), /step lock was not available \(lost\)|run record changed under this runner/)
+        assert.equal(firstCalls, 1, 'the first runner made exactly one importer call, then stopped')
+        assert.equal(resumed!.exit, 'OK', resumed!.problems.join('; '))
+        assert.equal(layersWhenSecondFinished, stockUnits, 'the second runner completed the step')
+        assert.equal(await count('cost_layers'), stockUnits, 'the first runner wrote nothing after losing the lock')
+        assert.equal(Number((await sql<{ n: string }>(`select count(*)::text as n from (select 1 from cost_layers group by "productId","warehouseId" having count(*) > 1) d`))[0]!.n), 0, 'no pair was written twice')
       })
     })
 

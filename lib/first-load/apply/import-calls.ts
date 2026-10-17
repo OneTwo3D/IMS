@@ -19,7 +19,7 @@ import { parseCsvStrict, serializeCsv } from '../csv'
 import { IMPORTER_MAX_BYTES, IMPORTER_MAX_ROWS } from '../spec'
 import type { ApplyStepId } from './constants'
 
-export const IMPORT_CALL_MAX_ROWS = 2_000
+export const IMPORT_CALL_MAX_ROWS = 500
 
 export interface ImportCall {
   /** 1-based position among the calls of this file. */

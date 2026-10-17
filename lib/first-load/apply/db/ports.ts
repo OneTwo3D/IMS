@@ -11,11 +11,14 @@
  * The target database is whatever DATABASE_URL names, because that is where the importers write; the CLI slice is what picks and confirms it
  * (name and system id) and refuses anything but an empty or rehearsal database. These ports add the data-level refusal (rails.ts: a first run needs an empty target).
  */
+import type { ApplyStepId } from '../constants'
 import type { ApplyPorts } from '../orchestrate'
 import type { PreparedRun } from '../prepared'
 import { createExecutor } from './execute'
 import { createJournal } from './journal'
-import { withStepLock } from './lock'
+import { db } from '@/lib/db'
+import { StepLockError } from '../orchestrate'
+import { assertStepLockLive, withStepLock } from './lock'
 import { observeStep } from './observe'
 import { evaluateRails } from './rails'
 
@@ -24,6 +27,22 @@ export interface DbPortsOptions {
   operator: string
   /** Test seam: the size of one importer call. */
   maxRowsPerCall?: number
+  /** Test seam: awaited after each importer call. */
+  afterCall?: (step: ApplyStepId, call: number) => Promise<void>
+}
+
+/** Before every importer call: the step lock is live (pg_locks), and the run record is still this load's and still running. */
+function guardBeforeCall(prepared: PreparedRun) {
+  return async (step: ApplyStepId): Promise<void> => {
+    await assertStepLockLive(step)
+    let row
+    try {
+      row = await db.firstLoadApplyRun.findFirst({ select: { manifestDigest: true, runId: true, status: true } })
+    } catch {
+      throw new StepLockError('unavailable')
+    }
+    if (row === null || row.manifestDigest !== prepared.manifestDigest || row.runId !== prepared.manifest.runId || row.status !== 'RUNNING') throw new StepLockError('lost')
+  }
 }
 
 export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): ApplyPorts {
@@ -34,6 +53,6 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
     // A recheck happens inside a run that holds a record, so the target is by definition not "fresh": emptiness is a preflight rail only.
     recheckRails: (step) => evaluateRails(prepared, { phase: 'recheck', resuming: true, step }),
     withStepLock,
-    execute: createExecutor({ runId: prepared.manifest.runId, operator: options.operator, maxRowsPerCall: options.maxRowsPerCall }),
+    execute: createExecutor({ runId: prepared.manifest.runId, operator: options.operator, maxRowsPerCall: options.maxRowsPerCall, beforeCall: guardBeforeCall(prepared), afterCall: options.afterCall }),
   }
 }
