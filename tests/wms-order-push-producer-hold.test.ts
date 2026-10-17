@@ -356,14 +356,18 @@ test(`LIVE (grant and ${CUTOFF}): an order paid AFTER the instant is created; on
   })
 })
 
-test('LIVE: an amendment of an order paid before the instant is a shadow (the bridge owns that order); cancel and hold have no obligation time and go ahead', async () => {
+test('LIVE: an amendment is judged on the time of the CHANGE, not the paid time: a pre-cutover order changed after the instant IS amended; a change made before it, or one with no change time, stays a shadow; cancel and hold have no obligation time and go ahead', async () => {
   await withEnv(LIVE, async () => {
-    const preCutoff = updateLink({ id: 'link-old', externalOrderId: 'wms-old', order: { ...candidate({ id: 'so-old', orderNumber: 'SO-OLD', paidAt: BEFORE_CUTOFF }), shipFromWarehouseId: 'wh-1' } })
-    const postCutoff = updateLink({ id: 'link-new', externalOrderId: 'wms-new', order: { ...candidate({ id: 'so-new', orderNumber: 'SO-NEW', paidAt: AFTER_CUTOFF }), shipFromWarehouseId: 'wh-1' } })
-    const run = await sweep({ updatable: [preCutoff, postCutoff], holdable: [ref('so-h')], cancellable: [ref('so-c')] })
-    assert.deepEqual(run.calls, ['updateOrder:wms-new', 'cancelOrder:wms-so-h', 'cancelOrder:wms-so-c'])
-    assert.deepEqual(shadows.map((s) => [s.operation, s.subjectId, s.reason]), [['order.amend', 'so-old', 'obligation_before_cutoff']])
-    assert.equal(run.result.shadowed, 1)
+    const link = (id: string, updatedAt: Date | undefined) => updateLink({ id: `link-${id}`, externalOrderId: `wms-${id}`, order: { ...candidate({ id: `so-${id}`, orderNumber: id.toUpperCase(), paidAt: BEFORE_CUTOFF, createdAt: BEFORE_CUTOFF }), updatedAt, shipFromWarehouseId: 'wh-1' } })
+    const run = await sweep({ updatable: [link('changed-before', BEFORE_CUTOFF), link('changed-after', AFTER_CUTOFF), link('no-time', undefined)], holdable: [ref('so-h')], cancellable: [ref('so-c')] })
+    console.log(`# LIVE amend: calls=${JSON.stringify(run.calls)} shadows=${JSON.stringify(shadows.map((s) => [s.subjectId, s.reason]))}`)
+    assert.deepEqual(run.calls, ['updateOrder:wms-changed-after', 'cancelOrder:wms-so-h', 'cancelOrder:wms-so-c'])
+    assert.deepEqual(shadows.map((s) => [s.operation, s.subjectId, s.reason]), [
+      ['order.amend', 'so-changed-before', 'obligation_before_cutoff'],
+      ['order.amend', 'so-no-time', 'obligation_time_required'],
+    ])
+    assert.equal(run.result.shadowed, 2)
+    assert.equal(run.result.updated, 1)
   })
 })
 

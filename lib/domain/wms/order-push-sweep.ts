@@ -374,6 +374,8 @@ type OrderForPush = {
   /** The business-event time of the order (paid, else created): the producer-side hold's obligation time. Read-only evidence; absent in a hand-built port. */
   paidAt?: Date | null
   createdAt?: Date | null
+  /** The time of the latest change to the order: the obligation time of an AMENDMENT (see the amend pass). Present on the update port's orders only. */
+  updatedAt?: Date | null
 }
 
 /** Decimal money from a stored value; anything non-numeric reads as 0, as num() does. */
@@ -2220,14 +2222,21 @@ export async function runWmsOrderPushSweepCore(
       let update: Awaited<ReturnType<NonNullable<PushConnector['updateOrder']>>> | null = null
       try {
         // The amendment asks before anything is built: a shadow touches no link (not even its error note), because the order
-        // is amended from the same unchanged link on the sweep that may write. The order's paid time is the obligation time.
+        // is amended from the same unchanged link on the sweep that may write.
+        //
+        // The obligation time is the time of THE CHANGE, not the order's paid time: the paid-time cut-off decides who may CREATE an
+        // order (order.create), whereas an amendment of an order the bridge already created belongs to IMS from the live phase on
+        // (ownership map: IMS amends orders in P2, including ones the bridge created). A link is due only because the order's
+        // updatedAt is newer than its last push, so updatedAt is the time of the change awaiting propagation; a change made before the
+        // live-from instant was the bridge's to propagate and stays a shadow. A port that cannot supply it leaves the time absent,
+        // which the map's `required` rule shadows: the safe side.
         const amendSeam = await wmsProducerSeam(connectorId, {
           operation: 'order.amend',
           subjectType: 'SalesOrder',
           subjectId: link.order.id,
           payload: () => buildPushInput(link.order, externalWarehouseId),
           summary: { orderNumber: link.order.orderNumber ?? null },
-          obligationAt: link.order.paidAt ?? link.order.createdAt ?? undefined,
+          obligationAt: link.order.updatedAt ?? undefined,
           context: producerContext,
         })
         if (!amendSeam.proceed) {
@@ -2769,7 +2778,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (!dueIds.length) return []
       return db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
-        select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } } },
+        select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
       })
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
