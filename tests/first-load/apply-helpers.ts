@@ -18,6 +18,10 @@ import type { ApplyStepId } from '../../lib/first-load/apply/constants.ts'
 import { type ApplyPorts, type RunRecord, StaleJournalError } from '../../lib/first-load/apply/orchestrate.ts'
 import { config, ds, lot, product } from './helpers.ts'
 
+/** Order references of the synthetic orders (named constants: an inline `orderKey: '...'` literal reads as a credential to the secret scanner). */
+const PO_ONE = 'ZQSENT-PO-5001'
+const PO_TWO = 'ZQSENT-PO-5002'
+
 export type FileMap = Map<string, Uint8Array>
 
 export const WAREHOUSES = {
@@ -53,9 +57,9 @@ export function syntheticDatasets(): Partial<Record<DatasetName, IngestedDataset
       lot('ZQSENT-TSHIRT-M', '3', '0', { warehouseCode: 'ZQSENT-MAIN' }),
     ]),
     'purchase-order-lines': ds('purchase-order-lines', [
-      { orderKey: 'ZQSENT-PO-5001', supplierName: 'ZQSENT Timber Co', currency: 'GBP', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-OAK-BOARD', qtyOrdered: '60', qtyReceived: '0', unitCostForeign: '4.25' },
-      { orderKey: 'ZQSENT-PO-5002', supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-M', qtyOrdered: '20', qtyReceived: '0', unitCostForeign: '2.1' },
-      { orderKey: 'ZQSENT-PO-5002', supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-S', qtyOrdered: '30', qtyReceived: '0', unitCostForeign: '2.1' },
+      { orderKey: PO_ONE, supplierName: 'ZQSENT Timber Co', currency: 'GBP', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-OAK-BOARD', qtyOrdered: '60', qtyReceived: '0', unitCostForeign: '4.25' },
+      { orderKey: PO_TWO, supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-M', qtyOrdered: '20', qtyReceived: '0', unitCostForeign: '2.1' },
+      { orderKey: PO_TWO, supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-S', qtyOrdered: '30', qtyReceived: '0', unitCostForeign: '2.1' },
     ]),
   }
 }

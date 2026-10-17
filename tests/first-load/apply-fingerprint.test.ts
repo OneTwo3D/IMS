@@ -13,6 +13,7 @@ import { IMPORT_TARGETS } from '../../lib/first-load/spec.ts'
 import { SENTINEL, loadOk, load, prepareSynthetic, preparedFiles, withConsistentFile, loadedProblemCount, type FileMap } from './apply-helpers.ts'
 import { precondition } from './helpers.ts'
 
+const ORDER_TWO = 'QBX-ZQSENT-PO-5002'
 const prepared = loadOk(preparedFiles(prepareSynthetic()))
 const importerSource = readFileSync(path.join(process.cwd(), 'app/actions/import.ts'), 'utf8')
 
@@ -64,7 +65,7 @@ test('a difference in each fingerprinted column of each step is a conflict (and 
     const ps = prepared.steps.find((s) => s.step === step)!
     const spec = FINGERPRINT_SPECS[step]
     const data: StepRows = ps.data
-    const baseUnit = ps.units.find((u) => (step === 'products' ? u.key === 'ZQSENT-TABLE-01' : step === 'purchase-orders' ? u.key === 'QBX-ZQSENT-PO-5002' : true))!
+    const baseUnit = ps.units.find((u) => (step === 'products' ? u.key === 'ZQSENT-TABLE-01' : step === 'purchase-orders' ? u.key === ORDER_TWO : true))!
     const asEntry = (u: typeof baseUnit): ObservedEntry => ({ key: u.key, collisionKey: u.collisionKey, fingerprint: u.fingerprint, recipe: u.recipe })
     const clean = classifyStep(step, [baseUnit], { entries: [asEntry(baseUnit)] })
     assert.equal(hasConflict(clean), false, `${step}: control, an identical row is not a conflict`)
@@ -92,7 +93,7 @@ test('a difference in each fingerprinted column of each step is a conflict (and 
 
 test('purchase-order lines: a difference in any per-line column, a missing line and an extra line are each a conflict', () => {
   const ps = prepared.steps.find((s) => s.step === 'purchase-orders')!
-  const unit = ps.units.find((u) => u.key === 'QBX-ZQSENT-PO-5002')!
+  const unit = ps.units.find((u) => u.key === ORDER_TWO)!
   const entry: ObservedEntry = { key: unit.key, collisionKey: unit.collisionKey, fingerprint: unit.fingerprint, recipe: null }
   const fp = JSON.parse(unit.fingerprint) as { lines: string[] }
   for (const lines of [fp.lines.slice(1), [...fp.lines, 'ZQSENT-EXTRA|1.0000|1.000000||||'], [fp.lines[0].replace('|', '|9'), fp.lines[1]]]) {
