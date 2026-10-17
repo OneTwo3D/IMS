@@ -21,41 +21,41 @@ import { config, ds, lot, product } from './helpers.ts'
 export type FileMap = Map<string, Uint8Array>
 
 export const WAREHOUSES = {
-  MAIN: { type: 'STANDARD', availableForSale: true, syncToStore: false },
-  OVER: { type: 'RESTOCK', availableForSale: false, syncToStore: false },
+  'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true, syncToStore: false },
+  'ZQSENT-OVER': { type: 'RESTOCK', availableForSale: false, syncToStore: false },
 } as const
 
 /** The synthetic catalogue: a variable product with two variants, three bundles/BOMs, a fee that is not stock tracked, stock in two warehouses, one zero-cost pair, two orders. */
 export function syntheticDatasets(): Partial<Record<DatasetName, IngestedDataset>> {
   return {
-    suppliers: ds('suppliers', [{ name: 'Timber Co', currency: 'GBP' }, { name: 'Cotton Ltd', currency: 'EUR' }]),
+    suppliers: ds('suppliers', [{ name: 'ZQSENT Timber Co', currency: 'GBP' }, { name: 'ZQSENT Cotton Ltd', currency: 'EUR' }]),
     products: ds('products', [
-      product('OAK-BOARD'),
-      product('TSHIRT', 'VARIABLE'),
-      product('TSHIRT-M', 'VARIANT', { parentSku: 'TSHIRT' }),
-      product('TSHIRT-S', 'VARIANT', { parentSku: 'TSHIRT' }),
-      product('LEG-01', 'BOM'),
-      product('TABLE-01', 'BOM'),
-      product('GIFT-SET', 'KIT'),
-      product('LICENCE-FEE', 'NON_INVENTORY'),
+      product('ZQSENT-OAK-BOARD'),
+      product('ZQSENT-TSHIRT', 'VARIABLE'),
+      product('ZQSENT-TSHIRT-M', 'VARIANT', { parentSku: 'ZQSENT-TSHIRT' }),
+      product('ZQSENT-TSHIRT-S', 'VARIANT', { parentSku: 'ZQSENT-TSHIRT' }),
+      product('ZQSENT-LEG-01', 'BOM'),
+      product('ZQSENT-TABLE-01', 'BOM'),
+      product('ZQSENT-GIFT-SET', 'KIT'),
+      product('ZQSENT-LICENCE-FEE', 'NON_INVENTORY'),
     ]),
     'recipe-lines': ds('recipe-lines', [
-      { parentSku: 'LEG-01', componentSku: 'OAK-BOARD', qty: '0.5' },
-      { parentSku: 'TABLE-01', componentSku: 'LEG-01', qty: '4' },
-      { parentSku: 'TABLE-01', componentSku: 'OAK-BOARD', qty: '2' },
-      { parentSku: 'GIFT-SET', componentSku: 'TSHIRT-S', qty: '1' },
-      { parentSku: 'GIFT-SET', componentSku: 'OAK-BOARD', qty: '2' },
+      { parentSku: 'ZQSENT-LEG-01', componentSku: 'ZQSENT-OAK-BOARD', qty: '0.5' },
+      { parentSku: 'ZQSENT-TABLE-01', componentSku: 'ZQSENT-LEG-01', qty: '4' },
+      { parentSku: 'ZQSENT-TABLE-01', componentSku: 'ZQSENT-OAK-BOARD', qty: '2' },
+      { parentSku: 'ZQSENT-GIFT-SET', componentSku: 'ZQSENT-TSHIRT-S', qty: '1' },
+      { parentSku: 'ZQSENT-GIFT-SET', componentSku: 'ZQSENT-OAK-BOARD', qty: '2' },
     ]),
     'stock-lots': ds('stock-lots', [
-      lot('OAK-BOARD', '60', '5.333333'),
-      lot('OAK-BOARD', '5', '4.5', { warehouseCode: 'OVER' }),
-      lot('LEG-01', '8', '12'),
-      lot('TSHIRT-M', '3', '0'),
+      lot('ZQSENT-OAK-BOARD', '60', '5.333333', { warehouseCode: 'ZQSENT-MAIN' }),
+      lot('ZQSENT-OAK-BOARD', '5', '4.5', { warehouseCode: 'ZQSENT-OVER' }),
+      lot('ZQSENT-LEG-01', '8', '12', { warehouseCode: 'ZQSENT-MAIN' }),
+      lot('ZQSENT-TSHIRT-M', '3', '0', { warehouseCode: 'ZQSENT-MAIN' }),
     ]),
     'purchase-order-lines': ds('purchase-order-lines', [
-      { orderKey: 'PO-5001', supplierName: 'Timber Co', currency: 'GBP', destinationWarehouseCode: 'MAIN', sku: 'OAK-BOARD', qtyOrdered: '60', qtyReceived: '0', unitCostForeign: '4.25' },
-      { orderKey: 'PO-5002', supplierName: 'Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'MAIN', sku: 'TSHIRT-M', qtyOrdered: '20', qtyReceived: '0', unitCostForeign: '2.1' },
-      { orderKey: 'PO-5002', supplierName: 'Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'MAIN', sku: 'TSHIRT-S', qtyOrdered: '30', qtyReceived: '0', unitCostForeign: '2.1' },
+      { orderKey: 'ZQSENT-PO-5001', supplierName: 'ZQSENT Timber Co', currency: 'GBP', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-OAK-BOARD', qtyOrdered: '60', qtyReceived: '0', unitCostForeign: '4.25' },
+      { orderKey: 'ZQSENT-PO-5002', supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-M', qtyOrdered: '20', qtyReceived: '0', unitCostForeign: '2.1' },
+      { orderKey: 'ZQSENT-PO-5002', supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-S', qtyOrdered: '30', qtyReceived: '0', unitCostForeign: '2.1' },
     ]),
   }
 }
@@ -81,7 +81,7 @@ export function manifestText(overrides: Record<string, unknown> = {}): string {
     baseCurrency: 'GBP',
     steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'],
     expectWarehouses: WAREHOUSES,
-    acceptZeroCost: ['TSHIRT-M@MAIN'],
+    acceptZeroCost: ['ZQSENT-TSHIRT-M@ZQSENT-MAIN'],
     fxRates: { EUR: '1.25' },
     restorePointDir: '/restore',
   }
@@ -94,9 +94,19 @@ export function manifest(overrides: Record<string, unknown> = {}): ApplyManifest
   return parseApplyManifest(manifestText(overrides))
 }
 
+/** Every fixture value (SKUs, supplier names, warehouse codes, order keys) carries this marker, so a problem that echoes a file value is caught. */
+export const SENTINEL = /zqsent/i
+
 export function load(files: FileMap, overrides: Record<string, unknown> = {}): ReturnType<typeof loadPreparedRun> {
-  return loadPreparedRun({ manifest: manifest(overrides), files, woo: null })
+  const loaded = loadPreparedRun({ manifest: manifest(overrides), files, woo: null })
+  // UNIVERSAL: this runs for every refusal arm of every test that loads through here.
+  if (!loaded.ok) for (const problem of loaded.problems) if (SENTINEL.test(problem)) throw new Error(`a problem echoes a prepared-file value: ${problem}`)
+  loadedProblemCount += loaded.ok ? 0 : loaded.problems.length
+  return loaded
 }
+
+/** How many problem strings the sentinel rule has examined in this process (a test prints it as its precondition). */
+export let loadedProblemCount = 0
 
 export function loadOk(files: FileMap, overrides: Record<string, unknown> = {}): PreparedRun {
   const loaded = load(files, overrides)

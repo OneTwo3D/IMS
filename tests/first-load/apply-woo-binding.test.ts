@@ -77,7 +77,7 @@ function preparedWithParents(bundle: { snapshot: Uint8Array; provenance: Uint8Ar
 function manifestFor(bundle: { origin: string }, over: Record<string, unknown> = {}, woo: Record<string, unknown> | null = {}) {
   return parseApplyManifest(JSON.stringify({
     formatVersion: 1, runId: 'woo-run', preparedDir: '/p', baseCurrency: 'GBP', steps: ['products', 'opening-stock'],
-    expectWarehouses: { MAIN: WAREHOUSES.MAIN }, restorePointDir: '/r',
+    expectWarehouses: { MAIN: WAREHOUSES['ZQSENT-MAIN'] }, restorePointDir: '/r',
     ...(woo === null ? {} : { wooSnapshot: { snapshot: '/s', provenance: '/p', variantParents: '/v', origin: bundle.origin, visibilityChecked: ATTESTED, ...woo } }),
     ...over,
   }))

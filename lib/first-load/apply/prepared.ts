@@ -17,7 +17,7 @@ import type { PrepareReport } from '../transform'
 import {
   PREPARED_REPORT_MARKDOWN_NAME, PREPARED_REPORT_NAME, STEP_TARGET, SUPPORTED_BASE_CURRENCY, TRANSFERS_REFUSAL, type ApplyStepId,
 } from './constants'
-import { componentSkus, keyStep, type KeyedUnit, type StepRow, type StepRows } from './keys'
+import { componentSkus, keyStep, rowLocation, type KeyedUnit, type StepRow, type StepRows } from './keys'
 import { digestableManifest, zeroCostKey, type ApplyManifest } from './manifest'
 
 export interface PreparedStep {
@@ -79,7 +79,7 @@ function outputEntries(report: Record<string, unknown>, problems: string[]): Out
     if (!isRecord(raw)) { problems.push('the prepared report lists an output that is not an object'); continue }
     const { name, target, chunk, chunks, rows, bytes, sha256 } = raw
     if (typeof name !== 'string' || typeof target !== 'string' || !targets.includes(target) || !Number.isInteger(chunk) || !Number.isInteger(chunks) || !Number.isInteger(rows) || !Number.isInteger(bytes) || typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) {
-      problems.push(`the prepared report lists a malformed output (${clip(JSON.stringify(raw))})`)
+      problems.push('the prepared report lists a malformed output')
       continue
     }
     out.push({ name, target: target as ImporterTarget, chunk: chunk as number, chunks: chunks as number, rows: rows as number, bytes: bytes as number, sha256 })
@@ -104,7 +104,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   const report = reportRaw as unknown as PrepareReport
   const reportSha256 = sha256Hex(reportBytes)
   if (report.tool !== 'first-load-prepare' || report.formatVersion !== 1) problems.push('the prepared report is not a first-load-prepare report of format version 1')
-  if (report.verdict !== 'PASS') problems.push(`the prepared report verdict is ${JSON.stringify(report.verdict)}, not PASS`)
+  if (report.verdict !== 'PASS') problems.push('the prepared report verdict is not PASS')
   if (!Array.isArray(report.selfCheckFailures) || report.selfCheckFailures.length > 0) problems.push('the prepared report records self-check failures (or has no such list)')
   if (report.accountingBalanced !== true) problems.push('the prepared report says its row accounting does not balance')
   if (!Array.isArray(report.accounting) || report.accounting.some((row) => row.unaccounted !== 0)) problems.push('the prepared report has unaccounted records (or no accounting)')
@@ -114,7 +114,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     if (errors.length > 0) problems.push(`the prepared report has ${errors.length} ERROR finding(s): ${errors.slice(0, 5).map((f) => f.code).join(', ')}`)
   }
   if (!isRecord(report.config) || report.config.baseCurrency !== manifest.baseCurrency) {
-    problems.push(`the prepared run was prepared for base currency ${JSON.stringify((report.config as { baseCurrency?: unknown } | undefined)?.baseCurrency)}, the apply manifest says ${manifest.baseCurrency}`)
+    problems.push('the prepared run was prepared for a different base currency than the apply manifest states')
   }
   if (manifest.baseCurrency !== SUPPORTED_BASE_CURRENCY) problems.push(`the base currency must be ${SUPPORTED_BASE_CURRENCY}`)
 
@@ -155,7 +155,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       try {
         parsed = parseCsvStrict(text)
       } catch (error) {
-        problems.push(`${label}: ${error instanceof CsvFormatError ? error.message : 'unreadable CSV'}`)
+        problems.push(`${label}: ${error instanceof CsvFormatError ? 'the CSV is malformed (the reader names the line)' : 'unreadable CSV'}`)
         return
       }
       if (parsed.hadBom) problems.push(`${label}: starts with a byte-order mark`)
@@ -210,14 +210,14 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       const type = cell(products, row, 'type')
       const parent = cell(products, row, 'parentSku')
       if (type === 'VARIANT') {
-        if (parent === '') problems.push(`products line ${row.line} (${sku}): a VARIANT without a parentSku`)
-        else if (productByExact.get(parent)?.type !== 'VARIABLE') problems.push(`products line ${row.line} (${sku}): its parent ${JSON.stringify(parent)} is not a VARIABLE product in the same files (the importer resolves a parent by exact SKU)`)
-      } else if (parent !== '') problems.push(`products line ${row.line} (${sku}): only a VARIANT may have a parentSku`)
+        if (parent === '') problems.push(`products ${rowLocation(row)}: a VARIANT without a parentSku`)
+        else if (productByExact.get(parent)?.type !== 'VARIABLE') problems.push(`products ${rowLocation(row)}: its parent is not a VARIABLE product in the same files (the importer resolves a parent by exact SKU)`)
+      } else if (parent !== '') problems.push(`products ${rowLocation(row)}: only a VARIANT may have a parentSku`)
       if (type === 'KIT' || type === 'BOM') {
         const skus = componentSkus(cell(products, row, 'components'))
         for (const component of skus) {
-          if (component === sku) problems.push(`products line ${row.line} (${sku}): a recipe that contains its own product`)
-          else if (!productByExact.has(component)) problems.push(`products line ${row.line} (${sku}): component ${JSON.stringify(component)} is not a product in the same files (the importer would count the product created and load no recipe)`)
+          if (component === sku) problems.push(`products ${rowLocation(row)}: a recipe that contains its own product`)
+          else if (!productByExact.has(component)) problems.push(`products ${rowLocation(row)}: a component is not a product in the same files (the importer would count the product created and load no recipe)`)
         }
         recipes.set(sku, skus.filter((c) => productByExact.has(c) && ['KIT', 'BOM'].includes(productByExact.get(c)!.type)))
       }
@@ -225,7 +225,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     const state = new Map<string, 1 | 2>()
     const visit = (sku: string, trail: string[]): void => {
       if (state.get(sku) === 2) return
-      if (state.get(sku) === 1) { problems.push(`products: a recipe cycle ${[...trail.slice(trail.indexOf(sku)), sku].join(' -> ')}`); return }
+      if (state.get(sku) === 1) { problems.push(`products ${rowLocation(productByExact.get(sku)!.row)}: part of a recipe cycle of ${trail.length - trail.indexOf(sku)} product(s)`); return }
       state.set(sku, 1)
       for (const next of recipes.get(sku) ?? []) visit(next, [...trail, sku])
       state.set(sku, 2)
@@ -238,6 +238,8 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   const orders = stepData('purchase-orders')
   const usedWarehouses = new Set<string>()
   const zeroCostPairs: string[] = []
+  const zeroCostLines = new Map<string, string>()
+  const warehouseLines = new Map<string, string>()
   if (stock) {
     let totalQty = new D(0)
     let totalValue = new D(0)
@@ -245,15 +247,16 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       const sku = cell(stock, row, 'sku').trim()
       const warehouse = cell(stock, row, 'warehouseCode').trim().toUpperCase()
       const type = productByUpper.get(sku.toUpperCase())?.type
-      if (type === undefined) problems.push(`opening-stock line ${row.line}: ${JSON.stringify(sku)} is not a product in the products file`)
-      else if (!STOCK_BEARING_TYPES.has(type)) problems.push(`opening-stock line ${row.line}: ${JSON.stringify(sku)} is a ${type} product, which cannot hold opening stock (the importer refuses it)`)
+      if (type === undefined) problems.push(`opening-stock ${rowLocation(row)}: the SKU is not a product in the products file`)
+      else if (!STOCK_BEARING_TYPES.has(type)) problems.push(`opening-stock ${rowLocation(row)}: the product's type cannot hold opening stock (the importer refuses it)`)
       usedWarehouses.add(warehouse)
+      if (!warehouseLines.has(warehouse)) warehouseLines.set(warehouse, `opening-stock ${rowLocation(row)}`)
       const qty = parseDecimal(cell(stock, row, 'qty'), 'qty', NUMERIC_LIMITS.stockQty)
       const cost = parseDecimal(cell(stock, row, 'unitCostBase'), 'unitCostBase', NUMERIC_LIMITS.unitCost)
       if (qty.ok && cost.ok) {
         totalQty = totalQty.add(qty.value)
         totalValue = totalValue.add(qty.value.mul(cost.value))
-        if (cost.value.isZero()) zeroCostPairs.push(zeroCostKey(sku, warehouse))
+        if (cost.value.isZero()) { zeroCostPairs.push(zeroCostKey(sku, warehouse)); zeroCostLines.set(zeroCostKey(sku, warehouse), rowLocation(row)) }
       }
     }
     zeroCostPairs.sort()
@@ -268,8 +271,8 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     const accepted = manifest.acceptZeroCost
     const missing = zeroCostPairs.filter((p) => !accepted.includes(p))
     const extra = accepted.filter((p) => !zeroCostPairs.includes(p))
-    if (missing.length > 0) problems.push(`opening-stock: ${missing.length} zero-cost pair(s) are not accepted in the apply manifest acceptZeroCost: ${missing.slice(0, 10).join(', ')}`)
-    if (extra.length > 0) problems.push(`the apply manifest acceptZeroCost accepts ${extra.length} pair(s) that have no zero-cost opening stock: ${extra.slice(0, 10).join(', ')}`)
+    if (missing.length > 0) problems.push(`opening-stock: ${missing.length} zero-cost pair(s) are not accepted in the apply manifest acceptZeroCost (first at ${missing.slice(0, 10).map((m) => zeroCostLines.get(m)).join('; ')})`)
+    if (extra.length > 0) problems.push(`the apply manifest acceptZeroCost accepts ${extra.length} pair(s) that have no zero-cost opening stock`)
   }
 
   if (orders) {
@@ -277,23 +280,23 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     const currenciesUsed = new Set<string>()
     for (const row of orders.data.rows) {
       const supplier = cell(orders, row, 'supplierName').trim().toUpperCase()
-      if (!supplierNames.has(supplier)) problems.push(`purchase-orders line ${row.line}: supplier ${JSON.stringify(cell(orders, row, 'supplierName'))} is not in the suppliers file`)
+      if (!supplierNames.has(supplier)) problems.push(`purchase-orders ${rowLocation(row)}: the supplier is not in the suppliers file`)
       const sku = cell(orders, row, 'sku').trim()
-      if (!productByUpper.has(sku.toUpperCase())) problems.push(`purchase-orders line ${row.line}: ${JSON.stringify(sku)} is not a product in the products file`)
+      if (!productByUpper.has(sku.toUpperCase())) problems.push(`purchase-orders ${rowLocation(row)}: the SKU is not a product in the products file`)
       const warehouse = cell(orders, row, 'destinationWarehouseCode').trim().toUpperCase()
-      if (warehouse === '') problems.push(`purchase-orders line ${row.line}: no destinationWarehouseCode (the warehouse is never assumed)`)
-      else usedWarehouses.add(warehouse)
+      if (warehouse === '') problems.push(`purchase-orders ${rowLocation(row)}: no destinationWarehouseCode (the warehouse is never assumed)`)
+      else { usedWarehouses.add(warehouse); if (!warehouseLines.has(warehouse)) warehouseLines.set(warehouse, `purchase-orders ${rowLocation(row)}`) }
       const currency = cell(orders, row, 'currency').trim().toUpperCase()
       const fx = cell(orders, row, 'fxRateToBase').trim()
       if (currency === SUPPORTED_BASE_CURRENCY) {
-        if (fx !== '' && fmt(new D(fx)) !== '1') problems.push(`purchase-orders line ${row.line}: a ${SUPPORTED_BASE_CURRENCY} order with an fxRateToBase of ${fx}`)
+        if (fx !== '' && fmt(new D(fx)) !== '1') problems.push(`purchase-orders ${rowLocation(row)}: a ${SUPPORTED_BASE_CURRENCY} order with an fxRateToBase other than 1`)
       } else {
         currenciesUsed.add(currency)
         const declared = manifest.fxRates[currency]
         const rate = parseDecimal(fx, 'fxRateToBase', NUMERIC_LIMITS.fx)
-        if (declared === undefined) problems.push(`purchase-orders line ${row.line}: currency ${currency} has no rate in the apply manifest fxRates`)
-        else if (!rate.ok) problems.push(`purchase-orders line ${row.line}: ${rate.reason}`)
-        else if (fmt(rate.value) !== declared) problems.push(`purchase-orders line ${row.line}: fxRateToBase ${fx} differs from the apply manifest fxRates.${currency} (${declared})`)
+        if (declared === undefined) problems.push(`purchase-orders ${rowLocation(row)}: the currency has no rate in the apply manifest fxRates`)
+        else if (!rate.ok) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase is not an acceptable number`)
+        else if (fmt(rate.value) !== declared) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase differs from the rate the apply manifest states for its currency`)
       }
     }
     for (const currency of Object.keys(manifest.fxRates)) if (!currenciesUsed.has(currency)) problems.push(`the apply manifest fxRates lists ${currency} but no selected purchase order uses it`)
@@ -304,26 +307,27 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   if (stock || orders) {
     const undeclared = used.filter((c) => !declared.includes(c))
     const unused = declared.filter((c) => !used.includes(c))
-    if (undeclared.length > 0) problems.push(`warehouse(s) used by the files but not declared in the apply manifest expectWarehouses: ${undeclared.join(', ')}`)
-    if (unused.length > 0) problems.push(`warehouse(s) declared in the apply manifest expectWarehouses but used by no selected file: ${unused.join(', ')}`)
+    if (undeclared.length > 0) problems.push(`${undeclared.length} warehouse code(s) used by the files are not declared in the apply manifest expectWarehouses (first use at ${undeclared.slice(0, 10).map((c) => warehouseLines.get(c)).join('; ')})`)
+    if (unused.length > 0) problems.push(`warehouse(s) declared in the apply manifest expectWarehouses but used by no selected file`)
     const reportCodes = new Set((report.warehouseCodesUsed ?? []).map((c) => c.toUpperCase()))
     const unknownToReport = used.filter((c) => !reportCodes.has(c))
-    if (unknownToReport.length > 0) problems.push(`warehouse(s) in the files that the prepared report does not list: ${unknownToReport.join(', ')}`)
+    if (unknownToReport.length > 0) problems.push(`${unknownToReport.length} warehouse code(s) in the files are not listed by the prepared report (first use at ${unknownToReport.slice(0, 10).map((c) => warehouseLines.get(c)).join('; ')})`)
   }
 
   // ---- 4. Owner rulings that exclude a product outright -----------------------------------------------------------------------------
   if (manifest.forbidSkus.length > 0) {
     const forbidden = new Set(manifest.forbidSkus)
-    const hits = new Set<string>()
-    for (const parsed of parsedFiles.values()) {
+    const hits: string[] = []
+    for (const [fileName, parsed] of parsedFiles) {
       const skuColumns = parsed.header.map((h, i) => (h === 'sku' || h === 'parentSku' ? i : -1)).filter((i) => i >= 0)
       const componentColumn = parsed.header.indexOf('components')
       for (const row of parsed.rows) {
-        for (const i of skuColumns) if (forbidden.has((row.cells[i] ?? '').trim().toUpperCase())) hits.add((row.cells[i] ?? '').trim().toUpperCase())
-        if (componentColumn >= 0) for (const component of componentSkus(row.cells[componentColumn] ?? '')) if (forbidden.has(component.toUpperCase())) hits.add(component.toUpperCase())
+        const hit = skuColumns.some((i) => forbidden.has((row.cells[i] ?? '').trim().toUpperCase()))
+          || (componentColumn >= 0 && componentSkus(row.cells[componentColumn] ?? '').some((c) => forbidden.has(c.toUpperCase())))
+        if (hit) hits.push(`${clip(fileName)} line ${row.line}`)
       }
     }
-    if (hits.size > 0) problems.push(`the prepared files contain ${hits.size} SKU(s) the apply manifest forbids (an owner ruling excludes them): ${[...hits].sort().slice(0, 10).join(', ')}`)
+    if (hits.length > 0) problems.push(`${hits.length} row(s) of the prepared files contain a SKU the apply manifest forbids (an owner ruling excludes it), first at ${hits.slice(0, 10).join('; ')}`)
   }
 
   // ---- 5. The variant-parents binding ------------------------------------------------------------------------------------------------

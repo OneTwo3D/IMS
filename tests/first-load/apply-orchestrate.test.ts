@@ -175,10 +175,10 @@ test('fail closed: an unreadable database is a refusal, never an empty database'
 test('conflicts on a fresh run stop everything before the first write: changed fields, a look-alike key, a foreign row, foreign stock history', async (t) => {
   const arms: Array<[string, (db: FakeDatabase, p: ReturnType<typeof setup>['prepared']) => void, string]> = [
     ['supplier with other fields', (db, p) => db.seed('suppliers', { ...p.steps[0].units[0], fingerprint: '{"name":"x"}', recipe: null }), 'FIELDS_DIFFER'],
-    ['SKU equal in upper case', (db) => db.seed('products', { key: 'oak-board', collisionKey: 'OAK-BOARD', fingerprint: 'x', recipe: null }), 'CASE_COLLISION'],
+    ['SKU equal in upper case', (db) => db.seed('products', { key: 'zqsent-oak-board', collisionKey: 'ZQSENT-OAK-BOARD', fingerprint: 'x', recipe: null }), 'CASE_COLLISION'],
     ['a product nobody emitted', (db) => db.seed('products', { key: 'STRANGER', collisionKey: 'STRANGER', fingerprint: 'x', recipe: null }), 'FOREIGN_ROW'],
-    ['the product exists but its recipe does not', (db, p) => { const u = p.steps[1].units.find((x) => x.key === 'LEG-01')!; db.seed('products', { key: u.key, collisionKey: u.collisionKey, fingerprint: u.fingerprint, recipe: null }) }, 'RECIPE_DIFFERS'],
-    ['stock history that is not an opening layer', (db) => { db.foreignHistory = ['LEG-01|MAIN'] }, 'FOREIGN_HISTORY'],
+    ['the product exists but its recipe does not', (db, p) => { const u = p.steps[1].units.find((x) => x.key === 'ZQSENT-LEG-01')!; db.seed('products', { key: u.key, collisionKey: u.collisionKey, fingerprint: u.fingerprint, recipe: null }) }, 'RECIPE_DIFFERS'],
+    ['stock history that is not an opening layer', (db) => { db.foreignHistory = ['ZQSENT-LEG-01|ZQSENT-MAIN'] }, 'FOREIGN_HISTORY'],
     ['the same key twice', (db, p) => { const u = p.steps[0].units[0]; db.seed('suppliers', { ...u }); db.seed('suppliers', { ...u }) }, 'DUPLICATE_IN_DATABASE'],
   ]
   precondition(t, 'conflict arms', arms.length)
@@ -223,14 +223,14 @@ test('crash in the middle of opening stock: the resume sends ONLY the rows that 
 
 test('silent recipe loss: a product the importer counted as created but whose recipe is missing is FAILED, the run stops, and the counters are only a cross-check', async () => {
   const { prepared, db, options } = setup()
-  db.dropRecipeFor.add('GIFT-SET')
+  db.dropRecipeFor.add('ZQSENT-GIFT-SET')
   const result = await runLoad(prepared, db.ports(), options())
   assert.equal(result.exit, 'STEP_FAILED')
   const products = result.steps.find((s) => s.step === 'products')!
   assert.equal(products.importer[0].created, 8, 'the importer says all eight were created')
   assert.equal(products.created, 7)
   assert.equal(products.failed, 1)
-  assert.deepEqual(products.rows.filter((r) => r.outcome === 'failed'), [{ key: 'GIFT-SET', outcome: 'failed', reason: 'RECIPE_DIFFERS' }])
+  assert.deepEqual(products.rows.filter((r) => r.outcome === 'failed'), [{ key: 'ZQSENT-GIFT-SET', outcome: 'failed', reason: 'RECIPE_DIFFERS' }])
   assert.match(products.counterFindings[0], /reported 8 row\(s\) created, the database shows 7/)
   assert.ok(!db.executed.some((e) => e.step === 'opening-stock'), 'nothing after the failed step ran')
   assert.equal(db.journalRecord?.steps.products?.status, 'FAILED')
@@ -241,7 +241,7 @@ test('conflict that appears AFTER the first read (another writer): the step re-r
   let stockReads = 0
   const ports = db.ports({
     observe: async (step) => {
-      if (step === 'opening-stock' && ++stockReads === 2) db.foreignHistory = ['OAK-BOARD|MAIN']
+      if (step === 'opening-stock' && ++stockReads === 2) db.foreignHistory = ['ZQSENT-OAK-BOARD|ZQSENT-MAIN']
       return db.observeNow(step)
     },
   })
@@ -257,7 +257,7 @@ test('a conflict found on a RESUME is reported as CONFLICT (earlier writes stand
   db.failAfterRows = 2 + 8 + 1
   assert.equal((await runLoad(prepared, db.ports(), options())).exit, 'STEP_FAILED')
   db.failAfterRows = null
-  db.foreignHistory = ['LEG-01|MAIN']
+  db.foreignHistory = ['ZQSENT-LEG-01|ZQSENT-MAIN']
   const result = await runLoad(prepared, db.ports(), options({ resume: true }))
   assert.equal(result.exit, 'CONFLICT')
 })
