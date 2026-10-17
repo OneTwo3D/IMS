@@ -1142,6 +1142,9 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // before the new build is started. Both are found by this scan because their prose names `psql`
   // and `prisma migrate deploy` — neither executes either tool, and neither writes anything.
   'scripts/check-db-writers.mjs': 'deploy-read-only-probe',
+  // The first-load apply runner's quiesce rail reads pg_stat_activity (on the app's own pooled client) to prove no other client session is connected before it loads anything. A READ: it writes nothing
+  // and cannot move a plugin key; the rest of that file only reads configuration (tax rates, warehouses, FX).
+  'lib/first-load/apply/db/rails.ts': 'deploy-read-only-probe',
   'scripts/run-migration-verifications.mjs': 'deploy-read-only-probe',
   // o3d-2sm1.5's post-migration ownership assertion. It runs one SELECT over pg_class and asks
   // has_table_privilege / has_sequence_privilege / has_schema_privilege ABOUT THE APPLICATION ROLE
