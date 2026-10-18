@@ -47,6 +47,8 @@ export interface KeyedUnit {
   recipe: string | null
   /** Indexes into StepRows.rows (a purchase order unit spans all its lines). */
   rowIndexes: number[]
+  /** Purchase orders only: each line's quantity, entered unit cost and line discount as the importer reads them, in file order. The read-back recomputes the stored amounts from these. */
+  poLines?: Array<{ qty: number; unitCost: number; discount: number }>
 }
 
 export interface KeyedStep {
@@ -230,7 +232,14 @@ export function keyStep(step: ApplyStepId, data: StepRows): KeyedStep {
         if (!qty.value.gt(new D(0))) { problems.push(`${where(row)}: quantity must be greater than zero`); continue }
         lines.push(purchaseOrderLine(cellsOf(row), qty.value, cost.value))
       }
-      units.push({ step, key, collisionKey: key.toUpperCase(), fingerprint: purchaseOrderFingerprint(purchaseOrderHeader(spec.fingerprinted, cellsOf(first)), lines), recipe: null, rowIndexes: indexes })
+      // The numbers as the importer reads them: Number(qty || 1), parseOptionalNumber(unit cost), parseOptionalNumber(discount) ?? 0.
+      const poLines = indexes.map((i) => {
+        const row = data.rows[i]
+        const qty = Number(get(row, 'qty') || 1)
+        const disc = get(row, 'lineDiscountForeign').trim() === '' ? 0 : Number(get(row, 'lineDiscountForeign').trim())
+        return { qty, unitCost: Number(get(row, 'unitCostForeign').trim()), discount: Number.isFinite(disc) ? disc : 0 }
+      })
+      units.push({ step, key, collisionKey: key.toUpperCase(), fingerprint: purchaseOrderFingerprint(purchaseOrderHeader(spec.fingerprinted, cellsOf(first)), lines), recipe: null, rowIndexes: indexes, poLines })
     }
     units.sort((a, b) => a.rowIndexes[0] - b.rowIndexes[0])
   }

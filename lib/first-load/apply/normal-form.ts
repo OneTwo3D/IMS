@@ -320,8 +320,6 @@ export interface DbPurchaseOrder {
     discountAmount: DecimalLike
     discountStr: string | null
     taxRate: { name: string; rate: DecimalLike; /** Digest of the rate's accounting profile as it is now. */ profileDigest?: string } | null
-    /** The stored tax amount is what the rate's current effective rate gives for the stored total (computed by the reader; absent = not checked). */
-    taxAmountConsistent?: boolean
   }>
 }
 
@@ -365,12 +363,11 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
     const prefix = linePrefix({ sku: line.product.sku, qty: new D(line.qty.toFixed()), amount, discount: new D(line.discountAmount.toFixed()), discountStr: line.discountStr ?? '' })
     const name = line.taxRate ? line.taxRate.name.trim().toLowerCase() : null
     const digest = line.taxRate?.profileDigest ?? null
-    const taxAmountConsistent = line.taxAmountConsistent !== false
     const rate4 = line.taxRate ? fmtFixed(new D(line.taxRate.rate.toFixed()), 4) : null
     // When the order states a value too (taxRatePercent), the order's rate must have that value.
     const sameAsOrderValue = rate4 !== null && (po.taxRatePercent === null || rate4 === fmtFixed(new D(po.taxRatePercent.toFixed()), 4))
     const inheritedOk = orderName === '' ? line.taxRate === null : line.taxRate !== null && line.taxRate.name.trim() === orderName && sameAsOrderValue
-    return { prefix, name, rate4, inheritedOk, digest, taxAmountConsistent }
+    return { prefix, name, rate4, inheritedOk, digest }
   })
   // The accounting profile the rate had when the orders were created is recorded on the run record (taxProfiles, by lookup key). A stored line whose rate's profile is not that one is
   // not what the importer stored for that lookup, whatever its name and percentage say.
@@ -380,8 +377,6 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
   }
   const satisfies = (line: (typeof stored)[number], fileLine: string): boolean => {
     if (!fileLine.startsWith(`${line.prefix}|`)) return false
-    // The stored tax amount must still be what the stored rate gives for the stored total: a rate edited after the load, or an amount edited by hand, is a difference.
-    if (!line.taxAmountConsistent) return false
     const token = fileLine.slice(line.prefix.length + 1)
     if (token === '') return line.inheritedOk && profileHolds(line, `o:${orderName}`)
     if (token.startsWith('v:')) return line.rate4 !== null && token === `v:${line.rate4}` && profileHolds(line, token)

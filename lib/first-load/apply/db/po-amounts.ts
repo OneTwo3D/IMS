@@ -7,14 +7,14 @@
  * `applyHeaderOrderDiscount`, already shared) and returns the NAMES of the columns that differ. The lines themselves are pinned to the file by the fingerprint (quantity, entered amount after
  * discount, tax token, tax profile, tax amount against the rate), so a header edited together with its lines still differs from the file through them.
  *
- * TOLERANCE. Amounts are stored to 4 decimal places and unit costs to 6. The importer computes in floating point and sums floats; this recomputation uses the same functions on the stored
- * (already rounded) values, so the only difference left is float accumulation and the last rounding: at most one unit in the last stored place. 0.0001 for 4 dp amounts; for the base unit
- * cost 0.000002 scaled by 1/fx when fx < 1 (the stored foreign unit cost was rounded to 6 dp before it was divided). A larger difference is a difference.
+ * NO TOLERANCE. Every stored line amount is compared EXACTLY, at the places it is stored (unit costs 6 dp, amounts 4 dp), with what the importer's own arithmetic gives for the FILE's numbers
+ * (`expectedLine`: the same expressions on the same rounding primitives). The header is composed from those expected lines with the importer's own `applyHeaderOrderDiscount`.
  *
  * Also checked: the columns the importer never sets (they keep their defaults) are still at them. A value in one of them did not come from this load.
  */
 import { calcLineTotals, safeFxRate } from '@/lib/domain/purchasing/line-totals'
 import { applyHeaderOrderDiscount } from '@/lib/domain/purchasing/order-discount'
+import { D } from '../../money'
 
 type Dec = { toFixed(): string }
 
@@ -61,60 +61,91 @@ export interface StoredPoAmounts {
     qtyReturned: Dec
     landedUnitCostBase: Dec
     reorderEvidence: unknown
+    sortOrder: number
+    /** The effective rate the line was taxed at: its rate's, or the order's stated percent when the line holds no rate. */
+    effectiveRate: number
   }>
 }
 
-export const AMOUNT_TOLERANCE = 0.0001
 const num = (value: Dec): number => Number(value.toFixed())
-const near = (a: number, b: number, tolerance: number): boolean => Math.abs(a - b) <= tolerance + 1e-12
+/** A stored decimal equals an importer-computed number rounded to `dp` places (half up), exactly. */
+const exact = (stored: Dec, value: number, dp: number): boolean => new D(stored.toFixed()).toFixed(dp) === new D(value).toDecimalPlaces(dp, D.ROUND_HALF_UP).toFixed(dp)
 
-/** The names (never values) of the stored columns that are not what the importer would have written; empty = all good. */
-export function headerAmountMismatches(po: StoredPoAmounts): string[] {
+/** One line of the FILE, as the importer reads it: quantity, entered unit cost and line discount, as numbers. */
+export interface FileLineNumbers {
+  qty: number
+  unitCost: number
+  discount: number
+}
+
+/**
+ * What createPurchaseOrder computes for one line, from the FILE's numbers, the line's tax rate (the effective rate it resolves to, or the order's stated percent when the line holds none)
+ * and the order's VAT convention and FX rate: the same expressions, in the same order, on the same rounding primitives. Nothing here is a tolerance.
+ */
+export function expectedLine(file: FileLineNumbers, rate: number, inclVat: boolean, fx: number): {
+  unitCostForeign: number; unitCostBase: number; totalForeign: number; totalBase: number; taxForeign: number; taxBase: number
+} {
+  const lineInclVat = inclVat && rate > 0
+  const grossAfterDisc = Math.max(0, file.qty * file.unitCost - file.discount)
+  const netLineForeign = lineInclVat ? grossAfterDisc / (1 + rate) : grossAfterDisc
+  const netUnitForeign = file.qty > 0 ? netLineForeign / file.qty : 0
+  const { unitCostBase, totalForeign, totalBase } = calcLineTotals(netUnitForeign, file.qty, fx)
+  const taxForeign = lineInclVat ? Math.round((grossAfterDisc - totalForeign) * 10000) / 10000 : Math.round(totalForeign * rate * 10000) / 10000
+  const taxBase = Math.round((taxForeign / fx) * 10000) / 10000
+  return { unitCostForeign: netUnitForeign, unitCostBase, totalForeign, totalBase, taxForeign, taxBase }
+}
+
+/**
+ * The names (never values) of the stored columns that are not what the importer would have written for THIS FILE; empty = all good. `file` holds the order's lines in file order (the
+ * importer stores them in that order, `sortOrder` = position); null for an order the file does not contain.
+ */
+export function headerAmountMismatches(po: StoredPoAmounts, file: readonly FileLineNumbers[] | null): string[] {
   const bad = new Set<string>()
-  const fx = safeFxRate(num(po.fxRateToBase))
+  const fxRaw = num(po.fxRateToBase)
+  const fx = safeFxRate(fxRaw)
+  const stored = [...po.lines].sort((a, b) => a.sortOrder - b.sortOrder)
 
-  // ---- lines ----
-  let subtotalForeign = 0
-  let subtotalBase = 0
-  let taxForeign = 0
-  let taxBase = 0
-  for (const line of po.lines) {
-    const totalForeign = num(line.totalForeign)
-    const lineTaxForeign = num(line.taxForeign)
-    // totalBase = round4(totalForeign / fx); taxBase = round4(taxForeign / fx); unitCostBase = round6(unitCostForeign / fx), by calcLineTotals on the stored net unit cost.
-    const derived = calcLineTotals(num(line.unitCostForeign), num(line.qty), fx)
-    // The stored net unit cost must give the stored line total: totalForeign = round4(unitCostForeign x qty) by calcLineTotals. The importer rounded the unit cost to 6 dp AFTER
-    // computing the total from the unrounded one, so the two agree to 0.0001 plus half a unit of the 6th place per unit of quantity. A unit cost altered (with its base twin)
-    // while the file-pinned total stays put is therefore a difference here, and the unit cost is tied to the file through the total the fingerprint compares.
-    if (!near(totalForeign, derived.totalForeign, AMOUNT_TOLERANCE + num(line.qty) * 0.0000005)) bad.add('line.unitCostForeign')
-    if (!near(num(line.totalBase), Math.round((totalForeign / fx) * 10000) / 10000, AMOUNT_TOLERANCE)) bad.add('line.totalBase')
-    if (!near(num(line.taxBase), Math.round((lineTaxForeign / fx) * 10000) / 10000, AMOUNT_TOLERANCE)) bad.add('line.taxBase')
-    if (!near(num(line.unitCostBase), derived.unitCostBase, 0.000002 * Math.max(1, 1 / fx))) bad.add('line.unitCostBase')
+  if (file === null) bad.add('notInFile')
+  else if (file.length !== stored.length) bad.add('lineCount')
+  else {
+    let subtotalForeign = 0
+    let subtotalBase = 0
+    let taxForeign = 0
+    let taxBase = 0
+    stored.forEach((line, i) => {
+      const e = expectedLine(file[i]!, line.effectiveRate, po.pricesIncludeVat, fxRaw)
+      // The net unit cost to 6 dp, its base twin, the totals and the taxes to the places they are stored: exactly what the importer's arithmetic gives for the file's numbers.
+      if (!exact(line.unitCostForeign, e.unitCostForeign, 6)) bad.add('line.unitCostForeign')
+      if (!exact(line.unitCostBase, e.unitCostBase, 6)) bad.add('line.unitCostBase')
+      if (!exact(line.totalForeign, e.totalForeign, 4)) bad.add('line.totalForeign')
+      if (!exact(line.totalBase, e.totalBase, 4)) bad.add('line.totalBase')
+      if (!exact(line.taxForeign, e.taxForeign, 4)) bad.add('line.taxForeign')
+      if (!exact(line.taxBase, e.taxBase, 4)) bad.add('line.taxBase')
+      subtotalForeign += e.totalForeign
+      subtotalBase += e.totalBase
+      taxForeign += e.taxForeign
+      taxBase += e.taxBase
+    })
+    // ---- header: the importer's own composition, from those expected lines ----
+    const discounted = applyHeaderOrderDiscount({
+      subtotalForeign, subtotalBase, taxForeign, taxBase,
+      orderDiscountForeign: Math.max(0, num(po.discountAmount)), inclVat: po.pricesIncludeVat, fxRate: fxRaw,
+    })
+    const expected: Record<string, number> = {
+      subtotalForeign: discounted.subtotalForeign,
+      subtotalBase: discounted.subtotalBase,
+      taxForeign: discounted.taxForeign,
+      taxBase: discounted.taxBase,
+      totalForeign: discounted.subtotalForeign + discounted.taxForeign,
+      totalBase: discounted.subtotalBase + discounted.taxBase,
+    }
+    for (const [column, value] of Object.entries(expected)) {
+      if (!exact((po as unknown as Record<string, Dec>)[column]!, value, 4)) bad.add(column)
+    }
+  }
+  for (const line of stored) {
     if (line.description !== null || line.purchaseUnitId !== null || line.purchaseUnitQty !== null || num(line.qtyReceived) !== 0 || num(line.qtyReturned) !== 0
       || num(line.landedUnitCostBase) !== 0 || line.reorderEvidence !== null) bad.add('line.defaults')
-    subtotalForeign += totalForeign
-    subtotalBase += num(line.totalBase)
-    taxForeign += lineTaxForeign
-    taxBase += num(line.taxBase)
-  }
-
-  // ---- header: the importer's own composition, from the stored lines ----
-  const discounted = applyHeaderOrderDiscount({
-    subtotalForeign, subtotalBase, taxForeign, taxBase,
-    orderDiscountForeign: Math.max(0, num(po.discountAmount)), inclVat: po.pricesIncludeVat, fxRate: num(po.fxRateToBase),
-  })
-  const freightForeign = 0
-  const freightBase = 0
-  const expected: Record<string, number> = {
-    subtotalForeign: discounted.subtotalForeign,
-    subtotalBase: discounted.subtotalBase,
-    taxForeign: discounted.taxForeign,
-    taxBase: discounted.taxBase,
-    totalForeign: discounted.subtotalForeign + discounted.taxForeign + freightForeign,
-    totalBase: discounted.subtotalBase + discounted.taxBase + freightBase,
-  }
-  for (const [column, value] of Object.entries(expected)) {
-    if (!near(num((po as unknown as Record<string, Dec>)[column]), value, AMOUNT_TOLERANCE)) bad.add(column)
   }
 
   // ---- columns this load never sets ----
@@ -132,7 +163,7 @@ export function headerAmountMismatches(po: StoredPoAmounts): string[] {
 }
 
 /** The fingerprint entry: `ok`, or the names of the columns that are not what the importer writes. */
-export function headerAmountsEntry(po: StoredPoAmounts): string {
-  const bad = headerAmountMismatches(po)
+export function headerAmountsEntry(po: StoredPoAmounts, file: readonly FileLineNumbers[] | null): string {
+  const bad = headerAmountMismatches(po, file)
   return bad.length === 0 ? 'ok' : `mismatch:${bad.join(',')}`
 }

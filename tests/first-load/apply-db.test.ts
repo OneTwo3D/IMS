@@ -88,6 +88,9 @@ const PO_NINE = `${TAG}-PO-9`
 const PO_TEN = `${TAG}-PO-10`
 const PO_ELEVEN = `${TAG}-PO-11`
 const PO_TWELVE = `${TAG}-PO-12`
+const PO_THIRTEEN = `${TAG}-PO-13`
+const PO_FOURTEEN = `${TAG}-PO-14`
+const PO_FIFTEEN = `${TAG}-PO-15`
 const SUPPLIER_A = `${TAG} Odd Supplier`
 const SUPPLIER_B = `${TAG} Euro Supplier`
 const ODD_FILES: Record<ApplyStepId, StepRows> = {
@@ -127,6 +130,11 @@ function differingColumns(a: string, b: string): string[] {
   const left = JSON.parse(a) as Record<string, unknown>
   const right = JSON.parse(b) as Record<string, unknown>
   return [...new Set([...Object.keys(left), ...Object.keys(right)])].filter((k) => JSON.stringify(left[k]) !== JSON.stringify(right[k])).sort()
+}
+
+/** A difference in the order's lines. Changing the tax RATE a line holds also changes the tax amount that rate implies, so the header amounts may differ with it: both are accepted, nothing else. */
+function assertLinesDiffer(actual: string[], label: string): void {
+  assert.ok(actual.includes('lines') && actual.every((c) => c === 'lines' || c === 'headerAmounts'), `${label}: ${JSON.stringify(actual)}`)
 }
 
 const OK_REHEARSAL = (digest: string, systemId: string) => ({ formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: digest, verdict: 'OK', systemId, finishedAt: new Date().toISOString() })
@@ -339,7 +347,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), [], 'control: as loaded, the blank currency is the supplier\'s and matches')
       await m.db.purchaseOrder.update({ where: { reference: PO_ONE }, data: { currency: 'EUR' } })
       try {
-        assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), ['currency', 'headerAmounts'], 'the currency, and the price cache that was written in the supplier\'s currency')
+        assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), ['currency'])
         const result = classifyStep('purchase-orders', [unit], { entries: [await entry(PO_ONE)] })
         assert.equal(result.units[0]!.conflict?.code, 'FIELDS_DIFFER')
       } finally {
@@ -352,7 +360,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       const rate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME }, select: { id: true } })
       await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { taxRateId: rate.id } })
       try {
-        assert.deepEqual(differingColumns(unitTwo.fingerprint, (await entry(PO_TWO)).fingerprint), ['lines'])
+        assertLinesDiffer(differingColumns(unitTwo.fingerprint, (await entry(PO_TWO)).fingerprint), 'a rate stored on a line that names none')
       } finally {
         await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { taxRateId: null } })
       }
@@ -386,7 +394,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           const line = await lineOf(key, sku)
           for (const alternative of alternatives) {
             await setTax(line.id, alternative)
-            try { assert.deepEqual(await diff(key), ['lines'], `${key} ${sku}: stored ${alternative === null ? 'none' : alternative === other.id ? 'another rate' : 'the order rate'} instead of ${original === null ? 'none' : 'the order rate'}`) } finally { await setTax(line.id, original) }
+            try { assertLinesDiffer(await diff(key), `${key} ${sku}: stored ${alternative === null ? 'none' : alternative === other.id ? 'another rate' : 'the order rate'} instead of ${original === null ? 'none' : 'the order rate'}`) } finally { await setTax(line.id, original) }
             arms++
           }
           assert.deepEqual(await diff(key), [], `${key} ${sku}: restored`)
@@ -424,7 +432,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual(differingColumns(five.fingerprint, (await entry(PO_FIVE)).fingerprint), [], 'control: matches as loaded')
         await m.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.1' } })
         try {
-          assert.deepEqual(differingColumns(five.fingerprint, (await entry(PO_FIVE)).fingerprint), ['lines'], 'a later change of the named rate\'s value surfaces')
+          assertLinesDiffer(differingColumns(five.fingerprint, (await entry(PO_FIVE)).fingerprint), 'a later change of the named rate\'s value surfaces')
           // (b) loaded while the rate is 10% although the file states 20: the importer takes the NAME, stores 10%, and the load is reported as different.
           const six = await load(PO_SIX)
           assert.equal(Number(await storedTax(PO_SIX)), 10, 'the importer applied the named rate (10%), not the stated 20')
@@ -460,7 +468,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           await m.db.purchaseOrderLine.update({ where: { id: inheriting.id }, data: { taxRateId: vat.id } })
           try {
             const changed = (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!
-            assert.deepEqual(differingColumns(keyed.units[0]!.fingerprint, changed.fingerprint), ['lines'])
+            assertLinesDiffer(differingColumns(keyed.units[0]!.fingerprint, changed.fingerprint), 'the inheriting line stored with the explicit rate')
           } finally { await m.db.purchaseOrderLine.update({ where: { id: inheriting.id }, data: { taxRateId: orderTax.id } }) }
         }
       } finally {
@@ -521,10 +529,10 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), [], `${label}: restored`)
         }
         // The stored tax AMOUNT is checked against the stored rate too: an amount edited by hand (or computed under a rate that has since changed) is a difference.
-        // Mutation named: drop taxAmountConsistent from the pairing -> this arm is green when it must be red.
+        // Mutation named: drop the exact per-line comparison with the file's arithmetic -> this arm is green when it must be red.
         const eightLine = await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_EIGHT } }, select: { id: true, taxForeign: true } })
         await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: '21' } })
-        try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['headerAmounts', 'lines'], 'a hand-edited tax amount (the header no longer adds up either)') } finally { await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: eightLine.taxForeign } }) }
+        try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['headerAmounts'], 'a hand-edited tax amount') } finally { await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: eightLine.taxForeign } }) }
         assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), [], 'restored')
         const component = await m.db.taxRateComponent.create({ data: { taxRateId: rate.id, name: 'part', rate: '0.2', sortOrder: 0 } })
         try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['lines'], 'a component added later') } finally { await m.db.taxRateComponent.delete({ where: { id: component.id } }) }
@@ -732,6 +740,81 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual([await diff(first), await diff(second)], [[], []], 'restored')
       } finally {
         for (const key of [PO_ELEVEN, PO_TWELVE]) {
+          await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key])
+          await sql('delete from purchase_orders where reference = $1', [key])
+        }
+      }
+    })
+
+    it('the stored amounts are compared EXACTLY with the importer\'s arithmetic on the FILE\'s numbers: a unit cost of 1.000040 where the file gives 1.000000 is a difference although both give a 4 dp total of 1.0000', async () => {
+      // Mutation named: compare the stored unit cost only with the stored total (the old tolerance) -> the 1.000040 arm is green when it must be red.
+      const execute = m.execute.createExecutor({ runId: 'exact', operator: 'Exact Test' })
+      const loaded: Array<(typeof units)['purchase-orders'][number]> = []
+      const stub = { steps: [{ step: 'purchase-orders', get units() { return [...units['purchase-orders'], ...loaded] } }] } as unknown as PreparedRun
+      const load = async (key: string, line: Record<string, string>) => {
+        const data = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: key, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, ...line }])
+        const keyed = keyStep('purchase-orders', data)
+        assert.deepEqual(keyed.problems, [])
+        assert.deepEqual((await execute('purchase-orders', buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!, NO_LOCK)).errors, [])
+        loaded.push(keyed.units[0]!)
+        return keyed.units[0]!
+      }
+      const diff = async (unit: (typeof loaded)[number]) => differingColumns(unit.fingerprint, (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === unit.key)!.fingerprint)
+      try {
+        const one = await load(PO_THIRTEEN, { qty: '1', unitCostForeign: '1.000000' })
+        assert.deepEqual(await diff(one), [], 'control: as written')
+        const line = await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_THIRTEEN } } })
+        // fx is 1, so the base twin is the same number; the TOTALS stay at 1.0000.
+        await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: '1.00004', unitCostBase: '1.00004' } })
+        assert.deepEqual(await diff(one), ['headerAmounts'], 'both unit costs at 1.000040, totals unchanged')
+        await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: '1', unitCostBase: '1.00004' } })
+        assert.deepEqual(await diff(one), ['headerAmounts'], 'only the base unit cost')
+        // The price cache follows the unit cost here, so that only the unit cost itself can be what differs.
+        const cache = await m.db.supplierProduct.findFirstOrThrow({ where: { supplier: { name: SUPPLIER_A }, product: { sku: `${TAG}-SIMPLE` } } })
+        await m.db.supplierProduct.update({ where: { id: cache.id }, data: { lastUnitCost: '1.00004' } })
+        await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: '1.00004', unitCostBase: '1' } })
+        assert.deepEqual(await diff(one), ['headerAmounts'], 'only the foreign unit cost')
+        await m.db.supplierProduct.update({ where: { id: cache.id }, data: { lastUnitCost: cache.lastUnitCost } })
+        await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: line.unitCostForeign, unitCostBase: line.unitCostBase } })
+        assert.deepEqual(await diff(one), [], 'restored')
+        // An order whose only tax statement is an order-level PERCENT (no name): the importer taxes the lines at it although no line holds a rate row.
+        const percent = await load(PO_FOURTEEN, { qty: '3', unitCostForeign: '2.5', orderTaxRateValue: '20' })
+        assert.deepEqual(await diff(percent), [], 'an order-level percent with no named rate matches as written')
+        const stored = await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_FOURTEEN } }, select: { taxForeign: true, taxRateId: true } })
+        assert.deepEqual({ rate: stored.taxRateId, tax: stored.taxForeign.toFixed() }, { rate: null, tax: '1.5' }, 'precondition: taxed at 20% without a rate row')
+      } finally {
+        for (const key of [PO_THIRTEEN, PO_FOURTEEN]) {
+          await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key])
+          await sql('delete from purchase_orders where reference = $1', [key])
+        }
+      }
+    })
+
+    it('two orders for one supplier and product in different currencies both match as written: only the LAST write is compared with the price cache', async () => {
+      // Mutation named: require the cache currency to equal EVERY order\'s (the old rule) -> the earlier order is a false conflict: red.
+      const execute = m.execute.createExecutor({ runId: 'currencies', operator: 'Currency Test' })
+      const loaded: Array<(typeof units)['purchase-orders'][number]> = []
+      const stub = { steps: [{ step: 'purchase-orders', get units() { return [...units['purchase-orders'], ...loaded] } }] } as unknown as PreparedRun
+      const load = async (key: string, currency: string, fx: string) => {
+        const data = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: key, supplierName: SUPPLIER_B, currency, fxRateToBase: fx, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-BOM`, qty: '2', unitCostForeign: '4' }])
+        const keyed = keyStep('purchase-orders', data)
+        assert.deepEqual(keyed.problems, [])
+        assert.deepEqual((await execute('purchase-orders', buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!, NO_LOCK)).errors, [])
+        loaded.push(keyed.units[0]!)
+        return keyed.units[0]!
+      }
+      const diff = async (unit: (typeof loaded)[number]) => differingColumns(unit.fingerprint, (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === unit.key)!.fingerprint)
+      try {
+        const eur = await load(PO_FIFTEEN, 'EUR', '1.25')
+        await new Promise((r) => setTimeout(r, 15))
+        const gbp = await load(`${PO_FIFTEEN}-B`, 'GBP', '1')
+        const sp = await m.db.supplierProduct.findFirstOrThrow({ where: { supplier: { name: SUPPLIER_B }, product: { sku: `${TAG}-BOM` } } })
+        assert.equal(sp.currency, 'GBP', 'precondition: the cache holds the last write\'s currency')
+        assert.deepEqual([await diff(eur), await diff(gbp)], [[], []], 'both match as written')
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { currency: 'EUR' } })
+        assert.deepEqual([await diff(eur), await diff(gbp)], [['headerAmounts'], ['headerAmounts']], 'a cache currency that is not the last write\'s')
+      } finally {
+        for (const key of [PO_FIFTEEN, `${PO_FIFTEEN}-B`]) {
           await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key])
           await sql('delete from purchase_orders where reference = $1', [key])
         }

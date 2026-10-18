@@ -16,7 +16,7 @@ import {
 } from '../normal-form'
 import type { PreparedRun } from '../prepared'
 import { loadFacts } from './journal'
-import { headerAmountsEntry } from './po-amounts'
+import { headerAmountsEntry, type FileLineNumbers } from './po-amounts'
 import { TAX_RATE_SELECT, effectiveRate, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import { ObservationError, type ObservedEntry, type StepObservation } from '../residual'
 
@@ -204,22 +204,6 @@ async function observeOpeningStock(): Promise<StepObservation> {
   return { entries, foreignHistoryKeys }
 }
 
-/**
- * Is the stored line tax what createPurchaseOrder computes from the line's stored total and the rate it holds NOW?
- *   exclusive prices: tax = round4(total x effective rate);
- *   VAT-inclusive prices (and a rate above zero): the total was gross / (1 + rate), so round4((total + tax) / (1 + rate)) is the total;
- * within one unit in the 4th decimal place (the importer computes in floating point). No rate: no tax.
- */
-function taxAmountConsistent(pricesIncludeVat: boolean, line: { totalForeign: { toFixed(): string }; taxForeign: { toFixed(): string }; taxRate: (TaxRateRow & { rate: { toFixed(): string } }) | null }): boolean {
-  const total = new D(line.totalForeign.toFixed())
-  const tax = new D(line.taxForeign.toFixed())
-  const rate = line.taxRate === null ? new D(0) : new D(effectiveRate(line.taxRate))
-  const tolerance = new D('0.0001')
-  if (rate.isZero()) return tax.isZero()
-  if (!pricesIncludeVat) return total.mul(rate).toDecimalPlaces(4, D.ROUND_HALF_UP).minus(tax).abs().lte(tolerance)
-  return total.plus(tax).div(rate.plus(1)).toDecimalPlaces(4, D.ROUND_HALF_UP).minus(total).abs().lte(tolerance)
-}
-
 async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObservation> {
   const facts = await loadFacts()
   const profiles = typeof facts.taxProfiles === 'object' && facts.taxProfiles !== null ? (facts.taxProfiles as Record<string, string>) : null
@@ -248,7 +232,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
   // beyond that).
   const supplierProducts = await db.supplierProduct.findMany({ select: { supplierId: true, productId: true, lastUnitCost: true, currency: true } })
   const cacheByPair = new Map(supplierProducts.map((sp) => [`${sp.supplierId}:${sp.productId}`, sp]))
-  const lastByPair = new Map<string, { at: number; costs: Set<string> }>()
+  const lastByPair = new Map<string, { at: number; written: Set<string> }>()
   for (const row of rows) {
     const lastInOrder = new Map<string, { sortOrder: number; cost: string }>()
     for (const line of row.lines) {
@@ -258,21 +242,28 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
     }
     const at = row.createdAt.getTime()
     for (const [pair, last] of lastInOrder) {
+      // What the upsert left in the cache is the cost AND the currency of that last write.
+      const written = `${last.cost}|${row.currency}`
       const best = lastByPair.get(pair)
-      if (!best || at > best.at) lastByPair.set(pair, { at, costs: new Set([last.cost]) })
-      else if (at === best.at) best.costs.add(last.cost)
+      if (!best || at > best.at) lastByPair.set(pair, { at, written: new Set([written]) })
+      else if (at === best.at) best.written.add(written)
     }
   }
+  // Only the LAST write per pair is compared with the cache: an earlier order, in whatever currency, is not (the cache was overwritten by what followed it).
   const supplierProductsOk = (row: (typeof rows)[number]): boolean => row.lines.every((line) => {
     const pair = `${row.supplierId}:${line.productId}`
     const cache = cacheByPair.get(pair)
-    return cache !== undefined && cache.currency === row.currency && cache.lastUnitCost !== null && (lastByPair.get(pair)?.costs.has(new D(cache.lastUnitCost.toFixed()).toFixed(6)) ?? false)
+    return cache !== undefined && cache.lastUnitCost !== null && (lastByPair.get(pair)?.written.has(`${new D(cache.lastUnitCost.toFixed()).toFixed(6)}|${cache.currency}`) ?? false)
   })
+  // The FILE's numbers for each order, in file order (the importer stores lines in that order): quantity, entered unit cost and line discount (KeyedUnit.poLines).
+  const fileLines = new Map<string, FileLineNumbers[]>(
+    (prepared.steps.find((st) => st.step === 'purchase-orders')?.units ?? []).filter((u) => u.poLines !== undefined).map((u) => [u.key, u.poLines!]),
+  )
   return {
     entries: rows.map((row): ObservedEntry => ({
       key: row.reference,
       collisionKey: row.reference.toUpperCase(),
-      fingerprint: purchaseOrderFingerprintFromDb(columns, { ...row, headerAmounts: headerAmountsEntry({ ...row, freightCostLineCount: row._count.freightCostLines, supplierProductsOk: supplierProductsOk(row) }), lines: row.lines.map((l) => ({ ...l, taxRate: l.taxRate ? { name: l.taxRate.name, rate: l.taxRate.rate, profileDigest: signatureDigest(taxRateSignature(l.taxRate)) } : null, taxAmountConsistent: taxAmountConsistent(row.pricesIncludeVat, l) })) }, fileFingerprints.get(row.reference) ?? null, profiles),
+      fingerprint: purchaseOrderFingerprintFromDb(columns, { ...row, headerAmounts: headerAmountsEntry({ ...row, freightCostLineCount: row._count.freightCostLines, supplierProductsOk: supplierProductsOk(row), lines: row.lines.map((l) => ({ ...l, effectiveRate: l.taxRate ? Number(effectiveRate(l.taxRate)) : Number(row.taxRatePercent?.toFixed() ?? 0) })) }, fileLines.get(row.reference) ?? null), lines: row.lines.map((l) => ({ ...l, taxRate: l.taxRate ? { name: l.taxRate.name, rate: l.taxRate.rate, profileDigest: signatureDigest(taxRateSignature(l.taxRate)) } : null})) }, fileFingerprints.get(row.reference) ?? null, profiles),
       recipe: null,
     })),
   }
