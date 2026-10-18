@@ -11,7 +11,10 @@ import {
   REHEARSAL_MAX_AGE_HOURS, RESTORE_PROCEDURE_TEXT, ROWS_WRITTEN_TEXT, STEP_PREREQUISITES, STEP_TARGET, TRANSFERS_REFUSAL, WAREHOUSE_TYPES,
 } from '../../lib/first-load/apply/constants.ts'
 import { APPLY_TIME_CHECKS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE } from '../../lib/first-load/spec.ts'
+import { IMPORT_CALL_MAX_ROWS } from '../../lib/first-load/apply/import-calls.ts'
+import { FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE } from '../../lib/db/advisory-locks.ts'
 import { precondition } from './helpers.ts'
+import { RUNNER_APPLICATION_NAME } from '../../lib/first-load/apply/constants.ts'
 
 const doc = readFileSync(path.join(process.cwd(), 'docs/first-load-apply.md'), 'utf8')
 
@@ -68,6 +71,7 @@ test('every apply-time check has exactly one coverage row, and the document has 
     assert.ok((CHECK_COVERAGE_STATUSES as readonly string[]).includes(row[1]))
     assert.equal(row[1], APPLY_CHECK_COVERAGE[row[0]].status)
     assert.equal(row[2], APPLY_CHECK_COVERAGE[row[0]].core)
+    assert.equal(row[3], APPLY_CHECK_COVERAGE[row[0]].database)
   }
   assert.deepEqual([...new Set(rows.map((r) => r[1]))].sort(), [...CHECK_COVERAGE_STATUSES].sort(), 'each status is used at least once (so the vocabulary is not dead)')
 })
@@ -92,4 +96,17 @@ test('the warehouse types the manifest accepts are the prisma WarehouseType enum
   const values = block[1].split('\n').map((l) => l.trim()).filter(Boolean)
   precondition(t, 'enum values', values.length)
   assert.deepEqual([...WAREHOUSE_TYPES], values)
+})
+
+test('the database side\'s stated numbers are the numbers in the code', (t) => {
+  precondition(t, 'stated numbers', 2)
+  assert.ok(doc.includes(`calls of at most ${IMPORT_CALL_MAX_ROWS.toLocaleString('en-US')} rows`))
+  assert.ok(doc.includes(`\`(${FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE}, n)\``))
+  assert.ok(doc.includes('411220875') && FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE === 411_220_875)
+})
+
+test('the quiesce precondition is stated at the top, with the application name the code uses', (t) => {
+  precondition(t, 'checks', 2)
+  assert.ok(doc.indexOf('PRECONDITION: THE APPLICATION IS STOPPED') > -1 && doc.indexOf('PRECONDITION: THE APPLICATION IS STOPPED') < doc.indexOf('**What exists today:**'), 'before anything else')
+  assert.ok(doc.includes(`PGAPPNAME=${RUNNER_APPLICATION_NAME}`))
 })

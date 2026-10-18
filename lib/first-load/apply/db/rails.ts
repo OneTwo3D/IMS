@@ -1,0 +1,253 @@
+/**
+ * THE DATABASE RAILS: what must be true of the target before a step may write.
+ *
+ *   base currency   the organisation's base currency is the manifest's (the importers compare against the database, not the manifest);
+ *   empty target    a FIRST run (no run record) needs a database that holds none of the business data the base currency locks on
+ *                   (products, suppliers, customers, purchase orders, sales orders, stock movements) and is not locked; a RESUME does not;
+ *   forbidden SKUs  none of the manifest's forbidSkus (owner rulings that exclude a product) exists in the database either: a file cannot carry them, and a
+ *                   load into a database that already has one would be building on a product the owner ruled out;
+ *   warehouses      every warehouse the manifest declares exists, is active, is unique under upper-casing and has exactly the declared profile;
+ *   FX rates        (purchase orders) each stated rate has a stored base-to-currency rate, and is within the importer's 2% of it;
+ *   tax rates       (purchase orders) every tax a line names resolves to an active purchase rate, and every order-level tax NAME exists with
+ *                   exactly that spelling (createPurchaseOrder looks the order-level name up case-exactly; the importer matches lines case-insensitively).
+ *
+ * Evaluated before anything is written (`preflight`) and again at the start of every step and just before its first write (`recheck`). An unreadable
+ * value is an ObservationError, never "fine". Problem text names a rail, a count or the position of an entry in the operator's manifest: never a value from a prepared file.
+ */
+import { db } from '@/lib/db'
+import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
+import { D, fmtFixed, type Dec } from '../../money'
+import { RUNNER_APPLICATION_NAME, type ApplyStepId } from '../constants'
+import { normaliseTaxValue } from '../normal-form'
+import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
+import type { PreparedRun } from '../prepared'
+import { ObservationError } from '../residual'
+import { DATABASE_READ_FAILED } from './observe'
+
+/** The tables the base currency locks on (lib/base-currency.ts isBaseCurrencyLocked): any row in one of them means the target is not empty. */
+const LOCKING_COUNTS = ['product', 'supplier', 'customer', 'purchaseOrder', 'salesOrder', 'stockMovement'] as const
+
+/** How long a session that is closing is given to leave before it counts as another writer. A real one does not leave. */
+const QUIESCE_GRACE_ATTEMPTS = 10
+const QUIESCE_GRACE_MS = 100
+
+export { RUNNER_APPLICATION_NAME }
+
+export interface RailScope {
+  /** 'preflight' also checks emptiness (a fresh run only); a step recheck does not, because the run's own rows are there by then. */
+  phase: 'preflight' | 'recheck'
+  resuming: boolean
+  /** The step being rechecked; null for preflight, which checks every selected step's rails. */
+  step: ApplyStepId | null
+}
+
+export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Promise<string[]> {
+  try {
+    const problems: string[] = []
+    const selected = new Set(prepared.steps.map((s) => s.step))
+    const relevant = (step: ApplyStepId): boolean => selected.has(step) && (scope.step === null || scope.step === step)
+
+    await quiesced(problems)
+    await baseCurrency(prepared, problems)
+    await forbiddenSkus(prepared, problems)
+    if (scope.phase === 'preflight' && !scope.resuming) await emptyTarget(problems)
+    if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await warehouses(prepared, problems)
+    if (relevant('purchase-orders')) {
+      await fxRates(prepared, problems)
+      await taxRates(prepared, problems)
+    }
+    return problems
+  } catch (error) {
+    if (error instanceof ObservationError) throw error
+    throw new ObservationError(DATABASE_READ_FAILED)
+  }
+}
+
+/**
+ * THE QUIESCE RAIL. The first load runs against a database that NO other writer is connected to: the application, its workers and its cron jobs are stopped first. The step lock
+ * only excludes other first-load runners; an ordinary request could create or change a row between the read and the import, and the importer would update it from the file,
+ * which the read-back would then report as "created". The rail proves what it can: no other client session is connected to this database right now.
+ *
+ * Every other client backend of the current database is another writer (a psql session counts: it can write). Background and system backends (autovacuum, WAL, statistics) are
+ * not client backends and are ignored. Sessions of this runner are recognised by their application_name; the rail refuses to run if its own session does not carry it, and if the
+ * role cannot see other sessions' details (it needs superuser or pg_read_all_stats), because a blind count is not a count. An unreadable view is a refusal.
+ */
+async function quiesced(problems: string[]): Promise<void> {
+  const me = (await db.$queryRaw<Array<{ app: string; seesAll: boolean }>>`
+    SELECT current_setting('application_name') AS app,
+           (COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) OR pg_has_role(current_user, 'pg_read_all_stats', 'member')) AS "seesAll"`)[0]
+  if (!me || me.app !== RUNNER_APPLICATION_NAME) { problems.push('quiesce: the runner\'s own database connections are not tagged, so they cannot be told from another writer\'s (set PGAPPNAME before the first connection)'); return }
+  if (!me.seesAll) { problems.push('quiesce: this role cannot see other sessions (it needs superuser or pg_read_all_stats), so it cannot prove there are none'); return }
+  let foreign = 0
+  for (let attempt = 0; attempt < QUIESCE_GRACE_ATTEMPTS; attempt++) {
+    const row = (await db.$queryRaw<Array<{ n: bigint }>>`
+      SELECT count(*) AS n FROM pg_stat_activity
+       WHERE datname = current_database() AND backend_type = 'client backend' AND pid <> pg_backend_pid()
+         AND COALESCE(application_name, '') <> ${RUNNER_APPLICATION_NAME}`)[0]
+    foreign = Number(row?.n ?? 0)
+    if (foreign === 0) return
+    await new Promise((resolve) => setTimeout(resolve, QUIESCE_GRACE_MS))
+  }
+  problems.push(`quiesce: ${foreign} other client session(s) are connected to this database; stop the application, its workers and its cron jobs before the load`)
+}
+
+async function baseCurrency(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const org = await db.organisation.findFirst({ select: { baseCurrency: true } })
+  // The importers fall back to GBP when there is no organisation row (lib/base-currency.ts); the rail reads it the same way.
+  const stored = org?.baseCurrency ?? 'GBP'
+  if (stored.toUpperCase() !== prepared.manifest.baseCurrency.toUpperCase()) problems.push('base currency: the organisation\'s base currency is not the manifest\'s')
+}
+
+async function forbiddenSkus(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const forbidden = prepared.manifest.forbidSkus
+  if (forbidden.length === 0) return
+  const found = await db.product.count({ where: { OR: forbidden.map((sku) => ({ sku: { equals: sku, mode: 'insensitive' as const } })) } })
+  if (found > 0) problems.push(`forbidden SKUs: ${found} product(s) the manifest forbids already exist in the database`)
+}
+
+async function emptyTarget(problems: string[]): Promise<void> {
+  const counts = await Promise.all(LOCKING_COUNTS.map(async (name) => [name, await (db[name] as { count(): Promise<number> }).count()] as const))
+  const setting = await db.setting.findUnique({ where: { key: 'base_currency_locked' }, select: { value: true } })
+  for (const [name, count] of counts) if (count > 0) problems.push(`empty target: the ${name} table holds ${count} row(s), and no run record says this runner loaded them`)
+  if (setting?.value === 'true') problems.push('empty target: the base currency is already locked')
+}
+
+async function warehouses(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const rows = await db.warehouse.findMany({ select: { code: true, type: true, availableForSale: true, syncToStore: true, active: true } })
+  const declared = Object.entries(prepared.manifest.expectWarehouses).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  declared.forEach(([code, profile], index) => {
+    const at = `warehouse ${index + 1} of ${declared.length} in expectWarehouses`
+    const matches = rows.filter((w) => w.code.toUpperCase() === code)
+    if (matches.length === 0) problems.push(`${at}: it does not exist in the database`)
+    else if (matches.length > 1) problems.push(`${at}: ${matches.length} warehouses share that code under upper-casing`)
+    else {
+      const w = matches[0]
+      if (!w.active) problems.push(`${at}: it is not active`)
+      if (w.type !== profile.type) problems.push(`${at}: its type is not the declared one`)
+      if (w.availableForSale !== profile.availableForSale) problems.push(`${at}: its availableForSale is not the declared one`)
+      if (w.syncToStore !== profile.syncToStore) problems.push(`${at}: its syncToStore is not the declared one`)
+    }
+  })
+}
+
+async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const base = prepared.manifest.baseCurrency.toUpperCase()
+  const declared = Object.entries(prepared.manifest.fxRates).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const now = new Date()
+  for (const [index, [currency, stated]] of declared.entries()) {
+    const at = `FX rate ${index + 1} of ${declared.length} in fxRates`
+    if (currency === base) continue
+    const row = await db.fxRate.findFirst({ where: { fromCurrency: base, toCurrency: currency, fetchedAt: { lte: now } }, orderBy: { fetchedAt: 'desc' }, select: { rate: true } })
+    if (row === null) { problems.push(`${at}: the database holds no rate for it on or before today`); continue }
+    const stored = new D(row.rate.toFixed())
+    if (!stored.gt(new D(0))) { problems.push(`${at}: the stored rate is not positive`); continue }
+    const delta = new D(stated).minus(stored).abs().div(stored)
+    if (delta.gt(new D(PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE))) problems.push(`${at}: it differs from the stored rate by more than the importer's tolerance`)
+  }
+}
+
+/** The lookups a purchase-order file makes, each with the rates the importer could take for it: `n:<lowercased name>` (a line's name), `v:<value, 4 dp>` (a line with no name), `o:<exact name>` (an order). */
+export function taxLookups(step: NonNullable<PreparedRun['steps'][number]>, rates: TaxRateRow[]): {
+  lookups: Map<string, TaxRateRow[]>
+  lineFacts: Array<{ stated: string; key: string | null; named: boolean }>
+  orderFacts: Array<{ key: string | null; stated: string; name: string }>
+} {
+  const active = rates.filter((r) => r.active)
+  const isPurchase = (r: { usedFor: string }): boolean => r.usedFor === 'PURCHASE' || r.usedFor === 'BOTH'
+  const eligible = active.filter(isPurchase)
+  const col = (name: string): number => step.data.header.indexOf(name)
+  const [nameIx, valueIx, orderNameIx, orderKeyIx, orderValueIx] = [col('taxRateName'), col('taxRateValue'), col('orderTaxRateName'), col('orderKey'), col('orderTaxRateValue')]
+  const lookups = new Map<string, TaxRateRow[]>()
+  const lineFacts: Array<{ stated: string; key: string | null; named: boolean }> = []
+  const orderFacts: Array<{ key: string | null; stated: string; name: string }> = []
+  const firstRowOfOrder = new Set<string>()
+  for (const row of step.data.rows) {
+    const name = (nameIx < 0 ? '' : row.cells[nameIx] ?? '').trim()
+    // A value that is blank, zero or negative is NOT a stated tax: the importer reads it as nothing (normalizeTaxRateValue), so the line then takes the order's tax.
+    const stated = normaliseTaxValue(valueIx < 0 ? '' : row.cells[valueIx] ?? '')
+    if (name !== '') {
+      const key = `n:${name.toLowerCase()}`
+      lookups.set(key, eligible.filter((r) => r.name.trim().toLowerCase() === name.toLowerCase()))
+      lineFacts.push({ stated, key, named: true })
+    } else if (stated !== '') {
+      const key = `v:${fmtFixed(new D(stated), 4)}`
+      lookups.set(key, eligible.filter((r) => new D(r.rate.toFixed()).minus(new D(stated)).abs().lt(new D('0.00005'))))
+      lineFacts.push({ stated, key, named: false })
+    }
+    const orderKey = orderKeyIx < 0 ? '' : row.cells[orderKeyIx] ?? ''
+    if (firstRowOfOrder.has(orderKey)) continue
+    firstRowOfOrder.add(orderKey)
+    const orderName = ((orderNameIx < 0 ? '' : row.cells[orderNameIx] ?? '').trim()) || name
+    if (orderName === '') continue
+    const key = `o:${orderName}`
+    lookups.set(key, active.filter((r) => r.name === orderName))
+    orderFacts.push({ key, name: orderName, stated: normaliseTaxValue(orderValueIx < 0 ? '' : row.cells[orderValueIx] ?? '') || stated })
+  }
+  return { lookups, lineFacts, orderFacts }
+}
+
+async function taxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const step = prepared.steps.find((s) => s.step === 'purchase-orders')
+  if (!step) return
+  const rates = (await db.taxRate.findMany({ select: TAX_RATE_SELECT })) as TaxRateRow[]
+  const isPurchase = (r: { usedFor: string }): boolean => r.usedFor === 'PURCHASE' || r.usedFor === 'BOTH'
+  const value = (r: TaxRateRow): Dec => new D(r.rate.toFixed())
+  const sameValue = (r: TaxRateRow, stated: string): boolean => value(r).eq(new D(stated))
+  // The ceiling the prepare report declared and used to bound every order's totals. The tool refuses to run without one when orders are present, so an absent one fails closed.
+  const declaredMax = prepared.report.config.maxPurchaseTaxRate
+  const ceiling = declaredMax === null ? null : new D(declaredMax)
+  if (ceiling === null) problems.push('purchase tax: the prepared report declares no maximum purchase tax rate, so no rate can be shown to be within it')
+  /** Several candidates are interchangeable only when their whole accounting profile is identical (rate, effective rate, tax type, reverse charge, reporting category, components). */
+  const ambiguous = (candidates: TaxRateRow[]): boolean => new Set(candidates.map(taxRateSignature)).size > 1
+  /** Both the rate column and the rate the tax is computed from must be within the ceiling. */
+  const aboveCeiling = (candidates: TaxRateRow[]): boolean => ceiling !== null && candidates.some((r) => value(r).gt(ceiling) || new D(effectiveRate(r)).gt(ceiling))
+  const inconsistent = (candidates: TaxRateRow[]): boolean => candidates.some(rateIsInconsistent)
+
+  const { lookups, lineFacts, orderFacts } = taxLookups(step, rates)
+  const counts = { unresolvedLines: 0, unspelledOrders: 0, valueMismatchLines: 0, valueMismatchOrders: 0, ambiguousLines: 0, ambiguousOrders: 0, ceilingLines: 0, ceilingOrders: 0, inconsistentLines: 0, inconsistentOrders: 0 }
+  for (const fact of lineFacts) {
+    const candidates = lookups.get(fact.key!) ?? []
+    if (candidates.length === 0) { counts.unresolvedLines++; continue }
+    if (fact.named && fact.stated !== '' && candidates.some((r) => !sameValue(r, fact.stated))) counts.valueMismatchLines++
+    if (ambiguous(candidates)) counts.ambiguousLines++
+    if (aboveCeiling(candidates)) counts.ceilingLines++
+    if (inconsistent(candidates)) counts.inconsistentLines++
+  }
+  for (const fact of orderFacts) {
+    // The importer's order-level lookup takes ANY active rate of exactly that name (no purchase filter) and names are not unique: every one must be a purchase rate with the same profile.
+    const orderRates = lookups.get(fact.key!) ?? []
+    if (!orderRates.some(isPurchase)) { counts.unspelledOrders++; continue }
+    if (orderRates.some((r) => !isPurchase(r)) || ambiguous(orderRates)) counts.ambiguousOrders++
+    if (fact.stated !== '' && orderRates.some((r) => !sameValue(r, fact.stated))) counts.valueMismatchOrders++
+    if (aboveCeiling(orderRates)) counts.ceilingOrders++
+    if (inconsistent(orderRates)) counts.inconsistentOrders++
+  }
+  const say = (n: number, text: string): void => { if (n > 0) problems.push(`purchase tax: ${n} ${text}`) }
+  say(counts.unresolvedLines, 'line(s) name a tax that matches no active purchase rate')
+  say(counts.valueMismatchLines, 'line(s) state a tax value that is not the value of the active rate they name')
+  say(counts.valueMismatchOrders, 'order(s) state a tax value that is not the value of the active rate they name')
+  say(counts.unspelledOrders, 'order(s) have an order-level tax name with no active purchase rate of exactly that spelling')
+  say(counts.ambiguousLines, 'line(s) resolve to more than one active purchase rate with different values or accounting settings')
+  say(counts.ambiguousOrders, 'order(s) have an order-level tax name shared by active rates that are not all purchase rates or that differ in value or accounting settings')
+  say(counts.ceilingLines, 'line(s) could be taxed above the maximum purchase tax rate the prepared report declares')
+  say(counts.ceilingOrders, 'order(s) could be taxed above the maximum purchase tax rate the prepared report declares')
+  say(counts.inconsistentLines, 'line(s) resolve to a rate whose components do not add up to its rate')
+  say(counts.inconsistentOrders, 'order(s) resolve to a rate whose components do not add up to its rate')
+}
+
+/**
+ * The profile digest of the single rate each lookup of the file resolves to, as the rails see it NOW. Recorded once on the run record just before the first purchase-order write
+ * (`setFactOnce`), so that a later change to a rate's accounting settings can be told from the state the orders were created under.
+ */
+export async function currentTaxProfiles(prepared: PreparedRun): Promise<Record<string, string>> {
+  const step = prepared.steps.find((s) => s.step === 'purchase-orders')
+  if (!step) return {}
+  const rates = (await db.taxRate.findMany({ select: TAX_RATE_SELECT })) as TaxRateRow[]
+  const { lookups } = taxLookups(step, rates)
+  const out: Record<string, string> = {}
+  for (const [key, candidates] of [...lookups.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    const signatures = new Set(candidates.map(taxRateSignature))
+    if (signatures.size === 1) out[key] = signatureDigest([...signatures][0]!)
+  }
+  return out
+}

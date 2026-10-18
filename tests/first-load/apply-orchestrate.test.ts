@@ -6,10 +6,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { CONFLICT_CODES, REHEARSAL_RECORD_FORMAT_VERSION, REPORT_CONFLICT_FIELDS, REPORT_IMPORTER_MESSAGE_FIELDS, REPORT_ROW_FIELDS, ROW_OUTCOMES } from '../../lib/first-load/apply/constants.ts'
-import { runLoad, type ApplyOptions, type ApplyResult, type RunRecord } from '../../lib/first-load/apply/orchestrate.ts'
+import { StepLockError, runLoad, type ApplyOptions, type ApplyResult, type RunRecord } from '../../lib/first-load/apply/orchestrate.ts'
 import { ObservationError } from '../../lib/first-load/apply/residual.ts'
 import { buildApplyReport, renderApplyJson, renderApplyMarkdown } from '../../lib/first-load/apply/report.ts'
-import { FakeDatabase, loadOk, prepareSynthetic, preparedFiles } from './apply-helpers.ts'
+import { FakeDatabase, NO_LOCK, loadOk, prepareSynthetic, preparedFiles } from './apply-helpers.ts'
 import { precondition } from './helpers.ts'
 
 const files = preparedFiles(prepareSynthetic())
@@ -41,7 +41,7 @@ test('control: a clean apply loads every unit of every step, the identity holds,
       assert.deepEqual(s.counterFindings, [], `${s.step}: the importer's counters agree with the database`)
     }
     assert.deepEqual(result.steps.map((s) => [s.step, s.created]), [['suppliers', 2], ['products', 8], ['opening-stock', 4], ['purchase-orders', 2]])
-    assert.equal(db.journalRecord?.status, 'APPLIED')
+    assert.equal(db.journalRecord?.status, 'VERIFIED')
     assert.deepEqual(db.executed.map((e) => e.step), ['suppliers', 'products', 'opening-stock', 'purchase-orders'], 'steps run in load order')
   })
 })
@@ -124,7 +124,7 @@ test('reports never carry importer error text or exception messages: only a code
   const SECRET_EXCEPTION = 'SENTINEL-EXCEPTION-SECRET-77'
   const runs: ApplyResult[] = []
   const a = setup()
-  runs.push(await runLoad(a.prepared, a.db.ports({ execute: async (step, file) => { const r = await a.db.ports().execute(step, file); return step === 'suppliers' ? { ...r, errors: [`Row 7: order ${SECRET_FILE_VALUE} already exists`, `unexpected ${SECRET_EXCEPTION}`] } : r } }), a.options()))
+  runs.push(await runLoad(a.prepared, a.db.ports({ execute: async (step, file, lock) => { const r = await a.db.ports().execute(step, file, lock); return step === 'suppliers' ? { ...r, errors: [`Row 7: order ${SECRET_FILE_VALUE} already exists`, `unexpected ${SECRET_EXCEPTION}`] } : r } }), a.options()))
   const b = setup()
   runs.push(await runLoad(b.prepared, b.db.ports({ execute: async () => { throw new Error(`password=${SECRET_EXCEPTION}`) } }), b.options()))
   const c = setup()
@@ -146,7 +146,7 @@ test('reports never carry importer error text or exception messages: only a code
 test('report rows carry only the declared identifier fields: unit key plus closed words; no other cell, importer text or exception text', async (t) => {
   const { prepared, db, options } = setup()
   db.dropRecipeFor.add('ZQSENT-GIFT-SET')
-  const failed = await runLoad(prepared, db.ports({ execute: async (step, file) => { const r = await db.ports().execute(step, file); return step === 'suppliers' ? { ...r, errors: ['Row 3: free text from the importer SENTINEL-IMPORTER-TEXT'] } : r } }), options())
+  const failed = await runLoad(prepared, db.ports({ execute: async (step, file, lock) => { const r = await db.ports().execute(step, file, lock); return step === 'suppliers' ? { ...r, errors: ['Row 3: free text from the importer SENTINEL-IMPORTER-TEXT'] } : r } }), options())
   const second = setup()
   second.db.foreignHistory = ['ZQSENT-LEG-01|ZQSENT-MAIN']
   const conflicted = await runLoad(second.prepared, second.db.ports(), second.options())
@@ -198,7 +198,7 @@ test('run record: a second load over an existing record, a resume with no record
   assert.match(second.problems[0], /run record already exists/)
   const finished = await runLoad(prepared, db.ports(), options({ resume: true }))
   assert.equal(finished.exit, 'PRECONDITION_REFUSED')
-  assert.match(finished.problems[0], /APPLIED, which is not resumable/)
+  assert.match(finished.problems[0], /VERIFIED, which is not resumable/)
   db.journalRecord = { ...(db.journalRecord as RunRecord), manifestDigest: 'e'.repeat(64), status: 'STEP_FAILED' }
   const other = await runLoad(prepared, db.ports(), options({ resume: true }))
   assert.equal(other.exit, 'PRECONDITION_REFUSED')
@@ -262,7 +262,7 @@ test('crash in the middle of opening stock: the resume sends ONLY the rows that 
   assert.deepEqual(stock.importer.map((i) => i.skipped), [0], 'the importer was never asked to re-load a row that exists')
   for (const s of resumed.steps.filter((x) => x.step === 'suppliers' || x.step === 'products')) assert.equal(s.skippedExisting, s.emitted)
   assert.equal(db.entries.get('opening-stock')!.length, 4, 'exactly one opening layer per pair')
-  assert.equal(db.journalRecord?.status, 'APPLIED')
+  assert.equal(db.journalRecord?.status, 'VERIFIED')
 })
 
 test('silent recipe loss: a product the importer counted as created but whose recipe is missing is FAILED, the run stops, and the counters are only a cross-check', async () => {
@@ -323,7 +323,7 @@ test('an unreadable database in the middle of the run is a resumable STEP_FAILED
   const { prepared, db, options } = setup()
   const ports = db.ports({
     execute: async (step, file) => {
-      const answer = await db.ports().execute(step, file)
+      const answer = await db.ports().execute(step, file, NO_LOCK)
       if (step === 'products') db.unreadable = true
       return answer
     },
@@ -389,4 +389,118 @@ test('report: deterministic bytes; the operator text claims "nothing written" on
 test('the observation error type is distinct (a port that throws anything else is a defect, not a "database is empty")', () => {
   assert.ok(new ObservationError('x') instanceof Error)
   assert.equal(new ObservationError('x').name, 'ObservationError')
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The preflight port and the step lock (the database slice supplies both)
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+test('preflight: problems refuse a plan and an apply before anything is written, and the core tells it whether a run record exists', async (t) => {
+  const { prepared, db, options } = setup()
+  const seen: boolean[] = []
+  const refuse = (problems: string[]) => db.ports({ preflight: async ({ resuming }) => { seen.push(resuming); return problems } })
+  // CONTROL: no problems, and the apply goes through.
+  const clean = await runLoad(prepared, refuse([]), options())
+  assert.equal(clean.exit, 'OK')
+  assert.deepEqual(seen, [false], 'a fresh load is told it is not resuming')
+  // A fresh database, problems found: both modes refuse; nothing is written.
+  const fresh = setup()
+  const planned = await runLoad(fresh.prepared, fresh.db.ports({ preflight: async () => ['empty target: the supplier table holds 1 row(s)'] }), options({ mode: 'plan', rehearsal: null, systemId: null }))
+  assert.equal(planned.exit, 'PRECONDITION_REFUSED')
+  assert.deepEqual(planned.problems, ['empty target: the supplier table holds 1 row(s)'])
+  const applied = await runLoad(fresh.prepared, fresh.db.ports({ preflight: async () => ['empty target: the supplier table holds 1 row(s)'] }), options())
+  assert.equal(applied.exit, 'PRECONDITION_REFUSED')
+  untouched(fresh.db)
+  precondition(t, 'modes refused', 2)
+})
+
+test('preflight: a resume is told it is resuming; an unreadable database in preflight is a refusal, not a pass', async () => {
+  const { options } = setup()
+  const first = setup()
+  first.db.failAfterRows = 1
+  await runLoad(first.prepared, first.db.ports(), options())
+  first.db.failAfterRows = null
+  const seen: boolean[] = []
+  const resumed = await runLoad(first.prepared, first.db.ports({ preflight: async ({ resuming }) => { seen.push(resuming); return [] } }), options({ resume: true }))
+  assert.equal(resumed.exit, 'OK', resumed.problems.join('; '))
+  assert.deepEqual(seen, [true])
+  const unreadable = setup()
+  const refused = await runLoad(unreadable.prepared, unreadable.db.ports({ preflight: async () => { throw new ObservationError('connection refused') } }), options())
+  assert.equal(refused.exit, 'PRECONDITION_REFUSED')
+  assert.match(refused.problems.join(' '), /never assumed to be empty/)
+  untouched(unreadable.db)
+})
+
+test('step lock: a step whose lock is busy, lost or unavailable stops the run as STEP_FAILED, makes no importer call for it and leaves the run record as it was', async () => {
+  for (const reason of ['busy', 'lost', 'unavailable'] as const) {
+    const { prepared, db, options } = setup()
+    const result = await runLoad(prepared, db.ports({ withStepLock: async () => { throw new StepLockError(reason) } }), options())
+    assert.equal(result.exit, 'STEP_FAILED', reason)
+    assert.match(result.problems.join(' '), new RegExp(`step lock was not available \\(${reason}\\)`))
+    assert.equal(db.executed.length, 0, `${reason}: no importer call`)
+    assert.equal(db.journalRecord?.version, 1, `${reason}: the record is as the run created it`)
+    assert.equal(db.journalRecord?.status, 'RUNNING')
+  }
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// No verification port: not a success; APPLIED is resumable for verification only
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+test('without a verification port a completed load is APPLIED_UNVERIFIED, never OK, and the record stays APPLIED', async () => {
+  // Mutation named: return 'OK' when ports.verify is absent (the old behaviour) -> this arm is red.
+  const { prepared, db, options } = setup()
+  const result = await runLoad(prepared, db.ports({ verify: undefined }), options())
+  assert.equal(result.exit, 'APPLIED_UNVERIFIED')
+  assert.notEqual(result.exit as string, 'OK')
+  assert.match(result.problems.join(' '), /no verification port/)
+  assert.equal(db.journalRecord?.status, 'APPLIED')
+  assert.equal(result.verification.length, 0)
+  assert.ok(result.steps.every((s) => s.status === 'DONE'), 'the load itself finished')
+})
+
+test('control: with a verification port the same load is OK and VERIFIED', async () => {
+  const { prepared, db, options } = setup()
+  const result = await runLoad(prepared, db.ports({ verify: async () => [{ id: 'x', result: 'pass', expected: 'a', actual: 'a' }] }), options())
+  assert.equal(result.exit, 'OK')
+  assert.equal(db.journalRecord?.status, 'VERIFIED')
+  assert.equal(result.verification.length, 1)
+})
+
+test('resume on an APPLIED run sends nothing and, without a verification port, writes nothing and says APPLIED_UNVERIFIED again', async () => {
+  // Mutation named: leave APPLIED out of the resumable path -> "not resumable" refusal; run the steps again -> importer calls here.
+  const { prepared, db, options } = setup()
+  await runLoad(prepared, db.ports({ verify: undefined }), options())
+  const calls = db.executed.length
+  const version = db.journalRecord!.version
+  const again = await runLoad(prepared, db.ports({ verify: undefined }), options({ resume: true }))
+  assert.equal(again.exit, 'APPLIED_UNVERIFIED')
+  assert.equal(db.executed.length, calls, 'no importer call')
+  assert.equal(db.journalRecord!.version, version, 'the run record was not written')
+  assert.equal(db.journalRecord!.status, 'APPLIED')
+})
+
+test('resume on an APPLIED run with a verification port runs ONLY the verification, and records the verdict', async () => {
+  for (const verdict of ['pass', 'fail'] as const) {
+    const { prepared, db, options } = setup()
+    await runLoad(prepared, db.ports({ verify: undefined }), options())
+    const calls = db.executed.length
+    let verified = 0
+    const resumed = await runLoad(prepared, db.ports({ verify: async () => { verified++; return [{ id: 'check', result: verdict, expected: 'a', actual: verdict === 'pass' ? 'a' : 'b' }] } }), options({ resume: true }))
+    assert.equal(verified, 1)
+    assert.equal(db.executed.length, calls, `${verdict}: no importer call`)
+    assert.equal(resumed.exit, verdict === 'pass' ? 'OK' : 'VERIFY_FAILED')
+    assert.equal(db.journalRecord!.status, verdict === 'pass' ? 'VERIFIED' : 'VERIFY_FAILED')
+  }
+})
+
+test('resume on an APPLIED run whose data has since changed is a CONFLICT and verifies nothing', async () => {
+  const { prepared, db, options } = setup()
+  await runLoad(prepared, db.ports({ verify: undefined }), options())
+  const supplier = db.entries.get('suppliers')![0]
+  supplier.fingerprint = '{"changed":true}'
+  let verified = 0
+  const resumed = await runLoad(prepared, db.ports({ verify: async () => { verified++; return [] } }), options({ resume: true }))
+  assert.equal(resumed.exit, 'CONFLICT')
+  assert.equal(verified, 0)
 })
