@@ -839,3 +839,65 @@ test('HOLD REFUSAL IS ATOMIC: a replay and a second claim that land right after 
   const plan = await d.retire.planHeldBacklogRetirement({ destinations: ['woocommerce' as const], cutoffs: { woocommerce: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 })
   assert.equal(plan.items.find((i: { id: string }) => i.id === row.id)?.classification.disposition, 'SKIP')
 })
+
+// ───────────── the cut-off is re-asked immediately before a claimed job sends (R5) ─────────────
+//
+// Named mutations (each shown red in the PR): c1 refuseClaimedJobBeforeCutoff never refuses; c2 the Xero fence statement drops the floor.
+
+test('CLAIMED OUTBOX JOB: a claim taken with no floor in force is parked WITHOUT sending once the floor is in force (SHADOWED when this claim made the stamp, PERMANENT_FAILED otherwise); switch off is a no-op', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const make = async (name: string) => {
+    const key = `woocommerce:stock.push:${tag}-${name}`
+    const row = (await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false } })) as { id: string }
+    await d.db.integrationOutbox.update({ where: { id: row.id }, data: { createdAt: BEFORE } })
+    // Claimed while the switch is OFF (no floor), so the claim itself is not refused.
+    const claimed = await withEnv({}, async () => (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'w1' }))[0]!)
+    return { id: row.id, claimed }
+  }
+  const fresh = await make('fresh')
+  const earlier = await make('earlier')
+  // `earlier` had been claimed before: its stamp is older than this claim.
+  await d.db.integrationOutbox.update({ where: { id: earlier.id }, data: { firstAttemptedAt: new Date(Date.now() - 3600_000) } })
+  const state = (id: string) => d.db.integrationOutbox.findUnique({ where: { id }, select: { status: true, lockedBy: true, lastError: true } })
+
+  assert.equal(await withEnv({}, () => d.outbox.refuseClaimedJobBeforeCutoff(fresh.claimed, 'w1')), null, 'switch off: nothing refused, nothing written')
+  assert.equal((await state(fresh.id))?.status, 'PROCESSING')
+
+  await withEnv(wcLive(), async () => {
+    const refused = await d.outbox.refuseClaimedJobBeforeCutoff(fresh.claimed, 'w1')
+    assert.match(String(refused), /^Not sent by IMS: this was queued before writes to WooCommerce went live/)
+    await d.outbox.refuseClaimedJobBeforeCutoff(earlier.claimed, 'w1')
+  })
+  assert.deepEqual([(await state(fresh.id))?.status, (await state(fresh.id))?.lockedBy], ['SHADOWED', null], 'this claim made the stamp and nothing left: proven unsent')
+  assert.equal((await state(earlier.id))?.status, 'PERMANENT_FAILED', 'an earlier claim may have sent: parked with the check-the-destination sentence, never shadowed')
+  assert.match(String((await state(earlier.id))?.lastError), /check WooCommerce before acting/)
+  // A post-cutoff job is untouched.
+  const later = await withEnv({}, async () => {
+    const key = `woocommerce:stock.push:${tag}-later`
+    await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: undefined, idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false } } as never)
+    return (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'w1' }))[0]!
+  })
+  await withEnv(wcLive(new Date(Date.now() - 60_000 * 60 * 24)), async () => {
+    assert.equal(await d.outbox.refuseClaimedJobBeforeCutoff(later, 'w1'), null, 'created after the instant')
+  })
+})
+
+test('XERO FENCE: a lease opened while no floor was in force refuses the remote write once the floor is in force (before-cutoff, nothing sent); the same row with the switch off still writes', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupSync(d, tag))
+  const row = await seedSyncLog(d, `${tag}-fence`, { createdAt: BEFORE, status: 'PROCESSING', attemptRevision: 1, processingStartedAt: new Date() })
+  const claimedAt = (await d.db.accountingSyncLog.findUnique({ where: { id: row.id }, select: { processingStartedAt: true } }))!.processingStartedAt!
+  const lease = await withEnv({}, async () => d.processor.openRemoteWriteLease(row.id, claimedAt))
+  assert.ok(lease, 'precondition: the lease opened with no floor')
+  const control = await withEnv({}, async () => lease!.fenceBeforeRemoteWrite('stock-receipt'))
+  assert.equal(control.ok, true, 'CONTROL: switch off, the fence lets the write through')
+  await withEnv(xeroLive(), async () => {
+    const fenced = await lease!.fenceBeforeRemoteWrite('stock-receipt')
+    console.log(`# fence under a floor: ${JSON.stringify({ ok: fenced.ok, reason: !fenced.ok ? fenced.result.notPosted?.reason : null })}`)
+    assert.equal(fenced.ok, false)
+    if (!fenced.ok) assert.equal(fenced.result.notPosted?.reason, 'before-cutoff')
+  })
+})

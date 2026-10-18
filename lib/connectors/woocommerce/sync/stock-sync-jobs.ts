@@ -17,10 +17,12 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   outboxRowBeforeCutoff,
+  refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
 import { wooDrainHold } from '../producer-egress'
+import { runWithWcAttemptFence } from '../attempt-fence'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
@@ -379,12 +381,25 @@ export async function processQueuedWcStockSyncJobs(options?: {
       continue
     }
 
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND: this worker may hold a claim taken before a floor came into force. A job
+    // older than the live-from instant is parked without sending, in one statement keyed on this claim; and every stock write inside the push asks
+    // again (the fence below). With no floor in force both are no-ops and nothing extra is queried.
+    const parkedBeforeCutoff = await refuseClaimedJobBeforeCutoff(job, WC_STOCK_SYNC_WORKER_ID)
+    if (parkedBeforeCutoff !== null) {
+      summary.failed++
+      summary.errors.push(parkedBeforeCutoff)
+      continue
+    }
+
     try {
-      const result = await pushStockToWc({
-        productIds: [payload.productId],
-        forceProductIds: payload.force ? [payload.productId] : [],
-        source: payload.reason,
-      })
+      const result = await runWithWcAttemptFence(
+        { signal: new AbortController().signal, stillOwned: async () => true, mayStillSend: () => outboxRowBeforeCutoff(job) === null },
+        () => pushStockToWc({
+          productIds: [payload.productId],
+          forceProductIds: payload.force ? [payload.productId] : [],
+          source: payload.reason,
+        }),
+      )
 
       if (shouldRetainJob(result, payload)) {
         await markIntegrationOutboxRetryableFailure({

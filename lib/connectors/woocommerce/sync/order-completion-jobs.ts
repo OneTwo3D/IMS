@@ -27,6 +27,8 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
+  outboxRowBeforeCutoff,
+  refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
 import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW, wcOrderStatusClaimGate } from './order-status-claim-gate'
@@ -204,6 +206,15 @@ export async function processWcOrderCompletionJobs(options?: {
       continue
     }
 
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND: a claim taken before a floor came into force must not send after it.
+    // A job older than the live-from instant is parked without sending, in one statement keyed on this claim. No floor: a no-op.
+    const parkedBeforeCutoff = await refuseClaimedJobBeforeCutoff(job, WORKER_ID, now ? { now } : {})
+    if (parkedBeforeCutoff !== null) {
+      summary.deadLettered++
+      summary.errors.push(parkedBeforeCutoff)
+      continue
+    }
+
     const retry = async (error: string) => {
       const row = await markIntegrationOutboxRetryableFailure({
         ...claim,
@@ -238,6 +249,8 @@ export async function processWcOrderCompletionJobs(options?: {
         stillOwned: async () => (await db.integrationOutbox.count({
           where: { id: job.id, status: 'PROCESSING', lockedBy: WORKER_ID, lockedAt: job.lockedAt },
         })) === 1,
+        // Asked again before each write (the tracking PUT and the status PUT), with the floor read at that moment.
+        mayStillSend: () => outboxRowBeforeCutoff(job) === null,
       }
       const retryReason = await runWithWcAttemptFence(fence, async (): Promise<string | null> => {
         // The facade, not the connector: it owns "is a storefront connector runnable at all".

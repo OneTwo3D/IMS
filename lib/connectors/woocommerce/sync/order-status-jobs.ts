@@ -33,6 +33,8 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
+  outboxRowBeforeCutoff,
+  refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
 import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW, wcOrderStatusClaimGate } from './order-status-claim-gate'
@@ -369,6 +371,14 @@ export async function runFencedWcOrderJob(
       continue
     }
 
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND (see the completion drain): park a pre-cutoff job without sending.
+    const parkedBeforeCutoff = await refuseClaimedJobBeforeCutoff(job, descriptor.workerId, now ? { now } : {})
+    if (parkedBeforeCutoff !== null) {
+      summary.deadLettered++
+      summary.errors.push(parkedBeforeCutoff)
+      continue
+    }
+
     const retry = async (error: string) => {
       const row = await markIntegrationOutboxRetryableFailure({
         ...claim,
@@ -399,6 +409,8 @@ export async function runFencedWcOrderJob(
         stillOwned: async () => (await db.integrationOutbox.count({
           where: { id: job.id, status: 'PROCESSING', lockedBy: descriptor.workerId, lockedAt: job.lockedAt },
         })) === 1,
+        // Asked again before the write, with the floor read at that moment.
+        mayStillSend: () => outboxRowBeforeCutoff(job) === null,
         // The re-read the PUT is gated on, as close to the write as the fence allows.
         stillWanted: async () => (await readImsStatus(orderId)) === descriptor.imsTarget,
       }

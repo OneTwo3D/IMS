@@ -38,6 +38,11 @@ export type WcAttemptFence = {
    * the completion job, whose rule is the WooCommerce reading alone.
    */
   stillWanted?: () => Promise<boolean>
+  /**
+   * THE WRITER-SIDE CUT-OFF, re-derived at every write: false when the claimed job was queued before the destination's live-from instant
+   * (the floor is read from the environment each time it is asked). Absent / always true for a job that no floor governs, and then it costs nothing.
+   */
+  mayStillSend?: () => boolean | Promise<boolean>
 }
 
 const storage = new AsyncLocalStorage<WcAttemptFence>()
@@ -55,12 +60,21 @@ export function currentWcAttemptSignal(): AbortSignal | undefined {
  * Throws unless the running attempt may still write. A no-op outside a completion attempt (every other
  * caller of the status push is unaffected).
  */
+export const WC_ATTEMPT_BEFORE_CUTOFF_MESSAGE = 'this job was queued before WooCommerce writes went live on this installation, so the write was not sent'
+
+/** The cut-off alone, for a write that is not behind the full fence (a tracking PUT, a stock batch). A no-op outside a drain's attempt. */
+export async function assertWcAttemptMayStillSend(): Promise<void> {
+  const fence = storage.getStore()
+  if (fence?.mayStillSend && !(await fence.mayStillSend())) throw new Error(WC_ATTEMPT_BEFORE_CUTOFF_MESSAGE)
+}
+
 export async function assertWcAttemptMayWrite(): Promise<void> {
   const fence = storage.getStore()
   if (!fence) return
   if (fence.signal.aborted) {
     throw new Error('the attempt deadline passed before the status write, so it was not sent')
   }
+  await assertWcAttemptMayStillSend()
   if (!(await fence.stillOwned())) {
     throw new Error('this worker no longer owns the completion job (it was parked or replayed), so the status write was not sent')
   }

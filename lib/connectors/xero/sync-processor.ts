@@ -2290,7 +2290,9 @@ export async function renewClaimForRemoteWrite(
     // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector. `held` is
     // asked for its instant HERE, as the statement is built — so a renewal that has happened since
     // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
-    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR },
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED AT EVERY REMOTE WRITE: the floor of THIS moment is a clause of the statement that proves the claim
+    // immediately before a request leaves, so a row that is (or has become) older than the live-from instant cannot take the fence and nothing is sent.
+    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR, ...xeroNotBeforeCutoffWhere(xeroCutoffFloor()) },
     // `processingStartedAt` is this host's clock and `createDispatchedAt` is the DATABASE's, read by
     // `planCreateDispatch` one statement ago. They are deliberately not the same instant: the claim is
     // only ever compared against itself, while the dispatch instant is aged against `clock_timestamp()`
@@ -2467,6 +2469,15 @@ export async function openRemoteWriteLease(
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'dispatch-unrecorded', operation, message } } }
       }
       if (!again) {
+        // Refused because the row predates the live-from instant (the fence statement carries the floor of this moment)? Say so, truthfully,
+        // rather than blaming another worker.
+        if (xeroCutoffFloor() !== null) {
+          const born = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { createdAt: true, type: true } })
+          const refusal = born ? xeroBeforeCutoffRefusal({ createdAt: born.createdAt, type: born.type }) : null
+          if (refusal !== null) {
+            return { ok: false, result: { success: false, error: refusal, notPosted: { reason: 'before-cutoff', operation, message: refusal } } }
+          }
+        }
         const message = lostClaimMessage(entryId, operation)
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
       }

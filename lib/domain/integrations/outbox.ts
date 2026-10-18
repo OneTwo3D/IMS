@@ -1,5 +1,5 @@
 import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
-import { OUTBOUND_HELD_RETRY_DELAY_MS, isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
+import { OUTBOUND_HELD_RETRY_DELAY_MS, isOutboundWriteHeldText, type OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import { db } from '@/lib/db'
 import {
   INTEGRATION_OUTBOX_DRAIN_LEASES_MS,
@@ -22,7 +22,7 @@ import {
 } from '@/lib/domain/integrations/outbox-registry'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
-import { producerShadowNotice, type ProducerReason } from '@/lib/security/producer-disposition-constants'
+import { producerBeforeCutoffNotice, producerShadowNotice, type ProducerReason } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecision } from '@/lib/security/producer-disposition'
 import { createdBeforeCutoffFloor, producerCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
 import { ownershipTargetForOutboxOperation, type MappedOperation } from '@/lib/security/writer-ownership-map'
@@ -371,6 +371,38 @@ export function outboxRowCutoffFloor(connector: string, operation: string, conte
   if (!(OUTBOX_CUTOFF_CONNECTORS as readonly string[]).includes(connector)) return null
   if (outboxInternalOperationsOf(connector as (typeof OUTBOX_CUTOFF_CONNECTORS)[number]).includes(operation)) return null
   return producerCutoffFloor(connector as (typeof OUTBOX_CUTOFF_CONNECTORS)[number], context.now ? { now: context.now } : {})
+}
+
+/**
+ * THE LAST CHECK BEFORE A CLAIMED JOB SENDS. The claim excludes a job created before the live-from instant, but a worker can hold a claim taken
+ * when no floor was in force and send after one is: so every drain asks again, with the floor re-derived from the environment NOW, immediately
+ * before each write. A job that predates it is parked without sending, in ONE statement keyed on this claim's identity (so a replay or another
+ * worker's claim cannot interleave): SHADOWED when this very claim created the job's first-attempt stamp (so nothing has ever left for it),
+ * otherwise PERMANENT_FAILED carrying the single-sourced "check the destination before acting" sentence. Returns that sentence when the job
+ * was refused (the caller must send nothing and count it), or null when it may send. No floor in force: null, and no query is made.
+ */
+export async function refuseClaimedJobBeforeCutoff(
+  job: IntegrationOutboxRow,
+  workerId: string,
+  options: { client?: IntegrationOutboxClient; now?: Date } = {},
+): Promise<string | null> {
+  const floor = outboxRowBeforeCutoff(job, options.now ? { now: options.now } : {})
+  if (floor === null) return null
+  const notice = producerBeforeCutoffNotice({ connector: job.connector as OutboundConnector, cutoff: floor })
+  if (!job.lockedAt) return notice
+  const client = getClient(options.client)
+  const cleared = { nextAttemptAt: null, lockedAt: null, lockedBy: null }
+  const shadowed = await client.integrationOutbox.updateMany({
+    where: { ...claimedBy({ id: job.id, workerId, lockedAt: job.lockedAt }), attemptHistoryTracked: true, firstAttemptedAt: job.lockedAt },
+    data: { status: INTEGRATION_OUTBOX_STATUS.SHADOWED, lastError: notice, ...cleared },
+  })
+  if (shadowed.count === 0) {
+    await client.integrationOutbox.updateMany({
+      where: claimedBy({ id: job.id, workerId, lockedAt: job.lockedAt }),
+      data: { status: INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED, lastError: notice, ...cleared },
+    })
+  }
+  return notice
 }
 
 /** True when this job predates the cut-off that applies to it. No floor: false. */
