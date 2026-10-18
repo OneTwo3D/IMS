@@ -18,6 +18,7 @@ import {
   markIntegrationOutboxRetryableFailure,
   currentOutboxRowBeforeCutoff,
   outboxRowBeforeCutoff,
+  outboxRowCutoffFloor,
   refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
@@ -95,12 +96,13 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
     })
 
     if (current.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
-      // A LIVE producer is writing into a job a worker holds. If a cut-off now applies and the job predates it, the worker's send-time check will
-      // refuse the job and every later claim excludes it by creation time, so the new update would be stranded for ever. The job is therefore
-      // RE-DATED in the same statement that merges the payload (the claim is keyed on its lock, not on createdAt, so the worker is unaffected), and the
+      // A LIVE producer is writing into a job a worker holds. While a cut-off applies, the merge MOVES THE JOB'S CREATION TIME in the same statement. That does two things: a job
+      // that predates the instant would otherwise be refused by the worker's send-time check and excluded by every later claim, stranding the new update for ever; and,
+      // because the worker read the stock BEFORE this event, the moved creation time is the generation stamp that stops completeClaimedJob taking an unchanged payload
+      // for proof the event was handled. The job is RE-DATED in the same statement that merges the payload (the claim is keyed on its lock, not on createdAt, so the worker is unaffected), and the
       // worker, which judges the current row, sends it. This applies to an identical payload too: the producer's event still needs its push after the instant.
       // With no floor in force nothing is re-dated and the statement is the legacy one.
-      const redateProcessing = outboxRowBeforeCutoff({ connector: current.connector, operation: current.operation, createdAt: current.createdAt }) !== null
+      const redateProcessing = outboxRowCutoffFloor(current.connector, current.operation) !== null
       if (samePayload(current.payloadJson, payload) && !redateProcessing) return true
       const updated = await db.integrationOutbox.updateMany({
         where: {
@@ -108,7 +110,8 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
           status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         },
         data: {
-          ...(redateProcessing ? { createdAt: new Date() } : {}),
+          // strictly later than the value the worker holds, so the generation always differs
+          ...(redateProcessing ? { createdAt: new Date(Math.max(Date.now(), current.createdAt.getTime() + 1)) } : {}),
           payloadJson: payload,
           lastError: null,
         },
@@ -151,7 +154,7 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
   return false
 }
 
-async function completeClaimedJob(job: IntegrationOutboxRow): Promise<'succeeded' | 'requeued'> {
+export async function completeClaimedJob(job: IntegrationOutboxRow): Promise<'succeeded' | 'requeued'> {
   const succeeded = await db.integrationOutbox.updateMany({
     where: {
       id: job.id,
@@ -172,18 +175,21 @@ async function completeClaimedJob(job: IntegrationOutboxRow): Promise<'succeeded
 
   const current = await db.integrationOutbox.findUnique({
     where: { id: job.id },
-    select: { payloadJson: true },
+    select: { payloadJson: true, createdAt: true },
   })
   if (!current) {
     throw new Error(`WooCommerce stock outbox job ${job.id} could not be completed by ${WC_STOCK_SYNC_WORKER_ID}`)
   }
-  if (samePayload(current.payloadJson, job.payloadJson)) {
+  // An unchanged payload is proof the work was handled ONLY if nothing was merged since the claim: while a cut-off applies every merge moves the creation time,
+  // so a moved creation time means a live event arrived after the worker read the stock, and the job is requeued below even when its payload is identical.
+  if (samePayload(current.payloadJson, job.payloadJson) && current.createdAt.getTime() === job.createdAt.getTime()) {
     const completed = await db.integrationOutbox.updateMany({
       where: {
         id: job.id,
         status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         lockedBy: WC_STOCK_SYNC_WORKER_ID,
         lockedAt: job.lockedAt,
+        createdAt: job.createdAt,
       },
       data: {
         status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,

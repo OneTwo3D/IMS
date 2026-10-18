@@ -1149,3 +1149,34 @@ test('STOCK JOB IN FLIGHT: a live event merged into a job a worker holds re-date
     assert.equal((await read(off.id))?.createdAt.getTime(), BEFORE.getTime(), 'CONTROL: no floor, nothing is re-dated (the legacy statement)')
   })
 })
+
+// ───────────── an identical payload merged during a claim is not proof the new event was handled (R11) ─────────────
+//
+// Named mutation (shown red in the PR): g1 completeClaimedJob takes an unchanged payload for completion without comparing the generation.
+
+test('STOCK COMPLETION GENERATION: an event merged into the job while a worker held it (identical payload included) makes the completion REQUEUE it, not succeed; nothing merged completes; the switch off is the legacy completion', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const claim = async (name: string, env: Record<string, string>) => {
+    const productId = `${tag}-${name}`
+    const key = `woocommerce:stock.push:${productId}`
+    await withEnv(env, async () => { await d.stock.enqueueWcStockSyncJobs([productId], 'MANUAL') })
+    const claimed = await withEnv(env, async () => (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'woocommerce-stock-sync' }))[0]!)
+    return { productId, id: claimed.id, claimed }
+  }
+  const read = (id: string) => d.db.integrationOutbox.findUnique({ where: { id }, select: { status: true } })
+  const live = wcLive(new Date(Date.now() - 3600_000))
+
+  const merged = await claim('merged', live)
+  await withEnv(live, async () => { await d.stock.enqueueWcStockSyncJobs([merged.productId], 'MANUAL') })   // the SAME payload, a new event, after the worker read the stock
+  assert.equal(await d.stock.completeClaimedJob(merged.claimed), 'requeued', 'identical payload, but a newer generation: requeued')
+  assert.equal((await read(merged.id))?.status, 'PENDING')
+
+  const quiet = await claim('quiet', live)
+  assert.equal(await d.stock.completeClaimedJob(quiet.claimed), 'succeeded', 'CONTROL: nothing merged, the claimed work is complete')
+
+  const legacy = await claim('legacy', {})
+  await withEnv({}, async () => { await d.stock.enqueueWcStockSyncJobs([legacy.productId], 'MANUAL') })
+  assert.equal(await d.stock.completeClaimedJob(legacy.claimed), 'succeeded', 'CONTROL: switch off, an identical payload is handled exactly as before')
+})
