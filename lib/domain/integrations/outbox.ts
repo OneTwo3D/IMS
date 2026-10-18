@@ -182,6 +182,12 @@ export type MarkIntegrationOutboxFailureOptions = {
 }
 
 export type MarkIntegrationOutboxRetryableFailureOptions = MarkIntegrationOutboxFailureOptions & {
+  /**
+   * PROOF THAT THIS CLAIM DISPATCHED NO WRITE (lib/security/write-ledger.ts). Only a caller that ran the attempt inside a write ledger and found it
+   * at zero may pass true. Without it a hold-refused claim keeps its first-attempt stamp: an earlier write of the same claim (a completion's tracking
+   * before its status) may already have left, and then the hold is not the job's only outcome.
+   */
+  noWriteSent?: boolean
   attemptsBeforeFailure: number
   retryDelayMs?: number
   retryBaseDelayMs?: number
@@ -771,10 +777,12 @@ export async function markIntegrationOutboxRetryableFailure(
     // claim's identity (status PROCESSING, this worker, this lockedAt) AND the stamp: there is no window in which an operator replay or another
     // worker's claim could take the row between them, and a later claim never matches because its lockedAt differs. A stamp from any earlier
     // claim, or a row the history does not track, falls through to the plain release below and keeps its stamp.
-    const withdrawn = await client.integrationOutbox.updateMany({
-      where: { ...claimedBy(options), attemptHistoryTracked: true, firstAttemptedAt: options.lockedAt },
-      data: { ...heldData, firstAttemptedAt: null },
-    })
+    const withdrawn = options.noWriteSent === true
+      ? await client.integrationOutbox.updateMany({
+        where: { ...claimedBy(options), attemptHistoryTracked: true, firstAttemptedAt: options.lockedAt },
+        data: { ...heldData, firstAttemptedAt: null },
+      })
+      : { count: 0 }
     if (withdrawn.count > 0) return requireOutboxRow(client, options.id)
     return updateClaimedOutboxRow(client, { id: options.id, workerId: options.workerId, lockedAt: options.lockedAt, data: heldData })
   }

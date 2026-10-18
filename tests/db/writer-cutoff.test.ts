@@ -619,7 +619,7 @@ test('OUTBOX HISTORY through the real functions: an attempted job that is REPLAY
   }
   const claim = async (key: string, worker: string) => (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: worker }))[0]!
   const refuse = (row: { id: string; lockedAt: Date | null }, worker: string, error: string) => d.outbox.markIntegrationOutboxRetryableFailure({
-    id: row.id, workerId: worker, lockedAt: row.lockedAt!, error, attemptsBeforeFailure: 0, retryDelayMs: 1000,
+    id: row.id, workerId: worker, lockedAt: row.lockedAt!, error, attemptsBeforeFailure: 0, retryDelayMs: 1000, noWriteSent: true,
   })
   const stamp = async (id: string) => d.db.integrationOutbox.findUnique({ where: { id }, select: { firstAttemptedAt: true, attemptHistoryTracked: true, attempts: true, status: true } })
 
@@ -729,7 +729,7 @@ test('DATABASE GUARD (outbox): a claim by a binary that does not stamp forfeits 
   await d.db.integrationOutbox.update({ where: { id: row.id }, data: { status: 'PERMANENT_FAILED', lockedAt: null, lockedBy: null, attempts: 5 } })
   await withEnv({}, async () => { await d.admin.replayIntegrationOutboxAdminRow({ id: row.id }) })    // attempts -> 0, error cleared
   const claimed = (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'new-binary' }))[0]!
-  await d.outbox.markIntegrationOutboxRetryableFailure({ id: row.id, workerId: 'new-binary', lockedAt: claimed.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000 })
+  await d.outbox.markIntegrationOutboxRetryableFailure({ id: row.id, workerId: 'new-binary', lockedAt: claimed.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000, noWriteSent: true })
   const after = await read()
   assert.deepEqual([after?.attemptHistoryTracked, after?.attempts, after?.status], [false, 0, 'RETRYABLE_FAILED'], 'it now looks like a never-attempted job that was only held, but it is untracked')
   // The flag cannot be switched back on by an update (a replay, a re-arm or a careless script).
@@ -829,7 +829,7 @@ test('HOLD REFUSAL IS ATOMIC: a replay and a second claim that land right after 
       },
     },
   }
-  await d.outbox.markIntegrationOutboxRetryableFailure({ client: hooked as never, id: row.id, workerId: 'w1', lockedAt: w1.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000 })
+  await d.outbox.markIntegrationOutboxRetryableFailure({ client: hooked as never, id: row.id, workerId: 'w1', lockedAt: w1.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000, noWriteSent: true })
   const after = await d.db.integrationOutbox.findUnique({ where: { id: row.id }, select: { firstAttemptedAt: true, status: true, lockedBy: true, attemptHistoryTracked: true } })
   console.log(`# atomic hold: interleaved=${interleaved} stamp=${after?.firstAttemptedAt ? 'present' : 'absent'} holder=${after?.lockedBy}`)
   assert.equal(interleaved, 1, 'precondition: the interleave ran')
@@ -1012,4 +1012,52 @@ test('STATUS: pre-cutoff-queued does not count the Xero types the cut-off exempt
   assert.equal(await withEnv(env, read), before, 'exempt types are not counted')
   await seedSyncLog(d, `${tag}-journal`, { createdAt: BEFORE, type: 'STOCK_RECEIPT' })
   assert.equal(await withEnv(env, read), before + 1, 'CONTROL: a write type is')
+})
+
+// ───────────── a multi-write claim: once ANY write left, a later hold must not withdraw the first-attempt stamp (R8) ─────────────
+//
+// Named mutations (each shown red in the PR): k1 the hold branch withdraws without the zero-writes proof; k2 the transport does not count writes.
+
+test('WRITE LEDGER: tracking sent, then the status request refused by the hold -> the stamp is kept and the job is PARKED, never shadowed; a hold with zero writes still withdraws it', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const savedKey = process.env.SETTINGS_ENCRYPTION_KEY
+  if (!savedKey) process.env.SETTINGS_ENCRYPTION_KEY = 'prod_readiness_ci_settings_key__'
+  t.after(() => { if (!savedKey) delete process.env.SETTINGS_ENCRYPTION_KEY })
+  const { createWriteLedger, runInWriteLedger } = await import('../../lib/security/write-ledger.ts')
+  const { noteRemoteWriteDispatched } = await import('../../lib/security/write-ledger.ts')
+  const held = (await import('../../lib/security/outbound-write-hold-constants.ts')).outboundHeldMessage({
+    connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/wp-json/x', hop: 0,
+  })
+  const make = async (name: string) => {
+    const key = `woocommerce:stock.push:${tag}-${name}`
+    const row = (await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false } })) as { id: string }
+    await d.db.integrationOutbox.update({ where: { id: row.id }, data: { createdAt: BEFORE } })
+    const claimed = (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'w1' }))[0]!
+    return { id: row.id, claimed }
+  }
+  const sent = await make('tracking-sent')
+  const none = await make('none-sent')
+
+  // The completion attempt: the tracking write leaves (the transport counts it, tests/connectors/write-ledger.test.ts proves the hook), then the status
+  // request is refused by the hold. A read does not count.
+  const ledger = createWriteLedger()
+  await runInWriteLedger(ledger, async () => { noteRemoteWriteDispatched('GET'); noteRemoteWriteDispatched('PUT') })
+  assert.equal(ledger.writes, 1, 'the write that left was counted; the read was not')
+  const idle = createWriteLedger()
+  assert.equal(idle.writes, 0)
+
+  // The status request is then refused by the hold; the drain reports the hold with the ledger's proof.
+  await d.outbox.markIntegrationOutboxRetryableFailure({ id: sent.id, workerId: 'w1', lockedAt: sent.claimed.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000, noWriteSent: Number(ledger.writes) === 0 })
+  await d.outbox.markIntegrationOutboxRetryableFailure({ id: none.id, workerId: 'w1', lockedAt: none.claimed.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000, noWriteSent: idle.writes === 0 })
+  const read = (id: string) => d.db.integrationOutbox.findUnique({ where: { id }, select: { firstAttemptedAt: true, status: true, attempts: true } })
+  assert.notEqual((await read(sent.id))?.firstAttemptedAt, null, 'a write left in this claim: the stamp is KEPT')
+  assert.equal((await read(none.id))?.firstAttemptedAt, null, 'CONTROL: nothing left, so the hold-only job withdraws it')
+
+  const scope = { destinations: ['woocommerce' as const], cutoffs: { woocommerce: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const by = (id: string) => plan.items.find((i: { id: string }) => i.id === id)?.classification.disposition
+  assert.equal(by(sent.id), 'PARK', 'held error, zero counted attempts, and still parked')
+  assert.equal(by(none.id), 'SHADOW')
 })

@@ -23,6 +23,7 @@ import {
 import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
 import { wooDrainHold } from '../producer-egress'
 import { runWithWcAttemptFence } from '../attempt-fence'
+import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
@@ -391,15 +392,17 @@ export async function processQueuedWcStockSyncJobs(options?: {
       continue
     }
 
+    // The writes this claim dispatches are counted (lib/security/write-ledger.ts): a hold that follows a write that already left is not the job's only outcome.
+    const ledger = createWriteLedger()
     try {
-      const result = await runWithWcAttemptFence(
+      const result = await runInWriteLedger(ledger, () => runWithWcAttemptFence(
         { signal: new AbortController().signal, stillOwned: async () => true, mayStillSend: () => outboxRowBeforeCutoff(job) === null },
         () => pushStockToWc({
           productIds: [payload.productId],
           forceProductIds: payload.force ? [payload.productId] : [],
           source: payload.reason,
         }),
-      )
+      ))
 
       if (shouldRetainJob(result, payload)) {
         await markIntegrationOutboxRetryableFailure({
@@ -409,6 +412,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
           error: result.errors.join(' | ') || result.message || 'WooCommerce stock sync failed',
           attemptsBeforeFailure: job.attempts,
           maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+          noWriteSent: ledger.writes === 0,
         })
         summary.failed++
         // Always record a reason: a retained force/abort case (e.g. version_changed
@@ -455,6 +459,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
         error: message,
         attemptsBeforeFailure: job.attempts,
         maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+        noWriteSent: ledger.writes === 0,
       })
       summary.failed++
       summary.errors.push(message)
