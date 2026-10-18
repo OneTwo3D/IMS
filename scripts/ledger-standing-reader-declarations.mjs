@@ -145,8 +145,6 @@ export const DECLARATIONS = [
     reason: "The retirement's honesty rule: a row that names a document id MAY have been sent, so it is PARKED (outcome unknown), never retired as a shadow. It reads the id only to refuse; the shadow arm additionally needs a positive no-attempt record (attempt-stamping custody with no claim, or the canonical attemptProvenNeverMade for a money row), and the write is a compare-and-set on externalTransactionId: null." },
   { key: "lib/domain/outbound-shadow/retire-held-backlog.ts::retireXeroSyncLog::where-admits-synced#1", class: "GUARD",
     reason: "A compare-and-swap on the status the retirement OBSERVED and classified (status: row.status, PENDING or PROCESSING), so a row that moved since is not rewritten. A fence on an observed value, not a reading of what the status means." },
-  { key: "lib/domain/outbound-shadow/retire-held-backlog.ts::voidMirrorUnlessAnotherAttemptIsLive::where-admits-synced#1", class: "GUARD",
-    reason: "Counts OTHER attempts at the same document that are queued, claimed or posted, to decide whether the shared mirrored event is still owned by one of them; if any is, the event is left untouched. A live attempt of any of the three statuses owns the mirror, so a SYNCED sibling is deliberately included. This only ever withholds a void." },
   { key: "lib/ops/outbound-producer-status.ts::readProducerCountsFromDatabase::where-admits-synced#1", class: "DISPLAY",
     reason: "A count for the operator report (rows the connector marked SYNCED in the last 24 hours, by destination). It decides nothing and gates nothing." },
   { key: "scripts/release-accounting-external-id-claim.ts::main::id-read#1", class: "GUARD",
