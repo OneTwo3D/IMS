@@ -16,10 +16,16 @@ import {
   isOutboxEnqueueShadowed,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
+  currentOutboxRowBeforeCutoff,
+  outboxRowBeforeCutoff,
+  outboxRowCutoffFloor,
+  refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
 import { wooDrainHold } from '../producer-egress'
+import { runWithWcAttemptFence } from '../attempt-fence'
+import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
@@ -90,13 +96,22 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
     })
 
     if (current.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
-      if (samePayload(current.payloadJson, payload)) return true
+      // A LIVE producer is writing into a job a worker holds. While a cut-off applies, the merge MOVES THE JOB'S CREATION TIME in the same statement. That does two things: a job
+      // that predates the instant would otherwise be refused by the worker's send-time check and excluded by every later claim, stranding the new update for ever; and,
+      // because the worker read the stock BEFORE this event, the moved creation time is the generation stamp that stops completeClaimedJob taking an unchanged payload
+      // for proof the event was handled. The job is RE-DATED in the same statement that merges the payload (the claim is keyed on its lock, not on createdAt, so the worker is unaffected), and the
+      // worker, which judges the current row, sends it. This applies to an identical payload too: the producer's event still needs its push after the instant.
+      // With no floor in force nothing is re-dated and the statement is the legacy one.
+      const redateProcessing = outboxRowCutoffFloor(current.connector, current.operation) !== null
+      if (samePayload(current.payloadJson, payload) && !redateProcessing) return true
       const updated = await db.integrationOutbox.updateMany({
         where: {
           id: current.id,
           status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         },
         data: {
+          // strictly later than the value the worker holds, so the generation always differs
+          ...(redateProcessing ? { createdAt: new Date(Math.max(Date.now(), current.createdAt.getTime() + 1)) } : {}),
           payloadJson: payload,
           lastError: null,
         },
@@ -107,12 +122,20 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
 
     const resetAttempts = current.status === INTEGRATION_OUTBOX_STATUS.SUCCEEDED
       || current.status === INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED
+    // THE WRITER-SIDE CUT-OFF, AND WHY THIS ROW IS RE-DATED. A product has ONE stock job for ever (its key is the product), re-armed in
+    // place by every stock change. The cut-off keeps a job created before the live-from instant from ever being delivered, and a row
+    // re-armed here is not that job: it is a NEW push of the current stock, ordered by a LIVE producer decision that the enqueue above has
+    // just taken after the instant. Left with its old creation time it would be refused for ever and the product's stock would stop
+    // syncing. A stock push is an absolute state, so delivering it now is correct (the ownership map marks it as needing no business-event
+    // time). The re-dating happens only while a floor is in force, so with the switch off the update is exactly what it was.
+    const redate = outboxRowBeforeCutoff({ connector: current.connector, operation: current.operation, createdAt: current.createdAt }) !== null
     const updated = await db.integrationOutbox.updateMany({
       where: {
         id: current.id,
         status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING },
       },
       data: {
+        ...(redate ? { createdAt: new Date() } : {}),
         connector: WC_STOCK_SYNC_CONNECTOR,
         operation: WC_STOCK_SYNC_OPERATION,
         idempotencyKey: wcStockSyncIdempotencyKey(options.productId),
@@ -131,7 +154,7 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
   return false
 }
 
-async function completeClaimedJob(job: IntegrationOutboxRow): Promise<'succeeded' | 'requeued'> {
+export async function completeClaimedJob(job: IntegrationOutboxRow): Promise<'succeeded' | 'requeued'> {
   const succeeded = await db.integrationOutbox.updateMany({
     where: {
       id: job.id,
@@ -152,18 +175,21 @@ async function completeClaimedJob(job: IntegrationOutboxRow): Promise<'succeeded
 
   const current = await db.integrationOutbox.findUnique({
     where: { id: job.id },
-    select: { payloadJson: true },
+    select: { payloadJson: true, createdAt: true },
   })
   if (!current) {
     throw new Error(`WooCommerce stock outbox job ${job.id} could not be completed by ${WC_STOCK_SYNC_WORKER_ID}`)
   }
-  if (samePayload(current.payloadJson, job.payloadJson)) {
+  // An unchanged payload is proof the work was handled ONLY if nothing was merged since the claim: while a cut-off applies every merge moves the creation time,
+  // so a moved creation time means a live event arrived after the worker read the stock, and the job is requeued below even when its payload is identical.
+  if (samePayload(current.payloadJson, job.payloadJson) && current.createdAt.getTime() === job.createdAt.getTime()) {
     const completed = await db.integrationOutbox.updateMany({
       where: {
         id: job.id,
         status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         lockedBy: WC_STOCK_SYNC_WORKER_ID,
         lockedAt: job.lockedAt,
+        createdAt: job.createdAt,
       },
       data: {
         status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,
@@ -370,12 +396,27 @@ export async function processQueuedWcStockSyncJobs(options?: {
       continue
     }
 
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND: this worker may hold a claim taken before a floor came into force. A job
+    // older than the live-from instant is parked without sending, in one statement keyed on this claim; and every stock write inside the push asks
+    // again (the fence below). With no floor in force both are no-ops and nothing extra is queried.
+    const parkedBeforeCutoff = await refuseClaimedJobBeforeCutoff(job, WC_STOCK_SYNC_WORKER_ID)
+    if (parkedBeforeCutoff !== null) {
+      summary.failed++
+      summary.errors.push(parkedBeforeCutoff)
+      continue
+    }
+
+    // The writes this claim dispatches are counted (lib/security/write-ledger.ts): a hold that follows a write that already left is not the job's only outcome.
+    const ledger = createWriteLedger()
     try {
-      const result = await pushStockToWc({
-        productIds: [payload.productId],
-        forceProductIds: payload.force ? [payload.productId] : [],
-        source: payload.reason,
-      })
+      const result = await runInWriteLedger(ledger, () => runWithWcAttemptFence(
+        { signal: new AbortController().signal, stillOwned: async () => true, mayStillSend: async () => (await currentOutboxRowBeforeCutoff(job)) === null },
+        () => pushStockToWc({
+          productIds: [payload.productId],
+          forceProductIds: payload.force ? [payload.productId] : [],
+          source: payload.reason,
+        }),
+      ))
 
       if (shouldRetainJob(result, payload)) {
         await markIntegrationOutboxRetryableFailure({
@@ -385,6 +426,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
           error: result.errors.join(' | ') || result.message || 'WooCommerce stock sync failed',
           attemptsBeforeFailure: job.attempts,
           maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+          noWriteSent: ledger.writes === 0,
         })
         summary.failed++
         // Always record a reason: a retained force/abort case (e.g. version_changed
@@ -431,6 +473,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
         error: message,
         attemptsBeforeFailure: job.attempts,
         maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+        noWriteSent: ledger.writes === 0,
       })
       summary.failed++
       summary.errors.push(message)

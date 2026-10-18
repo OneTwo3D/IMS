@@ -39,6 +39,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
+import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
@@ -102,6 +103,8 @@ async function safeWcPost(
   creds: ConnectorCredentials,
 ): Promise<{ data: unknown; error?: string }> {
   try {
+    // The writer-side cut-off, re-derived immediately before each stock write of a queued job (a no-op outside a drain's attempt).
+    await assertWcAttemptMayStillSend()
     const { data, error } = await wcPost(path, body, creds)
     return { data, error }
   } catch (e) {

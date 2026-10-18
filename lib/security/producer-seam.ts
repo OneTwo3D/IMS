@@ -118,3 +118,40 @@ export function producerEgressVerdict(
     }
   }
 }
+
+/**
+ * THE WRITER-SIDE CUT-OFF: the earliest instant at which a unit of QUEUED work for this destination may have been created and still be
+ * delivered. Null when no such floor applies; a number of queue-reading sites share this one answer.
+ *
+ * The producer seams decide whether work is produced at all. This answers the question of work that ALREADY EXISTS: a row queued
+ * before the destination's live-from instant (in the window when the transport hold was the only barrier, or while the hold was not
+ * enforced) belongs to the writer that owned the destination then, and must never be delivered by IMS once it is live, whatever its
+ * status and however it was re-queued. Every claim, every selection of oldest-first work and every re-queue asks here.
+ *
+ *   null     the destination is not enforced (the switch is off: legacy behaviour, byte for byte), or it is not in its live phase (no
+ *            grant, no live-from instant, or the instant not reached yet: the claim boundary hold already stands down everything), or
+ *            anything is unreadable. NOTHING is filtered.
+ *   a Date   enforced and in the live phase: work created before this instant is never delivered.
+ *
+ * Re-derived at every call from the environment, never cached, so a decision made under a claim reads the value of that moment.
+ * Pure and synchronous; never throws.
+ */
+export function producerCutoffFloor(
+  destination: OutboundConnector,
+  context: ProducerDecisionContext = {},
+): Date | null {
+  try {
+    const verdict = producerEgressVerdict(destination, context)
+    return verdict.kind === 'open' ? verdict.decision.cutoff : null
+  } catch {
+    return null
+  }
+}
+
+/** True when a row created at `createdAt` is before the floor. No floor: never. A createdAt that cannot be read is before it (fail closed). */
+export function createdBeforeCutoffFloor(createdAt: Date | null | undefined, floor: Date | null): boolean {
+  if (floor === null) return false
+  if (!(createdAt instanceof Date)) return true
+  const ms = createdAt.getTime()
+  return !Number.isFinite(ms) || ms < floor.getTime()
+}

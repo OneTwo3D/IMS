@@ -1,6 +1,6 @@
-import { producerShadowNotice } from '@/lib/security/producer-disposition-constants'
+import { producerBeforeCutoffNotice, producerShadowNotice } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecision } from '@/lib/security/producer-disposition'
-import { producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { createdBeforeCutoffFloor, producerCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
 import type { OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import {
   ACCOUNTING_SYNC_TYPE_EXCLUSIONS,
@@ -109,4 +109,39 @@ export function xeroProducerSeamVerdict(input: {
     decision: verdict.decision,
     notice: producerShadowNotice({ connector: target.destination, reason: verdict.decision.reason, owner: verdict.decision.owner }),
   }
+}
+
+/**
+ * THE WRITER-SIDE CUT-OFF FOR XERO: the instant before which a QUEUED accounting row is never delivered by IMS, or null when no such
+ * floor applies (the producer hold is not enforced for Xero, or Xero is not in its live phase: legacy behaviour, byte for byte).
+ * Every claim, every oldest-first selection and every re-queue of an accounting sync row asks here, and asks again at the moment of its
+ * own write: it reads the environment each time and caches nothing.
+ */
+export function xeroCutoffFloor(context?: { env?: Record<string, string | undefined>; now?: Date }): Date | null {
+  return producerCutoffFloor('xero', context ?? {})
+}
+
+/**
+ * The operator sentence when a row may not be re-queued or delivered because it predates the cut-off, or null when it may (no floor,
+ * created at or after it, or a type that is not a write to Xero at all: a PDF fetch and an e-mail are exactly as exempt as they are from
+ * the producer decision). A row whose type is not given is treated as a write: fail closed. The one place a re-queue path words this.
+ */
+export function xeroBeforeCutoffRefusal(
+  row: { createdAt: Date | null | undefined; type?: string },
+  context?: { env?: Record<string, string | undefined>; now?: Date },
+): string | null {
+  if (row.type !== undefined && Object.prototype.hasOwnProperty.call(ACCOUNTING_SYNC_TYPE_EXCLUSIONS, row.type)) return null
+  const floor = xeroCutoffFloor(context)
+  if (floor === null || !createdBeforeCutoffFloor(row.createdAt, floor)) return null
+  return producerBeforeCutoffNotice({ connector: 'xero', cutoff: floor })
+}
+
+/**
+ * The same rule as a where-fragment, for a claim or a selection: "NOT (created before the floor AND a write type)". Empty with no floor,
+ * so a query that spreads it is the legacy query exactly. The sync log's own statuses are untouched: a settled or cancelled row is not
+ * delivered by any query that carries this, so it needs no exception here.
+ */
+export function xeroNotBeforeCutoffWhere(floor: Date | null): { NOT?: Record<string, unknown> } {
+  if (floor === null) return {}
+  return { NOT: { createdAt: { lt: floor }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) } } }
 }

@@ -1,11 +1,15 @@
 import { db } from '@/lib/db'
 import {
   INTEGRATION_OUTBOX_STATUS,
+  outboxBeforeCutoffWhere,
+  outboxRowBeforeCutoff,
   type IntegrationOutboxClient,
   type IntegrationOutboxRow,
   type IntegrationOutboxStatus,
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_MAX_LEASE_MS } from '@/lib/domain/integrations/outbox-leases'
+import { producerBeforeCutoffNotice } from '@/lib/security/producer-disposition-constants'
+import type { OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 
 const ADMIN_OUTBOX_DEFAULT_LIMIT = 50
 export const ADMIN_OUTBOX_MAX_LIMIT = 100
@@ -280,6 +284,13 @@ export async function replayIntegrationOutboxAdminRow(options: {
   const prior = await requireRow(client, options.id)
   const priorStatus = prior.status
   const priorLastError = prior.lastError
+  if (prior.status === INTEGRATION_OUTBOX_STATUS.SHADOWED) {
+    throw new IntegrationOutboxAdminError(
+      `Integration outbox row ${options.id} was retired as a shadow while writes to its destination were held; it records work IMS did not send and is never replayed`,
+      409,
+      'shadowed',
+    )
+  }
   if (!includesStatus(REPLAYABLE_STATUSES, prior.status)) {
     throw new IntegrationOutboxAdminError(
       `Integration outbox row ${options.id} is ${prior.status}; only failed rows can be replayed`,
@@ -289,8 +300,19 @@ export async function replayIntegrationOutboxAdminRow(options: {
   }
 
   const now = options.now ?? new Date()
+  // THE WRITER-SIDE CUT-OFF AT THE RE-ARM: a job queued before its destination's live-from instant is not made claimable again. The floor
+  // is read here, and is also a clause of the write itself, so a job that is only just past the line cannot slip through between the two.
+  const beforeCutoff = outboxRowBeforeCutoff(prior, { now })
+  if (beforeCutoff !== null) {
+    throw new IntegrationOutboxAdminError(
+      producerBeforeCutoffNotice({ connector: prior.connector as OutboundConnector, cutoff: beforeCutoff }),
+      409,
+      'before_cutoff',
+    )
+  }
+  const cutoffGuard = outboxBeforeCutoffWhere({ now })
   const result = await client.integrationOutbox.updateMany({
-    where: { id: options.id, status: { in: [...REPLAYABLE_STATUSES] } },
+    where: { id: options.id, status: { in: [...REPLAYABLE_STATUSES] }, ...(cutoffGuard ? { NOT: cutoffGuard } : {}) },
     data: {
       status: INTEGRATION_OUTBOX_STATUS.PENDING,
       attempts: 0,
@@ -320,6 +342,13 @@ function assertPermanentFailableRow(options: {
   now: Date
   staleProcessingLockMs: number
 }) {
+  if (options.row.status === INTEGRATION_OUTBOX_STATUS.SHADOWED) {
+    throw new IntegrationOutboxAdminError(
+      `Integration outbox row ${options.row.id} is SHADOWED: it was retired unsent and is already terminal`,
+      409,
+      'not_permanent_failable',
+    )
+  }
   if (!includesStatus(PERMANENT_FAILABLE_STATUSES, options.row.status)) {
     throw new IntegrationOutboxAdminError(
       `Integration outbox row ${options.row.id} is ${options.row.status}; succeeded rows cannot be marked as permanent failures`,

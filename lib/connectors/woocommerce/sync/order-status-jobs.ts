@@ -33,10 +33,13 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
+  currentOutboxRowBeforeCutoff,
+  refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
 import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW, wcOrderStatusClaimGate } from './order-status-claim-gate'
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
+import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
 import { wooDrainHold } from '../producer-egress'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
@@ -369,10 +372,20 @@ export async function runFencedWcOrderJob(
       continue
     }
 
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND (see the completion drain): park a pre-cutoff job without sending.
+    const parkedBeforeCutoff = await refuseClaimedJobBeforeCutoff(job, descriptor.workerId, now ? { now } : {})
+    if (parkedBeforeCutoff !== null) {
+      summary.deadLettered++
+      summary.errors.push(parkedBeforeCutoff)
+      continue
+    }
+
+    const ledger = createWriteLedger()
     const retry = async (error: string) => {
       const row = await markIntegrationOutboxRetryableFailure({
         ...claim,
         error,
+        noWriteSent: ledger.writes === 0,
         attemptsBeforeFailure: job.attempts,
         maxAttempts: WC_ORDER_STATUS_PUSH_MAX_ATTEMPTS,
         now,
@@ -399,10 +412,12 @@ export async function runFencedWcOrderJob(
         stillOwned: async () => (await db.integrationOutbox.count({
           where: { id: job.id, status: 'PROCESSING', lockedBy: descriptor.workerId, lockedAt: job.lockedAt },
         })) === 1,
+        // Asked again before the write, with the floor read at that moment.
+        mayStillSend: async () => (await currentOutboxRowBeforeCutoff(job)) === null,
         // The re-read the PUT is gated on, as close to the write as the fence allows.
         stillWanted: async () => (await readImsStatus(orderId)) === descriptor.imsTarget,
       }
-      const verdict = await runWithWcAttemptFence(fence, () => attemptWcOrderStatusPush(descriptor, orderId))
+      const verdict = await runInWriteLedger(ledger, () => runWithWcAttemptFence(fence, () => attemptWcOrderStatusPush(descriptor, orderId)))
       switch (verdict.kind) {
         case 'done':
           await markIntegrationOutboxSuccess(claim)

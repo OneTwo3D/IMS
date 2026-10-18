@@ -8,6 +8,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch, wcPut } from '../api'
+import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import type { WcFullOrder, WcMeta, WcTrackingItem } from './types'
 
 type TrackingSourceRow = {
@@ -199,6 +200,8 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
       ? { id: existingMeta.id, key: existingMeta.key, value: outbound.items }
       : { key: '_wc_shipment_tracking_items', value: outbound.items }
 
+    // The writer-side cut-off, re-derived immediately before the write (a no-op outside a queued job's attempt).
+    await assertWcAttemptMayStillSend()
     const update = await wcPut(`/orders/${outbound.externalOrderId}`, {
       meta_data: [metaPatch],
     })

@@ -882,6 +882,8 @@ export interface WmsOrderPushPort {
    * Optional: a port without it simply leaves the stamp in place (the safe direction).
    */
   updateLinkIfCreateClaimOwned?(orderId: string, stamp: Date, data: LinkWrite): Promise<boolean>
+  /** The order's CURRENT paid and creation times, read fresh (never the candidate snapshot). Absent: the caller falls back to its snapshot. */
+  readOrderObligationTimes?(orderId: string): Promise<{ paidAt: Date | null; createdAt: Date | null } | null>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
 }
@@ -1712,6 +1714,31 @@ export async function runWmsOrderPushSweepCore(
         continue
       }
       if (claim !== 'CLAIMED') continue
+
+      // THE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND. `createFloor` was taken once, when the pass began, and the withdrawal screening and the
+      // claim have since awaited: the floor is asked again NOW. An order that is now paid before it belongs to the bridge and must not be created:
+      // the claim just taken is given back (only if it is still this worker's, and leaving no attempt stamp, exactly as a proven pre-send hold
+      // does) and nothing is sent. The durable claim history stays, so a later retirement parks the link rather than calling it unsent.
+      // No floor in force: nothing is read or written here.
+      const floorBeforeSend = wmsCreateObligationFloor(connectorId, producerContext)
+      // The same business-event time the create seam judged it on (paid time, else creation time).
+      // JUDGED ON THE ORDER AS IT IS NOW: the paid time is read afresh at this hand-off (a correction can land after the claim's lock was released), not the
+      // snapshot the candidate list carried. An order that can no longer be read is not created. A port that cannot read falls back to the snapshot.
+      let sendObligation: Date | null | undefined = order.paidAt ?? order.createdAt
+      if (floorBeforeSend && port.readOrderObligationTimes) {
+        const current = await port.readOrderObligationTimes(order.id).catch(() => null)
+        sendObligation = current ? (current.paidAt ?? current.createdAt) : null
+      }
+      if (floorBeforeSend && wmsPaidBeforeCreateFloor(sendObligation, floorBeforeSend)) {
+        recoveryRefusedCount += 1
+        console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} is paid before the live-from instant as it stands now — claim given back, NOT created`)
+        await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
+          state: 'PENDING_CREATE', attempts: order.pushAttempts,
+          lastError: 'Not sent by IMS: this order was paid before writes to the warehouse went live on this installation, so it belongs to the writer that owned the warehouse then. Check the warehouse before acting.',
+          lastAttemptAt: null,
+        }).catch(() => false)
+        continue
+      }
 
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // `push` is hoisted so the catch can tell "remote create failed" from "remote
@@ -2595,7 +2622,11 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         })
         if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return 'SKIPPED'
         // The ownership boundary, re-proved on the CURRENT paid time under the lock (see the sweep). Before any write.
-        if (paidNotBefore && wmsPaidBeforeCreateFloor(fresh?.paidAt, paidNotBefore)) return 'REFUSED_PRE_CUTOVER'
+        // The floor the caller took (when its pass began) AND the floor of this moment, the later of the two: a live-from instant that has moved
+        // since is honoured here, under the lock, without the caller having to pass it again.
+        const floorNow = wmsCreateObligationFloor(connector)
+        const claimFloor = paidNotBefore && floorNow ? (floorNow.getTime() > paidNotBefore.getTime() ? floorNow : paidNotBefore) : (paidNotBefore ?? floorNow)
+        if (claimFloor && wmsPaidBeforeCreateFloor(fresh?.paidAt, claimFloor)) return 'REFUSED_PRE_CUTOVER'
 
         // o3d-d82p: a live WooCommerce withdrawal SUPPRESSION is a fulfilment
         // fence in its own right, not just an ingestion guard.
@@ -2649,7 +2680,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
 
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
-          select: { state: true, attempts: true, lastAttemptAt: true },
+          select: { state: true, attempts: true, lastAttemptAt: true, firstClaimedAt: true },
         })
         // o3d-38gl: refuses while another worker's claim is still fresh. Without the lease,
         // PENDING_CREATE is merely a state that every waiting worker passes, and they all push.
@@ -2683,8 +2714,11 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         }
         await tx.wmsOrderPushLink.upsert({
           where: { orderId },
-          create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt },
-          update: { lastAttemptAt: attemptedAt },
+          // The durable claim history: this binary stamps the first claim (before any request can leave) and marks the row tracked at creation.
+          create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt, claimHistoryTracked: true, firstClaimedAt: attemptedAt },
+          // ONE statement: the database forfeits the history of any claim that does not stamp itself (see the migration), so the stamp must be written
+          // by the very statement that moves lastAttemptAt.
+          update: { lastAttemptAt: attemptedAt, ...(existing?.firstClaimedAt ? {} : { firstClaimedAt: attemptedAt }) },
         })
         return 'CLAIMED'
       })
@@ -2727,7 +2761,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           // CREATED here = provably pre-call: no link existed, so no worker had claimed the order
           // and pushOrder cannot have been invoked. attempts 0 is the hard-delete guard's proof,
           // and this branch is the ONLY writer entitled to mint it (see provesNoRemoteWmsCall).
-          create: { orderId, connector, state: 'VALIDATION_FAILED', attempts: 0, lastError: error, lastAttemptAt: attemptedAt },
+          create: { orderId, connector, state: 'VALIDATION_FAILED', attempts: 0, lastError: error, lastAttemptAt: attemptedAt, claimHistoryTracked: true },
           // CONVERTED from an EXPIRED claim = AMBIGUOUS. The claim was written immediately before
           // a pushOrder call; the increment that would have recorded that call lives in a catch
           // whose own write is `.catch(() => {})` and which does not run at all if the worker was
@@ -2937,6 +2971,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async updateLink(id, data) {
       await db.wmsOrderPushLink.update({ where: { id }, data })
+    },
+    async readOrderObligationTimes(orderId) {
+      return db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, createdAt: true } })
     },
     async updateLinkIfCreateClaimOwned(orderId, stamp, data) {
       const { count } = await db.wmsOrderPushLink.updateMany({

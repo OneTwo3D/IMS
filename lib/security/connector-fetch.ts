@@ -13,6 +13,7 @@ import {
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { OutboundWriteHeldError, outboundWriteRefusal } from './outbound-write-grant'
 import { recordOutboundWriteRefusal } from './outbound-write-refusal-log'
+import { noteRemoteWriteDispatched } from './write-ledger'
 
 export type ConnectorDnsLookup = (hostname: string) => Promise<LookupAddress[]>
 
@@ -450,6 +451,8 @@ export async function connectorFetch(
       }
       const gateRefusal = options.hopGate?.({ method, url, redirectCount })
       if (gateRefusal) throw new Error(gateRefusal)
+      // Counted BEFORE the dispatch, synchronously: a unit of work that wants to know whether anything left can only over-count.
+      noteRemoteWriteDispatched(method)
       const response = await sendConnectorRequest(url, method, headers, body, abortSignal.signal, options)
       const nextUrl = redirectLocation(response, url)
       if (!nextUrl) {

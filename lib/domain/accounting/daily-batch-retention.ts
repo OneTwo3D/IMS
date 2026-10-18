@@ -59,3 +59,20 @@ export async function recreateRetentionWindow(now?: Date): Promise<{
   // the filter cannot be taken from one read of the setting and the cutoff from another.
   return { cutoff, dateFilter: cutoff ? { gte: cutoff } : { not: null } }
 }
+
+/**
+ * THE WRITER-SIDE CUT-OFF APPLIED TO THE RECREATE WINDOW: a batch dated before the destination's live-from instant belongs to the writer
+ * that owned the destination then, so the sweep that rebuilds MISSING batch logs does not look at it. Without this a live installation
+ * re-produces every missing pre-cut-off batch each run (a shadow each, deduplicated, but never finished, and the work grows with history).
+ *
+ * The window's lower bound becomes the later of the retention bound and the floor; with no floor (the switch is off, or the destination is
+ * not live) the window is returned UNCHANGED, the same object. Pure.
+ */
+export function clampRecreateWindowToCutoff(
+  window: { cutoff: Date | null; dateFilter: { gte: Date } | { not: null } },
+  floor: Date | null,
+): { cutoff: Date | null; dateFilter: { gte: Date } | { not: null } } {
+  if (floor === null) return window
+  const lower = window.cutoff !== null && window.cutoff.getTime() >= floor.getTime() ? window.cutoff : floor
+  return { cutoff: lower, dateFilter: { gte: lower } }
+}

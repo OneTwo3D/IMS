@@ -1026,18 +1026,33 @@ function splitCsvSetting(value: string | null | undefined): string[] {
 async function getIntegrationOutboxHealth(now: Date = new Date()): Promise<HealthCheck> {
   try {
     const { db } = await import('@/lib/db')
+    const { outboxBeforeCutoffWhere } = await import('@/lib/domain/integrations/outbox')
+    // THE WRITER-SIDE CUT-OFF. Jobs queued before a live destination's live-from instant are never delivered (the claim excludes them), so they
+    // are not "pending work that is falling behind": counting them would hold this check red for ever. They are reported by
+    // `npm run outbound:status` (pre-cutoff-queued) until `npm run retire:held-backlog` retires them. With the switch off this adds nothing.
+    const beforeCutoff = outboxBeforeCutoffWhere({ now })
+    const notBeforeCutoff = beforeCutoff ? { NOT: beforeCutoff } : {}
     const [statusCounts, oldestPending, oldestProcessing] = await Promise.all([
       db.integrationOutbox.groupBy({
         by: ['status'],
-        where: {
-          status: {
-            in: ['PENDING', 'PROCESSING', 'RETRYABLE_FAILED', 'PERMANENT_FAILED'],
+        // A dead letter stays counted whatever its age (a parked row IS one: an operator has to look). Only QUEUED jobs predating the cut-off leave the count.
+        where: beforeCutoff
+          ? {
+            OR: [
+              { status: 'PERMANENT_FAILED' },
+              { status: { in: ['PENDING', 'PROCESSING', 'RETRYABLE_FAILED'] }, NOT: beforeCutoff },
+            ],
+          }
+          : {
+            status: {
+              in: ['PENDING', 'PROCESSING', 'RETRYABLE_FAILED', 'PERMANENT_FAILED'],
+            },
           },
-        },
         _count: { _all: true },
       }),
       db.integrationOutbox.findFirst({
         where: {
+          ...notBeforeCutoff,
           status: 'PENDING',
           OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
         },

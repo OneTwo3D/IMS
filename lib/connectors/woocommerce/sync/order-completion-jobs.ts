@@ -27,10 +27,13 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
+  currentOutboxRowBeforeCutoff,
+  refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
 import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW, wcOrderStatusClaimGate } from './order-status-claim-gate'
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
+import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
 import { wooDrainHold } from '../producer-egress'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
@@ -204,10 +207,22 @@ export async function processWcOrderCompletionJobs(options?: {
       continue
     }
 
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND: a claim taken before a floor came into force must not send after it.
+    // A job older than the live-from instant is parked without sending, in one statement keyed on this claim. No floor: a no-op.
+    const parkedBeforeCutoff = await refuseClaimedJobBeforeCutoff(job, WORKER_ID, now ? { now } : {})
+    if (parkedBeforeCutoff !== null) {
+      summary.deadLettered++
+      summary.errors.push(parkedBeforeCutoff)
+      continue
+    }
+
+    // The writes this claim dispatches (tracking, then status) are counted: a hold on the status request after the tracking left is not a hold-only job.
+    const ledger = createWriteLedger()
     const retry = async (error: string) => {
       const row = await markIntegrationOutboxRetryableFailure({
         ...claim,
         error,
+        noWriteSent: ledger.writes === 0,
         attemptsBeforeFailure: job.attempts,
         maxAttempts: WC_ORDER_COMPLETION_MAX_ATTEMPTS,
         now,
@@ -238,8 +253,10 @@ export async function processWcOrderCompletionJobs(options?: {
         stillOwned: async () => (await db.integrationOutbox.count({
           where: { id: job.id, status: 'PROCESSING', lockedBy: WORKER_ID, lockedAt: job.lockedAt },
         })) === 1,
+        // Asked again before each write (the tracking PUT and the status PUT), with the floor read at that moment.
+        mayStillSend: async () => (await currentOutboxRowBeforeCutoff(job)) === null,
       }
-      const retryReason = await runWithWcAttemptFence(fence, async (): Promise<string | null> => {
+      const retryReason = await runInWriteLedger(ledger, () => runWithWcAttemptFence(fence, async (): Promise<string | null> => {
         // The facade, not the connector: it owns "is a storefront connector runnable at all".
         const { pushOrderDeliveryMetadata, pushSalesOrderStatus } = await import('@/lib/shopping')
 
@@ -286,7 +303,7 @@ export async function processWcOrderCompletionJobs(options?: {
           return `WooCommerce order is "${outcome.wcStatus}" (${outcome.class === 'unknown' ? 'a status IMS has no reading of; add a status mapping' : 'not ready to complete'}), not completed`
         }
         return null
-      })
+      }))
       if (retryReason !== null) {
         await retry(retryReason)
         continue

@@ -30,6 +30,12 @@ type Declaration = {
   consults: boolean
   /** Calls of xeroProducerSeamVerdict the function body must contain itself (the primitive's own ask does not count for these). */
   verdictCalls?: number
+  /**
+   * THE WRITER-SIDE CUT-OFF: the number of calls of `xeroBeforeCutoffRefusal` / `xeroNotBeforeCutoffWhere` the function body must contain
+   * itself. A site that makes a row claimable again must refuse a row created before the destination's live-from instant. A site that
+   * does not (a held claim given back, a post-send finish) says why in `why`: the claim statement refuses such a row anyway.
+   */
+  cutoffCalls?: number
   /** Why it is correct that it does, or does not. */
   why: string
 }
@@ -38,10 +44,10 @@ export const DECLARED: readonly Declaration[] = [
   { site: 'lib/accounting.ts::queueAccountingSyncTx', count: 1, consults: true, why: 'create through createAccountingSyncLogRow, which asks the seam; a shadow gets no outbox job and no event' },
   { site: 'lib/connectors/xero/queue.ts::queueXeroSync', count: 1, consults: true, why: 'create through createAccountingSyncLogRow (seam); shadowed is reported as queued:true/shadowed' },
   { site: 'lib/connectors/xero/daily-sync.ts::createPendingSyncLog', count: 1, consults: true, why: 'create through createAccountingSyncLogRow (seam); the shadow row id is stamped on the batch rows' },
-  { site: 'lib/connectors/xero/daily-sync.ts::resetFailedDailyBatchLogs', count: 2, consults: true, verdictCalls: 1, why: 'switch off: the original status-wide reset, byte-identical; enforced: only rows decided not-SHADOW are reset' },
-  { site: 'lib/connectors/xero/sync-processor.ts::enqueueFollowUpSyncLog', count: 2, consults: true, verdictCalls: 1, why: 'revival asks xeroProducerSeamVerdict before the update and schedule (a held revival falls to the create path, which records the shadow and leaves the FAILED row as it was); the create goes through the primitive' },
-  { site: 'app/actions/xero-sync.ts::retryFailedXeroSync', count: 3, consults: true, verdictCalls: 2, why: 'per-candidate verdict before planManualRetry; the no-candidates fenced branch reads the row and asks the seam before the fenced reset' },
-  { site: 'lib/domain/accounting/sync-claim-fence.ts::releaseClaimForRetry', count: 1, consults: false, why: 'PROCESSING to PENDING with a future processingStartedAt: the worker already holds a claim it passed the claim-boundary gate for; the row was claimable already and its next claim asks the gate again (reason producer-held)' },
+  { site: 'lib/connectors/xero/daily-sync.ts::resetFailedDailyBatchLogs', count: 2, consults: true, verdictCalls: 1, cutoffCalls: 2, why: 'switch off: the original status-wide reset, byte-identical; enforced: only rows decided not-SHADOW and not created before the live-from instant are reset (checked per row, and again as a clause of the write)' },
+  { site: 'lib/connectors/xero/sync-processor.ts::enqueueFollowUpSyncLog', count: 2, consults: true, verdictCalls: 1, cutoffCalls: 1, why: 'revival asks xeroProducerSeamVerdict and the cut-off before the update and schedule (a held or pre-cut-off revival falls to the create path, which decides the new row on its own business-event time and leaves the FAILED row as it was); the create goes through the primitive' },
+  { site: 'app/actions/xero-sync.ts::retryFailedXeroSync', count: 3, consults: true, verdictCalls: 2, cutoffCalls: 2, why: 'per-candidate verdict and cut-off check before planManualRetry; the no-candidates fenced branch reads the row and asks the seam and the cut-off before the fenced reset' },
+  { site: 'lib/domain/accounting/sync-claim-fence.ts::releaseClaimForRetry', count: 1, consults: false, why: 'PROCESSING to PENDING with a future processingStartedAt: the worker already holds a claim it passed the claim-boundary gate and the cut-off floor for; the row was claimable already and its next claim asks both again (the claim statement carries the floor)' },
   { site: 'lib/connectors/xero/sync-processor.ts::reportUnrecordedXeroWrite', count: 1, consults: false, why: 'sets PENDING only AFTER Xero accepted the document and returned its id (externalTransactionId set), so that the row finishes without posting again; the send had already passed the gate' },
   { site: 'scripts/repro-scjz68.ts::seedScenario', count: 1, consults: true, why: 'raw seed of a queued row; refuses unless the hold is not enforced or the decision is LIVE' },
 ]
@@ -151,6 +157,20 @@ export function functionConsultsSeam(text: string, fnName: string, verdictCalls 
   return /xeroProducerSeamVerdict|createAccountingSyncLogRow|producerSeamVerdict|readProducerEnforcement/.test(source)
 }
 
+/** Does the function named by a declaration apply the writer-side cut-off (xeroBeforeCutoffRefusal / xeroNotBeforeCutoffWhere) at least `calls` times in its own body? */
+export function functionAppliesCutoff(text: string, fnName: string, calls: number): boolean {
+  const sf = ts.createSourceFile('x.ts', text, ts.ScriptTarget.Latest, true)
+  let body: ts.Node | undefined
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === fnName) body = node
+    if (ts.isVariableDeclaration(node) && node.name.getText() === fnName && node.initializer) body = node.initializer
+    ts.forEachChild(node, visit)
+  }
+  visit(sf)
+  if (!body) return false
+  return (body.getText().match(/xeroBeforeCutoffRefusal\(|xeroNotBeforeCutoffWhere\(/g) ?? []).length >= calls
+}
+
 test('the PENDING-transition census: every sync-row PENDING write is declared, and every declared consulting site asks the seam', () => {
   const files = loadFiles()
   const found = scanPendingWrites(files)
@@ -163,10 +183,20 @@ test('the PENDING-transition census: every sync-row PENDING write is declared, a
     const text = files.find((f) => f.rel === file)?.text ?? ''
     // The seed script and the e2e fixture are raw SQL/INSERT sites whose enclosing function is the seam-asking one by name.
     assert.ok(functionConsultsSeam(text, fn, d.verdictCalls), `${d.site} is declared as consulting the seam but its body does not call it`)
+    if (d.cutoffCalls !== undefined) assert.ok(functionAppliesCutoff(text, fn, d.cutoffCalls), `${d.site} is declared as applying the writer-side cut-off ${d.cutoffCalls} time(s) but its body does not`)
     consulting += 1
   }
   console.log(`# ${consulting} consulting sites verified to call the seam in their own body`)
   assert.ok(consulting >= 6)
+})
+
+test('the cut-off census can fail: a re-queue site that does not apply the cut-off is reported, and one that does is not', () => {
+  const without = "export async function revive() { await db.accountingSyncLog.updateMany({ where: { status: 'FAILED' }, data: { status: 'PENDING' } }) }"
+  const withIt = "export async function revive() { const r = xeroBeforeCutoffRefusal({ createdAt: row.createdAt }); if (r) return; await db.accountingSyncLog.updateMany({ where: { status: 'FAILED', ...xeroNotBeforeCutoffWhere(f) }, data: { status: 'PENDING' } }) }"
+  assert.equal(functionAppliesCutoff(without, 'revive', 1), false)
+  assert.equal(functionAppliesCutoff(withIt, 'revive', 2), true)
+  assert.equal(functionAppliesCutoff(withIt, 'revive', 3), false, 'the count is a floor, not decoration')
+  assert.equal(functionAppliesCutoff(withIt, 'nonexistent', 1), false)
 })
 
 test('the census can fail: an unlisted PENDING write, a stale declaration and a count mismatch are each reported', () => {

@@ -6,7 +6,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
-import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
@@ -1466,8 +1466,16 @@ export async function enqueueFollowUpSyncLog(
       // carry, BEFORE the write. A held revival leaves the FAILED row exactly as it is and falls through to the create path below,
       // whose primitive asks the same question, records the shadow (CANCELLED / HELD_SHADOW and its durable record) and queues
       // nothing. The hold's answer is therefore the same whether the follow-up is created or revived.
-      const revivalHeld = plan.action === 'reuse'
+      let revivalHeld = plan.action === 'reuse'
         && xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload: plan.payload }).kind === 'shadow'
+      // THE WRITER-SIDE CUT-OFF AT THE REVIVAL. A FAILED row queued before the live-from instant is never made PENDING again: the claim
+      // would refuse it and it would only cycle. The follow-up is not lost: the revival is declined exactly as a held one is, so the
+      // create path below runs, and its primitive decides the NEW row on the follow-up's own business-event time (a pre-cut-off
+      // obligation is a shadow there, a later one is a fresh row created after the instant). The floor is read here, inside the scope lock.
+      if (plan.action === 'reuse' && !revivalHeld && xeroCutoffFloor() !== null) {
+        const born = await tx.accountingSyncLog.findUnique({ where: { id: plan.syncLogId }, select: { createdAt: true } })
+        revivalHeld = xeroBeforeCutoffRefusal({ createdAt: born?.createdAt, type }) !== null
+      }
       if (plan.action === 'reuse' && !revivalHeld) {
         if (!reuseAttempt) throw new Error(`Xero follow-up revival for ${plan.syncLogId} reached its write with no attempt to fence on`)
         // Fenced on the ATTEMPT, not on the status: if another run revived the same row first, a
@@ -1847,7 +1855,7 @@ export type SyncLogClaimResult =
  * a type that is not competing for a single per-reference post slot, and taking it would put an
  * unnecessary order lock in front of every journal and invoice push.
  */
-async function claimAccountingSyncLog(
+export async function claimAccountingSyncLog(
   entry: { id: string; type: string; referenceType: string; referenceId: string; attemptRevision: number },
   claimedAt: Date,
   staleClaimCutoff: Date,
@@ -1875,8 +1883,15 @@ async function claimAccountingSyncLog(
   // custody alone would rewrite it into `attemptProvenNeverMade`'s positive proof — a payment that
   // may have posted, read as certainly not posted. The helper's predicate refuses that row instead;
   // the repair on the first line of this sweep stamps it, and it claims normally afterwards.
+  //
+  // The writer-side cut-off floor is part of the statement, and it is read at the moment the statement is BUILT. The unlocked path builds it here,
+  // immediately before its write. The INVOICE_PAYMENT arm below builds its OWN copy (`claimStatementUnderLock`) inside the order-row lock, after
+  // the exclusion test, so the cut-off that decides whether that row may be claimed is the one in force under the lock and not one read before
+  // it waited. Two literals rather than one shared builder: the structural test of this helper (xero-claim-fence) reads the first
+  // `claimStatement` as the one place the claim predicate is spelt, and a statement that is built once and reused is exactly the stale value
+  // this exists to avoid.
   const claimStatement = stampingCustodyOnClaim({
-    where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
+    where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision, xeroCutoffFloor()),
     processingStartedAt: claimedAt,
     data: {
       status: 'PROCESSING' as const,
@@ -1905,7 +1920,15 @@ async function claimAccountingSyncLog(
     if (!decision.claim) {
       return { outcome: 'deferred', reason: decision.reason, blockedBy: decision.blockedBy }
     }
-    const claim = await tx.accountingSyncLog.updateMany({ ...claimStatement })
+    const claimStatementUnderLock = stampingCustodyOnClaim({
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision, xeroCutoffFloor()),
+      processingStartedAt: claimedAt,
+      data: {
+        status: 'PROCESSING' as const,
+        attemptRevision: attempt.attemptRevision,
+      },
+    })
+    const claim = await tx.accountingSyncLog.updateMany({ ...claimStatementUnderLock })
     return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
   })
 }
@@ -2096,26 +2119,41 @@ export async function deferUpdateUntilCreatePosts(
   }, attempt)
 }
 
+/**
+ * THE ONE PREDICATE FOR "WHICH ACCOUNTING SYNC ROWS MAY THE QUEUE PROCESSOR PICK UP": queued and due, or claimed and gone stale, with
+ * retries left, for Xero. Both the direct-mode selection and the outbox backfill read it, so they cannot drift apart.
+ *
+ * `cutoffFloor` is the writer-side cut-off (xeroCutoffFloor): a row created before it is not selected, so a bounded oldest-first batch of
+ * such rows can never occupy the window and starve every row behind it. Null (the switch is off, or Xero is not live): no clause, and this
+ * is the legacy predicate exactly.
+ */
+export function claimableXeroSyncLogWhere(now: Date, staleClaimCutoff: Date, cutoffFloor: Date | null): Prisma.AccountingSyncLogWhereInput {
+  return {
+    connector: XERO_CONNECTOR,
+    ...xeroNotBeforeCutoffWhere(cutoffFloor),
+    OR: [
+      {
+        status: 'PENDING',
+        OR: [
+          { processingStartedAt: null },
+          { processingStartedAt: { lte: now } },
+        ],
+      },
+      {
+        status: 'PROCESSING',
+        processingStartedAt: { lt: staleClaimCutoff },
+      },
+    ],
+    retryCount: { lt: MAX_RETRIES },
+  }
+}
+
 async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutoff: Date): Promise<void> {
   const now = new Date()
+  // THE WRITER-SIDE CUT-OFF: no delivery job is created for a row queued before the live-from instant (and, being oldest-first and
+  // bounded, such rows must not occupy the window either).
   const logs = await db.accountingSyncLog.findMany({
-    where: {
-      connector: XERO_CONNECTOR,
-      OR: [
-        {
-          status: 'PENDING',
-          OR: [
-            { processingStartedAt: null },
-            { processingStartedAt: { lte: now } },
-          ],
-        },
-        {
-          status: 'PROCESSING',
-          processingStartedAt: { lt: staleClaimCutoff },
-        },
-      ],
-      retryCount: { lt: MAX_RETRIES },
-    },
+    where: claimableXeroSyncLogWhere(now, staleClaimCutoff, xeroCutoffFloor()),
     orderBy: { createdAt: 'asc' },
     take: limit,
   })
@@ -2137,10 +2175,21 @@ async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutof
  * with `attemptRevision: nextAttemptRevision(observed)` in the data makes exactly one of them win
  * and gives the winner a value nothing else can hold.
  */
-function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date, observedAttemptRevision: number) {
+function accountingSyncLogClaimWhere(
+  id: string,
+  staleClaimCutoff: Date,
+  observedAttemptRevision: number,
+  /**
+   * THE WRITER-SIDE CUT-OFF (producer-side hold). Read by the caller at the instant of the claim and carried INTO the claim statement,
+   * so "this row was created before the live-from instant" is decided by the same compare-and-set that takes the claim and not by a
+   * value read earlier. Null (the switch is off, or the destination is not live): no clause at all, the legacy predicate exactly.
+   */
+  createdNotBefore: Date | null = null,
+) {
   return claimAttemptWhere({
     id,
     connector: XERO_CONNECTOR,
+    ...xeroNotBeforeCutoffWhere(createdNotBefore),
     retryCount: { lt: MAX_RETRIES },
     OR: [
       {
@@ -2241,7 +2290,9 @@ export async function renewClaimForRemoteWrite(
     // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector. `held` is
     // asked for its instant HERE, as the statement is built — so a renewal that has happened since
     // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
-    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR },
+    // THE WRITER-SIDE CUT-OFF, RE-DERIVED AT EVERY REMOTE WRITE: the floor of THIS moment is a clause of the statement that proves the claim
+    // immediately before a request leaves, so a row that is (or has become) older than the live-from instant cannot take the fence and nothing is sent.
+    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR, ...xeroNotBeforeCutoffWhere(xeroCutoffFloor()) },
     // `processingStartedAt` is this host's clock and `createDispatchedAt` is the DATABASE's, read by
     // `planCreateDispatch` one statement ago. They are deliberately not the same instant: the claim is
     // only ever compared against itself, while the dispatch instant is aged against `clock_timestamp()`
@@ -2418,6 +2469,15 @@ export async function openRemoteWriteLease(
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'dispatch-unrecorded', operation, message } } }
       }
       if (!again) {
+        // Refused because the row predates the live-from instant (the fence statement carries the floor of this moment)? Say so, truthfully,
+        // rather than blaming another worker.
+        if (xeroCutoffFloor() !== null) {
+          const born = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { createdAt: true, type: true } })
+          const refusal = born ? xeroBeforeCutoffRefusal({ createdAt: born.createdAt, type: born.type }) : null
+          if (refusal !== null) {
+            return { ok: false, result: { success: false, error: refusal, notPosted: { reason: 'before-cutoff', operation, message: refusal } } }
+          }
+        }
         const message = lostClaimMessage(entryId, operation)
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
       }
@@ -2756,7 +2816,9 @@ function unsentPostEvidence(
           ? 'xero_sync_transport_refused_before_post'
           : notPosted.reason === 'producer-held'
             ? 'xero_sync_producer_held_before_post'
-            : 'xero_sync_claim_lost_before_post',
+            : notPosted.reason === 'before-cutoff'
+              ? 'xero_sync_before_cutoff_before_post'
+              : 'xero_sync_claim_lost_before_post',
     tag: 'sync',
     level: 'WARNING' as const,
     description: notPosted.message,
@@ -3950,24 +4012,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
+  // THE WRITER-SIDE CUT-OFF: a row created before the destination's live-from instant is not even selected, so a bounded batch of them
+  // can never occupy the oldest-first window and starve every row behind it. The claim re-asserts the same floor in its own statement.
   const pending = await db.accountingSyncLog.findMany({
-    where: {
-      connector: XERO_CONNECTOR,
-      OR: [
-        {
-          status: 'PENDING',
-          OR: [
-            { processingStartedAt: null },
-            { processingStartedAt: { lte: new Date() } },
-          ],
-        },
-        {
-          status: 'PROCESSING',
-          processingStartedAt: { lt: staleClaimCutoff },
-        },
-      ],
-      retryCount: { lt: MAX_RETRIES },
-    },
+    where: claimableXeroSyncLogWhere(new Date(), staleClaimCutoff, xeroCutoffFloor()),
     orderBy: { createdAt: 'asc' },
     take: MAX_PER_RUN,
   })
@@ -4515,6 +4563,16 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       continue
     }
 
+    // THE WRITER-SIDE CUT-OFF, FOR A JOB WHOSE ROW PREDATES IT. The row is never claimed (the claim statement would refuse it too), so
+    // this job can never deliver anything: it is dead-lettered with the single-sourced sentence rather than retried for ever. A bounded
+    // oldest-first batch of such jobs would otherwise be re-offered every tick and starve the jobs behind them.
+    const beforeCutoff = entry.status === 'SYNCED' || entry.status === 'CANCELLED' ? null : xeroBeforeCutoffRefusal({ createdAt: entry.createdAt, type: entry.type })
+    if (beforeCutoff !== null) {
+      await markXeroOutboxPermanent(job, beforeCutoff)
+      result.skipped++
+      continue
+    }
+
     const claimedAt = new Date()
     // The claim, not the bare instant (Codex r2, medium 2). Nothing in this runner renews it, so the
     // holder answers the same instant every time — but every fence below asks the holder rather than
@@ -4545,8 +4603,16 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       // would otherwise raise.
       const fresh = await db.accountingSyncLog.findUnique({
         where: { id: entry.id },
-        select: { status: true },
+        select: { status: true, createdAt: true, type: true },
       })
+      // The claim statement carries the cut-off floor read at the instant of the claim, so a row it refused for that reason (the floor
+      // came into force after the check above) is dead-lettered here for the same reason and with the same words.
+      const refusedByCutoff = fresh ? xeroBeforeCutoffRefusal({ createdAt: fresh.createdAt, type: fresh.type }) : null
+      if (refusedByCutoff !== null && fresh?.status !== 'SYNCED' && fresh?.status !== 'CANCELLED') {
+        await markXeroOutboxPermanent(job, refusedByCutoff)
+        result.skipped++
+        continue
+      }
       const liveStatus = fresh?.status ?? entry.status
       // THE SECOND DOOR TO THE SAME CONVERSION (Codex r3, HIGH). This branch is reached when the row was
       // settled between the batch read and the claim — which is exactly the window a displaced worker's
@@ -5005,7 +5071,7 @@ type EntryResult = {
      * minted — the fence sent nothing because the transport would not. The row is handed back exactly
      * like the other three, and the marker it left behind is a known, named residual (o3d-gvzu).
      */
-    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held'
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'before-cutoff'
     operation: string
     message: string
     /**
@@ -5923,6 +5989,19 @@ export async function processClaimedEntry(
   if (held.kind === 'shadow') {
     const message = producerHeldNotice({ connector: held.destination, reason: held.decision.reason, owner: held.decision.owner })
     return { success: false, error: message, notPosted: { reason: 'producer-held', operation: type, message } }
+  }
+
+  // THE WRITER-SIDE CUT-OFF, AT THE LAST POINT BEFORE ANYTHING CAN BE SENT. The claim statement and the selections already exclude a row
+  // created before the live-from instant; this asks the row itself once more, now, with the floor read now, so a row that reached here by
+  // any other route (a claim taken when the floor was not yet in force, a caller that does not go through the claim) still sends nothing.
+  // It is a read of the row's own creation time against the environment: no value read earlier in the run decides it. With the switch off
+  // `xeroCutoffFloor()` is null and this is skipped entirely.
+  if (xeroCutoffFloor() !== null) {
+    const born = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { createdAt: true } })
+    const refusal = xeroBeforeCutoffRefusal({ createdAt: born?.createdAt, type })
+    if (refusal !== null) {
+      return { success: false, error: refusal, notPosted: { reason: 'before-cutoff', operation: type, message: refusal } }
+    }
   }
 
   // THE CONNECTION CHECK USED TO BE HERE, and removing it is the fix rather than a regression.
