@@ -901,3 +901,22 @@ test('XERO FENCE: a lease opened while no floor was in force refuses the remote 
     if (!fenced.ok) assert.equal(fenced.result.notPosted?.reason, 'before-cutoff')
   })
 })
+
+test('SERVER IDENTITY on a real connection: it is readable by an ordinary role, stable, and an apply whose connection is not the confirmed server aborts before touching a row', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const identity = await d.retire.readServerIdentity(d.db)
+  const [name, systemId] = identity.split('@')
+  console.log(`# identity: ${name}@<${systemId?.length} digits>`)
+  assert.ok(name && /^\d{10,}$/.test(String(systemId)), 'database @ cluster system identifier')
+  assert.equal(await d.retire.readServerIdentity(d.db), identity, 'stable')
+  const job = await seedJob(d, `woocommerce:stock.push:${tag}-id`, BEFORE, { updatedAt: BEFORE })
+  const scope = { destinations: ['woocommerce' as const], cutoffs: { woocommerce: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const mine = plan.items.filter((i: { id: string }) => i.id === job.id)
+  await assert.rejects(d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope, { expectedIdentity: `${name}@1111111111111111111` }), /not the .* that was confirmed/)
+  assert.equal((await d.db.integrationOutbox.findUnique({ where: { id: job.id }, select: { status: true } }))?.status, 'PENDING', 'nothing was changed')
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope, { expectedIdentity: identity })
+  assert.equal(applied.counts.shadowed, 1, 'CONTROL: the right identity applies')
+})

@@ -22,7 +22,7 @@ const item = (disposition: 'SHADOW' | 'PARK' | 'SKIP', destination: 'xero' | 'mi
   status: 'PENDING', classification: { disposition, reason: 'because' },
 })
 
-function harness(items: RetirementItem[] = [item('SHADOW'), item('PARK', 'xero', 'r2')], overrides: { truncated?: RetirementPlan['truncated']; unscoped?: RetirementPlan['unscoped']; counts?: Partial<RetirementApplyResult['counts']>; database?: string } = {}) {
+function harness(items: RetirementItem[] = [item('SHADOW'), item('PARK', 'xero', 'r2')], overrides: { truncated?: RetirementPlan['truncated']; unscoped?: RetirementPlan['unscoped']; counts?: Partial<RetirementApplyResult['counts']>; identity?: string | Error } = {}) {
   const out: string[] = []
   const err: string[] = []
   const calls = { plan: 0, apply: 0, scope: null as RetirementScope | null }
@@ -34,11 +34,12 @@ function harness(items: RetirementItem[] = [item('SHADOW'), item('PARK', 'xero',
       calls.apply += 1
       return { outcomes: [], counts: { shadowed: plan.items.length, parked: 0, left_alone: 0, changed_since_plan: 0, ...overrides.counts } }
     },
-    currentDatabase: async () => overrides.database ?? 'ims_scratch',
+    serverIdentity: async () => { if (overrides.identity instanceof Error) throw overrides.identity; return overrides.identity ?? IDENTITY },
     disconnect: async () => undefined,
   })
   return { run, out, err, calls }
 }
+const IDENTITY = 'ims_scratch@7697665522638207492'
 const code = (name: string) => RETIRE_HELD_BACKLOG_EXIT_CODES.find((row) => row.name === name)!.code
 
 test('a dry run is the default: it plans, prints what each row would become, applies NOTHING, and exits 0', async () => {
@@ -58,16 +59,16 @@ test('--apply needs --confirm-database, and it must equal the connected database
   assert.equal(await noConfirm.run(['--apply', '--cutoff', '2026-12-01T00:00:00Z']), code('usage'))
   assert.equal(noConfirm.calls.plan + noConfirm.calls.apply, 0, 'nothing was even read')
   const wrong = harness()
-  assert.equal(await wrong.run(['--apply', '--confirm-database', 'onetwo3d_ims', '--cutoff', '2026-12-01T00:00:00Z']), code('apply-refused'))
+  assert.equal(await wrong.run(['--apply', '--confirm-database', 'ims_scratch', '--cutoff', '2026-12-01T00:00:00Z']), code('apply-refused'))
   assert.equal(wrong.calls.apply, 0)
   assert.equal(wrong.calls.plan, 0, 'refused before reading')
   assert.match(wrong.err.join('\n'), /REFUSING to apply/)
   const right = harness()
-  assert.equal(await right.run(['--apply', '--confirm-database', 'ims_scratch', '--cutoff', '2026-12-01T00:00:00Z']), code('ok'))
+  assert.equal(await right.run(['--apply', '--confirm-database', IDENTITY, '--cutoff', '2026-12-01T00:00:00Z']), code('ok'))
   assert.equal(right.calls.apply, 1)
   assert.match(right.out.join('\n'), /^APPLY/)
   const stray = harness()
-  assert.equal(await stray.run(['--confirm-database', 'ims_scratch']), code('usage'), 'a confirmation without --apply is a mistake, not a dry run')
+  assert.equal(await stray.run(['--confirm-database', IDENTITY]), code('usage'), 'a confirmation without --apply is a mistake, not a dry run')
 })
 
 test('which rows: an explicit --cutoff applies to every selected destination; otherwise each destination\'s own readable variable; nothing selected exits nothing-in-scope', async () => {
@@ -98,9 +99,9 @@ test('arguments are validated before anything is read: unknown flags, a flag mis
 
 test('incomplete: a truncated list, or an apply that skipped or lost a row, exits 1 so the operator runs it again; a clean apply exits 0', async () => {
   assert.equal(await harness(undefined, { truncated: [{ destination: 'xero', kind: 'xero_sync_log' }] }).run(['--cutoff', '2026-12-01T00:00:00Z']), code('incomplete'))
-  assert.equal(await harness(undefined, { counts: { changed_since_plan: 1 } }).run(['--apply', '--confirm-database', 'ims_scratch', '--cutoff', '2026-12-01T00:00:00Z']), code('incomplete'))
-  assert.equal(await harness(undefined, { counts: { left_alone: 1 } }).run(['--apply', '--confirm-database', 'ims_scratch', '--cutoff', '2026-12-01T00:00:00Z']), code('incomplete'))
-  assert.equal(await harness().run(['--apply', '--confirm-database', 'ims_scratch', '--cutoff', '2026-12-01T00:00:00Z']), code('ok'))
+  assert.equal(await harness(undefined, { counts: { changed_since_plan: 1 } }).run(['--apply', '--confirm-database', IDENTITY, '--cutoff', '2026-12-01T00:00:00Z']), code('incomplete'))
+  assert.equal(await harness(undefined, { counts: { left_alone: 1 } }).run(['--apply', '--confirm-database', IDENTITY, '--cutoff', '2026-12-01T00:00:00Z']), code('incomplete'))
+  assert.equal(await harness().run(['--apply', '--confirm-database', IDENTITY, '--cutoff', '2026-12-01T00:00:00Z']), code('ok'))
   const json = harness()
   await json.run(['--json', '--cutoff', '2026-12-01T00:00:00Z'])
   const parsed = JSON.parse(json.out.join('\n')) as { mode: string; items: Array<{ disposition: string }>; tally: Record<string, number> }
@@ -118,7 +119,7 @@ test('the exit-code table is documented once: the docs carry exactly the rows of
   assert.equal(rows.length, RETIRE_HELD_BACKLOG_EXIT_CODES.length)
   assert.ok(body.includes(renderRetireExitCodeTable()))
   assert.equal(new Set(RETIRE_HELD_BACKLOG_EXIT_CODES.map((row) => row.code)).size, RETIRE_HELD_BACKLOG_EXIT_CODES.length)
-  assert.match(body, /It changes nothing unless it is also given `--apply --confirm-database <name>`/)
+  assert.match(body, /It changes nothing unless it is also given `--apply --confirm-database <identity>`/)
 })
 
 test('--all-queued reports that a configured cut-off is ignored, and the JSON carries the effective (null) cut-offs', async () => {
@@ -130,4 +131,22 @@ test('--all-queued reports that a configured cut-off is ignored, and the JSON ca
   const parsed = JSON.parse(j.out.join('\n')) as { cutoffs: Record<string, string | null>; configuredCutoffsIgnored: boolean }
   assert.equal(parsed.cutoffs.xero, null)
   assert.equal(parsed.configuredCutoffsIgnored, true)
+})
+
+test('THE CONFIRMATION IS A SERVER IDENTITY: the dry run prints it; the same database NAME on another cluster is refused; an unreadable identity refuses; nothing is applied in either case', async () => {
+  const dry = harness()
+  await dry.run(['--cutoff', '2026-12-01T00:00:00Z'])
+  assert.match(dry.out.join('\n'), /Server identity \(pass it as --confirm-database to apply to THIS server\): ims_scratch@7697665522638207492/)
+  // A live cluster that happens to name its database the same: the NAME matches, the cluster does not.
+  const other = harness(undefined, { identity: 'ims_scratch@1111111111111111111' })
+  assert.equal(await other.run(['--apply', '--confirm-database', IDENTITY, '--cutoff', '2026-12-01T00:00:00Z']), code('apply-refused'))
+  assert.equal(other.calls.apply + other.calls.plan, 0)
+  const nameOnly = harness()
+  assert.equal(await nameOnly.run(['--apply', '--confirm-database', 'ims_scratch', '--cutoff', '2026-12-01T00:00:00Z']), code('apply-refused'), 'a bare database name no longer confirms anything')
+  const unreadable = harness(undefined, { identity: new Error('the identity of the connected server could not be read') })
+  assert.equal(await unreadable.run(['--apply', '--confirm-database', IDENTITY, '--cutoff', '2026-12-01T00:00:00Z']), code('apply-refused'))
+  assert.equal(unreadable.calls.apply, 0)
+  const json = harness()
+  await json.run(['--json', '--cutoff', '2026-12-01T00:00:00Z'])
+  assert.equal((JSON.parse(json.out.join('\n')) as { serverIdentity: string }).serverIdentity, IDENTITY)
 })

@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url'
 
 import {
   applyHeldBacklogRetirement,
+  readServerIdentity,
   effectiveRetirementCutoff,
   planHeldBacklogRetirement,
   resolveRetirementCutoffs,
@@ -16,12 +17,13 @@ import { RETIRE_HELD_BACKLOG_COMMAND, RETIRE_HELD_BACKLOG_EXIT_CODES } from '@/l
 
 /**
  * `npm run retire:held-backlog [-- --destination xero|mintsoft|woocommerce|all] [-- --cutoff <ISO-8601 UTC with Z>]
- *    [-- --all-queued] [-- --limit N] [-- --json] [-- --apply --confirm-database <name>]`
+ *    [-- --all-queued] [-- --limit N] [-- --json] [-- --apply --confirm-database <identity>]`
  *
  * DRY RUN BY DEFAULT: it reads the queues and prints what each queued row would become, changing nothing. `--apply` writes, and is for a
  * scratch or development database run by the coordinator; it is never run against a live installation. It will not run unless
- * `--confirm-database` names the database it is connected to, the way the scratch-database stamp does, so a wrong DATABASE_URL does not
- * apply anything by accident.
+ * `--confirm-database` carries the SERVER IDENTITY (`<database>@<cluster system identifier>`) that the dry run prints, checked against the
+ * server it is connected to and again on the connection of every row's transaction: a database name alone is not an identity, since a live and
+ * a scratch cluster can share one.
  *
  * Which rows: those queued BEFORE a destination's cut-off (`--cutoff` for all selected destinations, otherwise that destination's own
  * live-from variable when it is readable), or every queued row with `--all-queued`. What happens to them, and the proof that decides it,
@@ -35,7 +37,7 @@ export type RetireCliOptions = {
   env?: Record<string, string | undefined>
   plan?: (scope: RetirementScope) => Promise<RetirementPlan>
   apply?: (plan: RetirementPlan, scope: RetirementScope) => Promise<RetirementApplyResult>
-  currentDatabase?: () => Promise<string>
+  serverIdentity?: () => Promise<string>
   stdout?: Pick<Logger, 'log'>
   stderr?: Pick<Logger, 'error'>
   disconnect?: () => Promise<void>
@@ -52,10 +54,9 @@ function valueOf(args: string[], flag: string): string | undefined {
   return index >= 0 ? args[index + 1] : undefined
 }
 
-async function defaultCurrentDatabase(): Promise<string> {
+async function defaultServerIdentity(): Promise<string> {
   const { db } = await import('@/lib/db')
-  const rows = await db.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`
-  return rows[0]?.name ?? ''
+  return readServerIdentity(db)
 }
 
 async function disconnectDb(): Promise<void> {
@@ -68,7 +69,7 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
   const stderr = options.stderr ?? console
   const args = options.argv ?? process.argv.slice(2)
   const env = options.env ?? process.env
-  const usage = `Usage: ${RETIRE_HELD_BACKLOG_COMMAND} [-- --destination xero|mintsoft|woocommerce|all] [-- --cutoff <ISO-8601 UTC with Z>] [-- --all-queued] [-- --limit N] [-- --json] [-- --apply --confirm-database <name>]`
+  const usage = `Usage: ${RETIRE_HELD_BACKLOG_COMMAND} [-- --destination xero|mintsoft|woocommerce|all] [-- --cutoff <ISO-8601 UTC with Z>] [-- --all-queued] [-- --limit N] [-- --json] [-- --apply --confirm-database <identity>]`
 
   const valued = new Set(['--destination', '--cutoff', '--limit', '--confirm-database'])
   const bare = new Set(['--all-queued', '--json', '--apply'])
@@ -107,18 +108,28 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
   if (!apply && confirm !== undefined) { stderr.error(`--confirm-database is only meaningful with --apply. ${usage}`); return exit('usage') }
 
   const scope: RetirementScope = { destinations, cutoffs: resolveRetirementCutoffs(explicit, env), allQueued: args.includes('--all-queued'), limit }
+  let confirmedIdentity: string | undefined
   try {
     if (apply) {
-      const database = await (options.currentDatabase ?? defaultCurrentDatabase)()
-      if (confirm !== database) {
-        stderr.error(`REFUSING to apply: --confirm-database ${JSON.stringify(confirm)} is not the database this command is connected to. Nothing was changed.`)
+      let identity: string
+      try {
+        identity = await (options.serverIdentity ?? defaultServerIdentity)()
+      } catch (error) {
+        stderr.error(`REFUSING to apply: ${error instanceof Error ? error.message : String(error)}. Nothing was changed.`)
         return exit('apply-refused')
       }
+      if (confirm !== identity) {
+        stderr.error(`REFUSING to apply: --confirm-database ${JSON.stringify(confirm)} is not the identity of the server and database this command is connected to. Run it without --apply, copy the identity it prints, and pass that. Nothing was changed.`)
+        return exit('apply-refused')
+      }
+      confirmedIdentity = identity
     }
 
     const plan = await (options.plan ?? ((s) => planHeldBacklogRetirement(s)))(scope)
-    const result = apply ? await (options.apply ?? ((p, s) => applyHeldBacklogRetirement(p, s)))(plan, scope) : null
+    const result = apply ? await (options.apply ?? ((p, s) => applyHeldBacklogRetirement(p, s, { expectedIdentity: confirmedIdentity })))(plan, scope) : null
 
+    let shownIdentity: string | null = null
+    try { shownIdentity = await (options.serverIdentity ?? defaultServerIdentity)() } catch { shownIdentity = null }
     const tally = new Map<string, number>()
     for (const item of plan.items) {
       const key = `${item.destination} ${item.kind} ${item.classification.disposition}`
@@ -127,6 +138,7 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
     if (args.includes('--json')) {
       stdout.log(JSON.stringify({
         mode: apply ? 'apply' : 'dry-run',
+        serverIdentity: shownIdentity,
         generatedAt: plan.generatedAt.toISOString(),
         cutoffs: Object.fromEntries(destinations.map((d) => [d, effectiveRetirementCutoff(scope, d)?.toISOString() ?? null])),
         configuredCutoffsIgnored: scope.allQueued && Object.keys(scope.cutoffs).length > 0,
@@ -142,6 +154,7 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
       }, null, 2))
     } else {
       stdout.log(apply ? 'APPLY (rows are changed, one transaction each)' : 'DRY RUN (nothing is changed)')
+      stdout.log(shownIdentity ? `Server identity (pass it as --confirm-database to apply to THIS server): ${shownIdentity}` : 'Server identity: could not be read, so --apply would be refused')
       for (const destination of destinations) {
         const cutoff = effectiveRetirementCutoff(scope, destination)
         stdout.log(`${destination}: ${scope.allQueued ? `every queued row (--all-queued; ${scope.cutoffs[destination] ? `the configured cut-off ${scope.cutoffs[destination]!.toISOString()} is ignored` : 'no cut-off applies'})` : cutoff ? `queued before ${cutoff.toISOString()}` : 'no cut-off given or readable: nothing selected'}`)

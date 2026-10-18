@@ -611,6 +611,23 @@ async function retireWmsPushLink(tx: Prisma.TransactionClient, item: RetirementI
 
 class RetirementConflict extends Error {}
 
+/** The connected server is not the one the operator confirmed. Never swallowed as a per-row conflict: it aborts the apply. */
+export class RetirementIdentityMismatch extends Error {}
+
+/**
+ * WHICH SERVER AND WHICH DATABASE THIS CONNECTION IS WRITING TO: `<database>@<cluster system identifier>`. A database NAME alone is not an
+ * identity (a live and a scratch cluster can share one); the system identifier is written once when the cluster is initialised, is the same
+ * over TCP and a unix socket, and is readable by an ordinary role. It is read on the connection it is given, so the apply asks it on the very
+ * connection each row's transaction writes through. An identity that cannot be read throws: nothing is applied on a guess.
+ */
+export async function readServerIdentity(client: Pick<Prisma.TransactionClient, '$queryRaw'>): Promise<string> {
+  const rows = await client.$queryRaw<Array<{ db: string | null; sid: string | null }>>`
+    SELECT current_database() AS db, (SELECT system_identifier::text FROM pg_control_system()) AS sid`
+  const row = rows[0]
+  if (!row?.db || !row.sid) throw new RetirementIdentityMismatch('the identity of the connected server could not be read, so nothing was changed')
+  return `${row.db}@${row.sid}`
+}
+
 export type RetirementApplyResult = {
   outcomes: RetirementOutcome[]
   counts: Record<RetirementOutcome['result'], number>
@@ -619,7 +636,7 @@ export type RetirementApplyResult = {
 export async function applyHeldBacklogRetirement(
   plan: RetirementPlan,
   scope: RetirementScope,
-  options: { client?: typeof db; now?: Date } = {},
+  options: { client?: typeof db; now?: Date; expectedIdentity?: string } = {},
 ): Promise<RetirementApplyResult> {
   const client = options.client ?? db
   const now = options.now ?? new Date()
@@ -631,6 +648,13 @@ export async function applyHeldBacklogRetirement(
     }
     try {
       outcomes.push(await client.$transaction(async (tx) => {
+        // Verified on THIS transaction's connection, before anything is read or written for the row.
+        if (options.expectedIdentity !== undefined) {
+          const actual = await readServerIdentity(tx)
+          if (actual !== options.expectedIdentity) {
+            throw new RetirementIdentityMismatch(`this connection is ${actual}, not the ${options.expectedIdentity} that was confirmed, so nothing was changed`)
+          }
+        }
         if (item.kind === 'xero_sync_log') return retireXeroSyncLog(tx, item, scope, now)
         if (item.kind === 'outbox_job') return retireOutboxJob(tx, item, scope, now)
         return retireWmsPushLink(tx, item, scope, now)
