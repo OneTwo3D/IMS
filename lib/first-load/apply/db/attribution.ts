@@ -9,6 +9,7 @@
  * The audit trail and the run record are the runner's own by definition: every row of them is attributed.
  */
 import { db } from '@/lib/db'
+import { normalizeProductCategoryName } from '@/lib/products/category-name'
 import { normaliseCategory } from '../normal-form'
 import type { PreparedRun } from '../prepared'
 import type { ApplyStepId } from '../constants'
@@ -77,8 +78,18 @@ export const ATTRIBUTION_RULES: Readonly<Record<string, Rule>> = {
     return unattributed(await db.product.findMany({ select: { sku: true } }), (r) => f.products.has(r.sku))
   },
   product_categories: async (p) => {
+    // The importer's upsert keeps a category that already exists under the normalised path (update: {}), whatever its display name and parent, so a row is the run's only if its
+    // path is one the file names AND it hangs under the parent that path implies AND its display name is the path's last segment.
     const f = factsOf(p)
-    return unattributed(await db.productCategory.findMany({ select: { nameNormalized: true } }), (r) => f.categories.has(r.nameNormalized))
+    const rows = await db.productCategory.findMany({ select: { id: true, name: true, nameNormalized: true, parentId: true } })
+    const pathOf = new Map(rows.map((r) => [r.id, r.nameNormalized]))
+    return unattributed(rows, (r) => {
+      if (!f.categories.has(r.nameNormalized)) return false
+      const parts = r.nameNormalized.split('>')
+      const parent = parts.length > 1 ? parts.slice(0, -1).join('>') : null
+      const hangsUnder = r.parentId === null ? parent === null : pathOf.get(r.parentId) === parent
+      return hangsUnder && normalizeProductCategoryName(r.name) === parts[parts.length - 1]
+    })
   },
   product_components: async (p) => {
     const f = factsOf(p)
@@ -119,7 +130,14 @@ export const ATTRIBUTION_RULES: Readonly<Record<string, Rule>> = {
     return unattributed(await db.purchaseOrderLine.findMany({ select: { po: { select: { reference: true } }, product: { select: { sku: true } } } }), (r) => f.orderLines.has(`${r.po.reference}|${r.product.sku.toUpperCase()}`))
   },
   supplier_products: async (p) => {
+    // A cache row belongs to the run only if a stored order of the file used the pair: the importer's upsert MERGES into a row that already exists (keeping its supplier SKU and lead time),
+    // so a pair present before the purchase-order step wrote its line is somebody else's.
     const f = factsOf(p)
-    return unattributed(await db.supplierProduct.findMany({ select: { supplier: { select: { name: true } }, product: { select: { sku: true } } } }), (r) => f.priceCache.has(`${r.supplier.name.trim().toUpperCase()}|${r.product.sku.toUpperCase()}`))
+    const [rows, lines] = await Promise.all([
+      db.supplierProduct.findMany({ select: { supplierId: true, productId: true, supplier: { select: { name: true } }, product: { select: { sku: true } } } }),
+      db.purchaseOrderLine.findMany({ select: { productId: true, po: { select: { supplierId: true, reference: true } } } }),
+    ])
+    const used = new Set(lines.filter((l) => f.orders.has(l.po.reference)).map((l) => `${l.po.supplierId}:${l.productId}`))
+    return unattributed(rows, (r) => used.has(`${r.supplierId}:${r.productId}`) && f.priceCache.has(`${r.supplier.name.trim().toUpperCase()}|${r.product.sku.toUpperCase()}`))
   },
 }

@@ -607,6 +607,11 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], 'supplier product cost') } finally { await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: sp.lastUnitCost } }) }
         await m.db.supplierProduct.update({ where: { id: sp.id }, data: { currency: 'USD' } })
         try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], 'supplier product currency') } finally { await m.db.supplierProduct.update({ where: { id: sp.id }, data: { currency: sp.currency } }) }
+        // The upsert never sets the supplier's own SKU or the lead time: a value there is a foreign row the upsert merged into.
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { supplierSku: 'THEIRS' } })
+        try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], 'supplier product supplierSku') } finally { await m.db.supplierProduct.update({ where: { id: sp.id }, data: { supplierSku: null } }) }
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { leadTimeDays: 9 } })
+        try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], 'supplier product leadTimeDays') } finally { await m.db.supplierProduct.update({ where: { id: sp.id }, data: { leadTimeDays: null } }) }
         arms++
       }
       for (const [label, data, restore] of [
@@ -1204,7 +1209,16 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
     describe('every table the runner writes is attributed to the file on a resume', () => {
       // Mutation named: skip the attribution loop in dataClasses -> a foreign category / price-cache / recipe row between attempts is invisible: red.
       const resume = () => m.rails.evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
-      const rows = async (table: string) => (await resume()).filter((p) => p.startsWith('foreign data:') && p.includes(`the ${table} table holds`))
+      const rows = async (table: string, run: PreparedRun = prepared) => (await m.rails.evaluateRails(run, { phase: 'recheck', resuming: true, step: null })).filter((p) => p.startsWith('foreign data:') && p.includes(`the ${table} table holds`))
+      // The synthetic files carry no categories: the same run with its first two products naming a root and a two-level category.
+      const withCategories = (): PreparedRun => ({
+        ...prepared,
+        steps: prepared.steps.map((st) => {
+          if (st.step !== 'products') return st
+          const at = st.data.header.indexOf('category')
+          return { ...st, data: { ...st.data, rows: st.data.rows.map((r, i) => (i > 1 ? r : { ...r, cells: r.cells.map((c, j) => (j === at ? (i === 0 ? 'Kits' : 'Tools > Hand tools') : c)) })) } }
+        }),
+      })
 
       it('every RUNNER_WRITES table has an attribution rule, and no rule is for another table', async () => {
         const { ATTRIBUTION_RULES } = await import('../../lib/first-load/apply/db/attribution')
@@ -1231,6 +1245,37 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.ok(!(await resume()).join(';').includes('ZQ-STRAY'), 'no key in any message')
         } finally { await resetData() }
         assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'gone')
+      })
+
+      it('a category the importer would merge into (right path, wrong parent or display name) and a price-cache pair that existed before any order used it are refused on a resume', async () => {
+        await resetData()
+        try {
+          const kits = await m.db.productCategory.create({ data: { name: 'Somebody Elses Name', nameNormalized: 'kits' } })
+          assert.equal((await rows('product_categories', withCategories())).length, 1, 'wrong display name')
+          await m.db.productCategory.update({ where: { id: kits.id }, data: { name: 'Kits' } })
+          assert.equal((await rows('product_categories', withCategories())).length, 0, 'control: the right name')
+          const elsewhere = await m.db.productCategory.create({ data: { name: 'Elsewhere', nameNormalized: 'zq-elsewhere' } })
+          const tools = await m.db.productCategory.create({ data: { name: 'Tools', nameNormalized: 'tools' } })
+          const hand = await m.db.productCategory.create({ data: { name: 'Hand tools', nameNormalized: 'tools>hand tools', parentId: tools.id } })
+          assert.equal((await rows('product_categories', withCategories())).length, 1, 'only the elsewhere row is foreign')
+          await m.db.productCategory.delete({ where: { id: elsewhere.id } })
+          assert.equal((await rows('product_categories', withCategories())).length, 0, 'control: right parent')
+          await m.db.productCategory.update({ where: { id: hand.id }, data: { parentId: kits.id } })
+          assert.equal((await rows('product_categories', withCategories())).length, 1, 'wrong parent')
+        } finally { await resetData() }
+      })
+
+      it('a price-cache row for a pair of the file is foreign until a stored order of the file used it', async () => {
+        await resetData()
+        try {
+          const orders = prepared.steps.find((st) => st.step === 'purchase-orders')!.data
+          const get = (r: (typeof orders.rows)[number], n: string) => r.cells[orders.header.indexOf(n)] ?? ''
+          const first = orders.rows[0]!
+          const supplier = await m.db.supplier.create({ data: { name: get(first, 'supplierName').trim() } })
+          const product = await m.db.product.create({ data: { sku: get(first, 'sku').trim(), name: 'x' } })
+          await m.db.supplierProduct.create({ data: { supplierId: supplier.id, productId: product.id, lastUnitCost: '1', currency: 'GBP' } })
+          assert.equal((await rows('supplier_products')).length, 1)
+        } finally { await resetData() }
       })
 
       it('a recipe, a bill of materials and its items the file does not describe are refused on a resume', async () => {

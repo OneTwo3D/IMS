@@ -230,7 +230,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
   // (and, inside an order, the line order). So the cache must hold the net unit cost of the LAST line written for the pair: the last line (highest position) of the most recently created order.
   // Creation time is stored to the millisecond; orders created in the SAME millisecond cannot be ordered, so for those the cost of the last line of ANY of them is accepted (never a guess
   // beyond that).
-  const supplierProducts = await db.supplierProduct.findMany({ select: { supplierId: true, productId: true, lastUnitCost: true, currency: true } })
+  const supplierProducts = await db.supplierProduct.findMany({ select: { supplierId: true, productId: true, lastUnitCost: true, currency: true, supplierSku: true, leadTimeDays: true } })
   const cacheByPair = new Map(supplierProducts.map((sp) => [`${sp.supplierId}:${sp.productId}`, sp]))
   const lastByPair = new Map<string, { at: number; written: Set<string> }>()
   for (const row of rows) {
@@ -253,7 +253,8 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
   const supplierProductsOk = (row: (typeof rows)[number]): boolean => row.lines.every((line) => {
     const pair = `${row.supplierId}:${line.productId}`
     const cache = cacheByPair.get(pair)
-    return cache !== undefined && cache.lastUnitCost !== null && (lastByPair.get(pair)?.written.has(`${new D(cache.lastUnitCost.toFixed()).toFixed(6)}|${cache.currency}`) ?? false)
+    // The upsert writes only the cost and currency: the supplier's own SKU and the lead time stay what a create gives them (null), so a value there came from somebody else's row the upsert merged into.
+    return cache !== undefined && cache.supplierSku === null && cache.leadTimeDays === null && cache.lastUnitCost !== null && (lastByPair.get(pair)?.written.has(`${new D(cache.lastUnitCost.toFixed()).toFixed(6)}|${cache.currency}`) ?? false)
   })
   // The FILE's numbers for each order, in file order (the importer stores lines in that order): quantity, entered unit cost and line discount (KeyedUnit.poLines).
   const fileLines = new Map<string, FileLineNumbers[]>(
