@@ -611,6 +611,24 @@ async function retireWmsPushLink(tx: Prisma.TransactionClient, item: RetirementI
 
 class RetirementConflict extends Error {}
 
+/**
+ * WHERE THIS CONNECTION IS: the server address and port (or, for a unix-socket connection, the socket directory). Printed by the dry run beside the
+ * identity because the identity names the cluster's LINEAGE and not the environment: a physical clone or a promoted replica shares it, so only the
+ * operator checking the host and port can say it is the intended server. Best effort; an unreadable location is reported as such, never guessed.
+ */
+export async function readServerLocation(client: Pick<Prisma.TransactionClient, '$queryRaw'>): Promise<string> {
+  try {
+    const rows = await client.$queryRaw<Array<{ addr: string | null; port: number | null; socket: string | null }>>`
+      SELECT inet_server_addr()::text AS addr, inet_server_port() AS port, current_setting('unix_socket_directories', true) AS socket`
+    const row = rows[0]
+    if (row?.addr) return `${row.addr}:${row.port ?? '?'}`
+    if (row?.socket) return `unix socket ${row.socket}${row.port ? ` (port ${row.port})` : ''}`
+    return 'unreadable'
+  } catch {
+    return 'unreadable'
+  }
+}
+
 /** The connected server is not the one the operator confirmed. Never swallowed as a per-row conflict: it aborts the apply. */
 export class RetirementIdentityMismatch extends Error {}
 

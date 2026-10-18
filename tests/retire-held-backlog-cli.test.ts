@@ -34,6 +34,7 @@ function harness(items: RetirementItem[] = [item('SHADOW'), item('PARK', 'xero',
       calls.apply += 1
       return { outcomes: [], counts: { shadowed: plan.items.length, parked: 0, left_alone: 0, changed_since_plan: 0, ...overrides.counts } }
     },
+    serverLocation: async () => '10.0.0.5:5432',
     serverIdentity: async () => { if (overrides.identity instanceof Error) throw overrides.identity; return overrides.identity ?? IDENTITY },
     disconnect: async () => undefined,
   })
@@ -136,6 +137,8 @@ test('--all-queued reports that a configured cut-off is ignored, and the JSON ca
 test('THE CONFIRMATION IS A SERVER IDENTITY: the dry run prints it; the same database NAME on another cluster is refused; an unreadable identity refuses; nothing is applied in either case', async () => {
   const dry = harness()
   await dry.run(['--cutoff', '2026-12-01T00:00:00Z'])
+  assert.match(dry.out.join('\n'), /Connected to: 10\.0\.0\.5:5432/)
+  assert.match(dry.out.join('\n'), /names this cluster's LINEAGE, not the environment: a physical clone or a promoted replica of another server prints the same token/)
   assert.match(dry.out.join('\n'), /Server identity \(pass it as --confirm-database to apply to THIS server\): ims_scratch@7697665522638207492/)
   // A live cluster that happens to name its database the same: the NAME matches, the cluster does not.
   const other = harness(undefined, { identity: 'ims_scratch@1111111111111111111' })

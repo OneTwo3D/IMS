@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url'
 import {
   applyHeldBacklogRetirement,
   readServerIdentity,
+  readServerLocation,
   effectiveRetirementCutoff,
   planHeldBacklogRetirement,
   resolveRetirementCutoffs,
@@ -38,6 +39,7 @@ export type RetireCliOptions = {
   plan?: (scope: RetirementScope) => Promise<RetirementPlan>
   apply?: (plan: RetirementPlan, scope: RetirementScope) => Promise<RetirementApplyResult>
   serverIdentity?: () => Promise<string>
+  serverLocation?: () => Promise<string>
   stdout?: Pick<Logger, 'log'>
   stderr?: Pick<Logger, 'error'>
   disconnect?: () => Promise<void>
@@ -52,6 +54,11 @@ const exit = (name: string): number => {
 function valueOf(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag)
   return index >= 0 ? args[index + 1] : undefined
+}
+
+async function defaultServerLocation(): Promise<string> {
+  const { db } = await import('@/lib/db')
+  return readServerLocation(db)
 }
 
 async function defaultServerIdentity(): Promise<string> {
@@ -128,6 +135,8 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
     const plan = await (options.plan ?? ((s) => planHeldBacklogRetirement(s)))(scope)
     const result = apply ? await (options.apply ?? ((p, s) => applyHeldBacklogRetirement(p, s, { expectedIdentity: confirmedIdentity })))(plan, scope) : null
 
+    let shownLocation = 'unreadable'
+    try { shownLocation = await (options.serverLocation ?? defaultServerLocation)() } catch { /* shown as unreadable */ }
     let shownIdentity: string | null = null
     try { shownIdentity = await (options.serverIdentity ?? defaultServerIdentity)() } catch { shownIdentity = null }
     const tally = new Map<string, number>()
@@ -139,6 +148,7 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
       stdout.log(JSON.stringify({
         mode: apply ? 'apply' : 'dry-run',
         serverIdentity: shownIdentity,
+        serverLocation: shownLocation,
         generatedAt: plan.generatedAt.toISOString(),
         cutoffs: Object.fromEntries(destinations.map((d) => [d, effectiveRetirementCutoff(scope, d)?.toISOString() ?? null])),
         configuredCutoffsIgnored: scope.allQueued && Object.keys(scope.cutoffs).length > 0,
@@ -155,6 +165,8 @@ export async function runRetireHeldBacklogCli(options: RetireCliOptions = {}): P
     } else {
       stdout.log(apply ? 'APPLY (rows are changed, one transaction each)' : 'DRY RUN (nothing is changed)')
       stdout.log(shownIdentity ? `Server identity (pass it as --confirm-database to apply to THIS server): ${shownIdentity}` : 'Server identity: could not be read, so --apply would be refused')
+      stdout.log(`Connected to: ${shownLocation}`)
+      stdout.log('The identity names this cluster\'s LINEAGE, not the environment: a physical clone or a promoted replica of another server prints the same token. Before --apply, check that the host and port above are the server you mean to change.')
       for (const destination of destinations) {
         const cutoff = effectiveRetirementCutoff(scope, destination)
         stdout.log(`${destination}: ${scope.allQueued ? `every queued row (--all-queued; ${scope.cutoffs[destination] ? `the configured cut-off ${scope.cutoffs[destination]!.toISOString()} is ignored` : 'no cut-off applies'})` : cutoff ? `queued before ${cutoff.toISOString()}` : 'no cut-off given or readable: nothing selected'}`)
