@@ -44,6 +44,8 @@ export interface StoredPoAmounts {
   poSentAt: Date | null
   /** Additional-cost rows; the importer passes none. */
   freightCostLineCount: number
+  /** The price cache createPurchaseOrder writes per supplier and product agrees with the stored lines (computed by the reader from the orders it read). */
+  supplierProductsOk: boolean
   lines: ReadonlyArray<{
     qty: Dec
     unitCostForeign: Dec
@@ -81,6 +83,10 @@ export function headerAmountMismatches(po: StoredPoAmounts): string[] {
     const lineTaxForeign = num(line.taxForeign)
     // totalBase = round4(totalForeign / fx); taxBase = round4(taxForeign / fx); unitCostBase = round6(unitCostForeign / fx), by calcLineTotals on the stored net unit cost.
     const derived = calcLineTotals(num(line.unitCostForeign), num(line.qty), fx)
+    // The stored net unit cost must give the stored line total: totalForeign = round4(unitCostForeign x qty) by calcLineTotals. The importer rounded the unit cost to 6 dp AFTER
+    // computing the total from the unrounded one, so the two agree to 0.0001 plus half a unit of the 6th place per unit of quantity. A unit cost altered (with its base twin)
+    // while the file-pinned total stays put is therefore a difference here, and the unit cost is tied to the file through the total the fingerprint compares.
+    if (!near(totalForeign, derived.totalForeign, AMOUNT_TOLERANCE + num(line.qty) * 0.0000005)) bad.add('line.unitCostForeign')
     if (!near(num(line.totalBase), Math.round((totalForeign / fx) * 10000) / 10000, AMOUNT_TOLERANCE)) bad.add('line.totalBase')
     if (!near(num(line.taxBase), Math.round((lineTaxForeign / fx) * 10000) / 10000, AMOUNT_TOLERANCE)) bad.add('line.taxBase')
     if (!near(num(line.unitCostBase), derived.unitCostBase, 0.000002 * Math.max(1, 1 / fx))) bad.add('line.unitCostBase')
@@ -121,6 +127,7 @@ export function headerAmountMismatches(po: StoredPoAmounts): string[] {
   if (po.archived) bad.add('archived')
   if (po.trackingNumber !== null || po.shippingProvider !== null) bad.add('shipping')
   if (po.receivedAt !== null || po.invoicedAt !== null || po.rfqSentAt !== null || po.poSentAt !== null) bad.add('lifecycleDates')
+  if (!po.supplierProductsOk) bad.add('supplierProducts')
   return [...bad].sort()
 }
 

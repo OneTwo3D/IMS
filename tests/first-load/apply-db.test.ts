@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { after, before, describe, it } from 'node:test'
+import { after, afterEach, before, describe, it } from 'node:test'
 import { spawn } from 'node:child_process'
 
 import { freePort, startCluster, type Cluster } from '../scripts/real-postgres-cluster'
@@ -237,6 +237,15 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         }
       }
       assert.equal(await count('integration_outbox'), outboxBefore, 'the system-actor import queued nothing outbound')
+      cacheSnapshot = await m.db.supplierProduct.findMany()
+    })
+
+    // Orders that a test loads and then deletes leave their price cache behind (the cache is written by every order); put it back so each test sees the loaded state.
+    let cacheSnapshot: Awaited<ReturnType<typeof m.db.supplierProduct.findMany>> = []
+    afterEach(async () => {
+      if (cacheSnapshot.length === 0) return
+      await m.db.supplierProduct.deleteMany({})
+      await m.db.supplierProduct.createMany({ data: cacheSnapshot })
     })
 
     it('every unit of every step is observed in the database with the file side\'s exact fingerprint', async (t) => {
@@ -328,7 +337,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), [], 'control: as loaded, the blank currency is the supplier\'s and matches')
       await m.db.purchaseOrder.update({ where: { reference: PO_ONE }, data: { currency: 'EUR' } })
       try {
-        assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), ['currency'])
+        assert.deepEqual(differingColumns(unit.fingerprint, (await entry(PO_ONE)).fingerprint), ['currency', 'headerAmounts'], 'the currency, and the price cache that was written in the supplier\'s currency')
         const result = classifyStep('purchase-orders', [unit], { entries: [await entry(PO_ONE)] })
         assert.equal(result.units[0]!.conflict?.code, 'FIELDS_DIFFER')
       } finally {
@@ -571,6 +580,25 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       }
       // line-level base amounts and defaults
       const line = await lineOf(PO_TWO)
+      // The NET UNIT COST in both currencies altered consistently (the base one follows the foreign one at the order's rate) while the file-pinned totals stay put: the unit cost no longer
+      // gives the stored total. Mutation named: drop the derived-total check -> this arm is green when it must be red (the old code compared the base unit cost with the foreign one only).
+      {
+        const rate = Number((await po(PO_TWO)).fxRateToBase.toFixed())
+        const bumpedUnit = line.unitCostForeign.plus(1)
+        await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: bumpedUnit, unitCostBase: bumpedUnit.div(rate).toDecimalPlaces(6) } })
+        try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], 'both unit costs altered consistently, totals fixed') } finally { await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: line.unitCostForeign, unitCostBase: line.unitCostBase } }) }
+        assert.deepEqual(await diff(PO_TWO), [], 'restored')
+        arms++
+      }
+      // The price cache the order creation keeps per supplier and product
+      {
+        const sp = await m.db.supplierProduct.findFirstOrThrow({ where: { supplier: { name: SUPPLIER_B }, product: { sku: `${TAG}-VARIANT` } } })
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: sp.lastUnitCost.plus(7) } })
+        try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], 'supplier product cost') } finally { await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: sp.lastUnitCost } }) }
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { currency: 'USD' } })
+        try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], 'supplier product currency') } finally { await m.db.supplierProduct.update({ where: { id: sp.id }, data: { currency: sp.currency } }) }
+        arms++
+      }
       for (const [label, data, restore] of [
         ['line.totalBase', { totalBase: line.totalBase.plus(1) }, { totalBase: line.totalBase }],
         ['line.taxBase', { taxBase: line.taxBase.plus(1) }, { taxBase: line.taxBase }],
@@ -590,7 +618,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       const newTotalBase = newTotalForeign.div(rate)
       await m.db.purchaseOrderLine.update({ where: { id: beforeLine.id }, data: { totalForeign: newTotalForeign, totalBase: newTotalBase.toDecimalPlaces(4) } })
       await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { subtotalForeign: newTotalForeign, subtotalBase: newTotalBase.toDecimalPlaces(4), totalForeign: newTotalForeign, totalBase: newTotalBase.toDecimalPlaces(4) } })
-      try { assert.deepEqual(await diff(PO_TWO), ['lines'], 'a line and its header edited together still differ from the file') } finally {
+      try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts', 'lines'], 'a line and its header edited together still differ from the file (and the unit cost no longer gives the total)') } finally {
         await m.db.purchaseOrderLine.update({ where: { id: beforeLine.id }, data: { totalForeign: beforeLine.totalForeign, totalBase: beforeLine.totalBase } })
         await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { subtotalForeign: beforeHeader.subtotalForeign, subtotalBase: beforeHeader.subtotalBase, totalForeign: beforeHeader.totalForeign, totalBase: beforeHeader.totalBase } })
       }

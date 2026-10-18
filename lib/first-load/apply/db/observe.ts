@@ -213,7 +213,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
   const fileFingerprints = new Map((prepared.steps.find((s) => s.step === 'purchase-orders')?.units ?? []).map((u) => [u.key, u.fingerprint]))
   const rows = await db.purchaseOrder.findMany({
     select: {
-      reference: true, currency: true, fxRateToBase: true, taxRateName: true, taxRatePercent: true, pricesIncludeVat: true, supplierRef: true,
+      id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true, taxRateName: true, taxRatePercent: true, pricesIncludeVat: true, supplierRef: true,
       expectedDelivery: true, discountAmount: true, notes: true, status: true,
       // Every other accounting column createPurchaseOrder writes or defaults (validated in db/po-amounts.ts).
       type: true, landedCostMethod: true, subtotalForeign: true, subtotalBase: true, taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
@@ -224,16 +224,30 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
       lines: {
         orderBy: { sortOrder: 'asc' },
         select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true,
-          unitCostForeign: true, unitCostBase: true, totalBase: true, taxBase: true, description: true, purchaseUnitId: true, purchaseUnitQty: true, qtyReceived: true, qtyReturned: true, landedUnitCostBase: true, reorderEvidence: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
+          productId: true, unitCostForeign: true, unitCostBase: true, totalBase: true, taxBase: true, description: true, purchaseUnitId: true, purchaseUnitQty: true, qtyReceived: true, qtyReturned: true, landedUnitCostBase: true, reorderEvidence: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
       },
     },
   })
   const columns = FINGERPRINT_SPECS['purchase-orders'].fingerprinted
+  // The price cache createPurchaseOrder keeps per (supplier, product): its last unit cost and currency. The latest order wins, so the cache is checked against the set of stored lines:
+  // it must exist, carry the order's currency, and hold the net unit cost of one of the stored lines for that pair (an arbitrary value would be none of them).
+  const supplierProducts = await db.supplierProduct.findMany({ select: { supplierId: true, productId: true, lastUnitCost: true, currency: true } })
+  const cacheByPair = new Map(supplierProducts.map((sp) => [`${sp.supplierId}:${sp.productId}`, sp]))
+  const costsByPair = new Map<string, Set<string>>()
+  for (const row of rows) for (const line of row.lines) {
+    const pair = `${row.supplierId}:${line.productId}`
+    ;(costsByPair.get(pair) ?? costsByPair.set(pair, new Set()).get(pair)!).add(new D(line.unitCostForeign.toFixed()).toFixed(6))
+  }
+  const supplierProductsOk = (row: (typeof rows)[number]): boolean => row.lines.every((line) => {
+    const pair = `${row.supplierId}:${line.productId}`
+    const cache = cacheByPair.get(pair)
+    return cache !== undefined && cache.currency === row.currency && cache.lastUnitCost !== null && (costsByPair.get(pair)?.has(new D(cache.lastUnitCost.toFixed()).toFixed(6)) ?? false)
+  })
   return {
     entries: rows.map((row): ObservedEntry => ({
       key: row.reference,
       collisionKey: row.reference.toUpperCase(),
-      fingerprint: purchaseOrderFingerprintFromDb(columns, { ...row, headerAmounts: headerAmountsEntry({ ...row, freightCostLineCount: row._count.freightCostLines }), lines: row.lines.map((l) => ({ ...l, taxRate: l.taxRate ? { name: l.taxRate.name, rate: l.taxRate.rate, profileDigest: signatureDigest(taxRateSignature(l.taxRate)) } : null, taxAmountConsistent: taxAmountConsistent(row.pricesIncludeVat, l) })) }, fileFingerprints.get(row.reference) ?? null, profiles),
+      fingerprint: purchaseOrderFingerprintFromDb(columns, { ...row, headerAmounts: headerAmountsEntry({ ...row, freightCostLineCount: row._count.freightCostLines, supplierProductsOk: supplierProductsOk(row) }), lines: row.lines.map((l) => ({ ...l, taxRate: l.taxRate ? { name: l.taxRate.name, rate: l.taxRate.rate, profileDigest: signatureDigest(taxRateSignature(l.taxRate)) } : null, taxAmountConsistent: taxAmountConsistent(row.pricesIncludeVat, l) })) }, fileFingerprints.get(row.reference) ?? null, profiles),
       recipe: null,
     })),
   }
