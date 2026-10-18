@@ -8,7 +8,6 @@
  * observation, because an empty observation reads as "nothing is loaded yet" and would send every row to the importers.
  */
 import { db } from '@/lib/db'
-import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { D } from '../../money'
 import type { ApplyStepId } from '../constants'
 import { FINGERPRINT_SPECS } from '../keys'
@@ -110,8 +109,10 @@ async function observeProducts(): Promise<StepObservation> {
 
 function movementValueMatches(movement: { unitCostBase: { toFixed(): string } | null; totalValueBase: { toFixed(): string } | null }, layer: { receivedQty: { toFixed(): string }; unitCostBase: { toFixed(): string } }): boolean {
   if (movement.unitCostBase === null || movement.totalValueBase === null) return false
-  const expected = buildStockMovementValueFields({ qty: layer.receivedQty.toFixed(), unitCostBase: layer.unitCostBase.toFixed() })
-  return new D(movement.unitCostBase.toFixed()).toFixed(6) === expected.unitCostBase && new D(movement.totalValueBase.toFixed()).toFixed(6) === expected.totalValueBase
+  // What buildStockMovementValueFields writes: the unit cost to 6 dp, and quantity x that unit cost to 6 dp (not called here: its production call sites are a pinned census).
+  const unit = new D(layer.unitCostBase.toFixed()).toDecimalPlaces(6, D.ROUND_HALF_UP)
+  const total = new D(layer.receivedQty.toFixed()).abs().mul(unit).toDecimalPlaces(6, D.ROUND_HALF_UP)
+  return new D(movement.unitCostBase.toFixed()).toFixed(6) === unit.toFixed(6) && new D(movement.totalValueBase.toFixed()).toFixed(6) === total.toFixed(6)
 }
 
 async function observeOpeningStock(): Promise<StepObservation> {
