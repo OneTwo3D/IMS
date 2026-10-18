@@ -455,8 +455,8 @@ test('o3d-jit6 r1#2: the fence writes the claim renewal and the dispatch record 
   )
   assert.equal((renew.match(/await db\.accountingSyncLog\./g) ?? []).length, 1, 'exactly one write')
   assert.match(renew, /data: write \? \{ processingStartedAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt \}/)
-  assert.match(renew, /where: \{ \.\.\.heldClaimWhere\(entryId, held\), connector: XERO_CONNECTOR \}/,
-    'and the mint is scoped to the claim, so only the worker that owns the row can record a dispatch for it')
+  assert.match(renew, /where: \{ \.\.\.heldClaimWhere\(entryId, held\), connector: XERO_CONNECTOR, \.\.\.xeroNotBeforeCutoffWhere\(xeroCutoffFloor\(\)\) \}/,
+    'and the mint is scoped to the claim (and to the cut-off of that moment), so only the worker that owns the row can record a dispatch for it')
 })
 
 test('o3d-jit6 r1#3: every no-remedy type prescribes a remedy the settlement action would actually ACCEPT', async () => {
