@@ -1719,7 +1719,8 @@ export async function runWmsOrderPushSweepCore(
       // does) and nothing is sent. The durable claim history stays, so a later retirement parks the link rather than calling it unsent.
       // No floor in force: nothing is read or written here.
       const floorBeforeSend = wmsCreateObligationFloor(connectorId, producerContext)
-      if (floorBeforeSend && wmsPaidBeforeCreateFloor(order.paidAt, floorBeforeSend)) {
+      // The same business-event time the create seam judged it on (paid time, else creation time).
+      if (floorBeforeSend && wmsPaidBeforeCreateFloor(order.paidAt ?? order.createdAt, floorBeforeSend)) {
         recoveryRefusedCount += 1
         console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} is paid before the live-from instant as it stands now — claim given back, NOT created`)
         await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
