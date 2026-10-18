@@ -49,6 +49,7 @@ export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Pr
     const relevant = (step: ApplyStepId): boolean => selected.has(step) && (scope.step === null || scope.step === step)
 
     await quiesced(problems)
+    await tablesTheRunnerNeverWrites(problems)
     await baseCurrency(prepared, problems)
     await forbiddenSkus(prepared, problems)
     if (scope.phase === 'preflight' && !scope.resuming) await emptyTarget(problems)
@@ -128,6 +129,17 @@ async function forbiddenSkus(prepared: PreparedRun, problems: string[]): Promise
   if (forbidden.length === 0) return
   const found = await db.product.count({ where: { OR: forbidden.map((sku) => ({ sku: { equals: sku, mode: 'insensitive' as const } })) } })
   if (found > 0) problems.push(`forbidden SKUs: ${found} product(s) the manifest forbids already exist in the database`)
+}
+
+/**
+ * Tables this runner never creates a row in, checked on EVERY evaluation (a resume too): the empty-target rail covers a fresh run, but a resume trusts the run record, so customers and
+ * sales orders that appeared since (the application was up between a crash and the resume) would otherwise go unseen. Products, suppliers, purchase orders and stock movements are
+ * observed row by row (every row is either emitted by the run or reported as foreign), so they need no count here.
+ */
+async function tablesTheRunnerNeverWrites(problems: string[]): Promise<void> {
+  const [customers, salesOrders] = await Promise.all([db.customer.count(), db.salesOrder.count()])
+  if (customers > 0) problems.push(`foreign data: the customer table holds ${customers} row(s); this runner never writes customers`)
+  if (salesOrders > 0) problems.push(`foreign data: the sales order table holds ${salesOrders} row(s); this runner never writes sales orders`)
 }
 
 async function emptyTarget(problems: string[]): Promise<void> {

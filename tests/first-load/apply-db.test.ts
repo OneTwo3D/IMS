@@ -11,7 +11,7 @@ import { APPLY_STEP_IDS, RUN_STATUSES, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_A
 import { FINGERPRINT_SPECS, keyStep, type StepRows } from '../../lib/first-load/apply/keys'
 import { StaleJournalError, StepLockError, runLoad, type ApplyOptions, type ApplyPorts, type RunRecord } from '../../lib/first-load/apply/orchestrate'
 import { planImportCalls } from '../../lib/first-load/apply/import-calls'
-import { buildResidual, classifyStep, ObservationError } from '../../lib/first-load/apply/residual'
+import { buildResidual, classifyStep, listConflicts, ObservationError } from '../../lib/first-load/apply/residual'
 import type { PreparedRun } from '../../lib/first-load/apply/prepared'
 import { loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
 import { precondition } from './helpers'
@@ -86,6 +86,8 @@ const PO_SEVEN = `${TAG}-PO-7`
 const PO_EIGHT = `${TAG}-PO-8`
 const PO_NINE = `${TAG}-PO-9`
 const PO_TEN = `${TAG}-PO-10`
+const PO_ELEVEN = `${TAG}-PO-11`
+const PO_TWELVE = `${TAG}-PO-12`
 const SUPPLIER_A = `${TAG} Odd Supplier`
 const SUPPLIER_B = `${TAG} Euro Supplier`
 const ODD_FILES: Record<ApplyStepId, StepRows> = {
@@ -679,6 +681,63 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       precondition(t, 'arms', arms)
     })
 
+    it('a stock movement that names NO warehouse (a historical sales import writes these) is foreign history, on a resume as much as on a fresh run', async () => {
+      // Mutation named: skip movements with no warehouse (the old pair loop) -> the movement is invisible and the opening stock would load beside it: red.
+      const stub = { steps: [{ step: 'purchase-orders', units: units['purchase-orders'] }] } as unknown as PreparedRun
+      const product = await m.db.product.findUniqueOrThrow({ where: { sku: `${TAG}-SIMPLE` }, select: { id: true } })
+      const conflicts = async () => {
+        const observed = await m.observe.observeStep(stub, 'opening-stock')
+        const classified = classifyStep('opening-stock', units['opening-stock'], observed)
+        return { observed, classified }
+      }
+      const clean = await conflicts()
+      assert.deepEqual(clean.observed.foreignHistoryKeys, [], 'control: nothing foreign')
+      assert.equal(clean.classified.counts.foreign, 0)
+      const movement = await m.db.stockMovement.create({ data: { type: 'SALE_DISPATCH', productId: product.id, qty: '1', referenceType: 'WcHistorical', referenceId: 'hist-1', unitCostBase: '0', totalValueBase: '0' } })
+      try {
+        const dirty = await conflicts()
+        assert.deepEqual(dirty.observed.foreignHistoryKeys, [`${TAG}-SIMPLE|(NO WAREHOUSE)`])
+        assert.equal(dirty.classified.counts.foreign, 1, 'it is a foreign row of the step')
+        assert.deepEqual(listConflicts(dirty.classified).map((c) => c.code), ['FOREIGN_ROW'])
+      } finally { await m.db.stockMovement.delete({ where: { id: movement.id } }) }
+      assert.equal((await conflicts()).classified.counts.foreign, 0, 'restored')
+    })
+
+    it('the supplier price cache must hold the cost of the LAST line written for the pair: after orders at 10 and then 20, a cache reset to 10 is a difference', async () => {
+      // Mutation named: accept the cost of ANY stored line for the pair (the old rule) -> the reset-to-10 arm is green when it must be red.
+      const execute = m.execute.createExecutor({ runId: 'cache', operator: 'Cache Test' })
+      const loaded: Array<(typeof units)['purchase-orders'][number]> = []
+      const stub = { steps: [{ step: 'purchase-orders', get units() { return [...units['purchase-orders'], ...loaded] } }] } as unknown as PreparedRun
+      const load = async (key: string, cost: string) => {
+        const data = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: key, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '1', unitCostForeign: cost }])
+        const keyed = keyStep('purchase-orders', data)
+        assert.deepEqual(keyed.problems, [])
+        assert.deepEqual((await execute('purchase-orders', buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!, NO_LOCK)).errors, [])
+        loaded.push(keyed.units[0]!)
+        return keyed.units[0]!
+      }
+      const diff = async (unit: (typeof loaded)[number]) => differingColumns(unit.fingerprint, (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === unit.key)!.fingerprint)
+      try {
+        const first = await load(PO_ELEVEN, '10')
+        await new Promise((r) => setTimeout(r, 15)) // distinct creation times: the importer's calls are far apart in practice
+        const second = await load(PO_TWELVE, '20')
+        const sp = await m.db.supplierProduct.findFirstOrThrow({ where: { supplier: { name: SUPPLIER_A }, product: { sku: `${TAG}-SIMPLE` } } })
+        assert.equal(Number(sp.lastUnitCost.toFixed()), 20, 'precondition: the importer left the cache at the last order\'s cost')
+        assert.deepEqual([await diff(first), await diff(second)], [[], []], 'control: matches as written')
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: '10' } })
+        assert.deepEqual([await diff(first), await diff(second)], [['headerAmounts'], ['headerAmounts']], 'reset to the FIRST order\'s cost')
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: '15' } })
+        assert.deepEqual(await diff(second), ['headerAmounts'], 'a cost no line has')
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: '20' } })
+        assert.deepEqual([await diff(first), await diff(second)], [[], []], 'restored')
+      } finally {
+        for (const key of [PO_ELEVEN, PO_TWELVE]) {
+          await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key])
+          await sql('delete from purchase_orders where reference = $1', [key])
+        }
+      }
+    })
+
     it('a BOM whose manufacturing recipe is missing is NOT matching, although its component list is there', async () => {
       // Mutation named: drop the BOM branch in observeProducts -> the recipe equals the file's and this arm is green when it must be red.
       const bom = await m.db.product.findUniqueOrThrow({ where: { sku: `${TAG}-BOM` }, select: { id: true, manufacturingBom: { select: { id: true } } } })
@@ -993,6 +1052,21 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.match(result.problems.join(';'), /products: a rail no longer holds: quiesce: 1 other client session/)
           assert.equal(await count('products'), 0)
         } finally { await holder.client?.end() }
+      })
+    })
+
+    describe('tables the runner never writes', () => {
+      it('a customer or a sales order that appeared since is refused on a RESUME too (the empty-target rail is for a fresh run only)', async () => {
+        // Mutation named: drop the check -> a resume loads beside data of the application: red.
+        await resetData()
+        const resume = () => m.rails.evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
+        assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'control')
+        const customer = await m.db.customer.create({ data: { firstName: 'A', lastName: 'B' } })
+        try {
+          assert.ok((await resume()).some((p) => /^foreign data: the customer table holds 1 row\(s\)/.test(p)))
+          assert.ok((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: true, step: null })).some((p) => p.startsWith('foreign data:')))
+        } finally { await m.db.customer.delete({ where: { id: customer.id } }) }
+        assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'gone')
       })
     })
 

@@ -24,6 +24,8 @@ export const DATABASE_READ_FAILED = 'the database could not be read'
 
 /** The marker fingerprint of a stock pair that has history which is not exactly one opening layer; it never equals a file's fingerprint. */
 export const UNCLEAN_STOCK_PAIR = 'UNCLEAN_STOCK_PAIR'
+/** The warehouse part of the key of a stock movement that names no warehouse. */
+export const NO_WAREHOUSE = '(NO WAREHOUSE)'
 
 /** `ok`, or `mismatch:<names of the columns the importer never sets that are no longer at their defaults>`. Names only, never values. */
 function defaultsEntry(checks: Record<string, boolean>): string {
@@ -146,6 +148,9 @@ async function observeOpeningStock(): Promise<StepObservation> {
       if (pair.sku === '' || pair.code === '') missing.add(`${movement.productId}:${warehouseId}`)
     }
   }
+  // A movement with NEITHER warehouse (the application writes these for historical sales imports) belongs to no (product, warehouse) pair, so the pair loop would never see it: it is
+  // foreign history of its product, reported under a key of its own.
+  const unkeyedProducts = new Set(movements.filter((mv) => mv.toWarehouseId === null && mv.fromWarehouseId === null).map((mv) => mv.productId))
   if (missing.size > 0) {
     const [products, warehouses] = await Promise.all([
       db.product.findMany({ select: { id: true, sku: true } }),
@@ -163,6 +168,14 @@ async function observeOpeningStock(): Promise<StepObservation> {
 
   const entries: ObservedEntry[] = []
   const foreignHistoryKeys: string[] = []
+  if (unkeyedProducts.size > 0) {
+    const skuOf = new Map((await db.product.findMany({ where: { id: { in: [...unkeyedProducts] } }, select: { id: true, sku: true } })).map((p) => [p.id, p.sku]))
+    for (const productId of unkeyedProducts) {
+      const key = `${(skuOf.get(productId) ?? productId).toUpperCase()}|${NO_WAREHOUSE}`
+      foreignHistoryKeys.push(key)
+      entries.push({ key, collisionKey: key, fingerprint: UNCLEAN_STOCK_PAIR, recipe: null })
+    }
+  }
   for (const [id, pair] of pairs) {
     const [productId, warehouseId] = id.split(':')
     const key = `${pair.sku.toUpperCase()}|${pair.code.toUpperCase()}`
@@ -213,7 +226,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
   const fileFingerprints = new Map((prepared.steps.find((s) => s.step === 'purchase-orders')?.units ?? []).map((u) => [u.key, u.fingerprint]))
   const rows = await db.purchaseOrder.findMany({
     select: {
-      id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true, taxRateName: true, taxRatePercent: true, pricesIncludeVat: true, supplierRef: true,
+      id: true, supplierId: true, createdAt: true, reference: true, currency: true, fxRateToBase: true, taxRateName: true, taxRatePercent: true, pricesIncludeVat: true, supplierRef: true,
       expectedDelivery: true, discountAmount: true, notes: true, status: true,
       // Every other accounting column createPurchaseOrder writes or defaults (validated in db/po-amounts.ts).
       type: true, landedCostMethod: true, subtotalForeign: true, subtotalBase: true, taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
@@ -224,24 +237,36 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
       lines: {
         orderBy: { sortOrder: 'asc' },
         select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true,
-          productId: true, unitCostForeign: true, unitCostBase: true, totalBase: true, taxBase: true, description: true, purchaseUnitId: true, purchaseUnitQty: true, qtyReceived: true, qtyReturned: true, landedUnitCostBase: true, reorderEvidence: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
+          productId: true, sortOrder: true, unitCostForeign: true, unitCostBase: true, totalBase: true, taxBase: true, description: true, purchaseUnitId: true, purchaseUnitQty: true, qtyReceived: true, qtyReturned: true, landedUnitCostBase: true, reorderEvidence: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
       },
     },
   })
   const columns = FINGERPRINT_SPECS['purchase-orders'].fingerprinted
-  // The price cache createPurchaseOrder keeps per (supplier, product): its last unit cost and currency. The latest order wins, so the cache is checked against the set of stored lines:
-  // it must exist, carry the order's currency, and hold the net unit cost of one of the stored lines for that pair (an arbitrary value would be none of them).
+  // The price cache createPurchaseOrder keeps per (supplier, product): its last unit cost and currency, written by an upsert for every line of every order in the order the orders were created
+  // (and, inside an order, the line order). So the cache must hold the net unit cost of the LAST line written for the pair: the last line (highest position) of the most recently created order.
+  // Creation time is stored to the millisecond; orders created in the SAME millisecond cannot be ordered, so for those the cost of the last line of ANY of them is accepted (never a guess
+  // beyond that).
   const supplierProducts = await db.supplierProduct.findMany({ select: { supplierId: true, productId: true, lastUnitCost: true, currency: true } })
   const cacheByPair = new Map(supplierProducts.map((sp) => [`${sp.supplierId}:${sp.productId}`, sp]))
-  const costsByPair = new Map<string, Set<string>>()
-  for (const row of rows) for (const line of row.lines) {
-    const pair = `${row.supplierId}:${line.productId}`
-    ;(costsByPair.get(pair) ?? costsByPair.set(pair, new Set()).get(pair)!).add(new D(line.unitCostForeign.toFixed()).toFixed(6))
+  const lastByPair = new Map<string, { at: number; costs: Set<string> }>()
+  for (const row of rows) {
+    const lastInOrder = new Map<string, { sortOrder: number; cost: string }>()
+    for (const line of row.lines) {
+      const pair = `${row.supplierId}:${line.productId}`
+      const seen = lastInOrder.get(pair)
+      if (!seen || line.sortOrder >= seen.sortOrder) lastInOrder.set(pair, { sortOrder: line.sortOrder, cost: new D(line.unitCostForeign.toFixed()).toFixed(6) })
+    }
+    const at = row.createdAt.getTime()
+    for (const [pair, last] of lastInOrder) {
+      const best = lastByPair.get(pair)
+      if (!best || at > best.at) lastByPair.set(pair, { at, costs: new Set([last.cost]) })
+      else if (at === best.at) best.costs.add(last.cost)
+    }
   }
   const supplierProductsOk = (row: (typeof rows)[number]): boolean => row.lines.every((line) => {
     const pair = `${row.supplierId}:${line.productId}`
     const cache = cacheByPair.get(pair)
-    return cache !== undefined && cache.currency === row.currency && cache.lastUnitCost !== null && (costsByPair.get(pair)?.has(new D(cache.lastUnitCost.toFixed()).toFixed(6)) ?? false)
+    return cache !== undefined && cache.currency === row.currency && cache.lastUnitCost !== null && (lastByPair.get(pair)?.costs.has(new D(cache.lastUnitCost.toFixed()).toFixed(6)) ?? false)
   })
   return {
     entries: rows.map((row): ObservedEntry => ({
