@@ -95,13 +95,20 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
     })
 
     if (current.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
-      if (samePayload(current.payloadJson, payload)) return true
+      // A LIVE producer is writing into a job a worker holds. If a cut-off now applies and the job predates it, the worker's send-time check will
+      // refuse the job and every later claim excludes it by creation time, so the new update would be stranded for ever. The job is therefore
+      // RE-DATED in the same statement that merges the payload (the claim is keyed on its lock, not on createdAt, so the worker is unaffected), and the
+      // worker, which judges the current row, sends it. This applies to an identical payload too: the producer's event still needs its push after the instant.
+      // With no floor in force nothing is re-dated and the statement is the legacy one.
+      const redateProcessing = outboxRowBeforeCutoff({ connector: current.connector, operation: current.operation, createdAt: current.createdAt }) !== null
+      if (samePayload(current.payloadJson, payload) && !redateProcessing) return true
       const updated = await db.integrationOutbox.updateMany({
         where: {
           id: current.id,
           status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         },
         data: {
+          ...(redateProcessing ? { createdAt: new Date() } : {}),
           payloadJson: payload,
           lastError: null,
         },

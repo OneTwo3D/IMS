@@ -1110,3 +1110,42 @@ test('OUTBOX: the send-time recheck judges the job\'s CURRENT creation time, not
   })
   assert.equal((await d.db.integrationOutbox.findUnique({ where: { id: row.id }, select: { status: true } }))?.status, 'SHADOWED')
 })
+
+// ───────────── a live stock event arriving while an older job is held by a worker is not stranded by the cut-off (R10) ─────────────
+//
+// Named mutation (shown red in the PR): q1 the PROCESSING branch merges the payload without re-dating.
+
+test('STOCK JOB IN FLIGHT: a live event merged into a job a worker holds re-dates it, so the worker\'s send-time check passes and the update is not stranded; identical payloads too; no floor changes nothing', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const claimNew = async (name: string) => {
+    const productId = `${tag}-${name}`
+    const key = `woocommerce:stock.push:${productId}`
+    const row = (await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId, reason: 'MANUAL', force: false } })) as { id: string }
+    await d.db.integrationOutbox.update({ where: { id: row.id }, data: { createdAt: BEFORE } })
+    // The worker claims it while no floor is in force (the cut-off transition happens during the claim).
+    const claimed = await withEnv({}, async () => (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'w1' }))[0]!)
+    return { productId, id: row.id, claimed }
+  }
+  const differs = await claimNew('differs')
+  const same = await claimNew('same')
+  const off = await claimNew('off')
+  const read = (id: string) => d.db.integrationOutbox.findUnique({ where: { id }, select: { createdAt: true, payloadJson: true, status: true } })
+
+  await withEnv(wcLive(), async () => {
+    await d.stock.enqueueWcStockSyncJobs([differs.productId], 'MANUAL', { force: true })   // a different payload
+    await d.stock.enqueueWcStockSyncJobs([same.productId], 'MANUAL')                       // an identical one
+    for (const j of [differs, same]) {
+      const row = await read(j.id)
+      assert.equal(row?.status, 'PROCESSING', 'still held by the worker')
+      assert.ok(row!.createdAt.getTime() >= CUTOFF.getTime(), 're-dated by the live producer')
+      assert.equal(await d.outbox.refuseClaimedJobBeforeCutoff(j.claimed, 'w1'), null, 'the worker, judging the current row, sends it')
+    }
+    assert.equal(((await read(differs.id))!.payloadJson as { force?: boolean }).force, true, 'the new payload was merged')
+  })
+  await withEnv({}, async () => {
+    await d.stock.enqueueWcStockSyncJobs([off.productId], 'MANUAL', { force: true })
+    assert.equal((await read(off.id))?.createdAt.getTime(), BEFORE.getTime(), 'CONTROL: no floor, nothing is re-dated (the legacy statement)')
+  })
+})
