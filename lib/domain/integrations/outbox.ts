@@ -727,25 +727,24 @@ export async function markIntegrationOutboxRetryableFailure(
   // hold lasted longer than the retry budget. The job stays retryable, keeps its attempt count, and is
   // offered again after OUTBOUND_HELD_RETRY_DELAY_MS, for as long as the hold lasts.
   if (isOutboundWriteHeldText(errorMessage(options.error))) {
-    const heldRow = await updateClaimedOutboxRow(client, {
-      id: options.id,
-      workerId: options.workerId,
-      lockedAt: options.lockedAt,
-      data: {
-        status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
-        nextAttemptAt: new Date(now.getTime() + normalizeDelayMs(options.retryDelayMs ?? OUTBOUND_HELD_RETRY_DELAY_MS)),
-        lastError: truncateError(options.error),
-        lockedAt: null,
-        lockedBy: null,
-      },
-    })
+    const heldData = {
+      status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
+      nextAttemptAt: new Date(now.getTime() + normalizeDelayMs(options.retryDelayMs ?? OUTBOUND_HELD_RETRY_DELAY_MS)),
+      lastError: truncateError(options.error),
+      lockedAt: null,
+      lockedBy: null,
+    }
     // A hold refuses a request before it leaves. If THIS claim is the one that created the first-attempt stamp (the stamp equals its own claim
-    // time), nothing has ever left for this job, so the stamp is withdrawn; a stamp from any earlier claim never equals this one and stays.
-    await client.integrationOutbox.updateMany({
-      where: { id: options.id, attemptHistoryTracked: true, firstAttemptedAt: options.lockedAt },
-      data: { firstAttemptedAt: null },
+    // time), nothing has ever left for this job, so the stamp is withdrawn. The release and the withdrawal are ONE statement keyed on this
+    // claim's identity (status PROCESSING, this worker, this lockedAt) AND the stamp: there is no window in which an operator replay or another
+    // worker's claim could take the row between them, and a later claim never matches because its lockedAt differs. A stamp from any earlier
+    // claim, or a row the history does not track, falls through to the plain release below and keeps its stamp.
+    const withdrawn = await client.integrationOutbox.updateMany({
+      where: { ...claimedBy(options), attemptHistoryTracked: true, firstAttemptedAt: options.lockedAt },
+      data: { ...heldData, firstAttemptedAt: null },
     })
-    return heldRow
+    if (withdrawn.count > 0) return requireOutboxRow(client, options.id)
+    return updateClaimedOutboxRow(client, { id: options.id, workerId: options.workerId, lockedAt: options.lockedAt, data: heldData })
   }
 
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)

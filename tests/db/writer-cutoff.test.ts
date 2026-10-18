@@ -795,3 +795,47 @@ test('SHARED MIRRORED EVENT: a FAILED sibling attempt (with or without send evid
   assert.match(String(detail(rows.failedSent.id)), /mirrored accounting event was left untouched/)
   assert.deepEqual([(await event(refs.inert))?.status, (await event(refs.inert))?.voidBasis], ['VOID', 'held_shadow'], 'CONTROL: an inert cancelled sibling does not block the retirement of the mirror')
 })
+
+test('HOLD REFUSAL IS ATOMIC: a replay and a second claim that land right after the hold worker\'s release cannot have the first-attempt stamp withdrawn from under them', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const savedKey = process.env.SETTINGS_ENCRYPTION_KEY
+  if (!savedKey) process.env.SETTINGS_ENCRYPTION_KEY = 'prod_readiness_ci_settings_key__'
+  t.after(() => { if (!savedKey) delete process.env.SETTINGS_ENCRYPTION_KEY })
+  const held = (await import('../../lib/security/outbound-write-hold-constants.ts')).outboundHeldMessage({
+    connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/wp-json/x', hop: 0,
+  })
+  const key = `woocommerce:stock.push:${tag}-race`
+  const row = (await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false } })) as { id: string }
+  await d.db.integrationOutbox.update({ where: { id: row.id }, data: { createdAt: BEFORE } })
+  const w1 = (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'w1' }))[0]!
+  // The hook runs the moment the FIRST update of the hold worker's release has executed: an operator replay and a second worker's claim land there.
+  let interleaved = 0
+  const real = d.db.integrationOutbox
+  const hooked = {
+    integrationOutbox: {
+      findUnique: (a: unknown) => real.findUnique(a as never),
+      findMany: (a: unknown) => real.findMany(a as never),
+      create: (a: unknown) => real.create(a as never),
+      updateMany: async (a: unknown) => {
+        const result = await real.updateMany(a as never)
+        if (interleaved === 0) {
+          interleaved += 1
+          await withEnv({}, async () => { await d.admin.replayIntegrationOutboxAdminRow({ id: row.id }) })
+          await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'w2' })
+        }
+        return result
+      },
+    },
+  }
+  await d.outbox.markIntegrationOutboxRetryableFailure({ client: hooked as never, id: row.id, workerId: 'w1', lockedAt: w1.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000 })
+  const after = await d.db.integrationOutbox.findUnique({ where: { id: row.id }, select: { firstAttemptedAt: true, status: true, lockedBy: true, attemptHistoryTracked: true } })
+  console.log(`# atomic hold: interleaved=${interleaved} stamp=${after?.firstAttemptedAt ? 'present' : 'absent'} holder=${after?.lockedBy}`)
+  assert.equal(interleaved, 1, 'precondition: the interleave ran')
+  assert.equal(after?.status, 'PROCESSING', 'the second worker holds the row')
+  assert.notEqual(after?.firstAttemptedAt, null, 'the second worker may be sending: the stamp must not be withdrawn from under it')
+  // While worker two holds the row it is not a retirement candidate at all (a fresh claim is skipped), so nothing can shadow it mid-send.
+  const plan = await d.retire.planHeldBacklogRetirement({ destinations: ['woocommerce' as const], cutoffs: { woocommerce: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 })
+  assert.equal(plan.items.find((i: { id: string }) => i.id === row.id)?.classification.disposition, 'SKIP')
+})
