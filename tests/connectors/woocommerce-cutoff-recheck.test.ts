@@ -54,7 +54,7 @@ test('every WooCommerce drain parks a pre-cutoff claim BEFORE its first write, a
     const sendAt = text.indexOf(send, at)
     assert.ok(at > 0, `${file} calls the refusal`)
     assert.ok(sendAt > at, `${file}: the refusal comes before the send`)
-    assert.ok(text.includes('outboxRowBeforeCutoff(job)'), `${file} gives its fence the per-write check`)
+    assert.ok(text.includes('currentOutboxRowBeforeCutoff(job)'), `${file} gives its fence the per-write check`)
     checked += 1
   }
   assert.equal(checked, 3)

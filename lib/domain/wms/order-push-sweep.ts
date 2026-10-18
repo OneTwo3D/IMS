@@ -882,6 +882,8 @@ export interface WmsOrderPushPort {
    * Optional: a port without it simply leaves the stamp in place (the safe direction).
    */
   updateLinkIfCreateClaimOwned?(orderId: string, stamp: Date, data: LinkWrite): Promise<boolean>
+  /** The order's CURRENT paid and creation times, read fresh (never the candidate snapshot). Absent: the caller falls back to its snapshot. */
+  readOrderObligationTimes?(orderId: string): Promise<{ paidAt: Date | null; createdAt: Date | null } | null>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
 }
@@ -1720,7 +1722,14 @@ export async function runWmsOrderPushSweepCore(
       // No floor in force: nothing is read or written here.
       const floorBeforeSend = wmsCreateObligationFloor(connectorId, producerContext)
       // The same business-event time the create seam judged it on (paid time, else creation time).
-      if (floorBeforeSend && wmsPaidBeforeCreateFloor(order.paidAt ?? order.createdAt, floorBeforeSend)) {
+      // JUDGED ON THE ORDER AS IT IS NOW: the paid time is read afresh at this hand-off (a correction can land after the claim's lock was released), not the
+      // snapshot the candidate list carried. An order that can no longer be read is not created. A port that cannot read falls back to the snapshot.
+      let sendObligation: Date | null | undefined = order.paidAt ?? order.createdAt
+      if (floorBeforeSend && port.readOrderObligationTimes) {
+        const current = await port.readOrderObligationTimes(order.id).catch(() => null)
+        sendObligation = current ? (current.paidAt ?? current.createdAt) : null
+      }
+      if (floorBeforeSend && wmsPaidBeforeCreateFloor(sendObligation, floorBeforeSend)) {
         recoveryRefusedCount += 1
         console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} is paid before the live-from instant as it stands now — claim given back, NOT created`)
         await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
@@ -2962,6 +2971,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async updateLink(id, data) {
       await db.wmsOrderPushLink.update({ where: { id }, data })
+    },
+    async readOrderObligationTimes(orderId) {
+      return db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, createdAt: true } })
     },
     async updateLinkIfCreateClaimOwned(orderId, stamp, data) {
       const { count } = await db.wmsOrderPushLink.updateMany({

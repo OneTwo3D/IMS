@@ -27,7 +27,7 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
-  outboxRowBeforeCutoff,
+  currentOutboxRowBeforeCutoff,
   refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
@@ -254,7 +254,7 @@ export async function processWcOrderCompletionJobs(options?: {
           where: { id: job.id, status: 'PROCESSING', lockedBy: WORKER_ID, lockedAt: job.lockedAt },
         })) === 1,
         // Asked again before each write (the tracking PUT and the status PUT), with the floor read at that moment.
-        mayStillSend: () => outboxRowBeforeCutoff(job) === null,
+        mayStillSend: async () => (await currentOutboxRowBeforeCutoff(job)) === null,
       }
       const retryReason = await runInWriteLedger(ledger, () => runWithWcAttemptFence(fence, async (): Promise<string | null> => {
         // The facade, not the connector: it owns "is a storefront connector runnable at all".

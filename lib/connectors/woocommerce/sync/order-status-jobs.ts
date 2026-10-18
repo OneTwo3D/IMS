@@ -33,7 +33,7 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
-  outboxRowBeforeCutoff,
+  currentOutboxRowBeforeCutoff,
   refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
@@ -413,7 +413,7 @@ export async function runFencedWcOrderJob(
           where: { id: job.id, status: 'PROCESSING', lockedBy: descriptor.workerId, lockedAt: job.lockedAt },
         })) === 1,
         // Asked again before the write, with the floor read at that moment.
-        mayStillSend: () => outboxRowBeforeCutoff(job) === null,
+        mayStillSend: async () => (await currentOutboxRowBeforeCutoff(job)) === null,
         // The re-read the PUT is gated on, as close to the write as the fence allows.
         stillWanted: async () => (await readImsStatus(orderId)) === descriptor.imsTarget,
       }

@@ -16,6 +16,7 @@ import {
   isOutboxEnqueueShadowed,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
+  currentOutboxRowBeforeCutoff,
   outboxRowBeforeCutoff,
   refuseClaimedJobBeforeCutoff,
   type IntegrationOutboxRow,
@@ -396,7 +397,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
     const ledger = createWriteLedger()
     try {
       const result = await runInWriteLedger(ledger, () => runWithWcAttemptFence(
-        { signal: new AbortController().signal, stillOwned: async () => true, mayStillSend: () => outboxRowBeforeCutoff(job) === null },
+        { signal: new AbortController().signal, stillOwned: async () => true, mayStillSend: async () => (await currentOutboxRowBeforeCutoff(job)) === null },
         () => pushStockToWc({
           productIds: [payload.productId],
           forceProductIds: payload.force ? [payload.productId] : [],

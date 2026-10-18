@@ -380,6 +380,21 @@ export function outboxRowCutoffFloor(connector: string, operation: string, conte
 }
 
 /**
+ * THE CUT-OFF JUDGED ON THE JOB'S CURRENT ROW, never on the copy the claim returned: the creation time is read from the database at the moment of the
+ * question (and only when a floor is in force, so with the switch off no query is made). A job whose row cannot be read is judged before the floor
+ * (fail closed). Returns the floor that applies when the job is before it, else null.
+ */
+export async function currentOutboxRowBeforeCutoff(
+  job: Pick<IntegrationOutboxRow, 'id' | 'connector' | 'operation' | 'createdAt'>,
+  options: { client?: IntegrationOutboxClient; now?: Date } = {},
+): Promise<Date | null> {
+  const floor = outboxRowCutoffFloor(job.connector, job.operation, options.now ? { now: options.now } : {})
+  if (floor === null) return null
+  const current = await getClient(options.client).integrationOutbox.findUnique({ where: { id: job.id } })
+  return createdBeforeCutoffFloor(current?.createdAt, floor) ? floor : null
+}
+
+/**
  * THE LAST CHECK BEFORE A CLAIMED JOB SENDS. The claim excludes a job created before the live-from instant, but a worker can hold a claim taken
  * when no floor was in force and send after one is: so every drain asks again, with the floor re-derived from the environment NOW, immediately
  * before each write. A job that predates it is parked without sending, in ONE statement keyed on this claim's identity (so a replay or another
@@ -392,7 +407,7 @@ export async function refuseClaimedJobBeforeCutoff(
   workerId: string,
   options: { client?: IntegrationOutboxClient; now?: Date } = {},
 ): Promise<string | null> {
-  const floor = outboxRowBeforeCutoff(job, options.now ? { now: options.now } : {})
+  const floor = await currentOutboxRowBeforeCutoff(job, options)
   if (floor === null) return null
   const notice = producerBeforeCutoffNotice({ connector: job.connector as OutboundConnector, cutoff: floor })
   if (!job.lockedAt) return notice

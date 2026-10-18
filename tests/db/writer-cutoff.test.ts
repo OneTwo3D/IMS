@@ -1061,3 +1061,52 @@ test('WRITE LEDGER: tracking sent, then the status request refused by the hold -
   assert.equal(by(sent.id), 'PARK', 'held error, zero counted attempts, and still parked')
   assert.equal(by(none.id), 'SHADOW')
 })
+
+// ───────────── send-time rechecks judge the CURRENT row, not a snapshot (R9) ─────────────
+//
+// Named mutations (each shown red in the PR): p1 the Mintsoft hand-off judges the candidate snapshot; p2 the outbox refusal judges the claim's copy.
+
+test('MINTSOFT CREATE: an order whose paid time is corrected to before the instant AFTER the claim is not created (the paid time is read afresh at the hand-off)', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `msp${randomUUID().slice(0, 8)}`
+  const seeded = await seedMintsoftOrder(d, tag, new Date('2026-06-10T00:00:00Z'))
+  t.after(() => cleanupMintsoftOrder(d, seeded))
+  const env = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'mintsoft', MINTSOFT_WRITE_ALLOWED: 'https://wms.example.test|89', MINTSOFT_WRITES_LIVE_FROM: '2026-06-01T00:00:00Z' }
+  const real = d.sweep.createPrismaWmsOrderPushPort()
+  const run = (correctAfterClaim: boolean) => withEnv(env, async () => {
+    const port = {
+      ...real,
+      claimForCreate: async (...args: Parameters<typeof real.claimForCreate>) => {
+        const r = await real.claimForCreate(...args)
+        if (correctAfterClaim) await d.db.salesOrder.update({ where: { id: seeded.orderId }, data: { paidAt: new Date('2026-05-01T00:00:00Z') } })   // a correction after the claim's lock was released
+        return r
+      },
+    }
+    const double = msConnector()
+    await d.sweep.runWmsOrderPushSweepCore(double.connector as never, 'mintsoft', port as never, { batchSize: 1000 })
+    return double.calls.filter((c) => c.endsWith(`MSC-${tag}`))
+  })
+  assert.deepEqual(await run(true), [], 'nothing is sent: the order is now paid before the instant')
+  const link = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: seeded.orderId }, select: { lastAttemptAt: true, firstClaimedAt: true } })
+  assert.deepEqual([link?.lastAttemptAt, link?.firstClaimedAt !== null], [null, true], 'claim given back, durable history kept')
+  await d.db.wmsOrderPushLink.deleteMany({ where: { orderId: seeded.orderId } })
+  await d.db.salesOrder.update({ where: { id: seeded.orderId }, data: { paidAt: new Date('2026-06-10T00:00:00Z') } })
+  assert.deepEqual(await run(false), [`pushOrder:MSC-${tag}`], 'CONTROL: no correction, the order is created')
+})
+
+test('OUTBOX: the send-time recheck judges the job\'s CURRENT creation time, not the copy the claim returned', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const key = `woocommerce:stock.push:${tag}-current`
+  const row = (await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false } })) as { id: string }
+  const claimed = await withEnv({}, async () => (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'w1' }))[0]!)
+  assert.ok(claimed.createdAt.getTime() > CUTOFF.getTime(), 'precondition: the claim\'s copy says the job is after the instant')
+  await d.db.integrationOutbox.update({ where: { id: row.id }, data: { createdAt: BEFORE } })   // the row has since been corrected to before it
+  await withEnv(wcLive(), async () => {
+    assert.notEqual(await d.outbox.currentOutboxRowBeforeCutoff(claimed), null, 'judged on the current row')
+    const refused = await d.outbox.refuseClaimedJobBeforeCutoff(claimed, 'w1')
+    assert.match(String(refused), /^Not sent by IMS: this was queued before writes to WooCommerce went live/)
+  })
+  assert.equal((await d.db.integrationOutbox.findUnique({ where: { id: row.id }, select: { status: true } }))?.status, 'SHADOWED')
+})
