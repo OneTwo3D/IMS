@@ -19,6 +19,7 @@ import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/pu
 import { D, fmtFixed, type Dec } from '../../money'
 import { RUNNER_APPLICATION_NAME, type ApplyStepId } from '../constants'
 import { endpointKey, normaliseAddress, ownEndpoints } from './own-sessions'
+import { ATTRIBUTION_RULES } from './attribution'
 import { FRESH_RUN_MAY_HOLD, TABLE_CLASSES, tablesOfKind } from '../table-classes'
 import { normaliseTaxValue } from '../normal-form'
 import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
@@ -48,7 +49,7 @@ export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Pr
     const relevant = (step: ApplyStepId): boolean => selected.has(step) && (scope.step === null || scope.step === step)
 
     await quiesced(problems)
-    await dataClasses(problems, scope.phase === 'preflight' && !scope.resuming)
+    await dataClasses(prepared, problems, scope.phase === 'preflight' && !scope.resuming)
     await baseCurrency(prepared, problems)
     await forbiddenSkus(prepared, problems)
     if (scope.phase === 'preflight' && !scope.resuming) await baseCurrencyNotLocked(problems)
@@ -137,13 +138,21 @@ async function forbiddenSkus(prepared: PreparedRun, problems: string[]): Promise
  *   - a FIRST run also needs the tables the runner writes to be empty (except the audit trail and the run record). On a resume those are accounted for row by row by the observation.
  * The tables are read from the database itself (information_schema), then intersected with the registry. Messages carry the table name (a schema name) and a count only.
  */
-async function dataClasses(problems: string[], fresh: boolean): Promise<void> {
+async function dataClasses(prepared: PreparedRun, problems: string[], fresh: boolean): Promise<void> {
   const present = new Set((await db.$queryRaw<Array<{ name: string }>>`
     SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'`).map((r) => r.name))
   const unknown = [...present].filter((name) => !Object.prototype.hasOwnProperty.call(TABLE_CLASSES, name))
   if (unknown.length > 0) problems.push(`foreign data: ${unknown.length} table(s) of the database are not classified by the runner, so it cannot say they hold nothing (a new table needs a decision in table-classes.ts)`)
   const mustBeEmpty = tablesOfKind('MUST_BE_EMPTY').filter((name) => present.has(name))
   const runnerTables = fresh ? tablesOfKind('RUNNER_WRITES').filter((name) => present.has(name) && !FRESH_RUN_MAY_HOLD.has(name)) : []
+  // A RESUME: every row of every runner-written table must be traceable to the prepared file (one rule per table, attribution.ts). The step observation reads only what the file names.
+  if (!fresh) {
+    for (const name of tablesOfKind('RUNNER_WRITES').filter((t) => present.has(t))) {
+      const rule = Object.prototype.hasOwnProperty.call(ATTRIBUTION_RULES, name) ? ATTRIBUTION_RULES[name] : undefined
+      const n = rule ? await rule(prepared) : Number.MAX_SAFE_INTEGER
+      if (n > 0) problems.push(rule ? `foreign data: the ${name} table holds ${n} row(s) the prepared file does not account for` : `foreign data: the ${name} table has no attribution rule`)
+    }
+  }
   const checked = [...mustBeEmpty, ...runnerTables]
   if (checked.length === 0) return
   // The names come from the committed registry and are matched to [a-z_0-9]+ before they are quoted into the statement: nothing from the database or a file is interpolated.

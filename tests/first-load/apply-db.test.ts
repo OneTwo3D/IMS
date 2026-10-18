@@ -1201,6 +1201,64 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       })
     })
 
+    describe('every table the runner writes is attributed to the file on a resume', () => {
+      // Mutation named: skip the attribution loop in dataClasses -> a foreign category / price-cache / recipe row between attempts is invisible: red.
+      const resume = () => m.rails.evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
+      const rows = async (table: string) => (await resume()).filter((p) => p.startsWith('foreign data:') && p.includes(`the ${table} table holds`))
+
+      it('every RUNNER_WRITES table has an attribution rule, and no rule is for another table', async () => {
+        const { ATTRIBUTION_RULES } = await import('../../lib/first-load/apply/db/attribution')
+        const { tablesOfKind } = await import('../../lib/first-load/apply/table-classes')
+        assert.deepEqual(Object.keys(ATTRIBUTION_RULES).sort(), tablesOfKind('RUNNER_WRITES'))
+      })
+
+      it('CONTROL: an empty target passes every rule', async () => {
+        await resetData()
+        assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [])
+      })
+
+      it('a category nothing in the file names, and a price-cache row no file line explains, are refused on a resume (counts only)', async () => {
+        await resetData()
+        try {
+          await m.db.productCategory.create({ data: { name: 'Stray', nameNormalized: 'zq-stray-category' } })
+          assert.deepEqual(await rows('product_categories'), ['foreign data: the product_categories table holds 1 row(s) the prepared file does not account for'])
+          const supplier = await m.db.supplier.create({ data: { name: 'Stray Supplier Ltd' } })
+          const product = await m.db.product.create({ data: { sku: 'ZQ-STRAY-SKU', name: 'stray' } })
+          await m.db.supplierProduct.create({ data: { supplierId: supplier.id, productId: product.id, lastUnitCost: '1', currency: 'GBP' } })
+          assert.equal((await rows('supplier_products')).length, 1)
+          assert.equal((await rows('products')).length, 1)
+          assert.equal((await rows('suppliers')).length, 1)
+          assert.ok(!(await resume()).join(';').includes('ZQ-STRAY'), 'no key in any message')
+        } finally { await resetData() }
+        assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'gone')
+      })
+
+      it('a recipe, a bill of materials and its items the file does not describe are refused on a resume', async () => {
+        await resetData()
+        try {
+          const parent = await m.db.product.create({ data: { sku: 'ZQ-STRAY-PARENT', name: 'p', type: 'BOM' } })
+          const part = await m.db.product.create({ data: { sku: 'ZQ-STRAY-PART', name: 'c' } })
+          await m.db.productComponent.create({ data: { productId: parent.id, componentId: part.id, qty: '1' } })
+          const bom = await m.db.bom.create({ data: { name: 'stray', productId: parent.id } })
+          await m.db.bomItem.create({ data: { bomId: bom.id, parentProductId: parent.id, componentProductId: part.id, qty: '1' } })
+          for (const table of ['product_components', 'boms', 'bom_items']) assert.equal((await rows(table)).length, 1, table)
+        } finally { await resetData() }
+      })
+
+      it('stock the file does not name (a level, a movement, a layer) is refused on a resume', async () => {
+        await resetData()
+        try {
+          const product = await m.db.product.create({ data: { sku: 'ZQ-STRAY-STOCK', name: 's' } })
+          const main = await m.db.warehouse.findUniqueOrThrow({ where: { code: 'ZQSENT-MAIN' }, select: { id: true } })
+          await m.db.stockLevel.create({ data: { productId: product.id, warehouseId: main.id, quantity: '1' } })
+          await m.db.costLayer.create({ data: { productId: product.id, warehouseId: main.id, receivedQty: '1', remainingQty: '1', unitCostBase: '1' } })
+          const over = await m.db.warehouse.findUniqueOrThrow({ where: { code: 'ZQSENT-OVER' }, select: { id: true } })
+          await m.db.stockMovement.create({ data: { type: 'TRANSFER_OUT', productId: product.id, fromWarehouseId: main.id, toWarehouseId: over.id, qty: '1' } })
+          for (const table of ['stock_levels', 'cost_layers', 'stock_movements']) assert.equal((await rows(table)).length, 1, table)
+        } finally { await resetData() }
+      })
+    })
+
     describe('the other rails', () => {
       const rails = (step: ApplyStepId | null = null) => m.rails.evaluateRails(prepared, { phase: 'recheck', resuming: true, step })
 
