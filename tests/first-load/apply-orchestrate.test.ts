@@ -504,3 +504,43 @@ test('resume on an APPLIED run whose data has since changed is a CONFLICT and ve
   assert.equal(resumed.exit, 'CONFLICT')
   assert.equal(verified, 0)
 })
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Problem text carries no data key
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+test('a conflict found under the lock is reported as a closed code and a count: no supplier name, SKU, stock pair or order reference is in any problem, error or finding string', async (t) => {
+  // Mutation named: put the first conflicting key back into the problem sentence (the old text) -> this arm is red for every step.
+  let examined = 0
+  for (const stepId of ['suppliers', 'products', 'opening-stock', 'purchase-orders'] as const) {
+    const { prepared, db, options } = setup()
+    const target = prepared.steps.find((s) => s.step === stepId)!
+    const seededKey = target.units[0]!.key
+    const real = db.ports()
+    const reads = new Map<string, number>()
+    const ports = {
+      ...real,
+      // The first read (the plan) is clean; the read under the lock finds a different row for the first key of this step.
+      observe: async (step: typeof stepId) => {
+        reads.set(step, (reads.get(step) ?? 0) + 1)
+        const observed = await real.observe(step)
+        if (step === stepId && (reads.get(step) ?? 0) >= 2) {
+          return { ...observed, entries: [{ key: seededKey, collisionKey: seededKey.toUpperCase(), fingerprint: '{"other":"value"}', recipe: null }, ...observed.entries.filter((e) => e.key !== seededKey)] }
+        }
+        return observed
+      },
+    }
+    const result = await runLoad(prepared, ports, options())
+    assert.equal(result.exit, 'CONFLICT', `${stepId}: ${result.problems.join('; ')}`)
+    const strings = [...result.problems, ...result.steps.flatMap((s) => [s.error ?? '', ...s.counterFindings, ...s.importer.flatMap((i) => i.errors.map((e) => `${e.code}`))])]
+    const parts = seededKey.split('|')
+    for (const text of strings) {
+      for (const part of [seededKey, ...parts]) assert.ok(!text.toLowerCase().includes(part.toLowerCase()), `${stepId}: a string carries the key ${part}: ${text}`)
+    }
+    assert.match(result.problems.join(' '), /1 conflict\(s\): FIELDS_DIFFER x1/)
+    // The key IS in the controlled place: the conflict report.
+    assert.ok(result.steps.some((s) => s.conflicts.some((c) => c.key === seededKey)), `${stepId}: the conflict list names the key`)
+    examined++
+  }
+  precondition(t, 'steps examined', examined)
+})

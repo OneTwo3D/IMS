@@ -411,7 +411,10 @@ async function runStep(
   const before = classifyStep(id, step.units, await ports.observe(id))
   if (hasConflict(before)) {
     const conflicts = listConflicts(before)
-    return fail('CONFLICT', [`${id}: ${conflicts.length} conflict(s), first: ${conflicts[0].key} (${conflicts[0].code})`], { ...emptyResult(id, 'CONFLICT'), emitted: before.counts.emitted, conflicts })
+    // Problem text reaches logs: a closed code and a count per code, never a key. The keys are in the conflict report (rows and conflicts), which is the controlled place for them.
+    const byCode = new Map<string, number>()
+    for (const c of conflicts) byCode.set(c.code, (byCode.get(c.code) ?? 0) + 1)
+    return fail('CONFLICT', [`${id}: ${conflicts.length} conflict(s): ${[...byCode.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([code, n]) => `${code} x${n}`).join(', ')}`], { ...emptyResult(id, 'CONFLICT'), emitted: before.counts.emitted, conflicts })
   }
   const residual = buildResidual(id, step.data, before)
   const result: StepResult = {
@@ -461,8 +464,9 @@ async function runStep(
   // Cross-check against the importers' own counters: a disagreement is a finding that names what the database shows.
   const claimedCreated = result.importer.reduce((t, i) => t + i.created, 0)
   if (result.importer.length > 0 && claimedCreated !== loadedRows) {
-    const missing = result.rows.filter((r) => r.outcome === 'failed').map((r) => r.key).slice(0, 20)
-    result.counterFindings.push(`the importer(s) reported ${claimedCreated} row(s) created, the database shows ${loadedRows}${missing.length > 0 ? `; not loaded: ${missing.join(', ')}` : ''}`)
+    // A count only: which units are not loaded is in the step's rows (the controlled place for keys).
+    const notLoaded = result.rows.filter((r) => r.outcome === 'failed').length
+    result.counterFindings.push(`the importer(s) reported ${claimedCreated} row(s) created, the database shows ${loadedRows}${notLoaded > 0 ? `; ${notLoaded} unit(s) not loaded (see the step's rows)` : ''}`)
   }
   if (after.counts.foreign > 0) result.counterFindings.push(`${after.counts.foreign} database row(s) of this step were not emitted by this run`)
 

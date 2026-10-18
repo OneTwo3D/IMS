@@ -99,4 +99,11 @@ describe('the executor', () => {
     const result = await createExecutor({ runId: 'run-1', operator: 'Op' })('purchase-orders', file, NO_LOCK)
     assert.deepEqual(result.errors, ['Row 3: supplier not found', 'Row 2: bad line'])
   })
+
+  it('the planner itself refuses an order with more lines than a call may hold (the bound is not silently exceeded), with a closed code', async () => {
+    const { planImportCalls, ImportCallError } = await import('../../lib/first-load/apply/import-calls')
+    const text = 'orderKey,sku\r\nBIG,1\r\nBIG,2\r\nBIG,3\r\nSMALL,1\r\n'
+    assert.throws(() => planImportCalls('purchase-orders', new TextEncoder().encode(text), 2), (e: unknown) => e instanceof ImportCallError && e.code === 'ORDER_TOO_LARGE' && !/BIG/.test(e.message))
+    assert.equal(planImportCalls('purchase-orders', new TextEncoder().encode(text), 3).length, 2, 'control: at the bound it is two calls')
+  })
 })

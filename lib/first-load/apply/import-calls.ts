@@ -31,7 +31,7 @@ export interface ImportCall {
 }
 
 export class ImportCallError extends Error {
-  constructor(readonly code: 'CSV_UNREADABLE' | 'FILE_TOO_LARGE' | 'ORDER_KEY_MISSING') {
+  constructor(readonly code: 'CSV_UNREADABLE' | 'FILE_TOO_LARGE' | 'ORDER_KEY_MISSING' | 'ORDER_TOO_LARGE') {
     super(code)
     this.name = 'ImportCallError'
   }
@@ -64,6 +64,8 @@ export function planImportCalls(step: ApplyStepId, bytes: Uint8Array, maxRows: n
     }
     batches = []
     let current: string[][] = []
+    // An order is never split, so one with more lines than a call may hold would break the bound on a call's size: refused, not sent. (The prepared run is refused earlier, at load.)
+    for (const order of orders.values()) if (order.length > maxRows) throw new ImportCallError('ORDER_TOO_LARGE')
     for (const order of orders.values()) {
       if (current.length > 0 && current.length + order.length > maxRows) { batches.push(current); current = [] }
       current.push(...order)
