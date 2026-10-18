@@ -25,6 +25,13 @@ mock.module('@/app/actions/suppliers', {
   },
 })
 
+let orderErrors: string[] = []
+mock.module('@/app/actions/import', {
+  namedExports: {
+    importPurchaseOrdersCsv: async (): Promise<CsvImportActionResult> => ({ created: 0, updated: 0, skipped: 1, errors: orderErrors, system: outcome }),
+  },
+})
+
 const outcome = { actor: { runId: 'r', operator: 'o' }, touchedIds: { created: [], updated: [] }, deferredEffects: { shoppingMetadataPush: [], stockSync: [] } }
 const residual = (rows: number): ResidualFile => {
   const text = 'name\r\n' + Array.from({ length: rows }, (_, i) => `S${i}`).join('\r\n') + '\r\n'
@@ -80,5 +87,16 @@ describe('the executor', () => {
     const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
     assert.throws(() => createExecutor({ runId: 'has space', operator: 'Op' }))
     assert.throws(() => createExecutor({ runId: 'ok', operator: '   ' }))
+  })
+
+  it('a purchase order\'s lines are sent grouped, in another order than the file: a message row number is mapped through the call\'s own row list, not shifted', async () => {
+    // Mutation named: shift by the rows sent before (the old rule) -> B1 (line 3 of the residual file) is reported as line 4.
+    const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
+    const text = 'orderKey,sku\r\nA,1\r\nB,1\r\nA,2\r\n'
+    const file: ResidualFile = { name: 'residual-purchase-orders-001.csv', chunk: 1, rows: 3, bytes: new TextEncoder().encode(text), sha256: 'x' }
+    // The call file is A1, A2, B1: B1 is line 4 of it, and line 3 of the residual file.
+    orderErrors = ['Row 4: supplier not found', 'Row 2: bad line']
+    const result = await createExecutor({ runId: 'run-1', operator: 'Op' })('purchase-orders', file, NO_LOCK)
+    assert.deepEqual(result.errors, ['Row 3: supplier not found', 'Row 2: bad line'])
   })
 })

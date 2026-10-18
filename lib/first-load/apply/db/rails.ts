@@ -18,7 +18,7 @@ import { db } from '@/lib/db'
 import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
 import { D, fmtFixed, type Dec } from '../../money'
 import { RUNNER_APPLICATION_NAME, type ApplyStepId } from '../constants'
-import { ownClientPorts } from './own-sessions'
+import { endpointKey, normaliseAddress, ownEndpoints } from './own-sessions'
 import { normaliseTaxValue } from '../normal-form'
 import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import type { PreparedRun } from '../prepared'
@@ -86,20 +86,25 @@ export class QuiesceError extends Error {
  */
 export async function quiesceProblems(): Promise<string[]> {
   const problems: string[] = []
-  const me = (await db.$queryRaw<Array<{ seesAll: boolean; port: number | null }>>`
+  const me = (await db.$queryRaw<Array<{ seesAll: boolean; addr: string | null; port: number | null }>>`
     SELECT (COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) OR pg_has_role(current_user, 'pg_read_all_stats', 'member')) AS "seesAll",
-           inet_server_port() AS port`)[0]
+           host(inet_server_addr()) AS addr, inet_server_port() AS port`)[0]
   if (!me) { problems.push('quiesce: the database did not answer'); return problems }
   if (!me.seesAll) { problems.push('quiesce: this role cannot see other sessions (it needs superuser or pg_read_all_stats), so it cannot prove there are none'); return problems }
-  if (me.port === null) { problems.push('quiesce: this connection is not over TCP, so the runner\'s own sessions cannot be told from another writer\'s'); return problems }
+  const serverAddr = normaliseAddress(me.addr)
+  if (serverAddr === null || me.port === null) { problems.push('quiesce: this connection is not over TCP to a known address, so the runner\'s own sessions cannot be told from another writer\'s'); return problems }
   let foreign = 0
   for (let attempt = 0; attempt < QUIESCE_GRACE_ATTEMPTS; attempt++) {
-    let own: Set<number>
-    try { own = ownClientPorts(me.port) } catch { problems.push('quiesce: the sockets of this process could not be listed, so its own sessions cannot be told from another writer\'s'); return problems }
-    const rows = await db.$queryRaw<Array<{ port: number | null }>>`
-      SELECT client_port AS port FROM pg_stat_activity
+    let own: Set<string>
+    try { own = ownEndpoints({ addr: serverAddr, port: me.port }) } catch { problems.push('quiesce: the sockets of this process could not be listed, so its own sessions cannot be told from another writer\'s'); return problems }
+    const rows = await db.$queryRaw<Array<{ addr: string | null; port: number | null }>>`
+      SELECT host(client_addr) AS addr, client_port AS port FROM pg_stat_activity
        WHERE datname = current_database() AND backend_type = 'client backend' AND pid <> pg_backend_pid()`
-    foreign = rows.filter((r) => r.port === null || r.port < 0 || !own.has(r.port)).length
+    // Ours only if BOTH the address and the port are those of one of our sockets to this server; no address (a Unix socket) or an unusable one is not provable, hence foreign.
+    foreign = rows.filter((r) => {
+      const addr = normaliseAddress(r.addr)
+      return addr === null || r.port === null || r.port < 0 || !own.has(endpointKey(addr, r.port))
+    }).length
     if (foreign === 0) return problems
     await new Promise((resolve) => setTimeout(resolve, QUIESCE_GRACE_MS))
   }

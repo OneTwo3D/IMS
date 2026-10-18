@@ -32,9 +32,15 @@ async function importerFor(step: ApplyStepId): Promise<ImporterAction> {
   }
 }
 
-/** The row numbers in an importer message are relative to the call's file; shift them to the residual file so the report points at one place. */
-function shiftRows(message: string, offset: number): string {
-  return offset === 0 ? message : message.replace(/\b(Row|row|line|Line)\s+(\d+)\b/g, (_whole, word: string, n: string) => `${word} ${Number(n) + offset}`)
+/**
+ * The row numbers in an importer message are lines of the CALL's file (the header is line 1, so data row k is line k + 1); map each to the line of the same row in the residual
+ * file. A purchase order's lines are grouped into one call in a different order than the file, so this is a lookup, not an offset.
+ */
+function mapRows(message: string, rowNumbers: readonly number[]): string {
+  return message.replace(/\b(Row|row|line|Line)\s+(\d+)\b/g, (whole, word: string, n: string) => {
+    const original = rowNumbers[Number(n) - 2]
+    return original === undefined ? whole : `${word} ${original + 1}`
+  })
 }
 
 export interface ExecutorOptions {
@@ -68,7 +74,7 @@ export function createExecutor(options: ExecutorOptions): ApplyPorts['execute'] 
       total.skipped += result.skipped
       if (options.afterCall) await options.afterCall(step, call.index)
       const errors = result.error !== undefined && !result.errors.includes(result.error) ? [...result.errors, result.error] : result.errors
-      for (const message of errors) total.errors.push(shiftRows(message, call.rowOffset))
+      for (const message of errors) total.errors.push(mapRows(message, call.rowNumbers))
     }
     return total
   }

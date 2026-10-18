@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { spawn } from 'node:child_process'
@@ -860,17 +860,48 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         } finally { await spoof.end() }
       })
 
+      it('a session from ANOTHER ADDRESS that uses the very same source port as one of our sockets is still another client', async () => {
+        // Mutation named: match on the client port alone (the old rule) -> the session is admitted as ours and the rail passes: red.
+        await resetData()
+        appendFileSync(join(cluster.data, 'pg_hba.conf'), '\nhost all all 127.0.0.0/8 scram-sha-256\n')
+        socketPsql(cluster, 'select pg_reload_conf();')
+        await m.lock.withStepLock('suppliers', async () => undefined)
+        const server = (await sql<{ addr: string; port: number }>('select host(inet_server_addr()) as addr, inet_server_port() as port'))[0]!
+        const { ownEndpoints, normaliseAddress } = await import('../../lib/first-load/apply/db/own-sessions')
+        const ours = [...ownEndpoints({ addr: normaliseAddress(server.addr)!, port: Number(server.port) })]
+        assert.ok(ours.length > 0, 'precondition: we hold sessions')
+        const sharedPort = Number(ours[0]!.split('|')[1])
+        const script = `const net = require('net'); const pg = require('pg');
+          class S extends net.Socket { connect(port, host) { return super.connect({ port, host, localAddress: '127.0.0.2', localPort: Number(process.env.SHARED_PORT) }) } }
+          const c = new pg.Client({ connectionString: process.env.FOREIGN_URL, application_name: 'other-host', stream: () => new S() });
+          c.connect().then(() => { console.log('ready'); setInterval(() => {}, 1000) }, (e) => { console.error(e.message); process.exit(2) })`
+        const child = spawn(process.execPath, ['-e', script], { cwd: REPO, env: { PATH: process.env.PATH ?? '', FOREIGN_URL: url, SHARED_PORT: String(sharedPort) } as unknown as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+        try {
+          await new Promise<void>((resolve, reject) => {
+            child.stdout!.on('data', (d: Buffer) => { if (String(d).includes('ready')) resolve() })
+            child.stderr!.on('data', (d: Buffer) => reject(new Error(String(d))))
+            child.on('exit', (code) => reject(new Error(`exited ${code}`)))
+            setTimeout(() => reject(new Error('timed out')), 20_000)
+          })
+          const seen = await sql<{ addr: string; port: number }>(`select host(client_addr) as addr, client_port as port from pg_stat_activity where application_name = 'other-host'`)
+          assert.deepEqual(seen.map((r) => [r.addr, r.port]), [['127.0.0.2', sharedPort]], 'precondition: the session really has the same source port from another address')
+          const problems = await m.rails.quiesceProblems()
+          assert.ok(problems.some((p) => /^quiesce: 1 other client session/.test(p)), JSON.stringify(problems))
+        } finally { child.removeAllListeners('exit'); child.kill('SIGKILL') }
+      })
+
       it('every session of THIS process is recognised by its socket, however many the pools hold', async (t) => {
         await resetData()
         // Open several pool connections at once, plus the lock pool.
         await Promise.all(Array.from({ length: 6 }, () => m.db.$queryRaw`select 1 as one from pg_sleep(0.05)`))
         await m.lock.withStepLock('suppliers', async () => undefined)
-        const port = (await sql<{ port: string }>('show port'))[0]!
-        const own = (await import('../../lib/first-load/apply/db/own-sessions')).ownClientPorts(Number(port.port))
-        const sessions = await sql<{ port: number | null }>(`select client_port as port from pg_stat_activity where datname = current_database() and backend_type = 'client backend' and pid <> pg_backend_pid() and application_name = $1`, [RUNNER_APPLICATION_NAME])
+        const server = (await sql<{ addr: string; port: number }>('select host(inet_server_addr()) as addr, inet_server_port() as port'))[0]!
+        const { ownEndpoints, normaliseAddress, endpointKey } = await import('../../lib/first-load/apply/db/own-sessions')
+        const own = ownEndpoints({ addr: normaliseAddress(server.addr)!, port: Number(server.port) })
+        const sessions = await sql<{ addr: string | null; port: number | null }>(`select host(client_addr) as addr, client_port as port from pg_stat_activity where datname = current_database() and backend_type = 'client backend' and pid <> pg_backend_pid() and application_name = $1`, [RUNNER_APPLICATION_NAME])
         precondition(t, 'own sessions seen by the server', sessions.length)
         assert.ok(sessions.length >= 3, `the pools hold several connections (${sessions.length})`)
-        assert.deepEqual(sessions.filter((r) => r.port === null || !own.has(r.port)), [], `each of them is a socket of this process (own ports: ${[...own].join(',')})`)
+        assert.deepEqual(sessions.filter((r) => r.port === null || r.addr === null || !own.has(endpointKey(normaliseAddress(r.addr)!, r.port))), [], `each of them is a socket of this process (own endpoints: ${[...own].join(',')})`)
         assert.deepEqual(await m.rails.quiesceProblems(), [])
       })
 
@@ -1517,10 +1548,13 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('independent rows are cut at the limit, an order is never split, a products file is one call, and the row offsets add up', (t) => {
         const suppliers = new TextEncoder().encode('name\r\n' + Array.from({ length: 5 }, (_, i) => `S${i}`).join('\r\n') + '\r\n')
         const cuts = planImportCalls('suppliers', suppliers, 2)
-        assert.deepEqual(cuts.map((c) => [c.rows, c.rowOffset]), [[2, 0], [2, 2], [1, 4]])
+        assert.deepEqual(cuts.map((c) => [c.rows, c.rowNumbers]), [[2, [1, 2]], [2, [3, 4]], [1, [5]]])
         const products = new TextEncoder().encode('sku,name\r\n' + Array.from({ length: 5 }, (_, i) => `P${i},n`).join('\r\n') + '\r\n')
         assert.equal(planImportCalls('products', products, 2).length, 1, 'products are never cut')
         const orders = new TextEncoder().encode('orderKey,sku\r\nA,1\r\nA,2\r\nA,3\r\nB,1\r\nC,1\r\nC,2\r\n')
+        // Lines of one order are grouped into a call: A1, B1, A2 is sent as A1, A2, B1, and each call row keeps its number in the residual file.
+        const interleaved = planImportCalls('purchase-orders', new TextEncoder().encode('orderKey,sku\r\nA,1\r\nB,1\r\nA,2\r\n'), 10)
+        assert.deepEqual(interleaved.map((c) => c.rowNumbers), [[1, 3, 2]])
         const orderCalls = planImportCalls('purchase-orders', orders, 3)
         assert.deepEqual(orderCalls.map((c) => c.rows), [3, 3], 'A (3 lines) fills a call; B and C share the next')
         for (const call of orderCalls) {

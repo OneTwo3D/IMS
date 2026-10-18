@@ -26,8 +26,8 @@ export interface ImportCall {
   index: number
   bytes: Uint8Array
   rows: number
-  /** Data rows of the residual file before this call's first row: added to the row numbers in the importer's messages. */
-  rowOffset: number
+  /** For each data row of this call, in order: its 1-based data-row number in the RESIDUAL file. A call can hold rows in another order than the file (a purchase order's lines are grouped), so a row number in an importer's message is mapped through this, not shifted. */
+  rowNumbers: number[]
 }
 
 export class ImportCallError extends Error {
@@ -46,6 +46,7 @@ export function planImportCalls(step: ApplyStepId, bytes: Uint8Array, maxRows: n
     throw new ImportCallError('CSV_UNREADABLE')
   }
   const rows = parsed.rows.map((r) => r.cells)
+  const numberOf = new Map<string[], number>(rows.map((row, i) => [row, i + 1]))
   if (rows.length === 0) return []
   const encode = (batch: string[][]): Uint8Array => new TextEncoder().encode(serializeCsv(parsed.header, batch))
 
@@ -73,11 +74,8 @@ export function planImportCalls(step: ApplyStepId, bytes: Uint8Array, maxRows: n
     for (let i = 0; i < rows.length; i += maxRows) batches.push(rows.slice(i, i + maxRows))
   }
 
-  // An order batch is reordered by order, so the row offset is the count of rows sent before it, not the position in the residual file.
-  let sent = 0
   return batches.map((batch, i) => {
-    const call = { index: i + 1, bytes: encode(batch), rows: batch.length, rowOffset: sent }
-    sent += batch.length
+    const call = { index: i + 1, bytes: encode(batch), rows: batch.length, rowNumbers: batch.map((row) => numberOf.get(row)!) }
     if (batch.length > IMPORTER_MAX_ROWS - 1 || call.bytes.length > IMPORTER_MAX_BYTES - 1) throw new ImportCallError('FILE_TOO_LARGE')
     return call
   })
