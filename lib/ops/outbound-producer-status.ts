@@ -1,7 +1,7 @@
 import { OUTBOUND_CONNECTORS, OUTBOUND_CONNECTOR_LABEL, type OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import { explainProducerDisposition, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
 import { producerCutoffFloor, readProducerEnforcement } from '@/lib/security/producer-seam'
-import { WRITER_OWNERSHIP_MAP, type OwnershipRow } from '@/lib/security/writer-ownership-map'
+import { ACCOUNTING_SYNC_TYPE_EXCLUSIONS, WRITER_OWNERSHIP_MAP, type OwnershipRow } from '@/lib/security/writer-ownership-map'
 import { PRODUCER_CUTOFF_ENV, type ProducerAgreementState } from '@/lib/security/producer-disposition-constants'
 
 /**
@@ -180,7 +180,8 @@ export async function readProducerCountsFromDatabase(input: {
     if (destination === 'xero') {
       queued.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] } } })
       sent.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: 'SYNCED', syncedAt: { gte: since } } })
-      if (floor) pre.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] }, createdAt: { lt: floor } } })
+      // A PDF fetch and an e-mail are not writes to Xero: the cut-off does not govern them and the retirement leaves them, so they are not counted.
+      if (floor) pre.syncLog = await db.accountingSyncLog.count({ where: { connector: 'xero', status: { in: ['PENDING', 'PROCESSING'] }, createdAt: { lt: floor }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) as never } } })
     }
     const wmsConnectorIds = wmsConnectorIdsFor(destination)
     if (wmsConnectorIds.length > 0) {

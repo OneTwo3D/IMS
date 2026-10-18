@@ -1713,6 +1713,23 @@ export async function runWmsOrderPushSweepCore(
       }
       if (claim !== 'CLAIMED') continue
 
+      // THE CUT-OFF, RE-DERIVED IMMEDIATELY BEFORE THE SEND. `createFloor` was taken once, when the pass began, and the withdrawal screening and the
+      // claim have since awaited: the floor is asked again NOW. An order that is now paid before it belongs to the bridge and must not be created:
+      // the claim just taken is given back (only if it is still this worker's, and leaving no attempt stamp, exactly as a proven pre-send hold
+      // does) and nothing is sent. The durable claim history stays, so a later retirement parks the link rather than calling it unsent.
+      // No floor in force: nothing is read or written here.
+      const floorBeforeSend = wmsCreateObligationFloor(connectorId, producerContext)
+      if (floorBeforeSend && wmsPaidBeforeCreateFloor(order.paidAt, floorBeforeSend)) {
+        recoveryRefusedCount += 1
+        console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} is paid before the live-from instant as it stands now — claim given back, NOT created`)
+        await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
+          state: 'PENDING_CREATE', attempts: order.pushAttempts,
+          lastError: 'Not sent by IMS: this order was paid before writes to the warehouse went live on this installation, so it belongs to the writer that owned the warehouse then. Check the warehouse before acting.',
+          lastAttemptAt: null,
+        }).catch(() => false)
+        continue
+      }
+
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // `push` is hoisted so the catch can tell "remote create failed" from "remote
       // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
@@ -2595,7 +2612,11 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         })
         if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return 'SKIPPED'
         // The ownership boundary, re-proved on the CURRENT paid time under the lock (see the sweep). Before any write.
-        if (paidNotBefore && wmsPaidBeforeCreateFloor(fresh?.paidAt, paidNotBefore)) return 'REFUSED_PRE_CUTOVER'
+        // The floor the caller took (when its pass began) AND the floor of this moment, the later of the two: a live-from instant that has moved
+        // since is honoured here, under the lock, without the caller having to pass it again.
+        const floorNow = wmsCreateObligationFloor(connector)
+        const claimFloor = paidNotBefore && floorNow ? (floorNow.getTime() > paidNotBefore.getTime() ? floorNow : paidNotBefore) : (paidNotBefore ?? floorNow)
+        if (claimFloor && wmsPaidBeforeCreateFloor(fresh?.paidAt, claimFloor)) return 'REFUSED_PRE_CUTOVER'
 
         // o3d-d82p: a live WooCommerce withdrawal SUPPRESSION is a fulfilment
         // fence in its own right, not just an ingestion guard.

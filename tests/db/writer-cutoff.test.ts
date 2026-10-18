@@ -920,3 +920,96 @@ test('SERVER IDENTITY on a real connection: it is readable by an ordinary role, 
   const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope, { expectedIdentity: identity })
   assert.equal(applied.counts.shadowed, 1, 'CONTROL: the right identity applies')
 })
+
+// ───────────── Mintsoft: the floor is re-derived under the claim lock and again immediately before the send (R7) ─────────────
+//
+// Named mutations (each shown red in the PR): m1 claimForCreate trusts the caller's floor; m2 the pre-send re-derivation is removed;
+// s1 the status count includes the cut-off-exempt types.
+
+const MS_ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'MINTSOFT_WRITE_ALLOWED', 'MINTSOFT_WRITES_LIVE_FROM']
+async function seedMintsoftOrder(d: Deps, tag: string, paidAt: Date) {
+  const warehouse = await d.db.warehouse.create({ data: { code: `${tag}-W`.slice(0, 20), name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
+  const connection = await d.db.wmsConnection.create({ data: { connector: 'mintsoft', label: tag, active: true }, select: { id: true } })
+  const binding = await d.db.externalWmsBinding.create({
+    data: { connectionId: connection.id, warehouseId: warehouse.id, connector: 'mintsoft', externalWarehouseId: `ext-${tag}`, active: true, stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: new Date() },
+    select: { id: true },
+  })
+  const order = await d.db.salesOrder.create({
+    data: {
+      orderNumber: `MSC-${tag}`, status: 'PROCESSING', paidAt, shipFromWarehouseId: warehouse.id, customerName: 'Pat Example', customerEmail: 'pat@example.com',
+      currency: 'GBP', shippingAddress: { line1: '1 Test Street', city: 'Leeds', postcode: 'LS1 1AA', country: 'GB' },
+      subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10,
+      lines: { create: [{ description: 'Widget', sku: `SKU-${tag}`, qty: 1, unitPriceForeign: 10, unitPriceBase: 10, totalForeign: 10, totalBase: 10 }] },
+    },
+    select: { id: true },
+  })
+  return { warehouseId: warehouse.id, connectionId: connection.id, bindingId: binding.id, orderId: order.id }
+}
+async function cleanupMintsoftOrder(d: Deps, s: { warehouseId: string; connectionId: string; bindingId: string; orderId: string }) {
+  await d.db.wmsOrderPushLink.deleteMany({ where: { orderId: s.orderId } })
+  await d.db.outboundShadowWrite.deleteMany({ where: { subjectId: s.orderId } })
+  await d.db.salesOrderLine.deleteMany({ where: { orderId: s.orderId } })
+  await d.db.salesOrder.deleteMany({ where: { id: s.orderId } })
+  await d.db.externalWmsBinding.deleteMany({ where: { id: s.bindingId } })
+  await d.db.wmsConnection.deleteMany({ where: { id: s.connectionId } })
+  await d.db.warehouse.deleteMany({ where: { id: s.warehouseId } })
+}
+const msConnector = () => {
+  const calls: string[] = []
+  return {
+    calls,
+    connector: {
+      pushOrder: async (input: { orderNumber: string }) => { calls.push(`pushOrder:${input.orderNumber}`); return { externalOrderId: 'wms-c-1', externalOrderNumber: 'WN-C-1', status: 'NEW' } },
+      updateOrder: async () => ({ updated: true, status: 'NEW' }), cancelOrder: async () => ({ cancelled: true, status: 'CANCELLED' }),
+      addOrderComment: async () => undefined, verifyPushedOrder: async () => 'ours' as const, probeOrderPresence: async () => 'MISSING' as const,
+    },
+  }
+}
+
+test('MINTSOFT CREATE: a live-from instant that moves after the pass began is honoured under the claim lock AND again immediately before the send; with it unmoved the order is created', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `msc${randomUUID().slice(0, 8)}`
+  const seeded = await seedMintsoftOrder(d, tag, new Date('2026-06-10T00:00:00Z'))
+  t.after(() => cleanupMintsoftOrder(d, seeded))
+  const base = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'mintsoft', MINTSOFT_WRITE_ALLOWED: 'https://wms.example.test|89', MINTSOFT_WRITES_LIVE_FROM: '2026-06-01T00:00:00Z' }
+  const MOVED = '2026-06-20T00:00:00Z'   // after the order was paid, still in the past
+  const real = d.sweep.createPrismaWmsOrderPushPort()
+  const run = async (hook: 'none' | 'before-claim' | 'after-claim') => withEnv(base, async () => {
+    const port = {
+      ...real,
+      verifyWithdrawalFence: async (id: string) => { if (hook === 'before-claim') process.env.MINTSOFT_WRITES_LIVE_FROM = MOVED; return real.verifyWithdrawalFence ? real.verifyWithdrawalFence(id) : true },
+      claimForCreate: async (...args: Parameters<typeof real.claimForCreate>) => { const r = await real.claimForCreate(...args); if (hook === 'after-claim') process.env.MINTSOFT_WRITES_LIVE_FROM = MOVED; return r },
+    }
+    const double = msConnector()
+    await d.sweep.runWmsOrderPushSweepCore(double.connector as never, 'mintsoft', port as never, { batchSize: 1000 })
+    return double.calls.filter((c) => c.startsWith('pushOrder') && c.endsWith(`MSC-${tag}`))
+  })
+  const link = () => d.db.wmsOrderPushLink.findUnique({ where: { orderId: seeded.orderId }, select: { state: true, attempts: true, lastAttemptAt: true, firstClaimedAt: true, lastError: true } })
+
+  assert.deepEqual(await run('before-claim'), [], 'moved before the claim: the claim, under the lock, refuses; nothing is sent')
+  assert.equal(await link(), null, 'and no link was written')
+  assert.deepEqual(await run('after-claim'), [], 'moved after the claim: the send is refused')
+  const given = await link()
+  console.log(`# given back: ${JSON.stringify(given && { state: given.state, lastAttemptAt: given.lastAttemptAt, claimed: given.firstClaimedAt !== null })}`)
+  assert.equal(given?.state, 'PENDING_CREATE')
+  assert.equal(given?.lastAttemptAt, null, 'the claim stamp is given back, as for a proven pre-send hold')
+  assert.notEqual(given?.firstClaimedAt, null, 'the durable claim history stays: a later retirement parks it, never calls it unsent')
+  assert.match(String(given?.lastError), /Check the warehouse before acting/)
+  await d.db.wmsOrderPushLink.deleteMany({ where: { orderId: seeded.orderId } })
+  assert.deepEqual(await run('none'), [`pushOrder:MSC-${tag}`], 'CONTROL: nothing moved, the same order is created')
+})
+
+test('STATUS: pre-cutoff-queued does not count the Xero types the cut-off exempts (a PDF fetch, an e-mail)', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupSync(d, tag))
+  const { readProducerCountsFromDatabase } = await import('../../lib/ops/outbound-producer-status.ts')
+  const env = xeroLive()
+  const read = async () => (await readProducerCountsFromDatabase({ destinations: ['xero'], now: new Date(), env })).byDestination.xero!.preCutoffQueued.syncLog
+  const before = await withEnv(env, read)
+  await seedSyncLog(d, `${tag}-pdf`, { createdAt: BEFORE, type: 'INVOICE_PDF' })
+  await seedSyncLog(d, `${tag}-mail`, { createdAt: BEFORE, type: 'INVOICE_EMAIL' })
+  assert.equal(await withEnv(env, read), before, 'exempt types are not counted')
+  await seedSyncLog(d, `${tag}-journal`, { createdAt: BEFORE, type: 'STOCK_RECEIPT' })
+  assert.equal(await withEnv(env, read), before + 1, 'CONTROL: a write type is')
+})
