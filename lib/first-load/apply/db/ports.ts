@@ -20,7 +20,7 @@ import { db } from '@/lib/db'
 import { StepLockError, type StepLock } from '../orchestrate'
 import { withStepLock } from './lock'
 import { observeStep } from './observe'
-import { currentTaxProfiles, evaluateRails } from './rails'
+import { QuiesceError, currentTaxProfiles, evaluateRails, quiesceProblems } from './rails'
 
 export interface DbPortsOptions {
   /** Who the activity log names for the rows the importers write. */
@@ -36,6 +36,8 @@ function guardBeforeCall(prepared: PreparedRun) {
   return async (_step: ApplyStepId, lock: StepLock): Promise<void> => {
     if (!lock) throw new StepLockError('lost')
     await lock.assertLive()
+    // And again nobody else is connected: a session that appears between two calls stops the file before the next one.
+    if ((await quiesceProblems()).length > 0) throw new QuiesceError()
     let row
     try {
       row = await db.firstLoadApplyRun.findFirst({ select: { manifestDigest: true, runId: true, status: true } })

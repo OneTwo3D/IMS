@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
-import pg from 'pg'
+import { spawn } from 'node:child_process'
 
 import { freePort, startCluster, type Cluster } from '../scripts/real-postgres-cluster'
 import { databaseUrl, ident, inheritedEnv, randomHex, runChild, socketPsql, tail, withClient } from '../../scripts/rehearse-first-install'
@@ -807,10 +807,16 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
     })
 
     describe('the quiesce rail: no other writer is connected to the database', () => {
-      const foreignClient = async (applicationName = 'psql'): Promise<pg.Client> => {
-        const client = new pg.Client({ connectionString: url, application_name: applicationName })
-        await client.connect()
-        return client
+      // A session from ANOTHER PROCESS (a child that holds one connection): a client in this process would be this process's own socket, which the rail rightly counts as the runner's.
+      const foreignClient = async (applicationName = 'psql'): Promise<{ end(): Promise<void> }> => {
+        const script = `const pg = require('pg'); const c = new pg.Client({ connectionString: process.env.FOREIGN_URL, application_name: process.env.FOREIGN_APP }); c.connect().then(() => { console.log('ready'); setInterval(() => {}, 1000) }, (e) => { console.error(e.message); process.exit(2) })`
+        const child = spawn(process.execPath, ['-e', script], { cwd: REPO, env: { PATH: process.env.PATH ?? '', FOREIGN_URL: url, FOREIGN_APP: applicationName } as unknown as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+        await new Promise<void>((resolve, reject) => {
+          child.stdout!.on('data', (d: Buffer) => { if (String(d).includes('ready')) resolve() })
+          child.on('exit', (code) => reject(new Error(`the foreign session process exited (${code})`)))
+          setTimeout(() => reject(new Error('the foreign session did not connect')), 20_000)
+        })
+        return { end: async () => { child.removeAllListeners('exit'); child.kill('SIGKILL'); await new Promise((r) => child.once('exit', r)) } }
       }
       const counts = async () => ({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), suppliers: await count('suppliers') })
 
@@ -841,9 +847,55 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('quiesce:')), [], 'gone: accepted again')
       })
 
+      it('a foreign session that copies the runner\'s application_name is still another client (the label proves nothing)', async () => {
+        // Mutation named: exclude sessions by application_name (the old rule) -> the spoofing session is not counted and the rail passes: red.
+        await resetData()
+        const spoof = await foreignClient(RUNNER_APPLICATION_NAME)
+        try {
+          const problems = await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })
+          assert.ok(problems.some((p) => /^quiesce: 1 other client session\(s\)/.test(p)), JSON.stringify(problems))
+          const result = await runLoad(prepared, ports(), apply(prepared))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED')
+          assert.equal(await count('suppliers'), 0)
+        } finally { await spoof.end() }
+      })
+
+      it('every session of THIS process is recognised by its socket, however many the pools hold', async (t) => {
+        await resetData()
+        // Open several pool connections at once, plus the lock pool.
+        await Promise.all(Array.from({ length: 6 }, () => m.db.$queryRaw`select 1 as one from pg_sleep(0.05)`))
+        await m.lock.withStepLock('suppliers', async () => undefined)
+        const port = (await sql<{ port: string }>('show port'))[0]!
+        const own = (await import('../../lib/first-load/apply/db/own-sessions')).ownClientPorts(Number(port.port))
+        const sessions = await sql<{ port: number | null }>(`select client_port as port from pg_stat_activity where datname = current_database() and backend_type = 'client backend' and pid <> pg_backend_pid() and application_name = $1`, [RUNNER_APPLICATION_NAME])
+        precondition(t, 'own sessions seen by the server', sessions.length)
+        assert.ok(sessions.length >= 3, `the pools hold several connections (${sessions.length})`)
+        assert.deepEqual(sessions.filter((r) => r.port === null || !own.has(r.port)), [], `each of them is a socket of this process (own ports: ${[...own].join(',')})`)
+        assert.deepEqual(await m.rails.quiesceProblems(), [])
+      })
+
+      it('a session that appears in the middle of a step stops the file before its NEXT importer call: at most one bounded call of rows is written', async () => {
+        // Mutation named: drop the quiesce check from the per-call guard -> all four opening layers are written by the runner while another session is connected: red.
+        await resetData()
+        const holder: { client: { end(): Promise<void> } | null } = { client: null }
+        const small = m.ports.createDbPorts(prepared, {
+          operator: 'Apply Test',
+          maxRowsPerCall: 1,
+          afterCall: async (step, call) => { if (step === 'opening-stock' && call === 1 && holder.client === null) holder.client = await foreignClient('late-worker') },
+        })
+        try {
+          const result = await runLoad(prepared, small, apply(prepared))
+          assert.equal(result.exit, 'STEP_FAILED')
+          const stock = result.steps.find((x) => x.step === 'opening-stock')!
+          assert.match(stock.error ?? '', /QuiesceError/)
+          assert.equal(await count('cost_layers'), 1, 'exactly the one call that was already made')
+          assert.equal(await count('purchase_orders'), 0, 'and no later step ran')
+        } finally { await holder.client?.end() }
+      })
+
       it('a session that connects BETWEEN steps refuses the next step (its start rail), and the earlier step stays done', async () => {
         await resetData()
-        const holder: { client: pg.Client | null } = { client: null }
+        const holder: { client: { end(): Promise<void> } | null } = { client: null }
         const real = ports()
         const connecting: ApplyPorts = {
           ...real,
@@ -865,7 +917,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
 
       it('a session that appears after the step-start check but before the first write refuses the write (the third check)', async () => {
         await resetData()
-        const holder: { client: pg.Client | null } = { client: null }
+        const holder: { client: { end(): Promise<void> } | null } = { client: null }
         const real = ports()
         let startChecks = 0
         const connecting: ApplyPorts = {

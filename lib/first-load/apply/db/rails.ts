@@ -18,6 +18,7 @@ import { db } from '@/lib/db'
 import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
 import { D, fmtFixed, type Dec } from '../../money'
 import { RUNNER_APPLICATION_NAME, type ApplyStepId } from '../constants'
+import { ownClientPorts } from './own-sessions'
 import { normaliseTaxValue } from '../normal-form'
 import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import type { PreparedRun } from '../prepared'
@@ -63,32 +64,51 @@ export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Pr
   }
 }
 
+/** Thrown by the per-call guard when another client session is connected: the file stops before its next importer call. */
+export class QuiesceError extends Error {
+  constructor() {
+    super('another client session is connected to the database')
+    this.name = 'QuiesceError'
+  }
+}
+
 /**
  * THE QUIESCE RAIL. The first load runs against a database that NO other writer is connected to: the application, its workers and its cron jobs are stopped first. The step lock
  * only excludes other first-load runners; an ordinary request could create or change a row between the read and the import, and the importer would update it from the file,
  * which the read-back would then report as "created". The rail proves what it can: no other client session is connected to this database right now.
  *
- * Every other client backend of the current database is another writer (a psql session counts: it can write). Background and system backends (autovacuum, WAL, statistics) are
- * not client backends and are ignored. Sessions of this runner are recognised by their application_name; the rail refuses to run if its own session does not carry it, and if the
- * role cannot see other sessions' details (it needs superuser or pg_read_all_stats), because a blind count is not a count. An unreadable view is a refusal.
+ * Every client backend of the current database that is not PROVABLY this process's own is another writer (a psql session counts: it can write). Background and system backends
+ * (autovacuum, WAL, statistics) are not client backends and are ignored. A session is this process's own only if its client port is the local port of one of this process's sockets
+ * to the server (own-sessions.ts); its application_name is a label and proves nothing, so a foreign session that copies the runner's name is counted. The rail refuses when the role
+ * cannot see other sessions' details (it needs superuser or pg_read_all_stats: a blind count is not a count), when this process's sockets cannot be listed, and when the view is unreadable.
+ *
+ * Evaluated in the preflight, at each step's start, before each step's first write AND before every bounded importer call (`quiesceProblems` in the per-call guard).
  */
-async function quiesced(problems: string[]): Promise<void> {
-  const me = (await db.$queryRaw<Array<{ app: string; seesAll: boolean }>>`
-    SELECT current_setting('application_name') AS app,
-           (COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) OR pg_has_role(current_user, 'pg_read_all_stats', 'member')) AS "seesAll"`)[0]
-  if (!me || me.app !== RUNNER_APPLICATION_NAME) { problems.push('quiesce: the runner\'s own database connections are not tagged, so they cannot be told from another writer\'s (set PGAPPNAME before the first connection)'); return }
-  if (!me.seesAll) { problems.push('quiesce: this role cannot see other sessions (it needs superuser or pg_read_all_stats), so it cannot prove there are none'); return }
+export async function quiesceProblems(): Promise<string[]> {
+  const problems: string[] = []
+  const me = (await db.$queryRaw<Array<{ seesAll: boolean; port: number | null }>>`
+    SELECT (COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) OR pg_has_role(current_user, 'pg_read_all_stats', 'member')) AS "seesAll",
+           inet_server_port() AS port`)[0]
+  if (!me) { problems.push('quiesce: the database did not answer'); return problems }
+  if (!me.seesAll) { problems.push('quiesce: this role cannot see other sessions (it needs superuser or pg_read_all_stats), so it cannot prove there are none'); return problems }
+  if (me.port === null) { problems.push('quiesce: this connection is not over TCP, so the runner\'s own sessions cannot be told from another writer\'s'); return problems }
   let foreign = 0
   for (let attempt = 0; attempt < QUIESCE_GRACE_ATTEMPTS; attempt++) {
-    const row = (await db.$queryRaw<Array<{ n: bigint }>>`
-      SELECT count(*) AS n FROM pg_stat_activity
-       WHERE datname = current_database() AND backend_type = 'client backend' AND pid <> pg_backend_pid()
-         AND COALESCE(application_name, '') <> ${RUNNER_APPLICATION_NAME}`)[0]
-    foreign = Number(row?.n ?? 0)
-    if (foreign === 0) return
+    let own: Set<number>
+    try { own = ownClientPorts(me.port) } catch { problems.push('quiesce: the sockets of this process could not be listed, so its own sessions cannot be told from another writer\'s'); return problems }
+    const rows = await db.$queryRaw<Array<{ port: number | null }>>`
+      SELECT client_port AS port FROM pg_stat_activity
+       WHERE datname = current_database() AND backend_type = 'client backend' AND pid <> pg_backend_pid()`
+    foreign = rows.filter((r) => r.port === null || r.port < 0 || !own.has(r.port)).length
+    if (foreign === 0) return problems
     await new Promise((resolve) => setTimeout(resolve, QUIESCE_GRACE_MS))
   }
   problems.push(`quiesce: ${foreign} other client session(s) are connected to this database; stop the application, its workers and its cron jobs before the load`)
+  return problems
+}
+
+async function quiesced(problems: string[]): Promise<void> {
+  problems.push(...await quiesceProblems())
 }
 
 async function baseCurrency(prepared: PreparedRun, problems: string[]): Promise<void> {
