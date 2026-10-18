@@ -460,40 +460,54 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
     })
     if (updated.count === 0) throw new RetirementConflict('the row changed while it was being retired')
     await attachShadowSyncLog(tx, recorded.id, row.id)
-    await voidMirrorUnlessAnotherAttemptIsLive(tx, row)
-    return { item, result: 'shadowed', detail: verdict.reason }
+    const mirrorNote = await mirrorBlockedBySibling(tx, row)
+    if (mirrorNote === null) {
+      await updateMirroredAccountingEventStatus(tx, {
+        connector: 'xero', syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId,
+        payload: row.payload, status: 'VOID', voidBasis: HELD_SHADOW_VOID_BASIS,
+      })
+    }
+    return { item, result: 'shadowed', detail: mirrorNote === null ? verdict.reason : `${verdict.reason}; ${mirrorNote}` }
   }
   const updated = await tx.accountingSyncLog.updateMany({
     where: guard,
     data: { status: 'FAILED', errorMessage: notice, attemptRevision: { increment: 1 } },
   })
   if (updated.count === 0) throw new RetirementConflict('the row changed while it was being parked')
-  await updateMirroredAccountingEventStatus(tx, {
-    connector: 'xero', syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId,
-    payload: row.payload, status: 'FAILED', message: notice,
-  })
-  return { item, result: 'parked', detail: verdict.reason }
+  const parkMirrorNote = await mirrorBlockedBySibling(tx, row)
+  if (parkMirrorNote === null) {
+    await updateMirroredAccountingEventStatus(tx, {
+      connector: 'xero', syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId,
+      payload: row.payload, status: 'FAILED', message: notice,
+    })
+  }
+  return { item, result: 'parked', detail: parkMirrorNote === null ? verdict.reason : `${verdict.reason}; ${parkMirrorNote}` }
 }
 
 /**
- * The mirrored accounting event is shared by every attempt at one document. It is retired only when no other attempt is live
- * (queued, claimed or posted) for the same document; otherwise another attempt owns it and it is left exactly as it is.
+ * The mirrored accounting event is shared by every attempt at one document, so it is only written for a retirement when NO other attempt
+ * at that document could still owe it a say. A sibling attempt blocks, whatever its status (queued, claimed, posted, FAILED or settled by an
+ * operator), unless it is provably inert: CANCELLED with no document id, no create-dispatch marker, no remote-attempt stamp and no settlement
+ * basis other than the held-shadow one. A FAILED attempt in particular has an unverified remote outcome: voiding the shared event with a
+ * non-revivable basis would say IMS no longer owes a document whose earlier attempt may have posted it. Returns why the event was left
+ * untouched, or null when it was written.
  */
-async function voidMirrorUnlessAnotherAttemptIsLive(
+async function mirrorBlockedBySibling(
   tx: Prisma.TransactionClient,
-  row: { id: string; type: string; referenceType: string; referenceId: string; payload: unknown },
-): Promise<void> {
-  const siblings = await tx.accountingSyncLog.count({
+  row: { id: string; type: string; referenceType: string; referenceId: string },
+): Promise<string | null> {
+  const blocking = await tx.accountingSyncLog.findFirst({
     where: {
       connector: 'xero', type: row.type as never, referenceType: row.referenceType, referenceId: row.referenceId,
-      id: { not: row.id }, status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+      id: { not: row.id },
+      NOT: {
+        status: 'CANCELLED', externalTransactionId: null, createDispatchedAt: null, remoteAttemptedAt: null,
+        OR: [{ settlementBasis: null }, { settlementBasis: HELD_SHADOW_SETTLEMENT_BASIS }],
+      },
     },
+    select: { id: true, status: true },
   })
-  if (siblings > 0) return
-  await updateMirroredAccountingEventStatus(tx, {
-    connector: 'xero', syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId,
-    payload: row.payload, status: 'VOID', voidBasis: HELD_SHADOW_VOID_BASIS,
-  })
+  return blocking ? `the mirrored accounting event was left untouched: another attempt at the same document (${blocking.id}, ${blocking.status}) is live or has an unverified outcome` : null
 }
 
 async function retireOutboxJob(tx: Prisma.TransactionClient, item: RetirementItem, scope: RetirementScope, now: Date): Promise<RetirementOutcome> {

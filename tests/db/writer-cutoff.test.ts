@@ -700,3 +700,98 @@ test('LINK HISTORY: a link that was claimed and then reset (attempts and attempt
   await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
   for (const id of ids) assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { id }, select: { state: true } }))?.state, 'AMBIGUOUS_CREATE')
 })
+
+// ───────────── the history fails CLOSED in the database; a shared mirrored event is never voided over an unresolved sibling ─────────────
+//
+// Named mutations (each shown red in the PR): f1 the outbox/link triggers are dropped; f2 the false->true guard is dropped; f3 the sibling check
+// ignores FAILED siblings; f4 the sibling check ignores send evidence on a CANCELLED sibling.
+
+test('DATABASE GUARD (outbox): a claim by a binary that does not stamp forfeits the tracked flag, so replay then a hold refusal PARKS the job; the flag can never go false -> true by UPDATE', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupJobs(d, `woocommerce:stock.push:${tag}`))
+  const savedKey = process.env.SETTINGS_ENCRYPTION_KEY
+  if (!savedKey) process.env.SETTINGS_ENCRYPTION_KEY = 'prod_readiness_ci_settings_key__'
+  t.after(() => { if (!savedKey) delete process.env.SETTINGS_ENCRYPTION_KEY })
+  const held = (await import('../../lib/security/outbound-write-hold-constants.ts')).outboundHeldMessage({
+    connector: 'woocommerce', code: 'no_grant', granted: null, attempted: null, method: 'PUT', target: 'https://shop.example.test/wp-json/x', hop: 0,
+  })
+  const key = `woocommerce:stock.push:${tag}-old-binary`
+  const row = (await d.outbox.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'stock.push', idempotencyKey: key, payloadJson: { productId: key, reason: 'IMS_CHANGE', force: false } })) as { id: string }
+  await d.db.integrationOutbox.update({ where: { id: row.id }, data: { createdAt: BEFORE } })
+  const read = () => d.db.integrationOutbox.findUnique({ where: { id: row.id }, select: { attemptHistoryTracked: true, firstAttemptedAt: true, attempts: true, status: true } })
+  assert.equal((await read())?.attemptHistoryTracked, true, 'precondition: created tracked')
+  // An OLDER binary claims it: the status moves to PROCESSING and nothing writes the stamp.
+  await d.db.integrationOutbox.update({ where: { id: row.id }, data: { status: 'PROCESSING', lockedAt: new Date(), lockedBy: 'old-binary' } })
+  const afterOld = await read()
+  console.log(`# old-binary claim: tracked=${afterOld?.attemptHistoryTracked} stamp=${afterOld?.firstAttemptedAt}`)
+  assert.equal(afterOld?.attemptHistoryTracked, false, 'the database forfeited the history of an unstamped claim')
+  await d.db.integrationOutbox.update({ where: { id: row.id }, data: { status: 'PERMANENT_FAILED', lockedAt: null, lockedBy: null, attempts: 5 } })
+  await withEnv({}, async () => { await d.admin.replayIntegrationOutboxAdminRow({ id: row.id }) })    // attempts -> 0, error cleared
+  const claimed = (await d.outbox.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'stock.push', idempotencyKeys: [key], limit: 1, workerId: 'new-binary' }))[0]!
+  await d.outbox.markIntegrationOutboxRetryableFailure({ id: row.id, workerId: 'new-binary', lockedAt: claimed.lockedAt!, error: held, attemptsBeforeFailure: 0, retryDelayMs: 1000 })
+  const after = await read()
+  assert.deepEqual([after?.attemptHistoryTracked, after?.attempts, after?.status], [false, 0, 'RETRYABLE_FAILED'], 'it now looks like a never-attempted job that was only held, but it is untracked')
+  // The flag cannot be switched back on by an update (a replay, a re-arm or a careless script).
+  await d.db.integrationOutbox.update({ where: { id: row.id }, data: { attemptHistoryTracked: true } })
+  assert.equal((await read())?.attemptHistoryTracked, false, 'false -> true by UPDATE is refused')
+  const scope = { destinations: ['woocommerce' as const], cutoffs: { woocommerce: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const item = plan.items.find((i: { id: string }) => i.id === row.id)
+  assert.equal(item?.classification.disposition, 'PARK', 'PARKED, never shadowed')
+  await d.retire.applyHeldBacklogRetirement({ ...plan, items: [item!] }, scope)
+  assert.equal((await read())?.status, 'PERMANENT_FAILED')
+})
+
+test('DATABASE GUARD (link): an unstamped claim, an attempts increment or a warehouse id forfeits the claim history; the real claim stamps in the SAME statement and keeps it; false -> true is refused', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  const oldClaim = await seedLinkedOrder(d, `${tag}o`, BEFORE, {})
+  const realClaim = await seedLinkedOrder(d, `${tag}n`, BEFORE, {})
+  t.after(async () => { for (const s of [oldClaim, realClaim]) await cleanupLinked(d, s) })
+  const read = (id: string) => d.db.wmsOrderPushLink.findUnique({ where: { id }, select: { claimHistoryTracked: true, firstClaimedAt: true } })
+  assert.deepEqual(await read(oldClaim.linkId).then((r: { claimHistoryTracked: boolean } | null) => r?.claimHistoryTracked), true)
+  await d.db.wmsOrderPushLink.update({ where: { id: oldClaim.linkId }, data: { lastAttemptAt: new Date() } })   // an older binary's claim: no stamp
+  assert.equal((await read(oldClaim.linkId))?.claimHistoryTracked, false, 'forfeited')
+  await d.db.wmsOrderPushLink.update({ where: { id: oldClaim.linkId }, data: { claimHistoryTracked: true, lastAttemptAt: null, attempts: 0 } })
+  assert.equal((await read(oldClaim.linkId))?.claimHistoryTracked, false, 'false -> true refused, even after the attempt fields were reset')
+  // The real claim on an existing tracked link with no stamp (the UPDATE branch) stamps and keeps the history.
+  const outcome = await d.sweep.createPrismaWmsOrderPushPort().claimForCreate(realClaim.orderId, 'mintsoft', new Date())
+  assert.equal(outcome, 'CLAIMED')
+  const kept = await read(realClaim.linkId)
+  assert.deepEqual([kept?.claimHistoryTracked, kept?.firstClaimedAt !== null], [true, true], 'a self-stamping claim is unaffected')
+})
+
+test('SHARED MIRRORED EVENT: a FAILED sibling attempt (with or without send evidence) blocks voiding the event; an inert CANCELLED sibling does not', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupSync(d, tag))
+  const payload = (ref: string) => ({ date: '2026-06-01', narration: ref, lines: [{ description: 'Inventory', accountCode: '630', debit: 5 }, { description: 'Allocated Inventory', accountCode: '631', credit: 5 }] })
+  const refs = { failedBare: `${tag}-fb`, failedSent: `${tag}-fs`, inert: `${tag}-in`, cancelledSent: `${tag}-cs` }
+  await withSettings(d, () => withEnv({}, async () => {
+    for (const ref of Object.values(refs)) {
+      await d.db.$transaction(async (tx: Tx) => { await d.accounting.queueAccountingSyncTxWithOutcome(tx, { type: 'UNEARNED_REV_REVERSAL', connector: 'xero', referenceType: 'CogsEntry', referenceId: ref, chartConnector: 'xero', payload: payload(ref) } as never) }, { timeout: 60_000 })
+    }
+  }))
+  const queued = async (ref: string) => (await d.db.accountingSyncLog.findFirst({ where: { referenceId: ref }, select: { id: true, type: true, payload: true } }))!
+  const rows = { failedBare: await queued(refs.failedBare), failedSent: await queued(refs.failedSent), inert: await queued(refs.inert), cancelledSent: await queued(refs.cancelledSent) }
+  const sibling = (ref: string, over: Record<string, unknown>) => seedSyncLog(d, ref, { type: 'UNEARNED_REV_REVERSAL', referenceType: 'CogsEntry', payload: payload(ref), createdAt: BEFORE, ...over })
+  await sibling(refs.failedBare, { status: 'FAILED', attemptRevision: 1, retryCount: 2 })
+  await sibling(refs.failedSent, { status: 'FAILED', attemptRevision: 1, retryCount: 2, externalTransactionId: `X-${tag}` })
+  await sibling(refs.inert, { status: 'CANCELLED' })
+  await sibling(refs.cancelledSent, { status: 'CANCELLED', externalTransactionId: `X-${tag}-c` })
+  const scope = { destinations: ['xero' as const], cutoffs: { xero: new Date(Date.now() + 60_000) }, allQueued: false, limit: 5000 }
+  const plan = await d.retire.planHeldBacklogRetirement(scope)
+  const mine = plan.items.filter((item: { id: string }) => Object.values(rows).some((r) => r.id === item.id))
+  assert.equal(mine.length, 4)
+  const applied = await d.retire.applyHeldBacklogRetirement({ ...plan, items: mine }, scope)
+  const event = async (ref: string) => (await d.db.accountingEvent.findFirst({ where: { sourceEntityId: ref }, select: { status: true, voidBasis: true } }))
+  const detail = (id: string) => applied.outcomes.find((o: { item: { id: string } }) => o.item.id === id)?.detail
+  console.log(`# mirror: failedBare=${(await event(refs.failedBare))?.status} failedSent=${(await event(refs.failedSent))?.status} inert=${(await event(refs.inert))?.status}`)
+  assert.notEqual((await event(refs.failedBare))?.status, 'VOID', 'a FAILED sibling has an unverified outcome')
+  assert.notEqual((await event(refs.failedSent))?.status, 'VOID', 'and one with send evidence certainly does')
+  assert.notEqual((await event(refs.cancelledSent))?.status, 'VOID', 'a CANCELLED sibling that names a document is not inert')
+  assert.match(String(detail(rows.failedBare.id)), /mirrored accounting event was left untouched/)
+  assert.match(String(detail(rows.failedSent.id)), /mirrored accounting event was left untouched/)
+  assert.deepEqual([(await event(refs.inert))?.status, (await event(refs.inert))?.voidBasis], ['VOID', 'held_shadow'], 'CONTROL: an inert cancelled sibling does not block the retirement of the mirror')
+})

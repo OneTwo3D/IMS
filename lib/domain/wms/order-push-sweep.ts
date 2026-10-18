@@ -2649,7 +2649,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
 
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
-          select: { state: true, attempts: true, lastAttemptAt: true },
+          select: { state: true, attempts: true, lastAttemptAt: true, firstClaimedAt: true },
         })
         // o3d-38gl: refuses while another worker's claim is still fresh. Without the lease,
         // PENDING_CREATE is merely a state that every waiting worker passes, and they all push.
@@ -2685,9 +2685,10 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           where: { orderId },
           // The durable claim history: this binary stamps the first claim (before any request can leave) and marks the row tracked at creation.
           create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt, claimHistoryTracked: true, firstClaimedAt: attemptedAt },
-          update: { lastAttemptAt: attemptedAt },
+          // ONE statement: the database forfeits the history of any claim that does not stamp itself (see the migration), so the stamp must be written
+          // by the very statement that moves lastAttemptAt.
+          update: { lastAttemptAt: attemptedAt, ...(existing?.firstClaimedAt ? {} : { firstClaimedAt: attemptedAt }) },
         })
-        await tx.wmsOrderPushLink.updateMany({ where: { orderId, firstClaimedAt: null }, data: { firstClaimedAt: attemptedAt } })
         return 'CLAIMED'
       })
     },
