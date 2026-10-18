@@ -19,14 +19,13 @@ import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/pu
 import { D, fmtFixed, type Dec } from '../../money'
 import { RUNNER_APPLICATION_NAME, type ApplyStepId } from '../constants'
 import { endpointKey, normaliseAddress, ownEndpoints } from './own-sessions'
+import { FRESH_RUN_MAY_HOLD, TABLE_CLASSES, tablesOfKind } from '../table-classes'
 import { normaliseTaxValue } from '../normal-form'
 import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import type { PreparedRun } from '../prepared'
 import { ObservationError } from '../residual'
 import { DATABASE_READ_FAILED } from './observe'
 
-/** The tables the base currency locks on (lib/base-currency.ts isBaseCurrencyLocked): any row in one of them means the target is not empty. */
-const LOCKING_COUNTS = ['product', 'supplier', 'customer', 'purchaseOrder', 'salesOrder', 'stockMovement'] as const
 
 /** How long a session that is closing is given to leave before it counts as another writer. A real one does not leave. */
 const QUIESCE_GRACE_ATTEMPTS = 10
@@ -49,10 +48,10 @@ export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Pr
     const relevant = (step: ApplyStepId): boolean => selected.has(step) && (scope.step === null || scope.step === step)
 
     await quiesced(problems)
-    await tablesTheRunnerNeverWrites(problems)
+    await dataClasses(problems, scope.phase === 'preflight' && !scope.resuming)
     await baseCurrency(prepared, problems)
     await forbiddenSkus(prepared, problems)
-    if (scope.phase === 'preflight' && !scope.resuming) await emptyTarget(problems)
+    if (scope.phase === 'preflight' && !scope.resuming) await baseCurrencyNotLocked(problems)
     if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await warehouses(prepared, problems)
     if (relevant('purchase-orders')) {
       await fxRates(prepared, problems)
@@ -132,20 +131,37 @@ async function forbiddenSkus(prepared: PreparedRun, problems: string[]): Promise
 }
 
 /**
- * Tables this runner never creates a row in, checked on EVERY evaluation (a resume too): the empty-target rail covers a fresh run, but a resume trusts the run record, so customers and
- * sales orders that appeared since (the application was up between a crash and the resume) would otherwise go unseen. Products, suppliers, purchase orders and stock movements are
- * observed row by row (every row is either emitted by the run or reported as foreign), so they need no count here.
+ * THE DATA CLASSES (table-classes.ts): every table of the schema is RUNNER_WRITES, CONFIG_ALLOWED or MUST_BE_EMPTY.
+ *   - every evaluation (a first run, each step, each write, a resume): no MUST_BE_EMPTY table holds a row, and no table of the database is unclassified (a table nobody decided about is
+ *     not assumed harmless). Stock counts, stock transfers, sales, customers, invoices, payments, manufacturing, returns and the rest are all in the first class.
+ *   - a FIRST run also needs the tables the runner writes to be empty (except the audit trail and the run record). On a resume those are accounted for row by row by the observation.
+ * The tables are read from the database itself (information_schema), then intersected with the registry. Messages carry the table name (a schema name) and a count only.
  */
-async function tablesTheRunnerNeverWrites(problems: string[]): Promise<void> {
-  const [customers, salesOrders] = await Promise.all([db.customer.count(), db.salesOrder.count()])
-  if (customers > 0) problems.push(`foreign data: the customer table holds ${customers} row(s); this runner never writes customers`)
-  if (salesOrders > 0) problems.push(`foreign data: the sales order table holds ${salesOrders} row(s); this runner never writes sales orders`)
+async function dataClasses(problems: string[], fresh: boolean): Promise<void> {
+  const present = new Set((await db.$queryRaw<Array<{ name: string }>>`
+    SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'`).map((r) => r.name))
+  const unknown = [...present].filter((name) => !Object.prototype.hasOwnProperty.call(TABLE_CLASSES, name))
+  if (unknown.length > 0) problems.push(`foreign data: ${unknown.length} table(s) of the database are not classified by the runner, so it cannot say they hold nothing (a new table needs a decision in table-classes.ts)`)
+  const mustBeEmpty = tablesOfKind('MUST_BE_EMPTY').filter((name) => present.has(name))
+  const runnerTables = fresh ? tablesOfKind('RUNNER_WRITES').filter((name) => present.has(name) && !FRESH_RUN_MAY_HOLD.has(name)) : []
+  const checked = [...mustBeEmpty, ...runnerTables]
+  if (checked.length === 0) return
+  // The names come from the committed registry and are matched to [a-z_0-9]+ before they are quoted into the statement: nothing from the database or a file is interpolated.
+  for (const name of checked) if (!/^[a-z0-9_]+$/.test(name)) throw new ObservationError(DATABASE_READ_FAILED)
+  const sql = checked.map((name) => `SELECT '${name}' AS name, count(*)::bigint AS n FROM "${name}"`).join(' UNION ALL ')
+  const rows = await db.$queryRawUnsafe<Array<{ name: string; n: bigint }>>(sql)
+  const runnerSet = new Set(runnerTables)
+  for (const row of rows) {
+    const n = Number(row.n)
+    if (n === 0) continue
+    problems.push(runnerSet.has(row.name)
+      ? `empty target: the ${row.name} table holds ${n} row(s), and no run record says this runner loaded them`
+      : `foreign data: the ${row.name} table holds ${n} row(s); this runner never writes it`)
+  }
 }
 
-async function emptyTarget(problems: string[]): Promise<void> {
-  const counts = await Promise.all(LOCKING_COUNTS.map(async (name) => [name, await (db[name] as { count(): Promise<number> }).count()] as const))
+async function baseCurrencyNotLocked(problems: string[]): Promise<void> {
   const setting = await db.setting.findUnique({ where: { key: 'base_currency_locked' }, select: { value: true } })
-  for (const [name, count] of counts) if (count > 0) problems.push(`empty target: the ${name} table holds ${count} row(s), and no run record says this runner loaded them`)
   if (setting?.value === 'true') problems.push('empty target: the base currency is already locked')
 }
 

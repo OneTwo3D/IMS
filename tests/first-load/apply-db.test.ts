@@ -958,7 +958,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const writes = { logs: await count('activity_logs'), products: await count('products'), runs: await count('first_load_apply_runs') }
         const result = await runLoad(prepared, ports(), apply(prepared))
         assert.equal(result.exit, 'PRECONDITION_REFUSED')
-        assert.match(result.problems.join('; '), /empty target: the supplier table holds 1 row/)
+        assert.match(result.problems.join('; '), /empty target: the suppliers table holds 1 row/)
         assert.deepEqual({ logs: await count('activity_logs'), products: await count('products'), runs: await count('first_load_apply_runs') }, writes)
         const planned = await runLoad(prepared, ports(), plan())
         assert.equal(planned.exit, 'PRECONDITION_REFUSED')
@@ -1138,6 +1138,54 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       })
     })
 
+    describe('every table is classified: independent business tables refuse a first run and a resume', () => {
+      // Mutation named: go back to counting six tables (and customers/sales orders on a resume) -> the stock-count and transfer arms are green when they must be red.
+      const evaluate = (resuming: boolean) => m.rails.evaluateRails(prepared, resuming ? { phase: 'recheck', resuming: true, step: null } : { phase: 'preflight', resuming: false, step: null })
+      const foreignFor = async (resuming: boolean, table: string) => (await evaluate(resuming)).filter((p) => p.includes(`the ${table} table holds`))
+      it('CONTROL: a configured, otherwise empty database passes both rails', async () => {
+        await resetData()
+        assert.deepEqual((await evaluate(false)).filter((p) => /^(empty target|foreign data)/.test(p)), [])
+        assert.deepEqual((await evaluate(true)).filter((p) => /^(empty target|foreign data)/.test(p)), [])
+      })
+
+      it('a stock count that names only a warehouse, and a stock transfer between two warehouses, each refuse a first run AND a resume', async () => {
+        await resetData()
+        const main = await m.db.warehouse.findUniqueOrThrow({ where: { code: 'ZQSENT-MAIN' }, select: { id: true } })
+        const over = await m.db.warehouse.findUniqueOrThrow({ where: { code: 'ZQSENT-OVER' }, select: { id: true } })
+        const stockCount = await m.db.stockCount.create({ data: { reference: 'ZQDB-COUNT-1', warehouseId: main.id } })
+        try {
+          for (const resuming of [false, true]) assert.equal((await foreignFor(resuming, 'stock_counts')).length, 1, `stock count, resuming=${resuming}`)
+        } finally { await m.db.stockCount.delete({ where: { id: stockCount.id } }) }
+        const transfer = await m.db.stockTransfer.create({ data: { reference: 'ZQDB-TRANSFER-1', fromWarehouseId: main.id, toWarehouseId: over.id } })
+        try {
+          for (const resuming of [false, true]) assert.equal((await foreignFor(resuming, 'stock_transfers')).length, 1, `stock transfer, resuming=${resuming}`)
+          const result = await runLoad(prepared, ports(), apply(prepared))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED')
+          assert.equal(await count('suppliers'), 0, 'nothing was written')
+        } finally { await m.db.stockTransfer.delete({ where: { id: transfer.id } }) }
+        assert.deepEqual((await evaluate(true)).filter((p) => p.startsWith('foreign data')), [], 'gone')
+      })
+
+      it('a table the registry has never heard of refuses both, with a count and no name', async () => {
+        await resetData()
+        await sql('create table zz_unclassified (id int)')
+        try {
+          for (const resuming of [false, true]) {
+            const problems = (await evaluate(resuming)).filter((p) => /not classified/.test(p))
+            assert.equal(problems.length, 1)
+            assert.match(problems[0]!, /^foreign data: 1 table\(s\) of the database are not classified/)
+            assert.ok(!problems[0]!.includes('zz_unclassified'))
+          }
+        } finally { await sql('drop table zz_unclassified') }
+      })
+
+      it('the registry names exactly the tables the migrated database has', async () => {
+        const present = (await sql<{ name: string }>(`select table_name as name from information_schema.tables where table_schema = current_schema() and table_type = 'BASE TABLE'`)).map((r) => r.name).sort()
+        const { TABLE_CLASSES } = await import('../../lib/first-load/apply/table-classes')
+        assert.deepEqual(present, Object.keys(TABLE_CLASSES).sort())
+      })
+    })
+
     describe('tables the runner never writes', () => {
       it('a customer or a sales order that appeared since is refused on a RESUME too (the empty-target rail is for a fresh run only)', async () => {
         // Mutation named: drop the check -> a resume loads beside data of the application: red.
@@ -1146,7 +1194,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'control')
         const customer = await m.db.customer.create({ data: { firstName: 'A', lastName: 'B' } })
         try {
-          assert.ok((await resume()).some((p) => /^foreign data: the customer table holds 1 row\(s\)/.test(p)))
+          assert.ok((await resume()).some((p) => /^foreign data: the customers table holds 1 row\(s\)/.test(p)))
           assert.ok((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: true, step: null })).some((p) => p.startsWith('foreign data:')))
         } finally { await m.db.customer.delete({ where: { id: customer.id } }) }
         assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'gone')

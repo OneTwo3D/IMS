@@ -405,10 +405,10 @@ test('preflight: problems refuse a plan and an apply before anything is written,
   assert.deepEqual(seen, [false], 'a fresh load is told it is not resuming')
   // A fresh database, problems found: both modes refuse; nothing is written.
   const fresh = setup()
-  const planned = await runLoad(fresh.prepared, fresh.db.ports({ preflight: async () => ['empty target: the supplier table holds 1 row(s)'] }), options({ mode: 'plan', rehearsal: null, systemId: null }))
+  const planned = await runLoad(fresh.prepared, fresh.db.ports({ preflight: async () => ['empty target: the suppliers table holds 1 row(s)'] }), options({ mode: 'plan', rehearsal: null, systemId: null }))
   assert.equal(planned.exit, 'PRECONDITION_REFUSED')
-  assert.deepEqual(planned.problems, ['empty target: the supplier table holds 1 row(s)'])
-  const applied = await runLoad(fresh.prepared, fresh.db.ports({ preflight: async () => ['empty target: the supplier table holds 1 row(s)'] }), options())
+  assert.deepEqual(planned.problems, ['empty target: the suppliers table holds 1 row(s)'])
+  const applied = await runLoad(fresh.prepared, fresh.db.ports({ preflight: async () => ['empty target: the suppliers table holds 1 row(s)'] }), options())
   assert.equal(applied.exit, 'PRECONDITION_REFUSED')
   untouched(fresh.db)
   precondition(t, 'modes refused', 2)

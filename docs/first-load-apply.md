@@ -247,9 +247,21 @@ For each table the runner writes, every column is either **fingerprinted** (F, c
 | suppliers, products, purchase orders (and their lines) | the whole table is read; any row not emitted by the run is a foreign row |
 | stock movements | read for the whole table: a movement is attributed to its (product, warehouse) pair, and a movement that names **no warehouse** (historical sales imports write these) is foreign history under the key `SKU|(NO WAREHOUSE)`; a pair with anything but one opening layer and its movement is foreign history |
 | stock levels, cost layers | read for the whole table, by pair |
-| customers, sales orders | never written by this runner: a row in either refuses every evaluation (preflight, each step's start, before each write), a resume included |
+| every other table of the schema | classified in one registry (`lib/first-load/apply/table-classes.ts`): a table that is MUST_BE_EMPTY (stock counts, stock transfers, sales, customers, invoices, payments, manufacturing, returns, shipments, kits, connector records and the rest) refuses every evaluation of a first run and a resume if it holds a row |
 
 Foreign keys that can be null on these tables (a movement's warehouses, a supplier's default tax rate, a product's parent, preferred supplier and category) are read as such: a null is a value the comparison sees, not a row it skips.
+
+### Table classes: the class of foreign data is closed, not listed
+
+Every table of the schema (and the migration history) is classified once, in `lib/first-load/apply/table-classes.ts`:
+
+| Class | Meaning | Rule |
+| --- | --- | --- |
+| RUNNER_WRITES | tables the runner writes (suppliers, products, categories, recipes and BOMs, stock levels, movements and cost layers, purchase orders and lines, the supplier price cache, the audit trail, the run record) | rows accounted for one by one by the observation; a first run needs them empty (but the audit trail and the run record) |
+| CONFIG_ALLOWED | installation configuration, accounts, the application's own operation logs, the schema's migration history; each entry carries its reason | may hold rows |
+| MUST_BE_EMPTY | every other table: business data this runner never writes | any row refuses a first run and every evaluation of a resume |
+
+The registry is checked three ways: a unit test fails if a table of `prisma/schema.prisma` is unclassified or the registry lists a table the schema lacks (so a new table forces a decision); a database test checks the registry names exactly the tables the migrated database has; and at run time a table in the database that the registry does not list refuses the load (a count, no name). Messages carry the table name (a schema name) and a count only.
 
 ### The accounting profile of the tax rates
 
@@ -276,7 +288,7 @@ Evaluated once before anything is written (`preflight`, plan and apply alike) an
 | quiesce (always, and before every importer call) | another client backend (any session that is not provably this process's own, by socket) is connected to the database, this process's sockets cannot be listed, or the role cannot see other sessions. System and background backends (autovacuum, WAL, statistics) are not client backends and are ignored. A session that is closing is given about a second to leave |
 | base currency | the organisation's base currency (GBP when there is no row, as the importers read it) is not the manifest's |
 | forbidden SKUs | a product the manifest forbids (any case) already exists in the database |
-| empty target (a first run only) | the product, supplier, customer, purchase order, sales order or stock movement table holds a row, or the base currency is already locked, and no run record says this runner loaded them. A resume is not asked for emptiness |
+| data classes (every evaluation; a first run is stricter) | any table classified MUST_BE_EMPTY (see below) holds a row; or the database has a table the registry does not list. A FIRST run also needs the tables the runner writes to be empty (except the audit trail and the run record), and the base currency not yet locked |
 | warehouses | a warehouse the manifest declares is missing, inactive, duplicated under upper-casing, or has another type, availableForSale or syncToStore (a quarantine warehouse is declared `QUARANTINE`, not for sale, not synced, and is checked like the rest) |
 | FX rates (purchase orders) | a stated rate has no stored base-to-currency rate on or before today, or differs from it by more than the importer's 2%. The runner never writes a rate |
 | tax rates (purchase orders) | the name or value a line or order states does not resolve exactly as the importer would resolve it. A line that states a NAME must match an active purchase rate of that name (case-insensitive); a rate of another name with the stated value does not count, because the importer would fall back to it and create the order under a different tax. A line with no name must match an active purchase rate by value (within 0.00005). An order-level name must match an active rate of exactly that spelling, and EVERY active rate of that name (the importer takes any, whatever it is used for) must be a purchase rate. Where several rates match they must be **interchangeable**: the same percentage AND the same accounting profile (the effective rate its active components give, accounting tax type, compound flag, reverse-charge flag, reporting category, and the components themselves). Which of two same-named rates the importer takes is not relied on. A rate whose components do not add up to its percentage is refused (the importer matches the percentage and taxes at the components). A value that is blank, zero or negative on a line with no name states nothing: the importer reads it as no value and the line takes the order's tax, so it is not an unresolved tax. A stated value must be the value of the named rate. No rate the importer could apply (a named rate, an inherited order rate, a value match) may exceed the maximum purchase tax rate the prepared report declares (decimal-exact; a report that declares none refuses). |
