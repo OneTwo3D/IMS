@@ -513,7 +513,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         // Mutation named: drop taxAmountConsistent from the pairing -> this arm is green when it must be red.
         const eightLine = await m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: PO_EIGHT } }, select: { id: true, taxForeign: true } })
         await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: '21' } })
-        try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['lines'], 'a hand-edited tax amount') } finally { await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: eightLine.taxForeign } }) }
+        try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['headerAmounts', 'lines'], 'a hand-edited tax amount (the header no longer adds up either)') } finally { await m.db.purchaseOrderLine.update({ where: { id: eightLine.id }, data: { taxForeign: eightLine.taxForeign } }) }
         assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), [], 'restored')
         const component = await m.db.taxRateComponent.create({ data: { taxRateId: rate.id, name: 'part', rate: '0.2', sortOrder: 0 } })
         try { assert.deepEqual(differingColumns(eight.fingerprint, (await entry(PO_EIGHT)).fingerprint), ['lines'], 'a component added later') } finally { await m.db.taxRateComponent.delete({ where: { id: component.id } }) }
@@ -529,6 +529,126 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         await cleanup()
         await m.db.taxRate.delete({ where: { id: five.id } }).catch(() => undefined)
       }
+    })
+
+    it('every stored header amount and every column the importer never sets is read back: tamper each separately -> a difference in that column, restore -> a match', async (t) => {
+      // Mutation named: leave headerAmounts out of the observation (the old code read none of these) -> every arm below is green when it must be red.
+      const stub = { steps: [{ step: 'purchase-orders', units: units['purchase-orders'] }] } as unknown as PreparedRun
+      const diff = async (key: string) => differingColumns(units['purchase-orders'].find((u) => u.key === key)!.fingerprint, (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === key)!.fingerprint)
+      assert.deepEqual(await diff(PO_ONE), [], 'control: the inclusive, discounted, taxed order matches')
+      assert.deepEqual(await diff(PO_TWO), [], 'control: the EUR order matches')
+      const po = async (key: string) => m.db.purchaseOrder.findUniqueOrThrow({ where: { reference: key } })
+      const lineOf = async (key: string) => m.db.purchaseOrderLine.findFirstOrThrow({ where: { po: { reference: key } }, orderBy: { sortOrder: 'asc' } })
+      let arms = 0
+      // header amounts, both orders (one has VAT, a discount and VAT-inclusive prices; one is in EUR at 1.25)
+      for (const key of [PO_ONE, PO_TWO]) {
+        for (const column of ['subtotalForeign', 'subtotalBase', 'taxForeign', 'taxBase', 'totalForeign', 'totalBase'] as const) {
+          const original = (await po(key))[column]
+          await m.db.purchaseOrder.update({ where: { reference: key }, data: { [column]: original.plus(1) } })
+          try { assert.deepEqual(await diff(key), ['headerAmounts'], `${key}.${column}`) } finally { await m.db.purchaseOrder.update({ where: { reference: key }, data: { [column]: original } }) }
+          assert.deepEqual(await diff(key), [], `${key}.${column}: restored`)
+          arms++
+        }
+      }
+      // the FX rate and the order discount (each is also a header fingerprint column)
+      const two = await po(PO_TWO)
+      await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { fxRateToBase: '1.26' } })
+      try { assert.ok((await diff(PO_TWO)).includes('fxRateToBase'), 'fx rate'); arms++ } finally { await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { fxRateToBase: two.fxRateToBase } }) }
+      await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { discountAmount: '1' } })
+      try { assert.ok((await diff(PO_TWO)).includes('orderDiscountForeign'), 'order discount'); arms++ } finally { await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { discountAmount: two.discountAmount } }) }
+      // columns the importer never sets
+      for (const [label, data, restore] of [
+        ['directFreight', { directFreightForeign: '5' }, { directFreightForeign: '0' }],
+        ['discountStr', { discountStr: '10%' }, { discountStr: null }],
+        ['internalNotes', { internalNotes: 'x' }, { internalNotes: null }],
+        ['archived', { archived: true }, { archived: false }],
+        ['landedCostMethod', { landedCostMethod: 'BY_QUANTITY' }, { landedCostMethod: 'BY_VALUE' }],
+        ['lifecycleDates', { rfqSentAt: new Date() }, { rfqSentAt: null }],
+      ] as const) {
+        await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: data as never })
+        try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], label) } finally { await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: restore as never }) }
+        arms++
+      }
+      // line-level base amounts and defaults
+      const line = await lineOf(PO_TWO)
+      for (const [label, data, restore] of [
+        ['line.totalBase', { totalBase: line.totalBase.plus(1) }, { totalBase: line.totalBase }],
+        ['line.taxBase', { taxBase: line.taxBase.plus(1) }, { taxBase: line.taxBase }],
+        ['line.unitCostBase', { unitCostBase: line.unitCostBase.plus(1) }, { unitCostBase: line.unitCostBase }],
+        ['line.defaults', { qtyReceived: '1' }, { qtyReceived: '0' }],
+      ] as const) {
+        await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: data as never })
+        try { assert.deepEqual(await diff(PO_TWO), ['headerAmounts'], label) } finally { await m.db.purchaseOrderLine.update({ where: { id: line.id }, data: restore as never }) }
+        arms++
+      }
+      assert.deepEqual(await diff(PO_TWO), [], 'all restored')
+      // The lines AND the header edited consistently with each other, but not the file's: the lines themselves differ from the file (quantity/amount are in the fingerprint).
+      const beforeLine = await lineOf(PO_TWO)
+      const beforeHeader = await po(PO_TWO)
+      const rate = 1.25
+      const newTotalForeign = beforeLine.totalForeign.plus(10)
+      const newTotalBase = newTotalForeign.div(rate)
+      await m.db.purchaseOrderLine.update({ where: { id: beforeLine.id }, data: { totalForeign: newTotalForeign, totalBase: newTotalBase.toDecimalPlaces(4) } })
+      await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { subtotalForeign: newTotalForeign, subtotalBase: newTotalBase.toDecimalPlaces(4), totalForeign: newTotalForeign, totalBase: newTotalBase.toDecimalPlaces(4) } })
+      try { assert.deepEqual(await diff(PO_TWO), ['lines'], 'a line and its header edited together still differ from the file') } finally {
+        await m.db.purchaseOrderLine.update({ where: { id: beforeLine.id }, data: { totalForeign: beforeLine.totalForeign, totalBase: beforeLine.totalBase } })
+        await m.db.purchaseOrder.update({ where: { reference: PO_TWO }, data: { subtotalForeign: beforeHeader.subtotalForeign, subtotalBase: beforeHeader.subtotalBase, totalForeign: beforeHeader.totalForeign, totalBase: beforeHeader.totalBase } })
+      }
+      arms++
+      assert.deepEqual(await diff(PO_TWO), [], 'restored')
+      precondition(t, 'arms', arms)
+    })
+
+    it('columns the importers never set on suppliers, products and the manufacturing BOM, and the opening-stock movement\'s value, are read back too', async (t) => {
+      // Mutation named: drop the defaults entries / the movement value check -> the arms are green when they must be red.
+      const stub = { steps: [{ step: 'purchase-orders', units: units['purchase-orders'] }] } as unknown as PreparedRun
+      const diffOf = async (step: ApplyStepId, key: string) => differingColumns(units[step].find((u) => u.key === key)!.fingerprint, (await m.observe.observeStep(stub, step)).entries.find((e) => e.key === key)!.fingerprint)
+      let arms = 0
+      const supplierKey = SUPPLIER_A.toLowerCase()
+      assert.deepEqual(await diffOf('suppliers', supplierKey), [], 'control')
+      const tax = await m.db.taxRate.findFirstOrThrow({ select: { id: true } })
+      for (const [label, data, restore] of [
+        ['active', { active: false }, { active: true }],
+        ['prepaid', { prepaid: true }, { prepaid: false }],
+        ['default VAT rate', { taxRateId: tax.id }, { taxRateId: null }],
+        ['delivery days', { manualDeliveryDays: 9 }, { manualDeliveryDays: null }],
+      ] as const) {
+        await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: data as never })
+        try { assert.deepEqual(await diffOf('suppliers', supplierKey), ['importerDefaults'], label) } finally { await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: restore as never }) }
+        arms++
+      }
+      assert.deepEqual(await diffOf('products', `${TAG}-SIMPLE`), [], 'control')
+      for (const [label, data, restore] of [
+        ['taxCategory', { taxCategory: 'ZERO' }, { taxCategory: 'STANDARD' }],
+        ['hsCode', { hsCode: '123456' }, { hsCode: null }],
+        ['externalProductId', { externalProductId: BigInt(99) }, { externalProductId: null }],
+        ['reorderPoint', { reorderPoint: '5' }, { reorderPoint: null }],
+      ] as const) {
+        await m.db.product.update({ where: { sku: `${TAG}-SIMPLE` }, data: data as never })
+        try { assert.deepEqual(await diffOf('products', `${TAG}-SIMPLE`), ['importerDefaults'], label) } finally { await m.db.product.update({ where: { sku: `${TAG}-SIMPLE` }, data: restore as never }) }
+        arms++
+      }
+      // an INACTIVE manufacturing BOM: planning reads only active ones
+      const bom = await m.db.bom.findFirstOrThrow({ where: { product: { sku: `${TAG}-BOM` } }, select: { id: true } })
+      await m.db.bom.update({ where: { id: bom.id }, data: { active: false } })
+      try {
+        const observed = (await m.observe.observeStep(stub, 'products')).entries.find((e) => e.key === `${TAG}-BOM`)!
+        assert.notEqual(observed.recipe, units.products.find((u) => u.key === `${TAG}-BOM`)!.recipe)
+        arms++
+      } finally { await m.db.bom.update({ where: { id: bom.id }, data: { active: true } }) }
+      // the opening movement's unit cost and value
+      assert.deepEqual((await m.observe.observeStep(stub, 'opening-stock')).foreignHistoryKeys, [], 'control: clean')
+      const movement = await m.db.stockMovement.findFirstOrThrow({ where: { type: 'OPENING_STOCK', product: { sku: `${TAG}-SIMPLE` } }, select: { id: true, unitCostBase: true, totalValueBase: true } })
+      // The table's own check keeps the movement's value consistent with its quantity and unit cost, so the two are moved TOGETHER (a movement that agrees with itself but not with its layer).
+      const qty = (await m.db.stockMovement.findUniqueOrThrow({ where: { id: movement.id }, select: { qty: true } })).qty
+      await m.db.$executeRawUnsafe(`ALTER TABLE stock_movements DISABLE TRIGGER USER`)
+      try {
+        await m.db.stockMovement.update({ where: { id: movement.id }, data: { unitCostBase: movement.unitCostBase!.plus(1), totalValueBase: movement.totalValueBase!.plus(qty) } })
+        try { assert.deepEqual((await m.observe.observeStep(stub, 'opening-stock')).foreignHistoryKeys, [`${TAG}-SIMPLE|ZQSENT-MAIN`], 'movement value') } finally { await m.db.stockMovement.update({ where: { id: movement.id }, data: { unitCostBase: movement.unitCostBase!, totalValueBase: movement.totalValueBase! } }) }
+      } finally { await m.db.$executeRawUnsafe(`ALTER TABLE stock_movements ENABLE TRIGGER USER`) }
+      arms++
+      assert.deepEqual((await m.observe.observeStep(stub, 'opening-stock')).foreignHistoryKeys, [], 'restored')
+      precondition(t, 'arms', arms)
     })
 
     it('a BOM whose manufacturing recipe is missing is NOT matching, although its component list is there', async () => {

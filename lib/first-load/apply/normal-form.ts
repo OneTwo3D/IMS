@@ -80,8 +80,9 @@ export function supplierCell(column: string, cells: CellRecord): string {
   }
 }
 
-export function supplierFingerprint(columns: readonly string[], cells: CellRecord): string {
-  return JSON.stringify(Object.fromEntries(columns.map((c) => [c, supplierCell(c, cells)])))
+/** `importerDefaults` is 'ok' on the file side; the database side reports the columns the importer never sets that are no longer at their defaults. */
+export function supplierFingerprint(columns: readonly string[], cells: CellRecord, importerDefaults = 'ok'): string {
+  return JSON.stringify({ ...Object.fromEntries(columns.map((c) => [c, supplierCell(c, cells)])), importerDefaults })
 }
 
 export interface DbSupplier {
@@ -156,8 +157,8 @@ export function productCell(column: string, cells: CellRecord, source: CellSourc
   }
 }
 
-export function productFingerprint(columns: readonly string[], cells: CellRecord, source: CellSource): string {
-  return JSON.stringify(Object.fromEntries(columns.map((c) => [c, productCell(c, cells, source)])))
+export function productFingerprint(columns: readonly string[], cells: CellRecord, source: CellSource, importerDefaults = 'ok'): string {
+  return JSON.stringify({ ...Object.fromEntries(columns.map((c) => [c, productCell(c, cells, source)])), importerDefaults })
 }
 
 export interface DbProduct {
@@ -292,7 +293,8 @@ export function purchaseOrderLine(cells: CellRecord, qty: Dec, unitCost: Dec): s
 }
 
 export function purchaseOrderFingerprint(header: Record<string, string>, lines: readonly string[]): string {
-  return JSON.stringify({ ...header, status: 'DRAFT', lines: [...lines].sort() })
+  // `headerAmounts` is 'ok' on the file side: the file's order, loaded by the importer, has header amounts the importer's arithmetic reproduces and none of the columns it never sets.
+  return JSON.stringify({ ...header, status: 'DRAFT', headerAmounts: 'ok', lines: [...lines].sort() })
 }
 
 export interface DbPurchaseOrder {
@@ -308,6 +310,8 @@ export interface DbPurchaseOrder {
   discountAmount: DecimalLike
   notes: string | null
   status: string
+  /** 'ok', or `mismatch:<column names>` (see db/po-amounts.ts). */
+  headerAmounts: string
   lines: ReadonlyArray<{
     product: { sku: string }
     qty: DecimalLike
@@ -402,5 +406,5 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
     ? [...fileLines]
     // No complete pairing: show what is stored, marked so that it can never equal a file's line.
     : stored.map((line) => `${line.prefix}|!${line.name === null ? 'none' : `n:${line.name}@${line.rate4}`}`)
-  return JSON.stringify({ ...header, status: po.status, lines: lines.sort() })
+  return JSON.stringify({ ...header, status: po.status, headerAmounts: po.headerAmounts, lines: lines.sort() })
 }

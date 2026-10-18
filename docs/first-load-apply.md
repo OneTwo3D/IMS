@@ -217,6 +217,25 @@ Calls are cut by `planImportCalls`: independent rows (suppliers, opening stock) 
 
 `first_load_apply_runs` has **one row per database**: a unique `singleton` column makes a second row impossible, so a second load into the same database loses the insert. The record moves by compare-and-swap: `save(record, n)` is one `UPDATE ... WHERE version = n AND manifest_digest = ... AND run_id = ...` and the affected-row count is the answer, so two runners that read the same version cannot both advance it (the loser gets `StaleJournalError`). A save must advance the version by exactly one. A status or step the table does not know is refused by a CHECK constraint, and a record this runner cannot read is an unreadable state (`ObservationError`), never an absent one. It is audit and identity only: correctness never depends on it.
 
+### Column audit: every column the importers write or default
+
+For each table the runner writes, every column is either **fingerprinted** (F, compared with the file), **validated** (V, checked against the importer's own arithmetic or its fixed default), or **deliberately unread** (U, with the reason).
+
+| Table | Columns |
+| --- | --- |
+| suppliers | F: name, contact, email, phone, currency, VAT number, account number, payment terms, address, country, notes. V: active, prepaid, default tax rate, delivery-days override, accounting contact link (`importerDefaults`). U: id, created and updated times |
+| products | F: sku, name, description, type, parent, barcode, mpn, origin, preferred supplier (by name) and its lock, weight, dimensions, prices, tax-inclusive flag, stock unit, oversell, image, active, lifecycle, category. V: tax category, customs codes, shop and accounting links, replenishment settings (`importerDefaults`); recipe (components, and for a BOM the manufacturing BOM and that it is active). U: id, times, `fulfillmentGraphVersion` (bumped by recipe writes), `preferredSupplierUpdatedAt` |
+| product_categories | F: the normalised path (`nameNormalized`). U: display name, parent link (implied by the path) |
+| product_components, boms, bom_items | F: component, quantity (component list; manufacturing BOM items). V: BOM active. U: order within the recipe, BOM name and description, item notes |
+| stock_levels | V: quantity equals the layer, nothing reserved. U: update time |
+| cost_layers | F: quantity, unit cost (6 dp). V: remaining equals received, opening flag, no PO line or production order, received-at equals the movement's time, linked to the movement. U: id |
+| stock_movements | F/V: type, product, warehouse, quantity, unit cost and total value (equal to what the apply writes from the layer), no note, reference, idempotency key or shipment line. U: id, time |
+| purchase_orders | F: supplier, currency, FX rate, destination, order tax name and percent, VAT convention, supplier reference, expected delivery, order discount, notes, status. V: subtotal, tax, total in both currencies (recomputed from the stored lines with `applyHeaderOrderDiscount`), type, landed-cost method, freight, discount text, internal notes, the shipping and lifecycle columns, archived flag, additional-cost rows. U: id, reference (the key), times |
+| purchase_order_lines | F: product, quantity, entered amount after discount, discount and its text, tax (name, value, profile, amount against the rate). V: base unit cost, base total, base tax (`calcLineTotals` and the order's FX), description, purchase unit, received and returned quantities, landed cost, reorder evidence. U: id, position |
+| supplier_products | U: written by every order (`lastUnitCost`, currency) as a price cache where the latest order wins; it is not an accounting record and the winner depends on order sequence |
+| activity_logs | U: the audit trail of the run |
+| first_load_apply_runs | V: digest, run id, status and step by the run-record rules; `facts` recorded once |
+
 ### The accounting profile of the tax rates
 
 Just before the first purchase-order write the runner records, once, on the run record (`facts`, never rewritten), a digest of the accounting profile of the rate each tax lookup of the file resolves to. The read-back then requires each stored line's rate to have that profile, so a later change of a rate's tax type, reverse-charge flag, reporting category, compound flag or components shows as a difference in `lines`. It also checks that each stored line's tax AMOUNT is what its rate's current effective rate gives for the stored total (exclusive and VAT-inclusive), so a rate edited afterwards, or an amount edited by hand, shows too.
@@ -253,7 +272,7 @@ The restore point; the rails that read the outbound-write hold, the connector an
 
 ## Not proven here
 
-- **Order totals and base amounts are not read back.** The order's subtotal, tax, total, discount and freight totals, the base-currency amounts and the line costs in the base currency are not compared with anything; only the line amounts (entered amount, discount, tax and its rate) are. A hand edit of those totals would not show. Nor is the order `type`.
+- **The header-amount tolerance is one unit in the last stored place.** Header amounts are recomputed from the stored lines with the importer's own functions and accepted within 0.0001 (4 dp amounts) and, for a base unit cost, 0.000002 scaled by 1/fx below 1. A difference smaller than that is not seen. Header amounts are tied to the FILE only through the stored lines (quantity, entered amount, tax, rate), which the fingerprint pins; they are not recomputed from the file's raw numbers.
 - **The recorded profile is the state at the first purchase-order write.** A rate's settings edited before that point are the rails' business (they run again just before it); edited after it they show as a difference. If the profile was never recorded (no purchase-order write has happened) there is nothing to compare, and only the amount check applies.
 
 - **A call already in flight when the step lock is lost runs to its end.** The check is before each bounded call, not a fence inside the importers' own write transactions (they are the application's actions and are not changed). The window is therefore one bounded call: at most 500 rows for suppliers and opening stock, at most one order batch of 500 lines for purchase orders, and a whole products file (a variant needs its parent and a recipe its components in the same call). A runner that resumes in that window could write the same key at the same time; the database's own uniqueness (SKU, one opening layer per pair, purchase-order reference) then refuses the second write rather than duplicating it. Suppliers have no such constraint, so a supplier written by both could exist twice; the next read-back reports that as DUPLICATE_IN_DATABASE and the run stops. The lost runner stops at its next call and ends STEP_FAILED.

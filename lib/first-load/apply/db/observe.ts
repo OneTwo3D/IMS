@@ -8,6 +8,7 @@
  * observation, because an empty observation reads as "nothing is loaded yet" and would send every row to the importers.
  */
 import { db } from '@/lib/db'
+import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { D } from '../../money'
 import type { ApplyStepId } from '../constants'
 import { FINGERPRINT_SPECS } from '../keys'
@@ -16,6 +17,7 @@ import {
 } from '../normal-form'
 import type { PreparedRun } from '../prepared'
 import { loadFacts } from './journal'
+import { headerAmountsEntry } from './po-amounts'
 import { TAX_RATE_SELECT, effectiveRate, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import { ObservationError, type ObservedEntry, type StepObservation } from '../residual'
 
@@ -23,6 +25,12 @@ export const DATABASE_READ_FAILED = 'the database could not be read'
 
 /** The marker fingerprint of a stock pair that has history which is not exactly one opening layer; it never equals a file's fingerprint. */
 export const UNCLEAN_STOCK_PAIR = 'UNCLEAN_STOCK_PAIR'
+
+/** `ok`, or `mismatch:<names of the columns the importer never sets that are no longer at their defaults>`. Names only, never values. */
+function defaultsEntry(checks: Record<string, boolean>): string {
+  const bad = Object.entries(checks).filter(([, holds]) => !holds).map(([name]) => name).sort()
+  return bad.length === 0 ? 'ok' : `mismatch:${bad.join(',')}`
+}
 
 export async function observeStep(prepared: PreparedRun, step: ApplyStepId): Promise<StepObservation> {
   try {
@@ -44,6 +52,8 @@ async function observeSuppliers(): Promise<StepObservation> {
     select: {
       name: true, contactName: true, email: true, phone: true, currency: true, vatNumber: true, accountNumber: true, paymentTermsDays: true,
       addressLine1: true, addressLine2: true, city: true, county: true, postcode: true, country: true, notes: true,
+      // Columns the importer never sets: they keep their defaults (a default VAT rate, prepaid, a delivery-days override and the accounting contact link are accounting-relevant).
+      active: true, prepaid: true, taxRateId: true, manualDeliveryDays: true, accountingContactId: true, accountingContactProvenance: true,
     },
   })
   const columns = FINGERPRINT_SPECS.suppliers.fingerprinted
@@ -52,7 +62,10 @@ async function observeSuppliers(): Promise<StepObservation> {
       // The importer matches by lower(trim(name)).
       key: row.name.trim().toLowerCase(),
       collisionKey: row.name.trim().toUpperCase(),
-      fingerprint: supplierFingerprint(columns, supplierCellsFromDb(row)),
+      fingerprint: supplierFingerprint(columns, supplierCellsFromDb(row), defaultsEntry({
+        active: row.active === true, prepaid: row.prepaid === false, taxRateId: row.taxRateId === null, manualDeliveryDays: row.manualDeliveryDays === null,
+        accountingContact: row.accountingContactId === null && row.accountingContactProvenance === null,
+      })),
       recipe: null,
     })),
   }
@@ -65,8 +78,11 @@ async function observeProducts(): Promise<StepObservation> {
       preferredSupplier: { select: { name: true } }, preferredSupplierLocked: true, weight: true, widthCm: true, heightCm: true, depthCm: true,
       salesPriceBase: true, salePriceBase: true, salesPriceTaxInclusive: true, stockUnit: true, oversellAllowed: true, imageUrl: true, active: true,
       lifecycleStatus: true, category: { select: { nameNormalized: true } },
+      // Columns the importer never sets (taxCategory drives the sales tax; the rest link the product to the shop, the accountant, customs and replenishment).
+      taxCategory: true, hsCode: true, customsDescription: true, externalProductId: true, accountingItemId: true, accountingItemProvenance: true,
+      reorderPoint: true, reorderQty: true, safetyStockQty: true, leadTimeDays: true, abcClass: true,
       productComponents: { select: { qty: true, component: { select: { sku: true } } } },
-      manufacturingBom: { select: { items: { select: { qty: true, component: { select: { sku: true } } } } } },
+      manufacturingBom: { select: { active: true, items: { select: { qty: true, component: { select: { sku: true } } } } } },
     },
   })
   const columns = FINGERPRINT_SPECS.products.fingerprinted
@@ -79,19 +95,32 @@ async function observeProducts(): Promise<StepObservation> {
         // the runner exists to catch, so a BOM is "matching" only when both say the same thing.
         const bom = recipeFromDb((row.manufacturingBom?.items ?? []).map((i) => ({ sku: i.component.sku, qty: i.qty })))
         if (bom !== components) recipe = `BOM_REPRESENTATIONS_DIFFER:${components ?? '-'}|${bom ?? '-'}`
+        // Planning reads only ACTIVE manufacturing BOMs: an inactive one is the same silent loss as a missing one.
+        else if (row.manufacturingBom && !row.manufacturingBom.active) recipe = `BOM_INACTIVE:${components ?? '-'}`
       }
-      return { key: row.sku, collisionKey: row.sku.toUpperCase(), fingerprint: productFingerprint(columns, productCellsFromDb(row), 'db'), recipe }
+      return { key: row.sku, collisionKey: row.sku.toUpperCase(), fingerprint: productFingerprint(columns, productCellsFromDb(row), 'db', defaultsEntry({
+          taxCategory: row.taxCategory === 'STANDARD',
+          unlinked: row.externalProductId === null && row.accountingItemId === null && row.accountingItemProvenance === null,
+          customs: row.hsCode === null && row.customsDescription === null,
+          replenishment: row.reorderPoint === null && row.reorderQty === null && row.safetyStockQty === null && row.leadTimeDays === null && row.abcClass === null,
+        })), recipe }
     }),
   }
+}
+
+function movementValueMatches(movement: { unitCostBase: { toFixed(): string } | null; totalValueBase: { toFixed(): string } | null }, layer: { receivedQty: { toFixed(): string }; unitCostBase: { toFixed(): string } }): boolean {
+  if (movement.unitCostBase === null || movement.totalValueBase === null) return false
+  const expected = buildStockMovementValueFields({ qty: layer.receivedQty.toFixed(), unitCostBase: layer.unitCostBase.toFixed() })
+  return new D(movement.unitCostBase.toFixed()).toFixed(6) === expected.unitCostBase && new D(movement.totalValueBase.toFixed()).toFixed(6) === expected.totalValueBase
 }
 
 async function observeOpeningStock(): Promise<StepObservation> {
   const [layers, levels, movements] = await Promise.all([
     db.costLayer.findMany({
-      select: { productId: true, warehouseId: true, receivedQty: true, remainingQty: true, unitCostBase: true, isOpeningStock: true, adjustmentMovementId: true, product: { select: { sku: true } }, warehouse: { select: { code: true } } },
+      select: { productId: true, warehouseId: true, receivedQty: true, remainingQty: true, unitCostBase: true, isOpeningStock: true, adjustmentMovementId: true, poLineId: true, productionOrderId: true, receivedAt: true, product: { select: { sku: true } }, warehouse: { select: { code: true } } },
     }),
     db.stockLevel.findMany({ select: { productId: true, warehouseId: true, quantity: true, reservedQty: true, product: { select: { sku: true } }, warehouse: { select: { code: true } } } }),
-    db.stockMovement.findMany({ select: { id: true, type: true, productId: true, toWarehouseId: true, fromWarehouseId: true, qty: true } }),
+    db.stockMovement.findMany({ select: { id: true, type: true, productId: true, toWarehouseId: true, fromWarehouseId: true, qty: true, unitCostBase: true, totalValueBase: true, note: true, referenceType: true, referenceId: true, idempotencyKey: true, shipmentLineId: true, createdAt: true } }),
   ])
 
   interface Pair { sku: string; code: string; layers: typeof layers; level: (typeof levels)[number] | null; movements: typeof movements }
@@ -147,6 +176,10 @@ async function observeOpeningStock(): Promise<StepObservation> {
       && new D(pair.level.reservedQty.toFixed()).isZero()
       && movement.type === 'OPENING_STOCK' && movement.toWarehouseId === warehouseId && movement.fromWarehouseId === null && movement.productId === productId
       && new D(movement.qty.toFixed()).eq(new D(layer.receivedQty.toFixed())) && layer.adjustmentMovementId === movement.id
+      // The movement's VALUE is what the opening-stock apply wrote from the layer's quantity and cost (buildStockMovementValueFields), and everything the apply leaves empty is empty.
+      && movementValueMatches(movement, layer)
+      && movement.note === null && movement.referenceType === null && movement.referenceId === null && movement.idempotencyKey === null && movement.shipmentLineId === null
+      && layer.poLineId === null && layer.productionOrderId === null && layer.receivedAt.getTime() === movement.createdAt.getTime()
     if (clean) {
       entries.push({ key, collisionKey: key, fingerprint: openingStockFingerprint(pair.sku, pair.code, new D(layer.receivedQty.toFixed()), new D(layer.unitCostBase.toFixed())), recipe: null })
     } else {
@@ -181,10 +214,16 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
     select: {
       reference: true, currency: true, fxRateToBase: true, taxRateName: true, taxRatePercent: true, pricesIncludeVat: true, supplierRef: true,
       expectedDelivery: true, discountAmount: true, notes: true, status: true,
+      // Every other accounting column createPurchaseOrder writes or defaults (validated in db/po-amounts.ts).
+      type: true, landedCostMethod: true, subtotalForeign: true, subtotalBase: true, taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
+      directFreightForeign: true, directFreightBase: true, discountStr: true, internalNotes: true, skipPreferredSupplierUpdate: true, archived: true,
+      trackingNumber: true, shippingProvider: true, receivedAt: true, invoicedAt: true, rfqSentAt: true, poSentAt: true,
+      _count: { select: { freightCostLines: true } },
       supplier: { select: { name: true, currency: true } }, destinationWarehouse: { select: { code: true } },
       lines: {
         orderBy: { sortOrder: 'asc' },
-        select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
+        select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true,
+          unitCostForeign: true, unitCostBase: true, totalBase: true, taxBase: true, description: true, purchaseUnitId: true, purchaseUnitQty: true, qtyReceived: true, qtyReturned: true, landedUnitCostBase: true, reorderEvidence: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
       },
     },
   })
@@ -193,7 +232,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
     entries: rows.map((row): ObservedEntry => ({
       key: row.reference,
       collisionKey: row.reference.toUpperCase(),
-      fingerprint: purchaseOrderFingerprintFromDb(columns, { ...row, lines: row.lines.map((l) => ({ ...l, taxRate: l.taxRate ? { name: l.taxRate.name, rate: l.taxRate.rate, profileDigest: signatureDigest(taxRateSignature(l.taxRate)) } : null, taxAmountConsistent: taxAmountConsistent(row.pricesIncludeVat, l) })) }, fileFingerprints.get(row.reference) ?? null, profiles),
+      fingerprint: purchaseOrderFingerprintFromDb(columns, { ...row, headerAmounts: headerAmountsEntry({ ...row, freightCostLineCount: row._count.freightCostLines }), lines: row.lines.map((l) => ({ ...l, taxRate: l.taxRate ? { name: l.taxRate.name, rate: l.taxRate.rate, profileDigest: signatureDigest(taxRateSignature(l.taxRate)) } : null, taxAmountConsistent: taxAmountConsistent(row.pricesIncludeVat, l) })) }, fileFingerprints.get(row.reference) ?? null, profiles),
       recipe: null,
     })),
   }
