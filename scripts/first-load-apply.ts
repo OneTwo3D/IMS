@@ -217,7 +217,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
       if (!boundRead.ok) return stopWith('PRECONDITION_REFUSED', ['the report the rehearsal record binds cannot be read next to the record'])
       let boundParsed: unknown = null
       try { boundParsed = JSON.parse(boundRead.bytes.toString('utf8')) } catch { boundParsed = null }
-      const boundProblems = checkRecordReportFile(rehearsalRecord, createHash('sha256').update(boundRead.bytes).digest('hex'), boundParsed, prepared.manifestDigest)
+      const boundProblems = checkRecordReportFile(rehearsalRecord, createHash('sha256').update(boundRead.bytes).digest('hex'), boundParsed, prepared.manifestDigest, prepared.steps.map((st) => st.step))
       if (boundProblems.length > 0) return stopWith('PRECONDITION_REFUSED', boundProblems)
       const restoreProblem = checkRestoreDir(prepared.manifest.restorePointDir)
       if (restoreProblem !== null) return stopWith('PRECONDITION_REFUSED', [restoreProblem])
@@ -306,6 +306,7 @@ async function rehearseMode(
     targetSystemId: ctx.identity.systemId,
     manifestPath: args.manifest,
     manifestDigest: ctx.prepared.manifestDigest,
+    steps: ctx.prepared.steps.map((st) => st.step),
     schemaHead: lastMigrationName(REPO_ROOT),
     repoRoot: REPO_ROOT,
     root: args.root,

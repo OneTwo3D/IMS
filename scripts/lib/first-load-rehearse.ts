@@ -43,6 +43,8 @@ export interface RehearseInput {
   targetSystemId: string
   manifestPath: string
   manifestDigest: string
+  /** The steps this load selects, in order: the child's report must list exactly these. */
+  steps: readonly string[]
   schemaHead: string
   repoRoot: string
   /** Parent directory of the throwaway cluster. */
@@ -210,7 +212,7 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
     if (read.ok) {
       let parsed: unknown = null
       try { parsed = JSON.parse(read.bytes.toString('utf8')) } catch { parsed = null }
-      facts = validateChildReport(parsed, input.manifestDigest)
+      facts = validateChildReport(parsed, input.manifestDigest, input.steps)
       if (facts === null) problems.push('the report the rehearsal child published is unreadable or is not the report of this load')
       else report = { json, sha256: createHash('sha256').update(read.bytes).digest('hex') }
     } else problems.push('the rehearsal child published no report')

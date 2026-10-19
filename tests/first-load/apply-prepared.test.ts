@@ -207,8 +207,13 @@ test('cross-file: a missing parent, a missing component, a recipe cycle, stock o
 test('chain to the tool: opening-stock quantity and value must equal the prepared report even when the file hash is kept consistent', () => {
   const changed = withConsistentFile(honest, STOCK, (s) => s.replace('ZQSENT-OAK-BOARD,ZQSENT-MAIN,60,5.333333', 'ZQSENT-OAK-BOARD,ZQSENT-MAIN,61,5.333333'))
   const problems = problemsOf(changed)
-  assert.ok(problems.some((p) => /unit\(s\), the prepared report says 76/.test(p)), JSON.stringify(problems))
-  assert.ok(problems.some((p) => /is worth/.test(p)))
+  assert.ok(problems.some((p) => /TOTAL_QUANTITY_MISMATCH/.test(p)), JSON.stringify(problems))
+  assert.ok(problems.some((p) => /TOTAL_VALUE_MISMATCH/.test(p)))
+  // Mutation: put the figures back into the text and this fails. No quantity or value of the file or of the report reaches a problem string.
+  const marked = withReport(changed, (r) => { r.stock.totals.openingQty = '918273.645'; r.stock.totals.openingValueBase = '564738.291837' })
+  const text = problemsOf(marked).join('\n')
+  assert.match(text, /TOTAL_QUANTITY_MISMATCH/)
+  for (const figure of ['918273', '564738', '61', '443.83', '76']) assert.ok(!new RegExp(`(^|[^0-9])${figure.replace('.', '\\.')}([^0-9]|$)`).test(text), `the figure ${figure} is not printed`)
   // The same edit with the totals ALSO fixed in the report is the tool's problem, not a tampering: it is accepted at this layer.
   const fixed = withReport(changed, (r) => { r.stock.totals.openingQty = '77'; r.stock.totals.openingValueBase = '443.833313' })
   assert.deepEqual(problemsOf(fixed), [])
@@ -237,7 +242,7 @@ test('fx rates: a missing, a different and an unused rate are each refused', (t)
   precondition(t, 'non-base orders', 1)
   expectProblem(honest, /the currency has no rate in the apply manifest fxRates/, { fxRates: undefined })
   expectProblem(honest, /fxRateToBase differs from the rate the apply manifest states/, { fxRates: { EUR: '1.3' } })
-  expectProblem(honest, /lists USD but no selected purchase order uses it/, { fxRates: { EUR: '1.25', USD: '1.3' } })
+  expectProblem(honest, /lists a currency that no selected purchase order uses/, { fxRates: { EUR: '1.25', USD: '1.3' } })
 })
 
 test('owner rulings: a SKU the manifest forbids may appear in no prepared file, in any case, as a SKU, parent or component', (t) => {

@@ -8,6 +8,7 @@
  * names the operator is meant to check (--expect-db, --expect-system-id). Every value is also scanned: one that looks like a URL with credentials is refused outright, so a
  * pasted connection string cannot end up in the process list.
  */
+import { VERIFICATION_IDS } from './verify-core'
 import { APPLY_EXIT_CODES, APPLY_EXIT_CODE_TABLE, APPLY_REPORT_STEM_PREFIX, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME, type ApplyExitName } from './constants'
 
 export const CLI_MODES = ['rehearse', 'plan', 'apply'] as const
@@ -231,25 +232,43 @@ export interface ChildReportFacts {
   exitName: string
   verificationItems: number
   verificationFailed: number
+  /** The report has EXACTLY the shape of a finished, clean rehearsal load: the required steps (and only them) all DONE and balanced, no conflict, no problem, the throwaway target. */
+  complete: boolean
 }
 
 /**
- * Validate a parsed apply report as the report of THIS load's rehearsal child: the right tool, the digest of this load, a documented exit, a verification list that is a list.
- * Anything else is null (unreadable, invalid, or another run's report). Used by the rehearsal when it reads the child's report and by the apply when it re-reads the bound one.
+ * Validate a parsed apply report as the report of THIS load's rehearsal child. Every "which set" question is pinned to its exact required set, never "non-empty" or "all pass of whatever is there":
+ *   - the verification items are EXACTLY the closed list VERIFICATION_IDS (verify-core.ts, the one list the verifier also uses): each id once, no unknown id, none missing;
+ *   - the steps are EXACTLY the steps this load selected, in order;
+ *   - the tool, mode, digest and target database are the expected ones.
+ * Anything that does not parse into those shapes is null (unreadable, invalid, or another run's report). Whether the load was clean is `complete`, `verificationFailed` and the exit.
  */
-export function validateChildReport(parsed: unknown, manifestDigest: string): ChildReportFacts | null {
+export function validateChildReport(parsed: unknown, manifestDigest: string, expectedSteps: readonly string[]): ChildReportFacts | null {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
   const r = parsed as Record<string, unknown>
-  if (r.tool !== 'first-load-apply' || r.manifestDigest !== manifestDigest) return null
+  if (r.tool !== 'first-load-apply' || r.manifestDigest !== manifestDigest || r.mode !== 'apply') return null
   const exit = r.exit as { name?: unknown } | null | undefined
   if (typeof exit !== 'object' || exit === null || typeof exit.name !== 'string' || !APPLY_EXIT_CODE_TABLE.some((row) => row.name === exit.name)) return null
   if (!Array.isArray(r.verification)) return null
+  const seen = new Set<string>()
   let failed = 0
   for (const item of r.verification) {
-    const result = (item as { result?: unknown } | null)?.result
-    if (result !== 'pass') failed++
+    const id = (item as { id?: unknown } | null)?.id
+    if (typeof id !== 'string' || !(VERIFICATION_IDS as readonly string[]).includes(id) || seen.has(id)) return null
+    seen.add(id)
+    if ((item as { result?: unknown }).result !== 'pass') failed++
   }
-  return { exitName: exit.name, verificationItems: r.verification.length, verificationFailed: failed }
+  if (seen.size !== VERIFICATION_IDS.length) return null
+  const steps = Array.isArray(r.steps) ? (r.steps as Array<Record<string, unknown>>) : null
+  const target = r.target as { database?: unknown } | null | undefined
+  const complete = steps !== null
+    && steps.length === expectedSteps.length
+    && steps.every((st, i) => st !== null && typeof st === 'object' && st.step === expectedSteps[i] && st.status === 'DONE' && st.failed === 0 && st.updated === 0
+      && Number.isInteger(st.emitted) && st.emitted === (st.created as number) + (st.skippedExisting as number) && Array.isArray(st.conflicts) && st.conflicts.length === 0)
+    && r.accountingBalanced === true
+    && Array.isArray(r.problems) && r.problems.length === 0
+    && typeof target === 'object' && target !== null && target.database === REHEARSAL_DATABASE
+  return { exitName: exit.name, verificationItems: r.verification.length, verificationFailed: failed, complete }
 }
 
 /** Every signal of a rehearsal. The verdict is derived from all of them in ONE place (deriveRehearsalVerdict); nothing else may decide it. */
@@ -283,7 +302,8 @@ export function deriveRehearsalVerdict(s: RehearsalSignals): { verdict: string; 
   if (s.report === null) return no('REPORT_MISSING_OR_INVALID')
   if (s.report.exitName !== code) return no('REPORT_DISAGREES_WITH_EXIT')
   if (code !== 'OK') return no(code)
-  if (s.report.verificationItems === 0 || s.report.verificationFailed > 0) return no('VERIFICATION_NOT_ALL_PASS')
+  if (!s.report.complete) return no('REPORT_INCOMPLETE')
+  if (s.report.verificationItems !== VERIFICATION_IDS.length || s.report.verificationFailed > 0) return no('VERIFICATION_NOT_ALL_PASS')
   if (!s.targetUnchanged) return no('TARGET_CHANGED')
   if (!s.teardownComplete) return no('TEARDOWN_INCOMPLETE')
   if (s.problemCount > 0) return no('PROBLEMS_RECORDED')
@@ -322,20 +342,20 @@ export function checkRecordBinding(record: unknown): string[] {
   else {
     if (typeof b.file !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.json$/.test(b.file)) problems.push('the rehearsal record names no usable report file')
     if (typeof b.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(b.sha256)) problems.push('the rehearsal record binds no report SHA-256')
-    if (!Number.isInteger(b.verificationItems) || (b.verificationItems as number) <= 0) problems.push('the rehearsal record binds no verification items')
+    if (b.verificationItems !== VERIFICATION_IDS.length) problems.push('the rehearsal record does not bind the full verification list')
     if (b.verificationFailed !== 0) problems.push('the rehearsal record does not say every verification item passed')
   }
   return problems
 }
 
 /** The bound report as the file now holds it: its hash is the recorded one and its contents are a passing report of this load. */
-export function checkRecordReportFile(record: unknown, fileSha256: string, parsedReport: unknown, manifestDigest: string): string[] {
+export function checkRecordReportFile(record: unknown, fileSha256: string, parsedReport: unknown, manifestDigest: string, expectedSteps: readonly string[]): string[] {
   const b = (record as { report?: RecordReportBinding | null } | null)?.report
   if (!b) return ['the rehearsal record binds no child report']
   if (fileSha256 !== b.sha256) return ['the report the rehearsal record binds has changed since the rehearsal']
-  const facts = validateChildReport(parsedReport, manifestDigest)
+  const facts = validateChildReport(parsedReport, manifestDigest, expectedSteps)
   if (facts === null) return ['the report the rehearsal record binds is not a report of this load']
-  if (facts.exitName !== 'OK' || facts.verificationItems !== b.verificationItems || facts.verificationItems === 0 || facts.verificationFailed !== 0) return ['the report the rehearsal record binds is not an all-pass OK report']
+  if (facts.exitName !== 'OK' || !facts.complete || facts.verificationItems !== b.verificationItems || facts.verificationItems !== VERIFICATION_IDS.length || facts.verificationFailed !== 0) return ['the report the rehearsal record binds is not an all-pass OK report']
   return []
 }
 

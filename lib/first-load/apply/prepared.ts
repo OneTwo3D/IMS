@@ -269,8 +269,8 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     const stats = report.stock?.totals
     if (!stats) problems.push('the prepared report has no stock totals to compare the opening-stock file with')
     else {
-      if (fmt(totalQty) !== fmt(new D(stats.openingQty))) problems.push(`opening-stock: the file holds ${fmt(totalQty)} unit(s), the prepared report says ${stats.openingQty}`)
-      if (fmt(totalValue) !== fmt(new D(stats.openingValueBase))) problems.push(`opening-stock: the file is worth ${fmt(totalValue)}, the prepared report says ${stats.openingValueBase}`)
+      if (fmt(totalQty) !== fmt(new D(stats.openingQty))) problems.push('opening-stock: the total quantity of the file differs from the prepared report (TOTAL_QUANTITY_MISMATCH; the figures are in the two files, not here)')
+      if (fmt(totalValue) !== fmt(new D(stats.openingValueBase))) problems.push('opening-stock: the total value of the file differs from the prepared report (TOTAL_VALUE_MISMATCH; the figures are in the two files, not here)')
     }
     const zeroFinding = (report.findings ?? []).find((f) => f.code === 'ZERO_COST_OPENING_STOCK')
     if ((zeroFinding?.keys?.length ?? 0) !== zeroCostPairs.length) problems.push(`opening-stock: ${zeroCostPairs.length} zero-cost row(s) in the file, ${zeroFinding?.keys?.length ?? 0} in the prepared report`)
@@ -305,7 +305,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
         else if (fmt(rate.value) !== declared) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase differs from the rate the apply manifest states for its currency`)
       }
     }
-    for (const currency of Object.keys(manifest.fxRates)) if (!currenciesUsed.has(currency)) problems.push(`the apply manifest fxRates lists ${currency} but no selected purchase order uses it`)
+    for (const currency of Object.keys(manifest.fxRates)) if (!currenciesUsed.has(currency)) problems.push('the apply manifest fxRates lists a currency that no selected purchase order uses')
   }
 
   const declared = Object.keys(manifest.expectWarehouses).sort()

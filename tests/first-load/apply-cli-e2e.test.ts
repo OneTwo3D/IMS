@@ -177,7 +177,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
   describe('apply is refused, and writes nothing, without a rehearsal of this exact load', () => {
     it('no record file, a record of another digest, another target, an old one and one whose verdict is not OK: each exits 3 with no restore point and no run record', async (t) => {
       // Mutation: skip the gate before the restore point (or the core's gate) and the matching arm takes a dump or loads.
-      const good = { formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: 'x', verdict: 'OK', systemId, schemaHead: lastMigrationName(REPO), loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 1, verificationFailed: 0 }, finishedAt: new Date().toISOString() }
+      const good = { formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: 'x', verdict: 'OK', systemId, schemaHead: lastMigrationName(REPO), loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 17, verificationFailed: 0 }, finishedAt: new Date().toISOString() }
       const prepared = JSON.parse(readFileSync(join(reportDir, reportsIn().find((f) => f.includes('-plan-') && f.endsWith('.json'))!), 'utf8')) as { manifestDigest: string }
       const digest = prepared.manifestDigest
       const arms: Array<[string, Record<string, unknown>]> = [
@@ -315,6 +315,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
         targetSystemId: systemId,
         manifestPath: manifest,
         manifestDigest: planDigest,
+        steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'],
         schemaHead: lastMigrationName(REPO),
         repoRoot: REPO,
         root: rehearsalRoot,
@@ -340,7 +341,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       const planDigest = (jsonOf(reportsIn().find((f) => f.includes('-plan-') && f.endsWith('.json'))!) as { manifestDigest: string }).manifestDigest
       return rehearse({
         targetEnv: Object.fromEntries(readFileSync(envFile, 'utf8').split('\n').filter(Boolean).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)])),
-        targetSystemId: systemId, manifestPath: manifest, manifestDigest: planDigest, schemaHead: lastMigrationName(REPO), repoRoot: REPO, root: rehearsalRoot, reportDir, reportStem: stem, operator: 'E2E Operator',
+        targetSystemId: systemId, manifestPath: manifest, manifestDigest: planDigest, steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'], schemaHead: lastMigrationName(REPO), repoRoot: REPO, root: rehearsalRoot, reportDir, reportStem: stem, operator: 'E2E Operator',
         log: () => undefined, hooks: { afterChild },
       })
     }
@@ -350,6 +351,9 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       ['the report truncated to invalid JSON', (json) => writeFileSync(json, '{"tool": "first-load-apply", "manif')],
       ['the report of another load', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.manifestDigest = 'f'.repeat(64); writeFileSync(json, JSON.stringify(r)) }],
       ['the report with a failing verification item', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.verification[0].result = 'fail'; writeFileSync(json, JSON.stringify(r)) }],
+      ['the report with one verification item dropped', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.verification = r.verification.slice(1); writeFileSync(json, JSON.stringify(r)) }],
+      ['the report with one dropped and a duplicate as padding', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.verification = [...r.verification.slice(1), r.verification[1]]; writeFileSync(json, JSON.stringify(r)) }],
+      ['the report with a step removed', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.steps = r.steps.slice(1); writeFileSync(json, JSON.stringify(r)) }],
       ['the report with no verification items', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.verification = []; writeFileSync(json, JSON.stringify(r)) }],
       ['the report naming another exit than the process', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.exit.name = 'VERIFY_FAILED'; writeFileSync(json, JSON.stringify(r)) }],
     ]
