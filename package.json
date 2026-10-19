@@ -25,6 +25,7 @@
     "check:bom-recipes": "tsx scripts/check-bom-recipe-consistency.ts",
     "first-load:prepare": "tsx scripts/first-load-prepare.ts",
     "first-load:woo-snapshot": "tsx scripts/first-load-woo-snapshot.ts",
+    "first-load:apply": "tsx scripts/first-load-apply.ts",
     "repair:duplicate-bom": "tsx scripts/deactivate-duplicate-bom.ts",
     "db:stamp-scratch": "tsx scripts/stamp-scratch-database.ts",
     "db:unstamp-scratch": "tsx scripts/stamp-scratch-database.ts --unstamp",

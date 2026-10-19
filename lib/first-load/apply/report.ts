@@ -12,6 +12,20 @@ export interface PreconditionResult {
   detail: string
 }
 
+export interface ReportTarget {
+  database: string
+  systemId: string
+  migrations: number
+}
+
+export interface ReportRestorePoint {
+  path: string
+  sha256: string
+  bytes: number
+  /** pg_restore --list read the dump. A restore into a scratch database with row-count parity is NOT done by this command. */
+  listed: boolean
+}
+
 export interface ApplyReport {
   tool: 'first-load-apply'
   formatVersion: typeof APPLY_REPORT_FORMAT_VERSION
@@ -27,6 +41,12 @@ export interface ApplyReport {
     zeroCostAccepted: string[]
     warehouses: string[]
   }
+  /** The database the run was pointed at, as the server reported it. */
+  target: ReportTarget | null
+  /** apply only: the restore point taken before the first write. */
+  restorePoint: ReportRestorePoint | null
+  /** rehearse only: the target was only read, and its table counts were identical before and after. */
+  targetUnchanged: boolean | null
   preconditions: PreconditionResult[]
   steps: Array<Omit<StepResult, 'rows'> & { rows: StepResult['rows'] }>
   /** The accounting identity per step, restated: emitted = created + updated + skippedExisting + failed. */
@@ -36,7 +56,7 @@ export interface ApplyReport {
   window: { start: string; end: string } | null
 }
 
-export function buildApplyReport(args: { prepared: PreparedRun; result: ApplyResult; preconditions?: PreconditionResult[]; window?: { start: string; end: string } | null }): ApplyReport {
+export function buildApplyReport(args: { prepared: PreparedRun; result: ApplyResult; preconditions?: PreconditionResult[]; window?: { start: string; end: string } | null; target?: ReportTarget | null; restorePoint?: ReportRestorePoint | null; targetUnchanged?: boolean | null }): ApplyReport {
   const { prepared, result } = args
   const exitName = result.exit
   return {
@@ -54,6 +74,9 @@ export function buildApplyReport(args: { prepared: PreparedRun; result: ApplyRes
       zeroCostAccepted: prepared.manifest.acceptZeroCost,
       warehouses: prepared.warehouseCodes,
     },
+    target: args.target ?? null,
+    restorePoint: args.restorePoint ?? null,
+    targetUnchanged: args.targetUnchanged ?? null,
     preconditions: args.preconditions ?? [],
     steps: result.steps,
     accountingBalanced: result.steps.every((s) => s.emitted === s.created + s.updated + s.skippedExisting + s.failed),
@@ -84,6 +107,9 @@ export function renderApplyMarkdown(report: ApplyReport): string {
   if (report.exit.operatorText !== '') out.push(`- ${report.exit.operatorText}`)
   out.push('')
   if (report.problems.length > 0) out.push('## Problems', '', ...report.problems.map((p) => `- ${p}`), '')
+  if (report.target) out.push('## Target', '', `- Database: ${report.target.database}`, `- Cluster system identifier: ${report.target.systemId}`, `- Migrations recorded: ${report.target.migrations}`, '')
+  if (report.restorePoint) out.push('## Restore point', '', `- File: ${report.restorePoint.path}`, `- SHA-256: ${report.restorePoint.sha256} (${report.restorePoint.bytes} bytes)`, `- pg_restore --list read it: ${report.restorePoint.listed ? 'yes' : 'NO'}`, '')
+  if (report.targetUnchanged !== null) out.push(`- The target database was only read; its table row counts were ${report.targetUnchanged ? 'identical before and after' : '**DIFFERENT after (the rehearsal is not valid)**'}.`, '')
   out.push('## Prepared run', '', `- Prepared report SHA-256: ${report.prepared.reportSha256}`, `- Steps not selected: ${report.prepared.notSelected.join(', ') || 'none'}`)
   out.push(`- Variant parents bound to a verified WooCommerce snapshot: ${report.prepared.variantParents ? 'yes' : 'not used'}`, `- Zero-cost pairs accepted by the operator: ${report.prepared.zeroCostAccepted.length}`, '')
   out.push(...table(['File', 'SHA-256'], report.prepared.outputs.map((o) => [o.name, o.sha256])), '')

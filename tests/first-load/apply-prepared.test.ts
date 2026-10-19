@@ -167,6 +167,8 @@ test('keys: duplicate and look-alike keys, ids and unusable cells are refused', 
     ['duplicate SKU', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, `${oak}\r\n${oak}`)), /the same key as chunk 1 line/],
     ['SKU differing only in case', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, `${oak}\r\n${oak.replace('ZQSENT-OAK-BOARD,Name', 'zqsent-oak-board,Name')}`)), /only in letter case/],
     ['a productId', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, oak.replace(',,ZQSENT-OAK', 'p1,,ZQSENT-OAK'))), /productId must be blank/],
+    // Mutation: drop 'preferredSupplierId' from ID_COLUMNS (keys.ts) and this arm goes red, because the cell is then accepted and reads back as a conflict after a successful import.
+    ['a preferredSupplierId', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, oak.replace('SIMPLE,,,,,', 'SIMPLE,,,,,ZQSENT-SUPPLIER-ID'))), /preferredSupplierId must be blank/],
     ['duplicate supplier name in other case', withConsistentFile(honest, SUPPLIERS, (s) => s.replace(',ZQSENT Timber Co,', ',ZQSENT Cotton LTD,')), /only in letter case|the same key as/],
     ['duplicate opening-stock pair', withConsistentFile(honest, STOCK, (s) => s.replace('ZQSENT-LEG-01,ZQSENT-MAIN,8,12.000000', 'ZQSENT-OAK-BOARD,ZQSENT-MAIN,8,12.000000')), /the same key as chunk 1 line/],
     ['zero opening quantity', withConsistentFile(honest, STOCK, (s) => s.replace('ZQSENT-LEG-01,ZQSENT-MAIN,8,', 'ZQSENT-LEG-01,ZQSENT-MAIN,0,')), /greater than zero/],

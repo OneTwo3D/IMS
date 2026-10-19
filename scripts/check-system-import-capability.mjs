@@ -7,7 +7,7 @@
  * importers with no session and with their outbound effects suppressed. Anything that can import it can load data
  * into the installation without a permission check, so the set of importers is a closed list:
  *
- *   - `mintSystemImportContext` : lib/first-load/apply/** , scripts/first-load-apply.ts and tests.
+ *   - `mintSystemImportContext` : lib/first-load/apply/** , scripts/first-load-apply.ts, scripts/lib/first-load-rehearse.ts (the rehearsal: it takes the command's constants and the rehearsal record, not the symbol) and tests.
  *   - `SYSTEM_IMPORT`, `isSystemImportContext`, `withSystemActor`, `withSystemOutcome` and the types :
  *     those, plus the three importer modules that honour the context (they must compare the symbol INLINE, because
  *     the Server Action guard scan only credits a skipped permission check that compares against a module-level
@@ -36,7 +36,7 @@ export const CAPABILITY_MODULE = `${APPLY_TREE}/system-import-capability`
 
 /** Free to import anything from the module. */
 export const RUNNER_PREFIXES = ['lib/first-load/apply/', 'tests/']
-export const RUNNER_FILES = ['scripts/first-load-apply.ts']
+export const RUNNER_FILES = ['scripts/first-load-apply.ts', 'scripts/lib/first-load-rehearse.ts']
 
 /** The importer modules that honour the context: named bindings from CHECKER_NAMES (and types) only. */
 export const IMPORTER_MODULES = [
@@ -151,7 +151,7 @@ export function runCensus({ root = process.cwd() } = {}) {
       continue
     }
     for (const use of uses) {
-      violations.push(`${rel}:${use.line}: ${use.kind} of the system-import capability (${use.names.join(', ')}) is not allowed here; only lib/first-load/apply/**, scripts/first-load-apply.ts, tests and the three importer modules may touch it`)
+      violations.push(`${rel}:${use.line}: ${use.kind} of the system-import capability (${use.names.join(', ')}) is not allowed here; only lib/first-load/apply/**, scripts/first-load-apply.ts, scripts/lib/first-load-rehearse.ts, tests and the three importer modules may touch it`)
     }
   }
 

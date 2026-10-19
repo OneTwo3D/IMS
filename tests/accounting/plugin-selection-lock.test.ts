@@ -1145,6 +1145,17 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // The first-load apply runner's quiesce rail reads pg_stat_activity (on the app's own pooled client) to prove no other client session is connected before it loads anything. A READ: it writes nothing
   // and cannot move a plugin key; the rest of that file only reads configuration (tax rates, warehouses, FX).
   'lib/first-load/apply/db/rails.ts': 'deploy-read-only-probe',
+  // The first-load apply command and its verification. None of them names a plugin key or touches the connector selection:
+  //   * cli.ts and report.ts: pure; their prose names pg_dump / pg_restore (the restore point the command takes). They execute nothing.
+  //   * db/verify.ts: reads exact table counts and invariants through the app's own client, and writes ONE thing, the census baseline fact on the runner's own run record (first_load_apply_runs).
+  //   * scripts/first-load-apply.ts: the operator-run command. It loads the first-load files through the importers (as a system actor, with every connector effect suppressed), takes a pg_dump restore point and
+  //     writes the run record; it is run with the application stopped.
+  //   * scripts/lib/first-load-rehearse.ts: connects to the TARGET only over a read-only connection (counts) and through pg_dump; everything it writes goes to a throwaway cluster it initialises itself.
+  'lib/first-load/apply/cli.ts': 'names-the-tools-only',
+  'lib/first-load/apply/report.ts': 'names-the-tools-only',
+  'lib/first-load/apply/db/verify.ts': 'operator-run-write',
+  'scripts/first-load-apply.ts': 'operator-run-write',
+  'scripts/lib/first-load-rehearse.ts': 'operator-run-read',
   'scripts/run-migration-verifications.mjs': 'deploy-read-only-probe',
   // o3d-2sm1.5's post-migration ownership assertion. It runs one SELECT over pg_class and asks
   // has_table_privilege / has_sequence_privilege / has_schema_privilege ABOUT THE APPLICATION ROLE

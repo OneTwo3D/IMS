@@ -142,6 +142,11 @@ export interface ApplyOptions {
   rehearsal: unknown
   /** The target's system identifier (mode 'apply' only). */
   systemId: string | null
+  /**
+   * Set ONLY by the rehearsal itself, on the throwaway database it made: this run IS the rehearsal, so it needs no record of one. The command line sets it only after it has
+   * proved the database is the throwaway (docs/first-load-apply.md, "The rehearsal"). Never set it from an operator's argument.
+   */
+  thisIsTheRehearsal?: true
   now: Date
   maxRehearsalAgeHours: number
 }
@@ -228,7 +233,7 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   const finish = (exit: ApplyExitName, problems: string[], steps: StepResult[], record: RunRecord | null, verification: VerificationItem[] = []): ApplyResult =>
     ({ exit, mode: options.mode, problems, steps, verification, record })
 
-  if (options.mode === 'apply') {
+  if (options.mode === 'apply' && options.thisIsTheRehearsal !== true) {
     const gate = checkRehearsalGate(options.rehearsal, { manifestDigest: prepared.manifestDigest, systemId: options.systemId, now: options.now, maxAgeHours: options.maxRehearsalAgeHours })
     if (gate.length > 0) return finish('PRECONDITION_REFUSED', gate, [], null)
   }

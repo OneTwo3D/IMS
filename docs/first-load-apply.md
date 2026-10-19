@@ -1,6 +1,6 @@
-# First-load apply runner: the core
+# First-load apply runner
 
-The first-load tool (`npm run first-load:prepare`, see [first-load-input-spec.md](first-load-input-spec.md)) turns the owner's exports into importer files and proves what it can without a database. The **apply runner** loads those files into an empty installation through the application's own importers. This page documents the part of the runner that exists today: **the core**, which reads and verifies a prepared run from bytes, works out which rows still have to be loaded, and drives the steps (plan, apply, resume) through ports.
+The first-load tool (`npm run first-load:prepare`, see [first-load-input-spec.md](first-load-input-spec.md)) turns the owner's exports into importer files and proves what it can without a database. The **apply runner** loads those files into an empty installation through the application's own importers. This page documents the runner as it exists today: **the core**, which reads and verifies a prepared run from bytes, works out which rows still have to be loaded, and drives the steps (plan, apply, resume) through ports; **the database side**, the real implementations of those ports; **the verification and census** that decide whether a finished load is a success; and **the command** (`npm run first-load:apply`) with its rehearsal, restore point and report publication.
 
 > **PRECONDITION: THE APPLICATION IS STOPPED.** The first load must run against a database that **no other writer is connected to**. The runner's step lock excludes only other first-load runners; an ordinary request, worker or cron job could create or change a row between the runner's read and the importer's write, and the importer would overwrite it from the file while the read-back reported it as created.
 >
@@ -13,11 +13,11 @@ The first-load tool (`npm run first-load:prepare`, see [first-load-input-spec.md
 >
 > The runner **proves that no other client session is connected now** (before anything is written, at the start of each step, just before its first write, and before EVERY bounded importer call of at most 500 rows). A session that connects between two calls is detected at the next call only, so the most it can overlap is one bounded call; it cannot prove that none will connect later. See "The quiesce rail" and the not-proven list.
 
-**What exists today:** the **core**, which reads and verifies a prepared run from bytes, works out which rows still have to be loaded, and drives the steps (plan, apply, resume) through ports; and the **database side** (`lib/first-load/apply/db/`), the real implementations of those ports: reading the target, calling the application's own importers as a system actor, the durable run record, the per-step lock and the database rails. The core opens no database connection, socket or child process; the database side opens only the connections to the target it is pointed at (`DATABASE_URL`) and never touches the network. Mintsoft, Xero and WooCommerce are never touched.
+**What exists today:** the **core**; the **database side** (`lib/first-load/apply/db/`): reading the target, calling the application's own importers as a system actor, the durable run record, the per-step lock and the database rails; the **post-run verification and census** (`verify-core.ts`, `db/verify.ts`); and the **command** (`scripts/first-load-apply.ts`, `lib/first-load/apply/cli.ts`, `scripts/lib/first-load-apply-files.ts`, `scripts/lib/first-load-rehearse.ts`) with its three modes, the restore point and the published reports. The core opens no database connection, socket or child process; the database side opens only the connections to the target it is pointed at (`DATABASE_URL`) and never touches the network; the command's rehearsal starts a PostgreSQL cluster of its own on a loopback port. Mintsoft, Xero and WooCommerce are never touched.
 
-**What is not built yet:** the restore point, the rails that read the outbound-write hold, the connectors and the crons, the post-run verification and census, the command-line shell with its rehearsal mode (which is what picks the target and confirms its name and system id), and the go/no-go check.
+**What is not built yet:** the rails that read the outbound-write hold *before* a load (the verification reads it after: `outbound-held`), the runnable-connector, cron and producer cut-off rails, restoring the restore point into a scratch database to prove row-count parity, running `npm run validate:db` against the loaded database (the verification instead checks the migration table, the invariant report and the stock identities directly), and the readiness-gate check that reads the published apply report (the report is published in the gate's format so the check can be added without changing it).
 
-The code is in `lib/first-load/apply/`: `constants.ts` (every constant and operator sentence), `manifest.ts` (the operator's manifest), `prepared.ts` (load and verify), `keys.ts` (natural keys and fingerprints), `normal-form.ts` (what "the same value" means, in one place), `residual.ts` (what is still to load), `import-calls.ts` (how a file is cut into importer calls), `orchestrate.ts` (plan, apply, resume), `report.ts` and `io.ts`; and in `lib/first-load/apply/db/`: `observe.ts`, `execute.ts`, `journal.ts`, `lock.ts`, `rails.ts` and `ports.ts`.
+The code is in `lib/first-load/apply/`: `constants.ts` (every constant and operator sentence), `manifest.ts` (the operator's manifest), `prepared.ts` (load and verify), `keys.ts` (natural keys and fingerprints), `normal-form.ts` (what "the same value" means, in one place), `residual.ts` (what is still to load), `import-calls.ts` (how a file is cut into importer calls), `orchestrate.ts` (plan, apply, resume), `report.ts` and `io.ts`; and in `lib/first-load/apply/db/`: `observe.ts`, `execute.ts`, `journal.ts`, `lock.ts`, `rails.ts`, `verify.ts` and `ports.ts`. The pure verification rules are in `verify-core.ts`, and the command's pure part in `cli.ts`.
 
 ## What a load is
 
@@ -91,10 +91,13 @@ A conflict found under the step lock is reported in the problems as a **closed c
 The apply report (JSON and Markdown) is a **private operator artefact**: write it to a directory only the operator can read (the files are created 0600) and do not paste it into tickets or chat. It contains identifiers and counts, and nothing else from the prepared files:
 
 - the run id, the load digest, the prepared run's file names and SHA-256 hashes, counts, and the exit name with its operator sentence;
+- the target as the server reported it (database name, cluster system identifier, number of migrations recorded), the restore point (path, SHA-256, size, and that `pg_restore --list` read it), and for a rehearsal whether the target was proved unchanged;
 - per step: counts, the residual files' names, row counts and hashes, and one row per unit with exactly these fields: `key` (the unit key: a supplier name in lower case, a product SKU, an `SKU|WAREHOUSE` pair or a purchase-order reference), `outcome` (a closed word) and `reason` (a closed word or null);
 - per conflict: `key`, `code` (a closed word) and `detail` (a fixed sentence);
 - per importer message: a bounded `code` and a row number. The importer's own text is **never** stored or rendered, because it can carry file values or exception text;
-- the problems of the run (the problem text rules above) and the verification items the verification slice supplies.
+- the problems of the run (the problem text rules above) and the verification items (below), each a closed id with a pass or fail and a count or closed word for what was expected and found.
+
+A report is published as `first-load-apply-<mode>-<run id>-<UTC stamp>.json` with a `.md` companion, in the report directory: each file is created exclusively (never overwriting, never through a symlink, mode 600), the Markdown first and the JSON last as the commit record, and the JSON names its Markdown by SHA-256 (`companionMarkdownSha256`), the format `lib/ops/published-report.ts` verifies. A rehearsal also publishes `first-load-rehearsal-record-<run id>-<UTC stamp>.json`.
 
 The unit key is a catalogue identifier the operator needs in order to act on a failure, so it is in the report. **No other cell of a prepared file is, no exception message is, and no credential is.** The keys are catalogue data, not secrets, but a supplier name or a reference can still be commercially sensitive: keep the report directory private.
 
@@ -117,6 +120,89 @@ The unit key is a catalogue identifier the operator needs in order to act on a f
 
 An unreadable database is never treated as an empty one: the read fails closed (refusal before the first write, or STEP_FAILED during the run).
 
+## The command
+
+`npm run first-load:apply -- <flags>` (`scripts/first-load-apply.ts`). The target is named by an **env file**, never by an argument: no secret is ever on a command line, and a value that looks like a connection string with a credential is refused outright. The process environment is **replaced** by a short whitelist (`PATH`, `LANG`, `LC_ALL`, `TZ`, `HOME`) plus the env file's variables, before the application's database client is imported, so an inherited `DATABASE_URL`, `PG*` variable or outbound grant cannot change where the run writes or what it believes. An env file that sets a variable that would redirect a client library (`PG*`, `NODE_OPTIONS`, `LD_PRELOAD` and similar) is refused, not silently cleaned. The env file must be a regular file owned by the caller with mode 600. The target is confirmed twice, by what the server says about itself: `--expect-db` against `current_database()` and `--expect-system-id` against `pg_control_system()`; a mismatch is PRECONDITION_REFUSED before anything else is read or written.
+
+| Flag | Value | Applies to | Meaning |
+| --- | --- | --- | --- |
+| `--manifest` | `<file>` | all | The apply manifest (JSON). A relative preparedDir or wooSnapshot path in it is relative to the manifest file. |
+| `--env-file` | `<file>` | all | The installation env file naming the target (DATABASE_URL inside). A regular file owned by the caller, mode 600. The process environment is replaced by a short whitelist plus this file. |
+| `--expect-db` | `<name>` | all | Must equal current_database() as the server reports it, or the command refuses (exit 3). |
+| `--expect-system-id` | `<id>` | all | Must equal the cluster system identifier as the server reports it, or the command refuses (exit 3). |
+| `--report-dir` | `<dir>` | all | Where the reports and the rehearsal record are published. Created mode 700 if absent; a real directory owned by the caller, closed to group and others. |
+| `--rehearse` | none | mode | The default. Copy the target into a throwaway cluster, run the whole load there and write a rehearsal record. The target is only read, and proved unchanged. |
+| `--plan` | none | mode | Read the target and report what a load would do. Writes nothing to the database. |
+| `--apply` | none | mode | Load the target: restore point, steps, verification, census. Needs --rehearsal-record. |
+| `--rehearsal-record` | `<file>` | --apply | The record a rehearsal of this exact load wrote: same digest, same target system id, same newest migration as this checkout, verdict OK, within 24 hours. |
+| `--resume` | none | --apply | Continue an interrupted load of the same digest (also verifies an APPLIED run). Needs the restore point recorded on the run record, unchanged. |
+| `--operator` | `<label>` | --apply, --rehearse | Who the activity log names for the rows written (letters, digits, spaces, dots, dashes, underscores; default first-load-apply). |
+| `--root` | `<dir>` | --rehearse | Where the throwaway cluster is made (default /var/tmp; not on a RAM-backed file system; every ancestor must be trustworthy). |
+| `--help` | none | all | Print this text. |
+
+Modes: `--rehearse` is the default (the safe one). `--plan` reads and reports. `--apply` writes, and only with a rehearsal record. The command refuses to run as root in `--rehearse` (the throwaway cluster's `initdb` will not); `--plan` and `--apply` run as the account that owns the env file.
+
+### The rehearsal
+
+The whole load, steps, verification and census, on a **copy** of the target in a throwaway cluster of its own. A preview would not do: it writes nothing, so on an empty database every downstream file fails to find what the earlier file would have created, and a purchase-order preview never reaches the code that needs an exchange rate. The rehearsal:
+
+1. refuses to start (PRECONDITION_REFUSED, nothing created) as root, without PostgreSQL server binaries, on a `--root` that is not a directory, is on a RAM-backed file system or has an ancestor other accounts could modify;
+2. counts every table of the target exactly, over a connection that cannot write (`default_transaction_read_only`);
+3. dumps the target (`pg_dump --format=custom`, read only; the credentials reach the client tool as environment variables of that child only);
+4. initialises a cluster under `<root>/ims-rehearsal-*` on a loopback port nothing else holds, with a superuser role of its own and a random password, restores the dump into a database named `ims_firstload_rehearsal`, and writes the child's env file (the installation's variables with `DATABASE_URL` replaced; mode 600, shredded in the teardown);
+5. runs **this same command** as a child (`--apply --rehearsal-child-dir <run directory> --report-stem <stem>`) pointed at the copy. A child, because the application's database client reads its URL once, when first imported;
+6. tears the cluster down in a `finally`: the postmaster is stopped by the PID captured at start and confirmed to still be ours, the env file is shredded and the directory removed (`scripts/rehearse-first-install.ts` `teardownRun`, reused unchanged). An incomplete teardown is exit 7 (REHEARSAL_TEARDOWN_INCOMPLETE);
+7. counts every table of the target again. **Any difference makes the rehearsal not valid**: the copy is then not a copy of the target as it now is, so the verdict is `TARGET_CHANGED` and the exit INTERNAL. (This also catches an unrelated writer on the target during the rehearsal, which is the right answer for a record that says "this target loads".)
+8. publishes the **rehearsal record**: `formatVersion`, `manifestDigest`, `verdict`, `systemId` (the TARGET's cluster identifier, not the copy's), `finishedAt`, `schemaHead` (the newest migration directory of the checkout the rehearsal ran from; `--apply` refuses a record whose head is not its own checkout's, or that has none), and for the audit `loadExit`, `targetUnchanged`, `teardownComplete`. The verdict is the string `OK` only when the load on the copy ended OK, the target is proved unchanged and the teardown is complete; otherwise it is a closed word naming why (`TARGET_CHANGED`, `TEARDOWN_INCOMPLETE`, `NOT_RUN` or the load's own exit name).
+
+**The one thing the child waives is the need for a rehearsal record**, because it IS the rehearsal. It does so only after proving the database it was handed is the throwaway: the database is named `ims_firstload_rehearsal` AND the server's `data_directory` is inside the run directory the parent named, which must be an `ims-rehearsal-*` directory (both proofs are tested separately). Pointed at any other database it refuses (exit 3) and writes nothing.
+
+What a green rehearsal does **not** say: that the target will behave like the copy under a concurrent writer (the target is quiesced for a load, not fenced), that the real data's size or timing will, that anything outside the database is quiet, or that the target's content (rather than its row counts) is unchanged: the zero-write proof compares an exact `count(*)` of every table, so an update in place that changes no count is not seen by it (the rehearsal's own connections to the target are read-only, which is what prevents one).
+
+### The restore point
+
+Taken by `--apply` on a fresh load, after the rehearsal gate has passed and before the first write: `pg_dump --format=custom --no-owner` into `<restorePointDir>/first-load-<run id>.dump`, created exclusively with mode 600 (never overwritten), then its SHA-256 and size are recorded, and `pg_restore --list` must read it (otherwise it is removed and the command refuses, with nothing written to the database). `restorePointDir` must already exist, be a real directory owned by the caller and closed to group and others; it is not created, because a typo would make a new one. The restore point is recorded once on the run record (`facts.restorePoint`). A `--resume` checks the recorded file is still there with the same SHA-256 and size and refuses (exit 3) otherwise: **there is no resuming without a way back**. A load begun without a recorded restore point cannot be resumed. The command never restores by itself.
+
+## Verification and the census
+
+Run by the ports after the last step (and on a `--resume` of an APPLIED run, which loads nothing). Every item is in the report; any failing item gives exit 1 (VERIFY_FAILED) and the run record VERIFY_FAILED, which a later `--resume` re-verifies. Items carry counts and closed words, **never** a SKU, supplier, reference, warehouse code, quantity or amount from the files: a failing stock total says how many totals differ, and the operator reads the numbers from the database. **A reading that cannot be taken is a failed item** ("could not be read"), never a missing one and never a pass.
+
+| Item | What it checks |
+| --- | --- |
+| accounting-identity | In every step, emitted = created + skipped (existing); nothing was updated, failed or left in conflict. |
+| row-chain-to-prepared-report | In every step, the rows of the units are all of the prepared file's rows, the units are what the step emitted, and the file's row count is the one the prepared report planned: the tool's accounting continues into the runner's with no row in between. |
+| final-readback | The database is read again from scratch at the end and every unit of every selected step is present and matching, with no row nobody in this run emitted. The step results are not trusted. |
+| rails-after-load | The rails (nobody else connected, no data class holding a row it must not, warehouses and base currency as declared, every row of a table the runner writes attributable to the files) hold over the finished load. |
+| stock-totals | Opening-layer quantity and value equal the file per warehouse and the prepared report in total, exactly (tolerance zero), and no other layer exists. |
+| opening-movements | There is one opening movement per opening layer, their quantity equals the file, and no movement of another type exists. |
+| stock-levels-equal-layers | Every stock level equals the sum of the remaining quantity of its layers, and nothing is reserved. A level without a layer, or a layer without a level, is a difference. |
+| invariants | The application's own scheduled invariant check, run in process and writing nothing, completes with no critical finding. |
+| bom-recipe-drift | ProductComponent and the manufacturing BOM agree for every BOM product. |
+| purchase-orders-draft | Every loaded purchase order is a draft, and there are as many as the file has. |
+| base-currency | The base currency is locked, is GBP and is the manifest's. |
+| migrations-applied | Every migration of this checkout is recorded and finished, and none is rolled back. |
+| outbound-held | The outbound-write status, evaluated against the installation's environment (this process's, which is the env file's variables on a whitelist), exits 0 under --expect-held: no grant, none unreadable, nothing queued or live. |
+| no-held-writes | The number of refused outbound writes in the activity log equals its number at the start of the load (a count, not a time window). |
+| no-queue-growth | The outbound queue, the accounting sync log, the warehouse job queue and the email queue hold the rows they held at the start. |
+| census-baseline | The starting counts were recorded on the run record before the first importer call. |
+| write-census | Comparing an exact row count of every base table now with the starting counts, only tables the runner writes changed; any other changed table (or a table that appeared or vanished) is named. |
+
+**The census baseline.** The census compares the database with itself, so the starting counts are taken before the first importer call and kept where a resume can find them: the run record's `facts.baseline` (written once, never rewritten), recorded at the start of the first step after the rails have passed. It holds an exact `count(*)` of every base table of the `public` schema (from `information_schema`, not a fixed list, not `pg_stat`, whose counters flush asynchronously) and the number of refused outbound writes in the activity log. The tables the runner may change are exactly the registry's RUNNER_WRITES class; any other table that changed, and any table that appeared or vanished, is named. A load whose record has no baseline (begun by an earlier build) cannot be census-verified: all four census items fail.
+
+**Why a count and not a window** for refused outbound writes: a time window would infer "new" from two clocks (the database's and the application's) and from the order of timestamps. A count needs neither. What a count cannot see is one row deleted and another inserted in the same load, which needs the application running and writing during it; it is stopped for a load, and the quiesce rail checks nobody else is connected.
+
+### Audit of the failure classes the review keeps finding
+
+| Class | Where it could occur here | What closes it | Test (mutation that turns it red) |
+| --- | --- | --- | --- |
+| Time-of-check to time-of-use between a decision and a write | the rehearsal gate checked by the command, then the restore point, then the load; the baseline and the restore-point fact | the command checks the gate before the dump and the core checks it again before it reads the database; the run record is created by compare-and-swap, so a second runner that raced past the check loses; the restore point is created exclusively, so a second dump of the same run is refused; the baseline and the restore point are `setFactOnce` (the first writer wins), taken after the rails pass at step start | `apply-cli-e2e`: five stale or foreign records exit 3 with no dump and no run record (skip the gate); `apply-verify`: the baseline is the first attempt's after a crash and a resume (record it again on every start) |
+| Starvation or a false finding | the zero-write proof; the held-writes check; a rehearsal on a target someone else writes to | the proof is an exact count of every table, so it does not depend on a flush; held writes are a count against the baseline, not a window; an unrelated writer on the target makes the rehearsal NOT valid (stated, and the right answer) rather than green | `apply-cli`: one row, an added table, a dropped table and swapped rows are each a change (compare the baseline's keys only); `apply-verify`: a refused write is caught by count |
+| Fail-open on unreadable state | every verification read; the baseline; the env file; the restore point on resume; the target identity | a failed read is a failed item; an unreadable or missing baseline fails all four census items; an unreadable env file, run record or restore point is a refusal; an unreadable target is PRECONDITION_REFUSED | `apply-verify`: a table renamed away yields failed items for it and every id is still present (let the error escape or drop the item); a record without a baseline (return nothing) |
+| A secret or a data key in problem text, logs or arguments | the command's output, the process list, the child's environment | counts and closed words in every item and problem; the credential-in-URL argument check; the target by env file; whitelist environment; the child's env file is 600 and shredded; the report contains unit keys only (as already documented) | `apply-cli`: seven credential-shaped arguments are refused and not echoed; `apply-cli-e2e`: no output of any run contains a secret of the scratch installation or a value of the prepared files |
+| A verification through a coarser value than what is stored | stock totals; unit cost; levels against layers | exact decimals, tolerance zero, at the stored precision (6 dp); the database is summed in SQL as `numeric` (no float); levels are compared with the sum of layers per pair, including a level without a layer and a layer without a level | `apply-verify-core`: a difference of 0.000001 in quantity, in value, in the report total; `apply-verify`: the same in the database (compare through 2 dp or with a tolerance) |
+| "Looks empty, so skipped" | a baseline with no tables; no step selected; no opening-stock step; no report total; an empty list of steps | an empty baseline is unusable; an empty step list fails the identity and the chain; with no opening-stock step the database must hold NO opening layer and the report total expected is zero; a missing report total is a failure, not a pass | `apply-verify-core`: no steps, no baseline, no report total each fail |
+| Ordering inferred from timestamps | the census; the held-writes check; the report files | counts, not windows or timestamps; the report stem's timestamp is only a name, and a name that exists is refused rather than replaced | `apply-cli`: a second publication under the same stem is refused |
+
 ## Exit codes
 
 <!-- The table below is exactly APPLY_EXIT_CODE_TABLE in lib/first-load/apply/constants.ts; tests/first-load/apply-docs.test.ts fails when they differ. -->
@@ -131,7 +217,7 @@ An unreadable database is never treated as an empty one: the read fails closed (
 | 5 | CONFLICT | The database holds a key with different data than the file (or a row nobody in this run created). Nothing further was written; rows from earlier steps ARE written. |
 | 6 | INTERNAL | A self-check failed (the row accounting did not reconcile, or a report write failed). This is a defect in the runner. The database state is NOT assumed to be unchanged. |
 | 7 | REHEARSAL_TEARDOWN_INCOMPLETE | Rehearsal only: the throwaway database could not be removed completely. The real target was not written. |
-| 8 | APPLIED_UNVERIFIED | Every step loaded and the row accounting reconciles, but NO post-run verification was run (this runner has no verification port yet). This is NOT a success: do not treat it as OK. Rows ARE written. A later --resume of the same load runs the verification when it exists. |
+| 8 | APPLIED_UNVERIFIED | Every step loaded and the row accounting reconciles, but NO post-run verification was run (the runner was built without a verification port; the command always supplies one). This is NOT a success: do not treat it as OK. Rows ARE written. A later --resume of the same load runs the verification. |
 
 Only USAGE and PRECONDITION_REFUSED say that nothing was written, because no write happens before the precondition phase ends and a test proves it. Every other non-zero exit says that rows may be written and prints the restore procedure. The runner never restores by itself and never deletes rows.
 
@@ -185,7 +271,7 @@ Every id of `APPLY_TIME_CHECKS` (see [first-load-input-spec.md](first-load-input
 
 ## The database side
 
-`createDbPorts(prepared, { operator })` returns the ports the core is handed. The target is whatever `DATABASE_URL` names, because that is where the importers write; the command-line shell (not built yet) is what picks and confirms it, and refuses anything but an empty or rehearsal database. These ports add the data-level refusal: a first run needs an empty target (below).
+`createDbPorts(prepared, { operator })` returns the ports the core is handed. The target is whatever `DATABASE_URL` names, because that is where the importers write; the command (`scripts/first-load-apply.ts`) is what picks and confirms it (database name and cluster system identifier), and these ports refuse anything but an empty database for a first run. These ports add the data-level refusal: a first run needs an empty target (below).
 
 ### Observe
 
@@ -329,7 +415,7 @@ Owner rulings, and where each is enforced: the accepted zero-cost pairs (the cor
 
 ### What the database side leaves to later slices
 
-The restore point; the rails that read the outbound-write hold, the connector and cron state and the producer cut-offs; the post-run verification and the write census (so `ports.verify` is not supplied: a finished load ends with the record APPLIED and the result APPLIED_UNVERIFIED, exit 8, which is not a success and must not be read as OK); the command-line shell, target confirmation and rehearsal mode; the go/no-go check.
+The rails that read the outbound-write hold, the connector and cron state and the producer cut-offs *before* the load (the verification reads the outbound status after it); restoring the restore point into a scratch database to prove row-count parity; the readiness-gate check that reads the published apply report. The rest (verification and census, the command, the rehearsal, the restore point) exists and is documented below.
 
 ## Not proven here
 
@@ -345,3 +431,11 @@ The restore point; the rails that read the outbound-write hold, the connector an
 - **The session advisory lock** is proved against a direct PostgreSQL connection. Behind a transaction pooler a session lock excludes nobody; the lock-pool factory measures that, but a pooled production deployment has not been exercised.
 - **The quiesce proof is a snapshot, taken at each check.** The checks are before anything is written, at each step's start, before each step's first write and before every bounded importer call. A session that connects between two calls is seen at the next one; the most it can overlap is the call in flight (at most 500 rows for suppliers and opening stock, one 500-line order batch, or a whole products file). Within that window an importer can update a supplier or product row that session wrote, and the read-back reports it as created; the importers' own uniqueness refuses some collisions (SKU, opening layer, PO reference). Blocking the application's database role during the load is the recommended operator step because it removes the window; the runner does not do it (a database-level gate is out of scope). The empty-target rail is covered by this proof. After the step, the read-back does not look for evidence that a row classified absent had existed earlier. A resume trusts the run record's digest and then the row-by-row residual. A runner on a non-Linux host, or over a Unix socket, cannot prove its own sessions and refuses.
 - **The run record, the stock layers and the logs are written with the application's own clock**, so an opening layer is dated at the apply instant (the plan's ruling), not at the export time.
+- **The verification proves the database against the files and against itself; it does not prove the files against the world.** The owner's reconciliation against Qoblex, Mintsoft and WooCommerce is a separate pack. Nothing here says the prepared files are right, only that the database holds exactly them.
+- **The zero-write proof of the rehearsal is a row count of every table**, taken twice over a connection that cannot write. An update in place that changes no count would not be seen by it. It is not a content hash.
+- **The restore point is a dump that `pg_restore --list` can read.** It has not been restored into a scratch database with row-count parity by this command; the first restore is the operator's.
+- **The rehearsal's copy is a logical restore** (dump, then restore with `--no-owner --no-privileges`), so it has another cluster system identifier, other roles and no grants. The load does not depend on them; a difference the load does depend on would show as a rail or verification failure on the copy, not as a silent pass.
+- **Nothing here fences the database.** The application is stopped for a load by the operator; the runner proves nobody else is connected at each check (see the quiesce rail) and the census proves no other table changed. A writer that connects, writes and leaves between two checks is not seen.
+- **The rails that read the outbound-write hold are not built before the load.** The importers run with the system context, which suppresses every connector effect, and the verification proves afterwards that no queue grew and no write was refused; but a grant in the environment is only reported, by `outbound-held`, after rows are written.
+- **`npm run validate:db` is not run by the command.** It regenerates the Prisma client in the checkout and is a scratch-database step; the verification checks the migration table, the stock identities and the invariant report directly instead.
+- **A rehearsal is bound to the schema of the checkout (its newest migration) but not to the code.** The same schema with other application code between the rehearsal and the apply is not detected; run both from the same checkout. (The fresh-install rehearsal binds the commit and tree through the build identity; this command does not yet.)
