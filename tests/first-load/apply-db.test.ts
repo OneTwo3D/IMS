@@ -1175,6 +1175,36 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       })
     })
 
+    describe('what a failing importer leaves behind carries no file value', () => {
+      // Mutation named: drop the description redaction in withSystemActor -> the importers' raw first error lands in activity_logs, readable by every activity-log user: red.
+      const logText = async (): Promise<string> => (await sql<{ t: string }>('select row_to_json(a)::text as t from activity_logs a')).map((r) => r.t).join('\n')
+      const arms: Array<{ step: ApplyStepId; marker: string; file: () => StepRows; seed?: () => Promise<void> }> = [
+        {
+          step: 'suppliers', marker: 'zqleaksuppliername',
+          file: () => stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'zqleaksuppliername', currency: 'GBP' }]),
+          seed: async () => { await m.db.supplier.create({ data: { name: 'ZQLEAKSUPPLIERNAME' } }); await m.db.supplier.create({ data: { name: 'zqleaksuppliername' } }) },
+        },
+        { step: 'products', marker: 'ZQLEAKPARENTSKU', file: () => stepRows(PRODUCTS_IMPORT_HEADERS, [{ sku: 'ZQLEAK-CHILD', name: 'c', type: 'SIMPLE', parentSku: 'ZQLEAKPARENTSKU' }]) },
+        { step: 'opening-stock', marker: 'ZQLEAKSTOCKSKU', file: () => stepRows(OPENING_STOCK_IMPORT_HEADERS, [{ sku: 'ZQLEAKSTOCKSKU', warehouseCode: 'ZQSENT-MAIN', qty: '1', unitCostBase: '1' }]) },
+        { step: 'purchase-orders', marker: 'ZQLEAKSUPPLIEROFPO', file: () => stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: 'ZQLEAK-PO', supplierName: 'ZQLEAKSUPPLIEROFPO', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQLEAKSKU', qty: '1', unitCostForeign: '1' }]) },
+      ]
+      for (const arm of arms) {
+        it(`${arm.step}: the importer's raw error reaches the runner (which reduces it) but not activity_logs`, async () => {
+          await resetData()
+          try {
+            await arm.seed?.()
+            const execute = m.execute.createExecutor({ runId: 'leak', operator: 'Leak Test' })
+            const keyed = keyStep(arm.step, arm.file())
+            const result = await execute(arm.step, buildResidual(arm.step, arm.file(), classifyStep(arm.step, keyed.units, { entries: [] }))[0]!, NO_LOCK)
+            assert.ok(result.errors.join(';').includes(arm.marker), 'precondition: the importer echoes the value in its error, so a leak would be visible')
+            const logs = await logText()
+            assert.ok(/Failed to import|Imported/.test(logs), 'precondition: the importer did write an activity entry')
+            assert.ok(!logs.includes(arm.marker), 'no file value in activity_logs')
+          } finally { await resetData() }
+        })
+      }
+    })
+
     describe('every table is classified: independent business tables refuse a first run and a resume', () => {
       // Mutation named: go back to counting six tables (and customers/sales orders on a resume) -> the stock-count and transfer arms are green when they must be red.
       const evaluate = (resuming: boolean) => m.rails.evaluateRails(prepared, resuming ? { phase: 'recheck', resuming: true, step: null } : { phase: 'preflight', resuming: false, step: null })

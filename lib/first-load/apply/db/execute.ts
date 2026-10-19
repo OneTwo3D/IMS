@@ -69,12 +69,15 @@ export function createExecutor(options: ExecutorOptions): ApplyPorts['execute'] 
       if (result.preview === true) throw new Error(IMPORTER_RETURNED_A_PREVIEW)
       // An importer that refuses the FILE itself (too large, no file) returns early with an error and no outcome: that is a failure to account for, not a web-path call.
       if (result.system === undefined && result.error === undefined) throw new Error(IMPORTER_RETURNED_NO_SYSTEM_OUTCOME)
+      const noOutcome = result.system === undefined
       total.created += result.created
       total.updated += result.updated
       total.skipped += result.skipped
       if (options.afterCall) await options.afterCall(step, call.index)
       const errors = result.error !== undefined && !result.errors.includes(result.error) ? [...result.errors, result.error] : result.errors
       for (const message of errors) total.errors.push(mapRows(message, call.rowNumbers))
+      // A result without the system outcome (its catch path, after work that may be partly written) stops the file: no later call runs. What was written is accounted for from the database on resume.
+      if (noOutcome) break
     }
     return total
   }

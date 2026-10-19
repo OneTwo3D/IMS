@@ -68,6 +68,17 @@ describe('the executor', () => {
     assert.equal(result.created, 0)
   })
 
+  it('a result with an error but NO system outcome (a catch path after partial work) stops the file: no later call is made', async () => {
+    // Mutation named: keep going after such a result -> the later calls run against a state nobody accounted for: red.
+    calls.length = 0
+    respond = (call) => (call === 2 ? { created: 1, updated: 0, skipped: 0, errors: ['Error: boom'], error: 'Error: boom', success: false } : { created: 1, updated: 0, skipped: 0, errors: [], system: outcome })
+    const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
+    const result = await createExecutor({ runId: 'run-1', operator: 'Op', maxRowsPerCall: 2 })('suppliers', residual(6), NO_LOCK)
+    assert.deepEqual(calls.map((c) => c.rows), [2, 2], 'the third call was never made')
+    assert.deepEqual(result.errors, ['Error: boom'])
+    assert.equal(result.created, 2, 'what the first two calls reported is kept')
+  })
+
   it('a preview result is refused', async () => {
     calls.length = 0
     respond = () => ({ preview: true, dryRun: true, validRows: 1, invalidRows: 0, warnings: [], errors: [], proposedChanges: { created: 1, updated: 0, skipped: 0 } })

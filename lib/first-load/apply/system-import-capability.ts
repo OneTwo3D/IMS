@@ -73,6 +73,9 @@ export function withSystemActor(params: ActivityLogParams, system: unknown): Act
   if (!isSystemImportContext(system)) return params
   return {
     ...params,
+    // An ERROR or WARNING entry of a system-actor import carries an importer's raw error text, which can quote the first-load file (a supplier name, a SKU, an order reference). The entry is readable
+    // by every user with the activity-log permission, so on this path only the static lead-in before the first ": " is kept; the runner reports the bounded codes and counts itself.
+    description: params.level === 'ERROR' || params.level === 'WARNING' ? `${params.description.split(': ')[0]} (details withheld on the system path)` : params.description,
     resolveUser: false,
     metadata: { ...(params.metadata ?? {}), actor: { kind: 'system', runId: system.runId, operator: system.operator } },
   }
