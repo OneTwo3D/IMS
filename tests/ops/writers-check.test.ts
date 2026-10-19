@@ -118,7 +118,7 @@ test('ARM (a3): bridge evidence does not fail while IMS cannot write (the health
   assert.equal(report.verdict, 'ok')
   // Plugin off, grant absent, or a producer decision of SHADOW each keep IMS from writing; each is ok with the same evidence.
   for (const variant of [
-    inputs({ evidence, env: { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89' }, pluginEnabled: { woocommerce: true, mintsoft: false, xero: true } }),
+    inputs({ evidence, env: { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', MINTSOFT_WRITES_LIVE_FROM: CUTOFF }, pluginEnabled: { woocommerce: true, mintsoft: false, xero: true } }),
     inputs({ evidence, env: { ...MINTSOFT_LIVE_ENV, MINTSOFT_WRITES_LIVE_FROM: '2026-12-01T00:00:00Z' } }),
   ]) {
     const result = evaluateWritersCheck(variant)
@@ -153,16 +153,17 @@ test('ARM (b2): IMS able to post the Xero sales documents (legacy path, no produ
   for (const key of IMS_FORBIDDEN_OWNERSHIP_ROWS) assert.ok(claimed.includes(key), `${key} must be a double claim`)
   assert.equal(report.verdict, 'double-claim')
   // Switching the master off removes the claim.
-  const off = evaluateWritersCheck(inputs({ env, settings: new Map([['xero_sync_enabled', 'false']]) }))
+  const both = { ...env, XERO_WRITES_LIVE_FROM: CUTOFF }
+  const off = evaluateWritersCheck(inputs({ env: both, settings: new Map([['xero_sync_enabled', 'false']]) }))
   assert.equal(off.verdict, 'ok')
   // A per-type mode of 'off' removes only that type.
-  const oneOff = evaluateWritersCheck(inputs({ env, settings: new Map([['xero_sync_enabled', 'true'], ['xero_sync_sales_invoice', 'off']]) }))
+  const oneOff = evaluateWritersCheck(inputs({ env: both, settings: new Map([['xero_sync_enabled', 'true'], ['xero_sync_sales_invoice', 'off']]) }))
   assert.ok(!oneOff.findings.some((f) => f.subject === 'xero.sales.invoice' && f.code === 'ims-writes-owned-elsewhere'))
   assert.ok(oneOff.findings.some((f) => f.subject === 'xero.sales.credit-note' && f.code === 'ims-writes-owned-elsewhere'))
 })
 
 test('owners: an undecided owner fails, nobody warns, an operator button warns, IMS-owned is clean', () => {
-  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89' }
+  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', MINTSOFT_WRITES_LIVE_FROM: CUTOFF }
   const base = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])
   const withOwner = (key: string, owner: 'unknown' | 'nobody' | 'operator-manual' | 'IMS') =>
     base.map((row) => `${row.destination}.${row.operation}` === key ? { ...row, owners: { P0: row.owners.P0, P1: owner, P2: owner } } : row)
@@ -242,4 +243,52 @@ test('the exit-code table is complete and unique', () => {
   const codes = WRITERS_CHECK_EXIT_CODES.map((row) => row.code)
   assert.equal(new Set(codes).size, codes.length)
   for (const verdict of ['ok', 'double-claim', 'unreadable', 'evidence-gap'] as const) assert.ok(WRITERS_CHECK_EXIT_CODES.some((row) => row.name === verdict))
+})
+
+test('OPERATOR-TRIGGERED operations: owned by the operator is a stated warning; owned by ANY OTHER writer is a failing double claim', () => {
+  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', MINTSOFT_WRITES_LIVE_FROM: CUTOFF }
+  const base = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])
+  const withOwner = (key: string, owner: OwnershipRow['owners']['P1']) =>
+    base.map((row) => `${row.destination}.${row.operation}` === key ? { ...row, owners: { P0: row.owners.P0, P1: owner, P2: owner } } : row)
+  const run = (owner: OwnershipRow['owners']['P1']) => evaluateWritersCheck(inputs({ env, settings: new Map(), cronEnabled: {}, map: withOwner('mintsoft.asn.create', owner) }))
+
+  const manual = run('operator-manual')
+  assert.equal(manual.verdict, 'ok', 'the operator acting through the button is the owner acting')
+  assert.ok(manual.findings.some((f) => f.code === 'operator-capability-overlaps' && f.severity === 'warn' && f.subject === 'mintsoft.asn.create' && /operator-manual/.test(f.message)))
+  const text = renderWritersCheckText(manual)
+  assert.match(text, /operator-manual operations \(IMS writes them only by an operator action\): .*mintsoft\.asn\.create/)
+
+  // A row that regresses from operator-manual to another writer is a failing finding even though the trigger is an operator button.
+  for (const owner of ['woo-mintsoft-plugin', 'mintsoft-native', 'qoblex-native', 'aelia', 'xeroom', 'o3d-ioss-xero', 'woocommerce-native'] as const) {
+    const other = run(owner)
+    assert.equal(other.verdict, 'double-claim', owner)
+    assert.equal(other.exitCode, 1, owner)
+    assert.ok(other.findings.some((f) => f.code === 'ims-writes-owned-elsewhere' && f.severity === 'fail' && f.subject === 'mintsoft.asn.create'), owner)
+    assert.ok(!other.findings.some((f) => f.code === 'operator-capability-overlaps'), owner)
+    assert.doesNotMatch(renderWritersCheckText(other), /operator-manual operations/)
+  }
+  // And an automatic (non-operator) operation owned by another writer fails as before.
+  const auto = evaluateWritersCheck(inputs({ env, settings: new Map(), cronEnabled: {}, map: withOwner('mintsoft.order.hold', 'woo-mintsoft-plugin') }))
+  assert.equal(auto.verdict, 'double-claim')
+})
+
+test('INCONSISTENT configuration fails: a live-from instant with no grant, and a grant with no live-from instant, are each non-zero; both set (or neither) is not that finding', () => {
+  const grant = 'https://api.mintsoft.example|89'
+  const find = (env: Record<string, string>) => evaluateWritersCheck(inputs({ env, evidence: cleanEvidence() }))
+  const cutoffOnly = find({ MINTSOFT_WRITES_LIVE_FROM: CUTOFF })
+  const grantOnly = find({ MINTSOFT_WRITE_ALLOWED: grant })
+  for (const report of [cutoffOnly, grantOnly]) {
+    assert.ok(report.findings.some((f) => f.code === 'inconsistent-configuration' && f.severity === 'fail' && f.subject === 'mintsoft'), JSON.stringify(report.findings))
+    assert.notEqual(report.exitCode, 0)
+    assert.notEqual(report.verdict, 'ok')
+  }
+  assert.equal(cutoffOnly.verdict, 'unreadable', 'no grant: IMS cannot write, so the configuration finding alone decides')
+  assert.match(cutoffOnly.findings.find((f) => f.code === 'inconsistent-configuration')!.message, /mintsoft/i)
+  for (const clean of [find({}), find({ MINTSOFT_WRITE_ALLOWED: grant, MINTSOFT_WRITES_LIVE_FROM: CUTOFF })]) {
+    assert.ok(!clean.findings.some((f) => f.code === 'inconsistent-configuration'))
+    assert.equal(clean.exitCode, 0)
+  }
+  // Garbage stays the unreadable finding, not a second inconsistent one.
+  const garbage = find({ MINTSOFT_WRITES_LIVE_FROM: 'tomorrow' })
+  assert.ok(garbage.findings.some((f) => f.code === 'unreadable') && !garbage.findings.some((f) => f.code === 'inconsistent-configuration'))
 })

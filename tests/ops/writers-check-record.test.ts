@@ -7,7 +7,7 @@ import { WRITERS_CHECK_RECORD_ACTION } from '../../lib/security/writers-check-co
 
 function report(settings: Map<string, string> | null): WritersCheckReport {
   return evaluateWritersCheck({
-    env: { XERO_WRITE_ALLOWED_TENANT: 'tenant-1' }, now: new Date('2026-10-20T00:00:00Z'), windowDays: 14,
+    env: { XERO_WRITE_ALLOWED_TENANT: 'tenant-1', XERO_WRITES_LIVE_FROM: '2026-10-10T00:00:00Z' }, now: new Date('2026-10-20T00:00:00Z'), windowDays: 14,
     settings, cronEnabled: {}, pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
     evidence: Object.fromEntries(['MINTSOFT_ORDER_ID', 'MINTSOFT_OTHER_META', 'XEROOM_MARKER', 'XERO_FOREIGN_NUMBER'].map((k) => [k, { counted: 0, total: 0, unpaid: 0, floor: 'x' }])),
     evidenceUnrecorded: 0,

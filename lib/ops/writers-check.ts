@@ -178,7 +178,7 @@ export type WritersCheckInputs = {
 
 export type WritersCheckFinding = {
   code: 'ims-writes-owned-elsewhere' | 'ims-writes-undecided' | 'ims-owns-forbidden-row' | 'incumbent-evidence-vs-ims-writer'
-    | 'ims-writes-where-nobody-owns' | 'unreadable' | 'evidence-gap' | 'operator-capability-overlaps'
+    | 'ims-writes-where-nobody-owns' | 'inconsistent-configuration' | 'unreadable' | 'evidence-gap' | 'operator-capability-overlaps'
   severity: 'fail' | 'warn'
   /** `<destination>.<operation>`, or the destination, or null. A map key, never a data key. */
   subject: string | null
@@ -311,6 +311,12 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
       envUnreadable.add(connector)
       unreadable(connector, `${connector}: the grant or the live-from instant is set but cannot be read, so the phase cannot be established.`)
     }
+    const agreement = producerGrantCutoffAgreement(connector, inputs.env)
+    if (!bad && agreement.state === 'inconsistent') {
+      // Only one of the two is set (a live-from instant with no grant, or a grant with no live-from instant): the phase the installation
+      // is in is not the one either setting alone describes, so the check cannot vouch for it.
+      findings.push({ code: 'inconsistent-configuration', severity: 'fail', subject: connector, message: `${connector}: ${agreement.text}` })
+    }
     const configured = configuredLiveFrom(inputs.env, connector)
     destinations.push({
       connector,
@@ -357,8 +363,9 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
       findings.push({ code: 'ims-writes-undecided', severity: 'fail', subject: key, message: `IMS can write ${key} in ${decision.phase} while nobody has decided who owns it.` })
     } else if (owner === 'nobody') {
       findings.push({ code: 'ims-writes-where-nobody-owns', severity: 'warn', subject: key, message: `IMS can write ${key} in ${decision.phase}, where the map says nobody writes it. No other writer is claimed.` })
-    } else if (entry.trigger === 'operator') {
-      findings.push({ code: 'operator-capability-overlaps', severity: 'warn', subject: key, message: `IMS offers a button that writes ${key} while the map gives it to ${owner} in ${decision.phase}; it is a double claim only if the button is used.` })
+    } else if (entry.trigger === 'operator' && owner === 'operator-manual') {
+      // The owner IS the operator: IMS's button is how that owner acts, so IMS being able to write it is the intended state.
+      findings.push({ code: 'operator-capability-overlaps', severity: 'warn', subject: key, message: `${key} is operator-manual in ${decision.phase}: IMS can write it only when an operator uses the button, which is the owner acting, not a second writer.` })
     } else {
       findings.push({ code: 'ims-writes-owned-elsewhere', severity: 'fail', subject: key, message: `IMS can write ${key} in ${decision.phase} while the map gives it to ${decision.owner}: two writers claim one operation.` })
     }
@@ -393,9 +400,9 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
   }
 
   const failing = findings.filter((finding) => finding.severity === 'fail')
-  const verdict: WritersCheckVerdict = failing.some((f) => f.code !== 'unreadable' && f.code !== 'evidence-gap')
+  const verdict: WritersCheckVerdict = failing.some((f) => f.code !== 'unreadable' && f.code !== 'evidence-gap' && f.code !== 'inconsistent-configuration')
     ? 'double-claim'
-    : failing.some((f) => f.code === 'unreadable') ? 'unreadable'
+    : failing.some((f) => f.code === 'unreadable' || f.code === 'inconsistent-configuration') ? 'unreadable'
     : failing.length > 0 ? 'evidence-gap' : 'ok'
   return {
     schemaVersion: WRITERS_CHECK_SCHEMA_VERSION,
@@ -419,6 +426,8 @@ export function renderWritersCheckText(report: WritersCheckReport): string {
   for (const destination of report.destinations) {
     lines.push(`  ${destination.connector}: phase ${destination.phase}, grant ${destination.grant}, live-from ${destination.liveFrom ?? 'not set'}, producer hold ${destination.enforced ? 'enforced' : 'not enforced'}`)
   }
+  const operatorManual = report.operations.filter((op) => op.imsCanWrite && op.owner === 'operator-manual')
+  if (operatorManual.length > 0) lines.push(`  operator-manual operations (IMS writes them only by an operator action): ${operatorManual.map((op) => op.key).join(', ')}`)
   const claiming = report.operations.filter((op) => op.imsCanWrite)
   lines.push(`  IMS can write ${claiming.length} of ${report.operations.length} mapped operations now${claiming.length ? ': ' + claiming.map((op) => op.key).join(', ') : ''}`)
   if (report.evidence) {
