@@ -16,6 +16,7 @@
  */
 
 import type { WriterOwner } from './writer-ownership-map'
+import { WRITERS_CHECK_BLOCK_ID, renderWritersCheckDocBlock } from './writers-check-constants'
 import {
   OUTBOUND_CONNECTORS,
   OUTBOUND_CONNECTOR_LABEL,
@@ -213,7 +214,7 @@ export function renderRetireExitCodeTable(): string {
 export const PRODUCER_DOC_BLOCK_OPEN = (id: string) => `<!-- producer-disposition:${id} -->`
 export const PRODUCER_DOC_BLOCK_CLOSE = (id: string) => `<!-- /producer-disposition:${id} -->`
 
-export type ProducerDocBlockId = 'overview' | 'cutoffs' | 'enforcement' | 'retirement'
+export type ProducerDocBlockId = 'overview' | 'cutoffs' | 'enforcement' | 'retirement' | typeof WRITERS_CHECK_BLOCK_ID
 
 const CUTOFF_ROWS = OUTBOUND_CONNECTORS.map(
   (connector) => `| \`${PRODUCER_CUTOFF_ENV[connector]}\` | ${OUTBOUND_CONNECTOR_LABEL[connector]} | ${PRODUCER_CUTOFF_FORMAT} |`,
@@ -252,10 +253,11 @@ export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
   '',
   renderRetireExitCodeTable(),
 ].join('\n'),
+  [WRITERS_CHECK_BLOCK_ID]: renderWritersCheckDocBlock(),
 }
 
 export const PRODUCER_DOC_PLACEMENTS: ReadonlyArray<{ file: string; blocks: readonly ProducerDocBlockId[] }> = [
-  { file: 'docs/installation.md', blocks: ['overview', 'cutoffs', 'enforcement', 'retirement'] },
+  { file: 'docs/installation.md', blocks: ['overview', 'cutoffs', 'enforcement', 'retirement', WRITERS_CHECK_BLOCK_ID] },
 ]
 
 export function renderProducerDocBlock(id: ProducerDocBlockId): string {

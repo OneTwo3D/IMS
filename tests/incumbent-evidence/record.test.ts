@@ -1,0 +1,86 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import { classifyIncumbentMeta, readWcPaidTime } from '../../lib/domain/incumbent-evidence/classify'
+import { recordWcIncumbentEvidence } from '../../lib/domain/incumbent-evidence/record'
+
+/**
+ * WHAT THE STOREFRONT IMPORT KEEPS ABOUT OTHER WRITERS. Pure classification, plus the best-effort recorder over injected writers.
+ */
+
+type Written = { externalOrderId: string; kind: string; paidAt: Date | null }
+
+function harness(options: { failWrite?: boolean; failUnrecorded?: boolean } = {}) {
+  const written: Written[] = []
+  const unrecorded: Array<{ kinds: string[]; paidState: string; paidAt: Date | null; reason: string }> = []
+  return {
+    written,
+    unrecorded,
+    deps: {
+      write: async (input: Written) => { if (options.failWrite) throw new Error('db down'); written.push(input) },
+      unrecorded: async (input: (typeof unrecorded)[number]) => { if (options.failUnrecorded) throw new Error('log down'); unrecorded.push(input) },
+    },
+  }
+}
+
+test('classification: the bridge id, other bridge metas and the invoicing plugin are told apart; empty marks are not evidence', () => {
+  const kinds = (meta: unknown) => { const result = classifyIncumbentMeta(meta); assert.ok(result.ok); return result.ok ? result.kinds : [] }
+  assert.deepEqual(kinds([{ key: '_mintsoft_order_id', value: '12345' }]), ['MINTSOFT_ORDER_ID'])
+  assert.deepEqual(kinds([{ key: '_mintsoft_split_from', value: 77 }, { key: '_mintsoft_merged_into', value: 'x' }]), ['MINTSOFT_OTHER_META'])
+  assert.deepEqual(kinds([{ key: 'xeroom_invoice_id', value: 'abc' }, { key: '_Xeroom_status', value: 'sent' }]), ['XEROOM_MARKER'])
+  assert.deepEqual(kinds([{ key: '_mintsoft_order_id', value: '' }, { key: '_mintsoft_order_id', value: null }, { key: '_mintsoft_order_id', value: 0 }, { key: '_mintsoft_order_id', value: ' 0 ' }]), [])
+  // Not evidence: the PDF plugin's own number (the invoicing plugin only READS it) and unrelated keys.
+  assert.deepEqual(kinds([{ key: '_wcpdf_invoice_number', value: '1001' }, { key: 'mintsoft_order_id', value: '5' }, { key: '_billing_vat', value: 'x' }]), [])
+  assert.deepEqual(kinds([{ key: '_mintsoft_order_id', value: '5' }, { key: 'xeroom_x', value: 'y' }, null, 3, { value: 'k' }, { key: 5, value: 'k' }]), ['MINTSOFT_ORDER_ID', 'XEROOM_MARKER'])
+  assert.deepEqual(kinds(undefined), [])
+  assert.equal(classifyIncumbentMeta({ not: 'a list' }).ok, false)
+  assert.equal(classifyIncumbentMeta('text').ok, false)
+})
+
+test('paid time: read as UTC (never the host zone); unpaid and unreadable are different answers', () => {
+  const at = (state: ReturnType<typeof readWcPaidTime>) => (state.state === 'paid' ? state.at.toISOString() : state.state)
+  assert.equal(at(readWcPaidTime('2026-10-05T10:00:00')), '2026-10-05T10:00:00.000Z')
+  assert.equal(at(readWcPaidTime('2026-10-05 10:00:00')), '2026-10-05T10:00:00.000Z')
+  assert.equal(at(readWcPaidTime('2026-10-05T10:00:00Z')), '2026-10-05T10:00:00.000Z')
+  assert.equal(at(readWcPaidTime('2026-10-05T12:00:00+02:00')), '2026-10-05T10:00:00.000Z')
+  assert.equal(at(readWcPaidTime(null)), 'unpaid')
+  assert.equal(at(readWcPaidTime('')), 'unpaid')
+  for (const bad of ['yesterday', '2026-13-45T00:00:00', 12345, {}, '2026-10-05']) assert.equal(at(readWcPaidTime(bad)), 'unreadable', String(bad))
+})
+
+test('recorder: an ordinary order costs no write; a marked order writes one row per kind with the UTC paid time', async () => {
+  const plain = harness()
+  assert.deepEqual(await recordWcIncumbentEvidence({ id: 1, meta_data: [{ key: '_billing_vat', value: 'x' }], date_paid_gmt: '2026-10-05T10:00:00' }, plain.deps), { recorded: 0 })
+  assert.equal(plain.written.length, 0)
+
+  const marked = harness()
+  const result = await recordWcIncumbentEvidence({ id: 42, meta_data: [{ key: '_mintsoft_order_id', value: '9' }, { key: 'xeroom_id', value: 'a' }], date_paid_gmt: '2026-10-05T10:00:00' }, marked.deps)
+  assert.deepEqual(result, { recorded: 2 })
+  assert.deepEqual(marked.written.map((row) => [row.externalOrderId, row.kind, row.paidAt?.toISOString()]), [
+    ['42', 'MINTSOFT_ORDER_ID', '2026-10-05T10:00:00.000Z'],
+    ['42', 'XEROOM_MARKER', '2026-10-05T10:00:00.000Z'],
+  ])
+
+  const unpaid = harness()
+  await recordWcIncumbentEvidence({ id: 43, meta_data: [{ key: '_mintsoft_order_id', value: '9' }], date_paid_gmt: null }, unpaid.deps)
+  assert.equal(unpaid.written[0]?.paidAt, null, 'an unpaid order is kept with no paid time, so it is not counted until it is paid')
+})
+
+test('recorder FAIL CLOSED: an unreadable paid time, an unreadable meta list or a failed write is logged as unrecorded and never throws', async () => {
+  const badPaid = harness()
+  assert.deepEqual(await recordWcIncumbentEvidence({ id: 1, meta_data: [{ key: '_mintsoft_order_id', value: '9' }], date_paid_gmt: 'garbage' }, badPaid.deps), { recorded: 0, unrecorded: true })
+  assert.equal(badPaid.written.length, 0)
+  assert.deepEqual(badPaid.unrecorded.map((u) => [u.kinds, u.paidState]), [[['MINTSOFT_ORDER_ID'], 'unreadable']])
+
+  const badMeta = harness()
+  assert.deepEqual(await recordWcIncumbentEvidence({ id: 2, meta_data: { oops: true }, date_paid_gmt: '2026-10-05T10:00:00' }, badMeta.deps), { recorded: 0, unrecorded: true })
+  assert.equal(badMeta.unrecorded.length, 1)
+
+  const failing = harness({ failWrite: true })
+  assert.deepEqual(await recordWcIncumbentEvidence({ id: 3, meta_data: [{ key: '_mintsoft_order_id', value: '9' }], date_paid_gmt: '2026-10-05T10:00:00' }, failing.deps), { recorded: 0, unrecorded: true })
+  assert.deepEqual(failing.unrecorded.map((u) => [u.kinds, u.paidState, u.paidAt?.toISOString()]), [[['MINTSOFT_ORDER_ID'], 'paid', '2026-10-05T10:00:00.000Z']])
+
+  // Even the log failing does not throw into the import.
+  const both = harness({ failWrite: true, failUnrecorded: true })
+  assert.deepEqual(await recordWcIncumbentEvidence({ id: 4, meta_data: [{ key: '_mintsoft_order_id', value: '9' }], date_paid_gmt: '2026-10-05T10:00:00' }, both.deps), { recorded: 0, unrecorded: true })
+})

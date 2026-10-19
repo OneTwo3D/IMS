@@ -347,6 +347,11 @@ const ALLOWLIST = [
   // per connector, and the ownership map names each connector's operations and incumbents.
   'lib/security/producer-disposition-constants.ts',
   'lib/security/writer-ownership-map.ts',
+  // The coexistence check evaluates the ownership map per destination and per operation, so it names each
+  // connector's operations, switches and incumbent evidence (the bridge plugin's own meta keys) exactly as the map does.
+  'lib/security/writers-check-constants.ts',
+  'lib/ops/writers-check.ts',
+  'lib/domain/incumbent-evidence/classify.ts',
   'lib/ops/outbound-status.ts',
   // The read-sync liveness registry IS a per-connector inventory of the read feeds that keep IMS current
   // (one row and one limit per feed, so it necessarily names each connector), exactly as the outbound hold

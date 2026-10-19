@@ -47,6 +47,7 @@ import {
 import { getSettingValue } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
+import { recordWcIncumbentEvidence } from '@/lib/domain/incumbent-evidence/record'
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
 import type { WcAdmissionRefusalReason } from './order-admission'
 import {
@@ -1783,6 +1784,9 @@ async function refuseWcOrderCreate(
 
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<ImportWcOrderResult> {
   try {
+    // Keep what another writer left on this order (the bridge's or the invoicing plugin's marks) for the coexistence check. Best effort:
+    // it never throws and never decides anything, so the import below behaves exactly as it did.
+    await recordWcIncumbentEvidence(wcOrder)
     // THE SINGLE PIVOT (o3d-tj6v r4). This one read answers both "create or update?" and "is this
     // order gated?", and the two answers cannot disagree because there is only one of them.
     //

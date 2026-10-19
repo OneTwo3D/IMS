@@ -12,6 +12,16 @@ registerCronJobs([
     defaultEnabled: true,
   },
   {
+    slug: 'writers-check',
+    settingKey: 'writers_check',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Writers Coexistence Check',
+    description: 'Hourly record of the writers:check report: whether IMS and another writer could both write one destination operation in the current phase. Read-only: it reads the environment and IMS\'s own database, makes no call to any connected system, and keeps the report in the activity log. The run is red unless the verdict is ok.',
+    defaultSchedule: '40 * * * *',
+    defaultEnabled: false,
+  },
+  {
     slug: 'backup',
     settingKey: 'backup',
     module: 'system',
