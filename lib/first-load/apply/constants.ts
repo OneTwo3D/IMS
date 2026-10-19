@@ -58,6 +58,7 @@ export const APPLY_EXIT_CODES = {
   CONFLICT: 5,
   INTERNAL: 6,
   REHEARSAL_TEARDOWN_INCOMPLETE: 7,
+  APPLIED_UNVERIFIED: 8,
 } as const
 export type ApplyExitName = keyof typeof APPLY_EXIT_CODES
 
@@ -100,12 +101,17 @@ export const APPLY_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: ApplyExi
     name: 'REHEARSAL_TEARDOWN_INCOMPLETE',
     meaning: 'Rehearsal only: the throwaway database could not be removed completely. The real target was not written.',
   },
+  {
+    code: APPLY_EXIT_CODES.APPLIED_UNVERIFIED,
+    name: 'APPLIED_UNVERIFIED',
+    meaning: 'Every step loaded and the row accounting reconciles, but NO post-run verification was run (this runner has no verification port yet). This is NOT a success: do not treat it as OK. Rows ARE written. A later --resume of the same load runs the verification when it exists.',
+  },
 ]
 
 /** Exits for which the runner can PROVE that nothing was written: no write happens before the precondition phase ends. */
 export const NOTHING_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['USAGE', 'PRECONDITION_REFUSED'])
 /** Exits after which rows ARE (or may be) written and the restore procedure must be printed. */
-export const ROWS_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['VERIFY_FAILED', 'STEP_FAILED', 'CONFLICT', 'INTERNAL'])
+export const ROWS_WRITTEN_EXITS: ReadonlySet<ApplyExitName> = new Set<ApplyExitName>(['VERIFY_FAILED', 'STEP_FAILED', 'CONFLICT', 'INTERNAL', 'APPLIED_UNVERIFIED'])
 
 export const NOTHING_WRITTEN_TEXT = 'This command wrote nothing to the database.'
 export const ROWS_WRITTEN_TEXT = 'Rows may already be written to the database by this run.'
@@ -208,18 +214,24 @@ export type CheckCoverageStatus = (typeof CHECK_COVERAGE_STATUSES)[number]
  * `file-side`: proved from the prepared files alone by the core. `partial`: the file part is proved here and the part that needs IMS is
  * the database slice's. `database`: only the database slice can prove it. `not-applicable`: the runner refuses the whole area.
  */
-export const APPLY_CHECK_COVERAGE: Readonly<Record<string, { status: CheckCoverageStatus; core: string }>> = {
-  'warehouse-exists': { status: 'partial', core: 'The warehouse codes the files use must equal the codes declared in the apply manifest (expectWarehouses). That each exists in IMS with that profile is read from the database.' },
-  'base-currency': { status: 'partial', core: 'The apply manifest, the prepared report and the supported base currency (GBP) must agree. The organisation row is read from the database.' },
-  'opening-stock-empty': { status: 'partial', core: 'Stock history on a product and warehouse that is not this run\'s opening layer is a conflict (FOREIGN_HISTORY) and stops the run. Reading that history is the database slice\'s.' },
-  'po-supplier-exists': { status: 'partial', core: 'Every purchase-order supplier must be a supplier of the suppliers file, which the same run loads first.' },
-  'po-fx-rate': { status: 'partial', core: 'Every non-base order\'s fxRateToBase must equal the rate the apply manifest states for the currency, and every stated rate must be used. That IMS holds a rate within 2% is read from the database.' },
-  'po-tax-rate': { status: 'database', core: 'Needs the IMS tax rates.' },
-  'lookup-keys-unique-in-ims': { status: 'partial', core: 'Inside the files, no two suppliers, products, stock pairs or orders may differ only in letter case. A look-alike already in the database is a conflict (CASE_COLLISION).' },
-  'po-reference-free': { status: 'partial', core: 'An order whose reference already exists with the same content is skipped as existing; with different content it is a conflict. Reading the references is the database slice\'s.' },
-  'po-product-lifecycle': { status: 'database', core: 'Needs the lifecycle of products that are only in IMS.' },
-  'transfer-reference-free': { status: 'not-applicable', core: 'The runner refuses a prepared run that contains transfers.' },
-  'transfer-source-stock': { status: 'not-applicable', core: 'The runner refuses a prepared run that contains transfers.' },
-  'barcode-free': { status: 'database', core: 'Needs the barcodes already in IMS.' },
-  'product-parent-exists': { status: 'file-side', core: 'Every VARIANT\'s parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot.' },
+export const APPLY_CHECK_COVERAGE: Readonly<Record<string, { status: CheckCoverageStatus; core: string; database: string }>> = {
+  'warehouse-exists': { status: 'partial', core: 'The warehouse codes the files use must equal the codes declared in the apply manifest (expectWarehouses). That each exists in IMS with that profile is read from the database.', database: 'Rail warehouses: each declared warehouse exists, is active, is unique under upper-casing and has exactly the declared type, availableForSale and syncToStore. Checked before the run, at the start of every step and before its first write.' },
+  'base-currency': { status: 'partial', core: 'The apply manifest, the prepared report and the supported base currency (GBP) must agree. The organisation row is read from the database.', database: "Rail base currency: the organisation's base currency (GBP when there is no row, as the importers read it) equals the manifest's." },
+  'opening-stock-empty': { status: 'partial', core: 'Stock history on a product and warehouse that is not this run\'s opening layer is a conflict (FOREIGN_HISTORY) and stops the run. Reading that history is the database slice\'s.', database: 'observe reads every stock level, cost layer and movement per product and warehouse. A pair that is not exactly one opening layer, its one opening movement and a matching stock level is FOREIGN_HISTORY.' },
+  'po-supplier-exists': { status: 'partial', core: 'Every purchase-order supplier must be a supplier of the suppliers file, which the same run loads first.', database: 'Nothing more is needed: the supplier is loaded by the same run, and an order whose stored supplier differs from the file is FIELDS_DIFFER.' },
+  'po-fx-rate': { status: 'partial', core: 'Every non-base order\'s fxRateToBase must equal the rate the apply manifest states for the currency, and every stated rate must be used. That IMS holds a rate within 2% is read from the database.', database: "Rail FX rates: each stated rate has a stored base-to-currency rate on or before today and is within the importer's 2% tolerance of it. The runner never writes a rate." },
+  'po-tax-rate': { status: 'database', core: 'Needs the IMS tax rates.', database: 'Rail tax rates: every line tax resolves to an active purchase rate (by name, trimmed and case-insensitive, else by value within 0.00005), and every order-level tax name exists with exactly that spelling, because createPurchaseOrder looks it up case-exactly.' },
+  'lookup-keys-unique-in-ims': { status: 'partial', core: 'Inside the files, no two suppliers, products, stock pairs or orders may differ only in letter case. A look-alike already in the database is a conflict (CASE_COLLISION).', database: "observe keys every row by the importer's own key and its upper-case form. A different key with the same upper-case form is CASE_COLLISION, and a repeated key is DUPLICATE_IN_DATABASE." },
+  'po-reference-free': { status: 'partial', core: 'An order whose reference already exists with the same content is skipped as existing; with different content it is a conflict. Reading the references is the database slice\'s.', database: 'observe reads every order by reference. The same reference with the same content is skipped, and with different content (including any status other than DRAFT) is FIELDS_DIFFER.' },
+  'po-product-lifecycle': { status: 'database', core: 'Needs the lifecycle of products that are only in IMS.', database: "Covered by construction: the runner loads into an empty database, the products an order uses are the files' own, and a product nobody in this run emitted is FOREIGN_ROW. The importer itself refuses a product that is not active or draft, and the order then shows as not loaded." },
+  'transfer-reference-free': { status: 'not-applicable', core: 'The runner refuses a prepared run that contains transfers.', database: 'Not applicable.' },
+  'transfer-source-stock': { status: 'not-applicable', core: 'The runner refuses a prepared run that contains transfers.', database: 'Not applicable.' },
+  'barcode-free': { status: 'database', core: 'Needs the barcodes already in IMS.', database: 'The empty-target rail refuses a database that already holds products, and a product nobody in this run emitted is FOREIGN_ROW. The importer also refuses a barcode already in use.' },
+  'product-parent-exists': { status: 'file-side', core: 'Every VARIANT\'s parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot.', database: 'The stored parent SKU of a variant is part of the product fingerprint.' },
 }
+
+/**
+ * The application_name every connection of the runner carries (the database pool, the lock pool, the run-record writes: all one process). The command sets PGAPPNAME to this
+ * BEFORE it opens any connection, and the quiesce rail refuses to run if its own session does not report it, so the runner's sessions are told apart from everybody else's.
+ */
+export const RUNNER_APPLICATION_NAME = 'ims-first-load-apply'

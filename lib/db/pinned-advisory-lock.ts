@@ -76,6 +76,8 @@ export type PinnedAdvisoryLock = {
   release: () => Promise<void>
   /** True once the pinned connection has failed — the lock is NOT held any more. */
   readonly lost: boolean
+  /** The server backend (pg_backend_pid) the lock lives on, when the acquirer asked for it; lets a caller prove the lock in pg_locks. */
+  readonly backendPid: number | null
   /**
    * Throw if the lock has been lost. Call at each write phase: PostgreSQL frees
    * a session lock the instant its connection dies, so from that moment another
@@ -137,6 +139,7 @@ function heldPinnedLock(
   const { client } = connection
   return {
     get lost() { return connection.lost },
+    backendPid: null as number | null,
     assertHeld(context?: string) {
       if (connection.lost) {
         throw new AdvisoryLockLostError(
@@ -213,7 +216,16 @@ export async function acquirePinnedAdvisoryLockOrNull(
     return null
   }
 
-  return heldPinnedLock(connection, label, params, args)
+  const held = heldPinnedLock(connection, label, params, args)
+  try {
+    const pid = await connection.client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+    ;(held as { backendPid: number | null }).backendPid = pid.rows[0]?.pid ?? null
+  } catch (error) {
+    // The connection failed right after the lock was taken: do not hand back a lock nobody can vouch for.
+    await held.release()
+    throw error
+  }
+  return held
 }
 
 /** A bounded wait for the lock expired — nobody else's fault, and NOT the same as "not held". */
