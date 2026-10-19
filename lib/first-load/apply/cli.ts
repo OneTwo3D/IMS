@@ -202,6 +202,15 @@ export function libpqEnvFromUrl(url: string): { env: Record<string, string>; pro
 // The rehearsal record and the exit mapping
 // ---------------------------------------------------------------------------
 
+/** What the rehearsal binds from the child's published report into the record. An OK record needs it; an apply re-validates it against the report file itself. */
+export interface RecordReportBinding {
+  /** File name only, in the same directory as the record. */
+  file: string
+  sha256: string
+  verificationItems: number
+  verificationFailed: number
+}
+
 export interface RehearsalRecordFile {
   formatVersion: number
   manifestDigest: string
@@ -211,27 +220,123 @@ export interface RehearsalRecordFile {
   finishedAt: string
   /** The newest migration of the checkout the rehearsal ran from: an apply from a checkout with another schema is refused by the command. */
   schemaHead: string
-  /** For the audit; the apply's gate reads only the five fields above. */
   loadExit: string | null
   targetUnchanged: boolean
   teardownComplete: boolean
+  report: RecordReportBinding | null
 }
 
-/** The record an apply insists on. The verdict is OK only when the rehearsal's load ended OK and the target was proved unchanged. */
-export function buildRehearsalRecord(args: { manifestDigest: string; targetSystemId: string; schemaHead: string; finishedAt: Date; loadExit: ApplyExitName | null; targetUnchanged: boolean; teardownComplete: boolean }): RehearsalRecordFile {
-  // The verdict is a closed word and is the string 'OK' ONLY when every condition holds: a load that ended OK on a copy of a target that then changed is not a rehearsal of this target.
-  const verdict = args.loadExit === null ? 'NOT_RUN' : !args.targetUnchanged ? 'TARGET_CHANGED' : !args.teardownComplete ? 'TEARDOWN_INCOMPLETE' : args.loadExit
+/** The facts read from a child's published report, after validation. */
+export interface ChildReportFacts {
+  exitName: string
+  verificationItems: number
+  verificationFailed: number
+}
+
+/**
+ * Validate a parsed apply report as the report of THIS load's rehearsal child: the right tool, the digest of this load, a documented exit, a verification list that is a list.
+ * Anything else is null (unreadable, invalid, or another run's report). Used by the rehearsal when it reads the child's report and by the apply when it re-reads the bound one.
+ */
+export function validateChildReport(parsed: unknown, manifestDigest: string): ChildReportFacts | null {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+  const r = parsed as Record<string, unknown>
+  if (r.tool !== 'first-load-apply' || r.manifestDigest !== manifestDigest) return null
+  const exit = r.exit as { name?: unknown } | null | undefined
+  if (typeof exit !== 'object' || exit === null || typeof exit.name !== 'string' || !APPLY_EXIT_CODE_TABLE.some((row) => row.name === exit.name)) return null
+  if (!Array.isArray(r.verification)) return null
+  let failed = 0
+  for (const item of r.verification) {
+    const result = (item as { result?: unknown } | null)?.result
+    if (result !== 'pass') failed++
+  }
+  return { exitName: exit.name, verificationItems: r.verification.length, verificationFailed: failed }
+}
+
+/** Every signal of a rehearsal. The verdict is derived from all of them in ONE place (deriveRehearsalVerdict); nothing else may decide it. */
+export interface RehearsalSignals {
+  /** The copy was made and the child was started. */
+  childStarted: boolean
+  childTimedOut: boolean
+  /** The child's process exit code; null when it was killed by a signal or could not be started. */
+  childExitCode: number | null
+  /** The child's report, validated for this load; null when missing, unreadable or another run's. */
+  report: ChildReportFacts | null
+  targetUnchanged: boolean
+  teardownComplete: boolean
+  /** Problems the rehearsal recorded on its way (any one is enough to refuse an OK). */
+  problemCount: number
+}
+
+/**
+ * THE VERDICT. A closed word, and the string 'OK' only at the very end, after every signal has been checked: the default is non-OK, so a signal added later and not checked here
+ * cannot produce an OK by omission. The first failing signal names the verdict.
+ */
+export function deriveRehearsalVerdict(s: RehearsalSignals): { verdict: string; loadExit: ApplyExitName | null } {
+  const code = exitNameOfCode(s.childExitCode)
+  // The load exit reads 'OK' ONLY beside the verdict 'OK'; beside any other verdict it is the child's own non-OK exit when its report agrees, else null.
+  const loadExit = s.childStarted && !s.childTimedOut && s.report !== null && code !== null && code !== 'OK' && s.report.exitName === code ? code : null
+  const no = (verdict: string) => ({ verdict, loadExit })
+  if (!s.childStarted) return no('NOT_RUN')
+  if (s.childTimedOut) return no('CHILD_TIMED_OUT')
+  if (s.childExitCode === null) return no('CHILD_KILLED')
+  if (code === null) return no('CHILD_EXIT_UNKNOWN')
+  if (s.report === null) return no('REPORT_MISSING_OR_INVALID')
+  if (s.report.exitName !== code) return no('REPORT_DISAGREES_WITH_EXIT')
+  if (code !== 'OK') return no(code)
+  if (s.report.verificationItems === 0 || s.report.verificationFailed > 0) return no('VERIFICATION_NOT_ALL_PASS')
+  if (!s.targetUnchanged) return no('TARGET_CHANGED')
+  if (!s.teardownComplete) return no('TEARDOWN_INCOMPLETE')
+  if (s.problemCount > 0) return no('PROBLEMS_RECORDED')
+  return { verdict: 'OK', loadExit: 'OK' }
+}
+
+export function buildRehearsalRecord(args: { manifestDigest: string; targetSystemId: string; schemaHead: string; finishedAt: Date; verdict: string; loadExit: ApplyExitName | null; targetUnchanged: boolean; teardownComplete: boolean; report: RecordReportBinding | null }): RehearsalRecordFile {
+  // An OK record is never built without the bound, validated report (the one place a caller could otherwise forget it).
+  const ok = args.verdict === 'OK' && args.report !== null && args.loadExit === 'OK' && args.targetUnchanged && args.teardownComplete
   return {
     formatVersion: REHEARSAL_RECORD_FORMAT_VERSION,
     manifestDigest: args.manifestDigest,
-    verdict,
+    verdict: ok ? 'OK' : args.verdict === 'OK' ? 'RECORD_INCOMPLETE' : args.verdict,
     systemId: args.targetSystemId,
     finishedAt: args.finishedAt.toISOString(),
     schemaHead: args.schemaHead,
     loadExit: args.loadExit,
     targetUnchanged: args.targetUnchanged,
     teardownComplete: args.teardownComplete,
+    report: args.report,
   }
+}
+
+/**
+ * The command's own check of the fields an OK record binds, on top of the core's gate. Pure: the report FILE is re-read and re-validated by the shell (see checkRecordReportFile).
+ * A record that says OK but does not carry every one of these is refused.
+ */
+export function checkRecordBinding(record: unknown): string[] {
+  const r = typeof record === 'object' && record !== null && !Array.isArray(record) ? (record as Record<string, unknown>) : {}
+  const problems: string[] = []
+  if (r.loadExit !== 'OK') problems.push('the rehearsal record does not say the load on the copy ended OK')
+  if (r.targetUnchanged !== true) problems.push('the rehearsal record does not say the target was proved unchanged')
+  if (r.teardownComplete !== true) problems.push('the rehearsal record does not say the teardown was complete')
+  const b = r.report as Record<string, unknown> | null | undefined
+  if (typeof b !== 'object' || b === null) problems.push('the rehearsal record binds no child report')
+  else {
+    if (typeof b.file !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.json$/.test(b.file)) problems.push('the rehearsal record names no usable report file')
+    if (typeof b.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(b.sha256)) problems.push('the rehearsal record binds no report SHA-256')
+    if (!Number.isInteger(b.verificationItems) || (b.verificationItems as number) <= 0) problems.push('the rehearsal record binds no verification items')
+    if (b.verificationFailed !== 0) problems.push('the rehearsal record does not say every verification item passed')
+  }
+  return problems
+}
+
+/** The bound report as the file now holds it: its hash is the recorded one and its contents are a passing report of this load. */
+export function checkRecordReportFile(record: unknown, fileSha256: string, parsedReport: unknown, manifestDigest: string): string[] {
+  const b = (record as { report?: RecordReportBinding | null } | null)?.report
+  if (!b) return ['the rehearsal record binds no child report']
+  if (fileSha256 !== b.sha256) return ['the report the rehearsal record binds has changed since the rehearsal']
+  const facts = validateChildReport(parsedReport, manifestDigest)
+  if (facts === null) return ['the report the rehearsal record binds is not a report of this load']
+  if (facts.exitName !== 'OK' || facts.verificationItems !== b.verificationItems || facts.verificationItems === 0 || facts.verificationFailed !== 0) return ['the report the rehearsal record binds is not an all-pass OK report']
+  return []
 }
 
 export function exitCodeOf(name: ApplyExitName): number {

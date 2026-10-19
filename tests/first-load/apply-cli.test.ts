@@ -4,7 +4,7 @@ import path from 'node:path'
 import test, { after } from 'node:test'
 
 import { APPLY_EXIT_CODE_TABLE, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME } from '../../lib/first-load/apply/constants.ts'
-import { DEFAULT_OPERATOR, REHEARSAL_DATABASE, buildRehearsalRecord, checkRecordSchema, buildRunnerEnv, exitNameOfCode, helpText, libpqEnvFromUrl, parseCliArgs, reportStem } from '../../lib/first-load/apply/cli.ts'
+import { DEFAULT_OPERATOR, REHEARSAL_DATABASE, buildRehearsalRecord, checkRecordBinding, checkRecordReportFile, checkRecordSchema, deriveRehearsalVerdict, validateChildReport, type RehearsalSignals, buildRunnerEnv, exitNameOfCode, helpText, libpqEnvFromUrl, parseCliArgs, reportStem } from '../../lib/first-load/apply/cli.ts'
 import { runLoad } from '../../lib/first-load/apply/orchestrate.ts'
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import { prepareReportDir, publishReportPair, readEnvFile, sha256OfFile } from '../../scripts/lib/first-load-apply-files.ts'
@@ -106,29 +106,81 @@ test('libpq variables are derived from the URL for the client tools, and the URL
   for (const bad of ['', 'not a url', 'mysql://u:p@h/d', 'postgresql://u:p@h/']) assert.ok(libpqEnvFromUrl(bad).problems.length > 0, bad)
 })
 
-test('the rehearsal record: OK only when the load ended OK, the target is proved unchanged and the teardown is complete', (t) => {
-  const finishedAt = new Date('2026-10-20T10:00:00Z')
-  const rec = (over: Partial<Parameters<typeof buildRehearsalRecord>[0]>) => buildRehearsalRecord({ manifestDigest: 'd'.repeat(64), targetSystemId: '7', schemaHead: '20261001000000_x', finishedAt, loadExit: 'OK', targetUnchanged: true, teardownComplete: true, ...over })
-  assert.deepEqual(rec({}), { formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: 'd'.repeat(64), verdict: 'OK', systemId: '7', finishedAt: finishedAt.toISOString(), schemaHead: '20261001000000_x', loadExit: 'OK', targetUnchanged: true, teardownComplete: true })
-  // Mutation: ignore targetUnchanged or teardownComplete (or accept APPLIED_UNVERIFIED) and the matching arm is green.
-  const arms: Array<[string, Partial<Parameters<typeof buildRehearsalRecord>[0]>, string]> = [
+const DIGEST = 'd'.repeat(64)
+const goodReport = (over: Record<string, unknown> = {}) => ({ tool: 'first-load-apply', manifestDigest: DIGEST, exit: { name: 'OK' }, verification: [{ id: 'a', result: 'pass' }, { id: 'b', result: 'pass' }], ...over })
+const SIGNALS: RehearsalSignals = { childStarted: true, childTimedOut: false, childExitCode: 0, report: { exitName: 'OK', verificationItems: 2, verificationFailed: 0 }, targetUnchanged: true, teardownComplete: true, problemCount: 0 }
+
+test('the rehearsal verdict is derived in ONE place from every signal, and is OK only when all of them are good (each signal has an arm)', (t) => {
+  // Mutation per arm: delete the corresponding line of deriveRehearsalVerdict and that arm's verdict becomes 'OK' (or the next signal's word).
+  assert.deepEqual(deriveRehearsalVerdict(SIGNALS), { verdict: 'OK', loadExit: 'OK' })
+  const arms: Array<[string, Partial<RehearsalSignals>, string]> = [
+    ['the child never started', { childStarted: false }, 'NOT_RUN'],
+    ['the child timed out', { childTimedOut: true }, 'CHILD_TIMED_OUT'],
+    ['the child was killed by a signal', { childExitCode: null }, 'CHILD_KILLED'],
+    ['an exit code outside the table', { childExitCode: 99 }, 'CHILD_EXIT_UNKNOWN'],
+    ['the child exited 0 but its report is missing or invalid', { report: null }, 'REPORT_MISSING_OR_INVALID'],
+    ['the report names another exit than the process', { report: { exitName: 'VERIFY_FAILED', verificationItems: 2, verificationFailed: 0 } }, 'REPORT_DISAGREES_WITH_EXIT'],
+    ['a non-zero exit is mapped', { childExitCode: 1, report: { exitName: 'VERIFY_FAILED', verificationItems: 2, verificationFailed: 1 } }, 'VERIFY_FAILED'],
+    ['a partial report with no verification items', { report: { exitName: 'OK', verificationItems: 0, verificationFailed: 0 } }, 'VERIFICATION_NOT_ALL_PASS'],
+    ['a failing verification item behind an OK exit', { report: { exitName: 'OK', verificationItems: 2, verificationFailed: 1 } }, 'VERIFICATION_NOT_ALL_PASS'],
     ['the target changed', { targetUnchanged: false }, 'TARGET_CHANGED'],
-    ['the teardown was incomplete', { teardownComplete: false }, 'TEARDOWN_INCOMPLETE'],
-    ['the load was not verified', { loadExit: 'APPLIED_UNVERIFIED' }, 'APPLIED_UNVERIFIED'],
-    ['the verification failed', { loadExit: 'VERIFY_FAILED' }, 'VERIFY_FAILED'],
-    ['the load never ran', { loadExit: null }, 'NOT_RUN'],
+    ['the teardown failed after the report', { teardownComplete: false }, 'TEARDOWN_INCOMPLETE'],
+    ['any problem was recorded on the way', { problemCount: 1 }, 'PROBLEMS_RECORDED'],
   ]
-  for (const [label, over, notWhat] of arms) {
-    const got = rec(over).verdict
-    assert.notEqual(got, 'OK', label)
-    assert.equal(got, notWhat, label)
+  for (const [label, over, verdict] of arms) {
+    const got = deriveRehearsalVerdict({ ...SIGNALS, ...over })
+    assert.equal(got.verdict, verdict, label)
+    assert.notEqual(got.verdict, 'OK', label)
+    if (label !== 'a non-zero exit is mapped') assert.notEqual(got.loadExit, 'OK', `${label}: the load exit never reads OK beside a non-OK verdict`)
   }
+  precondition(t, 'verdict arms', arms.length)
+})
+
+test('an OK record cannot be built without the bound report, a load exit of OK, an unchanged target and a complete teardown', (t) => {
+  const base = { manifestDigest: DIGEST, targetSystemId: '7', schemaHead: 'h', finishedAt: new Date('2026-10-20T10:00:00Z'), verdict: 'OK', loadExit: 'OK' as const, targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 2, verificationFailed: 0 } }
+  assert.equal(buildRehearsalRecord(base).verdict, 'OK')
+  // Mutation: build 'OK' from args.verdict alone and every arm below is green.
+  const arms: Array<Partial<typeof base> & { report?: null }> = [{ report: null }, { loadExit: null as never }, { targetUnchanged: false }, { teardownComplete: false }]
+  for (const over of arms) assert.notEqual(buildRehearsalRecord({ ...base, ...over }).verdict, 'OK', JSON.stringify(over))
   precondition(t, 'record arms', arms.length)
+})
+
+test('a child report is valid only if it is this load\'s report with a documented exit and a verification list', (t) => {
+  assert.deepEqual(validateChildReport(goodReport(), DIGEST), { exitName: 'OK', verificationItems: 2, verificationFailed: 0 })
+  assert.deepEqual(validateChildReport(goodReport({ verification: [{ result: 'pass' }, { result: 'fail' }, {}] }), DIGEST), { exitName: 'OK', verificationItems: 3, verificationFailed: 2 })
+  const bad: unknown[] = [null, 'x', [], goodReport({ tool: 'other' }), goodReport({ manifestDigest: 'e'.repeat(64) }), goodReport({ exit: { name: 'WHATEVER' } }), goodReport({ exit: null }), goodReport({ verification: 'pass' }), (() => { const r = goodReport(); delete (r as Record<string, unknown>).verification; return r })()]
+  for (const parsed of bad) assert.equal(validateChildReport(parsed, DIGEST), null, JSON.stringify(parsed))
+  precondition(t, 'report arms', bad.length)
+})
+
+test('the apply re-validates what an OK record binds: fields, then the report file itself', (t) => {
+  const record = { verdict: 'OK', loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 2, verificationFailed: 0 } }
+  assert.deepEqual(checkRecordBinding(record), [])
+  const clone = (over: Record<string, unknown>) => ({ ...record, ...over })
+  const badFields: unknown[] = [
+    null, {}, clone({ loadExit: 'VERIFY_FAILED' }), clone({ loadExit: null }), clone({ targetUnchanged: false }), clone({ targetUnchanged: undefined }), clone({ teardownComplete: false }), clone({ report: null }), clone({ report: undefined }),
+    clone({ report: { ...record.report, file: '../r.json' } }), clone({ report: { ...record.report, file: 'r.csv' } }), clone({ report: { ...record.report, sha256: 'xyz' } }),
+    clone({ report: { ...record.report, verificationItems: 0 } }), clone({ report: { ...record.report, verificationFailed: 1 } }), clone({ report: { ...record.report, verificationFailed: undefined } }),
+  ]
+  for (const bad of badFields) assert.ok(checkRecordBinding(bad).length > 0, JSON.stringify(bad))
+  const sha = 'a'.repeat(64)
+  assert.deepEqual(checkRecordReportFile(record, sha, goodReport(), DIGEST), [])
+  const fileArms: Array<[string, string, unknown]> = [
+    ['the file changed', 'b'.repeat(64), goodReport()],
+    ['another load', sha, goodReport({ manifestDigest: 'e'.repeat(64) })],
+    ['not OK inside', sha, goodReport({ exit: { name: 'VERIFY_FAILED' } })],
+    ['a failing item inside', sha, goodReport({ verification: [{ result: 'pass' }, { result: 'fail' }] })],
+    ['a different item count', sha, goodReport({ verification: [{ result: 'pass' }] })],
+    ['unparseable', sha, null],
+  ]
+  for (const [label, hash, parsed] of fileArms) assert.equal(checkRecordReportFile(record, hash, parsed, DIGEST).length, 1, label)
+  assert.equal(checkRecordReportFile({ ...record, report: null }, sha, goodReport(), DIGEST).length, 1)
+  precondition(t, 'binding arms', badFields.length + fileArms.length + 1)
 })
 
 test('the record the command writes is accepted by the gate it feeds, and by nothing weaker', async () => {
   const prepared = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
-  const record = buildRehearsalRecord({ manifestDigest: prepared.manifestDigest, targetSystemId: 'sys-1', schemaHead: 'h', finishedAt: new Date(), loadExit: 'OK', targetUnchanged: true, teardownComplete: true })
+  const record = buildRehearsalRecord({ manifestDigest: prepared.manifestDigest, targetSystemId: 'sys-1', schemaHead: 'h', finishedAt: new Date(), verdict: 'OK', loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 1, verificationFailed: 0 } })
   const db = new FakeDatabase(prepared)
   const accepted = await runLoad(prepared, db.ports(), { mode: 'apply', resume: false, rehearsal: record, systemId: 'sys-1', now: new Date(), maxRehearsalAgeHours: 24 })
   assert.equal(accepted.exit, 'OK', accepted.problems.join('; '))

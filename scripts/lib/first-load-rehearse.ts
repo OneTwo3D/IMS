@@ -18,6 +18,7 @@
  * WHAT A GREEN REHEARSAL DOES NOT SAY: that the target will behave like the copy under a concurrent writer (it is quiesced, not fenced), that the real data's timing or size will,
  * or that anything outside the database (a connector, a cron job) is quiet. It says the same files, through the same code, onto the same schema and configuration, load and verify.
  */
+import { createHash } from 'node:crypto'
 import { closeSync, constants as fsConstants, chmodSync, existsSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, realpathSync, statSync, writeSync } from 'node:fs'
 import path from 'node:path'
 
@@ -29,8 +30,8 @@ import {
 } from '../rehearse-first-install'
 import { checkAncestors } from '../../lib/ops/published-report'
 import { type ApplyExitName } from '../../lib/first-load/apply/constants'
-import { REHEARSAL_DATABASE, buildRehearsalRecord, exitNameOfCode, libpqEnvFromUrl, type RehearsalRecordFile } from '../../lib/first-load/apply/cli'
-import { readRegularFile, sha256OfFile } from './first-load-apply-files'
+import { REHEARSAL_DATABASE, buildRehearsalRecord, deriveRehearsalVerdict, libpqEnvFromUrl, validateChildReport, type ChildReportFacts, type RehearsalRecordFile } from '../../lib/first-load/apply/cli'
+import { readRegularFile } from './first-load-apply-files'
 
 const CHILD_TIMEOUT_MS = 90 * 60 * 1000
 const DUMP_TIMEOUT_MS = 30 * 60 * 1000
@@ -54,6 +55,8 @@ export interface RehearseInput {
   /** Test seams. */
   hooks?: {
     afterRestore?: () => Promise<void>
+    /** Runs after the child finished and before its report is read (a test damages or replaces the report here). */
+    afterChild?: (reportJson: string) => void
     /** Runs after the child finished and before the target is counted again (a test changes the target here). */
     beforeTargetRecount?: () => Promise<void>
   }
@@ -99,9 +102,19 @@ function toolChild(cmd: string, args: string[], env: Record<string, string>, tim
 
 export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
   const problems: string[] = []
-  const record = (loadExit: ApplyExitName | null, targetUnchanged: boolean, teardownComplete: boolean): RehearsalRecordFile =>
-    buildRehearsalRecord({ manifestDigest: input.manifestDigest, targetSystemId: input.targetSystemId, schemaHead: input.schemaHead, finishedAt: new Date(), loadExit, targetUnchanged, teardownComplete })
-  const refused = (message: string): RehearseOutcome => ({ exit: 'PRECONDITION_REFUSED', loadExit: null, record: record(null, true, true), targetUnchanged: true, teardownComplete: true, problems: [message], report: null })
+  const finishedRecord = (verdictSignals: Parameters<typeof deriveRehearsalVerdict>[0], report: RehearseOutcome['report'], facts: ChildReportFacts | null): { record: RehearsalRecordFile; loadExit: ApplyExitName | null; verdict: string } => {
+    const derived = deriveRehearsalVerdict(verdictSignals)
+    const binding = report !== null && facts !== null ? { file: path.basename(report.json), sha256: report.sha256, verificationItems: facts.verificationItems, verificationFailed: facts.verificationFailed } : null
+    return {
+      record: buildRehearsalRecord({ manifestDigest: input.manifestDigest, targetSystemId: input.targetSystemId, schemaHead: input.schemaHead, finishedAt: new Date(), verdict: derived.verdict, loadExit: derived.loadExit, targetUnchanged: verdictSignals.targetUnchanged, teardownComplete: verdictSignals.teardownComplete, report: binding }),
+      loadExit: derived.loadExit,
+      verdict: derived.verdict,
+    }
+  }
+  const refused = (message: string): RehearseOutcome => {
+    const r = finishedRecord({ childStarted: false, childTimedOut: false, childExitCode: null, report: null, targetUnchanged: true, teardownComplete: true, problemCount: 1 }, null, null)
+    return { exit: 'PRECONDITION_REFUSED', loadExit: null, record: r.record, targetUnchanged: true, teardownComplete: true, problems: [message], report: null }
+  }
 
   // ---- Refusals: nothing has been created yet. ----
   if (typeof process.getuid === 'function' && process.getuid() === 0) return refused('refusing to rehearse as root: initdb will not run as root, and a rehearsal must not own files in an IMS tree. Run it as the account that owns the checkout.')
@@ -134,8 +147,11 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
   const root = mkdtempSync(path.join(parent, RUN_DIR_PREFIX))
   chmodSync(root, 0o700)
   const state: RunState = { root, envFile: path.join(root, 'child.env'), envFileId: null, cluster: null, postmasterPid: null, postmaster: null, role: null, password: randomHex(24), secrets: [], teardown: null }
-  let loadExit: ApplyExitName | null = null
+  let childStarted = false
+  let childTimedOut = false
+  let childExitCode: number | null = null
   let report: RehearseOutcome['report'] = null
+  let facts: ChildReportFacts | null = null
   try {
     // ---- The copy. ----
     const dumpFile = path.join(root, 'target.dump')
@@ -181,14 +197,23 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
       '--report-dir', input.reportDir, '--operator', input.operator,
     ]
     const child = await runChild({ cmd: path.join(input.repoRoot, 'node_modules/.bin/tsx'), args, env: inheritedEnv(root), cwd: input.repoRoot, timeoutMs: CHILD_TIMEOUT_MS })
-    loadExit = exitNameOfCode(child.exitCode)
+    childStarted = true
+    childExitCode = child.exitCode
+    childTimedOut = child.timedOut
     if (child.timedOut) problems.push('the rehearsal child timed out and was stopped')
-    if (loadExit === null) problems.push('the rehearsal child ended without one of the documented exit codes')
-    input.log(`[rehearsal] the load on the copy ended ${loadExit ?? 'unknown'}`)
+    if (child.exitCode === null) problems.push('the rehearsal child was killed or could not run')
+    input.log(`[rehearsal] the child ended with exit code ${child.exitCode ?? 'none'}`)
     const json = path.join(input.reportDir, `${input.reportStem}.json`)
-    const hashed = sha256OfFile(json)
-    if (hashed.ok) report = { json, sha256: hashed.sha256 }
-    else problems.push('the rehearsal child published no report')
+    input.hooks?.afterChild?.(json)
+    // The report is read ONCE, here: its hash and its contents come from the same bytes, and it must be a passing-or-not report of THIS load.
+    const read = readRegularFile(json, 16 * 1024 * 1024)
+    if (read.ok) {
+      let parsed: unknown = null
+      try { parsed = JSON.parse(read.bytes.toString('utf8')) } catch { parsed = null }
+      facts = validateChildReport(parsed, input.manifestDigest)
+      if (facts === null) problems.push('the report the rehearsal child published is unreadable or is not the report of this load')
+      else report = { json, sha256: createHash('sha256').update(read.bytes).digest('hex') }
+    } else problems.push('the rehearsal child published no report')
   } catch (error) {
     problems.push(error instanceof RehearsalFailure ? error.message : 'the rehearsal failed before the load could run')
   } finally {
@@ -207,20 +232,10 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
   }
   if (!targetUnchanged) problems.push('the row counts of the target database differ from before the rehearsal: the copy is not a copy of the target as it now is, so this rehearsal is not valid')
 
-  // The report the child published must be the one this load produced.
-  if (report !== null) {
-    const read = readRegularFile(report.json, 16 * 1024 * 1024)
-    let parsed: { tool?: unknown; manifestDigest?: unknown; exit?: { name?: unknown } } = {}
-    try { parsed = read.ok ? JSON.parse(read.bytes.toString('utf8')) : {} } catch { parsed = {} }
-    if (parsed.tool !== 'first-load-apply' || parsed.manifestDigest !== input.manifestDigest || parsed.exit?.name !== loadExit) {
-      problems.push('the report the rehearsal child published is not the report of this load')
-      loadExit = null
-    }
-  }
-
-  const rec = record(loadExit, targetUnchanged, teardownComplete)
-  const exit: ApplyExitName = !teardownComplete ? 'REHEARSAL_TEARDOWN_INCOMPLETE' : rec.verdict === 'OK' && problems.length === 0 ? 'OK' : loadExit !== null && loadExit !== 'OK' ? loadExit : !targetUnchanged ? 'INTERNAL' : 'PRECONDITION_REFUSED'
-  return { exit, loadExit, record: rec, targetUnchanged, teardownComplete, problems, report }
+  const finished = finishedRecord({ childStarted, childTimedOut, childExitCode, report: facts, targetUnchanged, teardownComplete, problemCount: problems.length }, report, facts)
+  const loadExit = finished.loadExit
+  const exit: ApplyExitName = finished.verdict === 'OK' ? 'OK' : !teardownComplete ? 'REHEARSAL_TEARDOWN_INCOMPLETE' : loadExit !== null && loadExit !== 'OK' ? loadExit : !childStarted ? 'PRECONDITION_REFUSED' : 'INTERNAL'
+  return { exit, loadExit, record: finished.record, targetUnchanged, teardownComplete, problems, report: facts !== null ? report : null }
 }
 
 class RehearsalFailure extends Error {}

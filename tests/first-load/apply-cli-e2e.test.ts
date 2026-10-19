@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, rmSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 
@@ -176,7 +177,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
   describe('apply is refused, and writes nothing, without a rehearsal of this exact load', () => {
     it('no record file, a record of another digest, another target, an old one and one whose verdict is not OK: each exits 3 with no restore point and no run record', async (t) => {
       // Mutation: skip the gate before the restore point (or the core's gate) and the matching arm takes a dump or loads.
-      const good = { formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: 'x', verdict: 'OK', systemId, schemaHead: lastMigrationName(REPO), finishedAt: new Date().toISOString() }
+      const good = { formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: 'x', verdict: 'OK', systemId, schemaHead: lastMigrationName(REPO), loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 1, verificationFailed: 0 }, finishedAt: new Date().toISOString() }
       const prepared = JSON.parse(readFileSync(join(reportDir, reportsIn().find((f) => f.includes('-plan-') && f.endsWith('.json'))!), 'utf8')) as { manifestDigest: string }
       const digest = prepared.manifestDigest
       const arms: Array<[string, Record<string, unknown>]> = [
@@ -224,6 +225,38 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       assert.equal(report.exit.name, 'OK')
       assert.equal(report.target.database, 'ims_firstload_rehearsal')
       assert.ok(report.verification.length > 0 && report.verification.every((v) => v.result === 'pass'))
+    })
+
+    it('an apply refuses a record that says OK but whose bound evidence is gone, changed, or not passing (the verdict is not taken on its word)', async (t) => {
+      // Mutation: drop checkRecordBinding / checkRecordReportFile from the command and the matching arm loads.
+      const rec = JSON.parse(readFileSync(recordFile, 'utf8')) as { report: { file: string; sha256: string } } & Record<string, unknown>
+      const original = readFileSync(join(reportDir, rec.report.file))
+      const place = (name: string, record: unknown, report: Buffer | null): string => {
+        const d = join(dir, `bound-${name}`)
+        mkdirSync(d, { mode: 0o700 })
+        if (report) writeFileSync(join(d, rec.report.file), report)
+        writeFileSync(join(d, 'record.json'), JSON.stringify(record), { mode: 0o600 })
+        return join(d, 'record.json')
+      }
+      const flipped = JSON.parse(original.toString('utf8')) as { verification: Array<{ result: string }> }
+      flipped.verification[0]!.result = 'fail'
+      const arms: Array<[string, string]> = [
+        ['report file absent', place('absent', rec, null)],
+        ['report file changed by a byte', place('changed', rec, Buffer.concat([original, Buffer.from(' ')]))],
+        ['report with a failing item, hash re-bound', (() => { const b = Buffer.from(JSON.stringify(flipped)); return place('failing', { ...rec, report: { ...rec.report, sha256: createHash('sha256').update(b).digest('hex') } }, b) })()],
+        ['no bound report', place('unbound', { ...rec, report: null }, original)],
+        ['load exit not OK', place('exit', { ...rec, loadExit: 'VERIFY_FAILED' }, original)],
+        ['target not proved unchanged', place('target', { ...rec, targetUnchanged: false }, original)],
+      ]
+      for (const [label, file] of arms) {
+        const r = await RUN(['--apply', '--rehearsal-record', file])()
+        assert.equal(r.exitCode, 3, `${label}: ${r.stderr}`)
+        assert.equal(await runRecords(), 0, label)
+        assert.deepEqual(readdirSync(restoreDir), [], `${label}: no restore point`)
+      }
+      // Control: the same record beside its own, untouched report is accepted by the binding checks (the next test applies with it).
+      assert.equal(createHash('sha256').update(original).digest('hex'), rec.report.sha256)
+      precondition(t, 'binding arms', arms.length)
     })
 
     it('an apply with that record takes a restore point (mode 600, readable by pg_restore), loads, verifies, and ends VERIFIED', async () => {
@@ -297,6 +330,43 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       assert.ok(outcome.problems.some((p) => /row counts of the target database differ/.test(p)))
       assert.equal(outcome.teardownComplete, true)
       assert.deepEqual(readdirSync(rehearsalRoot), [])
+    })
+  })
+
+  describe('a child that exits OK but whose report cannot be trusted never yields an OK record', () => {
+    const attempt = async (stem: string, afterChild: (json: string) => void) => {
+      await s.db.$disconnect()
+      await runs('truncate products, suppliers, product_categories, purchase_orders, stock_movements, first_load_apply_runs, activity_logs restart identity cascade')
+      const planDigest = (jsonOf(reportsIn().find((f) => f.includes('-plan-') && f.endsWith('.json'))!) as { manifestDigest: string }).manifestDigest
+      return rehearse({
+        targetEnv: Object.fromEntries(readFileSync(envFile, 'utf8').split('\n').filter(Boolean).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)])),
+        targetSystemId: systemId, manifestPath: manifest, manifestDigest: planDigest, schemaHead: lastMigrationName(REPO), repoRoot: REPO, root: rehearsalRoot, reportDir, reportStem: stem, operator: 'E2E Operator',
+        log: () => undefined, hooks: { afterChild },
+      })
+    }
+    // Mutation: derive the verdict from the child's exit code alone (the old shape) and every arm below records OK.
+    const arms: Array<[string, (json: string) => void]> = [
+      ['the report deleted', (json) => rmSync(json)],
+      ['the report truncated to invalid JSON', (json) => writeFileSync(json, '{"tool": "first-load-apply", "manif')],
+      ['the report of another load', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.manifestDigest = 'f'.repeat(64); writeFileSync(json, JSON.stringify(r)) }],
+      ['the report with a failing verification item', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.verification[0].result = 'fail'; writeFileSync(json, JSON.stringify(r)) }],
+      ['the report with no verification items', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.verification = []; writeFileSync(json, JSON.stringify(r)) }],
+      ['the report naming another exit than the process', (json) => { const r = JSON.parse(readFileSync(json, 'utf8')); r.exit.name = 'VERIFY_FAILED'; writeFileSync(json, JSON.stringify(r)) }],
+    ]
+    arms.forEach(([label, tamper], i) => {
+      it(label, async () => {
+        const outcome = await attempt(`first-load-apply-rehearse-tamper-${i}`, tamper)
+        assert.notEqual(outcome.record.verdict, 'OK')
+        assert.notEqual(outcome.exit, 'OK')
+        assert.notEqual(outcome.record.loadExit, 'OK')
+        assert.equal(outcome.teardownComplete, true)
+      })
+    })
+    it('CONTROL: untouched, the same call records OK with the report bound', async () => {
+      const outcome = await attempt('first-load-apply-rehearse-control', () => undefined)
+      assert.equal(outcome.record.verdict, 'OK', outcome.problems.join('; '))
+      assert.ok(outcome.record.report && outcome.record.report.verificationItems > 0 && outcome.record.report.verificationFailed === 0)
+      assert.equal(outcome.exit, 'OK')
     })
   })
 

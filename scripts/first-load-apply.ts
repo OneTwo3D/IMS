@@ -18,6 +18,7 @@
  * that only this account can use, Markdown first and the JSON last as the commit record.
  */
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { closeSync, constants as fsConstants, lstatSync, openSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -27,7 +28,7 @@ import pg from 'pg'
 import {
   APPLY_EXIT_CODES, REHEARSAL_MAX_AGE_HOURS, REHEARSAL_RECORD_STEM_PREFIX, RUNNER_APPLICATION_NAME, exitOperatorText, type ApplyExitName,
 } from '../lib/first-load/apply/constants'
-import { REHEARSAL_DATABASE, buildRunnerEnv, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
+import { REHEARSAL_DATABASE, buildRunnerEnv, checkRecordBinding, checkRecordReportFile, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
 import { readPreparedDir, PreparedDirError } from '../lib/first-load/apply/io'
 import { ApplyManifestError, parseApplyManifest, type ApplyManifest } from '../lib/first-load/apply/manifest'
 import { checkRehearsalGate, type ApplyResult } from '../lib/first-load/apply/orchestrate'
@@ -208,6 +209,16 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
       if (gate.length > 0) return stopWith('PRECONDITION_REFUSED', gate)
       const schema = checkRecordSchema(rehearsalRecord, lastMigrationName(REPO_ROOT))
       if (schema.length > 0) return stopWith('PRECONDITION_REFUSED', schema)
+      // The record's verdict is not taken on its word: it must carry every bound field, and the child report it binds is re-read from beside the record and re-validated.
+      const binding = checkRecordBinding(rehearsalRecord)
+      if (binding.length > 0) return stopWith('PRECONDITION_REFUSED', binding)
+      const bound = (rehearsalRecord as { report: { file: string } }).report.file
+      const boundRead = readRegularFile(path.join(path.dirname(path.resolve(args.rehearsalRecord!)), bound), 16 * 1024 * 1024)
+      if (!boundRead.ok) return stopWith('PRECONDITION_REFUSED', ['the report the rehearsal record binds cannot be read next to the record'])
+      let boundParsed: unknown = null
+      try { boundParsed = JSON.parse(boundRead.bytes.toString('utf8')) } catch { boundParsed = null }
+      const boundProblems = checkRecordReportFile(rehearsalRecord, createHash('sha256').update(boundRead.bytes).digest('hex'), boundParsed, prepared.manifestDigest)
+      if (boundProblems.length > 0) return stopWith('PRECONDITION_REFUSED', boundProblems)
       const restoreProblem = checkRestoreDir(prepared.manifest.restorePointDir)
       if (restoreProblem !== null) return stopWith('PRECONDITION_REFUSED', [restoreProblem])
 
