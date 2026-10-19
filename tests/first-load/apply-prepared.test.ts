@@ -295,3 +295,22 @@ test('chunks: an order whole inside one file loads; an order whose lines span tw
   const split = splitOrders(honest, ['QBX-ZQSENT-PO-5001', 'ZQSENT-TSHIRT-M'], ['ZQSENT-TSHIRT-S'])
   expectProblem(split, /the rows of this order are in 2 different files/)
 })
+
+test('an order with more lines than one importer call may hold is refused at load, before any call, with a count and no key; one at the bound loads', (t) => {
+  // Mutation named: drop the check in prepared.ts -> the oversized order loads and this arm is red.
+  const text = new TextDecoder().decode(honest.get(ORDERS)!)
+  const [header, ...lines] = text.split('\r\n').filter((l) => l !== '')
+  const first = lines[0]!
+  const orderLines = (n: number) => (body: string) => {
+    const rows = body.split('\r\n').filter((l) => l !== '')
+    return [rows[0]!, ...Array.from({ length: n }, () => first), ...rows.slice(1).filter((l) => !l.startsWith(first.split(',')[0]!))].join('\r\n') + '\r\n'
+  }
+  const atBound = problemsOf(withConsistentFile(honest, ORDERS, orderLines(500)))
+  assert.ok(!atBound.some((p) => /more than 500 lines/.test(p)), `at the bound: ${JSON.stringify(atBound)}`)
+  const over = problemsOf(withConsistentFile(honest, ORDERS, orderLines(501)))
+  precondition(t, 'problems', over.length)
+  const message = over.find((p) => /order\(s\) have more than 500 lines/.test(p))
+  assert.ok(message, JSON.stringify(over))
+  assert.match(message!, /^purchase-orders: 1 order\(s\) have more than 500 lines/)
+  assert.ok(!message!.includes(first.split(',')[0]!), 'no order key in the sentence')
+})

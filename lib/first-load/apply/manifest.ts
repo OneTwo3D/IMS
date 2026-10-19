@@ -127,15 +127,17 @@ export function parseApplyManifest(text: string): ApplyManifest {
   if (raw.expectWarehouses !== undefined) {
     if (!isObject(raw.expectWarehouses)) fail('apply manifest expectWarehouses must be an object of warehouse code to {type, availableForSale, syncToStore}')
     else {
-      for (const [code, profile] of Object.entries(raw.expectWarehouses)) {
-        if (!CODE_PATTERN.test(code)) { fail(`apply manifest expectWarehouses: ${JSON.stringify(code)} is not a usable warehouse code`); continue }
+      for (const [entryIndex, [code, profile]] of Object.entries(raw.expectWarehouses).entries()) {
+        // Entries are named by position, never by their code: a warehouse code is a data key and problem text carries none.
+        const at = `expectWarehouses entry ${entryIndex + 1}`
+        if (!CODE_PATTERN.test(code)) { fail(`apply manifest ${at} is not a usable warehouse code`); continue }
         const upper = code.toUpperCase()
-        if (upper in expectWarehouses) { fail(`apply manifest expectWarehouses lists ${upper} twice (codes are matched in upper case)`); continue }
-        if (!isObject(profile)) { fail(`apply manifest expectWarehouses.${code} must be an object`); continue }
-        for (const key of Object.keys(profile)) if (!(WAREHOUSE_PROFILE_KEYS as readonly string[]).includes(key)) fail(`apply manifest expectWarehouses.${code}: unknown key "${key}"`)
+        if (upper in expectWarehouses) { fail(`apply manifest ${at} lists a warehouse code twice (codes are matched in upper case)`); continue }
+        if (!isObject(profile)) { fail(`apply manifest ${at} must be an object`); continue }
+        for (const key of Object.keys(profile)) if (!(WAREHOUSE_PROFILE_KEYS as readonly string[]).includes(key)) fail(`apply manifest ${at}: unknown key "${key}"`)
         const { type, availableForSale, syncToStore } = profile
-        if (typeof type !== 'string' || !(WAREHOUSE_TYPES as readonly string[]).includes(type)) { fail(`apply manifest expectWarehouses.${code}.type must be one of ${WAREHOUSE_TYPES.join(', ')}`); continue }
-        if (typeof availableForSale !== 'boolean' || typeof syncToStore !== 'boolean') { fail(`apply manifest expectWarehouses.${code}: availableForSale and syncToStore must both be true or false (nothing is defaulted)`); continue }
+        if (typeof type !== 'string' || !(WAREHOUSE_TYPES as readonly string[]).includes(type)) { fail(`apply manifest ${at}.type must be one of ${WAREHOUSE_TYPES.join(', ')}`); continue }
+        if (typeof availableForSale !== 'boolean' || typeof syncToStore !== 'boolean') { fail(`apply manifest ${at}: availableForSale and syncToStore must both be true or false (nothing is defaulted)`); continue }
         expectWarehouses[upper] = { type: type as WarehouseProfile['type'], availableForSale, syncToStore }
       }
     }
@@ -148,10 +150,10 @@ export function parseApplyManifest(text: string): ApplyManifest {
   if (raw.acceptZeroCost !== undefined) {
     if (!Array.isArray(raw.acceptZeroCost)) fail('apply manifest acceptZeroCost must be a list of "SKU@WAREHOUSE"')
     else {
-      for (const entry of raw.acceptZeroCost) {
+      for (const [entryIndex, entry] of raw.acceptZeroCost.entries()) {
         const normalised = typeof entry === 'string' ? normaliseZeroCostEntry(entry) : null
-        if (normalised === null) fail(`apply manifest acceptZeroCost entry ${JSON.stringify(entry)} is not "SKU@WAREHOUSE"`)
-        else if (acceptZeroCost.includes(normalised)) fail(`apply manifest acceptZeroCost lists ${normalised} twice`)
+        if (normalised === null) fail(`apply manifest acceptZeroCost entry ${entryIndex + 1} is not "SKU@WAREHOUSE"`)
+        else if (acceptZeroCost.includes(normalised)) fail(`apply manifest acceptZeroCost entry ${entryIndex + 1} lists a pair twice`)
         else acceptZeroCost.push(normalised)
       }
       acceptZeroCost.sort()
@@ -181,8 +183,8 @@ export function parseApplyManifest(text: string): ApplyManifest {
   if (raw.forbidSkus !== undefined) {
     if (!Array.isArray(raw.forbidSkus)) fail('apply manifest forbidSkus must be a list of SKUs')
     else {
-      for (const sku of raw.forbidSkus) {
-        if (typeof sku !== 'string' || sku.trim() === '') fail(`apply manifest forbidSkus entry ${JSON.stringify(sku)} is not a SKU`)
+      for (const [entryIndex, sku] of raw.forbidSkus.entries()) {
+        if (typeof sku !== 'string' || sku.trim() === '') fail(`apply manifest forbidSkus entry ${entryIndex + 1} is not a SKU`)
         else if (!forbidSkus.includes(sku.trim().toUpperCase())) forbidSkus.push(sku.trim().toUpperCase())
       }
       forbidSkus.sort()

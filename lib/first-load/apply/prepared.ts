@@ -17,6 +17,7 @@ import type { PrepareReport } from '../transform'
 import {
   PREPARED_REPORT_MARKDOWN_NAME, PREPARED_REPORT_NAME, STEP_TARGET, SUPPORTED_BASE_CURRENCY, TRANSFERS_REFUSAL, type ApplyStepId,
 } from './constants'
+import { IMPORT_CALL_MAX_ROWS } from './import-calls'
 import { componentSkus, keyStep, rowLocation, type KeyedUnit, type StepRow, type StepRows } from './keys'
 import { digestableManifest, zeroCostKey, type ApplyManifest } from './manifest'
 
@@ -188,6 +189,11 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     const keyed = keyStep(id, data)
     problems.push(...keyed.problems.slice(0, 20))
     if (keyed.problems.length > 20) problems.push(`${id}: ... and ${keyed.problems.length - 20} more problem(s)`)
+    if (id === 'purchase-orders') {
+      // An order is sent in one importer call and never split, so one with more lines than a call may hold is refused here, before any call (the bound on a call's size is a safety bound).
+      const tooLarge = keyed.units.filter((u) => u.rowIndexes.length > IMPORT_CALL_MAX_ROWS).length
+      if (tooLarge > 0) problems.push(`purchase-orders: ${tooLarge} order(s) have more than ${IMPORT_CALL_MAX_ROWS} lines, more than one importer call may hold; split the order or raise the bound deliberately`)
+    }
     steps.push({ step: id, target, files: list.map((e) => ({ name: e.name, chunk: e.chunk, sha256: e.sha256, bytes: e.bytes, rows: e.rows })), data, units: keyed.units })
   }
   const notSelected = [...byTarget.keys()].filter((t) => !manifest.steps.includes(t as ApplyStepId)).sort()

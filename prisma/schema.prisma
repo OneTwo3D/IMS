@@ -4626,3 +4626,25 @@ model WcWithdrawalSuppression {
   @@id([connector, externalOrderId])
   @@map("wc_withdrawal_suppressions")
 }
+
+/// The first-load apply runner's run record: ONE row per database, moved only by compare-and-swap on `version`.
+/// Audit and "this is the same load" identity; correctness never depends on it (the runner re-reads the data tables).
+model FirstLoadApplyRun {
+  id             String   @id @default(cuid())
+  /// Always true. The unique index on it is what makes a second load into the same database impossible.
+  singleton      Boolean  @unique @default(true)
+  /// Starts at 1; every save writes the version it read plus one, and only if the stored version is still the one it read.
+  version        Int
+  manifestDigest String   @map("manifest_digest")
+  runId          String   @map("run_id")
+  status         String
+  currentStep    String?  @map("current_step")
+  /// Per-step counts and residual hashes: bounded codes and numbers, never a prepared-file value.
+  steps          Json     @default("{}")
+  /// Facts the runner records once and never rewrites (for example the accounting profile of the tax rates the purchase-order file resolves to, taken just before the first write).
+  facts          Json     @default("{}")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @default(now()) @map("updated_at")
+
+  @@map("first_load_apply_runs")
+}

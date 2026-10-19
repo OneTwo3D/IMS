@@ -15,8 +15,11 @@
  * docs/first-load-apply.md, "What a report contains".)
  */
 import { NUMERIC_LIMITS } from '../spec'
-import { D, fmt, fmtFixed, parseDecimal } from '../money'
+import { D, fmtFixed, parseDecimal } from '../money'
 import type { ApplyStepId } from './constants'
+import {
+  openingStockFingerprint, productFingerprint, purchaseOrderFingerprint, purchaseOrderHeader, purchaseOrderLine, supplierFingerprint, type CellRecord,
+} from './normal-form'
 
 export interface StepRow {
   /** 1-based chunk (file) the row came from. */
@@ -44,6 +47,8 @@ export interface KeyedUnit {
   recipe: string | null
   /** Indexes into StepRows.rows (a purchase order unit spans all its lines). */
   rowIndexes: number[]
+  /** Purchase orders only: each line's quantity, entered unit cost and line discount as the importer reads them, in file order. The read-back recomputes the stored amounts from these. */
+  poLines?: Array<{ qty: number; unitCost: number; discount: number }>
 }
 
 export interface KeyedStep {
@@ -109,31 +114,11 @@ export const FINGERPRINT_SPECS: Readonly<Record<ApplyStepId, FingerprintSpec>> =
   },
 }
 
-const NUMERIC_COLUMNS = new Set([
-  'weight', 'widthCm', 'heightCm', 'depthCm', 'salesPriceBase', 'salePriceBase', 'paymentTermsDays',
-  'fxRateToBase', 'orderTaxRateValue', 'orderDiscountForeign', 'lineDiscountForeign', 'taxRateValue',
-])
-const BOOLEAN_COLUMNS = new Set(['preferredSupplierLocked', 'salesPriceTaxInclusive', 'oversellAllowed', 'active', 'pricesIncludeVat'])
-const UPPER_COLUMNS = new Set(['currency', 'supplierName', 'destinationWarehouseCode'])
 /** Columns that would make an importer match by id instead of by natural key. They must be blank in a first load. */
 const ID_COLUMNS: Readonly<Record<string, readonly string[]>> = { suppliers: ['supplierId'], products: ['productId', 'parentProductId'] }
 
 function indexOf(header: string[]): Map<string, number> {
   return new Map(header.map((name, i) => [name, i]))
-}
-
-function normaliseNumber(raw: string): string {
-  const parsed = parseDecimal(raw, 'value', { maxIntDigits: 20, maxDp: 12 }, { allowNegative: true })
-  return parsed.ok ? fmt(parsed.value) : raw.trim()
-}
-
-/** One cell in its normal form (numbers without trailing zeros, booleans lower-case, currencies and warehouse codes upper-case). */
-function normaliseCell(column: string, raw: string): string {
-  const value = raw.trim()
-  if (NUMERIC_COLUMNS.has(column)) return value === '' ? '' : normaliseNumber(value)
-  if (BOOLEAN_COLUMNS.has(column)) return value.toLowerCase()
-  if (UPPER_COLUMNS.has(column)) return value.toUpperCase()
-  return value
 }
 
 /** "SKU:qty;SKU:qty" to a sorted multiset string; problems are returned, never thrown, and never carry a cell value. */
@@ -189,14 +174,14 @@ export function keyStep(step: ApplyStepId, data: StepRows): KeyedStep {
   const spec = FINGERPRINT_SPECS[step]
   const get = (row: StepRow, name: string): string => (col.has(name) ? row.cells[col.get(name)!] ?? '' : '')
   const where = (row: StepRow) => `${step} ${rowLocation(row)}`
-  const fieldsOf = (row: StepRow, columns: readonly string[]): Record<string, string> => Object.fromEntries(columns.map((c) => [c, normaliseCell(c, get(row, c))]))
+  const cellsOf = (row: StepRow): CellRecord => Object.fromEntries(data.header.map((name, i) => [name, row.cells[i] ?? '']))
   for (const row of data.rows) for (const idColumn of ID_COLUMNS[step] ?? []) if (get(row, idColumn) !== '') problems.push(`${where(row)}: ${idColumn} must be blank (an id would make the importer match by id, not by natural key)`)
 
   if (step === 'suppliers') {
     data.rows.forEach((row, index) => {
       const name = get(row, 'name')
       if (name.trim() === '' || name !== name.trim()) { problems.push(`${where(row)}: the name is blank or has surrounding spaces`); return }
-      units.push({ step, key: name.toLowerCase(), collisionKey: name.toUpperCase(), fingerprint: JSON.stringify(fieldsOf(row, spec.fingerprinted)), recipe: null, rowIndexes: [index] })
+      units.push({ step, key: name.toLowerCase(), collisionKey: name.toUpperCase(), fingerprint: supplierFingerprint(spec.fingerprinted, cellsOf(row)), recipe: null, rowIndexes: [index] })
     })
   } else if (step === 'products') {
     data.rows.forEach((row, index) => {
@@ -207,7 +192,7 @@ export function keyStep(step: ApplyStepId, data: StepRows): KeyedStep {
       problems.push(...components.problems)
       if ((type === 'KIT' || type === 'BOM') && components.recipe === null && components.problems.length === 0) problems.push(`${where(row)}: a ${type} without components would load with no recipe`)
       if (type !== 'KIT' && type !== 'BOM' && get(row, 'components') !== '') problems.push(`${where(row)}: only a KIT or BOM can carry components`)
-      units.push({ step, key: sku, collisionKey: sku.toUpperCase(), fingerprint: JSON.stringify(fieldsOf(row, spec.fingerprinted)), recipe: components.recipe, rowIndexes: [index] })
+      units.push({ step, key: sku, collisionKey: sku.toUpperCase(), fingerprint: productFingerprint(spec.fingerprinted, cellsOf(row), 'file'), recipe: components.recipe, rowIndexes: [index] })
     })
   } else if (step === 'opening-stock') {
     data.rows.forEach((row, index) => {
@@ -220,8 +205,7 @@ export function keyStep(step: ApplyStepId, data: StepRows): KeyedStep {
       if (!cost.ok) { problems.push(`${where(row)}: unitCostBase is not an acceptable number`); return }
       if (!qty.value.gt(new D(0))) { problems.push(`${where(row)}: quantity must be greater than zero (the importer refuses it)`); return }
       const key = `${sku.toUpperCase()}|${warehouse.toUpperCase()}`
-      const fields = { sku: sku.toUpperCase(), warehouseCode: warehouse.toUpperCase(), qty: fmt(qty.value), unitCostBase: fmtFixed(cost.value, 6) }
-      units.push({ step, key, collisionKey: key, fingerprint: JSON.stringify(fields), recipe: null, rowIndexes: [index] })
+      units.push({ step, key, collisionKey: key, fingerprint: openingStockFingerprint(sku, warehouse, qty.value, cost.value), recipe: null, rowIndexes: [index] })
     })
   } else {
     const orders = new Map<string, number[]>()
@@ -246,11 +230,16 @@ export function keyStep(step: ApplyStepId, data: StepRows): KeyedStep {
         if (!cost.ok) { problems.push(`${where(row)}: unitCostForeign is not an acceptable number`); continue }
         if (sku === '') { problems.push(`${where(row)}: the SKU is blank`); continue }
         if (!qty.value.gt(new D(0))) { problems.push(`${where(row)}: quantity must be greater than zero`); continue }
-        const rest = (spec.lineLevel ?? []).filter((c) => !['sku', 'qty', 'unitCostForeign'].includes(c)).map((c) => normaliseCell(c, get(row, c)))
-        lines.push([sku.toUpperCase(), fmtFixed(qty.value, 4), fmtFixed(cost.value, 6), ...rest].join('|'))
+        lines.push(purchaseOrderLine(cellsOf(row), qty.value, cost.value))
       }
-      const fields: Record<string, unknown> = { ...fieldsOf(first, spec.fingerprinted), status: 'DRAFT', lines: lines.sort() }
-      units.push({ step, key, collisionKey: key.toUpperCase(), fingerprint: JSON.stringify(fields), recipe: null, rowIndexes: indexes })
+      // The numbers as the importer reads them: Number(qty || 1), parseOptionalNumber(unit cost), parseOptionalNumber(discount) ?? 0.
+      const poLines = indexes.map((i) => {
+        const row = data.rows[i]
+        const qty = Number(get(row, 'qty') || 1)
+        const disc = get(row, 'lineDiscountForeign').trim() === '' ? 0 : Number(get(row, 'lineDiscountForeign').trim())
+        return { qty, unitCost: Number(get(row, 'unitCostForeign').trim()), discount: Number.isFinite(disc) ? disc : 0 }
+      })
+      units.push({ step, key, collisionKey: key.toUpperCase(), fingerprint: purchaseOrderFingerprint(purchaseOrderHeader(spec.fingerprinted, cellsOf(first)), lines), recipe: null, rowIndexes: indexes, poLines })
     }
     units.sort((a, b) => a.rowIndexes[0] - b.rowIndexes[0])
   }

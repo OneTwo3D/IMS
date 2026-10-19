@@ -80,6 +80,23 @@ export class StaleJournalError extends Error {
   }
 }
 
+/**
+ * Thrown by `withStepLock` when the step cannot be run under its lock: another runner holds it (`busy`), the lock's connection failed while the step ran
+ * (`lost`: the exclusion is gone, so the step must stop), or it could not be taken (`unavailable`). The run record is NOT touched on any of them: a runner
+ * that does not hold the lock has no business moving the record the holder is moving.
+ */
+export class StepLockError extends Error {
+  constructor(readonly reason: 'busy' | 'lost' | 'unavailable') {
+    super(`the step lock was not available (${reason})`)
+    this.name = 'StepLockError'
+  }
+}
+
+/** What a step lock lends the step's body: a check, bound to THAT acquisition, that the lock is still held. Importer calls are made only after it passes. */
+export interface StepLock {
+  assertLive(): Promise<void>
+}
+
 export interface VerificationItem {
   id: string
   result: 'pass' | 'fail'
@@ -94,12 +111,18 @@ export interface ApplyPorts {
     save(record: RunRecord, expectedVersion: number | null): Promise<void>
   }
   observe(step: ApplyStepId): Promise<StepObservation>
-  withStepLock<T>(step: ApplyStepId, body: () => Promise<T>): Promise<T>
+  /**
+   * Rails evaluated once, before anything is written (plan and apply alike), with the facts the core knows: whether a run record already exists.
+   * Returns the problems found (empty = the target may be loaded). An unreadable database throws ObservationError.
+   */
+  preflight?(facts: { resuming: boolean }): Promise<string[]>
+  withStepLock<T>(step: ApplyStepId, body: (lock: StepLock) => Promise<T>): Promise<T>
   /** Rails re-evaluated at the start of a step and again just before its first write. Returns the problems found (empty = still holds). */
   recheckRails?(step: ApplyStepId, phase: 'step-start' | 'before-first-write'): Promise<string[]>
   /** Persist a residual file exclusively (the file is evidence); optional. */
   storeResidual?(file: ResidualFile): Promise<void>
-  execute(step: ApplyStepId, file: ResidualFile): Promise<ImporterResult>
+  /** `lock` is the handle of the step lock this call runs under; an executor that makes several importer calls checks it before each. */
+  execute(step: ApplyStepId, file: ResidualFile, lock: StepLock): Promise<ImporterResult>
   verify?(run: PreparedRun, steps: StepResult[]): Promise<VerificationItem[]>
 }
 
@@ -170,7 +193,7 @@ export function checkRehearsalGate(record: unknown, expected: { manifestDigest: 
   const r = record as Record<string, unknown>
   const problems: string[] = []
   if (r.formatVersion !== REHEARSAL_RECORD_FORMAT_VERSION) problems.push('the rehearsal report is not format version 1')
-  if (r.verdict !== 'OK') problems.push(`the rehearsal verdict is ${JSON.stringify(r.verdict)}, not OK`)
+  if (r.verdict !== 'OK') problems.push('the rehearsal verdict is missing or is not OK')
   if (r.manifestDigest !== expected.manifestDigest) problems.push('the rehearsal was of a different load (its manifest digest differs)')
   if (expected.systemId === null || typeof r.systemId !== 'string' || r.systemId !== expected.systemId) problems.push('the rehearsal was run against a different target (its system id differs, or the target\'s is unknown)')
   const finished = typeof r.finishedAt === 'string' ? Date.parse(r.finishedAt) : NaN
@@ -234,20 +257,35 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   })
   const anyConflict = prepared.steps.some((s) => hasConflict(classified.get(s.step)!))
 
+  // The run record is read (never written) in both modes: the rails need to know whether this is a fresh load or a resume.
+  let existing: RunRecord | null
+  try {
+    existing = await ports.journal.load()
+    if (ports.preflight) {
+      const problems = await ports.preflight({ resuming: existing !== null })
+      if (problems.length > 0) return finish('PRECONDITION_REFUSED', problems, planSteps, existing)
+    }
+  } catch (error) {
+    if (error instanceof ObservationError) return finish('PRECONDITION_REFUSED', [`the database could not be read (${describeError(error)}); an unreadable state is never assumed to be empty`], planSteps, null)
+    throw error
+  }
+
   if (options.mode === 'plan') {
     return finish(anyConflict ? 'PRECONDITION_REFUSED' : 'OK', anyConflict ? ['the database holds data that conflicts with the files; see the conflicts per step (a plan writes nothing)'] : [], planSteps, null)
   }
 
   // ---- Run record: create, or resume the SAME load ----------------------------------------------------------------------------------
-  const existing = await ports.journal.load()
   if (existing === null && options.resume) return finish('PRECONDITION_REFUSED', ['--resume was given but no run record exists for this database'], planSteps, null)
   if (existing !== null) {
     if (!options.resume) return finish('PRECONDITION_REFUSED', ['a run record already exists in this database; this command refuses to start a second load over it (use --resume for the same load)'], planSteps, existing)
     if (existing.manifestDigest !== prepared.manifestDigest) return finish('PRECONDITION_REFUSED', [`the run record is for a different load (recorded digest ${existing.manifestDigest}, this load ${prepared.manifestDigest})`], planSteps, existing)
-    if (!RESUMABLE_STATUSES.has(existing.status)) return finish('PRECONDITION_REFUSED', [`the run record is ${existing.status}, which is not resumable`], planSteps, existing)
+    // An APPLIED run is resumable for VERIFICATION ONLY: no step is run and no importer is called.
+    if (!RESUMABLE_STATUSES.has(existing.status) && existing.status !== 'APPLIED') return finish('PRECONDITION_REFUSED', [`the run record is ${existing.status}, which is not resumable`], planSteps, existing)
   }
   // From here on a conflict means a fresh run found foreign data (nothing written yet), or a resume found it (earlier writes stand).
   if (anyConflict) return finish(existing === null ? 'PRECONDITION_REFUSED' : 'CONFLICT', ['the database holds data that conflicts with the files; see the conflicts per step'], planSteps, existing)
+
+  if (existing !== null && existing.status === 'APPLIED') return verifyApplied(prepared, ports, existing, planSteps, finish)
 
   let record: RunRecord
   try {
@@ -281,9 +319,9 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   for (const step of prepared.steps) {
     let outcome: StepOutcome
     try {
-      outcome = await ports.withStepLock(step.step, () => runStep(step, ports, persist))
+      outcome = await ports.withStepLock(step.step, (lock) => runStep(step, ports, persist, lock))
     } catch (error) {
-      if (error instanceof StaleJournalError) return finish('STEP_FAILED', [error.message], results, record)
+      if (error instanceof StaleJournalError || error instanceof StepLockError) return finish('STEP_FAILED', [`${step.step}: ${error.message}`], results, record)
       if (error instanceof ObservationError) {
         const failed = { ...emptyResult(step.step, 'FAILED'), error: describeError(error) }
         results.push(failed)
@@ -312,8 +350,42 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
     await persist({ status: 'VERIFY_FAILED' }).catch(() => undefined)
     return finish('VERIFY_FAILED', verification.filter((v) => v.result === 'fail').map((v) => `${v.id}: expected ${v.expected}, found ${v.actual}`), results, record, verification)
   }
-  await persist({ status: ports.verify ? 'VERIFIED' : 'APPLIED' })
+  if (!ports.verify) {
+    // Nothing verified the load, so it is NOT reported as a success: the record stays APPLIED and a later --resume verifies it.
+    await persist({ status: 'APPLIED' })
+    return finish('APPLIED_UNVERIFIED', ['no post-run verification was run: this runner has no verification port'], results, record, verification)
+  }
+  await persist({ status: 'VERIFIED' })
   return finish('OK', [], results, record, verification)
+}
+
+/**
+ * Resume of an APPLIED run: verification only. Nothing is loaded and no importer is called. Without a verification port nothing is written at all
+ * and the result is the same APPLIED_UNVERIFIED; with one, the verdict is recorded (VERIFIED or VERIFY_FAILED) by compare-and-swap.
+ */
+async function verifyApplied(
+  prepared: PreparedRun,
+  ports: ApplyPorts,
+  existing: RunRecord,
+  planSteps: StepResult[],
+  finish: (exit: ApplyExitName, problems: string[], steps: StepResult[], record: RunRecord | null, verification?: VerificationItem[]) => ApplyResult,
+): Promise<ApplyResult> {
+  if (!ports.verify) return finish('APPLIED_UNVERIFIED', ['no post-run verification was run: this runner has no verification port'], planSteps, existing)
+  let verification: VerificationItem[]
+  try {
+    verification = await ports.verify(prepared, planSteps)
+    const failed = verification.some((v) => v.result === 'fail')
+    const next: RunRecord = { ...existing, version: existing.version + 1, status: failed ? 'VERIFY_FAILED' : 'VERIFIED' }
+    await ports.journal.save(next, existing.version)
+    existing = next
+  } catch (error) {
+    if (error instanceof StaleJournalError) return finish('STEP_FAILED', [error.message], planSteps, existing)
+    throw error
+  }
+  if (verification.some((v) => v.result === 'fail')) {
+    return finish('VERIFY_FAILED', verification.filter((v) => v.result === 'fail').map((v) => `${v.id}: expected ${v.expected}, found ${v.actual}`), planSteps, existing, verification)
+  }
+  return finish('OK', [], planSteps, existing, verification)
 }
 
 interface StepOutcome {
@@ -326,6 +398,7 @@ async function runStep(
   step: PreparedStep,
   ports: ApplyPorts,
   persist: (patch: Partial<RunRecord>, step?: { id: ApplyStepId; journal: StepJournal }) => Promise<void>,
+  lock: StepLock,
 ): Promise<StepOutcome> {
   const id = step.step
   const fail = (exit: ApplyExitName, problems: string[], result: StepResult): StepOutcome => ({ result, halt: { exit, problems } })
@@ -338,7 +411,10 @@ async function runStep(
   const before = classifyStep(id, step.units, await ports.observe(id))
   if (hasConflict(before)) {
     const conflicts = listConflicts(before)
-    return fail('CONFLICT', [`${id}: ${conflicts.length} conflict(s), first: ${conflicts[0].key} (${conflicts[0].code})`], { ...emptyResult(id, 'CONFLICT'), emitted: before.counts.emitted, conflicts })
+    // Problem text reaches logs: a closed code and a count per code, never a key. The keys are in the conflict report (rows and conflicts), which is the controlled place for them.
+    const byCode = new Map<string, number>()
+    for (const c of conflicts) byCode.set(c.code, (byCode.get(c.code) ?? 0) + 1)
+    return fail('CONFLICT', [`${id}: ${conflicts.length} conflict(s): ${[...byCode.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([code, n]) => `${code} x${n}`).join(', ')}`], { ...emptyResult(id, 'CONFLICT'), emitted: before.counts.emitted, conflicts })
   }
   const residual = buildResidual(id, step.data, before)
   const result: StepResult = {
@@ -357,7 +433,7 @@ async function runStep(
     await persist({ currentStep: id }, { id, journal: { status: 'RUNNING', emitted: result.emitted, created: 0, updated: 0, skippedExisting: 0, failed: 0, residualSha256: residual.map((r) => r.sha256) } })
     for (const file of residual) {
       try {
-        const answer = await ports.execute(id, file)
+        const answer = await ports.execute(id, file, lock)
         result.importer.push({ file: file.name, created: answer.created, updated: answer.updated, skipped: answer.skipped, errors: summariseImporterErrors(answer.errors) })
       } catch (error) {
         result.error = `the importer failed on ${file.name}: ${describeError(error)}`
@@ -388,8 +464,9 @@ async function runStep(
   // Cross-check against the importers' own counters: a disagreement is a finding that names what the database shows.
   const claimedCreated = result.importer.reduce((t, i) => t + i.created, 0)
   if (result.importer.length > 0 && claimedCreated !== loadedRows) {
-    const missing = result.rows.filter((r) => r.outcome === 'failed').map((r) => r.key).slice(0, 20)
-    result.counterFindings.push(`the importer(s) reported ${claimedCreated} row(s) created, the database shows ${loadedRows}${missing.length > 0 ? `; not loaded: ${missing.join(', ')}` : ''}`)
+    // A count only: which units are not loaded is in the step's rows (the controlled place for keys).
+    const notLoaded = result.rows.filter((r) => r.outcome === 'failed').length
+    result.counterFindings.push(`the importer(s) reported ${claimedCreated} row(s) created, the database shows ${loadedRows}${notLoaded > 0 ? `; ${notLoaded} unit(s) not loaded (see the step's rows)` : ''}`)
   }
   if (after.counts.foreign > 0) result.counterFindings.push(`${after.counts.foreign} database row(s) of this step were not emitted by this run`)
 

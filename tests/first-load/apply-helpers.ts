@@ -15,12 +15,15 @@ import { parseCsvStrict } from '../../lib/first-load/csv.ts'
 import { keyStep } from '../../lib/first-load/apply/keys.ts'
 import { ObservationError, classifyStep, type ObservedEntry, type StepObservation } from '../../lib/first-load/apply/residual.ts'
 import type { ApplyStepId } from '../../lib/first-load/apply/constants.ts'
-import { type ApplyPorts, type RunRecord, StaleJournalError } from '../../lib/first-load/apply/orchestrate.ts'
+import { type ApplyPorts, type RunRecord, type StepLock, StaleJournalError } from '../../lib/first-load/apply/orchestrate.ts'
 import { config, ds, lot, product } from './helpers.ts'
 
 /** Order references of the synthetic orders (named constants: an inline `orderKey: '...'` literal reads as a credential to the secret scanner). */
 const PO_ONE = 'ZQSENT-PO-5001'
 const PO_TWO = 'ZQSENT-PO-5002'
+
+/** The lock handle for tests that run an executor or the in-memory ports without a real lock. */
+export const NO_LOCK: StepLock = { assertLive: async () => undefined }
 
 export type FileMap = Map<string, Uint8Array>
 
@@ -219,7 +222,9 @@ export class FakeDatabase {
         if (this.unreadable) throw new ObservationError('connection refused')
         return this.observeNow(step)
       },
-      withStepLock: async (_step, body) => body(),
+      withStepLock: async (_step, body) => body(NO_LOCK),
+      // The verification slice is not built; the in-memory ports stand in for it with a verification that passes, so the arms below test the orchestration. Tests of the absent-port behaviour pass `verify: undefined`.
+      verify: async () => [],
       recheckRails: async () => this.rails,
       execute: async (step, file) => {
         const ps = prepared.steps.find((s) => s.step === step)!
