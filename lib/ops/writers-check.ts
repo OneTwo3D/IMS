@@ -1,6 +1,7 @@
 import { OUTBOUND_CONNECTORS, type OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
-import { explainProducerDisposition, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
-import { producerSeamVerdict, readProducerEnforcement, producerCutoffFloor } from '@/lib/security/producer-seam'
+import { explainProducerDisposition, parseProducerCutoff, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
+import { PRODUCER_CUTOFF_ENV } from '@/lib/security/producer-disposition-constants'
+import { producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
 import { WRITER_OWNERSHIP_MAP, type OwnershipRow } from '@/lib/security/writer-ownership-map'
 import {
   EVIDENCE_CONTESTS,
@@ -206,16 +207,25 @@ const KIND_DESTINATION: Record<WritersCheckEvidenceKey, OutboundConnector> = {
 
 export const WRITERS_CHECK_EVIDENCE_KEYS: readonly WritersCheckEvidenceKey[] = [...INCUMBENT_EVIDENCE_KINDS, XERO_FOREIGN_NUMBER_EVIDENCE]
 
+/** The configured live-from instant of a destination, read on its own (not through the enforcement-dependent decision). Null when absent or unreadable. */
+function configuredLiveFrom(env: Record<string, string | undefined>, connector: OutboundConnector): Date | null {
+  const name = PRODUCER_CUTOFF_ENV[connector]
+  const read = parseProducerCutoff(Object.prototype.hasOwnProperty.call(env, name) ? env[name] : undefined)
+  return read.ok ? read.at : null
+}
+
 /**
  * The instant from which each kind of evidence counts: the later of the destination's live-from instant and the start of the
  * window. Evidence from before the live-from instant belongs to the writer that owned the destination then and is not a clash;
- * evidence older than the window is not current. An unreadable instant gives the window start alone (the broader count).
+ * evidence older than the window is not current. The configured instant is read on its own: it does NOT depend on the producer hold
+ * being enforced (a legacy-path destination with a configured live-from instant still bounds its evidence). An unreadable configured
+ * instant gives the window start alone (the broader count, which fails closed; the evaluator reports the instant itself unreadable).
  */
 export function evidenceFloors(env: Record<string, string | undefined>, now: Date, windowDays: number): Record<WritersCheckEvidenceKey, Date> {
   const windowStart = new Date(now.getTime() - windowDays * 86_400_000)
   const floors = {} as Record<WritersCheckEvidenceKey, Date>
   for (const key of WRITERS_CHECK_EVIDENCE_KEYS) {
-    const cutoff = producerCutoffFloor(KIND_DESTINATION[key], { env, now })
+    const cutoff = configuredLiveFrom(env, KIND_DESTINATION[key])
     floors[key] = cutoff && cutoff.getTime() > windowStart.getTime() ? cutoff : windowStart
   }
   return floors
@@ -285,12 +295,12 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
       envUnreadable.add(connector)
       unreadable(connector, `${connector}: the grant or the live-from instant is set but cannot be read, so the phase cannot be established.`)
     }
-    const floor = producerCutoffFloor(connector, context)
+    const configured = configuredLiveFrom(inputs.env, connector)
     destinations.push({
       connector,
       enforced: enforcement.enforced && enforcement.destinations.has(connector),
       phase: decision?.phase ?? 'P1',
-      liveFrom: floor ? floor.toISOString() : null,
+      liveFrom: configured ? configured.toISOString() : null,
       grant: decision?.grant ?? 'unreadable',
     })
   }

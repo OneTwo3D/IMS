@@ -92,6 +92,13 @@ test('ARM (a2): evidence that predates the cut-off or is not current does not fa
   assert.equal(early.MINTSOFT_ORDER_ID.toISOString(), '2026-10-10T00:00:00.000Z', 'the window start (09-28) is earlier than the cut-off, so the cut-off bounds it')
   const noCutoff = evidenceFloors({}, NOW, 14)
   assert.equal(noCutoff.MINTSOFT_ORDER_ID.toISOString(), '2026-10-06T12:00:00.000Z', 'with no instant the window alone bounds it')
+  // The configured instant bounds the evidence whether or not the producer hold is enforced (legacy evidence before it is not a clash).
+  const unenforced = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', MINTSOFT_WRITES_LIVE_FROM: CUTOFF }
+  assert.equal(evidenceFloors(unenforced, NOW, 14).MINTSOFT_ORDER_ID.toISOString(), '2026-10-10T00:00:00.000Z', 'not enforced: the configured instant still floors it')
+  assert.equal(evidenceFloors({ MINTSOFT_WRITES_LIVE_FROM: CUTOFF }, NOW, 14).MINTSOFT_ORDER_ID.toISOString(), '2026-10-10T00:00:00.000Z', 'no grant either: the configured instant still floors it')
+  assert.equal(evidenceFloors({ ...unenforced, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }, NOW, 14).MINTSOFT_ORDER_ID.toISOString(), '2026-10-10T00:00:00.000Z', 'enforced for another destination only')
+  assert.equal(evidenceFloors({ XERO_WRITES_LIVE_FROM: '2026-10-12T00:00:00Z' }, NOW, 14).XERO_FOREIGN_NUMBER.toISOString(), '2026-10-12T00:00:00.000Z', 'the Xero kind reads the Xero instant')
+  assert.equal(evidenceFloors({ MINTSOFT_WRITES_LIVE_FROM: '2026-09-01T00:00:00Z' }, NOW, 14).MINTSOFT_ORDER_ID.toISOString(), '2026-10-06T12:00:00.000Z', 'an instant older than the window start is bounded by the window')
   const garbage = evidenceFloors({ MINTSOFT_WRITES_LIVE_FROM: 'tomorrow' }, NOW, 14)
   assert.equal(garbage.MINTSOFT_ORDER_ID.toISOString(), '2026-10-06T12:00:00.000Z', 'an unreadable instant counts the broader window')
 })

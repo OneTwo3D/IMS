@@ -79,6 +79,7 @@ export const WRITERS_CHECK_CANNOT_SEE: readonly string[] = [
   'an incumbent\'s activity that leaves no trace IMS reads: a write an incumbent makes without a mark on an imported order or a refusal IMS provoked is invisible, and a green result says nothing about it',
   'any order IMS has not imported (its metas are unseen until the order is imported), and any change to an order\'s metas after its last import',
   'what Qoblex, Aelia, an operator working by hand or a Mintsoft channel writes: they leave no evidence IMS reads, so for their operations only the ownership map and IMS\'s own switches are checked',
+  'an order whose evidence write did not finish: the import does not wait for it, so a write that timed out and could not log that it did, or that was still running when the process stopped, leaves no trace',
   'anything that changes after the report was taken: the check is a snapshot that detects a shared destination, it does not stop either writer, so only the periodic record narrows the gap',
   'Xero documents that IMS never tried to post under (no new Xero call is made: the check reads only IMS\'s own database and environment)',
 ]

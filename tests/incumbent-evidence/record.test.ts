@@ -2,7 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { classifyIncumbentMeta, readWcPaidTime } from '../../lib/domain/incumbent-evidence/classify'
-import { recordWcIncumbentEvidence } from '../../lib/domain/incumbent-evidence/record'
+import {
+  EVIDENCE_MAX_IN_FLIGHT,
+  incumbentEvidenceStats,
+  recordWcIncumbentEvidence,
+  resetIncumbentEvidenceStats,
+  settleWcIncumbentEvidence,
+  startWcIncumbentEvidence,
+} from '../../lib/domain/incumbent-evidence/record'
 
 /**
  * WHAT THE STOREFRONT IMPORT KEEPS ABOUT OTHER WRITERS. Pure classification, plus the best-effort recorder over injected writers.
@@ -83,4 +90,63 @@ test('recorder FAIL CLOSED: an unreadable paid time, an unreadable meta list or 
   // Even the log failing does not throw into the import.
   const both = harness({ failWrite: true, failUnrecorded: true })
   assert.deepEqual(await recordWcIncumbentEvidence({ id: 4, meta_data: [{ key: '_mintsoft_order_id', value: '9' }], date_paid_gmt: '2026-10-05T10:00:00' }, both.deps), { recorded: 0, unrecorded: true })
+})
+
+const MARKED = (id: number) => ({ id, meta_data: [{ key: '_mintsoft_order_id', value: '9' }], date_paid_gmt: '2026-10-15T10:00:00' })
+
+test('OFF THE CRITICAL PATH: starting the evidence returns at once even when the write never finishes; the attempt then ends at its deadline, is counted, and is logged as unrecorded', async () => {
+  resetIncumbentEvidenceStats()
+  const unrecorded: Array<{ reason: string; kinds: string[] }> = []
+  const deps = {
+    write: () => new Promise<void>(() => {}), // a write blocked forever on the table
+    unrecorded: async (input: { reason: string; kinds: string[] }) => { unrecorded.push(input) },
+    deadlineMs: 40,
+  }
+  const before = Date.now()
+  const returned = startWcIncumbentEvidence(MARKED(1), deps as never)
+  assert.equal(returned, undefined, 'there is no promise for the caller to await')
+  assert.ok(Date.now() - before < 20, 'the start itself does not wait for the write')
+  assert.equal(unrecorded.length, 0, 'nothing is decided yet')
+  await settleWcIncumbentEvidence()
+  assert.deepEqual(unrecorded.map((u) => [u.reason, u.kinds]), [['EvidenceDeadline', ['MINTSOFT_ORDER_ID']]])
+  assert.equal(incumbentEvidenceStats.timedOut, 1)
+  assert.equal(incumbentEvidenceStats.recorded, 0)
+})
+
+test('the awaitable recorder is bounded too: a hanging write returns unrecorded at the deadline instead of hanging', async () => {
+  const unrecorded: unknown[] = []
+  const result = await recordWcIncumbentEvidence(MARKED(2), { write: () => new Promise<void>(() => {}), unrecorded: async (i) => { unrecorded.push(i) }, deadlineMs: 30 })
+  assert.deepEqual(result, { recorded: 0, unrecorded: true })
+  assert.equal(unrecorded.length, 1)
+  // A hanging unrecorded-log writer is bounded as well.
+  const both = await recordWcIncumbentEvidence(MARKED(3), { write: () => new Promise<void>(() => {}), unrecorded: () => new Promise<void>(() => {}), deadlineMs: 30 })
+  assert.deepEqual(both, { recorded: 0, unrecorded: true })
+})
+
+test('failures are counted: a failing write counts as failed, a good one as recorded; an unmarked order counts neither', async () => {
+  resetIncumbentEvidenceStats()
+  const h = harness({ failWrite: true })
+  startWcIncumbentEvidence(MARKED(4), h.deps as never)
+  startWcIncumbentEvidence({ id: 5, meta_data: [], date_paid_gmt: null }, h.deps as never)
+  const ok = harness()
+  startWcIncumbentEvidence(MARKED(6), ok.deps as never)
+  await settleWcIncumbentEvidence()
+  assert.equal(incumbentEvidenceStats.failed, 1)
+  assert.equal(incumbentEvidenceStats.recorded, 1, 'the unmarked order has nothing to write and counts as neither')
+  assert.equal(h.unrecorded.length, 1)
+})
+
+test('background attempts are capped: past the cap an attempt is not started and is logged as unrecorded, never queued without bound', async () => {
+  resetIncumbentEvidenceStats()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const unrecorded: Array<{ reason: string }> = []
+  const deps = { write: () => gate, unrecorded: async (i: { reason: string }) => { unrecorded.push(i) }, deadlineMs: 5_000 }
+  for (let i = 0; i < EVIDENCE_MAX_IN_FLIGHT + 3; i += 1) startWcIncumbentEvidence(MARKED(100 + i), deps as never)
+  assert.equal(incumbentEvidenceStats.dropped, 3)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(unrecorded.filter((u) => /in flight/.test(u.reason)).length, 3)
+  release()
+  await settleWcIncumbentEvidence()
+  assert.equal(incumbentEvidenceStats.recorded, EVIDENCE_MAX_IN_FLIGHT)
 })

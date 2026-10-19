@@ -6,7 +6,7 @@ import { config } from 'dotenv'
 
 import { evaluateWritersCheck, readWritersCheckInputs } from '../../lib/ops/writers-check'
 import { runWritersCheckRecord } from '../../lib/ops/writers-check-record'
-import { recordWcIncumbentEvidence } from '../../lib/domain/incumbent-evidence/record'
+import { recordWcIncumbentEvidence, settleWcIncumbentEvidence } from '../../lib/domain/incumbent-evidence/record'
 import { WRITERS_CHECK_RECORD_ACTION } from '../../lib/security/writers-check-constants'
 
 /**
@@ -127,7 +127,7 @@ test('Xero evidence comes from the refusals IMS already logged, not from a Xero 
   const report = await withRollback(async (tx) => {
     await seedConfiguration(tx, 'http://127.0.0.1:9')
     const meta = (refusalCode: string) => ({ connector: 'xero', refusalCode })
-    for (const [code, at] of [['NUMBER_HELD_BY_FOREIGN_DOCUMENT', '2026-10-15T00:00:00Z'], ['NUMBER_HELD_BY_MULTIPLE_DOCUMENTS', '2026-10-16T00:00:00Z'], ['NUMBER_HELD_BY_FOREIGN_DOCUMENT', '2026-10-01T00:00:00Z'], ['NUMBER_HELD_BY_ANOTHER_IMS_DOCUMENT', '2026-10-17T00:00:00Z']] as const) {
+    for (const [code, at] of [['NUMBER_HELD_BY_FOREIGN_DOCUMENT', '2026-10-15T00:00:00Z'], ['NUMBER_HELD_BY_MULTIPLE_DOCUMENTS', '2026-10-16T00:00:00Z'], ['NUMBER_HELD_BY_FOREIGN_DOCUMENT', '2026-10-01T00:00:00Z'], ['NUMBER_HELD_BY_ANOTHER_IMS_DOCUMENT', '2026-10-17T00:00:00Z'], ['NUMBER_HELD_BY_FOREIGN_DOCUMENT', '2026-10-08T00:00:00Z']] as const) {
       await tx.activityLog.create({ data: { entityType: 'SYSTEM', action: 'sales_invoice_number_not_ours', tag: 'accounting', level: 'WARNING', description: 'x', metadata: meta(code), createdAt: new Date(at) } })
     }
     return evaluateWritersCheck(await readWritersCheckInputs({
@@ -136,7 +136,7 @@ test('Xero evidence comes from the refusals IMS already logged, not from a Xero 
   })
   const reading = report.evidence!.XERO_FOREIGN_NUMBER!
   console.log(`# xero evidence counted=${reading.counted} total>=${reading.total}`)
-  assert.equal(reading.counted, 2, 'the foreign and multiple-holder refusals after the instant count; the pre-instant one and the IMS-owned one do not')
+  assert.equal(reading.counted, 2, 'the foreign and multiple-holder refusals after the instant count; the pre-instant ones (inside the window, with the hold not enforced) and the IMS-owned one do not')
 })
 
 test('entries the import could not record: only those that could matter count, and an unreadable one always does', { skip }, async () => {
@@ -172,6 +172,104 @@ test('the recorder keeps one row per order and kind under concurrent deliveries,
     assert.ok(after[0]!.lastSeenAt.getTime() >= after[0]!.firstSeenAt.getTime())
   } finally {
     await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: id } })
+  }
+})
+
+async function paidAtOf(id: string, kind = 'XEROOM_MARKER') {
+  const db = await getDb()
+  const rows = await db.incumbentWriterEvidence.findMany({ where: { externalOrderId: id, kind } })
+  assert.equal(rows.length, 1)
+  return rows[0]!.paidAt?.toISOString() ?? null
+}
+
+test('MONOTONIC: a stale, earlier or unpaid delivery after a qualifying paid one cannot rewind paid_at, and a later one advances it (every order of arrival)', { skip }, async () => {
+  const db = await getDb()
+  const id = `s7-${randomUUID()}`
+  const deliver = (paid: string | null, extra: Array<{ key: string; value: string }> = []) =>
+    recordWcIncumbentEvidence({ id, meta_data: [{ key: 'xeroom_invoice_id', value: 'a' }, ...extra], date_paid_gmt: paid })
+  try {
+    await deliver('2026-10-15T10:00:00')
+    await deliver(null)
+    assert.equal(await paidAtOf(id), '2026-10-15T10:00:00.000Z', 'an unpaid redelivery does not null a recorded paid time')
+    await deliver('2026-10-01T00:00:00')
+    assert.equal(await paidAtOf(id), '2026-10-15T10:00:00.000Z', 'a pre-cutoff/earlier delivery does not rewind it')
+    await deliver('2026-10-16T00:00:00')
+    assert.equal(await paidAtOf(id), '2026-10-16T00:00:00.000Z', 'a later paid time advances it')
+    // Unpaid first, paid after: the null is filled in.
+    const second = `s7-${randomUUID()}`
+    await recordWcIncumbentEvidence({ id: second, meta_data: [{ key: 'xeroom_invoice_id', value: 'a' }], date_paid_gmt: null })
+    await recordWcIncumbentEvidence({ id: second, meta_data: [{ key: 'xeroom_invoice_id', value: 'a' }], date_paid_gmt: '2026-10-12T00:00:00' })
+    assert.equal(await paidAtOf(second), '2026-10-12T00:00:00.000Z')
+    await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: second } })
+    // A delivery carrying one mark does not remove another: kinds are only added.
+    await deliver('2026-10-01T00:00:00', [{ key: '_mintsoft_order_id', value: '5' }])
+    assert.equal((await db.incumbentWriterEvidence.findMany({ where: { externalOrderId: id } })).length, 2)
+    assert.equal(await paidAtOf(id), '2026-10-16T00:00:00.000Z')
+  } finally {
+    await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: id } })
+  }
+})
+
+test('MONOTONIC under concurrency: out-of-order deliveries of one order, all at once, always end on the greatest paid time', { skip }, async () => {
+  const db = await getDb()
+  const id = `s7-${randomUUID()}`
+  const times: Array<string | null> = ['2026-10-14T00:00:00', null, '2026-10-02T00:00:00', '2026-10-18T09:00:00', null, '2026-10-17T00:00:00', '2026-09-01T00:00:00', '2026-10-18T09:00:00']
+  try {
+    for (let round = 0; round < 5; round += 1) {
+      const shuffled = [...times].sort(() => Math.random() - 0.5)
+      const results = await Promise.all(shuffled.map((paid) => recordWcIncumbentEvidence({ id, meta_data: [{ key: 'xeroom_invoice_id', value: 'a' }], date_paid_gmt: paid })))
+      assert.ok(results.every((result) => !('unrecorded' in result)), JSON.stringify(results))
+      assert.equal(await paidAtOf(id), '2026-10-18T09:00:00.000Z', `round ${round}`)
+    }
+  } finally {
+    await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: id } })
+  }
+})
+
+test('A WRITE BLOCKED ON THE EVIDENCE TABLE DOES NOT DELAY THE IMPORT: importWcOrder returns the same result within a bound, and the gap is logged for writers:check', { skip }, async () => {
+  const db = await getDb()
+  const { importWcOrder } = await import('../../lib/connectors/woocommerce/sync/order-import')
+  const { incumbentEvidenceStats, resetIncumbentEvidenceStats } = await import('../../lib/domain/incumbent-evidence/record')
+  const id = 900_000_000 + Math.floor(Math.random() * 90_000_000)
+  const order = {
+    id, status: 'wp2s7-no-such-status', currency: 'GBP', date_paid_gmt: '2026-10-15T10:00:00', date_created_gmt: '2026-10-15T09:00:00', date_modified_gmt: '2026-10-15T10:00:00',
+    meta_data: [{ key: '_mintsoft_order_id', value: '9' }], line_items: [], fee_lines: [], tax_lines: [], shipping_lines: [], billing: {}, shipping: {},
+  } as never
+  const unrecordedCount = () => db.activityLog.count({ where: { action: 'incumbent_evidence_unrecorded' } })
+  try {
+    const free = await importWcOrder(order)
+    await settleWcIncumbentEvidence()
+    assert.ok(!('error' in free && free.error), JSON.stringify(free))
+    await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: String(id) } })
+
+    resetIncumbentEvidenceStats()
+    const loggedBefore = await unrecordedCount()
+    let locked: unknown
+    let elapsed = -1
+    let settledWhileHeld = false
+    await db.$transaction(async (tx: Tx) => {
+      await tx.$executeRawUnsafe('LOCK TABLE incumbent_writer_evidence IN ACCESS EXCLUSIVE MODE')
+      const started = Date.now()
+      const winner = await Promise.race([
+        importWcOrder(order).then((result) => ({ result })),
+        new Promise<{ timedOut: true }>((resolve) => setTimeout(() => resolve({ timedOut: true }), 1_500)),
+      ])
+      elapsed = Date.now() - started
+      assert.ok(!('timedOut' in winner), 'the import was held by the blocked evidence write')
+      locked = (winner as { result: unknown }).result
+      // Keep holding the lock until the background attempt has hit its own timeout and logged.
+      await settleWcIncumbentEvidence()
+      settledWhileHeld = true
+    }, { timeout: 30_000, maxWait: 10_000 })
+    console.log(`# blocked-evidence import elapsed=${elapsed}ms stats=${JSON.stringify(incumbentEvidenceStats)}`)
+    assert.ok(settledWhileHeld)
+    assert.deepEqual(locked, free, 'identical result with the table blocked')
+    assert.ok(incumbentEvidenceStats.failed + incumbentEvidenceStats.timedOut >= 1, 'the failed write is counted')
+    assert.equal(await unrecordedCount(), loggedBefore + 1, 'and logged, so writers:check reports the gap')
+    assert.equal((await db.incumbentWriterEvidence.findMany({ where: { externalOrderId: String(id) } })).length, 0)
+  } finally {
+    await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: String(id) } })
+    await db.activityLog.deleteMany({ where: { action: 'incumbent_evidence_unrecorded', description: { contains: 'could not be kept' }, createdAt: { gte: new Date(Date.now() - 120_000) } } })
   }
 })
 

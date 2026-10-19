@@ -52,14 +52,21 @@ test('exit code follows the report; --json prints the report; an exception is `f
 
 test('the storefront import keeps incumbent evidence before it decides anything (declared site count printed)', () => {
   const source = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
-  const calls = source.match(/recordWcIncumbentEvidence\(/g) ?? []
-  console.log(`# order-import recordWcIncumbentEvidence calls=${calls.length}`)
+  const calls = source.match(/(?<![\w.])startWcIncumbentEvidence\(/g) ?? []
+  console.log(`# order-import startWcIncumbentEvidence calls=${calls.length}`)
   assert.equal(calls.length, 1)
   const start = source.indexOf('export async function importWcOrder(')
   const tryAt = source.indexOf('try {', start)
-  const callAt = source.indexOf('await recordWcIncumbentEvidence(wcOrder)', start)
+  const callAt = source.indexOf('startWcIncumbentEvidence(wcOrder)', start)
   const lookupAt = source.indexOf('db.salesOrder.findFirst', start)
   assert.ok(start > 0 && tryAt > start && callAt > tryAt && callAt < lookupAt, 'the call sits before the first decision of importWcOrder')
   const between = source.slice(tryAt + 5, callAt).replace(/\/\/.*$/gm, '').trim()
   assert.equal(between, '', 'nothing but comments precedes the call inside the try')
+  // OFF THE CRITICAL PATH: the call is a bare statement (not awaited, returned, assigned or chained), and the awaitable recorder is not
+  // referenced from the import at all, so no promise of the evidence write can be on the import's path.
+  const lineStart = source.lastIndexOf('\n', callAt) + 1
+  assert.equal(source.slice(lineStart, callAt).trim(), '', 'the call starts its own statement: no await, return or assignment before it')
+  assert.equal(source.slice(callAt).split('\n')[0]!.trim(), 'startWcIncumbentEvidence(wcOrder)', 'nothing chained or awaited after the call')
+  assert.ok(!/\brecordWcIncumbentEvidence\b/.test(source), 'the awaitable recorder is not used by the import')
+  assert.ok(!/\bawait\s+(?:startWc|settleWc)IncumbentEvidence/.test(source), 'the import never awaits the evidence')
 })
