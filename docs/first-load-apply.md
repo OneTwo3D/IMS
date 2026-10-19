@@ -221,6 +221,27 @@ A count, a sum or an aggregate never stands in for the identity of a record. Eve
 
 The migration check is one function (`compareMigrations`) used by the precondition **before any write** (a mismatch is PRECONDITION_REFUSED with closed codes and counts) and by `migrations-applied`. A rehearsal record binds the **hash of the ordered migration-name list** (`schemaHash`), not the newest name or a count, and `--apply` refuses a record whose hash is not this checkout's.
 
+### Fields read from an unverified file
+
+Whatever the runner prints (problems, standard error, the published reports) must carry no value from a file it has not yet verified. This is every such source and how each field is handled; `tests/first-load/apply-untrusted.test.ts` puts a marker in each and asserts it is never printed.
+
+| Source | Fields that reach text | Handling |
+| --- | --- | --- |
+| Prepared report | the codes of ERROR findings | only their NUMBER is printed |
+| Prepared report | output file names; stray file names in the directory | printed only if they match the tool's own pattern (`NN-target-00k-of-00n.csv`, the report's own names); otherwise "withheld" |
+| Prepared report | the planned row count; the stock quantity and value totals | a whole number or "not a whole number"; a total mismatch is `TOTAL_QUANTITY_MISMATCH` or `TOTAL_VALUE_MISMATCH` with no figure; a total that is not a decimal is a mismatch, never an exception |
+| Prepared report | verdict, tool, base currency, output target, checksums | never interpolated; fixed sentences |
+| Prepared files | cells | never interpolated; problems name a step, a chunk and a line, or a column |
+| WooCommerce snapshot | everything the verifier reports (ids, SKUs) | only the NUMBER of problems; the detail is read with `first-load:woo-snapshot --verify` |
+| Apply manifest | keys, steps, currency codes, rates, warehouse codes, SKUs, attestation | entries are named by position ("entry 3"); the JSON parser's message (which quotes the file) and the decimal parser's reason (which quotes the text) are dropped |
+| Rehearsal record | every field | fixed sentences only; the record's report file name must match a plain `*.json` name before it is opened |
+| Child report | every field | validated into numbers and booleans; anything else makes it invalid, and nothing from it is printed |
+| Baseline and restore point in the run record | table names; held-write ids; the restore point path | a baseline with a table name that is not a plain schema name is no baseline; ids are compared and counted, never printed; the recorded restore point path is accepted only if it equals the path this load composes (it is not opened, hashed or printed otherwise) |
+| Run record | the digest and the status | the status is one of the closed list or the record is unreadable; a digest mismatch says "not this load's" without the value |
+| Importers | their messages | reduced to a closed code and a row number |
+
+**A command whose evidence cannot be written does not succeed.** If a rehearsal's record cannot be published, the command exits INTERNAL and prints `RECORD_NOT_PUBLISHED` (a closed code, no path or error text), whatever the load on the copy did; likewise a report that cannot be published turns an OK into INTERNAL. Every other `catch` of the command either refuses (a refusal exit) or records a problem that makes the verdict non-OK.
+
 ### Audit of the failure classes the review keeps finding
 
 | Class | Where it could occur here | What closes it | Test (mutation that turns it red) |

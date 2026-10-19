@@ -21,13 +21,13 @@ export function readPreparedDir(dir: string): Map<string, Uint8Array> {
   try {
     names = readdirSync(dir)
   } catch (error) {
-    throw new PreparedDirError(`cannot read the prepared directory: ${error instanceof Error ? error.message : String(error)}`)
+    throw new PreparedDirError('cannot read the prepared directory')
   }
   const files = new Map<string, Uint8Array>()
   for (const name of names.sort()) {
     const full = path.join(dir, name)
     const info = lstatSync(full)
-    if (!info.isFile()) throw new PreparedDirError(`the prepared directory holds ${info.isSymbolicLink() ? 'a symbolic link' : 'something that is not a regular file'}: ${name}`)
+    if (!info.isFile()) throw new PreparedDirError(`the prepared directory holds ${info.isSymbolicLink() ? 'a symbolic link' : 'something that is not a regular file'}: ${/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(name) ? name : '(name withheld)'}`)
     files.set(name, readFileSync(full))
   }
   return files

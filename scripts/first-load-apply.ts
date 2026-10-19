@@ -28,7 +28,7 @@ import pg from 'pg'
 import {
   APPLY_EXIT_CODES, REHEARSAL_MAX_AGE_HOURS, REHEARSAL_RECORD_STEM_PREFIX, RUNNER_APPLICATION_NAME, exitOperatorText, type ApplyExitName,
 } from '../lib/first-load/apply/constants'
-import { REHEARSAL_DATABASE, buildRunnerEnv, checkRecordBinding, checkRecordReportFile, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
+import { REHEARSAL_DATABASE, buildRunnerEnv, checkRecordBinding, rehearsalCommandExit, restorePointPath, checkRecordReportFile, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
 import { readPreparedDir, PreparedDirError } from '../lib/first-load/apply/io'
 import { ApplyManifestError, parseApplyManifest, type ApplyManifest } from '../lib/first-load/apply/manifest'
 import { checkRehearsalGate, type ApplyResult } from '../lib/first-load/apply/orchestrate'
@@ -79,7 +79,7 @@ function replaceProcessEnv(env: Record<string, string>): void {
 
 /** A restore point: a custom-format dump written to a file that did not exist, mode 600, read back with pg_restore --list. The runner never restores by itself. */
 function takeRestorePoint(dir: string, runId: string, libpq: Record<string, string>): { ok: true; value: ReportRestorePoint } | { ok: false; problem: string } {
-  const file = path.join(dir, `first-load-${runId}.dump`)
+  const file = restorePointPath(dir, runId)
   let fd: number
   try {
     fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600)
@@ -190,7 +190,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
   const target: ReportTarget = { database: identity.database, systemId: identity.systemId, migrations: identity.migrations }
 
   // ---- 4. Modes. ----
-  if (args.mode === 'rehearse') return rehearseMode(args, io, { prepared, targetEnv: envFile.env, identity, reportDir: reportDir.value, stem, now, stopWith })
+  if (args.mode === 'rehearse') return rehearseMode(args, io, { prepared, targetEnv: envFile.env, identity, reportDir: reportDir.value, stem, now })
 
   // The database side is imported only now: the client reads DATABASE_URL when first imported.
   const { db } = await import('../lib/db')
@@ -248,6 +248,8 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
         }
         const r = recorded as { path?: unknown; sha256?: unknown; bytes?: unknown } | undefined
         if (!r || typeof r.path !== 'string' || typeof r.sha256 !== 'string' || typeof r.bytes !== 'number') return stopWith('PRECONDITION_REFUSED', ['the run record names no restore point; this load was begun without one and cannot be resumed'])
+        // The path comes from the database: it is accepted only if it is exactly the file this load would have taken (nothing else is ever hashed or printed).
+        if (r.path !== restorePointPath(prepared.manifest.restorePointDir, prepared.manifest.runId)) return stopWith('PRECONDITION_REFUSED', ['the run record names a restore point that is not the one this load takes'])
         const hashed = sha256OfFile(r.path)
         if (!hashed.ok || hashed.sha256 !== r.sha256 || hashed.bytes !== r.bytes) return stopWith('PRECONDITION_REFUSED', ['the recorded restore point is missing or has changed; do not resume without a way back'])
         restorePoint = { path: r.path, sha256: r.sha256, bytes: r.bytes, listed: true }
@@ -304,12 +306,18 @@ function publishAndPrint(io: CliIo, dir: ReportDir, stem: string, report: Return
   return exitCodeOf(finalExit)
 }
 
-async function rehearseMode(
+export interface RehearseModeDeps {
+  rehearse: typeof rehearse
+  publishRecord: typeof publishRecord
+}
+
+export async function rehearseMode(
   args: CliArgs,
   io: CliIo,
-  ctx: { prepared: PreparedRun; targetEnv: Record<string, string>; identity: Identity; reportDir: ReportDir; stem: string; now: Date; stopWith: (name: ApplyExitName, problems: string[]) => number },
+  ctx: { prepared: PreparedRun; targetEnv: Record<string, string>; identity: Pick<Identity, 'systemId'>; reportDir: ReportDir; stem: string; now: Date },
+  deps: RehearseModeDeps = { rehearse, publishRecord },
 ): Promise<number> {
-  const outcome = await rehearse({
+  const outcome = await deps.rehearse({
     targetEnv: ctx.targetEnv,
     targetSystemId: ctx.identity.systemId,
     manifestPath: args.manifest,
@@ -324,20 +332,23 @@ async function rehearseMode(
     log: (line) => io.err(`${line}\n`),
   })
   let recordFile: string | null = null
+  const problems = [...outcome.problems]
   try {
-    recordFile = publishRecord(ctx.reportDir, `${REHEARSAL_RECORD_STEM_PREFIX}${ctx.prepared.manifest.runId}-${ctx.stem.split('-').pop()}.json`, `${JSON.stringify(outcome.record, null, 2)}\n`)
+    recordFile = deps.publishRecord(ctx.reportDir, `${REHEARSAL_RECORD_STEM_PREFIX}${ctx.prepared.manifest.runId}-${ctx.stem.split('-').pop()}.json`, `${JSON.stringify(outcome.record, null, 2)}\n`)
   } catch {
-    outcome.problems.push('the rehearsal record could not be written')
+    problems.push('RECORD_NOT_PUBLISHED: the rehearsal record could not be written, so no apply can rely on this rehearsal')
   }
-  const lines = [`first-load-apply (rehearsal): ${outcome.exit} (exit ${exitCodeOf(outcome.exit)})`, `  the load on the copy ended: ${outcome.loadExit ?? 'it did not run'}`, `  the target was only read, and its table counts were ${outcome.targetUnchanged ? 'unchanged' : 'CHANGED'}`]
-  for (const problem of outcome.problems) lines.push(`  problem: ${problem}`)
+  // A rehearsal whose record was not published is not a success.
+  const exit = rehearsalCommandExit(outcome.exit, recordFile !== null)
+  const lines = [`first-load-apply (rehearsal): ${exit} (exit ${exitCodeOf(exit)})`, `  the load on the copy ended: ${outcome.loadExit ?? 'it did not run'}`, `  the target was only read, and its table counts were ${outcome.targetUnchanged ? 'unchanged' : 'CHANGED'}`]
+  for (const problem of problems) lines.push(`  problem: ${problem}`)
   lines.push(`  rehearsal verdict: ${outcome.record.verdict}`)
-  const text = exitOperatorText(outcome.exit)
+  const text = exitOperatorText(exit)
   if (text !== '') lines.push(text)
   if (outcome.report) lines.push(`Report: ${outcome.report.json}`)
   if (recordFile) lines.push(`Rehearsal record: ${recordFile}`)
-  ;(outcome.exit === 'OK' ? io.out : io.err)(`${lines.join('\n')}\n`)
-  return exitCodeOf(outcome.exit)
+  ;(exit === 'OK' ? io.out : io.err)(`${lines.join('\n')}\n`)
+  return exitCodeOf(exit)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

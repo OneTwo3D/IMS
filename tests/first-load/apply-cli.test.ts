@@ -365,3 +365,27 @@ test('the command refuses a record made against another schema, or by something 
   for (const record of arms) assert.equal(checkRecordSchema(record, '1111111111111111111111111111111111111111111111111111111111111111').length, 1, JSON.stringify(record))
   precondition(t, 'schema arms', arms.length)
 })
+
+test('rehearse mode: a record that cannot be published turns an OK rehearsal into the closed non-OK exit, printed as the result (and a published one stays OK)', async () => {
+  const { rehearseMode } = await import('../../scripts/first-load-apply.ts')
+  const preparedRun = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
+  const okOutcome = { exit: 'OK' as const, loadExit: 'OK' as const, record: { verdict: 'OK' } as never, targetUnchanged: true, teardownComplete: true, problems: [], report: { json: '/x/r.json', sha256: 'a'.repeat(64) } }
+  const args = { mode: 'rehearse', manifest: 'm.json', envFile: 'e', expectDb: 'd', expectSystemId: '1', reportDir: 'r', rehearsalRecord: null, resume: false, operator: 'op', root: '/var/tmp', rehearsalChild: null } as const
+  const ctx = { prepared: preparedRun, targetEnv: { DATABASE_URL: 'postgresql://x/y' }, identity: { systemId: '1' }, reportDir: { dir: '/x', dev: 0, ino: 0 }, stem: 'first-load-apply-rehearse-run-20261020T100000Z', now: new Date() }
+  const run = async (publish: () => string) => {
+    const out: string[] = []
+    const err: string[] = []
+    const code = await rehearseMode({ ...args }, { out: (t) => out.push(t), err: (t) => err.push(t) }, ctx, { rehearse: async () => okOutcome, publishRecord: publish as never })
+    return { code, text: [...out, ...err].join('') }
+  }
+  // Mutation: use outcome.exit unchanged (the old shape) and the failing-publication arm exits 0.
+  const failed = await run(() => { throw new Error('EEXIST /secret/path') })
+  assert.notEqual(failed.code, 0)
+  assert.equal(failed.code, 6, 'INTERNAL')
+  assert.match(failed.text, /INTERNAL \(exit 6\)/)
+  assert.match(failed.text, /RECORD_NOT_PUBLISHED/)
+  assert.doesNotMatch(failed.text, /secret/, 'the error text is not printed')
+  const fine = await run(() => '/x/record.json')
+  assert.equal(fine.code, 0)
+  assert.match(fine.text, /Rehearsal record: \/x\/record\.json/)
+})

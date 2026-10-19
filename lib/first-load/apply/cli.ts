@@ -381,3 +381,16 @@ export function checkRecordSchema(record: unknown, schemaHash: string): string[]
   if (hash !== schemaHash) return ['the rehearsal was made against another schema (its ordered migration list differs from this checkout\'s); rehearse again from this checkout']
   return []
 }
+
+/** THE restore point file of a load: the one place its path is composed. A resume accepts the recorded path only if it is exactly this. */
+export function restorePointPath(restorePointDir: string, runId: string): string {
+  return `${restorePointDir.replace(/\/+$/, '')}/first-load-${runId}.dump`
+}
+
+/**
+ * The exit of a rehearsal command once its record has (or has not) been published. The record is the evidence an apply needs: a rehearsal whose record could not be written is not a
+ * success, whatever the load on the copy did. `INTERNAL` is the closed code (a defect or an unwritable report directory), printed as the result.
+ */
+export function rehearsalCommandExit(loadExit: ApplyExitName, recordPublished: boolean): ApplyExitName {
+  return loadExit === 'OK' && !recordPublished ? 'INTERNAL' : loadExit
+}

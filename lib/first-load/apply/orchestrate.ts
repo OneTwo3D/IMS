@@ -283,7 +283,7 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   if (existing === null && options.resume) return finish('PRECONDITION_REFUSED', ['--resume was given but no run record exists for this database'], planSteps, null)
   if (existing !== null) {
     if (!options.resume) return finish('PRECONDITION_REFUSED', ['a run record already exists in this database; this command refuses to start a second load over it (use --resume for the same load)'], planSteps, existing)
-    if (existing.manifestDigest !== prepared.manifestDigest) return finish('PRECONDITION_REFUSED', [`the run record is for a different load (recorded digest ${existing.manifestDigest}, this load ${prepared.manifestDigest})`], planSteps, existing)
+    if (existing.manifestDigest !== prepared.manifestDigest) return finish('PRECONDITION_REFUSED', ['the run record is for a different load (its digest is not this load\'s)'], planSteps, existing)
     // An APPLIED run is resumable for VERIFICATION ONLY: no step is run and no importer is called.
     if (!RESUMABLE_STATUSES.has(existing.status) && existing.status !== 'APPLIED') return finish('PRECONDITION_REFUSED', [`the run record is ${existing.status}, which is not resumable`], planSteps, existing)
   }

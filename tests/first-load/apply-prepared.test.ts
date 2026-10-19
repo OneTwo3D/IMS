@@ -55,7 +55,7 @@ test('the digest changes with the manifest and with the prepared files, and igno
 test('manifest: control parses; every malformed manifest is refused with its reason (and all reasons at once)', (t) => {
   assert.doesNotThrow(() => parseApplyManifest(manifestText()))
   const arms: Array<[string, Record<string, unknown>, RegExp]> = [
-    ['unknown key', { surprise: 1 }, /unknown apply manifest key "surprise"/],
+    ['unknown key', { surprise: 1 }, /unknown apply manifest key \(position \d+\)/],
     ['format version', { formatVersion: 2 }, /formatVersion must be 1/],
     ['bad run id', { runId: 'has space' }, /runId/],
     ['base currency not GBP', { baseCurrency: 'USD' }, /must be GBP/],
@@ -68,7 +68,7 @@ test('manifest: control parses; every malformed manifest is refused with its rea
     ['warehouses with nothing to check', { steps: ['suppliers', 'products'], acceptZeroCost: undefined, fxRates: undefined }, /no step uses a warehouse/],
     ['profile incomplete', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true } } }, /availableForSale and syncToStore must both/],
     ['profile type', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'SHELF', availableForSale: true, syncToStore: false } } }, /type must be one of/],
-    ['profile key', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true, syncToStore: false, extra: 1 } } }, /unknown key "extra"/],
+    ['profile key', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true, syncToStore: false, extra: 1 } } }, /unknown key \(position \d+\)/],
     ['warehouse twice in upper case', { expectWarehouses: { 'ZQSENT-MAIN': WAREHOUSES_ONE['ZQSENT-MAIN'], 'zqsent-main': WAREHOUSES_ONE['ZQSENT-MAIN'] } }, /twice/],
     ['zero-cost entry shape', { acceptZeroCost: ['NOWAREHOUSE'] }, /not "SKU@WAREHOUSE"/],
     ['zero-cost twice', { acceptZeroCost: ['A@ZQSENT-MAIN', 'a@zqsent-main'] }, /twice/],
@@ -103,7 +103,7 @@ test('report: a blocked, unbalanced, self-check-failing or ERROR-bearing report 
     ['self-check failures', (r) => { r.selfCheckFailures = ['x'] }, /self-check failures/],
     ['accounting does not balance', (r) => { r.accountingBalanced = false }, /does not balance/],
     ['unaccounted records', (r) => { r.accounting[0].unaccounted = 1 }, /unaccounted/],
-    ['ERROR finding', (r) => { r.findings.push({ severity: 'ERROR', code: 'SOMETHING_BAD', message: 'm' }) }, /ERROR finding.*SOMETHING_BAD/],
+    ['ERROR finding', (r) => { r.findings.push({ severity: 'ERROR', code: 'SOMETHING_BAD', message: 'm' }) }, /1 ERROR finding\(s\)/],
     ['other tool', (r) => { r.tool = 'something-else' }, /not a first-load-prepare report/],
     ['prepared for USD', (r) => { r.config.baseCurrency = 'USD' }, /different base currency/],
   ]
@@ -118,7 +118,7 @@ test('report: a blocked, unbalanced, self-check-failing or ERROR-bearing report 
 test('files: a changed byte, a stray file, a missing file, a wrong header, a wrong size and a wrong row count are each refused on their own', (t) => {
   const arms: Array<[string, FileMap, RegExp]> = [
     ['one byte changed', withFile(honest, SUPPLIERS, (s) => s.replace('Cotton', 'Cottom')), /SHA-256 differs/],
-    ['stray file', new Map([...honest, ['extra.csv', new TextEncoder().encode('x')]]), /does not name: extra\.csv/],
+    ['stray file', new Map([...honest, ['extra.csv', new TextEncoder().encode('x')]]), /does not name: \(a file name that is not one this tool writes; withheld\)/],
     ['missing file', new Map([...honest].filter(([n]) => n !== STOCK)), /missing from the prepared directory/],
     ['header renamed (hash kept consistent)', withConsistentFile(honest, STOCK, (s) => s.replace('unitCostBase', 'unitCost')), /template header/],
     ['row count wrong in the report', withReport(honest, (r) => { r.outputs.find((o) => o.name === SUPPLIERS)!.rows = 3 }), /data row\(s\), the report says 3/],

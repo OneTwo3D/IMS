@@ -314,6 +314,16 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       assert.equal(r.exitCode, 3, r.stderr)
       assert.match(r.stderr, /restore point is missing or has changed/)
       writeFileSync(file, bytes)
+      // A path from the database is accepted only at the one place this load composes: a copy with the same bytes elsewhere is refused. Mutation: drop the path check and this resumes.
+      const copyPath = join(restoreDir, 'copy-of-the-dump.dump')
+      writeFileSync(copyPath, bytes, { mode: 0o600 })
+      const recorded = (await runs('select facts from first_load_apply_runs'))[0] as { facts: { restorePoint: Record<string, unknown> } }
+      await runs(`update first_load_apply_runs set facts = jsonb_set(facts, '{restorePoint,path}', to_jsonb($1::text))`, [copyPath])
+      const elsewhere = await RUN(['--apply', '--rehearsal-record', recordFile, '--resume'])()
+      assert.equal(elsewhere.exitCode, 3, elsewhere.stderr)
+      assert.match(elsewhere.stderr, /not the one this load takes/)
+      await runs(`update first_load_apply_runs set facts = jsonb_set(facts, '{restorePoint,path}', to_jsonb($1::text))`, [String(recorded.facts.restorePoint.path)])
+      rmSync(copyPath)
       // Control: restored byte for byte, the same resume verifies and records VERIFIED.
       const ok = await RUN(['--apply', '--rehearsal-record', recordFile, '--resume'])()
       assert.equal(ok.exitCode, 0, `${ok.stderr}\n${ok.stdout}`)

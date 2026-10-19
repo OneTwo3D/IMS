@@ -118,6 +118,7 @@ export const item = (id: VerificationId, ok: boolean, expected: string, actual: 
 // ---------------------------------------------------------------------------
 
 export const HELD_IDS_CAP = 5000
+const TABLE_NAME = /^[A-Za-z0-9_]{1,63}$/
 
 export interface Baseline {
   /** Exact row count of every base table of the schema, by table name. */
@@ -134,14 +135,15 @@ export function parseBaseline(raw: unknown): Baseline | null {
   if (typeof r.tables !== 'object' || r.tables === null || Array.isArray(r.tables)) return null
   const tables: Record<string, number> = {}
   for (const [name, n] of Object.entries(r.tables as Record<string, unknown>)) {
-    if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) return null
+    // A table name reaches problem text, so a baseline that holds anything but a plain schema name is no baseline.
+    if (!TABLE_NAME.test(name) || typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) return null
     tables[name] = n
   }
   if (Object.keys(tables).length === 0) return null
   if (typeof r.digests !== 'object' || r.digests === null || Array.isArray(r.digests)) return null
   const digests: Record<string, string> = {}
   for (const [name, d] of Object.entries(r.digests as Record<string, unknown>)) {
-    if (typeof d !== 'string' || !/^[0-9a-f]{32}$/.test(d)) return null
+    if (!TABLE_NAME.test(name) || typeof d !== 'string' || !/^[0-9a-f]{32}$/.test(d)) return null
     digests[name] = d
   }
   let heldIds: string[] | null = null
