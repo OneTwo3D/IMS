@@ -59,6 +59,22 @@ type Switch = {
 
 const XERO_MASTER: Requirement[] = [{ plugin: 'xero' }, { settingTrue: 'xero_sync_enabled', defaultValue: 'false' }]
 
+/**
+ * THE SCHEDULED ROUTES THAT DRIVE A MAPPED OPERATION, AND WHETHER THEIR SCHEDULE FLAG IS A CAPABILITY.
+ *
+ * A schedule's enabled flag only decides whether the crontab line exists. A route that does not itself check the flag stays callable
+ * (an authenticated manual call, a stale scheduler entry), so the flag must not be read as "IMS cannot write". Each route that drives a
+ * mapped operation is declared here:
+ *
+ *   always-callable   the route does not enforce the flag: the flag is IGNORED by the check (no `cron` requirement may name it).
+ *   flag-enforced     the route itself refuses when the job is off: a `cron` requirement may name it.
+ *
+ * tests/ops/writers-check-cron-census.test.ts reads each route's source and fails when the declaration and the route disagree.
+ */
+export const WRITER_CRON_ROUTES: Readonly<Record<string, 'always-callable' | 'flag-enforced'>> = {
+  'wms-order-push': 'always-callable',
+}
+
 /** The IMS-side switches of every operation IMS has a writer for. */
 export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.sales.invoice', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
@@ -81,10 +97,10 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   },
   { key: 'xero.daily-batch', trigger: 'automatic', requires: [...XERO_MASTER, { settingTrue: 'xero_daily_batch_enabled', defaultValue: 'false' }] },
   { key: 'xero.tax-rate', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_tax_rate' }] },
-  { key: 'mintsoft.order.create', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }, { cron: 'wms-order-push' }] },
-  { key: 'mintsoft.order.amend', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }, { cron: 'wms-order-push' }] },
-  { key: 'mintsoft.order.cancel', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }, { cron: 'wms-order-push' }] },
-  { key: 'mintsoft.order.hold', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }, { cron: 'wms-order-push' }] },
+  { key: 'mintsoft.order.create', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
+  { key: 'mintsoft.order.amend', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
+  { key: 'mintsoft.order.cancel', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
+  { key: 'mintsoft.order.hold', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.order.comment', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.product.upsert', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.product.content', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },

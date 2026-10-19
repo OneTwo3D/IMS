@@ -103,14 +103,22 @@ test('ARM (a2): evidence that predates the cut-off or is not current does not fa
   assert.equal(garbage.MINTSOFT_ORDER_ID.toISOString(), '2026-10-06T12:00:00.000Z', 'an unreadable instant counts the broader window')
 })
 
+test('ARM (a4): the schedule flag is NOT a capability: with the wms-order-push job OFF, counted post-cut-off bridge evidence still fails (the route stays callable)', () => {
+  const evidence = { ...cleanEvidence(), MINTSOFT_ORDER_ID: reading(3) }
+  for (const cronEnabled of [{ 'wms-order-push': false }, { 'wms-order-push': true }, {} as Record<string, boolean>]) {
+    const report = evaluateWritersCheck(inputs({ env: MINTSOFT_LIVE_ENV, evidence, cronEnabled }))
+    assert.equal(report.operations.find((op) => op.key === 'mintsoft.order.create')?.imsCanWrite, true, JSON.stringify(cronEnabled))
+    assert.equal(report.verdict, 'double-claim', JSON.stringify(cronEnabled))
+  }
+})
+
 test('ARM (a3): bridge evidence does not fail while IMS cannot write (the healthy first phase)', () => {
   const evidence = { ...cleanEvidence(), MINTSOFT_ORDER_ID: reading(500), MINTSOFT_OTHER_META: reading(20), XEROOM_MARKER: reading(500) }
   const report = evaluateWritersCheck(inputs({ evidence }))
   assert.equal(report.verdict, 'ok')
-  // Plugin off, cron off, grant absent, or a producer decision of SHADOW each keep IMS from writing; each is ok with the same evidence.
+  // Plugin off, grant absent, or a producer decision of SHADOW each keep IMS from writing; each is ok with the same evidence.
   for (const variant of [
     inputs({ evidence, env: { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89' }, pluginEnabled: { woocommerce: true, mintsoft: false, xero: true } }),
-    inputs({ evidence, env: { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89' }, cronEnabled: { 'wms-order-push': false } }),
     inputs({ evidence, env: { ...MINTSOFT_LIVE_ENV, MINTSOFT_WRITES_LIVE_FROM: '2026-12-01T00:00:00Z' } }),
   ]) {
     const result = evaluateWritersCheck(variant)
@@ -212,7 +220,8 @@ test('the map is covered: every mapped operation has IMS-side switches or a stat
   assert.equal(switches.size, IMS_WRITER_SWITCHES.length, 'no duplicate switch declarations')
   for (const key of mapped) assert.equal(Number(switches.has(key)) + Number(reasons.has(key)), 1, `${key} must be in exactly one of the two lists`)
   for (const key of [...switches, ...reasons]) assert.ok(mapped.includes(key), `${key} is declared but not in the map`)
-  assert.ok(writersCheckSettingKeys().includes('xero_sync_sales_invoice') && writersCheckCronSlugs().includes('wms-order-push'))
+  assert.ok(writersCheckSettingKeys().includes('xero_sync_sales_invoice'))
+  assert.deepEqual(writersCheckCronSlugs(), [], 'no switch relies on a schedule flag until its route enforces it (see the cron census)')
   // An unclassified new map row is reported, not skipped.
   const extra = [...(WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]), { ...(WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])[0]!, destination: 'xero' as const, operation: 'brand.new' }]
   const report = evaluateWritersCheck(inputs({ map: extra }))

@@ -99,7 +99,7 @@ test('the constructed double claim: IMS can create Mintsoft orders while a post-
   }
 })
 
-test('the same fixture is clean when the bridge marks all predate the cut-off, and when the cron row is off', { skip }, async () => {
+test('the same fixture is clean when the bridge marks all predate the cut-off, and the cron row being off does NOT make it clean', { skip }, async () => {
   const vendor = await listener()
   try {
     const pre = await withRollback(async (tx) => {
@@ -115,8 +115,8 @@ test('the same fixture is clean when the bridge marks all predate the cut-off, a
     })
     assert.equal(pre.evidence!.MINTSOFT_ORDER_ID!.counted, 0)
     assert.ok(!pre.findings.some((f) => f.code === 'incumbent-evidence-vs-ims-writer'))
-    assert.equal(off.operations.find((op) => op.key === 'mintsoft.order.create')?.imsCanWrite, false)
-    assert.ok(!off.findings.some((f) => f.code === 'incumbent-evidence-vs-ims-writer'))
+    assert.equal(off.operations.find((op) => op.key === 'mintsoft.order.create')?.imsCanWrite, true, 'the route does not check the flag, so it can still write')
+    assert.ok(off.findings.some((f) => f.code === 'incumbent-evidence-vs-ims-writer'), 'counted evidence stays actionable with the schedule off')
     assert.equal(vendor.hits(), 0)
   } finally {
     await vendor.close()
