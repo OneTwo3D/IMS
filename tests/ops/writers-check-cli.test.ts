@@ -21,6 +21,7 @@ const okReport = () => evaluateWritersCheck({
   env: {}, now: new Date('2026-10-20T00:00:00Z'), windowDays: 14, settings: new Map(), cronEnabled: {}, pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
   evidence: Object.fromEntries(['MINTSOFT_ORDER_ID', 'MINTSOFT_OTHER_META', 'XEROOM_MARKER', 'XERO_FOREIGN_NUMBER'].map((k) => [k, { counted: 0, total: 0, unpaid: 0, floor: 'x' }])),
   evidenceUnrecorded: 0,
+  unknownEvidenceKinds: 0,
 })
 
 test('arguments: only --json and --window-days <1..365>; anything else is usage and reads nothing', async () => {

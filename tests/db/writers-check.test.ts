@@ -195,6 +195,16 @@ test('the recorder keeps one row per order and kind under concurrent deliveries,
   }
 })
 
+/** Activity rows of an action that exist now, so a test can later remove ONLY the ones it caused (never the history that was already there). */
+async function activityIds(action: string): Promise<string[]> {
+  const db = await getDb()
+  return (await db.activityLog.findMany({ where: { action }, select: { id: true } })).map((row: { id: string }) => row.id)
+}
+async function deleteActivityCreatedSince(action: string, before: readonly string[]): Promise<void> {
+  const db = await getDb()
+  await db.activityLog.deleteMany({ where: { action, id: { notIn: [...before] } } })
+}
+
 async function paidAtOf(id: string, kind = 'XEROOM_MARKER') {
   const db = await getDb()
   const rows = await db.incumbentWriterEvidence.findMany({ where: { externalOrderId: id, kind } })
@@ -255,6 +265,7 @@ test('A WRITE BLOCKED ON THE EVIDENCE TABLE DOES NOT DELAY THE IMPORT: importWcO
     id, status: 'wp2s7-no-such-status', currency: 'GBP', date_paid_gmt: '2026-10-15T10:00:00', date_created_gmt: '2026-10-15T09:00:00', date_modified_gmt: '2026-10-15T10:00:00',
     meta_data: [{ key: '_mintsoft_order_id', value: '9' }], line_items: [], fee_lines: [], tax_lines: [], shipping_lines: [], billing: {}, shipping: {},
   } as never
+  const unrecordedBefore = await activityIds('incumbent_evidence_unrecorded')
   const unrecordedCount = () => db.activityLog.count({ where: { action: 'incumbent_evidence_unrecorded' } })
   try {
     const free = await importWcOrder(order)
@@ -289,14 +300,39 @@ test('A WRITE BLOCKED ON THE EVIDENCE TABLE DOES NOT DELAY THE IMPORT: importWcO
     assert.equal((await db.incumbentWriterEvidence.findMany({ where: { externalOrderId: String(id) } })).length, 0)
   } finally {
     await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: String(id) } })
-    await db.activityLog.deleteMany({ where: { action: 'incumbent_evidence_unrecorded', description: { contains: 'could not be kept' }, createdAt: { gte: new Date(Date.now() - 120_000) } } })
+    await deleteActivityCreatedSince('incumbent_evidence_unrecorded', unrecordedBefore)
   }
+})
+
+test('the evidence table accepts only the closed kinds (the CHECK matches the shared list), and an unknown kind that is somehow present makes the check UNREADABLE, never ok', { skip }, async () => {
+  const db = await getDb()
+  const { INCUMBENT_EVIDENCE_KINDS } = await import('../../lib/security/writers-check-constants')
+  const { readFileSync } = await import('node:fs')
+  // Parity: the constraint text in the migration lists exactly the shared constant's kinds.
+  const sql = readFileSync('prisma/migrations/20261019090000_incumbent_writer_evidence/migration.sql', 'utf8')
+  const listed = /CHECK \("kind" IN \(([^)]*)\)\)/.exec(sql)
+  assert.ok(listed, 'the migration carries the kind CHECK')
+  assert.deepEqual([...listed![1]!.matchAll(/'([^']+)'/g)].map((m) => m[1]!).sort(), [...INCUMBENT_EVIDENCE_KINDS].sort())
+  // The database refuses an unknown kind.
+  await assert.rejects(() => db.incumbentWriterEvidence.create({ data: { connector: 'woocommerce', externalOrderId: `s7-${randomUUID()}`, kind: 'FUTURE_KIND', paidAt: null } }), /check|constraint|violat/i)
+  // A database that holds one anyway (a restore from a newer version): the constraint is dropped INSIDE a rolled-back transaction.
+  const report = await withRollback(async (tx) => {
+    await seedConfiguration(tx, 'http://127.0.0.1:9')
+    await tx.$executeRawUnsafe('ALTER TABLE incumbent_writer_evidence DROP CONSTRAINT incumbent_writer_evidence_kind_check')
+    await tx.incumbentWriterEvidence.create({ data: { connector: 'woocommerce', externalOrderId: `s7-${randomUUID()}`, kind: 'FUTURE_KIND', paidAt: new Date('2026-10-15T00:00:00Z') } })
+    return evaluateWritersCheck(await readWritersCheckInputs({ env: {}, now: NOW, windowDays: 14, client: tx }))
+  })
+  assert.equal(report.unknownEvidenceKinds, 1)
+  assert.equal(report.verdict, 'unreadable')
+  assert.equal(report.exitCode, 2)
+  assert.ok(!JSON.stringify(report).includes('FUTURE_KIND'), 'the unknown kind text is never carried')
 })
 
 test('the periodic record keeps the report in the activity log with no data key, and a non-ok verdict is a failed run', { skip }, async () => {
   const db = await getDb()
   const secretOrderId = `s7-secret-${randomUUID()}`
-  const before = await db.activityLog.count({ where: { action: WRITERS_CHECK_RECORD_ACTION } })
+  const recordedBefore = await activityIds(WRITERS_CHECK_RECORD_ACTION)
+  const before = recordedBefore.length
   // A committed evidence row carrying a recognisable order id: the record may count it but must never carry the id.
   await db.incumbentWriterEvidence.create({ data: { connector: 'woocommerce', externalOrderId: secretOrderId, kind: 'XEROOM_MARKER', paidAt: new Date('2020-01-01T00:00:00Z') } })
   try {
@@ -311,6 +347,6 @@ test('the periodic record keeps the report in the activity log with no data key,
     assert.equal(outcome.status === 'RECORDED', outcome.verdict === 'ok')
   } finally {
     await db.incumbentWriterEvidence.deleteMany({ where: { externalOrderId: secretOrderId } })
-    await db.activityLog.deleteMany({ where: { action: WRITERS_CHECK_RECORD_ACTION } })
+    await deleteActivityCreatedSince(WRITERS_CHECK_RECORD_ACTION, recordedBefore)
   }
 })

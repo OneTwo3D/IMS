@@ -55,7 +55,7 @@ export const WRITERS_CHECK_EXIT_CODES: readonly WritersCheckExitCode[] = [
   { code: 3, name: 'usage', meaning: 'an unknown or malformed argument; nothing was read' },
   { code: 5, name: 'failed', meaning: 'an unexpected error; no verdict was reached, so treat it as a failure' },
   { code: 4, name: 'evidence-gap', meaning: 'the storefront import could not keep some incumbent evidence in the window (its own log entries say how many); the check is blind to those orders' },
-  { code: 2, name: 'unreadable', meaning: 'a grant, a live-from instant or the enforcement variable is set but cannot be read, a destination has a grant without a live-from instant or a live-from instant without a grant, or the settings or the evidence could not be read; no verdict can be given' },
+  { code: 2, name: 'unreadable', meaning: 'a grant, a live-from instant or the enforcement variable is set but cannot be read, a destination has a grant without a live-from instant or a live-from instant without a grant, the evidence table holds a row of a kind this version does not know, or the settings or the evidence could not be read; no verdict can be given' },
   { code: 1, name: 'double-claim', meaning: 'two writers claim one destination operation in the current phase (IMS can write it while another writer owns it or is seen writing it), or the ownership map gives IMS a row it must never own' },
   { code: 0, name: 'ok', meaning: 'no double claim was found in the evidence IMS holds; this is not proof that none exists (see what the check cannot see)' },
 ]

@@ -172,6 +172,8 @@ export type WritersCheckInputs = {
   evidence: Partial<Record<WritersCheckEvidenceKey, EvidenceReading>> | null
   /** Unrecorded-evidence log entries that could matter (counted by the reader against the same floors). */
   evidenceUnrecorded: number | null
+  /** Stored evidence rows whose kind this version does not know (null: could not be counted). Any is unreadable; the kind text is never carried. */
+  unknownEvidenceKinds: number | null
   /** Injectable for the tests; the real map by default. */
   map?: readonly OwnershipRow[]
 }
@@ -207,6 +209,7 @@ export type WritersCheckReport = {
   withoutImsSwitch: Array<{ key: string; reason: string }>
   evidence: Partial<Record<WritersCheckEvidenceKey, EvidenceReading>> | null
   evidenceUnrecorded: number | null
+  unknownEvidenceKinds: number | null
   findings: WritersCheckFinding[]
   canSee: readonly string[]
   cannotSee: readonly string[]
@@ -393,6 +396,11 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
       }
     }
   }
+  if (inputs.unknownEvidenceKinds === null || inputs.unknownEvidenceKinds === undefined) {
+    unreadable(null, 'Whether the evidence table holds rows of a kind this version does not know could not be established.')
+  } else if (inputs.unknownEvidenceKinds > 0) {
+    unreadable(null, `${inputs.unknownEvidenceKinds} stored evidence row(s) are of a kind this version of the check does not know (a newer writer or a restored database); the check cannot read them, so no verdict can be given.`)
+  }
   if (inputs.evidenceUnrecorded === null) {
     unreadable(null, `The log of evidence the storefront import could not keep (${INCUMBENT_EVIDENCE_UNRECORDED_ACTION}) could not be read.`)
   } else if (inputs.evidenceUnrecorded > 0) {
@@ -413,6 +421,7 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
     withoutImsSwitch: Object.entries(WRITERS_WITHOUT_IMS_SWITCH).map(([key, reason]) => ({ key, reason })),
     evidence: evidenceRead,
     evidenceUnrecorded: inputs.evidenceUnrecorded,
+    unknownEvidenceKinds: inputs.unknownEvidenceKinds ?? null,
     findings,
     canSee: WRITERS_CHECK_CAN_SEE,
     cannotSee: WRITERS_CHECK_CANNOT_SEE,
@@ -433,6 +442,7 @@ export function renderWritersCheckText(report: WritersCheckReport): string {
   if (report.evidence) {
     for (const [key, reading] of Object.entries(report.evidence)) lines.push(`  evidence ${key}: ${reading.counted} current of ${reading.total} (${reading.unpaid} unpaid, not counted), counted since ${reading.floor}`)
   }
+  lines.push(`  evidence rows of an unknown kind: ${report.unknownEvidenceKinds ?? 'unreadable'}`)
   lines.push(`  evidence the import could not keep: ${report.evidenceUnrecorded ?? 'unreadable'}`)
   for (const finding of report.findings) lines.push(`  ${finding.severity === 'fail' ? 'FAIL' : 'warn'} [${finding.code}] ${finding.message}`)
   lines.push('  What this check can see:')
@@ -454,7 +464,7 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
   const env = options.env ?? process.env
   const now = options.now ?? new Date()
   const windowDays = options.windowDays ?? WRITERS_CHECK_DEFAULT_WINDOW_DAYS
-  const base: WritersCheckInputs = { env, now, windowDays, settings: null, cronEnabled: null, pluginEnabled: null, evidence: null, evidenceUnrecorded: null }
+  const base: WritersCheckInputs = { env, now, windowDays, settings: null, cronEnabled: null, pluginEnabled: null, evidence: null, evidenceUnrecorded: null, unknownEvidenceKinds: null }
   const db = (options.client ?? (await import('@/lib/db')).db) as Db
 
   try {
@@ -514,6 +524,11 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
     base.evidence = evidence
   } catch {
     base.evidence = null
+  }
+  try {
+    base.unknownEvidenceKinds = await db.incumbentWriterEvidence.count({ where: { kind: { notIn: [...INCUMBENT_EVIDENCE_KINDS] } } })
+  } catch {
+    base.unknownEvidenceKinds = null
   }
 
   try {

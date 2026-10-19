@@ -47,6 +47,7 @@ function inputs(overrides: Partial<WritersCheckInputs> = {}): WritersCheckInputs
     pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
     evidence: cleanEvidence(),
     evidenceUnrecorded: 0,
+    unknownEvidenceKinds: 0,
     ...overrides,
   }
 }
@@ -291,4 +292,16 @@ test('INCONSISTENT configuration fails: a live-from instant with no grant, and a
   // Garbage stays the unreadable finding, not a second inconsistent one.
   const garbage = find({ MINTSOFT_WRITES_LIVE_FROM: 'tomorrow' })
   assert.ok(garbage.findings.some((f) => f.code === 'unreadable') && !garbage.findings.some((f) => f.code === 'inconsistent-configuration'))
+})
+
+test('UNKNOWN evidence kinds: any stored row of a kind this version does not know, or a count that cannot be read, is unreadable (exit 2), and a zero is clean', () => {
+  const clean = evaluateWritersCheck(inputs({ unknownEvidenceKinds: 0 }))
+  assert.equal(clean.exitCode, 0)
+  for (const unknownEvidenceKinds of [1, 7, null]) {
+    const report = evaluateWritersCheck(inputs({ unknownEvidenceKinds }))
+    assert.equal(report.verdict, 'unreadable', String(unknownEvidenceKinds))
+    assert.equal(report.exitCode, 2)
+    assert.ok(report.findings.some((f) => f.code === 'unreadable' && /does not know|could not be established/.test(f.message)))
+  }
+  assert.match(renderWritersCheckText(evaluateWritersCheck(inputs({ unknownEvidenceKinds: 3 }))), /evidence rows of an unknown kind: 3/)
 })

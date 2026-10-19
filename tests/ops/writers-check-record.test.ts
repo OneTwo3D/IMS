@@ -11,6 +11,7 @@ function report(settings: Map<string, string> | null): WritersCheckReport {
     settings, cronEnabled: {}, pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
     evidence: Object.fromEntries(['MINTSOFT_ORDER_ID', 'MINTSOFT_OTHER_META', 'XEROOM_MARKER', 'XERO_FOREIGN_NUMBER'].map((k) => [k, { counted: 0, total: 0, unpaid: 0, floor: 'x' }])),
     evidenceUnrecorded: 0,
+    unknownEvidenceKinds: 0,
   })
 }
 
