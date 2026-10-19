@@ -227,13 +227,15 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
     },
   })
   const columns = FINGERPRINT_SPECS['purchase-orders'].fingerprinted
-  // The price cache createPurchaseOrder keeps per (supplier, product): its last unit cost and currency, written by an upsert for every line of every order in the order the orders were created
-  // (and, inside an order, the line order). So the cache must hold the net unit cost of the LAST line written for the pair: the last line (highest position) of the most recently created order.
-  // Creation time is stored to the millisecond; orders created in the SAME millisecond cannot be ordered, so for those the cost of the last line of ANY of them is accepted (never a guess
-  // beyond that).
+  // The price cache createPurchaseOrder keeps per (supplier, product): its last unit cost and currency, written by an upsert for every line of every order, in the order the orders were created and,
+  // inside an order, in line order. So the cache must hold the net unit cost and currency of the LAST write: the last line (highest position) of the LAST created order.
+  // "Last created" is decided by the stored creation time, which has millisecond resolution, so orders of one importer call can tie. A tie is NOT ambiguous and never accepts either value: inside a call the
+  // importer creates orders strictly one after the other in the order the file lists them (first appearance of the order key; planImportCalls keeps that order), and the calls of an attempt are made in file order, so
+  // among orders created in the same millisecond the one listed later in the prepared file was created later. (Orders of different attempts are seconds apart; docs: not proven for a tie across attempts.)
+  const fileIndex = new Map((prepared.steps.find((st) => st.step === 'purchase-orders')?.units ?? []).map((u, i) => [u.key, i]))
   const supplierProducts = await db.supplierProduct.findMany({ select: { supplierId: true, productId: true, lastUnitCost: true, currency: true, supplierSku: true, leadTimeDays: true } })
   const cacheByPair = new Map(supplierProducts.map((sp) => [`${sp.supplierId}:${sp.productId}`, sp]))
-  const lastByPair = new Map<string, { at: number; written: Set<string> }>()
+  const lastByPair = new Map<string, { at: number; index: number; written: string }>()
   for (const row of rows) {
     const lastInOrder = new Map<string, { sortOrder: number; cost: string }>()
     for (const line of row.lines) {
@@ -242,12 +244,11 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
       if (!seen || line.sortOrder >= seen.sortOrder) lastInOrder.set(pair, { sortOrder: line.sortOrder, cost: new D(line.unitCostForeign.toFixed()).toFixed(6) })
     }
     const at = row.createdAt.getTime()
+    const index = fileIndex.get(row.reference) ?? Number.MAX_SAFE_INTEGER
     for (const [pair, last] of lastInOrder) {
       // What the upsert left in the cache is the cost AND the currency of that last write.
-      const written = `${last.cost}|${row.currency}`
       const best = lastByPair.get(pair)
-      if (!best || at > best.at) lastByPair.set(pair, { at, written: new Set([written]) })
-      else if (at === best.at) best.written.add(written)
+      if (!best || at > best.at || (at === best.at && index > best.index)) lastByPair.set(pair, { at, index, written: `${last.cost}|${row.currency}` })
     }
   }
   // Only the LAST write per pair is compared with the cache: an earlier order, in whatever currency, is not (the cache was overwritten by what followed it).
@@ -255,7 +256,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
     const pair = `${row.supplierId}:${line.productId}`
     const cache = cacheByPair.get(pair)
     // The upsert writes only the cost and currency: the supplier's own SKU and the lead time stay what a create gives them (null), so a value there came from somebody else's row the upsert merged into.
-    return cache !== undefined && cache.supplierSku === null && cache.leadTimeDays === null && cache.lastUnitCost !== null && (lastByPair.get(pair)?.written.has(`${new D(cache.lastUnitCost.toFixed()).toFixed(6)}|${cache.currency}`) ?? false)
+    return cache !== undefined && cache.supplierSku === null && cache.leadTimeDays === null && cache.lastUnitCost !== null && lastByPair.get(pair)?.written === `${new D(cache.lastUnitCost.toFixed()).toFixed(6)}|${cache.currency}`
   })
   // The FILE's numbers for each order, in file order (the importer stores lines in that order): quantity, entered unit cost and line discount (KeyedUnit.poLines).
   const fileLines = new Map<string, FileLineNumbers[]>(

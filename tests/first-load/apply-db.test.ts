@@ -89,6 +89,8 @@ const PO_TEN = `${TAG}-PO-10`
 const PO_ELEVEN = `${TAG}-PO-11`
 const PO_TWELVE = `${TAG}-PO-12`
 const PO_THIRTEEN = `${TAG}-PO-13`
+const PO_TIE_A = `${TAG}-PO-TIE-A`
+const PO_TIE_B = `${TAG}-PO-TIE-B`
 const PO_FOURTEEN = `${TAG}-PO-14`
 const PO_FIFTEEN = `${TAG}-PO-15`
 const SUPPLIER_A = `${TAG} Odd Supplier`
@@ -745,6 +747,36 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.deepEqual([await diff(first), await diff(second)], [[], []], 'restored')
       } finally {
         for (const key of [PO_ELEVEN, PO_TWELVE]) {
+          await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key])
+          await sql('delete from purchase_orders where reference = $1', [key])
+        }
+      }
+    })
+
+    it('two orders of one call created in the SAME millisecond for one supplier and product: the cache must hold the one the file lists LAST (a tie accepts neither value by guess)', async () => {
+      // Mutation named: accept the cost of either tied order (the old same-millisecond rule) -> the reset-to-the-earlier-order arm is green when it must be red.
+      const execute = m.execute.createExecutor({ runId: 'tie', operator: 'Tie Test' })
+      const data = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [
+        { orderKey: PO_TIE_A, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '1', unitCostForeign: '31' },
+        { orderKey: PO_TIE_B, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '1', unitCostForeign: '32' },
+      ])
+      const keyed = keyStep('purchase-orders', data)
+      assert.deepEqual(keyed.problems, [])
+      const stub = { steps: [{ step: 'purchase-orders', get units() { return [...units['purchase-orders'], ...keyed.units] } }] } as unknown as PreparedRun
+      const diff = async (unit: (typeof keyed.units)[number]) => differingColumns(unit.fingerprint, (await m.observe.observeStep(stub, 'purchase-orders')).entries.find((e) => e.key === unit.key)!.fingerprint)
+      try {
+        assert.deepEqual((await execute('purchase-orders', buildResidual('purchase-orders', data, classifyStep('purchase-orders', keyed.units, { entries: [] }))[0]!, NO_LOCK)).errors, [])
+        await sql(`update purchase_orders set "createdAt" = date_trunc('milliseconds', now() + interval '1 hour') where reference in ($1, $2)`, [PO_TIE_A, PO_TIE_B])
+        const [a, b] = keyed.units
+        const sp = await m.db.supplierProduct.findFirstOrThrow({ where: { supplier: { name: SUPPLIER_A }, product: { sku: `${TAG}-SIMPLE` } } })
+        assert.equal(Number(sp.lastUnitCost.toFixed()), 32, 'precondition: the importer left the cache at the order it created last')
+        assert.deepEqual([await diff(a!), await diff(b!)], [[], []], 'control: as written, the two orders have the same stored time')
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: '31' } })
+        assert.deepEqual([await diff(a!), await diff(b!)], [['headerAmounts'], ['headerAmounts']], 'reset to the EARLIER tied order\'s cost')
+        await m.db.supplierProduct.update({ where: { id: sp.id }, data: { lastUnitCost: '32' } })
+        assert.deepEqual([await diff(a!), await diff(b!)], [[], []], 'restored')
+      } finally {
+        for (const key of [PO_TIE_A, PO_TIE_B]) {
           await sql(`delete from purchase_order_lines where "poId" in (select id from purchase_orders where reference = $1)`, [key])
           await sql('delete from purchase_orders where reference = $1', [key])
         }

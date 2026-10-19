@@ -234,7 +234,7 @@ For each table the runner writes, every column is either **fingerprinted** (F, c
 | stock_movements | F/V: type, product, warehouse, quantity, unit cost and total value (equal to what the apply writes from the layer), no note, reference, idempotency key or shipment line. U: id, time |
 | purchase_orders | F: supplier, currency, FX rate, destination, order tax name and percent, VAT convention, supplier reference, expected delivery, order discount, notes, status. V: subtotal, tax, total in both currencies (recomputed from the stored lines with `applyHeaderOrderDiscount`), type, landed-cost method, freight, discount text, internal notes, the shipping and lifecycle columns, archived flag, additional-cost rows. U: id, reference (the key), times |
 | purchase_order_lines | F: product, quantity, entered amount after discount (which pins the stored total), discount and its text, tax (name, value, profile). V: net unit cost, base unit cost, total, base total, tax and base tax (each exactly equal to the importer's arithmetic on the file's numbers, at its stored precision), description, purchase unit, received and returned quantities, landed cost, reorder evidence. U: id, position |
-| supplier_products | V: the row for each (supplier, product) of a stored line exists, and its currency and last unit cost (6 dp) is the net unit cost of the LAST line written for that pair (the last line of the most recently created order; orders created in the same millisecond cannot be ordered, so the last line of any of those is accepted; earlier orders, in whatever currency, are not compared with the cache at all). U: other rows (not written by this run), the supplier's own SKU and lead time |
+| supplier_products | V: the row for each (supplier, product) of a stored line exists, and its currency and last unit cost (6 dp) is the net unit cost of the LAST line written for that pair (the last line of the most recently created order; orders stored with the same creation time are ordered by their position in the prepared file, because inside an importer call the orders are created one after the other in the order the file lists them (first appearance of the order key, kept by the call planner) and the calls of an attempt run in file order: a tie never accepts either value, only the later-listed order's; earlier orders, in whatever currency, are not compared with the cache at all). U: other rows (not written by this run), the supplier's own SKU and lead time |
 | activity_logs | U: the audit trail of the run |
 | first_load_apply_runs | V: digest, run id, status and step by the run-record rules; `facts` recorded once |
 
@@ -278,6 +278,10 @@ Every importer path that upserts merges into a pre-existing row of the same key,
 | stock levels, cost layers, opening movements | every column | a pair is clean only if one layer, one movement and one level agree on every column; otherwise foreign history |
 
 What stays unproven: a foreign row that already has exactly the values the importer would have written is indistinguishable from the run's own; and a category's display spelling beyond its normalised form is not compared (the importer keeps the first spelling it saw).
+
+### Which write was last
+
+The price cache is compared with the last write per (supplier, product). "Last" is never inferred from a tie of stored timestamps: the stored creation time (millisecond resolution) decides, and a tie is broken by the order's position in the prepared file, which is the importer's own creation order inside a call. Audited: this is the only place the observation infers a last write from a timestamp (the opening layer/movement comparison tests equality of the two stored times, not their order). Not proven: two orders sharing a pair created by DIFFERENT attempts in the same millisecond (attempts are seconds apart: each takes the step lock, re-observes and re-plans) where the later attempt created the earlier-listed order.
 
 ### A lone stock level
 
