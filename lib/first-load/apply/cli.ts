@@ -119,7 +119,7 @@ export const CLI_FLAGS: ReadonlyArray<{ flag: string; value: string; applies: st
   { flag: '--rehearse', value: '', applies: 'mode', meaning: 'The default. Copy the target into a throwaway cluster, run the whole load there and write a rehearsal record. The target is only read, and proved unchanged.' },
   { flag: '--plan', value: '', applies: 'mode', meaning: 'Read the target and report what a load would do. Writes nothing to the database.' },
   { flag: '--apply', value: '', applies: 'mode', meaning: 'Load the target: restore point, steps, verification, census. Needs --rehearsal-record.' },
-  { flag: '--rehearsal-record', value: '<file>', applies: '--apply', meaning: 'The record a rehearsal of this exact load wrote: same digest, same target system id, same newest migration as this checkout, verdict OK, within 24 hours.' },
+  { flag: '--rehearsal-record', value: '<file>', applies: '--apply', meaning: 'The record a rehearsal of this exact load wrote: same digest, same target system id, same ordered migration list as this checkout, verdict OK, within 24 hours.' },
   { flag: '--resume', value: '', applies: '--apply', meaning: 'Continue an interrupted load of the same digest (also verifies an APPLIED run). Needs the restore point recorded on the run record, unchanged.' },
   { flag: '--operator', value: '<label>', applies: '--apply, --rehearse', meaning: 'Who the activity log names for the rows written (letters, digits, spaces, dots, dashes, underscores; default first-load-apply).' },
   { flag: '--root', value: '<dir>', applies: '--rehearse', meaning: 'Where the throwaway cluster is made (default /var/tmp; not on a RAM-backed file system; every ancestor must be trustworthy).' },
@@ -219,8 +219,8 @@ export interface RehearsalRecordFile {
   /** The system identifier of the TARGET cluster (not of the throwaway the rehearsal ran on). */
   systemId: string
   finishedAt: string
-  /** The newest migration of the checkout the rehearsal ran from: an apply from a checkout with another schema is refused by the command. */
-  schemaHead: string
+  /** The hash of the ORDERED list of migration names of the checkout the rehearsal ran from (migrationsHash): an apply from a checkout with another schema is refused by the command. */
+  schemaHash: string
   loadExit: string | null
   targetUnchanged: boolean
   teardownComplete: boolean
@@ -310,7 +310,7 @@ export function deriveRehearsalVerdict(s: RehearsalSignals): { verdict: string; 
   return { verdict: 'OK', loadExit: 'OK' }
 }
 
-export function buildRehearsalRecord(args: { manifestDigest: string; targetSystemId: string; schemaHead: string; finishedAt: Date; verdict: string; loadExit: ApplyExitName | null; targetUnchanged: boolean; teardownComplete: boolean; report: RecordReportBinding | null }): RehearsalRecordFile {
+export function buildRehearsalRecord(args: { manifestDigest: string; targetSystemId: string; schemaHash: string; finishedAt: Date; verdict: string; loadExit: ApplyExitName | null; targetUnchanged: boolean; teardownComplete: boolean; report: RecordReportBinding | null }): RehearsalRecordFile {
   // An OK record is never built without the bound, validated report (the one place a caller could otherwise forget it).
   const ok = args.verdict === 'OK' && args.report !== null && args.loadExit === 'OK' && args.targetUnchanged && args.teardownComplete
   return {
@@ -319,7 +319,7 @@ export function buildRehearsalRecord(args: { manifestDigest: string; targetSyste
     verdict: ok ? 'OK' : args.verdict === 'OK' ? 'RECORD_INCOMPLETE' : args.verdict,
     systemId: args.targetSystemId,
     finishedAt: args.finishedAt.toISOString(),
-    schemaHead: args.schemaHead,
+    schemaHash: args.schemaHash,
     loadExit: args.loadExit,
     targetUnchanged: args.targetUnchanged,
     teardownComplete: args.teardownComplete,
@@ -374,10 +374,10 @@ export function reportStem(mode: CliMode, runId: string, now: Date): string {
   return `${APPLY_REPORT_STEM_PREFIX}${mode}-${runId}-${stamp}`
 }
 
-/** The command's own check of a rehearsal record, on top of the core's gate: the schema it was made against is the schema of this checkout. A record with no schema head is refused. */
-export function checkRecordSchema(record: unknown, schemaHead: string): string[] {
-  const head = typeof record === 'object' && record !== null && !Array.isArray(record) ? (record as Record<string, unknown>).schemaHead : undefined
-  if (typeof head !== 'string' || head === '') return ['the rehearsal record names no schema head: it was not made by this command']
-  if (head !== schemaHead) return ['the rehearsal was made against another schema (its newest migration differs from this checkout\'s); rehearse again from this checkout']
+/** The command's own check of a rehearsal record, on top of the core's gate: the schema it was made against (the hash of the ordered migration names) is this checkout's. A record with none is refused. */
+export function checkRecordSchema(record: unknown, schemaHash: string): string[] {
+  const hash = typeof record === 'object' && record !== null && !Array.isArray(record) ? (record as Record<string, unknown>).schemaHash : undefined
+  if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) return ['the rehearsal record names no schema hash: it was not made by this command']
+  if (hash !== schemaHash) return ['the rehearsal was made against another schema (its ordered migration list differs from this checkout\'s); rehearse again from this checkout']
   return []
 }

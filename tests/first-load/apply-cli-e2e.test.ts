@@ -8,7 +8,8 @@ import { runChild } from '../../scripts/rehearse-first-install'
 import { verifyPublishedReport } from '../../lib/ops/published-report'
 import { REHEARSAL_RECORD_FORMAT_VERSION } from '../../lib/first-load/apply/constants'
 import { rehearse } from '../../scripts/lib/first-load-rehearse'
-import { lastMigrationName } from '../../lib/first-load/apply/db/migrations'
+import { checkoutMigrationNames } from '../../lib/first-load/apply/db/migrations'
+import { migrationsHash } from '../../lib/first-load/apply/verify-core'
 import { manifestText, prepareSynthetic, preparedFiles } from './apply-helpers'
 import { startScratch, type Scratch } from './apply-scratch'
 import { precondition } from './helpers'
@@ -112,6 +113,23 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       precondition(t, 'confirmation arms', 2)
     })
 
+    it('a target whose migration history is not exactly the checkout\'s (same count, one name different) is refused (exit 3) before anything is written', async () => {
+      // Mutation: compare the number of migrations only (the old precondition) and this plans OK.
+      const first = `(select migration_name from _prisma_migrations order by migration_name limit 1)`
+      await s.db.$disconnect()
+      const before = await tableCounts()
+      await runs(`update _prisma_migrations set migration_name = migration_name || '_other' where migration_name = ${first}`)
+      try {
+        const r = await RUN(['--plan'])()
+        assert.equal(r.exitCode, 3, r.stderr)
+        assert.match(r.stderr, /MIGRATIONS_MISSING x1, MIGRATIONS_EXTRA x1/)
+        assert.doesNotMatch(r.stderr, /20\d{12}/, 'no migration name is printed')
+      } finally {
+        await runs(`update _prisma_migrations set migration_name = replace(migration_name, '_other', '') where migration_name like '%\\_other'`)
+      }
+      assert.equal(await tableCounts(), before)
+    })
+
     it('an env file that is readable by others, or that sets a PG variable, is refused (exit 2)', async () => {
       const loose = join(dir, 'loose.env')
       writeFileSync(loose, readFileSync(envFile), { mode: 0o644 })
@@ -177,7 +195,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
   describe('apply is refused, and writes nothing, without a rehearsal of this exact load', () => {
     it('no record file, a record of another digest, another target, an old one and one whose verdict is not OK: each exits 3 with no restore point and no run record', async (t) => {
       // Mutation: skip the gate before the restore point (or the core's gate) and the matching arm takes a dump or loads.
-      const good = { formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: 'x', verdict: 'OK', systemId, schemaHead: lastMigrationName(REPO), loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 17, verificationFailed: 0 }, finishedAt: new Date().toISOString() }
+      const good = { formatVersion: REHEARSAL_RECORD_FORMAT_VERSION, manifestDigest: 'x', verdict: 'OK', systemId, schemaHash: migrationsHash(checkoutMigrationNames(REPO)), loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 17, verificationFailed: 0 }, finishedAt: new Date().toISOString() }
       const prepared = JSON.parse(readFileSync(join(reportDir, reportsIn().find((f) => f.includes('-plan-') && f.endsWith('.json'))!), 'utf8')) as { manifestDigest: string }
       const digest = prepared.manifestDigest
       const arms: Array<[string, Record<string, unknown>]> = [
@@ -185,7 +203,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
         ['another target', { ...good, manifestDigest: digest, systemId: '1' }],
         ['older than 24 hours', { ...good, manifestDigest: digest, finishedAt: new Date(Date.now() - 25 * 3_600_000).toISOString() }],
         ['verdict not OK', { ...good, manifestDigest: digest, verdict: 'VERIFY_FAILED' }],
-        ['another schema', { ...good, manifestDigest: digest, schemaHead: '20200101000000_old' }],
+        ['another schema', { ...good, manifestDigest: digest, schemaHash: 'f'.repeat(64) }],
         ['claims the future', { ...good, manifestDigest: digest, finishedAt: new Date(Date.now() + 3_600_000).toISOString() }],
       ]
       for (const [label, record] of arms) {
@@ -316,7 +334,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
         manifestPath: manifest,
         manifestDigest: planDigest,
         steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'],
-        schemaHead: lastMigrationName(REPO),
+        schemaHash: migrationsHash(checkoutMigrationNames(REPO)),
         repoRoot: REPO,
         root: rehearsalRoot,
         reportDir,
@@ -341,7 +359,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       const planDigest = (jsonOf(reportsIn().find((f) => f.includes('-plan-') && f.endsWith('.json'))!) as { manifestDigest: string }).manifestDigest
       return rehearse({
         targetEnv: Object.fromEntries(readFileSync(envFile, 'utf8').split('\n').filter(Boolean).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)])),
-        targetSystemId: systemId, manifestPath: manifest, manifestDigest: planDigest, steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'], schemaHead: lastMigrationName(REPO), repoRoot: REPO, root: rehearsalRoot, reportDir, reportStem: stem, operator: 'E2E Operator',
+        targetSystemId: systemId, manifestPath: manifest, manifestDigest: planDigest, steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'], schemaHash: migrationsHash(checkoutMigrationNames(REPO)), repoRoot: REPO, root: rehearsalRoot, reportDir, reportStem: stem, operator: 'E2E Operator',
         log: () => undefined, hooks: { afterChild },
       })
     }

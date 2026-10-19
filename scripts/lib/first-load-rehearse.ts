@@ -45,7 +45,7 @@ export interface RehearseInput {
   manifestDigest: string
   /** The steps this load selects, in order: the child's report must list exactly these. */
   steps: readonly string[]
-  schemaHead: string
+  schemaHash: string
   repoRoot: string
   /** Parent directory of the throwaway cluster. */
   root: string
@@ -108,7 +108,7 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
     const derived = deriveRehearsalVerdict(verdictSignals)
     const binding = report !== null && facts !== null ? { file: path.basename(report.json), sha256: report.sha256, verificationItems: facts.verificationItems, verificationFailed: facts.verificationFailed } : null
     return {
-      record: buildRehearsalRecord({ manifestDigest: input.manifestDigest, targetSystemId: input.targetSystemId, schemaHead: input.schemaHead, finishedAt: new Date(), verdict: derived.verdict, loadExit: derived.loadExit, targetUnchanged: verdictSignals.targetUnchanged, teardownComplete: verdictSignals.teardownComplete, report: binding }),
+      record: buildRehearsalRecord({ manifestDigest: input.manifestDigest, targetSystemId: input.targetSystemId, schemaHash: input.schemaHash, finishedAt: new Date(), verdict: derived.verdict, loadExit: derived.loadExit, targetUnchanged: verdictSignals.targetUnchanged, teardownComplete: verdictSignals.teardownComplete, report: binding }),
       loadExit: derived.loadExit,
       verdict: derived.verdict,
     }

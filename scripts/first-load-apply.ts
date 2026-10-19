@@ -34,7 +34,8 @@ import { ApplyManifestError, parseApplyManifest, type ApplyManifest } from '../l
 import { checkRehearsalGate, type ApplyResult } from '../lib/first-load/apply/orchestrate'
 import { loadPreparedRun, type PreparedRun } from '../lib/first-load/apply/prepared'
 import { buildApplyReport, renderApplyMarkdown, type ReportRestorePoint, type ReportTarget } from '../lib/first-load/apply/report'
-import { countMigrationDirectories, lastMigrationName } from '../lib/first-load/apply/db/migrations'
+import { checkoutMigrationNames } from '../lib/first-load/apply/db/migrations'
+import { compareMigrations, migrationsHash, type MigrationRow } from '../lib/first-load/apply/verify-core'
 import { pgBinDir } from '../tests/scripts/real-postgres-cluster'
 import {
   prepareReportDir, publishRecord, publishReportPair, readEnvFile, readRegularFile, readSmallFile, sha256OfFile, ReportDirReplacedError, type ReportDir,
@@ -50,6 +51,7 @@ export interface CliIo {
 
 interface Identity extends ReportTarget {
   dataDirectory: string
+  migrationRows: MigrationRow[]
 }
 
 /** What the server says about itself. A read-only connection: this call can write nothing. */
@@ -57,10 +59,14 @@ async function readIdentity(url: string): Promise<Identity> {
   const client = new pg.Client({ connectionString: url, connectionTimeoutMillis: 10_000, options: '-c default_transaction_read_only=on', application_name: RUNNER_APPLICATION_NAME })
   await client.connect()
   try {
-    const row = (await client.query<{ db: string; sid: string; migrations: number; dir: string }>(
-      `select current_database() as db, (select system_identifier::text from pg_control_system()) as sid, (select count(*)::int from _prisma_migrations) as migrations, current_setting('data_directory') as dir`,
+    const row = (await client.query<{ db: string; sid: string; dir: string }>(
+      `select current_database() as db, (select system_identifier::text from pg_control_system()) as sid, current_setting('data_directory') as dir`,
     )).rows[0]!
-    return { database: row.db, systemId: row.sid, migrations: row.migrations, dataDirectory: row.dir }
+    // In the order they were applied; compared by NAME with the checkout's exact list (compareMigrations), never by count.
+    const migrationRows = (await client.query<{ name: string; finished: boolean; rolledback: boolean }>(
+      'select migration_name as name, finished_at is not null as finished, rolled_back_at is not null as rolledback from _prisma_migrations order by started_at, migration_name',
+    )).rows.map((r) => ({ name: r.name, finished: r.finished, rolledBack: r.rolledback }))
+    return { database: row.db, systemId: row.sid, migrations: migrationRows.length, dataDirectory: row.dir, migrationRows }
   } finally {
     await client.end()
   }
@@ -173,9 +179,11 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
     }
   }
 
-  const expectedMigrationCount = countMigrationDirectories(REPO_ROOT)
-  if (identity.migrations !== expectedMigrationCount) {
-    return stopWith('PRECONDITION_REFUSED', [`the target records ${identity.migrations} migration(s) and this checkout has ${expectedMigrationCount}: run the checkout that matches the installed schema (or migrate first)`])
+  const expectedMigrations = checkoutMigrationNames(REPO_ROOT)
+  const schemaHash = migrationsHash(expectedMigrations)
+  const migrationProblems = compareMigrations(expectedMigrations, identity.migrationRows)
+  if (migrationProblems.length > 0) {
+    return stopWith('PRECONDITION_REFUSED', [`the target's migration history is not exactly this checkout's (${migrationProblems.join(', ')}): run the checkout that matches the installed schema, or migrate first`])
   }
 
   const stem = reportStem(args.mode, prepared.manifest.runId, now)
@@ -191,7 +199,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
   const { runLoad } = await import('../lib/first-load/apply/orchestrate')
   const finishDb = async () => { await Promise.race([db.$disconnect(), new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref())]) }
   try {
-    const verification = { outboundEnv: { ...process.env }, expectedMigrationCount }
+    const verification = { outboundEnv: { ...process.env }, expectedMigrations }
     let restorePoint: ReportRestorePoint | null = null
     let rehearsalRecord: unknown = null
     const isRehearsalChild = args.rehearsalChild !== null
@@ -207,7 +215,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
       }
       const gate = checkRehearsalGate(rehearsalRecord, { manifestDigest: prepared.manifestDigest, systemId: identity.systemId, now, maxAgeHours: REHEARSAL_MAX_AGE_HOURS })
       if (gate.length > 0) return stopWith('PRECONDITION_REFUSED', gate)
-      const schema = checkRecordSchema(rehearsalRecord, lastMigrationName(REPO_ROOT))
+      const schema = checkRecordSchema(rehearsalRecord, schemaHash)
       if (schema.length > 0) return stopWith('PRECONDITION_REFUSED', schema)
       // The record's verdict is not taken on its word: it must carry every bound field, and the child report it binds is re-read from beside the record and re-validated.
       const binding = checkRecordBinding(rehearsalRecord)
@@ -307,7 +315,7 @@ async function rehearseMode(
     manifestPath: args.manifest,
     manifestDigest: ctx.prepared.manifestDigest,
     steps: ctx.prepared.steps.map((st) => st.step),
-    schemaHead: lastMigrationName(REPO_ROOT),
+    schemaHash: migrationsHash(checkoutMigrationNames(REPO_ROOT)),
     repoRoot: REPO_ROOT,
     root: args.root,
     reportDir: ctx.reportDir.dir,

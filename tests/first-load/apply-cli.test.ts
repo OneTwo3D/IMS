@@ -143,7 +143,7 @@ test('the rehearsal verdict is derived in ONE place from every signal, and is OK
 })
 
 test('an OK record cannot be built without the bound report, a load exit of OK, an unchanged target and a complete teardown', (t) => {
-  const base = { manifestDigest: DIGEST, targetSystemId: '7', schemaHead: 'h', finishedAt: new Date('2026-10-20T10:00:00Z'), verdict: 'OK', loadExit: 'OK' as const, targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0, complete: true } }
+  const base = { manifestDigest: DIGEST, targetSystemId: '7', schemaHash: '1111111111111111111111111111111111111111111111111111111111111111', finishedAt: new Date('2026-10-20T10:00:00Z'), verdict: 'OK', loadExit: 'OK' as const, targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0, complete: true } }
   assert.equal(buildRehearsalRecord(base).verdict, 'OK')
   // Mutation: build 'OK' from args.verdict alone and every arm below is green.
   const arms: Array<Record<string, unknown>> = [{ report: null }, { loadExit: null }, { targetUnchanged: false }, { teardownComplete: false }]
@@ -209,7 +209,7 @@ test('the apply re-validates what an OK record binds: fields, then the report fi
 
 test('the record the command writes is accepted by the gate it feeds, and by nothing weaker', async () => {
   const prepared = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
-  const record = buildRehearsalRecord({ manifestDigest: prepared.manifestDigest, targetSystemId: 'sys-1', schemaHead: 'h', finishedAt: new Date(), verdict: 'OK', loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0 } })
+  const record = buildRehearsalRecord({ manifestDigest: prepared.manifestDigest, targetSystemId: 'sys-1', schemaHash: '1111111111111111111111111111111111111111111111111111111111111111', finishedAt: new Date(), verdict: 'OK', loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0 } })
   const db = new FakeDatabase(prepared)
   const accepted = await runLoad(prepared, db.ports(), { mode: 'apply', resume: false, rehearsal: record, systemId: 'sys-1', now: new Date(), maxRehearsalAgeHours: 24 })
   assert.equal(accepted.exit, 'OK', accepted.problems.join('; '))
@@ -360,8 +360,8 @@ test('a file hash is of the bytes, and a symlink is refused', () => {
 
 test('the command refuses a record made against another schema, or by something else (no schema head)', (t) => {
   // Mutation: return [] from checkRecordSchema and every arm but the control is green.
-  assert.deepEqual(checkRecordSchema({ schemaHead: '20261001000000_x' }, '20261001000000_x'), [])
-  const arms: unknown[] = [{ schemaHead: '20261002000000_y' }, {}, { schemaHead: '' }, { schemaHead: 5 }, null, 'x', []]
-  for (const record of arms) assert.equal(checkRecordSchema(record, '20261001000000_x').length, 1, JSON.stringify(record))
+  assert.deepEqual(checkRecordSchema({ schemaHash: '1111111111111111111111111111111111111111111111111111111111111111' }, '1111111111111111111111111111111111111111111111111111111111111111'), [])
+  const arms: unknown[] = [{ schemaHash: '2222222222222222222222222222222222222222222222222222222222222222' }, {}, { schemaHash: '' }, { schemaHash: 5 }, { schemaHash: 'abc' }, null, 'x', []]
+  for (const record of arms) assert.equal(checkRecordSchema(record, '1111111111111111111111111111111111111111111111111111111111111111').length, 1, JSON.stringify(record))
   precondition(t, 'schema arms', arms.length)
 })

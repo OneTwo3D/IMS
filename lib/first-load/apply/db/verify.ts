@@ -26,31 +26,34 @@ import type { ApplyPorts, VerificationItem } from '../orchestrate'
 import type { PreparedRun } from '../prepared'
 import { classifyStep } from '../residual'
 import {
-  accountingItem, censusItems, chainItem, fileStockTotals, item, parseBaseline, stockTotalsItem, type Baseline, type Reading, type StockTotals, type VerificationId,
+  HELD_IDS_CAP, accountingItem, censusItems, chainItem, compareMigrations, expectedWrittenTables, fileStockPairs, item, openingMovementsItem, parseBaseline, purchaseOrdersItem, stockTotalsItem,
+  type Baseline, type Reading, type StoredLayer, type StoredMovement, type VerificationId,
 } from '../verify-core'
 import { loadFacts, setFactOnce } from './journal'
-import { countMigrationDirectories } from './migrations'
 import { observeStep } from './observe'
 import { evaluateRails } from './rails'
 
 export const BASELINE_FACT = 'baseline'
-export { countMigrationDirectories }
 const UNREADABLE = 'could not be read'
 const TABLE_NAME = /^[A-Za-z0-9_]{1,63}$/
 
 export interface VerifyDeps {
   /** The environment the outbound-write status is evaluated against: the installation's own variables, merged with this process's. A grant in it fails the verification. */
   outboundEnv: Record<string, string | undefined>
-  /** What `_prisma_migrations` must hold (see countMigrationDirectories). */
-  expectedMigrationCount: number
+  /** The checkout's migration names in applied order: the migration table must hold EXACTLY these (compareMigrations). */
+  expectedMigrations: readonly string[]
   /** Test seam: the scheduled invariant check. Default: the application's own, in process, writing nothing. */
   runInvariants?: () => Promise<{ ok: boolean; critical: number }>
 }
 
-/** Exact row count of every base table of the schema. */
-export async function countAllTables(): Promise<Record<string, number>> {
+async function tableNames(): Promise<string[]> {
   const names = (await db.$queryRaw<Array<{ table_name: string }>>`select table_name from information_schema.tables where table_schema = 'public' and table_type = 'BASE TABLE' order by table_name`).map((r) => r.table_name)
   if (names.length === 0 || names.some((n) => !TABLE_NAME.test(n))) throw new Error('the table list is empty or holds a name this reader does not trust')
+  return names
+}
+
+/** Exact row count of every base table of the schema. */
+export async function countAllTables(names: readonly string[]): Promise<Record<string, number>> {
   const rows = await db.$queryRawUnsafe<Array<{ t: string; n: string }>>(names.map((n) => `select '${n}' as t, count(*)::text as n from "${n}"`).join(' union all '))
   const out: Record<string, number> = {}
   for (const row of rows) out[row.t] = Number(row.n)
@@ -58,14 +61,32 @@ export async function countAllTables(): Promise<Record<string, number>> {
   return out
 }
 
-async function readNow(): Promise<Reading> {
-  return { tables: await countAllTables(), heldWrites: await db.activityLog.count({ where: { action: OUTBOUND_HELD_ACTION } }) }
+/** A digest of the CONTENT of each table (md5 over its rows' text, sorted): the identity of what is in it, which a count cannot give. */
+export async function digestTables(names: readonly string[]): Promise<Record<string, string>> {
+  if (names.length === 0) return {}
+  const rows = await db.$queryRawUnsafe<Array<{ t: string; d: string }>>(names.map((n) => `select '${n}' as t, md5(coalesce(string_agg(x, E'\\n' order by x), '')) as d from (select r::text as x from "${n}" r) s`).join(' union all '))
+  const out: Record<string, string> = {}
+  for (const row of rows) out[row.t] = row.d
+  if (Object.keys(out).length !== names.length) throw new Error('a table was not digested')
+  return out
 }
 
-/** Record the starting counts once. Returns true when this call recorded them. The ports call it at the start of every step, after the rails passed. */
+export async function readNow(): Promise<Reading> {
+  const names = await tableNames()
+  const written = expectedWrittenTables()
+  const held = await db.activityLog.findMany({ where: { action: OUTBOUND_HELD_ACTION }, select: { id: true }, take: HELD_IDS_CAP + 1 })
+  return {
+    tables: await countAllTables(names),
+    // Every table the runner does NOT write is compared by content; the runner's own tables are compared record by record by the other items.
+    digests: await digestTables(names.filter((n) => !written.has(n))),
+    heldIds: held.length > HELD_IDS_CAP ? null : held.map((h) => h.id).sort(),
+  }
+}
+
+/** Record the starting state once. Returns true when this call recorded it. The ports call it at the start of every step, after the rails passed. */
 export async function captureBaseline(): Promise<boolean> {
   const now = await readNow()
-  return setFactOnce(BASELINE_FACT, { tables: now.tables, heldWrites: now.heldWrites } satisfies Baseline)
+  return setFactOnce(BASELINE_FACT, now satisfies Baseline)
 }
 
 async function guarded(id: VerificationId, expected: string, read: () => Promise<VerificationItem>): Promise<VerificationItem> {
@@ -81,7 +102,7 @@ const num = (text: string | null | undefined): string => text ?? '0'
 export function createVerifier(deps: VerifyDeps): NonNullable<ApplyPorts['verify']> {
   return async (prepared: PreparedRun, steps): Promise<VerificationItem[]> => {
     const items: VerificationItem[] = []
-    items.push(accountingItem(steps))
+    items.push(accountingItem(prepared, steps))
     items.push(chainItem(prepared, steps))
 
     // The database against the files, from scratch: every unit of every selected step is present and matching, and nothing foreign is there. The step results are not trusted.
@@ -102,28 +123,39 @@ export function createVerifier(deps: VerifyDeps): NonNullable<ApplyPorts['verify
       return item('rails-after-load', problems.length === 0, 'every rail still holds', problems.length === 0 ? 'every rail holds' : `${problems.length} rail problem(s)`)
     }))
 
-    // Stock: exact totals per warehouse and in total, against the file and the prepared report.
-    items.push(await guarded('stock-totals', 'exact', async () => {
-      const layers = await db.$queryRaw<Array<{ code: string; qty: string; value: string }>>`
-        select upper(w.code) as code, sum(cl."receivedQty")::text as qty, sum(cl."receivedQty" * cl."unitCostBase")::text as value
-          from cost_layers cl join warehouses w on w.id = cl."warehouseId" where cl."isOpeningStock" group by upper(w.code)`
+    // Stock, record by record: every opening layer against its file record (SKU and warehouse), exactly.
+    const selectedStock = prepared.steps.some((st) => st.step === 'opening-stock')
+    items.push(await guarded('stock-totals', 'each layer equals its file record', async () => {
+      const rows = await db.$queryRaw<Array<{ sku: string; code: string; received: string; remaining: string; cost: string }>>`
+        select upper(p.sku) as sku, upper(w.code) as code, cl."receivedQty"::text as received, cl."remainingQty"::text as remaining, cl."unitCostBase"::text as cost
+          from cost_layers cl join products p on p.id = cl."productId" join warehouses w on w.id = cl."warehouseId" where cl."isOpeningStock"`
       const other = await db.$queryRaw<Array<{ n: string }>>`select count(*)::text as n from cost_layers where not "isOpeningStock"`
-      const database = new Map<string, StockTotals>(layers.map((l) => [l.code, { qty: new D(l.qty), value: new D(l.value) }]))
+      const layers: StoredLayer[] = rows.map((r) => ({ key: `${r.sku}|${r.code}`, received: new D(r.received), remaining: new D(r.remaining), cost: new D(r.cost) }))
       const totals = (prepared.report as unknown as { stock?: { totals?: { openingQty?: string; openingValueBase?: string } } }).stock?.totals
       // No opening-stock step selected: the prepared report's totals do not apply to this load, and the database must hold no opening layer at all.
-      const selected = prepared.steps.some((s) => s.step === 'opening-stock')
-      const report = !selected ? { qty: '0', value: '0' } : totals?.openingQty !== undefined && totals.openingValueBase !== undefined ? { qty: totals.openingQty, value: totals.openingValueBase } : null
-      return stockTotalsItem({ file: fileStockTotals(prepared), database, report, nonOpeningLayers: Number(num(other[0]?.n)) })
+      const report = !selectedStock ? { qty: '0', value: '0' } : totals?.openingQty !== undefined && totals.openingValueBase !== undefined ? { qty: totals.openingQty, value: totals.openingValueBase } : null
+      return stockTotalsItem({ file: fileStockPairs(prepared), layers, report, nonOpeningLayers: Number(num(other[0]?.n)) })
     }))
 
-    items.push(await guarded('opening-movements', 'one movement per opening layer, nothing else', async () => {
-      const file = fileStockTotals(prepared)
-      const pairs = prepared.steps.find((s) => s.step === 'opening-stock')?.units.length ?? 0
-      const fileQty = [...file.values()].reduce((t, v) => t.add(v.qty), new D(0))
-      const opening = (await db.$queryRaw<Array<{ n: string; qty: string }>>`select count(*)::text as n, coalesce(sum(qty), 0)::text as qty from stock_movements where type = 'OPENING_STOCK'`)[0]
+    items.push(await guarded('opening-movements', 'each movement paired with its layer and the file', async () => {
+      const rows = await db.$queryRaw<Array<{ id: string; sku: string; code: string | null; qty: string; cost: string | null; total: string | null; fromw: boolean; lsku: string | null; lcode: string | null; lreceived: string | null; lcost: string | null }>>`
+        select m.id, upper(p.sku) as sku, upper(w.code) as code, m.qty::text as qty, m."unitCostBase"::text as cost, m."totalValueBase"::text as total, (m."fromWarehouseId" is not null) as fromw,
+               upper(lp.sku) as lsku, upper(lw.code) as lcode, cl."receivedQty"::text as lreceived, cl."unitCostBase"::text as lcost
+          from stock_movements m
+          join products p on p.id = m."productId"
+          left join warehouses w on w.id = m."toWarehouseId"
+          left join cost_layers cl on cl.adjustment_movement_id = m.id
+          left join products lp on lp.id = cl."productId"
+          left join warehouses lw on lw.id = cl."warehouseId"
+         where m.type = 'OPENING_STOCK'`
+      const byId = new Map<string, StoredMovement>()
+      for (const r of rows) {
+        const m = byId.get(r.id) ?? { id: r.id, key: `${r.sku}|${r.code ?? ''}`, qty: new D(r.qty), cost: r.cost === null ? null : new D(r.cost), total: r.total === null ? null : new D(r.total), fromWarehouse: r.fromw, layers: [] }
+        if (r.lreceived !== null && r.lcost !== null) m.layers.push({ key: `${r.lsku}|${r.lcode}`, received: new D(r.lreceived), cost: new D(r.lcost) })
+        byId.set(r.id, m)
+      }
       const others = (await db.$queryRaw<Array<{ n: string }>>`select count(*)::text as n from stock_movements where type <> 'OPENING_STOCK'`)[0]
-      const ok = Number(num(opening?.n)) === pairs && new D(num(opening?.qty)).eq(fileQty) && Number(num(others?.n)) === 0
-      return item('opening-movements', ok, 'one movement per opening layer, nothing else', ok ? `${pairs} movement(s), all opening` : 'the movements differ from the opening layers')
+      return openingMovementsItem({ file: fileStockPairs(prepared), movements: [...byId.values()], otherTypes: Number(num(others?.n)) })
     }))
 
     items.push(await guarded('stock-levels-equal-layers', 'every stock level equals the sum of its layers, nothing reserved', async () => {
@@ -153,11 +185,10 @@ export function createVerifier(deps: VerifyDeps): NonNullable<ApplyPorts['verify
       return item('bom-recipe-drift', drift.length === 0, 'no drift between the two recipe representations', `${drift.length} drifting product(s)`)
     }))
 
-    items.push(await guarded('purchase-orders-draft', 'every loaded order is a draft', async () => {
-      const row = (await db.$queryRaw<Array<{ total: string; notDraft: string }>>`select count(*)::text as total, count(*) filter (where status <> 'DRAFT')::text as "notDraft" from purchase_orders`)[0]
-      const orders = prepared.steps.find((s) => s.step === 'purchase-orders')?.units.length ?? 0
-      const ok = Number(num(row?.notDraft)) === 0 && Number(num(row?.total)) === orders
-      return item('purchase-orders-draft', ok, 'every loaded order is a draft, and there are as many as the file has', ok ? `${orders} draft order(s)` : 'the orders differ from the file or one is not a draft')
+    items.push(await guarded('purchase-orders-draft', 'the stored orders are exactly the file\'s, each a draft', async () => {
+      const stored = await db.$queryRaw<Array<{ reference: string; status: string }>>`select reference, status::text as status from purchase_orders`
+      const references = (prepared.steps.find((st) => st.step === 'purchase-orders')?.units ?? []).map((u) => u.key)
+      return purchaseOrdersItem({ references, stored })
     }))
 
     items.push(await guarded('base-currency', `locked, ${SUPPORTED_BASE_CURRENCY}`, async () => {
@@ -166,12 +197,11 @@ export function createVerifier(deps: VerifyDeps): NonNullable<ApplyPorts['verify
       return item('base-currency', locked && code === SUPPORTED_BASE_CURRENCY && code === prepared.manifest.baseCurrency, `locked, ${SUPPORTED_BASE_CURRENCY}`, `${locked ? 'locked' : 'not locked'}, ${code === SUPPORTED_BASE_CURRENCY ? 'as declared' : 'a different currency'}`)
     }))
 
-    items.push(await guarded('migrations-applied', 'every migration of this checkout finished', async () => {
-      const row = (await db.$queryRaw<Array<{ total: string; open: string }>>`select count(*)::text as total, count(*) filter (where finished_at is null or rolled_back_at is not null)::text as open from _prisma_migrations`)[0]
-      const total = Number(num(row?.total))
-      const open = Number(num(row?.open))
-      const ok = open === 0 && total === deps.expectedMigrationCount
-      return item('migrations-applied', ok, `${deps.expectedMigrationCount} finished migration(s)`, `${total} recorded, ${open} unfinished or rolled back`)
+    items.push(await guarded('migrations-applied', 'the migration table is exactly the checkout\'s ordered list, all finished', async () => {
+      const rows = (await db.$queryRaw<Array<{ name: string; finished: boolean; rolledback: boolean }>>`select migration_name as name, finished_at is not null as finished, rolled_back_at is not null as rolledback from _prisma_migrations order by started_at, migration_name`)
+        .map((r) => ({ name: r.name, finished: r.finished, rolledBack: r.rolledback }))
+      const problems = compareMigrations(deps.expectedMigrations, rows)
+      return item('migrations-applied', problems.length === 0, `exactly ${deps.expectedMigrations.length} migration(s), by name, in order, all finished`, problems.length === 0 ? `${rows.length} migration(s), identical` : problems.join(', '))
     }))
 
     // No write may leave: the grant states in the installation's environment, and the producer-side counts, with exit 0 under --expect-held.
