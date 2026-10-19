@@ -140,8 +140,8 @@ test('an OK record cannot be built without the bound report, a load exit of OK, 
   const base = { manifestDigest: DIGEST, targetSystemId: '7', schemaHead: 'h', finishedAt: new Date('2026-10-20T10:00:00Z'), verdict: 'OK', loadExit: 'OK' as const, targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: 2, verificationFailed: 0 } }
   assert.equal(buildRehearsalRecord(base).verdict, 'OK')
   // Mutation: build 'OK' from args.verdict alone and every arm below is green.
-  const arms: Array<Partial<typeof base> & { report?: null }> = [{ report: null }, { loadExit: null as never }, { targetUnchanged: false }, { teardownComplete: false }]
-  for (const over of arms) assert.notEqual(buildRehearsalRecord({ ...base, ...over }).verdict, 'OK', JSON.stringify(over))
+  const arms: Array<Record<string, unknown>> = [{ report: null }, { loadExit: null }, { targetUnchanged: false }, { teardownComplete: false }]
+  for (const over of arms) assert.notEqual(buildRehearsalRecord({ ...base, ...over } as typeof base).verdict, 'OK', JSON.stringify(over))
   precondition(t, 'record arms', arms.length)
 })
 
