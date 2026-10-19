@@ -179,8 +179,9 @@ async function observeOpeningStock(): Promise<StepObservation> {
   for (const [id, pair] of pairs) {
     const [productId, warehouseId] = id.split(':')
     const key = `${pair.sku.toUpperCase()}|${pair.code.toUpperCase()}`
-    const emptyLevel = pair.level !== null && new D(pair.level.quantity.toFixed()).isZero() && new D(pair.level.reservedQty.toFixed()).isZero()
-    if (pair.layers.length === 0 && pair.movements.length === 0 && (pair.level === null || emptyLevel)) continue // nothing there: an empty level row is not history
+    // A pair with nothing at all is absent. A level row alone (even at zero quantity and zero reserved) is NOT: the opening-stock importer treats it as empty and increments it, so a row inserted
+    // between attempts would be merged silently, and a crash between the importer's own level and layer writes looks the same. Both are refused as unclean history (recovery: docs, "A lone stock level").
+    if (pair.layers.length === 0 && pair.movements.length === 0 && pair.level === null) continue
     const layer = pair.layers.length === 1 ? pair.layers[0] : null
     const movement = pair.movements.length === 1 ? pair.movements[0] : null
     const clean = layer !== null && movement !== null && pair.level !== null

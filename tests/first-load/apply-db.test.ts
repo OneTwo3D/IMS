@@ -1278,6 +1278,20 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         } finally { await resetData() }
       })
 
+      it('a lone stock level, even at zero quantity and zero reserved, is unclean history of its pair, not "absent"', async () => {
+        // Mutation named: treat a zero level with no layer or movement as absent again -> the importer would increment a row somebody else inserted between attempts: red.
+        await resetData()
+        try {
+          const product = await m.db.product.create({ data: { sku: `${TAG}-SIMPLE`, name: 'x' } })
+          const main = await m.db.warehouse.findUniqueOrThrow({ where: { code: 'ZQSENT-MAIN' }, select: { id: true } })
+          assert.deepEqual((await m.observe.observeStep(prepared, 'opening-stock')).foreignHistoryKeys, [], 'control: no row at all is absent')
+          await m.db.stockLevel.create({ data: { productId: product.id, warehouseId: main.id, quantity: '0', reservedQty: '0' } })
+          const observed = await m.observe.observeStep(prepared, 'opening-stock')
+          assert.deepEqual(observed.foreignHistoryKeys, [`${TAG}-SIMPLE|ZQSENT-MAIN`.toUpperCase()])
+          assert.equal(observed.entries.find((e) => e.key === `${TAG}-SIMPLE|ZQSENT-MAIN`.toUpperCase())?.fingerprint, 'UNCLEAN_STOCK_PAIR')
+        } finally { await resetData() }
+      })
+
       it('a recipe, a bill of materials and its items the file does not describe are refused on a resume', async () => {
         await resetData()
         try {

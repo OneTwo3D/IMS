@@ -193,7 +193,7 @@ export function checkRehearsalGate(record: unknown, expected: { manifestDigest: 
   const r = record as Record<string, unknown>
   const problems: string[] = []
   if (r.formatVersion !== REHEARSAL_RECORD_FORMAT_VERSION) problems.push('the rehearsal report is not format version 1')
-  if (r.verdict !== 'OK') problems.push(`the rehearsal verdict is ${JSON.stringify(r.verdict)}, not OK`)
+  if (r.verdict !== 'OK') problems.push('the rehearsal verdict is missing or is not OK')
   if (r.manifestDigest !== expected.manifestDigest) problems.push('the rehearsal was of a different load (its manifest digest differs)')
   if (expected.systemId === null || typeof r.systemId !== 'string' || r.systemId !== expected.systemId) problems.push('the rehearsal was run against a different target (its system id differs, or the target\'s is unknown)')
   const finished = typeof r.finishedAt === 'string' ? Date.parse(r.finishedAt) : NaN

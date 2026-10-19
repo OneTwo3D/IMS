@@ -279,6 +279,10 @@ Every importer path that upserts merges into a pre-existing row of the same key,
 
 What stays unproven: a foreign row that already has exactly the values the importer would have written is indistinguishable from the run's own; and a category's display spelling beyond its normalised form is not compared (the importer keeps the first spelling it saw).
 
+### A lone stock level
+
+Opening stock is observed per (SKU, warehouse) pair. A pair with no level, no layer and no movement is absent. A level row on its own, even at zero quantity and zero reserved, is NOT absent: the importer treats an empty level as a row to increment, so a level inserted between attempts would be merged silently, and a crash between the importer's own level and layer writes leaves the same picture. Both are reported as foreign history of the pair (the step is refused, nothing is written). Recovery, by the operator: look at the pair, and if the lone zero level is the leftover of this runner's own crash, delete that one row and resume; otherwise decide what the row is before loading. Other "looks empty" shortcuts were audited: a layer with a zero remaining quantity, a movement without its value fields, a movement with a note, reference or idempotency key, and a level with reserved stock each make the pair unclean (the clean test compares every column); defaults that are zero or blank (the products' and suppliers' unwritten columns) are compared exactly, not skipped.
+
 ### The accounting profile of the tax rates
 
 Just before the first purchase-order write the runner records, once, on the run record (`facts`, never rewritten), a digest of the accounting profile of the rate each tax lookup of the file resolves to. The read-back then requires each stored line's rate to have that profile, so a later change of a rate's tax type, reverse-charge flag, reporting category, compound flag or components shows as a difference in `lines`. The stored line and header amounts are also compared exactly with the importer's arithmetic on the file's numbers and the line's current effective rate, so a rate edited afterwards, or an amount edited by hand, shows too.

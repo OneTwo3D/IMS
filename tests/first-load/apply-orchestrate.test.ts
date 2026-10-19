@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { CONFLICT_CODES, REHEARSAL_RECORD_FORMAT_VERSION, REPORT_CONFLICT_FIELDS, REPORT_IMPORTER_MESSAGE_FIELDS, REPORT_ROW_FIELDS, ROW_OUTCOMES } from '../../lib/first-load/apply/constants.ts'
-import { StepLockError, runLoad, type ApplyOptions, type ApplyResult, type RunRecord } from '../../lib/first-load/apply/orchestrate.ts'
+import { StepLockError, checkRehearsalGate, runLoad, type ApplyOptions, type ApplyResult, type RunRecord } from '../../lib/first-load/apply/orchestrate.ts'
 import { ObservationError } from '../../lib/first-load/apply/residual.ts'
 import { buildApplyReport, renderApplyJson, renderApplyMarkdown } from '../../lib/first-load/apply/report.ts'
 import { FakeDatabase, NO_LOCK, loadOk, prepareSynthetic, preparedFiles } from './apply-helpers.ts'
@@ -543,4 +543,14 @@ test('a conflict found under the lock is reported as a closed code and a count: 
     examined++
   }
   precondition(t, 'steps examined', examined)
+})
+
+test('a rehearsal verdict that is not OK is refused with a fixed message: nothing the report supplied is echoed', () => {
+  const { prepared, rehearsal } = setup()
+  const marker = 'MARKER-SUPPLIED-VALUE'
+  for (const verdict of [marker, { nested: marker }, 7, null]) {
+    const problems = checkRehearsalGate({ ...rehearsal, verdict }, { manifestDigest: prepared.manifestDigest, systemId: 'sys-1', now: NOW, maxAgeHours: 24 })
+    assert.ok(problems.includes('the rehearsal verdict is missing or is not OK'))
+    assert.ok(!problems.join(';').includes(marker))
+  }
 })
