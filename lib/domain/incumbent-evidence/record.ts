@@ -56,6 +56,10 @@ function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
 type EvidenceWriter = (input: { externalOrderId: string; kind: IncumbentEvidenceKind; paidAt: Date | null }) => Promise<void>
 type UnrecordedWriter = (input: { kinds: string[]; paidState: 'paid' | 'unpaid' | 'unreadable'; paidAt: Date | null; reason: string }) => Promise<void>
 
+function hasUsableId(id: unknown): boolean {
+  return (typeof id === 'number' && Number.isFinite(id)) || (typeof id === 'string' && id.trim() !== '')
+}
+
 async function upsertEvidence(input: { externalOrderId: string; kind: IncumbentEvidenceKind; paidAt: Date | null }): Promise<void> {
   // One upsert statement, so two deliveries of one order cannot collide on the unique key. MONOTONIC: GREATEST ignores a null, so a
   // recorded paid time is never replaced by "unpaid" (null) or by an earlier time, and a null is replaced by any time. A stale,
@@ -104,9 +108,20 @@ export async function recordWcIncumbentEvidence(
       return { recorded: 0, unrecorded: true }
     }
     kinds = classified.kinds
-    if (kinds.length === 0) return { recorded: 0 }
+    if (kinds.length === 0) {
+      // A payload with no order id cannot be tied to anything: with no mark it is still a partial payload, so it is a gap.
+      if (!hasUsableId(order.id)) {
+        await unrecorded({ kinds: ['META_UNREADABLE'], paidState: paid.state, paidAt: paid.state === 'paid' ? paid.at : null, reason: 'the order has no usable id' })
+        return { recorded: 0, unrecorded: true }
+      }
+      return { recorded: 0 }
+    }
     if (paid.state === 'unreadable') {
       await unrecorded({ kinds, paidState: 'unreadable', paidAt: null, reason: 'the paid time cannot be read' })
+      return { recorded: 0, unrecorded: true }
+    }
+    if (!hasUsableId(order.id)) {
+      await unrecorded({ kinds, paidState: paid.state, paidAt: paid.state === 'paid' ? paid.at : null, reason: 'the order has no usable id' })
       return { recorded: 0, unrecorded: true }
     }
     const externalOrderId = String(order.id)

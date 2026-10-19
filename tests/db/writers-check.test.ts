@@ -142,7 +142,7 @@ test('Xero evidence comes from the refusals IMS already logged, not from a Xero 
 test('entries the import could not record: only those that could matter count, and an unreadable one always does', { skip }, async () => {
   const counted = await withRollback(async (tx) => {
     await seedConfiguration(tx, 'http://127.0.0.1:9')
-    const entry = (metadata: object | null) => tx.activityLog.create({ data: { entityType: 'SYNC', action: 'incumbent_evidence_unrecorded', tag: 'sync', level: 'WARNING', description: 'x', metadata } })
+    const entry = (metadata: object | null) => tx.activityLog.create({ data: { entityType: 'SYNC', action: 'incumbent_evidence_unrecorded', tag: 'sync', level: 'WARNING', description: 'x', metadata, createdAt: new Date('2026-10-18T00:00:00Z') } })
     await entry({ kinds: ['MINTSOFT_ORDER_ID'], paidState: 'paid', paidAt: '2026-10-05T00:00:00.000Z' }) // before the instant: cannot matter
     await entry({ kinds: ['MINTSOFT_ORDER_ID'], paidState: 'paid', paidAt: '2026-10-15T00:00:00.000Z' }) // counts
     await entry({ kinds: ['MINTSOFT_ORDER_ID'], paidState: 'unpaid', paidAt: null }) // IMS cannot create an unpaid order
@@ -153,6 +153,26 @@ test('entries the import could not record: only those that could matter count, a
     return inputs.evidenceUnrecorded
   })
   assert.equal(counted, 4)
+})
+
+test('FUTURE-DATED rows are not current claims: paid times and log entries after the report instant count nowhere, and a future paid time in the unrecorded log is ignored', { skip }, async () => {
+  const run = async (client: Tx, now: Date) => readWritersCheckInputs({ env: MINTSOFT_ENV, now, windowDays: 14, client })
+  const result = await withRollback(async (tx) => {
+    await seedConfiguration(tx, 'http://127.0.0.1:9')
+    await seedEvidence(tx, { kind: 'MINTSOFT_ORDER_ID', paidAt: new Date('2026-12-25T00:00:00Z'), id: `s7-${randomUUID()}` }) // after the report instant
+    await seedEvidence(tx, { kind: 'MINTSOFT_ORDER_ID', paidAt: new Date('2026-10-15T00:00:00Z'), id: `s7-${randomUUID()}` })
+    const log = (createdAt: string, paidAt: string, code = 'NUMBER_HELD_BY_FOREIGN_DOCUMENT') => tx.activityLog.create({ data: { entityType: 'SYSTEM', action: 'sales_invoice_number_not_ours', tag: 'accounting', level: 'WARNING', description: 'x', metadata: { connector: 'xero', refusalCode: code, paidAt }, createdAt: new Date(createdAt) } })
+    await log('2026-12-25T00:00:00Z', 'x')
+    await log('2026-10-15T00:00:00Z', 'x')
+    const unrecorded = (createdAt: string, paidAt: string) => tx.activityLog.create({ data: { entityType: 'SYNC', action: 'incumbent_evidence_unrecorded', tag: 'sync', level: 'WARNING', description: 'x', metadata: { kinds: ['MINTSOFT_ORDER_ID'], paidState: 'paid', paidAt }, createdAt: new Date(createdAt) } })
+    await unrecorded('2026-10-18T00:00:00Z', '2026-12-25T00:00:00.000Z') // a future paid time
+    await unrecorded('2026-12-25T00:00:00Z', '2026-10-15T00:00:00.000Z') // a future log entry
+    await unrecorded('2026-10-18T00:00:00Z', '2026-10-15T00:00:00.000Z') // counts
+    return run(tx, NOW)
+  })
+  assert.equal(result.evidence!.MINTSOFT_ORDER_ID!.counted, 1, 'only the order paid before the report instant counts')
+  assert.equal(result.evidence!.XERO_FOREIGN_NUMBER!.counted, 1, 'the in-window refusal counts; the one dated after the report instant does not')
+  assert.equal(result.evidenceUnrecorded, 1)
 })
 
 test('the recorder keeps one row per order and kind under concurrent deliveries, and updates the paid time', { skip }, async () => {

@@ -472,7 +472,7 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
     for (const kind of INCUMBENT_EVIDENCE_KINDS) {
       const floor = floors[kind]
       evidence[kind] = {
-        counted: await db.incumbentWriterEvidence.count({ where: { connector: 'woocommerce', kind, paidAt: { gte: floor } } }),
+        counted: await db.incumbentWriterEvidence.count({ where: { connector: 'woocommerce', kind, paidAt: { gte: floor, lte: now } } }),
         total: await db.incumbentWriterEvidence.count({ where: { connector: 'woocommerce', kind } }),
         unpaid: await db.incumbentWriterEvidence.count({ where: { connector: 'woocommerce', kind, paidAt: null } }),
         floor: floor.toISOString(),
@@ -481,7 +481,7 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
     const foreignFloor = floors[XERO_FOREIGN_NUMBER_EVIDENCE]
     const foreignWhere = { action: XERO_FOREIGN_NUMBER_ACTIVITY_ACTION, OR: XERO_FOREIGN_NUMBER_REFUSAL_CODES.map((code) => ({ metadata: { path: ['refusalCode'], equals: code } })) }
     evidence[XERO_FOREIGN_NUMBER_EVIDENCE] = {
-      counted: await db.activityLog.count({ where: { ...foreignWhere, createdAt: { gte: foreignFloor } } }),
+      counted: await db.activityLog.count({ where: { ...foreignWhere, createdAt: { gte: foreignFloor, lte: now } } }),
       total: await db.activityLog.count({ where: foreignWhere }),
       unpaid: 0,
       floor: foreignFloor.toISOString(),
@@ -494,7 +494,7 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
   try {
     const windowStart = new Date(now.getTime() - windowDays * 86_400_000)
     const entries = await db.activityLog.findMany({
-      where: { action: INCUMBENT_EVIDENCE_UNRECORDED_ACTION, createdAt: { gte: windowStart } },
+      where: { action: INCUMBENT_EVIDENCE_UNRECORDED_ACTION, createdAt: { gte: windowStart, lte: now } },
       select: { metadata: true },
       orderBy: { createdAt: 'desc' },
       take: UNRECORDED_READ_LIMIT,
@@ -510,6 +510,8 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
       const paidMs = typeof meta.paidAt === 'string' ? Date.parse(meta.paidAt) : NaN
       if (!Number.isFinite(paidMs)) { counted += 1; continue }
       const relevant = (kinds.length === 0 ? WRITERS_CHECK_EVIDENCE_KEYS : (kinds as string[]).map((kind) => (kind in floors ? kind : null)))
+      // A paid time after the report instant is not a current claim either.
+      if (paidMs > now.getTime()) continue
       const anyAfter = relevant.some((kind) => kind === null || paidMs >= floors[kind as WritersCheckEvidenceKey].getTime())
       if (anyAfter) counted += 1
     }

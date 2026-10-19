@@ -38,8 +38,12 @@ test('classification: the bridge id, other bridge metas and the invoicing plugin
   assert.deepEqual(kinds([{ key: '_mintsoft_order_id', value: '' }, { key: '_mintsoft_order_id', value: null }, { key: '_mintsoft_order_id', value: 0 }, { key: '_mintsoft_order_id', value: ' 0 ' }]), [])
   // Not evidence: the PDF plugin's own number (the invoicing plugin only READS it) and unrelated keys.
   assert.deepEqual(kinds([{ key: '_wcpdf_invoice_number', value: '1001' }, { key: 'mintsoft_order_id', value: '5' }, { key: '_billing_vat', value: 'x' }]), [])
-  assert.deepEqual(kinds([{ key: '_mintsoft_order_id', value: '5' }, { key: 'xeroom_x', value: 'y' }, null, 3, { value: 'k' }, { key: 5, value: 'k' }]), ['MINTSOFT_ORDER_ID', 'XEROOM_MARKER'])
-  assert.deepEqual(kinds(undefined), [])
+  assert.deepEqual(kinds([{ key: '_mintsoft_order_id', value: '5' }, { key: 'xeroom_x', value: 'y' }, { key: 'other', value: 1 }]), ['MINTSOFT_ORDER_ID', 'XEROOM_MARKER'])
+  assert.deepEqual(kinds([]), [], 'a list that is present and holds no mark is legitimately empty')
+  assert.deepEqual(kinds([{ key: 'unrelated' }]), [], 'an unrelated key with no value field cannot be a mark')
+  // FAIL CLOSED: anything that cannot be shown to carry no mark is unreadable, never "empty".
+  const unreadable = (meta: unknown) => assert.equal(classifyIncumbentMeta(meta).ok, false, JSON.stringify(meta) ?? String(meta))
+  for (const meta of [undefined, null, {}, 'x', 5, [null], [3], [{ value: 'k' }], [{ key: 5, value: 'k' }], [[]], [{ key: '_mintsoft_order_id' }], [{ key: 'xeroom_x' }], [{ key: '_mintsoft_split_from' }], [{ key: 'unrelated', value: 1 }, 7]]) unreadable(meta)
   assert.equal(classifyIncumbentMeta({ not: 'a list' }).ok, false)
   assert.equal(classifyIncumbentMeta('text').ok, false)
 })
@@ -51,6 +55,7 @@ test('paid time: read as UTC (never the host zone); unpaid and unreadable are di
   assert.equal(at(readWcPaidTime('2026-10-05T10:00:00Z')), '2026-10-05T10:00:00.000Z')
   assert.equal(at(readWcPaidTime('2026-10-05T12:00:00+02:00')), '2026-10-05T10:00:00.000Z')
   assert.equal(at(readWcPaidTime(null)), 'unpaid')
+  assert.equal(at(readWcPaidTime(undefined)), 'unreadable', 'an absent field is a partial payload, not an unpaid order')
   assert.equal(at(readWcPaidTime('')), 'unpaid')
   for (const bad of ['yesterday', '2026-13-45T00:00:00', 12345, {}, '2026-10-05']) assert.equal(at(readWcPaidTime(bad)), 'unreadable', String(bad))
 })
@@ -149,4 +154,20 @@ test('background attempts are capped: past the cap an attempt is not started and
   release()
   await settleWcIncumbentEvidence()
   assert.equal(incumbentEvidenceStats.recorded, EVIDENCE_MAX_IN_FLIGHT)
+})
+
+test('recorder: a payload that cannot be proven to carry no marks is a GAP; a present list with no marks is not', async () => {
+  const gap = async (order: Record<string, unknown>) => {
+    const h = harness()
+    const result = await recordWcIncumbentEvidence(order as never, h.deps)
+    return { result, unrecorded: h.unrecorded.length, written: h.written.length }
+  }
+  for (const order of [{ id: 1, date_paid_gmt: '2026-10-15T10:00:00' }, { id: 2, meta_data: null, date_paid_gmt: '2026-10-15T10:00:00' }, { id: 3, meta_data: [null], date_paid_gmt: '2026-10-15T10:00:00' }]) {
+    assert.deepEqual(await gap(order), { result: { recorded: 0, unrecorded: true }, unrecorded: 1, written: 0 }, JSON.stringify(order))
+  }
+  // A marked order with no paid field at all is a gap (the paid time cannot be read); with no id it is a gap too.
+  assert.equal((await gap({ id: 4, meta_data: [{ key: '_mintsoft_order_id', value: '9' }] })).unrecorded, 1)
+  assert.equal((await gap({ meta_data: [{ key: '_mintsoft_order_id', value: '9' }], date_paid_gmt: '2026-10-15T10:00:00' })).unrecorded, 1)
+  assert.equal((await gap({ meta_data: [], date_paid_gmt: null })).unrecorded, 1)
+  assert.deepEqual(await gap({ id: 5, meta_data: [], date_paid_gmt: '2026-10-15T10:00:00' }), { result: { recorded: 0 }, unrecorded: 0, written: 0 })
 })
