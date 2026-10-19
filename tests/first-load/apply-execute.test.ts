@@ -56,27 +56,23 @@ describe('the executor', () => {
     calls.length = 0
     respond = () => ({ created: 1, updated: 0, skipped: 0, errors: [] })
     const { createExecutor, IMPORTER_RETURNED_NO_SYSTEM_OUTCOME } = await import('../../lib/first-load/apply/db/execute')
-    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1), NO_LOCK), new Error(IMPORTER_RETURNED_NO_SYSTEM_OUTCOME))
+    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1), NO_LOCK), { message: IMPORTER_RETURNED_NO_SYSTEM_OUTCOME })
   })
 
-  it('an importer that refuses the file itself (an error, no outcome) is an error to account for, not a thrown web-path call', async () => {
+  it('an importer that refuses the file itself (an error, no outcome) THROWS too: nothing it reports is accepted as an account of the file', async () => {
     calls.length = 0
     respond = () => ({ created: 0, updated: 0, skipped: 0, errors: [], error: 'File exceeds maximum size', success: false })
-    const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
-    const result = await createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1), NO_LOCK)
-    assert.deepEqual(result.errors, ['File exceeds maximum size'])
-    assert.equal(result.created, 0)
+    const { createExecutor, IMPORTER_RETURNED_NO_SYSTEM_OUTCOME } = await import('../../lib/first-load/apply/db/execute')
+    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op' })('suppliers', residual(1), NO_LOCK), { name: IMPORTER_RETURNED_NO_SYSTEM_OUTCOME })
   })
 
-  it('a result with an error but NO system outcome (a catch path after partial work) stops the file: no later call is made', async () => {
-    // Mutation named: keep going after such a result -> the later calls run against a state nobody accounted for: red.
+  it('a result with an error but NO system outcome (a catch path after partial work) throws: no later call is made, and the error text is not carried', async () => {
+    // Mutation named: return normally after such a result -> the core goes on to the next file of the step and can mark it DONE: red.
     calls.length = 0
     respond = (call) => (call === 2 ? { created: 1, updated: 0, skipped: 0, errors: ['Error: boom'], error: 'Error: boom', success: false } : { created: 1, updated: 0, skipped: 0, errors: [], system: outcome })
     const { createExecutor } = await import('../../lib/first-load/apply/db/execute')
-    const result = await createExecutor({ runId: 'run-1', operator: 'Op', maxRowsPerCall: 2 })('suppliers', residual(6), NO_LOCK)
+    await assert.rejects(createExecutor({ runId: 'run-1', operator: 'Op', maxRowsPerCall: 2 })('suppliers', residual(6), NO_LOCK), (error: Error) => !error.message.includes('boom'))
     assert.deepEqual(calls.map((c) => c.rows), [2, 2], 'the third call was never made')
-    assert.deepEqual(result.errors, ['Error: boom'])
-    assert.equal(result.created, 2, 'what the first two calls reported is kept')
   })
 
   it('a preview result is refused', async () => {

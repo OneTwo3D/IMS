@@ -1205,6 +1205,24 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       }
     })
 
+    const logTextForCatch = async (): Promise<string> => (await sql<{ t: string }>('select description as t from activity_logs')).map((r) => r.t).join('\n')
+    describe('the supplier importer\'s catch path', () => {
+      it('the real importer\'s catch-all returns an error without the system outcome, and the executor throws instead of returning it', async () => {
+        // Mutation named: return normally after a result without the system outcome -> this arm resolves instead of rejecting.
+        await resetData()
+        const file = stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'ZQ Catch Path Ltd', currency: 'GBP' }])
+        const keyed = keyStep('suppliers', file)
+        const execute = m.execute.createExecutor({ runId: 'catch', operator: 'Catch Test' })
+        const residual = buildResidual('suppliers', file, classifyStep('suppliers', keyed.units, { entries: [] }))[0]!
+        await sql('alter table suppliers rename to suppliers_zq_hidden') // the importer\'s first read fails: its own catch-all answers
+        try {
+          await assert.rejects(execute('suppliers', residual, NO_LOCK), { name: m.execute.IMPORTER_RETURNED_NO_SYSTEM_OUTCOME })
+        } finally { await sql('alter table suppliers_zq_hidden rename to suppliers') }
+        assert.ok(/Failed to import suppliers/.test(await logTextForCatch()), 'precondition: it was the importer\'s catch path that ran')
+        await resetData()
+      })
+    })
+
     describe('every table is classified: independent business tables refuse a first run and a resume', () => {
       // Mutation named: go back to counting six tables (and customers/sales orders on a resume) -> the stock-count and transfer arms are green when they must be red.
       const evaluate = (resuming: boolean) => m.rails.evaluateRails(prepared, resuming ? { phase: 'recheck', resuming: true, step: null } : { phase: 'preflight', resuming: false, step: null })

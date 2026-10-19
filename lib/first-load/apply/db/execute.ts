@@ -67,17 +67,15 @@ export function createExecutor(options: ExecutorOptions): ApplyPorts['execute'] 
       form.set('mode', 'execute')
       const result = await importer(form, system)
       if (result.preview === true) throw new Error(IMPORTER_RETURNED_A_PREVIEW)
-      // An importer that refuses the FILE itself (too large, no file) returns early with an error and no outcome: that is a failure to account for, not a web-path call.
-      if (result.system === undefined && result.error === undefined) throw new Error(IMPORTER_RETURNED_NO_SYSTEM_OUTCOME)
-      const noOutcome = result.system === undefined
+      // EVERY result without the system outcome throws, with or without an error text: the web path was taken, or the importer's catch path ran after work that may be partly written. The throw fails the
+      // step (the core records the failure in the journal and runs no later file of the step); what was written is accounted for from the database on the resume. Nothing the result carries is kept.
+      if (result.system === undefined) throw Object.assign(new Error(IMPORTER_RETURNED_NO_SYSTEM_OUTCOME), { name: IMPORTER_RETURNED_NO_SYSTEM_OUTCOME })
       total.created += result.created
       total.updated += result.updated
       total.skipped += result.skipped
       if (options.afterCall) await options.afterCall(step, call.index)
       const errors = result.error !== undefined && !result.errors.includes(result.error) ? [...result.errors, result.error] : result.errors
       for (const message of errors) total.errors.push(mapRows(message, call.rowNumbers))
-      // A result without the system outcome (its catch path, after work that may be partly written) stops the file: no later call runs. What was written is accounted for from the database on resume.
-      if (noOutcome) break
     }
     return total
   }

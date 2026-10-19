@@ -554,3 +554,27 @@ test('a rehearsal verdict that is not OK is refused with a fixed message: nothin
     assert.ok(!problems.join(';').includes(marker))
   }
 })
+
+test('an importer result without the system outcome ends the step FAILED and journals it, even when the database read-back matches the file; the step\'s second file is never sent', async () => {
+  // Mutation named: let the executor return normally after such a result -> the core sends file 2 and (the rows being there) marks the step DONE: red.
+  const { prepared, db, options } = setup()
+  // The suppliers step in two prepared chunks, so there are two residual files.
+  const split: typeof prepared = { ...prepared, steps: prepared.steps.map((st) => (st.step !== 'suppliers' ? st : { ...st, data: { ...st.data, rows: st.data.rows.map((r, i) => ({ ...r, chunk: i % 2 === 0 ? 1 : 2 })) } })) }
+  const sent: string[] = []
+  const real = db.ports()
+  const ports = db.ports({
+    execute: async (step, file, lock) => {
+      sent.push(`${step}:${file.name}`)
+      if (step !== 'suppliers') return real.execute(step, file, lock)
+      await real.execute(step, file, lock) // the rows ARE written ...
+      throw Object.assign(new Error('ImporterIgnoredSystemContext'), { name: 'ImporterIgnoredSystemContext' }) // ... and then the executor refuses the result
+    },
+  })
+  const result = await runLoad(split, ports, options())
+  assert.equal(result.exit, 'STEP_FAILED')
+  assert.deepEqual(sent, ['suppliers:residual-suppliers-001.csv'], 'file 2 and the later steps were never sent')
+  const step = result.steps.find((s) => s.step === 'suppliers')!
+  assert.equal(step.status, 'FAILED')
+  assert.deepEqual(step.importer[0].errors, [{ code: 'EXCEPTION', row: null }])
+  assert.equal(db.journalRecord?.steps.suppliers?.status, 'FAILED')
+})
