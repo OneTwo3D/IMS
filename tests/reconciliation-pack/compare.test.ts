@@ -126,7 +126,7 @@ test('a side not known complete never passes', () => {
 test('"looks empty": nothing compared is EMPTY_UNPROVEN unless positive evidence is supplied', () => {
   assert.deepEqual(compare({ ims: [], vendor: [] }), { status: 'unreadable', reason: 'EMPTY_UNPROVEN' })
   assert.equal(outcomeOfComparison(compare({ ims: [], vendor: [] })).outcome, 'inconclusive')
-  assert.equal(outcomeOfComparison(compare({ ims: [], vendor: [], allowEmpty: true })).outcome, 'pass')
+  assert.equal(outcomeOfComparison(compare({ ims: [], vendor: [], emptyProof: 'vendor-total-zero' })).outcome, 'pass')
   // everything outside the population is also "nothing compared"
   const outside = compare({ ims: [row('A', '1')], vendor: [row('A', '1')], population: new Set() })
   assert.deepEqual(outside, { status: 'unreadable', reason: 'EMPTY_UNPROVEN' })

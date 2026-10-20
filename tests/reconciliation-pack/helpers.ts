@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } f
 import path from 'node:path'
 
 import { compareKeyed, type CompareInput, type CompareResult } from '../../lib/reconciliation-pack/compare.ts'
-import { PACK_ITEM_IDS, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
+import { PACK_ITEM_IDS, getPackItem, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
 import { outcomeOfComparison } from '../../lib/reconciliation-pack/compare.ts'
 import type { ItemInput } from '../../lib/reconciliation-pack/report.ts'
 import type { KeyPart } from '../../lib/reconciliation-pack/identity.ts'
@@ -24,15 +24,19 @@ export const at = (minutes: number) => new Date(NOW.getTime() + minutes * 60_000
 
 export const key = (sku: string, warehouse = 'MAIN'): KeyPart[] => [{ kind: 'sku', raw: sku }, { kind: 'warehouse', raw: warehouse }]
 
+/** A pass that carries the proof, the sources and (with allBrackets) the stream stamps a real pass would. */
 export function passItem(id: PackItemId): ItemInput {
-  return { id, outcome: 'pass', reasons: [] }
+  return { id, outcome: 'pass', reasons: [], proof: { kind: 'proven-empty', source: 'snapshot-run-row-present' }, sources: [...getPackItem(id).sources] }
 }
+export const STAMP = '2026-10-19T00:00:00.000Z'
+export const allBrackets = (stamp: string = STAMP) => (['woocommerce-order-sweep', 'mintsoft-stock-sync', 'mintsoft-dispatch-poll', 'mintsoft-order-status', 'xero-balance-snapshots', 'xero-tax-rates'] as const).map((stream) => ({ stream, start: stamp, end: stamp }))
 
 /** An item input built from a real comparison, the way a runner will build one. */
 export function itemFromComparison(id: PackItemId, input: Partial<CompareInput> & Pick<CompareInput, 'ims' | 'vendor'>): { item: ItemInput; result: CompareResult } {
   const result = compareKeyed({ imsComplete: true, vendorComplete: true, tolerance: { rule: 'exact' }, ...input })
   const verdict = outcomeOfComparison(result)
-  return { item: { id, outcome: verdict.outcome, reasons: verdict.reasons, entries: result.status === 'compared' ? result.buckets : undefined }, result }
+  const proof = verdict.outcome === 'pass' && result.status === 'compared' ? result.proof : null
+  return { item: { id, outcome: verdict.outcome, reasons: verdict.reasons, proof, sources: [...getPackItem(id).sources], entries: result.status === 'compared' ? result.buckets : undefined }, result }
 }
 
 export function allFiles(dir: string): string[] {

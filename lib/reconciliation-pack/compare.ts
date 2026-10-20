@@ -26,6 +26,8 @@ import {
   FINDING_BUCKETS,
   PENDING_PERSISTENCE_RUNS,
   type ComparisonBucket,
+  type ItemProof,
+  type PackEmptyProofCode,
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, keyToken, type KeyPart, type SafeToken } from '@/lib/reconciliation-pack/identity'
@@ -126,8 +128,8 @@ export type CompareInput = {
   /** Positive evidence that each side was read to the end (not capped, not truncated, not a partial page). */
   imsComplete: boolean
   vendorComplete: boolean
-  /** Positive evidence that an empty comparison is the true answer (for example a vendor total of zero). */
-  allowEmpty?: boolean
+  /** Positive evidence, by name, that an empty comparison is the true answer (for example a vendor total of zero). */
+  emptyProof?: PackEmptyProofCode
   tolerance: Tolerance
   /** The recorded population, as canonical keys. Absent = everything is in. */
   population?: ReadonlySet<string>
@@ -138,7 +140,7 @@ export type CompareInput = {
 }
 
 export type CompareResult =
-  | { status: 'compared'; buckets: Record<ComparisonBucket, CompareEntry[]>; nextCarried: Map<string, CarriedDifference> }
+  | { status: 'compared'; buckets: Record<ComparisonBucket, CompareEntry[]>; nextCarried: Map<string, CarriedDifference>; proof: ItemProof }
   | { status: 'unreadable'; reason: PackReasonCode }
 
 function emptyBuckets(): Record<ComparisonBucket, CompareEntry[]> {
@@ -215,8 +217,9 @@ export function compareKeyed(input: CompareInput): CompareResult {
   }
 
   const compared = COMPARISON_BUCKETS.filter((bucket) => bucket !== 'outOfPopulation').reduce((sum, bucket) => sum + buckets[bucket].length, 0)
-  if (compared === 0 && !input.allowEmpty) return { status: 'unreadable', reason: 'EMPTY_UNPROVEN' }
-  return { status: 'compared', buckets, nextCarried }
+  if (compared === 0 && !input.emptyProof) return { status: 'unreadable', reason: 'EMPTY_UNPROVEN' }
+  const proof: ItemProof = compared === 0 ? { kind: 'proven-empty', source: input.emptyProof! } : { kind: 'compared' }
+  return { status: 'compared', buckets, nextCarried, proof }
 }
 
 /** Counts are DERIVED from the lists, every time. */

@@ -1,0 +1,185 @@
+import assert from 'node:assert/strict'
+import { existsSync, readdirSync } from 'node:fs'
+import path from 'node:path'
+import test, { after } from 'node:test'
+
+import { PACK_ITEM_IDS, PACK_LOCK_FILE, getPackItem, itemApplicability, type PackItemId, type PackReasonCode } from '../../lib/reconciliation-pack/constants.ts'
+import { defaultItems, newRunId } from '../../lib/reconciliation-pack/harness.ts'
+import { publishPackReport } from '../../lib/reconciliation-pack/publish.ts'
+import { ReportInvalid, buildReport, parseReport, sha256Hex, type ItemInput, type ReportInput, type StreamBracket } from '../../lib/reconciliation-pack/report.ts'
+import { readPackChain } from '../../lib/reconciliation-pack/trend.ts'
+import { NOW, STAMP, allBrackets, cleanup, itemFromComparison, key, passItem, scratchDir } from './helpers.ts'
+
+const bases: string[] = []
+after(() => cleanup(bases))
+
+const entry = (sku: string) => ({ key: sku as never, ims: '1', vendor: '1', delta: '0' })
+function input(items: ItemInput[], streams: StreamBracket[] = allBrackets(), phase: 'P0' | 'P1' | 'P2' = 'P1'): ReportInput {
+  return { runId: newRunId(NOW), systemIdentifier: 'ims-test', phase, asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items }
+}
+const base = (phase: 'P0' | 'P1' | 'P2' = 'P1') => defaultItems(phase)
+const put = (items: ItemInput[], next: ItemInput) => items.map((item) => (item.id === next.id ? next : item))
+const rejects = (items: ItemInput[], streams?: StreamBracket[], phase?: 'P0' | 'P1' | 'P2') => assert.throws(() => buildReport(input(items, streams, phase), 1, null), ReportInvalid)
+const accepts = (items: ItemInput[], streams?: StreamBracket[], phase?: 'P0' | 'P1' | 'P2') => assert.doesNotThrow(() => buildReport(input(items, streams, phase), 1, null))
+
+test('a pass with a proof, its exact sources and every dependent stream bracketed is accepted', () => {
+  accepts(put(base(), passItem('R1')))
+  accepts(put(base(), { ...passItem('R1'), proof: { kind: 'compared' }, entries: { bothEqual: [entry('A|MAIN')] } }))
+  accepts(put(base(), passItem('R3')))
+})
+
+test('a pass with NO proof is rejected: an empty or unreadable comparison cannot be a verified pass', () => {
+  rejects(put(base(), { ...passItem('R1'), proof: null }))
+  rejects(put(base(), { id: 'R1', outcome: 'pass', reasons: [] }))
+  // "compared" with nothing compared
+  rejects(put(base(), { ...passItem('R1'), proof: { kind: 'compared' } }))
+  rejects(put(base(), { ...passItem('R1'), proof: { kind: 'compared' }, entries: { outOfPopulation: [entry('A|MAIN')] } }))
+  // "proven-empty" while identities were compared, or with an invented proof source
+  rejects(put(base(), { ...passItem('R1'), entries: { bothEqual: [entry('A|MAIN')] } }))
+  rejects(put(base(), { ...passItem('R1'), proof: { kind: 'proven-empty', source: 'because I said so' as never } }))
+  rejects(put(base(), { ...passItem('R1'), proof: { kind: 'wishful' as never } }))
+})
+
+test('a pass names exactly its catalogue sources', () => {
+  const spec = getPackItem('R1').sources
+  rejects(put(base(), { ...passItem('R1'), sources: [] }))
+  rejects(put(base(), { ...passItem('R1'), sources: [spec[0]!] }))
+  rejects(put(base(), { ...passItem('R1'), sources: [...spec, 'qoblex-file'] }))
+  rejects(put(base(), { ...passItem('R1'), sources: ['ims-database', 'xero-api'] }))
+  rejects(put(base(), { ...passItem('R1'), sources: ['ims-database', 'mintsoft-api', 'not-a-source' as never] }))
+  rejects(put(base(), { ...passItem('R1'), sources: [...spec, spec[0]!] }))
+  rejects(put(base(), { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], sources: ['qoblex-file'] }))
+  rejects(put(base(), { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], sources: ['ims-database', 'ims-database'] }))
+})
+
+test('a pass needs an equal start and end stamp for EVERY stream the item depends on', () => {
+  const items = put(base(), passItem('R12'))
+  assert.deepEqual([...getPackItem('R12').streams].sort(), ['woocommerce-order-sweep', 'xero-tax-rates'])
+  accepts(items)
+  const without = (stream: string) => allBrackets().filter((b) => b.stream !== stream)
+  rejects(items, without('xero-tax-rates'))
+  rejects(items, without('woocommerce-order-sweep'))
+  rejects(items, [])
+  const patched = (stream: string, patch: Partial<StreamBracket>) => allBrackets().map((b) => (b.stream === stream ? { ...b, ...patch } : b))
+  rejects(items, patched('xero-tax-rates', { end: '2026-10-19T00:00:01.000Z' }))
+  rejects(items, patched('xero-tax-rates', { start: null }))
+  rejects(items, patched('woocommerce-order-sweep', { end: null }))
+  rejects(items, patched('woocommerce-order-sweep', { start: null, end: null }))
+  // a stream the item does NOT depend on does not matter; an item with no streams needs none
+  accepts(items, patched('mintsoft-stock-sync', { start: null, end: null }))
+  accepts(put(base(), passItem('R3')), [])
+})
+
+test('nothing but a pass carries a proof; a pass carries no reason, finding or unsettled identity', () => {
+  rejects(put(base(), { id: 'R3', outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'], proof: { kind: 'compared' } }))
+  rejects(put(base(), { id: 'R3', outcome: 'fail', reasons: ['DIFFERENCES'], proof: { kind: 'compared' } }))
+  rejects(put(base(), { ...passItem('R3'), reasons: ['DIFFERENCES'] }))
+  rejects(put(base(), { ...passItem('R3'), entries: { onlyIms: [entry('A|MAIN')] } }))
+  rejects(put(base(), { ...passItem('R3'), entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: [] } }] } }))
+})
+
+test('fail, inconclusive and not-applicable have invariants of their own', () => {
+  const R = (outcome: ItemInput['outcome'], reasons: PackReasonCode[], extra: Partial<ItemInput> = {}): ItemInput => ({ id: 'R3', outcome, reasons, ...extra })
+  // fail
+  rejects(put(base(), R('fail', ['READ_INCOMPLETE'])))
+  rejects(put(base(), R('fail', [])))
+  accepts(put(base(), R('fail', ['DIFFERENCES'])))
+  // a finding is always a fail with DIFFERENCES
+  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { onlyVendor: [entry('A|MAIN')] } })))
+  rejects(put(base(), R('fail', ['UNSETTLED_PENDING'], { entries: { onlyVendor: [entry('A|MAIN')] } })))
+  // inconclusive
+  rejects(put(base(), R('inconclusive', [])))
+  rejects(put(base(), R('inconclusive', ['DIFFERENCES'])))
+  accepts(put(base(), R('inconclusive', ['STALE_BASIS'])))
+  // UNSETTLED_PENDING and the unsettled count agree, in both directions
+  rejects(put(base(), R('inconclusive', ['UNSETTLED_PENDING'])))
+  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
+  accepts(put(base(), R('inconclusive', ['UNSETTLED_PENDING'], { entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
+  // NO_RUNNER is an inconclusive item with nothing listed
+  rejects(put(base(), R('fail', ['NO_RUNNER', 'DIFFERENCES'])))
+  rejects(put(base(), R('inconclusive', ['NO_RUNNER'], { entries: { excluded: [entry('A|MAIN')] } })))
+  accepts(put(base(), R('inconclusive', ['NO_RUNNER'])))
+  // PHASE_NOT_APPLICABLE belongs to not-applicable alone, and not-applicable reads and lists nothing
+  rejects(put(base(), R('inconclusive', ['PHASE_NOT_APPLICABLE'])))
+  rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'], sources: ['qoblex-file'] }))
+  rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'], entries: { excluded: [entry('A|MAIN')] } }))
+  rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE', 'NO_RUNNER'] }))
+  rejects(put(base('P1'), { id: 'R7', outcome: 'inconclusive', reasons: ['NO_RUNNER'] }))
+  rejects(put(base('P1'), { id: 'R7', outcome: 'pass', reasons: [], proof: { kind: 'compared' }, entries: { bothEqual: [entry('A|MAIN')] }, sources: ['ims-database', 'qoblex-file'] }))
+  // an unlisted source on a non-pass is also refused
+  rejects(put(base(), R('inconclusive', ['STALE_BASIS'], { sources: ['qoblex-file'] })))
+})
+
+test('a listed-only item is held to the same rules', () => {
+  assert.equal(itemApplicability('R2', 'P1'), 'listed-only')
+  rejects(put(base('P1'), { id: 'R2', outcome: 'pass', reasons: [] }))
+  accepts(put(base('P1'), passItem('R2')))
+})
+
+// ---- the reader holds the same line --------------------------------------------------------------------
+
+function goodRecord(): Record<string, any> { // eslint-disable-line @typescript-eslint/no-explicit-any
+  const items = base('P1').map((item) => (itemApplicability(item.id, 'P1') === 'not-applicable' ? item : passItem(item.id)))
+  const { body, markdown } = buildReport(input(items), 1, null)
+  return { ...JSON.parse(JSON.stringify(body)), companionMarkdownSha256: sha256Hex(markdown) }
+}
+const item = (record: Record<string, any>, id: PackItemId) => record.items.find((i: { id: string }) => i.id === id) // eslint-disable-line @typescript-eslint/no-explicit-any
+
+test('the reader accepts what the builder wrote', () => {
+  const parsed = parseReport(JSON.stringify(goodRecord()))
+  assert.equal(parsed.exitCode, 0)
+  assert.equal(parsed.items.filter((i) => i.outcome === 'pass').length, 12)
+})
+
+test('the reader rejects every way a pass can lose its footing, after the file is written', () => {
+  const mutations: Array<[string, (r: Record<string, any>) => void]> = [ // eslint-disable-line @typescript-eslint/no-explicit-any
+    ['proof removed', (r) => { item(r, 'R1').proof = null }],
+    ['compared with nothing compared', (r) => { item(r, 'R1').proof = { kind: 'compared' } }],
+    ['proof source invented', (r) => { item(r, 'R1').proof = { kind: 'proven-empty', source: 'trust me' } }],
+    ['proof with an extra field', (r) => { item(r, 'R1').proof = { kind: 'proven-empty', source: 'vendor-total-zero', note: 'x' } }],
+    ['sources emptied', (r) => { item(r, 'R1').sources = [] }],
+    ['a source added', (r) => { item(r, 'R1').sources = [...item(r, 'R1').sources, 'qoblex-file'] }],
+    ['a source invented', (r) => { item(r, 'R1').sources = ['ims-database', 'mintsoft-api', 'a-website'] }],
+    ['a dependent stream removed', (r) => { r.streams = r.streams.filter((s: { stream: string }) => s.stream !== 'mintsoft-stock-sync') }],
+    ['a stream bracket moved', (r) => { r.streams.find((s: { stream: string }) => s.stream === 'xero-balance-snapshots').end = '2026-10-19T00:00:01.000Z' }],
+    ['a stream bracket nulled', (r) => { r.streams.find((s: { stream: string }) => s.stream === 'xero-tax-rates').start = null }],
+    ['a reason on a pass', (r) => { item(r, 'R3').reasons = ['NO_RUNNER'] }],
+    ['a proof on a not-applicable item', (r) => { item(r, 'R7').proof = { kind: 'compared' } }],
+    ['sources on a not-applicable item', (r) => { item(r, 'R7').sources = ['qoblex-file'] }],
+    ['proof key missing', (r) => { delete item(r, 'R1').proof }],
+    ['sources key missing', (r) => { delete item(r, 'R1').sources }],
+  ]
+  for (const [name, mutate] of mutations) {
+    const record = goodRecord()
+    mutate(record)
+    assert.throws(() => parseReport(JSON.stringify(record)), ReportInvalid, name)
+  }
+  // the unmutated record still parses (the mutations, not the fixture, are what fail)
+  assert.doesNotThrow(() => parseReport(JSON.stringify(goodRecord())))
+})
+
+test('the reader rejects the other states the builder rejects', () => {
+  const mutations: Array<[string, (r: Record<string, any>) => void]> = [ // eslint-disable-line @typescript-eslint/no-explicit-any
+    ['fail without DIFFERENCES', (r) => { Object.assign(item(r, 'R3'), { outcome: 'fail', reasons: ['READ_INCOMPLETE'], proof: null }); r.summary = { pass: 11, fail: 1, inconclusive: 0, notApplicable: 3 }; r.exitCode = 1 }],
+    ['inconclusive with DIFFERENCES', (r) => { Object.assign(item(r, 'R3'), { outcome: 'inconclusive', reasons: ['DIFFERENCES'], proof: null }); r.summary = { pass: 11, fail: 0, inconclusive: 1, notApplicable: 3 }; r.exitCode = 5 }],
+    ['UNSETTLED_PENDING with nothing unsettled', (r) => { Object.assign(item(r, 'R3'), { outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], proof: null }); r.summary = { pass: 11, fail: 0, inconclusive: 1, notApplicable: 3 }; r.exitCode = 5 }],
+    ['PHASE_NOT_APPLICABLE on an applicable item', (r) => { Object.assign(item(r, 'R3'), { outcome: 'inconclusive', reasons: ['PHASE_NOT_APPLICABLE'], proof: null }); r.summary = { pass: 11, fail: 0, inconclusive: 1, notApplicable: 3 }; r.exitCode = 5 }],
+    ['a stale exit code', (r) => { r.exitCode = 5 }],
+    ['a stale summary', (r) => { r.summary.pass = 3 }],
+  ]
+  for (const [name, mutate] of mutations) {
+    const record = goodRecord()
+    mutate(record)
+    assert.throws(() => parseReport(JSON.stringify(record)), ReportInvalid, name)
+  }
+})
+
+test('the publisher refuses an unproven pass: nothing is written, the lock is released, the chain is untouched', () => {
+  const dir = path.join(scratchDir(bases), 'reports')
+  const bad = put(base(), { id: 'R3', outcome: 'pass', reasons: [] })
+  assert.throws(() => publishPackReport(dir, input(bad)), ReportInvalid)
+  assert.equal(existsSync(path.join(dir, PACK_LOCK_FILE)), false)
+  assert.deepEqual(readdirSync(dir).filter((n) => !n.startsWith('.')), [])
+  assert.equal(readPackChain(dir).ok, true)
+  void itemFromComparison; void key; void PACK_ITEM_IDS
+})

@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto'
 
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
 import { READ_SYNC_STREAM_IDS, type ReadSyncStreamId } from '@/lib/ops/read-sync-liveness-constants'
-import { isStreamStamp, type CompareEntry, parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
+import { bracketStable, isStreamStamp, type CompareEntry, parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
 import {
   COMPARISON_BUCKETS,
   FINDING_BUCKETS,
@@ -28,11 +28,15 @@ import {
   PACK_APPLICABILITY,
   SYSTEM_IDENTIFIER_RE,
   getPackItem,
+  isPackEmptyProofCode,
   isPackReasonCode,
+  isPackSourceCode,
   itemApplicability,
   packExitCode,
   type ComparisonBucket,
+  type ItemProof,
   type PackApplicability,
+  type PackSourceCode,
   type PackItemId,
   type PackOutcome,
   type PackReasonCode,
@@ -51,6 +55,10 @@ export type ItemInput = {
   id: PackItemId
   outcome: PackOutcome
   reasons: readonly PackReasonCode[]
+  /** Required for a pass (see checkItemConsistency); null/absent otherwise. */
+  proof?: ItemProof | null
+  /** The sources the item read; a pass must name exactly its catalogue row's. */
+  sources?: readonly PackSourceCode[]
   entries?: Partial<Record<ComparisonBucket, readonly CompareEntry[]>>
 }
 
@@ -72,6 +80,8 @@ export type ItemResult = {
   applicability: PackApplicability
   outcome: PackOutcome
   reasons: PackReasonCode[]
+  proof: ItemProof | null
+  sources: PackSourceCode[]
   counts: Record<ComparisonBucket, number>
   bothEqualSha256: string | null
   evidenceLines: number
@@ -161,21 +171,60 @@ function itemEvidence(item: ItemInput): { lines: string[]; counts: Record<Compar
   return { lines, counts, cut }
 }
 
-function checkItemConsistency(input: ItemInput, applicability: PackApplicability, counts: Record<ComparisonBucket, number>, cut: boolean): PackReasonCode[] {
-  if (!(PACK_OUTCOMES as readonly string[]).includes(input.outcome)) throw new ReportInvalid(`item ${input.id}: unknown outcome`)
-  for (const reason of input.reasons) if (!isPackReasonCode(reason)) throw new ReportInvalid(`item ${input.id}: unknown reason code`)
+/** The item record every reader and writer accepts: one place, so the builder and the reader cannot drift apart. */
+export type ItemRecordView = { id: PackItemId; outcome: PackOutcome; reasons: readonly PackReasonCode[]; proof: ItemProof | null; sources: readonly PackSourceCode[] }
+
+function sameSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && [...left].sort().every((value, index) => value === [...right].sort()[index])
+}
+
+export function checkItemConsistency(input: ItemRecordView, applicability: PackApplicability, counts: Record<ComparisonBucket, number>, cut: boolean, streams: readonly StreamBracket[]): PackReasonCode[] {
+  const fail = (why: string): never => { throw new ReportInvalid(`item ${input.id}: ${why}`) }
+  if (!(PACK_OUTCOMES as readonly string[]).includes(input.outcome)) fail('unknown outcome')
+  for (const reason of input.reasons) if (!isPackReasonCode(reason)) fail('unknown reason code')
+  if (!input.sources.every(isPackSourceCode) || new Set(input.sources).size !== input.sources.length) fail('unknown or repeated source')
+  const spec = getPackItem(input.id)
+  if (!input.sources.every((source) => spec.sources.includes(source))) fail('a source the catalogue does not list for this item')
   const reasons = [...new Set(input.reasons)]
   const findings = FINDING_BUCKETS.reduce((sum, bucket) => sum + counts[bucket], 0)
+  const everything = COMPARISON_BUCKETS.reduce((sum, bucket) => sum + counts[bucket], 0)
+  const has = (code: PackReasonCode) => reasons.includes(code)
+
+  // Reason/count coupling that holds for every outcome.
+  if (has('PHASE_NOT_APPLICABLE') !== (input.outcome === 'not-applicable')) fail('PHASE_NOT_APPLICABLE belongs to not-applicable and nothing else')
+  if (has('UNSETTLED_PENDING') !== (counts.unsettled > 0)) fail('UNSETTLED_PENDING and the unsettled count must agree')
+  if (has('NO_RUNNER') && (input.outcome !== 'inconclusive' || everything !== 0)) fail('NO_RUNNER is an inconclusive item with nothing listed')
+  if (findings > 0 && (input.outcome !== 'fail' || !has('DIFFERENCES'))) fail('a finding makes the item a fail with DIFFERENCES')
+  if (input.proof !== null && input.outcome !== 'pass') fail('only a pass carries a proof')
+
   if (applicability === 'not-applicable') {
-    if (input.outcome !== 'not-applicable' || reasons.length !== 1 || reasons[0] !== 'PHASE_NOT_APPLICABLE') throw new ReportInvalid(`item ${input.id}: the phase does not apply it, so it must be not-applicable with PHASE_NOT_APPLICABLE`)
+    if (input.outcome !== 'not-applicable' || reasons.length !== 1) fail('the phase does not apply it, so it must be not-applicable with PHASE_NOT_APPLICABLE only')
   } else if (input.outcome === 'not-applicable') {
-    throw new ReportInvalid(`item ${input.id}: the phase applies it, so it cannot be not-applicable`)
+    fail('the phase applies it, so it cannot be not-applicable')
   }
-  if (input.outcome === 'pass' && (reasons.length > 0 || findings > 0 || counts.unsettled > 0)) throw new ReportInvalid(`item ${input.id}: a pass carries no reason, finding or unsettled identity`)
-  if ((input.outcome === 'fail' || input.outcome === 'inconclusive') && reasons.length === 0) throw new ReportInvalid(`item ${input.id}: ${input.outcome} needs a reason code`)
-  if (input.outcome === 'fail' && findings === 0 && !reasons.some((reason) => reason !== 'UNSETTLED_PENDING')) throw new ReportInvalid(`item ${input.id}: a fail names a finding or a reason`)
+  if (input.outcome === 'not-applicable' && (everything !== 0 || input.sources.length !== 0)) fail('a not-applicable item lists nothing and reads nothing')
+
+  if (input.outcome === 'pass') {
+    if (reasons.length > 0) fail('a pass carries no reason')
+    if (counts.unsettled > 0) fail('a pass has nothing unsettled')
+    const proof = input.proof
+    if (proof === null) throw new ReportInvalid(`item ${input.id}: a pass needs a proof: identities compared, or a named proof that empty is true`)
+    if (proof.kind !== 'compared' && proof.kind !== 'proven-empty') fail('unknown proof kind')
+    if (proof.kind === 'compared' && counts.bothEqual === 0) fail('a "compared" proof needs at least one identity compared and equal')
+    if (proof.kind === 'proven-empty' && (counts.bothEqual !== 0 || !isPackEmptyProofCode(proof.source))) fail('a "proven-empty" proof needs nothing compared and a named proof source')
+    if (!sameSet(input.sources, spec.sources)) fail('a pass names exactly the sources its catalogue row lists')
+    for (const stream of spec.streams) {
+      const bracket = streams.find((entry) => entry.stream === stream)
+      if (!bracket || !bracketStable(bracket.start, bracket.end)) fail(`a pass needs an equal start and end stamp for stream ${stream}`)
+    }
+  } else if (input.outcome === 'fail') {
+    if (!has('DIFFERENCES')) fail('a fail names DIFFERENCES')
+  } else if (input.outcome === 'inconclusive') {
+    if (reasons.length === 0) fail('inconclusive needs a reason code')
+    if (has('DIFFERENCES')) fail('an inconclusive item reports no difference')
+  }
   if (cut) {
-    if (input.outcome === 'pass') throw new ReportInvalid(`item ${input.id}: a capped listing cannot pass`)
+    if (input.outcome === 'pass') fail('a capped listing cannot pass')
     if (!reasons.includes('CAP_EXCEEDED')) reasons.push('CAP_EXCEEDED')
   }
   return reasons
@@ -205,10 +254,12 @@ export function buildReport(input: ReportInput, sequence: number, previousReport
     const item = byId.get(id)!
     const applicability = itemApplicability(id, input.phase)
     const evidence = itemEvidence(item)
-    const reasons = checkItemConsistency(item, applicability, evidence.counts, evidence.cut)
+    const proof = item.proof ?? null
+    const sources = [...(item.sources ?? [])].sort()
+    const reasons = checkItemConsistency({ id, outcome: item.outcome, reasons: item.reasons, proof, sources }, applicability, evidence.counts, evidence.cut, streams)
     const outcome = item.outcome
     evidenceLines.push(...evidence.lines)
-    return { id, applicability, outcome, reasons, counts: evidence.counts, bothEqualSha256: equalDigest(item.entries?.bothEqual ?? []), evidenceLines: evidence.lines.length }
+    return { id, applicability, outcome, reasons, proof, sources, counts: evidence.counts, bothEqualSha256: equalDigest(item.entries?.bothEqual ?? []), evidenceLines: evidence.lines.length }
   })
   const evidenceText = evidenceLines.length ? `${evidenceLines.join('\n')}\n` : ''
   const body: ReportBody = {
@@ -242,10 +293,10 @@ export function renderMarkdown(body: ReportBody): string {
   out.push(`- Summary: ${body.summary.pass} pass, ${body.summary.fail} fail, ${body.summary.inconclusive} inconclusive, ${body.summary.notApplicable} not-applicable`)
   out.push(`- Exit code: ${body.exitCode}`, '')
   out.push('This report renders no overall verdict; the readiness gate decides. Identities are in the evidence file only, as sanitised tokens.', '')
-  out.push('| Item | Title | Phase applicability | Outcome | Reasons | onlyIms | onlyVendor | bothEqual | bothDiffer | unsettled | outOfPopulation | excluded |', '|---|---|---|---|---|---|---|---|---|---|---|---|')
+  out.push('| Item | Title | Phase applicability | Outcome | Proof | Sources | Reasons | onlyIms | onlyVendor | bothEqual | bothDiffer | unsettled | outOfPopulation | excluded |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
   for (const item of body.items) {
     const c = item.counts
-    out.push(`| ${item.id} | ${getPackItem(item.id).title} | ${item.applicability} | ${item.outcome} | ${item.reasons.join(', ') || '-'} | ${c.onlyIms} | ${c.onlyVendor} | ${c.bothEqual} | ${c.bothDiffer} | ${c.unsettled} | ${c.outOfPopulation} | ${c.excluded} |`)
+    out.push(`| ${item.id} | ${getPackItem(item.id).title} | ${item.applicability} | ${item.outcome} | ${item.proof ? (item.proof.kind === 'compared' ? 'compared' : `proven-empty (${item.proof.source})`) : '-'} | ${item.sources.join(', ') || '-'} | ${item.reasons.join(', ') || '-'} | ${c.onlyIms} | ${c.onlyVendor} | ${c.bothEqual} | ${c.bothDiffer} | ${c.unsettled} | ${c.outOfPopulation} | ${c.excluded} |`)
   }
   out.push('', '| Stream | Stamp at start | Stamp at end |', '|---|---|---|')
   for (const s of body.streams) out.push(`| ${s.stream} | ${s.start ?? 'none'} | ${s.end ?? 'none'} |`)
@@ -258,7 +309,7 @@ export function renderMarkdown(body: ReportBody): string {
 // ---------------------------------------------------------------------------------------------
 
 const BODY_KEYS = ['schemaVersion', 'kind', 'runId', 'systemIdentifier', 'phase', 'asOf', 'startedAt', 'finishedAt', 'sequence', 'previousReportSha256', 'streams', 'items', 'summary', 'exitCode', 'evidence', 'companionMarkdownSha256']
-const ITEM_KEYS = ['id', 'applicability', 'outcome', 'reasons', 'counts', 'bothEqualSha256', 'evidenceLines']
+const ITEM_KEYS = ['id', 'applicability', 'outcome', 'reasons', 'proof', 'sources', 'counts', 'bothEqualSha256', 'evidenceLines']
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -307,6 +358,15 @@ export function parseReport(text: string): ReportRecord {
     if (entry.applicability !== applicability || !(PACK_APPLICABILITY as readonly string[]).includes(entry.applicability as string)) throw new ReportInvalid(`item ${id}: applicability does not match the catalogue`)
     if (typeof entry.outcome !== 'string' || !(PACK_OUTCOMES as readonly string[]).includes(entry.outcome)) throw new ReportInvalid(`item ${id}: bad outcome`)
     if (!Array.isArray(entry.reasons) || !entry.reasons.every(isPackReasonCode) || new Set(entry.reasons).size !== entry.reasons.length) throw new ReportInvalid(`item ${id}: bad reasons`)
+    let proof: ItemProof | null = null
+    if (entry.proof !== null) {
+      if (!isRecord(entry.proof)) throw new ReportInvalid(`item ${id}: bad proof`)
+      if (entry.proof.kind === 'compared') { exactKeys(entry.proof, ['kind'], 'a proof'); proof = { kind: 'compared' } }
+      else if (entry.proof.kind === 'proven-empty' && isPackEmptyProofCode(entry.proof.source)) { exactKeys(entry.proof, ['kind', 'source'], 'a proof'); proof = { kind: 'proven-empty', source: entry.proof.source } }
+      else throw new ReportInvalid(`item ${id}: bad proof`)
+    }
+    if (!Array.isArray(entry.sources) || !entry.sources.every(isPackSourceCode)) throw new ReportInvalid(`item ${id}: bad sources`)
+    const sources = entry.sources as PackSourceCode[]
     if (!isRecord(entry.counts)) throw new ReportInvalid(`item ${id}: bad counts`)
     exactKeys(entry.counts, COMPARISON_BUCKETS, 'counts')
     const counts = Object.fromEntries(COMPARISON_BUCKETS.map((bucket) => {
@@ -317,9 +377,9 @@ export function parseReport(text: string): ReportRecord {
     if (entry.bothEqualSha256 !== null && !(typeof entry.bothEqualSha256 === 'string' && SHA256_RE.test(entry.bothEqualSha256))) throw new ReportInvalid(`item ${id}: bad bothEqualSha256`)
     if ((entry.bothEqualSha256 === null) !== (counts.bothEqual === 0)) throw new ReportInvalid(`item ${id}: bothEqual count and digest disagree`)
     if (typeof entry.evidenceLines !== 'number' || entry.evidenceLines !== LISTED_BUCKETS.reduce((sum, bucket) => sum + counts[bucket], 0)) throw new ReportInvalid(`item ${id}: evidenceLines is not the sum of the listed counts`)
-    const result: ItemResult = { id, applicability, outcome: entry.outcome as PackOutcome, reasons: entry.reasons as PackReasonCode[], counts, bothEqualSha256: entry.bothEqualSha256 as string | null, evidenceLines: entry.evidenceLines }
+    const result: ItemResult = { id, applicability, outcome: entry.outcome as PackOutcome, reasons: entry.reasons as PackReasonCode[], proof, sources, counts, bothEqualSha256: entry.bothEqualSha256 as string | null, evidenceLines: entry.evidenceLines }
     // The same consistency rules the builder applies.
-    checkItemConsistency({ id, outcome: result.outcome, reasons: result.reasons }, applicability, counts, false)
+    checkItemConsistency({ id, outcome: result.outcome, reasons: result.reasons, proof, sources }, applicability, counts, false, streams)
     return result
   })
 

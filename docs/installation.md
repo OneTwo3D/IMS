@@ -1624,6 +1624,29 @@ Each item ends in exactly one outcome.
 | inconclusive | the claim could not be proven either way (unreadable, incomplete, stale or still settling); never a pass, and the gate reads it as unreadable |
 | not-applicable | the claim does not apply in this phase; the gate reads it as not available |
 <!-- /reconciliation-pack:outcomes -->
+### What a pass must prove
+
+<!-- reconciliation-pack:proof -->
+An outcome of pass is only accepted, when a report is written and again when it is read back, if the item record proves it. A pass must carry all of: a proof that at least one identity was compared (bothEqual above zero, with nothing on one side only, differing or unsettled), or the name of the evidence that an empty population is the true one; exactly the sources its catalogue row lists; a start and an end stamp, equal to each other, for every stream the item depends on; no reason code. A fail names a difference; an inconclusive item names why it could not be proven and lists no finding; a not-applicable item is the phase's doing alone and carries nothing. Any other combination makes the report invalid and a reader refuses it.
+
+| Source code | Meaning |
+|---|---|
+| ims-database | the IMS database, read in one read-only transaction |
+| ims-ledger | the IMS accounting subledger as of the cycle date |
+| invariant-report | the IMS invariant report |
+| mintsoft-api | Mintsoft (GET only) |
+| woocommerce-api | WooCommerce (GET only) |
+| xero-api | Xero (GET only) |
+| xero-trial-balance | the stored Xero trial-balance snapshot |
+| qoblex-file | the Qoblex export file named in its manifest |
+
+| Empty-population proof | Meaning |
+|---|---|
+| snapshot-run-row-present | the as-of snapshot run row exists and records no rows for the population |
+| per-status-total-zero | every enumerated status reported a vendor total of zero, read twice |
+| vendor-total-zero | the vendor reported a total of zero for the whole population |
+| invariant-report-clean | the invariant report ran to the end and lists no finding |
+<!-- /reconciliation-pack:proof -->
 ### Reason codes
 
 <!-- reconciliation-pack:reasons -->
@@ -1663,10 +1686,12 @@ A run is refused, and the trend reader refuses a directory, with exactly one of 
 | FORK | two reports claim the same sequence or the same predecessor |
 | LINK_BROKEN | a report's previousReportSha256 is not the digest of the report before it |
 | SYSTEM_MISMATCH | the chain mixes reports of different system identifiers |
-| LOCK_HELD | another run holds the run lock |
+| LOCK_HELD | another run holds the run lock (a live holder is never displaced, however old its lock) |
 | LOCK_UNREADABLE | the run lock exists but cannot be read or understood, so it was not taken |
 | LOCK_STALE_CONTENDED | a stale lock is being reclaimed by another run, or a reclaim guard was left behind |
+| LOCK_UNPROVABLE | the run lock exists but its holder cannot be shown dead (no process identity on this host, or a lock written without one); an operator must check the holder and remove the lock by hand |
 | LOCK_ERROR | the run lock could not be created |
+| SEQUENCE_CLAIMED | the next sequence number already has a claim file (a run committed it, or died after claiming it); an operator must check the report directory |
 | LOCK_LOST | the run lock was no longer this run's at the moment of commit, so nothing was published |
 | WRITE_FAILED | a report file could not be written or renamed |
 <!-- /reconciliation-pack:refusals -->
@@ -1675,23 +1700,23 @@ A run is refused, and the trend reader refuses a directory, with exactly one of 
 <!-- reconciliation-pack:items -->
 The catalogue. Tolerances are chosen defaults (owner decisions D1 and D2); an exact quantity comparison allows 0.0001.
 
-| Item | Claim | Exactness | Tolerance | Cadence | Phases | Dependent streams | Population |
-|---|---|---|---|---|---|---|---|
-| R1 | IMS stock_levels equal Mintsoft on-hand per (SKU, bound warehouse) | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | daily | P0 not-applicable, P1 applicable, P2 applicable | mintsoft-stock-sync | the SKUs and warehouses IMS has bound to Mintsoft, while Mintsoft alignment is unconfirmed |
-| R2 | IMS equals Qoblex StockOnHand per non-3PL location | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 listed-only, P2 applicable | none | the non-3PL locations named in the Qoblex export manifest |
-| R3 | StockLevel.quantity equals the sum of CostLayer.remainingQty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | every stock level the invariant report examined |
-| R4 | StockLevel.reservedQty equals the sum of OrderAllocation.qty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | every stock level the invariant report examined |
-| R5 | inventory valuation per warehouse and company equals Qoblex | tolerance | composite-max-abs-or-relative: max(GBP 1, 0.0005 of the larger total) (owner decision D2 and unverified formula U14) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | the warehouses and companies named in the Qoblex export manifest |
-| R6 | the IMS inventory subledger as of the cycle date equals Xero Inventory plus Allocated Inventory | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | the accounts configured for inventory and allocated inventory |
-| R7 | open purchase orders equal Qoblex Incoming (set exact, value exact in GBP, GBP 1 across FX) | set-exact-value-tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | the open purchase orders in the Qoblex export manifest |
-| R8 | outstanding quantity of part-received purchase-order lines equals Qoblex Incoming | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | the open purchase-order lines in the Qoblex export manifest |
-| R9 | open sales orders equal WooCommerce by order id (set exact, value within one minor unit of the order currency) | set-exact-value-tolerance | order-currency-minor-unit: 1 minor unit (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | woocommerce-order-sweep | the order statuses enumerated one by one, walked twice |
-| R10 | Xero control accounts (Inventory, Allocated, Transit) agree with IMS, and no IMS-originated posting reached COGS or Unearned Revenue | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | the configured control accounts; postings since the P0 start |
-| R11 | Stock in Transit equals the open-purchase-order transit schedule, and the transit account differs from the allocated account | tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | xero-balance-snapshots | the open purchase orders with goods in transit |
-| R12 | VAT per (country, reporting category, period) agrees across IMS, Xero and WooCommerce | set-exact-value-tolerance | absolute: 0.05 (owner decision D1) | monthly | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates, woocommerce-order-sweep | the closed reporting periods inside the budgeted window |
-| R13 | every WooCommerce and Xero tax rate is mapped | presence | none: - (a count of identities, not a measure) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates | the full tax-rate lists of both systems |
-| R14 | every SKU is present in Qoblex, WooCommerce, Mintsoft and IMS, except the written exclusions | presence | none: - (a count of identities, not a measure) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | the union of the four systems minus unexpired written exclusions |
-| R15 | the invariant report shows zero critical findings and every warning is accepted in writing | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | the whole invariant report |
+| Item | Claim | Exactness | Tolerance | Cadence | Phases | Dependent streams | Sources | Population |
+|---|---|---|---|---|---|---|---|---|
+| R1 | IMS stock_levels equal Mintsoft on-hand per (SKU, bound warehouse) | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | daily | P0 not-applicable, P1 applicable, P2 applicable | mintsoft-stock-sync | ims-database, mintsoft-api | the SKUs and warehouses IMS has bound to Mintsoft, while Mintsoft alignment is unconfirmed |
+| R2 | IMS equals Qoblex StockOnHand per non-3PL location | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 listed-only, P2 applicable | none | ims-database, qoblex-file | the non-3PL locations named in the Qoblex export manifest |
+| R3 | StockLevel.quantity equals the sum of CostLayer.remainingQty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | invariant-report | every stock level the invariant report examined |
+| R4 | StockLevel.reservedQty equals the sum of OrderAllocation.qty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | invariant-report | every stock level the invariant report examined |
+| R5 | inventory valuation per warehouse and company equals Qoblex | tolerance | composite-max-abs-or-relative: max(GBP 1, 0.0005 of the larger total) (owner decision D2 and unverified formula U14) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | ims-database, qoblex-file | the warehouses and companies named in the Qoblex export manifest |
+| R6 | the IMS inventory subledger as of the cycle date equals Xero Inventory plus Allocated Inventory | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | ims-ledger, xero-trial-balance | the accounts configured for inventory and allocated inventory |
+| R7 | open purchase orders equal Qoblex Incoming (set exact, value exact in GBP, GBP 1 across FX) | set-exact-value-tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | ims-database, qoblex-file | the open purchase orders in the Qoblex export manifest |
+| R8 | outstanding quantity of part-received purchase-order lines equals Qoblex Incoming | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | ims-database, qoblex-file | the open purchase-order lines in the Qoblex export manifest |
+| R9 | open sales orders equal WooCommerce by order id (set exact, value within one minor unit of the order currency) | set-exact-value-tolerance | order-currency-minor-unit: 1 minor unit (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | woocommerce-order-sweep | ims-database, woocommerce-api | the order statuses enumerated one by one, walked twice |
+| R10 | Xero control accounts (Inventory, Allocated, Transit) agree with IMS, and no IMS-originated posting reached COGS or Unearned Revenue | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | ims-ledger, xero-trial-balance | the configured control accounts; postings since the P0 start |
+| R11 | Stock in Transit equals the open-purchase-order transit schedule, and the transit account differs from the allocated account | tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | xero-balance-snapshots | ims-database, xero-trial-balance | the open purchase orders with goods in transit |
+| R12 | VAT per (country, reporting category, period) agrees across IMS, Xero and WooCommerce | set-exact-value-tolerance | absolute: 0.05 (owner decision D1) | monthly | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates, woocommerce-order-sweep | ims-ledger, xero-api, woocommerce-api | the closed reporting periods inside the budgeted window |
+| R13 | every WooCommerce and Xero tax rate is mapped | presence | none: - (a count of identities, not a measure) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates | woocommerce-api, xero-api | the full tax-rate lists of both systems |
+| R14 | every SKU is present in Qoblex, WooCommerce, Mintsoft and IMS, except the written exclusions | presence | none: - (a count of identities, not a measure) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | ims-database, qoblex-file, woocommerce-api, mintsoft-api | the union of the four systems minus unexpired written exclusions |
+| R15 | the invariant report shows zero critical findings and every warning is accepted in writing | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | invariant-report | the whole invariant report |
 <!-- /reconciliation-pack:items -->
 ### Settling a difference
 
@@ -1701,7 +1726,7 @@ A difference is not a failure the first time it is seen: a vendor can lag. A key
 ### The report chain and the run lock
 
 <!-- reconciliation-pack:chain -->
-Reports are ordered by `sequence` (1, 2, 3, ...) and linked by `previousReportSha256` (null for sequence 1), never by timestamp. A run takes the run lock (`.run.lock` in the report directory, created exclusively with its pid, host and a random token) before it reads the chain and holds it until the report is committed; the lock is checked again immediately before the JSON is renamed into place. A lock held by a live process, or by another host, is never taken: the run is refused. A lock of a process on this host that no longer exists, or older than 6 hours, is reclaimed through a second exclusive file so two reclaimers cannot both win.
+Reports are ordered by `sequence` (1, 2, 3, ...) and linked by `previousReportSha256` (null for sequence 1), never by timestamp. A run takes the run lock (`.run.lock` in the report directory, created exclusively with its pid, host and a random token) before it reads the chain and holds it until the report is committed; the lock is checked again immediately before the JSON is put into place. A lock is reclaimed only when its holder is provably dead: on this host the holder's process entry is gone, or its start time or the boot id differs from the ones the lock recorded (the pid was reused or the machine rebooted). A live holder is never displaced, however old its lock, and a lock from another host is never taken; where death cannot be proven (no process table, a lock without an identity, an unreadable lock) the run is refused and an operator decides. Reclaiming goes through a second exclusive file so two reclaimers cannot both win. At the commit the run also claims the sequence number with an exclusive file (`.seq-<n>`) and the JSON is linked into place without overwriting, so even a displaced holder cannot place a second commit record for a sequence that is taken.
 
 The trend reader verifies every pair (trusted files only, sha256 of the Markdown and the evidence, derived counts, derived outcome and exit code), then the chain: a missing sequence number is a gap and is refused, two reports with the same sequence or the same predecessor are a fork and are refused, and a link whose digest does not match is refused. It reads at most 5000 reports and refuses more. NOT defended: deleting the newest report or reports (the shorter chain is still a valid chain), and an account that can write as the report owner or as root.
 <!-- /reconciliation-pack:chain -->
@@ -1731,6 +1756,7 @@ The failure classes earlier reviews kept finding, and the guard for each. Every 
 | an aggregate or count standing in for identity | comparison is keyed; equal counts with one identity swapped fail (onlyIms plus onlyVendor); counts are derived from the lists and the reader recomputes them |
 | "looks empty so skipped" | empty on both sides is EMPTY_UNPROVEN unless positive evidence is supplied; a run in which nothing passed exits 5, never 0 |
 | ordering inferred from timestamps | the chain is ordered by sequence and linked by digest; settling uses equality of distinct last-success stamps and never compares two stamps for order |
+| a pass resting on nothing (empty, unbracketed or unattributed) | in the builder AND the reader a pass must carry a proof (at least one identity compared, or a named empty-population proof), exactly its catalogue sources, an equal start and end stamp for every dependent stream, no reason, finding or unsettled identity; every other outcome has its own invariants; the exit code is derived from the items by one function |
 | fail-open on unreadable state | an unreadable, untrusted, oversized, malformed or inconsistent file, directory or chain refuses (trend) or is inconclusive (item); there is no default that passes |
 | an untrusted-file field reaching text | every field read back from a file is validated against a closed set or a strict pattern before use, and the Markdown is rendered from validated values only |
 <!-- /reconciliation-pack:audit -->

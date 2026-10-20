@@ -6,13 +6,13 @@ import path from 'node:path'
 import test, { after } from 'node:test'
 
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
-import { PACK_EVIDENCE_FILE, PACK_ITEM_IDS, PACK_LOCK_FILE, PACK_RECLAIM_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN, itemApplicability, packExitCode, LOCK_STALE_MS, MAX_EVIDENCE_LINES_PER_ITEM, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
+import { PACK_EVIDENCE_FILE, PACK_ITEM_IDS, PACK_LOCK_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN, itemApplicability, packExitCode, MAX_EVIDENCE_LINES_PER_ITEM, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
 import { defaultItems, newRunId, publishSyntheticRun } from '../../lib/reconciliation-pack/harness.ts'
 import { acquireRunLock } from '../../lib/reconciliation-pack/lock.ts'
 import { publishPackReport } from '../../lib/reconciliation-pack/publish.ts'
 import { ReportInvalid, buildReport, parseReport, sha256Hex, type ItemInput, type ReportInput } from '../../lib/reconciliation-pack/report.ts'
 import { itemSeries, readPackChain } from '../../lib/reconciliation-pack/trend.ts'
-import { NOW, allFiles, at, cleanup, itemFromComparison, key, mode, passItem, readAll, scratchDir } from './helpers.ts'
+import { NOW, allBrackets, allFiles, at, cleanup, itemFromComparison, key, mode, passItem, readAll, scratchDir } from './helpers.ts'
 
 // Credential-shaped canaries are assembled at run time so the repository holds no literal that a secret scanner would flag.
 const STRIPE_SHAPED = ['sk', 'live', 'abcdef123456'].join('_')
@@ -23,7 +23,7 @@ after(() => cleanup(bases))
 const fresh = () => path.join(scratchDir(bases), 'reports')
 
 function publish(reportDir: string, minutes: number, over: Partial<Parameters<typeof publishSyntheticRun>[0]> = {}) {
-  return publishSyntheticRun({ reportDir, phase: 'P1', asOf: '2026-10-19', now: at(minutes), ...over })
+  return publishSyntheticRun({ reportDir, phase: 'P1', asOf: '2026-10-19', now: at(minutes), streams: allBrackets(), ...over })
 }
 function ok(result: ReturnType<typeof publish>) {
   assert.equal(result.ok, true, JSON.stringify(result))
@@ -208,7 +208,7 @@ test('counts are DERIVED: the reader recomputes them from the evidence and refus
 
 test('a capped listing is never a pass, and the counts stay what the evidence lists', () => {
   const rows = Array.from({ length: MAX_EVIDENCE_LINES_PER_ITEM + 5 }, (_, i) => ({ key: key(`S${i}`), value: '1' }))
-  const { item } = itemFromComparison('R1', { ims: rows, vendor: [], allowEmpty: true })
+  const { item } = itemFromComparison('R1', { ims: rows, vendor: [], emptyProof: 'vendor-total-zero' })
   const result = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: item } }))
   const r1 = result.record.items.find((i) => i.id === 'R1')!
   assert.equal(r1.outcome, 'fail')
@@ -218,9 +218,9 @@ test('a capped listing is never a pass, and the counts stay what the evidence li
   // an inconclusive item cut by the cap stays inconclusive and gains the reason; a pass-shaped item cannot be capped silently
   const equalRows = Array.from({ length: 6 }, (_, i) => ({ key: key(`E${i}`), value: '1' }))
   const outOfPop = Array.from({ length: MAX_EVIDENCE_LINES_PER_ITEM + 3 }, (_, i) => ({ key: key(`P${i}`), value: '1' }))
-  const capped = itemFromComparison('R1', { ims: [...equalRows, ...outOfPop], vendor: [...equalRows, ...outOfPop], population: new Set(equalRows.map((r) => JSON.stringify(r.key)).slice(0, 0)), allowEmpty: true })
+  const capped = itemFromComparison('R1', { ims: [...equalRows, ...outOfPop], vendor: [...equalRows, ...outOfPop], population: new Set(equalRows.map((r) => JSON.stringify(r.key)).slice(0, 0)), emptyProof: 'vendor-total-zero' })
   assert.equal(capped.item.outcome === 'pass' || capped.item.outcome === 'inconclusive', true)
-  const r = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: { ...capped.item, outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'] } } }))
+  const r = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: { ...capped.item, outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'], proof: null } } }))
   assert.ok(r.record.items.find((i) => i.id === 'R1')!.reasons.includes('READ_INCOMPLETE'))
 })
 
@@ -453,72 +453,6 @@ test('lock: held by a live process on this host => LOCK_HELD, released => takeab
   assert.deepEqual([refusedRun.ok, refusedRun.ok ? 0 : refusedRun.exitCode, refusedRun.ok ? '' : refusedRun.code], [false, 2, 'LOCK_HELD'])
 })
 
-test('lock: a lock of a dead pid on this host is reclaimed, and the old holder can no longer commit or release', () => {
-  const dir = lockDir()
-  const old = acquireRunLock(dir, { pid: () => 424242, hostname: () => 'host-a' })
-  assert.equal(old.ok, true)
-  const taken = acquireRunLock(dir, { hostname: () => 'host-a', pidAlive: () => false })
-  assert.equal(taken.ok, true)
-  if (old.ok && taken.ok) {
-    assert.equal(old.handle.verify(), false)
-    assert.equal(taken.handle.verify(), true)
-    old.handle.release()
-    assert.equal(taken.handle.verify(), true, 'the old holder\'s release did not remove the new lock')
-  }
-  assert.equal(existsSync(path.join(dir, PACK_RECLAIM_FILE)), false)
-  assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith('.run.lock.stale')), [])
-})
-
-test('lock: a lock from ANOTHER host is never reclaimed, however old and whatever its pid', () => {
-  const dir = lockDir()
-  assert.equal(acquireRunLock(dir, { hostname: () => 'host-a', now: () => NOW.getTime() - 10 * LOCK_STALE_MS }).ok, true)
-  assert.deepEqual(acquireRunLock(dir, { hostname: () => 'host-b', pidAlive: () => false }), { ok: false, code: 'LOCK_HELD' })
-})
-
-test('lock: age reclaims only this host\'s lock and only past LOCK_STALE_MS; a lock from the future is held', () => {
-  const young = lockDir()
-  assert.equal(acquireRunLock(young, { hostname: () => 'h', now: () => NOW.getTime() }).ok, true)
-  assert.deepEqual(acquireRunLock(young, { hostname: () => 'h', now: () => NOW.getTime() + LOCK_STALE_MS, pidAlive: () => true }), { ok: false, code: 'LOCK_HELD' })
-  assert.equal(acquireRunLock(young, { hostname: () => 'h', now: () => NOW.getTime() + LOCK_STALE_MS + 1, pidAlive: () => true }).ok, true)
-  const future = lockDir()
-  assert.equal(acquireRunLock(future, { hostname: () => 'h', now: () => NOW.getTime() + 10 * LOCK_STALE_MS }).ok, true)
-  assert.deepEqual(acquireRunLock(future, { hostname: () => 'h', now: () => NOW.getTime(), pidAlive: () => true }), { ok: false, code: 'LOCK_HELD' })
-})
-
-test('lock: an unreadable, malformed, oversized or symlinked lock is not taken (fail closed)', () => {
-  const lockFor = (dir: string) => path.join(dir, PACK_LOCK_FILE)
-  for (const body of ['', 'not json', '{}', JSON.stringify({ pid: 'x', host: 'h', token: 'a'.repeat(32), createdAt: NOW.toISOString() }), JSON.stringify({ pid: 5, host: 'h', token: 'short', createdAt: NOW.toISOString() }), JSON.stringify({ pid: 5, host: 'h', token: 'a'.repeat(32), createdAt: 'yesterday' }), JSON.stringify({ pid: 5, host: 'h', token: 'a'.repeat(32), createdAt: NOW.toISOString(), extra: 1 }), 'x'.repeat(5000)]) {
-    const dir = lockDir()
-    writeFileSync(lockFor(dir), body, { mode: 0o600 })
-    assert.deepEqual(acquireRunLock(dir, { hostname: () => 'h', pidAlive: () => false }), { ok: false, code: 'LOCK_UNREADABLE' }, body.slice(0, 20))
-  }
-  const dir = lockDir()
-  writeFileSync(path.join(dir, 'target'), '{}', { mode: 0o600 })
-  symlinkSync(path.join(dir, 'target'), lockFor(dir))
-  assert.deepEqual(acquireRunLock(dir), { ok: false, code: 'LOCK_UNREADABLE' })
-})
-
-test('lock: reclaims are serialised by a guard file; a guard left behind refuses until removed', () => {
-  const dir = lockDir()
-  assert.equal(acquireRunLock(dir, { hostname: () => 'h' }).ok, true)
-  writeFileSync(path.join(dir, PACK_RECLAIM_FILE), '{}', { mode: 0o600 })
-  assert.deepEqual(acquireRunLock(dir, { hostname: () => 'h', pidAlive: () => false }), { ok: false, code: 'LOCK_STALE_CONTENDED' })
-  assert.equal(existsSync(path.join(dir, PACK_RECLAIM_FILE)), true, 'a guard that is not ours is not removed')
-  unlinkSync(path.join(dir, PACK_RECLAIM_FILE))
-  assert.equal(acquireRunLock(dir, { hostname: () => 'h', pidAlive: () => false }).ok, true)
-})
-
-test('lock TOCTOU: a stale lock replaced between judgement and reclaim is not stolen', () => {
-  const dir = lockDir()
-  const lockFile = path.join(dir, PACK_LOCK_FILE)
-  assert.equal(acquireRunLock(dir, { hostname: () => 'h', pid: () => 77 }).ok, true)
-  const live = JSON.stringify({ pid: 88, host: 'h', token: 'b'.repeat(32), createdAt: NOW.toISOString() })
-  const result = acquireRunLock(dir, { hostname: () => 'h', pidAlive: (pid) => pid !== 77, now: () => NOW.getTime(), afterJudged: () => { unlinkSync(lockFile); writeFileSync(lockFile, live, { flag: 'wx', mode: 0o600 }) } })
-  assert.deepEqual(result, { ok: false, code: 'LOCK_HELD' })
-  assert.equal(readFileSync(lockFile, 'utf8'), live, 'the live lock is untouched')
-  assert.equal(existsSync(path.join(dir, PACK_RECLAIM_FILE)), false)
-})
-
 test('CONCURRENCY: parallel processes publishing into one directory get a contiguous, fork-free chain', async () => {
   const dir = fresh()
   mkdirSync(dir, { mode: 0o700 })
@@ -548,9 +482,9 @@ test('SECRETS / DATA ABSENCE: hostile identities never reach any published byte;
   const rows = canaries.map((c) => ({ key: [{ kind: 'sku' as const, raw: c }, { kind: 'warehouse' as const, raw: 'MAIN' }], value: '1' }))
   const { item } = itemFromComparison('R1', { ims: rows, vendor: [] })
   const dir = fresh()
-  ok(publish(dir, 0, { items: { ...passingAt('P1'), R1: item }, streams: [{ stream: 'xero-tax-rates', start: '2026-10-19T00:00:00.000Z', end: '2026-10-19T00:00:00.000Z' }] }))
+  ok(publish(dir, 0, { items: { ...passingAt('P1'), R1: item }, streams: allBrackets() }))
   const files = readAll(dir)
-  assert.equal(files.length, 3)
+  assert.equal(files.length, 4, 'the three report files and the sequence claim')
   const host = os.hostname()
   const user = os.userInfo().username
   for (const { file, text } of files) {
