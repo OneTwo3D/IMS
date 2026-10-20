@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { chmodSync, rmSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, rmSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
@@ -36,14 +36,14 @@ let systemId = ''
 const outputs: string[] = []
 const secrets: string[] = []
 
-const RUN = (extra: string[], over: { env?: Record<string, string>; expectDb?: string; expectSid?: string; envFile?: string; reportDir?: string } = {}) =>
+const RUN = (extra: string[], over: { env?: Record<string, string>; expectDb?: string; expectSid?: string; envFile?: string; reportDir?: string; script?: string } = {}) =>
   async () => {
     await s.db.$disconnect()
     // The caller's environment is hostile on purpose: an inherited database and PG variables that point somewhere else.
     const env: Record<string, string> = { PATH: process.env.PATH ?? '', LANG: 'C', HOME: join(s.root, 'home'), DATABASE_URL: 'postgresql://decoy:decoy@127.0.0.1:1/decoy', PGHOST: '127.0.0.1', PGPORT: '1', MINTSOFT_WRITE_ALLOWED: 'https://api.example.test|89', ...over.env }
     const result = await runChild({
       cmd: TSX,
-      args: ['scripts/first-load-apply.ts', '--manifest', manifest, '--env-file', over.envFile ?? envFile, '--expect-db', over.expectDb ?? s.database, '--expect-system-id', over.expectSid ?? systemId, '--report-dir', over.reportDir ?? reportDir, ...extra],
+      args: [over.script ?? 'scripts/first-load-apply.ts', '--manifest', manifest, '--env-file', over.envFile ?? envFile, '--expect-db', over.expectDb ?? s.database, '--expect-system-id', over.expectSid ?? systemId, '--report-dir', over.reportDir ?? reportDir, ...extra],
       env,
       cwd: REPO,
       timeoutMs: CHILD_TIMEOUT_MS,
@@ -145,34 +145,92 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       assert.match(b.stderr, /sets PGHOST/)
     })
 
-    it('a rehearsal child may run only on the throwaway database its rehearsal made: a database with another name is refused (exit 3) and nothing is written, even inside a directory that passes the directory proof', async () => {
-      // Mutation: drop the REHEARSAL_DATABASE name proof and this child applies the load to the scratch database without any record.
+    it('the public command has no child mode at all: the child flags are unknown arguments (exit 2), whatever database name and directory they are paired with', async () => {
+      // Mutation: put the child flags back into the public parser and this proceeds to the proof (exit 3) or worse.
       const before = await tableCounts()
-      const r = await RUN(['--apply', '--rehearsal-child-dir', s.root, '--report-stem', 'child-misuse'])()
-      assert.equal(r.exitCode, 3, r.stderr)
-      assert.match(r.stderr, /only on the throwaway database/)
+      const r = await RUN(['--apply', '--rehearsal-child-dir', s.root, '--report-stem', 'forged'])()
+      assert.equal(r.exitCode, 2, r.stderr)
+      assert.match(r.stderr, /not recognised/)
       assert.equal(await tableCounts(), before)
       assert.equal(await runRecords(), 0)
     })
-  })
 
-  describe('the rehearsal waiver needs BOTH proofs', () => {
-    it('a database with the throwaway name but a data directory outside the run directory is refused too (the name proof alone passes)', async () => {
-      // Mutation: drop the insideRunDir proof and this child loads with no record (the name proof alone passes here).
+    const CHILD = 'scripts/first-load-apply-rehearsal-child.ts'
+    const clusterId = () => systemId // the scratch cluster stands in for the "throwaway": the proofs below name it
+    const proofFile = () => join(s.root, 'rehearsal-child.json')
+    const writeProof = (over: Record<string, unknown> = {}, token = 'c'.repeat(64)) => {
+      writeFileSync(proofFile(), JSON.stringify({ tokenSha256: createHash('sha256').update(token).digest('hex'), clusterSystemId: clusterId(), targetSystemId: 'some-other-real-target', ...over }), { mode: 0o600 })
+      chmodSync(proofFile(), 0o600)
+    }
+    const childRun = (token: string | undefined) => RUN(['--apply', '--rehearsal-child-dir', s.root, '--report-stem', 'forged'], { script: CHILD, env: token === undefined ? {} : { IMS_FIRST_LOAD_REHEARSAL_TOKEN: token } })()
+
+    it('a forged child is refused with rails intact: name and directory matching is not proof (no token, a wrong token, a wrong cluster, the real target, a replay)', async (t) => {
+      // The scratch database is NOT named ims_firstload_rehearsal, so these arms isolate the TOKEN proof by using a lookalike database below; here they check the refusal text and effects.
+      // Mutation: skip the proof (checkChildProof) in runCli and the next section's loads run with no record and no restore point.
+      await s.db.$disconnect()
+      await runs('create database ims_firstload_rehearsal template ims_scratch')
+      const env = join(dir, 'lookalike.env')
+      writeFileSync(env, readFileSync(envFile, 'utf8').replace(/^DATABASE_URL=.*$/m, `DATABASE_URL=${s.url.replace(/\/ims_scratch$/, '/ims_firstload_rehearsal')}`), { mode: 0o600 })
+      chmodSync(env, 0o600)
+      const forged = (token: string | undefined) => RUN(['--apply', '--rehearsal-child-dir', s.root, '--report-stem', 'forged'], { script: CHILD, envFile: env, expectDb: 'ims_firstload_rehearsal', env: token === undefined ? {} : { IMS_FIRST_LOAD_REHEARSAL_TOKEN: token } })()
+      try {
+        const before = await tableCounts()
+        const arms: Array<[string, () => void, string | undefined, string]> = [
+          ['no proof file and no token', () => rmSync(proofFile(), { force: true }), undefined, 'NO_PROOF'],
+          ['a proof file and no token', () => writeProof(), undefined, 'NO_TOKEN'],
+          ['a proof file and the wrong token', () => writeProof(), 'd'.repeat(64), 'TOKEN_MISMATCH'],
+          ['the right token on another cluster', () => writeProof({ clusterSystemId: 'another-cluster' }), 'c'.repeat(64), 'WRONG_CLUSTER'],
+          ['the right token on the real target\'s cluster', () => writeProof({ targetSystemId: clusterId() }), 'c'.repeat(64), 'IS_THE_TARGET'],
+        ]
+        for (const [label, setup, token, code] of arms) {
+          setup()
+          const r = await forged(token)
+          assert.equal(r.exitCode, 3, `${label}: ${r.stderr}`)
+          assert.match(r.stderr, new RegExp(`REHEARSAL_CHILD_UNAUTHENTICATED: .*${code}`), label)
+          assert.equal(existsSync(proofFile()), false, `${label}: the proof is consumed whether or not it was accepted`)
+        }
+        // A replay: a valid proof is consumed by its first use, so a second claimant with the same token finds nothing.
+        writeProof()
+        const first = await forged('c'.repeat(64))
+        const replay = await forged('c'.repeat(64))
+        assert.match(replay.stderr, /NO_PROOF/, `${first.stderr}\n${replay.stderr}`)
+        // Rails intact: no relaxation of anything: no restore point, no run record, no table changed by any refusal.
+        assert.deepEqual(readdirSync(restoreDir), [])
+        assert.equal(await tableCounts(), before)
+        precondition(t, 'forged-child arms', arms.length + 1)
+      } finally {
+        await runs('drop database ims_firstload_rehearsal')
+      }
+    })
+
+    it('with a VALID proof the child still needs the throwaway database by name and by place; each is checked on its own', async () => {
+      // Mutation: drop the REHEARSAL_DATABASE name proof, or the insideRunDir proof, and the matching arm loads.
+      const before = await tableCounts()
+      writeProof()
+      const wrongName = await childRun('c'.repeat(64))
+      assert.equal(wrongName.exitCode, 3, wrongName.stderr)
+      assert.match(wrongName.stderr, /only on the throwaway database/)
       await s.db.$disconnect()
       await runs('create database ims_firstload_rehearsal template ims_scratch')
       try {
         const env = join(dir, 'lookalike.env')
         writeFileSync(env, readFileSync(envFile, 'utf8').replace(/^DATABASE_URL=.*$/m, `DATABASE_URL=${s.url.replace(/\/ims_scratch$/, '/ims_firstload_rehearsal')}`), { mode: 0o600 })
         chmodSync(env, 0o600)
-        const before = await tableCounts()
-        const r = await RUN(['--apply', '--rehearsal-child-dir', dir, '--report-stem', 'lookalike'], { envFile: env, expectDb: 'ims_firstload_rehearsal' })()
-        assert.equal(r.exitCode, 3, r.stderr)
-        assert.match(r.stderr, /only on the throwaway database/)
+        // A valid proof sits in the other directory too: the proof is valid, the PLACE is wrong (the data directory is not inside that directory).
+        writeFileSync(join(dir, 'rehearsal-child.json'), JSON.stringify({ tokenSha256: createHash('sha256').update('c'.repeat(64)).digest('hex'), clusterSystemId: clusterId(), targetSystemId: 'some-other-real-target' }), { mode: 0o600 })
+        const wrongPlace = await RUN(['--apply', '--rehearsal-child-dir', dir, '--report-stem', 'lookalike'], { script: CHILD, envFile: env, expectDb: 'ims_firstload_rehearsal', env: { IMS_FIRST_LOAD_REHEARSAL_TOKEN: 'c'.repeat(64) } })()
+        assert.equal(wrongPlace.exitCode, 3, wrongPlace.stderr)
+        assert.match(wrongPlace.stderr, /only on the throwaway database/)
         assert.equal(await tableCounts(), before)
       } finally {
         await runs('drop database ims_firstload_rehearsal')
       }
+    })
+
+    it('the child entrypoint without child arguments is refused (exit 2)', async () => {
+      const r = await RUN(['--apply', '--rehearsal-record', join(dir, 'none.json')], { script: CHILD })()
+      assert.equal(r.exitCode, 2, r.stderr)
+      assert.match(r.stderr, /needs its child arguments/)
     })
   })
 

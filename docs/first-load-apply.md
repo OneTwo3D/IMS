@@ -150,7 +150,7 @@ The whole load, steps, verification and census, on a **copy** of the target in a
 2. counts every table of the target exactly, over a connection that cannot write (`default_transaction_read_only`);
 3. dumps the target (`pg_dump --format=custom`, read only; the credentials reach the client tool as environment variables of that child only);
 4. initialises a cluster under `<root>/ims-rehearsal-*` on a loopback port nothing else holds, with a superuser role of its own and a random password, restores the dump into a database named `ims_firstload_rehearsal`, and writes the child's env file (the installation's variables with `DATABASE_URL` replaced; mode 600, shredded in the teardown);
-5. runs **this same command** as a child (`--apply --rehearsal-child-dir <run directory> --report-stem <stem>`) pointed at the copy. A child, because the application's database client reads its URL once, when first imported;
+5. runs the rehearsal's **own entrypoint** (`scripts/first-load-apply-rehearsal-child.ts`) as a child, pointed at the copy. A child, because the application's database client reads its URL once, when first imported. The public command cannot become that child: the child's two flags (`--rehearsal-child-dir`, `--report-stem`) are unknown arguments there (exit 2);
 6. tears the cluster down in a `finally`: the postmaster is stopped by the PID captured at start and confirmed to still be ours, the env file is shredded and the directory removed (`scripts/rehearse-first-install.ts` `teardownRun`, reused unchanged). An incomplete teardown is exit 7 (REHEARSAL_TEARDOWN_INCOMPLETE);
 7. counts every table of the target again. **Any difference makes the rehearsal not valid**: the copy is then not a copy of the target as it now is, so the verdict is `TARGET_CHANGED` and the exit INTERNAL. (This also catches an unrelated writer on the target during the rehearsal, which is the right answer for a record that says "this target loads".)
 8. publishes the **rehearsal record**: `formatVersion`, `manifestDigest`, `verdict`, `systemId` (the TARGET's cluster identifier, not the copy's), `finishedAt`, `schemaHash` (the hash of the ordered migration names of the checkout the rehearsal ran from), `loadExit`, `targetUnchanged`, `teardownComplete` and `report`: the child's published report **bound** by file name, SHA-256, number of verification items and number failed. The record is the evidence of the rehearsal, not its summary.
@@ -159,7 +159,7 @@ The whole load, steps, verification and census, on a **copy** of the target in a
 
 **`--apply` does not take the verdict on its word.** Besides the core's gate (digest, system id, age) and the schema head, it requires the record to say the load ended OK, the target was unchanged and the teardown complete, and to bind a report; it then re-reads that report from beside the record, requires its SHA-256 to be the recorded one, and re-validates it. **Every "which set" is pinned to its exact required set**: the verification items must be EXACTLY the closed list of 17 ids (`VERIFICATION_IDS` in `verify-core.ts`, the same constant the verifier uses; each once, none unknown, none missing, so a dropped item or duplicate padding is refused) and all must pass; the steps must be exactly the steps this load selects; the tool, mode, digest and target database must be the expected ones. A missing, changed or failing bound report refuses the apply (exit 3) before any restore point is taken.
 
-**The one thing the child waives is the need for a rehearsal record**, because it IS the rehearsal. It does so only after proving the database it was handed is the throwaway: the database is named `ims_firstload_rehearsal` AND the server's `data_directory` is inside the run directory the parent named, which must be an `ims-rehearsal-*` directory (both proofs are tested separately). Pointed at any other database it refuses (exit 3) and writes nothing.
+**The one thing the child waives is the need for a rehearsal record**, because it IS the rehearsal, and it is **authenticated, not recognised by its name or place**. Before it waives anything the child must present all of: (1) a single-use token (32 bytes from the CSPRNG) that the parent passes in the child's *environment* (`IMS_FIRST_LOAD_REHEARSAL_TOKEN`; never an argument) and whose SHA-256 the parent wrote, with the throwaway cluster's system identifier and the real target's, to `rehearsal-child.json` (mode 600) in the throwaway directory; the file is **consumed (deleted) on first use, accepted or not**, so a replay or a second claimant finds nothing; (2) the connected cluster is the recorded throwaway; (3) it is not the real target's cluster; and then, in addition, (4) the database is named `ims_firstload_rehearsal` and (5) its data directory is inside the run directory the parent named. Each of the five is tested on its own. A claim that fails any of them is refused with `REHEARSAL_CHILD_UNAUTHENTICATED` and a closed code (`NO_PROOF`, `NO_TOKEN`, `TOKEN_MISMATCH`, `WRONG_CLUSTER`, `IS_THE_TARGET`) and exit 3; that branch only ever refuses, so nothing else the command checks is relaxed by it. Matching the database name and a directory prefix is not proof (the rehearsal's first authentication was exactly that, and a forged claim with both matching waived the record and the restore point).
 
 What a green rehearsal does **not** say: that the target will behave like the copy under a concurrent writer (the target is quiesced for a load, not fenced), that the real data's size or timing will, that anything outside the database is quiet, or that the target's content (rather than its row counts) is unchanged: the zero-write proof compares an exact `count(*)` of every table, so an update in place that changes no count is not seen by it (the rehearsal's own connections to the target are read-only, which is what prevents one).
 
@@ -241,6 +241,22 @@ Whatever the runner prints (problems, standard error, the published reports) mus
 | Importers | their messages | reduced to a closed code and a row number |
 
 **A command whose evidence cannot be written does not succeed.** If a rehearsal's record cannot be published, the command exits INTERNAL and prints `RECORD_NOT_PUBLISHED` (a closed code, no path or error text), whatever the load on the copy did; likewise a report that cannot be published turns an OK into INTERNAL. Every other `catch` of the command either refuses (a refusal exit) or records a problem that makes the verdict non-OK.
+
+### Switches that relax a safeguard
+
+Every flag, variable and option that could skip a check, audited. None is on the public surface unauthenticated.
+
+| Switch | Where it exists | Why it cannot be forged |
+| --- | --- | --- |
+| skip the rehearsal record (`thisIsTheRehearsal`) | an option of `runLoad`, set in exactly one place in the code (a test scans the tree for any other) | set only after the child proof above has passed |
+| `--rehearsal-child-dir`, `--report-stem` | the rehearsal's own entrypoint only | unknown arguments on the public command; on the entrypoint they are inert without the proof |
+| skip the restore point | none: it is taken whenever `--apply` runs outside the proven child | no flag; the child alone is exempt, because its target is the throwaway |
+| skip the rails, the quiesce check, the rehearsal age limit | none | not configurable; the age limit is fixed in the core at 24 hours |
+| `IMS_FIRST_LOAD_REHEARSAL_TOKEN` | read only by the child entrypoint | the public command ignores it; the environment is replaced by a whitelist before anything else |
+| `--resume` | `--apply` | still needs the record, the rehearsal gate and the unchanged recorded restore point |
+| `--operator` | the label in the audit rows | a label only (a closed pattern); it changes no check |
+| `--root` | the rehearsal's scratch directory | refused on a RAM-backed or untrustworthy path; a rehearsal's verdict is not changed by where it ran |
+| `--expect-db`, `--expect-system-id` | the target confirmation | they can only make the command refuse |
 
 ### Audit of the failure classes the review keeps finding
 

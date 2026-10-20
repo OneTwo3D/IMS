@@ -11,14 +11,14 @@
  * (never on a command line), and the child's env file is mode 600 inside the run directory and shredded in the teardown. The cluster is stopped by the PID captured at start and
  * confirmed to still be ours (scripts/rehearse-first-install.ts teardownRun, reused unchanged), in a `finally`.
  *
- * THE RUN ITSELF is a child process: this same command with `--apply --rehearsal-child-dir`, pointed at the copy. A child, because the application's database client reads its URL
+ * THE RUN ITSELF is a child process: the rehearsal's own entrypoint (scripts/first-load-apply-rehearsal-child.ts, which the public command cannot reach), authenticated by a single-use token,, pointed at the copy. A child, because the application's database client reads its URL
  * once, when it is first imported; a process that has imported it for the target cannot be pointed at the copy. The child proves the database it is handed is the throwaway (its
  * name, and that its data directory is inside this run's directory) before it waives the need for a rehearsal record, which is the one thing it waives.
  *
  * WHAT A GREEN REHEARSAL DOES NOT SAY: that the target will behave like the copy under a concurrent writer (it is quiesced, not fenced), that the real data's timing or size will,
  * or that anything outside the database (a connector, a cron job) is quiet. It says the same files, through the same code, onto the same schema and configuration, load and verify.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, constants as fsConstants, chmodSync, existsSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, realpathSync, statSync, writeSync } from 'node:fs'
 import path from 'node:path'
 
@@ -28,9 +28,9 @@ import { freePort, pgBinDir, startCluster } from '../../tests/scripts/real-postg
 import {
   RAM_BACKED, RUN_DIR_PREFIX, capturePostmaster, databaseUrl, filesystemType, ident, inheritedEnv, randomHex, runChild, socketPsql, teardownRun, withClient, type RunState,
 } from '../rehearse-first-install'
-import { checkAncestors } from '../../lib/ops/published-report'
+import { checkAncestors, writeExclusive } from '../../lib/ops/published-report'
 import { type ApplyExitName } from '../../lib/first-load/apply/constants'
-import { REHEARSAL_DATABASE, buildRehearsalRecord, deriveRehearsalVerdict, libpqEnvFromUrl, validateChildReport, type ChildReportFacts, type RehearsalRecordFile } from '../../lib/first-load/apply/cli'
+import { CHILD_PROOF_FILE, CHILD_TOKEN_ENV, REHEARSAL_DATABASE, buildRehearsalRecord, deriveRehearsalVerdict, libpqEnvFromUrl, validateChildReport, type ChildReportFacts, type RehearsalRecordFile } from '../../lib/first-load/apply/cli'
 import { readRegularFile } from './first-load-apply-files'
 
 const CHILD_TIMEOUT_MS = 90 * 60 * 1000
@@ -136,7 +136,7 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
   }
   const target = libpqEnvFromUrl(input.targetEnv.DATABASE_URL ?? '')
   if (target.problems.length > 0) return refused(target.problems[0]!)
-  for (const needed of ['node_modules/.bin/tsx', 'scripts/first-load-apply.ts']) if (!existsSync(path.join(input.repoRoot, needed))) return refused(`${needed} not found under the checkout`)
+  for (const needed of ['node_modules/.bin/tsx', 'scripts/first-load-apply-rehearsal-child.ts']) if (!existsSync(path.join(input.repoRoot, needed))) return refused(`${needed} not found under the checkout`)
 
   // ---- The target, before: it is only ever read. ----
   let before: Record<string, number>
@@ -193,12 +193,16 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
     mkdirSync(path.join(root, 'home'), { recursive: true })
     mkdirSync(path.join(root, 'npm-cache'), { recursive: true })
 
+    // The child's proof: a single-use token from the CSPRNG. Its hash, the throwaway cluster's identity and the real target's identity go in a mode-600 file in the throwaway directory
+    // (consumed by the child on first use); the token itself travels in the child's environment, never on a command line.
+    const token = randomBytes(32).toString('hex')
+    writeExclusive(path.join(root, CHILD_PROOF_FILE), JSON.stringify({ tokenSha256: createHash('sha256').update(token).digest('hex'), clusterSystemId: copySystemId, targetSystemId: input.targetSystemId }))
     const args = [
-      'scripts/first-load-apply.ts', '--apply', '--rehearsal-child-dir', root, '--report-stem', input.reportStem,
+      'scripts/first-load-apply-rehearsal-child.ts', '--apply', '--rehearsal-child-dir', root, '--report-stem', input.reportStem,
       '--manifest', path.resolve(input.manifestPath), '--env-file', state.envFile, '--expect-db', REHEARSAL_DATABASE, '--expect-system-id', copySystemId,
       '--report-dir', input.reportDir, '--operator', input.operator,
     ]
-    const child = await runChild({ cmd: path.join(input.repoRoot, 'node_modules/.bin/tsx'), args, env: inheritedEnv(root), cwd: input.repoRoot, timeoutMs: CHILD_TIMEOUT_MS })
+    const child = await runChild({ cmd: path.join(input.repoRoot, 'node_modules/.bin/tsx'), args, env: { ...inheritedEnv(root), [CHILD_TOKEN_ENV]: token }, cwd: input.repoRoot, timeoutMs: CHILD_TIMEOUT_MS })
     childStarted = true
     childExitCode = child.exitCode
     childTimedOut = child.timedOut

@@ -37,11 +37,12 @@ export interface CliArgs {
 
 export type ParsedArgs = { kind: 'help' } | { kind: 'usage'; problems: string[] } | { kind: 'run'; args: CliArgs }
 
-const VALUE_FLAGS = ['--manifest', '--env-file', '--expect-db', '--expect-system-id', '--report-dir', '--rehearsal-record', '--operator', '--root', '--rehearsal-child-dir', '--report-stem'] as const
+const VALUE_FLAGS = ['--manifest', '--env-file', '--expect-db', '--expect-system-id', '--report-dir', '--rehearsal-record', '--operator', '--root'] as const
+/** Accepted ONLY by the rehearsal's own child entrypoint (parseCliArgs with allowChild); the public command refuses them as unknown arguments. */
+export const CHILD_FLAGS = ['--rehearsal-child-dir', '--report-stem'] as const
 const BOOLEAN_FLAGS = ['--rehearse', '--plan', '--apply', '--resume', '--help'] as const
-/** Every flag the parser accepts, and the two the rehearsal uses on its own child (not in the table, not in the help). */
+/** Every flag the PUBLIC command accepts. */
 export const KNOWN_FLAGS: readonly string[] = [...VALUE_FLAGS, ...BOOLEAN_FLAGS]
-export const INTERNAL_FLAGS: readonly string[] = ['--rehearsal-child-dir', '--report-stem']
 const OPERATOR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/
 const STEM_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/
 /** scheme://user:password@host or scheme://user@host?password=...: anything that carries a credential in a URL. */
@@ -50,7 +51,8 @@ const CREDENTIAL_IN_URL = /[a-z][a-z0-9+.-]*:\/\/[^/\s?#]*@|[?&](password|passwd
 export const DEFAULT_ROOT = '/var/tmp'
 export const DEFAULT_OPERATOR = 'first-load-apply'
 
-export function parseCliArgs(argv: readonly string[]): ParsedArgs {
+export function parseCliArgs(argv: readonly string[], options: { allowChild?: boolean } = {}): ParsedArgs {
+  const valueFlags: readonly string[] = options.allowChild === true ? [...VALUE_FLAGS, ...CHILD_FLAGS] : VALUE_FLAGS
   const problems: string[] = []
   const values = new Map<string, string>()
   const flags = new Set<string>()
@@ -59,7 +61,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs {
     if ((BOOLEAN_FLAGS as readonly string[]).includes(arg)) {
       if (flags.has(arg)) problems.push(`${arg} was given twice`)
       flags.add(arg)
-    } else if ((VALUE_FLAGS as readonly string[]).includes(arg)) {
+    } else if (valueFlags.includes(arg)) {
       const value = argv[i + 1]
       if (value === undefined || value.startsWith('--')) problems.push(`${arg} needs a value`)
       else {
@@ -393,4 +395,38 @@ export function restorePointPath(restorePointDir: string, runId: string): string
  */
 export function rehearsalCommandExit(loadExit: ApplyExitName, recordPublished: boolean): ApplyExitName {
   return loadExit === 'OK' && !recordPublished ? 'INTERNAL' : loadExit
+}
+
+// ---------------------------------------------------------------------------
+// The rehearsal child is AUTHENTICATED, not recognised by its name or its place
+// ---------------------------------------------------------------------------
+
+/** The environment variable that carries the single-use token from the rehearsal to its child (never an argument). The public command ignores it. */
+export const CHILD_TOKEN_ENV = 'IMS_FIRST_LOAD_REHEARSAL_TOKEN'
+/** The file, inside the throwaway cluster's own directory, that holds the hash of the token and the identities it is valid for. Consumed (deleted) on first use. */
+export const CHILD_PROOF_FILE = 'rehearsal-child.json'
+
+export interface ChildProof {
+  tokenSha256: string
+  /** The throwaway cluster the child is allowed to run on. */
+  clusterSystemId: string
+  /** The real target's cluster: the child may never run on it. */
+  targetSystemId: string
+}
+
+export const CHILD_REFUSAL_CODE = 'REHEARSAL_CHILD_UNAUTHENTICATED'
+
+/**
+ * Whether a process that CLAIMS to be the rehearsal's child is one. All of: a proof written by the parent (a parsed ChildProof), a presented token whose SHA-256 is the recorded one,
+ * the connected cluster is the recorded throwaway, and it is not the real target. Any other state is a refusal with closed codes. Pure: the caller reads and consumes the file.
+ */
+export function checkChildProof(proof: unknown, presentedTokenSha256: string | null, connectedSystemId: string): string[] {
+  const p = typeof proof === 'object' && proof !== null && !Array.isArray(proof) ? (proof as Record<string, unknown>) : null
+  if (p === null || typeof p.tokenSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(p.tokenSha256) || typeof p.clusterSystemId !== 'string' || typeof p.targetSystemId !== 'string' || p.clusterSystemId === '') return ['NO_PROOF']
+  const problems: string[] = []
+  if (presentedTokenSha256 === null) problems.push('NO_TOKEN')
+  else if (presentedTokenSha256 !== p.tokenSha256) problems.push('TOKEN_MISMATCH')
+  if (connectedSystemId !== p.clusterSystemId) problems.push('WRONG_CLUSTER')
+  if (connectedSystemId === p.targetSystemId) problems.push('IS_THE_TARGET')
+  return problems
 }

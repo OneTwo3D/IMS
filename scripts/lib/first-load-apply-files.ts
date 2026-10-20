@@ -184,3 +184,17 @@ export function publishRecord(dir: ReportDir, name: string, text: string): strin
   fsyncDirectory(dir.dir)
   return file
 }
+
+/**
+ * Read the rehearsal child's proof from the throwaway cluster's own directory and CONSUME it: the file is deleted whether or not it is then accepted (single use, so a replay or a second
+ * claimant finds nothing). It must be a regular file owned by this account, mode 600. Returns null when it is absent or unusable.
+ */
+export function consumeChildProof(runDir: string, fileName: string): unknown | null {
+  const file = path.join(path.resolve(runDir), fileName)
+  const read = readRegularFile(file, 4096)
+  try { rmSync(file, { force: true }) } catch { /* if it cannot be removed it is still not accepted twice: the token check below is hash-bound to this run */ }
+  if (!read.ok || read.uid !== myUid() || (read.mode & 0o077) !== 0) return null
+  try { return JSON.parse(read.bytes.toString('utf8')) } catch { return null }
+}
+
+export const sha256Text = (text: string): string => createHash('sha256').update(text).digest('hex')

@@ -2,9 +2,10 @@ import assert from 'node:assert/strict'
 import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import test, { after } from 'node:test'
+import { createHash } from 'node:crypto'
 
 import { APPLY_EXIT_CODE_TABLE, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME } from '../../lib/first-load/apply/constants.ts'
-import { DEFAULT_OPERATOR, REHEARSAL_DATABASE, buildRehearsalRecord, checkRecordBinding, checkRecordReportFile, checkRecordSchema, deriveRehearsalVerdict, validateChildReport, type RehearsalSignals, buildRunnerEnv, exitNameOfCode, helpText, libpqEnvFromUrl, parseCliArgs, reportStem } from '../../lib/first-load/apply/cli.ts'
+import { DEFAULT_OPERATOR, REHEARSAL_DATABASE, buildRehearsalRecord, checkChildProof, checkRecordBinding, checkRecordReportFile, checkRecordSchema, deriveRehearsalVerdict, validateChildReport, type RehearsalSignals, buildRunnerEnv, exitNameOfCode, helpText, libpqEnvFromUrl, parseCliArgs, reportStem } from '../../lib/first-load/apply/cli.ts'
 import { VERIFICATION_IDS } from '../../lib/first-load/apply/verify-core.ts'
 import { runLoad } from '../../lib/first-load/apply/orchestrate.ts'
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
@@ -39,9 +40,8 @@ test('arguments: the three modes, the default, and every refusal', (t) => {
     ['a repeated flag', ['--plan', '--plan'], /given twice/],
     ['a repeated value', ['--operator', 'a', '--operator', 'b'], /given twice/],
     ['an operator label with a slash', ['--operator', '../x'], /--operator must be/],
-    ['a child dir without a stem', ['--apply', '--rehearsal-child-dir', '/var/tmp/x'], /given together/],
-    ['a child that is not an apply', ['--plan', '--rehearsal-child-dir', '/var/tmp/x', '--report-stem', 's'], /runs as --apply/],
-    ['a child with a record', ['--apply', '--rehearsal-child-dir', '/var/tmp/x', '--report-stem', 's', '--rehearsal-record', 'r'], /IS the rehearsal/],
+    ['the rehearsal child flags (they are not part of the public command)', ['--apply', '--rehearsal-child-dir', '/var/tmp/x', '--report-stem', 's'], /not recognised/],
+    ['the child flags together with a record', ['--apply', '--rehearsal-child-dir', '/var/tmp/x', '--report-stem', 's', '--rehearsal-record', 'r'], /not recognised/],
   ]
   for (const [label, extra, pattern] of arms) {
     const parsed = parse(...extra)
@@ -388,4 +388,61 @@ test('rehearse mode: a record that cannot be published turns an OK rehearsal int
   const fine = await run(() => '/x/record.json')
   assert.equal(fine.code, 0)
   assert.match(fine.text, /Rehearsal record: \/x\/record\.json/)
+})
+
+test('the child flags exist only for the rehearsal\'s own entrypoint: the public parse refuses them, the child parse accepts them with the child rules', (t) => {
+  // Mutation: add the child flags to VALUE_FLAGS (the public list) and every public arm here is green, so the first assertion fails.
+  const childArgs = ['--apply', '--rehearsal-child-dir', '/var/tmp/x', '--report-stem', 'stem']
+  assert.equal(parseCliArgs([...base, ...childArgs]).kind, 'usage')
+  const parsed = parseCliArgs([...base, ...childArgs], { allowChild: true })
+  assert.equal(parsed.kind, 'run')
+  assert.deepEqual((parsed as { args: { rehearsalChild: unknown } }).args.rehearsalChild, { runDir: '/var/tmp/x', reportStem: 'stem' })
+  const arms: Array<[string, string[], RegExp]> = [
+    ['a dir without a stem', ['--apply', '--rehearsal-child-dir', '/var/tmp/x'], /given together/],
+    ['a child that is not an apply', ['--plan', '--rehearsal-child-dir', '/var/tmp/x', '--report-stem', 's'], /runs as --apply/],
+    ['a child with a record', [...childArgs, '--rehearsal-record', 'r'], /IS the rehearsal/],
+    ['a child with --resume', [...childArgs, '--resume'], /IS the rehearsal/],
+  ]
+  for (const [label, extra, pattern] of arms) {
+    const got = parseCliArgs([...base, ...extra], { allowChild: true })
+    assert.equal(got.kind, 'usage', label)
+    assert.ok((got as { problems: string[] }).problems.some((p) => pattern.test(p)), label)
+  }
+  precondition(t, 'child parse arms', arms.length + 2)
+})
+
+test('a claim to be the rehearsal\'s child is proved by a token, a cluster and not being the target; any one missing is a refusal with closed codes', (t) => {
+  const token = 'a'.repeat(64)
+  const hash = createHash('sha256').update(token).digest('hex')
+  const proof = { tokenSha256: hash, clusterSystemId: 'copy-1', targetSystemId: 'real-1' }
+  assert.deepEqual(checkChildProof(proof, hash, 'copy-1'), [])
+  // Mutation: delete the matching line of checkChildProof and that arm is green.
+  const arms: Array<[string, unknown, string | null, string, string]> = [
+    ['no proof file', null, hash, 'copy-1', 'NO_PROOF'],
+    ['a proof of the wrong shape', { tokenSha256: 'x' }, hash, 'copy-1', 'NO_PROOF'],
+    ['no token presented', proof, null, 'copy-1', 'NO_TOKEN'],
+    ['another token', proof, 'b'.repeat(64), 'copy-1', 'TOKEN_MISMATCH'],
+    ['another cluster', proof, hash, 'copy-2', 'WRONG_CLUSTER'],
+    ['the real target', { ...proof, clusterSystemId: 'real-1' }, hash, 'real-1', 'IS_THE_TARGET'],
+  ]
+  for (const [label, p, presented, connected, code] of arms) assert.ok(checkChildProof(p, presented, connected).includes(code), label)
+  precondition(t, 'proof arms', arms.length + 1)
+})
+
+test('the relaxation switch has one setter: thisIsTheRehearsal is set in exactly one place, after the authenticated-child branch', async () => {
+  const { readdirSync, readFileSync } = await import('node:fs')
+  const found: string[] = []
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === 'node_modules' || e.name.startsWith('.')) continue
+      const full = `${dir}/${e.name}`
+      if (e.isDirectory()) walk(full)
+      else if (/\.(ts|tsx|mjs|js)$/.test(e.name)) readFileSync(full, 'utf8').split('\n').forEach((line, i) => { if (/thisIsTheRehearsal\s*:\s*true/.test(line)) found.push(`${full.replace(process.cwd() + '/', '')}:${i + 1}`) })
+    }
+  }
+  for (const root of ['lib', 'app', 'scripts']) walk(`${process.cwd()}/${root}`)
+  assert.equal(found.length, 1, JSON.stringify(found))
+  assert.match(found[0]!, /^scripts\/first-load-apply\.ts:/)
+  const src = readFileSync('scripts/first-load-apply.ts', 'utf8')
+  assert.ok(src.indexOf('checkChildProof(') < src.indexOf('thisIsTheRehearsal: true'), 'the proof is checked before the switch is set')
 })

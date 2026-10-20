@@ -28,7 +28,7 @@ import pg from 'pg'
 import {
   APPLY_EXIT_CODES, REHEARSAL_MAX_AGE_HOURS, REHEARSAL_RECORD_STEM_PREFIX, RUNNER_APPLICATION_NAME, exitOperatorText, type ApplyExitName,
 } from '../lib/first-load/apply/constants'
-import { REHEARSAL_DATABASE, buildRunnerEnv, checkRecordBinding, rehearsalCommandExit, restorePointPath, checkRecordReportFile, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
+import { REHEARSAL_DATABASE, buildRunnerEnv, CHILD_PROOF_FILE, CHILD_REFUSAL_CODE, CHILD_TOKEN_ENV, checkChildProof, checkRecordBinding, rehearsalCommandExit, restorePointPath, checkRecordReportFile, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
 import { readPreparedDir, PreparedDirError } from '../lib/first-load/apply/io'
 import { ApplyManifestError, parseApplyManifest, type ApplyManifest } from '../lib/first-load/apply/manifest'
 import { checkRehearsalGate, type ApplyResult } from '../lib/first-load/apply/orchestrate'
@@ -38,7 +38,7 @@ import { checkoutMigrationNames } from '../lib/first-load/apply/db/migrations'
 import { compareMigrations, migrationsHash, type MigrationRow } from '../lib/first-load/apply/verify-core'
 import { pgBinDir } from '../tests/scripts/real-postgres-cluster'
 import {
-  prepareReportDir, publishRecord, publishReportPair, readEnvFile, readRegularFile, readSmallFile, sha256OfFile, ReportDirReplacedError, type ReportDir,
+  consumeChildProof, prepareReportDir, publishRecord, sha256Text, publishReportPair, readEnvFile, readRegularFile, readSmallFile, sha256OfFile, ReportDirReplacedError, type ReportDir,
 } from './lib/first-load-apply-files'
 import { insideRunDir, rehearse } from './lib/first-load-rehearse'
 
@@ -114,14 +114,19 @@ function checkRestoreDir(dir: string): string | null {
   }
 }
 
-export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Readonly<Record<string, string | undefined>> = process.env): Promise<number> {
-  const parsed = parseCliArgs(argv)
+/**
+ * `options.child` is passed ONLY by scripts/first-load-apply-rehearsal-child.ts, the rehearsal's own entrypoint; the public command never passes it, so the child flags are unknown
+ * arguments there. Even with it, the process is the rehearsal only if it presents the single-use token (see checkChildProof).
+ */
+export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Readonly<Record<string, string | undefined>> = process.env, options: { child?: boolean } = {}): Promise<number> {
+  const parsed = parseCliArgs(argv, { allowChild: options.child === true })
   if (parsed.kind === 'help') { io.out(helpText()); return APPLY_EXIT_CODES.OK }
   if (parsed.kind === 'usage') {
     io.err(`${parsed.problems.map((p) => `first-load-apply: ${p}`).join('\n')}\n(run with --help for the usage and the exit codes)\n`)
     return APPLY_EXIT_CODES.USAGE
   }
   const args = parsed.args
+  const presentedToken = options.child === true ? (parentEnv[CHILD_TOKEN_ENV] ?? null) : null
   const stopWith = (name: ApplyExitName, problems: string[]): number => {
     io.err(`${problems.map((p) => `first-load-apply: ${p}`).join('\n')}\nfirst-load-apply: ${name} (exit ${exitCodeOf(name)})\n${exitOperatorText(name) === '' ? '' : `${exitOperatorText(name)}\n`}`)
     return exitCodeOf(name)
@@ -172,8 +177,14 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
   }
   if (identity.database !== args.expectDb) return stopWith('PRECONDITION_REFUSED', ['--expect-db does not equal the database the server reports; the target is not the database you named'])
   if (identity.systemId !== args.expectSystemId) return stopWith('PRECONDITION_REFUSED', ['--expect-system-id does not equal the cluster system identifier the server reports; the target is not the cluster you named'])
+  if (options.child === true && args.rehearsalChild === null) return stopWith('USAGE', ['the rehearsal child entrypoint needs its child arguments'])
   if (args.rehearsalChild !== null) {
-    // The child may waive the need for a rehearsal record only on the throwaway database its parent made: by name, and by its data directory being inside the parent's run directory.
+    // The child may waive the need for a rehearsal record only if its parent made it: it presents the single-use token whose hash the parent recorded (and the file is consumed),
+    // it is connected to the throwaway cluster the parent recorded and not to the real target, AND the database is the throwaway by name and by place. A claim without all of that
+    // is refused and nothing is relaxed: this branch only ever refuses; it never changes what the rest of the command checks.
+    const proof = consumeChildProof(args.rehearsalChild.runDir, CHILD_PROOF_FILE)
+    const authentic = checkChildProof(proof, presentedToken === null ? null : sha256Text(presentedToken), identity.systemId)
+    if (authentic.length > 0) return stopWith('PRECONDITION_REFUSED', [`${CHILD_REFUSAL_CODE}: ${authentic.join(', ')}`])
     if (identity.database !== REHEARSAL_DATABASE || !insideRunDir(identity.dataDirectory, args.rehearsalChild.runDir)) {
       return stopWith('PRECONDITION_REFUSED', ['a rehearsal child may run only on the throwaway database its rehearsal made; this is not it'])
     }

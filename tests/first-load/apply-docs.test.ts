@@ -12,7 +12,7 @@ import {
 } from '../../lib/first-load/apply/constants.ts'
 import { APPLY_TIME_CHECKS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE } from '../../lib/first-load/spec.ts'
 import { IMPORT_CALL_MAX_ROWS } from '../../lib/first-load/apply/import-calls.ts'
-import { CLI_FLAGS, INTERNAL_FLAGS, KNOWN_FLAGS, REHEARSAL_DATABASE } from '../../lib/first-load/apply/cli.ts'
+import { CHILD_FLAGS, CLI_FLAGS, KNOWN_FLAGS, REHEARSAL_DATABASE } from '../../lib/first-load/apply/cli.ts'
 import { VERIFICATION_IDS, VERIFICATION_MEANING } from '../../lib/first-load/apply/verify-core.ts'
 import { FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE } from '../../lib/db/advisory-locks.ts'
 import { precondition } from './helpers.ts'
@@ -125,7 +125,9 @@ test('the flag table lists every flag the command accepts (except the two intern
   precondition(t, 'document flag rows', rows.length)
   assert.deepEqual(rows.map((r) => r[0]), CLI_FLAGS.map((f) => f.flag))
   rows.forEach((row, i) => assert.deepEqual(row, [CLI_FLAGS[i].flag, CLI_FLAGS[i].value === '' ? 'none' : CLI_FLAGS[i].value, CLI_FLAGS[i].applies, CLI_FLAGS[i].meaning]))
-  // The parser accepts exactly the documented flags plus the internal pair.
-  assert.deepEqual([...KNOWN_FLAGS].sort(), [...CLI_FLAGS.map((f) => f.flag), ...INTERNAL_FLAGS].sort())
+  // The parser accepts exactly the documented flags.
+  assert.deepEqual([...KNOWN_FLAGS].sort(), CLI_FLAGS.map((f) => f.flag).sort())
+  // The child flags are not part of the public surface at all.
+  for (const flag of CHILD_FLAGS) assert.ok(!KNOWN_FLAGS.includes(flag), flag)
   assert.ok(doc.includes(REHEARSAL_DATABASE))
 })
