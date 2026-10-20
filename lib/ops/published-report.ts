@@ -126,7 +126,10 @@ export function readTrustedRegularFile(file: string, maxBytes: number): string {
   return readTrustedRegularFileBytes(file, maxBytes).toString('utf8')
 }
 
-/** The same trust checks, returning the bytes exactly as read, so a digest can be taken over what was parsed. */
+/**
+ * The same trust checks as `readTrustedRegularFile`, returning the BYTES that were read. A caller that must hash and parse a file reads it once through this and does both
+ * on the one buffer: reading the path twice (once to digest, once to parse) lets the file change in between.
+ */
 export function readTrustedRegularFileBytes(file: string, maxBytes: number): Buffer {
   const fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
   try {

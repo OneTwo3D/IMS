@@ -19,7 +19,7 @@ Scope of this tool and what is still open:
 - **Variant parents come from WooCommerce, through a read-only command.** Qoblex exports variants with no parent. `npm run first-load:woo-snapshot` reads WooCommerce's variable products and
   their variations (GET requests only) and writes `variant-parents.csv`; this tool joins each Qoblex variant to the variation with the **same SKU** and emits the parent once as a VARIABLE
   product. See "WooCommerce snapshot command" and "Dataset: variant-parents".
-- **The apply runner is separate.** What loads these files into an empty installation (reading and verifying a prepared run, the residual, plan, apply and resume) is described in [first-load-apply.md](first-load-apply.md). Its core exists; the database side is a later work package, so no importer is driven yet.
+- **The apply runner is separate.** What loads these files into an empty installation (reading and verifying a prepared run, the residual, plan, apply and resume) is described in [first-load-apply.md](first-load-apply.md). Its core, the database side, the verification, the command and the readiness-gate check exist.
 - Not covered by an importer, so not produced: supplier product costs (`SupplierProduct` has no CSV importer) and customers (no source is defined for them
   in this work). Both are reported as gaps in the summary at the end of this page.
 

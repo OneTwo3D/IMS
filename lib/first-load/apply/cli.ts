@@ -8,6 +8,7 @@
  * names the operator is meant to check (--expect-db, --expect-system-id). Every value is also scanned: one that looks like a URL with credentials is refused outright, so a
  * pasted connection string cannot end up in the process list.
  */
+import { isBuildIdentity, type BuildIdentity } from '../../ops/build-identity'
 import { VERIFICATION_IDS } from './verify-core'
 import { APPLY_EXIT_CODES, APPLY_EXIT_CODE_TABLE, APPLY_REPORT_STEM_PREFIX, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME, type ApplyExitName } from './constants'
 
@@ -223,6 +224,8 @@ export interface RehearsalRecordFile {
   finishedAt: string
   /** The hash of the ORDERED list of migration names of the checkout the rehearsal ran from (migrationsHash): an apply from a checkout with another schema is refused by the command. */
   schemaHash: string
+  /** The code the rehearsal ran from: commit and tree of a CLEAN checkout. An apply from other code is refused. */
+  build: BuildIdentity | null
   loadExit: string | null
   targetUnchanged: boolean
   teardownComplete: boolean
@@ -312,7 +315,7 @@ export function deriveRehearsalVerdict(s: RehearsalSignals): { verdict: string; 
   return { verdict: 'OK', loadExit: 'OK' }
 }
 
-export function buildRehearsalRecord(args: { manifestDigest: string; targetSystemId: string; schemaHash: string; finishedAt: Date; verdict: string; loadExit: ApplyExitName | null; targetUnchanged: boolean; teardownComplete: boolean; report: RecordReportBinding | null }): RehearsalRecordFile {
+export function buildRehearsalRecord(args: { manifestDigest: string; targetSystemId: string; schemaHash: string; build: BuildIdentity | null; finishedAt: Date; verdict: string; loadExit: ApplyExitName | null; targetUnchanged: boolean; teardownComplete: boolean; report: RecordReportBinding | null }): RehearsalRecordFile {
   // An OK record is never built without the bound, validated report (the one place a caller could otherwise forget it).
   const ok = args.verdict === 'OK' && args.report !== null && args.loadExit === 'OK' && args.targetUnchanged && args.teardownComplete
   return {
@@ -322,6 +325,7 @@ export function buildRehearsalRecord(args: { manifestDigest: string; targetSyste
     systemId: args.targetSystemId,
     finishedAt: args.finishedAt.toISOString(),
     schemaHash: args.schemaHash,
+    build: args.build,
     loadExit: args.loadExit,
     targetUnchanged: args.targetUnchanged,
     teardownComplete: args.teardownComplete,
@@ -381,6 +385,19 @@ export function checkRecordSchema(record: unknown, schemaHash: string): string[]
   const hash = typeof record === 'object' && record !== null && !Array.isArray(record) ? (record as Record<string, unknown>).schemaHash : undefined
   if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) return ['the rehearsal record names no schema hash: it was not made by this command']
   if (hash !== schemaHash) return ['the rehearsal was made against another schema (its ordered migration list differs from this checkout\'s); rehearse again from this checkout']
+  return []
+}
+
+/**
+ * The rehearsal is of THIS CODE: the record names the commit and source tree of the clean checkout it ran from, and the command that applies must be running the same commit and tree, also clean.
+ * (A different checkout path with the same commit and tree is accepted: the identity is the code, and the schema hash and the digests bind the rest.) A record with no build, or a
+ * checkout whose identity cannot be read or has uncommitted changes, is refused.
+ */
+export function checkRecordBuild(record: unknown, current: BuildIdentity | null): string[] {
+  const build = typeof record === 'object' && record !== null && !Array.isArray(record) ? (record as Record<string, unknown>).build : undefined
+  if (current === null || !current.clean) return ['the code of this checkout cannot be identified (its commit cannot be read, or it has uncommitted changes), so the rehearsal cannot be tied to it']
+  if (!isBuildIdentity(build) || !build.clean) return ['the rehearsal record names no clean code commit: it was not made from a committed checkout by this command']
+  if (build.commit !== current.commit || build.tree !== current.tree) return ['the rehearsal was made from another code commit or source tree than this checkout; rehearse again from this checkout']
   return []
 }
 

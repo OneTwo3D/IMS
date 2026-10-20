@@ -8,7 +8,7 @@ import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import { READINESS_GATE_EXIT_CODES } from '../../lib/ops/readiness-gate-constants.ts'
 import type { GateDeps } from '../../lib/ops/readiness-gate-collect.ts'
 import { parseGateArgs, runReadinessGate } from '../../scripts/readiness-gate.ts'
-import { ALL_CONSTRAINTS, GATE_BUILD, NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance } from '../helpers/readiness-gate-fixtures.ts'
+import { ALL_CONSTRAINTS, GATE_BUILD, NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance, APPLY_RUN, APPLY_SYSTEM_ID, greenApplyReport } from '../helpers/readiness-gate-fixtures.ts'
 
 const ROOT = process.cwd()
 
@@ -34,6 +34,8 @@ function deps(overrides: Partial<GateDeps> = {}): GateDeps {
     readPackageScripts: () => ({}),
     readBuildIdentity: () => GATE_BUILD,
     readInstalledConstraints: ALL_CONSTRAINTS,
+    readApplyRun: async () => ({ systemId: APPLY_SYSTEM_ID, runs: [{ ...APPLY_RUN }] }),
+    readApplyReports: () => ({ reports: [{ parsed: greenApplyReport(), markdownDigestOk: true }], unparseable: 0 }),
     readNewestRehearsal: () => ({ digest: { ok: true }, parsed: greenRehearsal(), location: '/r' }),
     env: URL_ENV,
     repoRoot: ROOT,

@@ -46,6 +46,8 @@ export interface RehearseInput {
   /** The steps this load selects, in order: the child's report must list exactly these. */
   steps: readonly string[]
   schemaHash: string
+  /** The code this rehearsal runs from (null: it could not be identified; the record then binds no code and no apply accepts it). */
+  build: import('../../lib/ops/build-identity').BuildIdentity | null
   repoRoot: string
   /** Parent directory of the throwaway cluster. */
   root: string
@@ -108,7 +110,7 @@ export async function rehearse(input: RehearseInput): Promise<RehearseOutcome> {
     const derived = deriveRehearsalVerdict(verdictSignals)
     const binding = report !== null && facts !== null ? { file: path.basename(report.json), sha256: report.sha256, verificationItems: facts.verificationItems, verificationFailed: facts.verificationFailed } : null
     return {
-      record: buildRehearsalRecord({ manifestDigest: input.manifestDigest, targetSystemId: input.targetSystemId, schemaHash: input.schemaHash, finishedAt: new Date(), verdict: derived.verdict, loadExit: derived.loadExit, targetUnchanged: verdictSignals.targetUnchanged, teardownComplete: verdictSignals.teardownComplete, report: binding }),
+      record: buildRehearsalRecord({ manifestDigest: input.manifestDigest, targetSystemId: input.targetSystemId, schemaHash: input.schemaHash, build: input.build, finishedAt: new Date(), verdict: derived.verdict, loadExit: derived.loadExit, targetUnchanged: verdictSignals.targetUnchanged, teardownComplete: verdictSignals.teardownComplete, report: binding }),
       loadExit: derived.loadExit,
       verdict: derived.verdict,
     }

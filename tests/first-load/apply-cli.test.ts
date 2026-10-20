@@ -5,7 +5,7 @@ import test, { after } from 'node:test'
 import { createHash } from 'node:crypto'
 
 import { APPLY_EXIT_CODE_TABLE, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME } from '../../lib/first-load/apply/constants.ts'
-import { DEFAULT_OPERATOR, REHEARSAL_DATABASE, buildRehearsalRecord, checkChildProof, checkRecordBinding, checkRecordReportFile, checkRecordSchema, deriveRehearsalVerdict, validateChildReport, type RehearsalSignals, buildRunnerEnv, exitNameOfCode, helpText, libpqEnvFromUrl, parseCliArgs, reportStem } from '../../lib/first-load/apply/cli.ts'
+import { DEFAULT_OPERATOR, REHEARSAL_DATABASE, buildRehearsalRecord, checkChildProof, checkRecordBinding, checkRecordBuild, checkRecordReportFile, checkRecordSchema, deriveRehearsalVerdict, validateChildReport, type RehearsalSignals, buildRunnerEnv, exitNameOfCode, helpText, libpqEnvFromUrl, parseCliArgs, reportStem } from '../../lib/first-load/apply/cli.ts'
 import { VERIFICATION_IDS } from '../../lib/first-load/apply/verify-core.ts'
 import { runLoad } from '../../lib/first-load/apply/orchestrate.ts'
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
@@ -107,6 +107,7 @@ test('libpq variables are derived from the URL for the client tools, and the URL
   for (const bad of ['', 'not a url', 'mysql://u:p@h/d', 'postgresql://u:p@h/']) assert.ok(libpqEnvFromUrl(bad).problems.length > 0, bad)
 })
 
+const BUILD = { commit: 'a'.repeat(40), tree: 'b'.repeat(40), clean: true, path: '/opt/ims/app' }
 const DIGEST = 'd'.repeat(64)
 const STEPS = ['suppliers', 'products']
 const stepRow = (step: string) => ({ step, status: 'DONE', emitted: 3, created: 3, updated: 0, skippedExisting: 0, failed: 0, conflicts: [] })
@@ -143,7 +144,7 @@ test('the rehearsal verdict is derived in ONE place from every signal, and is OK
 })
 
 test('an OK record cannot be built without the bound report, a load exit of OK, an unchanged target and a complete teardown', (t) => {
-  const base = { manifestDigest: DIGEST, targetSystemId: '7', schemaHash: '1111111111111111111111111111111111111111111111111111111111111111', finishedAt: new Date('2026-10-20T10:00:00Z'), verdict: 'OK', loadExit: 'OK' as const, targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0, complete: true } }
+  const base = { manifestDigest: DIGEST, targetSystemId: '7', schemaHash: '1111111111111111111111111111111111111111111111111111111111111111', build: BUILD, finishedAt: new Date('2026-10-20T10:00:00Z'), verdict: 'OK', loadExit: 'OK' as const, targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0, complete: true } }
   assert.equal(buildRehearsalRecord(base).verdict, 'OK')
   // Mutation: build 'OK' from args.verdict alone and every arm below is green.
   const arms: Array<Record<string, unknown>> = [{ report: null }, { loadExit: null }, { targetUnchanged: false }, { teardownComplete: false }]
@@ -209,7 +210,7 @@ test('the apply re-validates what an OK record binds: fields, then the report fi
 
 test('the record the command writes is accepted by the gate it feeds, and by nothing weaker', async () => {
   const prepared = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
-  const record = buildRehearsalRecord({ manifestDigest: prepared.manifestDigest, targetSystemId: 'sys-1', schemaHash: '1111111111111111111111111111111111111111111111111111111111111111', finishedAt: new Date(), verdict: 'OK', loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0 } })
+  const record = buildRehearsalRecord({ manifestDigest: prepared.manifestDigest, targetSystemId: 'sys-1', schemaHash: '1111111111111111111111111111111111111111111111111111111111111111', build: BUILD, finishedAt: new Date(), verdict: 'OK', loadExit: 'OK', targetUnchanged: true, teardownComplete: true, report: { file: 'r.json', sha256: 'a'.repeat(64), verificationItems: N, verificationFailed: 0 } })
   const db = new FakeDatabase(prepared)
   const accepted = await runLoad(prepared, db.ports(), { mode: 'apply', resume: false, rehearsal: record, systemId: 'sys-1', now: new Date(), maxRehearsalAgeHours: 24 })
   assert.equal(accepted.exit, 'OK', accepted.problems.join('; '))
@@ -445,4 +446,24 @@ test('the relaxation switch has one setter: thisIsTheRehearsal is set in exactly
   assert.match(found[0]!, /^scripts\/first-load-apply\.ts:/)
   const src = readFileSync('scripts/first-load-apply.ts', 'utf8')
   assert.ok(src.indexOf('checkChildProof(') < src.indexOf('thisIsTheRehearsal: true'), 'the proof is checked before the switch is set')
+})
+
+test('the record binds the code: the same clean commit and tree is accepted, anything else is refused [mutation: checkRecordBuild returns []]', (t) => {
+  const record = { build: BUILD }
+  assert.deepEqual(checkRecordBuild(record, BUILD), [])
+  assert.deepEqual(checkRecordBuild(record, { ...BUILD, path: '/somewhere/else' }), [], 'the same code in another checkout path is the same code')
+  const arms: Array<[string, unknown, typeof BUILD | null]> = [
+    ['another commit', record, { ...BUILD, commit: 'c'.repeat(40) }],
+    ['another tree', record, { ...BUILD, tree: 'd'.repeat(40) }],
+    ['this checkout is dirty', record, { ...BUILD, clean: false }],
+    ['this checkout cannot be identified', record, null],
+    ['the record was made on a dirty checkout', { build: { ...BUILD, clean: false } }, BUILD],
+    ['the record names no build', {}, BUILD],
+    ['the record names a null build', { build: null }, BUILD],
+    ['the record names a malformed build', { build: { commit: 'x', tree: 'y', clean: true, path: 'p' } }, BUILD],
+    ['the record is not an object', 'text', BUILD],
+    ['the record is an array', [], BUILD],
+  ]
+  for (const [label, rec, current] of arms) assert.equal(checkRecordBuild(rec, current).length, 1, label)
+  precondition(t, 'build arms', arms.length)
 })

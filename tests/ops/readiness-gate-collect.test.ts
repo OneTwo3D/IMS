@@ -14,6 +14,7 @@ import {
   buildChildEnv,
   collectGateResults,
   type ConstraintRow,
+  readApplyReports,
   readNewestRehearsal,
   type ChildSpec,
   type GateDeps,
@@ -22,7 +23,7 @@ import { FORBIDDEN_ENV_PATTERNS } from '../../lib/ops/first-install-rehearsal.ts
 import { normaliseConstraintDefinition, READ_SYNC_STATUS_SCRIPT, REQUIRED_CHECK_CONSTRAINTS, REQUIRED_READ_SYNC_STREAMS, SCHEMA_STATE_SCRIPTS } from '../../lib/ops/readiness-gate-constants.ts'
 import { decideVerdict } from '../../lib/ops/readiness-gate.ts'
 import type { AccountingReconciliationReadiness } from '../../lib/ops/rollout-readiness.ts'
-import { ALL_CONSTRAINTS, DAY, PG_RENDERED, constraintRows, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal } from '../helpers/readiness-gate-fixtures.ts'
+import { ALL_CONSTRAINTS, DAY, PG_RENDERED, constraintRows, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal, APPLY_RUN, APPLY_SYSTEM_ID, greenApplyReport } from '../helpers/readiness-gate-fixtures.ts'
 
 /**
  * COLLECTION: every dependency failing is `unreadable`, never silence; the child environment is a
@@ -63,6 +64,8 @@ function deps(overrides: Partial<GateDeps> = {}, scripts: Record<string, string>
     readPackageScripts: () => scripts,
     readBuildIdentity: () => GATE_BUILD,
     readInstalledConstraints: ALL_CONSTRAINTS,
+    readApplyRun: async () => ({ systemId: APPLY_SYSTEM_ID, runs: [{ ...APPLY_RUN }] }),
+    readApplyReports: () => ({ reports: [{ parsed: greenApplyReport(), markdownDigestOk: true }], unparseable: 0 }),
     readNewestRehearsal: () => ({ digest: { ok: true }, parsed: greenRehearsal(), location: '/r/readiness-report.json' }),
     env: { PATH: '/usr/bin', HOME: '/home/x', DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/db', SMTP_PASSWORD: 'secret', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example', MINTSOFT_API_KEY: 'k', NODE_OPTIONS: '--require /evil.js', IMS_CONCURRENCY_SCRATCH_DB: 'x' },
     repoRoot: ROOT,
@@ -70,7 +73,7 @@ function deps(overrides: Partial<GateDeps> = {}, scripts: Record<string, string>
   }
 }
 
-const OPTIONS = { phase: 'P0' as const, expectGranted: null, rehearsalDir: '/r' }
+const OPTIONS = { phase: 'P0' as const, expectGranted: null, rehearsalDir: '/r', applyReportDir: '/a' }
 
 test('with healthy dependencies the collection yields a GO on this tree (the control for the arms below)', async () => {
   const d = deps()
@@ -79,7 +82,7 @@ test('with healthy dependencies the collection yields a GO on this tree (the con
   assert.equal(verdict.verdict, 'GO', verdict.blockingReasons.join('; '))
   assert.deepEqual(d.spawned.map((spec) => spec.script), [...SCHEMA_STATE_SCRIPTS], 'only the read-only schema scripts are spawned when there is no read-sync script')
   assert.equal(d.spawned.some((spec) => spec.script === 'validate:db' || /generate/.test(spec.script)), false, 'validate:db and any generate script are never run')
-  assert.equal(Object.keys(results).length, 21)
+  assert.equal(Object.keys(results).length, 22)
 })
 
 test('every dependency that throws, rejects or returns garbage becomes NO-GO, never a pass [mutation: unreadable treated as empty]', async () => {
@@ -95,6 +98,11 @@ test('every dependency that throws, rejects or returns garbage becomes NO-GO, ne
     ['the constraint catalogue cannot be read', { readInstalledConstraints: async () => { throw new Error('permission denied') } }, 'schema-state'],
     ['rehearsal dir unreadable', { readNewestRehearsal: () => { throw new Error('EACCES') } }, 'first-install-rehearsal'],
     ['no rehearsal', { readNewestRehearsal: () => ({ none: 'no rehearsal report was found' }) }, 'first-install-rehearsal'],
+    ['the database run record cannot be read', { readApplyRun: boom }, 'first-load-apply'],
+    ['the apply report directory cannot be read', { readApplyReports: () => { throw new Error('EACCES') } }, 'first-load-apply'],
+    ['no apply report', { readApplyReports: () => ({ none: 'no first-load apply report was found' }) }, 'first-load-apply'],
+    ['an untrusted apply report location', { readApplyReports: () => ({ untrusted: 'not trusted' }) }, 'first-load-apply'],
+    ['no run record in the database', { readApplyRun: async () => ({ systemId: APPLY_SYSTEM_ID, runs: [] }) }, 'first-load-apply'],
     ['package.json unreadable', { readPackageScripts: () => { throw new Error('ENOENT') } }, 'read-sync-liveness'],
     ['outbound activity log unreadable', { readOutbound: async () => cleanOutbound({ countsAvailable: false }) }, 'outbound-status'],
   ]
@@ -341,7 +349,7 @@ test('the default rehearsal location is refused too when it fails the checks (sa
   const dir = scratchBase('ims-gate-trustdefault-')
   publish(dir, 'run', greenRehearsal())
   chmodSync(dir, 0o777)
-  const { results } = await collectGateResults({ phase: 'P0', expectGranted: null, rehearsalDir: dir }, { ...deps(), readNewestRehearsal: (d) => readNewestRehearsal(d, verifyPublishedReport) })
+  const { results } = await collectGateResults({ phase: 'P0', expectGranted: null, rehearsalDir: dir, applyReportDir: '/a' }, { ...deps(), readNewestRehearsal: (d) => readNewestRehearsal(d, verifyPublishedReport) })
   assert.equal(results['first-install-rehearsal']!.kind, 'fail')
   assert.match(JSON.stringify(results['first-install-rehearsal']), /not trusted/)
 })
@@ -418,4 +426,20 @@ test('the expected CHECK constraints are exactly the migrations\' (name, table a
   assert.equal(probed.length, 6)
   for (const name of probed) assert.ok(REQUIRED_CHECK_CONSTRAINTS.some((entry) => entry.name === name), `${name} (made to fire by validate:db) is required by the gate`)
   assert.deepEqual(Object.keys(PG_RENDERED).sort(), REQUIRED_CHECK_CONSTRAINTS.map((entry) => entry.name).sort())
+})
+
+test('first-load-apply: a published pair on disk, the VERIFIED record and the same cluster collect as a pass; the same pair read against another cluster fails', async () => {
+  const dir = scratchBase('ims-gate-applycollect-')
+  chmodSync(dir, 0o700)
+  const markdown = '# apply\n'
+  writeFileSync(path.join(dir, 'first-load-apply-apply-qoblex-load-1-20261006T120000Z.md'), markdown, { mode: 0o600 })
+  writeFileSync(path.join(dir, 'first-load-apply-apply-qoblex-load-1-20261006T120000Z.json'), JSON.stringify({ ...greenApplyReport(), companionMarkdownSha256: createHash('sha256').update(markdown).digest('hex') }), { mode: 0o600 })
+  const options = { ...OPTIONS, applyReportDir: dir }
+  const good = await collectGateResults(options, deps({ readApplyReports }))
+  assert.equal(good.results['first-load-apply']!.kind, 'pass', JSON.stringify(good.results['first-load-apply']))
+  const elsewhere = await collectGateResults(options, deps({ readApplyReports, readApplyRun: async () => ({ systemId: '5'.repeat(19), runs: [{ ...APPLY_RUN }] }) }))
+  assert.equal(elsewhere.results['first-load-apply']!.kind, 'fail')
+  const verdict = decideVerdict({ phase: 'P0', results: elsewhere.results, acceptances: NO_ACCEPTANCES, now: NOW })
+  assert.equal(verdict.verdict, 'NO-GO')
+  assert.ok(verdict.blockingReasons.some((reason) => reason.startsWith('first-load-apply:')))
 })

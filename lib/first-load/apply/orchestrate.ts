@@ -124,6 +124,16 @@ export interface ApplyPorts {
   /** `lock` is the handle of the step lock this call runs under; an executor that makes several importer calls checks it before each. */
   execute(step: ApplyStepId, file: ResidualFile, lock: StepLock): Promise<ImporterResult>
   verify?(run: PreparedRun, steps: StepResult[]): Promise<VerificationItem[]>
+  /** What every rail answered over the whole run so far (preflight, step starts, before first writes). Read for the report; never decides anything. */
+  railTally?(): RailTally[]
+}
+
+/** One rail over a run: how often it was evaluated, how often it refused, and the closed description of the last state it read. */
+export interface RailTally {
+  id: string
+  evaluations: number
+  refusals: number
+  detail: string
 }
 
 export interface RehearsalRecord {

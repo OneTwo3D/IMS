@@ -353,6 +353,10 @@ const ALLOWLIST = [
   'lib/ops/writers-check.ts',
   'lib/domain/incumbent-evidence/classify.ts',
   'lib/ops/outbound-status.ts',
+  // The first-load runner's pre-load rails ask, per connector, whether it is enabled with a credential that could write (one switch and one
+  // set of credential rows each, read from the settings registry), so the file necessarily names each connector, exactly as the outbound hold
+  // and the coexistence check do. It is read-only and spells no connector flow, import or call.
+  'lib/first-load/apply/db/preload-rails.ts',
   // The read-sync liveness registry IS a per-connector inventory of the read feeds that keep IMS current
   // (one row and one limit per feed, so it necessarily names each connector), exactly as the outbound hold
   // names each destination. The alarm and the status script are generic: they iterate this registry and

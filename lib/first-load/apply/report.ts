@@ -2,8 +2,8 @@
  * The apply report: JSON for machines, Markdown for people. Pure and deterministic: everything in it comes from its arguments (the
  * caller supplies the window times), steps follow load order and rows are sorted by key.
  */
-import { APPLY_EXIT_CODES, APPLY_REPORT_FORMAT_VERSION, exitOperatorText, type ApplyMode } from './constants'
-import type { ApplyResult, StepResult } from './orchestrate'
+import { APPLY_CHECK_RAILS, APPLY_EXIT_CODES, APPLY_REPORT_FORMAT_VERSION, RAIL_IDS, exitOperatorText, type ApplyMode } from './constants'
+import type { ApplyResult, RailTally, StepResult } from './orchestrate'
 import type { PreparedRun } from './prepared'
 
 export interface PreconditionResult {
@@ -56,7 +56,36 @@ export interface ApplyReport {
   window: { start: string; end: string } | null
 }
 
-export function buildApplyReport(args: { prepared: PreparedRun; result: ApplyResult; preconditions?: PreconditionResult[]; window?: { start: string; end: string } | null; target?: ReportTarget | null; restorePoint?: ReportRestorePoint | null; targetUnchanged?: boolean | null }): ApplyReport {
+/**
+ * `preconditions[]`: every rail, then every apply-time check, always the same ids in the same order (PRECONDITION_IDS). A rail that refused in ANY evaluation of the run is refused,
+ * whatever a later evaluation said. A check is proved by the rails that prove it (APPLY_CHECK_RAILS); one the prepared files prove alone passes (the run could not have been loaded
+ * otherwise); one in an area the runner refuses is not applicable. With no rail evaluated at all (the run ended before the database was read) there are none.
+ */
+export function buildPreconditions(tally: readonly RailTally[]): PreconditionResult[] {
+  if (tally.length === 0) return []
+  const byId = new Map(tally.map((t) => [t.id, t]))
+  const railResult = (id: string): PreconditionResult['result'] => {
+    const t = byId.get(id)
+    return t === undefined || t.evaluations === 0 ? 'not-applicable' : t.refusals > 0 ? 'refused' : 'pass'
+  }
+  const out: PreconditionResult[] = RAIL_IDS.map((id) => {
+    const t = byId.get(id)
+    const result = railResult(id)
+    return { id: `rail:${id}`, result, detail: result === 'not-applicable' ? 'not evaluated for the steps selected' : result === 'refused' ? `refused in ${t!.refusals} of ${t!.evaluations} evaluation(s)` : `${t!.detail === '' ? 'held' : t!.detail} (${t!.evaluations} evaluation(s))` }
+  })
+  for (const id of Object.keys(APPLY_CHECK_RAILS).sort()) {
+    const rails = APPLY_CHECK_RAILS[id]
+    if (rails === null) out.push({ id: `check:${id}`, result: 'not-applicable', detail: 'the runner refuses this area' })
+    else if (rails === undefined || rails.length === 0) out.push({ id: `check:${id}`, result: rails === undefined ? 'refused' : 'pass', detail: rails === undefined ? 'no rail proves this check' : 'proved from the prepared files when the run was loaded' })
+    else {
+      const results = rails.map(railResult)
+      out.push({ id: `check:${id}`, result: results.includes('refused') ? 'refused' : results.every((r) => r === 'not-applicable') ? 'not-applicable' : 'pass', detail: `proved by ${rails.map((r) => `rail:${r}`).join(', ')}` })
+    }
+  }
+  return out
+}
+
+export function buildApplyReport(args: { prepared: PreparedRun; result: ApplyResult; preconditions?: PreconditionResult[]; rails?: readonly RailTally[]; window?: { start: string; end: string } | null; target?: ReportTarget | null; restorePoint?: ReportRestorePoint | null; targetUnchanged?: boolean | null }): ApplyReport {
   const { prepared, result } = args
   const exitName = result.exit
   return {
@@ -77,7 +106,7 @@ export function buildApplyReport(args: { prepared: PreparedRun; result: ApplyRes
     target: args.target ?? null,
     restorePoint: args.restorePoint ?? null,
     targetUnchanged: args.targetUnchanged ?? null,
-    preconditions: args.preconditions ?? [],
+    preconditions: args.preconditions ?? buildPreconditions(args.rails ?? []),
     steps: result.steps,
     accountingBalanced: result.steps.every((s) => s.emitted === s.created + s.updated + s.skippedExisting + s.failed),
     verification: result.verification,

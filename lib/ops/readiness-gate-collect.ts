@@ -27,7 +27,9 @@ import { spawn } from 'node:child_process'
 import { lstatSync, readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 
-import { UntrustedPathError, checkAncestors, readTrustedRegularFile } from '@/lib/ops/published-report'
+import { createHash } from 'node:crypto'
+
+import { UntrustedPathError, checkAncestors, readTrustedRegularFile, readTrustedRegularFileBytes } from '@/lib/ops/published-report'
 import {
   CHECK_CATALOGUE,
   PACK_ITEMS,
@@ -40,6 +42,7 @@ import {
   type ReadinessPhase,
 } from '@/lib/ops/readiness-gate-constants'
 import {
+  assessApplyReport,
   assessInvariantReport,
   assessOutboundStatus,
   assessReadSyncStatus,
@@ -47,6 +50,9 @@ import {
   derivePackItemFromInvariant,
   type CheckResult,
   type CollectedResults,
+  type ApplyEvidence,
+  type ApplyReportFile,
+  type ApplyRunRow,
   type GateWarning,
   type InvariantEvidence,
   type OutboundEvidence,
@@ -81,6 +87,10 @@ export type GateDeps = {
   readInstalledConstraints: () => Promise<ConstraintRow[]>
   /** The newest rehearsal report in `dir`, or a reason there is none. Throws when the directory cannot be read. */
   readNewestRehearsal: (dir: string, now: Date) => RehearsalEvidence | { none: string } | { untrusted: string }
+  /** The database's cluster system identifier and its first-load run record(s) (a read). Throws when they cannot be read. */
+  readApplyRun: () => Promise<{ systemId: string; runs: ApplyRunRow[] }>
+  /** Every published apply report in `dir`, each read ONCE, or a reason there is none. Throws when the directory cannot be read. */
+  readApplyReports: (dir: string) => ApplyReportsRead
   /** The environment of this process, read only by name. */
   env: Record<string, string | undefined>
   repoRoot: string
@@ -90,6 +100,7 @@ export type CollectOptions = {
   phase: ReadinessPhase
   expectGranted: string[] | null
   rehearsalDir: string
+  applyReportDir: string
 }
 
 function describe(error: unknown): string {
@@ -255,6 +266,73 @@ export function readNewestRehearsal(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Published first-load apply reports on disk.
+// ---------------------------------------------------------------------------------------------
+
+export type ApplyReportsRead = { none: string } | { untrusted: string } | { reports: ApplyReportFile[]; unparseable: number }
+
+/** The name every apply report's JSON has (scripts/first-load-apply.ts reportStem for mode `apply`). A name selects a CANDIDATE only; nothing is believed because of it. */
+const APPLY_REPORT_JSON_NAME = /^first-load-apply-apply-[A-Za-z0-9._-]+\.json$/
+const MAX_APPLY_REPORT_FILES = 500
+
+/**
+ * Every candidate apply report in `dir`. The same trust policy as the rehearsal reports: the directory and every ancestor, and each file, must be ones only root or the running account could
+ * have written (no symlink anywhere; any violation refuses the whole location). Each JSON is read ONCE through the trusted reader, and the digest, the parse and the Markdown comparison all
+ * use those bytes: a file that changes after the read changes nothing. The Markdown beside it is read the same way. Which report speaks for the database is NOT decided here (see
+ * assessApplyReport): this returns them all, in directory order, with no ranking by time.
+ */
+export function readApplyReports(dir: string): ApplyReportsRead {
+  const refuse = (reason: string) => ({ untrusted: `the first-load apply report location is not trusted (${reason}); a report that another account could have written proves nothing, so it was not read` })
+  let names: string[]
+  try {
+    const rootProblem = checkAncestors(dir, 'first-load apply report directory')
+    if (rootProblem) {
+      try { lstatSync(dir) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { none: `the first-load apply report directory ${dir} does not exist` } }
+      return refuse(rootProblem)
+    }
+    names = readdirSync(dir)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { none: `the first-load apply report directory ${dir} does not exist` }
+    throw error
+  }
+  const candidates = names.filter((name) => APPLY_REPORT_JSON_NAME.test(name)).sort()
+  if (candidates.length > MAX_APPLY_REPORT_FILES) return { untrusted: `the first-load apply report directory holds ${candidates.length} candidate reports, more than the ${MAX_APPLY_REPORT_FILES} this gate reads` }
+  const reports: ApplyReportFile[] = []
+  let unparseable = 0
+  for (const name of candidates) {
+    const json = path.join(dir, name)
+    let jsonBytes: Buffer
+    try {
+      jsonBytes = readTrustedRegularFileBytes(json, MAX_REPORT_BYTES)
+    } catch (error) {
+      if (error instanceof UntrustedPathError) return refuse(error.message)
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') return refuse(`${json} is a symlink`)
+      throw error
+    }
+    let markdownBytes: Buffer | null = null
+    try {
+      markdownBytes = readTrustedRegularFileBytes(json.replace(/\.json$/, '.md'), MAX_REPORT_BYTES)
+    } catch (error) {
+      if (error instanceof UntrustedPathError) return refuse(error.message)
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') return refuse(`${json.replace(/\.json$/, '.md')} is a symlink`)
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(jsonBytes.toString('utf8'))
+    } catch {
+      unparseable += 1
+      continue
+    }
+    const recorded = typeof parsed === 'object' && parsed !== null ? (parsed as { companionMarkdownSha256?: unknown }).companionMarkdownSha256 : undefined
+    const markdownDigestOk = markdownBytes !== null && typeof recorded === 'string' && createHash('sha256').update(markdownBytes).digest('hex') === recorded
+    reports.push({ parsed, markdownDigestOk })
+  }
+  if (reports.length === 0 && unparseable === 0) return { none: `no first-load apply report was found under ${dir}` }
+  return { reports, unparseable }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Reconciliation findings -> a check result.
 // ---------------------------------------------------------------------------------------------
 
@@ -374,6 +452,16 @@ export async function collectGateResults(options: CollectOptions, deps: GateDeps
     return assessRehearsalReport(found, now, gateBuild)
   })
 
+  // 4b. The first load: the database's run record (identity and status) and the published report that names it.
+  results['first-load-apply'] = await guarded('the first-load apply report', async () => {
+    const run = await deps.readApplyRun()
+    const found = deps.readApplyReports(options.applyReportDir)
+    if ('none' in found) return { kind: 'fail', reasons: [found.none] } as CheckResult
+    if ('untrusted' in found) return { kind: 'fail', reasons: [found.untrusted] } as CheckResult
+    const evidence: ApplyEvidence = { systemId: run.systemId, runs: run.runs, reports: found.reports, unparseable: found.unparseable }
+    return assessApplyReport(evidence, now)
+  })
+
   // 5. Reconciliation completeness.
   results['reconciliation-completeness'] = await guarded('the reconciliation completeness proof', async () => assessReconciliationReadiness(await deps.readReconciliation(now)))
 
@@ -425,6 +513,13 @@ export async function defaultReadReconciliation(now: Date): Promise<AccountingRe
   const { collectAccountingReconciliationReadiness, createDefaultRolloutReadinessAdapters } = await import('@/lib/ops/rollout-readiness')
   const adapters = createDefaultRolloutReadinessAdapters()
   return collectAccountingReconciliationReadiness(adapters, now)
+}
+
+export async function defaultReadApplyRun(): Promise<{ systemId: string; runs: ApplyRunRow[] }> {
+  const { db } = await import('@/lib/db')
+  const ids = await db.$queryRaw<Array<{ sid: string }>>`SELECT system_identifier::text AS sid FROM pg_control_system()`
+  const rows = await db.firstLoadApplyRun.findMany({ select: { runId: true, manifestDigest: true, status: true } })
+  return { systemId: ids[0]?.sid ?? '', runs: rows }
 }
 
 export function readPackageScriptsFrom(repoRoot: string): Record<string, string> {
