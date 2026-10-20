@@ -44,11 +44,13 @@ const BEFORE_CUTOFF = new Date('2026-05-20T00:00:00.000Z')
 const AFTER_CUTOFF = new Date('2026-06-10T00:00:00.000Z')
 
 // A recording shadow store in place of the database. Created before the sweep module is imported.
+let failShadowWrites = false
 const shadows: Array<{ operation: string; subjectType: string; subjectId: string; reason: string }> = []
 const fakeDb = {
   $queryRaw: async (query: { strings?: readonly string[]; values?: readonly unknown[] }) => {
     const text = (query.strings ?? []).join('?')
     if (!text.includes('outbound_shadow_writes')) return []
+    if (failShadowWrites) throw new Error('connection reset')
     const values = query.values ?? []
     const existing = shadows.filter((shadow) => shadow.operation === String(values[1]) && shadow.subjectId === String(values[3])).length
     shadows.push({ operation: String(values[1]), subjectType: String(values[2]), subjectId: String(values[3]), reason: String(values[6]) })
@@ -558,4 +560,35 @@ test('HELD create pass walks the candidates by a rotating cursor: the page after
   const off = await run(OFF, null, ['so-b', 'so-c'])
   assert.deepEqual(off.asked, [null], 'CONTROL: switch OFF asks the legacy question with no rotation')
   assert.deepEqual(off.writes, [], 'CONTROL: and keeps no cursor')
+})
+
+test('HELD create whose shadow write FAILS: not a clean held outcome (counted apart, logged, no link, no claim); the batch is not blocked; the next pass records it once; OFF is untouched', async () => {
+  const logged: string[] = []
+  const originalError = console.error
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')) }
+  try {
+    await withEnv(HELD, async () => {
+      failShadowWrites = true
+      const failing = await sweep({ createCandidates: [candidate({ id: 'so-a', orderNumber: 'SO-A' }), candidate({ id: 'so-b', orderNumber: 'SO-B' })] })
+      failShadowWrites = false
+      console.log(`# unrecorded: ${JSON.stringify(failing.result)} writes=${JSON.stringify(failing.writes)} calls=${JSON.stringify(failing.calls)}`)
+      assert.equal(failing.result.shadowUnrecorded, 2, 'both are reported as unrecorded, and the second is still attempted (the failing order does not block the batch)')
+      assert.equal('shadowed' in failing.result, false, 'and neither is counted as a clean shadow')
+      assert.deepEqual(failing.writes, [], 'no claim, no link write')
+      assert.deepEqual(failing.calls, [], 'nothing sent')
+      assert.ok(logged.filter((line) => line.includes('shadow_create_unrecorded')).length === 2, 'each is logged with the closed code')
+      const retry = await sweep({ createCandidates: [candidate({ id: 'so-a', orderNumber: 'SO-A' }), candidate({ id: 'so-b', orderNumber: 'SO-B' })] })
+      assert.equal(retry.result.shadowed, 2, 'the next pass records them')
+      assert.equal('shadowUnrecorded' in retry.result, false)
+      assert.deepEqual(shadows.map((s) => s.subjectId).sort(), ['so-a', 'so-b'])
+    })
+  } finally {
+    console.error = originalError
+    failShadowWrites = false
+  }
+  await withEnv(OFF, async () => {
+    const run = await sweep({ createCandidates: [candidate()] })
+    assert.equal('shadowUnrecorded' in run.result, false, 'CONTROL: switch off never reaches the arm')
+    assert.deepEqual(run.calls, ['pushOrder:SO-1'])
+  })
 })

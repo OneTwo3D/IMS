@@ -339,6 +339,12 @@ export type WmsOrderPushSweepResult = {
    */
   shadowed?: number
   /**
+   * Held creates whose shadow record could NOT be written. The order was not handled: it has no link and no record, so it stays in the candidate
+   * set and is tried again on the next pass (the walk and the other orders in the batch are unaffected), and each one is logged with a closed
+   * code. Never counted in `shadowed`. PRESENT ONLY WHEN NON-ZERO.
+   */
+  shadowUnrecorded?: number
+  /**
    * Once the destination is live, a HELD, VALIDATION_FAILED or AMBIGUOUS_CREATE link whose order was paid before the live-from instant was
    * NOT re-queued: the create query excludes such an order, so a re-queue would strand it in PENDING_CREATE and lose its prior error and
    * WMS id. The link is left exactly as it was. PRESENT ONLY WHEN NON-ZERO.
@@ -959,6 +965,7 @@ export async function runWmsOrderPushSweepCore(
   // the seam BEFORE it claims, records or calls anything, and a shadow answer changes no state: no claim, no link write, no
   // attempt, no failure. Unenforced (the default) every answer is `proceed` and nothing below differs from before.
   let shadowedCount = 0
+  let shadowUnrecordedCount = 0
   let recoveryRefusedCount = 0
   /** THE SINGLE FLOOR of this sweep: the create query and every re-queue into PENDING_CREATE read it, so they cannot disagree. Null: not enforced, or not live. */
   const createFloor = wmsCreateObligationFloor(connectorId, producerContext)
@@ -1603,6 +1610,15 @@ export async function runWmsOrderPushSweepCore(
         context: producerContext,
       })
       if (!createSeam.proceed) {
+        // RECORD OR NOT HANDLED. The record of a held create is the only trace IMS keeps of an order it declined to push (no link is written), and
+        // an order hard delete reads "no link and no record" as "nothing was called". A create whose record could not be written is therefore
+        // NOT a clean held outcome: it is counted apart, logged loudly, and left exactly as it was, so the next pass offers it again and records it
+        // once the store answers. It cannot starve the batch: the batch continues with the next order and the held walk's cursor advances by page.
+        if (!createSeam.recorded) {
+          shadowUnrecordedCount += 1
+          console.error(`[wms-order-push] shadow_create_unrecorded: the held create of order ${order.id} was not recorded; it stays a candidate and is retried next pass`)
+          continue
+        }
         shadowedCount += 1
         continue
       }
@@ -2485,6 +2501,7 @@ export async function runWmsOrderPushSweepCore(
   }
 
   if (shadowedCount > 0) result.shadowed = shadowedCount
+  if (shadowUnrecordedCount > 0) result.shadowUnrecorded = shadowUnrecordedCount
   if (recoveryRefusedCount > 0) result.recoveryRefusedPreCutoff = recoveryRefusedCount
   return result
 }
