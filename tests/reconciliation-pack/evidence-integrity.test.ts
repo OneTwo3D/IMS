@@ -95,7 +95,7 @@ test('currencies: R9 (minor unit) needs a known currency for each value, equal o
 test('presence items (R13, R14) carry no values and no currencies', () => {
   const base = defaultItems('P1')
   const r13 = (e: ItemInput['entries']): ItemInput => ({ ...passItem('R13'), proof: { kind: 'compared' }, entries: e })
-  assert.doesNotThrow(() => buildReport(input(put(base, r13({ bothEqual: [{ key: 'TAX1', ims: null, vendor: null, delta: null }] }))), 1, null))
+  assert.doesNotThrow(() => buildReport(input(put(base, r13({ bothEqual: [{ key: 'TAX1', ims: null, vendor: null, delta: null, imsPresent: true, vendorPresent: true }] }))), 1, null))
   rejects(put(base, r13({ bothEqual: [pair('TAX1')] })), 'a value in a presence item')
   rejects(put(base, r13({ bothEqual: [{ key: 'TAX1', ims: null, vendor: null, delta: null, imsCurrency: 'GBP' }] })), 'a currency in a presence item')
   assert.equal(getPackItem('R13').measure, null)
@@ -173,7 +173,7 @@ test('the rich input builds; its evidence and JSON hold only the whitelisted fie
   assert.equal(built.record.items.find((i) => i.id === 'R1')!.counts.unsettled, 1)
   const keys = new Set<string>()
   for (const l of built.evidenceText.trim().split('\n')) for (const k of Object.keys(JSON.parse(l))) keys.add(k)
-  assert.deepEqual([...keys].sort(), ['bucket', 'delta', 'ims', 'imsCurrency', 'item', 'key', 'settling', 'vendor', 'vendorCurrency'])
+  assert.deepEqual([...keys].sort(), ['bucket', 'delta', 'ims', 'imsCurrency', 'imsPresent', 'item', 'key', 'settling', 'vendor', 'vendorCurrency', 'vendorPresent'])
 })
 
 test('DATA ABSENCE: a marker added to, or put in place of, every nested property of the input is refused before any output exists', () => {

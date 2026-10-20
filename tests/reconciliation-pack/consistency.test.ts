@@ -224,7 +224,7 @@ test('the builder refuses every malformed input shape with ReportInvalid (never 
 test('the evidence reader refuses a value that is not in the one canonical text form', () => {
   const { body, markdown } = buildReport(input(put(base(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ key: 'A|MAIN' as never, ims: '1.5', vendor: null, delta: null }] } })), 1, null)
   const record = { ...body, companionMarkdownSha256: sha256Hex(markdown) }
-  const line = (ims: string) => `${JSON.stringify({ item: 'R3', bucket: 'excluded', key: 'A|MAIN', ims, vendor: null, delta: null, imsCurrency: null, vendorCurrency: null })}\n`
+  const line = (ims: string) => `${JSON.stringify({ item: 'R3', bucket: 'excluded', key: 'A|MAIN', ims, vendor: null, delta: null, imsCurrency: null, vendorCurrency: null, imsPresent: true, vendorPresent: false })}\n`
   const withText = (text: string) => ({ ...record, evidence: { ...record.evidence, sha256: sha256Hex(text) } })
   verifyEvidence(line('1.5'), withText(line('1.5')))
   for (const ims of ['1.50', '-0', '0.0', '01', '+1', '1e0']) assert.throws(() => verifyEvidence(line(ims), withText(line(ims))), ReportInvalid, ims)

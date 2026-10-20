@@ -58,7 +58,7 @@ const EMIT_ORDER: readonly ComparisonBucket[] = ['onlyIms', 'onlyVendor', 'bothD
 
 /** What a caller may hand in for one entry. The currencies default to null; no other field is optional. */
 /** The key is checked at runtime against the sanitised-token shape (identity.ts), so the type does not demand the brand. */
-export type EntryInput = Omit<CompareEntry, 'imsCurrency' | 'vendorCurrency' | 'key'> & { key: string; imsCurrency?: string | null; vendorCurrency?: string | null }
+export type EntryInput = Omit<CompareEntry, 'imsCurrency' | 'vendorCurrency' | 'imsPresent' | 'vendorPresent' | 'key'> & { key: string; imsCurrency?: string | null; vendorCurrency?: string | null; imsPresent?: boolean; vendorPresent?: boolean }
 
 export type ItemInput = {
   id: PackItemId
@@ -169,9 +169,12 @@ export type CleanEntry = {
   delta: string | null
   imsCurrency: string | null
   vendorCurrency: string | null
+  /** Whether each side had the identity. In values mode this is exactly "the side has a value"; in presence mode it is the only record of it. */
+  imsPresent: boolean
+  vendorPresent: boolean
   settling?: { first: string; later: string[] }
 }
-const ENTRY_KEYS = ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency', 'settling'] as const
+const ENTRY_KEYS = ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency', 'imsPresent', 'vendorPresent', 'settling'] as const
 const MAX_SETTLING_LATER = 8
 
 function nullableDecimal(value: unknown, what: string): string | null {
@@ -185,9 +188,22 @@ function nullableCurrency(value: unknown, what: string): string | null {
   return value
 }
 
+/**
+ * A presence flag is a boolean. When the caller leaves it out, a VALUES item's flag is read off its value (the only thing
+ * it can mean there); a PRESENCE item has no value to read it from, so the caller must say, and a missing flag is refused.
+ */
+function presenceFlag(flag: unknown, defaultsFor: PackItemId | null, value: unknown, side: string): boolean {
+  if (flag !== undefined) {
+    if (typeof flag !== 'boolean') throw new ReportInvalid(`an entry ${side} presence flag is not a boolean`)
+    return flag
+  }
+  if (defaultsFor !== null && getPackItem(defaultsFor).mode === 'values') return value !== null
+  throw new ReportInvalid(`an entry must say whether the ${side} side has the identity`)
+}
+
 /** Copy one caller-owned entry into a clean one (or throw). Used for builder input and for parsed evidence lines alike. */
-function cleanEntry(raw: unknown, optionalCurrencies: boolean): CleanEntry {
-  const r = plainRecord(raw, ENTRY_KEYS, optionalCurrencies ? ['key', 'ims', 'vendor', 'delta'] : ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency'], 'an entry')
+function cleanEntry(raw: unknown, defaultsFor: PackItemId | null): CleanEntry {
+  const r = plainRecord(raw, ENTRY_KEYS, defaultsFor ? ['key', 'ims', 'vendor', 'delta'] : ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency', 'imsPresent', 'vendorPresent'], 'an entry')
   if (typeof r.key !== 'string' || !isSafeTokenShape(r.key)) throw new ReportInvalid('an entry key is not a sanitised token')
   const entry: CleanEntry = {
     key: r.key,
@@ -196,6 +212,8 @@ function cleanEntry(raw: unknown, optionalCurrencies: boolean): CleanEntry {
     delta: nullableDecimal(r.delta, 'delta'),
     imsCurrency: nullableCurrency(r.imsCurrency === undefined ? null : r.imsCurrency, 'ims currency'),
     vendorCurrency: nullableCurrency(r.vendorCurrency === undefined ? null : r.vendorCurrency, 'vendor currency'),
+    imsPresent: presenceFlag(r.imsPresent, defaultsFor, r.ims, 'ims'),
+    vendorPresent: presenceFlag(r.vendorPresent, defaultsFor, r.vendor, 'vendor'),
   }
   if (r.settling !== undefined) {
     const settling = plainRecord(r.settling, ['first', 'later'], ['first', 'later'], 'settling data')
@@ -216,41 +234,49 @@ export function checkEntry(id: PackItemId, bucket: ComparisonBucket, entry: Clea
   const fail = (why: string): never => { throw new ReportInvalid(`item ${id}: ${bucket} entry ${why}`) }
   const spec = getPackItem(id)
   if ((entry.settling !== undefined) !== (bucket === 'unsettled')) fail('settling data belongs to unsettled entries and to nothing else')
+  if (!entry.imsPresent && !entry.vendorPresent) fail('is present on neither side')
+
+  // What the entry says about the pair, derived from the recorded fields alone: the bucket is judged against this, never believed.
+  let derived: 'onlyIms' | 'onlyVendor' | 'bothEqual' | 'bothDiffer'
+  let delta: string | null = null
   if (spec.mode === 'presence') {
     if (entry.ims !== null || entry.vendor !== null || entry.delta !== null || entry.imsCurrency !== null || entry.vendorCurrency !== null) fail('a presence item carries no values')
-    return
-  }
-  const measure = spec.measure!
-  const a = parseDecimalStrict(entry.ims)
-  const b = parseDecimalStrict(entry.vendor)
-  if ((entry.ims === null) !== (a === null) || (entry.vendor === null) !== (b === null)) fail('has an unreadable value')
-  if (measure.rule === 'minor-unit' && ((a !== null && entry.imsCurrency === null) || (b !== null && entry.vendorCurrency === null))) fail('needs a currency for each value')
-  if ((a === null && entry.imsCurrency !== null) || (b === null && entry.vendorCurrency !== null)) fail('has a currency for a missing value')
-  const both = a !== null && b !== null
-  if (both && (entry.imsCurrency === null) !== (entry.vendorCurrency === null)) fail('has a currency on one side only')
-  const delta = both ? decimalText(a.minus(b)) : null
-  // The verdict the pair gets, recomputed here.
-  let equal: boolean | null = null
-  if (both) {
-    if (entry.imsCurrency !== entry.vendorCurrency) equal = false
-    else {
-      const within = withinTolerance(measure, a, b, entry.imsCurrency)
-      if (within === null) fail('has no usable currency for its tolerance')
-      equal = within
+    derived = entry.imsPresent && entry.vendorPresent ? 'bothEqual' : entry.imsPresent ? 'onlyIms' : 'onlyVendor'
+  } else {
+    const measure = spec.measure!
+    const a = parseDecimalStrict(entry.ims)
+    const b = parseDecimalStrict(entry.vendor)
+    if (entry.imsPresent !== (a !== null) || entry.vendorPresent !== (b !== null)) fail('has a presence flag that disagrees with its value')
+    if (measure.rule === 'minor-unit' && ((a !== null && entry.imsCurrency === null) || (b !== null && entry.vendorCurrency === null))) fail('needs a currency for each value')
+    if ((a === null && entry.imsCurrency !== null) || (b === null && entry.vendorCurrency !== null)) fail('has a currency for a missing value')
+    if (a !== null && b !== null) {
+      if ((entry.imsCurrency === null) !== (entry.vendorCurrency === null)) fail('has a currency on one side only')
+      delta = decimalText(a.minus(b))
+      let equal: boolean
+      if (entry.imsCurrency !== entry.vendorCurrency) equal = false
+      else {
+        const within = withinTolerance(measure, a, b, entry.imsCurrency)
+        if (within === null) fail('has no usable currency for its tolerance')
+        equal = within as boolean
+      }
+      derived = equal ? 'bothEqual' : 'bothDiffer'
+    } else {
+      derived = a !== null ? 'onlyIms' : 'onlyVendor'
     }
+    // A delta exists exactly for a pair that is being judged (the four pair buckets and unsettled), and is the true one.
+    const judgedPair = bucket === 'bothEqual' || bucket === 'bothDiffer' || bucket === 'unsettled'
+    if (entry.delta !== (judgedPair ? delta : null)) fail('has the wrong delta')
   }
+
   switch (bucket) {
-    case 'onlyIms': if (a === null || b !== null || entry.delta !== null) fail('must carry the ims value alone'); return
-    case 'onlyVendor': if (b === null || a !== null || entry.delta !== null) fail('must carry the vendor value alone'); return
-    case 'bothEqual': if (!both || equal !== true || entry.delta !== delta) fail('is not a pair within the tolerance, with the true delta'); return
-    case 'bothDiffer': if (!both || equal !== false || entry.delta !== delta) fail('is not a pair outside the tolerance, with the true delta'); return
+    case 'onlyIms': case 'onlyVendor': case 'bothEqual': case 'bothDiffer':
+      if (derived !== bucket) fail(`is, by its own fields, ${derived}`)
+      return
     case 'unsettled':
-      if (a === null && b === null) fail('carries no value')
-      if (both) { if (equal !== false || entry.delta !== delta) fail('is a pair that does not differ, or has the wrong delta') } else if (entry.delta !== null) fail('has a delta with one value')
+      if (derived === 'bothEqual') fail('is a pair that does not differ')
       return
     case 'excluded': case 'outOfPopulation':
-      if (a === null && b === null) fail('carries no value')
-      if (entry.delta !== null) fail('carries a delta')
+      return
   }
 }
 
@@ -280,7 +306,7 @@ function cleanItem(raw: unknown): CleanItem {
     const e = plainRecord(r.entries, COMPARISON_BUCKETS, [], `item ${id} entries`)
     for (const bucket of COMPARISON_BUCKETS) {
       if (e[bucket] === undefined) continue
-      entries[bucket] = plainList(e[bucket], MAX_ENTRIES_PER_BUCKET, `item ${id} ${bucket} entries`).map((raw) => cleanEntry(raw, true))
+      entries[bucket] = plainList(e[bucket], MAX_ENTRIES_PER_BUCKET, `item ${id} ${bucket} entries`).map((raw) => cleanEntry(raw, id))
     }
   }
   return { id, outcome: r.outcome as PackOutcome, reasons: reasons as PackReasonCode[], proof, sources: sources as PackSourceCode[], entries }
@@ -325,7 +351,7 @@ function itemEvidence(item: CleanItem, maxLines: number): { lines: string[]; cou
 }
 
 function evidenceLine(item: PackItemId, bucket: ComparisonBucket, entry: CleanEntry): string {
-  const line = { item, bucket, key: entry.key, ims: entry.ims, vendor: entry.vendor, delta: entry.delta, imsCurrency: entry.imsCurrency, vendorCurrency: entry.vendorCurrency, ...(entry.settling ? { settling: { first: entry.settling.first, later: [...entry.settling.later] } } : {}) }
+  const line = { item, bucket, key: entry.key, ims: entry.ims, vendor: entry.vendor, delta: entry.delta, imsCurrency: entry.imsCurrency, vendorCurrency: entry.vendorCurrency, imsPresent: entry.imsPresent, vendorPresent: entry.vendorPresent, ...(entry.settling ? { settling: { first: entry.settling.first, later: [...entry.settling.later] } } : {}) }
   return JSON.stringify(line)
 }
 
@@ -591,7 +617,7 @@ export function verifyEvidence(text: string, record: ReportRecord): void {
     let parsed: unknown
     try { parsed = JSON.parse(line) } catch { throw new ReportInvalid('an evidence line is not JSON') }
     let fields: Record<string, unknown>
-    try { fields = plainRecord(parsed, ['item', 'bucket', ...ENTRY_KEYS], ['item', 'bucket', 'key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency'], 'an evidence line') } catch (error) {
+    try { fields = plainRecord(parsed, ['item', 'bucket', ...ENTRY_KEYS], ['item', 'bucket', 'key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency', 'imsPresent', 'vendorPresent'], 'an evidence line') } catch (error) {
       if (error instanceof ShapeError) throw new ReportInvalid(error.message)
       throw error
     }
@@ -603,7 +629,7 @@ export function verifyEvidence(text: string, record: ReportRecord): void {
     try {
       const { item: _item, bucket: _bucket, ...rest } = fields
       void _item; void _bucket
-      entry = cleanEntry(rest, false)
+      entry = cleanEntry(rest, null)
     } catch (error) {
       if (error instanceof ShapeError) throw new ReportInvalid(error.message)
       throw error

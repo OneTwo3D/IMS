@@ -139,6 +139,9 @@ export type CompareEntry = {
   /** The currency each side's row carried (null when it carried none). Present so a reader can re-judge the pair. */
   imsCurrency: string | null
   vendorCurrency: string | null
+  /** Whether each side had the identity (a presence-only comparison records nothing else about it). */
+  imsPresent: boolean
+  vendorPresent: boolean
   /** Only on unsettled entries: the stream stamps the difference was seen under. */
   settling?: { first: string; later: string[] }
 }
@@ -164,7 +167,7 @@ export type CompareInput = {
 }
 
 export type CompareResult =
-  | { status: 'compared'; buckets: Record<ComparisonBucket, CompareEntry[]>; nextCarried: Map<string, CarriedDifference>; proof: ItemProof }
+  | { status: 'compared'; buckets: Record<ComparisonBucket, CompareEntry[]>; nextCarried: Map<string, CarriedDifference>; proof: ItemProof | null }
   | { status: 'unreadable'; reason: PackReasonCode }
 
 function emptyBuckets(): Record<ComparisonBucket, CompareEntry[]> {
@@ -244,7 +247,7 @@ export function compareKeyed(input: CompareInput): CompareResult {
     const a = ims.get(canonical)
     const b = vendor.get(canonical)
     const token = (a ?? b)!.token
-    const entry: CompareEntry = { key: token, ims: a?.value ?? null, vendor: b?.value ?? null, delta: null, imsCurrency: a?.currency ?? null, vendorCurrency: b?.currency ?? null }
+    const entry: CompareEntry = { key: token, ims: a?.value ?? null, vendor: b?.value ?? null, delta: null, imsCurrency: a?.currency ?? null, vendorCurrency: b?.currency ?? null, imsPresent: a !== undefined, vendorPresent: b !== undefined }
     if (input.population && !input.population.has(canonical)) { buckets.outOfPopulation.push(entry); continue }
     if (input.excluded?.has(canonical)) { buckets.excluded.push(entry); continue }
 
@@ -270,9 +273,13 @@ export function compareKeyed(input: CompareInput): CompareResult {
     else buckets.unsettled.push({ ...entry, settling: { first: advanced.carried.first, later: [...advanced.carried.later] } })
   }
 
-  const compared = COMPARISON_BUCKETS.filter((bucket) => bucket !== 'outOfPopulation').reduce((sum, bucket) => sum + buckets[bucket].length, 0)
-  if (compared === 0 && !isPackEmptyProofCode(input.emptyProof)) return unreadable('EMPTY_UNPROVEN')
-  const proof: ItemProof = compared === 0 ? { kind: 'proven-empty', source: input.emptyProof as PackEmptyProofCode } : { kind: 'compared' }
+  // What was actually JUDGED: identities in the population and not excluded. Excluded and out-of-population identities
+  // are listed but were never compared, so they prove nothing.
+  const judged = (['onlyIms', 'onlyVendor', 'bothEqual', 'bothDiffer', 'unsettled'] as const).reduce((sum, bucket) => sum + buckets[bucket].length, 0)
+  if (judged === 0 && !isPackEmptyProofCode(input.emptyProof)) return unreadable('EMPTY_UNPROVEN')
+  // A proof exists only for something that could pass: equal identities that were really compared, or a named proof that
+  // the judged population is empty. A comparison with nothing but findings or unsettled identities has none.
+  const proof: ItemProof | null = buckets.bothEqual.length > 0 ? { kind: 'compared' } : judged === 0 ? { kind: 'proven-empty', source: input.emptyProof as PackEmptyProofCode } : null
   return { status: 'compared', buckets, nextCarried, proof }
 }
 
@@ -297,5 +304,6 @@ export function outcomeOfComparison(result: CompareResult): { outcome: 'pass' | 
   const unsettled = result.buckets.unsettled.length
   if (findings > 0) return { outcome: 'fail', reasons: unsettled > 0 ? ['DIFFERENCES', 'UNSETTLED_PENDING'] : ['DIFFERENCES'] }
   if (unsettled > 0) return { outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'] }
+  if (result.proof === null) return { outcome: 'inconclusive', reasons: ['EMPTY_UNPROVEN'] }
   return { outcome: 'pass', reasons: [] }
 }
