@@ -157,3 +157,23 @@ export async function findOrderWarehouseShadowRecords(client: ShadowEvidenceClie
   }
   return found
 }
+
+/**
+ * THE CREATE OBLIGATION WHOSE SHADOW COULD NOT BE RECORDED. The seam keeps the record of a held create best-effort (a failed write is logged and
+ * counted, never allowed to abort the business transaction), and a held create writes no push link, so a transient failure leaves an order that
+ * IMS declined to push, the bridge may have created in the warehouse, and nothing in IMS says so. The order hard delete must not read that as
+ * "nothing was called". It is fail-closed on the facts it CAN read: the warehouse is held (enforced and not live) and the order is paid, so the
+ * sweep owed it a create and this installation cannot tell what became of it.
+ *
+ * True only while the hold stands for a warehouse connector (switch off, or live: false, the legacy answer) and only for a paid order; the caller
+ * asks it only when the order has no push link and no durable record. A read that cannot be made throws.
+ */
+export async function warehouseCreateObligationUnrecorded(
+  client: { salesOrder: { findUnique(args: { where: { id: string }; select: { paidAt: true } }): Promise<{ paidAt: Date | null } | null> } },
+  orderId: string,
+): Promise<boolean> {
+  const held = (Object.keys(WMS_PRODUCER_DESTINATION) as WmsConnectorId[]).some((id) => wmsProducerHold(id).held)
+  if (!held) return false
+  const order = await client.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true } })
+  return Boolean(order?.paidAt)
+}

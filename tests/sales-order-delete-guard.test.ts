@@ -60,7 +60,7 @@ function makeTx(seed: {
   }>
   syncLogs?: SyncLogRow[]
   /** Durable external-document markers on the order itself — these survive log retention. */
-  order?: { accountingInvoiceId?: string | null; invoicedAt?: Date | null }
+  order?: { accountingInvoiceId?: string | null; invoicedAt?: Date | null; paidAt?: Date | null }
   /** Independent WMS evidence: a status snapshot can exist with no push link. */
   wmsSnapshot?: {
     connectorLabel: string
@@ -92,6 +92,7 @@ function makeTx(seed: {
       findUnique: async () => ({
         accountingInvoiceId: seed.order?.accountingInvoiceId ?? null,
         invoicedAt: seed.order?.invoicedAt ?? null,
+        paidAt: seed.order?.paidAt ?? null,
       }),
     },
     wmsOrderPushLink: {
@@ -1842,4 +1843,47 @@ test('[batch sentence] a SHADOW batch journal is not described as an operator se
   assert.doesNotMatch(shadow!.message, /operator settled it as not posted|retired with no recorded pre-call proof/)
   assert.equal(unknown?.code, 'daily_batch_staged')
   assert.match(unknown!.message, /operator settled it as not posted/, 'CONTROL: a FAILED row keeps the old sentence')
+})
+
+// ---------------------------------------------------------------------------
+// THE HELD CREATE WHOSE SHADOW COULD NOT BE RECORDED. The record is best-effort (a failed write is logged, never aborts the business transaction),
+// and a held create writes no link, so a transient failure leaves a paid order with NO link and NO record. The delete guard must not read that
+// as "nothing was called". Named mutation `unrecorded-reads-as-clean`: the obligation check is removed; the arms go red.
+// ---------------------------------------------------------------------------
+test('[unrecorded held create] a paid order with no link and no shadow record is NOT deletable while the warehouse is held; unpaid, switch OFF, live and a real link are the controls', async () => {
+  const paid = { paidAt: new Date('2026-07-01T00:00:00Z') }
+  await withMintsoftEnforcement('mintsoft', async () => {
+    const blocker = await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [], order: paid }), 'order-1', STAMPS)
+    assert.equal(blocker?.code, 'wms_create_unrecorded')
+    assert.match(blocker!.message, /cannot tell whether/)
+    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [], order: { paidAt: null } }), 'order-1', STAMPS), null, 'CONTROL: an unpaid order was never owed a create')
+    const recorded = await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [{ destination: 'mintsoft', operation: 'order.create', subject_type: 'SalesOrder', subject_id: 'order-1' }], order: paid }), 'order-1', STAMPS)
+    assert.equal(recorded?.code, 'wms_shadow_recorded', 'a record, when there is one, is the more specific blocker')
+  })
+  await withMintsoftEnforcement(undefined, async () => {
+    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [], order: paid }), 'order-1', STAMPS), null, 'CONTROL: switch off is the legacy guard')
+  })
+  const saved = { grant: process.env.MINTSOFT_WRITE_ALLOWED, from: process.env.MINTSOFT_WRITES_LIVE_FROM }
+  process.env.MINTSOFT_WRITE_ALLOWED = 'https://wms.example.test|89'
+  process.env.MINTSOFT_WRITES_LIVE_FROM = '2026-06-01T00:00:00Z'
+  try {
+    await withMintsoftEnforcement('mintsoft', async () => {
+      assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [], order: paid }), 'order-1', STAMPS), null, 'CONTROL: live, the sweep writes links, so no link is the legacy answer')
+    })
+  } finally {
+    if (saved.grant === undefined) delete process.env.MINTSOFT_WRITE_ALLOWED; else process.env.MINTSOFT_WRITE_ALLOWED = saved.grant
+    if (saved.from === undefined) delete process.env.MINTSOFT_WRITES_LIVE_FROM; else process.env.MINTSOFT_WRITES_LIVE_FROM = saved.from
+  }
+})
+
+test('[unrecorded held create] END TO END: the real seam with a shadow write that fails answers shadowed/unrecorded, and the guard then refuses the delete', async () => {
+  const { mintsoftProducerSeam } = await import('@/lib/connectors/mintsoft/producer-seam')
+  const failing = { $queryRaw: async () => { throw new Error('connection reset') }, $executeRaw: async () => { throw new Error('connection reset') }, $transaction: async () => { throw new Error('connection reset') } }
+  await withMintsoftEnforcement('mintsoft', async () => {
+    const answer = await mintsoftProducerSeam({ operation: 'order.create', subjectType: 'SalesOrder', subjectId: 'order-1', payload: { orderNumber: 'SO-1' }, obligationAt: new Date('2026-07-01T00:00:00Z'), client: failing })
+    assert.equal(answer.proceed, false)
+    assert.equal('recorded' in answer && answer.recorded, false, 'PRECONDITION: the shadow could not be written')
+    const blocker = await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [], order: { paidAt: new Date('2026-07-01T00:00:00Z') } }), 'order-1', STAMPS)
+    assert.equal(blocker?.code, 'wms_create_unrecorded')
+  })
 })
