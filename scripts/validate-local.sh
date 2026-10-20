@@ -93,6 +93,8 @@ run_step 'ledger standing readers'        npm run check:ledger-standing-readers
 # WP2 S2: every call that creates outbound work or writes to a vendor directly is declared against the
 # writer ownership map (scripts/producer-census-declarations.ts). A syntactic scan: no Prisma client needed.
 run_step 'producer census'                npm run check:producer-census
+# Every reader of a sync row's presence is declared with how it reads a producer-hold shadow (scripts/shadow-reader-declarations.ts). Syntactic: no Prisma client needed.
+run_step 'shadow readers'                 npm run check:shadow-readers
 run_step 'wms connector boundary'         npm run check:wms-connector-boundary
 # o3d-hic9: the Server Action authorization guards were in check:all but in no CI workflow, so they
 # only ran when someone remembered to type check:all locally. validate-local.sh exists so local and

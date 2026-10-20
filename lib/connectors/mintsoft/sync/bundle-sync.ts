@@ -6,6 +6,7 @@ import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsBundleComponent, WmsBundleDto, WmsBundleRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { mintsoftProducerSeam } from '../producer-seam'
+import { producerSeamVerdict } from '@/lib/security/producer-seam'
 import {
   BUNDLE_CLAIM_CHANGED_TEXT,
   BUNDLE_CLAIM_LEASE_MS,
@@ -571,6 +572,17 @@ async function syncBundleInternal(
 
   const connector = getWmsConnector(CONNECTOR)
   const missingLinks = imsComponents.filter((component) => !component.externalProductId)
+  if (missingLinks.length > 0 && producerSeamVerdict('mintsoft', 'product.upsert').kind === 'shadow') {
+    // While the producer-side hold shadows product upserts no product link is ever written, so a component with no link is the held state, not
+    // a bundle in conflict: raising a durable conflict here would be a finding no operator action can clear until the destination is live.
+    return {
+      status: 'SKIPPED',
+      action: 'no_wms_product_link',
+      reason: 'Component products have no Mintsoft product link because product writes to the warehouse are held on this installation; the bundle is not evaluated until they are written.',
+      productId,
+      sku: candidate.sku,
+    }
+  }
   if (missingLinks.length > 0) {
     await upsertBundleConflict({
       scopes,

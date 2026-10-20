@@ -44,11 +44,13 @@ const BEFORE_CUTOFF = new Date('2026-05-20T00:00:00.000Z')
 const AFTER_CUTOFF = new Date('2026-06-10T00:00:00.000Z')
 
 // A recording shadow store in place of the database. Created before the sweep module is imported.
+let failShadowWrites = false
 const shadows: Array<{ operation: string; subjectType: string; subjectId: string; reason: string }> = []
 const fakeDb = {
   $queryRaw: async (query: { strings?: readonly string[]; values?: readonly unknown[] }) => {
     const text = (query.strings ?? []).join('?')
     if (!text.includes('outbound_shadow_writes')) return []
+    if (failShadowWrites) throw new Error('connection reset')
     const values = query.values ?? []
     const existing = shadows.filter((shadow) => shadow.operation === String(values[1]) && shadow.subjectId === String(values[3])).length
     shadows.push({ operation: String(values[1]), subjectType: String(values[2]), subjectId: String(values[3]), reason: String(values[6]) })
@@ -313,7 +315,9 @@ test('ON: a PENDING_VERIFY link is still PROVED (a read) but is never converted:
     const run = await sweep({ verifiable: [verifyLink()], withdrawn: true }, { verdict: 'ours' })
     console.log(`# ON verify: calls=${JSON.stringify(run.calls)} writes=${JSON.stringify(run.writes)}`)
     assert.deepEqual(run.calls, ['verifyPushedOrder:wms-v'], 'the proof is a read and still happens; no cancel')
-    assert.deepEqual(run.writes, [], 'the link stays PENDING_VERIFY: nothing is written, nothing becomes a shadow state')
+    // Only the ROTATION column moves (the verify queue is least-recently-attempted first and bounded): the state is untouched, so nothing becomes a
+    // shadow state, but the link goes to the back of the queue instead of heading it for ever and starving the verifications behind it.
+    assert.deepEqual(run.writes, ['updateLinkIfState:link-v:PENDING_VERIFY->-'])
     assert.equal(run.result.shadowed, 1)
     assert.deepEqual(shadows.map((s) => s.operation), ['order.hold'])
   })
@@ -518,5 +522,73 @@ test('CLAIM-TIME RE-PROOF: paidAt corrected to before the live-from instant betw
         assert.equal(result.created, 1)
       }
     }
+  })
+})
+
+test('HELD verify queue: the verified-then-withdrawn shadow stamps only lastAttemptAt (the rotation column), never the state or the error; the live path is untouched', async () => {
+  const stamped: Array<{ id: string; from: string; data: Record<string, unknown> }> = []
+  const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+  await withEnv(HELD, async () => {
+    const harness = makePort({ verifiable: [verifyLink()], withdrawn: true })
+    const original = harness.port.updateLinkIfState
+    harness.port.updateLinkIfState = async (id, from, data) => { stamped.push({ id, from, data: data as Record<string, unknown> }); return original(id, from, data) }
+    await runWmsOrderPushSweepCore(makeConnector({ verdict: 'ours' }).connector, 'mintsoft', harness.port, { now: NOW })
+  })
+  console.log(`# held verify stamp: ${JSON.stringify(stamped.map((s) => Object.keys(s.data)))}`)
+  assert.equal(stamped.length, 1)
+  assert.deepEqual(Object.keys(stamped[0]!.data), ['lastAttemptAt'])
+  assert.equal(stamped[0]!.from, 'PENDING_VERIFY')
+})
+
+test('HELD create pass walks the candidates by a rotating cursor: the page after the cursor is asked for, the cursor advances on a full page and resets on a short one; OFF asks the legacy question with no cursor', async () => {
+  const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+  const run = async (env: Record<string, string>, initial: string | null, pageIds: string[]) => {
+    const state = { cursor: initial, asked: [] as Array<unknown>, writes: [] as Array<string | null> }
+    await withEnv(env, async () => {
+      const harness = makePort({ createCandidates: pageIds.map((id) => candidate({ id, orderNumber: id })) })
+      harness.port.createCandidates = async (_c, _b, _l, _p, rotation) => { state.asked.push(rotation ?? null); return pageIds.map((id) => candidate({ id, orderNumber: id })) }
+      harness.port.heldCreateCursor = { read: async () => state.cursor, write: async (value) => { state.writes.push(value); state.cursor = value } }
+      await runWmsOrderPushSweepCore(makeConnector().connector, 'mintsoft', harness.port, { now: NOW, batchSize: 2 })
+    })
+    return state
+  }
+  const full = await run(HELD, 'so-a', ['so-b', 'so-c'])
+  assert.deepEqual(full.asked, [{ afterId: 'so-a' }])
+  assert.deepEqual(full.writes, ['so-c'], 'a full page advances the cursor to its last id')
+  const short = await run(HELD, 'so-c', ['so-d'])
+  assert.deepEqual(short.writes, [null], 'a short page ends the walk and the next tick starts at the head')
+  const off = await run(OFF, null, ['so-b', 'so-c'])
+  assert.deepEqual(off.asked, [null], 'CONTROL: switch OFF asks the legacy question with no rotation')
+  assert.deepEqual(off.writes, [], 'CONTROL: and keeps no cursor')
+})
+
+test('HELD create whose shadow write FAILS: not a clean held outcome (counted apart, logged, no link, no claim); the batch is not blocked; the next pass records it once; OFF is untouched', async () => {
+  const logged: string[] = []
+  const originalError = console.error
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')) }
+  try {
+    await withEnv(HELD, async () => {
+      failShadowWrites = true
+      const failing = await sweep({ createCandidates: [candidate({ id: 'so-a', orderNumber: 'SO-A' }), candidate({ id: 'so-b', orderNumber: 'SO-B' })] })
+      failShadowWrites = false
+      console.log(`# unrecorded: ${JSON.stringify(failing.result)} writes=${JSON.stringify(failing.writes)} calls=${JSON.stringify(failing.calls)}`)
+      assert.equal(failing.result.shadowUnrecorded, 2, 'both are reported as unrecorded, and the second is still attempted (the failing order does not block the batch)')
+      assert.equal('shadowed' in failing.result, false, 'and neither is counted as a clean shadow')
+      assert.deepEqual(failing.writes, [], 'no claim, no link write')
+      assert.deepEqual(failing.calls, [], 'nothing sent')
+      assert.ok(logged.filter((line) => line.includes('shadow_create_unrecorded')).length === 2, 'each is logged with the closed code')
+      const retry = await sweep({ createCandidates: [candidate({ id: 'so-a', orderNumber: 'SO-A' }), candidate({ id: 'so-b', orderNumber: 'SO-B' })] })
+      assert.equal(retry.result.shadowed, 2, 'the next pass records them')
+      assert.equal('shadowUnrecorded' in retry.result, false)
+      assert.deepEqual(shadows.map((s) => s.subjectId).sort(), ['so-a', 'so-b'])
+    })
+  } finally {
+    console.error = originalError
+    failShadowWrites = false
+  }
+  await withEnv(OFF, async () => {
+    const run = await sweep({ createCandidates: [candidate()] })
+    assert.equal('shadowUnrecorded' in run.result, false, 'CONTROL: switch off never reaches the arm')
+    assert.deepEqual(run.calls, ['pushOrder:SO-1'])
   })
 })

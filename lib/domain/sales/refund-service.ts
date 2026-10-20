@@ -64,6 +64,7 @@ import {
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
 import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
+import { findDurableShadowRecords, shadowRecordNamesSyncLog } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
@@ -1928,6 +1929,14 @@ async function stageRefundAccountingReversals(
       // CANCELLED rows alike, so this absence is equally consistent with a relief that never
       // posted; counting it silently is how a refusal that was standing becomes a resolution.
       if (!journal) {
+        // A journal that WAS a shadow also expires with retention, but the durable shadow record keeps naming it: that absence is not "settled or
+        // abandoned, counted from the record", it is a posting IMS never sent, so the refusal that stood while the row existed must go on standing.
+        if (await shadowRecordNamesSyncLog(tx, record.syncLogId)) {
+          return {
+            kind: 'unresolved',
+            reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief under a journal IMS recorded as a SHADOW instead of sending (the row has since expired, the shadow record has not), so whether that credit reached any ledger cannot be established`,
+          }
+        }
         return {
           kind: 'assumed',
           reason: `${record.subject}'s £${record.recorded.toFixed(2)} of Allocated Inventory relief was counted from its own record because the journal it names is no longer on record (retention) — retention deletes cancelled journals as well as settled ones, so whether those pounds ever reached the account is not established`,
@@ -2064,6 +2073,11 @@ async function stageRefundAccountingReversals(
           // (A new refund is normally blocked while this flag stands - scjz.22 - so this is the net under it
           // for a flag set after the later refund was created, or a path that bypasses that check.)
           priorRefundReliefUnresolved = `prior refund ${priorRefund.id} recorded £${recordedRelief.toFixed(2)} of Allocated Inventory relief and STILL OWES its accounting, and its reversal journal has not been queued - nothing was credited to ${settings.allocatedInventoryAccount} for it, so how much of the A2 debit is still open cannot be established until that refund's accounting is retried`
+          continue
+        }
+        if (ownReversalRows.length === 0 && (await findDurableShadowRecords(tx, 'xero', [{ subjectType: 'SalesOrderRefund', exactIds: [priorRefund.id], operations: ['inventory.journals'] }])).length > 0) {
+          // The reversal journal was recorded as a shadow and its row has expired with retention; the record persists. Not "counted from the record".
+          priorRefundReliefUnresolved = `prior refund ${priorRefund.id} recorded £${recordedRelief.toFixed(2)} of Allocated Inventory relief under a reversal journal IMS recorded as a SHADOW instead of sending (the row has since expired, the shadow record has not), so whether that credit reached any ledger cannot be established`
           continue
         }
         if (ownReversalRows.length === 0) {

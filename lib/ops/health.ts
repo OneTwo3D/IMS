@@ -885,6 +885,7 @@ async function getLatestBackup(now: Date = new Date()): Promise<LatestOperationH
  * word (FAILED, CANCELLED, PENDING) already is not 'ok'.
  */
 export function latestBatchStatusLabel(status: string, standing: LedgerStanding): string {
+  if (standing === 'SHADOW_NOT_SENT_BY_IMS') return 'SHADOWED (not sent by IMS: writes to the ledger are held)'
   return standing === 'ASSERTED_POSTED' ? `${status} (asserted by an operator, not confirmed)` : status
 }
 

@@ -4,7 +4,8 @@ import {
   wmsMissingOrderRepushRefusal,
   type WmsCreateReplayPolicySource,
 } from './create-replay-policy'
-import { wmsCreateIneligibleRefusal } from './create-eligibility'
+import { wmsCreateIneligibleRefusal, wmsPaidBeforeCreateFloor, WMS_PRE_CUTOVER_NOTICE } from './create-eligibility'
+import { wmsCreateObligationFloor, wmsProducerHold } from '@/lib/connectors/wms/producer-seam'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from './order-push-sweep'
 
 /**
@@ -50,6 +51,10 @@ export type WmsPushReplayRefusal =
   | 'already-linked'
   /** A create may be in flight and this connector's create does not refuse a duplicate. */
   | 'create-not-repeatable'
+  /** The producer-side hold stands for the warehouse: every create is a shadow, so a re-queue is refused (and a control would only record another shadow). */
+  | 'create-held'
+  /** The order was paid before the destination's live-from instant: the bridge's order, which IMS can never create. */
+  | 'pre-cutover'
 
 export type WmsPushReplayDecision =
   | { replayable: true }
@@ -62,6 +67,12 @@ export type WmsPushReplayEvidence = {
   attempts: number
   externalOrderId: string | null
   pushedAt: Date | null
+}
+
+/** The producer-hold facts for one link's connector, read from the environment (no database). Legacy installs: held false, no floor. */
+export function wmsPushProducerFacts(connector: string, paidAt: Date | null | undefined): { held: boolean; heldNotice?: string; floor: Date | null; paidAt: Date | null } {
+  const hold = wmsProducerHold(connector)
+  return { held: hold.held, ...(hold.held ? { heldNotice: hold.notice } : {}), floor: wmsCreateObligationFloor(connector), paidAt: paidAt ?? null }
 }
 
 export const WMS_PUSH_REPLAY_STATES = ['DEAD_LETTER', 'AMBIGUOUS_CREATE'] as const
@@ -79,6 +90,11 @@ export function decideWmsPushReplay(
    *  registry containing a fictitious `client-side-dedupe-only` connector so this refusal is
    *  EXECUTED rather than merely compiled — see tests/wms-second-connector-seam.test.ts. */
   registry?: WmsCreateReplayPolicySource,
+  /**
+   * What the producer-side hold says about re-opening a create, from the environment. Optional: absent (or `held: false` with no floor) is the
+   * legacy decision exactly. `replayWmsOrderPush` refuses on the same facts, so a control is never offered over a click that is always refused.
+   */
+  producer?: { held: boolean; heldNotice?: string; floor?: Date | null; paidAt?: Date | null },
 ): WmsPushReplayDecision {
   // o3d-92fu: a payload-invalid push has nothing to re-queue — no remote call was ever made, and
   // the sweep's revalidation pass re-queues it for free once the payload builds.
@@ -116,6 +132,12 @@ export function decideWmsPushReplay(
       reason: 'create-not-repeatable',
       guidance: wmsAmbiguousCreateRefusal(link.connector, reference, registry),
     }
+  }
+  if (producer?.held) {
+    return { replayable: false, reason: 'create-held', guidance: producer.heldNotice ?? 'Writes to the warehouse are held on this installation, so IMS cannot re-queue this create; it is kept as a shadow record.' }
+  }
+  if (producer?.floor && wmsPaidBeforeCreateFloor(producer.paidAt, producer.floor)) {
+    return { replayable: false, reason: 'pre-cutover', guidance: WMS_PRE_CUTOVER_NOTICE }
   }
   return { replayable: true }
 }
@@ -204,13 +226,15 @@ export function decideWmsMissingRepush(input: {
  */
 export type BlockedWmsPushRowInput = WmsPushReplayEvidence & {
   orderId: string
+  /** The order's paid time, for the producer floor. Absent reads as "paid before it" only when a floor is in force. */
+  orderPaidAt?: Date | null
   lastError: string | null
   lastAttemptAt: Date | null
-  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null }
+  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null; paidAt?: Date | null }
 }
 
 export function buildBlockedWmsPushRow(link: BlockedWmsPushRowInput) {
-  const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
+  const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order), undefined, wmsPushProducerFacts(link.connector, link.orderPaidAt ?? link.order.paidAt))
   return {
     orderId: link.orderId,
     orderNumber: link.order.orderNumber,

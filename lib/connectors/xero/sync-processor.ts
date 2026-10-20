@@ -6,7 +6,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
-import { xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
@@ -1687,6 +1687,7 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
       type: 'INVOICE_PAYMENT',
       status: { in: ['PENDING', 'PROCESSING'] },
       OR: referenceFilters,
+      ...xeroNotNeverDeliverablePendingWhere(xeroCutoffFloor()),
     },
     // `status` is selected because this pre-filter now asks decideInvoicePaymentClaim the question
     // rather than re-deriving a second, narrower rule of its own (round 5 #1).
@@ -1913,6 +1914,8 @@ export async function claimAccountingSyncLog(
         referenceType: entry.referenceType,
         referenceId: entry.referenceId,
         status: { in: ['PENDING', 'PROCESSING'] },
+        // Read INSIDE the order lock, at the moment of the decision: a never-claimable pre-cutoff PENDING row is not earlier work to wait behind.
+        ...xeroNotNeverDeliverablePendingWhere(xeroCutoffFloor()),
       },
       select: { id: true, status: true, createdAt: true },
     })
@@ -2077,6 +2080,7 @@ export async function findInvoiceUpdatesBlockedByPendingCreate(
       connector: XERO_CONNECTOR,
       status: { in: ['PENDING', 'PROCESSING'] },
       OR: orFilters,
+      ...xeroNotNeverDeliverablePendingWhere(xeroCutoffFloor()),
     },
     select: { id: true, type: true, referenceType: true, referenceId: true, createdAt: true },
     orderBy: { createdAt: 'asc' },

@@ -1078,6 +1078,20 @@ function addExpectedSourceEventFinding(
     addSplitBridgeAmbiguityFinding(findings, reportedAmbiguousBridges, rows.accountingEvents, params)
     return
   }
+  // A SHADOW HAS NO EVENT BY DESIGN (the hold never mirrors one: events feed the ledger evaluators and a shadow is not an IMS ledger fact), so
+  // "no mirrored event" is the expected shape of a document whose posting was recorded as a shadow, not a missing mirror. The shadow row is
+  // loaded into `rows.syncLogs` precisely so this can be told apart from a posting that was never recorded at all.
+  if (rows.syncLogs.some((log) => (
+    log.type === params.type
+    && log.referenceType === params.sourceEntityType
+    && (log.referenceId === params.sourceEntityId || (params.digestBridged === true && log.referenceId.startsWith(`${params.sourceEntityId}-`)))
+    && isShadowedObligation({
+      status: log.status,
+      externalTransactionId: log.externalTransactionId,
+      settlementBasis: log.settlementBasis,
+      abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
+    })
+  ))) return
   findings.push({
     severity: 'warning',
     code: params.code,

@@ -145,3 +145,15 @@ export function xeroNotBeforeCutoffWhere(floor: Date | null): { NOT?: Record<str
   if (floor === null) return {}
   return { NOT: { createdAt: { lt: floor }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) } } }
 }
+
+/**
+ * The same cut-off for a read that asks "is there earlier LIVE work for this key that I must wait behind?". A queued (PENDING) row created
+ * before the floor can never be claimed, so waiting behind it is waiting for work that will not run: every later payment or update for the
+ * document would be deferred for ever (a starvation behind a never-deliverable row). A PROCESSING row is NOT excluded: a claim taken before
+ * the floor moved may still be in flight, and waiting behind an undetermined attempt is the money-safe answer. Empty with no floor, so a
+ * query that spreads it is the legacy query exactly.
+ */
+export function xeroNotNeverDeliverablePendingWhere(floor: Date | null): { NOT?: Record<string, unknown> } {
+  if (floor === null) return {}
+  return { NOT: { status: 'PENDING', createdAt: { lt: floor }, type: { notIn: Object.keys(ACCOUNTING_SYNC_TYPE_EXCLUSIONS) } } }
+}

@@ -1191,7 +1191,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         pushedAt: true,
         lastError: true,
         lastAttemptAt: true,
-        order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true, paidAt: true } },
       },
     }),
     // The admin list filter takes a single status, so query each failure status
@@ -1547,7 +1547,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   const data: Omit<ExceptionInboxData, 'summary' | 'maintenanceRecovery'> = {
     // o3d-2k5r r5: every field including the affordance comes from the shared rule — the client
     // receives the action's own answer rather than deriving one from `state`.
-    wmsPushDeadLetters: pushLinks.map(buildBlockedWmsPushRow),
+    wmsPushDeadLetters: pushLinks.map((link) => buildBlockedWmsPushRow(link)),
     outboxFailures: outbox.map((row) => ({
       id: row.id,
       connector: row.connector,
