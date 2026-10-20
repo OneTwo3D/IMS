@@ -170,7 +170,7 @@ test('the rails are the same everywhere: RAIL_IDS, the ids of an evaluation, the
 test('preconditions[]: every id, always in order; a rail that refused once is refused; checks follow their rails [mutation: take the last evaluation / drop a check]', (t) => {
   assert.deepEqual(buildPreconditions([]), [], 'no rail evaluated: none')
   const tally = (over: Record<string, { evaluations: number; refusals: number; detail?: string }> = {}) =>
-    RAIL_IDS.filter((id) => !['fx-rates', 'tax-rates', 'warehouses', 'forbidden-skus', 'currency-lock'].includes(id) || over[id]).map((id) => ({ id, evaluations: 3, refusals: 0, detail: '', ...over[id] }))
+    RAIL_IDS.filter((id) => !['fx-rates', 'tax-rates', 'warehouses', 'forbidden-skus', 'currency-lock'].includes(id) || over[id]).map((id) => ({ id: id as string, evaluations: over[id]?.evaluations ?? 3, refusals: over[id]?.refusals ?? 0, detail: over[id]?.detail ?? '' }))
   const clean = buildPreconditions(tally())
   precondition(t, 'precondition entries', clean.length)
   assert.deepEqual(clean.map((p) => p.id), PRECONDITION_IDS)
