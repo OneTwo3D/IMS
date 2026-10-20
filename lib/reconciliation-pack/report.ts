@@ -378,6 +378,7 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
   if (has('PHASE_NOT_APPLICABLE') !== (input.outcome === 'not-applicable')) fail('PHASE_NOT_APPLICABLE belongs to not-applicable and nothing else')
   if (has('UNSETTLED_PENDING') !== (counts.unsettled > 0)) fail('UNSETTLED_PENDING and the unsettled count must agree')
   if (has('NO_RUNNER') && (input.outcome !== 'inconclusive' || everything !== 0)) fail('NO_RUNNER is an inconclusive item with nothing listed')
+  if (has('NOT_SELECTED') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1)) fail('NOT_SELECTED is an inconclusive item with nothing listed and no other reason')
   if (findings > 0 && (input.outcome !== 'fail' || !has('DIFFERENCES'))) fail('a finding makes the item a fail with DIFFERENCES')
   if (input.proof !== null && input.outcome !== 'pass') fail('only a pass carries a proof')
 
