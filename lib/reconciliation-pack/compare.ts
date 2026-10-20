@@ -29,6 +29,9 @@ import {
   PENDING_PERSISTENCE_RUNS,
   type ComparisonBucket,
   type ItemProof,
+  type PackItemId,
+  type Tolerance,
+  getPackItem,
   type PackEmptyProofCode,
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
@@ -53,11 +56,7 @@ export function decimalText(value: Dec): string {
   return value.isZero() ? '0' : value.toFixed()
 }
 
-export type Tolerance =
-  | { rule: 'exact' }
-  | { rule: 'absolute'; limit: string }
-  | { rule: 'composite'; floor: string; fraction: string }
-  | { rule: 'minor-unit' }
+export type { Tolerance }
 
 /** Whether `tolerance` is a rule this module can apply: a known rule, and every limit a non-negative plain decimal. */
 export function isUsableTolerance(tolerance: unknown): tolerance is Tolerance {
@@ -137,6 +136,9 @@ export type CompareEntry = {
   ims: string | null
   vendor: string | null
   delta: string | null
+  /** The currency each side's row carried (null when it carried none). Present so a reader can re-judge the pair. */
+  imsCurrency: string | null
+  vendorCurrency: string | null
   /** Only on unsettled entries: the stream stamps the difference was seen under. */
   settling?: { first: string; later: string[] }
 }
@@ -242,7 +244,7 @@ export function compareKeyed(input: CompareInput): CompareResult {
     const a = ims.get(canonical)
     const b = vendor.get(canonical)
     const token = (a ?? b)!.token
-    const entry: CompareEntry = { key: token, ims: a?.value ?? null, vendor: b?.value ?? null, delta: null }
+    const entry: CompareEntry = { key: token, ims: a?.value ?? null, vendor: b?.value ?? null, delta: null, imsCurrency: a?.currency ?? null, vendorCurrency: b?.currency ?? null }
     if (input.population && !input.population.has(canonical)) { buckets.outOfPopulation.push(entry); continue }
     if (input.excluded?.has(canonical)) { buckets.excluded.push(entry); continue }
 
@@ -272,6 +274,15 @@ export function compareKeyed(input: CompareInput): CompareResult {
   if (compared === 0 && !isPackEmptyProofCode(input.emptyProof)) return unreadable('EMPTY_UNPROVEN')
   const proof: ItemProof = compared === 0 ? { kind: 'proven-empty', source: input.emptyProof as PackEmptyProofCode } : { kind: 'compared' }
   return { status: 'compared', buckets, nextCarried, proof }
+}
+
+/**
+ * Compare for one catalogue item: the MODE and the TOLERANCE are the catalogue's, never the caller's. The reader
+ * re-judges every evidence entry against the same catalogue row, so a runner cannot loosen its own test.
+ */
+export function compareItem(id: PackItemId, input: Omit<CompareInput, 'mode' | 'tolerance'>): CompareResult {
+  const spec = getPackItem(id)
+  return compareKeyed({ ...input, mode: spec.mode, tolerance: spec.measure ?? undefined })
 }
 
 /** Counts are DERIVED from the lists, every time. */

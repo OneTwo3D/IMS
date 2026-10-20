@@ -25,7 +25,7 @@ import path from 'node:path'
 import { checkAncestors, fsyncDirectory, writeExclusive } from '@/lib/ops/published-report'
 import { PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_SEQUENCE_CLAIM_PREFIX, PACK_REPORT_MARKDOWN, packExitCode, type PackChainCode } from '@/lib/reconciliation-pack/constants'
 import { acquireRunLock, type LockHooks } from '@/lib/reconciliation-pack/lock'
-import { buildReport, sha256Hex, type ReportInput, type ReportRecord } from '@/lib/reconciliation-pack/report'
+import { buildReport, sha256Hex, type BuildOptions, type ReportInput, type ReportRecord } from '@/lib/reconciliation-pack/report'
 import { readPackChain } from '@/lib/reconciliation-pack/trend'
 
 export type PublishHooks = {
@@ -38,6 +38,8 @@ export type PublishHooks = {
   /** Test seam: called as each phase begins, so the order lock, chain read, commit can be asserted. */
   onStep?: (step: 'locked' | 'chain-read') => void
   lock?: LockHooks
+  /** Test seam: a lower evidence cap per item. */
+  build?: BuildOptions
 }
 
 export type PublishResult =
@@ -64,15 +66,15 @@ export function publishPackReport(reportDir: string, input: ReportInput, hooks: 
     const chain = readPackChain(reportDir)
     hooks.onStep?.('chain-read')
     if (!chain.ok) return refused(chain.code)
-    if (chain.head && chain.head.record.systemIdentifier !== input.systemIdentifier) return refused('SYSTEM_MISMATCH')
     const sequence = chain.head ? chain.head.sequence + 1 : 1
     const claimFile = path.join(reportDir, `${PACK_SEQUENCE_CLAIM_PREFIX}${String(sequence).padStart(9, '0')}`)
     if (existsSync(claimFile)) return refused('SEQUENCE_CLAIMED')
-    const { body, evidenceText, markdown: markdownText } = buildReport(input, sequence, chain.head ? chain.head.sha256 : null)
-    const record: ReportRecord = { ...body, companionMarkdownSha256: sha256Hex(markdownText) }
-    const jsonText = `${JSON.stringify(record, null, 2)}\n`
+    // Built (copied, judged, and read back by the reader's own validation) BEFORE any byte is written. From here on
+    // nothing the caller owns is read again: every name and value below comes from the built record.
+    const { record, jsonText, evidenceText, markdown: markdownText } = buildReport(input, sequence, chain.head ? chain.head.sha256 : null, hooks.build)
+    if (chain.head && chain.head.record.systemIdentifier !== record.systemIdentifier) return refused('SYSTEM_MISMATCH')
 
-    outDir = path.join(reportDir, input.runId)
+    outDir = path.join(reportDir, record.runId)
     const jsonFile = path.join(outDir, PACK_REPORT_JSON)
     const markdownFile = path.join(outDir, PACK_REPORT_MARKDOWN)
     const evidenceFile = path.join(outDir, PACK_EVIDENCE_FILE)
@@ -95,7 +97,7 @@ export function publishPackReport(reportDir: string, input: ReportInput, hooks: 
       if (!lock.handle.verify()) return notPublished('LOCK_LOST')
       // Claim the sequence number exclusively, then link the JSON into place WITHOUT overwriting: even a holder that was
       // displaced cannot place a second commit record for a sequence that is already taken.
-      try { writeExclusive(claimFile, `${input.runId}\n`); claim = claimFile } catch (error) {
+      try { writeExclusive(claimFile, `${record.runId}\n`); claim = claimFile } catch (error) {
         return notPublished((error as NodeJS.ErrnoException).code === 'EEXIST' ? 'SEQUENCE_CLAIMED' : 'WRITE_FAILED')
       }
       created.push(jsonFile); linkSync(tmp(PACK_REPORT_JSON), jsonFile); unlinkSync(tmp(PACK_REPORT_JSON))
@@ -105,7 +107,7 @@ export function publishPackReport(reportDir: string, input: ReportInput, hooks: 
 
     hooks.afterCommit?.()
     const after = readPackChain(reportDir)
-    if (!after.ok || !after.head || after.head.runId !== input.runId || after.head.sha256 !== sha256Hex(jsonText)) {
+    if (!after.ok || !after.head || after.head.runId !== record.runId || after.head.sha256 !== sha256Hex(jsonText)) {
       return notPublished(after.ok ? 'PAIR_INVALID' : after.code)
     }
     created.length = 0 // committed: nothing to undo

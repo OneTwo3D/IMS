@@ -13,7 +13,10 @@ import { NOW, STAMP, allBrackets, cleanup, itemFromComparison, key, passItem, sc
 const bases: string[] = []
 after(() => cleanup(bases))
 
+// An equal pair (a bothEqual entry); solo/soloV carry one side only (onlyIms, onlyVendor, unsettled, excluded, outOfPopulation).
 const entry = (sku: string) => ({ key: sku as never, ims: '1', vendor: '1', delta: '0' })
+const solo = (sku: string) => ({ key: sku as never, ims: '1', vendor: null, delta: null })
+const soloV = (sku: string) => ({ key: sku as never, ims: null, vendor: '1', delta: null })
 function input(items: ItemInput[], streams: StreamBracket[] = allBrackets(), phase: 'P0' | 'P1' | 'P2' = 'P1'): ReportInput {
   return { runId: newRunId(NOW), systemIdentifier: 'ims-test', phase, asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items }
 }
@@ -33,7 +36,7 @@ test('a pass with NO proof is rejected: an empty or unreadable comparison cannot
   rejects(put(base(), { id: 'R1', outcome: 'pass', reasons: [] }))
   // "compared" with nothing compared
   rejects(put(base(), { ...passItem('R1'), proof: { kind: 'compared' } }))
-  rejects(put(base(), { ...passItem('R1'), proof: { kind: 'compared' }, entries: { outOfPopulation: [entry('A|MAIN')] } }))
+  rejects(put(base(), { ...passItem('R1'), proof: { kind: 'compared' }, entries: { outOfPopulation: [solo('A|MAIN')] } }))
   // "proven-empty" while identities were compared, or with an invented proof source
   rejects(put(base(), { ...passItem('R1'), entries: { bothEqual: [entry('A|MAIN')] } }))
   rejects(put(base(), { ...passItem('R1'), proof: { kind: 'proven-empty', source: 'because I said so' as never } }))
@@ -74,8 +77,8 @@ test('nothing but a pass carries a proof; a pass carries no reason, finding or u
   rejects(put(base(), { id: 'R3', outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'], proof: { kind: 'compared' } }))
   rejects(put(base(), { id: 'R3', outcome: 'fail', reasons: ['DIFFERENCES'], proof: { kind: 'compared' } }))
   rejects(put(base(), { ...passItem('R3'), reasons: ['DIFFERENCES'] }))
-  rejects(put(base(), { ...passItem('R3'), entries: { onlyIms: [entry('A|MAIN')] } }))
-  rejects(put(base(), { ...passItem('R3'), entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: [] } }] } }))
+  rejects(put(base(), { ...passItem('R3'), entries: { onlyIms: [solo('A|MAIN')] } }))
+  rejects(put(base(), { ...passItem('R3'), entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: [] } }] } }))
 })
 
 test('fail, inconclusive and not-applicable have invariants of their own', () => {
@@ -85,24 +88,24 @@ test('fail, inconclusive and not-applicable have invariants of their own', () =>
   rejects(put(base(), R('fail', [])))
   accepts(put(base(), R('fail', ['DIFFERENCES'])))
   // a finding is always a fail with DIFFERENCES
-  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { onlyVendor: [entry('A|MAIN')] } })))
-  rejects(put(base(), R('fail', ['UNSETTLED_PENDING'], { entries: { onlyVendor: [entry('A|MAIN')] } })))
+  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { onlyVendor: [soloV('A|MAIN')] } })))
+  rejects(put(base(), R('fail', ['UNSETTLED_PENDING'], { entries: { onlyVendor: [soloV('A|MAIN')] } })))
   // inconclusive
   rejects(put(base(), R('inconclusive', [])))
   rejects(put(base(), R('inconclusive', ['DIFFERENCES'])))
   accepts(put(base(), R('inconclusive', ['STALE_BASIS'])))
   // UNSETTLED_PENDING and the unsettled count agree, in both directions
   rejects(put(base(), R('inconclusive', ['UNSETTLED_PENDING'])))
-  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
-  accepts(put(base(), R('inconclusive', ['UNSETTLED_PENDING'], { entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
+  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
+  accepts(put(base(), R('inconclusive', ['UNSETTLED_PENDING'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
   // NO_RUNNER is an inconclusive item with nothing listed
   rejects(put(base(), R('fail', ['NO_RUNNER', 'DIFFERENCES'])))
-  rejects(put(base(), R('inconclusive', ['NO_RUNNER'], { entries: { excluded: [entry('A|MAIN')] } })))
+  rejects(put(base(), R('inconclusive', ['NO_RUNNER'], { entries: { excluded: [solo('A|MAIN')] } })))
   accepts(put(base(), R('inconclusive', ['NO_RUNNER'])))
   // PHASE_NOT_APPLICABLE belongs to not-applicable alone, and not-applicable reads and lists nothing
   rejects(put(base(), R('inconclusive', ['PHASE_NOT_APPLICABLE'])))
   rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'], sources: ['qoblex-file'] }))
-  rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'], entries: { excluded: [entry('A|MAIN')] } }))
+  rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'], entries: { excluded: [solo('A|MAIN')] } }))
   rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE', 'NO_RUNNER'] }))
   rejects(put(base('P1'), { id: 'R7', outcome: 'inconclusive', reasons: ['NO_RUNNER'] }))
   rejects(put(base('P1'), { id: 'R7', outcome: 'pass', reasons: [], proof: { kind: 'compared' }, entries: { bothEqual: [entry('A|MAIN')] }, sources: ['ims-database', 'qoblex-file'] }))
@@ -203,16 +206,16 @@ test('the builder refuses every malformed input shape with ReportInvalid (never 
     ['sources a string', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], sources: 'invariant-report' } as never))],
     ['a proof a string', () => input(put(good(), { ...passItem('R3'), proof: 'compared' } as never))],
     ['entries a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: [] } as never))],
-    ['an unknown bucket', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { onlyUs: [entry('A|MAIN')] } } as never))],
-    ['a bucket not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { onlyIms: entry('A|MAIN') } } as never))],
+    ['an unknown bucket', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { onlyUs: [solo('A|MAIN')] } } as never))],
+    ['a bucket not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { onlyIms: solo('A|MAIN') } } as never))],
     ['an entry null', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [null] } } as never))],
-    ['an entry key that is not a token', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...entry('a@b.c') }] } } as never))],
+    ['an entry key that is not a token', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...solo('a@b.c') }] } } as never))],
     ['an entry key missing', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ims: '1', vendor: '1', delta: '0' }] } } as never))],
-    ...['NaN', '', '1e3', ' 1', '-0', '1.50', '01', '+1', 5, undefined].map((value): [string, () => ReportInput] => [`an entry value ${String(value)}`, () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...entry('A|MAIN'), ims: value }] } } as never))]),
+    ...['NaN', '', '1e3', ' 1', '-0', '1.50', '01', '+1', 5, undefined].map((value): [string, () => ReportInput] => [`an entry value ${String(value)}`, () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...solo('A|MAIN'), ims: value }] } } as never))]),
     ['an entry delta undefined', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ key: 'A|MAIN', ims: null, vendor: null }] } } as never))],
-    ['a settling stamp bad', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: 'soon', later: [] } }] } } as never))],
-    ['settling not an object', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...entry('A|MAIN'), settling: 'x' }] } } as never))],
-    ['settling later not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: 'x' } }] } } as never))],
+    ['a settling stamp bad', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: 'soon', later: [] } }] } } as never))],
+    ['settling not an object', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: 'x' }] } } as never))],
+    ['settling later not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: 'x' } }] } } as never))],
   ]
   for (const [name, make] of bad) assert.throws(() => buildReport(make(), 1, null), ReportInvalid, name)
   assert.doesNotThrow(() => buildReport(input(base()), 1, null))
@@ -221,7 +224,7 @@ test('the builder refuses every malformed input shape with ReportInvalid (never 
 test('the evidence reader refuses a value that is not in the one canonical text form', () => {
   const { body, markdown } = buildReport(input(put(base(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ key: 'A|MAIN' as never, ims: '1.5', vendor: null, delta: null }] } })), 1, null)
   const record = { ...body, companionMarkdownSha256: sha256Hex(markdown) }
-  const line = (ims: string) => `${JSON.stringify({ item: 'R3', bucket: 'excluded', key: 'A|MAIN', ims, vendor: null, delta: null })}\n`
+  const line = (ims: string) => `${JSON.stringify({ item: 'R3', bucket: 'excluded', key: 'A|MAIN', ims, vendor: null, delta: null, imsCurrency: null, vendorCurrency: null })}\n`
   const withText = (text: string) => ({ ...record, evidence: { ...record.evidence, sha256: sha256Hex(text) } })
   verifyEvidence(line('1.5'), withText(line('1.5')))
   for (const ims of ['1.50', '-0', '0.0', '01', '+1', '1e0']) assert.throws(() => verifyEvidence(line(ims), withText(line(ims))), ReportInvalid, ims)

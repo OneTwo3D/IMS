@@ -1,7 +1,7 @@
 import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import path from 'node:path'
 
-import { compareKeyed, type CompareInput, type CompareResult } from '../../lib/reconciliation-pack/compare.ts'
+import { compareItem, type CompareInput, type CompareResult } from '../../lib/reconciliation-pack/compare.ts'
 import { PACK_ITEM_IDS, getPackItem, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
 import { outcomeOfComparison } from '../../lib/reconciliation-pack/compare.ts'
 import type { ItemInput } from '../../lib/reconciliation-pack/report.ts'
@@ -32,8 +32,8 @@ export const STAMP = '2026-10-19T00:00:00.000Z'
 export const allBrackets = (stamp: string = STAMP) => (['woocommerce-order-sweep', 'mintsoft-stock-sync', 'mintsoft-dispatch-poll', 'mintsoft-order-status', 'xero-balance-snapshots', 'xero-tax-rates'] as const).map((stream) => ({ stream, start: stamp, end: stamp }))
 
 /** An item input built from a real comparison, the way a runner will build one. */
-export function itemFromComparison(id: PackItemId, input: Partial<CompareInput> & Pick<CompareInput, 'ims' | 'vendor'>): { item: ItemInput; result: CompareResult } {
-  const result = compareKeyed({ imsComplete: true, vendorComplete: true, mode: getPackItem(id).mode, tolerance: { rule: 'exact' }, ...input })
+export function itemFromComparison(id: PackItemId, input: Partial<Omit<CompareInput, 'mode' | 'tolerance'>> & Pick<CompareInput, 'ims' | 'vendor'>): { item: ItemInput; result: CompareResult } {
+  const result = compareItem(id, { imsComplete: true, vendorComplete: true, ...input })
   const verdict = outcomeOfComparison(result)
   const proof = verdict.outcome === 'pass' && result.status === 'compared' ? result.proof : null
   return { item: { id, outcome: verdict.outcome, reasons: verdict.reasons, proof, sources: [...getPackItem(id).sources], entries: result.status === 'compared' ? result.buckets : undefined }, result }

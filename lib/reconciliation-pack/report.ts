@@ -15,11 +15,13 @@ import { createHash } from 'node:crypto'
 
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
 import { READ_SYNC_STREAM_IDS, type ReadSyncStreamId } from '@/lib/ops/read-sync-liveness-constants'
-import { bracketStable, decimalText, isStreamStamp, type CompareEntry, parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
+import { bracketStable, decimalText, isStreamStamp, parseDecimalStrict, withinTolerance, type CompareEntry } from '@/lib/reconciliation-pack/compare'
 import {
   COMPARISON_BUCKETS,
   FINDING_BUCKETS,
+  MAX_ENTRIES_PER_BUCKET,
   MAX_EVIDENCE_LINES_PER_ITEM,
+  isKnownCurrency,
   PACK_EVIDENCE_FILE,
   PACK_ITEM_IDS,
   PACK_OUTCOMES,
@@ -42,14 +44,21 @@ import {
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
 import { isSafeTokenShape } from '@/lib/reconciliation-pack/identity'
+import { ShapeError, plainList, plainRecord } from '@/lib/reconciliation-pack/shape'
 
 export const RUN_ID_RE = /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/
 export const AS_OF_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 export const SHA256_RE = /^[0-9a-f]{64}$/
 const PHASES: readonly ReadinessPhase[] = ['P0', 'P1', 'P2']
 
-/** The buckets whose members are listed one per evidence line. bothEqual is a count and a digest of its identities. */
-export const LISTED_BUCKETS: readonly ComparisonBucket[] = ['onlyIms', 'onlyVendor', 'bothDiffer', 'unsettled', 'excluded', 'outOfPopulation']
+/** Every bucket is listed: one evidence line per identity, equal ones included, so a reader recomputes every count itself. */
+export const LISTED_BUCKETS: readonly ComparisonBucket[] = COMPARISON_BUCKETS
+/** The order evidence lines are written in: findings first, so a cap can never cut a finding to keep an equal. */
+const EMIT_ORDER: readonly ComparisonBucket[] = ['onlyIms', 'onlyVendor', 'bothDiffer', 'unsettled', 'excluded', 'outOfPopulation', 'bothEqual']
+
+/** What a caller may hand in for one entry. The currencies default to null; no other field is optional. */
+/** The key is checked at runtime against the sanitised-token shape (identity.ts), so the type does not demand the brand. */
+export type EntryInput = Omit<CompareEntry, 'imsCurrency' | 'vendorCurrency' | 'key'> & { key: string; imsCurrency?: string | null; vendorCurrency?: string | null }
 
 export type ItemInput = {
   id: PackItemId
@@ -59,7 +68,7 @@ export type ItemInput = {
   proof?: ItemProof | null
   /** The sources the item read; a pass must name exactly its catalogue row's. */
   sources?: readonly PackSourceCode[]
-  entries?: Partial<Record<ComparisonBucket, readonly CompareEntry[]>>
+  entries?: Partial<Record<ComparisonBucket, readonly EntryInput[]>>
 }
 
 export type StreamBracket = { stream: ReadSyncStreamId; start: string | null; end: string | null }
@@ -136,46 +145,188 @@ function isReadSyncStream(value: unknown): value is ReadSyncStreamId {
   return typeof value === 'string' && (READ_SYNC_STREAM_IDS as readonly string[]).includes(value)
 }
 
-export function equalDigest(entries: readonly CompareEntry[]): string | null {
-  if (entries.length === 0) return null
-  return sha256Hex([...entries.map((entry) => entry.key)].sort().join('\n'))
+export function equalDigest(keys: readonly string[]): string | null {
+  if (keys.length === 0) return null
+  return sha256Hex([...keys].sort().join('\n'))
 }
 
 /** A decimal in the one text form the comparator writes (no minus zero, no trailing zeros, no padding). */
-function isCanonicalDecimal(value: unknown): boolean {
+function isCanonicalDecimal(value: unknown): value is string {
   const parsed = parseDecimalStrict(value)
   return parsed !== null && decimalText(parsed) === value
 }
 
-function validateEntry(entry: CompareEntry): void {
-  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new ReportInvalid('an entry is not an object')
-  if (!isSafeTokenShape(entry.key)) throw new ReportInvalid('an entry key is not a sanitised token')
-  for (const value of [entry.ims, entry.vendor, entry.delta]) {
-    if (value !== null && !isCanonicalDecimal(value)) throw new ReportInvalid('an entry value is not a canonical plain decimal')
+// ---------------------------------------------------------------------------------------------
+// Entries: one shape, one judge. The builder judges every entry before writing a byte and the reader judges
+// every evidence line again, with the same function, against the catalogue row of the item.
+// ---------------------------------------------------------------------------------------------
+
+/** An entry as it is stored: only these fields, only these types. */
+export type CleanEntry = {
+  key: string
+  ims: string | null
+  vendor: string | null
+  delta: string | null
+  imsCurrency: string | null
+  vendorCurrency: string | null
+  settling?: { first: string; later: string[] }
+}
+const ENTRY_KEYS = ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency', 'settling'] as const
+const MAX_SETTLING_LATER = 8
+
+function nullableDecimal(value: unknown, what: string): string | null {
+  if (value === null) return null
+  if (!isCanonicalDecimal(value)) throw new ReportInvalid(`an entry ${what} is not a canonical plain decimal`)
+  return value
+}
+function nullableCurrency(value: unknown, what: string): string | null {
+  if (value === null) return null
+  if (!isKnownCurrency(value)) throw new ReportInvalid(`an entry ${what} is not a known currency`)
+  return value
+}
+
+/** Copy one caller-owned entry into a clean one (or throw). Used for builder input and for parsed evidence lines alike. */
+function cleanEntry(raw: unknown, optionalCurrencies: boolean): CleanEntry {
+  const r = plainRecord(raw, ENTRY_KEYS, optionalCurrencies ? ['key', 'ims', 'vendor', 'delta'] : ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency'], 'an entry')
+  if (typeof r.key !== 'string' || !isSafeTokenShape(r.key)) throw new ReportInvalid('an entry key is not a sanitised token')
+  const entry: CleanEntry = {
+    key: r.key,
+    ims: nullableDecimal(r.ims, 'ims value'),
+    vendor: nullableDecimal(r.vendor, 'vendor value'),
+    delta: nullableDecimal(r.delta, 'delta'),
+    imsCurrency: nullableCurrency(r.imsCurrency === undefined ? null : r.imsCurrency, 'ims currency'),
+    vendorCurrency: nullableCurrency(r.vendorCurrency === undefined ? null : r.vendorCurrency, 'vendor currency'),
   }
-  if (entry.settling !== undefined) {
-    if (typeof entry.settling !== 'object' || entry.settling === null || !isStreamStamp(entry.settling.first) || !Array.isArray(entry.settling.later) || !entry.settling.later.every(isStreamStamp)) throw new ReportInvalid('an unsettled entry carries a bad stamp')
+  if (r.settling !== undefined) {
+    const settling = plainRecord(r.settling, ['first', 'later'], ['first', 'later'], 'settling data')
+    if (!isStreamStamp(settling.first)) throw new ReportInvalid('an unsettled entry carries a bad stamp')
+    const later = plainList(settling.later, MAX_SETTLING_LATER, 'settling stamps')
+    if (!later.every(isStreamStamp)) throw new ReportInvalid('an unsettled entry carries a bad stamp')
+    entry.settling = { first: settling.first, later: later as string[] }
+  }
+  return entry
+}
+
+/**
+ * Judge an entry against its item and its bucket: the value shape the item's mode demands, a delta that is the
+ * difference of the two values, and the tolerance verdict the catalogue's measure gives (bothEqual must be within it,
+ * bothDiffer must not be, or the currencies must differ). Nothing is taken on the writer's word.
+ */
+export function checkEntry(id: PackItemId, bucket: ComparisonBucket, entry: CleanEntry): void {
+  const fail = (why: string): never => { throw new ReportInvalid(`item ${id}: ${bucket} entry ${why}`) }
+  const spec = getPackItem(id)
+  if ((entry.settling !== undefined) !== (bucket === 'unsettled')) fail('settling data belongs to unsettled entries and to nothing else')
+  if (spec.mode === 'presence') {
+    if (entry.ims !== null || entry.vendor !== null || entry.delta !== null || entry.imsCurrency !== null || entry.vendorCurrency !== null) fail('a presence item carries no values')
+    return
+  }
+  const measure = spec.measure!
+  const a = parseDecimalStrict(entry.ims)
+  const b = parseDecimalStrict(entry.vendor)
+  if ((entry.ims === null) !== (a === null) || (entry.vendor === null) !== (b === null)) fail('has an unreadable value')
+  if (measure.rule === 'minor-unit' && ((a !== null && entry.imsCurrency === null) || (b !== null && entry.vendorCurrency === null))) fail('needs a currency for each value')
+  if ((a === null && entry.imsCurrency !== null) || (b === null && entry.vendorCurrency !== null)) fail('has a currency for a missing value')
+  const both = a !== null && b !== null
+  if (both && (entry.imsCurrency === null) !== (entry.vendorCurrency === null)) fail('has a currency on one side only')
+  const delta = both ? decimalText(a.minus(b)) : null
+  // The verdict the pair gets, recomputed here.
+  let equal: boolean | null = null
+  if (both) {
+    if (entry.imsCurrency !== entry.vendorCurrency) equal = false
+    else {
+      const within = withinTolerance(measure, a, b, entry.imsCurrency)
+      if (within === null) fail('has no usable currency for its tolerance')
+      equal = within
+    }
+  }
+  switch (bucket) {
+    case 'onlyIms': if (a === null || b !== null || entry.delta !== null) fail('must carry the ims value alone'); return
+    case 'onlyVendor': if (b === null || a !== null || entry.delta !== null) fail('must carry the vendor value alone'); return
+    case 'bothEqual': if (!both || equal !== true || entry.delta !== delta) fail('is not a pair within the tolerance, with the true delta'); return
+    case 'bothDiffer': if (!both || equal !== false || entry.delta !== delta) fail('is not a pair outside the tolerance, with the true delta'); return
+    case 'unsettled':
+      if (a === null && b === null) fail('carries no value')
+      if (both) { if (equal !== false || entry.delta !== delta) fail('is a pair that does not differ, or has the wrong delta') } else if (entry.delta !== null) fail('has a delta with one value')
+      return
+    case 'excluded': case 'outOfPopulation':
+      if (a === null && b === null) fail('carries no value')
+      if (entry.delta !== null) fail('carries a delta')
   }
 }
 
-/** Evidence lines for one item, findings first, capped. Returns the lines and whether the cap cut any. */
-function itemEvidence(item: ItemInput): { lines: string[]; counts: Record<ComparisonBucket, number>; cut: boolean } {
-  const counts = Object.fromEntries(COMPARISON_BUCKETS.map((bucket) => [bucket, 0])) as Record<ComparisonBucket, number>
-  const lines: string[] = []
-  let cut = false
-  for (const bucket of COMPARISON_BUCKETS) {
-    const entries = item.entries?.[bucket] ?? []
-    entries.forEach(validateEntry)
-    if (bucket === 'bothEqual') { counts.bothEqual = entries.length; continue }
-    for (const entry of entries) {
-      if (lines.length >= MAX_EVIDENCE_LINES_PER_ITEM) { cut = true; continue }
-      const line: Record<string, unknown> = { item: item.id, bucket, key: entry.key, ims: entry.ims, vendor: entry.vendor, delta: entry.delta }
-      if (entry.settling) line.settling = entry.settling
-      lines.push(JSON.stringify(line))
-      counts[bucket] += 1
+/** One clean item: copied from the caller's, field by field. */
+type CleanItem = { id: PackItemId; outcome: PackOutcome; reasons: PackReasonCode[]; proof: ItemProof | null; sources: PackSourceCode[]; entries: Record<ComparisonBucket, CleanEntry[]> }
+type CleanInput = { runId: string; systemIdentifier: string; phase: ReadinessPhase; asOf: string; startedAt: string; finishedAt: string; streams: StreamBracket[]; items: CleanItem[] }
+
+function cleanItem(raw: unknown): CleanItem {
+  const r = plainRecord(raw, ['id', 'outcome', 'reasons', 'proof', 'sources', 'entries'], ['id', 'outcome', 'reasons'], 'an item')
+  if (typeof r.id !== 'string' || !(PACK_ITEM_IDS as readonly string[]).includes(r.id)) throw new ReportInvalid('an item has an unknown id')
+  const id = r.id as PackItemId
+  if (typeof r.outcome !== 'string' || !(PACK_OUTCOMES as readonly string[]).includes(r.outcome)) throw new ReportInvalid(`item ${id}: unknown outcome`)
+  const reasons = plainList(r.reasons, 32, `item ${id} reasons`)
+  if (!reasons.every(isPackReasonCode)) throw new ReportInvalid(`item ${id}: unknown reason code`)
+  const sources = r.sources === undefined ? [] : plainList(r.sources, 16, `item ${id} sources`)
+  if (!sources.every(isPackSourceCode)) throw new ReportInvalid(`item ${id}: unknown source`)
+  let proof: ItemProof | null = null
+  if (r.proof !== undefined && r.proof !== null) {
+    const kind = (plainRecord(r.proof, ['kind', 'source'], ['kind'], `item ${id} proof`)).kind
+    const p = plainRecord(r.proof, kind === 'proven-empty' ? ['kind', 'source'] : ['kind'], kind === 'proven-empty' ? ['kind', 'source'] : ['kind'], `item ${id} proof`)
+    if (p.kind === 'compared') proof = { kind: 'compared' }
+    else if (p.kind === 'proven-empty' && isPackEmptyProofCode(p.source)) proof = { kind: 'proven-empty', source: p.source }
+    else throw new ReportInvalid(`item ${id}: bad proof`)
+  }
+  const entries = Object.fromEntries(COMPARISON_BUCKETS.map((bucket) => [bucket, [] as CleanEntry[]])) as Record<ComparisonBucket, CleanEntry[]>
+  if (r.entries !== undefined) {
+    const e = plainRecord(r.entries, COMPARISON_BUCKETS, [], `item ${id} entries`)
+    for (const bucket of COMPARISON_BUCKETS) {
+      if (e[bucket] === undefined) continue
+      entries[bucket] = plainList(e[bucket], MAX_ENTRIES_PER_BUCKET, `item ${id} ${bucket} entries`).map((raw) => cleanEntry(raw, true))
     }
   }
-  return { lines, counts, cut }
+  return { id, outcome: r.outcome as PackOutcome, reasons: reasons as PackReasonCode[], proof, sources: sources as PackSourceCode[], entries }
+}
+
+function cleanInput(raw: unknown): CleanInput {
+  const r = plainRecord(raw, ['runId', 'systemIdentifier', 'phase', 'asOf', 'startedAt', 'finishedAt', 'streams', 'items'], ['runId', 'systemIdentifier', 'phase', 'asOf', 'startedAt', 'finishedAt', 'streams', 'items'], 'the report input')
+  if (typeof r.runId !== 'string' || !RUN_ID_RE.test(r.runId)) throw new ReportInvalid('runId has the wrong shape')
+  if (typeof r.systemIdentifier !== 'string' || !SYSTEM_IDENTIFIER_RE.test(r.systemIdentifier)) throw new ReportInvalid('systemIdentifier has the wrong shape')
+  if (typeof r.phase !== 'string' || !(PHASES as readonly string[]).includes(r.phase)) throw new ReportInvalid('unknown phase')
+  if (typeof r.asOf !== 'string' || !AS_OF_RE.test(r.asOf) || Number.isNaN(Date.parse(`${r.asOf}T00:00:00Z`))) throw new ReportInvalid('asOf is not a date')
+  if (!isStreamStamp(r.startedAt) || !isStreamStamp(r.finishedAt)) throw new ReportInvalid('a run time is not an ISO time')
+  const streams = plainList(r.streams, READ_SYNC_STREAM_IDS.length, 'streams').map((raw): StreamBracket => {
+    const b = plainRecord(raw, ['stream', 'start', 'end'], ['stream', 'start', 'end'], 'a stream bracket')
+    if (!isReadSyncStream(b.stream)) throw new ReportInvalid('a stream is unknown')
+    for (const stamp of [b.start, b.end]) if (stamp !== null && !isStreamStamp(stamp)) throw new ReportInvalid('a stream stamp is not an ISO time')
+    return { stream: b.stream, start: b.start as string | null, end: b.end as string | null }
+  })
+  const items = plainList(r.items, PACK_ITEM_IDS.length, 'items').map(cleanItem)
+  return { runId: r.runId, systemIdentifier: r.systemIdentifier, phase: r.phase as ReadinessPhase, asOf: r.asOf, startedAt: r.startedAt as string, finishedAt: r.finishedAt as string, streams, items }
+}
+
+/** Evidence lines for one item, findings first, capped. Every line is built from named fields of a clean entry. */
+function itemEvidence(item: CleanItem, maxLines: number): { lines: string[]; counts: Record<ComparisonBucket, number>; cut: boolean; equalKeys: string[] } {
+  const counts = Object.fromEntries(COMPARISON_BUCKETS.map((bucket) => [bucket, 0])) as Record<ComparisonBucket, number>
+  const lines: string[] = []
+  const equalKeys: string[] = []
+  const seen = new Set<string>()
+  let cut = false
+  for (const bucket of EMIT_ORDER) {
+    for (const entry of item.entries[bucket]) {
+      checkEntry(item.id, bucket, entry)
+      if (seen.has(entry.key)) throw new ReportInvalid(`item ${item.id}: an identity appears twice`)
+      seen.add(entry.key)
+      if (lines.length >= maxLines) { cut = true; continue }
+      lines.push(evidenceLine(item.id, bucket, entry))
+      counts[bucket] += 1
+      if (bucket === 'bothEqual') equalKeys.push(entry.key)
+    }
+  }
+  return { lines, counts, cut, equalKeys }
+}
+
+function evidenceLine(item: PackItemId, bucket: ComparisonBucket, entry: CleanEntry): string {
+  const line = { item, bucket, key: entry.key, ims: entry.ims, vendor: entry.vendor, delta: entry.delta, imsCurrency: entry.imsCurrency, vendorCurrency: entry.vendorCurrency, ...(entry.settling ? { settling: { first: entry.settling.first, later: [...entry.settling.later] } } : {}) }
+  return JSON.stringify(line)
 }
 
 /** The item record every reader and writer accepts: one place, so the builder and the reader cannot drift apart. */
@@ -237,35 +388,30 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
   return reasons
 }
 
-export function buildReport(input: ReportInput, sequence: number, previousReportSha256: string | null): { body: ReportBody; evidenceText: string; markdown: string } {
-  if (!RUN_ID_RE.test(input.runId)) throw new ReportInvalid('runId has the wrong shape')
-  if (!SYSTEM_IDENTIFIER_RE.test(input.systemIdentifier)) throw new ReportInvalid('systemIdentifier has the wrong shape')
-  if (!PHASES.includes(input.phase)) throw new ReportInvalid('unknown phase')
-  if (!AS_OF_RE.test(input.asOf) || Number.isNaN(Date.parse(`${input.asOf}T00:00:00Z`))) throw new ReportInvalid('asOf is not a date')
-  if (!isStreamStamp(input.startedAt) || !isStreamStamp(input.finishedAt)) throw new ReportInvalid('a run time is not an ISO time')
+export type BuiltReport = { body: ReportBody; record: ReportRecord; jsonText: string; evidenceText: string; markdown: string }
+
+/**
+ * Build a report from caller data. The caller's objects are copied field by field into clean ones (shape.ts) before
+ * anything else; every entry is judged; the records and the evidence are built from the clean values only; and
+ * then the finished text is read back by the SAME validation a reader applies (parseReport, verifyEvidence, the
+ * Markdown digest) BEFORE this function returns. Nothing reaches a file unless it has already passed the reader.
+ */
+/** Tests lower the cap so the cut can be exercised without a hundred thousand entries; it can never be raised above the constant. */
+export type BuildOptions = { maxLinesPerItem?: number }
+
+export function buildReport(raw: ReportInput, sequence: number, previousReportSha256: string | null, options: BuildOptions = {}): BuiltReport {
+  const maxLines = options.maxLinesPerItem ?? MAX_EVIDENCE_LINES_PER_ITEM
+  if (!Number.isSafeInteger(maxLines) || maxLines < 1 || maxLines > MAX_EVIDENCE_LINES_PER_ITEM) throw new ReportInvalid('the line cap must be a whole number from 1 to the constant')
   if (!Number.isSafeInteger(sequence) || sequence < 1) throw new ReportInvalid('sequence must be a positive integer')
   if ((sequence === 1) !== (previousReportSha256 === null)) throw new ReportInvalid('previousReportSha256 is null exactly for sequence 1')
   if (previousReportSha256 !== null && !SHA256_RE.test(previousReportSha256)) throw new ReportInvalid('previousReportSha256 is not a sha256')
-  if (!Array.isArray(input.items) || !Array.isArray(input.streams)) throw new ReportInvalid('items and streams must be lists')
-  if (input.streams.some((bracket) => typeof bracket !== 'object' || bracket === null || typeof bracket.stream !== 'string')) throw new ReportInvalid('a stream bracket is not an object with a stream')
+  let input: CleanInput
+  try { input = cleanInput(raw) } catch (error) {
+    if (error instanceof ShapeError) throw new ReportInvalid(error.message)
+    throw error
+  }
   const streams = [...input.streams].sort((a, b) => a.stream.localeCompare(b.stream))
-  for (const [index, bracket] of streams.entries()) {
-    if (!isReadSyncStream(bracket.stream) || (index > 0 && streams[index - 1]!.stream === bracket.stream)) throw new ReportInvalid('a stream is unknown or repeated')
-    for (const stamp of [bracket.start, bracket.end]) if (stamp !== null && !isStreamStamp(stamp)) throw new ReportInvalid('a stream stamp is not an ISO time')
-  }
-  for (const item of input.items) {
-    if (typeof item !== 'object' || item === null || Array.isArray(item)) throw new ReportInvalid('an item is not an object')
-    if (!Array.isArray(item.reasons)) throw new ReportInvalid(`item ${String(item.id)}: reasons must be a list`)
-    if (item.sources !== undefined && !Array.isArray(item.sources)) throw new ReportInvalid(`item ${String(item.id)}: sources must be a list`)
-    if (item.proof !== undefined && item.proof !== null && (typeof item.proof !== 'object' || Array.isArray(item.proof))) throw new ReportInvalid(`item ${String(item.id)}: proof must be an object`)
-    if (item.entries !== undefined) {
-      if (typeof item.entries !== 'object' || item.entries === null || Array.isArray(item.entries)) throw new ReportInvalid(`item ${String(item.id)}: entries must be an object`)
-      for (const [bucket, list] of Object.entries(item.entries)) {
-        if (!(COMPARISON_BUCKETS as readonly string[]).includes(bucket)) throw new ReportInvalid(`item ${String(item.id)}: unknown bucket`)
-        if (!Array.isArray(list)) throw new ReportInvalid(`item ${String(item.id)}: a bucket must be a list`)
-      }
-    }
-  }
+  for (const [index, bracket] of streams.entries()) if (index > 0 && streams[index - 1]!.stream === bracket.stream) throw new ReportInvalid('a stream is repeated')
   const byId = new Map(input.items.map((item) => [item.id, item]))
   if (byId.size !== input.items.length || PACK_ITEM_IDS.some((id) => !byId.has(id)) || input.items.length !== PACK_ITEM_IDS.length) {
     throw new ReportInvalid('the report must carry each of R1 to R15 exactly once')
@@ -275,13 +421,11 @@ export function buildReport(input: ReportInput, sequence: number, previousReport
   const items: ItemResult[] = PACK_ITEM_IDS.map((id) => {
     const item = byId.get(id)!
     const applicability = itemApplicability(id, input.phase)
-    const evidence = itemEvidence(item)
-    const proof = item.proof ?? null
-    const sources = [...(item.sources ?? [])].sort()
-    const reasons = checkItemConsistency({ id, outcome: item.outcome, reasons: item.reasons, proof, sources }, applicability, evidence.counts, evidence.cut, streams)
-    const outcome = item.outcome
+    const evidence = itemEvidence(item, maxLines)
+    const sources = [...item.sources].sort()
+    const reasons = checkItemConsistency({ id, outcome: item.outcome, reasons: item.reasons, proof: item.proof, sources }, applicability, evidence.counts, evidence.cut, streams)
     evidenceLines.push(...evidence.lines)
-    return { id, applicability, outcome, reasons, proof, sources, counts: evidence.counts, bothEqualSha256: equalDigest(item.entries?.bothEqual ?? []), evidenceLines: evidence.lines.length }
+    return { id, applicability, outcome: item.outcome, reasons, proof: item.proof, sources, counts: evidence.counts, bothEqualSha256: equalDigest(evidence.equalKeys), evidenceLines: evidence.lines.length }
   })
   const evidenceText = evidenceLines.length ? `${evidenceLines.join('\n')}\n` : ''
   const body: ReportBody = {
@@ -301,7 +445,14 @@ export function buildReport(input: ReportInput, sequence: number, previousReport
     exitCode: deriveExitCode(items),
     evidence: { file: PACK_EVIDENCE_FILE, sha256: sha256Hex(evidenceText), lines: evidenceLines.length },
   }
-  return { body, evidenceText, markdown: renderMarkdown(body) }
+  const markdown = renderMarkdown(body)
+  const record: ReportRecord = { ...body, companionMarkdownSha256: sha256Hex(markdown) }
+  const jsonText = `${JSON.stringify(record, null, 2)}\n`
+  // The reader's own validation, on the finished text, before anything can be written.
+  const parsed = parseReport(jsonText)
+  verifyEvidence(evidenceText, parsed)
+  if (sha256Hex(markdown) !== parsed.companionMarkdownSha256) throw new ReportInvalid('the Markdown does not match its digest')
+  return { body, record, jsonText, evidenceText, markdown }
 }
 
 /** The Markdown: closed words, validated values and counts. It names no identity. */
@@ -398,7 +549,7 @@ export function parseReport(text: string): ReportRecord {
     })) as Record<ComparisonBucket, number>
     if (entry.bothEqualSha256 !== null && !(typeof entry.bothEqualSha256 === 'string' && SHA256_RE.test(entry.bothEqualSha256))) throw new ReportInvalid(`item ${id}: bad bothEqualSha256`)
     if ((entry.bothEqualSha256 === null) !== (counts.bothEqual === 0)) throw new ReportInvalid(`item ${id}: bothEqual count and digest disagree`)
-    if (typeof entry.evidenceLines !== 'number' || entry.evidenceLines !== LISTED_BUCKETS.reduce((sum, bucket) => sum + counts[bucket], 0)) throw new ReportInvalid(`item ${id}: evidenceLines is not the sum of the listed counts`)
+    if (typeof entry.evidenceLines !== 'number' || entry.evidenceLines !== COMPARISON_BUCKETS.reduce((sum, bucket) => sum + counts[bucket], 0)) throw new ReportInvalid(`item ${id}: evidenceLines is not the sum of the counts`)
     const result: ItemResult = { id, applicability, outcome: entry.outcome as PackOutcome, reasons: entry.reasons as PackReasonCode[], proof, sources, counts, bothEqualSha256: entry.bothEqualSha256 as string | null, evidenceLines: entry.evidenceLines }
     // The same consistency rules the builder applies.
     checkItemConsistency({ id, outcome: result.outcome, reasons: result.reasons, proof, sources }, applicability, counts, false, streams)
@@ -423,34 +574,53 @@ export function parseReport(text: string): ReportRecord {
   }
 }
 
-/** Validate evidence text against a parsed report: digest, line count, strict lines, and per-item per-bucket counts recomputed from the lines. */
+/**
+ * Validate evidence text against a parsed report: the digest, the line count, every line (strict fields, the item's
+ * mode and measure, the true delta, the verdict), then every per-item per-bucket count and every bothEqual digest
+ * RECOMPUTED from the lines. The report's own counts and digests are what is being checked, never what is believed.
+ */
 export function verifyEvidence(text: string, record: ReportRecord): void {
   if (sha256Hex(text) !== record.evidence.sha256) throw new ReportInvalid('the evidence does not match the digest the report records')
   if (text.length > 0 && !text.endsWith('\n')) throw new ReportInvalid('the evidence does not end with a newline')
   const lines = text.length === 0 ? [] : text.slice(0, -1).split('\n')
   if (lines.length !== record.evidence.lines) throw new ReportInvalid('the evidence line count does not match the report')
   const tally = new Map<string, number>()
+  const equalKeys = new Map<PackItemId, string[]>()
+  const seen = new Map<string, Set<string>>()
   for (const line of lines) {
-    let entry: unknown
-    try { entry = JSON.parse(line) } catch { throw new ReportInvalid('an evidence line is not JSON') }
-    if (!isRecord(entry)) throw new ReportInvalid('an evidence line is not an object')
-    const keys = Object.keys(entry).includes('settling') ? ['item', 'bucket', 'key', 'ims', 'vendor', 'delta', 'settling'] : ['item', 'bucket', 'key', 'ims', 'vendor', 'delta']
-    exactKeys(entry, keys, 'an evidence line')
-    if (typeof entry.item !== 'string' || !(PACK_ITEM_IDS as readonly string[]).includes(entry.item)) throw new ReportInvalid('an evidence line names an unknown item')
-    if (typeof entry.bucket !== 'string' || !(LISTED_BUCKETS as readonly string[]).includes(entry.bucket)) throw new ReportInvalid('an evidence line names an unknown bucket')
-    if (!isSafeTokenShape(entry.key)) throw new ReportInvalid('an evidence key is not a sanitised token')
-    for (const value of [entry.ims, entry.vendor, entry.delta]) if (value !== null && !isCanonicalDecimal(value)) throw new ReportInvalid('an evidence value is not a canonical plain decimal')
-    if (entry.settling !== undefined) {
-      if (entry.bucket !== 'unsettled' || !isRecord(entry.settling)) throw new ReportInvalid('settling data on a line that is not unsettled')
-      exactKeys(entry.settling, ['first', 'later'], 'settling data')
-      if (!isStreamStamp(entry.settling.first) || !Array.isArray(entry.settling.later) || !entry.settling.later.every(isStreamStamp)) throw new ReportInvalid('bad settling stamps')
-    } else if (entry.bucket === 'unsettled') throw new ReportInvalid('an unsettled line carries no settling data')
-    const tallyKey = `${entry.item}/${entry.bucket}`
+    let parsed: unknown
+    try { parsed = JSON.parse(line) } catch { throw new ReportInvalid('an evidence line is not JSON') }
+    let fields: Record<string, unknown>
+    try { fields = plainRecord(parsed, ['item', 'bucket', ...ENTRY_KEYS], ['item', 'bucket', 'key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency'], 'an evidence line') } catch (error) {
+      if (error instanceof ShapeError) throw new ReportInvalid(error.message)
+      throw error
+    }
+    if (typeof fields.item !== 'string' || !(PACK_ITEM_IDS as readonly string[]).includes(fields.item)) throw new ReportInvalid('an evidence line names an unknown item')
+    if (typeof fields.bucket !== 'string' || !(LISTED_BUCKETS as readonly string[]).includes(fields.bucket)) throw new ReportInvalid('an evidence line names an unknown bucket')
+    const id = fields.item as PackItemId
+    const bucket = fields.bucket as ComparisonBucket
+    let entry: CleanEntry
+    try {
+      const { item: _item, bucket: _bucket, ...rest } = fields
+      void _item; void _bucket
+      entry = cleanEntry(rest, false)
+    } catch (error) {
+      if (error instanceof ShapeError) throw new ReportInvalid(error.message)
+      throw error
+    }
+    checkEntry(id, bucket, entry)
+    const identities = seen.get(id) ?? new Set<string>()
+    if (identities.has(entry.key)) throw new ReportInvalid(`item ${id}: an identity appears twice in the evidence`)
+    identities.add(entry.key)
+    seen.set(id, identities)
+    const tallyKey = `${id}/${bucket}`
     tally.set(tallyKey, (tally.get(tallyKey) ?? 0) + 1)
+    if (bucket === 'bothEqual') equalKeys.set(id, [...(equalKeys.get(id) ?? []), entry.key])
   }
   for (const item of record.items) {
     for (const bucket of LISTED_BUCKETS) {
       if ((tally.get(`${item.id}/${bucket}`) ?? 0) !== item.counts[bucket]) throw new ReportInvalid(`item ${item.id}: ${bucket} count is not what the evidence lists`)
     }
+    if (equalDigest(equalKeys.get(item.id) ?? []) !== item.bothEqualSha256) throw new ReportInvalid(`item ${item.id}: the bothEqual identities do not match their digest`)
   }
 }

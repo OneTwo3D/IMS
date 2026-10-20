@@ -6,7 +6,7 @@ import path from 'node:path'
 import test, { after } from 'node:test'
 
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
-import { PACK_EVIDENCE_FILE, PACK_ITEM_IDS, PACK_LOCK_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN, itemApplicability, packExitCode, MAX_EVIDENCE_LINES_PER_ITEM, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
+import { PACK_EVIDENCE_FILE, PACK_ITEM_IDS, PACK_LOCK_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN, itemApplicability, packExitCode, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
 import { defaultItems, newRunId, publishSyntheticRun } from '../../lib/reconciliation-pack/harness.ts'
 import { acquireRunLock } from '../../lib/reconciliation-pack/lock.ts'
 import { publishPackReport } from '../../lib/reconciliation-pack/publish.ts'
@@ -18,6 +18,8 @@ import { NOW, allBrackets, allFiles, at, cleanup, itemFromComparison, key, mode,
 const STRIPE_SHAPED = ['sk', 'live', 'abcdef123456'].join('_')
 const BEARER_SHAPED = ['Bear', 'er abcdef0123456789'].join('')
 
+/** A small evidence cap, so the cut is exercised without a hundred thousand entries. */
+const CAP = 40
 const bases: string[] = []
 after(() => cleanup(bases))
 const fresh = () => path.join(scratchDir(bases), 'reports')
@@ -194,7 +196,7 @@ test('IDENTITY SWAP end to end: equal counts, one identity swapped => the report
   assert.equal(r1.counts.onlyVendor, 1)
   assert.equal(r1.bothEqualSha256, sha256Hex('A|MAIN'))
   const lines = readFileSync(result.evidence, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>)
-  assert.deepEqual(lines.map((l) => [l.item, l.bucket, l.key]), [['R1', 'onlyIms', 'B|MAIN'], ['R1', 'onlyVendor', 'C|MAIN']])
+  assert.deepEqual(lines.map((l) => [l.item, l.bucket, l.key]), [['R1', 'onlyIms', 'B|MAIN'], ['R1', 'onlyVendor', 'C|MAIN'], ['R1', 'bothEqual', 'A|MAIN']], 'findings first, then the equal identity: the reader recomputes the count and the digest from these lines')
 })
 
 test('counts are DERIVED: the reader recomputes them from the evidence and refuses a report whose counts were edited', () => {
@@ -207,20 +209,20 @@ test('counts are DERIVED: the reader recomputes them from the evidence and refus
 })
 
 test('a capped listing is never a pass, and the counts stay what the evidence lists', () => {
-  const rows = Array.from({ length: MAX_EVIDENCE_LINES_PER_ITEM + 5 }, (_, i) => ({ key: key(`S${i}`), value: '1' }))
+  const rows = Array.from({ length: CAP + 5 }, (_, i) => ({ key: key(`S${i}`), value: '1' }))
   const { item } = itemFromComparison('R1', { ims: rows, vendor: [], emptyProof: 'vendor-total-zero' })
-  const result = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: item } }))
+  const result = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: item }, hooks: { build: { maxLinesPerItem: CAP } } }))
   const r1 = result.record.items.find((i) => i.id === 'R1')!
   assert.equal(r1.outcome, 'fail')
   assert.ok(r1.reasons.includes('CAP_EXCEEDED'))
-  assert.equal(r1.counts.onlyIms, MAX_EVIDENCE_LINES_PER_ITEM)
-  assert.equal(r1.evidenceLines, MAX_EVIDENCE_LINES_PER_ITEM)
+  assert.equal(r1.counts.onlyIms, CAP)
+  assert.equal(r1.evidenceLines, CAP)
   // an inconclusive item cut by the cap stays inconclusive and gains the reason; a pass-shaped item cannot be capped silently
   const equalRows = Array.from({ length: 6 }, (_, i) => ({ key: key(`E${i}`), value: '1' }))
-  const outOfPop = Array.from({ length: MAX_EVIDENCE_LINES_PER_ITEM + 3 }, (_, i) => ({ key: key(`P${i}`), value: '1' }))
+  const outOfPop = Array.from({ length: CAP + 3 }, (_, i) => ({ key: key(`P${i}`), value: '1' }))
   const capped = itemFromComparison('R1', { ims: [...equalRows, ...outOfPop], vendor: [...equalRows, ...outOfPop], population: new Set(equalRows.map((r) => JSON.stringify(r.key)).slice(0, 0)), emptyProof: 'vendor-total-zero' })
   assert.equal(capped.item.outcome === 'pass' || capped.item.outcome === 'inconclusive', true)
-  const r = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: { ...capped.item, outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'], proof: null } } }))
+  const r = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: { ...capped.item, outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'], proof: null } }, hooks: { build: { maxLinesPerItem: CAP } } }))
   assert.ok(r.record.items.find((i) => i.id === 'R1')!.reasons.includes('READ_INCOMPLETE'))
 })
 

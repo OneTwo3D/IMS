@@ -5,13 +5,15 @@ import test, { after } from 'node:test'
 
 import { writeExclusive } from '../../lib/ops/published-report.ts'
 import { compareKeyed } from '../../lib/reconciliation-pack/compare.ts'
-import { MAX_EVIDENCE_LINES_PER_ITEM, PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN } from '../../lib/reconciliation-pack/constants.ts'
+import { PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN } from '../../lib/reconciliation-pack/constants.ts'
 import { defaultItems, newRunId, publishSyntheticRun } from '../../lib/reconciliation-pack/harness.ts'
 import { ReportInvalid, buildReport, deriveExitCode, parseReport, sha256Hex, verifyEvidence, type ItemInput, type ReportInput } from '../../lib/reconciliation-pack/report.ts'
 import { canonicalKey } from '../../lib/reconciliation-pack/identity.ts'
 import { readPackChain } from '../../lib/reconciliation-pack/trend.ts'
 import { NOW, at, cleanup, itemFromComparison, key, scratchDir } from './helpers.ts'
 
+/** A small evidence cap, so the cut is exercised without a hundred thousand entries. */
+const CAP = 40
 const bases: string[] = []
 after(() => cleanup(bases))
 const fresh = () => path.join(scratchDir(bases), 'reports')
@@ -54,10 +56,10 @@ test('two different whole-number identities are two identities (never one shared
 })
 
 test('a capped listing of a non-finding bucket cannot pass', () => {
-  const rows = Array.from({ length: MAX_EVIDENCE_LINES_PER_ITEM + 1 }, (_, i) => ({ key: key(`X${i}`), value: '1' }))
+  const rows = Array.from({ length: CAP + 1 }, (_, i) => ({ key: key(`X${i}`), value: '1' }))
   const { item } = itemFromComparison('R1', { ims: [...rows, { key: key('OK'), value: '1' }], vendor: [{ key: key('OK'), value: '1' }], excluded: new Set(rows.map((r) => canonicalKey(r.key))) })
   assert.equal(item.outcome, 'pass', 'precondition: the comparison itself passes')
-  assert.throws(() => buildReport(input('ims-test', 0, defaultItems('P1', { R1: item })), 1, null), ReportInvalid)
+  assert.throws(() => buildReport(input('ims-test', 0, defaultItems('P1', { R1: item })), 1, null, { maxLinesPerItem: CAP }), ReportInvalid)
 })
 
 test('deriveExitCode: a run in which nothing applicable exists or passed is inconclusive, never all-pass', () => {
