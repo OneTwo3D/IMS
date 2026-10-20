@@ -65,9 +65,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** Clip a message so a hostile file name or cell cannot flood the output. */
-function clip(text: string): string {
-  return text.length > 200 ? `${text.slice(0, 200)}...` : text
+/** A file name the tool itself writes (`NN-target-00k-of-00n.csv`) or the prepared report: anything else is withheld, because a name comes from a file the runner has not verified yet. */
+const KNOWN_NAME = /^(?:\d{2}-[a-z-]{3,30}-\d{3}-of-\d{3}\.csv|validation-report\.(?:json|md))$/
+function safeName(name: unknown): string {
+  return typeof name === 'string' && KNOWN_NAME.test(name) ? name : '(a file name that is not one this tool writes; withheld)'
+}
+
+/** A total from the report is untrusted text: one that is not a decimal is a mismatch, never an exception whose message would quote it. */
+function sameDecimal(total: InstanceType<typeof D>, raw: unknown): boolean {
+  try {
+    return (typeof raw === 'string' || typeof raw === 'number') && fmt(total) === fmt(new D(raw))
+  } catch {
+    return false
+  }
 }
 
 interface OutputEntry { name: string; target: ImporterTarget; chunk: number; chunks: number; rows: number; bytes: number; sha256: string }
@@ -112,7 +122,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   if (!Array.isArray(report.findings)) problems.push('the prepared report has no findings list')
   else {
     const errors = report.findings.filter((f) => f.severity === 'ERROR')
-    if (errors.length > 0) problems.push(`the prepared report has ${errors.length} ERROR finding(s): ${errors.slice(0, 5).map((f) => f.code).join(', ')}`)
+    if (errors.length > 0) problems.push(`the prepared report has ${errors.length} ERROR finding(s) (read them in the prepared report; a finding's code is not printed here because it comes from a file this runner has not verified)`)
   }
   if (!isRecord(report.config) || report.config.baseCurrency !== manifest.baseCurrency) {
     problems.push('the prepared run was prepared for a different base currency than the apply manifest states')
@@ -125,7 +135,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   if (named.size !== entries.length) problems.push('the prepared report names an output file twice')
   for (const name of files.keys()) {
     if (name === PREPARED_REPORT_NAME || name === PREPARED_REPORT_MARKDOWN_NAME) continue
-    if (!named.has(name)) problems.push(`the prepared directory holds a file the report does not name: ${clip(name)} (a stray file is never loaded, so it is refused)`)
+    if (!named.has(name)) problems.push(`the prepared directory holds a file the report does not name: ${safeName(name)} (a stray file is never loaded, so it is refused)`)
   }
   if (entries.some((e) => (e.target as string) === 'transfers') || (isRecord(report.plannedOutputRows) && Number((report.plannedOutputRows as Record<string, unknown>).transfers) > 0)) problems.push(TRANSFERS_REFUSAL)
 
@@ -137,7 +147,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     const spec = IMPORT_TARGETS[target]
     let planned = 0
     list.forEach((entry, index) => {
-      const label = clip(entry.name)
+      const label = safeName(entry.name)
       const expectedName = `${String(spec.loadOrder).padStart(2, '0')}-${target}-${String(index + 1).padStart(3, '0')}-of-${String(list.length).padStart(3, '0')}.csv`
       if (entry.chunk !== index + 1 || entry.chunks !== list.length || entry.name !== expectedName) problems.push(`${label}: the chunk numbering is not 1..${list.length} for ${target} (expected the name ${expectedName})`)
       const bytes = files.get(entry.name)
@@ -173,7 +183,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       parsedFiles.set(entry.name, { header: parsed.header, rows: parsed.rows.map((r) => ({ chunk: entry.chunk, line: r.line, cells: r.cells })) })
     })
     const claimed = isRecord(report.plannedOutputRows) ? (report.plannedOutputRows as Record<string, unknown>)[target] : undefined
-    if (claimed !== planned) problems.push(`${target}: the files hold ${planned} row(s), the report plans ${String(claimed)}`)
+    if (claimed !== planned) problems.push(`${target}: the files hold ${planned} row(s), the report plans ${Number.isSafeInteger(claimed) ? String(claimed) : 'a value that is not a whole number'}`)
   }
 
   // ---- 3. Steps, keys, cross-file references -----------------------------------------------------------------------------------------
@@ -269,8 +279,8 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     const stats = report.stock?.totals
     if (!stats) problems.push('the prepared report has no stock totals to compare the opening-stock file with')
     else {
-      if (fmt(totalQty) !== fmt(new D(stats.openingQty))) problems.push(`opening-stock: the file holds ${fmt(totalQty)} unit(s), the prepared report says ${stats.openingQty}`)
-      if (fmt(totalValue) !== fmt(new D(stats.openingValueBase))) problems.push(`opening-stock: the file is worth ${fmt(totalValue)}, the prepared report says ${stats.openingValueBase}`)
+      if (!sameDecimal(totalQty, stats.openingQty)) problems.push('opening-stock: the total quantity of the file differs from the prepared report (TOTAL_QUANTITY_MISMATCH; the figures are in the two files, not here)')
+      if (!sameDecimal(totalValue, stats.openingValueBase)) problems.push('opening-stock: the total value of the file differs from the prepared report (TOTAL_VALUE_MISMATCH; the figures are in the two files, not here)')
     }
     const zeroFinding = (report.findings ?? []).find((f) => f.code === 'ZERO_COST_OPENING_STOCK')
     if ((zeroFinding?.keys?.length ?? 0) !== zeroCostPairs.length) problems.push(`opening-stock: ${zeroCostPairs.length} zero-cost row(s) in the file, ${zeroFinding?.keys?.length ?? 0} in the prepared report`)
@@ -305,7 +315,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
         else if (fmt(rate.value) !== declared) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase differs from the rate the apply manifest states for its currency`)
       }
     }
-    for (const currency of Object.keys(manifest.fxRates)) if (!currenciesUsed.has(currency)) problems.push(`the apply manifest fxRates lists ${currency} but no selected purchase order uses it`)
+    for (const currency of Object.keys(manifest.fxRates)) if (!currenciesUsed.has(currency)) problems.push('the apply manifest fxRates lists a currency that no selected purchase order uses')
   }
 
   const declared = Object.keys(manifest.expectWarehouses).sort()
@@ -330,7 +340,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       for (const row of parsed.rows) {
         const hit = skuColumns.some((i) => forbidden.has((row.cells[i] ?? '').trim().toUpperCase()))
           || (componentColumn >= 0 && componentSkus(row.cells[componentColumn] ?? '').some((c) => forbidden.has(c.toUpperCase())))
-        if (hit) hits.push(`${clip(fileName)} line ${row.line}`)
+        if (hit) hits.push(`${safeName(fileName)} line ${row.line}`)
       }
     }
     if (hits.length > 0) problems.push(`${hits.length} row(s) of the prepared files contain a SKU the apply manifest forbids (an owner ruling excludes it), first at ${hits.slice(0, 10).join('; ')}`)
@@ -351,7 +361,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
         expectedOrigin: manifest.wooSnapshot.origin,
         visibilityChecked: manifest.wooSnapshot.visibilityChecked,
       })
-      if (!verdict.ok) problems.push(...verdict.problems.map((p) => `the WooCommerce snapshot is not verified: ${p}`))
+      if (!verdict.ok) problems.push(`the WooCommerce snapshot is not verified (${verdict.problems.length} problem(s); the detail names values from the snapshot, so it is not printed here: run first-load:woo-snapshot --verify)`)
       else if (dataset.sha256 !== verdict.csvSha256 || dataset.parts.length !== 1 || dataset.parts[0].sha256 !== verdict.csvSha256) problems.push('the variant-parents file the prepared run read is not the file of the verified snapshot bundle (its SHA-256 differs)')
       else variantParents = { csvSha256: verdict.csvSha256, snapshotPayloadSha256: verdict.payloadSha256 }
     }

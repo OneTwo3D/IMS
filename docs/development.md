@@ -766,7 +766,7 @@ that may import the capability is a closed list, enforced by:
 npm run check:system-import-capability
 ```
 
-`mintSystemImportContext` may be imported only by `lib/first-load/apply/**`, `scripts/first-load-apply.ts` and tests. The three
+`mintSystemImportContext` may be imported only by `lib/first-load/apply/**`, `scripts/first-load-apply.ts`, `scripts/lib/first-load-rehearse.ts` (the rehearsal, which takes the command's constants and the rehearsal record and never the symbol) and tests. The three
 importer modules may import only `SYSTEM_IMPORT` (they compare it inline, which is the only shape the Server Action guard scan credits),
 `isSystemImportContext`, `withSystemActor`, `withSystemOutcome` and types. Type-only imports, namespace imports, re-exports,
 dynamic `import()` and `require()` of anything under `lib/first-load/apply/` count as importing it. The guard prints how many files

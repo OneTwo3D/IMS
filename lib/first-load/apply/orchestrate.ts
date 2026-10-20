@@ -142,6 +142,11 @@ export interface ApplyOptions {
   rehearsal: unknown
   /** The target's system identifier (mode 'apply' only). */
   systemId: string | null
+  /**
+   * Set ONLY by the rehearsal itself, on the throwaway database it made: this run IS the rehearsal, so it needs no record of one. The command line sets it only after it has
+   * proved the database is the throwaway (docs/first-load-apply.md, "The rehearsal"). Never set it from an operator's argument.
+   */
+  thisIsTheRehearsal?: true
   now: Date
   maxRehearsalAgeHours: number
 }
@@ -228,7 +233,7 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   const finish = (exit: ApplyExitName, problems: string[], steps: StepResult[], record: RunRecord | null, verification: VerificationItem[] = []): ApplyResult =>
     ({ exit, mode: options.mode, problems, steps, verification, record })
 
-  if (options.mode === 'apply') {
+  if (options.mode === 'apply' && options.thisIsTheRehearsal !== true) {
     const gate = checkRehearsalGate(options.rehearsal, { manifestDigest: prepared.manifestDigest, systemId: options.systemId, now: options.now, maxAgeHours: options.maxRehearsalAgeHours })
     if (gate.length > 0) return finish('PRECONDITION_REFUSED', gate, [], null)
   }
@@ -278,7 +283,7 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
   if (existing === null && options.resume) return finish('PRECONDITION_REFUSED', ['--resume was given but no run record exists for this database'], planSteps, null)
   if (existing !== null) {
     if (!options.resume) return finish('PRECONDITION_REFUSED', ['a run record already exists in this database; this command refuses to start a second load over it (use --resume for the same load)'], planSteps, existing)
-    if (existing.manifestDigest !== prepared.manifestDigest) return finish('PRECONDITION_REFUSED', [`the run record is for a different load (recorded digest ${existing.manifestDigest}, this load ${prepared.manifestDigest})`], planSteps, existing)
+    if (existing.manifestDigest !== prepared.manifestDigest) return finish('PRECONDITION_REFUSED', ['the run record is for a different load (its digest is not this load\'s)'], planSteps, existing)
     // An APPLIED run is resumable for VERIFICATION ONLY: no step is run and no importer is called.
     if (!RESUMABLE_STATUSES.has(existing.status) && existing.status !== 'APPLIED') return finish('PRECONDITION_REFUSED', [`the run record is ${existing.status}, which is not resumable`], planSteps, existing)
   }

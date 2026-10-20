@@ -202,7 +202,8 @@ test('run record: a second load over an existing record, a resume with no record
   db.journalRecord = { ...(db.journalRecord as RunRecord), manifestDigest: 'e'.repeat(64), status: 'STEP_FAILED' }
   const other = await runLoad(prepared, db.ports(), options({ resume: true }))
   assert.equal(other.exit, 'PRECONDITION_REFUSED')
-  assert.ok(other.problems[0].includes('e'.repeat(64)) && other.problems[0].includes(prepared.manifestDigest), 'names both digests')
+  assert.match(other.problems[0], /different load/)
+  assert.ok(!other.problems[0].includes('e'.repeat(64)) && !other.problems[0].includes(prepared.manifestDigest), 'a digest read from the database is not printed')
   assert.equal(db.executed.length, before, 'none of the refusals sent anything to an importer')
   precondition(t, 'refusals', 4)
 })

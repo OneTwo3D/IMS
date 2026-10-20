@@ -1,0 +1,432 @@
+/**
+ * THE COMMAND LINE OF THE FIRST-LOAD APPLY RUNNER, THE PURE PART: arguments, help text, the environment a run gets, the rehearsal record and the exit mapping.
+ *
+ * No filesystem, no database, no clock of its own, no process environment: everything comes in as an argument, so each rule can be tested without a process (and each
+ * mutation of a rule is red). `scripts/first-load-apply.ts` is the shell that reads the files, opens the connections and calls this.
+ *
+ * NO SECRET ON AN ARGUMENT LIST. The target database is named by an installation env file (read by path, mode 600). The only identifiers on the command line are
+ * names the operator is meant to check (--expect-db, --expect-system-id). Every value is also scanned: one that looks like a URL with credentials is refused outright, so a
+ * pasted connection string cannot end up in the process list.
+ */
+import { VERIFICATION_IDS } from './verify-core'
+import { APPLY_EXIT_CODES, APPLY_EXIT_CODE_TABLE, APPLY_REPORT_STEM_PREFIX, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME, type ApplyExitName } from './constants'
+
+export const CLI_MODES = ['rehearse', 'plan', 'apply'] as const
+export type CliMode = (typeof CLI_MODES)[number]
+
+/** The throwaway database a rehearsal restores the target into. A child run refuses any other. */
+export const REHEARSAL_DATABASE = 'ims_firstload_rehearsal'
+
+export interface CliArgs {
+  mode: CliMode
+  manifest: string
+  envFile: string
+  expectDb: string
+  expectSystemId: string
+  reportDir: string
+  /** apply only: the rehearsal record file. */
+  rehearsalRecord: string | null
+  resume: boolean
+  /** The label the activity log names as the operator of the rows the importers write. */
+  operator: string
+  /** rehearse only: the parent directory of the throwaway cluster. */
+  root: string
+  /** INTERNAL: set by a rehearsal on the child it starts. The child runs the whole load on the throwaway database it was handed, as the rehearsal. */
+  rehearsalChild: { runDir: string; reportStem: string } | null
+}
+
+export type ParsedArgs = { kind: 'help' } | { kind: 'usage'; problems: string[] } | { kind: 'run'; args: CliArgs }
+
+const VALUE_FLAGS = ['--manifest', '--env-file', '--expect-db', '--expect-system-id', '--report-dir', '--rehearsal-record', '--operator', '--root'] as const
+/** Accepted ONLY by the rehearsal's own child entrypoint (parseCliArgs with allowChild); the public command refuses them as unknown arguments. */
+export const CHILD_FLAGS = ['--rehearsal-child-dir', '--report-stem'] as const
+const BOOLEAN_FLAGS = ['--rehearse', '--plan', '--apply', '--resume', '--help'] as const
+/** Every flag the PUBLIC command accepts. */
+export const KNOWN_FLAGS: readonly string[] = [...VALUE_FLAGS, ...BOOLEAN_FLAGS]
+const OPERATOR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/
+const STEM_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/
+/** scheme://user:password@host or scheme://user@host?password=...: anything that carries a credential in a URL. */
+const CREDENTIAL_IN_URL = /[a-z][a-z0-9+.-]*:\/\/[^/\s?#]*@|[?&](password|passwd|pwd|secret|token|key)=/i
+
+export const DEFAULT_ROOT = '/var/tmp'
+export const DEFAULT_OPERATOR = 'first-load-apply'
+
+export function parseCliArgs(argv: readonly string[], options: { allowChild?: boolean } = {}): ParsedArgs {
+  const valueFlags: readonly string[] = options.allowChild === true ? [...VALUE_FLAGS, ...CHILD_FLAGS] : VALUE_FLAGS
+  const problems: string[] = []
+  const values = new Map<string, string>()
+  const flags = new Set<string>()
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!
+    if ((BOOLEAN_FLAGS as readonly string[]).includes(arg)) {
+      if (flags.has(arg)) problems.push(`${arg} was given twice`)
+      flags.add(arg)
+    } else if (valueFlags.includes(arg)) {
+      const value = argv[i + 1]
+      if (value === undefined || value.startsWith('--')) problems.push(`${arg} needs a value`)
+      else {
+        if (values.has(arg)) problems.push(`${arg} was given twice`)
+        values.set(arg, value)
+        i += 1
+      }
+    } else problems.push(`an argument is not recognised (position ${i + 1})`)
+  }
+  if (flags.has('--help')) return { kind: 'help' }
+  for (const [flag, value] of values) if (CREDENTIAL_IN_URL.test(value)) problems.push(`the value of ${flag} looks like it carries a credential; name the target by an env file, never on the command line`)
+  const modes = (['--rehearse', '--plan', '--apply'] as const).filter((f) => flags.has(f))
+  if (modes.length > 1) problems.push('give at most one of --rehearse, --plan and --apply')
+  const mode: CliMode = modes[0] === '--plan' ? 'plan' : modes[0] === '--apply' ? 'apply' : 'rehearse'
+  for (const required of ['--manifest', '--env-file', '--expect-db', '--expect-system-id', '--report-dir'] as const) if (!values.has(required)) problems.push(`${required} is required`)
+  const isChild = values.has('--rehearsal-child-dir')
+  if (mode !== 'apply') {
+    if (flags.has('--resume')) problems.push('--resume is only valid with --apply')
+    if (values.has('--rehearsal-record')) problems.push('--rehearsal-record is only valid with --apply')
+  } else if (isChild) {
+    if (values.has('--rehearsal-record') || flags.has('--resume')) problems.push('a rehearsal child takes no --rehearsal-record and no --resume: it IS the rehearsal')
+  } else if (!values.has('--rehearsal-record')) problems.push('--apply needs --rehearsal-record: the record a rehearsal of this exact load wrote')
+  if (mode !== 'rehearse' && values.has('--root')) problems.push('--root is only valid with --rehearse')
+  const operator = values.get('--operator') ?? DEFAULT_OPERATOR
+  if (!OPERATOR_PATTERN.test(operator)) problems.push('--operator must be 1 to 64 letters, digits, spaces, dots, dashes or underscores')
+  const childDir = values.get('--rehearsal-child-dir')
+  const stem = values.get('--report-stem')
+  if ((childDir === undefined) !== (stem === undefined)) problems.push('--rehearsal-child-dir and --report-stem are given together or not at all')
+  if (stem !== undefined && !STEM_PATTERN.test(stem)) problems.push('--report-stem is not a plain file stem')
+  if (childDir !== undefined && mode !== 'apply') problems.push('a rehearsal child runs as --apply')
+  if (problems.length > 0) return { kind: 'usage', problems }
+  return {
+    kind: 'run',
+    args: {
+      mode,
+      manifest: values.get('--manifest')!,
+      envFile: values.get('--env-file')!,
+      expectDb: values.get('--expect-db')!,
+      expectSystemId: values.get('--expect-system-id')!,
+      reportDir: values.get('--report-dir')!,
+      rehearsalRecord: values.get('--rehearsal-record') ?? null,
+      resume: flags.has('--resume'),
+      operator,
+      root: values.get('--root') ?? DEFAULT_ROOT,
+      rehearsalChild: childDir !== undefined && stem !== undefined ? { runDir: childDir, reportStem: stem } : null,
+    },
+  }
+}
+
+/** Every flag of the command, once: the help text and docs/first-load-apply.md are both generated from or compared with this table. */
+export const CLI_FLAGS: ReadonlyArray<{ flag: string; value: string; applies: string; meaning: string }> = [
+  { flag: '--manifest', value: '<file>', applies: 'all', meaning: 'The apply manifest (JSON). A relative preparedDir or wooSnapshot path in it is relative to the manifest file.' },
+  { flag: '--env-file', value: '<file>', applies: 'all', meaning: 'The installation env file naming the target (DATABASE_URL inside). A regular file owned by the caller, mode 600. The process environment is replaced by a short whitelist plus this file.' },
+  { flag: '--expect-db', value: '<name>', applies: 'all', meaning: 'Must equal current_database() as the server reports it, or the command refuses (exit 3).' },
+  { flag: '--expect-system-id', value: '<id>', applies: 'all', meaning: 'Must equal the cluster system identifier as the server reports it, or the command refuses (exit 3).' },
+  { flag: '--report-dir', value: '<dir>', applies: 'all', meaning: 'Where the reports and the rehearsal record are published. Created mode 700 if absent; a real directory owned by the caller, closed to group and others.' },
+  { flag: '--rehearse', value: '', applies: 'mode', meaning: 'The default. Copy the target into a throwaway cluster, run the whole load there and write a rehearsal record. The target is only read, and proved unchanged.' },
+  { flag: '--plan', value: '', applies: 'mode', meaning: 'Read the target and report what a load would do. Writes nothing to the database.' },
+  { flag: '--apply', value: '', applies: 'mode', meaning: 'Load the target: restore point, steps, verification, census. Needs --rehearsal-record.' },
+  { flag: '--rehearsal-record', value: '<file>', applies: '--apply', meaning: 'The record a rehearsal of this exact load wrote: same digest, same target system id, same ordered migration list as this checkout, verdict OK, within 24 hours.' },
+  { flag: '--resume', value: '', applies: '--apply', meaning: 'Continue an interrupted load of the same digest (also verifies an APPLIED run). Needs the restore point recorded on the run record, unchanged.' },
+  { flag: '--operator', value: '<label>', applies: '--apply, --rehearse', meaning: 'Who the activity log names for the rows written (letters, digits, spaces, dots, dashes, underscores; default first-load-apply).' },
+  { flag: '--root', value: '<dir>', applies: '--rehearse', meaning: 'Where the throwaway cluster is made (default /var/tmp; not on a RAM-backed file system; every ancestor must be trustworthy).' },
+  { flag: '--help', value: '', applies: 'all', meaning: 'Print this text.' },
+]
+
+export function helpText(): string {
+  return [
+    'Usage: first-load-apply --manifest <file> --env-file <file> --expect-db <name> --expect-system-id <id> --report-dir <dir> [--rehearse | --plan | --apply --rehearsal-record <file> [--resume]]',
+    '',
+    ...CLI_FLAGS.map((row) => `  ${`${row.flag} ${row.value}`.trim().padEnd(26)} ${row.meaning}`),
+    '',
+    'No secret is ever an argument: the target is named by --env-file. THE APPLICATION MUST BE STOPPED for --apply (docs/first-load-apply.md has the checklist).',
+    '',
+    'Exit codes:',
+    ...APPLY_EXIT_CODE_TABLE.map((row) => `  ${row.code}  ${row.name}: ${row.meaning}`),
+    '',
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// The environment of a run
+// ---------------------------------------------------------------------------
+
+/** The only part of the caller's environment a run inherits. Never DATABASE_URL, never a PG variable, never a grant or a credential. */
+export const INHERITED_ENV = ['PATH', 'LANG', 'LC_ALL', 'TZ'] as const
+
+/** A variable of the installation env file that the runner will not take from it, because it would point the runner somewhere else. */
+const FORBIDDEN_FROM_FILE = /^(PG[A-Z]*|PSQL.*|LD_PRELOAD|LD_LIBRARY_PATH|NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|PS4)$/
+
+export interface RunnerEnv {
+  env: Record<string, string>
+  problems: string[]
+}
+
+/**
+ * The environment of one run: a short whitelist from the caller, then the installation env file's own variables, then the application name every connection carries.
+ * The database is the file's DATABASE_URL, never an inherited one. A variable that would redirect a client library is refused rather than dropped (a file that sets it is not the
+ * file the operator thinks it is).
+ */
+export function buildRunnerEnv(fileEnv: Readonly<Record<string, string>>, parentEnv: Readonly<Record<string, string | undefined>>, home: string): RunnerEnv {
+  const problems: string[] = []
+  const env: Record<string, string> = { HOME: home }
+  for (const name of INHERITED_ENV) {
+    const value = parentEnv[name]
+    if (value !== undefined) env[name] = value
+  }
+  for (const [name, value] of Object.entries(fileEnv)) {
+    if (FORBIDDEN_FROM_FILE.test(name)) problems.push(`the env file sets ${name}, which would redirect a client library; remove it from the file`)
+    else env[name] = value
+  }
+  if (typeof env.DATABASE_URL !== 'string' || env.DATABASE_URL === '') problems.push('the env file has no DATABASE_URL')
+  env['PGAPPNAME'] = RUNNER_APPLICATION_NAME
+  return { env, problems }
+}
+
+/** The libpq variables for a child that must connect without a password on its command line: pg_dump, pg_restore. Derived from the URL; the URL itself is not passed. */
+export function libpqEnvFromUrl(url: string): { env: Record<string, string>; problems: string[] } {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return { env: {}, problems: ['DATABASE_URL is not a URL'] }
+  }
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') return { env: {}, problems: ['DATABASE_URL is not a postgresql URL'] }
+  const env: Record<string, string> = {}
+  if (parsed.hostname !== '') env['PGHOST'] = decodeURIComponent(parsed.hostname)
+  if (parsed.port !== '') env['PGPORT'] = parsed.port
+  if (parsed.username !== '') env['PGUSER'] = decodeURIComponent(parsed.username)
+  if (parsed.password !== '') env['PGPASSWORD'] = decodeURIComponent(parsed.password)
+  const database = decodeURIComponent(parsed.pathname.replace(/^\//, ''))
+  if (database === '') return { env: {}, problems: ['DATABASE_URL names no database'] }
+  env['PGDATABASE'] = database
+  const sslmode = parsed.searchParams.get('sslmode')
+  if (sslmode) env['PGSSLMODE'] = sslmode
+  env['PGAPPNAME'] = RUNNER_APPLICATION_NAME
+  return { env, problems: [] }
+}
+
+// ---------------------------------------------------------------------------
+// The rehearsal record and the exit mapping
+// ---------------------------------------------------------------------------
+
+/** What the rehearsal binds from the child's published report into the record. An OK record needs it; an apply re-validates it against the report file itself. */
+export interface RecordReportBinding {
+  /** File name only, in the same directory as the record. */
+  file: string
+  sha256: string
+  verificationItems: number
+  verificationFailed: number
+}
+
+export interface RehearsalRecordFile {
+  formatVersion: number
+  manifestDigest: string
+  verdict: string
+  /** The system identifier of the TARGET cluster (not of the throwaway the rehearsal ran on). */
+  systemId: string
+  finishedAt: string
+  /** The hash of the ORDERED list of migration names of the checkout the rehearsal ran from (migrationsHash): an apply from a checkout with another schema is refused by the command. */
+  schemaHash: string
+  loadExit: string | null
+  targetUnchanged: boolean
+  teardownComplete: boolean
+  report: RecordReportBinding | null
+}
+
+/** The facts read from a child's published report, after validation. */
+export interface ChildReportFacts {
+  exitName: string
+  verificationItems: number
+  verificationFailed: number
+  /** The report has EXACTLY the shape of a finished, clean rehearsal load: the required steps (and only them) all DONE and balanced, no conflict, no problem, the throwaway target. */
+  complete: boolean
+}
+
+/**
+ * Validate a parsed apply report as the report of THIS load's rehearsal child. Every "which set" question is pinned to its exact required set, never "non-empty" or "all pass of whatever is there":
+ *   - the verification items are EXACTLY the closed list VERIFICATION_IDS (verify-core.ts, the one list the verifier also uses): each id once, no unknown id, none missing;
+ *   - the steps are EXACTLY the steps this load selected, in order;
+ *   - the tool, mode, digest and target database are the expected ones.
+ * Anything that does not parse into those shapes is null (unreadable, invalid, or another run's report). Whether the load was clean is `complete`, `verificationFailed` and the exit.
+ */
+export function validateChildReport(parsed: unknown, manifestDigest: string, expectedSteps: readonly string[]): ChildReportFacts | null {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+  const r = parsed as Record<string, unknown>
+  if (r.tool !== 'first-load-apply' || r.manifestDigest !== manifestDigest || r.mode !== 'apply') return null
+  const exit = r.exit as { name?: unknown } | null | undefined
+  if (typeof exit !== 'object' || exit === null || typeof exit.name !== 'string' || !APPLY_EXIT_CODE_TABLE.some((row) => row.name === exit.name)) return null
+  if (!Array.isArray(r.verification)) return null
+  const seen = new Set<string>()
+  let failed = 0
+  for (const item of r.verification) {
+    const id = (item as { id?: unknown } | null)?.id
+    if (typeof id !== 'string' || !(VERIFICATION_IDS as readonly string[]).includes(id) || seen.has(id)) return null
+    seen.add(id)
+    if ((item as { result?: unknown }).result !== 'pass') failed++
+  }
+  if (seen.size !== VERIFICATION_IDS.length) return null
+  const steps = Array.isArray(r.steps) ? (r.steps as Array<Record<string, unknown>>) : null
+  const target = r.target as { database?: unknown } | null | undefined
+  const complete = steps !== null
+    && steps.length === expectedSteps.length
+    && steps.every((st, i) => st !== null && typeof st === 'object' && st.step === expectedSteps[i] && st.status === 'DONE' && st.failed === 0 && st.updated === 0
+      && Number.isInteger(st.emitted) && st.emitted === (st.created as number) + (st.skippedExisting as number) && Array.isArray(st.conflicts) && st.conflicts.length === 0)
+    && r.accountingBalanced === true
+    && Array.isArray(r.problems) && r.problems.length === 0
+    && typeof target === 'object' && target !== null && target.database === REHEARSAL_DATABASE
+  return { exitName: exit.name, verificationItems: r.verification.length, verificationFailed: failed, complete }
+}
+
+/** Every signal of a rehearsal. The verdict is derived from all of them in ONE place (deriveRehearsalVerdict); nothing else may decide it. */
+export interface RehearsalSignals {
+  /** The copy was made and the child was started. */
+  childStarted: boolean
+  childTimedOut: boolean
+  /** The child's process exit code; null when it was killed by a signal or could not be started. */
+  childExitCode: number | null
+  /** The child's report, validated for this load; null when missing, unreadable or another run's. */
+  report: ChildReportFacts | null
+  targetUnchanged: boolean
+  teardownComplete: boolean
+  /** Problems the rehearsal recorded on its way (any one is enough to refuse an OK). */
+  problemCount: number
+}
+
+/**
+ * THE VERDICT. A closed word, and the string 'OK' only at the very end, after every signal has been checked: the default is non-OK, so a signal added later and not checked here
+ * cannot produce an OK by omission. The first failing signal names the verdict.
+ */
+export function deriveRehearsalVerdict(s: RehearsalSignals): { verdict: string; loadExit: ApplyExitName | null } {
+  const code = exitNameOfCode(s.childExitCode)
+  // The load exit reads 'OK' ONLY beside the verdict 'OK'; beside any other verdict it is the child's own non-OK exit when its report agrees, else null.
+  const loadExit = s.childStarted && !s.childTimedOut && s.report !== null && code !== null && code !== 'OK' && s.report.exitName === code ? code : null
+  const no = (verdict: string) => ({ verdict, loadExit })
+  if (!s.childStarted) return no('NOT_RUN')
+  if (s.childTimedOut) return no('CHILD_TIMED_OUT')
+  if (s.childExitCode === null) return no('CHILD_KILLED')
+  if (code === null) return no('CHILD_EXIT_UNKNOWN')
+  if (s.report === null) return no('REPORT_MISSING_OR_INVALID')
+  if (s.report.exitName !== code) return no('REPORT_DISAGREES_WITH_EXIT')
+  if (code !== 'OK') return no(code)
+  if (!s.report.complete) return no('REPORT_INCOMPLETE')
+  if (s.report.verificationItems !== VERIFICATION_IDS.length || s.report.verificationFailed > 0) return no('VERIFICATION_NOT_ALL_PASS')
+  if (!s.targetUnchanged) return no('TARGET_CHANGED')
+  if (!s.teardownComplete) return no('TEARDOWN_INCOMPLETE')
+  if (s.problemCount > 0) return no('PROBLEMS_RECORDED')
+  return { verdict: 'OK', loadExit: 'OK' }
+}
+
+export function buildRehearsalRecord(args: { manifestDigest: string; targetSystemId: string; schemaHash: string; finishedAt: Date; verdict: string; loadExit: ApplyExitName | null; targetUnchanged: boolean; teardownComplete: boolean; report: RecordReportBinding | null }): RehearsalRecordFile {
+  // An OK record is never built without the bound, validated report (the one place a caller could otherwise forget it).
+  const ok = args.verdict === 'OK' && args.report !== null && args.loadExit === 'OK' && args.targetUnchanged && args.teardownComplete
+  return {
+    formatVersion: REHEARSAL_RECORD_FORMAT_VERSION,
+    manifestDigest: args.manifestDigest,
+    verdict: ok ? 'OK' : args.verdict === 'OK' ? 'RECORD_INCOMPLETE' : args.verdict,
+    systemId: args.targetSystemId,
+    finishedAt: args.finishedAt.toISOString(),
+    schemaHash: args.schemaHash,
+    loadExit: args.loadExit,
+    targetUnchanged: args.targetUnchanged,
+    teardownComplete: args.teardownComplete,
+    report: args.report,
+  }
+}
+
+/**
+ * The command's own check of the fields an OK record binds, on top of the core's gate. Pure: the report FILE is re-read and re-validated by the shell (see checkRecordReportFile).
+ * A record that says OK but does not carry every one of these is refused.
+ */
+export function checkRecordBinding(record: unknown): string[] {
+  const r = typeof record === 'object' && record !== null && !Array.isArray(record) ? (record as Record<string, unknown>) : {}
+  const problems: string[] = []
+  if (r.loadExit !== 'OK') problems.push('the rehearsal record does not say the load on the copy ended OK')
+  if (r.targetUnchanged !== true) problems.push('the rehearsal record does not say the target was proved unchanged')
+  if (r.teardownComplete !== true) problems.push('the rehearsal record does not say the teardown was complete')
+  const b = r.report as Record<string, unknown> | null | undefined
+  if (typeof b !== 'object' || b === null) problems.push('the rehearsal record binds no child report')
+  else {
+    if (typeof b.file !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.json$/.test(b.file)) problems.push('the rehearsal record names no usable report file')
+    if (typeof b.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(b.sha256)) problems.push('the rehearsal record binds no report SHA-256')
+    if (b.verificationItems !== VERIFICATION_IDS.length) problems.push('the rehearsal record does not bind the full verification list')
+    if (b.verificationFailed !== 0) problems.push('the rehearsal record does not say every verification item passed')
+  }
+  return problems
+}
+
+/** The bound report as the file now holds it: its hash is the recorded one and its contents are a passing report of this load. */
+export function checkRecordReportFile(record: unknown, fileSha256: string, parsedReport: unknown, manifestDigest: string, expectedSteps: readonly string[]): string[] {
+  const b = (record as { report?: RecordReportBinding | null } | null)?.report
+  if (!b) return ['the rehearsal record binds no child report']
+  if (fileSha256 !== b.sha256) return ['the report the rehearsal record binds has changed since the rehearsal']
+  const facts = validateChildReport(parsedReport, manifestDigest, expectedSteps)
+  if (facts === null) return ['the report the rehearsal record binds is not a report of this load']
+  if (facts.exitName !== 'OK' || !facts.complete || facts.verificationItems !== b.verificationItems || facts.verificationItems !== VERIFICATION_IDS.length || facts.verificationFailed !== 0) return ['the report the rehearsal record binds is not an all-pass OK report']
+  return []
+}
+
+export function exitCodeOf(name: ApplyExitName): number {
+  return APPLY_EXIT_CODES[name]
+}
+
+export function exitNameOfCode(code: number | null): ApplyExitName | null {
+  const found = APPLY_EXIT_CODE_TABLE.find((row) => row.code === code)
+  return found ? found.name : null
+}
+
+/** A file stem for a report: mode, run id and a compact UTC stamp. Never a path; the caller joins it to the report directory. */
+export function reportStem(mode: CliMode, runId: string, now: Date): string {
+  const stamp = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
+  return `${APPLY_REPORT_STEM_PREFIX}${mode}-${runId}-${stamp}`
+}
+
+/** The command's own check of a rehearsal record, on top of the core's gate: the schema it was made against (the hash of the ordered migration names) is this checkout's. A record with none is refused. */
+export function checkRecordSchema(record: unknown, schemaHash: string): string[] {
+  const hash = typeof record === 'object' && record !== null && !Array.isArray(record) ? (record as Record<string, unknown>).schemaHash : undefined
+  if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) return ['the rehearsal record names no schema hash: it was not made by this command']
+  if (hash !== schemaHash) return ['the rehearsal was made against another schema (its ordered migration list differs from this checkout\'s); rehearse again from this checkout']
+  return []
+}
+
+/** THE restore point file of a load: the one place its path is composed. A resume accepts the recorded path only if it is exactly this. */
+export function restorePointPath(restorePointDir: string, runId: string): string {
+  return `${restorePointDir.replace(/\/+$/, '')}/first-load-${runId}.dump`
+}
+
+/**
+ * The exit of a rehearsal command once its record has (or has not) been published. The record is the evidence an apply needs: a rehearsal whose record could not be written is not a
+ * success, whatever the load on the copy did. `INTERNAL` is the closed code (a defect or an unwritable report directory), printed as the result.
+ */
+export function rehearsalCommandExit(loadExit: ApplyExitName, recordPublished: boolean): ApplyExitName {
+  return loadExit === 'OK' && !recordPublished ? 'INTERNAL' : loadExit
+}
+
+// ---------------------------------------------------------------------------
+// The rehearsal child is AUTHENTICATED, not recognised by its name or its place
+// ---------------------------------------------------------------------------
+
+/** The environment variable that carries the single-use token from the rehearsal to its child (never an argument). The public command ignores it. */
+export const CHILD_TOKEN_ENV = 'IMS_FIRST_LOAD_REHEARSAL_TOKEN'
+/** The file, inside the throwaway cluster's own directory, that holds the hash of the token and the identities it is valid for. Consumed (deleted) on first use. */
+export const CHILD_PROOF_FILE = 'rehearsal-child.json'
+
+export interface ChildProof {
+  tokenSha256: string
+  /** The throwaway cluster the child is allowed to run on. */
+  clusterSystemId: string
+  /** The real target's cluster: the child may never run on it. */
+  targetSystemId: string
+}
+
+export const CHILD_REFUSAL_CODE = 'REHEARSAL_CHILD_UNAUTHENTICATED'
+
+/**
+ * Whether a process that CLAIMS to be the rehearsal's child is one. All of: a proof written by the parent (a parsed ChildProof), a presented token whose SHA-256 is the recorded one,
+ * the connected cluster is the recorded throwaway, and it is not the real target. Any other state is a refusal with closed codes. Pure: the caller reads and consumes the file.
+ */
+export function checkChildProof(proof: unknown, presentedTokenSha256: string | null, connectedSystemId: string): string[] {
+  const p = typeof proof === 'object' && proof !== null && !Array.isArray(proof) ? (proof as Record<string, unknown>) : null
+  if (p === null || typeof p.tokenSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(p.tokenSha256) || typeof p.clusterSystemId !== 'string' || typeof p.targetSystemId !== 'string' || p.clusterSystemId === '') return ['NO_PROOF']
+  const problems: string[] = []
+  if (presentedTokenSha256 === null) problems.push('NO_TOKEN')
+  else if (presentedTokenSha256 !== p.tokenSha256) problems.push('TOKEN_MISMATCH')
+  if (connectedSystemId !== p.clusterSystemId) problems.push('WRONG_CLUSTER')
+  if (connectedSystemId === p.targetSystemId) problems.push('IS_THE_TARGET')
+  return problems
+}

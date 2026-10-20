@@ -38,6 +38,7 @@ const IMPORTERS: Record<string, string> = {
 }
 const RUNNER: Record<string, string> = {
   'scripts/first-load-apply.ts': `import { mintSystemImportContext, SYSTEM_IMPORT } from '${CAP}'\n`,
+  'scripts/lib/first-load-rehearse.ts': `import { REHEARSAL_DATABASE } from '@/lib/first-load/apply/cli'\n`,
   'lib/first-load/apply/steps.ts': `import { mintSystemImportContext } from './system-import-capability'\n`,
   'tests/anything.test.ts': `import * as cap from '${CAP}'\nconst x = await import('${CAP}')\n`,
 }
@@ -50,11 +51,12 @@ function verdict(root: string) {
 test('the allowed importers pass, and the census saw them (precondition)', (t) => {
   const { violations, importers } = verdict(tree(t, { ...IMPORTERS, ...RUNNER }))
   console.log(`census saw ${importers.length} importer file(s): ${importers.join(', ')}`)
-  assert.equal(importers.length, 6, 'the three importer modules, the runner CLI, a runner-tree file and a test')
+  assert.equal(importers.length, 7, 'the three importer modules, the runner CLI, the rehearsal, a runner-tree file and a test')
   assert.deepEqual(violations, [])
 })
 
 const ILLEGAL: Array<[string, string, string]> = [
+  ['another script helper (only the rehearsal is allowed)', 'scripts/lib/first-load-apply-files.ts', `import { REHEARSAL_DATABASE } from '@/lib/first-load/apply/cli'\n`],
   ['a page', 'app/page.ts', `import { SYSTEM_IMPORT } from '${CAP}'\n`],
   ['a client component', 'components/Button.tsx', `'use client'\nimport { SYSTEM_IMPORT } from '${CAP}'\n`],
   ['another server action module', 'app/actions/sales.ts', `import { SYSTEM_IMPORT } from '${CAP}'\n`],

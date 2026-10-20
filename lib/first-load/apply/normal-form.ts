@@ -190,8 +190,6 @@ export function productCellsFromDb(row: DbProduct): CellRecord {
   return {
     name: row.name, description: row.description ?? '', type: row.type, parentSku: row.parent?.sku ?? '', barcode: row.barcode ?? '', mpn: row.mpn ?? '',
     countryOfOrigin: row.countryOfOrigin ?? '',
-    // An id cannot be known to a file in a first load; the file side must be blank, so a stored id is not read back.
-    preferredSupplierId: '',
     preferredSupplierName: row.preferredSupplier?.name ?? '', preferredSupplierLocked: String(row.preferredSupplierLocked),
     weight: decimalText(row.weight), widthCm: decimalText(row.widthCm), heightCm: decimalText(row.heightCm), depthCm: decimalText(row.depthCm),
     salesPriceBase: decimalText(row.salesPriceBase), salePriceBase: decimalText(row.salePriceBase), salesPriceTaxInclusive: String(row.salesPriceTaxInclusive),

@@ -81,13 +81,14 @@ export const FINGERPRINT_SPECS: Readonly<Record<ApplyStepId, FingerprintSpec>> =
   products: {
     key: ['sku'],
     fingerprinted: [
-      'name', 'description', 'type', 'parentSku', 'barcode', 'mpn', 'countryOfOrigin', 'preferredSupplierId', 'preferredSupplierName', 'preferredSupplierLocked',
+      'name', 'description', 'type', 'parentSku', 'barcode', 'mpn', 'countryOfOrigin', 'preferredSupplierName', 'preferredSupplierLocked',
       'weight', 'widthCm', 'heightCm', 'depthCm', 'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive', 'stockUnit', 'oversellAllowed', 'imageUrl',
       'active', 'lifecycleStatus', 'category',
     ],
     comparedSeparately: { components: 'the recipe: compared as a multiset of component and quantity (a KIT or BOM)' },
     notPersisted: {
       productId: 'an id column: it must be blank in a first load',
+      preferredSupplierId: 'an id column: it must be blank in a first load (the preferred supplier is given by name; a stored id cannot be read back as the id the file gave, so a non-blank cell is refused before any write)',
       parentProductId: 'an id column: it must be blank in a first load (the parent is given by parentSku)',
     },
   },
@@ -115,7 +116,7 @@ export const FINGERPRINT_SPECS: Readonly<Record<ApplyStepId, FingerprintSpec>> =
 }
 
 /** Columns that would make an importer match by id instead of by natural key. They must be blank in a first load. */
-const ID_COLUMNS: Readonly<Record<string, readonly string[]>> = { suppliers: ['supplierId'], products: ['productId', 'parentProductId'] }
+const ID_COLUMNS: Readonly<Record<string, readonly string[]>> = { suppliers: ['supplierId'], products: ['productId', 'parentProductId', 'preferredSupplierId'] }
 
 function indexOf(header: string[]): Map<string, number> {
   return new Map(header.map((name, i) => [name, i]))

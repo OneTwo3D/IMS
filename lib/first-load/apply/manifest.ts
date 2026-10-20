@@ -85,11 +85,12 @@ export function parseApplyManifest(text: string): ApplyManifest {
   try {
     raw = JSON.parse(text)
   } catch (error) {
-    throw new ApplyManifestError([`the apply manifest is not valid JSON: ${error instanceof Error ? error.message : String(error)}`])
+    void error // the parser's message quotes a fragment of the file, which may be a value; only the fact is reported
+    throw new ApplyManifestError(['the apply manifest is not valid JSON'])
   }
   if (!isObject(raw)) throw new ApplyManifestError(['the apply manifest must be a JSON object'])
   const known = new Set<string>(APPLY_MANIFEST_KEYS)
-  for (const key of Object.keys(raw)) if (!known.has(key)) fail(`unknown apply manifest key "${key}"`)
+  Object.keys(raw).forEach((key, k) => { if (!known.has(key)) fail(`unknown apply manifest key (position ${k + 1})`) })
   if (raw.formatVersion !== 1) fail('apply manifest formatVersion must be 1')
 
   const runId = raw.runId
@@ -101,13 +102,13 @@ export function parseApplyManifest(text: string): ApplyManifest {
 
   const baseCurrency = raw.baseCurrency
   if (typeof baseCurrency !== 'string') fail('apply manifest baseCurrency is required: it is never assumed')
-  else if (baseCurrency !== SUPPORTED_BASE_CURRENCY) fail(`apply manifest baseCurrency must be ${SUPPORTED_BASE_CURRENCY} (the only base currency the first load supports), not ${JSON.stringify(baseCurrency)}`)
+  else if (baseCurrency !== SUPPORTED_BASE_CURRENCY) fail(`apply manifest baseCurrency must be ${SUPPORTED_BASE_CURRENCY} (the only base currency the first load supports)`)
 
   const steps: ApplyStepId[] = []
   if (!Array.isArray(raw.steps) || raw.steps.length === 0) fail(`apply manifest steps must be a non-empty list drawn from ${APPLY_STEP_IDS.join(', ')}`)
   else {
     for (const step of raw.steps) {
-      if (typeof step !== 'string' || !(APPLY_STEP_IDS as readonly string[]).includes(step)) fail(`apply manifest steps: ${JSON.stringify(step)} is not a step (${APPLY_STEP_IDS.join(', ')})`)
+      if (typeof step !== 'string' || !(APPLY_STEP_IDS as readonly string[]).includes(step)) fail(`apply manifest steps: an entry is not a step (${APPLY_STEP_IDS.join(', ')})`)
       else if (steps.includes(step as ApplyStepId)) fail(`apply manifest steps lists ${step} twice`)
       else steps.push(step as ApplyStepId)
     }
@@ -134,7 +135,7 @@ export function parseApplyManifest(text: string): ApplyManifest {
         const upper = code.toUpperCase()
         if (upper in expectWarehouses) { fail(`apply manifest ${at} lists a warehouse code twice (codes are matched in upper case)`); continue }
         if (!isObject(profile)) { fail(`apply manifest ${at} must be an object`); continue }
-        for (const key of Object.keys(profile)) if (!(WAREHOUSE_PROFILE_KEYS as readonly string[]).includes(key)) fail(`apply manifest ${at}: unknown key "${key}"`)
+        Object.keys(profile).forEach((key, k) => { if (!(WAREHOUSE_PROFILE_KEYS as readonly string[]).includes(key)) fail(`apply manifest ${at}: unknown key (position ${k + 1})`) })
         const { type, availableForSale, syncToStore } = profile
         if (typeof type !== 'string' || !(WAREHOUSE_TYPES as readonly string[]).includes(type)) { fail(`apply manifest ${at}.type must be one of ${WAREHOUSE_TYPES.join(', ')}`); continue }
         if (typeof availableForSale !== 'boolean' || typeof syncToStore !== 'boolean') { fail(`apply manifest ${at}: availableForSale and syncToStore must both be true or false (nothing is defaulted)`); continue }
@@ -165,14 +166,16 @@ export function parseApplyManifest(text: string): ApplyManifest {
   if (raw.fxRates !== undefined) {
     if (!isObject(raw.fxRates)) fail('apply manifest fxRates must be an object of currency to rate')
     else {
-      for (const [currency, rate] of Object.entries(raw.fxRates)) {
-        if (!CURRENCY_PATTERN.test(currency)) { fail(`apply manifest fxRates: ${JSON.stringify(currency)} is not a 3-letter currency`); continue }
+      for (const [fxIndex, [currency, rate]] of Object.entries(raw.fxRates).entries()) {
+        const at = `fxRates entry ${fxIndex + 1}`
+        if (!CURRENCY_PATTERN.test(currency)) { fail(`apply manifest ${at} is not a 3-letter currency`); continue }
         const upper = currency.toUpperCase()
         if (upper === SUPPORTED_BASE_CURRENCY) { fail(`apply manifest fxRates must not list the base currency ${SUPPORTED_BASE_CURRENCY}`); continue }
-        if (upper in fxRates) { fail(`apply manifest fxRates lists ${upper} twice`); continue }
-        const parsed = typeof rate === 'string' ? parseDecimal(rate, `fxRates.${currency}`, NUMERIC_LIMITS.fx) : { ok: false as const, reason: `fxRates.${currency} must be a string such as "1.25" (a JSON number would lose digits)` }
-        if (!parsed.ok) { fail(`apply manifest ${parsed.reason}`); continue }
-        if (!parsed.value.gt(new D(0))) { fail(`apply manifest fxRates.${currency} must be greater than zero`); continue }
+        if (upper in fxRates) { fail(`apply manifest ${at} lists a currency twice`); continue }
+        const parsed = typeof rate === 'string' ? parseDecimal(rate, 'rate', NUMERIC_LIMITS.fx) : { ok: false as const, reason: 'rate must be a string such as "1.25" (a JSON number would lose digits)' }
+        // parseDecimal's reason quotes the text it was given: only the fact is reported.
+        if (!parsed.ok) { fail(typeof rate === 'string' ? `apply manifest ${at} is not an acceptable rate (a plain decimal string within the limits)` : `apply manifest ${at} must be a string such as "1.25" (a JSON number would lose digits)`); continue }
+        if (!parsed.value.gt(new D(0))) { fail(`apply manifest ${at} must be greater than zero`); continue }
         fxRates[upper] = fmt(parsed.value)
       }
     }
@@ -196,7 +199,7 @@ export function parseApplyManifest(text: string): ApplyManifest {
     const w = raw.wooSnapshot
     if (!isObject(w)) fail('apply manifest wooSnapshot must be an object {snapshot, provenance, variantParents, origin, visibilityChecked}')
     else {
-      for (const key of Object.keys(w)) if (!(APPLY_WOO_SNAPSHOT_KEYS as readonly string[]).includes(key)) fail(`apply manifest wooSnapshot: unknown key "${key}"`)
+      Object.keys(w).forEach((key, k) => { if (!(APPLY_WOO_SNAPSHOT_KEYS as readonly string[]).includes(key)) fail(`apply manifest wooSnapshot: unknown key (position ${k + 1})`) })
       const paths = (['snapshot', 'provenance', 'variantParents'] as const).map((key) => {
         const value = w[key]
         if (typeof value !== 'string' || value.trim() === '') fail(`apply manifest wooSnapshot.${key} must be a path`)
@@ -205,7 +208,7 @@ export function parseApplyManifest(text: string): ApplyManifest {
       const origin = typeof w.origin === 'string' ? normaliseStoreOrigin(w.origin) : null
       if (origin === null) fail('apply manifest wooSnapshot.origin must be the http(s) origin of the WooCommerce store the snapshot must come from')
       const attestation = parseVisibilityAttestation(w.visibilityChecked)
-      if (!attestation.ok) fail(`apply manifest wooSnapshot.visibilityChecked: ${attestation.problem}`)
+      if (!attestation.ok) fail('apply manifest wooSnapshot.visibilityChecked is not a valid attestation (the detail would quote the file; see first-load-input-spec.md for the shape)')
       if (origin !== null && attestation.ok && paths.every((p) => p !== '')) {
         wooSnapshot = { snapshot: paths[0], provenance: paths[1], variantParents: paths[2], origin, visibilityChecked: attestation.value }
       }
