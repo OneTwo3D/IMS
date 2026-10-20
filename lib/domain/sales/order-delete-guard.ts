@@ -2,7 +2,7 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { parseAllocationDebitPasses } from '@/lib/domain/accounting/allocation-debit-passes'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { findDurableShadowRecords, type ShadowSubjectQuery } from '@/lib/domain/outbound-shadow/durable-evidence'
-import { readProducerEnforcement } from '@/lib/security/producer-seam'
+import { findOrderWarehouseShadowRecords } from '@/lib/connectors/wms/producer-seam'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import {
@@ -397,17 +397,14 @@ export async function findSalesOrderDeleteBlocker(
   // Asked only when the hold is enforced for the warehouse (switch off: nothing here changes, byte for byte), and a read that cannot be made
   // throws rather than reading as "none recorded".
   if (!pushLink) {
-    const enforcement = readProducerEnforcement(process.env)
-    if (enforcement.enforced && enforcement.destinations.has('mintsoft')) {
-      const warehouseShadows = await findDurableShadowRecords(tx, 'mintsoft', [{ subjectType: 'SalesOrder', exactIds: [orderId] }])
-      if (warehouseShadows.length > 0) {
-        blockers.push({
-          code: 'wms_shadow_recorded',
-          message: 'Cannot delete an order whose warehouse push IMS recorded as a SHADOW instead of sending '
-            + `(${[...new Set(warehouseShadows.map((record) => record.operation))].sort().join(', ')}). IMS holds no push link for it, and that does not say the warehouse has no order: `
-            + 'the writer that owns this operation in the current phase may have created it. Check the warehouse for it and cancel the order instead of deleting it, which keeps the record.',
-        })
-      }
+    const warehouseShadows = await findOrderWarehouseShadowRecords(tx, orderId)
+    if (warehouseShadows.length > 0) {
+      blockers.push({
+        code: 'wms_shadow_recorded',
+        message: 'Cannot delete an order whose warehouse push IMS recorded as a SHADOW instead of sending '
+          + `(${[...new Set(warehouseShadows.map((record) => record.operation))].sort().join(', ')}). IMS holds no push link for it, and that does not say the warehouse has no order: `
+          + 'the writer that owns this operation in the current phase may have created it. Check the warehouse for it and cancel the order instead of deleting it, which keeps the record.',
+      })
     }
   }
 

@@ -1,5 +1,5 @@
 import { db } from '@/lib/db'
-import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
+import { findDurableShadowRecords, type DurableShadowRecord, type ShadowEvidenceClient } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { mintsoftDrainHold, mintsoftProducerSeam, type MintsoftSeamInput, type MintsoftShadow } from '@/lib/connectors/mintsoft/producer-seam'
 import type { MintsoftHold } from '@/lib/connectors/mintsoft/producer-egress'
 import type { OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
@@ -138,4 +138,23 @@ export async function wmsOrderCreateShadowEvidence(connectorId: string, orderId:
     console.error(`[producer-hold] could not read the shadow record of order ${orderId}: ${error instanceof Error ? error.message : String(error)}`)
     return null
   }
+}
+
+/**
+ * THE DURABLE SHADOW RECORDS OF AN ORDER'S WAREHOUSE WRITES, for a destructive reader (the order hard delete). While the producer-side hold
+ * stands for the warehouse a create is a shadow and writes no push link, so "no link" proves nothing was called: the writer that owns order
+ * creation in the current phase may have made the warehouse order, and the record is the only evidence IMS holds.
+ *
+ * Empty (and no read is made) when the hold is not enforced for any warehouse destination: the legacy guard, byte for byte. A client that
+ * cannot run the read THROWS (it never reads as "none recorded").
+ */
+export async function findOrderWarehouseShadowRecords(client: ShadowEvidenceClient, orderId: string): Promise<DurableShadowRecord[]> {
+  const enforcement = readProducerEnforcement(process.env)
+  if (!enforcement.enforced) return []
+  const destinations = [...new Set(Object.values(WMS_PRODUCER_DESTINATION))].filter((destination) => enforcement.destinations.has(destination))
+  const found: DurableShadowRecord[] = []
+  for (const destination of destinations) {
+    found.push(...await findDurableShadowRecords(client, destination, [{ subjectType: 'SalesOrder', exactIds: [orderId] }]))
+  }
+  return found
 }
