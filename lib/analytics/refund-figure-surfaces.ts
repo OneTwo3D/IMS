@@ -555,6 +555,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'PDF page margins — a layout inset, not a money figure.',
   },
   {
+    file: 'scripts/shadow-reader-census.ts',
+    figures: ['accounting_revenue_deferred_batch_ref', 'accounting_revenue_deferred_date', 'revenueDeferredBatchRef', 'revenueDeferredDate'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'A static scan that LISTS the order columns the daily batch stamps (as strings, to find the code that reads them) and publishes no figure: it computes, nets and renders nothing, so no refund basis applies.',
+  },
+  {
     file: 'scripts/backfill-wc-coupon-order-discount.ts',
     figures: ['revenueDeferredBatchRef'],
     treatment: 'not-refund-sensitive',

@@ -655,6 +655,9 @@ const RESET_DISPATCH_FAILURES = {
   reconcileCheckedAt: null,
 } satisfies LinkWrite
 
+/** Where the held create pass's walk stands (a Setting). Cleared when a page comes back short. */
+export const HELD_CREATE_CURSOR_KEY = 'wms_order_push_held_create_cursor'
+
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
 export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
 /**
@@ -730,7 +733,12 @@ export interface WmsOrderPushPort {
   /** HELD links whose order is back in a ready+paid state, with the release evidence. */
   releasableHeldOrders(connector: string, limit: number, paidNotBefore?: Date): Promise<WmsPushReleasableLink[]>
   /** Ready+paid orders for bound warehouses with no link or a PENDING_CREATE link. */
-  createCandidates(connector: string, boundWarehouseIds: string[], limit: number, paidNotBefore?: Date): Promise<WmsPushCandidate[]>
+  createCandidates(connector: string, boundWarehouseIds: string[], limit: number, paidNotBefore?: Date, rotation?: { afterId: string | null }): Promise<WmsPushCandidate[]>
+  /**
+   * The position of the held create pass's walk (see the create pass). Optional: a port without one keeps the legacy order, which is only
+   * a problem while the producer-side hold stands for the warehouse.
+   */
+  heldCreateCursor?: { read(): Promise<string | null>; write(afterId: string | null): Promise<void> }
   /**
    * o3d-5r8 — claim a candidate for the remote create, under the order's row lock.
    *
@@ -1535,9 +1543,20 @@ export async function runWmsOrderPushSweepCore(
     // their place in the oldest-first queue), so a full batch of them would be reselected every sweep and starve the orders behind it.
     // They are left out of the query. No floor (the hold is not enforced, or not live): the legacy call, exactly.
     const paidNotBefore = createFloor
-    const candidates = paidNotBefore
-      ? await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize, paidNotBefore)
-      : await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+    // HELD: every candidate is a shadow that changes nothing about the order, so the oldest-updated batch would be re-shadowed on every tick
+    // and the orders behind it would never get a shadow record at all. While the warehouse is held the pass walks the candidates by a
+    // rotating id cursor instead (kept by the port when it supports one), so every eligible order is recorded within a few ticks. With the
+    // hold off, or live, the query and its order are the legacy ones.
+    const rotation = warehouseHeld && port.heldCreateCursor ? { afterId: await port.heldCreateCursor.read() } : undefined
+    const candidates = rotation
+      ? await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize, paidNotBefore ?? undefined, rotation)
+      : paidNotBefore
+        ? await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize, paidNotBefore)
+        : await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+    if (rotation && port.heldCreateCursor) {
+      // A short page means the walk reached the end: start over from the beginning on the next tick.
+      await port.heldCreateCursor.write(candidates.length < batchSize ? null : candidates[candidates.length - 1]!.id)
+    }
 
     // o3d-rbyg: screen the WHOLE batch against the live storefront before pushing any of it.
     //
@@ -2142,6 +2161,10 @@ export async function runWmsOrderPushSweepCore(
               // Shadowed: nothing is cancelled and the link is left exactly as it is (still PENDING_VERIFY, never converted to a
               // shadow state), so the next sweep proves and decides again once the warehouse may be written.
               shadowedCount += 1
+              // The verify queue is bounded and rotates on lastAttemptAt (least recently attempted first). A link left byte-for-byte as it was
+              // would stay at the head for ever, re-read every sweep, and crowd out the links whose verification is a read that should go on.
+              // Only the rotation column moves; the state, the attempt count and the error are untouched.
+              await port.updateLinkIfState(link.id, 'PENDING_VERIFY', { lastAttemptAt: now() }).catch(() => false)
               continue
             }
             const cancel = await connector.cancelOrder?.(link.externalOrderId, verifiedPullBack.clearance)
@@ -2582,19 +2605,34 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         },
         take: limit,
       }),
-    async createCandidates(connector, boundWarehouseIds, limit, paidNotBefore) {
-      const rows = await db.salesOrder.findMany({
-        where: {
-          // o3d-2k5r r6: THE predicate, from lib/domain/wms/create-eligibility.ts. This query is
-          // the definition of "the sweep will create a warehouse order for this", and four other
-          // readers have to agree with it; the last one written by hand agreed with half of it.
-          ...wmsCreateEligibleOrderWhere(boundWarehouseIds, paidNotBefore),
-          OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
-        },
-        select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, wmsOrderPush: { select: { attempts: true } } },
-        take: limit,
-        orderBy: { updatedAt: 'asc' },
-      })
+    heldCreateCursor: {
+      async read() {
+        const row = await db.setting.findUnique({ where: { key: HELD_CREATE_CURSOR_KEY }, select: { value: true } })
+        return row?.value ? row.value : null
+      },
+      async write(afterId) {
+        if (afterId === null) await db.setting.deleteMany({ where: { key: HELD_CREATE_CURSOR_KEY } })
+        else await db.setting.upsert({ where: { key: HELD_CREATE_CURSOR_KEY }, create: { key: HELD_CREATE_CURSOR_KEY, value: afterId }, update: { value: afterId } })
+      },
+    },
+    async createCandidates(connector, boundWarehouseIds, limit, paidNotBefore, rotation) {
+      const where = {
+        // o3d-2k5r r6: THE predicate, from lib/domain/wms/create-eligibility.ts. This query is
+        // the definition of "the sweep will create a warehouse order for this", and four other
+        // readers have to agree with it; the last one written by hand agreed with half of it.
+        ...wmsCreateEligibleOrderWhere(boundWarehouseIds, paidNotBefore),
+        OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' as const } }],
+      }
+      const select = { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, wmsOrderPush: { select: { attempts: true } } }
+      const shape = (rows: Array<{ wmsOrderPush: { attempts: number } | null } & Record<string, unknown>>) => (
+        rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
+      )
+      if (rotation) {
+        // Held walk: id order from the cursor. A short page ends the walk and the sweep clears the cursor, so the next tick starts at the head.
+        const tail = await db.salesOrder.findMany({ where: { AND: [where, rotation.afterId ? { id: { gt: rotation.afterId } } : {}] }, select, take: limit, orderBy: { id: 'asc' } })
+        return shape(tail as never) as never
+      }
+      const rows = await db.salesOrder.findMany({ where, select, take: limit, orderBy: { updatedAt: 'asc' } })
       return rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
     },
     async claimForCreate(orderId, connector, attemptedAt, paidNotBefore) {

@@ -2512,3 +2512,29 @@ test('o3d-11rf r6: a run row the list reader finds with no completeness recorded
   assert.equal(listed.completeness.state, 'unknown',
     'zero findings and a NULL column is a run nobody checked, not a run with nothing wrong')
 })
+
+test('[shadow readers] a document whose posting was recorded as a SHADOW is not reported as missing its mirrored event; a posting never recorded still is', () => {
+  // The hold never mirrors an event for a shadow, so "no event" is the expected shape of a shadowed batch. Control: the same order with
+  // NO row for the batch is still reported, and so is an orphan-sweep row (same shape, no HELD_SHADOW basis).
+  const without = (extra: Array<Record<string, unknown>>) => {
+    const rows = cleanRows()
+    rows.syncLogs = rows.syncLogs.filter((log) => log.id !== 'sync-a1' && log.id !== 'sync-a2')
+    rows.accountingEvents = rows.accountingEvents.filter((event) => !String(event.type).startsWith('DAILY_BATCH_REVENUE') && !String(event.type).startsWith('DAILY_BATCH_INVENTORY'))
+    for (const row of extra) rows.syncLogs.push(row as AccountingReconciliationRows['syncLogs'][number])
+    return evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+  }
+  const batch = (id: string, type: string, referenceId: string, settlementBasis: string | null) => ({
+    id, connector: 'xero', type, status: 'CANCELLED', referenceType: 'DailyBatch', referenceId, externalTransactionId: null,
+    settlementBasis, abandonedBeforeRemoteCall: true, payload: { date: '2026-04-24' },
+  })
+  const shadows = [batch('s-a1', 'DAILY_BATCH_REVENUE_DEFERRAL', 'A1-2026-04-24', 'HELD_SHADOW'), batch('s-a2', 'DAILY_BATCH_INVENTORY_ALLOC', 'A2-2026-04-24', 'HELD_SHADOW')]
+  const orphans = [batch('o-a1', 'DAILY_BATCH_REVENUE_DEFERRAL', 'A1-2026-04-24', null), batch('o-a2', 'DAILY_BATCH_INVENTORY_ALLOC', 'A2-2026-04-24', null)]
+  const none = without([])
+  const shadowed = without(shadows)
+  const orphaned = without(orphans)
+  console.log(`# without-event findings: none=${none.filter((c) => c.endsWith('_without_event')).length} shadow=${shadowed.filter((c) => c.endsWith('_without_event')).length} orphan=${orphaned.filter((c) => c.endsWith('_without_event')).length}`)
+  assert.ok(none.includes('source_order_revenue_deferral_without_event') && none.includes('source_order_inventory_allocation_without_event'), 'CONTROL: no row at all is reported')
+  assert.ok(orphaned.includes('source_order_revenue_deferral_without_event'), 'CONTROL: an orphan-sweep row is not a shadow')
+  assert.equal(shadowed.includes('source_order_revenue_deferral_without_event'), false)
+  assert.equal(shadowed.includes('source_order_inventory_allocation_without_event'), false)
+})

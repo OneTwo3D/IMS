@@ -37,6 +37,8 @@ const state = {
   queued: [] as { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }[],
   /** The connector being off: queueAccountingSync returns silently and writes nothing. */
   enqueueNoOps: false,
+  /** The producer-side hold shadowed the posting: nothing is queued, and the facade says queued:true reason 'shadowed'. */
+  enqueueShadows: false,
   // o3d-j625 r5: the facade's own refusal — it records the row (specific reason, both connectors) and says so.
   enqueueRefusesAndRecords: false,
   // o3d-j625 r6: every enqueue's params, so a later sweep's posting key can be compared with a refused one's.
@@ -170,6 +172,7 @@ mock.module('@/lib/accounting', {
       // Returns void and returns EARLY — silently — when the connector is off. That is the state
       // the whole sweep exists for.
       if (state.enqueueNoOps) return
+      if (state.enqueueShadows) return { queued: true, reason: 'shadowed', connector: 'xero' }
       if (state.enqueueRefusesAndRecords) {
         const posting = { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: params.referenceId, scope: '' }
         const existing = state.refusals.find((r) => r.referenceId === params.referenceId && r.resolvedAt === null)
@@ -200,6 +203,7 @@ function reset() {
   state.orders = []
   state.queued = []
   state.enqueueNoOps = false
+  state.enqueueShadows = false
   state.enqueueRefusesAndRecords = false
   state.asked = []
   state.activity = []
@@ -457,4 +461,59 @@ test('[o3d-j625 r6 H4] a refused held release is raised again, under the SAME po
   assert.equal(state.queued.length, 1, 'PRECONDITION: the next sweep queued it')
   assert.deepEqual(accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', ...state.asked[1] } as never),
     accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', ...refused } as never))
+})
+
+// ---------------------------------------------------------------------------
+// THE PRODUCER-SIDE HOLD SHADOWED THE RELEASE. A shadow is the record the hold keeps INSTEAD of a queued posting (a CANCELLED row with no
+// document id), so the release's re-read by the enqueue's dedupe predicate can never find it. Read as "the enqueue produced no row" it stranded
+// the hold PENDING for ever, recorded a posting refusal telling the operator to raise the invoice by hand (a duplicate of the owner's
+// document), and let shadowed holds fill the sweep's bounded oldest-first window. Named mutation `shadow-is-a-failure`: the release ignores
+// reason 'shadowed'; every arm below goes red.
+// ---------------------------------------------------------------------------
+test('[shadow] a shadowed release CLOSES the hold with its own sentence: no refusal, no stuck count, not retried', async () => {
+  reset()
+  state.held.push(heldRow({ id: 'hold-1', entityId: 'so-1' }))
+  state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+  state.enqueueShadows = true
+
+  const first = await sweep()
+  console.log(`# shadowed release: ${JSON.stringify(first)} hold=${state.held[0].status} refusals=${state.refusals.length}`)
+  assert.equal(first.stillStuck, 0)
+  assert.equal(first.released, 0)
+  assert.equal(first.closed, 1)
+  assert.equal(state.held[0].status, 'SYNCED')
+  assert.match(state.held[0].errorMessage ?? '', /Closed as a shadow/)
+  assert.match(state.held[0].errorMessage ?? '', /does not say whether the ledger's owner has written it/)
+  assert.doesNotMatch(state.held[0].errorMessage ?? '', /NOTHING will post|disconnected/)
+  assert.deepEqual(outstanding(), [], 'no posting refusal: a shadow is the record, not a failed enqueue')
+  assert.equal(state.activity.some((entry) => entry.action === 'sales_invoice_release_not_queued' || entry.action === 'sales_invoice_release_still_stuck'), false)
+  const asked = state.asked.length
+  const second = await sweep()
+  assert.equal(second.scanned, 0, 'a closed hold leaves the oldest-first window')
+  assert.equal(state.asked.length, asked, 'and is never re-driven')
+})
+
+test('[shadow] CONTROL: the same hold with the enqueue switched back to a silent no-op is still stuck, with its refusal', async () => {
+  reset()
+  state.held.push(heldRow({ id: 'hold-1', entityId: 'so-1' }))
+  state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+  state.enqueueNoOps = true
+  const result = await sweep()
+  assert.equal(result.stillStuck, 1)
+  assert.equal(state.held[0].status, 'PENDING')
+  assert.equal(outstanding().length, 1)
+})
+
+test('[shadow] shadowed holds do not consume the sweep limit: with a limit of 2, four shadowed holds are all closed in one run', async () => {
+  reset()
+  for (let i = 0; i < 4; i += 1) {
+    state.held.push(heldRow({ id: `hold-s${i}`, entityId: `so-s${i}`, createdAt: new Date(`2026-08-0${i + 1}T00:00:00Z`) }))
+    state.orders.push({ id: `so-s${i}`, invoiceNumber: `10${i}`, accountingInvoiceId: null })
+  }
+  state.enqueueShadows = true
+  const result = await sweep({ limit: 2 })
+  console.log(`# shadowed sweep with limit 2: ${JSON.stringify(result)}`)
+  assert.equal(result.closed, 4)
+  assert.equal(result.stillStuck, 0)
+  assert.ok(state.held.every((row) => row.status === 'SYNCED'))
 })

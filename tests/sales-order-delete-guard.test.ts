@@ -1793,3 +1793,51 @@ test('[durable shadow] a shipment-keyed and a batch-keyed shadow record also blo
   assert.match(blockerBatch!.message, /A2 inventory allocation/)
   assert.equal(await findSalesOrderDeleteBlocker(makeTx({ shadows: [{ ...batchShadow, subject_id: 'A2-2026-07-19-ffff0000' }] }), 'order-1', stamps), null, 'ISOLATING: another day\'s batch shadow does not block')
 })
+
+// ---------------------------------------------------------------------------
+// THE WAREHOUSE SHADOW AT THE DELETE GUARD. While the producer-side hold stands for the warehouse the push sweep records a shadow of the
+// order create instead of making a link, so "no push link" no longer proves nothing was called: the writer that owns creation in this phase
+// may have made the warehouse order. Named mutation `ignore-warehouse-shadow`: the guard stops asking for mintsoft shadows; the arms go red.
+// ---------------------------------------------------------------------------
+async function withMintsoftEnforcement<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const saved = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  if (value === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = value
+  try { return await fn() } finally {
+    if (saved === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = saved
+  }
+}
+
+test('[warehouse shadow] no push link but a durable mintsoft shadow of the create => BLOCKED while the hold is enforced for mintsoft; OFF, another destination, another order and a real link are the controls', async () => {
+  const shadow = { destination: 'mintsoft', operation: 'order.create', subject_type: 'SalesOrder', subject_id: 'order-1' }
+  console.log('# precondition: no push link, one mintsoft shadow record')
+  await withMintsoftEnforcement('mintsoft', async () => {
+    const blocker = await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [shadow] }), 'order-1', STAMPS)
+    assert.equal(blocker?.code, 'wms_shadow_recorded')
+    assert.match(blocker!.message, /SHADOW/)
+    assert.match(blocker!.message, /order\.create/)
+    assert.match(blocker!.message, /does not say the warehouse has no order/)
+    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [] }), 'order-1', STAMPS), null, 'CONTROL: no record, deletable')
+    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [{ ...shadow, subject_id: 'order-2' }] }), 'order-1', STAMPS), null, 'CONTROL: another order')
+    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [{ ...shadow, destination: 'woocommerce' }] }), 'order-1', STAMPS), null, 'CONTROL: another destination')
+  })
+  await withMintsoftEnforcement(undefined, async () => {
+    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [shadow] }), 'order-1', STAMPS), null, 'CONTROL: switch off is the legacy guard, byte for byte')
+  })
+  await withMintsoftEnforcement('xero', async () => {
+    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [shadow] }), 'order-1', STAMPS), null, 'CONTROL: enforced for a different destination')
+  })
+})
+
+test('[batch sentence] a SHADOW batch journal is not described as an operator settlement or a retirement; the other unproven standings keep that sentence', async () => {
+  const stamps = { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT, inventoryAllocatedBatchRef: 'A2-2026-07-20-1a2b3c4d' }
+  const batchRow = (overrides: Partial<SyncLogRow>) => syncLog({ type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20-1a2b3c4d', status: 'CANCELLED', abandonedBeforeRemoteCall: true, ...overrides })
+  const shadow = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [batchRow({ settlementBasis: 'HELD_SHADOW' })] }), 'order-1', stamps)
+  const unknown = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [batchRow({ status: 'FAILED', abandonedBeforeRemoteCall: null })] }), 'order-1', stamps)
+  assert.equal(shadow?.code, 'daily_batch_staged')
+  assert.match(shadow!.message, /recorded this batch journal as a SHADOW/)
+  assert.doesNotMatch(shadow!.message, /operator settled it as not posted|retired with no recorded pre-call proof/)
+  assert.equal(unknown?.code, 'daily_batch_staged')
+  assert.match(unknown!.message, /operator settled it as not posted/, 'CONTROL: a FAILED row keeps the old sentence')
+})

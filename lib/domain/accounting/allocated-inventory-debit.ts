@@ -1,3 +1,4 @@
+import { isShadowedObligation } from './ledger-standing'
 /**
  * o3d-o97 r4 — IS THERE A GROUP A2 DEBIT STANDING AGAINST THIS ORDER?
  *
@@ -81,7 +82,12 @@
 /** Minimal client: the journal probe is a primary-key read. */
 export type AllocatedInventoryDebitClient = {
   accountingSyncLog: {
-    findUnique(args: { where: { id: string }; select: { status: true } }): Promise<{ status: string } | null>
+    findUnique(args: { where: { id: string }; select: { status: true; externalTransactionId: true; settlementBasis: true; abandonedBeforeRemoteCall: true } }): Promise<{
+      status: string
+      externalTransactionId?: string | null
+      settlementBasis?: string | null
+      abandonedBeforeRemoteCall?: boolean | null
+    } | null>
   }
 }
 
@@ -147,12 +153,26 @@ export async function resolveStagedAllocationDebit(
   }
   const journal = await client.accountingSyncLog.findUnique({
     where: { id: order.allocationBatchSyncLogId },
-    select: { status: true },
+    // The standing columns, so a SHADOW is told from an abandonment (both are CANCELLED).
+    select: { status: true, externalTransactionId: true, settlementBasis: true, abandonedBeforeRemoteCall: true },
   })
   if (!journal) {
     return {
       standing: true,
       reason: `the Group A2 journal carrying this order's ${amountLabel} debit is no longer on record (retention), so whether it reached a ledger cannot be established`,
+    }
+  }
+  if (isShadowedObligation({
+    status: journal.status,
+    externalTransactionId: journal.externalTransactionId ?? null,
+    settlementBasis: journal.settlementBasis ?? null,
+    abandonedBeforeRemoteCall: journal.abandonedBeforeRemoteCall ?? null,
+  })) {
+    // A SHADOW is not an abandonment: the producer-side hold recorded this journal instead of sending it. The stamp still stands (the same
+    // answer as a CANCELLED row: nothing is cleared), but it is described as what it is, and it does not claim IMS ever tried to reach a ledger.
+    return {
+      standing: true,
+      reason: `the Group A2 journal carrying this order's ${amountLabel} debit was recorded as a SHADOW (IMS did not send it: writes to the ledger are held on this installation), which does not say whether the ledger's owner posted it, so that debit cannot be treated as un-posted`,
     }
   }
   if (journal.status === 'CANCELLED') {

@@ -126,3 +126,14 @@ export async function mintsoftProducerSeam<Op extends WmsWriteOperation>(input: 
   }
   return { proceed: false, shadowed: true, notice, reason: verdict.decision.reason, recorded, occurrences }
 }
+
+/**
+ * The operator sentence when the producer-side hold shadows ASN creation, so the Create control would only be refused; null when ASNs may be
+ * created (the hold is not enforced, or the decision is LIVE). Pure: it reads the environment only. The ASN state readers show it as the reason
+ * the control is blocked, instead of offering a control the action always refuses or blaming product links the held product writes never made.
+ */
+export function mintsoftAsnCreateShadowNotice(context: ProducerDecisionContext = {}): string | null {
+  const verdict = producerSeamVerdict('mintsoft', 'asn.create', undefined, context)
+  if (verdict.kind !== 'shadow') return null
+  return producerShadowNotice({ connector: 'mintsoft', reason: verdict.decision.reason, owner: verdict.decision.owner })
+}

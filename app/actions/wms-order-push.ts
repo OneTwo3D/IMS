@@ -10,7 +10,7 @@ import { wmsCreateObligationFloor, wmsOrderCreateReArmShadow, wmsOrderCreateShad
 import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPaidBeforeCreateFloor, wmsPushIsPreCutover } from '@/lib/domain/wms/create-eligibility'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
-import { decideWmsPushReplay } from '@/lib/domain/wms/push-recovery-affordance'
+import { decideWmsPushReplay, wmsPushProducerFacts } from '@/lib/domain/wms/push-recovery-affordance'
 import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 
 /**
@@ -80,7 +80,7 @@ export async function getWmsOrderPushStateForSalesOrder(salesOrderId: string): P
     if (!shadow) return null
     return { state: 'SHADOWED', externalOrderNumber: null, attempts: 0, lastError: null, pushedAt: null, canRetry: false, retryRefusal: shadow.notice }
   }
-  const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order))
+  const decision = decideWmsPushReplay(link, wmsPushOrderReference(link.order), undefined, wmsPushProducerFacts(link.connector, link.order.paidAt))
   // A never-attempted queue entry the create query now excludes (paid before the live-from instant): not "Queued", which nothing would keep.
   if (wmsPushIsPreCutover(link, link.order, wmsCreateObligationFloor(link.connector))) {
     return { state: WMS_PRE_CUTOVER_PUSH_STATE, externalOrderNumber: null, attempts: 0, lastError: link.lastError, pushedAt: null, canRetry: false, retryRefusal: WMS_PRE_CUTOVER_NOTICE }

@@ -4,7 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { wmsCreateObligationFloor } from '@/lib/connectors/wms/producer-seam'
+import { wmsCreateObligationFloor, wmsProducerHold } from '@/lib/connectors/wms/producer-seam'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus } from '@/lib/connectors/wms/types'
 import { notify } from '@/lib/notifications'
 import { scrubWmsError } from './error-scrub'
@@ -100,6 +100,12 @@ export type WmsOrderReconcileDeps = {
 
 /** The disposition written on a NOT_PUSHED finding closed because the order is out of IMS's scope (paid before the live-from instant). */
 export const WMS_RECONCILE_PRE_CUTOVER_DETAIL = 'Out of scope: this order was paid before the live-from instant, so it belongs to the bridge and IMS will not push it. Closed without a push link.'
+
+/**
+ * The disposition written on a NOT_PUSHED finding closed because the producer-side hold is standing for the warehouse: IMS shadows every create
+ * (no link is written), so an order with no link is the held state working, not a push cron that stopped.
+ */
+export const WMS_RECONCILE_HELD_DETAIL = 'Out of scope: writes to the warehouse are held on this installation, so IMS keeps a shadow record instead of creating the order. No push link is written while that stands; this does not say whether the warehouse already holds the order. Closed without a push link.'
 
 /** Testable core — pure orchestration over injected deps. */
 export async function runWmsOrderReconcileCore(
@@ -359,6 +365,18 @@ export async function resolveNotPushedChunk(input: {
   now: Date
 }): Promise<{ resolved: number; outOfScope: number }> {
   const { rows } = input
+  // HELD: while the producer-side hold stands for the warehouse every create is a shadow and writes no link, so no order can be "not pushed"
+  // in the sense this finding means. Close every open finding with an explicit disposition (never silently), whatever the order looks like.
+  if (wmsProducerHold(input.connectorId).held) {
+    const heldIds = rows.map((row) => row.id)
+    if (heldIds.length > 0) {
+      await db.wmsOrderDiscrepancy.updateMany({
+        where: { id: { in: heldIds }, status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: input.now, detail: WMS_RECONCILE_HELD_DETAIL },
+      })
+    }
+    return { resolved: 0, outOfScope: heldIds.length }
+  }
   const drifting = async (paidNotBefore: Date | null) => new Set(
     input.boundWarehouseIds.length === 0
       ? []
@@ -398,6 +416,8 @@ export async function resolveNotPushedChunk(input: {
 export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector: WmsConnector): WmsOrderReconcileDeps {
   return {
     async listUnpushedIntentOrders(limit) {
+      // While the producer-side hold stands for the warehouse no create produces a link (each is a shadow), so absence of a link is not drift.
+      if (wmsProducerHold(connectorId).held) return []
       const bindings = await db.externalWmsBinding.findMany({
         where: { connector: connectorId, active: true, connection: { active: true } },
         select: { warehouseId: true },

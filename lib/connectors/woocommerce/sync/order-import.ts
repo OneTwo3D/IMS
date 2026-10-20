@@ -1135,7 +1135,11 @@ type HeldReleaseOrderRef = {
  * `not-queued` is the one that matters: the hold is still PENDING, still owed an invoice, and the
  * only thing that will try again is the sweep.
  */
-export type HeldSalesInvoiceReleaseOutcome = 'no-hold' | 'released' | 'unreadable' | 'not-queued'
+/** The closing note of a hold whose release the producer-side hold recorded as a shadow. Names no claim about the owner's ledger. */
+export const HELD_SALES_INVOICE_SHADOWED_MESSAGE = (invoiceNumber: string): string =>
+  `Closed as a shadow: WooCommerce assigned invoice number ${invoiceNumber}, but writes to the ledger are held on this installation, so IMS recorded the sales invoice as a shadow instead of queueing it. IMS did not send it, and this does not say whether the ledger's owner has written it: check the ledger before acting.`
+
+export type HeldSalesInvoiceReleaseOutcome = 'no-hold' | 'released' | 'unreadable' | 'not-queued' | 'shadowed'
 
 /** Keep the hold PENDING, but stop it claiming to be waiting for a number that has already arrived. */
 async function noteHeldReleaseFailure(rowId: string, message: string): Promise<void> {
@@ -1284,6 +1288,21 @@ async function releaseHeldWcSalesInvoice(
       }).catch(() => {})
     }
     return 'not-queued'
+  }
+
+  // THE PRODUCER-SIDE HOLD SHADOWED THE INVOICE. A shadow is the record the hold keeps INSTEAD of a queued posting (a CANCELLED row with no
+  // document id, plus the durable shadow record): it is not "nothing was queued", and no later pass can turn it into a queued row. Reading
+  // it as a failed enqueue strands the hold PENDING for ever, records a posting refusal that says to raise the invoice by hand (a duplicate
+  // of the owner's document), and lets held-over shadows fill the sweep's bounded oldest-first window. The hold is closed with its own
+  // words; the shadow's standing says nothing about whether the owner posted the invoice.
+  if (enqueueOutcome.outcome?.reason === 'shadowed') {
+    await db.shoppingSyncLog.update({
+      where: { id: row.id },
+      data: { errorMessage: HELD_SALES_INVOICE_SHADOWED_MESSAGE(invoiceNumber), syncedAt: new Date(), status: 'SYNCED' },
+    }).catch((error) => {
+      console.error(`[wc-import] recorded the held sales invoice for ${orderId} as a shadow but could not mark the queue row:`, error)
+    })
+    return 'shadowed'
   }
 
   // The enqueue can no-op silently — see the note above. A row that is not there was not queued,
@@ -1531,7 +1550,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
       { logFailure: false },
     )
     if (outcome === 'released') result.released++
-    else if (outcome === 'unreadable') result.closed++
+    else if (outcome === 'unreadable' || outcome === 'shadowed') result.closed++
     else if (outcome === 'not-queued') {
       result.stillStuck++
       stuck.push(payload?.externalOrderNumber ?? order.id)

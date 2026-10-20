@@ -313,7 +313,9 @@ test('ON: a PENDING_VERIFY link is still PROVED (a read) but is never converted:
     const run = await sweep({ verifiable: [verifyLink()], withdrawn: true }, { verdict: 'ours' })
     console.log(`# ON verify: calls=${JSON.stringify(run.calls)} writes=${JSON.stringify(run.writes)}`)
     assert.deepEqual(run.calls, ['verifyPushedOrder:wms-v'], 'the proof is a read and still happens; no cancel')
-    assert.deepEqual(run.writes, [], 'the link stays PENDING_VERIFY: nothing is written, nothing becomes a shadow state')
+    // Only the ROTATION column moves (the verify queue is least-recently-attempted first and bounded): the state is untouched, so nothing becomes a
+    // shadow state, but the link goes to the back of the queue instead of heading it for ever and starving the verifications behind it.
+    assert.deepEqual(run.writes, ['updateLinkIfState:link-v:PENDING_VERIFY->-'])
     assert.equal(run.result.shadowed, 1)
     assert.deepEqual(shadows.map((s) => s.operation), ['order.hold'])
   })
@@ -519,4 +521,41 @@ test('CLAIM-TIME RE-PROOF: paidAt corrected to before the live-from instant betw
       }
     }
   })
+})
+
+test('HELD verify queue: the verified-then-withdrawn shadow stamps only lastAttemptAt (the rotation column), never the state or the error; the live path is untouched', async () => {
+  const stamped: Array<{ id: string; from: string; data: Record<string, unknown> }> = []
+  const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+  await withEnv(HELD, async () => {
+    const harness = makePort({ verifiable: [verifyLink()], withdrawn: true })
+    const original = harness.port.updateLinkIfState
+    harness.port.updateLinkIfState = async (id, from, data) => { stamped.push({ id, from, data: data as Record<string, unknown> }); return original(id, from, data) }
+    await runWmsOrderPushSweepCore(makeConnector({ verdict: 'ours' }).connector, 'mintsoft', harness.port, { now: NOW })
+  })
+  console.log(`# held verify stamp: ${JSON.stringify(stamped.map((s) => Object.keys(s.data)))}`)
+  assert.equal(stamped.length, 1)
+  assert.deepEqual(Object.keys(stamped[0]!.data), ['lastAttemptAt'])
+  assert.equal(stamped[0]!.from, 'PENDING_VERIFY')
+})
+
+test('HELD create pass walks the candidates by a rotating cursor: the page after the cursor is asked for, the cursor advances on a full page and resets on a short one; OFF asks the legacy question with no cursor', async () => {
+  const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+  const run = async (env: Record<string, string>, initial: string | null, pageIds: string[]) => {
+    const state = { cursor: initial, asked: [] as Array<unknown>, writes: [] as Array<string | null> }
+    await withEnv(env, async () => {
+      const harness = makePort({ createCandidates: pageIds.map((id) => candidate({ id, orderNumber: id })) })
+      harness.port.createCandidates = async (_c, _b, _l, _p, rotation) => { state.asked.push(rotation ?? null); return pageIds.map((id) => candidate({ id, orderNumber: id })) }
+      harness.port.heldCreateCursor = { read: async () => state.cursor, write: async (value) => { state.writes.push(value); state.cursor = value } }
+      await runWmsOrderPushSweepCore(makeConnector().connector, 'mintsoft', harness.port, { now: NOW, batchSize: 2 })
+    })
+    return state
+  }
+  const full = await run(HELD, 'so-a', ['so-b', 'so-c'])
+  assert.deepEqual(full.asked, [{ afterId: 'so-a' }])
+  assert.deepEqual(full.writes, ['so-c'], 'a full page advances the cursor to its last id')
+  const short = await run(HELD, 'so-c', ['so-d'])
+  assert.deepEqual(short.writes, [null], 'a short page ends the walk and the next tick starts at the head')
+  const off = await run(OFF, null, ['so-b', 'so-c'])
+  assert.deepEqual(off.asked, [null], 'CONTROL: switch OFF asks the legacy question with no rotation')
+  assert.deepEqual(off.writes, [], 'CONTROL: and keeps no cursor')
 })
