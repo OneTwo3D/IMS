@@ -132,6 +132,7 @@ test('crons: an ALLOWLIST. Only comments, environment lines and the exact read-o
     ['an arbitrary command on @reboot', '@reboot /usr/local/bin/anything', { ...none, refused: 1 }],
     ['a read-only job followed by a second command', job(`${literal('backup')}; /usr/local/bin/write-to-xero`), { ...none, refused: 1 }],
     ['a read-only job then a writing job on one line', job(`${literal('backup')} && ${literal('accounting-sync')}`), { ...none, refused: 1 }],
+    ['a writing command BEFORE a valid read-only command on one line', job(`/usr/local/bin/write-to-xero; ${literal('backup')}`), { ...none, refused: 1 }],
     ['a read-only job with a trailing pipe or redirect', job(`${literal('backup')} | sh`), { ...none, refused: 1 }],
     ['a read-only job with a command substitution appended', job(`${literal('backup')} $(id)`), { ...none, refused: 1 }],
     ['a read-only job with a backtick appended', job(`${literal('backup')} \`id\``), { ...none, refused: 1 }],
