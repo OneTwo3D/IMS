@@ -315,6 +315,12 @@ test('o3d-2sm1 r7: every enqueue in the refund hand-off is accounted for, and it
   assert.match(handoff, /ledger\.accountInTransaction\(sync, outcomeInTx\)/)
   // And the COGS subledger row is still recorded on the queue's OWN decision, not a second recheck.
   assert.match(handoff, /recordRefundCogsReversalFromSync\(tx, sync, outcome\.queued\)/)
+  // The transit row of a refund whose goods are in transit rides in the SAME transaction as the enqueue and reads the
+  // enqueue's whole answer (it must see a shadow), not a bare boolean: a journal that is only a shadow posts nothing.
+  const transitAt = handoff.indexOf('recordRefundTransitFromSync(tx, sync, outcome)')
+  assert.ok(transitAt > -1, 'the in-transit refund records its transit sub-ledger row at queue time')
+  assert.ok(transitAt > handoff.indexOf('queueAccountingSyncTxWithOutcome('), 'after the enqueue whose answer it reads')
+  assert.ok(transitAt < handoff.indexOf('ledger.accountInTransaction(sync, outcomeInTx)'), 'inside the transaction that queued it')
 
   // AND IT SETTLES LAST: nothing may discharge the obligation unless every answer was met.
   const settleAt = handoff.lastIndexOf('ledger.settle()')

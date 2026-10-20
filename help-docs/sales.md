@@ -252,6 +252,16 @@ Returned stock is added back into the selected warehouse's inventory automatical
 
 For Kit / Bundle sales, refunds reverse the component-level stock movements. Returned stock, FIFO cost restoration, and shipment reversal all happen against the underlying component products.
 
+### Returned goods in transit (switched off by default)
+
+Normally the returned units are restocked the moment the refund is recorded. When the setting
+`refund_returns_in_transit_enabled` is `true`, a refund that returns stock instead creates a **return expectation**:
+the units are not stock yet, so they cannot be allocated, sold or pushed to the storefront, and the refund's COGS
+reversal debits **Stock in Transit** instead of Inventory (DR Stock in Transit / CR COGS). The decision is stored on the
+refund when it is created, so a retry later does the same thing. The arrival side (clearing the expectation from the
+Mintsoft returns inbox, and writing off units that never come back) is not built yet, so leave the setting off. See
+`docs/refund-in-transit.md`.
+
 ### Refund-time cost revaluation
 
 When a refund processes returned stock, the system uses the **current** cost-layer unit cost — not the snapshot recorded at shipment time. This means if a landed-cost revaluation has changed the unit cost since the original shipment, the refund's COGS reversal uses the up-to-date value. The returned stock is also valued at the current cost.

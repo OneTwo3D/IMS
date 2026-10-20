@@ -50,6 +50,12 @@ import {
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import {
+  createReturnExpectationTx,
+  readReturnsInTransitEnabled,
+  type ReturnExpectationTransitLink,
+} from '@/lib/domain/sales/return-expectation'
 import {
   allocationOpenBalance,
   assertedJournalRemedy,
@@ -1333,6 +1339,12 @@ async function stageRefundAccountingReversals(
     newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
     /** scjz.70: revenue-only chargeback — suppress the COGS reversal (cost kept as a loss). */
     chargeback?: boolean
+    /**
+     * The refund's returned units are IN TRANSIT (a return expectation), not restocked: the COGS reversal then
+     * debits Stock in Transit instead of Inventory. Read from the refund row (decided once at creation), never
+     * from the live setting, so a retry stages the same treatment the first attempt did.
+     */
+    returnInTransit?: boolean
     /**
      * The active accounting connector that will receive the new reversal syncs. Scopes
      * the prior-reversal double-counting guard to that connector so a post-connector-
@@ -3162,6 +3174,15 @@ async function stageRefundAccountingReversals(
   // journal payload and is persisted on the refund for the daily-batch reconciliation.
   if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
     const cogsReversalJournalDate = new Date().toISOString().slice(0, 10)
+    // Goods in transit are not in Inventory: the debit goes to Stock in Transit until they arrive (the inventory
+    // sub-ledger is cost layers, and none exists for units that are not back). Only a refund that actually
+    // returns stock is in transit (`returnWarehouseId`), so a refund with nothing to return keeps its debit.
+    const returnsInTransit = params.returnInTransit === true && Boolean(params.returnWarehouseId)
+    const cogsReversalDebitAccount = returnsInTransit ? settings.transitAccount?.trim() : settings.inventoryAccount
+    // Fail closed: no Stock in Transit account configured means the journal cannot be coded. Falling back to
+    // Inventory would put value in the GL that no cost layer backs. The throw rolls back the staging
+    // transaction and leaves the refund flagged for accounting retry, to be re-run once the account is set.
+    if (!cogsReversalDebitAccount) throw new Error('refund_in_transit_account_not_configured')
     accountingSyncs.push({
       type: 'COGS_REVERSAL',
       referenceType: 'SalesOrderRefund',
@@ -3173,15 +3194,20 @@ async function stageRefundAccountingReversals(
       payload: {
         date: cogsReversalJournalDate,
         reference: `COGS reversal: ${params.orderRef}`,
-        narration: `COGS reversal — refund on order ${params.orderRef}`,
+        narration: returnsInTransit
+          ? `COGS reversal — refund on order ${params.orderRef} (goods in transit)`
+          : `COGS reversal — refund on order ${params.orderRef}`,
         // bcz9.4: carry the 6dp cost-layer base so the subledger row, recorded at
         // queue time (queueRefundAccountingActions) atomically with the COGS_REVERSAL
         // sync, preserves the residue the GL's 2dp posting drops — without re-deriving
         // it from the journal's 2dp credit lines. Ignored by the connectors (like the
         // other private `_`-prefixed payload fields).
         _cogsReversalBase: reversalAmounts.cogsReversalBase,
+        // The debit is Stock in Transit, not Inventory: the queue-time recorder reads this to add the matching
+        // transit sub-ledger row. Absent on every legacy payload, which reads as "not in transit".
+        ...(returnsInTransit ? { _returnInTransit: true } : {}),
         lines: [
-          { accountCode: settings.inventoryAccount, description: `COGS reversal: ${params.orderRef}`, debit: reversalAmounts.cogsReversal },
+          { accountCode: cogsReversalDebitAccount, description: `COGS reversal: ${params.orderRef}`, debit: reversalAmounts.cogsReversal },
           { accountCode: settings.cogsAccount, description: `COGS reversal: ${params.orderRef}`, credit: reversalAmounts.cogsReversal },
         ],
       },
@@ -3328,10 +3354,61 @@ export async function recordRefundCogsReversalFromSync(
   await recordCogsSubledgerMovement(client, {
     sourceType: 'REFUND_REVERSAL',
     sourceRef: sync.referenceId,
-    idempotencyKey: sync.idempotencyKey ?? `sales-order-refund:${sync.referenceId}:cogs-reversal`,
+    idempotencyKey: sync.idempotencyKey ?? refundCogsReversalKey(sync.referenceId),
     baseDelta: -base,
     journalDate: date,
   })
+}
+
+/**
+ * The refund's COGS reversal debited Stock in Transit: record that movement in the transit sub-ledger
+ * (positive: transit debited), ATOMICALLY with queuing the journal, exactly as the COGS row above is. Recorded on
+ * the queue's own decision, so the row exists only for a journal that is durably queued (not one the producer seam
+ * recorded as a shadow, which posts nothing), and idempotent on the
+ * journal's key, so the first queue and every retry record it once. The payload marker is what says the journal
+ * debits transit; a payload without it (every legacy one) records nothing here.
+ */
+export async function recordRefundTransitFromSync(
+  client: RefundServiceClient,
+  sync: RefundAccountingSyncRequest,
+  outcome: { queued: boolean; reason?: string },
+): Promise<void> {
+  if (sync.type !== 'COGS_REVERSAL' || !outcome.queued) return
+  // A SHADOWED journal is recorded but never sent: the ledger will not contain its debit, so a sub-ledger row for it
+  // would be a movement the GL never makes and the daily transit reconciliation would flag the gap for ever.
+  if (outcome.reason === 'shadowed') return
+  if (!isRecord(sync.payload) || sync.payload._returnInTransit !== true) return
+  const date = typeof sync.payload.date === 'string' ? sync.payload.date : null
+  const base = resolveRefundCogsReversalBase(sync.payload)
+  if (!date || base === null) return
+  await recordTransitSubledgerMovement(client, {
+    sourceType: 'CUSTOMER_RETURN_IN_TRANSIT',
+    sourceRef: sync.referenceId,
+    idempotencyKey: sync.idempotencyKey ?? refundCogsReversalKey(sync.referenceId),
+    baseDelta: base,
+    journalDate: date,
+  })
+}
+
+function refundCogsReversalKey(refundId: string): string {
+  return `sales-order-refund:${refundId}:cogs-reversal`
+}
+
+/**
+ * The ledger link for a refund's expectation: the staged COGS reversal that carries the transit marker, or null
+ * when none was staged (accounting off, or nothing shipped to reverse). Built from the staged request itself, so
+ * the document records the journal that was actually staged and not one re-derived from settings.
+ */
+export function returnExpectationTransitLinkFromSyncs(
+  syncs: readonly RefundAccountingSyncRequest[],
+): ReturnExpectationTransitLink | null {
+  for (const sync of syncs) {
+    if (sync.type !== 'COGS_REVERSAL' || !isRecord(sync.payload) || sync.payload._returnInTransit !== true) continue
+    const base = resolveRefundCogsReversalBase(sync.payload)
+    if (base === null) return null
+    return { journalKey: sync.idempotencyKey ?? refundCogsReversalKey(sync.referenceId), debitBase: base }
+  }
+  return null
 }
 
 function formatRefundAccountingError(error: unknown): string {
@@ -3986,6 +4063,11 @@ export async function createSalesOrderRefund(
       if (restockable.length === 0) restockWarehouseId = undefined
     }
 
+    // Returned units in transit: decided HERE, once, under the order lock, from the switch as it reads in this
+    // transaction, and persisted on the refund below. Only a refund that returns stock can be in transit
+    // (a chargeback already has no return warehouse). Nothing later re-reads the switch for this refund.
+    const returnInTransit = Boolean(restockWarehouseId) && await readReturnsInTransitEnabled(tx)
+
     // o3d-w00 #2/#5 + o3d-iup: fail closed on a monetary-only (unlinked) SALE line the order can't tax
     // uniformly. Such a line is an un-attributable goods amount; posting it under one header rate would
     // mis-allocate the credit note on a mixed-rate / reverse-charged / deactivated-rate order (e.g.
@@ -4451,6 +4533,7 @@ export async function createSalesOrderRefund(
         totalsBasis: 'NET',
         source: refundSource,
         returnWarehouseId: restockWarehouseId || null,
+        returnInTransit,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
         chargeback: input.chargeback ?? false,
@@ -4653,6 +4736,7 @@ export async function createSalesOrderRefund(
       releaseUnmatchedAnomaly,
       fallbackReturnRows,
       restockWarehouseId,
+      returnInTransit,
     }
   }).catch((error) => {
     if (isRefundReturnSourceError(error)) {
@@ -4738,6 +4822,7 @@ export async function createSalesOrderRefund(
           refundId: txResult.createdRefund.id,
           refundLines: txResult.createdRefundLines,
           returnWarehouseId: txResult.restockWarehouseId,
+          returnInTransit: txResult.returnInTransit,
           accountingSettings: input.accountingSettings!,
           so: txResult.so,
           newStatus: txResult.newStatus,
@@ -4856,15 +4941,30 @@ export async function createSalesOrderRefund(
       ? snapshotRows
       : txResult.fallbackReturnRows
 
-    returnedRows = await runInTransaction(client, (tx) => (
-      applyReturnInboundStockTx(tx, {
-        referenceType: 'SalesOrderRefund',
-        referenceId: txResult.createdRefund.id,
-        warehouseId: txResult.restockWarehouseId!,
-        rows: returnRows,
-        note: 'Refund return',
-      })
-    ))
+    if (txResult.returnInTransit) {
+      // In transit: a document, not stock. No movement, stock level or cost layer is written, so there is nothing
+      // to allocate or push and `returnedRows` stays empty by construction.
+      await runInTransaction(client, (tx) => (
+        createReturnExpectationTx(tx, {
+          refundId: txResult.createdRefund.id,
+          orderId: input.orderId,
+          creditNoteNumber: txResult.creditNoteNumber,
+          expectedWarehouseId: txResult.restockWarehouseId,
+          rows: returnRows,
+          transit: returnExpectationTransitLinkFromSyncs(accountingSyncs),
+        })
+      ))
+    } else {
+      returnedRows = await runInTransaction(client, (tx) => (
+        applyReturnInboundStockTx(tx, {
+          referenceType: 'SalesOrderRefund',
+          referenceId: txResult.createdRefund.id,
+          warehouseId: txResult.restockWarehouseId!,
+          rows: returnRows,
+          note: 'Refund return',
+        })
+      ))
+    }
   }
 
   return {
@@ -5155,6 +5255,9 @@ export async function retrySalesOrderRefundAccounting(
           id: true,
           orderId: true,
           returnWarehouseId: true,
+          // Decided once at creation: the retry stages the same treatment even if the switch has moved.
+          returnInTransit: true,
+          creditNoteNumber: true,
           externalRefundId: true,
           chargeback: true,
           accountingRetryRequired: true,
@@ -5367,6 +5470,7 @@ export async function retrySalesOrderRefundAccounting(
         refundId: refund.id,
         refundLines,
         returnWarehouseId: refund.returnWarehouseId ?? undefined,
+        returnInTransit: refund.returnInTransit,
         accountingSettings: input.accountingSettings,
         so: refund.order,
         newStatus,
@@ -5384,13 +5488,25 @@ export async function retrySalesOrderRefundAccounting(
             // throws on) a line that did not ship. Its persisted external id is how creation chose it.
             skipUnshipped: refund.externalRefundId != null,
           })
-        returnedRows = await applyReturnInboundStockTx(tx, {
-          referenceType: 'SalesOrderRefund',
-          referenceId: refund.id,
-          warehouseId: refund.returnWarehouseId!,
-          rows: returnRows,
-          note: 'Refund return',
-        })
+        if (refund.returnInTransit) {
+          // Idempotent on the refund: a retry never creates a second document (and never restocks).
+          await createReturnExpectationTx(tx, {
+            refundId: refund.id,
+            orderId: refund.orderId,
+            creditNoteNumber: refund.creditNoteNumber,
+            expectedWarehouseId: refund.returnWarehouseId,
+            rows: returnRows,
+            transit: returnExpectationTransitLinkFromSyncs(staged.accountingSyncs),
+          })
+        } else {
+          returnedRows = await applyReturnInboundStockTx(tx, {
+            referenceType: 'SalesOrderRefund',
+            referenceId: refund.id,
+            warehouseId: refund.returnWarehouseId!,
+            rows: returnRows,
+            note: 'Refund return',
+          })
+        }
       }
       await tx.salesOrderRefund.update({
         where: { id: refund.id },
