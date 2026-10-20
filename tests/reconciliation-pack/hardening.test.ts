@@ -36,7 +36,7 @@ function input(system: string, minutes: number, items?: ItemInput[]): ReportInpu
 }
 function swapReport() {
   const { item } = itemFromComparison('R1', { ims: [{ key: key('A'), value: '5' }, { key: key('B'), value: '7' }], vendor: [{ key: key('A'), value: '5' }, { key: key('C'), value: '7' }] })
-  return buildReport(input('ims-test', 0, defaultItems('P1', { R1: item })), 1, null)
+  return buildReport(input('7000000000000000001', 0, defaultItems('P1', { R1: item })), 1, null)
 }
 
 test('a key part is a non-empty plain string or a safe whole number, or the row is refused', () => {
@@ -59,7 +59,7 @@ test('a capped listing of a non-finding bucket cannot pass', () => {
   const rows = Array.from({ length: CAP + 1 }, (_, i) => ({ key: key(`X${i}`), value: '1' }))
   const { item } = itemFromComparison('R1', { ims: [...rows, { key: key('OK'), value: '1' }], vendor: [{ key: key('OK'), value: '1' }], excluded: new Set(rows.map((r) => canonicalKey(r.key))) })
   assert.equal(item.outcome, 'pass', 'precondition: the comparison itself passes')
-  assert.throws(() => buildReport(input('ims-test', 0, defaultItems('P1', { R1: item })), 1, null, { maxLinesPerItem: CAP }), ReportInvalid)
+  assert.throws(() => buildReport(input('7000000000000000001', 0, defaultItems('P1', { R1: item })), 1, null, { maxLinesPerItem: CAP }), ReportInvalid)
 })
 
 test('deriveExitCode: a run in which nothing applicable exists or passed is inconclusive, never all-pass', () => {
@@ -131,7 +131,7 @@ test('a run for a different system is REFUSED (exit 2), not published and then f
   const dir = fresh()
   publish(dir, 0)
   const before = readdirOf(dir)
-  const result = publish(dir, 1, { systemIdentifier: 'other-system' })
+  const result = publish(dir, 1, { systemIdentifier: '7000000000000000004' })
   assert.deepEqual([result.ok, result.ok ? 0 : result.exitCode, result.ok ? '' : result.kind], [false, 2, 'refused'])
   assert.deepEqual(readdirOf(dir), before)
 })
@@ -139,15 +139,15 @@ test('a run for a different system is REFUSED (exit 2), not published and then f
 test('a properly linked chain that changes system identifier midway is refused by the reader', () => {
   const dir = fresh()
   mkdirSync(dir, { mode: 0o700 })
-  const first = forge(dir, input('system-a', 0), 1, null)
+  const first = forge(dir, input('7000000000000000002', 0), 1, null)
   const firstSha = sha256Hex(readFileSync(path.join(first, PACK_REPORT_JSON)))
-  forge(dir, input('system-b', 1), 2, firstSha)
+  forge(dir, input('7000000000000000003', 1), 2, firstSha)
   assert.equal(chainCode(dir), 'SYSTEM_MISMATCH')
   // control: the same forge with one system is a valid chain
   const ok = fresh()
   mkdirSync(ok, { mode: 0o700 })
-  const a = forge(ok, input('system-a', 0), 1, null)
-  forge(ok, input('system-a', 1), 2, sha256Hex(readFileSync(path.join(a, PACK_REPORT_JSON))))
+  const a = forge(ok, input('7000000000000000002', 0), 1, null)
+  forge(ok, input('7000000000000000002', 1), 2, sha256Hex(readFileSync(path.join(a, PACK_REPORT_JSON))))
   assert.equal(chainCode(ok), 'ok')
 })
 

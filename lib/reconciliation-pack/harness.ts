@@ -41,7 +41,7 @@ export function publishSyntheticRun(run: SyntheticRun): PublishResult {
   const finished = run.now.toISOString()
   return publishPackReport(run.reportDir, {
     runId: newRunId(run.now),
-    systemIdentifier: run.systemIdentifier ?? 'ims-test',
+    systemIdentifier: run.systemIdentifier ?? '7000000000000000001',
     phase: run.phase,
     asOf: run.asOf,
     startedAt: finished,

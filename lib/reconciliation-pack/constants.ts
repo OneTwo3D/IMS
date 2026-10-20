@@ -317,15 +317,83 @@ export const MAX_EVIDENCE_BYTES = 128 * 1024 * 1024
 export const MAX_EVIDENCE_LINES_PER_ITEM = 100000
 /** A bound on what the builder will even look at: a longer list in one bucket is refused outright. */
 export const MAX_ENTRIES_PER_BUCKET = 1000000
-export const SYSTEM_IDENTIFIER_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/
+/** The system identifier is what PostgreSQL itself produces (pg_control_system().system_identifier): digits only. Nothing free-form. */
+export const SYSTEM_IDENTIFIER_RE = /^[0-9]{10,20}$/
 
 // ---------------------------------------------------------------------------------------------
 // The docs. Marked blocks in docs/installation.md equal these bodies byte for byte.
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * EVERY FIELD THAT CAN REACH PUBLISHED OUTPUT (the JSON, the Markdown, evidence.jsonl, the directory and claim file
+ * names, the run lock), each with the anchored allowlist grammar it must match. There is no free-form text field.
+ * A test publishes a rich report, walks every key and string value of every output, and fails on a key that has no
+ * row here or a value that does not match its row.
+ */
+export type PackPublishedField = { field: string; where: string; grammar: string; pattern: RegExp | null }
+const CODE = (words: readonly string[]) => new RegExp(`^(?:${words.join('|')})$`)
+const HEX64 = /^[0-9a-f]{64}$/
+const ISO_STAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?Z$/
+export const PACK_PUBLISHED_FIELDS: readonly PackPublishedField[] = [
+  { field: 'schemaVersion', where: 'JSON', grammar: 'the integer 1', pattern: null },
+  { field: 'kind', where: 'JSON; proof.kind', grammar: 'reconciliation-pack, compared or proven-empty', pattern: /^(?:reconciliation-pack|compared|proven-empty)$/ },
+  { field: 'runId', where: 'JSON, Markdown, directory name, claim file', grammar: '8 digits, T, 6 digits, Z, a hyphen and 12 lower-case hex digits', pattern: /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/ },
+  { field: 'systemIdentifier', where: 'JSON, Markdown', grammar: '10 to 20 digits: the identifier PostgreSQL itself produces for the cluster', pattern: /^[0-9]{10,20}$/ },
+  { field: 'phase', where: 'JSON, Markdown', grammar: 'P0, P1 or P2', pattern: /^P[012]$/ },
+  { field: 'asOf', where: 'JSON, Markdown', grammar: 'a real calendar date, YYYY-MM-DD', pattern: /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ },
+  { field: 'startedAt', where: 'JSON, Markdown', grammar: 'an ISO time in UTC with a trailing Z', pattern: ISO_STAMP },
+  { field: 'finishedAt', where: 'JSON, Markdown', grammar: 'an ISO time in UTC with a trailing Z', pattern: ISO_STAMP },
+  { field: 'start', where: 'JSON stream brackets', grammar: 'an ISO time in UTC with a trailing Z, or null', pattern: ISO_STAMP },
+  { field: 'end', where: 'JSON stream brackets', grammar: 'an ISO time in UTC with a trailing Z, or null', pattern: ISO_STAMP },
+  { field: 'first', where: 'evidence settling', grammar: 'an ISO time in UTC with a trailing Z', pattern: ISO_STAMP },
+  { field: 'later', where: 'evidence settling', grammar: 'a list of ISO times in UTC with a trailing Z', pattern: ISO_STAMP },
+  { field: 'streams', where: 'JSON', grammar: 'at most six stream brackets', pattern: null },
+  { field: 'items', where: 'JSON', grammar: 'exactly fifteen item records, R1 to R15 in order', pattern: null },
+  { field: 'evidence', where: 'JSON', grammar: 'an object with file, sha256 and lines', pattern: null },
+  { field: 'proof', where: 'JSON items', grammar: 'null, or an object with kind (and source)', pattern: null },
+  { field: 'sequence', where: 'JSON', grammar: 'a positive whole number', pattern: null },
+  { field: 'previousReportSha256', where: 'JSON', grammar: '64 lower-case hex digits, or null for sequence 1', pattern: HEX64 },
+  { field: 'companionMarkdownSha256', where: 'JSON', grammar: '64 lower-case hex digits', pattern: HEX64 },
+  { field: 'sha256', where: 'JSON evidence record', grammar: '64 lower-case hex digits', pattern: HEX64 },
+  { field: 'bothEqualSha256', where: 'JSON items', grammar: '64 lower-case hex digits, or null', pattern: HEX64 },
+  { field: 'file', where: 'JSON evidence record', grammar: 'the file name evidence.jsonl', pattern: /^evidence\.jsonl$/ },
+  { field: 'lines', where: 'JSON evidence record', grammar: 'a non-negative whole number', pattern: null },
+  { field: 'stream', where: 'JSON stream brackets', grammar: 'one of the read-sync stream ids', pattern: /^(?:woocommerce-order-sweep|mintsoft-stock-sync|mintsoft-dispatch-poll|mintsoft-order-status|xero-balance-snapshots|xero-tax-rates)$/ },
+  { field: 'id', where: 'JSON items', grammar: 'R1 to R15', pattern: /^R(?:[1-9]|1[0-5])$/ },
+  { field: 'item', where: 'evidence lines', grammar: 'R1 to R15', pattern: /^R(?:[1-9]|1[0-5])$/ },
+  { field: 'bucket', where: 'evidence lines', grammar: 'one of the seven comparison buckets', pattern: CODE(COMPARISON_BUCKETS) },
+  { field: 'applicability', where: 'JSON items', grammar: 'applicable, listed-only or not-applicable', pattern: CODE(PACK_APPLICABILITY) },
+  { field: 'outcome', where: 'JSON items', grammar: 'pass, fail, inconclusive or not-applicable', pattern: CODE(PACK_OUTCOMES) },
+  { field: 'reasons', where: 'JSON items', grammar: 'a list of reason codes from the closed table', pattern: CODE(PACK_REASON_CODE_LIST) },
+  { field: 'source', where: 'JSON items proof', grammar: 'a code from the empty-proof table', pattern: CODE(Object.keys(PACK_EMPTY_PROOF_CODES)) },
+  { field: 'sources', where: 'JSON items', grammar: 'a list of codes from the source table', pattern: CODE(Object.keys(PACK_SOURCE_CODES)) },
+  { field: 'key', where: 'evidence lines', grammar: 'one or more identity tokens joined by |: a digested form kind#8 hex digits, a cuid, a numeric id, or a SKU or warehouse token that passes the allowed-character pattern AND the credential screen (see Identity tokens)', pattern: null },
+  { field: 'ims', where: 'evidence lines', grammar: 'a canonical plain decimal, or null', pattern: /^-?(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{0,11}[1-9])?$/ },
+  { field: 'vendor', where: 'evidence lines', grammar: 'a canonical plain decimal, or null', pattern: /^-?(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{0,11}[1-9])?$/ },
+  { field: 'delta', where: 'evidence lines', grammar: 'a canonical plain decimal, or null', pattern: /^-?(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{0,11}[1-9])?$/ },
+  { field: 'imsCurrency', where: 'evidence lines', grammar: 'a code from the known-currency list, or null', pattern: /^[A-Z]{3}$/ },
+  { field: 'vendorCurrency', where: 'evidence lines', grammar: 'a code from the known-currency list, or null', pattern: /^[A-Z]{3}$/ },
+  { field: 'imsPresent', where: 'evidence lines', grammar: 'true or false', pattern: null },
+  { field: 'vendorPresent', where: 'evidence lines', grammar: 'true or false', pattern: null },
+  { field: 'settling', where: 'evidence lines (unsettled only)', grammar: 'an object with first and later', pattern: null },
+  { field: 'counts', where: 'JSON items', grammar: 'seven non-negative whole numbers named by bucket', pattern: null },
+  { field: 'evidenceLines', where: 'JSON items', grammar: 'a non-negative whole number', pattern: null },
+  { field: 'summary', where: 'JSON', grammar: 'four non-negative whole numbers', pattern: null },
+  { field: 'exitCode', where: 'JSON, Markdown', grammar: 'one of 0, 1 or 5', pattern: null },
+  { field: 'host', where: 'run lock only, never a report', grammar: 'a DNS-style host name: dot-separated labels of letters, digits and hyphens, at most 253 characters', pattern: /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}(?:\.[A-Za-z0-9][A-Za-z0-9-]{0,62})*)?$/ },
+  { field: 'token', where: 'run lock only', grammar: '32 lower-case hex digits', pattern: /^[0-9a-f]{32}$/ },
+  { field: 'pid', where: 'run lock only', grammar: 'a positive whole number', pattern: null },
+  { field: 'createdAt', where: 'run lock only', grammar: 'an ISO time in UTC with a trailing Z', pattern: ISO_STAMP },
+  { field: 'startTime', where: 'run lock only', grammar: 'digits (field 22 of /proc/<pid>/stat), or null', pattern: /^[0-9]+$/ },
+  { field: 'bootId', where: 'run lock only', grammar: 'hex digits and hyphens (the kernel boot id), or null', pattern: /^[0-9a-f-]{1,64}$/ },
+]
+export function renderPackPublishedFieldTable(): string {
+  return ['| Field | Appears in | Grammar |', '|---|---|---|', ...PACK_PUBLISHED_FIELDS.map((f) => `| ${f.field} | ${f.where} | ${f.grammar} |`)].join('\n')
+}
+
 export const PACK_DOC_BLOCK_OPEN = (id: string) => `<!-- reconciliation-pack:${id} -->`
 export const PACK_DOC_BLOCK_CLOSE = (id: string) => `<!-- /reconciliation-pack:${id} -->`
-export type PackDocBlockId = 'overview' | 'outcomes' | 'proof' | 'inputs' | 'reasons' | 'refusals' | 'items' | 'settling' | 'chain' | 'exit-codes' | 'audit'
+export type PackDocBlockId = 'overview' | 'outcomes' | 'proof' | 'tokens' | 'inputs' | 'reasons' | 'refusals' | 'items' | 'settling' | 'chain' | 'exit-codes' | 'audit'
 
 export function renderPackOutcomeTable(): string {
   return ['| Outcome | Meaning |', '|---|---|', ...PACK_OUTCOMES.map((o) => `| ${o} | ${PACK_OUTCOME_MEANING[o]} |`)].join('\n')
@@ -352,7 +420,7 @@ export const PACK_AUDIT_ROWS: ReadonlyArray<{ klass: string; guard: string }> = 
   { klass: 'TOCTOU between check and use', guard: 'every report file is opened once with O_NOFOLLOW and its digest taken on the same bytes; the run lock is verified (inode and token) immediately before the JSON commit; lock reclaim is serialised by a second exclusive file' },
   { klass: 'starvation of bounded oldest-first scans', guard: 'a read that hits its cap is CAP_EXCEEDED and never passes; there is no oldest-first window, and carried unsettled identities are re-checked first' },
   { klass: 'false findings for pre-cutoff items', guard: 'identities outside the RECORDED population go to outOfPopulation, listed and never counted as findings' },
-  { klass: 'secrets or data in text', guard: 'text carries closed codes, counts and sanitised identity tokens only; a token is a cuid, a numeric id, a validated SKU (else a sku# digest) or a warehouse code, and a raw string cannot be typed as one' },
+  { klass: 'secrets or data in text', guard: 'text carries closed codes, counts and sanitised identity tokens only; every other field has an anchored allowlist grammar (the system identifier is digits only); a token is a cuid, a numeric id, or a SKU or warehouse code that passes the character pattern and a credential screen (else a kind#digest), and a raw string cannot be typed as one. Tokens are trusted data keys and the screen is defence in depth, with its residual listed in the docs' },
   { klass: 'an aggregate or count standing in for identity', guard: 'comparison is keyed; equal counts with one identity swapped fail (onlyIms plus onlyVendor); counts are derived from the lists and the reader recomputes them' },
   { klass: '"looks empty so skipped"', guard: 'empty on both sides is EMPTY_UNPROVEN unless positive evidence is supplied; a run in which nothing passed exits 5, never 0' },
   { klass: 'ordering inferred from timestamps', guard: 'the chain is ordered by sequence and linked by digest; settling uses equality of distinct last-success stamps and never compares two stamps for order' },
@@ -382,6 +450,15 @@ export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
     '',
     renderPackEmptyProofTable(),
   ].join('\n'),
+  tokens: [
+    'Identity tokens (what evidence.jsonl prints for a SKU, a warehouse code or an id) are TRUSTED DATA KEYS: values the owner\'s own systems produced, not free text. Nothing a vendor or a file says in prose ever reaches output. The screen below is defence in depth for the day a credential is pasted into a SKU column; it is a denylist and incomplete by nature.',
+    '',
+    'A token is printed as it is only if it matches the allowed-character pattern for its kind (a SKU: letters, digits, dot, slash, underscore and hyphen, starting with a letter or digit, at most 64 characters; a warehouse code: upper-case letters, digits, underscore and hyphen, at most 32; a cuid; a numeric vendor id of at most 18 digits) AND passes the credential screen. Otherwise it is printed as its kind, a hash sign and the first 8 hex digits of its sha256 (for example sku#3aaf0386). The screen digests a token that contains, in any case, one of key, secret, token, passw, pwd, bearer, auth, cred, private, cookie, session, signature, jwt, sk_, pk_, ghp_, gho_, ghs_, xox, akia or asia; or a run of 24 or more letters, digits, plus, slash or equals with no separator; or that starts with eyJ or http; or that is longer than 64 characters. The same screen is applied again to every token read back from a file.',
+    '',
+    'What this does not cover (the residual): a credential that avoids every listed word, has no 24-character unbroken run and is built from allowed characters would still print; an 8-hex-digit digest of a LOW-entropy secret (a short password) could be guessed offline; a legitimate SKU that contains a listed word (MONKEY-WRENCH, AUTHOR-GUIDE) prints as a digest and is harder to read; cuid and numeric-id parts are not screened; and evidence.jsonl lists every identity, so it is as sensitive as the stock list itself and is written 0600 in a 0700 directory. Free-form fields do not exist: every other field that can reach output has the anchored allowlist grammar in this table.',
+    '',
+    renderPackPublishedFieldTable(),
+  ].join('\n'),
   inputs: ['The comparator never reads an unreadable input as equal, and never fills a gap with a default. Each of these shapes is inconclusive with the code shown; none reaches a bucket or a pass. A difference of zero is the only thing that is equal, and minus zero is read as zero. The comparison mode (values or presence) is fixed per item in the catalogue, and a currency outside the known list has no default number of decimals.', '', renderPackInputShapeTable()].join('\n'),
   reasons: ['Every reason a report can give is one of these codes; no other text describes a problem.', '', renderPackReasonTable()].join('\n'),
   refusals: ['A run is refused, and the trend reader refuses a directory, with exactly one of these codes.', '', renderPackChainCodeTable()].join('\n'),
@@ -397,7 +474,7 @@ export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
 }
 
 export const PACK_DOC_PLACEMENTS: ReadonlyArray<{ file: string; blocks: readonly PackDocBlockId[] }> = [
-  { file: 'docs/installation.md', blocks: ['overview', 'outcomes', 'proof', 'inputs', 'reasons', 'refusals', 'items', 'settling', 'chain', 'exit-codes', 'audit'] },
+  { file: 'docs/installation.md', blocks: ['overview', 'outcomes', 'proof', 'tokens', 'inputs', 'reasons', 'refusals', 'items', 'settling', 'chain', 'exit-codes', 'audit'] },
 ]
 
 export function renderPackDocBlock(id: PackDocBlockId): string {

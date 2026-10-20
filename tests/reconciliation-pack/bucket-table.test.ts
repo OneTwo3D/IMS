@@ -14,7 +14,7 @@ import { NOW, STAMP, allBrackets } from './helpers.ts'
  */
 
 const key = (raw: string) => [{ kind: 'sku' as const, raw }]
-const input = (items: ItemInput[]): ReportInput => ({ runId: newRunId(NOW), systemIdentifier: 'ims-test', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: allBrackets(), items })
+const input = (items: ItemInput[]): ReportInput => ({ runId: newRunId(NOW), systemIdentifier: '7000000000000000001', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: allBrackets(), items })
 const put = (items: ItemInput[], next: ItemInput) => items.map((item) => (item.id === next.id ? next : item))
 
 type Flags = { E: boolean; D: boolean; I: boolean; V: boolean; X: boolean; P: boolean; S: boolean; Y: boolean }

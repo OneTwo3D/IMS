@@ -18,7 +18,7 @@ const entry = (sku: string) => ({ key: sku as never, ims: '1', vendor: '1', delt
 const solo = (sku: string) => ({ key: sku as never, ims: '1', vendor: null, delta: null })
 const soloV = (sku: string) => ({ key: sku as never, ims: null, vendor: '1', delta: null })
 function input(items: ItemInput[], streams: StreamBracket[] = allBrackets(), phase: 'P0' | 'P1' | 'P2' = 'P1'): ReportInput {
-  return { runId: newRunId(NOW), systemIdentifier: 'ims-test', phase, asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items }
+  return { runId: newRunId(NOW), systemIdentifier: '7000000000000000001', phase, asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items }
 }
 const base = (phase: 'P0' | 'P1' | 'P2' = 'P1') => defaultItems(phase)
 const put = (items: ItemInput[], next: ItemInput) => items.map((item) => (item.id === next.id ? next : item))

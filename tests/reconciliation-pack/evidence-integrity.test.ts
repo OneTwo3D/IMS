@@ -22,7 +22,7 @@ const pair = (key: string, ims = '1', vendor = '1', delta = '0', extra: Record<s
 const soloI = (key: string) => ({ key: key as never, ims: '2', vendor: null, delta: null })
 const soloV = (key: string) => ({ key: key as never, ims: null, vendor: '3', delta: null })
 function input(items: ItemInput[], over: Partial<ReportInput> = {}): ReportInput {
-  return { runId: newRunId(NOW), systemIdentifier: 'ims-test', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: allBrackets(), items, ...over }
+  return { runId: newRunId(NOW), systemIdentifier: '7000000000000000001', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: allBrackets(), items, ...over }
 }
 const put = (items: ItemInput[], next: ItemInput) => items.map((item) => (item.id === next.id ? next : item))
 const compared = (id: PackItemId, entries: ItemInput['entries']): ItemInput => ({ ...passItem(id), proof: { kind: 'compared' }, entries })
@@ -231,7 +231,7 @@ test('prototype and object tricks never reach the output: every one is refused',
     ['an object with a custom prototype', (i) => Object.setPrototypeOf({ ...i }, { inherited: MARK })],
     ['a Map as an entry', () => { const c = clean(); c.items[0]!.entries!.onlyIms![0] = new Map() as never; return c }],
     ['a Date as a stamp', (i) => ({ ...i, startedAt: new Date(0) }) as never],
-    ['a String object as a name', (i) => ({ ...i, systemIdentifier: new String('ims-test') }) as never],
+    ['a String object as a name', (i) => ({ ...i, systemIdentifier: new String('7000000000000000001') }) as never],
     ['a sparse list', (i) => { const items = new Array(15); items[0] = i.items[0]; return { ...i, items } }],
     ['a list with an extra property', (i) => { const items = [...i.items]; Object.assign(items, { extra: MARK }); return { ...i, items } }],
     ['a list subclass', (i) => ({ ...i, items: Object.setPrototypeOf([...i.items], class Sub extends Array { }.prototype) })],

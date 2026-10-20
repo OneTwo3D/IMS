@@ -140,7 +140,7 @@ test('exit code: a listed-only item (R2 at P1) is reported but never moves the e
 // ---- the builder refuses a result that contradicts itself ---------------------------------------
 
 function input(items: ItemInput[], over: Partial<ReportInput> = {}): ReportInput {
-  return { runId: newRunId(NOW), systemIdentifier: 'ims-test', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: [], items, ...over }
+  return { runId: newRunId(NOW), systemIdentifier: '7000000000000000001', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: [], items, ...over }
 }
 const baseItems = (phase: 'P0' | 'P1' | 'P2' = 'P1') => defaultItems(phase)
 const replace = (items: ItemInput[], next: ItemInput) => items.map((item) => (item.id === next.id ? next : item))
@@ -356,14 +356,14 @@ test('LINK_BROKEN: a report whose predecessor was replaced by another valid repo
 test('SYSTEM_MISMATCH: reports of two systems in one chain are refused, and a run for another system is refused', () => {
   const dir = fresh()
   ok(publish(dir, 0))
-  const refused = publish(dir, 1, { systemIdentifier: 'other-system' })
+  const refused = publish(dir, 1, { systemIdentifier: '7000000000000000004' })
   assert.deepEqual([refused.ok, refused.ok ? '' : refused.code], [false, 'SYSTEM_MISMATCH'])
 
   const a = fresh()
   const b = fresh()
-  ok(publish(a, 0, { systemIdentifier: 'system-a' }))
-  ok(publish(b, 0, { systemIdentifier: 'system-b' }))
-  ok(publish(b, 1, { systemIdentifier: 'system-b' }))
+  ok(publish(a, 0, { systemIdentifier: '7000000000000000002' }))
+  ok(publish(b, 0, { systemIdentifier: '7000000000000000003' }))
+  ok(publish(b, 1, { systemIdentifier: '7000000000000000003' }))
   // graft b's second report (whose predecessor is b's first) after a's first by rewriting nothing: the link breaks first
   assert.notEqual(chainCode(a), 'FORK')
 })

@@ -1647,6 +1647,69 @@ An outcome of pass is only accepted, when a report is written and again when it 
 | vendor-total-zero | the vendor reported a total of zero for the whole population |
 | invariant-report-clean | the invariant report ran to the end and lists no finding |
 <!-- /reconciliation-pack:proof -->
+### Identity tokens and every published field
+
+<!-- reconciliation-pack:tokens -->
+Identity tokens (what evidence.jsonl prints for a SKU, a warehouse code or an id) are TRUSTED DATA KEYS: values the owner's own systems produced, not free text. Nothing a vendor or a file says in prose ever reaches output. The screen below is defence in depth for the day a credential is pasted into a SKU column; it is a denylist and incomplete by nature.
+
+A token is printed as it is only if it matches the allowed-character pattern for its kind (a SKU: letters, digits, dot, slash, underscore and hyphen, starting with a letter or digit, at most 64 characters; a warehouse code: upper-case letters, digits, underscore and hyphen, at most 32; a cuid; a numeric vendor id of at most 18 digits) AND passes the credential screen. Otherwise it is printed as its kind, a hash sign and the first 8 hex digits of its sha256 (for example sku#3aaf0386). The screen digests a token that contains, in any case, one of key, secret, token, passw, pwd, bearer, auth, cred, private, cookie, session, signature, jwt, sk_, pk_, ghp_, gho_, ghs_, xox, akia or asia; or a run of 24 or more letters, digits, plus, slash or equals with no separator; or that starts with eyJ or http; or that is longer than 64 characters. The same screen is applied again to every token read back from a file.
+
+What this does not cover (the residual): a credential that avoids every listed word, has no 24-character unbroken run and is built from allowed characters would still print; an 8-hex-digit digest of a LOW-entropy secret (a short password) could be guessed offline; a legitimate SKU that contains a listed word (MONKEY-WRENCH, AUTHOR-GUIDE) prints as a digest and is harder to read; cuid and numeric-id parts are not screened; and evidence.jsonl lists every identity, so it is as sensitive as the stock list itself and is written 0600 in a 0700 directory. Free-form fields do not exist: every other field that can reach output has the anchored allowlist grammar in this table.
+
+| Field | Appears in | Grammar |
+|---|---|---|
+| schemaVersion | JSON | the integer 1 |
+| kind | JSON; proof.kind | reconciliation-pack, compared or proven-empty |
+| runId | JSON, Markdown, directory name, claim file | 8 digits, T, 6 digits, Z, a hyphen and 12 lower-case hex digits |
+| systemIdentifier | JSON, Markdown | 10 to 20 digits: the identifier PostgreSQL itself produces for the cluster |
+| phase | JSON, Markdown | P0, P1 or P2 |
+| asOf | JSON, Markdown | a real calendar date, YYYY-MM-DD |
+| startedAt | JSON, Markdown | an ISO time in UTC with a trailing Z |
+| finishedAt | JSON, Markdown | an ISO time in UTC with a trailing Z |
+| start | JSON stream brackets | an ISO time in UTC with a trailing Z, or null |
+| end | JSON stream brackets | an ISO time in UTC with a trailing Z, or null |
+| first | evidence settling | an ISO time in UTC with a trailing Z |
+| later | evidence settling | a list of ISO times in UTC with a trailing Z |
+| streams | JSON | at most six stream brackets |
+| items | JSON | exactly fifteen item records, R1 to R15 in order |
+| evidence | JSON | an object with file, sha256 and lines |
+| proof | JSON items | null, or an object with kind (and source) |
+| sequence | JSON | a positive whole number |
+| previousReportSha256 | JSON | 64 lower-case hex digits, or null for sequence 1 |
+| companionMarkdownSha256 | JSON | 64 lower-case hex digits |
+| sha256 | JSON evidence record | 64 lower-case hex digits |
+| bothEqualSha256 | JSON items | 64 lower-case hex digits, or null |
+| file | JSON evidence record | the file name evidence.jsonl |
+| lines | JSON evidence record | a non-negative whole number |
+| stream | JSON stream brackets | one of the read-sync stream ids |
+| id | JSON items | R1 to R15 |
+| item | evidence lines | R1 to R15 |
+| bucket | evidence lines | one of the seven comparison buckets |
+| applicability | JSON items | applicable, listed-only or not-applicable |
+| outcome | JSON items | pass, fail, inconclusive or not-applicable |
+| reasons | JSON items | a list of reason codes from the closed table |
+| source | JSON items proof | a code from the empty-proof table |
+| sources | JSON items | a list of codes from the source table |
+| key | evidence lines | one or more identity tokens joined by |: a digested form kind#8 hex digits, a cuid, a numeric id, or a SKU or warehouse token that passes the allowed-character pattern AND the credential screen (see Identity tokens) |
+| ims | evidence lines | a canonical plain decimal, or null |
+| vendor | evidence lines | a canonical plain decimal, or null |
+| delta | evidence lines | a canonical plain decimal, or null |
+| imsCurrency | evidence lines | a code from the known-currency list, or null |
+| vendorCurrency | evidence lines | a code from the known-currency list, or null |
+| imsPresent | evidence lines | true or false |
+| vendorPresent | evidence lines | true or false |
+| settling | evidence lines (unsettled only) | an object with first and later |
+| counts | JSON items | seven non-negative whole numbers named by bucket |
+| evidenceLines | JSON items | a non-negative whole number |
+| summary | JSON | four non-negative whole numbers |
+| exitCode | JSON, Markdown | one of 0, 1 or 5 |
+| host | run lock only, never a report | a DNS-style host name: dot-separated labels of letters, digits and hyphens, at most 253 characters |
+| token | run lock only | 32 lower-case hex digits |
+| pid | run lock only | a positive whole number |
+| createdAt | run lock only | an ISO time in UTC with a trailing Z |
+| startTime | run lock only | digits (field 22 of /proc/<pid>/stat), or null |
+| bootId | run lock only | hex digits and hyphens (the kernel boot id), or null |
+<!-- /reconciliation-pack:tokens -->
 ### Unreadable input shapes
 
 <!-- reconciliation-pack:inputs -->
@@ -1786,7 +1849,7 @@ The failure classes earlier reviews kept finding, and the guard for each. Every 
 | TOCTOU between check and use | every report file is opened once with O_NOFOLLOW and its digest taken on the same bytes; the run lock is verified (inode and token) immediately before the JSON commit; lock reclaim is serialised by a second exclusive file |
 | starvation of bounded oldest-first scans | a read that hits its cap is CAP_EXCEEDED and never passes; there is no oldest-first window, and carried unsettled identities are re-checked first |
 | false findings for pre-cutoff items | identities outside the RECORDED population go to outOfPopulation, listed and never counted as findings |
-| secrets or data in text | text carries closed codes, counts and sanitised identity tokens only; a token is a cuid, a numeric id, a validated SKU (else a sku# digest) or a warehouse code, and a raw string cannot be typed as one |
+| secrets or data in text | text carries closed codes, counts and sanitised identity tokens only; every other field has an anchored allowlist grammar (the system identifier is digits only); a token is a cuid, a numeric id, or a SKU or warehouse code that passes the character pattern and a credential screen (else a kind#digest), and a raw string cannot be typed as one. Tokens are trusted data keys and the screen is defence in depth, with its residual listed in the docs |
 | an aggregate or count standing in for identity | comparison is keyed; equal counts with one identity swapped fail (onlyIms plus onlyVendor); counts are derived from the lists and the reader recomputes them |
 | "looks empty so skipped" | empty on both sides is EMPTY_UNPROVEN unless positive evidence is supplied; a run in which nothing passed exits 5, never 0 |
 | ordering inferred from timestamps | the chain is ordered by sequence and linked by digest; settling uses equality of distinct last-success stamps and never compares two stamps for order |

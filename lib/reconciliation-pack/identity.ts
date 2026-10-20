@@ -14,7 +14,7 @@
  *
  * `<sha8>` is the first eight hex digits of the sha256 of the raw string: it lets two runs refer to the same
  * unprintable identity without printing it. A SKU is also digested when it merely LOOKS like a credential
- * or an address (see SECRET_SHAPES), because the charset alone would let a Stripe-style key prefix through.
+ * or an address (see looksSensitive), because the charset alone would let a credential through.
  */
 
 import { createHash } from 'node:crypto'
@@ -27,17 +27,26 @@ export type IdentityKind = (typeof IDENTITY_KINDS)[number]
 
 const CUID_RE = /^c[a-z0-9]{24}$/
 const VENDOR_ID_RE = /^[0-9]{1,18}$/
-const SKU_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,39}$/
+export const MAX_TOKEN_LENGTH = 64
+const SKU_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/
 const WAREHOUSE_RE = /^[A-Z0-9][A-Z0-9_-]{0,31}$/
-/** Shapes a SKU must not have even though its characters are allowed. */
-const SECRET_SHAPES: readonly RegExp[] = [
-  /^(?:(?:sk|pk|rk)[_-](?:live|test|prod)|whsec_|xox[a-z]-|gh[pos]_|AKIA[A-Z0-9]{8}|ASIA[A-Z0-9]{8})/i,
-  /^eyJ[A-Za-z0-9_-]{6,}/,
-  /^[A-Fa-f0-9]{32,}$/,
-  /^[A-Za-z0-9+/]{32,}={0,2}$/,
-  /(password|secret|token|bearer|apikey|api-key|authorization)/i,
-  /^https?/i,
-]
+/**
+ * A token that merely LOOKS like it could carry a credential is digested instead of printed, even though its
+ * characters are allowed. This is a denylist and it is INCOMPLETE BY NATURE: it is defence in depth behind the real
+ * rule, which is that identity tokens are the owner's own SKUs, warehouse codes and ids (trusted data keys), not
+ * free text. It costs readability on purpose: a SKU such as "MONKEY-WRENCH" or "AUTHOR-GUIDE" contains a word on the
+ * list and is printed as sku#<sha8>. Three kinds of thing are digested:
+ *   - a credential-ish word, anywhere, in any case (key, secret, token, passw, pwd, bearer, auth, cred, private,
+ *     cookie, session, signature, jwt, and the vendor prefixes sk_, pk_, ghp_, xox, AKIA/ASIA);
+ *   - a run of 24 or more letters, digits, "+", "/" or "=" with no separator (an opaque identifier, base64 or hex);
+ *   - anything over MAX_TOKEN_LENGTH characters (the allowed-character patterns above already stop there).
+ */
+const CREDENTIAL_WORDS = /(key|secret|token|passw|pwd|bearer|auth|cred|private|cookie|session|signature|jwt|sk_|pk_|ghp_|gho_|ghs_|xox|akia|asia)/i
+const OPAQUE_RUN = /[A-Za-z0-9+/=]{24,}/
+const OTHER_SHAPES: readonly RegExp[] = [/^eyJ/, /^https?/i]
+export function looksSensitive(raw: string): boolean {
+  return raw.length > MAX_TOKEN_LENGTH || CREDENTIAL_WORDS.test(raw) || OPAQUE_RUN.test(raw) || OTHER_SHAPES.some((re) => re.test(raw))
+}
 
 export function digest8(raw: string): string {
   return createHash('sha256').update(raw, 'utf8').digest('hex').slice(0, 8)
@@ -51,8 +60,8 @@ function plainOk(kind: IdentityKind, raw: string): boolean {
   switch (kind) {
     case 'ims-id': return CUID_RE.test(raw)
     case 'vendor-id': return VENDOR_ID_RE.test(raw)
-    case 'warehouse': return WAREHOUSE_RE.test(raw) && !SECRET_SHAPES.some((re) => re.test(raw))
-    case 'sku': return SKU_RE.test(raw) && !SECRET_SHAPES.some((re) => re.test(raw))
+    case 'warehouse': return WAREHOUSE_RE.test(raw) && !looksSensitive(raw)
+    case 'sku': return SKU_RE.test(raw) && !looksSensitive(raw)
   }
 }
 
@@ -111,5 +120,6 @@ const HASHED_PART_RE = /^(?:ims-id|vendor-id|sku|warehouse)#(?:[0-9a-f]{8}|unrea
 export function isSafeTokenShape(value: unknown): value is SafeToken {
   if (typeof value !== 'string' || value.length === 0 || value.length > 512) return false
   if (value === 'key#empty') return true
-  return value.split('|').every((part) => HASHED_PART_RE.test(part) || plainOk('sku', part))
+  // Each part is a digested form, a cuid, a numeric vendor id, or a SKU/warehouse token that passes the same screen a fresh one does.
+  return value.split('|').every((part) => HASHED_PART_RE.test(part) || CUID_RE.test(part) || VENDOR_ID_RE.test(part) || plainOk('sku', part))
 }

@@ -57,6 +57,8 @@ export type LockResult = { ok: true; handle: LockHandle } | { ok: false; code: L
 
 type LockContent = { pid: number; host: string; token: string; createdAt: string; startTime: string | null; bootId: string | null }
 const MAX_LOCK_BYTES = 2048
+/** A host name is a DNS-style name: labels of letters, digits and hyphens joined by dots. Nothing else is ever written to, or accepted from, a lock. */
+export const HOST_NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}(?:\.[A-Za-z0-9][A-Za-z0-9-]{0,62})*)?$/
 const OPEN_FLAGS = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW
 
 function readText(file: string): string | null {
@@ -114,7 +116,7 @@ function parseLock(text: string): LockContent | null {
     const keys = Object.keys(raw).sort().join(',')
     if (keys !== 'bootId,createdAt,host,pid,startTime,token') return null
     if (typeof raw.pid !== 'number' || !Number.isSafeInteger(raw.pid) || raw.pid < 1) return null
-    if (typeof raw.host !== 'string' || raw.host.length === 0 || raw.host.length > 255) return null
+    if (typeof raw.host !== 'string' || raw.host.length > 253 || !HOST_NAME_RE.test(raw.host)) return null
     if (typeof raw.token !== 'string' || !/^[0-9a-f]{32}$/.test(raw.token)) return null
     if (!isStreamStamp(raw.createdAt)) return null
     for (const field of [raw.startTime, raw.bootId]) if (field !== null && (typeof field !== 'string' || !/^[0-9a-f-]{1,64}$/.test(field))) return null
@@ -165,6 +167,7 @@ export function acquireRunLock(dir: string, hooks: LockHooks = {}): LockResult {
   const stateOf = hooks.holderState ?? defaultHolderState
   const self = (hooks.selfIdentity ?? (() => identityOf(pid)))()
   const lockPath = path.join(dir, PACK_LOCK_FILE)
+  if (!HOST_NAME_RE.test(host) || host.length > 253) return { ok: false, code: 'LOCK_ERROR' }
   const content: LockContent = { pid, host, token: randomBytes(16).toString('hex'), createdAt: new Date(now()).toISOString(), startTime: self?.startTime ?? null, bootId: self?.bootId ?? null }
   const text = JSON.stringify(content)
   let existing: { text: string; ino: number } | null = null
