@@ -18,9 +18,8 @@
  * Problem text names a rail, a closed connector label and a count: never a value of the environment, a setting, a credential or a crontab line.
  */
 import { renderCronJobCommand, runtimeSecretPrefix } from '@/lib/crontab-sync'
-import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
+import { INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS, INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
 import type { IntegrationPluginId } from '@/lib/integration-plugin-keys'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { OUTBOUND_CONNECTORS, OUTBOUND_CONNECTOR_LABEL, OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
 import { readOutboundGrantStates } from '@/lib/security/outbound-write-grant'
 import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
@@ -142,7 +141,10 @@ export async function readConnectorSnapshot(env: PreloadEnv): Promise<ConnectorS
       return raw !== undefined && raw.trim() !== '' && raw.trim() !== 'false'
     }
     const state = pluginKeys.buildIntegrationPluginState(enabledOf)
-    const warehouseEnabled = WMS_CONNECTOR_IDS.some((id) => state[id] === true)
+    // Every registered warehouse connector id (the exclusivity group the plugin keys derive from the registry), not one named id.
+    const warehouseIds = INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS.find((group) => group.label === 'wms')?.ids ?? []
+    if (warehouseIds.length === 0) throw new Error('no warehouse connector ids')
+    const warehouseEnabled = warehouseIds.some((id) => state[id] === true)
     const credentialPresent: Record<string, boolean> = {}
     for (const key of [...STOREFRONT_CREDENTIAL_KEYS, ...WAREHOUSE_CREDENTIAL_KEYS, ...ACCOUNTING_CREDENTIAL_KEYS]) {
       const stored = (settings.get(key) ?? '').trim()
