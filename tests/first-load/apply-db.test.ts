@@ -1034,6 +1034,16 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 1, 'a stored key')
           await m.db.setting.update({ where: { key: 'mintsoft_api_key' }, data: { value: '' } })
           assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0, 'an emptied one is nothing')
+          // A plugin switch with a value the application does not understand is read as ENABLED (refuse), not as off.
+          for (const odd of ['yes', '1', 'TRUE', 'enabled']) {
+            await m.db.setting.update({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, data: { value: odd } })
+            await m.db.setting.upsert({ where: { key: 'mintsoft_api_key' }, create: { key: 'mintsoft_api_key', value: 'stored' }, update: { value: 'stored' } })
+            assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 1, `plugin value ${odd}`)
+          }
+          await m.db.setting.update({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, data: { value: 'false' } })
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0, 'exactly false is off')
+          await m.db.setting.update({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, data: { value: 'true' } })
+          await m.db.setting.update({ where: { key: 'mintsoft_api_key' }, data: { value: '' } })
           // Xero: enabled with a stored token.
           await m.db.setting.upsert({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.xero }, create: { key: INTEGRATION_PLUGIN_SETTING_KEYS.xero, value: 'true' }, update: { value: 'true' } })
           assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0)
@@ -1066,7 +1076,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           ['an outbound grant', { env: { WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test' } }, /outbound grants: a write grant for WooCommerce/],
           ['a live-from instant', { env: { XERO_WRITES_LIVE_FROM: '2026-10-30T00:00:00Z' } }, /producer hold: a live-from instant is set for Xero/],
           ['an unreadable enforcement value', { env: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'nope' } }, /producer hold: the enforcement variable is set but cannot be read/],
-          ['an armed writing cron', { crontab: async () => ({ resolved: true, text: '*/5 * * * * curl -sf -K - "$BASE_URL/accounting-sync"' }) }, /crons: 1 active scheduled-job line/],
+          ['an armed writing cron', { crontab: async () => ({ resolved: true, text: '*/5 * * * * curl -sf -K - "$BASE_URL/accounting-sync"' }) }, /crons: 1 active crontab line\(s\) are not proven/],
           ['an unreadable crontab', { crontab: async () => ({ resolved: false }) }, /crons: the crontab of the account running the load could not be read/],
         ]
         for (const [label, over, expected] of arms) {

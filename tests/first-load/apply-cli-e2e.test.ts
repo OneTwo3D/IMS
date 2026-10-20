@@ -366,7 +366,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       const arms: Array<[string, () => Promise<{ exitCode: number | null; stderr: string; stdout: string }>, RegExp, (() => Promise<void>) | null]> = [
         ['a grant in the installation env file', RUN(['--apply', '--rehearsal-record', recordFile], { envFile: withGrant }), /outbound grants: a write grant for Mintsoft is present/, null],
         ['the storefront enabled with credentials', RUN(['--apply', '--rehearsal-record', recordFile]), /connectors: the WooCommerce connector is enabled with store credentials/, null],
-        ['an armed writing cron', RUN(['--apply', '--rehearsal-record', recordFile], { env: { PATH: `${writerCron}:${process.env.PATH}` } }), /crons: 1 active scheduled-job line\(s\) in the crontab could write/, null],
+        ['an armed writing cron', RUN(['--apply', '--rehearsal-record', recordFile], { env: { PATH: `${writerCron}:${process.env.PATH}` } }), /crons: 1 active crontab line\(s\) are not proven/, null],
         ['an unreadable crontab', RUN(['--apply', '--rehearsal-record', recordFile], { env: { PATH: `${brokenCron}:${process.env.PATH}` } }), /crons: the crontab of the account running the load could not be read/, null],
       ]
       precondition(t, 'pre-load arms', arms.length)

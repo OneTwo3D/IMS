@@ -17,10 +17,13 @@
  *
  * Problem text names a rail, a closed connector label and a count: never a value of the environment, a setting, a credential or a crontab line.
  */
+import { renderCronJobCommand, runtimeSecretPrefix } from '@/lib/crontab-sync'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
-import { OUTBOUND_CONNECTORS, OUTBOUND_CONNECTOR_LABEL } from '@/lib/security/outbound-write-hold-constants'
+import type { IntegrationPluginId } from '@/lib/integration-plugin-keys'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { OUTBOUND_CONNECTORS, OUTBOUND_CONNECTOR_LABEL, OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
 import { readOutboundGrantStates } from '@/lib/security/outbound-write-grant'
-import { PRODUCER_CUTOFF_ENV } from '@/lib/security/producer-disposition-constants'
+import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
 import { parseProducerCutoff, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
 import { readProducerEnforcement } from '@/lib/security/producer-seam'
 import type { RailId } from '../constants'
@@ -52,6 +55,11 @@ export function outboundGrantFinding(env: PreloadEnv): PreloadFinding {
     if (state.state === 'granted') problems.push(`outbound grants: a write grant for ${label} is present in the installation environment`)
     else if (state.state === 'unreadable') problems.push(`outbound grants: the grant variable for ${label} is set but cannot be read`)
   }
+  // An unknown shape is refused, not skipped: a variable that looks like a grant, a live-from instant or the enforcement switch but is not spelled exactly as one (another case, a prefix, a
+  // suffix) is not read by the transport today, and is exactly the thing a later release or a wrapper could start reading. Counted, never named.
+  const known = new Set<string>([...Object.values(OUTBOUND_GRANT_ENV), ...Object.values(PRODUCER_CUTOFF_ENV), PRODUCER_HOLD_ENFORCED_ENV])
+  const lookalikes = Object.keys(env).filter((name) => !known.has(name) && /(?:WRITEBACK|WRITE_ALLOWED|WRITES_LIVE_FROM|PRODUCER_HOLD)/i.test(name)).length
+  if (lookalikes > 0) problems.push(`outbound grants: ${lookalikes} environment variable(s) look like an outbound grant, live-from instant or producer-hold switch but are not spelled as one the application reads`)
   return { rail: 'outbound-grants', problems, detail: problems.length === 0 ? `no write grant for ${OUTBOUND_CONNECTORS.length} destination(s)` : '' }
 }
 
@@ -128,7 +136,13 @@ export async function readConnectorSnapshot(env: PreloadEnv): Promise<ConnectorS
     const rows = await db.setting.findMany({ where: { key: { in: keys } }, select: { key: true, value: true } })
     const settings = new Map(rows.map((row) => [row.key, row.value]))
     const pluginKeys = await import('@/lib/integration-plugin-keys')
-    const state = pluginKeys.buildIntegrationPluginState((id) => pluginKeys.parseIntegrationPluginEnabled(settings.get(pluginKeys.INTEGRATION_PLUGIN_SETTING_KEYS[id])))
+    // Only the exact text 'true' enables a plugin in the application; anything else that is not blank or exactly 'false' is a value this rail does not understand, and is read as ENABLED (refuse).
+    const enabledOf = (id: IntegrationPluginId): boolean => {
+      const raw = settings.get(pluginKeys.INTEGRATION_PLUGIN_SETTING_KEYS[id])
+      return raw !== undefined && raw.trim() !== '' && raw.trim() !== 'false'
+    }
+    const state = pluginKeys.buildIntegrationPluginState(enabledOf)
+    const warehouseEnabled = WMS_CONNECTOR_IDS.some((id) => state[id] === true)
     const credentialPresent: Record<string, boolean> = {}
     for (const key of [...STOREFRONT_CREDENTIAL_KEYS, ...WAREHOUSE_CREDENTIAL_KEYS, ...ACCOUNTING_CREDENTIAL_KEYS]) {
       const stored = (settings.get(key) ?? '').trim()
@@ -141,7 +155,7 @@ export async function readConnectorSnapshot(env: PreloadEnv): Promise<ConnectorS
       db.wmsConnection.count({ where: { active: true } }),
       db.externalWmsBinding.count({ where: { active: true } }),
     ])
-    return { pluginEnabled: { woocommerce: state.woocommerce === true, mintsoft: state.mintsoft === true, xero: state.xero === true }, credentialPresent, accountingTokens, activeWarehouseConnections, activeWarehouseBindings }
+    return { pluginEnabled: { woocommerce: state.woocommerce === true, mintsoft: warehouseEnabled, xero: state.xero === true }, credentialPresent, accountingTokens, activeWarehouseConnections, activeWarehouseBindings }
   } catch {
     throw new ObservationError(DATABASE_READ_FAILED)
   }
@@ -151,34 +165,51 @@ export async function readConnectorSnapshot(env: PreloadEnv): Promise<ConnectorS
 // crons
 // ---------------------------------------------------------------------------
 
-/** The scheduled jobs that never write to the database or to a destination (a read-only check, or a file backup). Every other job line refuses. A test keeps each slug registered. */
+/** The scheduled jobs that never write to the database or to a destination (a read-only check, or a file backup). A test keeps each slug registered. */
 export const READ_ONLY_CRON_SLUGS: readonly string[] = ['backup', 'writers-check', 'read-sync-liveness']
 
-/** The two shapes the application's own job lines take: a curl to `$BASE_URL/<slug>` (managed, current and legacy) and a curl to `.../api/cron/<slug>` (a hand-written or older line). */
-const SLUG_AFTER_BASE_URL = /\$\{?BASE_URL\}?\/([A-Za-z0-9][A-Za-z0-9_-]*)/
-const SLUG_AFTER_API_CRON = /\/api\/cron\/([A-Za-z0-9][A-Za-z0-9_-]*)/
-const MANAGED_SIGNATURES = ['-K - "$BASE_URL/', '-H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/', '/api/cron/']
+/**
+ * AN ALLOWLIST, NOT A DENYLIST. A crontab line is harmless to the load only if it is PROVEN to be one of two things:
+ *   - an environment assignment (`NAME=value`), which runs nothing; or
+ *   - a schedule followed by a command that is, character for character, the line the application itself generates for one of the read-only jobs
+ *     (`renderCronJobCommand`, with the runtime-secret prefix or without it, any env-file and log path made of ordinary characters and no quote).
+ * Every other active line (a comment is the only other thing that is not active) is REFUSED, counted and never described: an arbitrary command, two commands on a line, a continued
+ * line, a command with extra arguments, a legacy bearer-on-the-command-line line, an `@reboot` line that is not one of the above, a case variant. The command is matched whole, so
+ * a read-only job followed by anything else is not that job.
+ */
+const SCHEDULE = '(?:@(?:reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)|(?:\\*|(?:\\*/)?[0-9]+(?:[,-][0-9]+)*)(?:[ \\t]+(?:\\*|(?:\\*/)?[0-9]+(?:[,-][0-9]+)*)){4})'
+const PATH_CLASS = "[^'%\\u0000-\\u001f\\u007f]+"
+const ENV_SENTINEL = 'ZZENVPATHZZ'
+const LOG_SENTINEL = 'ZZLOGPATHZZ'
+const escapeRegex = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** One anchored pattern per (read-only slug, secret mode), built from the application's own renderer so that the two cannot drift. */
+export const ALLOWED_JOB_COMMANDS: readonly RegExp[] = READ_ONLY_CRON_SLUGS.flatMap((slug) => [runtimeSecretPrefix(ENV_SENTINEL), ''].map((prefix) => {
+  const command = renderCronJobCommand({ prefix, slug, logPath: LOG_SENTINEL })
+  return new RegExp(`^${escapeRegex(command).replace(escapeRegex(ENV_SENTINEL), PATH_CLASS).replace(escapeRegex(LOG_SENTINEL), PATH_CLASS)}$`)
+}))
+const JOB_LINE = new RegExp(`^(${SCHEDULE})[ \\t]+(\\S[\\s\\S]*)$`)
+const ENV_LINE = /^[A-Za-z_][A-Za-z0-9_]*[ \t]*=/
 
 export interface CrontabJobLines {
-  /** Active job lines whose slug is on the read-only list. */
+  /** Active job lines proven to be one of the read-only jobs. */
   allowed: number
-  /** Active job lines whose slug is not (each is a job that could write). */
-  writers: number
-  /** Active lines that carry the application's job signature but whose slug could not be read: they cannot be shown to be harmless. */
-  unclassified: number
+  /** Environment assignments (they run nothing). */
+  environment: number
+  /** Every other active line: refused. */
+  refused: number
 }
 
-/** Classify the ACTIVE lines of a crontab text. A comment, a blank line and an environment assignment are not jobs. Nothing of a line is returned. */
+/** Classify the ACTIVE lines of a crontab text. Only a line whose first non-blank character is `#`, or a blank one, is inactive. Nothing of a line is returned. */
 export function classifyCrontabText(text: string): CrontabJobLines {
-  const out: CrontabJobLines = { allowed: 0, writers: 0, unclassified: 0 }
+  const out: CrontabJobLines = { allowed: 0, environment: 0, refused: 0 }
   for (const raw of text.split('\n')) {
-    const line = raw.trim()
+    const line = raw.replace(/[ \t\r]+$/, '').replace(/^[ \t]+/, '')
     if (line === '' || line.startsWith('#')) continue
-    if (!MANAGED_SIGNATURES.some((signature) => line.includes(signature)) && !/\$\{?BASE_URL\}?\//.test(line)) continue
-    const slug = (SLUG_AFTER_BASE_URL.exec(line) ?? SLUG_AFTER_API_CRON.exec(line))?.[1]
-    if (slug === undefined) out.unclassified += 1
-    else if (READ_ONLY_CRON_SLUGS.includes(slug)) out.allowed += 1
-    else out.writers += 1
+    if (ENV_LINE.test(line) && !line.endsWith('\\')) { out.environment += 1; continue }
+    const job = JOB_LINE.exec(line)
+    if (job !== null && ALLOWED_JOB_COMMANDS.some((pattern) => pattern.test(job[2]!))) out.allowed += 1
+    else out.refused += 1
   }
   return out
 }
@@ -189,9 +220,8 @@ export function cronFinding(read: CrontabRead): PreloadFinding {
   if (!read.resolved) return { rail: 'crons', problems: ['crons: the crontab of the account running the load could not be read, and an unreadable crontab is not an empty one'], detail: '' }
   const lines = classifyCrontabText(read.text)
   const problems: string[] = []
-  if (lines.writers > 0) problems.push(`crons: ${lines.writers} active scheduled-job line(s) in the crontab could write; remove or comment them before the load`)
-  if (lines.unclassified > 0) problems.push(`crons: ${lines.unclassified} active line(s) in the crontab call the application but name no job this check can classify`)
-  return { rail: 'crons', problems, detail: `${lines.allowed} read-only job line(s), ${lines.writers} writing, ${lines.unclassified} unclassified` }
+  if (lines.refused > 0) problems.push(`crons: ${lines.refused} active crontab line(s) are not proven to be one of the read-only jobs (backup, writers-check, read-sync-liveness) or an environment assignment; remove or comment them before the load`)
+  return { rail: 'crons', problems, detail: `${lines.allowed} read-only job line(s), ${lines.environment} environment line(s), ${lines.refused} refused` }
 }
 
 /**

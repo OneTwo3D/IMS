@@ -12,6 +12,7 @@ import {
   READ_ONLY_CRON_SLUGS, classifyCrontabText, connectorFinding, cronFinding, evaluatePreloadRails, outboundGrantFinding, producerHoldFinding,
   type ConnectorSnapshot, type PreloadReaders,
 } from '../../lib/first-load/apply/db/preload-rails.ts'
+import { renderCronJobCommand, runtimeSecretPrefix } from '../../lib/crontab-sync.ts'
 import { CLEAN_SNAPSHOT } from './apply-preload.ts'
 import { precondition } from './helpers.ts'
 
@@ -44,6 +45,14 @@ test('outbound grants: none is clean; any one, in any destination, refuses; an u
     assert.ok(!found.problems.join(' ').includes('shop.example') && !found.problems.join(' ').includes('POISON') && !found.problems.join(' ').includes(XERO), `${label}: no value in the text`)
   }
   assert.equal(outboundGrantFinding({ WC_WRITEBACK_ALLOWED_ORIGIN: WOO, MINTSOFT_WRITE_ALLOWED: MINTSOFT, XERO_WRITE_ALLOWED_TENANT: XERO }).problems.length, 3)
+  // Unknown shapes are refused, counted and never named: another case, a prefix, a suffix.
+  for (const name of ['wc_writeback_allowed_origin', 'APP_WC_WRITEBACK_ALLOWED_ORIGIN', 'MINTSOFT_WRITE_ALLOWED_2', 'XERO_WRITES_LIVE_FROM_X', 'producer_hold_enforced_destinations', 'OLD_XERO_WRITE_ALLOWED_TENANT']) {
+    const found = outboundGrantFinding({ [name]: 'anything' })
+    assert.equal(found.problems.length, 1, name)
+    assert.match(found.problems[0]!, /1 environment variable\(s\) look like an outbound grant/)
+    assert.ok(!found.problems[0]!.includes(name), 'the variable name is not printed')
+  }
+  assert.deepEqual(outboundGrantFinding({ UNRELATED_SETTING: 'x', WC_URL: 'y' }).problems, [])
 })
 
 test('producer hold: the state is reported; a live-from instant, a disagreement or an unreadable value refuses [mutation: drop the cutoff check]', (t) => {
@@ -104,27 +113,51 @@ test('connectors: enabled with a credential that could write refuses; enabled wi
   for (const [label, snap] of quiet) assert.deepEqual(connectorFinding(snap).problems, [], label)
 })
 
-test('crons: only active lines that call the application count; a read-only job is allowed; an unclassifiable line or an unreadable crontab refuses [mutation: count comments / allow every slug]', (t) => {
-  const managed = (slug: string) => `*/5 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/x/.env' | cut -d= -f2- | tr -d '"'); case "$CRON_SECRET" in '') echo no ;; *) echo "header = \\"Authorization: Bearer $CRON_SECRET\\"" | curl -sf -o /dev/null -K - "$BASE_URL/${slug}" ;; esac >> '/l' 2>&1`
-  const legacy = (slug: string) => `0 * * * *  curl -sf -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${slug}" >> /l 2>&1`
-  const direct = (slug: string) => `0 * * * * curl -s https://ims.example.test/api/cron/${slug}`
-  assert.deepEqual(classifyCrontabText(''), { allowed: 0, writers: 0, unclassified: 0 })
-  assert.deepEqual(classifyCrontabText(['# --- OTI CRON START ---', '# Managed by One Two Inventory', 'BASE_URL="http://x/api/cron"', '# accounting-sync', `# ${managed('accounting-sync')}`, '', '# --- OTI CRON END ---', 'MAILTO=ops@example.test', '0 3 * * * /usr/local/bin/other-job'].join('\n')), { allowed: 0, writers: 0, unclassified: 0 })
-  const cases: Array<[string, string, { allowed: number; writers: number; unclassified: number }]> = [
-    ['a managed accounting job', managed('accounting-sync'), { allowed: 0, writers: 1, unclassified: 0 }],
-    ['a legacy bearer-on-the-command-line job', legacy('mintsoft-stock-sync'), { allowed: 0, writers: 1, unclassified: 0 }],
-    ['a hand-written call to /api/cron/', direct('wc-reconcile'), { allowed: 0, writers: 1, unclassified: 0 }],
-    ['a read-only job (backup)', managed('backup'), { allowed: 1, writers: 0, unclassified: 0 }],
-    ['a read-only job (writers-check, legacy)', legacy('writers-check'), { allowed: 1, writers: 0, unclassified: 0 }],
-    ['a managed job whose slug cannot be read', 'case x in *) curl -sf -K - "$BASE_URL/" ;; esac', { allowed: 0, writers: 0, unclassified: 1 }],
-    ['two writers and a read-only one', [managed('invariant-check'), legacy('accounting-sync'), direct('backup')].join('\n'), { allowed: 1, writers: 2, unclassified: 0 }],
+test('crons: an ALLOWLIST. Only comments, environment lines and the exact read-only job commands pass; everything else is refused [mutation: allow every slug / ignore lines without the application URL / count comments]', (t) => {
+  const log = '/var/log/one-two-inventory/cron.log'
+  const runtime = (slug: string) => `${runtimeSecretPrefix('/opt/app/.env')}${renderCronJobCommand({ prefix: '', slug, logPath: log })}`
+  const literal = (slug: string) => renderCronJobCommand({ prefix: '', slug, logPath: log })
+  const job = (command: string, schedule = '*/5 * * * *') => `${schedule}  ${command}`
+  const none = { allowed: 0, environment: 0, refused: 0 }
+  assert.deepEqual(classifyCrontabText(''), none)
+  const quiet = ['# --- OTI CRON START ---', '# Managed by One Two Inventory', '   # indented comment', '\t# tab comment', '', '   ', 'MAILTO=ops@example.test', 'PATH=/usr/bin:/bin', 'BASE_URL="http://x/api/cron"', 'CRON_TZ = Europe/London', `# ${job(literal('accounting-sync'))}`, '# --- OTI CRON END ---'].join('\n')
+  assert.deepEqual(classifyCrontabText(quiet), { allowed: 0, environment: 4, refused: 0 })
+  const cases: Array<[string, string, { allowed: number; environment: number; refused: number }]> = [
+    ['managed read-only job, runtime secret', job(runtime('backup')), { ...none, allowed: 1 }],
+    ['managed read-only job, literal secret', job(literal('writers-check')), { ...none, allowed: 1 }],
+    ['read-only job on @daily and @reboot', [job(literal('read-sync-liveness'), '@daily'), job(literal('backup'), '@reboot')].join('\n'), { ...none, allowed: 2 }],
+    ['tabs between schedule and command and trailing blanks', `*/5\t*\t*\t*\t*\t${literal('backup')} \t`, { ...none, allowed: 1 }],
+    ['a managed WRITING job', job(runtime('accounting-sync')), { ...none, refused: 1 }],
+    ['an arbitrary command with no application URL', '* * * * * /usr/local/bin/write-to-xero', { ...none, refused: 1 }],
+    ['an arbitrary command on @reboot', '@reboot /usr/local/bin/anything', { ...none, refused: 1 }],
+    ['a read-only job followed by a second command', job(`${literal('backup')}; /usr/local/bin/write-to-xero`), { ...none, refused: 1 }],
+    ['a read-only job then a writing job on one line', job(`${literal('backup')} && ${literal('accounting-sync')}`), { ...none, refused: 1 }],
+    ['a read-only job with a trailing pipe or redirect', job(`${literal('backup')} | sh`), { ...none, refused: 1 }],
+    ['a read-only job with a command substitution appended', job(`${literal('backup')} $(id)`), { ...none, refused: 1 }],
+    ['a read-only job with a backtick appended', job(`${literal('backup')} \`id\``), { ...none, refused: 1 }],
+    ['a read-only job inside a larger shell command', job(`/bin/sh -c '${literal('backup')}'`), { ...none, refused: 1 }],
+    ['a legacy bearer-on-the-command-line job', '0 * * * *  curl -sf -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/backup" >> /l 2>&1', { ...none, refused: 1 }],
+    ['a hand-written call to /api/cron/backup', '0 * * * * curl -s https://ims.example.test/api/cron/backup', { ...none, refused: 1 }],
+    ['a job with a log path that carries a quote', job(renderCronJobCommand({ prefix: '', slug: 'backup', logPath: "/l' ; id ; '" })), { ...none, refused: 1 }],
+    ['a case variant of a read-only slug', job(literal('Backup')), { ...none, refused: 1 }],
+    ['an upper-case @DAILY schedule', `@DAILY ${literal('backup')}`, { ...none, refused: 1 }],
+    ['a schedule with a name instead of numbers', `0 3 * jan mon ${literal('backup')}`, { ...none, refused: 1 }],
+    ['a continued line (trailing backslash) and its continuation', '0 3 * * * /usr/local/bin/a \\\n  /usr/local/bin/b', { ...none, refused: 2 }],
+    ['an environment line that ends in a backslash', 'FOO=bar \\', { ...none, refused: 1 }],
+    ['a line that is only a schedule', '* * * * *', { ...none, refused: 1 }],
+    ['text that starts like a comment only after a command', '0 3 * * * /bin/true # backup', { ...none, refused: 1 }],
+    ['a commented-out job is ignored only when the line really starts with #', `#${job('/bin/write')}\n ${job('/bin/write')}`, { ...none, refused: 1 }],
+    ['CRLF line endings on a read-only job', `${job(literal('backup'))}\r\n`, { ...none, allowed: 1 }],
+    ['a carriage return inside the command', job(`${literal('backup')}\r/bin/write`), { ...none, refused: 1 }],
   ]
   precondition(t, 'cron arms', cases.length)
   for (const [label, text, expected] of cases) assert.deepEqual(classifyCrontabText(text), expected, label)
   assert.deepEqual(cronFinding({ resolved: true, text: '' }).problems, [])
-  assert.deepEqual(cronFinding({ resolved: true, text: managed('backup') }).problems, [])
-  assert.match(cronFinding({ resolved: true, text: managed('accounting-sync') }).problems.join(' '), /1 active scheduled-job line\(s\) in the crontab could write/)
-  assert.match(cronFinding({ resolved: true, text: 'case x in *) curl -K - "$BASE_URL/" ;; esac' }).problems.join(' '), /name no job this check can classify/)
+  assert.deepEqual(cronFinding({ resolved: true, text: job(runtime('backup')) }).problems, [])
+  const refused = cronFinding({ resolved: true, text: ['* * * * * /usr/local/bin/write-to-xero', job(runtime('accounting-sync'))].join('\n') })
+  assert.equal(refused.problems.length, 1)
+  assert.match(refused.problems[0]!, /2 active crontab line\(s\) are not proven/)
+  assert.ok(!refused.problems[0]!.includes('write-to-xero') && !refused.problems[0]!.includes('accounting-sync'), 'no line text in the message')
   const unreadable = cronFinding({ resolved: false })
   assert.equal(unreadable.problems.length, 1)
   assert.match(unreadable.problems[0]!, /an unreadable crontab is not an empty one/)
@@ -138,7 +171,8 @@ test('every read-only cron slug is a registered job, and every other registered 
   for (const slug of READ_ONLY_CRON_SLUGS) assert.ok(slugs.includes(slug), `${slug} is registered`)
   const writers = slugs.filter((slug) => !READ_ONLY_CRON_SLUGS.includes(slug))
   precondition(t, 'jobs treated as writers', writers.length)
-  for (const slug of writers) assert.equal(classifyCrontabText(`* * * * * curl -sf -K - "$BASE_URL/${slug}"`).writers, 1, slug)
+  for (const slug of writers) assert.equal(classifyCrontabText(`* * * * *  ${renderCronJobCommand({ prefix: '', slug, logPath: '/l' })}`).refused, 1, slug)
+  for (const slug of READ_ONLY_CRON_SLUGS) assert.equal(classifyCrontabText(`* * * * *  ${renderCronJobCommand({ prefix: '', slug, logPath: '/l' })}`).allowed, 1, slug)
 })
 
 test('evaluatePreloadRails: a reader that throws is not "fine" (connectors propagate the refusal; the crontab becomes unresolved)', async () => {
