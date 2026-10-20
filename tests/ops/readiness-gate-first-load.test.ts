@@ -7,7 +7,10 @@ import test, { after } from 'node:test'
 import { APPLY_REPORT_MAX_AGE_DAYS, CHECK_CATALOGUE, READINESS_GATE_DOC_BLOCKS, checkDefinition } from '../../lib/ops/readiness-gate-constants.ts'
 import { assessApplyReport, applyReportProblems, decideVerdict, type ApplyEvidence } from '../../lib/ops/readiness-gate.ts'
 import { readApplyReports } from '../../lib/ops/readiness-gate-collect.ts'
-import { PRECONDITION_IDS } from '../../lib/first-load/apply/constants.ts'
+import { APPLY_EXIT_CODES, APPLY_REPORT_FORMAT_VERSION, PRECONDITION_IDS, PRELOAD_RAIL_IDS, RUN_STATUSES } from '../../lib/first-load/apply/constants.ts'
+import {
+  APPLY_ALWAYS_PASS_PRECONDITIONS, APPLY_PRECONDITION_IDS, APPLY_REPORT_CONTRACT_EXIT_OK, APPLY_REPORT_CONTRACT_FORMAT_VERSION, APPLY_RUN_STATUSES, APPLY_RUN_STATUS_VERIFIED, APPLY_VERIFICATION_IDS,
+} from '../../lib/ops/first-load-apply-contract.ts'
 import { VERIFICATION_IDS } from '../../lib/first-load/apply/verify-core.ts'
 import { APPLY_RUN, APPLY_SYSTEM_ID, DAY, NOW, NO_ACCEPTANCES, allPassing, applyEvidence, greenApplyReport } from '../helpers/readiness-gate-fixtures.ts'
 import { precondition } from '../first-load/helpers.ts'
@@ -19,6 +22,23 @@ import { precondition } from '../first-load/helpers.ts'
 
 const POISON = 'POISON-FROM-AN-UNVERIFIED-FILE'
 const problemsOf = (over: Record<string, unknown>) => applyReportProblems({ parsed: greenApplyReport(over), markdownDigestOk: true }, { systemId: APPLY_SYSTEM_ID }, NOW)
+
+test('the gate\'s own copy of the report contract equals the runner\'s constants, both ways [mutation: change either side]', (t) => {
+  // The gate may not import from lib/first-load/apply (the system-import census), so it carries the contract as data; this is the test that keeps the two one thing.
+  assert.equal(APPLY_REPORT_CONTRACT_FORMAT_VERSION, APPLY_REPORT_FORMAT_VERSION)
+  assert.deepEqual(APPLY_REPORT_CONTRACT_EXIT_OK, { name: 'OK', code: APPLY_EXIT_CODES.OK })
+  assert.deepEqual([...APPLY_RUN_STATUSES], [...RUN_STATUSES])
+  assert.equal(APPLY_RUN_STATUS_VERIFIED, 'VERIFIED')
+  assert.ok(RUN_STATUSES.includes(APPLY_RUN_STATUS_VERIFIED))
+  assert.deepEqual([...APPLY_VERIFICATION_IDS], [...VERIFICATION_IDS])
+  assert.deepEqual([...APPLY_PRECONDITION_IDS], [...PRECONDITION_IDS])
+  assert.ok(APPLY_ALWAYS_PASS_PRECONDITIONS.every((id) => (APPLY_PRECONDITION_IDS as readonly string[]).includes(id)))
+  for (const rail of PRELOAD_RAIL_IDS) assert.ok((APPLY_ALWAYS_PASS_PRECONDITIONS as readonly string[]).includes(`rail:${rail}`), `${rail} is evaluated in every apply, so it must read pass`)
+  precondition(t, 'ids compared', APPLY_PRECONDITION_IDS.length + APPLY_VERIFICATION_IDS.length + APPLY_RUN_STATUSES.length)
+  // The gate\'s own source names nothing from the runner\'s tree.
+  const source = readFileSync(path.join(process.cwd(), 'lib/ops/readiness-gate.ts'), 'utf8')
+  assert.doesNotMatch(source, /from '@\/lib\/first-load\/apply/)
+})
 
 test('control: the green report is intact, and the evidence around it passes', (t) => {
   assert.deepEqual(problemsOf({}), [])

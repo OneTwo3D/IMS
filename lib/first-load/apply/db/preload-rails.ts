@@ -17,10 +17,6 @@
  *
  * Problem text names a rail, a closed connector label and a count: never a value of the environment, a setting, a credential or a crontab line.
  */
-import { execFile } from 'node:child_process'
-import os from 'node:os'
-
-import { isNoCrontabDiagnostic } from '@/lib/crontab-sync'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
 import { OUTBOUND_CONNECTORS, OUTBOUND_CONNECTOR_LABEL } from '@/lib/security/outbound-write-hold-constants'
 import { readOutboundGrantStates } from '@/lib/security/outbound-write-grant'
@@ -198,18 +194,15 @@ export function cronFinding(read: CrontabRead): PreloadFinding {
   return { rail: 'crons', problems, detail: `${lines.allowed} read-only job line(s), ${lines.writers} writing, ${lines.unclassified} unclassified` }
 }
 
-/** `crontab -l` of the account running this process, failing closed: only the single benign "no crontab for <user>" answer is an empty crontab. */
-export function readOwnCrontab(): Promise<CrontabRead> {
-  const user = (() => { try { return os.userInfo().username } catch { return '' } })()
-  return new Promise<CrontabRead>((resolve) => {
-    execFile('crontab', ['-l'], { timeout: 5000, encoding: 'utf8' }, (err, stdout, stderr) => {
-      const out = typeof stdout === 'string' ? stdout : String(stdout ?? '')
-      const errText = typeof stderr === 'string' ? stderr : String(stderr ?? '')
-      if (!err) return resolve({ resolved: true, text: out })
-      if (out === '' && user !== '' && isNoCrontabDiagnostic(user, errText)) return resolve({ resolved: true, text: '' })
-      resolve({ resolved: false })
-    })
-  })
+/**
+ * The crontab of the account running this process, read by the application's own reader (`readOwnCrontabResult`, lib/crontab-reconcile.ts), which fails closed: only the single benign
+ * answer "no crontab for <user>" is an empty crontab, and every other failure is unresolved. It is the one `crontab -l` caller in the application (a census test keeps it so), so this rail
+ * does not carry a second copy of the rule. The reader's reason text (the child's stderr) is dropped here: it is not ours to print.
+ */
+export async function readCrontabViaApplicationReader(): Promise<CrontabRead> {
+  const { readOwnCrontabResult } = await import('@/lib/crontab-reconcile')
+  const read = await readOwnCrontabResult()
+  return read.resolved ? { resolved: true, text: read.text } : { resolved: false }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +216,7 @@ export interface PreloadReaders {
   crontab: () => Promise<CrontabRead>
 }
 
-export const defaultPreloadReaders = (env: PreloadEnv): PreloadReaders => ({ env, connectors: readConnectorSnapshot, crontab: readOwnCrontab })
+export const defaultPreloadReaders = (env: PreloadEnv): PreloadReaders => ({ env, connectors: readConnectorSnapshot, crontab: readCrontabViaApplicationReader })
 
 export async function evaluatePreloadRails(readers: PreloadReaders): Promise<PreloadFinding[]> {
   const findings: PreloadFinding[] = [outboundGrantFinding(readers.env), producerHoldFinding(readers.env)]

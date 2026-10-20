@@ -42,8 +42,15 @@ import {
 import { BUILD_IDENTITY_TEXT, compareBuildIdentity, type BuildIdentity } from '@/lib/ops/build-identity'
 import { STEP_CATALOGUE, teardownIncomplete, type RehearsalReport } from '@/lib/ops/first-install-rehearsal'
 import { OUTBOUND_CONNECTORS } from '@/lib/security/outbound-write-hold-constants'
-import { APPLY_EXIT_CODES, APPLY_REPORT_FORMAT_VERSION, PRECONDITION_IDS, RUN_STATUSES } from '@/lib/first-load/apply/constants'
-import { VERIFICATION_IDS } from '@/lib/first-load/apply/verify-core'
+import {
+  APPLY_ALWAYS_PASS_PRECONDITIONS,
+  APPLY_PRECONDITION_IDS,
+  APPLY_REPORT_CONTRACT_EXIT_OK,
+  APPLY_REPORT_CONTRACT_FORMAT_VERSION,
+  APPLY_RUN_STATUSES,
+  APPLY_RUN_STATUS_VERIFIED,
+  APPLY_VERIFICATION_IDS,
+} from '@/lib/ops/first-load-apply-contract'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -526,9 +533,6 @@ export type ApplyEvidence = {
   unparseable: number
 }
 
-/** The rails that always run in an apply: their result must be `pass`, never `not-applicable`. */
-const ALWAYS_PASS_PRECONDITIONS: readonly string[] = ['rail:quiesce', 'rail:data-classes', 'rail:base-currency', 'rail:outbound-grants', 'rail:producer-hold', 'rail:connectors', 'rail:crons']
-
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0
 
@@ -542,10 +546,10 @@ export function applyReportProblems(file: ApplyReportFile, evidence: Pick<ApplyE
   if (!isRecord(report)) return ['not-an-object']
   if (!file.markdownDigestOk) codes.push('markdown-digest')
   if (report.tool !== 'first-load-apply') codes.push('tool')
-  if (report.formatVersion !== APPLY_REPORT_FORMAT_VERSION) codes.push('format-version')
+  if (report.formatVersion !== APPLY_REPORT_CONTRACT_FORMAT_VERSION) codes.push('format-version')
   if (report.mode !== 'apply') codes.push('mode')
   const exit = report.exit
-  if (!isRecord(exit) || exit.name !== 'OK' || exit.code !== APPLY_EXIT_CODES.OK) codes.push('exit-not-ok')
+  if (!isRecord(exit) || exit.name !== APPLY_REPORT_CONTRACT_EXIT_OK.name || exit.code !== APPLY_REPORT_CONTRACT_EXIT_OK.code) codes.push('exit-not-ok')
   if (!Array.isArray(report.problems) || report.problems.length !== 0) codes.push('problems-recorded')
   const steps = report.steps
   if (!Array.isArray(steps) || steps.length === 0) codes.push('steps')
@@ -555,16 +559,16 @@ export function applyReportProblems(file: ApplyReportFile, evidence: Pick<ApplyE
     && (step.status === 'DONE' || (step.status === 'PENDING' && step.created === 0 && step.updated === 0 && step.skippedExisting === step.emitted)))) codes.push('steps')
   if (report.accountingBalanced !== true) codes.push('accounting')
   const verification = report.verification
-  if (!Array.isArray(verification) || verification.length !== VERIFICATION_IDS.length
-    || !VERIFICATION_IDS.every((id) => verification.filter((item) => isRecord(item) && item.id === id && item.result === 'pass').length === 1)) codes.push('verification')
+  if (!Array.isArray(verification) || verification.length !== APPLY_VERIFICATION_IDS.length
+    || !APPLY_VERIFICATION_IDS.every((id) => verification.filter((item) => isRecord(item) && item.id === id && item.result === 'pass').length === 1)) codes.push('verification')
   const restore = report.restorePoint
   if (!isRecord(restore) || typeof restore.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(restore.sha256) || !isCount(restore.bytes) || restore.bytes === 0 || restore.listed !== true) codes.push('restore-point')
   const preconditions = report.preconditions
-  if (!Array.isArray(preconditions) || preconditions.length !== PRECONDITION_IDS.length
-    || !PRECONDITION_IDS.every((id, index) => isRecord(preconditions[index]) && preconditions[index].id === id)) codes.push('preconditions')
+  if (!Array.isArray(preconditions) || preconditions.length !== APPLY_PRECONDITION_IDS.length
+    || !APPLY_PRECONDITION_IDS.every((id, index) => isRecord(preconditions[index]) && preconditions[index].id === id)) codes.push('preconditions')
   else {
     const results = new Map(preconditions.map((p) => [(p as Record<string, unknown>).id, (p as Record<string, unknown>).result]))
-    if (![...results.values()].every((r) => r === 'pass' || r === 'not-applicable') || !ALWAYS_PASS_PRECONDITIONS.every((id) => results.get(id) === 'pass')) codes.push('preconditions')
+    if (![...results.values()].every((r) => r === 'pass' || r === 'not-applicable') || !APPLY_ALWAYS_PASS_PRECONDITIONS.every((id) => results.get(id) === 'pass')) codes.push('preconditions')
   }
   const target = report.target
   if (!isRecord(target) || typeof target.systemId !== 'string' || target.systemId === '' || target.systemId !== evidence.systemId) codes.push('system-id')
@@ -587,8 +591,8 @@ export function assessApplyReport(evidence: ApplyEvidence, now: Date): CheckResu
   if (evidence.runs.length === 0) return fail(['this database holds no first-load run record: no first load was applied here'])
   if (evidence.runs.length > 1) return fail([`this database holds ${evidence.runs.length} first-load run records; exactly one is expected`])
   const run = evidence.runs[0]!
-  const status = (RUN_STATUSES as readonly string[]).includes(run.status) ? run.status : 'an unrecognised status'
-  if (run.status !== 'VERIFIED') return fail([`the first-load run record is ${status}, not VERIFIED`], { runStatus: status })
+  const status = (APPLY_RUN_STATUSES as readonly string[]).includes(run.status) ? run.status : 'an unrecognised status'
+  if (run.status !== APPLY_RUN_STATUS_VERIFIED) return fail([`the first-load run record is ${status}, not VERIFIED`], { runStatus: status })
   const named = evidence.reports.filter((file) => isRecord(file.parsed) && file.parsed.runId === run.runId && file.parsed.manifestDigest === run.manifestDigest)
   if (named.length === 0) return fail([`no published apply report names this database's run and load digest (${evidence.reports.length} report file(s) read, ${evidence.unparseable} unparseable)`], { reportsRead: evidence.reports.length })
   const judged = named.map((file) => applyReportProblems(file, evidence, now))
