@@ -1556,7 +1556,7 @@ The outbound check reads the grant variables (`WC_WRITEBACK_ALLOWED_ORIGIN`, `MI
 
 The read-sync check reads `npm run --silent read-sync:status -- --json` and requires it to declare `schemaVersion` 1 and to be internally consistent (the report time, each entry's age against its last success and the report time, the future-timestamp flag, and the counts against the entries). That is the output of the WP8 producer at commit e6eb79b2 (the branch of the read-sync liveness work, not yet merged), which this reading was matched against by running its report assembly and feeding the result to the gate's parser; the contract is unproven until that branch merges, and a change to its JSON must change the gate with it. The scheduler object must be present with `examined` true, `unreadable` and `blockProblem` exactly null, and `unscheduled` and `disabled` empty lists. Every field the gate relies on must be present with its type: a producer that omits or renames one makes the output unreadable (a NO-GO), never fresh by default. It is optional only while the tree has no `read-sync:status` script. Once the script exists it is required in full: all six streams must be reported, each fresh with a valid last-success time that is not in the future and within the age limit the status reports.
 
-The reconciliation pack (R1-R15, see the pack definition for each item) is a set of slots. On this tree R3 and R4 are read from the invariant report the gate already holds (the invariant codes `stock_cost_layer_quantity_mismatch` and `stock_reserved_source_mismatch`) and R15 is the invariant check itself. Every other item has no runner yet: the report lists it as NOT YET AVAILABLE, with what exists on the tree to build it from, and it was not checked. That does not block P0 or P1 and does block P2. A pack item that is available and fails is reported at P0 and P1 and blocks at P2.
+The reconciliation pack (R1-R15, see the pack definition for each item) is a set of slots. On this tree R3 and R4 are read from the invariant report the gate already holds (the invariant codes `stock_cost_layer_quantity_mismatch` and `stock_reserved_source_mismatch`) and R15 is the invariant check itself. Every other item has no runner yet: the report lists it as NOT YET AVAILABLE, with what exists on the tree to build it from, and it was not checked. That does not block P0 or P1 and does block P2. A pack item that is available and fails is reported at P0 and P1 and blocks at P2. The pack's own comparators, report format, hash chain and exit codes are described under "Reconciliation pack" below; that code does not yet feed the gate, so nothing here changes.
 
 The reconciliation completeness check is the same code the rollout-readiness endpoint uses. It passes only when a reconciliation run exists, the run history shows no truncation that a later complete run over the same period has not covered, no run record is unreadable, and the check could read the history at all. A newest run that predates completeness recording is reported as a warning (its completeness is unknown, not shown to be incomplete) and needs a written acceptance; a partial run, a missing run, or an unreadable history is a failure. For an unresolved truncation the way to clear it is a later accounting reconciliation run, recorded as complete for that check, whose period contains the truncated one (several later runs together can cover it); for a missing or partial run it is a new run. The gate does not start a reconciliation.
 
@@ -1605,6 +1605,135 @@ A written acceptance is a person's recorded decision that a warning does not sto
 
 The same table is printed by `npm run readiness:gate -- --help`.
 
+## Reconciliation pack
+
+<!-- reconciliation-pack:overview -->
+`npm run reconcile:pack` is the reconciliation pack: fifteen items (R1 to R15), each a claim that IMS agrees with a vendor or with its own ledger. It is not a second readiness gate and renders no overall verdict; the gate reads the newest report. This build contains the pack's pure comparators, the report writer and the report reader; the item runners and the command itself arrive in later changes, and until they do every item the gate asks about is "not available". The pack makes no vendor call of any kind in this build.
+
+A run publishes `<report-dir>/<run id>/evidence.jsonl`, then `reconciliation-pack.md`, then `reconciliation-pack.json` last, each created exclusively and never through a symlink, fsynced and renamed into place under an exclusive 0700 directory. The JSON is the commit record: it names the Markdown by sha256 (`companionMarkdownSha256`) and the evidence by sha256 and line count, carries a `sequence` and the sha256 of the previous report's JSON (`previousReportSha256`), and counts that the reader recomputes from the evidence. Problem text is closed reason codes and counts only; identities appear only as sanitised tokens (a cuid, a numeric vendor id, a validated SKU or `sku#` and eight hex digits, a warehouse code).
+<!-- /reconciliation-pack:overview -->
+### Outcomes
+
+<!-- reconciliation-pack:outcomes -->
+Each item ends in exactly one outcome.
+
+| Outcome | Meaning |
+|---|---|
+| pass | the claim was compared on a complete, stable basis and held; nothing differs, nothing is unsettled |
+| fail | at least one identity is on one side only, or differs beyond the tolerance, and the difference has persisted (or needs no settling) |
+| inconclusive | the claim could not be proven either way (unreadable, incomplete, stale or still settling); never a pass, and the gate reads it as unreadable |
+| not-applicable | the claim does not apply in this phase; the gate reads it as not available |
+<!-- /reconciliation-pack:outcomes -->
+### Reason codes
+
+<!-- reconciliation-pack:reasons -->
+Every reason a report can give is one of these codes; no other text describes a problem.
+
+| Reason code | Meaning |
+|---|---|
+| DIFFERENCES | one or more identities are on one side only or differ beyond the tolerance |
+| UNSETTLED_PENDING | a difference was seen but has not yet persisted across two later successful runs of its stream |
+| STALE_BASIS | a stream the item depends on is stale, off, or reported no usable last-success stamp |
+| BASIS_MOVED | the stream stamp changed between the start and the end of the read, so the read is not one consistent basis |
+| READ_INCOMPLETE | a side of the comparison was not read completely |
+| EMPTY_UNPROVEN | both sides were empty and nothing positively proves that empty is the true answer |
+| DUPLICATE_KEY | two rows on one side carry the same identity; they are never summed or picked between |
+| BAD_VALUE | a row carries a value that is not a finite decimal number |
+| VALUE_SHAPE_MISMATCH | one side carries values and the other does not |
+| CURRENCY_UNKNOWN | the currency of a money comparison is missing or not a known code |
+| SOURCE_UNREADABLE | a source (database, file or vendor) could not be read or was not trusted |
+| CAP_EXCEEDED | a read hit its cap, so the population is not proven complete; capped scans never pass |
+| NO_POPULATION_RECORD | the recorded population the comparison is bounded by is missing or unreadable |
+| NO_RUNNER | no runner exists on this build for the item |
+| PHASE_NOT_APPLICABLE | the item does not apply in the phase asked about |
+| INTERNAL_ERROR | the item runner failed unexpectedly |
+<!-- /reconciliation-pack:reasons -->
+### Refusal codes
+
+<!-- reconciliation-pack:refusals -->
+A run is refused, and the trend reader refuses a directory, with exactly one of these codes.
+
+| Refusal code | Meaning |
+|---|---|
+| DIR_UNTRUSTED | the report directory or an ancestor could be modified by another account, or is not a real directory |
+| DIR_UNREADABLE | the report directory could not be listed |
+| TOO_MANY | more report directories than the reader will walk |
+| PAIR_INVALID | a report pair failed verification (untrusted, unreadable, malformed, or its digests or derived values disagree) |
+| GAP | a sequence number is missing from the chain |
+| FORK | two reports claim the same sequence or the same predecessor |
+| LINK_BROKEN | a report's previousReportSha256 is not the digest of the report before it |
+| SYSTEM_MISMATCH | the chain mixes reports of different system identifiers |
+| LOCK_HELD | another run holds the run lock |
+| LOCK_UNREADABLE | the run lock exists but cannot be read or understood, so it was not taken |
+| LOCK_STALE_CONTENDED | a stale lock is being reclaimed by another run, or a reclaim guard was left behind |
+| LOCK_ERROR | the run lock could not be created |
+| LOCK_LOST | the run lock was no longer this run's at the moment of commit, so nothing was published |
+| WRITE_FAILED | a report file could not be written or renamed |
+<!-- /reconciliation-pack:refusals -->
+### Items
+
+<!-- reconciliation-pack:items -->
+The catalogue. Tolerances are chosen defaults (owner decisions D1 and D2); an exact quantity comparison allows 0.0001.
+
+| Item | Claim | Exactness | Tolerance | Cadence | Phases | Dependent streams | Population |
+|---|---|---|---|---|---|---|---|
+| R1 | IMS stock_levels equal Mintsoft on-hand per (SKU, bound warehouse) | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | daily | P0 not-applicable, P1 applicable, P2 applicable | mintsoft-stock-sync | the SKUs and warehouses IMS has bound to Mintsoft, while Mintsoft alignment is unconfirmed |
+| R2 | IMS equals Qoblex StockOnHand per non-3PL location | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 listed-only, P2 applicable | none | the non-3PL locations named in the Qoblex export manifest |
+| R3 | StockLevel.quantity equals the sum of CostLayer.remainingQty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | every stock level the invariant report examined |
+| R4 | StockLevel.reservedQty equals the sum of OrderAllocation.qty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | every stock level the invariant report examined |
+| R5 | inventory valuation per warehouse and company equals Qoblex | tolerance | composite-max-abs-or-relative: max(GBP 1, 0.0005 of the larger total) (owner decision D2 and unverified formula U14) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | the warehouses and companies named in the Qoblex export manifest |
+| R6 | the IMS inventory subledger as of the cycle date equals Xero Inventory plus Allocated Inventory | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | the accounts configured for inventory and allocated inventory |
+| R7 | open purchase orders equal Qoblex Incoming (set exact, value exact in GBP, GBP 1 across FX) | set-exact-value-tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | the open purchase orders in the Qoblex export manifest |
+| R8 | outstanding quantity of part-received purchase-order lines equals Qoblex Incoming | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | the open purchase-order lines in the Qoblex export manifest |
+| R9 | open sales orders equal WooCommerce by order id (set exact, value within one minor unit of the order currency) | set-exact-value-tolerance | order-currency-minor-unit: 1 minor unit (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | woocommerce-order-sweep | the order statuses enumerated one by one, walked twice |
+| R10 | Xero control accounts (Inventory, Allocated, Transit) agree with IMS, and no IMS-originated posting reached COGS or Unearned Revenue | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | the configured control accounts; postings since the P0 start |
+| R11 | Stock in Transit equals the open-purchase-order transit schedule, and the transit account differs from the allocated account | tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | xero-balance-snapshots | the open purchase orders with goods in transit |
+| R12 | VAT per (country, reporting category, period) agrees across IMS, Xero and WooCommerce | set-exact-value-tolerance | absolute: 0.05 (owner decision D1) | monthly | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates, woocommerce-order-sweep | the closed reporting periods inside the budgeted window |
+| R13 | every WooCommerce and Xero tax rate is mapped | presence | none: - (a count of identities, not a measure) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates | the full tax-rate lists of both systems |
+| R14 | every SKU is present in Qoblex, WooCommerce, Mintsoft and IMS, except the written exclusions | presence | none: - (a count of identities, not a measure) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | the union of the four systems minus unexpired written exclusions |
+| R15 | the invariant report shows zero critical findings and every warning is accepted in writing | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | the whole invariant report |
+<!-- /reconciliation-pack:items -->
+### Settling a difference
+
+<!-- reconciliation-pack:settling -->
+A difference is not a failure the first time it is seen: a vendor can lag. A keyed difference (an identity on one side only, or a value beyond the tolerance) is carried as unsettled with the last-success stamp of the stream it was read under. It becomes a failure only when it is still there after 2 LATER successful runs of that stream, observed as 2 further DISTINCT last-success values. The stamps are compared for equality only, never for order: a repeated stamp is the same run and makes no progress. A difference that disappears is dropped. While anything is unsettled the item is inconclusive, never a pass. The stream stamp is also read at the start and end of an item's read; if it differs the read is BASIS_MOVED. The same item's result is also never a pass when the stream is stale or off.
+<!-- /reconciliation-pack:settling -->
+### The report chain and the run lock
+
+<!-- reconciliation-pack:chain -->
+Reports are ordered by `sequence` (1, 2, 3, ...) and linked by `previousReportSha256` (null for sequence 1), never by timestamp. A run takes the run lock (`.run.lock` in the report directory, created exclusively with its pid, host and a random token) before it reads the chain and holds it until the report is committed; the lock is checked again immediately before the JSON is renamed into place. A lock held by a live process, or by another host, is never taken: the run is refused. A lock of a process on this host that no longer exists, or older than 6 hours, is reclaimed through a second exclusive file so two reclaimers cannot both win.
+
+The trend reader verifies every pair (trusted files only, sha256 of the Markdown and the evidence, derived counts, derived outcome and exit code), then the chain: a missing sequence number is a gap and is refused, two reports with the same sequence or the same predecessor are a fork and are refused, and a link whose digest does not match is refused. It reads at most 5000 reports and refuses more. NOT defended: deleting the newest report or reports (the shorter chain is still a valid chain), and an account that can write as the report owner or as root.
+<!-- /reconciliation-pack:chain -->
+### Exit codes
+
+<!-- reconciliation-pack:exit-codes -->
+| Exit code | Name | Meaning |
+|---|---|---|
+| 0 | all-pass | every applicable item passed, at least one item passed, and the report was published |
+| 1 | fail | at least one item failed; the report was published and names each |
+| 2 | refused | the pack refused to run (bad arguments, an unsafe report directory, a held run lock, a broken report chain); no item was run and nothing was published |
+| 3 | report-not-published | a verdict per item was reached but the report could not be durably published; the outcomes are not evidence and must not be relied on |
+| 4 | internal | the pack itself failed unexpectedly before it could reach an outcome; treat as inconclusive |
+| 5 | inconclusive | no item failed, but at least one item could not be proven (or nothing at all was proven); the report was published. Never a pass |
+<!-- /reconciliation-pack:exit-codes -->
+### Failure classes audited up front
+
+<!-- reconciliation-pack:audit -->
+The failure classes earlier reviews kept finding, and the guard for each. Every guard has a test that fails when the guard is removed.
+
+| Failure class (found in earlier reviews) | Guard |
+|---|---|
+| TOCTOU between check and use | every report file is opened once with O_NOFOLLOW and its digest taken on the same bytes; the run lock is verified (inode and token) immediately before the JSON commit; lock reclaim is serialised by a second exclusive file |
+| starvation of bounded oldest-first scans | a read that hits its cap is CAP_EXCEEDED and never passes; there is no oldest-first window, and carried unsettled identities are re-checked first |
+| false findings for pre-cutoff items | identities outside the RECORDED population go to outOfPopulation, listed and never counted as findings |
+| secrets or data in text | text carries closed codes, counts and sanitised identity tokens only; a token is a cuid, a numeric id, a validated SKU (else a sku# digest) or a warehouse code, and a raw string cannot be typed as one |
+| an aggregate or count standing in for identity | comparison is keyed; equal counts with one identity swapped fail (onlyIms plus onlyVendor); counts are derived from the lists and the reader recomputes them |
+| "looks empty so skipped" | empty on both sides is EMPTY_UNPROVEN unless positive evidence is supplied; a run in which nothing passed exits 5, never 0 |
+| ordering inferred from timestamps | the chain is ordered by sequence and linked by digest; settling uses equality of distinct last-success stamps and never compares two stamps for order |
+| fail-open on unreadable state | an unreadable, untrusted, oversized, malformed or inconsistent file, directory or chain refuses (trend) or is inconclusive (item); there is no default that passes |
+| an untrusted-file field reaching text | every field read back from a file is validated against a closed set or a strict pattern before use, and the Markdown is rendered from validated values only |
+<!-- /reconciliation-pack:audit -->
 ## WooCommerce initial-import rehearsal
 
 `npm run rehearse:woo-import` runs the **real WooCommerce initial order import** (the code behind **Import Active Orders**: `lib/connectors/woocommerce/sync/initial-import.ts`, `importWcOrder` and the allocation service) end to end against a **local fake WooCommerce REST server** serving synthetic orders, into a PostgreSQL cluster created for the occasion and thrown away afterwards, and writes a report. It is the rehearsal behind the first load's order import (o3d-zjsb5.16): it shows, before anything touches the live store, what the import does with open orders, which of them it cannot allocate, and whether the numbers agree.

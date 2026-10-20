@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Reconciliation pack: the comparators and the report writer (no item runners yet)
+
+- **New (backend only, nothing runs yet): the core of the reconciliation pack** in `lib/reconciliation-pack/`. It holds the R1 to R15 catalogue (claim, tolerance rule and value, cadence, phase applicability, dependent streams), pure keyed comparators (identity on one side only, differing, unsettled, outside the recorded population, excluded; counts derived from the lists; exact quantities to 0.0001, absolute tolerances, the R5 composite and the order-currency minor-unit rule), the rule that a difference fails only after two later successful runs of its stream (distinct last-success stamps, never ordered), closed reason codes, and the identity-token sanitiser. It also holds the report writer (evidence file, Markdown, then the JSON as commit record, a hash chain by sequence, an exclusive run lock) and the trend reader that verifies every pair and the chain. There is no command and no vendor call yet, and the readiness gate does not read it yet. The exit-code table, the reason and refusal codes, the item catalogue and a table of the failure classes the design guards against are in the installation guide under "Reconciliation pack".
+- **Changed (internal):** `readTrustedRegularFileBytes` returns the bytes `readTrustedRegularFile` decodes, so a digest can be taken over exactly what was parsed.
+
 ### First load: the apply runner core (no database side yet)
 
 - **New (backend only, nothing runs yet): the core of the first-load apply runner** in `lib/first-load/apply/`. It reads and verifies a prepared run from bytes (every file against the prepared report's SHA-256, size, rows and the importer's header; unique keys; every parent, component, warehouse, FX rate and zero-cost pair backed by the files or refused; WooCommerce variant parents only from a re-verified snapshot), computes per step which rows are still to load, and drives plan, apply and resume through ports. The accounting is taken from the database, never from the importers' counters. It opens no database or network connection and adds no command yet. Documented in `docs/first-load-apply.md`.

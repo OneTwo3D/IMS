@@ -123,6 +123,11 @@ export class UntrustedPathError extends Error {}
  * that is out of scope and the callers say so. Ownership and mode are what is checked, not authenticity.
  */
 export function readTrustedRegularFile(file: string, maxBytes: number): string {
+  return readTrustedRegularFileBytes(file, maxBytes).toString('utf8')
+}
+
+/** The same trust checks, returning the bytes exactly as read, so a digest can be taken over what was parsed. */
+export function readTrustedRegularFileBytes(file: string, maxBytes: number): Buffer {
   const fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
   try {
     const info = fstatSync(fd)
@@ -140,7 +145,7 @@ export function readTrustedRegularFile(file: string, maxBytes: number): string {
       if (n === 0) break
       read += n
     }
-    return buffer.subarray(0, read).toString('utf8')
+    return buffer.subarray(0, read)
   } finally {
     closeSync(fd)
   }
