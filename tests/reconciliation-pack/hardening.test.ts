@@ -37,11 +37,20 @@ function swapReport() {
   return buildReport(input('ims-test', 0, defaultItems('P1', { R1: item })), 1, null)
 }
 
-test('canonical keys cannot collide even for adversarial raw values', () => {
-  const split = [{ kind: 'sku' as const, raw: 'a\u0001sku:b' }]
-  const two = [{ kind: 'sku' as const, raw: 'a' }, { kind: 'sku' as const, raw: 'b' }]
-  const result = compareKeyed({ imsComplete: true, vendorComplete: true, tolerance: { rule: 'exact' }, ims: [{ key: split, value: '1' }], vendor: [{ key: two, value: '1' }] })
+test('a key part is a non-empty plain string or a safe whole number, or the row is refused', () => {
+  const run = (raw: unknown) => compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: { rule: 'exact' }, ims: [{ key: [{ kind: 'sku', raw }], value: '1' }], vendor: [{ key: [{ kind: 'sku', raw }], value: '1' }] })
+  for (const bad of ['a\u0001sku:b', 'line\nbreak', '', 'x'.repeat(513), {}, { id: 'A' }, [], ['A'], null, undefined, true, BigInt(10), new Date(0), NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 2]) {
+    assert.deepEqual(run(bad), { status: 'unreadable', reason: 'BAD_KEY' }, String(typeof bad === 'bigint' ? 'bigint' : JSON.stringify(bad) ?? String(bad)))
+  }
+  for (const good of ['A', 'x'.repeat(512), 0, 7, Number.MAX_SAFE_INTEGER]) assert.equal(run(good).status, 'compared', String(good))
+})
+
+test('two different whole-number identities are two identities (never one shared form)', () => {
+  const side = (raw: number) => [{ key: [{ kind: 'vendor-id' as const, raw }], value: '1' }]
+  const result = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: { rule: 'exact' }, ims: side(7), vendor: side(8) })
   assert.equal(result.status === 'compared' && result.buckets.bothEqual.length, 0)
+  assert.equal(result.status === 'compared' && result.buckets.onlyIms.length, 1)
+  assert.equal(result.status === 'compared' && result.buckets.onlyVendor.length, 1)
 })
 
 test('a capped listing of a non-finding bucket cannot pass', () => {

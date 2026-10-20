@@ -63,6 +63,22 @@ export function identityToken(kind: IdentityKind, raw: unknown): SafeToken {
   return plainOk(kind, text) ? brand(text) : brand(`${kind}#${digest8(text)}`)
 }
 
+const CONTROL_RE = /[\u0000-\u001f\u007f]/
+export const MAX_KEY_PART_LENGTH = 512
+
+/** Whether `part` is a usable identity part: a known kind and a non-empty plain string or a safe non-negative integer. Total: never throws. */
+export function isKeyPart(part: unknown): part is KeyPart {
+  if (typeof part !== 'object' || part === null || Array.isArray(part)) return false
+  const { kind, raw } = part as { kind?: unknown; raw?: unknown }
+  if (typeof kind !== 'string' || !(IDENTITY_KINDS as readonly string[]).includes(kind)) return false
+  if (typeof raw === 'string') return raw.length > 0 && raw.length <= MAX_KEY_PART_LENGTH && !CONTROL_RE.test(raw)
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0
+}
+/** Whether `parts` is a non-empty list of usable identity parts. */
+export function isKey(parts: unknown): parts is readonly KeyPart[] {
+  return Array.isArray(parts) && parts.length > 0 && parts.every(isKeyPart)
+}
+
 /** One part of a composite key. */
 export type KeyPart = { kind: IdentityKind; raw: unknown }
 
@@ -77,8 +93,10 @@ export function keyToken(parts: readonly KeyPart[]): SafeToken {
  * length-prefixed so no two different part lists can collide.
  */
 export function canonicalKey(parts: readonly KeyPart[]): string {
+  // A key that is not a usable identity has NO canonical form: two different unusable keys must never share one.
+  if (!isKey(parts)) throw new TypeError('canonicalKey: not a usable identity')
   return parts.map((part) => {
-    const text = typeof part.raw === 'string' ? part.raw : typeof part.raw === 'number' && Number.isSafeInteger(part.raw) ? String(part.raw) : `\u0000${typeof part.raw}`
+    const text = typeof part.raw === 'string' ? part.raw : String(part.raw)
     return `${part.kind}:${text.length}:${text}`
   }).join('\u0001')
 }

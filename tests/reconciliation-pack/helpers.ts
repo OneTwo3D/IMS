@@ -33,7 +33,7 @@ export const allBrackets = (stamp: string = STAMP) => (['woocommerce-order-sweep
 
 /** An item input built from a real comparison, the way a runner will build one. */
 export function itemFromComparison(id: PackItemId, input: Partial<CompareInput> & Pick<CompareInput, 'ims' | 'vendor'>): { item: ItemInput; result: CompareResult } {
-  const result = compareKeyed({ imsComplete: true, vendorComplete: true, tolerance: { rule: 'exact' }, ...input })
+  const result = compareKeyed({ imsComplete: true, vendorComplete: true, mode: getPackItem(id).mode, tolerance: { rule: 'exact' }, ...input })
   const verdict = outcomeOfComparison(result)
   const proof = verdict.outcome === 'pass' && result.status === 'compared' ? result.proof : null
   return { item: { id, outcome: verdict.outcome, reasons: verdict.reasons, proof, sources: [...getPackItem(id).sources], entries: result.status === 'compared' ? result.buckets : undefined }, result }

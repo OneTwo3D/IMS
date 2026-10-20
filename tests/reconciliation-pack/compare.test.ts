@@ -13,7 +13,7 @@ const D = (value: string) => parseDecimalStrict(value)!
 const EXACT: Tolerance = { rule: 'exact' }
 
 function compare(over: Partial<CompareInput> & Pick<CompareInput, 'ims' | 'vendor'>): CompareResult {
-  return compareKeyed({ imsComplete: true, vendorComplete: true, tolerance: EXACT, ...over })
+  return compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ...over })
 }
 function buckets(result: CompareResult) {
   assert.equal(result.status, 'compared')
@@ -110,11 +110,14 @@ test('a duplicate identity on a side is never summed or picked between', () => {
   assert.deepEqual(compare({ ims: [row('A', '2')], vendor: [row('A', '1'), row('A', '1')] }), { status: 'unreadable', reason: 'DUPLICATE_KEY' })
 })
 
-test('one side with values and the other without is VALUE_SHAPE_MISMATCH; a mixed side too', () => {
-  assert.deepEqual(compare({ ims: [row('A', '1')], vendor: [row('A', null)] }), { status: 'unreadable', reason: 'VALUE_SHAPE_MISMATCH' })
-  assert.deepEqual(compare({ ims: [row('A', '1'), row('B', null)], vendor: [row('A', '1'), row('B', '1')] }), { status: 'unreadable', reason: 'VALUE_SHAPE_MISMATCH' })
-  const presence = compare({ ims: [row('A', null), row('B', null)], vendor: [row('A', null)] })
+test('presence mode compares identities only; values mode demands a value on every row of both sides', () => {
+  const presence = compare({ mode: 'presence', ims: [row('A', null), row('B', null)], vendor: [row('A', null)] })
   assert.deepEqual(tokens(buckets(presence).onlyIms), ['B|MAIN'])
+  assert.equal(buckets(presence).bothEqual.length, 1)
+  assert.deepEqual(compare({ mode: 'presence', ims: [row('A', '1')], vendor: [row('A', null)] }), { status: 'unreadable', reason: 'VALUE_SHAPE_MISMATCH' })
+  assert.deepEqual(compare({ ims: [row('A', null)], vendor: [row('A', null)] }), { status: 'unreadable', reason: 'VALUE_MISSING' }, 'missing on both sides is not equal')
+  assert.deepEqual(compare({ ims: [row('A', '1')], vendor: [row('A', null)] }), { status: 'unreadable', reason: 'VALUE_MISSING' })
+  assert.deepEqual(compare({ ims: [row('A', '1'), row('B', null)], vendor: [row('A', '1'), row('B', '1')] }), { status: 'unreadable', reason: 'VALUE_MISSING' })
 })
 
 test('a side not known complete never passes', () => {
@@ -220,18 +223,18 @@ test('a difference that goes away is dropped from the carried state, and returns
 
 test('a difference that changes kind restarts its count', () => {
   const first = run(T1, new Map())
-  const kinds = compareKeyed({ imsComplete: true, vendorComplete: true, tolerance: EXACT, ims: [row('A', '1')], vendor: [], settling: { carried: first.nextCarried, stamp: T2 } }) as Extract<CompareResult, { status: 'compared' }>
+  const kinds = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [row('A', '1')], vendor: [], settling: { carried: first.nextCarried, stamp: T2 } }) as Extract<CompareResult, { status: 'compared' }>
   assert.deepEqual(kinds.buckets.unsettled[0]!.settling, { first: T2, later: [] })
 })
 
 test('onlyIms and onlyVendor settle the same way as a value difference', () => {
   let carried: ReadonlyMap<string, CarriedDifference> = new Map()
   for (const stamp of [T1, T2]) {
-    const r = compareKeyed({ imsComplete: true, vendorComplete: true, tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp } }) as Extract<CompareResult, { status: 'compared' }>
+    const r = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp } }) as Extract<CompareResult, { status: 'compared' }>
     assert.equal(r.buckets.unsettled.length, 1)
     carried = r.nextCarried
   }
-  const done = compareKeyed({ imsComplete: true, vendorComplete: true, tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp: T3 } }) as Extract<CompareResult, { status: 'compared' }>
+  const done = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp: T3 } }) as Extract<CompareResult, { status: 'compared' }>
   assert.deepEqual(tokens(done.buckets.onlyVendor), ['V|MAIN'])
 })
 

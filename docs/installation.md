@@ -1647,6 +1647,36 @@ An outcome of pass is only accepted, when a report is written and again when it 
 | vendor-total-zero | the vendor reported a total of zero for the whole population |
 | invariant-report-clean | the invariant report ran to the end and lists no finding |
 <!-- /reconciliation-pack:proof -->
+### Unreadable input shapes
+
+<!-- reconciliation-pack:inputs -->
+The comparator never reads an unreadable input as equal, and never fills a gap with a default. Each of these shapes is inconclusive with the code shown; none reaches a bucket or a pass. A difference of zero is the only thing that is equal, and minus zero is read as zero. The comparison mode (values or presence) is fixed per item in the catalogue, and a currency outside the known list has no default number of decimals.
+
+| Unreadable input | Reason code |
+|---|---|
+| a side that is not a list of rows | SOURCE_UNREADABLE |
+| a row that is null, a number, a string or a list | BAD_KEY |
+| a row whose key is not a list of parts | BAD_KEY |
+| a row with no key parts | BAD_KEY |
+| a key part that is not an object | BAD_KEY |
+| a key part of an unknown kind | BAD_KEY |
+| a key part whose raw value is an object, a list, a date, a boolean, a bigint, null or undefined | BAD_KEY |
+| a key part whose raw value is NaN, infinite, negative, fractional, or not a safe integer | BAD_KEY |
+| a key part whose raw value is an empty string, a string over 512 characters, or contains a control character | BAD_KEY |
+| two rows on one side with the same identity | DUPLICATE_KEY |
+| a comparison mode that is missing or not values or presence | BAD_MODE |
+| a value-bearing comparison with a row whose value is missing, null or undefined (either side, or both) | VALUE_MISSING |
+| a value that is not a plain decimal string: NaN, Infinity, empty, spaces, exponent, plus sign, hex, comma, non-ASCII digits, a number type, more than 12 decimals or 30 integer digits | BAD_VALUE |
+| a presence-only comparison with a row that carries a value | VALUE_SHAPE_MISMATCH |
+| a value-bearing comparison with no tolerance, an unknown rule, or a limit that is missing, negative or not a plain decimal | BAD_TOLERANCE |
+| a minor-unit comparison where either currency is missing, lower case, padded, or not in the known list | CURRENCY_UNKNOWN |
+| a comparison where one side carries a currency and the other does not | CURRENCY_UNKNOWN |
+| a side whose completeness is anything other than the boolean true | READ_INCOMPLETE |
+| nothing compared and no valid empty-population proof | EMPTY_UNPROVEN |
+| a population or exclusion list that is not a set | NO_POPULATION_RECORD |
+| carried settling state that is not a map of well-formed records | SOURCE_UNREADABLE |
+| a settling stamp that is missing or not an ISO time | STALE_BASIS |
+<!-- /reconciliation-pack:inputs -->
 ### Reason codes
 
 <!-- reconciliation-pack:reasons -->
@@ -1661,6 +1691,10 @@ Every reason a report can give is one of these codes; no other text describes a 
 | READ_INCOMPLETE | a side of the comparison was not read completely |
 | EMPTY_UNPROVEN | both sides were empty and nothing positively proves that empty is the true answer |
 | DUPLICATE_KEY | two rows on one side carry the same identity; they are never summed or picked between |
+| BAD_KEY | a row has no usable identity (a key part that is not a non-empty string or a safe whole number, an unknown kind, no parts, or a row that is not an object); nothing is matched on a guessed identity |
+| VALUE_MISSING | a value-bearing comparison has a row with no value on one side or both; a missing value is never read as equal |
+| BAD_TOLERANCE | the tolerance rule is missing, unknown or carries a limit that is not a non-negative plain decimal |
+| BAD_MODE | the comparison mode (values or presence) is missing or unknown |
 | BAD_VALUE | a row carries a value that is not a finite decimal number |
 | VALUE_SHAPE_MISMATCH | one side carries values and the other does not |
 | CURRENCY_UNKNOWN | the currency of a money comparison is missing or not a known code |

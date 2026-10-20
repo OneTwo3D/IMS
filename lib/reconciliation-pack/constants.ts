@@ -51,6 +51,10 @@ export const PACK_REASON_CODES = {
   READ_INCOMPLETE: 'a side of the comparison was not read completely',
   EMPTY_UNPROVEN: 'both sides were empty and nothing positively proves that empty is the true answer',
   DUPLICATE_KEY: 'two rows on one side carry the same identity; they are never summed or picked between',
+  BAD_KEY: 'a row has no usable identity (a key part that is not a non-empty string or a safe whole number, an unknown kind, no parts, or a row that is not an object); nothing is matched on a guessed identity',
+  VALUE_MISSING: 'a value-bearing comparison has a row with no value on one side or both; a missing value is never read as equal',
+  BAD_TOLERANCE: 'the tolerance rule is missing, unknown or carries a limit that is not a non-negative plain decimal',
+  BAD_MODE: 'the comparison mode (values or presence) is missing or unknown',
   BAD_VALUE: 'a row carries a value that is not a finite decimal number',
   VALUE_SHAPE_MISMATCH: 'one side carries values and the other does not',
   CURRENCY_UNKNOWN: 'the currency of a money comparison is missing or not a known code',
@@ -66,6 +70,16 @@ export const PACK_REASON_CODE_LIST = Object.keys(PACK_REASON_CODES) as PackReaso
 
 export function isPackReasonCode(value: unknown): value is PackReasonCode {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(PACK_REASON_CODES, value)
+}
+
+/**
+ * The currencies a minor-unit comparison knows (ISO 4217 alphabetic codes in current use, without the fund and
+ * testing codes). A code outside it is CURRENCY_UNKNOWN: there is no default number of decimals for a currency this
+ * list does not name. The digits come from the repository's one minor-unit table (lib/domain/math/decimal.ts).
+ */
+export const PACK_KNOWN_CURRENCIES: ReadonlySet<string> = new Set(('AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UYW UZS VED VES VND VUV WST XAF XCD XOF XPF YER ZAR ZMW ZWG').split(' '))
+export function isKnownCurrency(value: unknown): value is string {
+  return typeof value === 'string' && PACK_KNOWN_CURRENCIES.has(value)
 }
 
 /** Where an item's data came from. A pass must name exactly the sources its catalogue row lists. */
@@ -120,6 +134,39 @@ export const PACK_CHAIN_CODES = {
 } as const
 export type PackChainCode = keyof typeof PACK_CHAIN_CODES
 
+/**
+ * Every input shape the comparator refuses, and the closed code it gives. Nothing here reaches a bucket and nothing
+ * becomes equal by default: an unreadable input is inconclusive. tests/reconciliation-pack/input-shapes.test.ts runs
+ * a case for EVERY id below and fails if an id has no case or a case has no id.
+ */
+export const PACK_INPUT_SHAPES: ReadonlyArray<{ id: string; shape: string; reason: PackReasonCode }> = [
+  { id: 'side-not-array', shape: 'a side that is not a list of rows', reason: 'SOURCE_UNREADABLE' },
+  { id: 'row-not-object', shape: 'a row that is null, a number, a string or a list', reason: 'BAD_KEY' },
+  { id: 'key-not-list', shape: 'a row whose key is not a list of parts', reason: 'BAD_KEY' },
+  { id: 'key-empty', shape: 'a row with no key parts', reason: 'BAD_KEY' },
+  { id: 'key-part-not-object', shape: 'a key part that is not an object', reason: 'BAD_KEY' },
+  { id: 'key-kind-unknown', shape: 'a key part of an unknown kind', reason: 'BAD_KEY' },
+  { id: 'key-raw-object', shape: 'a key part whose raw value is an object, a list, a date, a boolean, a bigint, null or undefined', reason: 'BAD_KEY' },
+  { id: 'key-raw-number', shape: 'a key part whose raw value is NaN, infinite, negative, fractional, or not a safe integer', reason: 'BAD_KEY' },
+  { id: 'key-raw-string', shape: 'a key part whose raw value is an empty string, a string over 512 characters, or contains a control character', reason: 'BAD_KEY' },
+  { id: 'duplicate-key', shape: 'two rows on one side with the same identity', reason: 'DUPLICATE_KEY' },
+  { id: 'mode-unknown', shape: 'a comparison mode that is missing or not values or presence', reason: 'BAD_MODE' },
+  { id: 'value-missing', shape: 'a value-bearing comparison with a row whose value is missing, null or undefined (either side, or both)', reason: 'VALUE_MISSING' },
+  { id: 'value-not-decimal', shape: 'a value that is not a plain decimal string: NaN, Infinity, empty, spaces, exponent, plus sign, hex, comma, non-ASCII digits, a number type, more than 12 decimals or 30 integer digits', reason: 'BAD_VALUE' },
+  { id: 'value-in-presence', shape: 'a presence-only comparison with a row that carries a value', reason: 'VALUE_SHAPE_MISMATCH' },
+  { id: 'tolerance-missing', shape: 'a value-bearing comparison with no tolerance, an unknown rule, or a limit that is missing, negative or not a plain decimal', reason: 'BAD_TOLERANCE' },
+  { id: 'currency-unknown', shape: 'a minor-unit comparison where either currency is missing, lower case, padded, or not in the known list', reason: 'CURRENCY_UNKNOWN' },
+  { id: 'currency-one-sided', shape: 'a comparison where one side carries a currency and the other does not', reason: 'CURRENCY_UNKNOWN' },
+  { id: 'complete-not-true', shape: 'a side whose completeness is anything other than the boolean true', reason: 'READ_INCOMPLETE' },
+  { id: 'empty-unproven', shape: 'nothing compared and no valid empty-population proof', reason: 'EMPTY_UNPROVEN' },
+  { id: 'population-not-set', shape: 'a population or exclusion list that is not a set', reason: 'NO_POPULATION_RECORD' },
+  { id: 'carried-malformed', shape: 'carried settling state that is not a map of well-formed records', reason: 'SOURCE_UNREADABLE' },
+  { id: 'stamp-unusable', shape: 'a settling stamp that is missing or not an ISO time', reason: 'STALE_BASIS' },
+]
+export function renderPackInputShapeTable(): string {
+  return ['| Unreadable input | Reason code |', '|---|---|', ...PACK_INPUT_SHAPES.map((r) => `| ${r.shape} | ${r.reason} |`)].join('\n')
+}
+
 /** The buckets of a keyed comparison. Counts are derived from the lists, never stored on their own. */
 export const COMPARISON_BUCKETS = ['onlyIms', 'onlyVendor', 'bothEqual', 'bothDiffer', 'unsettled', 'outOfPopulation', 'excluded'] as const
 export type ComparisonBucket = (typeof COMPARISON_BUCKETS)[number]
@@ -167,6 +214,8 @@ export type PackApplicability = (typeof PACK_APPLICABILITY)[number]
 export type PackItemSpec = {
   id: PackItemId
   title: string
+  /** values: every identity carries a decimal value on both sides and the values are compared. presence: no value is carried and only the set of identities is compared. Chosen per item, never inferred from the data. */
+  mode: 'values' | 'presence'
   claim: string
   exactness: 'exact' | 'tolerance' | 'set-exact-value-tolerance' | 'presence'
   tolerance: PackToleranceSpec
@@ -194,21 +243,21 @@ function item(spec: Omit<PackItemSpec, 'title'>): PackItemSpec {
 }
 
 export const PACK_ITEM_CATALOGUE: readonly PackItemSpec[] = [
-  item({ id: 'R1', claim: 'IMS stock_levels equal Mintsoft on-hand per (SKU, bound warehouse)', exactness: 'exact', tolerance: EXACT, cadence: 'daily', phases: VENDOR_P1, streams: ['mintsoft-stock-sync'], sources: ['ims-database', 'mintsoft-api'], population: 'the SKUs and warehouses IMS has bound to Mintsoft, while Mintsoft alignment is unconfirmed' }),
-  item({ id: 'R2', claim: 'IMS equals Qoblex StockOnHand per non-3PL location', exactness: 'exact', tolerance: EXACT, cadence: 'weekly', phases: P('not-applicable', 'listed-only', 'applicable'), streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the non-3PL locations named in the Qoblex export manifest' }),
-  item({ id: 'R3', claim: 'StockLevel.quantity equals the sum of CostLayer.remainingQty', exactness: 'exact', tolerance: NONE, cadence: 'daily', phases: P('applicable', 'applicable', 'applicable'), streams: [], sources: ['invariant-report'], population: 'every stock level the invariant report examined' }),
-  item({ id: 'R4', claim: 'StockLevel.reservedQty equals the sum of OrderAllocation.qty', exactness: 'exact', tolerance: NONE, cadence: 'daily', phases: P('applicable', 'applicable', 'applicable'), streams: [], sources: ['invariant-report'], population: 'every stock level the invariant report examined' }),
-  item({ id: 'R5', claim: 'inventory valuation per warehouse and company equals Qoblex', exactness: 'tolerance', tolerance: { rule: 'composite-max-abs-or-relative', value: `max(GBP ${R5_ABSOLUTE_FLOOR_GBP}, ${R5_RELATIVE_FRACTION} of the larger total)`, source: 'owner decision D2 and unverified formula U14' }, cadence: 'weekly', phases: VENDOR_P1, streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the warehouses and companies named in the Qoblex export manifest' }),
-  item({ id: 'R6', claim: 'the IMS inventory subledger as of the cycle date equals Xero Inventory plus Allocated Inventory', exactness: 'tolerance', tolerance: GBP1, cadence: 'daily', phases: VENDOR_P1, streams: ['xero-balance-snapshots'], sources: ['ims-ledger', 'xero-trial-balance'], population: 'the accounts configured for inventory and allocated inventory' }),
-  item({ id: 'R7', claim: 'open purchase orders equal Qoblex Incoming (set exact, value exact in GBP, GBP 1 across FX)', exactness: 'set-exact-value-tolerance', tolerance: GBP1, cadence: 'weekly', phases: P('not-applicable', 'not-applicable', 'applicable'), streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the open purchase orders in the Qoblex export manifest' }),
-  item({ id: 'R8', claim: 'outstanding quantity of part-received purchase-order lines equals Qoblex Incoming', exactness: 'exact', tolerance: EXACT, cadence: 'weekly', phases: P('not-applicable', 'not-applicable', 'applicable'), streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the open purchase-order lines in the Qoblex export manifest' }),
-  item({ id: 'R9', claim: 'open sales orders equal WooCommerce by order id (set exact, value within one minor unit of the order currency)', exactness: 'set-exact-value-tolerance', tolerance: { rule: 'order-currency-minor-unit', value: '1 minor unit', source: 'owner decision D1' }, cadence: 'daily', phases: VENDOR_P1, streams: ['woocommerce-order-sweep'], sources: ['ims-database', 'woocommerce-api'], population: 'the order statuses enumerated one by one, walked twice' }),
-  item({ id: 'R10', claim: 'Xero control accounts (Inventory, Allocated, Transit) agree with IMS, and no IMS-originated posting reached COGS or Unearned Revenue', exactness: 'tolerance', tolerance: GBP1, cadence: 'daily', phases: VENDOR_P1, streams: ['xero-balance-snapshots'], sources: ['ims-ledger', 'xero-trial-balance'], population: 'the configured control accounts; postings since the P0 start' }),
-  item({ id: 'R11', claim: 'Stock in Transit equals the open-purchase-order transit schedule, and the transit account differs from the allocated account', exactness: 'tolerance', tolerance: GBP1, cadence: 'weekly', phases: P('not-applicable', 'not-applicable', 'applicable'), streams: ['xero-balance-snapshots'], sources: ['ims-database', 'xero-trial-balance'], population: 'the open purchase orders with goods in transit' }),
-  item({ id: 'R12', claim: 'VAT per (country, reporting category, period) agrees across IMS, Xero and WooCommerce', exactness: 'set-exact-value-tolerance', tolerance: { rule: 'absolute', value: VAT_TOLERANCE_GBP, source: 'owner decision D1' }, cadence: 'monthly', phases: VENDOR_P1, streams: ['xero-tax-rates', 'woocommerce-order-sweep'], sources: ['ims-ledger', 'xero-api', 'woocommerce-api'], population: 'the closed reporting periods inside the budgeted window' }),
-  item({ id: 'R13', claim: 'every WooCommerce and Xero tax rate is mapped', exactness: 'presence', tolerance: NONE, cadence: 'daily', phases: VENDOR_P1, streams: ['xero-tax-rates'], sources: ['woocommerce-api', 'xero-api'], population: 'the full tax-rate lists of both systems' }),
-  item({ id: 'R14', claim: 'every SKU is present in Qoblex, WooCommerce, Mintsoft and IMS, except the written exclusions', exactness: 'presence', tolerance: NONE, cadence: 'weekly', phases: VENDOR_P1, streams: [], sources: ['ims-database', 'qoblex-file', 'woocommerce-api', 'mintsoft-api'], population: 'the union of the four systems minus unexpired written exclusions' }),
-  item({ id: 'R15', claim: 'the invariant report shows zero critical findings and every warning is accepted in writing', exactness: 'exact', tolerance: NONE, cadence: 'daily', phases: P('applicable', 'applicable', 'applicable'), streams: [], sources: ['invariant-report'], population: 'the whole invariant report' }),
+  item({ id: 'R1', mode: 'values', claim: 'IMS stock_levels equal Mintsoft on-hand per (SKU, bound warehouse)', exactness: 'exact', tolerance: EXACT, cadence: 'daily', phases: VENDOR_P1, streams: ['mintsoft-stock-sync'], sources: ['ims-database', 'mintsoft-api'], population: 'the SKUs and warehouses IMS has bound to Mintsoft, while Mintsoft alignment is unconfirmed' }),
+  item({ id: 'R2', mode: 'values', claim: 'IMS equals Qoblex StockOnHand per non-3PL location', exactness: 'exact', tolerance: EXACT, cadence: 'weekly', phases: P('not-applicable', 'listed-only', 'applicable'), streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the non-3PL locations named in the Qoblex export manifest' }),
+  item({ id: 'R3', mode: 'values', claim: 'StockLevel.quantity equals the sum of CostLayer.remainingQty', exactness: 'exact', tolerance: NONE, cadence: 'daily', phases: P('applicable', 'applicable', 'applicable'), streams: [], sources: ['invariant-report'], population: 'every stock level the invariant report examined' }),
+  item({ id: 'R4', mode: 'values', claim: 'StockLevel.reservedQty equals the sum of OrderAllocation.qty', exactness: 'exact', tolerance: NONE, cadence: 'daily', phases: P('applicable', 'applicable', 'applicable'), streams: [], sources: ['invariant-report'], population: 'every stock level the invariant report examined' }),
+  item({ id: 'R5', mode: 'values', claim: 'inventory valuation per warehouse and company equals Qoblex', exactness: 'tolerance', tolerance: { rule: 'composite-max-abs-or-relative', value: `max(GBP ${R5_ABSOLUTE_FLOOR_GBP}, ${R5_RELATIVE_FRACTION} of the larger total)`, source: 'owner decision D2 and unverified formula U14' }, cadence: 'weekly', phases: VENDOR_P1, streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the warehouses and companies named in the Qoblex export manifest' }),
+  item({ id: 'R6', mode: 'values', claim: 'the IMS inventory subledger as of the cycle date equals Xero Inventory plus Allocated Inventory', exactness: 'tolerance', tolerance: GBP1, cadence: 'daily', phases: VENDOR_P1, streams: ['xero-balance-snapshots'], sources: ['ims-ledger', 'xero-trial-balance'], population: 'the accounts configured for inventory and allocated inventory' }),
+  item({ id: 'R7', mode: 'values', claim: 'open purchase orders equal Qoblex Incoming (set exact, value exact in GBP, GBP 1 across FX)', exactness: 'set-exact-value-tolerance', tolerance: GBP1, cadence: 'weekly', phases: P('not-applicable', 'not-applicable', 'applicable'), streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the open purchase orders in the Qoblex export manifest' }),
+  item({ id: 'R8', mode: 'values', claim: 'outstanding quantity of part-received purchase-order lines equals Qoblex Incoming', exactness: 'exact', tolerance: EXACT, cadence: 'weekly', phases: P('not-applicable', 'not-applicable', 'applicable'), streams: [], sources: ['ims-database', 'qoblex-file'], population: 'the open purchase-order lines in the Qoblex export manifest' }),
+  item({ id: 'R9', mode: 'values', claim: 'open sales orders equal WooCommerce by order id (set exact, value within one minor unit of the order currency)', exactness: 'set-exact-value-tolerance', tolerance: { rule: 'order-currency-minor-unit', value: '1 minor unit', source: 'owner decision D1' }, cadence: 'daily', phases: VENDOR_P1, streams: ['woocommerce-order-sweep'], sources: ['ims-database', 'woocommerce-api'], population: 'the order statuses enumerated one by one, walked twice' }),
+  item({ id: 'R10', mode: 'values', claim: 'Xero control accounts (Inventory, Allocated, Transit) agree with IMS, and no IMS-originated posting reached COGS or Unearned Revenue', exactness: 'tolerance', tolerance: GBP1, cadence: 'daily', phases: VENDOR_P1, streams: ['xero-balance-snapshots'], sources: ['ims-ledger', 'xero-trial-balance'], population: 'the configured control accounts; postings since the P0 start' }),
+  item({ id: 'R11', mode: 'values', claim: 'Stock in Transit equals the open-purchase-order transit schedule, and the transit account differs from the allocated account', exactness: 'tolerance', tolerance: GBP1, cadence: 'weekly', phases: P('not-applicable', 'not-applicable', 'applicable'), streams: ['xero-balance-snapshots'], sources: ['ims-database', 'xero-trial-balance'], population: 'the open purchase orders with goods in transit' }),
+  item({ id: 'R12', mode: 'values', claim: 'VAT per (country, reporting category, period) agrees across IMS, Xero and WooCommerce', exactness: 'set-exact-value-tolerance', tolerance: { rule: 'absolute', value: VAT_TOLERANCE_GBP, source: 'owner decision D1' }, cadence: 'monthly', phases: VENDOR_P1, streams: ['xero-tax-rates', 'woocommerce-order-sweep'], sources: ['ims-ledger', 'xero-api', 'woocommerce-api'], population: 'the closed reporting periods inside the budgeted window' }),
+  item({ id: 'R13', mode: 'presence', claim: 'every WooCommerce and Xero tax rate is mapped', exactness: 'presence', tolerance: NONE, cadence: 'daily', phases: VENDOR_P1, streams: ['xero-tax-rates'], sources: ['woocommerce-api', 'xero-api'], population: 'the full tax-rate lists of both systems' }),
+  item({ id: 'R14', mode: 'presence', claim: 'every SKU is present in Qoblex, WooCommerce, Mintsoft and IMS, except the written exclusions', exactness: 'presence', tolerance: NONE, cadence: 'weekly', phases: VENDOR_P1, streams: [], sources: ['ims-database', 'qoblex-file', 'woocommerce-api', 'mintsoft-api'], population: 'the union of the four systems minus unexpired written exclusions' }),
+  item({ id: 'R15', mode: 'values', claim: 'the invariant report shows zero critical findings and every warning is accepted in writing', exactness: 'exact', tolerance: NONE, cadence: 'daily', phases: P('applicable', 'applicable', 'applicable'), streams: [], sources: ['invariant-report'], population: 'the whole invariant report' }),
 ]
 
 export function getPackItem(id: PackItemId): PackItemSpec {
@@ -264,7 +313,7 @@ export const SYSTEM_IDENTIFIER_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/
 
 export const PACK_DOC_BLOCK_OPEN = (id: string) => `<!-- reconciliation-pack:${id} -->`
 export const PACK_DOC_BLOCK_CLOSE = (id: string) => `<!-- /reconciliation-pack:${id} -->`
-export type PackDocBlockId = 'overview' | 'outcomes' | 'proof' | 'reasons' | 'refusals' | 'items' | 'settling' | 'chain' | 'exit-codes' | 'audit'
+export type PackDocBlockId = 'overview' | 'outcomes' | 'proof' | 'inputs' | 'reasons' | 'refusals' | 'items' | 'settling' | 'chain' | 'exit-codes' | 'audit'
 
 export function renderPackOutcomeTable(): string {
   return ['| Outcome | Meaning |', '|---|---|', ...PACK_OUTCOMES.map((o) => `| ${o} | ${PACK_OUTCOME_MEANING[o]} |`)].join('\n')
@@ -317,6 +366,7 @@ export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
     '',
     renderPackEmptyProofTable(),
   ].join('\n'),
+  inputs: ['The comparator never reads an unreadable input as equal, and never fills a gap with a default. Each of these shapes is inconclusive with the code shown; none reaches a bucket or a pass. A difference of zero is the only thing that is equal, and minus zero is read as zero. The comparison mode (values or presence) is fixed per item in the catalogue, and a currency outside the known list has no default number of decimals.', '', renderPackInputShapeTable()].join('\n'),
   reasons: ['Every reason a report can give is one of these codes; no other text describes a problem.', '', renderPackReasonTable()].join('\n'),
   refusals: ['A run is refused, and the trend reader refuses a directory, with exactly one of these codes.', '', renderPackChainCodeTable()].join('\n'),
   items: ['The catalogue. Tolerances are chosen defaults (owner decisions D1 and D2); an exact quantity comparison allows 0.0001.', '', renderPackItemTable()].join('\n'),
@@ -331,7 +381,7 @@ export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
 }
 
 export const PACK_DOC_PLACEMENTS: ReadonlyArray<{ file: string; blocks: readonly PackDocBlockId[] }> = [
-  { file: 'docs/installation.md', blocks: ['overview', 'outcomes', 'proof', 'reasons', 'refusals', 'items', 'settling', 'chain', 'exit-codes', 'audit'] },
+  { file: 'docs/installation.md', blocks: ['overview', 'outcomes', 'proof', 'inputs', 'reasons', 'refusals', 'items', 'settling', 'chain', 'exit-codes', 'audit'] },
 ]
 
 export function renderPackDocBlock(id: PackDocBlockId): string {

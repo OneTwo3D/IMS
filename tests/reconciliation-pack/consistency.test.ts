@@ -6,7 +6,7 @@ import test, { after } from 'node:test'
 import { PACK_ITEM_IDS, PACK_LOCK_FILE, getPackItem, itemApplicability, type PackItemId, type PackReasonCode } from '../../lib/reconciliation-pack/constants.ts'
 import { defaultItems, newRunId } from '../../lib/reconciliation-pack/harness.ts'
 import { publishPackReport } from '../../lib/reconciliation-pack/publish.ts'
-import { ReportInvalid, buildReport, parseReport, sha256Hex, type ItemInput, type ReportInput, type StreamBracket } from '../../lib/reconciliation-pack/report.ts'
+import { ReportInvalid, buildReport, parseReport, sha256Hex, verifyEvidence, type ItemInput, type ReportInput, type StreamBracket } from '../../lib/reconciliation-pack/report.ts'
 import { readPackChain } from '../../lib/reconciliation-pack/trend.ts'
 import { NOW, STAMP, allBrackets, cleanup, itemFromComparison, key, passItem, scratchDir } from './helpers.ts'
 
@@ -182,4 +182,47 @@ test('the publisher refuses an unproven pass: nothing is written, the lock is re
   assert.deepEqual(readdirSync(dir).filter((n) => !n.startsWith('.')), [])
   assert.equal(readPackChain(dir).ok, true)
   void itemFromComparison; void key; void PACK_ITEM_IDS
+})
+
+// ---- malformed shapes at the report layer: refused, never defaulted ---------------------------------------------
+
+test('the builder refuses every malformed input shape with ReportInvalid (never a TypeError, never a default)', () => {
+  const good = () => base()
+  const bad: Array<[string, () => ReportInput]> = [
+    ['items not a list', () => ({ ...input(good()), items: null as never })],
+    ['items an object', () => ({ ...input(good()), items: {} as never })],
+    ['streams not a list', () => ({ ...input(good()), streams: undefined as never })],
+    ['a stream bracket null', () => ({ ...input(good()), streams: [null as never] })],
+    ['a stream bracket without a stream', () => ({ ...input(good()), streams: [{ start: STAMP, end: STAMP } as never] })],
+    ['a bracket stamp undefined', () => ({ ...input(good()), streams: [{ stream: 'xero-tax-rates', start: undefined as never, end: STAMP }] })],
+    ['an item null', () => input([...good().slice(1), null as never])],
+    ['an item without reasons', () => input(put(good(), { id: 'R3', outcome: 'inconclusive' } as never))],
+    ['reasons a string', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: 'STALE_BASIS' } as never))],
+    ['an outcome undefined', () => input(put(good(), { id: 'R3', reasons: ['STALE_BASIS'] } as never))],
+    ['an outcome in the wrong case', () => input(put(good(), { id: 'R3', outcome: 'PASS', reasons: [] } as never))],
+    ['sources a string', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], sources: 'invariant-report' } as never))],
+    ['a proof a string', () => input(put(good(), { ...passItem('R3'), proof: 'compared' } as never))],
+    ['entries a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: [] } as never))],
+    ['an unknown bucket', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { onlyUs: [entry('A|MAIN')] } } as never))],
+    ['a bucket not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { onlyIms: entry('A|MAIN') } } as never))],
+    ['an entry null', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [null] } } as never))],
+    ['an entry key that is not a token', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...entry('a@b.c') }] } } as never))],
+    ['an entry key missing', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ims: '1', vendor: '1', delta: '0' }] } } as never))],
+    ...['NaN', '', '1e3', ' 1', '-0', '1.50', '01', '+1', 5, undefined].map((value): [string, () => ReportInput] => [`an entry value ${String(value)}`, () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...entry('A|MAIN'), ims: value }] } } as never))]),
+    ['an entry delta undefined', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ key: 'A|MAIN', ims: null, vendor: null }] } } as never))],
+    ['a settling stamp bad', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: 'soon', later: [] } }] } } as never))],
+    ['settling not an object', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...entry('A|MAIN'), settling: 'x' }] } } as never))],
+    ['settling later not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...entry('A|MAIN'), settling: { first: STAMP, later: 'x' } }] } } as never))],
+  ]
+  for (const [name, make] of bad) assert.throws(() => buildReport(make(), 1, null), ReportInvalid, name)
+  assert.doesNotThrow(() => buildReport(input(base()), 1, null))
+})
+
+test('the evidence reader refuses a value that is not in the one canonical text form', () => {
+  const { body, markdown } = buildReport(input(put(base(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ key: 'A|MAIN' as never, ims: '1.5', vendor: null, delta: null }] } })), 1, null)
+  const record = { ...body, companionMarkdownSha256: sha256Hex(markdown) }
+  const line = (ims: string) => `${JSON.stringify({ item: 'R3', bucket: 'excluded', key: 'A|MAIN', ims, vendor: null, delta: null })}\n`
+  const withText = (text: string) => ({ ...record, evidence: { ...record.evidence, sha256: sha256Hex(text) } })
+  verifyEvidence(line('1.5'), withText(line('1.5')))
+  for (const ims of ['1.50', '-0', '0.0', '01', '+1', '1e0']) assert.throws(() => verifyEvidence(line(ims), withText(line(ims))), ReportInvalid, ims)
 })

@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto'
 
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
 import { READ_SYNC_STREAM_IDS, type ReadSyncStreamId } from '@/lib/ops/read-sync-liveness-constants'
-import { bracketStable, isStreamStamp, type CompareEntry, parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
+import { bracketStable, decimalText, isStreamStamp, type CompareEntry, parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
 import {
   COMPARISON_BUCKETS,
   FINDING_BUCKETS,
@@ -141,13 +141,20 @@ export function equalDigest(entries: readonly CompareEntry[]): string | null {
   return sha256Hex([...entries.map((entry) => entry.key)].sort().join('\n'))
 }
 
+/** A decimal in the one text form the comparator writes (no minus zero, no trailing zeros, no padding). */
+function isCanonicalDecimal(value: unknown): boolean {
+  const parsed = parseDecimalStrict(value)
+  return parsed !== null && decimalText(parsed) === value
+}
+
 function validateEntry(entry: CompareEntry): void {
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new ReportInvalid('an entry is not an object')
   if (!isSafeTokenShape(entry.key)) throw new ReportInvalid('an entry key is not a sanitised token')
   for (const value of [entry.ims, entry.vendor, entry.delta]) {
-    if (value !== null && parseDecimalStrict(value) === null) throw new ReportInvalid('an entry value is not a plain decimal')
+    if (value !== null && !isCanonicalDecimal(value)) throw new ReportInvalid('an entry value is not a canonical plain decimal')
   }
-  if (entry.settling) {
-    if (!isStreamStamp(entry.settling.first) || !entry.settling.later.every(isStreamStamp)) throw new ReportInvalid('an unsettled entry carries a bad stamp')
+  if (entry.settling !== undefined) {
+    if (typeof entry.settling !== 'object' || entry.settling === null || !isStreamStamp(entry.settling.first) || !Array.isArray(entry.settling.later) || !entry.settling.later.every(isStreamStamp)) throw new ReportInvalid('an unsettled entry carries a bad stamp')
   }
 }
 
@@ -239,10 +246,25 @@ export function buildReport(input: ReportInput, sequence: number, previousReport
   if (!Number.isSafeInteger(sequence) || sequence < 1) throw new ReportInvalid('sequence must be a positive integer')
   if ((sequence === 1) !== (previousReportSha256 === null)) throw new ReportInvalid('previousReportSha256 is null exactly for sequence 1')
   if (previousReportSha256 !== null && !SHA256_RE.test(previousReportSha256)) throw new ReportInvalid('previousReportSha256 is not a sha256')
+  if (!Array.isArray(input.items) || !Array.isArray(input.streams)) throw new ReportInvalid('items and streams must be lists')
+  if (input.streams.some((bracket) => typeof bracket !== 'object' || bracket === null || typeof bracket.stream !== 'string')) throw new ReportInvalid('a stream bracket is not an object with a stream')
   const streams = [...input.streams].sort((a, b) => a.stream.localeCompare(b.stream))
   for (const [index, bracket] of streams.entries()) {
     if (!isReadSyncStream(bracket.stream) || (index > 0 && streams[index - 1]!.stream === bracket.stream)) throw new ReportInvalid('a stream is unknown or repeated')
     for (const stamp of [bracket.start, bracket.end]) if (stamp !== null && !isStreamStamp(stamp)) throw new ReportInvalid('a stream stamp is not an ISO time')
+  }
+  for (const item of input.items) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) throw new ReportInvalid('an item is not an object')
+    if (!Array.isArray(item.reasons)) throw new ReportInvalid(`item ${String(item.id)}: reasons must be a list`)
+    if (item.sources !== undefined && !Array.isArray(item.sources)) throw new ReportInvalid(`item ${String(item.id)}: sources must be a list`)
+    if (item.proof !== undefined && item.proof !== null && (typeof item.proof !== 'object' || Array.isArray(item.proof))) throw new ReportInvalid(`item ${String(item.id)}: proof must be an object`)
+    if (item.entries !== undefined) {
+      if (typeof item.entries !== 'object' || item.entries === null || Array.isArray(item.entries)) throw new ReportInvalid(`item ${String(item.id)}: entries must be an object`)
+      for (const [bucket, list] of Object.entries(item.entries)) {
+        if (!(COMPARISON_BUCKETS as readonly string[]).includes(bucket)) throw new ReportInvalid(`item ${String(item.id)}: unknown bucket`)
+        if (!Array.isArray(list)) throw new ReportInvalid(`item ${String(item.id)}: a bucket must be a list`)
+      }
+    }
   }
   const byId = new Map(input.items.map((item) => [item.id, item]))
   if (byId.size !== input.items.length || PACK_ITEM_IDS.some((id) => !byId.has(id)) || input.items.length !== PACK_ITEM_IDS.length) {
@@ -417,7 +439,7 @@ export function verifyEvidence(text: string, record: ReportRecord): void {
     if (typeof entry.item !== 'string' || !(PACK_ITEM_IDS as readonly string[]).includes(entry.item)) throw new ReportInvalid('an evidence line names an unknown item')
     if (typeof entry.bucket !== 'string' || !(LISTED_BUCKETS as readonly string[]).includes(entry.bucket)) throw new ReportInvalid('an evidence line names an unknown bucket')
     if (!isSafeTokenShape(entry.key)) throw new ReportInvalid('an evidence key is not a sanitised token')
-    for (const value of [entry.ims, entry.vendor, entry.delta]) if (value !== null && parseDecimalStrict(value) === null) throw new ReportInvalid('an evidence value is not a plain decimal')
+    for (const value of [entry.ims, entry.vendor, entry.delta]) if (value !== null && !isCanonicalDecimal(value)) throw new ReportInvalid('an evidence value is not a canonical plain decimal')
     if (entry.settling !== undefined) {
       if (entry.bucket !== 'unsettled' || !isRecord(entry.settling)) throw new ReportInvalid('settling data on a line that is not unsettled')
       exactKeys(entry.settling, ['first', 'later'], 'settling data')

@@ -24,13 +24,15 @@ import {
   COMPARISON_BUCKETS,
   EXACT_DECIMAL_TOLERANCE,
   FINDING_BUCKETS,
+  isKnownCurrency,
+  isPackEmptyProofCode,
   PENDING_PERSISTENCE_RUNS,
   type ComparisonBucket,
   type ItemProof,
   type PackEmptyProofCode,
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
-import { canonicalKey, keyToken, type KeyPart, type SafeToken } from '@/lib/reconciliation-pack/identity'
+import { canonicalKey, isKey, keyToken, type KeyPart, type SafeToken } from '@/lib/reconciliation-pack/identity'
 
 type Dec = Prisma.Decimal
 
@@ -46,13 +48,30 @@ export function parseDecimalStrict(value: unknown): Dec | null {
   return new Prisma.Decimal(value)
 }
 
+/** The one text form of a decimal: minus zero is zero, nothing else changes. */
+export function decimalText(value: Dec): string {
+  return value.isZero() ? '0' : value.toFixed()
+}
+
 export type Tolerance =
   | { rule: 'exact' }
   | { rule: 'absolute'; limit: string }
   | { rule: 'composite'; floor: string; fraction: string }
   | { rule: 'minor-unit' }
 
-const CURRENCY_RE = /^[A-Z]{3}$/
+/** Whether `tolerance` is a rule this module can apply: a known rule, and every limit a non-negative plain decimal. */
+export function isUsableTolerance(tolerance: unknown): tolerance is Tolerance {
+  if (typeof tolerance !== 'object' || tolerance === null) return false
+  const t = tolerance as Record<string, unknown>
+  if (typeof t.rule !== 'string' || !['exact', 'absolute', 'composite', 'minor-unit'].includes(t.rule)) return false
+  const nonNegative = (value: unknown) => { const d = parseDecimalStrict(value); return d !== null && !d.isNegative() }
+  switch (t.rule) {
+    case 'exact': case 'minor-unit': return true
+    case 'absolute': return nonNegative(t.limit)
+    case 'composite': return nonNegative(t.floor) && nonNegative(t.fraction)
+    default: return false // 'none' describes a count, not a measure: it cannot compare values
+  }
+}
 
 /** The largest absolute difference the rule accepts for this pair, or null when the rule cannot be applied (unknown currency). */
 export function toleranceLimit(tolerance: Tolerance, ims: Dec, vendor: Dec, currency?: string | null): Dec | null {
@@ -64,7 +83,7 @@ export function toleranceLimit(tolerance: Tolerance, ims: Dec, vendor: Dec, curr
       return Prisma.Decimal.max(new Prisma.Decimal(tolerance.floor), base.mul(tolerance.fraction))
     }
     case 'minor-unit': {
-      if (typeof currency !== 'string' || !CURRENCY_RE.test(currency)) return null
+      if (!isKnownCurrency(currency)) return null
       return new Prisma.Decimal(1).div(new Prisma.Decimal(10).pow(currencyMinorUnits(currency)))
     }
   }
@@ -130,7 +149,10 @@ export type CompareInput = {
   vendorComplete: boolean
   /** Positive evidence, by name, that an empty comparison is the true answer (for example a vendor total of zero). */
   emptyProof?: PackEmptyProofCode
-  tolerance: Tolerance
+  /** values or presence, fixed per item by the catalogue (getPackItem(id).mode); never inferred from the rows. */
+  mode: 'values' | 'presence'
+  /** Required in values mode; ignored in presence mode. */
+  tolerance?: Tolerance
   /** The recorded population, as canonical keys. Absent = everything is in. */
   population?: ReadonlySet<string>
   /** Identities with an unexpired written exclusion, as canonical keys. */
@@ -148,47 +170,77 @@ function emptyBuckets(): Record<ComparisonBucket, CompareEntry[]> {
 }
 
 type Indexed = { token: SafeToken; value: string | null; dec: Dec | null; currency: string | null }
+type Mode = 'values' | 'presence'
 
-/** Index one side by canonical key; null when a key repeats, a value is bad, or two keys print alike. */
-function indexSide(rows: readonly SideRow[]): { map: Map<string, Indexed>; hasValues: boolean } | PackReasonCode {
+/** Index one side by canonical key, refusing (with a closed code) any row that cannot be read exactly. */
+function indexSide(rows: unknown, mode: Mode, minorUnit: boolean): Map<string, Indexed> | PackReasonCode {
+  if (!Array.isArray(rows)) return 'SOURCE_UNREADABLE'
   const map = new Map<string, Indexed>()
   const tokens = new Set<string>()
-  let valued = 0
-  for (const row of rows) {
-    const canonical = canonicalKey(row.key)
-    const token = keyToken(row.key)
+  for (const row of rows as unknown[]) {
+    if (typeof row !== 'object' || row === null || Array.isArray(row)) return 'BAD_KEY'
+    const { key, value, currency } = row as { key?: unknown; value?: unknown; currency?: unknown }
+    if (!isKey(key)) return 'BAD_KEY'
+    const canonical = canonicalKey(key)
+    const token = keyToken(key)
     if (map.has(canonical) || tokens.has(token)) return 'DUPLICATE_KEY'
     let dec: Dec | null = null
-    let value: string | null = null
-    if (row.value !== undefined && row.value !== null) {
-      dec = parseDecimalStrict(row.value)
+    let text: string | null = null
+    if (mode === 'values') {
+      if (value === undefined || value === null) return 'VALUE_MISSING'
+      dec = parseDecimalStrict(value)
       if (dec === null) return 'BAD_VALUE'
-      value = dec.toFixed()
-      valued += 1
+      text = decimalText(dec)
+    } else if (value !== undefined && value !== null) {
+      return 'VALUE_SHAPE_MISMATCH'
     }
-    map.set(canonical, { token, value, dec, currency: row.currency ?? null })
+    let currencyText: string | null = null
+    if (currency !== undefined && currency !== null) {
+      if (!isKnownCurrency(currency)) return 'CURRENCY_UNKNOWN'
+      currencyText = currency
+    } else if (minorUnit && mode === 'values') {
+      return 'CURRENCY_UNKNOWN'
+    }
+    map.set(canonical, { token, value: text, dec, currency: currencyText })
     tokens.add(token)
   }
-  if (valued !== 0 && valued !== rows.length) return 'VALUE_SHAPE_MISMATCH'
-  return { map, hasValues: valued > 0 }
+  return map
+}
+
+function validCarried(carried: unknown): boolean {
+  if (!(carried instanceof Map)) return false
+  for (const [key, record] of carried) {
+    if (typeof key !== 'string' || typeof record !== 'object' || record === null) return false
+    const r = record as Partial<CarriedDifference>
+    if (r.kind !== 'onlyIms' && r.kind !== 'onlyVendor' && r.kind !== 'bothDiffer') return false
+    if (!isStreamStamp(r.first) || !Array.isArray(r.later) || !r.later.every(isStreamStamp)) return false
+  }
+  return true
 }
 
 export function compareKeyed(input: CompareInput): CompareResult {
-  if (!input.imsComplete || !input.vendorComplete) return { status: 'unreadable', reason: 'READ_INCOMPLETE' }
-  const ims = indexSide(input.ims)
-  if (typeof ims === 'string') return { status: 'unreadable', reason: ims }
-  const vendor = indexSide(input.vendor)
-  if (typeof vendor === 'string') return { status: 'unreadable', reason: vendor }
-  if (input.ims.length > 0 && input.vendor.length > 0 && ims.hasValues !== vendor.hasValues) return { status: 'unreadable', reason: 'VALUE_SHAPE_MISMATCH' }
+  const unreadable = (reason: PackReasonCode): CompareResult => ({ status: 'unreadable', reason })
+  if (input.imsComplete !== true || input.vendorComplete !== true) return unreadable('READ_INCOMPLETE')
+  const mode = input.mode
+  if (mode !== 'values' && mode !== 'presence') return unreadable('BAD_MODE')
+  if (mode === 'values' && !isUsableTolerance(input.tolerance)) return unreadable('BAD_TOLERANCE')
+  if (input.population !== undefined && !(input.population instanceof Set)) return unreadable('NO_POPULATION_RECORD')
+  if (input.excluded !== undefined && !(input.excluded instanceof Set)) return unreadable('NO_POPULATION_RECORD')
+  if (input.settling !== undefined && !validCarried(input.settling.carried)) return unreadable('SOURCE_UNREADABLE')
+  const minorUnit = mode === 'values' && input.tolerance!.rule === 'minor-unit'
+  const ims = indexSide(input.ims, mode, minorUnit)
+  if (typeof ims === 'string') return unreadable(ims)
+  const vendor = indexSide(input.vendor, mode, minorUnit)
+  if (typeof vendor === 'string') return unreadable(vendor)
   const stamp = input.settling?.stamp ?? null
-  if (input.settling && !isStreamStamp(stamp)) return { status: 'unreadable', reason: 'STALE_BASIS' }
+  if (input.settling && !isStreamStamp(stamp)) return unreadable('STALE_BASIS')
 
   const buckets = emptyBuckets()
   const nextCarried = new Map<string, CarriedDifference>()
-  const keys = new Set<string>([...ims.map.keys(), ...vendor.map.keys()])
+  const keys = new Set<string>([...ims.keys(), ...vendor.keys()])
   for (const canonical of [...keys].sort()) {
-    const a = ims.map.get(canonical)
-    const b = vendor.map.get(canonical)
+    const a = ims.get(canonical)
+    const b = vendor.get(canonical)
     const token = (a ?? b)!.token
     const entry: CompareEntry = { key: token, ims: a?.value ?? null, vendor: b?.value ?? null, delta: null }
     if (input.population && !input.population.has(canonical)) { buckets.outOfPopulation.push(entry); continue }
@@ -197,15 +249,15 @@ export function compareKeyed(input: CompareInput): CompareResult {
     let kind: DifferenceKind | null = null
     if (a && !b) kind = 'onlyIms'
     else if (!a && b) kind = 'onlyVendor'
-    else if (a && b) {
-      if (a.dec && b.dec) {
-        entry.delta = a.dec.minus(b.dec).toFixed()
-        if (a.currency !== b.currency && input.tolerance.rule === 'minor-unit') kind = 'bothDiffer'
-        else {
-          const within = withinTolerance(input.tolerance, a.dec, b.dec, a.currency)
-          if (within === null) return { status: 'unreadable', reason: 'CURRENCY_UNKNOWN' }
-          if (!within) kind = 'bothDiffer'
-        }
+    else if (a && b && mode === 'values') {
+      // Both rows carry a decimal here: indexSide refused anything else.
+      if ((a.currency === null) !== (b.currency === null)) return unreadable('CURRENCY_UNKNOWN')
+      entry.delta = decimalText(a.dec!.minus(b.dec!))
+      if (a.currency !== b.currency) kind = 'bothDiffer'
+      else {
+        const within = withinTolerance(input.tolerance as Tolerance, a.dec!, b.dec!, a.currency)
+        if (within === null) return unreadable('CURRENCY_UNKNOWN')
+        if (!within) kind = 'bothDiffer'
       }
     }
     if (kind === null) { buckets.bothEqual.push(entry); continue }
@@ -217,8 +269,8 @@ export function compareKeyed(input: CompareInput): CompareResult {
   }
 
   const compared = COMPARISON_BUCKETS.filter((bucket) => bucket !== 'outOfPopulation').reduce((sum, bucket) => sum + buckets[bucket].length, 0)
-  if (compared === 0 && !input.emptyProof) return { status: 'unreadable', reason: 'EMPTY_UNPROVEN' }
-  const proof: ItemProof = compared === 0 ? { kind: 'proven-empty', source: input.emptyProof! } : { kind: 'compared' }
+  if (compared === 0 && !isPackEmptyProofCode(input.emptyProof)) return unreadable('EMPTY_UNPROVEN')
+  const proof: ItemProof = compared === 0 ? { kind: 'proven-empty', source: input.emptyProof as PackEmptyProofCode } : { kind: 'compared' }
   return { status: 'compared', buckets, nextCarried, proof }
 }
 
