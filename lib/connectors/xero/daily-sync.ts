@@ -101,7 +101,7 @@ import {
   unearnedReversalStandingReport,
   type UnearnedReversalSyncRow,
 } from '@/lib/domain/accounting/deferred-trueup'
-import { LEDGER_STANDING_SELECT, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT, isShadowedObligation, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
@@ -787,7 +787,7 @@ export function dailyBatchUnprovedRefusal(type: string, describe: string): strin
   )
 }
 
-async function dailyBatchRecreateVerdict(
+export async function dailyBatchRecreateVerdict(
   type: DailyBatchLogType,
   refs: string | DailyBatchLiveRefs,
 ): Promise<DailyBatchRecreateVerdict> {
@@ -856,8 +856,13 @@ async function dailyBatchRecreateVerdict(
   // ever reads can carry `settlementBasis = OPERATOR_ASSERTION`. The column is selected anyway,
   // because handing a shared rule a row with the field missing is how a silent `undefined` becomes
   // a verdict.
-  const unproved = rows.filter((row) => !cancelledClaimIsResolved(row))
-  if (unproved.length === 0) return { blocked: false, refusal: null }
+  const unprovedOrShadow = rows.filter((row) => !cancelledClaimIsResolved(row))
+  if (unprovedOrShadow.length === 0) return { blocked: false, refusal: null }
+  // A SHADOW is the producer-side hold's record of this very batch: IMS did not send it and a rebuild must not happen over it (it blocks),
+  // but it is not "a cancelled or failed row that might have posted by mistake", and there is nothing for an operator to settle or re-post: the
+  // refusal's remedy would have them duplicate the owner's journal. It blocks quietly; any OTHER unproved row still gets the refusal.
+  const unproved = unprovedOrShadow.filter((row) => !isShadowedObligation(row))
+  if (unproved.length === 0) return { blocked: true, refusal: null }
   const describe = unproved
     .map((row) => `${row.referenceId} (${row.id}, ${row.status}${row.externalTransactionId ? `, external id ${row.externalTransactionId}` : ''})`)
     .join(', ')

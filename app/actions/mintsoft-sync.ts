@@ -49,7 +49,7 @@ import {
   createMintsoftBindingHandover,
   runStockSyncForBinding,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
-import { mintsoftProducerSeam } from '@/lib/connectors/mintsoft/producer-seam'
+import { mintsoftAsnCreateShadowNotice, mintsoftProducerSeam } from '@/lib/connectors/mintsoft/producer-seam'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { describeContentRun } from '@/lib/connectors/mintsoft/sync/product-content-sync'
 import { describeShadowedBundles, describeShadowedProducts } from '@/lib/connectors/mintsoft/operator-action-seam'
@@ -1746,6 +1746,8 @@ export async function getMintsoftPurchaseOrderAsnState(
     blockedReason = 'Mintsoft is disabled.'
   } else if (!canManage) {
     blockedReason = 'You do not have permission to create Mintsoft ASNs.'
+  } else if (mintsoftAsnCreateShadowNotice()) {
+    blockedReason = mintsoftAsnCreateShadowNotice()
   } else if (po.type !== 'GOODS') {
     blockedReason = 'Mintsoft ASNs are only available for goods purchase orders.'
   } else if (!po.destinationWarehouseId) {
@@ -1907,6 +1909,8 @@ export async function getMintsoftTransferAsnStates(
       blockedReason = 'Mintsoft is disabled.'
     } else if (!canManage) {
       blockedReason = 'You do not have permission to create Mintsoft ASNs for transfers.'
+    } else if (mintsoftAsnCreateShadowNotice()) {
+      blockedReason = mintsoftAsnCreateShadowNotice()
     } else if (!binding) {
       blockedReason = 'Bind the destination warehouse to Mintsoft before creating an ASN.'
     } else if (transfer.status !== 'IN_TRANSIT') {

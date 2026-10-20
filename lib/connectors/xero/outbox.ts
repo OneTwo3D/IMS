@@ -73,7 +73,8 @@ export async function scheduleXeroAccountingOutbox(
   }
 
   await client.integrationOutbox.updateMany({
-    where: { id: row.id, status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING } },
+    // A job the held-backlog retirement SHADOWED is a record, not work: re-arming it would erase that record and make a retired job claimable again.
+    where: { id: row.id, status: { notIn: [INTEGRATION_OUTBOX_STATUS.PROCESSING, INTEGRATION_OUTBOX_STATUS.SHADOWED] } },
     data: {
       connector: XERO_OUTBOX_CONNECTOR,
       operation: XERO_ACCOUNTING_POST_OPERATION,

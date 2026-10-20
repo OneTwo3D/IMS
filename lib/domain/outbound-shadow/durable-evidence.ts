@@ -76,3 +76,18 @@ export async function findDurableShadowRecords(
     occurrences: Number(row.occurrences),
   }))
 }
+
+/**
+ * Whether a durable shadow record names this accounting sync row as the carrier of its standing (`accounting_sync_log_id`). The sync row of a
+ * shadow expires with retention while the record persists, so "the row named by a stamp is no longer on record" is not by itself evidence
+ * that the posting was settled or abandoned: when this answers true the row WAS a shadow. A client that cannot run the read THROWS.
+ */
+export async function shadowRecordNamesSyncLog(client: ShadowEvidenceClient, syncLogId: string): Promise<boolean> {
+  if (typeof client?.$queryRaw !== 'function') {
+    throw new Error('shadowRecordNamesSyncLog needs a client that can read outbound_shadow_writes; refusing to treat "could not ask" as "none recorded"')
+  }
+  const rows = await client.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT id FROM outbound_shadow_writes WHERE accounting_sync_log_id = ${syncLogId} LIMIT 1
+  `)
+  return rows.length > 0
+}

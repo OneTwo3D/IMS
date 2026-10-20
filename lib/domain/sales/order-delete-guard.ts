@@ -2,6 +2,7 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { parseAllocationDebitPasses } from '@/lib/domain/accounting/allocation-debit-passes'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { findDurableShadowRecords, type ShadowSubjectQuery } from '@/lib/domain/outbound-shadow/durable-evidence'
+import { findOrderWarehouseShadowRecords, warehouseCreateObligationUnrecorded } from '@/lib/connectors/wms/producer-seam'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import {
@@ -100,6 +101,10 @@ export type SalesOrderDeleteBlocker = {
     | 'accounting_sync_live'
     // A durable shadow record (outbound_shadow_writes) for this order or its batch journals, read after the sync row itself has expired.
     | 'accounting_shadow_recorded'
+    // A durable shadow record of the warehouse create, read when the order has no push link (the producer-side hold writes none).
+    | 'wms_shadow_recorded'
+    // A paid order with no push link and no shadow record while the warehouse is held: the record may have failed to write.
+    | 'wms_create_unrecorded'
     | 'accounting_document_exists'
     | 'daily_batch_staged'
     | 'parked_refund'
@@ -386,6 +391,31 @@ export async function findSalesOrderDeleteBlocker(
         : `Cannot delete an order that has been claimed for or sent to the warehouse management system `
           + `(push state ${pushLink.state}${ref ? `, WMS order ${ref}` : ''}). Cancel the order instead so the WMS order is withdrawn.`,
     })
+  }
+
+  // THE WAREHOUSE SHADOW. While the producer-side hold stands for the warehouse the push sweep records a SHADOW of the order create instead
+  // of making a link, so "no push link" no longer proves that nothing was called: the writer that owns order creation in this phase (the
+  // bridge) may well have created the warehouse order. The durable record is the evidence IMS has, and an irreversible delete refuses on it.
+  // Asked only when the hold is enforced for the warehouse (switch off: nothing here changes, byte for byte), and a read that cannot be made
+  // throws rather than reading as "none recorded".
+  if (!pushLink) {
+    const warehouseShadows = await findOrderWarehouseShadowRecords(tx, orderId)
+    if (warehouseShadows.length > 0) {
+      blockers.push({
+        code: 'wms_shadow_recorded',
+        message: 'Cannot delete an order whose warehouse push IMS recorded as a SHADOW instead of sending '
+          + `(${[...new Set(warehouseShadows.map((record) => record.operation))].sort().join(', ')}). IMS holds no push link for it, and that does not say the warehouse has no order: `
+          + 'the writer that owns this operation in the current phase may have created it. Check the warehouse for it and cancel the order instead of deleting it, which keeps the record.',
+      })
+    } else if (await warehouseCreateObligationUnrecorded(tx as never, orderId)) {
+      // The record of a held create is best-effort: a transient failure to write it leaves exactly this shape. Without it "no link, no record" would
+      // read as "nothing was called" and the delete would destroy the only local trace of an order the bridge may have created.
+      blockers.push({
+        code: 'wms_create_unrecorded',
+        message: 'Cannot delete a paid order while writes to the warehouse are held on this installation: IMS keeps no push link for it and holds no record of what it declined to push, '
+          + 'so it cannot tell whether the writer that owns order creation in this phase made a warehouse order for it. Check the warehouse and cancel the order instead of deleting it.',
+      })
+    }
   }
 
   // 2. Accounting documents keyed by this order (or by one of its shipments).
@@ -769,7 +799,10 @@ export async function findSalesOrderDeleteBlocker(
         // finance to reverse an entry that does not exist creates an erroneous one - so it is conditional on existence.
         (batchStanding === 'CONFIRMED_POSTED'
           ? 'The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.'
-          : (batchStanding === 'ASSERTED_NOT_POSTED' || batchStanding === 'UNKNOWN' || batchStanding === 'SHADOW_NOT_SENT_BY_IMS'
+          : (batchStanding === 'SHADOW_NOT_SENT_BY_IMS'
+            ? 'IMS recorded this batch journal as a SHADOW instead of sending it (writes to the accounting system are held on this installation), so whether it is in '
+              + 'the accounting system is UNPROVEN: the writer that owns this operation in the current phase may have posted it. '
+            : batchStanding === 'ASSERTED_NOT_POSTED' || batchStanding === 'UNKNOWN'
             ? 'Whether this batch journal reached the accounting system is UNPROVEN (an operator settled it as not posted, '
               + 'or it was retired with no recorded pre-call proof). '
             : batchStanding === 'ASSERTED_POSTED'
@@ -861,6 +894,9 @@ export async function findSalesOrderDeleteBlocker(
     committed_shipment: 6,
     wms_order_status_snapshot: 7,
     wms_order_push_link: 8,
+    // The same rank as a push link: a warehouse record IMS holds instead of a link.
+    wms_shadow_recorded: 8,
+    wms_create_unrecorded: 8,
   }
   const severity = (blocker: SalesOrderDeleteBlocker) => REMEDY_RANK[blocker.code]
   return [...blockers].sort((a, b) => severity(a) - severity(b))[0]

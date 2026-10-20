@@ -589,6 +589,10 @@ export async function proveAllocationDebitPosting<C extends string = string>(
             ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED: it was verified reversed in the ledger and is no longer present there. It may have been posted earlier, so check whether a debit to Allocated Inventory still stands before reconciling`
           : standing === 'PROVEN_NOT_POSTED'
             ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED, and it is PROVEN never to have posted — nothing has been debited to Allocated Inventory for this order to reverse`
+            : standing === 'SHADOW_NOT_SENT_BY_IMS'
+              // A shadow is the producer-side hold's record: IMS did not send this journal, and whether the ledger's owner posted it is not known.
+              // Same refusal as every other unproven journal (nothing is credited), in words that do not call it a cancelled or failed row.
+              ? 'the A2 journal this order was staged into was recorded as a SHADOW (IMS did not send it: writes to the ledger are held on this installation), so whether a debit to Allocated Inventory stands is UNPROVEN: the ledger\'s owner may have posted it. Check the accounting system for that journal before reconciling'
             : standing === 'LIVE_WORK'
               ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED — it is still queued or in flight, so nothing has been confirmed as debited yet`
               // ASSERTED_NOT_POSTED, UNKNOWN, or a row naming a connector id that never settled: UNPROVEN either way

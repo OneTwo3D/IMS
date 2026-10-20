@@ -35,6 +35,7 @@ import {
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
 import { hasPostEvidence, registrationLedgerStanding } from './payment-ledger-hold'
+import { isShadowedObligation } from './ledger-standing'
 
 /** The payment sync row for one invoice/bill, reduced to what the verdict depends on. */
 export type PaymentSyncRow = {
@@ -302,6 +303,26 @@ export function settlementStatus(input: {
    */
   currency?: string | null
 }): SettlementVerdict {
+  // A SHADOW IS ITS OWN ANSWER, in both directions of the comparison. The producer-side hold recorded this payment registration instead of
+  // sending it (CANCELLED, HELD_SHADOW basis, no payment id): IMS attempted nothing, so it is neither "an attempt whose outcome was never
+  // recorded" nor "a payment the ledger still names", and the orphan sweep will not retire it. It is not a fault IMS can repair either: the
+  // owner of the operation in this phase may have registered the payment, which is not known. Not a discrepancy, and not proof either way.
+  if (input.payment && isShadowedObligation({
+    status: input.payment.status,
+    externalTransactionId: input.payment.externalTransactionId ?? null,
+    settlementBasis: input.payment.settlementBasis ?? null,
+    abandonedBeforeRemoteCall: input.payment.abandonedBeforeRemoteCall ?? null,
+  })) {
+    return {
+      status: 'LEDGER_UNDECIDED',
+      discrepancy: false,
+      basis: 'NONE',
+      detail:
+        'IMS recorded this payment registration as a shadow and did not send it: writes to the ledger are held on this installation. '
+        + 'That says nothing about whether the owner of this operation has registered the payment. Check the invoice in the accounting system '
+        + 'before registering anything against it.',
+    }
+  }
   if (!input.paidLocally) {
     // THE DISAGREEMENT POINTING THE OTHER WAY. Deleting a receipt whose registration already reached the
     // ledger succeeds locally — the payment is still attached to the invoice there, and paidAt clears

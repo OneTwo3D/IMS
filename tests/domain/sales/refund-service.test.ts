@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { shadowEvidenceFake, type FakeShadowRecord } from '../../helpers/shadow-evidence-fake'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
@@ -207,6 +208,8 @@ type RefundLine = {
 }
 
 type State = {
+  /** Durable shadow records (outbound_shadow_writes) the fake `$queryRaw` answers from. Default none. */
+  shadowRecords?: FakeShadowRecord[]
   orders: Order[]
   lines: SalesLine[]
   refunds: Refund[]
@@ -395,7 +398,7 @@ function createClient(state: State): RefundServiceClient {
   // by refund creation: physical SHIPPED rows for restocking and journaled rows
   // for accounting reversal snapshots.
   const client = {
-    $queryRaw: async () => [],
+    $queryRaw: (query: unknown) => shadowEvidenceFake(state.shadowRecords ?? []).queryRaw(query),
     $executeRaw: async () => {
       state.executeRawCalls += 1
       return 0
@@ -9587,3 +9590,22 @@ for (const arm of MIXED_ARMS) {
     assert.equal(credit, arm.credit)
   })
 }
+
+test('[shadow] a prior refund whose reversal journal was a SHADOW is not counted from the record once retention has deleted the row: the durable shadow record keeps it unresolved', async () => {
+  const shadow = { destination: 'xero', operation: 'inventory.journals', subject_type: 'SalesOrderRefund', subject_id: 'refund-prior' }
+  const expired = priorRefundOwingState({ priorFlag: false })
+  expired.shadowRecords = [shadow]
+  const held = await retryRefund2(expired)
+  console.log(`shadow reader (row expired, record present): credit=${held.credit} note=${held.note.slice(0, 140)}`)
+  assert.equal(held.credit, null, 'nothing is credited against an open balance that cannot be established')
+  assert.match(held.note, /reversal journal IMS recorded as a SHADOW instead of sending/)
+  assert.doesNotMatch(held.note, /counted from its own record/)
+  // CONTROL: the same expired row with NO shadow record is still the ordinary retention reading, and another refund's record does not apply.
+  for (const records of [[], [{ ...shadow, subject_id: 'refund-other' }], [{ ...shadow, destination: 'woocommerce' }]]) {
+    const state = priorRefundOwingState({ priorFlag: false })
+    state.shadowRecords = records
+    const control = await retryRefund2(state)
+    assert.equal(control.credit, 30, 'CONTROL: counted from its own record, as before')
+    assert.match(control.note, /counted from its own record because its reversal journal is no longer on record \(retention\)/)
+  }
+})

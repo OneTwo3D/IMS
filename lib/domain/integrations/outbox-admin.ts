@@ -81,6 +81,11 @@ const PERMANENT_FAILABLE_STATUSES = [
 
 export type AdminIntegrationOutboxRow = Omit<IntegrationOutboxRow, 'payloadJson'> & {
   payloadJson: unknown
+  /**
+   * Present only when the destination is live and this job was queued BEFORE its live-from instant: it will never be delivered by IMS (the
+   * claim excludes it and a replay is refused), so it must not read as owed work that is stuck. The instant it predates, as ISO text.
+   */
+  beforeCutoff?: string
 }
 
 export type ListIntegrationOutboxAdminOptions = {
@@ -190,11 +195,15 @@ function createdAtFilter(options: ListIntegrationOutboxAdminOptions): Record<str
 function listWhere(options: ListIntegrationOutboxAdminOptions): Record<string, unknown> {
   const status = requiredStatus(options)
   const createdAt = createdAtFilter(options)
+  // THE OLDEST-PENDING VIEW answers "which deliverable job has waited longest": a job queued before the live-from instant is never delivered, so
+  // it would head this list for ever. Excluded here (it stays visible, marked, in every other listing). With no floor nothing is added.
+  const beforeCutoff = options.oldestPending ? outboxBeforeCutoffWhere() : null
   return {
     ...(options.connector ? { connector: options.connector } : {}),
     ...(options.operation ? { operation: options.operation } : {}),
     ...(status ? { status } : {}),
     ...(createdAt ? { createdAt } : {}),
+    ...(beforeCutoff ? { NOT: beforeCutoff } : {}),
   }
 }
 
@@ -242,9 +251,11 @@ export function redactIntegrationOutboxPayload(payloadJson: unknown): unknown {
 }
 
 export function toAdminIntegrationOutboxRow(row: IntegrationOutboxRow): AdminIntegrationOutboxRow {
+  const floor = row.status === INTEGRATION_OUTBOX_STATUS.SHADOWED ? null : outboxRowBeforeCutoff(row)
   return {
     ...row,
     payloadJson: redactIntegrationOutboxPayload(row.payloadJson),
+    ...(floor ? { beforeCutoff: floor.toISOString() } : {}),
   }
 }
 

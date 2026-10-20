@@ -1,5 +1,5 @@
 import { db } from '@/lib/db'
-import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
+import { findDurableShadowRecords, type DurableShadowRecord, type ShadowEvidenceClient } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { mintsoftDrainHold, mintsoftProducerSeam, type MintsoftSeamInput, type MintsoftShadow } from '@/lib/connectors/mintsoft/producer-seam'
 import type { MintsoftHold } from '@/lib/connectors/mintsoft/producer-egress'
 import type { OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
@@ -138,4 +138,42 @@ export async function wmsOrderCreateShadowEvidence(connectorId: string, orderId:
     console.error(`[producer-hold] could not read the shadow record of order ${orderId}: ${error instanceof Error ? error.message : String(error)}`)
     return null
   }
+}
+
+/**
+ * THE DURABLE SHADOW RECORDS OF AN ORDER'S WAREHOUSE WRITES, for a destructive reader (the order hard delete). While the producer-side hold
+ * stands for the warehouse a create is a shadow and writes no push link, so "no link" proves nothing was called: the writer that owns order
+ * creation in the current phase may have made the warehouse order, and the record is the only evidence IMS holds.
+ *
+ * INDEPENDENT OF THE ENFORCEMENT SWITCH. The record outlives the switch: turning enforcement off does not make the bridge's warehouse order
+ * go away, so the question is asked of the durable table whatever the environment says. An order with no record gets the legacy answer (an
+ * empty list); the only cost with the switch off is one indexed read. A client that cannot run the read THROWS (it never reads as "none").
+ */
+export async function findOrderWarehouseShadowRecords(client: ShadowEvidenceClient, orderId: string): Promise<DurableShadowRecord[]> {
+  const destinations = [...new Set(Object.values(WMS_PRODUCER_DESTINATION))]
+  const found: DurableShadowRecord[] = []
+  for (const destination of destinations) {
+    found.push(...await findDurableShadowRecords(client, destination, [{ subjectType: 'SalesOrder', exactIds: [orderId] }]))
+  }
+  return found
+}
+
+/**
+ * THE CREATE OBLIGATION WHOSE SHADOW COULD NOT BE RECORDED. The seam keeps the record of a held create best-effort (a failed write is logged and
+ * counted, never allowed to abort the business transaction), and a held create writes no push link, so a transient failure leaves an order that
+ * IMS declined to push, the bridge may have created in the warehouse, and nothing in IMS says so. The order hard delete must not read that as
+ * "nothing was called". It is fail-closed on the facts it CAN read: the warehouse is held (enforced and not live) and the order is paid, so the
+ * sweep owed it a create and this installation cannot tell what became of it.
+ *
+ * True only while the hold stands for a warehouse connector (switch off, or live: false, the legacy answer) and only for a paid order; the caller
+ * asks it only when the order has no push link and no durable record. A read that cannot be made throws.
+ */
+export async function warehouseCreateObligationUnrecorded(
+  client: { salesOrder: { findUnique(args: { where: { id: string }; select: { paidAt: true } }): Promise<{ paidAt: Date | null } | null> } },
+  orderId: string,
+): Promise<boolean> {
+  const held = (Object.keys(WMS_PRODUCER_DESTINATION) as WmsConnectorId[]).some((id) => wmsProducerHold(id).held)
+  if (!held) return false
+  const order = await client.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true } })
+  return Boolean(order?.paidAt)
 }

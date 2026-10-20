@@ -1,0 +1,43 @@
+# SHADOW-READER CENSUS, RUN UNCONDITIONALLY.
+#
+# Every place that reads the PRESENCE of a sync row, an outbox job, a warehouse link, a storefront sync log or a daily-batch stamp as a
+# statement about what was sent, pending, done or failed must be DECLARED in scripts/shadow-reader-declarations.ts with how it reads a
+# producer-side-hold SHADOW (a record, not a queued row). `scripts/check-shadow-readers.ts` fails the build on a new undeclared reader, on a
+# declaration nothing matches, and on a count that moved. See scripts/shadow-reader-census.ts for what it counts.
+#
+# NO `paths:` FILTER, NO classifier, NO `needs:`, NO `if:`, NO `continue-on-error`: readers are scattered across app/, lib/ and scripts/,
+# and a guard a change classifier can switch off is not a guard (the same argument producer-census-guard.yml settled).
+# tests/scripts/ci-guard-coverage.test.ts parses this file and fails if any of those appears, or if the one `npm run check:*` step below is
+# not a single bare line.
+#
+# `npm ci` because the scan imports `typescript` and runs under `tsx`. No Prisma client, database or build
+# is involved: the scan reads syntax only.
+name: Shadow Reader Census Guard
+
+on:
+  pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shadow-reader-census-guard-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shadow-reader-census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:shadow-readers
