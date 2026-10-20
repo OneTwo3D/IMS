@@ -106,19 +106,21 @@ test('unbound or unverified variant parents are refused: no bundle named, the fi
   const edited = new TextEncoder().encode(text(bundle.csv).replace('REAL-PARENT', 'EVIL-PARENT'))
   const arms: Array<[string, ReturnType<typeof manifestFor>, typeof woo | null, RegExp]> = [
     ['no wooSnapshot in the apply manifest', manifestFor(bundle, {}, null), null, /must name the verified snapshot bundle/],
-    ['variant-parents.csv edited', manifestFor(bundle), { ...woo, variantParents: edited }, /snapshot is not verified.*variant-parents\.csv/],
+    ['variant-parents.csv edited', manifestFor(bundle), { ...woo, variantParents: edited }, /snapshot is not verified \(\d+ problem/],
     ['snapshot and provenance of another snapshot', manifestFor(bundle), { snapshot: other.snapshot, provenance: other.provenance, variantParents: bundle.csv }, /snapshot is not verified/],
     ['CSV of another snapshot, bundle of this one', manifestFor(bundle), { ...woo, variantParents: other.csv }, /snapshot is not verified/],
-    ['declared origin differs', manifestFor({ origin: 'https://other-shop.example' }), woo, /declared store/],
-    ['attestation differs', manifestFor(bundle, {}, { visibilityChecked: { products: { publish: 9, draft: 0, private: 0, pending: 0 }, variations: ATTESTED.variations } }), woo, /different variable products/],
+    ['declared origin differs', manifestFor({ origin: 'https://other-shop.example' }), woo, /snapshot is not verified \(\d+ problem/],
+    ['attestation differs', manifestFor(bundle, {}, { visibilityChecked: { products: { publish: 9, draft: 0, private: 0, pending: 0 }, variations: ATTESTED.variations } }), woo, /snapshot is not verified \(\d+ problem/],
   ]
   precondition(t, 'refusal arms', arms.length)
   for (const [label, manifest, bytes, pattern] of arms) {
     const loaded = loadPreparedRun({ manifest, files, woo: bytes })
     assert.ok(!loaded.ok && loaded.problems.some((p) => pattern.test(p)), `${label}: ${loaded.ok ? 'was accepted' : JSON.stringify(loaded.problems)}`)
+    // Snapshot values (SKUs, ids) never reach the text: only the number of problems does.
+    if (!loaded.ok) assert.ok(!/EVIL-PARENT|REAL-PARENT|V-33/.test(loaded.problems.join('\n')), `${label}: a snapshot value is printed`)
   }
   const unreadable = loadPreparedRun({ manifest: manifestFor(bundle), files, woo: { ...woo, provenance: null } })
-  assert.ok(!unreadable.ok && unreadable.problems.some((p) => /could not be read/.test(p)))
+  assert.ok(!unreadable.ok && unreadable.problems.some((p) => /snapshot is not verified/.test(p)))
 })
 
 test('the prepared run must have read exactly the verified CSV: a bundle that verifies, but is not the file the tool recorded reading, is refused', async () => {

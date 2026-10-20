@@ -18,7 +18,7 @@
  * action takes the ordinary, permission-checked path.
  *
  * WHO MAY IMPORT WHAT is enforced by `npm run check:system-import-capability`:
- *   - `mintSystemImportContext` : only lib/first-load/apply/** , scripts/first-load-apply.ts and tests;
+ *   - `mintSystemImportContext` : only lib/first-load/apply/** , scripts/first-load-apply.ts, scripts/lib/first-load-rehearse.ts and tests;
  *   - `SYSTEM_IMPORT` (compared inline, because the Server Action guard scan only credits a skipped permission check that
  *     compares against a module-level `Symbol()` it can resolve), `isSystemImportContext`, `withSystemActor`,
  *     `withSystemOutcome` and the types : those, plus the three importer modules that honour the context.

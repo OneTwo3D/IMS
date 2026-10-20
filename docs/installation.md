@@ -1794,6 +1794,18 @@ The failure classes earlier reviews kept finding, and the guard for each. Every 
 | fail-open on unreadable state | an unreadable, untrusted, oversized, malformed or inconsistent file, directory or chain refuses (trend) or is inconclusive (item); there is no default that passes |
 | an untrusted-file field reaching text | every field read back from a file is validated against a closed set or a strict pattern before use, and the Markdown is rendered from validated values only |
 <!-- /reconciliation-pack:audit -->
+
+## First load (phase P0)
+
+Loading the owner's exports into an empty, installed instance is a separate command from the installer: `npm run first-load:prepare` turns the exports into importer files and a validation report (see [first-load-input-spec.md](first-load-input-spec.md)), and `npm run first-load:apply` loads them through the application's own importers, verifies the result and publishes a report. The sequence on the host:
+
+1. `first-load:prepare`, then write the **apply manifest** (the operator's assertions: steps, warehouse profiles, accepted zero-cost stock, exchange rates).
+2. `npm run first-load:apply -- --rehearse ...`: the whole load on a copy of the target in a throwaway cluster. The target is only read. Fix whatever it reports and repeat until the rehearsal record says `OK`.
+3. **Stop the application** (web, workers, cron jobs that connect to the database; the checklist is in [first-load-apply.md](first-load-apply.md)).
+4. `npm run first-load:apply -- --apply --rehearsal-record <record> ...`: takes a restore point, loads, verifies, and ends `VERIFIED` (exit 0). Any other exit is not a success; the report and the printed restore procedure say what to do.
+
+The target is named by an env file (mode 600), never by an argument, and is confirmed by database name and cluster system identifier. The load is for the P0 phase only: it never writes to WooCommerce, Mintsoft or Xero, and the verification proves no outbound queue grew. The readiness gate does not yet read the apply report; run `npm run readiness:gate -- --phase P0` separately.
+
 ## WooCommerce initial-import rehearsal
 
 `npm run rehearse:woo-import` runs the **real WooCommerce initial order import** (the code behind **Import Active Orders**: `lib/connectors/woocommerce/sync/initial-import.ts`, `importWcOrder` and the allocation service) end to end against a **local fake WooCommerce REST server** serving synthetic orders, into a PostgreSQL cluster created for the occasion and thrown away afterwards, and writes a report. It is the rehearsal behind the first load's order import (o3d-zjsb5.16): it shows, before anything touches the live store, what the import does with open orders, which of them it cannot allocate, and whether the numbers agree.

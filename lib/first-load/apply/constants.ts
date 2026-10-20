@@ -104,7 +104,7 @@ export const APPLY_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: ApplyExi
   {
     code: APPLY_EXIT_CODES.APPLIED_UNVERIFIED,
     name: 'APPLIED_UNVERIFIED',
-    meaning: 'Every step loaded and the row accounting reconciles, but NO post-run verification was run (this runner has no verification port yet). This is NOT a success: do not treat it as OK. Rows ARE written. A later --resume of the same load runs the verification when it exists.',
+    meaning: 'Every step loaded and the row accounting reconciles, but NO post-run verification was run (the runner was built without a verification port; the command always supplies one). This is NOT a success: do not treat it as OK. Rows ARE written. A later --resume of the same load runs the verification.',
   },
 ]
 
@@ -183,8 +183,9 @@ export const APPLY_REPORT_FORMAT_VERSION = 1
 export const REPORT_ROW_FIELDS = ['key', 'outcome', 'reason'] as const
 export const REPORT_CONFLICT_FIELDS = ['key', 'code', 'detail'] as const
 export const REPORT_IMPORTER_MESSAGE_FIELDS = ['code', 'row'] as const
-export const APPLY_REPORT_JSON_NAME = 'first-load-apply-report.json'
-export const APPLY_REPORT_MARKDOWN_NAME = 'first-load-apply-report.md'
+/** Every report the command publishes is `<prefix><mode>-<run id>-<UTC stamp>.json` with its `.md` companion; the rehearsal record is `first-load-rehearsal-record-...json`. */
+export const APPLY_REPORT_STEM_PREFIX = 'first-load-apply-'
+export const REHEARSAL_RECORD_STEM_PREFIX = 'first-load-rehearsal-record-'
 export const RESIDUAL_FILE_PREFIX = 'residual-'
 
 /** The rehearsal record `--apply` insists on (written by the rehearsal mode). */

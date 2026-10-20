@@ -55,7 +55,7 @@ test('the digest changes with the manifest and with the prepared files, and igno
 test('manifest: control parses; every malformed manifest is refused with its reason (and all reasons at once)', (t) => {
   assert.doesNotThrow(() => parseApplyManifest(manifestText()))
   const arms: Array<[string, Record<string, unknown>, RegExp]> = [
-    ['unknown key', { surprise: 1 }, /unknown apply manifest key "surprise"/],
+    ['unknown key', { surprise: 1 }, /unknown apply manifest key \(position \d+\)/],
     ['format version', { formatVersion: 2 }, /formatVersion must be 1/],
     ['bad run id', { runId: 'has space' }, /runId/],
     ['base currency not GBP', { baseCurrency: 'USD' }, /must be GBP/],
@@ -68,7 +68,7 @@ test('manifest: control parses; every malformed manifest is refused with its rea
     ['warehouses with nothing to check', { steps: ['suppliers', 'products'], acceptZeroCost: undefined, fxRates: undefined }, /no step uses a warehouse/],
     ['profile incomplete', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true } } }, /availableForSale and syncToStore must both/],
     ['profile type', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'SHELF', availableForSale: true, syncToStore: false } } }, /type must be one of/],
-    ['profile key', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true, syncToStore: false, extra: 1 } } }, /unknown key "extra"/],
+    ['profile key', { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true, syncToStore: false, extra: 1 } } }, /unknown key \(position \d+\)/],
     ['warehouse twice in upper case', { expectWarehouses: { 'ZQSENT-MAIN': WAREHOUSES_ONE['ZQSENT-MAIN'], 'zqsent-main': WAREHOUSES_ONE['ZQSENT-MAIN'] } }, /twice/],
     ['zero-cost entry shape', { acceptZeroCost: ['NOWAREHOUSE'] }, /not "SKU@WAREHOUSE"/],
     ['zero-cost twice', { acceptZeroCost: ['A@ZQSENT-MAIN', 'a@zqsent-main'] }, /twice/],
@@ -103,7 +103,7 @@ test('report: a blocked, unbalanced, self-check-failing or ERROR-bearing report 
     ['self-check failures', (r) => { r.selfCheckFailures = ['x'] }, /self-check failures/],
     ['accounting does not balance', (r) => { r.accountingBalanced = false }, /does not balance/],
     ['unaccounted records', (r) => { r.accounting[0].unaccounted = 1 }, /unaccounted/],
-    ['ERROR finding', (r) => { r.findings.push({ severity: 'ERROR', code: 'SOMETHING_BAD', message: 'm' }) }, /ERROR finding.*SOMETHING_BAD/],
+    ['ERROR finding', (r) => { r.findings.push({ severity: 'ERROR', code: 'SOMETHING_BAD', message: 'm' }) }, /1 ERROR finding\(s\)/],
     ['other tool', (r) => { r.tool = 'something-else' }, /not a first-load-prepare report/],
     ['prepared for USD', (r) => { r.config.baseCurrency = 'USD' }, /different base currency/],
   ]
@@ -118,7 +118,7 @@ test('report: a blocked, unbalanced, self-check-failing or ERROR-bearing report 
 test('files: a changed byte, a stray file, a missing file, a wrong header, a wrong size and a wrong row count are each refused on their own', (t) => {
   const arms: Array<[string, FileMap, RegExp]> = [
     ['one byte changed', withFile(honest, SUPPLIERS, (s) => s.replace('Cotton', 'Cottom')), /SHA-256 differs/],
-    ['stray file', new Map([...honest, ['extra.csv', new TextEncoder().encode('x')]]), /does not name: extra\.csv/],
+    ['stray file', new Map([...honest, ['extra.csv', new TextEncoder().encode('x')]]), /does not name: \(a file name that is not one this tool writes; withheld\)/],
     ['missing file', new Map([...honest].filter(([n]) => n !== STOCK)), /missing from the prepared directory/],
     ['header renamed (hash kept consistent)', withConsistentFile(honest, STOCK, (s) => s.replace('unitCostBase', 'unitCost')), /template header/],
     ['row count wrong in the report', withReport(honest, (r) => { r.outputs.find((o) => o.name === SUPPLIERS)!.rows = 3 }), /data row\(s\), the report says 3/],
@@ -167,6 +167,8 @@ test('keys: duplicate and look-alike keys, ids and unusable cells are refused', 
     ['duplicate SKU', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, `${oak}\r\n${oak}`)), /the same key as chunk 1 line/],
     ['SKU differing only in case', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, `${oak}\r\n${oak.replace('ZQSENT-OAK-BOARD,Name', 'zqsent-oak-board,Name')}`)), /only in letter case/],
     ['a productId', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, oak.replace(',,ZQSENT-OAK', 'p1,,ZQSENT-OAK'))), /productId must be blank/],
+    // Mutation: drop 'preferredSupplierId' from ID_COLUMNS (keys.ts) and this arm goes red, because the cell is then accepted and reads back as a conflict after a successful import.
+    ['a preferredSupplierId', withConsistentFile(honest, PRODUCTS, (s) => s.replace(oak, oak.replace('SIMPLE,,,,,', 'SIMPLE,,,,,ZQSENT-SUPPLIER-ID'))), /preferredSupplierId must be blank/],
     ['duplicate supplier name in other case', withConsistentFile(honest, SUPPLIERS, (s) => s.replace(',ZQSENT Timber Co,', ',ZQSENT Cotton LTD,')), /only in letter case|the same key as/],
     ['duplicate opening-stock pair', withConsistentFile(honest, STOCK, (s) => s.replace('ZQSENT-LEG-01,ZQSENT-MAIN,8,12.000000', 'ZQSENT-OAK-BOARD,ZQSENT-MAIN,8,12.000000')), /the same key as chunk 1 line/],
     ['zero opening quantity', withConsistentFile(honest, STOCK, (s) => s.replace('ZQSENT-LEG-01,ZQSENT-MAIN,8,', 'ZQSENT-LEG-01,ZQSENT-MAIN,0,')), /greater than zero/],
@@ -205,8 +207,13 @@ test('cross-file: a missing parent, a missing component, a recipe cycle, stock o
 test('chain to the tool: opening-stock quantity and value must equal the prepared report even when the file hash is kept consistent', () => {
   const changed = withConsistentFile(honest, STOCK, (s) => s.replace('ZQSENT-OAK-BOARD,ZQSENT-MAIN,60,5.333333', 'ZQSENT-OAK-BOARD,ZQSENT-MAIN,61,5.333333'))
   const problems = problemsOf(changed)
-  assert.ok(problems.some((p) => /unit\(s\), the prepared report says 76/.test(p)), JSON.stringify(problems))
-  assert.ok(problems.some((p) => /is worth/.test(p)))
+  assert.ok(problems.some((p) => /TOTAL_QUANTITY_MISMATCH/.test(p)), JSON.stringify(problems))
+  assert.ok(problems.some((p) => /TOTAL_VALUE_MISMATCH/.test(p)))
+  // Mutation: put the figures back into the text and this fails. No quantity or value of the file or of the report reaches a problem string.
+  const marked = withReport(changed, (r) => { r.stock.totals.openingQty = '918273.645'; r.stock.totals.openingValueBase = '564738.291837' })
+  const text = problemsOf(marked).join('\n')
+  assert.match(text, /TOTAL_QUANTITY_MISMATCH/)
+  for (const figure of ['918273', '564738', '61', '443.83', '76']) assert.ok(!new RegExp(`(^|[^0-9])${figure.replace('.', '\\.')}([^0-9]|$)`).test(text), `the figure ${figure} is not printed`)
   // The same edit with the totals ALSO fixed in the report is the tool's problem, not a tampering: it is accepted at this layer.
   const fixed = withReport(changed, (r) => { r.stock.totals.openingQty = '77'; r.stock.totals.openingValueBase = '443.833313' })
   assert.deepEqual(problemsOf(fixed), [])
@@ -235,7 +242,7 @@ test('fx rates: a missing, a different and an unused rate are each refused', (t)
   precondition(t, 'non-base orders', 1)
   expectProblem(honest, /the currency has no rate in the apply manifest fxRates/, { fxRates: undefined })
   expectProblem(honest, /fxRateToBase differs from the rate the apply manifest states/, { fxRates: { EUR: '1.3' } })
-  expectProblem(honest, /lists USD but no selected purchase order uses it/, { fxRates: { EUR: '1.25', USD: '1.3' } })
+  expectProblem(honest, /lists a currency that no selected purchase order uses/, { fxRates: { EUR: '1.25', USD: '1.3' } })
 })
 
 test('owner rulings: a SKU the manifest forbids may appear in no prepared file, in any case, as a SKU, parent or component', (t) => {
