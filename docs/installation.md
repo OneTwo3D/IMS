@@ -1557,7 +1557,7 @@ The outbound check reads the grant variables (`WC_WRITEBACK_ALLOWED_ORIGIN`, `MI
 
 The read-sync check reads `npm run --silent read-sync:status -- --json` and requires it to declare `schemaVersion` 1 and to be internally consistent (the report time, each entry's age against its last success and the report time, the future-timestamp flag, and the counts against the entries). That is the output of the WP8 producer at commit e6eb79b2 (the branch of the read-sync liveness work, not yet merged), which this reading was matched against by running its report assembly and feeding the result to the gate's parser; the contract is unproven until that branch merges, and a change to its JSON must change the gate with it. The scheduler object must be present with `examined` true, `unreadable` and `blockProblem` exactly null, and `unscheduled` and `disabled` empty lists. Every field the gate relies on must be present with its type: a producer that omits or renames one makes the output unreadable (a NO-GO), never fresh by default. It is optional only while the tree has no `read-sync:status` script. Once the script exists it is required in full: all six streams must be reported, each fresh with a valid last-success time that is not in the future and within the age limit the status reports.
 
-The reconciliation pack (R1-R15, see the pack definition for each item) is a set of slots. On this tree R3 and R4 are read from the invariant report the gate already holds (the invariant codes `stock_cost_layer_quantity_mismatch` and `stock_reserved_source_mismatch`) and R15 is the invariant check itself. Every other item has no runner yet: the report lists it as NOT YET AVAILABLE, with what exists on the tree to build it from, and it was not checked. That does not block P0 or P1 and does block P2. A pack item that is available and fails is reported at P0 and P1 and blocks at P2.
+The reconciliation pack (R1-R15, see the pack definition for each item) is a set of slots. On this tree R3 and R4 are read from the invariant report the gate already holds (the invariant codes `stock_cost_layer_quantity_mismatch` and `stock_reserved_source_mismatch`) and R15 is the invariant check itself. Every other item has no runner yet: the report lists it as NOT YET AVAILABLE, with what exists on the tree to build it from, and it was not checked. That does not block P0 or P1 and does block P2. A pack item that is available and fails is reported at P0 and P1 and blocks at P2. The pack's own comparators, report format, hash chain and exit codes are described under "Reconciliation pack" below; that code does not yet feed the gate, so nothing here changes.
 
 The reconciliation completeness check is the same code the rollout-readiness endpoint uses. It passes only when a reconciliation run exists, the run history shows no truncation that a later complete run over the same period has not covered, no run record is unreadable, and the check could read the history at all. A newest run that predates completeness recording is reported as a warning (its completeness is unknown, not shown to be incomplete) and needs a written acceptance; a partial run, a missing run, or an unreadable history is a failure. For an unresolved truncation the way to clear it is a later accounting reconciliation run, recorded as complete for that check, whose period contains the truncated one (several later runs together can cover it); for a missing or partial run it is a new run. The gate does not start a reconciliation.
 
@@ -1606,6 +1606,262 @@ A written acceptance is a person's recorded decision that a warning does not sto
 
 The same table is printed by `npm run readiness:gate -- --help`.
 
+## Reconciliation pack
+
+<!-- reconciliation-pack:overview -->
+`npm run reconcile:pack` is the reconciliation pack: fifteen items (R1 to R15), each a claim that IMS agrees with a vendor or with its own ledger. It is not a second readiness gate and renders no overall verdict; the gate reads the newest report. This build contains the pack's pure comparators, the report writer and the report reader; the item runners and the command itself arrive in later changes, and until they do every item the gate asks about is "not available". The pack makes no vendor call of any kind in this build.
+
+A run publishes `<report-dir>/<run id>/evidence.jsonl`, then `reconciliation-pack.md`, then `reconciliation-pack.json` last, each created exclusively and never through a symlink, fsynced and renamed into place under an exclusive 0700 directory. The JSON is the commit record: it names the Markdown by sha256 (`companionMarkdownSha256`) and the evidence by sha256 and line count, carries a `sequence` and the sha256 of the previous report's JSON (`previousReportSha256`), and counts that the reader recomputes from the evidence. Every identity is one line of the evidence, equal ones included: the reader recomputes every count and the digest of the equal identities from those lines, and re-judges each line against the item's catalogue row (which sides had the identity, recorded as explicit presence flags; the value shape the item's mode demands; the true difference of the two values; the tolerance verdict; and, for a minor-unit item, the currencies). The bucket of every pair entry is DERIVED from those fields in the builder and again in the reader (both sides present is equal or differing, one side is onlyIms or onlyVendor, neither is invalid) and a label that disagrees is refused. Nothing the caller owns is serialised: the input is copied field by field into plain objects (an unknown field, an accessor, a symbol key, a Proxy, a class instance or a hole is refused), and the finished report is read back by the reader's own validation before the first byte is written. Problem text is closed reason codes and counts only; identities appear only as sanitised tokens (a cuid, a numeric vendor id, a validated SKU or `sku#` and eight hex digits, a warehouse code).
+<!-- /reconciliation-pack:overview -->
+### Outcomes
+
+<!-- reconciliation-pack:outcomes -->
+Each item ends in exactly one outcome.
+
+| Outcome | Meaning |
+|---|---|
+| pass | the claim was compared on a complete, stable basis and held; nothing differs, nothing is unsettled |
+| fail | at least one identity is on one side only, or differs beyond the tolerance, and the difference has persisted (or needs no settling) |
+| inconclusive | the claim could not be proven either way (unreadable, incomplete, stale or still settling); never a pass, and the gate reads it as unreadable |
+| not-applicable | the claim does not apply in this phase; the gate reads it as not available |
+<!-- /reconciliation-pack:outcomes -->
+### What a pass must prove
+
+<!-- reconciliation-pack:proof -->
+An outcome of pass is only accepted, when a report is written and again when it is read back, if the item record proves it. A pass must carry all of: a proof that at least one identity was compared (bothEqual above zero, with nothing on one side only, differing or unsettled), or the name of the evidence that an empty population is the true one; exactly the sources its catalogue row lists; a start and an end stamp, equal to each other, for every stream the item depends on; no reason code. A fail names a difference; an inconclusive item names why it could not be proven and lists no finding; a not-applicable item is the phase's doing alone and carries nothing. Any other combination makes the report invalid and a reader refuses it.
+
+| Source code | Meaning |
+|---|---|
+| ims-database | the IMS database, read in one read-only transaction |
+| ims-ledger | the IMS accounting subledger as of the cycle date |
+| invariant-report | the IMS invariant report |
+| mintsoft-api | Mintsoft (GET only) |
+| woocommerce-api | WooCommerce (GET only) |
+| xero-api | Xero (GET only) |
+| xero-trial-balance | the stored Xero trial-balance snapshot |
+| qoblex-file | the Qoblex export file named in its manifest |
+
+| Empty-population proof | Meaning |
+|---|---|
+| snapshot-run-row-present | the as-of snapshot run row exists and records no rows for the population |
+| per-status-total-zero | every enumerated status reported a vendor total of zero, read twice |
+| vendor-total-zero | the vendor reported a total of zero for the whole population |
+| invariant-report-clean | the invariant report ran to the end and lists no finding |
+<!-- /reconciliation-pack:proof -->
+### Identity tokens and every published field
+
+<!-- reconciliation-pack:tokens -->
+Identity tokens (what evidence.jsonl prints for a SKU, a warehouse code or an id) are TRUSTED DATA KEYS: values the owner's own systems produced, not free text. Nothing a vendor or a file says in prose ever reaches output. The screen below is defence in depth for the day a credential is pasted into a SKU column; it is a denylist and incomplete by nature.
+
+A token is printed as it is only if it matches the allowed-character pattern for its kind (a SKU: letters, digits, dot, slash, underscore and hyphen, starting with a letter or digit, at most 64 characters; a warehouse code: upper-case letters, digits, underscore and hyphen, at most 32; a cuid; a numeric vendor id of at most 18 digits) AND passes the credential screen. Otherwise it is printed as its kind, a hash sign and the first 8 hex digits of its sha256 (for example sku#3aaf0386). The screen digests a token that contains, in any case, one of key, secret, token, passw, pwd, bearer, auth, cred, private, cookie, session, signature, jwt, sk_, pk_, ghp_, gho_, ghs_, xox, akia or asia; or a run of 24 or more letters, digits, plus, slash or equals with no separator; or that starts with eyJ or http; or that is longer than 64 characters. The same screen is applied again to every token read back from a file.
+
+What this does not cover (the residual): a credential that avoids every listed word, has no 24-character unbroken run and is built from allowed characters would still print; an 8-hex-digit digest of a LOW-entropy secret (a short password) could be guessed offline; a legitimate SKU that contains a listed word (MONKEY-WRENCH, AUTHOR-GUIDE) prints as a digest and is harder to read; cuid and numeric-id parts are not screened; and evidence.jsonl lists every identity, so it is as sensitive as the stock list itself and is written 0600 in a 0700 directory. Free-form fields do not exist: every other field that can reach output has the anchored allowlist grammar in this table.
+
+| Field | Appears in | Grammar |
+|---|---|---|
+| schemaVersion | JSON | the integer 1 |
+| kind | JSON; proof.kind | reconciliation-pack, compared or proven-empty |
+| runId | JSON, Markdown, directory name, claim file | 8 digits, T, 6 digits, Z, a hyphen and 12 lower-case hex digits |
+| systemIdentifier | JSON, Markdown | 10 to 20 digits: the identifier PostgreSQL itself produces for the cluster |
+| phase | JSON, Markdown | P0, P1 or P2 |
+| asOf | JSON, Markdown | a real calendar date, YYYY-MM-DD |
+| startedAt | JSON, Markdown | an ISO time in UTC with a trailing Z |
+| finishedAt | JSON, Markdown | an ISO time in UTC with a trailing Z |
+| start | JSON stream brackets | an ISO time in UTC with a trailing Z, or null |
+| end | JSON stream brackets | an ISO time in UTC with a trailing Z, or null |
+| first | evidence settling | an ISO time in UTC with a trailing Z |
+| later | evidence settling | a list of ISO times in UTC with a trailing Z |
+| streams | JSON | at most six stream brackets |
+| items | JSON | exactly fifteen item records, R1 to R15 in order |
+| evidence | JSON | an object with file, sha256 and lines |
+| proof | JSON items | null, or an object with kind (and source) |
+| sequence | JSON | a positive whole number |
+| previousReportSha256 | JSON | 64 lower-case hex digits, or null for sequence 1 |
+| companionMarkdownSha256 | JSON | 64 lower-case hex digits |
+| sha256 | JSON evidence record | 64 lower-case hex digits |
+| bothEqualSha256 | JSON items | 64 lower-case hex digits, or null |
+| file | JSON evidence record | the file name evidence.jsonl |
+| lines | JSON evidence record | a non-negative whole number |
+| stream | JSON stream brackets | one of the read-sync stream ids |
+| id | JSON items | R1 to R15 |
+| item | evidence lines | R1 to R15 |
+| bucket | evidence lines | one of the seven comparison buckets |
+| applicability | JSON items | applicable, listed-only or not-applicable |
+| outcome | JSON items | pass, fail, inconclusive or not-applicable |
+| reasons | JSON items | a list of reason codes from the closed table |
+| source | JSON items proof | a code from the empty-proof table |
+| sources | JSON items | a list of codes from the source table |
+| key | evidence lines | one or more identity tokens joined by |: a digested form kind#8 hex digits, a cuid, a numeric id, or a SKU or warehouse token that passes the allowed-character pattern AND the credential screen (see Identity tokens) |
+| ims | evidence lines | a canonical plain decimal, or null |
+| vendor | evidence lines | a canonical plain decimal, or null |
+| delta | evidence lines | a canonical plain decimal, or null |
+| imsCurrency | evidence lines | a code from the known-currency list, or null |
+| vendorCurrency | evidence lines | a code from the known-currency list, or null |
+| imsPresent | evidence lines | true or false |
+| vendorPresent | evidence lines | true or false |
+| settling | evidence lines (unsettled only) | an object with first and later |
+| counts | JSON items | seven non-negative whole numbers named by bucket |
+| evidenceLines | JSON items | a non-negative whole number |
+| summary | JSON | four non-negative whole numbers |
+| exitCode | JSON, Markdown | one of 0, 1 or 5 |
+| host | run lock only, never a report | a DNS-style host name: dot-separated labels of letters, digits and hyphens, at most 253 characters |
+| token | run lock only | 32 lower-case hex digits |
+| pid | run lock only | a positive whole number |
+| createdAt | run lock only | an ISO time in UTC with a trailing Z |
+| startTime | run lock only | digits (field 22 of /proc/<pid>/stat), or null |
+| bootId | run lock only | hex digits and hyphens (the kernel boot id), or null |
+<!-- /reconciliation-pack:tokens -->
+### Unreadable input shapes
+
+<!-- reconciliation-pack:inputs -->
+The comparator never reads an unreadable input as equal, and never fills a gap with a default. Each of these shapes is inconclusive with the code shown; none reaches a bucket or a pass. A difference of zero is the only thing that is equal, and minus zero is read as zero. The comparison mode (values or presence) is fixed per item in the catalogue, and a currency outside the known list has no default number of decimals.
+
+| Unreadable input | Reason code |
+|---|---|
+| a side that is not a list of rows | SOURCE_UNREADABLE |
+| a row that is null, a number, a string or a list | BAD_KEY |
+| a row whose key is not a list of parts | BAD_KEY |
+| a row with no key parts | BAD_KEY |
+| a key part that is not an object | BAD_KEY |
+| a key part of an unknown kind | BAD_KEY |
+| a key part whose raw value is an object, a list, a date, a boolean, a bigint, null or undefined | BAD_KEY |
+| a key part whose raw value is NaN, infinite, negative, fractional, or not a safe integer | BAD_KEY |
+| a key part whose raw value is an empty string, a string over 512 characters, or contains a control character | BAD_KEY |
+| two rows on one side with the same identity | DUPLICATE_KEY |
+| a comparison mode that is missing or not values or presence | BAD_MODE |
+| a value-bearing comparison with a row whose value is missing, null or undefined (either side, or both) | VALUE_MISSING |
+| a value that is not a plain decimal string: NaN, Infinity, empty, spaces, exponent, plus sign, hex, comma, non-ASCII digits, a number type, more than 12 decimals or 30 integer digits | BAD_VALUE |
+| a presence-only comparison with a row that carries a value | VALUE_SHAPE_MISMATCH |
+| a value-bearing comparison with no tolerance, an unknown rule, or a limit that is missing, negative or not a plain decimal | BAD_TOLERANCE |
+| a minor-unit comparison where either currency is missing, lower case, padded, or not in the known list | CURRENCY_UNKNOWN |
+| a comparison where one side carries a currency and the other does not | CURRENCY_UNKNOWN |
+| a side whose completeness is anything other than the boolean true | READ_INCOMPLETE |
+| nothing compared and no valid empty-population proof | EMPTY_UNPROVEN |
+| a population or exclusion list that is not a set | NO_POPULATION_RECORD |
+| carried settling state that is not a map of well-formed records | SOURCE_UNREADABLE |
+| a settling stamp that is missing or not an ISO time | STALE_BASIS |
+<!-- /reconciliation-pack:inputs -->
+### Reason codes
+
+<!-- reconciliation-pack:reasons -->
+Every reason a report can give is one of these codes; no other text describes a problem.
+
+| Reason code | Meaning |
+|---|---|
+| DIFFERENCES | one or more identities are on one side only or differ beyond the tolerance |
+| UNSETTLED_PENDING | a difference was seen but has not yet persisted across two later successful runs of its stream |
+| STALE_BASIS | a stream the item depends on is stale, off, or reported no usable last-success stamp |
+| BASIS_MOVED | the stream stamp changed between the start and the end of the read, so the read is not one consistent basis |
+| READ_INCOMPLETE | a side of the comparison was not read completely |
+| EMPTY_UNPROVEN | both sides were empty and nothing positively proves that empty is the true answer |
+| DUPLICATE_KEY | two rows on one side carry the same identity; they are never summed or picked between |
+| BAD_KEY | a row has no usable identity (a key part that is not a non-empty string or a safe whole number, an unknown kind, no parts, or a row that is not an object); nothing is matched on a guessed identity |
+| VALUE_MISSING | a value-bearing comparison has a row with no value on one side or both; a missing value is never read as equal |
+| BAD_TOLERANCE | the tolerance rule is missing, unknown or carries a limit that is not a non-negative plain decimal |
+| BAD_MODE | the comparison mode (values or presence) is missing or unknown |
+| BAD_VALUE | a row carries a value that is not a finite decimal number |
+| VALUE_SHAPE_MISMATCH | one side carries values and the other does not |
+| CURRENCY_UNKNOWN | the currency of a money comparison is missing or not a known code |
+| SOURCE_UNREADABLE | a source (database, file or vendor) could not be read or was not trusted |
+| CAP_EXCEEDED | a read hit its cap, so the population is not proven complete; capped scans never pass |
+| NO_POPULATION_RECORD | the recorded population the comparison is bounded by is missing or unreadable |
+| NO_RUNNER | no runner exists on this build for the item |
+| PHASE_NOT_APPLICABLE | the item does not apply in the phase asked about |
+| INTERNAL_ERROR | the item runner failed unexpectedly |
+<!-- /reconciliation-pack:reasons -->
+### Refusal codes
+
+<!-- reconciliation-pack:refusals -->
+A run is refused, and the trend reader refuses a directory, with exactly one of these codes.
+
+| Refusal code | Meaning |
+|---|---|
+| DIR_UNTRUSTED | the report directory or an ancestor could be modified by another account, or is not a real directory |
+| DIR_UNREADABLE | the report directory could not be listed |
+| TOO_MANY | more report directories than the reader will walk |
+| PAIR_INVALID | a report pair failed verification (untrusted, unreadable, malformed, or its digests or derived values disagree) |
+| GAP | a sequence number is missing from the chain |
+| FORK | two reports claim the same sequence or the same predecessor |
+| LINK_BROKEN | a report's previousReportSha256 is not the digest of the report before it |
+| SYSTEM_MISMATCH | the chain mixes reports of different system identifiers |
+| LOCK_HELD | another run holds the run lock (a live holder is never displaced, however old its lock) |
+| LOCK_UNREADABLE | the run lock exists but cannot be read or understood, so it was not taken |
+| LOCK_STALE_CONTENDED | a stale lock is being reclaimed by another run, or a reclaim guard was left behind |
+| LOCK_UNPROVABLE | the run lock exists but its holder cannot be shown dead (no process identity on this host, or a lock written without one); an operator must check the holder and remove the lock by hand |
+| LOCK_ERROR | the run lock could not be created |
+| SEQUENCE_CLAIMED | the next sequence number already has a claim file (a run committed it, or died after claiming it); an operator must check the report directory |
+| LOCK_LOST | the run lock was no longer this run's at the moment of commit, so nothing was published |
+| WRITE_FAILED | a report file could not be written or renamed |
+<!-- /reconciliation-pack:refusals -->
+### Items
+
+<!-- reconciliation-pack:items -->
+The catalogue. Tolerances are chosen defaults (owner decisions D1 and D2); an exact quantity comparison allows 0.0001.
+
+| Item | Claim | Exactness | Tolerance | Cadence | Phases | Dependent streams | Sources | Population |
+|---|---|---|---|---|---|---|---|---|
+| R1 | IMS stock_levels equal Mintsoft on-hand per (SKU, bound warehouse) | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | daily | P0 not-applicable, P1 applicable, P2 applicable | mintsoft-stock-sync | ims-database, mintsoft-api | the SKUs and warehouses IMS has bound to Mintsoft, while Mintsoft alignment is unconfirmed |
+| R2 | IMS equals Qoblex StockOnHand per non-3PL location | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 listed-only, P2 applicable | none | ims-database, qoblex-file | the non-3PL locations named in the Qoblex export manifest |
+| R3 | StockLevel.quantity equals the sum of CostLayer.remainingQty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | invariant-report | every stock level the invariant report examined |
+| R4 | StockLevel.reservedQty equals the sum of OrderAllocation.qty | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | invariant-report | every stock level the invariant report examined |
+| R5 | inventory valuation per warehouse and company equals Qoblex | tolerance | composite-max-abs-or-relative: max(GBP 1, 0.0005 of the larger total) (owner decision D2 and unverified formula U14) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | ims-database, qoblex-file | the warehouses and companies named in the Qoblex export manifest |
+| R6 | the IMS inventory subledger as of the cycle date equals Xero Inventory plus Allocated Inventory | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | ims-ledger, xero-trial-balance | the accounts configured for inventory and allocated inventory |
+| R7 | open purchase orders equal Qoblex Incoming (set exact, value exact in GBP, GBP 1 across FX) | set-exact-value-tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | ims-database, qoblex-file | the open purchase orders in the Qoblex export manifest |
+| R8 | outstanding quantity of part-received purchase-order lines equals Qoblex Incoming | exact | exact: 0.0001 (stored quantities carry four decimals (plan)) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | none | ims-database, qoblex-file | the open purchase-order lines in the Qoblex export manifest |
+| R9 | open sales orders equal WooCommerce by order id (set exact, value within one minor unit of the order currency) | set-exact-value-tolerance | order-currency-minor-unit: 1 minor unit (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | woocommerce-order-sweep | ims-database, woocommerce-api | the order statuses enumerated one by one, walked twice |
+| R10 | Xero control accounts (Inventory, Allocated, Transit) agree with IMS, and no IMS-originated posting reached COGS or Unearned Revenue | tolerance | absolute: 1 (owner decision D1) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-balance-snapshots | ims-ledger, xero-trial-balance | the configured control accounts; postings since the P0 start |
+| R11 | Stock in Transit equals the open-purchase-order transit schedule, and the transit account differs from the allocated account | tolerance | absolute: 1 (owner decision D1) | weekly | P0 not-applicable, P1 not-applicable, P2 applicable | xero-balance-snapshots | ims-database, xero-trial-balance | the open purchase orders with goods in transit |
+| R12 | VAT per (country, reporting category, period) agrees across IMS, Xero and WooCommerce | set-exact-value-tolerance | absolute: 0.05 (owner decision D1) | monthly | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates, woocommerce-order-sweep | ims-ledger, xero-api, woocommerce-api | the closed reporting periods inside the budgeted window |
+| R13 | every WooCommerce and Xero tax rate is mapped | presence | none: - (a count of identities, not a measure) | daily | P0 not-applicable, P1 applicable, P2 applicable | xero-tax-rates | woocommerce-api, xero-api | the full tax-rate lists of both systems |
+| R14 | every SKU is present in Qoblex, WooCommerce, Mintsoft and IMS, except the written exclusions | presence | none: - (a count of identities, not a measure) | weekly | P0 not-applicable, P1 applicable, P2 applicable | none | ims-database, qoblex-file, woocommerce-api, mintsoft-api | the union of the four systems minus unexpired written exclusions |
+| R15 | the invariant report shows zero critical findings and every warning is accepted in writing | exact | none: - (a count of identities, not a measure) | daily | P0 applicable, P1 applicable, P2 applicable | none | invariant-report | the whole invariant report |
+<!-- /reconciliation-pack:items -->
+### Settling a difference
+
+<!-- reconciliation-pack:settling -->
+A difference is not a failure the first time it is seen: a vendor can lag. A keyed difference (an identity on one side only, or a value beyond the tolerance) is carried as unsettled with the last-success stamp of the stream it was read under. It becomes a failure only when it is still there after 2 LATER successful runs of that stream, observed as 2 further DISTINCT last-success values. The stamps are compared for equality only, never for order: a repeated stamp is the same run and makes no progress. A difference that disappears is dropped. While anything is unsettled the item is inconclusive, never a pass. The stream stamp is also read at the start and end of an item's read; if it differs the read is BASIS_MOVED. The same item's result is also never a pass when the stream is stale or off.
+<!-- /reconciliation-pack:settling -->
+### The report chain and the run lock
+
+<!-- reconciliation-pack:chain -->
+Reports are ordered by `sequence` (1, 2, 3, ...) and linked by `previousReportSha256` (null for sequence 1), never by timestamp. A run takes the run lock (`.run.lock` in the report directory, created exclusively with its pid, host and a random token) before it reads the chain and holds it until the report is committed; the lock is checked again immediately before the JSON is put into place. A lock is reclaimed only when its holder is provably dead: on this host the holder's process entry is gone, or its start time or the boot id differs from the ones the lock recorded (the pid was reused or the machine rebooted). A live holder is never displaced, however old its lock, and a lock from another host is never taken; where death cannot be proven (no process table, a lock without an identity, an unreadable lock) the run is refused and an operator decides. Reclaiming goes through a second exclusive file so two reclaimers cannot both win. At the commit the run also claims the sequence number with an exclusive file (`.seq-<n>`) and the JSON is linked into place without overwriting, so even a displaced holder cannot place a second commit record for a sequence that is taken.
+
+The trend reader verifies every pair (trusted files only, sha256 of the Markdown and the evidence, derived counts, derived outcome and exit code), then the chain: a missing sequence number is a gap and is refused, two reports with the same sequence or the same predecessor are a fork and are refused, and a link whose digest does not match is refused. It reads at most 5000 reports and refuses more. NOT defended: deleting the newest report or reports (the shorter chain is still a valid chain), and an account that can write as the report owner or as root.
+<!-- /reconciliation-pack:chain -->
+### Exit codes
+
+<!-- reconciliation-pack:exit-codes -->
+| Exit code | Name | Meaning |
+|---|---|---|
+| 0 | all-pass | every applicable item passed, at least one item passed, and the report was published |
+| 1 | fail | at least one item failed; the report was published and names each |
+| 2 | refused | the pack refused to run (bad arguments, an unsafe report directory, a held run lock, a broken report chain); no item was run and nothing was published |
+| 3 | report-not-published | a verdict per item was reached but the report could not be durably published; the outcomes are not evidence and must not be relied on |
+| 4 | internal | the pack itself failed unexpectedly before it could reach an outcome; treat as inconclusive |
+| 5 | inconclusive | no item failed, but at least one item could not be proven (or nothing at all was proven); the report was published. Never a pass |
+<!-- /reconciliation-pack:exit-codes -->
+### Failure classes audited up front
+
+<!-- reconciliation-pack:audit -->
+The failure classes earlier reviews kept finding, and the guard for each. Every guard has a test that fails when the guard is removed.
+
+| Failure class (found in earlier reviews) | Guard |
+|---|---|
+| TOCTOU between check and use | every report file is opened once with O_NOFOLLOW and its digest taken on the same bytes; the run lock is verified (inode and token) immediately before the JSON commit; lock reclaim is serialised by a second exclusive file |
+| starvation of bounded oldest-first scans | a read that hits its cap is CAP_EXCEEDED and never passes; there is no oldest-first window, and carried unsettled identities are re-checked first |
+| false findings for pre-cutoff items | identities outside the RECORDED population go to outOfPopulation, listed and never counted as findings |
+| secrets or data in text | text carries closed codes, counts and sanitised identity tokens only; every other field has an anchored allowlist grammar (the system identifier is digits only); a token is a cuid, a numeric id, or a SKU or warehouse code that passes the character pattern and a credential screen (else a kind#digest), and a raw string cannot be typed as one. Tokens are trusted data keys and the screen is defence in depth, with its residual listed in the docs |
+| an aggregate or count standing in for identity | comparison is keyed; equal counts with one identity swapped fail (onlyIms plus onlyVendor); counts are derived from the lists and the reader recomputes them |
+| "looks empty so skipped" | empty on both sides is EMPTY_UNPROVEN unless positive evidence is supplied; a run in which nothing passed exits 5, never 0 |
+| ordering inferred from timestamps | the chain is ordered by sequence and linked by digest; settling uses equality of distinct last-success stamps and never compares two stamps for order |
+| a pass resting on nothing (empty, unbracketed or unattributed) | in the builder AND the reader a pass must carry a proof (at least one identity compared, or a named empty-population proof), exactly its catalogue sources, an equal start and end stamp for every dependent stream, no reason, finding or unsettled identity; every other outcome has its own invariants; the exit code is derived from the items by one function |
+| a value-mode pass resting on entries with no values | an entry is judged against its item and bucket in the builder and again for every evidence line: a value-mode pair needs both values, the true delta and the tolerance verdict of the catalogue measure, a presence item carries none; every equal identity is an evidence line and the reader recomputes the counts and the digest from them |
+| a bucket label believed instead of derived (a one-sided identity published as equal) | every entry records which sides had the identity; the bucket of a pair entry is derived from those fields in the builder and the reader, in both modes, and a label that disagrees is refused |
+| identities that were never compared counted as compared (excluded, out of population, unsettled) | the comparator issues the "compared" proof only for equal in-population, non-excluded identities, and a named empty proof only when nothing was judged; a table test over every bucket combination in both modes runs comparator, report and reader and asserts nothing else can pass |
+| caller-owned data serialised or written before it is validated | input is copied field by field into plain objects through a whitelist (no unknown field, accessor, symbol key, Proxy, class instance, hole or oversized list), the report is built from the copies only, and the finished text passes the reader's validation before any file is created |
+| fail-open on unreadable state | an unreadable, untrusted, oversized, malformed or inconsistent file, directory or chain refuses (trend) or is inconclusive (item); there is no default that passes |
+| an untrusted-file field reaching text | every field read back from a file is validated against a closed set or a strict pattern before use, and the Markdown is rendered from validated values only |
+<!-- /reconciliation-pack:audit -->
 ## First load (phase P0)
 
 Loading the owner's exports into an empty, installed instance is a separate command from the installer: `npm run first-load:prepare` turns the exports into importer files and a validation report (see [first-load-input-spec.md](first-load-input-spec.md)), and `npm run first-load:apply` loads them through the application's own importers, verifies the result and publishes a report. The sequence on the host:
