@@ -3902,6 +3902,25 @@ model OutboundShadowWrite {
   @@map("outbound_shadow_writes")
 }
 
+/// A fact about ANOTHER writer, seen on an order IMS imported from the storefront (the bridge plugin's warehouse order id or
+/// split/merge metas, the invoicing plugin's markers). Evidence for the coexistence check (`npm run writers:check`) and nothing
+/// else: it never drives any writer. One row per order and closed kind; the meta VALUES are never stored.
+model IncumbentWriterEvidence {
+  id              String    @id @default(cuid())
+  connector       String
+  externalOrderId String    @map("external_order_id")
+  /// A closed code (writers-check-constants.ts INCUMBENT_EVIDENCE_KINDS).
+  kind            String
+  /// WooCommerce's date_paid_gmt for the order; null when it is not paid or the value could not be read.
+  paidAt          DateTime? @map("paid_at")
+  firstSeenAt     DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt      DateTime  @default(now()) @map("last_seen_at")
+
+  @@unique([connector, externalOrderId, kind], map: "incumbent_writer_evidence_order_kind_key")
+  @@index([kind, paidAt], map: "incumbent_writer_evidence_kind_paid_idx")
+  @@map("incumbent_writer_evidence")
+}
+
 /// AI HS-code classification proposal awaiting human review (6igm.3). A proposal is only
 /// authoritative once APPROVED, at which point its code is written to the product. Carries both
 /// the classifier's self-report (modelConfidence, source) and the deterministic validator output

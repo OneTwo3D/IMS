@@ -52,6 +52,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   fx_rate_push_log: { kind: 'CONFIG_ALLOWED', reason: 'operational log of exchange-rate pushes, no business data' },
   fx_rates: { kind: 'CONFIG_ALLOWED', reason: 'stored exchange rates (a purchase order needs one; checked by a rail)' },
   hs_code_proposals: { kind: 'MUST_BE_EMPTY', reason: 'customs code proposals' },
+  incumbent_writer_evidence: { kind: 'CONFIG_ALLOWED', reason: 'marks other writers left on imported storefront orders, kept for the coexistence check; no business data' },
   integration_outbox: { kind: 'MUST_BE_EMPTY', reason: 'outbound connector queue' },
   inventory_reservation_snapshot_runs: { kind: 'MUST_BE_EMPTY', reason: 'inventory snapshots' },
   inventory_reservation_snapshots: { kind: 'MUST_BE_EMPTY', reason: 'inventory snapshots' },
