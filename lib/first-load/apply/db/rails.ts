@@ -17,7 +17,8 @@
 import { db } from '@/lib/db'
 import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
 import { D, fmtFixed, type Dec } from '../../money'
-import { RUNNER_APPLICATION_NAME, type ApplyStepId } from '../constants'
+import { RUNNER_APPLICATION_NAME, type ApplyStepId, type RailId } from '../constants'
+import { defaultPreloadReaders, evaluatePreloadRails, type PreloadReaders } from './preload-rails'
 import { endpointKey, normaliseAddress, ownEndpoints } from './own-sessions'
 import { ATTRIBUTION_RULES } from './attribution'
 import { FRESH_RUN_MAY_HOLD, TABLE_CLASSES, tablesOfKind } from '../table-classes'
@@ -42,27 +43,46 @@ export interface RailScope {
   step: ApplyStepId | null
 }
 
-export async function evaluateRails(prepared: PreparedRun, scope: RailScope): Promise<string[]> {
+/** One rail's answer for one evaluation: its id, the refusals it raised and (for a rail that reports a state) a closed description of what it read. */
+export interface RailResult {
+  id: RailId
+  problems: string[]
+  detail: string
+}
+
+/** The same evaluation as `evaluateRails`, kept per rail so the report can say which rail refused. A rail that does not apply to the steps selected is absent. */
+export async function evaluateRailResults(prepared: PreparedRun, scope: RailScope, readers?: PreloadReaders): Promise<RailResult[]> {
   try {
-    const problems: string[] = []
+    const results: RailResult[] = []
     const selected = new Set(prepared.steps.map((s) => s.step))
     const relevant = (step: ApplyStepId): boolean => selected.has(step) && (scope.step === null || scope.step === step)
-
-    await quiesced(problems)
-    await dataClasses(prepared, problems, scope.phase === 'preflight' && !scope.resuming)
-    await baseCurrency(prepared, problems)
-    await forbiddenSkus(prepared, problems)
-    if (scope.phase === 'preflight' && !scope.resuming) await baseCurrencyNotLocked(problems)
-    if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await warehouses(prepared, problems)
-    if (relevant('purchase-orders')) {
-      await fxRates(prepared, problems)
-      await taxRates(prepared, problems)
+    const rail = async (id: RailId, body: (problems: string[]) => Promise<void>): Promise<void> => {
+      const problems: string[] = []
+      await body(problems)
+      results.push({ id, problems, detail: '' })
     }
-    return problems
+
+    await rail('quiesce', quiesced)
+    await rail('data-classes', (p) => dataClasses(prepared, p, scope.phase === 'preflight' && !scope.resuming))
+    await rail('base-currency', (p) => baseCurrency(prepared, p))
+    await rail('forbidden-skus', (p) => forbiddenSkus(prepared, p))
+    if (scope.phase === 'preflight' && !scope.resuming) await rail('currency-lock', baseCurrencyNotLocked)
+    if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await rail('warehouses', (p) => warehouses(prepared, p))
+    if (relevant('purchase-orders')) {
+      await rail('fx-rates', (p) => fxRates(prepared, p))
+      await rail('tax-rates', (p) => taxRates(prepared, p))
+    }
+    // The pre-load rails: nothing that could write outside the database may be armed (preload-rails.ts). The environment is this process's, which the command replaced with the installation env file.
+    for (const finding of await evaluatePreloadRails(readers ?? defaultPreloadReaders({ ...process.env }))) results.push({ id: finding.rail, problems: finding.problems, detail: finding.detail })
+    return results
   } catch (error) {
     if (error instanceof ObservationError) throw error
     throw new ObservationError(DATABASE_READ_FAILED)
   }
+}
+
+export async function evaluateRails(prepared: PreparedRun, scope: RailScope, readers?: PreloadReaders): Promise<string[]> {
+  return (await evaluateRailResults(prepared, scope, readers)).flatMap((r) => r.problems)
 }
 
 /** Thrown by the per-call guard when another client session is connected: the file stops before its next importer call. */

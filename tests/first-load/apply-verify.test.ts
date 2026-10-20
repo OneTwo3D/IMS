@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { CLEAN_PRELOAD } from './apply-preload'
 import { after, before, describe, it } from 'node:test'
 
 import { RUNNER_APPLICATION_NAME } from '../../lib/first-load/apply/constants'
@@ -36,10 +37,10 @@ const okRehearsal = (digest: string) => ({ formatVersion: REHEARSAL_RECORD_FORMA
 const apply = (p: PreparedRun, extra: Partial<ApplyOptions> = {}): ApplyOptions => ({ mode: 'apply', resume: false, rehearsal: okRehearsal(p.manifestDigest), systemId: SYSTEM_ID, now: new Date(), maxRehearsalAgeHours: 24, ...extra })
 
 function deps(over: Partial<import('../../lib/first-load/apply/db/verify').VerifyDeps> = {}): import('../../lib/first-load/apply/db/verify').VerifyDeps {
-  return { outboundEnv: {}, expectedMigrations: checkoutMigrationNames(REPO), ...over }
+  return { outboundEnv: {}, expectedMigrations: checkoutMigrationNames(REPO), preload: CLEAN_PRELOAD, ...over }
 }
 const ports = (over: Partial<import('../../lib/first-load/apply/db/verify').VerifyDeps> = {}, extra: Partial<Parameters<typeof m.ports.createDbPorts>[1]> = {}): ApplyPorts =>
-  m.ports.createDbPorts(prepared, { operator: 'Verify Test', verification: deps(over), ...extra })
+  m.ports.createDbPorts(prepared, { preload: CLEAN_PRELOAD, operator: 'Verify Test', verification: deps(over), ...extra })
 
 const byId = (items: VerificationItem[]) => Object.fromEntries(items.map((i) => [i.id, i]))
 const failing = (items: VerificationItem[]) => items.filter((i) => i.result === 'fail').map((i) => i.id).sort()
@@ -414,7 +415,7 @@ describe('the first-load post-run verification, database side', { timeout: 30 * 
       // Mutation: expect the prepared report's stock total even when the step is not selected, and this fails.
       await resetLoadedData(s)
       const subset = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', steps: ['suppliers', 'products'], expectWarehouses: undefined, acceptZeroCost: undefined, fxRates: undefined })
-      const result = await runLoad(subset, m.ports.createDbPorts(subset, { operator: 'Verify Test', verification: deps() }), apply(subset))
+      const result = await runLoad(subset, m.ports.createDbPorts(subset, { preload: CLEAN_PRELOAD, operator: 'Verify Test', verification: deps() }), apply(subset))
       assert.equal(result.exit, 'OK', result.problems.join('; '))
       assert.deepEqual(failing(result.verification), [])
     })

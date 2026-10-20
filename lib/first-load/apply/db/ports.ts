@@ -13,7 +13,7 @@
  * (name and system id) and refuses anything but an empty or rehearsal database. These ports add the data-level refusal (rails.ts: a first run needs an empty target).
  */
 import type { ApplyStepId } from '../constants'
-import type { ApplyPorts } from '../orchestrate'
+import type { ApplyPorts, RailTally } from '../orchestrate'
 import type { PreparedRun } from '../prepared'
 import { createExecutor } from './execute'
 import { createJournal, setFactOnce } from './journal'
@@ -21,7 +21,8 @@ import { db } from '@/lib/db'
 import { StepLockError, type StepLock } from '../orchestrate'
 import { withStepLock } from './lock'
 import { observeStep } from './observe'
-import { QuiesceError, currentTaxProfiles, evaluateRails, quiesceProblems } from './rails'
+import { QuiesceError, currentTaxProfiles, evaluateRailResults, quiesceProblems, type RailResult } from './rails'
+import type { PreloadReaders } from './preload-rails'
 import { DATABASE_READ_FAILED } from './observe'
 import { ObservationError } from '../residual'
 import { captureBaseline, createVerifier, type VerifyDeps } from './verify'
@@ -39,6 +40,8 @@ export interface DbPortsOptions {
   verification?: VerifyDeps
   /** The restore point the command took before this load: recorded once on the run record, so a resume can find and check it. */
   restorePoint?: { path: string; sha256: string; bytes: number }
+  /** Test seam: the readers of the pre-load rails (crontab, connector settings). The command passes none and the real ones are used. */
+  preload?: PreloadReaders
   /** Test seam: the size of one importer call. */
   maxRowsPerCall?: number
   /** Test seam: awaited after each importer call. */
@@ -63,13 +66,26 @@ function guardBeforeCall(prepared: PreparedRun) {
 }
 
 export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): ApplyPorts {
+  // Every evaluation of every rail, kept for the report: a rail that refused ONCE during the run is refused in the report, whatever a later evaluation said.
+  const tally = new Map<string, RailTally>()
+  const note = (results: RailResult[]): string[] => {
+    for (const r of results) {
+      const t = tally.get(r.id) ?? { id: r.id, evaluations: 0, refusals: 0, detail: '' }
+      t.evaluations += 1
+      if (r.problems.length > 0) t.refusals += 1
+      if (r.detail !== '') t.detail = r.detail
+      tally.set(r.id, t)
+    }
+    return results.flatMap((r) => r.problems)
+  }
   return {
     journal: createJournal(),
     observe: (step) => observeStep(prepared, step),
-    preflight: ({ resuming }) => evaluateRails(prepared, { phase: 'preflight', resuming, step: null }),
+    railTally: () => [...tally.values()],
+    preflight: async ({ resuming }) => note(await evaluateRailResults(prepared, { phase: 'preflight', resuming, step: null }, options.preload)),
     // A recheck happens inside a run that holds a record, so the target is by definition not "fresh": emptiness is a preflight rail only.
     recheckRails: async (step, phase) => {
-      const problems = await evaluateRails(prepared, { phase: 'recheck', resuming: true, step })
+      const problems = note(await evaluateRailResults(prepared, { phase: 'recheck', resuming: true, step }, options.preload))
       // The census starting point: once, after the rails passed at the start of a step and before any importer call of it. The first step of the first attempt records it; later calls change nothing.
       if (problems.length === 0 && phase === 'step-start' && (options.verification || options.restorePoint)) {
         try {
@@ -84,7 +100,7 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
       return problems
     },
     withStepLock,
-    verify: options.verification ? createVerifier(options.verification) : undefined,
+    verify: options.verification ? createVerifier(options.verification.preload === undefined && options.preload !== undefined ? { ...options.verification, preload: options.preload } : options.verification) : undefined,
     execute: createExecutor({ runId: prepared.manifest.runId, operator: options.operator, maxRowsPerCall: options.maxRowsPerCall, beforeCall: guardBeforeCall(prepared), afterCall: options.afterCall }),
   }
 }

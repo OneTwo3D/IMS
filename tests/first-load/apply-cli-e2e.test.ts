@@ -4,10 +4,14 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 
-import { runChild } from '../../scripts/rehearse-first-install'
+import { spawnSync } from 'node:child_process'
+import { databaseUrl, runChild, withClient } from '../../scripts/rehearse-first-install'
+import { pgBinDir } from '../scripts/real-postgres-cluster'
+import { libpqEnvFromUrl } from '../../lib/first-load/apply/cli'
 import { verifyPublishedReport } from '../../lib/ops/published-report'
 import { REHEARSAL_RECORD_FORMAT_VERSION } from '../../lib/first-load/apply/constants'
 import { rehearse } from '../../scripts/lib/first-load-rehearse'
+import { readBuildIdentity } from '../../lib/ops/build-identity'
 import { checkoutMigrationNames } from '../../lib/first-load/apply/db/migrations'
 import { migrationsHash } from '../../lib/first-load/apply/verify-core'
 import { manifestText, prepareSynthetic, preparedFiles } from './apply-helpers'
@@ -68,6 +72,12 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
     s = await startScratch('ims-rehearsal-apply-cli')
     dir = join(s.root, 'run')
     mkdirSync(dir)
+    // The crons rail reads this account's crontab. The test must not depend on the machine it runs on (a CI image may have no crontab command): a `crontab` that says, as the real one does, that this account has none.
+    const shim = join(dir, 'shim-bin')
+    mkdirSync(shim)
+    writeFileSync(join(shim, 'crontab'), '#!/bin/sh\necho "no crontab for $(id -un)" >&2\nexit 1\n', { mode: 0o755 })
+    chmodSync(join(shim, 'crontab'), 0o755)
+    process.env.PATH = `${shim}:${process.env.PATH ?? ''}`
     const prepared = join(dir, 'prepared')
     mkdirSync(prepared)
     for (const [name, bytes] of preparedFiles(prepareSynthetic())) writeFileSync(join(prepared, name), bytes)
@@ -85,6 +95,9 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
     chmodSync(envFile, 0o600)
     systemId = ((await s.sql<{ id: string }>('select system_identifier::text as id from pg_control_system()'))[0]!).id
     secrets.push(s.password, s.childEnv.AUTH_SECRET!, s.childEnv.CRON_SECRET!)
+    // The scratch installation has the storefront configured AND enabled (other suites use that to prove an effect is suppressed). The connectors rail refuses exactly that, so the command
+    // tests switch the storefront off (credentials stay): the arms below that need it enabled turn it back on and restore it.
+    await s.sql(`update settings set value = 'false' where key = 'plugin_woocommerce_enabled'`)
     await s.db.$disconnect()
   })
   after(async () => { await s?.stop() })
@@ -335,7 +348,46 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       precondition(t, 'binding arms', arms.length)
     })
 
-    it('an apply with that record takes a restore point (mode 600, readable by pg_restore), loads, verifies, and ends VERIFIED', async () => {
+    it('the pre-load rails refuse BEFORE the restore point: a grant in the installation env file, an enabled storefront, an armed cron, an unreadable crontab: exit 3, no dump, no run record, nothing changed', async (t) => {
+      // Mutation: evaluate the pre-load rails only inside runLoad (after the dump) and the dump directory is no longer empty; remove the rails and the arm exits 0.
+      const counts = await tableCounts()
+      const withGrant = join(dir, 'installation-with-grant.env')
+      writeFileSync(withGrant, `${readFileSync(envFile, 'utf8')}MINTSOFT_WRITE_ALLOWED=https://api.example.test|89\n`, { mode: 0o600 })
+      chmodSync(withGrant, 0o600)
+      const cronShim = (body: string): string => {
+        const bin = join(dir, `shim-${createHash('sha256').update(body).digest('hex').slice(0, 8)}`)
+        mkdirSync(bin, { recursive: true })
+        writeFileSync(join(bin, 'crontab'), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
+        chmodSync(join(bin, 'crontab'), 0o755)
+        return bin
+      }
+      const writerCron = cronShim(`echo '*/5 * * * * curl -sf -K - "$BASE_URL/accounting-sync"'`)
+      const brokenCron = cronShim('echo "crontab: cannot read the spool" >&2; exit 1')
+      const arms: Array<[string, () => Promise<{ exitCode: number | null; stderr: string; stdout: string }>, RegExp, (() => Promise<void>) | null]> = [
+        ['a grant in the installation env file', RUN(['--apply', '--rehearsal-record', recordFile], { envFile: withGrant }), /outbound grants: a write grant for Mintsoft is present/, null],
+        ['the storefront enabled with credentials', RUN(['--apply', '--rehearsal-record', recordFile]), /connectors: the WooCommerce connector is enabled with store credentials/, null],
+        ['an armed writing cron', RUN(['--apply', '--rehearsal-record', recordFile], { env: { PATH: `${writerCron}:${process.env.PATH}` } }), /crons: 1 active scheduled-job line\(s\) in the crontab could write/, null],
+        ['an unreadable crontab', RUN(['--apply', '--rehearsal-record', recordFile], { env: { PATH: `${brokenCron}:${process.env.PATH}` } }), /crons: the crontab of the account running the load could not be read/, null],
+      ]
+      precondition(t, 'pre-load arms', arms.length)
+      for (const [label, run, expected] of arms) {
+        if (label.startsWith('the storefront')) await s.sql(`update settings set value = 'true' where key = 'plugin_woocommerce_enabled'`)
+        try {
+          const r = await run()
+          assert.equal(r.exitCode, 3, `${label}: ${r.stderr}`)
+          assert.match(r.stderr, expected, label)
+          assert.ok(!r.stderr.includes('api.example.test') && !r.stderr.includes('accounting-sync'), `${label}: no value from the installation in the text`)
+        } finally {
+          if (label.startsWith('the storefront')) await s.sql(`update settings set value = 'false' where key = 'plugin_woocommerce_enabled'`)
+        }
+        assert.deepEqual(readdirSync(restoreDir), [], `${label}: no restore point was taken`)
+        assert.equal(await runRecords(), 0, `${label}: no run record`)
+        assert.equal(await tableCounts(), counts, `${label}: no table changed`)
+      }
+    })
+
+    it('an apply with that record takes a restore point (mode 600, readable by pg_restore, restorable with row-count parity), loads, verifies, and ends VERIFIED', async (t) => {
+      const beforeLoad = await tableCounts()
       const r = await RUN(['--apply', '--rehearsal-record', recordFile, '--operator', 'E2E Operator'])()
       assert.equal(r.exitCode, 0, `${r.stderr}\n${r.stdout}`)
       const dumps = readdirSync(restoreDir)
@@ -348,6 +400,22 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       assert.equal(report.restorePoint.sha256, row.facts.restorePoint!.sha256)
       assert.equal(report.restorePoint.listed, true)
       assert.equal(report.exit.name, 'OK')
+      // RESTORE PARITY: the restore point, restored into a database of its own, holds exactly the rows the target held when it was taken (counted table by table). A restore point that is only
+      // readable (pg_restore --list) is not yet a way back. Mutation: dump with --schema-only (or the wrong database) and the restored counts differ from the pre-load counts.
+      const parity = 'ims_restore_parity'
+      await withClient(s.url, async (client) => { await client.query(`create database ${parity}`) })
+      const lib = libpqEnvFromUrl(s.url).env
+      const restored = spawnSync(join(pgBinDir(), 'pg_restore'), ['--no-owner', '--no-privileges', '--exit-on-error', '-d', parity, join(restoreDir, dumps[0]!)], { env: { PATH: process.env.PATH ?? '', ...lib, PGDATABASE: parity } as unknown as NodeJS.ProcessEnv, encoding: 'utf8' })
+      assert.equal(restored.status, 0, restored.stderr)
+      const parityUrl = databaseUrl(s.role, s.password, s.port, parity)
+      const restoredCounts = await withClient(parityUrl, async (client) => {
+        const names = (await client.query<{ table_name: string }>(`select table_name from information_schema.tables where table_schema = 'public' and table_type = 'BASE TABLE' order by 1`)).rows.map((x) => x.table_name)
+        const rows = (await client.query<{ t: string; n: string }>(names.map((n) => `select '${n}' as t, count(*)::text as n from "${n}"`).join(' union all '))).rows
+        return JSON.stringify(Object.fromEntries(rows.map((x) => [x.t, x.n]).sort()))
+      })
+      precondition(t, 'tables compared', Object.keys(JSON.parse(beforeLoad)).length)
+      assert.equal(restoredCounts, beforeLoad, 'the restore point holds exactly the pre-load rows')
+      assert.notEqual(restoredCounts, await tableCounts(), 'control: the loaded database differs from the restore point')
       const activity = await runs(`select count(*)::int as n from activity_logs where metadata->'actor'->>'operator' = 'E2E Operator'`)
       assert.ok((activity[0] as { n: number }).n > 0, 'the operator label is on the audit rows')
     })
@@ -403,6 +471,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
         manifestDigest: planDigest,
         steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'],
         schemaHash: migrationsHash(checkoutMigrationNames(REPO)),
+        build: readBuildIdentity(REPO),
         repoRoot: REPO,
         root: rehearsalRoot,
         reportDir,
@@ -427,7 +496,7 @@ describe('the first-load apply command, end to end', { timeout: 60 * 60 * 1000 }
       const planDigest = (jsonOf(reportsIn().find((f) => f.includes('-plan-') && f.endsWith('.json'))!) as { manifestDigest: string }).manifestDigest
       return rehearse({
         targetEnv: Object.fromEntries(readFileSync(envFile, 'utf8').split('\n').filter(Boolean).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)])),
-        targetSystemId: systemId, manifestPath: manifest, manifestDigest: planDigest, steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'], schemaHash: migrationsHash(checkoutMigrationNames(REPO)), repoRoot: REPO, root: rehearsalRoot, reportDir, reportStem: stem, operator: 'E2E Operator',
+        targetSystemId: systemId, manifestPath: manifest, manifestDigest: planDigest, steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'], schemaHash: migrationsHash(checkoutMigrationNames(REPO)), build: readBuildIdentity(REPO), repoRoot: REPO, root: rehearsalRoot, reportDir, reportStem: stem, operator: 'E2E Operator',
         log: () => undefined, hooks: { afterChild },
       })
     }
