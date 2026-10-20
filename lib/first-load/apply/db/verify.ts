@@ -32,6 +32,7 @@ import {
 import { loadFacts, setFactOnce } from './journal'
 import { observeStep } from './observe'
 import { evaluateRails } from './rails'
+import type { PreloadReaders } from './preload-rails'
 
 export const BASELINE_FACT = 'baseline'
 const UNREADABLE = 'could not be read'
@@ -44,6 +45,8 @@ export interface VerifyDeps {
   expectedMigrations: readonly string[]
   /** Test seam: the scheduled invariant check. Default: the application's own, in process, writing nothing. */
   runInvariants?: () => Promise<{ ok: boolean; critical: number }>
+  /** Test seam: the readers of the pre-load rails (crontab, connector settings). The command passes none and the real ones are used. */
+  preload?: PreloadReaders
 }
 
 async function tableNames(): Promise<string[]> {
@@ -119,7 +122,7 @@ export function createVerifier(deps: VerifyDeps): NonNullable<ApplyPorts['verify
 
     // The rails, once more over the finished load: nobody else connected, no data class holding a row it must not, the warehouses and base currency as declared, every row attributable to the files.
     items.push(await guarded('rails-after-load', 'every rail still holds', async () => {
-      const problems = await evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
+      const problems = await evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null }, deps.preload)
       return item('rails-after-load', problems.length === 0, 'every rail still holds', problems.length === 0 ? 'every rail holds' : `${problems.length} rail problem(s)`)
     }))
 

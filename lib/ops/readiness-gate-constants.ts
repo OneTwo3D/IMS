@@ -62,6 +62,8 @@ export function renderReadinessGateExitCodeTable(): string {
 
 /** How old the newest first-install rehearsal may be. A chosen default; there is deliberately no option to relax it. */
 export const REHEARSAL_MAX_AGE_DAYS = 14
+/** How old the published first-load apply report may be. A chosen default; there is deliberately no option to relax it. */
+export const APPLY_REPORT_MAX_AGE_DAYS = 30
 /** A rehearsal that claims to have finished further than this in the future is not believed. */
 export const REHEARSAL_CLOCK_SKEW_MS = 5 * 60 * 1000
 /** The longest a written acceptance may run. A warning accepted for a year is a warning nobody reads again. */
@@ -125,6 +127,8 @@ export function normaliseConstraintDefinition(definition: string): string {
 
 export const DEFAULT_REPORT_DIR = '/var/tmp/ims-readiness-gate-reports'
 export const DEFAULT_REHEARSAL_DIR = '/var/tmp/ims-rehearsal-reports'
+/** Where `npm run first-load:apply -- --apply --report-dir` publishes by default in the operator procedure. */
+export const DEFAULT_APPLY_REPORT_DIR = '/var/tmp/ims-first-load-apply-reports'
 
 
 // ---------------------------------------------------------------------------------------------
@@ -145,6 +149,7 @@ export type FixedCheckId =
   | 'schema-state'
   | 'outbound-status'
   | 'first-install-rehearsal'
+  | 'first-load-apply'
   | 'reconciliation-completeness'
   | 'read-sync-liveness'
 
@@ -212,6 +217,16 @@ export const CHECK_CATALOGUE: readonly CheckDefinition[] = [
     expectation: ALL_PHASES(`The newest report in the rehearsal directory has an intact digest pair, was made for the same commit and source tree as the checkout the gate runs from (both must have no uncommitted changes; an older report format that records no build is refused), is GREEN with every step required and passed (outbound status included), a clean teardown, and finished within ${REHEARSAL_MAX_AGE_DAYS} days.`),
   },
   {
+    id: 'first-load-apply',
+    title: 'The first load was applied, verified, and its published report is intact and about this database',
+    requirement: { P0: 'required', P1: 'listed-only', P2: 'listed-only' },
+    expectation: {
+      P0: `The database holds exactly one first-load run record and it is VERIFIED. A published apply report (a Markdown and JSON pair, read once from a directory only root or the running account can write) names the same run id and load digest and the same cluster system identifier, finished within ${APPLY_REPORT_MAX_AGE_DAYS} days, ended OK with every step loaded, every verification passed, the row accounting balanced, a restore point read back, and every rail and apply-time check passed or not applicable.`,
+      P1: 'Listed. The first load was decided at P0; the result is shown and does not decide the verdict here.',
+      P2: 'Listed. The first load was decided at P0; the result is shown and does not decide the verdict here.',
+    },
+  },
+  {
     id: 'reconciliation-completeness',
     title: 'Accounting reconciliation is proven complete',
     requirement: ALL_PHASES('required'),
@@ -265,9 +280,9 @@ export const READINESS_GATE_DOC_BLOCKS: Record<ReadinessGateDocBlockId, string> 
     'Not checked by the gate: that the CHECK constraints actually fire, and that the Prisma client is generated. Both belong to `npm run validate:db`, which inserts probe rows in a transaction it rolls back and regenerates the client, so it is an operator pre-step run on a scratch database (the fresh-install rehearsal runs it on its own cluster). Also not checked: the build artefact, the `.env` configuration, every item the report lists as NOT YET AVAILABLE, and the authenticity of the rehearsal report beyond who could have written it (see the rehearsal section).',
   ].join('\n'),
   usage: [
-    `\`${READINESS_GATE_COMMAND} -- --phase <P0|P1|P2> [--expect-granted <connector[,connector]|none>] [--acceptances <file>] [--rehearsal-dir <dir>] [--report-dir <dir>] [--json]\``,
+    `\`${READINESS_GATE_COMMAND} -- --phase <P0|P1|P2> [--expect-granted <connector[,connector]|none>] [--acceptances <file>] [--rehearsal-dir <dir>] [--apply-report-dir <dir>] [--report-dir <dir>] [--json]\``,
     '',
-    'The phase is required; there is no default, because the same installation can be ready for one phase and not for the next. `DATABASE_URL` must be set in the environment of the gate: it does not read `.env` files, and it never puts a credential on a command line. `--expect-granted` is required for P2 and refused for P0 and P1: it names the connectors (woocommerce, mintsoft, xero) that are meant to be able to write at P2, or `none`, and the outbound check then requires exactly those to be granted and the others held. `--acceptances` names the written warning-acceptance file (default `ops/readiness-warning-acceptances.json` in the checkout; absent means no warning is accepted). `--rehearsal-dir` is where `npm run rehearse:first-install` publishes its reports. `--json` prints the JSON report on standard output and nothing else; progress and the Markdown go to standard error. The report is published as `readiness-gate.json` and `readiness-gate.md` under `<report-dir>/<run id>/`, Markdown first and the JSON last; the JSON names the Markdown by its sha256 and is the commit record.',
+    'The phase is required; there is no default, because the same installation can be ready for one phase and not for the next. `DATABASE_URL` must be set in the environment of the gate: it does not read `.env` files, and it never puts a credential on a command line. `--expect-granted` is required for P2 and refused for P0 and P1: it names the connectors (woocommerce, mintsoft, xero) that are meant to be able to write at P2, or `none`, and the outbound check then requires exactly those to be granted and the others held. `--acceptances` names the written warning-acceptance file (default `ops/readiness-warning-acceptances.json` in the checkout; absent means no warning is accepted). `--rehearsal-dir` is where `npm run rehearse:first-install` publishes its reports. `--apply-report-dir` is where `npm run first-load:apply -- --apply` published its report (default `/var/tmp/ims-first-load-apply-reports`); only P0 requires it. `--json` prints the JSON report on standard output and nothing else; progress and the Markdown go to standard error. The report is published as `readiness-gate.json` and `readiness-gate.md` under `<report-dir>/<run id>/`, Markdown first and the JSON last; the JSON names the Markdown by its sha256 and is the commit record.',
   ].join('\n'),
   phases: [
     'What each phase requires. Every row is collected on every run; a required check that is missing, unreadable, unavailable or failed is a NO-GO, and so is an optional-until-present check whose signal exists but cannot be read. A reconciliation pack item that is not yet available is listed, and blocks only at P2.',

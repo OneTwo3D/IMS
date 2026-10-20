@@ -172,7 +172,7 @@ export const RESUMABLE_STATUSES: ReadonlySet<RunStatus> = new Set<RunStatus>(['R
 export const STEP_STATUSES = ['PENDING', 'RUNNING', 'DONE', 'FAILED', 'CONFLICT'] as const
 export type StepStatus = (typeof STEP_STATUSES)[number]
 
-export const APPLY_REPORT_FORMAT_VERSION = 1
+export const APPLY_REPORT_FORMAT_VERSION = 2
 
 /**
  * WHAT A REPORT ROW MAY CARRY (docs/first-load-apply.md, "What a report contains"). A report is a private operator artefact. Per unit it holds the
@@ -236,3 +236,46 @@ export const APPLY_CHECK_COVERAGE: Readonly<Record<string, { status: CheckCovera
  * BEFORE it opens any connection, and the quiesce rail refuses to run if its own session does not report it, so the runner's sessions are told apart from everybody else's.
  */
 export const RUNNER_APPLICATION_NAME = 'ims-first-load-apply'
+
+// ---------------------------------------------------------------------------
+// The rails, by id, and which apply-time check each one proves (the report's preconditions[])
+// ---------------------------------------------------------------------------
+
+/**
+ * Every rail the runner evaluates before a load may write, in the order they are evaluated. The report lists each one (`preconditions[]`) and the readiness gate requires them all.
+ * The last four are the PRE-LOAD rails (the first load runs with the application STOPPED, and nothing that could write outside the database may be armed):
+ *   outbound-grants  no outbound write grant is present in the installation environment, readable or not;
+ *   producer-hold    the producer-hold variables are consistent, no live-from instant is set, and the state is reported;
+ *   connectors       no connector is enabled with a credential that could write;
+ *   crons            no scheduled job that could write is installed in the crontab of the account running the load.
+ */
+export const RAIL_IDS = [
+  'quiesce', 'data-classes', 'base-currency', 'forbidden-skus', 'currency-lock', 'warehouses', 'fx-rates', 'tax-rates', 'outbound-grants', 'producer-hold', 'connectors', 'crons',
+] as const
+export type RailId = (typeof RAIL_IDS)[number]
+
+/** The rails that need every prepared run (the others depend on the steps selected). */
+export const PRELOAD_RAIL_IDS: readonly RailId[] = ['outbound-grants', 'producer-hold', 'connectors', 'crons']
+
+/**
+ * Which rails prove each apply-time check (spec.ts APPLY_TIME_CHECKS). An empty list means the prepared files alone prove it (the run could not have been loaded otherwise);
+ * `null` means the runner refuses the whole area. A test keeps this table equal to the check list and to APPLY_CHECK_COVERAGE.
+ */
+export const APPLY_CHECK_RAILS: Readonly<Record<string, readonly RailId[] | null>> = {
+  'warehouse-exists': ['warehouses'],
+  'base-currency': ['base-currency', 'currency-lock'],
+  'opening-stock-empty': ['data-classes'],
+  'po-supplier-exists': [],
+  'po-fx-rate': ['fx-rates'],
+  'po-tax-rate': ['tax-rates'],
+  'lookup-keys-unique-in-ims': ['data-classes'],
+  'po-reference-free': ['data-classes'],
+  'po-product-lifecycle': ['data-classes'],
+  'transfer-reference-free': null,
+  'transfer-source-stock': null,
+  'barcode-free': ['data-classes'],
+  'product-parent-exists': [],
+}
+
+/** The ids of `preconditions[]` in an apply report, in order: every rail, then every apply-time check. The readiness gate requires exactly these. */
+export const PRECONDITION_IDS: readonly string[] = [...RAIL_IDS.map((id) => `rail:${id}`), ...Object.keys(APPLY_CHECK_RAILS).sort().map((id) => `check:${id}`)]

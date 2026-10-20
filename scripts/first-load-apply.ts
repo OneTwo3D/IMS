@@ -28,12 +28,13 @@ import pg from 'pg'
 import {
   APPLY_EXIT_CODES, REHEARSAL_MAX_AGE_HOURS, REHEARSAL_RECORD_STEM_PREFIX, RUNNER_APPLICATION_NAME, exitOperatorText, type ApplyExitName,
 } from '../lib/first-load/apply/constants'
-import { REHEARSAL_DATABASE, buildRunnerEnv, CHILD_PROOF_FILE, CHILD_REFUSAL_CODE, CHILD_TOKEN_ENV, checkChildProof, checkRecordBinding, rehearsalCommandExit, restorePointPath, checkRecordReportFile, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
+import { REHEARSAL_DATABASE, buildRunnerEnv, CHILD_PROOF_FILE, CHILD_REFUSAL_CODE, CHILD_TOKEN_ENV, checkChildProof, checkRecordBinding, checkRecordBuild, rehearsalCommandExit, restorePointPath, checkRecordReportFile, checkRecordSchema, exitCodeOf, helpText, libpqEnvFromUrl, parseCliArgs, reportStem, type CliArgs } from '../lib/first-load/apply/cli'
 import { readPreparedDir, PreparedDirError } from '../lib/first-load/apply/io'
 import { ApplyManifestError, parseApplyManifest, type ApplyManifest } from '../lib/first-load/apply/manifest'
 import { checkRehearsalGate, type ApplyResult } from '../lib/first-load/apply/orchestrate'
 import { loadPreparedRun, type PreparedRun } from '../lib/first-load/apply/prepared'
 import { buildApplyReport, renderApplyMarkdown, type ReportRestorePoint, type ReportTarget } from '../lib/first-load/apply/report'
+import { readBuildIdentity, type BuildIdentity } from '../lib/ops/build-identity'
 import { checkoutMigrationNames } from '../lib/first-load/apply/db/migrations'
 import { compareMigrations, migrationsHash, type MigrationRow } from '../lib/first-load/apply/verify-core'
 import { pgBinDir } from '../tests/scripts/real-postgres-cluster'
@@ -43,6 +44,11 @@ import {
 import { insideRunDir, rehearse } from './lib/first-load-rehearse'
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
+
+/** The identity of the code this command runs from, or null when git cannot say. */
+function currentBuild(): BuildIdentity | null {
+  try { return readBuildIdentity(REPO_ROOT) } catch { return null }
+}
 
 export interface CliIo {
   out: (text: string) => void
@@ -228,6 +234,8 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
       if (gate.length > 0) return stopWith('PRECONDITION_REFUSED', gate)
       const schema = checkRecordSchema(rehearsalRecord, schemaHash)
       if (schema.length > 0) return stopWith('PRECONDITION_REFUSED', schema)
+      const code = checkRecordBuild(rehearsalRecord, currentBuild())
+      if (code.length > 0) return stopWith('PRECONDITION_REFUSED', code)
       // The record's verdict is not taken on its word: it must carry every bound field, and the child report it binds is re-read from beside the record and re-validated.
       const binding = checkRecordBinding(rehearsalRecord)
       if (binding.length > 0) return stopWith('PRECONDITION_REFUSED', binding)
@@ -249,6 +257,20 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
       }
       if (existing !== null && !args.resume) return stopWith('PRECONDITION_REFUSED', ['a run record already exists in this database; use --resume for the same load'])
       if (existing === null && args.resume) return stopWith('PRECONDITION_REFUSED', ['--resume was given but no run record exists for this database'])
+      // EVERY rail, including the pre-load rails (outbound grants, producer hold, connectors, crons), BEFORE the restore point is taken: a refusal here has written nothing, not even a dump.
+      // The core evaluates them again before the first step, at each step and before each first write; this one only moves the earliest refusal ahead of the dump.
+      {
+        const { evaluateRails } = await import('../lib/first-load/apply/db/rails')
+        const { ObservationError } = await import('../lib/first-load/apply/residual')
+        let early: string[]
+        try {
+          early = await evaluateRails(prepared, { phase: 'preflight', resuming: existing !== null, step: null })
+        } catch (error) {
+          if (error instanceof ObservationError) return stopWith('PRECONDITION_REFUSED', ['the database could not be read; an unreadable state is never assumed to be fine'])
+          throw error
+        }
+        if (early.length > 0) return stopWith('PRECONDITION_REFUSED', early)
+      }
       if (existing !== null) {
         // A resume needs the restore point the first attempt took, unchanged: it is the only way back.
         let recorded: unknown
@@ -288,7 +310,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
       maxRehearsalAgeHours: REHEARSAL_MAX_AGE_HOURS,
       ...(isRehearsalChild ? { thisIsTheRehearsal: true as const } : {}),
     })
-    const report = buildApplyReport({ prepared, result, target, restorePoint, window: { start: windowStart.toISOString(), end: new Date().toISOString() } })
+    const report = buildApplyReport({ prepared, result, target, restorePoint, rails: ports.railTally?.() ?? [], window: { start: windowStart.toISOString(), end: new Date().toISOString() } })
     return publishAndPrint(io, reportDir.value, args.rehearsalChild?.reportStem ?? stem, report, result.exit, result.problems, restorePoint)
   } finally {
     await finishDb()
@@ -335,6 +357,7 @@ export async function rehearseMode(
     manifestDigest: ctx.prepared.manifestDigest,
     steps: ctx.prepared.steps.map((st) => st.step),
     schemaHash: migrationsHash(checkoutMigrationNames(REPO_ROOT)),
+    build: currentBuild(),
     repoRoot: REPO_ROOT,
     root: args.root,
     reportDir: ctx.reportDir.dir,

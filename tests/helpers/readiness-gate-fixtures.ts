@@ -6,6 +6,8 @@ import {
 } from '../../lib/ops/readiness-gate-constants.ts'
 import type { ConstraintRow } from '../../lib/ops/readiness-gate-collect.ts'
 import type { BuildIdentity } from '../../lib/ops/build-identity.ts'
+import { APPLY_REPORT_FORMAT_VERSION, PRECONDITION_IDS } from '../../lib/first-load/apply/constants.ts'
+import { VERIFICATION_IDS } from '../../lib/first-load/apply/verify-core.ts'
 import {
   type AcceptanceFile,
   type CheckResult,
@@ -148,3 +150,39 @@ export function constraintRows(): ConstraintRow[] {
   return REQUIRED_CHECK_CONSTRAINTS.map((entry) => ({ schema: 'public', table: entry.table, name: entry.name, validated: true, definition: PG_RENDERED[entry.name]!, currentSchema: 'public' }))
 }
 export const ALL_CONSTRAINTS = async (): Promise<ConstraintRow[]> => constraintRows()
+
+
+// ---------------------------------------------------------------------------------------------
+// The first load: the database's run record and the published apply report that names it.
+// ---------------------------------------------------------------------------------------------
+
+export const APPLY_SYSTEM_ID = '7400000000000000001'
+export const APPLY_RUN = { runId: 'qoblex-load-1', manifestDigest: 'd'.repeat(64), status: 'VERIFIED' }
+
+/** A published apply report as scripts/first-load-apply.ts writes it (format version 2) for APPLY_RUN, made on APPLY_SYSTEM_ID two days before NOW. */
+export function greenApplyReport(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    tool: 'first-load-apply',
+    formatVersion: APPLY_REPORT_FORMAT_VERSION,
+    runId: APPLY_RUN.runId,
+    manifestDigest: APPLY_RUN.manifestDigest,
+    mode: 'apply',
+    exit: { code: 0, name: 'OK', operatorText: '' },
+    target: { database: 'ims', systemId: APPLY_SYSTEM_ID, migrations: 10 },
+    restorePoint: { path: '/var/tmp/restore/first-load-qoblex-load-1.dump', sha256: 'c'.repeat(64), bytes: 1234, listed: true },
+    preconditions: PRECONDITION_IDS.map((id) => ({ id, result: id === 'rail:fx-rates' || id === 'rail:tax-rates' || id === 'rail:warehouses' || id === 'rail:forbidden-skus' || id === 'rail:currency-lock' || id.startsWith('check:transfer') ? 'not-applicable' : 'pass', detail: 'x' })),
+    steps: [
+      { step: 'suppliers', status: 'DONE', emitted: 3, created: 3, updated: 0, skippedExisting: 0, failed: 0 },
+      { step: 'products', status: 'DONE', emitted: 5, created: 4, updated: 0, skippedExisting: 1, failed: 0 },
+    ],
+    accountingBalanced: true,
+    verification: VERIFICATION_IDS.map((id) => ({ id, result: 'pass', expected: 'x', actual: 'x' })),
+    problems: [],
+    window: { start: new Date(NOW.getTime() - 2 * DAY - 60_000).toISOString(), end: new Date(NOW.getTime() - 2 * DAY).toISOString() },
+    ...overrides,
+  }
+}
+
+export function applyEvidence(over: Partial<import('../../lib/ops/readiness-gate.ts').ApplyEvidence> = {}): import('../../lib/ops/readiness-gate.ts').ApplyEvidence {
+  return { systemId: APPLY_SYSTEM_ID, runs: [{ ...APPLY_RUN }], reports: [{ parsed: greenApplyReport(), markdownDigestOk: true }], unparseable: 0, ...over }
+}

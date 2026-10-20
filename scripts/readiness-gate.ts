@@ -8,7 +8,7 @@
  *
  * Usage:
  *   npm run readiness:gate -- --phase <P0|P1|P2> [--expect-granted <connector[,connector]|none>]
- *                             [--acceptances <file>] [--rehearsal-dir <dir>] [--report-dir <dir>] [--json]
+ *                             [--acceptances <file>] [--rehearsal-dir <dir>] [--apply-report-dir <dir>] [--report-dir <dir>] [--json]
  *
  * Exit codes: READINESS_GATE_EXIT_CODES in lib/ops/readiness-gate-constants.ts, documented once in
  * docs/installation.md ("Readiness gate"); a test compares the two. Operator text lives in the same module.
@@ -31,6 +31,7 @@ import {
 } from '../lib/ops/readiness-gate.ts'
 import {
   ACCEPTANCES_DEFAULT_FILE,
+  DEFAULT_APPLY_REPORT_DIR,
   DEFAULT_REHEARSAL_DIR,
   DEFAULT_REPORT_DIR,
   READINESS_GATE_COMMAND,
@@ -41,10 +42,12 @@ import {
 } from '../lib/ops/readiness-gate-constants.ts'
 import {
   collectGateResults,
+  defaultReadApplyRun,
   defaultReadInstalledConstraints,
   defaultReadOutbound,
   defaultReadReconciliation,
   defaultRunInvariant,
+  readApplyReports,
   readNewestRehearsal,
   readPackageScriptsFrom,
   runNpmScript,
@@ -64,26 +67,27 @@ export type GateCliArgs = {
   expectGranted: string[] | null
   acceptances: string | null
   rehearsalDir: string
+  applyReportDir: string
   reportDir: string
   json: boolean
   help: boolean
 }
 
-const USAGE = `Usage: ${READINESS_GATE_COMMAND} -- --phase <${READINESS_PHASES.join('|')}> [--expect-granted <${OUTBOUND_CONNECTORS.join('|')}[,...]|none>] [--acceptances <file>] [--rehearsal-dir <dir>] [--report-dir <dir>] [--json]
+const USAGE = `Usage: ${READINESS_GATE_COMMAND} -- --phase <${READINESS_PHASES.join('|')}> [--expect-granted <${OUTBOUND_CONNECTORS.join('|')}[,...]|none>] [--acceptances <file>] [--rehearsal-dir <dir>] [--apply-report-dir <dir>] [--report-dir <dir>] [--json]
 
 Exit codes:
 ${READINESS_GATE_EXIT_CODES.map((row) => `  ${String(row.code).padStart(2)}  ${row.name}: ${row.meaning}`).join('\n')}
 `
 
 export function parseGateArgs(argv: readonly string[]): GateCliArgs | { error: string } {
-  const out: GateCliArgs = { phase: 'P0', expectGranted: null, acceptances: null, rehearsalDir: DEFAULT_REHEARSAL_DIR, reportDir: DEFAULT_REPORT_DIR, json: false, help: false }
+  const out: GateCliArgs = { phase: 'P0', expectGranted: null, acceptances: null, rehearsalDir: DEFAULT_REHEARSAL_DIR, applyReportDir: DEFAULT_APPLY_REPORT_DIR, reportDir: DEFAULT_REPORT_DIR, json: false, help: false }
   let phase: ReadinessPhase | null = null
   const seen = new Set<string>()
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!
     if (arg === '--help' || arg === '-h') { out.help = true; continue }
     if (arg === '--json') { out.json = true; continue }
-    if (['--phase', '--expect-granted', '--acceptances', '--rehearsal-dir', '--report-dir'].includes(arg)) {
+    if (['--phase', '--expect-granted', '--acceptances', '--rehearsal-dir', '--apply-report-dir', '--report-dir'].includes(arg)) {
       if (seen.has(arg)) return { error: `${arg} was given more than once` }
       seen.add(arg)
       const value = argv[i + 1]
@@ -99,6 +103,7 @@ export function parseGateArgs(argv: readonly string[]): GateCliArgs | { error: s
         out.expectGranted = names
       } else if (arg === '--acceptances') out.acceptances = value
       else if (arg === '--rehearsal-dir') out.rehearsalDir = value
+      else if (arg === '--apply-report-dir') out.applyReportDir = value
       else out.reportDir = value
       continue
     }
@@ -149,6 +154,8 @@ function defaultDeps(env: Record<string, string | undefined>): GateDeps {
     readBuildIdentity: () => readBuildIdentity(REPO_ROOT),
     readInstalledConstraints: defaultReadInstalledConstraints,
     readNewestRehearsal: (dir) => readNewestRehearsal(dir, verifyPublishedReport),
+    readApplyRun: defaultReadApplyRun,
+    readApplyReports,
     env,
     repoRoot: REPO_ROOT,
   }
@@ -215,7 +222,7 @@ export async function runReadinessGate(options: GateRunOptions): Promise<number>
 
     const deps = options.deps ?? defaultDeps(env)
     stderr(`Readiness gate for ${args.phase}: collecting checks (the schema commands can take a minute).`)
-    const { results, notes } = await collectGateResults({ phase: args.phase, expectGranted: args.expectGranted, rehearsalDir: path.resolve(args.rehearsalDir) }, deps)
+    const { results, notes } = await collectGateResults({ phase: args.phase, expectGranted: args.expectGranted, rehearsalDir: path.resolve(args.rehearsalDir), applyReportDir: path.resolve(args.applyReportDir) }, deps)
     const now = deps.now()
     const verdict = decideVerdict({ phase: args.phase, results, acceptances: accepted.file, now })
     const runId = `${now.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')}-${randomBytes(4).toString('hex')}`

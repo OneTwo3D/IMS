@@ -221,7 +221,7 @@ export function isCrontabEmbeddableSecret(secret: string): boolean {
  * (Codex: the pipeline exits 0 even when the file or line is missing, so an
  * empty bearer would otherwise still be sent).
  */
-function runtimeSecretPrefix(envFilePath: string): string {
+export function runtimeSecretPrefix(envFilePath: string): string {
   return `CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${envFilePath}' | cut -d= -f2- | tr -d '"'); `
 }
 

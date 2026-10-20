@@ -7,14 +7,17 @@ import { spawn } from 'node:child_process'
 import { freePort, startCluster, type Cluster } from '../scripts/real-postgres-cluster'
 import { databaseUrl, ident, inheritedEnv, randomHex, runChild, socketPsql, tail, withClient } from '../../scripts/rehearse-first-install'
 import { OPENING_STOCK_IMPORT_HEADERS, PRODUCTS_IMPORT_HEADERS, PURCHASE_ORDERS_IMPORT_HEADERS, SUPPLIERS_IMPORT_HEADERS } from '../../lib/first-load/spec'
-import { APPLY_STEP_IDS, RUN_STATUSES, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME, type ApplyStepId } from '../../lib/first-load/apply/constants'
+import { APPLY_STEP_IDS, PRECONDITION_IDS, PRELOAD_RAIL_IDS, RUN_STATUSES, REHEARSAL_RECORD_FORMAT_VERSION, RUNNER_APPLICATION_NAME, type ApplyStepId } from '../../lib/first-load/apply/constants'
 import { FINGERPRINT_SPECS, keyStep, type StepRows } from '../../lib/first-load/apply/keys'
 import { StaleJournalError, StepLockError, runLoad, type ApplyOptions, type ApplyPorts, type RunRecord } from '../../lib/first-load/apply/orchestrate'
+import { buildPreconditions } from '../../lib/first-load/apply/report'
 import { planImportCalls } from '../../lib/first-load/apply/import-calls'
 import { buildResidual, classifyStep, listConflicts, ObservationError } from '../../lib/first-load/apply/residual'
 import type { PreparedRun } from '../../lib/first-load/apply/prepared'
+import { CLEAN_PRELOAD, CLEAN_SNAPSHOT } from './apply-preload'
 import { loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
 import { precondition } from './helpers'
+import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys'
 
 /**
  * THE DATABASE SIDE OF THE FIRST-LOAD APPLY RUNNER, on a real throwaway PostgreSQL cluster with the migrations applied.
@@ -51,8 +54,11 @@ type Modules = {
   lock: typeof import('../../lib/first-load/apply/db/lock')
   execute: typeof import('../../lib/first-load/apply/db/execute')
   rails: typeof import('../../lib/first-load/apply/db/rails')
+  preload: typeof import('../../lib/first-load/apply/db/preload-rails')
 }
 let m: Modules
+/** The rails over a quiet installation (see apply-preload.ts); the pre-load rails have their own tests. */
+const evaluateRails = (...args: Parameters<Modules['rails']['evaluateRails']>) => m.rails.evaluateRails(args[0], args[1], args[2] ?? CLEAN_PRELOAD)
 
 async function sql<T = Record<string, unknown>>(text: string, params: unknown[] = []): Promise<T[]> {
   return withClient(url, async (client) => (await client.query(text, params)).rows as T[])
@@ -147,7 +153,7 @@ const apply = (prepared: PreparedRun, extra: Partial<ApplyOptions> = {}): ApplyO
 const plan = (): ApplyOptions => ({ mode: 'plan', resume: false, rehearsal: null, systemId: null, now: new Date(), maxRehearsalAgeHours: 24 })
 
 let prepared: PreparedRun
-const ports = (p: PreparedRun = prepared, overrides: Partial<ApplyPorts> = {}): ApplyPorts => ({ ...m.ports.createDbPorts(p, { operator: 'Apply Test' }), ...overrides })
+const ports = (p: PreparedRun = prepared, overrides: Partial<ApplyPorts> = {}): ApplyPorts => ({ ...m.ports.createDbPorts(p, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), ...overrides })
 
 describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000 }, () => {
   before(async () => {
@@ -199,6 +205,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       lock: await import('../../lib/first-load/apply/db/lock'),
       execute: await import('../../lib/first-load/apply/db/execute'),
       rails: await import('../../lib/first-load/apply/db/rails'),
+      preload: await import('../../lib/first-load/apply/db/preload-rails'),
     }
 
     // The target's configuration: the warehouses the manifest declares, a purchase tax rate, and a stored EUR rate.
@@ -983,10 +990,136 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       }
     })
 
+    describe('the pre-load rails', () => {
+      const readers = (over: Partial<import('../../lib/first-load/apply/db/preload-rails').PreloadReaders> = {}) => ({ ...CLEAN_PRELOAD, ...over })
+      const clearSettings = async (...keys: string[]) => { for (const key of keys) await m.db.setting.deleteMany({ where: { key } }) }
+
+      it('CONTROL: over a quiet installation every pre-load rail is evaluated and none refuses', async () => {
+        await resetData()
+        const results = await m.rails.evaluateRailResults(prepared, { phase: 'preflight', resuming: false, step: null }, readers())
+        for (const id of PRELOAD_RAIL_IDS) assert.deepEqual(results.find((r) => r.id === id)?.problems, [], id)
+        assert.deepEqual(results.flatMap((r) => r.problems), [])
+      })
+
+      it('the REAL connector reader sees this installation\'s configured storefront and refuses it [mutation: ignore the storefront in connectorFinding]', async () => {
+        // The suite seeds WooCommerce enabled with a URL and keys (to prove effects are suppressed). That is exactly the installation the rail must refuse.
+        const real = await m.preload.readConnectorSnapshot({})
+        assert.equal(real.pluginEnabled.woocommerce, true)
+        assert.ok(real.credentialPresent['wc_url'] && real.credentialPresent['wc_consumer_key'] && real.credentialPresent['wc_consumer_secret'])
+        const problems = (await m.rails.evaluateRailResults(prepared, { phase: 'preflight', resuming: false, step: null }, { ...CLEAN_PRELOAD, connectors: m.preload.readConnectorSnapshot })).flatMap((r) => r.problems)
+        assert.match(problems.join(' | '), /connectors: the WooCommerce connector is enabled with store credentials/)
+        assert.ok(!/ck_apply|cs_apply|127\.0\.0\.1/.test(problems.join(' ')), 'no credential or URL in the text')
+        // The refusal reaches the command: an apply is refused before anything is written.
+        const result = await runLoad(prepared, m.ports.createDbPorts(prepared, { operator: 'Apply Test', preload: { ...CLEAN_PRELOAD, connectors: m.preload.readConnectorSnapshot } }), apply(prepared))
+        assert.equal(result.exit, 'PRECONDITION_REFUSED')
+        assert.equal(await count('first_load_apply_runs'), 0)
+        assert.equal(await count('suppliers'), 0)
+        assert.equal(await count('products'), 0)
+      })
+
+      it('the real reader reads each connector: enabled with a credential refuses, switched off does not, a credential from the environment counts [mutation: skip the environment fallback / the enabled flag]', async () => {
+        const wooKeys = [INTEGRATION_PLUGIN_SETTING_KEYS.woocommerce]
+        const original = await m.db.setting.findUnique({ where: { key: wooKeys[0]! } })
+        try {
+          await m.db.setting.update({ where: { key: wooKeys[0]! }, data: { value: 'false' } })
+          const off = await m.preload.readConnectorSnapshot({})
+          assert.equal(off.pluginEnabled.woocommerce, false)
+          assert.deepEqual(m.preload.connectorFinding(off).problems, [], 'credentials without the connector enabled')
+          // Mintsoft: enabled, a key in the ENVIRONMENT only.
+          await m.db.setting.upsert({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, create: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft, value: 'true' }, update: { value: 'true' } })
+          assert.deepEqual(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems, [], 'enabled, nothing configured')
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({ MINTSOFT_API_KEY: 'k' })).problems.length, 1, 'a key from the environment')
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({ MINTSOFT_API_KEY: '   ' })).problems.length, 0, 'a blank one is nothing')
+          await m.db.setting.upsert({ where: { key: 'mintsoft_api_key' }, create: { key: 'mintsoft_api_key', value: 'stored' }, update: { value: 'stored' } })
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 1, 'a stored key')
+          await m.db.setting.update({ where: { key: 'mintsoft_api_key' }, data: { value: '' } })
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0, 'an emptied one is nothing')
+          // A plugin switch with a value the application does not understand is read as ENABLED (refuse), not as off.
+          for (const odd of ['yes', '1', 'TRUE', 'enabled']) {
+            await m.db.setting.update({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, data: { value: odd } })
+            await m.db.setting.upsert({ where: { key: 'mintsoft_api_key' }, create: { key: 'mintsoft_api_key', value: 'stored' }, update: { value: 'stored' } })
+            assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 1, `plugin value ${odd}`)
+          }
+          await m.db.setting.update({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, data: { value: 'false' } })
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0, 'exactly false is off')
+          await m.db.setting.update({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, data: { value: 'true' } })
+          await m.db.setting.update({ where: { key: 'mintsoft_api_key' }, data: { value: '' } })
+          // Xero: enabled with a stored token.
+          await m.db.setting.upsert({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.xero }, create: { key: INTEGRATION_PLUGIN_SETTING_KEYS.xero, value: 'true' }, update: { value: 'true' } })
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0)
+          await m.db.accountingToken.create({ data: { connector: 'xero', accessToken: 'a', refreshToken: 'r', expiresAt: new Date(Date.now() + 3_600_000), tenantId: 't' } })
+          assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 1, 'a stored accounting token')
+        } finally {
+          await m.db.accountingToken.deleteMany({})
+          await clearSettings(INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft, INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'mintsoft_api_key')
+          if (original) await m.db.setting.update({ where: { key: wooKeys[0]! }, data: { value: original.value } })
+        }
+      })
+
+      it('an unreadable settings table is a refusal, never a quiet installation [mutation: return an empty snapshot on error]', async () => {
+        await sql('alter table settings rename to settings_hidden')
+        try {
+          await assert.rejects(m.preload.readConnectorSnapshot({}), (e: unknown) => e instanceof ObservationError && e.message === m.observe.DATABASE_READ_FAILED)
+          const result = await runLoad(prepared, m.ports.createDbPorts(prepared, { operator: 'Apply Test', preload: { ...CLEAN_PRELOAD, connectors: m.preload.readConnectorSnapshot } }), apply(prepared))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED')
+          assert.match(result.problems.join(' '), /could not be read/)
+          assert.equal(await count('first_load_apply_runs'), 0)
+        } finally {
+          await sql('alter table settings_hidden rename to settings')
+        }
+      })
+
+      it('a grant, a live-from instant or an armed cron refuses a whole load before the run record, the first row or a lock (nothing written)', async () => {
+        await resetData()
+        const before = { runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), suppliers: await count('suppliers'), products: await count('products') }
+        const arms: Array<[string, Partial<import('../../lib/first-load/apply/db/preload-rails').PreloadReaders>, RegExp]> = [
+          ['an outbound grant', { env: { WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test' } }, /outbound grants: a write grant for WooCommerce/],
+          ['a live-from instant', { env: { XERO_WRITES_LIVE_FROM: '2026-10-30T00:00:00Z' } }, /producer hold: a live-from instant is set for Xero/],
+          ['an unreadable enforcement value', { env: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'nope' } }, /producer hold: the enforcement variable is set but cannot be read/],
+          ['an armed writing cron', { crontab: async () => ({ resolved: true, text: '*/5 * * * * curl -sf -K - "$BASE_URL/accounting-sync"' }) }, /crons: 1 active crontab line\(s\) are not proven/],
+          ['an unreadable crontab', { crontab: async () => ({ resolved: false }) }, /crons: the crontab of the account running the load could not be read/],
+        ]
+        for (const [label, over, expected] of arms) {
+          const result = await runLoad(prepared, m.ports.createDbPorts(prepared, { operator: 'Apply Test', preload: readers(over) }), apply(prepared))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED', label)
+          assert.match(result.problems.join(' | '), expected, label)
+          assert.deepEqual({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), suppliers: await count('suppliers'), products: await count('products') }, before, `${label}: nothing written`)
+          const planned = await runLoad(prepared, m.ports.createDbPorts(prepared, { operator: 'Apply Test', preload: readers(over) }), plan())
+          assert.equal(planned.exit, 'PRECONDITION_REFUSED', `${label}: a plan refuses too`)
+        }
+      })
+
+      it('the rails are evaluated again inside the run: a grant that appears after the preflight stops the first step before it writes [mutation: drop the step-start recheck]', async () => {
+        await resetData()
+        let reads = 0
+        const env: Record<string, string> = {}
+        const flipping = readers({ env, connectors: async () => { reads += 1; if (reads === 2) env.MINTSOFT_WRITE_ALLOWED = 'https://api.example.test|89'; return CLEAN_SNAPSHOT } })
+        const result = await runLoad(prepared, m.ports.createDbPorts(prepared, { operator: 'Apply Test', preload: flipping }), apply(prepared))
+        assert.equal(result.exit, 'STEP_FAILED', result.problems.join(' | '))
+        assert.match(result.problems.join(' | '), /a rail no longer holds: outbound grants: a write grant for Mintsoft/)
+        assert.equal(await count('suppliers'), 0)
+        assert.equal(await count('products'), 0)
+        assert.equal(result.steps[0]!.importer.length, 0, 'no importer was called')
+      })
+
+      it('the tally is kept for the report: a rail that refused once stays refused, and the rest are listed with their state', async () => {
+        await resetData()
+        const refusing = m.ports.createDbPorts(prepared, { operator: 'Apply Test', preload: readers({ env: { MINTSOFT_WRITE_ALLOWED: 'https://api.example.test|89' } }) })
+        await runLoad(prepared, refusing, apply(prepared))
+        const tally = refusing.railTally!()
+        assert.ok(tally.find((t) => t.id === 'outbound-grants')!.refusals >= 1)
+        const report = buildPreconditions(tally)
+        assert.equal(report.find((p) => p.id === 'rail:outbound-grants')!.result, 'refused')
+        assert.equal(report.find((p) => p.id === 'rail:producer-hold')!.result, 'refused')
+        assert.deepEqual(report.map((p) => p.id), PRECONDITION_IDS)
+        assert.match(report.find((p) => p.id === 'rail:producer-hold')!.detail, /refused in/)
+      })
+    })
+
     describe('the empty-target rail', () => {
       it('CONTROL: the rail passes on an empty database', async () => {
         await resetData()
-        assert.deepEqual(await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null }), [])
+        assert.deepEqual(await evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null }), [])
       })
 
       it('a first run into a database that already holds business data is refused before anything is written, with nothing written', async () => {
@@ -1005,8 +1138,8 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('a locked base currency alone is refused too', async () => {
         await m.db.setting.upsert({ where: { key: 'base_currency_locked' }, create: { key: 'base_currency_locked', value: 'true' }, update: { value: 'true' } })
         try {
-          assert.match((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).join(';'), /base currency is already locked/)
-          assert.deepEqual(await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: true, step: null }), [], 'a resume is not asked for emptiness')
+          assert.match((await evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).join(';'), /base currency is already locked/)
+          assert.deepEqual(await evaluateRails(prepared, { phase: 'preflight', resuming: true, step: null }), [], 'a resume is not asked for emptiness')
         } finally {
           await m.db.setting.delete({ where: { key: 'base_currency_locked' } })
         }
@@ -1033,7 +1166,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const own = Number((await sql<{ n: string }>(`select count(*)::text as n from pg_stat_activity where datname = current_database() and backend_type = 'client backend' and application_name = $1`, [RUNNER_APPLICATION_NAME]))[0]!.n)
         precondition(t, 'tagged sessions open', own)
         assert.ok(own >= 2, `the pool and the lock pool are both open (${own})`)
-        assert.deepEqual((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('quiesce:')), [])
+        assert.deepEqual((await evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('quiesce:')), [])
       })
 
       it('another client session on the database (here a psql-like one) refuses the preflight, and nothing is written', async () => {
@@ -1042,7 +1175,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const other = await foreignClient()
         try {
           const before = await counts()
-          const problems = await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })
+          const problems = await evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })
           assert.ok(problems.some((p) => /^quiesce: 1 other client session\(s\) are connected to this database/.test(p)), JSON.stringify(problems))
           const planned = await runLoad(prepared, ports(), plan())
           assert.equal(planned.exit, 'PRECONDITION_REFUSED')
@@ -1051,7 +1184,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.match(result.problems.join(';'), /quiesce: 1 other client session/)
           assert.deepEqual(await counts(), before, 'nothing was written')
         } finally { await other.end() }
-        assert.deepEqual((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('quiesce:')), [], 'gone: accepted again')
+        assert.deepEqual((await evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('quiesce:')), [], 'gone: accepted again')
       })
 
       it('a foreign session that copies the runner\'s application_name is still another client (the label proves nothing)', async () => {
@@ -1059,7 +1192,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         await resetData()
         const spoof = await foreignClient(RUNNER_APPLICATION_NAME)
         try {
-          const problems = await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })
+          const problems = await evaluateRails(prepared, { phase: 'preflight', resuming: false, step: null })
           assert.ok(problems.some((p) => /^quiesce: 1 other client session\(s\)/.test(p)), JSON.stringify(problems))
           const result = await runLoad(prepared, ports(), apply(prepared))
           assert.equal(result.exit, 'PRECONDITION_REFUSED')
@@ -1116,7 +1249,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         // Mutation named: drop the quiesce check from the per-call guard -> all four opening layers are written by the runner while another session is connected: red.
         await resetData()
         const holder: { client: { end(): Promise<void> } | null } = { client: null }
-        const small = m.ports.createDbPorts(prepared, {
+        const small = m.ports.createDbPorts(prepared, { preload: CLEAN_PRELOAD,
           operator: 'Apply Test',
           maxRowsPerCall: 1,
           afterCall: async (step, call) => { if (step === 'opening-stock' && call === 1 && holder.client === null) holder.client = await foreignClient('late-worker') },
@@ -1225,7 +1358,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
 
     describe('every table is classified: independent business tables refuse a first run and a resume', () => {
       // Mutation named: go back to counting six tables (and customers/sales orders on a resume) -> the stock-count and transfer arms are green when they must be red.
-      const evaluate = (resuming: boolean) => m.rails.evaluateRails(prepared, resuming ? { phase: 'recheck', resuming: true, step: null } : { phase: 'preflight', resuming: false, step: null })
+      const evaluate = (resuming: boolean) => evaluateRails(prepared, resuming ? { phase: 'recheck', resuming: true, step: null } : { phase: 'preflight', resuming: false, step: null })
       const foreignFor = async (resuming: boolean, table: string) => (await evaluate(resuming)).filter((p) => p.includes(`the ${table} table holds`))
       it('CONTROL: a configured, otherwise empty database passes both rails', async () => {
         await resetData()
@@ -1275,12 +1408,12 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('a customer or a sales order that appeared since is refused on a RESUME too (the empty-target rail is for a fresh run only)', async () => {
         // Mutation named: drop the check -> a resume loads beside data of the application: red.
         await resetData()
-        const resume = () => m.rails.evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
+        const resume = () => evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
         assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'control')
         const customer = await m.db.customer.create({ data: { firstName: 'A', lastName: 'B' } })
         try {
           assert.ok((await resume()).some((p) => /^foreign data: the customers table holds 1 row\(s\)/.test(p)))
-          assert.ok((await m.rails.evaluateRails(prepared, { phase: 'preflight', resuming: true, step: null })).some((p) => p.startsWith('foreign data:')))
+          assert.ok((await evaluateRails(prepared, { phase: 'preflight', resuming: true, step: null })).some((p) => p.startsWith('foreign data:')))
         } finally { await m.db.customer.delete({ where: { id: customer.id } }) }
         assert.deepEqual((await resume()).filter((p) => p.startsWith('foreign data:')), [], 'gone')
       })
@@ -1288,8 +1421,8 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
 
     describe('every table the runner writes is attributed to the file on a resume', () => {
       // Mutation named: skip the attribution loop in dataClasses -> a foreign category / price-cache / recipe row between attempts is invisible: red.
-      const resume = () => m.rails.evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
-      const rows = async (table: string, run: PreparedRun = prepared) => (await m.rails.evaluateRails(run, { phase: 'recheck', resuming: true, step: null })).filter((p) => p.startsWith('foreign data:') && p.includes(`the ${table} table holds`))
+      const resume = () => evaluateRails(prepared, { phase: 'recheck', resuming: true, step: null })
+      const rows = async (table: string, run: PreparedRun = prepared) => (await evaluateRails(run, { phase: 'recheck', resuming: true, step: null })).filter((p) => p.startsWith('foreign data:') && p.includes(`the ${table} table holds`))
       // The synthetic files carry no categories: the same run with its first two products naming a root and a two-level category.
       const withCategories = (): PreparedRun => ({
         ...prepared,
@@ -1399,7 +1532,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
     })
 
     describe('the other rails', () => {
-      const rails = (step: ApplyStepId | null = null) => m.rails.evaluateRails(prepared, { phase: 'recheck', resuming: true, step })
+      const rails = (step: ApplyStepId | null = null) => evaluateRails(prepared, { phase: 'recheck', resuming: true, step })
 
       it('CONTROL: every rail passes on the configured target', async () => {
         await resetData()
@@ -1436,7 +1569,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
 
       it('a QUARANTINE warehouse is checked against its declared profile like any other (owner ruling: not available for sale, not synced)', async () => {
         const quarantine = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', expectWarehouses: { ...WAREHOUSES, 'ZQSENT-OVER': { type: 'QUARANTINE', availableForSale: false, syncToStore: false } } })
-        const check = () => m.rails.evaluateRails(quarantine, { phase: 'recheck', resuming: true, step: 'opening-stock' })
+        const check = () => evaluateRails(quarantine, { phase: 'recheck', resuming: true, step: 'opening-stock' })
         assert.match((await check()).join(';'), /warehouse 2 of 2 in expectWarehouses: its type is not the declared one/, 'the database says RESTOCK')
         await m.db.warehouse.update({ where: { code: 'ZQSENT-OVER' }, data: { type: 'QUARANTINE' } })
         try {
@@ -1451,7 +1584,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('a SKU the manifest forbids is refused if the database already holds it, in any case', async () => {
         // Mutation named: drop the forbiddenSkus call -> the ruled-out product is silently built on and this arm is red.
         const forbidding = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', forbidSkus: ['ZQSENT-GHOST'] })
-        const check = () => m.rails.evaluateRails(forbidding, { phase: 'recheck', resuming: true, step: null })
+        const check = () => evaluateRails(forbidding, { phase: 'recheck', resuming: true, step: null })
         assert.deepEqual(await check(), [], 'control: no such product')
         await m.db.product.create({ data: { sku: 'zqsent-ghost', name: 'ruled out' } })
         try { assert.match((await check()).join(';'), /forbidden SKUs: 1 product\(s\) the manifest forbids already exist/) } finally { await m.db.product.delete({ where: { sku: 'zqsent-ghost' } }) }
@@ -1464,7 +1597,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', taxRateName: VAT_NAME, taxRateValue: '20', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' }])
         const stepOf = { step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }
         const stub = { ...prepared, steps: [stepOf] } as unknown as PreparedRun
-        const rail = () => m.rails.evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'purchase-orders' })
+        const rail = () => evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'purchase-orders' })
         assert.deepEqual(await rail(), [], 'control: the stated 20 is the rate\'s value')
         await m.db.taxRate.update({ where: { id: taxRate.id }, data: { rate: '0.1' } })
         try {
@@ -1474,7 +1607,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.ok(!/20|VAT/.test(problems.replace(/\d+ (line|order)\(s\)/g, '')), 'the sentence carries no value')
           // The preflight refuses the whole run, and nothing is written.
           const before = { runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }
-          const result = await runLoad(stub, m.ports.createDbPorts(stub, { operator: 'Apply Test' }), apply(stub))
+          const result = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(stub))
           assert.equal(result.exit, 'PRECONDITION_REFUSED')
           assert.match(result.problems.join(';'), /state a tax value that is not the value of the active rate they name/)
           assert.deepEqual({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }, before)
@@ -1491,7 +1624,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', ...line }])
           return { ...prepared, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }] } as unknown as PreparedRun
         }
-        const problemsFor = (line: Record<string, string>) => m.rails.evaluateRails(orderFile(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })
+        const problemsFor = (line: Record<string, string>) => evaluateRails(orderFile(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })
         const setNamed = async (data: { usedFor?: string; active?: boolean }) => { await m.db.taxRate.update({ where: { id: named.id }, data }) }
         const rows: Array<{ label: string; line: Record<string, string>; state?: { usedFor?: string; active?: boolean }; refused: boolean }> = [
           // name present, named rate eligible
@@ -1540,7 +1673,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           try {
             const stub = orderFile(refusedLine)
             const before = { runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }
-            const result = await runLoad(stub, m.ports.createDbPorts(stub, { operator: 'Apply Test' }), apply(stub))
+            const result = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(stub))
             assert.equal(result.exit, 'PRECONDITION_REFUSED')
             assert.deepEqual({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }, before)
           } finally { await setNamed({ usedFor: 'PURCHASE', active: true }) }
@@ -1563,7 +1696,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', ...line }])
           return { ...prepared, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }] } as unknown as PreparedRun
         }
-        const problemsFor = async (line: Record<string, string>) => (await m.rails.evaluateRails(stubFor(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })).filter((p) => p.startsWith('purchase tax:'))
+        const problemsFor = async (line: Record<string, string>) => (await evaluateRails(stubFor(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })).filter((p) => p.startsWith('purchase tax:'))
         const setNamed = async (rate: string) => { await m.db.taxRate.update({ where: { id: named.id }, data: { rate } }) }
         const LINE_NAMED = { taxRateName: VAT_NAME, orderTaxRateName: `${VAT_NAME} five`, orderTaxRateValue: '5' } // the order tax is valid, so only the LINE decides
         const ORDER_ONLY = { orderTaxRateName: VAT_NAME } // an unnamed line: the order tax (and what lines inherit) decides
@@ -1606,7 +1739,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           await setNamed('0.3')
           const stub = stubFor(LINE_NAMED)
           const before = { runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }
-          const result = await runLoad(stub, m.ports.createDbPorts(stub, { operator: 'Apply Test' }), apply(stub))
+          const result = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(stub))
           assert.equal(result.exit, 'PRECONDITION_REFUSED')
           assert.deepEqual({ runs: await count('first_load_apply_runs'), logs: await count('activity_logs'), orders: await count('purchase_orders') }, before)
         } finally {
@@ -1627,7 +1760,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           const rows = stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [{ orderKey: PO_ONE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '10', unitCostForeign: '10', ...line }])
           return { ...prepared, steps: [{ step: 'purchase-orders', target: 'purchase-orders', files: [], data: rows, units: keyStep('purchase-orders', rows).units }] } as unknown as PreparedRun
         }
-        const problemsFor = async (line: Record<string, string>) => (await m.rails.evaluateRails(stubFor(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })).filter((p) => p.startsWith('purchase tax:'))
+        const problemsFor = async (line: Record<string, string>) => (await evaluateRails(stubFor(line), { phase: 'recheck', resuming: true, step: 'purchase-orders' })).filter((p) => p.startsWith('purchase tax:'))
         const LINE = { taxRateName: VAT_NAME, orderTaxRateName: `${VAT_NAME} five`, orderTaxRateValue: '5' }
         const ORDER = { orderTaxRateName: VAT_NAME }
         let cells = 0
@@ -1685,7 +1818,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('purchase orders: a tax that matches no active purchase rate, and an order-level name spelt differently, are refused', async () => {
         const stub = await loadWithTaxFile()
         const taxRate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME } })
-        const check = () => m.rails.evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'purchase-orders' })
+        const check = () => evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'purchase-orders' })
         assert.deepEqual(await check(), [], 'control: the odd file\'s taxes resolve (by name in another case, by value as a percentage, and the order-level name exactly)')
         // With the rate no longer a purchase rate, the line that names it resolves nowhere; the line that gives only 20 still finds the seeded 20% rate.
         await m.db.taxRate.update({ where: { id: taxRate.id }, data: { usedFor: 'SALES' } })
@@ -1854,7 +1987,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         let resumed: Awaited<ReturnType<typeof runLoad>> | null = null
         let layersWhenSecondFinished = -1
         let firstCalls = 0
-        const killing = m.ports.createDbPorts(prepared, {
+        const killing = m.ports.createDbPorts(prepared, { preload: CLEAN_PRELOAD,
           operator: 'Apply Test',
           maxRowsPerCall: 1,
           afterCall: async (step, call) => {

@@ -32,6 +32,7 @@ import {
   REQUIRED_READ_SYNC_STREAMS,
   REHEARSAL_CLOCK_SKEW_MS,
   REHEARSAL_MAX_AGE_DAYS,
+  APPLY_REPORT_MAX_AGE_DAYS,
   readinessGateExitCode,
   type CheckDefinition,
   type ReadinessPhase,
@@ -41,6 +42,15 @@ import {
 import { BUILD_IDENTITY_TEXT, compareBuildIdentity, type BuildIdentity } from '@/lib/ops/build-identity'
 import { STEP_CATALOGUE, teardownIncomplete, type RehearsalReport } from '@/lib/ops/first-install-rehearsal'
 import { OUTBOUND_CONNECTORS } from '@/lib/security/outbound-write-hold-constants'
+import {
+  APPLY_ALWAYS_PASS_PRECONDITIONS,
+  APPLY_PRECONDITION_IDS,
+  APPLY_REPORT_CONTRACT_EXIT_OK,
+  APPLY_REPORT_CONTRACT_FORMAT_VERSION,
+  APPLY_RUN_STATUSES,
+  APPLY_RUN_STATUS_VERIFIED,
+  APPLY_VERIFICATION_IDS,
+} from '@/lib/ops/first-load-apply-contract'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -504,6 +514,96 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date, ga
   return failures.length === 0
     ? pass(`GREEN, all ${STEP_CATALOGUE.length} steps required and passed, finished ${ageDays} days ago. ${BUILD_SCOPE_TEXT}`, detail, buildWarnings)
     : fail(failures, detail, buildWarnings)
+}
+
+// ---- the first load ------------------------------------------------------------------------
+
+/** One published apply report as the collector read it: the parsed JSON, and whether the Markdown beside it has the digest the JSON records (both taken from the bytes that were read, once). */
+export type ApplyReportFile = { parsed: unknown; markdownDigestOk: boolean }
+
+/** The row of the database's first-load run record (the table holds at most one). */
+export type ApplyRunRow = { runId: string; manifestDigest: string; status: string }
+
+export type ApplyEvidence = {
+  /** The cluster system identifier of the database the gate is reading, as the server reports it. */
+  systemId: string
+  runs: ApplyRunRow[]
+  reports: ApplyReportFile[]
+  /** Files that matched the report name but could not be parsed as JSON. Counted, never named. */
+  unparseable: number
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0
+
+/**
+ * The CLOSED codes for what is wrong with one published apply report that names this database's run. No field of the file reaches a message: a code and a count are all that is printed.
+ * The report is checked on its own claims (exit, steps, verification, accounting, restore point, preconditions) AND against facts the gate read for itself (the system identifier, the clock).
+ */
+export function applyReportProblems(file: ApplyReportFile, evidence: Pick<ApplyEvidence, 'systemId'>, now: Date): string[] {
+  const codes: string[] = []
+  const report = file.parsed
+  if (!isRecord(report)) return ['not-an-object']
+  if (!file.markdownDigestOk) codes.push('markdown-digest')
+  if (report.tool !== 'first-load-apply') codes.push('tool')
+  if (report.formatVersion !== APPLY_REPORT_CONTRACT_FORMAT_VERSION) codes.push('format-version')
+  if (report.mode !== 'apply') codes.push('mode')
+  const exit = report.exit
+  if (!isRecord(exit) || exit.name !== APPLY_REPORT_CONTRACT_EXIT_OK.name || exit.code !== APPLY_REPORT_CONTRACT_EXIT_OK.code) codes.push('exit-not-ok')
+  if (!Array.isArray(report.problems) || report.problems.length !== 0) codes.push('problems-recorded')
+  const steps = report.steps
+  if (!Array.isArray(steps) || steps.length === 0) codes.push('steps')
+  else if (!steps.every((step) => isRecord(step) && isCount(step.emitted) && isCount(step.created) && isCount(step.updated) && isCount(step.skippedExisting) && step.failed === 0
+    && step.emitted === (step.created as number) + (step.updated as number) + (step.skippedExisting as number)
+    // A step the load ran is DONE. A report written by a verification-only resume of an APPLIED run lists the steps as PENDING with every unit already present and matching.
+    && (step.status === 'DONE' || (step.status === 'PENDING' && step.created === 0 && step.updated === 0 && step.skippedExisting === step.emitted)))) codes.push('steps')
+  if (report.accountingBalanced !== true) codes.push('accounting')
+  const verification = report.verification
+  if (!Array.isArray(verification) || verification.length !== APPLY_VERIFICATION_IDS.length
+    || !APPLY_VERIFICATION_IDS.every((id) => verification.filter((item) => isRecord(item) && item.id === id && item.result === 'pass').length === 1)) codes.push('verification')
+  const restore = report.restorePoint
+  if (!isRecord(restore) || typeof restore.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(restore.sha256) || !isCount(restore.bytes) || restore.bytes === 0 || restore.listed !== true) codes.push('restore-point')
+  const preconditions = report.preconditions
+  if (!Array.isArray(preconditions) || preconditions.length !== APPLY_PRECONDITION_IDS.length
+    || !APPLY_PRECONDITION_IDS.every((id, index) => isRecord(preconditions[index]) && preconditions[index].id === id)) codes.push('preconditions')
+  else {
+    const results = new Map(preconditions.map((p) => [(p as Record<string, unknown>).id, (p as Record<string, unknown>).result]))
+    if (![...results.values()].every((r) => r === 'pass' || r === 'not-applicable') || !APPLY_ALWAYS_PASS_PRECONDITIONS.every((id) => results.get(id) === 'pass')) codes.push('preconditions')
+  }
+  const target = report.target
+  if (!isRecord(target) || typeof target.systemId !== 'string' || target.systemId === '' || target.systemId !== evidence.systemId) codes.push('system-id')
+  const window = report.window
+  const ended = isRecord(window) && typeof window.end === 'string' && ISO_RE.test(window.end) ? Date.parse(window.end) : Number.NaN
+  if (!Number.isFinite(ended)) codes.push('window')
+  else if (now.getTime() - ended > APPLY_REPORT_MAX_AGE_DAYS * DAY_MS) codes.push('age')
+  else if (ended - now.getTime() > REHEARSAL_CLOCK_SKEW_MS) codes.push('future')
+  return codes
+}
+
+/**
+ * THE FIRST LOAD. Which report speaks for this database is decided by IDENTITY, never by time: the database's single run record names the run id and the load digest, and only a report
+ * naming that run and digest, made on this cluster, can pass. The record's status (moved only by compare-and-swap) is what orders runs and re-verifications: a later failed verification
+ * turns it VERIFY_FAILED and this check fails, whatever older OK report is on disk. Earlier reports of the same run that ended otherwise (a resumed load) are history and do not fail it:
+ * ONE intact report that ended OK is enough.
+ */
+export function assessApplyReport(evidence: ApplyEvidence, now: Date): CheckResult {
+  if (typeof evidence.systemId !== 'string' || evidence.systemId === '') return unreadable('the cluster system identifier of this database could not be read, so no report can be shown to be about it')
+  if (evidence.runs.length === 0) return fail(['this database holds no first-load run record: no first load was applied here'])
+  if (evidence.runs.length > 1) return fail([`this database holds ${evidence.runs.length} first-load run records; exactly one is expected`])
+  const run = evidence.runs[0]!
+  const status = (APPLY_RUN_STATUSES as readonly string[]).includes(run.status) ? run.status : 'an unrecognised status'
+  if (run.status !== APPLY_RUN_STATUS_VERIFIED) return fail([`the first-load run record is ${status}, not VERIFIED`], { runStatus: status })
+  const named = evidence.reports.filter((file) => isRecord(file.parsed) && file.parsed.runId === run.runId && file.parsed.manifestDigest === run.manifestDigest)
+  if (named.length === 0) return fail([`no published apply report names this database's run and load digest (${evidence.reports.length} report file(s) read, ${evidence.unparseable} unparseable)`], { reportsRead: evidence.reports.length })
+  const judged = named.map((file) => applyReportProblems(file, evidence, now))
+  const intact = judged.filter((codes) => codes.length === 0).length
+  if (intact === 0) {
+    const tally = new Map<string, number>()
+    for (const codes of judged) for (const code of codes) tally.set(code, (tally.get(code) ?? 0) + 1)
+    const text = [...tally.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([code, n]) => `${code} x${n}`).join(', ')
+    return fail([`${named.length} published apply report(s) name this run, and none is intact and about this cluster (${text})`], { reportsNamingTheRun: named.length })
+  }
+  return pass(`the run record is VERIFIED and ${intact} intact published apply report(s) name it, made on this cluster`, { reportsNamingTheRun: named.length, intactReports: intact, unparseableFiles: evidence.unparseable })
 }
 
 // ---- read-sync liveness ------------------------------------------------------------------------
