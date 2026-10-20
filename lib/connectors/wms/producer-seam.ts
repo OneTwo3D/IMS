@@ -145,13 +145,12 @@ export async function wmsOrderCreateShadowEvidence(connectorId: string, orderId:
  * stands for the warehouse a create is a shadow and writes no push link, so "no link" proves nothing was called: the writer that owns order
  * creation in the current phase may have made the warehouse order, and the record is the only evidence IMS holds.
  *
- * Empty (and no read is made) when the hold is not enforced for any warehouse destination: the legacy guard, byte for byte. A client that
- * cannot run the read THROWS (it never reads as "none recorded").
+ * INDEPENDENT OF THE ENFORCEMENT SWITCH. The record outlives the switch: turning enforcement off does not make the bridge's warehouse order
+ * go away, so the question is asked of the durable table whatever the environment says. An order with no record gets the legacy answer (an
+ * empty list); the only cost with the switch off is one indexed read. A client that cannot run the read THROWS (it never reads as "none").
  */
 export async function findOrderWarehouseShadowRecords(client: ShadowEvidenceClient, orderId: string): Promise<DurableShadowRecord[]> {
-  const enforcement = readProducerEnforcement(process.env)
-  if (!enforcement.enforced) return []
-  const destinations = [...new Set(Object.values(WMS_PRODUCER_DESTINATION))].filter((destination) => enforcement.destinations.has(destination))
+  const destinations = [...new Set(Object.values(WMS_PRODUCER_DESTINATION))]
   const found: DurableShadowRecord[] = []
   for (const destination of destinations) {
     found.push(...await findDurableShadowRecords(client, destination, [{ subjectType: 'SalesOrder', exactIds: [orderId] }]))

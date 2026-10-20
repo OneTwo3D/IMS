@@ -5220,7 +5220,7 @@ What was changed, by reader (switch off is byte-identical for every one: the new
 |---|---|---|
 | warehouse reconcile, "not pushed" drift | every paid order reported as not pushed while the hold stands (no link is ever written) | no drift is detected while held; open findings are closed with an explicit held disposition |
 | exception inbox and order chip, warehouse Replay / Retry | offered for a dead letter the action always refuses (held, or paid before the live-from instant) | the affordance takes the same producer facts as the action |
-| sales order hard delete | "no push link" read as nothing was called, though the bridge may have created the warehouse order | a durable warehouse shadow record blocks the delete while the hold is enforced for the warehouse |
+| sales order hard delete | "no push link" read as nothing was called, though the bridge may have created the warehouse order | a durable warehouse shadow record blocks the delete, whatever the enforcement switch says |
 | held storefront sales invoice release | a shadowed release read as "queued nothing", left the hold pending, and recorded a posting refusal telling the operator to raise the invoice by hand | the hold is closed with its own sentence; no refusal |
 | daily-batch rebuild sweep | every shadowed batch reported each run as a refused rebuild with a re-post instruction | a shadow blocks the rebuild quietly |
 | reconciliation | every order in a shadowed batch reported as missing its mirrored event | a posting recorded as a shadow is not reported as missing an event |
@@ -5230,6 +5230,17 @@ What was changed, by reader (switch off is byte-identical for every one: the new
 | Group A2 debit reason, delete guard batch sentence | a shadow described as an abandoned or operator-settled row | its own wording |
 | bundle sync, ASN state readers | a durable conflict about component links that the held product writes never made; a Create control offered then refused | skipped with a held reason; the control is blocked with the shadow sentence |
 | outbox re-arm of a Xero job | a job the retirement SHADOWED was re-armed to pending | the retirement record is kept |
+
+Which of these reads depend on the enforcement switch, and which must not. Evidence that has to outlive a change of the switch is read from the durable record (or the row it names) whatever the environment says; a read that only decides what to DISPLAY or whether to PRODUCE follows the environment.
+
+| Reader | Reads | Follows the switch? | Why |
+|---|---|---|---|
+| order hard delete (accounting and warehouse shadows) | durable `outbound_shadow_writes`, under the order lock | no | a recorded shadow still refuses after enforcement is turned off: the owner of the operation may have created the document or the warehouse order; an order with no record deletes as before |
+| refund relief, expired shadowed journal | durable record naming the row or the refund | no | retention deleted the row, the record did not |
+| settlement verdict, health label, daily-batch rebuild verdict, reconciliation, A2 debit reason | the sync row's own standing | no | a shadow row is read as a shadow whatever the switch says (the row expires with retention; the rebuild window is retention-bounded) |
+| warehouse replay affordance, warehouse reconcile, ASN state, bundle sync | the environment | yes | they decide whether IMS would produce the write now; with the hold off the legacy behaviour is correct |
+| held create pass, verify queue | the environment (cursor only while held) | yes | production behaviour of the sweep |
+| held storefront invoice release | the facade's answer at release time | n/a | the hold is closed once, with its own sentence, and stays closed |
 
 Open findings (misreports not fixed here, all only while a hold is enforced; the census pins their number): `queueAccountingSyncTx` classifies a shadow as no prior attempt, so after the hold is switched off the same posting is created live beside the shadow (a design decision about what a shadow occupies); `computePreview` and `runDailyBatchSync` report a shadowed unearned-revenue reversal as "cancelled but may have posted" while the true-up is itself shadowed; `applyWcCouponCorrection`, `wcCouponCorrectionNeedsLedgerAdjustment`, `buildWcCouponLedgerHandoff` and the `report` of the coupon back-fill CLI treat a shadowed revenue-deferral batch as a posted journal in their hand-off text and, for a pre-cutoff pending batch row, decline for ever; `evaluateAccountingInvariantRows` can report a standing critical for an order stamped by a shadowed batch whose chargeback credit note was shadowed; `reverseOrphanedAllocationPosting` tells the operator to post a reversal by hand for a shadowed Group A2 journal (the proof refuses correctly, and no shadow of the reversal is recorded); `getOpenAsnPendingQty` and `processBookedInEvent` do not know of warehouse ASNs made by hand while ASN creation is shadowed, so a downward stock alignment is not held for receipt timing and a booked-in callback for such an ASN ends as a dead receipt event. Also noted, not shadow defects: the daily-batch history page shows the oldest row of a date and type, and the credit-note allocation sweep examines the oldest 200 credit notes only.
 

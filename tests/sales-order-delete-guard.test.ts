@@ -1809,7 +1809,7 @@ async function withMintsoftEnforcement<T>(value: string | undefined, fn: () => P
   }
 }
 
-test('[warehouse shadow] no push link but a durable mintsoft shadow of the create => BLOCKED while the hold is enforced for mintsoft; OFF, another destination, another order and a real link are the controls', async () => {
+test('[warehouse shadow] no push link but a durable mintsoft shadow of the create => BLOCKED whatever the enforcement switch says; no record, another order and another destination are the controls', async () => {
   const shadow = { destination: 'mintsoft', operation: 'order.create', subject_type: 'SalesOrder', subject_id: 'order-1' }
   console.log('# precondition: no push link, one mintsoft shadow record')
   await withMintsoftEnforcement('mintsoft', async () => {
@@ -1822,12 +1822,14 @@ test('[warehouse shadow] no push link but a durable mintsoft shadow of the creat
     assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [{ ...shadow, subject_id: 'order-2' }] }), 'order-1', STAMPS), null, 'CONTROL: another order')
     assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [{ ...shadow, destination: 'woocommerce' }] }), 'order-1', STAMPS), null, 'CONTROL: another destination')
   })
-  await withMintsoftEnforcement(undefined, async () => {
-    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [shadow] }), 'order-1', STAMPS), null, 'CONTROL: switch off is the legacy guard, byte for byte')
-  })
-  await withMintsoftEnforcement('xero', async () => {
-    assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [shadow] }), 'order-1', STAMPS), null, 'CONTROL: enforced for a different destination')
-  })
+  // The record OUTLIVES the switch: the bridge's warehouse order does not go away because enforcement was turned off.
+  for (const value of [undefined, 'xero']) {
+    await withMintsoftEnforcement(value, async () => {
+      const blocker = await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [shadow] }), 'order-1', STAMPS)
+      assert.equal(blocker?.code, 'wms_shadow_recorded', `switch ${String(value)}: a recorded shadow still refuses the delete`)
+      assert.equal(await findSalesOrderDeleteBlocker(makeTx({ pushLink: null, shadows: [] }), 'order-1', STAMPS), null, `switch ${String(value)}: an order with NO record deletes as before`)
+    })
+  }
 })
 
 test('[batch sentence] a SHADOW batch journal is not described as an operator settlement or a retirement; the other unproven standings keep that sentence', async () => {

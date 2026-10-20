@@ -131,3 +131,18 @@ test('THE CUT-OFF IS ASKED BY ALL THREE ORDERING READS: the pre-filter, the lock
   const locked = source.slice(source.indexOf('await lockSalesOrder(tx, entry.referenceId)'))
   assert.ok(locked.indexOf('xeroNotNeverDeliverablePendingWhere(xeroCutoffFloor())') > 0 && locked.indexOf('xeroNotNeverDeliverablePendingWhere(xeroCutoffFloor())') < locked.indexOf('decideInvoicePaymentClaim'))
 })
+
+test('THE DURABLE WAREHOUSE READ DOES NOT DEPEND ON THE SWITCH: findOrderWarehouseShadowRecords asks the table with enforcement unset', async () => {
+  const { findOrderWarehouseShadowRecords } = await import('@/lib/connectors/wms/producer-seam')
+  const saved = process.env[PRODUCER_HOLD_ENFORCED_ENV]
+  delete process.env[PRODUCER_HOLD_ENFORCED_ENV]
+  try {
+    let asked = 0
+    const client = { $queryRaw: async () => { asked += 1; return [{ id: 's', operation: 'order.create', subject_type: 'SalesOrder', subject_id: 'o1', occurrences: 1 }] } }
+    const records = await findOrderWarehouseShadowRecords(client as never, 'o1')
+    assert.equal(asked > 0, true)
+    assert.equal(records.length, asked)
+  } finally {
+    if (saved === undefined) delete process.env[PRODUCER_HOLD_ENFORCED_ENV]; else process.env[PRODUCER_HOLD_ENFORCED_ENV] = saved
+  }
+})
