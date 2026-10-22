@@ -62,6 +62,7 @@ export const PACK_REASON_CODES = {
   CAP_EXCEEDED: 'a read hit its cap, so the population is not proven complete; capped scans never pass',
   NO_POPULATION_RECORD: 'the recorded population the comparison is bounded by is missing or unreadable',
   NO_RUNNER: 'no runner exists on this build for the item',
+  NOT_SELECTED: 'the run was not asked to run the item (--items), so it was not read; it is never a pass',
   PHASE_NOT_APPLICABLE: 'the item does not apply in the phase asked about',
   INTERNAL_ERROR: 'the item runner failed unexpectedly',
 } as const
@@ -288,7 +289,7 @@ export const PACK_EXIT_CODES: readonly PackExitCode[] = [
   { code: 0, name: 'all-pass', meaning: 'every applicable item passed, at least one item passed, and the report was published' },
   { code: 1, name: 'fail', meaning: 'at least one item failed; the report was published and names each' },
   { code: 5, name: 'inconclusive', meaning: 'no item failed, but at least one item could not be proven (or nothing at all was proven); the report was published. Never a pass' },
-  { code: 2, name: 'refused', meaning: 'the pack refused to run (bad arguments, an unsafe report directory, a held run lock, a broken report chain); no item was run and nothing was published' },
+  { code: 2, name: 'refused', meaning: 'the pack refused to run or to publish (bad arguments, an account that may not run it, an unsafe report directory, a held run lock, a broken report chain); nothing was published. Items only read, so a refusal after they ran leaves nothing behind' },
   { code: 3, name: 'report-not-published', meaning: 'a verdict per item was reached but the report could not be durably published; the outcomes are not evidence and must not be relied on' },
   { code: 4, name: 'internal', meaning: 'the pack itself failed unexpectedly before it could reach an outcome; treat as inconclusive' },
 ]
@@ -319,6 +320,66 @@ export const MAX_EVIDENCE_LINES_PER_ITEM = 100000
 export const MAX_ENTRIES_PER_BUCKET = 1000000
 /** The system identifier is what PostgreSQL itself produces (pg_control_system().system_identifier): digits only. Nothing free-form. */
 export const SYSTEM_IDENTIFIER_RE = /^[0-9]{10,20}$/
+
+// ---------------------------------------------------------------------------------------------
+// The IMS readers (lib/reconciliation-pack/ims-readers.ts).
+// ---------------------------------------------------------------------------------------------
+
+/** The most rows one section of the IMS read returns. More is CAP_EXCEEDED, never a shorter list. */
+export const IMS_READER_ROW_CAP = 2_000_000
+/** The statement timeout of the IMS read. A statement that runs longer is READ_INCOMPLETE. */
+export const IMS_READER_STATEMENT_TIMEOUT_MS = 120_000
+/** The largest timeout a caller may ask for; also the idle-in-transaction bound. */
+export const IMS_READER_MAX_TIMEOUT_MS = 600_000
+/** The statuses a first-load run record can hold (a test pins this list to the runner's own). Only VERIFIED makes a first load a boundary. */
+export const FIRST_LOAD_RUN_STATUSES = ['RUNNING', 'STEP_FAILED', 'CONFLICT', 'APPLIED', 'VERIFIED', 'VERIFY_FAILED'] as const
+/** The sales-order statuses that make an order OPEN for the reconciliation (a draft is not on the storefront). */
+export const IMS_OPEN_ORDER_STATUSES = ['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] as const
+
+/** Why an identity is outside the recorded population. Closed: it is listed under outOfPopulation with one of these and is never a finding. */
+export const PACK_POPULATION_REASONS = {
+  BEFORE_FIRST_LOAD: 'the identity was created before the recorded, verified first load, so IMS never held it',
+  BEFORE_STOREFRONT_IMPORT: 'the storefront order was created before the recorded initial import, which brought in active orders only',
+  OLDER_THAN_RETENTION: 'the identity is older than the recorded sales-order retention horizon',
+} as const
+export type PackPopulationReason = keyof typeof PACK_POPULATION_REASONS
+export function renderPackPopulationTable(): string {
+  return ['| Out-of-population reason | Meaning |', '|---|---|', ...(Object.keys(PACK_POPULATION_REASONS) as PackPopulationReason[]).map((c) => `| ${c} | ${PACK_POPULATION_REASONS[c]} |`)].join('\n')
+}
+
+// ---------------------------------------------------------------------------------------------
+// The command: flags and the closed codes it prints.
+// ---------------------------------------------------------------------------------------------
+
+export const PACK_CLI_FLAGS: ReadonlyArray<{ flag: string; value: string; meaning: string }> = [
+  { flag: '--phase', value: 'P0, P1 or P2', meaning: 'required; there is no default, because an item applies in some phases and not others' },
+  { flag: '--as-of', value: 'YYYY-MM-DD', meaning: 'the cycle date D (default: yesterday, UTC); a real calendar date before today (UTC)' },
+  { flag: '--items', value: 'R1 to R15, comma-separated, each once', meaning: 'run only these items (default: all); every other item is reported inconclusive with NOT_SELECTED, so a partial run never exits 0 unless every other item the phase applies is not applicable' },
+  { flag: '--acceptances', value: 'file', meaning: 'the written warning-acceptance file R15 uses, in the readiness gate\'s format (default ops/readiness-warning-acceptances.json in the checkout; absent means no warning is accepted; a named file that cannot be read is a refusal)' },
+  { flag: '--report-dir', value: 'directory', meaning: `where reports are published (default ${DEFAULT_PACK_REPORT_DIR}); created mode 0700 if absent, and it and every ancestor must be modifiable only by root or the running account` },
+  { flag: '--basis-only', value: '-', meaning: 'check only whether the as-of basis for --as-of exists, and run no item; until the basis check is built into this version it prints BASIS_UNAVAILABLE_NOT_BUILT and exits 2' },
+  { flag: '--vendor-reads-only', value: '-', meaning: 'reserved for a later version; refused with VENDOR_READS_RESERVED' },
+  { flag: '--help', value: '-', meaning: 'print the usage and the exit codes' },
+]
+export function renderPackFlagTable(): string {
+  return ['| Flag | Value | Meaning |', '|---|---|---|', ...PACK_CLI_FLAGS.map((f) => `| ${f.flag} | ${f.value} | ${f.meaning} |`)].join('\n')
+}
+
+/** What the command prints when it stops without a report. The text on the terminal is the code and nothing else. */
+export const PACK_CLI_CODES = {
+  BAD_ARGUMENTS: 'an argument is unknown, repeated, missing its value, or not in the allowed form',
+  CREDENTIAL_ARGUMENT: 'an argument value looks like it carries a credential; secrets are never given on a command line',
+  ACCOUNT_NOT_ALLOWED: 'the command was started by an account that is neither root nor the owner of the checkout',
+  DATABASE_URL_MISSING: 'DATABASE_URL is not in the environment (the command does not read .env files)',
+  ACCEPTANCE_FILE_UNREADABLE: 'the acceptance file named with --acceptances could not be read',
+  BASIS_UNAVAILABLE_NOT_BUILT: 'the as-of basis check is not built into this version',
+  VENDOR_READS_RESERVED: 'the vendor-reads-only mode is reserved: this version makes no vendor call of any kind',
+  DATABASE_UNREADABLE: 'the database could not be read, so the report could not be attributed to a cluster; nothing was published',
+} as const
+export type PackCliCode = keyof typeof PACK_CLI_CODES
+export function renderPackCliCodeTable(): string {
+  return ['| Code | Meaning |', '|---|---|', ...(Object.keys(PACK_CLI_CODES) as PackCliCode[]).map((c) => `| ${c} | ${PACK_CLI_CODES[c]} |`)].join('\n')
+}
 
 // ---------------------------------------------------------------------------------------------
 // The docs. Marked blocks in docs/installation.md equal these bodies byte for byte.
@@ -393,7 +454,7 @@ export function renderPackPublishedFieldTable(): string {
 
 export const PACK_DOC_BLOCK_OPEN = (id: string) => `<!-- reconciliation-pack:${id} -->`
 export const PACK_DOC_BLOCK_CLOSE = (id: string) => `<!-- /reconciliation-pack:${id} -->`
-export type PackDocBlockId = 'overview' | 'outcomes' | 'proof' | 'tokens' | 'inputs' | 'reasons' | 'refusals' | 'items' | 'settling' | 'chain' | 'exit-codes' | 'audit'
+export type PackDocBlockId = 'overview' | 'usage' | 'cli-codes' | 'readers' | 'population' | 'outcomes' | 'proof' | 'tokens' | 'inputs' | 'reasons' | 'refusals' | 'items' | 'settling' | 'chain' | 'exit-codes' | 'audit'
 
 export function renderPackOutcomeTable(): string {
   return ['| Outcome | Meaning |', '|---|---|', ...PACK_OUTCOMES.map((o) => `| ${o} | ${PACK_OUTCOME_MEANING[o]} |`)].join('\n')
@@ -419,7 +480,11 @@ export function renderPackItemTable(): string {
 export const PACK_AUDIT_ROWS: ReadonlyArray<{ klass: string; guard: string }> = [
   { klass: 'TOCTOU between check and use', guard: 'every report file is opened once with O_NOFOLLOW and its digest taken on the same bytes; the run lock is verified (inode and token) immediately before the JSON commit; lock reclaim is serialised by a second exclusive file' },
   { klass: 'starvation of bounded oldest-first scans', guard: 'a read that hits its cap is CAP_EXCEEDED and never passes; there is no oldest-first window, and carried unsettled identities are re-checked first' },
-  { klass: 'false findings for pre-cutoff items', guard: 'identities outside the RECORDED population go to outOfPopulation, listed and never counted as findings' },
+  { klass: 'false findings for pre-cutoff items', guard: 'identities outside the RECORDED population go to outOfPopulation with a closed reason, listed and never counted as findings; an identity whose boundary has no record, or no creation instant, is unknown and makes the item inconclusive (never in, never out); the first-load record counts only when VERIFIED' },
+  { klass: 'a write, or a mixed-instant read, on the IMS side', guard: 'every IMS section is read in one REPEATABLE READ, READ ONLY transaction whose mode is read back and whose snapshot must be equal at the start and the end; only SELECTs and three fixed SET LOCALs can be sent, one statement per text, and it is always rolled back. A no-write proof diffs every table\'s rows and statistics across a real run' },
+  { klass: 'a bounded or oldest-first IMS read standing in for the population', guard: 'every section is read in full; over the row cap is CAP_EXCEEDED and a statement timeout is READ_INCOMPLETE; a row that cannot be read exactly makes its whole section unreadable instead of being dropped; stored snapshot rows must match the run row\'s count' },
+  { klass: 'a name, flag or location taken as proof (who runs it, what it reads)', guard: 'the account is checked by uid against root and the checkout\'s owner, not by name; the environment is replaced by a whitelist before the database client loads; a credential-shaped argument is refused; the report directory and the acceptance file are trusted only after the ancestor and owner checks; a warning is accepted only by an exact id in a file that passed them' },
+  { klass: 'an outcome staying OK after a recorded failure', guard: 'a runner that throws, returns something the report refuses, or reads a stream that was stale or moved is INTERNAL_ERROR, STALE_BASIS or BASIS_MOVED, never a pass; an invariant finding that the pack\'s own comparison would call equal is inconclusive, never a pass; the exit code is derived from the published items by one function and a publication failure is exit 3, not the item verdict' },
   { klass: 'secrets or data in text', guard: 'text carries closed codes, counts and sanitised identity tokens only; every other field has an anchored allowlist grammar (the system identifier is digits only); a token is a cuid, a numeric id, or a SKU or warehouse code that passes the character pattern and a credential screen (else a kind#digest), and a raw string cannot be typed as one. Tokens are trusted data keys and the screen is defence in depth, with its residual listed in the docs' },
   { klass: 'an aggregate or count standing in for identity', guard: 'comparison is keyed; equal counts with one identity swapped fail (onlyIms plus onlyVendor); counts are derived from the lists and the reader recomputes them' },
   { klass: '"looks empty so skipped"', guard: 'empty on both sides is EMPTY_UNPROVEN unless positive evidence is supplied; a run in which nothing passed exits 5, never 0' },
@@ -438,9 +503,25 @@ export function renderPackAuditTable(): string {
 
 export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
   overview: [
-    `\`${PACK_COMMAND}\` is the reconciliation pack: fifteen items (R1 to R15), each a claim that IMS agrees with a vendor or with its own ledger. It is not a second readiness gate and renders no overall verdict; the gate reads the newest report. This build contains the pack's pure comparators, the report writer and the report reader; the item runners and the command itself arrive in later changes, and until they do every item the gate asks about is "not available". The pack makes no vendor call of any kind in this build.`,
+    `\`${PACK_COMMAND}\` is the reconciliation pack: fifteen items (R1 to R15), each a claim that IMS agrees with a vendor or with its own ledger. It is not a second readiness gate and renders no overall verdict; the gate reads the newest report. This build runs R3, R4 and R15 end to end from the invariant report, and reports every other item the phase applies as inconclusive with NO_RUNNER and nothing listed until its runner arrives. The pack makes no vendor call of any kind in this build.`,
     '',
     'A run publishes `<report-dir>/<run id>/evidence.jsonl`, then `reconciliation-pack.md`, then `reconciliation-pack.json` last, each created exclusively and never through a symlink, fsynced and renamed into place under an exclusive 0700 directory. The JSON is the commit record: it names the Markdown by sha256 (`companionMarkdownSha256`) and the evidence by sha256 and line count, carries a `sequence` and the sha256 of the previous report\'s JSON (`previousReportSha256`), and counts that the reader recomputes from the evidence. Every identity is one line of the evidence, equal ones included: the reader recomputes every count and the digest of the equal identities from those lines, and re-judges each line against the item\'s catalogue row (which sides had the identity, recorded as explicit presence flags; the value shape the item\'s mode demands; the true difference of the two values; the tolerance verdict; and, for a minor-unit item, the currencies). The bucket of every pair entry is DERIVED from those fields in the builder and again in the reader (both sides present is equal or differing, one side is onlyIms or onlyVendor, neither is invalid) and a label that disagrees is refused. Nothing the caller owns is serialised: the input is copied field by field into plain objects (an unknown field, an accessor, a symbol key, a Proxy, a class instance or a hole is refused), and the finished report is read back by the reader\'s own validation before the first byte is written. Problem text is closed reason codes and counts only; identities appear only as sanitised tokens (a cuid, a numeric vendor id, a validated SKU or `sku#` and eight hex digits, a warehouse code).',
+  ].join('\n'),
+  usage: [
+    `\`${PACK_COMMAND} -- --phase <P0|P1|P2> [--as-of <YYYY-MM-DD>] [--items <R3,R4,...>] [--acceptances <file>] [--report-dir <dir>] [--basis-only] [--vendor-reads-only]\``,
+    '',
+    renderPackFlagTable(),
+    '',
+    'The command is started as root or as the account that owns the checkout; any other account is refused. `DATABASE_URL` must be in the environment: the command does not read `.env` files, replaces its whole environment with a short whitelist (PATH, HOME, LANG, LC_ALL, TZ and DATABASE_URL) before the application\'s database client is loaded, and refuses an argument that looks like it carries a credential. It makes no call to WooCommerce, Mintsoft, Xero or Qoblex and writes nothing to the database; it writes only its report. The invariant report behind R3, R4 and R15 runs in the same process with no-op activity-log and notification writers, in ONE transaction opened `REPEATABLE READ` and set `READ ONLY`, with the application\'s database client bound to that transaction, so its three reports and every page of them read one database state and any write is refused by the server. The run records its proof (the isolation level, the read-only flag and `pg_current_snapshot()`, read at its start and its end and required to agree, and that the application\'s client was the transaction), and R3, R4 and R15 are inconclusive without it.',
+    '',
+    'R3 and R4 name each stock level the invariant report flags (the product and warehouse ids) with the two quantities that disagree; with no flagged level they pass on the named proof that the report ran to the end and lists nothing. R15 names each critical finding and each warning by a digest of the gate\'s warning id (`finding-` and 20 hex digits; the id itself carries product, order and sync-log ids and is never printed), with 1 for the finding and, as the number the claim allows, 0 for a critical finding or a warning with no current written acceptance, and 1 for a warning the acceptance file covers. Findings that share one id (the id carries no severity) are one entry, and it takes the strictest number any of them allows, so an accepted warning never hides a critical finding with the same id. A report that did not run to the end (a run that was not completed or listed errors, a missing domain, a truncated list, an inventory cursor that is not null or any cursor on the accounting or sales report, a finding that says its scan stopped at a row cap, any count of a report or of the run\'s own summary (total, info, warning or critical, per domain and overall) that differs from the findings listed, a critical-findings list, an `ok` flag or a preflight `failure` value that disagrees with them, a severity the module does not know, a subject id that is present but not a non-empty string, a critical-findings list that is not exactly the reports\' critical findings identity by identity, a stock-claim code under the accounting or sales report, a run without the one-snapshot proof) is inconclusive, never a pass, and so is a flagged level that the pack\'s own comparison would call equal. The stock-movement branch of the report is read over all history here, not over the 90-day window the scheduled check uses, so R15 is not a windowed claim. R3, R4 and R15 all validate the whole run (all three domains and the run summary) before reading a finding.',
+  ].join('\n'),
+  'cli-codes': ['When the command stops without a report it prints one of these codes and nothing else about the cause.', '', renderPackCliCodeTable()].join('\n'),
+  readers: 'The IMS side of every comparison is read by lib/reconciliation-pack/ims-readers.ts in ONE transaction opened `REPEATABLE READ, READ ONLY` with a statement timeout. The transaction proves what it asked for: `transaction_read_only` and `transaction_isolation` are read back, the snapshot is read at the start and at the end and must be equal (else BASIS_MOVED), the only statements sent are SELECTs and three fixed SET LOCALs, and it is always rolled back. Sections: the cluster identity, the population boundaries, stock levels (stock-tracked product types; the others are returned in a separate list, excluded and never compared), products, open sales orders (PENDING_PAYMENT, ON_HOLD, PROCESSING, ALLOCATED, PICKING, PACKING) with their storefront links and external dates, tax rates and mappings, connector-confirmed Xero sync rows (SYNCED, a document id, no operator assertion), the stored inventory and balance snapshots of the cycle date (rows without a run row, or a different number of rows than the run row counts, are READ_INCOMPLETE) and the warehouse bindings with their stock-sync mode and whether alignment is confirmed. Every section is read in full: a section over its row cap is CAP_EXCEEDED, a statement timeout is READ_INCOMPLETE, and a row that cannot be read exactly (no id, a value that is not a plain decimal, an unknown enum, a duplicate identity) makes its whole section unreadable; nothing is dropped, defaulted or shortened.',
+  population: [
+    'The population an item compares is bounded by RECORDED identities, never by a guess: the first-load run record (only a VERIFIED run counts), the storefront initial-import completion setting (only the text `true` counts) and the sales-order retention setting (absent means keep everything). An identity created before a recorded boundary is listed as out of population with one of these reasons, and is never a finding; an identity whose boundary has no record, or that has no creation instant, is unknown and makes its item inconclusive. An instant equal to a boundary is inside. A recorded instant bounds a population here and nowhere else: two runs are never ordered by a timestamp.',
+    '',
+    renderPackPopulationTable(),
   ].join('\n'),
   outcomes: ['Each item ends in exactly one outcome.', '', renderPackOutcomeTable()].join('\n'),
   proof: [
@@ -474,7 +555,7 @@ export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
 }
 
 export const PACK_DOC_PLACEMENTS: ReadonlyArray<{ file: string; blocks: readonly PackDocBlockId[] }> = [
-  { file: 'docs/installation.md', blocks: ['overview', 'outcomes', 'proof', 'tokens', 'inputs', 'reasons', 'refusals', 'items', 'settling', 'chain', 'exit-codes', 'audit'] },
+  { file: 'docs/installation.md', blocks: ['overview', 'usage', 'cli-codes', 'readers', 'population', 'outcomes', 'proof', 'tokens', 'inputs', 'reasons', 'refusals', 'items', 'settling', 'chain', 'exit-codes', 'audit'] },
 ]
 
 export function renderPackDocBlock(id: PackDocBlockId): string {
