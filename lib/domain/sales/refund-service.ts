@@ -5265,7 +5265,7 @@ async function ensureReturnExpectationBeforeReplay(
     syncs: readonly RefundAccountingSyncRequest[]
   },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const refuse = (code: string) => ({ ok: false as const, error: `This in-transit refund's return document cannot be established (${code}), so its Stock in Transit journal was not replayed. Check the refund's cost snapshot and raise the document by hand.` })
+  const refuse = (code: string) => ({ ok: false as const, error: withLedgerCheck(`This in-transit refund's return document cannot be established (${code}), so its Stock in Transit journal was not replayed. Check the refund's cost snapshot and raise the document by hand.`) })
   const link = returnExpectationTransitLinkFromSyncs(params.syncs)
   const existing = await tx.returnExpectation.findUnique({ where: { refundId: params.refundId }, select: { valuedAt: true } })
   if (existing?.valuedAt) {
