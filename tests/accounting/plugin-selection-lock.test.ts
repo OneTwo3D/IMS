@@ -1120,6 +1120,9 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // identity reads are read-only. Its only writes go through Prisma: `boms.active` for one id and one
   // `activity_logs` row. It cannot touch `settings`, so it cannot move a plugin key.
   'lib/products/bom-recipe-repair.ts': 'runtime-assembled-sql',
+  // The reconciliation pack's one-snapshot client: a REPEATABLE READ transaction set READ ONLY, bound as the application's db for
+  // the invariant run only (operator command `npm run reconcile:pack`); the server refuses any write through it.
+  'lib/reconciliation-pack/invariant-snapshot.ts': 'operator-run-read',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',
