@@ -52,3 +52,21 @@ export function mode(file: string): number {
   return statSync(file).mode & 0o777
 }
 export { PACK_ITEM_IDS }
+
+type Finding = Record<string, unknown>
+/** An invariant result in the REAL shape (every count consistent), carrying the given inventory findings. */
+export function realEvidence(inventoryFindings: Finding[] = []): Record<string, unknown> {
+  const n = (severity: string) => inventoryFindings.filter((f) => f.severity === severity).length
+  const counts = { total: inventoryFindings.length, info: n('info'), warning: n('warning'), critical: n('critical') }
+  const empty = { total: 0, info: 0, warning: 0, critical: 0 }
+  const plain = { findings: [], summary: empty }
+  return {
+    ok: counts.critical === 0,
+    result: {
+      status: 'completed', errors: [],
+      criticalFindings: inventoryFindings.filter((f) => f.severity === 'critical').map((f) => ({ domain: 'inventory', code: f.code })),
+      summary: { total: counts, inventory: counts, accounting: empty, sales: empty },
+      reports: { inventory: { findings: inventoryFindings, truncated: false, nextCursor: null, summary: counts }, accounting: plain, sales: plain },
+    },
+  }
+}

@@ -9,14 +9,13 @@ import { KEPT_ENV, accountAllowed, buildPackEnv, defaultAsOf, isCalendarDate, pa
 import { PACK_CLI_CODES, PACK_CLI_FLAGS, PACK_EXIT_CODES, PACK_ITEM_IDS } from '../../lib/reconciliation-pack/constants.ts'
 import type { ImsQueryClient } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { readPackChain } from '../../lib/reconciliation-pack/trend.ts'
-import { NOW, cleanup, scratchDir } from './helpers.ts'
+import { NOW, cleanup, realEvidence, scratchDir } from './helpers.ts'
 
 const bases: string[] = []
 afterEach(() => cleanup(bases))
 
 const SID = '7000000000000000001'
-const emptyReport = { findings: [], truncated: false, nextCursor: null, summary: { total: 0, info: 0, warning: 0, critical: 0 } }
-const clean = { ok: true, result: { status: 'completed', errors: [], criticalFindings: [], summary: { total: { critical: 0, warning: 0 } }, reports: { inventory: emptyReport, accounting: emptyReport, sales: emptyReport } } }
+const clean = realEvidence()
 
 type Rig = { sent: string[]; opened: number; invariantRuns: number; out: string[]; err: string[]; deps: Partial<PackCliDeps> }
 function rig(over: { sid?: string | null; evidence?: unknown; openFails?: boolean } = {}): Rig {
@@ -185,7 +184,7 @@ test('P1 exits 5 (items without a runner), and a failing invariant report exits 
   const dir = scratchDir(bases)
   const a = rig()
   assert.equal(await run(a, ['--phase', 'P1', '--report-dir', dir]), 5)
-  const b = rig({ evidence: { ...clean, ok: false, result: { ...clean.result, reports: { ...clean.result.reports, inventory: { findings: [{ severity: 'warning', code: 'stock_cost_layer_quantity_mismatch', productId: 'cproduct0000000000000001a', warehouseId: 'cwarehouse000000000000001', message: 'm', details: { quantity: 5, remainingCostLayerQty: 3 } }], truncated: false, nextCursor: null, summary: { total: 1, info: 0, warning: 1, critical: 0 } } }, summary: { total: { critical: 0, warning: 1 } } } } })
+  const b = rig({ evidence: realEvidence([{ severity: 'warning', code: 'stock_cost_layer_quantity_mismatch', productId: 'cproduct0000000000000001a', warehouseId: 'cwarehouse000000000000001', message: 'm', details: { quantity: 5, remainingCostLayerQty: 3 } }]) })
   assert.equal(await run(b, ['--phase', 'P0', '--report-dir', dir]), 1)
   assert.equal(readdirSync(dir).filter((n) => /^\d{8}T/.test(n)).length, 2)
   const chain = readPackChain(dir)
@@ -251,7 +250,7 @@ test('the acceptance file: a named file that cannot be read is a refusal; a trus
   assert.equal(missing.opened + missing.invariantRuns, 0)
 
   const warning = { severity: 'warning', code: 'some_warning', productId: 'cproduct0000000000000001a', warehouseId: 'cwarehouse000000000000001', message: 'm', details: {} }
-  const evidence = { ...clean, result: { ...clean.result, reports: { ...clean.result.reports, inventory: { findings: [warning], truncated: false, nextCursor: null, summary: { total: 1, info: 0, warning: 1, critical: 0 } } }, summary: { total: { critical: 0, warning: 1 } } } }
+  const evidence = realEvidence([warning])
   const file = path.join(scratchDir(bases), 'accept.json')
   const { now } = { now: NOW }
   const entry = { warningId: 'invariant:inventory:some_warning:product=cproduct0000000000000001a,warehouse=cwarehouse000000000000001', acceptedBy: 'A Person', acceptedAt: new Date(now.getTime() - 3600_000).toISOString(), reason: 'Read it and agreed by hand', expiresAt: new Date(now.getTime() + 86400_000 * 30).toISOString(), phases: ['P0'] }
@@ -266,7 +265,7 @@ test('the acceptance file: a named file that cannot be read is a refusal; a trus
 test('nothing from the database URL, the evidence ids or an exception reaches the output', async () => {
   const dir = scratchDir(bases)
   const secret = ['hun', 'ter2-canary'].join('')
-  const r = rig({ evidence: { ...clean, result: { ...clean.result, reports: { ...clean.result.reports, inventory: { findings: [{ severity: 'warning', code: 'stock_cost_layer_quantity_mismatch', productId: secret, warehouseId: 'cwarehouse000000000000001', message: secret, details: { quantity: 5, remainingCostLayerQty: 3 } }], truncated: false, nextCursor: null, summary: { total: 1, info: 0, warning: 1, critical: 0 } } }, summary: { total: { critical: 0, warning: 1 } } } } })
+  const r = rig({ evidence: realEvidence([{ severity: 'warning', code: 'stock_cost_layer_quantity_mismatch', productId: secret, warehouseId: 'cwarehouse000000000000001', message: secret, details: { quantity: 5, remainingCostLayerQty: 3 } }]) })
   r.deps.disconnect = async () => { throw new Error(secret) }
   await run(r, base(dir), { env: { DATABASE_URL: `postgresql://ims:${secret}@127.0.0.1:1/x` } })
   assert.ok(!text(r).includes(secret))

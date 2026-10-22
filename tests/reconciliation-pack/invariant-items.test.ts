@@ -27,12 +27,22 @@ const report = (findings: F[], over: F = {}): F => ({
   summary: { total: findings.length, info: findings.filter((f) => f.severity === 'info').length, warning: findings.filter((f) => f.severity === 'warning').length, critical: findings.filter((f) => f.severity === 'critical').length },
   ...over,
 })
-function evidence(inventory: F[] = [], over: { inventory?: unknown; accounting?: unknown; sales?: unknown; result?: F; top?: F } = {}): F {
-  const pick = (k: 'inventory' | 'accounting' | 'sales', fallback: F) => (k in over ? over[k] : fallback)
+type Domain = 'inventory' | 'accounting' | 'sales'
+const countsOf = (r: unknown): F => {
+  const raw = (r as F | null | undefined)?.findings
+  const fs = (Array.isArray(raw) ? raw : []).filter((f): f is F => typeof f === 'object' && f !== null)
+  const n = (severity: string) => fs.filter((f) => f.severity === severity).length
+  return { total: fs.length, info: n('info'), warning: n('warning'), critical: n('critical') }
+}
+/** A run result in the real shape, every count derived from the reports actually listed; the knobs then break one thing at a time. */
+function evidence(inventory: F[] = [], over: { inventory?: unknown; accounting?: unknown; sales?: unknown; result?: F; top?: F; total?: F; domains?: Partial<Record<Domain, unknown>>; ok?: unknown; criticalFindings?: unknown } = {}): F {
+  const pick = (k: Domain, fallback: F) => (k in over ? over[k] : fallback)
   const reports = { inventory: pick('inventory', report(inventory)), accounting: pick('accounting', plainReport([])), sales: pick('sales', plainReport([])) }
-  const all = [inventory, ...[over.accounting, over.sales].map((r) => ((r as F | undefined)?.findings as F[] | undefined) ?? [])].flat()
-  const critical = all.filter((f) => f.severity === 'critical')
-  return { ok: critical.length === 0, ...(over.top ?? {}), result: { status: 'completed', errors: [], criticalFindings: critical, summary: { total: { critical: critical.length, warning: all.filter((f) => f.severity === 'warning').length } }, reports, ...(over.result ?? {}) } }
+  const dom = { inventory: countsOf(reports.inventory), accounting: countsOf(reports.accounting), sales: countsOf(reports.sales) }
+  const sum = (key: string) => (['inventory', 'accounting', 'sales'] as Domain[]).reduce((n, d) => n + (dom[d][key] as number), 0)
+  const critical = (['inventory', 'accounting', 'sales'] as Domain[]).flatMap((d) => (Array.isArray((reports[d] as F | null | undefined)?.findings) ? ((reports[d] as F).findings as F[]) : []).filter((f) => f && f.severity === 'critical').map((f) => ({ domain: d, code: f.code })))
+  const summary = { total: { total: sum('total'), info: sum('info'), warning: sum('warning'), critical: sum('critical'), ...(over.total ?? {}) }, ...dom, ...(over.domains ?? {}) }
+  return { ok: 'ok' in over ? over.ok : sum('critical') === 0, ...(over.top ?? {}), result: { status: 'completed', errors: [], criticalFindings: 'criticalFindings' in over ? over.criticalFindings : critical, summary, reports, ...(over.result ?? {}) } }
 }
 
 function assertBuilds(item: ItemInput): void {
@@ -66,6 +76,7 @@ test('a flagged level is a bothDiffer identity (R3 and R4), keyed by product and
   assert.equal(runInvariantItem('R3', evidence([r4(2, 0)]), ctx()).outcome, 'pass')
 })
 
+const MIXED = (): F[] => [warning(), { severity: 'info', code: 'i', message: 'm', details: {} }, r4(2, 0)]
 type Shape = { name: string; ev: () => unknown; ids: InvariantItemId[] }
 const BOTH: InvariantItemId[] = ['R3', 'R4', 'R15']
 const SHAPES: Shape[] = [
@@ -119,15 +130,60 @@ const SHAPES: Shape[] = [
   { name: 'sales report truncated', ev: () => evidence([], { sales: report([], { truncated: true }) }), ids: ['R15'] },
   { name: 'sales report missing', ev: () => evidence([], { sales: undefined, result: { reports: { inventory: report([]), accounting: report([]) } } }), ids: ['R15'] },
   { name: 'unknown severity', ev: () => evidence([{ severity: 'urgent', code: 'x', productId: P, message: 'm', details: {} }]), ids: ['R15'] },
-  { name: 'critical count above what the reports list', ev: () => evidence([], { result: { summary: { total: { critical: 2, warning: 0 } } } }), ids: ['R15'] },
-  { name: 'critical findings list shorter than the reports', ev: () => evidence([r4(2, 0)], { result: { criticalFindings: [] } }), ids: ['R15'] },
-  { name: 'run-wide warning count above what the reports list', ev: () => evidence([], { result: { summary: { total: { critical: 0, warning: 2 } } } }), ids: ['R15'] },
-  { name: 'run-wide warning count below what the reports list', ev: () => evidence([warning()], { result: { summary: { total: { critical: 0, warning: 0 } } } }), ids: ['R15'] },
-  { name: 'run-wide warning count missing', ev: () => evidence([], { result: { summary: { total: { critical: 0 } } } }), ids: ['R15'] },
+  { name: 'critical count above what the reports list', ev: () => evidence([], { total: { critical: 2 } }), ids: BOTH },
+  { name: 'critical findings list shorter than the reports', ev: () => evidence([r4(2, 0)], { criticalFindings: [] }), ids: BOTH },
+  { name: 'run-wide warning count above what the reports list', ev: () => evidence([], { total: { warning: 2 } }), ids: BOTH },
+  { name: 'run-wide warning count below what the reports list', ev: () => evidence([warning()], { total: { warning: 0 } }), ids: BOTH },
+  { name: 'run-wide warning count missing', ev: () => evidence([], { total: { warning: undefined } }), ids: BOTH },
   { name: 'unknown severity with matching counts (inventory)', ev: () => evidence([{ severity: 'urgent', code: 'x', productId: P, message: 'm', details: {} }]), ids: BOTH },
   { name: 'unknown severity with matching counts (sales)', ev: () => evidence([], { sales: plainReport([{ severity: 'urgent', code: 'x', message: 'm', details: {} }]) }), ids: ['R15'] },
   { name: 'severity not a known word (case)', ev: () => evidence([{ severity: 'Critical', code: 'x', message: 'm', details: {} }]), ids: BOTH },
-  { name: 'critical summary missing', ev: () => evidence([], { result: { summary: undefined } }), ids: ['R15'] },
+  { name: 'critical summary missing', ev: () => evidence([], { result: { summary: undefined } }), ids: BOTH },
+  // ---- the whole class: every count, flag and enum of the report, the run summary and the findings ----
+  ...(['total', 'info', 'warning', 'critical'] as const).flatMap((key) => [
+    { name: `run-wide ${key} above the sum of the domains`, ev: () => evidence(MIXED(), { total: { [key]: 99 } }), ids: BOTH },
+    { name: `run-wide ${key} below the sum of the domains`, ev: () => evidence(MIXED(), { total: { [key]: 0 } }), ids: BOTH },
+    { name: `run-wide ${key} missing`, ev: () => evidence([], { total: { [key]: undefined } }), ids: BOTH },
+    { name: `run-wide ${key} not a number`, ev: () => evidence([], { total: { [key]: '0' } }), ids: BOTH },
+    { name: `run-wide ${key} negative`, ev: () => evidence([], { total: { [key]: -1 } }), ids: BOTH },
+    { name: `run-wide ${key} fractional`, ev: () => evidence([], { total: { [key]: 0.5 } }), ids: BOTH },
+    { name: `inventory report ${key} above its list`, ev: () => evidence([], { inventory: report([], { summary: { total: 0, info: 0, warning: 0, critical: 0, [key]: 5 } }) }), ids: BOTH },
+    { name: `inventory report ${key} missing`, ev: () => evidence([], { inventory: report([], { summary: { total: 0, info: 0, warning: 0, critical: 0, [key]: undefined } }) }), ids: BOTH },
+    { name: `accounting report ${key} above its list`, ev: () => evidence([], { accounting: { findings: [], summary: { total: 0, info: 0, warning: 0, critical: 0, [key]: 5 } } }), ids: BOTH },
+    { name: `sales report ${key} missing`, ev: () => evidence([], { sales: { findings: [], summary: { total: 0, info: 0, warning: 0, critical: 0, [key]: undefined } } }), ids: BOTH },
+    ...(['inventory', 'accounting', 'sales'] as const).flatMap((d) => [
+      { name: `run summary of ${d}: ${key} differs from its report`, ev: () => evidence([], { domains: { [d]: { total: 0, info: 0, warning: 0, critical: 0, [key]: 3 } } }), ids: BOTH },
+      { name: `run summary of ${d}: ${key} missing`, ev: () => evidence([], { domains: { [d]: { total: 0, info: 0, warning: 0, critical: 0, [key]: undefined } } }), ids: BOTH },
+    ]),
+  ]),
+  // The same tampering stated EVERYWHERE (the report, the run's domain summary and the run total agree with one another and disagree
+  // with the list) is caught by the report-versus-list check alone, so it is tested on its own.
+  ...(['total', 'info', 'warning', 'critical'] as const).flatMap((key) => [
+    { name: `${key} stated consistently everywhere but not matching the list`, ev: () => evidence([], { inventory: report([], { summary: { total: 0, info: 0, warning: 0, critical: 0, [key]: 4 } }), domains: { inventory: { total: 0, info: 0, warning: 0, critical: 0, [key]: 4 } }, total: { [key]: 4 }, ...(key === 'critical' ? { criticalFindings: [1, 2, 3, 4].map(() => ({ domain: 'inventory', code: 'x' })), ok: false } : {}) }), ids: BOTH },
+    { name: `${key} missing everywhere`, ev: () => evidence([], { inventory: report([], { summary: { total: 0, info: 0, warning: 0, critical: 0, [key]: undefined } }), domains: { inventory: { total: 0, info: 0, warning: 0, critical: 0, [key]: undefined } }, total: { [key]: undefined } }), ids: BOTH },
+  ]),
+  { name: 'run summary missing a domain', ev: () => evidence([], { domains: { sales: undefined } }), ids: BOTH },
+  { name: 'run summary total missing', ev: () => evidence([], { result: { summary: { inventory: countsOf(report([])), accounting: countsOf(plainReport([])), sales: countsOf(plainReport([])) } } }), ids: BOTH },
+  { name: 'ok missing', ev: () => ({ ...evidence(), ok: undefined }), ids: BOTH },
+  { name: 'ok a string', ev: () => evidence([], { ok: 'true' }), ids: BOTH },
+  { name: 'ok true beside a critical finding', ev: () => evidence([r4(2, 0)], { ok: true }), ids: BOTH },
+  { name: 'ok false beside nothing critical', ev: () => evidence([], { ok: false }), ids: BOTH },
+  { name: 'critical findings list not a list', ev: () => evidence([r4(2, 0)], { criticalFindings: 'x' }), ids: BOTH },
+  { name: 'critical findings entry not an object', ev: () => evidence([r4(2, 0)], { criticalFindings: [null] }), ids: BOTH },
+  { name: 'critical findings entry without a domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ code: 'x' }] }), ids: BOTH },
+  { name: 'critical findings entry of an unknown domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'other', code: 'x' }] }), ids: BOTH },
+  { name: 'critical findings: the right entries plus one from an unknown domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'inventory', code: 'x' }, { domain: 'other', code: 'x' }] }), ids: BOTH },
+  { name: 'critical findings: the right entries plus a duplicate of a clean domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'inventory', code: 'x' }, { domain: 'sales', code: 'x' }] }), ids: BOTH },
+  { name: 'critical findings entry in the wrong domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'sales', code: 'x' }] }), ids: BOTH },
+  { name: 'critical findings entry without a code', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'inventory' }] }), ids: BOTH },
+  { name: 'a finding with an empty code', ev: () => evidence([{ severity: 'info', code: '', message: 'm', details: {} }]), ids: BOTH },
+  { name: 'a finding with a numeric code', ev: () => evidence([{ severity: 'info', code: 5, message: 'm', details: {} }]), ids: BOTH },
+  { name: 'a finding with a numeric severity', ev: () => evidence([{ severity: 1, code: 'x', message: 'm', details: {} }]), ids: BOTH },
+  { name: 'a finding with an empty severity', ev: () => evidence([{ severity: '', code: 'x', message: 'm', details: {} }]), ids: BOTH },
+  { name: 'accounting findings not a list', ev: () => evidence([], { accounting: { findings: {}, summary: { total: 0, info: 0, warning: 0, critical: 0 } } }), ids: BOTH },
+  { name: 'sales report is a list', ev: () => evidence([], { sales: [] }), ids: BOTH },
+  { name: 'reports not an object', ev: () => evidence([], { result: { reports: [] } }), ids: BOTH },
+  { name: 'status an object', ev: () => evidence([], { result: { status: { x: 1 } } }), ids: BOTH },
   { name: 'a getter that throws', ev: () => ({ get result(): never { throw new Error('boom') } }), ids: BOTH },
   { name: 'a Proxy that throws', ev: () => new Proxy({}, { get() { throw new Error('boom') }, has() { throw new Error('boom') }, ownKeys() { throw new Error('boom') } }), ids: BOTH },
 ]
@@ -146,7 +202,7 @@ test('NO unfinished, unreadable, truncated or self-contradicting report is ever 
     }
   }
   console.log(`precondition: ${SHAPES.length} shapes, ${cases} item runs, none a pass`)
-  assert.ok(cases >= 100)
+  assert.ok(cases >= 390)
 })
 
 

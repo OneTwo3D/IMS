@@ -5,13 +5,13 @@ import { parseAcceptanceFile } from '../../lib/ops/readiness-gate.ts'
 import { publishPackReport } from '../../lib/reconciliation-pack/publish.ts'
 import { memoisedInvariant, runItems, type ItemRunner, type LivenessPort, type RunPlan, type StreamReadings } from '../../lib/reconciliation-pack/run.ts'
 import { type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
-import { NOW, cleanup, passItem, scratchDir } from './helpers.ts'
+import { NOW, cleanup, passItem, realEvidence, scratchDir } from './helpers.ts'
 
 const bases: string[] = []
 afterEach(() => cleanup(bases))
 
 const STAMP = '2026-10-19T03:00:00.000Z'
-const clean = { ok: true, result: { status: 'completed', errors: [], criticalFindings: [], summary: { total: { critical: 0, warning: 0 } }, reports: Object.fromEntries(['inventory', 'accounting', 'sales'].map((d) => [d, { findings: [], truncated: false, nextCursor: null, summary: { total: 0, info: 0, warning: 0, critical: 0 } }])) } }
+const clean = realEvidence()
 
 function plan(over: Partial<RunPlan> & { invariant?: () => Promise<unknown> } = {}): RunPlan {
   const { invariant, ...rest } = over

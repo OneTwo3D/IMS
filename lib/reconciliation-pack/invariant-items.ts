@@ -41,30 +41,33 @@ const SEVERITIES: ReadonlySet<string> = new Set(['info', 'warning', 'critical'])
 const DOMAINS = ['inventory', 'accounting', 'sales'] as const
 type Domain = (typeof DOMAINS)[number]
 type Finding = Record<string, unknown> & { severity: string; code: string }
-type DomainReport = { findings: Finding[]; summary: { total: number; warning: number; critical: number } }
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 
 const inconclusive = (id: InvariantItemId, ...reasons: PackReasonCode[]): ItemInput => ({ id, outcome: 'inconclusive', reasons, sources: [...getPackItem(id).sources] })
 
-/** The run itself must have finished cleanly: a partial run lists whatever it could and says nothing about the rest. */
-function runFinished(evidence: unknown): PackReasonCode | null {
-  if (!isObject(evidence) || !isObject(evidence.result)) return 'SOURCE_UNREADABLE'
-  const { status, errors } = evidence.result
-  return status === 'completed' && Array.isArray(errors) && errors.length === 0 ? null : 'SOURCE_UNREADABLE'
-}
+type Counts = { total: number; info: number; warning: number; critical: number }
+const COUNT_KEYS = ['total', 'info', 'warning', 'critical'] as const
+type DomainReport = { findings: Finding[]; summary: Counts }
 
-/** One domain's report, or the closed reason it cannot be used. */
-function readDomain(evidence: unknown, domain: Domain): DomainReport | PackReasonCode {
-  if (!isObject(evidence) || !isObject(evidence.result) || !isObject(evidence.result.reports)) return 'SOURCE_UNREADABLE'
-  const report = evidence.result.reports[domain]
-  if (!isObject(report) || !Array.isArray(report.findings) || !isObject(report.summary)) return 'SOURCE_UNREADABLE'
-  const { total, warning, critical } = report.summary
-  if (!isCount(total) || !isCount(warning) || !isCount(critical)) return 'SOURCE_UNREADABLE'
+/** All four counts of a summary, each a whole number, or null: a missing or malformed count is never zero. */
+function readCounts(value: unknown): Counts | null {
+  if (!isObject(value)) return null
+  const { total, info, warning, critical } = value
+  return isCount(total) && isCount(info) && isCount(warning) && isCount(critical) ? { total, info, warning, critical } : null
+}
+const sameCounts = (left: Counts, right: Counts) => COUNT_KEYS.every((key) => left[key] === right[key])
+
+/** One domain's report, or the closed reason it cannot be used. Every count it states must equal what it lists. */
+function readDomain(reports: Record<string, unknown>, domain: Domain): DomainReport | PackReasonCode {
+  const report = reports[domain]
+  if (!isObject(report) || !Array.isArray(report.findings)) return 'SOURCE_UNREADABLE'
+  const summary = readCounts(report.summary)
+  if (summary === null) return 'SOURCE_UNREADABLE'
   const findings: Finding[] = []
   for (const finding of report.findings as unknown[]) {
-    if (!isObject(finding) || typeof finding.severity !== 'string' || typeof finding.code !== 'string') return 'SOURCE_UNREADABLE'
+    if (!isObject(finding) || typeof finding.severity !== 'string' || typeof finding.code !== 'string' || finding.code === '') return 'SOURCE_UNREADABLE'
     // A severity this module does not know is a finding it cannot judge: no item may pass beside it.
     if (!SEVERITIES.has(finding.severity)) return 'SOURCE_UNREADABLE'
     findings.push(finding as Finding)
@@ -78,8 +81,45 @@ function readDomain(evidence: unknown, domain: Domain): DomainReport | PackReaso
   // A cursor left over means there was more to read.
   if (report.nextCursor !== undefined && report.nextCursor !== null && report.nextCursor !== '') return 'READ_INCOMPLETE'
   const count = (severity: string) => findings.filter((finding) => finding.severity === severity).length
-  if (findings.length !== total || count('critical') !== critical || count('warning') !== warning) return 'READ_INCOMPLETE'
-  return { findings, summary: { total, warning, critical } }
+  if (!sameCounts(summary, { total: findings.length, info: count('info'), warning: count('warning'), critical: count('critical') })) return 'READ_INCOMPLETE'
+  return { findings, summary }
+}
+
+/**
+ * The whole run, validated field by field. Every domain's counts equal its listed findings; the run's own summary (the total
+ * and each domain's) equals the sum of what the reports list, count by count; the critical findings it lists are objects and
+ * agree per domain; and `ok` is a boolean that says what the findings say. Anything else is inconclusive, never a pass.
+ */
+function readRun(evidence: unknown): { reports: Record<Domain, DomainReport>; run: Record<string, unknown> } | PackReasonCode {
+  if (!isObject(evidence) || !isObject(evidence.result) || !isObject(evidence.result.reports)) return 'SOURCE_UNREADABLE'
+  const result = evidence.result
+  if (result.status !== 'completed' || !Array.isArray(result.errors) || result.errors.length > 0) return 'SOURCE_UNREADABLE'
+  const reports = {} as Record<Domain, DomainReport>
+  for (const domain of DOMAINS) {
+    const report = readDomain(result.reports as Record<string, unknown>, domain)
+    if (typeof report === 'string') return report
+    reports[domain] = report
+  }
+  if (!isObject(result.summary)) return 'READ_INCOMPLETE'
+  const sum: Counts = { total: 0, info: 0, warning: 0, critical: 0 }
+  for (const domain of DOMAINS) {
+    const stated = readCounts(result.summary[domain])
+    if (stated === null || !sameCounts(stated, reports[domain].summary)) return 'READ_INCOMPLETE'
+    for (const key of COUNT_KEYS) sum[key] += reports[domain].summary[key]
+  }
+  const total = readCounts(result.summary.total)
+  if (total === null || !sameCounts(total, sum)) return 'READ_INCOMPLETE'
+  // The per-domain counts below, with the refusal of an entry from a domain that is not one, fix the length of this list exactly.
+  if (!Array.isArray(result.criticalFindings)) return 'READ_INCOMPLETE'
+  const perDomain = new Map<string, number>()
+  for (const entry of result.criticalFindings as unknown[]) {
+    if (!isObject(entry) || typeof entry.domain !== 'string' || typeof entry.code !== 'string' || entry.code === '') return 'READ_INCOMPLETE'
+    perDomain.set(entry.domain, (perDomain.get(entry.domain) ?? 0) + 1)
+  }
+  if (DOMAINS.some((domain) => (perDomain.get(domain) ?? 0) !== reports[domain].summary.critical) || [...perDomain.keys()].some((domain) => !(DOMAINS as readonly string[]).includes(domain))) return 'READ_INCOMPLETE'
+  // `ok` must be exactly the boolean the findings imply (a missing or non-boolean value is never equal to it).
+  if ((evidence as Record<string, unknown>).ok !== (sum.critical === 0)) return 'READ_INCOMPLETE'
+  return { reports, run: result }
 }
 
 /** A plain decimal text for a stored quantity, or undefined (the comparator then refuses the row; nothing is defaulted). */
@@ -101,10 +141,9 @@ const CLAIMS: Record<'R3' | 'R4', { code: string; ims: string; vendor: string }>
 }
 
 function stockClaim(id: 'R3' | 'R4', evidence: unknown): ItemInput {
-  const unfinished = runFinished(evidence)
-  if (unfinished !== null) return inconclusive(id, unfinished)
-  const inventory = readDomain(evidence, 'inventory')
-  if (typeof inventory === 'string') return inconclusive(id, inventory)
+  const run = readRun(evidence)
+  if (typeof run === 'string') return inconclusive(id, run)
+  const inventory = run.reports.inventory
   const claim = CLAIMS[id]
   const ims: SideRow[] = []
   const vendor: SideRow[] = []
@@ -128,23 +167,9 @@ export function findingToken(domain: string, finding: { code: string }): string 
 }
 
 function allFindings(id: 'R15', evidence: unknown, ctx: InvariantItemContext): ItemInput {
-  if (!isObject(evidence) || !isObject(evidence.result)) return inconclusive(id, 'SOURCE_UNREADABLE')
-  const result = evidence.result
-  const unfinished = runFinished(evidence)
-  if (unfinished !== null) return inconclusive(id, unfinished)
-  const reports: Array<{ domain: Domain; report: DomainReport }> = []
-  for (const domain of DOMAINS) {
-    const report = readDomain(evidence, domain)
-    if (typeof report === 'string') return inconclusive(id, report)
-    reports.push({ domain, report })
-  }
-  // Every critical finding must be enumerated: the run's own totals may not count more than the reports list.
-  const total = isObject(result.summary) && isObject(result.summary.total) ? result.summary.total : null
-  const listedCritical = reports.reduce((sum, { report }) => sum + report.summary.critical, 0)
-  const listedWarning = reports.reduce((sum, { report }) => sum + report.summary.warning, 0)
-  // The run's own totals may not count more warnings than the reports list either: those could not be read one by one.
-  if (total === null || !isCount(total.warning) || total.warning !== listedWarning) return inconclusive(id, 'READ_INCOMPLETE')
-  if (!isCount(total.critical) || total.critical !== listedCritical || !Array.isArray(result.criticalFindings) || result.criticalFindings.length !== listedCritical) return inconclusive(id, 'READ_INCOMPLETE')
+  const run = readRun(evidence)
+  if (typeof run === 'string') return inconclusive(id, run)
+  const reports = DOMAINS.map((domain) => ({ domain, report: run.reports[domain] }))
 
   const ims: SideRow[] = []
   const vendor: SideRow[] = []
