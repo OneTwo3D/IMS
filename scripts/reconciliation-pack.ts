@@ -18,7 +18,6 @@ import { pathToFileURL } from 'node:url'
 import pg from 'pg'
 
 import { pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
-import { checkAncestors } from '../lib/ops/published-report.ts'
 import { loadAcceptances } from '../lib/reconciliation-pack/acceptances.ts'
 import { accountAllowed, buildPackEnv, parsePackArgs, type PackArgs } from '../lib/reconciliation-pack/cli.ts'
 import {
@@ -90,7 +89,18 @@ let applicationClientLoaded = false
 async function defaultRunInvariant(): Promise<unknown> {
   applicationClientLoaded = true
   const { runInvariantCheckPreflight } = await import('../lib/cron/invariant-check-preflight.ts')
-  return await runInvariantCheckPreflight()
+  const { runScheduledInvariantCheck } = await import('../lib/cron/invariant-check.ts')
+  const { runInventoryInvariantReport } = await import('../lib/domain/inventory/invariants.ts')
+  // The scheduled check with every writer a no-op, and the stock-movement branch read over ALL history: the scheduled check looks back
+  // 90 days only, and a pack item that claims "zero critical findings" may not rest on a window.
+  return await runInvariantCheckPreflight(() => runScheduledInvariantCheck({
+    createRunId: () => `reconcile-pack-${new Date().toISOString()}`,
+    writeActivityLog: async () => {},
+    notifyAdmins: async () => {},
+    getPreviousCriticalFindingsHash: async () => null,
+    setCriticalFindingsHash: async () => {},
+    runInventoryReport: () => runInventoryInvariantReport({ collectionMode: 'sql', pageSize: 500, maxFindings: 5000, stockMovementLookbackDays: null }),
+  }))
 }
 async function defaultDisconnect(): Promise<void> {
   if (!applicationClientLoaded) return
@@ -140,7 +150,7 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
 
     const reportDir = path.resolve(args.reportDir)
     try { mkdirSync(reportDir, { recursive: true, mode: 0o700 }) } catch { return refuse('DIR_UNREADABLE') }
-    if (checkAncestors(reportDir, 'report directory') !== null) return refuse('DIR_UNTRUSTED')
+    // readPackChain checks the directory and every ancestor first (DIR_UNTRUSTED), so this is also the trust check.
     const chain = readPackChain(reportDir)
     if (!chain.ok) return refuse(chain.code)
 

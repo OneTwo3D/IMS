@@ -155,6 +155,11 @@ const UTC = (column: string) => `to_char(${column}, 'YYYY-MM-DD"T"HH24:MI:SS.MS"
 
 const ALLOWED_STATEMENT = /^\s*(?:SELECT\b|SET LOCAL (?:statement_timeout|idle_in_transaction_session_timeout) = [0-9]{1,7}\s*$|SET LOCAL TIME ZONE 'UTC'\s*$)/i
 
+/** Only a SELECT or one of three fixed SET LOCALs is ever sent, and never two statements in one text. */
+export function statementAllowed(sql: string): boolean {
+  return typeof sql === 'string' && ALLOWED_STATEMENT.test(sql) && !sql.includes(';')
+}
+
 function closedReason(error: unknown): PackReasonCode {
   if (error instanceof Unreadable) return error.reason
   const code = (error as { code?: unknown } | null)?.code
@@ -308,8 +313,7 @@ export async function readImsSnapshot(client: ImsQueryClient, options: ImsReadOp
 
   let open = false
   const run = async (sql: string, values?: unknown[]): Promise<Array<Record<string, unknown>>> => {
-    // Only a SELECT or one of three fixed SET LOCALs is ever sent, and never two statements in one text.
-    if (!ALLOWED_STATEMENT.test(sql) || sql.includes(';')) throw new Unreadable('SOURCE_UNREADABLE')
+    if (!statementAllowed(sql)) throw new Unreadable('SOURCE_UNREADABLE')
     return (await client.query(sql, values)).rows
   }
   try {

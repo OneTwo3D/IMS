@@ -33,6 +33,9 @@ import type { ItemInput } from '@/lib/reconciliation-pack/report'
 export type InvariantItemContext = { phase: ReadinessPhase; now: Date; acceptances: AcceptanceFile }
 export type InvariantItemId = 'R3' | 'R4' | 'R15'
 
+/** Findings that say a scan stopped at its cap: the list is a prefix, so nothing may pass on it. */
+const CAP_MARKER_CODES: ReadonlySet<string> = new Set([INVARIANT_TRUNCATED_CODE, 'refund_status_reconciliation_row_cap_reached', 'refund_basis_audit_row_cap_reached'])
+
 const DOMAINS = ['inventory', 'accounting', 'sales'] as const
 type Domain = (typeof DOMAINS)[number]
 type Finding = Record<string, unknown> & { severity: string; code: string }
@@ -42,6 +45,13 @@ const isObject = (value: unknown): value is Record<string, unknown> => typeof va
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 
 const inconclusive = (id: InvariantItemId, ...reasons: PackReasonCode[]): ItemInput => ({ id, outcome: 'inconclusive', reasons, sources: [...getPackItem(id).sources] })
+
+/** The run itself must have finished cleanly: a partial run lists whatever it could and says nothing about the rest. */
+function runFinished(evidence: unknown): PackReasonCode | null {
+  if (!isObject(evidence) || !isObject(evidence.result)) return 'SOURCE_UNREADABLE'
+  const { status, errors } = evidence.result
+  return status === 'completed' && Array.isArray(errors) && errors.length === 0 ? null : 'SOURCE_UNREADABLE'
+}
 
 /** One domain's report, or the closed reason it cannot be used. */
 function readDomain(evidence: unknown, domain: Domain): DomainReport | PackReasonCode {
@@ -57,8 +67,12 @@ function readDomain(evidence: unknown, domain: Domain): DomainReport | PackReaso
   }
   // Positive proof the report ran to the end: the flag is the boolean false, no marker finding, and the summary counts
   // exactly what is listed (a count above the list means findings that cannot be read one by one).
-  if (report.truncated === true || findings.some((finding) => finding.code === INVARIANT_TRUNCATED_CODE)) return 'CAP_EXCEEDED'
-  if (report.truncated !== false) return 'READ_INCOMPLETE'
+  if (report.truncated === true || findings.some((finding) => CAP_MARKER_CODES.has(finding.code))) return 'CAP_EXCEEDED'
+  // Only the inventory report carries the flag, and for it a missing flag is not a "no". The accounting and sales reports have
+  // no such field (they say so with a marker finding, above), so for them it may be absent but never anything but false.
+  if (domain === 'inventory' ? report.truncated !== false : report.truncated !== undefined && report.truncated !== false) return 'READ_INCOMPLETE'
+  // A cursor left over means there was more to read.
+  if (report.nextCursor !== undefined && report.nextCursor !== null && report.nextCursor !== '') return 'READ_INCOMPLETE'
   const count = (severity: string) => findings.filter((finding) => finding.severity === severity).length
   if (findings.length !== total || count('critical') !== critical || count('warning') !== warning) return 'READ_INCOMPLETE'
   return { findings, summary: { total, warning, critical } }
@@ -83,6 +97,8 @@ const CLAIMS: Record<'R3' | 'R4', { code: string; ims: string; vendor: string }>
 }
 
 function stockClaim(id: 'R3' | 'R4', evidence: unknown): ItemInput {
+  const unfinished = runFinished(evidence)
+  if (unfinished !== null) return inconclusive(id, unfinished)
   const inventory = readDomain(evidence, 'inventory')
   if (typeof inventory === 'string') return inconclusive(id, inventory)
   const claim = CLAIMS[id]
@@ -110,8 +126,8 @@ export function findingToken(domain: string, finding: { code: string }): string 
 function allFindings(id: 'R15', evidence: unknown, ctx: InvariantItemContext): ItemInput {
   if (!isObject(evidence) || !isObject(evidence.result)) return inconclusive(id, 'SOURCE_UNREADABLE')
   const result = evidence.result
-  // The run as a whole must have finished: a partial run lists whatever it could and says nothing about the rest.
-  if (result.status !== 'completed' || !Array.isArray(result.errors) || result.errors.length > 0) return inconclusive(id, 'SOURCE_UNREADABLE')
+  const unfinished = runFinished(evidence)
+  if (unfinished !== null) return inconclusive(id, unfinished)
   const reports: Array<{ domain: Domain; report: DomainReport }> = []
   for (const domain of DOMAINS) {
     const report = readDomain(evidence, domain)
