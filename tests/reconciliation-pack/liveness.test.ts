@@ -111,7 +111,7 @@ test('STALE_BASIS outranks BASIS_MOVED when both are true', () => {
 })
 
 // [mutation: scheduler examined/unreadable/blockProblem ignored]
-test('a scheduler that was not examined, could not be read, or has an untrusted block withholds every item that has a dependent stream, at either read', () => {
+test('a scheduler that was not examined, could not be read, or has an untrusted block withholds EVERY item (streamless ones too), at either read', () => {
   const variants: Array<[string, Partial<ReadSyncReport['scheduler']>]> = [
     ['not examined', { examined: false }],
     ['unreadable', { unreadable: 'the crontab could not be read: permission denied' }],
@@ -122,7 +122,7 @@ test('a scheduler that was not examined, could not be read, or has an untrusted 
     for (const [first, second] of [[bad, goodReport()], [goodReport(), bad]] as const) {
       const bracket = bracketLiveness(read(first), read(second))
       for (const spec of ITEMS_WITH_STREAMS) assert.deepEqual(itemLivenessVerdict(bracket, spec.id), { ok: false, reason: 'STALE_BASIS' }, `${name} ${spec.id}`)
-      for (const spec of ITEMS_WITHOUT_STREAMS) assert.deepEqual(itemLivenessVerdict(bracket, spec.id), { ok: true }, `${name} ${spec.id} depends on no stream`)
+      for (const spec of ITEMS_WITHOUT_STREAMS) assert.deepEqual(itemLivenessVerdict(bracket, spec.id), { ok: false, reason: 'STALE_BASIS' }, `${name} ${spec.id}: no dependent stream, but the scheduler was not proven`)
     }
   }
 })
@@ -314,4 +314,23 @@ test('CONTRADICTIONS: the consistent forms of the same entries ARE read, so the 
   assert.equal(reduceStatusReport(skew).ok, true)
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(skew), read(skew)), 'R13'), { ok: true })
   assert.equal(withEntry(goodReport(), 'xero-tax-rates', {}).entries.length, goodReport().entries.length)
+})
+
+// [mutation: the scheduler check skipped for an empty stream list]
+test('STREAMLESS ITEMS: R2, R3, R4 and every other item with no dependent stream are withheld when either read had an unexamined, unreadable or untrusted scheduler', () => {
+  const streamless = ITEMS_WITHOUT_STREAMS.map((spec) => spec.id)
+  assert.ok(['R2', 'R3', 'R4'].every((id) => (streamless as string[]).includes(id)))
+  const bad = [goodReport({ scheduler: { examined: false } }), goodReport({ scheduler: { unreadable: 'x' } }), goodReport({ scheduler: { blockProblem: 'x' } })]
+  for (const report of bad) {
+    for (const [first, second] of [[report, goodReport()], [goodReport(), report], [report, report]] as const) {
+      const bracket = bracketLiveness(read(first), read(second))
+      for (const id of streamless) assert.deepEqual(itemLivenessVerdict(bracket, id), { ok: false, reason: 'STALE_BASIS' }, id)
+      assert.deepEqual(streamsVerdict(bracket, []), { ok: false, reason: 'STALE_BASIS' })
+    }
+  }
+  const clean = bracketLiveness(read(goodReport()), read(goodReport()))
+  for (const id of streamless) assert.deepEqual(itemLivenessVerdict(clean, id), { ok: true }, id)
+  // An unscheduled job that no streamless item depends on does not withhold it.
+  const unrelated = goodReport({ scheduler: { unscheduled: ['account-balance-snapshot'] } })
+  for (const id of streamless) assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(unrelated), read(unrelated)), id), { ok: true }, id)
 })

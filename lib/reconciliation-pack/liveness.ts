@@ -274,14 +274,17 @@ function dependentJobs(streams: readonly ReadSyncStreamId[]): Set<string> {
  * Whether the streams in `streams` support a pass. Withholds only: STALE_BASIS when any dependent entry is not fresh
  * at either read (or is missing, or ambiguous), or the scheduler is unreadable / untrusted / names a dependent job as
  * unscheduled or disabled; BASIS_MOVED when everything was fresh and a stamp or an instance set moved; SOURCE_UNREADABLE
- * when a read failed. An empty `streams` list depends on no stream: only an unreadable bracket stops it.
+ * when a read failed. An empty `streams` list depends on no stream or job, but the scheduler must still have been examined, read and trusted at both reads.
  */
 export function streamsVerdict(bracket: LivenessBracket, streams: readonly ReadSyncStreamId[]): LivenessVerdict {
   if (!bracket.readable) return { ok: false, reason: 'SOURCE_UNREADABLE' }
-  if (streams.length === 0) return { ok: true }
-
+  // The scheduler is checked FIRST and for every item, including one with no dependent stream: a crontab that could
+  // not be read, an unexamined scheduler or an untrusted managed block at either read is not a healthy run.
   let stale = false
   let moved = false
+  for (const side of [bracket.scheduler.atStart, bracket.scheduler.atEnd]) if (!schedulerTrusted(side)) stale = true
+  if (streams.length === 0) return stale ? { ok: false, reason: 'STALE_BASIS' } : { ok: true }
+
   for (const stream of streams) {
     if (bracket.ambiguous.includes(stream)) stale = true
     const own = bracket.instances.filter((instance) => instance.stream === stream)
@@ -294,7 +297,7 @@ export function streamsVerdict(bracket: LivenessBracket, streams: readonly ReadS
   }
   const jobs = dependentJobs(streams)
   for (const side of [bracket.scheduler.atStart, bracket.scheduler.atEnd]) {
-    if (!schedulerTrusted(side)) { stale = true; continue }
+    if (!schedulerTrusted(side)) continue
     if (side.unscheduled.some((slug) => jobs.has(slug)) || side.disabled.some((slug) => jobs.has(slug))) stale = true
   }
   if (stale) return { ok: false, reason: 'STALE_BASIS' }
