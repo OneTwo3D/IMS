@@ -45,6 +45,9 @@ const SUBJECT_KEYS = ['productId', 'warehouseId', 'orderId', 'shipmentId', 'refu
  */
 const hasReadableSubject = (finding: Record<string, unknown>) => SUBJECT_KEYS.every((key) => finding[key] === undefined || finding[key] === null || (typeof finding[key] === 'string' && finding[key] !== ''))
 
+/** The codes R3 and R4 compare; only the inventory report may list them. */
+const STOCK_CLAIM_CODES: ReadonlySet<string> = new Set([R3_CODE, R4_CODE])
+
 const SEVERITIES: ReadonlySet<string> = new Set(['info', 'warning', 'critical'])
 
 const DOMAINS = ['inventory', 'accounting', 'sales'] as const
@@ -110,6 +113,11 @@ function readRun(evidence: unknown): { reports: Record<Domain, DomainReport>; ru
     const report = readDomain(result.reports as Record<string, unknown>, domain)
     if (typeof report === 'string') return report
     reports[domain] = report
+  }
+  // R3 and R4 read their claims from the inventory report alone (the only producer of these codes). One listed under another
+  // domain is a report this module cannot place: the readiness gate would see it there, the pack would not, so nothing passes.
+  for (const domain of DOMAINS) {
+    if (domain !== 'inventory' && reports[domain].findings.some((finding) => STOCK_CLAIM_CODES.has(finding.code))) return 'SOURCE_UNREADABLE'
   }
   if (!isObject(result.summary)) return 'READ_INCOMPLETE'
   const sum: Counts = { total: 0, info: 0, warning: 0, critical: 0 }
