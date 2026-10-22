@@ -163,6 +163,15 @@ test('two accounts sharing one code are reported, not hidden', async () => {
   if (basis.available) assert.deepEqual(basis.sharedCodeKinds, ['transit'])
 })
 
+// [mutation: the shared Inventory/Allocated refusal removed]
+test('Inventory and Allocated on ONE code: no usable basis, never one balance counted twice into "balanced"', async () => {
+  // The subledger equals TWICE the one stored balance: without the refusal, Inventory + Allocated reads 2 x 1000.50 and balances.
+  const state = goodState({ run: { snapshotCount: 1 }, snapshots: [{ valueBase: '2001.00', valueReplayReliable: true }] })
+  state.settings.set('xero_allocated_inventory_account', CODES.inventory)
+  state.gl = state.gl.filter((row) => row.accountCode !== CODES.allocated)
+  assert.equal(reason((await load(state)).basis), 'inventory_accounts_shared')
+})
+
 test('base currency: the organisation row decides, with the default only when there is no row', async () => {
   const eur = goodState({ baseCurrency: 'EUR' })
   assert.equal(reason((await load(eur)).basis), 'no_gl_snapshot', 'the GBP balances are not the EUR ones')
@@ -270,7 +279,7 @@ test('text safety: the result carries kinds, counts and decimals; never an accou
 
 test('the closed reason table is exactly the reasons the basis can return', () => {
   assert.deepEqual([...PACK_BASIS_REASON_LIST].sort(), [
-    'basis_unreadable', 'gl_snapshot_ambiguous', 'gl_snapshot_other_tenant', 'gl_snapshot_unlabelled', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
+    'basis_unreadable', 'gl_snapshot_ambiguous', 'gl_snapshot_other_tenant', 'gl_snapshot_unlabelled', 'inventory_accounts_shared', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
     'not_for_date', 'stream_not_fresh', 'subledger_snapshot_incomplete', 'unreliable_subledger_snapshot',
   ])
   const kinds: PackBasisAccountKind[] = ['inventory', 'allocated', 'transit', 'cogs', 'unearned']

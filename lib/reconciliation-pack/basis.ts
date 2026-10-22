@@ -146,6 +146,9 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
     if (code.length === 0) return fail('no_account_configured')
     codes.set(account.kind, code)
   }
+  // The inventory comparison adds the Inventory and Allocated Inventory balances. One code for both is ONE stored balance read
+  // twice, so a subledger at double the real GL balance would read as balanced: no usable basis rather than a false one.
+  if (codes.get('inventory') === codes.get('allocated')) return fail('inventory_accounts_shared')
   const sharedCodeKinds: PackBasisAccountKind[] = []
   const firstKindOfCode = new Map<string, PackBasisAccountKind>()
   for (const account of PACK_BASIS_ACCOUNTS) {
