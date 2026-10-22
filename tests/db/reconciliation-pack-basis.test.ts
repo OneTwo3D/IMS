@@ -73,7 +73,7 @@ test('as-of basis against a real database', { skip }, async () => {
     if (ok.available) {
       assert.deepEqual(ok.absentFromTrialBalance, ['transit'])
       assert.equal(ok.subledger.valueBase, '120.750000')
-      assert.equal(ok.inventoryGl.action, 'balanced')
+      assert.equal(ok.inventoryGl?.action, 'balanced')
     }
 
     // 1b. MOVED: an on-demand refresh that rewrites a balance with the SAME amount between the read inside the bracket and the

@@ -71,8 +71,13 @@ export type AsOfBasis =
       /** Kinds that share one configured code with an earlier kind (they resolve to the same stored balance). */
       sharedCodeKinds: readonly PackBasisAccountKind[]
       subledger: BasisSubledger
-      /** The existing evaluator over the subledger and Inventory plus Allocated, unchanged. */
-      inventoryGl: AccountGlReconciliation
+      /**
+       * The existing evaluator over the subledger and Inventory plus Allocated, unchanged; NULL when either of those two
+       * balances is a zero the pull synthesised for an account the trial balance omitted (inventoryGlWithheld says so). An
+       * absent account is not a reported zero, so no comparison, `balanced` least of all, may rest on it.
+       */
+      inventoryGl: AccountGlReconciliation | null
+      inventoryGlWithheld: 'absent-from-tb' | null
     }
   | { available: false; asOf: string | null; reason: PackBasisReason; packReason: PackReasonCode }
 
@@ -230,6 +235,7 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   const byKind = new Map(gl.map((g) => [g.kind, g]))
   const inventory = finiteDecimal(byKind.get('inventory')!.amountBase)!
   const allocated = finiteDecimal(byKind.get('allocated')!.amountBase)!
+  const inventoryLegAbsent = byKind.get('inventory')!.provenance === 'absent-from-tb' || byKind.get('allocated')!.provenance === 'absent-from-tb'
   // The change token: a digest of everything this basis rests on, as stored, update times included. Two reads with the same
   // token read the same evidence; an upsert of any balance row (whatever path wrote it) changes its update time.
   const stamp = (value: unknown) => (value instanceof Date ? value.toISOString() : value === null || value === undefined ? null : String(value))
@@ -250,7 +256,8 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
       absentFromTrialBalance: gl.filter((g) => g.provenance === 'absent-from-tb').map((g) => g.kind),
       sharedCodeKinds,
       subledger: { runPresent: true, rows: rowCount, valueBase: sum.toFixed(6), emptyProof: rowCount === 0 ? 'snapshot-run-row-present' : null },
-      inventoryGl: evaluateAccountGlReconciliation({ subledgerValue: sum.toNumber(), glBalance: inventory.add(allocated).toNumber() }),
+      inventoryGl: inventoryLegAbsent ? null : evaluateAccountGlReconciliation({ subledgerValue: sum.toNumber(), glBalance: inventory.add(allocated).toNumber() }),
+      inventoryGlWithheld: inventoryLegAbsent ? 'absent-from-tb' : null,
     },
   }
 }

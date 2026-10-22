@@ -44,7 +44,7 @@ test('available: five exact-date balances, a covered subledger, a fresh stream; 
   assert.deepEqual(basis.absentFromTrialBalance, [])
   assert.deepEqual(basis.subledger, { runPresent: true, rows: 2, valueBase: '1200.750000', emptyProof: null })
   assert.deepEqual(basis.inventoryGl, evaluateAccountGlReconciliation({ subledgerValue: 1200.75, glBalance: 1200.75 }))
-  assert.equal(basis.inventoryGl.action, 'balanced')
+  assert.equal(basis.inventoryGl?.action, 'balanced')
 })
 
 test('the evaluator is used unchanged for sweep and flag gaps', async () => {
@@ -53,7 +53,7 @@ test('the evaluator is used unchanged for sweep and flag gaps', async () => {
     const { basis } = await load(state)
     assert.equal(basis.available, true)
     if (basis.available) {
-      assert.equal(basis.inventoryGl.action, expected)
+      assert.equal(basis.inventoryGl?.action, expected)
       assert.deepEqual(basis.inventoryGl, evaluateAccountGlReconciliation({ subledgerValue: Number(sub), glBalance: 1200.75 }))
     }
   }
@@ -231,7 +231,25 @@ test('SUBLEDGER: a run row with no rows is a true zero position, and carries the
   assert.equal(basis.available, true)
   if (basis.available) {
     assert.deepEqual(basis.subledger, { runPresent: true, rows: 0, valueBase: '0.000000', emptyProof: 'snapshot-run-row-present' })
-    assert.equal(basis.inventoryGl.action, 'balanced')
+    assert.equal(basis.inventoryGl?.action, 'balanced')
+  }
+})
+
+// [mutation: the absent-from-tb guard on the inventory comparison removed]
+test('ABSENT: an empty subledger beside Inventory and Allocated both absent from the trial balance is never "balanced"', async () => {
+  for (const absent of [['inventory', 'allocated'], ['inventory'], ['allocated']] as const) {
+    const state = goodState({ run: { snapshotCount: 0 }, snapshots: [] })
+    state.gl = state.gl.map((row) => {
+      const kind = row.accountCode === CODES.inventory ? 'inventory' : row.accountCode === CODES.allocated ? 'allocated' : null
+      if (kind === null) return row
+      return (absent as readonly string[]).includes(kind) ? { ...row, amountBase: '0', sourcePayloadRef: REF_ABSENT(D) } : { ...row, amountBase: '0', sourcePayloadRef: REF(D) }
+    })
+    const { basis } = await load(state)
+    assert.equal(basis.available, true, absent.join('+'))
+    if (basis.available) {
+      assert.equal(basis.inventoryGl, null, absent.join('+'))
+      assert.equal(basis.inventoryGlWithheld, 'absent-from-tb', absent.join('+'))
+    }
   }
 })
 
