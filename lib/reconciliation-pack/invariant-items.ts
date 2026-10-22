@@ -39,6 +39,9 @@ const CAP_MARKER_CODES: ReadonlySet<string> = new Set([INVARIANT_TRUNCATED_CODE,
 /** The ids that name a finding's subject in the gate's identity (lib/ops/readiness-gate.ts findingSubject). */
 const SUBJECT_KEYS = ['productId', 'warehouseId', 'orderId', 'shipmentId', 'refundId', 'syncLogId'] as const
 
+/** Every subject id that is present (not undefined or null) is a string. */
+const hasReadableSubject = (finding: Record<string, unknown>) => SUBJECT_KEYS.every((key) => finding[key] === undefined || finding[key] === null || typeof finding[key] === 'string')
+
 const SEVERITIES: ReadonlySet<string> = new Set(['info', 'warning', 'critical'])
 
 const DOMAINS = ['inventory', 'accounting', 'sales'] as const
@@ -73,6 +76,8 @@ function readDomain(reports: Record<string, unknown>, domain: Domain): DomainRep
     if (!isObject(finding) || typeof finding.severity !== 'string' || typeof finding.code !== 'string' || finding.code === '') return 'SOURCE_UNREADABLE'
     // A severity this module does not know is a finding it cannot judge: no item may pass beside it.
     if (!SEVERITIES.has(finding.severity)) return 'SOURCE_UNREADABLE'
+    // The subject ids make up the finding's identity; one present but not a string is an identity nobody can read.
+    if (!hasReadableSubject(finding)) return 'SOURCE_UNREADABLE'
     findings.push(finding as Finding)
   }
   // Positive proof the report ran to the end: the flag is the boolean false, no marker finding, and the summary counts
@@ -127,7 +132,7 @@ function readRun(evidence: unknown): { reports: Record<Domain, DomainReport>; ru
   for (const entry of result.criticalFindings as unknown[]) {
     if (!isObject(entry) || typeof entry.domain !== 'string' || !(DOMAINS as readonly string[]).includes(entry.domain) || typeof entry.code !== 'string' || entry.code === '') return 'READ_INCOMPLETE'
     // A subject id that is present must be a string: anything else would print as some other identity.
-    if (SUBJECT_KEYS.some((key) => entry[key] !== undefined && entry[key] !== null && typeof entry[key] !== 'string')) return 'READ_INCOMPLETE'
+    if (!hasReadableSubject(entry)) return 'READ_INCOMPLETE'
     const identity = invariantWarningId(entry.domain, entry as Parameters<typeof invariantWarningId>[1])
     const left = owed.get(identity) ?? 0
     if (left === 0) return 'READ_INCOMPLETE'
