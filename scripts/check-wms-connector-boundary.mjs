@@ -367,6 +367,9 @@ const ALLOWLIST = [
   // WooCommerce, ...) name the systems the checks compare, exactly as the outbound registry does. Constants and
   // text only: no connector flow, import or call lives in this file.
   'lib/ops/readiness-gate-constants.ts',
+  // The reconciliation pack's item catalogue (claim text, vendor-versus-IMS comparisons) names the systems each item
+  // compares, as the gate's pack titles do. Constants and text only: no connector flow, import or call lives in this file.
+  'lib/reconciliation-pack/constants.ts',
   'lib/integration-plugins.ts',
   // The plugin setting keys, split out of lib/integration-plugins.ts so the full-chain quiesce
   // harness can name them without importing Prisma (o3d-osl8 round 6). Same registry, same reason
