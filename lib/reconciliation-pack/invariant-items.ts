@@ -92,8 +92,9 @@ function readDomain(reports: Record<string, unknown>, domain: Domain): DomainRep
   // Only the inventory report carries the flag, and for it a missing flag is not a "no". The accounting and sales reports have
   // no such field (they say so with a marker finding, above), so for them it may be absent but never anything but false.
   if (domain === 'inventory' ? report.truncated !== false : report.truncated !== undefined && report.truncated !== false) return 'READ_INCOMPLETE'
-  // A cursor left over means there was more to read.
-  if (report.nextCursor !== undefined && report.nextCursor !== null && report.nextCursor !== '') return 'READ_INCOMPLETE'
+  // The cursor says the same, by the producers' own shapes: the inventory report sets it to null when it read everything (and to
+  // a cursor when rows remain), so a missing or empty cursor is not that signal; the accounting and sales reports never carry one.
+  if (domain === 'inventory' ? report.nextCursor !== null : 'nextCursor' in report) return 'READ_INCOMPLETE'
   const count = (severity: string) => findings.filter((finding) => finding.severity === severity).length
   if (!sameCounts(summary, { total: findings.length, info: count('info'), warning: count('warning'), critical: count('critical') })) return 'READ_INCOMPLETE'
   return { findings, summary }
