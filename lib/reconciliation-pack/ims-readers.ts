@@ -28,6 +28,7 @@
 
 import { parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
 import {
+  FIRST_LOAD_RUN_STATUSES,
   IMS_OPEN_ORDER_STATUSES,
   IMS_READER_MAX_TIMEOUT_MS,
   IMS_READER_ROW_CAP,
@@ -36,7 +37,6 @@ import {
   type PackPopulationReason,
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
-import { RUN_STATUSES } from '@/lib/first-load/apply/constants'
 import { STOCK_TRACKED_PRODUCT_TYPES } from '@/lib/domain/inventory/backorder-policy'
 
 /** The slice of a `pg` client this module needs. A test double implements it; `pg.Client` satisfies it. */
@@ -191,7 +191,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     if (runs.length > 1) throw new Unreadable('DUPLICATE_KEY')
     let firstLoad: FirstLoadRecord = { state: 'absent' }
     if (runs.length === 1) {
-      const status = oneOf(runs[0]!.status, RUN_STATUSES)
+      const status = oneOf(runs[0]!.status, FIRST_LOAD_RUN_STATUSES)
       const cut = instantOrNull(runs[0]!.cut)
       if (status !== 'VERIFIED') firstLoad = { state: 'unverified' }
       else if (cut === null) throw new Unreadable('SOURCE_UNREADABLE')

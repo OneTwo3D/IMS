@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { RUN_STATUSES } from '../../lib/first-load/apply/constants.ts'
+import { FIRST_LOAD_RUN_STATUSES } from '../../lib/reconciliation-pack/constants.ts'
 import { alignmentState, classifyPopulation, readImsSnapshot, statementAllowed, type ImsQueryClient, type PopulationBoundaries } from '../../lib/reconciliation-pack/ims-readers.ts'
 
 /** A scripted connection: answers by the statement's text, records every statement. */
@@ -24,6 +26,10 @@ function fake(answer: (sql: string, values?: unknown[]) => Array<Record<string, 
 }
 const SID = '7000000000000000001'
 const identityRow = [{ sid: SID, db: 'ims' }]
+
+test('the first-load statuses the reader knows are exactly the runner\'s own', () => {
+  assert.deepEqual([...FIRST_LOAD_RUN_STATUSES], [...RUN_STATUSES])
+})
 
 test('one transaction: BEGIN REPEATABLE READ READ ONLY first, ROLLBACK last, only SELECT and fixed SET LOCAL between', async () => {
   const client = fake(() => identityRow)

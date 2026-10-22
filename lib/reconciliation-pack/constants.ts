@@ -331,6 +331,8 @@ export const IMS_READER_ROW_CAP = 2_000_000
 export const IMS_READER_STATEMENT_TIMEOUT_MS = 120_000
 /** The largest timeout a caller may ask for; also the idle-in-transaction bound. */
 export const IMS_READER_MAX_TIMEOUT_MS = 600_000
+/** The statuses a first-load run record can hold (a test pins this list to the runner's own). Only VERIFIED makes a first load a boundary. */
+export const FIRST_LOAD_RUN_STATUSES = ['RUNNING', 'STEP_FAILED', 'CONFLICT', 'APPLIED', 'VERIFIED', 'VERIFY_FAILED'] as const
 /** The sales-order statuses that make an order OPEN for the reconciliation (a draft is not on the storefront). */
 export const IMS_OPEN_ORDER_STATUSES = ['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] as const
 
