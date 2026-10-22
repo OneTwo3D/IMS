@@ -10070,5 +10070,5 @@ test('[in transit atomic] an in-transit refund of a build that predates the in-t
   const retry = await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
   assert.equal(retry.success, true)
   assert.equal((state.returnExpectations as unknown[] | undefined)?.length, 1)
-  assert.ok((state.returnExpectations as NonNullable<State['returnExpectations']>)[0].valuedAt)
+  assert.ok((state.returnExpectations as unknown as NonNullable<State['returnExpectations']>)[0].valuedAt)
 })
