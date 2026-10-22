@@ -1120,6 +1120,11 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // identity reads are read-only. Its only writes go through Prisma: `boms.active` for one id and one
   // `activity_logs` row. It cannot touch `settings`, so it cannot move a plugin key.
   'lib/products/bom-recipe-repair.ts': 'runtime-assembled-sql',
+  // Reconciliation pack basis. `withReadOnlySnapshot` issues `SET TRANSACTION READ ONLY`, `SET LOCAL statement_timeout =
+  // <whole number>` and one constant SELECT of three `current_setting` values on the transaction client it opens itself
+  // from the app's pooled client. It is READ ONLY by construction (the mode is read back, and nothing runs if it did
+  // not take), so it cannot write `settings` and cannot move a plugin key.
+  'lib/reconciliation-pack/read-tx.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',
