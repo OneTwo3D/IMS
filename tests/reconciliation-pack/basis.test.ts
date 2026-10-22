@@ -6,8 +6,8 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
 import { loadAsOfBasis, type AsOfBasis } from '../../lib/reconciliation-pack/basis.ts'
 import { PACK_BASIS_ACCOUNTS, PACK_BASIS_REASON_LIST, type PackBasisAccountKind } from '../../lib/reconciliation-pack/constants.ts'
 import { bracketLiveness, reduceStatusReport } from '../../lib/reconciliation-pack/liveness.ts'
-import { CODES, D, REF, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
-import { goodReport, withEntry } from './liveness-fixtures.ts'
+import { CODES, D, TENANT, REF, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
+import { goodReport, makeStale, withStamp } from './liveness-fixtures.ts'
 
 /**
  * THE AS-OF BASIS over a transaction double. The double refuses any read outside the one run, and any property the
@@ -58,7 +58,7 @@ test('the evaluator is used unchanged for sweep and flag gaps', async () => {
 test('every IMS read happens inside the one run (the double throws on a read outside it) and reads nothing but the allowed tables', async () => {
   const { log, calls } = await load(goodState())
   assert.equal(calls, 1)
-  assert.deepEqual([...new Set(log)].sort(), ['inventorySnapshot.aggregate', 'inventorySnapshot.count', 'organisation.findFirst', 'run.findUnique', 'setting.findMany', 'snapshot.findMany'])
+  assert.deepEqual([...new Set(log)].sort(), ['accountingToken.findUnique', 'inventorySnapshot.aggregate', 'inventorySnapshot.count', 'organisation.findFirst', 'run.findUnique', 'setting.findMany', 'snapshot.findMany'])
 })
 
 // [mutation: findLatest-style (on-or-before) read] the exact date, never the latest earlier balance
@@ -235,8 +235,8 @@ test('a database error or timeout is basis_unreadable and the message is not kep
 
 // [mutation: the stream check removed / a stale stream allowed]
 test('the Xero balance-snapshot stream must be fresh and unmoved at both liveness reads', async () => {
-  const stale = withEntry(goodReport(), 'xero-balance-snapshots', { state: 'stale' })
-  const moved = withEntry(goodReport(), 'xero-balance-snapshots', { lastSuccessAt: '2026-10-20T07:00:00.000Z' })
+  const stale = makeStale(goodReport(), 'xero-balance-snapshots')
+  const moved = withStamp(goodReport(), 'xero-balance-snapshots', '2026-10-20T07:00:00.000Z')
   const cases: Array<[string, ReturnType<typeof bracketLiveness>, string]> = [
     ['stale at start', bracketLiveness(reduceStatusReport(stale), reduceStatusReport(goodReport())), 'STALE_BASIS'],
     ['stale at end', bracketLiveness(reduceStatusReport(goodReport()), reduceStatusReport(stale)), 'STALE_BASIS'],
@@ -250,7 +250,7 @@ test('the Xero balance-snapshot stream must be fresh and unmoved at both livenes
     if (!basis.available) { assert.equal(basis.reason, 'stream_not_fresh', name); assert.equal(basis.packReason, packReason, name) }
   }
   // A stale stream the basis does not use does not matter.
-  const otherStale = withEntry(goodReport(), 'woocommerce-order-sweep', { state: 'stale' })
+  const otherStale = makeStale(goodReport(), 'woocommerce-order-sweep')
   assert.equal((await load(goodState(), D, bracketLiveness(reduceStatusReport(otherStale), reduceStatusReport(otherStale)))).basis.available, true)
   // The more specific missing-data reason wins over the stream.
   const both = await load(goodState({ run: null }), D, cases[0]![1])
@@ -270,9 +270,45 @@ test('text safety: the result carries kinds, counts and decimals; never an accou
 
 test('the closed reason table is exactly the reasons the basis can return', () => {
   assert.deepEqual([...PACK_BASIS_REASON_LIST].sort(), [
-    'basis_unreadable', 'gl_snapshot_ambiguous', 'gl_snapshot_unlabelled', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
+    'basis_unreadable', 'gl_snapshot_ambiguous', 'gl_snapshot_other_tenant', 'gl_snapshot_unlabelled', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
     'not_for_date', 'stream_not_fresh', 'subledger_snapshot_incomplete', 'unreliable_subledger_snapshot',
   ])
   const kinds: PackBasisAccountKind[] = ['inventory', 'allocated', 'transit', 'cogs', 'unearned']
   assert.deepEqual(KINDS, kinds)
+})
+
+// [mutation: the tenant filter removed from the row selection / the other-tenant check removed]
+test('REBIND: balances fetched under another organisation, or under none recorded, are never used', async () => {
+  for (const tenantId of ['tenant-previous', null, '']) {
+    for (const kind of KINDS) {
+      const state = goodState()
+      state.gl = state.gl.map((row) => (row.accountCode === CODES[kind] ? { ...row, tenantId } : row))
+      assert.equal(reason((await load(state)).basis), 'gl_snapshot_other_tenant', `${kind} ${JSON.stringify(tenantId)}`)
+    }
+  }
+  const all = goodState()
+  all.gl = all.gl.map((row) => ({ ...row, tenantId: 'tenant-previous' }))
+  assert.equal(reason((await load(all)).basis), 'gl_snapshot_other_tenant')
+})
+
+test('REBIND: when both organisations have a balance for the day, only the connected organisation\'s is used', async () => {
+  const state = goodState()
+  state.gl = [...state.gl.map((row) => ({ ...row, amountBase: '999999', externalAccountId: 'old', tenantId: 'tenant-previous' })), ...state.gl]
+  const { basis } = await load(state)
+  assert.equal(basis.available, true)
+  if (basis.available) assert.deepEqual(basis.gl.map((g) => g.amountBase), ['1000.500000', '200.250000', '50.000000', '75.100000', '-300.000000'])
+  const two = goodState()
+  two.gl = [...two.gl, ...two.gl.map((row) => ({ ...row, amountBase: '5' }))]
+  assert.equal(reason((await load(two)).basis), 'gl_snapshot_ambiguous', 'two of the CURRENT organisation are still ambiguous')
+})
+
+test('REBIND: another organisation\'s balances for other dates do not make this one not_for_date', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((row) => ({ ...row, balanceDate: dateOf('2026-10-18'), sourcePayloadRef: REF('2026-10-18'), tenantId: 'tenant-previous' }))
+  assert.equal(reason((await load(state)).basis), 'no_gl_snapshot')
+})
+
+test('no connected organisation, or a blank tenant, is no_account_configured', async () => {
+  for (const tenant of [null, '', '   ']) assert.equal(reason((await load(goodState({ tenant }))).basis), 'no_account_configured', JSON.stringify(tenant))
+  assert.ok(TENANT.length > 0)
 })

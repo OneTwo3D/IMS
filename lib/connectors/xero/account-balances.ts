@@ -71,6 +71,8 @@ type XeroAccountBalanceSnapshotBuildInput = {
   balanceDate: string
   baseCurrency: string
   syncRunId?: string | null
+  /** The tenant of the connection the trial balance was fetched under. */
+  tenantId?: string | null
 }
 
 function attrValue(cell: XeroReportCell | undefined, ids: string[]): string | null {
@@ -216,6 +218,7 @@ export function buildXeroAccountBalanceSnapshotInputs(
       amountForeign: amount,
       amountBase: amount,
       sourcePayloadRef: xeroTrialBalanceRef(input.balanceDate, parsed === null),
+      tenantId: input.tenantId ?? null,
       syncRunId: input.syncRunId ?? null,
     })
   }
@@ -270,6 +273,7 @@ export async function syncXeroAccountBalanceSnapshots(
     balanceDate,
     baseCurrency,
     syncRunId: options.syncRunId ?? null,
+    tenantId: connection?.tenantId ?? null,
   })
 
   const fenced = await withXeroConnectionFence(connection, async (tx) => {

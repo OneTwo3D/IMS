@@ -11,7 +11,7 @@ import {
 } from '../../lib/reconciliation-pack/liveness.ts'
 import { defaultItems } from '../../lib/reconciliation-pack/harness.ts'
 import { passItem } from './helpers.ts'
-import { STAMP_A, STAMP_B, cleanScheduler, freshEntry, goodReport, withEntry, withoutStream } from './liveness-fixtures.ts'
+import { GENERATED_AT, STAMP_A, STAMP_B, cleanScheduler, freshEntry, goodReport, makeFuture, makeNever, makeOff, makeStale, recount, withEntry, withStamp, withoutStream } from './liveness-fixtures.ts'
 
 /**
  * THE LIVENESS BRACKET. Every guard below has a mutation (named in the test title) that makes the test fail; the
@@ -42,8 +42,8 @@ test('a clean bracket lets every item through, with equal stamps and ages and st
     assert.equal(instance.stateAtEnd, 'fresh')
     assert.equal(instance.lastSuccessAtStart, STAMP_A)
     assert.equal(instance.lastSuccessAtEnd, STAMP_A)
-    assert.equal(instance.ageMsAtStart, 3_600_000)
-    assert.equal(instance.ageMsAtEnd, 3_600_000)
+    assert.equal(instance.ageMsAtStart, 41_400_000)
+    assert.equal(instance.ageMsAtEnd, 41_400_000)
     assert.equal(instance.maxAgeMsAtStart, 36 * 3_600_000)
     assert.equal(instance.fresh && instance.stable && instance.inBothReads, true)
   }
@@ -53,10 +53,11 @@ test('a clean bracket lets every item through, with equal stamps and ages and st
 // [mutation: a state other than `fresh` accepted] each non-fresh state, at EACH read, for EACH dependent stream of each item
 for (const spec of ITEMS_WITH_STREAMS) {
   for (const stream of spec.streams) {
-    for (const state of ['stale', 'never', 'off', 'invalid'] as const) {
+    const makers = { stale: makeStale, future: makeFuture, never: makeNever, off: makeOff }
+    for (const state of ['stale', 'future', 'never', 'off'] as const) {
       for (const where of ['start', 'end'] as const) {
         test(`${spec.id} on ${stream}: state ${state} at the ${where} read is STALE_BASIS, never a pass`, () => {
-          const bad = withEntry(goodReport(), stream, { state: state as never })
+          const bad = makers[state](goodReport(), stream)
           const bracket = where === 'start' ? bracketLiveness(read(bad), read(goodReport())) : bracketLiveness(read(goodReport()), read(bad))
           assert.deepEqual(itemLivenessVerdict(bracket, spec.id), { ok: false, reason: 'STALE_BASIS' })
         })
@@ -74,30 +75,22 @@ for (const spec of ITEMS_WITH_STREAMS) {
   }
 }
 
-test('a fresh state with no usable stamp is not fresh (the state alone is not believed)', () => {
-  for (const stamp of [null, 'yesterday', '2026-10-20', '2026-10-20T00:30:00+01:00']) {
-    const bad = withEntry(goodReport(), 'xero-balance-snapshots', { lastSuccessAt: stamp })
-    const bracket = bracketLiveness(read(bad), read(bad))
-    assert.deepEqual(itemLivenessVerdict(bracket, 'R6'), { ok: false, reason: 'STALE_BASIS' }, String(stamp))
-  }
-})
-
 test('every instance counts: one stale Mintsoft binding of two blocks R1, at either read', () => {
-  const bad = withEntry(goodReport(), 'mintsoft-stock-sync', { state: 'stale' }, 'OVERFLOW')
+  const bad = makeStale(goodReport(), 'mintsoft-stock-sync', 'OVERFLOW')
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(bad), read(goodReport())), 'R1'), { ok: false, reason: 'STALE_BASIS' })
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(goodReport()), read(bad)), 'R1'), { ok: false, reason: 'STALE_BASIS' })
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(goodReport()), read(goodReport())), 'R1'), { ok: true })
 })
 
 test('two entries for one instance are ambiguous, so not fresh', () => {
-  const doubled: ReadSyncReport = { ...goodReport(), entries: [...goodReport().entries, freshEntry('xero-balance-snapshots')] }
+  const doubled: ReadSyncReport = recount({ ...goodReport(), entries: [...goodReport().entries, freshEntry('xero-balance-snapshots')] })
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(doubled), read(goodReport())), 'R6'), { ok: false, reason: 'STALE_BASIS' })
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(goodReport()), read(doubled)), 'R6'), { ok: false, reason: 'STALE_BASIS' })
 })
 
 // [mutation: stamp equality check removed / ordering used instead]
 test('a stamp that differs between the reads is BASIS_MOVED in EITHER direction: equality is the only comparison', () => {
-  const later = withEntry(goodReport(), 'xero-balance-snapshots', { lastSuccessAt: STAMP_B })
+  const later = withStamp(goodReport(), 'xero-balance-snapshots', STAMP_B)
   const forward = bracketLiveness(read(goodReport()), read(later))
   const backward = bracketLiveness(read(later), read(goodReport()))
   assert.deepEqual(itemLivenessVerdict(forward, 'R6'), { ok: false, reason: 'BASIS_MOVED' })
@@ -106,19 +99,14 @@ test('a stamp that differs between the reads is BASIS_MOVED in EITHER direction:
   assert.deepEqual(itemLivenessVerdict(forward, 'R9'), { ok: true })
 })
 
-test('a stamp that is equal but far in the past is still equal: freshness is the status report\'s state, not arithmetic on stamps here', () => {
-  const old = withEntry(goodReport(), 'xero-balance-snapshots', { lastSuccessAt: '2020-01-01T00:00:00.000Z' })
-  assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(old), read(old)), 'R6'), { ok: true })
-})
-
 test('an instance that appears in only one read is BASIS_MOVED', () => {
-  const fewer: ReadSyncReport = { ...goodReport(), entries: goodReport().entries.filter((entry) => entry.instance !== 'OVERFLOW') }
+  const fewer: ReadSyncReport = recount({ ...goodReport(), entries: goodReport().entries.filter((entry) => entry.instance !== 'OVERFLOW') })
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(goodReport()), read(fewer)), 'R1'), { ok: false, reason: 'BASIS_MOVED' })
   assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(fewer), read(goodReport())), 'R1'), { ok: false, reason: 'BASIS_MOVED' })
 })
 
 test('STALE_BASIS outranks BASIS_MOVED when both are true', () => {
-  const stale = withEntry(withEntry(goodReport(), 'xero-balance-snapshots', { lastSuccessAt: STAMP_B }), 'xero-tax-rates', { state: 'stale' })
+  const stale = makeStale(withStamp(goodReport(), 'xero-balance-snapshots', STAMP_B), 'xero-tax-rates')
   assert.deepEqual(streamsVerdict(bracketLiveness(read(goodReport()), read(stale)), ['xero-balance-snapshots', 'xero-tax-rates']), { ok: false, reason: 'STALE_BASIS' })
 })
 
@@ -219,7 +207,7 @@ test('text safety: hostile warehouse codes and scheduler prose never reach the b
   const hostile = 'https://evil.example/?token=' + ['sk', 'live', 'abcdefghijklmnopqrstuvwxyz0123'].join('_')
   const bad = goodReport({
     entries: [...goodReport().entries, freshEntry('mintsoft-stock-sync', hostile)],
-    scheduler: { blockProblem: `the managed block says ${hostile}`, unreadable: hostile },
+    scheduler: { blockProblem: `the managed block says ${hostile}` },
   })
   const bracket = bracketLiveness(read(bad), read(bad))
   const text = JSON.stringify(bracket)
@@ -232,7 +220,7 @@ test('text safety: hostile warehouse codes and scheduler prose never reach the b
 
 // [mutation: the unclean stream is published with its end stamp] and the report writer/reader are the second lock
 test('published stream brackets: a clean stream has equal start and end; an unclean one has no end, and a pass on it is refused by the report writer', () => {
-  const stale = withEntry(goodReport(), 'xero-balance-snapshots', { state: 'stale' })
+  const stale = makeStale(goodReport(), 'xero-balance-snapshots')
   const bracket = bracketLiveness(read(goodReport()), read(stale))
   const brackets = publishedStreamBrackets(bracket, [...READ_SYNC_STREAM_IDS])
   assert.equal(brackets.length, READ_SYNC_STREAM_IDS.length)
@@ -253,7 +241,7 @@ test('published stream brackets: a clean stream has equal start and end; an uncl
 })
 
 test('a stream with several instances publishes one bracket, taken from the instance first by token; a moved sibling removes its end', () => {
-  const moved = withEntry(goodReport(), 'mintsoft-stock-sync', { lastSuccessAt: STAMP_B }, 'OVERFLOW')
+  const moved = withStamp(goodReport(), 'mintsoft-stock-sync', STAMP_B, 'OVERFLOW')
   const bracket = bracketLiveness(read(goodReport()), read(moved))
   const stock = publishedStreamBrackets(bracket, ['mintsoft-stock-sync'])
   assert.equal(stock.length, 1)
@@ -261,11 +249,69 @@ test('a stream with several instances publishes one bracket, taken from the inst
 })
 
 test('the catalogue\'s own stream lists are what decides: R1 depends on the Mintsoft stock sync and not the Xero pull', () => {
-  const xeroStale = withEntry(goodReport(), 'xero-balance-snapshots', { state: 'stale' })
+  const xeroStale = makeStale(goodReport(), 'xero-balance-snapshots')
   const bracket = bracketLiveness(read(xeroStale), read(xeroStale))
   assert.deepEqual(itemLivenessVerdict(bracket, 'R1'), { ok: true })
   assert.deepEqual(getPackItem('R1').streams, ['mintsoft-stock-sync'])
   assert.deepEqual(itemLivenessVerdict(bracket, 'R6'), { ok: false, reason: 'STALE_BASIS' })
   const streamsAll: ReadSyncStreamId[] = [...READ_SYNC_STREAM_IDS]
   assert.equal(streamsVerdict(bracket, streamsAll).ok, false)
+})
+
+// [mutation: any one of the consistency checks in reduceStatusReport removed]
+test('CONTRADICTIONS: a report that disagrees with itself is unreadable as a whole, never believed in part', () => {
+  const base = goodReport()
+  const first = (stream: string) => base.entries.findIndex((entry) => entry.stream === stream)
+  const entryAt = (index: number, change: Record<string, unknown>) => recount({ ...base, entries: base.entries.map((entry, at) => (at === index ? ({ ...entry, ...change } as never) : entry)) })
+  const i = first('xero-balance-snapshots')
+  const cases: Array<[string, unknown]> = [
+    ['fresh but older than its own limit', entryAt(i, { ageMs: 40 * 3_600_000, lastSuccessAt: new Date(Date.parse(GENERATED_AT) - 40 * 3_600_000).toISOString() })],
+    ['fresh but flagged future', entryAt(i, { futureTimestamp: true })],
+    ['fresh but dated in the future', entryAt(i, { lastSuccessAt: '2026-10-20T15:00:00.000Z', ageMs: -3 * 3_600_000 })],
+    ['fresh with no stamp', entryAt(i, { lastSuccessAt: null })],
+    ['fresh with no age', entryAt(i, { ageMs: null })],
+    ['fresh with no limit', entryAt(i, { maxAgeMs: null })],
+    ['fresh with a zero limit', entryAt(i, { maxAgeMs: 0 })],
+    ['fresh with an age that is not the distance to the stamp', entryAt(i, { ageMs: 1 })],
+    ['fresh with a non-finite age', entryAt(i, { ageMs: Number.POSITIVE_INFINITY })],
+    ['fresh with a string age', entryAt(i, { ageMs: '3600000' })],
+    ['fresh with a non-ISO stamp', entryAt(i, { lastSuccessAt: 'yesterday' })],
+    ['fresh with a stamp that is not UTC', entryAt(i, { lastSuccessAt: '2026-10-20T00:30:00+01:00' })],
+    ['stale but young', entryAt(i, { state: 'stale' })],
+    ['stale with the future flag missing the stamp', entryAt(i, { state: 'stale', lastSuccessAt: null, ageMs: null })],
+    ['never with a stamp', entryAt(i, { state: 'never' })],
+    ['never with an age', entryAt(i, { state: 'never', lastSuccessAt: null })],
+    ['never with no limit', entryAt(i, { state: 'never', lastSuccessAt: null, ageMs: null, maxAgeMs: null })],
+    ['off with a stamp', entryAt(i, { state: 'off' })],
+    ['off with a limit', entryAt(i, { state: 'off', lastSuccessAt: null, ageMs: null })],
+    ['future flag with no stamp', entryAt(i, { state: 'never', lastSuccessAt: null, ageMs: null, futureTimestamp: true })],
+    ['a state the report does not define', entryAt(i, { state: 'invalid' })],
+    ['a missing state', entryAt(i, { state: undefined })],
+    ['a missing future flag', entryAt(i, { futureTimestamp: undefined })],
+    ['a non-boolean future flag', entryAt(i, { futureTimestamp: 'false' })],
+    ['a missing limit field', (() => { const e = entryAt(i, {}); delete (e.entries[i] as Record<string, unknown>).maxAgeMs; return e })()],
+    ['counts that are not the tally', { ...base, counts: { fresh: 99, stale: 0, never: 0, off: 0 } }],
+    ['counts missing', { ...base, counts: undefined }],
+    ['a generation time that is not a time', { ...base, generatedAt: 'now' }],
+    ['no generation time', { ...base, generatedAt: undefined }],
+    ['a scheduler that was not examined yet names a problem', goodReport({ scheduler: { examined: false, blockProblem: 'x' } })],
+    ['a scheduler that was not examined yet lists a job', goodReport({ scheduler: { examined: false, disabled: ['account-balance-snapshot'] } })],
+    ['an unreadable crontab that also names a block problem', goodReport({ scheduler: { unreadable: 'a', blockProblem: 'b' } })],
+  ]
+  for (const [name, report] of cases) {
+    assert.deepEqual(reduceStatusReport(report), { ok: false }, name)
+    const bracket = bracketLiveness(read(report), read(goodReport()))
+    for (const spec of PACK_ITEM_CATALOGUE) assert.deepEqual(itemLivenessVerdict(bracket, spec.id), { ok: false, reason: 'SOURCE_UNREADABLE' }, `${name} ${spec.id}`)
+  }
+})
+
+test('CONTRADICTIONS: the consistent forms of the same entries ARE read, so the checks are not rejecting everything', () => {
+  for (const report of [goodReport(), makeStale(goodReport(), 'xero-tax-rates'), makeFuture(goodReport(), 'xero-tax-rates'), makeNever(goodReport(), 'xero-tax-rates'), makeOff(goodReport(), 'xero-tax-rates')]) {
+    assert.equal(reduceStatusReport(report).ok, true)
+  }
+  // A stamp a few minutes ahead of the report's clock is inside the skew tolerance: still fresh, not flagged.
+  const skew = withStamp(goodReport(), 'xero-tax-rates', '2026-10-20T12:03:00.000Z')
+  assert.equal(reduceStatusReport(skew).ok, true)
+  assert.deepEqual(itemLivenessVerdict(bracketLiveness(read(skew), read(skew)), 'R13'), { ok: true })
+  assert.equal(withEntry(goodReport(), 'xero-tax-rates', {}).entries.length, goodReport().entries.length)
 })

@@ -22,15 +22,16 @@
 
 import { READ_SYNC_ALARM_CRON_SLUG, READ_SYNC_STREAMS, READ_SYNC_STREAM_IDS, READ_SYNC_STATUS_SCHEMA_VERSION, type ReadSyncStreamId } from '@/lib/ops/read-sync-liveness-constants'
 import type { ReadSyncReport } from '@/lib/ops/read-sync-status'
+import { READ_SYNC_FUTURE_TOLERANCE_MS } from '@/lib/ops/read-sync-liveness'
 import { isStreamStamp } from '@/lib/reconciliation-pack/compare'
 import { getPackItem, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
 import { identityToken, type SafeToken } from '@/lib/reconciliation-pack/identity'
 import type { StreamBracket } from '@/lib/reconciliation-pack/report'
 
-export const LIVENESS_STATES = ['fresh', 'stale', 'never', 'off', 'invalid'] as const
+export const LIVENESS_STATES = ['fresh', 'stale', 'never', 'off'] as const
 export type LivenessState = (typeof LIVENESS_STATES)[number]
 
-/** One entry of one read, reduced to what the bracket needs. `invalid` is any state the status report is not defined to give. */
+/** One entry of one read, reduced to what the bracket needs (validated by `reduceStatusReport`). */
 export type LivenessEntry = {
   stream: ReadSyncStreamId
   /** The binding's warehouse for a per-binding stream; null otherwise. */
@@ -67,14 +68,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function finiteOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-function stateOf(value: unknown): LivenessState {
-  return value === 'fresh' || value === 'stale' || value === 'never' || value === 'off' ? value : 'invalid'
-}
-
 /** Keep only job slugs the status report is defined to name; anything else is dropped (it could be anything). */
 function closedSlugs(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null
@@ -82,12 +75,18 @@ function closedSlugs(value: unknown): string[] | null {
 }
 
 /**
- * Reduce one status report to a `LivenessRead`. A report that is not the shape the status command defines is
- * `{ ok: false }`: it is unreadable, and an unreadable liveness read is never read as healthy.
+ * Reduce one status report to a `LivenessRead`. The report is a claim, and it is checked against itself before any of
+ * it is believed: a field that is missing or the wrong type, a state the report is not defined to give, or a state
+ * that CONTRADICTS the fields beside it (a `fresh` entry that is older than its own limit, or dated in the future, or
+ * has no stamp; a `stale` one that is young; an age that is not the distance from the report's own clock to the stamp;
+ * counts that are not the tally of the entries; a scheduler that has "not been examined" yet names a problem) makes the
+ * WHOLE read `{ ok: false }`. An unreadable read is never read as healthy.
  */
 export function reduceStatusReport(report: unknown): LivenessRead {
   if (!isRecord(report) || report.schemaVersion !== READ_SYNC_STATUS_SCHEMA_VERSION) return { ok: false }
-  if (!Array.isArray(report.entries) || !isRecord(report.scheduler)) return { ok: false }
+  if (!isStreamStamp(report.generatedAt)) return { ok: false }
+  const generatedAtMs = Date.parse(report.generatedAt)
+  if (!Array.isArray(report.entries) || !isRecord(report.scheduler) || !isRecord(report.counts)) return { ok: false }
   const scheduler = report.scheduler
   const unscheduled = closedSlugs(scheduler.unscheduled)
   const disabled = closedSlugs(scheduler.disabled)
@@ -98,21 +97,51 @@ export function reduceStatusReport(report: unknown): LivenessRead {
   if (typeof scheduler.examined !== 'boolean') return { ok: false }
   if (scheduler.unreadable !== null && typeof scheduler.unreadable !== 'string') return { ok: false }
   if (scheduler.blockProblem !== null && typeof scheduler.blockProblem !== 'string') return { ok: false }
+  const schedulerProblem = scheduler.unreadable !== null || scheduler.blockProblem !== null || unscheduled.length > 0 || disabled.length > 0
+  if (!scheduler.examined && schedulerProblem) return { ok: false }
+  if (scheduler.unreadable !== null && (scheduler.blockProblem !== null || unscheduled.length > 0 || disabled.length > 0)) return { ok: false }
 
   const entries: LivenessEntry[] = []
   const seen = new Set<string>()
   const duplicates = new Set<ReadSyncStreamId>()
+  const tally: Record<string, number> = { fresh: 0, stale: 0, never: 0, off: 0 }
   for (const raw of report.entries) {
     if (!isRecord(raw) || typeof raw.stream !== 'string' || !STREAM_IDS.has(raw.stream)) return { ok: false }
     if (raw.instance !== null && typeof raw.instance !== 'string') return { ok: false }
+    if (raw.state !== 'fresh' && raw.state !== 'stale' && raw.state !== 'never' && raw.state !== 'off') return { ok: false }
+    if (typeof raw.futureTimestamp !== 'boolean') return { ok: false }
+    if (raw.lastSuccessAt !== null && !isStreamStamp(raw.lastSuccessAt)) return { ok: false }
+    for (const field of [raw.maxAgeMs, raw.ageMs]) if (field !== null && (typeof field !== 'number' || !Number.isFinite(field))) return { ok: false }
+    const lastSuccessAt = raw.lastSuccessAt as string | null
+    const maxAgeMs = raw.maxAgeMs as number | null
+    const ageMs = raw.ageMs as number | null
+    const state = raw.state
+    if (maxAgeMs !== null && maxAgeMs <= 0) return { ok: false }
+    if (lastSuccessAt === null) {
+      // Without a stamp there is no age and no future-dating, whatever the state: `never` and `off` only.
+      if (state !== 'never' && state !== 'off') return { ok: false }
+      if (ageMs !== null || raw.futureTimestamp) return { ok: false }
+      if (state === 'never' && maxAgeMs === null) return { ok: false }
+      if (state === 'off' && maxAgeMs !== null) return { ok: false }
+    } else {
+      if (state === 'never' || state === 'off') return { ok: false }
+      if (maxAgeMs === null || ageMs === null) return { ok: false }
+      // The age is the distance from the report's own clock to the stamp, to the millisecond.
+      if (ageMs !== generatedAtMs - Date.parse(lastSuccessAt)) return { ok: false }
+      const future = ageMs < -READ_SYNC_FUTURE_TOLERANCE_MS
+      if (raw.futureTimestamp !== future) return { ok: false }
+      const shouldBeStale = future || ageMs >= maxAgeMs
+      if ((state === 'stale') !== shouldBeStale) return { ok: false }
+    }
     const stream = raw.stream as ReadSyncStreamId
     const instance = raw.instance as string | null
-    const lastSuccessAt = typeof raw.lastSuccessAt === 'string' && isStreamStamp(raw.lastSuccessAt) ? raw.lastSuccessAt : null
     const identity = `${stream}\u0000${instance ?? ''}\u0000${instance === null ? 'n' : 'i'}`
     if (seen.has(identity)) duplicates.add(stream)
     seen.add(identity)
-    entries.push({ stream, instance, state: stateOf(raw.state), lastSuccessAt, maxAgeMs: finiteOrNull(raw.maxAgeMs), ageMs: finiteOrNull(raw.ageMs) })
+    tally[state] = (tally[state] ?? 0) + 1
+    entries.push({ stream, instance, state, lastSuccessAt, maxAgeMs, ageMs })
   }
+  for (const state of ['fresh', 'stale', 'never', 'off']) if (report.counts[state] !== tally[state]) return { ok: false }
   return {
     ok: true,
     entries,

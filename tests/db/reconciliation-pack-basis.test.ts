@@ -46,6 +46,8 @@ test('as-of basis against a real database', { skip }, async () => {
   const settingKeys = [d.INTEGRATION_PLUGIN_SETTING_KEYS.xero, ...d.PACK_BASIS_ACCOUNTS.map((a) => a.settingKey)]
   const savedSettings = await db.setting.findMany({ where: { key: { in: settingKeys } } })
   const org = await db.organisation.findFirst({ select: { baseCurrency: true } })
+  const savedToken = await db.accountingToken.findUnique({ where: { connector: 'xero' } })
+  const tenant = `tenant-${tag}`
   const createdOrg = org ? null : await db.organisation.create({ data: { name: `rb-${tag}` } })
   const currency = org?.baseCurrency ?? 'GBP'
   const bracket = d.bracketLiveness(d.reduceStatusReport(d.goodReport()), d.reduceStatusReport(d.goodReport()))
@@ -55,9 +57,10 @@ test('as-of basis against a real database', { skip }, async () => {
     for (const [key, value] of [[d.INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'], ...d.PACK_BASIS_ACCOUNTS.map((a) => [a.settingKey, codes[a.kind]!] as const)] as const) {
       await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
     }
+    await db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date('2031-01-01T00:00:00Z'), tenantId: tenant }, update: { tenantId: tenant } })
     const amounts: Record<string, string> = { inventory: '100.50', allocated: '20.25', transit: '0', cogs: '7', unearned: '-30' }
     for (const a of d.PACK_BASIS_ACCOUNTS) {
-      await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rb-${tag}-${a.kind}`, accountCode: codes[a.kind]!, accountName: 'rb', balanceDate: date(D), currency, amountForeign: amounts[a.kind]!, amountBase: amounts[a.kind]!, sourcePayloadRef: ref(D, a.kind === 'transit') } })
+      await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rb-${tag}-${a.kind}`, accountCode: codes[a.kind]!, accountName: 'rb', balanceDate: date(D), currency, amountForeign: amounts[a.kind]!, amountBase: amounts[a.kind]!, sourcePayloadRef: ref(D, a.kind === 'transit'), tenantId: tenant } })
     }
     await db.inventorySnapshotRun.create({ data: { snapshotDate: date(D), stockLevelCount: 1, snapshotCount: 1, source: 'rb-test' } })
     await db.inventorySnapshot.create({ data: { snapshotDate: date(D), productId: product.id, warehouseId: warehouse.id, qty: '1', valueBase: '120.75', unitCostBase: '120.75', valueReplayReliable: true } })
@@ -72,7 +75,7 @@ test('as-of basis against a real database', { skip }, async () => {
     }
 
     // 2. NO WRITE: row counts of every table the basis reads, and the tuple counters, are unchanged by a load.
-    const tables = ['settings', 'organisations', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots']
+    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots']
     const counts = async () => {
       const out: Record<string, string> = {}
       for (const t of tables) out[t] = String((await db.$queryRawUnsafe<Array<{ n: bigint }>>(`SELECT count(*) AS n FROM "${t}"`))[0]!.n)
@@ -107,6 +110,17 @@ test('as-of basis against a real database', { skip }, async () => {
     await db.inventorySnapshotRun.deleteMany({ where: { source: 'rb-test', snapshotDate: date('2031-03-07') } })
     await assert.rejects(d.withReadOnlySnapshot(async (tx) => { await (tx as never as { $queryRawUnsafe(q: string): Promise<unknown> }).$queryRawUnsafe('SELECT pg_sleep(3)') }, { statementTimeoutMs: 200 }), /timeout|cancel/i)
 
+    // 4b. REBIND: the connection moves to another organisation; the stored balances belong to the previous one.
+    await db.accountingToken.update({ where: { connector: 'xero' }, data: { tenantId: `${tenant}-new` } })
+    const rebound = await d.loadAsOfBasis(D, bracket)
+    assert.equal(rebound.available === false && rebound.reason, 'gl_snapshot_other_tenant')
+    await db.accountingAccountBalanceSnapshot.updateMany({ where: { externalAccountId: { startsWith: `rb-${tag}-` } }, data: { tenantId: null } })
+    const unrecorded = await d.loadAsOfBasis(D, bracket)
+    assert.equal(unrecorded.available === false && unrecorded.reason, 'gl_snapshot_other_tenant')
+    await db.accountingToken.update({ where: { connector: 'xero' }, data: { tenantId: tenant } })
+    await db.accountingAccountBalanceSnapshot.updateMany({ where: { externalAccountId: { startsWith: `rb-${tag}-` } }, data: { tenantId: tenant } })
+    assert.equal((await d.loadAsOfBasis(D, bracket)).available, true)
+
     // 5. Unlabelled stored balance, and a sibling row, make it unavailable.
     await db.accountingAccountBalanceSnapshot.updateMany({ where: { accountCode: codes.cogs, balanceDate: date(D) }, data: { sourcePayloadRef: null } })
     const unlabelled = await d.loadAsOfBasis(D, bracket)
@@ -130,6 +144,8 @@ test('as-of basis against a real database', { skip }, async () => {
       if (prior) await db.setting.update({ where: { key }, data: { value: prior.value } })
       else await db.setting.deleteMany({ where: { key } })
     }
+    if (savedToken) await db.accountingToken.update({ where: { connector: 'xero' }, data: { tenantId: savedToken.tenantId } })
+    else await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
     if (createdOrg) await db.organisation.delete({ where: { id: createdOrg.id } })
     await db.$disconnect()
   }

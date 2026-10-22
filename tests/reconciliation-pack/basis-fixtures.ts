@@ -5,6 +5,7 @@ import type { BasisGlRow, BasisTx } from '../../lib/reconciliation-pack/basis.ts
 import { goodReport } from './liveness-fixtures.ts'
 
 export const D = '2026-10-19'
+export const TENANT = 'tenant-current'
 export const dateOf = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
 export const CODES: Record<PackBasisAccountKind, string> = { inventory: '630', allocated: '631', transit: '632', cogs: '500', unearned: '260' }
 export const REF = (iso: string) => `xero:trial-balance:${iso}`
@@ -14,6 +15,8 @@ export type SnapshotRow = { valueBase: unknown; valueReplayReliable: boolean }
 export type FakeState = {
   settings: Map<string, string>
   baseCurrency: string | null | undefined
+  /** The bound Xero connection's tenant; null = not connected. */
+  tenant: string | null
   gl: Array<BasisGlRow & { externalAccountId?: string }>
   run: { snapshotCount: number } | null
   snapshots: SnapshotRow[]
@@ -26,7 +29,8 @@ export function goodState(overrides: Partial<FakeState> = {}): FakeState {
   return {
     settings,
     baseCurrency: 'GBP',
-    gl: PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D) })),
+    tenant: TENANT,
+    gl: PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT })),
     run: { snapshotCount: 2 },
     snapshots: [{ valueBase: '700.25', valueReplayReliable: true }, { valueBase: '500.50', valueReplayReliable: true }],
     ...overrides,
@@ -50,10 +54,11 @@ export function fakeRun(state: FakeState, log: string[] = []) {
   }
   const tx: BasisTx = {
     setting: { findMany: async (args) => guard('setting.findMany', () => [...state.settings].filter(([key]) => args.where.key.in.includes(key)).map(([key, value]) => ({ key, value }))) },
+    accountingToken: { findUnique: async () => guard('accountingToken.findUnique', () => (state.tenant === null ? null : { tenantId: state.tenant })) },
     organisation: { findFirst: async () => guard('organisation.findFirst', () => (state.baseCurrency === undefined ? null : { baseCurrency: state.baseCurrency })) },
     accountingAccountBalanceSnapshot: {
       findMany: async (args) => guard('snapshot.findMany', () => state.gl.filter((row) => args.where.accountCode.in.includes(row.accountCode ?? '\u0000') && row.currency === args.where.currency && dateMatch(row.balanceDate, args.where.balanceDate))),
-      count: async (args) => guard('snapshot.count', () => state.gl.filter((row) => row.accountCode === args.where.accountCode && row.currency === args.where.currency).length),
+      count: async (args) => guard('snapshot.count', () => state.gl.filter((row) => row.accountCode === args.where.accountCode && row.currency === args.where.currency && row.tenantId === args.where.tenantId).length),
     },
     inventorySnapshotRun: { findUnique: async () => guard('run.findUnique', () => state.run) },
     inventorySnapshot: {

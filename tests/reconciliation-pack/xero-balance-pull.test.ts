@@ -11,7 +11,7 @@ import { toDecimal } from '../../lib/domain/math/decimal.ts'
  * request, so the request count with and without the new account is compared, not assumed.
  */
 
-type Persisted = Array<{ accountCode?: string | null; amountBase: unknown; sourcePayloadRef?: string | null }>
+type Persisted = Array<{ accountCode?: string | null; amountBase: unknown; sourcePayloadRef?: string | null; tenantId?: string | null }>
 let getCalls: string[] = []
 let cachedCalls: string[] = []
 let persisted: Persisted = []
@@ -37,7 +37,7 @@ mock.module('@/lib/connectors/xero/api', {
 })
 mock.module('@/lib/connectors/xero/connection-fence', {
   namedExports: {
-    captureXeroConnection: async () => ({ organisation: 'org-1' }),
+    captureXeroConnection: async () => ({ tenantId: 'tenant-x', connectionGeneration: 'gen-1' }),
     withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => {
       const tx = { setting: { upsert: async ({ where }: { where: { key: string } }) => { stamps.push(where.key) } }, snapshots: [] as Persisted }
       const value = await fn(tx)
@@ -138,4 +138,12 @@ test('an EMPTY Trial Balance synthesises nothing: it is an error, not a set of z
   assert.equal(result.persisted, 0)
   assert.ok(result.errors.length >= 1)
   assert.deepEqual(stamps, [])
+})
+
+// [mutation: tenantId not passed from the captured connection]
+test('every stored balance records the organisation of the connection the trial balance was fetched under', async () => {
+  reset()
+  await pull()
+  assert.equal(persisted.length, 5)
+  for (const snapshot of persisted) assert.equal(snapshot.tenantId, 'tenant-x')
 })

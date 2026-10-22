@@ -84,14 +84,16 @@ export type BasisGlRow = {
   currency: string
   amountBase: unknown
   sourcePayloadRef: string | null
+  tenantId: string | null
 }
 
 export type BasisTx = {
   setting: { findMany(args: { where: { key: { in: string[] } }; select: { key: true; value: true } }): Promise<Array<{ key: string; value: string }>> }
+  accountingToken: { findUnique(args: { where: { connector: string }; select: { tenantId: true } }): Promise<{ tenantId: string } | null> }
   organisation: { findFirst(args: { select: { baseCurrency: true } }): Promise<{ baseCurrency: string | null } | null> }
   accountingAccountBalanceSnapshot: {
-    findMany(args: { where: { connector: string; currency: string; accountCode: { in: string[] }; balanceDate: Date }; select: { accountCode: true; balanceDate: true; currency: true; amountBase: true; sourcePayloadRef: true } }): Promise<BasisGlRow[]>
-    count(args: { where: { connector: string; currency: string; accountCode: string } }): Promise<number>
+    findMany(args: { where: { connector: string; currency: string; accountCode: { in: string[] }; balanceDate: Date }; select: { accountCode: true; balanceDate: true; currency: true; amountBase: true; sourcePayloadRef: true; tenantId: true } }): Promise<BasisGlRow[]>
+    count(args: { where: { connector: string; currency: string; accountCode: string; tenantId: string } }): Promise<number>
   }
   inventorySnapshotRun: { findUnique(args: { where: { snapshotDate: Date }; select: { snapshotCount: true } }): Promise<{ snapshotCount: number } | null> }
   inventorySnapshot: {
@@ -157,21 +159,29 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   const currency = (org?.baseCurrency ?? DEFAULT_BASE_CURRENCY).trim().toUpperCase()
   if (!/^[A-Z]{3}$/.test(currency)) return fail('basis_unreadable')
 
+  // 2b. The connected organisation, in the same transaction. A stored balance counts only if it was fetched under THIS
+  // organisation: the table has no other way to tell one organisation's ledger from another's after a rebind.
+  const token = await tx.accountingToken.findUnique({ where: { connector: BASIS_CONNECTOR }, select: { tenantId: true } })
+  const tenant = typeof token?.tenantId === 'string' ? token.tenantId.trim() : ''
+  if (tenant.length === 0) return fail('no_account_configured')
+
   // 3. The ledger balances for EXACTLY D. One query, then every row is judged against its account.
   const wanted = [...new Set(codes.values())]
   const glRows = await tx.accountingAccountBalanceSnapshot.findMany({
     where: { connector: BASIS_CONNECTOR, currency, accountCode: { in: wanted }, balanceDate: date },
-    select: { accountCode: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true },
+    select: { accountCode: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true, tenantId: true },
   })
   const gl: BasisGlBalance[] = []
   let failure: PackBasisReason | null = null
   const note = (reason: PackBasisReason) => { failure ??= reason }
   for (const account of PACK_BASIS_ACCOUNTS) {
     const code = codes.get(account.kind)!
-    const own = glRows.filter((row) => row.accountCode === code)
+    const forAccount = glRows.filter((row) => row.accountCode === code)
+    const own = forAccount.filter((row) => row.tenantId === tenant)
+    if (own.length === 0 && forAccount.length > 0) { note('gl_snapshot_other_tenant'); continue }
     if (own.length === 0) {
-      // Say whether the account has ANY stored balance: a different date is `not_for_date`, never a stand-in.
-      const anyDate = await tx.accountingAccountBalanceSnapshot.count({ where: { connector: BASIS_CONNECTOR, currency, accountCode: code } })
+      // Say whether the account has ANY stored balance of this organisation: a different date is `not_for_date`, never a stand-in.
+      const anyDate = await tx.accountingAccountBalanceSnapshot.count({ where: { connector: BASIS_CONNECTOR, currency, accountCode: code, tenantId: tenant } })
       note(anyDate > 0 ? 'not_for_date' : 'no_gl_snapshot')
       continue
     }
