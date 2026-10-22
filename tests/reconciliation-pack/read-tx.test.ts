@@ -18,7 +18,7 @@ test('asks for read only and the statement timeout first, reads the mode back, t
   const seen: unknown[] = []
   const result = await withReadOnlySnapshot(async () => { log.push('BODY'); return 7 }, { client: client({ isolation: 'repeatable read', readOnly: 'on' }, log, seen), isolationLevel: 'RepeatableRead' })
   assert.equal(result, 7)
-  assert.deepEqual(log, ['SET TRANSACTION READ ONLY', `SET LOCAL statement_timeout = ${PACK_READ_STATEMENT_TIMEOUT_MS}`, `SELECT current_setting('transaction_i`, 'BODY'])
+  assert.deepEqual(log, ['SET TRANSACTION READ ONLY', `SET LOCAL statement_timeout = ${PACK_READ_STATEMENT_TIMEOUT_MS}`, `SELECT current_setting('transa`, 'BODY'])
   assert.deepEqual((seen[0] as { isolationLevel: string }).isolationLevel, 'RepeatableRead')
 })
 
