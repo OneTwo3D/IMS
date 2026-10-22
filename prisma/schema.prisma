@@ -2596,6 +2596,8 @@ model AccountingAccountBalanceSnapshot {
   amountForeign     Decimal  @db.Decimal(18, 6)
   amountBase        Decimal  @db.Decimal(18, 6)
   sourcePayloadRef  String?
+  /// The Xero organisation the balance was fetched from (the bound connection's tenant at the pull). NULL = unknown.
+  tenantId          String?
   syncRunId         String?
   fetchedAt         DateTime @default(now())
   createdAt         DateTime @default(now())

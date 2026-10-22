@@ -1123,6 +1123,11 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // The reconciliation pack's one-snapshot client: a REPEATABLE READ transaction set READ ONLY, bound as the application's db for
   // the invariant run only (operator command `npm run reconcile:pack`); the server refuses any write through it.
   'lib/reconciliation-pack/invariant-snapshot.ts': 'operator-run-read',
+  // Reconciliation pack basis. `withReadOnlySnapshot` issues `SET TRANSACTION READ ONLY`, `SET LOCAL statement_timeout =
+  // <whole number>` and one constant SELECT of three `current_setting` values on the transaction client it opens itself
+  // from the app's pooled client. It is READ ONLY by construction (the mode is read back, and nothing runs if it did
+  // not take), so it cannot write `settings` and cannot move a plugin key.
+  'lib/reconciliation-pack/read-tx.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',

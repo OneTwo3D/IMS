@@ -452,9 +452,46 @@ export function renderPackPublishedFieldTable(): string {
   return ['| Field | Appears in | Grammar |', '|---|---|---|', ...PACK_PUBLISHED_FIELDS.map((f) => `| ${f.field} | ${f.where} | ${f.grammar} |`)].join('\n')
 }
 
+// ---------------------------------------------------------------------------------------------
+// The as-of basis (lib/reconciliation-pack/basis.ts): why a cycle date has no usable basis.
+// ---------------------------------------------------------------------------------------------
+
+/** The accounts the as-of basis needs a stored trial-balance balance for, in this order, and the setting that names each. */
+export const PACK_BASIS_ACCOUNTS = [
+  { kind: 'inventory', label: 'Inventory', settingKey: 'xero_inventory_account' },
+  { kind: 'allocated', label: 'Allocated Inventory', settingKey: 'xero_allocated_inventory_account' },
+  { kind: 'transit', label: 'Stock in Transit', settingKey: 'xero_transit_account' },
+  { kind: 'cogs', label: 'Cost of Goods Sold', settingKey: 'xero_cogs_account' },
+  { kind: 'unearned', label: 'Unearned Revenue', settingKey: 'xero_unearned_revenue_account' },
+] as const
+export type PackBasisAccountKind = (typeof PACK_BASIS_ACCOUNTS)[number]['kind']
+
+/** Every reason the basis can be unavailable. The first four before `not_for_date` are the inventory GL evaluator's own words. */
+export const PACK_BASIS_REASONS = {
+  no_account_configured: 'the Xero plugin is not on, or one of the five accounts (Inventory, Allocated Inventory, Stock in Transit, Cost of Goods Sold, Unearned Revenue) has no configured code',
+  inventory_accounts_shared: 'Inventory and Allocated Inventory are configured with the same account code, so the inventory comparison would count one balance twice',
+  no_gl_snapshot: 'no stored trial-balance balance exists, on any date, for a configured account',
+  not_for_date: 'stored balances exist for a configured account but none for exactly the cycle date; a balance for an earlier or later date is never substituted',
+  gl_snapshot_ambiguous: 'more than one stored balance exists for one configured account on the cycle date',
+  gl_snapshot_other_tenant: 'the stored balances for a configured account on the cycle date were fetched under a different Xero organisation than the one now connected, or do not record which one; they are never used. Pull the date again under the connected organisation',
+  gl_snapshot_unlabelled: 'a stored balance for the cycle date does not say whether Xero reported the account or the account was absent from the trial balance (it was stored by an older build); pull the date again',
+  no_subledger_snapshot: 'no inventory snapshot run row exists for the cycle date',
+  unreliable_subledger_snapshot: 'at least one inventory snapshot row for the cycle date is not point-in-time reliable',
+  subledger_snapshot_incomplete: 'the number of inventory snapshot rows for the cycle date is not the number its run row recorded',
+  basis_moved: 'the stored balances or the subledger for the cycle date changed between the read inside the liveness bracket and the read after it (a scheduled pull or an on-demand refresh wrote them during the run)',
+  stream_not_fresh: 'the Xero balance-snapshot stream was not fresh and unmoved at both liveness reads, or liveness could not be read',
+  basis_unreadable: 'the basis could not be read: the cycle date is not a real calendar date, a database error or timeout, or a stored value that is not a finite number',
+} as const
+export type PackBasisReason = keyof typeof PACK_BASIS_REASONS
+export const PACK_BASIS_REASON_LIST = Object.keys(PACK_BASIS_REASONS) as PackBasisReason[]
+
+export function renderPackBasisReasonTable(): string {
+  return ['| Basis reason | Meaning |', '|---|---|', ...PACK_BASIS_REASON_LIST.map((r) => `| ${r} | ${PACK_BASIS_REASONS[r]} |`)].join('\n')
+}
+
 export const PACK_DOC_BLOCK_OPEN = (id: string) => `<!-- reconciliation-pack:${id} -->`
 export const PACK_DOC_BLOCK_CLOSE = (id: string) => `<!-- /reconciliation-pack:${id} -->`
-export type PackDocBlockId = 'overview' | 'usage' | 'cli-codes' | 'readers' | 'population' | 'outcomes' | 'proof' | 'tokens' | 'inputs' | 'reasons' | 'refusals' | 'items' | 'settling' | 'chain' | 'exit-codes' | 'audit'
+export type PackDocBlockId = 'overview' | 'usage' | 'cli-codes' | 'readers' | 'population' | 'outcomes' | 'proof' | 'tokens' | 'inputs' | 'reasons' | 'refusals' | 'items' | 'settling' | 'liveness' | 'basis' | 'chain' | 'exit-codes' | 'audit'
 
 export function renderPackOutcomeTable(): string {
   return ['| Outcome | Meaning |', '|---|---|', ...PACK_OUTCOMES.map((o) => `| ${o} | ${PACK_OUTCOME_MEANING[o]} |`)].join('\n')
@@ -495,6 +532,11 @@ export const PACK_AUDIT_ROWS: ReadonlyArray<{ klass: string; guard: string }> = 
   { klass: 'identities that were never compared counted as compared (excluded, out of population, unsettled)', guard: 'the comparator issues the "compared" proof only for equal in-population, non-excluded identities, and a named empty proof only when nothing was judged; a table test over every bucket combination in both modes runs comparator, report and reader and asserts nothing else can pass' },
   { klass: 'caller-owned data serialised or written before it is validated', guard: 'input is copied field by field into plain objects through a whitelist (no unknown field, accessor, symbol key, Proxy, class instance, hole or oversized list), the report is built from the copies only, and the finished text passes the reader\'s validation before any file is created' },
   { klass: 'fail-open on unreadable state', guard: 'an unreadable, untrusted, oversized, malformed or inconsistent file, directory or chain refuses (trend) or is inconclusive (item); there is no default that passes' },
+  { klass: 'liveness unreadable, or a stale or off stream, treated as fine', guard: 'the status report is read at the start and again at the end of the run; a read that fails or is malformed makes EVERY item inconclusive; an item with a dependent stream that is not fresh at both reads, missing, ambiguous, whose stamp differs between the reads, or whose job is unscheduled or disabled, or a scheduler that was not examined, could not be read or has an untrusted block, cannot pass (STALE_BASIS or BASIS_MOVED); the published bracket of such a stream has no end stamp; no item without liveness is assumed healthy' },
+  { klass: 'the latest snapshot on or before now standing in for the cycle date', guard: 'the basis reads each ledger balance for EXACTLY the cycle date and never the latest earlier or later one: a missing exact date is not_for_date, never a substitute' },
+  { klass: 'another organisation\'s ledger balance read after a rebind (the snapshot table was shared across organisations)', guard: 'each stored trial-balance balance records the organisation it was fetched under; the basis reads the connected organisation in the same transaction and uses only balances whose recorded organisation equals it; a balance with another or no recorded organisation is gl_snapshot_other_tenant and the basis is unavailable' },
+  { klass: 'an account missing from the trial balance read as an explicit zero', guard: 'a zero synthesised for a configured account that a non-empty trial balance omitted is stored with an absent-from-tb reference and read back as absent-from-tb, and when the Inventory or Allocated Inventory balance is one, the inventory comparison is withheld (no result at all, never `balanced` on an inferred zero); a stored balance with no recognised reference is gl_snapshot_unlabelled and the basis is unavailable' },
+  { klass: 'a subledger read in several snapshots, or a snapshot whose row count is not what its run recorded', guard: 'every IMS read of the basis is made in one READ ONLY REPEATABLE READ transaction with a statement timeout, verified before the first read; the snapshot rows must be reliable and be exactly the number the run row recorded' },
   { klass: 'an untrusted-file field reaching text', guard: 'every field read back from a file is validated against a closed set or a strict pattern before use, and the Markdown is rendered from validated values only' },
 ]
 export function renderPackAuditTable(): string {
@@ -503,7 +545,7 @@ export function renderPackAuditTable(): string {
 
 export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
   overview: [
-    `\`${PACK_COMMAND}\` is the reconciliation pack: fifteen items (R1 to R15), each a claim that IMS agrees with a vendor or with its own ledger. It is not a second readiness gate and renders no overall verdict; the gate reads the newest report. This build runs R3, R4 and R15 end to end from the invariant report, and reports every other item the phase applies as inconclusive with NO_RUNNER and nothing listed until its runner arrives. The pack makes no vendor call of any kind in this build.`,
+    `\`${PACK_COMMAND}\` is the reconciliation pack: fifteen items (R1 to R15), each a claim that IMS agrees with a vendor or with its own ledger. It is not a second readiness gate and renders no overall verdict; the gate reads the newest report. This build runs R3, R4 and R15 end to end from the invariant report, and reports every other item the phase applies as inconclusive with NO_RUNNER and nothing listed until its runner arrives. It also contains the liveness bracket and the as-of basis described below; neither is wired into the command yet. The pack makes no vendor call of any kind in this build.`,
     '',
     'A run publishes `<report-dir>/<run id>/evidence.jsonl`, then `reconciliation-pack.md`, then `reconciliation-pack.json` last, each created exclusively and never through a symlink, fsynced and renamed into place under an exclusive 0700 directory. The JSON is the commit record: it names the Markdown by sha256 (`companionMarkdownSha256`) and the evidence by sha256 and line count, carries a `sequence` and the sha256 of the previous report\'s JSON (`previousReportSha256`), and counts that the reader recomputes from the evidence. Every identity is one line of the evidence, equal ones included: the reader recomputes every count and the digest of the equal identities from those lines, and re-judges each line against the item\'s catalogue row (which sides had the identity, recorded as explicit presence flags; the value shape the item\'s mode demands; the true difference of the two values; the tolerance verdict; and, for a minor-unit item, the currencies). The bucket of every pair entry is DERIVED from those fields in the builder and again in the reader (both sides present is equal or differing, one side is onlyIms or onlyVendor, neither is invalid) and a label that disagrees is refused. Nothing the caller owns is serialised: the input is copied field by field into plain objects (an unknown field, an accessor, a symbol key, a Proxy, a class instance or a hole is refused), and the finished report is read back by the reader\'s own validation before the first byte is written. Problem text is closed reason codes and counts only; identities appear only as sanitised tokens (a cuid, a numeric vendor id, a validated SKU or `sku#` and eight hex digits, a warehouse code).',
   ].join('\n'),
@@ -545,6 +587,24 @@ export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
   refusals: ['A run is refused, and the trend reader refuses a directory, with exactly one of these codes.', '', renderPackChainCodeTable()].join('\n'),
   items: ['The catalogue. Tolerances are chosen defaults (owner decisions D1 and D2); an exact quantity comparison allows 0.0001.', '', renderPackItemTable()].join('\n'),
   settling: `A difference is not a failure the first time it is seen: a vendor can lag. A keyed difference (an identity on one side only, or a value beyond the tolerance) is carried as unsettled with the last-success stamp of the stream it was read under. It becomes a failure only when it is still there after ${PENDING_PERSISTENCE_RUNS} LATER successful runs of that stream, observed as ${PENDING_PERSISTENCE_RUNS} further DISTINCT last-success values. The stamps are compared for equality only, never for order: a repeated stamp is the same run and makes no progress. A difference that disappears is dropped. While anything is unsettled the item is inconclusive, never a pass. The stream stamp is also read at the start and end of an item\'s read; if it differs the read is BASIS_MOVED. The same item's result is also never a pass when the stream is stale or off.`,
+  liveness: [
+    'Before and after its reads the pack reads the read-sync status report (the same report `npm run read-sync:status` prints) and compares the two reads. Each item names, in the catalogue above, the streams it depends on. An item cannot pass unless every entry of every such stream (one per binding for the Mintsoft stock sync) was `fresh` at BOTH reads, with a last-success stamp, and the stamp is EQUAL at both reads. Stamps are compared for equality only, never for order or age; "fresh" is the status report\'s own judgement against the stream\'s limit.',
+    '',
+    'An item is also withheld when the scheduler could not be examined, the crontab could not be read or the managed block cannot be trusted, at either read (this applies to EVERY item, including those with no dependent stream, such as R2 to R4), or when a job the item\'s streams depend on is unscheduled or switched off. A stream with no entry, two entries for one instance, or an entry that appears in only one read is not fresh. If either read of the status report fails, is not the shape the report defines, or contradicts itself (an entry marked `fresh` that is older than its own limit, dated in the future or without a stamp; a `stale` one that is young; an age that is not the distance from the report\'s clock to the stamp; counts that are not the tally of the entries; a scheduler that was not examined yet names a problem), EVERY item is inconclusive, including items with no dependent stream: liveness that could not be read is never taken as healthy. The item keeps its numbers; its outcome is inconclusive with STALE_BASIS (not fresh, or the scheduler), BASIS_MOVED (fresh, but a stamp or an instance moved between the reads) or SOURCE_UNREADABLE (a read failed). The published stream bracket of a stream that is not clean has no end stamp, so the report writer and reader refuse a pass on it.',
+  ].join('\n'),
+  basis: [
+    'The as-of basis is the stored evidence a ledger item (R6, R10) compares on. It is read for one cycle date D (default: yesterday, UTC) and reads stored snapshots only: it makes no vendor call and writes nothing. It is AVAILABLE only when ALL of the following hold, and otherwise it names the first reason that fails, from the table below.',
+    '',
+    '- the Xero plugin is on and each of the five accounts has a configured code: Inventory, Allocated Inventory, Stock in Transit, Cost of Goods Sold and Unearned Revenue;',
+    '- for each of the five accounts there is exactly one stored trial-balance balance, fetched under the Xero organisation connected now (a balance with another or no recorded organisation is never used), whose balance date is EXACTLY D, in the base currency. The latest balance on or before D is never used, and neither is a later one: a balance for another date is `not_for_date`;',
+    '- every one of those balances says where it came from: a row Xero reported, or `absent-from-tb`, the zero the pull records for a configured account that a non-empty trial balance omitted. An absent-from-tb zero is carried with that label and is never an explicit zero; a balance with neither label (stored by an older build) makes the basis unavailable until the date is pulled again;',
+    '- an inventory snapshot run row exists for D, every inventory snapshot row for D is point-in-time reliable, and the rows are exactly as many as the run row recorded. A run row with no rows is a true zero stock position, and is the named empty-population proof;',
+    '- the Xero balance-snapshot stream was fresh and unmoved at both liveness reads.',
+    '',
+    'Every IMS read of the basis is made in ONE read-only REPEATABLE READ transaction with a statement timeout, so the settings, the ledger balances and the snapshots are one consistent view; the transaction\'s mode is read back and a basis is not built if it is not what was asked for. The inventory subledger is compared with Inventory plus Allocated Inventory by the existing pure evaluator, unchanged. The pull that stores the balances now includes Unearned Revenue, taken from the same trial-balance response as the other four (no extra call); Unearned Revenue is a credit-balance liability, so its stored amount (debit minus credit) is normally negative.',
+    '',
+    renderPackBasisReasonTable(),
+  ].join('\n'),
   chain: [
     `Reports are ordered by \`sequence\` (1, 2, 3, ...) and linked by \`previousReportSha256\` (null for sequence 1), never by timestamp. A run takes the run lock (\`${PACK_LOCK_FILE}\` in the report directory, created exclusively with its pid, host and a random token) before it reads the chain and holds it until the report is committed; the lock is checked again immediately before the JSON is put into place. A lock is reclaimed only when its holder is provably dead: on this host the holder's process entry is gone, or its start time or the boot id differs from the ones the lock recorded (the pid was reused or the machine rebooted). A live holder is never displaced, however old its lock, and a lock from another host is never taken; where death cannot be proven (no process table, a lock without an identity, an unreadable lock) the run is refused and an operator decides. Reclaiming goes through a second exclusive file so two reclaimers cannot both win. At the commit the run also claims the sequence number with an exclusive file (\`${PACK_SEQUENCE_CLAIM_PREFIX}<n>\`) and the JSON is linked into place without overwriting, so even a displaced holder cannot place a second commit record for a sequence that is taken.`,
     '',
@@ -555,7 +615,7 @@ export const PACK_DOC_BLOCKS: Record<PackDocBlockId, string> = {
 }
 
 export const PACK_DOC_PLACEMENTS: ReadonlyArray<{ file: string; blocks: readonly PackDocBlockId[] }> = [
-  { file: 'docs/installation.md', blocks: ['overview', 'usage', 'cli-codes', 'readers', 'population', 'outcomes', 'proof', 'tokens', 'inputs', 'reasons', 'refusals', 'items', 'settling', 'chain', 'exit-codes', 'audit'] },
+  { file: 'docs/installation.md', blocks: ['overview', 'usage', 'cli-codes', 'readers', 'population', 'outcomes', 'proof', 'tokens', 'inputs', 'reasons', 'refusals', 'items', 'settling', 'liveness', 'basis', 'chain', 'exit-codes', 'audit'] },
 ]
 
 export function renderPackDocBlock(id: PackDocBlockId): string {

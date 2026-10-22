@@ -41,6 +41,7 @@ mock.module('@/lib/connectors/xero/settings', {
       xero_allocated_inventory_account: '',
       xero_cogs_account: '500',
       xero_transit_account: '',
+      xero_unearned_revenue_account: '',
     }),
   },
 })

@@ -24,6 +24,7 @@ function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): 
     amountForeign: toDecimal('0'),
     amountBase: toDecimal('0'),
     sourcePayloadRef: null,
+    tenantId: null,
     syncRunId: null,
     fetchedAt: new Date('2026-06-01T01:00:00.000Z'),
     ...overrides,
@@ -62,6 +63,7 @@ function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
           amountForeign: args.create.amountForeign,
           amountBase: args.create.amountBase,
           sourcePayloadRef: args.create.sourcePayloadRef,
+          tenantId: args.create.tenantId,
           syncRunId: args.create.syncRunId,
           fetchedAt: args.create.fetchedAt,
         } as AccountingAccountBalanceSnapshotRow
@@ -282,4 +284,17 @@ test('findLatestAccountBalanceSnapshot filters by currency', async () => {
 test('normalizeBalanceDate rejects invalid date strings', () => {
   assert.throws(() => normalizeBalanceDate('2026-02-30'), /real calendar date/)
   assert.throws(() => normalizeBalanceDate('2026/02/28'), /YYYY-MM-DD/)
+})
+
+// [mutation: tenantId left out of the update arm / the create arm]
+test('the organisation a balance was fetched under is stored, and a later pull under another organisation replaces it', async () => {
+  const client = snapshotClient()
+  const base = { connector: 'xero', externalAccountId: 'account-1', accountCode: '500', accountName: 'Inventory Asset', balanceDate: '2026-06-01', currency: 'GBP', amountForeign: '1', amountBase: '1' }
+  await persistAccountingAccountBalanceSnapshots([{ ...base, tenantId: ' tenant-a ' }], client as never)
+  assert.equal(client.rows[0]!.tenantId, 'tenant-a')
+  await persistAccountingAccountBalanceSnapshots([{ ...base, tenantId: 'tenant-b' }], client as never)
+  assert.equal(client.rows.length, 1)
+  assert.equal(client.rows[0]!.tenantId, 'tenant-b')
+  await persistAccountingAccountBalanceSnapshots([{ ...base }], client as never)
+  assert.equal(client.rows[0]!.tenantId, null, 'a pull that cannot name its organisation records none, not the previous one')
 })

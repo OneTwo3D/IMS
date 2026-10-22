@@ -345,6 +345,20 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Revenue deferral/recognition journal amounts. Ledger postings.',
   },
   {
+    file: 'lib/connectors/xero/account-balances.ts',
+    figures: ['xero_unearned_revenue_account'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Unearned-revenue account setting key, read to list the accounts whose trial-balance balance is stored. A ledger balance, not an IMS revenue figure.',
+  },
+  {
+    file: 'lib/reconciliation-pack/constants.ts',
+    figures: ['xero_unearned_revenue_account'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Unearned-revenue account setting key, named so the reconciliation pack basis can read the configured code. No revenue figure is computed.',
+  },
+  {
     file: 'app/actions/xero-sync.ts',
     figures: ['xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',

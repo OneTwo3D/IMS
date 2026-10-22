@@ -16,6 +16,8 @@ export type AccountingAccountBalanceSnapshotInput = {
   amountForeign: DecimalInput
   amountBase: DecimalInput
   sourcePayloadRef?: string | null
+  /** The organisation the balance was fetched from; null/absent = unknown. */
+  tenantId?: string | null
   syncRunId?: string | null
   fetchedAt?: Date
 }
@@ -31,6 +33,7 @@ export type AccountingAccountBalanceSnapshotRow = {
   amountForeign: Decimal
   amountBase: Decimal
   sourcePayloadRef: string | null
+  tenantId: string | null
   syncRunId: string | null
   fetchedAt: Date
 }
@@ -144,6 +147,7 @@ function normalizeInput(input: AccountingAccountBalanceSnapshotInput) {
     amountForeign: roundQuantity(input.amountForeign, 6),
     amountBase: roundQuantity(input.amountBase, 6),
     sourcePayloadRef: input.sourcePayloadRef?.trim() || null,
+    tenantId: input.tenantId?.trim() || null,
     syncRunId: input.syncRunId?.trim() || null,
     fetchedAt: input.fetchedAt ?? new Date(),
   }
@@ -166,6 +170,7 @@ function upsertSnapshotArgs(normalized: NormalizedAccountingAccountBalanceSnapsh
       amountForeign: normalized.amountForeign,
       amountBase: normalized.amountBase,
       sourcePayloadRef: normalized.sourcePayloadRef,
+      tenantId: normalized.tenantId,
       syncRunId: normalized.syncRunId,
       fetchedAt: normalized.fetchedAt,
     },

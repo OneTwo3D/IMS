@@ -9,6 +9,7 @@ import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
 import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
+import { xeroTrialBalanceRef } from './account-balance-refs'
 import { XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 
 const XERO_CONNECTOR = 'xero'
@@ -70,6 +71,8 @@ type XeroAccountBalanceSnapshotBuildInput = {
   balanceDate: string
   baseCurrency: string
   syncRunId?: string | null
+  /** The tenant of the connection the trial balance was fetched under. */
+  tenantId?: string | null
 }
 
 function attrValue(cell: XeroReportCell | undefined, ids: string[]): string | null {
@@ -144,7 +147,7 @@ export function parseXeroTrialBalanceRows(report: XeroTrialBalanceReport): Parse
   return output
 }
 
-function configuredAccountCodes(settings: Awaited<ReturnType<typeof getXeroSettings>>): string[] {
+export function configuredAccountCodes(settings: Pick<Awaited<ReturnType<typeof getXeroSettings>>, 'xero_inventory_account' | 'xero_allocated_inventory_account' | 'xero_cogs_account' | 'xero_transit_account' | 'xero_unearned_revenue_account'>): string[] {
   // Allocated Inventory is synced alongside Inventory + COGS so the inventory
   // GL <-> cost-layer reconciliation (scjz.60c/.74) has both on-hand legs (value
   // sits in the Allocated-Inventory contra between A2 and dispatch) on a common
@@ -153,11 +156,15 @@ function configuredAccountCodes(settings: Awaited<ReturnType<typeof getXeroSetti
   // transit subledger-vs-GL reconciliation has a daily GL balance to compare its
   // period movement against (without it the reconciliation stays permanently
   // unavailable).
+  // Reconciliation pack: UNEARNED REVENUE is snapshotted from the SAME Trial Balance response (the account list is
+  // matched against the one report, so this adds no request), so the pack's as-of basis can read a stored balance
+  // for it. It is a credit-balance liability: the stored amount is debit minus credit, so a normal balance is negative.
   return [
     settings.xero_inventory_account,
     settings.xero_allocated_inventory_account,
     settings.xero_cogs_account,
     settings.xero_transit_account,
+    settings.xero_unearned_revenue_account,
   ]
     .map((code) => code.trim())
     .filter((code): code is string => code.length > 0)
@@ -210,7 +217,8 @@ export function buildXeroAccountBalanceSnapshotInputs(
       currency: input.baseCurrency,
       amountForeign: amount,
       amountBase: amount,
-      sourcePayloadRef: `xero:trial-balance:${input.balanceDate}`,
+      sourcePayloadRef: xeroTrialBalanceRef(input.balanceDate, parsed === null),
+      tenantId: input.tenantId ?? null,
       syncRunId: input.syncRunId ?? null,
     })
   }
@@ -265,6 +273,7 @@ export async function syncXeroAccountBalanceSnapshots(
     balanceDate,
     baseCurrency,
     syncRunId: options.syncRunId ?? null,
+    tenantId: connection?.tenantId ?? null,
   })
 
   const fenced = await withXeroConnectionFence(connection, async (tx) => {
