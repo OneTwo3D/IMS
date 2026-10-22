@@ -62,9 +62,12 @@ export function realEvidence(inventoryFindings: Finding[] = []): Record<string, 
   const plain = { findings: [], summary: empty }
   return {
     ok: counts.critical === 0,
+    // The proof lib/reconciliation-pack/invariant-snapshot.ts attaches when the run read one REPEATABLE READ READ ONLY snapshot.
+    snapshot: { isolation: 'repeatable read', readOnly: true, snapshot: '812:812:', boundToApplicationClient: true },
     result: {
       status: 'completed', errors: [],
-      criticalFindings: inventoryFindings.filter((f) => f.severity === 'critical').map((f) => ({ domain: 'inventory', code: f.code })),
+      // As lib/cron/invariant-check.ts toCriticalFinding builds them (JSON drops the undefined ids).
+      criticalFindings: inventoryFindings.filter((f) => f.severity === 'critical').map((f) => JSON.parse(JSON.stringify({ domain: 'inventory', code: f.code, message: f.message, details: f.details, productId: f.productId, warehouseId: f.warehouseId, orderId: f.orderId, shipmentId: f.shipmentId, refundId: f.refundId, syncLogId: f.syncLogId }))),
       summary: { total: counts, inventory: counts, accounting: empty, sales: empty },
       reports: { inventory: { findings: inventoryFindings, truncated: false, nextCursor: null, summary: counts }, accounting: plain, sales: plain },
     },

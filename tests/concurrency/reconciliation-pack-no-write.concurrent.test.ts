@@ -77,6 +77,9 @@ test('[reconciliation pack] a whole run of the command writes nothing and connec
     net.Socket.prototype.connect = original
     assert.ok(code === 0 || code === 1, `exit ${code}: ${out.join('\n')}`)
     assert.ok(out.some((line) => line.startsWith('R3 ')) && out.some((line) => line.startsWith('R15 ')), 'precondition: the items ran')
+    // The invariant run read ONE snapshot through the application client (lib/reconciliation-pack/invariant-snapshot.ts): without
+    // the proof every one of these would be inconclusive, which is how a binding broken by import order shows up.
+    for (const id of ['R3', 'R4', 'R15']) assert.ok(out.some((line) => line.startsWith(`${id} pass`) || line.startsWith(`${id} fail`)), `${id} decided on one snapshot: ${out.join('\n')}`)
     const end = await census()
     assert.deepEqual(end.counts, start.counts, 'every table has the rows it had')
     assert.deepEqual(end.stats, start.stats, 'no table saw an insert, update or delete')

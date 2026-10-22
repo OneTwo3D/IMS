@@ -88,23 +88,40 @@ async function defaultOpenIms(): Promise<ImsConnection> {
 let applicationClientLoaded = false
 async function defaultRunInvariant(): Promise<unknown> {
   applicationClientLoaded = true
-  const { runInvariantCheckPreflight } = await import('../lib/cron/invariant-check-preflight.ts')
-  const { runScheduledInvariantCheck } = await import('../lib/cron/invariant-check.ts')
-  const { runInventoryInvariantReport } = await import('../lib/domain/inventory/invariants.ts')
-  // The scheduled check with every writer a no-op, and the stock-movement branch read over ALL history: the scheduled check looks back
-  // 90 days only, and a pack item that claims "zero critical findings" may not rest on a window.
-  return await runInvariantCheckPreflight(() => runScheduledInvariantCheck({
-    createRunId: () => `reconcile-pack-${new Date().toISOString()}`,
-    writeActivityLog: async () => {},
-    notifyAdmins: async () => {},
-    getPreviousCriticalFindingsHash: async () => null,
-    setCriticalFindingsHash: async () => {},
-    runInventoryReport: () => runInventoryInvariantReport({ collectionMode: 'sql', pageSize: 500, maxFindings: 5000, stockMovementLookbackDays: null }),
-  }))
+  const { runInvariantInOneSnapshot } = await import('../lib/reconciliation-pack/invariant-snapshot.ts')
+  // The whole check runs in ONE REPEATABLE READ READ ONLY transaction with the application's client bound to it
+  // (invariant-snapshot.ts), so its three reports and every page of them read one database state; the evidence carries the
+  // proof the items require. The check's modules import lib/db, so they are imported INSIDE the run, after the binding: imported
+  // first, `db` would be the ordinary client and the run gets no proof.
+  return await runInvariantInOneSnapshot(async () => {
+    const { runInvariantCheckPreflight } = await import('../lib/cron/invariant-check-preflight.ts')
+    const { runScheduledInvariantCheck } = await import('../lib/cron/invariant-check.ts')
+    const { runInventoryInvariantReport } = await import('../lib/domain/inventory/invariants.ts')
+    const { runAccountingInvariantReport } = await import('../lib/domain/accounting/invariants.ts')
+    const { runRefundStatusReconciliationReport } = await import('../lib/domain/sales/refund-status-reconciliation.ts')
+    // The check starts its three reports together; on one transaction they share one connection, so they are queued and run one
+    // after another rather than interleaving statements on it.
+    let queue: Promise<unknown> = Promise.resolve()
+    const serial = <T>(report: () => Promise<T>) => (): Promise<T> => { const next = queue.then(report); queue = next.catch(() => undefined); return next }
+    // The scheduled check with every writer a no-op, and the stock-movement branch read over ALL history: the scheduled check looks
+    // back 90 days only, and a pack item that claims "zero critical findings" may not rest on a window.
+    return await runInvariantCheckPreflight(() => runScheduledInvariantCheck({
+      createRunId: () => `reconcile-pack-${new Date().toISOString()}`,
+      writeActivityLog: async () => {},
+      notifyAdmins: async () => {},
+      getPreviousCriticalFindingsHash: async () => null,
+      setCriticalFindingsHash: async () => {},
+      runInventoryReport: serial(() => runInventoryInvariantReport({ collectionMode: 'sql', pageSize: 500, maxFindings: 5000, stockMovementLookbackDays: null })),
+      runAccountingReport: serial(() => runAccountingInvariantReport()),
+      runSalesReport: serial(() => runRefundStatusReconciliationReport()),
+    }))
+  })
 }
 async function defaultDisconnect(): Promise<void> {
   if (!applicationClientLoaded) return
   const { db } = await import('../lib/db/index.ts')
+  // After a snapshot run `db` is the spent transaction client, which has no $disconnect: its own client was closed with it.
+  if (typeof (db as { $disconnect?: unknown }).$disconnect !== 'function') return
   let timer: ReturnType<typeof setTimeout> | null = null
   await Promise.race([db.$disconnect(), new Promise<void>((resolve) => { timer = setTimeout(resolve, DISCONNECT_TIMEOUT_MS); timer.unref() })])
   if (timer) clearTimeout(timer)

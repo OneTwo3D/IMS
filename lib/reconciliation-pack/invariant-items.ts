@@ -100,12 +100,16 @@ function readDomain(reports: Record<string, unknown>, domain: Domain): DomainRep
 }
 
 /**
- * The whole run, validated field by field. Every domain's counts equal its listed findings; the run's own summary (the total
+ * The whole run, validated field by field. It read one snapshot (the proof the CLI attaches); every domain's counts equal its listed findings; the run's own summary (the total
  * and each domain's) equals the sum of what the reports list, count by count; the critical findings it lists are exactly the
  * reports' critical findings, identity by identity; and `ok` is a boolean that says what the findings say. Anything else is inconclusive, never a pass.
  */
 function readRun(evidence: unknown): { reports: Record<Domain, DomainReport>; run: Record<string, unknown> } | PackReasonCode {
   if (!isObject(evidence) || !isObject(evidence.result) || !isObject(evidence.result.reports)) return 'SOURCE_UNREADABLE'
+  // The run must have read ONE database state (invariant-snapshot.ts): reports taken at different instants can each be clean while
+  // no single state was. No proof, or any part of it different, is never a pass.
+  const proof = (evidence as Record<string, unknown>).snapshot
+  if (!isObject(proof) || proof.isolation !== 'repeatable read' || proof.readOnly !== true || proof.boundToApplicationClient !== true || typeof proof.snapshot !== 'string' || proof.snapshot === '') return 'READ_INCOMPLETE'
   const result = evidence.result
   if (result.status !== 'completed' || !Array.isArray(result.errors) || result.errors.length > 0) return 'SOURCE_UNREADABLE'
   const reports = {} as Record<Domain, DomainReport>

@@ -37,15 +37,17 @@ const countsOf = (r: unknown): F => {
 }
 /** A critical-findings entry exactly as lib/cron/invariant-check.ts toCriticalFinding builds it (JSON drops the undefined ids). */
 const criticalEntry = (domain: Domain, f: F): F => JSON.parse(JSON.stringify({ domain, code: f.code, message: f.message, details: f.details, productId: f.productId, warehouseId: f.warehouseId, orderId: f.orderId, shipmentId: f.shipmentId, refundId: f.refundId, syncLogId: f.syncLogId }))
+/** The proof lib/reconciliation-pack/invariant-snapshot.ts attaches when the run read one REPEATABLE READ READ ONLY snapshot. */
+const SNAPSHOT = { isolation: 'repeatable read', readOnly: true, snapshot: '812:812:', boundToApplicationClient: true }
 /** A run result in the real shape, every count derived from the reports actually listed; the knobs then break one thing at a time. */
-function evidence(inventory: F[] = [], over: { inventory?: unknown; accounting?: unknown; sales?: unknown; result?: F; top?: F; total?: F; domains?: Partial<Record<Domain, unknown>>; ok?: unknown; criticalFindings?: unknown } = {}): F {
+function evidence(inventory: F[] = [], over: { inventory?: unknown; accounting?: unknown; sales?: unknown; result?: F; top?: F; total?: F; domains?: Partial<Record<Domain, unknown>>; ok?: unknown; criticalFindings?: unknown; snapshot?: unknown } = {}): F {
   const pick = (k: Domain, fallback: F) => (k in over ? over[k] : fallback)
   const reports = { inventory: pick('inventory', report(inventory)), accounting: pick('accounting', plainReport([])), sales: pick('sales', plainReport([])) }
   const dom = { inventory: countsOf(reports.inventory), accounting: countsOf(reports.accounting), sales: countsOf(reports.sales) }
   const sum = (key: string) => (['inventory', 'accounting', 'sales'] as Domain[]).reduce((n, d) => n + (dom[d][key] as number), 0)
   const critical = (['inventory', 'accounting', 'sales'] as Domain[]).flatMap((d) => (Array.isArray((reports[d] as F | null | undefined)?.findings) ? ((reports[d] as F).findings as F[]) : []).filter((f) => f && f.severity === 'critical').map((f) => criticalEntry(d, f)))
   const summary = { total: { total: sum('total'), info: sum('info'), warning: sum('warning'), critical: sum('critical'), ...(over.total ?? {}) }, ...dom, ...(over.domains ?? {}) }
-  return { ok: 'ok' in over ? over.ok : sum('critical') === 0, ...(over.top ?? {}), result: { status: 'completed', errors: [], criticalFindings: 'criticalFindings' in over ? over.criticalFindings : critical, summary, reports, ...(over.result ?? {}) } }
+  return { ok: 'ok' in over ? over.ok : sum('critical') === 0, snapshot: 'snapshot' in over ? over.snapshot : SNAPSHOT, ...(over.top ?? {}), result: { status: 'completed', errors: [], criticalFindings: 'criticalFindings' in over ? over.criticalFindings : critical, summary, reports, ...(over.result ?? {}) } }
 }
 
 function assertBuilds(item: ItemInput): void {
@@ -192,6 +194,14 @@ const SHAPES: Shape[] = [
   { name: 'R3 code listed under sales', ev: () => evidence([], { sales: plainReport([r3(2, 0, { severity: 'warning' })]) }), ids: BOTH },
   { name: 'R4 code listed under accounting', ev: () => evidence([], { accounting: plainReport([r4(2, 0, { severity: 'warning' })]) }), ids: BOTH },
   { name: 'R4 code listed under sales', ev: () => evidence([], { sales: plainReport([r4(2, 0, { severity: 'warning' })]) }), ids: BOTH },
+  { name: 'no snapshot proof', ev: () => evidence([], { snapshot: undefined }), ids: BOTH },
+  { name: 'a null snapshot proof', ev: () => evidence([], { snapshot: null }), ids: BOTH },
+  { name: 'a snapshot proof read under read committed', ev: () => evidence([], { snapshot: { ...SNAPSHOT, isolation: 'read committed' } }), ids: BOTH },
+  { name: 'a snapshot proof that was not read-only', ev: () => evidence([], { snapshot: { ...SNAPSHOT, readOnly: false } }), ids: BOTH },
+  { name: 'a snapshot proof whose read-only flag is a string', ev: () => evidence([], { snapshot: { ...SNAPSHOT, readOnly: 'on' } }), ids: BOTH },
+  { name: 'a snapshot proof not bound to the application client', ev: () => evidence([], { snapshot: { ...SNAPSHOT, boundToApplicationClient: false } }), ids: BOTH },
+  { name: 'a snapshot proof with an empty snapshot', ev: () => evidence([], { snapshot: { ...SNAPSHOT, snapshot: '' } }), ids: BOTH },
+  { name: 'a snapshot proof that is a string', ev: () => evidence([], { snapshot: 'repeatable read' }), ids: BOTH },
   { name: 'a finding with an empty code', ev: () => evidence([{ severity: 'info', code: '', message: 'm', details: {} }]), ids: BOTH },
   { name: 'a finding with a numeric code', ev: () => evidence([{ severity: 'info', code: 5, message: 'm', details: {} }]), ids: BOTH },
   { name: 'a finding with a numeric severity', ev: () => evidence([{ severity: 1, code: 'x', message: 'm', details: {} }]), ids: BOTH },
