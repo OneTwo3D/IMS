@@ -4523,6 +4523,9 @@ export async function createSalesOrderRefund(
       : input.externalRefundId != null
         ? 'WOO_SYNC'
         : 'MANUAL_UI'
+    // Whether the accounting staging (and so the reversal journals) follows this transaction. ONE evaluation, used
+    // both to arm the refund's accounting obligation and to decide whether its return document waits to be valued.
+    const accountingStagingFollows = Boolean(so.revenueDeferredDate && input.accountingSettings)
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
         orderId: input.orderId,
@@ -4550,7 +4553,7 @@ export async function createSalesOrderRefund(
         // as a positive fact on an irreversible path. Fail closed instead: a crash leaves
         // accountingRetryRequired true, which the replay path at `existingChargeback` and
         // the unresolved-accounting guard both already know how to act on.
-        accountingRetryRequired: Boolean(so.revenueDeferredDate && input.accountingSettings),
+        accountingRetryRequired: accountingStagingFollows,
         // o3d-2sm1 (Codex r1): the OTHER half of the witness. This transaction sees the row come
         // into existence, so it can attest that as of now nothing has been staged for it — and,
         // more importantly, that this row was born under code that keeps the column at all. That
@@ -4696,7 +4699,7 @@ export async function createSalesOrderRefund(
         creditNoteNumber,
         expectedWarehouseId: restockWarehouseId,
         rows: fallbackReturnRows,
-        valued: !(so.revenueDeferredDate && input.accountingSettings),
+        valued: !accountingStagingFollows,
       })
     }
 
