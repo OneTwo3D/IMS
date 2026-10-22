@@ -1,5 +1,6 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { mkdtempSync, chmodSync, rmSync } from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
@@ -171,10 +172,11 @@ test('[reconciliation pack] pg_control_system() answers an account that is not a
   await withClient(async (admin, pg) => {
     const sup = await admin.query(`SELECT rolsuper FROM pg_roles WHERE rolname = current_user`)
     if (sup.rows[0].rolsuper !== true) return // the account running the tier is already unprivileged: the other tests prove it
-    await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER`)
+    const password = randomBytes(12).toString('hex') // random, used once, for a role dropped below
+    await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER PASSWORD '${password}'`)
     try {
       const url = new URL(process.env.DATABASE_URL!)
-      url.username = role; url.password = ''
+      url.username = role; url.password = password
       const probe = new pg.Client({ connectionString: url.toString() })
       await probe.connect()
       try {
