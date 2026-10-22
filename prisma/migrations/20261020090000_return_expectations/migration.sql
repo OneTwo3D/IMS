@@ -28,6 +28,7 @@ CREATE TABLE "return_expectations" (
     "expected_warehouse_id" TEXT,
     "transit_journal_key" TEXT,
     "transit_debit_base" DECIMAL(18,6),
+    "valued_at" TIMESTAMP(3),
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "closed_at" TIMESTAMP(3),
 

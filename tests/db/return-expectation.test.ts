@@ -4,7 +4,7 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 import { Prisma } from '../../app/generated/prisma/client'
-import { createReturnExpectationTx, ReturnExpectationError } from '../../lib/domain/sales/return-expectation'
+import { createReturnExpectationTx, settleReturnExpectationTx, ReturnExpectationError } from '../../lib/domain/sales/return-expectation'
 import { recordRefundTransitFromSync } from '../../lib/domain/sales/refund-service'
 import { sumTransitSubledgerMovement } from '../../lib/domain/accounting/transit-gl-reconciliation'
 
@@ -122,9 +122,9 @@ test('[db] createReturnExpectationTx writes the document once; a second call ret
       { productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[0], unitCostBase: '10', sourceCostLayerId: null, poLineId: null },
       { productId: fx.product.id, qty: 2, refundLineId: refund.lineIds[1], unitCostBase: '11.5', sourceCostLayerId: null, poLineId: null },
     ]
-    const first = await createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, creditNoteNumber: 'CN-1', expectedWarehouseId: fx.warehouseId, rows, transit: { journalKey: `k-${refund.id}`, debitBase: '33' } })
+    const first = await createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, creditNoteNumber: 'CN-1', expectedWarehouseId: fx.warehouseId, rows, transit: { journalKey: `k-${refund.id}`, debitBase: '33' } })
     assert.equal(first.outcome, 'created')
-    const second = await createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, creditNoteNumber: 'CN-1', expectedWarehouseId: fx.warehouseId, rows: [{ ...rows[0], qty: 5 }], transit: { journalKey: `k-${refund.id}`, debitBase: '33' } })
+    const second = await createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, creditNoteNumber: 'CN-1', expectedWarehouseId: fx.warehouseId, rows: [{ ...rows[0], qty: 5 }], transit: { journalKey: `k-${refund.id}`, debitBase: '33' } })
     assert.deepEqual(second, { outcome: 'existing', expectationId: first.expectationId })
 
     const stored = await tx.returnExpectation.findUnique({ where: { refundId: refund.id }, include: { lines: { orderBy: { qty: 'asc' } } } })
@@ -145,7 +145,7 @@ test('[db] createReturnExpectationTx writes the document once; a second call ret
 test('[db] an empty return creates no document', { skip }, async () => {
   await withRollback(async (tx) => {
     const fx = await seed(tx)
-    const result = await createReturnExpectationTx(tx, { refundId: fx.refunds[0].id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 0, refundLineId: fx.refunds[0].lineIds[0] }] })
+    const result = await createReturnExpectationTx(tx, { valued: true, refundId: fx.refunds[0].id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 0, refundLineId: fx.refunds[0].lineIds[0] }] })
     assert.deepEqual(result, { outcome: 'none', expectationId: null })
     assert.equal(await tx.returnExpectation.count(), 0)
   })
@@ -155,7 +155,7 @@ test('[db] a refund line belonging to ANOTHER refund is refused (the foreign key
   await withRollback(async (tx) => {
     const fx = await seed(tx, { refunds: 2 })
     await assert.rejects(
-      () => createReturnExpectationTx(tx, { refundId: fx.refunds[0].id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 1, refundLineId: fx.refunds[1].lineIds[0], unitCostBase: 1 }] }),
+      () => createReturnExpectationTx(tx, { valued: true, refundId: fx.refunds[0].id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 1, refundLineId: fx.refunds[1].lineIds[0], unitCostBase: 1 }] }),
       (error: unknown) => error instanceof ReturnExpectationError && error.code === 'refund_line_not_on_refund',
     )
   })
@@ -166,20 +166,20 @@ test('[db] the ledger link: a missing one is learned once, a recorded one is nev
     const fx = await seed(tx)
     const refund = fx.refunds[0]
     const rows = [{ productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[0], unitCostBase: '10' }]
-    await createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows })
+    await createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, rows })
     assert.equal((await tx.returnExpectation.findUnique({ where: { refundId: refund.id } })).transitJournalKey, null)
 
-    await createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows, transit: { journalKey: 'k-1', debitBase: '10' } })
+    await createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, rows, transit: { journalKey: 'k-1', debitBase: '10' } })
     assert.equal((await tx.returnExpectation.findUnique({ where: { refundId: refund.id } })).transitJournalKey, 'k-1', 'learned')
-    await createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows, transit: { journalKey: 'k-1', debitBase: '10.000000' } }) // same: fine
+    await createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, rows, transit: { journalKey: 'k-1', debitBase: '10.000000' } }) // same: fine
     for (const transit of [{ journalKey: 'k-2', debitBase: '10' }, { journalKey: 'k-1', debitBase: '10.000001' }]) {
       await assert.rejects(
-        () => createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows, transit }),
+        () => createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, rows, transit }),
         (error: unknown) => error instanceof ReturnExpectationError && error.code === 'transit_link_conflict',
       )
     }
     await assert.rejects(
-      () => createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows, transit: { journalKey: 'k-3', debitBase: '0' } }),
+      () => createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, rows, transit: { journalKey: 'k-3', debitBase: '0' } }),
       (error: unknown) => error instanceof ReturnExpectationError && error.code === 'transit_value_not_positive',
     )
   })
@@ -189,7 +189,7 @@ test('[db] a value that differs from the journal it should equal is recorded, in
   await withRollback(async (tx) => {
     const fx = await seed(tx)
     const refund = fx.refunds[0]
-    await createReturnExpectationTx(tx, {
+    await createReturnExpectationTx(tx, { valued: true,
       refundId: refund.id,
       orderId: fx.orderId,
       rows: [{ productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[0], unitCostBase: '10' }, { productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[1] }],
@@ -207,7 +207,7 @@ test('[db] the CHECKs hold the invariants the writers rely on', { skip }, async 
   await withRollback(async (tx) => {
     const fx = await seed(tx)
     const refund = fx.refunds[0]
-    await createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 2, refundLineId: refund.lineIds[0], unitCostBase: '5' }], transit: { journalKey: 'k-c', debitBase: '10' } })
+    await createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 2, refundLineId: refund.lineIds[0], unitCostBase: '5' }], transit: { journalKey: 'k-c', debitBase: '10' } })
     const line = await tx.returnExpectationLine.findFirst({ where: { expectation: { refundId: refund.id } } })
     const setLine = (data: Record<string, unknown>) => tx.returnExpectationLine.update({ where: { id: line.id }, data })
 
@@ -230,7 +230,7 @@ test('[db] one document per refund and one line per (refund line, product): a du
   await withRollback(async (tx) => {
     const fx = await seed(tx)
     const refund = fx.refunds[0]
-    const created = await createReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[0], unitCostBase: '1' }] })
+    const created = await createReturnExpectationTx(tx, { valued: true, refundId: refund.id, orderId: fx.orderId, rows: [{ productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[0], unitCostBase: '1' }] })
     await violates(tx, 'return_expectations_refund_id_key', () => tx.returnExpectation.create({ data: { reference: `RX-dup-${randomUUID()}`, orderId: fx.orderId, refundId: refund.id } }))
     await violates(tx, 'return_expectation_lines_refund_line_id_product_id_key', () => tx.returnExpectationLine.create({
       data: { expectationId: created.expectationId, refundLineId: refund.lineIds[0], productId: fx.product.id, sku: fx.product.sku, qty: '1', costSnapshot: [] },
@@ -254,5 +254,50 @@ test('[db] the refund records its transit sub-ledger row and the daily transit r
     // Without the row the same window reads zero: the reconciliation would FLAG a posted journal with no sub-ledger.
     await tx.transitSubledgerMovement.deleteMany({ where: { idempotencyKey: key } })
     assert.equal(await sumTransitSubledgerMovement(new Date('2099-01-01T00:00:00Z'), new Date('2099-01-02T00:00:00Z'), tx), 0)
+  })
+})
+
+test('[db] created unvalued in the refund transaction, then valued by the staging: lines re-stated, link recorded, valued_at set once', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx)
+    const refund = fx.refunds[0]
+    const wide = [
+      { productId: fx.product.id, qty: 2, refundLineId: refund.lineIds[0] },
+      { productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[1] },
+    ]
+    const made = await createReturnExpectationTx(tx, { valued: false, refundId: refund.id, orderId: fx.orderId, rows: wide })
+    assert.equal(made.outcome, 'created')
+    assert.equal((await tx.returnExpectation.findUnique({ where: { refundId: refund.id } })).valuedAt, null)
+    // The creating step repeated (a replay) changes nothing and does not value it.
+    assert.equal((await createReturnExpectationTx(tx, { valued: false, refundId: refund.id, orderId: fx.orderId, rows: wide })).outcome, 'existing')
+
+    const staged = [{ productId: fx.product.id, qty: 1, refundLineId: refund.lineIds[0], unitCostBase: '10' }]
+    const valued = await settleReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows: staged, transit: { journalKey: 'k-v', debitBase: '10' } })
+    assert.deepEqual(valued, { outcome: 'valued', expectationId: made.expectationId })
+    const stored = await tx.returnExpectation.findUnique({ where: { refundId: refund.id }, include: { lines: true } })
+    assert.ok(stored.valuedAt)
+    assert.equal(stored.transitJournalKey, 'k-v')
+    assert.deepEqual(stored.lines.map((line: { refundLineId: string; qty: Prisma.Decimal; transitValueBase: Prisma.Decimal }) => [line.refundLineId, line.qty.toFixed(6), line.transitValueBase.toFixed(6)]), [[refund.lineIds[0], '1.000000', '10.000000']])
+    // Once valued, a second settle is a no-op.
+    assert.equal((await settleReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows: [{ ...staged[0], qty: 9 }], transit: { journalKey: 'k-v', debitBase: '10' } })).outcome, 'existing')
+    assert.equal((await tx.returnExpectationLine.findMany({ where: { expectationId: made.expectationId } })).length, 1)
+  })
+})
+
+test('[db] settling an unvalued document that has accounted quantity is refused, and settle creates a missing document', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx)
+    const refund = fx.refunds[0]
+    const rows = [{ productId: fx.product.id, qty: 2, refundLineId: refund.lineIds[0], unitCostBase: '5' }]
+    await createReturnExpectationTx(tx, { valued: false, refundId: refund.id, orderId: fx.orderId, rows })
+    await tx.returnExpectationLine.updateMany({ where: { expectation: { refundId: refund.id } }, data: { qtyReceived: '1' } })
+    await assert.rejects(
+      () => settleReturnExpectationTx(tx, { refundId: refund.id, orderId: fx.orderId, rows }),
+      (error: unknown) => error instanceof ReturnExpectationError && error.code === 'unvalued_document_has_accounted_quantity',
+    )
+    const other = await seed(tx)
+    const created = await settleReturnExpectationTx(tx, { refundId: other.refunds[0].id, orderId: other.orderId, rows: [{ productId: other.product.id, qty: 1, refundLineId: other.refunds[0].lineIds[0], unitCostBase: '3' }] })
+    assert.equal(created.outcome, 'created')
+    assert.ok((await tx.returnExpectation.findUnique({ where: { refundId: other.refunds[0].id } })).valuedAt)
   })
 })

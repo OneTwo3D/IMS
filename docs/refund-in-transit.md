@@ -27,7 +27,7 @@ A refund is in transit only if it returns stock (it has a return warehouse) and 
 | Available to sell, allocate, push to the storefront | yes, at refund time | no: the post-commit allocator and storefront stock push receive an empty list |
 | COGS reversal journal | DR Inventory / CR COGS | DR **Stock in Transit** / CR COGS, same amount, date and idempotency key |
 | Transit sub-ledger | no row | `+` the 6dp reversal base, source `CUSTOMER_RETURN_IN_TRANSIT`, same key as the journal |
-| Document | none | one `return_expectations` row per refund, one `return_expectation_lines` row per (refund line, product) carrying the dispatch-cost snapshot |
+| Document | none | one `return_expectations` row per refund, one `return_expectation_lines` row per (refund line, product) carrying the dispatch-cost snapshot; written in the refund's own transaction (see "Nothing committed without its companion") |
 | Account missing | n/a | no Stock in Transit account configured: staging fails closed, the refund stays on the accounting retry list, **no Inventory fallback** |
 
 The value on the document is the refund's own dispatch-cost snapshot (the originally posted COGS), summed unrounded and
@@ -37,6 +37,24 @@ difference is recorded as the activity `return_expectation_value_mismatch` (coun
 The transit sub-ledger row is written in the same transaction that queues the journal, on the queue's own answer, and
 **not** when the producer seam recorded the journal as a shadow: a shadow posts nothing, so a sub-ledger row for it
 would be a movement the general ledger never makes and the daily transit reconciliation would flag it for ever.
+
+## Nothing committed without its companion
+
+A refund that routes its goods in transit must never commit without the records that make the goods traceable. Every
+step of the refund flow that writes a companion record was audited for a committed-but-companion-missing state:
+
+| Step | Companion record | Same commit as | If the step fails or the process dies between steps |
+|---|---|---|---|
+| Refund created | mode flag `return_in_transit` | the refund INSERT (one statement) | cannot be missing: it is a column of the row |
+| Refund created | the return expectation document (unvalued, from the refund's quantities) | the refund transaction, under the order lock | a failed document write rolls the WHOLE refund back (tested); a replayed webhook finds the committed refund and its document |
+| Accounting staging | the document's cost snapshot, `valued_at` and ledger link (journal key and amount) | the staging transaction that persists the staged syncs and the refund's staging witness | a failure while valuing rolls the staging back with it; the refund stays owing its accounting (`accounting_retry_required` is armed at the refund INSERT, whenever staging will follow) and the retry values the document |
+| Accounting retry (initial, persisted-sync replay, re-stage) | same as staging | the retry's staging transaction | a retry that finds persisted syncs is only reached after a staging commit, which already valued the document; a retry that re-stages values it; a refund written by an earlier build with no document gets one from the retry |
+| Journal queued | transit sub-ledger row | the transaction that queues the COGS reversal, on the queue's own answer | a crash after the staging commit and before the queue leaves the obligation armed; the queue and the row are one commit, so the row exists exactly when a non-shadow journal is queued |
+| No staging to follow (accounting off) | none to wait for | the document is valued in the refund transaction | n/a |
+
+An unvalued document is not usable: nothing may receive against or write off a document with `valued_at` null (slice 2
+must enforce it, and the settle step refuses a document that already carries an accounted quantity). Replacing the
+document's lines is allowed only while unvalued, and a valued document is never rewritten (first write wins).
 
 ## Accounting accepted by the owner
 

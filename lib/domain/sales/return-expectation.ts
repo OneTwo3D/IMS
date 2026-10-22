@@ -43,7 +43,8 @@ export class ReturnExpectationError extends Error {
   constructor(readonly code:
     | 'refund_line_not_on_refund'
     | 'transit_link_conflict'
-    | 'transit_value_not_positive') {
+    | 'transit_value_not_positive'
+    | 'unvalued_document_has_accounted_quantity') {
     super(`return_expectation:${code}`)
     this.name = 'ReturnExpectationError'
   }
@@ -57,29 +58,60 @@ export type ReturnExpectationTransitLink = {
 }
 
 export type CreateReturnExpectationResult = {
-  /** 'none' when the rows named no returnable quantity: no document is created for an empty return. */
-  outcome: 'created' | 'existing' | 'none'
+  /**
+   * 'created'  a new document was written.
+   * 'valued'   an unvalued document was settled (lines re-stated from the staged rows, link recorded).
+   * 'existing' a settled document was already there; only its ledger link may be learned.
+   * 'none'     the rows named no returnable quantity: no document is created for an empty return.
+   */
+  outcome: 'created' | 'valued' | 'existing' | 'none'
   expectationId: string | null
 }
 
+type ExpectationParams = {
+  refundId: string
+  orderId: string
+  creditNoteNumber?: string | null
+  expectedWarehouseId?: string | null
+  rows: readonly ReturnExpectationRowInput[]
+  transit?: ReturnExpectationTransitLink | null
+}
+
 /**
- * Create the expectation for a refund, once. Safe to call again for the same refund (the initial attempt, an
- * accounting retry, a replay): the document is keyed on the refund, the first write wins, and a second call
- * returns the existing one without touching its lines.
+ * Write the refund's return expectation, once. Called in TWO places, both inside a transaction that also commits the
+ * thing the document depends on, so there is no committed state with one and not the other:
  *
- * A per-refund transaction lock serialises two concurrent callers, so the check for an existing document and the
- * insert cannot interleave; the unique keys behind it are what make a missed lock a loud error and not a duplicate.
+ *  1. `valued: false|true` from the refund's OWN transaction (under the order lock), from the refund's quantities. A
+ *     refund that routes its goods in transit therefore cannot commit without its document. `valued: true` when no
+ *     accounting staging will follow (nothing will ever price it); `valued: false` when staging follows, whose
+ *     transaction then calls `settleReturnExpectationTx`.
+ *  2. `settleReturnExpectationTx`, from the staging transaction (and every accounting retry), which values the
+ *     document with the staged cost snapshot and records the journal that debited Stock in Transit for it, in the
+ *     SAME commit that persists the staged syncs.
+ *
+ * Safe to call again for the same refund (first attempt, retry, replay): the document is keyed on the refund. A
+ * per-refund transaction lock serialises two callers; the unique keys behind it make a missed lock a loud error and
+ * not a duplicate.
  */
 export async function createReturnExpectationTx(
   tx: Prisma.TransactionClient,
-  params: {
-    refundId: string
-    orderId: string
-    creditNoteNumber?: string | null
-    expectedWarehouseId?: string | null
-    rows: readonly ReturnExpectationRowInput[]
-    transit?: ReturnExpectationTransitLink | null
-  },
+  params: ExpectationParams & { valued: boolean },
+): Promise<CreateReturnExpectationResult> {
+  return writeExpectation(tx, params, params.valued)
+}
+
+/** Value the document (creating it if the refund transaction wrote none) from the staged rows and the staged journal. */
+export async function settleReturnExpectationTx(
+  tx: Prisma.TransactionClient,
+  params: ExpectationParams,
+): Promise<CreateReturnExpectationResult> {
+  return writeExpectation(tx, params, true)
+}
+
+async function writeExpectation(
+  tx: Prisma.TransactionClient,
+  params: ExpectationParams,
+  valued: boolean,
 ): Promise<CreateReturnExpectationResult> {
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`return_expectation:${params.refundId}`}))`
 
@@ -90,9 +122,17 @@ export async function createReturnExpectationTx(
 
   const existing = await tx.returnExpectation.findUnique({
     where: { refundId: params.refundId },
-    select: { id: true, transitJournalKey: true, transitDebitBase: true },
+    select: {
+      id: true,
+      valuedAt: true,
+      transitJournalKey: true,
+      transitDebitBase: true,
+      lines: { select: { id: true, refundLineId: true, productId: true, qtyReceived: true, qtyWrittenOff: true } },
+    },
   })
-  if (existing) {
+  // A settled document keeps its lines (first write wins). An unvalued one is only ever written by the refund
+  // transaction that created it and the staging that values it, so a repeat of the creating step is a no-op too.
+  if (existing && (existing.valuedAt != null || !valued)) {
     await reconcileTransitLink(tx, existing, params.transit ?? null, transitDebit)
     return { outcome: 'existing', expectationId: existing.id }
   }
@@ -102,42 +142,81 @@ export async function createReturnExpectationTx(
     ? []
     : await tx.product.findMany({ where: { id: { in: productIds } }, select: { id: true, sku: true } })
   const plan = planReturnExpectationLines(params.rows, new Map(products.map((product) => [product.id, product.sku])))
-  if (plan.lines.length === 0) return { outcome: 'none', expectationId: null }
+  if (plan.lines.length === 0 && !existing) return { outcome: 'none', expectationId: null }
 
   // Every line must belong to THIS refund. The foreign key only proves the refund line exists somewhere.
   const refundLineIds = [...new Set(plan.lines.map((line) => line.refundLineId))]
-  const ownLines = await tx.salesOrderRefundLine.findMany({
-    where: { refundId: params.refundId, id: { in: refundLineIds } },
-    select: { id: true },
-  })
-  if (ownLines.length !== refundLineIds.length) throw new ReturnExpectationError('refund_line_not_on_refund')
+  if (refundLineIds.length > 0) {
+    const ownLines = await tx.salesOrderRefundLine.findMany({
+      where: { refundId: params.refundId, id: { in: refundLineIds } },
+      select: { id: true },
+    })
+    if (ownLines.length !== refundLineIds.length) throw new ReturnExpectationError('refund_line_not_on_refund')
+  }
 
-  const created = await tx.returnExpectation.create({
-    data: {
-      reference: `${RETURN_EXPECTATION_REFERENCE_PREFIX}${params.creditNoteNumber ?? params.refundId}`,
-      orderId: params.orderId,
-      refundId: params.refundId,
-      expectedWarehouseId: params.expectedWarehouseId ?? null,
-      transitJournalKey: params.transit?.journalKey ?? null,
-      transitDebitBase: transitDebit ? transitDebit.toFixed(6) : null,
-      lines: {
-        create: plan.lines.map((line) => ({
-          refundLineId: line.refundLineId,
-          productId: line.productId,
-          sku: line.sku,
-          qty: line.qty.toFixed(6),
-          costSnapshot: line.costSnapshot as unknown as Prisma.InputJsonValue,
-          transitValueBase: line.transitValueBase.toFixed(6),
-        })),
-      },
-    },
-    select: { id: true },
+  const lineData = (line: (typeof plan.lines)[number]) => ({
+    qty: line.qty.toFixed(6),
+    costSnapshot: line.costSnapshot as unknown as Prisma.InputJsonValue,
+    transitValueBase: line.transitValueBase.toFixed(6),
   })
+  const link = {
+    transitJournalKey: params.transit?.journalKey ?? null,
+    transitDebitBase: transitDebit ? transitDebit.toFixed(6) : null,
+  }
+
+  let expectationId: string
+  let outcome: 'created' | 'valued'
+  if (!existing) {
+    const created = await tx.returnExpectation.create({
+      data: {
+        reference: `${RETURN_EXPECTATION_REFERENCE_PREFIX}${params.creditNoteNumber ?? params.refundId}`,
+        orderId: params.orderId,
+        refundId: params.refundId,
+        expectedWarehouseId: params.expectedWarehouseId ?? null,
+        ...link,
+        valuedAt: valued ? new Date() : null,
+        lines: {
+          create: plan.lines.map((line) => ({
+            refundLineId: line.refundLineId,
+            productId: line.productId,
+            sku: line.sku,
+            ...lineData(line),
+          })),
+        },
+      },
+      select: { id: true },
+    })
+    expectationId = created.id
+    outcome = 'created'
+  } else {
+    // Valuing an unvalued document. Nothing can have been received or written off against it (both refuse an
+    // unvalued document), so its lines may be re-stated to the staged rows; a line carrying any accounted quantity
+    // is a corrupt state and is refused rather than rewritten.
+    if (existing.lines.some((line) => compareDecimal(line.qtyReceived, 0) !== 0 || compareDecimal(line.qtyWrittenOff, 0) !== 0)) {
+      throw new ReturnExpectationError('unvalued_document_has_accounted_quantity')
+    }
+    const planKey = (line: { refundLineId: string; productId: string }) => `${line.refundLineId}\u0000${line.productId}`
+    const have = new Map(existing.lines.map((line) => [planKey(line), line.id]))
+    const wanted = new Set(plan.lines.map(planKey))
+    for (const line of plan.lines) {
+      const id = have.get(planKey(line))
+      if (id) await tx.returnExpectationLine.update({ where: { id }, data: lineData(line) })
+      else await tx.returnExpectationLine.create({ data: { expectationId: existing.id, refundLineId: line.refundLineId, productId: line.productId, sku: line.sku, ...lineData(line) } })
+    }
+    // Staging is authoritative where it has rows; with none, the refund transaction's lines stand.
+    if (plan.lines.length > 0) {
+      const stale = existing.lines.filter((line) => !wanted.has(planKey(line))).map((line) => line.id)
+      if (stale.length > 0) await tx.returnExpectationLine.deleteMany({ where: { id: { in: stale } } })
+    }
+    await tx.returnExpectation.update({ where: { id: existing.id }, data: { ...link, valuedAt: new Date() } })
+    expectationId = existing.id
+    outcome = 'valued'
+  }
 
   // The document's value and the journal's debit must be the same number. They are computed from the same rows, so
   // a difference means a row was dropped between the two; it is recorded for an operator, never silently absorbed.
   // Closed code and counts only: no amounts, ids or SKUs in the text.
-  if (transitDebit && compareDecimal(plan.totalValueBase, transitDebit) !== 0) {
+  if (valued && transitDebit && compareDecimal(plan.totalValueBase, transitDebit) !== 0) {
     await tx.activityLog.create({
       data: {
         entityType: 'SALES_ORDER',
@@ -150,7 +229,7 @@ export async function createReturnExpectationTx(
       },
     })
   }
-  return { outcome: 'created', expectationId: created.id }
+  return { outcome, expectationId }
 }
 
 /**

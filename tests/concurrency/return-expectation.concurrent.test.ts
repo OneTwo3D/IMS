@@ -173,7 +173,7 @@ test(
         select: { id: true, lines: { select: { id: true } } },
       })
       const rows = [{ productId: seeded.productId, qty: 1, refundLineId: refund.lines[0].id, unitCostBase: '10' }]
-      const params = { refundId: refund.id, orderId: seeded.orderId, creditNoteNumber: `RXC-${suffix}`, rows }
+      const params = { valued: true, refundId: refund.id, orderId: seeded.orderId, creditNoteNumber: `RXC-${suffix}`, rows }
 
       let release!: () => void
       const released = new Promise<void>((resolve) => { release = resolve })
@@ -232,6 +232,7 @@ test(
       assert.equal(seen.expectations[0].refundId, seen.refunds[0].id)
       assert.equal(seen.expectations[0].lines.length, 1)
       assert.equal(seen.expectations[0].lines[0].qty.toFixed(6), '1.000000')
+      assert.ok(seen.expectations[0].valuedAt, 'no accounting staging to follow, so it was valued in the refund transaction')
       assert.equal(seen.movements, 0, 'no RETURN_INBOUND movement')
       assert.equal(seen.levels, 0, 'no stock level in the returns warehouse')
       assert.equal(seen.layers, 0, 'no cost layer')

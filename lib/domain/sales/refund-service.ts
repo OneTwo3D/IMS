@@ -54,6 +54,7 @@ import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-
 import {
   createReturnExpectationTx,
   readReturnsInTransitEnabled,
+  settleReturnExpectationTx,
   type ReturnExpectationTransitLink,
 } from '@/lib/domain/sales/return-expectation'
 import {
@@ -4682,6 +4683,23 @@ export async function createSalesOrderRefund(
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
       : []
 
+    // Returned units in transit: the DOCUMENT is written here, in the refund's own transaction, so a refund that
+    // routes its goods in transit can never commit without it (a crash, a failed write or a replay cannot leave
+    // returned goods with no expectation). It is built from the refund's quantities; when accounting staging
+    // follows (the same condition that arms `accountingRetryRequired` above), it is left unvalued and the staging
+    // transaction values it in the same commit that persists the staged syncs. With no staging to come it is
+    // valued now, there being nothing later to price it.
+    if (returnInTransit) {
+      await createReturnExpectationTx(tx, {
+        refundId: createdRefund.id,
+        orderId: input.orderId,
+        creditNoteNumber,
+        expectedWarehouseId: restockWarehouseId,
+        rows: fallbackReturnRows,
+        valued: !(so.revenueDeferredDate && input.accountingSettings),
+      })
+    }
+
     // o3d-67y: eligibility is derived from RESIDUAL reserved quantity under this order lock, not lifecycle
     // status and not raw allocation-row count. Dispatch decrements stockLevel.reservedQty but RETAINS the
     // OrderAllocation rows for accounting snapshots (Codex review r5), so a fully-dispatched order still has
@@ -4829,6 +4847,20 @@ export async function createSalesOrderRefund(
           chargeback: input.chargeback,
           activeConnector: input.activeAccountingConnector,
         })
+        // In transit: value the refund's document from the staged snapshot and record the journal that debited
+        // Stock in Transit for it, in THIS commit (the one that persists the staged syncs below). If either
+        // fails, both roll back and the refund stays owing its accounting.
+        if (txResult.returnInTransit) {
+          const stagedRows = result.snapshotReturnRows ?? []
+          await settleReturnExpectationTx(tx, {
+            refundId: txResult.createdRefund.id,
+            orderId: input.orderId,
+            creditNoteNumber: txResult.creditNoteNumber,
+            expectedWarehouseId: txResult.restockWarehouseId,
+            rows: stagedRows.length > 0 ? stagedRows : txResult.fallbackReturnRows,
+            transit: returnExpectationTransitLinkFromSyncs(result.accountingSyncs),
+          })
+        }
         await tx.salesOrderRefund.update({
           where: { id: txResult.createdRefund.id },
           data: {
@@ -4935,36 +4967,21 @@ export async function createSalesOrderRefund(
   let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
   // scjz.70: effectiveReturnWarehouseId is undefined for a chargeback, so the
   // inbound return movement is skipped (the customer keeps the goods).
-  if (txResult.restockWarehouseId && !accountingWarning) {
+  if (txResult.restockWarehouseId && !accountingWarning && !txResult.returnInTransit) {
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
       : txResult.fallbackReturnRows
 
-    if (txResult.returnInTransit) {
-      // In transit: a document, not stock. No movement, stock level or cost layer is written, so there is nothing
-      // to allocate or push and `returnedRows` stays empty by construction.
-      await runInTransaction(client, (tx) => (
-        createReturnExpectationTx(tx, {
-          refundId: txResult.createdRefund.id,
-          orderId: input.orderId,
-          creditNoteNumber: txResult.creditNoteNumber,
-          expectedWarehouseId: txResult.restockWarehouseId,
-          rows: returnRows,
-          transit: returnExpectationTransitLinkFromSyncs(accountingSyncs),
-        })
-      ))
-    } else {
-      returnedRows = await runInTransaction(client, (tx) => (
-        applyReturnInboundStockTx(tx, {
-          referenceType: 'SalesOrderRefund',
-          referenceId: txResult.createdRefund.id,
-          warehouseId: txResult.restockWarehouseId!,
-          rows: returnRows,
-          note: 'Refund return',
-        })
-      ))
-    }
+    returnedRows = await runInTransaction(client, (tx) => (
+      applyReturnInboundStockTx(tx, {
+        referenceType: 'SalesOrderRefund',
+        referenceId: txResult.createdRefund.id,
+        warehouseId: txResult.restockWarehouseId!,
+        rows: returnRows,
+        note: 'Refund return',
+      })
+    ))
   }
 
   return {
@@ -5489,8 +5506,10 @@ export async function retrySalesOrderRefundAccounting(
             skipUnshipped: refund.externalRefundId != null,
           })
         if (refund.returnInTransit) {
-          // Idempotent on the refund: a retry never creates a second document (and never restocks).
-          await createReturnExpectationTx(tx, {
+          // Value (or, for a refund this build created before the document moved into the refund transaction,
+          // create) the document in THIS transaction, which also persists the re-staged syncs below. Idempotent
+          // on the refund: a retry never creates a second document and never restocks.
+          await settleReturnExpectationTx(tx, {
             refundId: refund.id,
             orderId: refund.orderId,
             creditNoteNumber: refund.creditNoteNumber,

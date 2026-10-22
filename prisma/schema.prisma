@@ -2219,6 +2219,11 @@ model ReturnExpectation {
   transitJournalKey   String?                 @map("transit_journal_key")
   /// What that journal debited, at 6dp, or null with the key.
   transitDebitBase    Decimal?                @map("transit_debit_base") @db.Decimal(18, 6)
+  /// When the document's cost snapshot and ledger link were settled. NULL while the refund's accounting staging is
+  /// still to run: the document is created in the refund's OWN transaction (so a refund never commits without it)
+  /// from the refund's quantities, and the staging transaction then values it. Nothing may receive against or
+  /// write off an unvalued document.
+  valuedAt            DateTime?               @map("valued_at")
   createdAt           DateTime                @default(now()) @map("created_at")
   closedAt            DateTime?               @map("closed_at")
 
