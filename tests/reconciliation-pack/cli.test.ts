@@ -161,7 +161,7 @@ test('P0 with a clean report: R3, R4 and R15 pass, exit 0, one report published 
   const dir = scratchDir(bases)
   const connects: unknown[] = []
   const original = net.Socket.prototype.connect
-  net.Socket.prototype.connect = function (...args: unknown[]) { connects.push(args); return (original as (...a: unknown[]) => unknown).apply(this, args) } as typeof original
+  net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) { connects.push(args); return (original as (...a: unknown[]) => unknown).apply(this, args) } as typeof original
   const r = rig()
   let code: number
   try { code = await run(r, base(dir)) } finally { net.Socket.prototype.connect = original }

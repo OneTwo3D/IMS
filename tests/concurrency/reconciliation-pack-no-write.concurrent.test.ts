@@ -61,7 +61,7 @@ test('[reconciliation pack] a whole run of the command writes nothing and connec
   const url = new URL(process.env.DATABASE_URL!)
   const targets: string[] = []
   const original = net.Socket.prototype.connect
-  net.Socket.prototype.connect = function (...args: unknown[]) {
+  net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
     // net.Socket.connect is called with (options), ([options]) or (port, host).
     const raw = args[0] as unknown
     const first = (Array.isArray(raw) ? raw[0] : raw) as { host?: string; port?: number; path?: string } | number | string
