@@ -102,6 +102,12 @@ test('fail, inconclusive and not-applicable have invariants of their own', () =>
   rejects(put(base(), R('fail', ['NO_RUNNER', 'DIFFERENCES'])))
   rejects(put(base(), R('inconclusive', ['NO_RUNNER'], { entries: { excluded: [solo('A|MAIN')] } })))
   accepts(put(base(), R('inconclusive', ['NO_RUNNER'])))
+  // NOT_SELECTED is the same, and carries no other reason
+  accepts(put(base(), R('inconclusive', ['NOT_SELECTED'])))
+  rejects(put(base(), R('inconclusive', ['NOT_SELECTED', 'STALE_BASIS'])))
+  rejects(put(base(), R('inconclusive', ['NOT_SELECTED'], { entries: { excluded: [solo('A|MAIN')] } })))
+  rejects(put(base(), R('fail', ['NOT_SELECTED', 'DIFFERENCES'])))
+  rejects(put(base(), R('pass', ['NOT_SELECTED'])))
   // PHASE_NOT_APPLICABLE belongs to not-applicable alone, and not-applicable reads and lists nothing
   rejects(put(base(), R('inconclusive', ['PHASE_NOT_APPLICABLE'])))
   rejects(put(base('P1'), { id: 'R7', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'], sources: ['qoblex-file'] }))

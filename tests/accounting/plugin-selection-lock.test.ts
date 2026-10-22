@@ -1120,6 +1120,9 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // identity reads are read-only. Its only writes go through Prisma: `boms.active` for one id and one
   // `activity_logs` row. It cannot touch `settings`, so it cannot move a plugin key.
   'lib/products/bom-recipe-repair.ts': 'runtime-assembled-sql',
+  // The reconciliation pack's one-snapshot client: a REPEATABLE READ transaction set READ ONLY, bound as the application's db for
+  // the invariant run only (operator command `npm run reconcile:pack`); the server refuses any write through it.
+  'lib/reconciliation-pack/invariant-snapshot.ts': 'operator-run-read',
   // Reconciliation pack basis. `withReadOnlySnapshot` issues `SET TRANSACTION READ ONLY`, `SET LOCAL statement_timeout =
   // <whole number>` and one constant SELECT of three `current_setting` values on the transaction client it opens itself
   // from the app's pooled client. It is READ ONLY by construction (the mode is read back, and nothing runs if it did
@@ -1323,6 +1326,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/invariant-check-preflight-fixture.ts': 'operator-run-write',
   'scripts/provision-instance.mjs': 'operator-run-write',
   'scripts/provision-xero-demo.ts': 'operator-run-write',
+  'scripts/reconciliation-pack.ts': 'operator-run-read',
   'scripts/remove-xero-live-e2e-footprint.ts': 'operator-run-read',
   'scripts/repro-scjz68.ts': 'operator-run-write',
   'scripts/restore-stage-connectors.ts': 'operator-run-write',

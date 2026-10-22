@@ -52,3 +52,25 @@ export function mode(file: string): number {
   return statSync(file).mode & 0o777
 }
 export { PACK_ITEM_IDS }
+
+type Finding = Record<string, unknown>
+/** An invariant result in the REAL shape (every count consistent), carrying the given inventory findings. */
+export function realEvidence(inventoryFindings: Finding[] = []): Record<string, unknown> {
+  const n = (severity: string) => inventoryFindings.filter((f) => f.severity === severity).length
+  const counts = { total: inventoryFindings.length, info: n('info'), warning: n('warning'), critical: n('critical') }
+  const empty = { total: 0, info: 0, warning: 0, critical: 0 }
+  const plain = { findings: [], summary: empty }
+  return {
+    ok: counts.critical === 0,
+    failure: counts.critical === 0 ? null : 'critical_findings',
+    // The proof lib/reconciliation-pack/invariant-snapshot.ts attaches when the run read one REPEATABLE READ READ ONLY snapshot.
+    snapshot: { isolation: 'repeatable read', readOnly: true, snapshot: '812:812:', boundToApplicationClient: true },
+    result: {
+      status: 'completed', errors: [],
+      // As lib/cron/invariant-check.ts toCriticalFinding builds them (JSON drops the undefined ids).
+      criticalFindings: inventoryFindings.filter((f) => f.severity === 'critical').map((f) => JSON.parse(JSON.stringify({ domain: 'inventory', code: f.code, message: f.message, details: f.details, productId: f.productId, warehouseId: f.warehouseId, orderId: f.orderId, shipmentId: f.shipmentId, refundId: f.refundId, syncLogId: f.syncLogId }))),
+      summary: { total: counts, inventory: counts, accounting: empty, sales: empty },
+      reports: { inventory: { findings: inventoryFindings, truncated: false, nextCursor: null, summary: counts }, accounting: plain, sales: plain },
+    },
+  }
+}

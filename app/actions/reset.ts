@@ -82,6 +82,9 @@ async function clearTransactionScope() {
   await db.shipmentLine.deleteMany({})
   await db.shipment.deleteMany({})
   await db.orderAllocation.deleteMany({})
+  // Return expectations reference the refund and its lines (restrict), so they go first.
+  await db.returnExpectationLine.deleteMany({})
+  await db.returnExpectation.deleteMany({})
   await db.salesOrderRefundLine.deleteMany({})
   await db.salesOrderRefund.deleteMany({})
   await db.salesOrderLine.deleteMany({})

@@ -10,6 +10,8 @@ import {
   createSalesOrderRefund,
   postedShipmentUnitCostKey,
   recordRefundCogsReversalFromSync,
+  recordRefundTransitFromSync,
+  returnExpectationTransitLinkFromSyncs,
   resolveRefundCogsReversalBase,
   retrySalesOrderRefundAccounting,
   type RefundAccountingSyncRequest,
@@ -174,6 +176,7 @@ type Refund = {
   totalForeign: number
   totalBase: number
   returnWarehouseId: string | null
+  returnInTransit?: boolean
   chargeback?: boolean
   reversalStaged?: boolean
   accountingRetryRequired?: boolean
@@ -265,6 +268,20 @@ type State = {
   }>
   activityLogs: unknown[]
   cogsSubledgerMovements: unknown[]
+  /** Return expectations (goods in transit) the refund service created. Absent until one is. */
+  returnExpectations?: Array<{
+    id: string
+    refundId: string
+    orderId: string
+    reference: string
+    expectedWarehouseId: string | null
+    transitJournalKey: string | null
+    transitDebitBase: string | null
+    valuedAt: Date | null
+    lines: Array<{ id: string; refundLineId: string; productId: string; sku: string; qty: string; qtyReceived: string; qtyWrittenOff: string; costSnapshot: unknown; transitValueBase: string }>
+  }>
+  /** Fault injection: make the named return-expectation write throw. */
+  failExpectationWrite?: 'create' | 'settle-line'
   // o3d-o97 r2: the reversal journals ALREADY POSTED (or queued) against this order and its prior
   // refunds. This used to be a hardcoded `[]` in the client below — which asserted "no reversal has
   // ever posted" as a fixture invariant, so no test could observe a posted reversal being READ, and
@@ -680,9 +697,15 @@ function createClient(state: State): RefundServiceClient {
       },
     },
     salesOrderRefundLine: {
-      findMany: async ({ where }: { where: { refund: { orderId: string } } }) => {
+      findMany: async ({ where }: { where: { refund?: { orderId: string }; refundId?: string; id?: { in: string[] } } }) => {
+        // return_expectation: the lines of ONE refund, by id.
+        if (where.refundId !== undefined) {
+          return state.refundLines
+            .filter((line) => line.refundId === where.refundId && (where.id?.in.includes(line.id) ?? true))
+            .map((line) => ({ id: line.id }))
+        }
         const refundIds = state.refunds
-          .filter((refund) => refund.orderId === where.refund.orderId)
+          .filter((refund) => refund.orderId === where.refund!.orderId)
           .map((refund) => refund.id)
         return state.refundLines
           .filter((line) => refundIds.includes(line.refundId))
@@ -765,6 +788,53 @@ function createClient(state: State): RefundServiceClient {
     activityLog: {
       create: async ({ data }: { data: unknown }) => {
         state.activityLogs.push(data)
+      },
+    },
+    returnExpectation: {
+      findUnique: async ({ where }: { where: { refundId: string } }) => (
+        (state.returnExpectations ?? []).find((row) => row.refundId === where.refundId) ?? null
+      ),
+      create: async ({ data }: { data: { reference: string; orderId: string; refundId: string; expectedWarehouseId: string | null; transitJournalKey: string | null; transitDebitBase: string | null; valuedAt: Date | null; lines: { create: Array<{ refundLineId: string; productId: string; sku: string; qty: string; costSnapshot: unknown; transitValueBase: string }> } } }) => {
+        if (state.failExpectationWrite === 'create') throw new Error('injected: expectation write failed')
+        const rows = state.returnExpectations ?? (state.returnExpectations = [])
+        if (rows.some((row) => row.refundId === data.refundId || row.reference === data.reference)) throw new Error('unique violation')
+        const { lines, ...header } = data
+        const row = { id: `rx-${rows.length + 1}`, ...header, lines: lines.create.map((line, index) => ({ id: `rxl-${rows.length + 1}-${index + 1}`, qtyReceived: '0', qtyWrittenOff: '0', ...line })) }
+        rows.push(row)
+        return { id: row.id }
+      },
+      update: async ({ where, data }: { where: { id: string }; data: Partial<NonNullable<State['returnExpectations']>[number]> }) => {
+        const row = (state.returnExpectations ?? []).find((entry) => entry.id === where.id)
+        if (!row) throw new Error('not found')
+        Object.assign(row, data)
+        return row
+      },
+      updateMany: async ({ where, data }: { where: { id: string; transitJournalKey: null }; data: { transitJournalKey: string; transitDebitBase: string } }) => {
+        const row = (state.returnExpectations ?? []).find((entry) => entry.id === where.id && entry.transitJournalKey === where.transitJournalKey)
+        if (!row) return { count: 0 }
+        row.transitJournalKey = data.transitJournalKey
+        row.transitDebitBase = data.transitDebitBase
+        return { count: 1 }
+      },
+    },
+    returnExpectationLine: {
+      update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+        if (state.failExpectationWrite === 'settle-line') throw new Error('injected: expectation line write failed')
+        const line = (state.returnExpectations ?? []).flatMap((row) => row.lines).find((entry) => entry.id === where.id)
+        if (!line) throw new Error('not found')
+        Object.assign(line, data)
+        return line
+      },
+      create: async ({ data }: { data: { expectationId: string; refundLineId: string; productId: string; sku: string; qty: string; costSnapshot: unknown; transitValueBase: string } }) => {
+        const row = (state.returnExpectations ?? []).find((entry) => entry.id === data.expectationId)
+        if (!row) throw new Error('not found')
+        const { expectationId: _ignored, ...rest } = data
+        row.lines.push({ id: `rxl-new-${row.lines.length + 1}`, qtyReceived: '0', qtyWrittenOff: '0', ...rest })
+        return {}
+      },
+      deleteMany: async ({ where }: { where: { id: { in: string[] } } }) => {
+        for (const row of state.returnExpectations ?? []) row.lines = row.lines.filter((line) => !where.id.in.includes(line.id))
+        return { count: where.id.in.length }
       },
     },
     costLayer: {
@@ -9608,4 +9678,471 @@ test('[shadow] a prior refund whose reversal journal was a SHADOW is not counted
     assert.equal(control.credit, 30, 'CONTROL: counted from its own record, as before')
     assert.match(control.note, /counted from its own record because its reversal journal is no longer on record \(retention\)/)
   }
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// Refund in transit (slice 1): a refund of shipped goods that have not come back is a DOCUMENT, not stock.
+//
+// What these pin, each with a mutation that turns it red (see the table in help-docs/refund-in-transit.md):
+//   * OFF (the default) is the legacy behaviour byte for byte: restock at refund, COGS reversal debits Inventory.
+//   * ON creates one expectation per refund and NO movement / stock level / cost layer, and the COGS reversal debits
+//     Stock in Transit with a marker that drives the matching transit sub-ledger row.
+//   * The mode is decided once and read back from the refund, never from the live setting.
+// ---------------------------------------------------------------------------------------------------------------
+const IN_TRANSIT_SETTING = 'refund_returns_in_transit_enabled'
+const transitSettings: AccountingSettings = { ...accountingSettings, transitAccount: '1250' }
+
+function shippedStateForTransit(overrides: Partial<State> = {}): State {
+  return baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+    ...overrides,
+  })
+}
+
+async function refundOneUnit(state: State, settings: AccountingSettings = transitSettings) {
+  return createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings: settings,
+  })
+}
+
+function cogsReversalLines(result: Awaited<ReturnType<typeof createSalesOrderRefund>>) {
+  const sync = findCogsReversalSync(result)
+  const payload = sync.payload as { _returnInTransit?: boolean; lines: Array<{ accountCode: string; debit?: number; credit?: number }> }
+  return { payload, debit: payload.lines.find((line) => line.debit != null), credit: payload.lines.find((line) => line.credit != null) }
+}
+
+test('[in transit] OFF is the legacy path: restocked at refund, COGS reversal debits Inventory, no document', async () => {
+  const state = shippedStateForTransit()
+  const result = await refundOneUnit(state)
+  assert.equal(result.success, true)
+  assert.equal(state.refunds[0].returnInTransit, false, 'the refund records that it was NOT routed in transit')
+  assert.equal(state.movements.length, 1, 'restocked at refund time')
+  assert.equal(state.stockLevels[0].quantity, 1)
+  assert.equal(result.success && result.returnedRows.length, 1)
+  const { payload, debit } = cogsReversalLines(result)
+  assert.equal(debit?.accountCode, '1200', 'Inventory')
+  assert.equal(payload._returnInTransit, undefined, 'no marker on a legacy payload')
+  assert.equal(state.returnExpectations, undefined)
+})
+
+for (const value of ['True', 'TRUE', '1', 'yes', '', ' true']) {
+  test(`[in transit] the switch reads exactly 'true': ${JSON.stringify(value)} is OFF`, async () => {
+    const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: value } })
+    const result = await refundOneUnit(state)
+    assert.equal(result.success, true)
+    assert.equal(state.refunds[0].returnInTransit, false)
+    assert.equal(state.movements.length, 1)
+    assert.equal(state.returnExpectations, undefined)
+  })
+}
+
+test('[in transit] ON: one document, NO movement / stock level / cost layer, COGS reversal debits Stock in Transit', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const result = await refundOneUnit(state)
+  assert.equal(result.success, true)
+  assert.equal(state.refunds[0].returnInTransit, true)
+
+  // Nothing returned is on hand, so nothing can be allocated or pushed.
+  assert.equal(state.movements.length, 0, 'no RETURN_INBOUND movement')
+  assert.equal(state.stockLevels.length, 0, 'no stock level change')
+  assert.equal(state.costLayers.length, 1, 'only the seeded dispatch layer: no return cost layer')
+  assert.equal(result.success && result.returnedRows.length, 0, 'the post-commit allocator / stock push see nothing')
+
+  // The document.
+  assert.equal(state.returnExpectations?.length, 1)
+  const expectation = state.returnExpectations![0]
+  assert.equal(expectation.refundId, 'refund-1')
+  assert.equal(expectation.reference, 'RX-CN-2026-00001')
+  assert.equal(expectation.expectedWarehouseId, 'warehouse-returns')
+  assert.equal(expectation.lines.length, 1)
+  assert.equal(expectation.lines[0].refundLineId, 'refund-line-1')
+  assert.equal(expectation.lines[0].qty, '1.000000')
+  assert.equal(expectation.lines[0].transitValueBase, '10.000000')
+  assert.deepEqual(expectation.lines[0].costSnapshot, [{ qty: '1.000000', unitCostBase: '10.000000', poLineId: 'po-line-1', sourceCostLayerId: 'layer-1' }])
+
+  // The ledger: same amount, same date, same key, only the DEBIT account moves.
+  const { payload, debit, credit } = cogsReversalLines(result)
+  assert.equal(debit?.accountCode, '1250', 'Stock in Transit')
+  assert.equal(debit?.debit, 10)
+  assert.equal(credit?.accountCode, '5000', 'COGS')
+  assert.equal(credit?.credit, 10)
+  assert.equal(payload._returnInTransit, true)
+  assert.equal(findCogsReversalSync(result).idempotencyKey, 'sales-order-refund:refund-1:cogs-reversal')
+  assert.equal(expectation.transitJournalKey, 'sales-order-refund:refund-1:cogs-reversal', 'the document names the journal that debited transit for it')
+  assert.equal(expectation.transitDebitBase, '10.000000')
+  assert.equal(state.activityLogs.some((entry) => (entry as { action?: string }).action === 'return_expectation_value_mismatch'), false)
+})
+
+test('[in transit] ON but no Stock in Transit account: fails closed - no Inventory fallback, document left unvalued, refund left owing its accounting', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const result = await refundOneUnit(state, { ...accountingSettings, transitAccount: '  ' })
+  assert.equal(result.success, true)
+  assert.match(result.success ? (result.accountingWarning ?? '') : '', /refund_in_transit_account_not_configured/)
+  assert.equal(state.refunds[0].accountingRetryRequired, true)
+  assert.equal((state.returnExpectations as unknown[] | undefined)?.length, 1, 'the document is there from the refund transaction, unvalued')
+  assert.equal((state.returnExpectations as NonNullable<State['returnExpectations']>)[0].valuedAt, null)
+  assert.equal(state.movements.length, 0, 'and it did not fall back to restocking')
+  assert.equal(state.stockLevels.length, 0)
+})
+
+test('[in transit] the mode is decided ONCE: a switch flipped off before the retry does not change the refund (and the retry is idempotent)', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const first = await refundOneUnit(state, { ...accountingSettings, transitAccount: '' })
+  assert.equal(first.success, true)
+  assert.equal(state.refunds[0].returnInTransit, true)
+
+  state.settings[IN_TRANSIT_SETTING] = 'false' // the operator switches it off between the attempt and the retry
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const retry = await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+    assert.equal(retry.success, true)
+    assert.equal(retry.success && retry.returnedRows.length, 0, 'the retry never restocks an in-transit refund')
+    const sync = retry.success ? retry.accountingSyncs.find((entry) => entry.type === 'COGS_REVERSAL') : undefined
+    const payload = sync?.payload as { _returnInTransit?: boolean; lines: Array<{ accountCode: string; debit?: number }> }
+    assert.equal(payload._returnInTransit, true)
+    assert.equal(payload.lines.find((line) => line.debit != null)?.accountCode, '1250', 'still Stock in Transit')
+  }
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.stockLevels.length, 0)
+  assert.equal(state.returnExpectations?.length, 1, 'one document per refund however many times it is retried')
+})
+
+test('[in transit] a LEGACY refund retried while the switch is ON stays legacy: it restocks and debits Inventory', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'false' } })
+  const created = await refundOneUnit(state, transitSettings)
+  assert.equal(created.success, true)
+  state.settings[IN_TRANSIT_SETTING] = 'true'
+  const retry = await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+  assert.equal(retry.success, true)
+  assert.equal(state.refunds[0].returnInTransit, false)
+  assert.equal(state.returnExpectations, undefined, 'no document for a refund that was never routed in transit')
+  const sync = retry.success ? retry.accountingSyncs.find((entry) => entry.type === 'COGS_REVERSAL') : undefined
+  const payload = sync?.payload as { _returnInTransit?: boolean; lines: Array<{ accountCode: string; debit?: number }> }
+  assert.equal(payload._returnInTransit, undefined)
+  assert.equal(payload.lines.find((line) => line.debit != null)?.accountCode, '1200')
+})
+
+test('[in transit] a chargeback is never in transit (the customer keeps the goods): no document, no marker', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Chargeback',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings: transitSettings,
+    chargeback: true,
+  })
+  assert.equal(result.success, true)
+  assert.equal(state.refunds[0].returnInTransit, false)
+  assert.equal(state.returnExpectations, undefined)
+  assert.equal(result.success && result.accountingSyncs.some((entry) => entry.type === 'COGS_REVERSAL'), false)
+})
+
+test('[in transit] a refund that returns nothing (no return warehouse) is not in transit even with the switch ON', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Goodwill',
+    creditNotePrefix: 'CN-',
+    accountingSettings: transitSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(state.refunds[0].returnInTransit, false)
+  assert.equal(state.returnExpectations, undefined)
+  const { payload, debit } = cogsReversalLines(result)
+  assert.equal(debit?.accountCode, '1200', 'unchanged: nothing is coming back, so nothing sits in transit')
+  assert.equal(payload._returnInTransit, undefined)
+})
+
+test('[in transit] ON with accounting off: a document with NO ledger link (nothing sits in transit in the books)', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  state.orders[0].revenueDeferredDate = null // no revenue deferral: refund staging does not run
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings: transitSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(state.movements.length, 0)
+  // Without staging there are no snapshot rows, so the document is built from the fallback rows (no cost).
+  const expectation = state.returnExpectations?.[0]
+  assert.ok(expectation)
+  assert.equal(expectation.transitJournalKey, null)
+  assert.equal(expectation.transitDebitBase, null)
+  assert.ok(expectation.valuedAt, 'nothing will ever price it, so it is valued at creation')
+})
+
+test('[in transit] recordRefundTransitFromSync writes the positive transit row, once, only for a queued non-shadow marked journal', async () => {
+  const rows: Array<Record<string, unknown>> = []
+  const client = {
+    transitSubledgerMovement: {
+      upsert: async ({ create, where }: { create: Record<string, unknown>; where: { idempotencyKey: string } }) => {
+        if (!rows.some((row) => row.idempotencyKey === where.idempotencyKey)) rows.push(create)
+      },
+    },
+  } as unknown as RefundServiceClient
+  const sync = (over: Record<string, unknown> = {}, payloadOver: Record<string, unknown> = {}) => ({
+    type: 'COGS_REVERSAL' as const,
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-9',
+    idempotencyKey: 'sales-order-refund:refund-9:cogs-reversal',
+    payload: { date: '2026-03-04', _cogsReversalBase: 12.345678, _returnInTransit: true, lines: [{ accountCode: '1250', debit: 12.35 }, { accountCode: '5000', credit: 12.35 }], ...payloadOver },
+    ...over,
+  }) as never
+
+  await recordRefundTransitFromSync(client, sync(), { queued: true })
+  await recordRefundTransitFromSync(client, sync(), { queued: true, reason: 'already-queued' }) // retry: idempotent
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].sourceType, 'CUSTOMER_RETURN_IN_TRANSIT')
+  assert.equal(rows[0].sourceRef, 'refund-9')
+  assert.equal(rows[0].idempotencyKey, 'sales-order-refund:refund-9:cogs-reversal')
+  assert.equal(String(rows[0].baseDelta), '12.345678', 'the 6dp base, positive: transit is debited')
+  assert.equal((rows[0].journalDate as Date).toISOString().slice(0, 10), '2026-03-04')
+
+  const before = rows.length
+  await recordRefundTransitFromSync(client, sync({ idempotencyKey: 'k-a' }), { queued: false })
+  await recordRefundTransitFromSync(client, sync({ idempotencyKey: 'k-b' }), { queued: true, reason: 'shadowed' })
+  await recordRefundTransitFromSync(client, sync({ idempotencyKey: 'k-c' }, { _returnInTransit: undefined }), { queued: true })
+  await recordRefundTransitFromSync(client, sync({ idempotencyKey: 'k-d', type: 'UNEARNED_REV_REVERSAL' }), { queued: true })
+  await recordRefundTransitFromSync(client, sync({ idempotencyKey: 'k-e' }, { _returnInTransit: 'true' }), { queued: true })
+  assert.equal(rows.length, before, 'not queued / shadowed / unmarked / other type / non-boolean marker: no row')
+})
+
+test('[in transit] returnExpectationTransitLinkFromSyncs reads the staged journal, and only a marked COGS reversal', () => {
+  const marked = { type: 'COGS_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: 'r1', idempotencyKey: 'k1', payload: { _returnInTransit: true, _cogsReversalBase: 7.5, lines: [] } }
+  const legacy = { ...marked, idempotencyKey: 'k2', payload: { _cogsReversalBase: 7.5, lines: [] } }
+  const other = { ...marked, type: 'UNEARNED_REV_REVERSAL', idempotencyKey: 'k3' }
+  assert.deepEqual(returnExpectationTransitLinkFromSyncs([other, legacy, marked] as never), { journalKey: 'k1', debitBase: 7.5 })
+  assert.equal(returnExpectationTransitLinkFromSyncs([legacy, other] as never), null)
+  assert.equal(returnExpectationTransitLinkFromSyncs([]), null)
+  assert.equal(returnExpectationTransitLinkFromSyncs([{ ...marked, payload: { _returnInTransit: true, lines: [] } }] as never), null, 'no positive base: no link')
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// Refund in transit: the document is written in the refund's OWN transaction, so there is no committed refund
+// without it, and the staging transaction values it in the commit that persists the staged syncs.
+// ---------------------------------------------------------------------------------------------------------------
+test('[in transit atomic] a failed document write rolls the WHOLE refund back: no refund, no lines, no credit note counter', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  state.failExpectationWrite = 'create'
+  await assert.rejects(() => refundOneUnit(state), /injected: expectation write failed/)
+  assert.equal(state.refunds.length, 0, 'no refund committed without its document')
+  assert.equal(state.refundLines.length, 0)
+  assert.equal(state.returnExpectations, undefined)
+  assert.equal(state.movements.length, 0)
+  // And with the fault gone, the same call succeeds: nothing was left half-done.
+  state.failExpectationWrite = undefined
+  const again = await refundOneUnit(state)
+  assert.equal(again.success, true)
+  assert.equal((state.returnExpectations as unknown[] | undefined)?.length, 1)
+})
+
+test('[in transit atomic] the document exists the moment the refund does, valued only by the staging that follows', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  // Staging fails (no Stock in Transit account): the refund and its document are committed, the document UNVALUED,
+  // and the refund is left owing its accounting - the existing obligation that brings a retry.
+  const first = await refundOneUnit(state, { ...accountingSettings, transitAccount: '' })
+  assert.equal(first.success, true)
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.refunds[0].accountingRetryRequired, true)
+  assert.equal(state.returnExpectations?.length, 1, 'returned goods are never without an expectation')
+  assert.equal(state.returnExpectations![0].valuedAt, null, 'not yet valued')
+  assert.equal(state.returnExpectations![0].transitJournalKey, null)
+
+  const retry = await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+  assert.equal(retry.success, true)
+  assert.equal(state.returnExpectations?.length, 1, 'the retry values the existing document, it does not add one')
+  const doc = state.returnExpectations![0]
+  assert.ok(doc.valuedAt)
+  assert.equal(doc.transitJournalKey, 'sales-order-refund:refund-1:cogs-reversal')
+  assert.equal(doc.transitDebitBase, '10.000000')
+  assert.equal(doc.lines[0].transitValueBase, '10.000000')
+  assert.deepEqual(doc.lines[0].costSnapshot, [{ qty: '1.000000', unitCostBase: '10.000000', poLineId: 'po-line-1', sourceCostLayerId: 'layer-1' }])
+})
+
+test('[in transit atomic] a failure while VALUING the document rolls the staging back with it: no persisted syncs, refund still owing', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  state.failExpectationWrite = 'settle-line'
+  const result = await refundOneUnit(state)
+  assert.equal(result.success, true)
+  assert.match(result.success ? (result.accountingWarning ?? '') : '', /injected: expectation line write failed/)
+  assert.equal(state.refunds[0].accountingRetryRequired, true)
+  assert.equal(state.refunds[0].accountingRetrySyncs ?? null, null, 'the staged syncs were not persisted without the valued document')
+  assert.equal(state.returnExpectations?.[0].valuedAt, null)
+  assert.equal(state.returnExpectations?.[0].transitJournalKey, null)
+  // Recovery: the fault clears, the retry values it.
+  state.failExpectationWrite = undefined
+  const retry = await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+  assert.equal(retry.success, true)
+  assert.ok(state.returnExpectations?.[0].valuedAt)
+})
+
+test('[in transit atomic] a normal in-transit refund is valued by its own staging (no retry needed) and a webhook replay adds nothing', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const input = {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    externalRefundId: 777,
+    creditNotePrefix: 'CN-',
+    accountingSettings: transitSettings,
+  }
+  const first = await createSalesOrderRefund(createClient(state), input)
+  assert.equal(first.success, true)
+  assert.ok(state.returnExpectations![0].valuedAt)
+  assert.equal(state.returnExpectations![0].transitJournalKey, 'sales-order-refund:refund-1:cogs-reversal')
+  const replay = await createSalesOrderRefund(createClient(state), input)
+  assert.equal(replay.success && replay.replayed, true)
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.returnExpectations?.length, 1)
+})
+
+test('[in transit atomic] valuing re-states the lines from the staged rows (staged quantity wins) and drops lines staging does not have', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  await refundOneUnit(state, { ...accountingSettings, transitAccount: '' })
+  const doc = state.returnExpectations![0]
+  // Pretend the refund-time lines were wider than what staging prices: an extra line and a different quantity.
+  doc.lines[0].qty = '5.000000'
+  doc.lines.push({ id: 'rxl-extra', refundLineId: 'refund-line-1', productId: 'other-product', sku: 'OTHER', qty: '1.000000', qtyReceived: '0', qtyWrittenOff: '0', costSnapshot: [], transitValueBase: '0.000000' })
+  await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+  assert.deepEqual(doc.lines.map((line) => [line.productId, line.qty]), [['product-1', '1.000000']])
+})
+
+test('[in transit atomic] a valued document is never rewritten by a later retry; an unvalued one with accounted quantity is refused', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  await refundOneUnit(state)
+  const doc = state.returnExpectations![0]
+  const valuedAt = doc.valuedAt
+  doc.lines[0].qty = '1.000000'
+  doc.lines[0].transitValueBase = '99.000000' // a later edit must survive: first write wins once valued
+  await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+  assert.equal(doc.lines[0].transitValueBase, '99.000000')
+  assert.equal(doc.valuedAt, valuedAt)
+
+  const broken = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  await refundOneUnit(broken, { ...accountingSettings, transitAccount: '' })
+  broken.returnExpectations![0].lines[0].qtyReceived = '1.000000'
+  const retry = await retrySalesOrderRefundAccounting(createClient(broken), { refundId: 'refund-1', accountingSettings: transitSettings })
+  assert.equal(retry.success, false)
+  assert.equal(broken.returnExpectations![0].valuedAt, null)
+})
+
+test('[in transit atomic] an in-transit refund of a build that predates the in-transaction document gets one from the retry', async () => {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  await refundOneUnit(state, { ...accountingSettings, transitAccount: '' })
+  state.returnExpectations = undefined // the earlier build never wrote one
+  const retry = await retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+  assert.equal(retry.success, true)
+  assert.equal((state.returnExpectations as unknown[] | undefined)?.length, 1)
+  assert.ok((state.returnExpectations as unknown as NonNullable<State['returnExpectations']>)[0].valuedAt)
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// Persisted-sync replay of an in-transit refund: the Stock in Transit journal is never handed back for replay
+// unless a VALUED return expectation stands behind it (rebuilt from the refund's own snapshot when an earlier
+// build never wrote it; refused when it cannot be).
+// ---------------------------------------------------------------------------------------------------------------
+async function inTransitRefundWithPersistedSyncs() {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const created = await refundOneUnit(state)
+  assert.equal(created.success, true)
+  assert.ok(state.refunds[0].accountingRetrySyncs, 'PRECONDITION: the staged journals are persisted, so the retry takes the replay branch')
+  assert.equal(state.refunds[0].accountingRetryRequired, true, 'PRECONDITION: and the refund is still owing its queueing')
+  return state
+}
+const replay = (state: State) => retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+
+test('[replay] a persisted-sync replay of an in-transit refund with NO document rebuilds it from the stored snapshot before returning the journal', async () => {
+  const state = await inTransitRefundWithPersistedSyncs()
+  state.returnExpectations = undefined // written by a build that created the document after the refund committed
+  const result = await replay(state)
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.accountingSyncs.some((sync) => sync.type === 'COGS_REVERSAL'), true, 'the persisted journal is what is replayed')
+  const docs = state.returnExpectations as unknown as NonNullable<State['returnExpectations']>
+  assert.equal(docs.length, 1)
+  assert.ok(docs[0].valuedAt)
+  assert.equal(docs[0].transitJournalKey, 'sales-order-refund:refund-1:cogs-reversal')
+  assert.equal(docs[0].transitDebitBase, '10.000000')
+  assert.deepEqual(docs[0].lines.map((line) => [line.productId, line.qty, line.transitValueBase]), [['product-1', '1.000000', '10.000000']])
+  assert.equal(state.movements.length, 0, 'and nothing was restocked')
+})
+
+test('[replay] an UNVALUED document is valued before the replay; a valued one is left alone', async () => {
+  const state = await inTransitRefundWithPersistedSyncs()
+  state.returnExpectations![0].valuedAt = null
+  state.returnExpectations![0].lines[0].qty = '5.000000' // refund-time quantity, to be restated from the stored snapshot
+  state.returnExpectations![0].lines[0].transitValueBase = '0.000000'
+  assert.equal((await replay(state)).success, true)
+  assert.ok(state.returnExpectations![0].valuedAt)
+  assert.deepEqual([state.returnExpectations![0].lines[0].qty, state.returnExpectations![0].lines[0].transitValueBase], ['1.000000', '10.000000'])
+  state.returnExpectations![0].lines[0].transitValueBase = '99.000000'
+  assert.equal((await replay(state)).success, true)
+  assert.equal(state.returnExpectations![0].lines[0].transitValueBase, '99.000000')
+})
+
+test('[replay] REFUSES (nothing replayed, no document invented) when the document is missing and the snapshot cannot rebuild it', async () => {
+  for (const [name, break_, code] of [
+    ['snapshot gone', (s: State) => { s.refundLines[0].costLayerSnapshot = null }, 'snapshot_missing'],
+    ['layer gone', (s: State) => { s.costLayers.length = 0 }, 'snapshot_layer_missing'],
+    ['snapshot disagrees with the journal', (s: State) => { (s.refundLines[0].costLayerSnapshot as Array<{ unitCostBase: unknown }>)[0].unitCostBase = '11.000000' }, 'snapshot_does_not_match_journal'],
+  ] as const) {
+    const state = await inTransitRefundWithPersistedSyncs()
+    state.returnExpectations = undefined
+    break_(state)
+    const result = await replay(state)
+    assert.equal(result.success, false, name)
+    assert.match(result.success ? '' : result.error, new RegExp(code), name)
+    assert.equal(state.returnExpectations, undefined, `${name}: no document invented`)
+  }
+})
+
+test('[replay] a document whose recorded journal differs from the persisted one refuses the replay', async () => {
+  const state = await inTransitRefundWithPersistedSyncs()
+  state.returnExpectations![0].transitJournalKey = 'some-other-journal'
+  const result = await replay(state)
+  assert.equal(result.success, false)
+})
+
+test('[replay] a LEGACY or chargeback refund replays untouched (no document is demanded)', async () => {
+  const legacy = shippedStateForTransit()
+  await refundOneUnit(legacy)
+  assert.equal(legacy.refunds[0].returnInTransit, false)
+  assert.equal((await replay(legacy)).success, true)
+  assert.equal(legacy.returnExpectations, undefined)
 })
