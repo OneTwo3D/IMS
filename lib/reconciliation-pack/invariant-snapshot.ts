@@ -56,7 +56,7 @@ function readProof(rows: unknown): ProofRead | null {
 }
 
 /** A dedicated single-connection client, built the way lib/db builds the application's (config form, schema options). */
-function createSnapshotClient(): SnapshotClient {
+export function createSnapshotClient(): SnapshotClient {
   const url = process.env.DATABASE_URL
   const adapter = new PrismaPg({ ...pgConnectionConfig(url), max: 1, connectionTimeoutMillis: CONNECT_WAIT_MS }, prismaAdapterSchemaOptions(url))
   return new PrismaClient({ adapter }) as unknown as SnapshotClient

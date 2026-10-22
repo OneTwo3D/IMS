@@ -21,15 +21,18 @@ import { pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
 import { loadAcceptances } from '../lib/reconciliation-pack/acceptances.ts'
 import { accountAllowed, buildPackEnv, parsePackArgs, type PackArgs } from '../lib/reconciliation-pack/cli.ts'
 import {
-  PACK_CHAIN_CODES, PACK_CLI_CODES, PACK_CLI_FLAGS, PACK_COMMAND, PACK_EXIT_CODES, packExitCode, renderPackCliCodeTable, renderPackExitCodeTable,
+  PACK_BASIS_REASON_LIST, PACK_CHAIN_CODES, PACK_CLI_CODES, PACK_CLI_FLAGS, PACK_COMMAND, PACK_EXIT_CODES, PACK_TRANSIT_LEG_REASONS, packExitCode, renderPackCliCodeTable, renderPackExitCodeTable,
   type PackChainCode, type PackCliCode,
 } from '../lib/reconciliation-pack/constants.ts'
 import { newRunId } from '../lib/reconciliation-pack/harness.ts'
-import { readImsSnapshot, type ImsQueryClient } from '../lib/reconciliation-pack/ims-readers.ts'
+import { childLivenessPort, ownClientBasisPort } from '../lib/reconciliation-pack/default-ports.ts'
+import { readImsSnapshot, type ImsQueryClient, type ImsReadOptions } from '../lib/reconciliation-pack/ims-readers.ts'
+import { bracketLiveness } from '../lib/reconciliation-pack/liveness.ts'
 import { publishPackReport, type PublishHooks } from '../lib/reconciliation-pack/publish.ts'
-import { memoisedInvariant, runItems, type BasisPort, type ItemRunner, type LivenessPort } from '../lib/reconciliation-pack/run.ts'
+import { memoisedInvariant, readLivenessSafe, runItems, type BasisPort, type ItemRunner, type LedgerRunner, type LivenessPort } from '../lib/reconciliation-pack/run.ts'
 import { readPackChain } from '../lib/reconciliation-pack/trend.ts'
 import type { PackItemId } from '../lib/reconciliation-pack/constants.ts'
+import type { LedgerItemId } from '../lib/reconciliation-pack/ledger-items.ts'
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const DISCONNECT_TIMEOUT_MS = 5_000
@@ -41,9 +44,12 @@ export type PackCliDeps = {
   openIms: () => Promise<ImsConnection>
   /** The invariant report with no-op writers. Evidence of unknown shape: the item runners validate it. */
   runInvariant: () => Promise<unknown>
+  /** The liveness reader. The default runs `npm run read-sync:status -- --json` as a child (default-ports.ts). */
   liveness?: LivenessPort
+  /** The as-of basis. The default reads through a client of its own, never the application's. */
   basis?: BasisPort
   runners?: Partial<Record<PackItemId, ItemRunner>>
+  ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
   /** Called last, whatever happened: closes the application's database client if the invariant run opened it. */
   disconnect: () => Promise<void>
 }
@@ -158,12 +164,16 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
     const owner = options.checkoutOwnerUid !== undefined ? options.checkoutOwnerUid : ownerUid(repoRoot)
     if (!accountAllowed(uid, owner)) return refuse('ACCOUNT_NOT_ALLOWED')
     if (args.vendorReadsOnly) return refuse('VENDOR_READS_RESERVED')
-    if (args.basisOnly) return await basisOnly(args, deps, out, err)
 
     const parent = options.env ?? process.env
     if (!parent.DATABASE_URL) return refuse('DATABASE_URL_MISSING')
     // Before anything imports the application's database client.
     if (options.env === undefined && options.keepProcessEnv !== true) replaceProcessEnv(buildPackEnv(parent, parent.HOME ?? '/tmp'))
+    // The real ports, unless a test handed doubles. Neither touches the application's client (default-ports.ts): the invariant run
+    // below needs to be the first to import it.
+    const liveness = deps.liveness ?? childLivenessPort({ cwd: repoRoot })
+    const basis = deps.basis ?? ownClientBasisPort()
+    if (args.basisOnly) return await basisOnly(args, liveness, basis, out)
 
     const reportDir = path.resolve(args.reportDir)
     try { mkdirSync(reportDir, { recursive: true, mode: 0o700 }) } catch { return refuse('DIR_UNREADABLE') }
@@ -195,9 +205,11 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       phase: args.phase,
       asOf: args.asOf!,
       selected: args.items,
-      liveness: deps.liveness,
+      liveness,
+      basis,
       runners: deps.runners,
-      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant) },
+      ledgerRunners: deps.ledgerRunners,
+      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions) },
     })
     const finishedAt = deps.now()
     const published = publishPackReport(reportDir, {
@@ -220,17 +232,36 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
   }
 }
 
-async function basisOnly(args: PackArgs, deps: PackCliDeps, out: (t: string) => void, err: (t: string) => void): Promise<number> {
-  if (!deps.basis) {
-    err(`Refused: BASIS_UNAVAILABLE_NOT_BUILT\n${PACK_CLI_CODES.BASIS_UNAVAILABLE_NOT_BUILT}`)
-    return packExitCode('refused')
+/** One IMS read in its own connection and its own read-only snapshot, closed whatever happens. */
+async function readIms(deps: PackCliDeps, options: ImsReadOptions) {
+  const ims = await deps.openIms()
+  try { return await readImsSnapshot(ims.client, options) } finally { await ims.close().catch(() => undefined) }
+}
+
+/**
+ * The same bracket a run makes, around the basis alone: the status report, the basis read, the status report again, then the
+ * basis settled. It is "ready" only when the basis is available AND the inventory comparison is not withheld; the transit leg
+ * (R10 only) is named beside it. Everything printed is a closed code.
+ */
+async function basisOnly(args: PackArgs, liveness: LivenessPort, basis: BasisPort, out: (t: string) => void): Promise<number> {
+  let settled
+  try {
+    const start = await readLivenessSafe(liveness)
+    const read = await basis.read(args.asOf!)
+    const end = await readLivenessSafe(liveness)
+    settled = await basis.settle(read, bracketLiveness(start, end))
+  } catch { return packExitCode('internal') }
+  if (typeof settled !== 'object' || settled === null) return packExitCode('internal')
+  if (settled.available !== true) {
+    const reason = (PACK_BASIS_REASON_LIST as readonly string[]).includes(settled.reason) ? settled.reason : 'basis_unreadable'
+    out(`Basis for ${args.asOf}: not ready (${reason})`)
+    return packExitCode('inconclusive')
   }
-  let reading
-  try { reading = await deps.basis.check(args.asOf!) } catch { return packExitCode('internal') }
-  // The port's codes are printed only if they are closed-code shaped; anything else is dropped to a count.
-  const codes = reading.codes.filter((code) => /^[A-Z][A-Z0-9_]{2,63}$/.test(code)).slice(0, 16)
-  out(`Basis for ${args.asOf}: ${reading.ok === true ? 'ready' : 'not ready'}${codes.length ? ` (${codes.join(', ')})` : ''}`)
-  return reading.ok === true ? 0 : packExitCode('inconclusive')
+  const withheld = settled.inventoryGl === null || settled.inventoryGlWithheld !== null
+  const legReason = settled.transit?.available === false && Object.prototype.hasOwnProperty.call(PACK_TRANSIT_LEG_REASONS, settled.transit.reason) ? settled.transit.reason : null
+  const notes = [withheld ? 'inventory comparison withheld: absent-from-tb' : null, legReason ? `transit leg: ${legReason}` : settled.transit?.available === true ? null : 'transit leg: unreadable'].filter((note): note is string => note !== null)
+  out(`Basis for ${args.asOf}: ${withheld ? 'not ready' : 'ready'}${notes.length ? ` (${notes.join('; ')})` : ''}`)
+  return withheld ? packExitCode('inconclusive') : 0
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

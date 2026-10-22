@@ -56,6 +56,7 @@ test('[reconciliation pack] the rig can fail: a control write moves the row coun
 
 test('[reconciliation pack] a whole run of the command writes nothing and connects only to the database', { skip: !RUN }, async () => {
   const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
+  const { healthyLiveness } = await import('../reconciliation-pack/basis-fixtures.ts')
   const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
   chmodSync(dir, 0o700)
   const url = new URL(process.env.DATABASE_URL!)
@@ -72,7 +73,8 @@ test('[reconciliation pack] a whole run of the command writes nothing and connec
     const out: string[] = []
     const start = await census()
     targets.length = 0
-    const code = await runPackCli({ argv: ['--phase', 'P0', '--report-dir', dir], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
+    // The liveness reader is a double here (a scratch database has no healthy read-sync estate); the next test runs the real child.
+    const code = await runPackCli({ argv: ['--phase', 'P0', '--report-dir', dir], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), deps: { liveness: healthyLiveness() }, stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
     const seen = [...targets]
     net.Socket.prototype.connect = original
     assert.ok(code === 0 || code === 1, `exit ${code}: ${out.join('\n')}`)
@@ -88,6 +90,107 @@ test('[reconciliation pack] a whole run of the command writes nothing and connec
     for (const target of seen) assert.ok(target === `${host}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}`, `unexpected connection to ${target}`)
   } finally {
     net.Socket.prototype.connect = original
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('[reconciliation pack] the REAL liveness reader (the status command as a child) on a scratch estate is never healthy: nothing passes, and nothing is written', { skip: !RUN }, async () => {
+  const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
+  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  chmodSync(dir, 0o700)
+  try {
+    const out: string[] = []
+    const start = await census()
+    const code = await runPackCli({ argv: ['--phase', 'P0', '--report-dir', dir], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
+    // A scratch database has no scheduled estate: the status report is either not healthy or cannot be read. Either way every item is
+    // inconclusive, so the run exits 5, and the invariant report was not even needed.
+    assert.equal(code, 5, out.join('\n'))
+    assert.ok(!out.some((line) => /^R\d+ pass\b/.test(line)), out.join('\n'))
+    assert.ok(out.some((line) => /^R3 inconclusive (STALE_BASIS|SOURCE_UNREADABLE)$/.test(line)), out.join('\n'))
+    const end = await census()
+    assert.deepEqual(end.counts, start.counts)
+    assert.deepEqual(end.stats, start.stats)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---- R6 and R10 end to end: the real basis (a client of its own), the real IMS reads, the real invariant run -------------------
+
+const LD = '2026-03-05' // the cycle date of the ledger items' data
+const LTAG = `RCLG${process.pid}`
+const SETTINGS = ['integration_xero_enabled', 'xero_inventory_account', 'xero_allocated_inventory_account', 'xero_transit_account', 'xero_cogs_account', 'xero_unearned_revenue_account', 'transit_ledger_coverage_start_date']
+
+test('[reconciliation pack] R6 and R10 on a seeded estate: decided from stored snapshots, a post-load write fails R10 by id, and the run writes nothing', { skip: !RUN }, async () => {
+  const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
+  const { healthyLiveness } = await import('../reconciliation-pack/basis-fixtures.ts')
+  const { INTEGRATION_PLUGIN_SETTING_KEYS } = await import('../../lib/integration-plugin-keys.ts')
+  const keys = { xero: INTEGRATION_PLUGIN_SETTING_KEYS.xero }
+  const codes = { inventory: `${LTAG}1`, allocated: `${LTAG}2`, transit: `${LTAG}3`, cogs: `${LTAG}4`, unearned: `${LTAG}5` }
+  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  chmodSync(dir, 0o700)
+  const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [[...SETTINGS, keys.xero]])).rows as Array<{ key: string; value: string }>)
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const setting = (key: string, value: string) => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, value])
+  try {
+    for (const [key, value] of [[keys.xero, 'true'], ['xero_inventory_account', codes.inventory], ['xero_allocated_inventory_account', codes.allocated], ['xero_transit_account', codes.transit], ['xero_cogs_account', codes.cogs], ['xero_unearned_revenue_account', codes.unearned], ['transit_ledger_coverage_start_date', '2026-01-01']] as const) await setting(key, value)
+    await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
+    await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'x', '2031-01-01', $2, now())`, [`${LTAG}-tok`, `${LTAG}-tenant`])
+    const amounts: Record<string, [string, string]> = { inventory: ['100.50', '100.50'], allocated: ['20.25', '20.25'], transit: ['50', '50'], cogs: ['7', '7'], unearned: ['-30', '-30'] }
+    for (const [kind, code] of Object.entries(codes)) {
+      await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', $4, 'GBP', $5, $5, $6, $7, now())`, [`${LTAG}-b-${kind}`, `${LTAG}-${kind}`, code, LD, amounts[kind]![0], `xero:trial-balance:${LD}`, `${LTAG}-tenant`])
+    }
+    await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', '2026-03-04', 'GBP', 40, 40, 'xero:trial-balance:2026-03-04', $4, now())`, [`${LTAG}-b-open`, `${LTAG}-transit-open`, codes.transit, `${LTAG}-tenant`])
+    await sql(`INSERT INTO transit_subledger_movements (id, source_type, source_ref, idempotency_key, base_delta, journal_date) VALUES ($1, 'STOCK_RECEIPT', $2, $3, 10, $4)`, [`${LTAG}-mv`, LTAG, `${LTAG}-mv`, LD])
+    await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now())`, [`${LTAG}-run`, LD])
+    // The estate is a sub-ledger of nothing against a GL of 120.75: R6 fails, which is the point (a gap beyond GBP 1 is a finding).
+    await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{}', '{}', '2026-03-01 09:00:00', '2026-03-02 09:00:00')`, [`${LTAG}-fl`])
+    await sql(`INSERT INTO accounting_sync_logs (id, connector, type, status, "referenceType", "referenceId", "externalTransactionId", "syncedAt", "createdAt") VALUES ($1, 'xero', 'COGS_JOURNAL', 'SYNCED', 'CogsEntry', 'ref', 'doc', '2026-03-03 10:00:00', '2026-03-03 10:00:00')`, [`${LTAG}-post`])
+    await sql(`INSERT INTO accounting_sync_logs (id, connector, type, status, "referenceType", "referenceId", "externalTransactionId", "syncedAt", "createdAt") VALUES ($1, 'xero', 'COGS_JOURNAL', 'SYNCED', 'CogsEntry', 'ref2', 'doc2', '2026-02-20 10:00:00', '2026-02-20 10:00:00')`, [`${LTAG}-old`])
+
+    const run = async () => {
+      const out: string[] = []
+      const before = await census()
+      const code = await runPackCli({ argv: ['--phase', 'P1', '--as-of', LD, '--items', 'R6,R10', '--report-dir', dir], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), deps: { liveness: healthyLiveness() }, stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
+      const after = await census()
+      assert.deepEqual(after.counts, before.counts, 'every table has the rows it had')
+      assert.deepEqual(after.stats, before.stats, 'no table saw an insert, update or delete')
+      return { code, out }
+    }
+
+    // 1. Sub-ledger empty against a GL of 120.75: R6 fails. A write since the first load began (and one before it) are in the IMS data: R10 fails.
+    const first = await run()
+    assert.equal(first.code, 1, first.out.join('\n'))
+    assert.ok(first.out.includes('R6 fail DIFFERENCES'), first.out.join('\n'))
+    assert.ok(first.out.includes('R10 fail DIFFERENCES'), first.out.join('\n'))
+
+    // 2. Stock appears in the snapshot (value 120.75), the post-load write goes: R6 passes; R10 passes on its two ledger legs and an empty postings leg.
+    await sql(`DELETE FROM accounting_sync_logs WHERE id = $1`, [`${LTAG}-post`])
+    await sql(`DELETE FROM inventory_snapshot_runs WHERE id = $1`, [`${LTAG}-run`])
+    await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${LTAG}-p`, `${LTAG}-SKU`])
+    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${LTAG}-w`, `${LTAG}W`])
+    await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 1, 1, now())`, [`${LTAG}-run`, LD])
+    await sql(`INSERT INTO inventory_snapshots (id, "snapshotDate", "productId", "warehouseId", qty, "valueBase", "unitCostBase") VALUES ($1, $2, $3, $4, 1, 120.75, 120.75)`, [`${LTAG}-snap`, LD, `${LTAG}-p`, `${LTAG}-w`])
+    const second = await run()
+    assert.equal(second.code, 5, second.out.join('\n'))
+    assert.ok(second.out.includes('R6 pass -'), second.out.join('\n'))
+    assert.ok(second.out.includes('R10 pass -'), second.out.join('\n'))
+  } finally {
+    await sql(`DELETE FROM inventory_snapshots WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM products WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM warehouses WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM accounting_sync_logs WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM first_load_apply_runs WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM transit_subledger_movements WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM accounting_account_balance_snapshots WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${LTAG}%'`)
+    for (const key of [...SETTINGS, keys.xero]) {
+      const prior = saved.find((row) => row.key === key)
+      if (prior) await setting(key, prior.value)
+      else await sql(`DELETE FROM settings WHERE key = $1`, [key])
+    }
     rmSync(dir, { recursive: true, force: true })
   }
 })

@@ -186,3 +186,55 @@ test('[reconciliation pack] pg_control_system() answers an account that is not a
     } finally { await admin.query(`DROP ROLE ${role}`) }
   })
 })
+
+// Rows of this test carry their own prefix, so the sections test above (which counts only rows starting with TAG) is unaffected.
+const XP = `RCXP${process.pid}`
+
+test('[reconciliation pack] xeroPostings reads the P0 record and every row that could be a write to Xero from the real tables (column names proven)', { skip: !RUN }, async () => {
+  const { readers, db } = await load()
+  const insert = (id: string, connector: string, type: string, status: string, doc: string | null, extra: { syncedAt?: string; processingStartedAt?: string; createdAt?: string } = {}) =>
+    db.$executeRawUnsafe(`INSERT INTO accounting_sync_logs (id, connector, type, status, "referenceType", "referenceId", "externalTransactionId", "syncedAt", "processingStartedAt", "createdAt") VALUES ($1, $2, $3::"AccountingSyncType", $4::"AccountingSyncStatus", 'SalesOrder', $5, $6, $7::timestamp, $8::timestamp, COALESCE($9::timestamp, now()))`,
+      id, connector, type, status, `${id}-ref`, doc, extra.syncedAt ?? null, extra.processingStartedAt ?? null, extra.createdAt ?? null)
+  const existing = await withClient((client) => client.query(`SELECT count(*)::int AS n FROM first_load_apply_runs`))
+  try {
+    // The sync-log population: in = SYNCED, PROCESSING, or any row with a document id; out = other connector, nothing sent.
+    await insert(`${XP}-synced`, 'xero', 'SALES_INVOICE', 'SYNCED', 'doc1', { syncedAt: '2026-10-05 10:00:00' })
+    await insert(`${XP}-asserted`, 'xero', 'SALES_INVOICE', 'SYNCED', 'doc2', { syncedAt: '2026-10-05 11:00:00' })
+    await db.$executeRawUnsafe(`UPDATE accounting_sync_logs SET settlement_basis = 'OPERATOR_ASSERTION' WHERE id = $1`, `${XP}-asserted`)
+    await insert(`${XP}-processing`, 'xero', 'INVOICE_PDF', 'PROCESSING', null, { processingStartedAt: '2026-10-06 12:00:00', createdAt: '2026-09-01 00:00:00' })
+    await insert(`${XP}-failed-with-doc`, 'xero', 'TAX_RATE_SYNC', 'FAILED', 'doc3', { createdAt: '2026-10-07 13:00:00' })
+    await insert(`${XP}-pending`, 'xero', 'COGS_JOURNAL', 'PENDING', null)
+    await insert(`${XP}-cancelled`, 'xero', 'COGS_JOURNAL', 'CANCELLED', null)
+    await insert(`${XP}-other-connector`, 'quickbooks', 'SALES_INVOICE', 'SYNCED', 'doc4', { syncedAt: '2026-10-05 10:00:00' })
+
+    const none = await withClient((client) => readers.readImsSnapshot(client, { sections: ['xeroPostings'] }))
+    assert.ok(none.ok && none.sections.xeroPostings!.ok, JSON.stringify(none))
+    if (!none.ok || !none.sections.xeroPostings!.ok) return
+    const mine = <T extends { id: string }>(rows: T[]) => rows.filter((r) => r.id.startsWith(XP))
+    const value = none.sections.xeroPostings!.value
+    assert.deepEqual(mine(value.rows).map((r) => [r.id.slice(XP.length + 1), r.type, r.status, r.at]), [
+      ['asserted', 'SALES_INVOICE', 'SYNCED', '2026-10-05T11:00:00.000Z'],
+      ['failed-with-doc', 'TAX_RATE_SYNC', 'FAILED', '2026-10-07T13:00:00.000Z'],
+      ['processing', 'INVOICE_PDF', 'PROCESSING', '2026-10-06T12:00:00.000Z'],
+      ['synced', 'SALES_INVOICE', 'SYNCED', '2026-10-05T10:00:00.000Z'],
+    ], 'the sync time, else the processing start, else the creation time; an operator assertion, a failure with a document id and a PROCESSING row are all kept; other connectors and rows that sent nothing are not')
+
+    if (existing.rows[0].n === 0) {
+      // The P0 record: only a VERIFIED run is a recorded P0, and the instant is when the load STARTED (created_at), not when it last changed.
+      for (const [status, expected] of [['APPLIED', 'unverified'], ['VERIFIED', 'verified']] as const) {
+        await db.$executeRawUnsafe(`DELETE FROM first_load_apply_runs`)
+        await db.$executeRawUnsafe(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'digest', 'run', $2, '{}', '{}', '2026-10-01 09:00:00', '2026-10-02 18:30:00')`, `${XP}-run`, status)
+        const read = await withClient((client) => readers.readImsSnapshot(client, { sections: ['xeroPostings'] }))
+        assert.ok(read.ok && read.sections.xeroPostings!.ok, JSON.stringify(read))
+        if (read.ok && read.sections.xeroPostings!.ok) {
+          const p0 = read.sections.xeroPostings!.value.p0
+          assert.equal(p0.state, expected)
+          if (p0.state === 'verified') assert.equal(p0.startedAt, '2026-10-01T09:00:00.000Z', 'created_at, not updated_at')
+        }
+      }
+    }
+  } finally {
+    await db.$executeRawUnsafe(`DELETE FROM accounting_sync_logs WHERE id LIKE '${XP}%'`)
+    await db.$executeRawUnsafe(`DELETE FROM first_load_apply_runs WHERE id LIKE '${XP}%'`)
+  }
+})

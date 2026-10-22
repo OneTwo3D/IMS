@@ -1,8 +1,11 @@
 import type { PrismaClient } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { balanceDateString, normalizeBalanceDate } from '@/lib/domain/accounting/balance-date'
 
-const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
+// The date helpers live in their own module (no database) so the reconciliation pack can use them without loading lib/db.
+export { balanceDateString, normalizeBalanceDate }
+
 const DAY_MS = 24 * 60 * 60 * 1000
 export const DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS = 1
 
@@ -111,23 +114,6 @@ function normalizeCurrency(value: string): string {
   const currency = assertNonEmpty(value, 'currency').toUpperCase()
   if (!/^[A-Z]{3}$/.test(currency)) throw new Error(`currency must be an ISO 4217 code: ${value}`)
   return currency
-}
-
-export function normalizeBalanceDate(value: Date | string): Date {
-  if (typeof value === 'string') {
-    if (!DATE_ONLY_RE.test(value)) throw new Error(`balanceDate must be YYYY-MM-DD: ${value}`)
-    const [year, month, day] = value.split('-').map(Number)
-    const parsed = new Date(Date.UTC(year!, month! - 1, day!))
-    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month! - 1 || parsed.getUTCDate() !== day) {
-      throw new Error(`balanceDate must be a real calendar date: ${value}`)
-    }
-    return parsed
-  }
-  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()))
-}
-
-export function balanceDateString(value: Date | string): string {
-  return normalizeBalanceDate(value).toISOString().slice(0, 10)
 }
 
 function previousDate(value: Date | string): Date {
