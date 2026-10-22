@@ -35,7 +35,9 @@ async function deps() {
     import('../reconciliation-pack/liveness-fixtures.ts'),
     import('../../lib/integration-plugin-keys.ts'),
   ])
-  return { db, ...basis, ...readTx, ...constants, ...liveness, ...fixtures, ...live }
+  /** The two phases a run makes, with nothing written in between. */
+  const loadAsOfBasis = async (asOf: string, bracket: Parameters<typeof basis.settleAsOfBasis>[1]) => basis.settleAsOfBasis(await basis.readAsOfBasis(asOf), bracket)
+  return { db, ...basis, ...readTx, ...constants, ...liveness, ...fixtures, ...live, loadAsOfBasis }
 }
 
 test('as-of basis against a real database', { skip }, async () => {
@@ -73,6 +75,15 @@ test('as-of basis against a real database', { skip }, async () => {
       assert.equal(ok.subledger.valueBase, '120.750000')
       assert.equal(ok.inventoryGl.action, 'balanced')
     }
+
+    // 1b. MOVED: an on-demand refresh that rewrites a balance with the SAME amount between the read inside the bracket and the
+    // settle after it (the stream stamp does not move) withholds the basis; the same two phases with nothing between are fine.
+    const read = await d.readAsOfBasis(D)
+    await db.accountingAccountBalanceSnapshot.updateMany({ where: { accountCode: codes.inventory!, balanceDate: date(D), connector: 'xero' }, data: { amountBase: '100.50' } })
+    const moved = await d.settleAsOfBasis(read, bracket)
+    assert.equal(moved.available, false, JSON.stringify(moved))
+    if (!moved.available) assert.equal(moved.reason, 'basis_moved')
+    assert.equal((await d.loadAsOfBasis(D, bracket)).available, true, 'nothing moved: available')
 
     // 2. NO WRITE: row counts of every table the basis reads, and the tuple counters, are unchanged by a load.
     const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots']

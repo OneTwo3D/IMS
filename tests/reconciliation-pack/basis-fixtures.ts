@@ -30,7 +30,7 @@ export function goodState(overrides: Partial<FakeState> = {}): FakeState {
     settings,
     baseCurrency: 'GBP',
     tenant: TENANT,
-    gl: PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT })),
+    gl: PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT, updatedAt: new Date('2026-10-20T01:00:00.000Z') })),
     run: { snapshotCount: 2 },
     snapshots: [{ valueBase: '700.25', valueReplayReliable: true }, { valueBase: '500.50', valueReplayReliable: true }],
     ...overrides,

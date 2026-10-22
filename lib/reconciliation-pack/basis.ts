@@ -11,7 +11,11 @@
  *       Xero reported the account or the account was absent from the trial balance (a zero it never reported);
  *     - an inventory snapshot run row exists for D, every inventory snapshot row for D is point-in-time reliable, and
  *       the rows are as many as the run row recorded;
- *     - the Xero balance-snapshot stream was fresh and unmoved at both liveness reads.
+ *     - the Xero balance-snapshot stream was fresh and unmoved at both liveness reads;
+ *     - the stored evidence did not move during the run: the basis is READ inside the liveness bracket (readAsOfBasis)
+ *       and SETTLED after its end read (settleAsOfBasis), which reads it again and compares a digest of every row it used,
+ *       update times included. The stream stamp alone cannot show this: an on-demand Xero refresh rewrites the stored
+ *       balances without advancing it.
  *   Otherwise the first failing reason (a closed code), never a substitute date and never a default.
  *
  * Every IMS read is made in ONE READ ONLY REPEATABLE READ transaction with a statement timeout (read-tx.ts). Stored
@@ -21,6 +25,8 @@
  * Text safety: a result carries closed reason codes, account KINDS, counts and decimal strings. It does not carry an
  * account code, an account name or any stored text.
  */
+
+import { createHash } from 'node:crypto'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { balanceDateString, normalizeBalanceDate } from '@/lib/domain/accounting/account-balance-snapshots'
@@ -85,6 +91,7 @@ export type BasisGlRow = {
   amountBase: unknown
   sourcePayloadRef: string | null
   tenantId: string | null
+  updatedAt: Date
 }
 
 export type BasisTx = {
@@ -92,7 +99,7 @@ export type BasisTx = {
   accountingToken: { findUnique(args: { where: { connector: string }; select: { tenantId: true } }): Promise<{ tenantId: string } | null> }
   organisation: { findFirst(args: { select: { baseCurrency: true } }): Promise<{ baseCurrency: string | null } | null> }
   accountingAccountBalanceSnapshot: {
-    findMany(args: { where: { connector: string; currency: string; accountCode: { in: string[] }; balanceDate: Date }; select: { accountCode: true; balanceDate: true; currency: true; amountBase: true; sourcePayloadRef: true; tenantId: true } }): Promise<BasisGlRow[]>
+    findMany(args: { where: { connector: string; currency: string; accountCode: { in: string[] }; balanceDate: Date }; select: { accountCode: true; balanceDate: true; currency: true; amountBase: true; sourcePayloadRef: true; tenantId: true; updatedAt: true } }): Promise<BasisGlRow[]>
     count(args: { where: { connector: string; currency: string; accountCode: string; tenantId: string } }): Promise<number>
   }
   inventorySnapshotRun: { findUnique(args: { where: { snapshotDate: Date }; select: { snapshotCount: true } }): Promise<{ snapshotCount: number } | null> }
@@ -126,7 +133,7 @@ function finiteDecimal(value: unknown): ReturnType<typeof toDecimal> | null {
   }
 }
 
-type Resolved = { ok: true; basis: AsOfBasis & { available: true } } | { ok: false; reason: PackBasisReason }
+type Resolved = { ok: true; basis: AsOfBasis & { available: true }; token: string } | { ok: false; reason: PackBasisReason }
 
 async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolved> {
   const fail = (reason: PackBasisReason): Resolved => ({ ok: false, reason })
@@ -172,7 +179,7 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   const wanted = [...new Set(codes.values())]
   const glRows = await tx.accountingAccountBalanceSnapshot.findMany({
     where: { connector: BASIS_CONNECTOR, currency, accountCode: { in: wanted }, balanceDate: date },
-    select: { accountCode: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true, tenantId: true },
+    select: { accountCode: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true, tenantId: true, updatedAt: true },
   })
   const gl: BasisGlBalance[] = []
   let failure: PackBasisReason | null = null
@@ -223,8 +230,18 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   const byKind = new Map(gl.map((g) => [g.kind, g]))
   const inventory = finiteDecimal(byKind.get('inventory')!.amountBase)!
   const allocated = finiteDecimal(byKind.get('allocated')!.amountBase)!
+  // The change token: a digest of everything this basis rests on, as stored, update times included. Two reads with the same
+  // token read the same evidence; an upsert of any balance row (whatever path wrote it) changes its update time.
+  const stamp = (value: unknown) => (value instanceof Date ? value.toISOString() : value === null || value === undefined ? null : String(value))
+  const changeToken = createHash('sha256').update(JSON.stringify({
+    settings: settingRows.map((row) => [row.key, row.value]).sort(),
+    tenant, currency,
+    gl: glRows.map((row) => [row.accountCode, stamp(row.balanceDate), row.currency, stamp(row.amountBase), row.sourcePayloadRef, row.tenantId, stamp(row.updatedAt)]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    run: run.snapshotCount, rows: rowCount, sum: sum.toFixed(6), unreliable,
+  })).digest('hex')
   return {
     ok: true,
+    token: changeToken,
     basis: {
       available: true,
       asOf,
@@ -238,27 +255,51 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   }
 }
 
+/** The basis as read inside the run's liveness bracket; usable only through settleAsOfBasis. */
+export type BasisRead = { readonly asOf: string | null; readonly date: Date | null; readonly resolved: Resolved | null }
+
+function defaultRun(deps: BasisDeps) {
+  return deps.run ?? (<T,>(fn: (tx: BasisTx) => Promise<T>) => withReadOnlySnapshot(fn as never) as Promise<T>)
+}
+
 /**
- * Load the basis for cycle date `asOf` (YYYY-MM-DD). `liveness` is the run's bracket: the Xero balance-snapshot
- * stream must have been fresh and unmoved at both of its reads. Never throws: a read error is `basis_unreadable`.
+ * Read the basis for cycle date `asOf` (YYYY-MM-DD), INSIDE the run's liveness bracket (after its start read). The result
+ * is not a basis: settleAsOfBasis turns it into one after the end read. Never throws.
  */
-export async function loadAsOfBasis(asOf: string, liveness: LivenessBracket, deps: BasisDeps = {}): Promise<AsOfBasis> {
+export async function readAsOfBasis(asOf: string, deps: BasisDeps = {}): Promise<BasisRead> {
   let date: Date
   try {
-    if (typeof asOf !== 'string') return unavailable(null, 'basis_unreadable')
+    if (typeof asOf !== 'string') return { asOf: null, date: null, resolved: null }
     date = normalizeBalanceDate(asOf)
-    if (balanceDateString(date) !== asOf) return unavailable(null, 'basis_unreadable')
+    if (balanceDateString(date) !== asOf) return { asOf: null, date: null, resolved: null }
   } catch {
-    return unavailable(null, 'basis_unreadable')
+    return { asOf: null, date: null, resolved: null }
   }
-  let resolved: Resolved
   try {
-    const run = deps.run ?? (<T,>(fn: (tx: BasisTx) => Promise<T>) => withReadOnlySnapshot(fn as never) as Promise<T>)
-    resolved = await run((tx) => readBasis(tx, asOf, date))
+    return { asOf, date, resolved: await defaultRun(deps)((tx) => readBasis(tx, asOf, date)) }
+  } catch {
+    return { asOf, date, resolved: null }
+  }
+}
+
+/**
+ * Settle a basis read AFTER the bracket's end read (`liveness` exists only once both reads are made). The evidence is read
+ * again in a fresh read-only snapshot and must carry the same change token: anything written in between, by the scheduled
+ * pull or an on-demand refresh, is BASIS_MOVED. Then the Xero balance-snapshot stream must have been fresh and unmoved at
+ * both liveness reads. Never throws: a read error is `basis_unreadable`.
+ */
+export async function settleAsOfBasis(read: BasisRead, liveness: LivenessBracket, deps: BasisDeps = {}): Promise<AsOfBasis> {
+  if (read.asOf === null || read.date === null) return unavailable(null, 'basis_unreadable')
+  const { asOf, date, resolved } = read
+  if (resolved === null) return unavailable(asOf, 'basis_unreadable')
+  if (!resolved.ok) return unavailable(asOf, resolved.reason)
+  let again: Resolved
+  try {
+    again = await defaultRun(deps)((tx) => readBasis(tx, asOf, date))
   } catch {
     return unavailable(asOf, 'basis_unreadable')
   }
-  if (!resolved.ok) return unavailable(asOf, resolved.reason)
+  if (!again.ok || again.token !== resolved.token) return unavailable(asOf, 'basis_moved', 'BASIS_MOVED')
   // The stream check comes last on purpose: a specific missing-data reason is more useful than "stale".
   const stream = streamsVerdict(liveness, [BASIS_STREAM])
   if (!stream.ok) return unavailable(asOf, 'stream_not_fresh', stream.reason)

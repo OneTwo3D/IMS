@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { evaluateAccountGlReconciliation } from '../../lib/domain/accounting/account-gl-reconciliation.ts'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
-import { loadAsOfBasis, type AsOfBasis } from '../../lib/reconciliation-pack/basis.ts'
+import { readAsOfBasis, settleAsOfBasis, type AsOfBasis, type BasisDeps } from '../../lib/reconciliation-pack/basis.ts'
 import { PACK_BASIS_ACCOUNTS, PACK_BASIS_REASON_LIST, type PackBasisAccountKind } from '../../lib/reconciliation-pack/constants.ts'
 import { bracketLiveness, reduceStatusReport } from '../../lib/reconciliation-pack/liveness.ts'
 import { CODES, D, TENANT, REF, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
@@ -14,6 +14,10 @@ import { goodReport, makeStale, withStamp } from './liveness-fixtures.ts'
  * basis is not allowed to use (so a write method does not exist to be called). Mutations are listed in the PR.
  */
 
+/** Read inside the bracket, then settle after it: the two phases a run makes, over one double (nothing moves in between). */
+async function loadAsOfBasis(asOf: string, bracket: ReturnType<typeof cleanBracket>, deps: BasisDeps) {
+  return settleAsOfBasis(await readAsOfBasis(asOf, deps), bracket, deps)
+}
 async function load(state: FakeState, asOf: string = D, bracket = cleanBracket()) {
   const log: string[] = []
   const fake = fakeRun(state, log)
@@ -31,7 +35,7 @@ test('available: five exact-date balances, a covered subledger, a fresh stream; 
   console.log(`precondition: ${JSON.stringify(basis)} reads=${log.length}`)
   assert.equal(basis.available, true)
   if (!basis.available) return
-  assert.equal(calls, 1, 'one transaction')
+  assert.equal(calls, 2, 'one transaction to read inside the bracket, one to settle after it')
   assert.equal(basis.asOf, D)
   assert.equal(basis.currency, 'GBP')
   assert.deepEqual(basis.gl.map((g) => g.kind), KINDS)
@@ -57,7 +61,7 @@ test('the evaluator is used unchanged for sweep and flag gaps', async () => {
 
 test('every IMS read happens inside the one run (the double throws on a read outside it) and reads nothing but the allowed tables', async () => {
   const { log, calls } = await load(goodState())
-  assert.equal(calls, 1)
+  assert.equal(calls, 2)
   assert.deepEqual([...new Set(log)].sort(), ['accountingToken.findUnique', 'inventorySnapshot.aggregate', 'inventorySnapshot.count', 'organisation.findFirst', 'run.findUnique', 'setting.findMany', 'snapshot.findMany'])
 })
 
@@ -172,6 +176,38 @@ test('Inventory and Allocated on ONE code: no usable basis, never one balance co
   assert.equal(reason((await load(state)).basis), 'inventory_accounts_shared')
 })
 
+// [mutation: the settle-time re-read and token comparison removed]
+test('MOVED: a refresh between the read inside the bracket and the settle after it withholds the basis, whatever wrote it', async () => {
+  const moves: Array<[string, (state: FakeState) => void]> = [
+    ['an on-demand refresh rewrote a balance with the SAME amount (only its update time moved)', (state) => { state.gl = state.gl.map((row) => (row.accountCode === CODES.inventory ? { ...row, updatedAt: new Date(row.updatedAt.getTime() + 1000) } : row)) }],
+    ['a refresh changed a balance', (state) => { state.gl = state.gl.map((row) => (row.accountCode === CODES.cogs ? { ...row, amountBase: '80' } : row)) }],
+    ['the subledger gained a row', (state) => { state.run = { snapshotCount: 3 }; state.snapshots = [...state.snapshots, { valueBase: '1', valueReplayReliable: true }] }],
+    ['a configured code changed', (state) => { state.settings.set('xero_cogs_account', '501'); state.gl = [...state.gl, { ...state.gl[0]!, accountCode: '501' }] }],
+  ]
+  for (const [name, move] of moves) {
+    const state = goodState()
+    const fake = fakeRun(state)
+    const read = await readAsOfBasis(D, { run: fake.run })
+    move(state)
+    const basis = await settleAsOfBasis(read, cleanBracket(), { run: fake.run })
+    assert.equal(reason(basis), 'basis_moved', name)
+    if (!basis.available) assert.equal(basis.packReason, 'BASIS_MOVED', name)
+  }
+  // The rig can fail: with nothing moved the same two phases are available.
+  const still = goodState()
+  const fake = fakeRun(still)
+  assert.equal((await settleAsOfBasis(await readAsOfBasis(D, { run: fake.run }), cleanBracket(), { run: fake.run })).available, true)
+})
+
+test('SETTLE: a second read that fails, or evidence that became unusable, is never the first read handed back', async () => {
+  const state = goodState()
+  const fake = fakeRun(state)
+  const read = await readAsOfBasis(D, { run: fake.run })
+  assert.equal(reason(await settleAsOfBasis(read, cleanBracket(), { run: async () => { throw new Error('db down') } })), 'basis_unreadable')
+  state.run = null
+  assert.equal(reason(await settleAsOfBasis(read, cleanBracket(), { run: fake.run })), 'basis_moved')
+})
+
 test('base currency: the organisation row decides, with the default only when there is no row', async () => {
   const eur = goodState({ baseCurrency: 'EUR' })
   assert.equal(reason((await load(eur)).basis), 'no_gl_snapshot', 'the GBP balances are not the EUR ones')
@@ -279,7 +315,7 @@ test('text safety: the result carries kinds, counts and decimals; never an accou
 
 test('the closed reason table is exactly the reasons the basis can return', () => {
   assert.deepEqual([...PACK_BASIS_REASON_LIST].sort(), [
-    'basis_unreadable', 'gl_snapshot_ambiguous', 'gl_snapshot_other_tenant', 'gl_snapshot_unlabelled', 'inventory_accounts_shared', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
+    'basis_moved', 'basis_unreadable', 'gl_snapshot_ambiguous', 'gl_snapshot_other_tenant', 'gl_snapshot_unlabelled', 'inventory_accounts_shared', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
     'not_for_date', 'stream_not_fresh', 'subledger_snapshot_incomplete', 'unreliable_subledger_snapshot',
   ])
   const kinds: PackBasisAccountKind[] = ['inventory', 'allocated', 'transit', 'cogs', 'unearned']

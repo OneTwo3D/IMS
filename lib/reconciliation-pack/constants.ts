@@ -478,6 +478,7 @@ export const PACK_BASIS_REASONS = {
   no_subledger_snapshot: 'no inventory snapshot run row exists for the cycle date',
   unreliable_subledger_snapshot: 'at least one inventory snapshot row for the cycle date is not point-in-time reliable',
   subledger_snapshot_incomplete: 'the number of inventory snapshot rows for the cycle date is not the number its run row recorded',
+  basis_moved: 'the stored balances or the subledger for the cycle date changed between the read inside the liveness bracket and the read after it (a scheduled pull or an on-demand refresh wrote them during the run)',
   stream_not_fresh: 'the Xero balance-snapshot stream was not fresh and unmoved at both liveness reads, or liveness could not be read',
   basis_unreadable: 'the basis could not be read: the cycle date is not a real calendar date, a database error or timeout, or a stored value that is not a finite number',
 } as const
