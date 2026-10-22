@@ -5245,6 +5245,69 @@ function refusalPrefixForRetry(reason: string): string {
     'The refund stays on the accounting retry list; retry it once the tax mapping is restored.'
 }
 
+/**
+ * Before persisted journals of an IN-TRANSIT refund are replayed: the refund must have a VALUED return expectation
+ * whose ledger link is the persisted journal. Present: the link is reconciled (a different one refuses). Missing or
+ * unvalued (a refund written by a build that created the document after the refund committed, or whose valuing never
+ * ran): rebuilt from the refund's own stored cost snapshot, and valued against the persisted journal's amount. Fails
+ * closed, with a closed code, when the rows cannot be rebuilt or do not add up to what the journal debited.
+ */
+async function ensureReturnExpectationBeforeReplay(
+  tx: Prisma.TransactionClient,
+  params: {
+    refundId: string
+    orderId: string
+    creditNoteNumber: string | null
+    returnWarehouseId: string
+    skipUnshipped: boolean
+    lines: ReadonlyArray<{ id: string; costLayerSnapshot: Prisma.JsonValue | null }>
+    fallbackLines: CreatedRefundLine[]
+    syncs: readonly RefundAccountingSyncRequest[]
+  },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const refuse = (code: string) => ({ ok: false as const, error: `This in-transit refund's return document cannot be established (${code}), so its Stock in Transit journal was not replayed. Check the refund's cost snapshot and raise the document by hand.` })
+  const link = returnExpectationTransitLinkFromSyncs(params.syncs)
+  const existing = await tx.returnExpectation.findUnique({ where: { refundId: params.refundId }, select: { valuedAt: true } })
+  if (existing?.valuedAt) {
+    // Settled already: only the ledger link is checked (a conflicting one throws and the retry reports it).
+    await settleReturnExpectationTx(tx, { refundId: params.refundId, orderId: params.orderId, rows: [], transit: link })
+    return { ok: true }
+  }
+
+  const entries = params.lines.flatMap((line) => parseCostLayerSnapshot(line.costLayerSnapshot)
+    .filter((entry) => entry.source === 'shipment')
+    .map((entry) => ({ refundLineId: line.id, entry })))
+  const layerIds = [...new Set(entries.map(({ entry }) => entry.costLayerId))]
+  const layers = layerIds.length === 0 ? [] : await tx.costLayer.findMany({ where: { id: { in: layerIds } }, select: { id: true, productId: true, poLineId: true } })
+  const layerById = new Map(layers.map((layer) => [layer.id, layer]))
+  let rows: RefundReturnRow[] = entries.flatMap(({ refundLineId, entry }) => {
+    const layer = layerById.get(entry.costLayerId)
+    if (!layer) return []
+    return [{ productId: layer.productId, qty: refundBoundaryNumber(entry.qty), refundLineId, unitCostBase: entry.unitCostBase, poLineId: layer.poLineId ?? null, sourceCostLayerId: entry.costLayerId }]
+  })
+  // A stored entry whose layer is gone cannot be priced: rebuilding without it would understate the document.
+  if (rows.length !== entries.length) return refuse('snapshot_layer_missing')
+
+  if (rows.length === 0) {
+    // Nothing was priced, so no journal can have been staged for a value: the refund's own quantities stand.
+    if (link) return refuse('snapshot_missing')
+    rows = await buildRefundFallbackReturnRows(tx, params.orderId, params.fallbackLines, params.refundId, { skipUnshipped: params.skipUnshipped })
+  } else if (link) {
+    let priced = toDecimal(0)
+    for (const row of rows) priced = addMoney(priced, multiplyMoney(row.qty, row.unitCostBase ?? 0))
+    if (!roundQuantity(priced, 6).eq(roundQuantity(link.debitBase, 6))) return refuse('snapshot_does_not_match_journal')
+  }
+  await settleReturnExpectationTx(tx, {
+    refundId: params.refundId,
+    orderId: params.orderId,
+    creditNoteNumber: params.creditNoteNumber,
+    expectedWarehouseId: params.returnWarehouseId,
+    rows,
+    transit: link,
+  })
+  return { ok: true }
+}
+
 export async function retrySalesOrderRefundAccounting(
   client: RefundServiceClient,
   input: {
@@ -5335,6 +5398,8 @@ export async function retrySalesOrderRefundAccounting(
               // productId, which reconstructs a monetary-only 'sale' line as 'shipping' — the exact
               // mis-posting reconstructReplayLine exists to prevent, still open on this path.
               lineKind: true,
+              // The staged cost snapshot: what an in-transit refund's missing document is rebuilt from.
+              costLayerSnapshot: true,
             },
           },
         },
@@ -5387,6 +5452,23 @@ export async function retrySalesOrderRefundAccounting(
         // no tax identity at all, so a retry that re-queues only those is not held up by the fence.
         if (postedTaxRefusal && persistedSyncs.some((sync) => sync.type === 'CREDIT_NOTE')) {
           return { success: false, error: postedTaxRefusal }
+        }
+        // An in-transit refund's persisted journal debits Stock in Transit FOR a return expectation. Replaying it
+        // with no valued document behind it would put value in transit that nothing can ever clear, so the
+        // document is verified (and, if an earlier build never wrote it, rebuilt from the refund's own stored
+        // cost snapshot and journal) BEFORE the journals are handed back; if it cannot be, the replay refuses.
+        if (refund.returnInTransit && refund.returnWarehouseId && !refund.chargeback) {
+          const repaired = await ensureReturnExpectationBeforeReplay(tx, {
+            refundId: refund.id,
+            orderId: refund.orderId,
+            creditNoteNumber: refund.creditNoteNumber,
+            returnWarehouseId: refund.returnWarehouseId,
+            skipUnshipped: refund.externalRefundId != null,
+            lines: refund.lines,
+            fallbackLines: replayLines,
+            syncs: persistedSyncs,
+          })
+          if (!repaired.ok) return { success: false, error: repaired.error }
         }
         // bcz9.4: the COGS subledger row is recorded by queueRefundAccountingActions
         // when it re-queues these persisted syncs, atomically with the COGS_REVERSAL.

@@ -10072,3 +10072,77 @@ test('[in transit atomic] an in-transit refund of a build that predates the in-t
   assert.equal((state.returnExpectations as unknown[] | undefined)?.length, 1)
   assert.ok((state.returnExpectations as unknown as NonNullable<State['returnExpectations']>)[0].valuedAt)
 })
+
+// ---------------------------------------------------------------------------------------------------------------
+// Persisted-sync replay of an in-transit refund: the Stock in Transit journal is never handed back for replay
+// unless a VALUED return expectation stands behind it (rebuilt from the refund's own snapshot when an earlier
+// build never wrote it; refused when it cannot be).
+// ---------------------------------------------------------------------------------------------------------------
+async function inTransitRefundWithPersistedSyncs() {
+  const state = shippedStateForTransit({ settings: { [IN_TRANSIT_SETTING]: 'true' } })
+  const created = await refundOneUnit(state)
+  assert.equal(created.success, true)
+  assert.ok(state.refunds[0].accountingRetrySyncs, 'PRECONDITION: the staged journals are persisted, so the retry takes the replay branch')
+  assert.equal(state.refunds[0].accountingRetryRequired, true, 'PRECONDITION: and the refund is still owing its queueing')
+  return state
+}
+const replay = (state: State) => retrySalesOrderRefundAccounting(createClient(state), { refundId: 'refund-1', accountingSettings: transitSettings })
+
+test('[replay] a persisted-sync replay of an in-transit refund with NO document rebuilds it from the stored snapshot before returning the journal', async () => {
+  const state = await inTransitRefundWithPersistedSyncs()
+  state.returnExpectations = undefined // written by a build that created the document after the refund committed
+  const result = await replay(state)
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.accountingSyncs.some((sync) => sync.type === 'COGS_REVERSAL'), true, 'the persisted journal is what is replayed')
+  const docs = state.returnExpectations as unknown as NonNullable<State['returnExpectations']>
+  assert.equal(docs.length, 1)
+  assert.ok(docs[0].valuedAt)
+  assert.equal(docs[0].transitJournalKey, 'sales-order-refund:refund-1:cogs-reversal')
+  assert.equal(docs[0].transitDebitBase, '10.000000')
+  assert.deepEqual(docs[0].lines.map((line) => [line.productId, line.qty, line.transitValueBase]), [['product-1', '1.000000', '10.000000']])
+  assert.equal(state.movements.length, 0, 'and nothing was restocked')
+})
+
+test('[replay] an UNVALUED document is valued before the replay; a valued one is left alone', async () => {
+  const state = await inTransitRefundWithPersistedSyncs()
+  state.returnExpectations![0].valuedAt = null
+  state.returnExpectations![0].lines[0].qty = '5.000000' // refund-time quantity, to be restated from the stored snapshot
+  state.returnExpectations![0].lines[0].transitValueBase = '0.000000'
+  assert.equal((await replay(state)).success, true)
+  assert.ok(state.returnExpectations![0].valuedAt)
+  assert.deepEqual([state.returnExpectations![0].lines[0].qty, state.returnExpectations![0].lines[0].transitValueBase], ['1.000000', '10.000000'])
+  state.returnExpectations![0].lines[0].transitValueBase = '99.000000'
+  assert.equal((await replay(state)).success, true)
+  assert.equal(state.returnExpectations![0].lines[0].transitValueBase, '99.000000')
+})
+
+test('[replay] REFUSES (nothing replayed, no document invented) when the document is missing and the snapshot cannot rebuild it', async () => {
+  for (const [name, break_, code] of [
+    ['snapshot gone', (s: State) => { s.refundLines[0].costLayerSnapshot = null }, 'snapshot_missing'],
+    ['layer gone', (s: State) => { s.costLayers.length = 0 }, 'snapshot_layer_missing'],
+    ['snapshot disagrees with the journal', (s: State) => { (s.refundLines[0].costLayerSnapshot as Array<{ unitCostBase: unknown }>)[0].unitCostBase = '11.000000' }, 'snapshot_does_not_match_journal'],
+  ] as const) {
+    const state = await inTransitRefundWithPersistedSyncs()
+    state.returnExpectations = undefined
+    break_(state)
+    const result = await replay(state)
+    assert.equal(result.success, false, name)
+    assert.match(result.success ? '' : result.error, new RegExp(code), name)
+    assert.equal(state.returnExpectations, undefined, `${name}: no document invented`)
+  }
+})
+
+test('[replay] a document whose recorded journal differs from the persisted one refuses the replay', async () => {
+  const state = await inTransitRefundWithPersistedSyncs()
+  state.returnExpectations![0].transitJournalKey = 'some-other-journal'
+  const result = await replay(state)
+  assert.equal(result.success, false)
+})
+
+test('[replay] a LEGACY or chargeback refund replays untouched (no document is demanded)', async () => {
+  const legacy = shippedStateForTransit()
+  await refundOneUnit(legacy)
+  assert.equal(legacy.refunds[0].returnInTransit, false)
+  assert.equal((await replay(legacy)).success, true)
+  assert.equal(legacy.returnExpectations, undefined)
+})

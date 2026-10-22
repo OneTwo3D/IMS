@@ -48,13 +48,19 @@ step of the refund flow that writes a companion record was audited for a committ
 | Refund created | mode flag `return_in_transit` | the refund INSERT (one statement) | cannot be missing: it is a column of the row |
 | Refund created | the return expectation document (unvalued, from the refund's quantities) | the refund transaction, under the order lock | a failed document write rolls the WHOLE refund back (tested); a replayed webhook finds the committed refund and its document |
 | Accounting staging | the document's cost snapshot, `valued_at` and ledger link (journal key and amount) | the staging transaction that persists the staged syncs and the refund's staging witness | a failure while valuing rolls the staging back with it; the refund stays owing its accounting (`accounting_retry_required` is armed at the refund INSERT, whenever staging will follow) and the retry values the document |
-| Accounting retry (initial, persisted-sync replay, re-stage) | same as staging | the retry's staging transaction | a retry that finds persisted syncs is only reached after a staging commit, which already valued the document; a retry that re-stages values it; a refund written by an earlier build with no document gets one from the retry |
+| Accounting retry (initial, persisted-sync replay, re-stage) | same as staging | the retry's staging transaction | a retry that finds persisted syncs FIRST verifies the document: valued and linked to the persisted journal, or rebuilt from the refund's own stored cost snapshot and valued against the journal's amount (an earlier build may never have written it); if it cannot be rebuilt (snapshot or layer missing, or the snapshot does not add up to the journal) the replay refuses, with a closed code, and hands no journal back; a retry that re-stages values it |
 | Journal queued | transit sub-ledger row | the transaction that queues the COGS reversal, on the queue's own answer | a crash after the staging commit and before the queue leaves the obligation armed; the queue and the row are one commit, so the row exists exactly when a non-shadow journal is queued |
 | No staging to follow (accounting off) | none to wait for | the document is valued in the refund transaction | n/a |
 
 An unvalued document is not usable: nothing may receive against or write off a document with `valued_at` null (slice 2
 must enforce it, and the settle step refuses a document that already carries an accounted quantity). Replacing the
 document's lines is allowed only while unvalued, and a valued document is never rewritten (first write wins).
+
+### Known limit: successive partial kit refunds
+
+Later partial refunds of a kit estimate the components already returned from `RETURN_INBOUND` movements. An in-transit
+refund writes none until its goods arrive (slice 2), so a second partial kit refund on the same order can over-estimate
+the components still returnable. Not fixed in slice 1; it only matters once the switch is on.
 
 ## Accounting accepted by the owner
 
