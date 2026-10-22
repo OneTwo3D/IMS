@@ -36,6 +36,8 @@ export type InvariantItemId = 'R3' | 'R4' | 'R15'
 /** Findings that say a scan stopped at its cap: the list is a prefix, so nothing may pass on it. */
 const CAP_MARKER_CODES: ReadonlySet<string> = new Set([INVARIANT_TRUNCATED_CODE, 'refund_status_reconciliation_row_cap_reached', 'refund_basis_audit_row_cap_reached'])
 
+const SEVERITIES: ReadonlySet<string> = new Set(['info', 'warning', 'critical'])
+
 const DOMAINS = ['inventory', 'accounting', 'sales'] as const
 type Domain = (typeof DOMAINS)[number]
 type Finding = Record<string, unknown> & { severity: string; code: string }
@@ -63,6 +65,8 @@ function readDomain(evidence: unknown, domain: Domain): DomainReport | PackReaso
   const findings: Finding[] = []
   for (const finding of report.findings as unknown[]) {
     if (!isObject(finding) || typeof finding.severity !== 'string' || typeof finding.code !== 'string') return 'SOURCE_UNREADABLE'
+    // A severity this module does not know is a finding it cannot judge: no item may pass beside it.
+    if (!SEVERITIES.has(finding.severity)) return 'SOURCE_UNREADABLE'
     findings.push(finding as Finding)
   }
   // Positive proof the report ran to the end: the flag is the boolean false, no marker finding, and the summary counts
@@ -137,7 +141,10 @@ function allFindings(id: 'R15', evidence: unknown, ctx: InvariantItemContext): I
   // Every critical finding must be enumerated: the run's own totals may not count more than the reports list.
   const total = isObject(result.summary) && isObject(result.summary.total) ? result.summary.total : null
   const listedCritical = reports.reduce((sum, { report }) => sum + report.summary.critical, 0)
-  if (total === null || !isCount(total.critical) || total.critical !== listedCritical || !Array.isArray(result.criticalFindings) || result.criticalFindings.length !== listedCritical) return inconclusive(id, 'READ_INCOMPLETE')
+  const listedWarning = reports.reduce((sum, { report }) => sum + report.summary.warning, 0)
+  // The run's own totals may not count more warnings than the reports list either: those could not be read one by one.
+  if (total === null || !isCount(total.warning) || total.warning !== listedWarning) return inconclusive(id, 'READ_INCOMPLETE')
+  if (!isCount(total.critical) || total.critical !== listedCritical || !Array.isArray(result.criticalFindings) || result.criticalFindings.length !== listedCritical) return inconclusive(id, 'READ_INCOMPLETE')
 
   const ims: SideRow[] = []
   const vendor: SideRow[] = []
