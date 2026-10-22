@@ -40,14 +40,14 @@ const criticalEntry = (domain: Domain, f: F): F => JSON.parse(JSON.stringify({ d
 /** The proof lib/reconciliation-pack/invariant-snapshot.ts attaches when the run read one REPEATABLE READ READ ONLY snapshot. */
 const SNAPSHOT = { isolation: 'repeatable read', readOnly: true, snapshot: '812:812:', boundToApplicationClient: true }
 /** A run result in the real shape, every count derived from the reports actually listed; the knobs then break one thing at a time. */
-function evidence(inventory: F[] = [], over: { inventory?: unknown; accounting?: unknown; sales?: unknown; result?: F; top?: F; total?: F; domains?: Partial<Record<Domain, unknown>>; ok?: unknown; criticalFindings?: unknown; snapshot?: unknown } = {}): F {
+function evidence(inventory: F[] = [], over: { inventory?: unknown; accounting?: unknown; sales?: unknown; result?: F; top?: F; total?: F; domains?: Partial<Record<Domain, unknown>>; ok?: unknown; failure?: unknown; criticalFindings?: unknown; snapshot?: unknown } = {}): F {
   const pick = (k: Domain, fallback: F) => (k in over ? over[k] : fallback)
   const reports = { inventory: pick('inventory', report(inventory)), accounting: pick('accounting', plainReport([])), sales: pick('sales', plainReport([])) }
   const dom = { inventory: countsOf(reports.inventory), accounting: countsOf(reports.accounting), sales: countsOf(reports.sales) }
   const sum = (key: string) => (['inventory', 'accounting', 'sales'] as Domain[]).reduce((n, d) => n + (dom[d][key] as number), 0)
   const critical = (['inventory', 'accounting', 'sales'] as Domain[]).flatMap((d) => (Array.isArray((reports[d] as F | null | undefined)?.findings) ? ((reports[d] as F).findings as F[]) : []).filter((f) => f && f.severity === 'critical').map((f) => criticalEntry(d, f)))
   const summary = { total: { total: sum('total'), info: sum('info'), warning: sum('warning'), critical: sum('critical'), ...(over.total ?? {}) }, ...dom, ...(over.domains ?? {}) }
-  return { ok: 'ok' in over ? over.ok : sum('critical') === 0, snapshot: 'snapshot' in over ? over.snapshot : SNAPSHOT, ...(over.top ?? {}), result: { status: 'completed', errors: [], criticalFindings: 'criticalFindings' in over ? over.criticalFindings : critical, summary, reports, ...(over.result ?? {}) } }
+  return { ok: 'ok' in over ? over.ok : sum('critical') === 0, failure: 'failure' in over ? over.failure : sum('critical') === 0 ? null : 'critical_findings', snapshot: 'snapshot' in over ? over.snapshot : SNAPSHOT, ...(over.top ?? {}), result: { status: 'completed', errors: [], criticalFindings: 'criticalFindings' in over ? over.criticalFindings : critical, summary, reports, ...(over.result ?? {}) } }
 }
 
 function assertBuilds(item: ItemInput): void {
@@ -206,6 +206,11 @@ const SHAPES: Shape[] = [
   { name: 'inventory report with an empty cursor', ev: () => evidence([], { inventory: report([], { nextCursor: '' }) }), ids: BOTH },
   { name: 'accounting report carrying a null cursor', ev: () => evidence([], { accounting: { ...plainReport([]), nextCursor: null } }), ids: BOTH },
   { name: 'sales report carrying an empty cursor', ev: () => evidence([], { sales: { ...plainReport([]), nextCursor: '' } }), ids: BOTH },
+  { name: 'ok true beside a report_failed preflight failure', ev: () => evidence([], { failure: 'report_failed' }), ids: BOTH },
+  { name: 'ok true beside a critical_findings preflight failure', ev: () => evidence([], { failure: 'critical_findings' }), ids: BOTH },
+  { name: 'no preflight failure field', ev: () => evidence([], { failure: undefined }), ids: BOTH },
+  { name: 'a critical run whose preflight failure is null', ev: () => evidence([r4(2, 0)], { failure: null }), ids: BOTH },
+  { name: 'a critical run whose preflight failure is report_failed', ev: () => evidence([r4(2, 0)], { failure: 'report_failed' }), ids: BOTH },
   { name: 'a finding with an empty code', ev: () => evidence([{ severity: 'info', code: '', message: 'm', details: {} }]), ids: BOTH },
   { name: 'a finding with a numeric code', ev: () => evidence([{ severity: 'info', code: 5, message: 'm', details: {} }]), ids: BOTH },
   { name: 'a finding with a numeric severity', ev: () => evidence([{ severity: 1, code: 'x', message: 'm', details: {} }]), ids: BOTH },

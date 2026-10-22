@@ -62,6 +62,7 @@ export function realEvidence(inventoryFindings: Finding[] = []): Record<string, 
   const plain = { findings: [], summary: empty }
   return {
     ok: counts.critical === 0,
+    failure: counts.critical === 0 ? null : 'critical_findings',
     // The proof lib/reconciliation-pack/invariant-snapshot.ts attaches when the run read one REPEATABLE READ READ ONLY snapshot.
     snapshot: { isolation: 'repeatable read', readOnly: true, snapshot: '812:812:', boundToApplicationClient: true },
     result: {

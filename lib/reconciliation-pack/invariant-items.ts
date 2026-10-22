@@ -157,6 +157,9 @@ function readRun(evidence: unknown): { reports: Record<Domain, DomainReport>; ru
   if ([...owed.values()].some((left) => left !== 0)) return 'READ_INCOMPLETE'
   // `ok` must be exactly the boolean the findings imply (a missing or non-boolean value is never equal to it).
   if ((evidence as Record<string, unknown>).ok !== (sum.critical === 0)) return 'READ_INCOMPLETE'
+  // And the preflight's own `failure` must say the same (lib/cron/invariant-check-preflight.ts): null for a clean run, and for a
+  // completed run with no errors only 'critical_findings' is possible. A missing field or any other value contradicts the run.
+  if ((evidence as Record<string, unknown>).failure !== (sum.critical === 0 ? null : 'critical_findings')) return 'READ_INCOMPLETE'
   return { reports, run: result }
 }
 
