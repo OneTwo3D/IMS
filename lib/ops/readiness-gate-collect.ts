@@ -59,6 +59,7 @@ import {
   type RehearsalEvidence,
 } from '@/lib/ops/readiness-gate'
 import type { BuildIdentity } from '@/lib/ops/build-identity'
+import { assessPackItems, combineDerivations, type PackReportRead } from '@/lib/ops/readiness-gate-pack'
 import type { AccountingReconciliationReadiness } from '@/lib/ops/rollout-readiness'
 
 export type ChildResult = { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }
@@ -91,6 +92,10 @@ export type GateDeps = {
   readApplyRun: () => Promise<{ systemId: string; runs: ApplyRunRow[] }>
   /** Every published apply report in `dir`, each read ONCE, or a reason there is none. Throws when the directory cannot be read. */
   readApplyReports: (dir: string) => ApplyReportsRead
+  /** The newest reconciliation pack report in `dir` (by sequence, through the pack's chain reader), or why there is none. Throws when it cannot be classified. */
+  readNewestPackReport: (dir: string) => PackReportRead
+  /** The database's cluster system identifier. Throws when it cannot be read. */
+  readSystemIdentifier: () => Promise<string>
   /** The environment of this process, read only by name. */
   env: Record<string, string | undefined>
   repoRoot: string
@@ -101,6 +106,8 @@ export type CollectOptions = {
   expectGranted: string[] | null
   rehearsalDir: string
   applyReportDir: string
+  /** Where `npm run reconcile:pack` publishes its reports. */
+  packReportDir: string
 }
 
 function describe(error: unknown): string {
@@ -477,14 +484,30 @@ export async function collectGateResults(options: CollectOptions, deps: GateDeps
     return assessReadSyncStatus(run, now)
   })
 
-  // 7. The reconciliation pack, as slots.
+  // 7. The reconciliation pack: the NEWEST report, read once, mapped item by item (readiness-gate-pack.ts). A report that is missing,
+  // untrusted, for another installation or phase, or too old for an item's cadence makes that item unreadable, never a pass.
+  let packRead: PackReportRead
+  try {
+    packRead = deps.readNewestPackReport(options.packReportDir)
+  } catch (error) {
+    // Only the system error CODE reaches the text: the message can carry a path.
+    packRead = { untrusted: `the reconciliation pack report location could not be read (${(error as NodeJS.ErrnoException | undefined)?.code ?? 'error'})` }
+  }
+  let systemIdentifier: string | { unreadable: string }
+  try {
+    systemIdentifier = await deps.readSystemIdentifier()
+    if (typeof systemIdentifier !== 'string' || systemIdentifier === '') systemIdentifier = { unreadable: 'the database returned no system identifier' }
+  } catch {
+    systemIdentifier = { unreadable: 'the database could not be asked for its system identifier' }
+  }
+  const packResults = assessPackItems(packRead, { phase: options.phase, now, systemIdentifier })
   for (const item of PACK_ITEMS) {
     const id = `pack-${item.id}`
-    if (item.derivedFrom === 'invariant-report') {
-      results[id] = derivePackItemFromInvariant(item.id as 'R3' | 'R4' | 'R15', invariantEvidence, results['invariant-preflight']!)
-    } else {
-      results[id] = { kind: 'not-available', reason: `no runner for ${item.id} exists on this tree (${item.source})` }
-    }
+    const fromPack = packResults[item.id]
+    // R3, R4 and R15 are also derived by the gate from its own run of the invariant report; the two must agree.
+    results[id] = item.derivedFrom === 'invariant-report'
+      ? combineDerivations(item.id, derivePackItemFromInvariant(item.id as 'R3' | 'R4' | 'R15', invariantEvidence, results['invariant-preflight']!), fromPack)
+      : fromPack
   }
   const slotIds = new Set(CHECK_CATALOGUE.map((definition) => definition.id as string))
   for (const id of Object.keys(results)) if (!slotIds.has(id)) notes.push(`internal: collected a result for ${id}, which the catalogue does not define`)
@@ -513,6 +536,12 @@ export async function defaultReadReconciliation(now: Date): Promise<AccountingRe
   const { collectAccountingReconciliationReadiness, createDefaultRolloutReadinessAdapters } = await import('@/lib/ops/rollout-readiness')
   const adapters = createDefaultRolloutReadinessAdapters()
   return collectAccountingReconciliationReadiness(adapters, now)
+}
+
+export async function defaultReadSystemIdentifier(): Promise<string> {
+  const { db } = await import('@/lib/db')
+  const ids = await db.$queryRaw<Array<{ sid: string }>>`SELECT system_identifier::text AS sid FROM pg_control_system()`
+  return ids[0]?.sid ?? ''
 }
 
 export async function defaultReadApplyRun(): Promise<{ systemId: string; runs: ApplyRunRow[] }> {
