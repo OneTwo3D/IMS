@@ -14,6 +14,7 @@ import { PACK_ITEM_IDS } from '../../lib/reconciliation-pack/constants.ts'
 const NOW = new Date('2026-10-20T12:00:00.000Z')
 const P = 'cproduct0000000000000001a'
 const W = 'cwarehouse000000000000001'
+const P2 = 'cproduct0000000000000002b'
 const NO_ACCEPTANCES = parseAcceptanceFile(null)
 const ctx = (acceptances = NO_ACCEPTANCES): InvariantItemContext => ({ phase: 'P1', now: NOW, acceptances })
 
@@ -34,13 +35,15 @@ const countsOf = (r: unknown): F => {
   const n = (severity: string) => fs.filter((f) => f.severity === severity).length
   return { total: fs.length, info: n('info'), warning: n('warning'), critical: n('critical') }
 }
+/** A critical-findings entry exactly as lib/cron/invariant-check.ts toCriticalFinding builds it (JSON drops the undefined ids). */
+const criticalEntry = (domain: Domain, f: F): F => JSON.parse(JSON.stringify({ domain, code: f.code, message: f.message, details: f.details, productId: f.productId, warehouseId: f.warehouseId, orderId: f.orderId, shipmentId: f.shipmentId, refundId: f.refundId, syncLogId: f.syncLogId }))
 /** A run result in the real shape, every count derived from the reports actually listed; the knobs then break one thing at a time. */
 function evidence(inventory: F[] = [], over: { inventory?: unknown; accounting?: unknown; sales?: unknown; result?: F; top?: F; total?: F; domains?: Partial<Record<Domain, unknown>>; ok?: unknown; criticalFindings?: unknown } = {}): F {
   const pick = (k: Domain, fallback: F) => (k in over ? over[k] : fallback)
   const reports = { inventory: pick('inventory', report(inventory)), accounting: pick('accounting', plainReport([])), sales: pick('sales', plainReport([])) }
   const dom = { inventory: countsOf(reports.inventory), accounting: countsOf(reports.accounting), sales: countsOf(reports.sales) }
   const sum = (key: string) => (['inventory', 'accounting', 'sales'] as Domain[]).reduce((n, d) => n + (dom[d][key] as number), 0)
-  const critical = (['inventory', 'accounting', 'sales'] as Domain[]).flatMap((d) => (Array.isArray((reports[d] as F | null | undefined)?.findings) ? ((reports[d] as F).findings as F[]) : []).filter((f) => f && f.severity === 'critical').map((f) => ({ domain: d, code: f.code })))
+  const critical = (['inventory', 'accounting', 'sales'] as Domain[]).flatMap((d) => (Array.isArray((reports[d] as F | null | undefined)?.findings) ? ((reports[d] as F).findings as F[]) : []).filter((f) => f && f.severity === 'critical').map((f) => criticalEntry(d, f)))
   const summary = { total: { total: sum('total'), info: sum('info'), warning: sum('warning'), critical: sum('critical'), ...(over.total ?? {}) }, ...dom, ...(over.domains ?? {}) }
   return { ok: 'ok' in over ? over.ok : sum('critical') === 0, ...(over.top ?? {}), result: { status: 'completed', errors: [], criticalFindings: 'criticalFindings' in over ? over.criticalFindings : critical, summary, reports, ...(over.result ?? {}) } }
 }
@@ -175,6 +178,9 @@ const SHAPES: Shape[] = [
   { name: 'critical findings: the right entries plus one from an unknown domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'inventory', code: 'x' }, { domain: 'other', code: 'x' }] }), ids: BOTH },
   { name: 'critical findings: the right entries plus a duplicate of a clean domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'inventory', code: 'x' }, { domain: 'sales', code: 'x' }] }), ids: BOTH },
   { name: 'critical findings entry in the wrong domain', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'sales', code: 'x' }] }), ids: BOTH },
+  { name: 'critical findings: one finding listed twice in place of another, every count still right', ev: () => { const a = r4(2, 0); const b = r4(3, 0, { productId: P2 }); return evidence([a, b], { criticalFindings: [criticalEntry('inventory', a), criticalEntry('inventory', a)] }) }, ids: BOTH },
+  { name: 'critical findings entry naming the right code for another subject', ev: () => evidence([r4(2, 0)], { criticalFindings: [criticalEntry('inventory', r4(2, 0, { productId: P2 }))] }), ids: BOTH },
+  { name: 'critical findings entry with a subject id that is not a string', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ ...criticalEntry('inventory', r4(2, 0)), orderId: 7 }] }), ids: BOTH },
   { name: 'critical findings entry without a code', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ domain: 'inventory' }] }), ids: BOTH },
   { name: 'a finding with an empty code', ev: () => evidence([{ severity: 'info', code: '', message: 'm', details: {} }]), ids: BOTH },
   { name: 'a finding with a numeric code', ev: () => evidence([{ severity: 'info', code: 5, message: 'm', details: {} }]), ids: BOTH },

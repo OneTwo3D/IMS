@@ -36,6 +36,9 @@ export type InvariantItemId = 'R3' | 'R4' | 'R15'
 /** Findings that say a scan stopped at its cap: the list is a prefix, so nothing may pass on it. */
 const CAP_MARKER_CODES: ReadonlySet<string> = new Set([INVARIANT_TRUNCATED_CODE, 'refund_status_reconciliation_row_cap_reached', 'refund_basis_audit_row_cap_reached'])
 
+/** The ids that name a finding's subject in the gate's identity (lib/ops/readiness-gate.ts findingSubject). */
+const SUBJECT_KEYS = ['productId', 'warehouseId', 'orderId', 'shipmentId', 'refundId', 'syncLogId'] as const
+
 const SEVERITIES: ReadonlySet<string> = new Set(['info', 'warning', 'critical'])
 
 const DOMAINS = ['inventory', 'accounting', 'sales'] as const
@@ -87,8 +90,8 @@ function readDomain(reports: Record<string, unknown>, domain: Domain): DomainRep
 
 /**
  * The whole run, validated field by field. Every domain's counts equal its listed findings; the run's own summary (the total
- * and each domain's) equals the sum of what the reports list, count by count; the critical findings it lists are objects and
- * agree per domain; and `ok` is a boolean that says what the findings say. Anything else is inconclusive, never a pass.
+ * and each domain's) equals the sum of what the reports list, count by count; the critical findings it lists are exactly the
+ * reports' critical findings, identity by identity; and `ok` is a boolean that says what the findings say. Anything else is inconclusive, never a pass.
  */
 function readRun(evidence: unknown): { reports: Record<Domain, DomainReport>; run: Record<string, unknown> } | PackReasonCode {
   if (!isObject(evidence) || !isObject(evidence.result) || !isObject(evidence.result.reports)) return 'SOURCE_UNREADABLE'
@@ -109,14 +112,28 @@ function readRun(evidence: unknown): { reports: Record<Domain, DomainReport>; ru
   }
   const total = readCounts(result.summary.total)
   if (total === null || !sameCounts(total, sum)) return 'READ_INCOMPLETE'
-  // The per-domain counts below, with the refusal of an entry from a domain that is not one, fix the length of this list exactly.
+  // The critical findings the run lists must be EXACTLY the critical findings the reports list, as a multiset of the gate's
+  // finding identity (domain, code and subject ids), duplicates included. Equal counts are not enough: a list naming one
+  // finding twice and another not at all has the right length and still hides a failure.
   if (!Array.isArray(result.criticalFindings)) return 'READ_INCOMPLETE'
-  const perDomain = new Map<string, number>()
-  for (const entry of result.criticalFindings as unknown[]) {
-    if (!isObject(entry) || typeof entry.domain !== 'string' || typeof entry.code !== 'string' || entry.code === '') return 'READ_INCOMPLETE'
-    perDomain.set(entry.domain, (perDomain.get(entry.domain) ?? 0) + 1)
+  const owed = new Map<string, number>()
+  for (const domain of DOMAINS) {
+    for (const finding of reports[domain].findings) {
+      if (finding.severity !== 'critical') continue
+      const identity = invariantWarningId(domain, finding as Parameters<typeof invariantWarningId>[1])
+      owed.set(identity, (owed.get(identity) ?? 0) + 1)
+    }
   }
-  if (DOMAINS.some((domain) => (perDomain.get(domain) ?? 0) !== reports[domain].summary.critical) || [...perDomain.keys()].some((domain) => !(DOMAINS as readonly string[]).includes(domain))) return 'READ_INCOMPLETE'
+  for (const entry of result.criticalFindings as unknown[]) {
+    if (!isObject(entry) || typeof entry.domain !== 'string' || !(DOMAINS as readonly string[]).includes(entry.domain) || typeof entry.code !== 'string' || entry.code === '') return 'READ_INCOMPLETE'
+    // A subject id that is present must be a string: anything else would print as some other identity.
+    if (SUBJECT_KEYS.some((key) => entry[key] !== undefined && entry[key] !== null && typeof entry[key] !== 'string')) return 'READ_INCOMPLETE'
+    const identity = invariantWarningId(entry.domain, entry as Parameters<typeof invariantWarningId>[1])
+    const left = owed.get(identity) ?? 0
+    if (left === 0) return 'READ_INCOMPLETE'
+    owed.set(identity, left - 1)
+  }
+  if ([...owed.values()].some((left) => left !== 0)) return 'READ_INCOMPLETE'
   // `ok` must be exactly the boolean the findings imply (a missing or non-boolean value is never equal to it).
   if ((evidence as Record<string, unknown>).ok !== (sum.critical === 0)) return 'READ_INCOMPLETE'
   return { reports, run: result }
