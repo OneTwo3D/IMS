@@ -186,6 +186,8 @@ const SHAPES: Shape[] = [
   { name: 'an info finding with a orderId that is not a string', ev: () => evidence([{ severity: 'info', code: 'x', orderId: { id: 1 }, message: 'm', details: {} }]), ids: BOTH },
   { name: 'a warning finding with a productId that is not a string', ev: () => evidence([{ severity: 'warning', code: 'x', productId: 42, message: 'm', details: {} }]), ids: BOTH },
   { name: 'a warning finding with a orderId that is not a string', ev: () => evidence([{ severity: 'warning', code: 'x', orderId: { id: 1 }, message: 'm', details: {} }]), ids: BOTH },
+  { name: 'an info finding with an empty productId', ev: () => evidence([{ severity: 'info', code: 'x', productId: '', message: 'm', details: {} }]), ids: BOTH },
+  { name: 'a critical findings entry with an empty orderId', ev: () => evidence([r4(2, 0)], { criticalFindings: [{ ...criticalEntry('inventory', r4(2, 0)), orderId: '' }] }), ids: BOTH },
   { name: 'a finding with an empty code', ev: () => evidence([{ severity: 'info', code: '', message: 'm', details: {} }]), ids: BOTH },
   { name: 'a finding with a numeric code', ev: () => evidence([{ severity: 'info', code: 5, message: 'm', details: {} }]), ids: BOTH },
   { name: 'a finding with a numeric severity', ev: () => evidence([{ severity: 1, code: 'x', message: 'm', details: {} }]), ids: BOTH },
@@ -241,6 +243,16 @@ test('R15: an accepted warning sharing its identity with a critical finding neve
     assert.equal((item.entries!.bothEqual ?? []).length, 0, name)
     assertBuilds(item)
   }
+})
+
+test('R15: a warning with an empty subject id never matches the acceptance written for the subjectless warning', () => {
+  const subjectless = { severity: 'warning', code: 'some_warning', message: 'm', details: {} }
+  const accepted = ctx(acceptance('invariant:inventory:some_warning:-'))
+  assert.equal(runInvariantItem('R15', evidence([subjectless]), accepted).outcome, 'pass', 'precondition: the acceptance covers the subjectless warning')
+  const item = runInvariantItem('R15', evidence([{ ...subjectless, productId: '' }]), accepted)
+  assert.equal(item.outcome, 'inconclusive')
+  assertBuilds(item)
+  assert.equal(runInvariantItem('R15', evidence([{ ...subjectless, productId: null }]), accepted).outcome, 'pass', 'null is how the inventory producer writes an absent id')
 })
 
 test('R15: a warning with no current written acceptance fails; an accepted one is an equal identity and passes on "compared"', () => {

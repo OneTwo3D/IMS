@@ -39,8 +39,11 @@ const CAP_MARKER_CODES: ReadonlySet<string> = new Set([INVARIANT_TRUNCATED_CODE,
 /** The ids that name a finding's subject in the gate's identity (lib/ops/readiness-gate.ts findingSubject). */
 const SUBJECT_KEYS = ['productId', 'warehouseId', 'orderId', 'shipmentId', 'refundId', 'syncLogId'] as const
 
-/** Every subject id that is present (not undefined or null) is a string. */
-const hasReadableSubject = (finding: Record<string, unknown>) => SUBJECT_KEYS.every((key) => finding[key] === undefined || finding[key] === null || typeof finding[key] === 'string')
+/**
+ * Every subject id is absent (undefined, or null as the inventory SQL rows carry it) or a NON-EMPTY string. The gate's identity
+ * drops a falsy id, so an empty string would read as absent and could match an acceptance written for another identity.
+ */
+const hasReadableSubject = (finding: Record<string, unknown>) => SUBJECT_KEYS.every((key) => finding[key] === undefined || finding[key] === null || (typeof finding[key] === 'string' && finding[key] !== ''))
 
 const SEVERITIES: ReadonlySet<string> = new Set(['info', 'warning', 'critical'])
 
