@@ -86,6 +86,8 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   purchase_return_lines: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
   purchase_returns: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
   purchase_units: { kind: 'CONFIG_ALLOWED', reason: 'configured units of measure' },
+  return_expectation_lines: { kind: 'MUST_BE_EMPTY', reason: 'return expectations: goods a refund sent back that have not arrived' },
+  return_expectations: { kind: 'MUST_BE_EMPTY', reason: 'return expectations: goods a refund sent back that have not arrived' },
   sales_order_lines: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
   sales_order_refund_lines: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
   sales_order_refunds: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },

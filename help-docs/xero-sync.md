@@ -474,7 +474,7 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Shipping Income | Revenue | Shipping charges on sales |
 | Discounts Given | Revenue / Expense | Order-level discounts |
 | Purchases | Direct Cost | Default account for purchase bills |
-| Stock in Transit | Asset | Goods ordered but not yet received |
+| Stock in Transit | Asset | Goods ordered but not yet received, and (when refund returns are held in transit) refunded goods not yet back |
 | Inventory Asset | Asset | Stock on hand (available) |
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
@@ -701,7 +701,7 @@ Configure which documents are synced to Xero under **Integrations → Xero → T
 | Credit Notes | Push credit notes on refund |
 | Purchase Bills | Push supplier bills when a PO is invoiced |
 | Stock Receipts | Journal: DR Inventory / CR Stock in Transit on goods received — raised by a receipt entered in IMS, by a WMS booked-in webhook against a purchase order (o3d-8f0p6), **and** by a WMS stock-sync *align-up* correction that absorbs the units into an open purchase-order ASN line (o3d-6nd55). Each raises it for the value it actually brought into stock — the goods cost plus that line's share of the order's additional costs, counting only freight orders that have not been cancelled — and each excludes units another of the three has already accounted for, so one delivery is never posted twice. A warehouse-to-warehouse stock transfer raises none: its value never left inventory, and neither does a free-of-charge line, which has no value to move. **Late landed cost on units still in transit between warehouses (o3d-nrl4):** because a transfer posts nothing, those units are still in Inventory, so when a freight order is added, edited or cancelled after the goods were bought, the landed-cost reclass journal (`STOCK_IN_TRANSIT`) includes their share in the same entry the on-hand units get — DR Inventory / CR Stock in Transit for an increase, the reverse for a decrease — at the moment the landed cost changes. Only the part of a transfer line that has not landed counts (a manual receipt or a WMS book-in **and** a WMS stock-sync alignment credit all count as landed). The later receipt, or the cancellation of the dispatch, posts nothing: the units arrive at the revalued cost. A second change, a reversal or a cancelled freight order posts its own difference. A landed-cost change made before this behaviour existed, while units were in transit, is not repaired retrospectively. |
-| COGS Reversals | Reverse COGS on stock returns |
+| COGS Reversals | Reverse COGS on stock returns. DR Inventory / CR COGS; for a refund whose returned goods are held in transit (`refund_returns_in_transit_enabled`, off by default) DR **Stock in Transit** / CR COGS, with a matching `CUSTOMER_RETURN_IN_TRANSIT` row in the transit sub-ledger that the daily transit reconciliation sums (not written when the journal is only a shadow). See `docs/refund-in-transit.md`. |
 | Inventory Adjustments | Journal for manual stock adjustments |
 | Manufacturing Journal | Capitalise per-run overhead (labour, machine, etc.) on assembly/disassembly: DR Inventory / CR Manufacturing Overhead. Includes the retro-recalc reclass (`MANUFACTURING_RECLASS`) when cost lines are edited after completion. |
 

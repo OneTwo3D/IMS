@@ -5495,6 +5495,7 @@ What was changed, by reader (switch off is byte-identical for every one: the new
 | payment and bill settlement verdict | a shadowed registration reported as a ledger discrepancy | its own non-discrepancy verdict that says IMS did not send it |
 | health page, latest accounting batch | a bare `CANCELLED` | `SHADOWED (not sent by IMS ...)` |
 | refund relief | an expired shadowed reversal journal counted as relief from the record | stays unresolved while the durable record exists |
+| refund transit sub-ledger row (`recordRefundTransitFromSync`) | a shadowed COGS reversal for an in-transit refund would add a Stock in Transit movement the ledger never makes, and the daily transit reconciliation would flag it for ever | no row is written for a shadowed journal (it reads the enqueue's whole answer, not a bare boolean) |
 | Group A2 debit reason, delete guard batch sentence | a shadow described as an abandoned or operator-settled row | its own wording |
 | bundle sync, ASN state readers | a durable conflict about component links that the held product writes never made; a Create control offered then refused | skipped with a held reason; the control is blocked with the shadow sentence |
 | outbox re-arm of a Xero job | a job the retirement SHADOWED was re-armed to pending | the retirement record is kept |

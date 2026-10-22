@@ -104,6 +104,7 @@ import {
   buildChargebackRefundLines,
   createSalesOrderRefund,
   recordRefundCogsReversalFromSync,
+  recordRefundTransitFromSync,
   retrySalesOrderRefundAccounting,
   type CreatedRefundLine,
   type RefundAccountingSyncRequest,
@@ -2201,6 +2202,8 @@ async function queueRefundAccountingActions(input: {
         })
         outcomeInTx = outcome
         await recordRefundCogsReversalFromSync(tx, sync, outcome.queued)
+        // The same journal, when it debits Stock in Transit (a refund whose goods are not back): its transit row.
+        await recordRefundTransitFromSync(tx, sync, outcome)
       })
       ledger.accountInTransaction(sync, outcomeInTx)
     } else {

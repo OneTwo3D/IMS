@@ -631,6 +631,7 @@ model Warehouse {
   productionOrders      ProductionOrder[]
   orderShipments        SalesOrder[]    @relation("ShipFromWarehouse")
   refundReturns         SalesOrderRefund[]
+  returnExpectations    ReturnExpectation[]
   incomingPurchaseOrders PurchaseOrder[] @relation("PODestinationWarehouse")
   orderAllocations      OrderAllocation[]
   shipments             Shipment[]
@@ -749,6 +750,7 @@ model Product {
 
   salesOrderLines SalesOrderLine[]
   returnLines     SalesOrderRefundLine[]
+  returnExpectationLines ReturnExpectationLine[]
 
   options         ProductOption[]
 
@@ -983,7 +985,7 @@ model TransitSubledgerMovement {
   id             String   @id @default(cuid())
   // 'PURCHASE_BILL' | 'PURCHASE_BILL_UPDATE' | 'SUPPLIER_CREDIT_NOTE' | 'STOCK_RECEIPT'
   // | 'LANDED_COST_RECLASS' | 'LANDED_COST_CONSUMED_OFFSET' | 'PURCHASE_ORDER_CANCEL'
-  // | 'SUPPLIER_RETURN'
+  // | 'SUPPLIER_RETURN' | 'CUSTOMER_RETURN_IN_TRANSIT'
   sourceType     String   @map("source_type")
   // originating entity (purchaseOrderId / creditNoteId) for traceability
   sourceRef      String   @map("source_ref")
@@ -2013,6 +2015,7 @@ model SalesOrder {
   shipFromWarehouse Warehouse?       @relation("ShipFromWarehouse", fields: [shipFromWarehouseId], references: [id])
   lines             SalesOrderLine[]
   refunds           SalesOrderRefund[]
+  returnExpectations ReturnExpectation[]
   payments          Payment[]
   allocations       OrderAllocation[]
   shipments         Shipment[]
@@ -2138,6 +2141,12 @@ model SalesOrderRefund {
   // a loss, goods not returned). Persisted so an accounting retry that re-stages
   // reproduces the treatment.
   chargeback      Boolean    @default(false)
+  // Whether this refund's returned units were routed to a return expectation (goods in transit) instead of
+  // being restocked at refund time. Decided ONCE, inside the refund transaction under the order lock, and
+  // persisted so an accounting retry days later (after the switch may have flipped) re-derives the same
+  // treatment: the COGS reversal debits Stock in Transit for exactly the refunds that carry true here. The
+  // default is false, which is the behaviour of every build that predates the column.
+  returnInTransit Boolean    @default(false) @map("return_in_transit")
   // scjz.71: whether this refund STAGED a COGS/unearned reversal (durable, set at
   // staging time). Distinguishes a fully-shipped chargeback (no reversal staged —
   // credit-note-only, exempt from reversal-evidence checks) from a partial/deferred
@@ -2185,10 +2194,79 @@ model SalesOrderRefund {
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])
   lines           SalesOrderRefundLine[]
   payments        Payment[]
+  returnExpectation ReturnExpectation?
 
   @@unique([externalRefundId])
   @@index([orderId])
   @@map("sales_order_refunds")
+}
+
+/// Goods a refund sent back that have not yet arrived. One per refund that was routed in transit.
+/// It holds NO stock: nothing here is on hand, allocatable or pushed to a storefront. The value sits in the
+/// Stock in Transit account (the refund's COGS reversal debits it) until the units arrive or are written off.
+/// Lines carry the dispatch-cost snapshot the refund was valued at, so arrival can clear exactly that value.
+model ReturnExpectation {
+  id                  String                  @id @default(cuid())
+  /// Human reference, `RX-` plus the credit note number (or the refund id when it has none).
+  reference           String                  @unique
+  orderId             String                  @map("order_id")
+  refundId            String                  @unique @map("refund_id")
+  status              ReturnExpectationStatus @default(IN_TRANSIT)
+  /// The refund's intended return warehouse. Informational: arrival books into the warehouse it physically reached.
+  expectedWarehouseId String?                 @map("expected_warehouse_id")
+  /// Idempotency key of the COGS_REVERSAL journal that debited Stock in Transit for this expectation, or null
+  /// when no such journal was staged (accounting off): in that case nothing sits in transit in the ledger.
+  transitJournalKey   String?                 @map("transit_journal_key")
+  /// What that journal debited, at 6dp, or null with the key.
+  transitDebitBase    Decimal?                @map("transit_debit_base") @db.Decimal(18, 6)
+  /// When the document's cost snapshot and ledger link were settled. NULL while the refund's accounting staging is
+  /// still to run: the document is created in the refund's OWN transaction (so a refund never commits without it)
+  /// from the refund's quantities, and the staging transaction then values it. Nothing may receive against or
+  /// write off an unvalued document.
+  valuedAt            DateTime?               @map("valued_at")
+  createdAt           DateTime                @default(now()) @map("created_at")
+  closedAt            DateTime?               @map("closed_at")
+
+  order             SalesOrder              @relation(fields: [orderId], references: [id])
+  refund            SalesOrderRefund        @relation(fields: [refundId], references: [id])
+  expectedWarehouse Warehouse?              @relation(fields: [expectedWarehouseId], references: [id])
+  lines             ReturnExpectationLine[]
+
+  @@index([orderId])
+  @@index([status])
+  @@map("return_expectations")
+}
+
+model ReturnExpectationLine {
+  id               String   @id @default(cuid())
+  expectationId    String   @map("expectation_id")
+  refundLineId     String   @map("refund_line_id")
+  productId        String   @map("product_id")
+  sku              String
+  qty              Decimal  @db.Decimal(14, 6)
+  qtyReceived      Decimal  @default(0) @map("qty_received") @db.Decimal(14, 6)
+  qtyWrittenOff    Decimal  @default(0) @map("qty_written_off") @db.Decimal(14, 6)
+  /// The refund's return rows (qty, unit cost at the originally posted dispatch cost, source layer, PO line).
+  costSnapshot     Json     @map("cost_snapshot")
+  transitValueBase Decimal  @default(0) @map("transit_value_base") @db.Decimal(18, 6)
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  expectation ReturnExpectation    @relation(fields: [expectationId], references: [id])
+  refundLine  SalesOrderRefundLine @relation(fields: [refundLineId], references: [id])
+  product     Product              @relation(fields: [productId], references: [id])
+
+  @@unique([refundLineId, productId])
+  @@index([expectationId])
+  @@index([productId])
+  @@map("return_expectation_lines")
+}
+
+enum ReturnExpectationStatus {
+  IN_TRANSIT
+  PARTIALLY_RECEIVED
+  RECEIVED
+  WRITTEN_OFF
+  PARTIALLY_WRITTEN_OFF
 }
 
 model SalesOrderRefundLine {
@@ -2221,6 +2299,7 @@ model SalesOrderRefundLine {
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)
   product         Product?         @relation(fields: [productId], references: [id])
+  returnExpectationLines ReturnExpectationLine[]
 
   @@index([refundId])
   @@index([salesOrderLineId], map: "sales_order_refund_lines_sales_order_line_id_idx")
