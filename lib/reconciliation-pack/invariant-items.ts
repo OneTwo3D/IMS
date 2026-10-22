@@ -188,25 +188,29 @@ function allFindings(id: 'R15', evidence: unknown, ctx: InvariantItemContext): I
   if (typeof run === 'string') return inconclusive(id, run)
   const reports = DOMAINS.map((domain) => ({ domain, report: run.reports[domain] }))
 
-  const ims: SideRow[] = []
-  const vendor: SideRow[] = []
-  const seen = new Set<string>()
+  // The gate counts one finding per identity, and so does the pack. The identity carries no severity, so a warning and a
+  // critical finding can share one: the claim then allows the STRICTEST of them (0 if any is critical or unaccepted), never
+  // whichever came first, so an accepted warning can never hide a critical finding.
+  const allowedByToken = new Map<string, '0' | '1'>()
   for (const { domain, report } of reports) {
     for (const finding of report.findings) {
       if (finding.severity === 'info') continue
       if (finding.severity !== 'critical' && finding.severity !== 'warning') return inconclusive(id, 'SOURCE_UNREADABLE')
       const token = findingToken(domain, finding)
-      if (seen.has(token)) continue // the gate counts one warning per id, and so does the pack
-      seen.add(token)
-      let allowed = '0'
+      let allowed: '0' | '1' = '0'
       if (finding.severity === 'warning') {
         const warning = { id: invariantWarningId(domain, finding as Parameters<typeof invariantWarningId>[1]), message: '' }
         if (dispositionOf(warning, ctx.acceptances, ctx.phase, ctx.now).accepted) allowed = '1'
       }
-      const key = [{ kind: 'sku' as const, raw: token }]
-      ims.push({ key, value: '1' })
-      vendor.push({ key, value: allowed })
+      allowedByToken.set(token, allowedByToken.get(token) === '0' ? '0' : allowed)
     }
+  }
+  const ims: SideRow[] = []
+  const vendor: SideRow[] = []
+  for (const [token, allowed] of allowedByToken) {
+    const key = [{ kind: 'sku' as const, raw: token }]
+    ims.push({ key, value: '1' })
+    vendor.push({ key, value: allowed })
   }
   return fromComparison(id, compareItem(id, { ims, vendor, imsComplete: true, vendorComplete: true, emptyProof: 'invariant-report-clean' }))
 }

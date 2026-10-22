@@ -226,6 +226,19 @@ test('R15: a critical finding fails, and an acceptance never applies to it', () 
   assertBuilds(item)
 })
 
+test('R15: an accepted warning sharing its identity with a critical finding never hides it, in either order', () => {
+  const crit = r4(2, 0)
+  const warn = r4(2, 0, { severity: 'warning' })
+  assert.equal(idOf(warn), idOf(crit), 'precondition: the two findings share one gate identity')
+  for (const [name, findings] of [['warning first', [warn, crit]], ['critical first', [crit, warn]]] as const) {
+    const item = runInvariantItem('R15', evidence([...findings]), ctx(acceptance(idOf(warn))))
+    assert.equal(item.outcome, 'fail', name)
+    assert.equal(item.entries!.bothDiffer!.length, 1, name)
+    assert.equal((item.entries!.bothEqual ?? []).length, 0, name)
+    assertBuilds(item)
+  }
+})
+
 test('R15: a warning with no current written acceptance fails; an accepted one is an equal identity and passes on "compared"', () => {
   const w = warning()
   const unaccepted = runInvariantItem('R15', evidence([w]), ctx())
