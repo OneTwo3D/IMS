@@ -26,6 +26,8 @@ import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-read
 import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconciliation-pack/ledger-items'
 import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
+import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
+import type { WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 
 /** Reads the read-sync status report, reduced and checked against itself (reduceStatusReport). May throw: the run treats that as an unreadable read. */
 export interface LivenessPort { read(): Promise<LivenessRead> }
@@ -47,6 +49,12 @@ export type RunContext = {
   invariant: () => Promise<unknown>
   /** Reads the IMS side in one READ ONLY REPEATABLE READ transaction (ims-readers.ts). Absent = an item that needs it is inconclusive. */
   ims?: (options: ImsReadOptions) => Promise<ImsRead>
+  /** The explicit opt-in to contact a vendor (--vendor-reads-only). Anything but the boolean true is off: an item that needs a vendor is then inconclusive VENDOR_READS_OFF and nothing is called. */
+  vendorReads?: boolean
+  /** The vendor ports (WooCommerce, the stored Xero rate list). Only ever touched by an item that needs them, and only when vendorReads is true. */
+  vendor?: VendorPorts
+  /** Test seam for the vendor walks' pacing and budget. */
+  wooOptions?: WooSourceOptions
 }
 export type ItemRunner = (context: RunContext) => Promise<ItemInput>
 /** A ledger item runs on the SETTLED basis, after the liveness bracket is closed. */
@@ -67,7 +75,9 @@ export type RunPlan = {
 export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromInvariant = (id: 'R3' | 'R4' | 'R15'): ItemRunner => async (context) =>
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
-  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15') }
+  const fromVendor = (id: 'R9' | 'R13'): ItemRunner => (context) =>
+    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions })
+  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13') }
 }
 
 /** R6 and R10 read the settled as-of basis (ledger-items.ts). */
@@ -83,6 +93,12 @@ export function memoisedInvariant(run: () => Promise<unknown>): () => Promise<un
     pending ??= run().catch(() => null)
     return pending
   }
+}
+
+const VENDOR_SOURCES: readonly string[] = ['woocommerce-api', 'xero-api', 'mintsoft-api']
+/** Whether the catalogue lists a vendor API among the item's sources. */
+export function needsVendor(id: PackItemId): boolean {
+  return getPackItem(id).sources.some((source) => VENDOR_SOURCES.includes(source))
 }
 
 const inconclusive = (id: PackItemId, reason: PackReasonCode): ItemInput => ({ id, outcome: 'inconclusive', reasons: [reason] })
@@ -129,6 +145,9 @@ export async function runItems(plan: RunPlan): Promise<{ items: ItemInput[]; str
     if (plan.selected !== null && !plan.selected.includes(id)) { results.set(id, inconclusive(id, 'NOT_SELECTED')); continue }
     const hasRunner = isLedgerItem(id) ? ledgerRunners[id] !== undefined : runners[id] !== undefined
     if (!hasRunner) { results.set(id, inconclusive(id, 'NO_RUNNER')); continue }
+    // An item that needs a vendor is not read, and nothing is called, unless the run opted in. Before the liveness verdict, so the
+    // reason a reader sees is the operator's choice and not a stale stream that would not have been read either way.
+    if (plan.context.vendorReads !== true && needsVendor(id)) { results.set(id, inconclusive(id, 'VENDOR_READS_OFF')); continue }
     const verdict = itemLivenessVerdict(startOnly, id)
     if (!verdict.ok) { results.set(id, inconclusive(id, verdict.reason)); continue }
     attempted.push(id)

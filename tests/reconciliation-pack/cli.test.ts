@@ -113,15 +113,6 @@ test('the account is decided by uid: root or the checkout owner; anyone else, or
   assert.equal(await run(r, base(dir), { uid: 0, checkoutOwnerUid: 1000 }), 0)
 })
 
-test('--vendor-reads-only is refused with its code and opens nothing', async () => {
-  const dir = scratchDir(bases)
-  const a = rig()
-  assert.equal(await run(a, base(dir, '--vendor-reads-only')), 2)
-  assert.ok(text(a).includes('VENDOR_READS_RESERVED'))
-  assert.equal(a.opened + a.invariantRuns, 0)
-  assert.deepEqual(readdirSync(dir), [], 'nothing was written')
-})
-
 test('--basis-only makes the same bracket a run makes (liveness, basis read, liveness, settle), prints a closed code, runs no item and writes nothing', async () => {
   const dir = scratchDir(bases)
   const cases: Array<[string, (r: Rig) => void, number, RegExp]> = [
@@ -229,7 +220,8 @@ test('injected item runners and ledger runners reach the run (the seam later ite
   const custom = rig()
   custom.deps.ledgerRunners = { R6: async () => ({ id: 'R6', outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'] }) }
   custom.deps.runners = { R1: async () => ({ id: 'R1', outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'] }) }
-  assert.equal(await run(custom, ['--phase', 'P1', '--as-of', D, '--report-dir', dir]), 5)
+  // R1's stand-in is a vendor item, so it runs only on a run that opted in (a vendor item without the flag is VENDOR_READS_OFF).
+  assert.equal(await run(custom, ['--phase', 'P1', '--as-of', D, '--report-dir', dir, '--vendor-reads-only']), 5)
   assert.ok(custom.out.includes('R6 inconclusive READ_INCOMPLETE') && custom.out.includes('R1 inconclusive READ_INCOMPLETE'), custom.out.join('\n'))
   const builtIn = rig()
   assert.equal(await run(builtIn, ['--phase', 'P1', '--as-of', D, '--items', 'R6', '--report-dir', scratchDir(bases)]), 5)

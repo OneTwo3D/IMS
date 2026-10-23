@@ -235,3 +235,17 @@ test('the evidence reader refuses a value that is not in the one canonical text 
   verifyEvidence(line('1.5'), withText(line('1.5')))
   for (const ims of ['1.50', '-0', '0.0', '01', '+1', '1e0']) assert.throws(() => verifyEvidence(line(ims), withText(line(ims))), ReportInvalid, ims)
 })
+
+// [mutation: the VENDOR_READS_OFF rule removed from checkItemConsistency]
+test('VENDOR_READS_OFF is accepted only as the single reason of an inconclusive vendor item that read nothing and lists nothing', () => {
+  const off = (id: PackItemId, over: Partial<ItemInput> = {}): ItemInput => ({ id, outcome: 'inconclusive', reasons: ['VENDOR_READS_OFF'], ...over })
+  accepts(put(base(), off('R9')))
+  accepts(put(base(), off('R13')))
+  accepts(put(base(), off('R1')))
+  rejects(put(base(), off('R3')))
+  rejects(put(base(), off('R9', { reasons: ['VENDOR_READS_OFF', 'STALE_BASIS'] })))
+  rejects(put(base(), off('R9', { sources: ['woocommerce-api'] })))
+  rejects(put(base(), off('R9', { entries: { bothEqual: [entry('11')] } })))
+  rejects(put(base(), off('R9', { outcome: 'fail' })))
+  rejects(put(base(), off('R9', { outcome: 'pass', proof: { kind: 'proven-empty', source: 'per-status-total-zero' }, sources: [...getPackItem('R9').sources] })))
+})

@@ -5,7 +5,7 @@
  * so outbound HTTP keeps the URL, DNS, timeout, redirect, and response-size
  * protections in lib/security/connector-fetch.ts.
  *
- * Scanned paths: lib/connectors/**, lib/shopping.ts, app/api/cron/**, and
+ * Scanned paths: lib/connectors/**, lib/reconciliation-pack/**, lib/shopping.ts, app/api/cron/**, and
  * app/actions/** files with a sync path segment or filename.
  *
  * Waiver: add `// connector-fetch-boundary-ok: <ticket-or-date>: <reason>` on
@@ -41,6 +41,8 @@ const SYNC_SEGMENT_RE = /(^|[-_.])sync($|[-_.])/i
 
 const TARGETS = [
   'lib/connectors',
+  // The reconciliation pack's vendor transport (woo-transport.ts): a vendor request there is connectorFetch or it is not made.
+  'lib/reconciliation-pack',
   'lib/shopping.ts',
   'app/api/cron',
 ]

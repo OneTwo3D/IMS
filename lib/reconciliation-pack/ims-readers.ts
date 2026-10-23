@@ -34,18 +34,20 @@ import {
   IMS_READER_ROW_CAP,
   IMS_READER_STATEMENT_TIMEOUT_MS,
   SYSTEM_IDENTIFIER_RE,
+  WOO_SYNC_STATUSES_SETTING_KEY,
   type PackPopulationReason,
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
+import { normaliseWcOrderStatus, WC_DEFAULT_SYNC_ORDER_STATUSES } from '@/lib/connectors/woocommerce/order-status-filter'
 import { STOCK_TRACKED_PRODUCT_TYPES } from '@/lib/domain/inventory/backorder-policy'
-import { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/enums'
+import { AccountingSyncStatus, AccountingSyncType, SalesOrderStatus } from '@/app/generated/prisma/enums'
 
 /** The slice of a `pg` client this module needs. A test double implements it; `pg.Client` satisfies it. */
 export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -63,6 +65,9 @@ export type ImsStock = { tracked: StockPair[]; untracked: StockPair[] }
 export type ProductRow = { id: string; sku: string; type: string; active: boolean; lifecycleStatus: string }
 export type OrderLink = { connector: string; externalOrderId: string }
 export type OrderRow = { id: string; status: string; currency: string; totalForeign: string; externalCreatedAt: string | null; externalUpdatedAt: string | null; links: OrderLink[] }
+/** The importer's admitted WooCommerce order statuses (normalised, unique) and every mapping row of the storefront connector. */
+export type StorefrontMappingRow = { externalStatus: string; imsStatus: string }
+export type StorefrontStatusConfig = { configured: string[]; mappings: StorefrontMappingRow[] }
 export type TaxRateRow = { id: string; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null }
 export type TaxMappingRow = { connector: string; externalTaxRateId: string; taxRateId: string }
 export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[] }
@@ -87,6 +92,7 @@ export type ImsSectionValues = {
   stock: ImsStock
   products: ProductRow[]
   orders: OrderRow[]
+  storefrontStatus: StorefrontStatusConfig
   taxes: ImsTaxes
   xeroSyncLogs: XeroSyncLogRow[]
   snapshots: ImsSnapshots
@@ -265,6 +271,30 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       order.links.push(link)
     }
     return orders
+  },
+
+  async storefrontStatus(tx) {
+    // The importer's admitted statuses. An ABSENT row is the documented default; a row that is not a JSON array of non-empty strings
+    // is unreadable (the importer falls back to its default, which is a guess this comparison does not make).
+    const rows = await tx.query('SELECT key, value FROM settings WHERE key = $1', [WOO_SYNC_STATUSES_SETTING_KEY])
+    if (rows.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    let configured: string[] = [...WC_DEFAULT_SYNC_ORDER_STATUSES]
+    if (rows.length === 1) {
+      const raw = rows[0]!.value
+      let parsed: unknown
+      try { parsed = typeof raw === 'string' ? JSON.parse(raw) : undefined } catch { throw new Unreadable('SOURCE_UNREADABLE') }
+      if (!Array.isArray(parsed) || parsed.length > 100 || parsed.some((entry) => typeof entry !== 'string' || entry.trim() === '' || entry.length > 64 || /[\u0000-\u001f\u007f]/.test(entry))) throw new Unreadable('SOURCE_UNREADABLE')
+      configured = []
+      for (const entry of parsed as string[]) {
+        const status = normaliseWcOrderStatus(entry)
+        if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(status)) throw new Unreadable('SOURCE_UNREADABLE')
+        if (!configured.includes(status)) configured.push(status)
+      }
+    }
+    const mappingRows = await readCapped(tx, `SELECT "externalStatus" AS external_status, "imsStatus"::text AS ims_status FROM shopping_status_mappings WHERE connector = 'woocommerce' ORDER BY id`)
+    const mappings = mappingRows.map((row): StorefrontMappingRow => ({ externalStatus: text(row.external_status), imsStatus: oneOf(row.ims_status, Object.values(SalesOrderStatus)) }))
+    unique(mappings, (mapping) => mapping.externalStatus)
+    return { configured, mappings }
   },
 
   async taxes(tx) {

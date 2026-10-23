@@ -80,6 +80,8 @@ export function parsePackArgs(argv: readonly string[], now: Date): PackArgs | { 
     out.items = ids as PackItemId[]
   }
   if (out.basisOnly && out.items !== null) return bad()
+  // The basis check reads no vendor: asking for both is a contradiction, not something to quietly drop.
+  if (out.basisOnly && out.vendorReadsOnly) return bad()
   out.acceptances = values.get('--acceptances') ?? null
   out.reportDir = values.get('--report-dir') ?? DEFAULT_PACK_REPORT_DIR
   return out
@@ -87,10 +89,15 @@ export function parsePackArgs(argv: readonly string[], now: Date): PackArgs | { 
 
 /** The only variables a run keeps. Never a PG variable, a grant, a credential other than the database URL, or anything that loads code. */
 export const KEPT_ENV = ['PATH', 'LANG', 'LC_ALL', 'TZ', 'DATABASE_URL'] as const
+/**
+ * Kept ONLY when the run opted in to vendor reads: the key that decrypts the stored storefront credentials. Without the opt-in the
+ * command never reads a vendor credential, so it has no use for the key and does not keep it.
+ */
+export const VENDOR_ENV = ['SETTINGS_ENCRYPTION_KEY', 'ENCRYPTION_KEY'] as const
 
-export function buildPackEnv(parent: Readonly<Record<string, string | undefined>>, home: string): Record<string, string> {
+export function buildPackEnv(parent: Readonly<Record<string, string | undefined>>, home: string, vendorReads = false): Record<string, string> {
   const env: Record<string, string> = { HOME: home }
-  for (const name of KEPT_ENV) {
+  for (const name of vendorReads ? [...KEPT_ENV, ...VENDOR_ENV] : KEPT_ENV) {
     const value = parent[name]
     if (value !== undefined && value !== '') env[name] = value
   }

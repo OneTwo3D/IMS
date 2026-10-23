@@ -57,6 +57,19 @@ test('an inconclusive item is NEVER a pass or "not available" - with one excepti
   assert.equal(assessPackItem({ record: packRecord('P1', { items: { R9: inconclusive('R9', 'NO_RUNNER', 'STALE_BASIS') } }) }, 'R9', ctx()).kind, 'unreadable', 'NO_RUNNER with another reason is not the exception')
 })
 
+// [mutation: the VENDOR_READS_OFF reading removed from assessPackItem / widened to "any reason list that contains it"]
+test('VENDOR_READS_OFF alone (the run did not opt in to vendor reads) is not available, like NO_RUNNER: the slot is what it was before the pack could read vendors; and a partial run (NOT_SELECTED) stays unreadable', () => {
+  const off = assessPackItem({ record: packRecord('P1', { items: { R9: inconclusive('R9', 'VENDOR_READS_OFF') } }) }, 'R9', ctx())
+  assert.equal(off.kind, 'not-available')
+  assert.ok(off.kind === 'not-available' && off.reason.includes('--vendor-reads-only'))
+  // The report builder refuses VENDOR_READS_OFF beside another reason (tests/reconciliation-pack/consistency.test.ts), so a pack report never carries one.
+  // A partial run (NOT_SELECTED) is an operator's choice of a different kind and stays unreadable.
+  assert.equal(assessPackItem({ record: packRecord('P1', { items: { R9: inconclusive('R9', 'NOT_SELECTED') } }) }, 'R9', ctx()).kind, 'unreadable')
+  // It blocks only where not-available blocks: not at P1, at P2 the slot is required.
+  const p1 = decideVerdict({ phase: 'P1', results: { ...passingFixed(), ...Object.fromEntries(PACK_ITEMS.map((item) => [`pack-${item.id}`, assessPackItem({ record: packRecord('P1', { items: { R9: inconclusive('R9', 'VENDOR_READS_OFF') } }) }, item.id, ctx())])) }, acceptances: NO_ACCEPTANCES, now: NOW })
+  assert.ok(!p1.blockingReasons.some((reason) => reason.startsWith('pack-R9:')))
+})
+
 test('the gate\'s verdict on a pack-fed run: unreadable ALWAYS blocks, a failing item blocks at P2 only as listed, not-available does not block before P2', () => {
   const record = packRecord('P1', { items: { R9: inconclusive('R9', 'STALE_BASIS') } })
   const results: Record<string, CheckResult> = Object.fromEntries(PACK_ITEMS.map((item) => [`pack-${item.id}`, assessPackItem({ record }, item.id, ctx())]))

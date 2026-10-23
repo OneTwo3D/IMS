@@ -98,7 +98,7 @@ function cycleDateProblem(record: ReportRecord, context: PackAssessContext, cade
  * Two readings are made on the catalogue's word, not on the report's: an item the pack's catalogue does not apply in the phase asked
  * about is not available whatever report there is (or is not) - a missing report cannot make it applicable, and the report cannot be
  * believed about it either way - and an item the report lists as inconclusive for NO_RUNNER alone (this build has no runner for it
- * yet) is not available, the state the slot had before the pack fed the gate. Every other inconclusive item is unreadable.
+ * yet) or for VENDOR_READS_OFF alone (the run did not opt in to vendor reads) is not available, the state the slot had before the pack fed the gate. Every other inconclusive item is unreadable.
  */
 export function assessPackItem(read: PackReportRead, id: PackItemId, context: PackAssessContext): CheckResult {
   if (itemApplicability(id, context.phase) === 'not-applicable') return { kind: 'not-available', reason: `${id} does not apply in phase ${context.phase} (the reconciliation pack's catalogue)` }
@@ -121,6 +121,9 @@ export function assessPackItem(read: PackReportRead, id: PackItemId, context: Pa
     case 'fail': return { kind: 'fail', reasons: [`${id} failed in the reconciliation pack run ${record.runId} for ${record.asOf}${codes}`], detail }
     case 'inconclusive':
       if (item.reasons.length === 1 && item.reasons[0] === 'NO_RUNNER') return { kind: 'not-available', reason: `${id} has no runner on the build that made reconciliation pack run ${record.runId}, so it was not checked` }
+      // The run was not started with --vendor-reads-only: no vendor was contacted and nothing was claimed. The slot is exactly what it
+      // was before the pack could read vendors (not available), so merging the vendor items changes no live verdict until a run opts in.
+      if (item.reasons.length === 1 && item.reasons[0] === 'VENDOR_READS_OFF') return { kind: 'not-available', reason: `${id} was not read in reconciliation pack run ${record.runId}: the run was not started with --vendor-reads-only, so no vendor was contacted` }
       return unreadable(`the reconciliation pack could not prove ${id} in run ${record.runId}${codes}`)
     case 'not-applicable':
       // The catalogue has already said (above) where an item does not apply; a report that calls an item not applicable where the catalogue applies it is not believed.
