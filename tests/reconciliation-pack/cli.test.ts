@@ -10,6 +10,9 @@ import { PACK_CLI_CODES, PACK_CLI_FLAGS, PACK_EXIT_CODES, PACK_ITEM_IDS } from '
 import type { ImsQueryClient } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { readPackChain } from '../../lib/reconciliation-pack/trend.ts'
 import { NOW, cleanup, realEvidence, scratchDir } from './helpers.ts'
+import { REF_ABSENT, CODES, D, fakeBasisPort, goodState, healthyLiveness } from './basis-fixtures.ts'
+import { reduceStatusReport } from '../../lib/reconciliation-pack/liveness.ts'
+import { goodReport, makeStale } from './liveness-fixtures.ts'
 
 const bases: string[] = []
 afterEach(() => cleanup(bases))
@@ -33,6 +36,9 @@ function rig(over: { sid?: string | null; evidence?: unknown; openFails?: boolea
     openIms: async () => { r.opened += 1; if (over.openFails) throw new Error('refused'); return { client, close: async () => undefined } },
     runInvariant: async () => { r.invariantRuns += 1; return 'evidence' in over ? over.evidence : clean },
     disconnect: async () => undefined,
+    // The real ports would start a child process and open a client of their own: a test always hands doubles.
+    liveness: healthyLiveness(),
+    basis: fakeBasisPort(goodState()),
   }
   return r
 }
@@ -107,23 +113,49 @@ test('the account is decided by uid: root or the checkout owner; anyone else, or
   assert.equal(await run(r, base(dir), { uid: 0, checkoutOwnerUid: 1000 }), 0)
 })
 
-test('--vendor-reads-only is refused with its code; --basis-only prints BASIS_UNAVAILABLE_NOT_BUILT until a basis port is injected; neither opens the database', async () => {
+test('--vendor-reads-only is refused with its code and opens nothing', async () => {
   const dir = scratchDir(bases)
   const a = rig()
   assert.equal(await run(a, base(dir, '--vendor-reads-only')), 2)
   assert.ok(text(a).includes('VENDOR_READS_RESERVED'))
-  const b = rig()
-  assert.equal(await run(b, base(dir, '--basis-only')), 2)
-  assert.ok(text(b).includes('BASIS_UNAVAILABLE_NOT_BUILT'))
-  assert.equal(a.opened + b.opened + a.invariantRuns + b.invariantRuns, 0)
+  assert.equal(a.opened + a.invariantRuns, 0)
   assert.deepEqual(readdirSync(dir), [], 'nothing was written')
-  const ready = rig(); ready.deps.basis = { check: async () => ({ ok: true, codes: [] }) }
-  assert.equal(await run(ready, base(dir, '--basis-only')), 0)
-  const notReady = rig(); notReady.deps.basis = { check: async () => ({ ok: false, codes: ['NO_RUN_ROW', 'free text with spaces', 'x'.repeat(200)] }) }
-  assert.equal(await run(notReady, base(dir, '--basis-only')), 5)
-  assert.ok(text(notReady).includes('NO_RUN_ROW') && !text(notReady).includes('free text') && !text(notReady).includes('xxxx'))
-  const throws = rig(); throws.deps.basis = { check: async () => { throw new Error('boom') } }
+})
+
+test('--basis-only makes the same bracket a run makes (liveness, basis read, liveness, settle), prints a closed code, runs no item and writes nothing', async () => {
+  const dir = scratchDir(bases)
+  const cases: Array<[string, (r: Rig) => void, number, RegExp]> = [
+    ['ready', () => undefined, 0, /^Basis for 2026-10-19: ready$/],
+    ['no subledger run row', (r) => { r.deps.basis = fakeBasisPort(goodState({ run: null })) }, 5, /not ready \(no_subledger_snapshot\)/],
+    ['the stream is stale', (r) => { r.deps.liveness = { read: async () => reduceStatusReport(makeStale(goodReport(), 'xero-balance-snapshots')) } }, 5, /not ready \(stream_not_fresh\)/],
+    ['the status report cannot be read', (r) => { r.deps.liveness = { read: async () => { throw new Error('boom') } } }, 5, /not ready \(stream_not_fresh\)/],
+    ['an inventory leg the trial balance omitted', (r) => {
+      const state = goodState()
+      state.gl = state.gl.map((row) => (row.accountCode === CODES.allocated && row.balanceDate.getTime() === new Date(`${D}T00:00:00.000Z`).getTime() ? { ...row, amountBase: '0', sourcePayloadRef: REF_ABSENT(D) } : row))
+      r.deps.basis = fakeBasisPort(state)
+    }, 5, /not ready \(inventory comparison withheld: absent-from-tb/],
+    ['the transit leg alone is unusable: still ready, and it says so', (r) => { const state = goodState(); state.settings.delete('transit_ledger_coverage_start_date'); r.deps.basis = fakeBasisPort(state) }, 0, /ready \(transit leg: transit_ledger_not_covering\)/],
+  ]
+  for (const [name, change, expected, pattern] of cases) {
+    const r = rig()
+    change(r)
+    let reads = 0
+    const inner = r.deps.liveness!
+    r.deps.liveness = { read: async () => { reads += 1; return inner.read() } }
+    assert.equal(await run(r, base(dir, '--basis-only')), expected, name)
+    assert.match(text(r), pattern, name)
+    assert.equal(reads, 2, `${name}: the status report is read at the start and the end`)
+    assert.equal(r.opened + r.invariantRuns, 0, `${name}: no item and no IMS section was run`)
+  }
+  assert.deepEqual(readdirSync(dir), [], 'nothing was written')
+  // A basis port that throws is an internal failure (4), and nothing about the cause is printed.
+  const throws = rig(); throws.deps.basis = { read: async () => { throw new Error('boom') }, settle: async () => { throw new Error('boom') } }
   assert.equal(await run(throws, base(dir, '--basis-only')), 4)
+  assert.ok(!text(throws).includes('boom'))
+  // The same environment rules as a run.
+  const noEnv = rig()
+  assert.equal(await run(noEnv, base(dir, '--basis-only'), { env: {} }), 2)
+  assert.ok(text(noEnv).includes('DATABASE_URL_MISSING'))
 })
 
 test('DATABASE_URL must be in the environment', async () => {
@@ -189,6 +221,19 @@ test('P1 exits 5 (items without a runner), and a failing invariant report exits 
   assert.equal(readdirSync(dir).filter((n) => /^\d{8}T/.test(n)).length, 2)
   const chain = readPackChain(dir)
   assert.ok(chain.ok && chain.head!.sequence === 2)
+})
+
+// [mutation: the injected ledger runners not passed to the run]
+test('injected item runners and ledger runners reach the run (the seam later items use); the built-in ledger runners run on the settled basis otherwise', async () => {
+  const dir = scratchDir(bases)
+  const custom = rig()
+  custom.deps.ledgerRunners = { R6: async () => ({ id: 'R6', outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'] }) }
+  custom.deps.runners = { R1: async () => ({ id: 'R1', outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'] }) }
+  assert.equal(await run(custom, ['--phase', 'P1', '--as-of', D, '--report-dir', dir]), 5)
+  assert.ok(custom.out.includes('R6 inconclusive READ_INCOMPLETE') && custom.out.includes('R1 inconclusive READ_INCOMPLETE'), custom.out.join('\n'))
+  const builtIn = rig()
+  assert.equal(await run(builtIn, ['--phase', 'P1', '--as-of', D, '--items', 'R6', '--report-dir', scratchDir(bases)]), 5)
+  assert.ok(builtIn.out.includes('R6 pass -'), builtIn.out.join('\n'))
 })
 
 test('an invariant run that throws, or reports something unreadable, never exits 0', async () => {

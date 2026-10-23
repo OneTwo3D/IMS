@@ -19,6 +19,9 @@ if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
 
 const D = '2031-03-05'
 const PREV = '2031-03-04'
+// The transit-leg and ledger-item test below uses its own dates; the global settings both tests write are used one test at a time (one file).
+const LD = '2031-04-05'
+const LPREV = '2031-04-04'
 const date = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
 const ref = (iso: string, absent = false) => `xero:trial-balance:${iso}${absent ? ':absent-from-tb' : ''}`
 
@@ -26,7 +29,7 @@ async function deps() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
-  const [{ db }, basis, readTx, constants, liveness, fixtures, live] = await Promise.all([
+  const [{ db }, basis, readTx, constants, liveness, fixtures, live, ledger, evaluator] = await Promise.all([
     import('../../lib/db/index.ts'),
     import('../../lib/reconciliation-pack/basis.ts'),
     import('../../lib/reconciliation-pack/read-tx.ts'),
@@ -34,10 +37,12 @@ async function deps() {
     import('../../lib/reconciliation-pack/liveness.ts'),
     import('../reconciliation-pack/liveness-fixtures.ts'),
     import('../../lib/integration-plugin-keys.ts'),
+    import('../../lib/reconciliation-pack/ledger-items.ts'),
+    import('../../lib/domain/accounting/account-gl-reconciliation.ts'),
   ])
   /** The two phases a run makes, with nothing written in between. */
   const loadAsOfBasis = async (asOf: string, bracket: Parameters<typeof basis.settleAsOfBasis>[1]) => basis.settleAsOfBasis(await basis.readAsOfBasis(asOf), bracket)
-  return { db, ...basis, ...readTx, ...constants, ...liveness, ...fixtures, ...live, loadAsOfBasis }
+  return { db, ...basis, ...readTx, ...constants, ...liveness, ...fixtures, ...live, ...ledger, ...evaluator, loadAsOfBasis }
 }
 
 test('as-of basis against a real database', { skip }, async () => {
@@ -148,6 +153,130 @@ test('as-of basis against a real database', { skip }, async () => {
     await db.inventorySnapshot.deleteMany({ where: { productId: product.id } })
     await db.inventorySnapshotRun.deleteMany({ where: { source: 'rb-test' } })
     await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: { startsWith: `rb-${tag}-` } } })
+    await db.warehouse.delete({ where: { id: warehouse.id } })
+    await db.product.delete({ where: { id: product.id } })
+    for (const key of settingKeys) {
+      const prior = savedSettings.find((row) => row.key === key)
+      if (prior) await db.setting.update({ where: { key }, data: { value: prior.value } })
+      else await db.setting.deleteMany({ where: { key } })
+    }
+    if (savedToken) await db.accountingToken.update({ where: { connector: 'xero' }, data: { tenantId: savedToken.tenantId } })
+    else await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+    if (createdOrg) await db.organisation.delete({ where: { id: createdOrg.id } })
+    await db.$disconnect()
+  }
+})
+
+/**
+ * THE TRANSIT LEG OF THE AS-OF BASIS (R10) AND THE LEDGER ITEMS AGAINST A REAL DATABASE: every column the leg reads exists (a wrong name is
+ * red here, not in production), the movement window is (D-1, D] on the journal date, the opening balance must be the day before, and the
+ * real basis feeds R6 and R10 without a write. In this file because both tests use the same global settings and the Xero token, which
+ * only one test at a time may hold.
+ */
+test('transit leg and ledger items against a real database', { skip }, async () => {
+  const d = await deps()
+  const { db } = d
+  const D = LD
+  const PREV = LPREV
+  const tag = randomBytes(4).toString('hex')
+  const codes = Object.fromEntries(d.PACK_BASIS_ACCOUNTS.map((a, i) => [a.kind, `RL${tag}${i}`])) as Record<string, string>
+  const settingKeys = [d.INTEGRATION_PLUGIN_SETTING_KEYS.xero, d.TRANSIT_COVERAGE_SETTING_KEY, ...d.PACK_BASIS_ACCOUNTS.map((a) => a.settingKey)]
+  const savedSettings = await db.setting.findMany({ where: { key: { in: settingKeys } } })
+  const org = await db.organisation.findFirst({ select: { baseCurrency: true } })
+  const savedToken = await db.accountingToken.findUnique({ where: { connector: 'xero' } })
+  const tenant = `tenant-${tag}`
+  const createdOrg = org ? null : await db.organisation.create({ data: { name: `rl-${tag}` } })
+  const currency = org?.baseCurrency ?? 'GBP'
+  const bracket = d.bracketLiveness(d.reduceStatusReport(d.goodReport()), d.reduceStatusReport(d.goodReport()))
+  const product = await db.product.create({ data: { sku: `RL-${tag}`, name: 'rl' } })
+  const warehouse = await db.warehouse.create({ data: { code: `RL${tag}`.toUpperCase(), name: 'rl' } })
+  const load = async () => d.settleAsOfBasis(await d.readAsOfBasis(D), bracket)
+  const setBalance = async (kind: string, iso: string, amount: string, absent = false) => {
+    await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-${kind}-${iso}` } })
+    await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rl-${tag}-${kind}-${iso}`, accountCode: codes[kind]!, accountName: 'rl', balanceDate: date(iso), currency, amountForeign: amount, amountBase: amount, sourcePayloadRef: ref(iso, absent), tenantId: tenant } })
+  }
+  const movement = (key: string, iso: string, delta: string) => db.transitSubledgerMovement.create({ data: { sourceType: 'STOCK_RECEIPT', sourceRef: `rl-${tag}`, idempotencyKey: `rl-${tag}-${key}`, baseDelta: delta, journalDate: date(iso) } })
+  try {
+    for (const [key, value] of [[d.INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'], [d.TRANSIT_COVERAGE_SETTING_KEY, '2031-01-01'], ...d.PACK_BASIS_ACCOUNTS.map((a) => [a.settingKey, codes[a.kind]!] as const)] as const) {
+      await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+    }
+    await db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date('2031-06-01T00:00:00Z'), tenantId: tenant }, update: { tenantId: tenant } })
+    const amounts: Record<string, string> = { inventory: '100.50', allocated: '20.25', transit: '50', cogs: '7', unearned: '-30' }
+    for (const a of d.PACK_BASIS_ACCOUNTS) await setBalance(a.kind, D, amounts[a.kind]!)
+    await setBalance('transit', PREV, '40')
+    await db.inventorySnapshotRun.create({ data: { snapshotDate: date(D), stockLevelCount: 1, snapshotCount: 1, source: 'rl-test' } })
+    await db.inventorySnapshot.create({ data: { snapshotDate: date(D), productId: product.id, warehouseId: warehouse.id, qty: '1', valueBase: '120.75', unitCostBase: '120.75', valueReplayReliable: true } })
+    // The window is (D-1, D] on the journal date: D-1 itself and D+1 are outside, D is inside.
+    await movement('before', PREV, '999')
+    await movement('inside-1', D, '4.25')
+    await movement('inside-2', D, '5.75')
+    await movement('after', '2031-04-06', '999')
+
+    // 1. The leg reads every column it names and returns the exact figures.
+    const ok = await load()
+    assert.equal(ok.available, true, JSON.stringify(ok))
+    if (!ok.available) return
+    assert.deepEqual(ok.transit, { available: true, glMovement: '10.000000', subledgerMovement: '10.000000', reconciliation: d.evaluateAccountGlReconciliation({ subledgerValue: 10, glBalance: 10 }) })
+
+    // 2. R6 and R10 on the real basis (the postings leg is a separate read, tested in the concurrency tier).
+    const r6 = await d.runLedgerItem('R6', ok, { phase: 'P1', asOf: D })
+    assert.deepEqual([r6.outcome, r6.reasons], ['pass', []])
+    const r10 = await d.runLedgerItem('R10', ok, { phase: 'P1', asOf: D, ims: async () => ({ ok: true, snapshotId: '1:1:', sections: { xeroPostings: { ok: true, value: { p0: { state: 'verified', startedAt: '2031-01-01T00:00:00.000Z' }, rows: [] } } } }) })
+    assert.deepEqual([r10.outcome, r10.reasons], ['pass', []])
+
+    // 3. A movement the sub-ledger holds but the ledger does not shows as a gap in the transit leg only.
+    await movement('extra', D, '3')
+    const gap = await load()
+    assert.ok(gap.available && gap.transit.available && gap.transit.reconciliation.action === 'flag' && gap.transit.subledgerMovement === '13.000000')
+    assert.equal(gap.available && gap.inventoryGl?.action, 'balanced', 'the inventory comparison is unaffected')
+    await db.transitSubledgerMovement.deleteMany({ where: { idempotencyKey: `rl-${tag}-extra` } })
+
+    // 4. No opening balance for exactly the day before: the leg alone is unusable, the basis stays available.
+    await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-transit-${PREV}` } })
+    const noOpening = await load()
+    assert.ok(noOpening.available)
+    assert.deepEqual(noOpening.available && noOpening.transit, { available: false, reason: 'transit_balance_unusable' })
+    await setBalance('transit', PREV, '40')
+
+    // 5. The coverage watermark: later than the opening day is not covering; a malformed one fails closed.
+    for (const value of ['2031-04-05', 'soon']) {
+      await db.setting.update({ where: { key: d.TRANSIT_COVERAGE_SETTING_KEY }, data: { value } })
+      const uncovered = await load()
+      assert.deepEqual(uncovered.available && uncovered.transit, { available: false, reason: 'transit_ledger_not_covering' }, value)
+    }
+    await db.setting.update({ where: { key: d.TRANSIT_COVERAGE_SETTING_KEY }, data: { value: '2031-01-01' } })
+
+    // 6. A synthesised zero at either end of the window is never a reported zero.
+    await setBalance('transit', PREV, '0', true)
+    const absentOpening = await load()
+    assert.deepEqual(absentOpening.available && absentOpening.transit, { available: false, reason: 'transit_absent_from_tb' })
+    await setBalance('transit', PREV, '40')
+    await setBalance('transit', D, '0', true)
+    const absentClosing = await load()
+    assert.deepEqual(absentClosing.available && absentClosing.transit, { available: false, reason: 'transit_absent_from_tb' })
+    const r10Withheld = await d.runLedgerItem('R10', absentClosing, { phase: 'P1', asOf: D, ims: async () => ({ ok: false, reason: 'READ_INCOMPLETE' }) })
+    assert.equal(r10Withheld.outcome, 'inconclusive')
+    await setBalance('transit', D, '50')
+
+    // 7. NO WRITE: a load changes no row and writes no tuple in any table it reads.
+    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots', 'transit_subledger_movements']
+    const counts = async () => {
+      const out: Record<string, string> = {}
+      for (const t of tables) out[t] = String((await db.$queryRawUnsafe<Array<{ n: bigint }>>(`SELECT count(*) AS n FROM "${t}"`))[0]!.n)
+      const stat = await db.$queryRawUnsafe<Array<{ s: string }>>(`SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del),0)::text AS s FROM pg_stat_user_tables WHERE relname = ANY($1)`, tables)
+      out.writes = stat[0]!.s
+      return out
+    }
+    await new Promise((r) => setTimeout(r, 1600))
+    const before = await counts()
+    for (let i = 0; i < 3; i += 1) await load()
+    await new Promise((r) => setTimeout(r, 1600))
+    assert.deepEqual(await counts(), before, 'a basis load including the transit leg changes no row and writes no tuple')
+  } finally {
+    await db.transitSubledgerMovement.deleteMany({ where: { idempotencyKey: { startsWith: `rl-${tag}-` } } })
+    await db.inventorySnapshot.deleteMany({ where: { productId: product.id } })
+    await db.inventorySnapshotRun.deleteMany({ where: { source: 'rl-test' } })
+    await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: { startsWith: `rl-${tag}-` } } })
     await db.warehouse.delete({ where: { id: warehouse.id } })
     await db.product.delete({ where: { id: product.id } })
     for (const key of settingKeys) {

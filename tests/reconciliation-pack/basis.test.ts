@@ -4,9 +4,9 @@ import test from 'node:test'
 import { evaluateAccountGlReconciliation } from '../../lib/domain/accounting/account-gl-reconciliation.ts'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
 import { readAsOfBasis, settleAsOfBasis, type AsOfBasis, type BasisDeps } from '../../lib/reconciliation-pack/basis.ts'
-import { PACK_BASIS_ACCOUNTS, PACK_BASIS_REASON_LIST, type PackBasisAccountKind } from '../../lib/reconciliation-pack/constants.ts'
+import { PACK_BASIS_ACCOUNTS, PACK_BASIS_REASON_LIST, PACK_TRANSIT_LEG_REASONS, TRANSIT_COVERAGE_SETTING_KEY, type PackBasisAccountKind } from '../../lib/reconciliation-pack/constants.ts'
 import { bracketLiveness, reduceStatusReport } from '../../lib/reconciliation-pack/liveness.ts'
-import { CODES, D, TENANT, REF, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
+import { CODES, D, PREVIOUS, TENANT, REF, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
 import { goodReport, makeStale, withStamp } from './liveness-fixtures.ts'
 
 /**
@@ -62,7 +62,7 @@ test('the evaluator is used unchanged for sweep and flag gaps', async () => {
 test('every IMS read happens inside the one run (the double throws on a read outside it) and reads nothing but the allowed tables', async () => {
   const { log, calls } = await load(goodState())
   assert.equal(calls, 2)
-  assert.deepEqual([...new Set(log)].sort(), ['accountingToken.findUnique', 'inventorySnapshot.aggregate', 'inventorySnapshot.count', 'organisation.findFirst', 'run.findUnique', 'setting.findMany', 'snapshot.findMany'])
+  assert.deepEqual([...new Set(log)].sort(), ['accountingToken.findUnique', 'inventorySnapshot.aggregate', 'inventorySnapshot.count', 'organisation.findFirst', 'run.findUnique', 'setting.findMany', 'snapshot.findMany', 'transit.aggregate'])
 })
 
 // [mutation: findLatest-style (on-or-before) read] the exact date, never the latest earlier balance
@@ -159,12 +159,31 @@ test('configuration: plugin off, or any of the five codes unset or blank, is no_
   }
 })
 
-test('two accounts sharing one code are reported, not hidden', async () => {
+test('two accounts sharing one code are reported, not hidden: BOTH of them, whatever their catalogue order', async () => {
   const state = goodState()
-  state.settings.set('xero_transit_account', CODES.allocated)
+  state.settings.set('xero_unearned_revenue_account', CODES.cogs)
   const { basis } = await load(state)
   assert.equal(basis.available, true)
-  if (basis.available) assert.deepEqual(basis.sharedCodeKinds, ['transit'])
+  if (basis.available) assert.deepEqual(basis.sharedCodeKinds, ['cogs', 'unearned'])
+})
+
+// [mutation: shared codes marked only on their later occurrence]
+test('Transit sharing its code with a LATER account (COGS, Unearned) withholds the transit leg; Inventory/Allocated sharing with any account is no basis', async () => {
+  for (const later of ['xero_cogs_account', 'xero_unearned_revenue_account']) {
+    const state = goodState()
+    state.settings.set(later, CODES.transit)
+    const { basis } = await load(state)
+    assert.equal(basis.available, true, later)
+    if (basis.available) {
+      assert.ok(basis.sharedCodeKinds.includes('transit'), later)
+      assert.deepEqual(transitOf(basis), { available: false, reason: 'transit_balance_unusable' }, later)
+    }
+  }
+  for (const [setting, code] of [['xero_cogs_account', CODES.inventory], ['xero_transit_account', CODES.allocated], ['xero_unearned_revenue_account', CODES.allocated]] as const) {
+    const state = goodState()
+    state.settings.set(setting, code)
+    assert.equal(reason((await load(state)).basis), 'inventory_accounts_shared', setting)
+  }
 })
 
 // [mutation: the shared Inventory/Allocated refusal removed]
@@ -374,4 +393,100 @@ test('REBIND: another organisation\'s balances for other dates do not make this 
 test('no connected organisation, or a blank tenant, is no_account_configured', async () => {
   for (const tenant of [null, '', '   ']) assert.equal(reason((await load(goodState({ tenant }))).basis), 'no_account_configured', JSON.stringify(tenant))
   assert.ok(TENANT.length > 0)
+})
+
+
+// ---- the transit leg (R10) ------------------------------------------------------------------------
+
+function transitOf(basis: AsOfBasis) {
+  assert.equal(basis.available, true)
+  if (!basis.available) throw new Error('unreachable')
+  return basis.transit
+}
+const OPENING = (state: FakeState) => state.gl.findIndex((row) => row.accountCode === CODES.transit && row.balanceDate.getTime() === dateOf(PREVIOUS).getTime())
+
+test('TRANSIT LEG: the movement of the day is the closing minus the opening balance, against the sub-ledger movement, by the existing evaluator', async () => {
+  const leg = transitOf((await load(goodState())).basis)
+  assert.deepEqual(leg, { available: true, glMovement: '10.000000', subledgerMovement: '10.000000', reconciliation: evaluateAccountGlReconciliation({ subledgerValue: 10, glBalance: 10 }) })
+  const off = transitOf((await load(goodState({ transitMovement: '12.50' }))).basis)
+  assert.ok(off.available && off.reconciliation.action === 'flag' && off.reconciliation.delta === 2.5)
+  const none = transitOf((await load(goodState({ transitMovement: null }))).basis)
+  assert.ok(none.available && none.subledgerMovement === '0.000000' && none.reconciliation.action === 'flag', 'a covered window with no movement rows is a true zero, compared')
+})
+
+// [mutation: the coverage check removed]
+test('TRANSIT LEG: the sub-ledger must be recorded as covering the day before D; a missing, malformed or later watermark withholds only the leg', async () => {
+  for (const value of [undefined, '', 'yesterday', '2026-10-18T00:00:00Z', '2026-10-19', '2026-02-30x']) {
+    const state = goodState()
+    if (value === undefined) state.settings.delete(TRANSIT_COVERAGE_SETTING_KEY)
+    else state.settings.set(TRANSIT_COVERAGE_SETTING_KEY, value)
+    const { basis } = await load(state)
+    assert.deepEqual(transitOf(basis), { available: false, reason: 'transit_ledger_not_covering' }, String(value))
+  }
+  const onTheDay = goodState()
+  onTheDay.settings.set(TRANSIT_COVERAGE_SETTING_KEY, PREVIOUS)
+  assert.equal(transitOf((await load(onTheDay)).basis).available, true, 'a watermark equal to the opening day covers the window')
+})
+
+// [mutation: the opening balance not required to be exactly the day before / its tenant, label or currency not checked]
+test('TRANSIT LEG: the opening balance must be one stored row for exactly the day before, of this organisation, labelled, in the base currency, finite', async () => {
+  const cases: Array<[string, (state: FakeState) => void]> = [
+    ['missing', (state) => { state.gl.splice(OPENING(state), 1) }],
+    ['two rows', (state) => { state.gl.push({ ...state.gl[OPENING(state)]!, amountBase: '41' }) }],
+    ['another organisation', (state) => { state.gl[OPENING(state)]!.tenantId = 'tenant-previous' }],
+    ['no recorded organisation', (state) => { state.gl[OPENING(state)]!.tenantId = null }],
+    ['unlabelled', (state) => { state.gl[OPENING(state)]!.sourcePayloadRef = null }],
+    ['another date label', (state) => { state.gl[OPENING(state)]!.sourcePayloadRef = REF(D) }],
+    ['not a number', (state) => { state.gl[OPENING(state)]!.amountBase = 'abc' }],
+    ['null amount', (state) => { state.gl[OPENING(state)]!.amountBase = null }],
+    ['another currency', (state) => { state.gl[OPENING(state)]!.currency = 'EUR' }],
+    ['absent label with a non-zero amount', (state) => { state.gl[OPENING(state)]!.sourcePayloadRef = REF_ABSENT(PREVIOUS) }],
+    ['the sub-ledger sum is not a number', (state) => { state.transitMovement = 'abc' }],
+    ['transit shares its code with COGS', (state) => { state.settings.set('xero_transit_account', CODES.cogs) }],
+  ]
+  for (const [name, change] of cases) {
+    const state = goodState()
+    change(state)
+    const { basis } = await load(state)
+    assert.deepEqual(transitOf(basis), { available: false, reason: 'transit_balance_unusable' }, name)
+  }
+  // The two days further back never stand in for the opening day.
+  const older = goodState()
+  older.gl[OPENING(older)] = { ...older.gl[OPENING(older)]!, balanceDate: dateOf('2026-10-17'), sourcePayloadRef: REF('2026-10-17') }
+  assert.deepEqual(transitOf((await load(older)).basis), { available: false, reason: 'transit_balance_unusable' })
+})
+
+// [mutation: the absent-from-tb check removed at either end]
+test('TRANSIT LEG: a transit balance that is the zero the pull synthesised, at either end of the window, is never a reported zero', async () => {
+  const opening = goodState()
+  opening.gl[OPENING(opening)] = { ...opening.gl[OPENING(opening)]!, amountBase: '0', sourcePayloadRef: REF_ABSENT(PREVIOUS) }
+  assert.deepEqual(transitOf((await load(opening)).basis), { available: false, reason: 'transit_absent_from_tb' })
+  const closing = goodState()
+  closing.gl = closing.gl.map((row) => (row.accountCode === CODES.transit && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, amountBase: '0', sourcePayloadRef: REF_ABSENT(D) } : row))
+  const basis = (await load(closing)).basis
+  assert.deepEqual(transitOf(basis), { available: false, reason: 'transit_absent_from_tb' })
+  assert.equal(basis.available && basis.inventoryGlWithheld, null, 'the inventory comparison is not affected by the transit leg')
+})
+
+test('TRANSIT LEG: the transit leg changing between the read and the settle is BASIS_MOVED, whichever row moved', async () => {
+  const stateChanges: Array<[string, (state: FakeState) => void]> = [
+    ['the sub-ledger movement', (state) => { state.transitMovement = '11' }],
+    ['the opening balance', (state) => { state.gl[OPENING(state)]!.amountBase = '41' }],
+    ['the opening balance update time only', (state) => { state.gl[OPENING(state)]!.updatedAt = new Date('2026-10-21T01:00:00.000Z') }],
+    ['the coverage watermark', (state) => { state.settings.set(TRANSIT_COVERAGE_SETTING_KEY, '2026-01-02') }],
+  ]
+  for (const [name, change] of stateChanges) {
+    const state = goodState()
+    const fake = fakeRun(state)
+    const read = await readAsOfBasis(D, { run: fake.run })
+    change(state)
+    const settled = await settleAsOfBasis(read, cleanBracket(), { run: fake.run })
+    assert.equal(settled.available, false, name)
+    if (!settled.available) assert.equal(settled.reason, 'basis_moved', name)
+  }
+})
+
+test('TRANSIT LEG: the closed reason table is exactly the reasons the leg can return, and a leg reason never reaches the basis reasons', () => {
+  assert.deepEqual(Object.keys(PACK_TRANSIT_LEG_REASONS).sort(), ['transit_absent_from_tb', 'transit_balance_unusable', 'transit_ledger_not_covering'])
+  assert.ok(!PACK_BASIS_REASON_LIST.some((r) => (r as string).startsWith('transit_')))
 })

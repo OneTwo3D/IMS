@@ -1,36 +1,42 @@
 /**
  * RUNNING THE ITEMS: which run, which are skipped and why, which streams they stand on, and what a runner that misbehaves
  * becomes. No file, no database and no clock of its own: everything comes in through the ports below, so a test drives the
- * whole of it and the command only wires the real ones.
+ * whole of it and the command only wires the real ones (lib/reconciliation-pack/default-ports.ts).
  *
  *   - An item the phase does not apply is not-applicable; one the run was not asked for is inconclusive NOT_SELECTED; one with
  *     no runner on this build is inconclusive NO_RUNNER. Nothing here is ever a pass by omission.
- *   - An item that stands on a read-sync stream is not run unless the stream is fresh at the start with a last-success stamp, and
- *     its result is replaced by BASIS_MOVED unless the SAME stamp is read again at the end (equality only, never an order). A
- *     missing liveness reader makes such an item STALE_BASIS: no reader is not "fresh".
+ *   - THE LIVENESS BRACKET. The read-sync status report is read at the START and again at the END (liveness.ts). An item is not
+ *     run unless the start read alone allows it, and its result is replaced by the bracket's verdict if the two reads together do
+ *     not: STALE_BASIS (a dependent stream not fresh, or the scheduler not trusted), BASIS_MOVED (the stamp or the instance set
+ *     moved), SOURCE_UNREADABLE (a read failed, or there is no liveness reader at all). This applies to EVERY item, one with no
+ *     dependent stream included: liveness that could not be read is never taken as healthy.
+ *   - THE LEDGER ITEMS (R6, R10) stand on the as-of basis. It is READ inside the bracket (after the start read, before any item)
+ *     and SETTLED after the end read, and the item runs on the settled basis only. No basis port is an unreadable source.
  *   - A runner that throws, names another item, or returns something the report builder refuses is INTERNAL_ERROR for that item
  *     alone; the others still publish. The report builder is the judge of every item, here in isolation and again in the
  *     publication, so no runner can loosen its own test.
- *
- * LivenessPort and BasisPort are the seams for the read-sync liveness reader and the as-of basis check, which are built
- * separately. The command wires neither today (the first makes every stream-dependent item STALE_BASIS, the second makes
- * --basis-only print BASIS_UNAVAILABLE_NOT_BUILT); when they land they are wired here without touching the runners.
  */
 
-import type { ReadSyncStreamId } from '@/lib/ops/read-sync-liveness-constants'
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
 import type { AcceptanceFile } from '@/lib/ops/readiness-gate'
+import type { AsOfBasis, BasisRead } from '@/lib/reconciliation-pack/basis'
 import { PACK_ITEM_IDS, getPackItem, itemApplicability, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
-import { isStreamStamp } from '@/lib/reconciliation-pack/compare'
 import { runInvariantItem } from '@/lib/reconciliation-pack/invariant-items'
+import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-readers'
+import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconciliation-pack/ledger-items'
+import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
 
-export type StreamReading = { state: 'fresh' | 'stale' | 'off' | 'unknown'; lastSuccess: string | null }
-export type StreamReadings = Partial<Record<ReadSyncStreamId, StreamReading>>
-/** Reads every stream's state and last-success stamp. May throw: the run then treats every stream as unknown. */
-export interface LivenessPort { read(): Promise<StreamReadings> }
-export interface BasisReading { ok: boolean; codes: readonly string[] }
-export interface BasisPort { check(asOf: string): Promise<BasisReading> }
+/** Reads the read-sync status report, reduced and checked against itself (reduceStatusReport). May throw: the run treats that as an unreadable read. */
+export interface LivenessPort { read(): Promise<LivenessRead> }
+/**
+ * The as-of basis in its two phases (basis.ts): `read` INSIDE the liveness bracket, `settle` AFTER its end read. Neither throws in
+ * the real port; a port that does is an unreadable basis.
+ */
+export interface BasisPort {
+  read(asOf: string): Promise<BasisRead>
+  settle(read: BasisRead, bracket: LivenessBracket): Promise<AsOfBasis>
+}
 
 export type RunContext = {
   phase: ReadinessPhase
@@ -39,8 +45,12 @@ export type RunContext = {
   acceptances: AcceptanceFile
   /** The invariant report, run at most once per pack run and shared. null when it could not be run. */
   invariant: () => Promise<unknown>
+  /** Reads the IMS side in one READ ONLY REPEATABLE READ transaction (ims-readers.ts). Absent = an item that needs it is inconclusive. */
+  ims?: (options: ImsReadOptions) => Promise<ImsRead>
 }
 export type ItemRunner = (context: RunContext) => Promise<ItemInput>
+/** A ledger item runs on the SETTLED basis, after the liveness bracket is closed. */
+export type LedgerRunner = (context: RunContext, basis: AsOfBasis) => Promise<ItemInput>
 
 export type RunPlan = {
   phase: ReadinessPhase
@@ -48,7 +58,9 @@ export type RunPlan = {
   selected: readonly PackItemId[] | null
   context: RunContext
   liveness?: LivenessPort
+  basis?: BasisPort
   runners?: Partial<Record<PackItemId, ItemRunner>>
+  ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
 }
 
 /** The runners this build has. R3, R4 and R15 read the shared invariant report. */
@@ -56,6 +68,12 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromInvariant = (id: 'R3' | 'R4' | 'R15'): ItemRunner => async (context) =>
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
   return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15') }
+}
+
+/** R6 and R10 read the settled as-of basis (ledger-items.ts). */
+export function builtInLedgerRunners(): Record<LedgerItemId, LedgerRunner> {
+  const run = (id: LedgerItemId): LedgerRunner => (context, basis) => runLedgerItem(id, basis, { phase: context.phase, asOf: context.asOf, ims: context.ims })
+  return { R6: run('R6'), R10: run('R10') }
 }
 
 /** Run the invariant report once and share the answer; a throw is a null answer (every dependent item is then inconclusive). */
@@ -69,14 +87,14 @@ export function memoisedInvariant(run: () => Promise<unknown>): () => Promise<un
 
 const inconclusive = (id: PackItemId, reason: PackReasonCode): ItemInput => ({ id, outcome: 'inconclusive', reasons: [reason] })
 
-async function readStreams(port: LivenessPort | undefined): Promise<StreamReadings | null> {
-  if (!port) return null
-  try { return await port.read() } catch { return null }
-}
-
-function stampOf(readings: StreamReadings | null, stream: ReadSyncStreamId): string | null {
-  const reading = readings?.[stream]
-  return reading && reading.state === 'fresh' && isStreamStamp(reading.lastSuccess) ? reading.lastSuccess : null
+export async function readLivenessSafe(port: LivenessPort | undefined): Promise<LivenessRead> {
+  if (!port) return { ok: false }
+  try {
+    const read = await port.read()
+    return typeof read === 'object' && read !== null && (read as { ok?: unknown }).ok === true ? read : { ok: false }
+  } catch {
+    return { ok: false }
+  }
 }
 
 /**
@@ -97,37 +115,68 @@ function judged(item: ItemInput, plan: Pick<RunPlan, 'phase' | 'asOf'>, brackets
 
 export async function runItems(plan: RunPlan): Promise<{ items: ItemInput[]; streams: StreamBracket[] }> {
   const runners = { ...builtInRunners(), ...(plan.runners ?? {}) }
-  const start = await readStreams(plan.liveness)
+  const ledgerRunners: Partial<Record<LedgerItemId, LedgerRunner>> = { ...builtInLedgerRunners(), ...(plan.ledgerRunners ?? {}) }
+  const start = await readLivenessSafe(plan.liveness)
+  // What the START read alone allows: an item that could not pass on it is not even run (its runner may be expensive).
+  const startOnly = bracketLiveness(start, start)
   const results = new Map<PackItemId, ItemInput>()
   const attempted: PackItemId[] = []
+  const ledgerAttempted: LedgerItemId[] = []
+  const plain: PackItemId[] = []
 
   for (const id of PACK_ITEM_IDS) {
     if (itemApplicability(id, plan.phase) === 'not-applicable') { results.set(id, { id, outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'] }); continue }
     if (plan.selected !== null && !plan.selected.includes(id)) { results.set(id, inconclusive(id, 'NOT_SELECTED')); continue }
-    const runner = runners[id]
-    if (!runner) { results.set(id, inconclusive(id, 'NO_RUNNER')); continue }
-    if (getPackItem(id).streams.some((stream) => stampOf(start, stream) === null)) { results.set(id, inconclusive(id, 'STALE_BASIS')); continue }
+    const hasRunner = isLedgerItem(id) ? ledgerRunners[id] !== undefined : runners[id] !== undefined
+    if (!hasRunner) { results.set(id, inconclusive(id, 'NO_RUNNER')); continue }
+    const verdict = itemLivenessVerdict(startOnly, id)
+    if (!verdict.ok) { results.set(id, inconclusive(id, verdict.reason)); continue }
     attempted.push(id)
+    if (isLedgerItem(id)) ledgerAttempted.push(id)
+    else plain.push(id)
+  }
+
+  // The basis is read INSIDE the bracket: after the start read and before the end read, whatever the items do in between.
+  let basisRead: BasisRead | null = null
+  let basisReadable = true
+  if (ledgerAttempted.length > 0) {
+    try { basisRead = plan.basis ? await plan.basis.read(plan.asOf) : null } catch { basisRead = null }
+    basisReadable = basisRead !== null
+  }
+
+  for (const id of plain) {
     try {
-      const produced = await runner(plan.context)
+      const produced = await runners[id]!(plan.context)
       results.set(id, produced.id === id ? produced : inconclusive(id, 'INTERNAL_ERROR'))
     } catch {
       results.set(id, inconclusive(id, 'INTERNAL_ERROR'))
     }
   }
 
-  // The stamps again, after every read: an item that stands on a stream keeps its result only if the stamp is the same one.
-  const end = attempted.some((id) => getPackItem(id).streams.length > 0) ? await readStreams(plan.liveness) : null
-  const streams = new Map<ReadSyncStreamId, StreamBracket>()
-  for (const id of attempted) {
-    for (const stream of getPackItem(id).streams) {
-      const first = stampOf(start, stream)
-      const last = stampOf(end, stream)
-      streams.set(stream, { stream, start: first, end: last })
-      if (first === null || last === null || first !== last) results.set(id, inconclusive(id, first === null || last === null ? 'STALE_BASIS' : 'BASIS_MOVED'))
+  // The status report again, after every read.
+  const end = attempted.length > 0 ? await readLivenessSafe(plan.liveness) : ({ ok: false } as LivenessRead)
+  const bracket = bracketLiveness(start, end)
+  const verdicts = new Map(attempted.map((id) => [id, itemLivenessVerdict(bracket, id)] as const))
+
+  for (const id of ledgerAttempted) {
+    const verdict = verdicts.get(id)!
+    if (!verdict.ok) { results.set(id, inconclusive(id, verdict.reason)); continue }
+    if (!basisReadable || !plan.basis || basisRead === null) { results.set(id, inconclusive(id, 'SOURCE_UNREADABLE')); continue }
+    try {
+      const basis = await plan.basis.settle(basisRead, bracket)
+      const produced = await ledgerRunners[id]!(plan.context, basis)
+      results.set(id, produced.id === id ? produced : inconclusive(id, 'INTERNAL_ERROR'))
+    } catch {
+      results.set(id, inconclusive(id, 'INTERNAL_ERROR'))
     }
   }
-  const brackets = [...streams.values()]
+  // A result is kept only if the bracket allows it: the verdict may take it away, and nothing here gives one back.
+  for (const id of plain) {
+    const verdict = verdicts.get(id)!
+    if (!verdict.ok) results.set(id, inconclusive(id, verdict.reason))
+  }
+
+  const brackets = publishedStreamBrackets(bracket, [...new Set(attempted.flatMap((id) => [...getPackItem(id).streams]))])
   const items = PACK_ITEM_IDS.map((id) => {
     const item = results.get(id)!
     return attempted.includes(id) ? judged(item, plan, brackets) : item

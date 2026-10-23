@@ -1,12 +1,14 @@
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
-import { PACK_BASIS_ACCOUNTS, type PackBasisAccountKind } from '../../lib/reconciliation-pack/constants.ts'
+import { PACK_BASIS_ACCOUNTS, TRANSIT_COVERAGE_SETTING_KEY, type PackBasisAccountKind } from '../../lib/reconciliation-pack/constants.ts'
 import { bracketLiveness, reduceStatusReport, type LivenessBracket } from '../../lib/reconciliation-pack/liveness.ts'
-import type { BasisGlRow, BasisTx } from '../../lib/reconciliation-pack/basis.ts'
+import { readAsOfBasis, settleAsOfBasis, type BasisGlRow, type BasisTx } from '../../lib/reconciliation-pack/basis.ts'
+import type { BasisPort, LivenessPort } from '../../lib/reconciliation-pack/run.ts'
 import { goodReport } from './liveness-fixtures.ts'
 
 export const D = '2026-10-19'
 export const TENANT = 'tenant-current'
 export const dateOf = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
+export const PREVIOUS = '2026-10-18'
 export const CODES: Record<PackBasisAccountKind, string> = { inventory: '630', allocated: '631', transit: '632', cogs: '500', unearned: '260' }
 export const REF = (iso: string) => `xero:trial-balance:${iso}`
 export const REF_ABSENT = (iso: string) => `xero:trial-balance:${iso}:absent-from-tb`
@@ -18,6 +20,8 @@ export type FakeState = {
   /** The bound Xero connection's tenant; null = not connected. */
   tenant: string | null
   gl: Array<BasisGlRow & { externalAccountId?: string }>
+  /** The sum of the transit sub-ledger movement in (D-1, D]; null = no movement rows. */
+  transitMovement: unknown
   run: { snapshotCount: number } | null
   snapshots: SnapshotRow[]
 }
@@ -25,12 +29,18 @@ export type FakeState = {
 export function goodState(overrides: Partial<FakeState> = {}): FakeState {
   const settings = new Map<string, string>([[INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true']])
   for (const account of PACK_BASIS_ACCOUNTS) settings.set(account.settingKey, CODES[account.kind])
+  settings.set(TRANSIT_COVERAGE_SETTING_KEY, '2026-01-01')
   const amounts: Record<PackBasisAccountKind, string> = { inventory: '1000.50', allocated: '200.25', transit: '50', cogs: '75.10', unearned: '-300' }
   return {
     settings,
     baseCurrency: 'GBP',
     tenant: TENANT,
-    gl: PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT, updatedAt: new Date('2026-10-20T01:00:00.000Z') })),
+    gl: [
+      ...PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT, updatedAt: new Date('2026-10-20T01:00:00.000Z') })),
+      // The transit balance of the day before D: the movement of the day is 50 - 40 = 10.
+      { accountCode: CODES.transit, balanceDate: dateOf(PREVIOUS), currency: 'GBP', amountBase: '40', sourcePayloadRef: REF(PREVIOUS), tenantId: TENANT, updatedAt: new Date('2026-10-19T01:00:00.000Z') },
+    ],
+    transitMovement: '10',
     run: { snapshotCount: 2 },
     snapshots: [{ valueBase: '700.25', valueReplayReliable: true }, { valueBase: '500.50', valueReplayReliable: true }],
     ...overrides,
@@ -60,6 +70,7 @@ export function fakeRun(state: FakeState, log: string[] = []) {
       findMany: async (args) => guard('snapshot.findMany', () => state.gl.filter((row) => args.where.accountCode.in.includes(row.accountCode ?? '\u0000') && row.currency === args.where.currency && dateMatch(row.balanceDate, args.where.balanceDate))),
       count: async (args) => guard('snapshot.count', () => state.gl.filter((row) => row.accountCode === args.where.accountCode && row.currency === args.where.currency && row.tenantId === args.where.tenantId).length),
     },
+    transitSubledgerMovement: { aggregate: async () => guard('transit.aggregate', () => ({ _sum: { baseDelta: state.transitMovement } })) },
     inventorySnapshotRun: { findUnique: async () => guard('run.findUnique', () => state.run) },
     inventorySnapshot: {
       aggregate: async () => guard('inventorySnapshot.aggregate', () => ({
@@ -82,4 +93,19 @@ export function fakeRun(state: FakeState, log: string[] = []) {
 
 export function cleanBracket(): LivenessBracket {
   return bracketLiveness(reduceStatusReport(goodReport()), reduceStatusReport(goodReport()))
+}
+
+/** The real basis (read inside the bracket, settled after it) over a transaction double. */
+export function fakeBasisPort(state: FakeState = goodState(), log: string[] = []): BasisPort & { calls: () => number } {
+  const fake = fakeRun(state, log)
+  return {
+    calls: fake.calls,
+    read: (asOf) => readAsOfBasis(asOf, { run: fake.run }),
+    settle: (read, bracket) => settleAsOfBasis(read, bracket, { run: fake.run }),
+  }
+}
+
+/** A liveness port whose every read is the all-fresh, clean-scheduler status report (reduced and checked like the real one). */
+export function healthyLiveness(): LivenessPort {
+  return { read: async () => reduceStatusReport(goodReport()) }
 }

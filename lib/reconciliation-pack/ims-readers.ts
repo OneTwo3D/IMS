@@ -38,13 +38,14 @@ import {
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
 import { STOCK_TRACKED_PRODUCT_TYPES } from '@/lib/domain/inventory/backorder-policy'
+import { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/enums'
 
 /** The slice of a `pg` client this module needs. A test double implements it; `pg.Client` satisfies it. */
 export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -69,6 +70,15 @@ export type XeroSyncLogRow = { id: string; type: string; referenceType: string; 
 export type SnapshotValueRow = { productId: string; warehouseId: string; qty: string; valueBase: string; valueReplayReliable: boolean }
 export type BalanceSnapshotRow = { externalAccountId: string; accountCode: string | null; currency: string; amountBase: string }
 export type ImsSnapshots = { asOf: string; run: { stockLevelCount: number; snapshotCount: number } | null; values: SnapshotValueRow[]; balances: BalanceSnapshotRow[] }
+/**
+ * R10, the zero-IMS-originated-posting leg. `p0` is the first-load run record: only a VERIFIED run is a recorded P0, and the instant
+ * is when that run STARTED (created_at), so a posting made at any time since the first load began is inside. `rows` is every sync
+ * log row of the Xero connector that could be a write to Xero (of ANY type: a posting, an attachment, an e-mail, a tax-rate push):
+ * SYNCED, PROCESSING (the write may have happened), or carrying an external document id. `at` is when it happened: the sync time,
+ * else the time processing started, else the time the row was created. The row's own status is kept so a reader can see why it is in.
+ */
+export type XeroPostingRow = { id: string; type: string; status: string; at: string }
+export type XeroPostings = { p0: { state: 'absent' } | { state: 'unverified' } | { state: 'verified'; startedAt: string }; rows: XeroPostingRow[] }
 export type WmsBindingRow = { connector: string; warehouseId: string; warehouseCode: string; externalWarehouseId: string; active: boolean; stockSyncMode: 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'; alignmentConfirmed: boolean }
 
 export type ImsSectionValues = {
@@ -81,6 +91,7 @@ export type ImsSectionValues = {
   xeroSyncLogs: XeroSyncLogRow[]
   snapshots: ImsSnapshots
   wmsBindings: WmsBindingRow[]
+  xeroPostings: XeroPostings
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -272,6 +283,32 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const logs = rows.map((row): XeroSyncLogRow => ({ id: text(row.id), type: text(row.type, 'SOURCE_UNREADABLE'), referenceType: text(row.ref_type), referenceId: text(row.ref_id), externalTransactionId: text(row.external_id) }))
     unique(logs, (log) => log.id)
     return logs
+  },
+
+  async xeroPostings(tx) {
+    const runs = await tx.query(`SELECT status, ${UTC('created_at')} AS started FROM first_load_apply_runs`)
+    if (runs.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    let p0: XeroPostings['p0'] = { state: 'absent' }
+    if (runs.length === 1) {
+      const status = oneOf(runs[0]!.status, FIRST_LOAD_RUN_STATUSES)
+      const started = instantOrNull(runs[0]!.started)
+      if (status !== 'VERIFIED') p0 = { state: 'unverified' }
+      else if (started === null) throw new Unreadable('SOURCE_UNREADABLE')
+      else p0 = { state: 'verified', startedAt: started }
+    }
+    // Whatever could be a write to Xero, of any type. Not "connector-confirmed rows only": a row that is still PROCESSING may
+    // have posted, and a row with a document id has been sent whatever its status says now. The instant is the LATEST of the
+    // row's sync time, processing start and creation time (GREATEST skips nulls; creation time is never null): the sync and
+    // processing times can come from an application host's clock, so preferring one of them could place a row created after
+    // the first load began before it. Taking the latest only ever moves a row INTO the population.
+    const rows = await readCapped(tx, `SELECT id, type::text AS type, status::text AS status, ${UTC('GREATEST("syncedAt", "processingStartedAt", "createdAt")')} AS at FROM accounting_sync_logs WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id`)
+    const postings = rows.map((row): XeroPostingRow => {
+      const at = instantOrNull(row.at)
+      if (at === null) throw new Unreadable('SOURCE_UNREADABLE')
+      return { id: text(row.id), type: oneOf(row.type, Object.values(AccountingSyncType)), status: oneOf(row.status, Object.values(AccountingSyncStatus)), at }
+    })
+    unique(postings, (posting) => posting.id)
+    return { p0, rows: postings }
   },
 
   async snapshots(tx) {

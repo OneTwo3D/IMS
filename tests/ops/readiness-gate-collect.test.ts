@@ -23,7 +23,7 @@ import { FORBIDDEN_ENV_PATTERNS } from '../../lib/ops/first-install-rehearsal.ts
 import { normaliseConstraintDefinition, READ_SYNC_STATUS_SCRIPT, REQUIRED_CHECK_CONSTRAINTS, REQUIRED_READ_SYNC_STREAMS, SCHEMA_STATE_SCRIPTS } from '../../lib/ops/readiness-gate-constants.ts'
 import { decideVerdict } from '../../lib/ops/readiness-gate.ts'
 import type { AccountingReconciliationReadiness } from '../../lib/ops/rollout-readiness.ts'
-import { ALL_CONSTRAINTS, DAY, PG_RENDERED, constraintRows, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal, APPLY_RUN, APPLY_SYSTEM_ID, greenApplyReport } from '../helpers/readiness-gate-fixtures.ts'
+import { ALL_CONSTRAINTS, DAY, PG_RENDERED, constraintRows, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal, APPLY_RUN, APPLY_SYSTEM_ID, greenApplyReport, packRecord } from '../helpers/readiness-gate-fixtures.ts'
 
 /**
  * COLLECTION: every dependency failing is `unreadable`, never silence; the child environment is a
@@ -66,6 +66,8 @@ function deps(overrides: Partial<GateDeps> = {}, scripts: Record<string, string>
     readInstalledConstraints: ALL_CONSTRAINTS,
     readApplyRun: async () => ({ systemId: APPLY_SYSTEM_ID, runs: [{ ...APPLY_RUN }] }),
     readApplyReports: () => ({ reports: [{ parsed: greenApplyReport(), markdownDigestOk: true }], unparseable: 0 }),
+    readNewestPackReport: () => ({ record: packRecord('P0') }),
+    readSystemIdentifier: async () => APPLY_SYSTEM_ID,
     readNewestRehearsal: () => ({ digest: { ok: true }, parsed: greenRehearsal(), location: '/r/readiness-report.json' }),
     env: { PATH: '/usr/bin', HOME: '/home/x', DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/db', SMTP_PASSWORD: 'secret', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example', MINTSOFT_API_KEY: 'k', NODE_OPTIONS: '--require /evil.js', IMS_CONCURRENCY_SCRATCH_DB: 'x' },
     repoRoot: ROOT,
@@ -73,7 +75,7 @@ function deps(overrides: Partial<GateDeps> = {}, scripts: Record<string, string>
   }
 }
 
-const OPTIONS = { phase: 'P0' as const, expectGranted: null, rehearsalDir: '/r', applyReportDir: '/a' }
+const OPTIONS = { phase: 'P0' as const, expectGranted: null, rehearsalDir: '/r', applyReportDir: '/a', packReportDir: '/p' }
 
 test('with healthy dependencies the collection yields a GO on this tree (the control for the arms below)', async () => {
   const d = deps()
@@ -349,7 +351,7 @@ test('the default rehearsal location is refused too when it fails the checks (sa
   const dir = scratchBase('ims-gate-trustdefault-')
   publish(dir, 'run', greenRehearsal())
   chmodSync(dir, 0o777)
-  const { results } = await collectGateResults({ phase: 'P0', expectGranted: null, rehearsalDir: dir, applyReportDir: '/a' }, { ...deps(), readNewestRehearsal: (d) => readNewestRehearsal(d, verifyPublishedReport) })
+  const { results } = await collectGateResults({ phase: 'P0', expectGranted: null, rehearsalDir: dir, applyReportDir: '/a', packReportDir: '/p' }, { ...deps(), readNewestRehearsal: (d) => readNewestRehearsal(d, verifyPublishedReport) })
   assert.equal(results['first-install-rehearsal']!.kind, 'fail')
   assert.match(JSON.stringify(results['first-install-rehearsal']), /not trusted/)
 })

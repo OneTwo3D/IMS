@@ -59,7 +59,7 @@ test('a statement that is not a SELECT or a fixed SET LOCAL, or holds two statem
   // The wrapper is exercised through the only door there is: a section whose SQL is wrong. Prove the allowlist by making the
   // fake observe every statement and by checking that none of the real sections sends anything else, across ALL sections.
   const client = fake(() => [])
-  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings'], asOf: '2026-10-19' })
+  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'], asOf: '2026-10-19' })
   for (const sql of client.sent) assert.ok(/^(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|ROLLBACK|SELECT\b|SET LOCAL (statement_timeout|idle_in_transaction_session_timeout) = \d+$|SET LOCAL TIME ZONE 'UTC'$)/.test(sql) && !sql.includes(';'), sql)
   assert.ok(!client.sent.some((s) => /\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|GRANT)\b/i.test(s)))
 })
@@ -159,6 +159,42 @@ test('snapshots: rows with no run row, or a run row that counts another number o
   for (const asOf of ['2026-13-40', 'yesterday', '']) assert.deepEqual(await section([], [], asOf), { ok: false, reason: 'STALE_BASIS' }, asOf)
   const none = await readImsSnapshot(fake(() => []), { sections: ['snapshots'] })
   assert.ok(none.ok && !none.sections.snapshots!.ok)
+})
+
+// [mutation: the P0 record read from updated_at / a non-VERIFIED run accepted / a row dropped for want of a time]
+test('xeroPostings: the P0 instant is when the VERIFIED first load STARTED; every row that could be a write is kept with its own status and instant; a row it cannot read makes the section unreadable', async () => {
+  const read = async (runs: Array<Record<string, unknown>>, rows: Array<Record<string, unknown>>) => {
+    const client = fake((sql) => (/first_load_apply_runs/.test(sql) ? runs : /FROM accounting_sync_logs/.test(sql) ? rows : []))
+    const r = await readImsSnapshot(client, { sections: ['xeroPostings'] })
+    assert.ok(r.ok)
+    return { section: r.sections.xeroPostings!, sent: client.sent }
+  }
+  const log = (over: Record<string, unknown> = {}) => ({ id: 'cl1', type: 'SALES_INVOICE', status: 'SYNCED', at: '2026-10-05T10:00:00.000Z', ...over })
+  const good = await read([{ status: 'VERIFIED', started: '2026-10-01T09:00:00.000Z' }], [log(), log({ id: 'cl2', type: 'INVOICE_PDF', status: 'PROCESSING' }), log({ id: 'cl3', type: 'TAX_RATE_SYNC', status: 'FAILED' })])
+  assert.deepEqual(good.section, { ok: true, value: { p0: { state: 'verified', startedAt: '2026-10-01T09:00:00.000Z' }, rows: [log(), log({ id: 'cl2', type: 'INVOICE_PDF', status: 'PROCESSING' }), log({ id: 'cl3', type: 'TAX_RATE_SYNC', status: 'FAILED' })] } })
+  const sql = good.sent.find((s) => /FROM accounting_sync_logs/.test(s))!
+  assert.match(sql, /connector = 'xero'/)
+  assert.match(sql, /status::text IN \('SYNCED', 'PROCESSING'\) OR "externalTransactionId" IS NOT NULL/)
+  assert.ok(!/type::text (<>|NOT IN|!=)/.test(sql) && !/settlement_basis/.test(sql), 'no type and no settlement basis is left out of the population')
+  assert.match(good.sent.find((s) => /first_load_apply_runs/.test(s))!, /created_at/)
+
+  const states = async (runs: Array<Record<string, unknown>>) => (await read(runs, [])).section
+  assert.deepEqual(await states([]), { ok: true, value: { p0: { state: 'absent' }, rows: [] } })
+  assert.deepEqual(await states([{ status: 'APPLIED', started: '2026-10-01T09:00:00.000Z' }]), { ok: true, value: { p0: { state: 'unverified' }, rows: [] } })
+  assert.deepEqual(await states([{ status: 'MADE_UP', started: '2026-10-01T09:00:00.000Z' }]), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await states([{ status: 'VERIFIED', started: null }]), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await states([{ status: 'VERIFIED', started: 'yesterday' }]), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await states([{ status: 'VERIFIED', started: '2026-10-01T09:00:00.000Z' }, { status: 'VERIFIED', started: '2026-10-01T09:00:00.000Z' }]), { ok: false, reason: 'DUPLICATE_KEY' })
+
+  const run = [{ status: 'VERIFIED', started: '2026-10-01T09:00:00.000Z' }]
+  const bad: Array<[string, Record<string, unknown>, string]> = [
+    ['no id', { id: null }, 'BAD_KEY'], ['unknown type', { type: 'NEW_TYPE' }, 'SOURCE_UNREADABLE'], ['unknown status', { status: 'LOST' }, 'SOURCE_UNREADABLE'],
+    ['no instant', { at: null }, 'SOURCE_UNREADABLE'], ['instant not ISO', { at: 'last week' }, 'SOURCE_UNREADABLE'],
+  ]
+  for (const [name, over, reason] of bad) assert.deepEqual((await read(run, [log(), log({ id: 'cl2', ...over })])).section, { ok: false, reason }, name)
+  assert.deepEqual((await read(run, [log(), log()])).section, { ok: false, reason: 'DUPLICATE_KEY' })
+  const over = await readImsSnapshot(fake((sql) => (/FROM accounting_sync_logs/.test(sql) ? [log(), log({ id: 'cl2' }), log({ id: 'cl3' })] : [])), { sections: ['xeroPostings'], rowCap: 2 })
+  assert.ok(over.ok && over.sections.xeroPostings!.ok === false && over.sections.xeroPostings!.reason === 'CAP_EXCEEDED', 'more rows than the cap is CAP_EXCEEDED, never a shorter list')
 })
 
 test('options are validated: duplicate or unknown sections, a cap or a timeout out of range', async () => {
