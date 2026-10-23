@@ -41,12 +41,34 @@ test('an empty list, a body that is not the list and an oversized list are refus
   refused({ Status: 'ERROR', TaxRates: [row()] })
 })
 
-// [mutation: the unknown-field check removed (body, row or component)]
-test('an unknown field anywhere refuses the whole body', () => {
-  refused({ ...body(row()), Pagination: { page: 2 } })
-  refused(body(row({ Surprise: 1 })))
-  refused(body(row({ TaxComponents: [{ Name: 'VAT', Rate: 20, Extra: true }] })))
-  refused(body(row(), row({ TaxType: 'OUTPUT3', Extra: 1 })))
+// [mutation: the unknown key kept instead of dropped / not reported]
+test('an unknown key at the body, row or component level is DROPPED (not stored, not digested) and reported by NAME only', () => {
+  const plain = parseXeroTaxRateList(body(row()))
+  const noisy = parseXeroTaxRateList({ ...body(row({ Surprise: 'secret-value', TaxComponents: [{ Name: 'VAT', Rate: 20, Extra: 'secret-component' }] })), Pagination: { page: 2 } })
+  assert.ok(plain.ok && noisy.ok)
+  if (!plain.ok || !noisy.ok) return
+  assert.deepEqual(noisy.rows, plain.rows, 'the rows are exactly what they would have been without the unknown keys')
+  assert.equal(digestTaxRateList('t', noisy.rows), digestTaxRateList('t', plain.rows), 'and so is the digest')
+  assert.deepEqual(noisy.ignored, { body: ['Pagination'], row: ['Surprise'], component: ['Extra'] })
+  assert.ok(!JSON.stringify(noisy.ignored).includes('secret'), 'names only, never values')
+  assert.deepEqual(plain.ignored, { body: [], row: [], component: [] })
+  const odd = parseXeroTaxRateList(body(row({ ['x\u0007y'.repeat(30)]: 1 })))
+  assert.ok(odd.ok && odd.ignored.row[0]!.length <= 40 && /^[\x20-\x7e]+$/.test(odd.ignored.row[0]!), 'a name is printable and truncated')
+})
+
+// [mutation: the variant-of-a-known-key check removed (any level)]
+test('a case or punctuation variant of a KNOWN key is not "unknown": it could shadow the real field, so the whole body is refused', () => {
+  for (const variant of ['taxtype', 'TAXTYPE', 'Tax_Type', 'tax-type', 'name', 'STATUS', 'taxcomponents', 'Report_Tax_Type', 'canapplytorevenue', 'effectiverate']) {
+    assert.match(refused(body(row({ [variant]: 'OUTPUT9' }))), /variant of a known field/, `row ${variant}`)
+  }
+  assert.match(refused(body(row({ TaxComponents: [{ Name: 'VAT', Rate: 20, rate: 5 }] }))), /variant of a known field/, 'component rate')
+  assert.match(refused(body(row({ TaxComponents: [{ Name: 'VAT', Rate: 20, is_compound: true }] }))), /variant/, 'component IsCompound')
+  assert.match(refused({ ...body(row()), taxrates: [] }), /variant of a known field/, 'body TaxRates')
+  assert.match(refused({ ...body(row()), status: 'ERROR' }), /variant/, 'body Status')
+  // A variant is refused even when the real key is absent (it would stand in for it).
+  const { TaxType: _gone, ...withoutType } = row()
+  void _gone
+  refused(body({ ...withoutType, taxtype: 'OUTPUT2' }))
 })
 
 // [mutation: one validator removed per line]
@@ -88,8 +110,8 @@ test('parse is total: whatever it is given it returns a verdict and never throws
   const r = parseXeroTaxRateList(hostile)
   assert.equal(r.ok, false)
   assert.ok(!JSON.stringify(r).includes('hunter2'))
-  const long = refused(body(row({ ['X'.repeat(500)]: 1 })))
-  assert.ok(long.length < 120, 'a field name is truncated in the reason')
+  const long = refused(body(row({ ['Tax_Type'.padEnd(500, 'x')]: 1, TaxType: 5 })))
+  assert.ok(long.length < 120)
   assert.ok(!refused(body(row({ Name: 'secret-name\n' }))).includes('secret-name'))
 })
 

@@ -76,7 +76,10 @@ export type StorefrontMappingRow = { externalStatus: string; imsStatus: string }
 export type StorefrontStatusConfig = { configured: string[]; withdrawal: { submitted: string; approved: string }; mappings: StorefrontMappingRow[] }
 export type TaxRateRow = { id: string; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null }
 export type TaxMappingRow = { connector: string; externalTaxRateId: string; taxRateId: string }
-export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[] }
+export type TaxComponentTypeRow = { id: string; taxRateId: string; active: boolean; accountingTaxType: string }
+/** The two reverse-charge settings: Xero tax-type CODES IMS posts with. A blank value is "none". */
+export type ReverseChargeTaxTypes = { sales: string; purchase: string }
+export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[]; componentTaxTypes: TaxComponentTypeRow[]; reverseCharge: ReverseChargeTaxTypes }
 /**
  * The stored copy of Xero's tax-rate list for the organisation CURRENTLY connected, with the proof that it is one complete read.
  * `proven` only when the header row of THAT organisation exists, its row count equals the rows read, every row carries the
@@ -333,7 +336,18 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     unique(mappings, (mapping) => `${mapping.connector}\u0001${mapping.externalTaxRateId}`)
     const known = new Set(rates.map((rate) => rate.id))
     if (mappings.some((mapping) => !known.has(mapping.taxRateId))) throw new Unreadable('SOURCE_UNREADABLE')
-    return { rates, mappings }
+    // Every other place IMS names a Xero tax type: a component's own accounting tax type, and the two reverse-charge settings.
+    const componentTaxTypes = (await readCapped(tx, 'SELECT id, tax_rate_id AS rate_id, active, accounting_tax_type AS tax_type FROM tax_rate_components WHERE accounting_tax_type IS NOT NULL ORDER BY id')).map((row): TaxComponentTypeRow => ({ id: text(row.id), taxRateId: text(row.rate_id), active: bool(row.active), accountingTaxType: text(row.tax_type) }))
+    unique(componentTaxTypes, (component) => component.id)
+    if (componentTaxTypes.some((component) => !known.has(component.taxRateId))) throw new Unreadable('SOURCE_UNREADABLE')
+    const settingRows = await readCapped(tx, "SELECT key, value FROM settings WHERE key IN ('accounting_reverse_charge_sales_tax_type', 'accounting_reverse_charge_purchase_tax_type') ORDER BY key")
+    const reverseValue = (key: string): string => {
+      const row = settingRows.find((candidate) => candidate.key === key)
+      if (row === undefined) return ''
+      if (typeof row.value !== 'string' || /[\u0000-\u001f\u007f]/.test(row.value)) throw new Unreadable('SOURCE_UNREADABLE')
+      return row.value.trim()
+    }
+    return { rates, mappings, componentTaxTypes, reverseCharge: { sales: reverseValue('accounting_reverse_charge_sales_tax_type'), purchase: reverseValue('accounting_reverse_charge_purchase_tax_type') } }
   },
 
   async xeroTaxRates(tx) {

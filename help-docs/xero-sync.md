@@ -1446,11 +1446,15 @@ run that records tax-rate drift).
   depend on the comparison), validates every row strictly, and then, in a single transaction behind the connection fence, replaces
   the organisation's rows and header, writes the drift snapshot and advances the read-sync last-success stamp (`xero_tax_rate_drift_last_checked_at`).
   The stamp therefore means "the list was stored", never "a request was made".
-- **What is refused.** An empty list, a response that is not the `TaxRates` list, an unknown field, a field of the wrong type, a rate
-  that cannot be held exactly (more than six decimal places, negative, above 1000), or a tax type listed twice refuses the **whole**
-  response: nothing is stored, the previous list and the stamp stay exactly as they were, the run errors in the cron log
-  (`XeroTaxRateListRefusedError`, with the reason) and the *Xero tax-rate read* feed goes stale after six hours. If Xero adds a field to
-  its response the run fails closed until `lib/connectors/xero/tax-rate-list.ts` is taught the field.
+- **What is refused.** An empty list, a response that is not the `TaxRates` list (not OK, no list, more rows than any real list), a
+  known field of the wrong type or missing (`TaxType`, `Name`, `Status`, `TaxComponents`, a component's `Name` and `Rate`), a rate that
+  cannot be held exactly (more than six decimal places, negative, above 1000), a tax type listed twice, or a key that is only a case or
+  punctuation variant of a known one (`taxtype`, `Tax_Type`: it could shadow the real field) refuses the **whole** response: nothing is
+  stored, the previous list and the stamp stay exactly as they were, the run errors in the cron log (`XeroTaxRateListRefusedError`,
+  with the reason) and the *Xero tax-rate read* feed goes stale after six hours.
+- **What is ignored.** A key IMS does not know, at the response, row or component level, is dropped: it is not stored and is not part of
+  the digest. Each run that meets one writes a single WARNING (`xero_tax_rate_unknown_fields` in the activity log, and the cron log)
+  naming the keys, never their values. If a new Xero field should be kept, `lib/connectors/xero/tax-rate-list.ts` has to learn it.
 - **Organisations.** The list belongs to the organisation it was read from. A reader asks for the organisation connected now; after a
   rebind to another organisation there is no list for it until its first run, and the first run removes the previous organisation's
   rows. If the connection changes while a run is in flight, the run is discarded (see the connection fence above).

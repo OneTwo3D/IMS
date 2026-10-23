@@ -303,11 +303,21 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
       const proven = await run(['--vendor-reads-only'])
       assert.ok(proven.out.includes('R13 pass -'), proven.out.join('\n'))
       for (const target of proven.targets) assert.ok(target === `${url.hostname}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}` || target === `127.0.0.1:${storePort}`, `unexpected connection to ${target} (no request to Xero)`)
-      // The archived type is stored but not compared; an ACTIVE Xero type that no IMS rate holds is a finding (R13 fails by id).
+      // An ACTIVE Xero type that no IMS rate, component or reverse-charge setting names is out of the population, not a finding.
       await sql(`UPDATE xero_tax_rates SET status = 'ACTIVE' WHERE id = $1`, [`${VTAG}-x-OLD1`])
       await sql(`UPDATE xero_tax_rate_lists SET digest = $2 WHERE id = $1`, [`${VTAG}-xl`, digestTaxRateList(tenant, [xeroRows[0]!, { ...xeroRows[1]!, status: 'ACTIVE' as const }])])
+      const unreferenced = await run(['--vendor-reads-only'])
+      assert.ok(unreferenced.out.includes('R13 pass -'), unreferenced.out.join('\n'))
+      // A type IMS names that the stored list does not hold as ACTIVE is a finding (R13 fails, by type code).
+      await sql(`UPDATE tax_rates SET accounting_tax_type = 'MISSING9' WHERE id = $1`, [`${VTAG}-t`])
       const unmapped = await run(['--vendor-reads-only'])
       assert.ok(unmapped.out.includes('R13 fail DIFFERENCES'), unmapped.out.join('\n'))
+      await sql(`UPDATE tax_rates SET accounting_tax_type = 'OUTPUT2' WHERE id = $1`, [`${VTAG}-t`])
+      // A reverse-charge setting naming a type the list lacks is a finding too.
+      await sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ('accounting_reverse_charge_sales_tax_type', 'NOSUCHTYPE', now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`)
+      const reverse = await run(['--vendor-reads-only'])
+      assert.ok(reverse.out.includes('R13 fail DIFFERENCES'), reverse.out.join('\n'))
+      await sql(`DELETE FROM settings WHERE key = 'accounting_reverse_charge_sales_tax_type'`)
       // A stored row edited behind the header's back is not a proof: the item is inconclusive, never a pass.
       await sql(`UPDATE xero_tax_rates SET name = 'edited' WHERE id = $1`, [`${VTAG}-x-OUTPUT2`])
       const tampered = await run(['--vendor-reads-only'])
@@ -316,6 +326,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
       await sql(`DELETE FROM xero_tax_rate_lists WHERE id LIKE '${VTAG}%'`)
       await sql(`DELETE FROM xero_tax_rates WHERE id LIKE '${VTAG}%'`)
       await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${VTAG}%'`)
+      await sql(`DELETE FROM settings WHERE key = 'accounting_reverse_charge_sales_tax_type'`)
     }
 
     // An order the store has and IMS lacks is a finding (the identity swap, with equal counts): R9 fails by id.

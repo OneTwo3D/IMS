@@ -24,8 +24,9 @@
  *        total of zero in both sweeps.
  *
  *   R13  TAX-RATE MAPPINGS, presence only. Every WooCommerce tax rate (the full list, walked twice) must have an IMS mapping, and
- *        every IMS mapping of the storefront must name a rate the storefront still has; every ACTIVE Xero tax rate must be held by an
- *        active IMS tax rate (its accounting tax type), and the reverse. The Xero list is IMS's stored copy of it (Xero is the tax-rate
+ *        every IMS mapping of the storefront must name a rate the storefront still has; every Xero tax type IMS USES (an active IMS
+ *        tax rate's accounting tax type, an active component's, and the two reverse-charge settings) must resolve to an ACTIVE type of the
+ *        stored Xero list, else it is a finding; an ACTIVE Xero type nothing in IMS names is out of the population (NOT_REFERENCED_BY_IMS), listed and never a finding. The Xero list is IMS's stored copy of it (Xero is the tax-rate
  *        master; the xero-tax-rate-drift sweep replaces it whole), read in the same snapshot as the IMS rates for the organisation now
  *        connected, and it counts only when the header row proves it is one complete read (present for that organisation, its count
  *        equal to the rows read, its digest equal to the rows'); otherwise the Xero leg is VENDOR_LIST_UNPROVEN. No request is made to
@@ -235,14 +236,25 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
     return inconclusive('R13', [IMS, WOO], 'VENDOR_LIST_UNPROVEN')
   }
 
-  // Only a rate Xero still holds as ACTIVE is a Xero tax type to be held by an IMS rate; a DELETED, ARCHIVED or PENDING one is stored but not compared.
+  // THE XERO LEG IS "ONLY THE TYPES IMS USES". Every Xero tax type IMS names must resolve to an ACTIVE type of the proven stored list; a
+  // referenced type that is missing, DELETED, ARCHIVED or PENDING is a finding (onlyIms, listing the code). An ACTIVE Xero type that
+  // nothing in IMS names is not a finding: it is listed as out of the population (NOT_REFERENCED_BY_IMS). IMS names a Xero tax type in
+  // four places: an active tax rate, an active component of an active rate, and the two reverse-charge settings.
+  const activeRates = new Set(rates.filter((rate) => rate.active).map((rate) => rate.id))
+  const referenced = new Set<string>()
+  for (const rate of rates) if (rate.active && rate.accountingTaxType !== null) referenced.add(rate.accountingTaxType)
+  for (const component of section.value.componentTaxTypes) if (component.active && activeRates.has(component.taxRateId)) referenced.add(component.accountingTaxType)
+  for (const type of [section.value.reverseCharge.sales, section.value.reverseCharge.purchase]) if (type !== '') referenced.add(type)
+  const imsTypes = [...referenced]
+  if (!imsTypes.every((type) => XERO_TAX_TYPE_RE.test(type))) return inconclusive('R13', [IMS, WOO, XERO], 'BAD_KEY')
   const types = stored.taxTypes.filter((entry) => entry.status === 'ACTIVE').map((entry) => entry.taxType)
   if (!types.every((type) => typeof type === 'string' && XERO_TAX_TYPE_RE.test(type))) return inconclusive('R13', [IMS, WOO, XERO], 'BAD_KEY')
-  const imsTypes = [...new Set(rates.filter((rate) => rate.active && rate.accountingTaxType !== null).map((rate) => rate.accountingTaxType as string))]
-  if (!imsTypes.every((type) => XERO_TAX_TYPE_RE.test(type))) return inconclusive('R13', [IMS, WOO, XERO], 'BAD_KEY')
   const ims = [...imsWoo, ...imsTypes.map((type): SideRow => ({ key: xeroTypeKey(type) }))]
   const vendor = [...vendorWoo, ...types.map((type): SideRow => ({ key: xeroTypeKey(type) }))]
-  const result = compareItem('R13', { ims, vendor, imsComplete: true, vendorComplete: true, emptyProof: walked.value.total === 0 && types.length === 0 ? 'vendor-total-zero' : undefined })
+  // Judged: every WooCommerce identity and every type IMS names. A Xero type nothing names is outside the population.
+  const population = new Set<string>()
+  for (const row of [...imsWoo, ...vendorWoo, ...imsTypes.map((type): SideRow => ({ key: xeroTypeKey(type) }))]) population.add(canonicalKey(row.key))
+  const result = compareItem('R13', { ims, vendor, imsComplete: true, vendorComplete: true, population, emptyProof: walked.value.total === 0 && imsTypes.length === 0 ? 'vendor-total-zero' : undefined })
   return fromComparison('R13', result, [IMS, WOO, XERO])
 }
 

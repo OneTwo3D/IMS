@@ -11,7 +11,7 @@ import { config } from 'dotenv'
  * header, the drift snapshot and the read-sync last-success stamp in ONE connection-fenced transaction. The Xero fetch is a hook
  * (no request leaves the process). Each refusal arm has a CONTROL that proves the write really happens when nothing is wrong.
  *
- *   - a refused body (empty, unknown field, malformed, duplicate, not the list) leaves the previous list, header, snapshot and stamp
+ *   - a refused body (empty, aliased field, malformed, duplicate, not the list) leaves the previous list, header, snapshot and stamp
  *     exactly as they were;
  *   - a failure in the MIDDLE of the replace (a trigger that rejects the header insert) rolls the rows, the snapshot and the stamp back;
  *   - a rebind: the new organisation never reads the old organisation's list as its own, before or after its first sweep, and the old
@@ -166,10 +166,10 @@ test('REFUSED BODIES: an empty, partial, malformed or foreign response leaves th
     ['no list', { Status: 'OK' }],
     ['not an object', 'TaxRates'],
     ['a different collection', { Accounts: [rateRow('OUTPUT2')] }],
-    ['unknown row field', { TaxRates: [rateRow('OUTPUT2'), rateRow('INPUT2', { Surprise: 1 })] }],
+    ['aliased row field', { TaxRates: [rateRow('OUTPUT2'), rateRow('INPUT2', { taxtype: 'OUTPUT2' })] }],
     ['malformed rate in the last row', { TaxRates: [rateRow('OUTPUT2'), rateRow('INPUT2'), rateRow('X', { TaxComponents: [{ Name: 'VAT', Rate: '20' }] })] }],
     ['duplicate tax type', { TaxRates: [rateRow('OUTPUT2'), rateRow('OUTPUT2')] }],
-    ['unknown envelope field', { ...goodBody('OUTPUT2'), Pagination: { page: 2 } }],
+    ['aliased envelope field', { ...goodBody('OUTPUT2'), taxrates: [] }],
     ['not OK', { ...goodBody('OUTPUT2'), Status: 'ERROR' }],
   ]
   for (const [name, body] of bad) {
@@ -182,6 +182,23 @@ test('REFUSED BODIES: an empty, partial, malformed or foreign response leaves th
   await deps.drift.runXeroTaxRateDriftSweep()
   assert.deepEqual((await deps.db.xeroTaxRate.findMany({ select: { taxType: true } })).map((r) => r.taxType), ['OUTPUT2'], 'CONTROL: a well-formed, shorter list replaces the previous one whole')
   assert.equal((await deps.db.xeroTaxRateList.findFirstOrThrow()).rowCount, 1)
+})
+
+test('UNKNOWN KEYS are dropped: the list is stored without them, the run succeeds, and one activity row names the keys (never values)', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const run = randomUUID().slice(0, 8)
+  await wipe(deps)
+  await bindTo(deps, `tenant-A-${run}`, run)
+  await deps.db.activityLog.deleteMany({ where: { action: 'xero_tax_rate_unknown_fields' } })
+  setBody({ ...goodBody('OUTPUT2'), Pagination: { secret: 'v1' }, TaxRates: [rateRow('OUTPUT2', { Surprise: 'secret-value', TaxComponents: [{ Name: 'VAT', Rate: 20, Extra: 1 }] })] })
+  await deps.drift.runXeroTaxRateDriftSweep()
+  const section = await readSection(deps)
+  assert.equal((section as { state: string }).state, 'proven')
+  const logs = await deps.db.activityLog.findMany({ where: { action: 'xero_tax_rate_unknown_fields' } })
+  assert.equal(logs.length, 1, 'once per run')
+  assert.ok(!JSON.stringify(logs[0]).includes('secret'), 'names only')
+  assert.deepEqual((logs[0]!.metadata as { ignored: unknown }).ignored, { body: ['Pagination'], row: ['Surprise'], component: ['Extra'] })
+  await deps.db.activityLog.deleteMany({ where: { action: 'xero_tax_rate_unknown_fields' } })
 })
 
 // [mutation: the stamp written outside the transaction / before the list]

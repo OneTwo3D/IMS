@@ -366,3 +366,35 @@ test('more stored Xero rows than the cap is CAP_EXCEEDED for that section, never
   const read = await readImsSnapshot(xeroFake(), { sections: ['xeroTaxRates'], rowCap: 1 })
   assert.ok(read.ok && read.sections.xeroTaxRates!.ok === false && read.sections.xeroTaxRates!.reason === 'CAP_EXCEEDED')
 })
+
+// ---- the other places IMS names a Xero tax type -------------------------------------------------------------------------------
+
+function taxesFake(opts: { components?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>> } = {}) {
+  return fake((sql) => {
+    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', active: true, tax_type: 'OUTPUT2', country: 'GB', category: null }]
+    if (/FROM shopping_tax_rate_mappings/.test(sql)) return []
+    if (/FROM tax_rate_components/.test(sql)) return opts.components ?? []
+    if (/FROM settings/.test(sql)) return opts.settings ?? []
+    return []
+  })
+}
+const taxesOf = async (client: ReturnType<typeof taxesFake>) => { const read = await readImsSnapshot(client, { sections: ['taxes'] }); assert.ok(read.ok); return read.ok ? read.sections.taxes : undefined }
+
+// [mutation: the component or settings query dropped]
+test('the taxes section also reads every component accounting tax type and the two reverse-charge settings (trimmed; absent or blank is none)', async () => {
+  const client = taxesFake({ components: [{ id: 'c1', rate_id: 'r1', active: true, tax_type: 'COMP1' }, { id: 'c2', rate_id: 'r1', active: false, tax_type: 'COMP2' }], settings: [{ key: 'accounting_reverse_charge_sales_tax_type', value: ' ECOUTPUTSERVICES ' }] })
+  const section = await taxesOf(client)
+  assert.ok(section && section.ok)
+  if (!section || !section.ok) return
+  assert.deepEqual(section.value.componentTaxTypes, [{ id: 'c1', taxRateId: 'r1', active: true, accountingTaxType: 'COMP1' }, { id: 'c2', taxRateId: 'r1', active: false, accountingTaxType: 'COMP2' }])
+  assert.deepEqual(section.value.reverseCharge, { sales: 'ECOUTPUTSERVICES', purchase: '' })
+  assert.ok(client.sent.some((sql) => /FROM tax_rate_components WHERE accounting_tax_type IS NOT NULL ORDER BY id LIMIT/.test(sql)), 'every component that names a type is asked for')
+  assert.ok(client.sent.some((sql) => /FROM settings WHERE key IN \('accounting_reverse_charge_sales_tax_type', 'accounting_reverse_charge_purchase_tax_type'\)/.test(sql)))
+})
+
+test('a component of an unknown rate, a duplicate component and an unreadable setting make the taxes section unreadable (nothing guessed)', async () => {
+  const reason = async (c: ReturnType<typeof taxesFake>) => { const s = await taxesOf(c); return s && !s.ok ? s.reason : 'ok' }
+  assert.equal(await reason(taxesFake({ components: [{ id: 'c1', rate_id: 'ghost', active: true, tax_type: 'X' }] })), 'SOURCE_UNREADABLE')
+  assert.equal(await reason(taxesFake({ components: [{ id: 'c1', rate_id: 'r1', active: true, tax_type: 'X' }, { id: 'c1', rate_id: 'r1', active: true, tax_type: 'Y' }] })), 'DUPLICATE_KEY')
+  assert.equal(await reason(taxesFake({ settings: [{ key: 'accounting_reverse_charge_sales_tax_type', value: 5 }] })), 'SOURCE_UNREADABLE')
+})

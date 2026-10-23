@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
-import type { ImsRead, ImsReadOptions, ImsSectionValues, OrderRow, PopulationBoundaries, StorefrontStatusConfig, TaxMappingRow, TaxRateRow, XeroTaxRateStore } from '../../lib/reconciliation-pack/ims-readers.ts'
+import type { ImsRead, ImsReadOptions, ImsSectionValues, OrderRow, PopulationBoundaries, StorefrontStatusConfig, TaxMappingRow, TaxRateRow, TaxComponentTypeRow, XeroTaxRateStore } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { openStorefrontStatuses, runVendorItem, type VendorItemContext } from '../../lib/reconciliation-pack/vendor-items.ts'
 import { WOO_BUILT_IN_STATUS_MAP } from '../../lib/reconciliation-pack/constants.ts'
 import { readFileSync } from 'node:fs'
@@ -25,7 +25,7 @@ const imsOrder = (n: number, wooId: string | null, over: Partial<OrderRow> = {})
   links: wooId === null ? [] : [{ connector: 'woocommerce', externalOrderId: wooId }], ...over,
 })
 
-type ImsFixture = { orders?: OrderRow[]; boundaries?: PopulationBoundaries; config?: Omit<StorefrontStatusConfig, 'withdrawal'> & { withdrawal?: StorefrontStatusConfig['withdrawal'] }; rates?: TaxRateRow[]; mappings?: TaxMappingRow[]; xeroStore?: XeroTaxRateStore; fail?: 'read' | 'throws' | Partial<Record<keyof ImsSectionValues, 'CAP_EXCEEDED'>> }
+type ImsFixture = { orders?: OrderRow[]; boundaries?: PopulationBoundaries; config?: Omit<StorefrontStatusConfig, 'withdrawal'> & { withdrawal?: StorefrontStatusConfig['withdrawal'] }; rates?: TaxRateRow[]; mappings?: TaxMappingRow[]; xeroStore?: XeroTaxRateStore; components?: TaxComponentTypeRow[]; reverse?: { sales?: string; purchase?: string }; fail?: 'read' | 'throws' | Partial<Record<keyof ImsSectionValues, 'CAP_EXCEEDED'>> }
 function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; ims: NonNullable<VendorItemContext['ims']> } {
   const calls: ImsReadOptions[] = []
   return {
@@ -36,7 +36,7 @@ function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; ims: NonN
       if (fixture.fail === 'read') return { ok: false, reason: 'READ_INCOMPLETE' }
       const values: Record<string, unknown> = {
         boundaries: fixture.boundaries ?? BOUNDARIES, orders: fixture.orders ?? [], storefrontStatus: fixture.config ? { withdrawal: WITHDRAWAL, ...fixture.config } : CONFIG,
-        taxes: { rates: fixture.rates ?? [], mappings: fixture.mappings ?? [] },
+        taxes: { rates: fixture.rates ?? [], mappings: fixture.mappings ?? [], componentTaxTypes: fixture.components ?? [], reverseCharge: { sales: fixture.reverse?.sales ?? '', purchase: fixture.reverse?.purchase ?? '' } },
         xeroTaxRates: fixture.xeroStore ?? { state: 'unproven', cause: 'NO_HEADER' },
       }
       const sections: Record<string, unknown> = {}
@@ -242,7 +242,7 @@ test('WITHOUT THE OPT-IN nothing is touched: no IMS read, no vendor request, no 
 const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, active: true, accountingTaxType: null, countryCode: 'GB', reportingCategory: null, ...over })
 const mapping = (externalTaxRateId: string, taxRateId = 'r1', connector = 'woocommerce'): TaxMappingRow => ({ connector, externalTaxRateId, taxRateId })
 const wooTaxes = (...ids: number[]): StoreData => ({ taxes: ids.map((id) => ({ id })) })
-const xero = (...taxTypes: string[]): XeroTaxRateStore => ({ state: 'proven', tenantId: 'tenant-A', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: taxTypes.map((taxType) => ({ taxType, status: 'ACTIVE' })) })
+const xero = (...taxTypes: string[]): XeroTaxRateStore => ({ state: 'proven', tenantId: 'tenant-A', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: taxTypes.map((entry) => { const [taxType, status] = entry.split(':'); return { taxType: taxType!, status: status ?? 'ACTIVE' } }) })
 
 test('R13 with a clean WooCommerce leg is INCONCLUSIVE (VENDOR_LIST_UNPROVEN) while the Xero list is not proven complete: it can never pass on half of its claim', async () => {
   const c = context({ rates: [rate('r1')], mappings: [mapping('1'), mapping('2')] }, wooTaxes(1, 2))
@@ -293,41 +293,56 @@ test('R13 empty: no rates and no mappings is not a pass without proof, and the X
   assert.deepEqual([pass.outcome, pass.proof, pass.sources], ['pass', { kind: 'proven-empty', source: 'vendor-total-zero' }, [...getPackItem('R13').sources]])
 })
 
-test('R13 WITH a proven Xero list: every Xero tax type held by an active IMS rate, and the reverse, passes naming all three sources; any difference fails', async () => {
+// [mutation: the population left unset (unreferenced Xero types become findings) / a reference source dropped / the ACTIVE filter removed]
+test('R13 WITH a proven Xero list: only the types IMS USES are judged. Each must resolve to an ACTIVE Xero type; a Xero type nothing names is out of the population, never a finding', async () => {
   const rates = [rate('r1', { accountingTaxType: 'OUTPUT2' }), rate('r2', { accountingTaxType: 'OUTPUT2' }), rate('r3', { accountingTaxType: 'TAX001' }), rate('r4', { accountingTaxType: 'OLDRATE', active: false }), rate('r5')]
-  const run = async (types: string[], woo = wooTaxes(1), mappings = [mapping('1')]) => {
-    const c = context({ rates, mappings, xeroStore: xero(...types) }, woo)
+  const run = async (types: string[], extra: Partial<ImsFixture> = {}, woo = wooTaxes(1), mappings = [mapping('1')]) => {
+    const c = context({ rates, mappings, xeroStore: xero(...types), ...extra }, woo)
     return runVendorItem('R13', c.ctx)
   }
   const pass = await run(['OUTPUT2', 'TAX001'])
   assert.deepEqual([pass.outcome, pass.sources, keys(pass, 'bothEqual').sort()], ['pass', [...getPackItem('R13').sources], ['woo-tax-rate|1', 'xero-tax-type|OUTPUT2', 'xero-tax-type|TAX001']])
-  const unmappedXero = await run(['OUTPUT2', 'TAX001', 'EXEMPTOUTPUT'])
-  assert.deepEqual([unmappedXero.outcome, keys(unmappedXero, 'onlyVendor')], ['fail', ['xero-tax-type|EXEMPTOUTPUT']])
-  const missingAtXero = await run(['OUTPUT2'])
-  assert.deepEqual([missingAtXero.outcome, keys(missingAtXero, 'onlyIms')], ['fail', ['xero-tax-type|TAX001']])
-  // IDENTITY SWAP on the Xero leg: same count, one type swapped.
+  // Xero types IMS does not use stay visible and are not findings (an inactive rate's type is not a reference either).
+  const extra = await run(['OUTPUT2', 'TAX001', 'EXEMPTOUTPUT', 'OLDRATE'])
+  assert.deepEqual([extra.outcome, extra.reasons, keys(extra, 'outOfPopulation').sort(), keys(extra, 'onlyVendor')], ['pass', [], ['xero-tax-type|EXEMPTOUTPUT', 'xero-tax-type|OLDRATE'], []])
+  // A type IMS uses that Xero lacks, or holds but not as ACTIVE, is a finding that names the code.
+  const missing = await run(['OUTPUT2'])
+  assert.deepEqual([missing.outcome, missing.reasons, keys(missing, 'onlyIms')], ['fail', ['DIFFERENCES'], ['xero-tax-type|TAX001']])
+  for (const status of ['DELETED', 'ARCHIVED', 'PENDING']) {
+    const inactive = await run(['OUTPUT2', `TAX001:${status}`])
+    assert.deepEqual([inactive.outcome, keys(inactive, 'onlyIms'), keys(inactive, 'bothEqual').includes('xero-tax-type|TAX001')], ['fail', ['xero-tax-type|TAX001'], false], status)
+  }
+  // IDENTITY SWAP: the reference points at another type. Same count on both sides; the missing one fails, the other is out of population.
   const swap = await run(['OUTPUT2', 'ZERORATED'])
-  assert.deepEqual([swap.outcome, keys(swap, 'onlyIms'), keys(swap, 'onlyVendor')], ['fail', ['xero-tax-type|TAX001'], ['xero-tax-type|ZERORATED']])
-  // The inactive rate's type is not held: Xero listing it is an unmapped Xero rate.
-  assert.deepEqual(keys(await run(['OUTPUT2', 'TAX001', 'OLDRATE']), 'onlyVendor'), ['xero-tax-type|OLDRATE'])
-  // A type that is not a plain code, or a repeated one, is never matched on a guess.
+  assert.deepEqual([swap.outcome, keys(swap, 'onlyIms'), keys(swap, 'outOfPopulation'), keys(swap, 'onlyVendor')], ['fail', ['xero-tax-type|TAX001'], ['xero-tax-type|ZERORATED'], []])
+  // ...and to an existing-but-non-active type.
+  const swapInactive = await run(['OUTPUT2', 'ZERORATED', 'TAX001:ARCHIVED'])
+  assert.deepEqual([swapInactive.outcome, keys(swapInactive, 'onlyIms')], ['fail', ['xero-tax-type|TAX001']])
+  // The other places IMS names a Xero type: an active component of an active rate, and the two reverse-charge settings.
+  const comp = (id: string, taxRateId: string, active: boolean, accountingTaxType: string): TaxComponentTypeRow => ({ id, taxRateId, active, accountingTaxType })
+  assert.deepEqual(keys(await run(['OUTPUT2', 'TAX001'], { components: [comp('c1', 'r1', true, 'COMP1')] }), 'onlyIms'), ['xero-tax-type|COMP1'], 'an active component')
+  assert.equal((await run(['OUTPUT2', 'TAX001', 'COMP1'], { components: [comp('c1', 'r1', true, 'COMP1')] })).outcome, 'pass')
+  assert.equal((await run(['OUTPUT2', 'TAX001'], { components: [comp('c1', 'r1', false, 'COMP1'), comp('c2', 'r4', true, 'COMP2')] })).outcome, 'pass', 'an inactive component, or one of an inactive rate, is not a reference')
+  assert.deepEqual(keys(await run(['OUTPUT2', 'TAX001'], { reverse: { sales: 'ECOUTPUTSERVICES' } }), 'onlyIms'), ['xero-tax-type|ECOUTPUTSERVICES'], 'the reverse-charge sales type')
+  assert.deepEqual(keys(await run(['OUTPUT2', 'TAX001'], { reverse: { purchase: 'REVERSECHARGES' } }), 'onlyIms'), ['xero-tax-type|REVERSECHARGES'], 'the reverse-charge purchase type')
+  assert.equal((await run(['OUTPUT2', 'TAX001', 'ECOUTPUTSERVICES', 'REVERSECHARGES'], { reverse: { sales: 'ECOUTPUTSERVICES', purchase: 'REVERSECHARGES' } })).outcome, 'pass')
+  // A type that is not a plain code, in IMS or in the list, or a repeated Xero type, is never matched on a guess.
   assert.deepEqual((await run(['OUTPUT2', 'bad type'])).reasons, ['BAD_KEY'])
+  assert.deepEqual((await run(['OUTPUT2', 'TAX001'], { reverse: { sales: 'not a code' } })).reasons, ['BAD_KEY'])
   assert.deepEqual((await run(['OUTPUT2', 'OUTPUT2'])).reasons, ['DUPLICATE_KEY'])
   // A WooCommerce finding still fails with the Xero leg proven.
-  assert.equal((await run(['OUTPUT2', 'TAX001'], wooTaxes(1, 2))).outcome, 'fail')
+  assert.equal((await run(['OUTPUT2', 'TAX001'], {}, wooTaxes(1, 2))).outcome, 'fail')
+  // A proven list is still required: an unproven one never passes however clean the references are.
+  assert.deepEqual((await runVendorItem('R13', context({ rates, mappings: [mapping('1')], xeroStore: { state: 'unproven', cause: 'DIGEST_MISMATCH' } }, wooTaxes(1)).ctx)).reasons, ['VENDOR_LIST_UNPROVEN'])
 })
 
-// [mutation: the ACTIVE filter removed / the Xero section read in a second IMS read]
-test('R13 reads the rates and the stored Xero list in ONE IMS read, and only ACTIVE Xero tax types are compared (a DELETED or ARCHIVED one is stored, not a finding)', async () => {
-  const rates = [rate('r1', { accountingTaxType: 'OUTPUT2' })]
-  const c = context({ rates, mappings: [mapping('1')], xeroStore: { state: 'proven', tenantId: 't', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: [{ taxType: 'OUTPUT2', status: 'ACTIVE' }, { taxType: 'OLD1', status: 'ARCHIVED' }, { taxType: 'OLD2', status: 'DELETED' }, { taxType: 'NEW1', status: 'PENDING' }] } }, wooTaxes(1))
+// [mutation: the Xero section read in a second IMS read]
+test('R13 reads the rates, their other Xero references and the stored Xero list in ONE IMS read', async () => {
+  const c = context({ rates: [rate('r1', { accountingTaxType: 'OUTPUT2' })], mappings: [mapping('1')], xeroStore: xero('OUTPUT2', 'OLD1:ARCHIVED', 'NEW1:PENDING') }, wooTaxes(1))
   const item = await runVendorItem('R13', c.ctx)
   assert.deepEqual([item.outcome, item.reasons], ['pass', []])
   assert.equal(c.ims.calls.length, 1, 'one snapshot for both')
   assert.deepEqual([...c.ims.calls[0]!.sections].sort(), ['taxes', 'xeroTaxRates'])
-  // An ACTIVE Xero type no IMS rate holds is still a finding.
-  const d = context({ rates, mappings: [mapping('1')], xeroStore: { state: 'proven', tenantId: 't', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: [{ taxType: 'OUTPUT2', status: 'ACTIVE' }, { taxType: 'NEW1', status: 'ACTIVE' }] } }, wooTaxes(1))
-  assert.deepEqual(keys(await runVendorItem('R13', d.ctx), 'onlyVendor'), ['xero-tax-type|NEW1'])
 })
 
 test('the vendor items are the only ones this module runs, and an unexpected failure inside one is INTERNAL_ERROR with no text', async () => {

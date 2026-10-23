@@ -3,9 +3,12 @@
  * copy is one complete read. Pure: no database, no network, no clock. Xero is the tax-rate master (the owner ruling that put
  * `xero.tax-rate` under Xero), so a stored copy of its list is only worth having if it is exactly what Xero said.
  *
- *   - EVERY row is validated or the WHOLE body is refused. An unknown field, a field of the wrong type, a value that cannot be
- *     held exactly, a duplicate TaxType, an empty list or a body that is not the list at all makes the caller keep the previous
- *     list. Nothing is dropped, defaulted or coerced: a refused read is louder than a quietly shorter list.
+ *   - EVERY row is validated or the WHOLE body is refused. A known field of the wrong type, a missing required field, a value that
+ *     cannot be held exactly, a duplicate TaxType, an empty list or a body that is not the list at all makes the caller keep the
+ *     previous list. Nothing is defaulted or coerced: a refused read is louder than a quietly shorter list.
+ *   - A key this module does not know (at body, row or component level) is IGNORED: not stored, not in the digest, and reported by
+ *     NAME only in `ignored` so the caller can log it once per run. A case or punctuation variant of a KNOWN key ('taxtype',
+ *     'Tax_Type') is not unknown, it is an alias that could shadow the real field, so it refuses the whole body.
  *   - The digest binds the rows to the organisation and is computed from the normalised rows in a fixed order and a fixed
  *     spelling (decimals as six-place text), so the writer and the reader of the stored rows reach the same value from the same
  *     data and from nothing else.
@@ -34,12 +37,24 @@ export type NormalisedXeroTaxRate = {
   canApply: CanApplyFlags
 }
 
-export type ParsedTaxRateList = { ok: true; rows: NormalisedXeroTaxRate[] } | { ok: false; reason: string }
+/** Names (never values) of the keys that were ignored, by level, sorted, de-duplicated, bounded. */
+export type IgnoredXeroKeys = { body: string[]; row: string[]; component: string[] }
+export type ParsedTaxRateList = { ok: true; rows: NormalisedXeroTaxRate[]; ignored: IgnoredXeroKeys } | { ok: false; reason: string }
 
 const ROW_KEYS = new Set(['Name', 'TaxType', 'Status', 'ReportTaxType', 'TaxComponents', 'DisplayTaxRate', 'EffectiveRate', 'CanApplyToAssets', 'CanApplyToEquity', 'CanApplyToExpenses', 'CanApplyToLiabilities', 'CanApplyToRevenue'])
 const COMPONENT_KEYS = new Set(['Name', 'Rate', 'IsCompound', 'IsNonRecoverable'])
 const BODY_KEYS = new Set(['Id', 'Status', 'ProviderName', 'DateTimeUTC', 'TaxRates'])
 const MAX_RATE = 1000
+const MAX_IGNORED_NAMES = 50
+
+const squash = (key: string) => key.toLowerCase().replace(/[^a-z0-9]/g, '')
+const KNOWN_SQUASHED = {
+  body: new Map([...BODY_KEYS].map((key) => [squash(key), key] as const)),
+  row: new Map([...ROW_KEYS].map((key) => [squash(key), key] as const)),
+  component: new Map([...COMPONENT_KEYS].map((key) => [squash(key), key] as const)),
+}
+/** A printable, bounded rendering of a key NAME for a log line. */
+const safeName = (key: string) => key.replace(/[^\x20-\x7e]/g, '?').slice(0, 40)
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype
 const cleanText = (value: unknown, max = 255): value is string => typeof value === 'string' && value.trim().length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value)
@@ -65,10 +80,21 @@ function optionalDecimal(row: Record<string, unknown>, key: string, where: strin
   return text === null ? refuse(`${where}: ${key} is not a rate held exactly`) : text
 }
 
-function parseRow(raw: unknown, index: number): NormalisedXeroTaxRate {
+type Collector = { body: Set<string>; row: Set<string>; component: Set<string> }
+
+/** Ignore an unknown key (recording its name); refuse a variant of a known one. */
+function screenKeys(object: Record<string, unknown>, known: ReadonlySet<string>, level: keyof Collector, collector: Collector, where: string): void {
+  for (const key of Object.keys(object)) {
+    if (known.has(key)) continue
+    if (KNOWN_SQUASHED[level].has(squash(key))) refuse(`${where}: ${safeName(key)} is a variant of a known field`)
+    collector[level].add(safeName(key))
+  }
+}
+
+function parseRow(raw: unknown, index: number, collector: Collector): NormalisedXeroTaxRate {
   const where = `row ${index}`
   if (!isPlainObject(raw)) return refuse(`${where}: not an object`)
-  for (const key of Object.keys(raw)) if (!ROW_KEYS.has(key)) return refuse(`${where}: unknown field ${key.slice(0, 40)}`)
+  screenKeys(raw, ROW_KEYS, 'row', collector, where)
   if (typeof raw.TaxType !== 'string' || !XERO_TAX_TYPE_RE.test(raw.TaxType)) return refuse(`${where}: TaxType is not a tax type`)
   if (!cleanText(raw.Name)) return refuse(`${where}: Name is not a name`)
   if (typeof raw.Status !== 'string' || !(XERO_TAX_RATE_STATUSES as readonly string[]).includes(raw.Status)) return refuse(`${where}: Status is not a known status`)
@@ -81,7 +107,7 @@ function parseRow(raw: unknown, index: number): NormalisedXeroTaxRate {
   const components = raw.TaxComponents.map((component, c): StoredTaxComponent => {
     const at = `${where} component ${c}`
     if (!isPlainObject(component)) return refuse(`${at}: not an object`)
-    for (const key of Object.keys(component)) if (!COMPONENT_KEYS.has(key)) return refuse(`${at}: unknown field ${key.slice(0, 40)}`)
+    screenKeys(component, COMPONENT_KEYS, 'component', collector, at)
     if (!cleanText(component.Name)) return refuse(`${at}: Name is not a name`)
     const rate = sixPlaceDecimal(component.Rate)
     if (rate === null) return refuse(`${at}: Rate is not a rate held exactly`)
@@ -112,18 +138,20 @@ function parseRow(raw: unknown, index: number): NormalisedXeroTaxRate {
 export function parseXeroTaxRateList(body: unknown): ParsedTaxRateList {
   try {
     if (!isPlainObject(body)) return { ok: false, reason: 'the body is not an object' }
-    for (const key of Object.keys(body)) if (!BODY_KEYS.has(key)) return { ok: false, reason: `the body has an unknown field ${key.slice(0, 40)}` }
+    const collector: Collector = { body: new Set(), row: new Set(), component: new Set() }
+    screenKeys(body, BODY_KEYS, 'body', collector, 'the body')
     if ('Status' in body && body.Status !== 'OK') return { ok: false, reason: 'the body status is not OK' }
     if (!Array.isArray(body.TaxRates)) return { ok: false, reason: 'the body has no TaxRates list' }
     if (body.TaxRates.length === 0) return { ok: false, reason: 'the TaxRates list is empty' }
     if (body.TaxRates.length > XERO_TAX_RATE_LIST_MAX_ROWS) return { ok: false, reason: 'the TaxRates list is longer than any real list' }
-    const rows = body.TaxRates.map((raw, index) => parseRow(raw, index))
+    const rows = body.TaxRates.map((raw, index) => parseRow(raw, index, collector))
     const seen = new Set<string>()
     for (const row of rows) {
       if (seen.has(row.taxType)) return { ok: false, reason: 'the TaxRates list names a TaxType twice' }
       seen.add(row.taxType)
     }
-    return { ok: true, rows }
+    const names = (set: Set<string>) => [...set].sort().slice(0, MAX_IGNORED_NAMES)
+    return { ok: true, rows, ignored: { body: names(collector.body), row: names(collector.row), component: names(collector.component) } }
   } catch (error) {
     if (error instanceof Refused) return { ok: false, reason: error.message }
     return { ok: false, reason: 'the body could not be read' }

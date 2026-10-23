@@ -158,6 +158,24 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
     throw new XeroTaxRateListRefusedError(parsed.reason)
   }
   const fetchedRows = parsed.rows
+  // Keys this build does not know are dropped (not stored, not digested). Say so once per run, by NAME only, never a value.
+  const ignoredCount = parsed.ignored.body.length + parsed.ignored.row.length + parsed.ignored.component.length
+  if (ignoredCount > 0) {
+    console.warn(`[xero] tax-rate list: ignored unknown keys ${JSON.stringify(parsed.ignored)}`)
+    try {
+      await logActivity({
+        entityType: 'SYSTEM',
+        entityId: 'xero-tax-rate-list',
+        action: 'xero_tax_rate_unknown_fields',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `Xero returned tax-rate fields this version of IMS does not know and ignored (names only): ${[...parsed.ignored.body, ...parsed.ignored.row, ...parsed.ignored.component].join(', ')}`,
+        metadata: { ignored: parsed.ignored },
+      })
+    } catch (error) {
+      console.warn(`[xero] could not record the ignored tax-rate keys: ${String(error)}`)
+    }
+  }
 
   const result = await sweepTaxRateDrift({
     async loadImsProfiles() {
