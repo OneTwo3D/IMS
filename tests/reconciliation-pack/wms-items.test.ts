@@ -325,3 +325,30 @@ test('EMPTY ESTATE: an unconfirmed binding with no products, no stock rows and a
   const zeros = await runSettled(setup(estate, { stock: { '5': PROBE_WH5.map(toStockRow).filter((r) => r.bundle), '6': PROBE_WH6.map(toStockRow).filter((r) => r.bundle) } }).ctx)
   assert.deepEqual([zeros.outcome, zeros.reasons], ['inconclusive', ['EMPTY_UNPROVEN']], 'only set-aside rows were read: nothing was compared and nothing proves empty')
 })
+
+// [mutation: the census-wide stock-row requirement removed]
+test('EVERY NON-BUNDLE CENSUS PRODUCT NEEDS A STOCK ROW IN EVERY BOUND WAREHOUSE, IMS has it or not: a census SKU absent from IMS and from one warehouse\'s stock list is READ_INCOMPLETE; a bundle is exempt', async () => {
+  const stranger = { sku: 'CENSUS-ONLY-1', productId: '777777', onHand: 0, bundle: false }
+  const censusOf = (wms: FakeWmsData) => [...new Map(Object.values(wms.stock).flat().map((r) => [r.productId, { id: r.productId, sku: r.sku }] as const)).values()]
+  // In warehouse 5 only: otherwise everything is equal, and IMS knows nothing of it.
+  const missing = equalEstate()
+  missing.wms.stock['5'] = [...missing.wms.stock['5']!, stranger]
+  missing.wms.census = censusOf(missing.wms)
+  const item = await runSettled(setup(missing.estate, missing.wms).ctx)
+  assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['READ_INCOMPLETE']])
+  // Present (as zero) in both: fine, it is out of the population.
+  const both = equalEstate()
+  both.wms.stock['5'] = [...both.wms.stock['5']!, stranger]
+  both.wms.stock['6'] = [...both.wms.stock['6']!, { ...stranger }]
+  both.wms.census = censusOf(both.wms)
+  assert.equal((await runSettled(setup(both.estate, both.wms).ctx)).outcome, 'pass')
+  // A bundle listed in one warehouse only is derived stock: exempt from the requirement.
+  const bundle = equalEstate()
+  bundle.wms.stock['5'] = [...bundle.wms.stock['5']!, { ...stranger, bundle: true }]
+  bundle.wms.census = censusOf(bundle.wms)
+  assert.equal((await runSettled(setup(bundle.estate, bundle.wms).ctx)).outcome, 'pass')
+  // A census product with no stock row anywhere is just as unproven.
+  const nowhere = equalEstate()
+  nowhere.wms.census = [...censusOf(nowhere.wms), { id: '888888', sku: 'NOWHERE-1' }]
+  assert.deepEqual((await runSettled(setup(nowhere.estate, nowhere.wms).ctx)).reasons, ['READ_INCOMPLETE'])
+})

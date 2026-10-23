@@ -30,8 +30,9 @@
  * IDENTITY. A linked product's recorded vendor product id must be the id the stock row carries for that SKU and the id the census holds for
  * it; an id under another SKU, or a SKU under another id, is IDENTITY_CONFLICT for the whole item (a swap is never read as two quantities).
  *
- * ABSENCE. A product that IMS links and the vendor does not list at all (no stock row, not in the census) is onlyIms. A product the census
- * lists but whose warehouse stock list has no row for it cannot be told from a zero: READ_INCOMPLETE for the whole item (never a zero).
+ * ABSENCE. A product that IMS links and the vendor does not list at all (no stock row, not in the census) is onlyIms. Any non-bundle product the
+ * census lists (IMS has it or not) but whose in-population warehouse stock list has no row for it cannot be told from a zero: READ_INCOMPLETE for the
+ * whole item (never a zero). OWNER QUESTION: if StockLevels legitimately omits never-stocked products this makes R1 permanently inconclusive.
  *
  * R1 SETTLES (owner decision D7), like R9: stock moves between the IMS snapshot and the vendor read, so a difference first seen is
  * UNSETTLED (inconclusive UNSETTLED_PENDING) and fails only when it is still there after two LATER successful runs of the stock sync
@@ -146,11 +147,16 @@ export function buildSides(inputs: Inputs, classified: Classified, stock: Readon
   const censusBySku = new Map(census.map((row) => [row.sku, row.id] as const))
   const quantityOf = new Map(inputs.tracked.map((pair) => [`${pair.warehouseId}\u0001${pair.productId}`, pair.quantity] as const))
 
+  const bundleSkus = new Set([...stock.values()].flat().filter((row) => row.bundle).map((row) => row.sku))
   for (const binding of classified.inPopulation) {
     const rows = stock.get(binding.externalWarehouseId)
     if (rows === undefined) throw new Refuse('READ_INCOMPLETE')
     const rowBySku = new Map(rows.map((row) => [row.sku, row] as const))
     const matched = new Set<string>()
+    // EVERY non-bundle census product must have a stock row in EVERY in-population warehouse, whether or not IMS has it: a stock list that
+    // omits a product the vendor lists cannot be told from a zero (or from a missing positive figure). No independent field proves a
+    // warehouse quantity of zero, so it is READ_INCOMPLETE, never a zero. A bundle (flagged so in any warehouse's list) is exempt: derived stock.
+    for (const entry of census) if (!rowBySku.has(entry.sku) && !bundleSkus.has(entry.sku)) throw new Refuse('READ_INCOMPLETE')
     const add = (side: SideRow[], sku: string, value: string, inPopulation: boolean): void => {
       const key = keyOf(binding.warehouseCode, sku)
       if (!isKey(key)) throw new Refuse('BAD_KEY')
