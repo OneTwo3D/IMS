@@ -237,8 +237,22 @@ test('EVERY ALIGNMENT CONFIRMED: R1 passes on the named proof alignment-confirme
   assert.deepEqual([noneItem.outcome, noneItem.reasons], ['inconclusive', ['NO_POPULATION_RECORD']])
   const off = equalEstate([binding({ stockSyncMode: 'DISABLED' }), binding6({ active: false })])
   assert.deepEqual((await runSettled(setup(off.estate, off.wms).ctx)).reasons, ['NO_POPULATION_RECORD'])
-  const mixed = equalEstate([binding({ stockSyncMode: 'DISABLED' }), binding6({ stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmed: true })])
-  assert.equal((await runSettled(setup(mixed.estate, mixed.wms).ctx)).outcome, 'pass', 'one confirmed and the rest not active: retired')
+  // [mutation: the proof granted for "some confirmed" instead of "every binding confirmed"]
+  const confirmed6 = binding6({ stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmed: true })
+  for (const [label, other] of [['DISABLED', binding({ stockSyncMode: 'DISABLED' })], ['inactive', binding({ active: false })], ['DISABLED with a stamp', binding({ stockSyncMode: 'DISABLED', alignmentConfirmed: true })]] as const) {
+    const mixed = equalEstate([other, confirmed6])
+    const { ctx, port } = setup(mixed.estate, mixed.wms)
+    const item = await runSettled(ctx)
+    assert.deepEqual([item.outcome, item.reasons, item.proof ?? null], ['inconclusive', ['BINDING_UNCONFIRMED_NOT_COMPARED'], null], `one confirmed beside one ${label} unconfirmed`)
+    assert.equal(port.calls.length, 0)
+  }
+  // Every binding confirmed (an inactive confirmed one included): the proof.
+  const allConfirmed = equalEstate([binding({ active: false, stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmed: true }), confirmed6])
+  const retired = await runSettled(setup(allConfirmed.estate, allConfirmed.wms).ctx)
+  assert.deepEqual([retired.outcome, retired.proof], ['pass', { kind: 'proven-empty', source: 'alignment-confirmed' }])
+  // An unconfirmed binding that IS compared is not "not compared": the in-population path judges it and the confirmed one is just out.
+  const compared = equalEstate([binding(), confirmed6])
+  assert.equal((await runSettled(setup(compared.estate, compared.wms).ctx)).outcome, 'pass')
 })
 
 // [mutation: the second read of the bindings removed]

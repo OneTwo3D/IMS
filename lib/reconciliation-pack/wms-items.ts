@@ -38,9 +38,9 @@
  * UNSETTLED (inconclusive UNSETTLED_PENDING) and fails only when it is still there after two LATER successful runs of the stock sync
  * stream (compare.ts advanceDifference, settling.ts).
  *
- * EMPTY. Nothing compared passes only on a named proof: `alignment-confirmed` (at least one binding is confirmed and none is unconfirmed:
+ * EMPTY. Nothing compared passes only on a named proof: `alignment-confirmed` (EVERY binding of the connector, inactive and DISABLED ones included, is a confirmed alignment, and at least one exists:
  * the vendor is not asked, and the pass names only the IMS source) or `vendor-total-zero` (the vendor's stock lists and census are empty
- * in both sweeps and both scans). No binding at all, or only disabled or inactive ones, is NO_POPULATION_RECORD.
+ * in both sweeps and both scans). No binding at all, or only disabled or inactive ones, is NO_POPULATION_RECORD; a confirmed binding beside an unconfirmed one that nothing compares (inactive or DISABLED) is BINDING_UNCONFIRMED_NOT_COMPARED, never a pass.
  */
 
 import { Prisma } from '@/app/generated/prisma/client'
@@ -89,6 +89,11 @@ export function classifyWmsBindings(bindings: readonly WmsBindingRow[]): Classif
     else return null
   }
   return out
+}
+
+/** A binding whose alignment is confirmed whatever its activity: ALIGN_TO_WMS with a confirmation stamp. DISABLED never is. */
+export function isConfirmedAlignment(binding: WmsBindingRow): boolean {
+  return binding.stockSyncMode === 'ALIGN_TO_WMS' && binding.alignmentConfirmed === true
 }
 
 /** What the population depends on, as one text: compared before and after the vendor reads. */
@@ -237,6 +242,9 @@ async function runR1(context: WmsItemContext): Promise<ItemInput> {
   // The claim is retired where every alignment is confirmed: nothing is asked of the vendor.
   if (classified.inPopulation.length === 0) {
     if (classified.confirmed.length === 0) return inconclusive([IMS], 'NO_POPULATION_RECORD')
+    // THE PROOF IS FOR "ALL", NOT "SOME": every binding of the connector (inactive and DISABLED ones included) must be a confirmed alignment.
+    // One that is not (an unconfirmed binding nothing compares, because it is inactive or DISABLED) leaves part of the claim unexamined.
+    if (!classified.notActive.every(isConfirmedAlignment)) return inconclusive([IMS], 'BINDING_UNCONFIRMED_NOT_COMPARED')
     const after = await readIms({ sections: ['wmsBindings'] })
     const again = after.ok ? after.sections.wmsBindings : undefined
     if (again === undefined || !again.ok) return inconclusive([IMS], again === undefined ? 'SOURCE_UNREADABLE' : again.reason)
