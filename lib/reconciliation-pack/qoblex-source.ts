@@ -15,6 +15,9 @@
  *   - THE MANIFEST IS CLOSED: an unknown key anywhere, a missing key, a repeated file or location, a name that is not a plain token, or a
  *     version other than 1 is unreadable. It declares `exportedAt` (an instant, UTC), `asOf` (the cycle date the export shows), the base
  *     currency (GBP only) and every LOCATION the export may contain with its IMS warehouse code, its company and whether it is a 3PL's.
+ *   - EVERY DATA ROW IS ACCOUNTED FOR. The column map is operator input and cannot decide what is compared: a row it skips (rowsSkipped) or
+ *     merges away, a rejected row, or a constant it gives an identity or value column makes the part unreadable. The native Qoblex
+ *     exports skip nothing. Only blank lines (no cell) are uncounted; zero-quantity rows are kept here and dropped by R2/R5 on both sides.
  *   - THE EXPORT IS PARSED BY THE FIRST-LOAD INGEST (lib/first-load/ingest.ts), not by a parser of its own: a malformed header, a rejected
  *     row, an unknown or repeated location, a SKU that is not a valid SKU, a non-decimal quantity (a negative one is data: an oversold position is compared as it is), a repeated (SKU, location)
  *     that is not told apart by distinct lot references, an empty file: each makes that part unreadable.
@@ -185,10 +188,19 @@ function ingest(dataset: 'stock-lots' | 'products', spec: PartSpec, files: Files
     if (map.source !== 'qoblex') return bad()
     mapping = map.datasets[dataset] ?? null
     if (mapping === null) return bad()
+    // The column map is operator input, so it cannot decide what the pack compares (a row kind it skips is refused below, by the rowsSkipped count): it may not give the
+    // identity or value columns a constant (every row would then carry one made-up value). Everything else it does (renaming headers,
+    // closed value maps, the wide layout) leaves every row accounted for below.
+    const fixed = dataset === 'stock-lots' ? ['sku', 'warehouseCode', 'qty', 'unitCost'] : ['sku', 'type']
+    if (fixed.some((column) => Object.prototype.hasOwnProperty.call(mapping!.constants, column))) return bad()
   }
   const out = ingestDataset(dataset, bytes, spec.file, mapping)
   // Nothing rejected, nothing set aside unaccounted, and not empty: a file that yields no rows says nothing about the stock.
+  // EVERY data row is accounted for: none rejected, none skipped by any mechanism (rowsSkipped is zero whatever the map says), none merged away
+  // (superseded is only produced by merging several files, which this source never does), and the records read are exactly the rows kept.
+  // Blank lines are the one thing not counted: a blank line carries no cell, so no stock or product is hidden by it.
   if (out.rejected.length > 0 || out.rows.length === 0 || out.recordsRead !== out.rows.length) return bad()
+  if (Object.values(out.rowsSkipped).some((n) => n > 0) || out.superseded.length > 0) return bad()
   return out
 }
 

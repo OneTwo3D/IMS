@@ -10,7 +10,7 @@ import type { ImsQueryClient } from '../../lib/reconciliation-pack/ims-readers.t
 import { readPackChain } from '../../lib/reconciliation-pack/trend.ts'
 import { D, fakeBasisPort, goodState, healthyLiveness } from './basis-fixtures.ts'
 import { NOW, allFiles, cleanup, realEvidence, scratchDir } from './helpers.ts'
-import { ASOF, stockCsv, writeExport } from './qoblex-fixtures.ts'
+import { ASOF, sha256, stockCsv, writeExport } from './qoblex-fixtures.ts'
 import { fakeStore } from './woo-fixtures.ts'
 
 /**
@@ -202,4 +202,23 @@ test('the export is judged against the run\'s OWN cycle date: an export for the 
   const r = rig()
   await run(r, ['--phase', 'P1', '--as-of', '2026-10-18', '--items', 'R2', '--report-dir', scratchDir(bases), '--qoblex-export', writeExport(bases)])
   assert.equal(line(r, 'R2'), 'R2 inconclusive QOBLEX_EXPORT_STALE')
+})
+
+// [mutation: the mapped-skip refusal removed from the source]
+test('a column map that skips a row kind cannot make R2, R5 or R14 pass: the part is unreadable', async () => {
+  const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
+  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
+  const m = JSON.parse(readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8'))
+  m.datasets['stock-lots'].rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] }
+  m.datasets.products.rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] }
+  const map = JSON.stringify(m)
+  const exportDir = writeExport(bases, {
+    stock: clean, products: null, locations: ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: false })),
+    extra: { 'map.json': map, 'stock.csv': clean },
+    patch: (man) => { const ref = { file: 'stock.csv', sha256: sha256(clean), columnMap: { file: 'map.json', sha256: sha256(map) } }; man.stock = ref; man.products = ref },
+  })
+  const r = rig()
+  r.deps.wmsSkus = async () => ({ ok: true, skus: [] })
+  await run(r, args(scratchDir(bases), '--qoblex-export', exportDir, '--vendor-reads-only'))
+  for (const id of ['R2', 'R5', 'R14']) assert.equal(line(r, id), `${id} inconclusive SOURCE_UNREADABLE`, id)
 })

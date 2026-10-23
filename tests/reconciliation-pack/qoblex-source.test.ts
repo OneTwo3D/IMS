@@ -204,6 +204,40 @@ test('a column map is read once, parsed by the first-load ingest, and must be a 
   assert.equal(partReason(read(bad), 'stock'), 'SOURCE_UNREADABLE')
 })
 
+// [mutation: the rowSelect.skip refusal / the rowsSkipped check / the constants refusal removed]
+test('a column map cannot hide rows: a mapped skip, or a constant for an identity or value column, makes the part unreadable (the native export itself skips nothing)', () => {
+  const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
+  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
+  const original = JSON.parse(readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')) as { datasets: Record<string, Record<string, unknown>> }
+  const locations = ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: code === 'RXT2' }))
+  const exportWith = (edit: (m: typeof original) => void) => {
+    const m = JSON.parse(JSON.stringify(original)) as typeof original
+    edit(m)
+    const map = JSON.stringify(m)
+    return read(writeExport(bases, { stock: clean, products: null, locations, extra: { 'map.json': map, 'stock.csv': clean }, patch: (man) => {
+      man.stock = { file: 'stock.csv', sha256: sha256(clean), columnMap: { file: 'map.json', sha256: sha256(map) } }
+      man.products = { file: 'stock.csv', sha256: sha256(clean), columnMap: { file: 'map.json', sha256: sha256(map) } }
+    } }))
+  }
+  // the unedited native map reads, both datasets, and skipped nothing
+  const plain = exportWith(() => undefined)
+  assert.equal(partReason(plain, 'stock'), 'ok')
+  assert.equal(partReason(plain, 'products'), 'ok')
+  // a skip that hides a kind of row the file holds
+  const skipsStock = exportWith((m) => { m.datasets['stock-lots']!.rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] } })
+  assert.equal(partReason(skipsStock, 'stock'), 'SOURCE_UNREADABLE')
+  assert.equal(partReason(skipsStock, 'products'), 'ok', 'the other dataset is judged on its own map entry')
+  const skipsProducts = exportWith((m) => { m.datasets.products!.rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] } })
+  assert.equal(partReason(skipsProducts, 'products'), 'SOURCE_UNREADABLE')
+  // a keep-only selection that leaves a kind unlisted is refused by the ingest itself (never guessed), not silently dropped
+  assert.equal(partReason(exportWith((m) => { m.datasets['stock-lots']!.rowSelect = { column: 'Product Type', keep: ['simple'] } }), 'stock'), 'SOURCE_UNREADABLE')
+  // constants for the identity and value columns would give every row one made-up value
+  for (const column of ['sku', 'warehouseCode', 'qty', 'unitCost']) {
+    const fixed = exportWith((m) => { const e = m.datasets['stock-lots']!; (e.columns as Record<string, string>)[column] && delete (e.columns as Record<string, string>)[column]; (e.constants as Record<string, string>)[column] = '1' })
+    assert.equal(partReason(fixed, 'stock'), 'SOURCE_UNREADABLE', column)
+  }
+})
+
 // [mutation: the shared promise removed so each item reads the export again]
 test('the source reads the export ONCE for the run and hands every item the same result', async () => {
   const dir = writeExport(bases)
