@@ -406,9 +406,19 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
   const previousMode = process.env.E2E_TEST_MODE
   const previousKeys = { SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, ENCRYPTION_KEY: process.env.ENCRYPTION_KEY }
   let stockStamp: string | null = null
+  let heldRows: { connections: string[]; bindings: string[]; links: string[] } | null = null
   try {
-    const existing = await sql(`SELECT (SELECT count(*) FROM wms_connections WHERE connector = 'mintsoft')::int AS connections, (SELECT count(*) FROM external_wms_bindings WHERE connector = 'mintsoft')::int AS bindings`)
-    assert.deepEqual([existing.rows[0].connections, existing.rows[0].bindings], [0, 0], 'precondition: the scratch database holds no Mintsoft connection or binding')
+    // R1 reads EVERY Mintsoft binding and link, and the tier shares one database across files, so rows other files left behind would be part
+    // of this estate. Hold them aside for the duration (their connector name is changed, nothing is deleted, so no cascade can fire) and put
+    // them back exactly in the finally block. This is setup and teardown: the no-write census below is taken around the COMMAND only.
+    const held = {
+      connections: (await sql(`UPDATE wms_connections SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
+      bindings: (await sql(`UPDATE external_wms_bindings SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
+      links: (await sql(`UPDATE wms_product_links SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
+    }
+    heldRows = held
+    const remaining = await sql(`SELECT (SELECT count(*) FROM wms_connections WHERE connector = 'mintsoft')::int AS connections, (SELECT count(*) FROM external_wms_bindings WHERE connector = 'mintsoft')::int AS bindings, (SELECT count(*) FROM wms_product_links WHERE connector = 'mintsoft')::int AS links`)
+    assert.deepEqual([remaining.rows[0].connections, remaining.rows[0].bindings, remaining.rows[0].links], [0, 0, 0], 'precondition: no foreign Mintsoft row is visible to the run')
     process.env.E2E_TEST_MODE = '1'
     process.env.SETTINGS_ENCRYPTION_KEY = randomBytes(32).toString('base64')
     delete process.env.ENCRYPTION_KEY
@@ -505,6 +515,11 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
     await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${MTAG}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${MTAG}%'`)
     await sql(`DELETE FROM wms_connections WHERE id LIKE '${MTAG}%'`)
+    if (heldRows !== null) {
+      await sql(`UPDATE wms_connections SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.connections])
+      await sql(`UPDATE external_wms_bindings SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.bindings])
+      await sql(`UPDATE wms_product_links SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.links])
+    }
     await sql(`DELETE FROM settings WHERE key = ANY($1)`, [MINTSOFT_SETTINGS])
     for (const prior of saved) await setting(prior.key, prior.value)
     rmSync(dir, { recursive: true, force: true })
