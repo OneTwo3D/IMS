@@ -11,6 +11,10 @@ const modules = [
   '../../lib/reconciliation-pack/woo-source.ts',
   '../../lib/reconciliation-pack/woo-transport.ts',
   '../../lib/reconciliation-pack/woo-credentials.ts',
+  '../../lib/reconciliation-pack/xero-source.ts',
+  '../../lib/reconciliation-pack/xero-transport.ts',
+  '../../lib/reconciliation-pack/xero-credentials.ts',
+  '../../lib/reconciliation-pack/vat-item.ts',
   '../../lib/reconciliation-pack/trend.ts',
   '../../lib/ops/readiness-gate-pack.ts',
 ]

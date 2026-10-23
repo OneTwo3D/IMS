@@ -361,3 +361,173 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ---- R12 end to end: the real IMS reads, the real stored Xero connection, the real GET-only transports, LOOPBACK Xero and store ------
+
+const XTAG = `RCVT${process.pid}`
+const XTENANT = 'b2c3d4e5-0000-4000-8000-000000000012'
+const X_SETTINGS = ['wc_url', 'wc_consumer_key', 'wc_consumer_secret', 'wc_initial_import_completed', 'wc_sync_order_statuses', 'xero_expected_tenant_id', 'xero_shipping_account']
+
+test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refreshed) Xero token, GET requests to loopback Xero and store only, three systems compared, and not one row written', { skip: !RUN }, async () => {
+  const http = await import('node:http')
+  const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
+  const { healthyLiveness } = await import('../reconciliation-pack/basis-fixtures.ts')
+  const { encryptSettingValue } = await import('../../lib/security/encrypted-settings.ts')
+  const { createXeroGetPort } = await import('../../lib/reconciliation-pack/xero-transport.ts')
+  const { readXeroAccess, readXeroBinding } = await import('../../lib/reconciliation-pack/xero-credentials.ts')
+  const { digestTaxRateList } = await import('../../lib/connectors/xero/tax-rate-list.ts')
+  const { randomBytes } = await import('node:crypto')
+  const TOKEN = `xero_tok_${XTAG}`
+  const xeroSeen: Array<{ method: string; url: string; authorization: string | undefined; tenant: string | undefined }> = []
+  const wooSeen: Array<{ method: string; url: string }> = []
+  let xeroTax = [60, 40]
+  const invoice = (n: number, date: string, tax: number) => ({ InvoiceID: `00000000-0000-4000-8000-0000000000${String(n).padStart(2, '0')}`, Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: tax }] })
+  const send = (res: import('node:http').ServerResponse, body: unknown, headers: Record<string, string> = {}) => { res.writeHead(200, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(body)) }
+  const xeroServer = http.createServer((req, res) => {
+    xeroSeen.push({ method: req.method ?? '', url: req.url ?? '', authorization: req.headers.authorization, tenant: req.headers['xero-tenant-id'] as string | undefined })
+    const url = new URL(req.url ?? '/', 'http://x')
+    if (url.pathname === '/api.xro/2.0/Organisation') return send(res, { Organisations: [{ BaseCurrency: 'GBP' }] })
+    if (url.pathname === '/api.xro/2.0/Invoices') {
+      const rows = url.searchParams.get('page') === '1' ? [invoice(1, '2026-09-05', xeroTax[0]!), invoice(2, '2026-09-20', xeroTax[1]!)] : []
+      return send(res, { Invoices: rows, pagination: { page: Number(url.searchParams.get('page')), pageSize: 100, pageCount: 1, itemCount: 2 } })
+    }
+    res.writeHead(404); res.end('{}')
+  })
+  const order = (id: number, created: string, tax: string) => ({ id, status: 'processing', currency: 'GBP', date_created_gmt: created, tax_lines: [{ id: 1, rate_id: 7001, tax_total: tax, shipping_tax_total: '1.00' }] })
+  const wooServer = http.createServer((req, res) => {
+    wooSeen.push({ method: req.method ?? '', url: req.url ?? '' })
+    const url = new URL(req.url ?? '/', 'http://x')
+    const first = url.searchParams.get('page') === '1'
+    const json = (body: unknown, total: number) => send(res, body, { 'x-wp-total': String(total), 'x-wp-totalpages': String(total ? 1 : 0) })
+    if (url.pathname === '/wp-json/wc/v3/orders') return url.searchParams.get('status') === 'processing' ? json(first ? [order(9101, '2026-09-10T09:30:00', '60.00'), order(9102, '2026-09-21T10:00:00', '40.00')] : [], 2) : json([], 0)
+    res.writeHead(404); res.end('{}')
+  })
+  await Promise.all([xeroServer, wooServer].map((server) => new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))))
+  const xeroPort = (xeroServer.address() as import('node:net').AddressInfo).port
+  const wooPort = (wooServer.address() as import('node:net').AddressInfo).port
+  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  chmodSync(dir, 0o700)
+  const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [X_SETTINGS])).rows as Array<{ key: string; value: string }>)
+  const savedTokens = await withClient(async (client) => (await client.query(`SELECT * FROM accounting_tokens WHERE connector = 'xero'`)).rows)
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const setting = (key: string, value: string, at = '2026-01-01 00:00:00') => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "updatedAt" = EXCLUDED."updatedAt"`, [key, value, at])
+  const targets: string[] = []
+  const original = net.Socket.prototype.connect
+  const previous = { E2E_TEST_MODE: process.env.E2E_TEST_MODE, SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, ENCRYPTION_KEY: process.env.ENCRYPTION_KEY, XERO_ALLOWED_TENANT_IDS: process.env.XERO_ALLOWED_TENANT_IDS }
+  const xeroRows = [{ taxType: 'OUTPUT2', name: 'Standard', status: 'ACTIVE' as const, reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: [{ name: 'VAT', rate: '20.000000', compound: false, nonRecoverable: false }], canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: true } }]
+  try {
+    process.env.E2E_TEST_MODE = '1'
+    process.env.SETTINGS_ENCRYPTION_KEY = randomBytes(32).toString('base64')
+    delete process.env.ENCRYPTION_KEY
+    process.env.XERO_ALLOWED_TENANT_IDS = XTENANT
+    await sql(`DELETE FROM settings WHERE key = ANY($1)`, [X_SETTINGS])
+    await setting('wc_url', `http://127.0.0.1:${wooPort}`)
+    await setting('wc_consumer_key', encryptSettingValue('wc_consumer_key', `ck_${XTAG}`))
+    await setting('wc_consumer_secret', encryptSettingValue('wc_consumer_secret', `cs_${XTAG}`))
+    await setting('wc_initial_import_completed', 'true')
+    await setting('xero_expected_tenant_id', XTENANT)
+    await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
+    await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "connectionGeneration", "updatedAt") VALUES ($1, 'xero', $2, '2031-01-01', $3, 'gen-e2e', now())`, [`${XTAG}-tok`, TOKEN, XTENANT])
+    await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{}', '{}', '2026-01-01 00:00:00', '2026-01-01 00:00:00')`, [`${XTAG}-fl`])
+    await sql(`INSERT INTO tax_rates (id, name, rate, accounting_tax_type, "countryCode", reporting_category, "updatedAt") VALUES ($1, 'UK Standard', 0.2, 'OUTPUT2', 'GB', 'DOMESTIC', now())`, [`${XTAG}-t`])
+    await sql(`INSERT INTO shopping_tax_rate_mappings (id, connector, "externalTaxRateId", "externalName", "externalRatePct", "taxRateId", "updatedAt") VALUES ($1, 'woocommerce', '7001', 'x', 20, $2, now())`, [`${XTAG}-m`, `${XTAG}-t`])
+    for (const [n, invoiced, tax] of [[1, '2026-09-05 10:00:00', '60'], [2, '2026-09-20 10:00:00', '40'], [3, '2026-10-02 10:00:00', '777']] as const) {
+      await sql(`INSERT INTO sales_orders (id, status, currency, "subtotalForeign", "totalForeign", "subtotalBase", "totalBase", "invoicedAt", "updatedAt") VALUES ($1, 'PROCESSING'::"SalesOrderStatus", 'GBP', 100, 120, 100, 120, $2, now())`, [`${XTAG}-o${n}`, invoiced])
+      await sql(`INSERT INTO sales_order_lines (id, "orderId", description, qty, "unitPriceForeign", "unitPriceBase", "taxRateId", "taxBase", "totalForeign", "totalBase") VALUES ($1, $2, 'x', 1, 100, 100, $3, $4, 120, 120)`, [`${XTAG}-l${n}`, `${XTAG}-o${n}`, `${XTAG}-t`, tax])
+    }
+    await sql(`INSERT INTO sales_orders (id, status, currency, "subtotalForeign", "totalForeign", "subtotalBase", "totalBase", "invoicedAt", archived, "updatedAt") VALUES ($1, 'CANCELLED'::"SalesOrderStatus", 'GBP', 100, 120, 100, 120, '2026-09-06 10:00:00', false, now())`, [`${XTAG}-o4`])
+    await sql(`INSERT INTO sales_order_lines (id, "orderId", description, qty, "unitPriceForeign", "unitPriceBase", "taxRateId", "taxBase", "totalForeign", "totalBase") VALUES ($1, $2, 'x', 1, 100, 100, $3, 555, 120, 120)`, [`${XTAG}-l4`, `${XTAG}-o4`, `${XTAG}-t`])
+    for (const row of xeroRows) {
+      await sql(`INSERT INTO xero_tax_rates (id, connector, "tenantId", "taxType", name, status, "reportTaxType", "effectiveRate", "displayTaxRate", components, "canApplyToAssets", "canApplyToEquity", "canApplyToExpenses", "canApplyToLiabilities", "canApplyToRevenue", "fetchedAt") VALUES ($1, 'xero', $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, '2026-10-23 08:00:00')`,
+        [`${XTAG}-x-${row.taxType}`, XTENANT, row.taxType, row.name, row.status, row.reportTaxType, row.effectiveRate, row.displayTaxRate, JSON.stringify(row.components), row.canApply.assets, row.canApply.equity, row.canApply.expenses, row.canApply.liabilities, row.canApply.revenue])
+    }
+    await sql(`INSERT INTO xero_tax_rate_lists (id, connector, "tenantId", "fetchedAt", "rowCount", digest) VALUES ($1, 'xero', $2, '2026-10-23 08:00:00', 1, $3)`, [`${XTAG}-xl`, XTENANT, digestTaxRateList(XTENANT, xeroRows)])
+
+    const run = async (extra: string[]) => {
+      const out: string[] = []
+      const before = await census()
+      xeroSeen.length = 0; wooSeen.length = 0; targets.length = 0
+      net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+        const raw = args[0] as unknown
+        const first = (Array.isArray(raw) ? raw[0] : raw) as { host?: string; port?: number; path?: string } | number | string
+        targets.push(typeof first === 'object' && first !== null ? (first.path ? `unix:${first.path}` : `${first.host ?? 'localhost'}:${first.port}`) : `${typeof args[1] === 'string' ? args[1] : 'localhost'}:${String(first)}`)
+        return (original as (...a: unknown[]) => unknown).apply(this, args)
+      } as typeof original
+      // The Xero loopback double: the same transport and the same stored-connection reader the command uses, aimed at the double. The
+      // grant in the seam's environment is what lets the fetch seam's outbound hold reach a non-Xero host; the command itself never sets it.
+      const xero = {
+        port: createXeroGetPort({ readAccess: () => withClient((client) => readXeroAccess(client as never, { now: new Date() })), baseUrl: `http://127.0.0.1:${xeroPort}/api.xro/2.0`, env: { E2E_TEST_MODE: '1', NODE_ENV: 'test', XERO_WRITE_ALLOWED_TENANT: XTENANT } }),
+        binding: () => withClient((client) => readXeroBinding(client as never)),
+      }
+      const code = await runPackCli({ argv: ['--phase', 'P1', '--as-of', '2026-10-19', '--items', 'R12', '--report-dir', dir, ...extra], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), deps: { liveness: healthyLiveness(), xero }, stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
+      net.Socket.prototype.connect = original
+      const after = await census()
+      assert.deepEqual(after.counts, before.counts, 'every table has the rows it had')
+      assert.deepEqual(after.stats, before.stats, 'no table saw an insert, update or delete')
+      return { code, out, targets: [...targets] }
+    }
+    const url = new URL(process.env.DATABASE_URL!)
+    const allowed = (target: string) => target === `${url.hostname}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}` || target === `127.0.0.1:${wooPort}` || target === `127.0.0.1:${xeroPort}`
+
+    // Without the flag: no request to either double, no connection to anything but the database.
+    const off = await run([])
+    assert.ok(off.out.includes('R12 inconclusive VENDOR_READS_OFF'), off.out.join('\n'))
+    assert.deepEqual([xeroSeen.length, wooSeen.length], [0, 0])
+    assert.ok(off.targets.every((target) => !target.endsWith(`:${xeroPort}`) && !target.endsWith(`:${wooPort}`)), off.targets.join(','))
+
+    // With it: the three systems agree (IMS 100.00 in September from two orders; the cancelled order and the October order are not in it).
+    const on = await run(['--vendor-reads-only'])
+    assert.ok(on.out.includes('R12 pass -'), on.out.join('\n'))
+    assert.deepEqual([...new Set(xeroSeen.map((s) => s.method)), ...new Set(wooSeen.map((s) => s.method))], ['GET', 'GET'])
+    assert.equal(xeroSeen.length, 3, 'the organisation, then one page of invoices read twice')
+    assert.ok(xeroSeen.every((s) => s.authorization === `Bearer ${TOKEN}` && s.tenant === XTENANT && !s.url.includes(TOKEN)))
+    for (const target of on.targets) assert.ok(allowed(target), `unexpected connection to ${target}`)
+    assert.ok(on.targets.some((target) => target === `127.0.0.1:${xeroPort}`) && on.targets.some((target) => target === `127.0.0.1:${wooPort}`), 'precondition: both doubles were contacted')
+    assert.ok(!on.out.join('\n').includes(TOKEN) && !on.out.join('\n').includes(`cs_${XTAG}`))
+
+    // A VAT difference beyond GBP 0.05 in Xero is a finding: the run fails (exit 1) and names the item.
+    xeroTax = [60.06, 40]
+    const differ = await run(['--vendor-reads-only'])
+    assert.equal(differ.code, 1, differ.out.join('\n'))
+    assert.ok(differ.out.includes('R12 fail DIFFERENCES'), differ.out.join('\n'))
+    xeroTax = [60.05, 40]
+    assert.ok((await run(['--vendor-reads-only'])).out.includes('R12 pass -'), 'exactly GBP 0.05 agrees')
+    xeroTax = [60, 40]
+
+    // U8: a non-domestic rate carrying VAT is VAT_MAPPING_UNVERIFIED, decided from IMS alone: no request to either double.
+    await sql(`UPDATE tax_rates SET reporting_category = 'OSS' WHERE id = $1`, [`${XTAG}-t`])
+    const oss = await run(['--vendor-reads-only'])
+    assert.ok(oss.out.includes('R12 inconclusive VAT_MAPPING_UNVERIFIED'), oss.out.join('\n'))
+    assert.deepEqual([xeroSeen.length, wooSeen.length], [0, 0])
+    await sql(`UPDATE tax_rates SET reporting_category = 'DOMESTIC' WHERE id = $1`, [`${XTAG}-t`])
+
+    // A token the read-sync has not renewed is never refreshed by the pack: no request to Xero, the token row untouched.
+    await sql(`UPDATE accounting_tokens SET "expiresAt" = now() + interval '1 minute' WHERE id = $1`, [`${XTAG}-tok`])
+    const before = (await sql(`SELECT "accessToken", "refreshToken", "expiresAt", "updatedAt" FROM accounting_tokens WHERE id = $1`, [`${XTAG}-tok`])).rows[0]
+    const expired = await run(['--vendor-reads-only'])
+    assert.ok(expired.out.includes('R12 inconclusive XERO_CONNECTION_UNUSABLE'), expired.out.join('\n'))
+    assert.equal(xeroSeen.length, 0)
+    assert.deepEqual((await sql(`SELECT "accessToken", "refreshToken", "expiresAt", "updatedAt" FROM accounting_tokens WHERE id = $1`, [`${XTAG}-tok`])).rows[0], before)
+    await sql(`UPDATE accounting_tokens SET "expiresAt" = '2031-01-01' WHERE id = $1`, [`${XTAG}-tok`])
+    assert.ok((await run(['--vendor-reads-only'])).out.includes('R12 pass -'))
+  } finally {
+    net.Socket.prototype.connect = original
+    for (const [name, value] of Object.entries(previous)) { if (value === undefined) delete process.env[name]; else process.env[name] = value }
+    await Promise.all([xeroServer, wooServer].map((server) => new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections() })))
+    await sql(`DELETE FROM xero_tax_rate_lists WHERE id LIKE '${XTAG}%'`)
+    await sql(`DELETE FROM xero_tax_rates WHERE id LIKE '${XTAG}%'`)
+    await sql(`DELETE FROM sales_order_lines WHERE id LIKE '${XTAG}%'`)
+    await sql(`DELETE FROM sales_orders WHERE id LIKE '${XTAG}%'`)
+    await sql(`DELETE FROM shopping_tax_rate_mappings WHERE id LIKE '${XTAG}%'`)
+    await sql(`DELETE FROM tax_rates WHERE id LIKE '${XTAG}%'`)
+    await sql(`DELETE FROM first_load_apply_runs WHERE id LIKE '${XTAG}%'`)
+    await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
+    for (const row of savedTokens) {
+      const columns = Object.keys(row)
+      await sql(`INSERT INTO accounting_tokens (${columns.map((c) => `"${c}"`).join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})`, columns.map((c) => row[c]))
+    }
+    await sql(`DELETE FROM settings WHERE key = ANY($1)`, [X_SETTINGS])
+    for (const prior of saved) await setting(prior.key, prior.value, '2026-09-01 00:00:00')
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

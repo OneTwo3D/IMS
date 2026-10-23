@@ -28,8 +28,10 @@ import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-read
 import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconciliation-pack/ledger-items'
 import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
+import { runVatItem } from '@/lib/reconciliation-pack/vat-item'
 import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
 import type { WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
+import type { XeroSourceOptions } from '@/lib/reconciliation-pack/xero-source'
 
 /** Reads the read-sync status report, reduced and checked against itself (reduceStatusReport). May throw: the run treats that as an unreadable read. */
 export interface LivenessPort { read(): Promise<LivenessRead> }
@@ -57,6 +59,8 @@ export type RunContext = {
   vendor?: VendorPorts
   /** Test seam for the vendor walks' pacing and budget. */
   wooOptions?: WooSourceOptions
+  /** Test seam for the Xero walks' pacing and budget (R12). */
+  xeroOptions?: XeroSourceOptions
   /**
    * Only for an item that settles (its catalogue row), and set per item by runItems, never by the caller: the state carried from the
    * previous report and the stream stamp this run's start read saw. Absent on any other item.
@@ -86,7 +90,9 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
   const fromVendor = (id: 'R9' | 'R13'): ItemRunner => (context) =>
     runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, settling: context.settling })
-  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13') }
+  const fromVat: ItemRunner = (context) =>
+    runVatItem('R12', { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, xeroOptions: context.xeroOptions })
+  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat }
 }
 
 /** R6 and R10 read the settled as-of basis (ledger-items.ts). */

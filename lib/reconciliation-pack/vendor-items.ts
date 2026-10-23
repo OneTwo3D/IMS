@@ -49,6 +49,7 @@ import {
 } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
+import type { XeroVatVendor } from '@/lib/reconciliation-pack/vat-item'
 import { readWooOrders, readWooTaxRates, type WooGetPort, type WooOrderRow, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 import { normaliseWcOrderStatus, resolveWcPullStatuses } from '@/lib/connectors/woocommerce/order-status-filter'
 
@@ -60,6 +61,8 @@ export function isVendorItem(id: string): id is VendorItemId {
 
 export type VendorPorts = {
   woo?: WooGetPort
+  /** R12 only (vat-item.ts): the GET-only Xero port and the stored connection's binding reader. */
+  xero?: XeroVatVendor
 }
 
 export type VendorItemContext = {

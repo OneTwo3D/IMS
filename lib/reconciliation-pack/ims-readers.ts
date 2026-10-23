@@ -52,7 +52,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings', 'vat'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -105,6 +105,27 @@ export type XeroPostingRow = { id: string; type: string; status: string; at: str
 export type XeroPostings = { p0: { state: 'absent' } | { state: 'unverified' } | { state: 'verified'; startedAt: string }; rows: XeroPostingRow[] }
 export type WmsBindingRow = { connector: string; warehouseId: string; warehouseCode: string; externalWarehouseId: string; active: boolean; stockSyncMode: 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'; alignmentConfirmed: boolean }
 
+/**
+ * R12, the IMS side of the VAT comparison, from the SALES LINES (SalesOrderLine.taxBase, the base-currency tax the IMS VAT report sums;
+ * shipping VAT is order-level and is not in it): per calendar month of the order's invoice instant (UTC) and per tax rate, over the
+ * orders invoiced inside the requested window that are not CANCELLED or archived. `xeroReportTypes` is the stored Xero list's
+ * (tax type, report tax type) for the connected organisation, read in the same snapshot as the proof in `xeroTaxRates`. `wooFx` is the
+ * recorded rate of every storefront-linked order not in the base currency (base amount = foreign amount / rate), the only rate
+ * WooCommerce's figures can be put in the base currency by.
+ */
+export type VatSalesRow = { period: string; taxRateId: string | null; taxBase: string; lines: number }
+export type VatXeroReportTypeRow = { taxType: string; reportTaxType: string | null }
+export type VatOrderFxRow = { externalOrderId: string; currency: string; fxRateToBase: string }
+export type ImsVat = {
+  baseCurrency: string
+  window: { from: string; toExclusive: string }
+  sales: VatSalesRow[]
+  xeroTenantId: string | null
+  xeroReportTypes: VatXeroReportTypeRow[]
+  shippingAccount: string
+  wooFx: VatOrderFxRow[]
+}
+
 export type ImsSectionValues = {
   identity: ImsIdentity
   boundaries: PopulationBoundaries
@@ -118,6 +139,7 @@ export type ImsSectionValues = {
   snapshots: ImsSnapshots
   wmsBindings: WmsBindingRow[]
   xeroPostings: XeroPostings
+  vat: ImsVat
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -130,6 +152,8 @@ export type ImsReadOptions = {
   sections: readonly ImsSectionId[]
   /** The cycle date (YYYY-MM-DD); required by the `snapshots` section and by nothing else. */
   asOf?: string
+  /** The `vat` section's window: invoice instants from `from` (inclusive) to `toExclusive`, plain dates (UTC). Required by that section and by nothing else. */
+  vatWindow?: { from: string; toExclusive: string }
   rowCap?: number
   statementTimeoutMs?: number
 }
@@ -204,7 +228,7 @@ function closedReason(error: unknown): PackReasonCode {
   return code === '57014' ? 'READ_INCOMPLETE' : 'SOURCE_UNREADABLE'
 }
 
-type Tx = { query: (sql: string, values?: unknown[]) => Promise<Array<Record<string, unknown>>>; cap: number; asOf: string | undefined }
+type Tx = { query: (sql: string, values?: unknown[]) => Promise<Array<Record<string, unknown>>>; cap: number; asOf: string | undefined; vatWindow: { from: string; toExclusive: string } | undefined }
 
 async function readCapped(tx: Tx, sql: string, values?: unknown[]): Promise<Array<Record<string, unknown>>> {
   const rows = await tx.query(`${sql} LIMIT ${tx.cap + 1}`, values)
@@ -433,6 +457,44 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     return { asOf, run, values, balances }
   },
 
+  async vat(tx) {
+    const window = tx.vatWindow
+    if (window === undefined || !ASOF_RE.test(window.from) || !ASOF_RE.test(window.toExclusive) || Number.isNaN(Date.parse(`${window.from}T00:00:00Z`)) || Number.isNaN(Date.parse(`${window.toExclusive}T00:00:00Z`)) || window.from >= window.toExclusive) throw new Unreadable('BAD_MODE')
+    // The base currency as the application reads it (resolveBaseCurrencyCode): the organisation row, else the documented default.
+    const orgs = await tx.query('SELECT "baseCurrency" AS base FROM organisations ORDER BY id')
+    if (orgs.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    const baseCurrency = orgs.length === 0 ? 'GBP' : text(orgs[0]!.base, 'CURRENCY_UNKNOWN')
+    const salesRows = await readCapped(tx, `SELECT to_char(so."invoicedAt", 'YYYY-MM') AS period, l."taxRateId" AS rate_id, SUM(l."taxBase")::text AS tax, COUNT(*)::text AS n FROM sales_order_lines l JOIN sales_orders so ON so.id = l."orderId" WHERE so."invoicedAt" >= $1::date AND so."invoicedAt" < $2::date AND so.status::text <> 'CANCELLED' AND so.archived = false GROUP BY 1, 2 ORDER BY 1, 2`, [window.from, window.toExclusive])
+    const sales = salesRows.map((row): VatSalesRow => {
+      const period = text(row.period, 'SOURCE_UNREADABLE')
+      if (!/^[0-9]{4}-(?:0[1-9]|1[0-2])$/.test(period)) throw new Unreadable('SOURCE_UNREADABLE')
+      return { period, taxRateId: textOrNull(row.rate_id), taxBase: decimal(row.tax), lines: count(row.n) }
+    })
+    unique(sales, (row) => `${row.period}\u0001${row.taxRateId ?? ''}`)
+    const tokens = await tx.query(`SELECT "tenantId" AS tenant FROM accounting_tokens WHERE connector = 'xero'`)
+    if (tokens.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    const xeroTenantId = tokens.length === 1 && typeof tokens[0]!.tenant === 'string' && tokens[0]!.tenant.trim() !== '' ? tokens[0]!.tenant : null
+    let xeroReportTypes: VatXeroReportTypeRow[] = []
+    if (xeroTenantId !== null) {
+      xeroReportTypes = (await readCapped(tx, `SELECT "taxType" AS tax_type, "reportTaxType" AS report FROM xero_tax_rates WHERE connector = 'xero' AND "tenantId" = $1 ORDER BY "taxType"`, [xeroTenantId])).map((row): VatXeroReportTypeRow => {
+        if (typeof row.tax_type !== 'string' || !XERO_TAX_TYPE_RE.test(row.tax_type) || (row.report !== null && (typeof row.report !== 'string' || !XERO_TAX_TYPE_RE.test(row.report)))) throw new Unreadable('SOURCE_UNREADABLE')
+        return { taxType: row.tax_type, reportTaxType: row.report as string | null }
+      })
+      unique(xeroReportTypes, (row) => row.taxType)
+    }
+    const settings = await tx.query(`SELECT key, value FROM settings WHERE key = 'xero_shipping_account'`)
+    if (settings.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    let shippingAccount = ''
+    if (settings.length === 1) {
+      const value = settings[0]!.value
+      if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) throw new Unreadable('SOURCE_UNREADABLE')
+      shippingAccount = value.trim()
+    }
+    const fx = (await readCapped(tx, `SELECT l."externalOrderId" AS external_id, so.currency, so."fxRateToBase"::text AS fx FROM shopping_order_links l JOIN sales_orders so ON so.id = l."orderId" WHERE l.connector = 'woocommerce' AND so.currency <> 'GBP' ORDER BY l.id`)).map((row): VatOrderFxRow => ({ externalOrderId: text(row.external_id), currency: text(row.currency, 'CURRENCY_UNKNOWN'), fxRateToBase: decimal(row.fx) }))
+    unique(fx, (row) => row.externalOrderId)
+    return { baseCurrency, window, sales, xeroTenantId, xeroReportTypes, shippingAccount, wooFx: fx }
+  },
+
   async wmsBindings(tx) {
     const rows = await readCapped(tx, 'SELECT b.connector, b."warehouseId" AS warehouse_id, w.code AS warehouse_code, b."externalWarehouseId" AS external_id, b.active, b."stockSyncMode"::text AS mode, b."alignmentConfirmedAt" IS NOT NULL AS confirmed FROM external_wms_bindings b JOIN warehouses w ON w.id = b."warehouseId" ORDER BY b.id')
     const bindings = rows.map((row): WmsBindingRow => ({ connector: text(row.connector), warehouseId: text(row.warehouse_id), warehouseCode: text(row.warehouse_code), externalWarehouseId: text(row.external_id), active: bool(row.active), stockSyncMode: oneOf(row.mode, ['DISABLED', 'NOTIFICATION_ONLY', 'ALIGN_TO_WMS'] as const), alignmentConfirmed: bool(row.confirmed) }))
@@ -467,7 +529,7 @@ export async function readImsSnapshot(client: ImsQueryClient, options: ImsReadOp
     const start = await run(`SELECT pg_current_snapshot()::text AS snapshot, current_setting('transaction_read_only') AS read_only, current_setting('transaction_isolation') AS isolation`)
     const first = start[0]
     if (start.length !== 1 || first!.read_only !== 'on' || first!.isolation !== 'repeatable read' || typeof first!.snapshot !== 'string' || first!.snapshot === '') return { ok: false, reason: 'SOURCE_UNREADABLE' }
-    const tx: Tx = { query: run, cap, asOf: options.asOf }
+    const tx: Tx = { query: run, cap, asOf: options.asOf, vatWindow: options.vatWindow }
     const sections: ImsSections = {}
     for (const id of options.sections) {
       try {

@@ -162,7 +162,7 @@ async function walkOnce<T extends { id: string }>(w: Walker, collection: WooColl
     w.requests += 1
     let response: WooPage
     try {
-      response = await w.port.get(collection, { ...extra, page: String(page), per_page: String(w.perPage), orderby: 'id', order: 'asc', _fields: FIELDS[collection] })
+      response = await w.port.get(collection, { ...extra, page: String(page), per_page: String(w.perPage), orderby: 'id', order: 'asc', _fields: extra._fields ?? FIELDS[collection] })
     } catch {
       throw new Stop('SOURCE_UNREADABLE')
     }
@@ -221,15 +221,15 @@ export type WooOrdersRead = {
   allZero: boolean
 }
 
-type Sweep = { orders: WooOrderRow[]; totals: Array<{ status: string; total: number }> }
+type Sweep<T> = { orders: T[]; totals: Array<{ status: string; total: number }> }
 
 /** ONE full proven walk of every status, in order. Each walk proves its own headers and pages; the sweep proves no order is in two statuses. */
-async function sweepOrders(w: Walker, statuses: readonly string[]): Promise<Sweep> {
-  const orders: WooOrderRow[] = []
+async function sweepOrders<T extends { id: string; status: string }>(w: Walker, statuses: readonly string[], extra: Readonly<Record<string, string>>, parse: (raw: unknown) => T): Promise<Sweep<T>> {
+  const orders: T[] = []
   const totals: Array<{ status: string; total: number }> = []
   const seen = new Set<string>()
   for (const status of statuses) {
-    const walk = await walkOnce(w, 'orders', { status }, parseOrder)
+    const walk = await walkOnce(w, 'orders', { ...extra, status }, parse)
     for (const row of walk.rows) {
       // The store was asked for one status; an order in another is a response that is not what was asked for.
       if (row.status !== status) throw new Stop('SOURCE_UNREADABLE')
@@ -240,6 +240,16 @@ async function sweepOrders(w: Walker, statuses: readonly string[]): Promise<Swee
     totals.push({ status, total: walk.total })
   }
   return { orders, totals }
+}
+
+/** Two sweeps, the second starting only after the first finished; their combined populations and per-status totals must be identical. */
+async function doubleSweep<T extends { id: string; status: string }>(w: Walker, statuses: readonly string[], extra: Readonly<Record<string, string>>, parse: (raw: unknown) => T): Promise<Sweep<T>> {
+  const a = await sweepOrders(w, statuses, extra, parse)
+  const b = await sweepOrders(w, statuses, extra, parse)
+  if (a.orders.length !== b.orders.length || JSON.stringify(a.totals) !== JSON.stringify(b.totals)) throw new Stop('VENDOR_READ_UNSTABLE')
+  const byId = new Map(b.orders.map((row) => [row.id, JSON.stringify(row)] as const))
+  for (const row of a.orders) if (byId.get(row.id) !== JSON.stringify(row)) throw new Stop('VENDOR_READ_UNSTABLE')
+  return a
 }
 
 /**
@@ -255,14 +265,57 @@ async function sweepOrders(w: Walker, statuses: readonly string[]): Promise<Swee
 export async function readWooOrders(port: WooGetPort, statuses: readonly string[], options: WooSourceOptions = {}): Promise<{ ok: true; value: WooOrdersRead } | { ok: false; reason: PackReasonCode }> {
   try {
     if (!Array.isArray(statuses) || new Set(statuses).size !== statuses.length || !statuses.every((s) => typeof s === 'string' && STATUS_RE.test(s))) return { ok: false, reason: 'UNKNOWN_STATUS' }
-    const w = makeWalker(port, options)
-    const a = await sweepOrders(w, statuses)
-    const b = await sweepOrders(w, statuses)
-    if (a.orders.length !== b.orders.length || JSON.stringify(a.totals) !== JSON.stringify(b.totals)) throw new Stop('VENDOR_READ_UNSTABLE')
-    const byId = new Map(b.orders.map((row) => [row.id, JSON.stringify(row)] as const))
-    for (const row of a.orders) if (byId.get(row.id) !== JSON.stringify(row)) throw new Stop('VENDOR_READ_UNSTABLE')
-    const totals = a.totals
-    return { ok: true, value: { orders: a.orders, totals, allZero: totals.length > 0 && totals.every((entry) => entry.total === 0) } }
+    const swept = await doubleSweep(makeWalker(port, options), statuses, {}, parseOrder)
+    const totals = swept.totals
+    return { ok: true, value: { orders: swept.orders, totals, allZero: totals.length > 0 && totals.every((entry) => entry.total === 0) } }
+  } catch (error) {
+    return { ok: false, reason: reasonOf(error) }
+  }
+}
+
+/**
+ * R12: the tax lines of the orders created in a date window, in each of `statuses`, as the same proven DOUBLE SWEEP (every status walked
+ * twice, the combined populations identical). The store is asked for the window (`after`, `before`, plain dates) and for the order's id,
+ * status, currency, GMT creation date and tax lines only; the caller widens the window and cuts by the GMT date, because the zone the
+ * store's date filter uses is unverified. Each tax line is the rate id and the LINE tax total (shipping tax is not read).
+ */
+export type WooOrderTaxRow = { id: string; status: string; currency: string; createdAt: string; taxes: Array<{ rateId: string; tax: string }> }
+
+function parseOrderTax(raw: unknown): WooOrderTaxRow {
+  const r = record(raw)
+  const status = normaliseWcOrderStatus(plainText(r.status, 64))
+  if (!STATUS_RE.test(status)) throw new Stop('SOURCE_UNREADABLE')
+  if (!isKnownCurrency(r.currency)) throw new Stop('CURRENCY_UNKNOWN')
+  const created = r.date_created_gmt
+  const m = typeof created === 'string' ? GMT_RE.exec(created) : null
+  if (!m) throw new Stop('SOURCE_UNREADABLE')
+  const iso = `${created as string}.000Z`
+  if (Number.isNaN(Date.parse(iso)) || new Date(iso).toISOString() !== iso) throw new Stop('SOURCE_UNREADABLE')
+  if (!Array.isArray(r.tax_lines) || r.tax_lines.length > 200) throw new Stop('SOURCE_UNREADABLE')
+  const sums = new Map<string, Prisma.Decimal>()
+  for (const entry of r.tax_lines) {
+    const line = record(entry)
+    const rateId = rowId(line.rate_id)
+    const tax = line.tax_total
+    if (typeof tax !== 'string' || parseDecimalStrict(tax) === null) throw new Stop('BAD_VALUE')
+    sums.set(rateId, (sums.get(rateId) ?? new Prisma.Decimal(0)).add(tax))
+  }
+  return { id: rowId(r.id), status, currency: r.currency as string, createdAt: iso, taxes: [...sums].map(([rateId, tax]) => ({ rateId, tax: tax.isZero() ? '0' : tax.toFixed() })).sort((x, y) => (BigInt(x.rateId) < BigInt(y.rateId) ? -1 : 1)) }
+}
+
+const PLAIN_DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
+
+export async function readWooOrderTaxes(
+  port: WooGetPort,
+  statuses: readonly string[],
+  window: { after: string; before: string },
+  options: WooSourceOptions = {},
+): Promise<{ ok: true; value: { orders: WooOrderTaxRow[]; totals: Array<{ status: string; total: number }> } } | { ok: false; reason: PackReasonCode }> {
+  try {
+    if (!Array.isArray(statuses) || statuses.length === 0 || new Set(statuses).size !== statuses.length || !statuses.every((s) => typeof s === 'string' && STATUS_RE.test(s))) return { ok: false, reason: 'UNKNOWN_STATUS' }
+    if (!PLAIN_DATE_RE.test(window.after) || !PLAIN_DATE_RE.test(window.before) || window.after >= window.before) return { ok: false, reason: 'BAD_MODE' }
+    const swept = await doubleSweep(makeWalker(port, options), statuses, { after: window.after, before: window.before, _fields: 'id,status,currency,date_created_gmt,tax_lines' }, parseOrderTax)
+    return { ok: true, value: { orders: swept.orders, totals: swept.totals } }
   } catch (error) {
     return { ok: false, reason: reasonOf(error) }
   }
