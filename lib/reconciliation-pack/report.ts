@@ -24,6 +24,7 @@ import {
   PENDING_PERSISTENCE_RUNS,
   isKnownCurrency,
   PACK_EVIDENCE_FILE,
+  PACK_ALIGNMENT_RETIRABLE_ITEMS,
   PACK_ITEM_IDS,
   PACK_OUTCOMES,
   PACK_REPORT_KIND,
@@ -31,6 +32,7 @@ import {
   PACK_APPLICABILITY,
   SYSTEM_IDENTIFIER_RE,
   getPackItem,
+  isVendorSource,
   itemNeedsVendor,
   isPackEmptyProofCode,
   isPackReasonCode,
@@ -418,7 +420,12 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
     if (proof.kind !== 'compared' && proof.kind !== 'proven-empty') fail('unknown proof kind')
     if (proof.kind === 'compared' && counts.bothEqual === 0) fail('a "compared" proof needs at least one identity compared and equal')
     if (proof.kind === 'proven-empty' && (counts.bothEqual !== 0 || !isPackEmptyProofCode(proof.source))) fail('a "proven-empty" proof needs nothing compared and a named proof source')
-    if (!sameSet(input.sources, spec.sources)) fail('a pass names exactly the sources its catalogue row lists')
+    // THE ONE EXCEPTION: a pass whose only proof is that the claim is retired (every binding's alignment is confirmed) asked nothing of the
+    // vendor, so it names the item's sources WITHOUT the vendor ones, and the vendor is claimed only where it was read.
+    const retired = proof.kind === 'proven-empty' && proof.source === 'alignment-confirmed'
+    const expected = retired ? spec.sources.filter((source) => !isVendorSource(source)) : spec.sources
+    if (retired && !PACK_ALIGNMENT_RETIRABLE_ITEMS.includes(input.id)) fail('the alignment-confirmed proof belongs to an item whose claim confirmed alignment retires')
+    if (!sameSet(input.sources, expected)) fail('a pass names exactly the sources its catalogue row lists')
     for (const stream of spec.streams) {
       const bracket = streams.find((entry) => entry.stream === stream)
       if (!bracket || !bracketStable(bracket.start, bracket.end)) fail(`a pass needs an equal start and end stamp for stream ${stream}`)

@@ -78,7 +78,7 @@ test('(e) every /api/... path literal in lib/connectors/mintsoft is classified a
   assert.ok(files.length >= 15, 'the census must be looking at the connector')
   assert.ok(distinct.length >= 15, `the census must find the paths the connector uses (found ${distinct.length})`)
   // The three the hazard is about must be among those it found, or it is not reading what it should.
-  for (const mustSee of ['/api/Auth', '/api/Order/1/Cancel', '/api/Order/1/Comments', '/api/Order/Search']) {
+  for (const mustSee of ['/api/Auth', '/api/Order/1/Cancel', '/api/Order/1/Comments', '/api/Order/Search', '/api/Product/List', '/api/Product/StockLevels']) {
     assert.ok(distinct.includes(mustSee), `the census must see ${mustSee}; saw ${distinct.join(', ')}`)
   }
 
@@ -93,7 +93,7 @@ test('(e) every /api/... path literal in lib/connectors/mintsoft is classified a
 test('the allow-list reads nothing that mutates, and the known writes are never reads', () => {
   // The allow-list must not contain a path that is also a known write for the SAME method.
   const readCases: Array<[string, string]> = [
-    ['GET', '/api/Warehouse'], ['GET', '/api/Product/StockLevels'], ['GET', '/api/Product/7'], ['GET', '/api/Product/7/Bundle'],
+    ['GET', '/api/Warehouse'], ['GET', '/api/Product/StockLevels'], ['GET', '/api/Product/List'], ['GET', '/api/Product/7'], ['GET', '/api/Product/7/Bundle'],
     ['GET', '/api/Returns'], ['GET', '/api/Order/Search'], ['GET', '/api/Order/List'], ['GET', '/api/Order/Statuses'],
     ['GET', '/api/Order/5'], ['GET', '/api/Order/5/Items'], ['GET', '/api/ASN/List'], ['GET', '/api/ASN/9'],
     [ 'GET', `${MINTSOFT_LOCAL_FAKE_PATH_PREFIX}/api/Warehouse`],
@@ -106,6 +106,8 @@ test('the allow-list reads nothing that mutates, and the known writes are never 
     ['POST', '/api/Auth'], ['GET', '/api/Auth'], ['PUT', '/api/Order'], ['POST', '/api/Order/5'], ['DELETE', '/api/Order/5'],
     ['PUT', '/api/Order/5/Items'], ['DELETE', '/api/Order/5/Items/3'], ['PUT', '/api/Product'], ['POST', '/api/Product'],
     ['PUT', '/api/Product/Bundle'], ['PUT', '/api/ASN'], ['DELETE', '/api/ASN/9'], ['POST', '/api/ASN/9'],
+    // The product list is a read by GET only (the pack's census); the same path by any other method, or spelled differently, is a write.
+    ['POST', '/api/Product/List'], ['PUT', '/api/Product/List'], ['DELETE', '/api/Product/List'], ['GET', '/api/Product/list'], ['GET', '/api/Product/List/'], ['GET', '/api/Product/List/1'],
     // Anything unknown, or spelled differently, is a write: never a read by accident.
     ['GET', '/api/Unknown/Thing'], ['GET', '/api/order/5'], ['GET', '/api/Order/5/'], ['GET', '//api/Order/5'],
     ['GET', '/api/Order/5%2FCancel'], ['GET', '/api/Order/abc'], ['GET', '/api/Order/Statuses/extra'], ['HEAD', '/api/Warehouse'],

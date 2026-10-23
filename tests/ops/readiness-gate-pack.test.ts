@@ -366,3 +366,25 @@ test('on disk and through the gate: a real published P0 report feeds the P0 slot
   assert.equal(elsewhere.R3.kind, 'unreadable')
   assert.equal(packStreams().length, 6)
 })
+
+// ---- R1 (the Mintsoft stock item) maps exactly as R9 does ---------------------------------------------
+
+// [mutation: the VENDOR_READS_OFF reading made specific to R9; UNSETTLED_PENDING for R1 mapped to pass or not-available]
+test('R1 is read like R9: VENDOR_READS_OFF alone is not available, an item still settling (UNSETTLED_PENDING, with or without SETTLING_STATE_UNUSABLE) is unreadable, anything else inconclusive is unreadable (a failure maps as for every item, above)', () => {
+  const stamp = '2026-10-19T00:00:00.000Z'
+  const off = assessPackItem({ record: packRecord('P1', { items: { R1: inconclusive('R1', 'VENDOR_READS_OFF') } }) }, 'R1', ctx())
+  assert.equal(off.kind, 'not-available')
+  assert.ok(off.kind === 'not-available' && off.reason.includes('--vendor-reads-only'))
+  for (const reasons of [['UNSETTLED_PENDING'], ['UNSETTLED_PENDING', 'SETTLING_STATE_UNUSABLE']] as const) {
+    const unsettled: ItemInput = { id: 'R1', outcome: 'inconclusive', reasons, entries: { unsettled: [{ key: 'MIL1|129552751', ims: '35', vendor: '36', delta: '-1', imsPresent: true, vendorPresent: true, settling: { sequence: 1, first: stamp, later: [] } }] } }
+    const result = assessPackItem({ record: packRecord('P1', { items: { R1: unsettled } }) }, 'R1', ctx())
+    assert.equal(result.kind, 'unreadable', reasons.join(','))
+    assert.ok(result.kind === 'unreadable' && result.reason.includes('UNSETTLED_PENDING'))
+  }
+  for (const reason of ['VENDOR_AUTH_REFUSED', 'IDENTITY_CONFLICT', 'VENDOR_READ_UNSTABLE', 'BASIS_MOVED', 'NO_POPULATION_RECORD', 'READ_INCOMPLETE', 'STALE_BASIS', 'NOT_SELECTED'] as const) {
+    assert.equal(assessPackItem({ record: packRecord('P1', { items: { R1: inconclusive('R1', reason) } }) }, 'R1', ctx()).kind, 'unreadable', reason)
+  }
+  assert.equal(assessPackItem({ record: packRecord('P1', { items: { R1: packPass('R1') } }) }, 'R1', ctx()).kind, 'pass')
+  assert.equal(itemApplicability('R1', 'P0'), 'not-applicable')
+  assert.equal(assessPackItem({ record: packRecord('P1', { items: { R1: packPass('R1') } }) }, 'R1', ctx({ phase: 'P0' })).kind, 'not-available', 'the catalogue says R1 does not apply at P0, whatever the report says')
+})
