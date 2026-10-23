@@ -19,3 +19,6 @@ f592b26a762a25caf541b7b0bc1706005c847225:tests/scripts/cron-bearer-rewrite-upgra
 66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-helpers.ts:generic-api-key:58
 66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-fingerprint.test.ts:generic-api-key:67
 66375dd5f56e631a2ffe03bcc9db20ad254b6b2c:tests/first-load/apply-fingerprint.test.ts:generic-api-key:95
+# Test-only fake cron secret ('0123456789') for the crontab builder in the reconciliation-pack schedule tests;
+# replaced by 'sekrit' in the next commit. Not a credential.
+bb4e9ee6f7a56110612dc1402384317f821f3495:tests/ops/reconciliation-pack-schedule-cron.test.ts:generic-api-key:21
