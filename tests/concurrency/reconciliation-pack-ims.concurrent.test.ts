@@ -198,8 +198,10 @@ test('[reconciliation pack] xeroPostings reads the P0 record and every row that 
   const existing = await withClient((client) => client.query(`SELECT count(*)::int AS n FROM first_load_apply_runs`))
   try {
     // The sync-log population: in = SYNCED, PROCESSING, or any row with a document id; out = other connector, nothing sent.
-    await insert(`${XP}-synced`, 'xero', 'SALES_INVOICE', 'SYNCED', 'doc1', { syncedAt: '2026-10-05 10:00:00' })
-    await insert(`${XP}-asserted`, 'xero', 'SALES_INVOICE', 'SYNCED', 'doc2', { syncedAt: '2026-10-05 11:00:00' })
+    await insert(`${XP}-synced`, 'xero', 'SALES_INVOICE', 'SYNCED', 'doc1', { syncedAt: '2026-10-05 10:00:00', createdAt: '2026-10-05 09:00:00' })
+    await insert(`${XP}-asserted`, 'xero', 'SALES_INVOICE', 'SYNCED', 'doc2', { syncedAt: '2026-10-05 11:00:00', createdAt: '2026-10-05 10:30:00' })
+    // Created after the others, but its sync time came from a host clock that was BEHIND: the later creation time is its instant.
+    await insert(`${XP}-late-created`, 'xero', 'SALES_INVOICE', 'SYNCED', 'doc5', { syncedAt: '2026-09-15 08:00:00', createdAt: '2026-10-08 08:00:00' })
     await db.$executeRawUnsafe(`UPDATE accounting_sync_logs SET settlement_basis = 'OPERATOR_ASSERTION' WHERE id = $1`, `${XP}-asserted`)
     await insert(`${XP}-processing`, 'xero', 'INVOICE_PDF', 'PROCESSING', null, { processingStartedAt: '2026-10-06 12:00:00', createdAt: '2026-09-01 00:00:00' })
     await insert(`${XP}-failed-with-doc`, 'xero', 'TAX_RATE_SYNC', 'FAILED', 'doc3', { createdAt: '2026-10-07 13:00:00' })
@@ -215,9 +217,10 @@ test('[reconciliation pack] xeroPostings reads the P0 record and every row that 
     assert.deepEqual(mine(value.rows).map((r) => [r.id.slice(XP.length + 1), r.type, r.status, r.at]), [
       ['asserted', 'SALES_INVOICE', 'SYNCED', '2026-10-05T11:00:00.000Z'],
       ['failed-with-doc', 'TAX_RATE_SYNC', 'FAILED', '2026-10-07T13:00:00.000Z'],
+      ['late-created', 'SALES_INVOICE', 'SYNCED', '2026-10-08T08:00:00.000Z'],
       ['processing', 'INVOICE_PDF', 'PROCESSING', '2026-10-06T12:00:00.000Z'],
       ['synced', 'SALES_INVOICE', 'SYNCED', '2026-10-05T10:00:00.000Z'],
-    ], 'the sync time, else the processing start, else the creation time; an operator assertion, a failure with a document id and a PROCESSING row are all kept; other connectors and rows that sent nothing are not')
+    ], 'the latest of the sync time, the processing start and the creation time; an operator assertion, a failure with a document id and a PROCESSING row are all kept; other connectors and rows that sent nothing are not')
 
     if (existing.rows[0].n === 0) {
       // The P0 record: only a VERIFIED run is a recorded P0, and the instant is when the load STARTED (created_at), not when it last changed.

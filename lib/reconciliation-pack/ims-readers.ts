@@ -297,9 +297,11 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       else p0 = { state: 'verified', startedAt: started }
     }
     // Whatever could be a write to Xero, of any type. Not "connector-confirmed rows only": a row that is still PROCESSING may
-    // have posted, and a row with a document id has been sent whatever its status says now. The instant is COALESCEd to the row's
-    // creation time, which is not null, so no row falls out of the population for want of an instant.
-    const rows = await readCapped(tx, `SELECT id, type::text AS type, status::text AS status, ${UTC('COALESCE("syncedAt", "processingStartedAt", "createdAt")')} AS at FROM accounting_sync_logs WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id`)
+    // have posted, and a row with a document id has been sent whatever its status says now. The instant is the LATEST of the
+    // row's sync time, processing start and creation time (GREATEST skips nulls; creation time is never null): the sync and
+    // processing times can come from an application host's clock, so preferring one of them could place a row created after
+    // the first load began before it. Taking the latest only ever moves a row INTO the population.
+    const rows = await readCapped(tx, `SELECT id, type::text AS type, status::text AS status, ${UTC('GREATEST("syncedAt", "processingStartedAt", "createdAt")')} AS at FROM accounting_sync_logs WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id`)
     const postings = rows.map((row): XeroPostingRow => {
       const at = instantOrNull(row.at)
       if (at === null) throw new Unreadable('SOURCE_UNREADABLE')
