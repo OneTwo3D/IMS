@@ -128,6 +128,15 @@ test('the hop gate refuses everything but a GET to exactly the stock list of one
   assert.equal(mintsoftReadHopRefusal(sub, { method: 'GET', url: new URL('https://api.example.test/api/Product/List?PageNo=1&Limit=100'), redirectCount: 0 }), 'path')
 })
 
+// [mutation: the connector's read classification dropped from the gate]
+test('the gate also asks the connector\'s own read classification: a path the allow-list does not list as a read is refused even when it is spelled like one of the two', () => {
+  const base = new URL('https://api.example.test')
+  const hop = { method: 'GET', url: new URL('https://api.example.test/api/Product/List?PageNo=1&Limit=100'), redirectCount: 0 }
+  assert.equal(mintsoftReadHopRefusal(base, hop), null)
+  assert.equal(mintsoftReadHopRefusal(base, hop, () => ({ class: 'write', label: 'x' })), 'path', 'the allow-list says write')
+  assert.equal(mintsoftReadHopRefusal(base, { ...hop, url: new URL('https://api.example.test/api/Product/StockLevels?WarehouseId=6') }, (_method, path) => (path.endsWith('StockLevels') ? { class: 'write', label: 'x' } : { class: 'read', label: 'y' })), 'path')
+})
+
 // [mutation: the hopGate not handed to the seam / refuseRedirects removed]
 test('the seam is handed the gate and refuses redirects: a POST or /api/Auth hop is refused through the gate it was given', async () => {
   let seamOptions: Parameters<typeof import('../../lib/security/connector-fetch.ts').connectorFetch>[2] | undefined
@@ -282,7 +291,7 @@ test('the Mintsoft credentials: settings rows and the connection in a READ ONLY 
       assert.deepEqual(await readMintsoftPackCredentials(spy, {}), { ok: false, reason: 'VENDOR_AUTH_REFUSED' }, String(mode))
       assert.equal(spy.sent.at(-1), 'ROLLBACK')
     }
-    const bad: Array<[string, Row[] | Error, Row[]?, string?, string]> = [
+    const bad: Array<[string, Row[] | Error, Row[] | undefined, string | undefined, string]> = [
       ['no key', [rows[0]!, rows[2]!], undefined, undefined, 'VENDOR_AUTH_REFUSED'], ['a blank key', [rows[0]!, { key: 'mintsoft_static_api_key', value: '   ' }, rows[2]!], undefined, undefined, 'VENDOR_AUTH_REFUSED'],
       ['no client id', [rows[0]!, rows[1]!], undefined, undefined, 'SOURCE_UNREADABLE'], ['a client id of zero', [rows[0]!, rows[1]!, { key: 'mintsoft_client_id', value: '0' }], undefined, undefined, 'SOURCE_UNREADABLE'],
       ['a client id with letters', [rows[0]!, rows[1]!, { key: 'mintsoft_client_id', value: '89a' }], undefined, undefined, 'SOURCE_UNREADABLE'], ['a repeated row', [...rows, rows[0]!], undefined, undefined, 'SOURCE_UNREADABLE'],

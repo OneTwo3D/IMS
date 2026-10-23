@@ -85,7 +85,7 @@ export async function readMintsoftPackCredentials(client: MintsoftQueryClient, e
 const DIGITS = /^[0-9]{1,9}$/
 
 /** The decision the hop gate makes for one hop. A string refuses the hop (nothing is sent). Exported so a test drives it directly. */
-export function mintsoftReadHopRefusal(base: URL, hop: { method: string; url: URL; redirectCount: number }): string | null {
+export function mintsoftReadHopRefusal(base: URL, hop: { method: string; url: URL; redirectCount: number }, classify: typeof classifyMintsoftRequest = classifyMintsoftRequest): string | null {
   if (hop.redirectCount !== 0) return 'redirect'
   if (hop.method !== 'GET') return 'method'
   if (hop.url.origin !== base.origin || hop.url.username || hop.url.password || hop.url.hash) return 'origin'
@@ -94,7 +94,7 @@ export function mintsoftReadHopRefusal(base: URL, hop: { method: string; url: UR
   const relative = hop.url.pathname.slice(prefix.length)
   // Two exact paths, AND the connector's own read classification must agree (a path the allow-list does not list is a write).
   const names = relative === '/api/Product/StockLevels' ? ['WarehouseId'] : relative === '/api/Product/List' ? ['PageNo', 'Limit'] : null
-  if (names === null || classifyMintsoftRequest('GET', relative).class !== 'read') return 'path'
+  if (names === null || classify('GET', relative).class !== 'read') return 'path'
   const seen = new Map<string, string>()
   for (const [name, value] of hop.url.searchParams) {
     if (!names.includes(name) || seen.has(name) || !DIGITS.test(value)) return 'parameter'

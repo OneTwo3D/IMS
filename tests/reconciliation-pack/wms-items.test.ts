@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
-import { bindingSignature, classifyWmsBindings } from '../../lib/reconciliation-pack/wms-items.ts'
+import { bindingSignature, classifyWmsBindings, runWmsItem } from '../../lib/reconciliation-pack/wms-items.ts'
 import { runVendorItem, type VendorItemContext } from '../../lib/reconciliation-pack/vendor-items.ts'
 import type { ItemInput } from '../../lib/reconciliation-pack/report.ts'
 import type { CarriedDifference } from '../../lib/reconciliation-pack/compare.ts'
@@ -283,6 +283,13 @@ test('R1 IS TOTAL AND OPT-IN: without the flag nothing is read and no port or IM
     const item = await runVendorItem('R1', { ...off.ctx, vendorReads: vendorReads as never })
     assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['VENDOR_READS_OFF']])
     assert.equal(item.sources, undefined)
+  }
+  assert.equal(off.port.calls.length, 0)
+  assert.equal(off.ims.calls.length, 0)
+  // The module guards itself too (the dispatcher's own check is a second, independent one).
+  for (const vendorReads of [undefined, false, 'true', 1] as const) {
+    const direct = await runWmsItem({ vendorReads: vendorReads as never, wms: off.ctx.vendor!.wms!, ims: off.ctx.ims, wmsOptions: { sleep: noSleep }, settling: { carried: new Map(), usable: true, stamp: S1 } })
+    assert.deepEqual([direct.outcome, direct.reasons], ['inconclusive', ['VENDOR_READS_OFF']])
   }
   assert.equal(off.port.calls.length, 0)
   assert.equal(off.ims.calls.length, 0)
