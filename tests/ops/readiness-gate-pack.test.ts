@@ -160,8 +160,8 @@ test('R12 reads the ledger as of its cycle date: a fresh report about an old dat
   assert.equal(at('2026-10-08'), 'unreadable', 'today, not yet ended')
   assert.equal(at('2026-10-07', new Date('2026-10-07T23:00:00.000Z')), 'unreadable', 'read before its day ended')
   for (const bad of ['2026-02-30', '20261007', '', 'yesterday', null]) {
-    const record = { ...packRecord('P1', { items: { [id]: packPass(id) } }), asOf: bad as never }
-    assert.equal(assessPackItem({ record }, id, ctx()).kind, 'unreadable', JSON.stringify(bad))
+    const record = { ...packRecord('P1', { items: { R12: packPass('R12') } }), asOf: bad as never }
+    assert.equal(assessPackItem({ record }, 'R12', ctx()).kind, 'unreadable', JSON.stringify(bad))
   }
   // The monthly age of the report itself still applies.
   const limit = PACK_CADENCE_MAX_AGE_MS.monthly

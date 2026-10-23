@@ -86,7 +86,7 @@ test('[reconciliation pack] every section reads the seeded rows from a real data
   const { readers } = await load()
   try {
     const s = await seed()
-    const read = await withClient((client) => readers.readImsSnapshot(client, { sections: [...readers.IMS_SECTIONS], asOf: '2026-10-19' }))
+    const read = await withClient((client) => readers.readImsSnapshot(client, { sections: [...readers.IMS_SECTIONS], asOf: '2026-10-19', vatWindow: { from: '2026-10-01', toExclusive: '2026-11-01' } }))
     assert.ok(read.ok, JSON.stringify(read))
     if (!read.ok) return
     for (const id of readers.IMS_SECTIONS) assert.ok(read.sections[id]?.ok, `${id}: ${JSON.stringify(read.sections[id])}`)
@@ -194,6 +194,48 @@ test('[reconciliation pack] pg_control_system() answers an account that is not a
 
 // Rows of this test carry their own prefix, so the sections test above (which counts only rows starting with TAG) is unaffected.
 const XP = `RCXP${process.pid}`
+
+const VP = `RCVR${process.pid}`
+test('[reconciliation pack] the vat section reads the sales tax per month and rate from the real tables: invoice-instant bounds, cancelled and archived left out, the Xero report types, the shipping account and the foreign order rates (column names proven)', { skip: !RUN }, async () => {
+  const { readers, db } = await load()
+  const sql = (text: string, ...values: unknown[]) => db.$executeRawUnsafe(text, ...values)
+  const savedShipping = await withClient((client) => client.query(`SELECT value FROM settings WHERE key = 'xero_shipping_account'`))
+  const order = async (n: string, status: string, invoiced: string | null, tax: string, extra: { archived?: boolean; currency?: string; fx?: string } = {}) => {
+    await sql(`INSERT INTO sales_orders (id, status, currency, "fxRateToBase", "subtotalForeign", "totalForeign", "subtotalBase", "totalBase", "invoicedAt", archived, "updatedAt") VALUES ($1, $2::"SalesOrderStatus", $3, $4::numeric, 1, 1, 1, 1, $5::timestamp, $6, now())`, `${VP}-o${n}`, status, extra.currency ?? 'GBP', extra.fx ?? '1', invoiced, extra.archived ?? false)
+    await sql(`INSERT INTO sales_order_lines (id, "orderId", description, qty, "unitPriceForeign", "unitPriceBase", "taxRateId", "taxBase", "totalForeign", "totalBase") VALUES ($1, $2, 'x', 1, 1, 1, $3, $4::numeric, 1, 1)`, `${VP}-l${n}`, `${VP}-o${n}`, `${VP}-t`, tax)
+  }
+  try {
+    await sql(`INSERT INTO tax_rates (id, name, rate, accounting_tax_type, "countryCode", reporting_category, "updatedAt") VALUES ($1, 'x', 0.2, 'OUTPUT2', 'GB', 'DOMESTIC', now())`, `${VP}-t`)
+    await order('1', 'PROCESSING', '2026-09-30 23:59:59', '10.50')
+    await order('2', 'COMPLETED', '2026-09-01 00:00:00', '4.25')
+    await order('3', 'PROCESSING', '2026-10-01 00:00:00', '99')
+    await order('4', 'PROCESSING', '2026-08-31 23:59:59.999', '98')
+    await order('5', 'CANCELLED', '2026-09-10 10:00:00', '97')
+    await order('6', 'PROCESSING', '2026-09-10 10:00:00', '96', { archived: true })
+    await order('7', 'PROCESSING', null, '95')
+    await order('8', 'PROCESSING', '2026-09-15 10:00:00', '1.00', { currency: 'EUR', fx: '1.2500' })
+    await sql(`INSERT INTO shopping_order_links (id, "orderId", connector, "externalOrderId", "updatedAt") VALUES ($1, $2, 'woocommerce', $3, now())`, `${VP}-k8`, `${VP}-o8`, `${VP}-ext8`)
+    await sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ('xero_shipping_account', ' 260 ', now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`)
+    const read = await withClient((client) => readers.readImsSnapshot(client, { sections: ['vat'], vatWindow: { from: '2026-09-01', toExclusive: '2026-10-01' } }))
+    assert.ok(read.ok, JSON.stringify(read))
+    const section = read.sections.vat
+    assert.ok(section?.ok, JSON.stringify(section))
+    const mine = section.value.sales.filter((row) => row.taxRateId === `${VP}-t`)
+    // September, this rate: orders 1, 2 and 8 (10.50 + 4.25 + 1.00); the instant bounds are inclusive below and exclusive above, a cancelled, an archived and an un-invoiced order are not in it.
+    assert.deepEqual(mine, [{ period: '2026-09', taxRateId: `${VP}-t`, taxBase: '15.7500', lines: 3 }])
+    assert.equal(section.value.shippingAccount, '260')
+    assert.equal(section.value.baseCurrency, 'GBP')
+    assert.deepEqual(section.value.wooFx.filter((row) => row.externalOrderId === `${VP}-ext8`), [{ externalOrderId: `${VP}-ext8`, currency: 'EUR', fxRateToBase: '1.25000000' }])
+    assert.ok(section.value.xeroReportTypes.every((row) => typeof row.taxType === 'string'))
+  } finally {
+    await sql(`DELETE FROM shopping_order_links WHERE id LIKE '${VP}%'`)
+    await sql(`DELETE FROM sales_order_lines WHERE id LIKE '${VP}%'`)
+    await sql(`DELETE FROM sales_orders WHERE id LIKE '${VP}%'`)
+    await sql(`DELETE FROM tax_rates WHERE id LIKE '${VP}%'`)
+    if (savedShipping.rows[0]) await sql(`UPDATE settings SET value = $1 WHERE key = 'xero_shipping_account'`, savedShipping.rows[0].value)
+    else await sql(`DELETE FROM settings WHERE key = 'xero_shipping_account'`)
+  }
+})
 
 test('[reconciliation pack] xeroPostings reads the P0 record and every row that could be a write to Xero from the real tables (column names proven)', { skip: !RUN }, async () => {
   const { readers, db } = await load()
