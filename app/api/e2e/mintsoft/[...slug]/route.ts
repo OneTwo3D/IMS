@@ -14,7 +14,10 @@ type FakeMintsoftStockLine = {
   warehouseId: string | null
   clientId: number | null
   sku: string
+  /** AVAILABLE (Mintsoft `Level`). */
   level: number
+  /** ON HAND (Mintsoft `TotalStockLevel`); defaults to `level` when the spec gives none. */
+  totalStockLevel: number
   preOrderable: boolean
   bundle: boolean
   lowStockLevel: number
@@ -196,6 +199,7 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
             clientId: recordLine?.clientId == null ? null : asNumber(recordLine.clientId, 0),
             sku,
             level: asNumber(recordLine?.level, 0),
+            totalStockLevel: asNumber(recordLine?.totalStockLevel, asNumber(recordLine?.level, 0)),
             preOrderable: asBoolean(recordLine?.preOrderable, true),
             bundle: asBoolean(recordLine?.bundle, false),
             lowStockLevel: asNumber(recordLine?.lowStockLevel, 0),
@@ -610,6 +614,7 @@ export async function GET(
         ClientId: line.clientId ?? 0,
         SKU: line.sku,
         Level: line.level,
+        TotalStockLevel: line.totalStockLevel,
         PreOrderable: line.preOrderable ?? true,
         Bundle: line.bundle ?? false,
         LowStockLevel: line.lowStockLevel ?? 0,

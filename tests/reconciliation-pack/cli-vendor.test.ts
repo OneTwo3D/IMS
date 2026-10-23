@@ -94,7 +94,6 @@ test('WITHOUT --vendor-reads-only the whole command makes NO request, reads NO c
   const r = rig(double.base)
   let wooTouched = 0
   r.deps.woo = { get: async () => { wooTouched += 1; return { ok: false } } }
-  r.deps.xeroTaxTypes = async () => { wooTouched += 1; return null }
   for (const args of [argv(scratchDir(bases)), ['--phase', 'P1', '--as-of', D, '--report-dir', scratchDir(bases)]]) {
     assert.equal(await run(r, args), 5)
     assert.equal(line(r, 'R9'), 'R9 inconclusive VENDOR_READS_OFF')

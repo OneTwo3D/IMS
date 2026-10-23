@@ -166,7 +166,7 @@ export const READ_SYNC_STREAMS: readonly ReadSyncStreamDef[] = [
     source: { kind: 'setting', key: XERO_TAX_RATE_LAST_SUCCESS_SETTING },
     maxAge: { kind: 'fixed', ms: 6 * HOUR_MS },
     cadence: 'hourly (the xero-tax-rate-drift job)',
-    successMeans: 'the sweep read the Xero tax rates (or found no IMS tax rates to compare) and stored its result; a sweep that found no drift counts',
+    successMeans: 'the sweep read the full Xero tax-rate list, validated every row and stored the list with its header row (and its drift result) in one transaction; a sweep that found no drift counts, and a response that was empty, partial or malformed does not',
     rationale: 'six missed hourly runs, long enough to ride out a Xero outage or rate-limit window',
     alarm: 'read-sync-liveness',
   },

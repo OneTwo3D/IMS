@@ -76,6 +76,8 @@ async function wipe(db: Deps['db']) {
   await db.setting.deleteMany({ where: { key: { in: [MAP_KEY, STAMP_KEY, 'xero_sync_enabled', SNAPSHOT_KEY, CHECKED_KEY, PLUGIN_KEY] } } })
   await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
   await db.accountingAccount.deleteMany({ where: { connector: 'xero' } })
+  await db.xeroTaxRateList.deleteMany({})
+  await db.xeroTaxRate.deleteMany({})
 }
 
 /** Bound to org A with A's mapping and A's cached chart, stamped as A's, Xero plugin on. */
@@ -122,6 +124,8 @@ function parkedFetch(payload: unknown) {
   fetchHook = async () => { entered(); await gate; return payload }
   return { entered: enteredPromise, release }
 }
+/** A well-formed GET /TaxRates body (the master store refuses anything else, an empty list included). */
+const taxRatesBody = (run: string) => ({ TaxRates: [{ TaxType: `OUT-${run}`, Name: `Rate ${run}`, Status: 'ACTIVE', TaxComponents: [{ Name: 'VAT', Rate: 20 }] }] })
 const immediateFetch = (payload: unknown) => { fetchHook = async () => payload }
 
 const chartRows = async (db: Deps['db']) => db.accountingAccount.count({ where: { connector: 'xero' } })
@@ -204,16 +208,18 @@ test('[o3d-6thk1] DRIFT SNAPSHOT: a sweep whose fetch straddles a rebind does no
 
   // Control first: no rebind, the snapshot and the last-checked stamp are written.
   await seedBoundTo(deps.db, A, run)
-  immediateFetch({ TaxRates: [] })
+  immediateFetch(taxRatesBody(run))
   await deps.drift.runXeroTaxRateDriftSweep()
   assert.notEqual(await snapshotNow(), null, 'CONTROL: the snapshot is written when nothing moved')
   assert.notEqual(await checkedNow(), null)
+  assert.equal(await deps.db.xeroTaxRate.count({ where: { tenantId: A } }), 1, 'CONTROL: the master list is written when nothing moved')
+  assert.equal(await deps.db.xeroTaxRateList.count({ where: { tenantId: A } }), 1)
 
   await seedBoundTo(deps.db, A, run)
-  // The sweep only fetches when IMS has a rate with an active component to compare, so give it one.
+  // Give IMS a rate with an active component, so the drift comparison has something to record as well.
   const driftRate = await deps.db.taxRate.create({ data: { name: `drift-${run}`, rate: '0.2', components: { create: [{ name: 'c', rate: '0.2' }] } }, select: { id: true } })
   createdRates.push(driftRate.id)
-  const fetch = parkedFetch({ TaxRates: [] })
+  const fetch = parkedFetch(taxRatesBody(run))
   const sweep = deps.drift.runXeroTaxRateDriftSweep()
   await fetch.entered
   const binding = await startBinding(deps, B, run)
@@ -224,6 +230,8 @@ test('[o3d-6thk1] DRIFT SNAPSHOT: a sweep whose fetch straddles a rebind does no
 
   assert.equal(await snapshotNow(), null, 'no snapshot of the previous organisation\'s rates after the rebind')
   assert.equal(await checkedNow(), null, 'and the last-checked stamp was not advanced')
+  assert.equal(await deps.db.xeroTaxRate.count(), 0, 'and no row of the previous organisation\'s tax-rate list was stored')
+  assert.equal(await deps.db.xeroTaxRateList.count(), 0, 'nor its header')
 })
 
 async function seedUnmappedRate(deps: Deps, run: string) {

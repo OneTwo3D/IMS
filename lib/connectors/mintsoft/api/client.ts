@@ -23,7 +23,7 @@ import {
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,
   normalizeMintsoftReturn,
-  normalizeMintsoftStockLine,
+  normalizeMintsoftStockLevels,
   normalizeMintsoftWarehouse,
 } from './normalizers'
 
@@ -247,9 +247,9 @@ export async function fetchMintsoftStockLevels(externalWarehouseId: string): Pro
     throw new Error(result.error)
   }
 
-  return extractMintsoftArrayPayload(result.data)
-    .map((item) => normalizeMintsoftStockLine(item))
-    .filter((item): item is WmsStockLine => Boolean(item))
+  // Fails closed (throws) on a malformed body, an unreadable row, a row without TotalStockLevel
+  // (on hand) or a duplicate SKU: see normalizeMintsoftStockLevels (o3d-4pzls).
+  return normalizeMintsoftStockLevels(result.data)
 }
 
 export async function fetchMintsoftProduct(externalProductId: string): Promise<WmsProductRef | null> {

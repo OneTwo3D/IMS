@@ -8,7 +8,6 @@ const ASN_ARRAY_PAYLOAD_KEYS = [...ARRAY_PAYLOAD_KEYS, 'lines', 'Lines', 'asnLin
 const WAREHOUSE_ID_KEYS = ['warehouseId', 'WarehouseId', 'id', 'Id', 'ID']
 const WAREHOUSE_NAME_KEYS = ['name', 'Name', 'warehouseName', 'WarehouseName', 'description', 'Description', 'label', 'Label']
 const STOCK_SKU_KEYS = ['sku', 'SKU', 'productSku', 'ProductSku', 'productCode', 'ProductCode', 'itemCode', 'ItemCode', 'code', 'Code']
-const STOCK_QTY_KEYS = ['level', 'Level', 'quantity', 'Quantity', 'qty', 'Qty', 'stockLevel', 'StockLevel', 'stockQuantity', 'StockQuantity', 'available', 'Available', 'freeStock', 'FreeStock']
 const PRODUCT_ID_KEYS = ['productId', 'ProductId', 'id', 'Id', 'ID']
 const PRODUCT_NAME_KEYS = ['name', 'Name', 'productName', 'ProductName', 'description', 'Description']
 const PRODUCT_BARCODE_KEYS = ['ean', 'EAN', 'barcode', 'Barcode', 'upc', 'UPC', 'eanCode', 'EANCode']
@@ -137,19 +136,86 @@ export function normalizeMintsoftWarehouse(value: unknown): WmsWarehouseRef | nu
   return { externalId, name }
 }
 
-export function normalizeMintsoftStockLine(value: unknown): WmsStockLine | null {
-  const record = asRecord(value)
-  if (!record) return null
-
-  const sku = getFirstString(record, STOCK_SKU_KEYS)
-  const quantity = getFirstNumber(record, STOCK_QTY_KEYS)
-  if (!sku || quantity == null) return null
-
-  return {
-    sku,
-    quantity,
-    raw: record,
+/**
+ * MINTSOFT `GET /api/Product/StockLevels?WarehouseId=` — ON HAND vs AVAILABLE (o3d-4pzls).
+ *
+ * Each row is `{ SKU, ProductId, WarehouseId, ClientId, Level, TotalStockLevel, LowStockLevel,
+ * PreOrderable, Bundle, Breakdown, LastUpdated }`. Owner-confirmed in the Mintsoft UI
+ * (2026-10-23) and seen in a live read-only probe of two warehouses (2 x 2386 rows, `Level <=
+ * TotalStockLevel` on every row, differing on 13 SKUs, e.g. SKU 129552751 Level 28 / Total 36):
+ *   - `TotalStockLevel` = physical ON HAND (includes units allocated to open orders)
+ *   - `Level`           = AVAILABLE (on hand minus allocated to open orders)
+ * The first version picked `Level` first from a fallback list, so IMS (whose
+ * `StockLevel.quantity` is on hand, reservations separate) was compared with AVAILABLE and
+ * every allocated unit read as a shortfall. Both fields are now read by EXACT name, with no
+ * fallback list, and a row that cannot supply a trustworthy `TotalStockLevel` throws.
+ *
+ * CONSUMER AUDIT (what each reader of the stock line means, and what changed):
+ *   lib/connectors/mintsoft/sync/stock-sync.ts  wmsQty = line.onHand (compared with IMS
+ *     stock_levels.quantity -> ON HAND; align-up/down, thresholds, discrepancy rows, activity
+ *     log, UNMAPPED/MISSING_IN_IMS wmsValue)                       CHANGED: Level -> TotalStockLevel
+ *   same file, wms_stock_snapshots.externalQty (read back by collectMissingInWmsCandidates and
+ *     compared with IMS quantity for "missing in WMS") -> ON HAND  CHANGED: follows wmsQty
+ *   lib/connectors/mintsoft/sync/stock-sync-helpers.ts consolidateMintsoftStockLines /
+ *     collectMissingInWmsCandidates / hasMintsoftThresholdBreach: pure on-hand arithmetic
+ *                                                                  CHANGED: duplicates throw, field rename
+ *   lib/connectors/wms/types.ts WmsStockLine / WmsConnector.fetchStockLevels: generic contract,
+ *     connector-agnostic; `onHand` + nullable `available`          CHANGED: `quantity` removed
+ *   tests/helpers/fictitious-wms-connector.ts (second-connector seam double)  CHANGED: new shape
+ *   app/api/e2e/mintsoft/[...slug]/route.ts (fake Mintsoft for e2e)  CHANGED: also emits TotalStockLevel
+ *   wms-watchdog cron: freshness of the last successful sync only, reads no quantity   NO CHANGE
+ *   reconciliation pack R1 ("IMS stock_levels equal Mintsoft on-hand"): declarative; its claim
+ *     was already on-hand and is now true of the sync's figure    NO CHANGE
+ *   first-load: operator-supplied 3PL export file, never this API  NO CHANGE
+ *   ShipHero: removed from the repo (docs/archive/shiphero-connector-removal.md)  N/A
+ * `available` is carried for diagnostics only; nothing may compare it with IMS on hand.
+ */
+function readStockInteger(record: Record<string, unknown>, field: string, where: string): number | undefined {
+  if (!(field in record) || record[field] === undefined) return undefined
+  const value = record[field]
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Mintsoft StockLevels ${where}: ${field} must be a non-negative integer number, got ${JSON.stringify(value)}`)
   }
+  return value
+}
+
+export function normalizeMintsoftStockLine(value: unknown, index = 0): WmsStockLine {
+  const record = asRecord(value)
+  if (!record) {
+    throw new Error(`Mintsoft StockLevels row ${index}: expected an object, got ${value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value}`)
+  }
+  const rawSku = record.SKU
+  const sku = typeof rawSku === 'string' ? rawSku.trim() : ''
+  if (!sku) {
+    throw new Error(`Mintsoft StockLevels row ${index}: SKU must be a non-empty string, got ${JSON.stringify(rawSku)}`)
+  }
+  const where = `row ${index} (SKU ${sku})`
+
+  const onHand = readStockInteger(record, 'TotalStockLevel', where)
+  if (onHand === undefined) {
+    throw new Error(`Mintsoft StockLevels ${where}: TotalStockLevel (on hand) is missing; refusing to fall back to Level (available) or 0`)
+  }
+  const availableRead = readStockInteger(record, 'Level', where)
+  const available = availableRead === undefined ? null : availableRead
+  if (available !== null && available > onHand) {
+    throw new Error(`Mintsoft StockLevels ${where}: Level (available ${available}) exceeds TotalStockLevel (on hand ${onHand}); the two fields no longer mean what the connector assumes`)
+  }
+
+  return { sku, onHand, available, raw: record }
+}
+
+/** Normalise a whole StockLevels response, failing closed on any unreadable row or duplicate SKU. */
+export function normalizeMintsoftStockLevels(data: unknown): WmsStockLine[] {
+  const rows = extractMintsoftArrayPayloadStrict(data, 'StockLevels')
+  const seen = new Set<string>()
+  return rows.map((row, index) => {
+    const line = normalizeMintsoftStockLine(row, index)
+    if (seen.has(line.sku)) {
+      throw new Error(`Mintsoft StockLevels row ${index}: duplicate SKU "${line.sku}" in one response; refusing to merge or pick one`)
+    }
+    seen.add(line.sku)
+    return line
+  })
 }
 
 export function normalizeMintsoftProduct(value: unknown): WmsProductRef | null {

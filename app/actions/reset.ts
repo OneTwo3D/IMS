@@ -255,6 +255,8 @@ async function clearFullScope() {
   await db.externalWmsBinding.deleteMany({})
   await db.wmsConnection.deleteMany({})
   await db.accountingAccount.deleteMany({})
+  await db.xeroTaxRateList.deleteMany({})
+  await db.xeroTaxRate.deleteMany({})
 
   // Core company configuration / reference data
   await db.purchaseUnit.deleteMany({})

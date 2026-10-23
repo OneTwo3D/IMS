@@ -4,6 +4,7 @@ import test from 'node:test'
 
 import { RUN_STATUSES } from '../../lib/first-load/apply/constants.ts'
 import { FIRST_LOAD_RUN_STATUSES, WDRAW_APPROVED_STATUS_KEY, WDRAW_DEFAULT_APPROVED_STATUS, WDRAW_DEFAULT_SUBMITTED_STATUS, WDRAW_SUBMITTED_STATUS_KEY } from '../../lib/reconciliation-pack/constants.ts'
+import { digestTaxRateList, type NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-list.ts'
 import { alignmentState, classifyPopulation, readImsSnapshot, statementAllowed, type ImsQueryClient, type PopulationBoundaries } from '../../lib/reconciliation-pack/ims-readers.ts'
 
 /** A scripted connection: answers by the statement's text, records every statement. */
@@ -60,7 +61,7 @@ test('a statement that is not a SELECT or a fixed SET LOCAL, or holds two statem
   // The wrapper is exercised through the only door there is: a section whose SQL is wrong. Prove the allowlist by making the
   // fake observe every statement and by checking that none of the real sections sends anything else, across ALL sections.
   const client = fake(() => [])
-  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'], asOf: '2026-10-19' })
+  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'], asOf: '2026-10-19' })
   for (const sql of client.sent) assert.ok(/^(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|ROLLBACK|SELECT\b|SET LOCAL (statement_timeout|idle_in_transaction_session_timeout) = \d+$|SET LOCAL TIME ZONE 'UTC'$)/.test(sql) && !sql.includes(';'), sql)
   assert.ok(!client.sent.some((s) => /\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|GRANT)\b/i.test(s)))
 })
@@ -295,4 +296,105 @@ test('storefrontStatus: the withdrawal pair is read as the importer reads it - t
 test('PIN: the withdrawal keys and defaults the pack reads are the connector\'s own', () => {
   const source = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   for (const needle of [`WDRAW_SUBMITTED_STATUS_KEY = '${WDRAW_SUBMITTED_STATUS_KEY}'`, `WDRAW_APPROVED_STATUS_KEY = '${WDRAW_APPROVED_STATUS_KEY}'`, `DEFAULT_WDRAW_SUBMITTED_STATUS = '${WDRAW_DEFAULT_SUBMITTED_STATUS}'`, `DEFAULT_WDRAW_APPROVED_STATUS = '${WDRAW_DEFAULT_APPROVED_STATUS}'`, 'normaliseStatus(map.get(WDRAW_SUBMITTED_STATUS_KEY) || DEFAULT_WDRAW_SUBMITTED_STATUS)', 'normaliseStatus(map.get(WDRAW_APPROVED_STATUS_KEY) || DEFAULT_WDRAW_APPROVED_STATUS)']) assert.ok(source.includes(needle), needle)
+})
+
+// ---- the stored Xero tax-rate list (R13's Xero leg) ----------------------------------------------------------------------------
+
+const xeroRow = (taxType: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({
+  taxType, name: `Rate ${taxType}`, status: 'ACTIVE', reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000',
+  components: [{ name: 'VAT', rate: '20.000000', compound: false, nonRecoverable: false }],
+  canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true }, ...over,
+})
+const FETCHED = '2026-10-23T08:00:00.000Z'
+/** The rows as the database hands them back to the reader. */
+const dbRow = (r: NormalisedXeroTaxRate, over: Record<string, unknown> = {}) => ({
+  tax_type: r.taxType, name: r.name, status: r.status, report: r.reportTaxType, effective: r.effectiveRate, display: r.displayTaxRate, components: r.components,
+  c_assets: r.canApply.assets, c_equity: r.canApply.equity, c_expenses: r.canApply.expenses, c_liabilities: r.canApply.liabilities, c_revenue: r.canApply.revenue, fetched: FETCHED, ...over,
+})
+function xeroFake(opts: { tokens?: Array<Record<string, unknown>>; header?: Array<Record<string, unknown>> | 'proper'; rows?: Array<Record<string, unknown>> } = {}) {
+  const good = [xeroRow('INPUT2'), xeroRow('OUTPUT2', { status: 'DELETED' })]
+  const rows = opts.rows ?? good.map((r) => dbRow(r))
+  const header = opts.header === undefined || opts.header === 'proper' ? [{ fetched: FETCHED, row_count: 2, digest: digestTaxRateList('tenant-A', good) }] : opts.header
+  const client = fake((sql) => {
+    if (/FROM accounting_tokens/.test(sql)) return opts.tokens ?? [{ tenant: 'tenant-A' }]
+    if (/FROM xero_tax_rate_lists/.test(sql)) return header
+    if (/FROM xero_tax_rates/.test(sql)) return rows
+    return []
+  })
+  return client
+}
+const xeroSection = async (client: ReturnType<typeof xeroFake>) => {
+  const read = await readImsSnapshot(client, { sections: ['xeroTaxRates'] })
+  assert.ok(read.ok)
+  return read.ok ? read.sections.xeroTaxRates : undefined
+}
+
+// [mutation: the proof is skipped and the rows are returned as proven]
+test('the stored Xero list is PROVEN only for a header that exists for the connected organisation, whose count and digest match the rows read', async () => {
+  const client = xeroFake()
+  assert.deepEqual(await xeroSection(client), { ok: true, value: { state: 'proven', tenantId: 'tenant-A', fetchedAt: FETCHED, taxTypes: [{ taxType: 'INPUT2', status: 'ACTIVE' }, { taxType: 'OUTPUT2', status: 'DELETED' }] } })
+  assert.ok(client.sent.some((s) => /FROM xero_tax_rate_lists WHERE connector = 'xero' AND "tenantId" = \$1/.test(s)), 'the header is asked for by organisation')
+  assert.ok(client.sent.some((s) => /FROM xero_tax_rates WHERE connector = 'xero' AND "tenantId" = \$1/.test(s)), 'and so are the rows')
+})
+
+test('the stored Xero list is UNPROVEN, with a closed cause, for a missing header, another organisation, a count or digest mismatch, a mixed read and a malformed row', async () => {
+  const good = [xeroRow('INPUT2'), xeroRow('OUTPUT2', { status: 'DELETED' })]
+  const cause = async (client: ReturnType<typeof xeroFake>) => { const section = await xeroSection(client); return section && section.ok ? (section.value as { cause?: string }).cause ?? 'proven' : `unreadable:${section && !section.ok ? section.reason : '?'}` }
+  assert.equal(await cause(xeroFake({ tokens: [] })), 'NO_CONNECTION')
+  assert.equal(await cause(xeroFake({ tokens: [{ tenant: '  ' }] })), 'NO_CONNECTION')
+  assert.equal(await cause(xeroFake({ header: [] })), 'NO_HEADER', 'no header (the list of another organisation is never asked for)')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!)] })), 'COUNT_MISMATCH', 'a row missing')
+  assert.equal(await cause(xeroFake({ rows: [...good.map((r) => dbRow(r)), dbRow(xeroRow('EXTRA'))] })), 'COUNT_MISMATCH', 'a row added')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!, { name: 'edited' }), dbRow(good[1]!)] })), 'DIGEST_MISMATCH', 'a row edited')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!, { tax_type: 'SWAPPED' }), dbRow(good[1]!)] })), 'DIGEST_MISMATCH', 'IDENTITY SWAP: same count, one tax type swapped')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!, { c_revenue: false }), dbRow(good[1]!)] })), 'DIGEST_MISMATCH', 'a flag flipped')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!), dbRow(good[1]!, { fetched: '2026-10-22T08:00:00.000Z' })] })), 'MIXED_READ', 'rows from two reads')
+  assert.equal(await cause(xeroFake({ header: [{ fetched: FETCHED, row_count: 2, digest: 'a'.repeat(64) }] })), 'DIGEST_MISMATCH', 'a header that does not describe these rows')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!, { components: [{ name: 'VAT' }] }), dbRow(good[1]!)] })), 'MALFORMED_ROW')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!, { status: 'WHATEVER' }), dbRow(good[1]!)] })), 'MALFORMED_ROW')
+  assert.equal(await cause(xeroFake({ rows: [dbRow(good[0]!, { tax_type: 'bad type' }), dbRow(good[1]!)] })), 'MALFORMED_ROW')
+  assert.equal(await cause(xeroFake({ header: [{ fetched: 'yesterday', row_count: 2, digest: 'a'.repeat(64) }] })), 'unreadable:SOURCE_UNREADABLE', 'a read time that is not an instant: the section is unreadable')
+  // Structurally impossible states are unreadable, never proven: two connections, two headers.
+  assert.equal(await cause(xeroFake({ tokens: [{ tenant: 'tenant-A' }, { tenant: 'tenant-B' }] })), 'unreadable:DUPLICATE_KEY')
+  assert.equal(await cause(xeroFake({ header: [{ fetched: FETCHED, row_count: 2, digest: 'a'.repeat(64) }, { fetched: FETCHED, row_count: 2, digest: 'b'.repeat(64) }] })), 'unreadable:DUPLICATE_KEY')
+  // The same rows under another organisation's digest are not proven for this one.
+  const other = xeroFake({ header: [{ fetched: FETCHED, row_count: 2, digest: digestTaxRateList('tenant-B', good) }] })
+  assert.equal(await cause(other), 'DIGEST_MISMATCH')
+})
+
+test('more stored Xero rows than the cap is CAP_EXCEEDED for that section, never a shorter list', async () => {
+  const read = await readImsSnapshot(xeroFake(), { sections: ['xeroTaxRates'], rowCap: 1 })
+  assert.ok(read.ok && read.sections.xeroTaxRates!.ok === false && read.sections.xeroTaxRates!.reason === 'CAP_EXCEEDED')
+})
+
+// ---- the other places IMS names a Xero tax type -------------------------------------------------------------------------------
+
+function taxesFake(opts: { components?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>> } = {}) {
+  return fake((sql) => {
+    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', active: true, tax_type: 'OUTPUT2', country: 'GB', category: null }]
+    if (/FROM shopping_tax_rate_mappings/.test(sql)) return []
+    if (/FROM tax_rate_components/.test(sql)) return opts.components ?? []
+    if (/FROM settings/.test(sql)) return opts.settings ?? []
+    return []
+  })
+}
+const taxesOf = async (client: ReturnType<typeof taxesFake>) => { const read = await readImsSnapshot(client, { sections: ['taxes'] }); assert.ok(read.ok); return read.ok ? read.sections.taxes : undefined }
+
+// [mutation: the component or settings query dropped]
+test('the taxes section also reads every component accounting tax type and the two reverse-charge settings (trimmed; absent or blank is none)', async () => {
+  const client = taxesFake({ components: [{ id: 'c1', rate_id: 'r1', active: true, tax_type: 'COMP1' }, { id: 'c2', rate_id: 'r1', active: false, tax_type: 'COMP2' }], settings: [{ key: 'accounting_reverse_charge_sales_tax_type', value: ' ECOUTPUTSERVICES ' }] })
+  const section = await taxesOf(client)
+  assert.ok(section && section.ok)
+  if (!section || !section.ok) return
+  assert.deepEqual(section.value.componentTaxTypes, [{ id: 'c1', taxRateId: 'r1', active: true, accountingTaxType: 'COMP1' }, { id: 'c2', taxRateId: 'r1', active: false, accountingTaxType: 'COMP2' }])
+  assert.deepEqual(section.value.reverseCharge, { sales: 'ECOUTPUTSERVICES', purchase: '' })
+  assert.ok(client.sent.some((sql) => /FROM tax_rate_components WHERE accounting_tax_type IS NOT NULL ORDER BY id LIMIT/.test(sql)), 'every component that names a type is asked for')
+  assert.ok(client.sent.some((sql) => /FROM settings WHERE key IN \('accounting_reverse_charge_sales_tax_type', 'accounting_reverse_charge_purchase_tax_type'\)/.test(sql)))
+})
+
+test('a component of an unknown rate, a duplicate component and an unreadable setting make the taxes section unreadable (nothing guessed)', async () => {
+  const reason = async (c: ReturnType<typeof taxesFake>) => { const s = await taxesOf(c); return s && !s.ok ? s.reason : 'ok' }
+  assert.equal(await reason(taxesFake({ components: [{ id: 'c1', rate_id: 'ghost', active: true, tax_type: 'X' }] })), 'SOURCE_UNREADABLE')
+  assert.equal(await reason(taxesFake({ components: [{ id: 'c1', rate_id: 'r1', active: true, tax_type: 'X' }, { id: 'c1', rate_id: 'r1', active: true, tax_type: 'Y' }] })), 'DUPLICATE_KEY')
+  assert.equal(await reason(taxesFake({ settings: [{ key: 'accounting_reverse_charge_sales_tax_type', value: 5 }] })), 'SOURCE_UNREADABLE')
 })

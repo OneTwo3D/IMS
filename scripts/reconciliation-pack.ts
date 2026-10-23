@@ -57,8 +57,6 @@ export type PackCliDeps = {
   ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
   /** The WooCommerce port. Consulted ONLY with --vendor-reads-only; the default is the GET-only transport (woo-transport.ts). */
   woo?: WooGetPort
-  /** The stored, proven-complete Xero tax-type list. None exists in this build (U13), so the default is absent. */
-  xeroTaxTypes?: VendorPorts['xeroTaxTypes']
   /** Called last, whatever happened: closes the application's database client if the invariant run opened it. */
   disconnect: () => Promise<void>
 }
@@ -216,7 +214,6 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
     const vendor: VendorPorts | undefined = args.vendorReadsOnly
       ? {
         woo: deps.woo ?? createWooGetPort({ readCredentials: () => readStoredWooCredentials(deps) }),
-        xeroTaxTypes: deps.xeroTaxTypes,
       }
       : undefined
 

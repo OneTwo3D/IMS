@@ -227,7 +227,7 @@ Used for coverage and to find a SKU that holds stock in the 3PL but is missing f
 | --- | --- | --- |
 | `sku` | yes | Passed through as given (trimmed). |
 | `warehouseCode` | no | Passed through as given (trimmed). |
-| `qty` | yes | Plain decimal, zero or more. Rows for one SKU are summed. |
+| `qty` | yes | Plain decimal, zero or more. Rows for one SKU are summed. This is the 3PL's **on-hand** quantity (Mintsoft `TotalStockLevel`), not its available quantity (`Level`, on hand minus units allocated to open orders): a SKU whose units are all allocated still holds stock and must not read as zero. |
 
 ### Dataset: woo-products
 

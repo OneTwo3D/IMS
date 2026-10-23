@@ -108,17 +108,19 @@ export function isMintsoftBindingDue(
   return now.getTime() >= dueAt
 }
 
+/**
+ * Sort stock lines by SKU. It no longer MERGES duplicates: summing two rows for one SKU
+ * silently invents a quantity, so a duplicate fails closed here (the connector already rejects
+ * it at the response level; this is the second wall for any other producer of lines).
+ */
 export function consolidateMintsoftStockLines(lines: WmsStockLine[]): WmsStockLine[] {
   const bySku = new Map<string, WmsStockLine>()
 
   for (const line of lines) {
-    const existing = bySku.get(line.sku)
-    if (existing) {
-      existing.quantity += line.quantity
-      existing.raw = line.raw ?? existing.raw
-    } else {
-      bySku.set(line.sku, { ...line })
+    if (bySku.has(line.sku)) {
+      throw new Error(`Mintsoft stock lines: SKU "${line.sku}" appears more than once; refusing to merge duplicate rows.`)
     }
+    bySku.set(line.sku, { ...line })
   }
 
   return Array.from(bySku.values()).sort((left, right) => left.sku.localeCompare(right.sku))

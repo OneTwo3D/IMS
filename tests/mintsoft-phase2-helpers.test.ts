@@ -44,34 +44,6 @@ test('normalizeMintsoftWarehouse accepts common Mintsoft warehouse field variant
   assert.equal(normalizers.normalizeMintsoftWarehouse({ foo: 'bar' }), null)
 })
 
-test('normalizeMintsoftStockLine accepts common stock line field variants', () => {
-  assert.deepEqual(
-    normalizers.normalizeMintsoftStockLine({ SKU: 'ABC-1', FreeStock: '12.5' }),
-    {
-      sku: 'ABC-1',
-      quantity: 12.5,
-      raw: { SKU: 'ABC-1', FreeStock: '12.5' },
-    },
-  )
-  assert.deepEqual(
-    normalizers.normalizeMintsoftStockLine({ productCode: 'XYZ-2', stockLevel: 3 }),
-    {
-      sku: 'XYZ-2',
-      quantity: 3,
-      raw: { productCode: 'XYZ-2', stockLevel: 3 },
-    },
-  )
-  assert.deepEqual(
-    normalizers.normalizeMintsoftStockLine({ SKU: 'REALISTIC-3', Level: 9 }),
-    {
-      sku: 'REALISTIC-3',
-      quantity: 9,
-      raw: { SKU: 'REALISTIC-3', Level: 9 },
-    },
-  )
-  assert.equal(normalizers.normalizeMintsoftStockLine({ productCode: 'XYZ-2' }), null)
-})
-
 test('extractMintsoftAuthToken accepts common Mintsoft auth response variants', () => {
   assert.equal(
     auth.extractMintsoftAuthToken({
@@ -117,20 +89,6 @@ test('isMintsoftBindingDue and hasMintsoftThresholdBreach reflect phase 2 schedu
   assert.equal(
     stockSyncHelpers.hasMintsoftThresholdBreach(10, 12, { absoluteDelta: null, percentDelta: 15 }),
     true,
-  )
-})
-
-test('consolidateMintsoftStockLines merges duplicate SKUs and keeps the latest raw payload', () => {
-  assert.deepEqual(
-    stockSyncHelpers.consolidateMintsoftStockLines([
-      { sku: 'ABC', quantity: 2, raw: { first: true } },
-      { sku: 'ABC', quantity: 3, raw: { second: true } },
-      { sku: 'DEF', quantity: 1, raw: null },
-    ]),
-    [
-      { sku: 'ABC', quantity: 5, raw: { second: true } },
-      { sku: 'DEF', quantity: 1, raw: null },
-    ],
   )
 })
 

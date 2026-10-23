@@ -11,6 +11,7 @@
 
 import { computeTaxRateDrift, formatDriftLines, type ImsTaxRateProfile, type TaxRateDriftResult } from './tax-rate-drift'
 import type { XeroTaxRate } from './tax-rates'
+import { parseXeroTaxRateList, type NormalisedXeroTaxRate } from './tax-rate-list'
 
 export type DriftSweepItem = {
   taxRateId: string
@@ -49,6 +50,9 @@ export async function sweepTaxRateDrift(deps: TaxRateDriftSweepDeps): Promise<Ta
   // call every hour to compare nothing against them. That is 24 calls/day out of a cap of 1,000
   // per org per rolling 24h (Xero cut the free tier from 5,000 on 2026-03-02), bought with
   // nothing but the ~100ms the concurrency saved. o3d-e2j.
+  //
+  // (This holds for the DI sweep itself. The cron wiring, runXeroTaxRateDriftSweep, reads the list once up front because
+  // Xero is now the tax-rate master and the stored list must be kept current whether or not IMS has anything to compare.)
   const imsProfiles = await deps.loadImsProfiles()
   if (imsProfiles.length === 0) {
     // Still stamp the check: "we looked and there was nothing to compare" is a successful sweep,
@@ -105,19 +109,73 @@ export function buildDriftSnapshot(result: TaxRateDriftSweepResult): TaxRateDrif
   return entries
 }
 
+/** The refusal of a Xero tax-rate body that is not exactly the full, well-formed list. Nothing is stored and the stamp is not advanced. */
+export class XeroTaxRateListRefusedError extends Error {
+  constructor(reason: string) {
+    super(`The Xero tax-rate list was not stored (the previous list and the read-sync stamp are unchanged): ${reason}`)
+    this.name = 'XeroTaxRateListRefusedError'
+  }
+}
+
+/** The drift comparison's view of a validated list: what fetchXeroTaxRates has always returned (no DELETED or ARCHIVED rate). */
+export function driftViewOfList(rows: readonly NormalisedXeroTaxRate[]): XeroTaxRate[] {
+  return rows
+    .filter((row) => row.status !== 'DELETED' && row.status !== 'ARCHIVED')
+    .map((row) => ({
+      Name: row.name,
+      ReportTaxType: row.reportTaxType ?? undefined,
+      TaxComponents: row.components.map((c) => ({ Name: c.name, Rate: Number(c.rate), IsCompound: c.compound, IsNonRecoverable: c.nonRecoverable })),
+      Status: row.status === 'PENDING' ? undefined : row.status,
+    }))
+}
+
 /**
- * Wire the sweep to the real IMS database, the live Xero API, the activity log,
- * and the last-checked setting. Used by the cron route.
+ * Wire the sweep to the real IMS database, the live Xero API, the activity log, and the tax-rate master store. Used by the
+ * cron route.
+ *
+ * Xero is the tax-rate master, so every run now reads the FULL list (also when IMS has no rate to compare: the store and the
+ * read-sync stamp describe the list, not the comparison), validates every row strictly and, only then, replaces the stored list
+ * for the connected organisation, its header, the drift snapshot and the last-success stamp in ONE connection-fenced
+ * transaction. A body that fails validation is refused as a whole: the previous list stays, the stamp does not advance, and the
+ * run errors.
  */
 export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResult> {
   const { db } = await import('@/lib/db')
   const { logActivity } = await import('@/lib/activity-log')
-  const { fetchXeroTaxRates } = await import('./tax-rates')
+  const { fetchXeroTaxRatesBody } = await import('./tax-rates')
   const { captureXeroConnection, withXeroConnectionFence } = await import('./connection-fence')
+  const { replaceXeroTaxRateList } = await import('./tax-rate-store')
   // o3d-6thk1 round 3: the snapshot describes the organisation the rates were fetched from. Remember the
-  // connection BEFORE the fetch; if it moved, the snapshot is not written (and the last-checked stamp is not
+  // connection BEFORE the fetch; if it moved, nothing is written (and the last-checked stamp is not
   // advanced, so the next sweep runs against the organisation now connected).
   const connection = await captureXeroConnection()
+  if (connection === null) throw new XeroTaxRateListRefusedError('no Xero organisation is connected')
+
+  const body = await fetchXeroTaxRatesBody()
+  const parsed = parseXeroTaxRateList(body)
+  if (!parsed.ok) {
+    console.error(`[xero] tax-rate list refused: ${parsed.reason}`)
+    throw new XeroTaxRateListRefusedError(parsed.reason)
+  }
+  const fetchedRows = parsed.rows
+  // Keys this build does not know are dropped (not stored, not digested). Say so once per run, by NAME only, never a value.
+  const ignoredCount = parsed.ignored.body.length + parsed.ignored.row.length + parsed.ignored.component.length
+  if (ignoredCount > 0) {
+    console.warn(`[xero] tax-rate list: ignored unknown keys ${JSON.stringify(parsed.ignored)}`)
+    try {
+      await logActivity({
+        entityType: 'SYSTEM',
+        entityId: 'xero-tax-rate-list',
+        action: 'xero_tax_rate_unknown_fields',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `Xero returned tax-rate fields this version of IMS does not know and ignored (names only): ${[...parsed.ignored.body, ...parsed.ignored.row, ...parsed.ignored.component].join(', ')}`,
+        metadata: { ignored: parsed.ignored },
+      })
+    } catch (error) {
+      console.warn(`[xero] could not record the ignored tax-rate keys: ${String(error)}`)
+    }
+  }
 
   const result = await sweepTaxRateDrift({
     async loadImsProfiles() {
@@ -145,7 +203,7 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
         },
       }))
     },
-    fetchXeroTaxRates,
+    fetchXeroTaxRates: async () => driftViewOfList(fetchedRows),
     async recordDrift(item) {
       await logActivity({
         entityType: 'SYSTEM',
@@ -173,22 +231,24 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
   // duration-independent (no activity-log time-window heuristic) and fully
   // replaced each run, so a fixed rate drops out on the next completed sweep.
   const snapshot = JSON.stringify(buildDriftSnapshot(result))
-  const checkedAt = new Date().toISOString()
+  const checkedAt = new Date()
   const fenced = await withXeroConnectionFence(connection, async (tx) => {
     await tx.setting.upsert({
       where: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING },
       create: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING, value: snapshot },
       update: { value: snapshot },
     })
-    // Advance last-checked only after the snapshot has persisted (same transaction, written second), so the
-    // reader's freshness/staleness guard never treats a stale snapshot as current.
+    // The master list and its header, replaced in this same transaction (any failure rolls ALL of it back).
+    await replaceXeroTaxRateList(tx, { tenantId: connection.tenantId, fetchedAt: checkedAt, rows: fetchedRows })
+    // Advance last-checked only after the snapshot AND the list have persisted (same transaction, written last), so the
+    // reader's freshness/staleness guard never treats a stale snapshot or a stale list as current.
     await tx.setting.upsert({
       where: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING },
-      create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: checkedAt },
-      update: { value: checkedAt },
+      create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: checkedAt.toISOString() },
+      update: { value: checkedAt.toISOString() },
     })
   })
-  if (!fenced.ok) console.warn(`[xero] tax-rate drift snapshot discarded: ${fenced.error}`)
+  if (!fenced.ok) console.warn(`[xero] tax-rate drift snapshot and list discarded: ${fenced.error}`)
 
   return result
 }
