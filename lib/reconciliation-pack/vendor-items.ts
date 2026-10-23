@@ -93,19 +93,27 @@ const XERO_TAX_TYPE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 const OPEN_IMS: ReadonlySet<string> = new Set(IMS_OPEN_ORDER_STATUSES)
 
 /**
- * The storefront statuses to walk: the importer's admitted statuses whose effective IMS reading is an open status. The effective
- * reading is what the connector uses (status-mapping.ts): a mapping row for the slug (the exact slug wins; several rows that agree
- * are one; rows that disagree are ambiguous), else the built-in table. No reading at all is UNKNOWN_STATUS.
+ * The storefront statuses to walk: the importer's admitted statuses whose effective IMS reading is an open status, read by the importer's
+ * own lookup rule (see below): a mapping row, else the built-in table. No reading is UNKNOWN_STATUS; a stored key the importer would never
+ * match but that normalises to the status is AMBIGUOUS_STATUS_MAPPING.
  */
-export function openStorefrontStatuses(config: StorefrontStatusConfig): { ok: true; statuses: string[] } | { ok: false; reason: 'UNKNOWN_STATUS' } {
+export function openStorefrontStatuses(config: StorefrontStatusConfig): { ok: true; statuses: string[] } | { ok: false; reason: 'UNKNOWN_STATUS' | 'AMBIGUOUS_STATUS_MAPPING' } {
   const statuses: string[] = []
   for (const slug of config.configured) {
-    const rows = config.mappings.filter((row) => normaliseWcOrderStatus(row.externalStatus) === slug)
-    const exact = rows.filter((row) => row.externalStatus === slug)
+    // THE CONNECTOR'S OWN RULE (lib/connectors/woocommerce/sync/status-mapping.ts findWcStatusMapping, lines 103-121): a row matches a
+    // slug only when its externalStatus EQUALS the slug or `wc-<slug>`, case-insensitively and with NO trimming (lines 110-111); the row
+    // that equals the slug exactly wins (line 119); otherwise the first match (line 121, in database order). The pack copies the rule
+    // (the connector imports lib/db) and a test pins the two equal on the same fixtures.
+    const matched = config.mappings.filter((row) => row.externalStatus.toLowerCase() === slug || row.externalStatus.toLowerCase() === `wc-${slug}`)
+    // A row whose key only NORMALISES to the slug (padding, an odd prefix) is one the importer never matches. It is neither used nor
+    // ignored: which reading the importer applies is then not what the stored data says, so the item is inconclusive.
+    if (config.mappings.some((row) => normaliseWcOrderStatus(row.externalStatus) === slug && !matched.includes(row))) return { ok: false, reason: 'AMBIGUOUS_STATUS_MAPPING' }
+    const exact = matched.filter((row) => row.externalStatus === slug)
     let reading: string | null
     if (exact.length === 1) reading = exact[0]!.imsStatus
-    else if (rows.length > 0) {
-      const distinct = new Set(rows.map((row) => row.imsStatus))
+    else if (matched.length > 0) {
+      // The importer takes the first row in database order, which is not defined: rows that disagree have no single reading.
+      const distinct = new Set(matched.map((row) => row.imsStatus))
       if (distinct.size !== 1) return { ok: false, reason: 'UNKNOWN_STATUS' }
       reading = [...distinct][0]!
     } else reading = Object.prototype.hasOwnProperty.call(WOO_BUILT_IN_STATUS_MAP, slug) ? WOO_BUILT_IN_STATUS_MAP[slug]! : null

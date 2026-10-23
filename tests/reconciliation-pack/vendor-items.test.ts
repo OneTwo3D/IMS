@@ -5,6 +5,7 @@ import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
 import type { ImsRead, ImsReadOptions, ImsSectionValues, OrderRow, PopulationBoundaries, StorefrontStatusConfig, TaxMappingRow, TaxRateRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { openStorefrontStatuses, runVendorItem, type VendorItemContext, type XeroTaxTypeList } from '../../lib/reconciliation-pack/vendor-items.ts'
 import { WOO_BUILT_IN_STATUS_MAP } from '../../lib/reconciliation-pack/constants.ts'
+import { readFileSync } from 'node:fs'
 import { fakeStore, noSleep, order, type StoreData, type Tweak } from './woo-fixtures.ts'
 
 /**
@@ -327,4 +328,49 @@ test('the vendor items are the only ones this module runs, and an unexpected fai
   const item = await runVendorItem('R9', c.ctx)
   assert.equal(item.outcome, 'inconclusive')
   assert.ok(!JSON.stringify(item).includes('hunter2'))
+})
+
+// ---- the importer's own lookup rule -------------------------------------------------------------
+
+// [mutation: matching by normalised key (trim) instead of the connector's equals / wc- rule]
+test('a stored mapping the importer would NOT match (padded, odd prefix) for an admitted status is AMBIGUOUS_STATUS_MAPPING: never used, never ignored, and no request is made', async () => {
+  const open = (configured: string[], mappings: StorefrontStatusConfig['mappings']) => openStorefrontStatuses({ configured, mappings })
+  for (const externalStatus of [' processing ', 'processing ', ' processing', '\tprocessing', ' wc-processing', 'WC-processing ', 'Processing\n']) {
+    assert.deepEqual(open(['processing'], [{ externalStatus, imsStatus: 'COMPLETED' }]), { ok: false, reason: 'AMBIGUOUS_STATUS_MAPPING' }, JSON.stringify(externalStatus))
+    const c = context({ orders: [], config: { configured: ['processing'], mappings: [{ externalStatus, imsStatus: 'COMPLETED' }] } }, { orders: {} })
+    const item = await runVendorItem('R9', c.ctx)
+    assert.deepEqual([item.outcome, item.reasons, c.woo.calls.length], ['inconclusive', ['AMBIGUOUS_STATUS_MAPPING'], 0], JSON.stringify(externalStatus))
+  }
+  // Even beside a row the importer WOULD match: the stray row still makes it ambiguous.
+  assert.deepEqual(open(['processing'], [{ externalStatus: 'processing', imsStatus: 'PROCESSING' }, { externalStatus: ' processing ', imsStatus: 'COMPLETED' }]), { ok: false, reason: 'AMBIGUOUS_STATUS_MAPPING' })
+  // A row for another status is not this status's business.
+  assert.deepEqual(open(['processing'], [{ externalStatus: ' on-hold ', imsStatus: 'COMPLETED' }]), { ok: true, statuses: ['processing'] })
+})
+
+test('a mapping the importer WOULD match exactly (the slug, or wc- and the slug, in any case) is used as the importer uses it', () => {
+  const open = (mappings: StorefrontStatusConfig['mappings']) => openStorefrontStatuses({ configured: ['processing'], mappings })
+  assert.deepEqual(open([{ externalStatus: 'processing', imsStatus: 'COMPLETED' }]), { ok: true, statuses: [] })
+  assert.deepEqual(open([{ externalStatus: 'wc-processing', imsStatus: 'COMPLETED' }]), { ok: true, statuses: [] })
+  assert.deepEqual(open([{ externalStatus: 'WC-Processing', imsStatus: 'COMPLETED' }]), { ok: true, statuses: [] })
+  assert.deepEqual(open([{ externalStatus: 'PROCESSING', imsStatus: 'COMPLETED' }]), { ok: true, statuses: [] })
+  assert.deepEqual(open([{ externalStatus: 'wc-processing', imsStatus: 'COMPLETED' }, { externalStatus: 'processing', imsStatus: 'PICKING' }]), { ok: true, statuses: ['processing'] }, 'the exact slug wins')
+  assert.deepEqual(open([{ externalStatus: 'wc-wc-processing', imsStatus: 'COMPLETED' }]), { ok: true, statuses: ['processing'] }, 'a key the importer does not match and that does not normalise to the slug is another status')
+})
+
+test('PIN: the pack copies the connector\'s lookup rule - the connector\'s source still says equals-the-slug-or-wc-slug, case-insensitive, exact wins, then the first match', () => {
+  const source = readFileSync('lib/connectors/woocommerce/sync/status-mapping.ts', 'utf8')
+  for (const needle of ["{ externalStatus: { equals: normalised, mode: 'insensitive' } }", "{ externalStatus: { equals: `wc-${normalised}`, mode: 'insensitive' } }", 'rows.find((row) => row.externalStatus === normalised)', 'rows.find((row) => normaliseWcOrderStatus(row.externalStatus) === normalised)', '?? rows[0]']) assert.ok(source.includes(needle), needle)
+  assert.ok(!/trim\(\)/.test(source.slice(source.indexOf('export async function findWcStatusMapping'))), 'the lookup does not trim the stored key')
+})
+
+// [mutation: a walked status dropped from the list / the empty proof made without enumerating every admitted open status]
+test('no admitted open status can be left out of the empty proof: every one is requested, in both sweeps, and the proof needs a zero total for each', async () => {
+  const c = context({ orders: [], config: { configured: ['processing', 'on-hold', 'pending'], mappings: [] } }, { orders: {} })
+  const item = await runVendorItem('R9', c.ctx)
+  assert.deepEqual([item.outcome, item.proof], ['pass', { kind: 'proven-empty', source: 'per-status-total-zero' }])
+  const asked = c.woo.calls.filter((call) => call.params.page === '1').map((call) => call.params.status)
+  assert.deepEqual(asked, ['processing', 'on-hold', 'pending', 'processing', 'on-hold', 'pending'])
+  // One status with an order: no empty proof.
+  const one = await runVendorItem('R9', context({ orders: [], config: { configured: ['processing', 'on-hold'], mappings: [] } }, { orders: { 'on-hold': [order(9, 'on-hold')] } }).ctx)
+  assert.deepEqual([one.outcome, one.proof ?? null], ['fail', null])
 })
