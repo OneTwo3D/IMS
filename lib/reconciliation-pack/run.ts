@@ -20,7 +20,7 @@
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
 import type { AcceptanceFile } from '@/lib/ops/readiness-gate'
 import type { AsOfBasis, BasisRead } from '@/lib/reconciliation-pack/basis'
-import { PACK_ITEM_IDS, getPackItem, itemApplicability, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
+import { PACK_ITEM_IDS, getPackItem, itemApplicability, itemNeedsVendor, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
 import { runInvariantItem } from '@/lib/reconciliation-pack/invariant-items'
 import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-readers'
 import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconciliation-pack/ledger-items'
@@ -95,12 +95,6 @@ export function memoisedInvariant(run: () => Promise<unknown>): () => Promise<un
   }
 }
 
-const VENDOR_SOURCES: readonly string[] = ['woocommerce-api', 'xero-api', 'mintsoft-api']
-/** Whether the catalogue lists a vendor API among the item's sources. */
-export function needsVendor(id: PackItemId): boolean {
-  return getPackItem(id).sources.some((source) => VENDOR_SOURCES.includes(source))
-}
-
 const inconclusive = (id: PackItemId, reason: PackReasonCode): ItemInput => ({ id, outcome: 'inconclusive', reasons: [reason] })
 
 export async function readLivenessSafe(port: LivenessPort | undefined): Promise<LivenessRead> {
@@ -147,7 +141,7 @@ export async function runItems(plan: RunPlan): Promise<{ items: ItemInput[]; str
     if (!hasRunner) { results.set(id, inconclusive(id, 'NO_RUNNER')); continue }
     // An item that needs a vendor is not read, and nothing is called, unless the run opted in. Before the liveness verdict, so the
     // reason a reader sees is the operator's choice and not a stale stream that would not have been read either way.
-    if (plan.context.vendorReads !== true && needsVendor(id)) { results.set(id, inconclusive(id, 'VENDOR_READS_OFF')); continue }
+    if (plan.context.vendorReads !== true && itemNeedsVendor(id)) { results.set(id, inconclusive(id, 'VENDOR_READS_OFF')); continue }
     const verdict = itemLivenessVerdict(startOnly, id)
     if (!verdict.ok) { results.set(id, inconclusive(id, verdict.reason)); continue }
     attempted.push(id)

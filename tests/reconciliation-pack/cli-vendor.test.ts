@@ -60,12 +60,12 @@ function rig(base: string): Rig {
     { id: `c${'2'.padStart(24, '0')}`, status: 'ALLOCATED', currency: 'GBP', total: '12.50', created: '2026-10-10T09:30:00.000Z', updated: null },
   ]
   const client: ImsQueryClient = {
-    async query(sql) {
+    async query(sql, values) {
       r.sent.push(sql)
       if (/pg_current_snapshot/.test(sql)) return { rows: [{ snapshot: '10:20:', read_only: 'on', isolation: 'repeatable read' }] }
       if (/transaction_read_only/.test(sql)) return { rows: [{ read_only: 'on' }] }
       if (/pg_control_system/.test(sql)) return { rows: [{ sid: SID, db: 'ims' }] }
-      if (/key = ANY/.test(sql)) { r.credentialReads += 1; return { rows: [{ key: 'wc_url', value: base }, { key: 'wc_consumer_key', value: KEY }, { key: 'wc_consumer_secret', value: SECRET }] } }
+      if (/key = ANY/.test(sql) && JSON.stringify(values).includes('wc_url')) { r.credentialReads += 1; return { rows: [{ key: 'wc_url', value: base }, { key: 'wc_consumer_key', value: KEY }, { key: 'wc_consumer_secret', value: SECRET }] } }
       if (/'wc_initial_import_completed'/.test(sql)) return { rows: [{ key: 'wc_initial_import_completed', value: 'true', at: '2026-09-01T00:00:00.000Z' }] }
       if (/FROM sales_orders/.test(sql)) return { rows: imsOrders.map((o) => ({ ...o })) }
       if (/FROM shopping_order_links/.test(sql)) return { rows: [{ order_id: imsOrders[0]!.id, connector: 'woocommerce', external_id: '11' }, { order_id: imsOrders[1]!.id, connector: 'woocommerce', external_id: '12' }] }
@@ -136,7 +136,7 @@ test('a store that cannot be read makes the vendor items inconclusive, never a p
   process.env.E2E_TEST_MODE = '1'
   const double = await store()
   const r = rig(double.base)
-  r.deps.openIms = (() => { const open = r.deps.openIms!; return async () => { const c = await open(); return { client: { query: async (sql: string) => /key = ANY/.test(sql) ? { rows: [] } : c.client.query(sql) }, close: c.close } } })()
+  r.deps.openIms = (() => { const open = r.deps.openIms!; return async () => { const c = await open(); return { client: { query: async (sql: string, values?: unknown[]) => /key = ANY/.test(sql) && JSON.stringify(values).includes('wc_url') && !/wc_sync/.test(JSON.stringify(values)) ? { rows: [] } : c.client.query(sql, values) }, close: c.close } } })()
   assert.equal(await run(r, argv(scratchDir(bases), '--vendor-reads-only')), 5)
   assert.equal(line(r, 'R9'), 'R9 inconclusive SOURCE_UNREADABLE')
   assert.equal(double.seen.length, 0, 'no credentials, no request')

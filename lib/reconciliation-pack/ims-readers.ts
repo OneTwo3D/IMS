@@ -35,6 +35,10 @@ import {
   IMS_READER_STATEMENT_TIMEOUT_MS,
   SYSTEM_IDENTIFIER_RE,
   WOO_SYNC_STATUSES_SETTING_KEY,
+  WDRAW_SUBMITTED_STATUS_KEY,
+  WDRAW_APPROVED_STATUS_KEY,
+  WDRAW_DEFAULT_APPROVED_STATUS,
+  WDRAW_DEFAULT_SUBMITTED_STATUS,
   type PackPopulationReason,
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
@@ -67,7 +71,8 @@ export type OrderLink = { connector: string; externalOrderId: string }
 export type OrderRow = { id: string; status: string; currency: string; totalForeign: string; externalCreatedAt: string | null; externalUpdatedAt: string | null; links: OrderLink[] }
 /** The importer's admitted WooCommerce order statuses (normalised, unique) and every mapping row of the storefront connector. */
 export type StorefrontMappingRow = { externalStatus: string; imsStatus: string }
-export type StorefrontStatusConfig = { configured: string[]; mappings: StorefrontMappingRow[] }
+/** `withdrawal` is the pair of customer-withdrawal statuses the importer ALSO admits (normalised; each setting's documented default when its row is absent or empty). */
+export type StorefrontStatusConfig = { configured: string[]; withdrawal: { submitted: string; approved: string }; mappings: StorefrontMappingRow[] }
 export type TaxRateRow = { id: string; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null }
 export type TaxMappingRow = { connector: string; externalTaxRateId: string; taxRateId: string }
 export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[] }
@@ -276,8 +281,20 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   async storefrontStatus(tx) {
     // The importer's admitted statuses. An ABSENT row is the documented default; a row that is not a JSON array of non-empty strings
     // is unreadable (the importer falls back to its default, which is a guess this comparison does not make).
-    const rows = await tx.query('SELECT key, value FROM settings WHERE key = $1', [WOO_SYNC_STATUSES_SETTING_KEY])
-    if (rows.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    const allRows = await tx.query('SELECT key, value FROM settings WHERE key = ANY($1::text[])', [[WOO_SYNC_STATUSES_SETTING_KEY, WDRAW_SUBMITTED_STATUS_KEY, WDRAW_APPROVED_STATUS_KEY]])
+    unique(allRows, (row) => text(row.key))
+    const rows = allRows.filter((row) => row.key === WOO_SYNC_STATUSES_SETTING_KEY)
+    // The withdrawal statuses, read as the importer reads them (sync/withdrawal.ts getWithdrawalStatuses, lines 85-90): the stored
+    // value, else the default when the row is absent or EMPTY, normalised. A value that is not a plain status slug is unreadable, not defaulted.
+    const withdrawalStatus = (key: string, fallback: string): string => {
+      const row = allRows.find((entry) => entry.key === key)
+      const raw = row === undefined ? '' : row.value
+      if (typeof raw !== 'string') throw new Unreadable('SOURCE_UNREADABLE')
+      const slug = normaliseWcOrderStatus(raw || fallback)
+      if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(slug)) throw new Unreadable('SOURCE_UNREADABLE')
+      return slug
+    }
+    const withdrawal = { submitted: withdrawalStatus(WDRAW_SUBMITTED_STATUS_KEY, WDRAW_DEFAULT_SUBMITTED_STATUS), approved: withdrawalStatus(WDRAW_APPROVED_STATUS_KEY, WDRAW_DEFAULT_APPROVED_STATUS) }
     let configured: string[] = [...WC_DEFAULT_SYNC_ORDER_STATUSES]
     if (rows.length === 1) {
       const raw = rows[0]!.value
@@ -294,7 +311,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const mappingRows = await readCapped(tx, `SELECT "externalStatus" AS external_status, "imsStatus"::text AS ims_status FROM shopping_status_mappings WHERE connector = 'woocommerce' ORDER BY id`)
     const mappings = mappingRows.map((row): StorefrontMappingRow => ({ externalStatus: text(row.external_status), imsStatus: oneOf(row.ims_status, Object.values(SalesOrderStatus)) }))
     unique(mappings, (mapping) => mapping.externalStatus)
-    return { configured, mappings }
+    return { configured, withdrawal, mappings }
   },
 
   async taxes(tx) {

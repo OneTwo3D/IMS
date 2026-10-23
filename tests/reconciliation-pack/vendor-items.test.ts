@@ -14,15 +14,18 @@ import { fakeStore, noSleep, order, type StoreData, type Tweak } from './woo-fix
 
 const D = '2026-10-19'
 const BOUNDARIES: PopulationBoundaries = { firstLoad: { state: 'verified', cutAt: '2026-09-01T00:00:00.000Z' }, storefrontImport: { state: 'completed', cutAt: '2026-09-01T00:00:00.000Z' }, retentionMonths: 0 }
-const CONFIG: StorefrontStatusConfig = { configured: ['processing'], mappings: [] }
+const WITHDRAWAL = { submitted: 'pending-wdraw', approved: 'withdrawn' }
+const CONFIG: StorefrontStatusConfig = { configured: ['processing'], withdrawal: WITHDRAWAL, mappings: [] }
 const cuid = (n: number) => `c${String(n).padStart(24, '0')}`
 
+/** The withdrawal-submitted status is always walked; the older assertions are about the SELECTED statuses. */
+const withoutWithdrawal = (r: ReturnType<typeof openStorefrontStatuses>) => (r.ok ? { ok: true as const, statuses: r.statuses.filter((status) => status !== 'pending-wdraw') } : r)
 const imsOrder = (n: number, wooId: string | null, over: Partial<OrderRow> = {}): OrderRow => ({
   id: cuid(n), status: 'PROCESSING', currency: 'GBP', totalForeign: '12.50', externalCreatedAt: '2026-10-10T09:30:00.000Z', externalUpdatedAt: null,
   links: wooId === null ? [] : [{ connector: 'woocommerce', externalOrderId: wooId }], ...over,
 })
 
-type ImsFixture = { orders?: OrderRow[]; boundaries?: PopulationBoundaries; config?: StorefrontStatusConfig; rates?: TaxRateRow[]; mappings?: TaxMappingRow[]; fail?: 'read' | 'throws' | Partial<Record<keyof ImsSectionValues, 'CAP_EXCEEDED'>> }
+type ImsFixture = { orders?: OrderRow[]; boundaries?: PopulationBoundaries; config?: Omit<StorefrontStatusConfig, 'withdrawal'> & { withdrawal?: StorefrontStatusConfig['withdrawal'] }; rates?: TaxRateRow[]; mappings?: TaxMappingRow[]; fail?: 'read' | 'throws' | Partial<Record<keyof ImsSectionValues, 'CAP_EXCEEDED'>> }
 function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; ims: NonNullable<VendorItemContext['ims']> } {
   const calls: ImsReadOptions[] = []
   return {
@@ -32,7 +35,7 @@ function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; ims: NonN
       if (fixture.fail === 'throws') throw new Error('boom')
       if (fixture.fail === 'read') return { ok: false, reason: 'READ_INCOMPLETE' }
       const values: Record<string, unknown> = {
-        boundaries: fixture.boundaries ?? BOUNDARIES, orders: fixture.orders ?? [], storefrontStatus: fixture.config ?? CONFIG,
+        boundaries: fixture.boundaries ?? BOUNDARIES, orders: fixture.orders ?? [], storefrontStatus: fixture.config ? { withdrawal: WITHDRAWAL, ...fixture.config } : CONFIG,
         taxes: { rates: fixture.rates ?? [], mappings: fixture.mappings ?? [] },
       }
       const sections: Record<string, unknown> = {}
@@ -153,7 +156,7 @@ test('the statuses walked are the ADMITTED statuses whose reading is an open IMS
   const both = context({ orders: [imsOrder(1, '11'), imsOrder(2, '12', { status: 'ON_HOLD' })], config: { configured: ['processing', 'on-hold', 'completed'], mappings: [] } }, { orders: { processing: processing(11), 'on-hold': [order(12, 'on-hold')], completed: [order(99, 'completed')] } })
   const item = await runVendorItem('R9', both.ctx)
   assert.equal(item.outcome, 'pass')
-  assert.deepEqual([...new Set(both.woo.calls.map((c) => c.params.status))], ['processing', 'on-hold'], 'completed is admitted but not open')
+  assert.deepEqual([...new Set(both.woo.calls.map((c) => c.params.status))], ['processing', 'on-hold', 'pending-wdraw'], 'completed is admitted but not open; the withdrawal-submitted status is always walked')
   const unknown = context({ orders: [], config: { configured: ['processing', 'weird'], mappings: [] } }, { orders: {} })
   const refused = await runVendorItem('R9', unknown.ctx)
   assert.deepEqual([refused.outcome, refused.reasons], ['inconclusive', ['UNKNOWN_STATUS']])
@@ -162,11 +165,11 @@ test('the statuses walked are the ADMITTED statuses whose reading is an open IMS
   const mapped = context({ orders: [], config: { configured: ['weird', 'processing'], mappings: [{ externalStatus: 'wc-weird', imsStatus: 'ON_HOLD' }, { externalStatus: 'processing', imsStatus: 'COMPLETED' }] } }, { orders: { weird: [] } })
   const m = await runVendorItem('R9', mapped.ctx)
   assert.equal(m.outcome, 'pass')
-  assert.deepEqual([...new Set(mapped.woo.calls.map((c) => c.params.status))], ['weird'], 'processing is remapped to a closed status, so it is not walked')
+  assert.deepEqual([...new Set(mapped.woo.calls.map((c) => c.params.status))], ['weird', 'pending-wdraw'], 'processing is remapped to a closed status, so it is not walked')
 })
 
 test('openStorefrontStatuses: the exact slug wins, agreeing rows are one, disagreeing rows are unknown, no reading is unknown; the built-in table is a copy of the connector\'s own', async () => {
-  const open = (configured: string[], mappings: StorefrontStatusConfig['mappings']) => openStorefrontStatuses({ configured, mappings })
+  const open = (configured: string[], mappings: StorefrontStatusConfig['mappings']) => withoutWithdrawal(openStorefrontStatuses({ configured, withdrawal: WITHDRAWAL, mappings }))
   assert.deepEqual(open(['pending', 'failed', 'on-hold', 'processing', 'refunded', 'completed', 'cancelled'], []), { ok: true, statuses: ['pending', 'failed', 'on-hold', 'processing', 'refunded'] })
   assert.deepEqual(open(['x'], [{ externalStatus: 'x', imsStatus: 'PICKING' }]), { ok: true, statuses: ['x'] })
   assert.deepEqual(open(['x'], [{ externalStatus: 'x', imsStatus: 'COMPLETED' }, { externalStatus: 'wc-x', imsStatus: 'PICKING' }]), { ok: true, statuses: [] }, 'the exact slug wins')
@@ -322,7 +325,7 @@ test('the vendor items are the only ones this module runs, and an unexpected fai
 
 // [mutation: matching by normalised key (trim) instead of the connector's equals / wc- rule]
 test('a stored mapping the importer would NOT match (padded, odd prefix) for an admitted status is AMBIGUOUS_STATUS_MAPPING: never used, never ignored, and no request is made', async () => {
-  const open = (configured: string[], mappings: StorefrontStatusConfig['mappings']) => openStorefrontStatuses({ configured, mappings })
+  const open = (configured: string[], mappings: StorefrontStatusConfig['mappings']) => withoutWithdrawal(openStorefrontStatuses({ configured, withdrawal: WITHDRAWAL, mappings }))
   for (const externalStatus of [' processing ', 'processing ', ' processing', '\tprocessing', ' wc-processing', 'WC-processing ', 'Processing\n']) {
     assert.deepEqual(open(['processing'], [{ externalStatus, imsStatus: 'COMPLETED' }]), { ok: false, reason: 'AMBIGUOUS_STATUS_MAPPING' }, JSON.stringify(externalStatus))
     const c = context({ orders: [], config: { configured: ['processing'], mappings: [{ externalStatus, imsStatus: 'COMPLETED' }] } }, { orders: {} })
@@ -336,7 +339,7 @@ test('a stored mapping the importer would NOT match (padded, odd prefix) for an 
 })
 
 test('a mapping the importer WOULD match exactly (the slug, or wc- and the slug, in any case) is used as the importer uses it', () => {
-  const open = (mappings: StorefrontStatusConfig['mappings']) => openStorefrontStatuses({ configured: ['processing'], mappings })
+  const open = (mappings: StorefrontStatusConfig['mappings']) => withoutWithdrawal(openStorefrontStatuses({ configured: ['processing'], withdrawal: WITHDRAWAL, mappings }))
   assert.deepEqual(open([{ externalStatus: 'processing', imsStatus: 'COMPLETED' }]), { ok: true, statuses: [] })
   assert.deepEqual(open([{ externalStatus: 'wc-processing', imsStatus: 'COMPLETED' }]), { ok: true, statuses: [] })
   assert.deepEqual(open([{ externalStatus: 'WC-Processing', imsStatus: 'COMPLETED' }]), { ok: true, statuses: [] })
@@ -357,8 +360,53 @@ test('no admitted open status can be left out of the empty proof: every one is r
   const item = await runVendorItem('R9', c.ctx)
   assert.deepEqual([item.outcome, item.proof], ['pass', { kind: 'proven-empty', source: 'per-status-total-zero' }])
   const asked = c.woo.calls.filter((call) => call.params.page === '1').map((call) => call.params.status)
-  assert.deepEqual(asked, ['processing', 'on-hold', 'pending', 'processing', 'on-hold', 'pending'])
+  assert.deepEqual(asked, ['processing', 'on-hold', 'pending', 'pending-wdraw', 'processing', 'on-hold', 'pending', 'pending-wdraw'])
   // One status with an order: no empty proof.
   const one = await runVendorItem('R9', context({ orders: [], config: { configured: ['processing', 'on-hold'], mappings: [] } }, { orders: { 'on-hold': [order(9, 'on-hold')] } }).ctx)
   assert.deepEqual([one.outcome, one.proof ?? null], ['fail', null])
+})
+
+// ---- every route by which the importer admits a status ---------------------------------------------
+
+// [mutation: the withdrawal statuses left out of the admitted set / the empty-selection rule dropped]
+test('THE WITHDRAWAL STATUSES: the importer also admits the withdrawal pair whenever the selection is non-empty, so a store order in a mapped OPEN withdrawal status that IMS lacks is a finding, never a pass', async () => {
+  // approved status mapped to an open IMS status, outside wc_sync_order_statuses
+  const c = context({ orders: [imsOrder(1, '11')], config: { configured: ['processing'], mappings: [{ externalStatus: 'withdrawn', imsStatus: 'ON_HOLD' }] } }, { orders: { processing: processing(11), withdrawn: [order(31, 'withdrawn')] } })
+  const item = await runVendorItem('R9', c.ctx)
+  assert.deepEqual([item.outcome, keys(item, 'onlyVendor')], ['fail', ['31']])
+  assert.deepEqual([...new Set(c.woo.calls.map((call) => call.params.status))], ['processing', 'pending-wdraw', 'withdrawn'])
+  // the submitted status is walked without a mapping: an IMS hold must find its storefront order, and a store order in it is judged
+  const sub = await runVendorItem('R9', context({ orders: [imsOrder(1, '11')] }, { orders: { processing: processing(11), 'pending-wdraw': [order(32, 'pending-wdraw')] } }).ctx)
+  assert.deepEqual([sub.outcome, keys(sub, 'onlyVendor')], ['fail', ['32']])
+  // a renamed pair (settings) is followed
+  const renamed = context({ orders: [], config: { configured: ['processing'], withdrawal: { submitted: 'wdraw-asked', approved: 'wdraw-done' }, mappings: [{ externalStatus: 'wdraw-done', imsStatus: 'PROCESSING' }] } }, { orders: { 'wdraw-done': [order(33, 'wdraw-done')] } })
+  const r = await runVendorItem('R9', renamed.ctx)
+  assert.deepEqual([r.outcome, keys(r, 'onlyVendor')], ['fail', ['33']])
+  assert.deepEqual([...new Set(renamed.woo.calls.map((call) => call.params.status))], ['processing', 'wdraw-asked', 'wdraw-done'])
+  // an unmapped approved status is closed (the withdrawal handler cancels), and a mapped-closed one too: not walked
+  const closed = context({ orders: [], config: { configured: ['processing'], mappings: [{ externalStatus: 'withdrawn', imsStatus: 'CANCELLED' }] } }, { orders: {} })
+  await runVendorItem('R9', closed.ctx)
+  assert.deepEqual([...new Set(closed.woo.calls.map((call) => call.params.status))], ['processing', 'pending-wdraw'])
+})
+
+test('an EMPTY selection admits nothing on any route, the withdrawal statuses included: nothing is walked and the empty proof is not given', async () => {
+  const c = context({ orders: [], config: { configured: [], mappings: [] } }, { orders: {} })
+  const item = await runVendorItem('R9', c.ctx)
+  assert.deepEqual([item.outcome, item.reasons, c.woo.calls.length], ['inconclusive', ['EMPTY_UNPROVEN'], 0])
+  // The withdrawal pair is not admitted, whatever a mapping says; only the manual historical import (which ignores the selection) keeps completed and delivered.
+  assert.deepEqual(openStorefrontStatuses({ configured: [], withdrawal: WITHDRAWAL, mappings: [{ externalStatus: 'delivered', imsStatus: 'PROCESSING' }, { externalStatus: 'pending-wdraw', imsStatus: 'PROCESSING' }] }), { ok: true, statuses: ['delivered'] })
+})
+
+test('the routes: completed is added by the reconcile sweeps and delivered by the historical import, and a mapping that reads either as open makes it walked; the shared rule is the connector\'s own', async () => {
+  const open = (mappings: StorefrontStatusConfig['mappings']) => openStorefrontStatuses({ configured: ['processing'], withdrawal: WITHDRAWAL, mappings })
+  assert.deepEqual(open([{ externalStatus: 'completed', imsStatus: 'PROCESSING' }, { externalStatus: 'wc-delivered', imsStatus: 'ON_HOLD' }]), { ok: true, statuses: ['processing', 'completed', 'pending-wdraw', 'delivered'] })
+  assert.deepEqual(open([]), { ok: true, statuses: ['processing', 'pending-wdraw'] })
+  // A padded key for a route-added status is ambiguous too.
+  assert.deepEqual(open([{ externalStatus: ' completed', imsStatus: 'PROCESSING' }]), { ok: false, reason: 'AMBIGUOUS_STATUS_MAPPING' })
+  // Pins: the connector's routes are still the ones the pack unions.
+  const read = (file: string) => readFileSync(file, 'utf8')
+  assert.ok(read('lib/connectors/woocommerce/orders.ts').includes("status: 'completed,delivered'"))
+  assert.ok(read('lib/connectors/woocommerce/sync/order-import.ts').includes('resolveWcPullStatuses(route, parseWcSyncOrderStatuses(setting?.value), withdrawal)'))
+  assert.ok(read('lib/connectors/woocommerce/sync/withdrawal.ts').includes("export const WDRAW_SUBMITTED_STATUS_KEY = 'wc_withdrawal_submitted_status'") && read('lib/connectors/woocommerce/sync/withdrawal.ts').includes("export const WDRAW_APPROVED_STATUS_KEY = 'wc_withdrawal_approved_status'"))
+  assert.ok(read('lib/connectors/woocommerce/sync/withdrawal.ts').includes("DEFAULT_WDRAW_SUBMITTED_STATUS = 'pending-wdraw'") && read('lib/connectors/woocommerce/sync/withdrawal.ts').includes("DEFAULT_WDRAW_APPROVED_STATUS = 'withdrawn'"))
 })

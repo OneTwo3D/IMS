@@ -226,8 +226,13 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
   const targets: string[] = []
   const original = net.Socket.prototype.connect
   const previousMode = process.env.E2E_TEST_MODE
+  // The test brings its own settings key (a fresh random one), so it does not depend on the environment providing one; it is never logged.
+  const { randomBytes } = await import('node:crypto')
+  const previousKeys = { SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, ENCRYPTION_KEY: process.env.ENCRYPTION_KEY }
   try {
     process.env.E2E_TEST_MODE = '1'
+    process.env.SETTINGS_ENCRYPTION_KEY = randomBytes(32).toString('base64')
+    delete process.env.ENCRYPTION_KEY
     await sql(`DELETE FROM settings WHERE key = ANY($1)`, [VENDOR_SETTINGS])
     await setting('wc_url', `http://127.0.0.1:${storePort}`)
     await setting('wc_consumer_key', encryptSettingValue('wc_consumer_key', `ck_${VTAG}`))
@@ -271,7 +276,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     assert.equal(on.code, 5, on.out.join('\n'))
     assert.ok(on.out.includes('R9 pass -'), on.out.join('\n'))
     assert.ok(on.out.includes('R13 inconclusive VENDOR_LIST_UNPROVEN'), on.out.join('\n'))
-    assert.equal(seen.length, 4, "processing (the importer's default) and the tax rates: one page each, read twice")
+    assert.equal(seen.length, 6, "processing (the importer's default), the withdrawal-submitted status and the tax rates: one page each, read twice")
     assert.deepEqual([...new Set(seen.map((s) => s.method))], ['GET'])
     assert.ok(seen.every((s) => s.authorization === `Basic ${Buffer.from(`ck_${VTAG}:cs_${VTAG}`).toString('base64')}`))
     const url = new URL(process.env.DATABASE_URL!)
@@ -288,6 +293,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
   } finally {
     net.Socket.prototype.connect = original
     if (previousMode === undefined) delete process.env.E2E_TEST_MODE; else process.env.E2E_TEST_MODE = previousMode
+    for (const [name, value] of Object.entries(previousKeys)) { if (value === undefined) delete process.env[name]; else process.env[name] = value }
     await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections() })
     await sql(`DELETE FROM shopping_tax_rate_mappings WHERE id LIKE '${VTAG}%'`)
     await sql(`DELETE FROM tax_rates WHERE id LIKE '${VTAG}%'`)

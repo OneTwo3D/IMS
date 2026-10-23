@@ -113,6 +113,7 @@ test('[reconciliation pack] every section reads the seeded rows from a real data
     // The storefront status section (R9): column names proven against the real tables. The migration seeds the built-in mapping rows.
     const statuses = v('storefrontStatus')
     assert.ok(statuses.configured.length >= 0 && statuses.configured.every((slug) => /^[a-z0-9][a-z0-9_-]*$/.test(slug)))
+    assert.ok(/^[a-z0-9][a-z0-9_-]*$/.test(statuses.withdrawal.submitted) && /^[a-z0-9][a-z0-9_-]*$/.test(statuses.withdrawal.approved))
     assert.ok(statuses.mappings.some((m) => m.externalStatus === 'processing' && m.imsStatus === 'PROCESSING'), JSON.stringify(statuses.mappings))
   } finally { await cleanup() }
 })

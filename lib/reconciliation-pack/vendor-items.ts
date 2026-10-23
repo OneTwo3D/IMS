@@ -39,13 +39,14 @@ import { compareItem, outcomeOfComparison, type CompareResult, type SideRow } fr
 import {
   IMS_OPEN_ORDER_STATUSES,
   WOO_BUILT_IN_STATUS_MAP,
+  WOO_HISTORICAL_IMPORT_EXTRA_STATUS,
   type PackReasonCode,
   type PackSourceCode,
 } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
 import { readWooOrders, readWooTaxRates, type WooGetPort, type WooOrderRow, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
-import { normaliseWcOrderStatus } from '@/lib/connectors/woocommerce/order-status-filter'
+import { normaliseWcOrderStatus, resolveWcPullStatuses } from '@/lib/connectors/woocommerce/order-status-filter'
 
 export const VENDOR_ITEM_IDS = ['R9', 'R13'] as const
 export type VendorItemId = (typeof VENDOR_ITEM_IDS)[number]
@@ -96,13 +97,29 @@ const XERO_TAX_TYPE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 const OPEN_IMS: ReadonlySet<string> = new Set(IMS_OPEN_ORDER_STATUSES)
 
 /**
- * The storefront statuses to walk: the importer's admitted statuses whose effective IMS reading is an open status, read by the importer's
- * own lookup rule (see below): a mapping row, else the built-in table. No reading is UNKNOWN_STATUS; a stored key the importer would never
- * match but that normalises to the status is AMBIGUOUS_STATUS_MAPPING.
+ * THE STATUSES THE IMPORTER ADMITS, by every route that admits an order by status, from the SHARED pure rule the connector itself uses
+ * (order-status-filter.ts resolveWcPullStatuses, no database in it):
+ *   - the initial import: the selected statuses only (initial-import.ts:210, getWcPullStatuses('initial'));
+ *   - the live poll and the reconcile sweeps: the selected statuses, plus the two customer-withdrawal statuses, plus `completed` for the
+ *     reconcile routes (order-import.ts:3000-3006 and order-status-filter.ts resolveWcPullStatuses);
+ *   - a webhook: the selected statuses plus the withdrawal pair, judged on the order's current status (order-admission.ts:81,
+ *     order-status-filter.ts:166);
+ *   - the manual historical import: `completed` and `delivered` within a date range (connectors/woocommerce/orders.ts:139);
+ *   - an EMPTY selection admits nothing on the sweeps, the webhook and the initial import, the withdrawal statuses included; the manual
+ *     historical import does not consult the selection, so `completed` and `delivered` stay in the union.
+ * The pack walks the union, so a status admitted by any route is never left out. Each admitted status is then read as follows.
+ *   - A SELECTED status: the importer's own mapping lookup (see below), else the built-in table; no reading is UNKNOWN_STATUS.
+ *   - The WITHDRAWAL-SUBMITTED status: always walked. A linked order in it is held ON_HOLD by the withdrawal handler (sync/withdrawal.ts,
+ *     which takes the transition before any status mapping), and an IMS hold must find its storefront order.
+ *   - Any other route-added status (approved, completed, delivered): walked only if a mapping row reads it as an open IMS status; with
+ *     no reading it is closed, not unknown (the importer closes it too: withdrawn cancels, completed completes).
+ * A stored key the importer would never match but that normalises to an admitted status is AMBIGUOUS_STATUS_MAPPING.
  */
 export function openStorefrontStatuses(config: StorefrontStatusConfig): { ok: true; statuses: string[] } | { ok: false; reason: 'UNKNOWN_STATUS' | 'AMBIGUOUS_STATUS_MAPPING' } {
   const statuses: string[] = []
-  for (const slug of config.configured) {
+  const admitted = [...new Set([...(config.configured.length === 0 ? [] : resolveWcPullStatuses('reconcile', config.configured, config.withdrawal)), 'completed', WOO_HISTORICAL_IMPORT_EXTRA_STATUS])]
+  for (const slug of admitted) {
+    const selected = config.configured.includes(slug)
     // THE CONNECTOR'S OWN RULE (lib/connectors/woocommerce/sync/status-mapping.ts findWcStatusMapping, lines 103-121): a row matches a
     // slug only when its externalStatus EQUALS the slug or `wc-<slug>`, case-insensitively and with NO trimming (lines 110-111); the row
     // that equals the slug exactly wins (line 119); otherwise the first match (line 121, in database order). The pack copies the rule
@@ -120,7 +137,11 @@ export function openStorefrontStatuses(config: StorefrontStatusConfig): { ok: tr
       if (distinct.size !== 1) return { ok: false, reason: 'UNKNOWN_STATUS' }
       reading = [...distinct][0]!
     } else reading = Object.prototype.hasOwnProperty.call(WOO_BUILT_IN_STATUS_MAP, slug) ? WOO_BUILT_IN_STATUS_MAP[slug]! : null
-    if (reading === null) return { ok: false, reason: 'UNKNOWN_STATUS' }
+    if (slug === config.withdrawal.submitted) { statuses.push(slug); continue }
+    if (reading === null) {
+      if (selected) return { ok: false, reason: 'UNKNOWN_STATUS' }
+      continue
+    }
     if (OPEN_IMS.has(reading)) statuses.push(slug)
   }
   return { ok: true, statuses }
