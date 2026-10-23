@@ -68,7 +68,7 @@ for (const mode of ['values', 'presence'] as const) {
       const result = compareItem(id, {
         imsComplete: true, vendorComplete: true, ims: rows.ims, vendor: rows.vendor, excluded: rows.excluded, population: rows.population,
         emptyProof: flags.Y ? 'vendor-total-zero' : undefined,
-        settling: flags.S ? { carried: new Map(), stamp: STAMP } : undefined,
+        settling: flags.S ? { carried: new Map(), stamp: STAMP, usable: true } : undefined,
       })
       const want = expected(flags, mode)
       assert.deepEqual(outcomeOfComparison(result), want, `${mode} ${label}: comparator outcome`)
@@ -197,7 +197,7 @@ test('COMPARATOR: excluded, out-of-population and unsettled identities never bec
   const finding = run({ ims: [row('I1')], vendor: [] })
   assert.equal(finding.status === 'compared' && finding.proof, null)
   assert.equal(outcomeOfComparison(finding).outcome, 'fail')
-  const unsettled = run({ ims: [row('I1')], vendor: [], settling: { carried: new Map(), stamp: STAMP } })
+  const unsettled = run({ ims: [row('I1')], vendor: [], settling: { carried: new Map(), stamp: STAMP, usable: true } })
   assert.equal(unsettled.status === 'compared' && unsettled.proof, null)
   assert.equal(outcomeOfComparison(unsettled).outcome, 'inconclusive')
   // a real equal identity beside an excluded one: "compared", resting on the equal one

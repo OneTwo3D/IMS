@@ -110,19 +110,35 @@ export function bracketStable(start: string | null, end: string | null): boolean
 }
 
 export type DifferenceKind = 'onlyIms' | 'onlyVendor' | 'bothDiffer'
-export type CarriedDifference = { kind: DifferenceKind; first: string; later: readonly string[] }
-export type SettlingInput = { carried: ReadonlyMap<string, CarriedDifference>; stamp: string | null }
+/**
+ * One difference carried between runs. Its identity is the token it is filed under PLUS `kind` PLUS `signature` (the values and
+ * currencies it was seen with): a value that changed between runs is a NEW difference, first seen now, not a continuation.
+ * `sequence` is the report sequence the difference was first seen in; null only in memory, for one first seen in the run being built
+ * (the builder fills it with the sequence it assigns).
+ */
+export type CarriedDifference = { kind: DifferenceKind; signature: string; sequence: number | null; first: string; later: readonly string[] }
+/**
+ * `usable` is whether the carried map came from a trusted, same-installation, same-phase previous report that carries the state in the
+ * exact shape. When it is false the map is empty and every difference is first seen (the item says so: SETTLING_STATE_UNUSABLE).
+ */
+export type SettlingInput = { carried: ReadonlyMap<string, CarriedDifference>; stamp: string | null; usable: boolean }
+
+/** The one text form of what a difference looked like: its kind, both values and both currencies. Used by the comparator and by the carry-over reader alike. */
+export function differenceSignature(kind: DifferenceKind, parts: { ims: string | null; vendor: string | null; imsCurrency: string | null; vendorCurrency: string | null }): string {
+  return JSON.stringify([kind, parts.ims, parts.vendor, parts.imsCurrency, parts.vendorCurrency])
+}
 
 /**
  * Advance one difference. Returns the record to carry and whether it has persisted (is now a finding).
- * A repeated stamp (the first one, or one already counted) is the same run of the stream: no progress.
+ * A repeated stamp (the first one, or one already counted) is the same run of the stream: no progress. A previous record of another
+ * kind or another signature is not this difference: it starts over, first seen at this stamp.
  */
-export function advanceDifference(kind: DifferenceKind, previous: CarriedDifference | undefined, stamp: string): { carried: CarriedDifference; persisted: boolean } {
-  if (!previous || previous.kind !== kind) return { carried: { kind, first: stamp, later: [] }, persisted: false }
+export function advanceDifference(kind: DifferenceKind, signature: string, previous: CarriedDifference | undefined, stamp: string): { carried: CarriedDifference; persisted: boolean } {
+  if (!previous || previous.kind !== kind || previous.signature !== signature) return { carried: { kind, signature, sequence: null, first: stamp, later: [] }, persisted: false }
   if (previous.later.length >= PENDING_PERSISTENCE_RUNS) return { carried: previous, persisted: true }
   if (stamp === previous.first || previous.later.includes(stamp)) return { carried: previous, persisted: false }
   const later = [...previous.later, stamp]
-  return { carried: { kind, first: previous.first, later }, persisted: later.length >= PENDING_PERSISTENCE_RUNS }
+  return { carried: { ...previous, later }, persisted: later.length >= PENDING_PERSISTENCE_RUNS }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,8 +158,8 @@ export type CompareEntry = {
   /** Whether each side had the identity (a presence-only comparison records nothing else about it). */
   imsPresent: boolean
   vendorPresent: boolean
-  /** Only on unsettled entries: the stream stamps the difference was seen under. */
-  settling?: { first: string; later: string[] }
+  /** On unsettled entries, and on the failing entries of a comparison that settles: the stream stamps the difference was seen under. */
+  settling?: { sequence: number | null; first: string; later: string[] }
 }
 
 export type CompareInput = {
@@ -167,7 +183,7 @@ export type CompareInput = {
 }
 
 export type CompareResult =
-  | { status: 'compared'; buckets: Record<ComparisonBucket, CompareEntry[]>; nextCarried: Map<string, CarriedDifference>; proof: ItemProof | null }
+  | { status: 'compared'; buckets: Record<ComparisonBucket, CompareEntry[]>; nextCarried: Map<string, CarriedDifference>; proof: ItemProof | null; carriedUnusable: boolean }
   | { status: 'unreadable'; reason: PackReasonCode }
 
 function emptyBuckets(): Record<ComparisonBucket, CompareEntry[]> {
@@ -218,7 +234,10 @@ function validCarried(carried: unknown): boolean {
     if (typeof key !== 'string' || typeof record !== 'object' || record === null) return false
     const r = record as Partial<CarriedDifference>
     if (r.kind !== 'onlyIms' && r.kind !== 'onlyVendor' && r.kind !== 'bothDiffer') return false
+    if (typeof r.signature !== 'string' || r.signature.length === 0) return false
+    if (r.sequence !== null && !(typeof r.sequence === 'number' && Number.isSafeInteger(r.sequence) && r.sequence >= 1)) return false
     if (!isStreamStamp(r.first) || !Array.isArray(r.later) || !r.later.every(isStreamStamp)) return false
+    if (new Set([r.first, ...r.later]).size !== r.later.length + 1) return false
   }
   return true
 }
@@ -231,7 +250,7 @@ export function compareKeyed(input: CompareInput): CompareResult {
   if (mode === 'values' && !isUsableTolerance(input.tolerance)) return unreadable('BAD_TOLERANCE')
   if (input.population !== undefined && !(input.population instanceof Set)) return unreadable('NO_POPULATION_RECORD')
   if (input.excluded !== undefined && !(input.excluded instanceof Set)) return unreadable('NO_POPULATION_RECORD')
-  if (input.settling !== undefined && !validCarried(input.settling.carried)) return unreadable('SOURCE_UNREADABLE')
+  if (input.settling !== undefined && (typeof input.settling.usable !== 'boolean' || !validCarried(input.settling.carried) || (!input.settling.usable && input.settling.carried.size > 0))) return unreadable('SOURCE_UNREADABLE')
   const minorUnit = mode === 'values' && input.tolerance!.rule === 'minor-unit'
   const ims = indexSide(input.ims, mode, minorUnit)
   if (typeof ims === 'string') return unreadable(ims)
@@ -243,7 +262,13 @@ export function compareKeyed(input: CompareInput): CompareResult {
   const buckets = emptyBuckets()
   const nextCarried = new Map<string, CarriedDifference>()
   const keys = new Set<string>([...ims.keys(), ...vendor.keys()])
-  for (const canonical of [...keys].sort()) {
+  // CARRIED IDENTITIES ARE RE-CHECKED FIRST: they are judged, and listed within each bucket, before any identity first seen now, so a
+  // cap on the listing can cut a new identity and never one whose settling is already under way.
+  const tokenOf = (canonical: string): string => (ims.get(canonical) ?? vendor.get(canonical))!.token
+  const carriedKeys = input.settling ? input.settling.carried : null
+  const ordered = [...keys].sort()
+  const order = carriedKeys ? [...ordered.filter((k) => carriedKeys.has(tokenOf(k))), ...ordered.filter((k) => !carriedKeys.has(tokenOf(k)))] : ordered
+  for (const canonical of order) {
     const a = ims.get(canonical)
     const b = vendor.get(canonical)
     const token = (a ?? b)!.token
@@ -267,10 +292,11 @@ export function compareKeyed(input: CompareInput): CompareResult {
     }
     if (kind === null) { buckets.bothEqual.push(entry); continue }
     if (!input.settling) { buckets[kind].push(entry); continue }
-    const advanced = advanceDifference(kind, input.settling.carried.get(token), stamp as string)
+    const advanced = advanceDifference(kind, differenceSignature(kind, entry), input.settling.carried.get(token), stamp as string)
     nextCarried.set(token, advanced.carried)
-    if (advanced.persisted) buckets[kind].push(entry)
-    else buckets.unsettled.push({ ...entry, settling: { first: advanced.carried.first, later: [...advanced.carried.later] } })
+    const settling = { sequence: advanced.carried.sequence, first: advanced.carried.first, later: [...advanced.carried.later] }
+    if (advanced.persisted) buckets[kind].push({ ...entry, settling })
+    else buckets.unsettled.push({ ...entry, settling })
   }
 
   // What was actually JUDGED: identities in the population and not excluded. Excluded and out-of-population identities
@@ -280,7 +306,7 @@ export function compareKeyed(input: CompareInput): CompareResult {
   // A proof exists only for something that could pass: equal identities that were really compared, or a named proof that
   // the judged population is empty. A comparison with nothing but findings or unsettled identities has none.
   const proof: ItemProof | null = buckets.bothEqual.length > 0 ? { kind: 'compared' } : judged === 0 ? { kind: 'proven-empty', source: input.emptyProof as PackEmptyProofCode } : null
-  return { status: 'compared', buckets, nextCarried, proof }
+  return { status: 'compared', buckets, nextCarried, proof, carriedUnusable: input.settling !== undefined && !input.settling.usable }
 }
 
 /**
@@ -302,8 +328,10 @@ export function outcomeOfComparison(result: CompareResult): { outcome: 'pass' | 
   if (result.status === 'unreadable') return { outcome: 'inconclusive', reasons: [result.reason] }
   const findings = FINDING_BUCKETS.reduce((sum, bucket) => sum + result.buckets[bucket].length, 0)
   const unsettled = result.buckets.unsettled.length
-  if (findings > 0) return { outcome: 'fail', reasons: unsettled > 0 ? ['DIFFERENCES', 'UNSETTLED_PENDING'] : ['DIFFERENCES'] }
-  if (unsettled > 0) return { outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'] }
+  // An unsettled difference whose carried state could not be used is said to be so: it cannot mature while that holds.
+  const unusable: PackReasonCode[] = unsettled > 0 && result.carriedUnusable ? ['SETTLING_STATE_UNUSABLE'] : []
+  if (findings > 0) return { outcome: 'fail', reasons: unsettled > 0 ? ['DIFFERENCES', 'UNSETTLED_PENDING', ...unusable] : ['DIFFERENCES'] }
+  if (unsettled > 0) return { outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING', ...unusable] }
   if (result.proof === null) return { outcome: 'inconclusive', reasons: ['EMPTY_UNPROVEN'] }
   return { outcome: 'pass', reasons: [] }
 }

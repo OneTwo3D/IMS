@@ -78,7 +78,7 @@ test('nothing but a pass carries a proof; a pass carries no reason, finding or u
   rejects(put(base(), { id: 'R3', outcome: 'fail', reasons: ['DIFFERENCES'], proof: { kind: 'compared' } }))
   rejects(put(base(), { ...passItem('R3'), reasons: ['DIFFERENCES'] }))
   rejects(put(base(), { ...passItem('R3'), entries: { onlyIms: [solo('A|MAIN')] } }))
-  rejects(put(base(), { ...passItem('R3'), entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: [] } }] } }))
+  rejects(put(base(), { ...passItem('R3'), entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] } }))
 })
 
 test('fail, inconclusive and not-applicable have invariants of their own', () => {
@@ -96,8 +96,8 @@ test('fail, inconclusive and not-applicable have invariants of their own', () =>
   accepts(put(base(), R('inconclusive', ['STALE_BASIS'])))
   // UNSETTLED_PENDING and the unsettled count agree, in both directions
   rejects(put(base(), R('inconclusive', ['UNSETTLED_PENDING'])))
-  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
-  accepts(put(base(), R('inconclusive', ['UNSETTLED_PENDING'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: [] } }] } })))
+  rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] } })))
+  accepts(put(base(), R('inconclusive', ['UNSETTLED_PENDING'], { entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] } })))
   // NO_RUNNER is an inconclusive item with nothing listed
   rejects(put(base(), R('fail', ['NO_RUNNER', 'DIFFERENCES'])))
   rejects(put(base(), R('inconclusive', ['NO_RUNNER'], { entries: { excluded: [solo('A|MAIN')] } })))
@@ -219,9 +219,9 @@ test('the builder refuses every malformed input shape with ReportInvalid (never 
     ['an entry key missing', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ims: '1', vendor: '1', delta: '0' }] } } as never))],
     ...['NaN', '', '1e3', ' 1', '-0', '1.50', '01', '+1', 5, undefined].map((value): [string, () => ReportInput] => [`an entry value ${String(value)}`, () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ ...solo('A|MAIN'), ims: value }] } } as never))]),
     ['an entry delta undefined', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['STALE_BASIS'], entries: { excluded: [{ key: 'A|MAIN', ims: null, vendor: null }] } } as never))],
-    ['a settling stamp bad', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: 'soon', later: [] } }] } } as never))],
+    ['a settling stamp bad', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: 'soon', later: [] } }] } } as never))],
     ['settling not an object', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: 'x' }] } } as never))],
-    ['settling later not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { first: STAMP, later: 'x' } }] } } as never))],
+    ['settling later not a list', () => input(put(good(), { id: 'R3', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: { unsettled: [{ ...solo('A|MAIN'), settling: { sequence: 1, first: STAMP, later: 'x' } }] } } as never))],
   ]
   for (const [name, make] of bad) assert.throws(() => buildReport(make(), 1, null), ReportInvalid, name)
   assert.doesNotThrow(() => buildReport(input(base()), 1, null))

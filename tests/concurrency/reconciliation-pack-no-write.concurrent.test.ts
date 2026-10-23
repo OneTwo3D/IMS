@@ -204,6 +204,9 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
   const http = await import('node:http')
   const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
   const { healthyLiveness } = await import('../reconciliation-pack/basis-fixtures.ts')
+  const { goodReport, withStamp } = await import('../reconciliation-pack/liveness-fixtures.ts')
+  const { reduceStatusReport } = await import('../../lib/reconciliation-pack/liveness.ts')
+  let sweepStamp: string | null = null
   const { encryptSettingValue } = await import('../../lib/security/encrypted-settings.ts')
   const seen: Array<{ method: string; url: string; authorization: string | undefined }> = []
   const row = (id: number) => ({ id, status: 'processing', currency: 'GBP', total: '12.50', date_created_gmt: '2026-10-10T09:30:00', billing: { email: 'customer@example.com' } })
@@ -256,7 +259,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
         targets.push(typeof first === 'object' && first !== null ? (first.path ? `unix:${first.path}` : `${first.host ?? 'localhost'}:${first.port}`) : `${typeof args[1] === 'string' ? args[1] : 'localhost'}:${String(first)}`)
         return (original as (...a: unknown[]) => unknown).apply(this, args)
       } as typeof original
-      const code = await runPackCli({ argv: ['--phase', 'P1', '--as-of', LD, '--items', 'R9,R13', '--report-dir', dir, ...extra], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), deps: { liveness: healthyLiveness() }, stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
+      const code = await runPackCli({ argv: ['--phase', 'P1', '--as-of', LD, '--items', 'R9,R13', '--report-dir', dir, ...extra], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), deps: { liveness: sweepStamp === null ? healthyLiveness() : { read: async () => reduceStatusReport(withStamp(goodReport(), 'woocommerce-order-sweep', sweepStamp!)) } }, stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
       net.Socket.prototype.connect = original
       const after = await census()
       assert.deepEqual(after.counts, before.counts, 'every table has the rows it had')
@@ -333,8 +336,17 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     await sql(`DELETE FROM shopping_order_links WHERE id = $1`, [`${VTAG}-l2`])
     await sql(`INSERT INTO shopping_order_links (id, "orderId", connector, "externalOrderId", "updatedAt") VALUES ($1, $2, 'woocommerce', '9003', now())`, [`${VTAG}-l2`, `${VTAG}-o2`])
     const swapped = await run(['--vendor-reads-only'])
-    assert.equal(swapped.code, 1, swapped.out.join('\n'))
-    assert.ok(swapped.out.includes('R9 fail DIFFERENCES'), swapped.out.join('\n'))
+    // D7: a difference first seen is UNSETTLED (the previous report is a usable pass, so nothing says the state was unusable) ...
+    assert.equal(swapped.code, 5, swapped.out.join('\n'))
+    assert.ok(swapped.out.includes('R9 inconclusive UNSETTLED_PENDING'), swapped.out.join('\n'))
+    // ... still unsettled after one further run of the order sweep, and a failure after two (nothing is written by any of them).
+    sweepStamp = '2026-10-20T01:30:00.000Z'
+    const again = await run(['--vendor-reads-only'])
+    assert.ok(again.out.includes('R9 inconclusive UNSETTLED_PENDING'), again.out.join('\n'))
+    sweepStamp = '2026-10-20T02:30:00.000Z'
+    const settled = await run(['--vendor-reads-only'])
+    assert.equal(settled.code, 1, settled.out.join('\n'))
+    assert.ok(settled.out.includes('R9 fail DIFFERENCES'), settled.out.join('\n'))
   } finally {
     net.Socket.prototype.connect = original
     if (previousMode === undefined) delete process.env.E2E_TEST_MODE; else process.env.E2E_TEST_MODE = previousMode

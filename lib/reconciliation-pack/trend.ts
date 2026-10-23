@@ -19,9 +19,10 @@ import path from 'node:path'
 
 import { checkAncestors, readTrustedRegularFileBytes } from '@/lib/ops/published-report'
 import { MAX_EVIDENCE_BYTES, MAX_REPORTS_READ, MAX_REPORT_JSON_BYTES, PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN, type PackChainCode, type PackItemId, type PackOutcome } from '@/lib/reconciliation-pack/constants'
-import { RUN_ID_RE, ReportInvalid, parseReport, sha256Hex, verifyEvidence, type ReportRecord } from '@/lib/reconciliation-pack/report'
+import { RUN_ID_RE, ReportInvalid, extractSettlingLines, parseReport, sha256Hex, verifyEvidence, type ReportRecord, type SettlingLine } from '@/lib/reconciliation-pack/report'
 
-export type ChainEntry = { sequence: number; runId: string; sha256: string; record: ReportRecord }
+/** `settling` is the verified evidence's entries that carry settling state (the only part of the evidence a later run reads). */
+export type ChainEntry = { sequence: number; runId: string; sha256: string; record: ReportRecord; settling: SettlingLine[] }
 export type ChainResult =
   | { ok: true; reports: ChainEntry[]; head: ChainEntry | null; unpublishedRuns: number }
   | { ok: false; code: PackChainCode; runId: string | null }
@@ -67,7 +68,7 @@ export function readPackChain(reportDir: string): ChainResult {
       const evidence = readTrustedRegularFileBytes(path.join(dir, PACK_EVIDENCE_FILE), MAX_EVIDENCE_BYTES)
       verifyEvidence(evidence.toString('utf8'), record)
       if (sha256Hex(evidence) !== record.evidence.sha256) throw new ReportInvalid('the evidence bytes are not valid UTF-8 text')
-      found.push({ sequence: record.sequence, runId, sha256: sha256Hex(jsonBytes), record })
+      found.push({ sequence: record.sequence, runId, sha256: sha256Hex(jsonBytes), record, settling: extractSettlingLines(evidence.toString('utf8')) })
     } catch {
       return refuse('PAIR_INVALID', runId)
     }

@@ -21,6 +21,7 @@ import {
   FINDING_BUCKETS,
   MAX_ENTRIES_PER_BUCKET,
   MAX_EVIDENCE_LINES_PER_ITEM,
+  PENDING_PERSISTENCE_RUNS,
   isKnownCurrency,
   PACK_EVIDENCE_FILE,
   PACK_ITEM_IDS,
@@ -59,7 +60,7 @@ const EMIT_ORDER: readonly ComparisonBucket[] = ['onlyIms', 'onlyVendor', 'bothD
 
 /** What a caller may hand in for one entry. The currencies default to null; no other field is optional. */
 /** The key is checked at runtime against the sanitised-token shape (identity.ts), so the type does not demand the brand. */
-export type EntryInput = Omit<CompareEntry, 'imsCurrency' | 'vendorCurrency' | 'imsPresent' | 'vendorPresent' | 'key'> & { key: string; imsCurrency?: string | null; vendorCurrency?: string | null; imsPresent?: boolean; vendorPresent?: boolean }
+export type EntryInput = Omit<CompareEntry, 'imsCurrency' | 'vendorCurrency' | 'imsPresent' | 'vendorPresent' | 'key' | 'settling'> & { key: string; settling?: { sequence?: number | null; first: string; later: string[]; count?: number }; imsCurrency?: string | null; vendorCurrency?: string | null; imsPresent?: boolean; vendorPresent?: boolean }
 
 export type ItemInput = {
   id: PackItemId
@@ -173,7 +174,8 @@ export type CleanEntry = {
   /** Whether each side had the identity. In values mode this is exactly "the side has a value"; in presence mode it is the only record of it. */
   imsPresent: boolean
   vendorPresent: boolean
-  settling?: { first: string; later: string[] }
+  /** The settling state (see the settling block of the docs). Evidence always carries all four fields; `count` is the length of `later`. */
+  settling?: { sequence: number; first: string; later: string[]; count: number }
 }
 const ENTRY_KEYS = ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency', 'imsPresent', 'vendorPresent', 'settling'] as const
 const MAX_SETTLING_LATER = 8
@@ -203,7 +205,7 @@ function presenceFlag(flag: unknown, defaultsFor: PackItemId | null, value: unkn
 }
 
 /** Copy one caller-owned entry into a clean one (or throw). Used for builder input and for parsed evidence lines alike. */
-function cleanEntry(raw: unknown, defaultsFor: PackItemId | null): CleanEntry {
+function cleanEntry(raw: unknown, defaultsFor: PackItemId | null, fillSequence: number | null = null): CleanEntry {
   const r = plainRecord(raw, ENTRY_KEYS, defaultsFor ? ['key', 'ims', 'vendor', 'delta'] : ['key', 'ims', 'vendor', 'delta', 'imsCurrency', 'vendorCurrency', 'imsPresent', 'vendorPresent'], 'an entry')
   if (typeof r.key !== 'string' || !isSafeTokenShape(r.key)) throw new ReportInvalid('an entry key is not a sanitised token')
   const entry: CleanEntry = {
@@ -217,11 +219,20 @@ function cleanEntry(raw: unknown, defaultsFor: PackItemId | null): CleanEntry {
     vendorPresent: presenceFlag(r.vendorPresent, defaultsFor, r.vendor, 'vendor'),
   }
   if (r.settling !== undefined) {
-    const settling = plainRecord(r.settling, ['first', 'later'], ['first', 'later'], 'settling data')
-    if (!isStreamStamp(settling.first)) throw new ReportInvalid('an unsettled entry carries a bad stamp')
+    // Builder input (fillSequence given) may leave `sequence` out or null (a difference first seen in this run: the builder says which
+    // report that is) and `count` out; evidence (no fill) carries every field.
+    const strict = fillSequence === null
+    const settling = plainRecord(r.settling, ['sequence', 'first', 'later', 'count'], strict ? ['sequence', 'first', 'later', 'count'] : ['first', 'later'], 'settling data')
+    if (!isStreamStamp(settling.first)) throw new ReportInvalid('an entry carries a bad settling stamp')
     const later = plainList(settling.later, MAX_SETTLING_LATER, 'settling stamps')
-    if (!later.every(isStreamStamp)) throw new ReportInvalid('an unsettled entry carries a bad stamp')
-    entry.settling = { first: settling.first, later: later as string[] }
+    if (!later.every(isStreamStamp)) throw new ReportInvalid('an entry carries a bad settling stamp')
+    // Distinct stamps, none equal to the first: a repeated stamp is the same run of the stream and is never counted twice.
+    if (new Set([settling.first, ...later]).size !== later.length + 1) throw new ReportInvalid('an entry carries a settling stamp more than once')
+    const sequence = settling.sequence === undefined || settling.sequence === null ? fillSequence : settling.sequence
+    if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 1) throw new ReportInvalid('an entry carries a bad first-seen sequence')
+    const count = settling.count === undefined ? later.length : settling.count
+    if (count !== later.length) throw new ReportInvalid('an entry settling count is not the number of later stamps')
+    entry.settling = { sequence, first: settling.first, later: later as string[], count }
   }
   return entry
 }
@@ -234,7 +245,14 @@ function cleanEntry(raw: unknown, defaultsFor: PackItemId | null): CleanEntry {
 export function checkEntry(id: PackItemId, bucket: ComparisonBucket, entry: CleanEntry): void {
   const fail = (why: string): never => { throw new ReportInvalid(`item ${id}: ${bucket} entry ${why}`) }
   const spec = getPackItem(id)
-  if ((entry.settling !== undefined) !== (bucket === 'unsettled')) fail('settling data belongs to unsettled entries and to nothing else')
+  // Settling state belongs to the unsettled entries, and to the failing entries of an item that settles (it is how the next run knows a
+  // difference has already persisted); nowhere else. An unsettled entry has not yet seen its later runs; a failing one has seen them all.
+  const carriesSettling = bucket === 'unsettled' || ((FINDING_BUCKETS as readonly string[]).includes(bucket) && spec.settles)
+  if ((entry.settling !== undefined) !== carriesSettling) fail('settling data belongs to unsettled entries and to the failing entries of an item that settles, and to nothing else')
+  if (entry.settling !== undefined) {
+    if (bucket === 'unsettled' && entry.settling.count >= PENDING_PERSISTENCE_RUNS) fail('is unsettled but has already persisted')
+    if (bucket !== 'unsettled' && entry.settling.count !== PENDING_PERSISTENCE_RUNS) fail('is a failure that has not persisted')
+  }
   if (!entry.imsPresent && !entry.vendorPresent) fail('is present on neither side')
 
   // What the entry says about the pair, derived from the recorded fields alone: the bucket is judged against this, never believed.
@@ -285,7 +303,7 @@ export function checkEntry(id: PackItemId, bucket: ComparisonBucket, entry: Clea
 type CleanItem = { id: PackItemId; outcome: PackOutcome; reasons: PackReasonCode[]; proof: ItemProof | null; sources: PackSourceCode[]; entries: Record<ComparisonBucket, CleanEntry[]> }
 type CleanInput = { runId: string; systemIdentifier: string; phase: ReadinessPhase; asOf: string; startedAt: string; finishedAt: string; streams: StreamBracket[]; items: CleanItem[] }
 
-function cleanItem(raw: unknown): CleanItem {
+function cleanItem(raw: unknown, sequence: number): CleanItem {
   const r = plainRecord(raw, ['id', 'outcome', 'reasons', 'proof', 'sources', 'entries'], ['id', 'outcome', 'reasons'], 'an item')
   if (typeof r.id !== 'string' || !(PACK_ITEM_IDS as readonly string[]).includes(r.id)) throw new ReportInvalid('an item has an unknown id')
   const id = r.id as PackItemId
@@ -307,13 +325,13 @@ function cleanItem(raw: unknown): CleanItem {
     const e = plainRecord(r.entries, COMPARISON_BUCKETS, [], `item ${id} entries`)
     for (const bucket of COMPARISON_BUCKETS) {
       if (e[bucket] === undefined) continue
-      entries[bucket] = plainList(e[bucket], MAX_ENTRIES_PER_BUCKET, `item ${id} ${bucket} entries`).map((raw) => cleanEntry(raw, id))
+      entries[bucket] = plainList(e[bucket], MAX_ENTRIES_PER_BUCKET, `item ${id} ${bucket} entries`).map((raw) => cleanEntry(raw, id, sequence))
     }
   }
   return { id, outcome: r.outcome as PackOutcome, reasons: reasons as PackReasonCode[], proof, sources: sources as PackSourceCode[], entries }
 }
 
-function cleanInput(raw: unknown): CleanInput {
+function cleanInput(raw: unknown, sequence: number): CleanInput {
   const r = plainRecord(raw, ['runId', 'systemIdentifier', 'phase', 'asOf', 'startedAt', 'finishedAt', 'streams', 'items'], ['runId', 'systemIdentifier', 'phase', 'asOf', 'startedAt', 'finishedAt', 'streams', 'items'], 'the report input')
   if (typeof r.runId !== 'string' || !RUN_ID_RE.test(r.runId)) throw new ReportInvalid('runId has the wrong shape')
   if (typeof r.systemIdentifier !== 'string' || !SYSTEM_IDENTIFIER_RE.test(r.systemIdentifier)) throw new ReportInvalid('systemIdentifier has the wrong shape')
@@ -326,7 +344,7 @@ function cleanInput(raw: unknown): CleanInput {
     for (const stamp of [b.start, b.end]) if (stamp !== null && !isStreamStamp(stamp)) throw new ReportInvalid('a stream stamp is not an ISO time')
     return { stream: b.stream, start: b.start as string | null, end: b.end as string | null }
   })
-  const items = plainList(r.items, PACK_ITEM_IDS.length, 'items').map(cleanItem)
+  const items = plainList(r.items, PACK_ITEM_IDS.length, 'items').map((item) => cleanItem(item, sequence))
   return { runId: r.runId, systemIdentifier: r.systemIdentifier, phase: r.phase as ReadinessPhase, asOf: r.asOf, startedAt: r.startedAt as string, finishedAt: r.finishedAt as string, streams, items }
 }
 
@@ -352,7 +370,7 @@ function itemEvidence(item: CleanItem, maxLines: number): { lines: string[]; cou
 }
 
 function evidenceLine(item: PackItemId, bucket: ComparisonBucket, entry: CleanEntry): string {
-  const line = { item, bucket, key: entry.key, ims: entry.ims, vendor: entry.vendor, delta: entry.delta, imsCurrency: entry.imsCurrency, vendorCurrency: entry.vendorCurrency, imsPresent: entry.imsPresent, vendorPresent: entry.vendorPresent, ...(entry.settling ? { settling: { first: entry.settling.first, later: [...entry.settling.later] } } : {}) }
+  const line = { item, bucket, key: entry.key, ims: entry.ims, vendor: entry.vendor, delta: entry.delta, imsCurrency: entry.imsCurrency, vendorCurrency: entry.vendorCurrency, imsPresent: entry.imsPresent, vendorPresent: entry.vendorPresent, ...(entry.settling ? { settling: { sequence: entry.settling.sequence, first: entry.settling.first, later: [...entry.settling.later], count: entry.settling.count } } : {}) }
   return JSON.stringify(line)
 }
 
@@ -378,6 +396,7 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
   // Reason/count coupling that holds for every outcome.
   if (has('PHASE_NOT_APPLICABLE') !== (input.outcome === 'not-applicable')) fail('PHASE_NOT_APPLICABLE belongs to not-applicable and nothing else')
   if (has('UNSETTLED_PENDING') !== (counts.unsettled > 0)) fail('UNSETTLED_PENDING and the unsettled count must agree')
+  if (has('SETTLING_STATE_UNUSABLE') && (input.outcome === 'pass' || counts.unsettled === 0 || !spec.settles)) fail('SETTLING_STATE_UNUSABLE belongs to an item that settles and has something unsettled')
   if (has('NO_RUNNER') && (input.outcome !== 'inconclusive' || everything !== 0)) fail('NO_RUNNER is an inconclusive item with nothing listed')
   if (has('VENDOR_READS_OFF') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1 || input.sources.length !== 0 || !itemNeedsVendor(input.id))) fail('VENDOR_READS_OFF is an inconclusive item that needs a vendor, with nothing listed, nothing read and no other reason')
   if (has('NOT_SELECTED') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1)) fail('NOT_SELECTED is an inconclusive item with nothing listed and no other reason')
@@ -435,7 +454,7 @@ export function buildReport(raw: ReportInput, sequence: number, previousReportSh
   if ((sequence === 1) !== (previousReportSha256 === null)) throw new ReportInvalid('previousReportSha256 is null exactly for sequence 1')
   if (previousReportSha256 !== null && !SHA256_RE.test(previousReportSha256)) throw new ReportInvalid('previousReportSha256 is not a sha256')
   let input: CleanInput
-  try { input = cleanInput(raw) } catch (error) {
+  try { input = cleanInput(raw, sequence) } catch (error) {
     if (error instanceof ShapeError) throw new ReportInvalid(error.message)
     throw error
   }
@@ -616,6 +635,8 @@ export function verifyEvidence(text: string, record: ReportRecord): void {
   const tally = new Map<string, number>()
   const equalKeys = new Map<PackItemId, string[]>()
   const seen = new Map<string, Set<string>>()
+  // Per item: whether EVERY unsettled entry was first seen in this very report (what SETTLING_STATE_UNUSABLE says).
+  const firstSeenNow = new Map<string, boolean>()
   for (const line of lines) {
     let parsed: unknown
     try { parsed = JSON.parse(line) } catch { throw new ReportInvalid('an evidence line is not JSON') }
@@ -638,6 +659,12 @@ export function verifyEvidence(text: string, record: ReportRecord): void {
       throw error
     }
     checkEntry(id, bucket, entry)
+    if (entry.settling !== undefined) {
+      // First seen in THIS report exactly when no later stamp has been counted; never in a report that does not exist yet.
+      if (entry.settling.sequence > record.sequence) throw new ReportInvalid(`item ${id}: ${bucket} entry was first seen in a later report than this one`)
+      if (entry.settling.count > 0 && entry.settling.sequence >= record.sequence) throw new ReportInvalid(`item ${id}: ${bucket} entry counts later runs but was first seen in this report`)
+      if (bucket === 'unsettled') firstSeenNow.set(id, firstSeenNow.get(id) !== false && entry.settling.sequence === record.sequence && entry.settling.count === 0)
+    }
     const identities = seen.get(id) ?? new Set<string>()
     if (identities.has(entry.key)) throw new ReportInvalid(`item ${id}: an identity appears twice in the evidence`)
     identities.add(entry.key)
@@ -647,9 +674,33 @@ export function verifyEvidence(text: string, record: ReportRecord): void {
     if (bucket === 'bothEqual') equalKeys.set(id, [...(equalKeys.get(id) ?? []), entry.key])
   }
   for (const item of record.items) {
+    if (item.reasons.includes('SETTLING_STATE_UNUSABLE') && firstSeenNow.get(item.id) !== true) throw new ReportInvalid(`item ${item.id}: SETTLING_STATE_UNUSABLE is recorded but an unsettled entry is a continuation`)
     for (const bucket of LISTED_BUCKETS) {
       if ((tally.get(`${item.id}/${bucket}`) ?? 0) !== item.counts[bucket]) throw new ReportInvalid(`item ${item.id}: ${bucket} count is not what the evidence lists`)
     }
     if (equalDigest(equalKeys.get(item.id) ?? []) !== item.bothEqualSha256) throw new ReportInvalid(`item ${item.id}: the bothEqual identities do not match their digest`)
   }
+}
+
+/** One evidence entry that carries settling state, as read back from VERIFIED evidence. */
+export type SettlingLine = { item: PackItemId; bucket: ComparisonBucket; entry: CleanEntry }
+
+/**
+ * The entries of verified evidence that carry settling state (unsettled, and the failing entries of an item that settles). Call it only
+ * on text verifyEvidence has accepted: it re-parses each line with the same strict reader and throws ReportInvalid on anything else.
+ */
+export function extractSettlingLines(text: string): SettlingLine[] {
+  const out: SettlingLine[] = []
+  if (text.length === 0) return out
+  for (const line of text.slice(0, -1).split('\n')) {
+    let parsed: unknown
+    try { parsed = JSON.parse(line) } catch { throw new ReportInvalid('an evidence line is not JSON') }
+    const fields = plainRecord(parsed, ['item', 'bucket', ...ENTRY_KEYS], ['item', 'bucket', 'key'], 'an evidence line')
+    if (typeof fields.item !== 'string' || !(PACK_ITEM_IDS as readonly string[]).includes(fields.item)) throw new ReportInvalid('an evidence line names an unknown item')
+    if (typeof fields.bucket !== 'string' || !(LISTED_BUCKETS as readonly string[]).includes(fields.bucket)) throw new ReportInvalid('an evidence line names an unknown bucket')
+    const { item, bucket, ...rest } = fields
+    const entry = cleanEntry(rest, null)
+    if (entry.settling !== undefined) out.push({ item: item as PackItemId, bucket: bucket as ComparisonBucket, entry })
+  }
+  return out
 }

@@ -149,7 +149,7 @@ test('builder: a pass may carry no reason, no finding and nothing unsettled', ()
   const entries = { onlyIms: [{ key: 'A|MAIN' as never, ims: '1', vendor: null, delta: null }] }
   assert.throws(() => buildReport(input(replace(baseItems(), { id: 'R3', outcome: 'pass', reasons: ['DIFFERENCES'] })), 1, null), ReportInvalid)
   assert.throws(() => buildReport(input(replace(baseItems(), { id: 'R3', outcome: 'pass', reasons: [], entries })), 1, null), ReportInvalid)
-  assert.throws(() => buildReport(input(replace(baseItems(), { id: 'R3', outcome: 'pass', reasons: [], entries: { unsettled: [{ key: 'A|MAIN' as never, ims: null, vendor: null, delta: null, settling: { first: '2026-10-01T00:00:00Z', later: [] } }] } })), 1, null), ReportInvalid)
+  assert.throws(() => buildReport(input(replace(baseItems(), { id: 'R3', outcome: 'pass', reasons: [], entries: { unsettled: [{ key: 'A|MAIN' as never, ims: null, vendor: null, delta: null, settling: { sequence: 1, first: '2026-10-01T00:00:00Z', later: [] } }] } })), 1, null), ReportInvalid)
 })
 
 test('builder: fail and inconclusive need a reason; a fail names a finding or a reason other than UNSETTLED_PENDING', () => {

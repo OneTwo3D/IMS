@@ -33,12 +33,13 @@
  *        Xero. A WooCommerce leg with a finding is still a FAIL (it is true whatever the Xero leg says), and it
  *        carries VENDOR_LIST_UNPROVEN beside DIFFERENCES; a clean WooCommerce leg with an unproven Xero leg is inconclusive, never a pass.
  *
- * No difference is settled over later runs here (the pack carries no settling state for any item yet), so a difference seen is a
- * failure on this run.
+ * R9 SETTLES (owner decision D7): a difference first seen is UNSETTLED (inconclusive UNSETTLED_PENDING), and fails only when it is still
+ * there after two LATER successful runs of the order sweep stream, counted as distinct last-success stamps carried in the pack's own
+ * reports (compare.ts advanceDifference, settling.ts for what may be carried). R13 does not settle: its difference fails at once.
  */
 
 import type { ImsRead, ImsReadOptions, OrderRow, StorefrontStatusConfig, TaxRateRow, TaxMappingRow } from '@/lib/reconciliation-pack/ims-readers'
-import { compareItem, outcomeOfComparison, type CompareResult, type SideRow } from '@/lib/reconciliation-pack/compare'
+import { compareItem, outcomeOfComparison, type CompareResult, type SettlingInput, type SideRow } from '@/lib/reconciliation-pack/compare'
 import {
   IMS_OPEN_ORDER_STATUSES,
   WOO_BUILT_IN_STATUS_MAP,
@@ -69,6 +70,8 @@ export type VendorItemContext = {
   ims?: (options: ImsReadOptions) => Promise<ImsRead>
   /** Test seam for pacing and budget. */
   wooOptions?: WooSourceOptions
+  /** R9 only: the state carried from the previous report and the stream stamp of this run (set by runItems). Absent = no stamp, so R9 is inconclusive STALE_BASIS and never a pass. */
+  settling?: SettlingInput
 }
 
 const IMS: PackSourceCode = 'ims-database'
@@ -193,7 +196,10 @@ async function runR9(context: VendorItemContext): Promise<ItemInput> {
     if (!unlinked.has(canonical)) population.add(canonical)
   }
 
-  const result = compareItem('R9', { ims, vendor, imsComplete: true, vendorComplete: true, population, emptyProof: walked.value.allZero ? 'per-status-total-zero' : undefined })
+  // R9 settles (its catalogue row): a difference fails only after two later successful runs of the order sweep. Without the run's settling
+  // input there is no stamp to settle under, and the comparator says so (STALE_BASIS); it never falls back to failing at once.
+  const settling: SettlingInput = context.settling ?? { carried: new Map(), usable: false, stamp: null }
+  const result = compareItem('R9', { ims, vendor, imsComplete: true, vendorComplete: true, population, emptyProof: walked.value.allZero ? 'per-status-total-zero' : undefined, settling })
   return fromComparison('R9', result, [IMS, WOO])
 }
 
