@@ -35,7 +35,8 @@ import type { VendorPorts } from '../lib/reconciliation-pack/vendor-items.ts'
 import type { WooGetPort } from '../lib/reconciliation-pack/woo-source.ts'
 import { memoisedInvariant, readLivenessSafe, runItems, type BasisPort, type ItemRunner, type LedgerRunner, type LivenessPort } from '../lib/reconciliation-pack/run.ts'
 import { readPackChain } from '../lib/reconciliation-pack/trend.ts'
-import type { PackItemId } from '../lib/reconciliation-pack/constants.ts'
+import { carriedStateFromChain, type CarriedState } from '../lib/reconciliation-pack/settling.ts'
+import { PACK_ITEM_IDS, getPackItem, type PackItemId } from '../lib/reconciliation-pack/constants.ts'
 import type { LedgerItemId } from '../lib/reconciliation-pack/ledger-items.ts'
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
@@ -227,6 +228,8 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       basis,
       runners: deps.runners,
       ledgerRunners: deps.ledgerRunners,
+      // What the previous report carries for each item that settles, from the chain read above (trusted, or the run stopped).
+      carried: Object.fromEntries(PACK_ITEM_IDS.filter((id) => getPackItem(id).settles).map((id) => [id, carriedStateFromChain(chain, id, { phase: args.phase, systemIdentifier: systemIdentifier! })])) as Partial<Record<PackItemId, CarriedState>>,
       context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor },
     })
     const finishedAt = deps.now()

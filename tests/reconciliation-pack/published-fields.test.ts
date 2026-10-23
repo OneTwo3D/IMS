@@ -132,7 +132,7 @@ test('UNIVERSAL: every key in the JSON, the evidence and the lock has a row in t
   const rows = compareItem('R1', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'A1' }], value: '5' }, { key: [{ kind: 'sku', raw: CANARY }], value: '2' }, { key: [{ kind: 'sku', raw: 'E1' }], value: '1' }], vendor: [{ key: [{ kind: 'sku', raw: 'E1' }], value: '1' }, { key: [{ kind: 'sku', raw: 'V1' }], value: '3' }] })
   const r9 = compareItem('R9', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'vendor-id', raw: 1001 }], value: '10', currency: 'GBP' }], vendor: [{ key: [{ kind: 'vendor-id', raw: 1001 }], value: '10.01', currency: 'GBP' }] })
   const r13 = compareItem('R13', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'TAX1' }] }, { key: [{ kind: 'sku', raw: 'TAX2' }] }], vendor: [{ key: [{ kind: 'sku', raw: 'TAX1' }] }] })
-  const unsettled = compareItem('R12', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'U1' }], value: '4' }], vendor: [], settling: { carried: new Map(), stamp: STAMP } })
+  const unsettled = compareItem('R12', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'U1' }], value: '4' }], vendor: [], settling: { carried: new Map(), stamp: STAMP, usable: true } })
   assert.ok([rows, r9, r13, unsettled].every((r) => r.status === 'compared'))
   const entries = (r: typeof rows) => (r.status === 'compared' ? r.buckets : undefined)
   const held: { lock?: string } = {}

@@ -57,6 +57,17 @@ test('an inconclusive item is NEVER a pass or "not available" - with one excepti
   assert.equal(assessPackItem({ record: packRecord('P1', { items: { R9: inconclusive('R9', 'NO_RUNNER', 'STALE_BASIS') } }) }, 'R9', ctx()).kind, 'unreadable', 'NO_RUNNER with another reason is not the exception')
 })
 
+// [mutation: UNSETTLED_PENDING (alone, or beside SETTLING_STATE_UNUSABLE) mapped to pass or to not-available]
+test('D7: R9 still settling (UNSETTLED_PENDING, with or without SETTLING_STATE_UNUSABLE) is UNREADABLE for the gate - not a pass, not "not available" (a failure maps to fail as for every item, above)', () => {
+  const stamp = '2026-10-19T00:00:00.000Z'
+  const unsettled = (reasons: ItemInput['reasons']): ItemInput => ({ id: 'R9', outcome: 'inconclusive', reasons, entries: { unsettled: [{ key: '12', ims: '1', vendor: null, delta: null, imsCurrency: 'GBP', settling: { sequence: 1, first: stamp, later: [] } }] } })
+  for (const reasons of [['UNSETTLED_PENDING'], ['UNSETTLED_PENDING', 'SETTLING_STATE_UNUSABLE']] as const) {
+    const result = assessPackItem({ record: packRecord('P1', { items: { R9: unsettled(reasons) } }) }, 'R9', ctx())
+    assert.equal(result.kind, 'unreadable', reasons.join(','))
+    assert.ok(result.kind === 'unreadable' && result.reason.includes('UNSETTLED_PENDING'))
+  }
+})
+
 // [mutation: the VENDOR_READS_OFF reading removed from assessPackItem / widened to "any reason list that contains it"]
 test('VENDOR_READS_OFF alone (the run did not opt in to vendor reads) is not available, like NO_RUNNER: the slot is what it was before the pack could read vendors; and a partial run (NOT_SELECTED) stays unreadable', () => {
   const off = assessPackItem({ record: packRecord('P1', { items: { R9: inconclusive('R9', 'VENDOR_READS_OFF') } }) }, 'R9', ctx())

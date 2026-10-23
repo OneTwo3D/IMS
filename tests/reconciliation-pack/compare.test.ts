@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  advanceDifference, bracketStable, bucketCounts, compareKeyed, outcomeOfComparison, parseDecimalStrict, toleranceLimit, withinTolerance,
+  advanceDifference, bracketStable, bucketCounts, compareKeyed, differenceSignature, outcomeOfComparison, parseDecimalStrict, toleranceLimit, withinTolerance,
   type CarriedDifference, type CompareInput, type CompareResult, type SideRow, type Tolerance,
 } from '../../lib/reconciliation-pack/compare.ts'
 import { canonicalKey, keyToken, type KeyPart } from '../../lib/reconciliation-pack/identity.ts'
@@ -168,18 +168,18 @@ const T3 = '2026-10-03T00:00:00.000Z'
 const T4 = '2026-10-04T00:00:00.000Z'
 
 function run(stamp: string | null, carried: ReadonlyMap<string, CarriedDifference>, ims = '1', vendor = '2') {
-  const result = compare({ ims: [row('A', ims)], vendor: [row('A', vendor)], settling: { carried, stamp } })
+  const result = compare({ ims: [row('A', ims)], vendor: [row('A', vendor)], settling: { carried, stamp, usable: true } })
   return result as Extract<CompareResult, { status: 'compared' }>
 }
 
 test('a difference fails only after two LATER successful runs of its stream (distinct stamps)', () => {
   const first = run(T1, new Map())
   assert.equal(first.buckets.unsettled.length, 1)
-  assert.deepEqual(first.buckets.unsettled[0]!.settling, { first: T1, later: [] })
+  assert.deepEqual(first.buckets.unsettled[0]!.settling, { sequence: null, first: T1, later: [] })
   assert.deepEqual(outcomeOfComparison(first), { outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'] })
   const second = run(T2, first.nextCarried)
   assert.equal(second.buckets.unsettled.length, 1)
-  assert.deepEqual(second.buckets.unsettled[0]!.settling, { first: T1, later: [T2] })
+  assert.deepEqual(second.buckets.unsettled[0]!.settling, { sequence: null, first: T1, later: [T2] })
   assert.equal(outcomeOfComparison(second).outcome, 'inconclusive')
   const third = run(T3, second.nextCarried)
   assert.equal(third.buckets.unsettled.length, 0)
@@ -218,39 +218,41 @@ test('a difference that goes away is dropped from the carried state, and returns
   assert.equal(healed.nextCarried.size, 0)
   assert.equal(outcomeOfComparison(healed).outcome, 'pass')
   const back = run(T3, healed.nextCarried)
-  assert.deepEqual(back.buckets.unsettled[0]!.settling, { first: T3, later: [] })
+  assert.deepEqual(back.buckets.unsettled[0]!.settling, { sequence: null, first: T3, later: [] })
 })
 
 test('a difference that changes kind restarts its count', () => {
   const first = run(T1, new Map())
-  const kinds = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [row('A', '1')], vendor: [], settling: { carried: first.nextCarried, stamp: T2 } }) as Extract<CompareResult, { status: 'compared' }>
-  assert.deepEqual(kinds.buckets.unsettled[0]!.settling, { first: T2, later: [] })
+  const kinds = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [row('A', '1')], vendor: [], settling: { carried: first.nextCarried, stamp: T2, usable: true } }) as Extract<CompareResult, { status: 'compared' }>
+  assert.deepEqual(kinds.buckets.unsettled[0]!.settling, { sequence: null, first: T2, later: [] })
 })
 
 test('onlyIms and onlyVendor settle the same way as a value difference', () => {
   let carried: ReadonlyMap<string, CarriedDifference> = new Map()
   for (const stamp of [T1, T2]) {
-    const r = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp } }) as Extract<CompareResult, { status: 'compared' }>
+    const r = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp, usable: true } }) as Extract<CompareResult, { status: 'compared' }>
     assert.equal(r.buckets.unsettled.length, 1)
     carried = r.nextCarried
   }
-  const done = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp: T3 } }) as Extract<CompareResult, { status: 'compared' }>
+  const done = compareKeyed({ imsComplete: true, vendorComplete: true, mode: 'values', tolerance: EXACT, ims: [], vendor: [row('V', '1')], settling: { carried, stamp: T3, usable: true } }) as Extract<CompareResult, { status: 'compared' }>
   assert.deepEqual(tokens(done.buckets.onlyVendor), ['V|MAIN'])
 })
 
 test('settling needs a usable stamp: a missing or malformed one is STALE_BASIS', () => {
   for (const stamp of [null, '', 'yesterday', '2026-10-01', '2026-13-45T00:00:00Z']) {
-    assert.deepEqual(compare({ ims: [row('A', '1')], vendor: [row('A', '2')], settling: { carried: new Map(), stamp } }), { status: 'unreadable', reason: 'STALE_BASIS' }, String(stamp))
+    assert.deepEqual(compare({ ims: [row('A', '1')], vendor: [row('A', '2')], settling: { carried: new Map(), stamp, usable: true } }), { status: 'unreadable', reason: 'STALE_BASIS' }, String(stamp))
   }
 })
 
+const SIG_A = differenceSignature('bothDiffer', { ims: '1', vendor: '2', imsCurrency: null, vendorCurrency: null })
+const SIG = differenceSignature('onlyIms', { ims: '1', vendor: null, imsCurrency: null, vendorCurrency: null })
 test('advanceDifference: the pure rule, directly', () => {
-  assert.deepEqual(advanceDifference('onlyIms', undefined, T1), { carried: { kind: 'onlyIms', first: T1, later: [] }, persisted: false })
-  const mid = advanceDifference('onlyIms', { kind: 'onlyIms', first: T1, later: [] }, T2)
-  assert.deepEqual(mid, { carried: { kind: 'onlyIms', first: T1, later: [T2] }, persisted: false })
-  assert.equal(advanceDifference('onlyIms', mid.carried, T3).persisted, true)
-  assert.equal(advanceDifference('onlyIms', mid.carried, T1).persisted, false)
-  assert.equal(advanceDifference('onlyIms', mid.carried, T2).persisted, false)
+  assert.deepEqual(advanceDifference('onlyIms', SIG, undefined, T1), { carried: { kind: 'onlyIms', signature: SIG, sequence: null, first: T1, later: [] }, persisted: false })
+  const mid = advanceDifference('onlyIms', SIG, { kind: 'onlyIms', signature: SIG, sequence: 3, first: T1, later: [] }, T2)
+  assert.deepEqual(mid, { carried: { kind: 'onlyIms', signature: SIG, sequence: 3, first: T1, later: [T2] }, persisted: false })
+  assert.equal(advanceDifference('onlyIms', SIG, mid.carried, T3).persisted, true)
+  assert.equal(advanceDifference('onlyIms', SIG, mid.carried, T1).persisted, false)
+  assert.equal(advanceDifference('onlyIms', SIG, mid.carried, T2).persisted, false)
 })
 
 test('the stability bracket is equality of both stamps and nothing else', () => {
@@ -263,8 +265,8 @@ test('the stability bracket is equality of both stamps and nothing else', () => 
 })
 
 test('outcome: a finding beats unsettled; unsettled alone is never a pass', () => {
-  const both = compare({ ims: [row('A', '1'), row('B', '1')], vendor: [row('A', '2'), row('B', '1')], settling: { carried: new Map([['A|MAIN', { kind: 'bothDiffer' as const, first: T1, later: [T2, T3] }]]), stamp: T4 } })
+  const both = compare({ ims: [row('A', '1'), row('B', '1')], vendor: [row('A', '2'), row('B', '1')], settling: { carried: new Map([['A|MAIN', { kind: 'bothDiffer' as const, signature: SIG_A, sequence: 1, first: T1, later: [T2, T3] }]]), stamp: T4, usable: true } })
   assert.deepEqual(outcomeOfComparison(both), { outcome: 'fail', reasons: ['DIFFERENCES'] })
-  const mix = compare({ ims: [row('A', '1'), row('B', '1')], vendor: [row('A', '2'), row('C', '1')], settling: { carried: new Map([['A|MAIN', { kind: 'bothDiffer' as const, first: T1, later: [T2, T3] }]]), stamp: T4 } })
+  const mix = compare({ ims: [row('A', '1'), row('B', '1')], vendor: [row('A', '2'), row('C', '1')], settling: { carried: new Map([['A|MAIN', { kind: 'bothDiffer' as const, signature: SIG_A, sequence: 1, first: T1, later: [T2, T3] }]]), stamp: T4, usable: true } })
   assert.deepEqual(outcomeOfComparison(mix), { outcome: 'fail', reasons: ['DIFFERENCES', 'UNSETTLED_PENDING'] })
 })

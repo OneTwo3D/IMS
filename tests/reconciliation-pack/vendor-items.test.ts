@@ -6,6 +6,7 @@ import type { ImsRead, ImsReadOptions, ImsSectionValues, OrderRow, PopulationBou
 import { openStorefrontStatuses, runVendorItem, type VendorItemContext, type XeroTaxTypeList } from '../../lib/reconciliation-pack/vendor-items.ts'
 import { WOO_BUILT_IN_STATUS_MAP } from '../../lib/reconciliation-pack/constants.ts'
 import { readFileSync } from 'node:fs'
+import { runR9 } from './settling-fixtures.ts'
 import { fakeStore, noSleep, order, type StoreData, type Tweak } from './woo-fixtures.ts'
 
 /**
@@ -61,7 +62,7 @@ const processing = (...ids: number[]) => ids.map((id) => order(id))
 
 test('R9 passes when the open orders are the same set with the same totals, comparing the identities and naming both sources', async () => {
   const { ctx } = context({ orders: [imsOrder(1, '11'), imsOrder(2, '12'), imsOrder(3, '13', { status: 'PICKING' })] }, { orders: { processing: processing(11, 12, 13) } })
-  const item = await runVendorItem('R9', ctx)
+  const item = await runR9(undefined, ctx)
   assert.equal(item.outcome, 'pass')
   assert.deepEqual(item.reasons, [])
   assert.deepEqual(item.proof, { kind: 'compared' })
@@ -71,7 +72,7 @@ test('R9 passes when the open orders are the same set with the same totals, comp
 
 test('IDENTITY SWAP: equal counts with one order id swapped is an onlyIms plus an onlyVendor and a fail, never a pass', async () => {
   const { ctx } = context({ orders: [imsOrder(1, '11'), imsOrder(2, '12'), imsOrder(3, '14')] }, { orders: { processing: processing(11, 12, 13) } })
-  const item = await runVendorItem('R9', ctx)
+  const item = await runR9(undefined, ctx)
   assert.equal(item.outcome, 'fail')
   assert.deepEqual(item.reasons, ['DIFFERENCES'])
   assert.deepEqual(keys(item, 'onlyIms'), ['14'])
@@ -86,84 +87,84 @@ test('the value is within ONE MINOR UNIT of the order currency, inclusive: 0.01 
   ]
   for (const [currency, imsTotal, wooTotal, expected] of cases) {
     const { ctx } = context({ orders: [imsOrder(1, '11', { currency, totalForeign: imsTotal })] }, { orders: { processing: [order(11, 'processing', { currency, total: wooTotal })] } })
-    const item = await runVendorItem('R9', ctx)
+    const item = await runR9(undefined, ctx)
     assert.equal(item.outcome, expected, `${currency} ${imsTotal} vs ${wooTotal}`)
     if (expected === 'fail') assert.deepEqual(keys(item, 'bothDiffer'), ['11'])
   }
   const other = context({ orders: [imsOrder(1, '11', { currency: 'GBP' })] }, { orders: { processing: [order(11, 'processing', { currency: 'EUR' })] } })
-  const item = await runVendorItem('R9', other.ctx)
+  const item = await runR9(undefined, other.ctx)
   assert.equal(item.outcome, 'fail')
   assert.deepEqual(keys(item, 'bothDiffer'), ['11'])
-  const unknown = await runVendorItem('R9', context({ orders: [imsOrder(1, '11', { currency: 'XXX' })] }, { orders: { processing: processing(11) } }).ctx)
+  const unknown = await runR9(undefined, context({ orders: [imsOrder(1, '11', { currency: 'XXX' })] }, { orders: { processing: processing(11) } }).ctx)
   assert.deepEqual([unknown.outcome, unknown.reasons], ['inconclusive', ['CURRENCY_UNKNOWN']])
 })
 
 // [mutation: an age-based exclusion put back for storefront orders IMS lacks]
 test('NO ORDER IS SET ASIDE BY ITS AGE: a storefront order created before the initial import, now in an admitted open status and absent from IMS, is a finding - the importer admits by current status', async () => {
   const wooOld = order(21, 'processing', { date_created_gmt: '2020-01-01T00:00:00' })
-  const item = await runVendorItem('R9', context({ orders: [imsOrder(1, '11')] }, { orders: { processing: [order(11), wooOld] } }).ctx)
+  const item = await runR9(undefined, context({ orders: [imsOrder(1, '11')] }, { orders: { processing: [order(11), wooOld] } }).ctx)
   assert.deepEqual([item.outcome, item.reasons, keys(item, 'onlyVendor'), keys(item, 'outOfPopulation')], ['fail', ['DIFFERENCES'], ['21'], []])
   // Whatever the recorded boundaries say (before the import, beyond retention, no record at all, no creation date): judged, not excluded, not unknown.
   for (const boundaries of [BOUNDARIES, { ...BOUNDARIES, retentionMonths: 1 }, { ...BOUNDARIES, storefrontImport: { state: 'not-completed' as const } }, { ...BOUNDARIES, firstLoad: { state: 'absent' as const } }]) {
     for (const date of ['2020-01-01T00:00:00', '2026-08-31T23:59:59', '2026-09-01T00:00:00', null]) {
       const c = context({ boundaries, orders: [] }, { orders: { processing: [order(22, 'processing', { date_created_gmt: date })] } })
-      const r = await runVendorItem('R9', c.ctx)
+      const r = await runR9(undefined, c.ctx)
       assert.deepEqual([r.outcome, r.reasons, keys(r, 'onlyVendor')], ['fail', ['DIFFERENCES'], ['22']], `${JSON.stringify(boundaries)} ${date}`)
     }
   }
   // An open IMS order the store does not list is judged whatever its age, with or without a creation instant.
-  const imsOld = await runVendorItem('R9', context({ orders: [imsOrder(1, '11'), imsOrder(2, '12', { externalCreatedAt: '2026-01-01T00:00:00.000Z' }), imsOrder(3, '13', { externalCreatedAt: null })] }, { orders: { processing: processing(11) } }).ctx)
+  const imsOld = await runR9(undefined, context({ orders: [imsOrder(1, '11'), imsOrder(2, '12', { externalCreatedAt: '2026-01-01T00:00:00.000Z' }), imsOrder(3, '13', { externalCreatedAt: null })] }, { orders: { processing: processing(11) } }).ctx)
   assert.deepEqual([imsOld.outcome, keys(imsOld, 'onlyIms').sort(), keys(imsOld, 'outOfPopulation')], ['fail', ['12', '13'], []])
   // An old pair that differs is a finding; an old pair that agrees is compared.
-  const pair = await runVendorItem('R9', context({ orders: [imsOrder(1, '21', { totalForeign: '99.00' })] }, { orders: { processing: [wooOld] } }).ctx)
+  const pair = await runR9(undefined, context({ orders: [imsOrder(1, '21', { totalForeign: '99.00' })] }, { orders: { processing: [wooOld] } }).ctx)
   assert.deepEqual([pair.outcome, keys(pair, 'bothDiffer')], ['fail', ['21']])
-  assert.equal((await runVendorItem('R9', context({ orders: [imsOrder(1, '21')] }, { orders: { processing: [wooOld] } }).ctx)).outcome, 'pass')
+  assert.equal((await runR9(undefined, context({ orders: [imsOrder(1, '21')] }, { orders: { processing: [wooOld] } }).ctx)).outcome, 'pass')
 })
 
 test('R9 needs no population record: it does not read the boundaries section at all, and cannot be NO_POPULATION_RECORD', async () => {
   const c = context({ orders: [imsOrder(1, '11')] }, { orders: { processing: processing(11) } })
-  assert.equal((await runVendorItem('R9', c.ctx)).outcome, 'pass')
+  assert.equal((await runR9(undefined, c.ctx)).outcome, 'pass')
   assert.deepEqual(c.ims.calls.map((call) => [...call.sections]), [['orders', 'storefrontStatus']])
 })
 
 test('an open IMS order with no WooCommerce order id is listed as out of the population (never a finding, never a guess at an identity)', async () => {
-  const item = await runVendorItem('R9', context({ orders: [imsOrder(1, '11'), imsOrder(2, null)] }, { orders: { processing: processing(11) } }).ctx)
+  const item = await runR9(undefined, context({ orders: [imsOrder(1, '11'), imsOrder(2, null)] }, { orders: { processing: processing(11) } }).ctx)
   assert.equal(item.outcome, 'pass')
   assert.deepEqual(keys(item, 'outOfPopulation'), [cuid(2)])
   // A link of another connector is not a storefront identity.
-  const other = await runVendorItem('R9', context({ orders: [imsOrder(1, null, { links: [{ connector: 'mintsoft', externalOrderId: '11' }] }), imsOrder(2, '11')] }, { orders: { processing: processing(11) } }).ctx)
+  const other = await runR9(undefined, context({ orders: [imsOrder(1, null, { links: [{ connector: 'mintsoft', externalOrderId: '11' }] }), imsOrder(2, '11')] }, { orders: { processing: processing(11) } }).ctx)
   assert.deepEqual([other.outcome, keys(other, 'outOfPopulation')], ['pass', [cuid(1)]])
 })
 
 test('EMPTY needs a named proof: both sides empty passes only on per-status-total-zero; nothing enumerated is EMPTY_UNPROVEN', async () => {
-  const empty = await runVendorItem('R9', context({ orders: [] }, { orders: {} }).ctx)
+  const empty = await runR9(undefined, context({ orders: [] }, { orders: {} }).ctx)
   assert.deepEqual([empty.outcome, empty.proof], ['pass', { kind: 'proven-empty', source: 'per-status-total-zero' }])
-  const onlyUnlinked = await runVendorItem('R9', context({ orders: [imsOrder(1, null)] }, { orders: {} }).ctx)
+  const onlyUnlinked = await runR9(undefined, context({ orders: [imsOrder(1, null)] }, { orders: {} }).ctx)
   assert.deepEqual([onlyUnlinked.outcome, onlyUnlinked.proof], ['pass', { kind: 'proven-empty', source: 'per-status-total-zero' }])
   const nothingAdmitted = context({ orders: [], config: { configured: [], mappings: [] } }, { orders: {} })
-  const none = await runVendorItem('R9', nothingAdmitted.ctx)
+  const none = await runR9(undefined, nothingAdmitted.ctx)
   assert.deepEqual([none.outcome, none.reasons], ['inconclusive', ['EMPTY_UNPROVEN']])
   assert.equal(nothingAdmitted.woo.calls.length, 0)
 })
 
 test('an IMS order with nothing at the vendor is onlyIms and a fail: an empty store is not an empty answer', async () => {
-  const item = await runVendorItem('R9', context({ orders: [imsOrder(1, '11')] }, { orders: {} }).ctx)
+  const item = await runR9(undefined, context({ orders: [imsOrder(1, '11')] }, { orders: {} }).ctx)
   assert.deepEqual([item.outcome, keys(item, 'onlyIms')], ['fail', ['11']])
 })
 
 // [mutation: the per-status enumeration replaced by one request / the mapping not consulted / an unknown status defaulted]
 test('the statuses walked are the ADMITTED statuses whose reading is an open IMS status, one request series each; an unknown status fails the whole item before any call', async () => {
   const both = context({ orders: [imsOrder(1, '11'), imsOrder(2, '12', { status: 'ON_HOLD' })], config: { configured: ['processing', 'on-hold', 'completed'], mappings: [] } }, { orders: { processing: processing(11), 'on-hold': [order(12, 'on-hold')], completed: [order(99, 'completed')] } })
-  const item = await runVendorItem('R9', both.ctx)
+  const item = await runR9(undefined, both.ctx)
   assert.equal(item.outcome, 'pass')
   assert.deepEqual([...new Set(both.woo.calls.map((c) => c.params.status))], ['processing', 'on-hold', 'pending-wdraw'], 'completed is admitted but not open; the withdrawal-submitted status is always walked')
   const unknown = context({ orders: [], config: { configured: ['processing', 'weird'], mappings: [] } }, { orders: {} })
-  const refused = await runVendorItem('R9', unknown.ctx)
+  const refused = await runR9(undefined, unknown.ctx)
   assert.deepEqual([refused.outcome, refused.reasons], ['inconclusive', ['UNKNOWN_STATUS']])
   assert.equal(unknown.woo.calls.length, 0, 'no request before the statuses are decided')
   // A mapping row decides a custom status, and overrides the built-in reading.
   const mapped = context({ orders: [], config: { configured: ['weird', 'processing'], mappings: [{ externalStatus: 'wc-weird', imsStatus: 'ON_HOLD' }, { externalStatus: 'processing', imsStatus: 'COMPLETED' }] } }, { orders: { weird: [] } })
-  const m = await runVendorItem('R9', mapped.ctx)
+  const m = await runR9(undefined, mapped.ctx)
   assert.equal(m.outcome, 'pass')
   assert.deepEqual([...new Set(mapped.woo.calls.map((c) => c.params.status))], ['weird', 'pending-wdraw'], 'processing is remapped to a closed status, so it is not walked')
 })
@@ -185,18 +186,18 @@ test('openStorefrontStatuses: the exact slug wins, agreeing rows are one, disagr
 test('every IMS failure is a closed reason and NO vendor request is made: a failed read, a section that failed, a throw, a bad link id', async () => {
   for (const [fixture, reason] of [[{ fail: 'read' }, 'READ_INCOMPLETE'], [{ fail: { orders: 'CAP_EXCEEDED' } }, 'CAP_EXCEEDED'], [{ fail: { storefrontStatus: 'CAP_EXCEEDED' } }, 'CAP_EXCEEDED'], [{ fail: 'throws' }, 'INTERNAL_ERROR']] as const) {
     const c = context(fixture as ImsFixture, { orders: { processing: processing(11) } })
-    const item = await runVendorItem('R9', c.ctx)
+    const item = await runR9(undefined, c.ctx)
     assert.deepEqual([item.outcome, item.reasons], ['inconclusive', [reason]], JSON.stringify(fixture))
     assert.equal(c.woo.calls.length, 0)
   }
   for (const id of ['abc', '007', '0', '-1', '1.5', ' 7', '99999999999999999999']) {
     const c = context({ orders: [imsOrder(1, id)] }, { orders: { processing: processing(11) } })
-    const item = await runVendorItem('R9', c.ctx)
+    const item = await runR9(undefined, c.ctx)
     assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['BAD_KEY']], id)
     assert.equal(c.woo.calls.length, 0)
   }
-  assert.deepEqual((await runVendorItem('R9', { asOf: D, vendorReads: true, ims: imsPort().ims })).reasons, ['SOURCE_UNREADABLE'], 'no WooCommerce port')
-  assert.deepEqual((await runVendorItem('R9', { asOf: D, vendorReads: true, vendor: { woo: fakeStore({}) } })).reasons, ['SOURCE_UNREADABLE'], 'no IMS read')
+  assert.deepEqual((await runR9(undefined, { asOf: D, vendorReads: true, ims: imsPort().ims })).reasons, ['SOURCE_UNREADABLE'], 'no WooCommerce port')
+  assert.deepEqual((await runR9(undefined, { asOf: D, vendorReads: true, vendor: { woo: fakeStore({}) } })).reasons, ['SOURCE_UNREADABLE'], 'no IMS read')
 })
 
 // [mutation: a vendor walk's failure turned into an empty or partial list]
@@ -209,15 +210,15 @@ test('every vendor failure is a closed reason with no entries: a lying store giv
     ['no header', (_c, _n, page) => ({ ...page, total: null }), 'SOURCE_UNREADABLE'],
   ]
   for (const [name, tweak, reason] of lies) {
-    const item = await runVendorItem('R9', context({ orders: [imsOrder(1, '11'), imsOrder(2, '12')] }, data, {}, tweak).ctx)
+    const item = await runR9(undefined, context({ orders: [imsOrder(1, '11'), imsOrder(2, '12')] }, data, {}, tweak).ctx)
     assert.deepEqual([item.outcome, item.reasons, item.entries], ['inconclusive', [reason], undefined], name)
   }
-  const capped = await runVendorItem('R9', context({ orders: [] }, data, { wooOptions: { sleep: noSleep, budget: 1 } }).ctx)
+  const capped = await runR9(undefined, context({ orders: [] }, data, { wooOptions: { sleep: noSleep, budget: 1 } }).ctx)
   assert.deepEqual(capped.reasons, ['CAP_EXCEEDED'])
 })
 
 test('a repeated IMS storefront id (two orders, one WooCommerce id) is DUPLICATE_KEY, never summed or picked between', async () => {
-  const item = await runVendorItem('R9', context({ orders: [imsOrder(1, '11'), imsOrder(2, '11')] }, { orders: { processing: processing(11) } }).ctx)
+  const item = await runR9(undefined, context({ orders: [imsOrder(1, '11'), imsOrder(2, '11')] }, { orders: { processing: processing(11) } }).ctx)
   assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['DUPLICATE_KEY']])
 })
 
@@ -316,7 +317,7 @@ test('the vendor items are the only ones this module runs, and an unexpected fai
   const c = context({ orders: [] }, { orders: {} })
   c.ctx.vendor = { woo: { get: () => { throw new Error('hunter2') } } as never }
   c.ctx.wooOptions = { sleep: noSleep }
-  const item = await runVendorItem('R9', c.ctx)
+  const item = await runR9(undefined, c.ctx)
   assert.equal(item.outcome, 'inconclusive')
   assert.ok(!JSON.stringify(item).includes('hunter2'))
 })
@@ -329,7 +330,7 @@ test('a stored mapping the importer would NOT match (padded, odd prefix) for an 
   for (const externalStatus of [' processing ', 'processing ', ' processing', '\tprocessing', ' wc-processing', 'WC-processing ', 'Processing\n']) {
     assert.deepEqual(open(['processing'], [{ externalStatus, imsStatus: 'COMPLETED' }]), { ok: false, reason: 'AMBIGUOUS_STATUS_MAPPING' }, JSON.stringify(externalStatus))
     const c = context({ orders: [], config: { configured: ['processing'], mappings: [{ externalStatus, imsStatus: 'COMPLETED' }] } }, { orders: {} })
-    const item = await runVendorItem('R9', c.ctx)
+    const item = await runR9(undefined, c.ctx)
     assert.deepEqual([item.outcome, item.reasons, c.woo.calls.length], ['inconclusive', ['AMBIGUOUS_STATUS_MAPPING'], 0], JSON.stringify(externalStatus))
   }
   // Even beside a row the importer WOULD match: the stray row still makes it ambiguous.
@@ -357,12 +358,12 @@ test('PIN: the pack copies the connector\'s lookup rule - the connector\'s sourc
 // [mutation: a walked status dropped from the list / the empty proof made without enumerating every admitted open status]
 test('no admitted open status can be left out of the empty proof: every one is requested, in both sweeps, and the proof needs a zero total for each', async () => {
   const c = context({ orders: [], config: { configured: ['processing', 'on-hold', 'pending'], mappings: [] } }, { orders: {} })
-  const item = await runVendorItem('R9', c.ctx)
+  const item = await runR9(undefined, c.ctx)
   assert.deepEqual([item.outcome, item.proof], ['pass', { kind: 'proven-empty', source: 'per-status-total-zero' }])
   const asked = c.woo.calls.filter((call) => call.params.page === '1').map((call) => call.params.status)
   assert.deepEqual(asked, ['processing', 'on-hold', 'pending', 'pending-wdraw', 'processing', 'on-hold', 'pending', 'pending-wdraw'])
   // One status with an order: no empty proof.
-  const one = await runVendorItem('R9', context({ orders: [], config: { configured: ['processing', 'on-hold'], mappings: [] } }, { orders: { 'on-hold': [order(9, 'on-hold')] } }).ctx)
+  const one = await runR9(undefined, context({ orders: [], config: { configured: ['processing', 'on-hold'], mappings: [] } }, { orders: { 'on-hold': [order(9, 'on-hold')] } }).ctx)
   assert.deepEqual([one.outcome, one.proof ?? null], ['fail', null])
 })
 
@@ -372,26 +373,26 @@ test('no admitted open status can be left out of the empty proof: every one is r
 test('THE WITHDRAWAL STATUSES: the importer also admits the withdrawal pair whenever the selection is non-empty, so a store order in a mapped OPEN withdrawal status that IMS lacks is a finding, never a pass', async () => {
   // approved status mapped to an open IMS status, outside wc_sync_order_statuses
   const c = context({ orders: [imsOrder(1, '11')], config: { configured: ['processing'], mappings: [{ externalStatus: 'withdrawn', imsStatus: 'ON_HOLD' }] } }, { orders: { processing: processing(11), withdrawn: [order(31, 'withdrawn')] } })
-  const item = await runVendorItem('R9', c.ctx)
+  const item = await runR9(undefined, c.ctx)
   assert.deepEqual([item.outcome, keys(item, 'onlyVendor')], ['fail', ['31']])
   assert.deepEqual([...new Set(c.woo.calls.map((call) => call.params.status))], ['processing', 'pending-wdraw', 'withdrawn'])
   // the submitted status is walked without a mapping: an IMS hold must find its storefront order, and a store order in it is judged
-  const sub = await runVendorItem('R9', context({ orders: [imsOrder(1, '11')] }, { orders: { processing: processing(11), 'pending-wdraw': [order(32, 'pending-wdraw')] } }).ctx)
+  const sub = await runR9(undefined, context({ orders: [imsOrder(1, '11')] }, { orders: { processing: processing(11), 'pending-wdraw': [order(32, 'pending-wdraw')] } }).ctx)
   assert.deepEqual([sub.outcome, keys(sub, 'onlyVendor')], ['fail', ['32']])
   // a renamed pair (settings) is followed
   const renamed = context({ orders: [], config: { configured: ['processing'], withdrawal: { submitted: 'wdraw-asked', approved: 'wdraw-done' }, mappings: [{ externalStatus: 'wdraw-done', imsStatus: 'PROCESSING' }] } }, { orders: { 'wdraw-done': [order(33, 'wdraw-done')] } })
-  const r = await runVendorItem('R9', renamed.ctx)
+  const r = await runR9(undefined, renamed.ctx)
   assert.deepEqual([r.outcome, keys(r, 'onlyVendor')], ['fail', ['33']])
   assert.deepEqual([...new Set(renamed.woo.calls.map((call) => call.params.status))], ['processing', 'wdraw-asked', 'wdraw-done'])
   // an unmapped approved status is closed (the withdrawal handler cancels), and a mapped-closed one too: not walked
   const closed = context({ orders: [], config: { configured: ['processing'], mappings: [{ externalStatus: 'withdrawn', imsStatus: 'CANCELLED' }] } }, { orders: {} })
-  await runVendorItem('R9', closed.ctx)
+  await runR9(undefined, closed.ctx)
   assert.deepEqual([...new Set(closed.woo.calls.map((call) => call.params.status))], ['processing', 'pending-wdraw'])
 })
 
 test('an EMPTY selection admits nothing on any route, the withdrawal statuses included: nothing is walked and the empty proof is not given', async () => {
   const c = context({ orders: [], config: { configured: [], mappings: [] } }, { orders: {} })
-  const item = await runVendorItem('R9', c.ctx)
+  const item = await runR9(undefined, c.ctx)
   assert.deepEqual([item.outcome, item.reasons, c.woo.calls.length], ['inconclusive', ['EMPTY_UNPROVEN'], 0])
   // The withdrawal pair is not admitted, whatever a mapping says; only the manual historical import (which ignores the selection) keeps completed and delivered.
   assert.deepEqual(openStorefrontStatuses({ configured: [], withdrawal: WITHDRAWAL, mappings: [{ externalStatus: 'delivered', imsStatus: 'PROCESSING' }, { externalStatus: 'pending-wdraw', imsStatus: 'PROCESSING' }] }), { ok: true, statuses: ['delivered'] })

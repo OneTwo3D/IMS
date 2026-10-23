@@ -20,6 +20,8 @@
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
 import type { AcceptanceFile } from '@/lib/ops/readiness-gate'
 import type { AsOfBasis, BasisRead } from '@/lib/reconciliation-pack/basis'
+import { type SettlingInput } from '@/lib/reconciliation-pack/compare'
+import type { CarriedState } from '@/lib/reconciliation-pack/settling'
 import { PACK_ITEM_IDS, getPackItem, itemApplicability, itemNeedsVendor, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
 import { runInvariantItem } from '@/lib/reconciliation-pack/invariant-items'
 import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-readers'
@@ -55,6 +57,11 @@ export type RunContext = {
   vendor?: VendorPorts
   /** Test seam for the vendor walks' pacing and budget. */
   wooOptions?: WooSourceOptions
+  /**
+   * Only for an item that settles (its catalogue row), and set per item by runItems, never by the caller: the state carried from the
+   * previous report and the stream stamp this run's start read saw. Absent on any other item.
+   */
+  settling?: SettlingInput
 }
 export type ItemRunner = (context: RunContext) => Promise<ItemInput>
 /** A ledger item runs on the SETTLED basis, after the liveness bracket is closed. */
@@ -69,6 +76,8 @@ export type RunPlan = {
   basis?: BasisPort
   runners?: Partial<Record<PackItemId, ItemRunner>>
   ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
+  /** The settling state carried from the previous report, per item that settles (settling.ts). An item with no entry has none: every difference is first seen. */
+  carried?: Partial<Record<PackItemId, CarriedState>>
 }
 
 /** The runners this build has. R3, R4 and R15 read the shared invariant report. */
@@ -76,7 +85,7 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromInvariant = (id: 'R3' | 'R4' | 'R15'): ItemRunner => async (context) =>
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
   const fromVendor = (id: 'R9' | 'R13'): ItemRunner => (context) =>
-    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions })
+    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, settling: context.settling })
   return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13') }
 }
 
@@ -111,16 +120,26 @@ export async function readLivenessSafe(port: LivenessPort | undefined): Promise<
  * The report builder is the judge: an item it refuses (in isolation, against empty defaults for the others) becomes
  * INTERNAL_ERROR so one bad runner cannot take the publication down, and cannot loosen its own test either.
  */
+/** A sequence no real chain reaches, so a carried first-seen sequence (always an earlier report's) is never ahead of the report this check builds. */
+const JUDGED_SEQUENCE = 2 ** 31
+
 function judged(item: ItemInput, plan: Pick<RunPlan, 'phase' | 'asOf'>, brackets: readonly StreamBracket[]): ItemInput {
   const stamp = '2026-01-01T00:00:00.000Z'
   const others = PACK_ITEM_IDS.filter((id) => id !== item.id).map((id): ItemInput => itemApplicability(id, plan.phase) === 'not-applicable' ? { id, outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'] } : inconclusive(id, 'NO_RUNNER'))
   try {
-    buildReport({ runId: '20260101T000000Z-000000000000', systemIdentifier: '1000000000', phase: plan.phase, asOf: plan.asOf, startedAt: stamp, finishedAt: stamp, streams: [...brackets], items: [item, ...others] }, 1, null)
+    buildReport({ runId: '20260101T000000Z-000000000000', systemIdentifier: '1000000000', phase: plan.phase, asOf: plan.asOf, startedAt: stamp, finishedAt: stamp, streams: [...brackets], items: [item, ...others] }, JUDGED_SEQUENCE, '0'.repeat(64))
     return item
   } catch {
     // ReportInvalid or anything else the builder throws: this item cannot be published as it is.
     return inconclusive(item.id, 'INTERNAL_ERROR')
   }
+}
+
+function settlingFor(id: PackItemId, carried: RunPlan['carried'], startOnly: LivenessBracket): SettlingInput {
+  const state = carried?.[id] ?? { usable: false, carried: new Map() }
+  const [stream] = getPackItem(id).streams
+  const stamp = stream === undefined ? null : publishedStreamBrackets(startOnly, [stream])[0]?.start ?? null
+  return { carried: state.carried, usable: state.usable, stamp }
 }
 
 export async function runItems(plan: RunPlan): Promise<{ items: ItemInput[]; streams: StreamBracket[] }> {
@@ -159,7 +178,11 @@ export async function runItems(plan: RunPlan): Promise<{ items: ItemInput[]; str
 
   for (const id of plain) {
     try {
-      const produced = await runners[id]!(plan.context)
+      // An item that settles is handed what the previous report carried and the stamp of its stream at the START read, the one the
+      // published bracket records. If the end read differs, the verdict below replaces the result (BASIS_MOVED), so a stamp that moved
+      // is never counted as a run of the stream.
+      const context = getPackItem(id).settles ? { ...plan.context, settling: settlingFor(id, plan.carried, startOnly) } : plan.context
+      const produced = await runners[id]!(context)
       results.set(id, produced.id === id ? produced : inconclusive(id, 'INTERNAL_ERROR'))
     } catch {
       results.set(id, inconclusive(id, 'INTERNAL_ERROR'))

@@ -115,11 +115,14 @@ const cases: Record<string, () => void> = {
     }
   },
   'carried-malformed': () => {
-    const good = { kind: 'bothDiffer', first: STAMP, later: [] }
-    const bad: unknown[] = [[], {}, null, 'x', new Map([['A|MAIN', null]]), new Map([['A|MAIN', 'x']]), new Map([['A|MAIN', { ...good, kind: 'both' }]]), new Map([['A|MAIN', { ...good, first: 'yesterday' }]]), new Map([['A|MAIN', { ...good, later: 'x' }]]), new Map([['A|MAIN', { ...good, later: ['soon'] }]]), new Map([[5, good]])]
-    for (const carried of bad) refused(run({ settling: { carried, stamp: STAMP } }), 'SOURCE_UNREADABLE', String(carried))
+    const good = { kind: 'bothDiffer', signature: '["bothDiffer","1","2",null,null]', sequence: 1, first: STAMP, later: [] }
+    const bad: unknown[] = [[], {}, null, 'x', new Map([['A|MAIN', null]]), new Map([['A|MAIN', 'x']]), new Map([['A|MAIN', { ...good, kind: 'both' }]]), new Map([['A|MAIN', { ...good, first: 'yesterday' }]]), new Map([['A|MAIN', { ...good, later: 'x' }]]), new Map([['A|MAIN', { ...good, later: ['soon'] }]]), new Map([[5, good]]), new Map([['A|MAIN', { ...good, signature: undefined }]]), new Map([['A|MAIN', { ...good, signature: '' }]]), new Map([['A|MAIN', { ...good, sequence: 0 }]]), new Map([['A|MAIN', { ...good, sequence: 1.5 }]]), new Map([['A|MAIN', { ...good, sequence: undefined }]]), new Map([['A|MAIN', { ...good, later: [STAMP] }]]), new Map([['A|MAIN', { ...good, later: ['2026-10-20T00:00:00.000Z', '2026-10-20T00:00:00.000Z'] }]])]
+    for (const carried of bad) refused(run({ settling: { carried, stamp: STAMP, usable: true } }), 'SOURCE_UNREADABLE', String(carried))
+    // a state that says it is unusable carries nothing, and a usable flag that is not a boolean is refused
+    refused(run({ settling: { carried: new Map([['A|MAIN', good]]), stamp: STAMP, usable: false } }), 'SOURCE_UNREADABLE', 'unusable state with entries')
+    refused(run({ settling: { carried: new Map(), stamp: STAMP, usable: 'yes' } }), 'SOURCE_UNREADABLE', 'usable not a boolean')
   },
-  'stamp-unusable': () => { for (const stamp of [null, undefined, '', 'yesterday', '2026-10-19', '2026-13-45T00:00:00Z', 5]) refused(run({ settling: { carried: new Map(), stamp } }), 'STALE_BASIS', String(stamp)) },
+  'stamp-unusable': () => { for (const stamp of [null, undefined, '', 'yesterday', '2026-10-19', '2026-13-45T00:00:00Z', 5]) refused(run({ settling: { carried: new Map(), stamp, usable: true } }), 'STALE_BASIS', String(stamp)) },
 }
 
 test('every refused input shape in the table has a case, and every case is in the table', () => {

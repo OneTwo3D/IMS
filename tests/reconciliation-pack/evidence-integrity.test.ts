@@ -47,9 +47,9 @@ test('each bucket demands its own value shape, delta and verdict', () => {
   const reasonsFor = (entries: ItemInput['entries']) => (entries?.unsettled?.length ? (['DIFFERENCES', 'UNSETTLED_PENDING'] as const) : (['DIFFERENCES'] as const))
   const fail = (entries: ItemInput['entries'], label: string) => rejects(put(base, { id: 'R1', outcome: 'fail', reasons: [...reasonsFor(entries)], entries }), label)
   const ok = (entries: ItemInput['entries'], label: string) => assert.doesNotThrow(() => buildReport(input(put(base, { id: 'R1', outcome: 'fail', reasons: [...reasonsFor(entries)], entries })), 1, null), label)
-  ok({ unsettled: [{ ...soloI('U|MAIN'), settling: { first: STAMP, later: [] } }], onlyIms: [soloI('V|MAIN')] }, 'an unsettled one-sided difference')
-  ok({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-4'), settling: { first: STAMP, later: [STAMP] } }] }, 'an unsettled pair that differs')
-  fail({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-3'), settling: { first: STAMP, later: [] } }] }, 'an unsettled pair with a wrong delta')
+  ok({ unsettled: [{ ...soloI('U|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }], onlyIms: [soloI('V|MAIN')] }, 'an unsettled one-sided difference')
+  ok({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-4'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'an unsettled pair that differs')
+  fail({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-3'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'an unsettled pair with a wrong delta')
   ok({ bothDiffer: [pair('A|MAIN', '1', '5', '-4')] }, 'a real difference')
   fail({ bothDiffer: [pair('A|MAIN', '1', '1', '0')] }, 'bothDiffer within tolerance')
   fail({ bothDiffer: [pair('A|MAIN', '1', '5', '9')] }, 'bothDiffer with a wrong delta')
@@ -65,9 +65,9 @@ test('each bucket demands its own value shape, delta and verdict', () => {
   fail({ excluded: [{ key: 'A|MAIN', ims: null, vendor: null, delta: null }] }, 'excluded with no value')
   fail({ excluded: [{ ...soloI('A|MAIN'), delta: '1' }] }, 'excluded with a delta')
   fail({ outOfPopulation: [pair('A|MAIN', '1', '1', '1')] }, 'outOfPopulation with a delta')
-  fail({ unsettled: [{ ...pair('A|MAIN'), settling: { first: STAMP, later: [] } }] }, 'unsettled pair that does not differ')
-  fail({ unsettled: [{ key: 'A|MAIN', ims: null, vendor: null, delta: null, settling: { first: STAMP, later: [] } }] }, 'unsettled without values')
-  fail({ onlyIms: [{ ...soloI('A|MAIN'), settling: { first: STAMP, later: [] } }] }, 'settling data outside unsettled')
+  fail({ unsettled: [{ ...pair('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'unsettled pair that does not differ')
+  fail({ unsettled: [{ key: 'A|MAIN', ims: null, vendor: null, delta: null, settling: { sequence: 1, first: STAMP, later: [] } }] }, 'unsettled without values')
+  fail({ onlyIms: [{ ...soloI('A|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'settling data outside unsettled')
   fail({ unsettled: [soloI('A|MAIN')] }, 'unsettled without settling data')
   fail({ onlyIms: [soloI('A|MAIN')], bothDiffer: [pair('A|MAIN', '1', '5', '-4')] }, 'one identity in two buckets')
   fail({ onlyIms: [{ key: 'A|MAIN' as never, ims: '2', vendor: null, delta: null, vendorCurrency: 'GBP' }] }, 'a currency for a value that is missing')
@@ -86,9 +86,12 @@ test('currencies: R9 (minor unit) needs a known currency for each value, equal o
   rejects(put(base, r9({ bothEqual: [pair('1001', '10', '10', '0', { imsCurrency: 'GBP', vendorCurrency: 'EUR' })] })), 'two currencies listed as equal')
   rejects(put(base, r9({ bothEqual: [pair('1001', '10', '10', '0', { imsCurrency: 'QQQ', vendorCurrency: 'QQQ' })] })), 'an unknown currency')
   rejects(put(base, r9({ bothEqual: [pair('1001', '10', '10', '0', { imsCurrency: 'GBP', vendorCurrency: null })] })), 'a currency on one side')
-  assert.doesNotThrow(() => buildReport(input(put(base, r9({ bothDiffer: [pair('1001', '10', '10', '0', { imsCurrency: 'GBP', vendorCurrency: 'EUR' })] }, 'fail'))), 1, null), 'a currency disagreement is a difference')
-  assert.doesNotThrow(() => buildReport(input(put(base, r9({ onlyIms: [{ key: '1002', ims: '5', vendor: null, delta: null, imsCurrency: 'JPY' }] }, 'fail'))), 1, null))
-  rejects(put(base, r9({ onlyIms: [{ key: '1002', ims: '5', vendor: null, delta: null }] }, 'fail')), 'a value with no currency')
+  // R9 settles: a failing entry carries the settling state that matured it, and was first seen in an EARLIER report.
+  const matured = { settling: { sequence: 1, first: '2026-10-01T00:00:00.000Z', later: ['2026-10-02T00:00:00.000Z', '2026-10-03T00:00:00.000Z'] } }
+  const later = (items: ItemInput[]) => buildReport(input(items), 2, '0'.repeat(64))
+  assert.doesNotThrow(() => later(put(base, r9({ bothDiffer: [pair('1001', '10', '10', '0', { imsCurrency: 'GBP', vendorCurrency: 'EUR', ...matured })] }, 'fail'))), 'a currency disagreement is a difference')
+  assert.doesNotThrow(() => later(put(base, r9({ onlyIms: [{ key: '1002', ims: '5', vendor: null, delta: null, imsCurrency: 'JPY', ...matured }] }, 'fail'))))
+  assert.throws(() => later(put(base, r9({ onlyIms: [{ key: '1002', ims: '5', vendor: null, delta: null, ...matured }] }, 'fail'))), ReportInvalid, 'a value with no currency')
   rejects(put(base, { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [{ key: 'A|MAIN', ims: null, vendor: null, delta: null, imsCurrency: 'GBP' }] } } as never), 'a currency for a missing value')
 })
 
@@ -150,7 +153,7 @@ function richInput(): ReportInput {
     id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES', 'UNSETTLED_PENDING'], sources: ['ims-database', 'mintsoft-api'],
     entries: {
       onlyIms: [soloI('A|MAIN')], onlyVendor: [soloV('B|MAIN')], bothDiffer: [pair('C|MAIN', '1', '5', '-4')], bothEqual: [pair('D|MAIN')],
-      unsettled: [{ ...soloI('E|MAIN'), settling: { first: STAMP, later: [STAMP] } }], excluded: [soloI('F|MAIN')], outOfPopulation: [soloV('G|MAIN')],
+      unsettled: [{ ...soloI('E|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }], excluded: [soloI('F|MAIN')], outOfPopulation: [soloV('G|MAIN')],
     },
   }), { ...passItem('R3'), proof: { kind: 'proven-empty', source: 'invariant-report-clean' } })
   return input(items)
