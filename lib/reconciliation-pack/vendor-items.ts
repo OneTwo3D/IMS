@@ -24,10 +24,12 @@
  *        total of zero in both sweeps.
  *
  *   R13  TAX-RATE MAPPINGS, presence only. Every WooCommerce tax rate (the full list, walked twice) must have an IMS mapping, and
- *        every IMS mapping of the storefront must name a rate the storefront still has; every Xero tax rate must be held by an active
- *        IMS tax rate (its accounting tax type), and the reverse. The Xero list is not available in this build: the stored tax-rate
- *        read keeps only the IMS rates that drift from Xero (U13 in the plan, open), so the Xero leg is VENDOR_LIST_UNPROVEN unless a
- *        port proves a complete list. A WooCommerce leg with a finding is still a FAIL (it is true whatever the Xero leg says), and it
+ *        every IMS mapping of the storefront must name a rate the storefront still has; every ACTIVE Xero tax rate must be held by an
+ *        active IMS tax rate (its accounting tax type), and the reverse. The Xero list is IMS's stored copy of it (Xero is the tax-rate
+ *        master; the xero-tax-rate-drift sweep replaces it whole), read in the same snapshot as the IMS rates for the organisation now
+ *        connected, and it counts only when the header row proves it is one complete read (present for that organisation, its count
+ *        equal to the rows read, its digest equal to the rows'); otherwise the Xero leg is VENDOR_LIST_UNPROVEN. No request is made to
+ *        Xero. A WooCommerce leg with a finding is still a FAIL (it is true whatever the Xero leg says), and it
  *        carries VENDOR_LIST_UNPROVEN beside DIFFERENCES; a clean WooCommerce leg with an unproven Xero leg is inconclusive, never a pass.
  *
  * No difference is settled over later runs here (the pack carries no settling state for any item yet), so a difference seen is a
@@ -54,13 +56,8 @@ export function isVendorItem(id: string): id is VendorItemId {
   return (VENDOR_ITEM_IDS as readonly string[]).includes(id)
 }
 
-/** Xero tax types held in IMS's stored copy of Xero's rate list, with the proof that it is the WHOLE list. Absent port or null = not available. */
-export type XeroTaxTypeList = { complete: true; taxTypes: readonly string[] }
-
 export type VendorPorts = {
   woo?: WooGetPort
-  /** Reads the stored, proven-complete list of Xero tax types, or null. The build has none (U13); a test supplies one. */
-  xeroTaxTypes?: () => Promise<XeroTaxTypeList | null>
 }
 
 export type VendorItemContext = {
@@ -210,7 +207,7 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
   const woo = context.vendor?.woo
   const readIms = context.ims
   if (woo === undefined || readIms === undefined) return inconclusive('R13', [], 'SOURCE_UNREADABLE')
-  const read = await readIms({ sections: ['taxes'] })
+  const read = await readIms({ sections: ['taxes', 'xeroTaxRates'] })
   if (!read.ok) return inconclusive('R13', [IMS], read.reason)
   const section = read.sections.taxes
   if (section === undefined || !section.ok) return inconclusive('R13', [IMS], section === undefined ? 'SOURCE_UNREADABLE' : section.reason)
@@ -226,12 +223,11 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
   if (!walked.ok) return inconclusive('R13', [IMS, WOO], walked.reason)
   const vendorWoo: SideRow[] = walked.value.rates.map((rate) => ({ key: wooRateKey(rate.id) }))
 
-  // The Xero leg: a stored list that is PROVEN complete, or nothing.
-  let xero: XeroTaxTypeList | null = null
-  try { xero = context.vendor?.xeroTaxTypes ? await context.vendor.xeroTaxTypes() : null } catch { xero = null }
-  const xeroProven = typeof xero === 'object' && xero !== null && xero.complete === true && Array.isArray(xero.taxTypes)
-
-  if (!xeroProven) {
+  // The Xero leg: IMS's stored copy of Xero's tax-rate list (read in the SAME snapshot as the rates above, for the organisation now
+  // connected), proven to be one complete read by its header row, or nothing. There is no port and no request to Xero here.
+  const xeroSection = read.sections.xeroTaxRates
+  const stored = xeroSection !== undefined && xeroSection.ok ? xeroSection.value : null
+  if (stored === null || stored.state !== 'proven') {
     // The WooCommerce leg alone cannot pass the item, but a finding in it is a finding.
     const leg = compareItem('R13', { ims: imsWoo, vendor: vendorWoo, imsComplete: true, vendorComplete: true, emptyProof: walked.value.total === 0 ? 'vendor-total-zero' : undefined })
     if (leg.status === 'compared' && outcomeOfComparison(leg).outcome === 'fail') return fromComparison('R13', leg, [IMS, WOO], ['VENDOR_LIST_UNPROVEN'])
@@ -239,7 +235,8 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
     return inconclusive('R13', [IMS, WOO], 'VENDOR_LIST_UNPROVEN')
   }
 
-  const types = (xero as XeroTaxTypeList).taxTypes
+  // Only a rate Xero still holds as ACTIVE is a Xero tax type to be held by an IMS rate; a DELETED, ARCHIVED or PENDING one is stored but not compared.
+  const types = stored.taxTypes.filter((entry) => entry.status === 'ACTIVE').map((entry) => entry.taxType)
   if (!types.every((type) => typeof type === 'string' && XERO_TAX_TYPE_RE.test(type))) return inconclusive('R13', [IMS, WOO, XERO], 'BAD_KEY')
   const imsTypes = [...new Set(rates.filter((rate) => rate.active && rate.accountingTaxType !== null).map((rate) => rate.accountingTaxType as string))]
   if (!imsTypes.every((type) => XERO_TAX_TYPE_RE.test(type))) return inconclusive('R13', [IMS, WOO, XERO], 'BAD_KEY')

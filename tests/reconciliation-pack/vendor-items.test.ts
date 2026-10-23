@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
-import type { ImsRead, ImsReadOptions, ImsSectionValues, OrderRow, PopulationBoundaries, StorefrontStatusConfig, TaxMappingRow, TaxRateRow } from '../../lib/reconciliation-pack/ims-readers.ts'
-import { openStorefrontStatuses, runVendorItem, type VendorItemContext, type XeroTaxTypeList } from '../../lib/reconciliation-pack/vendor-items.ts'
+import type { ImsRead, ImsReadOptions, ImsSectionValues, OrderRow, PopulationBoundaries, StorefrontStatusConfig, TaxMappingRow, TaxRateRow, XeroTaxRateStore } from '../../lib/reconciliation-pack/ims-readers.ts'
+import { openStorefrontStatuses, runVendorItem, type VendorItemContext } from '../../lib/reconciliation-pack/vendor-items.ts'
 import { WOO_BUILT_IN_STATUS_MAP } from '../../lib/reconciliation-pack/constants.ts'
 import { readFileSync } from 'node:fs'
 import { fakeStore, noSleep, order, type StoreData, type Tweak } from './woo-fixtures.ts'
@@ -25,7 +25,7 @@ const imsOrder = (n: number, wooId: string | null, over: Partial<OrderRow> = {})
   links: wooId === null ? [] : [{ connector: 'woocommerce', externalOrderId: wooId }], ...over,
 })
 
-type ImsFixture = { orders?: OrderRow[]; boundaries?: PopulationBoundaries; config?: Omit<StorefrontStatusConfig, 'withdrawal'> & { withdrawal?: StorefrontStatusConfig['withdrawal'] }; rates?: TaxRateRow[]; mappings?: TaxMappingRow[]; fail?: 'read' | 'throws' | Partial<Record<keyof ImsSectionValues, 'CAP_EXCEEDED'>> }
+type ImsFixture = { orders?: OrderRow[]; boundaries?: PopulationBoundaries; config?: Omit<StorefrontStatusConfig, 'withdrawal'> & { withdrawal?: StorefrontStatusConfig['withdrawal'] }; rates?: TaxRateRow[]; mappings?: TaxMappingRow[]; xeroStore?: XeroTaxRateStore; fail?: 'read' | 'throws' | Partial<Record<keyof ImsSectionValues, 'CAP_EXCEEDED'>> }
 function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; ims: NonNullable<VendorItemContext['ims']> } {
   const calls: ImsReadOptions[] = []
   return {
@@ -37,6 +37,7 @@ function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; ims: NonN
       const values: Record<string, unknown> = {
         boundaries: fixture.boundaries ?? BOUNDARIES, orders: fixture.orders ?? [], storefrontStatus: fixture.config ? { withdrawal: WITHDRAWAL, ...fixture.config } : CONFIG,
         taxes: { rates: fixture.rates ?? [], mappings: fixture.mappings ?? [] },
+        xeroTaxRates: fixture.xeroStore ?? { state: 'unproven', cause: 'NO_HEADER' },
       }
       const sections: Record<string, unknown> = {}
       for (const name of options.sections) {
@@ -228,8 +229,7 @@ test('WITHOUT THE OPT-IN nothing is touched: no IMS read, no vendor request, no 
   for (const flag of [false, undefined, 'true', 1, null] as unknown[]) {
     for (const id of ['R9', 'R13'] as const) {
       const c = context({ orders: [] }, { orders: {} }, { vendorReads: flag as boolean })
-      let xeroAsked = 0
-      c.ctx.vendor = { woo: c.woo, xeroTaxTypes: async () => { xeroAsked += 1; return null } }
+      const xeroAsked = 0
       const item = await runVendorItem(id, c.ctx)
       assert.deepEqual([item.outcome, item.reasons, item.sources ?? []], ['inconclusive', ['VENDOR_READS_OFF'], []])
       assert.equal(c.woo.calls.length + c.ims.calls.length + xeroAsked, 0)
@@ -242,18 +242,25 @@ test('WITHOUT THE OPT-IN nothing is touched: no IMS read, no vendor request, no 
 const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, active: true, accountingTaxType: null, countryCode: 'GB', reportingCategory: null, ...over })
 const mapping = (externalTaxRateId: string, taxRateId = 'r1', connector = 'woocommerce'): TaxMappingRow => ({ connector, externalTaxRateId, taxRateId })
 const wooTaxes = (...ids: number[]): StoreData => ({ taxes: ids.map((id) => ({ id })) })
-const xero = (...taxTypes: string[]): (() => Promise<XeroTaxTypeList | null>) => async () => ({ complete: true, taxTypes })
+const xero = (...taxTypes: string[]): XeroTaxRateStore => ({ state: 'proven', tenantId: 'tenant-A', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: taxTypes.map((taxType) => ({ taxType, status: 'ACTIVE' })) })
 
 test('R13 with a clean WooCommerce leg is INCONCLUSIVE (VENDOR_LIST_UNPROVEN) while the Xero list is not proven complete: it can never pass on half of its claim', async () => {
   const c = context({ rates: [rate('r1')], mappings: [mapping('1'), mapping('2')] }, wooTaxes(1, 2))
   const item = await runVendorItem('R13', c.ctx)
   assert.deepEqual([item.outcome, item.reasons, item.proof ?? null, item.sources], ['inconclusive', ['VENDOR_LIST_UNPROVEN'], null, ['ims-database', 'woocommerce-api']])
-  // Not proven: no port, a null, an incomplete list, a throw, a list that says complete in some other way.
-  for (const xeroTaxTypes of [undefined, async () => null, async () => ({ complete: false, taxTypes: [] }), async () => { throw new Error('x') }, async () => ({ complete: 'yes', taxTypes: [] }), async () => ({ complete: true, taxTypes: 'OUTPUT2' })] as unknown[]) {
-    const d = context({ rates: [rate('r1')], mappings: [mapping('1')] }, wooTaxes(1))
-    d.ctx.vendor = { woo: d.woo, xeroTaxTypes: xeroTaxTypes as never }
-    assert.deepEqual((await runVendorItem('R13', d.ctx)).reasons, ['VENDOR_LIST_UNPROVEN'])
+  // Not proven, whatever the cause: every closed cause, an unreadable section and an absent section.
+  const causes = ['NO_CONNECTION', 'NO_HEADER', 'COUNT_MISMATCH', 'DIGEST_MISMATCH', 'MIXED_READ', 'MALFORMED_ROW'] as const
+  for (const cause of causes) {
+    const d = context({ rates: [rate('r1')], mappings: [mapping('1')], xeroStore: { state: 'unproven', cause } }, wooTaxes(1))
+    assert.deepEqual((await runVendorItem('R13', d.ctx)).reasons, ['VENDOR_LIST_UNPROVEN'], cause)
   }
+  for (const code of ['CAP_EXCEEDED', 'DUPLICATE_KEY'] as const) {
+    const d = context({ rates: [rate('r1')], mappings: [mapping('1')], fail: { xeroTaxRates: code } as never }, wooTaxes(1))
+    assert.deepEqual((await runVendorItem('R13', d.ctx)).reasons, ['VENDOR_LIST_UNPROVEN'], code)
+  }
+  // A section that claims a state this module does not know is not a proof.
+  const odd = context({ rates: [rate('r1')], mappings: [mapping('1')], xeroStore: { state: 'complete' } as never }, wooTaxes(1))
+  assert.deepEqual((await runVendorItem('R13', odd.ctx)).reasons, ['VENDOR_LIST_UNPROVEN'])
 })
 
 test('R13: an unmapped WooCommerce rate, or a mapping to a rate the store no longer has, is a finding - and a fail stands even though the Xero leg is unproven', async () => {
@@ -281,8 +288,7 @@ test('R13: a mapping whose external id is not a plain numeric id, a read that fa
 test('R13 empty: no rates and no mappings is not a pass without proof, and the Xero leg is still needed', async () => {
   const item = await runVendorItem('R13', context({}, wooTaxes()).ctx)
   assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['VENDOR_LIST_UNPROVEN']])
-  const d = context({}, wooTaxes())
-  d.ctx.vendor = { woo: d.woo, xeroTaxTypes: xero() }
+  const d = context({ xeroStore: xero() }, wooTaxes())
   const pass = await runVendorItem('R13', d.ctx)
   assert.deepEqual([pass.outcome, pass.proof, pass.sources], ['pass', { kind: 'proven-empty', source: 'vendor-total-zero' }, [...getPackItem('R13').sources]])
 })
@@ -290,8 +296,7 @@ test('R13 empty: no rates and no mappings is not a pass without proof, and the X
 test('R13 WITH a proven Xero list: every Xero tax type held by an active IMS rate, and the reverse, passes naming all three sources; any difference fails', async () => {
   const rates = [rate('r1', { accountingTaxType: 'OUTPUT2' }), rate('r2', { accountingTaxType: 'OUTPUT2' }), rate('r3', { accountingTaxType: 'TAX001' }), rate('r4', { accountingTaxType: 'OLDRATE', active: false }), rate('r5')]
   const run = async (types: string[], woo = wooTaxes(1), mappings = [mapping('1')]) => {
-    const c = context({ rates, mappings }, woo)
-    c.ctx.vendor = { woo: c.woo, xeroTaxTypes: xero(...types) }
+    const c = context({ rates, mappings, xeroStore: xero(...types) }, woo)
     return runVendorItem('R13', c.ctx)
   }
   const pass = await run(['OUTPUT2', 'TAX001'])

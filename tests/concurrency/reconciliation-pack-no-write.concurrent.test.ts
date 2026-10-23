@@ -284,6 +284,40 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     assert.ok(on.targets.some((target) => target === `127.0.0.1:${storePort}`), 'precondition: the store was contacted')
     assert.ok(!on.out.join('\n').includes(`cs_${VTAG}`) && !on.out.join('\n').includes('customer@example.com'))
 
+    // R13's Xero leg from the STORED list: a connected organisation and a proven list of its tax rates turn the item into a PASS, with no
+    // request to Xero (the only connections are the database and the loopback store) and not one row written.
+    const { digestTaxRateList } = await import('../../lib/connectors/xero/tax-rate-list.ts')
+    const xeroRows = [
+      { taxType: 'OUTPUT2', name: 'Standard', status: 'ACTIVE' as const, reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: [{ name: 'VAT', rate: '20.000000', compound: false, nonRecoverable: false }], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } },
+      { taxType: 'OLD1', name: 'Retired', status: 'ARCHIVED' as const, reportTaxType: null, effectiveRate: null, displayTaxRate: null, components: [], canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: null } },
+    ]
+    const tenant = `${VTAG}-tenant`
+    try {
+      await sql(`UPDATE tax_rates SET accounting_tax_type = 'OUTPUT2' WHERE id = $1`, [`${VTAG}-t`])
+      await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'not-a-token', now(), $2, now())`, [`${VTAG}-tok`, tenant])
+      for (const row of xeroRows) {
+        await sql(`INSERT INTO xero_tax_rates (id, connector, "tenantId", "taxType", name, status, "reportTaxType", "effectiveRate", "displayTaxRate", components, "canApplyToAssets", "canApplyToEquity", "canApplyToExpenses", "canApplyToLiabilities", "canApplyToRevenue", "fetchedAt") VALUES ($1, 'xero', $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, '2026-10-23 08:00:00')`,
+          [`${VTAG}-x-${row.taxType}`, tenant, row.taxType, row.name, row.status, row.reportTaxType, row.effectiveRate, row.displayTaxRate, JSON.stringify(row.components), row.canApply.assets, row.canApply.equity, row.canApply.expenses, row.canApply.liabilities, row.canApply.revenue])
+      }
+      await sql(`INSERT INTO xero_tax_rate_lists (id, connector, "tenantId", "fetchedAt", "rowCount", digest) VALUES ($1, 'xero', $2, '2026-10-23 08:00:00', 2, $3)`, [`${VTAG}-xl`, tenant, digestTaxRateList(tenant, xeroRows)])
+      const proven = await run(['--vendor-reads-only'])
+      assert.ok(proven.out.includes('R13 pass -'), proven.out.join('\n'))
+      for (const target of proven.targets) assert.ok(target === `${url.hostname}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}` || target === `127.0.0.1:${storePort}`, `unexpected connection to ${target} (no request to Xero)`)
+      // The archived type is stored but not compared; an ACTIVE Xero type that no IMS rate holds is a finding (R13 fails by id).
+      await sql(`UPDATE xero_tax_rates SET status = 'ACTIVE' WHERE id = $1`, [`${VTAG}-x-OLD1`])
+      await sql(`UPDATE xero_tax_rate_lists SET digest = $2 WHERE id = $1`, [`${VTAG}-xl`, digestTaxRateList(tenant, [xeroRows[0]!, { ...xeroRows[1]!, status: 'ACTIVE' as const }])])
+      const unmapped = await run(['--vendor-reads-only'])
+      assert.ok(unmapped.out.includes('R13 fail DIFFERENCES'), unmapped.out.join('\n'))
+      // A stored row edited behind the header's back is not a proof: the item is inconclusive, never a pass.
+      await sql(`UPDATE xero_tax_rates SET name = 'edited' WHERE id = $1`, [`${VTAG}-x-OUTPUT2`])
+      const tampered = await run(['--vendor-reads-only'])
+      assert.ok(tampered.out.includes('R13 inconclusive VENDOR_LIST_UNPROVEN'), tampered.out.join('\n'))
+    } finally {
+      await sql(`DELETE FROM xero_tax_rate_lists WHERE id LIKE '${VTAG}%'`)
+      await sql(`DELETE FROM xero_tax_rates WHERE id LIKE '${VTAG}%'`)
+      await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${VTAG}%'`)
+    }
+
     // An order the store has and IMS lacks is a finding (the identity swap, with equal counts): R9 fails by id.
     await sql(`DELETE FROM shopping_order_links WHERE id = $1`, [`${VTAG}-l2`])
     await sql(`INSERT INTO shopping_order_links (id, "orderId", connector, "externalOrderId", "updatedAt") VALUES ($1, $2, 'woocommerce', '9003', now())`, [`${VTAG}-l2`, `${VTAG}-o2`])

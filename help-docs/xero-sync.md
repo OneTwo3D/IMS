@@ -1431,6 +1431,34 @@ uses a multi-component rate also emits a one-shot WARNING activity log
 the affected rate, so the operator knows the per-component breakdown depends on the accounting-side
 configuration.
 
+### The Xero tax-rate master store
+
+Xero is the tax-rate master: an operator maintains tax rates by hand in Xero and IMS reads them. IMS keeps a stored copy of the
+**full** list of Xero tax rates for the connected organisation (every rate, every status), so a report can compare it with the IMS
+rates without calling Xero. It is read-only to operators and is filled by one job, the hourly `xero-tax-rate-drift` cron (the same
+run that records tax-rate drift).
+
+- **What is stored.** One row per Xero `TaxType` (unique per organisation): name, status (`ACTIVE`, `DELETED`, `ARCHIVED` or
+  `PENDING`), report tax type, effective and display rate (exact decimals), the components (name, rate, compound, non-recoverable)
+  and the five *can apply to* flags Xero returns. Beside the rows sits one header row per organisation: when the list was read, how
+  many rows it held, and a digest of the rows. The header is what lets a reader prove the rows are **one complete read**.
+- **How it is refreshed.** Each run does one `GET /TaxRates` (also when IMS has no tax rate to compare: the stored list does not
+  depend on the comparison), validates every row strictly, and then, in a single transaction behind the connection fence, replaces
+  the organisation's rows and header, writes the drift snapshot and advances the read-sync last-success stamp (`xero_tax_rate_drift_last_checked_at`).
+  The stamp therefore means "the list was stored", never "a request was made".
+- **What is refused.** An empty list, a response that is not the `TaxRates` list, an unknown field, a field of the wrong type, a rate
+  that cannot be held exactly (more than six decimal places, negative, above 1000), or a tax type listed twice refuses the **whole**
+  response: nothing is stored, the previous list and the stamp stay exactly as they were, the run errors in the cron log
+  (`XeroTaxRateListRefusedError`, with the reason) and the *Xero tax-rate read* feed goes stale after six hours. If Xero adds a field to
+  its response the run fails closed until `lib/connectors/xero/tax-rate-list.ts` is taught the field.
+- **Organisations.** The list belongs to the organisation it was read from. A reader asks for the organisation connected now; after a
+  rebind to another organisation there is no list for it until its first run, and the first run removes the previous organisation's
+  rows. If the connection changes while a run is in flight, the run is discarded (see the connection fence above).
+- **Nothing is written to Xero and nothing else changes.** Mapping Xero's rates into IMS tax codes, pushing rates to WooCommerce and
+  the tax-rate write path (*Generate missing Xero tax rates*, the multi-component sync) are not part of this store and behave as before.
+- **Used by** reconciliation-pack item R13 (the Xero leg), which reads the stored list in its own read-only snapshot. See
+  *Reconciliation pack* in the installation guide.
+
 ### Reverse Charge
 
 Lines whose `TaxRate.reverseCharge` is true post to Xero / QuickBooks with the connector-side tax
@@ -1935,6 +1963,7 @@ settles expire normally.
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
 | `/api/cron/accounting-fx-revaluation` | Daily | Periodic unrealised FX revaluation of open AR/AP balances |
 | `/api/cron/account-balance-snapshot` | Daily | Snapshot Xero account balances for period reporting |
+| `/api/cron/xero-tax-rate-drift` | Hourly | Read the full Xero tax-rate list into the tax-rate master store (rows, header and read-sync stamp in one transaction) and record IMS-vs-Xero tax-rate drift |
 
 All cron endpoints require the `CRON_SECRET` bearer header in production.
 
