@@ -159,12 +159,31 @@ test('configuration: plugin off, or any of the five codes unset or blank, is no_
   }
 })
 
-test('two accounts sharing one code are reported, not hidden', async () => {
+test('two accounts sharing one code are reported, not hidden: BOTH of them, whatever their catalogue order', async () => {
   const state = goodState()
-  state.settings.set('xero_transit_account', CODES.allocated)
+  state.settings.set('xero_unearned_revenue_account', CODES.cogs)
   const { basis } = await load(state)
   assert.equal(basis.available, true)
-  if (basis.available) assert.deepEqual(basis.sharedCodeKinds, ['transit'])
+  if (basis.available) assert.deepEqual(basis.sharedCodeKinds, ['cogs', 'unearned'])
+})
+
+// [mutation: shared codes marked only on their later occurrence]
+test('Transit sharing its code with a LATER account (COGS, Unearned) withholds the transit leg; Inventory/Allocated sharing with any account is no basis', async () => {
+  for (const later of ['xero_cogs_account', 'xero_unearned_revenue_account']) {
+    const state = goodState()
+    state.settings.set(later, CODES.transit)
+    const { basis } = await load(state)
+    assert.equal(basis.available, true, later)
+    if (basis.available) {
+      assert.ok(basis.sharedCodeKinds.includes('transit'), later)
+      assert.deepEqual(transitOf(basis), { available: false, reason: 'transit_balance_unusable' }, later)
+    }
+  }
+  for (const [setting, code] of [['xero_cogs_account', CODES.inventory], ['xero_transit_account', CODES.allocated], ['xero_unearned_revenue_account', CODES.allocated]] as const) {
+    const state = goodState()
+    state.settings.set(setting, code)
+    assert.equal(reason((await load(state)).basis), 'inventory_accounts_shared', setting)
+  }
 })
 
 // [mutation: the shared Inventory/Allocated refusal removed]

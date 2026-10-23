@@ -222,16 +222,18 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
     if (code.length === 0) return fail('no_account_configured')
     codes.set(account.kind, code)
   }
-  // The inventory comparison adds the Inventory and Allocated Inventory balances. One code for both is ONE stored balance read
-  // twice, so a subledger at double the real GL balance would read as balanced: no usable basis rather than a false one.
-  if (codes.get('inventory') === codes.get('allocated')) return fail('inventory_accounts_shared')
-  const sharedCodeKinds: PackBasisAccountKind[] = []
-  const firstKindOfCode = new Map<string, PackBasisAccountKind>()
+  // EVERY kind whose code is also another kind's code, whatever their order in the catalogue (marking only the later one let an
+  // earlier kind, e.g. Transit before COGS, read a balance it shares as if it were its own).
+  const kindsOfCode = new Map<string, PackBasisAccountKind[]>()
   for (const account of PACK_BASIS_ACCOUNTS) {
     const code = codes.get(account.kind)!
-    if (firstKindOfCode.has(code)) sharedCodeKinds.push(account.kind)
-    else firstKindOfCode.set(code, account.kind)
+    kindsOfCode.set(code, [...(kindsOfCode.get(code) ?? []), account.kind])
   }
+  const sharedCodeKinds: PackBasisAccountKind[] = PACK_BASIS_ACCOUNTS.map((account) => account.kind).filter((kind) => kindsOfCode.get(codes.get(kind)!)!.length > 1)
+  // The inventory comparison adds the Inventory and Allocated Inventory balances. Either one sharing its code (with the other,
+  // or with Transit, COGS or Unearned Revenue) makes that sum a balance that is not the inventory ledger's: no usable basis
+  // rather than a false one.
+  if (sharedCodeKinds.includes('inventory') || sharedCodeKinds.includes('allocated')) return fail('inventory_accounts_shared')
 
   // 2. The base currency, by the same rule as everywhere else (the organisation row, else the default).
   const org = await tx.organisation.findFirst({ select: { baseCurrency: true } })

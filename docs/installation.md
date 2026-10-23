@@ -1907,7 +1907,7 @@ The Stock in Transit leg (R10 only) is separate and never makes the basis unavai
 | Basis reason | Meaning |
 |---|---|
 | no_account_configured | the Xero plugin is not on, or one of the five accounts (Inventory, Allocated Inventory, Stock in Transit, Cost of Goods Sold, Unearned Revenue) has no configured code |
-| inventory_accounts_shared | Inventory and Allocated Inventory are configured with the same account code, so the inventory comparison would count one balance twice |
+| inventory_accounts_shared | Inventory or Allocated Inventory is configured with an account code another of the five accounts also uses, so the inventory comparison would not be over the inventory ledger alone |
 | no_gl_snapshot | no stored trial-balance balance exists, on any date, for a configured account |
 | not_for_date | stored balances exist for a configured account but none for exactly the cycle date; a balance for an earlier or later date is never substituted |
 | gl_snapshot_ambiguous | more than one stored balance exists for one configured account on the cycle date |
