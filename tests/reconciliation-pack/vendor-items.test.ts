@@ -317,6 +317,19 @@ test('R13 WITH a proven Xero list: every Xero tax type held by an active IMS rat
   assert.equal((await run(['OUTPUT2', 'TAX001'], wooTaxes(1, 2))).outcome, 'fail')
 })
 
+// [mutation: the ACTIVE filter removed / the Xero section read in a second IMS read]
+test('R13 reads the rates and the stored Xero list in ONE IMS read, and only ACTIVE Xero tax types are compared (a DELETED or ARCHIVED one is stored, not a finding)', async () => {
+  const rates = [rate('r1', { accountingTaxType: 'OUTPUT2' })]
+  const c = context({ rates, mappings: [mapping('1')], xeroStore: { state: 'proven', tenantId: 't', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: [{ taxType: 'OUTPUT2', status: 'ACTIVE' }, { taxType: 'OLD1', status: 'ARCHIVED' }, { taxType: 'OLD2', status: 'DELETED' }, { taxType: 'NEW1', status: 'PENDING' }] } }, wooTaxes(1))
+  const item = await runVendorItem('R13', c.ctx)
+  assert.deepEqual([item.outcome, item.reasons], ['pass', []])
+  assert.equal(c.ims.calls.length, 1, 'one snapshot for both')
+  assert.deepEqual([...c.ims.calls[0]!.sections].sort(), ['taxes', 'xeroTaxRates'])
+  // An ACTIVE Xero type no IMS rate holds is still a finding.
+  const d = context({ rates, mappings: [mapping('1')], xeroStore: { state: 'proven', tenantId: 't', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: [{ taxType: 'OUTPUT2', status: 'ACTIVE' }, { taxType: 'NEW1', status: 'ACTIVE' }] } }, wooTaxes(1))
+  assert.deepEqual(keys(await runVendorItem('R13', d.ctx), 'onlyVendor'), ['xero-tax-type|NEW1'])
+})
+
 test('the vendor items are the only ones this module runs, and an unexpected failure inside one is INTERNAL_ERROR with no text', async () => {
   const c = context({ orders: [] }, { orders: {} })
   c.ctx.vendor = { woo: { get: () => { throw new Error('hunter2') } } as never }
