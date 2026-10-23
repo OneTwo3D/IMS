@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { config } from 'dotenv'
 
-import { RECONCILIATION_PACK_SCHEDULE_LOCK_KEY } from '../../lib/db/advisory-locks'
+import { RECONCILIATION_PACK_SCHEDULE_LOCK_KEY, RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY } from '../../lib/db/advisory-locks'
 import { DEFAULT_PACK_REPORT_DIR, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN } from '../../lib/reconciliation-pack/constants'
 import { lockPackScheduleSettings } from '../../lib/reconciliation-pack/schedule-lock'
 import { PACK_SCHEDULE_VENDOR_READS_SETTING, PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_RECORD_ACTION } from '../../lib/reconciliation-pack/schedule-constants'
@@ -249,6 +249,96 @@ test('a settings save never waits for a running child', { skip }, async () => {
     console.log(`# save while the child ran: ${took} ms`)
     assert.ok(took < 3000, `the save took ${took} ms`)
     endChild()
+    assert.equal((await run).record.outcome, 'published')
+  })
+})
+
+// --- THE FENCE IS HELD UNTIL THE CHILD HAS SPAWNED ---
+function child() {
+  let spawn!: () => void
+  let failSpawn!: (error: Error) => void
+  let finish!: (result: ReturnType<typeof ran>) => void
+  const killed: number[] = []
+  const started = {
+    spawned: new Promise<void>((resolve, reject) => { spawn = resolve; failSpawn = reject }),
+    done: new Promise<ReturnType<typeof ran>>((resolve) => { finish = resolve }),
+    kill: () => { killed.push(1) },
+  }
+  started.spawned.catch(() => undefined)
+  return { started, spawn, failSpawn, finish, killed }
+}
+const settled = async <T>(promise: Promise<T>, ms: number): Promise<boolean> => Promise.race([promise.then(() => true, () => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms))])
+
+test('a disable saved after the final read but before the spawn waits for the spawn: the save is ordered AFTER the start, never a start after a committed disable', { skip }, async () => {
+  await withRows({ [PACK_SCHEDULE_ENABLED_SETTING]: 'true', [PACK_SCHEDULE_PHASE_SETTING]: 'P1', [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'true' }, async (db) => {
+    const { runScheduledReconciliationPack } = await import('../../lib/ops/reconciliation-pack-schedule')
+    const c = child()
+    const events: string[] = []
+    let saved: Promise<void> | undefined
+    const specs: Array<{ args?: readonly string[] }> = []
+    const run = runScheduledReconciliationPack(randomUUID(), {
+      env: ENV,
+      vendorGate: async () => true,
+      // between the final read and the spawn: a disable and a vendor-off arrive
+      beforeSpawn: async () => {
+        saved = save(db, { [PACK_SCHEDULE_ENABLED_SETTING]: 'false', [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'false' }).then(() => { events.push('save-committed') })
+        events.push('save-issued')
+        assert.equal(await settled(saved, 700), false, 'the save is blocked by the fence while the child has not spawned')
+      },
+      startChild: (spec) => { specs.push(spec); events.push('start'); return c.started },
+      verifyReport: () => ({ sequence: 1 }),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    assert.deepEqual(events, ['save-issued', 'start'], 'still blocked: the child exists but has not spawned')
+    events.push('spawned')
+    c.spawn()
+    await saved
+    assert.deepEqual(events, ['save-issued', 'start', 'spawned', 'save-committed'])
+    // the child that started is the one the settings of that moment asked for (including the flag), and the save landed after
+    assert.deepEqual(specs[0]!.args, ['--phase', 'P1', '--vendor-reads-only'])
+    c.finish(ran())
+    assert.equal((await run).record.outcome, 'published')
+    const row = await db.setting.findUnique({ where: { key: PACK_SCHEDULE_ENABLED_SETTING } })
+    assert.equal(row?.value, 'false', 'and the disable did commit, for the next start')
+  })
+})
+
+test('a spawn failure or timeout releases the fence: the next save is not held, the failure is recorded', { skip }, async () => {
+  for (const mode of ['error', 'timeout'] as const) {
+    await withRows({ [PACK_SCHEDULE_ENABLED_SETTING]: 'true', [PACK_SCHEDULE_PHASE_SETTING]: 'P1' }, async (db) => {
+      const { runScheduledReconciliationPack } = await import('../../lib/ops/reconciliation-pack-schedule')
+      const c = child()
+      if (mode === 'error') c.failSpawn(new Error('ENOENT'))
+      const outcome = await runScheduledReconciliationPack(randomUUID(), { env: ENV, startChild: () => c.started, spawnTimeoutMs: 300, verifyReport: () => ({ sequence: 1 }) })
+      assert.equal(outcome.record.code, 'CHILD_NOT_STARTED', mode)
+      assert.equal(c.killed.length, 1, mode)
+      const t0 = Date.now()
+      await save(db, { [PACK_SCHEDULE_PHASE_SETTING]: 'P2' })
+      assert.ok(Date.now() - t0 < 3000, `${mode}: the save was held ${Date.now() - t0} ms`)
+      const locks = await db.$queryRaw<Array<{ n: bigint }>>`select count(*)::bigint as n from pg_locks where locktype = 'advisory' and objid in (${RECONCILIATION_PACK_SCHEDULE_LOCK_KEY}, ${RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY})`
+      assert.equal(Number(locks[0]!.n), 0, `${mode}: no lock left open`)
+    })
+  }
+})
+
+test('a save during the running child (after the spawn) completes in milliseconds, and no lock is held by the run beyond the session lock', { skip }, async () => {
+  await withRows({ [PACK_SCHEDULE_ENABLED_SETTING]: 'true', [PACK_SCHEDULE_PHASE_SETTING]: 'P1' }, async (db) => {
+    const { runScheduledReconciliationPack } = await import('../../lib/ops/reconciliation-pack-schedule')
+    const c = child()
+    let began!: () => void
+    const startedChild = new Promise<void>((resolve) => { began = resolve })
+    const run = runScheduledReconciliationPack(randomUUID(), { env: ENV, startChild: () => { began(); return c.started }, verifyReport: () => ({ sequence: 1 }) })
+    await startedChild
+    c.spawn()
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const t0 = Date.now()
+    await save(db, { [PACK_SCHEDULE_ENABLED_SETTING]: 'false' })
+    const took = Date.now() - t0
+    console.log(`# save while the spawned child ran: ${took} ms`)
+    assert.ok(took < 1500, `the save took ${took} ms`)
+    const fence = await db.$queryRaw<Array<{ n: bigint }>>`select count(*)::bigint as n from pg_locks where locktype = 'advisory' and objid = ${RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY}`
+    assert.equal(Number(fence[0]!.n), 0, 'the settings fence is not held while the child runs')
+    c.finish(ran())
     assert.equal((await run).record.outcome, 'published')
   })
 })

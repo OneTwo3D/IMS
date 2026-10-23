@@ -157,19 +157,30 @@ function tail(text: string): string {
   return text.length > OUTPUT_TAIL_BYTES ? text.slice(text.length - OUTPUT_TAIL_BYTES) : text
 }
 
+/** A started `npm run` child: `spawned` settles when the process exists (or could not be started); `done` is its result. */
+export type StartedScript = { spawned: Promise<void>; done: Promise<ChildResult>; kill: () => void }
+
 /** `npm run [--silent] <script>` with no shell. The child leads its own process group so a timeout stops what it started. */
-export function runNpmScript(spec: ChildSpec): Promise<ChildResult> {
-  return new Promise((resolve) => {
+export function startNpmScript(spec: ChildSpec): StartedScript {
+  let kill = () => {}
+  let spawned!: Promise<void>
+  const done = new Promise<ChildResult>((resolve) => {
     const args = ['run', ...(spec.silent ? ['--silent'] : []), spec.script, ...(spec.args && spec.args.length > 0 ? ['--', ...spec.args] : [])]
     const child = spawn('npm', args, { cwd: spec.cwd, env: spec.env as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true, shell: false })
+    spawned = new Promise<void>((ok, fail) => {
+      child.once('spawn', () => ok())
+      child.once('error', (error) => fail(error))
+    })
+    spawned.catch(() => undefined)
     let stdout = ''
     let stderr = ''
     let timedOut = false
+    kill = () => { try { process.kill(-(child.pid as number), 'SIGKILL') } catch { /* already gone */ } }
     child.stdout.on('data', (chunk: Buffer) => { stdout = tail(stdout + chunk.toString('utf8')) })
     child.stderr.on('data', (chunk: Buffer) => { stderr = tail(stderr + chunk.toString('utf8')) })
     const timer = setTimeout(() => {
       timedOut = true
-      try { process.kill(-(child.pid as number), 'SIGKILL') } catch { /* already gone */ }
+      kill()
     }, spec.timeoutMs)
     child.on('error', (error) => {
       clearTimeout(timer)
@@ -180,6 +191,11 @@ export function runNpmScript(spec: ChildSpec): Promise<ChildResult> {
       resolve({ exitCode: code, stdout, stderr, timedOut })
     })
   })
+  return { spawned, done, kill: () => kill() }
+}
+
+export function runNpmScript(spec: ChildSpec): Promise<ChildResult> {
+  return startNpmScript(spec).done
 }
 
 export const SCHEMA_SCRIPT_TIMEOUT_MS = 5 * 60 * 1000

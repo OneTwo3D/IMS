@@ -6,13 +6,18 @@ import {
   PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_RECORD_ACTION, PACK_SCHEDULE_VENDOR_READS_SETTING,
 } from '../../lib/reconciliation-pack/schedule-constants'
 import { runScheduledReconciliationPack, scheduledChildEnv, type ScheduledPackDeps } from '../../lib/ops/reconciliation-pack-schedule'
-import type { ChildResult, ChildSpec } from '../../lib/ops/readiness-gate-collect'
+import { startNpmScript, type ChildResult, type ChildSpec, type StartedScript } from '../../lib/ops/readiness-gate-collect'
 import { assertClosedRecord } from '../reconciliation-pack/schedule-helpers'
 
 const RUN_ID = '20261023T030000Z-0123456789ab'
 const dir = `${DEFAULT_PACK_REPORT_DIR}/${RUN_ID}`
 const PUBLISHED_STDERR = `Report: ${dir}/${PACK_REPORT_JSON}\nReport: ${dir}/${PACK_REPORT_MARKDOWN}\n`
 const SCHEDULE_RUN_ID = '11111111-2222-4333-8444-555555555555'
+
+/** A fence double: runs `fn` with the given rows. */
+function fencedFrom(map: Record<string, string | undefined>): NonNullable<ScheduledPackDeps['fenced']> {
+  return async (_keys, fn) => fn(new Map(Object.entries(map).filter((entry): entry is [string, string] => entry[1] !== undefined)))
+}
 
 type Logged = { action: string; level?: string; description: string; metadata: Record<string, unknown>; entityType: string; tag: string }
 
@@ -25,7 +30,7 @@ function harness(settings: Record<string, string | undefined>, overrides: Partia
   const deps: ScheduledPackDeps = {
     now: () => 1_000,
     readSettings: async () => new Map(Object.entries(settings).filter((entry): entry is [string, string] => entry[1] !== undefined)),
-    readFinalSettings: async () => new Map(Object.entries(settings).filter((entry): entry is [string, string] => entry[1] !== undefined)),
+    fenced: fencedFrom(settings),
     acquireLock: async () => { events.push('lock'); return { release: async () => { events.push('release') } } },
     vendorGate: async () => true,
     runChild: async (spec) => { events.push('child'); children.push(spec); return { exitCode: 0, stdout: '', stderr: '', timedOut: false, ...ended } },
@@ -252,34 +257,34 @@ test('no network and no real process: the harness never reached a socket or the 
 
 test('THE FINAL READ: a disable or a vendor-off saved while the run waited on the lock or the rate gate is honoured; the child starts with the re-read values only', async () => {
   const stored: Record<string, string | undefined> = { ...ON_P1, [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'true' }
-  const reads = (map: Record<string, string | undefined>) => async () => new Map(Object.entries(map).filter((entry): entry is [string, string] => entry[1] !== undefined))
+  const reads = fencedFrom
   // disabled while the gate waited
-  const disabled = harness(stored, { readFinalSettings: reads({ ...stored, [PACK_SCHEDULE_ENABLED_SETTING]: 'false' }) })
+  const disabled = harness(stored, { fenced: reads({ ...stored, [PACK_SCHEDULE_ENABLED_SETTING]: 'false' }) })
   const out = await runScheduledReconciliationPack(SCHEDULE_RUN_ID, disabled.deps)
   assert.equal(disabled.children.length, 0)
   assertOneClosedRecord(disabled, 'SCHEDULE_DISABLED', 'refused')
   assert.equal(out.status, 'skipped')
   assert.deepEqual(disabled.events, ['lock', 'log', 'release'])
   // vendor reads turned off while it waited: the pack runs WITHOUT the flag and without the keys (the conservative choice)
-  const off = harness(stored, { readFinalSettings: reads({ ...stored, [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'false' }) })
+  const off = harness(stored, { fenced: reads({ ...stored, [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'false' }) })
   await runScheduledReconciliationPack(SCHEDULE_RUN_ID, off.deps)
   assert.deepEqual(off.children[0]!.args, ['--phase', 'P1'])
   assert.ok(!('SETTINGS_ENCRYPTION_KEY' in off.children[0]!.env) && !('ENCRYPTION_KEY' in off.children[0]!.env))
   assert.equal(off.logged[0]!.metadata.vendorReads, false, 'the record states what actually ran')
   // vendor reads turned ON while it waited: not honoured for this start (the rate gate was not consulted for it)
-  const on = harness(ON_P1, { readFinalSettings: reads({ ...ON_P1, [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'true' }) })
+  const on = harness(ON_P1, { fenced: reads({ ...ON_P1, [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'true' }) })
   await runScheduledReconciliationPack(SCHEDULE_RUN_ID, on.deps)
   assert.deepEqual(on.children[0]!.args, ['--phase', 'P1'])
   // the phase changed or was cleared while it waited: exactly the re-read phase
-  const moved = harness(ON_P1, { readFinalSettings: reads({ ...ON, [PACK_SCHEDULE_PHASE_SETTING]: 'P2' }) })
+  const moved = harness(ON_P1, { fenced: reads({ ...ON, [PACK_SCHEDULE_PHASE_SETTING]: 'P2' }) })
   await runScheduledReconciliationPack(SCHEDULE_RUN_ID, moved.deps)
   assert.deepEqual(moved.children[0]!.args, ['--phase', 'P2'])
-  const cleared = harness(ON_P1, { readFinalSettings: reads(ON) })
+  const cleared = harness(ON_P1, { fenced: reads(ON) })
   await runScheduledReconciliationPack(SCHEDULE_RUN_ID, cleared.deps)
   assert.equal(cleared.children.length, 0)
   assertOneClosedRecord(cleared, 'PHASE_NOT_SET', 'refused')
   // an unreadable final read starts nothing
-  const broken = harness(ON_P1, { readFinalSettings: async () => { throw new Error('x') } })
+  const broken = harness(ON_P1, { fenced: async () => { throw new Error('x') } })
   await runScheduledReconciliationPack(SCHEDULE_RUN_ID, broken.deps)
   assert.equal(broken.children.length, 0)
   assertOneClosedRecord(broken, 'SETTINGS_UNREADABLE', 'refused')
@@ -290,7 +295,7 @@ test('the final read comes AFTER the lock and the rate gate and BEFORE the child
   const h = harness({ ...ON_P1, [PACK_SCHEDULE_VENDOR_READS_SETTING]: 'true' }, {
     acquireLock: async () => { events.push('lock'); return { release: async () => { events.push('release') } } },
     vendorGate: async () => { events.push('gate'); return true },
-    readFinalSettings: async () => { events.push('final-read'); return new Map<string, string>([[PACK_SCHEDULE_ENABLED_SETTING, 'true'], [PACK_SCHEDULE_PHASE_SETTING, 'P1'], [PACK_SCHEDULE_VENDOR_READS_SETTING, 'true']]) },
+    fenced: async (_keys, fn) => { events.push('final-read'); return fn(new Map<string, string>([[PACK_SCHEDULE_ENABLED_SETTING, 'true'], [PACK_SCHEDULE_PHASE_SETTING, 'P1'], [PACK_SCHEDULE_VENDOR_READS_SETTING, 'true']])) },
     runChild: async () => { events.push('child'); return { exitCode: 0, stdout: '', stderr: PUBLISHED_STDERR, timedOut: false } },
   })
   await runScheduledReconciliationPack(SCHEDULE_RUN_ID, h.deps)
@@ -304,4 +309,75 @@ test('an exit that looks published but whose report does not verify is a failed 
   assert.equal(h.logged[0]!.level, 'ERROR')
   assert.equal(out.status, 'failed')
   assert.equal(h.logged[0]!.metadata.sequence, null)
+})
+
+// --- THE SPAWN INSIDE THE FENCE ---
+/** A controllable child: `spawned` and `done` are settled by the test. */
+function controlledChild() {
+  let spawn!: () => void
+  let failSpawn!: (error: Error) => void
+  let finish!: (result: ChildResult) => void
+  const killed: number[] = []
+  const started: StartedScript = {
+    spawned: new Promise<void>((resolve, reject) => { spawn = resolve; failSpawn = reject }),
+    done: new Promise<ChildResult>((resolve) => { finish = resolve }),
+    kill: () => { killed.push(1) },
+  }
+  return { started, spawn, failSpawn, finish, killed }
+}
+
+test('the fence is held until the child has SPAWNED and released then; the child\'s life is outside it', async () => {
+  const events: string[] = []
+  const child = controlledChild()
+  const h = harness(ON_P1, {
+    fenced: async (_keys, fn) => { events.push('fence-start'); const out = await fn(new Map([[PACK_SCHEDULE_ENABLED_SETTING, 'true'], [PACK_SCHEDULE_PHASE_SETTING, 'P1']])); events.push('fence-end'); return out },
+    startChild: () => { events.push('start'); return child.started },
+  })
+  const run = runScheduledReconciliationPack(SCHEDULE_RUN_ID, h.deps)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(events, ['fence-start', 'start'], 'started inside the fence, which is still held: the child has not spawned')
+  child.spawn()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(events, ['fence-start', 'start', 'fence-end'], 'released as soon as it spawned, while the child still runs')
+  child.finish({ exitCode: 0, stdout: '', stderr: PUBLISHED_STDERR, timedOut: false })
+  assert.equal((await run).record.outcome, 'published')
+})
+
+test('a spawn that fails or times out releases the fence, kills what it started and is a recorded CHILD_NOT_STARTED', async () => {
+  for (const mode of ['error', 'timeout', 'throws'] as const) {
+    const events: string[] = []
+    const child = controlledChild()
+    const h = harness(ON_P1, {
+      fenced: async (_keys, fn) => { events.push('fence-start'); try { return await fn(new Map([[PACK_SCHEDULE_ENABLED_SETTING, 'true'], [PACK_SCHEDULE_PHASE_SETTING, 'P1']])) } finally { events.push('fence-end') } },
+      startChild: () => { if (mode === 'throws') throw new Error('spawn exploded'); if (mode === 'error') child.failSpawn(new Error('ENOENT')); return child.started },
+      spawnTimeoutMs: 50,
+    })
+    const outcome = await runScheduledReconciliationPack(SCHEDULE_RUN_ID, h.deps)
+    assertOneClosedRecord(h, 'CHILD_NOT_STARTED', 'failed')
+    assert.equal(outcome.status, 'failed', mode)
+    assert.deepEqual(events, ['fence-start', 'fence-end'], mode)
+    assert.deepEqual(h.events.filter((e) => e === 'release'), ['release'], `${mode}: the session lock is released too`)
+    if (mode !== 'throws') assert.equal(child.killed.length, 1, `${mode}: the child is killed`)
+  }
+})
+
+test('a fence that fails after the child spawned does not orphan it: the run is still waited for and recorded', async () => {
+  const child = controlledChild()
+  const h = harness(ON_P1, {
+    fenced: async (_keys, fn) => { await fn(new Map([[PACK_SCHEDULE_ENABLED_SETTING, 'true'], [PACK_SCHEDULE_PHASE_SETTING, 'P1']])); throw new Error('commit failed') },
+    startChild: () => child.started,
+  })
+  const run = runScheduledReconciliationPack(SCHEDULE_RUN_ID, h.deps)
+  child.spawn()
+  child.finish({ exitCode: 0, stdout: '', stderr: PUBLISHED_STDERR, timedOut: false })
+  const outcome = await run
+  assert.equal(outcome.record.outcome, 'published')
+  assertOneClosedRecord(h, 'all-pass', 'published')
+})
+
+test('startNpmScript: a process that cannot be started rejects `spawned` and resolves `done` with no exit code', async () => {
+  const started = startNpmScript({ script: 'x', silent: true, env: { PATH: '/nonexistent' }, cwd: '/nonexistent-dir-for-test', timeoutMs: 5000 })
+  await assert.rejects(started.spawned)
+  const result = await started.done
+  assert.equal(result.exitCode, null)
 })

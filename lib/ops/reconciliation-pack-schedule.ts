@@ -4,7 +4,7 @@ import { logActivityPersisted } from '@/lib/activity-log'
 import { acquirePinnedAdvisoryLockOrNull, type PinnedAdvisoryLock } from '@/lib/db/pinned-advisory-lock'
 import { RECONCILIATION_PACK_SCHEDULE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
-import { buildChildEnv, runNpmScript, type ChildResult, type ChildSpec } from '@/lib/ops/readiness-gate-collect'
+import { buildChildEnv, startNpmScript, type ChildResult, type ChildSpec, type StartedScript } from '@/lib/ops/readiness-gate-collect'
 import { VENDOR_ENV } from '@/lib/reconciliation-pack/cli'
 import { checkAncestors, readTrustedRegularFileBytes } from '@/lib/ops/published-report'
 import { DEFAULT_PACK_REPORT_DIR, MAX_EVIDENCE_BYTES, MAX_REPORT_JSON_BYTES, PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN } from '@/lib/reconciliation-pack/constants'
@@ -16,7 +16,7 @@ import {
   type ParsedPackOutput, type ScheduledRunRecord,
 } from '@/lib/reconciliation-pack/schedule'
 import {
-  PACK_SCHEDULE_CHILD_TIMEOUT_MS, PACK_SCHEDULE_DEFAULT_ENABLED, PACK_SCHEDULE_NPM_SCRIPT, PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING,
+  PACK_SCHEDULE_CHILD_TIMEOUT_MS, PACK_SCHEDULE_SPAWN_TIMEOUT_MS, PACK_SCHEDULE_DEFAULT_ENABLED, PACK_SCHEDULE_NPM_SCRIPT, PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING,
   PACK_SCHEDULE_RECORD_ACTION, PACK_SCHEDULE_VENDOR_READS_SETTING, PACK_SCHEDULE_VENDOR_RATE_KEY, PACK_SCHEDULE_VENDOR_WINDOW_MS,
   type PackSchedulePhase, type PackScheduleRefusal,
 } from '@/lib/reconciliation-pack/schedule-constants'
@@ -60,8 +60,13 @@ export type ScheduledPackOutcome = {
 export type ScheduledPackDeps = {
   now?: () => number
   readSettings?: (keys: string[]) => Promise<Map<string, string>>
-  /** The final read under the settings fence (default: a short transaction holding the settings advisory lock). */
-  readFinalSettings?: (keys: string[]) => Promise<Map<string, string>>
+  /** Runs `fn` with the job's rows re-read under the settings fence, holding the fence until `fn` returns (default: a transaction holding the settings advisory lock). */
+  fenced?: <T>(keys: string[], fn: (settings: Map<string, string>) => Promise<T>) => Promise<T>
+  /** Starts the child and reports when it has spawned (default: startNpmScript). */
+  startChild?: (spec: ChildSpec) => StartedScript
+  /** Test seam: runs inside the fence after the final read and before the child is started. */
+  beforeSpawn?: () => Promise<void>
+  spawnTimeoutMs?: number
   acquireLock?: () => Promise<Pick<PinnedAdvisoryLock, 'release'> | null>
   /** True when a run that reads a vendor may start now. */
   vendorGate?: () => Promise<boolean>
@@ -87,14 +92,20 @@ export function scheduledChildEnv(source: Record<string, string | undefined>, ve
 }
 
 /**
- * THE FINAL READ: a short transaction that takes the settings fence and reads the job's three rows from the database. Writers of the
- * rows hold the fence only for their own save transaction, so this waits for at most one save and never for a running child.
+ * The settings fence: a transaction that takes the fence, reads the job's rows from the database and runs `fn` with them, holding the
+ * fence until `fn` returns. The runner's `fn` starts the child and waits only for its spawn, so a save waits for at most that, never
+ * for the child's life. The transaction timeout covers the spawn alone.
  */
-export async function readSettingsUnderFence(keys: string[]): Promise<Map<string, string>> {
+export async function runUnderSettingsFence<T>(keys: string[], fn: (settings: Map<string, string>) => Promise<T>): Promise<T> {
   return db.$transaction(async (tx) => {
     await lockPackScheduleSettings(tx)
-    return getSettingValues(keys, tx)
-  }, { timeout: 15_000, maxWait: 10_000 })
+    return fn(await getSettingValues(keys, tx))
+  }, { timeout: PACK_SCHEDULE_SPAWN_TIMEOUT_MS + 15_000, maxWait: 10_000 })
+}
+
+/** A child started by a test double of `runChild`: it counts as spawned at once. */
+function adaptRunChild(run: (spec: ChildSpec) => Promise<ChildResult>): (spec: ChildSpec) => StartedScript {
+  return (spec) => ({ spawned: Promise.resolve(), done: (async () => run(spec))(), kill: () => undefined })
 }
 
 /**
@@ -200,38 +211,66 @@ export async function runScheduledReconciliationPack(scheduleRunId: string, deps
       if (!allowed) return await refuse('VENDOR_READS_TOO_SOON')
     }
 
-    // 6. THE FINAL READ, under the settings fence. Everything above waited on something (the lock, the rate gate), so the values
-    // read at the top may be stale: a disable or a vendor-off saved meanwhile must not be followed by a start that uses them. Every
-    // writer of the four rows takes the same transaction-scoped advisory lock in its save, so this short transaction either sees
-    // that save's committed rows or waits for it; it reads the rows from the database (not a cache) and the child starts
-    // immediately with exactly these values. Vendor reads are conservative: they run only if the top read said on (and the gate
-    // above was consulted for it) AND this read still says on; a turned-off option runs the pack without the flag and without the
-    // keys, a newly turned-on one waits for the next start.
-    let finalSettings: Map<string, string>
+    // 6. THE FINAL READ AND THE SPAWN, both under the settings fence. Everything above waited on something (the lock, the rate gate),
+    // so the values read at the top may be stale: a disable or a vendor-off saved meanwhile must not be followed by a start that
+    // uses them. Every writer of the four rows takes the same transaction-scoped advisory lock in its save. This transaction takes
+    // it, re-reads the rows from the database (not a cache), and STARTS THE CHILD BEFORE IT ENDS, waiting only for the process to
+    // exist (the 'spawn' event, or its error, within PACK_SCHEDULE_SPAWN_TIMEOUT_MS). A save arriving in that window waits for the
+    // spawn and is ordered after the start; one that committed earlier was seen by the read. The fence is released when the
+    // transaction ends, i.e. as soon as the child has spawned: the child's lifetime is never inside the transaction, and a
+    // settings save never waits for a running child. Vendor reads are conservative: they run only if the top read said on (and the
+    // gate above was consulted for it) AND this read still says on; a turned-off option runs the pack without the flag and
+    // without the keys, a newly turned-on one waits for the next start.
+    type Fenced = { kind: 'refuse'; refusal: PackScheduleRefusal } | { kind: 'spawned' } | { kind: 'spawn-failed' }
+    let started: StartedScript | null = null
+    let spawnState: 'none' | 'ok' | 'failed' = 'none'
+    let fenced: Fenced
     try {
-      finalSettings = await (deps.readFinalSettings ?? readSettingsUnderFence)([PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_VENDOR_READS_SETTING])
-    } catch {
-      return await refuse('SETTINGS_UNREADABLE')
-    }
-    const last = parseScheduleSettings({ phase: finalSettings.get(PACK_SCHEDULE_PHASE_SETTING), vendorReads: finalSettings.get(PACK_SCHEDULE_VENDOR_READS_SETTING) })
-    phase = last.ok ? last.phase : null
-    vendorReads = parsed.vendorReads && last.vendorReads
-    if (!resolveCronEnablement({ canonical: finalSettings.get(PACK_SCHEDULE_ENABLED_SETTING), legacy: undefined, hasLegacyKey: false, defaultEnabled: PACK_SCHEDULE_DEFAULT_ENABLED })) return await refuse('SCHEDULE_DISABLED')
-    if (!last.ok) return await refuse(last.refusal)
-
-    // 7. The operator's command, as a child.
-    let ended: ChildResult
-    try {
-      ended = await (deps.runChild ?? runNpmScript)({
-        script: PACK_SCHEDULE_NPM_SCRIPT,
-        silent: true,
-        args: scheduledPackArgs(last.phase, vendorReads),
-        env: scheduledChildEnv(deps.env ?? process.env, vendorReads),
-        cwd: deps.cwd ?? process.cwd(),
-        timeoutMs: PACK_SCHEDULE_CHILD_TIMEOUT_MS,
+      fenced = await (deps.fenced ?? runUnderSettingsFence)([PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_VENDOR_READS_SETTING], async (finalSettings): Promise<Fenced> => {
+        const last = parseScheduleSettings({ phase: finalSettings.get(PACK_SCHEDULE_PHASE_SETTING), vendorReads: finalSettings.get(PACK_SCHEDULE_VENDOR_READS_SETTING) })
+        phase = last.ok ? last.phase : null
+        vendorReads = parsed.vendorReads && last.vendorReads
+        if (!resolveCronEnablement({ canonical: finalSettings.get(PACK_SCHEDULE_ENABLED_SETTING), legacy: undefined, hasLegacyKey: false, defaultEnabled: PACK_SCHEDULE_DEFAULT_ENABLED })) return { kind: 'refuse', refusal: 'SCHEDULE_DISABLED' }
+        if (!last.ok) return { kind: 'refuse', refusal: last.refusal }
+        await deps.beforeSpawn?.()
+        const spec: ChildSpec = {
+          script: PACK_SCHEDULE_NPM_SCRIPT,
+          silent: true,
+          args: scheduledPackArgs(last.phase, vendorReads),
+          env: scheduledChildEnv(deps.env ?? process.env, vendorReads),
+          cwd: deps.cwd ?? process.cwd(),
+          timeoutMs: PACK_SCHEDULE_CHILD_TIMEOUT_MS,
+        }
+        const begin = deps.startChild ?? (deps.runChild ? adaptRunChild(deps.runChild) : startNpmScript)
+        let timer: ReturnType<typeof setTimeout> | null = null
+        try {
+          started = begin(spec)
+          const spawnedOk = await Promise.race([
+            started.spawned.then(() => true, () => false),
+            new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), deps.spawnTimeoutMs ?? PACK_SCHEDULE_SPAWN_TIMEOUT_MS) }),
+          ])
+          if (!spawnedOk) { started.kill(); spawnState = 'failed'; return { kind: 'spawn-failed' } }
+        } catch {
+          started?.kill()
+          spawnState = 'failed'
+          return { kind: 'spawn-failed' }
+        } finally {
+          if (timer) clearTimeout(timer)
+        }
+        spawnState = 'ok'
+        return { kind: 'spawned' }
       })
     } catch {
-      ended = { exitCode: null, stdout: '', stderr: '', timedOut: false }
+      // The fence itself failed. If the child had already spawned it runs on and is recorded; otherwise nothing started.
+      if (spawnState === 'none') return await refuse('SETTINGS_UNREADABLE')
+      fenced = spawnState === 'ok' ? { kind: 'spawned' } : { kind: 'spawn-failed' }
+    }
+    if (fenced.kind === 'refuse') return await refuse(fenced.refusal)
+
+    // 7. The operator's command has been started; wait for it OUTSIDE the transaction.
+    let ended: ChildResult = { exitCode: null, stdout: '', stderr: '', timedOut: false }
+    if (fenced.kind === 'spawned' && started !== null) {
+      try { ended = await (started as StartedScript).done } catch { /* a result that never came is a start that failed */ }
     }
     const verifyReport = deps.verifyReport ?? ((output: ParsedPackOutput, exitCode: number) => verifyNamedPackReport(output, exitCode))
     const record = classifyChildEnd(base(), { exitCode: ended.exitCode, timedOut: ended.timedOut, stderr: ended.stderr }, verifyReport)

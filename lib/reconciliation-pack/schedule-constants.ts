@@ -30,6 +30,8 @@ export const PACK_SCHEDULE_RECORD_VERSION = 1
 
 /** A pack run that has not finished in this long is killed (with its process group) and recorded as CHILD_TIMED_OUT. */
 export const PACK_SCHEDULE_CHILD_TIMEOUT_MS = 45 * 60 * 1000
+/** How long the settings fence is held waiting for the child to exist (its spawn); never for the child's life. */
+export const PACK_SCHEDULE_SPAWN_TIMEOUT_MS = 10_000
 /**
  * Scheduled runs that read WooCommerce are spaced at least this far apart (one per window), on top of the framework's own limit
  * of one start per hour for every cron route. The pack's per-run request budget and pace are the command's (constants.ts); this
