@@ -19,6 +19,7 @@ import { getAllCronJobs } from '@/lib/cron-jobs'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { runPostCommit } from '@/lib/domain/post-commit'
 import { combinePostCommitOutcomes, type SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { PACK_SCHEDULE_PHASES, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_VENDOR_READS_SETTING } from '@/lib/reconciliation-pack/schedule-constants'
 
 /**
  * Reconcile the OS crontab from the stored cron_* settings, behind the permission gate.
@@ -126,6 +127,57 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
   }, 'Failed to sync crontab')
 
   return combinePostCommitOutcomes({ local, scheduler, schedulerFollowUpError })
+}
+
+export type ReconciliationPackScheduleOptionsInput = {
+  /** P0, P1 or P2; the empty string clears the phase (the scheduled pack then refuses to run: there is no default phase). */
+  phase: string
+  /** Whether scheduled runs may read WooCommerce (`--vendor-reads-only`). Off unless an operator turns it on here. */
+  vendorReads: boolean
+}
+
+/**
+ * SAVE THE SCHEDULED RECONCILIATION PACK'S TWO OWN OPTIONS (phase, vendor reads).
+ *
+ * Whether the job is on, and when it runs, are the ordinary scheduled-job rows (`saveCronJobSettings`). These two are read
+ * by the job when it fires, so saving them needs no crontab write. They are saved here, validated, rather than through the
+ * generic settings writer: the phase is a closed set, and the vendor option decides whether a scheduled run contacts a
+ * vendor, so only the exact words `true` and `false` are ever stored.
+ */
+export async function saveReconciliationPackScheduleOptions(input: ReconciliationPackScheduleOptionsInput): Promise<SettingSaveResult> {
+  await requirePermission('settings.company')
+  const phase = typeof input?.phase === 'string' ? input.phase : null
+  if (phase === null || (phase !== '' && !(PACK_SCHEDULE_PHASES as readonly string[]).includes(phase))) {
+    throw new Error('The phase must be P0, P1 or P2, or empty.')
+  }
+  if (typeof input.vendorReads !== 'boolean') throw new Error('The WooCommerce option must be on or off.')
+
+  await db.$transaction(async (tx) => {
+    if (phase === '') await tx.setting.deleteMany({ where: { key: PACK_SCHEDULE_PHASE_SETTING } })
+    else {
+      await tx.setting.upsert({
+        where: { key: PACK_SCHEDULE_PHASE_SETTING },
+        create: { key: PACK_SCHEDULE_PHASE_SETTING, value: serializeSettingValue(PACK_SCHEDULE_PHASE_SETTING, phase) },
+        update: { value: serializeSettingValue(PACK_SCHEDULE_PHASE_SETTING, phase) },
+      })
+    }
+    const vendor = String(input.vendorReads)
+    await tx.setting.upsert({
+      where: { key: PACK_SCHEDULE_VENDOR_READS_SETTING },
+      create: { key: PACK_SCHEDULE_VENDOR_READS_SETTING, value: serializeSettingValue(PACK_SCHEDULE_VENDOR_READS_SETTING, vendor) },
+      update: { value: serializeSettingValue(PACK_SCHEDULE_VENDOR_READS_SETTING, vendor) },
+    })
+  })
+
+  const local = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated scheduled reconciliation pack options (phase ${phase === '' ? 'cleared' : phase}, WooCommerce reads ${input.vendorReads ? 'on' : 'off'})`,
+    })
+  }, 'Failed to record the scheduled reconciliation pack change')
+  return combinePostCommitOutcomes({ local, scheduler: { status: 'ok' } })
 }
 
 export type CrontabDriftStatus = OtiCrontabStatus & {

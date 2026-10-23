@@ -1,4 +1,5 @@
 import { registerCronJobs } from '@/lib/cron-registry'
+import { PACK_SCHEDULE_DEFAULT_CRON, PACK_SCHEDULE_DEFAULT_ENABLED, PACK_SCHEDULE_SETTING_KEY, PACK_SCHEDULE_SLUG } from '@/lib/reconciliation-pack/schedule-constants'
 
 registerCronJobs([
   {
@@ -20,6 +21,16 @@ registerCronJobs([
     description: 'Hourly record of the writers:check report: whether IMS and another writer could both write one destination operation in the current phase. Read-only: it reads the environment and IMS\'s own database, makes no call to any connected system, and keeps the report in the activity log. The run is red unless the verdict is ok.',
     defaultSchedule: '40 * * * *',
     defaultEnabled: false,
+  },
+  {
+    slug: PACK_SCHEDULE_SLUG,
+    settingKey: PACK_SCHEDULE_SETTING_KEY,
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Reconciliation Pack',
+    description: 'Runs the whole reconciliation pack (npm run reconcile:pack) on this schedule and records every run, refusal and failure in the activity log. OFF by default. It refuses to run, and says so in the activity log, until a phase (P0, P1 or P2) is set below: there is no default phase. It contacts no vendor unless the separate "read WooCommerce" option below is also on (also off by default; GET requests only, at most one such run per 20 hours). Reads IMS\'s own database and writes reports to the pack\'s report directory.',
+    defaultSchedule: PACK_SCHEDULE_DEFAULT_CRON,
+    defaultEnabled: PACK_SCHEDULE_DEFAULT_ENABLED,
   },
   {
     slug: 'backup',

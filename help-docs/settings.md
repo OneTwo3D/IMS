@@ -341,6 +341,7 @@ The system relies on scheduled jobs to keep external systems in sync and to main
 | `/api/cron/invariant-check` | Scheduled data-integrity check | Daily |
 | `/api/cron/backup` | Database backup | Daily |
 | `/api/cron/product-lifecycle-archive` | Auto-archive exhausted EOL products | Daily |
+| `/api/cron/reconciliation-pack` | Run the reconciliation pack on a schedule and record every start in the activity log. **Off by default**; refuses to run until a phase is set; reads no vendor unless its separate WooCommerce option is on (also off by default). See "Scheduling the pack" in docs/installation.md | Daily at 03:00 once switched on |
 | `/api/cron/mintsoft-webhook-sweeper` | Drain Mintsoft webhook events | Every 5 min |
 | `/api/cron/mintsoft-dispatch-sync` | Poll Mintsoft for despatches of orders IMS has pushed and progress the IMS shipment and tracking. Reads from Mintsoft only and never logs in (use a fixed API key; with username and password it skips once the stored key has expired). On by default | Every 15 min |
 | `/api/cron/wms-order-push` | Push paid, ready-to-fulfil orders for WMS-bound warehouses to the WMS, and propagate cancellations (Phase 8 dispatch). **Off by default** | Every 10 min |

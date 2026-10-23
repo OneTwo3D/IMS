@@ -111,6 +111,18 @@ export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
 export const ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY = 918_274_233
 
 /**
+ * The SCHEDULED RECONCILIATION PACK's single-runner lock.
+ *
+ * Held (session-scoped, TRY form, on a pinned connection) by the `reconciliation-pack` scheduled job for as long as its
+ * child process runs, so a second scheduled start is told it is not alone and does not start a second run (which would
+ * read the database and, when vendor reads are on, spend a vendor request budget a second time before the pack's own
+ * run lock could refuse it at publication). It excludes nobody but another scheduled start: an operator's own
+ * `npm run reconcile:pack` is held apart from a scheduled run by the pack's file run lock, not by this key. Its own
+ * domain, shared with nothing.
+ */
+export const RECONCILIATION_PACK_SCHEDULE_LOCK_KEY = 918_274_301
+
+/**
  * THERE IS NO CRONTAB LOCK IN THIS REGISTRY, AND THAT IS THE POINT (Codex r22 HIGH).
  *
  * A round of review put one here — `CRONTAB_RECONCILE_LOCK_KEY = 918_274_234`, a session advisory
@@ -137,6 +149,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   SWEEP_CURSOR_LOCK_KEY,
   COMPONENT_GRAPH_WRITE_LOCK_KEY,
   ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY,
+  RECONCILIATION_PACK_SCHEDULE_LOCK_KEY,
 } as const
 
 /**
