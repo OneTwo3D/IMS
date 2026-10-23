@@ -2609,6 +2609,50 @@ model AccountingAccountBalanceSnapshot {
   @@map("accounting_account_balance_snapshots")
 }
 
+/// The full list of tax rates Xero holds for one organisation (Xero is the tax-rate master), one row per Xero TaxType,
+/// replaced as a whole by the xero-tax-rate-drift sweep together with its header row. Written ONLY through
+/// lib/connectors/xero/tax-rate-store.ts. Read-only everywhere else.
+model XeroTaxRate {
+  id                  String   @id @default(cuid())
+  connector           String   @default("xero")
+  /// The Xero organisation the list was read from. A list never stands for another organisation.
+  tenantId            String
+  /// Xero's TaxType code, unique per organisation.
+  taxType             String
+  name                String
+  /// Xero's own status (ACTIVE, DELETED, ARCHIVED, PENDING). Every status is kept.
+  status              String
+  reportTaxType       String?
+  effectiveRate       Decimal? @db.Decimal(18, 6)
+  displayTaxRate      Decimal? @db.Decimal(18, 6)
+  /// [{ name, rate (percent, 6 dp text), compound, nonRecoverable }], validated before it is stored.
+  components          Json
+  canApplyToAssets      Boolean?
+  canApplyToEquity      Boolean?
+  canApplyToExpenses    Boolean?
+  canApplyToLiabilities Boolean?
+  canApplyToRevenue     Boolean?
+  fetchedAt           DateTime
+
+  @@unique([connector, tenantId, taxType])
+  @@map("xero_tax_rates")
+}
+
+/// The proof that the xero_tax_rates rows of one organisation are ONE complete read: when it was read, how many rows
+/// it held and a digest of them. Replaced in the same transaction as the rows (and the read-sync last-success stamp).
+model XeroTaxRateList {
+  id        String   @id @default(cuid())
+  connector String   @default("xero")
+  tenantId  String
+  fetchedAt DateTime
+  rowCount  Int
+  /// sha256 (hex) over the canonical form of the stored rows, see lib/connectors/xero/tax-rate-store.ts.
+  digest    String
+
+  @@unique([connector, tenantId])
+  @@map("xero_tax_rate_lists")
+}
+
 model AccountingSyncLog {
   id                    String               @id @default(cuid())
   connector             String               @default("xero")

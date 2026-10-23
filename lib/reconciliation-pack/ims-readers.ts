@@ -27,6 +27,7 @@
  */
 
 import { parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
+import { digestTaxRateList, readStoredComponents, XERO_TAX_RATE_STATUSES, XERO_TAX_TYPE_RE, type NormalisedXeroTaxRate, type XeroTaxRateStatus } from '@/lib/connectors/xero/tax-rate-list'
 import {
   FIRST_LOAD_RUN_STATUSES,
   IMS_OPEN_ORDER_STATUSES,
@@ -51,7 +52,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -75,7 +76,20 @@ export type StorefrontMappingRow = { externalStatus: string; imsStatus: string }
 export type StorefrontStatusConfig = { configured: string[]; withdrawal: { submitted: string; approved: string }; mappings: StorefrontMappingRow[] }
 export type TaxRateRow = { id: string; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null }
 export type TaxMappingRow = { connector: string; externalTaxRateId: string; taxRateId: string }
-export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[] }
+export type TaxComponentTypeRow = { id: string; taxRateId: string; active: boolean; accountingTaxType: string }
+/** The two reverse-charge settings: Xero tax-type CODES IMS posts with. A blank value is "none". */
+export type ReverseChargeTaxTypes = { sales: string; purchase: string }
+export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[]; componentTaxTypes: TaxComponentTypeRow[]; reverseCharge: ReverseChargeTaxTypes }
+/**
+ * The stored copy of Xero's tax-rate list for the organisation CURRENTLY connected, with the proof that it is one complete read.
+ * `proven` only when the header row of THAT organisation exists, its row count equals the rows read, every row carries the
+ * header's read time, every row re-validates and the digest recomputed from the rows equals the header's. Anything else is
+ * `unproven` with a closed cause; the list is never partly used.
+ */
+export type XeroTaxRateStoreCause = 'NO_CONNECTION' | 'NO_HEADER' | 'COUNT_MISMATCH' | 'DIGEST_MISMATCH' | 'MIXED_READ' | 'MALFORMED_ROW'
+export type XeroTaxRateStore =
+  | { state: 'proven'; tenantId: string; fetchedAt: string; taxTypes: Array<{ taxType: string; status: string }> }
+  | { state: 'unproven'; cause: XeroTaxRateStoreCause }
 export type XeroSyncLogRow = { id: string; type: string; referenceType: string; referenceId: string; externalTransactionId: string }
 export type SnapshotValueRow = { productId: string; warehouseId: string; qty: string; valueBase: string; valueReplayReliable: boolean }
 export type BalanceSnapshotRow = { externalAccountId: string; accountCode: string | null; currency: string; amountBase: string }
@@ -99,6 +113,7 @@ export type ImsSectionValues = {
   orders: OrderRow[]
   storefrontStatus: StorefrontStatusConfig
   taxes: ImsTaxes
+  xeroTaxRates: XeroTaxRateStore
   xeroSyncLogs: XeroSyncLogRow[]
   snapshots: ImsSnapshots
   wmsBindings: WmsBindingRow[]
@@ -321,7 +336,50 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     unique(mappings, (mapping) => `${mapping.connector}\u0001${mapping.externalTaxRateId}`)
     const known = new Set(rates.map((rate) => rate.id))
     if (mappings.some((mapping) => !known.has(mapping.taxRateId))) throw new Unreadable('SOURCE_UNREADABLE')
-    return { rates, mappings }
+    // Every other place IMS names a Xero tax type: a component's own accounting tax type, and the two reverse-charge settings.
+    const componentTaxTypes = (await readCapped(tx, 'SELECT id, tax_rate_id AS rate_id, active, accounting_tax_type AS tax_type FROM tax_rate_components WHERE accounting_tax_type IS NOT NULL ORDER BY id')).map((row): TaxComponentTypeRow => ({ id: text(row.id), taxRateId: text(row.rate_id), active: bool(row.active), accountingTaxType: text(row.tax_type) }))
+    unique(componentTaxTypes, (component) => component.id)
+    if (componentTaxTypes.some((component) => !known.has(component.taxRateId))) throw new Unreadable('SOURCE_UNREADABLE')
+    const settingRows = await readCapped(tx, "SELECT key, value FROM settings WHERE key IN ('accounting_reverse_charge_sales_tax_type', 'accounting_reverse_charge_purchase_tax_type') ORDER BY key")
+    const reverseValue = (key: string): string => {
+      const row = settingRows.find((candidate) => candidate.key === key)
+      if (row === undefined) return ''
+      if (typeof row.value !== 'string' || /[\u0000-\u001f\u007f]/.test(row.value)) throw new Unreadable('SOURCE_UNREADABLE')
+      return row.value.trim()
+    }
+    return { rates, mappings, componentTaxTypes, reverseCharge: { sales: reverseValue('accounting_reverse_charge_sales_tax_type'), purchase: reverseValue('accounting_reverse_charge_purchase_tax_type') } }
+  },
+
+  async xeroTaxRates(tx) {
+    const tokens = await tx.query(`SELECT "tenantId" AS tenant FROM accounting_tokens WHERE connector = 'xero'`)
+    if (tokens.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    if (tokens.length === 0 || typeof tokens[0]!.tenant !== 'string' || tokens[0]!.tenant.trim() === '') return { state: 'unproven', cause: 'NO_CONNECTION' }
+    const tenantId = tokens[0]!.tenant
+    const headers = await tx.query(`SELECT ${UTC('"fetchedAt"')} AS fetched, "rowCount" AS row_count, digest FROM xero_tax_rate_lists WHERE connector = 'xero' AND "tenantId" = $1`, [tenantId])
+    if (headers.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    if (headers.length === 0) return { state: 'unproven', cause: 'NO_HEADER' }
+    const header = headers[0]!
+    const rowCount = count(header.row_count)
+    const fetchedAt = instantOrNull(header.fetched)
+    if (fetchedAt === null || typeof header.digest !== 'string') return { state: 'unproven', cause: 'MALFORMED_ROW' }
+    const raw = await readCapped(tx, `SELECT "taxType" AS tax_type, name, status, "reportTaxType" AS report, "effectiveRate"::text AS effective, "displayTaxRate"::text AS display, components, "canApplyToAssets" AS c_assets, "canApplyToEquity" AS c_equity, "canApplyToExpenses" AS c_expenses, "canApplyToLiabilities" AS c_liabilities, "canApplyToRevenue" AS c_revenue, ${UTC('"fetchedAt"')} AS fetched FROM xero_tax_rates WHERE connector = 'xero' AND "tenantId" = $1 ORDER BY "taxType"`, [tenantId])
+    if (raw.length !== rowCount) return { state: 'unproven', cause: 'COUNT_MISMATCH' }
+    if (raw.some((row) => row.fetched !== fetchedAt)) return { state: 'unproven', cause: 'MIXED_READ' }
+    const flag = (value: unknown): boolean | null => (value === null ? null : typeof value === 'boolean' ? value : (() => { throw new Unreadable('SOURCE_UNREADABLE') })())
+    const rate = (value: unknown): string | null => (value === null ? null : typeof value === 'string' && /^[0-9]{1,12}\.[0-9]{6}$/.test(value) ? value : (() => { throw new Unreadable('BAD_VALUE') })())
+    const rows: NormalisedXeroTaxRate[] = []
+    for (const row of raw) {
+      const components = readStoredComponents(row.components)
+      if (components === null || typeof row.tax_type !== 'string' || !XERO_TAX_TYPE_RE.test(row.tax_type) || typeof row.name !== 'string' || row.name.trim() === ''
+        || typeof row.status !== 'string' || !(XERO_TAX_RATE_STATUSES as readonly string[]).includes(row.status) || (row.report !== null && typeof row.report !== 'string')) return { state: 'unproven', cause: 'MALFORMED_ROW' }
+      rows.push({
+        taxType: row.tax_type, name: row.name, status: row.status as XeroTaxRateStatus, reportTaxType: row.report as string | null,
+        effectiveRate: rate(row.effective), displayTaxRate: rate(row.display), components,
+        canApply: { assets: flag(row.c_assets), equity: flag(row.c_equity), expenses: flag(row.c_expenses), liabilities: flag(row.c_liabilities), revenue: flag(row.c_revenue) },
+      })
+    }
+    if (digestTaxRateList(tenantId, rows) !== header.digest) return { state: 'unproven', cause: 'DIGEST_MISMATCH' }
+    return { state: 'proven', tenantId, fetchedAt, taxTypes: rows.map((row) => ({ taxType: row.taxType, status: row.status })) }
   },
 
   async xeroSyncLogs(tx) {

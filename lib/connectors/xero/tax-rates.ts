@@ -100,3 +100,16 @@ export async function fetchXeroTaxRates(): Promise<XeroTaxRate[]> {
   }
   return (res.data.TaxRates ?? []).filter((rate) => rate.Status !== 'DELETED' && rate.Status !== 'ARCHIVED')
 }
+
+/**
+ * The UNFILTERED body of GET /TaxRates (every rate, every status, every field), for the tax-rate master store, which validates it
+ * strictly before keeping any of it (tax-rate-list.ts). GET only. Throws on an API failure so the sweep records an error instead
+ * of storing nothing and calling it success.
+ */
+export async function fetchXeroTaxRatesBody(): Promise<unknown> {
+  const res = await xeroGet<unknown>('TaxRates')
+  if (!res.ok || res.data === undefined || res.data === null) {
+    throw new Error(res.error ?? `Failed to fetch Xero tax rates (status ${res.status})`)
+  }
+  return res.data
+}

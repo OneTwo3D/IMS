@@ -352,6 +352,27 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Unearned-revenue account setting key, read to list the accounts whose trial-balance balance is stored. A ledger balance, not an IMS revenue figure.',
   },
   {
+    file: 'lib/connectors/xero/tax-rate-list.ts',
+    figures: ['revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`revenue` is the name of one of the five can-apply-to flags Xero returns for a tax rate (it may be applied to revenue accounts), a boolean on a tax-rate definition, not a figure.',
+  },
+  {
+    file: 'lib/connectors/xero/tax-rate-store.ts',
+    figures: ['canApplyToRevenue', 'revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'The same Xero can-apply-to flag, copied into the stored tax-rate list. A boolean on a tax-rate definition; no refund moves it.',
+  },
+  {
+    file: 'lib/reconciliation-pack/ims-readers.ts',
+    figures: ['c_revenue', 'canApplyToRevenue', 'revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'The same Xero can-apply-to flag, read back from the stored tax-rate list to prove it is one complete read. A boolean, not a figure.',
+  },
+  {
     file: 'lib/reconciliation-pack/constants.ts',
     figures: ['xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',
