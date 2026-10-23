@@ -4,6 +4,7 @@ import path from 'node:path'
 import test, { afterEach } from 'node:test'
 
 import { PACK_CADENCE_MAX_AGE_MS } from '../../lib/reconciliation-pack/constants.ts'
+import { QOBLEX_NATIVE_COLUMN_MAP } from '../../lib/reconciliation-pack/qoblex-native-map.ts'
 import { createQoblexSource, parseQoblexManifest, qoblexStaleness, readQoblexExport } from '../../lib/reconciliation-pack/qoblex-source.ts'
 import { ASOF, DEFAULT_STOCK, EXPORTED_AT, LOCATIONS, productsCsv, sha256, stockCsv, writeExport } from './qoblex-fixtures.ts'
 import { NOW, cleanup } from './helpers.ts'
@@ -175,7 +176,7 @@ test('products: a type that is not a product type, a repeated SKU and two SKUs t
   assert.equal(productsWith(productsCsv([{ sku: 'SKU-1', type: 'VARIANT' }])), 'ok')
 })
 
-test('a column map is read once, parsed by the first-load ingest, and must be a qoblex map that covers the dataset', () => {
+test('the native column map is read once and parsed by the first-load ingest; a map that is not the native one is refused', () => {
   const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
   const native = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n')
   // The fixture carries a deliberately bad row ('Unknown' product type); the export an operator supplies must not.
@@ -201,41 +202,52 @@ test('a column map is read once, parsed by the first-load ingest, and must be a 
   const wrong = map.replace('"source": "qoblex"', '"source": "wms"')
   assert.notEqual(wrong, map)
   const bad = writeExport(bases, { stock: clean, products: null, locations: ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: false })), extra: { 'map.json': wrong, 'stock.csv': clean }, patch: (m) => { m.stock = { file: 'stock.csv', sha256: sha256(clean), columnMap: { file: 'map.json', sha256: sha256(wrong) } } } })
-  assert.equal(partReason(read(bad), 'stock'), 'SOURCE_UNREADABLE')
+  assert.equal(partReason(read(bad), 'stock'), 'COLUMN_MAP_NOT_NATIVE')
 })
 
-// [mutation: the rowSelect.skip refusal / the rowsSkipped check / the constants refusal removed]
-test('a column map cannot hide rows: a mapped skip, or a constant for an identity or value column, makes the part unreadable (the native export itself skips nothing)', () => {
+// [mutation: the native-map digest check removed from ingest()]
+test('a column map cannot change what is compared: ONLY the repository\'s native map is accepted, by the bytes read (a valueMap 9 -> 10, a constant, a skip, one changed byte are all COLUMN_MAP_NOT_NATIVE)', () => {
   const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
   const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
-  const original = JSON.parse(readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')) as { datasets: Record<string, Record<string, unknown>> }
+  const nativeText = readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')
+  const original = JSON.parse(nativeText) as { datasets: Record<string, Record<string, unknown>> }
   const locations = ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: code === 'RXT2' }))
-  const exportWith = (edit: (m: typeof original) => void) => {
-    const m = JSON.parse(JSON.stringify(original)) as typeof original
-    edit(m)
-    const map = JSON.stringify(m)
-    return read(writeExport(bases, { stock: clean, products: null, locations, extra: { 'map.json': map, 'stock.csv': clean }, patch: (man) => {
-      man.stock = { file: 'stock.csv', sha256: sha256(clean), columnMap: { file: 'map.json', sha256: sha256(map) } }
-      man.products = { file: 'stock.csv', sha256: sha256(clean), columnMap: { file: 'map.json', sha256: sha256(map) } }
-    } }))
-  }
-  // the unedited native map reads, both datasets, and skipped nothing
-  const plain = exportWith(() => undefined)
+  const exportWithText = (map: string | null) => read(writeExport(bases, { stock: clean, products: null, locations, extra: { 'map.json': map ?? '', 'stock.csv': clean }, patch: (man) => {
+    const ref = { file: 'stock.csv', sha256: sha256(clean), ...(map === null ? {} : { columnMap: { file: 'map.json', sha256: sha256(map) } }) }
+    man.stock = ref; man.products = ref
+  } }))
+  const exportWith = (edit: (m: typeof original) => void) => { const m = JSON.parse(nativeText) as typeof original; edit(m); return exportWithText(JSON.stringify(m)) }
+  // the repository's own copy is the first-load tool's tested map, byte for byte
+  assert.equal(QOBLEX_NATIVE_COLUMN_MAP, nativeText)
+  // the unedited native map reads both datasets
+  const plain = exportWithText(nativeText)
   assert.equal(partReason(plain, 'stock'), 'ok')
   assert.equal(partReason(plain, 'products'), 'ok')
-  // a skip that hides a kind of row the file holds
-  const skipsStock = exportWith((m) => { m.datasets['stock-lots']!.rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] } })
-  assert.equal(partReason(skipsStock, 'stock'), 'SOURCE_UNREADABLE')
-  assert.equal(partReason(skipsStock, 'products'), 'ok', 'the other dataset is judged on its own map entry')
-  const skipsProducts = exportWith((m) => { m.datasets.products!.rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] } })
-  assert.equal(partReason(skipsProducts, 'products'), 'SOURCE_UNREADABLE')
-  // a keep-only selection that leaves a kind unlisted is refused by the ingest itself (never guessed), not silently dropped
-  assert.equal(partReason(exportWith((m) => { m.datasets['stock-lots']!.rowSelect = { column: 'Product Type', keep: ['simple'] } }), 'stock'), 'SOURCE_UNREADABLE')
-  // constants for the identity and value columns would give every row one made-up value
-  for (const column of ['sku', 'warehouseCode', 'qty', 'unitCost']) {
-    const fixed = exportWith((m) => { const e = m.datasets['stock-lots']!; (e.columns as Record<string, string>)[column] && delete (e.columns as Record<string, string>)[column]; (e.constants as Record<string, string>)[column] = '1' })
-    assert.equal(partReason(fixed, 'stock'), 'SOURCE_UNREADABLE', column)
+  // one changed byte, with the digest declared honestly, is still not the native map
+  for (const text of [`${nativeText} `, `${nativeText}\n`, nativeText.replace('"formatVersion": 1', '"formatVersion":1')]) {
+    assert.notEqual(text, nativeText)
+    assert.equal(partReason(exportWithText(text), 'stock'), 'COLUMN_MAP_NOT_NATIVE')
+    assert.equal(partReason(exportWithText(text), 'products'), 'COLUMN_MAP_NOT_NATIVE')
   }
+  // the same content re-serialised (every key and value equal) is not the native map either: the bytes are what is pinned
+  assert.equal(partReason(exportWith(() => undefined), 'stock'), 'COLUMN_MAP_NOT_NATIVE')
+  // edits that would change a compared value
+  const edits: Array<[string, (m: typeof original) => void]> = [
+    ['a valueMap turning stock qty 9 into 10', (m) => { const e = m.datasets['stock-lots']!; (e.valueMaps as Record<string, unknown>) = { qty: { '9.000000': '10.000000' } } }],
+    ['a valueMap on the SKU', (m) => { m.datasets['stock-lots']!.valueMaps = { sku: { 'SYN-1001': 'SYN-9999' } } }],
+    ['a valueMap on the product type', (m) => { (m.datasets.products!.valueMaps as Record<string, Record<string, string>>).type!.simple = 'VARIANT' }],
+    ['a warehouse label pointed at another code', (m) => { ((m.datasets['stock-lots']!.wide as { warehouses: Record<string, string> }).warehouses)['1 MIL1'] = 'RXT2' }],
+    ['a mapped skip', (m) => { m.datasets['stock-lots']!.rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] } }],
+    ['a constant for the quantity', (m) => { (m.datasets['stock-lots']!.constants as Record<string, string>).unitCost = '1' }],
+    ['another currency constant', (m) => { (m.datasets['stock-lots']!.constants as Record<string, string>).currency = 'EUR' }],
+  ]
+  for (const [label, edit] of edits) {
+    const r = exportWith(edit)
+    assert.equal(partReason(r, 'stock'), 'COLUMN_MAP_NOT_NATIVE', label)
+    assert.equal(partReason(r, 'products'), 'COLUMN_MAP_NOT_NATIVE', label)
+  }
+  // a map declared with a wrong digest is refused earlier, as unreadable; no map at all means the canonical layout (no transform exists)
+  assert.equal(partReason(read(writeExport(bases)), 'stock'), 'ok')
 })
 
 // [mutation: the shared promise removed so each item reads the export again]
