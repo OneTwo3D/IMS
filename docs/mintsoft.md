@@ -54,7 +54,9 @@ Mintsoft connector settings cannot be marked active until a **Test Connection** 
 
 ## Stock Alignment
 
-- Mintsoft stock is normalized and consolidated before comparison with IMS.
+- Mintsoft stock is normalized and sorted before comparison with IMS.
+- **The figure compared is ON HAND (o3d-4pzls).** `GET /api/Product/StockLevels` returns two numbers per SKU: `TotalStockLevel` is physical **on hand** (including units allocated to open orders) and `Level` is **available** (on hand minus allocated). IMS `stock_levels.quantity` is on hand (reservations are tracked separately in `reservedQty`), so the sync compares, snapshots (`wms_stock_snapshots.externalQty`), reports and aligns on `TotalStockLevel`; `Level` is carried on the stock line (`available`) for diagnostics only and is never used as a fallback. The fields are read by exact name. A response is **refused as a whole** (the run ends FAILED with the reason, nothing is snapshotted, flagged or aligned) when it is not an array, or any row has no `SKU`, no `TotalStockLevel`, a `TotalStockLevel`/`Level` that is not a non-negative integer number (null, string, negative, fractional), a `Level` above `TotalStockLevel`, or when one SKU appears twice. Duplicate rows are never summed or picked between.
+- After this change the first sync on a warehouse shifts IMS-vs-Mintsoft comparisons by exactly the units Mintsoft has allocated to open orders (the live probe of EAR2/MIL1 showed 2 and 28 units across 13 SKUs). Under **Align To WMS** the previous behaviour would have aligned IMS down by those allocated units.
 - Open discrepancies are stored in `wms_stock_discrepancies`; partial unique indexes prevent duplicate open discrepancy rows for the same connector, warehouse, category, and product/SKU.
 - Alignment should only change IMS stock after the binding permits it and discrepancy thresholds are satisfied.
 

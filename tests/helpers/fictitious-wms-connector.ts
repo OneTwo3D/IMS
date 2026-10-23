@@ -160,7 +160,7 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
   }
 
   async fetchStockLevels(externalWarehouseId: string): Promise<WmsStockLine[]> {
-    return [{ sku: `ACME-${externalWarehouseId}`, quantity: 7, raw: null }]
+    return [{ sku: `ACME-${externalWarehouseId}`, onHand: 7, available: 7, raw: null }]
   }
 
   async fetchProduct(externalProductId: string): Promise<WmsProductRef | null> {

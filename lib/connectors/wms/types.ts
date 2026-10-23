@@ -103,9 +103,24 @@ export type WmsWarehouseRef = {
   name: string
 }
 
+/**
+ * One SKU's stock as a WMS reports it, with the two meanings kept apart.
+ *
+ * `onHand` is PHYSICAL stock in the warehouse, INCLUDING units already allocated to open
+ * orders. It is the only figure comparable with IMS `StockLevel.quantity` (which is on hand;
+ * IMS tracks reservations separately in `reservedQty`), so every stock-sync / alignment /
+ * discrepancy consumer reads `onHand`.
+ *
+ * `available` is on hand minus what the WMS has allocated to open orders; null when the WMS
+ * does not report it. It is informational only: comparing it with IMS on hand double-counts
+ * the reservations (IMS would be told it holds less than it physically does). Nothing may
+ * fall back from `onHand` to `available`, or the reverse. A connector that cannot supply
+ * on-hand must throw from `fetchStockLevels` rather than return `available` as `onHand`.
+ */
 export type WmsStockLine = {
   sku: string
-  quantity: number
+  onHand: number
+  available: number | null
   raw: Record<string, unknown> | null
 }
 
@@ -482,6 +497,7 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   isConfigured(): Promise<boolean>
   validateConnection(): Promise<WmsConnectionCheck>
   fetchWarehouses(): Promise<WmsWarehouseRef[]>
+  /** Per-SKU stock for a warehouse. Each line carries `onHand` and `available` separately; throws (never guesses) when the WMS response cannot supply a trustworthy `onHand`. */
   fetchStockLevels(externalWarehouseId: string): Promise<WmsStockLine[]>
   fetchProduct(externalProductId: string): Promise<WmsProductRef | null>
   fetchProductBySku(sku: string): Promise<WmsProductRef | null>
