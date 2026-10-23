@@ -13,6 +13,9 @@ import { ActivityLogRetentionSetting } from '@/components/settings/activity-log-
 import { DataRetentionSetting } from '@/components/settings/data-retention'
 import { DatabaseReset } from '@/components/settings/database-reset'
 import { CronJobsSettings } from '@/components/settings/cron-jobs-settings'
+import { ReconciliationPackScheduleOptions } from '@/components/settings/reconciliation-pack-schedule-options'
+import { PACK_SCHEDULE_PHASES, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_VENDOR_READS_SETTING } from '@/lib/reconciliation-pack/schedule-constants'
+import { parseVendorReadsSetting } from '@/lib/reconciliation-pack/schedule'
 import { IntegrationPluginsSettings } from '@/components/settings/integration-plugins-settings'
 import { PublicAppUrlSettings } from '@/components/settings/public-app-url-settings'
 import type { CronJobState } from '@/components/settings/cron-jobs-settings'
@@ -59,12 +62,14 @@ export default async function SystemSettingsPage({
     : null
 
   // Only fetch data needed for the active tab
-  const [pluginState, publicAppUrl, cronJobs, retentionData, crontabStatus] = await Promise.all([
+  const [pluginState, publicAppUrl, cronJobs, retentionData, crontabStatus, packPhase, packVendorReads] = await Promise.all([
     activeTab === 'plugins' || activeTab === 'scheduler' ? getIntegrationPluginState() : null,
     activeTab === 'scheduler' ? getPublicAppUrlInfo() : null,
     activeTab === 'scheduler' ? loadCronJobs() : null,
     activeTab === 'retention' ? loadRetentionData() : null,
     activeTab === 'scheduler' ? getCrontabStatus().catch(() => null) : null,
+    activeTab === 'scheduler' ? getSetting(PACK_SCHEDULE_PHASE_SETTING) : null,
+    activeTab === 'scheduler' ? getSetting(PACK_SCHEDULE_VENDOR_READS_SETTING) : null,
   ])
 
   // ryxy drift conditions: no managed block for the app user, a STALE embedded
@@ -217,6 +222,12 @@ export default async function SystemSettingsPage({
               system crontab when you save.
             </p>
             <CronJobsSettings jobs={cronJobs} />
+          </Card>
+          <Card className="p-6">
+            <ReconciliationPackScheduleOptions
+              phase={packPhase && (PACK_SCHEDULE_PHASES as readonly string[]).includes(packPhase) ? packPhase : ''}
+              vendorReads={parseVendorReadsSetting(packVendorReads)}
+            />
           </Card>
         </div>
       )}

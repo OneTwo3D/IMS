@@ -369,6 +369,7 @@ test('every committing settings writer is discovered — an empty scan proves no
     committingWriters().map((w) => `${w.module}#${w.name}`).sort(),
     [
       'app/actions/cron.ts#saveCronJobSettings',
+      'app/actions/cron.ts#saveReconciliationPackScheduleOptions',
       'app/actions/onboarding.ts#completeOnboarding',
       'app/actions/onboarding.ts#dismissOnboarding',
       'app/actions/onboarding.ts#saveOnboardingPluginState',
@@ -422,6 +423,7 @@ test('...and the guard is actually being used, so the check above is not vacuous
     guarded.map((w) => `${w.module}#${w.name}`).sort(),
     [
       'app/actions/cron.ts#saveCronJobSettings',
+      'app/actions/cron.ts#saveReconciliationPackScheduleOptions',
       'app/actions/onboarding.ts#completeOnboarding',
       'app/actions/onboarding.ts#dismissOnboarding',
       'app/actions/onboarding.ts#saveOnboardingPluginState',
