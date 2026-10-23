@@ -20,7 +20,7 @@ import {
  * is read or written.
  */
 
-const SECRET = { kind: 'literal', secret: 'abcdef0123456789' } as const
+const SECRET = { kind: 'literal', secret: 'sekrit' } as const
 const jobs = (): CrontabJobDef[] => getAllCronJobs()
 const block = (settings: Map<string, string>) => {
   const built = buildOtiCrontabBlock({ jobs: jobs(), settings, secretRef: SECRET, baseUrl: 'https://ims.example.com' })
