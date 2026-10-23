@@ -55,7 +55,7 @@ const text = (r: Rig) => [...r.out, ...r.err].join('\n')
 
 test('arguments: every refusal is a closed code, and a good line parses to exactly what it says', () => {
   const ok = parsePackArgs(['--phase', 'P1', '--as-of', '2026-10-19', '--items', 'R3,R15', '--report-dir', '/var/tmp/x', '--acceptances', '/var/tmp/a.json'], NOW)
-  assert.deepEqual(ok, { phase: 'P1', asOf: '2026-10-19', items: ['R3', 'R15'], acceptances: '/var/tmp/a.json', reportDir: '/var/tmp/x', basisOnly: false, vendorReadsOnly: false, help: false })
+  assert.deepEqual(ok, { phase: 'P1', asOf: '2026-10-19', items: ['R3', 'R15'], acceptances: '/var/tmp/a.json', qoblexExport: null, skuExclusions: null, reportDir: '/var/tmp/x', basisOnly: false, vendorReadsOnly: false, help: false })
   assert.equal((parsePackArgs(['--phase', 'P2'], NOW) as { asOf: string }).asOf, '2026-10-19', 'default is yesterday UTC')
   const bad: Array<[string, string[]]> = [
     ['no phase', []], ['unknown phase', ['--phase', 'P3']], ['lower-case phase', ['--phase', 'p1']], ['unknown flag', ['--phase', 'P1', '--force']],
@@ -68,7 +68,7 @@ test('arguments: every refusal is a closed code, and a good line parses to exact
     ['positional argument', ['--phase', 'P1', 'R3']],
   ]
   for (const [name, argv] of bad) assert.deepEqual(parsePackArgs(argv, NOW), { code: 'BAD_ARGUMENTS' }, name)
-  assert.deepEqual(parsePackArgs(['--help'], NOW), { phase: 'P0', asOf: null, items: null, acceptances: null, reportDir: '/var/tmp/ims-reconciliation-pack-reports', basisOnly: false, vendorReadsOnly: false, help: true })
+  assert.deepEqual(parsePackArgs(['--help'], NOW), { phase: 'P0', asOf: null, items: null, acceptances: null, qoblexExport: null, skuExclusions: null, reportDir: '/var/tmp/ims-reconciliation-pack-reports', basisOnly: false, vendorReadsOnly: false, help: true })
   assert.ok(isCalendarDate('2024-02-29') && !isCalendarDate('2026-02-29'))
   assert.equal(defaultAsOf(new Date('2026-03-01T00:00:00Z')), '2026-02-28')
 })

@@ -52,7 +52,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings', 'warehouses'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -105,6 +105,9 @@ export type XeroPostingRow = { id: string; type: string; status: string; at: str
 export type XeroPostings = { p0: { state: 'absent' } | { state: 'unverified' } | { state: 'verified'; startedAt: string }; rows: XeroPostingRow[] }
 export type WmsBindingRow = { connector: string; warehouseId: string; warehouseCode: string; externalWarehouseId: string; active: boolean; stockSyncMode: 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'; alignmentConfirmed: boolean }
 
+/** Every warehouse IMS holds: the identity a location named in a file is resolved against (R2, R5). The code is unique. */
+export type WarehouseRow = { id: string; code: string; active: boolean }
+
 export type ImsSectionValues = {
   identity: ImsIdentity
   boundaries: PopulationBoundaries
@@ -118,6 +121,7 @@ export type ImsSectionValues = {
   snapshots: ImsSnapshots
   wmsBindings: WmsBindingRow[]
   xeroPostings: XeroPostings
+  warehouses: WarehouseRow[]
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -431,6 +435,14 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const balances = (await readCapped(tx, `SELECT "externalAccountId" AS account_id, "accountCode" AS code, currency, "amountBase"::text AS amount FROM accounting_account_balance_snapshots WHERE connector = 'xero' AND "balanceDate" = $1::date ORDER BY id`, [asOf])).map((row): BalanceSnapshotRow => ({ externalAccountId: text(row.account_id), accountCode: textOrNull(row.code), currency: text(row.currency, 'CURRENCY_UNKNOWN'), amountBase: decimal(row.amount) }))
     unique(balances, (balance) => `${balance.externalAccountId}\u0001${balance.currency}`)
     return { asOf, run, values, balances }
+  },
+
+  async warehouses(tx) {
+    const rows = await readCapped(tx, 'SELECT id, code, active FROM warehouses ORDER BY id')
+    const warehouses = rows.map((row): WarehouseRow => ({ id: text(row.id), code: text(row.code), active: bool(row.active) }))
+    unique(warehouses, (warehouse) => warehouse.id)
+    unique(warehouses, (warehouse) => warehouse.code)
+    return warehouses
   },
 
   async wmsBindings(tx) {

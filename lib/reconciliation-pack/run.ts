@@ -29,6 +29,10 @@ import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconcilia
 import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
 import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
+import { runCoverageItem, type SkuListPort } from '@/lib/reconciliation-pack/coverage-items'
+import { runQoblexItem, type QoblexItemId } from '@/lib/reconciliation-pack/qoblex-items'
+import type { QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
+import type { SkuExclusionFile } from '@/lib/reconciliation-pack/sku-exclusions'
 import type { WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 
 /** Reads the read-sync status report, reduced and checked against itself (reduceStatusReport). May throw: the run treats that as an unreadable read. */
@@ -57,6 +61,12 @@ export type RunContext = {
   vendor?: VendorPorts
   /** Test seam for the vendor walks' pacing and budget. */
   wooOptions?: WooSourceOptions
+  /** The Qoblex export the run was pointed at (--qoblex-export); absent = none was named, and R2, R5 and R14 read nothing (QOBLEX_EXPORT_OFF). */
+  qoblex?: QoblexSource
+  /** The SKU-coverage exclusions R14 uses (sku-exclusions.ts). Absent = none. */
+  skuExclusions?: SkuExclusionFile
+  /** The 3PL warehouse system's SKU list for R14. Absent = that leg is not compared (LEG_UNAVAILABLE). */
+  wmsSkus?: SkuListPort
   /**
    * Only for an item that settles (its catalogue row), and set per item by runItems, never by the caller: the state carried from the
    * previous report and the stream stamp this run's start read saw. Absent on any other item.
@@ -86,7 +96,12 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
   const fromVendor = (id: 'R9' | 'R13'): ItemRunner => (context) =>
     runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, settling: context.settling })
-  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13') }
+  const fromQoblex = (id: QoblexItemId): ItemRunner => (context) => runQoblexItem(id, { asOf: context.asOf, ims: context.ims, qoblex: context.qoblex })
+  const coverage: ItemRunner = (context) => runCoverageItem({
+    asOf: context.asOf, now: context.now, vendorReads: context.vendorReads, woo: context.vendor?.woo, wooOptions: context.wooOptions,
+    ims: context.ims, qoblex: context.qoblex, wms: context.wmsSkus, exclusions: context.skuExclusions,
+  })
+  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R2: fromQoblex('R2'), R5: fromQoblex('R5'), R14: coverage }
 }
 
 /** R6 and R10 read the settled as-of basis (ledger-items.ts). */
@@ -161,6 +176,8 @@ export async function runItems(plan: RunPlan): Promise<{ items: ItemInput[]; str
     // An item that needs a vendor is not read, and nothing is called, unless the run opted in. Before the liveness verdict, so the
     // reason a reader sees is the operator's choice and not a stale stream that would not have been read either way.
     if (plan.context.vendorReads !== true && itemNeedsVendor(id)) { results.set(id, inconclusive(id, 'VENDOR_READS_OFF')); continue }
+    // An item that stands on the Qoblex export is not read, and no file is touched, unless the run named an export.
+    if (plan.context.qoblex === undefined && getPackItem(id).sources.includes('qoblex-file')) { results.set(id, inconclusive(id, 'QOBLEX_EXPORT_OFF')); continue }
     const verdict = itemLivenessVerdict(startOnly, id)
     if (!verdict.ok) { results.set(id, inconclusive(id, verdict.reason)); continue }
     attempted.push(id)

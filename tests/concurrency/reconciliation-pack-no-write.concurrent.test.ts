@@ -361,3 +361,100 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ---- R2, R5 and R14 end to end: a real export directory, the real IMS reads, doubles for the storefront and Mintsoft (no network) -------
+
+const QTAG = `RCQX${process.pid}`
+const QD = '2026-03-07'
+
+test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export compared with the real snapshot, nothing read without the flag, no connection but the database, and not one row written', { skip: !RUN }, async () => {
+  const { createHash } = await import('node:crypto')
+  const { writeFileSync } = await import('node:fs')
+  const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
+  const { healthyLiveness } = await import('../reconciliation-pack/basis-fixtures.ts')
+  const { fakeStore, noSleep } = await import('../reconciliation-pack/woo-fixtures.ts')
+  const { stockCsv, productsCsv } = await import('../reconciliation-pack/qoblex-fixtures.ts')
+  void noSleep
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  const exportDir = mkdtempSync('/var/tmp/recon-pack-qx-')
+  chmodSync(dir, 0o700)
+  chmodSync(exportDir, 0o700)
+  const skus = [`${QTAG}-A`, `${QTAG}-B`]
+  const codes = [`${QTAG}W1`, `${QTAG}W2`]
+  const sha = (text: string) => createHash('sha256').update(text).digest('hex')
+  const writeExport = (qtyA: string) => {
+    const stock = stockCsv([{ sku: skus[0]!, location: codes[0]!, qty: qtyA, unitCost: '2.5' }, { sku: skus[1]!, location: codes[1]!, qty: '4', unitCost: '10' }])
+    const products = productsCsv(skus.map((sku) => ({ sku })))
+    writeFileSync(`${exportDir}/stock.csv`, stock, { mode: 0o644 })
+    writeFileSync(`${exportDir}/products.csv`, products, { mode: 0o644 })
+    writeFileSync(`${exportDir}/manifest.json`, JSON.stringify({
+      formatVersion: 1, exportedAt: '2026-03-08T08:00:00Z', asOf: QD, baseCurrency: 'GBP',
+      locations: codes.map((code) => ({ code, company: 'ACME', threePl: false })),
+      stock: { file: 'stock.csv', sha256: sha(stock) }, products: { file: 'products.csv', sha256: sha(products) },
+    }), { mode: 0o644 })
+  }
+  const targets: string[] = []
+  const original = net.Socket.prototype.connect
+  try {
+    await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-p1`, skus[0], `${QTAG}-p2`, skus[1]])
+    await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-w1`, codes[0], `${QTAG}-w2`, codes[1]])
+    await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 2, 2, now())`, [`${QTAG}-run`, QD])
+    await sql(`INSERT INTO inventory_snapshots (id, "snapshotDate", "productId", "warehouseId", qty, "valueBase", "unitCostBase") VALUES ($1, $2, $3, $4, 10, 25, 2.5), ($5, $2, $6, $7, 4, 40, 10)`, [`${QTAG}-s1`, QD, `${QTAG}-p1`, `${QTAG}-w1`, `${QTAG}-s2`, `${QTAG}-p2`, `${QTAG}-w2`])
+    const everySku = (await sql(`SELECT sku FROM products ORDER BY sku`)).rows.map((r: { sku: string }) => r.sku)
+    const alone = everySku.length === skus.length
+    const run = async (extra: string[]) => {
+      const out: string[] = []
+      const before = await census()
+      targets.length = 0
+      net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+        const raw = args[0] as unknown
+        const first = (Array.isArray(raw) ? raw[0] : raw) as { host?: string; port?: number; path?: string } | number | string
+        targets.push(typeof first === 'object' && first !== null ? (first.path ? `unix:${first.path}` : `${first.host ?? 'localhost'}:${first.port}`) : `${typeof args[1] === 'string' ? args[1] : 'localhost'}:${String(first)}`)
+        return (original as (...a: unknown[]) => unknown).apply(this, args)
+      } as typeof original
+      const store = fakeStore({ products: everySku.map((sku: string, i: number) => ({ id: i + 1, sku, status: 'publish', type: 'simple' })) })
+      const code = await runPackCli({
+        argv: ['--phase', 'P1', '--as-of', QD, '--items', 'R2,R5,R14', '--report-dir', dir, ...extra], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(),
+        deps: { liveness: healthyLiveness(), now: () => new Date('2026-03-08T12:00:00Z'), woo: store, wmsSkus: async () => ({ ok: true, skus: everySku }) },
+        stdout: (t) => out.push(t), stderr: (t) => out.push(t),
+      })
+      net.Socket.prototype.connect = original
+      const after = await census()
+      assert.deepEqual(after.counts, before.counts, 'every table has the rows it had')
+      assert.deepEqual(after.stats, before.stats, 'no table saw an insert, update or delete')
+      return { code, out, targets: [...targets] }
+    }
+    writeExport('10')
+    // Without the flag: nothing is read for the Qoblex items.
+    const off = await run(['--vendor-reads-only'])
+    assert.ok(off.out.includes('R2 inconclusive QOBLEX_EXPORT_OFF') && off.out.includes('R5 inconclusive QOBLEX_EXPORT_OFF') && off.out.includes('R14 inconclusive QOBLEX_EXPORT_OFF'), off.out.join('\n'))
+    // With it: the export is compared with the snapshot of the cycle date.
+    const on = await run(['--vendor-reads-only', '--qoblex-export', exportDir])
+    assert.equal(on.code, 5, on.out.join('\n'))
+    assert.ok(on.out.includes('R2 pass -') && on.out.includes('R5 pass -'), on.out.join('\n'))
+    assert.ok(!on.out.some((line) => /^R14 .*INTERNAL_ERROR/.test(line)), on.out.join('\n'))
+    if (alone) assert.ok(on.out.includes('R14 pass -'), on.out.join('\n'))
+    const url = new URL(process.env.DATABASE_URL!)
+    assert.ok(on.targets.length > 0)
+    for (const target of on.targets) assert.ok(target === `${url.hostname}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}`, `unexpected connection to ${target}`)
+    // A quantity that differs by one in the export is a finding by identity; the snapshot is not touched.
+    writeExport('11')
+    const differs = await run(['--vendor-reads-only', '--qoblex-export', exportDir])
+    assert.ok(differs.out.includes('R2 fail DIFFERENCES'), differs.out.join('\n'))
+    // 11 x 2.5 = 27.5 against 25: 2.5 apart on a total of 67.5, beyond max(GBP 1, 0.05%): R5 fails too.
+    assert.ok(differs.out.includes('R5 fail DIFFERENCES'), differs.out.join('\n'))
+    // A stale export (another cycle date) is inconclusive and the snapshot is not read.
+    writeFileSync(`${exportDir}/manifest.json`, (await import('node:fs')).readFileSync(`${exportDir}/manifest.json`, 'utf8').replace(`"asOf":"${QD}"`, '"asOf":"2026-03-06"'), { mode: 0o644 })
+    const stale = await run(['--vendor-reads-only', '--qoblex-export', exportDir])
+    assert.ok(stale.out.includes('R2 inconclusive QOBLEX_EXPORT_STALE'), stale.out.join('\n'))
+  } finally {
+    net.Socket.prototype.connect = original
+    await sql(`DELETE FROM inventory_snapshots WHERE id LIKE '${QTAG}%'`)
+    await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${QTAG}%'`)
+    await sql(`DELETE FROM products WHERE id LIKE '${QTAG}%'`)
+    await sql(`DELETE FROM warehouses WHERE id LIKE '${QTAG}%'`)
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(exportDir, { recursive: true, force: true })
+  }
+})

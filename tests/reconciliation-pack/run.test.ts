@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { afterEach } from 'node:test'
 
+import { sourceOf } from './qoblex-fixtures.ts'
 import { parseAcceptanceFile } from '../../lib/ops/readiness-gate.ts'
 import type { AsOfBasis } from '../../lib/reconciliation-pack/basis.ts'
 import { bracketLiveness, reduceStatusReport, type LivenessRead } from '../../lib/reconciliation-pack/liveness.ts'
@@ -45,7 +46,10 @@ test('P1: R6 passes on a balanced settled basis; R10 is inconclusive without a w
   assert.deepEqual(items.filter((i) => i.outcome === 'pass').map((i) => i.id), ['R3', 'R4', 'R6', 'R15'])
   assert.deepEqual([outcome(items, 'R10').outcome, outcome(items, 'R10').reasons], ['inconclusive', ['SOURCE_UNREADABLE']])
   for (const id of ['R9', 'R13']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['VENDOR_READS_OFF'], []], `${id}: vendor reads are off unless the run asks`)
-  for (const id of ['R1', 'R2', 'R5', 'R12', 'R14']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['NO_RUNNER']], id)
+  for (const id of ['R1', 'R12']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['NO_RUNNER']], id)
+  // The Qoblex items read nothing unless the run names an export; R14 is also a vendor item and says so first.
+  for (const id of ['R2', 'R5']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['QOBLEX_EXPORT_OFF'], []], id)
+  assert.deepEqual([outcome(items, 'R14').outcome, outcome(items, 'R14').reasons], ['inconclusive', ['VENDOR_READS_OFF']])
   for (const id of ['R7', 'R8', 'R11']) assert.equal(outcome(items, id).outcome, 'not-applicable', id)
   assert.deepEqual(streams.map((s) => s.stream), ['xero-balance-snapshots'])
   const published = publishPackReport(dir, { runId: '20261020T120000Z-aaaaaaaaaaaa', systemIdentifier: '7000000000000000001', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items })
@@ -196,6 +200,26 @@ test('the basis: no basis port is an unreadable source; a basis that moved or is
 
 // ---- a misbehaving runner -----------------------------------------------------------------------
 
+// [mutation: the Qoblex check removed from runItems]
+test('an item that stands on the Qoblex export is not run, whatever runner it has, when the run named no export', async () => {
+  const called: string[] = []
+  const runners: Partial<Record<PackItemId, ItemRunner>> = {
+    R2: async () => { called.push('R2'); return passItem('R2') },
+    R5: async () => { called.push('R5'); return passItem('R5') },
+    R14: async () => { called.push('R14'); return passItem('R14') },
+  }
+  const withVendor = vendorOn()
+  const off = await runItems(plan({ runners, ...withVendor }))
+  assert.deepEqual(called, [])
+  for (const id of ['R2', 'R5', 'R14']) assert.deepEqual([outcome(off.items, id).outcome, outcome(off.items, id).reasons, outcome(off.items, id).sources ?? []], ['inconclusive', ['QOBLEX_EXPORT_OFF'], []], id)
+  // R14 also needs the opt-in, and without it that is what it says
+  const noVendor = await runItems(plan({ runners }))
+  assert.deepEqual(outcome(noVendor.items, 'R14').reasons, ['VENDOR_READS_OFF'])
+  // named: the runners run
+  await runItems(plan({ runners, ...withVendor, context: { ...withVendor.context!, qoblex: sourceOf({}) } }))
+  assert.deepEqual(called.sort(), ['R14', 'R2', 'R5'])
+})
+
 test('a runner that throws, names another item, or returns something the report refuses is INTERNAL_ERROR for that item only', async () => {
   const runners: Partial<Record<PackItemId, ItemRunner>> = {
     R1: async () => { throw new Error('secret value') },
@@ -205,7 +229,8 @@ test('a runner that throws, names another item, or returns something the report 
     R13: async () => ({ id: 'R13', outcome: 'pass', reasons: [], proof: { kind: 'proven-empty', source: 'vendor-total-zero' }, sources: ['woocommerce-api', 'xero-api'], entries: { onlyIms: [{ key: 'A1', ims: null, vendor: null, delta: null }] } }),
   }
   const ledgerRunners: Partial<Record<'R6' | 'R10', LedgerRunner>> = { R6: async () => { throw new Error('secret value') }, R10: async () => passItem('R6') }
-  const { items } = await runItems(plan({ runners, ledgerRunners, liveness: seq(reduceStatusReport(goodReport())), ...vendorOn() }))
+  const withExport = vendorOn()
+  const { items } = await runItems(plan({ runners, ledgerRunners, liveness: seq(reduceStatusReport(goodReport())), ...withExport, context: { ...withExport.context!, qoblex: sourceOf({}) } }))
   for (const id of ['R1', 'R2', 'R5', 'R9', 'R13', 'R6', 'R10']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['INTERNAL_ERROR']], id)
   assert.equal(outcome(items, 'R3').outcome, 'pass', 'the others are untouched')
   assert.ok(!JSON.stringify(items).includes('secret value'))

@@ -68,6 +68,16 @@ test('D7: R9 still settling (UNSETTLED_PENDING, with or without SETTLING_STATE_U
   }
 })
 
+// [mutation: the QOBLEX_EXPORT_OFF reading removed from assessPackItem / widened to "any reason list that contains it"]
+test('QOBLEX_EXPORT_OFF alone (no export was named) is not available, like VENDOR_READS_OFF; a stale export or an unavailable snapshot is unreadable (the report builder refuses the reason beside any other, tests/reconciliation-pack/consistency.test.ts)', () => {
+  for (const id of ['R2', 'R5', 'R14'] as PackItemId[]) {
+    const off = assessPackItem({ record: packRecord('P1', { items: { [id]: inconclusive(id, 'QOBLEX_EXPORT_OFF') } }) }, id, ctx())
+    assert.equal(off.kind, 'not-available', id)
+    assert.equal(assessPackItem({ record: packRecord('P1', { items: { [id]: inconclusive(id, 'QOBLEX_EXPORT_STALE') } }) }, id, ctx()).kind, 'unreadable', id)
+    assert.equal(assessPackItem({ record: packRecord('P1', { items: { [id]: inconclusive(id, 'SNAPSHOT_UNAVAILABLE') } }) }, id, ctx()).kind, 'unreadable', id)
+  }
+})
+
 // [mutation: the VENDOR_READS_OFF reading removed from assessPackItem / widened to "any reason list that contains it"]
 test('VENDOR_READS_OFF alone (the run did not opt in to vendor reads) is not available, like NO_RUNNER: the slot is what it was before the pack could read vendors; and a partial run (NOT_SELECTED) stays unreadable', () => {
   const off = assessPackItem({ record: packRecord('P1', { items: { R9: inconclusive('R9', 'VENDOR_READS_OFF') } }) }, 'R9', ctx())
@@ -128,13 +138,15 @@ test('a report made for another phase says nothing about the one asked', () => {
 })
 
 // [mutation: the cycle-date check removed / applied by finish time instead / the day-ended rule dropped]
-test('R6 and R10 need a CURRENT cycle date: a fresh report about an old date, or about a day not yet ended, is not established', () => {
+test('R6, R10 and the Qoblex items (R2, R5, R14) need a CURRENT cycle date: a fresh report about an old date, or about a day not yet ended, is not established', () => {
   // NOW is 2026-10-08T12:00Z; the default cycle date 2026-10-07 ended 12 hours ago.
-  for (const id of ['R6', 'R10'] as PackItemId[]) {
+  // The daily ledger items are held to 36 hours; the weekly Qoblex items to the weekly cadence (8 days): the day that ended exactly that long ago is the last good one.
+  const bounds: Record<string, { last: string; first: string }> = { R6: { last: '2026-10-06', first: '2026-10-05' }, R10: { last: '2026-10-06', first: '2026-10-05' }, R2: { last: '2026-09-30', first: '2026-09-29' }, R5: { last: '2026-09-30', first: '2026-09-29' }, R14: { last: '2026-09-30', first: '2026-09-29' } }
+  for (const id of ['R6', 'R10', 'R2', 'R5', 'R14'] as PackItemId[]) {
     const at = (asOf: string, finishedAt: Date = new Date(NOW.getTime() - 3600_000)) => assessPackItem({ record: packRecord('P1', { asOf, finishedAt, items: { [id]: packPass(id) } }) }, id, ctx()).kind
     assert.equal(at('2026-10-07'), 'pass', `${id}: yesterday, read after it ended`)
-    assert.equal(at('2026-10-06'), 'pass', `${id}: ended 36 hours ago, inclusive`)
-    assert.equal(at('2026-10-05'), 'unreadable', `${id}: a fresh report about a date that ended 60 hours ago`)
+    assert.equal(at(bounds[id]!.last), 'pass', `${id}: ended exactly its cadence ago, inclusive`)
+    assert.equal(at(bounds[id]!.first), 'unreadable', `${id}: a fresh report about a date that ended longer ago than its cadence`)
     assert.equal(at('2026-09-01'), 'unreadable', `${id}: an old date`)
     assert.equal(at('2026-10-08'), 'unreadable', `${id}: today, not yet ended`)
     assert.equal(at('2026-10-07', new Date('2026-10-07T23:00:00.000Z')), 'unreadable', `${id}: read before its day ended`)
@@ -150,7 +162,7 @@ test('R6 and R10 need a CURRENT cycle date: a fresh report about an old date, or
 
 // [mutation: the age check removed / the cadence ignored / the boundary moved]
 test('a report is current by its item\'s cadence: daily 36 hours, weekly 8 days, monthly 35 days - inclusive at the limit, stale one millisecond past it', () => {
-  const cases: Array<[PackItemId, 'daily' | 'weekly' | 'monthly']> = [['R3', 'daily'], ['R14', 'weekly'], ['R12', 'monthly']]
+  const cases: Array<[PackItemId, 'daily' | 'weekly' | 'monthly']> = [['R3', 'daily'], ['R12', 'monthly']]
   for (const [id, cadence] of cases) {
     const limit = PACK_CADENCE_MAX_AGE_MS[cadence]
     const at = (age: number) => packRecord('P1', { finishedAt: new Date(NOW.getTime() - age), items: { [id]: packPass(id) } })
@@ -158,11 +170,20 @@ test('a report is current by its item\'s cadence: daily 36 hours, weekly 8 days,
     assert.equal(assessPackItem({ record: at(limit + 1) }, id, ctx()).kind, 'unreadable', `${id} one ms past`)
     assert.equal(assessPackItem({ record: at(limit * 10) }, id, ctx()).kind, 'unreadable', `${id} long past`)
   }
+  // R14 stands on the Qoblex export, which is dated by its cycle date like the ledger items, so its report must also have been made after that
+  // day ended: the weekly limit is tried on a report finished at the very end of its cycle date, where both ages are the same.
+  {
+    const limit = PACK_CADENCE_MAX_AGE_MS.weekly
+    const finishedAt = new Date('2026-10-08T00:00:00.000Z')
+    const record = packRecord('P1', { asOf: '2026-10-07', finishedAt, items: { R14: packPass('R14') } })
+    assert.equal(assessPackItem({ record }, 'R14', ctx({ now: new Date(finishedAt.getTime() + limit) })).kind, 'pass', 'R14 exactly the weekly limit')
+    assert.equal(assessPackItem({ record }, 'R14', ctx({ now: new Date(finishedAt.getTime() + limit + 1) })).kind, 'unreadable', 'R14 one ms past')
+  }
   assert.deepEqual([PACK_CADENCE_MAX_AGE_MS.daily, PACK_CADENCE_MAX_AGE_MS.weekly, PACK_CADENCE_MAX_AGE_MS.monthly], [36 * 3600_000, 8 * DAY, 35 * DAY])
   // One report, two cadences: at 40 hours the daily items are stale and the weekly item still holds.
   const record = packRecord('P1', { finishedAt: new Date(NOW.getTime() - 40 * 3600_000), items: { R14: packPass('R14') } })
   assert.equal(assessPackItem({ record }, 'R3', ctx()).kind, 'unreadable')
-  assert.equal(assessPackItem({ record }, 'R14', ctx()).kind, 'pass')
+  assert.equal(assessPackItem({ record: packRecord('P1', { asOf: '2026-10-05', finishedAt: new Date(NOW.getTime() - 40 * 3600_000), items: { R14: packPass('R14') } }) }, 'R14', ctx()).kind, 'pass')
 })
 
 // [mutation: a future-dated report accepted]

@@ -61,7 +61,7 @@ test('a statement that is not a SELECT or a fixed SET LOCAL, or holds two statem
   // The wrapper is exercised through the only door there is: a section whose SQL is wrong. Prove the allowlist by making the
   // fake observe every statement and by checking that none of the real sections sends anything else, across ALL sections.
   const client = fake(() => [])
-  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'], asOf: '2026-10-19' })
+  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings', 'warehouses'], asOf: '2026-10-19' })
   for (const sql of client.sent) assert.ok(/^(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|ROLLBACK|SELECT\b|SET LOCAL (statement_timeout|idle_in_transaction_session_timeout) = \d+$|SET LOCAL TIME ZONE 'UTC'$)/.test(sql) && !sql.includes(';'), sql)
   assert.ok(!client.sent.some((s) => /\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|GRANT)\b/i.test(s)))
 })
@@ -397,4 +397,22 @@ test('a component of an unknown rate, a duplicate component and an unreadable se
   assert.equal(await reason(taxesFake({ components: [{ id: 'c1', rate_id: 'ghost', active: true, tax_type: 'X' }] })), 'SOURCE_UNREADABLE')
   assert.equal(await reason(taxesFake({ components: [{ id: 'c1', rate_id: 'r1', active: true, tax_type: 'X' }, { id: 'c1', rate_id: 'r1', active: true, tax_type: 'Y' }] })), 'DUPLICATE_KEY')
   assert.equal(await reason(taxesFake({ settings: [{ key: 'accounting_reverse_charge_sales_tax_type', value: 5 }] })), 'SOURCE_UNREADABLE')
+})
+
+// [mutation: the warehouses section reads a page / drops a duplicate code / coerces an inactive flag]
+test('the warehouses section reads every warehouse, and a repeated code, a repeated id or a row that is not exact makes the section unreadable', async () => {
+  const row = (over: Record<string, unknown> = {}) => ({ id: 'w1', code: 'MIL1', active: true, ...over })
+  const good = await readImsSnapshot(fake(() => [row(), row({ id: 'w2', code: 'CAMBRIDGE', active: false })]), { sections: ['warehouses'] })
+  assert.ok(good.ok && good.sections.warehouses!.ok && good.sections.warehouses!.value.length === 2)
+  if (good.ok && good.sections.warehouses!.ok) assert.deepEqual(good.sections.warehouses!.value[1], { id: 'w2', code: 'CAMBRIDGE', active: false })
+  const reasons = async (rows: Array<Record<string, unknown>>) => {
+    const read = await readImsSnapshot(fake(() => rows), { sections: ['warehouses'] })
+    return read.ok && !read.sections.warehouses!.ok ? read.sections.warehouses!.reason : 'read'
+  }
+  assert.equal(await reasons([row(), row({ id: 'w2' })]), 'DUPLICATE_KEY', 'two warehouses with one code')
+  assert.equal(await reasons([row(), row({ code: 'OTHER' })]), 'DUPLICATE_KEY', 'two rows with one id')
+  assert.equal(await reasons([row({ code: '' })]), 'BAD_KEY')
+  assert.equal(await reasons([row({ active: 'yes' })]), 'SOURCE_UNREADABLE')
+  const over = await readImsSnapshot(fake(() => [row(), row({ id: 'w2', code: 'B' }), row({ id: 'w3', code: 'C' })]), { sections: ['warehouses'], rowCap: 2 })
+  assert.ok(over.ok && !over.sections.warehouses!.ok && over.sections.warehouses!.reason === 'CAP_EXCEEDED')
 })

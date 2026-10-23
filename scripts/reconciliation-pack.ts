@@ -19,6 +19,9 @@ import pg from 'pg'
 
 import { pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
 import { loadAcceptances } from '../lib/reconciliation-pack/acceptances.ts'
+import type { SkuListPort } from '../lib/reconciliation-pack/coverage-items.ts'
+import { createQoblexSource } from '../lib/reconciliation-pack/qoblex-source.ts'
+import { loadSkuExclusions } from '../lib/reconciliation-pack/sku-exclusions.ts'
 import { accountAllowed, buildPackEnv, parsePackArgs, type PackArgs } from '../lib/reconciliation-pack/cli.ts'
 import {
   PACK_BASIS_REASON_LIST, PACK_CHAIN_CODES, PACK_CLI_CODES, PACK_CLI_FLAGS, PACK_COMMAND, PACK_EXIT_CODES, PACK_TRANSIT_LEG_REASONS, packExitCode, renderPackCliCodeTable, renderPackExitCodeTable,
@@ -57,6 +60,8 @@ export type PackCliDeps = {
   ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
   /** The WooCommerce port. Consulted ONLY with --vendor-reads-only; the default is the GET-only transport (woo-transport.ts). */
   woo?: WooGetPort
+  /** R14's SKU list from the 3PL's warehouse system. There is none on this build (that source is separate); absent means that leg is not compared (LEG_UNAVAILABLE). */
+  wmsSkus?: SkuListPort
   /** Called last, whatever happened: closes the application's database client if the invariant run opened it. */
   disconnect: () => Promise<void>
 }
@@ -78,7 +83,7 @@ export type PackCliOptions = {
 }
 
 const usage = (): string => [
-  `Usage: ${PACK_COMMAND} -- --phase <P0|P1|P2> [--as-of <YYYY-MM-DD>] [--items <R3,R4,...>] [--acceptances <file>] [--report-dir <dir>] [--basis-only] [--vendor-reads-only]`,
+  `Usage: ${PACK_COMMAND} -- --phase <P0|P1|P2> [--as-of <YYYY-MM-DD>] [--items <R3,R4,...>] [--acceptances <file>] [--report-dir <dir>] [--basis-only] [--vendor-reads-only] [--qoblex-export <dir>] [--sku-exclusions <file>]`,
   '',
   ...PACK_CLI_FLAGS.map((f) => `  ${f.flag}${f.value === '-' ? '' : ` <${f.value}>`}: ${f.meaning}`),
   '',
@@ -193,6 +198,11 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
     const accepted = loadAcceptances(args.acceptances, repoRoot)
     if ('refused' in accepted) return refuse('ACCEPTANCE_FILE_UNREADABLE')
 
+    const exclusions = loadSkuExclusions(args.skuExclusions, repoRoot)
+    if ('refused' in exclusions) return refuse('EXCLUSION_FILE_UNREADABLE')
+    // The export is named by the operator; nothing is read from it until an item asks (qoblex-source.ts), and then once.
+    const qoblex = args.qoblexExport === null ? undefined : createQoblexSource({ dir: path.resolve(args.qoblexExport), asOf: args.asOf!, now: deps.now })
+
     const startedAt = deps.now()
     let systemIdentifier: string | null = null
     try {
@@ -227,7 +237,7 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       ledgerRunners: deps.ledgerRunners,
       // What the previous report carries for each item that settles, from the chain read above (trusted, or the run stopped).
       carried: Object.fromEntries(PACK_ITEM_IDS.filter((id) => getPackItem(id).settles).map((id) => [id, carriedStateFromChain(chain, id, { phase: args.phase, systemIdentifier: systemIdentifier! })])) as Partial<Record<PackItemId, CarriedState>>,
-      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor },
+      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor, qoblex, skuExclusions: exclusions.file, wmsSkus: args.vendorReadsOnly ? deps.wmsSkus : undefined },
     })
     const finishedAt = deps.now()
     const published = publishPackReport(reportDir, {
