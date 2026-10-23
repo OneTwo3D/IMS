@@ -103,6 +103,27 @@ test('a report made for another phase says nothing about the one asked', () => {
   }
 })
 
+// [mutation: the cycle-date check removed / applied by finish time instead / the day-ended rule dropped]
+test('R6 and R10 need a CURRENT cycle date: a fresh report about an old date, or about a day not yet ended, is not established', () => {
+  // NOW is 2026-10-08T12:00Z; the default cycle date 2026-10-07 ended 12 hours ago.
+  for (const id of ['R6', 'R10'] as PackItemId[]) {
+    const at = (asOf: string, finishedAt: Date = new Date(NOW.getTime() - 3600_000)) => assessPackItem({ record: packRecord('P1', { asOf, finishedAt, items: { [id]: packPass(id) } }) }, id, ctx()).kind
+    assert.equal(at('2026-10-07'), 'pass', `${id}: yesterday, read after it ended`)
+    assert.equal(at('2026-10-06'), 'pass', `${id}: ended 36 hours ago, inclusive`)
+    assert.equal(at('2026-10-05'), 'unreadable', `${id}: a fresh report about a date that ended 60 hours ago`)
+    assert.equal(at('2026-09-01'), 'unreadable', `${id}: an old date`)
+    assert.equal(at('2026-10-08'), 'unreadable', `${id}: today, not yet ended`)
+    assert.equal(at('2026-10-07', new Date('2026-10-07T23:00:00.000Z')), 'unreadable', `${id}: read before its day ended`)
+    // A record the report reader would refuse, met here anyway: the gate does not rely on the reader for it.
+    for (const bad of ['2026-02-30', '20261007', '', 'yesterday', null]) {
+      const record = { ...packRecord('P1', { items: { [id]: packPass(id) } }), asOf: bad as never }
+      assert.equal(assessPackItem({ record }, id, ctx()).kind, 'unreadable', `${id}: cycle date ${JSON.stringify(bad)}`)
+    }
+  }
+  // Items that read no cycle-dated evidence are not held to it.
+  assert.equal(assessPackItem({ record: packRecord('P1', { asOf: '2026-09-01' }) }, 'R3', ctx()).kind, 'pass')
+})
+
 // [mutation: the age check removed / the cadence ignored / the boundary moved]
 test('a report is current by its item\'s cadence: daily 36 hours, weekly 8 days, monthly 35 days - inclusive at the limit, stale one millisecond past it', () => {
   const cases: Array<[PackItemId, 'daily' | 'weekly' | 'monthly']> = [['R3', 'daily'], ['R14', 'weekly'], ['R12', 'monthly']]

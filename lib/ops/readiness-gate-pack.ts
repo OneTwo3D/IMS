@@ -72,6 +72,26 @@ function reportProblem(record: ReportRecord, context: PackAssessContext, cadence
   return null
 }
 
+/** Sources read as a stored snapshot for the run's cycle date (the as-of basis): a fresh report about an old date proves nothing current. */
+const CYCLE_DATED_SOURCES: ReadonlySet<string> = new Set(['xero-trial-balance'])
+const DAY_MS = 86_400_000
+
+/**
+ * Why an item that reads cycle-dated evidence cannot be taken as current; null when it can. The cycle date must be a real calendar
+ * date whose day had ENDED when the run finished (evidence for a day still in progress is not that day's), and the end of that day
+ * must be within the item's cadence of the gate's own clock: the report's finish time alone says nothing about the date it read.
+ */
+function cycleDateProblem(record: ReportRecord, context: PackAssessContext, cadenceMs: number): string | null {
+  const asOf = record.asOf
+  const start = typeof asOf === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(asOf) ? Date.parse(`${asOf}T00:00:00.000Z`) : Number.NaN
+  if (!Number.isFinite(start) || new Date(start).toISOString().slice(0, 10) !== asOf) return 'the newest reconciliation pack report has no readable cycle date'
+  const dayEnd = start + DAY_MS
+  if (Date.parse(record.finishedAt) < dayEnd) return 'the newest reconciliation pack report read its cycle date before that day had ended'
+  const age = context.now.getTime() - dayEnd
+  if (age > cadenceMs) return `the newest reconciliation pack report is for a cycle date that ended ${Math.floor(age / 3_600_000)} hours ago, longer than this item's cadence allows (${Math.floor(cadenceMs / 3_600_000)} hours)`
+  return null
+}
+
 /**
  * One slot from one read, by the mapping above.
  *
@@ -87,6 +107,7 @@ export function assessPackItem(read: PackReportRead, id: PackItemId, context: Pa
   const record = read.record
   const spec = getPackItem(id)
   const problem = reportProblem(record, context, PACK_CADENCE_MAX_AGE_MS[spec.cadence])
+    ?? (spec.sources.some((source) => CYCLE_DATED_SOURCES.has(source)) ? cycleDateProblem(record, context, PACK_CADENCE_MAX_AGE_MS[spec.cadence]) : null)
   if (problem !== null) return unreadable(`${problem}, so ${id} is not established`)
   const matches = record.items.filter((item) => item.id === id)
   if (matches.length !== 1) return unreadable(`the newest reconciliation pack report lists ${id} ${matches.length} times, expected exactly once`)

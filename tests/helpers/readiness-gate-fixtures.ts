@@ -203,12 +203,12 @@ export const packStreams = (): StreamBracket[] => (['woocommerce-order-sweep', '
  * A pack report record as the publisher would have written it (built by the real builder), for the installation APPLY_SYSTEM_ID, one hour
  * before NOW. R3, R4 and R15 pass unless `items` says otherwise; at P1 and P2 the other items the phase applies are NO_RUNNER.
  */
-export function packRecord(phase: ReadinessPhase = 'P0', over: { finishedAt?: Date; systemIdentifier?: string; items?: Partial<Record<PackItemId, ItemInput>>; sequence?: number } = {}): ReportRecord {
+export function packRecord(phase: ReadinessPhase = 'P0', over: { finishedAt?: Date; systemIdentifier?: string; items?: Partial<Record<PackItemId, ItemInput>>; sequence?: number; asOf?: string } = {}): ReportRecord {
   const finished = (over.finishedAt ?? new Date(NOW.getTime() - 3600_000)).toISOString()
   const items = defaultItems(phase, { R3: packPass('R3'), R4: packPass('R4'), R15: packPass('R15'), ...over.items })
   const needsStreams = items.some((item) => getPackItem(item.id).streams.length > 0 && item.outcome === 'pass')
   return buildReport({
-    runId: '20261008T100000Z-aaaaaaaaaaaa', systemIdentifier: over.systemIdentifier ?? APPLY_SYSTEM_ID, phase, asOf: '2026-10-07', startedAt: finished, finishedAt: finished,
+    runId: '20261008T100000Z-aaaaaaaaaaaa', systemIdentifier: over.systemIdentifier ?? APPLY_SYSTEM_ID, phase, asOf: over.asOf ?? '2026-10-07', startedAt: finished, finishedAt: finished,
     streams: needsStreams ? packStreams() : [], items,
   }, over.sequence ?? 1, null).record
 }
