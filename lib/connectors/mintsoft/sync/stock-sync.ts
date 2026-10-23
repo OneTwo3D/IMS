@@ -2666,6 +2666,10 @@ export async function runStockSyncForBinding(
     }
 
     const connector = getWmsConnector('mintsoft')
+    // `onHand` (Mintsoft TotalStockLevel), never `available` (Level): IMS stock_levels.quantity is
+    // physical on hand with reservations tracked separately, so the comparison, the snapshot's
+    // externalQty and every discrepancy figure below are on-hand figures. A response that cannot
+    // supply on-hand for every row throws here and fails the run (see normalizeMintsoftStockLevels).
     const fetchedLines = await connector.fetchStockLevels(binding.externalWarehouseId)
     await refreshLease(true)
     const stockLines = consolidateMintsoftStockLines(fetchedLines)
@@ -2773,7 +2777,7 @@ export async function runStockSyncForBinding(
             productId: null,
             sku: line.sku,
             imsValue: null,
-            wmsValue: formatQuantity(line.quantity),
+            wmsValue: formatQuantity(line.onHand),
             delta: null,
             message: category === 'MISSING_IN_IMS'
               ? `Mintsoft holds stock for SKU ${line.sku}, which has no matching IMS product. Create or import the product in IMS.`
@@ -2785,7 +2789,7 @@ export async function runStockSyncForBinding(
             sku: line.sku,
             productId: null,
             action: 'discrepancy',
-            wmsQty: line.quantity,
+            wmsQty: line.onHand,
             delta: null,
             reason: category,
             payload: (line.raw ?? {}) as Prisma.InputJsonValue,
@@ -2794,7 +2798,7 @@ export async function runStockSyncForBinding(
         }
 
         const imsQty = Number(stockLevelByProductId.get(product.id)?.quantity ?? 0)
-        const wmsQty = line.quantity
+        const wmsQty = line.onHand
         const delta = wmsQty - imsQty
 
         await db.wmsStockSnapshot.upsert({
@@ -2964,7 +2968,7 @@ export async function runStockSyncForBinding(
           sku: line.sku,
           productId: null,
           action: 'error',
-          wmsQty: line.quantity,
+          wmsQty: line.onHand,
           reason: error instanceof Error ? error.message : 'Unexpected Mintsoft stock sync error',
           payload: (line.raw ?? {}) as Prisma.InputJsonValue,
         })

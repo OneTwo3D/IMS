@@ -268,6 +268,7 @@ export {
   normalizeMintsoftProduct,
   normalizeMintsoftProductListItem,
   normalizeMintsoftReturn,
+  normalizeMintsoftStockLevels,
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './api/normalizers'
