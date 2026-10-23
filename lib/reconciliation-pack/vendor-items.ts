@@ -10,7 +10,7 @@
  *        PROCESSING, ALLOCATED, PICKING, PACKING) that has a recorded WooCommerce order id; an open order without one is listed as out
  *        of the population (NO_STOREFRONT_LINK), never compared. Vendor side: the orders in the statuses the importer ADMITS
  *        (wc_sync_order_statuses; absent means its default) whose effective reading (a mapping row, else the connector's built-in
- *        table) is an open IMS status, each status walked twice on its own. A status the importer admits that has no reading is
+ *        table) is an open IMS status, read as two full sweeps of every status. A status the importer admits that has no reading is
  *        UNKNOWN_STATUS (the whole item). The SET must be exact; the VALUE (the order total, in the order's own currency) must agree
  *        within one minor unit of that currency (owner decision D1), and a currency that differs is a difference. An identity on
  *        both sides is always judged. A storefront order the store holds and IMS does not is judged only if the recorded boundaries put

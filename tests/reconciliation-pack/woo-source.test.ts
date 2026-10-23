@@ -19,7 +19,7 @@ const fails = async (data: Parameters<typeof fakeStore>[0], tweak: Tweak | undef
   assert.ok(!('value' in read), 'and no partial value')
 }
 
-test('a faithful store: every status walked on its own, twice, with the rows exactly as the store holds them', async () => {
+test('a faithful store: every status walked on its own in two full sweeps, with the rows exactly as the store holds them', async () => {
   const store = fakeStore({ orders: { processing: many(250), 'on-hold': many(3, 1000, 'on-hold') } })
   const read = await readWooOrders(store, ['processing', 'on-hold'], opts)
   assert.ok(read.ok)
@@ -31,7 +31,8 @@ test('a faithful store: every status walked on its own, twice, with the rows exa
   assert.equal(store.calls.length, 8)
   assert.deepEqual([...new Set(store.calls.map((c) => c.params.status))], ['processing', 'on-hold'])
   for (const call of store.calls) assert.deepEqual(Object.keys(call.params).sort(), ['_fields', 'order', 'orderby', 'page', 'per_page', 'status'])
-  assert.deepEqual(store.calls.slice(0, 6).map((c) => c.params.page), ['1', '2', '3', '1', '2', '3'])
+  // Sweep A (processing 3 pages, on-hold 1) finishes before sweep B starts.
+  assert.deepEqual(store.calls.map((c) => `${c.params.status}:${c.params.page}`), ['processing:1', 'processing:2', 'processing:3', 'on-hold:1', 'processing:1', 'processing:2', 'processing:3', 'on-hold:1'])
 })
 
 test('products and tax rates are walked in full and twice, with their own fields', async () => {
@@ -185,4 +186,67 @@ test('a status list that is not distinct closed slugs is refused before any requ
 test('nothing a failing store says is kept: the result is a closed reason and no text of the store\'s own', async () => {
   const read = await readWooOrders(fakeStore({ orders: { processing: many(2) } }, () => { throw new Error('hunter2 https://shop.example/?consumer_key=ck_abc') }), ['processing'], opts)
   assert.deepEqual(read, { ok: false, reason: 'SOURCE_UNREADABLE' })
+})
+
+// ---- THE DOUBLE SWEEP ---------------------------------------------------------------------------
+
+type Mutable = { orders: Record<string, Array<Record<string, unknown>>> }
+/** A store that changes when a given request is first/next made: `when` sees the request (and how many like it came before) and may move orders. */
+function shifting(data: Mutable, when: (call: { status: string; page: string }, nth: number, data: Mutable) => void) {
+  const inner = fakeStore(data)
+  const counts = new Map<string, number>()
+  return {
+    calls: inner.calls,
+    get: async (collection: Parameters<typeof inner.get>[0], params: Record<string, string>) => {
+      const id = `${params.status}:${params.page}`
+      const nth = (counts.get(id) ?? 0) + 1
+      counts.set(id, nth)
+      when({ status: params.status ?? '', page: params.page ?? '' }, nth, data)
+      return inner.get(collection, params)
+    },
+  }
+}
+const move = (data: Mutable, id: number, from: string, to: string) => {
+  const row = data.orders[from]!.find((r) => r.id === id)!
+  data.orders[from] = data.orders[from]!.filter((r) => r !== row)
+  data.orders[to] = [...(data.orders[to] ?? []), { ...row, status: to }]
+}
+const SWEEP_STATUSES = ['processing', 'on-hold']
+
+// [mutation: the combined comparison skipped / the sweeps compared by count only]
+test('SWEEP A: an order that moves from a later open status to an earlier one after the earlier status was read and before the later one is read is VENDOR_READ_UNSTABLE, never a list - and never an empty proof', async () => {
+  const data: Mutable = { orders: { processing: [], 'on-hold': [order(5, 'on-hold')] } }
+  // The first request for on-hold comes after processing was read (twice, in a per-status double read; once, in sweep A).
+  const store = shifting(data, (call, nth, d) => { if (call.status === 'on-hold' && call.page === '1' && nth === 1) move(d, 5, 'on-hold', 'processing') })
+  const read = await readWooOrders(store, SWEEP_STATUSES, opts)
+  assert.deepEqual(read, { ok: false, reason: 'VENDOR_READ_UNSTABLE' })
+})
+
+test('SWEEP B: the same move during the second sweep (after its processing walk) is unstable too', async () => {
+  const data: Mutable = { orders: { processing: [], 'on-hold': [order(5, 'on-hold')] } }
+  const store = shifting(data, (call, nth, d) => { if (call.status === 'on-hold' && call.page === '1' && nth === 2) move(d, 5, 'on-hold', 'processing') })
+  assert.deepEqual(await readWooOrders(store, SWEEP_STATUSES, opts), { ok: false, reason: 'VENDOR_READ_UNSTABLE' })
+})
+
+test('an order that is held between sweeps changing status (processing in A, on-hold in B) is unstable; a count-preserving swap is unstable', async () => {
+  const data: Mutable = { orders: { processing: [order(5)], 'on-hold': [] } }
+  const store = shifting(data, (call, nth, d) => { if (call.status === 'processing' && call.page === '1' && nth === 2) move(d, 5, 'processing', 'on-hold') })
+  assert.deepEqual(await readWooOrders(store, SWEEP_STATUSES, opts), { ok: false, reason: 'VENDOR_READ_UNSTABLE' })
+  // Same totals per status in both sweeps, one identity replaced by another.
+  const swap: Mutable = { orders: { processing: [order(5)], 'on-hold': [] } }
+  const swapped = shifting(swap, (call, nth, d) => { if (call.status === 'processing' && call.page === '1' && nth === 2) d.orders.processing = [order(6)] })
+  assert.deepEqual(await readWooOrders(swapped, SWEEP_STATUSES, opts), { ok: false, reason: 'VENDOR_READ_UNSTABLE' })
+  // A value changed in place between the sweeps.
+  const value: Mutable = { orders: { processing: [order(5)], 'on-hold': [] } }
+  const changed = shifting(value, (call, nth, d) => { if (call.status === 'processing' && call.page === '1' && nth === 2) d.orders.processing = [order(5, 'processing', { total: '99.00' })] })
+  assert.deepEqual(await readWooOrders(changed, SWEEP_STATUSES, opts), { ok: false, reason: 'VENDOR_READ_UNSTABLE' })
+})
+
+test('a quiet store gives the same list from both sweeps, with the empty proof only if every status was zero in both', async () => {
+  const quiet = await readWooOrders(fakeStore({ orders: { processing: [order(5)], 'on-hold': [order(6, 'on-hold')] } }), SWEEP_STATUSES, opts)
+  assert.ok(quiet.ok && quiet.value.orders.map((o) => o.id).join() === '5,6' && !quiet.value.allZero)
+  // Zero in sweep A, an order only in B: unstable, so no allZero to pass on.
+  const data: Mutable = { orders: { processing: [], 'on-hold': [] } }
+  const store = shifting(data, (call, nth, d) => { if (call.status === 'processing' && call.page === '1' && nth === 2) d.orders.processing = [order(7)] })
+  assert.deepEqual(await readWooOrders(store, SWEEP_STATUSES, opts), { ok: false, reason: 'VENDOR_READ_UNSTABLE' })
 })

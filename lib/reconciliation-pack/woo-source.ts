@@ -215,33 +215,54 @@ function reasonOf(error: unknown): PackReasonCode {
 export type WooOrdersRead = {
   /** Every order of every requested status, ascending by id within a status. */
   orders: WooOrderRow[]
-  /** The total each status reported (the same on both reads). */
+  /** The total each status reported (the same in both sweeps). */
   totals: Array<{ status: string; total: number }>
-  /** True only when at least one status was enumerated and every one reported a total of zero on both reads. */
+  /** True only when at least one status was enumerated and every one reported a total of zero in both sweeps. */
   allZero: boolean
 }
 
-/** The orders in each of `statuses`, one status at a time, each walked twice. `statuses` must be a non-empty-or-empty list of distinct closed slugs. */
+type Sweep = { orders: WooOrderRow[]; totals: Array<{ status: string; total: number }> }
+
+/** ONE full proven walk of every status, in order. Each walk proves its own headers and pages; the sweep proves no order is in two statuses. */
+async function sweepOrders(w: Walker, statuses: readonly string[]): Promise<Sweep> {
+  const orders: WooOrderRow[] = []
+  const totals: Array<{ status: string; total: number }> = []
+  const seen = new Set<string>()
+  for (const status of statuses) {
+    const walk = await walkOnce(w, 'orders', { status }, parseOrder)
+    for (const row of walk.rows) {
+      // The store was asked for one status; an order in another is a response that is not what was asked for.
+      if (row.status !== status) throw new Stop('SOURCE_UNREADABLE')
+      if (seen.has(row.id)) throw new Stop('VENDOR_READ_UNSTABLE')
+      seen.add(row.id)
+      orders.push(row)
+    }
+    totals.push({ status, total: walk.total })
+  }
+  return { orders, totals }
+}
+
+/**
+ * The orders in each of `statuses`: a DOUBLE SWEEP. Sweep A walks every status one at a time; sweep B starts only after A finished and
+ * walks them all again. A per-status double read would not do: an order that moves from a later status to an earlier one between two
+ * status walks is in neither read of the earlier status and not yet in the later one's, so every walk is consistent and the order is
+ * missing. Here the COMBINED populations of A and B (id, status, currency, total, date: every field R9 uses) must be identical, the
+ * totals per status must be identical, and any difference is VENDOR_READ_UNSTABLE and no list. The empty proof needs zero in BOTH sweeps.
+ *
+ * One request per status on purpose: a multi-status request (status array or comma list) is unverified on the live store (U4), so it is not used.
+ * REMAINING LIMIT: an order that moves between open statuses TWICE within one run (out and back) can be missed by both sweeps.
+ */
 export async function readWooOrders(port: WooGetPort, statuses: readonly string[], options: WooSourceOptions = {}): Promise<{ ok: true; value: WooOrdersRead } | { ok: false; reason: PackReasonCode }> {
   try {
     if (!Array.isArray(statuses) || new Set(statuses).size !== statuses.length || !statuses.every((s) => typeof s === 'string' && STATUS_RE.test(s))) return { ok: false, reason: 'UNKNOWN_STATUS' }
     const w = makeWalker(port, options)
-    const orders: WooOrderRow[] = []
-    const totals: Array<{ status: string; total: number }> = []
-    const seen = new Set<string>()
-    for (const status of statuses) {
-      const walk = await walkTwice(w, 'orders', { status }, parseOrder, (row) => {
-        // The store was asked for one status; an order in another is a response that is not what was asked for.
-        if (row.status !== status) throw new Stop('SOURCE_UNREADABLE')
-      })
-      for (const row of walk.rows) {
-        if (seen.has(row.id)) throw new Stop('VENDOR_READ_UNSTABLE')
-        seen.add(row.id)
-        orders.push(row)
-      }
-      totals.push({ status, total: walk.total })
-    }
-    return { ok: true, value: { orders, totals, allZero: totals.length > 0 && totals.every((entry) => entry.total === 0) } }
+    const a = await sweepOrders(w, statuses)
+    const b = await sweepOrders(w, statuses)
+    if (a.orders.length !== b.orders.length || JSON.stringify(a.totals) !== JSON.stringify(b.totals)) throw new Stop('VENDOR_READ_UNSTABLE')
+    const byId = new Map(b.orders.map((row) => [row.id, JSON.stringify(row)] as const))
+    for (const row of a.orders) if (byId.get(row.id) !== JSON.stringify(row)) throw new Stop('VENDOR_READ_UNSTABLE')
+    const totals = a.totals
+    return { ok: true, value: { orders: a.orders, totals, allZero: totals.length > 0 && totals.every((entry) => entry.total === 0) } }
   } catch (error) {
     return { ok: false, reason: reasonOf(error) }
   }
