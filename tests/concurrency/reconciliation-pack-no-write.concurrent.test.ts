@@ -390,7 +390,7 @@ test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, G
     if (url.pathname === '/api/Product/StockLevels') { res.writeHead(200, headers); res.end(JSON.stringify(wireRows(url.searchParams.get('WarehouseId') === '5' ? PROBE_WH5 : url.searchParams.get('WarehouseId') === '6' ? PROBE_WH6 : []))); return }
     if (url.pathname === '/api/Product/List') {
       const limit = Number(url.searchParams.get('Limit')); const page = Number(url.searchParams.get('PageNo'))
-      res.writeHead(limit > 100 ? 400 : 200, headers); res.end(JSON.stringify(limit > 100 ? {} : wireRows(PROBE_WH6).slice((page - 1) * limit, page * limit).map((r) => ({ ID: r.ProductId, SKU: r.SKU, ClientId: r.ClientId })))); return
+      res.writeHead(limit > 100 ? 400 : 200, headers); res.end(JSON.stringify(limit > 100 ? {} : wireRows(PROBE_WH6).slice((page - 1) * limit, page * limit).map((r) => ({ ID: r.ProductId, SKU: r.SKU, ClientId: r.ClientId, Bundle: r.Bundle })))); return
     }
     res.writeHead(404, headers); res.end('{}')
   })

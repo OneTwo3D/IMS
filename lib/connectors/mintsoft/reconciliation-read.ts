@@ -201,7 +201,8 @@ export function createMintsoftReadPort(deps: MintsoftReadPortDeps): WmsReadPort 
           if (id === null || sku.length === 0) throw new Error('row')
           // A shared tenant: a row that names another client is not ours, and a row that names none is read as ours (the key is the scope).
           if (raw.ClientId !== undefined && raw.ClientId !== null && raw.ClientId !== Number(creds.value.clientId)) throw new Error('client')
-          return { id: String(id), sku }
+          if (typeof raw.Bundle !== 'boolean') throw new Error('bundle')
+          return { id: String(id), sku, bundle: raw.Bundle }
         })
         return { ok: true, value: rows }
       } catch {

@@ -21,9 +21,9 @@
  *     (2) the last page is SHORT (including empty) and the page AFTER it is then requested and must be empty: a short page is a claim, and
  *         a truncation that is the same every time looks exactly like an end until the next page is asked for;
  *     (3) no product id and no SKU appears twice in a scan;
- *     (4) the scan is read a SECOND time and must hold exactly the same (id, SKU) pairs, compared as a set (no ordering is assumed);
+ *     (4) the scan is read a SECOND time and must hold exactly the same (id, SKU, bundle flag) triples, compared as a set (no ordering is assumed);
  *   and then, independently of how the vendor pages, (5) CONTAINMENT: every row of every stock list must be a product of the census with
- *   the same SKU (a product the stock list shows and the census lacks means the census is not the whole list: READ_INCOMPLETE; the same id
+ *   the same SKU and bundle flag (a product the stock list shows and the census lacks means the census is not the whole list: READ_INCOMPLETE; the same id
  *   under another SKU is IDENTITY_CONFLICT).
  *   NOT PROVEN, stated: that the vendor's pages are a window over one stable permutation of the whole set and not a keyset walk that
  *   skips the same row every time. Step (5) is the independent check against that for every product that has a stock row; a product with
@@ -47,7 +47,7 @@ import {
 /** One row of a stock list, already strictly read. `onHand` is a non-negative whole number. */
 export type WmsStockRow = { sku: string; productId: string; onHand: number; bundle: boolean }
 /** One row of the product list, already strictly read. */
-export type WmsProductRow = { id: string; sku: string }
+export type WmsProductRow = { id: string; sku: string; bundle: boolean }
 export type WmsPortResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 
 export interface WmsReadPort {
@@ -156,8 +156,12 @@ function requireSameSweeps(a: Map<string, WmsStockRow[]>, b: Map<string, WmsStoc
 function requireOneIdentity(sweep: Map<string, WmsStockRow[]>): void {
   const idOfSku = new Map<string, string>()
   const skuOfId = new Map<string, string>()
+  const bundleOfId = new Map<string, boolean>()
   for (const rows of sweep.values()) {
     for (const row of rows) {
+      // The kind of a product (bundle or plain) is part of its identity: every warehouse must say the same.
+      if ((bundleOfId.get(row.productId) ?? row.bundle) !== row.bundle) throw new Stop('IDENTITY_CONFLICT')
+      bundleOfId.set(row.productId, row.bundle)
       if ((idOfSku.get(row.sku) ?? row.productId) !== row.productId || (skuOfId.get(row.productId) ?? row.sku) !== row.sku) throw new Stop('IDENTITY_CONFLICT')
       idOfSku.set(row.sku, row.productId)
       skuOfId.set(row.productId, row.sku)
@@ -171,7 +175,7 @@ function checkProductRows(rows: unknown, limit: number): WmsProductRow[] {
   for (const row of rows as unknown[]) {
     if (typeof row !== 'object' || row === null) throw new Stop('SOURCE_UNREADABLE')
     const r = row as Partial<WmsProductRow>
-    if (typeof r.id !== 'string' || !/^[1-9][0-9]{0,17}$/.test(r.id) || typeof r.sku !== 'string' || r.sku.length === 0) throw new Stop('SOURCE_UNREADABLE')
+    if (typeof r.id !== 'string' || !/^[1-9][0-9]{0,17}$/.test(r.id) || typeof r.sku !== 'string' || r.sku.length === 0 || typeof r.bundle !== 'boolean') throw new Stop('SOURCE_UNREADABLE')
   }
   return rows as WmsProductRow[]
 }
@@ -203,18 +207,19 @@ async function scanProducts(r: Reader): Promise<WmsProductRow[]> {
 
 function requireSameScans(a: readonly WmsProductRow[], b: readonly WmsProductRow[]): void {
   if (a.length !== b.length) throw new Stop('VENDOR_READ_UNSTABLE')
-  const skuOfId = new Map(b.map((row) => [row.id, row.sku] as const))
-  for (const row of a) if (skuOfId.get(row.id) !== row.sku) throw new Stop('VENDOR_READ_UNSTABLE')
+  const kindOfId = new Map(b.map((row) => [row.id, `${row.sku}\u0001${row.bundle}`] as const))
+  for (const row of a) if (kindOfId.get(row.id) !== `${row.sku}\u0001${row.bundle}`) throw new Stop('VENDOR_READ_UNSTABLE')
 }
 
 /** CONTAINMENT: every product a stock list shows is a product of the census, under the same SKU. */
 function requireContainment(sweep: Map<string, WmsStockRow[]>, census: readonly WmsProductRow[]): void {
-  const skuOfId = new Map(census.map((row) => [row.id, row.sku] as const))
+  const byId = new Map(census.map((row) => [row.id, row] as const))
   for (const rows of sweep.values()) {
     for (const row of rows) {
-      const sku = skuOfId.get(row.productId)
-      if (sku === undefined) throw new Stop('READ_INCOMPLETE')
-      if (sku !== row.sku) throw new Stop('IDENTITY_CONFLICT')
+      const product = byId.get(row.productId)
+      if (product === undefined) throw new Stop('READ_INCOMPLETE')
+      // Same SKU AND same kind: the census says whether a product is a bundle, and so does every stock list; they must agree.
+      if (product.sku !== row.sku || product.bundle !== row.bundle) throw new Stop('IDENTITY_CONFLICT')
     }
   }
 }

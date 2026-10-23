@@ -10,7 +10,7 @@ import { fakeWms, noSleep, PROBE_WH5, PROBE_WH6, toStockRow, type FakeWmsData, t
  */
 
 const probe = (): FakeWmsData => ({ stock: { '5': PROBE_WH5.map(toStockRow), '6': PROBE_WH6.map(toStockRow) } })
-const synthetic = (n: number): WmsProductRow[] => Array.from({ length: n }, (_, i) => ({ id: String(1000 + i), sku: `SYN-${1000 + i}` }))
+const synthetic = (n: number): WmsProductRow[] => Array.from({ length: n }, (_, i) => ({ id: String(1000 + i), sku: `SYN-${1000 + i}`, bundle: false }))
 const reasonOf = (r: Awaited<ReturnType<typeof readWms>>) => (r.ok ? 'ok' : r.reason)
 
 test('a full read is two stock sweeps then two proven product scans, in that order, paced, and holds the probe rows as they are', async () => {
@@ -97,7 +97,7 @@ test('TRUNCATION AND DRIFT of the census: a page after the short one that still 
   assert.equal(await run((c) => (c.kind === 'page' && c.pageNo === 2 ? { ok: true, value: all.slice(100, 200).map((r, i) => (i === 0 ? { ...r, sku: all[0]!.sku } : r)) } : undefined)), 'IDENTITY_CONFLICT', 'one SKU under two ids')
   // scan 2 differs from scan 1 (calls 3..6 are scan 1, 7.. scan 2)
   assert.equal(await run((c, n) => (c.kind === 'page' && c.pageNo === 3 && n > 6 ? { ok: true, value: all.slice(200, 249) } : undefined)), 'VENDOR_READ_UNSTABLE', 'a product left between the scans')
-  assert.equal(await run((c, n) => (c.kind === 'page' && c.pageNo === 3 && n > 6 ? { ok: true, value: [...all.slice(200), { id: '90001', sku: 'LATE-1' }] } : undefined)), 'VENDOR_READ_UNSTABLE', 'a product appeared between the scans')
+  assert.equal(await run((c, n) => (c.kind === 'page' && c.pageNo === 3 && n > 6 ? { ok: true, value: [...all.slice(200), { id: '90001', sku: 'LATE-1', bundle: false }] } : undefined)), 'VENDOR_READ_UNSTABLE', 'a product appeared between the scans')
   assert.equal(await run((c, n) => (c.kind === 'page' && c.pageNo === 3 && n > 6 ? { ok: true, value: all.slice(200).map((r, i) => (i === 0 ? { ...r, sku: 'RENAMED-1' } : r)) } : undefined)), 'VENDOR_READ_UNSTABLE', 'a SKU changed under its id')
   assert.equal(await run(() => undefined), 'ok')
 })
@@ -105,7 +105,7 @@ test('TRUNCATION AND DRIFT of the census: a page after the short one that still 
 // [mutation: containment removed]
 test('CONTAINMENT: every product a stock list shows must be in the census with the same SKU (absent is READ_INCOMPLETE, another SKU is IDENTITY_CONFLICT)', async () => {
   const stock = { '5': PROBE_WH5.map(toStockRow) }
-  const census = PROBE_WH5.map((r) => ({ id: String(r.ProductId), sku: r.SKU }))
+  const census = PROBE_WH5.map((r) => ({ id: String(r.ProductId), sku: r.SKU, bundle: r.Bundle }))
   assert.equal(reasonOf(await readWms(fakeWms({ stock, census }), ['5'], { sleep: noSleep })), 'ok')
   assert.equal(reasonOf(await readWms(fakeWms({ stock, census: census.slice(1) }), ['5'], { sleep: noSleep })), 'READ_INCOMPLETE')
   assert.equal(reasonOf(await readWms(fakeWms({ stock, census: census.map((r, i) => (i === 0 ? { ...r, sku: 'ELSE-1' } : r)) }), ['5'], { sleep: noSleep })), 'IDENTITY_CONFLICT')
@@ -139,4 +139,23 @@ test('an empty estate (no stock rows, no products) is reported as such, so a cal
   assert.ok(none.ok && none.value.allEmpty)
   const one = await readWms(fakeWms({ stock: { '5': [], '6': [] }, census: synthetic(1) }), ['5', '6'], { sleep: noSleep })
   assert.ok(one.ok && !one.value.allEmpty)
+})
+
+// [mutation: the bundle flag left out of the cross-warehouse identity check / of the census containment check / of the scan comparison]
+test('THE BUNDLE FLAG IS PART OF IDENTITY: one product flagged a bundle in one warehouse and plain in another (stable across both sweeps), or a census flag that disagrees with a stock list, is IDENTITY_CONFLICT; a census flip between the scans is unstable', async () => {
+  const base = probe()
+  // A census-only style product: a bundle with stock in warehouse 6, plain with zero in warehouse 5 - the same in both sweeps.
+  const stable: FakeWmsData = { stock: { '5': base.stock['5']!.map((r) => (r.sku === '6878843248-24' ? { ...r, bundle: false } : r)), '6': base.stock['6']! } }
+  assert.equal(reasonOf(await readWms(fakeWms(stable), ['5', '6'], { sleep: noSleep })), 'IDENTITY_CONFLICT')
+  // The census disagrees with the stock lists (all of which agree with each other).
+  const census = (flip: string) => [...new Map(Object.values(base.stock).flat().map((r) => [r.productId, { id: r.productId, sku: r.sku, bundle: r.sku === flip ? !r.bundle : r.bundle }] as const)).values()]
+  assert.equal(reasonOf(await readWms(fakeWms({ stock: base.stock, census: census('6878843248-24') }), ['5', '6'], { sleep: noSleep })), 'IDENTITY_CONFLICT', 'a bundle the census calls plain')
+  assert.equal(reasonOf(await readWms(fakeWms({ stock: base.stock, census: census('129552751') }), ['5', '6'], { sleep: noSleep })), 'IDENTITY_CONFLICT', 'a plain product the census calls a bundle')
+  assert.equal(reasonOf(await readWms(fakeWms({ stock: base.stock, census: census('none') }), ['5', '6'], { sleep: noSleep })), 'ok')
+  // The census flag changes between its two scans.
+  const all = census('none')
+  const drift: WmsTweak = (c, n) => (c.kind === 'page' && c.pageNo === 1 && n > 6 ? { ok: true, value: all.map((r) => (r.sku === '129552751' ? { ...r, bundle: true } : r)) } : undefined)
+  assert.equal(reasonOf(await readWms(fakeWms({ stock: base.stock, census: all }, drift), ['5', '6'], { sleep: noSleep })), 'VENDOR_READ_UNSTABLE')
+  // A census row without a boolean flag is unreadable.
+  assert.equal(reasonOf(await readWms(fakeWms({ stock: base.stock, census: all }, (c) => (c.kind === 'page' && c.pageNo === 1 ? { ok: true, value: [{ id: '1', sku: 'A' } as never] } : undefined)), ['5'], { sleep: noSleep })), 'SOURCE_UNREADABLE')
 })

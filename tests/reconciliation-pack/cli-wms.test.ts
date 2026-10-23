@@ -39,7 +39,7 @@ async function mintsoft(): Promise<{ base: string; seen: Seen[] }> {
     if (url.pathname === '/api/Product/List') {
       const limit = Number(url.searchParams.get('Limit')); const page = Number(url.searchParams.get('PageNo'))
       res.writeHead(limit > 100 ? 400 : 200, headers)
-      res.end(JSON.stringify(limit > 100 ? {} : PROBE_WH6.slice((page - 1) * limit, page * limit).map((r) => ({ ID: r.ProductId, SKU: r.SKU, ClientId: r.ClientId }))))
+      res.end(JSON.stringify(limit > 100 ? {} : PROBE_WH6.slice((page - 1) * limit, page * limit).map((r) => ({ ID: r.ProductId, SKU: r.SKU, ClientId: r.ClientId, Bundle: r.Bundle }))))
       return
     }
     res.writeHead(404, headers); res.end('{}')

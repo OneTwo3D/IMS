@@ -142,14 +142,14 @@ test('IDENTITY SWAP: equal counts with two SKUs exchanged is two differences, ne
   const other = equalEstate()
   other.wms.stock['6'] = other.wms.stock['6']!.map((r) => (r.sku === '129552751' ? { ...r, productId: '5555' } : r))
   other.wms.stock['5'] = other.wms.stock['5']!.map((r) => (r.sku === '129552751' ? { ...r, productId: '5555' } : r))
-  other.wms.census = [...new Map([...other.wms.stock['6']!, ...other.wms.stock['5']!].map((r) => [r.productId, { id: r.productId, sku: r.sku }] as const)).values()]
+  other.wms.census = [...new Map([...other.wms.stock['6']!, ...other.wms.stock['5']!].map((r) => [r.productId, { id: r.productId, sku: r.sku, bundle: r.bundle }] as const)).values()]
   assert.deepEqual((await runSettled(setup(other.estate, other.wms).ctx)).reasons, ['IDENTITY_CONFLICT'])
 })
 
 // [mutation: the census check removed, so a product the census lists but the stock list omits is read as a zero]
 test('A PRODUCT THE CENSUS LISTS BUT THE STOCK LIST OMITS cannot be told from a zero: READ_INCOMPLETE for the whole item', async () => {
   const { estate, wms } = equalEstate()
-  wms.census = [...new Map(Object.values(wms.stock).flat().map((r) => [r.productId, { id: r.productId, sku: r.sku }] as const)).values()]
+  wms.census = [...new Map(Object.values(wms.stock).flat().map((r) => [r.productId, { id: r.productId, sku: r.sku, bundle: r.bundle }] as const)).values()]
   wms.stock['6'] = wms.stock['6']!.filter((r) => r.sku !== '22771122402-01')
   const item = await runSettled(setup(estate, wms).ctx)
   assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['READ_INCOMPLETE']])
@@ -329,7 +329,7 @@ test('EMPTY ESTATE: an unconfirmed binding with no products, no stock rows and a
 // [mutation: the census-wide stock-row requirement removed]
 test('EVERY NON-BUNDLE CENSUS PRODUCT NEEDS A STOCK ROW IN EVERY BOUND WAREHOUSE, IMS has it or not: a census SKU absent from IMS and from one warehouse\'s stock list is READ_INCOMPLETE; a bundle is exempt', async () => {
   const stranger = { sku: 'CENSUS-ONLY-1', productId: '777777', onHand: 0, bundle: false }
-  const censusOf = (wms: FakeWmsData) => [...new Map(Object.values(wms.stock).flat().map((r) => [r.productId, { id: r.productId, sku: r.sku }] as const)).values()]
+  const censusOf = (wms: FakeWmsData) => [...new Map(Object.values(wms.stock).flat().map((r) => [r.productId, { id: r.productId, sku: r.sku, bundle: r.bundle }] as const)).values()]
   // In warehouse 5 only: otherwise everything is equal, and IMS knows nothing of it.
   const missing = equalEstate()
   missing.wms.stock['5'] = [...missing.wms.stock['5']!, stranger]
@@ -349,6 +349,6 @@ test('EVERY NON-BUNDLE CENSUS PRODUCT NEEDS A STOCK ROW IN EVERY BOUND WAREHOUSE
   assert.equal((await runSettled(setup(bundle.estate, bundle.wms).ctx)).outcome, 'pass')
   // A census product with no stock row anywhere is just as unproven.
   const nowhere = equalEstate()
-  nowhere.wms.census = [...censusOf(nowhere.wms), { id: '888888', sku: 'NOWHERE-1' }]
+  nowhere.wms.census = [...censusOf(nowhere.wms), { id: '888888', sku: 'NOWHERE-1', bundle: false }]
   assert.deepEqual((await runSettled(setup(nowhere.estate, nowhere.wms).ctx)).reasons, ['READ_INCOMPLETE'])
 })

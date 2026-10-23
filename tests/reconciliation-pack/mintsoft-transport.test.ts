@@ -10,7 +10,7 @@ import {
 import { classifyMintsoftRequest } from '../../lib/connectors/mintsoft/api/read-allowlist.ts'
 import { readWms } from '../../lib/reconciliation-pack/wms-source.ts'
 import { encryptSettingValue } from '../../lib/security/encrypted-settings.ts'
-import { noSleep, PROBE_WH5, PROBE_WH6 } from './wms-fixtures.ts'
+import { noSleep, PROBE_PRODUCT_LIST_ROWS, PROBE_WH5, PROBE_WH6 } from './wms-fixtures.ts'
 
 /**
  * THE MINTSOFT READER over a LOOPBACK HTTP double (no real network: tests/no-outbound-network.cjs refuses anything else).
@@ -50,7 +50,7 @@ const noWriteNoLogin = (rig: Rig) => {
 }
 
 /** A tenant of 12 products as the live API answers it (warehouses 5 and 6), the product list in pages as asked. */
-const PRODUCTS = [...PROBE_WH6].map((r) => ({ ID: r.ProductId, SKU: r.SKU, ClientId: r.ClientId, Name: 'a product' }))
+const PRODUCTS = [...PROBE_WH6].map((r) => ({ ID: r.ProductId, SKU: r.SKU, ClientId: r.ClientId, Bundle: r.Bundle, Name: 'a product' }))
 function tenant(req: http.IncomingMessage, res: http.ServerResponse): void {
   const url = new URL(req.url ?? '/', 'http://x')
   if (url.pathname === '/api/Product/StockLevels') return json(res, url.searchParams.get('WarehouseId') === '5' ? PROBE_WH5 : url.searchParams.get('WarehouseId') === '6' ? PROBE_WH6 : [])
@@ -218,11 +218,12 @@ test('STRICT STOCK ROWS (the connector\'s own reader): a malformed row makes the
 
 test('PRODUCT ROWS: exact fields, one id key, a SKU, and a row that names another client or nothing readable makes the whole page unreadable', async () => {
   const ok = async (body: unknown) => { const rig = await double((_req, res) => json(res, body)); return portFor(rig).productPage(1, 100) }
-  assert.deepEqual(await ok([{ ID: 7, SKU: ' ABC ' }, { ID: '8', SKU: 'DEF', ClientId: 89 }, { Id: 9, SKU: 'GHI', ClientId: null }]), { ok: true, value: [{ id: '7', sku: 'ABC' }, { id: '8', sku: 'DEF' }, { id: '9', sku: 'GHI' }] })
+  assert.deepEqual(await ok([{ ID: 7, SKU: ' ABC ', Bundle: false }, { ID: '8', SKU: 'DEF', ClientId: 89, Bundle: true }, { Id: 9, SKU: 'GHI', ClientId: null, Bundle: false }]), { ok: true, value: [{ id: '7', sku: 'ABC', bundle: false }, { id: '8', sku: 'DEF', bundle: true }, { id: '9', sku: 'GHI', bundle: false }] })
   assert.deepEqual(await ok([]), { ok: true, value: [] })
   for (const [label, body] of [
-    ['not an array', { Message: 'x' }], ['a row that is not an object', [5]], ['no id', [{ SKU: 'A' }]], ['two id keys', [{ ID: 1, Id: 1, SKU: 'A' }]], ['id zero', [{ ID: 0, SKU: 'A' }]], ['id fractional', [{ ID: 1.5, SKU: 'A' }]],
-    ['id text with letters', [{ ID: '1a', SKU: 'A' }]], ['no SKU', [{ ID: 1 }]], ['blank SKU', [{ ID: 1, SKU: '  ' }]], ['SKU not a string', [{ ID: 1, SKU: 5 }]], ['another client', [{ ID: 1, SKU: 'A', ClientId: 90 }]],
+    ['not an array', { Message: 'x' }], ['a row that is not an object', [5]], ['no id', [{ SKU: 'A', Bundle: false }]], ['two id keys', [{ ID: 1, Id: 1, SKU: 'A', Bundle: false }]], ['id zero', [{ ID: 0, SKU: 'A', Bundle: false }]], ['id fractional', [{ ID: 1.5, SKU: 'A', Bundle: false }]],
+    ['id text with letters', [{ ID: '1a', SKU: 'A', Bundle: false }]], ['no SKU', [{ ID: 1, Bundle: false }]], ['blank SKU', [{ ID: 1, SKU: '  ', Bundle: false }]], ['SKU not a string', [{ ID: 1, SKU: 5, Bundle: false }]], ['another client', [{ ID: 1, SKU: 'A', ClientId: 90, Bundle: false }]],
+    ['no Bundle flag', [{ ID: 1, SKU: 'A' }]], ['Bundle a string', [{ ID: 1, SKU: 'A', Bundle: 'false' }]],
   ] as Array<[string, unknown]>) assert.deepEqual(await ok(body), { ok: false, reason: 'SOURCE_UNREADABLE' }, label)
 })
 
@@ -332,4 +333,14 @@ test('the whole chain from stored rows to the port works end to end against loop
   assert.ok(walked.ok)
   noWriteNoLogin(rig)
   assert.ok(!JSON.stringify(walked).includes(KEY))
+})
+
+test('THE LIVE PRODUCT-LIST SHAPE (rows copied verbatim from the 2026-10-23 probe) parses: ID, SKU, Bundle and ClientId are read, DisCont and every other field are ignored', async () => {
+  const rig = await double((_req, res) => json(res, PROBE_PRODUCT_LIST_ROWS))
+  const page = await portFor(rig).productPage(1, 100)
+  assert.deepEqual(page, { ok: true, value: [
+    { id: '263881', sku: '22771122402-02', bundle: false }, ...PROBE_PRODUCT_LIST_ROWS.slice(1).map((r) => ({ id: String(r.ID), sku: String(r.SKU), bundle: r.Bundle as boolean })),
+  ] })
+  assert.equal(PROBE_PRODUCT_LIST_ROWS[0]!.DisCont, true, 'precondition: a discontinued product is in the fixture and is read like any other')
+  assert.deepEqual(PROBE_PRODUCT_LIST_ROWS.map((r) => r.Bundle), [false, false, true, false])
 })
