@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { lockPackScheduleSettings } from '@/lib/reconciliation-pack/schedule-lock'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import {
   ACCOUNTING_BINDING_PIN_SETTING_KEYS,
@@ -323,6 +324,8 @@ async function clearFullScope() {
   // connecting again) and never a token with no pin (the halt).
   await db.$transaction(async (tx) => {
     await lockIntegrationPluginSelection(tx)
+    // This wipe deletes the scheduled reconciliation pack's rows with the rest: fenced like every other writer of them.
+    await lockPackScheduleSettings(tx)
     await runOrderedAccountingBindingWrites({
       pin: () => tx.setting.deleteMany({ where: { key: { in: [...ACCOUNTING_BINDING_PIN_SETTING_KEYS] } } }),
       token: () => tx.accountingToken.deleteMany({}),

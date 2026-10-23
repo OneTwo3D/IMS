@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
 
@@ -6,6 +7,7 @@ import { getAllCronJobs } from '../../lib/cron-jobs'
 import { buildOtiCrontabBlock, extractOtiBlock, spliceOtiBlock, type CrontabJobDef } from '../../lib/crontab-sync'
 import { settingKeyWriteRefusal } from '../../lib/domain/settings/writable-setting-keys'
 import { apiRouteAuthPolicy } from '../../lib/security/route-auth-policy'
+import { RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY } from '../../lib/db/advisory-locks'
 import { PACK_COMMAND } from '../../lib/reconciliation-pack/constants'
 import {
   PACK_SCHEDULE_NPM_SCRIPT, PACK_SCHEDULE_DEFAULT_CRON, PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_SETTING_KEY, PACK_SCHEDULE_SLUG,
@@ -109,11 +111,12 @@ test('the phase and the vendor option cannot be written by the generic settings 
 })
 
 // --- the action itself, over doubles ---
-const state = { writes: [] as string[], deletes: [] as string[], permissions: [] as string[], logged: [] as string[], logThrows: false }
+const state = { raw: [] as string[], writes: [] as string[], deletes: [] as string[], permissions: [] as string[], logged: [] as string[], logThrows: false }
 mock.module('@/lib/db', {
   namedExports: {
     db: {
       $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
+        $executeRaw: async (query: TemplateStringsArray, ...values: unknown[]) => { state.raw.push(`${query.join('?')}|${values.join(',')}|writes=${state.writes.length + state.deletes.length}`) },
         setting: {
           upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { state.writes.push(`${where.key}=${create.value}`) },
           deleteMany: async ({ where }: { where: { key: string } }) => { state.deletes.push(where.key) },
@@ -128,10 +131,11 @@ mock.module('@/lib/crontab-reconcile', { namedExports: { reconcileCrontab: async
 
 test('saveReconciliationPackScheduleOptions: validated, gated, writes only its two rows, never the crontab', async () => {
   const { saveReconciliationPackScheduleOptions } = await import('../../app/actions/cron')
-  const reset = () => { state.writes = []; state.deletes = []; state.permissions = []; state.logged = []; state.logThrows = false }
+  const reset = () => { state.raw = []; state.writes = []; state.deletes = []; state.permissions = []; state.logged = []; state.logThrows = false }
   reset()
   assert.deepEqual(await saveReconciliationPackScheduleOptions({ phase: 'P1', vendorReads: false }), { status: 'saved' })
   assert.deepEqual(state.permissions, ['settings.company'])
+  assert.deepEqual(state.raw, [`SELECT pg_advisory_xact_lock(?)|${RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY}|writes=0`], 'the settings fence is taken first, before any row is written')
   assert.deepEqual(state.writes.sort(), [`${PACK_SCHEDULE_PHASE_SETTING}=P1`, `${PACK_SCHEDULE_VENDOR_READS_SETTING}=false`])
   reset()
   await saveReconciliationPackScheduleOptions({ phase: '', vendorReads: true })
@@ -152,4 +156,23 @@ test('saveReconciliationPackScheduleOptions: validated, gated, writes only its t
   const result = await saveReconciliationPackScheduleOptions({ phase: 'P2', vendorReads: false })
   assert.equal(result.status, 'post-commit-failed')
   assert.equal(state.writes.length, 2)
+})
+
+test('every writer of the job\'s rows takes the settings fence first in its save transaction (source census)', () => {
+  const cron = readFileSync('app/actions/cron.ts', 'utf8')
+  // saveCronJobSettings: only when the job is among the changes, before any upsert
+  const save = cron.slice(cron.indexOf('export async function saveCronJobSettings'), cron.indexOf('export type CrontabDriftStatus'))
+  const tx = save.slice(save.indexOf('await db.$transaction'))
+  assert.match(tx, /touchesPack = |if \(touchesPack\) await lockPackScheduleSettings\(tx\)/)
+  assert.ok(tx.indexOf('lockPackScheduleSettings(tx)') < tx.indexOf('tx.setting.upsert'))
+  assert.match(save, /jobs\.some\(\(job\) => job\.settingKey === PACK_SCHEDULE_SETTING_KEY\)/)
+  // the options action
+  const options = cron.slice(cron.indexOf('export async function saveReconciliationPackScheduleOptions'))
+  assert.ok(options.indexOf('lockPackScheduleSettings(tx)') > 0 && options.indexOf('lockPackScheduleSettings(tx)') < options.indexOf('tx.setting.'))
+  // the factory reset wipes every settings row, so it is a writer of them too
+  const reset = readFileSync('app/actions/reset.ts', 'utf8')
+  assert.ok(reset.indexOf('lockPackScheduleSettings(tx)') > 0 && reset.indexOf('lockPackScheduleSettings(tx)') < reset.indexOf("tx.setting.deleteMany({ where: { key: { notIn:"))
+  // and no OTHER module writes a cron_reconciliation_pack row or the two option keys
+  const hits = execSync("grep -rlE \"reconciliation_pack_schedule_(phase|vendor_reads)|PACK_SCHEDULE_(PHASE|VENDOR_READS|ENABLED)_SETTING|cron_reconciliation_pack\" app lib scripts --include=*.ts --include=*.tsx --include=*.mjs || true", { encoding: 'utf8' }).split('\n').filter(Boolean).sort()
+  assert.deepEqual(hits, ['app/actions/cron.ts', 'lib/ops/reconciliation-pack-schedule.ts', 'lib/reconciliation-pack/schedule-constants.ts', 'app/(dashboard)/settings/system/page.tsx'].sort())
 })

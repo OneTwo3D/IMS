@@ -123,6 +123,17 @@ export const ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY = 918_274_233
 export const RECONCILIATION_PACK_SCHEDULE_LOCK_KEY = 918_274_301
 
 /**
+ * The SCHEDULED RECONCILIATION PACK's SETTINGS FENCE (transaction-scoped, `pg_advisory_xact_lock`).
+ *
+ * Taken first inside the save transaction of every writer of the job's rows (its enable switch, its schedule, its phase and its
+ * vendor-reads option: saveCronJobSettings when the job is among the changes, saveReconciliationPackScheduleOptions, and the
+ * factory reset), and by the runner in the short transaction in which it re-reads those rows immediately before starting the
+ * child. A save therefore waits only for that short read, the runner waits only for one save, and no save ever waits for a running
+ * child (the run holds the session lock above, which no writer takes). Distinct from the session lock; shares nothing.
+ */
+export const RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY = 918_274_302
+
+/**
  * THERE IS NO CRONTAB LOCK IN THIS REGISTRY, AND THAT IS THE POINT (Codex r22 HIGH).
  *
  * A round of review put one here — `CRONTAB_RECONCILE_LOCK_KEY = 918_274_234`, a session advisory
@@ -150,6 +161,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   COMPONENT_GRAPH_WRITE_LOCK_KEY,
   ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY,
   RECONCILIATION_PACK_SCHEDULE_LOCK_KEY,
+  RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY,
 } as const
 
 /**

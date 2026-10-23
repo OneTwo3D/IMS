@@ -13,7 +13,7 @@ import {
 } from '@/lib/reconciliation-pack/constants'
 import {
   PACK_SCHEDULE_NOT_A_FAULT_CODES, PACK_SCHEDULE_FAILURES, PACK_SCHEDULE_PHASES, PACK_SCHEDULE_RECORD_VERSION, PACK_SCHEDULE_REFUSALS,
-  PACK_SCHEDULE_RUN_ID_RE, type PackScheduleFailure, type PackScheduleOutcome, type PackSchedulePhase, type PackScheduleRefusal,
+  type PackScheduleFailure, type PackScheduleOutcome, type PackSchedulePhase, type PackScheduleRefusal,
 } from '@/lib/reconciliation-pack/schedule-constants'
 
 export type ScheduleSettings =
@@ -70,16 +70,6 @@ export function parsePackOutput(stderr: string): ParsedPackOutput {
   return out
 }
 
-/** The sequence a published report records, or null for anything that is not exactly a positive safe integer next to the right run id. */
-export function sequenceOfReport(jsonText: string, runId: string): number | null {
-  try {
-    const parsed = JSON.parse(jsonText) as { runId?: unknown; sequence?: unknown }
-    if (typeof parsed !== 'object' || parsed === null) return null
-    if (parsed.runId !== runId || !PACK_SCHEDULE_RUN_ID_RE.test(runId)) return null
-    return typeof parsed.sequence === 'number' && Number.isSafeInteger(parsed.sequence) && parsed.sequence >= 1 ? parsed.sequence : null
-  } catch { return null }
-}
-
 /** The ONE record of a scheduled run or of a refused or failed start. Closed codes and counts only. */
 export type ScheduledRunRecord = {
   schemaVersion: typeof PACK_SCHEDULE_RECORD_VERSION
@@ -123,7 +113,7 @@ export type ChildEnd = { exitCode: number | null; timedOut: boolean; stderr: str
  * the runner before the pack starts (a missing module, say) exits 1 too, and must not be read as the pack's `fail`.
  * Exit 2 is a refusal (the code it printed), 3 a report that was not published, 4 an internal failure; those two print a code too.
  */
-export function classifyChildEnd(base: RecordBase, end: ChildEnd, sequence: (parsed: ParsedPackOutput) => number | null): ScheduledRunRecord {
+export function classifyChildEnd(base: RecordBase, end: ChildEnd, verify: (parsed: ParsedPackOutput, exitCode: number) => { sequence: number } | null): ScheduledRunRecord {
   const common = { schemaVersion: PACK_SCHEDULE_RECORD_VERSION as 1, ...base }
   const failed = (code: PackScheduleFailure, exitCode: number | null, parsed?: ParsedPackOutput): ScheduledRunRecord => ({
     ...common, outcome: 'failed', code, codeMeaning: PACK_SCHEDULE_FAILURES[code], exitCode, exitMeaning: exitMeaningOf(exitCode),
@@ -136,9 +126,13 @@ export function classifyChildEnd(base: RecordBase, end: ChildEnd, sequence: (par
   const parsed = parsePackOutput(end.stderr)
   if (row.name === 'all-pass' || row.name === 'fail' || row.name === 'inconclusive') {
     if (parsed.runId === null || parsed.reportJson === null || parsed.reportMarkdown === null) return failed('EXIT_WITHOUT_REPORT', end.exitCode, parsed)
+    // Published only after a VERIFIED read of the named report (the pack's own reader, run id, digests, sequence, exit code).
+    let verified: { sequence: number } | null = null
+    try { verified = verify(parsed, row.code) } catch { verified = null }
+    if (verified === null || !Number.isSafeInteger(verified.sequence) || verified.sequence < 1) return failed('REPORT_UNVERIFIED', end.exitCode, parsed)
     return {
       ...common, outcome: 'published', code: row.name, codeMeaning: row.meaning, exitCode: row.code, exitMeaning: row.meaning,
-      runId: parsed.runId, sequence: sequence(parsed), reportJson: parsed.reportJson, reportMarkdown: parsed.reportMarkdown,
+      runId: parsed.runId, sequence: verified.sequence, reportJson: parsed.reportJson, reportMarkdown: parsed.reportMarkdown,
     }
   }
   // refused (2), report-not-published (3), internal (4)

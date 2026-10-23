@@ -19,7 +19,8 @@ import { getAllCronJobs } from '@/lib/cron-jobs'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { runPostCommit } from '@/lib/domain/post-commit'
 import { combinePostCommitOutcomes, type SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
-import { PACK_SCHEDULE_PHASES, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_VENDOR_READS_SETTING } from '@/lib/reconciliation-pack/schedule-constants'
+import { lockPackScheduleSettings } from '@/lib/reconciliation-pack/schedule-lock'
+import { PACK_SCHEDULE_PHASES, PACK_SCHEDULE_SETTING_KEY, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_VENDOR_READS_SETTING } from '@/lib/reconciliation-pack/schedule-constants'
 
 /**
  * Reconcile the OS crontab from the stored cron_* settings, behind the permission gate.
@@ -92,7 +93,11 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
   })
   if (entries.length === 0) return { status: 'saved' }
 
+  // The scheduled reconciliation pack re-reads its switch, schedule, phase and vendor option under this fence just before it starts
+  // a run, so a save that changes any of them takes it first (and waits only for that short read, never for a running child).
+  const touchesPack = jobs.some((job) => job.settingKey === PACK_SCHEDULE_SETTING_KEY)
   await db.$transaction(async (tx) => {
+    if (touchesPack) await lockPackScheduleSettings(tx)
     for (const [key, value] of entries) {
       await tx.setting.upsert({
         where: { key },
@@ -153,6 +158,7 @@ export async function saveReconciliationPackScheduleOptions(input: Reconciliatio
   if (typeof input.vendorReads !== 'boolean') throw new Error('The WooCommerce option must be on or off.')
 
   await db.$transaction(async (tx) => {
+    await lockPackScheduleSettings(tx)
     if (phase === '') await tx.setting.deleteMany({ where: { key: PACK_SCHEDULE_PHASE_SETTING } })
     else {
       await tx.setting.upsert({

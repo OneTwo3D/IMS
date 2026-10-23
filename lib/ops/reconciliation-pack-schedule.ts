@@ -1,4 +1,4 @@
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from 'node:fs'
+import path from 'node:path'
 
 import { logActivityPersisted } from '@/lib/activity-log'
 import { acquirePinnedAdvisoryLockOrNull, type PinnedAdvisoryLock } from '@/lib/db/pinned-advisory-lock'
@@ -6,9 +6,13 @@ import { RECONCILIATION_PACK_SCHEDULE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
 import { buildChildEnv, runNpmScript, type ChildResult, type ChildSpec } from '@/lib/ops/readiness-gate-collect'
 import { VENDOR_ENV } from '@/lib/reconciliation-pack/cli'
-import { MAX_REPORT_JSON_BYTES } from '@/lib/reconciliation-pack/constants'
+import { checkAncestors, readTrustedRegularFileBytes } from '@/lib/ops/published-report'
+import { DEFAULT_PACK_REPORT_DIR, MAX_EVIDENCE_BYTES, MAX_REPORT_JSON_BYTES, PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN } from '@/lib/reconciliation-pack/constants'
+import { RUN_ID_RE, parseReport, sha256Hex, verifyEvidence } from '@/lib/reconciliation-pack/report'
+import { lockPackScheduleSettings } from '@/lib/reconciliation-pack/schedule-lock'
+import { db } from '@/lib/db'
 import {
-  classifyChildEnd, isNotAFault, parseScheduleSettings, refusalRecord, scheduledPackArgs, sequenceOfReport,
+  classifyChildEnd, isNotAFault, parseScheduleSettings, refusalRecord, scheduledPackArgs,
   type ParsedPackOutput, type ScheduledRunRecord,
 } from '@/lib/reconciliation-pack/schedule'
 import {
@@ -56,12 +60,14 @@ export type ScheduledPackOutcome = {
 export type ScheduledPackDeps = {
   now?: () => number
   readSettings?: (keys: string[]) => Promise<Map<string, string>>
+  /** The final read under the settings fence (default: a short transaction holding the settings advisory lock). */
+  readFinalSettings?: (keys: string[]) => Promise<Map<string, string>>
   acquireLock?: () => Promise<Pick<PinnedAdvisoryLock, 'release'> | null>
   /** True when a run that reads a vendor may start now. */
   vendorGate?: () => Promise<boolean>
   runChild?: (spec: ChildSpec) => Promise<ChildResult>
-  /** The report JSON text of a run id, or null when it cannot be read. */
-  readReport?: (parsed: ParsedPackOutput) => string | null
+  /** The verified report the command named (see verifyNamedPackReport), or null when it does not verify. */
+  verifyReport?: (parsed: ParsedPackOutput, exitCode: number) => { sequence: number } | null
   env?: Record<string, string | undefined>
   cwd?: string
   log?: typeof logActivityPersisted
@@ -80,25 +86,40 @@ export function scheduledChildEnv(source: Record<string, string | undefined>, ve
   return env
 }
 
-/** Read a published report: a real file (never a symlink), no larger than the pack's own limit. */
-export function readPublishedReport(parsed: ParsedPackOutput): string | null {
-  if (parsed.reportJson === null) return null
-  let fd: number | null = null
+/**
+ * THE FINAL READ: a short transaction that takes the settings fence and reads the job's three rows from the database. Writers of the
+ * rows hold the fence only for their own save transaction, so this waits for at most one save and never for a running child.
+ */
+export async function readSettingsUnderFence(keys: string[]): Promise<Map<string, string>> {
+  return db.$transaction(async (tx) => {
+    await lockPackScheduleSettings(tx)
+    return getSettingValues(keys, tx)
+  }, { timeout: 15_000, maxWait: 10_000 })
+}
+
+/**
+ * A report counts as published only after the pack's own reader verifies it: the JSON parses under the report grammar, names the run
+ * id the command printed (and the directory it sits in), the Markdown it names has the digest the JSON records, the evidence has the
+ * digest, line count and content the JSON records, the sequence is a positive integer, and the exit code the JSON derived is the
+ * exit code the command ended with. Files are read as trusted regular files (never symlinks, owned by root or this account).
+ */
+export function verifyNamedPackReport(parsed: ParsedPackOutput, exitCode: number, reportDir: string = DEFAULT_PACK_REPORT_DIR): { sequence: number } | null {
   try {
-    fd = openSync(parsed.reportJson, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
-    const info = fstatSync(fd)
-    if (!info.isFile() || info.size > MAX_REPORT_JSON_BYTES) return null
-    const buffer = Buffer.alloc(info.size)
-    let read = 0
-    while (read < info.size) {
-      const n = readSync(fd, buffer, read, info.size - read, read)
-      if (n === 0) break
-      read += n
-    }
-    return buffer.subarray(0, read).toString('utf8')
-  } catch { return null } finally {
-    if (fd !== null) { try { closeSync(fd) } catch { /* nothing to close */ } }
-  }
+    if (parsed.runId === null || !RUN_ID_RE.test(parsed.runId)) return null
+    if (checkAncestors(reportDir, 'report directory') !== null) return null
+    const dir = path.join(reportDir, parsed.runId)
+    const jsonBytes = readTrustedRegularFileBytes(path.join(dir, PACK_REPORT_JSON), MAX_REPORT_JSON_BYTES)
+    const record = parseReport(jsonBytes.toString('utf8'))
+    if (record.runId !== parsed.runId) return null
+    const markdown = readTrustedRegularFileBytes(path.join(dir, PACK_REPORT_MARKDOWN), MAX_REPORT_JSON_BYTES)
+    if (sha256Hex(markdown) !== record.companionMarkdownSha256) return null
+    const evidence = readTrustedRegularFileBytes(path.join(dir, PACK_EVIDENCE_FILE), MAX_EVIDENCE_BYTES)
+    verifyEvidence(evidence.toString('utf8'), record)
+    if (sha256Hex(evidence) !== record.evidence.sha256) return null
+    if (!Number.isSafeInteger(record.sequence) || record.sequence < 1) return null
+    if (record.exitCode !== exitCode) return null
+    return { sequence: record.sequence }
+  } catch { return null }
 }
 
 const levelOf = (record: ScheduledRunRecord): 'INFO' | 'WARNING' | 'ERROR' => {
@@ -179,25 +200,41 @@ export async function runScheduledReconciliationPack(scheduleRunId: string, deps
       if (!allowed) return await refuse('VENDOR_READS_TOO_SOON')
     }
 
-    // 6. The operator's command, as a child.
+    // 6. THE FINAL READ, under the settings fence. Everything above waited on something (the lock, the rate gate), so the values
+    // read at the top may be stale: a disable or a vendor-off saved meanwhile must not be followed by a start that uses them. Every
+    // writer of the four rows takes the same transaction-scoped advisory lock in its save, so this short transaction either sees
+    // that save's committed rows or waits for it; it reads the rows from the database (not a cache) and the child starts
+    // immediately with exactly these values. Vendor reads are conservative: they run only if the top read said on (and the gate
+    // above was consulted for it) AND this read still says on; a turned-off option runs the pack without the flag and without the
+    // keys, a newly turned-on one waits for the next start.
+    let finalSettings: Map<string, string>
+    try {
+      finalSettings = await (deps.readFinalSettings ?? readSettingsUnderFence)([PACK_SCHEDULE_ENABLED_SETTING, PACK_SCHEDULE_PHASE_SETTING, PACK_SCHEDULE_VENDOR_READS_SETTING])
+    } catch {
+      return await refuse('SETTINGS_UNREADABLE')
+    }
+    const last = parseScheduleSettings({ phase: finalSettings.get(PACK_SCHEDULE_PHASE_SETTING), vendorReads: finalSettings.get(PACK_SCHEDULE_VENDOR_READS_SETTING) })
+    phase = last.ok ? last.phase : null
+    vendorReads = parsed.vendorReads && last.vendorReads
+    if (!resolveCronEnablement({ canonical: finalSettings.get(PACK_SCHEDULE_ENABLED_SETTING), legacy: undefined, hasLegacyKey: false, defaultEnabled: PACK_SCHEDULE_DEFAULT_ENABLED })) return await refuse('SCHEDULE_DISABLED')
+    if (!last.ok) return await refuse(last.refusal)
+
+    // 7. The operator's command, as a child.
     let ended: ChildResult
     try {
       ended = await (deps.runChild ?? runNpmScript)({
         script: PACK_SCHEDULE_NPM_SCRIPT,
         silent: true,
-        args: scheduledPackArgs(parsed.phase, parsed.vendorReads),
-        env: scheduledChildEnv(deps.env ?? process.env, parsed.vendorReads),
+        args: scheduledPackArgs(last.phase, vendorReads),
+        env: scheduledChildEnv(deps.env ?? process.env, vendorReads),
         cwd: deps.cwd ?? process.cwd(),
         timeoutMs: PACK_SCHEDULE_CHILD_TIMEOUT_MS,
       })
     } catch {
       ended = { exitCode: null, stdout: '', stderr: '', timedOut: false }
     }
-    const readReport = deps.readReport ?? readPublishedReport
-    const record = classifyChildEnd(base(), { exitCode: ended.exitCode, timedOut: ended.timedOut, stderr: ended.stderr }, (output) => {
-      const text = readReport(output)
-      return text === null || output.runId === null ? null : sequenceOfReport(text, output.runId)
-    })
+    const verifyReport = deps.verifyReport ?? ((output: ParsedPackOutput, exitCode: number) => verifyNamedPackReport(output, exitCode))
+    const record = classifyChildEnd(base(), { exitCode: ended.exitCode, timedOut: ended.timedOut, stderr: ended.stderr }, verifyReport)
     return await finish(record)
   } finally {
     await lock.release().catch(() => undefined)

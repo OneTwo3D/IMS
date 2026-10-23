@@ -56,6 +56,7 @@ export const PACK_SCHEDULE_FAILURES = {
   CHILD_TIMED_OUT: 'the command did not finish in time and was killed',
   EXIT_WITHOUT_REPORT: 'the command exited with a code that means a report was published, but it named no report in the report directory (it may have failed before the pack ran)',
   EXIT_CODE_UNKNOWN: 'the command exited with a code the pack does not define',
+  REPORT_UNVERIFIED: 'the command exited with a code that means a report was published and named one, but the pack\'s own reader does not verify it (it is missing or unreadable, is not valid, its digests do not match, it names another run, its sequence is not a positive integer, or its exit code is not the command\'s)',
   NO_CODE_PRINTED: 'the command refused or stopped, but printed no code the pack defines',
 } as const
 export type PackScheduleFailure = keyof typeof PACK_SCHEDULE_FAILURES

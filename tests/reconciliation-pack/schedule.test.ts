@@ -7,7 +7,7 @@ import {
 } from '../../lib/reconciliation-pack/constants'
 import { assertClosedRecord } from './schedule-helpers'
 import {
-  classifyChildEnd, isNotAFault, parsePackOutput, parseScheduleSettings, refusalRecord, scheduledPackArgs, sequenceOfReport,
+  classifyChildEnd, isNotAFault, parsePackOutput, parseScheduleSettings, refusalRecord, scheduledPackArgs,
   type ScheduledRunRecord,
 } from '../../lib/reconciliation-pack/schedule'
 import {
@@ -18,7 +18,7 @@ const RUN_ID = '20261023T030000Z-0123456789ab'
 const dir = `${DEFAULT_PACK_REPORT_DIR}/${RUN_ID}`
 const published = `Report: ${dir}/${PACK_REPORT_JSON}\nReport: ${dir}/${PACK_REPORT_MARKDOWN}\n`
 const BASE = { scheduleRunId: '11111111-2222-4333-8444-555555555555', phase: 'P1' as const, vendorReads: false, durationMs: 1234 }
-const classify = (exitCode: number | null, stderr: string, timedOut = false, sequence: number | null = 7) => classifyChildEnd(BASE, { exitCode, timedOut, stderr }, () => sequence)
+const classify = (exitCode: number | null, stderr: string, timedOut = false, sequence: number | null = 7) => classifyChildEnd(BASE, { exitCode, timedOut, stderr }, () => (sequence === null ? null : { sequence }))
 
 test('settings: there is no default phase, and the vendor option is on only for the exact word true', () => {
   for (const absent of [undefined, null, '']) assert.deepEqual(parseScheduleSettings({ phase: absent, vendorReads: undefined }), { ok: false, refusal: 'PHASE_NOT_SET', vendorReads: false })
@@ -70,14 +70,6 @@ test('output parsing: only a code from the pack\'s own tables and a report path 
   assert.deepEqual([mixed.runId, mixed.reportJson, mixed.reportMarkdown], [null, null, null])
 })
 
-test('sequence: a positive safe integer from the report of the same run id, otherwise null', () => {
-  assert.equal(sequenceOfReport(JSON.stringify({ runId: RUN_ID, sequence: 12 }), RUN_ID), 12)
-  for (const text of [JSON.stringify({ runId: RUN_ID, sequence: 0 }), JSON.stringify({ runId: RUN_ID, sequence: -1 }), JSON.stringify({ runId: RUN_ID, sequence: 1.5 }), JSON.stringify({ runId: RUN_ID, sequence: '3' }),
-    JSON.stringify({ runId: '20261023T030000Z-ffffffffffff', sequence: 3 }), JSON.stringify({ sequence: 3 }), 'not json', '[]', 'null', JSON.stringify({ runId: RUN_ID, sequence: 2 ** 60 })]) {
-    assert.equal(sequenceOfReport(text, RUN_ID), null, text)
-  }
-})
-
 test('how a started command ended: every exit code of the pack, with the meaning the pack gives it', () => {
   const rows: Array<[number, string, string]> = [[0, 'published', 'all-pass'], [1, 'published', 'fail'], [5, 'published', 'inconclusive']]
   for (const [exit, outcome, code] of rows) {
@@ -86,8 +78,16 @@ test('how a started command ended: every exit code of the pack, with the meaning
     assert.equal(record.exitMeaning, PACK_EXIT_CODES.find((row) => row.code === exit)!.meaning)
     assert.equal(record.codeMeaning, record.exitMeaning)
   }
-  // a published report whose sequence cannot be read is still published; the sequence is null, not guessed
-  assert.equal(classify(0, published, false, null).sequence, null)
+  // a report that does not verify is NEVER published, whatever the exit code and the printed paths say
+  for (const exit of [0, 1, 5]) {
+    const unverified = classify(exit, published, false, null)
+    assert.deepEqual([unverified.outcome, unverified.code, unverified.exitCode, unverified.runId, unverified.sequence], ['failed', 'REPORT_UNVERIFIED', exit, null, null])
+  }
+  for (const bad of [0, -1, 1.5, Number.NaN]) {
+    const record = classifyChildEnd(BASE, { exitCode: 0, timedOut: false, stderr: published }, () => ({ sequence: bad }))
+    assert.equal(record.code, 'REPORT_UNVERIFIED', String(bad))
+  }
+  assert.equal(classifyChildEnd(BASE, { exitCode: 0, timedOut: false, stderr: published }, () => { throw new Error('boom') }).code, 'REPORT_UNVERIFIED')
   // refused / not published / internal: the code the command printed
   const refused = classify(2, 'Refused: LOCK_HELD\nthe text\n')
   assert.deepEqual([refused.outcome, refused.code, refused.exitCode, refused.codeMeaning, refused.runId], ['refused', 'LOCK_HELD', 2, PACK_CHAIN_CODES.LOCK_HELD, null])
