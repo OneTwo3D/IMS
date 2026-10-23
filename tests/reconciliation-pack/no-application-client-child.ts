@@ -7,6 +7,10 @@ const modules = [
   '../../lib/reconciliation-pack/run.ts',
   '../../lib/reconciliation-pack/ims-readers.ts',
   '../../lib/reconciliation-pack/liveness.ts',
+  '../../lib/reconciliation-pack/vendor-items.ts',
+  '../../lib/reconciliation-pack/woo-source.ts',
+  '../../lib/reconciliation-pack/woo-transport.ts',
+  '../../lib/reconciliation-pack/woo-credentials.ts',
   '../../lib/reconciliation-pack/trend.ts',
   '../../lib/ops/readiness-gate-pack.ts',
 ]

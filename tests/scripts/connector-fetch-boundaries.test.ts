@@ -47,6 +47,17 @@ test('connector fetch boundary guard blocks raw fetch in connector paths', (t) =
   assert.match(result.stderr, /lib\/connectors\/example\.ts:1/)
 })
 
+// [mutation: lib/reconciliation-pack removed from the guard's targets]
+test('connector fetch boundary guard covers the reconciliation pack, whose vendor transport must use connectorFetch', (t) => {
+  const root = createRoot(t)
+  writeFixture(root, 'lib/reconciliation-pack/woo-transport.ts', 'export async function bad() { return fetch("https://example.test") }\n')
+  const bad = runGuard(root)
+  assert.equal(bad.status, 1)
+  assert.match(bad.stderr, /lib\/reconciliation-pack\/woo-transport\.ts:1/)
+  writeFixture(root, 'lib/reconciliation-pack/woo-transport.ts', 'export async function ok() { return connectorFetch("https://example.test", {}, { connectorName: "Example" }) }\n')
+  assert.equal(runGuard(root).status, 0)
+})
+
 test('connector fetch boundary guard allows connectorFetch calls', (t) => {
   const root = createRoot(t)
   writeFixture(root, 'lib/connectors/example.ts', 'export async function ok() { return connectorFetch("https://example.test", {}, { connectorName: "Example" }) }\n')

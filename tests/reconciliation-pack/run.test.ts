@@ -26,7 +26,9 @@ function plan(over: Partial<RunPlan> & { invariant?: () => Promise<unknown> } = 
     ...rest,
   }
 }
-const outcome = (items: Array<{ id: string; outcome: string; reasons: readonly string[] }>, id: string) => items.find((i) => i.id === id)!
+/** The explicit opt-in. A runner that stands in for a vendor item only runs on a plan that has it. */
+const vendorOn = (over: Partial<RunPlan> = {}): Partial<RunPlan> => ({ ...over, context: { ...plan().context, vendorReads: true } })
+const outcome = (items: Array<{ id: string; outcome: string; reasons: readonly string[]; sources?: readonly string[] }>, id: string) => items.find((i) => i.id === id)!
 
 test('P0: R3, R4 and R15 pass from a clean report and every other item is not-applicable, so the run exits 0', async () => {
   const dir = scratchDir(bases)
@@ -42,7 +44,8 @@ test('P1: R6 passes on a balanced settled basis; R10 is inconclusive without a w
   const { items, streams } = await runItems(plan())
   assert.deepEqual(items.filter((i) => i.outcome === 'pass').map((i) => i.id), ['R3', 'R4', 'R6', 'R15'])
   assert.deepEqual([outcome(items, 'R10').outcome, outcome(items, 'R10').reasons], ['inconclusive', ['SOURCE_UNREADABLE']])
-  for (const id of ['R1', 'R2', 'R5', 'R9', 'R12', 'R13', 'R14']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['NO_RUNNER']], id)
+  for (const id of ['R9', 'R13']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['VENDOR_READS_OFF'], []], `${id}: vendor reads are off unless the run asks`)
+  for (const id of ['R1', 'R2', 'R5', 'R12', 'R14']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['NO_RUNNER']], id)
   for (const id of ['R7', 'R8', 'R11']) assert.equal(outcome(items, id).outcome, 'not-applicable', id)
   assert.deepEqual(streams.map((s) => s.stream), ['xero-balance-snapshots'])
   const published = publishPackReport(dir, { runId: '20261020T120000Z-aaaaaaaaaaaa', systemIdentifier: '7000000000000000001', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items })
@@ -202,7 +205,7 @@ test('a runner that throws, names another item, or returns something the report 
     R13: async () => ({ id: 'R13', outcome: 'pass', reasons: [], proof: { kind: 'proven-empty', source: 'vendor-total-zero' }, sources: ['woocommerce-api', 'xero-api'], entries: { onlyIms: [{ key: 'A1', ims: null, vendor: null, delta: null }] } }),
   }
   const ledgerRunners: Partial<Record<'R6' | 'R10', LedgerRunner>> = { R6: async () => { throw new Error('secret value') }, R10: async () => passItem('R6') }
-  const { items } = await runItems(plan({ runners, ledgerRunners, liveness: seq(reduceStatusReport(goodReport())) }))
+  const { items } = await runItems(plan({ runners, ledgerRunners, liveness: seq(reduceStatusReport(goodReport())), ...vendorOn() }))
   for (const id of ['R1', 'R2', 'R5', 'R9', 'R13', 'R6', 'R10']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['INTERNAL_ERROR']], id)
   assert.equal(outcome(items, 'R3').outcome, 'pass', 'the others are untouched')
   assert.ok(!JSON.stringify(items).includes('secret value'))
@@ -211,7 +214,7 @@ test('a runner that throws, names another item, or returns something the report 
 test('a runner cannot loosen its own test: a pass the report refuses never reaches a published pass', async () => {
   const dir = scratchDir(bases)
   const runners: Partial<Record<PackItemId, ItemRunner>> = { R1: async () => ({ id: 'R1', outcome: 'pass', reasons: [], proof: { kind: 'compared' }, sources: ['ims-database', 'mintsoft-api'] }) }
-  const { items, streams } = await runItems(plan({ runners, selected: ['R1'] }))
+  const { items, streams } = await runItems(plan({ runners, selected: ['R1'], ...vendorOn() }))
   assert.equal(outcome(items, 'R1').outcome, 'inconclusive', 'compared with nothing equal is refused')
   const published = publishPackReport(dir, { runId: '20261020T120000Z-aaaaaaaaaaaa', systemIdentifier: '7000000000000000001', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items })
   assert.ok(published.ok && published.exitCode === 5)
@@ -221,7 +224,7 @@ test('the bracket is a pure function of the two reads: a stream that moved in a 
   // The Mintsoft stock sync has one entry per binding; one binding moving moves the stream (R1 has a runner stub here).
   const runners: Partial<Record<PackItemId, ItemRunner>> = { R1: async () => ({ id: 'R1', outcome: 'inconclusive', reasons: ['DIFFERENCES'] }) }
   const moved = reduceStatusReport(withStamp(goodReport(), 'mintsoft-stock-sync', STAMP_B, 'OVERFLOW'))
-  const { items } = await runItems(plan({ runners, selected: ['R1'], liveness: seq(good(), moved) }))
+  const { items } = await runItems(plan({ runners, selected: ['R1'], liveness: seq(good(), moved), ...vendorOn() }))
   assert.deepEqual([outcome(items, 'R1').outcome, outcome(items, 'R1').reasons], ['inconclusive', ['BASIS_MOVED']])
   void bracketLiveness
 })

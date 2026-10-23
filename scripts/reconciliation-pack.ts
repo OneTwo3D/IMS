@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * THE RECONCILIATION PACK (npm run reconcile:pack): runs the pack's items, publishes one report, exits with a code derived from
- * the items. READ-ONLY against the database, NO call to any vendor, no secret on a command line, and no overall verdict (the
+ * the items. READ-ONLY against the database, NO call to any vendor unless --vendor-reads-only (then GET only, WooCommerce only), no secret on a command line, and no overall verdict (the
  * readiness gate decides). Flags, closed codes and exit codes are single-sourced in lib/reconciliation-pack/constants.ts and
  * rendered into docs/installation.md ("Reconciliation pack"); `--help` prints them.
  *
@@ -29,6 +29,10 @@ import { childLivenessPort, ownClientBasisPort } from '../lib/reconciliation-pac
 import { readImsSnapshot, type ImsQueryClient, type ImsReadOptions } from '../lib/reconciliation-pack/ims-readers.ts'
 import { bracketLiveness } from '../lib/reconciliation-pack/liveness.ts'
 import { publishPackReport, type PublishHooks } from '../lib/reconciliation-pack/publish.ts'
+import { createWooGetPort } from '../lib/reconciliation-pack/woo-transport.ts'
+import { readWooCredentials } from '../lib/reconciliation-pack/woo-credentials.ts'
+import type { VendorPorts } from '../lib/reconciliation-pack/vendor-items.ts'
+import type { WooGetPort } from '../lib/reconciliation-pack/woo-source.ts'
 import { memoisedInvariant, readLivenessSafe, runItems, type BasisPort, type ItemRunner, type LedgerRunner, type LivenessPort } from '../lib/reconciliation-pack/run.ts'
 import { readPackChain } from '../lib/reconciliation-pack/trend.ts'
 import type { PackItemId } from '../lib/reconciliation-pack/constants.ts'
@@ -50,6 +54,10 @@ export type PackCliDeps = {
   basis?: BasisPort
   runners?: Partial<Record<PackItemId, ItemRunner>>
   ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
+  /** The WooCommerce port. Consulted ONLY with --vendor-reads-only; the default is the GET-only transport (woo-transport.ts). */
+  woo?: WooGetPort
+  /** The stored, proven-complete Xero tax-type list. None exists in this build (U13), so the default is absent. */
+  xeroTaxTypes?: VendorPorts['xeroTaxTypes']
   /** Called last, whatever happened: closes the application's database client if the invariant run opened it. */
   disconnect: () => Promise<void>
 }
@@ -66,6 +74,8 @@ export type PackCliOptions = {
   stdout?: (text: string) => void
   stderr?: (text: string) => void
   publishHooks?: PublishHooks
+  /** Test seam: told the whitelisted environment the run keeps (which replaces the process environment unless a test passed its own). */
+  onKeptEnv?: (kept: Readonly<Record<string, string>>) => void
 }
 
 const usage = (): string => [
@@ -163,12 +173,12 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
     const uid = options.uid !== undefined ? options.uid : typeof process.getuid === 'function' ? process.getuid() : null
     const owner = options.checkoutOwnerUid !== undefined ? options.checkoutOwnerUid : ownerUid(repoRoot)
     if (!accountAllowed(uid, owner)) return refuse('ACCOUNT_NOT_ALLOWED')
-    if (args.vendorReadsOnly) return refuse('VENDOR_READS_RESERVED')
-
     const parent = options.env ?? process.env
     if (!parent.DATABASE_URL) return refuse('DATABASE_URL_MISSING')
     // Before anything imports the application's database client.
-    if (options.env === undefined && options.keepProcessEnv !== true) replaceProcessEnv(buildPackEnv(parent, parent.HOME ?? '/tmp'))
+    const kept = buildPackEnv(parent, parent.HOME ?? '/tmp', args.vendorReadsOnly)
+    if (options.env === undefined && options.keepProcessEnv !== true) replaceProcessEnv(kept)
+    options.onKeptEnv?.(kept)
     // The real ports, unless a test handed doubles. Neither touches the application's client (default-ports.ts): the invariant run
     // below needs to be the first to import it.
     const liveness = deps.liveness ?? childLivenessPort({ cwd: repoRoot })
@@ -201,6 +211,14 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       return packExitCode('internal')
     }
 
+    // Vendor ports exist only for a run that opted in; without it nothing is constructed, so nothing can be called.
+    const vendor: VendorPorts | undefined = args.vendorReadsOnly
+      ? {
+        woo: deps.woo ?? createWooGetPort({ readCredentials: () => readStoredWooCredentials(deps) }),
+        xeroTaxTypes: deps.xeroTaxTypes,
+      }
+      : undefined
+
     const { items, streams } = await runItems({
       phase: args.phase,
       asOf: args.asOf!,
@@ -209,7 +227,7 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       basis,
       runners: deps.runners,
       ledgerRunners: deps.ledgerRunners,
-      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions) },
+      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor },
     })
     const finishedAt = deps.now()
     const published = publishPackReport(reportDir, {
@@ -230,6 +248,12 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
   } finally {
     await deps.disconnect().catch(() => undefined)
   }
+}
+
+/** The storefront credentials, read on the first vendor request over a connection of their own, closed whatever happens. */
+async function readStoredWooCredentials(deps: PackCliDeps) {
+  const ims = await deps.openIms()
+  try { return await readWooCredentials(ims.client) } finally { await ims.close().catch(() => undefined) }
 }
 
 /** One IMS read in its own connection and its own read-only snapshot, closed whatever happens. */

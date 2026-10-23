@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { RUN_STATUSES } from '../../lib/first-load/apply/constants.ts'
-import { FIRST_LOAD_RUN_STATUSES } from '../../lib/reconciliation-pack/constants.ts'
+import { FIRST_LOAD_RUN_STATUSES, WDRAW_APPROVED_STATUS_KEY, WDRAW_DEFAULT_APPROVED_STATUS, WDRAW_DEFAULT_SUBMITTED_STATUS, WDRAW_SUBMITTED_STATUS_KEY } from '../../lib/reconciliation-pack/constants.ts'
 import { alignmentState, classifyPopulation, readImsSnapshot, statementAllowed, type ImsQueryClient, type PopulationBoundaries } from '../../lib/reconciliation-pack/ims-readers.ts'
 
 /** A scripted connection: answers by the statement's text, records every statement. */
@@ -59,7 +60,7 @@ test('a statement that is not a SELECT or a fixed SET LOCAL, or holds two statem
   // The wrapper is exercised through the only door there is: a section whose SQL is wrong. Prove the allowlist by making the
   // fake observe every statement and by checking that none of the real sections sends anything else, across ALL sections.
   const client = fake(() => [])
-  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'], asOf: '2026-10-19' })
+  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'], asOf: '2026-10-19' })
   for (const sql of client.sent) assert.ok(/^(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|ROLLBACK|SELECT\b|SET LOCAL (statement_timeout|idle_in_transaction_session_timeout) = \d+$|SET LOCAL TIME ZONE 'UTC'$)/.test(sql) && !sql.includes(';'), sql)
   assert.ok(!client.sent.some((s) => /\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|GRANT)\b/i.test(s)))
 })
@@ -256,4 +257,42 @@ test('alignment state: DISABLED takes no part, NOTIFICATION_ONLY and unconfirmed
   assert.equal(alignmentState({ stockSyncMode: 'NOTIFICATION_ONLY', alignmentConfirmed: true }), 'unconfirmed')
   assert.equal(alignmentState({ stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmed: false }), 'unconfirmed')
   assert.equal(alignmentState({ stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmed: true }), 'confirmed')
+})
+
+// ---- the storefront status section (R9) ----------------------------------------------------------
+
+// [mutation: a malformed admitted-status setting read as the default / a mapping status not checked against the enum]
+test('storefrontStatus: the importer\'s admitted statuses (absent = its default, malformed = unreadable, normalised, unique) and every mapping row', async () => {
+  const run = async (settings: Array<Record<string, unknown>>, mappings: Array<Record<string, unknown>> = []) => {
+    const r = await readImsSnapshot(fake((sql) => /FROM settings/.test(sql) ? settings : /shopping_status_mappings/.test(sql) ? mappings : []), { sections: ['storefrontStatus'] })
+    assert.ok(r.ok); return r.sections.storefrontStatus!
+  }
+  assert.deepEqual(await run([]), { ok: true, value: { configured: ['processing'], withdrawal: { submitted: 'pending-wdraw', approved: 'withdrawn' }, mappings: [] } }, 'absent = the documented default')
+  assert.deepEqual(await run([{ key: 'wc_sync_order_statuses', value: '["wc-On-Hold"," processing ","on-hold"]' }], [{ external_status: 'wc-weird', ims_status: 'PICKING' }]), { ok: true, value: { configured: ['on-hold', 'processing'], withdrawal: { submitted: 'pending-wdraw', approved: 'withdrawn' }, mappings: [{ externalStatus: 'wc-weird', imsStatus: 'PICKING' }] } })
+  assert.deepEqual(await run([{ key: 'wc_sync_order_statuses', value: '[]' }]), { ok: true, value: { configured: [], withdrawal: { submitted: 'pending-wdraw', approved: 'withdrawn' }, mappings: [] } }, 'an empty selection is a decision: import nothing')
+  for (const value of ['not json', '{}', '"processing"', '[1]', '[""]', '["a b"]', '["x/y"]', '[null]', '["a\\nb"]', JSON.stringify(Array.from({ length: 101 }, (_, i) => `s${i}`)), null, 5]) {
+    assert.deepEqual(await run([{ key: 'wc_sync_order_statuses', value }]), { ok: false, reason: 'SOURCE_UNREADABLE' }, String(value))
+  }
+  assert.deepEqual(await run([{ key: 'wc_sync_order_statuses', value: '["processing"]' }, { key: 'wc_sync_order_statuses', value: '["processing"]' }]), { ok: false, reason: 'DUPLICATE_KEY' })
+  assert.deepEqual(await run([], [{ external_status: 'x', ims_status: 'NOT_A_STATUS' }]), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await run([], [{ external_status: 'x', ims_status: 'PICKING' }, { external_status: 'x', ims_status: 'PICKING' }]), { ok: false, reason: 'DUPLICATE_KEY' })
+  assert.deepEqual(await run([], [{ external_status: '', ims_status: 'PICKING' }]), { ok: false, reason: 'BAD_KEY' })
+})
+
+// [mutation: a malformed withdrawal status read as the default / an empty value not defaulted]
+test('storefrontStatus: the withdrawal pair is read as the importer reads it - the stored value normalised, the default when absent or empty, unreadable (never defaulted) when it is not a status slug', async () => {
+  const run = async (settings: Array<Record<string, unknown>>) => {
+    const r = await readImsSnapshot(fake((sql) => /FROM settings/.test(sql) ? settings : []), { sections: ['storefrontStatus'] })
+    assert.ok(r.ok); return r.sections.storefrontStatus!
+  }
+  const pair = async (settings: Array<Record<string, unknown>>) => { const r = await run(settings); return r.ok ? r.value.withdrawal : r }
+  assert.deepEqual(await pair([{ key: 'wc_withdrawal_submitted_status', value: ' WC-Wdraw-Asked ' }, { key: 'wc_withdrawal_approved_status', value: 'wdraw-done' }]), { submitted: 'wdraw-asked', approved: 'wdraw-done' })
+  assert.deepEqual(await pair([{ key: 'wc_withdrawal_submitted_status', value: '' }]), { submitted: 'pending-wdraw', approved: 'withdrawn' }, 'an empty value is the default, as the importer reads it')
+  for (const value of ['  ', 'a b', 'x/y', 'a'.repeat(65), 5, null]) assert.deepEqual(await run([{ key: 'wc_withdrawal_submitted_status', value }]), { ok: false, reason: 'SOURCE_UNREADABLE' }, String(value))
+  assert.deepEqual(await run([{ key: 'wc_withdrawal_approved_status', value: 'a' }, { key: 'wc_withdrawal_approved_status', value: 'a' }]), { ok: false, reason: 'DUPLICATE_KEY' })
+})
+
+test('PIN: the withdrawal keys and defaults the pack reads are the connector\'s own', () => {
+  const source = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  for (const needle of [`WDRAW_SUBMITTED_STATUS_KEY = '${WDRAW_SUBMITTED_STATUS_KEY}'`, `WDRAW_APPROVED_STATUS_KEY = '${WDRAW_APPROVED_STATUS_KEY}'`, `DEFAULT_WDRAW_SUBMITTED_STATUS = '${WDRAW_DEFAULT_SUBMITTED_STATUS}'`, `DEFAULT_WDRAW_APPROVED_STATUS = '${WDRAW_DEFAULT_APPROVED_STATUS}'`, 'normaliseStatus(map.get(WDRAW_SUBMITTED_STATUS_KEY) || DEFAULT_WDRAW_SUBMITTED_STATUS)', 'normaliseStatus(map.get(WDRAW_APPROVED_STATUS_KEY) || DEFAULT_WDRAW_APPROVED_STATUS)']) assert.ok(source.includes(needle), needle)
 })
