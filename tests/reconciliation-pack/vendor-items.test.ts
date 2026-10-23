@@ -95,42 +95,32 @@ test('the value is within ONE MINOR UNIT of the order currency, inclusive: 0.01 
   assert.deepEqual([unknown.outcome, unknown.reasons], ['inconclusive', ['CURRENCY_UNKNOWN']])
 })
 
-// [mutation: classifyPopulation not used / both-sided identities classified too]
-test('POPULATION from the recorded boundaries: a storefront order IMS lacks, older than the initial import or beyond retention, is listed out, never a finding; one at the boundary is in; an open IMS order is always judged', async () => {
-  const wooOld = order(21, 'processing', { date_created_gmt: '2026-08-31T23:59:59' })
-  const wooAtCut = order(22, 'processing', { date_created_gmt: '2026-09-01T00:00:00' })
-  const item = await runVendorItem('R9', context({ orders: [imsOrder(1, '11')] }, { orders: { processing: [order(11), wooOld, wooAtCut] } }).ctx)
-  assert.equal(item.outcome, 'fail')
-  assert.deepEqual(keys(item, 'outOfPopulation'), ['21'])
-  assert.deepEqual(keys(item, 'onlyVendor'), ['22'], 'an instant equal to the boundary is inside')
-  // Only the old one: no finding, and the pass has something compared.
-  const clean = await runVendorItem('R9', context({ orders: [imsOrder(1, '11')] }, { orders: { processing: [order(11), wooOld] } }).ctx)
-  assert.equal(clean.outcome, 'pass')
-  assert.deepEqual(keys(clean, 'outOfPopulation'), ['21'])
-  // Retention: 1 month before 2026-10-19 is 2026-09-19.
-  const retained = await runVendorItem('R9', context({ boundaries: { ...BOUNDARIES, retentionMonths: 1 }, orders: [imsOrder(1, '11')] }, { orders: { processing: [order(11), order(23, 'processing', { date_created_gmt: '2026-09-18T12:00:00' })] } }).ctx)
-  assert.equal(retained.outcome, 'pass')
-  assert.deepEqual(keys(retained, 'outOfPopulation'), ['23'])
-  // An open IMS order the store does not list is ALWAYS judged, however old: IMS holding it proves it was imported, and an old one is the likeliest to be stale.
-  const imsOld = await runVendorItem('R9', context({ boundaries: { ...BOUNDARIES, retentionMonths: 1 }, orders: [imsOrder(1, '11'), imsOrder(2, '12', { externalCreatedAt: '2026-01-01T00:00:00.000Z' })] }, { orders: { processing: processing(11) } }).ctx)
-  assert.deepEqual([imsOld.outcome, keys(imsOld, 'onlyIms'), keys(imsOld, 'outOfPopulation')], ['fail', ['12'], []])
-  // An identity on BOTH sides is judged whatever its age: an old pair that differs is a finding.
-  const bothOld = await runVendorItem('R9', context({ orders: [imsOrder(1, '21', { totalForeign: '99.00', externalCreatedAt: '2026-01-01T00:00:00.000Z' })] }, { orders: { processing: [wooOld] } }).ctx)
-  assert.deepEqual([bothOld.outcome, keys(bothOld, 'bothDiffer')], ['fail', ['21']])
+// [mutation: an age-based exclusion put back for storefront orders IMS lacks]
+test('NO ORDER IS SET ASIDE BY ITS AGE: a storefront order created before the initial import, now in an admitted open status and absent from IMS, is a finding - the importer admits by current status', async () => {
+  const wooOld = order(21, 'processing', { date_created_gmt: '2020-01-01T00:00:00' })
+  const item = await runVendorItem('R9', context({ orders: [imsOrder(1, '11')] }, { orders: { processing: [order(11), wooOld] } }).ctx)
+  assert.deepEqual([item.outcome, item.reasons, keys(item, 'onlyVendor'), keys(item, 'outOfPopulation')], ['fail', ['DIFFERENCES'], ['21'], []])
+  // Whatever the recorded boundaries say (before the import, beyond retention, no record at all, no creation date): judged, not excluded, not unknown.
+  for (const boundaries of [BOUNDARIES, { ...BOUNDARIES, retentionMonths: 1 }, { ...BOUNDARIES, storefrontImport: { state: 'not-completed' as const } }, { ...BOUNDARIES, firstLoad: { state: 'absent' as const } }]) {
+    for (const date of ['2020-01-01T00:00:00', '2026-08-31T23:59:59', '2026-09-01T00:00:00', null]) {
+      const c = context({ boundaries, orders: [] }, { orders: { processing: [order(22, 'processing', { date_created_gmt: date })] } })
+      const r = await runVendorItem('R9', c.ctx)
+      assert.deepEqual([r.outcome, r.reasons, keys(r, 'onlyVendor')], ['fail', ['DIFFERENCES'], ['22']], `${JSON.stringify(boundaries)} ${date}`)
+    }
+  }
+  // An open IMS order the store does not list is judged whatever its age, with or without a creation instant.
+  const imsOld = await runVendorItem('R9', context({ orders: [imsOrder(1, '11'), imsOrder(2, '12', { externalCreatedAt: '2026-01-01T00:00:00.000Z' }), imsOrder(3, '13', { externalCreatedAt: null })] }, { orders: { processing: processing(11) } }).ctx)
+  assert.deepEqual([imsOld.outcome, keys(imsOld, 'onlyIms').sort(), keys(imsOld, 'outOfPopulation')], ['fail', ['12', '13'], []])
+  // An old pair that differs is a finding; an old pair that agrees is compared.
+  const pair = await runVendorItem('R9', context({ orders: [imsOrder(1, '21', { totalForeign: '99.00' })] }, { orders: { processing: [wooOld] } }).ctx)
+  assert.deepEqual([pair.outcome, keys(pair, 'bothDiffer')], ['fail', ['21']])
+  assert.equal((await runVendorItem('R9', context({ orders: [imsOrder(1, '21')] }, { orders: { processing: [wooOld] } }).ctx)).outcome, 'pass')
 })
 
-// [mutation: an unknown verdict treated as in / as out]
-test('a boundary with no record, or an identity with no creation instant, is NO_POPULATION_RECORD - never "in", never "out"', async () => {
-  const noInstant = await runVendorItem('R9', context({ orders: [] }, { orders: { processing: [order(21, 'processing', { date_created_gmt: null })] } }).ctx)
-  assert.deepEqual([noInstant.outcome, noInstant.reasons], ['inconclusive', ['NO_POPULATION_RECORD']])
-  // An IMS-side identity needs no creation instant: it is judged.
-  const imsNoInstant = await runVendorItem('R9', context({ orders: [imsOrder(1, '12', { externalCreatedAt: null })] }, { orders: { processing: [] } }).ctx)
-  assert.deepEqual([imsNoInstant.outcome, keys(imsNoInstant, 'onlyIms')], ['fail', ['12']])
-  const notImported = await runVendorItem('R9', context({ boundaries: { ...BOUNDARIES, storefrontImport: { state: 'not-completed' } }, orders: [] }, { orders: { processing: [order(21)] } }).ctx)
-  assert.deepEqual([notImported.outcome, notImported.reasons], ['inconclusive', ['NO_POPULATION_RECORD']])
-  // A pair needs no boundary: it is judged.
-  const pair = await runVendorItem('R9', context({ boundaries: { ...BOUNDARIES, storefrontImport: { state: 'not-completed' } }, orders: [imsOrder(1, '11')] }, { orders: { processing: [order(11)] } }).ctx)
-  assert.equal(pair.outcome, 'pass')
+test('R9 needs no population record: it does not read the boundaries section at all, and cannot be NO_POPULATION_RECORD', async () => {
+  const c = context({ orders: [imsOrder(1, '11')] }, { orders: { processing: processing(11) } })
+  assert.equal((await runVendorItem('R9', c.ctx)).outcome, 'pass')
+  assert.deepEqual(c.ims.calls.map((call) => [...call.sections]), [['orders', 'storefrontStatus']])
 })
 
 test('an open IMS order with no WooCommerce order id is listed as out of the population (never a finding, never a guess at an identity)', async () => {
@@ -142,7 +132,7 @@ test('an open IMS order with no WooCommerce order id is listed as out of the pop
   assert.deepEqual([other.outcome, keys(other, 'outOfPopulation')], ['pass', [cuid(1)]])
 })
 
-test('EMPTY needs a named proof: both sides empty passes only on per-status-total-zero; nothing enumerated, or a vendor list that is all out of population, is EMPTY_UNPROVEN', async () => {
+test('EMPTY needs a named proof: both sides empty passes only on per-status-total-zero; nothing enumerated is EMPTY_UNPROVEN', async () => {
   const empty = await runVendorItem('R9', context({ orders: [] }, { orders: {} }).ctx)
   assert.deepEqual([empty.outcome, empty.proof], ['pass', { kind: 'proven-empty', source: 'per-status-total-zero' }])
   const onlyUnlinked = await runVendorItem('R9', context({ orders: [imsOrder(1, null)] }, { orders: {} }).ctx)
@@ -151,8 +141,6 @@ test('EMPTY needs a named proof: both sides empty passes only on per-status-tota
   const none = await runVendorItem('R9', nothingAdmitted.ctx)
   assert.deepEqual([none.outcome, none.reasons], ['inconclusive', ['EMPTY_UNPROVEN']])
   assert.equal(nothingAdmitted.woo.calls.length, 0)
-  const allOld = await runVendorItem('R9', context({ orders: [] }, { orders: { processing: [order(21, 'processing', { date_created_gmt: '2026-01-01T00:00:00' })] } }).ctx)
-  assert.deepEqual([allOld.outcome, allOld.reasons], ['inconclusive', ['EMPTY_UNPROVEN']])
 })
 
 test('an IMS order with nothing at the vendor is onlyIms and a fail: an empty store is not an empty answer', async () => {
@@ -192,7 +180,7 @@ test('openStorefrontStatuses: the exact slug wins, agreeing rows are one, disagr
 })
 
 test('every IMS failure is a closed reason and NO vendor request is made: a failed read, a section that failed, a throw, a bad link id', async () => {
-  for (const [fixture, reason] of [[{ fail: 'read' }, 'READ_INCOMPLETE'], [{ fail: { orders: 'CAP_EXCEEDED' } }, 'CAP_EXCEEDED'], [{ fail: { boundaries: 'CAP_EXCEEDED' } }, 'CAP_EXCEEDED'], [{ fail: { storefrontStatus: 'CAP_EXCEEDED' } }, 'CAP_EXCEEDED'], [{ fail: 'throws' }, 'INTERNAL_ERROR']] as const) {
+  for (const [fixture, reason] of [[{ fail: 'read' }, 'READ_INCOMPLETE'], [{ fail: { orders: 'CAP_EXCEEDED' } }, 'CAP_EXCEEDED'], [{ fail: { storefrontStatus: 'CAP_EXCEEDED' } }, 'CAP_EXCEEDED'], [{ fail: 'throws' }, 'INTERNAL_ERROR']] as const) {
     const c = context(fixture as ImsFixture, { orders: { processing: processing(11) } })
     const item = await runVendorItem('R9', c.ctx)
     assert.deepEqual([item.outcome, item.reasons], ['inconclusive', [reason]], JSON.stringify(fixture))

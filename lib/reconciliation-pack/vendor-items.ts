@@ -13,12 +13,16 @@
  *        table) is an open IMS status, read as two full sweeps of every status. A status the importer admits that has no reading is
  *        UNKNOWN_STATUS (the whole item). The SET must be exact; the VALUE (the order total, in the order's own currency) must agree
  *        within one minor unit of that currency (owner decision D1), and a currency that differs is a difference. An identity on
- *        both sides is always judged. A storefront order the store holds and IMS does not is judged only if the recorded boundaries put
- *        it in the population (created at or after the recorded initial import, inside the recorded retention horizon); a boundary with
- *        no record, or an order with no creation instant, makes the item inconclusive (NO_POPULATION_RECORD), never "in". An open IMS
- *        order the store does not list as open is ALWAYS judged, whatever its age (it was imported, and an old one is the likeliest to
- *        be stale). Empty on both sides passes only on the named proof that every enumerated status reported a total of zero on both
- *        reads.
+ *        both sides is always judged, and so is every other identity: NO order is set aside by its age. The importer admits an order by its
+ *        CURRENT status alone, whatever its age (the initial import asks the store for the selected statuses with no date bound,
+ *        initial-import.ts:270-276; the ongoing sweep asks for the selected statuses modified after a cursor, order-import.ts:3160-3166;
+ *        a webhook admits on the current status, order-status-filter.ts:166), so an order created before the initial import that entered
+ *        an admitted open status later is one IMS should hold. Retention archives only TERMINAL orders (data-retention.ts:689-706), so it
+ *        never removes an open order either. Comparing a storefront timestamp with an IMS one to exclude an order is cross-system clock
+ *        ordering, which the pack never does. The only identities set aside are open IMS orders that have no storefront order id at all
+ *        (no identity to compare), listed. Empty on both sides passes only on the named proof that every enumerated status reported a
+ *        total of zero in both sweeps.
+ *
  *   R13  TAX-RATE MAPPINGS, presence only. Every WooCommerce tax rate (the full list, walked twice) must have an IMS mapping, and
  *        every IMS mapping of the storefront must name a rate the storefront still has; every Xero tax rate must be held by an active
  *        IMS tax rate (its accounting tax type), and the reverse. The Xero list is not available in this build: the stored tax-rate
@@ -30,8 +34,7 @@
  * failure on this run.
  */
 
-import { classifyPopulation } from '@/lib/reconciliation-pack/ims-readers'
-import type { ImsRead, ImsReadOptions, OrderRow, PopulationBoundaries, StorefrontStatusConfig, TaxRateRow, TaxMappingRow } from '@/lib/reconciliation-pack/ims-readers'
+import type { ImsRead, ImsReadOptions, OrderRow, StorefrontStatusConfig, TaxRateRow, TaxMappingRow } from '@/lib/reconciliation-pack/ims-readers'
 import { compareItem, outcomeOfComparison, type CompareResult, type SideRow } from '@/lib/reconciliation-pack/compare'
 import {
   IMS_OPEN_ORDER_STATUSES,
@@ -130,14 +133,13 @@ async function runR9(context: VendorItemContext): Promise<ItemInput> {
   const woo = context.vendor?.woo
   const readIms = context.ims
   if (woo === undefined || readIms === undefined) return inconclusive('R9', [], 'SOURCE_UNREADABLE')
-  const read = await readIms({ sections: ['boundaries', 'orders', 'storefrontStatus'] })
+  const read = await readIms({ sections: ['orders', 'storefrontStatus'] })
   if (!read.ok) return inconclusive('R9', [IMS], read.reason)
-  const failed = (['boundaries', 'orders', 'storefrontStatus'] as const).flatMap((name) => {
+  const failed = (['orders', 'storefrontStatus'] as const).flatMap((name) => {
     const section = read.sections[name]
     return section === undefined ? ['SOURCE_UNREADABLE' as const] : section.ok ? [] : [section.reason]
   })
   if (failed.length > 0) return inconclusive('R9', [IMS], ...failed)
-  const boundaries = (read.sections.boundaries as { ok: true; value: PopulationBoundaries }).value
   const orders = (read.sections.orders as { ok: true; value: OrderRow[] }).value
   const config = (read.sections.storefrontStatus as { ok: true; value: StorefrontStatusConfig }).value
 
@@ -146,7 +148,6 @@ async function runR9(context: VendorItemContext): Promise<ItemInput> {
 
   // IMS side: the identity is the storefront order id; an open order without one is set aside, listed.
   const ims: SideRow[] = []
-  const imsCreated = new Set<string>()
   const unlinked = new Set<string>()
   for (const order of orders) {
     const link = order.links.find((entry) => entry.connector === 'woocommerce')
@@ -159,27 +160,18 @@ async function runR9(context: VendorItemContext): Promise<ItemInput> {
     }
     if (!ORDER_ID_RE.test(link.externalOrderId)) return inconclusive('R9', [IMS], 'BAD_KEY')
     ims.push({ key: wooKey(link.externalOrderId), value: order.totalForeign, currency: order.currency })
-    imsCreated.add(link.externalOrderId)
   }
 
   const walked = await readWooOrders(woo, open.statuses, context.wooOptions)
   if (!walked.ok) return inconclusive('R9', [IMS, WOO], walked.reason)
   const vendor: SideRow[] = walked.value.orders.map((order: WooOrderRow) => ({ key: wooKey(order.id), value: order.total, currency: order.currency }))
-  const wooCreated = new Map(walked.value.orders.map((order) => [order.id, order.createdAt] as const))
 
-  // Population. An identity on both sides is always judged. A storefront order the store holds that IMS does not is judged only if the
-  // recorded boundaries say IMS should have it (it was created at or after the initial import, inside the retention horizon); one older
-  // than that is listed out. An open IMS order the store does not list as open is ALWAYS judged: IMS holding an order is proof that it
-  // was imported, and an old one is the likeliest to be stale, so its age is never a reason to set it aside.
+  // Population: every identity is judged except an open IMS order with no storefront order id (listed, never compared). No order is set
+  // aside by an instant: see the header for the importer rules (file:line) that admit an order by its current status whatever its age.
   const population = new Set<string>()
   for (const row of [...ims, ...vendor]) {
     const canonical = canonicalKey(row.key)
-    if (unlinked.has(canonical)) continue
-    const id = (row.key[0]!.raw as string)
-    if (imsCreated.has(id)) { population.add(canonical); continue }
-    const verdict = classifyPopulation(boundaries, 'storefront-order', wooCreated.get(id)!, context.asOf)
-    if (verdict.kind === 'unknown') return inconclusive('R9', [IMS, WOO], verdict.reason)
-    if (verdict.kind === 'in') population.add(canonical)
+    if (!unlinked.has(canonical)) population.add(canonical)
   }
 
   const result = compareItem('R9', { ims, vendor, imsComplete: true, vendorComplete: true, population, emptyProof: walked.value.allZero ? 'per-status-total-zero' : undefined })
