@@ -56,7 +56,7 @@ function itemOf(id: PackItemId, result: CompareResult): ItemInput {
 }
 
 for (const mode of ['values', 'presence'] as const) {
-  const id: PackItemId = mode === 'values' ? 'R1' : 'R13'
+  const id: PackItemId = mode === 'values' ? 'R4' : 'R13'
   test(`TABLE ${mode}: every combination of equal, differ, onlyIms, onlyVendor, excluded, out of population, settling and empty proof`, () => {
     let combos = 0
     let passes = 0
@@ -122,7 +122,7 @@ function entriesFor(mode: 'values' | 'presence', bucket: ComparisonBucket): Entr
 }
 
 for (const mode of ['values', 'presence'] as const) {
-  const id: PackItemId = mode === 'values' ? 'R1' : 'R13'
+  const id: PackItemId = mode === 'values' ? 'R4' : 'R13'
   const buckets: ComparisonBucket[] = mode === 'values' ? ['bothEqual', 'bothDiffer', 'onlyIms', 'onlyVendor', 'unsettled', 'excluded', 'outOfPopulation'] : ['bothEqual', 'onlyIms', 'onlyVendor', 'unsettled', 'excluded', 'outOfPopulation']
   test(`FORGED PASS ${mode}: a pass is accepted only with equal identities and the "compared" proof, or no equal identity and a named empty proof`, () => {
     let accepted = 0
@@ -179,7 +179,7 @@ test('PRESENCE: the bucket is derived from the per-side presence flags in the bu
 test('COMPARATOR: excluded, out-of-population and unsettled identities never become a "compared" proof', () => {
   const X = canonicalKey(key('X1'))
   const row = (k: string): SideRow => ({ key: key(k), value: '1' })
-  const run = (over: Record<string, unknown>) => compareItem('R1', { imsComplete: true, vendorComplete: true, ims: [row('X1')], vendor: [row('X1')], ...over } as never)
+  const run = (over: Record<string, unknown>) => compareItem('R4', { imsComplete: true, vendorComplete: true, ims: [row('X1')], vendor: [row('X1')], ...over } as never)
   // one excluded row, nothing else, no proof: unreadable (the reviewed attack passed here)
   assert.deepEqual(run({ excluded: new Set([X]) }), { status: 'unreadable', reason: 'EMPTY_UNPROVEN' })
   assert.deepEqual(outcomeOfComparison(run({ excluded: new Set([X]) })), { outcome: 'inconclusive', reasons: ['EMPTY_UNPROVEN'] })
@@ -238,7 +238,7 @@ test('READER: presence evidence lines are re-judged from their recorded presence
 })
 
 test('VALUES: the presence flags must agree with the values, and the bucket with both', () => {
-  const r1 = (entry: Record<string, unknown>, bucket: ComparisonBucket = 'onlyIms') => buildReport(input(put(defaultItems('P1'), { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { [bucket]: [entry] } } as never)), 1, null)
+  const r1 = (entry: Record<string, unknown>, bucket: ComparisonBucket = 'onlyIms') => buildReport(input(put(defaultItems('P1'), { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { [bucket]: [entry] } } as never)), 1, null)
   assert.doesNotThrow(() => r1({ key: 'A', ims: '2', vendor: null, delta: null }))
   assert.doesNotThrow(() => r1({ key: 'A', ims: '2', vendor: null, delta: null, imsPresent: true, vendorPresent: false }))
   assert.throws(() => r1({ key: 'A', ims: '2', vendor: null, delta: null, imsPresent: false, vendorPresent: false }), ReportInvalid, 'flag false for a value')
@@ -256,7 +256,7 @@ test('a presence entry must SAY which sides have the identity; a flag left out i
   assert.throws(() => build(entry({})), ReportInvalid, 'both omitted')
   assert.doesNotThrow(() => build(entry({ imsPresent: true, vendorPresent: false })))
   // an evidence line for a VALUES item that lacks its flags is refused too (the reader does not default them)
-  const built = buildReport(input(put(defaultItems('P1'), { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [{ key: 'A', ims: '2', vendor: null, delta: null }] } } as never)), 1, null)
+  const built = buildReport(input(put(defaultItems('P1'), { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [{ key: 'A', ims: '2', vendor: null, delta: null }] } } as never)), 1, null)
   const text = built.evidenceText.replace(',"imsPresent":true,"vendorPresent":false', '')
   assert.notEqual(text, built.evidenceText)
   assert.throws(() => verifyEvidence(text, { ...built.record, evidence: { ...built.record.evidence, sha256: sha256Hex(text) } }), ReportInvalid)

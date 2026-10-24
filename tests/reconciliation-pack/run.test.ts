@@ -45,8 +45,8 @@ test('P1: R6 passes on a balanced settled basis; R10 is inconclusive without a w
   const { items, streams } = await runItems(plan())
   assert.deepEqual(items.filter((i) => i.outcome === 'pass').map((i) => i.id), ['R3', 'R4', 'R6', 'R15'])
   assert.deepEqual([outcome(items, 'R10').outcome, outcome(items, 'R10').reasons], ['inconclusive', ['SOURCE_UNREADABLE']])
-  for (const id of ['R9', 'R13']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['VENDOR_READS_OFF'], []], `${id}: vendor reads are off unless the run asks`)
-  for (const id of ['R1', 'R12']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['NO_RUNNER']], id)
+  for (const id of ['R1', 'R9', 'R13']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['VENDOR_READS_OFF'], []], `${id}: vendor reads are off unless the run asks`)
+  for (const id of ['R12']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['NO_RUNNER']], id)
   // The Qoblex items read nothing unless the run names an export; R14 is also a vendor item and says so first.
   for (const id of ['R2', 'R5']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['QOBLEX_EXPORT_OFF'], []], id)
   assert.deepEqual([outcome(items, 'R14').outcome, outcome(items, 'R14').reasons], ['inconclusive', ['VENDOR_READS_OFF']])

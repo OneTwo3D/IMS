@@ -33,6 +33,7 @@ import { runCoverageItem, type SkuListPort } from '@/lib/reconciliation-pack/cov
 import { runQoblexItem, type QoblexItemId } from '@/lib/reconciliation-pack/qoblex-items'
 import type { QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
 import type { SkuExclusionFile } from '@/lib/reconciliation-pack/sku-exclusions'
+import type { WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
 import type { WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 
 /** Reads the read-sync status report, reduced and checked against itself (reduceStatusReport). May throw: the run treats that as an unreadable read. */
@@ -67,6 +68,7 @@ export type RunContext = {
   skuExclusions?: SkuExclusionFile
   /** The 3PL warehouse system's SKU list for R14. Absent = that leg is not compared (LEG_UNAVAILABLE). */
   wmsSkus?: SkuListPort
+  wmsOptions?: WmsSourceOptions
   /**
    * Only for an item that settles (its catalogue row), and set per item by runItems, never by the caller: the state carried from the
    * previous report and the stream stamp this run's start read saw. Absent on any other item.
@@ -94,14 +96,14 @@ export type RunPlan = {
 export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromInvariant = (id: 'R3' | 'R4' | 'R15'): ItemRunner => async (context) =>
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
-  const fromVendor = (id: 'R9' | 'R13'): ItemRunner => (context) =>
-    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, settling: context.settling })
+  const fromVendor = (id: 'R1' | 'R9' | 'R13'): ItemRunner => (context) =>
+    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, wmsOptions: context.wmsOptions, settling: context.settling })
   const fromQoblex = (id: QoblexItemId): ItemRunner => (context) => runQoblexItem(id, { asOf: context.asOf, ims: context.ims, qoblex: context.qoblex })
   const coverage: ItemRunner = (context) => runCoverageItem({
     asOf: context.asOf, now: context.now, vendorReads: context.vendorReads, woo: context.vendor?.woo, wooOptions: context.wooOptions,
     ims: context.ims, qoblex: context.qoblex, wms: context.wmsSkus, exclusions: context.skuExclusions,
   })
-  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R2: fromQoblex('R2'), R5: fromQoblex('R5'), R14: coverage }
+  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R2: fromQoblex('R2'), R5: fromQoblex('R5'), R14: coverage }
 }
 
 /** R6 and R10 read the settled as-of basis (ledger-items.ts). */

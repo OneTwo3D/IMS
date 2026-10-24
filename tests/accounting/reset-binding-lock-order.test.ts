@@ -105,6 +105,8 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 mock.module('@/lib/integration-plugin-selection-lock', {
   namedExports: { lockIntegrationPluginSelection: async () => {} },
 })
+// The scheduled reconciliation pack's settings fence is an advisory lock, not a row acquisition: this test is about row order.
+mock.module('@/lib/reconciliation-pack/schedule-lock', { namedExports: { lockPackScheduleSettings: async () => {} } })
 mock.module('@/lib/auth/server', {
   namedExports: {
     requireFreshAdmin: async () => ({ user: { id: 'admin-1', email: 'admin@example.test' } }),

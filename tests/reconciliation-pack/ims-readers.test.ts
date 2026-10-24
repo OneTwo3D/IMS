@@ -61,7 +61,7 @@ test('a statement that is not a SELECT or a fixed SET LOCAL, or holds two statem
   // The wrapper is exercised through the only door there is: a section whose SQL is wrong. Prove the allowlist by making the
   // fake observe every statement and by checking that none of the real sections sends anything else, across ALL sections.
   const client = fake(() => [])
-  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings', 'warehouses'], asOf: '2026-10-19' })
+  await readImsSnapshot(client, { sections: ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'warehouses'], asOf: '2026-10-19' })
   for (const sql of client.sent) assert.ok(/^(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|ROLLBACK|SELECT\b|SET LOCAL (statement_timeout|idle_in_transaction_session_timeout) = \d+$|SET LOCAL TIME ZONE 'UTC'$)/.test(sql) && !sql.includes(';'), sql)
   assert.ok(!client.sent.some((s) => /\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|GRANT)\b/i.test(s)))
 })
@@ -415,4 +415,21 @@ test('the warehouses section reads every warehouse, and a repeated code, a repea
   assert.equal(await reasons([row({ active: 'yes' })]), 'SOURCE_UNREADABLE')
   const over = await readImsSnapshot(fake(() => [row(), row({ id: 'w2', code: 'B' }), row({ id: 'w3', code: 'C' })]), { sections: ['warehouses'], rowCap: 2 })
   assert.ok(over.ok && !over.sections.warehouses!.ok && over.sections.warehouses!.reason === 'CAP_EXCEEDED')
+})
+
+test('wmsProductLinks: the product link rows (connector, product, the warehouse system\'s own id) in one snapshot; a repeated product or a repeated vendor id for one connector, or a row that is not text, makes the section unreadable', async () => {
+  const row = (connector: string, product: string, external: string) => ({ connector, product_id: product, external_id: external })
+  const cuid = (n: number) => `c${String(n).padStart(24, '0')}`
+  const ok = await readImsSnapshot(fake((sql) => (/FROM wms_product_links/.test(sql) ? [row('mintsoft', cuid(1), '264511'), row('mintsoft', cuid(2), '500944'), row('other-wms', cuid(1), '264511')] : [])), { sections: ['wmsProductLinks'] })
+  assert.ok(ok.ok)
+  if (ok.ok) assert.deepEqual(ok.sections.wmsProductLinks, { ok: true, value: [{ connector: 'mintsoft', productId: cuid(1), externalProductId: '264511' }, { connector: 'mintsoft', productId: cuid(2), externalProductId: '500944' }, { connector: 'other-wms', productId: cuid(1), externalProductId: '264511' }] })
+  const refused = async (rows: Array<Record<string, unknown>>, reason: string) => {
+    const read = await readImsSnapshot(fake((sql) => (/FROM wms_product_links/.test(sql) ? rows : [])), { sections: ['wmsProductLinks'] })
+    assert.ok(read.ok)
+    if (read.ok) assert.deepEqual(read.sections.wmsProductLinks, { ok: false, reason })
+  }
+  await refused([row('mintsoft', cuid(1), '1'), row('mintsoft', cuid(1), '2')], 'DUPLICATE_KEY')
+  await refused([row('mintsoft', cuid(1), '1'), row('mintsoft', cuid(2), '1')], 'DUPLICATE_KEY')
+  await refused([{ connector: 'mintsoft', product_id: 5, external_id: '1' }], 'BAD_KEY')
+  await refused([{ connector: 'mintsoft', product_id: cuid(1), external_id: null }], 'BAD_KEY')
 })

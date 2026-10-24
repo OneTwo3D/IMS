@@ -186,33 +186,33 @@ test('builder: each of R1..R15 exactly once; closed reasons; strict shapes; chai
 
 test('IDENTITY SWAP end to end: equal counts, one identity swapped => the report fails and names both identities in the evidence', () => {
   const dir = fresh()
-  const { item } = itemFromComparison('R1', { ims: [{ key: key('A'), value: '5' }, { key: key('B'), value: '7' }], vendor: [{ key: key('A'), value: '5' }, { key: key('C'), value: '7' }] })
-  const result = ok(publish(dir, 0, { items: { ...passingAt('P1'), R1: item } }))
+  const { item } = itemFromComparison('R4', { ims: [{ key: key('A'), value: '5' }, { key: key('B'), value: '7' }], vendor: [{ key: key('A'), value: '5' }, { key: key('C'), value: '7' }] })
+  const result = ok(publish(dir, 0, { items: { ...passingAt('P1'), R4: item } }))
   assert.equal(result.exitCode, 1)
-  const r1 = result.record.items.find((i) => i.id === 'R1')!
+  const r1 = result.record.items.find((i) => i.id === 'R4')!
   assert.deepEqual([r1.outcome, r1.reasons], ['fail', ['DIFFERENCES']])
   assert.equal(r1.counts.bothEqual, 1)
   assert.equal(r1.counts.onlyIms, 1)
   assert.equal(r1.counts.onlyVendor, 1)
   assert.equal(r1.bothEqualSha256, sha256Hex('A|MAIN'))
   const lines = readFileSync(result.evidence, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>)
-  assert.deepEqual(lines.map((l) => [l.item, l.bucket, l.key]), [['R1', 'onlyIms', 'B|MAIN'], ['R1', 'onlyVendor', 'C|MAIN'], ['R1', 'bothEqual', 'A|MAIN']], 'findings first, then the equal identity: the reader recomputes the count and the digest from these lines')
+  assert.deepEqual(lines.map((l) => [l.item, l.bucket, l.key]), [['R4', 'onlyIms', 'B|MAIN'], ['R4', 'onlyVendor', 'C|MAIN'], ['R4', 'bothEqual', 'A|MAIN']], 'findings first, then the equal identity: the reader recomputes the count and the digest from these lines')
 })
 
 test('counts are DERIVED: the reader recomputes them from the evidence and refuses a report whose counts were edited', () => {
   const dir = fresh()
-  const { item } = itemFromComparison('R1', { ims: [{ key: key('A'), value: '5' }, { key: key('B'), value: '7' }], vendor: [{ key: key('A'), value: '5' }] })
-  const result = ok(publish(dir, 0, { items: { ...passingAt('P1'), R1: item } }))
-  editJson(result.json, (v) => { ((v.items as Array<{ id: string; counts: Record<string, number> }>).find((i) => i.id === 'R1')!).counts.onlyIms = 0 })
+  const { item } = itemFromComparison('R4', { ims: [{ key: key('A'), value: '5' }, { key: key('B'), value: '7' }], vendor: [{ key: key('A'), value: '5' }] })
+  const result = ok(publish(dir, 0, { items: { ...passingAt('P1'), R4: item } }))
+  editJson(result.json, (v) => { ((v.items as Array<{ id: string; counts: Record<string, number> }>).find((i) => i.id === 'R4')!).counts.onlyIms = 0 })
   const chain = readPackChain(dir)
   assert.deepEqual(chain.ok, false)
 })
 
 test('a capped listing is never a pass, and the counts stay what the evidence lists', () => {
   const rows = Array.from({ length: CAP + 5 }, (_, i) => ({ key: key(`S${i}`), value: '1' }))
-  const { item } = itemFromComparison('R1', { ims: rows, vendor: [], emptyProof: 'vendor-total-zero' })
-  const result = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: item }, hooks: { build: { maxLinesPerItem: CAP } } }))
-  const r1 = result.record.items.find((i) => i.id === 'R1')!
+  const { item } = itemFromComparison('R4', { ims: rows, vendor: [], emptyProof: 'vendor-total-zero' })
+  const result = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R4: item }, hooks: { build: { maxLinesPerItem: CAP } } }))
+  const r1 = result.record.items.find((i) => i.id === 'R4')!
   assert.equal(r1.outcome, 'fail')
   assert.ok(r1.reasons.includes('CAP_EXCEEDED'))
   assert.equal(r1.counts.onlyIms, CAP)
@@ -220,10 +220,10 @@ test('a capped listing is never a pass, and the counts stay what the evidence li
   // an inconclusive item cut by the cap stays inconclusive and gains the reason; a pass-shaped item cannot be capped silently
   const equalRows = Array.from({ length: 6 }, (_, i) => ({ key: key(`E${i}`), value: '1' }))
   const outOfPop = Array.from({ length: CAP + 3 }, (_, i) => ({ key: key(`P${i}`), value: '1' }))
-  const capped = itemFromComparison('R1', { ims: [...equalRows, ...outOfPop], vendor: [...equalRows, ...outOfPop], population: new Set(equalRows.map((r) => JSON.stringify(r.key)).slice(0, 0)), emptyProof: 'vendor-total-zero' })
+  const capped = itemFromComparison('R4', { ims: [...equalRows, ...outOfPop], vendor: [...equalRows, ...outOfPop], population: new Set(equalRows.map((r) => JSON.stringify(r.key)).slice(0, 0)), emptyProof: 'vendor-total-zero' })
   assert.equal(capped.item.outcome === 'pass' || capped.item.outcome === 'inconclusive', true)
-  const r = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: { ...capped.item, outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'], proof: null } }, hooks: { build: { maxLinesPerItem: CAP } } }))
-  assert.ok(r.record.items.find((i) => i.id === 'R1')!.reasons.includes('READ_INCOMPLETE'))
+  const r = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R4: { ...capped.item, outcome: 'inconclusive', reasons: ['READ_INCOMPLETE'], proof: null } }, hooks: { build: { maxLinesPerItem: CAP } } }))
+  assert.ok(r.record.items.find((i) => i.id === 'R4')!.reasons.includes('READ_INCOMPLETE'))
 })
 
 // ---- tampering: every one refuses, none is skipped ---------------------------------------------------
@@ -242,7 +242,7 @@ function chainCode(dir: string): string {
 test('tamper: a changed Markdown, evidence, JSON field, or a stray extra field is PAIR_INVALID, and publishing is refused', () => {
   for (const mutate of [
     (d: string) => writeFileSync(path.join(d, PACK_REPORT_MARKDOWN), 'forged\n'),
-    (d: string) => writeFileSync(path.join(d, PACK_EVIDENCE_FILE), '{"item":"R1"}\n'),
+    (d: string) => writeFileSync(path.join(d, PACK_EVIDENCE_FILE), '{"item":"R4"}\n'),
     (d: string) => editJson(path.join(d, PACK_REPORT_JSON), (v) => { v.exitCode = 0 }),
     (d: string) => editJson(path.join(d, PACK_REPORT_JSON), (v) => { v.extra = 'x' }),
     (d: string) => editJson(path.join(d, PACK_REPORT_JSON), (v) => { delete v.companionMarkdownSha256 }),
@@ -264,7 +264,7 @@ test('tamper: a changed Markdown, evidence, JSON field, or a stray extra field i
 
 test('tamper: the evidence in a report whose digest was also rewritten is still checked line by line', () => {
   const { dir, second } = seeded()
-  const evidence = `${JSON.stringify({ item: 'R1', bucket: 'onlyIms', key: 'victim@example.com', ims: null, vendor: null, delta: null })}\n`
+  const evidence = `${JSON.stringify({ item: 'R4', bucket: 'onlyIms', key: 'victim@example.com', ims: null, vendor: null, delta: null })}\n`
   writeFileSync(path.join(second, PACK_EVIDENCE_FILE), evidence)
   editJson(path.join(second, PACK_REPORT_JSON), (v) => { v.evidence = { file: PACK_EVIDENCE_FILE, sha256: sha256Hex(evidence), lines: 1 } })
   assert.equal(chainCode(dir), 'PAIR_INVALID')
@@ -482,9 +482,9 @@ test('CONCURRENCY: parallel processes publishing into one directory get a contig
 test('SECRETS / DATA ABSENCE: hostile identities never reach any published byte; every evidence key re-validates', () => {
   const canaries = ['victim@example.com', 'https://evil.example/hook?token=abc123', BEARER_SHAPED, STRIPE_SHAPED, 'password=hunter2', 'Customer Name Ltd', 'eyJhbGciOiJIUzI1NiJ9.payload.sig']
   const rows = canaries.map((c) => ({ key: [{ kind: 'sku' as const, raw: c }, { kind: 'warehouse' as const, raw: 'MAIN' }], value: '1' }))
-  const { item } = itemFromComparison('R1', { ims: rows, vendor: [] })
+  const { item } = itemFromComparison('R4', { ims: rows, vendor: [] })
   const dir = fresh()
-  ok(publish(dir, 0, { items: { ...passingAt('P1'), R1: item }, streams: allBrackets() }))
+  ok(publish(dir, 0, { items: { ...passingAt('P1'), R4: item }, streams: allBrackets() }))
   const files = readAll(dir)
   assert.equal(files.length, 4, 'the three report files and the sequence claim')
   const host = os.hostname()
@@ -503,8 +503,8 @@ test('SECRETS / DATA ABSENCE: hostile identities never reach any published byte;
 })
 
 test('the Markdown names no identity at all and states that it renders no verdict', () => {
-  const { item } = itemFromComparison('R1', { ims: [{ key: key('SECRET-LOOKING-SKU-1'), value: '1' }], vendor: [] })
-  const result = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R1: item } }))
+  const { item } = itemFromComparison('R4', { ims: [{ key: key('SECRET-LOOKING-SKU-1'), value: '1' }], vendor: [] })
+  const result = ok(publish(fresh(), 0, { items: { ...passingAt('P1'), R4: item } }))
   const markdown = readFileSync(result.markdown, 'utf8')
   assert.ok(!markdown.includes('SECRET-LOOKING-SKU-1'))
   assert.match(markdown, /renders no overall verdict/)
