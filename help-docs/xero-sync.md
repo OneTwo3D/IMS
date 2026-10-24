@@ -431,7 +431,8 @@ Like other integrations, Xero sync is gated behind a successful connection test.
 ### Permissions (scopes), and why a reconnect is sometimes required
 
 When you authorise IMS, Xero grants a fixed set of **permissions** — invoices, contacts, payments,
-manual journals, attachments, settings. **That grant is frozen at the moment you connect.** Refreshing
+manual journals, attachments, settings, and the trial balance report (`accounting.reports.trialbalance.read`,
+used by the account-balance snapshot behind the reconciliation pack's as-of basis). **That grant is frozen at the moment you connect.** Refreshing
 the access token does not widen it: a refreshed token carries exactly the permissions the original
 consent screen granted.
 
@@ -447,6 +448,9 @@ permission:
 - The **Sync** tab shows a **"Reconnect required"** warning naming the missing permission(s).
 - Affected rows fail with `REQUIRES RECONNECT: …`, naming the permission and stating that **nothing was
   sent** — instead of a bare `401 AuthorizationUnsuccessful` that could be any of a dozen causes.
+- The account-balance snapshot refuses with the same `REQUIRES RECONNECT: …` message, without calling Xero,
+  when the recorded grant lacks the trial-balance permission. **Installations connected before this
+  permission was added must reconnect once** to grant it; until then no balance snapshot is stored.
 - The fix is always the same: **Reconnect** on the Connection tab and approve the consent screen. Then
   retry the failed rows from the **Logs** tab.
 

@@ -33,6 +33,7 @@ mock.module('@/lib/db', {
     },
   },
 })
+mock.module('@/lib/connectors/xero/auth', { namedExports: { getGrantedScopes: async () => null } })
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/connectors/xero/settings', {
   namedExports: {

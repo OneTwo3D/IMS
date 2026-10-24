@@ -1024,7 +1024,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               <p className="text-xs text-amber-800 dark:text-amber-300 ml-6">
                 Not granted: <span className="font-mono">{readiness.missingScopes.join(', ')}</span>.
                 {' '}Syncs that need {readiness.missingScopes.length === 1 ? 'it' : 'them'} — payments,
-                {' '}manual journals or attachments, depending on the permission — will fail until you
+                {' '}manual journals, attachments or the trial-balance snapshot, depending on the permission — will fail until you
                 {' '}<strong>Reconnect</strong> on the Connection tab and approve the new consent screen.
                 {' '}Refreshing the token does not help: it keeps the permissions the original connection
                 {' '}was granted. Rows that failed for this reason can be retried afterwards from the Logs tab.
