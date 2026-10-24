@@ -209,6 +209,11 @@ test('NO realised-FX journal is queued for Xero, by either enqueue, even for a f
     assert.equal(viaFacade.reason, 'not-configured')
     assert.equal(viaTx!.queued, false)
     assert.equal(viaTx!.reason, 'not-configured')
+    // 'not-configured' is the answer that means nothing is OWED: the callers' reportPostingNotQueued does not fire, so no inbox debt either.
+    const { postingIsOwed } = await import('../../lib/domain/accounting/enqueue-outcome.ts')
+    assert.equal(postingIsOwed(viaFacade), false)
+    assert.equal(postingIsOwed(viaTx!), false)
+    assert.equal((await d.db.accountingPostingRefusal.count({ where: { referenceId: { in: [ids.facade, ids.tx] } } })), 0)
     assert.equal((await readBack(d.db, ids.facade)).rows.length, 0)
     assert.equal((await readBack(d.db, ids.tx)).rows.length, 0)
   })
