@@ -6,7 +6,7 @@ import { runCoverageItem, type CoverageContext, type SkuListPort } from '../../l
 import type { ImsRead, ImsReadOptions, ProductRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { parseSkuExclusionFile, type SkuExclusionFile } from '../../lib/reconciliation-pack/sku-exclusions.ts'
 import { NOW } from './helpers.ts'
-import { sourceOf } from './qoblex-fixtures.ts'
+import { lot, sourceOf } from './qoblex-fixtures.ts'
 import { fakeStore, noSleep } from './woo-fixtures.ts'
 
 /**
@@ -17,7 +17,7 @@ const imsProduct = (sku: string, type = 'SIMPLE'): ProductRow => ({ id: `p-${sku
 const wooProduct = (id: number, sku: string) => ({ id, sku, status: 'publish', type: 'simple' })
 const qobProduct = (sku: string, type = 'SIMPLE') => ({ sku, type })
 
-type Rig = { ims?: string[] | ProductRow[]; woo?: Array<[number, string]>; qoblex?: Array<{ sku: string; type: string }> | 'fail'; mintsoft?: SkuListPort | string[] | 'absent'; exclusions?: SkuExclusionFile; imsFail?: boolean }
+type Rig = { stock?: ReturnType<typeof lot>[] | 'fail'; ims?: string[] | ProductRow[]; woo?: Array<[number, string]>; qoblex?: Array<{ sku: string; type: string }> | 'fail'; mintsoft?: SkuListPort | string[] | 'absent'; exclusions?: SkuExclusionFile; imsFail?: boolean }
 function ctx(rig: Rig, over: Partial<CoverageContext> = {}): CoverageContext & { imsCalls: ImsReadOptions[]; fake: ReturnType<typeof fakeStore> } {
   const imsCalls: ImsReadOptions[] = []
   const imsRows = (rig.ims ?? ['A', 'B']).map((p) => (typeof p === 'string' ? imsProduct(p) : p))
@@ -30,7 +30,7 @@ function ctx(rig: Rig, over: Partial<CoverageContext> = {}): CoverageContext & {
       if (rig.imsFail) return { ok: false, reason: 'READ_INCOMPLETE' }
       return { ok: true, snapshotId: '1:2:', sections: { products: { ok: true, value: imsRows } } } as ImsRead
     },
-    qoblex: sourceOf(rig.qoblex === 'fail' ? { products: 'fail' } : { products: rig.qoblex ?? [qobProduct('A'), qobProduct('B')] }),
+    qoblex: sourceOf(rig.qoblex === 'fail' ? { products: 'fail' } : { products: rig.qoblex ?? [qobProduct('A'), qobProduct('B')], stock: rig.stock }),
     wms: mintsoft, exclusions: rig.exclusions,
     ...over,
   }
@@ -197,4 +197,24 @@ test('R14 uses the storefront walk only (GET of products), and returns no storef
   const item = await runCoverageItem(c)
   assert.ok(c.fake.calls.length >= 2 && c.fake.calls.every((call) => call.collection === 'products'))
   assert.ok(!JSON.stringify(item).includes('publish'))
+})
+
+// [mutation: the stock-part requirement / the stock-against-products check removed]
+test('R14 needs the export to agree with itself: a stocked SKU missing from the product list, or no readable stock part, is inconclusive, never a pass', async () => {
+  // the regression: stock holds B, the product list only A, and every other leg only A
+  const incomplete = await runCoverageItem(ctx({ ims: ['A'], woo: [[1, 'A']], qoblex: [qobProduct('A')], mintsoft: ['A'], stock: [lot('A', 'MIL1', '1'), lot('B', 'MIL1', '1')] }))
+  assert.deepEqual([incomplete.outcome, incomplete.reasons], ['inconclusive', ['EXPORT_INCONSISTENT']])
+  assert.equal(incomplete.entries, undefined)
+  // a zero-quantity stock row and a 3PL location are still SKUs the export names
+  const zero = await runCoverageItem(ctx({ ims: ['A'], woo: [[1, 'A']], qoblex: [qobProduct('A')], mintsoft: ['A'], stock: [lot('B', 'RXT2', '0')] }))
+  assert.deepEqual(zero.reasons, ['EXPORT_INCONSISTENT'])
+  // the case is exact: a stocked 'a' is not the listed 'A'
+  const folded = await runCoverageItem(ctx({ ims: ['A'], woo: [[1, 'A']], qoblex: [qobProduct('A')], mintsoft: ['A'], stock: [lot('a', 'MIL1', '1')] }))
+  assert.deepEqual(folded.reasons, ['EXPORT_INCONSISTENT'])
+  // consistent: every stocked SKU is listed
+  const ok = await runCoverageItem(ctx({ ims: ['A'], woo: [[1, 'A']], qoblex: [qobProduct('A')], mintsoft: ['A'], stock: [lot('A', 'MIL1', '1'), lot('A', 'CAMBRIDGE', '2')] }))
+  assert.equal(ok.outcome, 'pass', JSON.stringify(ok.reasons))
+  // no stock part to cross-check the list against
+  const noStock = await runCoverageItem(ctx({ ims: ['A'], woo: [[1, 'A']], qoblex: [qobProduct('A')], mintsoft: ['A'], stock: 'fail' }))
+  assert.deepEqual([noStock.outcome, noStock.reasons], ['inconclusive', ['SOURCE_UNREADABLE']])
 })

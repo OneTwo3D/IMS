@@ -274,3 +274,15 @@ test('END TO END: an exclusion with expiresAt named twice excludes nothing, so R
   await run(r, args(scratchDir(bases), '--items', 'R14', '--qoblex-export', exportDir, '--vendor-reads-only', '--sku-exclusions', file))
   assert.equal(line(r, 'R14'), 'R14 fail DIFFERENCES')
 })
+
+// [mutation: the stock-against-products check removed from R14]
+test('END TO END: a stock file naming a SKU the separate products file lacks makes R14 inconclusive EXPORT_INCONSISTENT, though every other leg agrees with the products file', async () => {
+  const exportDir = writeExport(bases, {
+    stock: stockCsv([{ sku: 'SKU-1', location: 'MIL1', qty: '1', unitCost: '1' }, { sku: 'SKU-9', location: 'MIL1', qty: '1', unitCost: '1' }]),
+    products: productsCsv([{ sku: 'SKU-1' }]),
+  })
+  const r = rig({ imsSkus: ['SKU-1'], wooSkus: ['SKU-1'] })
+  r.deps.wmsSkus = async () => ({ ok: true, skus: ['SKU-1'] })
+  await run(r, args(scratchDir(bases), '--items', 'R14', '--qoblex-export', exportDir, '--vendor-reads-only'))
+  assert.equal(line(r, 'R14'), 'R14 inconclusive EXPORT_INCONSISTENT')
+})

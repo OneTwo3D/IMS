@@ -73,6 +73,12 @@ async function runR14(context: CoverageContext): Promise<ItemInput> {
   if (!qoblex.ok) return inconclusive([QOBLEX], qoblex.reason)
   if (!qoblex.value.products.ok) return inconclusive([QOBLEX], qoblex.value.products.reason)
   const qoblexProducts = qoblex.value.products.value
+  // THE EXPORT MUST AGREE WITH ITSELF. The stock part is the only cross-check the export offers on its own product list (nothing in it proves
+  // the list complete), so R14 needs it readable, and every SKU it holds, in any location and whatever the quantity, must be a product of the
+  // list, exactly. A product list that leaves out a stocked SKU is an incomplete list, and a leg built from it would pass by omission.
+  if (!qoblex.value.stock.ok) return inconclusive([QOBLEX], qoblex.value.stock.reason)
+  const listed = new Set(qoblexProducts.map((p) => p.sku))
+  if (qoblex.value.stock.value.some((lot) => !listed.has(lot.sku))) return inconclusive([QOBLEX], 'EXPORT_INCONSISTENT')
 
   const read = await readIms({ sections: ['products'] })
   if (!read.ok) return inconclusive([IMS, QOBLEX], read.reason)

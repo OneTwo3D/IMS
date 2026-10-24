@@ -7,7 +7,7 @@ import { runPackCli, type PackCliDeps } from '../../scripts/reconciliation-pack.
 import type { ImsQueryClient } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { fakeBasisPort, goodState, healthyLiveness } from './basis-fixtures.ts'
 import { NOW, cleanup, realEvidence, scratchDir } from './helpers.ts'
-import { ASOF, productsCsv, writeExport } from './qoblex-fixtures.ts'
+import { ASOF, productsCsv, stockCsv, writeExport } from './qoblex-fixtures.ts'
 import { PROBE_WH5, PROBE_WH6, cuid } from './wms-fixtures.ts'
 import { fakeStore } from './woo-fixtures.ts'
 
@@ -86,7 +86,7 @@ function rig(base: string, config: { mode?: string; wooSkus?: string[] } = {}): 
 const run = (r: Rig, argv: string[]) => runPackCli({ argv, env: { DATABASE_URL: 'postgresql://ims@127.0.0.1:1/x' }, uid: 1000, checkoutOwnerUid: 1000, repoRoot: process.cwd(), keepProcessEnv: true, deps: r.deps, stdout: (t) => r.out.push(t), stderr: (t) => r.err.push(t) })
 const args = (items: string, ...more: string[]) => ['--phase', 'P1', '--as-of', ASOF, '--items', items, '--report-dir', scratchDir(bases), '--vendor-reads-only', ...more]
 const line = (r: Rig, id: string) => r.out.find((l) => l.startsWith(`${id} `))
-const exportOf = (skus: string[] = ALL) => writeExport(bases, { products: productsCsv(skus.map((sku) => ({ sku }))) })
+const exportOf = (skus: string[] = ALL) => writeExport(bases, { products: productsCsv(skus.map((sku) => ({ sku }))), stock: stockCsv(skus.map((sku) => ({ sku, location: 'MIL1', qty: '1', unitCost: '1' }))) })
 
 // [mutation: the SKU port not wired by default / a second Mintsoft reader / the leg dropped from the sources]
 test('R14 passes four-way against a loopback Mintsoft: the census SKUs (bundles included) are present in Qoblex, WooCommerce, Mintsoft and IMS; GET only, never /api/Auth', async () => {
