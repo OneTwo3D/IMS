@@ -8,12 +8,13 @@ import { formatFinancialYearEnd, parseFinancialYearEnd, windowCrossesFinancialYe
  * GL COGS reconciliation must be WITHHELD (by name) for a window that crosses it, through the real movement reader.
  */
 let accountType: string | null = 'DIRECTCOSTS'
-let yearEnd: string | null = '12-31'
+let openingYearEnd: string | null = '12-31'
+let closingYearEnd: string | null = '12-31'
 let closingDate = '2027-01-02'
 
 const snap = (id: string, date: string, amount: string) => ({
   id, connector: 'xero', externalAccountId: 'a-310', accountCode: '310', accountName: 'COGS', balanceDate: new Date(`${date}T00:00:00.000Z`),
-  currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId: null, syncRunId: null, fetchedAt: new Date(),
+  currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId: 't1', financialYearEnd: openingYearEnd, syncRunId: null, fetchedAt: new Date(),
 })
 mock.module('@/lib/db', {
   namedExports: {
@@ -21,11 +22,11 @@ mock.module('@/lib/db', {
       accountingAccountBalanceSnapshot: {
         findFirst: async ({ where }: { where: { balanceDate: { lte: Date } } }) => {
           const d = where.balanceDate.lte.toISOString().slice(0, 10)
-          return d >= closingDate ? snap('c', closingDate, '40') : snap('o', '2026-12-31', '900')
+          return d >= closingDate ? { ...snap('c', closingDate, '40'), financialYearEnd: closingYearEnd } : snap('o', '2026-12-31', '900')
         },
       },
       accountingAccount: { findFirst: async () => (accountType === null ? null : { type: accountType }) },
-      setting: { findUnique: async ({ where }: { where: { key: string } }) => (where.key === 'xero_financial_year_end' ? (yearEnd === null ? null : { value: yearEnd }) : { value: '2026-01-01' }) },
+      setting: { findUnique: async () => ({ value: '2026-01-01' }) },
       cogsSubledgerMovement: { aggregate: async () => ({ _sum: { baseDelta: 40 } }) },
     },
   },
@@ -45,14 +46,14 @@ async function reconcile() {
 }
 
 test('the GL COGS reconciliation is withheld by name when the window crosses the financial-year start', async () => {
-  accountType = 'DIRECTCOSTS'; yearEnd = '12-31'; closingDate = '2027-01-01'
+  accountType = 'DIRECTCOSTS'; openingYearEnd = '12-31'; closingYearEnd = '12-31'; closingDate = '2027-01-01'
   // opening is the day before the closing date: 2026-12-31, closing 2027-01-01 (YTD restarted).
   const result = await reconcile()
   assert.deepEqual(result, { available: false, reason: 'financial_year_boundary' })
 })
 
-test('an unrecorded financial-year end withholds a profit-and-loss account', async () => {
-  accountType = 'EXPENSE'; yearEnd = null; closingDate = '2027-01-01'
+test('a year end that changed between the two balances withholds a profit-and-loss account', async () => {
+  accountType = 'EXPENSE'; openingYearEnd = '12-31'; closingYearEnd = '03-31'; closingDate = '2026-12-31'
   assert.deepEqual(await reconcile(), { available: false, reason: 'financial_year_boundary' })
 })
 

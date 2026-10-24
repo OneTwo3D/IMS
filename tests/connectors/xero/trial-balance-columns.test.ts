@@ -9,12 +9,11 @@ import { toDecimal } from '../../../lib/domain/math/decimal.ts'
  * its account.
  */
 
-type Persisted = Array<{ accountCode?: string | null; amountBase: unknown }>
+type Persisted = Array<{ accountCode?: string | null; amountBase: unknown; financialYearEnd?: string | null; tenantId?: string | null }>
 let persisted: Persisted = []
 let persistCalls = 0
 let trialBalance: unknown = {}
 let orgFields: Record<string, number | undefined> = {}
-let fenceWrites: Array<[string, string]> = []
 const chart = [
   { externalAccountId: 'a-310', code: '310', name: 'Cost of Goods Sold' },
   { externalAccountId: 'a-631', code: '631', name: 'Inventory Control' },
@@ -40,7 +39,7 @@ mock.module('@/lib/connectors/xero/api', {
 mock.module('@/lib/connectors/xero/connection-fence', {
   namedExports: {
     captureXeroConnection: async () => ({ tenantId: 'tenant-x', connectionGeneration: 'gen-1' }),
-    withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => ({ ok: true, value: await fn({ setting: { upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { fenceWrites.push([where.key, create.value]) } } }) }),
+    withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => ({ ok: true, value: await fn({ setting: { upsert: async () => undefined } }) }),
   },
 })
 mock.module('@/lib/domain/accounting/account-balance-snapshots', {
@@ -119,23 +118,32 @@ test('a refused row for an account that is NOT configured does not block the con
   assert.deepEqual(stored(), { '310': '73019.20', '631': '123639.63', '810': '-100.81' })
 })
 
-test('the organisation financial-year end is recorded in the same fenced transaction as the balances', async () => {
+test('the organisation financial-year end is stored WITH each snapshot, with the tenant', async () => {
   trialBalance = realReport()
   orgFields = { FinancialYearEndMonth: 3, FinancialYearEndDay: 31 }
-  fenceWrites = []
   const result = await pull()
   orgFields = {}
   assert.deepEqual(result.errors, [])
-  assert.deepEqual(fenceWrites, [['xero_financial_year_end', '03-31']])
+  assert.deepEqual(persisted.map((s) => [s.accountCode, s.financialYearEnd, s.tenantId]).sort(), [['310', '03-31', 'tenant-x'], ['631', '03-31', 'tenant-x'], ['810', '03-31', 'tenant-x']])
 })
 
-test('no financial-year end is written when the Organisation does not carry one, or carries an impossible one', async () => {
+test('an Organisation without a valid year end stores null on every snapshot (the previous value is never carried over)', async () => {
   for (const fields of [{} as Record<string, number>, { FinancialYearEndMonth: 2, FinancialYearEndDay: 30 }, { FinancialYearEndMonth: 0, FinancialYearEndDay: 1 }]) {
     trialBalance = realReport()
     orgFields = fields
-    fenceWrites = []
     await pull()
-    assert.deepEqual(fenceWrites, [], JSON.stringify(fields))
+    assert.deepEqual(persisted.map((s) => s.financialYearEnd), [null, null, null], JSON.stringify(fields))
   }
   orgFields = {}
+})
+
+test('a year end that changes between two pulls is stored as it was at each pull', async () => {
+  trialBalance = realReport()
+  orgFields = { FinancialYearEndMonth: 12, FinancialYearEndDay: 31 }
+  await pull()
+  const first = persisted.map((s) => s.financialYearEnd)
+  orgFields = { FinancialYearEndMonth: 3, FinancialYearEndDay: 31 }
+  await pull()
+  orgFields = {}
+  assert.deepEqual([first[0], persisted[0]!.financialYearEnd], ['12-31', '03-31'])
 })

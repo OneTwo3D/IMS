@@ -6,7 +6,7 @@ import {
   type AccountingAccountBalanceSnapshotInput,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
-import { formatFinancialYearEnd, XERO_FINANCIAL_YEAR_END_SETTING } from '@/lib/domain/accounting/financial-year'
+import { formatFinancialYearEnd } from '@/lib/domain/accounting/financial-year'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
 import { getGrantedScopes } from './auth'
@@ -79,6 +79,8 @@ type XeroAccountBalanceSnapshotBuildInput = {
   syncRunId?: string | null
   /** The tenant of the connection the trial balance was fetched under. */
   tenantId?: string | null
+  /** The organisation's financial-year end ("MM-DD") at the pull; null when the Organisation did not carry a valid one. */
+  financialYearEnd?: string | null
 }
 
 function attrValue(cell: XeroReportCell | undefined, ids: string[]): string | null {
@@ -336,6 +338,9 @@ export function buildXeroAccountBalanceSnapshotInputs(
       amountBase: amount,
       sourcePayloadRef: xeroTrialBalanceRef(input.balanceDate, parsed === null),
       tenantId: input.tenantId ?? null,
+      // Stored WITH the balance (the Trial Balance is year-to-date, so a P&L balance is only comparable with one that proves
+      // the same year end). Null when the Organisation carried none: an old value is never kept.
+      financialYearEnd: input.financialYearEnd ?? null,
       syncRunId: input.syncRunId ?? null,
     })
   }
@@ -403,20 +408,11 @@ export async function syncXeroAccountBalanceSnapshots(
     baseCurrency,
     syncRunId: options.syncRunId ?? null,
     tenantId: connection?.tenantId ?? null,
+    financialYearEnd: xeroOrganisation.financialYearEnd,
   })
 
   const fenced = await withXeroConnectionFence(connection, async (tx) => {
     const stored = await persistAccountingAccountBalanceSnapshots(snapshots, tx as never)
-    // The Trial Balance is year-to-date, so a profit-and-loss account's balance restarts at the financial-year start. Record
-    // the year end (from the Organisation already fetched for the base currency) in the same transaction as the balances, so
-    // every reader that differences two stored balances can tell when a window crosses it.
-    if (stored.persisted > 0 && xeroOrganisation.financialYearEnd) {
-      await tx.setting.upsert({
-        where: { key: XERO_FINANCIAL_YEAR_END_SETTING },
-        create: { key: XERO_FINANCIAL_YEAR_END_SETTING, value: xeroOrganisation.financialYearEnd },
-        update: { value: xeroOrganisation.financialYearEnd },
-      })
-    }
     // The last-success stamp is written in THIS transaction, after the snapshots, and only for a clean
     // scheduled pull that stored a snapshot for every distinct account it was configured to fetch. A
     // pull that fetched but matched no configured account in the chart (nothing to store), one that

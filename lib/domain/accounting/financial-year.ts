@@ -9,9 +9,6 @@
  */
 import { normalizeBalanceDate } from '@/lib/domain/accounting/balance-date'
 
-/** "MM-DD" of the last day of the organisation's financial year, written by the Trial Balance pull from the Organisation. */
-export const XERO_FINANCIAL_YEAR_END_SETTING = 'xero_financial_year_end'
-
 const DAY_MS = 24 * 60 * 60 * 1000
 
 /** Account types that carry a lifetime balance. Anything NOT in this list (including an unknown type) is treated as periodic. */

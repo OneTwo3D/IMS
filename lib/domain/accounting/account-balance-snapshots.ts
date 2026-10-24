@@ -6,7 +6,6 @@ import {
   isLifetimeBalanceAccountType,
   parseFinancialYearEnd,
   windowCrossesFinancialYearStart,
-  XERO_FINANCIAL_YEAR_END_SETTING,
 } from '@/lib/domain/accounting/financial-year'
 
 // The date helpers live in their own module (no database) so the reconciliation pack can use them without loading lib/db.
@@ -27,6 +26,8 @@ export type AccountingAccountBalanceSnapshotInput = {
   sourcePayloadRef?: string | null
   /** The organisation the balance was fetched from; null/absent = unknown. */
   tenantId?: string | null
+  /** The organisation's financial-year end ("MM-DD") in force at the pull; null/absent = not proven. */
+  financialYearEnd?: string | null
   syncRunId?: string | null
   fetchedAt?: Date
 }
@@ -43,6 +44,7 @@ export type AccountingAccountBalanceSnapshotRow = {
   amountBase: Decimal
   sourcePayloadRef: string | null
   tenantId: string | null
+  financialYearEnd: string | null
   syncRunId: string | null
   fetchedAt: Date
 }
@@ -55,7 +57,7 @@ export type PersistAccountingAccountBalanceSnapshotResult = {
 
 type SnapshotClient = Pick<PrismaClient, 'accountingAccountBalanceSnapshot'> & Partial<Pick<PrismaClient, '$transaction'>>
 /** What a period movement reads: the snapshots, plus the chart (account type) and the stored financial-year end. */
-type MovementClient = SnapshotClient & Pick<PrismaClient, 'accountingAccount' | 'setting'>
+type MovementClient = SnapshotClient & Pick<PrismaClient, 'accountingAccount'>
 
 export type AccountBalanceSnapshotLookup = {
   connector: string
@@ -77,7 +79,7 @@ export type MissingAccountBalanceSnapshotReason =
 
 export type AccountBalanceMovementWithheldReason =
   | 'window_crosses_financial_year_start'
-  | 'financial_year_end_unknown'
+  | 'financial_year_end_unproven'
 
 /**
  * A closing-minus-opening movement that would not be a movement: the account is a profit-and-loss account (its Trial Balance
@@ -90,7 +92,7 @@ export class AccountBalanceMovementWithheldError extends Error {
   constructor(input: { reason: AccountBalanceMovementWithheldReason; accountCode: string | null; openingDate: string; closingDate: string }) {
     super(input.reason === 'window_crosses_financial_year_start'
       ? `Account ${input.accountCode ?? 'unknown'} is a profit-and-loss account whose year-to-date balance restarts at the financial-year start, which falls between ${input.openingDate} and ${input.closingDate}; the movement is withheld.`
-      : `Account ${input.accountCode ?? 'unknown'} is a profit-and-loss account and the organisation's financial-year end is not recorded, so a movement between ${input.openingDate} and ${input.closingDate} is withheld.`)
+      : `Account ${input.accountCode ?? 'unknown'} is a profit-and-loss account and its two balances do not prove the same financial-year end for the same organisation, so a movement between ${input.openingDate} and ${input.closingDate} is withheld.`)
     this.name = 'AccountBalanceMovementWithheldError'
     this.reason = input.reason
     this.accountCode = input.accountCode
@@ -164,6 +166,8 @@ function normalizeInput(input: AccountingAccountBalanceSnapshotInput) {
     amountBase: roundQuantity(input.amountBase, 6),
     sourcePayloadRef: input.sourcePayloadRef?.trim() || null,
     tenantId: input.tenantId?.trim() || null,
+    // Only a real MM-DD is kept; anything else is 'not proven'.
+    financialYearEnd: parseFinancialYearEnd(input.financialYearEnd) ? input.financialYearEnd!.trim() : null,
     syncRunId: input.syncRunId?.trim() || null,
     fetchedAt: input.fetchedAt ?? new Date(),
   }
@@ -187,6 +191,7 @@ function upsertSnapshotArgs(normalized: NormalizedAccountingAccountBalanceSnapsh
       amountBase: normalized.amountBase,
       sourcePayloadRef: normalized.sourcePayloadRef,
       tenantId: normalized.tenantId,
+      financialYearEnd: normalized.financialYearEnd,
       syncRunId: normalized.syncRunId,
       fetchedAt: normalized.fetchedAt,
     },
@@ -286,9 +291,15 @@ export async function getAccountBalancePeriodMovement(
     const withheld = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({
       reason, accountCode: closing.accountCode, openingDate: balanceDateString(opening.balanceDate), closingDate: balanceDateString(closing.balanceDate),
     })
-    const setting = await client.setting.findUnique({ where: { key: XERO_FINANCIAL_YEAR_END_SETTING }, select: { value: true } })
-    const yearEnd = parseFinancialYearEnd(setting?.value)
-    if (!yearEnd) throw withheld('financial_year_end_unknown')
+    // Each balance carries the year end in force when it was pulled, and the organisation it was pulled from. A year end that
+    // changed between the two pulls, a balance that does not prove one, or two organisations: nothing to difference.
+    const openingYearEnd = parseFinancialYearEnd(opening.financialYearEnd)
+    const closingYearEnd = parseFinancialYearEnd(closing.financialYearEnd)
+    const sameOrganisation = typeof opening.tenantId === 'string' && opening.tenantId.length > 0 && opening.tenantId === closing.tenantId
+    if (!openingYearEnd || !closingYearEnd || !sameOrganisation || openingYearEnd.month !== closingYearEnd.month || openingYearEnd.day !== closingYearEnd.day) {
+      throw withheld('financial_year_end_unproven')
+    }
+    const yearEnd = closingYearEnd
     if (windowCrossesFinancialYearStart(opening.balanceDate, closing.balanceDate, yearEnd)) throw withheld('window_crosses_financial_year_start')
   }
   return {
