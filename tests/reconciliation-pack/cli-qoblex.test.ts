@@ -261,3 +261,16 @@ test('END TO END: a manifest that names one data file under two digests rejects 
   for (const id of ['R2', 'R5', 'R14']) assert.equal(line(r, id), `${id} inconclusive MANIFEST_INCONSISTENT`, id)
   assert.ok(!r.sent.some((sql) => /inventory_snapshots/.test(sql)), 'IMS snapshot not read')
 })
+
+// [mutation: parseSkuExclusionFile back on JSON.parse]
+test('END TO END: an exclusion with expiresAt named twice excludes nothing, so R14 cannot pass on it', async () => {
+  const exportDir = writeExport(bases)
+  const folder = scratchDir(bases)
+  const file = path.join(folder, 'exclusions.json')
+  const entry = '{"sku":"SKU-3","system":"woocommerce","acceptedBy":"owner","acceptedAt":"2026-10-01T00:00:00Z","reason":"not on the shop on purpose","expiresAt":"2026-10-10T00:00:00Z","expiresAt":"2026-12-01T00:00:00Z"}'
+  writeFileSync(file, `{"schemaVersion":1,"exclusions":[${entry}]}`, { mode: 0o644 })
+  const r = rig({ wooSkus: ['SKU-1', 'SKU-2'] })
+  r.deps.wmsSkus = async () => ({ ok: true, skus: ['SKU-1', 'SKU-2', 'SKU-3'] })
+  await run(r, args(scratchDir(bases), '--items', 'R14', '--qoblex-export', exportDir, '--vendor-reads-only', '--sku-exclusions', file))
+  assert.equal(line(r, 'R14'), 'R14 fail DIFFERENCES')
+})

@@ -37,6 +37,7 @@ import { parseCsvStrict } from '@/lib/first-load/csv'
 import { PRODUCT_TYPES } from '@/lib/first-load/spec'
 import { idToken, parseSku } from '@/lib/first-load/validate'
 import { QOBLEX_NATIVE_COLUMN_MAP } from '@/lib/reconciliation-pack/qoblex-native-map'
+import { DuplicateMemberError, parseJsonNoDuplicates } from '@/lib/ops/strict-json'
 import { checkAncestors, readTrustedRegularFileBytes } from '@/lib/ops/published-report'
 import { parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
 import {
@@ -117,7 +118,8 @@ function calendarDate(value: unknown): string {
 /** The manifest, strictly. Total in the sense that anything wrong throws an Unreadable and nothing else. */
 export function parseQoblexManifest(text: string): Manifest {
   let raw: unknown
-  try { raw = JSON.parse(text) } catch { return bad() }
+  // A member named twice (two threePl on a location, say) is a manifest that says two things: refused whole (lib/ops/strict-json.ts).
+  try { raw = parseJsonNoDuplicates(text) } catch (error) { return bad(error instanceof DuplicateMemberError ? 'MANIFEST_INCONSISTENT' : 'SOURCE_UNREADABLE') }
   const r = record(raw, ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations', 'stock', 'products'], ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations'])
   if (r.formatVersion !== QOBLEX_MANIFEST_VERSION) return bad()
   if (r.baseCurrency !== QOBLEX_BASE_CURRENCY) return bad('CURRENCY_UNKNOWN')

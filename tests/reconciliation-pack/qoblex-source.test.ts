@@ -313,6 +313,22 @@ test('a SKU or warehouse code the ingest would trim or normalise is IDENTITY_NOT
   }
 })
 
+// [mutation: the manifest parsed with JSON.parse]
+test('a manifest naming a member twice, at the top level or nested (a location with two threePl), is rejected whole', () => {
+  const text = (edit: (json: string) => string) => {
+    const base = JSON.stringify({ formatVersion: 1, exportedAt: EXPORTED_AT, asOf: ASOF, baseCurrency: 'GBP', locations: LOCATIONS.map((l) => ({ ...l })) })
+    const out = edit(base)
+    assert.notEqual(out, base)
+    return out
+  }
+  for (const manifestText of [
+    text((j) => j.replace('"asOf"', '"asOf":"2026-10-18","asOf"')),
+    text((j) => j.replace('"threePl":false', '"threePl":true,"threePl":false')),
+    text((j) => j.replace('"code":"MIL1"', '"code":"RXT2","code":"MIL1"')),
+    text((j) => j.replace('"formatVersion":1', '"formatVersion":1,"formatVersion":1')),
+  ]) refused(writeExport(bases, { manifestText }), 'MANIFEST_INCONSISTENT')
+})
+
 // [mutation: the shared promise removed so each item reads the export again]
 test('the source reads the export ONCE for the run and hands every item the same result', async () => {
   const dir = writeExport(bases)

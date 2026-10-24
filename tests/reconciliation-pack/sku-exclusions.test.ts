@@ -4,6 +4,7 @@ import path from 'node:path'
 import test, { afterEach } from 'node:test'
 
 import { SKU_EXCLUSION_DEFAULT_FILE, SKU_EXCLUSION_MAX_ENTRIES } from '../../lib/reconciliation-pack/constants.ts'
+import { loadAcceptances } from '../../lib/reconciliation-pack/acceptances.ts'
 import { exclusionsInForce, loadSkuExclusions, parseSkuExclusionFile } from '../../lib/reconciliation-pack/sku-exclusions.ts'
 import { NOW, cleanup, scratchDir } from './helpers.ts'
 
@@ -80,4 +81,34 @@ test('an oversized named file is a refusal and a default one is rejected (read a
   const big = path.join(dir, 'big.json')
   writeFileSync(big, ' '.repeat(9 * 1024 * 1024), { mode: 0o644 })
   assert.deepEqual(loadSkuExclusions(big, '/var/tmp'), { refused: true })
+})
+
+// [mutation: parseSkuExclusionFile back on JSON.parse]
+test('an exclusion naming a member twice (expiresAt expired and current, either order, or any other member) rejects the whole file, so it excludes nothing', () => {
+  const base = JSON.stringify(entry({ expiresAt: 'PLACEHOLDER' }))
+  const withTwo = (first: string, second: string) => `{"schemaVersion":1,"exclusions":[${base.replace('"expiresAt":"PLACEHOLDER"', `"expiresAt":"${first}","expiresAt":"${second}"`)}]}`
+  const expired = '2026-10-10T00:00:00Z'
+  const current = '2026-12-01T00:00:00Z'
+  assert.equal(exclusionsInForce(parseSkuExclusionFile(file([entry()])), NOW).length, 1)
+  for (const text of [withTwo(expired, current), withTwo(current, expired), withTwo(current, current)]) {
+    const parsed = parseSkuExclusionFile(text)
+    assert.equal(parsed.status, 'rejected', text)
+    assert.equal(exclusionsInForce(parsed, NOW).length, 0, text)
+  }
+  assert.equal(parseSkuExclusionFile(`{"schemaVersion":1,"schemaVersion":1,"exclusions":[]}`).status, 'rejected')
+  assert.equal(parseSkuExclusionFile(`{"schemaVersion":1,"exclusions":[${JSON.stringify(entry()).replace('"system":"woocommerce"', '"system":"woocommerce","system":"ims"')}]}`).status, 'rejected')
+})
+
+// [mutation: the acceptance parser the pack delegates to back on JSON.parse]
+test('THE PACK\'S R15 ACCEPTANCE FILE (read through the gate\'s parser): expiresAt named twice rejects the whole file', () => {
+  const dir = scratchDir(bases)
+  const file = path.join(dir, 'a.json')
+  const base = JSON.stringify({ warningId: 'w-1', acceptedBy: 'owner', acceptedAt: '2026-10-01T00:00:00Z', reason: 'reviewed and accepted', expiresAt: 'PLACEHOLDER', phases: ['P1'] })
+  const text = (a: string, b: string) => `{"schemaVersion":1,"acceptances":[${base.replace('"expiresAt":"PLACEHOLDER"', `"expiresAt":"${a}","expiresAt":"${b}"`)}]}`
+  writeFileSync(file, text('2026-10-10T00:00:00Z', '2026-12-01T00:00:00Z'), { mode: 0o644 })
+  const loaded = loadAcceptances(file, '/var/tmp')
+  assert.ok('file' in loaded && loaded.file.status === 'rejected' && loaded.file.entries.length === 0)
+  writeFileSync(file, text('2026-12-01T00:00:00Z', '2026-12-01T00:00:00Z').replace(/"expiresAt":"2026-12-01T00:00:00Z","expiresAt":"2026-12-01T00:00:00Z"/, '"expiresAt":"2026-12-01T00:00:00Z"'), { mode: 0o644 })
+  const single = loadAcceptances(file, '/var/tmp')
+  assert.ok('file' in single && single.file.status === 'ok' && single.file.entries.length === 1)
 })

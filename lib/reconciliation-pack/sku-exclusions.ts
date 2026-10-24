@@ -5,7 +5,7 @@
  * The trust is the R15 acceptance file's (lib/reconciliation-pack/acceptances.ts): used only if it is a regular file (a symlink is never
  * followed) owned by root or the running account, not writable by group or others, in a directory whose every ancestor only root or that
  * account can modify. Otherwise the WHOLE file is rejected and accepts nothing, so R14 reports every missing SKU: the safe side. The
- * format is closed: an unknown field, a version other than 1, a repeated (SKU, system) pair, a system that is not one of the four, or
+ * format is closed: a member named twice anywhere (strict-json.ts), an unknown field, a version other than 1, a repeated (SKU, system) pair, a system that is not one of the four, or
  * more entries than the cap rejects the WHOLE file (which exclusion applies would be ambiguous); an entry that is incomplete (who, why,
  * when, a reason of at least 15 characters, an expiry after the acceptance and within 90 days) accepts nothing and the others stand.
  * Whether an entry is IN FORCE is decided against the run's clock: not before it was accepted, and not at or after its expiry.
@@ -15,6 +15,7 @@
 
 import path from 'node:path'
 
+import { parseJsonNoDuplicates } from '@/lib/ops/strict-json'
 import { ACCEPTANCE_REASON_MIN_LENGTH } from '@/lib/ops/readiness-gate-constants'
 import { UntrustedPathError, readTrustedRegularFile } from '@/lib/ops/published-report'
 import {
@@ -52,7 +53,8 @@ const REJECTED: SkuExclusionFile = { status: 'rejected', entries: [] }
 export function parseSkuExclusionFile(text: string | null): SkuExclusionFile {
   if (text === null) return { status: 'absent', entries: [] }
   let parsed: unknown
-  try { parsed = JSON.parse(text) } catch { return REJECTED }
+  // A repeated member (two expiresAt, one expired) is malformed: JSON.parse would keep the last (lib/ops/strict-json.ts).
+  try { parsed = parseJsonNoDuplicates(text) } catch { return REJECTED }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return REJECTED
   const file = parsed as Record<string, unknown>
   if (Object.keys(file).some((key) => !(FILE_KEYS as readonly string[]).includes(key))) return REJECTED
