@@ -83,10 +83,11 @@ export const sale = (period: string, taxRateId: string | null, taxBase: string, 
 
 type Json = Record<string, unknown>
 export const uuid = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`
-export type XeroLine = { type: string; tax: number; account?: string }
+/** `account` defaults to the sales account '200'; null leaves the code off the line. */
+export type XeroLine = { type: string; tax: number; account?: string | null }
 export const invoice = (n: number, date: string, lines: XeroLine[], over: Json = {}): Json => ({
   InvoiceID: uuid(n), Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1,
-  LineItems: lines.map((line) => ({ TaxType: line.type, TaxAmount: line.tax, ...(line.account === undefined ? {} : { AccountCode: line.account }) })), ...over,
+  LineItems: lines.map((line) => ({ TaxType: line.type, TaxAmount: line.tax, ...(line.account === null ? {} : { AccountCode: line.account ?? '200' }) })), ...over,
 })
 
 export type XeroCall = { resource: XeroResource; params: Record<string, string> }

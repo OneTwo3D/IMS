@@ -27,6 +27,9 @@
  *
  *   SHIPPING AND FEES. Shipping VAT is cut from every side and the cut must be provable: the Xero shipping account must be configured, one
  *   active account of the stored chart, and neither the sales nor the discount account (else VAT_MAPPING_UNVERIFIED before any request).
+ *   A TAXABLE XERO LINE COUNTS ONLY WITH A PROVEN CLASSIFICATION: its AccountCode must be the sales account (IMS posts every goods and fee line
+ *   there, order-import.ts:2678) or the discount account (the order discount line, xero/invoices.ts); shipping is cut by its account; a taxable
+ *   line with no code or any other account makes the item unverified. Zero-tax lines are harmless.
  *   IMS never makes shipping a sales line (it is order level: shippingForeign, and the order's taxForeign adds shipping tax to the line tax,
  *   order-import.ts:178-195), and WooCommerce's shipping_tax_total is never read. FEE lines are different: IMS turns them into sales lines
  *   (field-mapping.ts mapWcFeeLines, order-import.ts:1926) and the storefront's tax_total is understood to count them, but that is not
@@ -274,7 +277,7 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
   // the account must be configured, be exactly one active account of the stored chart, and not be the sales or the discount account (a
   // shared account cannot tell shipping from goods).
   const shared = (account: string) => account !== '' && account === vat.shippingAccount
-  if (vat.shippingAccount === '' || !vat.shippingAccountInChart || shared(vat.salesAccount) || shared(vat.discountAccount)) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
+  if (vat.shippingAccount === '' || !vat.shippingAccountInChart || vat.salesAccount === '' || shared(vat.salesAccount) || shared(vat.discountAccount)) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
 
   // THE IMS SIDE, before any vendor request: every non-zero figure must have a verified place.
   const imsSums: Sums = new Map()
@@ -317,6 +320,12 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
       if (line.accountCode === vat.shippingAccount) continue
       const amount = D(line.taxAmount)
       if (amount.isZero()) continue
+      // A taxable line counts only when its classification is PROVEN: IMS posts goods and fee lines to the sales account
+      // (order-import.ts:2678 accountCode: settings.salesAccount) and the order discount to the discount account (invoices.ts discountAccountCode);
+      // shipping is the shipping account (cut above). A taxable line with no account code, or on any other account, is unclassified:
+      // the item is unverified whatever it nets to, and it is never counted.
+      const code = line.accountCode
+      if (code === null || (code !== vat.salesAccount && !(vat.discountAccount !== '' && code === vat.discountAccount))) return inconclusive([LEDGER, XERO], 'VAT_MAPPING_UNVERIFIED')
       const owner = catalogue.ownerOf(line.taxType)
       const place = owner === null ? null : catalogue.place(owner)
       if (place === null) return inconclusive([LEDGER, XERO], 'VAT_MAPPING_UNVERIFIED')

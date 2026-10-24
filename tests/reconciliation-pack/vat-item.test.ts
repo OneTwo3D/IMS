@@ -417,6 +417,29 @@ test('SHIPPING MUST BE RELIABLY SEPARATED: an unconfigured shipping account, one
   assert.deepEqual(keys(separated, 'bothDiffer').sort(), ['ims-xero|2026-09|GB|domestic', 'xero-woo|2026-09|GB|domestic'])
 })
 
+// [mutation: an uncoded or unrecognised taxable line counted / the sales-account requirement removed]
+test('A TAXABLE XERO LINE COUNTS ONLY WITH A PROVEN CLASSIFICATION: no account code or an unrecognised account is VAT_MAPPING_UNVERIFIED (whatever it nets to); zero-tax uncoded lines are harmless; sales, discount and shipping accounts are classified', async () => {
+  // The regression: IMS and Woo hold 100.00; Xero holds 99.00 of product VAT and 1.00 of UNCODED (really shipping) VAT. Counted, every leg read 100.00.
+  const regression = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 59 }, { type: 'OUTPUT2', tax: 1, account: null }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(regression.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // Uncoded +1 and -1 that net to zero are still two unclassified taxable lines.
+  const netting = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT2', tax: 1, account: null }, { type: 'OUTPUT2', tax: -1, account: null }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(netting.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // An unrecognised account.
+  const unknown = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT2', tax: 0.5, account: '999' }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(unknown.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // A zero-tax uncoded line and a zero-tax line on an unknown account are harmless; a discount-account line counts.
+  const harmless = standard({ ims: { discountAccount: '270' }, xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 70 }, { type: 'NONE', tax: 0, account: null }, { type: 'NONE', tax: 0, account: '999' }, { type: 'OUTPUT2', tax: -10, account: '270' }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(harmless.ctx)), ['pass'])
+  // With no discount account configured, a taxable line on any other account is unrecognised.
+  const noDiscount = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT2', tax: 1, account: '270' }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(noDiscount.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // The sales account must be configured (before any request).
+  const noSales = standard({ ims: { salesAccount: '' } })
+  assert.deepEqual(reasons(await run(noSales.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  assert.deepEqual([noSales.xero.calls.length, noSales.woo.calls.length], [0, 0])
+})
+
 // [mutation: the fee-line tax check removed]
 test('FEE-LINE TAX is not proven to be counted alike: a WooCommerce order with a non-zero fee-line tax in a closed month is VAT_MAPPING_UNVERIFIED; zero fee tax and orders outside the months are not', async () => {
   const fee = (total: string) => ({ fee_lines: [{ total_tax: total }] })

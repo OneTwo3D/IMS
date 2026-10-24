@@ -381,7 +381,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
   const xeroSeen: Array<{ method: string; url: string; authorization: string | undefined; tenant: string | undefined }> = []
   const wooSeen: Array<{ method: string; url: string }> = []
   let xeroTax = [60, 40]
-  const invoice = (n: number, date: string, tax: number) => ({ InvoiceID: `00000000-0000-4000-8000-0000000000${String(n).padStart(2, '0')}`, Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: tax }] })
+  const invoice = (n: number, date: string, tax: number) => ({ InvoiceID: `00000000-0000-4000-8000-0000000000${String(n).padStart(2, '0')}`, Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: tax, AccountCode: '200' }] })
   const send = (res: import('node:http').ServerResponse, body: unknown, headers: Record<string, string> = {}) => { res.writeHead(200, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(body)) }
   const xeroServer = http.createServer((req, res) => {
     xeroSeen.push({ method: req.method ?? '', url: req.url ?? '', authorization: req.headers.authorization, tenant: req.headers['xero-tenant-id'] as string | undefined })

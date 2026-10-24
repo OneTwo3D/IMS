@@ -21,7 +21,7 @@ test('a faithful multi-page walk returns every invoice, normalised, once, after 
   assert.ok(read.ok)
   assert.equal(read.value.total, 5)
   assert.deepEqual(read.value.invoices.map((i) => i.id).sort(), [1, 2, 3, 4, 5].map(uuid).sort())
-  assert.deepEqual(read.value.invoices[0], { id: read.value.invoices[0]!.id, date: '2026-09-10', currency: 'GBP', rate: '1', lines: [{ taxType: 'OUTPUT2', taxAmount: '20', accountCode: null }] })
+  assert.deepEqual(read.value.invoices[0], { id: read.value.invoices[0]!.id, date: '2026-09-10', currency: 'GBP', rate: '1', lines: [{ taxType: 'OUTPUT2', taxAmount: '20', accountCode: '200' }] })
   assert.equal(double.calls.length, 6, 'three pages, read twice')
   assert.deepEqual(double.calls.map((c) => c.params.page), ['1', '2', '3', '1', '2', '3'])
 })
