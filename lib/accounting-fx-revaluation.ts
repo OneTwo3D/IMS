@@ -106,7 +106,11 @@ export type FxRevaluationResult = {
    * the journal for a side is keyed by date and side, and a second run sees it as already queued.
    */
   skippedNoRate: SkippedRevaluation[]
+  /** Sides (AR / AP) left entirely alone this run because a document on them had no rate: no reversal, no new journal. */
+  withheldSides: WithheldSide[]
 }
+
+export type WithheldSide = { side: FxSettlementSide; reason: 'side_withheld_missing_rate'; skipped: SkippedRevaluation[] }
 
 export type SkippedRevaluation = {
   side: FxSettlementSide
@@ -276,11 +280,12 @@ export async function reportAssertedRevaluationRows(
  * asserted because `false` is the safe direction: it means "do not skip", and the revaluation enqueue
  * then refuses on its own `chartConnector: null` and writes nothing.
  */
-async function hasRevaluationForDate(
+async function revaluedSidesForDate(
   valuationDate: string,
   connector: AccountingSettings['connector'],
-): Promise<boolean> {
-  if (connector === null) return false
+): Promise<Set<FxSettlementSide>> {
+  const sides = new Set<FxSettlementSide>()
+  if (connector === null) return sides
   const logs = await db.accountingSyncLog.findMany({
     where: {
       type: 'UNREALISED_FX_JOURNAL',
@@ -299,7 +304,15 @@ async function hasRevaluationForDate(
   })
   // o3d-3la07 (M10, D2): existence question - an asserted row still counts, and is reported.
   await reportAssertedRevaluationRows(matching, 'same-date-check', valuationDate)
-  return matching.length > 0
+  // PER SIDE (o3d-q0x56.4): a side that was withheld for a missing rate queued nothing, so it is not in this set and
+  // a same-day rerun does it once the rate exists. A row with no readable side counts for both (the safe direction:
+  // it can only skip work that a row claims was done).
+  for (const log of matching) {
+    const side = (log.payload as RevaluationPayload).side
+    if (side === 'receivable' || side === 'payable') sides.add(side)
+    else { sides.add('receivable'); sides.add('payable') }
+  }
+  return sides
 }
 
 async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> {
@@ -442,6 +455,21 @@ async function buildRevaluationLines(params: {
   return { lines, documents, skipped }
 }
 
+async function reportWithheldSide(valuationDate: string, side: FxSettlementSide, skipped: SkippedRevaluation[]): Promise<void> {
+  const { logActivity } = await import('@/lib/activity-log')
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'unrealised_fx_side_withheld_missing_rate',
+    tag: 'accounting',
+    level: 'WARNING',
+    description:
+      `The unrealised FX revaluation for ${valuationDate} WITHHELD the whole ${side === 'receivable' ? 'receivables (AR)' : 'payables (AP)'} side: `
+      + `${skipped.length} open document${skipped.length === 1 ? ' has' : 's have'} no usable FX rate (${skipped.map((item) => `${item.reference} ${item.currency}: ${item.reason}`).join('; ')}). `
+      + 'Nothing was reversed or posted for this side, so its previous valuation stays in force. Add the rate in Settings -> Currencies and rerun the revaluation.',
+    metadata: { side, reason: 'side_withheld_missing_rate', valuationDate, skipped },
+  }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
+}
+
 async function reportSkippedRevaluations(valuationDate: string, skipped: SkippedRevaluation[]): Promise<void> {
   if (skipped.length === 0) return
   const { logActivity } = await import('@/lib/activity-log')
@@ -471,22 +499,61 @@ export async function runArApFxRevaluation(input?: {
   ])
 
   if (!settings.syncEnabled) {
-    return { success: true, skipped: true, reason: 'Accounting sync disabled', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [] }
+    return { success: true, skipped: true, reason: 'Accounting sync disabled', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [], withheldSides: [] }
   }
   if (!settings.unrealisedFxGainLossAccount) {
-    return { success: false, error: 'Configure an unrealised FX gain/loss account before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [] }
+    return { success: false, error: 'Configure an unrealised FX gain/loss account before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [], withheldSides: [] }
   }
   const receivableAccounts = getUnrealisedFxAccounts(settings, 'receivable')
   const payableAccounts = getUnrealisedFxAccounts(settings, 'payable')
   if (!receivableAccounts || !payableAccounts) {
-    return { success: false, error: 'Configure AR, AP, and unrealised FX accounts before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [] }
+    return { success: false, error: 'Configure AR, AP, and unrealised FX accounts before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [], withheldSides: [] }
   }
 
   // Don't bail the whole run when today's revaluation already exists: the
   // reversal-retry loop below must still run so a prior reversal that failed (or
   // never queued) gets retried instead of being stranded (scjz.39). Only the
   // fresh revaluation step is skipped when it has already been queued today.
-  const alreadyRevaluedForDate = await hasRevaluationForDate(valuationDate, settings.connector)
+  const revaluedSides = await revaluedSidesForDate(valuationDate, settings.connector)
+
+  // o3d-q0x56.4 (Codex R1 HIGH) - RESOLVE EVERY OPEN DOCUMENT'S RATE BEFORE ANYTHING IS REVERSED OR POSTED.
+  //
+  // A side is journalled as a whole: its prior journal is one entry covering all of its documents. If any open
+  // document on a side has no usable rate, reversing that prior journal would back out a valuation we cannot
+  // replace (and a mixed journal would be reversed in full for one missing document), and posting a new journal
+  // without the document would misstate the side. So such a side is WITHHELD AS A WHOLE: no reversal, no new
+  // journal, the prior valuation stays in force (the last correct statement), and the withholding is reported with
+  // the skipped documents. The other side is unaffected. Nothing is queued for a withheld side, so it does not look
+  // "revalued for this date" and a rerun after the rate is added does the side.
+  type SidePlan = { done: boolean; built: Awaited<ReturnType<typeof buildRevaluationLines>> | null; withheld: boolean }
+  const sidePlans = new Map<FxSettlementSide, SidePlan>()
+  const skippedNoRate: SkippedRevaluation[] = []
+  const withheldSides: WithheldSide[] = []
+  for (const [side, load, accounts] of [
+    ['receivable', getOpenReceivables, receivableAccounts],
+    ['payable', getOpenPayables, payableAccounts],
+  ] as const) {
+    if (revaluedSides.has(side)) {
+      sidePlans.set(side, { done: true, built: null, withheld: false })
+      continue
+    }
+    const built = await buildRevaluationLines({
+      balances: await load(baseCurrency),
+      side,
+      valuationDate,
+      baseCurrency,
+      controlAccount: accounts.controlAccount,
+      fxGainLossAccount: accounts.fxGainLossAccount,
+    })
+    const withheld = built.skipped.length > 0
+    sidePlans.set(side, { done: false, built, withheld })
+    if (withheld) {
+      skippedNoRate.push(...built.skipped)
+      withheldSides.push({ side, reason: 'side_withheld_missing_rate', skipped: built.skipped })
+      await reportSkippedRevaluations(valuationDate, built.skipped)
+      await reportWithheldSide(valuationDate, side, built.skipped)
+    }
+  }
 
   let reversed = 0
   // o3d-j625 r3 (Codex MEDIUM): enqueues that declined and left the posting owed. Counted apart from
@@ -494,6 +561,8 @@ export async function runArApFxRevaluation(input?: {
   let refused = 0
   const priorRevaluations = await getPriorRevaluations(valuationDate)
   for (const prior of priorRevaluations) {
+    // A withheld side keeps its prior valuation in force (see above): its journal is not reversed.
+    if (sidePlans.get(prior.side)?.withheld) continue
     const lines = reverseJournalLines(prior.lines, `(reversal for ${prior.valuationDate})`)
     if (lines.length === 0) continue
     // o3d-j625 r2 (Codex MEDIUM 1) — A CONNECTOR THIS BUILD CANNOT ROUTE IS REFUSED, NOT GUESSED AT.
@@ -575,30 +644,13 @@ export async function runArApFxRevaluation(input?: {
 
   let revalued = 0
   let documents = 0
-  const skippedNoRate: SkippedRevaluation[] = []
-  // Skip only the fresh revaluation when one is already queued for today; the
-  // reversal retries above always run regardless (scjz.39).
-  if (!alreadyRevaluedForDate) {
-    const [receivables, payables] = await Promise.all([
-      getOpenReceivables(baseCurrency),
-      getOpenPayables(baseCurrency),
-    ])
-
-    for (const [side, balances, accounts] of [
-      ['receivable', receivables, receivableAccounts],
-      ['payable', payables, payableAccounts],
-    ] as const) {
-      const built = await buildRevaluationLines({
-        balances,
-        side,
-        valuationDate,
-        baseCurrency,
-        controlAccount: accounts.controlAccount,
-        fxGainLossAccount: accounts.fxGainLossAccount,
-      })
+  {
+    for (const side of ['receivable', 'payable'] as const) {
+      const plan = sidePlans.get(side)
+      // Done already today, or withheld: nothing to post for this side.
+      if (!plan || plan.done || plan.withheld || !plan.built) continue
+      const built = plan.built
       documents += built.documents
-      skippedNoRate.push(...built.skipped)
-      await reportSkippedRevaluations(valuationDate, built.skipped)
       if (built.lines.length === 0) continue
 
       const revaluationEnqueued = await queueAccountingSync({
@@ -634,7 +686,7 @@ export async function runArApFxRevaluation(input?: {
   // o3d-j625 r3 (Codex MEDIUM): AND A REFUSAL IS NOT NOTHING HAPPENING. `reversed === 0 && revalued === 0`
   // used to be reachable with several refused enqueues behind it, and the run then announced itself as
   // a no-op — the most reassuring message available for the state where postings are owed.
-  const noop = alreadyRevaluedForDate && reversed === 0 && revalued === 0 && refused === 0
+  const noop = revaluedSides.size > 0 && reversed === 0 && revalued === 0 && refused === 0 && withheldSides.length === 0
   return {
     success: true,
     valuationDate,
@@ -643,6 +695,7 @@ export async function runArApFxRevaluation(input?: {
     documents,
     refused,
     skippedNoRate,
+    withheldSides,
     ...(noop ? { skipped: true, reason: 'Revaluation already queued for this date' } : {}),
     // Surfaced in the cron route's JSON body, beside the per-refusal WARNING the facade writes to the
     // activity log. Not `success: false`: the run did everything it could, and failing it would make the
@@ -655,9 +708,9 @@ export async function runArApFxRevaluation(input?: {
                 + 'remain OUTSTANDING — see the accounting activity log for which, and why.'
               : null,
             skippedNoRate.length > 0
-              ? `${skippedNoRate.length} open document${skippedNoRate.length === 1 ? ' was' : 's were'} NOT revalued because no usable FX rate exists `
+              ? `${skippedNoRate.length} open document${skippedNoRate.length === 1 ? ' has' : 's have'} no usable FX rate `
                 + `(${skippedNoRate.map((item) => `${item.reference} ${item.currency}: ${item.reason}`).join('; ')}). `
-                + 'Add the rate in Settings -> Currencies; those documents are not in this date\'s journal.'
+                + `Add the rate in Settings -> Currencies and rerun. WITHHELD as a whole (nothing reversed or posted; the previous valuation stays in force): ${withheldSides.map((w) => (w.side === 'receivable' ? 'AR' : 'AP')).join(', ')}.`
               : null,
           ].filter(Boolean).join(' '),
         }
