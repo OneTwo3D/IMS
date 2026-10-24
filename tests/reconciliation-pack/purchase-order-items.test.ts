@@ -15,7 +15,7 @@ import { PO_PREFIX, poLine, poLines, sourceOf } from './qoblex-fixtures.ts'
 const line = (sku: string, qty: string, received: string, cost: string, id = `l-${sku}`): PoLineRow => ({ id, sku, qty, qtyReceived: received, unitCostBase: cost })
 const po = (number: string, lines: PoLineRow[], over: Partial<PoRow> = {}): PoRow => ({ id: `po-${number}`, reference: `${PO_PREFIX}${number}`, status: 'PO_SENT', currency: 'GBP', createdAt: '2026-03-01T10:00:00.000Z', discount: '0', lines, ...over })
 
-type Fixture = { orders?: PoRow[]; fx?: FxRateRow[]; native?: string[]; provenance?: Partial<FirstLoadProvenance> | null; fxSection?: 'fail'; firstLoad?: 'verified' | 'unverified' | 'absent'; fail?: Partial<Record<'purchaseOrders' | 'boundaries', 'READ_INCOMPLETE'>>; whole?: 'fail' | 'throws'; noSection?: 'purchaseOrders' | 'boundaries' }
+type Fixture = { orders?: PoRow[]; fx?: FxRateRow[]; native?: string[]; provenance?: Partial<FirstLoadProvenance> | null; fxSection?: 'fail'; firstLoad?: 'verified' | 'unverified' | 'absent'; fail?: Partial<Record<'purchaseOrders' | 'boundaries' | 'firstLoadProvenance', 'READ_INCOMPLETE'>>; whole?: 'fail' | 'throws'; noSection?: 'purchaseOrders' | 'boundaries' | 'firstLoadProvenance' }
 function ims(fixture: Fixture = {}) {
   const calls: ImsReadOptions[] = []
   const firstLoad = fixture.firstLoad ?? 'verified'
@@ -37,7 +37,7 @@ function ims(fixture: Fixture = {}) {
     const sections: Record<string, unknown> = {}
     for (const name of options.sections) {
       if (fixture.noSection === name) continue
-      const failure = name === 'fxRates' && fixture.fxSection === 'fail' ? 'READ_INCOMPLETE' : fixture.fail?.[name as 'purchaseOrders' | 'boundaries']
+      const failure = name === 'fxRates' && fixture.fxSection === 'fail' ? 'READ_INCOMPLETE' : fixture.fail?.[name as 'purchaseOrders' | 'boundaries' | 'firstLoadProvenance']
       sections[name] = failure ? { ok: false, reason: failure } : { ok: true, value: values[name] }
     }
     return { ok: true, snapshotId: '1:2:', sections } as ImsRead

@@ -282,7 +282,6 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
     // An order-level discount is in IMS's order and cannot be expressed by the export (its report has no order-level discount and the native map reads no discount at
     // all): such an order cannot be judged on its value, so R7 is inconclusive rather than passing with the discount on one side only.
     if (id === 'R7' && [...mine.orders.values()].some((o) => !o.outOfScope && !o.discount.isZero())) return inconclusive(id, SOURCES, 'VALUE_SHAPE_MISMATCH')
-    if (!mine.ok) return inconclusive(id, SOURCES, mine.reason)
     let fxRates: readonly FxRateRow[] | null = null
     if (id === 'R7') {
       const fx = ims.sections.fxRates

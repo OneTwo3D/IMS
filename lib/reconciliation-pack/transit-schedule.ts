@@ -5,7 +5,7 @@
  * cancellation moves value out. Every posting to the account records a signed row in the transit sub-ledger
  * (lib/domain/accounting/transit-subledger-movement.ts: it lists EVERY source type that posts to the account, and every posting site calls
  * recordTransitSubledgerMovement: PURCHASE_BILL and PURCHASE_BILL_UPDATE and SUPPLIER_CREDIT_NOTE and PURCHASE_ORDER_CANCEL and SUPPLIER_RETURN in
- * app/actions/purchase-orders.ts and lib/domain/purchasing, STOCK_RECEIPT in lib/domain/wms/booked-in-service.ts and lib/connectors/mintsoft/sync/stock-sync.ts,
+ * app/actions/purchase-orders.ts and lib/domain/purchasing, STOCK_RECEIPT in lib/domain/wms/booked-in-service.ts and the warehouse-system stock sync,
  * LANDED_COST_RECLASS and LANDED_COST_CONSUMED_OFFSET in lib/domain/purchasing/landed-cost-service.ts, CUSTOMER_RETURN_IN_TRANSIT in
  * lib/domain/sales/refund-service.ts). THE SCHEDULE IS THE SUM OF ALL OF IT: the value in transit for each purchase order (its rows by recorded source,
  * summed), open or not, plus the refund-in-transit leg, which belongs to no order. R11 compares that total with the stored Stock in Transit balance of
