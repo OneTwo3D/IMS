@@ -11,10 +11,13 @@
  * (manifest asOf equal to --as-of), exported after D ended; that is the operator's declaration (U10), so equality of two figures taken at
  * two slightly different instants is only as good as that declaration.
  *
- * THE POPULATION. The locations are the manifest's: a location declared threePl is set aside (IMS holds no feed for a 3PL's stock in P1,
- * F8) and the rest are NON-3PL. A non-3PL location must resolve to an IMS warehouse by its code and that warehouse must have NO WMS binding
- * of any connector (a declared non-3PL warehouse that IMS knows as a 3PL's is a contradiction, NO_POPULATION_RECORD). A location the export
- * contains but the manifest does not declare makes the stock part unreadable (qoblex-source.ts).
+ * THE POPULATION IS IMS'S, not the file's. The eligible set is every ACTIVE IMS warehouse with NO WMS binding of any connector (a bound
+ * warehouse is a 3PL's: IMS holds no feed for its stock in P1, F8), of every warehouse type. The manifest's non-3PL codes must EQUAL that set
+ * exactly, else NO_POPULATION_RECORD for R2 and R5 (an eligible warehouse left out would hide its stock; a code that is unknown, inactive or
+ * bound is not compared). A snapshot row for D in a warehouse outside the set is out only because the warehouse is bound (a 3PL's); an inactive
+ * warehouse holding stock or value that day makes the item inconclusive (NO_POPULATION_RECORD), never skipped. A location the export contains
+ * but the manifest does not declare makes the stock part unreadable (qoblex-source.ts). The company grouping covers exactly this set, since
+ * every eligible warehouse is a declared location with its company.
  *
  *   R2  The identity is (SKU, warehouse code); the value is the quantity on hand, EXACT (the finest stored precision, 0.0001). A position
  *       of zero and no position are the same thing, so zero rows are dropped on BOTH sides before the comparison (otherwise the
@@ -94,18 +97,19 @@ export async function readImsPositions(readIms: (options: ImsReadOptions) => Pro
   }
   const snapshot = (snapshots as { ok: true; value: ImsSnapshots }).value
   const productList = (products as { ok: true; value: Array<{ id: string; sku: string }> }).value
-  const warehouseList = (warehouses as { ok: true; value: Array<{ id: string; code: string }> }).value
+  const warehouseList = (warehouses as { ok: true; value: Array<{ id: string; code: string; active: boolean }> }).value
   const bindingList = (bindings as { ok: true; value: Array<{ warehouseId: string }> }).value
 
-  const byCode = new Map(warehouseList.map((w) => [w.code, w.id]))
-  const inScope = new Map<string, string>()
-  for (const location of scope) {
-    const id = byCode.get(location.code)
-    if (id === undefined) return { ok: false, reason: 'NO_POPULATION_RECORD' }
-    // A warehouse the manifest calls non-3PL that IMS has a WMS binding for is a contradiction: it is never compared as non-3PL.
-    if (bindingList.some((b) => b.warehouseId === id)) return { ok: false, reason: 'NO_POPULATION_RECORD' }
-    inScope.set(id, location.code)
-  }
+  // THE POPULATION COMES FROM IMS, NOT FROM THE FILE. The eligible set is every ACTIVE IMS warehouse that has NO WMS binding of any connector
+  // and any state (a bound warehouse is a 3PL's: IMS holds no feed for its stock, F8). Every warehouse TYPE is eligible (STANDARD, QUARANTINE and
+  // RESTOCK): the native Qoblex map reports all three kinds of location (MIL1, RESTOCK and QUARANTINE-CAMBRIDGE beside CAMBRIDGE), and the
+  // location labels map to IMS warehouse codes (qoblex-native-map.ts). The manifest's non-3PL codes must EQUAL that set exactly: an eligible
+  // warehouse the manifest leaves out would hide whatever it holds, and a code that is not eligible (unknown, inactive, bound) is not compared.
+  const boundIds = new Set(bindingList.map((b) => b.warehouseId))
+  const eligible = new Set(warehouseList.filter((w) => w.active && !boundIds.has(w.id)).map((w) => w.code))
+  const declared = new Set(scope.map((l) => l.code))
+  if (eligible.size !== declared.size || [...eligible].some((code) => !declared.has(code))) return { ok: false, reason: 'NO_POPULATION_RECORD' }
+  const inScope = new Map(warehouseList.filter((w) => eligible.has(w.code)).map((w) => [w.id, w.code] as const))
   // The snapshot of the cycle date must exist (its run row), and name only products and warehouses IMS holds.
   if (snapshot.run === null) return { ok: false, reason: 'SNAPSHOT_UNAVAILABLE' }
   const skuById = new Map(productList.map((p) => [p.id, p.sku]))
@@ -114,11 +118,17 @@ export async function readImsPositions(readIms: (options: ImsReadOptions) => Pro
   for (const row of snapshot.values) {
     const sku = skuById.get(row.productId)
     if (sku === undefined || !knownWarehouse.has(row.warehouseId)) return { ok: false, reason: 'SNAPSHOT_UNAVAILABLE' }
-    const code = inScope.get(row.warehouseId)
-    if (code === undefined) continue
     const qty = parseDecimalStrict(row.qty)
     const value = parseDecimalStrict(row.valueBase)
     if (qty === null || value === null) return { ok: false, reason: 'BAD_VALUE' }
+    const code = inScope.get(row.warehouseId)
+    if (code === undefined) {
+      // Out of the population by ONE stated rule: the warehouse is a 3PL's (bound). An inactive warehouse is out only while it holds nothing
+      // on the cycle date; stock there is a position nobody compares, so the item cannot be decided.
+      if (boundIds.has(row.warehouseId)) continue
+      if (qty.isZero() && value.isZero()) continue
+      return { ok: false, reason: 'NO_POPULATION_RECORD' }
+    }
     positions.push({ sku, code, qty, value, reliable: row.valueReplayReliable })
   }
   return { ok: true, positions }

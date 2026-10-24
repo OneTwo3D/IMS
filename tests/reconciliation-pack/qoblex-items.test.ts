@@ -17,6 +17,7 @@ type Snap = { sku: string; code: string; qty: string; value?: string; reliable?:
 type Fixture = {
   snaps?: Snap[]
   warehouses?: string[]
+  inactive?: string[]
   bindings?: string[]
   skus?: string[]
   run?: boolean
@@ -35,8 +36,8 @@ function ims(fixture: Fixture = {}) {
       balances: [],
     },
     products: skus.map((sku) => ({ id: pid(sku), sku, type: 'SIMPLE', active: true, lifecycleStatus: 'ACTIVE' })),
-    warehouses: (fixture.warehouses ?? ['MIL1', 'CAMBRIDGE', 'RXT2']).map((code) => ({ id: wid(code), code, active: true })),
-    wmsBindings: (fixture.bindings ?? []).map((code) => ({ connector: 'x', warehouseId: wid(code), warehouseCode: code, externalWarehouseId: '1', active: true, stockSyncMode: 'NOTIFICATION_ONLY', alignmentConfirmed: false })),
+    warehouses: (fixture.warehouses ?? ['MIL1', 'CAMBRIDGE', 'RXT2']).map((code) => ({ id: wid(code), code, active: !(fixture.inactive ?? []).includes(code) })),
+    wmsBindings: (fixture.bindings ?? ['RXT2']).map((code) => ({ connector: 'x', warehouseId: wid(code), warehouseCode: code, externalWarehouseId: '1', active: true, stockSyncMode: 'NOTIFICATION_ONLY', alignmentConfirmed: false })),
   }
   const port = async (options: ImsReadOptions): Promise<ImsRead> => {
     calls.push(options)
@@ -147,6 +148,45 @@ test('R2 snapshot problems: a product or warehouse the snapshot names that IMS d
   assert.deepEqual([whole.item.outcome, whole.item.reasons], ['inconclusive', ['READ_INCOMPLETE']])
 })
 
+// [mutation: the equality of the manifest's codes with IMS's eligible set removed / the active filter / the bound filter]
+test('THE POPULATION IS IMS\'S: an eligible warehouse the manifest and export leave out cannot be hidden (R2 and R5 are NO_POPULATION_RECORD); all eligible listed passes; inactive and bound ones are correctly out', async () => {
+  const stock = [lot('SKU-1', 'MIL1', '10', '2.5'), lot('SKU-2', 'CAMBRIDGE', '4', '10')]
+  const snaps: Snap[] = [{ sku: 'SKU-1', code: 'MIL1', qty: '10', value: '25' }, { sku: 'SKU-2', code: 'CAMBRIDGE', qty: '4', value: '40' }]
+  // an unbound, active IMS warehouse that holds stock which would differ, omitted from the manifest and the export
+  const hidden: Snap[] = [...snaps, { sku: 'SKU-9', code: 'MIL2', qty: '99', value: '990' }]
+  for (const id of ['R2', 'R5'] as const) {
+    const out = await run2(id, stock, { snaps: hidden, warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2', 'MIL2'], skus: ['SKU-1', 'SKU-2', 'SKU-9'] })
+    assert.deepEqual([out.item.outcome, out.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], id)
+    // all eligible listed (the stock file and manifest now name it too, with matching stock): decided
+    const listed = await run2(id, [...stock, lot('SKU-9', 'MIL2', '99', '10')], { snaps: hidden, warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2', 'MIL2'], skus: ['SKU-1', 'SKU-2', 'SKU-9'] }, [...LOCATIONS, { code: 'MIL2', company: 'ACME', threePl: false }])
+    assert.equal(listed.item.outcome, 'pass', `${id} ${JSON.stringify(listed.item.reasons)}`)
+    // and with the omitted warehouse's stock different, it fails by identity instead of being skipped
+    const differs = await run2(id, [...stock, lot('SKU-9', 'MIL2', '98', '10')], { snaps: hidden, warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2', 'MIL2'], skus: ['SKU-1', 'SKU-2', 'SKU-9'] }, [...LOCATIONS, { code: 'MIL2', company: 'ACME', threePl: false }])
+    assert.equal(differs.item.outcome, 'fail', id)
+    // an eligible warehouse the manifest calls 3PL is left out of the comparison all the same: refused
+    const wrongFlag = await run2(id, stock, { snaps, warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2'], bindings: [] })
+    assert.deepEqual([wrongFlag.item.outcome, wrongFlag.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], `${id}: RXT2 is unbound and active in IMS but the manifest calls it 3PL`)
+    // an INACTIVE unbound warehouse is out while it holds nothing; with stock it is never skipped
+    const quiet = await run2(id, stock, { snaps: [...snaps, { sku: 'SKU-8', code: 'OLD1', qty: '0', value: '0' }], warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2', 'OLD1'], inactive: ['OLD1'], skus: ['SKU-1', 'SKU-2', 'SKU-8'] })
+    assert.equal(quiet.item.outcome, 'pass', `${id} ${JSON.stringify(quiet.item.reasons)}`)
+    const holding = await run2(id, stock, { snaps: [...snaps, { sku: 'SKU-8', code: 'OLD1', qty: '5', value: '50' }], warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2', 'OLD1'], inactive: ['OLD1'], skus: ['SKU-1', 'SKU-2', 'SKU-8'] })
+    assert.deepEqual([holding.item.outcome, holding.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], `${id}: stock in an inactive warehouse`)
+    // an inactive warehouse listed as a non-3PL location is not eligible: refused, not compared
+    const listedInactive = await run2(id, stock, { snaps, warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2'], inactive: ['CAMBRIDGE'] })
+    assert.deepEqual([listedInactive.item.outcome, listedInactive.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], id)
+    // a bound warehouse is out: stock there is not compared
+    const bound = await run2(id, stock, { snaps: [...snaps, { sku: 'SKU-7', code: 'RXT2', qty: '77', value: '770' }], skus: ['SKU-1', 'SKU-2', 'SKU-7'] })
+    assert.equal(bound.item.outcome, 'pass', id)
+  }
+})
+
+// [mutation: a snapshot row of an unknown warehouse skipped]
+test('snapshot stock in a warehouse IMS does not hold at all is SNAPSHOT_UNAVAILABLE, never skipped', async () => {
+  const stock = [lot('SKU-1', 'MIL1', '10', '2.5'), lot('SKU-2', 'CAMBRIDGE', '4', '10')]
+  const out = await run2('R2', stock, { snaps: [{ sku: 'SKU-1', code: 'MIL1', qty: '10', value: '25' }, { sku: 'SKU-2', code: 'CAMBRIDGE', qty: '4', value: '40' }, { sku: 'SKU-1', code: 'GHOST', qty: '3', value: '3' }], warehouses: ['MIL1', 'CAMBRIDGE', 'RXT2'] })
+  assert.deepEqual([out.item.outcome, out.item.reasons], ['inconclusive', ['SNAPSHOT_UNAVAILABLE']])
+})
+
 // [mutation: the Qoblex source failure ignored / read before the opt-in is checked]
 test('R2 and R5 with no export named read NOTHING (QOBLEX_EXPORT_OFF); an unreadable export is its closed reason and IMS is not read', async () => {
   for (const id of ['R2', 'R5'] as const) {
@@ -167,7 +207,8 @@ test('R2 and R5 with no export named read NOTHING (QOBLEX_EXPORT_OFF); an unread
 // ---- R5 -----------------------------------------------------------------------------------------
 
 const snapV = (sku: string, code: string, value: string, over: Partial<Snap> = {}): Snap => ({ sku, code, qty: '1', value, ...over })
-const r5 = (stock: Parameters<typeof run2>[1], snaps: Snap[], locations?: readonly QoblexLocation[], fixture: Fixture = {}) => run2('R5', stock, { snaps, ...fixture }, locations)
+// With its own locations the IMS estate is exactly those warehouses (a 3PL's bound), so the population IMS establishes is the one the manifest declares.
+const r5 = (stock: Parameters<typeof run2>[1], snaps: Snap[], locations?: readonly QoblexLocation[], fixture: Fixture = {}) => run2('R5', stock, { snaps, ...(locations ? { warehouses: locations.map((l) => l.code), bindings: locations.filter((l) => l.threePl).map((l) => l.code) } : {}), ...fixture }, locations)
 
 test('R5 passes when each warehouse and each company agrees, and names both sources', async () => {
   // SKU-1 qty 10 x 2.5 = 25 in MIL1; SKU-2 qty 4 x 10 = 40 in CAMBRIDGE; one company holds both
