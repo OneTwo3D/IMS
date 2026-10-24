@@ -7,7 +7,7 @@ import { collectGateResults, type GateDeps } from '../../lib/ops/readiness-gate-
 import { assessPackItem, assessPackItems, combineDerivations, readNewestPackReport, type PackAssessContext, type PackReportRead } from '../../lib/ops/readiness-gate-pack.ts'
 import { PACK_ITEMS } from '../../lib/ops/readiness-gate-constants.ts'
 import { decideVerdict, type CheckResult } from '../../lib/ops/readiness-gate.ts'
-import { PACK_CADENCE_MAX_AGE_MS, PACK_ITEM_IDS, itemApplicability, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
+import { PACK_CADENCE_MAX_AGE_MS, PACK_ITEM_IDS, getPackItem, itemApplicability, type PackItemId } from '../../lib/reconciliation-pack/constants.ts'
 import { publishSyntheticRun } from '../../lib/reconciliation-pack/harness.ts'
 import type { ItemInput } from '../../lib/reconciliation-pack/report.ts'
 import { APPLY_RUN, APPLY_SYSTEM_ID, ALL_CONSTRAINTS, DAY, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenApplyReport, greenRehearsal, packPass, packRecord, packStreams } from '../helpers/readiness-gate-fixtures.ts'
@@ -160,9 +160,30 @@ test('R6, R10 and the Qoblex items (R2, R5, R14) need a CURRENT cycle date: a fr
   assert.equal(assessPackItem({ record: packRecord('P1', { asOf: '2026-09-01' }) }, 'R3', ctx()).kind, 'pass')
 })
 
+// [mutation: 'ims-ledger' removed from the gate's cycle-dated sources]
+test('R12 reads the ledger as of its cycle date: a fresh report about an old date, a day not yet ended or an unreadable date is not established; the monthly limit is counted from the end of the cycle day, inclusive', () => {
+  const id: PackItemId = 'R12'
+  assert.ok(getPackItem(id).sources.includes('ims-ledger') && getPackItem(id).cadence === 'monthly')
+  const at = (asOf: string, finishedAt: Date = new Date(NOW.getTime() - 3600_000)) => assessPackItem({ record: packRecord('P1', { asOf, finishedAt, items: { [id]: packPass(id) } }) }, id, ctx()).kind
+  assert.equal(at('2026-10-07'), 'pass', 'yesterday, read after it ended')
+  assert.equal(at('2026-09-03', new Date(NOW.getTime() - 3600_000)), 'pass', 'its day ended 34.5 days ago: inside the monthly limit')
+  assert.equal(at('2026-09-02'), 'unreadable', 'its day ended 35.5 days ago: a fresh report about an old cycle date')
+  assert.equal(at('2026-08-01'), 'unreadable')
+  assert.equal(at('2026-10-08'), 'unreadable', 'today, not yet ended')
+  assert.equal(at('2026-10-07', new Date('2026-10-07T23:00:00.000Z')), 'unreadable', 'read before its day ended')
+  for (const bad of ['2026-02-30', '20261007', '', 'yesterday', null]) {
+    const record = { ...packRecord('P1', { items: { R12: packPass('R12') } }), asOf: bad as never }
+    assert.equal(assessPackItem({ record }, 'R12', ctx()).kind, 'unreadable', JSON.stringify(bad))
+  }
+  // The monthly age of the report itself still applies.
+  const limit = PACK_CADENCE_MAX_AGE_MS.monthly
+  assert.equal(assessPackItem({ record: packRecord('P1', { asOf: '2026-09-03', finishedAt: new Date(NOW.getTime() - limit - 1), items: { [id]: packPass(id) } }) }, id, ctx()).kind, 'unreadable')
+})
+
 // [mutation: the age check removed / the cadence ignored / the boundary moved]
 test('a report is current by its item\'s cadence: daily 36 hours, weekly 8 days, monthly 35 days - inclusive at the limit, stale one millisecond past it', () => {
-  const cases: Array<[PackItemId, 'daily' | 'weekly' | 'monthly']> = [['R3', 'daily'], ['R12', 'monthly']]
+  // R12 (monthly) and R14 (weekly) read cycle-dated sources, so each is judged by the end of its cycle day: their own tests follow.
+  const cases: Array<[PackItemId, 'daily' | 'weekly' | 'monthly']> = [['R3', 'daily']]
   for (const [id, cadence] of cases) {
     const limit = PACK_CADENCE_MAX_AGE_MS[cadence]
     const at = (age: number) => packRecord('P1', { finishedAt: new Date(NOW.getTime() - age), items: { [id]: packPass(id) } })

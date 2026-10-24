@@ -28,6 +28,7 @@ import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-read
 import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconciliation-pack/ledger-items'
 import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
+import { runVatItem } from '@/lib/reconciliation-pack/vat-item'
 import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
 import { wmsSkuListPort } from '@/lib/reconciliation-pack/wms-skus'
 import { createWmsReadSession, type WmsReadSession } from '@/lib/reconciliation-pack/wms-source'
@@ -37,6 +38,7 @@ import type { QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
 import type { SkuExclusionFile } from '@/lib/reconciliation-pack/sku-exclusions'
 import type { WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
 import type { WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
+import type { XeroSourceOptions } from '@/lib/reconciliation-pack/xero-source'
 
 /** Reads the read-sync status report, reduced and checked against itself (reduceStatusReport). May throw: the run treats that as an unreadable read. */
 export interface LivenessPort { read(): Promise<LivenessRead> }
@@ -70,6 +72,8 @@ export type RunContext = {
   skuExclusions?: SkuExclusionFile
   /** An injected SKU list for R14's warehouse-system leg (tests). Absent = the proven census R1 reads, through the shared session. */
   wmsSkus?: SkuListPort
+  /** Test seam for the Xero walks' pacing and budget (R12). */
+  xeroOptions?: XeroSourceOptions
   wmsOptions?: WmsSourceOptions
   /** The run's one shared read of the warehouse system (created by the command; R1 and R14 share it). Absent = each item reads for itself. */
   wmsSession?: WmsReadSession
@@ -102,6 +106,8 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
   const fromVendor = (id: 'R1' | 'R9' | 'R13'): ItemRunner => (context) =>
     runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, wmsOptions: context.wmsOptions, wmsSession: context.wmsSession, settling: context.settling })
+  const fromVat: ItemRunner = (context) =>
+    runVatItem('R12', { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, xeroOptions: context.xeroOptions })
   const fromQoblex = (id: QoblexItemId): ItemRunner => (context) => runQoblexItem(id, { asOf: context.asOf, ims: context.ims, qoblex: context.qoblex })
   // R14's warehouse-system leg: an injected list wins (a test double); otherwise the proven census R1 reads, shared through the run's session.
   const wmsLeg = (context: RunContext): SkuListPort | undefined => context.wmsSkus ?? (
@@ -113,7 +119,7 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
     asOf: context.asOf, now: context.now, vendorReads: context.vendorReads, woo: context.vendor?.woo, wooOptions: context.wooOptions,
     ims: context.ims, qoblex: context.qoblex, wms: wmsLeg(context), exclusions: context.skuExclusions,
   })
-  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R2: fromQoblex('R2'), R5: fromQoblex('R5'), R14: coverage }
+  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat, R2: fromQoblex('R2'), R5: fromQoblex('R5'), R14: coverage }
 }
 
 /** R6 and R10 read the settled as-of basis (ledger-items.ts). */

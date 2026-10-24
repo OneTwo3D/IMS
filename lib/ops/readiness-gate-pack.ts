@@ -73,7 +73,7 @@ function reportProblem(record: ReportRecord, context: PackAssessContext, cadence
 }
 
 /** Sources read as a stored snapshot for the run's cycle date (the as-of basis): a fresh report about an old date proves nothing current. */
-const CYCLE_DATED_SOURCES: ReadonlySet<string> = new Set(['xero-trial-balance', 'qoblex-file'])
+const CYCLE_DATED_SOURCES: ReadonlySet<string> = new Set(['xero-trial-balance', 'ims-ledger', 'qoblex-file'])
 const DAY_MS = 86_400_000
 
 /**

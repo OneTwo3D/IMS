@@ -46,10 +46,11 @@ test('P1: R6 passes on a balanced settled basis; R10 is inconclusive without a w
   assert.deepEqual(items.filter((i) => i.outcome === 'pass').map((i) => i.id), ['R3', 'R4', 'R6', 'R15'])
   assert.deepEqual([outcome(items, 'R10').outcome, outcome(items, 'R10').reasons], ['inconclusive', ['SOURCE_UNREADABLE']])
   for (const id of ['R1', 'R9', 'R13']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['VENDOR_READS_OFF'], []], `${id}: vendor reads are off unless the run asks`)
-  for (const id of ['R12']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons], ['inconclusive', ['NO_RUNNER']], id)
-  // The Qoblex items read nothing unless the run names an export; R14 is also a vendor item and says so first.
+  // The Qoblex items read nothing unless the run names an export; R14 is also a vendor item and says so first, and so is R12.
   for (const id of ['R2', 'R5']) assert.deepEqual([outcome(items, id).outcome, outcome(items, id).reasons, outcome(items, id).sources ?? []], ['inconclusive', ['QOBLEX_EXPORT_OFF'], []], id)
   assert.deepEqual([outcome(items, 'R14').outcome, outcome(items, 'R14').reasons], ['inconclusive', ['VENDOR_READS_OFF']])
+  // R12 has a runner but reads two vendors: without the opt-in it is not read, and nothing is called.
+  assert.deepEqual([outcome(items, 'R12').outcome, outcome(items, 'R12').reasons], ['inconclusive', ['VENDOR_READS_OFF']])
   for (const id of ['R7', 'R8', 'R11']) assert.equal(outcome(items, id).outcome, 'not-applicable', id)
   assert.deepEqual(streams.map((s) => s.stream), ['xero-balance-snapshots'])
   const published = publishPackReport(dir, { runId: '20261020T120000Z-aaaaaaaaaaaa', systemIdentifier: '7000000000000000001', phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items })

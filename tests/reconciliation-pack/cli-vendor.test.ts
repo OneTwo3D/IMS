@@ -156,9 +156,15 @@ test('the encryption key that reads the stored credentials is kept in the enviro
   const parent = { PATH: '/bin', DATABASE_URL: 'postgresql://x', SETTINGS_ENCRYPTION_KEY: 'a'.repeat(32), ENCRYPTION_KEY: 'b'.repeat(32), E2E_TEST_MODE: '1', NODE_OPTIONS: '--require x', WC_CONSUMER_SECRET: 'z' }
   assert.deepEqual(Object.keys(buildPackEnv(parent, '/tmp')).sort(), ['DATABASE_URL', 'HOME', 'PATH'])
   assert.deepEqual(Object.keys(buildPackEnv(parent, '/tmp', true)).sort(), ['DATABASE_URL', 'ENCRYPTION_KEY', 'HOME', 'PATH', 'SETTINGS_ENCRYPTION_KEY'])
+  // R12 judges the stored Xero connection by the connector's own tenant guard, so a vendor run (and only a vendor run) keeps the guard's variables.
+  const guarded = { ...parent, XERO_ALLOWED_TENANT_IDS: 'a1b2c3d4-0000-4000-8000-000000000001', XERO_BLOCKED_TENANT_IDS: 'x', XERO_TENANT_ID: 'y', XERO_ALLOWED_TENANT_NAMES: 'z', XERO_REQUIRE_DEMO_ORG: '1', NODE_ENV: 'production', XERO_WRITE_ALLOWED_TENANT: 'a1b2c3d4-0000-4000-8000-000000000001' }
+  assert.deepEqual(Object.keys(buildPackEnv(guarded, '/tmp')).sort(), ['DATABASE_URL', 'HOME', 'PATH'])
+  assert.deepEqual(Object.keys(buildPackEnv(guarded, '/tmp', true)).sort(), ['DATABASE_URL', 'ENCRYPTION_KEY', 'HOME', 'NODE_ENV', 'PATH', 'SETTINGS_ENCRYPTION_KEY', 'XERO_ALLOWED_TENANT_IDS', 'XERO_ALLOWED_TENANT_NAMES', 'XERO_BLOCKED_TENANT_IDS', 'XERO_REQUIRE_DEMO_ORG', 'XERO_TENANT_ID'])
+  // Never the write grant (it would make the fetch seam's hold treat a Xero request to a non-Xero host as granted) and never the loopback allowance.
+  assert.ok(!('XERO_WRITE_ALLOWED_TENANT' in buildPackEnv(guarded, '/tmp', true)) && !('E2E_TEST_MODE' in buildPackEnv(guarded, '/tmp', true)))
   // Nothing that loosens the transport survives either way: no loopback allowance, no loader variable, no vendor credential in the environment.
   for (const env of [buildPackEnv(parent, '/tmp'), buildPackEnv(parent, '/tmp', true)]) for (const name of ['E2E_TEST_MODE', 'NODE_OPTIONS', 'WC_CONSUMER_SECRET']) assert.ok(!(name in env), name)
-  assert.deepEqual([...VENDOR_ENV], ['SETTINGS_ENCRYPTION_KEY', 'ENCRYPTION_KEY'])
+  assert.deepEqual([...VENDOR_ENV], ['SETTINGS_ENCRYPTION_KEY', 'ENCRYPTION_KEY', 'XERO_ALLOWED_TENANT_IDS', 'XERO_ALLOWED_TENANT_NAMES', 'XERO_BLOCKED_TENANT_IDS', 'XERO_TENANT_ID', 'XERO_REQUIRE_DEMO_ORG', 'NODE_ENV'])
   assert.ok(!KEPT_ENV.some((name) => (VENDOR_ENV as readonly string[]).includes(name)))
 })
 
