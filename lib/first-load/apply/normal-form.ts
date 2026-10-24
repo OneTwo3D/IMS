@@ -106,12 +106,13 @@ export interface DbSupplier {
   taxRate: { accountingTaxType: string | null } | null
 }
 
-export function supplierCellsFromDb(row: DbSupplier): CellRecord {
+/** `rateIsCurrent` is false when the stored rate is not the one rate the importer would choose now for its type; the cell then reads as no file can state it. */
+export function supplierCellsFromDb(row: DbSupplier, rateIsCurrent = true): CellRecord {
   return {
     name: row.name, contactName: row.contactName ?? '', email: row.email ?? '', phone: row.phone ?? '', currency: row.currency,
     vatNumber: row.vatNumber ?? '', accountNumber: row.accountNumber ?? '', paymentTermsDays: row.paymentTermsDays === null ? '' : String(row.paymentTermsDays),
     addressLine1: row.addressLine1 ?? '', addressLine2: row.addressLine2 ?? '', city: row.city ?? '', county: row.county ?? '', postcode: row.postcode ?? '',
-    country: row.country ?? '', notes: row.notes ?? '', purchaseTaxType: row.taxRate?.accountingTaxType ?? '',
+    country: row.country ?? '', notes: row.notes ?? '', purchaseTaxType: row.taxRate === null ? '' : rateIsCurrent ? row.taxRate.accountingTaxType ?? '' : `(not the current rate) ${row.taxRate.accountingTaxType ?? ''}`,
   }
 }
 

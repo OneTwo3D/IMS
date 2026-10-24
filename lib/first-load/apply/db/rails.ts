@@ -25,6 +25,7 @@ import { endpointKey, normaliseAddress, ownEndpoints } from './own-sessions'
 import { ATTRIBUTION_RULES } from './attribution'
 import { FRESH_RUN_MAY_HOLD, TABLE_CLASSES, tablesOfKind } from '../table-classes'
 import { normaliseTaxValue } from '../normal-form'
+import { loadPurchaseRatesByType } from '../../purchase-tax-rates'
 import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import type { PreparedRun } from '../prepared'
 import { ObservationError } from '../residual'
@@ -283,13 +284,13 @@ export async function supplierTaxRates(prepared: PreparedRun, problems: string[]
   const at = step.data.header.indexOf('purchaseTaxType')
   if (at < 0) { problems.push('supplier tax: the suppliers file has no purchaseTaxType column'); return }
   const types = new Set(step.data.rows.map((row) => (row.cells[at] ?? '').trim()))
-  const rates = (await db.taxRate.findMany({ select: TAX_RATE_SELECT })) as TaxRateRow[]
+  const byType = await loadPurchaseRatesByType(db)
   let none = 0
   let several = 0
   let blank = 0
   for (const type of types) {
     if (type === '') { blank++; continue }
-    const eligible = rates.filter((r) => r.active && (r.usedFor === 'PURCHASE' || r.usedFor === 'BOTH') && r.accountingTaxType === type)
+    const eligible = byType.get(type) ?? []
     if (eligible.length === 0) none++
     else if (eligible.length > 1) several++
   }

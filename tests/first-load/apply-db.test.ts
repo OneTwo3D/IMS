@@ -1438,6 +1438,42 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         } finally { await cleanup() }
       })
 
+      it('the read-back compares the stored rate with the rate the importer would choose NOW: a rate of the right type that is inactive, sales-only or no longer the sole one is a conflict, never present-and-matching', async (t) => {
+        // Mutation named: compare only the stored rate's accountingTaxType again (drop storedRateIsCurrent in observeSuppliers) -> the three drift arms are green when they must be red.
+        await fresh()
+        try {
+          const file = stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'ZQST Drift', currency: 'GBP', purchaseTaxType: 'INPUT2' }])
+          const keyed = keyStep('suppliers', file)
+          assert.deepEqual((await load([{ name: 'ZQST Drift', currency: 'GBP', purchaseTaxType: 'INPUT2' }])).errors, [])
+          const stub = { steps: [{ step: 'purchase-orders', units: [] }] } as unknown as PreparedRun
+          const verdict = async () => {
+            const observed = await m.observe.observeStep(stub, 'suppliers')
+            return classifyStep('suppliers', keyed.units, { entries: observed.entries.filter((e) => e.key === 'zqst drift') }).units.map((c) => c.state)
+          }
+          assert.deepEqual(await verdict(), ['present-matching'], 'control: the supplier points at the one active purchase INPUT2 rate')
+          const wasA = ids.std!
+          const resume = async (label: string, breakA: () => Promise<unknown>) => {
+            await breakA()
+            await addRate('replacement', { name: `ZQST Replacement ${label}`, usedFor: 'PURCHASE', accountingTaxType: 'INPUT2' })
+            try { assert.deepEqual(await verdict(), ['present-conflicting'], label) } finally {
+              await m.db.taxRate.delete({ where: { id: ids.replacement! } })
+              await m.db.taxRate.update({ where: { id: wasA }, data: { active: true, usedFor: 'PURCHASE' } })
+            }
+          }
+          await resume('A deactivated, B the sole active rate', () => m.db.taxRate.update({ where: { id: wasA }, data: { active: false } }))
+          await resume('A sales-only, B the sole purchase rate', () => m.db.taxRate.update({ where: { id: wasA }, data: { usedFor: 'SALES' } }))
+          // the stored rate is inactive and nothing replaces it: still not present-and-matching
+          await m.db.taxRate.update({ where: { id: wasA }, data: { active: false } })
+          assert.deepEqual(await verdict(), ['present-conflicting'], 'A deactivated, no replacement')
+          await m.db.taxRate.update({ where: { id: wasA }, data: { active: true } })
+          // a second active purchase rate of the type: the importer would now refuse, so the stored one is no longer "the" rate
+          await addRate('second', { name: 'ZQST Second', usedFor: 'BOTH', accountingTaxType: 'INPUT2' })
+          assert.deepEqual(await verdict(), ['present-conflicting'], 'two active purchase rates')
+          assert.deepEqual(await m.observe.observeStep(stub, 'suppliers').then((o) => o.entries.length > 0), true)
+          precondition(t, 'drift arms', 4)
+        } finally { await cleanup() }
+      })
+
       it('the tax-rates rail refuses a suppliers file whose type matches no rate, several rates, or is blank, and passes one that matches exactly one', async (t) => {
         await fresh()
         try {

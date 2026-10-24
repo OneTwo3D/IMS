@@ -8,6 +8,7 @@ import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { SYSTEM_IMPORT, withSystemActor, withSystemOutcome, type SystemImportContext } from '@/lib/first-load/apply/system-import-capability'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
+import { loadPurchaseRatesByType } from '@/lib/first-load/purchase-tax-rates'
 import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
@@ -318,13 +319,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
     // The supplier's default tax rate is given by its Xero tax type (`purchaseTaxType`), resolved to EXACTLY ONE active tax rate usable for purchases (usedFor PURCHASE or
     // BOTH) that carries that accountingTaxType. Zero or several refuse the row: a default tax rate is never guessed (by name or otherwise).
     const isSystemImport = system?.systemImportToken === SYSTEM_IMPORT
-    const purchaseRatesByType = new Map<string, string[]>()
-    for (const rate of await db.taxRate.findMany({
-      where: { active: true, usedFor: { in: ['PURCHASE', 'BOTH'] }, accountingTaxType: { not: null } },
-      select: { id: true, accountingTaxType: true },
-    })) {
-      purchaseRatesByType.set(rate.accountingTaxType!, [...(purchaseRatesByType.get(rate.accountingTaxType!) ?? []), rate.id])
-    }
+    const purchaseRatesByType = await loadPurchaseRatesByType(db)
 
     let created = 0
     let updated = 0

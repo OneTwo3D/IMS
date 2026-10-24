@@ -16,6 +16,7 @@ import {
 } from '../normal-form'
 import type { PreparedRun } from '../prepared'
 import { loadFacts } from './journal'
+import { loadPurchaseRatesByType, uniqueRateId } from '../../purchase-tax-rates'
 import { headerAmountsEntry, type FileLineNumbers } from './po-amounts'
 import { TAX_RATE_SELECT, effectiveRate, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import { ObservationError, type ObservedEntry, type StepObservation } from '../residual'
@@ -48,24 +49,33 @@ export async function observeStep(prepared: PreparedRun, step: ApplyStepId): Pro
   }
 }
 
+function storedRateIsCurrent(row: { taxRateId: string | null; taxRate: { accountingTaxType: string | null } | null }, byType: ReadonlyMap<string, readonly string[]>): boolean {
+  const type = row.taxRate?.accountingTaxType
+  return row.taxRateId !== null && type != null && uniqueRateId(byType, type) === row.taxRateId
+}
+
 async function observeSuppliers(): Promise<StepObservation> {
   const rows = await db.supplier.findMany({
     select: {
       name: true, contactName: true, email: true, phone: true, currency: true, vatNumber: true, accountNumber: true, paymentTermsDays: true,
       addressLine1: true, addressLine2: true, city: true, county: true, postcode: true, country: true, notes: true,
       // The default tax rate is set by the importer (from the file's purchaseTaxType) and compared as its accounting tax type.
-      taxRate: { select: { accountingTaxType: true } },
+      taxRateId: true, taxRate: { select: { accountingTaxType: true } },
       // Columns the importer never sets: they keep their defaults (prepaid, a delivery-days override and the accounting contact link are accounting-relevant).
       active: true, prepaid: true, manualDeliveryDays: true, accountingContactId: true, accountingContactProvenance: true,
     },
   })
   const columns = FINGERPRINT_SPECS.suppliers.fingerprinted
+  // The stored default tax rate matches the file only if it IS the one rate the importer would choose now for its tax type (same resolution as the importer and the rail). A rate of
+  // the right type that is no longer the unique active purchase rate (deactivated, sales-only, or one of several) must not read as matching; it reads as a different value, so the
+  // unit is present-conflicting (FIELDS_DIFFER, residual.ts classifyStep) and a resume refuses instead of skipping it.
+  const byType = await loadPurchaseRatesByType(db)
   return {
     entries: rows.map((row): ObservedEntry => ({
       // The importer matches by lower(trim(name)).
       key: row.name.trim().toLowerCase(),
       collisionKey: row.name.trim().toUpperCase(),
-      fingerprint: supplierFingerprint(columns, supplierCellsFromDb(row), defaultsEntry({
+      fingerprint: supplierFingerprint(columns, supplierCellsFromDb(row, storedRateIsCurrent(row, byType)), defaultsEntry({
         active: row.active === true, prepaid: row.prepaid === false, manualDeliveryDays: row.manualDeliveryDays === null,
         accountingContact: row.accountingContactId === null && row.accountingContactProvenance === null,
       })),
