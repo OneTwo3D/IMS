@@ -254,6 +254,7 @@ test('[R2 HIGH] the replacement is REFUSED (unresolved FAILED attempt for today)
   assert.equal(logged.length, 1)
   assert.equal(logged[0].metadata?.side, 'receivable')
   assert.equal(logged[0].metadata?.enqueueReason, 'refused')
+  assert.equal(state.activity.filter((a) => a.action === 'unrealised_fx_journal_not_queued').length, 1, 'and the owed posting is recorded OUTSIDE the rolled-back unit')
 })
 
 test('[R2 HIGH] a REFUSED reversal blocks its side too: no replacement is posted beside an un-reversed prior', async () => {

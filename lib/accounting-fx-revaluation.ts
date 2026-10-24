@@ -1,7 +1,7 @@
 import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { getAccountingSettings, queueAccountingSyncTxWithOutcome, type AccountingSettings, type AccountingEnqueueOutcome } from '@/lib/accounting'
-import { postingIsOwed } from '@/lib/domain/accounting/enqueue-outcome'
+import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   LEDGER_STANDING_SELECT,
   WORK_SLOT_OCCUPIED_WHERE,
@@ -694,6 +694,21 @@ export async function runArApFxRevaluation(input?: {
         description: `The unrealised FX revaluation for ${valuationDate}: ${detail}`,
         metadata: { side, reason: 'side_blocked_enqueue_refused', valuationDate, enqueueReason: error.outcome.reason ?? null, enqueueConnector: error.outcome.connector ?? null },
       }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
+      // The refusal row the enqueue wrote INSIDE the rolled-back unit went with it, so the posting that is owed is
+      // recorded again here, outside the transaction, where it survives (the exception inbox; clears when retried).
+      try {
+        await reportPostingNotQueued({
+          entityType: 'SYSTEM',
+          entityId: valuationDate,
+          action: 'unrealised_fx_journal_not_queued',
+          kind: 'unrealised_fx_journal',
+          posting: `the ${side === 'receivable' ? 'AR' : 'AP'} unrealised FX revaluation for ${valuationDate}`,
+          committed: 'the previous valuation stays in force (nothing was reversed or posted for this side)',
+          remedy: 'Resolve the cause shown in the accounting activity log (for example a FAILED attempt for this date), then rerun the revaluation for this date.',
+          outcome: error.outcome,
+          metadata: { side, valuationDate, chartConnector: settings.connector },
+        })
+      } catch { /* the WARNING above already names it */ }
       continue
     }
     reversed += counted.reversed

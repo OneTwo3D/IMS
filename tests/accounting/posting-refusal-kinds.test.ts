@@ -124,9 +124,11 @@ const DYNAMIC_FACADE_POSTINGS: Record<string, Array<[string, string]>> = {
 }
 
 test('[o3d-j625 r6 H4] every posting an enqueue can record a refusal for has a kind to record it under', () => {
+  // o3d-q0x56.4: 12, was 14 - the AR/AP revaluation's two facade enqueues became one in-transaction unit per side, and
+  // report their rollback refusals through reportPostingNotQueued (kind unrealised_fx_journal) instead.
   const sites = enqueueSites()
   console.log(`[o3d-j625 r6] enqueue sites read: ${sites.length}; that record refusals: ${sites.filter((s) => s.recordsRefusal).length}`)
-  assert.ok(sites.filter((site) => site.recordsRefusal).length >= 14, 'PRECONDITION: the facade and asking in-transaction sites were found')
+  assert.ok(sites.filter((site) => site.recordsRefusal).length >= 12, 'PRECONDITION: the facade and asking in-transaction sites were found')
   const unclassified: string[] = []
   for (const site of sites.filter((s) => s.recordsRefusal)) {
     const postings: Array<[string, string]> = site.type === '(dynamic)' || site.referenceType === '(dynamic)'
