@@ -143,11 +143,11 @@ test('the two sections send only SELECTs (one statement each) and never a write'
 
 // [mutation: rows from a currency other than the base read, or the table read with a window]
 test('fxRates: reads every row quoted FROM the base currency (bound), exact decimals and instants; a bad rate, a missing instant, an empty currency or a read over the cap is unreadable', async () => {
-  const row = (over: Record<string, unknown> = {}) => ({ currency: 'USD', rate: '1.25000000', fetched: '2026-02-20T00:00:00.000Z', ...over })
-  const client = fake((sql) => (/FROM fx_rates/.test(sql) ? [row(), row({ currency: 'EUR', rate: '1.15', fetched: '2026-02-21T00:00:00.000Z' })] : []))
+  const row = (over: Record<string, unknown> = {}) => ({ currency: 'USD', rate: '1.25000000', manual: false, fetched: '2026-02-20T00:00:00.000Z', ...over })
+  const client = fake((sql) => (/FROM fx_rates/.test(sql) ? [row(), row({ currency: 'EUR', rate: '1.15', manual: true, fetched: '2026-02-21T00:00:00.000Z' })] : []))
   const section = await sectionOf('fxRates', client)
   assert.ok(section.ok)
-  assert.deepEqual(section.value, [{ currency: 'USD', rate: '1.25000000', fetchedAt: '2026-02-20T00:00:00.000Z' }, { currency: 'EUR', rate: '1.15', fetchedAt: '2026-02-21T00:00:00.000Z' }])
+  assert.deepEqual(section.value, [{ currency: 'USD', rate: '1.25000000', fetchedAt: '2026-02-20T00:00:00.000Z', manualOverride: false }, { currency: 'EUR', rate: '1.15', fetchedAt: '2026-02-21T00:00:00.000Z', manualOverride: true }])
   const q = client.sent.find((x) => /FROM fx_rates/.test(x.sql))!
   assert.match(q.sql, /"fromCurrency" = \$1/)
   assert.deepEqual(q.values, ['GBP'])
@@ -159,6 +159,8 @@ test('fxRates: reads every row quoted FROM the base currency (bound), exact deci
   assert.equal(await reason([row({ rate: '1e3' })]), 'BAD_VALUE')
   assert.equal(await reason([row({ rate: null })]), 'BAD_VALUE')
   assert.equal(await reason([row({ fetched: null })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([row({ manual: null })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([row({ manual: 'true' })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([row({ currency: '' })]), 'CURRENCY_UNKNOWN')
   assert.equal(await reason([row(), row({ currency: 'EUR' })], 1), 'CAP_EXCEEDED')
   assert.equal(await reason([]), 'ok')

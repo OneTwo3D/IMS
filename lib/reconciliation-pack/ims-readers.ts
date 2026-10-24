@@ -164,7 +164,7 @@ export type FirstLoadProvenance = { runId: string; status: string; journalEmitte
  * `currency`, as fetched at `fetchedAt`. Every row from the base currency is read (a cap is CAP_EXCEEDED); nothing is picked here: the item
  * takes the latest row on or before a stated instant and refuses a tie it cannot break.
  */
-export type FxRateRow = { currency: string; rate: string; fetchedAt: string }
+export type FxRateRow = { currency: string; rate: string; fetchedAt: string; /** An admin-pinned rate (fx_rates.manualOverride): it stays in force until a newer non-override row replaces it. */ manualOverride: boolean }
 
 /**
  * R11, the IMS side: the transit sub-ledger (append-only; every posting to the Stock in Transit account records a signed base-currency row)
@@ -649,8 +649,8 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   },
 
   async fxRates(tx) {
-    const rows = await readCapped(tx, `SELECT "toCurrency" AS currency, rate::text AS rate, ${UTC('"fetchedAt"')} AS fetched FROM fx_rates WHERE "fromCurrency" = $1 ORDER BY id`, [QOBLEX_BASE_CURRENCY])
-    return rows.map((row): FxRateRow => ({ currency: text(row.currency, 'CURRENCY_UNKNOWN'), rate: decimal(row.rate), fetchedAt: text(row.fetched, 'SOURCE_UNREADABLE') }))
+    const rows = await readCapped(tx, `SELECT "toCurrency" AS currency, rate::text AS rate, "manualOverride" AS manual, ${UTC('"fetchedAt"')} AS fetched FROM fx_rates WHERE "fromCurrency" = $1 ORDER BY id`, [QOBLEX_BASE_CURRENCY])
+    return rows.map((row): FxRateRow => ({ currency: text(row.currency, 'CURRENCY_UNKNOWN'), rate: decimal(row.rate), fetchedAt: text(row.fetched, 'SOURCE_UNREADABLE'), manualOverride: bool(row.manual) }))
   },
 
   async transitSchedule(tx) {

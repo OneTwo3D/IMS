@@ -4,6 +4,7 @@ import test from 'node:test'
 import { identityToken } from '../../lib/reconciliation-pack/identity.ts'
 import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
 import type { FirstLoadProvenance, FxRateRow, ImsRead, ImsReadOptions, PoLineRow, PoRow } from '../../lib/reconciliation-pack/ims-readers.ts'
+import { R7_FX_MAX_RATE_AGE_DAYS } from '../../lib/reconciliation-pack/constants.ts'
 import { ORDER_LINES_TOKEN, VALUE_EXACT_GBP_TOKEN, imsSide, qoblexSide, rateAt, runPoItem, type PoItemContext } from '../../lib/reconciliation-pack/purchase-order-items.ts'
 import type { QoblexPoLine } from '../../lib/reconciliation-pack/qoblex-source.ts'
 import { PO_PREFIX, poLine, poLines, sourceOf } from './qoblex-fixtures.ts'
@@ -117,7 +118,7 @@ test('R7 POPULATION NARROWING: an IMS incoming order that no export line explain
 // [mutation: the value tolerance changed, or made exclusive]
 test('R7 FX BOUNDARY: an order in another currency is within GBP 1 INCLUSIVE (1.00 passes, 1.000001 fails); an order in GBP must be exact', async () => {
   // USD at rate 1.25: price 12.5 -> 10 per unit; ordered 100 -> GBP 1000.
-  const usd = (cost: string) => run('R7', [po('PO1', [line('A', '100', '0', cost)], { currency: 'USD' })], [poLine('PO1', 'A', '100', '0', '12.5')], { fixture: { fx: [fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z')] } })
+  const usd = (cost: string) => run('R7', [po('PO1', [line('A', '100', '0', cost)], { currency: 'USD' })], [poLine('PO1', 'A', '100', '0', '12.5')], { fixture: { fx: [fxRow('USD', '1.25', '2026-02-27T00:00:00.000Z')] } })
   assert.equal((await usd('10')).item.outcome, 'pass')
   assert.equal((await usd('10.01')).item.outcome, 'pass')
   assert.equal((await usd('10.01')).item.entries!.bothEqual!.length, 1)
@@ -145,11 +146,11 @@ test('R7 FX BOUNDARY: an order in another currency is within GBP 1 INCLUSIVE (1.
   }
 })
 
-const fxRow = (currency: string, rate: string, fetchedAt: string): FxRateRow => ({ currency, rate, fetchedAt })
+const fxRow = (currency: string, rate: string, fetchedAt: string, manualOverride = false): FxRateRow => ({ currency, rate, fetchedAt, manualOverride })
 
 // [mutation: the foreign price used unconverted / the rate applied the wrong way round / the map's fixed table used]
 test('R7 FX source: Qoblex converts price / rate (1 GBP = rate foreign) with the central fx_rates row, six decimals half-up per unit; IMS uses its stored base cost', async () => {
-  const fx = [fxRow('EUR', '1.15', '2026-02-20T00:00:00.000Z')]
+  const fx = [fxRow('EUR', '1.15', '2026-02-27T00:00:00.000Z')]
   // EUR rate 1.15, price 0.4 -> 0.347826 (0.3478260869...), x 6 outstanding = 2.086956
   const eur = poLine('PO901', 'S', '10', '4', '0.4')
   const mine = imsSide([po('PO901', [line('S', '6', '0', '0.347826')], { currency: 'EUR' })], PO_PREFIX)
@@ -163,7 +164,7 @@ test('R7 FX source: Qoblex converts price / rate (1 GBP = rate foreign) with the
   const large = poLine('PO902', 'S', '1000', '0', '0.4')
   const same = await run('R7', [po('PO902', [line('S', '1000', '0', '0.347826')], { currency: 'EUR' })], [large], { fixture: { fx } })
   assert.equal(same.item.outcome, 'pass')
-  const other = await run('R7', [po('PO902', [line('S', '1000', '0', '0.347826')], { currency: 'EUR' })], [large], { fixture: { fx: [fxRow('EUR', '1.30', '2026-02-20T00:00:00.000Z')] } })
+  const other = await run('R7', [po('PO902', [line('S', '1000', '0', '0.347826')], { currency: 'EUR' })], [large], { fixture: { fx: [fxRow('EUR', '1.30', '2026-02-27T00:00:00.000Z')] } })
   assert.equal(other.item.outcome, 'fail')
   // an order no IMS order explains has no recorded currency: it is onlyVendor with its unconverted sum
   const orphan = await run('R7', [], [poLine('PX', 'S', '2', '0', '3')], { fixture: { fx } })
@@ -174,23 +175,23 @@ test('R7 FX source: Qoblex converts price / rate (1 GBP = rate foreign) with the
 // [mutation: the latest row picked without the instant bound / a tie broken silently / a missing row read as rate 1]
 test('R7 RATE SELECTION: the latest fx_rates row on or before the IMS order\'s creation; none, a non-positive rate or a tie that disagrees is CURRENCY_UNKNOWN, never a pass', async () => {
   const at = '2026-03-01T10:00:00.000Z'
-  const rows = [fxRow('USD', '1.20', '2026-02-01T00:00:00.000Z'), fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z'), fxRow('USD', '9.99', '2026-03-02T00:00:00.000Z'), fxRow('EUR', '1.10', '2026-02-25T00:00:00.000Z')]
+  const rows = [fxRow('USD', '1.20', '2026-02-24T00:00:00.000Z'), fxRow('USD', '1.25', '2026-02-27T00:00:00.000Z'), fxRow('USD', '9.99', '2026-03-02T00:00:00.000Z'), fxRow('EUR', '1.10', '2026-02-25T00:00:00.000Z')]
   assert.equal(rateAt('USD', at, rows)!.toFixed(), '1.25', 'the latest on or before; a later row is ignored')
-  assert.equal(rateAt('USD', '2026-02-20T00:00:00.000Z', rows)!.toFixed(), '1.25', 'a row at exactly the instant is on or before it')
-  assert.equal(rateAt('USD', '2026-02-19T23:59:59.999Z', rows)!.toFixed(), '1.2')
+  assert.equal(rateAt('USD', '2026-02-27T00:00:00.000Z', rows)!.toFixed(), '1.25', 'a row at exactly the instant is on or before it')
+  assert.equal(rateAt('USD', '2026-02-26T23:59:59.999Z', rows)!.toFixed(), '1.2')
   assert.equal(rateAt('GBP', at, [])!.toFixed(), '1', 'the base currency needs no row')
-  assert.equal(rateAt('USD', '2026-01-01T00:00:00.000Z', rows), null, 'no row on or before the instant')
+  assert.equal(rateAt('USD', '2026-02-01T00:00:00.000Z', rows), null, 'no row on or before the instant')
   assert.equal(rateAt('JPY', at, rows), null, 'no row for the currency')
   assert.equal(rateAt('USD', 'soon', rows), null)
-  assert.equal(rateAt('USD', at, [fxRow('USD', '0', '2026-02-20T00:00:00.000Z')]), null)
-  assert.equal(rateAt('USD', at, [fxRow('USD', '-1.2', '2026-02-20T00:00:00.000Z')]), null)
-  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z'), fxRow('USD', '1.26', '2026-02-20T00:00:00.000Z')]), null, 'two rows at the latest instant that disagree')
-  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z'), fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z')])!.toFixed(), '1.25', 'the same rate twice is not an ambiguity')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '0', '2026-02-27T00:00:00.000Z')]), null)
+  assert.equal(rateAt('USD', at, [fxRow('USD', '-1.2', '2026-02-27T00:00:00.000Z')]), null)
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', '2026-02-27T00:00:00.000Z'), fxRow('USD', '1.26', '2026-02-27T00:00:00.000Z')]), null, 'two rows at the latest instant that disagree')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', '2026-02-27T00:00:00.000Z'), fxRow('USD', '1.25', '2026-02-27T00:00:00.000Z')])!.toFixed(), '1.25', 'the same rate twice is not an ambiguity')
   assert.equal(rateAt('usd', at, rows), null, 'a currency code is exact')
   // through the item
   const order = [po('PO1', [line('A', '1', '0', '1')], { currency: 'USD' })]
   const lines = [poLine('PO1', 'A', '1', '0', '1')]
-  for (const fx of [[], [fxRow('USD', '0', '2026-02-20T00:00:00.000Z')], [fxRow('USD', '1', '2026-03-02T00:00:00.000Z')], [fxRow('USD', '1', '2026-02-20T00:00:00.000Z'), fxRow('USD', '2', '2026-02-20T00:00:00.000Z')]]) {
+  for (const fx of [[], [fxRow('USD', '0', '2026-02-27T00:00:00.000Z')], [fxRow('USD', '1', '2026-03-02T00:00:00.000Z')], [fxRow('USD', '1', '2026-02-27T00:00:00.000Z'), fxRow('USD', '2', '2026-02-27T00:00:00.000Z')]]) {
     const r = await run('R7', order, lines, { fixture: { fx } })
     assert.deepEqual([r.item.outcome, r.item.reasons], ['inconclusive', ['CURRENCY_UNKNOWN']], JSON.stringify(fx))
   }
@@ -464,4 +465,36 @@ test('THE EMPTY PROOF NEEDS NO INCOMING GOODS ORDER AT ALL: a verified first loa
     const none = await run(id, [], [])
     assert.deepEqual([none.item.outcome, none.item.proof], ['pass', { kind: 'proven-empty', source: 'qoblex-incoming-report-empty' }], id)
   }
+})
+
+// [mutation: the age bound removed / the bound made exclusive / the override exemption widened to a row that is no longer the latest]
+test('R7 RATE FRESHNESS: the row may be at most R7_FX_MAX_RATE_AGE_DAYS (7, INCLUSIVE) days older than the order\'s creation; an admin-pinned manual override is accepted at any age only while it is still the latest row; a stale non-override row, or a stale row that superseded an override, is CURRENCY_UNKNOWN; GBP needs no row', async () => {
+  assert.equal(R7_FX_MAX_RATE_AGE_DAYS, 7)
+  const at = '2026-03-08T00:00:00.000Z'
+  const day = (n: number) => new Date(Date.parse(at) - n * 86_400_000).toISOString()
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(7))])!.toFixed(), '1.25', 'exactly 7 days is accepted (inclusive)')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', new Date(Date.parse(day(7)) - 1).toISOString())]), null, 'a millisecond past 7 days is stale')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(8))]), null, '8 days is stale')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(400))]), null, 'a feed that stopped long ago')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(0))])!.toFixed(), '1.25')
+  // a pinned override is in force until cleared: accepted at any age while it is the latest...
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(400), true)])!.toFixed(), '1.25')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.20', day(500)), fxRow('USD', '1.25', day(400), true)])!.toFixed(), '1.25')
+  // ...but not once a newer non-override row exists: that row is judged, and it is stale
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(400), true), fxRow('USD', '1.30', day(30))]), null, 'an old override superseded by a newer STALE non-override row')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(400), true), fxRow('USD', '1.30', day(3))])!.toFixed(), '1.3', 'superseded by a FRESH row: that row is used')
+  // a mixed instant (override and non-override at the same time) gets no exemption
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(30), true), fxRow('USD', '1.25', day(30), false)]), null)
+  // an override posted AFTER the order is not in force at its creation
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', day(400)), fxRow('USD', '1.25', new Date(Date.parse(at) + 1000).toISOString(), true)]), null)
+  assert.equal(rateAt('GBP', at, [])!.toFixed(), '1')
+  // through the item: an 8-day-old rate that otherwise balances is CURRENCY_UNKNOWN; 7 days passes
+  const order = [po('PO1', [line('A', '100', '0', '10')], { currency: 'USD', createdAt: at })]
+  const lines = [poLine('PO1', 'A', '100', '0', '12.5')]
+  const stale = await run('R7', order, lines, { fixture: { fx: [fxRow('USD', '1.25', day(8))] } })
+  assert.deepEqual([stale.item.outcome, stale.item.reasons], ['inconclusive', ['CURRENCY_UNKNOWN']])
+  assert.equal((await run('R7', order, lines, { fixture: { fx: [fxRow('USD', '1.25', day(7))] } })).item.outcome, 'pass')
+  assert.equal((await run('R7', order, lines, { fixture: { fx: [fxRow('USD', '1.25', day(900), true)] } })).item.outcome, 'pass')
+  assert.deepEqual((await run('R7', order, lines, { fixture: { fx: [fxRow('USD', '1.25', day(900), true), fxRow('USD', '1.25', day(20))] } })).item.reasons, ['CURRENCY_UNKNOWN'])
+  assert.equal((await run('R7', [po('PO1', [line('A', '100', '0', '12.5')], { createdAt: at })], lines, { fixture: { fx: [] } })).item.outcome, 'pass', 'GBP needs no row')
 })

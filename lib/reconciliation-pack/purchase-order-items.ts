@@ -45,7 +45,7 @@
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { compareItem, decimalText, outcomeOfComparison, parseDecimalStrict, type CompareResult, type SideRow } from '@/lib/reconciliation-pack/compare'
-import { QOBLEX_BASE_CURRENCY, QOBLEX_PO_NUMBER_RE, itemApplicability, type PackReasonCode, type PackSourceCode } from '@/lib/reconciliation-pack/constants'
+import { QOBLEX_BASE_CURRENCY, QOBLEX_PO_NUMBER_RE, R7_FX_MAX_RATE_AGE_DAYS, itemApplicability, type PackReasonCode, type PackSourceCode } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { FxRateRow, ImsRead, ImsReadOptions, PoRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { QoblexPoLine, QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
@@ -132,7 +132,8 @@ export function imsSide(orders: readonly PoRow[], prefix: string, scope?: Readon
  * THE EXCHANGE RATE (one central source). For an order in the base currency the rate is 1. For any other currency it is the LATEST fx_rates row
  * (1 GBP = rate units of the currency) with fetchedAt ON OR BEFORE the instant the IMS purchase order was created, and nothing else: no
  * rate stored on the order is trusted (the first-load importer accepts a supplied rate within 2% of the table's, so the stored one is not provably
- * a table row), no fixed table is carried by the pack. No row on or before that instant, a rate that is not a positive plain decimal, or two rows
+ * a table row), no fixed table is carried by the pack. The row must also be FRESH: no more than R7_FX_MAX_RATE_AGE_DAYS (7, inclusive) before that instant, except an admin-pinned
+ * manual override that is still the latest row (it stays in force until cleared). No row on or before that instant, a stale one, a rate that is not a positive plain decimal, or two rows
  * at the latest instant that disagree, is null: the caller makes the item CURRENCY_UNKNOWN. The instant is the order's creation because that is
  * when IMS booked its own figures; the same table row is then what both sides would have used.
  */
@@ -151,6 +152,10 @@ export function rateAt(currency: string, createdAt: string, rows: readonly FxRat
     rates.add(rate.toFixed())
   }
   if (rates.size !== 1) return null
+  // FRESHNESS (R7_FX_MAX_RATE_AGE_DAYS, inclusive): the latest row may not be older than the bound at the order's creation, unless it is an admin-pinned override, which stays in
+  // force until a newer non-override row exists (and this IS the latest row, so none does). A mixed instant (an override and a non-override row at the same time) gets no exemption.
+  const pinned = atLatest.every((row) => row.manualOverride)
+  if (!pinned && at - latest > R7_FX_MAX_RATE_AGE_DAYS * 86_400_000) return null
   return new Dec([...rates][0]!)
 }
 
