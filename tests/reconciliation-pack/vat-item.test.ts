@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { R12_CLOSE_LAG_DAYS, R12_VERIFIED_CATEGORIES, getPackItem, itemNeedsVendor } from '../../lib/reconciliation-pack/constants.ts'
-import { r12ClosedPeriods, runVatItem } from '../../lib/reconciliation-pack/vat-item.ts'
+import { R12_LEGS, r12ClosedPeriods, runVatItem } from '../../lib/reconciliation-pack/vat-item.ts'
 import {
   BOUNDARIES, MAPPINGS, noSleep, REPORT_TYPES, R_DE_OSS, R_GB, R_IE, TENANT, binding, invoice, provenStore, rate, sale, standard, wooOrder, type ImsFixture,
 } from './vat-fixtures.ts'
@@ -159,6 +159,52 @@ test('IDENTITY SWAP: the same total under another country is an onlyIms plus an 
   assert.deepEqual(item.reasons, ['DIFFERENCES'])
   assert.deepEqual(keys(item, 'onlyIms').sort(), ['ims-woo|2026-09|IE|domestic', 'ims-xero|2026-09|IE|domestic'])
   assert.deepEqual(keys(item, 'onlyVendor').sort(), ['ims-woo|2026-09|GB|domestic', 'ims-xero|2026-09|GB|domestic'])
+})
+
+// [mutation: any leg's operand replaced by the other leg's source]
+test('THE THREE LEGS compare three different pairs: the table names two different sources per leg and exactly {ims,xero}, {ims,woo}, {xero,woo}; its labels match the printed identities', () => {
+  for (const leg of R12_LEGS) assert.notEqual(leg.left, leg.right, leg.label)
+  assert.deepEqual(R12_LEGS.map((leg) => [...new Set([leg.left, leg.right])].sort().join('+')).sort(), ['ims+woo', 'ims+xero', 'woo+xero'])
+  assert.deepEqual(R12_LEGS.map((leg) => leg.label), ['ims-xero', 'ims-woo', 'xero-woo'])
+  assert.equal(R12_LEGS.length, 3)
+})
+
+// [mutation: the xero-woo leg compares one vendor with itself]
+test('VENDORS ON OPPOSITE SIDES OF IMS: IMS 100.00, Xero 100.05, Woo 99.95 each agree with IMS within 0.05 but differ 0.10 from each other, so R12 FAILS on the xero-woo leg alone', async () => {
+  const s = standard({
+    xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 100.05 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '99.95']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+  })
+  const item = await run(s.ctx)
+  assert.equal(item.outcome, 'fail')
+  assert.deepEqual(keys(item, 'bothDiffer'), ['xero-woo|2026-09|GB|domestic'])
+  assert.deepEqual(keys(item, 'bothEqual').filter((k) => k.startsWith('ims-')).sort(), ['ims-woo|2026-08|GB|domestic', 'ims-woo|2026-09|GB|domestic', 'ims-xero|2026-08|GB|domestic', 'ims-xero|2026-09|GB|domestic'])
+  const entry = item.entries!.bothDiffer![0]!
+  assert.deepEqual([entry.ims, entry.vendor, entry.delta], ['100.05', '99.95', '0.1'])
+})
+
+// [mutation: a leg's operand replaced; each leg is caught by data only it can see]
+test('PER-LEG IDENTITY SWAP: swapping a key between two countries in ONE system is caught by the two legs that touch that system, and the third leg stays equal', async () => {
+  const base = {
+    sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-09', 'rIE', '20.00', 1), sale('2026-08', 'rGB', '50.00', 2)],
+    xero: (gb: number, iev: number) => [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: gb }, { type: 'OUTPUT9', tax: iev }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
+    woo: (gb: string, iev: string) => ({ processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, gb], [12, iev]]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] }),
+  }
+  const agree = await run(standard({ ims: { sales: base.sales }, xero: base.xero(100, 20), woo: base.woo('100.00', '20.00') }).ctx)
+  assert.deepEqual(reasons(agree), ['pass'])
+  // Only Xero's two countries swapped (GB 20, IE 100): ims-xero and xero-woo see it; ims-woo is equal.
+  const xeroSwap = await run(standard({ ims: { sales: base.sales }, xero: base.xero(20, 100), woo: base.woo('100.00', '20.00') }).ctx)
+  assert.equal(xeroSwap.outcome, 'fail')
+  assert.deepEqual(keys(xeroSwap, 'bothDiffer').map((k) => k.split('|')[0]).sort(), ['ims-xero', 'ims-xero', 'xero-woo', 'xero-woo'])
+  // Only Woo swapped: ims-woo and xero-woo see it; ims-xero is equal.
+  const wooSwap = await run(standard({ ims: { sales: base.sales }, xero: base.xero(100, 20), woo: base.woo('20.00', '100.00') }).ctx)
+  assert.equal(wooSwap.outcome, 'fail')
+  assert.deepEqual(keys(wooSwap, 'bothDiffer').map((k) => k.split('|')[0]).sort(), ['ims-woo', 'ims-woo', 'xero-woo', 'xero-woo'])
+  // Only IMS swapped: ims-xero and ims-woo see it; xero-woo is equal.
+  const imsSwap = await run(standard({ ims: { sales: [sale('2026-09', 'rGB', '20.00', 3), sale('2026-09', 'rIE', '100.00', 1), sale('2026-08', 'rGB', '50.00', 2)] }, xero: base.xero(100, 20), woo: base.woo('100.00', '20.00') }).ctx)
+  assert.equal(imsSwap.outcome, 'fail')
+  assert.deepEqual(keys(imsSwap, 'bothDiffer').map((k) => k.split('|')[0]).sort(), ['ims-woo', 'ims-woo', 'ims-xero', 'ims-xero'])
+  assert.ok(keys(imsSwap, 'bothEqual').some((k) => k.startsWith('xero-woo|')))
 })
 
 test('two rates of one key are summed; two Woo rate ids of one IMS rate are summed', async () => {

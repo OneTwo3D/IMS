@@ -93,6 +93,14 @@ export type VatItemContext = {
   xeroOptions?: XeroSourceOptions
 }
 
+export type R12Source = 'ims' | 'xero' | 'woo'
+/** The three legs: label, left operand, right operand. A test walks this table (two different sources per leg; the pairs are exactly the three pairs). */
+export const R12_LEGS: ReadonlyArray<{ label: string; left: R12Source; right: R12Source }> = [
+  { label: 'ims-xero', left: 'ims', right: 'xero' },
+  { label: 'ims-woo', left: 'ims', right: 'woo' },
+  { label: 'xero-woo', left: 'xero', right: 'woo' },
+]
+
 const LEDGER: PackSourceCode = 'ims-ledger'
 const WOO: PackSourceCode = 'woocommerce-api'
 const XERO: PackSourceCode = 'xero-api'
@@ -329,10 +337,12 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
   const ims = rounded(imsSums)
   const xeroFigures = rounded(xeroSums)
   const wooFigures = rounded(wooSums)
-  // Three legs, one comparator: the identity carries the leg, so a key on one side of one leg is a finding of that leg.
+  // Three legs, one comparator: the identity carries the leg, so a key on one side of one leg is a finding of that leg. The legs are a TABLE
+  // (R12_LEGS) so that each compares two DIFFERENT sources and the pairs are exactly the three pairs of the three systems.
+  const figures = { ims, xero: xeroFigures, woo: wooFigures }
   const result: CompareResult = compareItem('R12', {
-    ims: [...rows('ims-xero', ims), ...rows('ims-woo', ims), ...rows('xero-woo', xeroFigures)],
-    vendor: [...rows('ims-xero', xeroFigures), ...rows('ims-woo', wooFigures), ...rows('xero-woo', wooFigures)],
+    ims: R12_LEGS.flatMap((leg) => rows(leg.label, figures[leg.left])),
+    vendor: R12_LEGS.flatMap((leg) => rows(leg.label, figures[leg.right])),
     imsComplete: true,
     vendorComplete: true,
     // Nothing compared is the true answer only when both vendors reported nothing at all for the whole (wider) window.
