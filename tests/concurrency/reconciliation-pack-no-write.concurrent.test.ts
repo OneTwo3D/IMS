@@ -49,13 +49,16 @@ async function census(): Promise<Census> {
 // THE TIER SHARES ONE DATABASE: a Xero token and a first-load run record left by another file are visible to a run, and each is a unique row
 // (one token per connector, one first-load record, whose singleton flag a check constraint pins to true) that a test needing its own must not
 // delete or collide with. A foreign token is held aside by renaming its connector; a foreign first-load record is saved WHOLE (every column, as
-// JSON), removed, and re-inserted exactly. Both are put back in finally and the counts asserted.
-type Held = { tokens: string[]; firstLoad: string[] }
-const NOTHING_HELD: Held = { tokens: [], firstLoad: [] }
+// JSON), removed, and re-inserted exactly. A foreign Xero sync-log row that R10 would read as an IMS-originated write (SYNCED, PROCESSING or carrying
+// a document id) is held aside by renaming its connector. Both are put back in finally and the counts asserted.
+type Held = { tokens: string[]; firstLoad: string[]; syncRows: string[] }
+const NOTHING_HELD: Held = { tokens: [], firstLoad: [], syncRows: [] }
 async function holdForeignEstate(): Promise<Held> {
   const tokens = (await withClient((c) => c.query(`SELECT id FROM accounting_tokens WHERE connector = 'xero' ORDER BY id`))).rows.map((r: { id: string }) => r.id)
   const firstLoad = (await withClient((c) => c.query(`SELECT to_jsonb(t)::text AS j FROM first_load_apply_runs t ORDER BY id`))).rows.map((r: { j: string }) => r.j)
-  const held: Held = { tokens, firstLoad }
+  const syncRows = (await withClient((c) => c.query(`SELECT id FROM accounting_sync_logs WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id`))).rows.map((r: { id: string }) => r.id)
+  const held: Held = { tokens, firstLoad, syncRows }
+  if (syncRows.length > 0) await withClient((c) => c.query(`UPDATE accounting_sync_logs SET connector = 'held-xero' WHERE id = ANY($1) AND connector = 'xero'`, [syncRows]))
   if (tokens.length > 0) await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'held-' || id WHERE id = ANY($1) AND connector = 'xero'`, [tokens]))
   for (const j of firstLoad) await withClient((c) => c.query(`DELETE FROM first_load_apply_runs WHERE id = $1`, [(JSON.parse(j) as { id: string }).id]))
   const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs)::int AS f`))).rows[0]
@@ -64,9 +67,10 @@ async function holdForeignEstate(): Promise<Held> {
 }
 async function restoreForeignEstate(held: Held): Promise<void> {
   const t = held.tokens.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'xero' WHERE id = ANY($1) AND connector = 'held-' || id`, [held.tokens]))).rowCount
+  const r = held.syncRows.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE accounting_sync_logs SET connector = 'xero' WHERE id = ANY($1) AND connector = 'held-xero'`, [held.syncRows]))).rowCount
   let f = 0
   for (const j of held.firstLoad) f += (await withClient((c) => c.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb)`, [j]))).rowCount ?? 0
-  assert.deepEqual([t, f], [held.tokens.length, held.firstLoad.length], 'every foreign Xero token and first-load record was put back')
+  assert.deepEqual([t, f, r], [held.tokens.length, held.firstLoad.length, held.syncRows.length], 'every foreign Xero token, first-load record and write-shaped sync row was put back')
 }
 
 test('[reconciliation pack] the rig can fail: a control write moves the row counts and the statistics', { skip: !RUN }, async () => {
