@@ -52,7 +52,8 @@
         "county": "Shipping Address State",
         "postcode": "Shipping Address ZipCode",
         "country": "Shipping Address Country",
-        "notes": "Notes"
+        "notes": "Notes",
+        "purchaseTaxType": "Purchase Tax Class Name"
       },
       "rowSelect": {
         "column": "Wholesale or Retail",
@@ -65,6 +66,12 @@
           "": "",
           "NONE": "",
           "30 days net": "30"
+        },
+        "purchaseTaxType": {
+          "": "",
+          "Purchase Tax": "INPUT2",
+          "Zero Rated Purchase": "ZERORATEDINPUT",
+          "No VAT": "NONE"
         }
       }
     }

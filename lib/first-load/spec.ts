@@ -124,7 +124,7 @@ export const PRODUCTS_IMPORT_HEADERS = [
 /** app/api/export/suppliers/route.ts HEADERS. */
 export const SUPPLIERS_IMPORT_HEADERS = [
   'supplierId', 'name', 'contactName', 'email', 'phone', 'currency', 'vatNumber', 'accountNumber', 'paymentTermsDays',
-  'addressLine1', 'addressLine2', 'city', 'county', 'postcode', 'country', 'notes',
+  'addressLine1', 'addressLine2', 'city', 'county', 'postcode', 'country', 'notes', 'purchaseTaxType',
 ] as const
 
 /** app/api/export/stock-levels/route.ts TEMPLATE_HEADERS (= HEADERS), the opening-stock template. */
@@ -226,6 +226,7 @@ export const DATASET_NAMES = [
   'sku-exclusions',
   'ims-skus',
   'ims-suppliers',
+  'ims-tax-rates',
 ] as const
 export type DatasetName = (typeof DATASET_NAMES)[number]
 
@@ -268,11 +269,11 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
   suppliers: {
     columns: [
       'name', 'contactName', 'email', 'phone', 'currency', 'vatNumber', 'accountNumber', 'paymentTermsDays',
-      'addressLine1', 'addressLine2', 'city', 'county', 'postcode', 'country', 'notes',
+      'addressLine1', 'addressLine2', 'city', 'county', 'postcode', 'country', 'notes', 'purchaseTaxType',
     ],
     required: ['name'],
     sources: ['qoblex'],
-    purpose: 'Suppliers. Becomes the suppliers import file.',
+    purpose: 'Suppliers. Becomes the suppliers import file. The transform also requires `currency` and `purchaseTaxType` of every row (a blank is refused, never defaulted), each with its own rejection code.',
   },
   'purchase-order-lines': {
     columns: [
@@ -327,12 +328,37 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     sources: [],
     purpose: 'Supplier names that already exist in the target IMS. Lets the tool reject a new supplier whose name collides with one of them under the importers\' matching, and check purchase order supplier names. Omit for an empty database. Always canonical.',
   },
+  'ims-tax-rates': {
+    columns: ['name', 'accountingTaxType', 'usedFor', 'active'],
+    required: ['name'],
+    sources: [],
+    purpose: 'The tax rates that already exist in the target IMS (name, accounting tax type, usedFor, active). Lets the tool resolve each supplier\'s purchase tax type to exactly one active purchase-capable IMS rate at prepare time. Omit it and that resolution is NOT checked here (the apply-time rail supplier-tax-rates still refuses). Always canonical.',
+  },
   'ims-skus': {
     columns: ['sku', 'type'],
     required: ['sku'],
     sources: [],
     purpose: 'SKUs that already exist in the target IMS (from /api/export/products). The fourth side of R14. Omit for an empty database. Always canonical.',
   },
+}
+
+/**
+ * THE PURCHASE TAX TYPES A SUPPLIER'S DEFAULT TAX RATE MAY BE RESOLVED FROM: Xero's built-in tax types (Xero is the tax-rate master; scripts/copy-tax-rates.ts
+ * XERO_BUILT_IN_TAX_TYPES lists INPUT2, ZERORATEDINPUT and NONE among the types that mean the same thing in every organisation, unlike the per-organisation custom
+ * TAX001..TAXnnn ids, which are refused here). INPUT2 is the purchase-side counterpart of OUTPUT2 ("20% (VAT on Income)", scripts/provision-xero-demo.ts); NONE is
+ * the type the Xero connector already posts when a line carries no tax (lib/connectors/xero/bills.ts DEFAULT_TAX_TYPE). A CLOSED list: any other type rejects the row.
+ */
+export const SUPPLIER_PURCHASE_TAX_TYPES = ['INPUT2', 'ZERORATEDINPUT', 'NONE'] as const
+
+/**
+ * THE PINNED NATIVE VALUE MAP for Qoblex's "Purchase Tax Class Name" -> Xero tax type. tests/first-load/supplier-currency-tax.test.ts pins the
+ * `valueMaps.purchaseTaxType` entry of tests/first-load/fixtures/qoblex-native/maps/qoblex-contacts.map.json to this object, so the map shipped to the operator cannot
+ * drift from it. The map also carries `"": ""` so that a BLANK class reaches the transform, which refuses it (MISSING_PURCHASE_TAX_TYPE) instead of the ingest.
+ */
+export const QOBLEX_PURCHASE_TAX_CLASS_TYPES: Readonly<Record<string, (typeof SUPPLIER_PURCHASE_TAX_TYPES)[number]>> = {
+  'Purchase Tax': 'INPUT2',
+  'Zero Rated Purchase': 'ZERORATEDINPUT',
+  'No VAT': 'NONE',
 }
 
 /** Datasets whose rows end up in an importer file. The others only feed checks. */
@@ -462,6 +488,7 @@ export const APPLY_TIME_CHECKS: ReadonlyArray<{ id: string; area: string; check:
   { id: 'base-currency', area: 'all', check: 'The manifest baseCurrency equals the organisation base currency in IMS (the importers compare against IMS, not the manifest).' },
   { id: 'opening-stock-empty', area: 'opening-stock', check: 'The product and warehouse have no stock, cost layer or movement yet (importOpeningStockCsv refuses otherwise; it is not repeatable).' },
   { id: 'po-supplier-exists', area: 'purchase-orders', check: 'Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first.' },
+  { id: 'supplier-tax-rate', area: 'suppliers', check: 'Each supplier\'s purchaseTaxType (a Xero tax type) resolves to exactly one active IMS tax rate that is usable for purchases (usedFor PURCHASE or BOTH) and carries that accountingTaxType. Zero or several matching rates refuse the run; the supplier importer sets the supplier\'s default tax rate to it and refuses the row otherwise. The tool performs this only against an ims-tax-rates list you supply; WITHOUT it the report says the resolution was NOT checked.' },
   { id: 'po-fx-rate', area: 'purchase-orders', check: 'For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this.' },
   { id: 'po-tax-rate', area: 'purchase-orders', check: 'Each line\'s taxRateName (names are matched case-insensitively, trimmed) or, when only a taxRateValue is given, its value (matched within 0.00005) resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. A line never carries both: the tool cannot show a name and a value agree.' },
   { id: 'lookup-keys-unique-in-ims', area: 'all', check: 'In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers\' case-insensitive matching: they build a Map and the last duplicate wins silently. The tool performs the supplier and SKU parts only against an ims-suppliers / ims-skus list you supply; WITHOUT that list the collision check against IMS is NOT performed and the report says so. Warehouse codes and tax names are never checked by the tool.' },

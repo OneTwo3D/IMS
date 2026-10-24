@@ -8,7 +8,9 @@
  *                   load into a database that already has one would be building on a product the owner ruled out;
  *   warehouses      every warehouse the manifest declares exists, is active, is unique under upper-casing and has exactly the declared profile;
  *   FX rates        (purchase orders) each stated rate has a stored base-to-currency rate, and is within the importer's 2% of it;
- *   tax rates       (purchase orders) every tax a line names resolves to an active purchase rate, and every order-level tax NAME exists with
+ *   tax rates       (suppliers) every purchase tax type the suppliers file states resolves to EXACTLY ONE active IMS tax rate usable for purchases (usedFor PURCHASE or BOTH)
+ *                   with that accounting tax type: the supplier importer sets the supplier's default tax rate to it;
+ *                   (purchase orders) every tax a line names resolves to an active purchase rate, and every order-level tax NAME exists with
  *                   exactly that spelling (createPurchaseOrder looks the order-level name up case-exactly; the importer matches lines case-insensitively).
  *
  * Evaluated before anything is written (`preflight`) and again at the start of every step and just before its first write (`recheck`). An unreadable
@@ -23,6 +25,7 @@ import { endpointKey, normaliseAddress, ownEndpoints } from './own-sessions'
 import { ATTRIBUTION_RULES } from './attribution'
 import { FRESH_RUN_MAY_HOLD, TABLE_CLASSES, tablesOfKind } from '../table-classes'
 import { normaliseTaxValue } from '../normal-form'
+import { loadPurchaseRatesByType } from '../../purchase-tax-rates'
 import { TAX_RATE_SELECT, effectiveRate, rateIsInconsistent, signatureDigest, taxRateSignature, type TaxRateRow } from './tax-profile'
 import type { PreparedRun } from '../prepared'
 import { ObservationError } from '../residual'
@@ -68,9 +71,12 @@ export async function evaluateRailResults(prepared: PreparedRun, scope: RailScop
     await rail('forbidden-skus', (p) => forbiddenSkus(prepared, p))
     if (scope.phase === 'preflight' && !scope.resuming) await rail('currency-lock', baseCurrencyNotLocked)
     if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await rail('warehouses', (p) => warehouses(prepared, p))
-    if (relevant('purchase-orders')) {
-      await rail('fx-rates', (p) => fxRates(prepared, p))
-      await rail('tax-rates', (p) => taxRates(prepared, p))
+    if (relevant('purchase-orders')) await rail('fx-rates', (p) => fxRates(prepared, p))
+    if (relevant('suppliers') || relevant('purchase-orders')) {
+      await rail('tax-rates', async (p) => {
+        if (relevant('suppliers')) await supplierTaxRates(prepared, p)
+        if (relevant('purchase-orders')) await taxRates(prepared, p)
+      })
     }
     // The pre-load rails: nothing that could write outside the database may be armed (preload-rails.ts). The environment is this process's, which the command replaced with the installation env file.
     for (const finding of await evaluatePreloadRails(readers ?? defaultPreloadReaders({ ...process.env }))) results.push({ id: finding.rail, problems: finding.problems, detail: finding.detail })
@@ -266,6 +272,32 @@ export function taxLookups(step: NonNullable<PreparedRun['steps'][number]>, rate
     orderFacts.push({ key, name: orderName, stated: normaliseTaxValue(orderValueIx < 0 ? '' : row.cells[orderValueIx] ?? '') || stated })
   }
   return { lookups, lineFacts, orderFacts }
+}
+
+/**
+ * The suppliers file's purchase tax types against the IMS rates. A type with no eligible rate is refused (the importer would refuse the row), and so is a type with
+ * SEVERAL: which of them the supplier should default to would be a guess, even when their profiles happen to be identical. Never by name similarity.
+ */
+export async function supplierTaxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const step = prepared.steps.find((s) => s.step === 'suppliers')
+  if (!step) return
+  const at = step.data.header.indexOf('purchaseTaxType')
+  if (at < 0) { problems.push('supplier tax: the suppliers file has no purchaseTaxType column'); return }
+  const types = new Set(step.data.rows.map((row) => (row.cells[at] ?? '').trim()))
+  const byType = await loadPurchaseRatesByType(db)
+  let none = 0
+  let several = 0
+  let blank = 0
+  for (const type of types) {
+    if (type === '') { blank++; continue }
+    const eligible = byType.get(type) ?? []
+    if (eligible.length === 0) none++
+    else if (eligible.length > 1) several++
+  }
+  const say = (n: number, text: string): void => { if (n > 0) problems.push(`supplier tax: ${n} ${text}`) }
+  say(blank, 'supplier purchase tax type(s) are blank')
+  say(none, 'supplier purchase tax type(s) match no active IMS tax rate usable for purchases')
+  say(several, 'supplier purchase tax type(s) match more than one active IMS tax rate usable for purchases')
 }
 
 async function taxRates(prepared: PreparedRun, problems: string[]): Promise<void> {

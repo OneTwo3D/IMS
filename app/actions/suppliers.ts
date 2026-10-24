@@ -8,6 +8,7 @@ import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { SYSTEM_IMPORT, withSystemActor, withSystemOutcome, type SystemImportContext } from '@/lib/first-load/apply/system-import-capability'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
+import { loadPurchaseRatesByType } from '@/lib/first-load/purchase-tax-rates'
 import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
@@ -315,6 +316,11 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
       byName.set(key, [...(byName.get(key) ?? []), supplier])
     }
 
+    // The supplier's default tax rate is given by its Xero tax type (`purchaseTaxType`), resolved to EXACTLY ONE active tax rate usable for purchases (usedFor PURCHASE or
+    // BOTH) that carries that accountingTaxType. Zero or several refuse the row: a default tax rate is never guessed (by name or otherwise).
+    const isSystemImport = system?.systemImportToken === SYSTEM_IMPORT
+    const purchaseRatesByType = await loadPurchaseRatesByType(db)
+
     let created = 0
     let updated = 0
     let skipped = 0
@@ -344,6 +350,28 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
         skipped++
         continue
       }
+      // The first-load runner states both facts of every supplier: a blank currency would take the importer's silent default (the base currency), and a blank tax class
+      // would leave the supplier without a default tax rate. The interactive importer keeps its defaults; a system import refuses the row.
+      if (isSystemImport && !r.currency?.trim()) {
+        errors.push(`Row ${lineNum}: currency is blank (a system import never takes the default currency)`)
+        skipped++
+        continue
+      }
+      const taxType = r.purchaseTaxType?.trim() ?? ''
+      let taxRateId: string | null = null
+      if (taxType !== '') {
+        const matches = purchaseRatesByType.get(taxType) ?? []
+        if (matches.length !== 1) {
+          errors.push(`Row ${lineNum}: purchaseTaxType matches ${matches.length} active purchase tax rates (exactly one is needed)`)
+          skipped++
+          continue
+        }
+        taxRateId = matches[0]
+      } else if (isSystemImport) {
+        errors.push(`Row ${lineNum}: purchaseTaxType is blank (a system import never leaves the default tax rate unset)`)
+        skipped++
+        continue
+      }
       try {
         if (existing) {
           if (!preview) {
@@ -365,6 +393,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 ...(r.postcode?.trim() ? { postcode: r.postcode.trim() } : {}),
                 ...(r.country?.trim() ? { country: toIsoCountryCode(r.country.trim()) ?? r.country.trim() } : {}),
                 ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
+                ...(taxRateId ? { taxRateId } : {}),
               },
             })
           }
@@ -379,7 +408,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 contactName: r.contactName?.trim() || null,
                 email: r.email?.trim() || null,
                 phone: r.phone?.trim() || null,
-                currency: r.currency?.trim() || baseCurrency,
+                currency: r.currency?.trim().toUpperCase() || baseCurrency,
                 vatNumber: r.vatNumber?.trim() || null,
                 accountNumber: r.accountNumber?.trim() || null,
                 paymentTermsDays: r.paymentTermsDays ? parseInt(r.paymentTermsDays, 10) : null,
@@ -390,6 +419,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 postcode: r.postcode?.trim() || null,
                 country: r.country?.trim() ? (toIsoCountryCode(r.country.trim()) ?? r.country.trim()) : null,
                 notes: r.notes?.trim() || null,
+                taxRateId,
               },
             })
             createdSupplierIds.push(createdSupplier.id)

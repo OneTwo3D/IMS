@@ -103,8 +103,8 @@ const SUPPLIER_A = `${TAG} Odd Supplier`
 const SUPPLIER_B = `${TAG} Euro Supplier`
 const ODD_FILES: Record<ApplyStepId, StepRows> = {
   suppliers: stepRows(SUPPLIERS_IMPORT_HEADERS, [
-    { name: SUPPLIER_A, contactName: ' Pat Buyer ', email: 'pat@example.test', phone: '01234 567890', currency: '', vatNumber: 'GB123456789', accountNumber: 'A-1', paymentTermsDays: '030', addressLine1: '1 High Street', city: 'Cambridge', postcode: 'CB1 1AA', country: 'United Kingdom', notes: 'first' },
-    { name: SUPPLIER_B, currency: 'eur', paymentTermsDays: '45', country: 'gb' },
+    { name: SUPPLIER_A, contactName: ' Pat Buyer ', email: 'pat@example.test', phone: '01234 567890', currency: 'gbp', purchaseTaxType: 'NONE', vatNumber: 'GB123456789', accountNumber: 'A-1', paymentTermsDays: '030', addressLine1: '1 High Street', city: 'Cambridge', postcode: 'CB1 1AA', country: 'United Kingdom', notes: 'first' },
+    { name: SUPPLIER_B, currency: 'eur', purchaseTaxType: 'NONE', paymentTermsDays: '45', country: 'gb' },
   ]),
   products: stepRows(PRODUCTS_IMPORT_HEADERS, [
     { sku: `${TAG}-VAR`, name: 'Variable parent', type: 'VARIABLE', description: ' a parent ', category: 'Tools > Hand tools', weight: '1.50', salesPriceBase: '10.50', salePriceBase: '9.0', widthCm: '10.00', heightCm: '5', depthCm: '2.50', salesPriceTaxInclusive: 'TRUE', oversellAllowed: 'false', stockUnit: 'm', imageUrl: 'https://example.test/p.png', countryOfOrigin: 'china', lifecycleStatus: 'ACTIVE' },
@@ -213,6 +213,8 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       await db.warehouse.create({ data: { code, name: code, type: profile.type, availableForSale: profile.availableForSale, syncToStore: profile.syncToStore } })
     }
     await db.taxRate.create({ data: { name: VAT_NAME, rate: '0.2', usedFor: 'PURCHASE', active: true } })
+    // The one rate the suppliers' purchaseTaxType NONE resolves to (exactly one active purchase-capable rate carries it).
+    await db.taxRate.create({ data: { name: 'ZQDB No VAT', rate: '0', usedFor: 'BOTH', accountingTaxType: 'NONE', active: true } })
     await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date(Date.now() - 3_600_000) } })
 
     // WooCommerce configured and enabled, so that an effect that is NOT suppressed leaves an outbox row behind; the control below proves it would.
@@ -312,7 +314,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       // Control against a vacuous pass: if the file cells already equalled the stored text, equality would prove nothing.
       const rawSupplier = ODD_FILES.suppliers.rows[0]!.cells
       assert.equal(rawSupplier[ODD_FILES.suppliers.header.indexOf('paymentTermsDays')], '030')
-      assert.equal(rawSupplier[ODD_FILES.suppliers.header.indexOf('currency')], '')
+      assert.equal(rawSupplier[ODD_FILES.suppliers.header.indexOf('currency')], 'gbp')
       const stored = await m.db.supplier.findFirstOrThrow({ where: { name: SUPPLIER_A }, select: { paymentTermsDays: true, currency: true, country: true, contactName: true } })
       assert.deepEqual(stored, { paymentTermsDays: 30, currency: 'GBP', country: 'GB', contactName: 'Pat Buyer' })
       const product = await m.db.product.findFirstOrThrow({ where: { sku: `${TAG}-SIMPLE` }, select: { salesPriceBase: true, weight: true, stockUnit: true, oversellAllowed: true, lifecycleStatus: true, active: true, salesPriceTaxInclusive: true, category: { select: { nameNormalized: true } } } })
@@ -658,15 +660,20 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       let arms = 0
       const supplierKey = SUPPLIER_A.toLowerCase()
       assert.deepEqual(await diffOf('suppliers', supplierKey), [], 'control')
-      const tax = await m.db.taxRate.findFirstOrThrow({ select: { id: true } })
-      for (const [label, data, restore] of [
-        ['active', { active: false }, { active: true }],
-        ['prepaid', { prepaid: true }, { prepaid: false }],
-        ['default VAT rate', { taxRateId: tax.id }, { taxRateId: null }],
-        ['delivery days', { manualDeliveryDays: 9 }, { manualDeliveryDays: null }],
+      // The default tax rate IS set by the importer now (from purchaseTaxType), so it is compared as a fingerprinted column, not as an importer default: moving the supplier to a
+      // rate with another accounting tax type shows as a `purchaseTaxType` difference. Mutation named: read `taxRateId === null` back as an importer default again -> this arm is red.
+      const loaded = await m.db.supplier.findFirstOrThrow({ where: { name: SUPPLIER_A }, select: { taxRateId: true } })
+      const otherRate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME }, select: { id: true } })
+      assert.ok(loaded.taxRateId !== null && loaded.taxRateId !== otherRate.id, 'precondition: the importer set the supplier\'s tax rate, and the other rate is a different one')
+      for (const [label, data, restore, expected] of [
+        ['active', { active: false }, { active: true }, ['importerDefaults']],
+        ['prepaid', { prepaid: true }, { prepaid: false }, ['importerDefaults']],
+        ['default tax rate', { taxRateId: otherRate.id }, { taxRateId: loaded.taxRateId }, ['purchaseTaxType']],
+        ['no default tax rate', { taxRateId: null }, { taxRateId: loaded.taxRateId }, ['purchaseTaxType']],
+        ['delivery days', { manualDeliveryDays: 9 }, { manualDeliveryDays: null }, ['importerDefaults']],
       ] as const) {
         await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: data as never })
-        try { assert.deepEqual(await diffOf('suppliers', supplierKey), ['importerDefaults'], label) } finally { await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: restore as never }) }
+        try { assert.deepEqual(await diffOf('suppliers', supplierKey), expected, label) } finally { await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: restore as never }) }
         arms++
       }
       assert.deepEqual(await diffOf('products', `${TAG}-SIMPLE`), [], 'control')
@@ -1314,7 +1321,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       const arms: Array<{ step: ApplyStepId; marker: string; file: () => StepRows; seed?: () => Promise<void> }> = [
         {
           step: 'suppliers', marker: 'zqleaksuppliername',
-          file: () => stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'zqleaksuppliername', currency: 'GBP' }]),
+          file: () => stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'zqleaksuppliername', currency: 'GBP', purchaseTaxType: 'NONE' }]),
           seed: async () => { await m.db.supplier.create({ data: { name: 'ZQLEAKSUPPLIERNAME' } }); await m.db.supplier.create({ data: { name: 'zqleaksuppliername' } }) },
         },
         { step: 'products', marker: 'ZQLEAKPARENTSKU', file: () => stepRows(PRODUCTS_IMPORT_HEADERS, [{ sku: 'ZQLEAK-CHILD', name: 'c', type: 'SIMPLE', parentSku: 'ZQLEAKPARENTSKU' }]) },
@@ -1343,7 +1350,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('the real importer\'s catch-all returns an error without the system outcome, and the executor throws instead of returning it', async () => {
         // Mutation named: return normally after a result without the system outcome -> this arm resolves instead of rejecting.
         await resetData()
-        const file = stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'ZQ Catch Path Ltd', currency: 'GBP' }])
+        const file = stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'ZQ Catch Path Ltd', currency: 'GBP', purchaseTaxType: 'NONE' }])
         const keyed = keyStep('suppliers', file)
         const execute = m.execute.createExecutor({ runId: 'catch', operator: 'Catch Test' })
         const residual = buildResidual('suppliers', file, classifyStep('suppliers', keyed.units, { entries: [] }))[0]!
@@ -1353,6 +1360,132 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         } finally { await sql('alter table suppliers_zq_hidden rename to suppliers') }
         assert.ok(/Failed to import suppliers/.test(await logTextForCatch()), 'precondition: it was the importer\'s catch path that ran')
         await resetData()
+      })
+    })
+
+    describe('supplier currency and default tax rate (owner rulings)', () => {
+      // Mutations named, one per guard (each was made, the arm went red, and it was reverted):
+      //   delete `taxRateId` from the create/update data in importSuppliersCsv -> 'sets the currency and the default tax rate' red;
+      //   drop the `.length !== 1` test in importSuppliersCsv (take the first match) -> the ambiguous row is created: red;
+      //   drop `usedFor: { in: ['PURCHASE','BOTH'] }` / `active: true` from its rate query -> the decoy rates are chosen: red;
+      //   drop the isSystemImport currency/blank-tax refusals -> the blank rows are created with the default currency / no rate: red;
+      //   change `matches.length === 1`-style check in rails supplierTaxRates to `=== 0` only -> the several-rates arm is green when it must be red.
+      const ids: Record<string, string> = {}
+      const addRate = async (key: string, data: { name: string; usedFor: string; active?: boolean; accountingTaxType: string }) => {
+        ids[key] = (await m.db.taxRate.create({ data: { rate: '0.2', ...data, active: data.active ?? true }, select: { id: true } })).id
+      }
+      const load = async (rows: Array<Record<string, string>>) => {
+        const file = stepRows(SUPPLIERS_IMPORT_HEADERS, rows)
+        const keyed = keyStep('suppliers', file)
+        const execute = m.execute.createExecutor({ runId: 'sup-tax', operator: 'Supplier Tax Test' })
+        return execute('suppliers', buildResidual('suppliers', file, classifyStep('suppliers', keyed.units, { entries: [] }))[0]!, NO_LOCK)
+      }
+      const fresh = async () => {
+        await resetData()
+        await m.db.taxRate.deleteMany({ where: { name: { startsWith: 'ZQST ' } } })
+        await addRate('std', { name: 'ZQST Std', usedFor: 'PURCHASE', accountingTaxType: 'INPUT2' })
+        await addRate('zero', { name: 'ZQST Zero', usedFor: 'BOTH', accountingTaxType: 'ZERORATEDINPUT' })
+        // decoys: never chosen
+        await addRate('oldStd', { name: 'ZQST Old Std', usedFor: 'PURCHASE', accountingTaxType: 'INPUT2', active: false })
+        await addRate('salesNone', { name: 'ZQST Sales None', usedFor: 'SALES', accountingTaxType: 'NONE' })
+        await addRate('salesZero', { name: 'ZQST Sales Zero', usedFor: 'SALES', accountingTaxType: 'ZERORATEDINPUT' })
+      }
+      const cleanup = async () => { await m.db.taxRate.deleteMany({ where: { name: { startsWith: 'ZQST ' } } }); await resetData() }
+
+      it('sets the currency and the default tax rate of every created supplier, each to its one rate', async (t) => {
+        await fresh()
+        try {
+          const none = await m.db.taxRate.findFirstOrThrow({ where: { name: 'ZQDB No VAT' }, select: { id: true } })
+          const result = await load([
+            { name: 'ZQST A', currency: 'GBP', purchaseTaxType: 'INPUT2' },
+            { name: 'ZQST B', currency: 'EUR', purchaseTaxType: 'ZERORATEDINPUT' },
+            { name: 'ZQST C', currency: 'USD', purchaseTaxType: 'NONE' },
+          ])
+          assert.deepEqual(result.errors, [])
+          const stored = await m.db.supplier.findMany({ where: { name: { startsWith: 'ZQST ' } }, select: { name: true, currency: true, taxRateId: true }, orderBy: { name: 'asc' } })
+          assert.deepEqual(stored.map((x) => [x.name, x.currency, x.taxRateId]), [['ZQST A', 'GBP', ids.std], ['ZQST B', 'EUR', ids.zero], ['ZQST C', 'USD', none.id]])
+          precondition(t, 'suppliers checked', stored.length)
+        } finally { await cleanup() }
+      })
+
+      it('refuses the row when the rate is not exactly one: none, several, or only a decoy', async (t) => {
+        await fresh()
+        try {
+          await m.db.taxRate.update({ where: { id: ids.zero! }, data: { active: false } })      // ZERORATEDINPUT: only an inactive rate and a sales-only decoy remain
+          await addRate('stdTwo', { name: 'ZQST Std Two', usedFor: 'BOTH', accountingTaxType: 'INPUT2' }) // INPUT2: two active purchase-capable rates
+          const result = await load([
+            { name: 'ZQST Ambiguous', currency: 'GBP', purchaseTaxType: 'INPUT2' },
+            { name: 'ZQST Decoys Only', currency: 'GBP', purchaseTaxType: 'ZERORATEDINPUT' },
+            { name: 'ZQST Unknown Type', currency: 'GBP', purchaseTaxType: 'EXEMPTINPUT' },
+          ])
+          assert.equal(result.errors.filter((e) => /purchaseTaxType matches \d+ active purchase tax rates/.test(e)).length, 3)
+          assert.equal(await m.db.supplier.count({ where: { name: { startsWith: 'ZQST ' } } }), 0, 'no supplier was created with a guessed rate')
+          precondition(t, 'refused rows', 3)
+        } finally { await cleanup() }
+      })
+
+      it('a system import refuses a blank currency and a blank tax class (the importer\'s silent defaults are not taken)', async (t) => {
+        await fresh()
+        try {
+          const result = await load([
+            { name: 'ZQST No Currency', currency: '', purchaseTaxType: 'INPUT2' },
+            { name: 'ZQST No Class', currency: 'GBP', purchaseTaxType: '' },
+            { name: 'ZQST Good', currency: 'GBP', purchaseTaxType: 'INPUT2' },
+          ])
+          assert.equal(result.errors.length, 2)
+          assert.deepEqual((await m.db.supplier.findMany({ where: { name: { startsWith: 'ZQST ' } }, select: { name: true } })).map((x) => x.name), ['ZQST Good'])
+          precondition(t, 'refused rows', 2)
+        } finally { await cleanup() }
+      })
+
+      it('the read-back compares the stored rate with the rate the importer would choose NOW: a rate of the right type that is inactive, sales-only or no longer the sole one is a conflict, never present-and-matching', async (t) => {
+        // Mutation named: compare only the stored rate's accountingTaxType again (drop storedRateIsCurrent in observeSuppliers) -> the three drift arms are green when they must be red.
+        await fresh()
+        try {
+          const file = stepRows(SUPPLIERS_IMPORT_HEADERS, [{ name: 'ZQST Drift', currency: 'GBP', purchaseTaxType: 'INPUT2' }])
+          const keyed = keyStep('suppliers', file)
+          assert.deepEqual((await load([{ name: 'ZQST Drift', currency: 'GBP', purchaseTaxType: 'INPUT2' }])).errors, [])
+          const stub = { steps: [{ step: 'purchase-orders', units: [] }] } as unknown as PreparedRun
+          const verdict = async () => {
+            const observed = await m.observe.observeStep(stub, 'suppliers')
+            return classifyStep('suppliers', keyed.units, { entries: observed.entries.filter((e) => e.key === 'zqst drift') }).units.map((c) => c.state)
+          }
+          assert.deepEqual(await verdict(), ['present-matching'], 'control: the supplier points at the one active purchase INPUT2 rate')
+          const wasA = ids.std!
+          const resume = async (label: string, breakA: () => Promise<unknown>) => {
+            await breakA()
+            await addRate('replacement', { name: `ZQST Replacement ${label}`, usedFor: 'PURCHASE', accountingTaxType: 'INPUT2' })
+            try { assert.deepEqual(await verdict(), ['present-conflicting'], label) } finally {
+              await m.db.taxRate.delete({ where: { id: ids.replacement! } })
+              await m.db.taxRate.update({ where: { id: wasA }, data: { active: true, usedFor: 'PURCHASE' } })
+            }
+          }
+          await resume('A deactivated, B the sole active rate', () => m.db.taxRate.update({ where: { id: wasA }, data: { active: false } }))
+          await resume('A sales-only, B the sole purchase rate', () => m.db.taxRate.update({ where: { id: wasA }, data: { usedFor: 'SALES' } }))
+          // the stored rate is inactive and nothing replaces it: still not present-and-matching
+          await m.db.taxRate.update({ where: { id: wasA }, data: { active: false } })
+          assert.deepEqual(await verdict(), ['present-conflicting'], 'A deactivated, no replacement')
+          await m.db.taxRate.update({ where: { id: wasA }, data: { active: true } })
+          // a second active purchase rate of the type: the importer would now refuse, so the stored one is no longer "the" rate
+          await addRate('second', { name: 'ZQST Second', usedFor: 'BOTH', accountingTaxType: 'INPUT2' })
+          assert.deepEqual(await verdict(), ['present-conflicting'], 'two active purchase rates')
+          assert.deepEqual(await m.observe.observeStep(stub, 'suppliers').then((o) => o.entries.length > 0), true)
+          precondition(t, 'drift arms', 4)
+        } finally { await cleanup() }
+      })
+
+      it('the tax-rates rail refuses a suppliers file whose type matches no rate, several rates, or is blank, and passes one that matches exactly one', async (t) => {
+        await fresh()
+        try {
+          const prepared = (types: string[]) => ({ steps: [{ step: 'suppliers', data: { header: ['name', 'currency', 'purchaseTaxType'], rows: types.map((type, i) => ({ chunk: 1, line: i + 2, cells: [`S${i}`, 'GBP', type] })) } }] }) as unknown as PreparedRun
+          const problems = async (types: string[]) => { const p: string[] = []; await m.rails.supplierTaxRates(prepared(types), p); return p }
+          assert.deepEqual(await problems(['INPUT2', 'ZERORATEDINPUT', 'NONE', 'INPUT2']), [], 'one rate each (the decoys do not count)')
+          assert.deepEqual(await problems(['EXEMPTINPUT']), ['supplier tax: 1 supplier purchase tax type(s) match no active IMS tax rate usable for purchases'])
+          assert.deepEqual(await problems(['']), ['supplier tax: 1 supplier purchase tax type(s) are blank'])
+          await addRate('stdTwo', { name: 'ZQST Std Two', usedFor: 'BOTH', accountingTaxType: 'INPUT2' })
+          assert.deepEqual(await problems(['INPUT2']), ['supplier tax: 1 supplier purchase tax type(s) match more than one active IMS tax rate usable for purchases'])
+          precondition(t, 'rail cases', 4)
+        } finally { await cleanup() }
       })
     })
 

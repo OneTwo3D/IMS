@@ -71,6 +71,7 @@ export const APPLY_PRECONDITION_IDS = [
   'check:po-supplier-exists',
   'check:po-tax-rate',
   'check:product-parent-exists',
+  'check:supplier-tax-rate',
   'check:transfer-reference-free',
   'check:transfer-source-stock',
   'check:warehouse-exists',

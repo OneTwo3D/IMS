@@ -265,6 +265,10 @@ Navigate to **Purchasing > Suppliers** to manage your supplier list. Each suppli
 - **Tax Rate** -- The default tax rate applied to POs for this supplier.
 - **Payment Terms** -- The agreed payment terms (e.g. Net 30, Net 60).
 
+### Importing suppliers from CSV
+
+The supplier CSV (export it from the Suppliers page for the exact columns) carries the supplier's currency and, in the `purchaseTaxType` column, its **default tax rate** as a Xero tax type (for example `INPUT2` for 20% VAT on expenses, `ZERORATEDINPUT` for zero-rated purchases, `NONE` for no VAT). The import sets the supplier's tax rate to the one **active tax rate that can be used for purchases** (used for Purchases or Both) and carries that Xero tax type. If no such rate exists, or more than one does, the row is refused and reported; the tax rate is never chosen by name. A blank `purchaseTaxType` leaves an existing supplier's tax rate unchanged. The first-load import (a new installation) is stricter: it refuses a supplier with a blank currency or a blank tax class instead of defaulting them, so a base-currency supplier must say `GBP` explicitly (see `docs/first-load-input-spec.md`).
+
 
 ## Auto-Save Last PO Prices
 

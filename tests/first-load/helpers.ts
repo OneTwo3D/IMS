@@ -11,6 +11,9 @@ import { prepare, type PrepareConfig, type PrepareResult } from '../../lib/first
 /** A canonical dataset built in memory. `rows` are objects keyed by canonical column; omitted columns are blank. */
 export function ds(name: DatasetName, rows: Array<Record<string, string>>, file = `${name}.csv`): IngestedDataset {
   const spec = DATASETS[name]
+  // A supplier row must state its currency and purchase tax type (the transform refuses a blank, MISSING_CURRENCY / MISSING_PURCHASE_TAX_TYPE). Tests that are about something
+  // else need not repeat them, so an ABSENT key takes GBP / NONE here; a test about the refusal passes the key with an empty value, which is kept as written.
+  if (name === 'suppliers') rows = rows.map((row) => ({ ...('currency' in row ? {} : { currency: 'GBP' }), ...('purchaseTaxType' in row ? {} : { purchaseTaxType: 'NONE' }), ...row }))
   const header = spec.columns.filter((column) => spec.required.includes(column) || rows.some((row) => column in row))
   const text = serializeCsv(header, rows.map((row) => header.map((column) => row[column] ?? '')))
   return ingestDataset(name, new TextEncoder().encode(text), file, null)

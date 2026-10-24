@@ -74,7 +74,7 @@ export interface FingerprintSpec {
 export const FINGERPRINT_SPECS: Readonly<Record<ApplyStepId, FingerprintSpec>> = {
   suppliers: {
     key: ['name'],
-    fingerprinted: ['contactName', 'email', 'phone', 'currency', 'vatNumber', 'accountNumber', 'paymentTermsDays', 'addressLine1', 'addressLine2', 'city', 'county', 'postcode', 'country', 'notes'],
+    fingerprinted: ['contactName', 'email', 'phone', 'currency', 'vatNumber', 'accountNumber', 'paymentTermsDays', 'addressLine1', 'addressLine2', 'city', 'county', 'postcode', 'country', 'notes', 'purchaseTaxType'],
     comparedSeparately: {},
     notPersisted: { supplierId: 'an id column: it must be blank in a first load, an id would make the importer match by id' },
   },

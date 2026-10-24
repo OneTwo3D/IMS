@@ -82,6 +82,8 @@ export async function startScratch(prefix: string, database = 'ims_scratch'): Pr
     await db.warehouse.create({ data: { code, name: code, type: profile.type, availableForSale: profile.availableForSale, syncToStore: profile.syncToStore } })
   }
   await db.taxRate.create({ data: { name: VAT_NAME, rate: '0.2', usedFor: 'PURCHASE', active: true } })
+  // The one rate the suppliers' purchaseTaxType NONE resolves to (exactly one active purchase-capable rate carries it).
+  await db.taxRate.create({ data: { name: 'ZQSCR No VAT', rate: '0', usedFor: 'BOTH', accountingTaxType: 'NONE', active: true } })
   await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date(Date.now() - 3_600_000) } })
   const { serializeSettingValue } = await import('@/lib/settings-store')
   const { INTEGRATION_PLUGIN_SETTING_KEYS } = await import('@/lib/integration-plugin-keys')
