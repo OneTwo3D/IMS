@@ -11,12 +11,16 @@ import { endOfBusinessDateUtc, getFxRateToBase, getFxRatesToBase, MissingFxRateE
  * reconciliation-pack basis test counts tuple writes on that table across the whole run, so the base currency is
  * passed explicitly here and the organisation read is covered by tests/currencies/fx-lookup.test.ts.
  *
+ * FILE NAME: `zz-` keeps it LAST in the runner's start order. tests/db/reconciliation-pack-basis.test.ts asserts that no
+ * tuple is written to settings/organisations/etc. during a 3 s window on a shared database, so any file that shifts which
+ * files run beside it can fail it (reproduced three times in a row by adding this file under an alphabetically earlier name).
+ *
  * GATED on RUN_DB_RETENTION_TESTS with the REQUIRE_DB_RETENTION_TESTS tripwire (npm run test:db).
  */
 const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
 
 if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
-  throw new Error('REQUIRE_DB_RETENTION_TESTS=1 but RUN_DB_RETENTION_TESTS is not 1: tests/db/fx-lookup.test.ts would be skipped in an environment that promised a migrated database. Fix the invocation (npm run test:db).')
+  throw new Error('REQUIRE_DB_RETENTION_TESTS=1 but RUN_DB_RETENTION_TESTS is not 1: tests/db/zz-fx-lookup.test.ts would be skipped in an environment that promised a migrated database. Fix the invocation (npm run test:db).')
 }
 
 class RollbackProbe extends Error {}
