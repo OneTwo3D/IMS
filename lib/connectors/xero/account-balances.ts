@@ -79,6 +79,8 @@ type XeroAccountBalanceSnapshotBuildInput = {
   parsedRows: ParsedXeroTrialBalanceRow[]
   /** Rows the parser refused to read. A configured account matching one gets a named error and NO snapshot. */
   refusedRows?: RefusedXeroTrialBalanceRow[]
+  /** Null when the report proved itself complete (its rows add up to its balanced Total row); else why not. */
+  completenessUnproven: string | null
   balanceDate: string
   baseCurrency: string
   syncRunId?: string | null
@@ -137,6 +139,8 @@ export type XeroTrialBalanceRefusalCode =
   | 'TB_ROW_CELL_COUNT'
   | 'TB_NON_MONEY_CELL'
   | 'TB_BLANK_LABEL'
+  | 'TB_COMPLETENESS_UNPROVEN'
+  | 'TB_DUPLICATE_ACCOUNT_ROW'
 
 export type RefusedXeroTrialBalanceRow = {
   code: XeroTrialBalanceRefusalCode
@@ -152,6 +156,12 @@ export type ParsedXeroTrialBalance = {
   refusedRows: RefusedXeroTrialBalanceRow[]
   /** Set when the whole report cannot be read (no usable Header row). Nothing may be stored from it. */
   reportError: string | null
+  /**
+   * Whether the report proves ITSELF complete. Xero omits accounts with no balance, so an absent account may be a true zero, but
+   * only if the rows read add up to the report's own Total row (YTD Debit and YTD Credit, to the cent) and that total balances.
+   * Null = proven; otherwise the named reason.
+   */
+  completenessUnproven: string | null
 }
 
 type TrialBalanceColumns = { cellCount: number; ytdDebit: number; ytdCredit: number }
@@ -195,13 +205,16 @@ function ytdMoney(cell: XeroReportCell | undefined): Decimal | 'invalid' {
   return parseMoneyCell(value) ?? 'invalid'
 }
 
+type YtdSums = { debit: Decimal; credit: Decimal }
+
 function collectRows(
   rows: XeroReportRow[] | undefined,
   columns: TrialBalanceColumns,
   output: ParsedXeroTrialBalance,
+  sums: YtdSums,
 ): void {
   for (const row of rows ?? []) {
-    if (row.Rows?.length) collectRows(row.Rows, columns, output)
+    if (row.Rows?.length) collectRows(row.Rows, columns, output, sums)
     if (row.RowType && row.RowType !== 'Row') continue
     const cells = row.Cells ?? []
     const label = typeof cells[0]?.Value === 'string' ? cells[0].Value.trim() : ''
@@ -232,20 +245,52 @@ function collectRows(
       continue
     }
     // Stored convention: debit minus credit, so a credit-balance account is negative.
+    sums.debit = sums.debit.add(ytdDebit)
+    sums.credit = sums.credit.add(ytdCredit)
     output.rows.push({ ...identity, amount: ytdDebit.sub(ytdCredit) })
   }
 }
 
+function findTotalRows(rows: XeroReportRow[] | undefined, found: XeroReportRow[] = []): XeroReportRow[] {
+  for (const row of rows ?? []) {
+    if (row.RowType === 'SummaryRow' && typeof row.Cells?.[0]?.Value === 'string' && row.Cells[0].Value.trim().toLowerCase() === 'total') found.push(row)
+    findTotalRows(row.Rows, found)
+  }
+  return found
+}
+
+/** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row and that total balances. */
+function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: TrialBalanceColumns, sums: YtdSums, refused: number): string | null {
+  if (refused > 0) return 'a row was refused, so the rows read cannot be summed'
+  const totals = findTotalRows(entryRows)
+  if (totals.length !== 1) return `the report has ${totals.length} "Total" summary rows (exactly one is required)`
+  const cells = totals[0]!.Cells ?? []
+  if (cells.length !== columns.cellCount) return 'its Total row has a different cell count from the Header'
+  const totalDebit = ytdMoney(cells[columns.ytdDebit])
+  const totalCredit = ytdMoney(cells[columns.ytdCredit])
+  if (totalDebit === 'invalid' || totalCredit === 'invalid') return 'its Total row is not readable'
+  if (sums.debit.toFixed(2) !== totalDebit.toFixed(2) || sums.credit.toFixed(2) !== totalCredit.toFixed(2)) {
+    return `the rows read add up to ${sums.debit.toFixed(2)} / ${sums.credit.toFixed(2)} (YTD Debit / Credit) but the Total row says ${totalDebit.toFixed(2)} / ${totalCredit.toFixed(2)}`
+  }
+  if (totalDebit.toFixed(2) !== totalCredit.toFixed(2)) return `its Total row does not balance (YTD Debit ${totalDebit.toFixed(2)}, YTD Credit ${totalCredit.toFixed(2)})`
+  return null
+}
+
 export function parseXeroTrialBalanceReport(report: XeroTrialBalanceReport): ParsedXeroTrialBalance {
-  const output: ParsedXeroTrialBalance = { rows: [], refusedRows: [], reportError: null }
+  const output: ParsedXeroTrialBalance = { rows: [], refusedRows: [], reportError: null, completenessUnproven: null }
   for (const entry of report.Reports ?? []) {
     const located = trialBalanceColumns(findHeaderRow(entry.Rows))
     if ('error' in located) {
       output.reportError = located.error
       continue
     }
-    collectRows(entry.Rows, located.columns, output)
+    const sums: YtdSums = { debit: toDecimal(0), credit: toDecimal(0) }
+    const refusedBefore = output.refusedRows.length
+    collectRows(entry.Rows, located.columns, output, sums)
+    const problem = completenessProblem(entry.Rows, located.columns, sums, output.refusedRows.length - refusedBefore)
+    if (problem) output.completenessUnproven ??= problem
   }
+  if ((report.Reports ?? []).length === 0) output.completenessUnproven = 'the response has no report'
   return output
 }
 
@@ -317,10 +362,18 @@ export function buildXeroAccountBalanceSnapshotInputs(
       errors.push(`Configured account ${accountRef} was not stored: ${ownRefused.map((row) => row.message).join(' ')}`)
       continue
     }
-    // The row's own account id decides. The code is a fallback ONLY for a row that carries no id.
-    const parsed = parsedAll.find((row) => row.externalAccountId === account.externalAccountId)
-      ?? (account.code && account.codeUnique !== false ? parsedAll.find((row) => row.externalAccountId === null && row.accountCode === account.code) : undefined)
-      ?? null
+    // The row's own account id decides. The code is a fallback ONLY for a row that carries no id. EVERY matching row is
+    // collected: two rows for one account (a repeated id, or an id row and an id-less code row) are not resolved by taking the
+    // first, the account is refused.
+    const matches = [
+      ...parsedAll.filter((row) => row.externalAccountId === account.externalAccountId),
+      ...(account.code && account.codeUnique !== false ? parsedAll.filter((row) => row.externalAccountId === null && row.accountCode === account.code) : []),
+    ]
+    if (matches.length > 1) {
+      errors.push(`TB_DUPLICATE_ACCOUNT_ROW: the Xero Trial Balance has ${matches.length} rows for ${accountRef} (${matches.map((row) => String(row.amount.toFixed(2))).join(', ')}); nothing was stored for it.`)
+      continue
+    }
+    const parsed = matches[0] ?? null
     if (!parsed && account.code && account.codeUnique === false && parsedAll.some((row) => row.externalAccountId === null && row.accountCode === account.code)) {
       errors.push(`TB_CODE_NOT_UNIQUE: code ${account.code} is also held by another account in the current Xero chart and the Trial Balance row for it carries no account id, so it cannot be tied to ${accountRef}; nothing was stored for it.`)
       continue
@@ -339,6 +392,12 @@ export function buildXeroAccountBalanceSnapshotInputs(
     // balance — synthesize a zero snapshot rather than failing the whole sync.
     // Guard on a non-empty report: if NOTHING parsed, the fetch/parse itself
     // failed, so a missing row is a real error, not a genuine zero balance.
+    // That reading holds only if the report proves itself complete (its rows add up to its own balanced Total row); a partial
+    // report that merely leaves the account out would otherwise store a zero for a real balance.
+    if (!parsed && input.completenessUnproven !== null) {
+      errors.push(`TB_COMPLETENESS_UNPROVEN: configured account ${accountRef} is not in the Xero Trial Balance and the report does not prove it is complete (${input.completenessUnproven}), so it is not taken as zero; nothing was stored for it.`)
+      continue
+    }
     const amount = parsed ? parsed.amount : 0
     if (!parsed && input.parsedRows.length === 0) {
       errors.push(`No Trial Balance row matched configured account ${account.code ?? account.externalAccountId} (${account.name}).`)
@@ -438,6 +497,7 @@ export async function syncXeroAccountBalanceSnapshots(
     accounts,
     parsedRows,
     refusedRows: parsedTrialBalance.refusedRows,
+    completenessUnproven: parsedTrialBalance.completenessUnproven,
     balanceDate,
     baseCurrency,
     syncRunId: options.syncRunId ?? null,

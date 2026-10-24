@@ -215,3 +215,49 @@ test('CURRENT CHART: the chart fetch is GET-only, failing it stores nothing, and
   await pull()
   assert.equal(chartWrites, 3, 'the fetched chart was written inside the fenced transaction')
 })
+
+// ---- end to end: absent-means-zero needs completeness evidence; duplicate rows ----------------------------------------------
+const totalRowE2E = (debit: string, credit: string) => ({ RowType: 'SummaryRow', Cells: ['Total', '', '', debit, credit].map((Value) => ({ Value })) })
+const completeReport = (total: unknown) => ({
+  Reports: [{
+    Rows: [
+      header(),
+      { RowType: 'Section', Title: 'Revenue', Rows: [{ RowType: 'Row', Cells: cells('Income in Advance (810)', '11.88', '', '', '100.81') }] },
+      { RowType: 'Section', Title: 'Expenses', Rows: [{ RowType: 'Row', Cells: cells('Cost of Goods Sold (310)', '9171.62', '', '73019.20', '') }] },
+      // 631 is ABSENT from the rows; the equity row makes the report balance without it.
+      { RowType: 'Section', Title: 'Equity', Rows: [{ RowType: 'Row', Cells: cells('Owner Funds (970)', '', '', '', '72918.39') }, total] },
+    ],
+  }],
+})
+
+test('COMPLETE report (rows add up to a balanced Total) with 631 absent: 631 is stored as zero', async () => {
+  trialBalance = completeReport(totalRowE2E('73019.20', '73019.20'))
+  const result = await pull()
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(stored(), { '310': '73019.20', '631': '0.00', '810': '-100.81' })
+})
+
+test('PARTIAL report (Total counts more than the rows) with 631 absent: 631 withheld by name, the others stored, no stamp', async () => {
+  trialBalance = completeReport(totalRowE2E('196658.83', '196658.83'))
+  const result = await pull()
+  assert.deepEqual(stored(), { '310': '73019.20', '810': '-100.81' })
+  assert.match(result.errors[0]!, /TB_COMPLETENESS_UNPROVEN.*631/)
+})
+
+test('no Total row, or an unbalanced one: 631 withheld', async () => {
+  for (const total of [{ RowType: 'Section', Rows: [] }, totalRowE2E('73019.20', '73000.00')]) {
+    trialBalance = completeReport(total)
+    const result = await pull()
+    assert.deepEqual(stored(), { '310': '73019.20', '810': '-100.81' })
+    assert.match(result.errors[0]!, /TB_COMPLETENESS_UNPROVEN/)
+  }
+})
+
+test('two rows for one configured account: that account is refused, not the first row taken', async () => {
+  trialBalance = realReport()
+  const rows = (trialBalance as { Reports: Array<{ Rows: Array<{ Rows?: unknown[] }> }> }).Reports[0]!.Rows[3]!.Rows!
+  rows.push({ RowType: 'Row', Cells: cells('Inventory Control (631)', '', '', '1', '') })
+  const result = await pull()
+  assert.deepEqual(stored(), { '310': '73019.20', '810': '-100.81' })
+  assert.match(result.errors[0]!, /TB_DUPLICATE_ACCOUNT_ROW/)
+})

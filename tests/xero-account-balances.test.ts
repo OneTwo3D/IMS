@@ -122,6 +122,7 @@ test('buildXeroAccountBalanceSnapshotInputs: a configured account whose row was 
   const result = buildXeroAccountBalanceSnapshotInputs({
     balanceDate: '2026-10-23',
     baseCurrency: 'GBP',
+    completenessUnproven: null,
     accounts: [{ externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }, { externalAccountId: 'a-310', code: '310', name: 'Cost of Goods Sold' }],
     parsedRows: parsed.rows,
     refusedRows: parsed.refusedRows,
@@ -134,7 +135,7 @@ test('buildXeroAccountBalanceSnapshotInputs: a configured account whose row was 
 test('a refused row alone (nothing else parsed) still gives the refusal error, not a stored zero and not the generic no-match error', () => {
   const parsed = parseXeroTrialBalanceReport(report(HEADER, row('Inventory Control (631)', '1')))
   const result = buildXeroAccountBalanceSnapshotInputs({
-    balanceDate: '2026-10-23', baseCurrency: 'GBP',
+    balanceDate: '2026-10-23', baseCurrency: 'GBP', completenessUnproven: null,
     accounts: [{ externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }],
     parsedRows: parsed.rows, refusedRows: parsed.refusedRows,
   })
@@ -145,7 +146,7 @@ test('a refused row alone (nothing else parsed) still gives the refusal error, n
 test('buildXeroAccountBalanceSnapshotInputs synthesizes a zero snapshot for a configured account omitted from a non-empty Trial Balance, and prefers external id', () => {
   const result = buildXeroAccountBalanceSnapshotInputs({
     balanceDate: '2026-06-01',
-    baseCurrency: 'GBP',
+    baseCurrency: 'GBP', completenessUnproven: null,
     accounts: [
       { externalAccountId: 'account-x', code: '500', name: 'Inventory Asset' },
       { externalAccountId: 'account-missing', code: '600', name: 'Allocated Inventory' },
@@ -172,7 +173,7 @@ test('buildXeroAccountBalanceSnapshotInputs synthesizes a zero snapshot for a co
 test('buildXeroAccountBalanceSnapshotInputs still errors when the Trial Balance parsed no rows at all (fetch/parse failure, not a genuine zero)', () => {
   const result = buildXeroAccountBalanceSnapshotInputs({
     balanceDate: '2026-06-01',
-    baseCurrency: 'GBP',
+    baseCurrency: 'GBP', completenessUnproven: null,
     accounts: [{ externalAccountId: 'account-x', code: '500', name: 'Inventory Asset' }],
     parsedRows: [],
   })
@@ -189,7 +190,7 @@ test('a Header that Xero nests inside a wrapper Row is still found', () => {
 const ACCOUNT_631 = { externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }
 const buildFor = (accounts: Array<{ externalAccountId: string; code: string | null; name: string }>, rows: unknown[]) => {
   const parsed = parseXeroTrialBalanceReport(report(HEADER, ...rows))
-  return buildXeroAccountBalanceSnapshotInputs({ balanceDate: '2026-10-23', baseCurrency: 'GBP', accounts, parsedRows: parsed.rows, refusedRows: parsed.refusedRows })
+  return buildXeroAccountBalanceSnapshotInputs({ balanceDate: '2026-10-23', baseCurrency: 'GBP', completenessUnproven: null, accounts, parsedRows: parsed.rows, refusedRows: parsed.refusedRows })
 }
 
 test('a trailing currency suffix after the code does not hide the code', () => {
@@ -270,4 +271,102 @@ test('SummaryRow, Section and Header rows with blank labels are still not accoun
   const rows = parseXeroTrialBalanceReport(report(HEADER, { RowType: 'Section', Title: 'x', Rows: [{ RowType: 'SummaryRow', Cells: ['', '', '', '1', ''].map((Value) => ({ Value })) }, row('Inventory Control (631)', '', '', '4', '')] }))
   assert.deepEqual(rows.refusedRows, [])
   assert.equal(rows.rows.length, 1)
+})
+
+// ---- completeness: absent-means-zero only when the report proves itself complete -------------------------------------------
+const totalRow = (ytdDebit: string, ytdCredit: string, label = 'Total') => ({ RowType: 'SummaryRow', Cells: [label, '', '', ytdDebit, ytdCredit].map((Value) => ({ Value })) })
+// Shaped like Xero's report: a Header, sections of Rows (each with its own section SummaryRow), then a final Total SummaryRow.
+const realShaped = (total: ReturnType<typeof totalRow> | null, ...extra: unknown[]) => report(
+  HEADER,
+  { RowType: 'Section', Title: 'Revenue', Rows: [row('Income in Advance (810)', '', '', '', '100.81'), { RowType: 'SummaryRow', Cells: ['Total Revenue', '', '', '', '100.81'].map((Value) => ({ Value })) }] },
+  { RowType: 'Section', Title: 'Assets', Rows: [row('Cost of Goods Sold (310)', '', '', '73019.20', ''), row('Inventory Control (631)', '', '', '123639.63', ''), ...extra] },
+  { RowType: 'Section', Title: '', Rows: [row('Owner Funds (970)', '', '', '', '196558.02'), ...(total ? [total] : [])] },
+)
+const COMPLETE_TOTAL = () => totalRow('196658.83', '196658.83')
+
+test('a report whose rows add up to its balanced Total row proves itself complete', () => {
+  assert.equal(parseXeroTrialBalanceReport(realShaped(COMPLETE_TOTAL())).completenessUnproven, null)
+})
+
+test('COMPLETE report with a configured account absent: stored as zero', () => {
+  const parsed = parseXeroTrialBalanceReport(realShaped(COMPLETE_TOTAL()))
+  const absent = { externalAccountId: 'a-900', code: '900', name: 'Suspense' }
+  const result = buildXeroAccountBalanceSnapshotInputs({ balanceDate: '2026-10-23', baseCurrency: 'GBP', completenessUnproven: parsed.completenessUnproven, accounts: [absent], parsedRows: parsed.rows, refusedRows: parsed.refusedRows })
+  assert.deepEqual(result.snapshots.map((s) => String(s.amountBase)), ['0'])
+  assert.deepEqual(result.errors, [])
+})
+
+test('PARTIAL report (rows do not add up to the Total) with the account absent: withheld, TB_COMPLETENESS_UNPROVEN', () => {
+  // A row (631's real 123639.63) missing from the rows while the Total still counts it.
+  const partial = report(HEADER, { RowType: 'Section', Rows: [row('Cost of Goods Sold (310)', '', '', '73019.20', ''), row('Owner Funds (970)', '', '', '', '196658.83'), COMPLETE_TOTAL()] })
+  const parsed = parseXeroTrialBalanceReport(partial)
+  assert.match(parsed.completenessUnproven ?? '', /add up/)
+  const result = buildXeroAccountBalanceSnapshotInputs({ balanceDate: '2026-10-23', baseCurrency: 'GBP', completenessUnproven: parsed.completenessUnproven, accounts: [{ externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }], parsedRows: parsed.rows, refusedRows: parsed.refusedRows })
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /^TB_COMPLETENESS_UNPROVEN/)
+})
+
+test('NO Total row, an unreadable Total, two Total rows, or an unbalanced Total: completeness unproven', () => {
+  const cases: Array<[string, ReturnType<typeof realShaped>]> = [
+    ['none', realShaped(null)],
+    ['unreadable', realShaped(totalRow('n/a', '196658.83'))],
+    ['unbalanced', realShaped(totalRow('196658.83', '196658.00'))],
+    ['two', realShaped(COMPLETE_TOTAL(), COMPLETE_TOTAL())],
+  ]
+  for (const [name, input] of cases) assert.ok(parseXeroTrialBalanceReport(input).completenessUnproven, name)
+})
+
+test('a row refused anywhere means completeness cannot be proven', () => {
+  assert.match(parseXeroTrialBalanceReport(realShaped(COMPLETE_TOTAL(), row('Bad (100)', '', '', 'n/a', ''))).completenessUnproven ?? '', /refused/)
+})
+
+test('a section subtotal labelled "Total Revenue" is not the report Total', () => {
+  const parsed = parseXeroTrialBalanceReport(realShaped(null))
+  assert.match(parsed.completenessUnproven ?? '', /0 "Total"/)
+})
+
+test('an absent account is NOT zero when completeness is unproven, but an account that has a row is still read', () => {
+  const result = buildXeroAccountBalanceSnapshotInputs({
+    balanceDate: '2026-10-23', baseCurrency: 'GBP', completenessUnproven: 'x',
+    accounts: [{ externalAccountId: 'a-631', code: '631', name: 'Inventory' }, { externalAccountId: 'a-310', code: '310', name: 'COGS' }],
+    parsedRows: parseXeroTrialBalanceRows(report(HEADER, row('Cost of Goods Sold (310)', '', '', '5', ''))),
+  })
+  assert.deepEqual(result.snapshots.map((s) => s.accountCode), ['310'])
+  assert.match(result.errors[0]!, /TB_COMPLETENESS_UNPROVEN.*631/)
+})
+
+// ---- duplicates ----------------------------------------------------------------------------------------------------------
+test('two rows with the same account id and different amounts: refused, nothing stored (not the first)', () => {
+  const result = buildFor([ACCOUNT_631], [withId('Inventory Control (631)', 'a-631', '100'), withId('Inventory Control (631)', 'a-631', '200')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /^TB_DUPLICATE_ACCOUNT_ROW/)
+})
+
+test('two id-less rows for one unique code: refused', () => {
+  const result = buildFor([ACCOUNT_631], [row('Inventory Control (631)', '', '', '100', ''), row('Inventory Control (631)', '', '', '200', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /^TB_DUPLICATE_ACCOUNT_ROW/)
+})
+
+test('an id row and an id-less code row for the same account: refused', () => {
+  const result = buildFor([ACCOUNT_631], [withId('Inventory Control (631)', 'a-631', '100'), row('Inventory Control (631)', '', '', '200', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /^TB_DUPLICATE_ACCOUNT_ROW/)
+})
+
+test('one row per account is still read; a duplicate for ONE account does not block another', () => {
+  const result = buildFor([ACCOUNT_631, { externalAccountId: 'a-310', code: '310', name: 'COGS' }], [withId('Inventory Control (631)', 'a-631', '1'), withId('Inventory Control (631)', 'a-631', '2'), withId('Cost of Goods Sold (310)', 'a-310', '5')])
+  assert.deepEqual(result.snapshots.map((s) => s.accountCode), ['310'])
+})
+
+test('completeness: a credit total the rows do not reach, a total that is itself unbalanced, and an empty response are each unproven', () => {
+  // Credit rows sum to 196658.83 but the Total claims 196659.00 as credit and 196658.83 as debit... debits match, credits do not.
+  const creditShort = realShaped(totalRow('196658.83', '196659.83'))
+  assert.match(parseXeroTrialBalanceReport(creditShort).completenessUnproven ?? '', /add up/)
+  // Rows and Total agree with each other but the books do not balance (an extra debit only): a trial balance must balance.
+  const unbalanced = report(HEADER, { RowType: 'Section', Rows: [row('Cost of Goods Sold (310)', '', '', '5', ''), totalRow('5', '5.00') ] })
+  assert.match(parseXeroTrialBalanceReport(unbalanced).completenessUnproven ?? '', /add up/)
+  const rowsAgreeButUnbalanced = report(HEADER, { RowType: 'Section', Rows: [row('Cost of Goods Sold (310)', '', '', '5', ''), totalRow('5', '0')] })
+  assert.match(parseXeroTrialBalanceReport(rowsAgreeButUnbalanced).completenessUnproven ?? '', /does not balance/)
+  assert.ok(parseXeroTrialBalanceReport({ Reports: [] }).completenessUnproven)
 })
