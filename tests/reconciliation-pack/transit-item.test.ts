@@ -97,13 +97,14 @@ test('R11 SCHEDULE BY ORDER: rows are summed per order across source types; an o
 
 // [mutation: the coverage check removed or weakened to "any watermark"]
 test('R11 COVERAGE: the sub-ledger must be recorded as covering every open order; an unrecorded, later-than-D, malformed watermark, or an open order created on or before it, is NO_POPULATION_RECORD, never a short schedule', async () => {
-  for (const [label, over] of [
+  const cases: Array<[string, Partial<ImsTransitSchedule>]> = [
     ['no watermark', { coverageStart: null }],
     ['a watermark after D', { coverageStart: '2026-10-20' }],
     ['an open order created on the watermark day', { coverageStart: '2026-09-01' }],
     ['an open order created before the watermark', { coverageStart: '2026-09-02' }],
     ['an open order with no usable creation instant', { openOrders: [order('po1', { createdAt: 'yesterday' })] }],
-  ] as const) {
+  ]
+  for (const [label, over] of cases) {
     const { item } = await r11(section(over))
     assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], label)
   }
