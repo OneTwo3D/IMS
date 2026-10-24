@@ -86,7 +86,7 @@ const order = (id: string, ref: string, currency: string): Row => ({
 const bill = (id: string, ref: string, currency: string): Row => ({
   id, invoiceNumber: ref, totalForeign: 100, totalBase: 80, fxRateToBase: 1.25, po: { reference: `PO-${ref}`, currency },
 })
-const priorJournal = (id: string, side: 'receivable' | 'payable', documents?: Array<{ documentId: string; reference: string; currency: string; gainLossBase: number }>): Row => ({
+const priorJournal = (id: string, side: 'receivable' | 'payable', documents?: Array<{ documentId: string; reference: string; currency: string; gainLossBase: number; outstandingForeign?: string }>): Row => ({
   id, type: 'UNREALISED_FX_JOURNAL', status: 'SYNCED', connector: 'xero',
   payload: {
     kind: 'revaluation', side, valuationDate: '2026-05-31', ...(documents ? { documents } : {}),
@@ -291,7 +291,7 @@ test('[R2 HIGH] a blocked side is picked up by a rerun once the queue admits it 
   assert.deepEqual(rerun.withheldSides, [])
 })
 
-const DOC = (documentId: string, reference: string, currency: string, gainLossBase: number) => ({ documentId, reference, currency, gainLossBase })
+const DOC = (documentId: string, reference: string, currency: string, gainLossBase: number, outstandingForeign: string | null = '100') => ({ documentId, reference, currency, gainLossBase, ...(outstandingForeign !== null ? { outstandingForeign } : {}) })
 
 test('[R4 HIGH] A closed, B has no rate: the replacement is B\'s PREVIOUS amount only; A\'s is gone; the prior is fully reversed', async () => {
   state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-a', 'INV-A', 'USD', -9), DOC('so-b', 'INV-B', 'CHF', 4)])]
@@ -305,7 +305,7 @@ test('[R4 HIGH] A closed, B has no rate: the replacement is B\'s PREVIOUS amount
   assert.match(replacement[0].payload.lines[0].description, /carried forward on INV-B/)
   // the carried amount is a GAIN of 4: debit the control account, as when it was first posted
   assert.deepEqual(replacement[0].payload.lines.map((l) => [l.accountCode, l.debit, l.credit]), [['AR', 4, 0], ['UFX', 0, 4]])
-  assert.deepEqual((replacement[0].payload as unknown as { documents: unknown }).documents, [{ documentId: 'so-b', reference: 'INV-B', currency: 'CHF', gainLossBase: 4, carriedForward: true }])
+  assert.deepEqual((replacement[0].payload as unknown as { documents: unknown }).documents, [{ documentId: 'so-b', reference: 'INV-B', currency: 'CHF', gainLossBase: 4, outstandingForeign: '100', carriedForward: true }])
   assert.deepEqual(result.withheldSides, [])
   assert.deepEqual(result.skippedNoRate.map((s) => [s.reference, s.treatment, s.carriedGainLossBase]), [['INV-B', 'carried_forward', 4]])
   assert.equal(result.reversed, 1)
@@ -368,7 +368,7 @@ test('[R4 HIGH] every revaluation records its per-document amounts in its payloa
   state.receivables = [order('so-usd', 'INV-USD', 'USD')]
   await run()
   const docs = (posted('revaluation', 'receivable')[0].payload as unknown as { documents: unknown }).documents
-  assert.deepEqual(docs, [{ documentId: 'so-usd', reference: 'INV-USD', currency: 'USD', gainLossBase: -17.5 }])
+  assert.deepEqual(docs, [{ documentId: 'so-usd', reference: 'INV-USD', currency: 'USD', gainLossBase: -17.5, outstandingForeign: '100' }])
 })
 
 test('[R4 HIGH] with two journals still in force the document is carried from the LATEST one that names it', async () => {
@@ -381,4 +381,109 @@ test('[R4 HIGH] with two journals still in force the document is carried from th
   await run()
   assert.deepEqual(posted('reversal').map((e) => e.payload.sourceEntryId).sort(), ['prior-new', 'prior-old'])
   assert.deepEqual(amounts(posted('revaluation', 'receivable')[0]), [6, 6])
+})
+
+const withOutstanding = (ref: string, currency: string, outstanding: number): Row => ({ ...order(`so-${ref}`, `INV-${ref}`, currency), totalForeign: outstanding, totalBase: outstanding * 0.8 })
+
+test('[R5 HIGH] half paid: exactly HALF of the previous amount is carried (Decimal, 2dp half-up), and the paid half is not posted again', async () => {
+  // previous: 20.00 gain on 100 outstanding; now 50 outstanding and no rate
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 20, '100')])]
+  state.receivables = [withOutstanding('B', 'CHF', 50)]
+  state.receivables[0].id = 'so-b'
+  const result = await run()
+  assert.deepEqual(amounts(posted('revaluation', 'receivable')[0]), [10, 10])
+  const doc = (posted('revaluation', 'receivable')[0].payload as unknown as { documents: Array<Record<string, unknown>> }).documents[0]
+  assert.deepEqual(doc, { documentId: 'so-b', reference: 'INV-B', currency: 'CHF', gainLossBase: 10, outstandingForeign: '50', carriedForward: true }, 'the carried record is struck on the NEW balance, so a further part-payment scales again')
+  assert.equal(result.skippedNoRate[0].carriedGainLossBase, 10)
+  assert.deepEqual(result.withheldSides, [])
+})
+
+test('[R5 HIGH] the share is rounded half-up to 2dp: 10.01 x 1/3 -> 3.34 (not truncated)', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 10.01, '90')])]
+  state.receivables = [withOutstanding('B', 'CHF', 30)]
+  state.receivables[0].id = 'so-b'
+  await run()
+  assert.deepEqual(amounts(posted('revaluation', 'receivable')[0]), [3.34, 3.34])
+})
+
+test('[R5 HIGH] fully paid (nothing outstanding): contributes nothing', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 20)])]
+  state.receivables = []
+  const result = await run()
+  assert.deepEqual(posted('reversal').length, 1)
+  assert.equal(posted('revaluation', 'receivable').length, 0)
+  assert.deepEqual(result.skippedNoRate, [])
+})
+
+test('[R5 HIGH] unchanged outstanding: the FULL previous amount is carried', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 20, '100')])]
+  state.receivables = [withOutstanding('B', 'CHF', 100)]
+  state.receivables[0].id = 'so-b'
+  await run()
+  assert.deepEqual(amounts(posted('revaluation', 'receivable')[0]), [20, 20])
+})
+
+test('[R5 HIGH] outstanding GREW (an amendment): the side is withheld, naming the document', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 20, '100')])]
+  state.receivables = [withOutstanding('B', 'CHF', 120)]
+  state.receivables[0].id = 'so-b'
+  const result = await run()
+  assert.equal(state.enqueued.length, 0)
+  assert.equal(result.withheldSides[0]?.reason, 'side_withheld_missing_rate')
+  assert.match(String(result.withheldSides[0]?.detail), /INV-B: its outstanding balance GREW/)
+  assert.equal(result.skippedNoRate[0]?.treatment, 'side_withheld')
+})
+
+test('[R5 HIGH] a prior record WITHOUT the outstanding balance (posted before it was recorded): the side is withheld', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 20, null)])]
+  state.receivables = [withOutstanding('B', 'CHF', 100)]
+  state.receivables[0].id = 'so-b'
+  const result = await run()
+  assert.equal(state.enqueued.length, 0)
+  assert.match(String(result.withheldSides[0]?.detail), /did not record its outstanding balance/)
+})
+
+test('[R5 HIGH] a prior outstanding of zero is unusable: the side is withheld', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 20, '0')])]
+  state.receivables = [withOutstanding('B', 'CHF', 10)]
+  state.receivables[0].id = 'so-b'
+  const result = await run()
+  assert.equal(state.enqueued.length, 0)
+  assert.match(String(result.withheldSides[0]?.detail), /zero or negative/)
+})
+
+test('[R5 HIGH] a changed currency is unusable: the side is withheld', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'EUR', 20, '100')])]
+  state.receivables = [withOutstanding('B', 'CHF', 100)]
+  state.receivables[0].id = 'so-b'
+  const result = await run()
+  assert.equal(state.enqueued.length, 0)
+  assert.match(String(result.withheldSides[0]?.detail), /currency changed/)
+})
+
+test('[R5 HIGH] one unsafe document withholds the side even when another could be carried', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 20, '100'), DOC('so-c', 'INV-C', 'CHF', 8, null)])]
+  const b = withOutstanding('B', 'CHF', 100); b.id = 'so-b'
+  const c = withOutstanding('C', 'CHF', 100); c.id = 'so-c'
+  state.receivables = [b, c]
+  const result = await run()
+  assert.equal(state.enqueued.length, 0)
+  assert.match(String(result.withheldSides[0]?.detail), /INV-C/)
+})
+
+test('[R5 HIGH] every valuation records the outstanding foreign balance it was struck on', async () => {
+  state.rates = [USD_OK()]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD')]
+  await run()
+  const doc = (posted('revaluation', 'receivable')[0].payload as unknown as { documents: Array<Record<string, unknown>> }).documents[0]
+  assert.equal(doc.outstandingForeign, '100')
+})
+
+test('[R5 HIGH] a document read with nothing outstanding is closed: it contributes nothing and is not carried', async () => {
+  state.logs = [priorJournal('prior-ap', 'payable', [DOC('b-b', 'BILL-B', 'CHF', 20, '100')])]
+  state.payables = [{ ...bill('b-b', 'BILL-B', 'CHF'), totalForeign: 0 }]
+  const result = await run()
+  assert.equal(posted('reversal').length, 1)
+  assert.equal(posted('revaluation', 'payable').length, 0)
+  assert.equal(result.skippedNoRate[0]?.treatment, 'excluded_closed')
 })

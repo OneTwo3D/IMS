@@ -80,7 +80,13 @@ export type ValuedDocument = {
   currency: string
   /** Signed, exactly what `buildRealisedFxJournal` turns into lines: positive = gain on the side's control account. */
   gainLossBase: number
-  /** True when this amount was CARRIED FORWARD unchanged from the previous journal because the document had no rate. */
+  /**
+   * The document's OUTSTANDING FOREIGN balance this amount was struck on (decimal string). Without it a carry-forward
+   * cannot tell how much of the amount still belongs to an outstanding balance after a part-payment, so a record
+   * without it cannot be carried from. Absent on journals posted before it was recorded.
+   */
+  outstandingForeign?: string
+  /** True when this amount was CARRIED FORWARD, scaled to the current outstanding balance from the previous journal because the document had no rate. */
   carriedForward?: boolean
 }
 
@@ -93,7 +99,12 @@ function parseValuedDocuments(value: unknown): ValuedDocument[] | null {
     if (typeof e.documentId !== 'string' || typeof e.reference !== 'string' || typeof e.currency !== 'string') return null
     const gainLossBase = typeof e.gainLossBase === 'number' ? e.gainLossBase : Number(e.gainLossBase)
     if (!Number.isFinite(gainLossBase)) return null
-    out.push({ documentId: e.documentId, reference: e.reference, currency: e.currency, gainLossBase, ...(e.carriedForward === true ? { carriedForward: true } : {}) })
+    const outstanding = typeof e.outstandingForeign === 'string' || typeof e.outstandingForeign === 'number' ? String(e.outstandingForeign) : undefined
+    out.push({
+      documentId: e.documentId, reference: e.reference, currency: e.currency, gainLossBase,
+      ...(outstanding !== undefined ? { outstandingForeign: outstanding } : {}),
+      ...(e.carriedForward === true ? { carriedForward: true } : {}),
+    })
   }
   return out
 }
@@ -166,11 +177,16 @@ export type SkippedRevaluation = {
   message: string
   /**
    * What the run did about the document:
-   * `carried_forward` - it was in the previous journal, so that amount is carried forward unchanged;
+   * `carried_forward` - it was in the previous journal, so its share of that amount (scaled to what is still outstanding) is carried forward;
+   * `excluded_closed` - it was in the previous journal but nothing is outstanding on it now, so it contributes nothing;
    * `excluded_not_in_prior` - it was not in the previous journal, so it contributes nothing;
    * `side_withheld` - the previous journal has no per-document record, so the whole side is withheld.
    */
-  treatment?: 'carried_forward' | 'excluded_not_in_prior' | 'side_withheld'
+  treatment?: 'carried_forward' | 'excluded_closed' | 'excluded_not_in_prior' | 'side_withheld'
+  /** The document's current outstanding foreign balance, as read for this run. */
+  outstandingForeign?: number
+  /** For `side_withheld`: why this document's share could not be established. */
+  withheldBecause?: string
   /** For `carried_forward`: the amount carried (signed, base currency). */
   carriedGainLossBase?: number
 }
@@ -486,6 +502,7 @@ async function buildRevaluationLines(params: {
         currency: balance.currency,
         reason: error.reason,
         message: describeFxRefusal(error),
+        outstandingForeign: balance.outstandingForeign,
       })
       continue
     }
@@ -503,7 +520,7 @@ async function buildRevaluationLines(params: {
       fxGainLossAccount: params.fxGainLossAccount,
       description: `Unrealised FX ${revaluation.outcome} on ${balance.reference}`,
     })
-    valuations.push({ documentId: balance.id, reference: balance.reference, currency: balance.currency, gainLossBase: revaluation.gainLossBase })
+    valuations.push({ documentId: balance.id, reference: balance.reference, currency: balance.currency, gainLossBase: revaluation.gainLossBase, outstandingForeign: String(balance.outstandingForeign) })
     if (journalLines.length === 0) continue
     lines.push(...journalLines)
     documents += 1
@@ -628,33 +645,58 @@ export async function runArApFxRevaluation(input?: {
     // be carried and the whole side is withheld exactly as before: nothing reversed, nothing posted, the previous
     // valuation stays in force. That is the stated limit for the first run after this change.
     const sidePriors = priorRevaluations.filter((prior) => prior.side === side)
-    const carryable = sidePriors.every((prior) => prior.documents !== null && isRegisteredAccountingConnector(prior.connector))
-    if (!carryable) {
-      const skipped = built.skipped.map((item) => ({ ...item, treatment: 'side_withheld' as const }))
+    const withholdSide = async (because: string): Promise<void> => {
+      const skipped = built.skipped.map((item) => ({ ...item, treatment: 'side_withheld' as const, withheldBecause: because }))
       sidePlans.set(side, { done: false, built, withheld: true })
       skippedNoRate.push(...skipped)
-      withheldSides.push({ side, reason: 'side_withheld_missing_rate', skipped })
+      withheldSides.push({ side, reason: 'side_withheld_missing_rate', skipped, detail: because })
       await reportSkippedRevaluations(valuationDate, skipped)
       await reportWithheldSide(valuationDate, side, skipped)
+    }
+    if (!sidePriors.every((prior) => prior.documents !== null && isRegisteredAccountingConnector(prior.connector))) {
+      await withholdSide('a previous journal for this side has no per-document record (posted before they were recorded) or cannot be routed by this build')
       continue
     }
-    // The journals still in force, newest first: a document's carried amount is the one in the latest journal naming it.
+    // The journals still in force, newest first: a document's carried amount comes from the latest journal naming it.
     const newestFirst = [...sidePriors].sort((x, y) => y.valuationDate.localeCompare(x.valuationDate))
     const carriedLines: JournalLine[] = []
     const carriedValuations: ValuedDocument[] = []
-    const treated = built.skipped.map((item): SkippedRevaluation => {
+    const unsafe: string[] = []
+    const treated: SkippedRevaluation[] = []
+    for (const item of built.skipped) {
       const previous = newestFirst.flatMap((prior) => prior.documents ?? []).find((doc) => doc.documentId === item.documentId)
-      if (!previous) return { ...item, treatment: 'excluded_not_in_prior' }
+      if (!previous) { treated.push({ ...item, treatment: 'excluded_not_in_prior' }); continue }
+      // CARRY ONLY THE SHARE THAT BELONGS TO WHAT IS STILL OUTSTANDING (Codex R5): after a part-payment the previous
+      // amount, struck on the whole balance, would otherwise be posted again for the half still owed.
+      //     carried = previous amount x (outstanding now / outstanding then)
+      // in Decimal, rounded half-up to 2 places (`roundAccountingMoney`, the posting precision). When the share
+      // cannot be established safely the whole side is withheld instead, naming the document and the reason.
+      const then = previous.outstandingForeign === undefined ? null : toDecimal(previous.outstandingForeign)
+      const now = item.outstandingForeign === undefined || !Number.isFinite(item.outstandingForeign) ? null : toDecimal(item.outstandingForeign)
+      let why: string | null = null
+      if (then === null || !then.isFinite()) why = 'the previous journal did not record its outstanding balance'
+      else if (!then.gt(0)) why = 'its outstanding balance in the previous journal was zero or negative'
+      else if (previous.currency !== item.currency) why = `its currency changed (${previous.currency} to ${item.currency})`
+      else if (now === null) why = 'its current outstanding balance could not be read'
+      else if (now.gt(then)) why = `its outstanding balance GREW since the previous journal (${then.toString()} to ${now.toString()}, e.g. an amendment)`
+      if (why !== null) { unsafe.push(`${item.reference}: ${why}`); continue }
+      if (now === null || then === null) continue
+      if (!now.gt(0)) { treated.push({ ...item, treatment: 'excluded_closed' }); continue }
+      const carried = roundAccountingMoney(toDecimal(previous.gainLossBase).mul(now).div(then))
       carriedLines.push(...buildRealisedFxJournal({
         side,
-        gainLossBase: previous.gainLossBase,
+        gainLossBase: carried,
         controlAccount: accounts.controlAccount,
         fxGainLossAccount: accounts.fxGainLossAccount,
         description: `Unrealised FX carried forward on ${item.reference} (no rate for ${valuationDate})`,
       }))
-      carriedValuations.push({ documentId: item.documentId, reference: item.reference, currency: item.currency, gainLossBase: previous.gainLossBase, carriedForward: true })
-      return { ...item, treatment: 'carried_forward', carriedGainLossBase: previous.gainLossBase }
-    })
+      carriedValuations.push({ documentId: item.documentId, reference: item.reference, currency: item.currency, gainLossBase: carried, outstandingForeign: now.toString(), carriedForward: true })
+      treated.push({ ...item, treatment: 'carried_forward', carriedGainLossBase: carried })
+    }
+    if (unsafe.length > 0) {
+      await withholdSide(unsafe.join('; '))
+      continue
+    }
     sidePlans.set(side, {
       done: false,
       built: { ...built, lines: [...built.lines, ...carriedLines], valuations: [...built.valuations, ...carriedValuations], skipped: treated },
@@ -840,7 +882,7 @@ export async function runArApFxRevaluation(input?: {
                 + `Add the rate in Settings -> Currencies. Carried forward unchanged from the previous journal: ${skippedNoRate.filter((i) => i.treatment === 'carried_forward').map((i) => i.reference).join(', ') || 'none'}; `
                 + `left out (not in the previous journal): ${skippedNoRate.filter((i) => i.treatment === 'excluded_not_in_prior').map((i) => i.reference).join(', ') || 'none'}`
                 + (withheldSides.some((w) => w.reason === 'side_withheld_missing_rate')
-                  ? `; WITHHELD as a whole (the previous journal has no per-document record; nothing reversed or posted, the previous valuation stays in force): ${withheldSides.filter((w) => w.reason === 'side_withheld_missing_rate').map((w) => (w.side === 'receivable' ? 'AR' : 'AP')).join(', ')}.`
+                  ? `; WITHHELD as a whole (the carried share could not be established safely - see the withheld detail; nothing reversed or posted, the previous valuation stays in force): ${withheldSides.filter((w) => w.reason === 'side_withheld_missing_rate').map((w) => (w.side === 'receivable' ? 'AR' : 'AP')).join(', ')}.`
                   : '.')
               : null,
           ].filter(Boolean).join(' '),
