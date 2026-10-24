@@ -134,11 +134,18 @@ test('a BASE-currency receipt is still recorded, at 1, without reading the table
   assert.equal(state.asOfs.length, 0)
 })
 
-test('a refund-payment (refundId) never needs a rate: it produces no FX journal', async () => {
-  const result = await addPayment(receipt({ refundId: 'rf-1' }))
-  // The refund lookup double returns null, so this refuses for a DIFFERENT reason - and not the FX one.
-  assert.doesNotMatch(String(result.error), /FX rate/)
-  assert.equal(state.asOfs.length, 0)
+test('a refund-payment (refundId) never needs a rate: it produces no FX journal, so it is recorded with no rate in the table', async () => {
+  // the refund exists and the payment settles it; the table is EMPTY and the receipt still goes through
+  const original = tx.salesOrderRefund.findFirst
+  tx.salesOrderRefund.findFirst = async () => ({ totalForeign: 100 })
+  try {
+    const result = await addPayment(receipt({ refundId: 'rf-1' }))
+    assert.equal(result.success, true, JSON.stringify(result))
+    assert.equal(state.created.length, 1)
+    assert.equal(state.asOfs.length, 0, 'the rate table was never read')
+  } finally {
+    tx.salesOrderRefund.findFirst = original
+  }
 })
 
 test('[q0x56.16] a date-only paidAt looks the rate up as of the END of that day, and a 09:00 same-day rate is used', async () => {
