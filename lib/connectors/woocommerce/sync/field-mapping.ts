@@ -3,6 +3,7 @@
  */
 
 import { db } from '@/lib/db'
+import { getFxRateToBase as getFxRateToBaseFromTable, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { TaxCategory } from '@/app/generated/prisma/client'
@@ -488,51 +489,37 @@ export function extractWcTracking(order: WcFullOrder): { carrier: string; tracki
 // FX rate lookup
 // ---------------------------------------------------------------------------
 
-export class MissingFxRateError extends Error {
-  constructor(
-    message: string,
-    readonly currency: string,
-    readonly asOf: Date | undefined,
-  ) {
-    super(message)
-    this.name = 'MissingFxRateError'
-  }
-}
+// The error class and its predicate live with the one central lookup (lib/currencies/fx-lookup.ts); re-exported so the
+// connector's importers and `instanceof` checks keep working against a single class.
+export { MissingFxRateError, isMissingFxRateError }
 
-export function isMissingFxRateError(error: unknown): error is MissingFxRateError {
-  return error instanceof MissingFxRateError
-}
-
-export async function getFxRateToGbp(currency: string, asOf?: Date): Promise<number> {
+/**
+ * The base-currency rate for a WooCommerce order: 1 base = X foreign, so `base = foreign / rate`.
+ *
+ * `asOf` is REQUIRED: the order's own date for an import, `new Date()` where "now" is meant. (It used to be optional,
+ * and an omitted one meant "the latest row ever", which is no bound at all.) The base currency is the organisation's,
+ * not a literal GBP. Never silently falls back to 1:1 for a foreign currency; that corrupts revenue, COGS, and
+ * accounting sync downstream. A missing rate is logged and refuses with MissingFxRateError, as it always did.
+ */
+export async function getFxRateToBase(currency: string, asOf: Date): Promise<number> {
   const normalizedCurrency = currency.trim().toUpperCase()
-  if (normalizedCurrency === 'GBP') return 1
-
-  // Get date-bounded FX rate: stored as 1 GBP = X foreign.
-  // Never silently fall back to 1:1 for foreign currencies; that corrupts
-  // revenue, COGS, and accounting sync downstream.
-  const rate = await db.fxRate.findFirst({
-    where: {
-      fromCurrency: 'GBP',
-      toCurrency: normalizedCurrency,
-      ...(asOf ? { fetchedAt: { lte: asOf } } : {}),
-    },
-    orderBy: { fetchedAt: 'desc' },
-    select: { rate: true },
-  })
-  if (!rate) {
-    const message = `Missing GBP FX rate for ${normalizedCurrency}${asOf ? ` on or before ${asOf.toISOString().slice(0, 10)}` : ''}`
+  try {
+    const rate = await getFxRateToBaseFromTable(db, { currency: normalizedCurrency, asOf })
+    return rate.rate.toNumber()
+  } catch (error) {
+    if (!isMissingFxRateError(error)) throw error
     await logActivity({
       entityType: 'SYNC',
       action: 'wc_order_fx_missing',
       tag: 'sync',
       level: 'ERROR',
-      description: message,
-      metadata: { currency: normalizedCurrency, asOf: asOf?.toISOString() ?? null },
+      description: error.message,
+      metadata: { currency: normalizedCurrency, asOf: error.asOf?.toISOString() ?? null, reason: error.reason },
       resolveUser: false,
     })
-    throw new MissingFxRateError(message, normalizedCurrency, asOf)
+    throw error
   }
-  // fxRateToBase in the SalesOrder means: foreign / fxRate = GBP
-  // So if 1 GBP = 1.15 EUR, fxRateToBase = 1.15
-  return Number(rate.rate)
 }
+
+/** The historic name; the lookup is no longer GBP-specific. */
+export const getFxRateToGbp = getFxRateToBase

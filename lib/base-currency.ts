@@ -30,7 +30,7 @@ export function getFallbackCurrencyMeta(code: string): { name: string; symbol: s
  * Two definitions of "is this order in the base currency?" is two answers to "what does this credit
  * note post".
  */
-export async function resolveBaseCurrencyCode(client: Pick<PrismaClient, 'organisation'>): Promise<string> {
+export async function resolveBaseCurrencyCode(client: { organisation: Pick<PrismaClient['organisation'], 'findFirst'> }): Promise<string> {
   const org = await client.organisation.findFirst({ select: { baseCurrency: true } })
   return org?.baseCurrency ?? DEFAULT_BASE_CURRENCY
 }

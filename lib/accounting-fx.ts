@@ -1,5 +1,6 @@
 import type { AccountingSettings } from '@/lib/accounting'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type FxSettlementSide = 'receivable' | 'payable'
@@ -152,16 +153,17 @@ export async function resolveSettlementFxRateToBase(
   const currency = params.currency.trim().toUpperCase()
   const baseCurrency = params.baseCurrency.trim().toUpperCase()
   if (!currency || currency === baseCurrency) return 1
-  const rate = await tx.fxRate.findFirst({
-    where: {
-      fromCurrency: baseCurrency,
-      toCurrency: currency,
-      fetchedAt: { lte: params.asOf },
-    },
-    orderBy: { fetchedAt: 'desc' },
-    select: { rate: true },
-  })
-  const resolved = rate ? Number(rate.rate) : Number(params.fallbackRateToBase)
+  // The table read is the one central lookup. Only a MISSING row falls back to the caller's rate (below); a row
+  // that exists but is unusable (zero, negative, ambiguous tie) refuses rather than being papered over.
+  // TODO(o3d-q0x56.4): the fallback below is removed there; a missing rate then refuses.
+  let rate: Awaited<ReturnType<typeof getFxRateToBase>> | null = null
+  try {
+    rate = await getFxRateToBase(tx, { currency, asOf: params.asOf, baseCurrency })
+  } catch (error) {
+    // (a code that is not three letters can have no row either; it fell back before and still does)
+    if (!(isMissingFxRateError(error) && (error.reason === 'no_rate' || error.reason === 'invalid_currency'))) throw error
+  }
+  const resolved = rate ? rate.rate.toNumber() : Number(params.fallbackRateToBase)
   if (!rate && Number.isFinite(resolved) && resolved > 0) {
     await tx.activityLog.create({
       data: {

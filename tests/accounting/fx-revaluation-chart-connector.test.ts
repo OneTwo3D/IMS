@@ -141,7 +141,7 @@ mock.module('@/lib/db', {
       // `resolveSettlementFxRateToBase` reads `fxRate` on it. `null` makes it fall back to the balance's
       // own booked rate, which is all this file needs.
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
-        fxRate: { findFirst: async () => null },
+        fxRate: { groupBy: async () => [], findMany: async () => [] },
         // ...and it records a WARNING when it falls back, through the same transaction.
         activityLog: { create: async () => ({ id: 'activity-1' }) },
       }),

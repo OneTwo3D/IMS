@@ -178,6 +178,7 @@ mock.module('@/lib/connectors/woocommerce/sync/field-mapping', {
     resolveWcTaxRateById: async () => ({
       taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, reverseCharge: false,
     }),
+    getFxRateToBase: async () => 1,
     getFxRateToGbp: async () => 1,
     isMissingFxRateError: () => false,
     readWcCustomerVat: () => null,

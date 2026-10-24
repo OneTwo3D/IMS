@@ -78,7 +78,7 @@ const tx = {
     },
   },
   salesOrderRefund: { findFirst: async (): Promise<{ totalForeign: number } | null> => null },
-  fxRate: { findFirst: async () => null },
+  fxRate: { groupBy: async () => [], findMany: async () => [] },
   activityLog: { create: async () => ({}) },
 }
 

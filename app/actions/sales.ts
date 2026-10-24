@@ -150,6 +150,7 @@ import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPushIsPreCutover
 import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
+import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -398,30 +399,6 @@ async function getExistingDocumentNumberMax(
     return rows.reduce((max, row) => Math.max(max, parseSuffix(row.creditNoteNumber)), 0)
   }
   return 0
-}
-
-async function resolveFxRateToBase(
-  tx: Prisma.TransactionClient,
-  currency: string,
-  baseCurrency: string,
-  asOf: Date,
-): Promise<number> {
-  const normalizedCurrency = currency.trim().toUpperCase()
-  const normalizedBase = baseCurrency.trim().toUpperCase()
-  if (!normalizedCurrency || normalizedCurrency === normalizedBase) return 1
-  const rate = await tx.fxRate.findFirst({
-    where: {
-      fromCurrency: normalizedBase,
-      toCurrency: normalizedCurrency,
-      fetchedAt: { lte: asOf },
-    },
-    orderBy: { fetchedAt: 'desc' },
-    select: { rate: true },
-  })
-  if (!rate) {
-    throw new Error(`Missing ${normalizedBase} FX rate for ${normalizedCurrency} on or before ${asOf.toISOString().slice(0, 10)}`)
-  }
-  return Number(rate.rate)
 }
 
 async function refreshDraftOrderFxAtFinalization(

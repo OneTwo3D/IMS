@@ -74,6 +74,8 @@ import {
   type ProductCategoryNode,
 } from '@/lib/products/categories'
 import type { ProductLifecycleStatus, TaxCategory } from '@/app/generated/prisma/client'
+import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
+import { resolveFxRatesToBase } from '@/lib/currencies/fx-lookup'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1229,27 +1231,23 @@ export async function getProductSuppliers(productId: string): Promise<ProductSup
 
   if (rows.length === 0) return []
 
-  // Collect unique non-GBP currencies and look up latest FX rate + symbol for each
-  const currencies = [...new Set(rows.map((r) => r.currency).filter((c) => c !== 'GBP'))]
+  // Collect unique non-base currencies and look up the latest FX rate + symbol for each. The rate is the one central
+  // lookup (as of now): a currency with no usable rate (none, zero, an ambiguous tie) shows no base equivalent.
+  const baseCurrency = await getBaseCurrencyCode()
+  const currencies = [...new Set(rows.map((r) => r.currency).filter((c) => c !== baseCurrency))]
 
-  const symbolMap = new Map<string, string>([['GBP', '£']])
+  const symbolMap = new Map<string, string>([[baseCurrency, getFallbackCurrencyMeta(baseCurrency).symbol]])
   const currencyRows = await db.currency.findMany({
-    where: { code: { in: currencies } },
+    where: { code: { in: [...currencies, baseCurrency] } },
     select: { code: true, symbol: true },
   })
   for (const cr of currencyRows) symbolMap.set(cr.code, cr.symbol)
 
   const fxMap = new Map<string, { rate: number; fetchedAt: Date }>()
-  await Promise.all(
-    currencies.map(async (code) => {
-      const fx = await db.fxRate.findFirst({
-        where: { toCurrency: code },
-        orderBy: { fetchedAt: 'desc' },
-        select: { rate: true, fetchedAt: true },
-      })
-      if (fx) fxMap.set(code, { rate: Number(fx.rate), fetchedAt: fx.fetchedAt })
-    })
-  )
+  const outcomes = await resolveFxRatesToBase(db, { currencies, asOf: new Date(), baseCurrency })
+  for (const [code, outcome] of outcomes) {
+    if (outcome.ok) fxMap.set(code, { rate: outcome.rate.toNumber(), fetchedAt: outcome.fetchedAt })
+  }
 
   return rows.map((r) => {
     const cost = Number(r.lastUnitCost)
@@ -1258,7 +1256,7 @@ export async function getProductSuppliers(productId: string): Promise<ProductSup
     let fxRate: string | null = null
     let fxFetchedAt: Date | null = null
 
-    if (r.currency === 'GBP') {
+    if (r.currency === baseCurrency) {
       baseEquivalent = cost.toFixed(2)
       fxRate = '1'
     } else {

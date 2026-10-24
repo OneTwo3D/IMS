@@ -837,6 +837,15 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 - **IMS** stores `fxRateToBase` as: 1 base = X doc-currency (e.g. base GBP, doc EUR ⇒ 1 GBP = 1.18 EUR).
 - **Xero** `CurrencyRate` is: 1 doc-currency = X base. The connector inverts (`1 / fxRateToBase`) and rounds to 6dp to match Xero's `Decimal(18,6)` schema.
 
+**One lookup for every rate read.** Every IMS read of an exchange rate goes through `lib/currencies/fx-lookup.ts` (`getFxRateToBase`, with `getFxRatesToBase` / `resolveFxRatesToBase` for many currencies at one instant), against the `fx_rates` table:
+
+- `FxRate.rate` means 1 base = `rate` foreign, so `base = foreign / rate`. The base currency is the organisation's (Settings → Company), never a literal.
+- A foreign currency equal to the base is 1. Nothing else is ever defaulted to 1.
+- The row used is the latest one for that base and currency with `fetchedAt` on or before the caller's `asOf`. `asOf` is always supplied by the caller; the lookup has no implicit "now" (a caller that means now passes `new Date()`).
+- **Date rule.** A business date (document date, payment date, valuation date) maps to the END of that day, UTC: 23:59:59.999 (`endOfBusinessDateUtc`). A rate fetched at any time that day is therefore that day's rate; a rate fetched at 00:00 the next day is not. A caller holding an instant (an order's creation time) passes the instant itself.
+- Two rows at the same latest `fetchedAt` are accepted only if they carry the same rate; different rates refuse (`ambiguous_rate`). A zero, negative or non-numeric latest rate refuses too; an older good row is not substituted.
+- A missing rate refuses with `MissingFxRateError` and a closed reason (`no_rate`, `non_positive_rate`, `non_finite_rate`, `ambiguous_rate`, `invalid_currency`, `invalid_base_currency`, `invalid_as_of`). The owner ruling (2026-10-24) is that a missing rate never falls back to 1, to a document's booked rate or to a vendor's own rate; callers that still carry such a fallback are being moved to refuse (epic `[one-fx]`).
+
 **What's covered:**
 
 | Path | FX rate stamped? |

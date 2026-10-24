@@ -81,7 +81,7 @@ function transactionClient(pending: Array<() => void>) {
     purchaseInvoice: {
       updateMany: async (args: { data?: unknown }) => { pending.push(() => state.committedPaid.push(args.data)); return { count: 1 } },
     },
-    fxRate: { findFirst: async () => null },
+    fxRate: { groupBy: async () => [], findMany: async () => [] },
     activityLog: { create: async () => ({ id: 'a-1' }) },
     $executeRaw: async () => 1,
     $queryRaw: async () => [],
