@@ -5,12 +5,13 @@
  * That string can hold anything (an email address, a URL, a token pasted into a SKU column). So an identity
  * becomes text only through `identityToken`, which returns a `SafeToken`: a branded string that nothing but
  * this module can make. Renderers accept `SafeToken`, never `string`, so a raw value cannot be typed into a
- * report by accident. Four kinds exist and nothing else:
+ * report by accident. Five kinds exist and nothing else:
  *
  *   ims-id     a cuid                              kept as is, else `ims-id#<sha8>`
  *   vendor-id  a numeric vendor id (digits only)   kept as is, else `vendor-id#<sha8>`
  *   sku        a validated SKU                     kept as is, else `sku#<sha8>`
  *   warehouse  a warehouse code                    kept as is, else `warehouse#<sha8>`
+ *   order-ref  a purchase-order number or reference   kept as is when a plain token that does not look sensitive (the SKU pattern), else `order-ref#<sha8>`
  *
  * `<sha8>` is the first eight hex digits of the sha256 of the raw string: it lets two runs refer to the same
  * unprintable identity without printing it. A SKU is also digested when it merely LOOKS like a credential
@@ -22,7 +23,7 @@ import { createHash } from 'node:crypto'
 declare const safeTokenBrand: unique symbol
 export type SafeToken = string & { readonly [safeTokenBrand]: true }
 
-export const IDENTITY_KINDS = ['ims-id', 'vendor-id', 'sku', 'warehouse'] as const
+export const IDENTITY_KINDS = ['ims-id', 'vendor-id', 'sku', 'warehouse', 'order-ref'] as const
 export type IdentityKind = (typeof IDENTITY_KINDS)[number]
 
 const CUID_RE = /^c[a-z0-9]{24}$/
@@ -62,6 +63,7 @@ function plainOk(kind: IdentityKind, raw: string): boolean {
     case 'vendor-id': return VENDOR_ID_RE.test(raw)
     case 'warehouse': return WAREHOUSE_RE.test(raw) && !looksSensitive(raw)
     case 'sku': return SKU_RE.test(raw) && !looksSensitive(raw)
+    case 'order-ref': return SKU_RE.test(raw) && !looksSensitive(raw)
   }
 }
 
@@ -110,7 +112,7 @@ export function canonicalKey(parts: readonly KeyPart[]): string {
   }).join('\u0001')
 }
 
-const HASHED_PART_RE = /^(?:ims-id|vendor-id|sku|warehouse)#(?:[0-9a-f]{8}|unreadable)$/
+const HASHED_PART_RE = /^(?:ims-id|vendor-id|sku|warehouse|order-ref)#(?:[0-9a-f]{8}|unreadable)$/
 
 /**
  * A token read back from a file is acceptable only if every `|`-separated part is a hashed form or passes

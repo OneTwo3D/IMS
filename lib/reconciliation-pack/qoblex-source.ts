@@ -1,5 +1,5 @@
 /**
- * THE QOBLEX SOURCE: an operator-supplied EXPORT DIRECTORY, read once per run, for items R2, R5 and R14.
+ * THE QOBLEX SOURCE: an operator-supplied EXPORT DIRECTORY, read once per run, for items R2, R5, R7, R8 and R14.
  *
  * Qoblex is the incumbent system and has no API the pack may call (plan F7): the owner supplies a weekly export as files (owner decision
  * D9). This module decides what a read of those files PROVES. A part of the export (the stock, the products) is returned only when every
@@ -18,6 +18,10 @@
  *   - THE COLUMN MAP IS NOT THE OPERATOR'S. A manifest may name a column map only if its bytes are exactly the repository's native Qoblex map
  *     (qoblex-native-map.ts, which lists every transform in it); anything else is COLUMN_MAP_NOT_NATIVE. With no column map the file must
  *     be in the canonical layout, which has no transform at all.
+ *   - THE INCOMING REPORT (R7, R8) is a fourth part, `purchaseOrders`: its column map is REQUIRED and is the repository's native incoming-stock map
+ *     (the foreign exchange source of the export side is written into it), and it declares the prefix the first load gave the IMS purchase-order
+ *     references. Its lines must be open, internally consistent and unique per (order, SKU) (purchaseOrdersOf); an empty report is legal and is
+ *     the only part that may be empty.
  *   - EVERY DATA ROW IS ACCOUNTED FOR: a rejected row makes the part unreadable. The native map skips nothing. Only blank lines (no cell) are uncounted; zero-quantity rows are kept here and dropped by R2/R5 on both sides.
  *   - THE EXPORT IS PARSED BY THE FIRST-LOAD INGEST (lib/first-load/ingest.ts), not by a parser of its own: a malformed header, a rejected
  *     row, an unknown or repeated location, a SKU that is not a valid SKU, a non-decimal quantity (a negative one is data: an oversold position is compared as it is), a repeated (SKU, location)
@@ -36,7 +40,7 @@ import { ingestDataset, parseColumnMap, type DatasetMapping, type IngestedDatase
 import { parseCsvStrict } from '@/lib/first-load/csv'
 import { PRODUCT_TYPES } from '@/lib/first-load/spec'
 import { idToken, parseSku } from '@/lib/first-load/validate'
-import { QOBLEX_NATIVE_COLUMN_MAP } from '@/lib/reconciliation-pack/qoblex-native-map'
+import { QOBLEX_NATIVE_COLUMN_MAP, QOBLEX_NATIVE_PO_COLUMN_MAP } from '@/lib/reconciliation-pack/qoblex-native-map'
 import { DuplicateMemberError, parseJsonNoDuplicates } from '@/lib/ops/strict-json'
 import { checkAncestors, readTrustedRegularFileBytes } from '@/lib/ops/published-report'
 import { parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
@@ -49,6 +53,8 @@ import {
   QOBLEX_MAX_FILE_BYTES,
   QOBLEX_MAX_LOCATIONS,
   QOBLEX_NAME_RE,
+  QOBLEX_PO_KEY_PREFIX_RE,
+  QOBLEX_PO_NUMBER_RE,
   type PackReasonCode,
 } from '@/lib/reconciliation-pack/constants'
 
@@ -56,6 +62,14 @@ export type QoblexLocation = { code: string; company: string; threePl: boolean }
 /** One stock row of the export (a lot, or the one row of a SKU in a location). Quantities and costs are plain decimals as written. */
 export type QoblexLot = { sku: string; location: string; qty: string; unitCost: string | null; currency: string; fxRateToBase: string; lotRef: string }
 export type QoblexProduct = { sku: string; type: string }
+/**
+ * One line of the export's Incoming (open purchase order) report, as written: the Qoblex order number, the SKU, the supplier, and the
+ * quantities and the unit price in the order's own currency. The report carries no currency or rate: the currency is the one IMS recorded on
+ * the matched purchase order and the rate is the central fx_rates row (purchase-order-items.ts).
+ */
+export type QoblexPoLine = { orderKey: string; sku: string; supplier: string; qtyOrdered: string; qtyReceived: string; unitCostForeign: string }
+/** `keyPrefix` is what the first load put in front of a Qoblex order number to make the IMS purchase-order reference (the manifest's declaration; it only maps identities and never narrows a population). */
+export type QoblexPurchaseOrders = { keyPrefix: string; lines: QoblexPoLine[] }
 export type QoblexPart<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type QoblexExport = {
   exportedAt: string
@@ -63,12 +77,13 @@ export type QoblexExport = {
   locations: QoblexLocation[]
   stock: QoblexPart<QoblexLot[]>
   products: QoblexPart<QoblexProduct[]>
+  purchaseOrders: QoblexPart<QoblexPurchaseOrders>
   /** Every file read, once, with the sha256 of the bytes that were parsed. */
   files: Array<{ name: string; sha256: string }>
 }
 export type QoblexRead = { ok: true; value: QoblexExport } | { ok: false; reason: PackReasonCode }
 
-/** What R2, R5 and R14 hold: one read per run, shared. */
+/** What R2, R5, R7, R8 and R14 hold: one read per run, shared. */
 export interface QoblexSource { read(): Promise<QoblexRead> }
 
 class Unreadable extends Error {
@@ -82,10 +97,12 @@ const DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 const DAY_MS = 86_400_000
 
 const NATIVE_MAP_SHA256 = createHash('sha256').update(QOBLEX_NATIVE_COLUMN_MAP).digest('hex')
+const NATIVE_PO_MAP_SHA256 = createHash('sha256').update(QOBLEX_NATIVE_PO_COLUMN_MAP).digest('hex')
 
 type Reference = { file: string; sha256: string }
 type PartSpec = { file: string; sha256: string; columnMap: Reference | null }
-type Manifest = { exportedAt: string; asOf: string; locations: QoblexLocation[]; stock: PartSpec | null; products: PartSpec | null }
+type PoSpec = PartSpec & { keyPrefix: string }
+type Manifest = { exportedAt: string; asOf: string; locations: QoblexLocation[]; stock: PartSpec | null; products: PartSpec | null; purchaseOrders: PoSpec | null }
 
 function record(value: unknown, keys: readonly string[], required: readonly string[]): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return bad()
@@ -108,6 +125,13 @@ function partSpec(value: unknown): PartSpec {
   return { ...data, columnMap: r.columnMap === undefined ? null : reference(r.columnMap) }
 }
 
+/** The purchase-order part: a data file, the native map (required: the foreign exchange source is in it) and the prefix the first load gave the IMS references. */
+function poSpec(value: unknown): PoSpec {
+  const r = record(value, ['file', 'sha256', 'columnMap', 'keyPrefix'], ['file', 'sha256', 'columnMap', 'keyPrefix'])
+  if (typeof r.keyPrefix !== 'string' || !QOBLEX_PO_KEY_PREFIX_RE.test(r.keyPrefix)) return bad('NO_POPULATION_RECORD')
+  return { ...partSpec({ file: r.file, sha256: r.sha256, columnMap: r.columnMap }), keyPrefix: r.keyPrefix }
+}
+
 function calendarDate(value: unknown): string {
   if (typeof value !== 'string' || !DATE_RE.test(value)) return bad()
   const parsed = new Date(`${value}T00:00:00.000Z`)
@@ -120,7 +144,7 @@ export function parseQoblexManifest(text: string): Manifest {
   let raw: unknown
   // A member named twice (two threePl on a location, say) is a manifest that says two things: refused whole (lib/ops/strict-json.ts).
   try { raw = parseJsonNoDuplicates(text) } catch (error) { return bad(error instanceof DuplicateMemberError ? 'MANIFEST_INCONSISTENT' : 'SOURCE_UNREADABLE') }
-  const r = record(raw, ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations', 'stock', 'products'], ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations'])
+  const r = record(raw, ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations', 'stock', 'products', 'purchaseOrders'], ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations'])
   if (r.formatVersion !== QOBLEX_MANIFEST_VERSION) return bad()
   if (r.baseCurrency !== QOBLEX_BASE_CURRENCY) return bad('CURRENCY_UNKNOWN')
   if (typeof r.exportedAt !== 'string' || !ISO_UTC_RE.test(r.exportedAt) || Number.isNaN(Date.parse(r.exportedAt))) return bad()
@@ -136,13 +160,14 @@ export function parseQoblexManifest(text: string): Manifest {
   })
   const stock = r.stock === undefined ? null : partSpec(r.stock)
   const products = r.products === undefined ? null : partSpec(r.products)
+  const purchaseOrders = r.purchaseOrders === undefined ? null : poSpec(r.purchaseOrders)
   // ONE FILE, ONE CLAIM. Every reference to a file, a data file or a column map, in any part, is gathered. A file name is judged
   // CASE-INSENSITIVELY (two names that differ only in case could be one file on a case-folding file system, so they are refused, not
   // guessed apart); every reference to it must spell it identically and declare the same sha256. A file is never both a data file and a
   // column map. A data file shared by the two parts (the native stock report feeds both datasets) must be shared with the same column map.
   // Any contradiction rejects the WHOLE manifest, so no part is used on a manifest that claims two things about the same bytes.
   const refs: Array<{ file: string; sha256: string; role: 'data' | 'map' }> = []
-  for (const part of [stock, products]) {
+  for (const part of [stock, products, purchaseOrders]) {
     if (part === null) continue
     refs.push({ file: part.file, sha256: part.sha256, role: 'data' })
     if (part.columnMap) refs.push({ file: part.columnMap.file, sha256: part.columnMap.sha256, role: 'map' })
@@ -158,7 +183,9 @@ export function parseQoblexManifest(text: string): Manifest {
     const b = products.columnMap
     if ((a === null) !== (b === null) || (a !== null && b !== null && (a.file !== b.file || a.sha256 !== b.sha256))) return bad('MANIFEST_INCONSISTENT')
   }
-  return { exportedAt: r.exportedAt, asOf, locations, stock, products }
+  // The incoming report is its own file: sharing the stock report's file would read one set of bytes as two different reports.
+  if (purchaseOrders !== null && [stock, products].some((other) => other !== null && other.file.toLowerCase() === purchaseOrders.file.toLowerCase())) return bad('MANIFEST_INCONSISTENT')
+  return { exportedAt: r.exportedAt, asOf, locations, stock, products, purchaseOrders }
 }
 
 /**
@@ -215,7 +242,7 @@ const identityCellIsCanonical = (cell: string): boolean => cell !== '' && cell =
  * whitespace is dropped, and the value must then be a plain decimal (no locale formatting, comma, exponent or sign other than a minus), so a
  * padded number has one unambiguous value.
  */
-function assertRawIdentities(bytes: Uint8Array, dataset: 'stock-lots' | 'products', mapping: DatasetMapping | null): void {
+function assertRawIdentities(bytes: Uint8Array, dataset: 'stock-lots' | 'products' | 'purchase-order-lines', mapping: DatasetMapping | null): void {
   let text: string
   try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { return bad() }
   const parsed = parseCsvStrict(text, mapping?.delimiter ?? ',')
@@ -234,6 +261,8 @@ function assertRawIdentities(bytes: Uint8Array, dataset: 'stock-lots' | 'product
     columns.push({ index, upper })
   }
   find(mapping === null ? 'sku' : mapping.columns.sku ?? '', false)
+  // The order number is an identity too (R7 and R8 match purchase orders by it): its cell must already be the exact text the pack compares.
+  if (dataset === 'purchase-order-lines') find(mapping === null ? 'orderKey' : mapping.columns.orderKey ?? '', false)
   if (mapping === null && dataset === 'stock-lots') find('warehouseCode', true)
   for (const record of records) {
     if (record.cells.length !== header.length) continue
@@ -245,15 +274,17 @@ function assertRawIdentities(bytes: Uint8Array, dataset: 'stock-lots' | 'product
   }
 }
 
-function ingest(dataset: 'stock-lots' | 'products', spec: PartSpec, files: Files): IngestedDataset {
+function ingest(dataset: 'stock-lots' | 'products' | 'purchase-order-lines', spec: PartSpec, files: Files): IngestedDataset {
   const bytes = files.read({ file: spec.file, sha256: spec.sha256 })
   let mapping = null
+  if (dataset === 'purchase-order-lines' && spec.columnMap === null) return bad('COLUMN_MAP_NOT_NATIVE')
   if (spec.columnMap !== null) {
     // The column map is operator input and must not decide what is compared (rename, replace, fix or skip a value): only the repository's own
     // native map is accepted, by the digest of the bytes read, and it is the pack's own copy that is parsed (qoblex-native-map.ts).
     const mapBytes = files.read(spec.columnMap)
-    if (createHash('sha256').update(mapBytes).digest('hex') !== NATIVE_MAP_SHA256) return bad('COLUMN_MAP_NOT_NATIVE')
-    mapping = parseColumnMap(QOBLEX_NATIVE_COLUMN_MAP, 'native').datasets[dataset] ?? null
+    const wantDigest = dataset === 'purchase-order-lines' ? NATIVE_PO_MAP_SHA256 : NATIVE_MAP_SHA256
+    if (createHash('sha256').update(mapBytes).digest('hex') !== wantDigest) return bad('COLUMN_MAP_NOT_NATIVE')
+    mapping = parseColumnMap(dataset === 'purchase-order-lines' ? QOBLEX_NATIVE_PO_COLUMN_MAP : QOBLEX_NATIVE_COLUMN_MAP, 'native').datasets[dataset] ?? null
     if (mapping === null) return bad()
   }
   const out = ingestDataset(dataset, bytes, spec.file, mapping)
@@ -261,7 +292,9 @@ function ingest(dataset: 'stock-lots' | 'products', spec: PartSpec, files: Files
   // Nothing rejected, nothing set aside unaccounted, and not empty: a file that yields no rows says nothing about the stock.
   // EVERY data row is accounted for: none rejected, and the records read are exactly the rows kept. The only map is the native one, which skips
   // nothing and merges nothing. Blank lines are the one thing not counted: a blank line carries no cell, so no stock or product is hidden by it.
-  if (out.rejected.length > 0 || out.rows.length === 0 || out.recordsRead !== out.rows.length) return bad()
+  // The incoming report alone may be empty (no order is incoming): the header check of the ingest still proved it is that report, and R7 and R8
+  // pass on it only on a named proof that also needs IMS to hold no open order.
+  if (out.rejected.length > 0 || out.recordsRead !== out.rows.length || (out.rows.length === 0 && dataset !== 'purchase-order-lines')) return bad()
   return out
 }
 
@@ -317,6 +350,49 @@ function productsOf(spec: PartSpec, files: Files): QoblexProduct[] {
   return products
 }
 
+const isNonNegativeDecimal = (value: string): boolean => { const d = parseDecimalStrict(value); return d !== null && !d.isNegative() }
+
+/**
+ * The Incoming report as the lines it lists. Every line must be an OPEN one (the native map's only statuses), carry a plain non-negative
+ * ordered and received quantity with received not above ordered, and a plain non-negative price in the order's own currency. The lines of one order share one supplier (the importer refuses an order that does not). An order number or SKU is the exact text of the file (assertRawIdentities) and an order number
+ * is a plain token (QOBLEX_PO_NUMBER_RE); the same (order, SKU) twice, or two order numbers that differ only in case, is DUPLICATE_KEY (never
+ * summed, never picked between). Anything else is a closed reason and no line is returned.
+ */
+function purchaseOrdersOf(spec: PoSpec, files: Files): QoblexPurchaseOrders {
+  const ingested = ingest('purchase-order-lines', spec, files)
+  const lines = ingested.rows.map((row): QoblexPoLine => {
+    const v = row.values
+    const sku = parseSku(v.sku ?? '')
+    if (!sku.ok) return bad('BAD_KEY')
+    const orderKey = v.orderKey ?? ''
+    if (!QOBLEX_PO_NUMBER_RE.test(orderKey)) return bad('BAD_KEY')
+    if ((v.status ?? '') !== 'OPEN') return bad('BAD_VALUE')
+    const qtyOrdered = v.qtyOrdered ?? ''
+    const qtyReceived = v.qtyReceived ?? ''
+    const price = v.unitCostForeign ?? ''
+    if (!isNonNegativeDecimal(qtyOrdered) || !isNonNegativeDecimal(qtyReceived) || !isNonNegativeDecimal(price)) return bad('BAD_VALUE')
+    if (parseDecimalStrict(qtyReceived)!.gt(parseDecimalStrict(qtyOrdered)!)) return bad('BAD_VALUE')
+    return { orderKey, sku: sku.sku, supplier: v.supplierName ?? '', qtyOrdered, qtyReceived, unitCostForeign: price }
+  })
+  const lineIds = new Set<string>()
+  const orderIds = new Map<string, string>()
+  const shape = new Map<string, string>()
+  for (const line of lines) {
+    const lineId = `${line.orderKey}\u0001${line.sku}`
+    if (lineIds.has(lineId)) return bad('DUPLICATE_KEY')
+    lineIds.add(lineId)
+    const folded = line.orderKey.toUpperCase()
+    const spelled = orderIds.get(folded)
+    if (spelled !== undefined && spelled !== line.orderKey) return bad('DUPLICATE_KEY')
+    orderIds.set(folded, line.orderKey)
+    const sig = line.supplier
+    const seen = shape.get(line.orderKey)
+    if (seen !== undefined && seen !== sig) return bad('EXPORT_INCONSISTENT')
+    shape.set(line.orderKey, sig)
+  }
+  return { keyPrefix: spec.keyPrefix, lines }
+}
+
 function part<T>(run: () => T): QoblexPart<T> {
   try { return { ok: true, value: run() } } catch (error) {
     if (error instanceof Unreadable) return { ok: false, reason: error.reason }
@@ -339,14 +415,15 @@ export function readQoblexExport(dir: string, asOf: string, now: Date): QoblexRe
     if (stale !== null) return { ok: false, reason: stale }
     const stock = manifest.stock === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => stockOf(manifest.stock!, manifest.locations, files))
     const products = manifest.products === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => productsOf(manifest.products!, files))
-    return { ok: true, value: { exportedAt: manifest.exportedAt, asOf: manifest.asOf, locations: manifest.locations, stock, products, files: files.list } }
+    const purchaseOrders = manifest.purchaseOrders === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => purchaseOrdersOf(manifest.purchaseOrders!, files))
+    return { ok: true, value: { exportedAt: manifest.exportedAt, asOf: manifest.asOf, locations: manifest.locations, stock, products, purchaseOrders, files: files.list } }
   } catch (error) {
     return { ok: false, reason: error instanceof Unreadable ? error.reason : 'SOURCE_UNREADABLE' }
   }
 }
 
 /**
- * The source an item holds: nothing is read until an item asks, and then once for the run (a shared promise), so R2, R5 and R14 see the
+ * The source an item holds: nothing is read until an item asks, and then once for the run (a shared promise), so R2, R5, R7, R8 and R14 see the
  * same bytes. An error from the ingest (InputError) or anything unexpected is an unreadable part, never a throw.
  */
 export function createQoblexSource(options: { dir: string; asOf: string; now: () => Date }): QoblexSource {

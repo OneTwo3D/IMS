@@ -45,14 +45,16 @@ import {
 } from '@/lib/reconciliation-pack/constants'
 import { normaliseWcOrderStatus, WC_DEFAULT_SYNC_ORDER_STATUSES } from '@/lib/connectors/woocommerce/order-status-filter'
 import { STOCK_TRACKED_PRODUCT_TYPES } from '@/lib/domain/inventory/backorder-policy'
-import { AccountingSyncStatus, AccountingSyncType, SalesOrderStatus } from '@/app/generated/prisma/enums'
+import { AccountingSyncStatus, AccountingSyncType, PurchaseOrderStatus, SalesOrderStatus } from '@/app/generated/prisma/enums'
+import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
+import { QOBLEX_BASE_CURRENCY, TRANSIT_COVERAGE_SETTING_KEY } from '@/lib/reconciliation-pack/constants'
 
 /** The slice of a `pg` client this module needs. A test double implements it; `pg.Client` satisfies it. */
 export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'firstLoadProvenance'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -137,6 +139,74 @@ export type ImsVat = {
   wooFx: VatOrderFxRow[]
 }
 
+/**
+ * R7 and R8, the IMS side: every GOODS purchase order in a status that counts as committed incoming supply (the one shared definition,
+ * lib/domain/inventory/po-status-sets.ts INCOMING_PO_STATUSES: PO_SENT, SHIPPED, PARTIALLY_RECEIVED), with every line. A line's outstanding
+ * quantity is qty - qtyReceived; `unitCostBase` is the stored net cost per stock unit in the base currency (the rate was fixed when the order
+ * was created). `currency` is the order's own currency. Read whole (a cap is CAP_EXCEEDED), in the snapshot of the other sections.
+ */
+export type PoLineRow = { id: string; sku: string; qty: string; qtyReceived: string; unitCostBase: string }
+export type PoRow = { id: string; reference: string; status: string; currency: string; createdAt: string; /** The order-level discount (PurchaseOrder.discountAmount, in the order's currency; 0 when none). */ discount: string; lines: PoLineRow[] }
+/**
+ * WHICH PURCHASE ORDERS THE FIRST LOAD CREATED, from what IMS RECORDED (never from a reference's prefix, never from the export). The first-load apply runner
+ * creates each order through createPurchaseOrder with a system-actor context, and that function writes an activity-log row (entity PURCHASE_ORDER,
+ * entity id = the order's id, action `created`) whose metadata carries `actor: {kind: 'system', runId, operator}` (app/actions/purchase-orders.ts, lib/first-load/apply/system-import-capability.ts
+ * withSystemActor). `runId` is the run record's `run_id`. So: `runId`, `status`, `journalEmitted` and `journalFailed` (the run record's purchase-orders step: orders emitted and failed) come from
+ * first_load_apply_runs; `attributed` is the id of every order carrying that run's system-actor creation row, and `attributedExisting` how many of those ids are still purchase orders.
+ * The activity log has a retention sweep, so a pruned row would make an order look native. COMPLETENESS IS PROVEN AGAINST ORDERS: the run record's purchase-orders step counts UNITS, and a unit
+ * of that step is ONE ORDER (all the lines of one order, lib/first-load/validate.ts; orchestrate.ts classifies each unit absent -> present = created, present -> present = skippedExisting),
+ * per ATTEMPT, so `created` alone is not the run's total after a resume; `emitted` (= created + updated + skippedExisting + failed, orchestrate.ts:353) is the number of orders in the
+ * step's file, every one of them present when the run is VERIFIED. So `journalEmitted` (with `journalFailed` = 0) is what the number of distinct attributed orders must equal.
+ */
+export type FirstLoadProvenance = { runId: string; status: string; journalEmitted: number | null; journalFailed: number | null; attributed: string[]; attributedExisting: number }
+/**
+ * The central exchange-rate table (fx_rates, fed by lib/currencies/fx-refresh.ts): 1 unit of the base currency (GBP) = `rate` units of
+ * `currency`, as fetched at `fetchedAt`. Every row from the base currency is read (a cap is CAP_EXCEEDED); nothing is picked here: the item
+ * takes the latest row on or before a stated instant and refuses a tie it cannot break.
+ */
+export type FxRateRow = { currency: string; rate: string; fetchedAt: string; /** An admin-pinned rate (fx_rates.manualOverride): it stays in force until a newer non-override row replaces it. */ manualOverride: boolean }
+
+/**
+ * R11, the IMS side: the transit sub-ledger (append-only; every posting to the Stock in Transit account records a signed base-currency row)
+ * read up to and including the cycle date, grouped by the purchase order each row belongs to and its source type. A row belongs to a
+ * purchase order by its recorded source: the order id itself for a bill, update, receipt, cancellation and landed-cost leg, the order of the
+ * return for a supplier return and of the credit note for a supplier credit note. The refund-in-transit leg belongs to no order (`customerReturns`).
+ * `orders` holds every order the rows name, with its status and type; `openOrders` every order in an incoming status with its creation instant.
+ * `coverageStart` is the sub-ledger's recorded coverage watermark (null when unrecorded). A source type this module does not know, or a row
+ * whose order does not exist, makes the section unreadable.
+ */
+export type TransitNetRow = { poId: string; sourceType: string; net: string }
+export type TransitOrderRow = { id: string; reference: string; status: string; type: string; createdAt: string }
+/**
+ * What the sub-ledger CANNOT have recorded, because it predates the recorded coverage watermark W (`coverageStart`; all zero when none is recorded). The ledger has no opening
+ * balance and records only postings after W, so any of these makes the whole-ledger total incomplete. EVERY check rests on a DURABLE DOMAIN RECORD, never on a log: the retention
+ * job (lib/data-retention.ts purgeExpiredData) prunes only shopping_sync_logs, accounting_sync_logs, wms_sync_jobs, cogs_entries and stock_movements (the activity log has its own
+ * sweep, lib/activity-log-cleanup.ts), and none of the tables below; the only code that deletes a row of any of them is the operator's reset action (app/actions/reset.ts), which
+ * wipes the whole estate, ledger included. One count per source document kind (TRANSIT_SOURCE_DOCUMENTS, each the document behind one or more transit source types), plus the
+ * ledger's own rows dated before W. A count is of documents created on or before W's day (a ledger row: dated before W).
+ */
+export type TransitPreWatermark = Record<string, number>
+/**
+ * The durable source documents of every source type that posts to the transit account (lib/domain/accounting/transit-subledger-movement.ts), and the SQL counting those created
+ * on or before the watermark's day ($1 = the watermark). A purchase order of ANY type and status (goods and freight, cancelled and closed included) anchors the bill, bill update,
+ * receipt, cancellation and landed-cost legs; the others are the document of their own leg. Refunds are counted whether or not they went to transit (stricter is fine: the first load
+ * runs on an empty database, so nothing legitimately predates the watermark). `sync-log-reversals` is an ADDITIONAL signal only: its table is pruned by retention, so nothing rests on it alone.
+ */
+export const TRANSIT_SOURCE_DOCUMENTS: ReadonlyArray<{ kind: string; sourceTypes: string; sql: string }> = [
+  { kind: 'purchase-orders', sourceTypes: 'PURCHASE_BILL, PURCHASE_BILL_UPDATE, STOCK_RECEIPT, PURCHASE_ORDER_CANCEL, LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM purchase_orders WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'purchase-invoices', sourceTypes: 'PURCHASE_BILL, PURCHASE_BILL_UPDATE', sql: `SELECT count(*)::text AS n FROM purchase_invoices WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'purchase-receipts', sourceTypes: 'STOCK_RECEIPT', sql: `SELECT count(*)::text AS n FROM purchase_receipts WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'purchase-returns', sourceTypes: 'SUPPLIER_RETURN', sql: `SELECT count(*)::text AS n FROM purchase_returns WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'supplier-credit-notes', sourceTypes: 'SUPPLIER_CREDIT_NOTE', sql: `SELECT count(*)::text AS n FROM supplier_credit_notes WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'landed-cost-links', sourceTypes: 'LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM landed_cost_links WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'landed-cost-revaluations', sourceTypes: 'LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM landed_cost_revaluation_runs WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'sales-order-refunds', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT', sql: `SELECT count(*)::text AS n FROM sales_order_refunds WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'return-expectations', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT', sql: `SELECT count(*)::text AS n FROM return_expectations WHERE created_at < ($1::date + 1)` },
+  { kind: 'subledger-rows', sourceTypes: 'every type (the ledger itself)', sql: `SELECT count(*)::text AS n FROM transit_subledger_movements WHERE journal_date < $1::date` },
+  { kind: 'sync-log-reversals', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT (additional signal; the table is pruned by retention)', sql: `SELECT count(*)::text AS n FROM accounting_sync_logs WHERE type::text = 'COGS_REVERSAL' AND payload->>'_returnInTransit' = 'true' AND "createdAt" < ($1::date + 1)` },
+]
+export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; preWatermark: TransitPreWatermark; net: TransitNetRow[]; customerReturns: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
+
 export type ImsSectionValues = {
   identity: ImsIdentity
   boundaries: PopulationBoundaries
@@ -153,6 +223,10 @@ export type ImsSectionValues = {
   xeroPostings: XeroPostings
   warehouses: WarehouseRow[]
   vat: ImsVat
+  purchaseOrders: PoRow[]
+  transitSchedule: ImsTransitSchedule
+  fxRates: FxRateRow[]
+  firstLoadProvenance: FirstLoadProvenance | null
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -538,7 +612,100 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     unique(links, (link) => `${link.connector}\u0001${link.externalProductId}`)
     return links
   },
+
+  async purchaseOrders(tx) {
+    const statuses = [...INCOMING_PO_STATUSES].map(String)
+    const rows = await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.currency, po."discountAmount"::text AS discount, ${UTC('po."createdAt"')} AS created FROM purchase_orders po WHERE po.type::text = 'GOODS' AND po.status::text = ANY($1::text[]) ORDER BY po.id`, [statuses])
+    const orders = rows.map((row): PoRow => ({ id: text(row.id), reference: text(row.reference), status: oneOf(row.status, statuses), currency: text(row.currency, 'CURRENCY_UNKNOWN'), createdAt: text(row.created, 'SOURCE_UNREADABLE'), discount: decimal(row.discount), lines: [] }))
+    unique(orders, (order) => order.id)
+    unique(orders, (order) => order.reference)
+    const byId = new Map(orders.map((order) => [order.id, order]))
+    const lines = await readCapped(tx, `SELECT l.id, l."poId" AS po_id, p.sku, l.qty::text AS qty, l."qtyReceived"::text AS received, l."unitCostBase"::text AS cost FROM purchase_order_lines l JOIN purchase_orders po ON po.id = l."poId" JOIN products p ON p.id = l."productId" WHERE po.type::text = 'GOODS' AND po.status::text = ANY($1::text[]) ORDER BY l.id`, [statuses])
+    const seen = new Set<string>()
+    for (const row of lines) {
+      const order = byId.get(text(row.po_id))
+      if (!order) throw new Unreadable('SOURCE_UNREADABLE')
+      const line: PoLineRow = { id: text(row.id), sku: text(row.sku), qty: decimal(row.qty), qtyReceived: decimal(row.received), unitCostBase: decimal(row.cost) }
+      if (seen.has(line.id)) throw new Unreadable('DUPLICATE_KEY')
+      seen.add(line.id)
+      order.lines.push(line)
+    }
+    return orders
+  },
+
+  async firstLoadProvenance(tx) {
+    const runs = await tx.query(`SELECT run_id, status, steps->'purchase-orders'->>'emitted' AS emitted, steps->'purchase-orders'->>'failed' AS failed FROM first_load_apply_runs`)
+    if (runs.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    if (runs.length === 0) return null
+    const runId = text(runs[0]!.run_id, 'SOURCE_UNREADABLE')
+    const status = oneOf(runs[0]!.status, FIRST_LOAD_RUN_STATUSES)
+    const journalEmitted = runs[0]!.emitted === null || runs[0]!.emitted === undefined ? null : count(runs[0]!.emitted)
+    const journalFailed = runs[0]!.failed === null || runs[0]!.failed === undefined ? null : count(runs[0]!.failed)
+    const rows = await readCapped(tx, `SELECT "entityId" AS id FROM activity_logs WHERE "entityType"::text = 'PURCHASE_ORDER' AND action = 'created' AND metadata->'actor'->>'kind' = 'system' AND metadata->'actor'->>'runId' = $1 AND "entityId" IS NOT NULL ORDER BY "entityId"`, [runId])
+    const attributed = rows.map((row) => text(row.id))
+    unique(attributed, (id) => id)
+    const existing = attributed.length === 0 ? [{ n: '0' }] : await tx.query(`SELECT count(*)::text AS n FROM purchase_orders WHERE id = ANY($1::text[])`, [attributed])
+    return { runId, status, journalEmitted, journalFailed, attributed, attributedExisting: count(existing[0]!.n) }
+  },
+
+  async fxRates(tx) {
+    const rows = await readCapped(tx, `SELECT "toCurrency" AS currency, rate::text AS rate, "manualOverride" AS manual, ${UTC('"fetchedAt"')} AS fetched FROM fx_rates WHERE "fromCurrency" = $1 ORDER BY id`, [QOBLEX_BASE_CURRENCY])
+    return rows.map((row): FxRateRow => ({ currency: text(row.currency, 'CURRENCY_UNKNOWN'), rate: decimal(row.rate), fetchedAt: text(row.fetched, 'SOURCE_UNREADABLE'), manualOverride: bool(row.manual) }))
+  },
+
+  async transitSchedule(tx) {
+    const asOf = tx.asOf
+    if (asOf === undefined || !ASOF_RE.test(asOf) || Number.isNaN(Date.parse(`${asOf}T00:00:00Z`))) throw new Unreadable('STALE_BASIS')
+    const coverageRows = await tx.query('SELECT value FROM settings WHERE key = $1', [TRANSIT_COVERAGE_SETTING_KEY])
+    if (coverageRows.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    let coverageStart: string | null = null
+    if (coverageRows.length === 1) {
+      const raw = coverageRows[0]!.value
+      if (typeof raw !== 'string' || !ASOF_RE.test(raw.trim()) || Number.isNaN(Date.parse(`${raw.trim()}T00:00:00Z`))) throw new Unreadable('SOURCE_UNREADABLE')
+      coverageStart = raw.trim()
+    }
+    const known = TRANSIT_SOURCE_TYPES.map((entry) => entry.type)
+    // Each row's order by its recorded source (see ImsTransitSchedule). A row with no order that is not the refund leg stays null and is refused below.
+    const grouped = await readCapped(tx, `SELECT g.po_id, g.source_type, SUM(g.base_delta)::text AS net FROM (SELECT m.source_type, m.base_delta, CASE m.source_type WHEN 'SUPPLIER_RETURN' THEN (SELECT r."poId" FROM purchase_returns r WHERE r.id = m.source_ref) WHEN 'SUPPLIER_CREDIT_NOTE' THEN (SELECT c."poId" FROM supplier_credit_notes c WHERE c.id = m.source_ref) WHEN 'CUSTOMER_RETURN_IN_TRANSIT' THEN NULL ELSE m.source_ref END AS po_id FROM transit_subledger_movements m WHERE m.journal_date <= $1::date) g GROUP BY g.po_id, g.source_type ORDER BY g.po_id NULLS FIRST, g.source_type`, [asOf])
+    const net: TransitNetRow[] = []
+    let customerReturns = '0'
+    for (const row of grouped) {
+      const sourceType = oneOf(row.source_type, known)
+      const amount = decimal(row.net)
+      if (sourceType === 'CUSTOMER_RETURN_IN_TRANSIT') {
+        if (row.po_id !== null) throw new Unreadable('SOURCE_UNREADABLE')
+        customerReturns = amount
+        continue
+      }
+      if (row.po_id === null) throw new Unreadable('BAD_KEY')
+      net.push({ poId: text(row.po_id), sourceType, net: amount })
+    }
+    unique(net, (entry) => `${entry.poId}\u0001${entry.sourceType}`)
+    const statuses = [...INCOMING_PO_STATUSES].map(String)
+    const orderRows = (rows: Array<Record<string, unknown>>): TransitOrderRow[] => rows.map((row): TransitOrderRow => ({ id: text(row.id), reference: text(row.reference), status: oneOf(row.status, Object.values(PurchaseOrderStatus)), type: oneOf(row.type, ['GOODS', 'FREIGHT'] as const), createdAt: text(row.created, 'SOURCE_UNREADABLE') }))
+    const named = [...new Set(net.map((entry) => entry.poId))]
+    const orders = named.length === 0 ? [] : orderRows(await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.type::text AS type, ${UTC('po."createdAt"')} AS created FROM purchase_orders po WHERE po.id = ANY($1::text[]) ORDER BY po.id`, [named]))
+    unique(orders, (order) => order.id)
+    if (orders.length !== named.length) throw new Unreadable('BAD_KEY')
+    const openOrders = orderRows(await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.type::text AS type, ${UTC('po."createdAt"')} AS created FROM purchase_orders po WHERE po.status::text = ANY($1::text[]) ORDER BY po.id`, [statuses]))
+    unique(openOrders, (order) => order.id)
+    const pre = async (sql: string): Promise<number> => {
+      if (coverageStart === null) return 0
+      const found = await tx.query(sql, [coverageStart])
+      if (found.length !== 1) throw new Unreadable('SOURCE_UNREADABLE')
+      return count(found[0]!.n)
+    }
+    const preWatermark: TransitPreWatermark = {}
+    for (const document of TRANSIT_SOURCE_DOCUMENTS) preWatermark[document.kind] = await pre(document.sql)
+    return { asOf, coverageStart, preWatermark, net, customerReturns, orders, openOrders }
+  },
 }
+
+/** Every source type the transit sub-ledger records (lib/domain/accounting/transit-subledger-movement.ts), and nothing else is read. */
+export const TRANSIT_SOURCE_TYPES: ReadonlyArray<{ type: string }> = [
+  { type: 'PURCHASE_BILL' }, { type: 'PURCHASE_BILL_UPDATE' }, { type: 'SUPPLIER_CREDIT_NOTE' }, { type: 'STOCK_RECEIPT' }, { type: 'LANDED_COST_RECLASS' },
+  { type: 'LANDED_COST_CONSUMED_OFFSET' }, { type: 'PURCHASE_ORDER_CANCEL' }, { type: 'SUPPLIER_RETURN' }, { type: 'CUSTOMER_RETURN_IN_TRANSIT' },
+]
 
 /**
  * Read the requested sections in one REPEATABLE READ, READ ONLY transaction. A section that cannot be read exactly is

@@ -10,7 +10,7 @@
  *     not: STALE_BASIS (a dependent stream not fresh, or the scheduler not trusted), BASIS_MOVED (the stamp or the instance set
  *     moved), SOURCE_UNREADABLE (a read failed, or there is no liveness reader at all). This applies to EVERY item, one with no
  *     dependent stream included: liveness that could not be read is never taken as healthy.
- *   - THE LEDGER ITEMS (R6, R10) stand on the as-of basis. It is READ inside the bracket (after the start read, before any item)
+ *   - THE LEDGER ITEMS (R6, R10, R11) stand on the as-of basis. It is READ inside the bracket (after the start read, before any item)
  *     and SETTLED after the end read, and the item runs on the settled basis only. No basis port is an unreadable source.
  *   - A runner that throws, names another item, or returns something the report builder refuses is INTERNAL_ERROR for that item
  *     alone; the others still publish. The report builder is the judge of every item, here in isolation and again in the
@@ -34,6 +34,7 @@ import { wmsSkuListPort } from '@/lib/reconciliation-pack/wms-skus'
 import { createWmsReadSession, type WmsReadSession } from '@/lib/reconciliation-pack/wms-source'
 import { runCoverageItem, type SkuListPort } from '@/lib/reconciliation-pack/coverage-items'
 import { runQoblexItem, type QoblexItemId } from '@/lib/reconciliation-pack/qoblex-items'
+import { runPoItem, type PoItemId } from '@/lib/reconciliation-pack/purchase-order-items'
 import type { QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
 import type { SkuExclusionFile } from '@/lib/reconciliation-pack/sku-exclusions'
 import type { WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
@@ -109,6 +110,8 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromVat: ItemRunner = (context) =>
     runVatItem('R12', { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, xeroOptions: context.xeroOptions })
   const fromQoblex = (id: QoblexItemId): ItemRunner => (context) => runQoblexItem(id, { asOf: context.asOf, ims: context.ims, qoblex: context.qoblex })
+  // R7 and R8 apply at P2 only: the runner is handed the phase and reads nothing at any other (purchase-order-items.ts).
+  const fromPo = (id: PoItemId): ItemRunner => (context) => runPoItem(id, { phase: context.phase, ims: context.ims, qoblex: context.qoblex })
   // R14's warehouse-system leg: an injected list wins (a test double); otherwise the proven census R1 reads, shared through the run's session.
   const wmsLeg = (context: RunContext): SkuListPort | undefined => context.wmsSkus ?? (
     context.vendorReads === true && context.vendor?.wms !== undefined && context.ims !== undefined
@@ -119,13 +122,13 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
     asOf: context.asOf, now: context.now, vendorReads: context.vendorReads, woo: context.vendor?.woo, wooOptions: context.wooOptions,
     ims: context.ims, qoblex: context.qoblex, wms: wmsLeg(context), exclusions: context.skuExclusions,
   })
-  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat, R2: fromQoblex('R2'), R5: fromQoblex('R5'), R14: coverage }
+  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat, R2: fromQoblex('R2'), R5: fromQoblex('R5'), R7: fromPo('R7'), R8: fromPo('R8'), R14: coverage }
 }
 
-/** R6 and R10 read the settled as-of basis (ledger-items.ts). */
+/** R6, R10 and R11 read the settled as-of basis (ledger-items.ts). */
 export function builtInLedgerRunners(): Record<LedgerItemId, LedgerRunner> {
   const run = (id: LedgerItemId): LedgerRunner => (context, basis) => runLedgerItem(id, basis, { phase: context.phase, asOf: context.asOf, ims: context.ims })
-  return { R6: run('R6'), R10: run('R10') }
+  return { R6: run('R6'), R10: run('R10'), R11: run('R11') }
 }
 
 /** Run the invariant report once and share the answer; a throw is a null answer (every dependent item is then inconclusive). */

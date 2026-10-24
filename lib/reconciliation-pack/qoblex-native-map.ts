@@ -200,3 +200,74 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
   }
 }
 `
+
+/**
+ * THE ONE COLUMN MAP THE PACK ACCEPTS FOR A NATIVE QOBLEX INCOMING-STOCK (open purchase order) EXPORT, for R7 and R8. The same rule as the
+ * stock map above: a manifest may name a column map for its `purchaseOrders` part only if its bytes are EXACTLY this text (the digest is
+ * checked on the bytes read, qoblex-source.ts); the pack parses THIS constant. It is the first-load tool's tested map
+ * (tests/first-load/fixtures/qoblex-native/maps/qoblex-incoming-stock.map.json) WITH THE CURRENCY AND RATE TABLES REMOVED: a test derives
+ * this text from that file (remove `derived`, `valueMaps.currency` and `valueMaps.fxRateToBase`, give `currency` the constant XXX) and
+ * fails if the two ever differ in anything else, so the column renames and the status map cannot drift.
+ *
+ * EVERY TRANSFORM IN IT, and why none can change a compared value:
+ *   columns orderKey/supplierName/status/sku/qtyOrdered/qtyReceived/unitCostForeign/supplierRef/expectedDelivery  header renames only.
+ *   constants.destinationWarehouseCode MIL1   the report has no destination column; the pack never reads the warehouse of an order.
+ *   constants.currency XXX                     ISO 4217 "no currency": the report has NO currency or rate column and the pack no longer
+ *                                               carries a supplier-to-currency or currency-to-rate table. The currency of an order is the one
+ *                                               IMS RECORDED on the purchase order, and its rate is the central fx_rates row (purchase-order-items.ts);
+ *                                               the ingest only needs the column to exist, and the pack never reads this value.
+ *   valueMaps.status Approved/PartiallyReceived -> OPEN   the only two statuses the incoming report lists; any other status is not mapped and
+ *                                               the pack refuses a row whose status is not OPEN (BAD_VALUE), it never drops it.
+ *   dateFormats.expectedDelivery              a date format for a column the pack does not read.
+ * LIMITS: the foreign unit price is read as being in the currency IMS recorded on the matched purchase order; the report cannot confirm
+ * that (stated limit). The report carries no line number: a line is identified by its order and SKU.
+ */
+
+export const QOBLEX_NATIVE_PO_COLUMN_MAP = `{
+  "formatVersion": 1,
+  "source": "qoblex",
+  "datasets": {
+    "purchase-order-lines": {
+      "expectedHeaders": [
+        "Product variant",
+        "SKU",
+        "Created on",
+        "Received on",
+        "Due On",
+        "Purchase Order",
+        "Status",
+        "Ordered Quantity",
+        "Received Quantity",
+        "Price",
+        "Discount (%)",
+        "Supplier",
+        "Supplier Reference"
+      ],
+      "columns": {
+        "orderKey": "Purchase Order",
+        "supplierName": "Supplier",
+        "status": "Status",
+        "sku": "SKU",
+        "qtyOrdered": "Ordered Quantity",
+        "qtyReceived": "Received Quantity",
+        "unitCostForeign": "Price",
+        "supplierRef": "Supplier Reference",
+        "expectedDelivery": "Due On"
+      },
+      "constants": {
+        "destinationWarehouseCode": "MIL1",
+        "currency": "XXX"
+      },
+      "dateFormats": {
+        "expectedDelivery": "ddd, MMM D YYYY"
+      },
+      "valueMaps": {
+        "status": {
+          "Approved": "OPEN",
+          "PartiallyReceived": "OPEN"
+        }
+      }
+    }
+  }
+}
+`

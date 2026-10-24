@@ -1,5 +1,5 @@
 /**
- * ITEMS R6 AND R10: THE LEDGER ITEMS, FROM THE SETTLED AS-OF BASIS.
+ * ITEMS R6, R10 AND R11: THE LEDGER ITEMS, FROM THE SETTLED AS-OF BASIS.
  *
  * Both compare IMS with the Xero ledger for ONE cycle date D, from stored snapshots only: no vendor call, no write, no "latest
  * snapshot on or before now". They run last, after the liveness bracket is closed, on the basis that settleAsOfBasis returned (the
@@ -15,6 +15,13 @@
  *        test at P1: nothing IMS sends may reach them. R10 is decided at P1; at P2 IMS posts by design, so (b) cannot be the
  *        claim there and the item reports NO_RUNNER rather than a pass on half of it.
  *
+ *   R11  (P2 only; at P0 and P1 it is not-applicable and nothing is read) the stored Stock in Transit balance of Xero for D against the WHOLE transit
+ *        sub-ledger of IMS to D (transit-schedule.ts: open orders, non-open orders still holding transit, and the refund-in-transit leg), within GBP 1 inclusive, AND the transit account must not be the allocated (or
+ *        any other control) account: a shared code makes the balance not the transit account's own, so nothing is compared (the basis is
+ *        unavailable when transit shares with Allocated Inventory; any other sharing is SOURCE_UNREADABLE here). The sub-ledger must be
+ *        recorded as covering every open order (NO_POPULATION_RECORD otherwise). The non-open orders with a non-zero residue are LISTED by identity
+ *        with that residue under outOfPopulation (a finding detail, never judged; their value is in the total).
+ *
  * A leg that rests on an account the trial balance omitted is WITHHELD (GL_LEG_ABSENT), never compared as a zero. The postings
  * leg needs a recorded, VERIFIED first load (NO_POPULATION_RECORD otherwise); a row older than that load's start is listed as out
  * of the population and is never a finding. No bounded scan: the postings are read in full or CAP_EXCEEDED. The module is total:
@@ -24,13 +31,15 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { AsOfBasis } from '@/lib/reconciliation-pack/basis'
 import { compareItem, outcomeOfComparison, parseDecimalStrict, type CompareResult, type SideRow } from '@/lib/reconciliation-pack/compare'
-import { getPackItem, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
+import { getPackItem, itemApplicability, type PackItemId, type PackReasonCode } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-readers'
+import { evaluateAccountGlReconciliation } from '@/lib/domain/accounting/account-gl-reconciliation'
+import { buildTransitSchedule, TRANSIT_BALANCE_KEY, TRANSIT_BALANCE_TOKEN } from '@/lib/reconciliation-pack/transit-schedule'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
 import type { ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
 
-export const LEDGER_ITEM_IDS = ['R6', 'R10'] as const
+export const LEDGER_ITEM_IDS = ['R6', 'R10', 'R11'] as const
 export type LedgerItemId = (typeof LEDGER_ITEM_IDS)[number]
 export function isLedgerItem(id: PackItemId): id is LedgerItemId {
   return (LEDGER_ITEM_IDS as readonly string[]).includes(id)
@@ -191,10 +200,46 @@ async function runR10(basis: AsOfBasis, context: LedgerItemContext): Promise<Ite
   return fromComparison('R10', result)
 }
 
+/** R11: the Stock in Transit balance of D against the open-order transit schedule. See the header. */
+async function runR11(basis: AsOfBasis, context: LedgerItemContext): Promise<ItemInput> {
+  // PHASES: the catalogue is the authority; a phase the item does not apply in reads nothing at all.
+  if (itemApplicability('R11', context.phase) !== 'applicable') return { id: 'R11', outcome: 'not-applicable', reasons: ['PHASE_NOT_APPLICABLE'] }
+  const checked = availableBasis(basis, context.asOf)
+  if (!checked.ok) return inconclusive('R11', ...checked.reasons)
+  const b = checked.basis
+  // The transit balance must be the transit account's own: a code another control account also uses is a balance that is not the transit ledger's.
+  if (!Array.isArray(b.sharedCodeKinds) || b.sharedCodeKinds.includes('transit')) return inconclusive('R11', 'SOURCE_UNREADABLE')
+  if (!Array.isArray(b.gl)) return inconclusive('R11', 'SOURCE_UNREADABLE')
+  const transit = b.gl.filter((balance) => balance !== null && typeof balance === 'object' && balance.kind === 'transit')
+  if (transit.length !== 1) return inconclusive('R11', 'SOURCE_UNREADABLE')
+  const balance = transit[0]!
+  // An account the trial balance omitted is not a reported zero.
+  if (balance.provenance !== 'trial-balance-row') return inconclusive('R11', 'GL_LEG_ABSENT')
+  const gl = dec(balance.amountBase)
+  if (gl === null) return inconclusive('R11', 'BAD_VALUE')
+  if (context.ims === undefined) return inconclusive('R11', 'SOURCE_UNREADABLE')
+  const read = await context.ims({ sections: ['transitSchedule'], asOf: context.asOf })
+  if (!read.ok) return inconclusive('R11', read.reason)
+  const section = read.sections.transitSchedule
+  if (section === undefined) return inconclusive('R11', 'SOURCE_UNREADABLE')
+  if (!section.ok) return inconclusive('R11', section.reason)
+  const schedule = buildTransitSchedule(section.value, context.asOf)
+  if (!schedule.ok) return inconclusive('R11', schedule.reason)
+  const scheduled = dec(schedule.value)
+  if (scheduled === null) return inconclusive('R11', 'BAD_VALUE')
+  const ims: SideRow[] = [{ key: TRANSIT_BALANCE_KEY, value: scheduled.toFixed(6), currency: LEDGER_CURRENCY }, ...schedule.residue.map((entry): SideRow => ({ key: entry.key, value: entry.value, currency: LEDGER_CURRENCY }))]
+  const vendor: SideRow[] = [{ key: TRANSIT_BALANCE_KEY, value: gl.toFixed(6), currency: LEDGER_CURRENCY }]
+  const evaluator = evaluateAccountGlReconciliation({ subledgerValue: scheduled.toNumber(), glBalance: gl.toNumber() })
+  const result = compareItem('R11', { ims, vendor, imsComplete: true, vendorComplete: true, population: new Set([canonicalKey(TRANSIT_BALANCE_KEY)]) })
+  const leg: OkLeg = { ok: true, key: TRANSIT_BALANCE_KEY, token: TRANSIT_BALANCE_TOKEN, ims: scheduled.toFixed(6), vendor: gl.toFixed(6), action: evaluator.action }
+  if (!legsAgree(result, [leg])) return inconclusive('R11', 'SOURCE_UNREADABLE')
+  return fromComparison('R11', result)
+}
+
 /** Run one ledger item on the settled basis. Never throws. */
 export async function runLedgerItem(id: LedgerItemId, basis: AsOfBasis, context: LedgerItemContext): Promise<ItemInput> {
   try {
-    return id === 'R6' ? runR6(basis, context) : await runR10(basis, context)
+    return id === 'R6' ? runR6(basis, context) : id === 'R10' ? await runR10(basis, context) : await runR11(basis, context)
   } catch {
     return inconclusive(id, 'INTERNAL_ERROR')
   }

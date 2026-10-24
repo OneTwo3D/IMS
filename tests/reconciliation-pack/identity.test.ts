@@ -58,3 +58,16 @@ test('a plain string is not assignable to SafeToken (compile-time guard)', () =>
   const forged: SafeToken = 'victim@example.com'
   assert.equal(typeof forged, 'string')
 })
+
+// [mutation: the order-ref screen removed, or the kind folded into another]
+test('an order-ref (a purchase-order number or reference) is kept when it is a plain token, else a digest of its own kind; it never prints a credential-shaped or hostile value', () => {
+  assert.equal(identityToken('order-ref', 'PO900'), 'PO900')
+  assert.equal(identityToken('order-ref', 'PO-2026-0001.A_b/9'), 'PO-2026-0001.A_b/9')
+  for (const raw of ['victim@example.com', 'https://evil.example/x', BEARER_SHAPED, STRIPE_SHAPED, 'password=hunter2', 'has space', 'IMS:ref', '', 'x'.repeat(65), 'PO-TOKEN-1']) {
+    assert.equal(identityToken('order-ref', raw), `order-ref#${digest8(raw)}`, raw)
+    assert.ok(isSafeTokenShape(identityToken('order-ref', raw)))
+  }
+  // the kind is part of the key: the same text as an order reference and as a SKU are two identities
+  assert.notEqual(canonicalKey([{ kind: 'order-ref', raw: 'A' }]), canonicalKey([{ kind: 'sku', raw: 'A' }]))
+  assert.equal(identityToken('order-ref', 7), '7')
+})
