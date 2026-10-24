@@ -73,7 +73,7 @@ function reportProblem(record: ReportRecord, context: PackAssessContext, cadence
 }
 
 /** Sources read as a stored snapshot for the run's cycle date (the as-of basis): a fresh report about an old date proves nothing current. */
-const CYCLE_DATED_SOURCES: ReadonlySet<string> = new Set(['xero-trial-balance', 'ims-ledger'])
+const CYCLE_DATED_SOURCES: ReadonlySet<string> = new Set(['xero-trial-balance', 'ims-ledger', 'qoblex-file'])
 const DAY_MS = 86_400_000
 
 /**
@@ -124,6 +124,8 @@ export function assessPackItem(read: PackReportRead, id: PackItemId, context: Pa
       // The run was not started with --vendor-reads-only: no vendor was contacted and nothing was claimed. The slot is exactly what it
       // was before the pack could read vendors (not available), so merging the vendor items changes no live verdict until a run opts in.
       if (item.reasons.length === 1 && item.reasons[0] === 'VENDOR_READS_OFF') return { kind: 'not-available', reason: `${id} was not read in reconciliation pack run ${record.runId}: the run was not started with --vendor-reads-only, so no vendor was contacted` }
+      // No Qoblex export was named: nothing was read and nothing was claimed, so the slot is what it was before the pack could read one.
+      if (item.reasons.length === 1 && item.reasons[0] === 'QOBLEX_EXPORT_OFF') return { kind: 'not-available', reason: `${id} was not read in reconciliation pack run ${record.runId}: the run was not started with --qoblex-export, so no Qoblex export was read` }
       return unreadable(`the reconciliation pack could not prove ${id} in run ${record.runId}${codes}`)
     case 'not-applicable':
       // The catalogue has already said (above) where an item does not apply; a report that calls an item not applicable where the catalogue applies it is not believed.

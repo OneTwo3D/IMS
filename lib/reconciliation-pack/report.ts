@@ -401,6 +401,7 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
   if (has('SETTLING_STATE_UNUSABLE') && (input.outcome === 'pass' || counts.unsettled === 0 || !spec.settles)) fail('SETTLING_STATE_UNUSABLE belongs to an item that settles and has something unsettled')
   if (has('NO_RUNNER') && (input.outcome !== 'inconclusive' || everything !== 0)) fail('NO_RUNNER is an inconclusive item with nothing listed')
   if (has('VENDOR_READS_OFF') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1 || input.sources.length !== 0 || !itemNeedsVendor(input.id))) fail('VENDOR_READS_OFF is an inconclusive item that needs a vendor, with nothing listed, nothing read and no other reason')
+  if (has('QOBLEX_EXPORT_OFF') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1 || input.sources.length !== 0 || !spec.sources.includes('qoblex-file'))) fail('QOBLEX_EXPORT_OFF is an inconclusive item that stands on the Qoblex export, with nothing listed, nothing read and no other reason')
   if (has('NOT_SELECTED') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1)) fail('NOT_SELECTED is an inconclusive item with nothing listed and no other reason')
   if (findings > 0 && (input.outcome !== 'fail' || !has('DIFFERENCES'))) fail('a finding makes the item a fail with DIFFERENCES')
   if (input.proof !== null && input.outcome !== 'pass') fail('only a pass carries a proof')

@@ -16,13 +16,15 @@ export type PackArgs = {
   asOf: string | null
   items: PackItemId[] | null
   acceptances: string | null
+  qoblexExport: string | null
+  skuExclusions: string | null
   reportDir: string
   basisOnly: boolean
   vendorReadsOnly: boolean
   help: boolean
 }
 
-const VALUE_FLAGS = ['--phase', '--as-of', '--items', '--acceptances', '--report-dir'] as const
+const VALUE_FLAGS = ['--phase', '--as-of', '--items', '--acceptances', '--report-dir', '--qoblex-export', '--sku-exclusions'] as const
 const BOOLEAN_FLAGS = ['--basis-only', '--vendor-reads-only', '--help'] as const
 /** Every flag the command accepts, taken from the documented table so the two cannot drift. */
 export const KNOWN_PACK_FLAGS: readonly string[] = PACK_CLI_FLAGS.map((f) => f.flag)
@@ -64,7 +66,7 @@ export function parsePackArgs(argv: readonly string[], now: Date): PackArgs | { 
       return CREDENTIAL_SHAPE.test(arg) ? bad('CREDENTIAL_ARGUMENT') : bad()
     }
   }
-  const out: PackArgs = { phase: 'P0', asOf: null, items: null, acceptances: null, reportDir: DEFAULT_PACK_REPORT_DIR, basisOnly: flags.has('--basis-only'), vendorReadsOnly: flags.has('--vendor-reads-only'), help: flags.has('--help') }
+  const out: PackArgs = { phase: 'P0', asOf: null, items: null, acceptances: null, qoblexExport: null, skuExclusions: null, reportDir: DEFAULT_PACK_REPORT_DIR, basisOnly: flags.has('--basis-only'), vendorReadsOnly: flags.has('--vendor-reads-only'), help: flags.has('--help') }
   if (out.help) return out
   const phase = values.get('--phase')
   if (phase === undefined || !(READINESS_PHASES as readonly string[]).includes(phase)) return bad()
@@ -83,6 +85,10 @@ export function parsePackArgs(argv: readonly string[], now: Date): PackArgs | { 
   // The basis check reads no vendor: asking for both is a contradiction, not something to quietly drop.
   if (out.basisOnly && out.vendorReadsOnly) return bad()
   out.acceptances = values.get('--acceptances') ?? null
+  out.qoblexExport = values.get('--qoblex-export') ?? null
+  out.skuExclusions = values.get('--sku-exclusions') ?? null
+  // The basis check runs no item, so an input only an item reads is a contradiction, not something to quietly drop.
+  if (out.basisOnly && (out.qoblexExport !== null || out.skuExclusions !== null)) return bad()
   out.reportDir = values.get('--report-dir') ?? DEFAULT_PACK_REPORT_DIR
   return out
 }

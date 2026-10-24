@@ -19,6 +19,9 @@ import pg from 'pg'
 
 import { pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
 import { loadAcceptances } from '../lib/reconciliation-pack/acceptances.ts'
+import type { SkuListPort } from '../lib/reconciliation-pack/coverage-items.ts'
+import { createQoblexSource } from '../lib/reconciliation-pack/qoblex-source.ts'
+import { loadSkuExclusions } from '../lib/reconciliation-pack/sku-exclusions.ts'
 import { accountAllowed, buildPackEnv, parsePackArgs, type PackArgs } from '../lib/reconciliation-pack/cli.ts'
 import {
   PACK_BASIS_REASON_LIST, PACK_CHAIN_CODES, PACK_CLI_CODES, PACK_CLI_FLAGS, PACK_COMMAND, PACK_EXIT_CODES, PACK_TRANSIT_LEG_REASONS, packExitCode, renderPackCliCodeTable, renderPackExitCodeTable,
@@ -36,7 +39,7 @@ import { createXeroGetPort } from '../lib/reconciliation-pack/xero-transport.ts'
 import { readXeroAccess, readXeroBinding } from '../lib/reconciliation-pack/xero-credentials.ts'
 import type { XeroVatVendor } from '../lib/reconciliation-pack/vat-item.ts'
 import type { VendorPorts } from '../lib/reconciliation-pack/vendor-items.ts'
-import type { WmsReadPort } from '../lib/reconciliation-pack/wms-source.ts'
+import { createWmsReadSession, type WmsReadPort } from '../lib/reconciliation-pack/wms-source.ts'
 import type { WooGetPort } from '../lib/reconciliation-pack/woo-source.ts'
 import { memoisedInvariant, readLivenessSafe, runItems, type BasisPort, type ItemRunner, type LedgerRunner, type LivenessPort } from '../lib/reconciliation-pack/run.ts'
 import { readPackChain } from '../lib/reconciliation-pack/trend.ts'
@@ -62,6 +65,8 @@ export type PackCliDeps = {
   ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
   /** The WooCommerce port. Consulted ONLY with --vendor-reads-only; the default is the GET-only transport (woo-transport.ts). */
   woo?: WooGetPort
+  /** A SKU list for R14's warehouse-system leg (a test seam). Absent = the proven census R1 reads, through the run's shared session. */
+  wmsSkus?: SkuListPort
   /** The Xero port and binding reader (R12). Consulted ONLY with --vendor-reads-only; the default is the GET-only transport over the stored connection (xero-transport.ts), which never refreshes a token. */
   xero?: XeroVatVendor
   /** The warehouse-system port (R1). Consulted ONLY with --vendor-reads-only; the default is the GET-only, fixed-key reader (lib/connectors/mintsoft/reconciliation-read.ts). */
@@ -87,7 +92,7 @@ export type PackCliOptions = {
 }
 
 const usage = (): string => [
-  `Usage: ${PACK_COMMAND} -- --phase <P0|P1|P2> [--as-of <YYYY-MM-DD>] [--items <R3,R4,...>] [--acceptances <file>] [--report-dir <dir>] [--basis-only] [--vendor-reads-only]`,
+  `Usage: ${PACK_COMMAND} -- --phase <P0|P1|P2> [--as-of <YYYY-MM-DD>] [--items <R3,R4,...>] [--acceptances <file>] [--report-dir <dir>] [--basis-only] [--vendor-reads-only] [--qoblex-export <dir>] [--sku-exclusions <file>]`,
   '',
   ...PACK_CLI_FLAGS.map((f) => `  ${f.flag}${f.value === '-' ? '' : ` <${f.value}>`}: ${f.meaning}`),
   '',
@@ -202,6 +207,11 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
     const accepted = loadAcceptances(args.acceptances, repoRoot)
     if ('refused' in accepted) return refuse('ACCEPTANCE_FILE_UNREADABLE')
 
+    const exclusions = loadSkuExclusions(args.skuExclusions, repoRoot)
+    if ('refused' in exclusions) return refuse('EXCLUSION_FILE_UNREADABLE')
+    // The export is named by the operator; nothing is read from it until an item asks (qoblex-source.ts), and then once.
+    const qoblex = args.qoblexExport === null ? undefined : createQoblexSource({ dir: path.resolve(args.qoblexExport), asOf: args.asOf!, now: deps.now })
+
     const startedAt = deps.now()
     let systemIdentifier: string | null = null
     try {
@@ -230,6 +240,8 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
         wms: deps.wms ?? createMintsoftReadPort({ readCredentials: () => readStoredMintsoftCredentials(deps) }),
       }
       : undefined
+    // ONE read of the warehouse system per run, shared by R1 and R14 (wms-source.ts createWmsReadSession): R14 adds no request to R1's.
+    const wmsSession = vendor?.wms === undefined ? undefined : createWmsReadSession(vendor.wms)
 
     const { items, streams } = await runItems({
       phase: args.phase,
@@ -241,7 +253,7 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       ledgerRunners: deps.ledgerRunners,
       // What the previous report carries for each item that settles, from the chain read above (trusted, or the run stopped).
       carried: Object.fromEntries(PACK_ITEM_IDS.filter((id) => getPackItem(id).settles).map((id) => [id, carriedStateFromChain(chain, id, { phase: args.phase, systemIdentifier: systemIdentifier! })])) as Partial<Record<PackItemId, CarriedState>>,
-      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor },
+      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor, wmsSession, qoblex, skuExclusions: exclusions.file, wmsSkus: args.vendorReadsOnly ? deps.wmsSkus : undefined },
     })
     const finishedAt = deps.now()
     const published = publishPackReport(reportDir, {

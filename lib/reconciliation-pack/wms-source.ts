@@ -224,6 +224,64 @@ function requireContainment(sweep: Map<string, WmsStockRow[]>, census: readonly 
   }
 }
 
+function readerFor(port: WmsReadPort, options: WmsSourceOptions): Reader {
+  return {
+    port,
+    left: options.budget ?? WMS_REQUEST_BUDGET,
+    requests: 0,
+    limit: clampedWmsLimit(options.limit),
+    maxPages: Math.min(options.maxPages ?? WMS_PRODUCT_LIST_MAX_PAGES, WMS_PRODUCT_LIST_MAX_PAGES),
+    sleep: options.sleep ?? ((ms) => new Promise<void>((resolve) => { setTimeout(resolve, ms) })),
+  }
+}
+
+/**
+ * The product census ALONE, for a caller with no stock list to check it against (steps 1 to 4 above: full pages, the short last page and the
+ * empty page after it, no repeated id or SKU, two scans equal as sets). Containment (step 5) needs a stock list and is NOT made here, so the
+ * residual named above is wider: a product the paging skips every time is not caught. Used only by a run that did not read the stock lists.
+ */
+export async function readWmsCensus(port: WmsReadPort, options: WmsSourceOptions = {}): Promise<{ ok: true; value: WmsProductRow[] } | { ok: false; reason: PackReasonCode }> {
+  try {
+    const r = readerFor(port, options)
+    const first = await scanProducts(r)
+    const second = await scanProducts(r)
+    requireSameScans(first, second)
+    return { ok: true, value: first }
+  } catch (error) {
+    return { ok: false, reason: error instanceof Stop ? error.reason : 'SOURCE_UNREADABLE' }
+  }
+}
+
+export type WmsReadResult = Awaited<ReturnType<typeof readWms>>
+/**
+ * ONE READ OF THE VENDOR PER RUN, shared by the items that need it (R1 and R14). The first caller makes the read; every later caller gets
+ * the SAME result (a success or the same closed reason): no second request is ever made, so R14 adds none to what R1 makes. R14 asks for the
+ * census of the very warehouses R1 read; a different warehouse list is BASIS_MOVED (the bindings changed under the run), never a second read.
+ * With no stock read to share (R1 not run, or nothing to compare), the census alone is read once.
+ */
+export interface WmsReadSession {
+  read(warehouses: readonly string[]): Promise<WmsReadResult>
+  census(): Promise<{ ok: true; value: WmsProductRow[] } | { ok: false; reason: PackReasonCode }>
+}
+
+export function createWmsReadSession(port: WmsReadPort, options: WmsSourceOptions = {}): WmsReadSession {
+  let full: { key: string; result: Promise<WmsReadResult> } | null = null
+  let only: ReturnType<WmsReadSession['census']> | null = null
+  return {
+    read(warehouses) {
+      const key = JSON.stringify(warehouses)
+      if (full !== null) return key === full.key ? full.result : Promise.resolve({ ok: false, reason: 'BASIS_MOVED' })
+      full = { key, result: readWms(port, warehouses, options) }
+      return full.result
+    },
+    census() {
+      if (full !== null) return full.result.then((result) => (result.ok ? { ok: true as const, value: result.value.census } : result))
+      only ??= readWmsCensus(port, options)
+      return only
+    },
+  }
+}
+
 /**
  * The stock lists of `warehouses` (the vendor's own ids) and the product census, proven as described above. Total: never throws; a
  * failure is a closed reason and no list.
@@ -232,14 +290,7 @@ export async function readWms(port: WmsReadPort, warehouses: readonly string[], 
   try {
     if (!Array.isArray(warehouses) || warehouses.length === 0 || warehouses.length > WMS_MAX_WAREHOUSES) return { ok: false, reason: 'CAP_EXCEEDED' }
     if (new Set(warehouses).size !== warehouses.length || !warehouses.every((id) => typeof id === 'string' && WAREHOUSE_ID_RE.test(id))) return { ok: false, reason: 'BAD_KEY' }
-    const r: Reader = {
-      port,
-      left: options.budget ?? WMS_REQUEST_BUDGET,
-      requests: 0,
-      limit: clampedWmsLimit(options.limit),
-      maxPages: Math.min(options.maxPages ?? WMS_PRODUCT_LIST_MAX_PAGES, WMS_PRODUCT_LIST_MAX_PAGES),
-      sleep: options.sleep ?? ((ms) => new Promise<void>((resolve) => { setTimeout(resolve, ms) })),
-    }
+    const r = readerFor(port, options)
     const a = await sweepStock(r, warehouses)
     const b = await sweepStock(r, warehouses)
     requireSameSweeps(a, b)

@@ -18,6 +18,7 @@
  *  3. The verdict is a pure function of (phase, results, acceptances, now).
  */
 
+import { DuplicateMemberError, parseJsonNoDuplicates } from '@/lib/ops/strict-json'
 import {
   ACCEPTANCE_CLOCK_SKEW_MS,
   ACCEPTANCE_MAX_DAYS,
@@ -109,8 +110,10 @@ export function parseAcceptanceFile(text: string | null): AcceptanceFile {
   if (text === null) return { status: 'absent', problems: [], entries: [] }
   let parsed: unknown
   try {
-    parsed = JSON.parse(text)
-  } catch {
+    // A repeated member (two `expiresAt`, say) is malformed, not "the last one wins" (lib/ops/strict-json.ts).
+    parsed = parseJsonNoDuplicates(text)
+  } catch (error) {
+    if (error instanceof DuplicateMemberError) return { status: 'rejected', problems: ['the acceptance file names a member twice, so which value was meant is not known'], entries: [] }
     return { status: 'rejected', problems: ['the acceptance file is not valid JSON'], entries: [] }
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {

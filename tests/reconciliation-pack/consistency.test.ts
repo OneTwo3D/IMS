@@ -236,6 +236,18 @@ test('the evidence reader refuses a value that is not in the one canonical text 
   for (const ims of ['1.50', '-0', '0.0', '01', '+1', '1e0']) assert.throws(() => verifyEvidence(line(ims), withText(line(ims))), ReportInvalid, ims)
 })
 
+// [mutation: the QOBLEX_EXPORT_OFF rule removed from checkItemConsistency]
+test('QOBLEX_EXPORT_OFF is accepted only as the single reason of an inconclusive Qoblex item that read nothing and lists nothing', () => {
+  const off = (id: PackItemId, over: Partial<ItemInput> = {}): ItemInput => ({ id, outcome: 'inconclusive', reasons: ['QOBLEX_EXPORT_OFF'], ...over })
+  for (const id of ['R2', 'R5', 'R14'] as const) accepts(put(base(), off(id)))
+  rejects(put(base(), off('R3')))
+  rejects(put(base(), off('R2', { reasons: ['QOBLEX_EXPORT_OFF', 'STALE_BASIS'] })))
+  rejects(put(base(), off('R2', { sources: ['qoblex-file'] })))
+  rejects(put(base(), off('R2', { entries: { excluded: [solo('A|MAIN')] } })))
+  rejects(put(base(), { id: 'R2', outcome: 'fail', reasons: ['QOBLEX_EXPORT_OFF', 'DIFFERENCES'] }))
+  rejects(put(base(), { id: 'R2', outcome: 'pass', reasons: ['QOBLEX_EXPORT_OFF'], proof: { kind: 'compared' }, sources: ['ims-database', 'qoblex-file'] }))
+})
+
 // [mutation: the VENDOR_READS_OFF rule removed from checkItemConsistency]
 test('VENDOR_READS_OFF is accepted only as the single reason of an inconclusive vendor item that read nothing and lists nothing', () => {
   const off = (id: PackItemId, over: Partial<ItemInput> = {}): ItemInput => ({ id, outcome: 'inconclusive', reasons: ['VENDOR_READS_OFF'], ...over })

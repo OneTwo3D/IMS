@@ -49,7 +49,7 @@ import { PACK_WMS_CONNECTOR_ID, getPackItem, isVendorSource, type PackReasonCode
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import { alignmentState, type ImsRead, type ImsReadOptions, type ProductRow, type StockPair, type WmsBindingRow, type WmsProductLinkRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
-import { readWms, type WmsReadPort, type WmsSourceOptions, type WmsStockRow } from '@/lib/reconciliation-pack/wms-source'
+import { readWms, type WmsReadSession, type WmsReadPort, type WmsSourceOptions, type WmsStockRow } from '@/lib/reconciliation-pack/wms-source'
 
 export type WmsItemContext = {
   /** The opt-in. Anything but the boolean true is off. */
@@ -57,6 +57,8 @@ export type WmsItemContext = {
   wms?: WmsReadPort
   ims?: (options: ImsReadOptions) => Promise<ImsRead>
   wmsOptions?: WmsSourceOptions
+  /** The run's shared read (wms-source.ts createWmsReadSession): R1 and R14 make ONE read between them. Absent = R1 reads on its own. */
+  wmsSession?: WmsReadSession
   settling?: SettlingInput
 }
 
@@ -253,7 +255,8 @@ async function runR1(context: WmsItemContext): Promise<ItemInput> {
     return fromComparison(compareItem('R1', { ims: sides.ims, vendor: sides.vendor, imsComplete: true, vendorComplete: true, population: sides.population, emptyProof: 'alignment-confirmed', settling }), [IMS])
   }
 
-  const walked = await readWms(wms, classified.inPopulation.map((binding) => binding.externalWarehouseId), context.wmsOptions)
+  const inPopulationIds = classified.inPopulation.map((binding) => binding.externalWarehouseId)
+  const walked = context.wmsSession !== undefined ? await context.wmsSession.read(inPopulationIds) : await readWms(wms, inPopulationIds, context.wmsOptions)
   if (!walked.ok) return inconclusive([IMS, WMS], walked.reason)
 
   // The population was decided in the first snapshot; it must still be the population.
