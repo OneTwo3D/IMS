@@ -730,7 +730,7 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
   const sha = (text: string) => createHash('sha256').update(text).digest('hex')
   const writeExport = (qtyA: string) => {
     const stock = stockCsv([{ sku: skus[0]!, location: codes[0]!, qty: qtyA, unitCost: '2.5' }, { sku: skus[1]!, location: codes[1]!, qty: '4', unitCost: '10' }])
-    const products = productsCsv(skus.map((sku) => ({ sku })))
+    const products = productsCsv(catalogue.map((sku) => ({ sku })))
     writeFileSync(`${exportDir}/stock.csv`, stock, { mode: 0o644 })
     writeFileSync(`${exportDir}/products.csv`, products, { mode: 0o644 })
     writeFileSync(`${exportDir}/manifest.json`, JSON.stringify({
@@ -741,13 +741,27 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
   }
   const targets: string[] = []
   const original = net.Socket.prototype.connect
+  // THE TIER SHARES ONE DATABASE: warehouses, products and snapshot rows left by other files are visible to a run, and the population is IMS's.
+  // Foreign rows are held aside by RECORDED ids with reversible updates (no delete) and restored exactly in finally; the ids are recorded after
+  // EACH update so a partial setup is restored too. Foreign PRODUCTS cannot be held aside (R14 reads every product), so the export, the storefront
+  // and the warehouse-system list carry them too.
+  const held = { warehouses: [] as string[], runs: [] as string[], snapshots: [] as string[] }
+  let catalogue: string[] = [...skus]
   try {
+    held.warehouses = (await sql(`UPDATE warehouses SET active = false WHERE active = true RETURNING id`)).rows.map((r: { id: string }) => r.id)
+    held.runs = (await sql(`UPDATE inventory_snapshot_runs SET "snapshotDate" = '2020-01-01' WHERE "snapshotDate" = $1 RETURNING id`, [QD])).rows.map((r: { id: string }) => r.id)
+    held.snapshots = (await sql(`UPDATE inventory_snapshots SET "snapshotDate" = '2020-01-01' WHERE "snapshotDate" = $1 RETURNING id`, [QD])).rows.map((r: { id: string }) => r.id)
+    const visible = await sql(`SELECT (SELECT count(*) FROM warehouses WHERE active)::int AS w, (SELECT count(*) FROM inventory_snapshots WHERE "snapshotDate" = $1)::int AS s, (SELECT count(*) FROM inventory_snapshot_runs WHERE "snapshotDate" = $1)::int AS r`, [QD])
+    assert.deepEqual([visible.rows[0].w, visible.rows[0].s, visible.rows[0].r], [0, 0, 0], 'precondition: no foreign warehouse or snapshot row is visible to the run')
     await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-p1`, skus[0], `${QTAG}-p2`, skus[1]])
     await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${QTAG}-w1`, codes[0], `${QTAG}-w2`, codes[1]])
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 2, 2, now())`, [`${QTAG}-run`, QD])
     await sql(`INSERT INTO inventory_snapshots (id, "snapshotDate", "productId", "warehouseId", qty, "valueBase", "unitCostBase") VALUES ($1, $2, $3, $4, 10, 25, 2.5), ($5, $2, $6, $7, 4, 40, 10)`, [`${QTAG}-s1`, QD, `${QTAG}-p1`, `${QTAG}-w1`, `${QTAG}-s2`, `${QTAG}-p2`, `${QTAG}-w2`])
     const everySku = (await sql(`SELECT sku FROM products ORDER BY sku`)).rows.map((r: { sku: string }) => r.sku)
-    const alone = everySku.length === skus.length
+    catalogue = everySku
+    // Foreign SKUs that the export cannot carry as written (outer space, non-NFC, control characters) make the export refuse itself: then R14 is only
+    // required not to fail internally.
+    const canonical = everySku.every((sku: string) => sku !== '' && sku === sku.trim() && sku === sku.normalize('NFC') && !/[\u0000-\u001f\u007f\u00a0\u200b-\u200d\u2060\ufeff]/.test(sku) && !sku.startsWith('#'))
     const run = async (extra: string[]) => {
       const out: string[] = []
       const before = await census()
@@ -779,7 +793,7 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
     assert.equal(on.code, 5, on.out.join('\n'))
     assert.ok(on.out.includes('R2 pass -') && on.out.includes('R5 pass -'), on.out.join('\n'))
     assert.ok(!on.out.some((line) => /^R14 .*INTERNAL_ERROR/.test(line)), on.out.join('\n'))
-    if (alone) assert.ok(on.out.includes('R14 pass -'), on.out.join('\n'))
+    if (canonical) assert.ok(on.out.includes('R14 pass -'), on.out.join('\n'))
     const url = new URL(process.env.DATABASE_URL!)
     assert.ok(on.targets.length > 0)
     for (const target of on.targets) assert.ok(target === `${url.hostname}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}`, `unexpected connection to ${target}`)
@@ -799,7 +813,14 @@ test('[reconciliation pack] R2, R5 and R14 with --qoblex-export: the export comp
     await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${QTAG}%'`)
     await sql(`DELETE FROM products WHERE id LIKE '${QTAG}%'`)
     await sql(`DELETE FROM warehouses WHERE id LIKE '${QTAG}%'`)
+    // Put every held row back exactly as it was, and say so if one cannot be.
+    const restored = {
+      warehouses: (await sql(`UPDATE warehouses SET active = true WHERE id = ANY($1) AND active = false`, [held.warehouses])).rowCount,
+      runs: (await sql(`UPDATE inventory_snapshot_runs SET "snapshotDate" = $2 WHERE id = ANY($1) AND "snapshotDate" = '2020-01-01'`, [held.runs, QD])).rowCount,
+      snapshots: (await sql(`UPDATE inventory_snapshots SET "snapshotDate" = $2 WHERE id = ANY($1) AND "snapshotDate" = '2020-01-01'`, [held.snapshots, QD])).rowCount,
+    }
     rmSync(dir, { recursive: true, force: true })
     rmSync(exportDir, { recursive: true, force: true })
+    assert.deepEqual(restored, { warehouses: held.warehouses.length, runs: held.runs.length, snapshots: held.snapshots.length }, 'every held foreign row was restored')
   }
 })
