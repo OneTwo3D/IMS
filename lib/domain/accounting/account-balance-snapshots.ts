@@ -2,6 +2,11 @@ import type { PrismaClient } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { balanceDateString, normalizeBalanceDate } from '@/lib/domain/accounting/balance-date'
+import {
+  isLifetimeBalanceAccountType,
+  parseFinancialYearEnd,
+  windowCrossesFinancialYearStart,
+} from '@/lib/domain/accounting/financial-year'
 
 // The date helpers live in their own module (no database) so the reconciliation pack can use them without loading lib/db.
 export { balanceDateString, normalizeBalanceDate }
@@ -21,6 +26,8 @@ export type AccountingAccountBalanceSnapshotInput = {
   sourcePayloadRef?: string | null
   /** The organisation the balance was fetched from; null/absent = unknown. */
   tenantId?: string | null
+  /** The organisation's financial-year end ("MM-DD") in force at the pull; null/absent = not proven. */
+  financialYearEnd?: string | null
   syncRunId?: string | null
   fetchedAt?: Date
 }
@@ -37,6 +44,7 @@ export type AccountingAccountBalanceSnapshotRow = {
   amountBase: Decimal
   sourcePayloadRef: string | null
   tenantId: string | null
+  financialYearEnd: string | null
   syncRunId: string | null
   fetchedAt: Date
 }
@@ -48,6 +56,9 @@ export type PersistAccountingAccountBalanceSnapshotResult = {
 }
 
 type SnapshotClient = Pick<PrismaClient, 'accountingAccountBalanceSnapshot'> & Partial<Pick<PrismaClient, '$transaction'>>
+/** What a period movement reads: the snapshots, plus the chart (account type) and the stored financial-year end. */
+type MovementClient = SnapshotClient & Pick<PrismaClient, 'accountingAccount'>
+type ConfiguredReadClient = MovementClient & Pick<PrismaClient, 'accountingToken'>
 
 export type AccountBalanceSnapshotLookup = {
   connector: string
@@ -66,6 +77,39 @@ export type AccountBalancePeriodMovement = {
 export type MissingAccountBalanceSnapshotReason =
   | 'missing_previous_day_snapshot'
   | 'missing_closing_snapshot'
+
+export type AccountBalanceMovementWithheldReason =
+  | 'window_crosses_financial_year_start'
+  | 'financial_year_end_unproven'
+  | 'account_identity_unproven'
+  | 'account_identity_changed'
+  | 'organisation_unproven'
+
+/**
+ * A closing-minus-opening movement that would not be a movement: the account is a profit-and-loss account (its Trial Balance
+ * figure is year-to-date and restarts at the financial-year start) and the window crosses that start, or the year end is not
+ * known. The consumer withholds the figure with this reason; it never shows the difference.
+ */
+export class AccountBalanceMovementWithheldError extends Error {
+  reason: AccountBalanceMovementWithheldReason
+  accountCode: string | null
+  constructor(input: { reason: AccountBalanceMovementWithheldReason; accountCode: string | null; openingDate: string; closingDate: string }) {
+    const window = `${input.openingDate} and ${input.closingDate}`
+    const account = input.accountCode ?? 'unknown'
+    super(input.reason === 'window_crosses_financial_year_start'
+      ? `Account ${account} is a profit-and-loss account whose year-to-date balance restarts at the financial-year start, which falls between ${window}; the movement is withheld.`
+      : input.reason === 'account_identity_unproven'
+        ? `The chart does not name exactly one active account for code ${account}, so a movement between ${window} cannot be tied to an account; it is withheld.`
+        : input.reason === 'organisation_unproven'
+          ? `No connected Xero organisation is recorded, so a stored balance for code ${account} cannot be shown to be the connected organisation's; it is withheld.`
+        : input.reason === 'account_identity_changed'
+          ? `The stored balances for code ${account} between ${window} are not both the configured account's own, from the same organisation (the code was reassigned or the organisation changed); the movement is withheld.`
+          : `Account ${account} is a profit-and-loss account and its two balances do not prove the same financial-year end for the same organisation, so a movement between ${window} is withheld.`)
+    this.name = 'AccountBalanceMovementWithheldError'
+    this.reason = input.reason
+    this.accountCode = input.accountCode
+  }
+}
 
 export class MissingAccountBalanceSnapshotError extends Error {
   reason: MissingAccountBalanceSnapshotReason
@@ -134,6 +178,8 @@ function normalizeInput(input: AccountingAccountBalanceSnapshotInput) {
     amountBase: roundQuantity(input.amountBase, 6),
     sourcePayloadRef: input.sourcePayloadRef?.trim() || null,
     tenantId: input.tenantId?.trim() || null,
+    // Only a real MM-DD is kept; anything else is 'not proven'.
+    financialYearEnd: parseFinancialYearEnd(input.financialYearEnd) ? input.financialYearEnd!.trim() : null,
     syncRunId: input.syncRunId?.trim() || null,
     fetchedAt: input.fetchedAt ?? new Date(),
   }
@@ -157,6 +203,7 @@ function upsertSnapshotArgs(normalized: NormalizedAccountingAccountBalanceSnapsh
       amountBase: normalized.amountBase,
       sourcePayloadRef: normalized.sourcePayloadRef,
       tenantId: normalized.tenantId,
+      financialYearEnd: normalized.financialYearEnd,
       syncRunId: normalized.syncRunId,
       fetchedAt: normalized.fetchedAt,
     },
@@ -210,16 +257,65 @@ export async function findLatestAccountBalanceSnapshot(
     : null
 }
 
+/**
+ * The latest stored balance on or before a date for the account a CONFIGURED CODE names. A code is not an identity: it can be
+ * reassigned to another account. So the code is resolved to the one active chart account that holds it, the balance is read by
+ * that account's id, and only a balance fetched under the CONNECTED organisation counts. A chart that does not name exactly one
+ * account, or no recorded connected organisation, throws AccountBalanceMovementWithheldError (a named reason); the caller
+ * withholds its figure. Returns null when the account has no balance on or before the date.
+ */
+export async function findLatestConfiguredAccountBalanceSnapshot(
+  lookup: { connector: string; accountCode: string; balanceDate: Date | string; currency?: string | null },
+  client: ConfiguredReadClient = db,
+): Promise<AccountingAccountBalanceSnapshotRow | null> {
+  const date = balanceDateString(lookup.balanceDate)
+  const withheld = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({ reason, accountCode: lookup.accountCode, openingDate: date, closingDate: date })
+  const code = lookup.accountCode.trim()
+  const chartRows = code
+    ? await client.accountingAccount.findMany({ where: { connector: lookup.connector, code, active: true }, select: { externalAccountId: true, type: true } })
+    : []
+  if (chartRows.length !== 1) throw withheld('account_identity_unproven')
+  const token = await client.accountingToken.findUnique({ where: { connector: lookup.connector }, select: { tenantId: true } })
+  const tenantId = typeof token?.tenantId === 'string' ? token.tenantId.trim() : ''
+  if (!tenantId) throw withheld('organisation_unproven')
+  return client.accountingAccountBalanceSnapshot.findFirst({
+    where: {
+      connector: lookup.connector,
+      externalAccountId: chartRows[0]!.externalAccountId,
+      tenantId,
+      balanceDate: { lte: normalizeBalanceDate(lookup.balanceDate) },
+      ...(lookup.currency ? { currency: normalizeCurrency(lookup.currency) } : {}),
+    },
+    orderBy: [{ balanceDate: 'desc' }, { fetchedAt: 'desc' }, { id: 'desc' }],
+  })
+}
+
 export async function getAccountBalancePeriodMovement(
   lookup: Omit<AccountBalanceSnapshotLookup, 'balanceDate'> & { dateFrom: Date | string; dateTo: Date | string; maxOpeningStalenessDays?: number },
-  client: SnapshotClient = db,
+  client: MovementClient = db,
 ): Promise<AccountBalancePeriodMovement> {
   const dateFrom = normalizeBalanceDate(lookup.dateFrom)
   const requiredOpeningDate = previousDate(lookup.dateFrom)
   const requiredClosingDate = normalizeBalanceDate(lookup.dateTo)
+  // WHICH account: a code can be reassigned to another account, and a stored balance belongs to the account id it was pulled
+  // for. The intended id is the caller's, else the one ACTIVE chart account with that code; both balances must be that
+  // account's own (and from one organisation), for every account type. An id the chart cannot name is withheld, never guessed.
+  const withheldFor = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({
+    reason, accountCode: lookup.accountCode ?? null, openingDate: balanceDateString(requiredOpeningDate), closingDate: balanceDateString(requiredClosingDate),
+  })
+  const explicitId = lookup.externalAccountId?.trim()
+  const accountCode = lookup.accountCode?.trim()
+  const chartRows = explicitId
+    ? await client.accountingAccount.findMany({ where: { connector: lookup.connector, externalAccountId: explicitId }, select: { externalAccountId: true, type: true } })
+    : accountCode
+      ? await client.accountingAccount.findMany({ where: { connector: lookup.connector, code: accountCode, active: true }, select: { externalAccountId: true, type: true } })
+      : []
+  if (chartRows.length !== 1) throw withheldFor('account_identity_unproven')
+  const intended = chartRows[0]!
+  const byId = { ...lookup, externalAccountId: intended.externalAccountId, accountCode: undefined }
   const [opening, closing] = await Promise.all([
-    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: requiredOpeningDate }, client),
-    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: requiredClosingDate }, client),
+    findLatestAccountBalanceSnapshot({ ...byId, balanceDate: requiredOpeningDate }, client),
+    findLatestAccountBalanceSnapshot({ ...byId, balanceDate: requiredClosingDate }, client),
   ])
   const maxStalenessDays = lookup.maxOpeningStalenessDays ?? DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS
   const staleBefore = dateFrom.getTime() - maxStalenessDays * DAY_MS
@@ -243,6 +339,28 @@ export async function getAccountBalancePeriodMovement(
       externalAccountId: lookup.externalAccountId,
       accountCode: lookup.accountCode,
     })
+  }
+  // Defence in depth over the id-keyed read above: both rows are the intended account's, from one organisation.
+  if (opening.externalAccountId !== intended.externalAccountId || closing.externalAccountId !== intended.externalAccountId || opening.tenantId !== closing.tenantId) {
+    throw withheldFor('account_identity_changed')
+  }
+  // The stored figure is year-to-date. A lifetime-balance account (inventory, transit, ...) differences cleanly; a
+  // profit-and-loss account does not across a financial-year start. The type is the chart's, not the setting key's, and a type
+  // the repo does not list as a lifetime balance is treated as profit-and-loss (withheld rather than guessed).
+  if (!isLifetimeBalanceAccountType(intended.type)) {
+    const withheld = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({
+      reason, accountCode: closing.accountCode, openingDate: balanceDateString(opening.balanceDate), closingDate: balanceDateString(closing.balanceDate),
+    })
+    // Each balance carries the year end in force when it was pulled, and the organisation it was pulled from. A year end that
+    // changed between the two pulls, a balance that does not prove one, or two organisations: nothing to difference.
+    const openingYearEnd = parseFinancialYearEnd(opening.financialYearEnd)
+    const closingYearEnd = parseFinancialYearEnd(closing.financialYearEnd)
+    const sameOrganisation = typeof opening.tenantId === 'string' && opening.tenantId.length > 0 && opening.tenantId === closing.tenantId
+    if (!openingYearEnd || !closingYearEnd || !sameOrganisation || openingYearEnd.month !== closingYearEnd.month || openingYearEnd.day !== closingYearEnd.day) {
+      throw withheld('financial_year_end_unproven')
+    }
+    const yearEnd = closingYearEnd
+    if (windowCrossesFinancialYearStart(opening.balanceDate, closing.balanceDate, yearEnd)) throw withheld('window_crosses_financial_year_start')
   }
   return {
     opening,

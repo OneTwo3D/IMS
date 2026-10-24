@@ -657,6 +657,8 @@ export const PACK_BASIS_ACCOUNTS = [
   { kind: 'inventory', label: 'Inventory', settingKey: 'xero_inventory_account' },
   { kind: 'allocated', label: 'Allocated Inventory', settingKey: 'xero_allocated_inventory_account' },
   { kind: 'transit', label: 'Stock in Transit', settingKey: 'xero_transit_account' },
+  // COGS is a profit-and-loss account: its stored balance is year-to-date. The pack reads it only as the balance at D and never
+  // subtracts two dates, so it is unaffected by the financial-year restart.
   { kind: 'cogs', label: 'Cost of Goods Sold', settingKey: 'xero_cogs_account' },
   { kind: 'unearned', label: 'Unearned Revenue', settingKey: 'xero_unearned_revenue_account' },
 ] as const
@@ -682,6 +684,7 @@ export const PACK_BASIS_REASONS = {
   inventory_accounts_shared: 'Inventory or Allocated Inventory is configured with an account code another of the five accounts also uses, so the inventory comparison would not be over the inventory ledger alone',
   no_gl_snapshot: 'no stored trial-balance balance exists, on any date, for a configured account',
   not_for_date: 'stored balances exist for a configured account but none for exactly the cycle date; a balance for an earlier or later date is never substituted',
+  gl_account_identity: 'the chart does not name exactly one active account for a configured account code, or the stored balances under that code were pulled for a different account (the code was reassigned)',
   gl_snapshot_ambiguous: 'more than one stored balance exists for one configured account on the cycle date',
   gl_snapshot_other_tenant: 'the stored balances for a configured account on the cycle date were fetched under a different Xero organisation than the one now connected, or do not record which one; they are never used. Pull the date again under the connected organisation',
   gl_snapshot_unlabelled: 'a stored balance for the cycle date does not say whether Xero reported the account or the account was absent from the trial balance (it was stored by an older build); pull the date again',

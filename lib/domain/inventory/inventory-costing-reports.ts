@@ -4,8 +4,9 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import {
   calculateAccountBalanceVarianceBase,
-  findLatestAccountBalanceSnapshot,
+  findLatestConfiguredAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
+  AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on-hand-as-of'
@@ -594,12 +595,24 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
       notices: ['No inventory asset account is configured on the active accounting connector, so GL variance is blank.'],
     }
   }
-  const snapshot = await findLatestAccountBalanceSnapshot({
-    connector: context.connector,
-    accountCode: context.inventoryAccountCode,
-    balanceDate: asOf,
-    currency: context.baseCurrency,
-  })
+  let snapshot
+  try {
+    snapshot = await findLatestConfiguredAccountBalanceSnapshot({
+      connector: context.connector,
+      accountCode: context.inventoryAccountCode,
+      balanceDate: asOf,
+      currency: context.baseCurrency,
+    })
+  } catch (error) {
+    if (error instanceof AccountBalanceMovementWithheldError) {
+      return {
+        glBalanceBase: null,
+        glVarianceBase: null,
+        notices: [`The stored GL balance cannot be shown to be inventory asset account ${context.inventoryAccountCode}'s own, from the connected organisation (the code may have been reassigned), so GL variance is blank.`],
+      }
+    }
+    throw error
+  }
   if (!snapshot) {
     return {
       glBalanceBase: null,
@@ -644,6 +657,7 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
     dateTo,
     currency: context.baseCurrency,
   })
+  if (!movement.ok && movement.withheld) return { glBalanceBase: null, glVarianceBase: null, notices: [movement.notice!] }
   if (!movement.ok) return missingCogsGlMovementResult(context.cogsAccountCode, dateFrom, dateTo, movement.notice)
   const notices = movement.movementBase.lt(0)
     ? ['GL COGS movement is negative. This can be caused by period-end reclassification, year-end close, or refunds; investigate before relying on the variance.']
@@ -664,13 +678,26 @@ type CogsGlMovementLookup = Parameters<typeof getAccountBalancePeriodMovement>[0
 
 type CogsGlMovementResult =
   | { ok: true; movementBase: Decimal }
-  | { ok: false; notice?: string }
+  | { ok: false; notice?: string; withheld?: true }
+
+function cogsMovementWithheldNotice(error: AccountBalanceMovementWithheldError): string {
+  switch (error.reason) {
+    case 'window_crosses_financial_year_start':
+      return 'The period crosses the start of a financial year, when the COGS account\'s year-to-date GL balance restarts from zero, so no GL COGS movement can be taken from two stored balances. The GL variance is blank.'
+    case 'account_identity_unproven':
+    case 'account_identity_changed':
+      return 'The two stored GL COGS balances cannot be shown to be the configured COGS account\'s own, from one organisation (the account code may have been reassigned), so no movement is taken from them. The GL variance is blank.'
+    default:
+      return 'The two stored GL COGS balances do not prove the same financial-year end for the same organisation (re-pull the Trial Balance for those dates), so a movement cannot be taken from two year-to-date balances. The GL variance is blank.'
+  }
+}
 
 async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovementLookup): Promise<CogsGlMovementResult> {
   try {
     const movement = await getAccountBalancePeriodMovement(lookup)
     return { ok: true, movementBase: movement.movementBase }
   } catch (error) {
+    if (error instanceof AccountBalanceMovementWithheldError) return { ok: false, notice: cogsMovementWithheldNotice(error), withheld: true }
     if (!(error instanceof MissingAccountBalanceSnapshotError)) throw error
 
     // Connector-agnostic on-demand snapshot sync: dispatches to the active accounting
@@ -693,6 +720,7 @@ async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovement
       return { ok: true, movementBase: movement.movementBase }
     } catch (retryError) {
       if (retryError instanceof MissingAccountBalanceSnapshotError) return { ok: false }
+      if (retryError instanceof AccountBalanceMovementWithheldError) return { ok: false, notice: cogsMovementWithheldNotice(retryError), withheld: true }
       throw retryError
     }
   }

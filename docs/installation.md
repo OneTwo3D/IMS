@@ -1946,6 +1946,7 @@ The Stock in Transit leg (R10 only) is separate and never makes the basis unavai
 | inventory_accounts_shared | Inventory or Allocated Inventory is configured with an account code another of the five accounts also uses, so the inventory comparison would not be over the inventory ledger alone |
 | no_gl_snapshot | no stored trial-balance balance exists, on any date, for a configured account |
 | not_for_date | stored balances exist for a configured account but none for exactly the cycle date; a balance for an earlier or later date is never substituted |
+| gl_account_identity | the chart does not name exactly one active account for a configured account code, or the stored balances under that code were pulled for a different account (the code was reassigned) |
 | gl_snapshot_ambiguous | more than one stored balance exists for one configured account on the cycle date |
 | gl_snapshot_other_tenant | the stored balances for a configured account on the cycle date were fetched under a different Xero organisation than the one now connected, or do not record which one; they are never used. Pull the date again under the connected organisation |
 | gl_snapshot_unlabelled | a stored balance for the cycle date does not say whether Xero reported the account or the account was absent from the trial balance (it was stored by an older build); pull the date again |

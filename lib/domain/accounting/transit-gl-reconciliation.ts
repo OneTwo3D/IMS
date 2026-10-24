@@ -5,8 +5,9 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   balanceDateString,
   getAccountBalancePeriodMovement,
+  AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
-  findLatestAccountBalanceSnapshot,
+  findLatestConfiguredAccountBalanceSnapshot,
 } from './account-balance-snapshots'
 import { isTransitLedgerCoverageSatisfied } from './transit-ledger-coverage'
 import {
@@ -52,6 +53,8 @@ export type TransitGlReconciliationUnavailableReason =
   | 'no_account_configured'
   | 'no_gl_snapshot'
   | 'no_opening_snapshot'
+  | 'financial_year_boundary'
+  | 'account_identity_unproven'
   | 'ledger_not_covering_window'
 
 export type TransitGlReconciliationResult = AccountGlReconciliationResult<TransitGlReconciliationUnavailableReason>
@@ -99,12 +102,18 @@ export async function loadTransitGlReconciliation(options?: {
   if (!transitAccount) return { available: false, reason: 'no_account_configured' }
 
   const currency = await getBaseCurrencyCode()
-  const closing = await findLatestAccountBalanceSnapshot({
-    connector,
-    accountCode: transitAccount,
-    balanceDate: options?.now ?? new Date(),
-    currency,
-  })
+  let closing
+  try {
+    closing = await findLatestConfiguredAccountBalanceSnapshot({
+      connector,
+      accountCode: transitAccount,
+      balanceDate: options?.now ?? new Date(),
+      currency,
+    })
+  } catch (error) {
+    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: 'account_identity_unproven' }
+    throw error
+  }
   if (!closing) return { available: false, reason: 'no_gl_snapshot' }
   const closingDate = closing.balanceDate
 
@@ -120,6 +129,11 @@ export async function loadTransitGlReconciliation(options?: {
   } catch (error) {
     if (error instanceof MissingAccountBalanceSnapshotError) {
       return { available: false, reason: 'no_opening_snapshot' }
+    }
+    // Stock in Transit is a balance-sheet account, so this does not happen for a correctly typed chart; if the chart says
+    // otherwise, or does not know the account, the movement is withheld rather than guessed.
+    if (error instanceof AccountBalanceMovementWithheldError) {
+      return { available: false, reason: 'financial_year_boundary' }
     }
     throw error
   }

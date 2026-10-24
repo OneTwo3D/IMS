@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getAccountingSettings, getActiveAccountingConnectorInfo, getAccountingSettingsFor } from '@/lib/accounting'
-import { balanceDateString, findLatestAccountBalanceSnapshot } from './account-balance-snapshots'
+import { AccountBalanceMovementWithheldError, balanceDateString, findLatestConfiguredAccountBalanceSnapshot } from './account-balance-snapshots'
 import {
   DEFAULT_GL_SWEEP_LIMIT,
   buildAccountReconciliationSweepJournal,
@@ -60,6 +60,7 @@ export function evaluateInventoryGlReconciliation(input: {
 export type InventoryGlReconciliationUnavailableReason =
   | 'no_account_configured'
   | 'no_gl_snapshot'
+  | 'account_identity_unproven'
   | 'no_subledger_snapshot'
   | 'unreliable_subledger_snapshot'
 
@@ -110,22 +111,30 @@ export async function loadInventoryGlReconciliation(options?: {
   if (!inventoryAccount || !allocatedAccount) return { available: false, reason: 'no_account_configured' }
 
   const currency = await getBaseCurrencyCode()
-  const inventorySnapshot = await findLatestAccountBalanceSnapshot({
-    connector,
-    accountCode: inventoryAccount,
-    balanceDate: options?.now ?? new Date(),
-    currency,
-  })
-  if (!inventorySnapshot) return { available: false, reason: 'no_gl_snapshot' }
+  // Each configured code is resolved to its one active chart account and read BY ACCOUNT ID under the connected organisation;
+  // an older account that once held the code is never compared with the current sub-ledger. Identity not proven: withheld.
+  let inventorySnapshot
+  let allocatedSnapshot
+  try {
+    inventorySnapshot = await findLatestConfiguredAccountBalanceSnapshot({
+      connector,
+      accountCode: inventoryAccount,
+      balanceDate: options?.now ?? new Date(),
+      currency,
+    })
+    if (!inventorySnapshot) return { available: false, reason: 'no_gl_snapshot' }
+    // The Allocated-Inventory balance must be for the SAME date to be comparable.
+    allocatedSnapshot = await findLatestConfiguredAccountBalanceSnapshot({
+      connector,
+      accountCode: allocatedAccount,
+      balanceDate: inventorySnapshot.balanceDate,
+      currency,
+    })
+  } catch (error) {
+    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: 'account_identity_unproven' }
+    throw error
+  }
   const balanceDate = inventorySnapshot.balanceDate
-
-  // The Allocated-Inventory balance must be for the SAME date to be comparable.
-  const allocatedSnapshot = await findLatestAccountBalanceSnapshot({
-    connector,
-    accountCode: allocatedAccount,
-    balanceDate,
-    currency,
-  })
   if (!allocatedSnapshot || balanceDateString(allocatedSnapshot.balanceDate) !== balanceDateString(balanceDate)) {
     return { available: false, reason: 'no_gl_snapshot' }
   }

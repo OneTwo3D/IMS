@@ -243,9 +243,12 @@ test('[reconciliation pack] R6 and R10 on a seeded estate: decided from stored s
     await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'x', '2031-01-01', $2, now())`, [`${LTAG}-tok`, `${LTAG}-tenant`])
     const amounts: Record<string, [string, string]> = { inventory: ['100.50', '100.50'], allocated: ['20.25', '20.25'], transit: ['50', '50'], cogs: ['7', '7'], unearned: ['-30', '-30'] }
     for (const [kind, code] of Object.entries(codes)) {
+      await sql(`INSERT INTO accounting_accounts (id, connector, "externalAccountId", code, name, type, active) VALUES ($1, 'xero', $2, $3, 'x', 'ASSET', true)`, [`${LTAG}-ca-${kind}`, `${LTAG}-${kind}`, code])
+    }
+    for (const [kind, code] of Object.entries(codes)) {
       await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', $4, 'GBP', $5, $5, $6, $7, now())`, [`${LTAG}-b-${kind}`, `${LTAG}-${kind}`, code, LD, amounts[kind]![0], `xero:trial-balance:${LD}`, `${LTAG}-tenant`])
     }
-    await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', '2026-03-04', 'GBP', 40, 40, 'xero:trial-balance:2026-03-04', $4, now())`, [`${LTAG}-b-open`, `${LTAG}-transit-open`, codes.transit, `${LTAG}-tenant`])
+    await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', '2026-03-04', 'GBP', 40, 40, 'xero:trial-balance:2026-03-04', $4, now())`, [`${LTAG}-b-open`, `${LTAG}-transit`, codes.transit, `${LTAG}-tenant`])
     await sql(`INSERT INTO transit_subledger_movements (id, source_type, source_ref, idempotency_key, base_delta, journal_date) VALUES ($1, 'STOCK_RECEIPT', $2, $3, 10, $4)`, [`${LTAG}-mv`, LTAG, `${LTAG}-mv`, LD])
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now())`, [`${LTAG}-run`, LD])
     // The estate is a sub-ledger of nothing against a GL of 120.75: R6 fails, which is the point (a gap beyond GBP 1 is a finding).
@@ -289,6 +292,7 @@ test('[reconciliation pack] R6 and R10 on a seeded estate: decided from stored s
     await sql(`DELETE FROM first_load_apply_runs WHERE id LIKE '${LTAG}%'`)
     await sql(`DELETE FROM transit_subledger_movements WHERE id LIKE '${LTAG}%'`)
     await sql(`DELETE FROM accounting_account_balance_snapshots WHERE id LIKE '${LTAG}%'`)
+    await sql(`DELETE FROM accounting_accounts WHERE id LIKE '${LTAG}%'`)
     await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${LTAG}%'`)
     await restoreForeignEstate(estate)
     for (const key of [...SETTINGS, keys.xero]) {
@@ -990,6 +994,9 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
     await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'x', '2031-01-01', $2, now())`, [`${OTAG}-tok`, `${OTAG}-tenant`])
     const amounts: Record<string, string> = { inventory: '0', allocated: '0', transit: '50', cogs: '0', unearned: '0' }
     for (const [kind, code] of Object.entries(codes)) {
+      await sql(`INSERT INTO accounting_accounts (id, connector, "externalAccountId", code, name, type, active) VALUES ($1, 'xero', $2, $3, 'x', 'ASSET', true)`, [`${OTAG}-ca-${kind}`, `${OTAG}-acc-${kind}`, code])
+    }
+    for (const [kind, code] of Object.entries(codes)) {
       await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', $4, 'GBP', $5, $5, $6, $7, now())`, [`${OTAG}-b-${kind}`, `${OTAG}-acc-${kind}`, code, OD, amounts[kind], `xero:trial-balance:${OD}`, `${OTAG}-tenant`])
     }
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now())`, [`${OTAG}-run`, OD])
@@ -1077,6 +1084,7 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
     await sql(`DELETE FROM products WHERE id LIKE '${OTAG}%'`)
     await sql(`DELETE FROM inventory_snapshot_runs WHERE id LIKE '${OTAG}%'`)
     await sql(`DELETE FROM accounting_account_balance_snapshots WHERE id LIKE '${OTAG}%'`)
+    await sql(`DELETE FROM accounting_accounts WHERE id LIKE '${OTAG}%'`)
     await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${OTAG}%'`)
     await sql(`DELETE FROM first_load_apply_runs WHERE id LIKE '${OTAG}%'`)
     // Put every held row back exactly as it was, and say so if one cannot be.

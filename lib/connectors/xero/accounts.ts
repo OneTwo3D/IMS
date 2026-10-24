@@ -2,6 +2,7 @@
  * Sync Xero Chart of Accounts → local AccountingAccount table.
  */
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { xeroGet, xeroGetCached } from './api'
 import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
@@ -20,6 +21,52 @@ type AccountingAccountResponse = {
   }>
 }
 
+export type XeroChartAccount = AccountingAccountResponse['Accounts'][number]
+
+/** GET the current chart of accounts (read only). */
+export async function fetchXeroChartOfAccounts(): Promise<{ ok: true; accounts: XeroChartAccount[] } | { ok: false; error: string }> {
+  const res = await xeroGet<AccountingAccountResponse>('Accounts')
+  if (!res.ok || !res.data || !Array.isArray(res.data.Accounts)) return { ok: false, error: res.error ?? 'Failed to fetch accounts' }
+  return { ok: true, accounts: res.data.Accounts }
+}
+
+/**
+ * Write a fetched chart into AccountingAccount, inside a transaction the caller holds under the connection fence. ALL-OR-NOTHING:
+ * a statement that fails inside an interactive transaction aborts it, so a per-account failure fails the caller's transaction
+ * instead of leaving a half-written chart.
+ */
+export async function storeChartOfAccounts(tx: Pick<Prisma.TransactionClient, 'accountingAccount'>, accounts: XeroChartAccount[]): Promise<number> {
+  for (const acc of accounts) {
+    await tx.accountingAccount.upsert({
+      where: { connector_externalAccountId: { connector: XERO_CONNECTOR, externalAccountId: acc.AccountID } },
+      create: {
+        connector: XERO_CONNECTOR,
+        externalAccountId: acc.AccountID,
+        code: acc.Code ?? null,
+        name: acc.Name,
+        type: acc.Type,
+        taxType: acc.TaxType ?? null,
+        active: acc.Status === 'ACTIVE',
+        syncedAt: new Date(),
+      },
+      update: {
+        code: acc.Code ?? null,
+        name: acc.Name,
+        type: acc.Type,
+        taxType: acc.TaxType ?? null,
+        active: acc.Status === 'ACTIVE',
+        syncedAt: new Date(),
+      },
+    })
+  }
+  // Deactivate accounts that no longer exist in Xero
+  await tx.accountingAccount.updateMany({
+    where: { connector: XERO_CONNECTOR, externalAccountId: { notIn: accounts.map((a) => a.AccountID) } },
+    data: { active: false },
+  })
+  return accounts.length
+}
+
 /**
  * Pull the full chart of accounts from Xero and upsert into AccountingAccount.
  */
@@ -29,48 +76,11 @@ export async function syncChartOfAccounts(): Promise<{ synced: number; errors: s
   // organisation A could land A's chart AFTER the rebind to B had cleared the cache, and the Sync page would
   // offer A's accounts for B's re-map.
   const connection = await captureXeroConnection()
-  const res = await xeroGet<AccountingAccountResponse>('Accounts')
-  if (!res.ok || !res.data) {
-    return { synced: 0, errors: [res.error ?? 'Failed to fetch accounts'] }
-  }
-  const accounts = res.data.Accounts
-
-  // ALL-OR-NOTHING inside one transaction held under the lock: a statement that fails inside an interactive
-  // transaction aborts it, so a per-account failure now fails the refresh (and is reported) instead of
-  // leaving a half-written chart.
+  const fetched = await fetchXeroChartOfAccounts()
+  if (!fetched.ok) return { synced: 0, errors: [fetched.error] }
   let fenced
   try {
-    fenced = await withXeroConnectionFence(connection, async (tx) => {
-      for (const acc of accounts) {
-        await tx.accountingAccount.upsert({
-          where: { connector_externalAccountId: { connector: XERO_CONNECTOR, externalAccountId: acc.AccountID } },
-          create: {
-            connector: XERO_CONNECTOR,
-            externalAccountId: acc.AccountID,
-            code: acc.Code ?? null,
-            name: acc.Name,
-            type: acc.Type,
-            taxType: acc.TaxType ?? null,
-            active: acc.Status === 'ACTIVE',
-            syncedAt: new Date(),
-          },
-          update: {
-            code: acc.Code ?? null,
-            name: acc.Name,
-            type: acc.Type,
-            taxType: acc.TaxType ?? null,
-            active: acc.Status === 'ACTIVE',
-            syncedAt: new Date(),
-          },
-        })
-      }
-      // Deactivate accounts that no longer exist in Xero
-      await tx.accountingAccount.updateMany({
-        where: { connector: XERO_CONNECTOR, externalAccountId: { notIn: accounts.map((a) => a.AccountID) } },
-        data: { active: false },
-      })
-      return accounts.length
-    }, { timeoutMs: 120_000 })
+    fenced = await withXeroConnectionFence(connection, (tx) => storeChartOfAccounts(tx, fetched.accounts), { timeoutMs: 120_000 })
   } catch (e) {
     return { synced: 0, errors: [`Chart of accounts was not stored: ${String(e)}`] }
   }
