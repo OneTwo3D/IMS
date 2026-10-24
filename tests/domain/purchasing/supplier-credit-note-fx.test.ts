@@ -73,18 +73,19 @@ test('recordSupplierFreightCreditNote: base amount divides by the BILL rate, and
   assert.equal(Number(captured.created[0]!.amountBase), 85.4701)
 })
 
-test('recordSupplierFreightCreditNote: with no bill rate the order rate is used, divided', async () => {
-  poFixture = {
-    id: 'po-2', reference: 'PO-2', currency: 'EUR', fxRateToBase: '1.25', supplierId: 's1',
-    invoices: [{ id: 'inv-2', fxRateToBase: null, totalForeign: '500' }],
-  }
-  captured.created.length = 0
+test('[R3 HIGH] a selected bill whose own rate is unusable REFUSES before any write - the PO rate is never substituted', async () => {
   const { recordSupplierFreightCreditNote } = await import('@/app/actions/purchase-orders')
-  const result = await recordSupplierFreightCreditNote({ poId: 'po-2', amountForeign: 100 })
-  console.log(`action PRECONDITION (order-rate fallback): success=${result.success} data=${JSON.stringify(captured.created[0])}`)
-  assert.equal(result.success, true, String(result.error))
-  assert.equal(captured.created.length, 1)
-  assert.equal(Number(captured.created[0]!.amountBase), 80)
+  for (const billRate of [null, '0', '-1']) {
+    poFixture = {
+      id: 'po-2', reference: 'PO-2', currency: 'EUR', fxRateToBase: '1.25', supplierId: 's1',
+      invoices: [{ id: 'inv-2', fxRateToBase: billRate, totalForeign: '500' }],
+    }
+    captured.created.length = 0
+    const result = await recordSupplierFreightCreditNote({ poId: 'po-2', amountForeign: 100 })
+    assert.equal(result.success, false, `bill rate ${billRate}`)
+    assert.match(String(result.error), /Credit note not recorded: Bill for purchase order PO-2 is in EUR but has no usable stored FX rate to GBP/)
+    assert.equal(captured.created.length, 0, 'no credit note row (it would have been booked at the PO rate 1.25 = GBP 80)')
+  }
 })
 
 test('[q0x56.8] recordSupplierFreightCreditNote: a FOREIGN document with no usable stored rate refuses before any write', async () => {

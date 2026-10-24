@@ -4449,8 +4449,11 @@ export async function recordSupplierFreightCreditNote(input: {
       fxRateToBase = (await resolveStoredFxRateToBase({
         currency: po.currency,
         baseCurrency: getBaseCurrencyCode,
-        storedRate: selectedInvoice?.fxRateToBase ?? po.fxRateToBase,
-        document: selectedInvoice?.fxRateToBase != null ? `Bill for purchase order ${po.reference}` : `Purchase order ${po.reference}`,
+        // A selected bill is converted at ITS OWN booked rate and nothing else: if that is unusable the credit note is
+        // refused, never silently taken at the purchase order's rate (the bill's booked rate is then unknown). The PO's
+        // rate is used only when no bill is selected.
+        storedRate: selectedInvoice ? selectedInvoice.fxRateToBase : po.fxRateToBase,
+        document: selectedInvoice ? `Bill for purchase order ${po.reference}` : `Purchase order ${po.reference}`,
       })).toNumber()
     } catch (error) {
       if (isMissingStoredFxRateError(error)) return { success: false, error: `Credit note not recorded: ${error.message}` }
