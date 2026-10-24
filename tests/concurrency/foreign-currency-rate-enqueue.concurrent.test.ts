@@ -1,3 +1,4 @@
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
@@ -8,7 +9,8 @@ import { config } from 'dotenv'
  *
  * Drives the REAL enqueue entry points (the facade `queueAccountingSync` and the in-transaction `queueAccountingSyncTxWithOutcome`) with the base
  * currency GBP, and reads back the sync rows and the exception-inbox rows each call leaves. Fixtures are unique per run and removed afterwards.
- * GATED on RUN_DB_RETENTION_TESTS (npm run test:db).
+ * GATED on RUN_DB_CONCURRENCY_TESTS (npm run test:concurrency), and in THAT tier on purpose: the arms switch Xero's global settings on for the
+ * length of the file, and the parallel `test:db` tier has a test that counts rows of the settings table across a window (tests/db/reconciliation-pack-basis).
  *
  * Named mutations (each shown red, restored from a copy, md5-verified):
  *  a  tx-guard-removed          the foreign-rate refusal in queueAccountingSyncTx is deleted: the Tx arms go red
@@ -16,11 +18,7 @@ import { config } from 'dotenv'
  *  c  payment-types-unguarded   INVOICE_PAYMENT / BILL_PAYMENT dropped from the guard's type set: the payment arms go red
  *  d  fx-suppression-removed    isFxGainLossJournalSuppressed returns false for REALISED_FX_JOURNAL: the "no realised-FX journal" arms go red
  */
-const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
-
-if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
-  throw new Error('REQUIRE_DB_RETENTION_TESTS=1 but RUN_DB_RETENTION_TESTS is not 1: tests/db/foreign-currency-rate-enqueue.test.ts would have been skipped.')
-}
+const skip = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
 
 const SETTINGS = [['plugin_xero_enabled', 'true'], ['xero_sync_enabled', 'true']] as const
 
@@ -30,8 +28,8 @@ type Tx = any
 async function deps() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
-  const [{ db }, accounting] = await Promise.all([import('../../lib/db/index.ts'), import('../../lib/accounting.ts')])
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
+  const [{ db }, accounting] = await Promise.all([import('@/lib/db'), import('@/lib/accounting')])
   return { db, accounting }
 }
 
@@ -210,7 +208,7 @@ test('NO realised-FX journal is queued for Xero, by either enqueue, even for a f
     assert.equal(viaTx!.queued, false)
     assert.equal(viaTx!.reason, 'not-configured')
     // 'not-configured' is the answer that means nothing is OWED: the callers' reportPostingNotQueued does not fire, so no inbox debt either.
-    const { postingIsOwed } = await import('../../lib/domain/accounting/enqueue-outcome.ts')
+    const { postingIsOwed } = await import('@/lib/domain/accounting/enqueue-outcome')
     assert.equal(postingIsOwed(viaFacade), false)
     assert.equal(postingIsOwed(viaTx!), false)
     assert.equal((await d.db.accountingPostingRefusal.count({ where: { referenceId: { in: [ids.facade, ids.tx] } } })), 0)

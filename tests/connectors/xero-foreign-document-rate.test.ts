@@ -7,7 +7,7 @@ import type { BillData, CreditNoteData, InvoiceData } from '@/lib/connectors/typ
  * o3d-q0x56.3 - A FOREIGN XERO DOCUMENT NEVER LEAVES WITHOUT IMS'S RATE.
  *
  * An omitted `CurrencyRate` makes Xero apply its own XE.com day rate, a second FX reference the owner has ruled out (2026-10-24). So, at the
- * connector (defence in depth behind the enqueue refusal in tests/db/foreign-currency-rate-enqueue.test.ts):
+ * connector (defence in depth behind the enqueue refusal in tests/concurrency/foreign-currency-rate-enqueue.concurrent.test.ts):
  *
  *  - a foreign sales invoice, bill, sales credit note and supplier credit note WITHOUT a usable rate is refused BEFORE any request: no contact is
  *    created, no item is created, nothing is posted (the pure builders THROW, the push functions return a named failure);
