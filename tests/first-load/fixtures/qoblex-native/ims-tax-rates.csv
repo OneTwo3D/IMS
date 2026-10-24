@@ -1,4 +1,4 @@
-name,accountingTaxType,usedFor,active
+﻿name,accountingTaxType,usedFor,active
 Synthetic Purchase VAT 20,INPUT2,PURCHASE,TRUE
 Synthetic Zero Rated Purchase,ZERORATEDINPUT,PURCHASE,TRUE
 Synthetic No VAT,NONE,BOTH,TRUE
