@@ -158,7 +158,7 @@ genuine deposit suppliers, and let IMS resolve the contact id.
 | `contactName` | no | Passed through as given (trimmed). |
 | `email` | no | Passed through as given (trimmed). |
 | `phone` | no | Passed through as given (trimmed). |
-| `currency` | no | 3-letter code. |
+| `currency` | no | 3-letter code. **A supplier row must state it (the column is optional in a file but a blank cell is refused):** a blank is rejected as `MISSING_CURRENCY`, never defaulted, because the supplier importer would otherwise default it silently (the base currency on create). A base-currency supplier says `GBP`. A malformed code is `BAD_CURRENCY`. |
 | `vatNumber` | no | Passed through as given (trimmed). |
 | `accountNumber` | no | Passed through as given (trimmed). |
 | `paymentTermsDays` | no | Whole number of days. |
@@ -169,6 +169,7 @@ genuine deposit suppliers, and let IMS resolve the contact id.
 | `postcode` | no | Passed through as given (trimmed). |
 | `country` | no | Passed through as given (trimmed). |
 | `notes` | no | Passed through as given (trimmed). |
+| `purchaseTaxType` | no | The supplier's default purchase tax rate, as a **Xero tax type** from the closed list `INPUT2`, `ZERORATEDINPUT`, `NONE` (Xero is the tax-rate master; custom `TAX001..` ids are per-organisation and refused). **A supplier row must state it:** blank is `MISSING_PURCHASE_TAX_TYPE`, any other value `UNSUPPORTED_PURCHASE_TAX_TYPE`. The importer resolves it to **exactly one** active IMS tax rate with `usedFor` `PURCHASE` or `BOTH` and that `accountingTaxType`, and sets the supplier's tax rate to it; with an `ims-tax-rates` list the tool resolves it at prepare time too: no such rate is `NO_IMS_PURCHASE_TAX_RATE`, several are `AMBIGUOUS_IMS_PURCHASE_TAX_RATE`. Never guessed by rate name. |
 
 ### Dataset: purchase-order-lines
 
@@ -280,6 +281,17 @@ Supplier names that already exist in the target IMS. Omit it for an empty databa
 | Column | Required | Meaning |
 | --- | --- | --- |
 | `name` | yes | An existing supplier's name. A new supplier whose name collides with one of these under the importers' matching (upper-case or lower-case, a different spelling) is rejected; purchase-order supplier names are checked against it when no suppliers dataset names them. **Without this list the collision check against IMS is not performed** (the report says so). |
+
+### Dataset: ims-tax-rates
+
+The tax rates that already exist in the target IMS (an export you assemble from Settings, Tax rates). Omit it and the supplier purchase tax types are **not** resolved at prepare time (the report says `NOT RUN` and warns `SUPPLIER_TAX_RATES_UNCHECKED`); the apply-time rail `tax-rates` and the supplier importer still refuse a type that does not resolve. Always a canonical file.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | The rate's name (for the report only: a rate is never chosen by name). |
+| `accountingTaxType` | no | The rate's Xero tax type (`TaxRate.accountingTaxType`); blank when it is not mapped, which makes the rate ineligible. |
+| `usedFor` | no | `SALES`, `PURCHASE` or `BOTH`; anything else rejects the row (`BAD_USED_FOR`). Only `PURCHASE` and `BOTH` rates are eligible. |
+| `active` | no | `TRUE` or `FALSE`; anything else rejects the row (`BAD_ACTIVE`). Only active rates are eligible. |
 
 ### Dataset: ims-skus
 
@@ -464,6 +476,7 @@ How each fact the export states is read, and what is a decision for the owner:
 - **Open purchase orders** come from the incoming-stock file, one row per line. `Status` is a closed list: `Approved` and `PartiallyReceived` are open (OPEN); any other status is rejected until the owner says whether it is open. Outstanding quantity is `Ordered Quantity` minus `Received Quantity`, so a fully received line is excluded. The destination warehouse is a constant (`MIL1`; the report's `Incoming Quantity` appears only for that warehouse in the sample); confirm it.
   The file has **no currency and no exchange rate**: the currency is derived from the supplier (`derived`, from the supplier's currency in the contact export) and the rate from the currency, both closed lists in the map. A supplier whose contact has no currency is rejected until the owner gives one; the rates in the shipped map are placeholders for the synthetic suppliers only. The `Discount (%)` column is not read (every value in the sample is 0): it shows under "Source columns not read", and a non-zero value would be lost, so check it.
   `Due On` (`Thu, Oct 8 2026`) becomes `expectedDelivery`. The `Incoming Quantity` per warehouse in the stock report and these lines describe the same open orders: their per-SKU totals should agree, and a PO line for a SKU the catalogue lacks is rejected (`SKU_NOT_IN_CATALOGUE`).
+- **Supplier currency and tax rate.** `Currency` is required: a blank is `MISSING_CURRENCY` (the supplier importer's silent GBP default is refused; a GBP supplier must say GBP). `Purchase Tax Class Name` becomes the supplier's default tax rate through the **pinned** value map in `qoblex-contacts.map.json` (also pinned in code as `QOBLEX_PURCHASE_TAX_CLASS_TYPES` and by a test): `Purchase Tax` is `INPUT2` (20% VAT on expenses), `Zero Rated Purchase` is `ZERORATEDINPUT`, `No VAT` is `NONE` (Xero built-in tax types). Any other class is `UNMAPPED_VALUE`, a blank class is `MISSING_PURCHASE_TAX_TYPE`. Each type must then resolve to exactly one active purchase-capable IMS tax rate carrying it (`NO_IMS_PURCHASE_TAX_RATE` / `AMBIGUOUS_IMS_PURCHASE_TAX_RATE`; the rate is never chosen by name), so IMS tax rates must be mapped to Xero types (`INPUT2`, `ZERORATEDINPUT`, `NONE`) before the load.
 - **Suppliers** come from the contact export. **The export has no supplier/customer flag.** `Wholesale or Retail` is a closed list (`Wholesale` only): a `Retail` contact is rejected as `UNLISTED_ROW_KIND` for an owner decision. Every other contact is loaded as a supplier. Whether a contact is a supplier is read from its use: the suppliers named in the stock report's `Supplier` column and in the incoming-stock file's `Supplier` column should all be present (a purchase order line naming an absent supplier is rejected).
   Payment terms are a closed list (`NONE` and blank are no terms, `30 days net` is 30). The shipping address columns feed the supplier address; the billing columns are not read.
 
@@ -537,7 +550,7 @@ for opening stock (see the first-load work items). This tool's own output is ide
 Importer: `importSuppliersCsv` (app/actions/suppliers.ts). Template: `app/api/export/suppliers/route.ts`.
 
 ```text
-supplierId,name,contactName,email,phone,currency,vatNumber,accountNumber,paymentTermsDays,addressLine1,addressLine2,city,county,postcode,country,notes
+supplierId,name,contactName,email,phone,currency,vatNumber,accountNumber,paymentTermsDays,addressLine1,addressLine2,city,county,postcode,country,notes,purchaseTaxType
 ```
 
 ### Output header: products
@@ -590,6 +603,7 @@ Every importer rejection rule that depends on what is in IMS. The importers' CSV
 | base-currency | all | The manifest baseCurrency equals the organisation base currency in IMS (the importers compare against IMS, not the manifest). |
 | opening-stock-empty | opening-stock | The product and warehouse have no stock, cost layer or movement yet (importOpeningStockCsv refuses otherwise; it is not repeatable). |
 | po-supplier-exists | purchase-orders | Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first. |
+| supplier-tax-rate | suppliers | Each supplier's purchaseTaxType (a Xero tax type) resolves to exactly one active IMS tax rate that is usable for purchases (usedFor PURCHASE or BOTH) and carries that accountingTaxType. Zero or several matching rates refuse the run; the supplier importer sets the supplier's default tax rate to it and refuses the row otherwise. The tool performs this only against an ims-tax-rates list you supply; WITHOUT it the report says the resolution was NOT checked. |
 | po-fx-rate | purchase-orders | For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this. |
 | po-tax-rate | purchase-orders | Each line's taxRateName (names are matched case-insensitively, trimmed) or, when only a taxRateValue is given, its value (matched within 0.00005) resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. A line never carries both: the tool cannot show a name and a value agree. |
 | lookup-keys-unique-in-ims | all | In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers' case-insensitive matching: they build a Map and the last duplicate wins silently. The tool performs the supplier and SKU parts only against an ims-suppliers / ims-skus list you supply; WITHOUT that list the collision check against IMS is NOT performed and the report says so. Warehouse codes and tax names are never checked by the tool. |

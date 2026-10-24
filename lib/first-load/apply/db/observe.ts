@@ -53,8 +53,10 @@ async function observeSuppliers(): Promise<StepObservation> {
     select: {
       name: true, contactName: true, email: true, phone: true, currency: true, vatNumber: true, accountNumber: true, paymentTermsDays: true,
       addressLine1: true, addressLine2: true, city: true, county: true, postcode: true, country: true, notes: true,
-      // Columns the importer never sets: they keep their defaults (a default VAT rate, prepaid, a delivery-days override and the accounting contact link are accounting-relevant).
-      active: true, prepaid: true, taxRateId: true, manualDeliveryDays: true, accountingContactId: true, accountingContactProvenance: true,
+      // The default tax rate is set by the importer (from the file's purchaseTaxType) and compared as its accounting tax type.
+      taxRate: { select: { accountingTaxType: true } },
+      // Columns the importer never sets: they keep their defaults (prepaid, a delivery-days override and the accounting contact link are accounting-relevant).
+      active: true, prepaid: true, manualDeliveryDays: true, accountingContactId: true, accountingContactProvenance: true,
     },
   })
   const columns = FINGERPRINT_SPECS.suppliers.fingerprinted
@@ -64,7 +66,7 @@ async function observeSuppliers(): Promise<StepObservation> {
       key: row.name.trim().toLowerCase(),
       collisionKey: row.name.trim().toUpperCase(),
       fingerprint: supplierFingerprint(columns, supplierCellsFromDb(row), defaultsEntry({
-        active: row.active === true, prepaid: row.prepaid === false, taxRateId: row.taxRateId === null, manualDeliveryDays: row.manualDeliveryDays === null,
+        active: row.active === true, prepaid: row.prepaid === false, manualDeliveryDays: row.manualDeliveryDays === null,
         accountingContact: row.accountingContactId === null && row.accountingContactProvenance === null,
       })),
       recipe: null,

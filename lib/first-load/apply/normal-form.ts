@@ -73,7 +73,8 @@ function importerInteger(raw: string): string {
 export function supplierCell(column: string, cells: CellRecord): string {
   const value = cell(cells, column)
   switch (column) {
-    case 'currency': return (value === '' ? NORMAL_FORM_BASE_CURRENCY : value).toUpperCase()
+    // A blank currency stays blank: the supplier importer's silent default is refused (prepared.ts refuses a blank cell, the importer refuses it under a system import), so a blank can never equal a stored currency.
+    case 'currency': return value.toUpperCase()
     case 'paymentTermsDays': return importerInteger(value)
     case 'country': return value === '' ? '' : (toIsoCountryCode(value) ?? value)
     default: return value
@@ -101,6 +102,8 @@ export interface DbSupplier {
   postcode: string | null
   country: string | null
   notes: string | null
+  /** The supplier's default tax rate, as its accounting tax type (the file's purchaseTaxType); null when the supplier has none. */
+  taxRate: { accountingTaxType: string | null } | null
 }
 
 export function supplierCellsFromDb(row: DbSupplier): CellRecord {
@@ -108,7 +111,7 @@ export function supplierCellsFromDb(row: DbSupplier): CellRecord {
     name: row.name, contactName: row.contactName ?? '', email: row.email ?? '', phone: row.phone ?? '', currency: row.currency,
     vatNumber: row.vatNumber ?? '', accountNumber: row.accountNumber ?? '', paymentTermsDays: row.paymentTermsDays === null ? '' : String(row.paymentTermsDays),
     addressLine1: row.addressLine1 ?? '', addressLine2: row.addressLine2 ?? '', city: row.city ?? '', county: row.county ?? '', postcode: row.postcode ?? '',
-    country: row.country ?? '', notes: row.notes ?? '',
+    country: row.country ?? '', notes: row.notes ?? '', purchaseTaxType: row.taxRate?.accountingTaxType ?? '',
   }
 }
 

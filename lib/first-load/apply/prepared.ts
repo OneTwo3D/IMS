@@ -11,7 +11,7 @@ import { CsvFormatError, importerSilentlySkipsRow, parseCsvStrict } from '../csv
 import { D, fmt, parseDecimal } from '../money'
 import { canonicalJson, sha256Hex, verifyWooSnapshotBundle } from '../snapshot'
 import {
-  IMPORT_TARGETS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE, NUMERIC_LIMITS, STOCK_BEARING_TYPES, type ImporterTarget,
+  IMPORT_TARGETS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE, NUMERIC_LIMITS, STOCK_BEARING_TYPES, SUPPLIER_PURCHASE_TAX_TYPES, type ImporterTarget,
 } from '../spec'
 import type { PrepareReport } from '../transform'
 import {
@@ -250,6 +250,13 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   }
 
   const suppliers = stepData('suppliers')
+  if (suppliers) {
+    // The supplier importer defaults a blank currency and leaves a blank tax class as no default tax rate, both silently: a prepared file that relies on either is refused.
+    for (const row of suppliers.data.rows) {
+      if (cell(suppliers, row, 'currency').trim() === '') problems.push(`suppliers ${rowLocation(row)}: no currency (the importer would default it silently; a supplier states its currency)`)
+      if (!(SUPPLIER_PURCHASE_TAX_TYPES as readonly string[]).includes(cell(suppliers, row, 'purchaseTaxType').trim())) problems.push(`suppliers ${rowLocation(row)}: the purchaseTaxType is blank or not one of ${SUPPLIER_PURCHASE_TAX_TYPES.join(', ')} (the supplier would get no default tax rate, or a guessed one)`)
+    }
+  }
   const stock = stepData('opening-stock')
   const orders = stepData('purchase-orders')
   const usedWarehouses = new Set<string>()

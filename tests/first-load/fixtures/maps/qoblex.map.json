@@ -53,7 +53,15 @@
         "currency": "Cur",
         "vatNumber": "VAT No",
         "city": "Town",
-        "country": "Country"
+        "country": "Country",
+        "purchaseTaxType": "Purch Tax"
+      },
+      "valueMaps": {
+        "purchaseTaxType": {
+          "Purchase Tax": "INPUT2",
+          "Zero Rated Purchase": "ZERORATEDINPUT",
+          "No VAT": "NONE"
+        }
       }
     },
     "purchase-order-lines": {

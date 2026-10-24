@@ -321,3 +321,18 @@ test('an order with more lines than one importer call may hold is refused at loa
   assert.match(message!, /^purchase-orders: 1 order\(s\) have more than 500 lines/)
   assert.ok(!message!.includes(first.split(',')[0]!), 'no order key in the sentence')
 })
+
+test('suppliers: a blank currency, a blank or unknown purchaseTaxType is refused with no file value in the problem [mutation: delete the suppliers block in loadPreparedRun]', (t) => {
+  const arms: Array<[string, FileMap, RegExp]> = [
+    ['blank currency', withConsistentFile(honest, SUPPLIERS, (s) => s.replace(',ZQSENT Timber Co,,,,GBP,', ',ZQSENT Timber Co,,,,,')), /suppliers .*: no currency/],
+    ['blank tax type', withConsistentFile(honest, SUPPLIERS, (s) => s.replace('NONE\r\n,ZQSENT Timber Co', '\r\n,ZQSENT Timber Co')), /purchaseTaxType is blank or not one of/],
+    ['a tax type outside the closed list', withConsistentFile(honest, SUPPLIERS, (s) => s.replace('EUR,,,,,,,,,,,NONE', 'EUR,,,,,,,,,,,TAX001')), /purchaseTaxType is blank or not one of/],
+  ]
+  let examined = 0
+  for (const [label, files, pattern] of arms) {
+    const problems = expectProblem(files, pattern)
+    assert.ok(problems.every((p) => !p.includes('TAX001')), `${label}: the problem text carries no file value`)
+    examined++
+  }
+  precondition(t, 'arms', examined)
+})

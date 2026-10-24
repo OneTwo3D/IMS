@@ -10,6 +10,7 @@
     { "dataset": "recipe-lines", "file": "bundles.csv", "columnMap": "maps/qoblex-bundles.map.json" },
     { "dataset": "stock-lots", "file": "stock-on-hand.csv", "columnMap": "maps/qoblex-stock-on-hand.map.json" },
     { "dataset": "suppliers", "file": "contacts.csv", "columnMap": "maps/qoblex-contacts.map.json" },
+    { "dataset": "ims-tax-rates", "file": "ims-tax-rates.csv" },
     { "dataset": "purchase-order-lines", "file": "incoming-stock.csv", "columnMap": "maps/qoblex-incoming-stock.map.json" }
   ]
 }

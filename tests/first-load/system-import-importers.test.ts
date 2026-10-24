@@ -152,6 +152,8 @@ describe('the first-load importers as a system actor', { timeout: 20 * 60 * 1000
     Object.assign(process.env, { DATABASE_URL: url, SETTINGS_ENCRYPTION_KEY: SETTINGS_KEY, AUTH_SECRET: childEnv.AUTH_SECRET, E2E_TEST_MODE: '1', IMS_SKIP_ENV_FILE: '1' })
     await installRecorders()
     db = (await import('@/lib/db')).db
+    // The one rate the suppliers' purchaseTaxType NONE resolves to: a system import refuses a supplier without a default tax rate.
+    await db.taxRate.create({ data: { name: `${TAG} No VAT`, rate: '0', usedFor: 'BOTH', accountingTaxType: 'NONE', active: true } })
     assert.equal((await db.$queryRaw<Array<{ d: string }>>`select current_database() as d`)[0]!.d, 'ims_spike', 'precondition: the application client points at the scratch database')
 
     // WooCommerce configured and enabled, pointing at a loopback port nothing listens on: every effect that is not suppressed

@@ -315,6 +315,17 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
       byName.set(key, [...(byName.get(key) ?? []), supplier])
     }
 
+    // The supplier's default tax rate is given by its Xero tax type (`purchaseTaxType`), resolved to EXACTLY ONE active tax rate usable for purchases (usedFor PURCHASE or
+    // BOTH) that carries that accountingTaxType. Zero or several refuse the row: a default tax rate is never guessed (by name or otherwise).
+    const isSystemImport = system?.systemImportToken === SYSTEM_IMPORT
+    const purchaseRatesByType = new Map<string, string[]>()
+    for (const rate of await db.taxRate.findMany({
+      where: { active: true, usedFor: { in: ['PURCHASE', 'BOTH'] }, accountingTaxType: { not: null } },
+      select: { id: true, accountingTaxType: true },
+    })) {
+      purchaseRatesByType.set(rate.accountingTaxType!, [...(purchaseRatesByType.get(rate.accountingTaxType!) ?? []), rate.id])
+    }
+
     let created = 0
     let updated = 0
     let skipped = 0
@@ -344,6 +355,28 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
         skipped++
         continue
       }
+      // The first-load runner states both facts of every supplier: a blank currency would take the importer's silent default (the base currency), and a blank tax class
+      // would leave the supplier without a default tax rate. The interactive importer keeps its defaults; a system import refuses the row.
+      if (isSystemImport && !r.currency?.trim()) {
+        errors.push(`Row ${lineNum}: currency is blank (a system import never takes the default currency)`)
+        skipped++
+        continue
+      }
+      const taxType = r.purchaseTaxType?.trim() ?? ''
+      let taxRateId: string | null = null
+      if (taxType !== '') {
+        const matches = purchaseRatesByType.get(taxType) ?? []
+        if (matches.length !== 1) {
+          errors.push(`Row ${lineNum}: purchaseTaxType matches ${matches.length} active purchase tax rates (exactly one is needed)`)
+          skipped++
+          continue
+        }
+        taxRateId = matches[0]
+      } else if (isSystemImport) {
+        errors.push(`Row ${lineNum}: purchaseTaxType is blank (a system import never leaves the default tax rate unset)`)
+        skipped++
+        continue
+      }
       try {
         if (existing) {
           if (!preview) {
@@ -365,6 +398,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 ...(r.postcode?.trim() ? { postcode: r.postcode.trim() } : {}),
                 ...(r.country?.trim() ? { country: toIsoCountryCode(r.country.trim()) ?? r.country.trim() } : {}),
                 ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
+                ...(taxRateId ? { taxRateId } : {}),
               },
             })
           }
@@ -390,6 +424,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 postcode: r.postcode?.trim() || null,
                 country: r.country?.trim() ? (toIsoCountryCode(r.country.trim()) ?? r.country.trim()) : null,
                 notes: r.notes?.trim() || null,
+                taxRateId,
               },
             })
             createdSupplierIds.push(createdSupplier.id)

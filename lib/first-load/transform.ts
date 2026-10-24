@@ -29,6 +29,7 @@ import {
   RECIPE_TYPES,
   STOCK_BEARING_TYPES,
   STRANDED_TRANSFER_DAYS,
+  SUPPLIER_PURCHASE_TAX_TYPES,
   type DatasetName,
   type ImporterTarget,
   type InTransitConvention,
@@ -322,6 +323,8 @@ class Run {
   imsSuppliers = new Map<string, string>()
   imsSuppliersLower = new Map<string, string>()
   imsSupplierCollidedKeys = new Set<string>()
+  /** The IMS tax rates the ims-tax-rates list states (rows that passed validation), in file order. */
+  imsTaxRates: Array<{ name: string; accountingTaxType: string; usedFor: string; active: boolean }> = []
   suppliers = new Map<string, { name: string; cells: Record<string, string> }>()
   supplierStatus = new Map<string, 'ok' | 'rejected'>()
   stockGroups = new Map<string, StockGroup>()
@@ -858,6 +861,30 @@ function imsSupplierRivals(run: Run, name: string): string[] {
   return [...rivals].sort(cmp)
 }
 
+/**
+ * The IMS tax rates, read ONLY to resolve a supplier's purchase tax type (loadSuppliers). A row must state a usedFor of SALES, PURCHASE or BOTH and an active flag of
+ * TRUE or FALSE: a rate whose eligibility cannot be read is rejected, never assumed eligible.
+ */
+function loadImsTaxRates(run: Run): void {
+  for (const row of run.rows('ims-tax-rates')) {
+    const v = row.values
+    const name = v.name.normalize('NFC').trim()
+    const reject = (code: string, reason: string) => run.add('ims-tax-rates', row.line, name || '(blank)', 'REJECTED', code, reason)
+    if (name === '') { reject('MISSING_NAME', 'name is empty'); continue }
+    const usedFor = v.usedFor.trim().toUpperCase()
+    if (!['SALES', 'PURCHASE', 'BOTH'].includes(usedFor)) { reject('BAD_USED_FOR', `usedFor ${JSON.stringify(v.usedFor)} is not SALES, PURCHASE or BOTH`); continue }
+    const activeText = v.active.trim().toUpperCase()
+    if (activeText !== 'TRUE' && activeText !== 'FALSE') { reject('BAD_ACTIVE', `active ${JSON.stringify(v.active)} is not TRUE or FALSE`); continue }
+    run.imsTaxRates.push({ name, accountingTaxType: v.accountingTaxType.trim(), usedFor, active: activeText === 'TRUE' })
+    run.add('ims-tax-rates', row.line, name, 'EMITTED', 'IMS_TAX_RATE_REGISTERED', 'used to resolve each supplier\'s purchase tax type to exactly one IMS rate')
+  }
+}
+
+/** The IMS rates a Xero purchase tax type could resolve to: ACTIVE, usable for purchases (PURCHASE or BOTH) and carrying exactly that accounting tax type. */
+function purchaseRatesForTaxType(run: Run, taxType: string): string[] {
+  return run.imsTaxRates.filter((r) => r.active && (r.usedFor === 'PURCHASE' || r.usedFor === 'BOTH') && r.accountingTaxType === taxType).map((r) => r.name)
+}
+
 function loadSuppliers(run: Run): void {
   type Candidate = { row: CanonRow; name: string; cells: Record<string, string> }
   const groups = new Map<string, Candidate[]>()
@@ -868,11 +895,22 @@ function loadSuppliers(run: Run): void {
     if (name === '') { reject('MISSING_NAME', 'name is empty'); continue }
     if (name.startsWith('#')) { reject('NAME_STARTS_WITH_HASH', 'the importers\' CSV reader silently skips a row whose first value starts with "#"'); continue }
     const cells: Record<string, string> = { name }
-    if (v.currency !== '') {
-      const currency = parseCurrency(v.currency)
-      if (!currency) { reject('BAD_CURRENCY', `currency ${JSON.stringify(v.currency)} is not a 3-letter code`); continue }
-      cells.currency = currency
+    // A supplier states its currency: the supplier importer would otherwise default it silently (Supplier.currency @default("GBP"), the base currency on create), and so a
+    // base-currency supplier says GBP explicitly. The owner chose refusal over a silent default.
+    if (v.currency.trim() === '') { reject('MISSING_CURRENCY', 'currency is empty: a supplier must state its currency (GBP for a base-currency supplier); the importer would default it silently'); continue }
+    const currency = parseCurrency(v.currency)
+    if (!currency) { reject('BAD_CURRENCY', `currency ${JSON.stringify(v.currency)} is not a 3-letter code`); continue }
+    cells.currency = currency
+    // The supplier's default tax rate is its purchase tax type (a Xero tax type, mapped from the source's class by a pinned value map) resolved to ONE IMS rate. Never guessed by name.
+    const taxType = v.purchaseTaxType.trim()
+    if (taxType === '') { reject('MISSING_PURCHASE_TAX_TYPE', 'purchaseTaxType is empty: a supplier must state its purchase tax class; the supplier would otherwise carry no default tax rate'); continue }
+    if (!(SUPPLIER_PURCHASE_TAX_TYPES as readonly string[]).includes(taxType)) { reject('UNSUPPORTED_PURCHASE_TAX_TYPE', `purchaseTaxType ${JSON.stringify(taxType)} is not one of ${SUPPLIER_PURCHASE_TAX_TYPES.join(', ')} (a closed list of Xero built-in tax types)`); continue }
+    if (run.has('ims-tax-rates')) {
+      const matches = purchaseRatesForTaxType(run, taxType)
+      if (matches.length === 0) { reject('NO_IMS_PURCHASE_TAX_RATE', `no active IMS tax rate usable for purchases carries the accounting tax type ${taxType}`); continue }
+      if (matches.length > 1) { reject('AMBIGUOUS_IMS_PURCHASE_TAX_RATE', `${matches.length} active IMS tax rates usable for purchases carry the accounting tax type ${taxType}; the supplier default rate would be a guess`); continue }
     }
+    cells.purchaseTaxType = taxType
     if (v.paymentTermsDays !== '') {
       if (!/^\d{1,4}$/.test(v.paymentTermsDays)) { reject('BAD_PAYMENT_TERMS', `paymentTermsDays ${JSON.stringify(v.paymentTermsDays)} is not a whole number of days (the importer would truncate a fraction)`); continue }
       cells.paymentTermsDays = String(Number(v.paymentTermsDays))
@@ -920,6 +958,9 @@ function loadSuppliers(run: Run): void {
     run.supplierStatus.set(key, 'ok')
     run.add('suppliers', list[0].row.line, list[0].name, 'EMITTED', 'SUPPLIER', 'in the suppliers import file')
     for (const extra of list.slice(1)) run.add('suppliers', extra.row.line, extra.name, 'EXCLUDED', 'DUPLICATE_ROW', 'exact duplicate of another supplier row')
+  }
+  if (run.suppliers.size > 0 && !run.has('ims-tax-rates')) {
+    run.find('WARNING', 'SUPPLIER_TAX_RATES_UNCHECKED', 'no ims-tax-rates list was supplied, so it was NOT checked that each supplier purchase tax type resolves to exactly one IMS tax rate. The apply-time rail tax-rates refuses a run where it does not, and the supplier importer refuses the row.', 'suppliers', [...run.suppliers.values()].map((s) => s.name))
   }
 }
 
@@ -1750,6 +1791,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   loadRecipes(run)
   if (run.has('products')) checkRecipesPresent(run)
   loadImsSuppliers(run)
+  loadImsTaxRates(run)
   loadSuppliers(run)
   loadStock(run)
   loadTransfers(run)
@@ -1813,6 +1855,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     { check: 'row accounting identity', status: 'RAN', note: 'every record read has exactly one disposition' },
     split ? { check: 'zero on-hand versus missing from extract', status: 'RAN', note: 'stock-lots and products supplied' } : { check: 'zero on-hand versus missing from extract', status: 'NOT RUN', note: 'needs the products and stock-lots datasets' },
     coverage ? { check: 'R14 four-way SKU coverage', status: 'RAN', note: `sides supplied: ${['products', 'wms', 'woo', 'ims'].filter((s) => (s === 'products' ? run.has('products') : s === 'wms' ? run.has('wms-products') || run.has('wms-stock') : s === 'woo' ? run.has('woo-products') : run.has('ims-skus'))).join(', ')}` } : { check: 'R14 four-way SKU coverage', status: 'NOT RUN', note: 'needs the products dataset' },
+    run.has('suppliers') ? (run.has('ims-tax-rates') ? { check: 'supplier purchase tax type versus IMS tax rates', status: 'RAN', note: 'each type resolves to exactly one active purchase-capable IMS rate' } : { check: 'supplier purchase tax type versus IMS tax rates', status: 'NOT RUN', note: 'no ims-tax-rates list supplied: the resolution to one IMS rate is NOT checked here (apply-time rail tax-rates, check supplier-tax-rate)' }) : { check: 'supplier purchase tax type versus IMS tax rates', status: 'NOT RUN', note: 'suppliers not supplied' },
     run.has('ims-suppliers') ? { check: 'new supplier names versus suppliers already in IMS', status: 'RAN', note: 'under both importer matching rules' } : { check: 'new supplier names versus suppliers already in IMS', status: 'NOT RUN', note: 'no ims-suppliers list supplied: a collision with an existing IMS supplier is NOT checked (apply-time check lookup-keys-unique-in-ims)' },
     run.has('variant-parents') ? { check: 'variants joined to WooCommerce parents by exact SKU', status: 'RAN', note: 'the parent is the one WooCommerce gives the variation; a SKU stem is only compared, never used' } : { check: 'variants joined to WooCommerce parents by exact SKU', status: 'NOT RUN', note: 'variant-parents not supplied: every Qoblex variant is rejected as VARIANT_WITHOUT_PARENT' },
     run.has('recipe-lines') ? { check: 'recipe graph is acyclic', status: 'RAN', note: 'detectBomItemCycleInEdges over every valid recipe line' } : { check: 'recipe graph is acyclic', status: 'NOT RUN', note: 'recipe-lines not supplied' },

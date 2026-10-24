@@ -86,9 +86,9 @@ async function main(): Promise<void> {
 
   // 5. The real thing, in dependency order. Each result is recorded verbatim.
   await attempt('system:suppliers', () => suppliers.importSuppliersCsv(form([
-    ['name', 'currency', 'email'],
-    [SUPPLIER, 'GBP', 'buyer@example.test'],
-    [`${tag} Second Supplier`, 'GBP', ''],
+    ['name', 'currency', 'email', 'purchaseTaxType'],
+    [SUPPLIER, 'GBP', 'buyer@example.test', 'NONE'],
+    [`${tag} Second Supplier`, 'GBP', '', 'NONE'],
   ]), system))
 
   await attempt('system:products', () => imports.importProductsCsv(form([
