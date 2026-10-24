@@ -413,7 +413,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 contactName: r.contactName?.trim() || null,
                 email: r.email?.trim() || null,
                 phone: r.phone?.trim() || null,
-                currency: r.currency?.trim() || baseCurrency,
+                currency: r.currency?.trim().toUpperCase() || baseCurrency,
                 vatNumber: r.vatNumber?.trim() || null,
                 accountNumber: r.accountNumber?.trim() || null,
                 paymentTermsDays: r.paymentTermsDays ? parseInt(r.paymentTermsDays, 10) : null,

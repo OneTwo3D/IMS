@@ -660,15 +660,20 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       let arms = 0
       const supplierKey = SUPPLIER_A.toLowerCase()
       assert.deepEqual(await diffOf('suppliers', supplierKey), [], 'control')
-      const tax = await m.db.taxRate.findFirstOrThrow({ select: { id: true } })
-      for (const [label, data, restore] of [
-        ['active', { active: false }, { active: true }],
-        ['prepaid', { prepaid: true }, { prepaid: false }],
-        ['default VAT rate', { taxRateId: tax.id }, { taxRateId: null }],
-        ['delivery days', { manualDeliveryDays: 9 }, { manualDeliveryDays: null }],
+      // The default tax rate IS set by the importer now (from purchaseTaxType), so it is compared as a fingerprinted column, not as an importer default: moving the supplier to a
+      // rate with another accounting tax type shows as a `purchaseTaxType` difference. Mutation named: read `taxRateId === null` back as an importer default again -> this arm is red.
+      const loaded = await m.db.supplier.findFirstOrThrow({ where: { name: SUPPLIER_A }, select: { taxRateId: true } })
+      const otherRate = await m.db.taxRate.findFirstOrThrow({ where: { name: VAT_NAME }, select: { id: true } })
+      assert.ok(loaded.taxRateId !== null && loaded.taxRateId !== otherRate.id, 'precondition: the importer set the supplier\'s tax rate, and the other rate is a different one')
+      for (const [label, data, restore, expected] of [
+        ['active', { active: false }, { active: true }, ['importerDefaults']],
+        ['prepaid', { prepaid: true }, { prepaid: false }, ['importerDefaults']],
+        ['default tax rate', { taxRateId: otherRate.id }, { taxRateId: loaded.taxRateId }, ['purchaseTaxType']],
+        ['no default tax rate', { taxRateId: null }, { taxRateId: loaded.taxRateId }, ['purchaseTaxType']],
+        ['delivery days', { manualDeliveryDays: 9 }, { manualDeliveryDays: null }, ['importerDefaults']],
       ] as const) {
         await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: data as never })
-        try { assert.deepEqual(await diffOf('suppliers', supplierKey), ['importerDefaults'], label) } finally { await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: restore as never }) }
+        try { assert.deepEqual(await diffOf('suppliers', supplierKey), expected, label) } finally { await m.db.supplier.updateMany({ where: { name: SUPPLIER_A }, data: restore as never }) }
         arms++
       }
       assert.deepEqual(await diffOf('products', `${TAG}-SIMPLE`), [], 'control')
