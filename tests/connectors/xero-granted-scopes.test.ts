@@ -148,7 +148,7 @@ test('a legacy accounting.transactions grant is NOT reported as missing the gran
   // transactional endpoints. Judging such a connection "missing accounting.payments" would block every
   // payment row that Xero would have accepted — a compatibility outage of our own making.
   const granted = ['openid', 'profile', 'email', 'offline_access', 'accounting.settings',
-    'accounting.contacts', 'accounting.transactions', 'accounting.attachments']
+    'accounting.contacts', 'accounting.transactions', 'accounting.attachments', 'accounting.reports.trialbalance.read']
   assert.deepEqual(missingScopes(granted), [], 'the broad scope covers invoices, payments and journals')
   assert.equal(blockingScopeFor('INVOICE_PAYMENT', granted), null)
   assert.equal(blockingScopeFor('BILL_PAYMENT', granted), null)

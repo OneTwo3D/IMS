@@ -8,6 +8,8 @@ import {
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
+import { getGrantedScopes } from './auth'
+import { blockingScopeForTrialBalance, trialBalanceScopeError } from './scopes'
 import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
 import { xeroTrialBalanceRef } from './account-balance-refs'
 import { XERO_BALANCE_SNAPSHOT_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
@@ -232,6 +234,12 @@ export async function syncXeroAccountBalanceSnapshots(
   // and stored after a rebind would sit in the new organisation's ledger history. Remember the connection
   // BEFORE the fetch; the write below is refused if it moved.
   const connection = await captureXeroConnection()
+  // A recorded grant without the trial-balance scope would 401 AuthorizationUnsuccessful and read as a generic
+  // fetch failure. Refuse first, by name, before any request. Unknown grant (null) fails open.
+  const blockingScope = blockingScopeForTrialBalance(await getGrantedScopes())
+  if (blockingScope) {
+    return { fetched: 0, persisted: 0, skipped: 0, errors: [trialBalanceScopeError(blockingScope)] }
+  }
   const [settings, baseCurrency, xeroBaseCurrency] = await Promise.all([getXeroSettings(), getBaseCurrencyCode(), getXeroBaseCurrency()])
   if (!xeroBaseCurrency) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: ['Could not determine the connected Xero organisation base currency.'] }

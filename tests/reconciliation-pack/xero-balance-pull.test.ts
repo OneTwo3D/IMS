@@ -21,6 +21,7 @@ let chart: Array<{ externalAccountId: string; code: string | null; name: string 
 let trialBalance: unknown = {}
 
 mock.module('@/lib/db', { namedExports: { db: { accountingAccount: { findMany: async () => chart }, setting: { upsert: async () => { throw new Error('outside the fence') } } } } })
+mock.module('@/lib/connectors/xero/auth', { namedExports: { getGrantedScopes: async () => null } })
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/connectors/xero/settings', {
   namedExports: {

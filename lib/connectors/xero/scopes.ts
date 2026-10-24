@@ -38,6 +38,11 @@ export const XERO_REQUESTED_SCOPES = [
   'accounting.payments',
   'accounting.manualjournals',
   'accounting.attachments',
+  // REQUIRED to GET Reports/TrialBalance — the Xero account-balance snapshot (syncXeroAccountBalanceSnapshots),
+  // which the reconciliation pack's as-of basis reads. Without it the call 401s AuthorizationUnsuccessful and no
+  // snapshot row is ever stored. The broad `accounting.reports.read` is rejected as invalid_scope for this app;
+  // this granular scope is the accepted one.
+  'accounting.reports.trialbalance.read',
 ] as const
 
 export const XERO_SCOPE_STRING = XERO_REQUESTED_SCOPES.join(' ')
@@ -53,6 +58,8 @@ export const XERO_SCOPE_STRING = XERO_REQUESTED_SCOPES.join(' ')
 const PAYMENTS = 'accounting.payments'
 const JOURNALS = 'accounting.manualjournals'
 const ATTACHMENTS = 'accounting.attachments'
+/** GET Reports/TrialBalance. Not a queued sync type, so it is checked by name via `blockingScopeForTrialBalance`. */
+export const TRIAL_BALANCE_SCOPE = 'accounting.reports.trialbalance.read'
 
 const SCOPE_BY_SYNC_TYPE: Record<string, string> = {
   // POST /Payments
@@ -181,6 +188,15 @@ export function blockingScopeFor(type: string, granted: string[] | null): string
   return expand(granted).has(required) ? null : required
 }
 
+/**
+ * Can the trial-balance snapshot run on this grant? Returns the missing scope, or null if it can.
+ * Same fail-open rule as `blockingScopeFor`: an unrecorded grant (null) never blocks.
+ */
+export function blockingScopeForTrialBalance(granted: string[] | null): string | null {
+  if (granted === null) return null
+  return expand(granted).has(TRIAL_BALANCE_SCOPE) ? null : TRIAL_BALANCE_SCOPE
+}
+
 /** The message a scope-blocked sync row carries. Recognisable, so the retry path can find these rows. */
 export const SCOPE_RECONSENT_PREFIX = 'REQUIRES RECONNECT'
 
@@ -190,5 +206,14 @@ export function scopeBlockedError(type: string, scope: string): string {
     `${type} needs. The scope was added to the app after this connection was made, and a refreshed token ` +
     `keeps its original grant — so reconnect Xero (Settings → Sync → Xero → Reconnect) to re-consent. ` +
     `Nothing was sent; retry this row after reconnecting.`
+  )
+}
+
+/** What the Xero account-balance snapshot returns when the grant lacks the trial-balance scope. */
+export function trialBalanceScopeError(scope: string = TRIAL_BALANCE_SCOPE): string {
+  return (
+    `${SCOPE_RECONSENT_PREFIX}: this Xero connection was authorised without the "${scope}" scope, which the ` +
+    `Xero account-balance snapshot (Reports/TrialBalance) needs. A refreshed token keeps its original grant — ` +
+    `reconnect Xero (Settings → Sync → Xero → Reconnect) to re-consent. No request was sent to Xero.`
   )
 }
