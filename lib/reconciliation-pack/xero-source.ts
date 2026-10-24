@@ -21,6 +21,10 @@
  * requests (XERO_MIN_REQUEST_INTERVAL_MS). No response body, URL, header or message is kept: what comes out is the validated rows
  * or a closed reason.
  *
+ * TRUST BOUNDARY, stated: R12 trusts that Xero's API returns an invoice's own line items. Omitted lines are caught when the tax or the amounts
+ * of the invoice stop adding up to its totals; a response that omits lines whose tax AND amounts both net to zero is undetectable from one
+ * invoice response (the API gives no independent line count).
+ *
  * LIMITS, stated: the item count is Xero's own claim; there is no second source for it (U7 open: not compared with Xero's screens), so
  * the proof is internal consistency plus the double read. The `where` syntax and the `Statuses` filter are unverified against the
  * live service; the window is asked for widened by a day each side and every row is checked against the filter that was sent, so a
@@ -47,7 +51,7 @@ export interface XeroGetPort {
   get(resource: XeroResource, params: Readonly<Record<string, string>>): Promise<XeroPage>
 }
 
-export type XeroInvoiceLine = { taxType: string; taxAmount: string; accountCode: string | null }
+export type XeroInvoiceLine = { taxType: string; taxAmount: string; lineAmount: string; accountCode: string | null }
 /** `rate` is Xero's CurrencyRate as plain decimal text (Xero's convention, connectors/xero/fx.ts: 1 document-currency = X base, so base = amount times rate; 1 for the base currency). `date` is the invoice date, YYYY-MM-DD. */
 export type XeroInvoiceRow = { id: string; date: string; currency: string; rate: string; lines: XeroInvoiceLine[] }
 
@@ -136,7 +140,7 @@ function parseInvoice(raw: unknown, window: XeroWalkWindow): XeroInvoiceRow {
       if (typeof line.AccountCode !== 'string' || !ACCOUNT_CODE_RE.test(line.AccountCode)) throw new Stop('SOURCE_UNREADABLE')
       accountCode = line.AccountCode
     }
-    return { taxType: line.TaxType, taxAmount: decimalOf(line.TaxAmount, 6), accountCode }
+    return { taxType: line.TaxType, taxAmount: decimalOf(line.TaxAmount, 6), lineAmount: decimalOf(line.LineAmount, 6), accountCode }
   })
   // THE LINES MUST ADD UP TO WHAT THE INVOICE SAYS. Xero's TotalTax is the sum of the lines' TaxAmount (each a plain 2dp amount), and Total is
   // SubTotal (tax excluded) plus TotalTax, in every LineAmountTypes (Exclusive, Inclusive, NoTax): TaxAmount means the tax inside the line in all
@@ -149,6 +153,14 @@ function parseInvoice(raw: unknown, window: XeroWalkWindow): XeroInvoiceRow {
   const total = new Prisma.Decimal(decimalOf(r.Total, 6))
   const linesTax = lines.reduce((sum, line) => sum.add(line.taxAmount), new Prisma.Decimal(0))
   if (!linesTax.eq(totalTax) || !subTotal.add(totalTax).eq(total)) throw new Stop('SOURCE_UNREADABLE')
+  // THE LINE AMOUNTS MUST ADD UP TOO (an independent figure: tax that is hidden by omitting offsetting lines would have to offset in amounts as
+  // well). Exact, as Xero stores them (2dp): Exclusive => SubTotal = sum of LineAmount (LineAmount excludes tax); Inclusive => Total = sum of
+  // LineAmount (LineAmount includes tax); NoTax => SubTotal = Total = sum of LineAmount. NOT checked: LineAmount against Quantity x UnitAmount
+  // less discount - Xero rounds the unit amount, the discount and the product in ways its documentation does not pin to the penny, so it is not
+  // an exact test and a tolerance would be a guess.
+  const linesAmount = lines.reduce((sum, line) => sum.add(line.lineAmount), new Prisma.Decimal(0))
+  const amountsAgree = r.LineAmountTypes === 'Exclusive' ? linesAmount.eq(subTotal) : r.LineAmountTypes === 'Inclusive' ? linesAmount.eq(total) : linesAmount.eq(subTotal) && subTotal.eq(total)
+  if (!amountsAgree) throw new Stop('SOURCE_UNREADABLE')
   if (r.LineAmountTypes === 'NoTax' && !totalTax.isZero()) throw new Stop('SOURCE_UNREADABLE')
   return { id: r.InvoiceID.toLowerCase(), date, currency, rate, lines }
 }

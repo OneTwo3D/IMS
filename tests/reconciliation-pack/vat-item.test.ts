@@ -442,7 +442,7 @@ test('A TAXABLE XERO LINE COUNTS ONLY WITH A PROVEN CLASSIFICATION: no account c
 
 // [mutation: the Xero or WooCommerce reconciliation of an order against its own total removed]
 test('A MISSING VAT AMOUNT CANNOT HIDE: a Xero invoice with TotalTax 20 and no lines, or a store order whose tax lines do not add up to its total_tax, makes the item unreadable, never a pass', async () => {
-  const xero = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(4, '2026-09-25', [], { TotalTax: 20, Total: 520 }), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  const xero = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(4, '2026-09-25', [], { TotalTax: 20, SubTotal: 0, Total: 20 }), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
   assert.deepEqual(reasons(await run(xero.ctx)), ['inconclusive', 'SOURCE_UNREADABLE'])
   assert.equal(xero.woo.calls.length, 0)
   // Woo: an order reports total_tax 20 more than its tax lines (a line was dropped) - and one whose tax lines exceed it.
@@ -450,6 +450,14 @@ test('A MISSING VAT AMOUNT CANNOT HIDE: a Xero invoice with TotalTax 20 and no l
     const woo = standard({ woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00']], { total_tax: (Number(wooTotalTax([[11, '100.00']])) + Number(extra)).toFixed(2) }), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] } })
     assert.deepEqual(reasons(await run(woo.ctx)), ['inconclusive', 'SOURCE_UNREADABLE'], extra)
   }
+})
+
+// [mutation: the line-amount reconciliation removed]
+test('OFFSETTING OMITTED LINES: Xero drops a +10 line on a verified rate and a -10 line on an unverified rate; the tax total still agrees but the amounts do not, so the item is unreadable and cannot pass', async () => {
+  const dropped = invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }], { TotalTax: 60, SubTotal: 150, Total: 210 })
+  const s = standard({ xero: [dropped, invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(s.ctx)), ['inconclusive', 'SOURCE_UNREADABLE'])
+  assert.equal(s.woo.calls.length, 0)
 })
 
 // [mutation: the fee-line tax check removed]

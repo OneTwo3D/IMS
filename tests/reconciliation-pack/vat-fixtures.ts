@@ -84,11 +84,11 @@ export const sale = (period: string, taxRateId: string | null, taxBase: string, 
 type Json = Record<string, unknown>
 export const uuid = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`
 /** `account` defaults to the sales account '200'; null leaves the code off the line. */
-export type XeroLine = { type: string; tax: number; account?: string | null }
+export type XeroLine = { type: string; tax: number; account?: string | null; amount?: number }
 export const invoice = (n: number, date: string, lines: XeroLine[], over: Json = {}): Json => ({
   InvoiceID: uuid(n), Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1, LineAmountTypes: 'Exclusive',
-  TotalTax: Math.round(lines.reduce((sum, line) => sum + line.tax, 0) * 100) / 100, SubTotal: 500, Total: Math.round((500 + lines.reduce((sum, line) => sum + line.tax, 0)) * 100) / 100,
-  LineItems: lines.map((line) => ({ TaxType: line.type, TaxAmount: line.tax, ...(line.account === null ? {} : { AccountCode: line.account ?? '200' }) })), ...over,
+  TotalTax: Math.round(lines.reduce((sum, line) => sum + line.tax, 0) * 100) / 100, SubTotal: lines.reduce((sum, line) => sum + (line.amount ?? 100), 0), Total: Math.round((lines.reduce((sum, line) => sum + (line.amount ?? 100), 0) + lines.reduce((sum, line) => sum + line.tax, 0)) * 100) / 100,
+  LineItems: lines.map((line) => ({ TaxType: line.type, TaxAmount: line.tax, LineAmount: line.amount ?? 100, ...(line.account === null ? {} : { AccountCode: line.account ?? '200' }) })), ...over,
 })
 
 export type XeroCall = { resource: XeroResource; params: Record<string, string> }

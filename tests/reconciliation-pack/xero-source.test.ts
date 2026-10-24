@@ -21,7 +21,7 @@ test('a faithful multi-page walk returns every invoice, normalised, once, after 
   assert.ok(read.ok)
   assert.equal(read.value.total, 5)
   assert.deepEqual(read.value.invoices.map((i) => i.id).sort(), [1, 2, 3, 4, 5].map(uuid).sort())
-  assert.deepEqual(read.value.invoices[0], { id: read.value.invoices[0]!.id, date: '2026-09-10', currency: 'GBP', rate: '1', lines: [{ taxType: 'OUTPUT2', taxAmount: '20', accountCode: '200' }] })
+  assert.deepEqual(read.value.invoices[0], { id: read.value.invoices[0]!.id, date: '2026-09-10', currency: 'GBP', rate: '1', lines: [{ taxType: 'OUTPUT2', taxAmount: '20', lineAmount: '100', accountCode: '200' }] })
   assert.equal(double.calls.length, 6, 'three pages, read twice')
   assert.deepEqual(double.calls.map((c) => c.params.page), ['1', '2', '3', '1', '2', '3'])
 })
@@ -96,10 +96,10 @@ test('THE SECOND SCAN MUST EQUAL THE FIRST: an invoice added, changed in value, 
   }
   const one = [1, 2, 3].map((n) => invoice(n, '2026-09-10', line))
   const cases: Array<[string, XeroTweak]> = [
-    ['a value changed', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 21, AccountCode: '200' }], TotalTax: 21, Total: 521 } : row)))],
+    ['a value changed', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 21, LineAmount: 100, AccountCode: '200' }], TotalTax: 21, Total: 121 } : row)))],
     ['an invoice swapped for another', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, InvoiceID: uuid(99) } : row)))],
     ['a date changed', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, DateString: '2026-09-11T00:00:00' } : row)))],
-    ['a line added', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, LineItems: [...(row.LineItems as unknown[]), { TaxType: 'OUTPUT2', TaxAmount: 0 }] } : row)))],
+    ['a line added', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, LineItems: [...(row.LineItems as unknown[]), { TaxType: 'OUTPUT2', TaxAmount: 0, LineAmount: 0 }] } : row)))],
   ]
   for (const [name, tweak] of cases) assert.deepEqual(await walk(xeroDouble(one, { pageSize: 100, tweak })), { ok: false, reason: 'VENDOR_READ_UNSTABLE' }, name)
   // A second scan with a different count is caught by its own consistency or by the comparison; either way no list.
@@ -138,21 +138,41 @@ test('EVERY INVOICE IS VALIDATED: a row that is not what was asked for is SOURCE
 test('THE LINES MUST ADD UP TO THE INVOICE: TotalTax 20 with no lines, a truncated list, a missing figure, Total != SubTotal + TotalTax, or an unknown LineAmountTypes is SOURCE_UNREADABLE and no list', async () => {
   const bad = (change: Record<string, unknown>) => walk(xeroDouble([invoice(1, '2026-09-10', line, change)]))
   const unreadable = { ok: false, reason: 'SOURCE_UNREADABLE' }
-  assert.deepEqual(await bad({ LineItems: [], TotalTax: 20, Total: 520 }), unreadable, 'tax with no lines')
-  assert.deepEqual(await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 15, AccountCode: '200' }] }), unreadable, 'truncated: lines sum 15, TotalTax 20')
-  assert.deepEqual(await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 25, AccountCode: '200' }] }), unreadable, 'lines exceed TotalTax')
-  assert.deepEqual(await bad({ TotalTax: 20.01, Total: 520.01 }), unreadable, 'off by a penny: exact')
+  const l = (tax: number, amount = 100, account = '200') => ({ TaxType: 'OUTPUT2', TaxAmount: tax, LineAmount: amount, AccountCode: account })
+  // The default invoice: one line, tax 20, amount 100 => SubTotal 100, TotalTax 20, Total 120.
+  assert.deepEqual(await bad({ LineItems: [], TotalTax: 20, SubTotal: 0, Total: 20 }), unreadable, 'tax with no lines')
+  assert.deepEqual(await bad({ LineItems: [l(15)] }), unreadable, 'truncated: lines sum 15, TotalTax 20')
+  assert.deepEqual(await bad({ LineItems: [l(25)] }), unreadable, 'lines exceed TotalTax')
+  assert.deepEqual(await bad({ TotalTax: 20.01, Total: 120.01 }), unreadable, 'off by a penny: exact')
   for (const key of ['TotalTax', 'SubTotal', 'Total', 'LineAmountTypes']) assert.deepEqual(await bad({ [key]: undefined }), unreadable, `${key} missing`)
   assert.deepEqual(await bad({ TotalTax: '20' }), unreadable, 'TotalTax as text')
-  assert.deepEqual(await bad({ Total: 521 }), unreadable, 'Total != SubTotal + TotalTax')
-  assert.deepEqual(await bad({ SubTotal: 499 }), unreadable)
+  assert.deepEqual(await bad({ Total: 121 }), unreadable, 'Total != SubTotal + TotalTax')
+  assert.deepEqual(await bad({ SubTotal: 99 }), unreadable)
   assert.deepEqual(await bad({ LineAmountTypes: 'Weird' }), unreadable)
   assert.deepEqual(await bad({ LineAmountTypes: 'NoTax' }), unreadable, 'NoTax invoice carrying tax')
   // Matching totals: every LineAmountTypes (tax means the tax inside the line in all), several lines, a zero invoice, a NoTax invoice with none.
-  for (const kind of ['Exclusive', 'Inclusive']) assert.ok((await bad({ LineAmountTypes: kind })).ok, kind)
-  assert.ok((await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 12.5, AccountCode: '200' }, { TaxType: 'OUTPUT2', TaxAmount: 7.5, AccountCode: '260' }] })).ok, 'two lines of any accounts add up')
-  assert.ok((await bad({ LineItems: [], TotalTax: 0, Total: 500 })).ok, 'no lines and no tax')
-  assert.ok((await bad({ LineAmountTypes: 'NoTax', LineItems: [{ TaxType: 'NONE', TaxAmount: 0 }], TotalTax: 0, Total: 500 })).ok)
+  assert.ok((await bad({})).ok, 'Exclusive')
+  assert.ok((await bad({ LineAmountTypes: 'Inclusive', LineItems: [l(20, 120)], SubTotal: 100, Total: 120 })).ok, 'Inclusive: LineAmount includes the tax; Total = sum of LineAmount')
+  assert.ok((await bad({ LineItems: [l(12.5, 50), l(7.5, 50, '260')] })).ok, 'two lines of any accounts add up')
+  assert.ok((await bad({ LineItems: [], TotalTax: 0, SubTotal: 0, Total: 0 })).ok, 'no lines and no tax')
+  assert.ok((await bad({ LineAmountTypes: 'NoTax', LineItems: [{ TaxType: 'NONE', TaxAmount: 0, LineAmount: 100 }], TotalTax: 0, Total: 100 })).ok)
+})
+
+// [mutation: the line-amount reconciliation removed, for any one LineAmountTypes / the LineAmount type check removed]
+test('THE LINE AMOUNTS MUST ADD UP TOO: omitted offsetting lines (+10 / -10 of tax) cannot hide unless their amounts offset as well; each LineAmountTypes has its own exact rule', async () => {
+  const bad = (change: Record<string, unknown>) => walk(xeroDouble([invoice(1, '2026-09-10', line, change)]))
+  const unreadable = { ok: false, reason: 'SOURCE_UNREADABLE' }
+  const l = (tax: number, amount: number) => ({ TaxType: 'OUTPUT2', TaxAmount: tax, LineAmount: amount, AccountCode: '200' })
+  // The scenario: the response drops a +10 line on a verified rate and a -10 line on an unverified one. The tax total still agrees; the amounts do not
+  // (the dropped lines carried 50 and -30, so the kept lines sum to 80 against a SubTotal of 100 + ... as Xero states it).
+  assert.deepEqual(await bad({ LineItems: [l(20, 80)], SubTotal: 100, TotalTax: 20, Total: 120 }), unreadable, 'Exclusive: sum of LineAmount 80 against SubTotal 100')
+  assert.deepEqual(await bad({ LineAmountTypes: 'Inclusive', LineItems: [l(20, 110)], SubTotal: 100, TotalTax: 20, Total: 120 }), unreadable, 'Inclusive: sum 110 against Total 120')
+  assert.deepEqual(await bad({ LineAmountTypes: 'NoTax', LineItems: [{ TaxType: 'NONE', TaxAmount: 0, LineAmount: 90 }], SubTotal: 100, TotalTax: 0, Total: 100 }), unreadable, 'NoTax: sum 90 against 100')
+  assert.deepEqual(await bad({ LineItems: [l(20, 100.01)] }), unreadable, 'exact to the penny')
+  assert.deepEqual(await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 20, AccountCode: '200' }] }), { ok: false, reason: 'BAD_VALUE' }, 'LineAmount missing')
+  assert.deepEqual(await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 20, LineAmount: '100', AccountCode: '200' }] }), { ok: false, reason: 'BAD_VALUE' }, 'LineAmount as text')
+  // Offsetting amounts that DO add up are accepted: the tax and the amounts both agree, nothing is detectably missing.
+  assert.ok((await bad({ LineItems: [l(30, 150), l(-10, -50)] })).ok)
 })
 
 test('a transport failure, a non-200 answer or a throwing port on any request is SOURCE_UNREADABLE', async () => {
