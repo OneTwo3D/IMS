@@ -32,7 +32,8 @@
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 
-import { ingestDataset, parseColumnMap, type IngestedDataset } from '@/lib/first-load/ingest'
+import { ingestDataset, parseColumnMap, type DatasetMapping, type IngestedDataset } from '@/lib/first-load/ingest'
+import { parseCsvStrict } from '@/lib/first-load/csv'
 import { PRODUCT_TYPES } from '@/lib/first-load/spec'
 import { idToken, parseSku } from '@/lib/first-load/validate'
 import { QOBLEX_NATIVE_COLUMN_MAP } from '@/lib/reconciliation-pack/qoblex-native-map'
@@ -181,6 +182,50 @@ function fileReader(dir: string): Files {
   }
 }
 
+/** A cell that is already exactly what the pack will compare: nothing the ingest or parseSku would trim, normalise or refuse. */
+const FORBIDDEN_IDENTITY = /[\u0000-\u001f\u007f\u00a0\u200b-\u200d\u2060\ufeff]/
+const identityCellIsCanonical = (cell: string): boolean => cell !== '' && cell === cell.trim() && cell === cell.normalize('NFC') && !FORBIDDEN_IDENTITY.test(cell)
+
+/**
+ * THE IDENTITIES THE PACK COMPARES ARE THE EXACT TEXT OF THE FILE. The ingest trims and NFC-normalises every cell (and upper-cases a warehouse
+ * code), and parseSku does it again, so a SKU written ` A` or in a non-NFC spelling would arrive as `A` and could match a system holding `A`.
+ * The same bytes are therefore read again, raw, and EVERY data row's SKU cell (and, in the canonical layout, warehouse code cell) must already
+ * be canonical: no outer whitespace, already NFC, no control, zero-width or no-break character, and a warehouse code already upper-case. One
+ * that is not makes the part unreadable (IDENTITY_NOT_CANONICAL); nothing is compared in its transformed form. In the native layout the
+ * warehouse code is the pinned map's own, never file text. Quantities and costs are the one thing the ingest may normalise: surrounding
+ * whitespace is dropped, and the value must then be a plain decimal (no locale formatting, comma, exponent or sign other than a minus), so a
+ * padded number has one unambiguous value.
+ */
+function assertRawIdentities(bytes: Uint8Array, dataset: 'stock-lots' | 'products', mapping: DatasetMapping | null): void {
+  let text: string
+  try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { return bad() }
+  const parsed = parseCsvStrict(text, mapping?.delimiter ?? ',')
+  let header = parsed.header
+  let records = parsed.rows
+  if (mapping !== null && mapping.rowsAboveHeader === 1) {
+    if (records.length === 0) return bad()
+    header = records[0]!.cells
+    records = records.slice(1)
+  }
+  header = header.map((name) => name.normalize('NFC').trim())
+  const columns: Array<{ index: number; upper: boolean }> = []
+  const find = (name: string, upper: boolean): void => {
+    const index = header.indexOf(name)
+    if (index < 0 || header.lastIndexOf(name) !== index) return bad()
+    columns.push({ index, upper })
+  }
+  find(mapping === null ? 'sku' : mapping.columns.sku ?? '', false)
+  if (mapping === null && dataset === 'stock-lots') find('warehouseCode', true)
+  for (const record of records) {
+    if (record.cells.length !== header.length) continue
+    if (record.cells.every((cell) => cell.trim() === '')) continue
+    for (const { index, upper } of columns) {
+      const cell = record.cells[index]!
+      if (!identityCellIsCanonical(cell) || (upper && cell !== cell.toUpperCase())) return bad('IDENTITY_NOT_CANONICAL')
+    }
+  }
+}
+
 function ingest(dataset: 'stock-lots' | 'products', spec: PartSpec, files: Files): IngestedDataset {
   const bytes = files.read({ file: spec.file, sha256: spec.sha256 })
   let mapping = null
@@ -193,6 +238,7 @@ function ingest(dataset: 'stock-lots' | 'products', spec: PartSpec, files: Files
     if (mapping === null) return bad()
   }
   const out = ingestDataset(dataset, bytes, spec.file, mapping)
+  assertRawIdentities(bytes, dataset, mapping)
   // Nothing rejected, nothing set aside unaccounted, and not empty: a file that yields no rows says nothing about the stock.
   // EVERY data row is accounted for: none rejected, and the records read are exactly the rows kept. The only map is the native one, which skips
   // nothing and merges nothing. Blank lines are the one thing not counted: a blank line carries no cell, so no stock or product is hidden by it.

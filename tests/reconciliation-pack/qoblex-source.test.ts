@@ -148,8 +148,8 @@ test('a malformed export part is unreadable and returns NO rows: header, row, qu
   assert.equal(stockWith(stockCsv([{ sku: 'SKU-1', location: 'MIL1', qty: 'ten', unitCost: '1' }])), 'BAD_VALUE')
   assert.equal(stockWith(stockCsv([{ sku: 'SKU-1', location: 'MIL1', qty: '1', unitCost: '1' }, { sku: 'SKU-2', location: 'MIL1', qty: 'x', unitCost: '1' }])), 'BAD_VALUE', 'one bad row among good ones: no partial list')
   assert.equal(stockWith(stockCsv([{ sku: 'SKU-1', location: 'ELSEWHERE', qty: '1', unitCost: '1' }])), 'NO_POPULATION_RECORD', 'a location the manifest does not declare')
-  assert.equal(stockWith(stockCsv([{ sku: 'SKU 1​', location: 'MIL1', qty: '1', unitCost: '1' }])), 'BAD_KEY', 'a zero-width character in a SKU')
-  assert.equal(stockWith(stockCsv([{ sku: '', location: 'MIL1', qty: '1', unitCost: '1' }])), 'BAD_KEY', 'an empty SKU')
+  assert.equal(stockWith(stockCsv([{ sku: 'SKU 1​', location: 'MIL1', qty: '1', unitCost: '1' }])), 'IDENTITY_NOT_CANONICAL', 'a zero-width character in a SKU')
+  assert.equal(stockWith(stockCsv([{ sku: '', location: 'MIL1', qty: '1', unitCost: '1' }])), 'IDENTITY_NOT_CANONICAL', 'an empty SKU')
   assert.equal(stockWith(stockCsv([])), 'SOURCE_UNREADABLE', 'a file with no rows says nothing about the stock')
   assert.equal(stockWith(''), 'SOURCE_UNREADABLE')
   assert.equal(stockWith(stockCsv([{ sku: 'SKU-1', location: 'MIL1', qty: '1', unitCost: '1', currency: 'gbp' }])), 'CURRENCY_UNKNOWN')
@@ -248,6 +248,40 @@ test('a column map cannot change what is compared: ONLY the repository\'s native
   }
   // a map declared with a wrong digest is refused earlier, as unreadable; no map at all means the canonical layout (no transform exists)
   assert.equal(partReason(read(writeExport(bases)), 'stock'), 'ok')
+})
+
+// [mutation: assertRawIdentities removed / its trim, NFC, forbidden-character or upper-case test removed]
+test('a SKU or warehouse code the ingest would trim or normalise is IDENTITY_NOT_CANONICAL, never compared in its transformed form (canonical and native layouts)', () => {
+  const stockOf = (sku: string, location = 'MIL1') => stockCsv([{ sku, location, qty: '1', unitCost: '1' }])
+  const reasons = (stock: string, products: string) => { const r = read(writeExport(bases, { stock, products })); return [partReason(r, 'stock'), partReason(r, 'products')] }
+  assert.deepEqual(reasons(stockOf('SKU-1'), productsCsv([{ sku: 'SKU-1' }])), ['ok', 'ok'])
+  const nfd = 'CAFÉ-1'
+  assert.notEqual(nfd, nfd.normalize('NFC'))
+  for (const [label, sku] of [['leading space', ' SKU-1'], ['trailing space', 'SKU-1 '], ['trailing tab', 'SKU-1\t'], ['non-NFC', nfd], ['no-break space inside', 'SKU 1'], ['zero-width', 'SKU​1']] as const) {
+    assert.deepEqual(reasons(stockOf(sku), productsCsv([{ sku }])).map((r, i) => (r === 'ok' ? r : `${i}:${r}`)), ['0:' + 'IDENTITY_NOT_CANONICAL', '1:IDENTITY_NOT_CANONICAL'].map((x) => x), label)
+  }
+  // a lower-case warehouse code would be upper-cased by the ingest and so match the manifest's code
+  assert.equal(partReason(read(writeExport(bases, { stock: stockOf('SKU-1', 'mil1') })), 'stock'), 'IDENTITY_NOT_CANONICAL')
+  assert.equal(partReason(read(writeExport(bases, { stock: stockOf('SKU-1', ' MIL1') })), 'stock'), 'IDENTITY_NOT_CANONICAL')
+  // one bad row among good ones refuses the part
+  assert.equal(partReason(read(writeExport(bases, { stock: stockCsv([{ sku: 'SKU-1', location: 'MIL1', qty: '1', unitCost: '1' }, { sku: ' SKU-2', location: 'MIL1', qty: '1', unitCost: '1' }]) })), 'stock'), 'IDENTITY_NOT_CANONICAL')
+  // a padded number has one value: accepted, trimmed
+  assert.equal(partReason(read(writeExport(bases, { stock: stockCsv([{ sku: 'SKU-1', location: 'MIL1', qty: ' 5 ', unitCost: '1' }]) })), 'stock'), 'ok')
+  // the native layout: the Sku cell of the stock report
+  const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
+  const nativeText = readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')
+  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
+  const locations = ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: code === 'RXT2' }))
+  const native = (csv: string) => read(writeExport(bases, { stock: csv, products: null, locations, extra: { 'map.json': nativeText, 'stock.csv': csv }, patch: (man) => {
+    const ref = { file: 'stock.csv', sha256: sha256(csv), columnMap: { file: 'map.json', sha256: sha256(nativeText) } }
+    man.stock = ref; man.products = ref
+  } }))
+  assert.deepEqual([partReason(native(clean), 'stock'), partReason(native(clean), 'products')], ['ok', 'ok'])
+  assert.ok(clean.includes('"SYN-1001"'))
+  for (const spelling of ['" SYN-1001"', '"SYN-1001 "', '"SYN-1001 "']) {
+    const padded = native(clean.replace('"SYN-1001"', spelling))
+    assert.deepEqual([partReason(padded, 'stock'), partReason(padded, 'products')], ['IDENTITY_NOT_CANONICAL', 'IDENTITY_NOT_CANONICAL'], spelling)
+  }
 })
 
 // [mutation: the shared promise removed so each item reads the export again]

@@ -10,7 +10,7 @@ import type { ImsQueryClient } from '../../lib/reconciliation-pack/ims-readers.t
 import { readPackChain } from '../../lib/reconciliation-pack/trend.ts'
 import { D, fakeBasisPort, goodState, healthyLiveness } from './basis-fixtures.ts'
 import { NOW, allFiles, cleanup, realEvidence, scratchDir } from './helpers.ts'
-import { ASOF, sha256, stockCsv, writeExport } from './qoblex-fixtures.ts'
+import { ASOF, productsCsv, sha256, stockCsv, writeExport } from './qoblex-fixtures.ts'
 import { fakeStore } from './woo-fixtures.ts'
 
 /**
@@ -221,4 +221,33 @@ test('a column map that is not the native one (here one that skips a row kind) c
   r.deps.wmsSkus = async () => ({ ok: true, skus: [] })
   await run(r, args(scratchDir(bases), '--qoblex-export', exportDir, '--vendor-reads-only'))
   for (const id of ['R2', 'R5', 'R14']) assert.equal(line(r, id), `${id} inconclusive COLUMN_MAP_NOT_NATIVE`, id)
+})
+
+// [mutation: assertRawIdentities removed from the source]
+test('END TO END: a whitespace-padded or non-NFC Qoblex SKU can never make R2, R5 or R14 pass against a system holding the plain SKU', async () => {
+  for (const [label, qob] of [['padded', ' SKU-1'], ['trailing', 'SKU-1 '], ['non-NFC', 'SKU-É'.normalize('NFD')]] as const) {
+    const plain = label === 'non-NFC' ? 'SKU-É' : 'SKU-1'
+    const exportDir = writeExport(bases, {
+      stock: stockCsv([{ sku: qob, location: 'MIL1', qty: '10', unitCost: '2.5' }, { sku: 'SKU-2', location: 'CAMBRIDGE', qty: '4', unitCost: '10' }]),
+      products: productsCsv([{ sku: qob }, { sku: 'SKU-2' }]),
+    })
+    const r = rig({ imsSkus: [plain, 'SKU-2'], wooSkus: [plain, 'SKU-2'] })
+    r.deps.wmsSkus = async () => ({ ok: true, skus: [plain, 'SKU-2'] })
+    await run(r, args(scratchDir(bases), '--qoblex-export', exportDir, '--vendor-reads-only'))
+    for (const id of ['R2', 'R5', 'R14']) assert.equal(line(r, id), `${id} inconclusive IDENTITY_NOT_CANONICAL`, `${label} ${id}`)
+  }
+})
+
+// A storefront SKU is compared exactly as the store holds it: no trimming on that leg either.
+test('END TO END: a padded SKU on the storefront leg is a finding, never matched to the plain SKU', async () => {
+  const exportDir = writeExport(bases)
+  const r = rig({ wooSkus: ['SKU-1', 'SKU-2', ' SKU-3'] })
+  r.deps.wmsSkus = async () => ({ ok: true, skus: ['SKU-1', 'SKU-2', 'SKU-3'] })
+  await run(r, args(scratchDir(bases), '--items', 'R14', '--qoblex-export', exportDir, '--vendor-reads-only'))
+  assert.equal(line(r, 'R14'), 'R14 fail DIFFERENCES')
+  // and the warehouse-system list the same
+  const w = rig()
+  w.deps.wmsSkus = async () => ({ ok: true, skus: ['SKU-1', 'SKU-2', 'SKU-3 '] })
+  await run(w, args(scratchDir(bases), '--items', 'R14', '--qoblex-export', exportDir, '--vendor-reads-only'))
+  assert.equal(line(w, 'R14'), 'R14 fail DIFFERENCES')
 })
