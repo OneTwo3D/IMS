@@ -22,7 +22,7 @@ mock.module('@/lib/db', {
       accountingAccountBalanceSnapshot: {
         findFirst: async ({ where }: { where: { balanceDate: { lte: Date } } }) => {
           const d = where.balanceDate.lte.toISOString().slice(0, 10)
-          return d >= closingDate ? { ...snap('c', closingDate, '40'), financialYearEnd: closingYearEnd } : snap('o', '2026-12-31', '900')
+          return d >= closingDate ? { ...snap('c', closingDate, '40'), financialYearEnd: closingYearEnd } : snap('o', new Date(new Date(`${closingDate}T00:00:00.000Z`).getTime() - 86_400_000).toISOString().slice(0, 10), '900')
         },
       },
       accountingToken: { findUnique: async () => ({ tenantId: 't1' }) },

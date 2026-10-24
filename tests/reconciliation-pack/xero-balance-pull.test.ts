@@ -53,6 +53,7 @@ mock.module('@/lib/domain/accounting/account-balance-snapshots', {
   },
 })
 
+const LIVE_META = { ReportID: 'TrialBalance', ReportName: 'Trial Balance', ReportType: 'TrialBalance', ReportTitles: ['Trial Balance', 'One Two Enterprises Ltd', 'As at 19 October 2026'], ReportDate: '20 October 2026' }
 const row = (id: string, label: string, debit: string, credit = '0') => ({ RowType: 'Row', Cells: [{ Value: label, Attributes: [{ Id: 'account', Value: id }] }, { Value: '0' }, { Value: '0' }, { Value: debit }, { Value: credit }] })
 const TB_HEADER = { RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }
 const FULL_CHART = [
@@ -66,7 +67,7 @@ const FULL_CHART = [
 function reset() {
   getCalls = []; cachedCalls = []; persisted = []; stamps = []; unearnedCode = '260'
   chart = FULL_CHART
-  trialBalance = { Reports: [{ Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '200'), row('a-632', '632 - Transit', '50'), row('a-500', '500 - COGS', '75'), row('a-260', '260 - Unearned Revenue', '0', '300')] }] }] }
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '200'), row('a-632', '632 - Transit', '50'), row('a-500', '500 - COGS', '75'), row('a-260', '260 - Unearned Revenue', '0', '300')] }] }] }
 }
 
 async function pull() {
@@ -126,7 +127,7 @@ test('an Unearned Revenue account that is configured but not in the chart stops 
 test('a configured account that a NON-EMPTY Trial Balance omits is stored as a zero labelled absent-from-tb; a reported zero is not', async () => {
   reset()
   // Complete by its own evidence: the rows add up to the Total row (the offsetting credit is on an unconfigured equity account).
-  trialBalance = { Reports: [{ Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75'), row('a-999', '999 - Equity', '0', '1075')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '1075', '1075'].map((Value) => ({ Value })) }] }] }] }
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75'), row('a-999', '999 - Equity', '0', '1075')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '1075', '1075'].map((Value) => ({ Value })) }] }] }] }
   await pull()
   const byCode = new Map(persisted.map((snapshot) => [snapshot.accountCode, snapshot]))
   assert.equal(byCode.get('630')!.sourcePayloadRef, 'xero:trial-balance:2026-10-19')
@@ -139,7 +140,7 @@ test('a configured account that a NON-EMPTY Trial Balance omits is stored as a z
 
 test('an EMPTY Trial Balance synthesises nothing: it is an error, not a set of zeros', async () => {
   reset()
-  trialBalance = { Reports: [{ Rows: [] }] }
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [] }] }
   const result = await pull()
   assert.equal(persisted.length, 0)
   assert.equal(result.persisted, 0)

@@ -89,6 +89,9 @@ function trialBalance(rows: Array<{ id: string; label: string; debit: string }>)
     ok: true,
     data: {
       Reports: [{
+        ReportType: 'TrialBalance',
+        ReportTitles: ['Trial Balance', 'Org', 'As at 7 October 2026'],
+        ReportDate: '8 October 2026',
         Rows: [{ RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }, {
           RowType: 'Section',
           Rows: rows.map((row) => ({

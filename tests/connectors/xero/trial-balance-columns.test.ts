@@ -57,9 +57,11 @@ mock.module('@/lib/domain/accounting/account-balance-snapshots', {
 })
 
 const cells = (...values: string[]) => values.map((Value, i) => (i === 0 ? { Value, Attributes: [{ Id: 'account', Value: `a-${/\((\d+)\)/.exec(Value)![1]}` }] } : { Value }))
+const LIVE_META = { ReportID: 'TrialBalance', ReportName: 'Trial Balance', ReportType: 'TrialBalance', ReportTitles: ['Trial Balance', 'One Two Enterprises Ltd', 'As at 23 October 2026'], ReportDate: '24 October 2026', UpdatedDateUTC: '/Date(1792884279700)/' }
 const header = () => ({ RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) })
 const realReport = (...extra: unknown[]) => ({
   Reports: [{
+    ...LIVE_META,
     ReportName: 'Trial Balance',
     Rows: [
       header(),
@@ -168,7 +170,7 @@ test('a blank-label row carrying a configured account id and a balance stores no
 const acct = (id: string, code: string, status = 'ACTIVE') => ({ AccountID: id, Code: code, Name: `acct ${code}`, Type: 'ASSET', TaxType: 'NONE', Status: status, Class: 'ASSET' })
 const idless = (label: string, ytdDebit: string) => ({ RowType: 'Row', Cells: [{ Value: label }, ...['', '', ytdDebit, ''].map((Value) => ({ Value }))] })
 const withChart = async (accounts: Array<Record<string, unknown>> | null, run: () => Promise<void>) => { chartOverride = accounts; try { await run() } finally { chartOverride = null; chartAfter = null; chartFetchOk = true } }
-const reportWith = (...rows: unknown[]) => ({ Reports: [{ Rows: [header(), { RowType: 'Section', Rows: rows }] }] })
+const reportWith = (...rows: unknown[]) => ({ Reports: [{ ...LIVE_META, Rows: [header(), { RowType: 'Section', Rows: rows }] }] })
 
 test('CURRENT CHART: a code Xero moved to another account is stored under the NEW account\'s id (id-less row), never the stale local one', async () => {
   trialBalance = reportWith(idless('Inventory Control (631)', '500'), idless('Cost of Goods Sold (310)', '5'), idless('Income in Advance (810)', '1'))
@@ -223,6 +225,7 @@ test('CURRENT CHART: the chart fetch is GET-only, failing it stores nothing, and
 const totalRowE2E = (debit: string, credit: string) => ({ RowType: 'SummaryRow', Cells: ['Total', '', '', debit, credit].map((Value) => ({ Value })) })
 const completeReport = (total: unknown) => ({
   Reports: [{
+    ...LIVE_META,
     Rows: [
       header(),
       { RowType: 'Section', Title: 'Revenue', Rows: [{ RowType: 'Row', Cells: cells('Income in Advance (810)', '11.88', '', '', '100.81') }] },
@@ -291,4 +294,45 @@ test('RACE: an unchanged chart across both reads stores everything and the pull 
   const result = await pull()
   assert.deepEqual(result.errors, [])
   assert.equal(chartReads, 2)
+})
+
+// ---- the report must be AS AT the requested date (ReportDate is the generation date and is not read) -----------------------
+const withMeta = (change: (entry: Record<string, unknown>) => void) => {
+  trialBalance = realReport()
+  change((trialBalance as { Reports: Array<Record<string, unknown>> }).Reports[0]!)
+}
+
+test('LIVE SHAPE: ReportDate is the day AFTER the as-at date (generation date) and does not cause a refusal', async () => {
+  withMeta((entry) => { assert.equal(entry.ReportDate, '24 October 2026') })
+  const result = await pull()
+  assert.deepEqual(result.errors, [])
+  assert.equal(persisted.length, 3)
+})
+
+test('DATE: a report as at a different day is refused whole, whatever its other fields say', async () => {
+  withMeta((entry) => { entry.ReportTitles = ['Trial Balance', 'Org', 'As at 22 October 2026'] })
+  const result = await pull()
+  assert.equal(persistCalls, 0)
+  assert.match(result.errors[0]!, /^TB_REPORT_DATE_MISMATCH.*as at 2026-10-22/)
+})
+
+test('DATE: titles without an "As at" line, two of them, or an unreadable one, are refused', async () => {
+  for (const titles of [['Trial Balance', 'Org'], ['Trial Balance', 'As at 23 October 2026', 'As at 23 October 2026'], ['As at 2026-10-23'], ['As at 31 February 2026'], ['As at 23 Octob 2026'], undefined]) {
+    withMeta((entry) => { entry.ReportTitles = titles })
+    const result = await pull()
+    assert.equal(persistCalls, 0, JSON.stringify(titles))
+    assert.match(result.errors[0]!, /^TB_REPORT_DATE_MISMATCH/, JSON.stringify(titles))
+  }
+})
+
+test('DATE: a report that is not a TrialBalance is refused', async () => {
+  withMeta((entry) => { entry.ReportType = 'ProfitAndLoss' })
+  assert.match((await pull()).errors[0]!, /^TB_REPORT_DATE_MISMATCH.*ProfitAndLoss/)
+})
+
+test('DATE: ReportDate matching the request does NOT stand in for a missing or different As-at title', async () => {
+  withMeta((entry) => { entry.ReportDate = '23 October 2026'; entry.ReportTitles = ['Trial Balance', 'Org', 'As at 24 October 2026'] })
+  const result = await pull()
+  assert.equal(persistCalls, 0)
+  assert.match(result.errors[0]!, /^TB_REPORT_DATE_MISMATCH/)
 })

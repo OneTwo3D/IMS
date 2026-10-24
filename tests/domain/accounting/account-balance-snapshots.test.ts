@@ -459,3 +459,19 @@ test('an explicit externalAccountId in the lookup is the intended account (the c
   const movement = await getAccountBalancePeriodMovement({ ...lookup('2026-06-01', '2026-06-30'), accountCode: undefined, externalAccountId: 'cogs-account' }, client as never)
   assert.equal(movement.movementBase.toFixed(2), '-860.00')
 })
+
+// EXACT dates: the latest balance on or before a date is not the balance AT that date.
+test('a closing balance from an EARLIER day is not the closing balance: missing_closing_snapshot (so the on-demand sync runs)', async () => {
+  const client = snapshotClient(windowRows('2026-05-31', '2026-06-29'), { accountType: 'INVENTORY' })
+  await assert.rejects(
+    () => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never),
+    (error) => error instanceof MissingAccountBalanceSnapshotError && error.reason === 'missing_closing_snapshot' && error.requiredBalanceDate === '2026-06-30',
+  )
+})
+
+test('an opening balance from before the day before the window is missing_previous_day_snapshot, and only the exact days are differenced', async () => {
+  const older = snapshotClient(windowRows('2026-05-30', '2026-06-30'), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), older as never), (e) => e instanceof MissingAccountBalanceSnapshotError && e.reason === 'missing_previous_day_snapshot')
+  const exact = snapshotClient(windowRows('2026-05-31', '2026-06-30'), { accountType: 'INVENTORY' })
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), exact as never)).movementBase.toFixed(2), '-860.00')
+})

@@ -12,7 +12,6 @@ import {
 export { balanceDateString, normalizeBalanceDate }
 
 const DAY_MS = 24 * 60 * 60 * 1000
-export const DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS = 1
 
 export type AccountingAccountBalanceSnapshotInput = {
   connector: string
@@ -291,7 +290,7 @@ export async function findLatestConfiguredAccountBalanceSnapshot(
 }
 
 export async function getAccountBalancePeriodMovement(
-  lookup: Omit<AccountBalanceSnapshotLookup, 'balanceDate'> & { dateFrom: Date | string; dateTo: Date | string; maxOpeningStalenessDays?: number },
+  lookup: Omit<AccountBalanceSnapshotLookup, 'balanceDate'> & { dateFrom: Date | string; dateTo: Date | string },
   client: MovementClient = db,
 ): Promise<AccountBalancePeriodMovement> {
   const dateFrom = normalizeBalanceDate(lookup.dateFrom)
@@ -317,9 +316,10 @@ export async function getAccountBalancePeriodMovement(
     findLatestAccountBalanceSnapshot({ ...byId, balanceDate: requiredOpeningDate }, client),
     findLatestAccountBalanceSnapshot({ ...byId, balanceDate: requiredClosingDate }, client),
   ])
-  const maxStalenessDays = lookup.maxOpeningStalenessDays ?? DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS
-  const staleBefore = dateFrom.getTime() - maxStalenessDays * DAY_MS
-  if (!opening || opening.balanceDate.getTime() < staleBefore) {
+  // BOTH balances must be for EXACTLY the dates asked for: the latest balance on or before a date is found by the read above, but
+  // a balance from an earlier day is not the balance at that date (an Oct 23 closing is not the Oct 24 closing). Anything else is
+  // reported as missing, so the caller's on-demand sync (or its withhold path) runs.
+  if (!opening || balanceDateString(opening.balanceDate) !== balanceDateString(requiredOpeningDate)) {
     throw new MissingAccountBalanceSnapshotError({
       reason: 'missing_previous_day_snapshot',
       requiredBalanceDate: requiredOpeningDate,
@@ -330,7 +330,7 @@ export async function getAccountBalancePeriodMovement(
       foundBalanceDate: opening?.balanceDate ?? null,
     })
   }
-  if (!closing) {
+  if (!closing || balanceDateString(closing.balanceDate) !== balanceDateString(requiredClosingDate)) {
     throw new MissingAccountBalanceSnapshotError({
       reason: 'missing_closing_snapshot',
       requiredBalanceDate: requiredClosingDate,
@@ -338,6 +338,7 @@ export async function getAccountBalancePeriodMovement(
       currency: lookup.currency,
       externalAccountId: lookup.externalAccountId,
       accountCode: lookup.accountCode,
+      foundBalanceDate: closing?.balanceDate ?? null,
     })
   }
   // Defence in depth over the id-keyed read above: both rows are the intended account's, from one organisation.

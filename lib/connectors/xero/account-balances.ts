@@ -33,6 +33,9 @@ export type XeroTrialBalanceReport = {
   Reports?: Array<{
     ReportID?: string
     ReportName?: string
+    ReportType?: string
+    ReportTitles?: string[]
+    /** The GENERATION date (the day the report was run), NOT the as-at date: the as-at date is only in ReportTitles. */
     ReportDate?: string
     Rows?: XeroReportRow[]
   }>
@@ -277,6 +280,37 @@ function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: Tr
   return null
 }
 
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+const AS_AT_TITLE = new RegExp(`^As at (\\d{1,2}) (${MONTHS.join('|')}) (\\d{4})$`)
+
+/**
+ * The as-at date a Trial Balance says it is for: the one ReportTitles entry of the form "As at 23 October 2026" (Xero's live shape;
+ * `ReportDate` is the day the report was GENERATED, not the as-at date, and is deliberately not read). ISO date, or null if there
+ * is not exactly one such entry or it is not a real date.
+ */
+export function xeroTrialBalanceAsAtDate(titles: unknown): string | null {
+  if (!Array.isArray(titles)) return null
+  const matches = titles.filter((title): title is string => typeof title === 'string' && AS_AT_TITLE.test(title))
+  if (matches.length !== 1) return null
+  const [, day, month, year] = AS_AT_TITLE.exec(matches[0]!)!
+  const date = new Date(Date.UTC(Number(year), MONTHS.indexOf(month!), Number(day)))
+  if (date.getUTCFullYear() !== Number(year) || date.getUTCMonth() !== MONTHS.indexOf(month!) || date.getUTCDate() !== Number(day)) return null
+  return date.toISOString().slice(0, 10)
+}
+
+/** Null if every report is a Trial Balance as at `balanceDate`; otherwise the named refusal. Amounts are never stamped with a date the report does not state. */
+export function trialBalanceDateProblem(report: XeroTrialBalanceReport, balanceDate: string): string | null {
+  const reports = report.Reports ?? []
+  if (reports.length === 0) return `TB_REPORT_DATE_MISMATCH: the Xero response carries no report, so its as-at date cannot be checked against ${balanceDate}; nothing was stored.`
+  for (const entry of reports) {
+    if (entry.ReportType !== 'TrialBalance') return `TB_REPORT_DATE_MISMATCH: the Xero report is of type ${JSON.stringify(entry.ReportType ?? null)}, not TrialBalance; nothing was stored.`
+    const asAt = xeroTrialBalanceAsAtDate(entry.ReportTitles)
+    if (asAt === null) return `TB_REPORT_DATE_MISMATCH: the Xero report's titles do not carry exactly one readable "As at <day> <month> <year>" line, so the date it is for cannot be confirmed as ${balanceDate}; nothing was stored.`
+    if (asAt !== balanceDate) return `TB_REPORT_DATE_MISMATCH: the Xero report is as at ${asAt} but ${balanceDate} was requested; nothing was stored.`
+  }
+  return null
+}
+
 export function parseXeroTrialBalanceReport(report: XeroTrialBalanceReport): ParsedXeroTrialBalance {
   const output: ParsedXeroTrialBalance = { rows: [], refusedRows: [], reportError: null, completenessUnproven: null }
   for (const entry of report.Reports ?? []) {
@@ -516,6 +550,8 @@ export async function syncXeroAccountBalanceSnapshots(
   const chart = await fetchXeroChartOfAccounts()
   if (!chart.ok) return { fetched: 0, persisted: 0, skipped: 0, errors: [`Failed to fetch the current Xero chart of accounts: ${chart.error}`] }
   const { accounts, errors: chartErrors } = resolveConfiguredAccountsStable([...new Set(requestedCodes)], chartBefore.accounts, chart.accounts)
+  const dateProblem = trialBalanceDateProblem(res.data, balanceDate)
+  if (dateProblem) return { fetched: 0, persisted: 0, skipped: 0, errors: [dateProblem] }
   const parsedTrialBalance = parseXeroTrialBalanceReport(res.data)
   if (parsedTrialBalance.reportError) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: [parsedTrialBalance.reportError] }
