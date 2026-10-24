@@ -1,4 +1,4 @@
-import { Prisma } from '@/app/generated/prisma/client'
+import { Prisma, type PrismaClient } from '@/app/generated/prisma/client'
 import { resolveBaseCurrencyCode } from '@/lib/base-currency'
 
 /**
@@ -78,7 +78,7 @@ export type FxRateRow = {
 /** What the helper needs from a Prisma client or transaction client. `organisation` is only read when no `baseCurrency` is passed. */
 export type FxLookupClient = {
   fxRate: Pick<Prisma.TransactionClient['fxRate'], 'groupBy' | 'findMany'>
-  organisation?: Pick<Prisma.TransactionClient['organisation'], 'findFirst'>
+  organisation?: Pick<PrismaClient['organisation'], 'findFirst'>
 }
 
 const CURRENCY_CODE = /^[A-Z]{3}$/
@@ -135,7 +135,7 @@ function refuse(reason: FxMissingReason, base: string, currency: string, asOf: D
 function toRate(value: unknown): Prisma.Decimal | null {
   try {
     if (value === null || value === undefined || typeof value === 'boolean') return null
-    const d = new Prisma.Decimal(value as Prisma.Decimal.Value)
+    const d = new Prisma.Decimal(value as ConstructorParameters<typeof Prisma.Decimal>[0])
     return d.isFinite() ? d : null
   } catch {
     return null

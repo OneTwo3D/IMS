@@ -477,7 +477,7 @@ test('purchase-order rate-only update re-resolves stored FX rate and persists re
   }
   const db = {
     ...createTransactionalRebaseDb(state),
-    fxRate: fx.fxRate,
+    fxRate: fx.fxRate as never,
   }
 
   const po = await updatePurchaseOrderFxRateOnly(

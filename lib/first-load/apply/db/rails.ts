@@ -228,7 +228,7 @@ async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void>
     if (currency === base) continue
     // The one central lookup, "on or before now". A manifest rate is only ever compared with the stored one.
     // TODO(o3d-q0x56.7): file rates are decided there (accepted or refused); this check then follows that ruling.
-    let stored: D
+    let stored: Dec
     try {
       stored = new D((await getFxRateToBase(db, { currency, asOf: now, baseCurrency: base })).rate.toFixed())
     } catch (error) {
