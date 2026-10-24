@@ -200,3 +200,87 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
   }
 }
 `
+
+/**
+ * THE ONE COLUMN MAP THE PACK ACCEPTS FOR A NATIVE QOBLEX INCOMING-STOCK (open purchase order) EXPORT, for R7 and R8. The same rule as the
+ * stock map above: a manifest may name a column map for its `purchaseOrders` part only if its bytes are EXACTLY this text (the digest is
+ * checked on the bytes read, qoblex-source.ts); the pack parses THIS constant; a test pins it byte for byte to
+ * tests/first-load/fixtures/qoblex-native/maps/qoblex-incoming-stock.map.json, the map the first-load tool is tested with.
+ *
+ * EVERY TRANSFORM IN IT, and why none can change a compared value:
+ *   columns orderKey/supplierName/status/sku/qtyOrdered/qtyReceived/unitCostForeign/supplierRef/expectedDelivery  header renames only.
+ *   constants.destinationWarehouseCode MIL1   the report has no destination column; the pack never reads the warehouse of an order.
+ *   valueMaps.status Approved/PartiallyReceived -> OPEN   the only two statuses the incoming report lists; any other status is not mapped and
+ *                                               the pack refuses a row whose status is not OPEN (BAD_VALUE), it never drops it.
+ *   derived.currency (from the supplier) and derived.fxRateToBase (from the currency), with valueMaps.currency and valueMaps.fxRateToBase:
+ *                                               THE FOREIGN EXCHANGE SOURCE OF THE EXPORT SIDE. The report has no currency or rate column, so the
+ *                                               currency of an order is the one the map gives its supplier, and its rate is the one the map
+ *                                               gives that currency (foreign = base x rate, the first-load tool's convention). These are fixed
+ *                                               rates written into the repository, not market rates, and GBP is the blank rate.
+ *   dateFormats.expectedDelivery              a date format for a column the pack does not read.
+ * LIMITS: the supplier-to-currency and currency-to-rate tables are the first-load tool's tested ones; a supplier or rate that differs in the
+ * real export needs this map changed in the repository, not in an export (an unmapped supplier reads as a currency the ingest refuses, so the
+ * part is unreadable, never guessed). The report carries no line number: a line is identified by its order and SKU.
+ */
+
+export const QOBLEX_NATIVE_PO_COLUMN_MAP = `{
+  "formatVersion": 1,
+  "source": "qoblex",
+  "datasets": {
+    "purchase-order-lines": {
+      "expectedHeaders": [
+        "Product variant",
+        "SKU",
+        "Created on",
+        "Received on",
+        "Due On",
+        "Purchase Order",
+        "Status",
+        "Ordered Quantity",
+        "Received Quantity",
+        "Price",
+        "Discount (%)",
+        "Supplier",
+        "Supplier Reference"
+      ],
+      "columns": {
+        "orderKey": "Purchase Order",
+        "supplierName": "Supplier",
+        "status": "Status",
+        "sku": "SKU",
+        "qtyOrdered": "Ordered Quantity",
+        "qtyReceived": "Received Quantity",
+        "unitCostForeign": "Price",
+        "supplierRef": "Supplier Reference",
+        "expectedDelivery": "Due On"
+      },
+      "constants": {
+        "destinationWarehouseCode": "MIL1"
+      },
+      "derived": {
+        "currency": "supplierName",
+        "fxRateToBase": "currency"
+      },
+      "dateFormats": {
+        "expectedDelivery": "ddd, MMM D YYYY"
+      },
+      "valueMaps": {
+        "status": {
+          "Approved": "OPEN",
+          "PartiallyReceived": "OPEN"
+        },
+        "currency": {
+          "Supplier Alpha": "USD",
+          "Supplier Beta": "GBP",
+          "Supplier Gamma": "EUR"
+        },
+        "fxRateToBase": {
+          "GBP": "",
+          "USD": "1.25",
+          "EUR": "1.15"
+        }
+      }
+    }
+  }
+}
+`
