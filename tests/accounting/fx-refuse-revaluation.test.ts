@@ -86,10 +86,10 @@ const order = (id: string, ref: string, currency: string): Row => ({
 const bill = (id: string, ref: string, currency: string): Row => ({
   id, invoiceNumber: ref, totalForeign: 100, totalBase: 80, fxRateToBase: 1.25, po: { reference: `PO-${ref}`, currency },
 })
-const priorJournal = (id: string, side: 'receivable' | 'payable'): Row => ({
+const priorJournal = (id: string, side: 'receivable' | 'payable', documents?: Array<{ documentId: string; reference: string; currency: string; gainLossBase: number }>): Row => ({
   id, type: 'UNREALISED_FX_JOURNAL', status: 'SYNCED', connector: 'xero',
   payload: {
-    kind: 'revaluation', side, valuationDate: '2026-05-31',
+    kind: 'revaluation', side, valuationDate: '2026-05-31', ...(documents ? { documents } : {}),
     lines: [
       { accountCode: side === 'receivable' ? 'AR' : 'AP', description: 'Unrealised FX', debit: 9, credit: 0 },
       { accountCode: 'UFX', description: 'Unrealised FX', debit: 0, credit: 9 },
@@ -99,9 +99,9 @@ const priorJournal = (id: string, side: 'receivable' | 'payable'): Row => ({
 const amounts = (e: Enqueued) => e.payload.lines.flatMap((l) => [l.debit ?? 0, l.credit ?? 0]).filter((n) => n > 0)
 const posted = (kind: string, side?: string) => state.enqueued.filter((e) => e.payload.kind === kind && (!side || e.payload.side === side))
 
-async function run() {
+async function run(date = DATE) {
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
-  return runArApFxRevaluation({ valuationDate: DATE })
+  return runArApFxRevaluation({ valuationDate: date })
 }
 
 test.beforeEach(() => {
@@ -118,7 +118,7 @@ test.beforeEach(() => {
 
 const USD_OK = () => rate('USD', '1.60', '2026-06-29T12:00:00.000Z')
 
-test('[R1 HIGH] a prior AR journal + one AR document now missing a rate: no reversal, no new AR journal, AP still posts', async () => {
+test('[R1 HIGH, fallback: prior journal with NO per-document record] a prior AR journal + one AR document now missing a rate: no reversal, no new AR journal, AP still posts', async () => {
   state.rates = [USD_OK()]
   state.logs = [priorJournal('prior-ar', 'receivable')]
   state.receivables = [order('so-usd', 'INV-USD', 'USD'), order('so-chf', 'INV-CHF', 'CHF')]
@@ -216,13 +216,13 @@ test('nothing is posted at 1: a missing-rate document that would have shown a 20
   assert.equal(state.enqueued.flatMap(amounts).includes(20), false)
 })
 
-test('an unusable (zero) stored rate withholds the side by its own reason', async () => {
+test('an unusable (zero) stored rate is reported by its own reason (nothing prior to carry, so nothing posts)', async () => {
   state.rates = [rate('USD', '0', '2026-06-29T12:00:00.000Z')]
   state.receivables = [order('so-usd', 'INV-USD', 'USD')]
   const result = await run()
   assert.equal(state.enqueued.length, 0)
   assert.equal(result.skippedNoRate[0]?.reason, 'non_positive_rate')
-  assert.equal(result.withheldSides[0]?.side, 'receivable')
+  assert.equal(result.skippedNoRate[0]?.treatment, 'excluded_not_in_prior')
 })
 
 test('[q0x56.16] the valuation date is a business day: a rate fetched at 09:00 on it is the valuation rate', async () => {
@@ -289,4 +289,96 @@ test('[R2 HIGH] a blocked side is picked up by a rerun once the queue admits it 
   assert.deepEqual(posted('reversal').map((e) => e.payload.sourceEntryId), ['prior-ar'])
   assert.equal(posted('revaluation', 'receivable').length, 1)
   assert.deepEqual(rerun.withheldSides, [])
+})
+
+const DOC = (documentId: string, reference: string, currency: string, gainLossBase: number) => ({ documentId, reference, currency, gainLossBase })
+
+test('[R4 HIGH] A closed, B has no rate: the replacement is B\'s PREVIOUS amount only; A\'s is gone; the prior is fully reversed', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-a', 'INV-A', 'USD', -9), DOC('so-b', 'INV-B', 'CHF', 4)])]
+  state.receivables = [order('so-b', 'INV-B', 'CHF')] // A is no longer open
+  const result = await run()
+
+  assert.deepEqual(posted('reversal').map((e) => [e.payload.side, e.payload.sourceEntryId]), [['receivable', 'prior-ar']], 'the whole prior journal is reversed')
+  const replacement = posted('revaluation', 'receivable')
+  assert.equal(replacement.length, 1)
+  assert.deepEqual(amounts(replacement[0]), [4, 4], 'B\'s previous 4.00 only: A\'s 9.00 no longer sits on the books')
+  assert.match(replacement[0].payload.lines[0].description, /carried forward on INV-B/)
+  // the carried amount is a GAIN of 4: debit the control account, as when it was first posted
+  assert.deepEqual(replacement[0].payload.lines.map((l) => [l.accountCode, l.debit, l.credit]), [['AR', 4, 0], ['UFX', 0, 4]])
+  assert.deepEqual((replacement[0].payload as unknown as { documents: unknown }).documents, [{ documentId: 'so-b', reference: 'INV-B', currency: 'CHF', gainLossBase: 4, carriedForward: true }])
+  assert.deepEqual(result.withheldSides, [])
+  assert.deepEqual(result.skippedNoRate.map((s) => [s.reference, s.treatment, s.carriedGainLossBase]), [['INV-B', 'carried_forward', 4]])
+  assert.equal(result.reversed, 1)
+  assert.equal(result.revalued, 1)
+  assert.match(String(result.reason), /Carried forward unchanged from the previous journal: INV-B/)
+  const logged = state.activity.filter((a) => a.action === 'unrealised_fx_document_skipped_no_rate')
+  assert.equal(logged.length, 1)
+  assert.equal(logged[0].metadata?.treatment, 'carried_forward')
+})
+
+test('[R4 HIGH] a rated document is revalued while an unrated one is carried: the replacement is the sum of both', async () => {
+  state.rates = [USD_OK()]
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-usd', 'INV-USD', 'USD', -1), DOC('so-b', 'INV-B', 'CHF', 4)])]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD'), order('so-b', 'INV-B', 'CHF')]
+  await run()
+  const replacement = posted('revaluation', 'receivable')[0]
+  assert.deepEqual(amounts(replacement).sort((x, y) => x - y), [4, 4, 17.5, 17.5], 'USD at today\'s rate (17.50 loss) + CHF carried (4.00 gain)')
+  const docs = (replacement.payload as unknown as { documents: Array<{ documentId: string; gainLossBase: number; carriedForward?: boolean }> }).documents
+  assert.deepEqual(docs.map((d) => [d.documentId, d.gainLossBase, d.carriedForward ?? false]), [['so-usd', -17.5, false], ['so-b', 4, true]])
+})
+
+test('[R4 HIGH] a skipped document that was NOT in the previous journal contributes nothing and is reported', async () => {
+  state.rates = [USD_OK()]
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-usd', 'INV-USD', 'USD', -1)])]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD'), order('so-new', 'INV-NEW', 'CHF')]
+  const result = await run()
+  assert.deepEqual(amounts(posted('revaluation', 'receivable')[0]), [17.5, 17.5])
+  assert.deepEqual(result.skippedNoRate.map((s) => [s.reference, s.treatment]), [['INV-NEW', 'excluded_not_in_prior']])
+  assert.match(String(result.reason), /left out \(not in the previous journal\): INV-NEW/)
+})
+
+test('[R4 HIGH] B gains a rate on the NEXT run: it is revalued normally, and the carried journal is reversed', async () => {
+  state.logs = [priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 4)])]
+  state.receivables = [order('so-b', 'INV-B', 'CHF')]
+  await run() // carries B forward on 2026-06-30
+  state.rates = [rate('CHF', '1.60', '2026-07-01T09:00:00.000Z')]
+  state.enqueued = []
+  const next = await run('2026-07-01')
+  assert.deepEqual(next.skippedNoRate, [])
+  const reversals = posted('reversal', 'receivable').map((e) => e.payload.sourceEntryId)
+  assert.equal(reversals.length, 1, 'only the carried-forward journal of the 30th is still in force (the original was reversed on the 30th)')
+  assert.notEqual(reversals[0], 'prior-ar')
+  assert.deepEqual(amounts(posted('revaluation', 'receivable')[0]), [17.5, 17.5], 'B at its own new rate')
+  const docs = (posted('revaluation', 'receivable')[0].payload as unknown as { documents: Array<{ carriedForward?: boolean }> }).documents
+  assert.equal(docs[0].carriedForward, undefined)
+})
+
+test('[R4 HIGH] a prior with a document record but an UNROUTABLE source connector cannot be carried: the side is withheld', async () => {
+  const prior = priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 4)])
+  prior.connector = 'quickbooks'
+  state.logs = [prior]
+  state.receivables = [order('so-b', 'INV-B', 'CHF')]
+  const result = await run()
+  assert.equal(state.enqueued.length, 0)
+  assert.equal(result.withheldSides[0]?.reason, 'side_withheld_missing_rate')
+})
+
+test('[R4 HIGH] every revaluation records its per-document amounts in its payload', async () => {
+  state.rates = [USD_OK()]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD')]
+  await run()
+  const docs = (posted('revaluation', 'receivable')[0].payload as unknown as { documents: unknown }).documents
+  assert.deepEqual(docs, [{ documentId: 'so-usd', reference: 'INV-USD', currency: 'USD', gainLossBase: -17.5 }])
+})
+
+test('[R4 HIGH] with two journals still in force the document is carried from the LATEST one that names it', async () => {
+  const older = priorJournal('prior-old', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 4)])
+  const newer = priorJournal('prior-new', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 6)])
+  ;(older.payload as { valuationDate: string }).valuationDate = '2026-04-30'
+  ;(newer.payload as { valuationDate: string }).valuationDate = '2026-05-31'
+  state.logs = [older, newer]
+  state.receivables = [order('so-b', 'INV-B', 'CHF')]
+  await run()
+  assert.deepEqual(posted('reversal').map((e) => e.payload.sourceEntryId).sort(), ['prior-new', 'prior-old'])
+  assert.deepEqual(amounts(posted('revaluation', 'receivable')[0]), [6, 6])
 })
