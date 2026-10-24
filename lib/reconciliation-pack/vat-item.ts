@@ -19,11 +19,17 @@
  *   WooCommerce's tax lines name a rate id that IMS maps (shopping_tax_rate_mappings); a Xero invoice line names a Xero tax type that
  *   exactly one IMS rate carries (accounting_tax_type).
  *
+ *   NETTING. A mapping is judged on every CONSTITUENT non-zero line (an IMS sales line, a Xero invoice line, a WooCommerce tax line), before
+ *   anything is summed: lines that cancel on an unverified rate still make the item unverified. After that check, a verified key that nets to
+ *   zero (after rounding to the penny) is not a key of that system, the same rule on all three sides, so a key that nets to zero in one
+ *   system and has a non-zero value in another is a finding of the leg that sees the difference. Lines on the shipping account are cut
+ *   from Xero before the check on purpose: shipping VAT is out of scope in every system.
+ *
  *   FIGURES. Sales VAT in GBP, SHIPPING VAT EXCLUDED (IMS holds it at order level with no rate; the other two are cut to match): IMS =
  *   the sum of line taxBase (its recorded base amount) of orders by invoice instant, not CANCELLED, not archived (the IMS VAT report's
  *   own population); Xero = the sum of line TaxAmount of AUTHORISED and PAID sales invoices by invoice date, lines on the configured
- *   shipping account left out, a foreign invoice divided by Xero's own CurrencyRate; WooCommerce = the sum of tax-line totals of
- *   orders in processing, completed and refunded by GMT creation date, a non-GBP order divided by the rate IMS recorded on the
+ *   shipping account left out, a foreign invoice multiplied by Xero's own CurrencyRate (1 document-currency = X base: connectors/xero/fx.ts); WooCommerce = the sum of tax-line totals of
+ *   orders in processing, completed and refunded by GMT creation date, a non-GBP order divided by the fxRateToBase (1 base = X foreign) IMS recorded on the
  *   linked order (the storefront records none). Each key is rounded to the penny, half up; a key whose total is zero in a system is not
  *   a key of that system (a key on one side only with a non-zero value is a finding; a zero is provably nothing because every read is
  *   proven complete).
@@ -59,6 +65,7 @@ import {
   type PackReasonCode,
   type PackSourceCode,
 } from '@/lib/reconciliation-pack/constants'
+import { xeroDocumentAmountToBase } from '@/lib/connectors/xero/fx'
 import type { KeyPart } from '@/lib/reconciliation-pack/identity'
 import { classifyPopulation, type ImsRead, type ImsReadOptions, type ImsTaxes, type ImsVat, type PopulationBoundaries, type TaxRateRow, type XeroTaxRateStore } from '@/lib/reconciliation-pack/ims-readers'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
@@ -256,9 +263,11 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
     const amount = parseDecimalStrict(row.taxBase)
     if (amount === null) return inconclusive([LEDGER], 'BAD_VALUE')
     imsRows += 1
-    if (amount.isZero()) continue
+    // VERIFICATION IS DECIDED ON THE CONSTITUENT LINES, never on what they net to: a +x and a -x line on an unverified rate sum to zero and
+    // would otherwise vanish. Any non-zero line (the reader counts them) on a rate with no verified place makes the item unverified.
     const place = catalogue.place(row.taxRateId)
-    if (place === null) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
+    if ((row.nonZeroLines > 0 || !amount.isZero()) && place === null) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
+    if (place === null) continue
     add(imsSums, { period: row.period, ...place }, amount)
   }
   // The storefront's rate ids resolve through IMS's own mapping rows.
@@ -290,7 +299,7 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
       const owner = catalogue.ownerOf(line.taxType)
       const place = owner === null ? null : catalogue.place(owner)
       if (place === null) return inconclusive([LEDGER, XERO], 'VAT_MAPPING_UNVERIFIED')
-      add(xeroSums, { period, ...place }, invoice.currency === VAT_BASE_CURRENCY ? amount : amount.div(D(invoice.rate)))
+      add(xeroSums, { period, ...place }, invoice.currency === VAT_BASE_CURRENCY ? amount : xeroDocumentAmountToBase(amount, invoice.rate))
     }
   }
 

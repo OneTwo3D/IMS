@@ -35,14 +35,14 @@ const read = async (answers: Answers, vatWindow: { from: string; toExclusive: st
 test('the section carries the base currency, the monthly sales tax per rate, the Xero report types, the shipping account and the foreign order rates', async () => {
   const { section, client } = await read({
     orgs: [{ base: 'GBP' }],
-    sales: [{ period: '2026-08', rate_id: 'rGB', tax: '50.0000', n: '2' }, { period: '2026-09', rate_id: 'rGB', tax: '100.0000', n: '3' }, { period: '2026-09', rate_id: null, tax: '0.0000', n: '1' }],
+    sales: [{ period: '2026-08', rate_id: 'rGB', tax: '50.0000', n: '2', nz: '2' }, { period: '2026-09', rate_id: 'rGB', tax: '100.0000', n: '3', nz: '3' }, { period: '2026-09', rate_id: null, tax: '0.0000', n: '1', nz: '0' }],
     types: [{ tax_type: 'OUTPUT2', report: 'OUTPUT' }, { tax_type: 'NONE', report: null }],
     settings: [{ key: 'xero_shipping_account', value: ' 260 ' }],
     fx: [{ external_id: '9001', currency: 'EUR', fx: '1.15000000' }],
   })
   assert.deepEqual(section, { ok: true, value: {
     baseCurrency: 'GBP', window: WINDOW,
-    sales: [{ period: '2026-08', taxRateId: 'rGB', taxBase: '50.0000', lines: 2 }, { period: '2026-09', taxRateId: 'rGB', taxBase: '100.0000', lines: 3 }, { period: '2026-09', taxRateId: null, taxBase: '0.0000', lines: 1 }],
+    sales: [{ period: '2026-08', taxRateId: 'rGB', taxBase: '50.0000', lines: 2, nonZeroLines: 2 }, { period: '2026-09', taxRateId: 'rGB', taxBase: '100.0000', lines: 3, nonZeroLines: 3 }, { period: '2026-09', taxRateId: null, taxBase: '0.0000', lines: 1, nonZeroLines: 0 }],
     xeroTenantId: 'tenant-1', xeroReportTypes: [{ taxType: 'OUTPUT2', reportTaxType: 'OUTPUT' }, { taxType: 'NONE', reportTaxType: null }], shippingAccount: '260', wooFx: [{ externalOrderId: '9001', currency: 'EUR', fxRateToBase: '1.15000000' }],
   } })
   // The window is a parameter of the sales statement, and the statement leaves out cancelled and archived orders (the IMS VAT report's own population).
@@ -75,13 +75,14 @@ test('THE WINDOW IS REQUIRED AND MUST BE A WINDOW: none, a bad date, or an empty
 // [mutation: the period or amount parsing loosened / the uniqueness check removed]
 test('a row that cannot be read exactly makes the whole section unreadable: a bad period, a non-decimal tax, a repeated (period, rate), a bad count, a bad Xero type', async () => {
   const cases: Array<[string, Answers, string]> = [
-    ['period shape', { sales: [{ period: '2026-8', rate_id: 'r', tax: '1.0000', n: '1' }] }, 'SOURCE_UNREADABLE'],
-    ['period month', { sales: [{ period: '2026-13', rate_id: 'r', tax: '1.0000', n: '1' }] }, 'SOURCE_UNREADABLE'],
-    ['tax not a decimal', { sales: [{ period: '2026-09', rate_id: 'r', tax: '1e3', n: '1' }] }, 'BAD_VALUE'],
-    ['tax a number', { sales: [{ period: '2026-09', rate_id: 'r', tax: 5, n: '1' }] }, 'BAD_VALUE'],
-    ['repeated key', { sales: [{ period: '2026-09', rate_id: 'r', tax: '1.0000', n: '1' }, { period: '2026-09', rate_id: 'r', tax: '2.0000', n: '1' }] }, 'DUPLICATE_KEY'],
-    ['repeated null rate', { sales: [{ period: '2026-09', rate_id: null, tax: '1.0000', n: '1' }, { period: '2026-09', rate_id: null, tax: '2.0000', n: '1' }] }, 'DUPLICATE_KEY'],
-    ['count', { sales: [{ period: '2026-09', rate_id: 'r', tax: '1.0000', n: 'many' }] }, 'BAD_VALUE'],
+    ['period shape', { sales: [{ period: '2026-8', rate_id: 'r', tax: '1.0000', n: '1', nz: '1' }] }, 'SOURCE_UNREADABLE'],
+    ['period month', { sales: [{ period: '2026-13', rate_id: 'r', tax: '1.0000', n: '1', nz: '1' }] }, 'SOURCE_UNREADABLE'],
+    ['tax not a decimal', { sales: [{ period: '2026-09', rate_id: 'r', tax: '1e3', n: '1', nz: '1' }] }, 'BAD_VALUE'],
+    ['tax a number', { sales: [{ period: '2026-09', rate_id: 'r', tax: 5, n: '1', nz: '1' }] }, 'BAD_VALUE'],
+    ['repeated key', { sales: [{ period: '2026-09', rate_id: 'r', tax: '1.0000', n: '1', nz: '1' }, { period: '2026-09', rate_id: 'r', tax: '2.0000', n: '1', nz: '1' }] }, 'DUPLICATE_KEY'],
+    ['repeated null rate', { sales: [{ period: '2026-09', rate_id: null, tax: '1.0000', n: '1', nz: '1' }, { period: '2026-09', rate_id: null, tax: '2.0000', n: '1', nz: '1' }] }, 'DUPLICATE_KEY'],
+    ['non-zero count', { sales: [{ period: '2026-09', rate_id: 'r', tax: '1.0000', n: '1', nz: 'x' }] }, 'BAD_VALUE'],
+    ['count', { sales: [{ period: '2026-09', rate_id: 'r', tax: '1.0000', n: 'many', nz: '0' }] }, 'BAD_VALUE'],
     ['xero type', { types: [{ tax_type: 'OUT PUT', report: 'OUTPUT' }] }, 'SOURCE_UNREADABLE'],
     ['xero report', { types: [{ tax_type: 'OUTPUT2', report: 5 }] }, 'SOURCE_UNREADABLE'],
     ['xero duplicate', { types: [{ tax_type: 'OUTPUT2', report: 'OUTPUT' }, { tax_type: 'OUTPUT2', report: 'OUTPUT' }] }, 'DUPLICATE_KEY'],
@@ -103,7 +104,7 @@ test('no connected organisation: no Xero report types are read at all and the te
 })
 
 test('the row cap is a section failure, never a shorter list', async () => {
-  const client = fake({ sales: [{ period: '2026-09', rate_id: 'a', tax: '1.0000', n: '1' }, { period: '2026-09', rate_id: 'b', tax: '1.0000', n: '1' }] })
+  const client = fake({ sales: [{ period: '2026-09', rate_id: 'a', tax: '1.0000', n: '1', nz: '1' }, { period: '2026-09', rate_id: 'b', tax: '1.0000', n: '1', nz: '1' }] })
   const result = await readImsSnapshot(client, { sections: ['vat'], vatWindow: WINDOW, rowCap: 1 })
   assert.ok(result.ok)
   assert.deepEqual(result.sections.vat, { ok: false, reason: 'CAP_EXCEEDED' })

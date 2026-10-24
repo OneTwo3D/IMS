@@ -292,15 +292,17 @@ function parseOrderTax(raw: unknown): WooOrderTaxRow {
   const iso = `${created as string}.000Z`
   if (Number.isNaN(Date.parse(iso)) || new Date(iso).toISOString() !== iso) throw new Stop('SOURCE_UNREADABLE')
   if (!Array.isArray(r.tax_lines) || r.tax_lines.length > 200) throw new Stop('SOURCE_UNREADABLE')
-  const sums = new Map<string, Prisma.Decimal>()
+  // EVERY tax line stays a line (in the order the store gave them): lines of one rate that cancel are not merged here, because the caller
+  // judges each non-zero line's mapping before anything is summed.
+  const taxes: Array<{ rateId: string; tax: string }> = []
   for (const entry of r.tax_lines) {
     const line = record(entry)
     const rateId = rowId(line.rate_id)
     const tax = line.tax_total
     if (typeof tax !== 'string' || parseDecimalStrict(tax) === null) throw new Stop('BAD_VALUE')
-    sums.set(rateId, (sums.get(rateId) ?? new Prisma.Decimal(0)).add(tax))
+    taxes.push({ rateId, tax: new Prisma.Decimal(tax).isZero() ? '0' : new Prisma.Decimal(tax).toFixed() })
   }
-  return { id: rowId(r.id), status, currency: r.currency as string, createdAt: iso, taxes: [...sums].map(([rateId, tax]) => ({ rateId, tax: tax.isZero() ? '0' : tax.toFixed() })).sort((x, y) => (BigInt(x.rateId) < BigInt(y.rateId) ? -1 : 1)) }
+  return { id: rowId(r.id), status, currency: r.currency as string, createdAt: iso, taxes }
 }
 
 const PLAIN_DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/

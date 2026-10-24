@@ -71,7 +71,7 @@ export function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; im
   }
 }
 
-export const sale = (period: string, taxRateId: string | null, taxBase: string, lines = 1): VatSalesRow => ({ period, taxRateId, taxBase, lines })
+export const sale = (period: string, taxRateId: string | null, taxBase: string, lines = 1, nonZeroLines?: number): VatSalesRow => ({ period, taxRateId, taxBase, lines, nonZeroLines: nonZeroLines ?? (/^-?0+(\.0+)?$/.test(taxBase) ? 0 : lines) })
 
 // ---- Xero double ------------------------------------------------------------------------------
 

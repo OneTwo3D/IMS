@@ -113,7 +113,8 @@ export type WmsBindingRow = { connector: string; warehouseId: string; warehouseC
  * recorded rate of every storefront-linked order not in the base currency (base amount = foreign amount / rate), the only rate
  * WooCommerce's figures can be put in the base currency by.
  */
-export type VatSalesRow = { period: string; taxRateId: string | null; taxBase: string; lines: number }
+/** `taxBase` is the SUM; `nonZeroLines` counts the lines whose own tax is not zero (lines of opposite sign cancel in the sum, not in the count). */
+export type VatSalesRow = { period: string; taxRateId: string | null; taxBase: string; lines: number; nonZeroLines: number }
 export type VatXeroReportTypeRow = { taxType: string; reportTaxType: string | null }
 export type VatOrderFxRow = { externalOrderId: string; currency: string; fxRateToBase: string }
 export type ImsVat = {
@@ -464,11 +465,11 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const orgs = await tx.query('SELECT "baseCurrency" AS base FROM organisations ORDER BY id')
     if (orgs.length > 1) throw new Unreadable('DUPLICATE_KEY')
     const baseCurrency = orgs.length === 0 ? 'GBP' : text(orgs[0]!.base, 'CURRENCY_UNKNOWN')
-    const salesRows = await readCapped(tx, `SELECT to_char(so."invoicedAt", 'YYYY-MM') AS period, l."taxRateId" AS rate_id, SUM(l."taxBase")::text AS tax, COUNT(*)::text AS n FROM sales_order_lines l JOIN sales_orders so ON so.id = l."orderId" WHERE so."invoicedAt" >= $1::date AND so."invoicedAt" < $2::date AND so.status::text <> 'CANCELLED' AND so.archived = false GROUP BY 1, 2 ORDER BY 1, 2`, [window.from, window.toExclusive])
+    const salesRows = await readCapped(tx, `SELECT to_char(so."invoicedAt", 'YYYY-MM') AS period, l."taxRateId" AS rate_id, SUM(l."taxBase")::text AS tax, COUNT(*)::text AS n, (COUNT(*) FILTER (WHERE l."taxBase" <> 0))::text AS nz FROM sales_order_lines l JOIN sales_orders so ON so.id = l."orderId" WHERE so."invoicedAt" >= $1::date AND so."invoicedAt" < $2::date AND so.status::text <> 'CANCELLED' AND so.archived = false GROUP BY 1, 2 ORDER BY 1, 2`, [window.from, window.toExclusive])
     const sales = salesRows.map((row): VatSalesRow => {
       const period = text(row.period, 'SOURCE_UNREADABLE')
       if (!/^[0-9]{4}-(?:0[1-9]|1[0-2])$/.test(period)) throw new Unreadable('SOURCE_UNREADABLE')
-      return { period, taxRateId: textOrNull(row.rate_id), taxBase: decimal(row.tax), lines: count(row.n) }
+      return { period, taxRateId: textOrNull(row.rate_id), taxBase: decimal(row.tax), lines: count(row.n), nonZeroLines: count(row.nz) }
     })
     unique(sales, (row) => `${row.period}\u0001${row.taxRateId ?? ''}`)
     const tokens = await tx.query(`SELECT "tenantId" AS tenant FROM accounting_tokens WHERE connector = 'xero'`)

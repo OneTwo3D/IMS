@@ -235,6 +235,47 @@ test('U8 on the vendor sides: Xero VAT on a type no single IMS rate carries, on 
   assert.deepEqual(reasons(await run(zeroUnknown.ctx)), ['pass'])
 })
 
+// [mutation: verification decided on the aggregate / zero lines skipped before the mapping check / Woo lines merged in the reader]
+test('NETTING: a +x and a -x line on an UNVERIFIED rate cancel to zero but are still two non-zero lines: VAT_MAPPING_UNVERIFIED in IMS, in Xero and in WooCommerce, with matching verified keys beside them', async () => {
+  // IMS: the reader reports the sum (0.00) and counts two non-zero lines.
+  const ims = standard({ ims: { sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-08', 'rGB', '50.00', 2), sale('2026-09', 'rDE', '0.00', 2, 2)] } })
+  assert.deepEqual(reasons(await run(ims.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  assert.deepEqual([ims.xero.calls.length, ims.woo.calls.length], [0, 0])
+  // An unmapped rate (no rate at all) too.
+  const none = standard({ ims: { sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-08', 'rGB', '50.00', 2), sale('2026-09', null, '0.00', 2, 2)] } })
+  assert.deepEqual(reasons(await run(none.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // Xero: two lines of the OSS type, +4 and -4, in one invoice.
+  const xero = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 100 }, { type: 'MOSS1', tax: 4 }, { type: 'MOSS1', tax: -4 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(xero.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // Xero: two unknown-type lines that cancel across two invoices.
+  const unknown = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 100 }, { type: 'TAX999', tax: 3 }]), invoice(2, '2026-09-06', [{ type: 'TAX999', tax: -3 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(unknown.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // WooCommerce: +2 and -2 on the OSS rate in ONE order (the reader must not merge them), and on an unmapped rate id.
+  const wooOss = standard({ woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00'], [13, '2.00'], [13, '-2.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] } })
+  assert.deepEqual(reasons(await run(wooOss.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  const wooUnmapped = standard({ woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00'], [99, '2.00'], [99, '-2.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] } })
+  assert.deepEqual(reasons(await run(wooUnmapped.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+})
+
+// [mutation: the zero-key drop made one-sided]
+test('NETTING of VERIFIED keys is one rule on all three sides: a key that nets to zero from non-zero lines is not a key; against a non-zero value elsewhere it is a finding, against nothing it is equal', async () => {
+  // IE nets to zero in IMS (+5, -5) and in Xero (+3, -3): equal, no key. Woo has no IE line.
+  const allZero = standard({
+    ims: { sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-08', 'rGB', '50.00', 2), sale('2026-09', 'rIE', '0.00', 2, 2)] },
+    xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 100 }, { type: 'OUTPUT9', tax: 3 }, { type: 'OUTPUT9', tax: -3 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
+  })
+  assert.deepEqual(reasons(await run(allZero.ctx)), ['pass'])
+  // IE nets to zero in IMS but Xero holds a real +5: the Xero legs see an onlyVendor / onlyIms difference.
+  const differ = standard({
+    ims: { sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-08', 'rGB', '50.00', 2), sale('2026-09', 'rIE', '0.00', 2, 2)] },
+    xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 100 }, { type: 'OUTPUT9', tax: 5 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
+  })
+  const item = await run(differ.ctx)
+  assert.equal(item.outcome, 'fail')
+  assert.deepEqual(keys(item, 'onlyVendor'), ['ims-xero|2026-09|IE|domestic'])
+  assert.deepEqual(keys(item, 'onlyIms'), ['xero-woo|2026-09|IE|domestic'])
+})
+
 test('the stored Xero list must be PROVEN and be the organisation whose report types were read beside it, else VENDOR_LIST_UNPROVEN before any request', async () => {
   const unproven = standard({ ims: { store: { state: 'unproven', cause: 'DIGEST_MISMATCH' } } })
   assert.deepEqual(reasons(await run(unproven.ctx)), ['inconclusive', 'VENDOR_LIST_UNPROVEN'])
@@ -259,23 +300,27 @@ test('BASE CURRENCY: an IMS or Xero base currency other than GBP compares nothin
   assert.deepEqual([xero.xero.calls.length, xero.woo.calls.length], [1, 0], 'only the organisation read was made')
 })
 
-// [mutation: the foreign amount not divided by the rate / the wrong rate used]
-test('FX: a foreign Xero invoice is put in GBP by Xero\'s own CurrencyRate and a foreign Woo order by the rate IMS recorded on the linked order (foreign per GBP)', async () => {
+// [mutation: Xero's rate divided instead of multiplied / the Woo rate multiplied instead of divided]
+test('FX: a foreign Xero invoice is put in GBP by MULTIPLYING Xero\'s CurrencyRate (1 document-currency = X base, connectors/xero/fx.ts) and a foreign Woo order by DIVIDING the fxRateToBase IMS recorded (1 base = X foreign)', async () => {
+  // A realistic EUR order. IMS records fxRateToBase 1.25 (1 GBP = 1.25 EUR); the connector posts Xero CurrencyRate 1/1.25 = 0.8 (GBP per EUR).
+  // EUR 50 of VAT is GBP 40 in all three places.
   const s = standard({
     xero: [
       invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]),
-      invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 1.25 }),
+      invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 0.8 }),
       invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }]),
     ],
-    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '60.00']]), wooOrder(102, '2026-09-21T10:00:00', [[11, '48.00']], { currency: 'EUR' }), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
-    ims: { wooFx: [{ externalOrderId: '102', currency: 'EUR', fxRateToBase: '1.2' }] },
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '60.00']]), wooOrder(102, '2026-09-21T10:00:00', [[11, '50.00']], { currency: 'EUR' }), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+    ims: { wooFx: [{ externalOrderId: '102', currency: 'EUR', fxRateToBase: '1.25' }] },
   })
-  // Xero: 60 + 50/1.25 = 100.00; Woo: 60 + 48/1.2 = 100.00; IMS 100.00.
   assert.deepEqual(reasons(await run(s.ctx)), ['pass'])
-  const wrong = standard({ ...{ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 1.5 }), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] } })
-  const item = await run(wrong.ctx)
+  // The reversed calculation (EUR 50 at 1.25 treated as GBP per EUR) gives GBP 62.50, not 40: a finding, never a pass.
+  const reversed = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 1.25 }), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  const item = await run(reversed.ctx)
   assert.equal(item.outcome, 'fail')
   assert.deepEqual(keys(item, 'bothDiffer').sort(), ['ims-xero|2026-09|GB|domestic', 'xero-woo|2026-09|GB|domestic'])
+  const entry = item.entries!.bothDiffer!.find((e) => e.key === 'ims-xero|2026-09|GB|domestic')!
+  assert.equal(entry.vendor, '122.5', '60 + 50 x 1.25')
 })
 
 test('FX: a foreign Woo order with no linked IMS rate, a different currency, or a non-positive rate is CURRENCY_UNKNOWN; a foreign zero-tax order needs none', async () => {

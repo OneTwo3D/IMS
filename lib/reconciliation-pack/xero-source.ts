@@ -48,7 +48,7 @@ export interface XeroGetPort {
 }
 
 export type XeroInvoiceLine = { taxType: string; taxAmount: string; accountCode: string | null }
-/** `rate` is Xero's CurrencyRate as plain decimal text (foreign units per one base unit; 1 for the base currency). `date` is the invoice date, YYYY-MM-DD. */
+/** `rate` is Xero's CurrencyRate as plain decimal text (Xero's convention, connectors/xero/fx.ts: 1 document-currency = X base, so base = amount times rate; 1 for the base currency). `date` is the invoice date, YYYY-MM-DD. */
 export type XeroInvoiceRow = { id: string; date: string; currency: string; rate: string; lines: XeroInvoiceLine[] }
 
 export type XeroSourceOptions = {

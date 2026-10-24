@@ -36,11 +36,12 @@ test('the tax lines of every order of every status, each status walked twice; on
   assert.ok(plain.calls.every((c) => c.params._fields === 'id,status,currency,total,date_created_gmt' && c.params.after === undefined))
 })
 
-test('two tax lines of one rate are summed into one; the lines are sorted by rate id', async () => {
-  const double = wooDouble({ processing: [wooOrder(1, '2026-09-10T09:30:00', [[12, '1.10'], [11, '2.20'], [12, '0.05']])] })
+// [mutation: lines of one rate merged in the reader]
+test('EVERY TAX LINE STAYS A LINE: two lines of one rate (even +x and -x) are carried separately, in the store\'s order, never merged', async () => {
+  const double = wooDouble({ processing: [wooOrder(1, '2026-09-10T09:30:00', [[12, '1.10'], [11, '2.20'], [12, '-1.10']])] })
   const result = await read(double, ['processing'])
   assert.ok(result.ok)
-  assert.deepEqual(result.value.orders[0]!.taxes, [{ rateId: '11', tax: '2.2' }, { rateId: '12', tax: '1.15' }])
+  assert.deepEqual(result.value.orders[0]!.taxes, [{ rateId: '12', tax: '1.1' }, { rateId: '11', tax: '2.2' }, { rateId: '12', tax: '-1.1' }])
 })
 
 // [mutation: the second sweep removed / compared by count]
