@@ -296,13 +296,22 @@ function parseOrderTax(raw: unknown): WooOrderTaxRow {
   // EVERY tax line stays a line (in the order the store gave them): lines of one rate that cancel are not merged here, because the caller
   // judges each non-zero line's mapping before anything is summed.
   const taxes: Array<{ rateId: string; tax: string }> = []
+  let partsTotal = new Prisma.Decimal(0)
   for (const entry of r.tax_lines) {
     const line = record(entry)
     const rateId = rowId(line.rate_id)
     const tax = line.tax_total
     if (typeof tax !== 'string' || parseDecimalStrict(tax) === null) throw new Stop('BAD_VALUE')
+    // The shipping share of the line is not carried (R12 leaves shipping out) but it is part of the order's total_tax, so it is read to reconcile.
+    const shipping = line.shipping_tax_total
+    if (typeof shipping !== 'string' || parseDecimalStrict(shipping) === null) throw new Stop('BAD_VALUE')
+    partsTotal = partsTotal.add(tax).add(shipping)
     taxes.push({ rateId, tax: new Prisma.Decimal(tax).isZero() ? '0' : new Prisma.Decimal(tax).toFixed() })
   }
+  // THE PARTS MUST ADD UP TO THE ORDER'S OWN FIGURE: total_tax is the sum of every tax line's tax_total and shipping_tax_total. An order whose
+  // lines were dropped, truncated or not reported (tax missing from tax_lines) does not reconcile and is unreadable, never a partial figure.
+  if (typeof r.total_tax !== 'string' || parseDecimalStrict(r.total_tax) === null) throw new Stop('SOURCE_UNREADABLE')
+  if (!partsTotal.eq(r.total_tax)) throw new Stop('SOURCE_UNREADABLE')
   if (!Array.isArray(r.fee_lines) || r.fee_lines.length > 200) throw new Stop('SOURCE_UNREADABLE')
   let feeTaxLines = 0
   for (const entry of r.fee_lines) {
@@ -324,7 +333,7 @@ export async function readWooOrderTaxes(
   try {
     if (!Array.isArray(statuses) || statuses.length === 0 || new Set(statuses).size !== statuses.length || !statuses.every((s) => typeof s === 'string' && STATUS_RE.test(s))) return { ok: false, reason: 'UNKNOWN_STATUS' }
     if (!PLAIN_DATE_RE.test(window.after) || !PLAIN_DATE_RE.test(window.before) || window.after >= window.before) return { ok: false, reason: 'BAD_MODE' }
-    const swept = await doubleSweep(makeWalker(port, options), statuses, { after: window.after, before: window.before, _fields: 'id,status,currency,date_created_gmt,tax_lines,fee_lines' }, parseOrderTax)
+    const swept = await doubleSweep(makeWalker(port, options), statuses, { after: window.after, before: window.before, _fields: 'id,status,currency,date_created_gmt,total_tax,tax_lines,fee_lines' }, parseOrderTax)
     return { ok: true, value: { orders: swept.orders, totals: swept.totals } }
   } catch (error) {
     return { ok: false, reason: reasonOf(error) }

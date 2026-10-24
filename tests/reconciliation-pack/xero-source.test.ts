@@ -96,7 +96,7 @@ test('THE SECOND SCAN MUST EQUAL THE FIRST: an invoice added, changed in value, 
   }
   const one = [1, 2, 3].map((n) => invoice(n, '2026-09-10', line))
   const cases: Array<[string, XeroTweak]> = [
-    ['a value changed', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 21 }] } : row)))],
+    ['a value changed', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 21, AccountCode: '200' }], TotalTax: 21, Total: 521 } : row)))],
     ['an invoice swapped for another', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, InvoiceID: uuid(99) } : row)))],
     ['a date changed', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, DateString: '2026-09-11T00:00:00' } : row)))],
     ['a line added', sweepB((rows) => rows.map((row, i) => (i === 0 ? { ...row, LineItems: [...(row.LineItems as unknown[]), { TaxType: 'OUTPUT2', TaxAmount: 0 }] } : row)))],
@@ -132,6 +132,27 @@ test('EVERY INVOICE IS VALIDATED: a row that is not what was asked for is SOURCE
   await reason('a tax amount with seven places', { LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 0.1234567 }] }, 'BAD_VALUE')
   await reason('an account code with a space', { LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 1, AccountCode: '2 60' }] }, 'SOURCE_UNREADABLE')
   assert.ok((await bad({})).ok, 'the unmodified row is accepted')
+})
+
+// [mutation: the TotalTax reconciliation removed / loosened / the SubTotal+TotalTax check removed / LineAmountTypes unchecked]
+test('THE LINES MUST ADD UP TO THE INVOICE: TotalTax 20 with no lines, a truncated list, a missing figure, Total != SubTotal + TotalTax, or an unknown LineAmountTypes is SOURCE_UNREADABLE and no list', async () => {
+  const bad = (change: Record<string, unknown>) => walk(xeroDouble([invoice(1, '2026-09-10', line, change)]))
+  const unreadable = { ok: false, reason: 'SOURCE_UNREADABLE' }
+  assert.deepEqual(await bad({ LineItems: [], TotalTax: 20, Total: 520 }), unreadable, 'tax with no lines')
+  assert.deepEqual(await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 15, AccountCode: '200' }] }), unreadable, 'truncated: lines sum 15, TotalTax 20')
+  assert.deepEqual(await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 25, AccountCode: '200' }] }), unreadable, 'lines exceed TotalTax')
+  assert.deepEqual(await bad({ TotalTax: 20.01, Total: 520.01 }), unreadable, 'off by a penny: exact')
+  for (const key of ['TotalTax', 'SubTotal', 'Total', 'LineAmountTypes']) assert.deepEqual(await bad({ [key]: undefined }), unreadable, `${key} missing`)
+  assert.deepEqual(await bad({ TotalTax: '20' }), unreadable, 'TotalTax as text')
+  assert.deepEqual(await bad({ Total: 521 }), unreadable, 'Total != SubTotal + TotalTax')
+  assert.deepEqual(await bad({ SubTotal: 499 }), unreadable)
+  assert.deepEqual(await bad({ LineAmountTypes: 'Weird' }), unreadable)
+  assert.deepEqual(await bad({ LineAmountTypes: 'NoTax' }), unreadable, 'NoTax invoice carrying tax')
+  // Matching totals: every LineAmountTypes (tax means the tax inside the line in all), several lines, a zero invoice, a NoTax invoice with none.
+  for (const kind of ['Exclusive', 'Inclusive']) assert.ok((await bad({ LineAmountTypes: kind })).ok, kind)
+  assert.ok((await bad({ LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: 12.5, AccountCode: '200' }, { TaxType: 'OUTPUT2', TaxAmount: 7.5, AccountCode: '260' }] })).ok, 'two lines of any accounts add up')
+  assert.ok((await bad({ LineItems: [], TotalTax: 0, Total: 500 })).ok, 'no lines and no tax')
+  assert.ok((await bad({ LineAmountTypes: 'NoTax', LineItems: [{ TaxType: 'NONE', TaxAmount: 0 }], TotalTax: 0, Total: 500 })).ok)
 })
 
 test('a transport failure, a non-200 answer or a throwing port on any request is SOURCE_UNREADABLE', async () => {

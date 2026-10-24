@@ -381,7 +381,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
   const xeroSeen: Array<{ method: string; url: string; authorization: string | undefined; tenant: string | undefined }> = []
   const wooSeen: Array<{ method: string; url: string }> = []
   let xeroTax = [60, 40]
-  const invoice = (n: number, date: string, tax: number) => ({ InvoiceID: `00000000-0000-4000-8000-0000000000${String(n).padStart(2, '0')}`, Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: tax, AccountCode: '200' }] })
+  const invoice = (n: number, date: string, tax: number) => ({ InvoiceID: `00000000-0000-4000-8000-0000000000${String(n).padStart(2, '0')}`, Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1, LineAmountTypes: 'Exclusive', TotalTax: tax, SubTotal: 500, Total: Math.round((500 + tax) * 100) / 100, LineItems: [{ TaxType: 'OUTPUT2', TaxAmount: tax, AccountCode: '200' }] })
   const send = (res: import('node:http').ServerResponse, body: unknown, headers: Record<string, string> = {}) => { res.writeHead(200, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(body)) }
   const xeroServer = http.createServer((req, res) => {
     xeroSeen.push({ method: req.method ?? '', url: req.url ?? '', authorization: req.headers.authorization, tenant: req.headers['xero-tenant-id'] as string | undefined })
@@ -393,7 +393,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     }
     res.writeHead(404); res.end('{}')
   })
-  const order = (id: number, created: string, tax: string) => ({ id, status: 'processing', currency: 'GBP', date_created_gmt: created, fee_lines: [], tax_lines: [{ id: 1, rate_id: 7001, tax_total: tax, shipping_tax_total: '1.00' }] })
+  const order = (id: number, created: string, tax: string) => ({ id, status: 'processing', currency: 'GBP', date_created_gmt: created, fee_lines: [], total_tax: (Number(tax) + 1).toFixed(2), tax_lines: [{ id: 1, rate_id: 7001, tax_total: tax, shipping_tax_total: '1.00' }] })
   const wooServer = http.createServer((req, res) => {
     wooSeen.push({ method: req.method ?? '', url: req.url ?? '' })
     const url = new URL(req.url ?? '/', 'http://x')

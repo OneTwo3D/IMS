@@ -86,7 +86,8 @@ export const uuid = (n: number): string => `00000000-0000-4000-8000-${String(n).
 /** `account` defaults to the sales account '200'; null leaves the code off the line. */
 export type XeroLine = { type: string; tax: number; account?: string | null }
 export const invoice = (n: number, date: string, lines: XeroLine[], over: Json = {}): Json => ({
-  InvoiceID: uuid(n), Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1,
+  InvoiceID: uuid(n), Type: 'ACCREC', Status: 'AUTHORISED', DateString: `${date}T00:00:00`, CurrencyCode: 'GBP', CurrencyRate: 1, LineAmountTypes: 'Exclusive',
+  TotalTax: Math.round(lines.reduce((sum, line) => sum + line.tax, 0) * 100) / 100, SubTotal: 500, Total: Math.round((500 + lines.reduce((sum, line) => sum + line.tax, 0)) * 100) / 100,
   LineItems: lines.map((line) => ({ TaxType: line.type, TaxAmount: line.tax, ...(line.account === null ? {} : { AccountCode: line.account ?? '200' }) })), ...over,
 })
 
@@ -116,8 +117,10 @@ export function xeroDouble(invoices: Json[], options: { pageSize?: number; baseC
 
 export type WooCall = { collection: string; params: Record<string, string> }
 export type WooTweak = (call: WooCall, n: number, page: Extract<WooPage, { ok: true }>) => WooPage | undefined
+/** The order's total_tax as the store reports it: every tax line's tax_total plus its shipping_tax_total (the double puts 99.00 of shipping tax on each line). */
+export const wooTotalTax = (taxes: Array<[number, string]>): string => (taxes.reduce((sum, [, total]) => sum + Math.round((Number(total) + 99) * 100), 0) / 100).toFixed(2)
 export const wooOrder = (id: number, created: string, taxes: Array<[number, string]>, over: Json = {}): Json => ({
-  id, status: 'processing', currency: 'GBP', date_created_gmt: created, fee_lines: [], tax_lines: taxes.map(([rateId, total]) => ({ id: rateId * 10, rate_id: rateId, tax_total: total, shipping_tax_total: '99.00' })), ...over,
+  id, status: 'processing', currency: 'GBP', date_created_gmt: created, fee_lines: [], total_tax: wooTotalTax(taxes), tax_lines: taxes.map(([rateId, total]) => ({ id: rateId * 10, rate_id: rateId, tax_total: total, shipping_tax_total: '99.00' })), ...over,
 })
 export function wooDouble(orders: Record<string, Json[]>, tweak?: WooTweak): WooGetPort & { calls: WooCall[] } {
   const calls: WooCall[] = []

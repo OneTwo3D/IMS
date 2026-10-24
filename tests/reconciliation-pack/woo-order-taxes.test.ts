@@ -25,7 +25,7 @@ test('the tax lines of every order of every status, each status walked twice; on
   assert.deepEqual(result.value.totals, [{ status: 'processing', total: 2 }, { status: 'completed', total: 1 }])
   assert.equal(double.calls.length, 4)
   for (const call of double.calls) {
-    assert.equal(call.params._fields, 'id,status,currency,date_created_gmt,tax_lines,fee_lines')
+    assert.equal(call.params._fields, 'id,status,currency,date_created_gmt,total_tax,tax_lines,fee_lines')
     assert.deepEqual([call.params.after, call.params.before], [WINDOW.after, WINDOW.before])
     assert.ok(!JSON.stringify(call.params).includes('shipping'))
   }
@@ -82,7 +82,7 @@ test('EVERY ORDER IS VALIDATED: no date, a bad date, an unknown currency, a tax 
   assert.deepEqual(await bad({ status: 'completed' }), { ok: false, reason: 'SOURCE_UNREADABLE' }, 'asked for processing, got completed')
   const ok = await bad({})
   assert.ok(ok.ok)
-  const none = await bad({ tax_lines: [] })
+  const none = await bad({ tax_lines: [], total_tax: '0.00' })
   assert.ok(none.ok && none.value.orders[0]!.taxes.length === 0)
 })
 
@@ -94,6 +94,19 @@ test('THE BUDGET IS HARD and every status is a walk of its own: the request over
     assert.equal(double.calls.length, budget)
   }
   assert.ok((await read(wooDouble(orders), ['processing', 'completed'], { budget: 4 })).ok)
+})
+
+// [mutation: the total_tax reconciliation removed / shipping_tax_total ignored]
+test('THE PARTS MUST ADD UP TO THE ORDER: total_tax equals every line\'s tax_total plus shipping_tax_total; a dropped line, a missing figure or a malformed one is refused whole', async () => {
+  const one = (change: Record<string, unknown>) => read(wooDouble({ processing: [wooOrder(1, '2026-09-10T09:30:00', [[11, '10.00'], [12, '5.00']], change)] }), ['processing'])
+  assert.ok((await one({})).ok, 'matching totals (10 + 5 plus 99 + 99 of shipping tax = 213)')
+  assert.deepEqual(await one({ total_tax: '212.00' }), { ok: false, reason: 'SOURCE_UNREADABLE' }, 'short by 1')
+  assert.deepEqual(await one({ total_tax: '15.00' }), { ok: false, reason: 'SOURCE_UNREADABLE' }, 'shipping tax is part of total_tax')
+  assert.deepEqual(await one({ tax_lines: [{ id: 1, rate_id: 11, tax_total: '10.00', shipping_tax_total: '99.00' }] }), { ok: false, reason: 'SOURCE_UNREADABLE' }, 'a line dropped')
+  assert.deepEqual(await one({ total_tax: undefined }), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await one({ total_tax: 213 }), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await one({ total_tax: '2,14' }), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await one({ tax_lines: [{ id: 1, rate_id: 11, tax_total: '10.00' }] }), { ok: false, reason: 'BAD_VALUE' }, 'no shipping_tax_total')
 })
 
 test('the statuses and the window are validated before any request', async () => {

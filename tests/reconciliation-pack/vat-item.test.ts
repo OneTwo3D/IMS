@@ -4,7 +4,7 @@ import test from 'node:test'
 import { R12_CLOSE_LAG_DAYS, R12_VERIFIED_CATEGORIES, getPackItem, itemNeedsVendor } from '../../lib/reconciliation-pack/constants.ts'
 import { R12_LEGS, r12ClosedPeriods, runVatItem } from '../../lib/reconciliation-pack/vat-item.ts'
 import {
-  BOUNDARIES, MAPPINGS, noSleep, REPORT_TYPES, R_DE_OSS, R_GB, R_IE, TENANT, binding, invoice, provenStore, rate, sale, standard, wooOrder, type ImsFixture,
+  BOUNDARIES, wooTotalTax, MAPPINGS, noSleep, REPORT_TYPES, R_DE_OSS, R_GB, R_IE, TENANT, binding, invoice, provenStore, rate, sale, standard, wooOrder, type ImsFixture,
 } from './vat-fixtures.ts'
 
 /**
@@ -390,7 +390,7 @@ test('SHIPPING VAT IS OUT: Xero lines on the configured shipping account are not
     xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT2', tax: 1.5, account: '260' }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40, account: '200' }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
   })
   assert.deepEqual(reasons(await run(s.ctx)), ['pass'])
-  assert.ok(s.woo.calls.every((c) => c.params._fields === 'id,status,currency,date_created_gmt,tax_lines,fee_lines'))
+  assert.ok(s.woo.calls.every((c) => c.params._fields === 'id,status,currency,date_created_gmt,total_tax,tax_lines,fee_lines'))
   // The standard double puts 99.00 of SHIPPING tax on every Woo tax line: counting it would have failed the pass above.
 })
 
@@ -438,6 +438,18 @@ test('A TAXABLE XERO LINE COUNTS ONLY WITH A PROVEN CLASSIFICATION: no account c
   const noSales = standard({ ims: { salesAccount: '' } })
   assert.deepEqual(reasons(await run(noSales.ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
   assert.deepEqual([noSales.xero.calls.length, noSales.woo.calls.length], [0, 0])
+})
+
+// [mutation: the Xero or WooCommerce reconciliation of an order against its own total removed]
+test('A MISSING VAT AMOUNT CANNOT HIDE: a Xero invoice with TotalTax 20 and no lines, or a store order whose tax lines do not add up to its total_tax, makes the item unreadable, never a pass', async () => {
+  const xero = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(4, '2026-09-25', [], { TotalTax: 20, Total: 520 }), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  assert.deepEqual(reasons(await run(xero.ctx)), ['inconclusive', 'SOURCE_UNREADABLE'])
+  assert.equal(xero.woo.calls.length, 0)
+  // Woo: an order reports total_tax 20 more than its tax lines (a line was dropped) - and one whose tax lines exceed it.
+  for (const extra of ['20.00', '-20.00']) {
+    const woo = standard({ woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00']], { total_tax: (Number(wooTotalTax([[11, '100.00']])) + Number(extra)).toFixed(2) }), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] } })
+    assert.deepEqual(reasons(await run(woo.ctx)), ['inconclusive', 'SOURCE_UNREADABLE'], extra)
+  }
 })
 
 // [mutation: the fee-line tax check removed]

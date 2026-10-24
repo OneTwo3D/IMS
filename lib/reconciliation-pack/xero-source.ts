@@ -138,6 +138,18 @@ function parseInvoice(raw: unknown, window: XeroWalkWindow): XeroInvoiceRow {
     }
     return { taxType: line.TaxType, taxAmount: decimalOf(line.TaxAmount, 6), accountCode }
   })
+  // THE LINES MUST ADD UP TO WHAT THE INVOICE SAYS. Xero's TotalTax is the sum of the lines' TaxAmount (each a plain 2dp amount), and Total is
+  // SubTotal (tax excluded) plus TotalTax, in every LineAmountTypes (Exclusive, Inclusive, NoTax): TaxAmount means the tax inside the line in all
+  // three, and NoTax lines carry none. Checked exactly, on ALL the returned lines before any cut or classification; an invoice that is missing a
+  // figure or does not add up (lines dropped from the page, a truncated list, an invoice-level adjustment) is unreadable, never a partial figure.
+  for (const key of ['TotalTax', 'SubTotal', 'Total'] as const) if (typeof r[key] !== 'number') throw new Stop('SOURCE_UNREADABLE')
+  if (r.LineAmountTypes !== 'Exclusive' && r.LineAmountTypes !== 'Inclusive' && r.LineAmountTypes !== 'NoTax') throw new Stop('SOURCE_UNREADABLE')
+  const totalTax = new Prisma.Decimal(decimalOf(r.TotalTax, 6))
+  const subTotal = new Prisma.Decimal(decimalOf(r.SubTotal, 6))
+  const total = new Prisma.Decimal(decimalOf(r.Total, 6))
+  const linesTax = lines.reduce((sum, line) => sum.add(line.taxAmount), new Prisma.Decimal(0))
+  if (!linesTax.eq(totalTax) || !subTotal.add(totalTax).eq(total)) throw new Stop('SOURCE_UNREADABLE')
+  if (r.LineAmountTypes === 'NoTax' && !totalTax.isZero()) throw new Stop('SOURCE_UNREADABLE')
   return { id: r.InvoiceID.toLowerCase(), date, currency, rate, lines }
 }
 
