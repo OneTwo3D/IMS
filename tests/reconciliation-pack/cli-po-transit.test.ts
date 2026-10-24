@@ -21,14 +21,17 @@ const cuid = (n: number) => `c${String(n).padStart(24, '0')}`
 type Rig = { sent: string[]; out: string[]; err: string[]; deps: Partial<PackCliDeps> }
 function rig(over: { orders?: Array<Record<string, unknown>>; lines?: Array<Record<string, unknown>>; net?: Array<Record<string, unknown>> } = {}): Rig {
   const r: Rig = { sent: [], out: [], err: [], deps: {} }
-  const orders = over.orders ?? [{ id: cuid(1), reference: 'QBX-PO1', status: 'PO_SENT', currency: 'GBP', created: '2026-09-02T10:00:00.000Z' }]
+  const orders = over.orders ?? [{ id: cuid(1), reference: 'QBX-PO1', status: 'PO_SENT', currency: 'GBP', discount: '0', created: '2026-09-02T10:00:00.000Z' }]
   const lines = over.lines ?? [{ id: cuid(11), po_id: cuid(1), sku: 'SKU-1', qty: '6', received: '0', cost: '2.5' }, { id: cuid(12), po_id: cuid(1), sku: 'SKU-2', qty: '3', received: '0', cost: '10' }]
   const client: ImsQueryClient = {
     async query(sql) {
       r.sent.push(sql)
       if (/pg_current_snapshot/.test(sql)) return { rows: [{ snapshot: '10:20:', read_only: 'on', isolation: 'repeatable read' }] }
       if (/pg_control_system/.test(sql)) return { rows: [{ sid: SID, db: 'ims' }] }
+      if (/FROM first_load_apply_runs/.test(sql) && /run_id/.test(sql)) return { rows: [{ run_id: 'run-1', status: 'VERIFIED', created: String(lines.length) }] }
       if (/FROM first_load_apply_runs/.test(sql)) return { rows: [{ status: 'VERIFIED', cut: '2026-10-01T00:00:00.000Z' }] }
+      if (/FROM activity_logs/.test(sql)) return { rows: orders.map((o) => ({ id: o.id })) }
+      if (/count\(\*\)::text/.test(sql) && /purchase_order_lines/.test(sql)) return { rows: [{ n: String(lines.length) }] }
       if (/FROM settings WHERE key = \$1/.test(sql)) return { rows: [{ value: '2026-01-01' }] }
       if (/FROM transit_subledger_movements/.test(sql)) return { rows: over.net ?? [{ po_id: cuid(1), source_type: 'PURCHASE_BILL', net: '50' }] }
       if (/po\.type::text = 'GOODS'/.test(sql) && !/purchase_order_lines/.test(sql)) return { rows: orders }
@@ -125,7 +128,7 @@ test('nothing in any output carries a path, a file name, a URL, a credential or 
 // [mutation: the new identity kind unknown to the report reader's token screen]
 test('an order number the identity screen digests (it contains a credential-ish word) still publishes, reads back through the chain reader and is never printed', async () => {
   const dir = scratchDir(bases)
-  const r = rig({ orders: [{ id: cuid(1), reference: 'QBX-PO-KEY-1', status: 'PO_SENT', currency: 'GBP', created: '2026-09-02T10:00:00.000Z' }], lines: [{ id: cuid(11), po_id: cuid(1), sku: 'SKU-1', qty: '6', received: '0', cost: '2.5' }] })
+  const r = rig({ orders: [{ id: cuid(1), reference: 'QBX-PO-KEY-1', status: 'PO_SENT', currency: 'GBP', discount: '0', created: '2026-09-02T10:00:00.000Z' }], lines: [{ id: cuid(11), po_id: cuid(1), sku: 'SKU-1', qty: '6', received: '0', cost: '2.5' }] })
   const csv = incomingCsv([{ po: 'PO-KEY-1', sku: 'SKU-1', ordered: '10', received: '4', price: '2.5' }])
   assert.equal(await run(r, args(dir, 'P2', 'R7,R8', '--qoblex-export', exportWith(csv))), 5)
   assert.equal(line(r, 'R7'), 'R7 pass -')

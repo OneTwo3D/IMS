@@ -54,7 +54,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'firstLoadProvenance'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -146,7 +146,16 @@ export type ImsVat = {
  * was created). `currency` is the order's own currency. Read whole (a cap is CAP_EXCEEDED), in the snapshot of the other sections.
  */
 export type PoLineRow = { id: string; sku: string; qty: string; qtyReceived: string; unitCostBase: string }
-export type PoRow = { id: string; reference: string; status: string; currency: string; createdAt: string; lines: PoLineRow[] }
+export type PoRow = { id: string; reference: string; status: string; currency: string; createdAt: string; /** The order-level discount (PurchaseOrder.discountAmount, in the order's currency; 0 when none). */ discount: string; lines: PoLineRow[] }
+/**
+ * WHICH PURCHASE ORDERS THE FIRST LOAD CREATED, from what IMS RECORDED (never from a reference's prefix, never from the export). The first-load apply runner
+ * creates each order through createPurchaseOrder with a system-actor context, and that function writes an activity-log row (entity PURCHASE_ORDER,
+ * entity id = the order's id, action `created`) whose metadata carries `actor: {kind: 'system', runId, operator}` (app/actions/purchase-orders.ts, lib/first-load/apply/system-import-capability.ts
+ * withSystemActor). `runId` is the run record's `run_id`. So: `runId`, `status` and `journalCreated` (the run record's purchase-orders step: lines created) come from
+ * first_load_apply_runs; `attributed` is the id of every order carrying that run's system-actor creation row, and `attributedLines` the lines those orders hold now.
+ * The activity log has a retention sweep, so a pruned row would make an order look native: the item compares `attributedLines` with `journalCreated`.
+ */
+export type FirstLoadProvenance = { runId: string; status: string; journalCreated: number | null; attributed: string[]; attributedLines: number }
 /**
  * The central exchange-rate table (fx_rates, fed by lib/currencies/fx-refresh.ts): 1 unit of the base currency (GBP) = `rate` units of
  * `currency`, as fetched at `fetchedAt`. Every row from the base currency is read (a cap is CAP_EXCEEDED); nothing is picked here: the item
@@ -186,6 +195,7 @@ export type ImsSectionValues = {
   purchaseOrders: PoRow[]
   transitSchedule: ImsTransitSchedule
   fxRates: FxRateRow[]
+  firstLoadProvenance: FirstLoadProvenance | null
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -574,8 +584,8 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
 
   async purchaseOrders(tx) {
     const statuses = [...INCOMING_PO_STATUSES].map(String)
-    const rows = await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.currency, ${UTC('po."createdAt"')} AS created FROM purchase_orders po WHERE po.type::text = 'GOODS' AND po.status::text = ANY($1::text[]) ORDER BY po.id`, [statuses])
-    const orders = rows.map((row): PoRow => ({ id: text(row.id), reference: text(row.reference), status: oneOf(row.status, statuses), currency: text(row.currency, 'CURRENCY_UNKNOWN'), createdAt: text(row.created, 'SOURCE_UNREADABLE'), lines: [] }))
+    const rows = await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.currency, po."discountAmount"::text AS discount, ${UTC('po."createdAt"')} AS created FROM purchase_orders po WHERE po.type::text = 'GOODS' AND po.status::text = ANY($1::text[]) ORDER BY po.id`, [statuses])
+    const orders = rows.map((row): PoRow => ({ id: text(row.id), reference: text(row.reference), status: oneOf(row.status, statuses), currency: text(row.currency, 'CURRENCY_UNKNOWN'), createdAt: text(row.created, 'SOURCE_UNREADABLE'), discount: decimal(row.discount), lines: [] }))
     unique(orders, (order) => order.id)
     unique(orders, (order) => order.reference)
     const byId = new Map(orders.map((order) => [order.id, order]))
@@ -590,6 +600,20 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       order.lines.push(line)
     }
     return orders
+  },
+
+  async firstLoadProvenance(tx) {
+    const runs = await tx.query(`SELECT run_id, status, steps->'purchase-orders'->>'created' AS created FROM first_load_apply_runs`)
+    if (runs.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    if (runs.length === 0) return null
+    const runId = text(runs[0]!.run_id, 'SOURCE_UNREADABLE')
+    const status = oneOf(runs[0]!.status, FIRST_LOAD_RUN_STATUSES)
+    const journalCreated = runs[0]!.created === null || runs[0]!.created === undefined ? null : count(runs[0]!.created)
+    const rows = await readCapped(tx, `SELECT "entityId" AS id FROM activity_logs WHERE "entityType"::text = 'PURCHASE_ORDER' AND action = 'created' AND metadata->'actor'->>'kind' = 'system' AND metadata->'actor'->>'runId' = $1 AND "entityId" IS NOT NULL ORDER BY "entityId"`, [runId])
+    const attributed = rows.map((row) => text(row.id))
+    unique(attributed, (id) => id)
+    const lines = attributed.length === 0 ? [{ n: '0' }] : await tx.query(`SELECT count(*)::text AS n FROM purchase_order_lines WHERE "poId" = ANY($1::text[])`, [attributed])
+    return { runId, status, journalCreated, attributed, attributedLines: count(lines[0]!.n) }
   },
 
   async fxRates(tx) {

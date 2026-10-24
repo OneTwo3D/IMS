@@ -15,12 +15,12 @@
  *        test at P1: nothing IMS sends may reach them. R10 is decided at P1; at P2 IMS posts by design, so (b) cannot be the
  *        claim there and the item reports NO_RUNNER rather than a pass on half of it.
  *
- *   R11  (P2 only; at P0 and P1 it is not-applicable and nothing is read) the stored Stock in Transit balance of Xero for D against the open-purchase-
- *        order transit schedule of IMS (transit-schedule.ts), within GBP 1 inclusive, AND the transit account must not be the allocated (or
+ *   R11  (P2 only; at P0 and P1 it is not-applicable and nothing is read) the stored Stock in Transit balance of Xero for D against the WHOLE transit
+ *        sub-ledger of IMS to D (transit-schedule.ts: open orders, non-open orders still holding transit, and the refund-in-transit leg), within GBP 1 inclusive, AND the transit account must not be the allocated (or
  *        any other control) account: a shared code makes the balance not the transit account's own, so nothing is compared (the basis is
  *        unavailable when transit shares with Allocated Inventory; any other sharing is SOURCE_UNREADABLE here). The sub-ledger must be
- *        recorded as covering every open order (NO_POPULATION_RECORD otherwise). Orders that are not open but still hold transit, and the
- *        refund-in-transit leg, are listed out of the population and make the balance differ from the schedule.
+ *        recorded as covering every open order (NO_POPULATION_RECORD otherwise). The non-open orders with a non-zero residue are LISTED by identity
+ *        with that residue under outOfPopulation (a finding detail, never judged; their value is in the total).
  *
  * A leg that rests on an account the trial balance omitted is WITHHELD (GL_LEG_ABSENT), never compared as a zero. The postings
  * leg needs a recorded, VERIFIED first load (NO_POPULATION_RECORD otherwise); a row older than that load's start is listed as out
@@ -227,7 +227,7 @@ async function runR11(basis: AsOfBasis, context: LedgerItemContext): Promise<Ite
   if (!schedule.ok) return inconclusive('R11', schedule.reason)
   const scheduled = dec(schedule.value)
   if (scheduled === null) return inconclusive('R11', 'BAD_VALUE')
-  const ims: SideRow[] = [{ key: TRANSIT_BALANCE_KEY, value: scheduled.toFixed(6), currency: LEDGER_CURRENCY }, ...schedule.listed.map((entry): SideRow => ({ key: entry.key, value: entry.value, currency: LEDGER_CURRENCY }))]
+  const ims: SideRow[] = [{ key: TRANSIT_BALANCE_KEY, value: scheduled.toFixed(6), currency: LEDGER_CURRENCY }, ...schedule.residue.map((entry): SideRow => ({ key: entry.key, value: entry.value, currency: LEDGER_CURRENCY }))]
   const vendor: SideRow[] = [{ key: TRANSIT_BALANCE_KEY, value: gl.toFixed(6), currency: LEDGER_CURRENCY }]
   const evaluator = evaluateAccountGlReconciliation({ subledgerValue: scheduled.toNumber(), glBalance: gl.toNumber() })
   const result = compareItem('R11', { ims, vendor, imsComplete: true, vendorComplete: true, population: new Set([canonicalKey(TRANSIT_BALANCE_KEY)]) })

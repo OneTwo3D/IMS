@@ -70,29 +70,36 @@ test('R11 tolerance is GBP 1 INCLUSIVE on either side: 1.00 passes, 1.01 fails; 
   }
 })
 
-// [mutation: every order summed, not only the open ones / the refund leg dropped silently]
-test('R11 schedules only the OPEN orders: a closed order still holding transit and the refund-in-transit leg are listed out of the population, never judged, and the balance then differs', async () => {
+// [mutation: only the open orders summed / the refund leg dropped / the residue list left out]
+test('R11 is the WHOLE sub-ledger: open orders + non-open orders still holding transit + the refund-in-transit leg are compared with the stored balance; the non-open residue is LISTED by identity (not judged) and the refund leg is not listed', async () => {
   const closed = order('po2', { status: 'RECEIVED' })
-  const { item } = await r11(section({ net: [net('po1', 'PURCHASE_BILL', '80'), net('po1', 'STOCK_RECEIPT', '-30'), net('po2', 'PURCHASE_BILL', '12')], orders: [order('po1'), closed], customerReturns: '4.5' }))
-  // the schedule is 50 and so is the stored balance: the listed amounts are not in the account here, so the item passes and shows what it left out
-  assert.equal(item.outcome, 'pass')
-  assert.deepEqual(keys(item, 'outOfPopulation'), [identityToken('ims-id', 'po2'), 'ledger-transit-customer-return'].sort())
-  const listed = Object.fromEntries((item.entries!.outOfPopulation as unknown as Array<{ key: string; ims: string; vendor: string | null }>).map((e) => [e.key, [e.ims, e.vendor]]))
-  assert.deepEqual(listed[identityToken('ims-id', 'po2')], ['12', null])
-  assert.deepEqual(listed['ledger-transit-customer-return'], ['4.5', null])
-  // and when the account does hold them, the schedule (open orders only) is short of the balance: a finding
-  const short = await r11(section({ net: [net('po1', 'PURCHASE_BILL', '80'), net('po1', 'STOCK_RECEIPT', '-30'), net('po2', 'PURCHASE_BILL', '12')], orders: [order('po1'), closed] }), goodState({ gl: goodState().gl.map((r) => (r.accountCode === CODES.transit && r.balanceDate.getTime() === dateOf(D).getTime() ? { ...r, amountBase: '62' } : r)) }))
-  assert.equal(short.item.outcome, 'fail')
-  assert.deepEqual(keys(short.item, 'bothDiffer'), [TRANSIT_BALANCE_TOKEN])
-  assert.deepEqual(keys(short.item, 'outOfPopulation'), [identityToken('ims-id', 'po2')])
+  const state = (balance: string) => goodState({ gl: goodState().gl.map((r) => (r.accountCode === CODES.transit && r.balanceDate.getTime() === dateOf(D).getTime() ? { ...r, amountBase: balance } : r)) })
+  const ledger = section({ net: [net('po1', 'PURCHASE_BILL', '80'), net('po1', 'STOCK_RECEIPT', '-30'), net('po2', 'PURCHASE_BILL', '12')], orders: [order('po1'), closed], customerReturns: '4.5' })
+  // 50 + 12 + 4.5 = 66.5 is what the account must hold
+  const equal = await r11(ledger, state('66.5'))
+  assert.equal(equal.item.outcome, 'pass')
+  const [entry] = equal.item.entries!.bothEqual! as unknown as Array<{ ims: string; vendor: string }>
+  assert.deepEqual([entry!.ims, entry!.vendor], ['66.5', '66.5'])
+  assert.deepEqual(keys(equal.item, 'outOfPopulation'), [identityToken('ims-id', 'po2')], 'only the non-open order is listed; the refund leg is part of the total, not a listing')
+  const listed = (equal.item.entries!.outOfPopulation as unknown as Array<{ ims: string; vendor: string | null }>)[0]!
+  assert.deepEqual([listed.ims, listed.vendor], ['12', null])
+  // a balance of only the open orders' 50 is a gap of 16.5: a finding, with the residue visible beside it
+  const gap = await r11(ledger, state('50'))
+  assert.equal(gap.item.outcome, 'fail')
+  assert.deepEqual(keys(gap.item, 'bothDiffer'), [TRANSIT_BALANCE_TOKEN])
+  assert.deepEqual(keys(gap.item, 'outOfPopulation'), [identityToken('ims-id', 'po2')])
+  // the listing does not change the outcome by itself: the same residue with a balance that matches passes (above); no residue and a gap still fails
+  const noResidue = await r11(section({ net: [net('po1', 'PURCHASE_BILL', '80')] }), state('50'))
+  assert.equal(noResidue.item.outcome, 'fail')
+  assert.deepEqual(keys(noResidue.item, 'outOfPopulation'), [])
 })
 
 // [mutation: an order's rows from another order's source added, or a row of an unknown order skipped]
-test('R11 SCHEDULE BY ORDER: rows are summed per order across source types; an open order with nothing recorded is zero; a non-open order netting to zero is not listed', () => {
-  const s = buildTransitSchedule(section({ net: [net('po1', 'PURCHASE_BILL', '10'), net('po1', 'LANDED_COST_RECLASS', '-2.5'), net('po2', 'PURCHASE_BILL', '5'), net('po2', 'STOCK_RECEIPT', '-5'), net('po3', 'SUPPLIER_RETURN', '1')], orders: [order('po1'), order('po2', { status: 'CLOSED' }), order('po3', { status: 'CLOSED' })], openOrders: [order('po1'), order('po4')] }), D)
+test('R11 SCHEDULE BY ORDER: the total is every order\'s rows summed across source types plus the refund leg; the residue list holds the non-open orders with a non-zero figure only', () => {
+  const s = buildTransitSchedule(section({ net: [net('po1', 'PURCHASE_BILL', '10'), net('po1', 'LANDED_COST_RECLASS', '-2.5'), net('po2', 'PURCHASE_BILL', '5'), net('po2', 'STOCK_RECEIPT', '-5'), net('po3', 'SUPPLIER_RETURN', '1')], orders: [order('po1'), order('po2', { status: 'CLOSED' }), order('po3', { status: 'CLOSED' })], openOrders: [order('po1'), order('po4')], customerReturns: '0.25' }), D)
   assert.ok(s.ok)
-  assert.equal(s.value, '7.500000')
-  assert.deepEqual(s.listed.map((e) => [e.key[0]!.raw, e.value]), [['po3', '1']])
+  assert.equal(s.value, '8.750000')
+  assert.deepEqual(s.residue.map((e) => [e.key[0]!.raw, e.value]), [['po3', '1']])
 })
 
 // [mutation: the coverage check removed or weakened to "any watermark"]

@@ -21,7 +21,7 @@ function fake(answer: (sql: string, values?: unknown[]) => Array<Record<string, 
     },
   }
 }
-const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule' | 'fxRates'>(name: K, client: ImsQueryClient, asOf?: string, rowCap?: number) => {
+const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule' | 'fxRates' | 'firstLoadProvenance'>(name: K, client: ImsQueryClient, asOf?: string, rowCap?: number) => {
   const read = await readImsSnapshot(client, { sections: [name], ...(asOf !== undefined ? { asOf } : {}), ...(rowCap !== undefined ? { rowCap } : {}) })
   assert.ok(read.ok)
   return read.sections[name]!
@@ -29,7 +29,7 @@ const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule' | 'fxRat
 
 // ---- purchaseOrders -------------------------------------------------------------------------------
 
-const orderRow = (over: Record<string, unknown> = {}) => ({ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', currency: 'GBP', created: '2026-03-01T10:00:00.000Z', ...over })
+const orderRow = (over: Record<string, unknown> = {}) => ({ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', currency: 'GBP', discount: '0.0000', created: '2026-03-01T10:00:00.000Z', ...over })
 const lineRow = (over: Record<string, unknown> = {}) => ({ id: 'l1', po_id: 'po1', sku: 'A', qty: '10', received: '4', cost: '2.500000', ...over })
 const poAnswer = (orders: Array<Record<string, unknown>>, lines: Array<Record<string, unknown>>) => (sql: string) => (/FROM purchase_order_lines/.test(sql) ? lines : /FROM purchase_orders/.test(sql) ? orders : [])
 
@@ -38,7 +38,7 @@ test('purchaseOrders: reads every goods order in a committed-incoming status wit
   const client = fake(poAnswer([orderRow(), orderRow({ id: 'po2', reference: 'QBX-PO2', status: 'PARTIALLY_RECEIVED', currency: 'USD' })], [lineRow(), lineRow({ id: 'l2', sku: 'B' }), lineRow({ id: 'l3', po_id: 'po2', sku: 'A' })]))
   const section = await sectionOf('purchaseOrders', client)
   assert.ok(section.ok)
-  assert.deepEqual(section.value.map((o) => [o.id, o.reference, o.status, o.currency, o.createdAt, o.lines.map((l) => l.sku)]), [['po1', 'QBX-PO1', 'PO_SENT', 'GBP', '2026-03-01T10:00:00.000Z', ['A', 'B']], ['po2', 'QBX-PO2', 'PARTIALLY_RECEIVED', 'USD', '2026-03-01T10:00:00.000Z', ['A']]])
+  assert.deepEqual(section.value.map((o) => [o.id, o.reference, o.status, o.currency, o.createdAt, o.discount, o.lines.map((l) => l.sku)]), [['po1', 'QBX-PO1', 'PO_SENT', 'GBP', '2026-03-01T10:00:00.000Z', '0.0000', ['A', 'B']], ['po2', 'QBX-PO2', 'PARTIALLY_RECEIVED', 'USD', '2026-03-01T10:00:00.000Z', '0.0000', ['A']]])
   assert.deepEqual(section.value[0]!.lines[0], { id: 'l1', sku: 'A', qty: '10', qtyReceived: '4', unitCostBase: '2.500000' })
   const queries = client.sent.filter((q) => /FROM purchase_order/.test(q.sql))
   assert.equal(queries.length, 2)
@@ -64,6 +64,8 @@ test('purchaseOrders: a repeated reference, a line of an order not read, a value
   assert.equal(await reason([orderRow({ status: 'DRAFT' })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([orderRow({ currency: '' })]), 'CURRENCY_UNKNOWN')
   assert.equal(await reason([orderRow({ created: null })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([orderRow({ discount: 'x' })]), 'BAD_VALUE')
+  assert.equal(await reason([orderRow({ discount: null })]), 'BAD_VALUE')
   assert.equal(await reason([orderRow(), orderRow({ id: 'po2', reference: 'B' })], [], 1), 'CAP_EXCEEDED')
   assert.equal(await reason([orderRow()], [lineRow(), lineRow({ id: 'l2' })], 1), 'CAP_EXCEEDED')
   assert.equal(await reason([orderRow()], [lineRow({ sku: '' })]), 'BAD_KEY')
@@ -156,4 +158,37 @@ test('fxRates: reads every row quoted FROM the base currency (bound), exact deci
   assert.equal(await reason([row({ currency: '' })]), 'CURRENCY_UNKNOWN')
   assert.equal(await reason([row(), row({ currency: 'EUR' })], 1), 'CAP_EXCEEDED')
   assert.equal(await reason([]), 'ok')
+})
+
+// ---- firstLoadProvenance ---------------------------------------------------------------------------------------------------------
+
+// [mutation: provenance inferred without the run id / the actor kind not required / lines not counted]
+test('firstLoadProvenance: the run record and every order carrying THAT run\'s system-actor creation row, with the lines they hold; no run record is null; two records, a repeated order id or a bad count is unreadable', async () => {
+  const run = (over: Record<string, unknown> = {}) => ({ run_id: 'run-1', status: 'VERIFIED', created: '3', ...over })
+  const answer = (runs: Array<Record<string, unknown>>, logs: Array<Record<string, unknown>>) => (sql: string) => (/FROM first_load_apply_runs/.test(sql) ? runs : /FROM activity_logs/.test(sql) ? logs : /count\(\*\)/.test(sql) ? [{ n: '3' }] : [])
+  const client = fake(answer([run()], [{ id: 'po1' }, { id: 'po2' }]))
+  const section = await sectionOf('firstLoadProvenance', client)
+  assert.ok(section.ok)
+  assert.deepEqual(section.value, { runId: 'run-1', status: 'VERIFIED', journalCreated: 3, attributed: ['po1', 'po2'], attributedLines: 3 })
+  const log = client.sent.find((q) => /FROM activity_logs/.test(q.sql))!
+  assert.match(log.sql, /"entityType"::text = 'PURCHASE_ORDER'/)
+  assert.match(log.sql, /action = 'created'/)
+  assert.match(log.sql, /metadata->'actor'->>'kind' = 'system'/)
+  assert.match(log.sql, /metadata->'actor'->>'runId' = \$1/)
+  assert.deepEqual(log.values, ['run-1'])
+  const lines = client.sent.find((q) => /count\(\*\)/.test(q.sql))!
+  assert.deepEqual(lines.values, [['po1', 'po2']])
+  const none = await sectionOf('firstLoadProvenance', fake(answer([], [])))
+  assert.ok(none.ok && none.value === null)
+  const reason = async (runs: Array<Record<string, unknown>>, logs: Array<Record<string, unknown>> = []) => {
+    const s = await sectionOf('firstLoadProvenance', fake(answer(runs, logs)))
+    return s.ok ? 'ok' : s.reason
+  }
+  assert.equal(await reason([run(), run({ run_id: 'run-2' })]), 'DUPLICATE_KEY')
+  assert.equal(await reason([run({ created: 'x' })]), 'BAD_VALUE')
+  assert.equal(await reason([run({ status: 'BOGUS' })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([run({ run_id: '' })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([run()], [{ id: 'po1' }, { id: 'po1' }]), 'DUPLICATE_KEY')
+  assert.equal(await reason([run({ created: null })]), 'ok')
+  assert.equal(await reason([run()], [{ id: null }]), 'BAD_KEY')
 })

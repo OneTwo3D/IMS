@@ -46,7 +46,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { compareItem, decimalText, outcomeOfComparison, parseDecimalStrict, type CompareResult, type SideRow } from '@/lib/reconciliation-pack/compare'
 import { QOBLEX_BASE_CURRENCY, QOBLEX_PO_NUMBER_RE, itemApplicability, type PackReasonCode, type PackSourceCode } from '@/lib/reconciliation-pack/constants'
-import type { KeyPart } from '@/lib/reconciliation-pack/identity'
+import { canonicalKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { FxRateRow, ImsRead, ImsReadOptions, PoRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { QoblexPoLine, QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
@@ -89,20 +89,27 @@ function fromComparison(id: PoItemId, result: CompareResult): ItemInput {
 // One side each, as { identity -> figures }. Built before anything is compared; a malformed input ends here.
 // ---------------------------------------------------------------------------------------------
 
-export type Order = { key: KeyPart[]; token: string; currency: string; createdAt: string; value: Dec; lines: Map<string, { sku: string; outstanding: Dec }>; native: boolean }
+export type Order = { key: KeyPart[]; token: string; currency: string; createdAt: string; value: Dec; lines: Map<string, { sku: string; outstanding: Dec }>; native: boolean; /** No first-load provenance: listed, never judged, never matched to the export. */ outOfScope: boolean; discount: Dec }
 type Side = { ok: true; orders: Map<string, Order> } | { ok: false; reason: PackReasonCode }
 
 const dec = (text: string): Dec | null => parseDecimalStrict(text)
 const round6 = (value: Dec): Dec => value.toDecimalPlaces(6, Dec.ROUND_HALF_UP)
 
-/** The IMS side: every incoming goods order, keyed by the Qoblex number its reference explains with the declared prefix, else by its own reference. */
-export function imsSide(orders: readonly PoRow[], prefix: string): Side {
+/**
+ * The IMS side: every incoming goods order. An order the first load created (`scope` holds its id: recorded provenance, see FirstLoadProvenance) is keyed
+ * by the Qoblex number its reference explains with the declared prefix, else by its own id. An order NOT in `scope` has no first-load provenance: it is
+ * keyed by its own id, flagged out of scope (listed, never judged, never matched), whatever its reference looks like. No `scope` = every order is in scope.
+ */
+export function imsSide(orders: readonly PoRow[], prefix: string, scope?: ReadonlySet<string>): Side {
   const out = new Map<string, Order>()
   for (const po of orders) {
-    const explained = po.reference.startsWith(prefix) && QOBLEX_PO_NUMBER_RE.test(po.reference.slice(prefix.length))
+    const outOfScope = scope !== undefined && !scope.has(po.id)
+    const explained = !outOfScope && po.reference.startsWith(prefix) && QOBLEX_PO_NUMBER_RE.test(po.reference.slice(prefix.length))
     const key: KeyPart[] = explained ? [{ kind: 'order-ref', raw: po.reference.slice(prefix.length) }] : [{ kind: 'ims-id', raw: po.id }]
     const token = `${key[0]!.kind}\u0001${String(key[0]!.raw)}`
     if (out.has(token)) return { ok: false, reason: 'DUPLICATE_KEY' }
+    const discount = dec(po.discount)
+    if (discount === null) return { ok: false, reason: 'BAD_VALUE' }
     let value = new Dec(0)
     const lines = new Map<string, { sku: string; outstanding: Dec }>()
     for (const line of po.lines) {
@@ -116,7 +123,7 @@ export function imsSide(orders: readonly PoRow[], prefix: string): Side {
       lines.set(line.sku, { sku: line.sku, outstanding })
       value = value.plus(outstanding.mul(cost))
     }
-    out.set(token, { key, token, currency: po.currency, createdAt: po.createdAt, value: round6(value), lines, native: !explained })
+    out.set(token, { key, token, currency: po.currency, createdAt: po.createdAt, value: round6(value), lines, native: !explained, outOfScope, discount })
   }
   return { ok: true, orders: out }
 }
@@ -181,7 +188,7 @@ export function qoblexSide(lines: readonly QoblexPoLine[], context: { mine: Read
       }
       if (booked.currency !== QOBLEX_BASE_CURRENCY) unit = round6(price.div(rate))
     }
-    const have = out.get(token) ?? { key: [{ kind: 'order-ref', raw: line.orderKey }] as KeyPart[], token, currency, createdAt: booked?.createdAt ?? '', value: new Dec(0), lines: new Map<string, { sku: string; outstanding: Dec }>(), native: false }
+    const have = out.get(token) ?? { key: [{ kind: 'order-ref', raw: line.orderKey }] as KeyPart[], token, currency, createdAt: booked?.createdAt ?? '', value: new Dec(0), lines: new Map<string, { sku: string; outstanding: Dec }>(), native: false, outOfScope: false, discount: new Dec(0) }
     if (have.lines.has(line.sku)) return { ok: false, reason: 'DUPLICATE_KEY' }
     have.lines.set(line.sku, { sku: line.sku, outstanding })
     have.value = round6(have.value.plus(outstanding.mul(unit)))
@@ -251,7 +258,7 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
     if (!part.ok) return inconclusive(id, [QOBLEX], part.reason)
     const { keyPrefix, lines } = part.value
 
-    const ims = await context.ims({ sections: id === 'R7' ? ['purchaseOrders', 'boundaries', 'fxRates'] : ['purchaseOrders', 'boundaries'] })
+    const ims = await context.ims({ sections: id === 'R7' ? ['purchaseOrders', 'boundaries', 'fxRates', 'firstLoadProvenance'] : ['purchaseOrders', 'boundaries', 'firstLoadProvenance'] })
     if (!ims.ok) return inconclusive(id, SOURCES, ims.reason)
     const orders = ims.sections.purchaseOrders
     const boundaries = ims.sections.boundaries
@@ -261,7 +268,20 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
     // The load that put the Qoblex numbers into IMS must be a recorded, verified one: without it the reference carries no recorded meaning.
     if (boundaries.value.firstLoad.state !== 'verified') return inconclusive(id, SOURCES, 'NO_POPULATION_RECORD')
 
-    const mine = imsSide(orders.value, keyPrefix)
+    // THE POPULATION IS WHAT THE FIRST LOAD CREATED, from recorded provenance. The provenance must belong to the VERIFIED run, and must be complete: the
+    // lines of the orders it attributes must be exactly the lines the run record says it created (an activity-log row pruned by retention would
+    // otherwise make a first-load order look native and drop it from the comparison).
+    const provenance = ims.sections.firstLoadProvenance
+    if (provenance === undefined) return inconclusive(id, SOURCES, 'SOURCE_UNREADABLE')
+    if (!provenance.ok) return inconclusive(id, SOURCES, provenance.reason)
+    const p = provenance.value
+    if (p === null || p.status !== 'VERIFIED' || p.journalCreated === null || p.attributedLines !== p.journalCreated) return inconclusive(id, SOURCES, 'NO_POPULATION_RECORD')
+
+    const mine = imsSide(orders.value, keyPrefix, new Set(p.attributed))
+    if (!mine.ok) return inconclusive(id, SOURCES, mine.reason)
+    // An order-level discount is in IMS's order and cannot be expressed by the export (its report has no order-level discount and the native map reads no discount at
+    // all): such an order cannot be judged on its value, so R7 is inconclusive rather than passing with the discount on one side only.
+    if (id === 'R7' && [...mine.orders.values()].some((o) => !o.outOfScope && !o.discount.isZero())) return inconclusive(id, SOURCES, 'VALUE_SHAPE_MISMATCH')
     if (!mine.ok) return inconclusive(id, SOURCES, mine.reason)
     let fxRates: readonly FxRateRow[] | null = null
     if (id === 'R7') {
@@ -273,7 +293,8 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
     const theirs = qoblexSide(lines, { mine: mine.orders, fxRates })
     if (!theirs.ok) return inconclusive(id, SOURCES, theirs.reason)
 
-    const empty = mine.orders.size === 0 && theirs.orders.size === 0
+    const inScope = [...mine.orders.values()].filter((o) => !o.outOfScope)
+    const empty = inScope.length === 0 && theirs.orders.size === 0
     let rows: { ims: SideRow[]; vendor: SideRow[] }
     if (id === 'R7') {
       const built = r7Rows(mine.orders, theirs.orders)
@@ -283,7 +304,17 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
       rows = r8Rows(mine.orders, theirs.orders)
     }
     // The empty proof is granted only when no order is on either side (R8 also has an order-level row for every order, so an order with no open line is never "empty").
-    const result = compareItem(id, { ims: rows.ims, vendor: rows.vendor, imsComplete: true, vendorComplete: true, ...(empty ? { emptyProof: 'qoblex-incoming-report-empty' as const } : {}) })
+    // The population: everything except the rows of orders without first-load provenance, which are listed out of the population (reported, never judged).
+    const outside = new Set<string>()
+    for (const o of mine.orders.values()) {
+      if (!o.outOfScope) continue
+      outside.add(canonicalKey(o.key))
+      if (id === 'R8') for (const line of o.lines.values()) if (!line.outstanding.isZero()) outside.add(canonicalKey([...o.key, { kind: 'sku', raw: line.sku }]))
+      if (id === 'R8') outside.add(canonicalKey([...o.key, { kind: 'sku', raw: ORDER_LINES_TOKEN }]))
+    }
+    const population = new Set<string>()
+    for (const row of [...rows.ims, ...rows.vendor]) { const k = canonicalKey(row.key); if (!outside.has(k)) population.add(k) }
+    const result = compareItem(id, { ims: rows.ims, vendor: rows.vendor, imsComplete: true, vendorComplete: true, population, ...(empty ? { emptyProof: 'qoblex-incoming-report-empty' as const } : {}) })
     return fromComparison(id, result)
   } catch {
     return inconclusive(id, [], 'INTERNAL_ERROR')

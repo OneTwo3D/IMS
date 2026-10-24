@@ -1,23 +1,23 @@
 /**
- * THE OPEN-PURCHASE-ORDER TRANSIT SCHEDULE (R11's IMS side), from IMS's own transit sub-ledger.
+ * THE TRANSIT SCHEDULE (R11's IMS side), from IMS's own transit sub-ledger: the WHOLE of it up to the cycle date.
  *
  * Stock in Transit is a clearing account: a goods or freight bill DEBITS it, and a receipt, a landed-cost reclass, a supplier credit note or a
- * cancellation moves value out (lib/domain/accounting/transit-subledger-movement.ts lists every flow). Every posting to the account records a
- * signed row in the transit sub-ledger against the purchase order it belongs to, so the value in transit for ONE purchase order at the cycle
- * date D is the sum of its rows dated up to and including D. THE SCHEDULE is the sum of that figure over the OPEN purchase orders, the goods
- * and freight orders in a committed-incoming status (PO_SENT, SHIPPED, PARTIALLY_RECEIVED: the one definition in
- * lib/domain/inventory/po-status-sets.ts). R11 compares it with the stored Stock in Transit balance of Xero for D.
+ * cancellation moves value out. Every posting to the account records a signed row in the transit sub-ledger
+ * (lib/domain/accounting/transit-subledger-movement.ts: it lists EVERY source type that posts to the account, and every posting site calls
+ * recordTransitSubledgerMovement: PURCHASE_BILL and PURCHASE_BILL_UPDATE and SUPPLIER_CREDIT_NOTE and PURCHASE_ORDER_CANCEL and SUPPLIER_RETURN in
+ * app/actions/purchase-orders.ts and lib/domain/purchasing, STOCK_RECEIPT in lib/domain/wms/booked-in-service.ts and lib/connectors/mintsoft/sync/stock-sync.ts,
+ * LANDED_COST_RECLASS and LANDED_COST_CONSUMED_OFFSET in lib/domain/purchasing/landed-cost-service.ts, CUSTOMER_RETURN_IN_TRANSIT in
+ * lib/domain/sales/refund-service.ts). THE SCHEDULE IS THE SUM OF ALL OF IT: the value in transit for each purchase order (its rows by recorded source,
+ * summed), open or not, plus the refund-in-transit leg, which belongs to no order. R11 compares that total with the stored Stock in Transit balance of
+ * Xero for the cycle date (owner ruling 2026-10-24: the balance holds all of it, so the comparison must).
  *
- * WHAT THE COMPARISON CAN AND CANNOT SEE (stated, decided; owner question in the build report):
- *   - The sub-ledger records postings only after its recorded coverage watermark (`transit_ledger_coverage_start_date`), and has no opening
- *     balance. The schedule is complete only for an order whose whole history is after the watermark, so the watermark must be recorded, a
- *     real date on or before D, and EVERY open order must have been created after it; otherwise the schedule is not proven complete
- *     (NO_POPULATION_RECORD), never short.
- *   - A purchase order that is NOT open but still holds value in transit (a received or closed order whose freight was never reclassed), and the
- *     refund-in-transit leg (goods a customer returned that are not yet back, which belongs to no order), are in the account's balance but
- *     are not "open-order" transit: they are not in the schedule, so the balance differs from it and the item FAILS, and each is LISTED
- *     (out of the population, never judged) with its sub-ledger figure so the difference can be explained.
- *   - A sub-ledger row whose source type this module does not know, or that names an order IMS does not hold, makes the schedule unreadable.
+ * THE NAMED RESIDUE LIST. The purchase orders that are NOT open (not in a committed-incoming status: PO_SENT, SHIPPED, PARTIALLY_RECEIVED, the one definition in
+ * lib/domain/inventory/po-status-sets.ts) but still hold a non-zero transit balance are listed by identity with that residue, under outOfPopulation
+ * (reported, never judged): a finding detail that explains the total and does not change the outcome by itself. Their value is IN the total.
+ *
+ * COVERAGE (unchanged). The sub-ledger records postings only after its recorded coverage watermark (`transit_ledger_coverage_start_date`) and has no
+ * opening balance, so the total is complete only if the watermark is recorded, a real date on or before D, and EVERY open order was created after it;
+ * otherwise NO_POPULATION_RECORD, never a short schedule. A source type this module does not know, or an order IMS does not hold, makes it unreadable.
  * Nothing here reads a clock or a file; the sub-ledger arrives from the one read-only IMS transaction (ims-readers.ts, `transitSchedule`).
  */
 
@@ -32,12 +32,10 @@ type Dec = Prisma.Decimal
 
 /** Fixed words, not data: they print as they are. */
 export const TRANSIT_BALANCE_TOKEN = 'ledger-transit-balance'
-export const CUSTOMER_RETURN_TRANSIT_TOKEN = 'ledger-transit-customer-return'
 export const TRANSIT_BALANCE_KEY: readonly KeyPart[] = [{ kind: 'sku', raw: TRANSIT_BALANCE_TOKEN }]
-export const CUSTOMER_RETURN_TRANSIT_KEY: readonly KeyPart[] = [{ kind: 'sku', raw: CUSTOMER_RETURN_TRANSIT_TOKEN }]
 
 export type TransitSchedule =
-  | { ok: true; /** The sum of the open orders' transit, six decimals. */ value: string; /** Non-open orders and the refund leg with a non-zero figure: listed, never judged. */ listed: Array<{ key: KeyPart[]; value: string }> }
+  | { ok: true; /** The WHOLE sub-ledger to the cycle date (every order, open or not, and the refund leg), six decimals. */ value: string; /** Non-open orders with a non-zero residue: listed by identity, never judged. */ residue: Array<{ key: KeyPart[]; value: string }> }
   | { ok: false; reason: PackReasonCode }
 
 const DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
@@ -68,16 +66,16 @@ export function buildTransitSchedule(section: ImsTransitSchedule, asOf: string):
       perOrder.set(row.poId, (perOrder.get(row.poId) ?? new Dec(0)).plus(amount))
     }
     let total = new Dec(0)
-    const listed: Array<{ key: KeyPart[]; value: string }> = []
+    const residue: Array<{ key: KeyPart[]; value: string }> = []
     for (const [poId, amount] of [...perOrder.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-      if (open.has(poId)) { total = total.plus(amount); continue }
-      if (amount.isZero()) continue
-      listed.push({ key: [{ kind: 'ims-id', raw: poId }], value: decimalText(amount) })
+      total = total.plus(amount)
+      if (open.has(poId) || amount.isZero()) continue
+      residue.push({ key: [{ kind: 'ims-id', raw: poId }], value: decimalText(amount) })
     }
     const customer = parseDecimalStrict(section.customerReturns)
     if (customer === null) return { ok: false, reason: 'BAD_VALUE' }
-    if (!customer.isZero()) listed.push({ key: [...CUSTOMER_RETURN_TRANSIT_KEY], value: decimalText(customer) })
-    return { ok: true, value: total.toFixed(6), listed }
+    total = total.plus(customer)
+    return { ok: true, value: total.toFixed(6), residue }
   } catch {
     return { ok: false, reason: 'INTERNAL_ERROR' }
   }

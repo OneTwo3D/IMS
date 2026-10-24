@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { identityToken } from '../../lib/reconciliation-pack/identity.ts'
 import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
-import type { FxRateRow, ImsRead, ImsReadOptions, PoLineRow, PoRow } from '../../lib/reconciliation-pack/ims-readers.ts'
+import type { FirstLoadProvenance, FxRateRow, ImsRead, ImsReadOptions, PoLineRow, PoRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { ORDER_LINES_TOKEN, VALUE_EXACT_GBP_TOKEN, imsSide, qoblexSide, rateAt, runPoItem, type PoItemContext } from '../../lib/reconciliation-pack/purchase-order-items.ts'
 import type { QoblexPoLine } from '../../lib/reconciliation-pack/qoblex-source.ts'
 import { PO_PREFIX, poLine, poLines, sourceOf } from './qoblex-fixtures.ts'
@@ -13,14 +13,20 @@ import { PO_PREFIX, poLine, poLines, sourceOf } from './qoblex-fixtures.ts'
  */
 
 const line = (sku: string, qty: string, received: string, cost: string, id = `l-${sku}`): PoLineRow => ({ id, sku, qty, qtyReceived: received, unitCostBase: cost })
-const po = (number: string, lines: PoLineRow[], over: Partial<PoRow> = {}): PoRow => ({ id: `po-${number}`, reference: `${PO_PREFIX}${number}`, status: 'PO_SENT', currency: 'GBP', createdAt: '2026-03-01T10:00:00.000Z', lines, ...over })
+const po = (number: string, lines: PoLineRow[], over: Partial<PoRow> = {}): PoRow => ({ id: `po-${number}`, reference: `${PO_PREFIX}${number}`, status: 'PO_SENT', currency: 'GBP', createdAt: '2026-03-01T10:00:00.000Z', discount: '0', lines, ...over })
 
-type Fixture = { orders?: PoRow[]; fx?: FxRateRow[]; fxSection?: 'fail'; firstLoad?: 'verified' | 'unverified' | 'absent'; fail?: Partial<Record<'purchaseOrders' | 'boundaries', 'READ_INCOMPLETE'>>; whole?: 'fail' | 'throws'; noSection?: 'purchaseOrders' | 'boundaries' }
+type Fixture = { orders?: PoRow[]; fx?: FxRateRow[]; native?: string[]; provenance?: Partial<FirstLoadProvenance> | null; fxSection?: 'fail'; firstLoad?: 'verified' | 'unverified' | 'absent'; fail?: Partial<Record<'purchaseOrders' | 'boundaries', 'READ_INCOMPLETE'>>; whole?: 'fail' | 'throws'; noSection?: 'purchaseOrders' | 'boundaries' }
 function ims(fixture: Fixture = {}) {
   const calls: ImsReadOptions[] = []
   const firstLoad = fixture.firstLoad ?? 'verified'
   const values: Record<string, unknown> = {
     purchaseOrders: fixture.orders ?? [],
+    // THE FIRST LOAD'S RECORDED PROVENANCE: every order of the fixture was created by it unless named in `native`; the run record's line count is the attributed orders' lines.
+    firstLoadProvenance: fixture.provenance === null ? null : (() => {
+      const attributed = (fixture.orders ?? []).filter((o) => !(fixture.native ?? []).includes(o.id))
+      const lineCount = attributed.reduce((n, o) => n + o.lines.length, 0)
+      return { runId: 'run-1', status: 'VERIFIED', journalCreated: lineCount, attributed: attributed.map((o) => o.id), attributedLines: lineCount, ...(fixture.provenance ?? {}) }
+    })(),
     fxRates: fixture.fx ?? [],
     boundaries: { firstLoad: firstLoad === 'verified' ? { state: 'verified', cutAt: '2026-10-01T00:00:00.000Z' } : { state: firstLoad }, storefrontImport: { state: 'not-completed' }, retentionMonths: 0 },
   }
@@ -57,7 +63,7 @@ test('R7 passes when every incoming order agrees (set exact, value in GBP), nami
   assert.deepEqual(item.sources, [...getPackItem('R7').sources])
   assert.deepEqual(keys(item, 'bothEqual'), ['PO1', 'PO1|value-exact-gbp', 'PO2', 'PO2|value-exact-gbp'])
   assert.equal(port.calls.length, 1)
-  assert.deepEqual([...port.calls[0]!.sections].sort(), ['boundaries', 'fxRates', 'purchaseOrders'])
+  assert.deepEqual([...port.calls[0]!.sections].sort(), ['boundaries', 'firstLoadProvenance', 'fxRates', 'purchaseOrders'])
   assert.equal(counter.reads, 1)
   const values = Object.fromEntries((item.entries!.bothEqual as unknown as Array<{ key: string; ims: string; vendor: string }>).map((e) => [e.key, [e.ims, e.vendor]]))
   // PO2: ordered 4, received 1, outstanding 3 at 10 each.
@@ -295,7 +301,7 @@ test('R8 passes when every open line\'s outstanding quantity agrees; a part-rece
   assert.deepEqual(lineKeys(item, 'bothEqual'), ['PO1|A', 'PO2|C'])
   const entry = (item.entries!.bothEqual as unknown as Array<{ key: string; ims: string; vendor: string }>).find((e) => e.key === 'PO1|A')!
   assert.deepEqual([entry.ims, entry.vendor], ['6', '6'])
-  assert.deepEqual([...port.calls[0]!.sections].sort(), ['boundaries', 'purchaseOrders'])
+  assert.deepEqual([...port.calls[0]!.sections].sort(), ['boundaries', 'firstLoadProvenance', 'purchaseOrders'])
   // IMS booked the load as a smaller order with nothing received: the same outstanding quantity is the same line.
   const loaded = await run('R8', [po('PO1', [line('A', '6', '0', '2')])], [poLine('PO1', 'A', '10', '4', '2')])
   assert.equal(loaded.item.outcome, 'pass')
@@ -372,4 +378,59 @@ test('R8 ORDER PRESENCE: PO1 matching plus an IMS incoming order PO2 whose lines
   // an order whose count of open lines differs is a difference even when the lines it shares are equal
   const extra = await run('R8', [po('PO1', [line('A', '10', '4', '2'), line('C', '1', '0', '1')])], lines)
   assert.equal(extra.item.outcome, 'fail')
+})
+
+// ---- the population: first-load provenance, order-level discount ------------------------------------------------------------------
+
+// [mutation: the population taken from the reference prefix / from the export / native orders judged]
+test('POPULATION BY RECORDED PROVENANCE: an incoming IMS order the first load did not create is listed out of the population and never judged or matched (whatever its reference looks like); an export order with no in-scope IMS match is onlyVendor; a first-load order the export omits is onlyIms', async () => {
+  const loaded = po('PO1', [line('A', '10', '4', '2')])
+  const native = po('PO2', [line('B', '5', '0', '1')])   // its reference carries the prefix, but nothing records the first load creating it
+  const fixture = { native: [native.id] }
+  for (const id of ['R7', 'R8'] as const) {
+    const ok = await run(id, [loaded, native], [poLine('PO1', 'A', '10', '4', '2')], { fixture })
+    assert.equal(ok.item.outcome, 'pass', id)
+    const outside = keys(ok.item, 'outOfPopulation')
+    assert.ok(outside.length >= 1 && outside.every((k) => k.startsWith(identityToken('ims-id', native.id))), `${id} ${outside.join()}`)
+    assert.ok(!keys(ok.item, 'bothEqual').some((k) => k.startsWith(identityToken('ims-id', native.id))))
+    // an export order carrying the native order's number does not match it: onlyVendor
+    const claims = await run(id, [loaded, native], [poLine('PO1', 'A', '10', '4', '2'), poLine('PO2', 'B', '5', '0', '1')], { fixture })
+    assert.equal(claims.item.outcome, 'fail', id)
+    assert.ok(keys(claims.item, 'onlyVendor').some((k) => k.startsWith('PO2')), id)
+    // a first-load order the export omits cannot pass
+    const omitted = await run(id, [loaded, native], [], { fixture })
+    assert.equal(omitted.item.outcome, 'fail', id)
+    assert.ok(keys(omitted.item, 'onlyIms').some((k) => k.startsWith('PO1')), id)
+  }
+  // with only native orders in IMS and an empty report the named empty proof holds (nothing the first load created is incoming), the natives listed
+  const onlyNative = await run('R8', [native], [], { fixture })
+  assert.equal(onlyNative.item.outcome, 'pass')
+  assert.deepEqual(onlyNative.item.proof, { kind: 'proven-empty', source: 'qoblex-incoming-report-empty' })
+  assert.ok(keys(onlyNative.item, 'outOfPopulation').length >= 1)
+})
+
+// [mutation: the provenance checks removed]
+test('PROVENANCE MUST BE RECORDED, OF THE VERIFIED RUN, AND COMPLETE: none, an unverified run, no run-record count, or attributed lines that differ from what the run created (a pruned log) is NO_POPULATION_RECORD; an unreadable section is its own reason', async () => {
+  const orders = [po('PO1', [line('A', '10', '4', '2')])]
+  const lines = [poLine('PO1', 'A', '10', '4', '2')]
+  const arms: Array<[string, Fixture['provenance']]> = [['no run', null], ['unverified run', { status: 'APPLIED' }], ['no count', { journalCreated: null }], ['pruned (fewer lines attributed)', { attributedLines: 0, attributed: [] }], ['more lines than created', { journalCreated: 0 }]]
+  for (const id of ['R7', 'R8'] as const) {
+    for (const [label, provenance] of arms) {
+      const r = await run(id, orders, lines, { fixture: { provenance } })
+      assert.deepEqual([r.item.outcome, r.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], `${id} ${label}`)
+    }
+    const missing = await runPoItem(id, { phase: 'P2', ims: ims({ orders, noSection: 'firstLoadProvenance' }).port, qoblex: sourceOf({ purchaseOrders: poLines(lines) }) })
+    assert.deepEqual([missing.outcome, missing.reasons], ['inconclusive', ['SOURCE_UNREADABLE']], id)
+  }
+})
+
+// [mutation: the discount check removed / applied to out-of-scope orders / to R8]
+test('ORDER-LEVEL DISCOUNT: an in-scope order with a non-zero order discount makes R7 inconclusive (the export cannot express it, so it could pass with the discount on one side only); a native order\'s discount is out of scope; R8 compares quantities and is unaffected', async () => {
+  const discounted = po('PO1', [line('A', '10', '4', '2')], { discount: '5.00' })
+  const lines = [poLine('PO1', 'A', '10', '4', '2')]
+  const r7 = await run('R7', [discounted], lines)
+  assert.deepEqual([r7.item.outcome, r7.item.reasons], ['inconclusive', ['VALUE_SHAPE_MISMATCH']])
+  assert.equal((await run('R8', [discounted], lines)).item.outcome, 'pass')
+  assert.equal((await run('R7', [discounted], lines, { fixture: { native: [discounted.id] } })).item.reasons[0], 'DIFFERENCES', 'a native order is out of scope; the export order is then onlyVendor')
+  assert.equal((await run('R7', [po('PO1', [line('A', '10', '4', '2')], { discount: '0.000000' })], lines)).item.outcome, 'pass')
 })
