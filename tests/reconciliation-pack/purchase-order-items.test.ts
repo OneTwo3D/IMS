@@ -21,11 +21,10 @@ function ims(fixture: Fixture = {}) {
   const firstLoad = fixture.firstLoad ?? 'verified'
   const values: Record<string, unknown> = {
     purchaseOrders: fixture.orders ?? [],
-    // THE FIRST LOAD'S RECORDED PROVENANCE: every order of the fixture was created by it unless named in `native`; the run record's line count is the attributed orders' lines.
+    // THE FIRST LOAD'S RECORDED PROVENANCE: every order of the fixture was created by it unless named in `native`; the run record's step counted one unit per order.
     firstLoadProvenance: fixture.provenance === null ? null : (() => {
       const attributed = (fixture.orders ?? []).filter((o) => !(fixture.native ?? []).includes(o.id))
-      const lineCount = attributed.reduce((n, o) => n + o.lines.length, 0)
-      return { runId: 'run-1', status: 'VERIFIED', journalCreated: lineCount, attributed: attributed.map((o) => o.id), attributedLines: lineCount, ...(fixture.provenance ?? {}) }
+      return { runId: 'run-1', status: 'VERIFIED', journalEmitted: attributed.length, journalFailed: 0, attributed: attributed.map((o) => o.id), attributedExisting: attributed.length, ...(fixture.provenance ?? {}) }
     })(),
     fxRates: fixture.fx ?? [],
     boundaries: { firstLoad: firstLoad === 'verified' ? { state: 'verified', cutAt: '2026-10-01T00:00:00.000Z' } : { state: firstLoad }, storefrontImport: { state: 'not-completed' }, retentionMonths: 0 },
@@ -409,11 +408,11 @@ test('POPULATION BY RECORDED PROVENANCE: an incoming IMS order the first load di
   assert.ok(keys(onlyNative.item, 'outOfPopulation').length >= 1)
 })
 
-// [mutation: the provenance checks removed]
-test('PROVENANCE MUST BE RECORDED, OF THE VERIFIED RUN, AND COMPLETE: none, an unverified run, no run-record count, or attributed lines that differ from what the run created (a pruned log) is NO_POPULATION_RECORD; an unreadable section is its own reason', async () => {
+// [mutation: the provenance checks removed / completeness reverted to a LINE count]
+test('PROVENANCE MUST BE RECORDED, OF THE VERIFIED RUN, AND COMPLETE AGAINST ORDERS: none, an unverified run, no run-record count, a failed unit, a count that differs from the distinct attributed orders (a pruned log, however many lines the rest hold), a repeated id, or an attributed order that no longer exists is NO_POPULATION_RECORD', async () => {
   const orders = [po('PO1', [line('A', '10', '4', '2')])]
   const lines = [poLine('PO1', 'A', '10', '4', '2')]
-  const arms: Array<[string, Fixture['provenance']]> = [['no run', null], ['unverified run', { status: 'APPLIED' }], ['no count', { journalCreated: null }], ['pruned (fewer lines attributed)', { attributedLines: 0, attributed: [] }], ['more lines than created', { journalCreated: 0 }]]
+  const arms: Array<[string, Fixture['provenance']]> = [['no run', null], ['unverified run', { status: 'APPLIED' }], ['no count', { journalEmitted: null }], ['a failed unit', { journalFailed: 1 }], ['no failed count', { journalFailed: null }], ['pruned (fewer orders attributed)', { attributed: [] }], ['more orders recorded than attributed', { journalEmitted: 2 }], ['a repeated id', { attributed: [orders[0]!.id, orders[0]!.id], journalEmitted: 2, attributedExisting: 2 }], ['an attributed order deleted since', { attributedExisting: 0 }]]
   for (const id of ['R7', 'R8'] as const) {
     for (const [label, provenance] of arms) {
       const r = await run(id, orders, lines, { fixture: { provenance } })
@@ -421,6 +420,28 @@ test('PROVENANCE MUST BE RECORDED, OF THE VERIFIED RUN, AND COMPLETE: none, an u
     }
     const missing = await runPoItem(id, { phase: 'P2', ims: ims({ orders, noSection: 'firstLoadProvenance' }).port, qoblex: sourceOf({ purchaseOrders: poLines(lines) }) })
     assert.deepEqual([missing.outcome, missing.reasons], ['inconclusive', ['SOURCE_UNREADABLE']], id)
+  }
+})
+
+// [mutation: the guard compares lines (or the run's created count) instead of distinct orders]
+test('COMPLETENESS IS ORDERS, NOT LINES: the run created A (2 lines) and B (1 line); B\'s attribution pruned leaves 1 order against 2 emitted - NO_POPULATION_RECORD although the lines of A alone equal 2; a resumed run (created counts only the last attempt) is judged on the emitted total; editing a line changes nothing', async () => {
+  const a = po('PA', [line('A', '10', '0', '2', 'la1'), line('B', '3', '0', '1', 'la2')])
+  const b = po('PB', [line('C', '5', '0', '1', 'lb1')])
+  const export_ = [poLine('PA', 'A', '10', '0', '2'), poLine('PA', 'B', '3', '0', '1')]
+  for (const id of ['R7', 'R8'] as const) {
+    // B's creation row pruned: the guard sees 1 distinct order against 2 emitted, whatever the line counts, and the export that omits B cannot pass
+    const pruned = await run(id, [a, b], export_, { fixture: { provenance: { attributed: [a.id], journalEmitted: 2, attributedExisting: 1 } } })
+    assert.deepEqual([pruned.item.outcome, pruned.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], id)
+    // complete: both attributed, and the export omitting B is then a finding
+    const omitted = await run(id, [a, b], export_)
+    assert.equal(omitted.item.outcome, 'fail', id)
+    // a resumed run: the first attempt created A, the second created B and skipped A (created 1, skippedExisting 1, emitted 2); both rows carry the one run id
+    const resumed = await run(id, [a, b], [...export_, poLine('PB', 'C', '5', '0', '1')], { fixture: { provenance: { journalEmitted: 2 } } })
+    assert.equal(resumed.item.outcome, 'pass', id)
+    // a line edited after the load (an added line) does not change the order count
+    const edited = po('PA', [line('A', '10', '0', '2', 'la1'), line('B', '3', '0', '1', 'la2'), line('D', '1', '0', '1', 'la3')])
+    const afterEdit = await run(id, [edited, b], [...export_, poLine('PA', 'D', '1', '0', '1'), poLine('PB', 'C', '5', '0', '1')])
+    assert.equal(afterEdit.item.outcome, 'pass', id)
   }
 })
 

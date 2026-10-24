@@ -993,7 +993,7 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
       await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', $4, 'GBP', $5, $5, $6, $7, now())`, [`${OTAG}-b-${kind}`, `${OTAG}-acc-${kind}`, code, OD, amounts[kind], `xero:trial-balance:${OD}`, `${OTAG}-tenant`])
     }
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now())`, [`${OTAG}-run`, OD])
-    await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{"purchase-orders": {"created": 2}}', '{}', '2026-03-01 09:00:00', '2026-03-02 09:00:00')`, [`${OTAG}-fl`])
+    await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{"purchase-orders": {"emitted": 1, "created": 1, "failed": 0}}', '{}', '2026-03-01 09:00:00', '2026-03-02 09:00:00')`, [`${OTAG}-fl`])
     // One supplier, one open order with two lines (A part-received: 10 ordered of which 4 received in IMS terms is 6 outstanding), the transit rows of its bill and its receipt.
     await sql(`INSERT INTO suppliers (id, name, "updatedAt") VALUES ($1, 'x', now())`, [`${OTAG}-sup`])
     await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${OTAG}-pa`, `${OTAG}-A`, `${OTAG}-pb`, `${OTAG}-B`])
@@ -1038,10 +1038,15 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
     const on = await run('P2', ['--qoblex-export', exportDir])
     assert.equal(on.code, 5, on.out.join('\n'))
     assert.ok(on.out.includes('R7 pass -') && on.out.includes('R8 pass -') && on.out.includes('R11 pass -'), on.out.join('\n'))
-    // the native order (prefix, no recorded first-load creation) was not judged: with a recorded provenance only for PO1 the comparison passes, and removing the record from PO1 would make it a finding
+    // the native order (prefix, no recorded first-load creation) was not judged: it is listed out of the population. A creation row that moves to the native order makes
+    // THAT order the first load's (one attributed order, as the run record says) and PO1 the unattributed one: the export's PO1 is then onlyVendor, so both fail.
     await sql(`UPDATE activity_logs SET "entityId" = $2 WHERE id = $1`, [`${OTAG}-act`, `${OTAG}-nat`])
     const swapped = await run('P2', ['--qoblex-export', exportDir])
-    assert.ok(swapped.out.includes('R7 inconclusive NO_POPULATION_RECORD') && swapped.out.includes('R8 inconclusive NO_POPULATION_RECORD'), swapped.out.join('\n'))
+    assert.ok(swapped.out.includes('R7 fail DIFFERENCES') && swapped.out.includes('R8 fail DIFFERENCES'), swapped.out.join('\n'))
+    // a creation row pruned (the retention sweep): 0 attributed orders against 1 emitted is not a population - NO_POPULATION_RECORD, never a pass
+    await sql(`UPDATE activity_logs SET "entityId" = NULL WHERE id = $1`, [`${OTAG}-act`])
+    const pruned = await run('P2', ['--qoblex-export', exportDir])
+    assert.ok(pruned.out.includes('R7 inconclusive NO_POPULATION_RECORD') && pruned.out.includes('R8 inconclusive NO_POPULATION_RECORD'), pruned.out.join('\n'))
     await sql(`UPDATE activity_logs SET "entityId" = $2 WHERE id = $1`, [`${OTAG}-act`, `${OTAG}-po`])
     const url = new URL(process.env.DATABASE_URL!)
     assert.ok(on.targets.length > 0)

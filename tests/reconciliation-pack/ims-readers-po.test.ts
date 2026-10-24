@@ -162,22 +162,28 @@ test('fxRates: reads every row quoted FROM the base currency (bound), exact deci
 
 // ---- firstLoadProvenance ---------------------------------------------------------------------------------------------------------
 
-// [mutation: provenance inferred without the run id / the actor kind not required / lines not counted]
-test('firstLoadProvenance: the run record and every order carrying THAT run\'s system-actor creation row, with the lines they hold; no run record is null; two records, a repeated order id or a bad count is unreadable', async () => {
-  const run = (over: Record<string, unknown> = {}) => ({ run_id: 'run-1', status: 'VERIFIED', created: '3', ...over })
-  const answer = (runs: Array<Record<string, unknown>>, logs: Array<Record<string, unknown>>) => (sql: string) => (/FROM first_load_apply_runs/.test(sql) ? runs : /FROM activity_logs/.test(sql) ? logs : /count\(\*\)/.test(sql) ? [{ n: '3' }] : [])
+// [mutation: provenance inferred without the run id / the actor kind not required / existence not counted]
+test('firstLoadProvenance: the run record (orders emitted and failed) and every order carrying THAT run\'s system-actor creation row, with how many of them still exist; no run record is null; two records, a repeated order id or a bad count is unreadable', async () => {
+  const run = (over: Record<string, unknown> = {}) => ({ run_id: 'run-1', status: 'VERIFIED', emitted: '2', failed: '0', ...over })
+  const answer = (runs: Array<Record<string, unknown>>, logs: Array<Record<string, unknown>>, existing = '2') => (sql: string) => (/FROM first_load_apply_runs/.test(sql) ? runs : /FROM activity_logs/.test(sql) ? logs : /count\(\*\)/.test(sql) ? [{ n: existing }] : [])
   const client = fake(answer([run()], [{ id: 'po1' }, { id: 'po2' }]))
   const section = await sectionOf('firstLoadProvenance', client)
   assert.ok(section.ok)
-  assert.deepEqual(section.value, { runId: 'run-1', status: 'VERIFIED', journalCreated: 3, attributed: ['po1', 'po2'], attributedLines: 3 })
+  assert.deepEqual(section.value, { runId: 'run-1', status: 'VERIFIED', journalEmitted: 2, journalFailed: 0, attributed: ['po1', 'po2'], attributedExisting: 2 })
   const log = client.sent.find((q) => /FROM activity_logs/.test(q.sql))!
   assert.match(log.sql, /"entityType"::text = 'PURCHASE_ORDER'/)
   assert.match(log.sql, /action = 'created'/)
   assert.match(log.sql, /metadata->'actor'->>'kind' = 'system'/)
   assert.match(log.sql, /metadata->'actor'->>'runId' = \$1/)
   assert.deepEqual(log.values, ['run-1'])
-  const lines = client.sent.find((q) => /count\(\*\)/.test(q.sql))!
-  assert.deepEqual(lines.values, [['po1', 'po2']])
+  const runSql = client.sent.find((q) => /FROM first_load_apply_runs/.test(q.sql) && /emitted/.test(q.sql))!
+  assert.match(runSql.sql, /steps->'purchase-orders'->>'emitted'/)
+  assert.doesNotMatch(runSql.sql, /purchase_order_lines/)
+  const exist = client.sent.find((q) => /count\(\*\)/.test(q.sql))!
+  assert.match(exist.sql, /FROM purchase_orders WHERE id = ANY/)
+  assert.deepEqual(exist.values, [['po1', 'po2']])
+  const gone = await sectionOf('firstLoadProvenance', fake(answer([run()], [{ id: 'po1' }, { id: 'po2' }], '1')))
+  assert.ok(gone.ok && gone.value!.attributedExisting === 1, 'a deleted attributed order is counted as missing')
   const none = await sectionOf('firstLoadProvenance', fake(answer([], [])))
   assert.ok(none.ok && none.value === null)
   const reason = async (runs: Array<Record<string, unknown>>, logs: Array<Record<string, unknown>> = []) => {
@@ -185,10 +191,11 @@ test('firstLoadProvenance: the run record and every order carrying THAT run\'s s
     return s.ok ? 'ok' : s.reason
   }
   assert.equal(await reason([run(), run({ run_id: 'run-2' })]), 'DUPLICATE_KEY')
-  assert.equal(await reason([run({ created: 'x' })]), 'BAD_VALUE')
+  assert.equal(await reason([run({ emitted: 'x' })]), 'BAD_VALUE')
+  assert.equal(await reason([run({ failed: '-1' })]), 'BAD_VALUE')
   assert.equal(await reason([run({ status: 'BOGUS' })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([run({ run_id: '' })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([run()], [{ id: 'po1' }, { id: 'po1' }]), 'DUPLICATE_KEY')
-  assert.equal(await reason([run({ created: null })]), 'ok')
+  assert.equal(await reason([run({ emitted: null, failed: null })]), 'ok')
   assert.equal(await reason([run()], [{ id: null }]), 'BAD_KEY')
 })

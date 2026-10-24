@@ -151,11 +151,14 @@ export type PoRow = { id: string; reference: string; status: string; currency: s
  * WHICH PURCHASE ORDERS THE FIRST LOAD CREATED, from what IMS RECORDED (never from a reference's prefix, never from the export). The first-load apply runner
  * creates each order through createPurchaseOrder with a system-actor context, and that function writes an activity-log row (entity PURCHASE_ORDER,
  * entity id = the order's id, action `created`) whose metadata carries `actor: {kind: 'system', runId, operator}` (app/actions/purchase-orders.ts, lib/first-load/apply/system-import-capability.ts
- * withSystemActor). `runId` is the run record's `run_id`. So: `runId`, `status` and `journalCreated` (the run record's purchase-orders step: lines created) come from
- * first_load_apply_runs; `attributed` is the id of every order carrying that run's system-actor creation row, and `attributedLines` the lines those orders hold now.
- * The activity log has a retention sweep, so a pruned row would make an order look native: the item compares `attributedLines` with `journalCreated`.
+ * withSystemActor). `runId` is the run record's `run_id`. So: `runId`, `status`, `journalEmitted` and `journalFailed` (the run record's purchase-orders step: orders emitted and failed) come from
+ * first_load_apply_runs; `attributed` is the id of every order carrying that run's system-actor creation row, and `attributedExisting` how many of those ids are still purchase orders.
+ * The activity log has a retention sweep, so a pruned row would make an order look native. COMPLETENESS IS PROVEN AGAINST ORDERS: the run record's purchase-orders step counts UNITS, and a unit
+ * of that step is ONE ORDER (all the lines of one order, lib/first-load/validate.ts; orchestrate.ts classifies each unit absent -> present = created, present -> present = skippedExisting),
+ * per ATTEMPT, so `created` alone is not the run's total after a resume; `emitted` (= created + updated + skippedExisting + failed, orchestrate.ts:353) is the number of orders in the
+ * step's file, every one of them present when the run is VERIFIED. So `journalEmitted` (with `journalFailed` = 0) is what the number of distinct attributed orders must equal.
  */
-export type FirstLoadProvenance = { runId: string; status: string; journalCreated: number | null; attributed: string[]; attributedLines: number }
+export type FirstLoadProvenance = { runId: string; status: string; journalEmitted: number | null; journalFailed: number | null; attributed: string[]; attributedExisting: number }
 /**
  * The central exchange-rate table (fx_rates, fed by lib/currencies/fx-refresh.ts): 1 unit of the base currency (GBP) = `rate` units of
  * `currency`, as fetched at `fetchedAt`. Every row from the base currency is read (a cap is CAP_EXCEEDED); nothing is picked here: the item
@@ -603,17 +606,18 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   },
 
   async firstLoadProvenance(tx) {
-    const runs = await tx.query(`SELECT run_id, status, steps->'purchase-orders'->>'created' AS created FROM first_load_apply_runs`)
+    const runs = await tx.query(`SELECT run_id, status, steps->'purchase-orders'->>'emitted' AS emitted, steps->'purchase-orders'->>'failed' AS failed FROM first_load_apply_runs`)
     if (runs.length > 1) throw new Unreadable('DUPLICATE_KEY')
     if (runs.length === 0) return null
     const runId = text(runs[0]!.run_id, 'SOURCE_UNREADABLE')
     const status = oneOf(runs[0]!.status, FIRST_LOAD_RUN_STATUSES)
-    const journalCreated = runs[0]!.created === null || runs[0]!.created === undefined ? null : count(runs[0]!.created)
+    const journalEmitted = runs[0]!.emitted === null || runs[0]!.emitted === undefined ? null : count(runs[0]!.emitted)
+    const journalFailed = runs[0]!.failed === null || runs[0]!.failed === undefined ? null : count(runs[0]!.failed)
     const rows = await readCapped(tx, `SELECT "entityId" AS id FROM activity_logs WHERE "entityType"::text = 'PURCHASE_ORDER' AND action = 'created' AND metadata->'actor'->>'kind' = 'system' AND metadata->'actor'->>'runId' = $1 AND "entityId" IS NOT NULL ORDER BY "entityId"`, [runId])
     const attributed = rows.map((row) => text(row.id))
     unique(attributed, (id) => id)
-    const lines = attributed.length === 0 ? [{ n: '0' }] : await tx.query(`SELECT count(*)::text AS n FROM purchase_order_lines WHERE "poId" = ANY($1::text[])`, [attributed])
-    return { runId, status, journalCreated, attributed, attributedLines: count(lines[0]!.n) }
+    const existing = attributed.length === 0 ? [{ n: '0' }] : await tx.query(`SELECT count(*)::text AS n FROM purchase_orders WHERE id = ANY($1::text[])`, [attributed])
+    return { runId, status, journalEmitted, journalFailed, attributed, attributedExisting: count(existing[0]!.n) }
   },
 
   async fxRates(tx) {

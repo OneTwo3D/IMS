@@ -268,14 +268,15 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
     // The load that put the Qoblex numbers into IMS must be a recorded, verified one: without it the reference carries no recorded meaning.
     if (boundaries.value.firstLoad.state !== 'verified') return inconclusive(id, SOURCES, 'NO_POPULATION_RECORD')
 
-    // THE POPULATION IS WHAT THE FIRST LOAD CREATED, from recorded provenance. The provenance must belong to the VERIFIED run, and must be complete: the
-    // lines of the orders it attributes must be exactly the lines the run record says it created (an activity-log row pruned by retention would
-    // otherwise make a first-load order look native and drop it from the comparison).
+    // THE POPULATION IS WHAT THE FIRST LOAD CREATED, from recorded provenance. The provenance must belong to the VERIFIED run, and must be complete AGAINST ORDERS:
+    // the number of DISTINCT orders it attributes must equal the number of orders the run record's purchase-orders step emitted (a unit is one order; every unit is
+    // present when the run is VERIFIED and none failed), and every attributed id must still be a purchase order (an activity-log row pruned by retention, or an order
+    // deleted since, would otherwise make a first-load order look native, or vanish, and drop it from the comparison). Lines are not counted: editing a line changes nothing here.
     const provenance = ims.sections.firstLoadProvenance
     if (provenance === undefined) return inconclusive(id, SOURCES, 'SOURCE_UNREADABLE')
     if (!provenance.ok) return inconclusive(id, SOURCES, provenance.reason)
     const p = provenance.value
-    if (p === null || p.status !== 'VERIFIED' || p.journalCreated === null || p.attributedLines !== p.journalCreated) return inconclusive(id, SOURCES, 'NO_POPULATION_RECORD')
+    if (p === null || p.status !== 'VERIFIED' || p.journalEmitted === null || p.journalFailed !== 0 || new Set(p.attributed).size !== p.attributed.length || p.attributed.length !== p.journalEmitted || p.attributedExisting !== p.attributed.length) return inconclusive(id, SOURCES, 'NO_POPULATION_RECORD')
 
     const mine = imsSide(orders.value, keyPrefix, new Set(p.attributed))
     if (!mine.ok) return inconclusive(id, SOURCES, mine.reason)
