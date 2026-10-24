@@ -22,6 +22,8 @@ import type { PurchaseCreditNoteLookup } from '@/lib/domain/purchasing/supplier-
  * the four happens, because the difference is invisible in the payload.
  */
 
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
+
 const calls: Array<{ method: 'GET' | 'POST' | 'PUT'; path: string; body?: Record<string, unknown> }> = []
 let getResponse: { ok: boolean; status: number; data?: unknown; error?: string } = {
   ok: true, status: 200, data: { CreditNotes: [] },

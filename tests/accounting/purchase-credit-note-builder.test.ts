@@ -20,7 +20,7 @@ const base: CreditNoteData = {
 }
 
 test('builds an ACCPAYCREDIT (purchase) credit note, not a sales one', () => {
-  const body = buildXeroPurchaseCreditNote(base, 'AUTHORISED', 'contact-123')
+  const body = buildXeroPurchaseCreditNote(base, 'AUTHORISED', 'contact-123', 'GBP')
   assert.equal(body.Type, XERO_PURCHASE_CREDIT_NOTE_TYPE)
   assert.equal(XERO_PURCHASE_CREDIT_NOTE_TYPE, 'ACCPAYCREDIT')
   assert.deepEqual(body.Contact, { ContactID: 'contact-123' })
@@ -31,7 +31,7 @@ test('builds an ACCPAYCREDIT (purchase) credit note, not a sales one', () => {
 })
 
 test('maps line items with the expense account code + tax type', () => {
-  const body = buildXeroPurchaseCreditNote(base, 'DRAFT', 'c1')
+  const body = buildXeroPurchaseCreditNote(base, 'DRAFT', 'c1', 'GBP')
   const lines = body.LineItems as Array<Record<string, unknown>>
   assert.equal(lines.length, 1)
   assert.equal(lines[0].AccountCode, '6200')
@@ -45,15 +45,16 @@ test('defaults a missing line tax type to NONE (Xero mandates TaxType)', () => {
     { ...base, lines: [{ description: 'x', quantity: 1, unitAmount: 10, accountCode: '6200' }] },
     'AUTHORISED',
     'c1',
+    'GBP',
   )
   const lines = body.LineItems as Array<Record<string, unknown>>
   assert.equal(lines[0].TaxType, 'NONE')
 })
 
 test('stamps the IMS FX rate and omits Reference when absent', () => {
-  const withRate = buildXeroPurchaseCreditNote(base, 'AUTHORISED', 'c1')
+  const withRate = buildXeroPurchaseCreditNote(base, 'AUTHORISED', 'c1', 'GBP')
   assert.ok('CurrencyRate' in withRate, 'CurrencyRate should be stamped when currencyRateToBase is set')
 
-  const noRef = buildXeroPurchaseCreditNote({ ...base, reference: undefined }, 'AUTHORISED', 'c1')
+  const noRef = buildXeroPurchaseCreditNote({ ...base, reference: undefined }, 'AUTHORISED', 'c1', 'GBP')
   assert.equal('Reference' in noRef, false)
 })

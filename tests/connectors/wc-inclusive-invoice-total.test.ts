@@ -126,6 +126,7 @@ async function buildInvoiceForWcOrder(order: {
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
 }
 

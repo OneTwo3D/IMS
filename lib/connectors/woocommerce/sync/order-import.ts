@@ -4,6 +4,7 @@
 
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
+import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { logActivity } from '@/lib/activity-log'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
@@ -2670,7 +2671,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           currency,
           // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
-          currencyRateToBase: Number(fxRate) || undefined,
+          currencyRateToBase: usableStoredFxRate(fxRate)?.toNumber(),
           reference: orderNumber,
           lines: lineData.map((l, idx) => ({
             itemCode: l.productId ? (l.sku || undefined) : undefined,

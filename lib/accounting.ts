@@ -727,6 +727,29 @@ async function recordRefusalIfAsked(
   return true
 }
 
+/**
+ * o3d-q0x56.2 / .3 - THE FOREIGN-RATE VERDICT FOR THIS ENQUEUE, or null. Reads the base currency (pooled) only for a type that carries a
+ * foreign rate and a payload that names a currency, so every other enqueue pays nothing. See foreign-currency-rate-guard.ts.
+ */
+async function foreignRateRefusalForEnqueue(params: {
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  payload: Record<string, unknown>
+}) {
+  const { needsForeignRate, foreignCurrencyRateRefusal } = await import('@/lib/domain/accounting/foreign-currency-rate-guard')
+  if (!needsForeignRate(params.type)) return null
+  if (typeof params.payload.currency !== 'string' || params.payload.currency.trim() === '') return null
+  const { getBaseCurrencyCode } = await import('@/lib/base-currency')
+  return foreignCurrencyRateRefusal({
+    type: params.type,
+    referenceType: params.referenceType,
+    referenceId: params.referenceId,
+    payload: params.payload,
+    baseCurrency: await getBaseCurrencyCode(),
+  })
+}
+
 export async function queueAccountingSync(params: {
   type: AccountingSyncType
   referenceType: string
@@ -927,6 +950,31 @@ export async function queueAccountingSync(params: {
   // pay nothing.
   if (isFxGainLossJournalSuppressed(connector, params.type)) {
     return { ...await notConfiguredUnderPinnedLedgerFence(params.connector), connector }
+  }
+
+  // o3d-q0x56.2 / .3 - A FOREIGN POSTING WITH NO USABLE IMS RATE IS NOT QUEUED. After every "is this the right ledger" answer above, and only
+  // for a connector that WOULD post this type: a posting nobody will make is not owed, so it must not become a debt in the inbox.
+  const rateRefusal = await foreignRateRefusalForEnqueue(params)
+  if (rateRefusal && await isAccountingSyncTypeEnabledFor(connector, params.type)) {
+    const { logActivity } = await import('@/lib/activity-log')
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: `accounting_enqueue_refused_${rateRefusal.reason}`,
+      tag: 'accounting',
+      level: 'ERROR',
+      description: `NOTHING WAS QUEUED. ${rateRefusal.message} This posting is still OUTSTANDING. ${withHandPostSafety(rateRefusal.remedy)}`,
+      metadata: { type: params.type, referenceType: params.referenceType, referenceId: params.referenceId, ...rateRefusal.detail },
+    }).catch(() => { /* logging must never turn a refusal into a throw */ })
+    const activeNowForRate = await getActiveAccountingConnectorId().catch(() => null)
+    const recordedForRate = await recordRefusalIfAsked({ ...params, recordRefusalAsOutstanding: true, posting, decidedAt }, {
+      chartConnector: params.chartConnector,
+      activeConnector: activeNowForRate,
+      reason: rateRefusal.reason,
+      committed: 'the document or payment this posting is for stands in IMS',
+      remedy: `${rateRefusal.remedy} ${MARK_REMEDY_TAIL}`,
+      detail: rateRefusal.detail,
+    })
+    return { queued: false, reason: 'refused', connector, activeConnector: activeNowForRate, refusalRecorded: recordedForRate, posting }
   }
 
   // o3d-i0o6 r8: `pinnedLedger` is what makes the check above binding at the moment of the write. It
@@ -1494,6 +1542,28 @@ export async function queueAccountingSyncTx(
   // Return false: no IMS GL counterpart posts, so callers stay consistent.
   if (isFxGainLossJournalSuppressed(context.connector, params.type)) {
     return answer({ queued: false, reason: 'not-configured' }, context.connector)
+  }
+
+  // o3d-q0x56.2 / .3 - A FOREIGN POSTING WITH NO USABLE IMS RATE IS NOT QUEUED (after the verdict: a type nobody posts is not owed). `refused`
+  // keeps the posting owed; the caller reports it (reportPostingNotQueued), or rolls its own change back, exactly as for any other refusal.
+  {
+    const rateRefusalTx = await foreignRateRefusalForEnqueue(params)
+    if (rateRefusalTx) {
+      const { logActivity } = await import('@/lib/activity-log')
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: `accounting_enqueue_refused_${rateRefusalTx.reason}`,
+        tag: 'accounting',
+        level: 'ERROR',
+        description: `NOTHING WAS QUEUED. ${rateRefusalTx.message} This posting is still OUTSTANDING. ${withHandPostSafety(rateRefusalTx.remedy)}`,
+        metadata: { type: params.type, referenceType: params.referenceType, referenceId: params.referenceId, ...rateRefusalTx.detail },
+      }).catch(() => { /* logging must never turn a refusal into a throw */ })
+      return answer({ queued: false, reason: 'refused' }, context.connector, {
+        reason: rateRefusalTx.reason,
+        remedy: `${rateRefusalTx.remedy} ${MARK_REMEDY_TAIL}`,
+        detail: rateRefusalTx.detail,
+      })
+    }
   }
 
   // o3d-19gy: the CONNECTION this payload was composed for. Stamped for whichever connector is active,

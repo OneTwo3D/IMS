@@ -100,6 +100,8 @@ const postingRefusalTable = {
 }
 const outstandingRows = () => refusalRows.filter((row) => row.resolvedAt === null)
 
+// o3d-q0x56.2/.3: the payment and document posters read the base currency to tell a foreign posting from a base one.
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/db/savepoint', {
   namedExports: { withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => fn() },
 })

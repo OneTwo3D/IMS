@@ -122,6 +122,8 @@ const db = {
   async $transaction(fn: (tx: unknown) => Promise<unknown>) { return fn(db) },
 }
 
+// o3d-q0x56.2/.3: the payment and document posters read the base currency to tell a foreign posting from a base one.
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/db', { namedExports: { db } })
 /**
  * o3d-0m56: every money post now runs inside `postMoneyUnderLedgerFence`, which takes a per-DOCUMENT
@@ -235,6 +237,8 @@ const PAYMENT_PAYLOAD = {
   bankAccountId: 'BANK-1',
   amount: 250,
   paymentDate: '2026-01-02',
+  // o3d-q0x56.2: a payment payload names its currency (the processor refuses one that does not); this one is in the base currency.
+  currency: 'GBP',
 }
 
 test('o3d-gfh: a rebinding BETWEEN the check and the request is refused, and nothing reaches the wire', async () => {

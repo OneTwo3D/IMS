@@ -1,4 +1,5 @@
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
+import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type PurchaseInvoiceEditHeader = {
@@ -310,7 +311,8 @@ export function buildPurchaseInvoiceAccountingPayload(params: {
     date: params.date,
     dueDate: params.dueDate ?? undefined,
     currency: params.currency,
-    currencyRateToBase: Number(params.fxRateToBase) || undefined,
+    // o3d-q0x56.3: the PO's STORED booked rate, or absent (a foreign bill without one is refused at the enqueue and at the connector).
+    currencyRateToBase: usableStoredFxRate(params.fxRateToBase)?.toNumber(),
     reference: params.poReference,
     lines: params.lines,
     supplierInvoicePath: params.supplierInvoicePath ?? undefined,
