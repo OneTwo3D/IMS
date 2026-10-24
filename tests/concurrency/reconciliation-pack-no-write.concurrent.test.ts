@@ -46,31 +46,106 @@ async function census(): Promise<Census> {
 }
 
 
-// THE TIER SHARES ONE DATABASE: a Xero token and a first-load run record left by another file are visible to a run, and each is a unique row
-// (one token per connector, one first-load record, whose singleton flag a check constraint pins to true) that a test needing its own must not
-// delete or collide with. A foreign token is held aside by renaming its connector; a foreign first-load record is saved WHOLE (every column, as
-// JSON), removed, and re-inserted exactly. A foreign Xero sync-log row that R10 would read as an IMS-originated write (SYNCED, PROCESSING or carrying
-// a document id) is held aside by renaming its connector. Both are put back in finally and the counts asserted.
-type Held = { tokens: string[]; firstLoad: string[]; syncRows: string[] }
-const NOTHING_HELD: Held = { tokens: [], firstLoad: [], syncRows: [] }
-async function holdForeignEstate(): Promise<Held> {
-  const tokens = (await withClient((c) => c.query(`SELECT id FROM accounting_tokens WHERE connector = 'xero' ORDER BY id`))).rows.map((r: { id: string }) => r.id)
-  const firstLoad = (await withClient((c) => c.query(`SELECT to_jsonb(t)::text AS j FROM first_load_apply_runs t ORDER BY id`))).rows.map((r: { j: string }) => r.j)
-  const syncRows = (await withClient((c) => c.query(`SELECT id FROM accounting_sync_logs WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id`))).rows.map((r: { id: string }) => r.id)
-  const held: Held = { tokens, firstLoad, syncRows }
-  if (syncRows.length > 0) await withClient((c) => c.query(`UPDATE accounting_sync_logs SET connector = 'held-xero' WHERE id = ANY($1) AND connector = 'xero'`, [syncRows]))
-  if (tokens.length > 0) await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'held-' || id WHERE id = ANY($1) AND connector = 'xero'`, [tokens]))
-  for (const j of firstLoad) await withClient((c) => c.query(`DELETE FROM first_load_apply_runs WHERE id = $1`, [(JSON.parse(j) as { id: string }).id]))
+// WHY HOLDS EXIST. CI runs the whole concurrency tier on ONE shared scratch database, so a Xero token, a first-load run record and Xero sync-log
+// rows left by other files are visible to a run, and each is a row a test needing its own must not delete or collide with (one token per connector;
+// one first-load record, whose singleton flag a check constraint pins to true; R10 reads every write-shaped sync row). The command reads on OTHER
+// connections, so a hold must be COMMITTED. A committed hold that nothing can undo strands foreign rows if the test fails or the process is killed,
+// so every hold is SELF-DESCRIBING AND DURABLE: in the SAME transaction as the rename or delete, the row's full original goes into the test-owned
+// table `_test_held_rows` (run_id, kind, table_name, row_id, payload jsonb, held_at). There is never a committed change without its recovery record.
+// Restore reads that table, not a value held in memory, and every hold first sweeps the entries of any EARLIER run (run_id other than its own), so
+// a killed run heals on the next. The table is created only here, only after scratch-database-setup has refused a non-scratch database, so it only
+// ever exists in scratch/CI databases.
+type Held = string
+const NOTHING_HELD: Held = ''
+let holdCounter = 0
+const HELD_DDL = `CREATE TABLE IF NOT EXISTS _test_held_rows (run_id text NOT NULL, kind text NOT NULL, table_name text NOT NULL, row_id text NOT NULL, payload jsonb NOT NULL, held_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (run_id, table_name, row_id))`
+
+type Q = import('pg').Client
+/** Put back every entry matching `where` (a run id filter), delete the entries, all in one transaction; returns how many entries were restored. */
+async function restoreHeld(client: Q, runFilter: { run: string } | { notRun: string }): Promise<number> {
+  const [clause, value] = 'run' in runFilter ? ['run_id = $1', runFilter.run] : ['run_id <> $1', runFilter.notRun]
+  await client.query('BEGIN')
+  try {
+    await client.query(HELD_DDL)
+    const entries = (await client.query(`SELECT run_id, kind, table_name, row_id, payload FROM _test_held_rows WHERE ${clause} ORDER BY held_at, row_id FOR UPDATE`, [value])).rows as Array<{ run_id: string; kind: string; table_name: string; row_id: string; payload: Record<string, unknown> }>
+    for (const e of entries) {
+      if (e.kind === 'token') await client.query(`UPDATE accounting_tokens SET connector = $2 WHERE id = $1 AND connector = 'held-' || id`, [e.row_id, e.payload.connector])
+      else if (e.kind === 'sync_row') await client.query(`UPDATE accounting_sync_logs SET connector = $2 WHERE id = $1 AND connector = 'held-xero'`, [e.row_id, e.payload.connector])
+      else if (e.kind === 'first_load') await client.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(e.payload)])
+      else throw new Error(`unknown held kind ${e.kind}`)
+    }
+    await client.query(`DELETE FROM _test_held_rows WHERE ${clause}`, [value])
+    await client.query('COMMIT')
+    return entries.length
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  }
+}
+
+/** Heal whatever an earlier (failed or killed) run left held. Called at the start of every hold. */
+async function sweepEarlierHolds(except: string): Promise<number> {
+  return withClient((client) => restoreHeld(client, { notRun: except }))
+}
+
+/**
+ * Hold every foreign Xero token, first-load record and write-shaped Xero sync row aside, recording each original in `_test_held_rows` in the SAME
+ * single transaction. `injectFailureAfter` (tests of this helper only) throws inside the transaction after that many holds, which rolls ALL of it back.
+ */
+async function holdForeignEstate(injectFailureAfter?: number): Promise<Held> {
+  const runId = `${process.pid}-${++holdCounter}-${Date.now()}`
+  await sweepEarlierHolds(runId)
+  await withClient(async (client) => {
+    await client.query('BEGIN')
+    try {
+      await client.query(HELD_DDL)
+      let held = 0
+      const step = () => { held += 1; if (injectFailureAfter !== undefined && held >= injectFailureAfter) throw new Error('injected failure after hold') }
+      const record = (kind: string, table: string, id: string, payload: unknown) => client.query(`INSERT INTO _test_held_rows (run_id, kind, table_name, row_id, payload) VALUES ($1, $2, $3, $4, $5::jsonb)`, [runId, kind, table, id, JSON.stringify(payload)])
+      for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM accounting_tokens t WHERE connector = 'xero' ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+        await record('token', 'accounting_tokens', row.id, row.j)
+        await client.query(`UPDATE accounting_tokens SET connector = 'held-' || id WHERE id = $1 AND connector = 'xero'`, [row.id])
+        step()
+      }
+      for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM accounting_sync_logs t WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL) ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+        await record('sync_row', 'accounting_sync_logs', row.id, row.j)
+        await client.query(`UPDATE accounting_sync_logs SET connector = 'held-xero' WHERE id = $1 AND connector = 'xero'`, [row.id])
+        step()
+      }
+      for (const row of (await client.query(`SELECT id, to_jsonb(t) AS j FROM first_load_apply_runs t ORDER BY id FOR UPDATE`)).rows as Array<{ id: string; j: unknown }>) {
+        await record('first_load', 'first_load_apply_runs', row.id, row.j)
+        await client.query(`DELETE FROM first_load_apply_runs WHERE id = $1`, [row.id])
+        step()
+      }
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    }
+  })
   const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs)::int AS f`))).rows[0]
   assert.deepEqual([visible.t, visible.f], [0, 0], 'precondition: no foreign Xero token or first-load record is visible to the run')
-  return held
+  return runId
 }
-async function restoreForeignEstate(held: Held): Promise<void> {
-  const t = held.tokens.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'xero' WHERE id = ANY($1) AND connector = 'held-' || id`, [held.tokens]))).rowCount
-  const r = held.syncRows.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE accounting_sync_logs SET connector = 'xero' WHERE id = ANY($1) AND connector = 'held-xero'`, [held.syncRows]))).rowCount
-  let f = 0
-  for (const j of held.firstLoad) f += (await withClient((c) => c.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb)`, [j]))).rowCount ?? 0
-  assert.deepEqual([t, f, r], [held.tokens.length, held.firstLoad.length, held.syncRows.length], 'every foreign Xero token, first-load record and write-shaped sync row was put back')
+
+/** Put this run's holds back from the table (never from memory) and assert every one was. */
+async function restoreForeignEstate(runId: Held): Promise<void> {
+  if (runId === NOTHING_HELD) return
+  const { restored, expected } = await withClient(async (client) => {
+    await client.query(HELD_DDL)
+    const expected = (await client.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId])).rows[0].n as number
+    return { restored: await restoreHeld(client, { run: runId }), expected }
+  })
+  assert.equal(restored, expected, 'every foreign Xero token, first-load record and write-shaped sync row was put back')
+  assert.equal((await withClient((c) => c.query(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [runId]))).rows[0].n, 0, 'no entry of this run is left')
+}
+
+/** A digest of every row a hold touches, as stored, for before/after comparison in the arms below. */
+async function heldKindsDigest(): Promise<string> {
+  return (await withClient((c) => c.query(`SELECT md5(coalesce(string_agg(x, '|' ORDER BY x), '')) AS d FROM (
+    SELECT 't:' || to_jsonb(t)::text AS x FROM accounting_tokens t WHERE connector IN ('xero') OR connector LIKE 'held-%'
+    UNION ALL SELECT 's:' || to_jsonb(t)::text FROM accounting_sync_logs t WHERE connector IN ('xero', 'held-xero') AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL)
+    UNION ALL SELECT 'f:' || to_jsonb(t)::text FROM first_load_apply_runs t) q`))).rows[0].d as string
 }
 
 test('[reconciliation pack] the rig can fail: a control write moves the row counts and the statistics', { skip: !RUN }, async () => {
@@ -998,5 +1073,55 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
     rmSync(dir, { recursive: true, force: true })
     rmSync(exportDir, { recursive: true, force: true })
     assert.deepEqual(restored, { orders: held.orders.length, movements: held.movements.length, runs: held.runs.length, snapshots: held.snapshots.length }, 'every held foreign row was restored')
+  }
+})
+
+// ---- the holds themselves --------------------------------------------------------------------------------------------------------
+
+// [mutation: the recovery record written outside the hold's transaction / the sweep removed / restore taken from memory]
+test('[reconciliation pack] the holds are durable: a failure after the first hold rolls ALL of it back, a failure after the commit is healed by the restore, and a killed run is healed by the next hold\'s sweep; foreign rows are identical each time', { skip: !RUN }, async () => {
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const tag = `RCHOLD${process.pid}`
+  // Foreign rows other files left are simply part of what the holds take and give back: they are counted, not avoided (holds do not nest: each hold
+  // sweeps every other run's entries first).
+  try {
+    // Holds do not nest, so foreign rows are not avoided: the unique rows (one token, one first-load record) are seeded only when a foreign one is not already there.
+    await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") SELECT $1, 'xero', 'y', '2031-01-01', 'hold-tenant', now() WHERE NOT EXISTS (SELECT 1 FROM accounting_tokens WHERE connector = 'xero')`, [`${tag}-tok`])
+    await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) SELECT $1, true, 1, 'd', 'r', 'APPLIED', '{}', '{}', '2026-01-01 09:00:00', '2026-01-02 09:00:00' WHERE NOT EXISTS (SELECT 1 FROM first_load_apply_runs)`, [`${tag}-fl`])
+    await sql(`INSERT INTO accounting_sync_logs (id, connector, type, status, "referenceType", "referenceId", "createdAt") VALUES ($1, 'xero', 'COGS_JOURNAL', 'PROCESSING', 'CogsEntry', 'hold', now())`, [`${tag}-sync`])
+    const before = await heldKindsDigest()
+    const baseVisible = (await sql(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int + (SELECT count(*) FROM first_load_apply_runs)::int AS n`)).rows[0].n as number
+    const tables = async () => (await sql(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs)::int AS f, (SELECT count(*) FROM _test_held_rows)::int AS h`)).rows[0] as { t: number; f: number; h: number }
+    const entries = (await sql(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int + (SELECT count(*) FROM first_load_apply_runs)::int + (SELECT count(*) FROM accounting_sync_logs WHERE connector = 'xero' AND (status::text IN ('SYNCED', 'PROCESSING') OR "externalTransactionId" IS NOT NULL))::int AS n`)).rows[0].n as number
+    const visibleMine = async () => (await sql(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int + (SELECT count(*) FROM first_load_apply_runs)::int AS n`)).rows[0].n as number
+
+    // (a) a failure injected after the FIRST hold: the single transaction rolls everything back; nothing is stranded and no entry is committed.
+    await assert.rejects(holdForeignEstate(1), /injected failure after hold/)
+    assert.equal(await heldKindsDigest(), before, 'a failed hold changed nothing')
+    assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
+    // (a2) a failure AFTER the commit (the test body throws): the finally restores from the table.
+    let held: Held = NOTHING_HELD
+    await assert.rejects((async () => { try { held = await holdForeignEstate(); assert.deepEqual(await tables(), { t: 0, f: 0, h: entries }); throw new Error('the test body failed') } finally { await restoreForeignEstate(held) } })(), /the test body failed/)
+    assert.equal(await heldKindsDigest(), before, 'the finally put everything back')
+    assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
+
+    // (b) a KILLED run: holds committed, restore never reached, the run id is gone. The next hold sweeps it BEFORE holding, so the rows are back and held again under the new run.
+    const killed = await holdForeignEstate()
+    assert.deepEqual(await tables(), { t: 0, f: 0, h: entries })
+    void killed // the id is forgotten, as a killed process forgets it
+    assert.equal(await sweepEarlierHolds('some-other-run'), entries, 'the sweep restored the dead run\'s entries')
+    assert.equal(await heldKindsDigest(), before, 'the dead run\'s rows are back exactly')
+    assert.equal((await tables()).h, 0); assert.equal(await visibleMine(), baseVisible)
+    const dead = await holdForeignEstate() // killed again
+    const next = await holdForeignEstate() // the next run: its own sweep heals `dead` first, then holds
+    assert.notEqual(next, dead)
+    assert.deepEqual(await tables(), { t: 0, f: 0, h: entries })
+    assert.equal((await sql(`SELECT count(*)::int AS n FROM _test_held_rows WHERE run_id = $1`, [dead])).rows[0].n, 0, 'nothing of the dead run is left')
+    await restoreForeignEstate(next)
+    assert.equal(await heldKindsDigest(), before, 'foreign rows identical after the next run restored')
+  } finally {
+    await sql(`DELETE FROM accounting_sync_logs WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${tag}%'`)
+    await sql(`DELETE FROM first_load_apply_runs WHERE id LIKE '${tag}%'`)
   }
 })
