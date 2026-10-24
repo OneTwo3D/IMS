@@ -76,9 +76,10 @@ test('purchaseOrders: a repeated reference, a line of an order not read, a value
 
 const netRow = (over: Record<string, unknown> = {}) => ({ po_id: 'po1', source_type: 'PURCHASE_BILL', net: '100.500000', ...over })
 const tOrder = (over: Record<string, unknown> = {}) => ({ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', type: 'GOODS', created: '2026-09-01T10:00:00.000Z', ...over })
-function transitAnswer(opts: { coverage?: Array<Record<string, unknown>>; net?: Array<Record<string, unknown>>; orders?: Array<Record<string, unknown>>; open?: Array<Record<string, unknown>> }) {
+function transitAnswer(opts: { pre?: { orders?: string; rows?: string; returns?: string }; coverage?: Array<Record<string, unknown>>; net?: Array<Record<string, unknown>>; orders?: Array<Record<string, unknown>>; open?: Array<Record<string, unknown>> }) {
   return (sql: string) => {
     if (/FROM settings/.test(sql)) return opts.coverage ?? [{ value: '2026-01-01' }]
+    if (/count\(\*\)::text/.test(sql)) return [{ n: opts.pre?.[/FROM purchase_orders/.test(sql) ? 'orders' : /FROM transit_subledger_movements/.test(sql) ? 'rows' : 'returns'] ?? '0' }]
     if (/FROM transit_subledger_movements/.test(sql)) return opts.net ?? []
     if (/po\.id = ANY/.test(sql)) return opts.orders ?? []
     if (/po\.status::text = ANY/.test(sql)) return opts.open ?? []
@@ -93,7 +94,7 @@ test('transitSchedule: needs the cycle date; reads the sub-ledger up to and incl
   const section = await sectionOf('transitSchedule', client, '2026-10-19')
   assert.ok(section.ok)
   assert.deepEqual(section.value, {
-    asOf: '2026-10-19', coverageStart: '2026-01-01',
+    asOf: '2026-10-19', coverageStart: '2026-01-01', preWatermark: { orders: 0, rows: 0, returns: 0 },
     net: [{ poId: 'po1', sourceType: 'PURCHASE_BILL', net: '100.500000' }, { poId: 'po1', sourceType: 'STOCK_RECEIPT', net: '-40' }],
     customerReturns: '7.25',
     orders: [{ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', type: 'GOODS', createdAt: '2026-09-01T10:00:00.000Z' }],
@@ -198,4 +199,29 @@ test('firstLoadProvenance: the run record (orders emitted and failed) and every 
   assert.equal(await reason([run()], [{ id: 'po1' }, { id: 'po1' }]), 'DUPLICATE_KEY')
   assert.equal(await reason([run({ emitted: null, failed: null })]), 'ok')
   assert.equal(await reason([run()], [{ id: null }]), 'BAD_KEY')
+})
+
+// [mutation: a pre-watermark kind read without the watermark bound, or counted only for open orders / goods orders / non-cancelled orders]
+test('transitSchedule: counts what predates the watermark - ANY purchase order (no type or status filter), sub-ledger rows dated before it, and the refund-in-transit source documents - bound to the watermark; none are read when no watermark is recorded', async () => {
+  const client = fake(transitAnswer({ pre: { orders: '3', rows: '1', returns: '2' } }))
+  const section = await sectionOf('transitSchedule', client, '2026-10-19')
+  assert.ok(section.ok)
+  assert.deepEqual(section.value.preWatermark, { orders: 3, rows: 1, returns: 2 })
+  const counts = client.sent.filter((q) => /count\(\*\)::text/.test(q.sql))
+  assert.equal(counts.length, 3)
+  for (const q of counts) assert.deepEqual(q.values, ['2026-01-01'])
+  const orders = counts.find((q) => /FROM purchase_orders/.test(q.sql))!
+  assert.match(orders.sql, /"createdAt" < \(\$1::date \+ 1\)/)
+  assert.doesNotMatch(orders.sql, /status|type/, 'any status and any type')
+  assert.match(counts.find((q) => /FROM transit_subledger_movements/.test(q.sql))!.sql, /journal_date < \$1::date/)
+  const returns = counts.find((q) => /FROM accounting_sync_logs/.test(q.sql))!
+  assert.match(returns.sql, /type::text = 'COGS_REVERSAL'/)
+  assert.match(returns.sql, /payload->>'_returnInTransit' = 'true'/)
+  const none = fake(transitAnswer({ coverage: [] }))
+  const unrecorded = await sectionOf('transitSchedule', none, '2026-10-19')
+  assert.ok(unrecorded.ok && unrecorded.value.coverageStart === null)
+  assert.deepEqual(unrecorded.value.preWatermark, { orders: 0, rows: 0, returns: 0 })
+  assert.equal(none.sent.filter((q) => /count\(\*\)::text/.test(q.sql)).length, 0)
+  const bad = await sectionOf('transitSchedule', fake(transitAnswer({ pre: { rows: 'x' } })), '2026-10-19')
+  assert.deepEqual(bad, { ok: false, reason: 'BAD_VALUE' })
 })

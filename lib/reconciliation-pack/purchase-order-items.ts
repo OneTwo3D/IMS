@@ -294,7 +294,9 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
     if (!theirs.ok) return inconclusive(id, SOURCES, theirs.reason)
 
     const inScope = [...mine.orders.values()].filter((o) => !o.outOfScope)
-    const empty = inScope.length === 0 && theirs.orders.size === 0
+    // THE EMPTY PROOF needs IMS to hold NO incoming goods order AT ALL: an order without first-load provenance is out of the judged population, but its existence means "nothing incoming"
+    // is not what IMS shows, so with one present and nothing judged the item is EMPTY_UNPROVEN, never a pass.
+    const empty = inScope.length === 0 && mine.orders.size === 0 && theirs.orders.size === 0
     let rows: { ims: SideRow[]; vendor: SideRow[] }
     if (id === 'R7') {
       const built = r7Rows(mine.orders, theirs.orders)

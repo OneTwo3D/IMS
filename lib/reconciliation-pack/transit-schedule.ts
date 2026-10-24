@@ -15,8 +15,9 @@
  * lib/domain/inventory/po-status-sets.ts) but still hold a non-zero transit balance are listed by identity with that residue, under outOfPopulation
  * (reported, never judged): a finding detail that explains the total and does not change the outcome by itself. Their value is IN the total.
  *
- * COVERAGE (unchanged). The sub-ledger records postings only after its recorded coverage watermark (`transit_ledger_coverage_start_date`) and has no
- * opening balance, so the total is complete only if the watermark is recorded, a real date on or before D, and EVERY open order was created after it;
+ * COVERAGE. The sub-ledger records postings only after its recorded coverage watermark (`transit_ledger_coverage_start_date`) and has no opening balance, so the total
+ * is complete only if the watermark is recorded, a real date on or before D, EVERY purchase order in IMS (goods and freight, any status, cancelled and closed included) was created
+ * after it, EVERY refund-in-transit source document (a COGS reversal marked as debiting transit) was created after it, and NO sub-ledger row is dated before it (ImsTransitSchedule.preWatermark);
  * otherwise NO_POPULATION_RECORD, never a short schedule. A source type this module does not know, or an order IMS does not hold, makes it unreadable.
  * Nothing here reads a clock or a file; the sub-ledger arrives from the one read-only IMS transaction (ims-readers.ts, `transitSchedule`).
  */
@@ -49,11 +50,12 @@ export function buildTransitSchedule(section: ImsTransitSchedule, asOf: string):
     if (watermark === null || !DATE_RE.test(watermark) || watermark > asOf) return { ok: false, reason: 'NO_POPULATION_RECORD' }
     const open = new Map(section.openOrders.map((order) => [order.id, order] as const))
     if (open.size !== section.openOrders.length) return { ok: false, reason: 'DUPLICATE_KEY' }
-    for (const order of section.openOrders) {
-      const created = order.createdAt.slice(0, 10)
-      if (!DATE_RE.test(created)) return { ok: false, reason: 'NO_POPULATION_RECORD' }
-      if (created <= watermark) return { ok: false, reason: 'NO_POPULATION_RECORD' }
-    }
+    // The ledger has no opening balance: ANYTHING that can post to transit and predates the watermark can carry history the total does not hold, and offsetting amounts could then
+    // make the balance equal a partial ledger. So every purchase order of any type and status, every refund-in-transit source document and every sub-ledger row must postdate it. A row
+    // dated before the watermark contradicts the recorded watermark itself (the ledger claims to start there), so the recorded boundary is not trustworthy: NO_POPULATION_RECORD.
+    const pre = section.preWatermark
+    if (typeof pre !== 'object' || pre === null || ![pre.orders, pre.rows, pre.returns].every((n) => Number.isSafeInteger(n) && n >= 0)) return { ok: false, reason: 'SOURCE_UNREADABLE' }
+    if (pre.orders > 0 || pre.rows > 0 || pre.returns > 0) return { ok: false, reason: 'NO_POPULATION_RECORD' }
     const known = new Map(section.orders.map((order) => [order.id, order] as const))
     if (known.size !== section.orders.length) return { ok: false, reason: 'DUPLICATE_KEY' }
 

@@ -986,7 +986,7 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
 
     // The estate: Xero on, five tagged accounts with stored balances for the cycle date, a coverage watermark, a verified first load.
     const setting = (key: string, value: string) => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, value])
-    for (const [key, value] of [[INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'], ['xero_inventory_account', codes.inventory], ['xero_allocated_inventory_account', codes.allocated], ['xero_transit_account', codes.transit], ['xero_cogs_account', codes.cogs], ['xero_unearned_revenue_account', codes.unearned], ['transit_ledger_coverage_start_date', '2026-03-01']] as const) await setting(key, value)
+    for (const [key, value] of [[INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'], ['xero_inventory_account', codes.inventory], ['xero_allocated_inventory_account', codes.allocated], ['xero_transit_account', codes.transit], ['xero_cogs_account', codes.cogs], ['xero_unearned_revenue_account', codes.unearned], ['transit_ledger_coverage_start_date', '2000-01-01']] as const) await setting(key, value)
     await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'x', '2031-01-01', $2, now())`, [`${OTAG}-tok`, `${OTAG}-tenant`])
     const amounts: Record<string, string> = { inventory: '0', allocated: '0', transit: '50', cogs: '0', unearned: '0' }
     for (const [kind, code] of Object.entries(codes)) {
@@ -1055,6 +1055,12 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
     writeExport('11')
     const differs = await run('P2', ['--qoblex-export', exportDir])
     assert.ok(differs.out.includes('R7 fail DIFFERENCES') && differs.out.includes('R8 fail DIFFERENCES'), differs.out.join('\n'))
+    // The coverage watermark is the proof the sub-ledger holds every posting: with it AFTER the order's creation (2026-03-05) the order may carry history the ledger has
+    // no record of, and R11 is NO_POPULATION_RECORD (every purchase order, whatever its status, must postdate the watermark); the watermark of 2000-01-01 is restored after.
+    await sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ('transit_ledger_coverage_start_date', '2026-03-06', now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`)
+    const late = await run('P2', ['--qoblex-export', exportDir])
+    assert.ok(late.out.includes('R11 inconclusive NO_POPULATION_RECORD'), late.out.join('\n'))
+    await sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ('transit_ledger_coverage_start_date', '2000-01-01', now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`)
     // A transit row the schedule does not explain moves R11: another bill on the order (+5) is 55 against the stored 50, beyond GBP 1.
     writeExport('10')
     await sql(`INSERT INTO transit_subledger_movements (id, source_type, source_ref, idempotency_key, base_delta, journal_date) VALUES ($1, 'PURCHASE_BILL_UPDATE', $2, $1, 5, '2026-03-11')`, [`${OTAG}-m3`, `${OTAG}-po`])

@@ -31,6 +31,7 @@ function rig(over: { orders?: Array<Record<string, unknown>>; lines?: Array<Reco
       if (/FROM first_load_apply_runs/.test(sql) && /run_id/.test(sql)) return { rows: [{ run_id: 'run-1', status: 'VERIFIED', emitted: String(orders.length), failed: '0' }] }
       if (/FROM first_load_apply_runs/.test(sql)) return { rows: [{ status: 'VERIFIED', cut: '2026-10-01T00:00:00.000Z' }] }
       if (/FROM activity_logs/.test(sql)) return { rows: orders.map((o) => ({ id: o.id })) }
+      if (/count\(\*\)::text/.test(sql) && (/\$1::date \+ 1\)/.test(sql) || /journal_date < \$1::date/.test(sql))) return { rows: [{ n: '0' }] }
       if (/count\(\*\)::text/.test(sql) && /FROM purchase_orders WHERE id = ANY/.test(sql)) return { rows: [{ n: String(orders.length) }] }
       if (/FROM settings WHERE key = \$1/.test(sql)) return { rows: [{ value: '2026-01-01' }] }
       if (/FROM transit_subledger_movements/.test(sql)) return { rows: over.net ?? [{ po_id: cuid(1), source_type: 'PURCHASE_BILL', net: '50' }] }

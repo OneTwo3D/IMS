@@ -177,7 +177,16 @@ export type FxRateRow = { currency: string; rate: string; fetchedAt: string }
  */
 export type TransitNetRow = { poId: string; sourceType: string; net: string }
 export type TransitOrderRow = { id: string; reference: string; status: string; type: string; createdAt: string }
-export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; net: TransitNetRow[]; customerReturns: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
+/**
+ * What the sub-ledger CANNOT have recorded, because it predates the recorded coverage watermark W (`coverageStart`; all zero when none is recorded). The ledger has no opening
+ * balance and records only postings after W, so any of these makes the whole-ledger total incomplete: `orders` is the number of purchase orders of ANY type and status
+ * (cancelled and closed included) created on or before W's day, `rows` the number of sub-ledger rows dated before W, and `returns` the number of refund cost-of-sales reversals
+ * marked as debiting Stock in Transit (the refund-in-transit leg's source documents: an `accounting_sync_logs` COGS_REVERSAL whose payload carries `_returnInTransit`,
+ * lib/domain/sales/refund-service.ts recordRefundTransitFromSync) created on or before W's day. That leg's debit is its only sub-ledger row, recorded when the journal is
+ * queued, so a reversal queued before the ledger existed has a GL debit and no row.
+ */
+export type TransitPreWatermark = { orders: number; rows: number; returns: number }
+export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; preWatermark: TransitPreWatermark; net: TransitNetRow[]; customerReturns: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
 
 export type ImsSectionValues = {
   identity: ImsIdentity
@@ -661,7 +670,18 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     if (orders.length !== named.length) throw new Unreadable('BAD_KEY')
     const openOrders = orderRows(await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.type::text AS type, ${UTC('po."createdAt"')} AS created FROM purchase_orders po WHERE po.status::text = ANY($1::text[]) ORDER BY po.id`, [statuses]))
     unique(openOrders, (order) => order.id)
-    return { asOf, coverageStart, net, customerReturns, orders, openOrders }
+    const pre = async (sql: string): Promise<number> => {
+      if (coverageStart === null) return 0
+      const found = await tx.query(sql, [coverageStart])
+      if (found.length !== 1) throw new Unreadable('SOURCE_UNREADABLE')
+      return count(found[0]!.n)
+    }
+    const preWatermark: TransitPreWatermark = {
+      orders: await pre(`SELECT count(*)::text AS n FROM purchase_orders WHERE "createdAt" < ($1::date + 1)`),
+      rows: await pre(`SELECT count(*)::text AS n FROM transit_subledger_movements WHERE journal_date < $1::date`),
+      returns: await pre(`SELECT count(*)::text AS n FROM accounting_sync_logs WHERE type::text = 'COGS_REVERSAL' AND payload->>'_returnInTransit' = 'true' AND "createdAt" < ($1::date + 1)`),
+    }
+    return { asOf, coverageStart, preWatermark, net, customerReturns, orders, openOrders }
   },
 }
 

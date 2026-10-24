@@ -403,9 +403,7 @@ test('POPULATION BY RECORDED PROVENANCE: an incoming IMS order the first load di
   }
   // with only native orders in IMS and an empty report the named empty proof holds (nothing the first load created is incoming), the natives listed
   const onlyNative = await run('R8', [native], [], { fixture })
-  assert.equal(onlyNative.item.outcome, 'pass')
-  assert.deepEqual(onlyNative.item.proof, { kind: 'proven-empty', source: 'qoblex-incoming-report-empty' })
-  assert.ok(keys(onlyNative.item, 'outOfPopulation').length >= 1)
+  assert.deepEqual([onlyNative.item.outcome, onlyNative.item.reasons], ['inconclusive', ['EMPTY_UNPROVEN']])
 })
 
 // [mutation: the provenance checks removed / completeness reverted to a LINE count]
@@ -454,4 +452,16 @@ test('ORDER-LEVEL DISCOUNT: an in-scope order with a non-zero order discount mak
   assert.equal((await run('R8', [discounted], lines)).item.outcome, 'pass')
   assert.equal((await run('R7', [discounted], lines, { fixture: { native: [discounted.id] } })).item.reasons[0], 'DIFFERENCES', 'a native order is out of scope; the export order is then onlyVendor')
   assert.equal((await run('R7', [po('PO1', [line('A', '10', '4', '2')], { discount: '0.000000' })], lines)).item.outcome, 'pass')
+})
+
+// [mutation: the empty proof granted when only first-load orders are counted]
+test('THE EMPTY PROOF NEEDS NO INCOMING GOODS ORDER AT ALL: a verified first load with no incoming first-load order, a NATIVE incoming order and an empty report is EMPTY_UNPROVEN (never a pass); with no incoming order at all it passes on the named proof', async () => {
+  const native = po('PN', [line('B', '5', '0', '1')])
+  for (const id of ['R7', 'R8'] as const) {
+    const withNative = await run(id, [native], [], { fixture: { native: [native.id] } })
+    assert.deepEqual([withNative.item.outcome, withNative.item.reasons], ['inconclusive', ['EMPTY_UNPROVEN']], id)
+    assert.ok(keys(withNative.item, 'outOfPopulation').length >= 1 || withNative.item.entries === undefined, id)
+    const none = await run(id, [], [])
+    assert.deepEqual([none.item.outcome, none.item.proof], ['pass', { kind: 'proven-empty', source: 'qoblex-incoming-report-empty' }], id)
+  }
 })
