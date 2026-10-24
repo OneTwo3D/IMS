@@ -284,7 +284,7 @@ const realShaped = (total: ReturnType<typeof totalRow> | null, ...extra: unknown
 )
 const COMPLETE_TOTAL = () => totalRow('196658.83', '196658.83')
 
-test('a report whose rows add up to its balanced Total row proves itself complete', () => {
+test('a report whose rows add up to its Total row proves itself complete', () => {
   assert.equal(parseXeroTrialBalanceReport(realShaped(COMPLETE_TOTAL())).completenessUnproven, null)
 })
 
@@ -306,11 +306,11 @@ test('PARTIAL report (rows do not add up to the Total) with the account absent: 
   assert.match(result.errors[0]!, /^TB_COMPLETENESS_UNPROVEN/)
 })
 
-test('NO Total row, an unreadable Total, two Total rows, or an unbalanced Total: completeness unproven', () => {
+test('NO Total row, an unreadable Total, two Total rows, or rows that do not reach the Total: completeness unproven', () => {
   const cases: Array<[string, ReturnType<typeof realShaped>]> = [
     ['none', realShaped(null)],
     ['unreadable', realShaped(totalRow('n/a', '196658.83'))],
-    ['unbalanced', realShaped(totalRow('196658.83', '196658.00'))],
+    ['credits short', realShaped(totalRow('196658.83', '196658.00'))],
     ['two', realShaped(COMPLETE_TOTAL(), COMPLETE_TOTAL())],
   ]
   for (const [name, input] of cases) assert.ok(parseXeroTrialBalanceReport(input).completenessUnproven, name)
@@ -359,14 +359,46 @@ test('one row per account is still read; a duplicate for ONE account does not bl
   assert.deepEqual(result.snapshots.map((s) => s.accountCode), ['310'])
 })
 
-test('completeness: a credit total the rows do not reach, a total that is itself unbalanced, and an empty response are each unproven', () => {
-  // Credit rows sum to 196658.83 but the Total claims 196659.00 as credit and 196658.83 as debit... debits match, credits do not.
+test('completeness: a credit total the rows do not reach, and an empty response, are each unproven', () => {
   const creditShort = realShaped(totalRow('196658.83', '196659.83'))
   assert.match(parseXeroTrialBalanceReport(creditShort).completenessUnproven ?? '', /add up/)
-  // Rows and Total agree with each other but the books do not balance (an extra debit only): a trial balance must balance.
-  const unbalanced = report(HEADER, { RowType: 'Section', Rows: [row('Cost of Goods Sold (310)', '', '', '5', ''), totalRow('5', '5.00') ] })
-  assert.match(parseXeroTrialBalanceReport(unbalanced).completenessUnproven ?? '', /add up/)
-  const rowsAgreeButUnbalanced = report(HEADER, { RowType: 'Section', Rows: [row('Cost of Goods Sold (310)', '', '', '5', ''), totalRow('5', '0')] })
-  assert.match(parseXeroTrialBalanceReport(rowsAgreeButUnbalanced).completenessUnproven ?? '', /does not balance/)
+  const debitShort = realShaped(totalRow('196659.83', '196658.83'))
+  assert.match(parseXeroTrialBalanceReport(debitShort).completenessUnproven ?? '', /add up/)
   assert.ok(parseXeroTrialBalanceReport({ Reports: [] }).completenessUnproven)
+})
+
+// The LIVE organisation's shape (checked read-only on 2026-10-23, 2026-09-30, 2026-03-31): Header, titled Sections, then a final
+// Section with an EMPTY title holding ONE Total SummaryRow. Xero's own Total can be unbalanced by a cent through rounding (live
+// 2026-10-23: YTD Debit 311524.29, YTD Credit 311524.30), and the rows still sum to it exactly in both columns.
+test('LIVE SHAPE: a final empty-title Section with one Total, unbalanced by 0.01, is PROVEN complete and an absent account stores zero', () => {
+  const live = report(
+    HEADER,
+    { RowType: 'Section', Title: 'Revenue', Rows: [row('Income in Advance (810)', '', '', '', '100.81')] },
+    { RowType: 'Section', Title: 'Expenses', Rows: [row('Cost of Goods Sold (310)', '', '', '73019.20', '')] },
+    { RowType: 'Section', Title: 'Assets', Rows: [row('Bank (090)', '', '', '238505.09', '')] },
+    { RowType: 'Section', Title: 'Liabilities', Rows: [row('Trade Creditors (800)', '', '', '', '311423.49')] },
+    { RowType: 'Section', Title: 'Equity', Rows: [] },
+    { RowType: 'Section', Title: '', Rows: [totalRow('311524.29', '311524.30')] },
+  )
+  const parsed = parseXeroTrialBalanceReport(live)
+  assert.equal(parsed.completenessUnproven, null)
+  const result = buildXeroAccountBalanceSnapshotInputs({
+    balanceDate: '2026-10-23', baseCurrency: 'GBP', completenessUnproven: parsed.completenessUnproven,
+    accounts: [{ externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }],
+    parsedRows: parsed.rows, refusedRows: parsed.refusedRows,
+  })
+  assert.deepEqual(result.snapshots.map((s) => String(s.amountBase)), ['0'])
+  assert.deepEqual(result.errors, [])
+})
+
+test('LIVE SHAPE: the same report with the rows one cent off the Total is withheld (no tolerance on the sum comparison)', () => {
+  const off = report(
+    HEADER,
+    { RowType: 'Section', Title: 'Revenue', Rows: [row('Income in Advance (810)', '', '', '', '100.81')] },
+    { RowType: 'Section', Title: 'Expenses', Rows: [row('Cost of Goods Sold (310)', '', '', '73019.20', '')] },
+    { RowType: 'Section', Title: 'Assets', Rows: [row('Bank (090)', '', '', '238505.09', '')] },
+    { RowType: 'Section', Title: 'Liabilities', Rows: [row('Trade Creditors (800)', '', '', '', '311423.49')] },
+    { RowType: 'Section', Title: '', Rows: [totalRow('311524.30', '311524.30')] },
+  )
+  assert.match(parseXeroTrialBalanceReport(off).completenessUnproven ?? '', /add up/)
 })

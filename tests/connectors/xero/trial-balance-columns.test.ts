@@ -230,7 +230,7 @@ const completeReport = (total: unknown) => ({
   }],
 })
 
-test('COMPLETE report (rows add up to a balanced Total) with 631 absent: 631 is stored as zero', async () => {
+test('COMPLETE report (rows add up to the Total) with 631 absent: 631 is stored as zero', async () => {
   trialBalance = completeReport(totalRowE2E('73019.20', '73019.20'))
   const result = await pull()
   assert.deepEqual(result.errors, [])
@@ -244,7 +244,7 @@ test('PARTIAL report (Total counts more than the rows) with 631 absent: 631 with
   assert.match(result.errors[0]!, /TB_COMPLETENESS_UNPROVEN.*631/)
 })
 
-test('no Total row, or an unbalanced one: 631 withheld', async () => {
+test('no Total row, or one the rows do not reach: 631 withheld', async () => {
   for (const total of [{ RowType: 'Section', Rows: [] }, totalRowE2E('73019.20', '73000.00')]) {
     trialBalance = completeReport(total)
     const result = await pull()

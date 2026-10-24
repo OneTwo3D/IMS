@@ -124,7 +124,7 @@ test('an Unearned Revenue account that is configured but not in the chart stops 
 // [mutation: the absent suffix removed]
 test('a configured account that a NON-EMPTY Trial Balance omits is stored as a zero labelled absent-from-tb; a reported zero is not', async () => {
   reset()
-  // Complete by its own evidence: the rows add up to a balanced Total row (the offsetting credit is on an unconfigured equity account).
+  // Complete by its own evidence: the rows add up to the Total row (the offsetting credit is on an unconfigured equity account).
   trialBalance = { Reports: [{ Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75'), row('a-999', '999 - Equity', '0', '1075')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '1075', '1075'].map((Value) => ({ Value })) }] }] }] }
   await pull()
   const byCode = new Map(persisted.map((snapshot) => [snapshot.accountCode, snapshot]))

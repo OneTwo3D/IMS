@@ -79,7 +79,7 @@ type XeroAccountBalanceSnapshotBuildInput = {
   parsedRows: ParsedXeroTrialBalanceRow[]
   /** Rows the parser refused to read. A configured account matching one gets a named error and NO snapshot. */
   refusedRows?: RefusedXeroTrialBalanceRow[]
-  /** Null when the report proved itself complete (its rows add up to its balanced Total row); else why not. */
+  /** Null when the report proved itself complete (its rows add up to its Total row); else why not. */
   completenessUnproven: string | null
   balanceDate: string
   baseCurrency: string
@@ -158,7 +158,7 @@ export type ParsedXeroTrialBalance = {
   reportError: string | null
   /**
    * Whether the report proves ITSELF complete. Xero omits accounts with no balance, so an absent account may be a true zero, but
-   * only if the rows read add up to the report's own Total row (YTD Debit and YTD Credit, to the cent) and that total balances.
+   * only if the rows read add up to the report's own single Total row (YTD Debit and YTD Credit, each exact to the cent).
    * Null = proven; otherwise the named reason.
    */
   completenessUnproven: string | null
@@ -259,7 +259,7 @@ function findTotalRows(rows: XeroReportRow[] | undefined, found: XeroReportRow[]
   return found
 }
 
-/** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row and that total balances. */
+/** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row (both YTD columns, exact to the cent). */
 function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: TrialBalanceColumns, sums: YtdSums, refused: number): string | null {
   if (refused > 0) return 'a row was refused, so the rows read cannot be summed'
   const totals = findTotalRows(entryRows)
@@ -272,7 +272,8 @@ function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: Tr
   if (sums.debit.toFixed(2) !== totalDebit.toFixed(2) || sums.credit.toFixed(2) !== totalCredit.toFixed(2)) {
     return `the rows read add up to ${sums.debit.toFixed(2)} / ${sums.credit.toFixed(2)} (YTD Debit / Credit) but the Total row says ${totalDebit.toFixed(2)} / ${totalCredit.toFixed(2)}`
   }
-  if (totalDebit.toFixed(2) !== totalCredit.toFixed(2)) return `its Total row does not balance (YTD Debit ${totalDebit.toFixed(2)}, YTD Credit ${totalCredit.toFixed(2)})`
+  // Deliberately NO debit == credit test: Xero's own Total row is not guaranteed to balance (the live organisation's differs by
+  // 0.01 / 0.02 on some dates through rounding), while the rows summing exactly to it held on every live date checked.
   return null
 }
 
