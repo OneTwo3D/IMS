@@ -11,16 +11,11 @@ import {
   rebasePurchaseOrderStoredBaseAmountsWithParentUpdate,
   type PurchaseOrderFxRebaseTransactionDb,
 } from '@/lib/domain/purchasing/purchase-order-fx-rebase'
+import { fakeFxClient } from '@/tests/helpers/fx-fake-client'
 import { updatePurchaseOrderFxRateOnly } from '@/lib/domain/purchasing/purchase-order-fx-update'
 
 function createClient(rate: number | null) {
-  return {
-    fxRate: {
-      findFirst: async () => rate == null
-        ? null
-        : { rate, fetchedAt: new Date('2026-06-10T00:00:00.000Z') },
-    },
-  }
+  return fakeFxClient(rate == null ? [] : [{ fromCurrency: 'GBP', toCurrency: 'EUR', rate, fetchedAt: new Date('2026-06-10T00:00:00.000Z') }])
 }
 
 test('purchase-order FX resolver defaults to the latest stored rate when input is missing', async () => {
@@ -455,7 +450,7 @@ test('purchase-order FX rebase rolls back child base updates when parent update 
 
 test('purchase-order rate-only update re-resolves stored FX rate and persists rebased values', async () => {
   const asOf = new Date('2026-06-11T12:00:00.000Z')
-  const fxRateQueries: unknown[] = []
+  const fx = fakeFxClient([{ fromCurrency: 'GBP', toCurrency: 'EUR', rate: 1.18, fetchedAt: new Date('2026-06-11T00:00:00.000Z') }])
   const state: RebaseTestState = {
     purchaseOrder: {
       currency: 'GBP',
@@ -482,12 +477,7 @@ test('purchase-order rate-only update re-resolves stored FX rate and persists re
   }
   const db = {
     ...createTransactionalRebaseDb(state),
-    fxRate: {
-      findFirst: async (args: unknown) => {
-        fxRateQueries.push(args)
-        return { rate: 1.18, fetchedAt: new Date('2026-06-11T00:00:00.000Z') }
-      },
-    },
+    fxRate: fx.fxRate,
   }
 
   const po = await updatePurchaseOrderFxRateOnly(
@@ -508,16 +498,9 @@ test('purchase-order rate-only update re-resolves stored FX rate and persists re
     },
   )
 
-  assert.deepEqual(fxRateQueries, [
-    {
-      where: {
-        fromCurrency: 'GBP',
-        toCurrency: 'EUR',
-        fetchedAt: { lte: asOf },
-      },
-      orderBy: { fetchedAt: 'desc' },
-      select: { rate: true, fetchedAt: true },
-    },
+  // the central lookup's query: latest fetchedAt per currency on or before asOf, base GBP, then the rows at that instant
+  assert.deepEqual(fx.calls.filter((c) => c.op === 'fxRate.groupBy').map((c) => (c.args as { where: unknown }).where), [
+    { fromCurrency: 'GBP', toCurrency: { in: ['EUR'] }, fetchedAt: { lte: asOf } },
   ])
   assert.deepEqual(po, {
     currency: 'EUR',

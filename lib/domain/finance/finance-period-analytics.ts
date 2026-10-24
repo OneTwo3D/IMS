@@ -3,6 +3,7 @@ import { computeRealisedFx, type FxSettlementSide } from '@/lib/accounting-fx'
 import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
+import { isMissingFxRateError, selectFxRateFromRows } from '@/lib/currencies/fx-lookup'
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
@@ -283,6 +284,8 @@ type FxRateRow = {
   toCurrency: string
   rate: DecimalInput
   fetchedAt: Date
+  source?: string
+  manualOverride?: boolean
 }
 
 function clientFromDeps(deps?: FinanceAnalyticsDeps): FinanceAnalyticsClient {
@@ -425,12 +428,21 @@ function bucketAmount(age: number, amount: Prisma.Decimal, buckets: [number, num
   return { current: new Prisma.Decimal(0), bucket1: new Prisma.Decimal(0), bucket2: new Prisma.Decimal(0), bucket3: new Prisma.Decimal(0), bucket4: amount }
 }
 
+/**
+ * The settlement rate for one document: the central rule (lib/currencies/fx-lookup.ts `selectFxRateFromRows`) over the
+ * rows `loadFxRates` pre-read, because each payment/invoice has its own `asOf` (a batch at one instant does not fit).
+ * Only a MISSING row falls back to the document's booked rate; a row that exists but is unusable (zero, negative, an
+ * ambiguous tie) refuses.
+ * TODO(o3d-q0x56.4): the booked-rate fallback and the "non-positive becomes 1" guard below are removed there.
+ */
 function latestRateToBase(rates: FxRateRow[], baseCurrency: string, currency: string, asOf: Date, fallback: DecimalInput): Prisma.Decimal {
   if (currency === baseCurrency) return new Prisma.Decimal(1)
-  const match = rates
-    .filter((row) => row.fromCurrency === baseCurrency && row.toCurrency === currency && row.fetchedAt.getTime() <= asOf.getTime())
-    .sort((a, b) => b.fetchedAt.getTime() - a.fetchedAt.getTime())[0]
-  const value = match ? toDecimal(match.rate) : toDecimal(fallback)
+  try {
+    return selectFxRateFromRows(rates, { baseCurrency, currency, asOf }).rate
+  } catch (error) {
+    if (!(isMissingFxRateError(error) && (error.reason === 'no_rate' || error.reason === 'invalid_currency'))) throw error
+  }
+  const value = toDecimal(fallback)
   return value.gt(0) ? value : new Prisma.Decimal(1)
 }
 
@@ -994,8 +1006,11 @@ export async function getCurrencySummaryReport(
 
 async function loadFxRates(client: FinanceAnalyticsClient, baseCurrency: string, window: { dateToExclusive: Date }): Promise<FxRateRow[]> {
   return client.fxRate.findMany({
+    // Strictly before the window's exclusive end: every lookup below is `asOf` a payment/invoice instant inside the
+    // window, so a row at or after that end can never be the latest on or before one. Over the cap is a refusal
+    // (assertSourceLimit), never a silently truncated history.
     where: { fromCurrency: baseCurrency, fetchedAt: { lt: window.dateToExclusive } },
-    select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true },
+    select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true, source: true, manualOverride: true },
     orderBy: { fetchedAt: 'desc' },
     take: SOURCE_ROW_LIMIT + 1,
   }) as Promise<FxRateRow[]>

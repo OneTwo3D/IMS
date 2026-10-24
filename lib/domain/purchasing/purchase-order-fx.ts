@@ -1,18 +1,8 @@
+import { getFxRateToBase, type FxLookupClient } from '@/lib/currencies/fx-lookup'
+
 export const PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE = 0.02
 
-export type PurchaseOrderFxClient = {
-  fxRate: {
-    findFirst(args: {
-      where: {
-        fromCurrency: string
-        toCurrency: string
-        fetchedAt: { lte: Date }
-      }
-      orderBy: { fetchedAt: 'desc' }
-      select: { rate: true; fetchedAt: true }
-    }): Promise<{ rate: unknown; fetchedAt: Date } | null>
-  }
-}
+export type PurchaseOrderFxClient = FxLookupClient
 
 export type ResolvePurchaseOrderFxRateInput = {
   currency: string
@@ -29,23 +19,11 @@ export async function resolvePurchaseOrderFxRateToBase(
   const baseCurrency = input.baseCurrency.trim().toUpperCase()
   if (!currency || currency === baseCurrency) return 1
 
-  const latestRate = await client.fxRate.findFirst({
-    where: {
-      fromCurrency: baseCurrency,
-      toCurrency: currency,
-      fetchedAt: { lte: input.asOf },
-    },
-    orderBy: { fetchedAt: 'desc' },
-    select: { rate: true, fetchedAt: true },
-  })
-  if (!latestRate) {
-    throw new Error(`Missing ${baseCurrency} FX rate for ${currency} on or before ${input.asOf.toISOString().slice(0, 10)}`)
-  }
-
-  const resolvedRate = Number(latestRate.rate)
-  if (!Number.isFinite(resolvedRate) || resolvedRate <= 0) {
-    throw new Error(`Invalid stored ${baseCurrency} FX rate for ${currency}`)
-  }
+  // The one central lookup. A missing rate throws "Missing <base> FX rate for <cur> on or before <date>" and a
+  // stored zero/negative rate throws "Invalid stored <base> FX rate for <cur>", as this function always did.
+  // TODO(o3d-q0x56.6): the user-typed override below is removed there; this lookup then becomes the whole answer.
+  const latestRate = await getFxRateToBase(client, { currency, asOf: input.asOf, baseCurrency })
+  const resolvedRate = latestRate.rate.toNumber()
 
   const inputRate = input.inputRateToBase
   if (inputRate == null || !Number.isFinite(inputRate) || inputRate <= 0) return resolvedRate

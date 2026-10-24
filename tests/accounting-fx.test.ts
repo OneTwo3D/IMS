@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { fakeFxClient } from './helpers/fx-fake-client.ts'
 import { buildRealisedFxJournal, computeRealisedFx, resolveSettlementFxRateToBase, reverseJournalLines } from '../lib/accounting-fx.ts'
 
 test('computes realised FX loss on customer payment when settlement base is below booked AR', () => {
@@ -143,9 +144,7 @@ test('reverses prior unrealised FX journal lines by swapping debits and credits'
 test('settlement FX resolver logs when falling back to the booked rate', async () => {
   const activityLogs: unknown[] = []
   const tx = {
-    fxRate: {
-      findFirst: async () => null,
-    },
+    fxRate: fakeFxClient([]).fxRate,
     activityLog: {
       create: async (args: unknown) => {
         activityLogs.push(args)
@@ -182,4 +181,41 @@ test('settlement FX resolver logs when falling back to the booked rate', async (
       },
     },
   })
+})
+
+test('settlement FX resolver uses the stored rate on or before the settlement instant and does not log', async () => {
+  const activityLogs: unknown[] = []
+  const tx = {
+    ...fakeFxClient([
+      { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.30', fetchedAt: new Date('2026-01-14T00:00:00Z') },
+      { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.40', fetchedAt: new Date('2026-01-16T00:00:00Z') },
+    ]),
+    activityLog: { create: async (a: unknown) => { activityLogs.push(a) } },
+  }
+  const rate = await resolveSettlementFxRateToBase(tx as never, {
+    currency: ' usd ', baseCurrency: 'gbp', asOf: new Date('2026-01-15T12:00:00.000Z'), fallbackRateToBase: 9,
+  })
+  assert.equal(rate, 1.3)
+  assert.equal(activityLogs.length, 0)
+})
+
+test('settlement FX resolver: base currency is 1 and never reads the table', async () => {
+  const c = fakeFxClient([])
+  assert.equal(await resolveSettlementFxRateToBase(c as never, { currency: 'GBP', baseCurrency: 'GBP', asOf: new Date(), fallbackRateToBase: 9 }), 1)
+  assert.equal(c.calls.length, 0)
+})
+
+test('settlement FX resolver: a tied or non-positive stored rate refuses instead of using the fallback', async () => {
+  for (const rows of [
+    [{ rate: '1.30' }, { rate: '1.31' }],
+    [{ rate: '0' }],
+  ]) {
+    const tx = {
+      ...fakeFxClient(rows.map((r) => ({ fromCurrency: 'GBP', toCurrency: 'USD', rate: r.rate, fetchedAt: new Date('2026-01-14T00:00:00Z') }))),
+      activityLog: { create: async () => { assert.fail('must not log a fallback') } },
+    }
+    await assert.rejects(resolveSettlementFxRateToBase(tx as never, {
+      currency: 'USD', baseCurrency: 'GBP', asOf: new Date('2026-01-15T12:00:00.000Z'), fallbackRateToBase: 1.25,
+    }), (e: Error) => e.name === 'MissingFxRateError')
+  }
 })

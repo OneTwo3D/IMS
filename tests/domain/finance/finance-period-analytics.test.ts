@@ -547,3 +547,39 @@ test('VAT report skips purchase invoice lines whose taxRate category does not ma
   assert.equal(report.rows[0]?.reportingCategory, 'REVERSE_CHARGE')
   assert.equal(report.rows[0]?.taxBase, '0')
 })
+
+function fxGainLossClient(rates: Array<{ rate: string; at: string }>): FinanceAnalyticsClient {
+  return {
+    ...unusedClient(),
+    payment: {
+      findMany: async () => [{
+        id: 'payment-1',
+        amount: decimal('120'),
+        currency: 'USD',
+        paidAt: new Date('2026-06-10T00:00:00.000Z'),
+        refundId: null,
+        order: { id: 'so-1', orderNumber: 'SO-1', invoiceNumber: 'INV-1', currency: 'USD', fxRateToBase: decimal('1.2'), customerName: 'Customer A', customerEmail: null },
+      }],
+    },
+    fxRate: {
+      findMany: async () => rates.map((r) => ({ fromCurrency: 'GBP', toCurrency: 'USD', rate: decimal(r.rate), fetchedAt: new Date(r.at) })),
+    },
+  }
+}
+const fxOpts = (client: FinanceAnalyticsClient) => ({ deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z'), accountingSettings: settings } })
+
+test('FX gain/loss: two different rates at the latest instant refuse instead of picking one', async () => {
+  const client = fxGainLossClient([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }, { rate: '1.6', at: '2026-06-09T00:00:00.000Z' }])
+  await assert.rejects(getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client)), /Ambiguous GBP FX rate for USD/)
+})
+
+test('FX gain/loss: a stored zero rate refuses (it used to become 1)', async () => {
+  const client = fxGainLossClient([{ rate: '0', at: '2026-06-09T00:00:00.000Z' }])
+  await assert.rejects(getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client)), /Invalid stored GBP FX rate for USD/)
+})
+
+test('FX gain/loss: no stored rate on or before the payment still falls back to the booked rate (unchanged; removed by the settlement task)', async () => {
+  const client = fxGainLossClient([{ rate: '1.1', at: '2026-06-11T00:00:00.000Z' }]) // after paidAt
+  const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
+  assert.equal(report.rows[0]?.settlementRateToBase, '1.2')
+})

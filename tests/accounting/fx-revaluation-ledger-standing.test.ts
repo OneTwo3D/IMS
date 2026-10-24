@@ -103,7 +103,7 @@ mock.module('@/lib/db', {
       },
       purchaseInvoice: { findMany: async () => [] },
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
-        fxRate: { findFirst: async () => null },
+        fxRate: { groupBy: async () => [], findMany: async () => [] },
         activityLog: { create: async () => ({ id: 'a-1' }) },
       }),
     },

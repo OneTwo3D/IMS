@@ -12,7 +12,7 @@ import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from 
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
-  mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
+  mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
@@ -1642,11 +1642,11 @@ async function resolveDirectCreateShortfall(orderId: string): Promise<void> {
  * type says nothing about it.
  *
  * WHAT COUNTS AS USABLE: a non-blank three-letter code. IMS holds no allowlist of currencies — the
- * FX-rate table is the registry, and `getFxRateToGbp` already refuses a well-formed code it has no
+ * FX-rate table is the registry, and `getFxRateToBase` already refuses a well-formed code it has no
  * rate for by retaining the order in the pending-FX queue. So the two checks compose and neither
  * duplicates the other: this one answers "did WooCommerce state a currency at all?", and the FX
  * lookup answers "does IMS support the one it stated?". Deliberately NOT normalised away as
- * `getFxRateToGbp` would have done anyway — the trimmed, upper-cased code is what gets PERSISTED
+ * `getFxRateToBase` would have done anyway — the trimmed, upper-cased code is what gets PERSISTED
  * from here on, so `salesOrder.currency` and the accounting payload can no longer disagree with the
  * FX rate that was fetched for them.
  */
@@ -1916,7 +1916,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const orderedAt = wcOrder.date_created_gmt
       ? new Date(`${wcOrder.date_created_gmt.replace(/Z$/, '')}Z`)
       : (wcOrder.date_created ? new Date(wcOrder.date_created) : undefined)
-    const fxRate = await getFxRateToGbp(currency, orderedAt)
+    // The order's own date bounds the rate. An order with no date at all is priced as of now (it used to be unbounded,
+    // which meant the same thing: the latest row there is).
+    const fxRate = await getFxRateToBase(currency, orderedAt ?? new Date())
 
     const pricesIncludeVat = wcOrder.prices_include_tax
 
