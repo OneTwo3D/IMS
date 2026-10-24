@@ -2,6 +2,12 @@ import type { PrismaClient } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { balanceDateString, normalizeBalanceDate } from '@/lib/domain/accounting/balance-date'
+import {
+  isLifetimeBalanceAccountType,
+  parseFinancialYearEnd,
+  windowCrossesFinancialYearStart,
+  XERO_FINANCIAL_YEAR_END_SETTING,
+} from '@/lib/domain/accounting/financial-year'
 
 // The date helpers live in their own module (no database) so the reconciliation pack can use them without loading lib/db.
 export { balanceDateString, normalizeBalanceDate }
@@ -48,6 +54,8 @@ export type PersistAccountingAccountBalanceSnapshotResult = {
 }
 
 type SnapshotClient = Pick<PrismaClient, 'accountingAccountBalanceSnapshot'> & Partial<Pick<PrismaClient, '$transaction'>>
+/** What a period movement reads: the snapshots, plus the chart (account type) and the stored financial-year end. */
+type MovementClient = SnapshotClient & Pick<PrismaClient, 'accountingAccount' | 'setting'>
 
 export type AccountBalanceSnapshotLookup = {
   connector: string
@@ -66,6 +74,28 @@ export type AccountBalancePeriodMovement = {
 export type MissingAccountBalanceSnapshotReason =
   | 'missing_previous_day_snapshot'
   | 'missing_closing_snapshot'
+
+export type AccountBalanceMovementWithheldReason =
+  | 'window_crosses_financial_year_start'
+  | 'financial_year_end_unknown'
+
+/**
+ * A closing-minus-opening movement that would not be a movement: the account is a profit-and-loss account (its Trial Balance
+ * figure is year-to-date and restarts at the financial-year start) and the window crosses that start, or the year end is not
+ * known. The consumer withholds the figure with this reason; it never shows the difference.
+ */
+export class AccountBalanceMovementWithheldError extends Error {
+  reason: AccountBalanceMovementWithheldReason
+  accountCode: string | null
+  constructor(input: { reason: AccountBalanceMovementWithheldReason; accountCode: string | null; openingDate: string; closingDate: string }) {
+    super(input.reason === 'window_crosses_financial_year_start'
+      ? `Account ${input.accountCode ?? 'unknown'} is a profit-and-loss account whose year-to-date balance restarts at the financial-year start, which falls between ${input.openingDate} and ${input.closingDate}; the movement is withheld.`
+      : `Account ${input.accountCode ?? 'unknown'} is a profit-and-loss account and the organisation's financial-year end is not recorded, so a movement between ${input.openingDate} and ${input.closingDate} is withheld.`)
+    this.name = 'AccountBalanceMovementWithheldError'
+    this.reason = input.reason
+    this.accountCode = input.accountCode
+  }
+}
 
 export class MissingAccountBalanceSnapshotError extends Error {
   reason: MissingAccountBalanceSnapshotReason
@@ -212,7 +242,7 @@ export async function findLatestAccountBalanceSnapshot(
 
 export async function getAccountBalancePeriodMovement(
   lookup: Omit<AccountBalanceSnapshotLookup, 'balanceDate'> & { dateFrom: Date | string; dateTo: Date | string; maxOpeningStalenessDays?: number },
-  client: SnapshotClient = db,
+  client: MovementClient = db,
 ): Promise<AccountBalancePeriodMovement> {
   const dateFrom = normalizeBalanceDate(lookup.dateFrom)
   const requiredOpeningDate = previousDate(lookup.dateFrom)
@@ -243,6 +273,23 @@ export async function getAccountBalancePeriodMovement(
       externalAccountId: lookup.externalAccountId,
       accountCode: lookup.accountCode,
     })
+  }
+  // The stored figure is year-to-date. A lifetime-balance account (inventory, transit, ...) differences cleanly; a
+  // profit-and-loss account does not across a financial-year start. The type is the chart's, not the setting key's, and an
+  // account the chart does not know is treated as profit-and-loss (withheld rather than guessed).
+  const chartAccount = await client.accountingAccount.findFirst({
+    where: { connector: lookup.connector, OR: [{ externalAccountId: closing.externalAccountId }, ...(closing.accountCode ? [{ code: closing.accountCode }] : [])] },
+    select: { type: true },
+    orderBy: [{ active: 'desc' }, { syncedAt: 'desc' }],
+  })
+  if (!isLifetimeBalanceAccountType(chartAccount?.type)) {
+    const withheld = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({
+      reason, accountCode: closing.accountCode, openingDate: balanceDateString(opening.balanceDate), closingDate: balanceDateString(closing.balanceDate),
+    })
+    const setting = await client.setting.findUnique({ where: { key: XERO_FINANCIAL_YEAR_END_SETTING }, select: { value: true } })
+    const yearEnd = parseFinancialYearEnd(setting?.value)
+    if (!yearEnd) throw withheld('financial_year_end_unknown')
+    if (windowCrossesFinancialYearStart(opening.balanceDate, closing.balanceDate, yearEnd)) throw withheld('window_crosses_financial_year_start')
   }
   return {
     opening,

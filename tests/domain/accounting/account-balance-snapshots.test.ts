@@ -5,6 +5,7 @@ import {
   calculateAccountBalanceVarianceBase,
   findLatestAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
+  AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
   normalizeBalanceDate,
   persistAccountingAccountBalanceSnapshots,
@@ -31,10 +32,15 @@ function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): 
   }
 }
 
-function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
+function snapshotClient(
+  initial: AccountingAccountBalanceSnapshotRow[] = [],
+  chart: { accountType: string | null; yearEnd: string | null } = { accountType: 'EXPENSE', yearEnd: '12-31' },
+) {
   const rows = [...initial]
   return {
     rows,
+    accountingAccount: { findFirst: async () => (chart.accountType === null ? null : { type: chart.accountType }) },
+    setting: { findUnique: async () => (chart.yearEnd === null ? null : { value: chart.yearEnd }) },
     accountingAccountBalanceSnapshot: {
       async upsert(args: {
         where: { connector_externalAccountId_balanceDate_currency: { connector: string; externalAccountId: string; balanceDate: Date; currency: string } }
@@ -297,4 +303,62 @@ test('the organisation a balance was fetched under is stored, and a later pull u
   assert.equal(client.rows[0]!.tenantId, 'tenant-b')
   await persistAccountingAccountBalanceSnapshots([{ ...base }], client as never)
   assert.equal(client.rows[0]!.tenantId, null, 'a pull that cannot name its organisation records none, not the previous one')
+})
+
+// P&L accounts are year-to-date in a Trial Balance: they restart at the financial-year start.
+function windowRows(openingDate: string, closingDate: string) {
+  const base = { externalAccountId: 'cogs-account', accountCode: '600', accountName: 'COGS' }
+  return [
+    makeSnapshot({ ...base, id: 'o', balanceDate: new Date(`${openingDate}T00:00:00.000Z`), amountBase: toDecimal('900'), amountForeign: toDecimal('900') }),
+    makeSnapshot({ ...base, id: 'c', balanceDate: new Date(`${closingDate}T00:00:00.000Z`), amountBase: toDecimal('40'), amountForeign: toDecimal('40') }),
+  ]
+}
+const lookup = (dateFrom: string, dateTo: string) => ({ connector: 'xero', accountCode: '600', dateFrom, dateTo, currency: 'GBP' })
+
+test('a profit-and-loss account is WITHHELD, not differenced, when the window crosses the financial-year start', async () => {
+  const client = snapshotClient(windowRows('2026-12-30', '2027-01-02'), { accountType: 'DIRECTCOSTS', yearEnd: '12-31' })
+  await assert.rejects(
+    () => getAccountBalancePeriodMovement(lookup('2026-12-31', '2027-01-02'), client as never),
+    (error) => error instanceof AccountBalanceMovementWithheldError && error.reason === 'window_crosses_financial_year_start',
+  )
+})
+
+test('the financial-year start day itself is inside the window; the day before is not', async () => {
+  const crossing = snapshotClient(windowRows('2026-12-31', '2027-01-01'), { accountType: 'EXPENSE', yearEnd: '12-31' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2027-01-01', '2027-01-01'), crossing as never), AccountBalanceMovementWithheldError)
+  const inside = snapshotClient(windowRows('2026-12-30', '2026-12-31'), { accountType: 'EXPENSE', yearEnd: '12-31' })
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-12-31', '2026-12-31'), inside as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('a profit-and-loss window inside one financial year is a plain difference', async () => {
+  const client = snapshotClient(windowRows('2026-05-31', '2026-06-30'), { accountType: 'EXPENSE', yearEnd: '03-31' })
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('a non-calendar year end (31 March) is honoured', async () => {
+  const client = snapshotClient(windowRows('2026-03-30', '2026-04-02'), { accountType: 'REVENUE', yearEnd: '03-31' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-03-31', '2026-04-02'), client as never), AccountBalanceMovementWithheldError)
+})
+
+test('a profit-and-loss account with an unknown financial-year end is withheld', async () => {
+  for (const yearEnd of [null, 'garbage', '02-30']) {
+    const client = snapshotClient(windowRows('2026-05-31', '2026-06-30'), { accountType: 'EXPENSE', yearEnd })
+    await assert.rejects(
+      () => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never),
+      (error) => error instanceof AccountBalanceMovementWithheldError && error.reason === 'financial_year_end_unknown',
+      String(yearEnd),
+    )
+  }
+})
+
+test('a balance-sheet account (lifetime balance) is differenced across a financial-year start', async () => {
+  for (const accountType of ['INVENTORY', 'CURRENT', 'CURRLIAB', 'ASSET']) {
+    const client = snapshotClient(windowRows('2026-12-30', '2027-01-02'), { accountType, yearEnd: '12-31' })
+    assert.equal((await getAccountBalancePeriodMovement(lookup('2026-12-31', '2027-01-02'), client as never)).movementBase.toFixed(2), '-860.00', accountType)
+  }
+})
+
+test('an account the chart does not know is treated as profit-and-loss (withheld, not guessed)', async () => {
+  const client = snapshotClient(windowRows('2026-12-30', '2027-01-02'), { accountType: null, yearEnd: '12-31' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-12-31', '2027-01-02'), client as never), AccountBalanceMovementWithheldError)
 })

@@ -5,6 +5,7 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   balanceDateString,
   getAccountBalancePeriodMovement,
+  AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
   findLatestAccountBalanceSnapshot,
 } from './account-balance-snapshots'
@@ -52,6 +53,7 @@ export type CogsGlReconciliationUnavailableReason =
   | 'no_account_configured'
   | 'no_gl_snapshot'
   | 'no_opening_snapshot'
+  | 'financial_year_boundary'
   | 'ledger_not_covering_window'
 
 export type CogsGlReconciliationResult = AccountGlReconciliationResult<CogsGlReconciliationUnavailableReason>
@@ -120,6 +122,11 @@ export async function loadCogsGlReconciliation(options?: {
   } catch (error) {
     if (error instanceof MissingAccountBalanceSnapshotError) {
       return { available: false, reason: 'no_opening_snapshot' }
+    }
+    // COGS is a profit-and-loss account: its stored balance is year-to-date, so a window over a financial-year start (or an
+    // unknown year end) has no movement to compare. Withheld by name.
+    if (error instanceof AccountBalanceMovementWithheldError) {
+      return { available: false, reason: 'financial_year_boundary' }
     }
     throw error
   }

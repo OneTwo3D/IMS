@@ -185,3 +185,56 @@ test('a Header that Xero nests inside a wrapper Row is still found', () => {
   const rows = parseXeroTrialBalanceRows(report({ RowType: 'Section', Rows: [HEADER, REAL.cogs] }))
   assert.equal(rows[0]!.amount.toFixed(2), '73019.20')
 })
+
+const ACCOUNT_631 = { externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }
+const buildFor = (accounts: Array<{ externalAccountId: string; code: string | null; name: string }>, rows: unknown[]) => {
+  const parsed = parseXeroTrialBalanceReport(report(HEADER, ...rows))
+  return buildXeroAccountBalanceSnapshotInputs({ balanceDate: '2026-10-23', baseCurrency: 'GBP', accounts, parsedRows: parsed.rows, refusedRows: parsed.refusedRows })
+}
+
+test('a trailing currency suffix after the code does not hide the code', () => {
+  const [r] = parseXeroTrialBalanceRows(report(HEADER, row('Inventory Control (631) (GBP)', '', '', '5', '')))
+  assert.equal(r!.accountCode, '631')
+  assert.equal(r!.accountName, 'Inventory Control')
+  const [legacy] = parseXeroTrialBalanceRows(report(HEADER, row('500 Inventory Asset (GBP)', '', '', '5', '')))
+  assert.equal(legacy!.accountCode, '500')
+  assert.equal(legacy!.accountName, 'Inventory Asset')
+})
+
+test('a refused row that cannot be tied to any account refuses the WHOLE report: no absent account becomes a stored zero', () => {
+  // No code (no digit anywhere), no id, refused for its YTD cell; another row parses fine.
+  const result = buildFor([ACCOUNT_631], [row('Mystery Inventory', '', '', 'N/A', ''), row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /^TB_UNIDENTIFIED_REFUSED_ROW/)
+})
+
+test('the same row WITH its code is attributed to its account, so the report is not wholly refused', () => {
+  const result = buildFor([ACCOUNT_631, { externalAccountId: 'a-310', code: '310', name: 'COGS' }], [row('Inventory Control (631) (GBP)', '', '', 'N/A', ''), row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots.map((s) => s.accountCode), ['310'])
+  assert.match(result.errors[0]!, /631.*TB_NON_MONEY_CELL/)
+})
+
+const withId = (label: string, id: string, ytdDebit: string) => ({ RowType: 'Row', Cells: [{ Value: label, Attributes: [{ Id: 'account', Value: id }] }, ...['', '', ytdDebit, ''].map((Value) => ({ Value }))] })
+
+test('a row whose account id differs from the configured account is never stored under it, even if the code matches', () => {
+  const result = buildFor([ACCOUNT_631], [withId('Other Account (631)', 'a-OTHER', '777'), row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /^TB_ACCOUNT_ID_CONFLICT/)
+})
+
+test('the configured account\'s own id row wins over a different-id row with the same code', () => {
+  const result = buildFor([ACCOUNT_631], [withId('Other Account (631)', 'a-OTHER', '777'), withId('Inventory Control (631)', 'a-631', '123')])
+  assert.deepEqual(result.snapshots.map((s) => String(s.amountBase)), ['123'])
+  assert.deepEqual(result.errors, [])
+})
+
+test('the code fallback still applies to a row that carries no id', () => {
+  const result = buildFor([ACCOUNT_631], [row('Inventory Control (631)', '', '', '9', '')])
+  assert.deepEqual(result.snapshots.map((s) => String(s.amountBase)), ['9'])
+})
+
+test('a refused row with a different id and the same code is a conflict too, not a zero for the configured account', () => {
+  const result = buildFor([ACCOUNT_631], [{ RowType: 'Row', Cells: [{ Value: 'Other (631)', Attributes: [{ Id: 'account', Value: 'a-OTHER' }] }, ...['', '', 'N/A', ''].map((Value) => ({ Value }))] }, row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /TB_ACCOUNT_ID_CONFLICT/)
+})

@@ -657,6 +657,8 @@ export const PACK_BASIS_ACCOUNTS = [
   { kind: 'inventory', label: 'Inventory', settingKey: 'xero_inventory_account' },
   { kind: 'allocated', label: 'Allocated Inventory', settingKey: 'xero_allocated_inventory_account' },
   { kind: 'transit', label: 'Stock in Transit', settingKey: 'xero_transit_account' },
+  // COGS is a profit-and-loss account: its stored balance is year-to-date. The pack reads it only as the balance at D and never
+  // subtracts two dates, so it is unaffected by the financial-year restart.
   { kind: 'cogs', label: 'Cost of Goods Sold', settingKey: 'xero_cogs_account' },
   { kind: 'unearned', label: 'Unearned Revenue', settingKey: 'xero_unearned_revenue_account' },
 ] as const

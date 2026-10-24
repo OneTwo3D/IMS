@@ -6,6 +6,7 @@ import {
   type AccountingAccountBalanceSnapshotInput,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { formatFinancialYearEnd, XERO_FINANCIAL_YEAR_END_SETTING } from '@/lib/domain/accounting/financial-year'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
 import { getGrantedScopes } from './auth'
@@ -37,9 +38,10 @@ export type XeroTrialBalanceReport = {
   }>
 }
 
+type XeroOrganisationRecord = { BaseCurrency?: string | null; FinancialYearEndDay?: number | null; FinancialYearEndMonth?: number | null }
 type XeroOrganisationResponse = {
-  Organisations?: Array<{ BaseCurrency?: string | null }>
-  Organisation?: Array<{ BaseCurrency?: string | null }>
+  Organisations?: XeroOrganisationRecord[]
+  Organisation?: XeroOrganisationRecord[]
 }
 
 export type ParsedXeroTrialBalanceRow = {
@@ -98,12 +100,13 @@ function parseMoneyCell(value: unknown): Decimal | null {
   return negative ? amount.neg() : amount
 }
 
-function labelParts(label: string): { code: string; name: string } | null {
-  // Xero's own Trial Balance label form: "Cost of Goods Sold (310)". The code must contain a digit, so a trailing
-  // currency such as "(GBP)" is not mistaken for one.
-  const trailing = label.trim().match(/^(.+?)\s*\(([A-Za-z0-9._-]*\d[A-Za-z0-9._-]*)\)\s*$/)
+function labelParts(rawLabel: string): { code: string; name: string } | null {
+  // A trailing currency suffix "(GBP)" never hides the code: "Inventory Control (631) (GBP)" is code 631.
+  const label = rawLabel.trim().replace(/\s*\([A-Z]{3}\)\s*$/, '')
+  // Xero's own Trial Balance label form: "Cost of Goods Sold (310)". The code must contain a digit.
+  const trailing = label.match(/^(.+?)\s*\(([A-Za-z0-9._-]*\d[A-Za-z0-9._-]*)\)\s*$/)
   if (trailing?.[1] && trailing[2]) return { code: trailing[2], name: trailing[1].trim() }
-  const match = label.trim().match(/^([A-Za-z0-9._-]*\d[A-Za-z0-9._-]*)(?:\s*[-–—:]\s*|\s+)(.+?)\s*(?:\([A-Z]{3}\))?\s*$/)
+  const match = label.match(/^([A-Za-z0-9._-]*\d[A-Za-z0-9._-]*)(?:\s*[-–—:]\s*|\s+)(.+?)\s*$/)
   if (!match?.[1] || !match[2]) return null
   return { code: match[1], name: match[2].trim() }
 }
@@ -262,24 +265,17 @@ export function configuredAccountCodes(settings: Pick<Awaited<ReturnType<typeof 
     .filter((code): code is string => code.length > 0)
 }
 
-function matchParsedBalance(
-  account: MatchedAccount,
-  parsedRows: ParsedXeroTrialBalanceRow[],
-): ParsedXeroTrialBalanceRow | null {
-  const externalIdMatch = parsedRows.find((row) => row.externalAccountId === account.externalAccountId)
-  if (externalIdMatch) return externalIdMatch
-  return account.code
-    ? parsedRows.find((row) => row.accountCode === account.code) ?? null
-    : null
-}
-
-async function getXeroBaseCurrency(): Promise<string | null> {
+async function getXeroOrganisation(): Promise<{ baseCurrency: string | null; financialYearEnd: string | null }> {
   try {
     const res = await xeroGetCached<XeroOrganisationResponse>('Organisation')
     const organisations = res.data?.Organisations ?? res.data?.Organisation ?? []
-    return res.ok ? organisations[0]?.BaseCurrency?.trim().toUpperCase() ?? null : null
+    const organisation = res.ok ? organisations[0] : undefined
+    return {
+      baseCurrency: organisation?.BaseCurrency?.trim().toUpperCase() ?? null,
+      financialYearEnd: formatFinancialYearEnd(organisation?.FinancialYearEndMonth, organisation?.FinancialYearEndDay),
+    }
   } catch {
-    return null
+    return { baseCurrency: null, financialYearEnd: null }
   }
 }
 
@@ -288,16 +284,37 @@ export function buildXeroAccountBalanceSnapshotInputs(
 ): { snapshots: AccountingAccountBalanceSnapshotInput[]; errors: string[] } {
   const snapshots: AccountingAccountBalanceSnapshotInput[] = []
   const errors: string[] = []
+  // A refused row with NO identity (no account id, no code) could be any configured account. Nothing may then be read as
+  // "Xero omitted it, so it is zero": the whole report is refused.
+  const unidentified = (input.refusedRows ?? []).filter((row) => row.externalAccountId === null && row.accountCode === null)
+  if (unidentified.length > 0) {
+    return {
+      snapshots,
+      errors: [`TB_UNIDENTIFIED_REFUSED_ROW: the Xero Trial Balance has ${unidentified.length} refused row(s) that cannot be tied to an account (${unidentified.map((row) => `"${row.label}"`).join(', ')}), so no absent account can be taken as zero; nothing was stored. ${unidentified.map((row) => row.message).join(' ')}`],
+    }
+  }
+  const parsedAll = input.parsedRows
+  const refusedAll = input.refusedRows ?? []
   for (const account of input.accounts) {
-    const refused = (input.refusedRows ?? []).filter((row) =>
-      row.externalAccountId === account.externalAccountId
-      || (account.code !== null && row.accountCode === account.code)
-      || (row.accountCode === null && row.externalAccountId === null && row.accountName === account.name))
-    if (refused.length > 0) {
-      errors.push(`Configured account ${account.code ?? account.externalAccountId} (${account.name}) was not stored: ${refused.map((row) => row.message).join(' ')}`)
+    const accountRef = `${account.code ?? account.externalAccountId} (${account.name})`
+    const ownRefused = refusedAll.filter((row) => row.externalAccountId === account.externalAccountId || (row.externalAccountId === null && account.code !== null && row.accountCode === account.code))
+    if (ownRefused.length > 0) {
+      errors.push(`Configured account ${accountRef} was not stored: ${ownRefused.map((row) => row.message).join(' ')}`)
       continue
     }
-    const parsed = matchParsedBalance(account, input.parsedRows)
+    // The row's own account id decides. The code is a fallback ONLY for a row that carries no id.
+    const parsed = parsedAll.find((row) => row.externalAccountId === account.externalAccountId)
+      ?? (account.code ? parsedAll.find((row) => row.externalAccountId === null && row.accountCode === account.code) : undefined)
+      ?? null
+    if (!parsed) {
+      const conflicting = account.code
+        ? [...parsedAll, ...refusedAll].find((row) => row.accountCode === account.code && row.externalAccountId !== null && row.externalAccountId !== account.externalAccountId)
+        : undefined
+      if (conflicting) {
+        errors.push(`TB_ACCOUNT_ID_CONFLICT: the Xero Trial Balance row "${conflicting.accountName}" carries code ${account.code} but account id ${conflicting.externalAccountId}, not the configured account's id ${account.externalAccountId}; configured account ${accountRef} was not stored.`)
+        continue
+      }
+    }
     // Xero omits zero-balance accounts from the Trial Balance, so a configured
     // (and therefore real) chart account with no matching row simply has a zero
     // balance — synthesize a zero snapshot rather than failing the whole sync.
@@ -338,7 +355,8 @@ export async function syncXeroAccountBalanceSnapshots(
   if (blockingScope) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: [trialBalanceScopeError(blockingScope)] }
   }
-  const [settings, baseCurrency, xeroBaseCurrency] = await Promise.all([getXeroSettings(), getBaseCurrencyCode(), getXeroBaseCurrency()])
+  const [settings, baseCurrency, xeroOrganisation] = await Promise.all([getXeroSettings(), getBaseCurrencyCode(), getXeroOrganisation()])
+  const xeroBaseCurrency = xeroOrganisation.baseCurrency
   if (!xeroBaseCurrency) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: ['Could not determine the connected Xero organisation base currency.'] }
   }
@@ -389,6 +407,16 @@ export async function syncXeroAccountBalanceSnapshots(
 
   const fenced = await withXeroConnectionFence(connection, async (tx) => {
     const stored = await persistAccountingAccountBalanceSnapshots(snapshots, tx as never)
+    // The Trial Balance is year-to-date, so a profit-and-loss account's balance restarts at the financial-year start. Record
+    // the year end (from the Organisation already fetched for the base currency) in the same transaction as the balances, so
+    // every reader that differences two stored balances can tell when a window crosses it.
+    if (stored.persisted > 0 && xeroOrganisation.financialYearEnd) {
+      await tx.setting.upsert({
+        where: { key: XERO_FINANCIAL_YEAR_END_SETTING },
+        create: { key: XERO_FINANCIAL_YEAR_END_SETTING, value: xeroOrganisation.financialYearEnd },
+        update: { value: xeroOrganisation.financialYearEnd },
+      })
+    }
     // The last-success stamp is written in THIS transaction, after the snapshots, and only for a clean
     // scheduled pull that stored a snapshot for every distinct account it was configured to fetch. A
     // pull that fetched but matched no configured account in the chart (nothing to store), one that
