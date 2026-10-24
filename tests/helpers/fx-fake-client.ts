@@ -4,6 +4,8 @@
  * test can seed rates and watch a moved caller's behaviour. It is NOT proof of the SQL: tests/db/fx-lookup.test.ts
  * runs the same arms against Postgres.
  */
+import type { FxLookupClient } from '@/lib/currencies/fx-lookup'
+
 export type FakeFxRow = {
   fromCurrency: string
   toCurrency: string
@@ -31,9 +33,9 @@ function matches(row: FakeFxRow, where: Where | undefined): boolean {
   return true
 }
 
-export function fakeFxClient(rows: FakeFxRow[], baseCurrency: string | null = 'GBP') {
+export function fakeFxClient(rows: FakeFxRow[], baseCurrency: string | null = 'GBP'): FxLookupClient & { calls: Array<{ op: string; args: unknown }> } {
   const calls: Array<{ op: string; args: unknown }> = []
-  return {
+  const client = {
     calls,
     organisation: {
       findFirst: async (args: unknown) => {
@@ -59,4 +61,7 @@ export function fakeFxClient(rows: FakeFxRow[], baseCurrency: string | null = 'G
       },
     },
   }
+  // The fake answers only the argument shapes fx-lookup.ts sends; Prisma's generic delegate signatures cannot be
+  // satisfied structurally by a hand-written fake, so the cast is confined here.
+  return client as unknown as FxLookupClient & { calls: typeof calls }
 }
