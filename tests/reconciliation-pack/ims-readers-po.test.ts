@@ -21,7 +21,7 @@ function fake(answer: (sql: string, values?: unknown[]) => Array<Record<string, 
     },
   }
 }
-const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule'>(name: K, client: ImsQueryClient, asOf?: string, rowCap?: number) => {
+const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule' | 'fxRates'>(name: K, client: ImsQueryClient, asOf?: string, rowCap?: number) => {
   const read = await readImsSnapshot(client, { sections: [name], ...(asOf !== undefined ? { asOf } : {}), ...(rowCap !== undefined ? { rowCap } : {}) })
   assert.ok(read.ok)
   return read.sections[name]!
@@ -29,7 +29,7 @@ const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule'>(name: K
 
 // ---- purchaseOrders -------------------------------------------------------------------------------
 
-const orderRow = (over: Record<string, unknown> = {}) => ({ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', currency: 'GBP', ...over })
+const orderRow = (over: Record<string, unknown> = {}) => ({ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', currency: 'GBP', created: '2026-03-01T10:00:00.000Z', ...over })
 const lineRow = (over: Record<string, unknown> = {}) => ({ id: 'l1', po_id: 'po1', sku: 'A', qty: '10', received: '4', cost: '2.500000', ...over })
 const poAnswer = (orders: Array<Record<string, unknown>>, lines: Array<Record<string, unknown>>) => (sql: string) => (/FROM purchase_order_lines/.test(sql) ? lines : /FROM purchase_orders/.test(sql) ? orders : [])
 
@@ -38,7 +38,7 @@ test('purchaseOrders: reads every goods order in a committed-incoming status wit
   const client = fake(poAnswer([orderRow(), orderRow({ id: 'po2', reference: 'QBX-PO2', status: 'PARTIALLY_RECEIVED', currency: 'USD' })], [lineRow(), lineRow({ id: 'l2', sku: 'B' }), lineRow({ id: 'l3', po_id: 'po2', sku: 'A' })]))
   const section = await sectionOf('purchaseOrders', client)
   assert.ok(section.ok)
-  assert.deepEqual(section.value.map((o) => [o.id, o.reference, o.status, o.currency, o.lines.map((l) => l.sku)]), [['po1', 'QBX-PO1', 'PO_SENT', 'GBP', ['A', 'B']], ['po2', 'QBX-PO2', 'PARTIALLY_RECEIVED', 'USD', ['A']]])
+  assert.deepEqual(section.value.map((o) => [o.id, o.reference, o.status, o.currency, o.createdAt, o.lines.map((l) => l.sku)]), [['po1', 'QBX-PO1', 'PO_SENT', 'GBP', '2026-03-01T10:00:00.000Z', ['A', 'B']], ['po2', 'QBX-PO2', 'PARTIALLY_RECEIVED', 'USD', '2026-03-01T10:00:00.000Z', ['A']]])
   assert.deepEqual(section.value[0]!.lines[0], { id: 'l1', sku: 'A', qty: '10', qtyReceived: '4', unitCostBase: '2.500000' })
   const queries = client.sent.filter((q) => /FROM purchase_order/.test(q.sql))
   assert.equal(queries.length, 2)
@@ -63,6 +63,7 @@ test('purchaseOrders: a repeated reference, a line of an order not read, a value
   assert.equal(await reason([orderRow()], [lineRow({ cost: 'NaN' })]), 'BAD_VALUE')
   assert.equal(await reason([orderRow({ status: 'DRAFT' })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([orderRow({ currency: '' })]), 'CURRENCY_UNKNOWN')
+  assert.equal(await reason([orderRow({ created: null })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([orderRow(), orderRow({ id: 'po2', reference: 'B' })], [], 1), 'CAP_EXCEEDED')
   assert.equal(await reason([orderRow()], [lineRow(), lineRow({ id: 'l2' })], 1), 'CAP_EXCEEDED')
   assert.equal(await reason([orderRow()], [lineRow({ sku: '' })]), 'BAD_KEY')
@@ -130,4 +131,29 @@ test('the two sections send only SELECTs (one statement each) and never a write'
   await readImsSnapshot(client, { sections: ['purchaseOrders', 'transitSchedule'], asOf: '2026-10-19' })
   for (const { sql } of client.sent) assert.ok(/^(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|ROLLBACK|SELECT\b|SET LOCAL )/.test(sql) && !sql.includes(';'), sql)
   assert.ok(!client.sent.some(({ sql }) => /\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|GRANT)\b/i.test(sql)))
+})
+
+// ---- fxRates --------------------------------------------------------------------------------------
+
+// [mutation: rows from a currency other than the base read, or the table read with a window]
+test('fxRates: reads every row quoted FROM the base currency (bound), exact decimals and instants; a bad rate, a missing instant, an empty currency or a read over the cap is unreadable', async () => {
+  const row = (over: Record<string, unknown> = {}) => ({ currency: 'USD', rate: '1.25000000', fetched: '2026-02-20T00:00:00.000Z', ...over })
+  const client = fake((sql) => (/FROM fx_rates/.test(sql) ? [row(), row({ currency: 'EUR', rate: '1.15', fetched: '2026-02-21T00:00:00.000Z' })] : []))
+  const section = await sectionOf('fxRates', client)
+  assert.ok(section.ok)
+  assert.deepEqual(section.value, [{ currency: 'USD', rate: '1.25000000', fetchedAt: '2026-02-20T00:00:00.000Z' }, { currency: 'EUR', rate: '1.15', fetchedAt: '2026-02-21T00:00:00.000Z' }])
+  const q = client.sent.find((x) => /FROM fx_rates/.test(x.sql))!
+  assert.match(q.sql, /"fromCurrency" = \$1/)
+  assert.deepEqual(q.values, ['GBP'])
+  const reason = async (rows: Array<Record<string, unknown>>, cap?: number) => {
+    const s = await sectionOf('fxRates', fake((sql) => (/FROM fx_rates/.test(sql) ? rows : [])), undefined, cap)
+    return s.ok ? 'ok' : s.reason
+  }
+  assert.equal(await reason([row({ rate: 'NaN' })]), 'BAD_VALUE')
+  assert.equal(await reason([row({ rate: '1e3' })]), 'BAD_VALUE')
+  assert.equal(await reason([row({ rate: null })]), 'BAD_VALUE')
+  assert.equal(await reason([row({ fetched: null })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([row({ currency: '' })]), 'CURRENCY_UNKNOWN')
+  assert.equal(await reason([row(), row({ currency: 'EUR' })], 1), 'CAP_EXCEEDED')
+  assert.equal(await reason([]), 'ok')
 })

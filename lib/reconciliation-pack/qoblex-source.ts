@@ -63,10 +63,11 @@ export type QoblexLocation = { code: string; company: string; threePl: boolean }
 export type QoblexLot = { sku: string; location: string; qty: string; unitCost: string | null; currency: string; fxRateToBase: string; lotRef: string }
 export type QoblexProduct = { sku: string; type: string }
 /**
- * One line of the export's Incoming (open purchase order) report, as written: the Qoblex order number, the SKU, the supplier, the currency and
- * rate the pinned native map gives that supplier (foreign = base x rate; blank = base currency), and the quantities and foreign unit price.
+ * One line of the export's Incoming (open purchase order) report, as written: the Qoblex order number, the SKU, the supplier, and the
+ * quantities and the unit price in the order's own currency. The report carries no currency or rate: the currency is the one IMS recorded on
+ * the matched purchase order and the rate is the central fx_rates row (purchase-order-items.ts).
  */
-export type QoblexPoLine = { orderKey: string; sku: string; supplier: string; currency: string; fxRateToBase: string; qtyOrdered: string; qtyReceived: string; unitCostForeign: string }
+export type QoblexPoLine = { orderKey: string; sku: string; supplier: string; qtyOrdered: string; qtyReceived: string; unitCostForeign: string }
 /** `keyPrefix` is what the first load put in front of a Qoblex order number to make the IMS purchase-order reference (the manifest's declaration; it only maps identities and never narrows a population). */
 export type QoblexPurchaseOrders = { keyPrefix: string; lines: QoblexPoLine[] }
 export type QoblexPart<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
@@ -353,9 +354,7 @@ const isNonNegativeDecimal = (value: string): boolean => { const d = parseDecima
 
 /**
  * The Incoming report as the lines it lists. Every line must be an OPEN one (the native map's only statuses), carry a plain non-negative
- * ordered and received quantity with received not above ordered, a plain non-negative foreign price, a three-letter currency, and a rate that is
- * blank or exactly 1 for GBP and a positive decimal for any other currency. The lines of one order share supplier, currency and rate (the
- * importer refuses an order that does not). An order number or SKU is the exact text of the file (assertRawIdentities) and an order number
+ * ordered and received quantity with received not above ordered, and a plain non-negative price in the order's own currency. The lines of one order share one supplier (the importer refuses an order that does not). An order number or SKU is the exact text of the file (assertRawIdentities) and an order number
  * is a plain token (QOBLEX_PO_NUMBER_RE); the same (order, SKU) twice, or two order numbers that differ only in case, is DUPLICATE_KEY (never
  * summed, never picked between). Anything else is a closed reason and no line is returned.
  */
@@ -373,16 +372,7 @@ function purchaseOrdersOf(spec: PoSpec, files: Files): QoblexPurchaseOrders {
     const price = v.unitCostForeign ?? ''
     if (!isNonNegativeDecimal(qtyOrdered) || !isNonNegativeDecimal(qtyReceived) || !isNonNegativeDecimal(price)) return bad('BAD_VALUE')
     if (parseDecimalStrict(qtyReceived)!.gt(parseDecimalStrict(qtyOrdered)!)) return bad('BAD_VALUE')
-    const currency = v.currency ?? ''
-    if (!/^[A-Z]{3}$/.test(currency)) return bad('CURRENCY_UNKNOWN')
-    const rate = v.fxRateToBase ?? ''
-    if (currency === QOBLEX_BASE_CURRENCY) {
-      if (rate !== '' && !(parseDecimalStrict(rate)?.equals(1) ?? false)) return bad('CURRENCY_UNKNOWN')
-    } else {
-      const parsed = parseDecimalStrict(rate)
-      if (parsed === null || !parsed.gt(0)) return bad('CURRENCY_UNKNOWN')
-    }
-    return { orderKey, sku: sku.sku, supplier: v.supplierName ?? '', currency, fxRateToBase: rate, qtyOrdered, qtyReceived, unitCostForeign: price }
+    return { orderKey, sku: sku.sku, supplier: v.supplierName ?? '', qtyOrdered, qtyReceived, unitCostForeign: price }
   })
   const lineIds = new Set<string>()
   const orderIds = new Map<string, string>()
@@ -395,7 +385,7 @@ function purchaseOrdersOf(spec: PoSpec, files: Files): QoblexPurchaseOrders {
     const spelled = orderIds.get(folded)
     if (spelled !== undefined && spelled !== line.orderKey) return bad('DUPLICATE_KEY')
     orderIds.set(folded, line.orderKey)
-    const sig = JSON.stringify([line.supplier, line.currency, line.fxRateToBase])
+    const sig = line.supplier
     const seen = shape.get(line.orderKey)
     if (seen !== undefined && seen !== sig) return bad('EXPORT_INCONSISTENT')
     shape.set(line.orderKey, sig)

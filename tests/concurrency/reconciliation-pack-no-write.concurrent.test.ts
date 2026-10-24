@@ -45,6 +45,30 @@ async function census(): Promise<Census> {
   })
 }
 
+
+// THE TIER SHARES ONE DATABASE: a Xero token and a first-load run record left by another file are visible to a run, and each is a unique row
+// (one token per connector, one first-load record) that a test needing its own must not delete or collide with. Foreign rows are held aside
+// REVERSIBLY by recorded id (the token's connector renamed, the first-load record's singleton flag cleared) and put back exactly, with the counts asserted.
+type Held = { tokens: string[]; firstLoad: string[] }
+const NOTHING_HELD: Held = { tokens: [], firstLoad: [] }
+async function holdForeignEstate(): Promise<Held> {
+  const tokens = (await withClient((c) => c.query(`SELECT id FROM accounting_tokens WHERE connector = 'xero' ORDER BY id`))).rows.map((r: { id: string }) => r.id)
+  const firstLoad = (await withClient((c) => c.query(`SELECT id FROM first_load_apply_runs WHERE singleton = true ORDER BY id`))).rows.map((r: { id: string }) => r.id)
+  const spare = (await withClient((c) => c.query(`SELECT count(*)::int AS n FROM first_load_apply_runs WHERE singleton = false`))).rows[0].n
+  assert.equal(spare, 0, 'precondition: no first-load record is already held aside by something else')
+  const held: Held = { tokens, firstLoad }
+  if (tokens.length > 0) await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'held-' || id WHERE id = ANY($1) AND connector = 'xero'`, [tokens]))
+  if (firstLoad.length > 0) await withClient((c) => c.query(`UPDATE first_load_apply_runs SET singleton = false WHERE id = ANY($1) AND singleton = true`, [firstLoad]))
+  const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs WHERE singleton = true)::int AS f`))).rows[0]
+  assert.deepEqual([visible.t, visible.f], [0, 0], 'precondition: no foreign Xero token or first-load record is visible to the run')
+  return held
+}
+async function restoreForeignEstate(held: Held): Promise<void> {
+  const t = held.tokens.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'xero' WHERE id = ANY($1) AND connector = 'held-' || id`, [held.tokens]))).rowCount
+  const f = held.firstLoad.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE first_load_apply_runs SET singleton = true WHERE id = ANY($1) AND singleton = false`, [held.firstLoad]))).rowCount
+  assert.deepEqual([t, f], [held.tokens.length, held.firstLoad.length], 'every foreign Xero token and first-load record was put back')
+}
+
 test('[reconciliation pack] the rig can fail: a control write moves the row counts and the statistics', { skip: !RUN }, async () => {
   const before = await census()
   await withClient(async (client) => { await client.query(`INSERT INTO settings (key, value, "updatedAt") VALUES ('${TAG}', 'x', now())`) })
@@ -133,9 +157,10 @@ test('[reconciliation pack] R6 and R10 on a seeded estate: decided from stored s
   const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [[...SETTINGS, keys.xero]])).rows as Array<{ key: string; value: string }>)
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
   const setting = (key: string, value: string) => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, value])
+  let estate: Held = NOTHING_HELD
   try {
+    estate = await holdForeignEstate()
     for (const [key, value] of [[keys.xero, 'true'], ['xero_inventory_account', codes.inventory], ['xero_allocated_inventory_account', codes.allocated], ['xero_transit_account', codes.transit], ['xero_cogs_account', codes.cogs], ['xero_unearned_revenue_account', codes.unearned], ['transit_ledger_coverage_start_date', '2026-01-01']] as const) await setting(key, value)
-    await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
     await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'x', '2031-01-01', $2, now())`, [`${LTAG}-tok`, `${LTAG}-tenant`])
     const amounts: Record<string, [string, string]> = { inventory: ['100.50', '100.50'], allocated: ['20.25', '20.25'], transit: ['50', '50'], cogs: ['7', '7'], unearned: ['-30', '-30'] }
     for (const [kind, code] of Object.entries(codes)) {
@@ -186,6 +211,7 @@ test('[reconciliation pack] R6 and R10 on a seeded estate: decided from stored s
     await sql(`DELETE FROM transit_subledger_movements WHERE id LIKE '${LTAG}%'`)
     await sql(`DELETE FROM accounting_account_balance_snapshots WHERE id LIKE '${LTAG}%'`)
     await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${LTAG}%'`)
+    await restoreForeignEstate(estate)
     for (const key of [...SETTINGS, keys.xero]) {
       const prior = saved.find((row) => row.key === key)
       if (prior) await setting(key, prior.value)
@@ -295,7 +321,9 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
       { taxType: 'OLD1', name: 'Retired', status: 'ARCHIVED' as const, reportTaxType: null, effectiveRate: null, displayTaxRate: null, components: [], canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: null } },
     ]
     const tenant = `${VTAG}-tenant`
+    let estate: Held = NOTHING_HELD
     try {
+      estate = await holdForeignEstate()
       await sql(`UPDATE tax_rates SET accounting_tax_type = 'OUTPUT2' WHERE id = $1`, [`${VTAG}-t`])
       await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'not-a-token', now(), $2, now())`, [`${VTAG}-tok`, tenant])
       for (const row of xeroRows) {
@@ -329,6 +357,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
       await sql(`DELETE FROM xero_tax_rate_lists WHERE id LIKE '${VTAG}%'`)
       await sql(`DELETE FROM xero_tax_rates WHERE id LIKE '${VTAG}%'`)
       await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${VTAG}%'`)
+      await restoreForeignEstate(estate)
       await sql(`DELETE FROM settings WHERE key = 'accounting_reverse_charge_sales_tax_type'`)
     }
 
@@ -408,7 +437,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
   const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
   chmodSync(dir, 0o700)
   const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [X_SETTINGS])).rows as Array<{ key: string; value: string }>)
-  const savedTokens = await withClient(async (client) => (await client.query(`SELECT * FROM accounting_tokens WHERE connector = 'xero'`)).rows)
+  let estate: Held = NOTHING_HELD
   const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
   const setting = (key: string, value: string, at = '2026-01-01 00:00:00') => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "updatedAt" = EXCLUDED."updatedAt"`, [key, value, at])
   const targets: string[] = []
@@ -429,7 +458,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     await setting('xero_shipping_account', '260')
     await setting('xero_sales_account', '200')
     await sql(`INSERT INTO accounting_accounts (id, connector, "externalAccountId", code, name, type, active) VALUES ($1, 'xero', $2, '260', 'Shipping', 'REVENUE', true)`, [`${XTAG}-acc`, `${XTAG}-acc-ext`])
-    await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
+    estate = await holdForeignEstate()
     await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "connectionGeneration", "updatedAt") VALUES ($1, 'xero', $2, '2031-01-01', $3, 'gen-e2e', now())`, [`${XTAG}-tok`, TOKEN, XTENANT])
     await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{}', '{}', '2026-01-01 00:00:00', '2026-01-01 00:00:00')`, [`${XTAG}-fl`])
     await sql(`INSERT INTO tax_rates (id, name, rate, accounting_tax_type, "countryCode", reporting_category, "updatedAt") VALUES ($1, 'UK Standard', 0.2, 'OUTPUT2', 'GB', 'DOMESTIC', now())`, [`${XTAG}-t`])
@@ -532,11 +561,8 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     await sql(`DELETE FROM shopping_tax_rate_mappings WHERE id LIKE '${XTAG}%'`)
     await sql(`DELETE FROM tax_rates WHERE id LIKE '${XTAG}%'`)
     await sql(`DELETE FROM first_load_apply_runs WHERE id LIKE '${XTAG}%'`)
-    await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
-    for (const row of savedTokens) {
-      const columns = Object.keys(row)
-      await sql(`INSERT INTO accounting_tokens (${columns.map((c) => `"${c}"`).join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})`, columns.map((c) => row[c]))
-    }
+    await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${XTAG}%'`)
+    await restoreForeignEstate(estate)
     await sql(`DELETE FROM settings WHERE key = ANY($1)`, [X_SETTINGS])
     for (const prior of saved) await setting(prior.key, prior.value, '2026-09-01 00:00:00')
     rmSync(dir, { recursive: true, force: true })
@@ -853,7 +879,8 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
   // other files are visible to a run, and both populations are IMS's. Foreign rows are held aside by RECORDED ids with reversible updates (a
   // status, a journal date, a snapshot date; never a delete of a foreign row except the token, which is saved whole and put back) and restored
   // exactly in finally with the counts asserted; ids are recorded BEFORE each update so a partial setup is restored too.
-  const held = { orders: [] as Array<{ id: string; status: string }>, movements: [] as Array<{ id: string; at: string }>, runs: [] as string[], snapshots: [] as string[], firstLoad: [] as Array<{ id: string; status: string }>, token: [] as string[], settings: [] as Array<{ key: string; value: string }> }
+  const held = { orders: [] as Array<{ id: string; status: string }>, movements: [] as Array<{ id: string; at: string }>, runs: [] as string[], snapshots: [] as string[], settings: [] as Array<{ key: string; value: string }> }
+  let estate: Held = NOTHING_HELD
   const targets: string[] = []
   const original = net.Socket.prototype.connect
   const writeExport = (qty: string) => {
@@ -868,29 +895,26 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
   }
   try {
     held.settings = (await sql(`SELECT key, value FROM settings WHERE key = ANY($1)`, [settingKeys])).rows as Array<{ key: string; value: string }>
-    held.token = (await sql(`SELECT to_jsonb(t)::text AS j FROM accounting_tokens t WHERE connector = 'xero'`)).rows.map((r: { j: string }) => r.j)
+    estate = await holdForeignEstate()
     held.orders = (await sql(`SELECT id, status::text AS status FROM purchase_orders WHERE status::text = ANY($1)`, [incoming])).rows as Array<{ id: string; status: string }>
     await sql(`UPDATE purchase_orders SET status = 'DRAFT' WHERE id = ANY($1)`, [held.orders.map((o) => o.id)])
     held.movements = (await sql(`SELECT id, to_char(journal_date, 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS at FROM transit_subledger_movements WHERE journal_date <= $1`, [OD])).rows as Array<{ id: string; at: string }>
     await sql(`UPDATE transit_subledger_movements SET journal_date = '2099-01-01' WHERE id = ANY($1)`, [held.movements.map((m) => m.id)])
     held.runs = (await sql(`UPDATE inventory_snapshot_runs SET "snapshotDate" = '2020-01-02' WHERE "snapshotDate" = $1 RETURNING id`, [OD])).rows.map((r: { id: string }) => r.id)
     held.snapshots = (await sql(`UPDATE inventory_snapshots SET "snapshotDate" = '2020-01-02' WHERE "snapshotDate" = $1 RETURNING id`, [OD])).rows.map((r: { id: string }) => r.id)
-    held.firstLoad = (await sql(`SELECT id, status FROM first_load_apply_runs`)).rows as Array<{ id: string; status: string }>
     const visible = await sql(`SELECT (SELECT count(*) FROM purchase_orders WHERE status::text = ANY($2))::int AS o, (SELECT count(*) FROM transit_subledger_movements WHERE journal_date <= $1)::int AS m, (SELECT count(*) FROM inventory_snapshot_runs WHERE "snapshotDate" = $1)::int AS r`, [OD, incoming])
     assert.deepEqual([visible.rows[0].o, visible.rows[0].m, visible.rows[0].r], [0, 0, 0], 'precondition: no foreign incoming order, transit row or snapshot run is visible to the run')
 
     // The estate: Xero on, five tagged accounts with stored balances for the cycle date, a coverage watermark, a verified first load.
     const setting = (key: string, value: string) => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, value])
     for (const [key, value] of [[INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'], ['xero_inventory_account', codes.inventory], ['xero_allocated_inventory_account', codes.allocated], ['xero_transit_account', codes.transit], ['xero_cogs_account', codes.cogs], ['xero_unearned_revenue_account', codes.unearned], ['transit_ledger_coverage_start_date', '2026-03-01']] as const) await setting(key, value)
-    await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
     await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "updatedAt") VALUES ($1, 'xero', 'x', '2031-01-01', $2, now())`, [`${OTAG}-tok`, `${OTAG}-tenant`])
     const amounts: Record<string, string> = { inventory: '0', allocated: '0', transit: '50', cogs: '0', unearned: '0' }
     for (const [kind, code] of Object.entries(codes)) {
       await sql(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "sourcePayloadRef", "tenantId", "updatedAt") VALUES ($1, 'xero', $2, $3, 'x', $4, 'GBP', $5, $5, $6, $7, now())`, [`${OTAG}-b-${kind}`, `${OTAG}-acc-${kind}`, code, OD, amounts[kind], `xero:trial-balance:${OD}`, `${OTAG}-tenant`])
     }
     await sql(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, $2, 0, 0, now())`, [`${OTAG}-run`, OD])
-    if (held.firstLoad.length === 0) await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{}', '{}', '2026-03-01 09:00:00', '2026-03-02 09:00:00')`, [`${OTAG}-fl`])
-    else await sql(`UPDATE first_load_apply_runs SET status = 'VERIFIED' WHERE id = ANY($1)`, [held.firstLoad.map((f) => f.id)])
+    await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{}', '{}', '2026-03-01 09:00:00', '2026-03-02 09:00:00')`, [`${OTAG}-fl`])
     // One supplier, one open order with two lines (A part-received: 10 ordered of which 4 received in IMS terms is 6 outstanding), the transit rows of its bill and its receipt.
     await sql(`INSERT INTO suppliers (id, name, "updatedAt") VALUES ($1, 'x', now())`, [`${OTAG}-sup`])
     await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now()), ($3, $4, 'x', now())`, [`${OTAG}-pa`, `${OTAG}-A`, `${OTAG}-pb`, `${OTAG}-B`])
@@ -960,18 +984,15 @@ test('[reconciliation pack] R7, R8 and R11 at P2: nothing read at P1, nothing of
       movements: held.movements.length === 0 ? 0 : (await sql(`UPDATE transit_subledger_movements m SET journal_date = v.at::timestamp FROM unnest($1::text[], $2::text[]) AS v(id, at) WHERE m.id = v.id AND m.journal_date = '2099-01-01'`, [held.movements.map((m) => m.id), held.movements.map((m) => m.at)])).rowCount,
       runs: (await sql(`UPDATE inventory_snapshot_runs SET "snapshotDate" = $2 WHERE id = ANY($1) AND "snapshotDate" = '2020-01-02'`, [held.runs, OD])).rowCount,
       snapshots: (await sql(`UPDATE inventory_snapshots SET "snapshotDate" = $2 WHERE id = ANY($1) AND "snapshotDate" = '2020-01-02'`, [held.snapshots, OD])).rowCount,
-      firstLoad: held.firstLoad.length === 0 ? 0 : (await sql(`UPDATE first_load_apply_runs f SET status = v.status FROM unnest($1::text[], $2::text[]) AS v(id, status) WHERE f.id = v.id`, [held.firstLoad.map((f) => f.id), held.firstLoad.map((f) => f.status)])).rowCount,
     }
     for (const key of settingKeys) {
       const prior = held.settings.find((row) => row.key === key)
       if (prior) await sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, prior.value])
       else await sql(`DELETE FROM settings WHERE key = $1`, [key])
     }
-    let tokens = 0
-    for (const j of held.token) { await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`); tokens += (await sql(`INSERT INTO accounting_tokens SELECT * FROM jsonb_populate_record(NULL::accounting_tokens, $1::jsonb)`, [j])).rowCount ?? 0 }
+    await restoreForeignEstate(estate)
     rmSync(dir, { recursive: true, force: true })
     rmSync(exportDir, { recursive: true, force: true })
-    assert.deepEqual(restored, { orders: held.orders.length, movements: held.movements.length, runs: held.runs.length, snapshots: held.snapshots.length, firstLoad: held.firstLoad.length }, 'every held foreign row was restored')
-    assert.equal(tokens, held.token.length, 'the foreign Xero token was put back')
+    assert.deepEqual(restored, { orders: held.orders.length, movements: held.movements.length, runs: held.runs.length, snapshots: held.snapshots.length }, 'every held foreign row was restored')
   }
 })

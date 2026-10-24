@@ -3,8 +3,8 @@ import test from 'node:test'
 
 import { identityToken } from '../../lib/reconciliation-pack/identity.ts'
 import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
-import type { ImsRead, ImsReadOptions, PoLineRow, PoRow } from '../../lib/reconciliation-pack/ims-readers.ts'
-import { VALUE_EXACT_GBP_TOKEN, imsSide, qoblexSide, runPoItem, type PoItemContext } from '../../lib/reconciliation-pack/purchase-order-items.ts'
+import type { FxRateRow, ImsRead, ImsReadOptions, PoLineRow, PoRow } from '../../lib/reconciliation-pack/ims-readers.ts'
+import { ORDER_LINES_TOKEN, VALUE_EXACT_GBP_TOKEN, imsSide, qoblexSide, rateAt, runPoItem, type PoItemContext } from '../../lib/reconciliation-pack/purchase-order-items.ts'
 import type { QoblexPoLine } from '../../lib/reconciliation-pack/qoblex-source.ts'
 import { PO_PREFIX, poLine, poLines, sourceOf } from './qoblex-fixtures.ts'
 
@@ -13,14 +13,15 @@ import { PO_PREFIX, poLine, poLines, sourceOf } from './qoblex-fixtures.ts'
  */
 
 const line = (sku: string, qty: string, received: string, cost: string, id = `l-${sku}`): PoLineRow => ({ id, sku, qty, qtyReceived: received, unitCostBase: cost })
-const po = (number: string, lines: PoLineRow[], over: Partial<PoRow> = {}): PoRow => ({ id: `po-${number}`, reference: `${PO_PREFIX}${number}`, status: 'PO_SENT', currency: 'GBP', lines, ...over })
+const po = (number: string, lines: PoLineRow[], over: Partial<PoRow> = {}): PoRow => ({ id: `po-${number}`, reference: `${PO_PREFIX}${number}`, status: 'PO_SENT', currency: 'GBP', createdAt: '2026-03-01T10:00:00.000Z', lines, ...over })
 
-type Fixture = { orders?: PoRow[]; firstLoad?: 'verified' | 'unverified' | 'absent'; fail?: Partial<Record<'purchaseOrders' | 'boundaries', 'READ_INCOMPLETE'>>; whole?: 'fail' | 'throws'; noSection?: 'purchaseOrders' | 'boundaries' }
+type Fixture = { orders?: PoRow[]; fx?: FxRateRow[]; fxSection?: 'fail'; firstLoad?: 'verified' | 'unverified' | 'absent'; fail?: Partial<Record<'purchaseOrders' | 'boundaries', 'READ_INCOMPLETE'>>; whole?: 'fail' | 'throws'; noSection?: 'purchaseOrders' | 'boundaries' }
 function ims(fixture: Fixture = {}) {
   const calls: ImsReadOptions[] = []
   const firstLoad = fixture.firstLoad ?? 'verified'
   const values: Record<string, unknown> = {
     purchaseOrders: fixture.orders ?? [],
+    fxRates: fixture.fx ?? [],
     boundaries: { firstLoad: firstLoad === 'verified' ? { state: 'verified', cutAt: '2026-10-01T00:00:00.000Z' } : { state: firstLoad }, storefrontImport: { state: 'not-completed' }, retentionMonths: 0 },
   }
   const port = async (options: ImsReadOptions): Promise<ImsRead> => {
@@ -30,13 +31,14 @@ function ims(fixture: Fixture = {}) {
     const sections: Record<string, unknown> = {}
     for (const name of options.sections) {
       if (fixture.noSection === name) continue
-      const failure = fixture.fail?.[name as 'purchaseOrders' | 'boundaries']
+      const failure = name === 'fxRates' && fixture.fxSection === 'fail' ? 'READ_INCOMPLETE' : fixture.fail?.[name as 'purchaseOrders' | 'boundaries']
       sections[name] = failure ? { ok: false, reason: failure } : { ok: true, value: values[name] }
     }
     return { ok: true, snapshotId: '1:2:', sections } as ImsRead
   }
   return { calls, port }
 }
+const lineKeys = (item: { entries?: Partial<Record<string, readonly { key: string }[]>> }, bucket: string) => (item.entries?.[bucket] ?? []).map((e) => e.key).filter((k) => !k.endsWith(`|${ORDER_LINES_TOKEN}`)).sort()
 const keys = (item: { entries?: Partial<Record<string, readonly { key: string }[]>> }, bucket: string) => (item.entries?.[bucket] ?? []).map((e) => e.key).sort()
 
 async function run(id: 'R7' | 'R8', orders: PoRow[], lines: QoblexPoLine[], over: Partial<PoItemContext> & { fixture?: Fixture; prefix?: string } = {}) {
@@ -55,7 +57,7 @@ test('R7 passes when every incoming order agrees (set exact, value in GBP), nami
   assert.deepEqual(item.sources, [...getPackItem('R7').sources])
   assert.deepEqual(keys(item, 'bothEqual'), ['PO1', 'PO1|value-exact-gbp', 'PO2', 'PO2|value-exact-gbp'])
   assert.equal(port.calls.length, 1)
-  assert.deepEqual([...port.calls[0]!.sections].sort(), ['boundaries', 'purchaseOrders'])
+  assert.deepEqual([...port.calls[0]!.sections].sort(), ['boundaries', 'fxRates', 'purchaseOrders'])
   assert.equal(counter.reads, 1)
   const values = Object.fromEntries((item.entries!.bothEqual as unknown as Array<{ key: string; ims: string; vendor: string }>).map((e) => [e.key, [e.ims, e.vendor]]))
   // PO2: ordered 4, received 1, outstanding 3 at 10 each.
@@ -110,7 +112,7 @@ test('R7 POPULATION NARROWING: an IMS incoming order that no export line explain
 // [mutation: the value tolerance changed, or made exclusive]
 test('R7 FX BOUNDARY: an order in another currency is within GBP 1 INCLUSIVE (1.00 passes, 1.000001 fails); an order in GBP must be exact', async () => {
   // USD at rate 1.25: price 12.5 -> 10 per unit; ordered 100 -> GBP 1000.
-  const usd = (cost: string) => run('R7', [po('PO1', [line('A', '100', '0', cost)], { currency: 'USD' })], [poLine('PO1', 'A', '100', '0', '12.5', { currency: 'USD', fxRateToBase: '1.25', supplier: 'S' })])
+  const usd = (cost: string) => run('R7', [po('PO1', [line('A', '100', '0', cost)], { currency: 'USD' })], [poLine('PO1', 'A', '100', '0', '12.5')], { fixture: { fx: [fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z')] } })
   assert.equal((await usd('10')).item.outcome, 'pass')
   assert.equal((await usd('10.01')).item.outcome, 'pass')
   assert.equal((await usd('10.01')).item.entries!.bothEqual!.length, 1)
@@ -127,32 +129,70 @@ test('R7 FX BOUNDARY: an order in another currency is within GBP 1 INCLUSIVE (1.
   assert.equal(off.item.outcome, 'fail')
   assert.deepEqual(keys(off.item, 'bothDiffer'), [`PO1|${VALUE_EXACT_GBP_TOKEN}`])
   assert.equal(keys(off.item, 'bothEqual').join(), 'PO1')
-  // the stored precision is six decimals: one millionth of a pound is the finest difference, and it is tolerated; ten are not
-  assert.equal((await gbp('10.00000001')).item.outcome, 'pass')
+  // the stored precision is six decimals: ONE MILLIONTH of a pound is a difference, and a GBP order must not carry one
+  assert.equal((await gbp('10.00000001')).item.outcome, 'fail')
   assert.equal((await gbp('10.0000001')).item.outcome, 'fail')
+  const micro = (cost: string) => run('R7', [po('PO1', [line('A', '1', '0', cost)])], [poLine('PO1', 'A', '1', '0', '10')])
+  for (const [cost, expected] of [['10', 'pass'], ['10.000001', 'fail'], ['9.999999', 'fail']] as const) {
+    const m = await micro(cost)
+    assert.equal(m.item.outcome, expected, cost)
+    if (expected === 'fail') assert.deepEqual(keys(m.item, 'bothDiffer'), [`PO1|${VALUE_EXACT_GBP_TOKEN}`], cost)
+  }
 })
 
-// [mutation: the foreign price used unconverted / the rate applied the wrong way round]
-test('R7 FX source: Qoblex converts price / rate with the map\'s fixed rate, six decimals half-up per unit; IMS uses its stored base cost', async () => {
+const fxRow = (currency: string, rate: string, fetchedAt: string): FxRateRow => ({ currency, rate, fetchedAt })
+
+// [mutation: the foreign price used unconverted / the rate applied the wrong way round / the map's fixed table used]
+test('R7 FX source: Qoblex converts price / rate (1 GBP = rate foreign) with the central fx_rates row, six decimals half-up per unit; IMS uses its stored base cost', async () => {
+  const fx = [fxRow('EUR', '1.15', '2026-02-20T00:00:00.000Z')]
   // EUR rate 1.15, price 0.4 -> 0.347826 (0.3478260869...), x 6 outstanding = 2.086956
-  const eur = poLine('PO901', 'S', '10', '4', '0.4', { currency: 'EUR', fxRateToBase: '1.15', supplier: 'G' })
-  const side = qoblexSide([eur])
+  const eur = poLine('PO901', 'S', '10', '4', '0.4')
+  const mine = imsSide([po('PO901', [line('S', '6', '0', '0.347826')], { currency: 'EUR' })], PO_PREFIX)
+  assert.ok(mine.ok)
+  const side = qoblexSide([eur], { mine: mine.orders, fxRates: fx })
   assert.ok(side.ok)
   assert.equal([...side.orders.values()][0]!.value.toFixed(), '2.086956')
-  const { item } = await run('R7', [po('PO901', [line('S', '6', '0', '0.347826')], { currency: 'EUR' })], [eur])
+  const { item } = await run('R7', [po('PO901', [line('S', '6', '0', '0.347826')], { currency: 'EUR' })], [eur], { fixture: { fx } })
   assert.equal(item.outcome, 'pass')
-  const wrongWay = await run('R7', [po('PO901', [line('S', '6', '0', '0.46')], { currency: 'EUR' })], [eur])
-  assert.equal(wrongWay.item.outcome, 'pass') // 2.76 vs 2.086956 is within GBP 1 only because the order is small: the tolerance is absolute
-  const large = poLine('PO902', 'S', '1000', '0', '0.4', { currency: 'EUR', fxRateToBase: '1.15', supplier: 'G' })
-  const bad = await run('R7', [po('PO902', [line('S', '1000', '0', '0.46')], { currency: 'EUR' })], [large])
-  assert.equal(bad.item.outcome, 'fail')
+  // the same order at a different central rate is a different Qoblex value (the rate is read, not carried by the pack)
+  const large = poLine('PO902', 'S', '1000', '0', '0.4')
+  const same = await run('R7', [po('PO902', [line('S', '1000', '0', '0.347826')], { currency: 'EUR' })], [large], { fixture: { fx } })
+  assert.equal(same.item.outcome, 'pass')
+  const other = await run('R7', [po('PO902', [line('S', '1000', '0', '0.347826')], { currency: 'EUR' })], [large], { fixture: { fx: [fxRow('EUR', '1.30', '2026-02-20T00:00:00.000Z')] } })
+  assert.equal(other.item.outcome, 'fail')
+  // an order no IMS order explains has no recorded currency: it is onlyVendor with its unconverted sum
+  const orphan = await run('R7', [], [poLine('PX', 'S', '2', '0', '3')], { fixture: { fx } })
+  assert.equal(orphan.item.outcome, 'fail')
+  assert.equal((orphan.item.entries!.onlyVendor as unknown as Array<{ vendor: string }>)[0]!.vendor, '6')
 })
 
-// [mutation: an order currency disagreement ignored]
-test('R7: an order whose currency differs between IMS and the export is CURRENCY_UNKNOWN, never compared across the disagreement', async () => {
-  const { item } = await run('R7', [po('PO1', [line('A', '1', '0', '1')], { currency: 'EUR' })], [poLine('PO1', 'A', '1', '0', '1')])
-  assert.equal(item.outcome, 'inconclusive')
-  assert.deepEqual(item.reasons, ['CURRENCY_UNKNOWN'])
+// [mutation: the latest row picked without the instant bound / a tie broken silently / a missing row read as rate 1]
+test('R7 RATE SELECTION: the latest fx_rates row on or before the IMS order\'s creation; none, a non-positive rate or a tie that disagrees is CURRENCY_UNKNOWN, never a pass', async () => {
+  const at = '2026-03-01T10:00:00.000Z'
+  const rows = [fxRow('USD', '1.20', '2026-02-01T00:00:00.000Z'), fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z'), fxRow('USD', '9.99', '2026-03-02T00:00:00.000Z'), fxRow('EUR', '1.10', '2026-02-25T00:00:00.000Z')]
+  assert.equal(rateAt('USD', at, rows)!.toFixed(), '1.25', 'the latest on or before; a later row is ignored')
+  assert.equal(rateAt('USD', '2026-02-20T00:00:00.000Z', rows)!.toFixed(), '1.25', 'a row at exactly the instant is on or before it')
+  assert.equal(rateAt('USD', '2026-02-19T23:59:59.999Z', rows)!.toFixed(), '1.2')
+  assert.equal(rateAt('GBP', at, [])!.toFixed(), '1', 'the base currency needs no row')
+  assert.equal(rateAt('USD', '2026-01-01T00:00:00.000Z', rows), null, 'no row on or before the instant')
+  assert.equal(rateAt('JPY', at, rows), null, 'no row for the currency')
+  assert.equal(rateAt('USD', 'soon', rows), null)
+  assert.equal(rateAt('USD', at, [fxRow('USD', '0', '2026-02-20T00:00:00.000Z')]), null)
+  assert.equal(rateAt('USD', at, [fxRow('USD', '-1.2', '2026-02-20T00:00:00.000Z')]), null)
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z'), fxRow('USD', '1.26', '2026-02-20T00:00:00.000Z')]), null, 'two rows at the latest instant that disagree')
+  assert.equal(rateAt('USD', at, [fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z'), fxRow('USD', '1.25', '2026-02-20T00:00:00.000Z')])!.toFixed(), '1.25', 'the same rate twice is not an ambiguity')
+  assert.equal(rateAt('usd', at, rows), null, 'a currency code is exact')
+  // through the item
+  const order = [po('PO1', [line('A', '1', '0', '1')], { currency: 'USD' })]
+  const lines = [poLine('PO1', 'A', '1', '0', '1')]
+  for (const fx of [[], [fxRow('USD', '0', '2026-02-20T00:00:00.000Z')], [fxRow('USD', '1', '2026-03-02T00:00:00.000Z')], [fxRow('USD', '1', '2026-02-20T00:00:00.000Z'), fxRow('USD', '2', '2026-02-20T00:00:00.000Z')]]) {
+    const r = await run('R7', order, lines, { fixture: { fx } })
+    assert.deepEqual([r.item.outcome, r.item.reasons], ['inconclusive', ['CURRENCY_UNKNOWN']], JSON.stringify(fx))
+  }
+  const failed = await run('R7', order, lines, { fixture: { fx: [], fxSection: 'fail' } })
+  assert.deepEqual([failed.item.outcome, failed.item.reasons], ['inconclusive', ['READ_INCOMPLETE']])
+  // R8 does not need rates: the same orders compare without them
+  assert.equal((await run('R8', order, lines)).item.outcome, 'pass')
 })
 
 // [mutation: ordered quantity used instead of ordered - received]
@@ -252,7 +292,7 @@ test('R8 passes when every open line\'s outstanding quantity agrees; a part-rece
   const { item, port } = await run('R8', [po('PO1', [line('A', '10', '4', '2'), line('B', '5', '5', '1')]), po('PO2', [line('C', '3', '0', '9')])], lines)
   assert.equal(item.outcome, 'pass')
   assert.deepEqual(item.sources, [...getPackItem('R8').sources])
-  assert.deepEqual(keys(item, 'bothEqual'), ['PO1|A', 'PO2|C'])
+  assert.deepEqual(lineKeys(item, 'bothEqual'), ['PO1|A', 'PO2|C'])
   const entry = (item.entries!.bothEqual as unknown as Array<{ key: string; ims: string; vendor: string }>).find((e) => e.key === 'PO1|A')!
   assert.deepEqual([entry.ims, entry.vendor], ['6', '6'])
   assert.deepEqual([...port.calls[0]!.sections].sort(), ['boundaries', 'purchaseOrders'])
@@ -266,19 +306,19 @@ test('R8 LINE IDENTITY: the same quantities on the other SKU or the other order 
   const mine = [po('PO1', [line('A', '10', '0', '1'), line('B', '3', '0', '1')])]
   const swappedSku = await run('R8', mine, [poLine('PO1', 'A', '3', '0', '1'), poLine('PO1', 'B', '10', '0', '1')])
   assert.equal(swappedSku.item.outcome, 'fail')
-  assert.deepEqual(keys(swappedSku.item, 'bothDiffer'), ['PO1|A', 'PO1|B'])
+  assert.deepEqual(lineKeys(swappedSku.item, 'bothDiffer'), ['PO1|A', 'PO1|B'])
   const elsewhere = await run('R8', mine, [poLine('PO2', 'A', '10', '0', '1'), poLine('PO2', 'B', '3', '0', '1')])
   assert.equal(elsewhere.item.outcome, 'fail')
-  assert.deepEqual(keys(elsewhere.item, 'onlyIms'), ['PO1|A', 'PO1|B'])
-  assert.deepEqual(keys(elsewhere.item, 'onlyVendor'), ['PO2|A', 'PO2|B'])
+  assert.deepEqual(lineKeys(elsewhere.item, 'onlyIms'), ['PO1|A', 'PO1|B'])
+  assert.deepEqual(lineKeys(elsewhere.item, 'onlyVendor'), ['PO2|A', 'PO2|B'])
   const omitted = await run('R8', mine, [poLine('PO1', 'A', '10', '0', '1')])
   assert.equal(omitted.item.outcome, 'fail')
-  assert.deepEqual(keys(omitted.item, 'onlyIms'), ['PO1|B'])
+  assert.deepEqual(lineKeys(omitted.item, 'onlyIms'), ['PO1|B'])
   const extra = await run('R8', mine, [poLine('PO1', 'A', '10', '0', '1'), poLine('PO1', 'B', '3', '0', '1'), poLine('PO1', 'C', '1', '0', '1')])
-  assert.deepEqual(keys(extra.item, 'onlyVendor'), ['PO1|C'])
+  assert.deepEqual(lineKeys(extra.item, 'onlyVendor'), ['PO1|C'])
   // An IMS order the references do not explain is an IMS-only line, never dropped.
   const native = await run('R8', [po('PO1', [line('A', '10', '0', '1')]), po('N', [line('Z', '1', '0', '1')], { reference: 'PO-1' })], [poLine('PO1', 'A', '10', '0', '1')])
-  assert.deepEqual(keys(native.item, 'onlyIms'), [`${identityToken('ims-id', 'po-N')}|Z`])
+  assert.deepEqual(lineKeys(native.item, 'onlyIms'), [`${identityToken('ims-id', 'po-N')}|Z`])
 })
 
 // [mutation: the exact tolerance widened]
@@ -295,8 +335,10 @@ test('R8 EMPTY: no outstanding line on either side passes only on the named proo
   const empty = await run('R8', [], [])
   assert.equal(empty.item.outcome, 'pass')
   assert.deepEqual(empty.item.proof, { kind: 'proven-empty', source: 'qoblex-incoming-report-empty' })
+  // an IMS order in an incoming status with every line received, absent from the export, is an ORDER-level finding (it has no open line to show)
   const noLines = await run('R8', [po('PO1', [line('A', '2', '2', '1')])], [])
-  assert.deepEqual([noLines.item.outcome, noLines.item.reasons], ['inconclusive', ['EMPTY_UNPROVEN']])
+  assert.equal(noLines.item.outcome, 'fail')
+  assert.deepEqual(keys(noLines.item, 'onlyIms'), [`PO1|${ORDER_LINES_TOKEN}`])
 })
 
 // ---- the sides -----------------------------------------------------------------------------------
@@ -309,9 +351,25 @@ test('the sides: IMS orders are keyed by vendor number when the prefix explains 
   const odd = imsSide([po('A', [], { reference: PO_PREFIX }), po('B', [], { reference: `${PO_PREFIX}a/b`, id: 'b' })], PO_PREFIX)
   assert.ok(odd.ok)
   assert.deepEqual([...odd.orders.values()].map((o) => o.native), [true, true])
-  const theirs = qoblexSide([poLine('PO1', 'A', '2', '1', '3'), poLine('PO1', 'B', '1', '1', '3')])
+  const theirs = qoblexSide([poLine('PO1', 'A', '2', '1', '3'), poLine('PO1', 'B', '1', '1', '3')], { mine: new Map(), fxRates: [] })
   assert.ok(theirs.ok)
   const order = [...theirs.orders.values()][0]!
   assert.equal(order.value.toFixed(), '3')
   assert.equal(order.lines.size, 1)
+})
+
+// [mutation: R8 emits rows only for nonzero-outstanding lines]
+test('R8 ORDER PRESENCE: PO1 matching plus an IMS incoming order PO2 whose lines are all received and which the export omits cannot pass; the order-level count is judged on a matched order too', async () => {
+  const mine = [po('PO1', [line('A', '10', '4', '2')]), po('PO2', [line('B', '5', '5', '1')])]
+  const lines = [poLine('PO1', 'A', '10', '4', '2')]
+  const r = await run('R8', mine, lines)
+  assert.equal(r.item.outcome, 'fail')
+  assert.deepEqual(keys(r.item, 'onlyIms'), [`PO2|${ORDER_LINES_TOKEN}`])
+  assert.deepEqual(keys(r.item, 'bothEqual'), [`PO1|${ORDER_LINES_TOKEN}`, 'PO1|A'].sort())
+  // with the order in the export too, R8 has nothing to compare for PO2 beyond its (zero) count, and Qoblex lists none: still a finding, never a pass
+  const both = await run('R8', mine, [...lines, poLine('PO2', 'B', '5', '5', '1')])
+  assert.equal(both.item.outcome, 'fail')
+  // an order whose count of open lines differs is a difference even when the lines it shares are equal
+  const extra = await run('R8', [po('PO1', [line('A', '10', '4', '2'), line('C', '1', '0', '1')])], lines)
+  assert.equal(extra.item.outcome, 'fail')
 })

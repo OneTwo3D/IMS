@@ -47,14 +47,14 @@ import { normaliseWcOrderStatus, WC_DEFAULT_SYNC_ORDER_STATUSES } from '@/lib/co
 import { STOCK_TRACKED_PRODUCT_TYPES } from '@/lib/domain/inventory/backorder-policy'
 import { AccountingSyncStatus, AccountingSyncType, PurchaseOrderStatus, SalesOrderStatus } from '@/app/generated/prisma/enums'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
-import { TRANSIT_COVERAGE_SETTING_KEY } from '@/lib/reconciliation-pack/constants'
+import { QOBLEX_BASE_CURRENCY, TRANSIT_COVERAGE_SETTING_KEY } from '@/lib/reconciliation-pack/constants'
 
 /** The slice of a `pg` client this module needs. A test double implements it; `pg.Client` satisfies it. */
 export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -146,7 +146,13 @@ export type ImsVat = {
  * was created). `currency` is the order's own currency. Read whole (a cap is CAP_EXCEEDED), in the snapshot of the other sections.
  */
 export type PoLineRow = { id: string; sku: string; qty: string; qtyReceived: string; unitCostBase: string }
-export type PoRow = { id: string; reference: string; status: string; currency: string; lines: PoLineRow[] }
+export type PoRow = { id: string; reference: string; status: string; currency: string; createdAt: string; lines: PoLineRow[] }
+/**
+ * The central exchange-rate table (fx_rates, fed by lib/currencies/fx-refresh.ts): 1 unit of the base currency (GBP) = `rate` units of
+ * `currency`, as fetched at `fetchedAt`. Every row from the base currency is read (a cap is CAP_EXCEEDED); nothing is picked here: the item
+ * takes the latest row on or before a stated instant and refuses a tie it cannot break.
+ */
+export type FxRateRow = { currency: string; rate: string; fetchedAt: string }
 
 /**
  * R11, the IMS side: the transit sub-ledger (append-only; every posting to the Stock in Transit account records a signed base-currency row)
@@ -179,6 +185,7 @@ export type ImsSectionValues = {
   vat: ImsVat
   purchaseOrders: PoRow[]
   transitSchedule: ImsTransitSchedule
+  fxRates: FxRateRow[]
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -567,8 +574,8 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
 
   async purchaseOrders(tx) {
     const statuses = [...INCOMING_PO_STATUSES].map(String)
-    const rows = await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.currency FROM purchase_orders po WHERE po.type::text = 'GOODS' AND po.status::text = ANY($1::text[]) ORDER BY po.id`, [statuses])
-    const orders = rows.map((row): PoRow => ({ id: text(row.id), reference: text(row.reference), status: oneOf(row.status, statuses), currency: text(row.currency, 'CURRENCY_UNKNOWN'), lines: [] }))
+    const rows = await readCapped(tx, `SELECT po.id, po.reference, po.status::text AS status, po.currency, ${UTC('po."createdAt"')} AS created FROM purchase_orders po WHERE po.type::text = 'GOODS' AND po.status::text = ANY($1::text[]) ORDER BY po.id`, [statuses])
+    const orders = rows.map((row): PoRow => ({ id: text(row.id), reference: text(row.reference), status: oneOf(row.status, statuses), currency: text(row.currency, 'CURRENCY_UNKNOWN'), createdAt: text(row.created, 'SOURCE_UNREADABLE'), lines: [] }))
     unique(orders, (order) => order.id)
     unique(orders, (order) => order.reference)
     const byId = new Map(orders.map((order) => [order.id, order]))
@@ -583,6 +590,11 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       order.lines.push(line)
     }
     return orders
+  },
+
+  async fxRates(tx) {
+    const rows = await readCapped(tx, `SELECT "toCurrency" AS currency, rate::text AS rate, ${UTC('"fetchedAt"')} AS fetched FROM fx_rates WHERE "fromCurrency" = $1 ORDER BY id`, [QOBLEX_BASE_CURRENCY])
+    return rows.map((row): FxRateRow => ({ currency: text(row.currency, 'CURRENCY_UNKNOWN'), rate: decimal(row.rate), fetchedAt: text(row.fetched, 'SOURCE_UNREADABLE') }))
   },
 
   async transitSchedule(tx) {

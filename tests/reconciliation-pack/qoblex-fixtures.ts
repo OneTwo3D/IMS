@@ -109,7 +109,7 @@ export const lot = (sku: string, location: string, qty: string, unitCost: string
 /** The prefix the first load gave the IMS references of the Qoblex purchase orders in these fixtures. */
 export const PO_PREFIX = 'QBX-'
 /** One line of the Incoming report (GBP unless stated). */
-export const poLine = (orderKey: string, sku: string, ordered: string, received: string, price: string, over: Partial<QoblexPoLine> = {}): QoblexPoLine => ({ orderKey, sku, supplier: 'Supplier Beta', currency: 'GBP', fxRateToBase: '', qtyOrdered: ordered, qtyReceived: received, unitCostForeign: price, ...over })
+export const poLine = (orderKey: string, sku: string, ordered: string, received: string, price: string, over: Partial<QoblexPoLine> = {}): QoblexPoLine => ({ orderKey, sku, supplier: 'Supplier Beta', qtyOrdered: ordered, qtyReceived: received, unitCostForeign: price, ...over })
 export const poLines = (lines: QoblexPoLine[], keyPrefix = PO_PREFIX): QoblexPurchaseOrders => ({ keyPrefix, lines })
 
 export const INCOMING_HEADERS = ['Product variant', 'SKU', 'Created on', 'Received on', 'Due On', 'Purchase Order', 'Status', 'Ordered Quantity', 'Received Quantity', 'Price', 'Discount (%)', 'Supplier', 'Supplier Reference']
