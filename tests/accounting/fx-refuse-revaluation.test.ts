@@ -22,7 +22,13 @@ const state = {
   enqueued: [] as Enqueued[],
   activity: [] as Array<{ action: string; level: string; entityId?: string; metadata?: Record<string, unknown> }>,
   asOfs: [] as Date[],
+  /** `kind:side` of enqueues the queue REFUSES (e.g. an unresolved FAILED attempt for the date). */
+  refuse: new Set<string>(),
+  /** `kind:side` of enqueues that THROW. */
+  throwOn: new Set<string>(),
 }
+
+type PendingTx = { __pending: Array<Enqueued & { chartConnector: unknown }> }
 
 mock.module('@/lib/accounting', {
   namedExports: {
@@ -30,10 +36,12 @@ mock.module('@/lib/accounting', {
       syncEnabled: true, connector: 'xero',
       accountsReceivableAccount: 'AR', accountsPayableAccount: 'AP', unrealisedFxGainLossAccount: 'UFX', realisedFxGainLossAccount: 'RFX',
     }),
-    queueAccountingSync: async (params: Enqueued & { chartConnector: unknown }) => {
-      state.enqueued.push(params)
-      // a queued journal is a live work-slot row, exactly what the next run's reads see
-      state.logs.push({ id: `log-${state.logs.length + 1}`, type: 'UNREALISED_FX_JOURNAL', status: 'PENDING', connector: 'xero', payload: params.payload })
+    queueAccountingSyncTxWithOutcome: async (tx: PendingTx, params: Enqueued & { chartConnector: unknown }) => {
+      const key = `${params.payload.kind}:${params.payload.side}`
+      if (state.throwOn.has(key)) throw new Error(`boom on ${key}`)
+      if (state.refuse.has(key)) return { queued: false, reason: 'refused', connector: params.chartConnector }
+      // written inside the caller's transaction: it becomes visible only if that transaction commits
+      tx.__pending.push(params)
       return { queued: true, connector: params.chartConnector }
     },
   },
@@ -48,13 +56,23 @@ mock.module('@/lib/db', {
       accountingSyncLog: { findMany: async () => state.logs },
       salesOrder: { findMany: async () => state.receivables },
       purchaseInvoice: { findMany: async () => state.payables },
-      $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
+      $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
+        const tx = {
+        __pending: [] as Array<Enqueued & { chartConnector: unknown }>,
         fxRate: {
           groupBy: async (args: { where: { fetchedAt: { lte: Date } } }) => { state.asOfs.push(args.where.fetchedAt.lte); return fakeFxClient(state.rates).fxRate.groupBy(args as never) },
           findMany: async (args: never) => fakeFxClient(state.rates).fxRate.findMany(args),
         },
         activityLog: { create: async () => ({ id: 'a-1' }) },
-      }),
+        }
+        const result = await fn(tx)
+        // COMMIT: only now do the queued journals exist, exactly as Postgres would have it
+        for (const params of tx.__pending) {
+          state.enqueued.push(params)
+          state.logs.push({ id: `log-${state.logs.length + 1}`, type: 'UNREALISED_FX_JOURNAL', status: 'PENDING', connector: 'xero', payload: params.payload })
+        }
+        return result
+      },
     },
   },
 })
@@ -94,6 +112,8 @@ test.beforeEach(() => {
   state.enqueued = []
   state.activity = []
   state.asOfs = []
+  state.refuse = new Set()
+  state.throwOn = new Set()
 })
 
 const USD_OK = () => rate('USD', '1.60', '2026-06-29T12:00:00.000Z')
@@ -212,4 +232,60 @@ test('[q0x56.16] the valuation date is a business day: a rate fetched at 09:00 o
   assert.equal(result.skippedNoRate.length, 0)
   assert.equal(state.asOfs[0].toISOString(), '2026-06-30T23:59:59.999Z')
   assert.deepEqual(amounts(state.enqueued[0]), [17.5, 17.5], 'the 09:00 same-day rate (1.60), neither the previous day nor the next')
+})
+
+test('[R2 HIGH] the replacement is REFUSED (unresolved FAILED attempt for today): neither the reversal nor the replacement is queued for that side; the other side proceeds', async () => {
+  state.rates = [USD_OK()]
+  state.logs = [priorJournal('prior-ar', 'receivable'), priorJournal('prior-ap', 'payable')]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD')]
+  state.payables = [bill('b-usd', 'BILL-USD', 'USD')]
+  state.refuse.add('revaluation:receivable')
+  const result = await run()
+
+  assert.deepEqual(posted('reversal').map((e) => [e.payload.side, e.payload.sourceEntryId]), [['payable', 'prior-ap']], 'the AR reversal was queued then ROLLED BACK with the refused replacement')
+  assert.equal(posted('revaluation', 'receivable').length, 0)
+  assert.equal(posted('revaluation', 'payable').length, 1, 'AP is untouched by the AR refusal')
+  assert.equal(result.refused, 1)
+  assert.equal(result.reversed, 1)
+  assert.equal(result.revalued, 1)
+  assert.deepEqual(result.withheldSides.map((w) => [w.side, w.reason]), [['receivable', 'side_blocked_enqueue_refused']])
+  assert.match(String(result.withheldSides[0].detail), /NOTHING was queued for the receivables \(AR\) side/)
+  const logged = state.activity.filter((a) => a.action === 'unrealised_fx_side_blocked_enqueue_refused')
+  assert.equal(logged.length, 1)
+  assert.equal(logged[0].metadata?.side, 'receivable')
+  assert.equal(logged[0].metadata?.enqueueReason, 'refused')
+})
+
+test('[R2 HIGH] a REFUSED reversal blocks its side too: no replacement is posted beside an un-reversed prior', async () => {
+  state.rates = [USD_OK()]
+  state.logs = [priorJournal('prior-ar', 'receivable')]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD')]
+  state.refuse.add('reversal:receivable')
+  const result = await run()
+  assert.equal(state.enqueued.length, 0)
+  assert.equal(result.refused, 1)
+  assert.equal(result.withheldSides[0].reason, 'side_blocked_enqueue_refused')
+})
+
+test('[R2 HIGH] a replacement that THROWS mid-way rolls the reversal back, and the run fails loudly', async () => {
+  state.rates = [USD_OK()]
+  state.logs = [priorJournal('prior-ar', 'receivable')]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD')]
+  state.throwOn.add('revaluation:receivable')
+  await assert.rejects(run(), /boom on revaluation:receivable/)
+  assert.equal(state.enqueued.length, 0, 'the reversal that was queued first did not survive the failed unit')
+})
+
+test('[R2 HIGH] a blocked side is picked up by a rerun once the queue admits it (nothing was recorded as done)', async () => {
+  state.rates = [USD_OK()]
+  state.logs = [priorJournal('prior-ar', 'receivable')]
+  state.receivables = [order('so-usd', 'INV-USD', 'USD')]
+  state.refuse.add('revaluation:receivable')
+  await run()
+  assert.equal(state.enqueued.length, 0)
+  state.refuse.clear()
+  const rerun = await run()
+  assert.deepEqual(posted('reversal').map((e) => e.payload.sourceEntryId), ['prior-ar'])
+  assert.equal(posted('revaluation', 'receivable').length, 1)
+  assert.deepEqual(rerun.withheldSides, [])
 })

@@ -1,6 +1,6 @@
 import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
-import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
+import { getAccountingSettings, queueAccountingSyncTxWithOutcome, type AccountingSettings, type AccountingEnqueueOutcome } from '@/lib/accounting'
 import { postingIsOwed } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   LEDGER_STANDING_SELECT,
@@ -110,7 +110,20 @@ export type FxRevaluationResult = {
   withheldSides: WithheldSide[]
 }
 
-export type WithheldSide = { side: FxSettlementSide; reason: 'side_withheld_missing_rate'; skipped: SkippedRevaluation[] }
+export type WithheldSide = {
+  side: FxSettlementSide
+  /** `side_withheld_missing_rate`: a document had no rate. `side_blocked_enqueue_refused`: the queue refused a reversal or the replacement, so the unit was rolled back. */
+  reason: 'side_withheld_missing_rate' | 'side_blocked_enqueue_refused'
+  skipped: SkippedRevaluation[]
+  detail?: string
+}
+
+class SideEnqueueRefused extends Error {
+  constructor(readonly what: string, readonly outcome: AccountingEnqueueOutcome) {
+    super(`${what} was refused by the accounting queue`)
+    this.name = 'SideEnqueueRefused'
+  }
+}
 
 export type SkippedRevaluation = {
   side: FxSettlementSide
@@ -560,132 +573,134 @@ export async function runArApFxRevaluation(input?: {
   // `reversed`/`revalued`, which now count only what was actually queued.
   let refused = 0
   const priorRevaluations = await getPriorRevaluations(valuationDate)
-  for (const prior of priorRevaluations) {
-    // A withheld side keeps its prior valuation in force (see above): its journal is not reversed.
-    if (sidePlans.get(prior.side)?.withheld) continue
-    const lines = reverseJournalLines(prior.lines, `(reversal for ${prior.valuationDate})`)
-    if (lines.length === 0) continue
-    // o3d-j625 r2 (Codex MEDIUM 1) — A CONNECTOR THIS BUILD CANNOT ROUTE IS REFUSED, NOT GUESSED AT.
-    //
-    // `prior.connector` is a raw column value. Every row this build writes carries 'xero' or
-    // 'quickbooks', but a row written by another build (or a connector since removed — see the
-    // ShipHero removal in #680) can carry something else, and there is no safe substitute for it:
-    // naming this run's connector is the mis-attribution being fixed, and `null` would answer
-    // `not-configured`, which is the one no-op an obligation ledger is allowed to settle with. So the
-    // reversal is left OUTSTANDING and said to be outstanding.
-    const chartConnector = isRegisteredAccountingConnector(prior.connector) ? prior.connector : null
-    if (chartConnector === null) {
+  let revalued = 0
+  let documents = 0
+
+  // o3d-q0x56.4 (Codex R2 HIGH) - A SIDE'S REVERSALS AND ITS REPLACEMENT ARE ONE ATOMIC UNIT.
+  //
+  // They used to be queued as separate enqueues (all reversals first, then each side's replacement), each in its own
+  // transaction. If the replacement was then refused - an earlier FAILED attempt for today with an unresolved
+  // outcome, a retired chart, anything - the reversal had already committed: the ledger lost the prior valuation with
+  // no replacement, and a rerun could not take the reversal back. (That ordering, and so the defect, was already on
+  // development: the reversal loop ran before the revaluation enqueue there too.)
+  //
+  // Now each side's reversal(s) and replacement go through the TRANSACTIONAL enqueue inside one `db.$transaction`.
+  // Any enqueue that comes back refused-and-owed throws `SideEnqueueRefused`, which rolls back EVERYTHING queued for
+  // that side in this unit (the refusal is evaluated by the same enqueue that would write the row, in the same
+  // transaction, so nothing is written before the replacement is known to be admissible). The side is then reported
+  // as blocked, with the enqueue's own reason, and counted as refused; the other side is unaffected. `not-configured`
+  // (a connector that does not post FX journals, Xero by design) is not a refusal and does not block. Any other
+  // failure is a fault: it rolls the unit back and propagates, as before.
+  for (const side of ['receivable', 'payable'] as const) {
+    const plan = sidePlans.get(side)
+    if (!plan || plan.withheld) continue
+
+    const reversals: Array<{ prior: PriorRevaluation; lines: JournalLine[]; chartConnector: NonNullable<AccountingSettings['connector']> }> = []
+    for (const prior of priorRevaluations.filter((entry) => entry.side === side)) {
+      const lines = reverseJournalLines(prior.lines, `(reversal for ${prior.valuationDate})`)
+      if (lines.length === 0) continue
+      const chartConnector = isRegisteredAccountingConnector(prior.connector) ? prior.connector : null
+      if (chartConnector === null) {
+        const { logActivity } = await import('@/lib/activity-log')
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'unrealised_fx_reversal_unroutable_source_connector',
+          tag: 'accounting',
+          level: 'WARNING',
+          description:
+            `NOTHING WAS QUEUED. The unrealised FX revaluation of ${prior.valuationDate} (sync log `
+            + `${prior.id}) was posted under accounting connector '${prior.connector}', which this build `
+            + 'cannot route, so its reversal cannot be raised in the books its account codes belong to. '
+            + 'This reversal is still OUTSTANDING and the unrealised FX from that date is still carried: '
+            + 'reverse it by hand in that connector, or cancel the source row if it never posted.',
+          metadata: {
+            sourceEntryId: prior.id,
+            sourceConnector: prior.connector,
+            sourceValuationDate: prior.valuationDate,
+            valuationDate,
+          },
+        }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
+        continue
+      }
+      reversals.push({ prior, lines, chartConnector })
+    }
+    const built = plan.done ? null : plan.built
+    const replacementLines = built && built.lines.length > 0 ? built.lines : null
+    if (reversals.length === 0 && !replacementLines) {
+      if (built) documents += built.documents
+      continue
+    }
+
+    const counted = { reversed: 0, revalued: 0 }
+    try {
+      await db.$transaction(async (tx) => {
+        for (const { prior, lines, chartConnector } of reversals) {
+          const outcome = await queueAccountingSyncTxWithOutcome(tx, {
+            type: 'UNREALISED_FX_JOURNAL',
+            referenceType: 'FxRevaluation',
+            referenceId: valuationDate,
+            payload: {
+              kind: 'reversal',
+              valuationDate,
+              sourceEntryId: prior.id,
+              sourceValuationDate: prior.valuationDate,
+              side: prior.side,
+              date: valuationDate,
+              reference: `FXREV-${valuationDate}`,
+              narration: `Reverse unrealised FX revaluation from ${prior.valuationDate}`,
+              lines,
+            },
+            idempotencyKey: `unrealised-fx:reversal:${valuationDate}:${prior.id}`,
+            // The SOURCE row's connector (o3d-j625 r2): its codes are that chart's.
+            chartConnector,
+          })
+          if (outcome.queued) counted.reversed += 1
+          else if (postingIsOwed(outcome)) throw new SideEnqueueRefused(`the reversal of the ${prior.valuationDate} valuation (sync log ${prior.id})`, outcome)
+        }
+        if (replacementLines && built) {
+          const outcome = await queueAccountingSyncTxWithOutcome(tx, {
+            type: 'UNREALISED_FX_JOURNAL',
+            referenceType: 'FxRevaluation',
+            referenceId: valuationDate,
+            payload: {
+              kind: 'revaluation',
+              valuationDate,
+              side,
+              date: valuationDate,
+              reference: `FXREV-${valuationDate}`,
+              narration: `Unrealised ${side === 'receivable' ? 'AR' : 'AP'} FX revaluation at ${valuationDate}`,
+              lines: replacementLines,
+              documentCount: built.documents,
+            },
+            idempotencyKey: `unrealised-fx:revaluation:${valuationDate}:${side}`,
+            // o3d-j625: `accounts.controlAccount` / `accounts.fxGainLossAccount` are this run's chart.
+            chartConnector: settings.connector,
+          })
+          if (outcome.queued) counted.revalued += 1
+          else if (postingIsOwed(outcome)) throw new SideEnqueueRefused(`the ${side === 'receivable' ? 'AR' : 'AP'} revaluation for ${valuationDate}`, outcome)
+        }
+      })
+    } catch (error) {
+      if (!(error instanceof SideEnqueueRefused)) throw error
+      refused += 1
+      const detail = `${error.what} was refused by the accounting queue (${error.outcome.reason ?? 'refused'}), so NOTHING was queued for the ${side === 'receivable' ? 'receivables (AR)' : 'payables (AP)'} side: its reversal(s) and replacement are one unit and were rolled back together. The previous valuation stays in force. Resolve the cause shown in the accounting activity log (for example a FAILED attempt for this date), then rerun.`
+      withheldSides.push({ side, reason: 'side_blocked_enqueue_refused', skipped: [], detail })
       const { logActivity } = await import('@/lib/activity-log')
       await logActivity({
         entityType: 'SYSTEM',
-        action: 'unrealised_fx_reversal_unroutable_source_connector',
+        action: 'unrealised_fx_side_blocked_enqueue_refused',
         tag: 'accounting',
         level: 'WARNING',
-        description:
-          `NOTHING WAS QUEUED. The unrealised FX revaluation of ${prior.valuationDate} (sync log `
-          + `${prior.id}) was posted under accounting connector '${prior.connector}', which this build `
-          + 'cannot route, so its reversal cannot be raised in the books its account codes belong to. '
-          + 'This reversal is still OUTSTANDING and the unrealised FX from that date is still carried: '
-          + 'reverse it by hand in that connector, or cancel the source row if it never posted.',
-        metadata: {
-          sourceEntryId: prior.id,
-          sourceConnector: prior.connector,
-          sourceValuationDate: prior.valuationDate,
-          valuationDate,
-        },
+        description: `The unrealised FX revaluation for ${valuationDate}: ${detail}`,
+        metadata: { side, reason: 'side_blocked_enqueue_refused', valuationDate, enqueueReason: error.outcome.reason ?? null, enqueueConnector: error.outcome.connector ?? null },
       }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
       continue
     }
-    const reversalEnqueued = await queueAccountingSync({
-      type: 'UNREALISED_FX_JOURNAL',
-      referenceType: 'FxRevaluation',
-      referenceId: valuationDate,
-      payload: {
-        kind: 'reversal',
-        valuationDate,
-        sourceEntryId: prior.id,
-        sourceValuationDate: prior.valuationDate,
-        side: prior.side,
-        date: valuationDate,
-        reference: `FXREV-${valuationDate}`,
-        narration: `Reverse unrealised FX revaluation from ${prior.valuationDate}`,
-        lines,
-      },
-      idempotencyKey: `unrealised-fx:reversal:${valuationDate}:${prior.id}`,
-      // o3d-j625 r2 (Codex MEDIUM 1) — THE SOURCE ROW'S CONNECTOR, NOT THIS RUN'S SETTINGS OBJECT.
-      //
-      // `lines` is `reverseJournalLines(prior.lines, …)`: every account code on this journal was read
-      // out of a HISTORIC `AccountingSyncLog.payload`, not off the `settings` read at the top of this
-      // function. r1 wrote `settings.connector` here and argued that "every account code reachable from
-      // here came from the single getAccountingSettings()" — which is true of the REVALUATION enqueue
-      // below and false of this one. Attributing a QuickBooks-era journal's codes to a now-active Xero
-      // chart is the mis-routing of an existing cross-connector row, so it is routed by the row.
-      //
-      // A prior whose connector is no longer the active one is therefore REFUSED by the facade (and
-      // recorded as owed) instead of being reversed into the wrong books — which is the correct answer:
-      // you cannot reverse a QuickBooks journal by posting to Xero.
-      chartConnector,
-    })
-    // o3d-j625 r3 (Codex MEDIUM) — THE ANSWER IS READ, AND A REFUSAL IS NOT A REVERSAL.
-    //
-    // `reversed += 1` ran unconditionally. A prior written under a connector that is KNOWN but no
-    // longer active reaches the facade, is refused there (the chart cannot be honoured), and this loop
-    // counted it anyway — reporting a reversal with no reversal row, which makes the unrealised FX from
-    // that date look backed out when it is still carried. The facade writes its own
-    // `accounting_enqueue_refused_retired_chart` WARNING naming both connectors, so the report here is
-    // the count: what the run owes.
-    //
-    // `not-configured` is not counted as owed either way — it means this connector does not post FX
-    // journals at all (Xero, by design: see isFxGainLossJournalSuppressed), so there is no reversal
-    // outstanding to chase.
-    if (reversalEnqueued.queued) reversed += 1
-    else if (postingIsOwed(reversalEnqueued)) refused += 1
+    reversed += counted.reversed
+    revalued += counted.revalued
+    if (built) documents += built.documents
   }
 
-  let revalued = 0
-  let documents = 0
-  {
-    for (const side of ['receivable', 'payable'] as const) {
-      const plan = sidePlans.get(side)
-      // Done already today, or withheld: nothing to post for this side.
-      if (!plan || plan.done || plan.withheld || !plan.built) continue
-      const built = plan.built
-      documents += built.documents
-      if (built.lines.length === 0) continue
-
-      const revaluationEnqueued = await queueAccountingSync({
-        type: 'UNREALISED_FX_JOURNAL',
-        referenceType: 'FxRevaluation',
-        referenceId: valuationDate,
-        payload: {
-          kind: 'revaluation',
-          valuationDate,
-          side,
-          date: valuationDate,
-          reference: `FXREV-${valuationDate}`,
-          narration: `Unrealised ${side === 'receivable' ? 'AR' : 'AP'} FX revaluation at ${valuationDate}`,
-          lines: built.lines,
-          documentCount: built.documents,
-        },
-        idempotencyKey: `unrealised-fx:revaluation:${valuationDate}:${side}`,
-        // o3d-j625: `accounts.controlAccount` / `accounts.fxGainLossAccount` are this run's chart.
-        chartConnector: settings.connector,
-      })
-      // o3d-j625 r3 (Codex MEDIUM): the same defect on the same function's other enqueue. The reviewer
-      // named the reversal; this one is identical and is fixed with it — a revaluation counted as done
-      // is worse here, because `hasRevaluationForDate` would then read a row that does not exist... or,
-      // the case that actually bit, read ANOTHER connector's row (Codex HIGH 4) and skip the run.
-      if (revaluationEnqueued.queued) revalued += 1
-      else if (postingIsOwed(revaluationEnqueued)) refused += 1
-    }
-  }
-
-  // Report skipped only when nothing happened this run (revaluation already
-  // existed and no reversal needed retrying), preserving the prior signal.
-  //
-  // o3d-j625 r3 (Codex MEDIUM): AND A REFUSAL IS NOT NOTHING HAPPENING. `reversed === 0 && revalued === 0`
-  // used to be reachable with several refused enqueues behind it, and the run then announced itself as
-  // a no-op — the most reassuring message available for the state where postings are owed.
   const noop = revaluedSides.size > 0 && reversed === 0 && revalued === 0 && refused === 0 && withheldSides.length === 0
   return {
     success: true,

@@ -46,7 +46,7 @@ mock.module('@/lib/accounting', {
       unrealisedFxGainLossAccount: `${state.connector}-UFX`,
       realisedFxGainLossAccount: `${state.connector}-RFX`,
     }),
-    queueAccountingSync: async (params: { payload: Record<string, unknown>; chartConnector: unknown }) => {
+    queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: { payload: Record<string, unknown>; chartConnector: unknown }) => {
       state.asked.push(params as unknown as Record<string, unknown>)
       const kind = params.payload.kind
       if (state.refuseKinds.has(String(kind))) {

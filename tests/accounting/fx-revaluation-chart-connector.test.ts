@@ -102,7 +102,7 @@ const TODAYS_REVALUATION = {
 mock.module('@/lib/accounting', {
   namedExports: {
     getAccountingSettings: async () => settings,
-    queueAccountingSync: async (params: {
+    queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: {
       type: string
       payload: Record<string, unknown>
       chartConnector: unknown

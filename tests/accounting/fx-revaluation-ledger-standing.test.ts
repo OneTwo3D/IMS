@@ -34,7 +34,7 @@ mock.module('@/lib/accounting', {
       unrealisedFxGainLossAccount: 'xero-UFX',
       realisedFxGainLossAccount: 'xero-RFX',
     }),
-    queueAccountingSync: async (params: { payload: Record<string, unknown>; chartConnector: unknown }) => {
+    queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: { payload: Record<string, unknown>; chartConnector: unknown }) => {
       enqueued.push({ kind: params.payload.kind, chartConnector: params.chartConnector })
       return { queued: true, connector: params.chartConnector }
     },
