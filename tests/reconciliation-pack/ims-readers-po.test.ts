@@ -74,12 +74,15 @@ test('purchaseOrders: a repeated reference, a line of an order not read, a value
 
 // ---- transitSchedule ------------------------------------------------------------------------------
 
+const KINDS = ['purchase-orders', 'purchase-invoices', 'purchase-receipts', 'purchase-returns', 'supplier-credit-notes', 'landed-cost-links', 'landed-cost-revaluations', 'sales-order-refunds', 'return-expectations', 'subledger-rows', 'sync-log-reversals']
+const TABLES: Record<string, string> = { 'purchase-orders': 'purchase_orders', 'purchase-invoices': 'purchase_invoices', 'purchase-receipts': 'purchase_receipts', 'purchase-returns': 'purchase_returns', 'supplier-credit-notes': 'supplier_credit_notes', 'landed-cost-links': 'landed_cost_links', 'landed-cost-revaluations': 'landed_cost_revaluation_runs', 'sales-order-refunds': 'sales_order_refunds', 'return-expectations': 'return_expectations', 'subledger-rows': 'transit_subledger_movements', 'sync-log-reversals': 'accounting_sync_logs' }
+const ZERO_PRE = Object.fromEntries(KINDS.map((k) => [k, 0]))
 const netRow = (over: Record<string, unknown> = {}) => ({ po_id: 'po1', source_type: 'PURCHASE_BILL', net: '100.500000', ...over })
 const tOrder = (over: Record<string, unknown> = {}) => ({ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', type: 'GOODS', created: '2026-09-01T10:00:00.000Z', ...over })
-function transitAnswer(opts: { pre?: { orders?: string; rows?: string; returns?: string }; coverage?: Array<Record<string, unknown>>; net?: Array<Record<string, unknown>>; orders?: Array<Record<string, unknown>>; open?: Array<Record<string, unknown>> }) {
+function transitAnswer(opts: { pre?: Record<string, string>; coverage?: Array<Record<string, unknown>>; net?: Array<Record<string, unknown>>; orders?: Array<Record<string, unknown>>; open?: Array<Record<string, unknown>> }) {
   return (sql: string) => {
     if (/FROM settings/.test(sql)) return opts.coverage ?? [{ value: '2026-01-01' }]
-    if (/count\(\*\)::text/.test(sql)) return [{ n: opts.pre?.[/FROM purchase_orders/.test(sql) ? 'orders' : /FROM transit_subledger_movements/.test(sql) ? 'rows' : 'returns'] ?? '0' }]
+    if (/count\(\*\)::text/.test(sql)) return [{ n: opts.pre?.[KINDS.find((k) => sql.includes(`FROM ${TABLES[k]} `))!] ?? '0' }]
     if (/FROM transit_subledger_movements/.test(sql)) return opts.net ?? []
     if (/po\.id = ANY/.test(sql)) return opts.orders ?? []
     if (/po\.status::text = ANY/.test(sql)) return opts.open ?? []
@@ -94,7 +97,7 @@ test('transitSchedule: needs the cycle date; reads the sub-ledger up to and incl
   const section = await sectionOf('transitSchedule', client, '2026-10-19')
   assert.ok(section.ok)
   assert.deepEqual(section.value, {
-    asOf: '2026-10-19', coverageStart: '2026-01-01', preWatermark: { orders: 0, rows: 0, returns: 0 },
+    asOf: '2026-10-19', coverageStart: '2026-01-01', preWatermark: ZERO_PRE,
     net: [{ poId: 'po1', sourceType: 'PURCHASE_BILL', net: '100.500000' }, { poId: 'po1', sourceType: 'STOCK_RECEIPT', net: '-40' }],
     customerReturns: '7.25',
     orders: [{ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', type: 'GOODS', createdAt: '2026-09-01T10:00:00.000Z' }],
@@ -201,27 +204,27 @@ test('firstLoadProvenance: the run record (orders emitted and failed) and every 
   assert.equal(await reason([run()], [{ id: null }]), 'BAD_KEY')
 })
 
-// [mutation: a pre-watermark kind read without the watermark bound, or counted only for open orders / goods orders / non-cancelled orders]
-test('transitSchedule: counts what predates the watermark - ANY purchase order (no type or status filter), sub-ledger rows dated before it, and the refund-in-transit source documents - bound to the watermark; none are read when no watermark is recorded', async () => {
-  const client = fake(transitAnswer({ pre: { orders: '3', rows: '1', returns: '2' } }))
+// [mutation: a source kind not counted, counted without the watermark bound, or counted only for goods/open/non-cancelled rows]
+test('transitSchedule: counts, per DURABLE source document kind, what predates the watermark - one query each, bound to the watermark, with no status or type filter - plus the ledger\'s own earlier rows; none are read when no watermark is recorded', async () => {
+  const client = fake(transitAnswer({ pre: { 'purchase-orders': '3', 'purchase-returns': '1', 'sales-order-refunds': '2', 'subledger-rows': '4' } }))
   const section = await sectionOf('transitSchedule', client, '2026-10-19')
   assert.ok(section.ok)
-  assert.deepEqual(section.value.preWatermark, { orders: 3, rows: 1, returns: 2 })
+  assert.deepEqual(section.value.preWatermark, { ...ZERO_PRE, 'purchase-orders': 3, 'purchase-returns': 1, 'sales-order-refunds': 2, 'subledger-rows': 4 })
   const counts = client.sent.filter((q) => /count\(\*\)::text/.test(q.sql))
-  assert.equal(counts.length, 3)
+  assert.equal(counts.length, KINDS.length)
   for (const q of counts) assert.deepEqual(q.values, ['2026-01-01'])
-  const orders = counts.find((q) => /FROM purchase_orders/.test(q.sql))!
-  assert.match(orders.sql, /"createdAt" < \(\$1::date \+ 1\)/)
-  assert.doesNotMatch(orders.sql, /status|type/, 'any status and any type')
-  assert.match(counts.find((q) => /FROM transit_subledger_movements/.test(q.sql))!.sql, /journal_date < \$1::date/)
-  const returns = counts.find((q) => /FROM accounting_sync_logs/.test(q.sql))!
-  assert.match(returns.sql, /type::text = 'COGS_REVERSAL'/)
-  assert.match(returns.sql, /payload->>'_returnInTransit' = 'true'/)
+  for (const kind of KINDS) {
+    const q = counts.find((c) => c.sql.includes(`FROM ${TABLES[kind]} `))
+    assert.ok(q, kind)
+    if (kind !== 'subledger-rows' && kind !== 'sync-log-reversals') assert.doesNotMatch(q!.sql, /status|type/, `${kind}: any status and any type`)
+    assert.match(q!.sql, kind === 'subledger-rows' ? /journal_date < \$1::date/ : kind === 'return-expectations' ? /created_at < \(\$1::date \+ 1\)/ : /"createdAt" < \(\$1::date \+ 1\)/, kind)
+  }
+  assert.match(counts.find((q) => /accounting_sync_logs/.test(q.sql))!.sql, /payload->>'_returnInTransit' = 'true'/)
   const none = fake(transitAnswer({ coverage: [] }))
   const unrecorded = await sectionOf('transitSchedule', none, '2026-10-19')
   assert.ok(unrecorded.ok && unrecorded.value.coverageStart === null)
-  assert.deepEqual(unrecorded.value.preWatermark, { orders: 0, rows: 0, returns: 0 })
+  assert.deepEqual(unrecorded.value.preWatermark, ZERO_PRE)
   assert.equal(none.sent.filter((q) => /count\(\*\)::text/.test(q.sql)).length, 0)
-  const bad = await sectionOf('transitSchedule', fake(transitAnswer({ pre: { rows: 'x' } })), '2026-10-19')
+  const bad = await sectionOf('transitSchedule', fake(transitAnswer({ pre: { 'landed-cost-links': 'x' } })), '2026-10-19')
   assert.deepEqual(bad, { ok: false, reason: 'BAD_VALUE' })
 })

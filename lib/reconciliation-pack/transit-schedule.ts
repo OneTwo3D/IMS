@@ -17,15 +17,16 @@
  *
  * COVERAGE. The sub-ledger records postings only after its recorded coverage watermark (`transit_ledger_coverage_start_date`) and has no opening balance, so the total
  * is complete only if the watermark is recorded, a real date on or before D, EVERY purchase order in IMS (goods and freight, any status, cancelled and closed included) was created
- * after it, EVERY refund-in-transit source document (a COGS reversal marked as debiting transit) was created after it, and NO sub-ledger row is dated before it (ImsTransitSchedule.preWatermark);
- * otherwise NO_POPULATION_RECORD, never a short schedule. A source type this module does not know, or an order IMS does not hold, makes it unreadable.
+ * after it, EVERY durable source document of every transit source type (bills, receipts, supplier returns, supplier credit notes, landed-cost links and revaluations, customer refunds and
+ * return expectations: TRANSIT_SOURCE_DOCUMENTS, none of which the retention job prunes) was created after it, and NO sub-ledger row is dated before it (ImsTransitSchedule.preWatermark);
+ * otherwise NO_POPULATION_RECORD, never a short schedule. Nothing rests on a log: the sync-log signal is additional only. A source type this module does not know, or an order IMS does not hold, makes it unreadable.
  * Nothing here reads a clock or a file; the sub-ledger arrives from the one read-only IMS transaction (ims-readers.ts, `transitSchedule`).
  */
 
 import { Prisma } from '@/app/generated/prisma/client'
 import { decimalText, parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
 import type { PackReasonCode } from '@/lib/reconciliation-pack/constants'
-import type { ImsTransitSchedule } from '@/lib/reconciliation-pack/ims-readers'
+import { TRANSIT_SOURCE_DOCUMENTS, type ImsTransitSchedule } from '@/lib/reconciliation-pack/ims-readers'
 import type { KeyPart } from '@/lib/reconciliation-pack/identity'
 
 const Dec = Prisma.Decimal
@@ -53,9 +54,12 @@ export function buildTransitSchedule(section: ImsTransitSchedule, asOf: string):
     // The ledger has no opening balance: ANYTHING that can post to transit and predates the watermark can carry history the total does not hold, and offsetting amounts could then
     // make the balance equal a partial ledger. So every purchase order of any type and status, every refund-in-transit source document and every sub-ledger row must postdate it. A row
     // dated before the watermark contradicts the recorded watermark itself (the ledger claims to start there), so the recorded boundary is not trustworthy: NO_POPULATION_RECORD.
+    // One count per durable source document kind (TRANSIT_SOURCE_DOCUMENTS); the section must name EVERY kind, each a whole number, or the schedule is unreadable (a missing kind is
+    // never zero).
     const pre = section.preWatermark
-    if (typeof pre !== 'object' || pre === null || ![pre.orders, pre.rows, pre.returns].every((n) => Number.isSafeInteger(n) && n >= 0)) return { ok: false, reason: 'SOURCE_UNREADABLE' }
-    if (pre.orders > 0 || pre.rows > 0 || pre.returns > 0) return { ok: false, reason: 'NO_POPULATION_RECORD' }
+    if (typeof pre !== 'object' || pre === null) return { ok: false, reason: 'SOURCE_UNREADABLE' }
+    for (const document of TRANSIT_SOURCE_DOCUMENTS) { const n = (pre as Record<string, unknown>)[document.kind]; if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) return { ok: false, reason: 'SOURCE_UNREADABLE' } }
+    if (TRANSIT_SOURCE_DOCUMENTS.some((document) => pre[document.kind]! > 0)) return { ok: false, reason: 'NO_POPULATION_RECORD' }
     const known = new Map(section.orders.map((order) => [order.id, order] as const))
     if (known.size !== section.orders.length) return { ok: false, reason: 'DUPLICATE_KEY' }
 

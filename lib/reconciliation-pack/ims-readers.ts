@@ -179,13 +179,32 @@ export type TransitNetRow = { poId: string; sourceType: string; net: string }
 export type TransitOrderRow = { id: string; reference: string; status: string; type: string; createdAt: string }
 /**
  * What the sub-ledger CANNOT have recorded, because it predates the recorded coverage watermark W (`coverageStart`; all zero when none is recorded). The ledger has no opening
- * balance and records only postings after W, so any of these makes the whole-ledger total incomplete: `orders` is the number of purchase orders of ANY type and status
- * (cancelled and closed included) created on or before W's day, `rows` the number of sub-ledger rows dated before W, and `returns` the number of refund cost-of-sales reversals
- * marked as debiting Stock in Transit (the refund-in-transit leg's source documents: an `accounting_sync_logs` COGS_REVERSAL whose payload carries `_returnInTransit`,
- * lib/domain/sales/refund-service.ts recordRefundTransitFromSync) created on or before W's day. That leg's debit is its only sub-ledger row, recorded when the journal is
- * queued, so a reversal queued before the ledger existed has a GL debit and no row.
+ * balance and records only postings after W, so any of these makes the whole-ledger total incomplete. EVERY check rests on a DURABLE DOMAIN RECORD, never on a log: the retention
+ * job (lib/data-retention.ts purgeExpiredData) prunes only shopping_sync_logs, accounting_sync_logs, wms_sync_jobs, cogs_entries and stock_movements (the activity log has its own
+ * sweep, lib/activity-log-cleanup.ts), and none of the tables below; the only code that deletes a row of any of them is the operator's reset action (app/actions/reset.ts), which
+ * wipes the whole estate, ledger included. One count per source document kind (TRANSIT_SOURCE_DOCUMENTS, each the document behind one or more transit source types), plus the
+ * ledger's own rows dated before W. A count is of documents created on or before W's day (a ledger row: dated before W).
  */
-export type TransitPreWatermark = { orders: number; rows: number; returns: number }
+export type TransitPreWatermark = Record<string, number>
+/**
+ * The durable source documents of every source type that posts to the transit account (lib/domain/accounting/transit-subledger-movement.ts), and the SQL counting those created
+ * on or before the watermark's day ($1 = the watermark). A purchase order of ANY type and status (goods and freight, cancelled and closed included) anchors the bill, bill update,
+ * receipt, cancellation and landed-cost legs; the others are the document of their own leg. Refunds are counted whether or not they went to transit (stricter is fine: the first load
+ * runs on an empty database, so nothing legitimately predates the watermark). `sync-log-reversals` is an ADDITIONAL signal only: its table is pruned by retention, so nothing rests on it alone.
+ */
+export const TRANSIT_SOURCE_DOCUMENTS: ReadonlyArray<{ kind: string; sourceTypes: string; sql: string }> = [
+  { kind: 'purchase-orders', sourceTypes: 'PURCHASE_BILL, PURCHASE_BILL_UPDATE, STOCK_RECEIPT, PURCHASE_ORDER_CANCEL, LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM purchase_orders WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'purchase-invoices', sourceTypes: 'PURCHASE_BILL, PURCHASE_BILL_UPDATE', sql: `SELECT count(*)::text AS n FROM purchase_invoices WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'purchase-receipts', sourceTypes: 'STOCK_RECEIPT', sql: `SELECT count(*)::text AS n FROM purchase_receipts WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'purchase-returns', sourceTypes: 'SUPPLIER_RETURN', sql: `SELECT count(*)::text AS n FROM purchase_returns WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'supplier-credit-notes', sourceTypes: 'SUPPLIER_CREDIT_NOTE', sql: `SELECT count(*)::text AS n FROM supplier_credit_notes WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'landed-cost-links', sourceTypes: 'LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM landed_cost_links WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'landed-cost-revaluations', sourceTypes: 'LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM landed_cost_revaluation_runs WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'sales-order-refunds', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT', sql: `SELECT count(*)::text AS n FROM sales_order_refunds WHERE "createdAt" < ($1::date + 1)` },
+  { kind: 'return-expectations', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT', sql: `SELECT count(*)::text AS n FROM return_expectations WHERE created_at < ($1::date + 1)` },
+  { kind: 'subledger-rows', sourceTypes: 'every type (the ledger itself)', sql: `SELECT count(*)::text AS n FROM transit_subledger_movements WHERE journal_date < $1::date` },
+  { kind: 'sync-log-reversals', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT (additional signal; the table is pruned by retention)', sql: `SELECT count(*)::text AS n FROM accounting_sync_logs WHERE type::text = 'COGS_REVERSAL' AND payload->>'_returnInTransit' = 'true' AND "createdAt" < ($1::date + 1)` },
+]
 export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; preWatermark: TransitPreWatermark; net: TransitNetRow[]; customerReturns: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
 
 export type ImsSectionValues = {
@@ -676,11 +695,8 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       if (found.length !== 1) throw new Unreadable('SOURCE_UNREADABLE')
       return count(found[0]!.n)
     }
-    const preWatermark: TransitPreWatermark = {
-      orders: await pre(`SELECT count(*)::text AS n FROM purchase_orders WHERE "createdAt" < ($1::date + 1)`),
-      rows: await pre(`SELECT count(*)::text AS n FROM transit_subledger_movements WHERE journal_date < $1::date`),
-      returns: await pre(`SELECT count(*)::text AS n FROM accounting_sync_logs WHERE type::text = 'COGS_REVERSAL' AND payload->>'_returnInTransit' = 'true' AND "createdAt" < ($1::date + 1)`),
-    }
+    const preWatermark: TransitPreWatermark = {}
+    for (const document of TRANSIT_SOURCE_DOCUMENTS) preWatermark[document.kind] = await pre(document.sql)
     return { asOf, coverageStart, preWatermark, net, customerReturns, orders, openOrders }
   },
 }

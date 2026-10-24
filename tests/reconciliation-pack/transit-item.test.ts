@@ -6,6 +6,7 @@ import { getPackItem } from '../../lib/reconciliation-pack/constants.ts'
 import { identityToken } from '../../lib/reconciliation-pack/identity.ts'
 import type { ImsRead, ImsReadOptions, ImsTransitSchedule, TransitNetRow, TransitOrderRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { runLedgerItem, type LedgerItemContext } from '../../lib/reconciliation-pack/ledger-items.ts'
+import { TRANSIT_SOURCE_DOCUMENTS } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { buildTransitSchedule, TRANSIT_BALANCE_TOKEN } from '../../lib/reconciliation-pack/transit-schedule.ts'
 import { CODES, D, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
 
@@ -21,8 +22,11 @@ async function settled(state: FakeState = goodState()): Promise<AsOfBasis> {
 
 const order = (id: string, over: Partial<TransitOrderRow> = {}): TransitOrderRow => ({ id, reference: `QBX-${id}`, status: 'PO_SENT', type: 'GOODS', createdAt: '2026-09-01T10:00:00.000Z', ...over })
 const net = (poId: string, sourceType: string, amount: string): TransitNetRow => ({ poId, sourceType, net: amount })
+/** THE KINDS, written out (not read from the constant under test): the durable source document of every transit source type, the ledger's own rows, and the additional log signal. */
+const PRE_KINDS = ['purchase-orders', 'purchase-invoices', 'purchase-receipts', 'purchase-returns', 'supplier-credit-notes', 'landed-cost-links', 'landed-cost-revaluations', 'sales-order-refunds', 'return-expectations', 'subledger-rows', 'sync-log-reversals'] as const
+const pre = (over: Record<string, number> = {}): Record<string, number> => ({ ...Object.fromEntries(PRE_KINDS.map((kind) => [kind, 0])), ...over })
 function section(over: Partial<ImsTransitSchedule> = {}): ImsTransitSchedule {
-  return { asOf: D, coverageStart: '2026-01-01', preWatermark: { orders: 0, rows: 0, returns: 0 }, net: [net('po1', 'PURCHASE_BILL', '80'), net('po1', 'STOCK_RECEIPT', '-30')], customerReturns: '0', orders: [order('po1')], openOrders: [order('po1')], ...over }
+  return { asOf: D, coverageStart: '2026-01-01', preWatermark: pre(), net: [net('po1', 'PURCHASE_BILL', '80'), net('po1', 'STOCK_RECEIPT', '-30')], customerReturns: '0', orders: [order('po1')], openOrders: [order('po1')], ...over }
 }
 function rig(value: ImsTransitSchedule | 'section-error' | 'read-error' | 'throws' | 'no-section') {
   const calls: ImsReadOptions[] = []
@@ -102,30 +106,32 @@ test('R11 SCHEDULE BY ORDER: the total is every order\'s rows summed across sour
   assert.deepEqual(s.residue.map((e) => [e.key[0]!.raw, e.value]), [['po3', '1']])
 })
 
-// [mutation: the coverage check removed or weakened to open orders only / any pre-watermark kind of history ignored]
-test('R11 COVERAGE: the watermark must be recorded and on or before D, and NOTHING that can hold unrecorded transit history may predate it - any purchase order (closed, cancelled, freight, whatever its status), any refund-in-transit source document, any sub-ledger row - else NO_POPULATION_RECORD, even when offsetting amounts make the balance equal the partial ledger', async () => {
-  const arms: Array<[string, Partial<ImsTransitSchedule>]> = [
-    ['no watermark', { coverageStart: null }],
-    ['a watermark after D', { coverageStart: '2026-10-20' }],
-    ['a malformed watermark', { coverageStart: 'soon' }],
-    ['a closed or cancelled purchase order created before the watermark', { preWatermark: { orders: 1, rows: 0, returns: 0 } }],
-    ['a sub-ledger row dated before the watermark', { preWatermark: { orders: 0, rows: 1, returns: 0 } }],
-    ['a refund-in-transit source document from before the watermark', { preWatermark: { orders: 0, rows: 0, returns: 2 } }],
-  ]
-  for (const [label, over] of arms) {
+// [mutation: any one source kind left out of the check / a kind missing from the section read as zero / only open orders considered]
+test('R11 COVERAGE: the watermark must be recorded and on or before D, and NOTHING that can hold unrecorded transit history may predate it - a durable document of EACH source kind (order, bill, receipt, supplier return, credit note, landed-cost link and revaluation, customer refund, return expectation) or a ledger row - else NO_POPULATION_RECORD, even when offsetting amounts make the balance equal the partial ledger', async () => {
+  for (const [label, over] of [['no watermark', { coverageStart: null }], ['a watermark after D', { coverageStart: '2026-10-20' }], ['a malformed watermark', { coverageStart: 'soon' }]] as const) {
     const { item } = await r11(section(over))
     assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], label)
   }
+  for (const kind of PRE_KINDS) {
+    const { item } = await r11(section({ preWatermark: pre({ [kind]: 1 }) }))
+    assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']], kind)
+  }
+  assert.deepEqual(TRANSIT_SOURCE_DOCUMENTS.map((d) => d.kind), [...PRE_KINDS], 'the reader counts exactly these kinds')
   // OFFSETTING HISTORY: a closed pre-watermark order whose bill (before the watermark, unrecorded) was received after it leaves a lone receipt of -30 in the ledger, and an open order
   // holds 80: the ledger sums to 50 and the stored balance is 50, so the comparison would pass on a partial ledger without the guard.
-  const offsetting = section({ net: [net('po1', 'PURCHASE_BILL', '80'), net('po9', 'STOCK_RECEIPT', '-30')], orders: [order('po1'), order('po9', { status: 'RECEIVED' })], preWatermark: { orders: 1, rows: 0, returns: 0 } })
-  assert.equal(buildTransitSchedule({ ...offsetting, preWatermark: { orders: 0, rows: 0, returns: 0 } }, D).ok, true, 'precondition: without the guard the partial ledger is a clean total of 50')
+  const offsetting = section({ net: [net('po1', 'PURCHASE_BILL', '80'), net('po9', 'STOCK_RECEIPT', '-30')], orders: [order('po1'), order('po9', { status: 'RECEIVED' })], preWatermark: pre({ 'purchase-orders': 1 }) })
+  assert.equal(buildTransitSchedule({ ...offsetting, preWatermark: pre() }, D).ok, true, 'precondition: without the guard the partial ledger is a clean total of 50')
   const guarded = await r11(offsetting)
   assert.deepEqual([guarded.item.outcome, guarded.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']])
-  // a malformed count is unreadable, never zero
-  for (const bad of [{ orders: -1, rows: 0, returns: 0 }, { orders: 0, rows: 1.5, returns: 0 }, { orders: 0, rows: 0, returns: Number.NaN }]) {
+  // A purged log is not evidence of absence: the refund's durable record remains while the sync-log signal reads zero
+  const purged = await r11(section({ preWatermark: pre({ 'sales-order-refunds': 1, 'sync-log-reversals': 0 }) }))
+  assert.deepEqual([purged.item.outcome, purged.item.reasons], ['inconclusive', ['NO_POPULATION_RECORD']])
+  // a malformed or missing count is unreadable, never zero
+  for (const bad of [pre({ 'purchase-orders': -1 }), pre({ 'subledger-rows': 1.5 }), pre({ 'sales-order-refunds': Number.NaN })]) {
     assert.deepEqual((await r11(section({ preWatermark: bad }))).item.reasons, ['SOURCE_UNREADABLE'])
   }
+  const missing = pre(); delete missing['return-expectations']
+  assert.deepEqual((await r11(section({ preWatermark: missing }))).item.reasons, ['SOURCE_UNREADABLE'])
   assert.deepEqual((await r11(section({ preWatermark: undefined as never }))).item.reasons, ['SOURCE_UNREADABLE'])
   // everything after the watermark passes (the watermark may be the cycle date itself)
   assert.equal((await r11(section({ coverageStart: '2026-08-31' }))).item.outcome, 'pass')
