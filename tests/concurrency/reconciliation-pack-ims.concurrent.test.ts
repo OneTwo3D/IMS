@@ -218,6 +218,7 @@ test('[reconciliation pack] the vat section reads the sales tax per month and ra
     await order('8', 'PROCESSING', '2026-09-15 10:00:00', '1.00', { currency: 'EUR', fx: '1.2500' })
     await sql(`INSERT INTO shopping_order_links (id, "orderId", connector, "externalOrderId", "updatedAt") VALUES ($1, $2, 'woocommerce', $3, now())`, `${VP}-k8`, `${VP}-o8`, `${VP}-ext8`)
     await sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ('xero_shipping_account', ' 260 ', now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`)
+    await sql(`INSERT INTO accounting_accounts (id, connector, "externalAccountId", code, name, type, active) VALUES ($1, 'xero', $2, '260', 'Shipping', 'REVENUE', true)`, `${VP}-acc`, `${VP}-acc-ext`)
     const read = await withClient((client) => readers.readImsSnapshot(client, { sections: ['vat'], vatWindow: { from: '2026-09-01', toExclusive: '2026-10-01' } }))
     assert.ok(read.ok, JSON.stringify(read))
     const section = read.sections.vat
@@ -226,10 +227,12 @@ test('[reconciliation pack] the vat section reads the sales tax per month and ra
     // September, this rate: orders 1, 2, 8, 9 and 10 (10.50 + 4.25 + 1.00 - 2.00 + 0; the negative line is one of 4 non-zero lines, the zero line is not counted as one); the instant bounds are inclusive below and exclusive above, a cancelled, an archived and an un-invoiced order are not in it.
     assert.deepEqual(mine, [{ period: '2026-09', taxRateId: `${VP}-t`, taxBase: '13.7500', lines: 5, nonZeroLines: 4 }])
     assert.equal(section.value.shippingAccount, '260')
+    assert.equal(section.value.shippingAccountInChart, true)
     assert.equal(section.value.baseCurrency, 'GBP')
     assert.deepEqual(section.value.wooFx.filter((row) => row.externalOrderId === `${VP}-ext8`), [{ externalOrderId: `${VP}-ext8`, currency: 'EUR', fxRateToBase: '1.25000000' }])
     assert.ok(section.value.xeroReportTypes.every((row) => typeof row.taxType === 'string'))
   } finally {
+    await sql(`DELETE FROM accounting_accounts WHERE id LIKE '${VP}%'`)
     await sql(`DELETE FROM shopping_order_links WHERE id LIKE '${VP}%'`)
     await sql(`DELETE FROM sales_order_lines WHERE id LIKE '${VP}%'`)
     await sql(`DELETE FROM sales_orders WHERE id LIKE '${VP}%'`)

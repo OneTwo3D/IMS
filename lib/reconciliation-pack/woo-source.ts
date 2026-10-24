@@ -279,7 +279,8 @@ export async function readWooOrders(port: WooGetPort, statuses: readonly string[
  * status, currency, GMT creation date and tax lines only; the caller widens the window and cuts by the GMT date, because the zone the
  * store's date filter uses is unverified. Each tax line is the rate id and the LINE tax total (shipping tax is not read).
  */
-export type WooOrderTaxRow = { id: string; status: string; currency: string; createdAt: string; taxes: Array<{ rateId: string; tax: string }> }
+/** `feeTaxLines` counts the order's fee lines whose own tax is not zero (R12 cannot prove fee tax is counted alike in the three systems, so one makes it inconclusive). */
+export type WooOrderTaxRow = { id: string; status: string; currency: string; createdAt: string; taxes: Array<{ rateId: string; tax: string }>; feeTaxLines: number }
 
 function parseOrderTax(raw: unknown): WooOrderTaxRow {
   const r = record(raw)
@@ -302,7 +303,14 @@ function parseOrderTax(raw: unknown): WooOrderTaxRow {
     if (typeof tax !== 'string' || parseDecimalStrict(tax) === null) throw new Stop('BAD_VALUE')
     taxes.push({ rateId, tax: new Prisma.Decimal(tax).isZero() ? '0' : new Prisma.Decimal(tax).toFixed() })
   }
-  return { id: rowId(r.id), status, currency: r.currency as string, createdAt: iso, taxes }
+  if (!Array.isArray(r.fee_lines) || r.fee_lines.length > 200) throw new Stop('SOURCE_UNREADABLE')
+  let feeTaxLines = 0
+  for (const entry of r.fee_lines) {
+    const fee = record(entry).total_tax
+    if (typeof fee !== 'string' || parseDecimalStrict(fee) === null) throw new Stop('BAD_VALUE')
+    if (!new Prisma.Decimal(fee).isZero()) feeTaxLines += 1
+  }
+  return { id: rowId(r.id), status, currency: r.currency as string, createdAt: iso, taxes, feeTaxLines }
 }
 
 const PLAIN_DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
@@ -316,7 +324,7 @@ export async function readWooOrderTaxes(
   try {
     if (!Array.isArray(statuses) || statuses.length === 0 || new Set(statuses).size !== statuses.length || !statuses.every((s) => typeof s === 'string' && STATUS_RE.test(s))) return { ok: false, reason: 'UNKNOWN_STATUS' }
     if (!PLAIN_DATE_RE.test(window.after) || !PLAIN_DATE_RE.test(window.before) || window.after >= window.before) return { ok: false, reason: 'BAD_MODE' }
-    const swept = await doubleSweep(makeWalker(port, options), statuses, { after: window.after, before: window.before, _fields: 'id,status,currency,date_created_gmt,tax_lines' }, parseOrderTax)
+    const swept = await doubleSweep(makeWalker(port, options), statuses, { after: window.after, before: window.before, _fields: 'id,status,currency,date_created_gmt,tax_lines,fee_lines' }, parseOrderTax)
     return { ok: true, value: { orders: swept.orders, totals: swept.totals } }
   } catch (error) {
     return { ok: false, reason: reasonOf(error) }

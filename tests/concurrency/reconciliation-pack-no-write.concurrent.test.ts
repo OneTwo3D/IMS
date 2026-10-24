@@ -366,7 +366,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
 
 const XTAG = `RCVT${process.pid}`
 const XTENANT = 'b2c3d4e5-0000-4000-8000-000000000012'
-const X_SETTINGS = ['wc_url', 'wc_consumer_key', 'wc_consumer_secret', 'wc_initial_import_completed', 'wc_sync_order_statuses', 'xero_expected_tenant_id', 'xero_shipping_account']
+const X_SETTINGS = ['wc_url', 'wc_consumer_key', 'wc_consumer_secret', 'wc_initial_import_completed', 'wc_sync_order_statuses', 'xero_expected_tenant_id', 'xero_shipping_account', 'xero_sales_account', 'xero_discount_account']
 
 test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refreshed) Xero token, GET requests to loopback Xero and store only, three systems compared, and not one row written', { skip: !RUN }, async () => {
   const http = await import('node:http')
@@ -393,7 +393,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     }
     res.writeHead(404); res.end('{}')
   })
-  const order = (id: number, created: string, tax: string) => ({ id, status: 'processing', currency: 'GBP', date_created_gmt: created, tax_lines: [{ id: 1, rate_id: 7001, tax_total: tax, shipping_tax_total: '1.00' }] })
+  const order = (id: number, created: string, tax: string) => ({ id, status: 'processing', currency: 'GBP', date_created_gmt: created, fee_lines: [], tax_lines: [{ id: 1, rate_id: 7001, tax_total: tax, shipping_tax_total: '1.00' }] })
   const wooServer = http.createServer((req, res) => {
     wooSeen.push({ method: req.method ?? '', url: req.url ?? '' })
     const url = new URL(req.url ?? '/', 'http://x')
@@ -426,6 +426,9 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     await setting('wc_consumer_secret', encryptSettingValue('wc_consumer_secret', `cs_${XTAG}`))
     await setting('wc_initial_import_completed', 'true')
     await setting('xero_expected_tenant_id', XTENANT)
+    await setting('xero_shipping_account', '260')
+    await setting('xero_sales_account', '200')
+    await sql(`INSERT INTO accounting_accounts (id, connector, "externalAccountId", code, name, type, active) VALUES ($1, 'xero', $2, '260', 'Shipping', 'REVENUE', true)`, [`${XTAG}-acc`, `${XTAG}-acc-ext`])
     await sql(`DELETE FROM accounting_tokens WHERE connector = 'xero'`)
     await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "connectionGeneration", "updatedAt") VALUES ($1, 'xero', $2, '2031-01-01', $3, 'gen-e2e', now())`, [`${XTAG}-tok`, TOKEN, XTENANT])
     await sql(`INSERT INTO first_load_apply_runs (id, singleton, version, manifest_digest, run_id, status, steps, facts, created_at, updated_at) VALUES ($1, true, 1, 'd', 'r', 'VERIFIED', '{}', '{}', '2026-01-01 00:00:00', '2026-01-01 00:00:00')`, [`${XTAG}-fl`])
@@ -501,6 +504,13 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     assert.deepEqual([xeroSeen.length, wooSeen.length], [0, 0])
     await sql(`UPDATE tax_rates SET reporting_category = 'DOMESTIC' WHERE id = $1`, [`${XTAG}-t`])
 
+    // Shipping must be separable: with the shipping account gone from the chart, nothing is requested and the item is unverified.
+    await sql(`UPDATE accounting_accounts SET active = false WHERE id = $1`, [`${XTAG}-acc`])
+    const noChart = await run(['--vendor-reads-only'])
+    assert.ok(noChart.out.includes('R12 inconclusive VAT_MAPPING_UNVERIFIED'), noChart.out.join('\n'))
+    assert.deepEqual([xeroSeen.length, wooSeen.length], [0, 0])
+    await sql(`UPDATE accounting_accounts SET active = true WHERE id = $1`, [`${XTAG}-acc`])
+
     // A token the read-sync has not renewed is never refreshed by the pack: no request to Xero, the token row untouched.
     await sql(`UPDATE accounting_tokens SET "expiresAt" = now() + interval '1 minute' WHERE id = $1`, [`${XTAG}-tok`])
     const before = (await sql(`SELECT "accessToken", "refreshToken", "expiresAt", "updatedAt" FROM accounting_tokens WHERE id = $1`, [`${XTAG}-tok`])).rows[0]
@@ -514,6 +524,7 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     net.Socket.prototype.connect = original
     for (const [name, value] of Object.entries(previous)) { if (value === undefined) delete process.env[name]; else process.env[name] = value }
     await Promise.all([xeroServer, wooServer].map((server) => new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections() })))
+    await sql(`DELETE FROM accounting_accounts WHERE id LIKE '${XTAG}%'`)
     await sql(`DELETE FROM xero_tax_rate_lists WHERE id LIKE '${XTAG}%'`)
     await sql(`DELETE FROM xero_tax_rates WHERE id LIKE '${XTAG}%'`)
     await sql(`DELETE FROM sales_order_lines WHERE id LIKE '${XTAG}%'`)

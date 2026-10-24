@@ -123,7 +123,11 @@ export type ImsVat = {
   sales: VatSalesRow[]
   xeroTenantId: string | null
   xeroReportTypes: VatXeroReportTypeRow[]
+  /** The configured Xero shipping, sales and discount account codes ('' = not configured) and whether the shipping code is exactly ONE active account of the stored chart. */
   shippingAccount: string
+  shippingAccountInChart: boolean
+  salesAccount: string
+  discountAccount: string
   wooFx: VatOrderFxRow[]
 }
 
@@ -483,17 +487,25 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       })
       unique(xeroReportTypes, (row) => row.taxType)
     }
-    const settings = await tx.query(`SELECT key, value FROM settings WHERE key = 'xero_shipping_account'`)
-    if (settings.length > 1) throw new Unreadable('DUPLICATE_KEY')
-    let shippingAccount = ''
-    if (settings.length === 1) {
-      const value = settings[0]!.value
-      if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) throw new Unreadable('SOURCE_UNREADABLE')
-      shippingAccount = value.trim()
+    const settings = await tx.query(`SELECT key, value FROM settings WHERE key IN ('xero_shipping_account', 'xero_sales_account', 'xero_discount_account')`)
+    unique(settings, (row) => text(row.key))
+    const account = (key: string): string => {
+      const row = settings.find((candidate) => candidate.key === key)
+      if (row === undefined) return ''
+      if (typeof row.value !== 'string' || /[\u0000-\u001f\u007f]/.test(row.value)) throw new Unreadable('SOURCE_UNREADABLE')
+      return row.value.trim()
+    }
+    const shippingAccount = account('xero_shipping_account')
+    const salesAccount = account('xero_sales_account')
+    const discountAccount = account('xero_discount_account')
+    let shippingAccountInChart = false
+    if (shippingAccount !== '') {
+      const chart = await tx.query(`SELECT count(*)::text AS n FROM accounting_accounts WHERE connector = 'xero' AND active = true AND code = $1`, [shippingAccount])
+      shippingAccountInChart = chart.length === 1 && count(chart[0]!.n) === 1
     }
     const fx = (await readCapped(tx, `SELECT l."externalOrderId" AS external_id, so.currency, so."fxRateToBase"::text AS fx FROM shopping_order_links l JOIN sales_orders so ON so.id = l."orderId" WHERE l.connector = 'woocommerce' AND so.currency <> 'GBP' ORDER BY l.id`)).map((row): VatOrderFxRow => ({ externalOrderId: text(row.external_id), currency: text(row.currency, 'CURRENCY_UNKNOWN'), fxRateToBase: decimal(row.fx) }))
     unique(fx, (row) => row.externalOrderId)
-    return { baseCurrency, window, sales, xeroTenantId, xeroReportTypes, shippingAccount, wooFx: fx }
+    return { baseCurrency, window, sales, xeroTenantId, xeroReportTypes, shippingAccount, shippingAccountInChart, salesAccount, discountAccount, wooFx: fx }
   },
 
   async wmsBindings(tx) {

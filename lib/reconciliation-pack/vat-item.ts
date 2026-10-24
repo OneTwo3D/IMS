@@ -25,6 +25,13 @@
  *   system and has a non-zero value in another is a finding of the leg that sees the difference. Lines on the shipping account are cut
  *   from Xero before the check on purpose: shipping VAT is out of scope in every system.
  *
+ *   SHIPPING AND FEES. Shipping VAT is cut from every side and the cut must be provable: the Xero shipping account must be configured, one
+ *   active account of the stored chart, and neither the sales nor the discount account (else VAT_MAPPING_UNVERIFIED before any request).
+ *   IMS never makes shipping a sales line (it is order level: shippingForeign, and the order's taxForeign adds shipping tax to the line tax,
+ *   order-import.ts:178-195), and WooCommerce's shipping_tax_total is never read. FEE lines are different: IMS turns them into sales lines
+ *   (field-mapping.ts mapWcFeeLines, order-import.ts:1926) and the storefront's tax_total is understood to count them, but that is not
+ *   proven on the live store, so a WooCommerce order with a non-zero fee-line tax in the window makes the item VAT_MAPPING_UNVERIFIED.
+ *
  *   FIGURES. Sales VAT in GBP, SHIPPING VAT EXCLUDED (IMS holds it at order level with no rate; the other two are cut to match): IMS =
  *   the sum of line taxBase (its recorded base amount) of orders by invoice instant, not CANCELLED, not archived (the IMS VAT report's
  *   own population); Xero = the sum of line TaxAmount of AUTHORISED and PAID sales invoices by invoice date, lines on the configured
@@ -263,6 +270,12 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
   if (vat.xeroTenantId !== storedList.tenantId || vat.xeroReportTypes.length !== proven.size || !vat.xeroReportTypes.every((entry) => proven.has(entry.taxType))) return inconclusive([LEDGER], 'VENDOR_LIST_UNPROVEN')
   const catalogue = buildCatalogue(taxes.rates, new Map(vat.xeroReportTypes.map((entry) => [entry.taxType, entry.reportTaxType] as const)))
 
+  // SHIPPING VAT MUST BE RELIABLY SEPARATED before anything is requested: the Xero lines on the shipping account are what is cut out, so
+  // the account must be configured, be exactly one active account of the stored chart, and not be the sales or the discount account (a
+  // shared account cannot tell shipping from goods).
+  const shared = (account: string) => account !== '' && account === vat.shippingAccount
+  if (vat.shippingAccount === '' || !vat.shippingAccountInChart || shared(vat.salesAccount) || shared(vat.discountAccount)) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
+
   // THE IMS SIDE, before any vendor request: every non-zero figure must have a verified place.
   const imsSums: Sums = new Map()
   let imsRows = 0
@@ -301,7 +314,7 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
     if (!periodSet.has(period)) continue
     for (const line of invoice.lines) {
       // The shipping line is cut out: the figures compared exclude shipping VAT in every system.
-      if (vat.shippingAccount !== '' && line.accountCode === vat.shippingAccount) continue
+      if (line.accountCode === vat.shippingAccount) continue
       const amount = D(line.taxAmount)
       if (amount.isZero()) continue
       const owner = catalogue.ownerOf(line.taxType)
@@ -318,6 +331,9 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
   for (const order of walked.value.orders) {
     const period = order.createdAt.slice(0, 7)
     if (!periodSet.has(period)) continue
+    // Fee-line tax: IMS turns a fee line into a sales line (field-mapping.ts mapWcFeeLines) and WooCommerce's tax_total is understood to
+    // include it, but that is not proven on the live store, so any fee tax in the window makes the item unverified.
+    if (order.feeTaxLines > 0) return inconclusive([LEDGER, XERO, WOO], 'VAT_MAPPING_UNVERIFIED')
     for (const tax of order.taxes) {
       let amount = D(tax.tax)
       if (amount.isZero()) continue

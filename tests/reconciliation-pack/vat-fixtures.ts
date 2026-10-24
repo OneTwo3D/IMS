@@ -32,6 +32,9 @@ export type ImsFixture = {
   reportTypes?: Array<{ taxType: string; reportTaxType: string | null }>
   xeroTenantId?: string | null
   shippingAccount?: string
+  shippingAccountInChart?: boolean
+  salesAccount?: string
+  discountAccount?: string
   wooFx?: ImsVat['wooFx']
   fail?: 'read' | 'throws' | { section: 'boundaries' | 'taxes' | 'xeroTaxRates' | 'vat'; reason: 'CAP_EXCEEDED' | 'READ_INCOMPLETE' }
 }
@@ -52,7 +55,10 @@ export function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; im
         sales: fixture.sales ?? [],
         xeroTenantId: fixture.xeroTenantId === undefined ? TENANT : fixture.xeroTenantId,
         xeroReportTypes: fixture.reportTypes ?? REPORT_TYPES,
-        shippingAccount: fixture.shippingAccount ?? '',
+        shippingAccount: fixture.shippingAccount ?? '260',
+        shippingAccountInChart: fixture.shippingAccountInChart ?? true,
+        salesAccount: fixture.salesAccount ?? '200',
+        discountAccount: fixture.discountAccount ?? '',
         wooFx: fixture.wooFx ?? [],
       }
       const values: Record<string, unknown> = {
@@ -110,7 +116,7 @@ export function xeroDouble(invoices: Json[], options: { pageSize?: number; baseC
 export type WooCall = { collection: string; params: Record<string, string> }
 export type WooTweak = (call: WooCall, n: number, page: Extract<WooPage, { ok: true }>) => WooPage | undefined
 export const wooOrder = (id: number, created: string, taxes: Array<[number, string]>, over: Json = {}): Json => ({
-  id, status: 'processing', currency: 'GBP', date_created_gmt: created, tax_lines: taxes.map(([rateId, total]) => ({ id: rateId * 10, rate_id: rateId, tax_total: total, shipping_tax_total: '99.00' })), ...over,
+  id, status: 'processing', currency: 'GBP', date_created_gmt: created, fee_lines: [], tax_lines: taxes.map(([rateId, total]) => ({ id: rateId * 10, rate_id: rateId, tax_total: total, shipping_tax_total: '99.00' })), ...over,
 })
 export function wooDouble(orders: Record<string, Json[]>, tweak?: WooTweak): WooGetPort & { calls: WooCall[] } {
   const calls: WooCall[] = []

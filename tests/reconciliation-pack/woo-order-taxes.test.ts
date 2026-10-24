@@ -17,15 +17,15 @@ test('the tax lines of every order of every status, each status walked twice; on
   const double = wooDouble(orders)
   const result = await read(double)
   assert.ok(result.ok)
-  assert.deepEqual(result.value.orders.map((o) => [o.id, o.createdAt, o.taxes]), [
-    ['101', '2026-09-10T09:30:00.000Z', [{ rateId: '11', tax: '60' }, { rateId: '12', tax: '5' }]],
-    ['102', '2026-09-21T10:00:00.000Z', [{ rateId: '11', tax: '40' }]],
-    ['103', '2026-08-12T10:00:00.000Z', [{ rateId: '11', tax: '50' }]],
+  assert.deepEqual(result.value.orders.map((o) => [o.id, o.createdAt, o.taxes, o.feeTaxLines]), [
+    ['101', '2026-09-10T09:30:00.000Z', [{ rateId: '11', tax: '60' }, { rateId: '12', tax: '5' }], 0],
+    ['102', '2026-09-21T10:00:00.000Z', [{ rateId: '11', tax: '40' }], 0],
+    ['103', '2026-08-12T10:00:00.000Z', [{ rateId: '11', tax: '50' }], 0],
   ])
   assert.deepEqual(result.value.totals, [{ status: 'processing', total: 2 }, { status: 'completed', total: 1 }])
   assert.equal(double.calls.length, 4)
   for (const call of double.calls) {
-    assert.equal(call.params._fields, 'id,status,currency,date_created_gmt,tax_lines')
+    assert.equal(call.params._fields, 'id,status,currency,date_created_gmt,tax_lines,fee_lines')
     assert.deepEqual([call.params.after, call.params.before], [WINDOW.after, WINDOW.before])
     assert.ok(!JSON.stringify(call.params).includes('shipping'))
   }
@@ -73,6 +73,12 @@ test('EVERY ORDER IS VALIDATED: no date, a bad date, an unknown currency, a tax 
   assert.deepEqual(await bad({ tax_lines: [{ rate_id: 11, tax_total: 1 }] }), { ok: false, reason: 'BAD_VALUE' })
   assert.deepEqual(await bad({ tax_lines: [{ rate_id: 11, tax_total: '1,00' }] }), { ok: false, reason: 'BAD_VALUE' })
   assert.deepEqual(await bad({ tax_lines: [{ rate_id: 11, tax_total: '' }] }), { ok: false, reason: 'BAD_VALUE' })
+  assert.deepEqual(await bad({ fee_lines: undefined }), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await bad({ fee_lines: {} }), { ok: false, reason: 'SOURCE_UNREADABLE' })
+  assert.deepEqual(await bad({ fee_lines: [{ total_tax: 1 }] }), { ok: false, reason: 'BAD_VALUE' })
+  assert.deepEqual(await bad({ fee_lines: [{}] }), { ok: false, reason: 'BAD_VALUE' })
+  const fees = await bad({ fee_lines: [{ total_tax: '0.00' }, { total_tax: '1.20' }, { total_tax: '-1.20' }] })
+  assert.ok(fees.ok && fees.value.orders[0]!.feeTaxLines === 2, 'fee lines with a non-zero tax are counted one by one, never netted')
   assert.deepEqual(await bad({ status: 'completed' }), { ok: false, reason: 'SOURCE_UNREADABLE' }, 'asked for processing, got completed')
   const ok = await bad({})
   assert.ok(ok.ok)

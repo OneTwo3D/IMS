@@ -5,7 +5,7 @@ import { readImsSnapshot, statementAllowed, type ImsQueryClient } from '../../li
 
 /** The `vat` section of the IMS read (R12's IMS side) over a scripted connection. The SQL itself runs against a real database in the concurrency test. */
 
-type Answers = { orgs?: Array<Record<string, unknown>>; sales?: Array<Record<string, unknown>>; tokens?: Array<Record<string, unknown>>; types?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>>; fx?: Array<Record<string, unknown>> }
+type Answers = { orgs?: Array<Record<string, unknown>>; sales?: Array<Record<string, unknown>>; tokens?: Array<Record<string, unknown>>; types?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>>; chart?: Array<Record<string, unknown>>; fx?: Array<Record<string, unknown>> }
 function fake(answers: Answers): ImsQueryClient & { sent: Array<{ sql: string; values?: unknown[] }> } {
   const sent: Array<{ sql: string; values?: unknown[] }> = []
   return {
@@ -19,6 +19,7 @@ function fake(answers: Answers): ImsQueryClient & { sent: Array<{ sql: string; v
       if (/FROM accounting_tokens/.test(sql)) return { rows: answers.tokens ?? [{ tenant: 'tenant-1' }] }
       if (/FROM xero_tax_rates/.test(sql)) return { rows: answers.types ?? [] }
       if (/FROM settings/.test(sql)) return { rows: answers.settings ?? [] }
+      if (/FROM accounting_accounts/.test(sql)) return { rows: answers.chart ?? [{ n: '0' }] }
       if (/FROM shopping_order_links/.test(sql)) return { rows: answers.fx ?? [] }
       throw new Error(`unexpected statement ${sql}`)
     },
@@ -37,13 +38,14 @@ test('the section carries the base currency, the monthly sales tax per rate, the
     orgs: [{ base: 'GBP' }],
     sales: [{ period: '2026-08', rate_id: 'rGB', tax: '50.0000', n: '2', nz: '2' }, { period: '2026-09', rate_id: 'rGB', tax: '100.0000', n: '3', nz: '3' }, { period: '2026-09', rate_id: null, tax: '0.0000', n: '1', nz: '0' }],
     types: [{ tax_type: 'OUTPUT2', report: 'OUTPUT' }, { tax_type: 'NONE', report: null }],
-    settings: [{ key: 'xero_shipping_account', value: ' 260 ' }],
+    settings: [{ key: 'xero_shipping_account', value: ' 260 ' }, { key: 'xero_sales_account', value: '200' }, { key: 'xero_discount_account', value: '' }],
+    chart: [{ n: '1' }],
     fx: [{ external_id: '9001', currency: 'EUR', fx: '1.15000000' }],
   })
   assert.deepEqual(section, { ok: true, value: {
     baseCurrency: 'GBP', window: WINDOW,
     sales: [{ period: '2026-08', taxRateId: 'rGB', taxBase: '50.0000', lines: 2, nonZeroLines: 2 }, { period: '2026-09', taxRateId: 'rGB', taxBase: '100.0000', lines: 3, nonZeroLines: 3 }, { period: '2026-09', taxRateId: null, taxBase: '0.0000', lines: 1, nonZeroLines: 0 }],
-    xeroTenantId: 'tenant-1', xeroReportTypes: [{ taxType: 'OUTPUT2', reportTaxType: 'OUTPUT' }, { taxType: 'NONE', reportTaxType: null }], shippingAccount: '260', wooFx: [{ externalOrderId: '9001', currency: 'EUR', fxRateToBase: '1.15000000' }],
+    xeroTenantId: 'tenant-1', xeroReportTypes: [{ taxType: 'OUTPUT2', reportTaxType: 'OUTPUT' }, { taxType: 'NONE', reportTaxType: null }], shippingAccount: '260', shippingAccountInChart: true, salesAccount: '200', discountAccount: '', wooFx: [{ externalOrderId: '9001', currency: 'EUR', fxRateToBase: '1.15000000' }],
   } })
   // The window is a parameter of the sales statement, and the statement leaves out cancelled and archived orders (the IMS VAT report's own population).
   const sales = client.sent.find((s) => /FROM sales_order_lines/.test(s.sql))!
@@ -89,6 +91,7 @@ test('a row that cannot be read exactly makes the whole section unreadable: a ba
     ['two tokens', { tokens: [{ tenant: 'a' }, { tenant: 'b' }] }, 'DUPLICATE_KEY'],
     ['setting control char', { settings: [{ key: 'xero_shipping_account', value: '2\u000060' }] }, 'SOURCE_UNREADABLE'],
     ['setting not text', { settings: [{ key: 'xero_shipping_account', value: null }] }, 'SOURCE_UNREADABLE'],
+    ['chart count text', { settings: [{ key: 'xero_shipping_account', value: '260' }], chart: [{ n: 'x' }] }, 'BAD_VALUE'],
     ['two settings', { settings: [{ key: 'xero_shipping_account', value: '1' }, { key: 'xero_shipping_account', value: '2' }] }, 'DUPLICATE_KEY'],
     ['fx rate', { fx: [{ external_id: '9', currency: 'EUR', fx: 'x' }] }, 'BAD_VALUE'],
     ['fx duplicate', { fx: [{ external_id: '9', currency: 'EUR', fx: '1.1' }, { external_id: '9', currency: 'EUR', fx: '1.1' }] }, 'DUPLICATE_KEY'],
@@ -99,7 +102,7 @@ test('a row that cannot be read exactly makes the whole section unreadable: a ba
 test('no connected organisation: no Xero report types are read at all and the tenant is null; an absent shipping account is the empty string', async () => {
   const { section, client } = await read({ tokens: [] })
   assert.ok(section.ok)
-  assert.deepEqual([section.value.xeroTenantId, section.value.xeroReportTypes, section.value.shippingAccount], [null, [], ''])
+  assert.deepEqual([section.value.xeroTenantId, section.value.xeroReportTypes, section.value.shippingAccount, section.value.shippingAccountInChart], [null, [], '', false])
   assert.ok(!client.sent.some((s) => /FROM xero_tax_rates/.test(s.sql)))
 })
 

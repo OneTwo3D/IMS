@@ -384,16 +384,47 @@ test('FX: a foreign Woo order with no linked IMS rate, a different currency, or 
 // ---- shipping ----------------------------------------------------------------------------------------
 
 // [mutation: the shipping-account cut removed]
-test('SHIPPING VAT IS OUT: Xero lines on the configured shipping account are not counted, and WooCommerce\'s shipping tax is never read', async () => {
+test('SHIPPING VAT IS OUT: Xero lines on the configured shipping account are not counted, and WooCommerce\'s shipping tax and fee_lines are read only as a fee-tax check', async () => {
   const s = standard({
     ims: { shippingAccount: '260' },
     xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT2', tax: 1.5, account: '260' }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40, account: '200' }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
   })
   assert.deepEqual(reasons(await run(s.ctx)), ['pass'])
-  assert.ok(s.woo.calls.every((c) => c.params._fields === 'id,status,currency,date_created_gmt,tax_lines'))
+  assert.ok(s.woo.calls.every((c) => c.params._fields === 'id,status,currency,date_created_gmt,tax_lines,fee_lines'))
   // The standard double puts 99.00 of SHIPPING tax on every Woo tax line: counting it would have failed the pass above.
-  const uncut = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT2', tax: 1.5, account: '260' }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
-  assert.equal((await run(uncut.ctx)).outcome, 'fail', 'with no shipping account configured the line is part of the figure')
+})
+
+// [mutation: the shipping-account guard removed / loosened]
+test('SHIPPING MUST BE RELIABLY SEPARATED: an unconfigured shipping account, one missing from the chart, or one shared with the sales or discount account cannot pass, and nothing is requested', async () => {
+  // The regression: IMS and Woo hold 100.00 of product VAT; Xero holds 99.00 of product VAT and 1.00 of SHIPPING VAT. With no shipping account
+  // the shipping line is counted, every leg reads 100.00, and the old code passed although the in-scope Xero figure is 99.00.
+  const xero = [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 59 }, { type: 'OUTPUT2', tax: 1, account: '260' }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])]
+  const cases: Array<[string, ImsFixture]> = [
+    ['unconfigured', { shippingAccount: '' }],
+    ['not in the chart', { shippingAccountInChart: false }],
+    ['the sales account', { shippingAccount: '200' }],
+    ['the discount account', { discountAccount: '260' }],
+  ]
+  for (const [name, ims] of cases) {
+    const s = standard({ ims, xero })
+    const item = await run(s.ctx)
+    assert.deepEqual(reasons(item), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'], name)
+    assert.deepEqual([s.xero.calls.length, s.woo.calls.length], [0, 0], `${name}: decided before any request`)
+  }
+  // Properly separated, the same data is a FAILURE: Xero's in-scope figure is 99.00 against 100.00.
+  const separated = await run(standard({ xero }).ctx)
+  assert.equal(separated.outcome, 'fail')
+  assert.deepEqual(keys(separated, 'bothDiffer').sort(), ['ims-xero|2026-09|GB|domestic', 'xero-woo|2026-09|GB|domestic'])
+})
+
+// [mutation: the fee-line tax check removed]
+test('FEE-LINE TAX is not proven to be counted alike: a WooCommerce order with a non-zero fee-line tax in a closed month is VAT_MAPPING_UNVERIFIED; zero fee tax and orders outside the months are not', async () => {
+  const fee = (total: string) => ({ fee_lines: [{ total_tax: total }] })
+  const withFee = (created: string, total: string) => standard({ woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00']], created === 'in' ? fee(total) : {}), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']]), ...(created === 'out' ? [wooOrder(104, '2026-10-02T10:00:00', [[11, '1.00']], fee(total))] : [])] } })
+  assert.deepEqual(reasons(await run(withFee('in', '1.50').ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  assert.deepEqual(reasons(await run(withFee('in', '-0.40').ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  assert.deepEqual(reasons(await run(withFee('in', '0.00').ctx)), ['pass'])
+  assert.deepEqual(reasons(await run(withFee('out', '2.00').ctx)), ['pass'], 'October is not a closed month')
 })
 
 // ---- empty ----------------------------------------------------------------------------------------------
