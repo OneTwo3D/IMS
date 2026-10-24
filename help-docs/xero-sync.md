@@ -1985,6 +1985,10 @@ settles expire normally.
 All cron endpoints require the `CRON_SECRET` bearer header in production.
 
 
+### Account balance snapshots (Trial Balance)
+
+The snapshot pull reads Xero's Trial Balance and stores, per configured account, the balance at the report date: **YTD Debit minus YTD Credit**, so a credit-balance account such as Income in Advance is negative. Columns are found by **name** in the report's Header row (a blank cell is an empty string and means zero), never by position among the cells that happen to hold a number, and the period columns (Debit, Credit) are never used as a balance. A report with no Header, or with no YTD Debit / YTD Credit columns, is refused as a whole; a row with a non-money YTD cell or a different cell count from the Header is refused, and a configured account whose row is refused gets a named error (`TB_NON_MONEY_CELL`, `TB_ROW_CELL_COUNT`, `TB_NO_HEADER`, `TB_NO_YTD_COLUMNS`) and **nothing is stored for it**. **Balances stored before this fix were misread (blank cells were dropped, which shifted values into the wrong column) and must be re-pulled.** The pull upserts by connector + account + balance date + currency (`persistAccountingAccountBalanceSnapshots` in `lib/domain/accounting/account-balance-snapshots.ts`), so re-running it for a date replaces that date's row; there is no backfill, and the reconciliation pack, inventory GL reconciliation and transit reconciliation read correct figures only for dates pulled after this fix.
+
 ## Realised and Unrealised FX
 
 The system tracks both kinds of foreign-currency P&L impact separately.

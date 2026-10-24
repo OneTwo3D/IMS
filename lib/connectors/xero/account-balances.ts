@@ -70,6 +70,8 @@ type MatchedAccount = {
 type XeroAccountBalanceSnapshotBuildInput = {
   accounts: MatchedAccount[]
   parsedRows: ParsedXeroTrialBalanceRow[]
+  /** Rows the parser refused to read. A configured account matching one gets a named error and NO snapshot. */
+  refusedRows?: RefusedXeroTrialBalanceRow[]
   balanceDate: string
   baseCurrency: string
   syncRunId?: string | null
@@ -97,6 +99,10 @@ function parseMoneyCell(value: unknown): Decimal | null {
 }
 
 function labelParts(label: string): { code: string; name: string } | null {
+  // Xero's own Trial Balance label form: "Cost of Goods Sold (310)". The code must contain a digit, so a trailing
+  // currency such as "(GBP)" is not mistaken for one.
+  const trailing = label.trim().match(/^(.+?)\s*\(([A-Za-z0-9._-]*\d[A-Za-z0-9._-]*)\)\s*$/)
+  if (trailing?.[1] && trailing[2]) return { code: trailing[2], name: trailing[1].trim() }
   const match = label.trim().match(/^([A-Za-z0-9._-]*\d[A-Za-z0-9._-]*)(?:\s*[-–—:]\s*|\s+)(.+?)\s*(?:\([A-Z]{3}\))?\s*$/)
   if (!match?.[1] || !match[2]) return null
   return { code: match[1], name: match[2].trim() }
@@ -110,43 +116,127 @@ function accountNameFromLabel(label: string): string {
   return labelParts(label)?.name ?? label
 }
 
-function amountFromCells(cells: XeroReportCell[]): Decimal | null {
-  const numericCells = cells
-    .slice(1)
-    .map((cell) => parseMoneyCell(cell.Value))
-    .filter((value): value is Decimal => value !== null)
-  if (numericCells.length === 0) return null
-  if (numericCells.length === 1) return numericCells[0]!
-  if (numericCells.length >= 3) return numericCells[numericCells.length - 1]!
+/**
+ * Named refusal codes for a Trial Balance the reader will not interpret. A misread balance must never be stored,
+ * so every one of these means "store nothing for the affected account(s)".
+ */
+export type XeroTrialBalanceRefusalCode =
+  | 'TB_NO_HEADER'
+  | 'TB_NO_YTD_COLUMNS'
+  | 'TB_AMBIGUOUS_COLUMNS'
+  | 'TB_ROW_CELL_COUNT'
+  | 'TB_NON_MONEY_CELL'
 
-  const debit = numericCells[numericCells.length - 2]!
-  const credit = numericCells[numericCells.length - 1]!
-  return debit.sub(credit)
+export type RefusedXeroTrialBalanceRow = {
+  code: XeroTrialBalanceRefusalCode
+  accountCode: string | null
+  accountName: string
+  externalAccountId: string | null
+  label: string
+  message: string
 }
 
-function collectRows(rows: XeroReportRow[] | undefined, output: ParsedXeroTrialBalanceRow[]): void {
+export type ParsedXeroTrialBalance = {
+  rows: ParsedXeroTrialBalanceRow[]
+  refusedRows: RefusedXeroTrialBalanceRow[]
+  /** Set when the whole report cannot be read (no usable Header row). Nothing may be stored from it. */
+  reportError: string | null
+}
+
+type TrialBalanceColumns = { cellCount: number; ytdDebit: number; ytdCredit: number }
+
+function findHeaderRow(rows: XeroReportRow[] | undefined): XeroReportRow | null {
   for (const row of rows ?? []) {
-    if (row.Rows?.length) collectRows(row.Rows, output)
+    if (row.RowType === 'Header') return row
+    const nested = findHeaderRow(row.Rows)
+    if (nested) return nested
+  }
+  return null
+}
+
+/**
+ * Locate the YTD Debit / YTD Credit columns BY NAME in the report's Header row. Xero sends a blank cell as an
+ * empty string and the columns are Account, Debit, Credit, YTD Debit, YTD Credit; the balance at the report date
+ * is the YTD pair (Debit/Credit are the period movement and are never a balance). Column positions are never
+ * inferred from which cells happen to hold a number.
+ */
+function trialBalanceColumns(header: XeroReportRow | null): { columns: TrialBalanceColumns } | { error: string } {
+  if (!header) {
+    return { error: 'TB_NO_HEADER: the Xero Trial Balance has no Header row, so its columns cannot be identified; nothing was stored.' }
+  }
+  const titles = (header.Cells ?? []).map((cell) => (typeof cell.Value === 'string' ? cell.Value.trim().toLowerCase() : ''))
+  const find = (name: string) => titles.flatMap((title, index) => (title === name ? [index] : []))
+  const debit = find('ytd debit')
+  const credit = find('ytd credit')
+  if (debit.length === 0 || credit.length === 0) {
+    return { error: `TB_NO_YTD_COLUMNS: the Xero Trial Balance Header has no "YTD Debit"/"YTD Credit" columns (found: ${titles.join(' | ') || 'none'}); the balance is not read from the period columns, nothing was stored.` }
+  }
+  if (debit.length > 1 || credit.length > 1) {
+    return { error: 'TB_AMBIGUOUS_COLUMNS: the Xero Trial Balance Header repeats a "YTD Debit" or "YTD Credit" column; nothing was stored.' }
+  }
+  return { columns: { cellCount: titles.length, ytdDebit: debit[0]!, ytdCredit: credit[0]! } }
+}
+
+/** An empty string is a zero; any other cell must parse as money or the row is refused. */
+function ytdMoney(cell: XeroReportCell | undefined): Decimal | 'invalid' {
+  const value = cell?.Value
+  if (typeof value === 'string' && value.trim() === '') return toDecimal(0)
+  return parseMoneyCell(value) ?? 'invalid'
+}
+
+function collectRows(
+  rows: XeroReportRow[] | undefined,
+  columns: TrialBalanceColumns,
+  output: ParsedXeroTrialBalance,
+): void {
+  for (const row of rows ?? []) {
+    if (row.Rows?.length) collectRows(row.Rows, columns, output)
     if (row.RowType && row.RowType !== 'Row') continue
     const cells = row.Cells ?? []
     const label = typeof cells[0]?.Value === 'string' ? cells[0].Value.trim() : ''
-    const amount = amountFromCells(cells)
-    if (!label || amount === null) continue
-    output.push({
+    if (!label) continue
+    const identity = {
       accountCode: attrValue(cells[0], ['accountCode', 'code']) ?? accountCodeFromLabel(label),
       accountName: attrValue(cells[0], ['accountName', 'name']) ?? accountNameFromLabel(label),
       externalAccountId: attrValue(cells[0], ['accountId', 'accountID', 'account']),
-      amount,
-    })
+    }
+    const refuse = (code: XeroTrialBalanceRefusalCode, detail: string) => {
+      output.refusedRows.push({ code, ...identity, label, message: `${code}: Xero Trial Balance row "${label}" was refused: ${detail}` })
+    }
+    if (cells.length !== columns.cellCount) {
+      refuse('TB_ROW_CELL_COUNT', `it has ${cells.length} cells but the Header has ${columns.cellCount}`)
+      continue
+    }
+    const ytdDebit = ytdMoney(cells[columns.ytdDebit])
+    const ytdCredit = ytdMoney(cells[columns.ytdCredit])
+    if (ytdDebit === 'invalid' || ytdCredit === 'invalid') {
+      refuse('TB_NON_MONEY_CELL', `its ${ytdDebit === 'invalid' ? 'YTD Debit' : 'YTD Credit'} cell is not a money amount`)
+      continue
+    }
+    // Stored convention: debit minus credit, so a credit-balance account is negative.
+    output.rows.push({ ...identity, amount: ytdDebit.sub(ytdCredit) })
   }
 }
 
-export function parseXeroTrialBalanceRows(report: XeroTrialBalanceReport): ParsedXeroTrialBalanceRow[] {
-  const output: ParsedXeroTrialBalanceRow[] = []
+export function parseXeroTrialBalanceReport(report: XeroTrialBalanceReport): ParsedXeroTrialBalance {
+  const output: ParsedXeroTrialBalance = { rows: [], refusedRows: [], reportError: null }
   for (const entry of report.Reports ?? []) {
-    collectRows(entry.Rows, output)
+    const located = trialBalanceColumns(findHeaderRow(entry.Rows))
+    if ('error' in located) {
+      output.reportError = located.error
+      continue
+    }
+    collectRows(entry.Rows, located.columns, output)
   }
   return output
+}
+
+/** Strict form: throws, by name, if the report or any account row cannot be read. */
+export function parseXeroTrialBalanceRows(report: XeroTrialBalanceReport): ParsedXeroTrialBalanceRow[] {
+  const parsed = parseXeroTrialBalanceReport(report)
+  if (parsed.reportError) throw new Error(parsed.reportError)
+  if (parsed.refusedRows.length > 0) throw new Error(parsed.refusedRows.map((row) => row.message).join(' '))
+  return parsed.rows
 }
 
 export function configuredAccountCodes(settings: Pick<Awaited<ReturnType<typeof getXeroSettings>>, 'xero_inventory_account' | 'xero_allocated_inventory_account' | 'xero_cogs_account' | 'xero_transit_account' | 'xero_unearned_revenue_account'>): string[] {
@@ -199,6 +289,14 @@ export function buildXeroAccountBalanceSnapshotInputs(
   const snapshots: AccountingAccountBalanceSnapshotInput[] = []
   const errors: string[] = []
   for (const account of input.accounts) {
+    const refused = (input.refusedRows ?? []).filter((row) =>
+      row.externalAccountId === account.externalAccountId
+      || (account.code !== null && row.accountCode === account.code)
+      || (row.accountCode === null && row.externalAccountId === null && row.accountName === account.name))
+    if (refused.length > 0) {
+      errors.push(`Configured account ${account.code ?? account.externalAccountId} (${account.name}) was not stored: ${refused.map((row) => row.message).join(' ')}`)
+      continue
+    }
     const parsed = matchParsedBalance(account, input.parsedRows)
     // Xero omits zero-balance accounts from the Trial Balance, so a configured
     // (and therefore real) chart account with no matching row simply has a zero
@@ -274,10 +372,15 @@ export async function syncXeroAccountBalanceSnapshots(
     where: { connector: XERO_CONNECTOR, active: true, code: { in: [...new Set(requestedCodes)] } },
     select: { externalAccountId: true, code: true, name: true },
   })
-  const parsedRows = parseXeroTrialBalanceRows(res.data)
+  const parsedTrialBalance = parseXeroTrialBalanceReport(res.data)
+  if (parsedTrialBalance.reportError) {
+    return { fetched: 0, persisted: 0, skipped: 0, errors: [parsedTrialBalance.reportError] }
+  }
+  const parsedRows = parsedTrialBalance.rows
   const { snapshots, errors } = buildXeroAccountBalanceSnapshotInputs({
     accounts,
     parsedRows,
+    refusedRows: parsedTrialBalance.refusedRows,
     balanceDate,
     baseCurrency,
     syncRunId: options.syncRunId ?? null,

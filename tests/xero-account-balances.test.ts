@@ -1,116 +1,145 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { buildXeroAccountBalanceSnapshotInputs, parseXeroTrialBalanceRows } from '@/lib/connectors/xero/account-balances'
+import { buildXeroAccountBalanceSnapshotInputs, parseXeroTrialBalanceReport, parseXeroTrialBalanceRows } from '@/lib/connectors/xero/account-balances'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
-test('parseXeroTrialBalanceRows walks nested report sections and calculates debit minus credit', () => {
-  const rows = parseXeroTrialBalanceRows({
+const HEADER = { RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }
+const row = (...values: string[]) => ({ RowType: 'Row', Cells: values.map((Value) => ({ Value })) })
+const report = (...rows: unknown[]) => ({ Reports: [{ Rows: rows }] }) as Parameters<typeof parseXeroTrialBalanceRows>[0]
+
+// The three rows below are REAL rows from the live organisation (report date 2026-10-23).
+const REAL = {
+  cogs: row('Cost of Goods Sold (310)', '9171.62', '', '73019.20', ''),
+  inventory: row('Inventory Control (631)', '', '8164.12', '123639.63', ''),
+  advance: row('Income in Advance (810)', '11.88', '', '', '100.81'),
+}
+
+test('the three real organisation rows read YTD Debit minus YTD Credit, never the shifted movement cells', () => {
+  const rows = parseXeroTrialBalanceRows(report(HEADER, { RowType: 'Section', Title: 'Mixed', Rows: [REAL.cogs, REAL.inventory, REAL.advance] }))
+  assert.deepEqual(rows.map((r) => [r.accountCode, r.amount.toFixed(2)]), [['310', '73019.20'], ['631', '123639.63'], ['810', '-100.81']])
+})
+
+test('a row with every cell empty is a genuine zero (not dropped, not misread)', () => {
+  const rows = parseXeroTrialBalanceRows(report(HEADER, row('Suspense (900)', '', '', '', '')))
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.amount.toFixed(2), '0.00')
+})
+
+test('a row with both YTD cells non-zero is debit minus credit, with thousands separators and parentheses', () => {
+  const rows = parseXeroTrialBalanceRows(report(HEADER, row('500 - Inventory Asset', '1', '2', '2,000.00', '(125.50)'), row('600 - COGS', '', '', '10', '4')))
+  assert.deepEqual(rows.map((r) => r.amount.toFixed(2)), ['2125.50', '6.00'])
+})
+
+test('columns are found by NAME: a Header in a different order still reads correctly', () => {
+  const header = { RowType: 'Header', Cells: ['Account', 'YTD Credit', 'YTD Debit', 'Credit', 'Debit'].map((Value) => ({ Value })) }
+  const rows = parseXeroTrialBalanceRows(report(header, row('Income in Advance (810)', '100.81', '', '', '11.88'), row('Cost of Goods Sold (310)', '', '73019.20', '', '9171.62')))
+  assert.deepEqual(rows.map((r) => r.amount.toFixed(2)), ['-100.81', '73019.20'])
+})
+
+test('header names match case-insensitively and ignore surrounding spaces', () => {
+  const header = { RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', ' ytd debit ', 'YTD CREDIT'].map((Value) => ({ Value })) }
+  assert.equal(parseXeroTrialBalanceRows(report(header, row('310 Cost of Goods Sold', '', '', '5', '')))[0]!.amount.toFixed(2), '5.00')
+})
+
+test('Xero groups accounts under Sections: rows nested inside Rows are read with the top-level Header', () => {
+  const parsed = parseXeroTrialBalanceReport({
     Reports: [{
+      ReportName: 'Trial Balance',
       Rows: [
-        {
-          RowType: 'Section',
-          Title: 'Assets',
-          Rows: [{
-            RowType: 'Row',
-            Cells: [
-              {
-                Value: '500 - Inventory Asset',
-                Attributes: [
-                  { Id: 'account', Value: 'xero-account-500' },
-                  { Id: 'accountCode', Value: '500' },
-                ],
-              },
-              { Value: '150.25' },
-              { Value: '' },
-            ],
-          }],
-        },
-        {
-          RowType: 'Section',
-          Title: 'Expenses',
-          Rows: [{
-            RowType: 'Row',
-            Cells: [
-              { Value: '600 - Cost of Goods Sold' },
-              { Value: '2,000.00' },
-              { Value: '125.50' },
-            ],
-          }],
-        },
+        HEADER,
+        { RowType: 'Section', Title: 'Revenue', Rows: [{ ...REAL.advance, Rows: undefined }, { RowType: 'SummaryRow', Cells: [{ Value: 'Total Revenue' }, { Value: '1' }, { Value: '' }] }] },
+        { RowType: 'Section', Title: 'Assets', Rows: [{ RowType: 'Section', Title: 'Current', Rows: [REAL.inventory] }, REAL.cogs] },
+        { RowType: 'Section', Title: '', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '1', '2', '3', '4'].map((Value) => ({ Value })) }] },
       ],
     }],
   })
-
-  assert.equal(rows.length, 2)
-  assert.equal(rows[0]?.externalAccountId, 'xero-account-500')
-  assert.equal(rows[0]?.accountCode, '500')
-  assert.equal(rows[0]?.accountName, 'Inventory Asset')
-  assert.equal(rows[0]?.amount.toFixed(6), '150.250000')
-  assert.equal(rows[1]?.accountCode, '600')
-  assert.equal(rows[1]?.accountName, 'Cost of Goods Sold')
-  assert.equal(rows[1]?.amount.toFixed(6), '1874.500000')
+  assert.equal(parsed.reportError, null)
+  assert.deepEqual(parsed.refusedRows, [])
+  assert.deepEqual(parsed.rows.map((r) => [r.accountCode, r.amount.toFixed(2)]), [['810', '-100.81'], ['631', '123639.63'], ['310', '73019.20']])
 })
 
-test('parseXeroTrialBalanceRows skips section and summary cells that are not account rows', () => {
-  const rows = parseXeroTrialBalanceRows({
-    Reports: [{
-      Rows: [
-        {
-          RowType: 'Section',
-          Cells: [{ Value: 'Total Assets' }, { Value: '10000' }, { Value: '' }],
-          Rows: [{
-            RowType: 'SummaryRow',
-            Cells: [{ Value: 'Total Inventory' }, { Value: '5000' }, { Value: '' }],
-          }],
-        },
-        {
-          RowType: 'Row',
-          Cells: [{ Value: '500 — Inventory Asset' }, { Value: '125.50' }, { Value: '' }],
-        },
-      ],
-    }],
-  })
-
-  assert.equal(rows.length, 1)
-  assert.equal(rows[0]?.accountCode, '500')
-  assert.equal(rows[0]?.accountName, 'Inventory Asset')
+test('account identity still comes from the label cell and its Attributes', () => {
+  const labelled = { RowType: 'Row', Cells: [{ Value: '500 - Inventory Asset', Attributes: [{ Id: 'account', Value: 'xero-account-500' }, { Id: 'accountCode', Value: '500' }] }, ...['', '', '150.25', ''].map((Value) => ({ Value }))] }
+  const [r] = parseXeroTrialBalanceRows(report(HEADER, labelled))
+  assert.equal(r!.externalAccountId, 'xero-account-500')
+  assert.equal(r!.accountCode, '500')
+  assert.equal(r!.accountName, 'Inventory Asset')
+  assert.equal(r!.amount.toFixed(6), '150.250000')
 })
 
-test('parseXeroTrialBalanceRows handles parenthesis negatives and empty numeric cells', () => {
-  const rows = parseXeroTrialBalanceRows({
-    Reports: [{
-      Rows: [{
-        RowType: 'Row',
-        Cells: [{ Value: '600: Cost of Goods Sold' }, { Value: '' }, { Value: '(125.50)' }],
-      }],
-    }],
-  })
-
-  assert.equal(rows.length, 1)
-  assert.equal(rows[0]?.accountCode, '600')
-  assert.equal(rows[0]?.amount.toFixed(6), '-125.500000')
+test('a non-money cell in a YTD column refuses THAT row by name; the other rows are still read', () => {
+  const parsed = parseXeroTrialBalanceReport(report(HEADER, row('Bad (100)', '', '', 'n/a', ''), row('Dash (101)', '', '', '-', ''), row('Good (102)', '', '', '1', '')))
+  assert.deepEqual(parsed.rows.map((r) => r.accountCode), ['102'])
+  assert.deepEqual(parsed.refusedRows.map((r) => [r.code, r.accountCode]), [['TB_NON_MONEY_CELL', '100'], ['TB_NON_MONEY_CELL', '101']])
+  assert.match(parsed.refusedRows[0]!.message, /^TB_NON_MONEY_CELL: .*"Bad \(100\)".*YTD Debit/)
 })
 
-test('parseXeroTrialBalanceRows uses explicit balance column when present', () => {
-  const rows = parseXeroTrialBalanceRows({
-    Reports: [{
-      Rows: [{
-        RowType: 'Row',
-        Cells: [
-          { Value: '500 Inventory Asset (GBP)' },
-          { Value: '200.00' },
-          { Value: '50.00' },
-          { Value: '150.00' },
-        ],
-      }],
-    }],
-  })
+test('a null or missing cell value is not an empty string: the row is refused', () => {
+  const nullish = { RowType: 'Row', Cells: [{ Value: 'Null (103)' }, { Value: '' }, { Value: '' }, { Value: null }, { Value: '' }] }
+  assert.equal(parseXeroTrialBalanceReport(report(HEADER, nullish)).refusedRows[0]!.code, 'TB_NON_MONEY_CELL')
+})
 
+test('a non-money cell in a movement column is irrelevant: only the YTD cells are read', () => {
+  assert.equal(parseXeroTrialBalanceReport(report(HEADER, row('Odd (104)', 'x', 'y', '3', ''))).rows[0]!.amount.toFixed(2), '3.00')
+})
+
+test('a row whose cell count differs from the Header is refused, even if the YTD positions exist', () => {
+  const parsed = parseXeroTrialBalanceReport(report(HEADER, row('Short (105)', '1', '2', '3'), row('Long (106)', '', '', '3', '', '9')))
+  assert.deepEqual(parsed.rows, [])
+  assert.deepEqual(parsed.refusedRows.map((r) => r.code), ['TB_ROW_CELL_COUNT', 'TB_ROW_CELL_COUNT'])
+})
+
+test('a report with no Header row is refused as a whole, by name, with no rows', () => {
+  const parsed = parseXeroTrialBalanceReport(report({ RowType: 'Section', Rows: [REAL.cogs] }))
+  assert.deepEqual(parsed.rows, [])
+  assert.match(parsed.reportError ?? '', /^TB_NO_HEADER/)
+  assert.throws(() => parseXeroTrialBalanceRows(report(REAL.cogs)), /TB_NO_HEADER/)
+})
+
+test('a Header without YTD columns is refused; the movement columns are never a balance', () => {
+  const header = { RowType: 'Header', Cells: ['Account', 'Debit', 'Credit'].map((Value) => ({ Value })) }
+  const parsed = parseXeroTrialBalanceReport(report(header, row('Cost of Goods Sold (310)', '9171.62', '')))
+  assert.deepEqual(parsed.rows, [])
+  assert.match(parsed.reportError ?? '', /^TB_NO_YTD_COLUMNS/)
+  const onlyOne = { RowType: 'Header', Cells: ['Account', 'YTD Debit'].map((Value) => ({ Value })) }
+  assert.match(parseXeroTrialBalanceReport(report(onlyOne, row('X (1)', '1'))).reportError ?? '', /^TB_NO_YTD_COLUMNS/)
+})
+
+test('a Header that repeats a YTD column is ambiguous and refused', () => {
+  const header = { RowType: 'Header', Cells: ['Account', 'YTD Debit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }
+  assert.match(parseXeroTrialBalanceReport(report(header, row('X (1)', '1', '2', '3'))).reportError ?? '', /^TB_AMBIGUOUS_COLUMNS/)
+})
+
+test('summary and section rows are not account rows', () => {
+  const rows = parseXeroTrialBalanceRows(report(HEADER, { RowType: 'Section', Cells: ['Total Assets', '', '', '10000', ''].map((Value) => ({ Value })), Rows: [{ RowType: 'SummaryRow', Cells: ['Total Inventory', '', '', '5000', ''].map((Value) => ({ Value })) }] }, row('500 - Inventory Asset', '', '', '125.50', '')))
   assert.equal(rows.length, 1)
-  assert.equal(rows[0]?.accountCode, '500')
-  assert.equal(rows[0]?.accountName, 'Inventory Asset')
-  assert.equal(rows[0]?.amount.toFixed(6), '150.000000')
+  assert.equal(rows[0]!.accountCode, '500')
+})
+
+test('buildXeroAccountBalanceSnapshotInputs: a configured account whose row was refused gets a named error and NO snapshot; others are stored', () => {
+  const parsed = parseXeroTrialBalanceReport(report(HEADER, row('Inventory Control (631)', '', '', 'n/a', ''), row('Cost of Goods Sold (310)', '', '', '5', '')))
+  const result = buildXeroAccountBalanceSnapshotInputs({
+    balanceDate: '2026-10-23',
+    baseCurrency: 'GBP',
+    accounts: [{ externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }, { externalAccountId: 'a-310', code: '310', name: 'Cost of Goods Sold' }],
+    parsedRows: parsed.rows,
+    refusedRows: parsed.refusedRows,
+  })
+  assert.deepEqual(result.snapshots.map((s) => s.accountCode), ['310'])
+  assert.equal(result.errors.length, 1)
+  assert.match(result.errors[0]!, /631.*TB_NON_MONEY_CELL/)
+})
+
+test('a refused row alone (nothing else parsed) still gives the refusal error, not a stored zero and not the generic no-match error', () => {
+  const parsed = parseXeroTrialBalanceReport(report(HEADER, row('Inventory Control (631)', '1')))
+  const result = buildXeroAccountBalanceSnapshotInputs({
+    balanceDate: '2026-10-23', baseCurrency: 'GBP',
+    accounts: [{ externalAccountId: 'a-631', code: '631', name: 'Inventory Control' }],
+    parsedRows: parsed.rows, refusedRows: parsed.refusedRows,
+  })
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /TB_ROW_CELL_COUNT/)
 })
 
 test('buildXeroAccountBalanceSnapshotInputs synthesizes a zero snapshot for a configured account omitted from a non-empty Trial Balance, and prefers external id', () => {
@@ -150,4 +179,9 @@ test('buildXeroAccountBalanceSnapshotInputs still errors when the Trial Balance 
 
   assert.equal(result.snapshots.length, 0)
   assert.deepEqual(result.errors, ['No Trial Balance row matched configured account 500 (Inventory Asset).'])
+})
+
+test('a Header that Xero nests inside a wrapper Row is still found', () => {
+  const rows = parseXeroTrialBalanceRows(report({ RowType: 'Section', Rows: [HEADER, REAL.cogs] }))
+  assert.equal(rows[0]!.amount.toFixed(2), '73019.20')
 })

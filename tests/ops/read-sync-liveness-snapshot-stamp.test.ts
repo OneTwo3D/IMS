@@ -88,14 +88,16 @@ function trialBalance(rows: Array<{ id: string; label: string; debit: string }>)
     ok: true,
     data: {
       Reports: [{
-        Rows: [{
+        Rows: [{ RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }, {
           RowType: 'Section',
           Rows: rows.map((row) => ({
             RowType: 'Row',
             Cells: [
               { Value: row.label, Attributes: [{ Id: 'account', Value: row.id }] },
-              { Value: row.debit },
               { Value: '0' },
+              { Value: '0' },
+              { Value: row.debit },
+              { Value: '' },
             ],
           })),
         }],

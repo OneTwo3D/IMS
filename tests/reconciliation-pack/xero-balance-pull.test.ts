@@ -53,7 +53,8 @@ mock.module('@/lib/domain/accounting/account-balance-snapshots', {
   },
 })
 
-const row = (id: string, label: string, debit: string, credit = '0') => ({ RowType: 'Row', Cells: [{ Value: label, Attributes: [{ Id: 'account', Value: id }] }, { Value: debit }, { Value: credit }] })
+const row = (id: string, label: string, debit: string, credit = '0') => ({ RowType: 'Row', Cells: [{ Value: label, Attributes: [{ Id: 'account', Value: id }] }, { Value: '0' }, { Value: '0' }, { Value: debit }, { Value: credit }] })
+const TB_HEADER = { RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }
 const FULL_CHART = [
   { externalAccountId: 'a-630', code: '630', name: 'Inventory' },
   { externalAccountId: 'a-631', code: '631', name: 'Allocated' },
@@ -65,7 +66,7 @@ const FULL_CHART = [
 function reset() {
   getCalls = []; cachedCalls = []; persisted = []; stamps = []; unearnedCode = '260'
   chart = FULL_CHART
-  trialBalance = { Reports: [{ Rows: [{ RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '200'), row('a-632', '632 - Transit', '50'), row('a-500', '500 - COGS', '75'), row('a-260', '260 - Unearned Revenue', '0', '300')] }] }] }
+  trialBalance = { Reports: [{ Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '200'), row('a-632', '632 - Transit', '50'), row('a-500', '500 - COGS', '75'), row('a-260', '260 - Unearned Revenue', '0', '300')] }] }] }
 }
 
 async function pull() {
@@ -120,7 +121,7 @@ test('an Unearned Revenue account that is configured but not in the chart stops 
 // [mutation: the absent suffix removed]
 test('a configured account that a NON-EMPTY Trial Balance omits is stored as a zero labelled absent-from-tb; a reported zero is not', async () => {
   reset()
-  trialBalance = { Reports: [{ Rows: [{ RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75')] }] }] }
+  trialBalance = { Reports: [{ Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75')] }] }] }
   await pull()
   const byCode = new Map(persisted.map((snapshot) => [snapshot.accountCode, snapshot]))
   assert.equal(byCode.get('630')!.sourcePayloadRef, 'xero:trial-balance:2026-10-19')
