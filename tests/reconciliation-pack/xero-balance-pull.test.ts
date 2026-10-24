@@ -32,7 +32,7 @@ mock.module('@/lib/connectors/xero/settings', {
 })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    xeroGet: async (path: string) => { getCalls.push(path); return { ok: true, data: trialBalance } },
+    xeroGet: async (path: string) => { getCalls.push(path); return { ok: true, data: path.startsWith('Accounts') ? { Accounts: chart.map((a) => ({ AccountID: a.externalAccountId, Code: a.code, Name: a.name, Type: 'ASSET', TaxType: 'NONE', Status: 'ACTIVE', Class: 'ASSET' })) } : trialBalance } },
     xeroGetCached: async (path: string) => { cachedCalls.push(path); return { ok: true, data: { Organisations: [{ BaseCurrency: 'GBP' }] } } },
   },
 })
@@ -40,7 +40,7 @@ mock.module('@/lib/connectors/xero/connection-fence', {
   namedExports: {
     captureXeroConnection: async () => ({ tenantId: 'tenant-x', connectionGeneration: 'gen-1' }),
     withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => {
-      const tx = { setting: { upsert: async ({ where }: { where: { key: string } }) => { stamps.push(where.key) } }, snapshots: [] as Persisted }
+      const tx = { accountingAccount: { upsert: async () => undefined, updateMany: async () => undefined }, setting: { upsert: async ({ where }: { where: { key: string } }) => { stamps.push(where.key) } }, snapshots: [] as Persisted }
       const value = await fn(tx)
       return { ok: true, value }
     },
@@ -105,8 +105,11 @@ test('ZERO EXTRA CALLS: the request count is identical with and without Unearned
   chart = FULL_CHART.filter((account) => account.code !== '260')
   await pull()
   assert.deepEqual({ gets: getCalls, cached: cachedCalls }, withUnearned)
-  assert.equal(withUnearned.gets.length, 1)
+  // Two GETs since the pull resolves the configured codes against the CURRENT chart (Accounts) as well as the Trial Balance;
+  // adding an account to the list still adds none.
+  assert.equal(withUnearned.gets.length, 2)
   assert.match(withUnearned.gets[0]!, /^Reports\/TrialBalance\?date=2026-10-19$/)
+  assert.equal(withUnearned.gets[1], 'Accounts')
   assert.equal(withUnearned.cached.length, 1)
 })
 

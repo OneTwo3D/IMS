@@ -7,7 +7,7 @@ import {
   getAccountBalancePeriodMovement,
   AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
-  findLatestAccountBalanceSnapshot,
+  findLatestConfiguredAccountBalanceSnapshot,
 } from './account-balance-snapshots'
 import {
   buildAccountReconciliationSweepJournal,
@@ -54,6 +54,7 @@ export type CogsGlReconciliationUnavailableReason =
   | 'no_gl_snapshot'
   | 'no_opening_snapshot'
   | 'financial_year_boundary'
+  | 'account_identity_unproven'
   | 'ledger_not_covering_window'
 
 export type CogsGlReconciliationResult = AccountGlReconciliationResult<CogsGlReconciliationUnavailableReason>
@@ -101,12 +102,18 @@ export async function loadCogsGlReconciliation(options?: {
   if (!cogsAccount) return { available: false, reason: 'no_account_configured' }
 
   const currency = await getBaseCurrencyCode()
-  const closing = await findLatestAccountBalanceSnapshot({
-    connector,
-    accountCode: cogsAccount,
-    balanceDate: options?.now ?? new Date(),
-    currency,
-  })
+  let closing
+  try {
+    closing = await findLatestConfiguredAccountBalanceSnapshot({
+      connector,
+      accountCode: cogsAccount,
+      balanceDate: options?.now ?? new Date(),
+      currency,
+    })
+  } catch (error) {
+    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: 'account_identity_unproven' }
+    throw error
+  }
   if (!closing) return { available: false, reason: 'no_gl_snapshot' }
   const closingDate = closing.balanceDate
 

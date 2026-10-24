@@ -25,14 +25,14 @@ mock.module('@/lib/connectors/xero/settings', {
 })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    xeroGet: async (path: string) => { getCalls.push(path); return { ok: true, data: { Reports: [] } } },
+    xeroGet: async (path: string) => { getCalls.push(path); return { ok: true, data: path.startsWith('Accounts') ? { Accounts: [] } : { Reports: [] } } },
     xeroGetCached: async (path: string) => { cachedCalls.push(path); return { ok: true, data: { Organisations: [{ BaseCurrency: 'GBP' }] } } },
   },
 })
 mock.module('@/lib/connectors/xero/connection-fence', {
   namedExports: {
     captureXeroConnection: async () => ({ tenantId: 't', connectionGeneration: 'g' }),
-    withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => ({ ok: true, value: await fn({}) }),
+    withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => ({ ok: true, value: await fn({ accountingAccount: { upsert: async () => undefined, updateMany: async () => undefined } }) }),
   },
 })
 mock.module('@/lib/domain/accounting/account-balance-snapshots', {
@@ -75,12 +75,12 @@ test('a known grant lacking the scope is refused by name and makes no HTTP call'
 test('an unrecorded grant fails open and attempts the call', async () => {
   granted = null
   await pull()
-  assert.equal(getCalls.length, 1)
+  assert.equal(getCalls.length, 2) // the Trial Balance, then the current chart of accounts
   assert.match(getCalls[0]!, /^Reports\/TrialBalance\?date=2026-10-19/)
 })
 
 test('a grant that includes the scope proceeds to the call', async () => {
   granted = [...XERO_REQUESTED_SCOPES]
   await pull()
-  assert.equal(getCalls.length, 1)
+  assert.equal(getCalls.length, 2)
 })

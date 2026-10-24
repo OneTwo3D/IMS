@@ -58,6 +58,7 @@ export type PersistAccountingAccountBalanceSnapshotResult = {
 type SnapshotClient = Pick<PrismaClient, 'accountingAccountBalanceSnapshot'> & Partial<Pick<PrismaClient, '$transaction'>>
 /** What a period movement reads: the snapshots, plus the chart (account type) and the stored financial-year end. */
 type MovementClient = SnapshotClient & Pick<PrismaClient, 'accountingAccount'>
+type ConfiguredReadClient = MovementClient & Pick<PrismaClient, 'accountingToken'>
 
 export type AccountBalanceSnapshotLookup = {
   connector: string
@@ -82,6 +83,7 @@ export type AccountBalanceMovementWithheldReason =
   | 'financial_year_end_unproven'
   | 'account_identity_unproven'
   | 'account_identity_changed'
+  | 'organisation_unproven'
 
 /**
  * A closing-minus-opening movement that would not be a movement: the account is a profit-and-loss account (its Trial Balance
@@ -98,6 +100,8 @@ export class AccountBalanceMovementWithheldError extends Error {
       ? `Account ${account} is a profit-and-loss account whose year-to-date balance restarts at the financial-year start, which falls between ${window}; the movement is withheld.`
       : input.reason === 'account_identity_unproven'
         ? `The chart does not name exactly one active account for code ${account}, so a movement between ${window} cannot be tied to an account; it is withheld.`
+        : input.reason === 'organisation_unproven'
+          ? `No connected Xero organisation is recorded, so a stored balance for code ${account} cannot be shown to be the connected organisation's; it is withheld.`
         : input.reason === 'account_identity_changed'
           ? `The stored balances for code ${account} between ${window} are not both the configured account's own, from the same organisation (the code was reassigned or the organisation changed); the movement is withheld.`
           : `Account ${account} is a profit-and-loss account and its two balances do not prove the same financial-year end for the same organisation, so a movement between ${window} is withheld.`)
@@ -251,6 +255,39 @@ export async function findLatestAccountBalanceSnapshot(
         orderBy,
       })
     : null
+}
+
+/**
+ * The latest stored balance on or before a date for the account a CONFIGURED CODE names. A code is not an identity: it can be
+ * reassigned to another account. So the code is resolved to the one active chart account that holds it, the balance is read by
+ * that account's id, and only a balance fetched under the CONNECTED organisation counts. A chart that does not name exactly one
+ * account, or no recorded connected organisation, throws AccountBalanceMovementWithheldError (a named reason); the caller
+ * withholds its figure. Returns null when the account has no balance on or before the date.
+ */
+export async function findLatestConfiguredAccountBalanceSnapshot(
+  lookup: { connector: string; accountCode: string; balanceDate: Date | string; currency?: string | null },
+  client: ConfiguredReadClient = db,
+): Promise<AccountingAccountBalanceSnapshotRow | null> {
+  const date = balanceDateString(lookup.balanceDate)
+  const withheld = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({ reason, accountCode: lookup.accountCode, openingDate: date, closingDate: date })
+  const code = lookup.accountCode.trim()
+  const chartRows = code
+    ? await client.accountingAccount.findMany({ where: { connector: lookup.connector, code, active: true }, select: { externalAccountId: true, type: true } })
+    : []
+  if (chartRows.length !== 1) throw withheld('account_identity_unproven')
+  const token = await client.accountingToken.findUnique({ where: { connector: lookup.connector }, select: { tenantId: true } })
+  const tenantId = typeof token?.tenantId === 'string' ? token.tenantId.trim() : ''
+  if (!tenantId) throw withheld('organisation_unproven')
+  return client.accountingAccountBalanceSnapshot.findFirst({
+    where: {
+      connector: lookup.connector,
+      externalAccountId: chartRows[0]!.externalAccountId,
+      tenantId,
+      balanceDate: { lte: normalizeBalanceDate(lookup.balanceDate) },
+      ...(lookup.currency ? { currency: normalizeCurrency(lookup.currency) } : {}),
+    },
+    orderBy: [{ balanceDate: 'desc' }, { fetchedAt: 'desc' }, { id: 'desc' }],
+  })
 }
 
 export async function getAccountBalancePeriodMovement(

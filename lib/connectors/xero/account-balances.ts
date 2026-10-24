@@ -1,4 +1,3 @@
-import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
   balanceDateString,
@@ -10,6 +9,7 @@ import { formatFinancialYearEnd } from '@/lib/domain/accounting/financial-year'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
 import { getGrantedScopes } from './auth'
+import { fetchXeroChartOfAccounts, storeChartOfAccounts, type XeroChartAccount } from './accounts'
 import { blockingScopeForTrialBalance, trialBalanceScopeError } from './scopes'
 import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
 import { xeroTrialBalanceRef } from './account-balance-refs'
@@ -67,6 +67,11 @@ type MatchedAccount = {
   externalAccountId: string
   code: string | null
   name: string
+  /**
+   * True when NO other account in the chart (active or not) holds this code. Only then may a Trial Balance row that carries no
+   * account id be read by code. Absent means true (a caller that has no chart to ask).
+   */
+  codeUnique?: boolean
 }
 
 type XeroAccountBalanceSnapshotBuildInput = {
@@ -314,8 +319,12 @@ export function buildXeroAccountBalanceSnapshotInputs(
     }
     // The row's own account id decides. The code is a fallback ONLY for a row that carries no id.
     const parsed = parsedAll.find((row) => row.externalAccountId === account.externalAccountId)
-      ?? (account.code ? parsedAll.find((row) => row.externalAccountId === null && row.accountCode === account.code) : undefined)
+      ?? (account.code && account.codeUnique !== false ? parsedAll.find((row) => row.externalAccountId === null && row.accountCode === account.code) : undefined)
       ?? null
+    if (!parsed && account.code && account.codeUnique === false && parsedAll.some((row) => row.externalAccountId === null && row.accountCode === account.code)) {
+      errors.push(`TB_CODE_NOT_UNIQUE: code ${account.code} is also held by another account in the current Xero chart and the Trial Balance row for it carries no account id, so it cannot be tied to ${accountRef}; nothing was stored for it.`)
+      continue
+    }
     if (!parsed) {
       const conflicting = account.code
         ? [...parsedAll, ...refusedAll].find((row) => row.accountCode === account.code && row.externalAccountId !== null && row.externalAccountId !== account.externalAccountId)
@@ -353,6 +362,21 @@ export function buildXeroAccountBalanceSnapshotInputs(
     })
   }
   return { snapshots, errors }
+}
+
+export function resolveConfiguredAccounts(codes: string[], chart: XeroChartAccount[]): { accounts: MatchedAccount[]; errors: string[] } {
+  const accounts: MatchedAccount[] = []
+  const errors: string[] = []
+  for (const code of codes) {
+    const holders = chart.filter((account) => typeof account.Code === 'string' && account.Code.trim() === code)
+    const active = holders.filter((account) => account.Status === 'ACTIVE')
+    if (active.length !== 1) {
+      errors.push(`TB_CHART_CODE_UNRESOLVED: configured account code ${code} is held by ${active.length} active accounts in the current Xero chart (it must be exactly one); nothing was stored for it.`)
+      continue
+    }
+    accounts.push({ externalAccountId: active[0]!.AccountID, code, name: active[0]!.Name, codeUnique: holders.length === 1 })
+  }
+  return { accounts, errors }
 }
 
 export async function syncXeroAccountBalanceSnapshots(
@@ -399,16 +423,18 @@ export async function syncXeroAccountBalanceSnapshots(
     return { fetched: 0, persisted: 0, skipped: 0, errors: [res.error ?? 'Failed to fetch Xero trial balance'] }
   }
 
-  const accounts = await db.accountingAccount.findMany({
-    where: { connector: XERO_CONNECTOR, active: true, code: { in: [...new Set(requestedCodes)] } },
-    select: { externalAccountId: true, code: true, name: true },
-  })
+  // WHICH accounts: resolved against the CURRENT Xero chart, fetched here (GET only), not the locally stored one, which may be
+  // stale after a code was reassigned. A configured code must be held by exactly one ACTIVE account; otherwise nothing is stored
+  // for it. The same fetch refreshes the local chart below, in the same fenced transaction as the balances.
+  const chart = await fetchXeroChartOfAccounts()
+  if (!chart.ok) return { fetched: 0, persisted: 0, skipped: 0, errors: [`Failed to fetch the current Xero chart of accounts: ${chart.error}`] }
+  const { accounts, errors: chartErrors } = resolveConfiguredAccounts([...new Set(requestedCodes)], chart.accounts)
   const parsedTrialBalance = parseXeroTrialBalanceReport(res.data)
   if (parsedTrialBalance.reportError) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: [parsedTrialBalance.reportError] }
   }
   const parsedRows = parsedTrialBalance.rows
-  const { snapshots, errors } = buildXeroAccountBalanceSnapshotInputs({
+  const built = buildXeroAccountBalanceSnapshotInputs({
     accounts,
     parsedRows,
     refusedRows: parsedTrialBalance.refusedRows,
@@ -418,8 +444,11 @@ export async function syncXeroAccountBalanceSnapshots(
     tenantId: connection?.tenantId ?? null,
     financialYearEnd: xeroOrganisation.financialYearEnd,
   })
+  const snapshots = built.snapshots
+  const errors = [...chartErrors, ...built.errors]
 
   const fenced = await withXeroConnectionFence(connection, async (tx) => {
+    await storeChartOfAccounts(tx, chart.accounts)
     const stored = await persistAccountingAccountBalanceSnapshots(snapshots, tx as never)
     // The last-success stamp is written in THIS transaction, after the snapshots, and only for a clean
     // scheduled pull that stored a snapshot for every distinct account it was configured to fetch. A
@@ -439,7 +468,7 @@ export async function syncXeroAccountBalanceSnapshots(
       })
     }
     return stored
-  })
+  }, { timeoutMs: 120_000 })
   if (!fenced.ok) return { fetched: parsedRows.length, persisted: 0, skipped: accounts.length, errors: [fenced.error] }
   const persisted = fenced.value
   return {

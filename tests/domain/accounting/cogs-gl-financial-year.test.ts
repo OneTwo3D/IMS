@@ -25,6 +25,7 @@ mock.module('@/lib/db', {
           return d >= closingDate ? { ...snap('c', closingDate, '40'), financialYearEnd: closingYearEnd } : snap('o', '2026-12-31', '900')
         },
       },
+      accountingToken: { findUnique: async () => ({ tenantId: 't1' }) },
       accountingAccount: { findMany: async () => (accountType === null ? [] : [{ externalAccountId: 'a-310', type: accountType }]) },
       setting: { findUnique: async () => ({ value: '2026-01-01' }) },
       cogsSubledgerMovement: { aggregate: async () => ({ _sum: { baseDelta: 40 } }) },

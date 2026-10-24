@@ -13,6 +13,10 @@ type Persisted = Array<{ accountCode?: string | null; amountBase: unknown; finan
 let persisted: Persisted = []
 let persistCalls = 0
 let trialBalance: unknown = {}
+/** When set, the Xero `Accounts` response (the CURRENT chart) instead of one active account per entry of `chart`. */
+let chartOverride: Array<Record<string, unknown>> | null = null
+let chartFetchOk = true
+let chartWrites = 0
 let orgFields: Record<string, number | undefined> = {}
 const chart = [
   { externalAccountId: 'a-310', code: '310', name: 'Cost of Goods Sold' },
@@ -32,14 +36,14 @@ mock.module('@/lib/connectors/xero/settings', {
 })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    xeroGet: async () => ({ ok: true, data: trialBalance }),
+    xeroGet: async (path: string) => path.startsWith('Accounts') && !chartFetchOk ? { ok: false, error: 'Xero HTTP 503' } : ({ ok: true, data: path.startsWith('Accounts') ? chartOverride ? { Accounts: chartOverride } : { Accounts: chart.map((a) => ({ AccountID: a.externalAccountId, Code: a.code, Name: a.name, Type: 'ASSET', TaxType: 'NONE', Status: 'ACTIVE', Class: 'ASSET' })) } : trialBalance }),
     xeroGetCached: async () => ({ ok: true, data: { Organisations: [{ BaseCurrency: 'GBP', ...orgFields }] } }),
   },
 })
 mock.module('@/lib/connectors/xero/connection-fence', {
   namedExports: {
     captureXeroConnection: async () => ({ tenantId: 'tenant-x', connectionGeneration: 'gen-1' }),
-    withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => ({ ok: true, value: await fn({ setting: { upsert: async () => undefined } }) }),
+    withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => ({ ok: true, value: await fn({ accountingAccount: { upsert: async () => { chartWrites += 1 }, updateMany: async () => undefined }, setting: { upsert: async () => undefined } }) }),
   },
 })
 mock.module('@/lib/domain/accounting/account-balance-snapshots', {
@@ -64,7 +68,7 @@ const realReport = (...extra: unknown[]) => ({
 })
 
 async function pull() {
-  persisted = []; persistCalls = 0
+  persisted = []; persistCalls = 0; chartWrites = 0
   const { syncXeroAccountBalanceSnapshots } = await import('../../../lib/connectors/xero/account-balances.ts')
   return syncXeroAccountBalanceSnapshots({ balanceDate: '2026-10-23', syncRunId: 'run-1' })
 }
@@ -156,4 +160,58 @@ test('a blank-label row carrying a configured account id and a balance stores no
   const result = await pull()
   assert.deepEqual(stored(), { '310': '73019.20', '810': '-100.81' })
   assert.match(result.errors[0]!, /631.*TB_BLANK_LABEL/)
+})
+
+const acct = (id: string, code: string, status = 'ACTIVE') => ({ AccountID: id, Code: code, Name: `acct ${code}`, Type: 'ASSET', TaxType: 'NONE', Status: status, Class: 'ASSET' })
+const idless = (label: string, ytdDebit: string) => ({ RowType: 'Row', Cells: [{ Value: label }, ...['', '', ytdDebit, ''].map((Value) => ({ Value }))] })
+const withChart = async (accounts: Array<Record<string, unknown>> | null, run: () => Promise<void>) => { chartOverride = accounts; try { await run() } finally { chartOverride = null; chartFetchOk = true } }
+const reportWith = (...rows: unknown[]) => ({ Reports: [{ Rows: [header(), { RowType: 'Section', Rows: rows }] }] })
+
+test('CURRENT CHART: a code Xero moved to another account is stored under the NEW account\'s id (id-less row), never the stale local one', async () => {
+  trialBalance = reportWith(idless('Inventory Control (631)', '500'), idless('Cost of Goods Sold (310)', '5'), idless('Income in Advance (810)', '1'))
+  await withChart([acct('a-NEW', '631'), acct('a-310', '310'), acct('a-810', '810'), acct('a-631', '631', 'ARCHIVED')], async () => {
+    const result = await pull()
+    // 631 now has an archived duplicate: the id-less row cannot be told apart, so it is refused for 631 and 310/810 (unique) store.
+    assert.deepEqual(stored(), { '310': '5.00', '810': '1.00' })
+    assert.match(result.errors.join(' '), /TB_CODE_NOT_UNIQUE/)
+  })
+})
+
+test('CURRENT CHART: an id-less row is read by code when the fresh chart has exactly one account with that code', async () => {
+  trialBalance = reportWith(idless('Inventory Control (631)', '500'), idless('Cost of Goods Sold (310)', '5'), idless('Income in Advance (810)', '1'))
+  await withChart([acct('a-NEW', '631'), acct('a-310', '310'), acct('a-810', '810')], async () => {
+    const result = await pull()
+    assert.deepEqual(result.errors, [])
+    assert.deepEqual(persisted.map((s) => [s.accountCode, (s as { externalAccountId?: string }).externalAccountId]).sort(), [['310', 'a-310'], ['631', 'a-NEW'], ['810', 'a-810']])
+  })
+})
+
+test('CURRENT CHART: the old account\'s row (carrying its id) is not stored under the code\'s new holder', async () => {
+  trialBalance = reportWith({ RowType: 'Row', Cells: cells('Inventory Control (631)', '', '', '777', '') }, idless('Cost of Goods Sold (310)', '5'), idless('Income in Advance (810)', '1'))
+  await withChart([acct('a-NEW', '631'), acct('a-310', '310'), acct('a-810', '810')], async () => {
+    const result = await pull()
+    assert.deepEqual(stored(), { '310': '5.00', '810': '1.00' })
+    assert.match(result.errors.join(' '), /TB_ACCOUNT_ID_CONFLICT/)
+  })
+})
+
+test('CURRENT CHART: a configured code held by two ACTIVE accounts, or by none, stores nothing for it and errors by name', async () => {
+  trialBalance = realReport()
+  await withChart([acct('a-631', '631'), acct('a-631b', '631'), acct('a-310', '310')], async () => {
+    const result = await pull()
+    assert.deepEqual(stored(), { '310': '73019.20' })
+    assert.equal(result.errors.filter((e) => /^TB_CHART_CODE_UNRESOLVED/.test(e)).length, 2, 'two active holders of 631, no 810')
+  })
+})
+
+test('CURRENT CHART: the chart fetch is GET-only, failing it stores nothing, and a good pull refreshes the local chart in the same transaction', async () => {
+  trialBalance = realReport()
+  chartFetchOk = false
+  const failed = await pull()
+  chartFetchOk = true
+  assert.equal(persistCalls, 0)
+  assert.equal(chartWrites, 0)
+  assert.match(failed.errors[0]!, /current Xero chart/)
+  await pull()
+  assert.equal(chartWrites, 3, 'the fetched chart was written inside the fenced transaction')
 })

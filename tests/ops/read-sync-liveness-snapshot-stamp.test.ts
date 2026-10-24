@@ -48,7 +48,7 @@ mock.module('@/lib/connectors/xero/settings', {
 })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    xeroGet: async () => xeroGetResult,
+    xeroGet: async (path: string) => (path.startsWith('Accounts') ? { ok: true, data: { Accounts: chart.map((a) => ({ AccountID: a.externalAccountId, Code: a.code, Name: a.name, Type: 'ASSET', TaxType: 'NONE', Status: 'ACTIVE', Class: 'ASSET' })) } } : xeroGetResult),
     xeroGetCached: async () => ({ ok: true, data: { Organisations: [{ BaseCurrency: 'GBP' }] } }),
   },
 })
@@ -60,6 +60,7 @@ mock.module('@/lib/connectors/xero/connection-fence', {
       const call = fenceCalls
       const pending: Write[] = []
       const tx = {
+        accountingAccount: { upsert: async () => undefined, updateMany: async () => undefined },
         setting: {
           upsert: async ({ where }: { where: { key: string } }) => { pending.push({ call, kind: 'stamp', detail: where.key }) },
         },

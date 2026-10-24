@@ -4,7 +4,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import {
   calculateAccountBalanceVarianceBase,
-  findLatestAccountBalanceSnapshot,
+  findLatestConfiguredAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
   AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
@@ -595,12 +595,24 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
       notices: ['No inventory asset account is configured on the active accounting connector, so GL variance is blank.'],
     }
   }
-  const snapshot = await findLatestAccountBalanceSnapshot({
-    connector: context.connector,
-    accountCode: context.inventoryAccountCode,
-    balanceDate: asOf,
-    currency: context.baseCurrency,
-  })
+  let snapshot
+  try {
+    snapshot = await findLatestConfiguredAccountBalanceSnapshot({
+      connector: context.connector,
+      accountCode: context.inventoryAccountCode,
+      balanceDate: asOf,
+      currency: context.baseCurrency,
+    })
+  } catch (error) {
+    if (error instanceof AccountBalanceMovementWithheldError) {
+      return {
+        glBalanceBase: null,
+        glVarianceBase: null,
+        notices: [`The stored GL balance cannot be shown to be inventory asset account ${context.inventoryAccountCode}'s own, from the connected organisation (the code may have been reassigned), so GL variance is blank.`],
+      }
+    }
+    throw error
+  }
   if (!snapshot) {
     return {
       glBalanceBase: null,
