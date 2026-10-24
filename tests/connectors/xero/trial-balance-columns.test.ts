@@ -16,6 +16,9 @@ let trialBalance: unknown = {}
 /** When set, the Xero `Accounts` response (the CURRENT chart) instead of one active account per entry of `chart`. */
 let chartOverride: Array<Record<string, unknown>> | null = null
 let chartFetchOk = true
+/** When set, the SECOND `Accounts` read of a pull (after the Trial Balance) answers this instead: Xero moved something in between. */
+let chartAfter: Array<Record<string, unknown>> | null = null
+let chartReads = 0
 let chartWrites = 0
 let orgFields: Record<string, number | undefined> = {}
 const chart = [
@@ -36,7 +39,7 @@ mock.module('@/lib/connectors/xero/settings', {
 })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    xeroGet: async (path: string) => path.startsWith('Accounts') && !chartFetchOk ? { ok: false, error: 'Xero HTTP 503' } : ({ ok: true, data: path.startsWith('Accounts') ? chartOverride ? { Accounts: chartOverride } : { Accounts: chart.map((a) => ({ AccountID: a.externalAccountId, Code: a.code, Name: a.name, Type: 'ASSET', TaxType: 'NONE', Status: 'ACTIVE', Class: 'ASSET' })) } : trialBalance }),
+    xeroGet: async (path: string) => path.startsWith('Accounts') && (chartReads += 1) > 0 && !chartFetchOk ? { ok: false, error: 'Xero HTTP 503' } : ({ ok: true, data: path.startsWith('Accounts') ? chartOverride ? { Accounts: chartReads > 1 && chartAfter ? chartAfter : chartOverride } : { Accounts: chart.map((a) => ({ AccountID: a.externalAccountId, Code: a.code, Name: a.name, Type: 'ASSET', TaxType: 'NONE', Status: 'ACTIVE', Class: 'ASSET' })) } : trialBalance }),
     xeroGetCached: async () => ({ ok: true, data: { Organisations: [{ BaseCurrency: 'GBP', ...orgFields }] } }),
   },
 })
@@ -68,7 +71,7 @@ const realReport = (...extra: unknown[]) => ({
 })
 
 async function pull() {
-  persisted = []; persistCalls = 0; chartWrites = 0
+  persisted = []; persistCalls = 0; chartWrites = 0; chartReads = 0
   const { syncXeroAccountBalanceSnapshots } = await import('../../../lib/connectors/xero/account-balances.ts')
   return syncXeroAccountBalanceSnapshots({ balanceDate: '2026-10-23', syncRunId: 'run-1' })
 }
@@ -164,7 +167,7 @@ test('a blank-label row carrying a configured account id and a balance stores no
 
 const acct = (id: string, code: string, status = 'ACTIVE') => ({ AccountID: id, Code: code, Name: `acct ${code}`, Type: 'ASSET', TaxType: 'NONE', Status: status, Class: 'ASSET' })
 const idless = (label: string, ytdDebit: string) => ({ RowType: 'Row', Cells: [{ Value: label }, ...['', '', ytdDebit, ''].map((Value) => ({ Value }))] })
-const withChart = async (accounts: Array<Record<string, unknown>> | null, run: () => Promise<void>) => { chartOverride = accounts; try { await run() } finally { chartOverride = null; chartFetchOk = true } }
+const withChart = async (accounts: Array<Record<string, unknown>> | null, run: () => Promise<void>) => { chartOverride = accounts; try { await run() } finally { chartOverride = null; chartAfter = null; chartFetchOk = true } }
 const reportWith = (...rows: unknown[]) => ({ Reports: [{ Rows: [header(), { RowType: 'Section', Rows: rows }] }] })
 
 test('CURRENT CHART: a code Xero moved to another account is stored under the NEW account\'s id (id-less row), never the stale local one', async () => {
@@ -260,4 +263,32 @@ test('two rows for one configured account: that account is refused, not the firs
   const result = await pull()
   assert.deepEqual(stored(), { '310': '73019.20', '810': '-100.81' })
   assert.match(result.errors[0]!, /TB_DUPLICATE_ACCOUNT_ROW/)
+})
+
+test('RACE: a code Xero moves to another account between the chart read and the Trial Balance read stores nothing for that code', async () => {
+  trialBalance = reportWith(idless('Inventory Control (631)', '500'), idless('Cost of Goods Sold (310)', '5'), idless('Income in Advance (810)', '1'))
+  await withChart([acct('a-631', '631'), acct('a-310', '310'), acct('a-810', '810')], async () => {
+    chartAfter = [acct('a-NEW', '631'), acct('a-310', '310'), acct('a-810', '810')]
+    const result = await pull()
+    assert.deepEqual(stored(), { '310': '5.00', '810': '1.00' })
+    assert.match(result.errors.join(' '), /TB_CHART_CHANGED_DURING_PULL.*631/)
+    assert.equal(chartReads, 2, 'chart before, chart after')
+  })
+})
+
+test('RACE: the code gaining a second holder in between also refuses it (uniqueness is compared too)', async () => {
+  trialBalance = reportWith(idless('Inventory Control (631)', '500'), idless('Cost of Goods Sold (310)', '5'), idless('Income in Advance (810)', '1'))
+  await withChart([acct('a-631', '631'), acct('a-310', '310'), acct('a-810', '810')], async () => {
+    chartAfter = [acct('a-631', '631'), acct('a-OLD', '631', 'ARCHIVED'), acct('a-310', '310'), acct('a-810', '810')]
+    const result = await pull()
+    assert.deepEqual(stored(), { '310': '5.00', '810': '1.00' })
+    assert.match(result.errors.join(' '), /TB_CHART_CHANGED_DURING_PULL.*631/)
+  })
+})
+
+test('RACE: an unchanged chart across both reads stores everything and the pull reads the chart twice', async () => {
+  trialBalance = realReport()
+  const result = await pull()
+  assert.deepEqual(result.errors, [])
+  assert.equal(chartReads, 2)
 })

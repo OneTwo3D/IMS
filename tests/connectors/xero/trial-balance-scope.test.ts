@@ -75,12 +75,12 @@ test('a known grant lacking the scope is refused by name and makes no HTTP call'
 test('an unrecorded grant fails open and attempts the call', async () => {
   granted = null
   await pull()
-  assert.equal(getCalls.length, 2) // the Trial Balance, then the current chart of accounts
-  assert.match(getCalls[0]!, /^Reports\/TrialBalance\?date=2026-10-19/)
+  assert.equal(getCalls.length, 3) // the current chart, the Trial Balance, the current chart again
+  assert.match(getCalls[1]!, /^Reports\/TrialBalance\?date=2026-10-19/)
 })
 
 test('a grant that includes the scope proceeds to the call', async () => {
   granted = [...XERO_REQUESTED_SCOPES]
   await pull()
-  assert.equal(getCalls.length, 2)
+  assert.equal(getCalls.length, 3)
 })

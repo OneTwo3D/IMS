@@ -439,6 +439,29 @@ export function resolveConfiguredAccounts(codes: string[], chart: XeroChartAccou
   return { accounts, errors }
 }
 
+/**
+ * Resolve against the chart read AFTER the Trial Balance, and accept an account only if the chart read BEFORE it resolves the
+ * same code to the same holder (same account id, same code-uniqueness). A code Xero moved between the two reads could otherwise
+ * attach an id-less row of the old account to the new one. A row's own account id still decides on its own.
+ *
+ * ACCEPTED LIMIT: a change that lands and is reverted between the two chart reads cannot be seen.
+ */
+export function resolveConfiguredAccountsStable(codes: string[], before: XeroChartAccount[], after: XeroChartAccount[]): { accounts: MatchedAccount[]; errors: string[] } {
+  const first = resolveConfiguredAccounts(codes, before)
+  const second = resolveConfiguredAccounts(codes, after)
+  const accounts: MatchedAccount[] = []
+  const errors = [...second.errors]
+  for (const account of second.accounts) {
+    const earlier = first.accounts.find((candidate) => candidate.code === account.code)
+    if (!earlier || earlier.externalAccountId !== account.externalAccountId || earlier.codeUnique !== account.codeUnique) {
+      errors.push(`TB_CHART_CHANGED_DURING_PULL: the Xero chart changed for configured account code ${account.code} while the Trial Balance was being read; nothing was stored for it. Pull again.`)
+      continue
+    }
+    accounts.push(account)
+  }
+  return { accounts, errors }
+}
+
 export async function syncXeroAccountBalanceSnapshots(
   options: SyncXeroAccountBalanceSnapshotsOptions = {},
 ): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
@@ -471,6 +494,10 @@ export async function syncXeroAccountBalanceSnapshots(
   }
 
   const balanceDate = balanceDateString(options.balanceDate ?? new Date())
+  // The chart is read BEFORE and AFTER the Trial Balance (see resolveConfiguredAccountsStable): a code that Xero moves to another
+  // account while the report is in flight is refused rather than attached to the wrong account.
+  const chartBefore = await fetchXeroChartOfAccounts()
+  if (!chartBefore.ok) return { fetched: 0, persisted: 0, skipped: 0, errors: [`Failed to fetch the current Xero chart of accounts: ${chartBefore.error}`] }
   let res
   try {
     // xeroGet routes through connectorFetch, which applies the connector
@@ -488,7 +515,7 @@ export async function syncXeroAccountBalanceSnapshots(
   // for it. The same fetch refreshes the local chart below, in the same fenced transaction as the balances.
   const chart = await fetchXeroChartOfAccounts()
   if (!chart.ok) return { fetched: 0, persisted: 0, skipped: 0, errors: [`Failed to fetch the current Xero chart of accounts: ${chart.error}`] }
-  const { accounts, errors: chartErrors } = resolveConfiguredAccounts([...new Set(requestedCodes)], chart.accounts)
+  const { accounts, errors: chartErrors } = resolveConfiguredAccountsStable([...new Set(requestedCodes)], chartBefore.accounts, chart.accounts)
   const parsedTrialBalance = parseXeroTrialBalanceReport(res.data)
   if (parsedTrialBalance.reportError) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: [parsedTrialBalance.reportError] }

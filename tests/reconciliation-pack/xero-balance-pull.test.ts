@@ -105,11 +105,12 @@ test('ZERO EXTRA CALLS: the request count is identical with and without Unearned
   chart = FULL_CHART.filter((account) => account.code !== '260')
   await pull()
   assert.deepEqual({ gets: getCalls, cached: cachedCalls }, withUnearned)
-  // Two GETs since the pull resolves the configured codes against the CURRENT chart (Accounts) as well as the Trial Balance;
-  // adding an account to the list still adds none.
-  assert.equal(withUnearned.gets.length, 2)
-  assert.match(withUnearned.gets[0]!, /^Reports\/TrialBalance\?date=2026-10-19$/)
-  assert.equal(withUnearned.gets[1], 'Accounts')
+  // Three GETs: the pull brackets the Trial Balance with two reads of the CURRENT chart (Accounts), so a code Xero moves while the
+  // report is in flight is caught; adding an account to the list still adds none.
+  assert.equal(withUnearned.gets.length, 3)
+  assert.equal(withUnearned.gets[0], 'Accounts')
+  assert.match(withUnearned.gets[1]!, /^Reports\/TrialBalance\?date=2026-10-19$/)
+  assert.equal(withUnearned.gets[2], 'Accounts')
   assert.equal(withUnearned.cached.length, 1)
 })
 
