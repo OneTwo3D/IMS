@@ -8,7 +8,7 @@
  *
  * THE LEGS. Qoblex: the products of the export (qoblex-source.ts). WooCommerce: the full proven double walk of the storefront's top-level
  * products (woo-source.ts readWooProducts, GET only, behind --vendor-reads-only). IMS: every product, read with the rest in one read-only
- * snapshot. The 3PL's warehouse system: an injected SKU-list port; there is none on a build without that source, and then that leg is
+ * snapshot. The 3PL's warehouse system: the SKU-list port of wms-skus.ts, which hands over the census R1 reads (one read per run, shared); if it is absent or fails, that leg is
  * LEG_UNAVAILABLE: the other three are still compared and a finding among them still fails the item, but the item never passes.
  * A leg that cannot be read for any other reason makes the whole item inconclusive with that reason.
  *

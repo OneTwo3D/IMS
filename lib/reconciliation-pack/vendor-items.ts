@@ -51,7 +51,7 @@ import {
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
 import { runWmsItem } from '@/lib/reconciliation-pack/wms-items'
-import type { WmsReadPort, WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
+import type { WmsReadPort, WmsReadSession, WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
 import { readWooOrders, readWooTaxRates, type WooGetPort, type WooOrderRow, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 import { normaliseWcOrderStatus, resolveWcPullStatuses } from '@/lib/connectors/woocommerce/order-status-filter'
 
@@ -77,6 +77,8 @@ export type VendorItemContext = {
   wooOptions?: WooSourceOptions
   /** Test seam for the warehouse system's pacing and budget. */
   wmsOptions?: WmsSourceOptions
+  /** The run's shared warehouse-system read (R1 and R14 share it). */
+  wmsSession?: WmsReadSession
   /** R1 and R9 (the items that settle): the state carried from the previous report and the stream stamp of this run (set by runItems). Absent = no stamp, so R9 is inconclusive STALE_BASIS and never a pass. */
   settling?: SettlingInput
 }
@@ -275,7 +277,7 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
 export async function runVendorItem(id: VendorItemId, context: VendorItemContext): Promise<ItemInput> {
   if (context.vendorReads !== true) return { id, outcome: 'inconclusive', reasons: ['VENDOR_READS_OFF'] }
   try {
-    if (id === 'R1') return await runWmsItem({ vendorReads: context.vendorReads, wms: context.vendor?.wms, ims: context.ims, wmsOptions: context.wmsOptions, settling: context.settling })
+    if (id === 'R1') return await runWmsItem({ vendorReads: context.vendorReads, wms: context.vendor?.wms, ims: context.ims, wmsOptions: context.wmsOptions, wmsSession: context.wmsSession, settling: context.settling })
     return id === 'R9' ? await runR9(context) : await runR13(context)
   } catch {
     return inconclusive(id, [], 'INTERNAL_ERROR')

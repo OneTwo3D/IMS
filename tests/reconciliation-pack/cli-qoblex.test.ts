@@ -93,7 +93,7 @@ test('WITH --qoblex-export: R2 and R5 pass on agreeing data, R14 is not a pass w
   assert.equal(await run(r, args(dir, '--qoblex-export', exportDir, '--vendor-reads-only')), 5)
   assert.equal(line(r, 'R2'), 'R2 pass -')
   assert.equal(line(r, 'R5'), 'R5 pass -')
-  assert.equal(line(r, 'R14'), 'R14 inconclusive LEG_UNAVAILABLE')
+  assert.equal(line(r, 'R14'), 'R14 inconclusive LEG_UNAVAILABLE,SOURCE_UNREADABLE', 'no usable Mintsoft source in this rig: the leg is unavailable with the source\'s own reason')
   assert.ok(!r.sent.some((sql) => /\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|GRANT|COMMIT)\b/i.test(sql)), 'nothing was written to the database')
   assert.ok(r.sent.every((sql) => /^\s*(SELECT|SET LOCAL|BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|ROLLBACK)/i.test(sql)), r.sent.filter((sql) => !/^\s*(SELECT|SET LOCAL|BEGIN|ROLLBACK)/i.test(sql)).join('\n'))
   const chain = readPackChain(dir)

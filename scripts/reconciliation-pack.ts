@@ -36,7 +36,7 @@ import { createMintsoftReadPort, readMintsoftPackCredentials } from '../lib/conn
 import { createWooGetPort } from '../lib/reconciliation-pack/woo-transport.ts'
 import { readWooCredentials } from '../lib/reconciliation-pack/woo-credentials.ts'
 import type { VendorPorts } from '../lib/reconciliation-pack/vendor-items.ts'
-import type { WmsReadPort } from '../lib/reconciliation-pack/wms-source.ts'
+import { createWmsReadSession, type WmsReadPort } from '../lib/reconciliation-pack/wms-source.ts'
 import type { WooGetPort } from '../lib/reconciliation-pack/woo-source.ts'
 import { memoisedInvariant, readLivenessSafe, runItems, type BasisPort, type ItemRunner, type LedgerRunner, type LivenessPort } from '../lib/reconciliation-pack/run.ts'
 import { readPackChain } from '../lib/reconciliation-pack/trend.ts'
@@ -62,7 +62,7 @@ export type PackCliDeps = {
   ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
   /** The WooCommerce port. Consulted ONLY with --vendor-reads-only; the default is the GET-only transport (woo-transport.ts). */
   woo?: WooGetPort
-  /** R14's SKU list from the 3PL's warehouse system. There is none on this build (that source is separate); absent means that leg is not compared (LEG_UNAVAILABLE). */
+  /** A SKU list for R14's warehouse-system leg (a test seam). Absent = the proven census R1 reads, through the run's shared session. */
   wmsSkus?: SkuListPort
   /** The warehouse-system port (R1). Consulted ONLY with --vendor-reads-only; the default is the GET-only, fixed-key reader (lib/connectors/mintsoft/reconciliation-read.ts). */
   wms?: WmsReadPort
@@ -231,6 +231,8 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
         wms: deps.wms ?? createMintsoftReadPort({ readCredentials: () => readStoredMintsoftCredentials(deps) }),
       }
       : undefined
+    // ONE read of the warehouse system per run, shared by R1 and R14 (wms-source.ts createWmsReadSession): R14 adds no request to R1's.
+    const wmsSession = vendor?.wms === undefined ? undefined : createWmsReadSession(vendor.wms)
 
     const { items, streams } = await runItems({
       phase: args.phase,
@@ -242,7 +244,7 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       ledgerRunners: deps.ledgerRunners,
       // What the previous report carries for each item that settles, from the chain read above (trusted, or the run stopped).
       carried: Object.fromEntries(PACK_ITEM_IDS.filter((id) => getPackItem(id).settles).map((id) => [id, carriedStateFromChain(chain, id, { phase: args.phase, systemIdentifier: systemIdentifier! })])) as Partial<Record<PackItemId, CarriedState>>,
-      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor, qoblex, skuExclusions: exclusions.file, wmsSkus: args.vendorReadsOnly ? deps.wmsSkus : undefined },
+      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor, wmsSession, qoblex, skuExclusions: exclusions.file, wmsSkus: args.vendorReadsOnly ? deps.wmsSkus : undefined },
     })
     const finishedAt = deps.now()
     const published = publishPackReport(reportDir, {

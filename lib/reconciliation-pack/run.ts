@@ -29,6 +29,8 @@ import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconcilia
 import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
 import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
+import { wmsSkuListPort } from '@/lib/reconciliation-pack/wms-skus'
+import { createWmsReadSession, type WmsReadSession } from '@/lib/reconciliation-pack/wms-source'
 import { runCoverageItem, type SkuListPort } from '@/lib/reconciliation-pack/coverage-items'
 import { runQoblexItem, type QoblexItemId } from '@/lib/reconciliation-pack/qoblex-items'
 import type { QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
@@ -66,9 +68,11 @@ export type RunContext = {
   qoblex?: QoblexSource
   /** The SKU-coverage exclusions R14 uses (sku-exclusions.ts). Absent = none. */
   skuExclusions?: SkuExclusionFile
-  /** The 3PL warehouse system's SKU list for R14. Absent = that leg is not compared (LEG_UNAVAILABLE). */
+  /** An injected SKU list for R14's warehouse-system leg (tests). Absent = the proven census R1 reads, through the shared session. */
   wmsSkus?: SkuListPort
   wmsOptions?: WmsSourceOptions
+  /** The run's one shared read of the warehouse system (created by the command; R1 and R14 share it). Absent = each item reads for itself. */
+  wmsSession?: WmsReadSession
   /**
    * Only for an item that settles (its catalogue row), and set per item by runItems, never by the caller: the state carried from the
    * previous report and the stream stamp this run's start read saw. Absent on any other item.
@@ -97,11 +101,17 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromInvariant = (id: 'R3' | 'R4' | 'R15'): ItemRunner => async (context) =>
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
   const fromVendor = (id: 'R1' | 'R9' | 'R13'): ItemRunner => (context) =>
-    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, wmsOptions: context.wmsOptions, settling: context.settling })
+    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, wmsOptions: context.wmsOptions, wmsSession: context.wmsSession, settling: context.settling })
   const fromQoblex = (id: QoblexItemId): ItemRunner => (context) => runQoblexItem(id, { asOf: context.asOf, ims: context.ims, qoblex: context.qoblex })
+  // R14's warehouse-system leg: an injected list wins (a test double); otherwise the proven census R1 reads, shared through the run's session.
+  const wmsLeg = (context: RunContext): SkuListPort | undefined => context.wmsSkus ?? (
+    context.vendorReads === true && context.vendor?.wms !== undefined && context.ims !== undefined
+      ? wmsSkuListPort({ session: context.wmsSession ?? createWmsReadSession(context.vendor.wms, context.wmsOptions), ims: context.ims })
+      : undefined
+  )
   const coverage: ItemRunner = (context) => runCoverageItem({
     asOf: context.asOf, now: context.now, vendorReads: context.vendorReads, woo: context.vendor?.woo, wooOptions: context.wooOptions,
-    ims: context.ims, qoblex: context.qoblex, wms: context.wmsSkus, exclusions: context.skuExclusions,
+    ims: context.ims, qoblex: context.qoblex, wms: wmsLeg(context), exclusions: context.skuExclusions,
   })
   return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R2: fromQoblex('R2'), R5: fromQoblex('R5'), R14: coverage }
 }
