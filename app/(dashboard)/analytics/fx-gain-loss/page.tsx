@@ -15,7 +15,8 @@ const columns: Array<FinanceAnalyticsColumn<FxGainLossReportRow>> = [
   { key: 'foreign', label: 'Foreign amount', align: 'right', render: (row) => row.amountForeign },
   { key: 'bookedRate', label: 'Booked rate', align: 'right', render: (row) => row.bookedRateToBase },
   { key: 'settlementRate', label: 'Settlement rate', align: 'right', render: (row) => row.settlementRateToBase },
-  { key: 'gainLoss', label: 'Gain/loss', align: 'right', render: (row) => row.gainLossBase },
+  { key: 'gainLoss', label: 'Gain/loss', align: 'right', render: (row) => (row.outcome === 'not_computable' ? 'Not computable' : row.gainLossBase) },
+  { key: 'reason', label: 'Why not computable', render: (row) => row.notComputableReason ?? '' },
   { key: 'account', label: 'FX account', render: (row) => row.fxGainLossAccount || 'Unconfigured' },
 ]
 
@@ -38,6 +39,7 @@ export default async function FxGainLossAnalyticsPage({ searchParams }: Props) {
         { label: 'Gains', value: report.totals.gainsBase ?? '0' },
         { label: 'Losses', value: report.totals.lossesBase ?? '0' },
         { label: 'Rows', value: report.totals.rowCount ?? '0' },
+        { label: 'Not computable (no rate)', value: report.totals.unconvertedCount ?? '0' },
       ]}
       notices={report.notices}
     />

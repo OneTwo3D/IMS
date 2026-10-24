@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { fakeFxClient } from '../helpers/fx-fake-client'
+
 /**
  * o3d-j625 r2 (Codex MEDIUM 1) — THE FX REVERSAL'S ACCOUNT CODES COME OUT OF A HISTORIC ROW, SO ITS
  * CHART IS THAT ROW'S CONNECTOR AND NOT THE SETTINGS OBJECT BESIDE THE ENQUEUE.
@@ -100,7 +102,7 @@ const TODAYS_REVALUATION = {
 mock.module('@/lib/accounting', {
   namedExports: {
     getAccountingSettings: async () => settings,
-    queueAccountingSync: async (params: {
+    queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: {
       type: string
       payload: Record<string, unknown>
       chartConnector: unknown
@@ -141,7 +143,8 @@ mock.module('@/lib/db', {
       // `resolveSettlementFxRateToBase` reads `fxRate` on it. `null` makes it fall back to the balance's
       // own booked rate, which is all this file needs.
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
-        fxRate: { groupBy: async () => [], findMany: async () => [] },
+        // o3d-q0x56.4: a missing rate now SKIPS the document, so the USD balance below is given the rate it used to fall back to.
+        fxRate: fakeFxClient([{ fromCurrency: 'GBP', toCurrency: 'USD', rate: '0.8', fetchedAt: new Date('2020-01-01T00:00:00.000Z') }]).fxRate,
         // ...and it records a WARNING when it falls back, through the same transaction.
         activityLog: { create: async () => ({ id: 'activity-1' }) },
       }),

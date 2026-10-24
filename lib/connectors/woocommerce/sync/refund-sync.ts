@@ -5,6 +5,8 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { resolveBaseCurrencyCode } from '@/lib/base-currency'
+import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
@@ -26,7 +28,9 @@ export type WcRefundSyncDependencies = {
   // o3d-w00 (Codex r7 #5): the identity an ITEMISED refund line will be re-grossed under is priced by
   // the WRITER now, inside the refund transaction, so this sync reads no tax rates of its own — it
   // states the VAT WooCommerce reported per refunded line and lets the fence there act on it.
-  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | '$transaction'>
+  // `organisation` is read only when the order's stored FX rate is unusable (to tell a base-currency order, rate 1,
+  // from a foreign one that must be refused): a refund on an order with a usable rate never touches it.
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | '$transaction'> & Partial<Pick<typeof db, 'organisation'>>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -671,6 +675,9 @@ export async function syncWcRefund(
         id: true,
         externalOrderNumber: true,
         fxRateToBase: true,
+        // o3d-q0x56.8: the ORDER's currency, read only to tell a base-currency order (rate 1 by definition) from a
+        // foreign one whose stored rate is missing. The shipping identity is still resolved by the writer, not here.
+        currency: true,
         // o3d-w00 (Codex r7 #5): currency and taxRateName are NOT read here any more. r6 resolved and
         // priced the shipping identity in this function; the writer does it now, from its own locked
         // read, so reading them here would only be a second, staler copy of the same two columns.
@@ -779,7 +786,44 @@ export async function syncWcRefund(
       return { outcome: 'handled-unapplied-resolvable', error: `WooCommerce refund ${wcRefund.id} is quarantined for this order and awaits manual resolution` }
     }
 
-    const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
+    // o3d-q0x56.8 - THE ORDER'S BOOKED RATE, OR THE REFUND IS PARKED WITH A NAMED REASON. A foreign order whose stored
+    // rate is not a positive number used to convert every refund line at 1; and a refusal that merely returned would
+    // have dropped the refund (the webhook is acknowledged, and nothing would hold it). So the refusal goes through
+    // the same mechanism as the other deliberate, non-transient refusals just below (`resolveMonetaryRefundVatRate`):
+    // a QUARANTINED park (`upsertRefundPark`, a `shopping_sync_logs` row) that the sweep skips and the sync-exceptions
+    // inbox lists with this message, reported as `quarantined-refusal` (operator-resolvable, so a caller holds its
+    // delivery). The operator corrects the order's exchange rate and records the refund from the inbox. No table
+    // rate is looked up: the refund reverses what was booked.
+    let fxRate: Decimal
+    try {
+      fxRate = await resolveStoredFxRateToBase({
+        currency: so.currency,
+        baseCurrency: () => resolveBaseCurrencyCode({ organisation: (client as { organisation?: typeof db.organisation }).organisation ?? db.organisation }),
+        storedRate: so.fxRateToBase,
+        document: `Order ${so.externalOrderNumber ?? so.id}`,
+      })
+    } catch (error) {
+      if (!isMissingStoredFxRateError(error)) throw error
+      const message = `WooCommerce refund ${wcRefund.id} was NOT recorded: ${error.message}`
+      await upsertRefundPark(client, {
+        soId: so.id,
+        externalId: String(wcRefund.id),
+        status: 'QUARANTINED',
+        errorMessage: message,
+        payload: wcRefund,
+      })
+      await writeActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'refund_sync_missing_order_fx_rate',
+        tag: 'sync',
+        level: 'ERROR',
+        description: message,
+        metadata: { externalRefundId: wcRefund.id, currency: error.currency, baseCurrency: error.baseCurrency },
+        resolveUser: false,
+      })
+      return { outcome: 'quarantined-refusal', error: message }
+    }
     const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
 
     // Determine if restock is needed

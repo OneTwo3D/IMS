@@ -137,8 +137,9 @@ test('[o3d-j625] every facade accounting enqueue in app/ and lib/ names the char
   // fail this test for the wrong reason.
   assert.ok(
     // o3d-j625 r6: 11 — the stock adjustment moved into the caller's transaction (review M3). The floor is the count.
-    sites.length >= 11,
-    `expected to find the 11 facade enqueue call sites, found `
+    // o3d-q0x56.4: 9 - the AR/AP revaluation's two enqueues moved into one transaction per side (transactional census).
+    sites.length >= 9,
+    `expected to find the 9 facade enqueue call sites, found `
     + `${sites.length}. The detector is not examining the source it claims to.`,
   )
 
@@ -170,7 +171,6 @@ test('[o3d-j625] the census names the sites it examined, so a shrinking sweep is
   for (const expected of [
     'app/actions/purchase-orders.ts',
     'app/actions/sales.ts',
-    'lib/accounting-fx-revaluation.ts',
     'lib/accounting/tax-rate-sync-trigger.ts',
     'lib/connectors/woocommerce/sync/order-import.ts',
     // (lib/domain/inventory/stock-adjustment-apply.ts moved to the transactional census in r6, review M3.)
@@ -548,6 +548,7 @@ test('[o3d-j625 r2] the transactional census names the files it examined, so a s
     'app/actions/manufacturing.ts',
     'app/actions/purchase-orders.ts',
     'app/actions/sales.ts',
+    'lib/accounting-fx-revaluation.ts',
     'lib/accounting.ts',
     'lib/cost-layers.ts',
     'lib/domain/accounting/invoice-payment-enqueue.ts',

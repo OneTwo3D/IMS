@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+
+import { fakeFxClient } from '../helpers/fx-fake-client'
 import { createSyncLogStore, matchesWhere, syncLogRow, type SyncLogRow } from '@/tests/fixtures/accounting-sync-log-store'
 
 /**
@@ -32,7 +34,7 @@ mock.module('@/lib/accounting', {
       unrealisedFxGainLossAccount: 'xero-UFX',
       realisedFxGainLossAccount: 'xero-RFX',
     }),
-    queueAccountingSync: async (params: { payload: Record<string, unknown>; chartConnector: unknown }) => {
+    queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: { payload: Record<string, unknown>; chartConnector: unknown }) => {
       enqueued.push({ kind: params.payload.kind, chartConnector: params.chartConnector })
       return { queued: true, connector: params.chartConnector }
     },
@@ -103,7 +105,8 @@ mock.module('@/lib/db', {
       },
       purchaseInvoice: { findMany: async () => [] },
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
-        fxRate: { groupBy: async () => [], findMany: async () => [] },
+        // o3d-q0x56.4: a missing rate now SKIPS the document, so the USD balance below is given the rate it used to fall back to.
+        fxRate: fakeFxClient([{ fromCurrency: 'GBP', toCurrency: 'USD', rate: '0.8', fetchedAt: new Date('2020-01-01T00:00:00.000Z') }]).fxRate,
         activityLog: { create: async () => ({ id: 'a-1' }) },
       }),
     },

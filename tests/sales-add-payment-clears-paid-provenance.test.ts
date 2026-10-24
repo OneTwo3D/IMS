@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { toDecimal } from '@/lib/domain/math/decimal'
+import { fakeFxClient } from './helpers/fx-fake-client'
 
 /**
  * o3d-psrx r5 (Codex HIGH 1, second half) — A RECEIPT REPLACES THE OFF-LEDGER PROVENANCE, INCLUDING
@@ -78,7 +79,8 @@ const tx = {
     },
   },
   salesOrderRefund: { findFirst: async (): Promise<{ totalForeign: number } | null> => null },
-  fxRate: { groupBy: async () => [], findMany: async () => [] },
+  // o3d-q0x56.4: a foreign receipt REFUSES without a rate, so the CLF orders below are given one.
+  fxRate: fakeFxClient([{ fromCurrency: 'GBP', toCurrency: 'CLF', rate: '0.03', fetchedAt: new Date('2026-01-01T00:00:00.000Z') }]).fxRate,
   activityLog: { create: async () => ({}) },
 }
 

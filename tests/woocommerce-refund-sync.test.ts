@@ -304,6 +304,8 @@ function makeDependencies(options: {
           return { id: 'return-wh' }
         },
       },
+      // o3d-q0x56.8: read only when the order's stored FX rate is unusable (base-currency vs foreign).
+      organisation: { async findFirst() { return { baseCurrency: 'GBP' } } },
       // o3d-w00 (Codex r7 #5): NO taxRate double. The sync no longer reads the tax table at all — the
       // identity an itemised refund line posts under is resolved and priced by the writer, from its own
       // read inside the refund transaction. A double that still offered one would let a regression
@@ -1668,4 +1670,53 @@ test('the park the sweep writes carries the stamp the recovery inbox selects on 
     true,
     'and in an actionable status, or the inbox never shows it',
   )
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-q0x56.8 - a missing STORED rate on the order: the refund is PARKED with a named reason, never lost, never at 1
+// ---------------------------------------------------------------------------------------------------
+
+test('[q0x56.8] a refund on a FOREIGN order with no usable stored rate is QUARANTINED with a named reason, not dropped and not converted at 1', async () => {
+  for (const fxRateToBase of [0, -2, null]) {
+    const state = makeDependencies({
+      alwaysMissExistingRefund: true,
+      order: { currency: 'USD', fxRateToBase } as unknown as Partial<OrderDouble>,
+    })
+    const refund = makeRefund({ id: 7301 })
+
+    const result = await syncWcRefund(1001, refund, state.dependencies)
+
+    assert.equal(result.outcome, 'quarantined-refusal', String(fxRateToBase))
+    assert.equal(refundOutcomeFailed(result.outcome), true, 'reported to the caller as a failure')
+    assert.equal(refundMayStillReachIms(result.outcome), true, 'operator-resolvable, so a delivery is held for it')
+    assert.match(result.error ?? '', /WooCommerce refund 7301 was NOT recorded: Order WC-1001 is in USD but has no usable stored FX rate to GBP/)
+    assert.equal(state.createRefundCalls, 0, 'no refund is created, so nothing is converted')
+    assert.equal(state.refunds.length, 0)
+    const park = state.syncLogs.at(-1) as { data?: { status?: string; externalId?: string; entityId?: string; errorMessage?: string; payload?: unknown } }
+    assert.equal(park?.data?.status, 'QUARANTINED', 'parked in the exception inbox mechanism, not lost')
+    assert.equal(park?.data?.externalId, '7301')
+    assert.equal(park?.data?.entityId, 'so-1')
+    assert.match(String(park?.data?.errorMessage), /correct the document's exchange rate/)
+    assert.ok(state.activityLogs.some((a) => (a as { action?: string }).action === 'refund_sync_missing_order_fx_rate'), 'and named in the activity log')
+  }
+})
+
+test('[q0x56.8] a refund on a BASE-currency order with no usable stored rate is applied (currency === base is 1)', async () => {
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { currency: 'GBP', fxRateToBase: 0 } as unknown as Partial<OrderDouble>,
+  })
+  const result = await syncWcRefund(1001, makeRefund({ id: 7302 }), state.dependencies)
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal(state.createRefundCalls, 1)
+})
+
+test('[q0x56.8] a refund on a foreign order with a usable stored rate converts at THAT rate', async () => {
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { currency: 'USD', fxRateToBase: 1.25 } as unknown as Partial<OrderDouble>,
+  })
+  const result = await syncWcRefund(1001, makeRefund({ id: 7303 }), state.dependencies)
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal(state.createRefundLines[0].totalBase, 10, '12.50 foreign / the booked 1.25')
 })

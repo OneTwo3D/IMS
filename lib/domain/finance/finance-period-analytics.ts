@@ -1,5 +1,5 @@
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
-import { computeRealisedFx, type FxSettlementSide } from '@/lib/accounting-fx'
+import { computeRealisedFx, describeFxRefusal, settlementAsOfFromStored, type FxSettlementSide } from '@/lib/accounting-fx'
 import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
@@ -89,6 +89,8 @@ export type FxGainLossReportTotals = {
   gainsBase: string
   lossesBase: string
   rowCount: string
+  /** Settlements with NO usable settlement rate: listed, with the reason, and excluded from the three totals above. */
+  unconvertedCount: string
 }
 
 export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
@@ -96,7 +98,7 @@ export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
   arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
   apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
   currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0' } satisfies CurrencySummaryReportTotals,
-  fxGainLoss: { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0' } satisfies FxGainLossReportTotals,
+  fxGainLoss: { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0', unconvertedCount: '0' } satisfies FxGainLossReportTotals,
 } as const
 
 export type VatReportRow = {
@@ -140,7 +142,9 @@ export type FxGainLossReportRow = {
   bookedBase: string
   settlementBase: string
   gainLossBase: string
-  outcome: 'gain' | 'loss' | 'none'
+  /** `not_computable`: no usable settlement rate. Rate, base and gain/loss are then empty (never a value at 1), and `notComputableReason` says why. */
+  outcome: 'gain' | 'loss' | 'none' | 'not_computable'
+  notComputableReason: string | null
   controlAccount: string
   fxGainLossAccount: string
 }
@@ -431,19 +435,25 @@ function bucketAmount(age: number, amount: Prisma.Decimal, buckets: [number, num
 /**
  * The settlement rate for one document: the central rule (lib/currencies/fx-lookup.ts `selectFxRateFromRows`) over the
  * rows `loadFxRates` pre-read, because each payment/invoice has its own `asOf` (a batch at one instant does not fit).
- * Only a MISSING row falls back to the document's booked rate; a row that exists but is unusable (zero, negative, an
- * ambiguous tie) refuses.
- * TODO(o3d-q0x56.4): the booked-rate fallback and the "non-positive becomes 1" guard below are removed there.
+ *
+ * A MISSING rate (`no_rate`, `invalid_currency`) is reported as `{ rate: null, reason }` so the row can say it is not
+ * computable; it is never replaced by the document's booked rate or by 1 (o3d-q0x56.4). A row that exists but is
+ * unusable (zero, negative, an ambiguous tie) still refuses the whole report. `asOf` is the stored settlement date
+ * read the way the payment read it (`settlementAsOfFromStored`).
  */
-function latestRateToBase(rates: FxRateRow[], baseCurrency: string, currency: string, asOf: Date, fallback: DecimalInput): Prisma.Decimal {
-  if (currency === baseCurrency) return new Prisma.Decimal(1)
+function settlementRateToBase(
+  rates: FxRateRow[],
+  baseCurrency: string,
+  currency: string,
+  paidAt: Date,
+): { rate: Prisma.Decimal; reason: null } | { rate: null; reason: string } {
+  if (currency === baseCurrency) return { rate: new Prisma.Decimal(1), reason: null }
   try {
-    return selectFxRateFromRows(rates, { baseCurrency, currency, asOf }).rate
+    return { rate: selectFxRateFromRows(rates, { baseCurrency, currency, asOf: settlementAsOfFromStored(paidAt) }).rate, reason: null }
   } catch (error) {
     if (!(isMissingFxRateError(error) && (error.reason === 'no_rate' || error.reason === 'invalid_currency'))) throw error
+    return { rate: null, reason: describeFxRefusal(error) }
   }
-  const value = toDecimal(fallback)
-  return value.gt(0) ? value : new Prisma.Decimal(1)
 }
 
 export async function getVatReport(
@@ -1077,9 +1087,32 @@ export async function getFxGainLossReport(
 
   const rows: FxGainLossReportRow[] = []
   for (const payment of payments) {
-    const settlementRate = latestRateToBase(fxRates, baseCurrency, payment.currency, payment.paidAt, payment.order.fxRateToBase)
+    const settlement = settlementRateToBase(fxRates, baseCurrency, payment.currency, payment.paidAt)
     const paymentForeign = toDecimal(payment.amount).abs()
     const orderTotalForeign = toDecimal(payment.order.totalForeign)
+    if (settlement.rate === null) {
+      rows.push({
+        side: 'receivable',
+        settlementId: payment.id,
+        documentId: payment.order.id,
+        reference: payment.order.invoiceNumber ?? payment.order.orderNumber ?? payment.order.id,
+        partyName: payment.order.customerName ?? payment.order.customerEmail ?? 'Unknown customer',
+        currency: payment.currency,
+        paidAt: payment.paidAt.toISOString(),
+        amountForeign: qtyString(paymentForeign),
+        bookedRateToBase: qtyString(payment.order.fxRateToBase),
+        settlementRateToBase: '',
+        bookedBase: '',
+        settlementBase: '',
+        gainLossBase: '',
+        outcome: 'not_computable',
+        notComputableReason: settlement.reason,
+        controlAccount: settings.accountsReceivableAccount,
+        fxGainLossAccount: settings.realisedFxGainLossAccount,
+      })
+      continue
+    }
+    const settlementRate = settlement.rate
     const result = computeRealisedFx({
       side: 'receivable',
       amountForeign: paymentForeign.toNumber(),
@@ -1106,13 +1139,37 @@ export async function getFxGainLossReport(
       settlementBase: moneyString(result.settlementBase, baseCurrency),
       gainLossBase: moneyString(result.gainLossBase, baseCurrency),
       outcome: result.outcome,
+      notComputableReason: null,
       controlAccount: settings.accountsReceivableAccount,
       fxGainLossAccount: settings.realisedFxGainLossAccount,
     })
   }
   for (const invoice of purchaseInvoices) {
     if (!invoice.paidAt) continue
-    const settlementRate = latestRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt, invoice.fxRateToBase)
+    const settlement = settlementRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt)
+    if (settlement.rate === null) {
+      rows.push({
+        side: 'payable',
+        settlementId: invoice.id,
+        documentId: invoice.id,
+        reference: invoice.invoiceNumber ?? invoice.po.reference,
+        partyName: invoice.po.supplier.name,
+        currency: invoice.po.currency,
+        paidAt: invoice.paidAt.toISOString(),
+        amountForeign: qtyString(toDecimal(invoice.totalForeign).abs()),
+        bookedRateToBase: qtyString(invoice.fxRateToBase),
+        settlementRateToBase: '',
+        bookedBase: '',
+        settlementBase: '',
+        gainLossBase: '',
+        outcome: 'not_computable',
+        notComputableReason: settlement.reason,
+        controlAccount: settings.accountsPayableAccount,
+        fxGainLossAccount: settings.realisedFxGainLossAccount,
+      })
+      continue
+    }
+    const settlementRate = settlement.rate
     const result = computeRealisedFx({
       side: 'payable',
       amountForeign: toDecimal(invoice.totalForeign).abs().toNumber(),
@@ -1137,12 +1194,14 @@ export async function getFxGainLossReport(
       settlementBase: moneyString(result.settlementBase, baseCurrency),
       gainLossBase: moneyString(result.gainLossBase, baseCurrency),
       outcome: result.outcome,
+      notComputableReason: null,
       controlAccount: settings.accountsPayableAccount,
       fxGainLossAccount: settings.realisedFxGainLossAccount,
     })
   }
   rows.sort((a, b) => a.paidAt.localeCompare(b.paidAt) || a.reference.localeCompare(b.reference))
   const totals = rows.reduce((total, row) => {
+    if (row.outcome === 'not_computable') return total
     const value = toDecimal(row.gainLossBase)
     return {
       gainLossBase: total.gainLossBase.add(value),
@@ -1155,11 +1214,12 @@ export async function getFxGainLossReport(
     gainsBase: moneyString(totals.gainsBase, baseCurrency),
     lossesBase: moneyString(totals.lossesBase, baseCurrency),
     rowCount: String(rows.length),
+    unconvertedCount: String(rows.filter((row) => row.outcome === 'not_computable').length),
   }, [
     `FX gain/loss uses IMS FxRate semantics where rate means 1 ${baseCurrency} = foreign currency; base value is foreign amount divided by the rate, matching the Xero realised-FX posting helper.`,
     'Receivable FX rows are one row per Payment.id so partial settlements keep their own paidAt settlement rate; purchase-invoice rows remain one row per paid invoice because supplier partial payments are not modelled.',
     'Base-currency settlements are excluded from FX rows because they have no FX exposure; rowCount is therefore foreign-currency settlement count, not total settlement count.',
-    'Settlement rate is the latest FxRate row on or before paidAt, falling back to the document booking rate when no settlement rate exists.',
+    'Settlement rate is the latest FxRate row on or before the end of the paidAt day (an instant when paidAt carries a time). When no settlement rate exists the row is listed as NOT COMPUTABLE with the reason, shows no rate or gain/loss, and is excluded from the totals: it is never valued at the document booking rate or at 1. Add the rate in Settings -> Currencies to include it.',
     `Rows surface the configured realised FX account (${settings.realisedFxGainLossAccount || 'not configured'}) plus the AR/AP control account used by the Xero journal path.`,
   ], options.paginate !== false)
 }

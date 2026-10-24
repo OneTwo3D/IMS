@@ -106,6 +106,8 @@ import {
 import { refundedOrderLineId } from '@/lib/connectors/woocommerce/sync/refund-line-link'
 import type { WcRefundLineItem } from '@/lib/connectors/woocommerce/sync/types'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   buildTaxTypeRateIndex,
@@ -2847,7 +2849,20 @@ export async function recordRefundParkManually(
       loadRefundPostingTaxContext(),
     ])
 
-    const fxRate = toDecimal(order.fxRateToBase).gt(0) ? toDecimal(order.fxRateToBase) : toDecimal(1)
+    // o3d-q0x56.8: the order's BOOKED rate, or a refusal that leaves the park QUARANTINED and recordable once the
+    // order is corrected (nothing has been written yet). Never 1 for a missing rate; no table rate is looked up.
+    let fxRate: Decimal
+    try {
+      fxRate = await resolveStoredFxRateToBase({
+        currency: order.currency,
+        baseCurrency: getBaseCurrencyCode,
+        storedRate: order.fxRateToBase,
+        document: `Order ${order.id}`,
+      })
+    } catch (error) {
+      if (isMissingStoredFxRateError(error)) return { success: false, error: `This refund cannot be recorded: ${error.message}` }
+      throw error
+    }
     // The order-default identity, resolved exactly as createSalesOrderRefund resolves it.
     const orderDefaultTaxType = order.taxRateName
       ? postingTaxContext.activeTaxTypeByName.get(order.taxRateName) ?? null

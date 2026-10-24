@@ -1,6 +1,6 @@
 import type { AccountingSettings } from '@/lib/accounting'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { endOfBusinessDateUtc, getFxRateToBase, type MissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type FxSettlementSide = 'receivable' | 'payable'
@@ -139,50 +139,78 @@ export function getUnrealisedFxAccounts(settings: AccountingSettings, side: FxSe
   }
 }
 
+/**
+ * The rate a settlement or revaluation is measured at: the central `fx_rates` lookup, and nothing else.
+ *
+ * A MISSING rate REFUSES (owner ruling 2026-10-24): there is no default of 1, no fallback to the document's
+ * booked rate and no vendor rate. Every `MissingFxRateError` reason (`no_rate`, `invalid_currency`,
+ * `non_positive_rate`, `ambiguous_rate`, ...) propagates; callers decide what "refused" means for their own
+ * writes (see `describeFxRefusal` for the operator text).
+ *
+ * Only a base-currency document answers 1, and it does so because `currency === baseCurrency`, never because a
+ * value was missing. An EMPTY currency is not the base currency: it reaches the lookup and refuses.
+ *
+ * `asOf` must already be an instant. A date-only input (`YYYY-MM-DD`) is converted by the caller with
+ * `endOfBusinessDateUtc` (or `settlementAsOfFromInput`) so a rate fetched at 09:00 on that day is visible.
+ */
 export async function resolveSettlementFxRateToBase(
   tx: Prisma.TransactionClient,
   params: {
     currency: string
     baseCurrency: string
     asOf: Date
-    fallbackRateToBase: number
-    referenceType?: string
-    referenceId?: string
   },
 ): Promise<number> {
   const currency = params.currency.trim().toUpperCase()
   const baseCurrency = params.baseCurrency.trim().toUpperCase()
-  if (!currency || currency === baseCurrency) return 1
-  // The table read is the one central lookup. Only a MISSING row falls back to the caller's rate (below); a row
-  // that exists but is unusable (zero, negative, ambiguous tie) refuses rather than being papered over.
-  // TODO(o3d-q0x56.4): the fallback below is removed there; a missing rate then refuses.
-  let rate: Awaited<ReturnType<typeof getFxRateToBase>> | null = null
-  try {
-    rate = await getFxRateToBase(tx, { currency, asOf: params.asOf, baseCurrency })
-  } catch (error) {
-    // (a code that is not three letters can have no row either; it fell back before and still does)
-    if (!(isMissingFxRateError(error) && (error.reason === 'no_rate' || error.reason === 'invalid_currency'))) throw error
+  if (currency && currency === baseCurrency) return 1
+  const rate = await getFxRateToBase(tx, { currency, asOf: params.asOf, baseCurrency })
+  return rate.rate.toNumber()
+}
+
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * The `asOf` for an FX lookup from a user-supplied payment/valuation input.
+ *
+ * A date-only string (`YYYY-MM-DD`, what a date picker sends) names a BUSINESS DAY, so it maps to the end of that
+ * UTC day (`endOfBusinessDateUtc`); `new Date('2026-06-10')` is midnight and would hide every rate fetched that day.
+ * Anything else is a real instant and is used as it is (`fallback` when the input is absent: "now").
+ */
+export function settlementAsOfFromInput(input: string | Date | null | undefined, fallback: Date): Date {
+  if (typeof input === 'string' && DATE_ONLY.test(input)) return endOfBusinessDateUtc(input)
+  if (input instanceof Date) return input
+  if (typeof input === 'string' && input) return new Date(input)
+  return fallback
+}
+
+/**
+ * A stored settlement date that is EXACTLY midnight UTC is a date-only input that was stored as `new Date('YYYY-MM-DD')`
+ * (the payment form and the bill-payment form do this). Reports re-deriving the settlement rate must read it the way the
+ * payment did, i.e. as that business day; any other stored value is a real instant.
+ */
+export function settlementAsOfFromStored(paidAt: Date): Date {
+  if (
+    paidAt.getUTCHours() === 0 && paidAt.getUTCMinutes() === 0 && paidAt.getUTCSeconds() === 0 && paidAt.getUTCMilliseconds() === 0
+  ) return endOfBusinessDateUtc(paidAt)
+  return paidAt
+}
+
+/** The operator-facing sentence for a refused rate. Always says what to do: add the rate, or correct the document. */
+export function describeFxRefusal(error: MissingFxRateError): string {
+  const remedy = 'Add the rate in Settings -> Currencies (or correct the document), then retry.'
+  switch (error.reason) {
+    case 'no_rate':
+      return `${error.message}. ${remedy}`
+    case 'ambiguous_rate':
+      return `${error.message}: two different rates are stored for the same instant. Remove the wrong one in Settings -> Currencies, then retry.`
+    case 'non_positive_rate':
+    case 'non_finite_rate':
+      return `${error.message}: the stored rate is not a positive number. Correct it in Settings -> Currencies, then retry.`
+    case 'invalid_currency':
+    case 'invalid_base_currency':
+      return `${error.message}. Correct the document's currency, then retry.`
+    default:
+      return `${error.message}. ${remedy}`
   }
-  const resolved = rate ? rate.rate.toNumber() : Number(params.fallbackRateToBase)
-  if (!rate && Number.isFinite(resolved) && resolved > 0) {
-    await tx.activityLog.create({
-      data: {
-        entityType: 'SYSTEM',
-        entityId: params.referenceId ?? null,
-        action: 'fx_rate_fallback_used',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `Used fallback FX rate for ${currency} settlement on ${params.asOf.toISOString().slice(0, 10)}`,
-        metadata: {
-          currency,
-          baseCurrency,
-          settlementDate: params.asOf.toISOString().slice(0, 10),
-          fallbackRateToBase: resolved,
-          referenceType: params.referenceType ?? null,
-          referenceId: params.referenceId ?? null,
-        },
-      },
-    })
-  }
-  return Number.isFinite(resolved) && resolved > 0 ? resolved : 1
 }

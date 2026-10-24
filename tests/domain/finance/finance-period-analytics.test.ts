@@ -578,8 +578,79 @@ test('FX gain/loss: a stored zero rate refuses (it used to become 1)', async () 
   await assert.rejects(getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client)), /Invalid stored GBP FX rate for USD/)
 })
 
-test('FX gain/loss: no stored rate on or before the payment still falls back to the booked rate (unchanged; removed by the settlement task)', async () => {
+test('FX gain/loss: no stored rate on or before the payment lists the item as NOT COMPUTABLE with the reason, never at the booked rate or 1', async () => {
   const client = fxGainLossClient([{ rate: '1.1', at: '2026-06-11T00:00:00.000Z' }]) // after paidAt
   const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
-  assert.equal(report.rows[0]?.settlementRateToBase, '1.2')
+  const row = report.rows[0]
+  assert.equal(row?.outcome, 'not_computable')
+  assert.match(String(row?.notComputableReason), /Missing GBP FX rate for USD/)
+  assert.match(String(row?.notComputableReason), /Settings -> Currencies/)
+  assert.equal(row?.settlementRateToBase, '', 'no rate shown')
+  assert.equal(row?.settlementBase, '')
+  assert.equal(row?.gainLossBase, '', 'no value computed at the booked rate or at 1')
+  assert.equal(row?.bookedRateToBase, '1.2', 'the booked rate is shown as a fact about the document, not used')
+  assert.equal(report.totals.unconvertedCount, '1')
+  assert.equal(report.totals.rowCount, '1')
+  assert.equal(report.totals.gainLossBase, '0', 'the unconverted row adds nothing to the totals')
+  assert.equal(report.totals.lossesBase, '0')
+})
+
+test('FX gain/loss: computable and not-computable rows sit side by side and only the computable one is totalled', async () => {
+  const base = fxGainLossClient([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }])
+  const client: FinanceAnalyticsClient = {
+    ...base,
+    payment: {
+      findMany: async () => [
+        { id: 'payment-1', amount: decimal('120'), currency: 'USD', paidAt: new Date('2026-06-10T00:00:00.000Z'), refundId: null, order: { id: 'so-1', orderNumber: 'SO-1', invoiceNumber: 'INV-1', currency: 'USD', fxRateToBase: decimal('1.2'), customerName: 'A', customerEmail: null } },
+        { id: 'payment-2', amount: decimal('50'), currency: 'CHF', paidAt: new Date('2026-06-12T00:00:00.000Z'), refundId: null, order: { id: 'so-2', orderNumber: 'SO-2', invoiceNumber: 'INV-2', currency: 'CHF', fxRateToBase: decimal('1.1'), customerName: 'B', customerEmail: null } },
+      ],
+    },
+  }
+  const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
+  assert.deepEqual(report.rows.map((r) => [r.settlementId, r.outcome]), [['payment-1', 'loss'], ['payment-2', 'not_computable']])
+  assert.equal(report.totals.lossesBase, '20')
+  assert.equal(report.totals.unconvertedCount, '1')
+  assert.equal(report.totals.rowCount, '2')
+})
+
+test('FX gain/loss: a rated foreign settlement is computed from the table and counts no unconverted rows', async () => {
+  const client = fxGainLossClient([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }])
+  const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
+  assert.equal(report.rows[0]?.outcome, 'loss')
+  assert.equal(report.totals.unconvertedCount, '0')
+})
+
+test('FX gain/loss: a paid BILL with no rate is also listed as not computable (the payable path)', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...fxGainLossClient([]),
+    payment: { findMany: async () => [] },
+    purchaseInvoice: {
+      findMany: async () => [{
+        id: 'inv-1', invoiceNumber: 'BILL-1', paidAt: new Date('2026-06-10T00:00:00.000Z'), totalForeign: decimal('100'), totalBase: decimal('80'),
+        fxRateToBase: decimal('1.25'), po: { reference: 'PO-1', currency: 'CHF', supplier: { name: 'Supplier' } },
+      }],
+    },
+  } as unknown as FinanceAnalyticsClient
+  const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
+  assert.equal(report.rows[0]?.side, 'payable')
+  assert.equal(report.rows[0]?.outcome, 'not_computable')
+  assert.equal(report.rows[0]?.gainLossBase, '')
+  assert.equal(report.totals.unconvertedCount, '1')
+})
+
+test('[q0x56.16] FX gain/loss: a date-only (midnight) paidAt reads a rate fetched at 09:00 that day, as the payment did', async () => {
+  const client = fxGainLossClient([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }, { rate: '1.6', at: '2026-06-10T09:00:00.000Z' }])
+  const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
+  assert.equal(report.rows[0]?.settlementRateToBase, '1.6')
+})
+
+test('[q0x56.16] FX gain/loss: a real timestamp stays an instant (the 09:00 rate is invisible to an 08:00 payment)', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...fxGainLossClient([{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }, { rate: '1.6', at: '2026-06-10T09:00:00.000Z' }]),
+    payment: {
+      findMany: async () => [{ id: 'payment-1', amount: decimal('120'), currency: 'USD', paidAt: new Date('2026-06-10T08:00:00.000Z'), refundId: null, order: { id: 'so-1', orderNumber: 'SO-1', invoiceNumber: 'INV-1', currency: 'USD', fxRateToBase: decimal('1.2'), customerName: 'A', customerEmail: null } }],
+    },
+  }
+  const report = await getFxGainLossReport({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }, fxOpts(client))
+  assert.equal(report.rows[0]?.settlementRateToBase, '1.5')
 })

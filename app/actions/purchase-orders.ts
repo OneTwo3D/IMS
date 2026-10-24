@@ -117,8 +117,12 @@ import {
   buildRealisedFxJournal,
   computeRealisedFx,
   getRealisedFxAccounts,
+  describeFxRefusal,
   resolveSettlementFxRateToBase,
+  settlementAsOfFromInput,
 } from '@/lib/accounting-fx'
+import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { Prisma } from '@/app/generated/prisma/client'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
@@ -4006,17 +4010,36 @@ export async function markBillPaid(
     const paymentAmount = input.amountForeign ?? Number(invoice.totalForeign)
     const paymentDate = new Date(input.paymentDate)
     const baseCurrency = await getBaseCurrencyCode()
-    const settlementRateToBase = await db.$transaction(
-      (tx) => resolveSettlementFxRateToBase(tx, {
-        currency: invoice.po.currency,
-        baseCurrency,
-        asOf: paymentDate,
-        fallbackRateToBase: Number(invoice.fxRateToBase),
-        referenceType: 'PurchaseInvoice',
-        referenceId: invoice.id,
-      }),
-      STOCK_TX_OPTIONS,
-    )
+    // o3d-q0x56.4 / .16 - THE SETTLEMENT RATE IS RESOLVED BEFORE THE FIRST WRITE, AND A MISSING ONE REFUSES.
+    // Nothing has been written when this runs (the only statements so far are reads), so the refusal leaves the
+    // bill unpaid, with no sync row and no activity beyond the warning, which is what lets the operator add the
+    // rate and press Pay again. `paymentDate` (midnight, what is stored as `paidAt`) is NOT the lookup instant:
+    // `input.paymentDate` is a business day, so the rate is as of the END of that day, and a rate fetched at 09:00
+    // that day counts.
+    let settlementRateToBase: number
+    try {
+      settlementRateToBase = await db.$transaction(
+        (tx) => resolveSettlementFxRateToBase(tx, {
+          currency: invoice.po.currency,
+          baseCurrency,
+          asOf: settlementAsOfFromInput(input.paymentDate, paymentDate),
+        }),
+        STOCK_TX_OPTIONS,
+      )
+    } catch (error) {
+      if (!isMissingFxRateError(error)) throw error
+      const message = `Bill not marked as paid: ${describeFxRefusal(error)}`
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: invoice.poId,
+        action: 'bill_payment_refused_missing_fx_rate',
+        tag: 'purchase',
+        level: 'WARNING',
+        description: `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: ${error.message}`,
+        metadata: { invoiceId: invoice.id, currency: invoice.po.currency, baseCurrency, paymentDate: input.paymentDate, reason: error.reason },
+      }).catch(() => { /* logging must never block the refusal */ })
+      return { success: false, error: message }
+    }
 
     // MARK PAID, RETIRE THE PRE-CALL REGISTRATIONS, AND QUEUE THE REPLACEMENT — ALL THREE, OR NONE
     // (o3d-a3wx; Codex round 3 #4).
@@ -4418,7 +4441,24 @@ export async function recordSupplierFreightCreditNote(input: {
     })
     if (validationError) return { success: false, error: validationError }
 
-    const fxRateToBase = Number(selectedInvoice?.fxRateToBase ?? po.fxRateToBase ?? 1)
+    // o3d-q0x56.8: the credit note reverses the bill it is recorded against, so it takes THAT bill's booked rate
+    // (the PO's when no bill is selected). A foreign document with no usable stored rate REFUSES here, before the
+    // credit note row exists; it never becomes 1 and no table rate is looked up in its place.
+    let fxRateToBase: number
+    try {
+      fxRateToBase = (await resolveStoredFxRateToBase({
+        currency: po.currency,
+        baseCurrency: getBaseCurrencyCode,
+        // A selected bill is converted at ITS OWN booked rate and nothing else: if that is unusable the credit note is
+        // refused, never silently taken at the purchase order's rate (the bill's booked rate is then unknown). The PO's
+        // rate is used only when no bill is selected.
+        storedRate: selectedInvoice ? selectedInvoice.fxRateToBase : po.fxRateToBase,
+        document: selectedInvoice ? `Bill for purchase order ${po.reference}` : `Purchase order ${po.reference}`,
+      })).toNumber()
+    } catch (error) {
+      if (isMissingStoredFxRateError(error)) return { success: false, error: `Credit note not recorded: ${error.message}` }
+      throw error
+    }
     // fxRateToBase is foreign units per ONE base unit: DIVIDE, as every purchase-order conversion does.
     const amountBase = supplierCreditNoteAmountBase(roundQuantity(input.amountForeign, 4).toString(), fxRateToBase).toNumber()
 

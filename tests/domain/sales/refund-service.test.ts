@@ -10146,3 +10146,44 @@ test('[replay] a LEGACY or chargeback refund replays untouched (no document is d
   assert.equal((await replay(legacy)).success, true)
   assert.equal(legacy.returnExpectations, undefined)
 })
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-q0x56.8 - a missing STORED rate on the order refuses; it is never 1, and no table rate is looked up
+// ---------------------------------------------------------------------------------------------------
+
+const MONETARY_REFUND = {
+  orderId: 'order-1',
+  lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+  reason: 'Customer return',
+  creditNotePrefix: 'CN-',
+}
+
+test('[q0x56.8] a FOREIGN order with a zero stored rate refuses, quarantined and named, and creates nothing', async () => {
+  for (const fxRateToBase of [0, -1, Number.NaN]) {
+    const state = baseState()
+    state.orders[0] = { ...state.orders[0], currency: 'USD', fxRateToBase }
+    const result = await createSalesOrderRefund(createClient(state), MONETARY_REFUND)
+    assert.equal(result.success, false, String(fxRateToBase))
+    assert.equal((result as { quarantine?: boolean }).quarantine, true, 'parked for an operator, not dropped')
+    assert.match(String((result as { error?: string }).error), /Refund not created: Order SO-1 is in USD but has no usable stored FX rate to GBP/)
+    assert.equal(state.refunds.length, 0, 'no refund row')
+    assert.equal(state.refundLines.length, 0, 'no refund lines')
+    assert.equal((state.accountingSyncLogs ?? []).length, 0, 'nothing queued for the ledger')
+  }
+})
+
+test('[q0x56.8] a BASE-currency order with no usable stored rate is 1 because currency === base', async () => {
+  const state = baseState()
+  state.orders[0] = { ...state.orders[0], currency: 'GBP', fxRateToBase: 0 }
+  const result = await createSalesOrderRefund(createClient(state), MONETARY_REFUND)
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(state.refunds.length, 1)
+})
+
+test('[q0x56.8] a foreign order with a usable stored rate converts at THAT rate (no table lookup, no 1)', async () => {
+  const state = baseState()
+  state.orders[0] = { ...state.orders[0], currency: 'USD', fxRateToBase: 1.25 }
+  const result = await createSalesOrderRefund(createClient(state), MONETARY_REFUND)
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(Number(state.refunds[0].totalForeign), 62.5, '50 base x the booked 1.25')
+})
