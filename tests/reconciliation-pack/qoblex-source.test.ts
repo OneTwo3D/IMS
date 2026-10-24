@@ -6,7 +6,7 @@ import test, { afterEach } from 'node:test'
 import { PACK_CADENCE_MAX_AGE_MS } from '../../lib/reconciliation-pack/constants.ts'
 import { QOBLEX_NATIVE_COLUMN_MAP } from '../../lib/reconciliation-pack/qoblex-native-map.ts'
 import { createQoblexSource, parseQoblexManifest, qoblexStaleness, readQoblexExport } from '../../lib/reconciliation-pack/qoblex-source.ts'
-import { ASOF, DEFAULT_STOCK, EXPORTED_AT, LOCATIONS, productsCsv, sha256, stockCsv, writeExport } from './qoblex-fixtures.ts'
+import { ASOF, DEFAULT_PRODUCTS, DEFAULT_STOCK, EXPORTED_AT, LOCATIONS, productsCsv, sha256, stockCsv, writeExport } from './qoblex-fixtures.ts'
 import { NOW, cleanup } from './helpers.ts'
 
 /**
@@ -88,7 +88,36 @@ test('a file used by two parts is read ONCE, and a second use must declare the s
   assert.ok(r.ok)
   assert.equal(r.value.files.filter((f) => f.name === 'products.csv').length, 1)
   const other = writeExport(bases, { stock: null, products: same, patch: (m) => { m.stock = { file: 'products.csv', sha256: 'a'.repeat(64) } } })
-  assert.equal(partReason(read(other), 'stock'), 'SOURCE_UNREADABLE')
+  refused(other, 'MANIFEST_INCONSISTENT')
+})
+
+// [mutation: the per-name sha256 comparison / the spelling comparison / the role comparison / the shared-data-file map comparison removed]
+test('a manifest that contradicts itself about a file is rejected WHOLE: no part of the export is usable', () => {
+  const good = (name: string) => ({ file: name, sha256: sha256(name === 'stock.csv' ? DEFAULT_STOCK : productsCsv([{ sku: 'SKU-1' }])) })
+  const clash: Array<[string, (m: Record<string, unknown>) => void, Parameters<typeof writeExport>[1]?]> = [
+    ['stock and products name one data file under different digests', (m) => { m.products = { file: 'stock.csv', sha256: 'b'.repeat(64) } }],
+    ['stock and products name one data file, each with the correct digest of the other bytes', (m) => { m.products = { file: 'stock.csv', sha256: sha256(productsCsv([{ sku: 'SKU-1' }])) } }],
+    ['one data file under two spellings', (m) => { m.products = { file: 'STOCK.csv', sha256: sha256(DEFAULT_STOCK) } }],
+    ['names that differ only in case', (m) => { m.products = { file: 'Products.CSV', sha256: sha256(DEFAULT_PRODUCTS) }; (m.stock as Record<string, unknown>).columnMap = { file: 'products.csv', sha256: sha256(DEFAULT_PRODUCTS) } }],
+    ['a data file that is also a column map', (m) => { (m.products as Record<string, unknown>).columnMap = good('stock.csv') }],
+    ['one data file with a column map in one part and none in the other', (m) => { m.products = { file: 'stock.csv', sha256: sha256(DEFAULT_STOCK) }; (m.stock as Record<string, unknown>).columnMap = { file: 'map.json', sha256: sha256('{}') } }],
+    ['one data file with two different column maps', (m) => { m.products = { file: 'stock.csv', sha256: sha256(DEFAULT_STOCK), columnMap: { file: 'other.json', sha256: sha256('{}') } }; (m.stock as Record<string, unknown>).columnMap = { file: 'map.json', sha256: sha256('{}') } }],
+    ['one column map under two digests', (m) => { (m.stock as Record<string, unknown>).columnMap = { file: 'map.json', sha256: 'a'.repeat(64) }; (m.products as Record<string, unknown>).columnMap = { file: 'map.json', sha256: 'b'.repeat(64) } }],
+    ['one column map under two spellings', (m) => { (m.stock as Record<string, unknown>).columnMap = { file: 'map.json', sha256: 'a'.repeat(64) }; (m.products as Record<string, unknown>).columnMap = { file: 'Map.json', sha256: 'a'.repeat(64) } }],
+  ]
+  for (const [label, patch] of clash) {
+    const dir = writeExport(bases, { patch })
+    const r = read(dir)
+    assert.deepEqual(r.ok ? 'ok' : r.reason, 'MANIFEST_INCONSISTENT', label)
+  }
+  // a consistent manifest that shares a data file and its map still reads
+  const same = productsCsv([{ sku: 'SKU-1' }])
+  const sharedOk = writeExport(bases, { stock: null, products: same, patch: (m) => { m.stock = { file: 'products.csv', sha256: sha256(same) } } })
+  assert.ok(read(sharedOk).ok)
+  // a location declared twice, with the same or different company / 3PL flag, rejects the whole manifest
+  for (const second of [{ ...LOCATIONS[0]! }, { ...LOCATIONS[0]!, threePl: true }, { ...LOCATIONS[0]!, company: 'OTHER' }]) {
+    refused(writeExport(bases, { patch: (m) => { m.locations = [...LOCATIONS, second] } }), 'DUPLICATE_KEY')
+  }
 })
 
 // [mutation: any one of the manifest's closed-set checks removed]
@@ -108,7 +137,7 @@ test('the manifest is closed: an unknown or missing key, another version, anothe
   refused(dir((m) => { (m.stock as Record<string, unknown>).file = 'sub/stock.csv' }), 'SOURCE_UNREADABLE')
   refused(dir((m) => { (m.stock as Record<string, unknown>).file = 'manifest.json' }), 'SOURCE_UNREADABLE')
   refused(dir((m) => { (m.stock as Record<string, unknown>).sha256 = 'XYZ' }), 'SOURCE_UNREADABLE')
-  refused(dir((m) => { (m.stock as Record<string, unknown>).columnMap = { file: 'stock.csv', sha256: sha256(DEFAULT_STOCK) } }), 'DUPLICATE_KEY')
+  refused(dir((m) => { (m.stock as Record<string, unknown>).columnMap = { file: 'stock.csv', sha256: sha256(DEFAULT_STOCK) } }), 'MANIFEST_INCONSISTENT')
   assert.throws(() => parseQoblexManifest('{not json'), (e) => (e as { reason?: string }).reason === 'SOURCE_UNREADABLE')
   refused(writeExport(bases, { manifestText: '[]' }), 'SOURCE_UNREADABLE')
   refused(writeExport(bases, { manifestText: '{"__proto__":{"x":1}}' }), 'SOURCE_UNREADABLE')

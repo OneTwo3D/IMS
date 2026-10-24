@@ -134,11 +134,28 @@ export function parseQoblexManifest(text: string): Manifest {
   })
   const stock = r.stock === undefined ? null : partSpec(r.stock)
   const products = r.products === undefined ? null : partSpec(r.products)
-  // A file is read ONCE however many parts use it (the native stock report feeds both datasets; a column map may be shared): a second
-  // use must declare the same digest. A column map is never also a data file.
-  const names = [stock?.file, products?.file].filter((n): n is string => n !== undefined)
-  for (const part of [stock, products]) if (part?.columnMap && names.includes(part.columnMap.file)) return bad('DUPLICATE_KEY')
-  if (stock !== null && products !== null && stock.columnMap && products.columnMap && stock.columnMap.file === products.columnMap.file && stock.columnMap.sha256 !== products.columnMap.sha256) return bad()
+  // ONE FILE, ONE CLAIM. Every reference to a file, a data file or a column map, in any part, is gathered. A file name is judged
+  // CASE-INSENSITIVELY (two names that differ only in case could be one file on a case-folding file system, so they are refused, not
+  // guessed apart); every reference to it must spell it identically and declare the same sha256. A file is never both a data file and a
+  // column map. A data file shared by the two parts (the native stock report feeds both datasets) must be shared with the same column map.
+  // Any contradiction rejects the WHOLE manifest, so no part is used on a manifest that claims two things about the same bytes.
+  const refs: Array<{ file: string; sha256: string; role: 'data' | 'map' }> = []
+  for (const part of [stock, products]) {
+    if (part === null) continue
+    refs.push({ file: part.file, sha256: part.sha256, role: 'data' })
+    if (part.columnMap) refs.push({ file: part.columnMap.file, sha256: part.columnMap.sha256, role: 'map' })
+  }
+  const byName = new Map<string, (typeof refs)[number]>()
+  for (const ref of refs) {
+    const seen = byName.get(ref.file.toLowerCase())
+    if (seen === undefined) { byName.set(ref.file.toLowerCase(), ref); continue }
+    if (seen.file !== ref.file || seen.sha256 !== ref.sha256 || seen.role !== ref.role) return bad('MANIFEST_INCONSISTENT')
+  }
+  if (stock !== null && products !== null && stock.file === products.file) {
+    const a = stock.columnMap
+    const b = products.columnMap
+    if ((a === null) !== (b === null) || (a !== null && b !== null && (a.file !== b.file || a.sha256 !== b.sha256))) return bad('MANIFEST_INCONSISTENT')
+  }
   return { exportedAt: r.exportedAt, asOf, locations, stock, products }
 }
 

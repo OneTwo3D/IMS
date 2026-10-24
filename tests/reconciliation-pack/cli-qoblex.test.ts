@@ -251,3 +251,13 @@ test('END TO END: a padded SKU on the storefront leg is a finding, never matched
   await run(w, args(scratchDir(bases), '--items', 'R14', '--qoblex-export', exportDir, '--vendor-reads-only'))
   assert.equal(line(w, 'R14'), 'R14 fail DIFFERENCES')
 })
+
+// [mutation: the per-file consistency check removed from the manifest parser]
+test('END TO END: a manifest that names one data file under two digests rejects the whole export, so R2, R5 and R14 cannot pass on either part', async () => {
+  const exportDir = writeExport(bases, { patch: (m) => { m.products = { file: 'stock.csv', sha256: 'b'.repeat(64) } } })
+  const r = rig()
+  r.deps.wmsSkus = async () => ({ ok: true, skus: ['SKU-1', 'SKU-2', 'SKU-3'] })
+  await run(r, args(scratchDir(bases), '--qoblex-export', exportDir, '--vendor-reads-only'))
+  for (const id of ['R2', 'R5', 'R14']) assert.equal(line(r, id), `${id} inconclusive MANIFEST_INCONSISTENT`, id)
+  assert.ok(!r.sent.some((sql) => /inventory_snapshots/.test(sql)), 'IMS snapshot not read')
+})
