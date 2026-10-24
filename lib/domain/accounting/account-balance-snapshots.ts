@@ -80,6 +80,8 @@ export type MissingAccountBalanceSnapshotReason =
 export type AccountBalanceMovementWithheldReason =
   | 'window_crosses_financial_year_start'
   | 'financial_year_end_unproven'
+  | 'account_identity_unproven'
+  | 'account_identity_changed'
 
 /**
  * A closing-minus-opening movement that would not be a movement: the account is a profit-and-loss account (its Trial Balance
@@ -90,9 +92,15 @@ export class AccountBalanceMovementWithheldError extends Error {
   reason: AccountBalanceMovementWithheldReason
   accountCode: string | null
   constructor(input: { reason: AccountBalanceMovementWithheldReason; accountCode: string | null; openingDate: string; closingDate: string }) {
+    const window = `${input.openingDate} and ${input.closingDate}`
+    const account = input.accountCode ?? 'unknown'
     super(input.reason === 'window_crosses_financial_year_start'
-      ? `Account ${input.accountCode ?? 'unknown'} is a profit-and-loss account whose year-to-date balance restarts at the financial-year start, which falls between ${input.openingDate} and ${input.closingDate}; the movement is withheld.`
-      : `Account ${input.accountCode ?? 'unknown'} is a profit-and-loss account and its two balances do not prove the same financial-year end for the same organisation, so a movement between ${input.openingDate} and ${input.closingDate} is withheld.`)
+      ? `Account ${account} is a profit-and-loss account whose year-to-date balance restarts at the financial-year start, which falls between ${window}; the movement is withheld.`
+      : input.reason === 'account_identity_unproven'
+        ? `The chart does not name exactly one active account for code ${account}, so a movement between ${window} cannot be tied to an account; it is withheld.`
+        : input.reason === 'account_identity_changed'
+          ? `The stored balances for code ${account} between ${window} are not both the configured account's own, from the same organisation (the code was reassigned or the organisation changed); the movement is withheld.`
+          : `Account ${account} is a profit-and-loss account and its two balances do not prove the same financial-year end for the same organisation, so a movement between ${window} is withheld.`)
     this.name = 'AccountBalanceMovementWithheldError'
     this.reason = input.reason
     this.accountCode = input.accountCode
@@ -252,9 +260,25 @@ export async function getAccountBalancePeriodMovement(
   const dateFrom = normalizeBalanceDate(lookup.dateFrom)
   const requiredOpeningDate = previousDate(lookup.dateFrom)
   const requiredClosingDate = normalizeBalanceDate(lookup.dateTo)
+  // WHICH account: a code can be reassigned to another account, and a stored balance belongs to the account id it was pulled
+  // for. The intended id is the caller's, else the one ACTIVE chart account with that code; both balances must be that
+  // account's own (and from one organisation), for every account type. An id the chart cannot name is withheld, never guessed.
+  const withheldFor = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({
+    reason, accountCode: lookup.accountCode ?? null, openingDate: balanceDateString(requiredOpeningDate), closingDate: balanceDateString(requiredClosingDate),
+  })
+  const explicitId = lookup.externalAccountId?.trim()
+  const accountCode = lookup.accountCode?.trim()
+  const chartRows = explicitId
+    ? await client.accountingAccount.findMany({ where: { connector: lookup.connector, externalAccountId: explicitId }, select: { externalAccountId: true, type: true } })
+    : accountCode
+      ? await client.accountingAccount.findMany({ where: { connector: lookup.connector, code: accountCode, active: true }, select: { externalAccountId: true, type: true } })
+      : []
+  if (chartRows.length !== 1) throw withheldFor('account_identity_unproven')
+  const intended = chartRows[0]!
+  const byId = { ...lookup, externalAccountId: intended.externalAccountId, accountCode: undefined }
   const [opening, closing] = await Promise.all([
-    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: requiredOpeningDate }, client),
-    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: requiredClosingDate }, client),
+    findLatestAccountBalanceSnapshot({ ...byId, balanceDate: requiredOpeningDate }, client),
+    findLatestAccountBalanceSnapshot({ ...byId, balanceDate: requiredClosingDate }, client),
   ])
   const maxStalenessDays = lookup.maxOpeningStalenessDays ?? DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS
   const staleBefore = dateFrom.getTime() - maxStalenessDays * DAY_MS
@@ -279,15 +303,14 @@ export async function getAccountBalancePeriodMovement(
       accountCode: lookup.accountCode,
     })
   }
+  // Defence in depth over the id-keyed read above: both rows are the intended account's, from one organisation.
+  if (opening.externalAccountId !== intended.externalAccountId || closing.externalAccountId !== intended.externalAccountId || opening.tenantId !== closing.tenantId) {
+    throw withheldFor('account_identity_changed')
+  }
   // The stored figure is year-to-date. A lifetime-balance account (inventory, transit, ...) differences cleanly; a
-  // profit-and-loss account does not across a financial-year start. The type is the chart's, not the setting key's, and an
-  // account the chart does not know is treated as profit-and-loss (withheld rather than guessed).
-  const chartAccount = await client.accountingAccount.findFirst({
-    where: { connector: lookup.connector, OR: [{ externalAccountId: closing.externalAccountId }, ...(closing.accountCode ? [{ code: closing.accountCode }] : [])] },
-    select: { type: true },
-    orderBy: [{ active: 'desc' }, { syncedAt: 'desc' }],
-  })
-  if (!isLifetimeBalanceAccountType(chartAccount?.type)) {
+  // profit-and-loss account does not across a financial-year start. The type is the chart's, not the setting key's, and a type
+  // the repo does not list as a lifetime balance is treated as profit-and-loss (withheld rather than guessed).
+  if (!isLifetimeBalanceAccountType(intended.type)) {
     const withheld = (reason: AccountBalanceMovementWithheldReason) => new AccountBalanceMovementWithheldError({
       reason, accountCode: closing.accountCode, openingDate: balanceDateString(opening.balanceDate), closingDate: balanceDateString(closing.balanceDate),
     })

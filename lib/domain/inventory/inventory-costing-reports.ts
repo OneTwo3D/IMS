@@ -669,9 +669,15 @@ type CogsGlMovementResult =
   | { ok: false; notice?: string; withheld?: true }
 
 function cogsMovementWithheldNotice(error: AccountBalanceMovementWithheldError): string {
-  return error.reason === 'window_crosses_financial_year_start'
-    ? 'The period crosses the start of a financial year, when the COGS account\'s year-to-date GL balance restarts from zero, so no GL COGS movement can be taken from two stored balances. The GL variance is blank.'
-    : 'The two stored GL COGS balances do not prove the same financial-year end for the same organisation (re-pull the Trial Balance for those dates), so a movement cannot be taken from two year-to-date balances. The GL variance is blank.'
+  switch (error.reason) {
+    case 'window_crosses_financial_year_start':
+      return 'The period crosses the start of a financial year, when the COGS account\'s year-to-date GL balance restarts from zero, so no GL COGS movement can be taken from two stored balances. The GL variance is blank.'
+    case 'account_identity_unproven':
+    case 'account_identity_changed':
+      return 'The two stored GL COGS balances cannot be shown to be the configured COGS account\'s own, from one organisation (the account code may have been reassigned), so no movement is taken from them. The GL variance is blank.'
+    default:
+      return 'The two stored GL COGS balances do not prove the same financial-year end for the same organisation (re-pull the Trial Balance for those dates), so a movement cannot be taken from two year-to-date balances. The GL variance is blank.'
+  }
 }
 
 async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovementLookup): Promise<CogsGlMovementResult> {

@@ -131,6 +131,7 @@ export type XeroTrialBalanceRefusalCode =
   | 'TB_AMBIGUOUS_COLUMNS'
   | 'TB_ROW_CELL_COUNT'
   | 'TB_NON_MONEY_CELL'
+  | 'TB_BLANK_LABEL'
 
 export type RefusedXeroTrialBalanceRow = {
   code: XeroTrialBalanceRefusalCode
@@ -199,14 +200,21 @@ function collectRows(
     if (row.RowType && row.RowType !== 'Row') continue
     const cells = row.Cells ?? []
     const label = typeof cells[0]?.Value === 'string' ? cells[0].Value.trim() : ''
-    if (!label) continue
+    // Xero's Trial Balance row types are Header, Section (carries Title and nested Rows), Row (an account) and SummaryRow
+    // (totals). Header, Section and SummaryRow were skipped above, so what reaches here IS an account row. A blank label does not
+    // make it a spacer: it may still carry an account id and a balance, so it is refused (never skipped) and its identity, if
+    // any, withholds that account; one with no identity at all refuses the whole report.
     const identity = {
-      accountCode: attrValue(cells[0], ['accountCode', 'code']) ?? accountCodeFromLabel(label),
-      accountName: attrValue(cells[0], ['accountName', 'name']) ?? accountNameFromLabel(label),
+      accountCode: attrValue(cells[0], ['accountCode', 'code']) ?? (label ? accountCodeFromLabel(label) : null),
+      accountName: attrValue(cells[0], ['accountName', 'name']) ?? (label ? accountNameFromLabel(label) : ''),
       externalAccountId: attrValue(cells[0], ['accountId', 'accountID', 'account']),
     }
     const refuse = (code: XeroTrialBalanceRefusalCode, detail: string) => {
-      output.refusedRows.push({ code, ...identity, label, message: `${code}: Xero Trial Balance row "${label}" was refused: ${detail}` })
+      output.refusedRows.push({ code, ...identity, label: label || "(blank)", message: `${code}: Xero Trial Balance row "${label || "(blank)"}" was refused: ${detail}` })
+    }
+    if (!label) {
+      refuse('TB_BLANK_LABEL', 'its account label cell is blank')
+      continue
     }
     if (cells.length !== columns.cellCount) {
       refuse('TB_ROW_CELL_COUNT', `it has ${cells.length} cells but the Header has ${columns.cellCount}`)

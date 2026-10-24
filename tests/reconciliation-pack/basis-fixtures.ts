@@ -10,6 +10,7 @@ export const TENANT = 'tenant-current'
 export const dateOf = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
 export const PREVIOUS = '2026-10-18'
 export const CODES: Record<PackBasisAccountKind, string> = { inventory: '630', allocated: '631', transit: '632', cogs: '500', unearned: '260' }
+export const ACCT = (code: string) => `acct-${code}`
 export const REF = (iso: string) => `xero:trial-balance:${iso}`
 export const REF_ABSENT = (iso: string) => `xero:trial-balance:${iso}:absent-from-tb`
 
@@ -19,7 +20,9 @@ export type FakeState = {
   baseCurrency: string | null | undefined
   /** The bound Xero connection's tenant; null = not connected. */
   tenant: string | null
-  gl: Array<BasisGlRow & { externalAccountId?: string }>
+  gl: BasisGlRow[]
+  /** The chart: active accounts by code. Defaults to one `acct-<code>` per configured code. */
+  chart: Array<{ code: string | null; externalAccountId: string }>
   /** The sum of the transit sub-ledger movement in (D-1, D]; null = no movement rows. */
   transitMovement: unknown
   run: { snapshotCount: number } | null
@@ -36,10 +39,11 @@ export function goodState(overrides: Partial<FakeState> = {}): FakeState {
     baseCurrency: 'GBP',
     tenant: TENANT,
     gl: [
-      ...PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT, updatedAt: new Date('2026-10-20T01:00:00.000Z') })),
+      ...PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], externalAccountId: ACCT(CODES[account.kind]), balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT, updatedAt: new Date('2026-10-20T01:00:00.000Z') })),
       // The transit balance of the day before D: the movement of the day is 50 - 40 = 10.
-      { accountCode: CODES.transit, balanceDate: dateOf(PREVIOUS), currency: 'GBP', amountBase: '40', sourcePayloadRef: REF(PREVIOUS), tenantId: TENANT, updatedAt: new Date('2026-10-19T01:00:00.000Z') },
+      { accountCode: CODES.transit, externalAccountId: ACCT(CODES.transit), balanceDate: dateOf(PREVIOUS), currency: 'GBP', amountBase: '40', sourcePayloadRef: REF(PREVIOUS), tenantId: TENANT, updatedAt: new Date('2026-10-19T01:00:00.000Z') },
     ],
+    chart: PACK_BASIS_ACCOUNTS.map((account) => ({ code: CODES[account.kind], externalAccountId: ACCT(CODES[account.kind]) })),
     transitMovement: '10',
     run: { snapshotCount: 2 },
     snapshots: [{ valueBase: '700.25', valueReplayReliable: true }, { valueBase: '500.50', valueReplayReliable: true }],
@@ -65,6 +69,7 @@ export function fakeRun(state: FakeState, log: string[] = []) {
   const tx: BasisTx = {
     setting: { findMany: async (args) => guard('setting.findMany', () => [...state.settings].filter(([key]) => args.where.key.in.includes(key)).map(([key, value]) => ({ key, value }))) },
     accountingToken: { findUnique: async () => guard('accountingToken.findUnique', () => (state.tenant === null ? null : { tenantId: state.tenant })) },
+    accountingAccount: { findMany: async (args) => guard('accountingAccount.findMany', () => state.chart.filter((row) => row.code !== null && args.where.code.in.includes(row.code))) },
     organisation: { findFirst: async () => guard('organisation.findFirst', () => (state.baseCurrency === undefined ? null : { baseCurrency: state.baseCurrency })) },
     accountingAccountBalanceSnapshot: {
       findMany: async (args) => guard('snapshot.findMany', () => state.gl.filter((row) => args.where.accountCode.in.includes(row.accountCode ?? '\u0000') && row.currency === args.where.currency && dateMatch(row.balanceDate, args.where.balanceDate))),

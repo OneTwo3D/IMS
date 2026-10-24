@@ -147,3 +147,13 @@ test('a year end that changes between two pulls is stored as it was at each pull
   orgFields = {}
   assert.deepEqual([first[0], persisted[0]!.financialYearEnd], ['12-31', '03-31'])
 })
+
+test('a blank-label row carrying a configured account id and a balance stores nothing for that account (not a zero) and errors by name', async () => {
+  const blank = { RowType: 'Row', Cells: [{ Value: '', Attributes: [{ Id: 'account', Value: 'a-631' }] }, ...['', '', '5000', ''].map((Value) => ({ Value }))] }
+  trialBalance = realReport()
+  const rows = (trialBalance as { Reports: Array<{ Rows: Array<{ Rows?: unknown[] }> }> }).Reports[0]!.Rows[3]!.Rows!
+  rows.splice(0, 1, blank)
+  const result = await pull()
+  assert.deepEqual(stored(), { '310': '73019.20', '810': '-100.81' })
+  assert.match(result.errors[0]!, /631.*TB_BLANK_LABEL/)
+})

@@ -65,6 +65,7 @@ test('as-of basis against a real database', { skip }, async () => {
       await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
     }
     await db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date('2031-01-01T00:00:00Z'), tenantId: tenant }, update: { tenantId: tenant } })
+    for (const a of d.PACK_BASIS_ACCOUNTS) await db.accountingAccount.create({ data: { connector: 'xero', externalAccountId: `rb-${tag}-${a.kind}`, code: codes[a.kind]!, name: 'rb', type: 'ASSET', active: true } })
     const amounts: Record<string, string> = { inventory: '100.50', allocated: '20.25', transit: '0', cogs: '7', unearned: '-30' }
     for (const a of d.PACK_BASIS_ACCOUNTS) {
       await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rb-${tag}-${a.kind}`, accountCode: codes[a.kind]!, accountName: 'rb', balanceDate: date(D), currency, amountForeign: amounts[a.kind]!, amountBase: amounts[a.kind]!, sourcePayloadRef: ref(D, a.kind === 'transit'), tenantId: tenant } })
@@ -91,7 +92,7 @@ test('as-of basis against a real database', { skip }, async () => {
     assert.equal((await d.loadAsOfBasis(D, bracket)).available, true, 'nothing moved: available')
 
     // 2. NO WRITE: row counts of every table the basis reads, and the tuple counters, are unchanged by a load.
-    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots']
+    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_accounts', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots']
     const counts = async () => {
       const out: Record<string, string> = {}
       for (const t of tables) out[t] = String((await db.$queryRawUnsafe<Array<{ n: bigint }>>(`SELECT count(*) AS n FROM "${t}"`))[0]!.n)
@@ -153,6 +154,7 @@ test('as-of basis against a real database', { skip }, async () => {
     await db.inventorySnapshot.deleteMany({ where: { productId: product.id } })
     await db.inventorySnapshotRun.deleteMany({ where: { source: 'rb-test' } })
     await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: { startsWith: `rb-${tag}-` } } })
+    await db.accountingAccount.deleteMany({ where: { externalAccountId: { startsWith: `rb-${tag}-` } } })
     await db.warehouse.delete({ where: { id: warehouse.id } })
     await db.product.delete({ where: { id: product.id } })
     for (const key of settingKeys) {
@@ -192,8 +194,8 @@ test('transit leg and ledger items against a real database', { skip }, async () 
   const warehouse = await db.warehouse.create({ data: { code: `RL${tag}`.toUpperCase(), name: 'rl' } })
   const load = async () => d.settleAsOfBasis(await d.readAsOfBasis(D), bracket)
   const setBalance = async (kind: string, iso: string, amount: string, absent = false) => {
-    await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-${kind}-${iso}` } })
-    await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rl-${tag}-${kind}-${iso}`, accountCode: codes[kind]!, accountName: 'rl', balanceDate: date(iso), currency, amountForeign: amount, amountBase: amount, sourcePayloadRef: ref(iso, absent), tenantId: tenant } })
+    await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-${kind}`, balanceDate: date(iso) } })
+    await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rl-${tag}-${kind}`, accountCode: codes[kind]!, accountName: 'rl', balanceDate: date(iso), currency, amountForeign: amount, amountBase: amount, sourcePayloadRef: ref(iso, absent), tenantId: tenant } })
   }
   const movement = (key: string, iso: string, delta: string) => db.transitSubledgerMovement.create({ data: { sourceType: 'STOCK_RECEIPT', sourceRef: `rl-${tag}`, idempotencyKey: `rl-${tag}-${key}`, baseDelta: delta, journalDate: date(iso) } })
   try {
@@ -201,6 +203,7 @@ test('transit leg and ledger items against a real database', { skip }, async () 
       await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
     }
     await db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date('2031-06-01T00:00:00Z'), tenantId: tenant }, update: { tenantId: tenant } })
+    for (const a of d.PACK_BASIS_ACCOUNTS) await db.accountingAccount.create({ data: { connector: 'xero', externalAccountId: `rl-${tag}-${a.kind}`, code: codes[a.kind]!, name: 'rl', type: 'ASSET', active: true } })
     const amounts: Record<string, string> = { inventory: '100.50', allocated: '20.25', transit: '50', cogs: '7', unearned: '-30' }
     for (const a of d.PACK_BASIS_ACCOUNTS) await setBalance(a.kind, D, amounts[a.kind]!)
     await setBalance('transit', PREV, '40')
@@ -232,7 +235,7 @@ test('transit leg and ledger items against a real database', { skip }, async () 
     await db.transitSubledgerMovement.deleteMany({ where: { idempotencyKey: `rl-${tag}-extra` } })
 
     // 4. No opening balance for exactly the day before: the leg alone is unusable, the basis stays available.
-    await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-transit-${PREV}` } })
+    await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-transit`, balanceDate: date(PREV) } })
     const noOpening = await load()
     assert.ok(noOpening.available)
     assert.deepEqual(noOpening.available && noOpening.transit, { available: false, reason: 'transit_balance_unusable' })
@@ -259,7 +262,7 @@ test('transit leg and ledger items against a real database', { skip }, async () 
     await setBalance('transit', D, '50')
 
     // 7. NO WRITE: a load changes no row and writes no tuple in any table it reads.
-    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots', 'transit_subledger_movements']
+    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_accounts', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots', 'transit_subledger_movements']
     const counts = async () => {
       const out: Record<string, string> = {}
       for (const t of tables) out[t] = String((await db.$queryRawUnsafe<Array<{ n: bigint }>>(`SELECT count(*) AS n FROM "${t}"`))[0]!.n)
@@ -277,6 +280,7 @@ test('transit leg and ledger items against a real database', { skip }, async () 
     await db.inventorySnapshot.deleteMany({ where: { productId: product.id } })
     await db.inventorySnapshotRun.deleteMany({ where: { source: 'rl-test' } })
     await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: { startsWith: `rl-${tag}-` } } })
+    await db.accountingAccount.deleteMany({ where: { externalAccountId: { startsWith: `rl-${tag}-` } } })
     await db.warehouse.delete({ where: { id: warehouse.id } })
     await db.product.delete({ where: { id: product.id } })
     for (const key of settingKeys) {

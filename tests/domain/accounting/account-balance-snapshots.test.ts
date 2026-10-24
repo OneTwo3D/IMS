@@ -35,14 +35,14 @@ function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): 
 
 function snapshotClient(
   initial: AccountingAccountBalanceSnapshotRow[] = [],
-  chart: { accountType: string | null; yearEnd?: string | null } = { accountType: 'EXPENSE', yearEnd: '12-31' },
+  chart: { accountType: string | null; yearEnd?: string | null; chartIds?: string[] } = { accountType: 'EXPENSE', yearEnd: '12-31' },
 ) {
   // `yearEnd` (when given) stamps every row with that proven year end and one organisation; rows that already carry their own
   // tenant/year end (the proof tests) are left alone.
   const rows = initial.map((row) => (chart.yearEnd === undefined ? row : { ...row, tenantId: row.tenantId ?? 'tenant-1', financialYearEnd: row.financialYearEnd ?? chart.yearEnd }))
   return {
     rows,
-    accountingAccount: { findFirst: async () => (chart.accountType === null ? null : { type: chart.accountType }) },
+    accountingAccount: { findMany: async () => (chart.accountType === null ? [] : (chart.chartIds ?? ['cogs-account']).map((externalAccountId) => ({ externalAccountId, type: chart.accountType }))) },
     accountingAccountBalanceSnapshot: {
       async upsert(args: {
         where: { connector_externalAccountId_balanceDate_currency: { connector: string; externalAccountId: string; balanceDate: Date; currency: string } }
@@ -361,7 +361,7 @@ test('a balance-sheet account (lifetime balance) is differenced across a financi
   }
 })
 
-test('an account the chart does not know is treated as profit-and-loss (withheld, not guessed)', async () => {
+test('an account the chart does not know is withheld, not guessed', async () => {
   const client = snapshotClient(windowRows('2026-12-30', '2027-01-02'), { accountType: null, yearEnd: '12-31' })
   await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-12-31', '2027-01-02'), client as never), AccountBalanceMovementWithheldError)
 })
@@ -375,7 +375,8 @@ function provenRows(opening: { yearEnd: string | null; tenant: string | null }, 
   ]
 }
 const pnl = { accountType: 'EXPENSE' } as const
-const withheldAs = (error: unknown) => error instanceof AccountBalanceMovementWithheldError && error.reason === 'financial_year_end_unproven'
+const withheldAs = (error: unknown) => error instanceof AccountBalanceMovementWithheldError
+const unprovenAs = (error: unknown) => error instanceof AccountBalanceMovementWithheldError && error.reason === 'financial_year_end_unproven'
 
 test('P&L balances that prove the SAME year end for the SAME organisation, window not crossing, are differenced', async () => {
   const client = snapshotClient(provenRows({ yearEnd: '12-31', tenant: 't1' }, { yearEnd: '12-31', tenant: 't1' }), pnl)
@@ -384,13 +385,13 @@ test('P&L balances that prove the SAME year end for the SAME organisation, windo
 
 test('a financial-year end that CHANGED between the two pulls withholds the movement, even though neither window crosses a start', async () => {
   const client = snapshotClient(provenRows({ yearEnd: '12-31', tenant: 't1' }, { yearEnd: '03-31', tenant: 't1' }), pnl)
-  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), withheldAs)
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), unprovenAs)
 })
 
 test('a balance that proves no year end (either end of the window) withholds the movement', async () => {
   for (const [o, c] of [[null, '12-31'], ['12-31', null], [null, null], ['13-01', '13-01']] as const) {
     const client = snapshotClient(provenRows({ yearEnd: o, tenant: 't1' }, { yearEnd: c, tenant: 't1' }), pnl)
-    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), withheldAs, `${o}/${c}`)
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), unprovenAs, `${o}/${c}`)
   }
 })
 
@@ -402,7 +403,7 @@ test('balances from different organisations, or with no organisation, withhold t
 })
 
 test('a balance-sheet account is differenced without any year-end proof', async () => {
-  const client = snapshotClient(provenRows({ yearEnd: null, tenant: null }, { yearEnd: null, tenant: 't2' }), { accountType: 'INVENTORY' })
+  const client = snapshotClient(provenRows({ yearEnd: null, tenant: 't1' }, { yearEnd: null, tenant: 't1' }), { accountType: 'INVENTORY' })
   assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
 })
 
@@ -415,4 +416,46 @@ test('persistAccountingAccountBalanceSnapshots stores the year end with the bala
   assert.equal(client.rows[0]!.financialYearEnd, null, 'a re-pull without a year end clears the old one')
   await persistAccountingAccountBalanceSnapshots([{ ...base, financialYearEnd: '02-30' }], client as never)
   assert.equal(client.rows[0]!.financialYearEnd, null, 'an impossible year end is not stored')
+})
+
+// WHICH account the two balances belong to.
+const ids = (openingId: string, closingId: string, openingTenant = 't1', closingTenant = 't1') => {
+  const [o, c] = windowRows('2026-05-31', '2026-06-30')
+  return [{ ...o!, externalAccountId: openingId, tenantId: openingTenant }, { ...c!, externalAccountId: closingId, tenantId: closingTenant }]
+}
+
+test('a code reassigned to another account: the old account\'s opening is NEVER subtracted from the new account\'s closing', async () => {
+  for (const accountType of ['INVENTORY', 'EXPENSE']) {
+    const client = snapshotClient(ids('old-account', 'cogs-account'), { accountType, yearEnd: '12-31', chartIds: ['cogs-account'] })
+    await assert.rejects(
+      () => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never),
+      (error) => error instanceof MissingAccountBalanceSnapshotError && error.reason === 'missing_previous_day_snapshot',
+      accountType,
+    )
+  }
+})
+
+test('both balances of the configured account\'s own id, same organisation: differenced (every type)', async () => {
+  for (const accountType of ['INVENTORY', 'EXPENSE']) {
+    const client = snapshotClient(ids('cogs-account', 'cogs-account'), { accountType, yearEnd: '12-31' })
+    assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00', accountType)
+  }
+})
+
+test('a balance-sheet account whose two balances come from different organisations is withheld', async () => {
+  const client = snapshotClient(ids('cogs-account', 'cogs-account', 't1', 't2'), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), (e) => e instanceof AccountBalanceMovementWithheldError && e.reason === 'account_identity_changed')
+})
+
+test('a code the chart does not name exactly once (none, two active, or an unknown id) is withheld, never guessed', async () => {
+  for (const chart of [{ accountType: null }, { accountType: 'INVENTORY', chartIds: ['cogs-account', 'other-account'] }] as Array<{ accountType: string | null; chartIds?: string[] }>) {
+    const client = snapshotClient(ids('cogs-account', 'cogs-account'), chart)
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), (e) => e instanceof AccountBalanceMovementWithheldError && e.reason === 'account_identity_unproven')
+  }
+})
+
+test('an explicit externalAccountId in the lookup is the intended account (the chart is asked for that id)', async () => {
+  const client = snapshotClient(ids('cogs-account', 'cogs-account'), { accountType: 'INVENTORY' })
+  const movement = await getAccountBalancePeriodMovement({ ...lookup('2026-06-01', '2026-06-30'), accountCode: undefined, externalAccountId: 'cogs-account' }, client as never)
+  assert.equal(movement.movementBase.toFixed(2), '-860.00')
 })

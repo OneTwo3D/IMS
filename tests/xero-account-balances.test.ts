@@ -238,3 +238,36 @@ test('a refused row with a different id and the same code is a conflict too, not
   assert.deepEqual(result.snapshots, [])
   assert.match(result.errors[0]!, /TB_ACCOUNT_ID_CONFLICT/)
 })
+
+const blankWithId = (id: string, ytdDebit: string, code?: string) => ({ RowType: 'Row', Cells: [{ Value: '', Attributes: [{ Id: 'account', Value: id }, ...(code ? [{ Id: 'accountCode', Value: code }] : [])] }, ...['', '', ytdDebit, ''].map((Value) => ({ Value }))] })
+
+test('a data Row with a BLANK label is refused, never skipped, and withholds the account its attributes name', () => {
+  const result = buildFor([ACCOUNT_631], [blankWithId('a-631', '500'), row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots, [], '631 must not be stored as an absent zero')
+  assert.match(result.errors[0]!, /631.*TB_BLANK_LABEL/)
+})
+
+test('a blank-label Row that names the account only by code withholds that account', () => {
+  const result = buildFor([ACCOUNT_631], [{ RowType: 'Row', Cells: [{ Value: '  ', Attributes: [{ Id: 'accountCode', Value: '631' }] }, ...['', '', '9', ''].map((Value) => ({ Value }))] }, row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /TB_BLANK_LABEL/)
+})
+
+test('a blank-label Row with no account identity at all refuses the whole report', () => {
+  for (const blank of [row('', '', '', '500', ''), { RowType: 'Row', Cells: [] }, { RowType: 'Row' }]) {
+    const result = buildFor([ACCOUNT_631], [blank, row('Cost of Goods Sold (310)', '', '', '5', '')])
+    assert.deepEqual(result.snapshots, [])
+    assert.match(result.errors[0]!, /^TB_UNIDENTIFIED_REFUSED_ROW/)
+  }
+})
+
+test('a blank-label Row naming a DIFFERENT account does not block the configured one (positively another account)', () => {
+  const result = buildFor([ACCOUNT_631], [blankWithId('a-OTHER', '500'), withId('Inventory Control (631)', 'a-631', '12')])
+  assert.deepEqual(result.snapshots.map((s) => String(s.amountBase)), ['12'])
+})
+
+test('SummaryRow, Section and Header rows with blank labels are still not account rows', () => {
+  const rows = parseXeroTrialBalanceReport(report(HEADER, { RowType: 'Section', Title: 'x', Rows: [{ RowType: 'SummaryRow', Cells: ['', '', '', '1', ''].map((Value) => ({ Value })) }, row('Inventory Control (631)', '', '', '4', '')] }))
+  assert.deepEqual(rows.refusedRows, [])
+  assert.equal(rows.rows.length, 1)
+})
