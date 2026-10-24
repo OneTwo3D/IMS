@@ -30,3 +30,12 @@ export function imsRateToXeroCurrencyRate(rateToBase: number | undefined | null)
   const factor = 10 ** XERO_RATE_DECIMALS
   return Math.round(inverted * factor) / factor
 }
+
+/**
+ * The READ direction, for a caller that holds a Xero document and wants its base-currency amount (the reconciliation pack's R12). Xero's
+ * `CurrencyRate` is 1 document-currency = X base (above), so the base amount is the document amount TIMES the rate: EUR 50 at 1.25 is GBP
+ * 62.50. Generic over the decimal type so the pack keeps its exact arithmetic; this file stays free of imports.
+ */
+export function xeroDocumentAmountToBase<T extends { mul(factor: string): T }>(documentAmount: T, xeroCurrencyRate: string): T {
+  return documentAmount.mul(xeroCurrencyRate)
+}

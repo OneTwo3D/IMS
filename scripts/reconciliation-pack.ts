@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * THE RECONCILIATION PACK (npm run reconcile:pack): runs the pack's items, publishes one report, exits with a code derived from
- * the items. READ-ONLY against the database, NO call to any vendor unless --vendor-reads-only (then GET only: WooCommerce, and the warehouse system with its stored fixed key, never a login), no secret on a command line, and no overall verdict (the
+ * the items. READ-ONLY against the database, NO call to any vendor unless --vendor-reads-only (then GET only: WooCommerce, the warehouse system with its stored fixed key (never a login), and Xero for R12 with the stored token (never refreshed)), no secret on a command line, and no overall verdict (the
  * readiness gate decides). Flags, closed codes and exit codes are single-sourced in lib/reconciliation-pack/constants.ts and
  * rendered into docs/installation.md ("Reconciliation pack"); `--help` prints them.
  *
@@ -32,6 +32,9 @@ import { publishPackReport, type PublishHooks } from '../lib/reconciliation-pack
 import { createMintsoftReadPort, readMintsoftPackCredentials } from '../lib/connectors/mintsoft/reconciliation-read.ts'
 import { createWooGetPort } from '../lib/reconciliation-pack/woo-transport.ts'
 import { readWooCredentials } from '../lib/reconciliation-pack/woo-credentials.ts'
+import { createXeroGetPort } from '../lib/reconciliation-pack/xero-transport.ts'
+import { readXeroAccess, readXeroBinding } from '../lib/reconciliation-pack/xero-credentials.ts'
+import type { XeroVatVendor } from '../lib/reconciliation-pack/vat-item.ts'
 import type { VendorPorts } from '../lib/reconciliation-pack/vendor-items.ts'
 import type { WmsReadPort } from '../lib/reconciliation-pack/wms-source.ts'
 import type { WooGetPort } from '../lib/reconciliation-pack/woo-source.ts'
@@ -59,6 +62,8 @@ export type PackCliDeps = {
   ledgerRunners?: Partial<Record<LedgerItemId, LedgerRunner>>
   /** The WooCommerce port. Consulted ONLY with --vendor-reads-only; the default is the GET-only transport (woo-transport.ts). */
   woo?: WooGetPort
+  /** The Xero port and binding reader (R12). Consulted ONLY with --vendor-reads-only; the default is the GET-only transport over the stored connection (xero-transport.ts), which never refreshes a token. */
+  xero?: XeroVatVendor
   /** The warehouse-system port (R1). Consulted ONLY with --vendor-reads-only; the default is the GET-only, fixed-key reader (lib/connectors/mintsoft/reconciliation-read.ts). */
   wms?: WmsReadPort
   /** Called last, whatever happened: closes the application's database client if the invariant run opened it. */
@@ -218,6 +223,10 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
     const vendor: VendorPorts | undefined = args.vendorReadsOnly
       ? {
         woo: deps.woo ?? createWooGetPort({ readCredentials: () => readStoredWooCredentials(deps) }),
+        xero: deps.xero ?? {
+          port: createXeroGetPort({ readAccess: () => readStoredXeroAccess(deps) }),
+          binding: () => readStoredXeroBinding(deps),
+        },
         wms: deps.wms ?? createMintsoftReadPort({ readCredentials: () => readStoredMintsoftCredentials(deps) }),
       }
       : undefined
@@ -259,6 +268,18 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
 async function readStoredWooCredentials(deps: PackCliDeps) {
   const ims = await deps.openIms()
   try { return await readWooCredentials(ims.client) } finally { await ims.close().catch(() => undefined) }
+}
+
+/** The stored Xero access, read on the first Xero request over a connection of their own, closed whatever happens. Never refreshed. */
+async function readStoredXeroAccess(deps: PackCliDeps) {
+  const ims = await deps.openIms()
+  try { return await readXeroAccess(ims.client, { now: deps.now() }) } finally { await ims.close().catch(() => undefined) }
+}
+
+/** The stored Xero connection's tenant and generation, read in a connection of its own. */
+async function readStoredXeroBinding(deps: PackCliDeps) {
+  const ims = await deps.openIms()
+  try { return await readXeroBinding(ims.client) } finally { await ims.close().catch(() => undefined) }
 }
 
 /** The warehouse-system credentials, read on the first vendor request over a connection of their own, closed whatever happens. */

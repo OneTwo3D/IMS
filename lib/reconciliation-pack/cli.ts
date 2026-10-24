@@ -90,10 +90,17 @@ export function parsePackArgs(argv: readonly string[], now: Date): PackArgs | { 
 /** The only variables a run keeps. Never a PG variable, a grant, a credential other than the database URL, or anything that loads code. */
 export const KEPT_ENV = ['PATH', 'LANG', 'LC_ALL', 'TZ', 'DATABASE_URL'] as const
 /**
+ * The variables the Xero tenant guard judges the stored connection by (lib/connectors/xero/tenant-guard.ts readXeroTenantAllowList): the
+ * allow-list, the block-list, the demo requirement, and the two that say whether the instance is production. Kept only for a run that
+ * opted in to vendor reads, so the pack refuses a connection the connector would refuse. E2E_TEST_MODE is deliberately NOT kept: it
+ * relaxes the guard and the fetch seam's address rules, and a real run never needs it.
+ */
+export const XERO_TENANT_GUARD_ENV = ['XERO_ALLOWED_TENANT_IDS', 'XERO_ALLOWED_TENANT_NAMES', 'XERO_BLOCKED_TENANT_IDS', 'XERO_TENANT_ID', 'XERO_REQUIRE_DEMO_ORG', 'NODE_ENV'] as const
+/**
  * Kept ONLY when the run opted in to vendor reads: the key that decrypts the stored storefront credentials. Without the opt-in the
  * command never reads a vendor credential, so it has no use for the key and does not keep it.
  */
-export const VENDOR_ENV = ['SETTINGS_ENCRYPTION_KEY', 'ENCRYPTION_KEY'] as const
+export const VENDOR_ENV = ['SETTINGS_ENCRYPTION_KEY', 'ENCRYPTION_KEY', ...XERO_TENANT_GUARD_ENV] as const
 
 export function buildPackEnv(parent: Readonly<Record<string, string | undefined>>, home: string, vendorReads = false): Record<string, string> {
   const env: Record<string, string> = { HOME: home }

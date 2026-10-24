@@ -50,6 +50,7 @@ import {
 } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
+import type { XeroVatVendor } from '@/lib/reconciliation-pack/vat-item'
 import { runWmsItem } from '@/lib/reconciliation-pack/wms-items'
 import type { WmsReadPort, WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
 import { readWooOrders, readWooTaxRates, type WooGetPort, type WooOrderRow, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
@@ -63,6 +64,8 @@ export function isVendorItem(id: string): id is VendorItemId {
 
 export type VendorPorts = {
   woo?: WooGetPort
+  /** R12 only (vat-item.ts): the GET-only Xero port and the stored connection's binding reader. */
+  xero?: XeroVatVendor
   /** The warehouse system (R1): GET only, the stored fixed key only. */
   wms?: WmsReadPort
 }
