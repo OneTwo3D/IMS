@@ -47,25 +47,25 @@ async function census(): Promise<Census> {
 
 
 // THE TIER SHARES ONE DATABASE: a Xero token and a first-load run record left by another file are visible to a run, and each is a unique row
-// (one token per connector, one first-load record) that a test needing its own must not delete or collide with. Foreign rows are held aside
-// REVERSIBLY by recorded id (the token's connector renamed, the first-load record's singleton flag cleared) and put back exactly, with the counts asserted.
+// (one token per connector, one first-load record, whose singleton flag a check constraint pins to true) that a test needing its own must not
+// delete or collide with. A foreign token is held aside by renaming its connector; a foreign first-load record is saved WHOLE (every column, as
+// JSON), removed, and re-inserted exactly. Both are put back in finally and the counts asserted.
 type Held = { tokens: string[]; firstLoad: string[] }
 const NOTHING_HELD: Held = { tokens: [], firstLoad: [] }
 async function holdForeignEstate(): Promise<Held> {
   const tokens = (await withClient((c) => c.query(`SELECT id FROM accounting_tokens WHERE connector = 'xero' ORDER BY id`))).rows.map((r: { id: string }) => r.id)
-  const firstLoad = (await withClient((c) => c.query(`SELECT id FROM first_load_apply_runs WHERE singleton = true ORDER BY id`))).rows.map((r: { id: string }) => r.id)
-  const spare = (await withClient((c) => c.query(`SELECT count(*)::int AS n FROM first_load_apply_runs WHERE singleton = false`))).rows[0].n
-  assert.equal(spare, 0, 'precondition: no first-load record is already held aside by something else')
+  const firstLoad = (await withClient((c) => c.query(`SELECT to_jsonb(t)::text AS j FROM first_load_apply_runs t ORDER BY id`))).rows.map((r: { j: string }) => r.j)
   const held: Held = { tokens, firstLoad }
   if (tokens.length > 0) await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'held-' || id WHERE id = ANY($1) AND connector = 'xero'`, [tokens]))
-  if (firstLoad.length > 0) await withClient((c) => c.query(`UPDATE first_load_apply_runs SET singleton = false WHERE id = ANY($1) AND singleton = true`, [firstLoad]))
-  const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs WHERE singleton = true)::int AS f`))).rows[0]
+  for (const j of firstLoad) await withClient((c) => c.query(`DELETE FROM first_load_apply_runs WHERE id = $1`, [(JSON.parse(j) as { id: string }).id]))
+  const visible = (await withClient((c) => c.query(`SELECT (SELECT count(*) FROM accounting_tokens WHERE connector = 'xero')::int AS t, (SELECT count(*) FROM first_load_apply_runs)::int AS f`))).rows[0]
   assert.deepEqual([visible.t, visible.f], [0, 0], 'precondition: no foreign Xero token or first-load record is visible to the run')
   return held
 }
 async function restoreForeignEstate(held: Held): Promise<void> {
   const t = held.tokens.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE accounting_tokens SET connector = 'xero' WHERE id = ANY($1) AND connector = 'held-' || id`, [held.tokens]))).rowCount
-  const f = held.firstLoad.length === 0 ? 0 : (await withClient((c) => c.query(`UPDATE first_load_apply_runs SET singleton = true WHERE id = ANY($1) AND singleton = false`, [held.firstLoad]))).rowCount
+  let f = 0
+  for (const j of held.firstLoad) f += (await withClient((c) => c.query(`INSERT INTO first_load_apply_runs SELECT * FROM jsonb_populate_record(NULL::first_load_apply_runs, $1::jsonb)`, [j]))).rowCount ?? 0
   assert.deepEqual([t, f], [held.tokens.length, held.firstLoad.length], 'every foreign Xero token and first-load record was put back')
 }
 
