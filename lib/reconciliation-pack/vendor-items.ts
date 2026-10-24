@@ -1,5 +1,6 @@
 /**
- * ITEMS R9 AND R13: THE VENDOR ITEMS (WooCommerce), BEHIND AN EXPLICIT OPT-IN.
+ * ITEMS R1, R9 AND R13: THE VENDOR ITEMS, BEHIND AN EXPLICIT OPT-IN. R1 (the warehouse system) lives in wms-items.ts and is dispatched from here;
+ * R9 and R13 (WooCommerce) follow.
  *
  * Both compare IMS with the storefront by identity, from the proven walks of lib/reconciliation-pack/woo-source.ts and the IMS read of
  * lib/reconciliation-pack/ims-readers.ts (one REPEATABLE READ snapshot). Neither runs unless the run was started with
@@ -49,10 +50,12 @@ import {
 } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
+import { runWmsItem } from '@/lib/reconciliation-pack/wms-items'
+import type { WmsReadPort, WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
 import { readWooOrders, readWooTaxRates, type WooGetPort, type WooOrderRow, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 import { normaliseWcOrderStatus, resolveWcPullStatuses } from '@/lib/connectors/woocommerce/order-status-filter'
 
-export const VENDOR_ITEM_IDS = ['R9', 'R13'] as const
+export const VENDOR_ITEM_IDS = ['R1', 'R9', 'R13'] as const
 export type VendorItemId = (typeof VENDOR_ITEM_IDS)[number]
 export function isVendorItem(id: string): id is VendorItemId {
   return (VENDOR_ITEM_IDS as readonly string[]).includes(id)
@@ -60,6 +63,8 @@ export function isVendorItem(id: string): id is VendorItemId {
 
 export type VendorPorts = {
   woo?: WooGetPort
+  /** The warehouse system (R1): GET only, the stored fixed key only. */
+  wms?: WmsReadPort
 }
 
 export type VendorItemContext = {
@@ -70,7 +75,9 @@ export type VendorItemContext = {
   ims?: (options: ImsReadOptions) => Promise<ImsRead>
   /** Test seam for pacing and budget. */
   wooOptions?: WooSourceOptions
-  /** R9 only: the state carried from the previous report and the stream stamp of this run (set by runItems). Absent = no stamp, so R9 is inconclusive STALE_BASIS and never a pass. */
+  /** Test seam for the warehouse system's pacing and budget. */
+  wmsOptions?: WmsSourceOptions
+  /** R1 and R9 (the items that settle): the state carried from the previous report and the stream stamp of this run (set by runItems). Absent = no stamp, so R9 is inconclusive STALE_BASIS and never a pass. */
   settling?: SettlingInput
 }
 
@@ -268,6 +275,7 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
 export async function runVendorItem(id: VendorItemId, context: VendorItemContext): Promise<ItemInput> {
   if (context.vendorReads !== true) return { id, outcome: 'inconclusive', reasons: ['VENDOR_READS_OFF'] }
   try {
+    if (id === 'R1') return await runWmsItem({ vendorReads: context.vendorReads, wms: context.vendor?.wms, ims: context.ims, wmsOptions: context.wmsOptions, settling: context.settling })
     return id === 'R9' ? await runR9(context) : await runR13(context)
   } catch {
     return inconclusive(id, [], 'INTERNAL_ERROR')

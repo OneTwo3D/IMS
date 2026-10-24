@@ -22,7 +22,7 @@ import { NOW, allBrackets, cleanup, realEvidence, scratchDir } from './helpers.t
 import { S1, S2, S3, S4, carryFrom, r9Context, runR9Once } from './settling-fixtures.ts'
 
 /**
- * D7: SETTLING FOR R9. A difference first seen is unsettled and fails only after two LATER successful runs of the order sweep
+ * D7: SETTLING FOR R9 (R1 settles too; see settling-r1.test.ts). A difference first seen is unsettled and fails only after two LATER successful runs of the order sweep
  * stream, counted from the pack's own trusted reports. Mutations are listed in the PR.
  */
 
@@ -152,7 +152,7 @@ test('R9 WITHOUT THE RUN\'S SETTLING INPUT is inconclusive STALE_BASIS: it never
   assert.deepEqual(shape(noInput), ['inconclusive', ['STALE_BASIS']])
   const noStamp = await runR9Once(lacking(), new Map(), null)
   assert.deepEqual(shape(noStamp), ['inconclusive', ['STALE_BASIS']])
-  assert.deepEqual(PACK_ITEM_CATALOGUE.filter((spec) => spec.settles).map((spec) => spec.id), ['R9'], 'only R9 opts in')
+  assert.deepEqual(PACK_ITEM_CATALOGUE.filter((spec) => spec.settles).map((spec) => spec.id), ['R1', 'R9'], 'only R1 and R9 opt in')
   for (const spec of PACK_ITEM_CATALOGUE.filter((candidate) => candidate.settles)) assert.ok(spec.streams.length > 0, 'an item that settles has a stream whose stamp it counts')
 })
 

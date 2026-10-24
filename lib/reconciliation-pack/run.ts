@@ -29,6 +29,7 @@ import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconcilia
 import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
 import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
+import type { WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
 import type { WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 
 /** Reads the read-sync status report, reduced and checked against itself (reduceStatusReport). May throw: the run treats that as an unreadable read. */
@@ -57,6 +58,7 @@ export type RunContext = {
   vendor?: VendorPorts
   /** Test seam for the vendor walks' pacing and budget. */
   wooOptions?: WooSourceOptions
+  wmsOptions?: WmsSourceOptions
   /**
    * Only for an item that settles (its catalogue row), and set per item by runItems, never by the caller: the state carried from the
    * previous report and the stream stamp this run's start read saw. Absent on any other item.
@@ -84,9 +86,9 @@ export type RunPlan = {
 export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromInvariant = (id: 'R3' | 'R4' | 'R15'): ItemRunner => async (context) =>
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
-  const fromVendor = (id: 'R9' | 'R13'): ItemRunner => (context) =>
-    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, settling: context.settling })
-  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13') }
+  const fromVendor = (id: 'R1' | 'R9' | 'R13'): ItemRunner => (context) =>
+    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, wmsOptions: context.wmsOptions, settling: context.settling })
+  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13') }
 }
 
 /** R6 and R10 read the settled as-of basis (ledger-items.ts). */

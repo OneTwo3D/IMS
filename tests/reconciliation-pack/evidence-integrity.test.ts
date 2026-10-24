@@ -26,7 +26,7 @@ function input(items: ItemInput[], over: Partial<ReportInput> = {}): ReportInput
 }
 const put = (items: ItemInput[], next: ItemInput) => items.map((item) => (item.id === next.id ? next : item))
 const compared = (id: PackItemId, entries: ItemInput['entries']): ItemInput => ({ ...passItem(id), proof: { kind: 'compared' }, entries })
-const R1 = (entries: ItemInput['entries']) => compared('R1', entries)
+const R1 = (entries: ItemInput['entries']) => compared('R4', entries)
 const rejects = (items: ItemInput[], label: string) => assert.throws(() => buildReport(input(items), 1, null), ReportInvalid, label)
 
 // ---- (1) a value-bearing entry must carry what the item's mode and measure demand --------------------------------
@@ -45,8 +45,8 @@ test('a value-mode item cannot pass on entries that carry no values (the empty c
 test('each bucket demands its own value shape, delta and verdict', () => {
   const base = defaultItems('P1')
   const reasonsFor = (entries: ItemInput['entries']) => (entries?.unsettled?.length ? (['DIFFERENCES', 'UNSETTLED_PENDING'] as const) : (['DIFFERENCES'] as const))
-  const fail = (entries: ItemInput['entries'], label: string) => rejects(put(base, { id: 'R1', outcome: 'fail', reasons: [...reasonsFor(entries)], entries }), label)
-  const ok = (entries: ItemInput['entries'], label: string) => assert.doesNotThrow(() => buildReport(input(put(base, { id: 'R1', outcome: 'fail', reasons: [...reasonsFor(entries)], entries })), 1, null), label)
+  const fail = (entries: ItemInput['entries'], label: string) => rejects(put(base, { id: 'R4', outcome: 'fail', reasons: [...reasonsFor(entries)], entries }), label)
+  const ok = (entries: ItemInput['entries'], label: string) => assert.doesNotThrow(() => buildReport(input(put(base, { id: 'R4', outcome: 'fail', reasons: [...reasonsFor(entries)], entries })), 1, null), label)
   ok({ unsettled: [{ ...soloI('U|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }], onlyIms: [soloI('V|MAIN')] }, 'an unsettled one-sided difference')
   ok({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-4'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'an unsettled pair that differs')
   fail({ unsettled: [{ ...pair('U|MAIN', '1', '5', '-3'), settling: { sequence: 1, first: STAMP, later: [] } }] }, 'an unsettled pair with a wrong delta')
@@ -92,7 +92,7 @@ test('currencies: R9 (minor unit) needs a known currency for each value, equal o
   assert.doesNotThrow(() => later(put(base, r9({ bothDiffer: [pair('1001', '10', '10', '0', { imsCurrency: 'GBP', vendorCurrency: 'EUR', ...matured })] }, 'fail'))), 'a currency disagreement is a difference')
   assert.doesNotThrow(() => later(put(base, r9({ onlyIms: [{ key: '1002', ims: '5', vendor: null, delta: null, imsCurrency: 'JPY', ...matured }] }, 'fail'))))
   assert.throws(() => later(put(base, r9({ onlyIms: [{ key: '1002', ims: '5', vendor: null, delta: null, ...matured }] }, 'fail'))), ReportInvalid, 'a value with no currency')
-  rejects(put(base, { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [{ key: 'A|MAIN', ims: null, vendor: null, delta: null, imsCurrency: 'GBP' }] } } as never), 'a currency for a missing value')
+  rejects(put(base, { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [{ key: 'A|MAIN', ims: null, vendor: null, delta: null, imsCurrency: 'GBP' }] } } as never), 'a currency for a missing value')
 })
 
 test('presence items (R13, R14) carry no values and no currencies', () => {
@@ -113,8 +113,8 @@ function passingBuild(keys = ['A|MAIN', 'B|MAIN', 'C|MAIN']) {
 test('every equal identity is a line of the evidence; the count and the digest are recomputed from the lines', () => {
   const built = passingBuild()
   const lines = built.evidenceText.trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>)
-  assert.deepEqual(lines.map((l) => [l.item, l.bucket, l.key]), [['R1', 'bothEqual', 'A|MAIN'], ['R1', 'bothEqual', 'B|MAIN'], ['R1', 'bothEqual', 'C|MAIN']])
-  const r1 = built.record.items.find((i) => i.id === 'R1')!
+  assert.deepEqual(lines.map((l) => [l.item, l.bucket, l.key]), [['R4', 'bothEqual', 'A|MAIN'], ['R4', 'bothEqual', 'B|MAIN'], ['R4', 'bothEqual', 'C|MAIN']])
+  const r1 = built.record.items.find((i) => i.id === 'R4')!
   assert.equal(r1.counts.bothEqual, 3)
   assert.equal(r1.evidenceLines, 3)
   assert.equal(r1.bothEqualSha256, equalDigest(['A|MAIN', 'B|MAIN', 'C|MAIN']))
@@ -135,14 +135,14 @@ test('the reader rejects evidence that no longer proves the count or the digest,
   check(`${[lines[0], lines[1], lines[2]!.replace('"delta":"0"', '"delta":null')].join('\n')}\n`, 'a missing delta')
   check(`${[lines[0], lines[1], lines[2]!.replace(',"imsCurrency":null', '')].join('\n')}\n`, 'a missing field')
   check(`${[lines[0], lines[1], lines[2]!.replace('}', ',"extra":1}')].join('\n')}\n`, 'an extra field')
-  check(`${[lines[0], lines[1], lines[2]!.replace('"item":"R1"', '"item":"R13"')].join('\n')}\n`, 'a line for a presence item carrying values')
+  check(`${[lines[0], lines[1], lines[2]!.replace('"item":"R4"', '"item":"R13"')].join('\n')}\n`, 'a line for a presence item carrying values')
   assert.doesNotThrow(() => verifyEvidence(built.evidenceText, built.record))
 })
 
 test('the count the reader trusts is the evidence\'s: a report that claims more equal identities than it lists is invalid', () => {
   const built = passingBuild()
   const lying = JSON.parse(JSON.stringify(built.record))
-  lying.items.find((i: { id: string }) => i.id === 'R1').counts.bothEqual = 30
+  lying.items.find((i: { id: string }) => i.id === 'R4').counts.bothEqual = 30
   assert.throws(() => verifyEvidence(built.evidenceText, lying), ReportInvalid)
 })
 
@@ -150,7 +150,7 @@ test('the count the reader trusts is the evidence\'s: a report that claims more 
 
 function richInput(): ReportInput {
   const items = put(put(defaultItems('P1'), {
-    id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES', 'UNSETTLED_PENDING'], sources: ['ims-database', 'mintsoft-api'],
+    id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES', 'UNSETTLED_PENDING'], sources: ['invariant-report'],
     entries: {
       onlyIms: [soloI('A|MAIN')], onlyVendor: [soloV('B|MAIN')], bothDiffer: [pair('C|MAIN', '1', '5', '-4')], bothEqual: [pair('D|MAIN')],
       unsettled: [{ ...soloI('E|MAIN'), settling: { sequence: 1, first: STAMP, later: [] } }], excluded: [soloI('F|MAIN')], outOfPopulation: [soloV('G|MAIN')],
@@ -173,7 +173,7 @@ const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T
 
 test('the rich input builds; its evidence and JSON hold only the whitelisted fields', () => {
   const built = buildReport(richInput(), 1, null)
-  assert.equal(built.record.items.find((i) => i.id === 'R1')!.counts.unsettled, 1)
+  assert.equal(built.record.items.find((i) => i.id === 'R4')!.counts.unsettled, 1)
   const keys = new Set<string>()
   for (const l of built.evidenceText.trim().split('\n')) for (const k of Object.keys(JSON.parse(l))) keys.add(k)
   assert.deepEqual([...keys].sort(), ['bucket', 'delta', 'ims', 'imsCurrency', 'imsPresent', 'item', 'key', 'settling', 'vendor', 'vendorCurrency', 'vendorPresent'])
@@ -223,28 +223,28 @@ test('prototype and object tricks never reach the output: every one is refused',
     ['toJSON as a key', (i) => ({ ...i, toJSON: () => ({ leak: MARK }) }) as never],
     ['a getter on the input', (i) => { const o = { ...i }; Object.defineProperty(o, 'asOf', { get: () => '2026-10-19', enumerable: true }); return o }],
     ['a getter on an item', (i) => { const items = [...i.items]; const it = { ...items[0]! }; Object.defineProperty(it, 'outcome', { get: () => 'inconclusive', enumerable: true }); items[0] = it; return { ...i, items } }],
-    ['a getter on an entry', () => { const c = clean(); const e = { ...c.items[0]!.entries!.onlyIms![0]! }; Object.defineProperty(e, 'ims', { get: () => '2', enumerable: true }); c.items[0]!.entries!.onlyIms![0] = e; return c }],
+    ['a getter on an entry', () => { const c = clean(); const e = { ...c.items[3]!.entries!.onlyIms![0]! }; Object.defineProperty(e, 'ims', { get: () => '2', enumerable: true }); c.items[3]!.entries!.onlyIms![0] = e; return c }],
     ['a symbol key', (i) => ({ ...i, [Symbol('x')]: MARK }) as never],
     ['a non-enumerable property', (i) => { const o = { ...i }; Object.defineProperty(o, 'hidden', { value: MARK, enumerable: false }); return o }],
     ['a class instance as the input', (i) => Object.assign(new (class Evil { })(), i) as never],
-    ['a class instance as an entry', () => { const c = clean(); c.items[0]!.entries!.onlyIms![0] = Object.assign(new (class E { })(), c.items[0]!.entries!.onlyIms![0]) as never; return c }],
+    ['a class instance as an entry', () => { const c = clean(); c.items[3]!.entries!.onlyIms![0] = Object.assign(new (class E { })(), c.items[3]!.entries!.onlyIms![0]) as never; return c }],
     ['a Proxy as the input', (i) => new Proxy(i, {})],
-    ['a Proxy as an item', () => { const c = clean(); c.items[0] = new Proxy(c.items[0]!, {}); return c }],
+    ['a Proxy as an item', () => { const c = clean(); c.items[3] = new Proxy(c.items[3]!, {}); return c }],
     ['a Proxy as a list', () => { const c = clean(); return { ...c, items: new Proxy(c.items, {}) as never } }],
     ['an object with a custom prototype', (i) => Object.setPrototypeOf({ ...i }, { inherited: MARK })],
-    ['a Map as an entry', () => { const c = clean(); c.items[0]!.entries!.onlyIms![0] = new Map() as never; return c }],
+    ['a Map as an entry', () => { const c = clean(); c.items[3]!.entries!.onlyIms![0] = new Map() as never; return c }],
     ['a Date as a stamp', (i) => ({ ...i, startedAt: new Date(0) }) as never],
     ['a String object as a name', (i) => ({ ...i, systemIdentifier: new String('7000000000000000001') }) as never],
     ['a sparse list', (i) => { const items = new Array(15); items[0] = i.items[0]; return { ...i, items } }],
     ['a list with an extra property', (i) => { const items = [...i.items]; Object.assign(items, { extra: MARK }); return { ...i, items } }],
     ['a list subclass', (i) => ({ ...i, items: Object.setPrototypeOf([...i.items], class Sub extends Array { }.prototype) })],
     ['a list with a getter element', (i) => { const items = [...i.items]; Object.defineProperty(items, 0, { get: () => i.items[0], enumerable: true }); return { ...i, items } }],
-    ['an enormous list', () => { const c = clean(); c.items[0]!.entries!.onlyIms = new Array(5_000_000).fill(null) as never; return c }],
-    ['an enormous sparse list', () => { const c = clean(); c.items[0]!.entries!.onlyIms = new Array(2 ** 31) as never; return c }],
+    ['an enormous list', () => { const c = clean(); c.items[3]!.entries!.onlyIms = new Array(5_000_000).fill(null) as never; return c }],
+    ['an enormous sparse list', () => { const c = clean(); c.items[3]!.entries!.onlyIms = new Array(2 ** 31) as never; return c }],
     ['deep nesting in an unknown field', (i) => { let deep: Record<string, unknown> = {}; for (let n = 0; n < 20000; n += 1) deep = { d: deep }; return { ...i, extra: deep } as never }],
-    ['deep nesting in a settling field', () => { let deep: unknown = []; for (let n = 0; n < 20000; n += 1) deep = [deep]; const c = clean(); (c.items[0]!.entries!.unsettled![0] as { settling: { later: unknown } }).settling.later = deep; return c }],
+    ['deep nesting in a settling field', () => { let deep: unknown = []; for (let n = 0; n < 20000; n += 1) deep = [deep]; const c = clean(); (c.items[3]!.entries!.unsettled![0] as { settling: { later: unknown } }).settling.later = deep; return c }],
     ['a function as a value', (i) => ({ ...i, asOf: () => '2026-10-19' }) as never],
-    ['a bigint as a count-like value', () => { const c = clean(); (c.items[0]!.entries!.onlyIms![0] as { ims: unknown }).ims = BigInt(2); return c }],
+    ['a bigint as a count-like value', () => { const c = clean(); (c.items[3]!.entries!.onlyIms![0] as { ims: unknown }).ims = BigInt(2); return c }],
   ]
   let n = 0
   for (const [label, make] of tricks) {
@@ -269,7 +269,7 @@ test('CRASH SAFETY: an invalid input never writes a file, a directory or a claim
   const dir = path.join(scratchDir(bases), 'reports')
   const writes: string[] = []
   const hooks = { writeFile: (file: string) => { writes.push(file) } }
-  const bad = richInput(); (bad.items[0] as unknown as { extra: string }).extra = MARK
+  const bad = richInput(); (bad.items[3] as unknown as { extra: string }).extra = MARK
   assert.throws(() => publishPackReport(dir, bad, hooks), ReportInvalid)
   assert.throws(() => publishPackReport(dir, { ...richInput(), items: [] }, hooks), ReportInvalid)
   assert.deepEqual(writes, [])
@@ -299,8 +299,8 @@ test('the report reader refuses a JSON document with a __proto__, constructor or
 
 test('the cap cuts equal identities, never a finding; a cut item cannot pass', () => {
   const equal = Array.from({ length: CAP + 5 }, (_, i) => pair(`E${i}`))
-  const built = buildReport(input(put(defaultItems('P1'), { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { bothEqual: equal, onlyIms: [soloI('LOST-IF-CUT')] } })), 1, null, { maxLinesPerItem: CAP })
-  const r1 = built.record.items.find((i) => i.id === 'R1')!
+  const built = buildReport(input(put(defaultItems('P1'), { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { bothEqual: equal, onlyIms: [soloI('LOST-IF-CUT')] } })), 1, null, { maxLinesPerItem: CAP })
+  const r1 = built.record.items.find((i) => i.id === 'R4')!
   assert.equal(r1.counts.onlyIms, 1, 'the finding is kept')
   assert.equal(r1.counts.bothEqual, CAP - 1)
   assert.ok(r1.reasons.includes('CAP_EXCEEDED'))
@@ -318,7 +318,7 @@ test('a proof carries exactly its own fields', () => {
 })
 
 test('the reader refuses one identity listed twice in the evidence even when every count still adds up', () => {
-  const built = buildReport(input(put(defaultItems('P1'), { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [soloI('A|MAIN')], onlyVendor: [soloV('B|MAIN')] } })), 1, null)
+  const built = buildReport(input(put(defaultItems('P1'), { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [soloI('A|MAIN')], onlyVendor: [soloV('B|MAIN')] } })), 1, null)
   const lines = built.evidenceText.trim().split('\n')
   const text = `${lines[0]}\n${lines[1]!.replace('B|MAIN', 'A|MAIN')}\n`
   assert.throws(() => verifyEvidence(text, { ...built.record, evidence: { ...built.record.evidence, sha256: sha256Hex(text) } }), ReportInvalid)
@@ -327,8 +327,8 @@ test('the reader refuses one identity listed twice in the evidence even when eve
 test('the comparator for an item uses the catalogue\'s mode and measure, whatever the caller would prefer', () => {
   const cmp = (id: PackItemId, ims: string, vendor: string, extra: Record<string, unknown> = {}) => compareItem(id, { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'A' }], value: ims, ...extra }], vendor: [{ key: [{ kind: 'sku', raw: 'A' }], value: vendor, ...extra }] })
   const counts = (r: ReturnType<typeof cmp>) => (r.status === 'compared' ? { equal: r.buckets.bothEqual.length, differ: r.buckets.bothDiffer.length } : r.reason)
-  assert.deepEqual(counts(cmp('R1', '1', '5')), { equal: 0, differ: 1 }, 'exact')
-  assert.deepEqual(counts(cmp('R1', '1', '1.00005')), { equal: 1, differ: 0 })
+  assert.deepEqual(counts(cmp('R4', '1', '5')), { equal: 0, differ: 1 }, 'exact')
+  assert.deepEqual(counts(cmp('R4', '1', '1.00005')), { equal: 1, differ: 0 })
   assert.deepEqual(counts(cmp('R6', '100', '100.9')), { equal: 1, differ: 0 }, 'GBP 1')
   assert.deepEqual(counts(cmp('R6', '100', '101.1')), { equal: 0, differ: 1 })
   assert.deepEqual(counts(cmp('R12', '10', '10.04')), { equal: 1, differ: 0 }, 'GBP 0.05')

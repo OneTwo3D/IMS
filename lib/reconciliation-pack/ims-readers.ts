@@ -52,7 +52,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'xeroPostings'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -105,6 +105,9 @@ export type XeroPostingRow = { id: string; type: string; status: string; at: str
 export type XeroPostings = { p0: { state: 'absent' } | { state: 'unverified' } | { state: 'verified'; startedAt: string }; rows: XeroPostingRow[] }
 export type WmsBindingRow = { connector: string; warehouseId: string; warehouseCode: string; externalWarehouseId: string; active: boolean; stockSyncMode: 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'; alignmentConfirmed: boolean }
 
+/** A product linked to a warehouse system: the product id IMS recorded for the warehouse system's own id of it. */
+export type WmsProductLinkRow = { connector: string; productId: string; externalProductId: string }
+
 export type ImsSectionValues = {
   identity: ImsIdentity
   boundaries: PopulationBoundaries
@@ -117,6 +120,7 @@ export type ImsSectionValues = {
   xeroSyncLogs: XeroSyncLogRow[]
   snapshots: ImsSnapshots
   wmsBindings: WmsBindingRow[]
+  wmsProductLinks: WmsProductLinkRow[]
   xeroPostings: XeroPostings
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
@@ -438,6 +442,14 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const bindings = rows.map((row): WmsBindingRow => ({ connector: text(row.connector), warehouseId: text(row.warehouse_id), warehouseCode: text(row.warehouse_code), externalWarehouseId: text(row.external_id), active: bool(row.active), stockSyncMode: oneOf(row.mode, ['DISABLED', 'NOTIFICATION_ONLY', 'ALIGN_TO_WMS'] as const), alignmentConfirmed: bool(row.confirmed) }))
     unique(bindings, (binding) => `${binding.connector}\u0001${binding.warehouseId}`)
     return bindings
+  },
+
+  async wmsProductLinks(tx) {
+    const rows = await readCapped(tx, 'SELECT connector, "productId" AS product_id, "externalProductId" AS external_id FROM wms_product_links ORDER BY id')
+    const links = rows.map((row): WmsProductLinkRow => ({ connector: text(row.connector), productId: text(row.product_id), externalProductId: text(row.external_id) }))
+    unique(links, (link) => `${link.connector}\u0001${link.productId}`)
+    unique(links, (link) => `${link.connector}\u0001${link.externalProductId}`)
+    return links
   },
 }
 

@@ -65,17 +65,17 @@ function everyText(dir: string): string {
 test('END TO END: a credential-shaped SKU and warehouse code reach no published byte, no file name and no error message', () => {
   const dir = fresh()
   const key = [{ kind: 'sku' as const, raw: CANARY }, { kind: 'warehouse' as const, raw: WAREHOUSE_CANARY }]
-  const result = compareItem('R1', { imsComplete: true, vendorComplete: true, ims: [{ key, value: '5' }], vendor: [] })
+  const result = compareItem('R4', { imsComplete: true, vendorComplete: true, ims: [{ key, value: '5' }], vendor: [] })
   assert.equal(result.status, 'compared')
-  const item: ItemInput = { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: result.status === 'compared' ? result.buckets : undefined }
-  const published = publishSyntheticRun({ reportDir: dir, phase: 'P1', asOf: '2026-10-19', now: NOW, streams: allBrackets(), items: { R1: item }, hooks: { lock: { hostname: () => 'api-key-abcdefghijklmnopqrstuv' } } })
+  const item: ItemInput = { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: result.status === 'compared' ? result.buckets : undefined }
+  const published = publishSyntheticRun({ reportDir: dir, phase: 'P1', asOf: '2026-10-19', now: NOW, streams: allBrackets(), items: { R4: item }, hooks: { lock: { hostname: () => 'api-key-abcdefghijklmnopqrstuv' } } })
   assert.equal(published.ok, true)
   const text = everyText(dir)
   for (const needle of [CANARY, CANARY.toUpperCase(), 'api_key', 'API_KEY', 'api-key-abcdefghijklmnopqrstuv']) assert.ok(!text.includes(needle), `leaked ${needle}`)
   assert.match(text, new RegExp(`sku#${digest8(CANARY)}\\|warehouse#${digest8(WAREHOUSE_CANARY)}`), 'the evidence names it by digest')
 
   // handed to the builder as an already-formed key, the raw canary is refused, and the refusal does not repeat it
-  const items = defaultItems('P1').map((i) => (i.id === 'R1' ? { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [{ key: CANARY, ims: '5', vendor: null, delta: null }] } } as unknown as ItemInput : i))
+  const items = defaultItems('P1').map((i) => (i.id === 'R4' ? { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyIms: [{ key: CANARY, ims: '5', vendor: null, delta: null }] } } as unknown as ItemInput : i))
   const input: ReportInput = { runId: newRunId(NOW), systemIdentifier: SYSTEM, phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: allBrackets(), items }
   assert.throws(() => buildReport(input, 1, null), (error: unknown) => error instanceof ReportInvalid && !error.message.includes(CANARY))
 })
@@ -129,7 +129,7 @@ function walk(value: Json, field: string, visit: (field: string, leaf: string | 
 
 test('UNIVERSAL: every key in the JSON, the evidence and the lock has a row in the table, and every string matches its row\'s grammar', () => {
   const dir = fresh()
-  const rows = compareItem('R1', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'A1' }], value: '5' }, { key: [{ kind: 'sku', raw: CANARY }], value: '2' }, { key: [{ kind: 'sku', raw: 'E1' }], value: '1' }], vendor: [{ key: [{ kind: 'sku', raw: 'E1' }], value: '1' }, { key: [{ kind: 'sku', raw: 'V1' }], value: '3' }] })
+  const rows = compareItem('R4', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'A1' }], value: '5' }, { key: [{ kind: 'sku', raw: CANARY }], value: '2' }, { key: [{ kind: 'sku', raw: 'E1' }], value: '1' }], vendor: [{ key: [{ kind: 'sku', raw: 'E1' }], value: '1' }, { key: [{ kind: 'sku', raw: 'V1' }], value: '3' }] })
   const r9 = compareItem('R9', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'vendor-id', raw: 1001 }], value: '10', currency: 'GBP' }], vendor: [{ key: [{ kind: 'vendor-id', raw: 1001 }], value: '10.01', currency: 'GBP' }] })
   const r13 = compareItem('R13', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'TAX1' }] }, { key: [{ kind: 'sku', raw: 'TAX2' }] }], vendor: [{ key: [{ kind: 'sku', raw: 'TAX1' }] }] })
   const unsettled = compareItem('R12', { imsComplete: true, vendorComplete: true, ims: [{ key: [{ kind: 'sku', raw: 'U1' }], value: '4' }], vendor: [], settling: { carried: new Map(), stamp: STAMP, usable: true } })
@@ -139,7 +139,7 @@ test('UNIVERSAL: every key in the JSON, the evidence and the lock has a row in t
   const published = publishSyntheticRun({
     reportDir: dir, phase: 'P1', asOf: '2026-10-19', now: NOW, streams: allBrackets(),
     items: {
-      R1: { id: 'R1', outcome: 'fail', reasons: ['DIFFERENCES'], entries: entries(rows) },
+      R4: { id: 'R4', outcome: 'fail', reasons: ['DIFFERENCES'], entries: entries(rows) },
       R9: { id: 'R9', outcome: 'pass', reasons: [], sources: ['ims-database', 'woocommerce-api'], proof: { kind: 'compared' }, entries: entries(r9) },
       R13: { id: 'R13', outcome: 'fail', reasons: ['DIFFERENCES'], entries: entries(r13) },
       R12: { id: 'R12', outcome: 'inconclusive', reasons: ['UNSETTLED_PENDING'], entries: entries(unsettled) },

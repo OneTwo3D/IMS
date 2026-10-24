@@ -35,8 +35,8 @@ function input(system: string, minutes: number, items?: ItemInput[]): ReportInpu
   return { runId: newRunId(at(minutes)), systemIdentifier: system, phase: 'P1', asOf: '2026-10-19', startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams: [], items: items ?? defaultItems('P1') }
 }
 function swapReport() {
-  const { item } = itemFromComparison('R1', { ims: [{ key: key('A'), value: '5' }, { key: key('B'), value: '7' }], vendor: [{ key: key('A'), value: '5' }, { key: key('C'), value: '7' }] })
-  return buildReport(input('7000000000000000001', 0, defaultItems('P1', { R1: item })), 1, null)
+  const { item } = itemFromComparison('R4', { ims: [{ key: key('A'), value: '5' }, { key: key('B'), value: '7' }], vendor: [{ key: key('A'), value: '5' }, { key: key('C'), value: '7' }] })
+  return buildReport(input('7000000000000000001', 0, defaultItems('P1', { R4: item })), 1, null)
 }
 
 test('a key part is a non-empty plain string or a safe whole number, or the row is refused', () => {
@@ -57,9 +57,9 @@ test('two different whole-number identities are two identities (never one shared
 
 test('a capped listing of a non-finding bucket cannot pass', () => {
   const rows = Array.from({ length: CAP + 1 }, (_, i) => ({ key: key(`X${i}`), value: '1' }))
-  const { item } = itemFromComparison('R1', { ims: [...rows, { key: key('OK'), value: '1' }], vendor: [{ key: key('OK'), value: '1' }], excluded: new Set(rows.map((r) => canonicalKey(r.key))) })
+  const { item } = itemFromComparison('R4', { ims: [...rows, { key: key('OK'), value: '1' }], vendor: [{ key: key('OK'), value: '1' }], excluded: new Set(rows.map((r) => canonicalKey(r.key))) })
   assert.equal(item.outcome, 'pass', 'precondition: the comparison itself passes')
-  assert.throws(() => buildReport(input('7000000000000000001', 0, defaultItems('P1', { R1: item })), 1, null, { maxLinesPerItem: CAP }), ReportInvalid)
+  assert.throws(() => buildReport(input('7000000000000000001', 0, defaultItems('P1', { R4: item })), 1, null, { maxLinesPerItem: CAP }), ReportInvalid)
 })
 
 test('deriveExitCode: a run in which nothing applicable exists or passed is inconclusive, never all-pass', () => {
@@ -85,8 +85,8 @@ test('parseReport re-derives and cross-checks every field it reads', () => {
   assert.throws(() => parseReport(editReport((v) => { v.exitCode = 0 })), ReportInvalid, 'exit code')
   assert.throws(() => parseReport(editReport((v) => { v.sequence = 2 })), ReportInvalid, 'sequence 2 with no predecessor')
   assert.throws(() => parseReport(editReport((v) => { v.previousReportSha256 = 'a'.repeat(64) })), ReportInvalid, 'sequence 1 with a predecessor')
-  assert.throws(() => parseReport(editReport((v) => { v.items[0].bothEqualSha256 = null })), ReportInvalid, 'bothEqual count without digest')
-  assert.throws(() => parseReport(editReport((v) => { v.items[0].counts.onlyIms = 9 })), ReportInvalid, 'counts against evidenceLines')
+  assert.throws(() => parseReport(editReport((v) => { v.items[3].bothEqualSha256 = null })), ReportInvalid, 'bothEqual count without digest')
+  assert.throws(() => parseReport(editReport((v) => { v.items[3].counts.onlyIms = 9 })), ReportInvalid, 'counts against evidenceLines')
   assert.throws(() => parseReport(editReport((v) => { v.items[2].reasons = ['free text'] })), ReportInvalid, 'reason')
   assert.throws(() => parseReport(editReport((v) => { v.items[2].applicability = 'applicable'; v.items[6].applicability = 'applicable' })), ReportInvalid, 'applicability')
   assert.throws(() => parseReport(editReport((v) => { v.extra = 1 })), ReportInvalid)
