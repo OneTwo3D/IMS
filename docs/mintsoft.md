@@ -553,6 +553,14 @@ Product **content** (description, short description, picture) is authored in Woo
 - Operators review unmatched returns and choose restock/refund handling.
 - Restocking preserves the selected destination warehouse on subsequent polling updates.
 
+## Reconciliation Pack Reads (R1)
+
+`npm run reconcile:pack -- --vendor-reads-only` reads Mintsoft for item R1 (IMS on-hand against `TotalStockLevel` per bound warehouse and SKU; the rules are in the installation guide, "Reconciliation pack"). The reader is `lib/connectors/mintsoft/reconciliation-read.ts`:
+
+- It uses the **stored fixed API key only**. It refuses, with no request, unless `mintsoft_auth_mode` is exactly `api_key` and a key and a numeric `mintsoft_client_id` are stored; `POST /api/Auth` (which mints a new tenant key) is unreachable from it, and a 401 is reported, never refreshed. An installation configured through `MINTSOFT_AUTH_MODE` / `MINTSOFT_STATIC_API_KEY` alone is refused: the pack's environment is a short whitelist.
+- It sends only `GET /api/Product/StockLevels?WarehouseId=<n>` and `GET /api/Product/List?PageNo=<n>&Limit=<n, at most 100>` (both on `MINTSOFT_READ_ALLOWLIST`), to the connection's own origin, and a redirect is an error.
+- The live `Product/List` row shape (read 2026-10-23: `ID`, `SKU`, `ClientId`, `Bundle`, `DisCont`, ...) is what the reader parses: `ID`, `SKU`, a boolean `Bundle` (required) and `ClientId` when present. `Bundle` must agree with every warehouse's stock list (else `IDENTITY_CONFLICT`). `DisCont` is not read: discontinued products are still compared. Mintsoft pages `Product/List` with no total, so completeness is proven by exact pages, the empty page after the last, no repeats, two equal scans and containment of every stock row.
+
 ## Stocktakes and Mirrored Warehouses
 
 An IMS-side stock count against a WMS-bound warehouse is coordinated with the stock sync (6oyu.3): under **Align To WMS** posting is **blocked** — the WMS is the stock master, so perform the stocktake there and let the sync import the corrections; under **notification-only** posting **warns and requires acknowledgement**, since any remaining divergence against the WMS is re-flagged as a discrepancy on the next sync. Unbound (or sync-disabled) warehouses are unaffected.

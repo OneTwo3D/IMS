@@ -15,6 +15,9 @@ const modules = [
   '../../lib/reconciliation-pack/xero-transport.ts',
   '../../lib/reconciliation-pack/xero-credentials.ts',
   '../../lib/reconciliation-pack/vat-item.ts',
+  '../../lib/reconciliation-pack/wms-source.ts',
+  '../../lib/reconciliation-pack/wms-items.ts',
+  '../../lib/connectors/mintsoft/reconciliation-read.ts',
   '../../lib/reconciliation-pack/trend.ts',
   '../../lib/ops/readiness-gate-pack.ts',
 ]

@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * THE RECONCILIATION PACK (npm run reconcile:pack): runs the pack's items, publishes one report, exits with a code derived from
- * the items. READ-ONLY against the database, NO call to any vendor unless --vendor-reads-only (then GET only, WooCommerce and Xero), no secret on a command line, and no overall verdict (the
+ * the items. READ-ONLY against the database, NO call to any vendor unless --vendor-reads-only (then GET only: WooCommerce, the warehouse system with its stored fixed key (never a login), and Xero for R12 with the stored token (never refreshed)), no secret on a command line, and no overall verdict (the
  * readiness gate decides). Flags, closed codes and exit codes are single-sourced in lib/reconciliation-pack/constants.ts and
  * rendered into docs/installation.md ("Reconciliation pack"); `--help` prints them.
  *
@@ -29,12 +29,14 @@ import { childLivenessPort, ownClientBasisPort } from '../lib/reconciliation-pac
 import { readImsSnapshot, type ImsQueryClient, type ImsReadOptions } from '../lib/reconciliation-pack/ims-readers.ts'
 import { bracketLiveness } from '../lib/reconciliation-pack/liveness.ts'
 import { publishPackReport, type PublishHooks } from '../lib/reconciliation-pack/publish.ts'
+import { createMintsoftReadPort, readMintsoftPackCredentials } from '../lib/connectors/mintsoft/reconciliation-read.ts'
 import { createWooGetPort } from '../lib/reconciliation-pack/woo-transport.ts'
 import { readWooCredentials } from '../lib/reconciliation-pack/woo-credentials.ts'
 import { createXeroGetPort } from '../lib/reconciliation-pack/xero-transport.ts'
 import { readXeroAccess, readXeroBinding } from '../lib/reconciliation-pack/xero-credentials.ts'
 import type { XeroVatVendor } from '../lib/reconciliation-pack/vat-item.ts'
 import type { VendorPorts } from '../lib/reconciliation-pack/vendor-items.ts'
+import type { WmsReadPort } from '../lib/reconciliation-pack/wms-source.ts'
 import type { WooGetPort } from '../lib/reconciliation-pack/woo-source.ts'
 import { memoisedInvariant, readLivenessSafe, runItems, type BasisPort, type ItemRunner, type LedgerRunner, type LivenessPort } from '../lib/reconciliation-pack/run.ts'
 import { readPackChain } from '../lib/reconciliation-pack/trend.ts'
@@ -62,6 +64,8 @@ export type PackCliDeps = {
   woo?: WooGetPort
   /** The Xero port and binding reader (R12). Consulted ONLY with --vendor-reads-only; the default is the GET-only transport over the stored connection (xero-transport.ts), which never refreshes a token. */
   xero?: XeroVatVendor
+  /** The warehouse-system port (R1). Consulted ONLY with --vendor-reads-only; the default is the GET-only, fixed-key reader (lib/connectors/mintsoft/reconciliation-read.ts). */
+  wms?: WmsReadPort
   /** Called last, whatever happened: closes the application's database client if the invariant run opened it. */
   disconnect: () => Promise<void>
 }
@@ -223,6 +227,7 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
           port: createXeroGetPort({ readAccess: () => readStoredXeroAccess(deps) }),
           binding: () => readStoredXeroBinding(deps),
         },
+        wms: deps.wms ?? createMintsoftReadPort({ readCredentials: () => readStoredMintsoftCredentials(deps) }),
       }
       : undefined
 
@@ -275,6 +280,12 @@ async function readStoredXeroAccess(deps: PackCliDeps) {
 async function readStoredXeroBinding(deps: PackCliDeps) {
   const ims = await deps.openIms()
   try { return await readXeroBinding(ims.client) } finally { await ims.close().catch(() => undefined) }
+}
+
+/** The warehouse-system credentials, read on the first vendor request over a connection of their own, closed whatever happens. */
+async function readStoredMintsoftCredentials(deps: PackCliDeps) {
+  const ims = await deps.openIms()
+  try { return await readMintsoftPackCredentials(ims.client) } finally { await ims.close().catch(() => undefined) }
 }
 
 /** One IMS read in its own connection and its own read-only snapshot, closed whatever happens. */

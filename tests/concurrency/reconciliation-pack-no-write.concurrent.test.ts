@@ -542,3 +542,167 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ---- R1 end to end: the real IMS reads, the real stored-credential read, the real GET-only reader, a LOOPBACK Mintsoft ---------------
+
+const MTAG = `RCMS${process.pid}`
+const MINTSOFT_SETTINGS = ['mintsoft_auth_mode', 'mintsoft_static_api_key', 'mintsoft_client_id']
+
+test('[reconciliation pack] R1 with --vendor-reads-only: the stored fixed key, GET requests to the loopback Mintsoft only (never /api/Auth), the IMS stock compared, a refused auth mode makes no request, and not one row is written', { skip: !RUN }, async () => {
+  const http = await import('node:http')
+  const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
+  const { goodReport, withStamp } = await import('../reconciliation-pack/liveness-fixtures.ts')
+  const { reduceStatusReport } = await import('../../lib/reconciliation-pack/liveness.ts')
+  const { encryptSettingValue } = await import('../../lib/security/encrypted-settings.ts')
+  const { PROBE_WH5, PROBE_WH6 } = await import('../reconciliation-pack/wms-fixtures.ts')
+  const { readFileSync, readdirSync } = await import('node:fs')
+  const { randomBytes } = await import('node:crypto')
+  const KEY = `ms_${MTAG}_fixed_key_value_0123456789`
+  // The probe rows with the SKUs made this test's own (the product ids, warehouses, client and figures are the live tenant's).
+  const plain = PROBE_WH6.filter((r) => !r.Bundle)
+  const sku = (r: { SKU: string }) => `${MTAG}-${r.SKU}`
+  const wireRows = (rows: typeof PROBE_WH5) => rows.map((r) => ({ ...r, SKU: sku(r) }))
+  const seen: Array<{ method: string; url: string; apikey: string | undefined }> = []
+  const server = http.createServer((req, res) => {
+    seen.push({ method: req.method ?? '', url: req.url ?? '', apikey: req.headers['ms-apikey'] as string | undefined })
+    const url = new URL(req.url ?? '/', 'http://x')
+    const headers = { 'content-type': 'application/json' }
+    if (req.method !== 'GET' || url.pathname === '/api/Auth') { res.writeHead(500, headers); res.end('{}'); return }
+    if (url.pathname === '/api/Product/StockLevels') { res.writeHead(200, headers); res.end(JSON.stringify(wireRows(url.searchParams.get('WarehouseId') === '5' ? PROBE_WH5 : url.searchParams.get('WarehouseId') === '6' ? PROBE_WH6 : []))); return }
+    if (url.pathname === '/api/Product/List') {
+      const limit = Number(url.searchParams.get('Limit')); const page = Number(url.searchParams.get('PageNo'))
+      res.writeHead(limit > 100 ? 400 : 200, headers); res.end(JSON.stringify(limit > 100 ? {} : wireRows(PROBE_WH6).slice((page - 1) * limit, page * limit).map((r) => ({ ID: r.ProductId, SKU: r.SKU, ClientId: r.ClientId, Bundle: r.Bundle })))); return
+    }
+    res.writeHead(404, headers); res.end('{}')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as import('node:net').AddressInfo).port
+  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  chmodSync(dir, 0o700)
+  const saved = await withClient(async (client) => (await client.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [MINTSOFT_SETTINGS])).rows as Array<{ key: string; value: string }>)
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const setting = (key: string, value: string) => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "updatedAt" = EXCLUDED."updatedAt"`, [key, value])
+  const targets: string[] = []
+  const original = net.Socket.prototype.connect
+  const previousMode = process.env.E2E_TEST_MODE
+  const previousKeys = { SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, ENCRYPTION_KEY: process.env.ENCRYPTION_KEY }
+  let stockStamp: string | null = null
+  let heldRows: { connections: string[]; bindings: string[]; links: string[] } | null = null
+  try {
+    // R1 reads EVERY Mintsoft binding and link, and the tier shares one database across files, so rows other files left behind would be part
+    // of this estate. Hold them aside for the duration (their connector name is changed, nothing is deleted, so no cascade can fire) and put
+    // them back exactly in the finally block. This is setup and teardown: the no-write census below is taken around the COMMAND only.
+    const held = {
+      connections: (await sql(`UPDATE wms_connections SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
+      bindings: (await sql(`UPDATE external_wms_bindings SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
+      links: (await sql(`UPDATE wms_product_links SET connector = 'held-' || connector WHERE connector = 'mintsoft' RETURNING id`)).rows.map((r) => r.id as string),
+    }
+    heldRows = held
+    const remaining = await sql(`SELECT (SELECT count(*) FROM wms_connections WHERE connector = 'mintsoft')::int AS connections, (SELECT count(*) FROM external_wms_bindings WHERE connector = 'mintsoft')::int AS bindings, (SELECT count(*) FROM wms_product_links WHERE connector = 'mintsoft')::int AS links`)
+    assert.deepEqual([remaining.rows[0].connections, remaining.rows[0].bindings, remaining.rows[0].links], [0, 0, 0], 'precondition: no foreign Mintsoft row is visible to the run')
+    process.env.E2E_TEST_MODE = '1'
+    process.env.SETTINGS_ENCRYPTION_KEY = randomBytes(32).toString('base64')
+    delete process.env.ENCRYPTION_KEY
+    await sql(`DELETE FROM settings WHERE key = ANY($1)`, [MINTSOFT_SETTINGS])
+    await setting('mintsoft_auth_mode', 'api_key')
+    await setting('mintsoft_static_api_key', encryptSettingValue('mintsoft_static_api_key', KEY))
+    await setting('mintsoft_client_id', '89')
+    await sql(`INSERT INTO wms_connections (id, connector, label, "baseUrl", "updatedAt") VALUES ($1, 'mintsoft', $2, $3, now())`, [`${MTAG}-c`, MTAG, `http://127.0.0.1:${port}`])
+    for (const [n, wh] of [[5, 'EAR2'], [6, 'MIL1']] as const) {
+      await sql(`INSERT INTO warehouses (id, code, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${MTAG}-w${n}`, `${MTAG}${wh}`])
+      await sql(`INSERT INTO external_wms_bindings (id, "connectionId", "warehouseId", connector, "externalWarehouseId", "stockSyncMode", "updatedAt") VALUES ($1, $2, $3, 'mintsoft', $4, 'NOTIFICATION_ONLY', now())`, [`${MTAG}-b${n}`, `${MTAG}-c`, `${MTAG}-w${n}`, String(n)])
+    }
+    for (const [i, r] of plain.entries()) {
+      await sql(`INSERT INTO products (id, sku, name, "updatedAt") VALUES ($1, $2, 'x', now())`, [`${MTAG}-p${i}`, sku(r)])
+      await sql(`INSERT INTO wms_product_links (id, "productId", connector, "externalProductId", "updatedAt") VALUES ($1, $2, 'mintsoft', $3, now())`, [`${MTAG}-l${i}`, `${MTAG}-p${i}`, String(r.ProductId)])
+      for (const [n, rows] of [[5, PROBE_WH5], [6, PROBE_WH6]] as const) {
+        const figure = rows.find((x) => x.SKU === r.SKU)!.TotalStockLevel
+        await sql(`INSERT INTO stock_levels (id, "productId", "warehouseId", quantity, "reservedQty", "updatedAt") VALUES ($1, $2, $3, $4, 0, now())`, [`${MTAG}-s${i}-${n}`, `${MTAG}-p${i}`, `${MTAG}-w${n}`, figure])
+      }
+    }
+
+    const run = async (extra: string[]) => {
+      const out: string[] = []
+      const err: string[] = []
+      const before = await census()
+      seen.length = 0
+      targets.length = 0
+      net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+        const raw = args[0] as unknown
+        const first = (Array.isArray(raw) ? raw[0] : raw) as { host?: string; port?: number; path?: string } | number | string
+        targets.push(typeof first === 'object' && first !== null ? (first.path ? `unix:${first.path}` : `${first.host ?? 'localhost'}:${first.port}`) : `${typeof args[1] === 'string' ? args[1] : 'localhost'}:${String(first)}`)
+        return (original as (...a: unknown[]) => unknown).apply(this, args)
+      } as typeof original
+      const liveness = { read: async () => reduceStatusReport(withStamp(goodReport(), 'mintsoft-stock-sync', stockStamp ?? '2026-10-20T00:30:00.000Z')) }
+      const code = await runPackCli({ argv: ['--phase', 'P1', '--as-of', LD, '--items', 'R1', '--report-dir', dir, ...extra], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), deps: { liveness }, stdout: (t) => out.push(t), stderr: (t) => err.push(t) })
+      net.Socket.prototype.connect = original
+      const after = await census()
+      assert.deepEqual(after.counts, before.counts, 'every table has the rows it had')
+      assert.deepEqual(after.stats, before.stats, 'no table saw an insert, update or delete')
+      return { code, out, err, targets: [...targets] }
+    }
+    const url = new URL(process.env.DATABASE_URL!)
+    const onlyDatabaseAndMintsoft = (list: string[]) => { for (const target of list) assert.ok(target === `${url.hostname}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}` || target === `127.0.0.1:${port}`, `unexpected connection to ${target}`) }
+
+    // Without the flag: no request to Mintsoft, no connection to anything but the database.
+    const off = await run([])
+    assert.equal(off.code, 5, off.out.join('\n'))
+    assert.ok(off.out.includes('R1 inconclusive VENDOR_READS_OFF'), off.out.join('\n'))
+    assert.equal(seen.length, 0)
+    assert.ok(off.targets.every((target) => !target.endsWith(`:${port}`)), off.targets.join(','))
+
+    // With it: the stored fixed key, GET only, the two read paths, and the IMS stock equals Mintsoft's on-hand figure.
+    const on = await run(['--vendor-reads-only'])
+    assert.equal(on.code, 5, on.out.join('\n'))
+    assert.ok(on.out.includes('R1 pass -'), on.out.join('\n'))
+    assert.equal(seen.length, 8, '2 warehouses read twice, and the 12 products in one page with its end proof, read twice')
+    assert.deepEqual([...new Set(seen.map((s) => s.method))], ['GET'])
+    assert.ok(seen.every((s) => /^\/api\/Product\/(StockLevels|List)\?/.test(s.url) && s.apikey === KEY && !s.url.includes(KEY)))
+    assert.ok(!seen.some((s) => /\/api\/Auth/i.test(s.url)))
+    onlyDatabaseAndMintsoft(on.targets)
+    assert.ok(on.targets.some((target) => target === `127.0.0.1:${port}`), 'precondition: Mintsoft was contacted')
+    // THE SECRETS-ABSENCE SCAN over every output: stdout, stderr and every published file.
+    const published = (function walk(d: string): string[] { return readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(`${d}/${e.name}`) : [readFileSync(`${d}/${e.name}`, 'utf8')])) })(dir).join('\n')
+    const everything = `${on.out.join('\n')}\n${on.err.join('\n')}\n${published}`
+    for (const secret of [KEY, `127.0.0.1:${port}`, 'ms-apikey', 'mintsoft_static_api_key']) assert.ok(!everything.includes(secret), `output contains ${secret}`)
+
+    // D7: a difference (IMS holds one unit fewer than Mintsoft in MIL1) is UNSETTLED, still unsettled after one further stream run, a failure after two.
+    await sql(`UPDATE stock_levels SET quantity = 35 WHERE id = $1`, [`${MTAG}-s0-6`])
+    const first = await run(['--vendor-reads-only'])
+    assert.equal(first.code, 5, first.out.join('\n'))
+    assert.ok(first.out.includes('R1 inconclusive UNSETTLED_PENDING'), first.out.join('\n'))
+    stockStamp = '2026-10-20T01:30:00.000Z'
+    assert.ok((await run(['--vendor-reads-only'])).out.includes('R1 inconclusive UNSETTLED_PENDING'))
+    stockStamp = '2026-10-20T02:30:00.000Z'
+    const settled = await run(['--vendor-reads-only'])
+    assert.equal(settled.code, 1, settled.out.join('\n'))
+    assert.ok(settled.out.includes('R1 fail DIFFERENCES'), settled.out.join('\n'))
+    onlyDatabaseAndMintsoft(settled.targets)
+
+    // An auth mode that would log in is refused before any request: the loopback sees NOTHING, /api/Auth included.
+    await setting('mintsoft_auth_mode', 'credentials')
+    const refused = await run(['--vendor-reads-only'])
+    assert.ok(refused.out.includes('R1 inconclusive VENDOR_AUTH_REFUSED'), refused.out.join('\n'))
+    assert.equal(seen.length, 0, 'no request of any kind')
+    assert.ok(refused.targets.every((target) => !target.endsWith(`:${port}`)), refused.targets.join(','))
+  } finally {
+    net.Socket.prototype.connect = original
+    if (previousMode === undefined) delete process.env.E2E_TEST_MODE; else process.env.E2E_TEST_MODE = previousMode
+    for (const [name, value] of Object.entries(previousKeys)) { if (value === undefined) delete process.env[name]; else process.env[name] = value }
+    await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections() })
+    await sql(`DELETE FROM stock_levels WHERE id LIKE '${MTAG}%'`)
+    await sql(`DELETE FROM wms_product_links WHERE id LIKE '${MTAG}%'`)
+    await sql(`DELETE FROM products WHERE id LIKE '${MTAG}%'`)
+    await sql(`DELETE FROM external_wms_bindings WHERE id LIKE '${MTAG}%'`)
+    await sql(`DELETE FROM warehouses WHERE id LIKE '${MTAG}%'`)
+    await sql(`DELETE FROM wms_connections WHERE id LIKE '${MTAG}%'`)
+    if (heldRows !== null) {
+      await sql(`UPDATE wms_connections SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.connections])
+      await sql(`UPDATE external_wms_bindings SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.bindings])
+      await sql(`UPDATE wms_product_links SET connector = 'mintsoft' WHERE id = ANY($1) AND connector = 'held-mintsoft'`, [heldRows.links])
+    }
+    await sql(`DELETE FROM settings WHERE key = ANY($1)`, [MINTSOFT_SETTINGS])
+    for (const prior of saved) await setting(prior.key, prior.value)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

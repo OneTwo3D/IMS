@@ -38,6 +38,7 @@ const ID = '[0-9]+'
 export const MINTSOFT_READ_ALLOWLIST: readonly MintsoftReadRule[] = [
   { method: 'GET', pattern: /^\/api\/Warehouse$/, label: 'GET /api/Warehouse' },
   { method: 'GET', pattern: /^\/api\/Product\/StockLevels$/, label: 'GET /api/Product/StockLevels' },
+  { method: 'GET', pattern: /^\/api\/Product\/List$/, label: 'GET /api/Product/List' },
   { method: 'GET', pattern: /^\/api\/Product\/LookupProductId$/, label: 'GET /api/Product/LookupProductId' },
   { method: 'GET', pattern: new RegExp(`^/api/Product/${ID}$`), label: 'GET /api/Product/{id}' },
   { method: 'GET', pattern: new RegExp(`^/api/Product/${ID}/Bundle$`), label: 'GET /api/Product/{id}/Bundle' },

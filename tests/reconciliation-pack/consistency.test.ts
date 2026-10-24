@@ -249,3 +249,20 @@ test('VENDOR_READS_OFF is accepted only as the single reason of an inconclusive 
   rejects(put(base(), off('R9', { outcome: 'fail' })))
   rejects(put(base(), off('R9', { outcome: 'pass', proof: { kind: 'proven-empty', source: 'per-status-total-zero' }, sources: [...getPackItem('R9').sources] })))
 })
+
+// [mutation: the exception applied to every item, or to a pass that still names the vendor, or to a pass with another proof]
+test('THE ONE SOURCE EXCEPTION: a pass on the proof alignment-confirmed names the IMS source alone, for R1 only; every other pass still names exactly its catalogue sources', () => {
+  const retired = (over: Partial<ItemInput> = {}): ItemInput => ({ id: 'R1', outcome: 'pass', reasons: [], proof: { kind: 'proven-empty', source: 'alignment-confirmed' }, sources: ['ims-database'], ...over })
+  accepts(put(base(), retired()))
+  accepts(put(base(), retired({ entries: { outOfPopulation: [solo('A|MAIN')] } })))
+  rejects(put(base(), retired({ sources: [...getPackItem('R1').sources] })), undefined, undefined) // still naming the vendor it never asked
+  rejects(put(base(), retired({ sources: [] })))
+  rejects(put(base(), retired({ sources: ['mintsoft-api'] })))
+  rejects(put(base(), retired({ proof: { kind: 'proven-empty', source: 'vendor-total-zero' } })), undefined, undefined) // another proof still needs the vendor named
+  rejects(put(base(), retired({ proof: { kind: 'compared' }, entries: { bothEqual: [entry('A|MAIN')] } })))
+  rejects(put(base(), { ...retired({ id: 'R9' }) }))
+  rejects(put(base(), { ...retired({ id: 'R13' }), sources: ['ims-database'] }))
+  rejects(put(base(), { ...retired({ id: 'R3' }), sources: ['invariant-report'] }))
+  // The stream still has to be bracketed and stable for the pass (the stock sync is the item's stream).
+  rejects(put(base(), retired()), allBrackets().map((b) => (b.stream === 'mintsoft-stock-sync' ? { ...b, end: '2026-10-19T00:00:01.000Z' } : b)))
+})

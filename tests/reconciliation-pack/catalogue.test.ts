@@ -71,3 +71,10 @@ test('buckets: the finding buckets are a subset of the comparison buckets', () =
   for (const b of FINDING_BUCKETS) assert.ok((COMPARISON_BUCKETS as readonly string[]).includes(b))
   assert.equal(new Set(COMPARISON_BUCKETS).size, 7)
 })
+
+test('only R1 and R9 settle (owner decision D7): their dependent streams are the stock sync and the order sweep; every other item fails on the run that sees a difference', () => {
+  assert.deepEqual(PACK_ITEM_CATALOGUE.filter((spec) => spec.settles).map((spec) => spec.id), ['R1', 'R9'])
+  assert.deepEqual(getPackItem('R1').streams, ['mintsoft-stock-sync'])
+  assert.deepEqual(getPackItem('R9').streams, ['woocommerce-order-sweep'])
+  for (const spec of PACK_ITEM_CATALOGUE) if (spec.settles) assert.ok(spec.streams.length > 0, `${spec.id} needs a stream to settle under`)
+})

@@ -30,6 +30,7 @@ import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type Liv
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
 import { runVatItem } from '@/lib/reconciliation-pack/vat-item'
 import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
+import type { WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
 import type { WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 import type { XeroSourceOptions } from '@/lib/reconciliation-pack/xero-source'
 
@@ -61,6 +62,7 @@ export type RunContext = {
   wooOptions?: WooSourceOptions
   /** Test seam for the Xero walks' pacing and budget (R12). */
   xeroOptions?: XeroSourceOptions
+  wmsOptions?: WmsSourceOptions
   /**
    * Only for an item that settles (its catalogue row), and set per item by runItems, never by the caller: the state carried from the
    * previous report and the stream stamp this run's start read saw. Absent on any other item.
@@ -88,11 +90,11 @@ export type RunPlan = {
 export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
   const fromInvariant = (id: 'R3' | 'R4' | 'R15'): ItemRunner => async (context) =>
     runInvariantItem(id, await context.invariant(), { phase: context.phase, now: context.now(), acceptances: context.acceptances })
-  const fromVendor = (id: 'R9' | 'R13'): ItemRunner => (context) =>
-    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, settling: context.settling })
+  const fromVendor = (id: 'R1' | 'R9' | 'R13'): ItemRunner => (context) =>
+    runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, wmsOptions: context.wmsOptions, settling: context.settling })
   const fromVat: ItemRunner = (context) =>
     runVatItem('R12', { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, xeroOptions: context.xeroOptions })
-  return { R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat }
+  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat }
 }
 
 /** R6 and R10 read the settled as-of basis (ledger-items.ts). */

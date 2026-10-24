@@ -62,11 +62,13 @@ async function seed(): Promise<Seed> {
   await db.$executeRawUnsafe(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "updatedAt") VALUES ($1, 'xero', $2, '630', 'Inventory', '2026-10-19', 'GBP', 7, 7, now())`, `${TAG}-bal`, `${TAG}-acct`)
   const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: TAG } })
   await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: warehouse.id, connector: 'mintsoft', externalWarehouseId: `${TAG}ext`, stockSyncMode: 'NOTIFICATION_ONLY' } })
+  await db.wmsProductLink.create({ data: { productId: product.id, connector: 'mintsoft', externalProductId: `${TAG}ext-product` } })
   return { warehouseId: warehouse.id, productId: product.id, feeId: fee.id, orderId: order.id, taxRateId: rate.id, ids: {} }
 }
 
 async function cleanup() {
   const { db } = await load()
+  await db.$executeRawUnsafe(`DELETE FROM wms_product_links WHERE "externalProductId" LIKE '${TAG}%'`)
   await db.$executeRawUnsafe(`DELETE FROM external_wms_bindings WHERE "externalWarehouseId" LIKE '${TAG}%'`)
   await db.$executeRawUnsafe(`DELETE FROM wms_connections WHERE label = '${TAG}'`)
   await db.$executeRawUnsafe(`DELETE FROM accounting_account_balance_snapshots WHERE id LIKE '${TAG}%'`)
@@ -107,6 +109,7 @@ test('[reconciliation pack] every section reads the seeded rows from a real data
     assert.deepEqual(snaps.run, { stockLevelCount: 1, snapshotCount: 1 }) // a shared scratch DB may hold others' runs for other dates, never this one
     assert.deepEqual(snaps.values.map((x) => [x.productId, x.qty, x.valueBase, x.valueReplayReliable]), [[s.productId, '5.000000', '12.500000', true]])
     assert.deepEqual(snaps.balances.filter((b) => b.externalAccountId.startsWith(TAG)).map((b) => [b.accountCode, b.currency, b.amountBase]), [['630', 'GBP', '7.000000']])
+    assert.deepEqual(v('wmsProductLinks').filter((l) => l.externalProductId.startsWith(TAG)).map((l) => [l.connector, l.productId, l.externalProductId]), [['mintsoft', s.productId, `${TAG}ext-product`]], 'the product link section runs against the real table')
     const binding = v('wmsBindings').find((b) => b.externalWarehouseId === `${TAG}ext`)!
     assert.deepEqual([binding.stockSyncMode, binding.alignmentConfirmed, readers.alignmentState(binding)], ['NOTIFICATION_ONLY', false, 'unconfirmed'])
     assert.ok(['absent', 'unverified', 'verified'].includes(v('boundaries').firstLoad.state))
