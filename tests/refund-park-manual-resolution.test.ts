@@ -171,6 +171,8 @@ mock.module('@/lib/db', {
         },
       },
       salesOrder: { async findUnique() { return state.order } },
+      // o3d-q0x56.8: read only when the order's stored FX rate is unusable.
+      organisation: { async findFirst() { return { baseCurrency: 'GBP' } } },
       // How an accounting tax code is priced (Codex r3 #1). Returned in full so a production query that
       // forgot to filter deactivated / purchase-only rates would show up here rather than pass silently.
       taxRate: { async findMany() { return state.taxRates } },
@@ -951,4 +953,29 @@ test('a retry that never reaches the refund RESTORES the quarantine instead of s
   assert.equal(state.syncRefundsCalls, 1, 'the re-fetch was attempted')
   assert.equal(state.park?.status, 'QUARANTINED', 'the quarantine is restored, so Record manually stays available')
   assert.equal(state.park?.errorMessage, QUARANTINE_MESSAGE, 'and it still says why it was refused')
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-q0x56.8 - the order's stored rate is missing: the hand-recording refuses by name, the park stays recordable
+// ---------------------------------------------------------------------------------------------------
+
+test('[q0x56.8] a FOREIGN order with no usable stored rate refuses the hand-recording by name and writes nothing', async () => {
+  for (const fxRateToBase of [0, -1]) {
+    state.order = { ...ORDER, currency: 'USD', fxRateToBase, lines: ORDER.lines.map((line) => ({ ...line, taxRate: { ...line.taxRate } })) }
+    state.park = { ...QUARANTINED_PARK }
+    state.createRefundCalls = []
+    state.parkUpdates = []
+    const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'WC refund 7101')
+    assert.equal(result.success, false, String(fxRateToBase))
+    assert.match(String(result.error), /This refund cannot be recorded: Order so-1 is in USD but has no usable stored FX rate to GBP/)
+    assert.equal(state.createRefundCalls.length, 0, 'no credit note is raised at 1')
+    assert.equal(state.park?.status, 'QUARANTINED', 'the park stays QUARANTINED and recordable once the order is corrected')
+  }
+})
+
+test('[q0x56.8] a BASE-currency order with no usable stored rate still records, at 1', async () => {
+  state.order = { ...ORDER, currency: 'GBP', fxRateToBase: 0, lines: ORDER.lines.map((line) => ({ ...line, taxRate: { ...line.taxRate } })) }
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'WC refund 7101')
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(state.createRefundCalls.length, 1)
 })

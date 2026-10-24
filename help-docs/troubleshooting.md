@@ -136,7 +136,7 @@ When something goes wrong, three places hold the information you need:
 
 ### Xero invoice CurrencyRate looks wrong
 - IMS stores `1 base = X foreign`; Xero expects `1 foreign = X base`. The connector inverts and rounds to 6dp. If you see a substantially wrong rate, check `SalesOrder.fxRateToBase` on the source order.
-- Zero or null rates fall back to Xero's daily rate (logged as a fallback case). If you want explicit rate control, ensure the order had a valid rate at creation time.
+- For an invoice or bill, a zero or null rate leaves `CurrencyRate` off and Xero applies its daily rate (logged as a fallback case); ensure the order had a valid rate at creation time. A refund or credit note does not do this: a foreign order with no usable stored rate is refused by name (nothing is created at 1). Correct the order's exchange rate and retry. A payment, or a month-end revaluation, with no `fx_rates` row for its date is refused or skipped by name: add the rate in Settings → Currencies.
 
 ### Mintsoft webhook signature mismatch
 - The shared secret must match between IMS and Mintsoft. Re-paste from Settings > Integrations > Mintsoft.

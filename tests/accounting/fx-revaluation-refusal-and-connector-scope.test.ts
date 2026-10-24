@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { fakeFxClient } from '../helpers/fx-fake-client'
+
 /**
  * o3d-j625 r3 — THE AR/AP FX REVALUATION RUN: TWO FINDINGS IN ONE FUNCTION.
  *
@@ -82,7 +84,8 @@ mock.module('@/lib/db', {
       salesOrder: { findMany: async () => state.receivables },
       purchaseInvoice: { findMany: async () => [] },
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
-        fxRate: { groupBy: async () => [], findMany: async () => [] },
+        // o3d-q0x56.4: a missing rate now SKIPS the document, so the USD balance below is given the rate it used to fall back to.
+        fxRate: fakeFxClient([{ fromCurrency: 'GBP', toCurrency: 'USD', rate: '0.8', fetchedAt: new Date('2020-01-01T00:00:00.000Z') }]).fxRate,
         activityLog: { create: async () => ({ id: 'a-1' }) },
       }),
     },

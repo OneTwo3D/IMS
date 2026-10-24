@@ -13,11 +13,13 @@ import {
   computeRealisedFx,
   reverseJournalLines,
   getUnrealisedFxAccounts,
+  describeFxRefusal,
   resolveSettlementFxRateToBase,
   roundAccountingMoney,
   type FxSettlementSide,
 } from '@/lib/accounting-fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { endOfBusinessDateUtc, isMissingFxRateError, type FxMissingReason } from '@/lib/currencies/fx-lookup'
 import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 type JournalLine = {
@@ -92,6 +94,27 @@ export type FxRevaluationResult = {
    * now only count rows that were queued, and what was NOT is stated here instead of vanishing.
    */
   refused: number
+  /**
+   * o3d-q0x56.4 - OPEN DOCUMENTS THIS RUN DID NOT REVALUE BECAUSE NO USABLE RATE EXISTS FOR THEM.
+   *
+   * Each is excluded from the journal (never revalued at 1, never at its booked rate) and named here with the
+   * reason; the same list is written to the activity log as one WARNING per document. Empty when every open
+   * foreign document had a rate. The run is still `success: true`: the documents that did have a rate posted,
+   * and failing the run would make the cron retry something only a rate can fix.
+   *
+   * A skipped document stays unrevalued for THIS valuation date even if the rate is added later the same day:
+   * the journal for a side is keyed by date and side, and a second run sees it as already queued.
+   */
+  skippedNoRate: SkippedRevaluation[]
+}
+
+export type SkippedRevaluation = {
+  side: FxSettlementSide
+  documentId: string
+  reference: string
+  currency: string
+  reason: FxMissingReason
+  message: string
 }
 
 function asDateOnly(input?: Date | string): string {
@@ -367,20 +390,36 @@ async function buildRevaluationLines(params: {
   baseCurrency: string
   controlAccount: string
   fxGainLossAccount: string
-}): Promise<{ lines: JournalLine[]; documents: number }> {
-  const valuationDate = new Date(params.valuationDate)
+}): Promise<{ lines: JournalLine[]; documents: number; skipped: SkippedRevaluation[] }> {
+  // A valuation date is a BUSINESS DAY ('YYYY-MM-DD'): the rate is the latest one on or before the END of that day
+  // (o3d-q0x56.16). `new Date('2026-06-30')` is midnight and would miss every rate fetched during the 30th.
+  const valuationInstant = endOfBusinessDateUtc(params.valuationDate)
   const lines: JournalLine[] = []
+  const skipped: SkippedRevaluation[] = []
   let documents = 0
 
   for (const balance of params.balances) {
-    const settlementRateToBase = await db.$transaction((tx) => resolveSettlementFxRateToBase(tx, {
-      currency: balance.currency,
-      baseCurrency: params.baseCurrency,
-      asOf: valuationDate,
-      fallbackRateToBase: balance.bookedRateToBase,
-      referenceType: params.side === 'receivable' ? 'SalesOrder' : 'PurchaseInvoice',
-      referenceId: balance.id,
-    }))
+    let settlementRateToBase: number
+    try {
+      settlementRateToBase = await db.$transaction((tx) => resolveSettlementFxRateToBase(tx, {
+        currency: balance.currency,
+        baseCurrency: params.baseCurrency,
+        asOf: valuationInstant,
+      }))
+    } catch (error) {
+      // A document with no usable rate is NOT revalued: no line is built for it, so nothing is posted at 1 or at
+      // its booked rate. Any other failure is a fault, not a data gap, and still aborts the run.
+      if (!isMissingFxRateError(error)) throw error
+      skipped.push({
+        side: params.side,
+        documentId: balance.id,
+        reference: balance.reference,
+        currency: balance.currency,
+        reason: error.reason,
+        message: describeFxRefusal(error),
+      })
+      continue
+    }
     const revaluation = computeRealisedFx({
       side: params.side,
       amountForeign: balance.outstandingForeign,
@@ -400,7 +439,26 @@ async function buildRevaluationLines(params: {
     documents += 1
   }
 
-  return { lines, documents }
+  return { lines, documents, skipped }
+}
+
+async function reportSkippedRevaluations(valuationDate: string, skipped: SkippedRevaluation[]): Promise<void> {
+  if (skipped.length === 0) return
+  const { logActivity } = await import('@/lib/activity-log')
+  for (const item of skipped) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      entityId: item.documentId,
+      action: 'unrealised_fx_document_skipped_no_rate',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `The unrealised FX revaluation for ${valuationDate} SKIPPED ${item.side === 'receivable' ? 'order' : 'bill'} `
+        + `${item.reference} (${item.currency}): ${item.message} It is not in this period's revaluation journal, `
+        + 'and nothing was posted for it at a default or booked rate.',
+      metadata: { ...item, valuationDate },
+    }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
+  }
 }
 
 export async function runArApFxRevaluation(input?: {
@@ -413,15 +471,15 @@ export async function runArApFxRevaluation(input?: {
   ])
 
   if (!settings.syncEnabled) {
-    return { success: true, skipped: true, reason: 'Accounting sync disabled', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0 }
+    return { success: true, skipped: true, reason: 'Accounting sync disabled', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [] }
   }
   if (!settings.unrealisedFxGainLossAccount) {
-    return { success: false, error: 'Configure an unrealised FX gain/loss account before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0 }
+    return { success: false, error: 'Configure an unrealised FX gain/loss account before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [] }
   }
   const receivableAccounts = getUnrealisedFxAccounts(settings, 'receivable')
   const payableAccounts = getUnrealisedFxAccounts(settings, 'payable')
   if (!receivableAccounts || !payableAccounts) {
-    return { success: false, error: 'Configure AR, AP, and unrealised FX accounts before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0 }
+    return { success: false, error: 'Configure AR, AP, and unrealised FX accounts before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0, skippedNoRate: [] }
   }
 
   // Don't bail the whole run when today's revaluation already exists: the
@@ -517,6 +575,7 @@ export async function runArApFxRevaluation(input?: {
 
   let revalued = 0
   let documents = 0
+  const skippedNoRate: SkippedRevaluation[] = []
   // Skip only the fresh revaluation when one is already queued for today; the
   // reversal retries above always run regardless (scjz.39).
   if (!alreadyRevaluedForDate) {
@@ -538,6 +597,8 @@ export async function runArApFxRevaluation(input?: {
         fxGainLossAccount: accounts.fxGainLossAccount,
       })
       documents += built.documents
+      skippedNoRate.push(...built.skipped)
+      await reportSkippedRevaluations(valuationDate, built.skipped)
       if (built.lines.length === 0) continue
 
       const revaluationEnqueued = await queueAccountingSync({
@@ -581,15 +642,24 @@ export async function runArApFxRevaluation(input?: {
     revalued,
     documents,
     refused,
+    skippedNoRate,
     ...(noop ? { skipped: true, reason: 'Revaluation already queued for this date' } : {}),
     // Surfaced in the cron route's JSON body, beside the per-refusal WARNING the facade writes to the
     // activity log. Not `success: false`: the run did everything it could, and failing it would make the
     // cron retry a refusal that a retry cannot fix.
-    ...(refused > 0
+    ...(refused > 0 || skippedNoRate.length > 0
       ? {
-          reason:
-            `${refused} unrealised-FX journal${refused === 1 ? '' : 's'} could not be queued and `
-            + 'remain OUTSTANDING — see the accounting activity log for which, and why.',
+          reason: [
+            refused > 0
+              ? `${refused} unrealised-FX journal${refused === 1 ? '' : 's'} could not be queued and `
+                + 'remain OUTSTANDING — see the accounting activity log for which, and why.'
+              : null,
+            skippedNoRate.length > 0
+              ? `${skippedNoRate.length} open document${skippedNoRate.length === 1 ? ' was' : 's were'} NOT revalued because no usable FX rate exists `
+                + `(${skippedNoRate.map((item) => `${item.reference} ${item.currency}: ${item.reason}`).join('; ')}). `
+                + 'Add the rate in Settings -> Currencies; those documents are not in this date\'s journal.'
+              : null,
+          ].filter(Boolean).join(' '),
         }
       : {}),
   }

@@ -5,6 +5,7 @@ import type { db } from '@/lib/db'
 import type { AccountingSettings } from '@/lib/accounting'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { resolveBaseCurrencyCode } from '@/lib/base-currency'
+import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
@@ -3750,7 +3751,25 @@ export async function createSalesOrderRefund(
     })
     if (!so) return { error: 'Order not found' } as const
 
-    const fxRate = refundBoundaryNumber(so.fxRateToBase) || 1
+    // o3d-q0x56.8 - THE ORDER'S BOOKED RATE, OR A REFUSAL. Never 1 for a missing one: a foreign order with no usable
+    // stored rate would have had every refund line converted one-for-one. A credit note reverses what was booked, so
+    // no table rate is looked up in its place either. A base-currency order is 1 because `currency === base`.
+    // Nothing has been written in this transaction yet (advisory/row locks and reads only), so returning here
+    // creates no refund; `quarantine` parks a WooCommerce refund for an operator instead of dropping it.
+    let fxRate: number
+    try {
+      fxRate = (await resolveStoredFxRateToBase({
+        currency: so.currency,
+        baseCurrency: () => resolveBaseCurrencyCode(tx),
+        storedRate: so.fxRateToBase,
+        document: `Order ${so.orderNumber ?? so.externalOrderNumber ?? so.id}`,
+      })).toNumber()
+    } catch (error) {
+      if (isMissingStoredFxRateError(error)) {
+        return { error: `Refund not created: ${error.message}`, quarantine: true as const }
+      }
+      throw error
+    }
 
     // Snapshot each refund line's VAT identity at creation, resolved EXACTLY as the invoice did
     // (o3d-w00). Store the resolved connector tax type so the credit note posts under the rate that was

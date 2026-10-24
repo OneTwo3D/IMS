@@ -97,8 +97,12 @@ import {
   buildRealisedFxJournal,
   computeRealisedFx,
   getRealisedFxAccounts,
+  describeFxRefusal,
   resolveSettlementFxRateToBase,
+  settlementAsOfFromInput,
 } from '@/lib/accounting-fx'
+import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
   buildChargebackRefundLines,
@@ -2212,6 +2216,8 @@ async function loadRefundAccountingQueueInput(
       order: {
         select: {
           fxRateToBase: true,
+          currency: true,
+          orderNumber: true,
           externalOrderNumber: true,
         },
       },
@@ -2242,7 +2248,15 @@ async function loadRefundAccountingQueueInput(
     orderId: refund.orderId,
     refundId: refund.id,
     creditNoteNumber: refund.creditNoteNumber,
-    refundFxRate: decimalToNumber(refund.order.fxRateToBase) || 1,
+    // o3d-q0x56.8: the credit note converts at the order's BOOKED rate. A foreign order without a usable stored
+    // rate throws (this loader already throws for a missing refund) rather than posting at 1; a base-currency
+    // order is 1 because `currency === base`.
+    refundFxRate: (await resolveStoredFxRateToBase({
+      currency: refund.order.currency,
+      baseCurrency: getBaseCurrencyCode,
+      storedRate: refund.order.fxRateToBase,
+      document: `Order ${refund.order.orderNumber ?? refund.order.externalOrderNumber ?? refund.orderId}`,
+    })).toNumber(),
     externalOrderNumber: refund.order.externalOrderNumber,
     lines: refund.lines.map((line) => ({
       id: line.id,
@@ -2956,7 +2970,30 @@ export async function raiseChargebackForReversedOrder(
     // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
     // is false). discountAmount is stored in the order's inclusive/exclusive convention,
     // so strip VAT when the order is tax-inclusive, then to base currency.
-    const fxRate = decimalToNumber(order.fxRateToBase) || 1
+    // o3d-q0x56.8: the discount line is converted at the order's BOOKED rate; a foreign order without one is not
+    // charged back automatically (nothing has been written yet), and an operator is told why. Never 1.
+    let fxRate: number
+    try {
+      fxRate = (await resolveStoredFxRateToBase({
+        currency: order.currency,
+        baseCurrency: getBaseCurrencyCode,
+        storedRate: order.fxRateToBase,
+        document: `Order ${order.orderNumber ?? order.externalOrderNumber ?? orderId}`,
+      })).toNumber()
+    } catch (error) {
+      if (!isMissingStoredFxRateError(error)) throw error
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'chargeback_requires_manual_handling',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: withLedgerCheck(`Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount, but ${error.message} Auto-chargeback skipped; correct the order's rate, or raise the credit note manually.`),
+        metadata: { reason: 'MISSING_STORED_FX_RATE', currency: error.currency, baseCurrency: error.baseCurrency },
+        resolveUser: false,
+      })
+      return { raised: false, reason: 'the order has no usable stored FX rate for its discount line — manual chargeback required' }
+    }
     const vatPct = decimalToNumber(order.taxRatePercent)
     // The posted figure uses the SAME convention as the column it replaces — the invoice payload is
     // built from `SalesOrder.discountAmount` verbatim (queueSalesInvoiceForOrder), in the order's
@@ -3699,6 +3736,35 @@ export async function addPayment(input: {
       }
 
       const paidAt = input.paidAt ? new Date(input.paidAt) : new Date()
+      // o3d-q0x56.4 / .16 - THE SETTLEMENT RATE IS RESOLVED BEFORE THE FIRST WRITE, AND A MISSING ONE REFUSES.
+      //
+      // WHY REFUSE INSTEAD OF "RECORD THE RECEIPT AND HOLD THE FX JOURNAL". The receipt row and the realised-FX
+      // journal are computed from the same dated rate, and nothing in this module retries a journal that was
+      // not queued (`reportPostingNotQueued` below says "Raise it by hand"). Recording the receipt without the
+      // rate would therefore leave a gain/loss that only a person remembering to hand-post it can ever book;
+      // refusing leaves the operator with the dialog still open, the money still in the bank, and a one-line
+      // fix (add the rate, press save again). Nothing is lost by refusing: the only writes so far in this
+      // transaction are the `lockSalesOrder` row lock and reads, and returning here commits none of them
+      // (`PaymentTransactionRefusal` is for refusals AFTER writes; there are none yet).
+      //
+      // ONLY a customer receipt on a foreign-currency order needs it: a refund payment (`refundId`) never
+      // produces an FX journal (see the `!input.refundId` guard below), and a base-currency order is 1 because
+      // `currency === baseCurrency`, not because anything was missing. A date-only `paidAt` ('YYYY-MM-DD', what
+      // the date picker sends) is a business day, so the lookup is as of the END of that day; `paidAt` itself
+      // is stored exactly as before.
+      let settlementRateToBase: number | null = null
+      if (!refundId && so.currency !== baseCurrency) {
+        try {
+          settlementRateToBase = await resolveSettlementFxRateToBase(tx, {
+            currency: so.currency,
+            baseCurrency,
+            asOf: settlementAsOfFromInput(input.paidAt, paidAt),
+          })
+        } catch (error) {
+          if (isMissingFxRateError(error)) return { error: `Payment not recorded: ${describeFxRefusal(error)}` }
+          throw error
+        }
+      }
       const payment = await tx.payment.create({
         data: {
           orderId: input.orderId,
@@ -3806,14 +3872,6 @@ export async function addPayment(input: {
           data: { unregisteredPaidAt: null },
         })
       }
-      const settlementRateToBase = await resolveSettlementFxRateToBase(tx, {
-        currency: so.currency,
-        baseCurrency,
-        asOf: payment.paidAt,
-        fallbackRateToBase: Number(so.fxRateToBase),
-        referenceType: 'Payment',
-        referenceId: payment.id,
-      })
       return { so, becamePaid, paymentId: payment.id, paidAt: payment.paidAt, paymentAmount: payment.amount, settlementRateToBase, baseCurrency }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
@@ -3884,7 +3942,7 @@ export async function addPayment(input: {
           ? await getAccountingSettingsFor(registeredFor.connector)
           : await getAccountingSettings()
         const accounts = getRealisedFxAccounts(accountingSettings, 'receivable')
-        if (accountingSettings.syncEnabled && accounts && txResult.so.currency !== txResult.baseCurrency) {
+        if (accountingSettings.syncEnabled && accounts && txResult.so.currency !== txResult.baseCurrency && txResult.settlementRateToBase !== null) {
           const realised = computeRealisedFx({
             side: 'receivable',
             amountForeign: input.amount,

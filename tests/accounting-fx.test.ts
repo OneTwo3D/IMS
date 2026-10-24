@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { fakeFxClient } from './helpers/fx-fake-client.ts'
-import { buildRealisedFxJournal, computeRealisedFx, resolveSettlementFxRateToBase, reverseJournalLines } from '../lib/accounting-fx.ts'
+import { buildRealisedFxJournal, computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, reverseJournalLines, settlementAsOfFromInput, settlementAsOfFromStored } from '../lib/accounting-fx.ts'
 
 test('computes realised FX loss on customer payment when settlement base is below booked AR', () => {
   const result = computeRealisedFx({
@@ -141,81 +141,76 @@ test('reverses prior unrealised FX journal lines by swapping debits and credits'
   ])
 })
 
-test('settlement FX resolver logs when falling back to the booked rate', async () => {
-  const activityLogs: unknown[] = []
+test('settlement FX resolver: a MISSING rate refuses (no fallback to the booked rate, no 1, nothing logged)', async () => {
   const tx = {
     fxRate: fakeFxClient([]).fxRate,
-    activityLog: {
-      create: async (args: unknown) => {
-        activityLogs.push(args)
-      },
-    },
+    activityLog: { create: async () => { assert.fail('no fallback may be logged: there is no fallback') } },
   }
-
-  const rate = await resolveSettlementFxRateToBase(tx as never, {
-    currency: 'USD',
-    baseCurrency: 'GBP',
-    asOf: new Date('2026-01-15T12:00:00.000Z'),
-    fallbackRateToBase: 1.25,
-    referenceType: 'Payment',
-    referenceId: 'payment-1',
-  })
-
-  assert.equal(rate, 1.25)
-  assert.equal(activityLogs.length, 1)
-  assert.deepEqual(activityLogs[0], {
-    data: {
-      entityType: 'SYSTEM',
-      entityId: 'payment-1',
-      action: 'fx_rate_fallback_used',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: 'Used fallback FX rate for USD settlement on 2026-01-15',
-      metadata: {
-        currency: 'USD',
-        baseCurrency: 'GBP',
-        settlementDate: '2026-01-15',
-        fallbackRateToBase: 1.25,
-        referenceType: 'Payment',
-        referenceId: 'payment-1',
-      },
-    },
-  })
+  await assert.rejects(
+    resolveSettlementFxRateToBase(tx as never, { currency: 'USD', baseCurrency: 'GBP', asOf: new Date('2026-01-15T12:00:00.000Z') }),
+    (e: Error & { reason?: string }) => e.name === 'MissingFxRateError' && e.reason === 'no_rate',
+  )
 })
 
-test('settlement FX resolver uses the stored rate on or before the settlement instant and does not log', async () => {
-  const activityLogs: unknown[] = []
-  const tx = {
-    ...fakeFxClient([
-      { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.30', fetchedAt: new Date('2026-01-14T00:00:00Z') },
-      { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.40', fetchedAt: new Date('2026-01-16T00:00:00Z') },
-    ]),
-    activityLog: { create: async (a: unknown) => { activityLogs.push(a) } },
+test('settlement FX resolver: an empty or malformed currency refuses (it is not the base currency, so it is not 1)', async () => {
+  for (const currency of ['', '  ', 'US', 'U$D']) {
+    await assert.rejects(
+      resolveSettlementFxRateToBase(fakeFxClient([]) as never, { currency, baseCurrency: 'GBP', asOf: new Date('2026-01-15T12:00:00.000Z') }),
+      (e: Error & { reason?: string }) => e.name === 'MissingFxRateError' && e.reason === 'invalid_currency',
+      JSON.stringify(currency),
+    )
   }
+})
+
+test('settlement FX resolver uses the stored rate on or before the settlement instant', async () => {
+  const tx = fakeFxClient([
+    { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.30', fetchedAt: new Date('2026-01-14T00:00:00Z') },
+    { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.40', fetchedAt: new Date('2026-01-16T00:00:00Z') },
+  ])
   const rate = await resolveSettlementFxRateToBase(tx as never, {
-    currency: ' usd ', baseCurrency: 'gbp', asOf: new Date('2026-01-15T12:00:00.000Z'), fallbackRateToBase: 9,
+    currency: ' usd ', baseCurrency: 'gbp', asOf: new Date('2026-01-15T12:00:00.000Z'),
   })
   assert.equal(rate, 1.3)
-  assert.equal(activityLogs.length, 0)
 })
 
 test('settlement FX resolver: base currency is 1 and never reads the table', async () => {
   const c = fakeFxClient([])
-  assert.equal(await resolveSettlementFxRateToBase(c as never, { currency: 'GBP', baseCurrency: 'GBP', asOf: new Date(), fallbackRateToBase: 9 }), 1)
+  assert.equal(await resolveSettlementFxRateToBase(c as never, { currency: 'GBP', baseCurrency: 'GBP', asOf: new Date() }), 1)
   assert.equal(c.calls.length, 0)
 })
 
-test('settlement FX resolver: a tied or non-positive stored rate refuses instead of using the fallback', async () => {
+test('settlement FX resolver: a tied or non-positive stored rate refuses', async () => {
   for (const rows of [
     [{ rate: '1.30' }, { rate: '1.31' }],
     [{ rate: '0' }],
   ]) {
-    const tx = {
-      ...fakeFxClient(rows.map((r) => ({ fromCurrency: 'GBP', toCurrency: 'USD', rate: r.rate, fetchedAt: new Date('2026-01-14T00:00:00Z') }))),
-      activityLog: { create: async () => { assert.fail('must not log a fallback') } },
-    }
+    const tx = fakeFxClient(rows.map((r) => ({ fromCurrency: 'GBP', toCurrency: 'USD', rate: r.rate, fetchedAt: new Date('2026-01-14T00:00:00Z') })))
     await assert.rejects(resolveSettlementFxRateToBase(tx as never, {
-      currency: 'USD', baseCurrency: 'GBP', asOf: new Date('2026-01-15T12:00:00.000Z'), fallbackRateToBase: 1.25,
+      currency: 'USD', baseCurrency: 'GBP', asOf: new Date('2026-01-15T12:00:00.000Z'),
     }), (e: Error) => e.name === 'MissingFxRateError')
   }
+})
+
+test('settlementAsOfFromInput: a date-only string is the END of that UTC day; a timestamp stays an instant', () => {
+  const now = new Date('2030-01-01T00:00:00.000Z')
+  assert.equal(settlementAsOfFromInput('2026-06-10', now).toISOString(), '2026-06-10T23:59:59.999Z')
+  assert.equal(settlementAsOfFromInput('2026-06-10T08:30:00.000Z', now).toISOString(), '2026-06-10T08:30:00.000Z')
+  assert.equal(settlementAsOfFromInput(new Date('2026-06-10T00:00:00.000Z'), now).toISOString(), '2026-06-10T00:00:00.000Z')
+  assert.equal(settlementAsOfFromInput(undefined, now).toISOString(), now.toISOString())
+  assert.equal(settlementAsOfFromInput('', now).toISOString(), now.toISOString())
+})
+
+test('settlementAsOfFromStored: exactly-midnight is the stored form of a date-only input; anything else is an instant', () => {
+  assert.equal(settlementAsOfFromStored(new Date('2026-06-10T00:00:00.000Z')).toISOString(), '2026-06-10T23:59:59.999Z')
+  assert.equal(settlementAsOfFromStored(new Date('2026-06-10T00:00:00.001Z')).toISOString(), '2026-06-10T00:00:00.001Z')
+  assert.equal(settlementAsOfFromStored(new Date('2026-06-10T09:00:00.000Z')).toISOString(), '2026-06-10T09:00:00.000Z')
+})
+
+test('describeFxRefusal tells the operator what to do for each kind of refusal', async () => {
+  const { MissingFxRateError } = await import('../lib/currencies/fx-lookup.ts')
+  const noRate = describeFxRefusal(new MissingFxRateError('Missing GBP FX rate for USD on or before 2026-06-10', 'USD', undefined, 'no_rate', 'GBP'))
+  assert.match(noRate, /Settings -> Currencies/)
+  assert.match(describeFxRefusal(new MissingFxRateError('Invalid stored GBP FX rate for USD', 'USD', undefined, 'non_positive_rate', 'GBP')), /not a positive number/)
+  assert.match(describeFxRefusal(new MissingFxRateError('Ambiguous', 'USD', undefined, 'ambiguous_rate', 'GBP')), /two different rates/)
+  assert.match(describeFxRefusal(new MissingFxRateError('Invalid currency code', 'U', undefined, 'invalid_currency', 'GBP')), /currency/)
 })

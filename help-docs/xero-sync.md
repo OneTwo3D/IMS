@@ -844,7 +844,7 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 - The row used is the latest one for that base and currency with `fetchedAt` on or before the caller's `asOf`. `asOf` is always supplied by the caller; the lookup has no implicit "now" (a caller that means now passes `new Date()`).
 - **Date rule.** A business date (document date, payment date, valuation date) maps to the END of that day, UTC: 23:59:59.999 (`endOfBusinessDateUtc`). A rate fetched at any time that day is therefore that day's rate; a rate fetched at 00:00 the next day is not. A caller holding an instant (an order's creation time) passes the instant itself.
 - Two rows at the same latest `fetchedAt` are accepted only if they carry the same rate; different rates refuse (`ambiguous_rate`). A zero, negative or non-numeric latest rate refuses too; an older good row is not substituted.
-- A missing rate refuses with `MissingFxRateError` and a closed reason (`no_rate`, `non_positive_rate`, `non_finite_rate`, `ambiguous_rate`, `invalid_currency`, `invalid_base_currency`, `invalid_as_of`). The owner ruling (2026-10-24) is that a missing rate never falls back to 1, to a document's booked rate or to a vendor's own rate; callers that still carry such a fallback are being moved to refuse (epic `[one-fx]`).
+- A missing rate refuses with `MissingFxRateError` and a closed reason (`no_rate`, `non_positive_rate`, `non_finite_rate`, `ambiguous_rate`, `invalid_currency`, `invalid_base_currency`, `invalid_as_of`). The owner ruling (2026-10-24) is that a missing rate never falls back to 1, to a document's booked rate or to a vendor's own rate; callers that still carry such a fallback are being moved to refuse (epic `[one-fx]`). The settlement, revaluation and refund/credit-note paths below have been moved; **what to do when one refuses: add the missing rate in Settings → Currencies (or correct the document's own exchange rate where the message says so), then repeat the action.**
 
 **What's covered:**
 
@@ -855,7 +855,9 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 | Sales credit note (refund) | Yes — read from the txn-level FX rate computed for the refund |
 | Purchase invoice (PO → bill) | Yes — read from the PO's `fxRateToBase` at invoice time |
 | Same-currency invoices (rate = 1) | `CurrencyRate = 1` is sent (still explicit, so Xero never falls back to its own rate) |
-| Missing/zero/invalid rate | Field is omitted; Xero's default applies (logged as a fallback case) |
+| Missing/zero/invalid rate on an invoice or bill | Field is omitted; Xero's default applies (logged as a fallback case). Refunds and credit notes no longer reach this: see "Refunds and credit notes use the booked rate" below |
+
+**Refunds and credit notes use the booked rate, and refuse without one.** A refund, a chargeback's discount line, a supplier credit note and a hand-recorded WooCommerce refund are all converted at the exchange rate stored on the order or bill they reverse (never a fresh table rate). A document in the base currency is 1 because its currency is the base currency. A foreign document whose stored rate is missing, zero or negative is **refused by name before anything is written** (`<document> is in USD but has no usable stored FX rate to GBP`): the refund or credit note is not created and nothing is converted at 1. A WooCommerce refund that hits this is not lost: it is parked as a quarantined refund (the sync-exceptions inbox, with the message above and an `refund_sync_missing_order_fx_rate` activity entry). **Operator action: correct the document's exchange rate, then record or retry the refund from the inbox.**
 
 **Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it. Xero sends the inverse form (`1 / x`) as `CurrencyRate`; QuickBooks also inverts the IMS rate before setting `ExchangeRate`, rounded to the connector's supported precision.
 
@@ -1998,6 +2000,8 @@ When a multi-currency invoice or bill is paid, the actual settlement exchange ra
 
 The realised FX entry is queued as a `REALISED_FX_JOURNAL` accounting sync row. Configure the Realised FX Gain/Loss account in **Integrations → Xero → Account Mapping**.
 
+**A missing settlement rate refuses; there is no fallback.** The settlement rate is the latest `fx_rates` row on or before the end of the payment date (a date picked in the form is a whole business day, so a rate fetched at 09:00 that day is that day's rate). If the currency has no rate for that date, or its stored rate is zero, negative or ambiguous, the payment is **refused before anything is written**: no customer receipt or bill-paid status is recorded, nothing is queued, and the message names the currency and date. The old behaviour (use the document's booked rate, then 1, with an `fx_rate_fallback_used` warning) is gone. **Operator action: add the rate in Settings → Currencies for that date (or earlier), then record the payment again.** Refund payments and base-currency documents never need a rate.
+
 ### Unrealised FX (period revaluation)
 
 For open multi-currency AR and AP balances, the daily `accounting-fx-revaluation` cron job:
@@ -2009,11 +2013,15 @@ For open multi-currency AR and AP balances, the daily `accounting-fx-revaluation
 
 This ensures month-end financial reports correctly reflect what your foreign-currency exposure is worth today, without double-counting movements.
 
+**A document with no rate is skipped, by name; the rest still post.** The valuation date is a whole business day (the latest rate on or before the end of it). An open foreign document whose currency has no usable rate for that date is left out of the journal: no line is posted for it, at 1 or at its booked rate. The run still succeeds for the other documents and reports the skips in its result (`skippedNoRate`: document, currency, reason) and as one `unrealised_fx_document_skipped_no_rate` WARNING activity entry per document. A side whose every document was skipped posts no journal at all. **Operator action: add the missing rate in Settings → Currencies.** A skipped document stays unrevalued for that valuation date (the journal for a date and side is posted once); it is picked up on the next run date, and the next period's reversal only reverses what was actually posted.
+
+The **FX Gain/Loss report** (Analytics → FX Gain/Loss) lists a settlement with no rate as *Not computable*, with the reason, an empty rate and gain/loss, and counts it under "Not computable (no rate)"; it is excluded from the totals and never valued at the booked rate or 1.
+
 Configure the Unrealised FX Gain/Loss account separately from Realised in Xero account mapping.
 
 ### FX rate staleness
 
-If the FX rate for a transaction's currency is older than 1 day, the system surfaces this in the activity log as a `fx_rate_fallback_used` WARNING entry. Period-movement queries for accounts strictly require a previous-day snapshot — if no snapshot exists, the report shows a notice rather than silently using a stale value.
+Settlement and revaluation no longer write `fx_rate_fallback_used` entries: they use the latest rate on or before the date, and refuse (settlement) or skip with a named reason (revaluation) when there is none. Period-movement queries for accounts strictly require a previous-day snapshot — if no snapshot exists, the report shows a notice rather than silently using a stale value.
 
 
 ## Daily Batch Caps
