@@ -51,6 +51,21 @@ export interface WooGetPort {
 export type WooOrderRow = { id: string; status: string; currency: string; total: string; createdAt: string | null }
 export type WooProductRow = { id: string; sku: string; status: string; type: string }
 export type WooTaxRateRow = { id: string }
+/** A tax rate with the fields the VAT difference report compares (lib/tax/vat-difference-report.ts). Text fields are the store's own, validated, never repaired. */
+export type WooTaxRateDetail = {
+  id: string
+  name: string
+  /** Percent text exactly as the store states it, for example "20.0000". */
+  rate: string
+  country: string
+  state: string
+  postcode: string
+  city: string
+  /** The tax class slug; the store's standard class is "standard". */
+  class: string
+  shipping: boolean
+  compound: boolean
+}
 
 export type WalkOutcome<T> = { ok: true; rows: T[]; total: number } | { ok: false; reason: PackReasonCode }
 
@@ -145,6 +160,24 @@ function parseProduct(raw: unknown): WooProductRow {
 
 function parseTaxRate(raw: unknown): WooTaxRateRow {
   return { id: rowId(record(raw).id) }
+}
+
+function flag(value: unknown): boolean {
+  if (typeof value !== 'boolean') throw new Stop('SOURCE_UNREADABLE')
+  return value
+}
+
+const TAX_DETAIL_FIELDS = 'id,name,rate,country,state,postcode,city,class,shipping,compound'
+
+function parseTaxRateDetail(raw: unknown): WooTaxRateDetail {
+  const r = record(raw)
+  const rate = r.rate
+  if (typeof rate !== 'string' || parseDecimalStrict(rate) === null) throw new Stop('BAD_VALUE')
+  return {
+    id: rowId(r.id), name: plainText(r.name), rate,
+    country: plainText(r.country, 8), state: plainText(r.state, 64), postcode: plainText(r.postcode, 2048), city: plainText(r.city, 2048),
+    class: plainText(r.class, 64), shipping: flag(r.shipping), compound: flag(r.compound),
+  }
 }
 
 const idNumber = (id: string): bigint => BigInt(id)
@@ -335,6 +368,20 @@ export async function readWooOrderTaxes(
     if (!PLAIN_DATE_RE.test(window.after) || !PLAIN_DATE_RE.test(window.before) || window.after >= window.before) return { ok: false, reason: 'BAD_MODE' }
     const swept = await doubleSweep(makeWalker(port, options), statuses, { after: window.after, before: window.before, _fields: 'id,status,currency,date_created_gmt,total_tax,tax_lines,fee_lines' }, parseOrderTax)
     return { ok: true, value: { orders: swept.orders, totals: swept.totals } }
+  } catch (error) {
+    return { ok: false, reason: reasonOf(error) }
+  }
+}
+
+/**
+ * Every tax rate WITH the fields the VAT difference report compares (rate, country, state, postcode, city, class, shipping, compound),
+ * under the same proof as readWooTaxRates: every page's headers, no short page except the last, strictly ascending ids, and the whole
+ * walk read twice with equal results. The same GET-only port and the same `taxes` collection; only the `_fields` the store is asked for differ.
+ */
+export async function readWooTaxRateDetails(port: WooGetPort, options: WooSourceOptions = {}): Promise<{ ok: true; value: { rates: WooTaxRateDetail[]; total: number } } | { ok: false; reason: PackReasonCode }> {
+  try {
+    const walk = await walkTwice(makeWalker(port, options), 'taxes', { _fields: TAX_DETAIL_FIELDS }, parseTaxRateDetail)
+    return { ok: true, value: { rates: walk.rows, total: walk.total } }
   } catch (error) {
     return { ok: false, reason: reasonOf(error) }
   }

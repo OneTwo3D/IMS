@@ -649,6 +649,32 @@ export async function importPurchaseTaxRatesFromXero(input: { narrowSalesTypes?:
 }
 
 // ---------------------------------------------------------------------------
+// VAT difference report (Xero, IMS and WooCommerce use ONE set of VAT rates; Xero is the master)
+// ---------------------------------------------------------------------------
+
+export type VatDifferenceActionResult =
+  | { success: true; report: import('@/lib/tax/vat-difference-report').VatDifferenceReport }
+  | { success: false; error: string }
+
+/**
+ * READ-ONLY. Compares the VAT rates of Xero (the stored, proven copy of its list; Xero is never called), IMS and WooCommerce
+ * (GET /taxes, every page, through the reconciliation pack's GET-only transport with the stored credentials) and returns every difference
+ * with a reason code. A side that cannot be read or proven is returned as a refusal, never as "no differences". Writes nothing anywhere: at P1
+ * the owner corrects WooCommerce by hand from this report (lib/tax/vat-difference-report.ts).
+ */
+export async function getVatDifferenceReport(): Promise<VatDifferenceActionResult> {
+  await requirePermission('settings.company')
+  try {
+    const { runVatDifferenceReport, createStoredWooPort } = await import('@/lib/tax/vat-difference-run')
+    const report = await runVatDifferenceReport({ db, now: () => new Date(), woo: createStoredWooPort() })
+    return { success: true, report }
+  } catch (e) {
+    unstable_rethrow(e)
+    return { success: false, error: 'The VAT difference report could not be produced.' }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Generate + map missing accounting tax rates (onetwo3d-ims-30tg)
 // ---------------------------------------------------------------------------
 

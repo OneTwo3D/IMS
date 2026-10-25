@@ -131,6 +131,7 @@ export const WOO_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>>
   'order.withdrawal-outcome': 'No IMS producer exists: the endpoint stays in the WooCommerce withdrawal plugin (producer census NO_PRODUCER).',
   'order.trackship-reconcile': 'No IMS producer exists: the endpoint stays in the TrackShip plugin (producer census NO_PRODUCER).',
   'order.invoice-document': 'No IMS producer exists yet: the My Account invoice is a later build (producer census NO_PRODUCER).',
+  'tax-rate': 'No IMS producer exists yet: P1 is the owner correcting WooCommerce by hand from the VAT difference report (producer census NO_PRODUCER).',
 }
 
 export const SOURCE_ROOTS = ['app', 'lib', 'scripts', 'components'] as const

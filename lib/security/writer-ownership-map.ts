@@ -234,6 +234,10 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'No webhooks are registered on the live store in P1; an operator registers them through IMS at P2.',
   }),
+  row('woocommerce', 'tax-rate', { P1: 'operator-manual', P2: 'IMS' }, {
+    obligationTime: 'not-applicable',
+    note: 'Owner ruling 2026-10-25: WooCommerce, IMS and Xero use the SAME set of VAT rates and Xero is the master. P1: the owner corrects WooCommerce tax rates by hand, guided by the read-only VAT difference report (`npm run vat:diff`); IMS writes nothing. P2: IMS writes them. This row only declares ownership: no producer exists yet.',
+  }),
   // ---- Customer e-mail: mapped only (decision D7); enforcement stays the existing settings ---------------------
   row('customer-email', 'despatch', { P1: 'woocommerce-native', P2: 'IMS' }, {
     obligationTime: 'not-applicable',

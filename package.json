@@ -44,6 +44,7 @@
     "read-sync:status": "tsx scripts/read-sync-status.ts",
     "readiness:gate": "tsx scripts/readiness-gate.ts",
     "reconcile:pack": "tsx scripts/reconciliation-pack.ts",
+    "vat:diff": "tsx scripts/vat-difference-report.ts",
     "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",
     "inventory:snapshots:backfill": "tsx scripts/backfill-inventory-snapshots.ts",
     "wc:coupon-discount:backfill": "tsx scripts/backfill-wc-coupon-order-discount.ts",
