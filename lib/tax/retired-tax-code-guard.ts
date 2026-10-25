@@ -24,20 +24,34 @@ import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types
 
 export const RETIRED_CODES_SETTING = 'tax_rekey_retired_codes'
 export const RETIRED_TAX_CODE_REASON = 'retired_tax_code'
+export const RETIRED_TAX_CODE_QUARANTINE_REASON = 'retired_tax_code_in_quarantine'
+
+/**
+ * THE QUARANTINE WINDOW after a re-key commit, for a retired code that an ACTIVE rate now carries under a different meaning (the swap: re-keying CY VAT retires TAX005 while re-keying
+ * BG VAT gives the new BG row TAX005). A CY payload built just before the apply and enqueued just after would pass "an active rate carries it" and post Cyprus sales as Bulgarian VAT.
+ * The window refuses such a code until retired.at + this. 15 minutes: a producer's read-to-enqueue gap is seconds (it reads the line's rate and inserts in one request, and the same
+ * request takes the lock), so the window is orders of magnitude longer than any in-flight build; after it, a payload carrying the code was built from current rows (the apply re-pointed
+ * every document that could still post) and is accepted. Producers were NOT changed to stamp source rate ids: that would touch every cited builder (sales invoice / update, credit note,
+ * refund, bills, supplier credit note) and the payload digests their idempotency keys hash; the window needs no producer change. The apply need not wait for in-flight builders for the same
+ * reason: a stale payload that reaches the insert is refused there, by this window, under the lock.
+ */
+export const REKEY_QUARANTINE_MS = 15 * 60_000
 
 export class RetiredTaxCodeInPayloadError extends Error {
   readonly codes: string[]
-  constructor(codes: string[]) {
-    super(`The accounting payload carries tax code(s) ${codes.join(', ')} that a tax re-key retired and that no active IMS tax rate carries now; it was not queued. Rebuild it from the current document (retry the action).`)
+  readonly reason: typeof RETIRED_TAX_CODE_REASON | typeof RETIRED_TAX_CODE_QUARANTINE_REASON
+  constructor(codes: string[], reason: typeof RETIRED_TAX_CODE_REASON | typeof RETIRED_TAX_CODE_QUARANTINE_REASON = RETIRED_TAX_CODE_REASON) {
+    super(`The accounting payload carries tax code(s) ${codes.join(', ')} that a tax re-key retired${reason === RETIRED_TAX_CODE_REASON ? ' and that no active IMS tax rate carries now' : ' and that now means another rate (quarantine window after the re-key)'}; it was not queued. Rebuild it from the current document (retry the action).`)
     this.name = 'RetiredTaxCodeInPayloadError'
     this.codes = codes
+    this.reason = reason
   }
 }
 
 /** What the guard reads: a Prisma client or transaction. Structural, so a test double without these simply is not guarded. */
 type GuardClient = {
   $executeRaw?: (query: TemplateStringsArray, ...values: unknown[]) => Promise<number>
-  taxRate?: { findMany(args: { where: { accountingTaxType: { in: string[] }; active: true }; select: { accountingTaxType: true } }): Promise<Array<{ accountingTaxType: string | null }>> }
+  taxRate?: { findMany(args: { where: { accountingTaxType: { in: string[] }; active: true }; select: { id: true; accountingTaxType: true } }): Promise<Array<{ id: string; accountingTaxType: string | null }>> }
   setting?: { findUnique(args: { where: { key: string }; select: { value: true } }): Promise<{ value: string } | null> }
 }
 
@@ -51,8 +65,13 @@ export function parseRetiredCodes(value: string | null | undefined): RetiredCode
   } catch { return {} }
 }
 
-/** The retired codes in `payload` that no active rate carries; [] = fine. Takes the shared lock when the payload carries any custom code. */
-export async function retiredTaxCodesInPayload(client: unknown, input: { type: string; payload: unknown }): Promise<string[]> {
+export type RetiredCodeFinding = { code: string; reason: typeof RETIRED_TAX_CODE_REASON | typeof RETIRED_TAX_CODE_QUARANTINE_REASON }
+
+/**
+ * The retired codes in `payload` that must be refused; [] = fine. Takes the shared lock when the payload carries any custom code. A retired code is refused when (a) no active rate
+ * carries it, or (b) an active rate other than the one it was retired from carries it (it changed meaning) and the re-key committed less than REKEY_QUARANTINE_MS ago.
+ */
+export async function retiredTaxCodesInPayload(client: unknown, input: { type: string; payload: unknown; now?: Date }): Promise<RetiredCodeFinding[]> {
   if (input.type === 'TAX_RATE_SYNC') return []
   const codes = taxCodesInPayload(input.payload).filter(isOrganisationSpecificTaxType)
   if (codes.length === 0) return []
@@ -62,6 +81,16 @@ export async function retiredTaxCodesInPayload(client: unknown, input: { type: s
   const retired = parseRetiredCodes((await c.setting.findUnique({ where: { key: RETIRED_CODES_SETTING }, select: { value: true } }))?.value)
   const suspect = codes.filter((code) => Object.prototype.hasOwnProperty.call(retired, code))
   if (suspect.length === 0) return []
-  const active = new Set((await c.taxRate.findMany({ where: { accountingTaxType: { in: suspect }, active: true }, select: { accountingTaxType: true } })).map((r) => r.accountingTaxType))
-  return suspect.filter((code) => !active.has(code))
+  const carriers = await c.taxRate.findMany({ where: { accountingTaxType: { in: suspect }, active: true }, select: { id: true, accountingTaxType: true } })
+  const now = (input.now ?? new Date()).getTime()
+  const out: RetiredCodeFinding[] = []
+  for (const code of suspect) {
+    const entry = retired[code]!
+    const active = carriers.filter((r) => r.accountingTaxType === code)
+    if (active.length === 0) { out.push({ code, reason: RETIRED_TAX_CODE_REASON }); continue }
+    if (active.some((r) => r.id === entry.rateId)) continue
+    const at = Date.parse(entry.at)
+    if (!Number.isFinite(at) || now < at + REKEY_QUARANTINE_MS) out.push({ code, reason: RETIRED_TAX_CODE_QUARANTINE_REASON })
+  }
+  return out
 }

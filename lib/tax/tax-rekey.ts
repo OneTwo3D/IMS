@@ -45,7 +45,7 @@
  *     the reverse-charge tax-type SETTINGS (accounting_reverse_charge_*_tax_type) are separate configuration, reported not changed. No other model stores a tax type.
  *   - ENQUEUE RACE: a producer reads the line's rate BEFORE it takes the enqueue lock, so it can build an old-code payload, pause while this apply commits (no queued row to see), then
  *     insert it. createAccountingSyncLogRow (the one insert of a sync row) therefore refuses, under the lock this apply holds, any payload carrying a code recorded here as retired (setting
- *     tax_rekey_retired_codes, written in the apply's transaction) that no active rate carries: lib/tax/retired-tax-code-guard.ts. The producer's retry rebuilds from the re-pointed rows.
+ *     tax_rekey_retired_codes, written in the apply's transaction)  that no active rate carries, or that now means another rate (a swap) within the quarantine window after this commit: lib/tax/retired-tax-code-guard.ts. The producer's retry rebuilds from the re-pointed rows.
  *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED - a FAILED row keeps blocking until it is retried or cancelled - or an accounting event PENDING / FAILED,
  *     whose lines carry the old code) are snapshots IMS does not rewrite. They BLOCK the apply (QUEUED_PAYLOADS) with no override: let them post, or cancel them, first.
  */
@@ -480,7 +480,7 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     const retired: RetiredCodes = { ...existing }
     const at = new Date().toISOString()
     for (const c of result.created) retired[c.fromCode] = { rateId: c.oldId, newCode: c.toCode, at }
-    for (const c of result.created) if (retired[c.toCode] !== undefined && result.created.some((x) => x.toCode === c.toCode)) delete retired[c.toCode]
+    // A code that is both retired (from one rate) and a target (of another: the swap) STAYS in the set: it changed meaning, and the guard quarantines it for REKEY_QUARANTINE_MS.
     const value = JSON.stringify(retired)
     await tx.setting.upsert({ where: { key: RETIRED_CODES_SETTING }, create: { key: RETIRED_CODES_SETTING, value }, update: { value } })
     await tx.activityLog.create({

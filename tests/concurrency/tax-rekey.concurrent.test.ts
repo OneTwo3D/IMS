@@ -496,11 +496,23 @@ test('THE ENQUEUE GUARD: after a re-key, a payload built from the old code is re
   const inbox = await db.accountingPostingRefusal.findFirst({ where: { type: 'SALES_INVOICE', referenceId: w.soDraftCy.id } })
   assert.equal(inbox?.reason, 'retired_tax_code', 'the refusal is in the posting-refusal inbox with a named reason')
   // Normal enqueues are unaffected: the live code, a built-in, a code no rate carries, and a payload with no tax code at all.
-  for (const payload of [{ lines: [{ taxType: code('A') }] }, { lines: [{ taxType: 'OUTPUT2' }] }, { lines: [{ taxType: code('NOSUCHRATE') }] }, { lines: [] }]) {
+  for (const payload of [{ lines: [{ taxType: code('C') }] }, { lines: [{ taxType: 'OUTPUT2' }] }, { lines: [{ taxType: code('NOSUCHRATE') }] }, { lines: [] }]) {
     const ok = await insert(db, payload)
     assert.ok(ok.row, JSON.stringify(payload))
     created.logs.push(ok.row!.id)
   }
+
+  // (1b) THE SWAP: GR VAT's old code A is retired while BE VAT's new row carries it. A GR payload built before the apply (code A) and enqueued after must NOT pass as "an active rate carries A".
+  await assert.rejects(insert(db, { lines: [{ taxType: code('A') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code_in_quarantine', 'swap, inside the quarantine window')
+  assert.equal((await db.accountingPostingRefusal.findFirst({ where: { type: 'SALES_INVOICE', referenceId: w.soDraftCy.id } }))?.reason, 'retired_tax_code_in_quarantine')
+  // After the window the code is accepted: a payload carrying A was built from current rows (BE VAT). The window is aged by rewriting the recorded commit time.
+  const setting = await db.setting.findUniqueOrThrow({ where: { key: 'tax_rekey_retired_codes' } })
+  const aged = Object.fromEntries(Object.entries(JSON.parse(setting.value) as Record<string, { at: string }>).map(([k, v]) => [k, { ...v, at: new Date(Date.now() - 20 * 60_000).toISOString() }]))
+  await db.setting.update({ where: { key: 'tax_rekey_retired_codes' }, data: { value: JSON.stringify(aged) } })
+  const late = await insert(db, { lines: [{ taxType: code('A') }] })
+  assert.ok(late.row, 'after the window')
+  created.logs.push(late.row!.id)
+  await assert.rejects(insert(db, { lines: [{ taxType: code('OLD1') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code', 'no active carrier: refused whatever the age')
 
   // (2) the interleaving: a producer INSERTS first (the code is not retired yet) and holds the lock to its commit; the apply started meanwhile must wait for it and then see the queued row.
   const w2 = await seedWorld(d)
