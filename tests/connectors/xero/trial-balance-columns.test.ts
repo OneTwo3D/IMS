@@ -336,3 +336,9 @@ test('DATE: ReportDate matching the request does NOT stand in for a missing or d
   assert.equal(persistCalls, 0)
   assert.match(result.errors[0]!, /^TB_REPORT_DATE_MISMATCH/)
 })
+
+test('PARSER VERSION: every snapshot the pull writes carries the current parser version', async () => {
+  trialBalance = realReport()
+  await pull()
+  assert.deepEqual(persisted.map((s) => (s as { parserVersion?: number }).parserVersion), [2, 2, 2])
+})

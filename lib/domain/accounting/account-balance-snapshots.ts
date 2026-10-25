@@ -2,6 +2,7 @@ import type { PrismaClient } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { balanceDateString, normalizeBalanceDate } from '@/lib/domain/accounting/balance-date'
+import { XERO_TRIAL_BALANCE_PARSER_VERSION } from '@/lib/domain/accounting/snapshot-provenance'
 import {
   isLifetimeBalanceAccountType,
   parseFinancialYearEnd,
@@ -27,6 +28,8 @@ export type AccountingAccountBalanceSnapshotInput = {
   tenantId?: string | null
   /** The organisation's financial-year end ("MM-DD") in force at the pull; null/absent = not proven. */
   financialYearEnd?: string | null
+  /** The parser version that produced the balance; absent = not current (readers ignore the row). */
+  parserVersion?: number | null
   syncRunId?: string | null
   fetchedAt?: Date
 }
@@ -44,6 +47,7 @@ export type AccountingAccountBalanceSnapshotRow = {
   sourcePayloadRef: string | null
   tenantId: string | null
   financialYearEnd: string | null
+  parserVersion: number | null
   syncRunId: string | null
   fetchedAt: Date
 }
@@ -179,6 +183,7 @@ function normalizeInput(input: AccountingAccountBalanceSnapshotInput) {
     tenantId: input.tenantId?.trim() || null,
     // Only a real MM-DD is kept; anything else is 'not proven'.
     financialYearEnd: parseFinancialYearEnd(input.financialYearEnd) ? input.financialYearEnd!.trim() : null,
+    parserVersion: Number.isSafeInteger(input.parserVersion) ? input.parserVersion! : null,
     syncRunId: input.syncRunId?.trim() || null,
     fetchedAt: input.fetchedAt ?? new Date(),
   }
@@ -203,6 +208,7 @@ function upsertSnapshotArgs(normalized: NormalizedAccountingAccountBalanceSnapsh
       sourcePayloadRef: normalized.sourcePayloadRef,
       tenantId: normalized.tenantId,
       financialYearEnd: normalized.financialYearEnd,
+      parserVersion: normalized.parserVersion,
       syncRunId: normalized.syncRunId,
       fetchedAt: normalized.fetchedAt,
     },
@@ -237,6 +243,8 @@ export async function findLatestAccountBalanceSnapshot(
   const baseWhere = {
     connector: assertNonEmpty(lookup.connector, 'connector'),
     balanceDate: { lte: normalizeBalanceDate(lookup.balanceDate) },
+    // A balance written by an earlier parser is not a balance: it is ignored, as if the date had not been pulled.
+    parserVersion: XERO_TRIAL_BALANCE_PARSER_VERSION,
     ...(lookup.currency ? { currency: normalizeCurrency(lookup.currency) } : {}),
   }
   const orderBy = [{ balanceDate: 'desc' as const }, { fetchedAt: 'desc' as const }, { id: 'desc' as const }]
@@ -282,6 +290,7 @@ export async function findLatestConfiguredAccountBalanceSnapshot(
       connector: lookup.connector,
       externalAccountId: chartRows[0]!.externalAccountId,
       tenantId,
+      parserVersion: XERO_TRIAL_BALANCE_PARSER_VERSION,
       balanceDate: { lte: normalizeBalanceDate(lookup.balanceDate) },
       ...(lookup.currency ? { currency: normalizeCurrency(lookup.currency) } : {}),
     },

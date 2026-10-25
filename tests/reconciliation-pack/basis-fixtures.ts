@@ -10,6 +10,7 @@ export const TENANT = 'tenant-current'
 export const dateOf = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
 export const PREVIOUS = '2026-10-18'
 export const CODES: Record<PackBasisAccountKind, string> = { inventory: '630', allocated: '631', transit: '632', cogs: '500', unearned: '260' }
+export const CURRENT_PARSER = 2
 export const ACCT = (code: string) => `acct-${code}`
 export const REF = (iso: string) => `xero:trial-balance:${iso}`
 export const REF_ABSENT = (iso: string) => `xero:trial-balance:${iso}:absent-from-tb`
@@ -23,6 +24,8 @@ export type FakeState = {
   gl: BasisGlRow[]
   /** The chart: active accounts by code. Defaults to one `acct-<code>` per configured code. */
   chart: Array<{ code: string | null; externalAccountId: string }>
+  /** A double whose query does NOT honour the parser-version filter, to prove the basis checks the row itself too. */
+  queryIgnoresVersion?: boolean
   /** The sum of the transit sub-ledger movement in (D-1, D]; null = no movement rows. */
   transitMovement: unknown
   run: { snapshotCount: number } | null
@@ -39,9 +42,9 @@ export function goodState(overrides: Partial<FakeState> = {}): FakeState {
     baseCurrency: 'GBP',
     tenant: TENANT,
     gl: [
-      ...PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], externalAccountId: ACCT(CODES[account.kind]), balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT, updatedAt: new Date('2026-10-20T01:00:00.000Z') })),
+      ...PACK_BASIS_ACCOUNTS.map((account) => ({ accountCode: CODES[account.kind], externalAccountId: ACCT(CODES[account.kind]), parserVersion: CURRENT_PARSER, balanceDate: dateOf(D), currency: 'GBP', amountBase: amounts[account.kind], sourcePayloadRef: REF(D), tenantId: TENANT, updatedAt: new Date('2026-10-20T01:00:00.000Z') })),
       // The transit balance of the day before D: the movement of the day is 50 - 40 = 10.
-      { accountCode: CODES.transit, externalAccountId: ACCT(CODES.transit), balanceDate: dateOf(PREVIOUS), currency: 'GBP', amountBase: '40', sourcePayloadRef: REF(PREVIOUS), tenantId: TENANT, updatedAt: new Date('2026-10-19T01:00:00.000Z') },
+      { accountCode: CODES.transit, externalAccountId: ACCT(CODES.transit), parserVersion: CURRENT_PARSER, balanceDate: dateOf(PREVIOUS), currency: 'GBP', amountBase: '40', sourcePayloadRef: REF(PREVIOUS), tenantId: TENANT, updatedAt: new Date('2026-10-19T01:00:00.000Z') },
     ],
     chart: PACK_BASIS_ACCOUNTS.map((account) => ({ code: CODES[account.kind], externalAccountId: ACCT(CODES[account.kind]) })),
     transitMovement: '10',
@@ -72,8 +75,8 @@ export function fakeRun(state: FakeState, log: string[] = []) {
     accountingAccount: { findMany: async (args) => guard('accountingAccount.findMany', () => state.chart.filter((row) => row.code !== null && args.where.code.in.includes(row.code))) },
     organisation: { findFirst: async () => guard('organisation.findFirst', () => (state.baseCurrency === undefined ? null : { baseCurrency: state.baseCurrency })) },
     accountingAccountBalanceSnapshot: {
-      findMany: async (args) => guard('snapshot.findMany', () => state.gl.filter((row) => args.where.accountCode.in.includes(row.accountCode ?? '\u0000') && row.currency === args.where.currency && dateMatch(row.balanceDate, args.where.balanceDate))),
-      count: async (args) => guard('snapshot.count', () => state.gl.filter((row) => row.accountCode === args.where.accountCode && row.currency === args.where.currency && row.tenantId === args.where.tenantId).length),
+      findMany: async (args) => guard('snapshot.findMany', () => state.gl.filter((row) => args.where.accountCode.in.includes(row.accountCode ?? '\u0000') && row.currency === args.where.currency && (state.queryIgnoresVersion === true || row.parserVersion === args.where.parserVersion) && dateMatch(row.balanceDate, args.where.balanceDate))),
+      count: async (args) => guard('snapshot.count', () => state.gl.filter((row) => row.accountCode === args.where.accountCode && row.currency === args.where.currency && row.tenantId === args.where.tenantId && (state.queryIgnoresVersion === true || row.parserVersion === args.where.parserVersion)).length),
     },
     transitSubledgerMovement: { aggregate: async () => guard('transit.aggregate', () => ({ _sum: { baseDelta: state.transitMovement } })) },
     inventorySnapshotRun: { findUnique: async () => guard('run.findUnique', () => state.run) },

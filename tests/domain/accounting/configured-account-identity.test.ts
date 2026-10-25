@@ -8,7 +8,7 @@ import test, { mock } from 'node:test'
  */
 type Row = { id: string; connector: string; externalAccountId: string; accountCode: string; accountName: string; balanceDate: Date; currency: string; amountForeign: string; amountBase: string; sourcePayloadRef: null; tenantId: string | null; financialYearEnd: null; syncRunId: null; fetchedAt: Date }
 const day = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
-const row = (id: string, accountId: string, code: string, iso: string, amount: string, tenantId: string | null = 't1'): Row => ({ id, connector: 'xero', externalAccountId: accountId, accountCode: code, accountName: code, balanceDate: day(iso), currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId, financialYearEnd: null, syncRunId: null, fetchedAt: day(iso) })
+const row = (id: string, accountId: string, code: string, iso: string, amount: string, tenantId: string | null = 't1'): Row => ({ id, connector: 'xero', externalAccountId: accountId, accountCode: code, accountName: code, balanceDate: day(iso), currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId, financialYearEnd: null, parserVersion: 2 as number | null, syncRunId: null, fetchedAt: day(iso) })
 
 let rows: Row[] = []
 let chart: Array<{ code: string; externalAccountId: string; type: string }> = []
@@ -21,9 +21,9 @@ mock.module('@/lib/db', {
       accountingAccount: { findMany: async ({ where }: { where: { code: string } }) => chart.filter((c) => c.code === where.code) },
       accountingToken: { findUnique: async () => (tenant === null ? null : { tenantId: tenant }) },
       accountingAccountBalanceSnapshot: {
-        findFirst: async ({ where }: { where: { externalAccountId?: string; accountCode?: string; tenantId?: string; balanceDate: { lte: Date }; currency?: string } }) => {
+        findFirst: async ({ where }: { where: { externalAccountId?: string; accountCode?: string; tenantId?: string; parserVersion?: number; balanceDate: { lte: Date }; currency?: string } }) => {
           queries.push(where)
-          return rows.filter((r) => (where.externalAccountId === undefined || r.externalAccountId === where.externalAccountId) && (where.accountCode === undefined || r.accountCode === where.accountCode) && (where.tenantId === undefined || r.tenantId === where.tenantId) && r.balanceDate <= where.balanceDate.lte && (where.currency === undefined || r.currency === where.currency))
+          return rows.filter((r) => (where.externalAccountId === undefined || r.externalAccountId === where.externalAccountId) && (where.accountCode === undefined || r.accountCode === where.accountCode) && (where.tenantId === undefined || r.tenantId === where.tenantId) && (where.parserVersion === undefined || r.parserVersion === where.parserVersion) && r.balanceDate <= where.balanceDate.lte && (where.currency === undefined || r.currency === where.currency))
             .sort((a, b) => b.balanceDate.getTime() - a.balanceDate.getTime())[0] ?? null
         },
       },
@@ -85,4 +85,13 @@ test('COGS and transit reconciliations are withheld on an ambiguous or unknown c
   good(); chart = chart.filter((c) => c.code !== '500' && c.code !== '632')
   assert.deepEqual(await cogs(), { available: false, reason: 'account_identity_unproven' })
   assert.deepEqual(await transit(), { available: false, reason: 'account_identity_unproven' })
+})
+
+test('PARSER VERSION: a balance written by an earlier parser is absent to every single-balance reader', async () => {
+  good(); rows = rows.map((r) => ({ ...r, parserVersion: null }))
+  assert.deepEqual(await inv(), { available: false, reason: 'no_gl_snapshot' })
+  assert.deepEqual(await cogs(), { available: false, reason: 'no_gl_snapshot' })
+  assert.deepEqual(await transit(), { available: false, reason: 'no_gl_snapshot' })
+  good(); rows = rows.map((r) => ({ ...r, parserVersion: 1 }))
+  assert.deepEqual(await inv(), { available: false, reason: 'no_gl_snapshot' })
 })

@@ -526,3 +526,52 @@ test('IDENTITY: the transit opening balance must be the configured transit accou
   assert.equal(basis.available, true)
   assert.deepEqual((basis as unknown as { transit: unknown }).transit, { available: false, reason: 'transit_balance_unusable' })
 })
+
+// [mutation: the parser-version filter removed from the query AND the row check] a balance the earlier parser wrote is absent
+test('PARSER VERSION: a balance written by an earlier parser is ABSENT for the cycle date, never a value', async () => {
+  for (const version of [null, 1]) {
+    for (const kind of KINDS) {
+      const state = goodState()
+      state.gl = state.gl.map((row) => (row.accountCode === CODES[kind] && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, parserVersion: version } : row))
+      const { basis } = await load(state)
+      // The only row for that account on any date is the old one, so the account has no balance at all.
+      assert.equal(reason(basis), kind === 'transit' ? 'not_for_date' : 'no_gl_snapshot', `${kind} v${String(version)}`)
+    }
+  }
+})
+
+test('PARSER VERSION: an old-version row for D with a CURRENT-version row on another date is not_for_date', async () => {
+  const state = goodState()
+  const current = state.gl.find((row) => row.accountCode === CODES.inventory)!
+  state.gl = [...state.gl.map((row) => (row === current ? { ...row, parserVersion: null } : row)), { ...current, balanceDate: dateOf('2026-10-10'), sourcePayloadRef: REF('2026-10-10'), parserVersion: 2 }]
+  assert.equal(reason((await load(state)).basis), 'not_for_date')
+})
+
+test('PARSER VERSION: a re-pulled row (current version) is used again', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((row) => ({ ...row, parserVersion: null }))
+  assert.equal((await load(state)).basis.available, false)
+  state.gl = state.gl.map((row) => ({ ...row, parserVersion: 2 }))
+  assert.equal((await load(state)).basis.available, true)
+})
+
+test('PARSER VERSION: an old-version transit OPENING balance makes the transit leg unusable, not a number', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((row) => (row.balanceDate.getTime() === dateOf(PREVIOUS).getTime() ? { ...row, parserVersion: null } : row))
+  const { basis } = await load(state)
+  assert.equal(basis.available, true)
+  assert.deepEqual((basis as unknown as { transit: unknown }).transit, { available: false, reason: 'transit_balance_unusable' })
+})
+
+test('PARSER VERSION: even if the query returned an old-version row, the basis checks the row itself (second wall)', async () => {
+  const state = goodState()
+  state.queryIgnoresVersion = true
+  state.gl = state.gl.map((row) => (row.accountCode === CODES.inventory && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, parserVersion: null } : row))
+  assert.equal((await load(state)).basis.available, false)
+  const transit = goodState()
+  transit.queryIgnoresVersion = true
+  transit.gl = transit.gl.map((row) => (row.balanceDate.getTime() === dateOf(PREVIOUS).getTime() ? { ...row, parserVersion: null } : row))
+  const { basis } = await load(transit)
+  assert.equal(basis.available, true)
+  assert.deepEqual((basis as unknown as { transit: unknown }).transit, { available: false, reason: 'transit_balance_unusable' })
+})

@@ -5,6 +5,7 @@ import {
   type AccountingAccountBalanceSnapshotInput,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { XERO_TRIAL_BALANCE_PARSER_VERSION } from '@/lib/domain/accounting/snapshot-provenance'
 import { formatFinancialYearEnd } from '@/lib/domain/accounting/financial-year'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
@@ -452,6 +453,7 @@ export function buildXeroAccountBalanceSnapshotInputs(
       // Stored WITH the balance (the Trial Balance is year-to-date, so a P&L balance is only comparable with one that proves
       // the same year end). Null when the Organisation carried none: an old value is never kept.
       financialYearEnd: input.financialYearEnd ?? null,
+      parserVersion: XERO_TRIAL_BALANCE_PARSER_VERSION,
       syncRunId: input.syncRunId ?? null,
     })
   }

@@ -27,6 +27,7 @@ function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): 
     sourcePayloadRef: null,
     tenantId: null,
     financialYearEnd: null,
+    parserVersion: 2,
     syncRunId: null,
     fetchedAt: new Date('2026-06-01T01:00:00.000Z'),
     ...overrides,
@@ -73,6 +74,7 @@ function snapshotClient(
           sourcePayloadRef: args.create.sourcePayloadRef,
           tenantId: args.create.tenantId,
           financialYearEnd: args.create.financialYearEnd,
+          parserVersion: args.create.parserVersion,
           syncRunId: args.create.syncRunId,
           fetchedAt: args.create.fetchedAt,
         } as AccountingAccountBalanceSnapshotRow
@@ -86,11 +88,13 @@ function snapshotClient(
           currency?: string
           externalAccountId?: string
           accountCode?: string
+          parserVersion?: number
         }
         return rows
           .filter((row) =>
             row.connector === where.connector &&
             row.balanceDate <= where.balanceDate.lte &&
+            (where.parserVersion === undefined || row.parserVersion === where.parserVersion) &&
             (!where.currency || row.currency === where.currency) &&
             (!where.externalAccountId || row.externalAccountId === where.externalAccountId) &&
             (!where.accountCode || row.accountCode === where.accountCode),
@@ -474,4 +478,32 @@ test('an opening balance from before the day before the window is missing_previo
   await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), older as never), (e) => e instanceof MissingAccountBalanceSnapshotError && e.reason === 'missing_previous_day_snapshot')
   const exact = snapshotClient(windowRows('2026-05-31', '2026-06-30'), { accountType: 'INVENTORY' })
   assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), exact as never)).movementBase.toFixed(2), '-860.00')
+})
+
+// ---- balances written by the EARLIER (column-shifting) parser are absent, never a value -----------------------------------
+const oldParser = (rows: ReturnType<typeof windowRows>, which: 'opening' | 'closing' | 'both', version: number | null = null) =>
+  rows.map((row, index) => (which === 'both' || (which === 'opening' ? index === 0 : index === 1) ? { ...row, parserVersion: version } : row))
+
+test('PARSER VERSION: an opening or closing balance written by an earlier parser is missing, so the on-demand sync / withhold path runs', async () => {
+  for (const version of [null, 1]) {
+    const closingOld = snapshotClient(oldParser(windowRows('2026-05-31', '2026-06-30'), 'closing', version), { accountType: 'INVENTORY' })
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), closingOld as never), (e) => e instanceof MissingAccountBalanceSnapshotError && e.reason === 'missing_closing_snapshot')
+    const openingOld = snapshotClient(oldParser(windowRows('2026-05-31', '2026-06-30'), 'opening', version), { accountType: 'INVENTORY' })
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), openingOld as never), (e) => e instanceof MissingAccountBalanceSnapshotError && e.reason === 'missing_previous_day_snapshot')
+  }
+})
+
+test('PARSER VERSION: a re-pulled balance (upsert overwrites the version) is used again', async () => {
+  const client = snapshotClient(oldParser(windowRows('2026-05-31', '2026-06-30'), 'both'), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), MissingAccountBalanceSnapshotError)
+  for (const row of client.rows) {
+    await persistAccountingAccountBalanceSnapshots([{ connector: row.connector, externalAccountId: row.externalAccountId, accountCode: row.accountCode, accountName: row.accountName, balanceDate: row.balanceDate, currency: row.currency, amountForeign: row.amountBase, amountBase: row.amountBase, tenantId: row.tenantId, parserVersion: 2 }], client as never)
+  }
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('PARSER VERSION: persist stores no version unless the caller names one (so a stray writer is never read as current)', async () => {
+  const client = snapshotClient()
+  await persistAccountingAccountBalanceSnapshots([{ connector: 'xero', externalAccountId: 'a', accountName: 'x', balanceDate: '2026-06-30', currency: 'GBP', amountForeign: '1', amountBase: '1' }], client as never)
+  assert.equal(client.rows[0]!.parserVersion, null)
 })

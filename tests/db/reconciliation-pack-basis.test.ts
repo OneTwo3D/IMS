@@ -68,7 +68,7 @@ test('as-of basis against a real database', { skip }, async () => {
     for (const a of d.PACK_BASIS_ACCOUNTS) await db.accountingAccount.create({ data: { connector: 'xero', externalAccountId: `rb-${tag}-${a.kind}`, code: codes[a.kind]!, name: 'rb', type: 'ASSET', active: true } })
     const amounts: Record<string, string> = { inventory: '100.50', allocated: '20.25', transit: '0', cogs: '7', unearned: '-30' }
     for (const a of d.PACK_BASIS_ACCOUNTS) {
-      await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rb-${tag}-${a.kind}`, accountCode: codes[a.kind]!, accountName: 'rb', balanceDate: date(D), currency, amountForeign: amounts[a.kind]!, amountBase: amounts[a.kind]!, sourcePayloadRef: ref(D, a.kind === 'transit'), tenantId: tenant } })
+      await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rb-${tag}-${a.kind}`, accountCode: codes[a.kind]!, accountName: 'rb', balanceDate: date(D), currency, amountForeign: amounts[a.kind]!, amountBase: amounts[a.kind]!, sourcePayloadRef: ref(D, a.kind === 'transit'), tenantId: tenant, parserVersion: 2 } })
     }
     await db.inventorySnapshotRun.create({ data: { snapshotDate: date(D), stockLevelCount: 1, snapshotCount: 1, source: 'rb-test' } })
     await db.inventorySnapshot.create({ data: { snapshotDate: date(D), productId: product.id, warehouseId: warehouse.id, qty: '1', valueBase: '120.75', unitCostBase: '120.75', valueReplayReliable: true } })
@@ -195,7 +195,7 @@ test('transit leg and ledger items against a real database', { skip }, async () 
   const load = async () => d.settleAsOfBasis(await d.readAsOfBasis(D), bracket)
   const setBalance = async (kind: string, iso: string, amount: string, absent = false) => {
     await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-${kind}`, balanceDate: date(iso) } })
-    await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rl-${tag}-${kind}`, accountCode: codes[kind]!, accountName: 'rl', balanceDate: date(iso), currency, amountForeign: amount, amountBase: amount, sourcePayloadRef: ref(iso, absent), tenantId: tenant } })
+    await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rl-${tag}-${kind}`, accountCode: codes[kind]!, accountName: 'rl', balanceDate: date(iso), currency, amountForeign: amount, amountBase: amount, sourcePayloadRef: ref(iso, absent), tenantId: tenant , parserVersion: 2 } })
   }
   const movement = (key: string, iso: string, delta: string) => db.transitSubledgerMovement.create({ data: { sourceType: 'STOCK_RECEIPT', sourceRef: `rl-${tag}`, idempotencyKey: `rl-${tag}-${key}`, baseDelta: delta, journalDate: date(iso) } })
   try {

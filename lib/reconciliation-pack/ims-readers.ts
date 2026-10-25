@@ -27,6 +27,7 @@
  */
 
 import { parseDecimalStrict } from '@/lib/reconciliation-pack/compare'
+import { XERO_TRIAL_BALANCE_PARSER_VERSION } from '@/lib/domain/accounting/snapshot-provenance'
 import { digestTaxRateList, readStoredComponents, XERO_TAX_RATE_STATUSES, XERO_TAX_TYPE_RE, type NormalisedXeroTaxRate, type XeroTaxRateStatus } from '@/lib/connectors/xero/tax-rate-list'
 import {
   FIRST_LOAD_RUN_STATUSES,
@@ -539,7 +540,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     // that counts a different number of rows than were read means the read is not the day's snapshot.
     if (run !== null && run.snapshotCount !== values.length) throw new Unreadable('READ_INCOMPLETE')
     if (run === null && values.length > 0) throw new Unreadable('READ_INCOMPLETE')
-    const balances = (await readCapped(tx, `SELECT "externalAccountId" AS account_id, "accountCode" AS code, currency, "amountBase"::text AS amount FROM accounting_account_balance_snapshots WHERE connector = 'xero' AND "balanceDate" = $1::date ORDER BY id`, [asOf])).map((row): BalanceSnapshotRow => ({ externalAccountId: text(row.account_id), accountCode: textOrNull(row.code), currency: text(row.currency, 'CURRENCY_UNKNOWN'), amountBase: decimal(row.amount) }))
+    const balances = (await readCapped(tx, `SELECT "externalAccountId" AS account_id, "accountCode" AS code, currency, "amountBase"::text AS amount FROM accounting_account_balance_snapshots WHERE connector = 'xero' AND "balanceDate" = $1::date AND "parserVersion" = ${XERO_TRIAL_BALANCE_PARSER_VERSION} ORDER BY id`, [asOf])).map((row): BalanceSnapshotRow => ({ externalAccountId: text(row.account_id), accountCode: textOrNull(row.code), currency: text(row.currency, 'CURRENCY_UNKNOWN'), amountBase: decimal(row.amount) }))
     unique(balances, (balance) => `${balance.externalAccountId}\u0001${balance.currency}`)
     return { asOf, run, values, balances }
   },
