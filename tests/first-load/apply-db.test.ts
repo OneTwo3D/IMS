@@ -2162,6 +2162,13 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.ok(cells >= 7)
       })
 
+      it('purchase orders: a stored supplier whose currency differs from the order\'s is refused PO_CURRENCY_DIFFERS_FROM_SUPPLIER; restored, it passes', async () => {
+        const sup = await m.db.supplier.findFirstOrThrow({ where: { name: SUPPLIER_B } })
+        await m.db.supplier.update({ where: { id: sup.id }, data: { currency: 'USD' } })
+        try { assert.match((await rails('purchase-orders')).join(';'), /PO_CURRENCY_DIFFERS_FROM_SUPPLIER/) } finally { await m.db.supplier.update({ where: { id: sup.id }, data: { currency: sup.currency } }) }
+        assert.deepEqual(await rails('purchase-orders'), [])
+      })
+
       it('purchase orders: a file rate that fx_rates does not hold, one outside the importer\'s 2% of today\'s, and a currency with no stored rate, are refused', async () => {
         const row = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR' } })
         await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.30' } })

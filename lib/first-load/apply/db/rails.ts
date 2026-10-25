@@ -78,7 +78,7 @@ export async function evaluateRailResults(prepared: PreparedRun, scope: RailScop
     await rail('forbidden-skus', (p) => forbiddenSkus(prepared, p))
     if (scope.phase === 'preflight' && !scope.resuming) await rail('currency-lock', baseCurrencyNotLocked)
     if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await rail('warehouses', (p) => warehouses(prepared, p))
-    if (relevant('purchase-orders')) await rail('fx-rates', (p) => fxRates(prepared, p))
+    if (relevant('purchase-orders')) await rail('fx-rates', async (p) => { await fxRates(prepared, p); await poSupplierCurrencies(prepared, p) })
     if (relevant('suppliers') || relevant('purchase-orders')) {
       await rail('tax-rates', async (p, note) => {
         if (relevant('suppliers')) await supplierTaxRates(prepared, p, { allowImport: scope.strictSupplierTax !== true, note })
@@ -223,6 +223,24 @@ async function warehouses(prepared: PreparedRun, problems: string[]): Promise<vo
       if (w.syncToStore !== profile.syncToStore) problems.push(`${at}: its syncToStore is not the declared one`)
     }
   })
+}
+
+/** PO_CURRENCY_DIFFERS_FROM_SUPPLIER against the database: a supplier already stored must have the currency the order states (the file check covers a supplier the suppliers step is about to create). */
+async function poSupplierCurrencies(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const step = prepared.steps.find((s) => s.step === 'purchase-orders')
+  if (!step) return
+  const col = (name: string): number => step.data.header.indexOf(name)
+  const [nameIx, currencyIx] = [col('supplierName'), col('currency')]
+  const stored = new Map<string, string[]>()
+  for (const s of await db.supplier.findMany({ select: { name: true, currency: true } })) stored.set(s.name.toUpperCase(), [...(stored.get(s.name.toUpperCase()) ?? []), s.currency.toUpperCase()])
+  let bad = 0
+  for (const row of step.data.rows) {
+    const known = stored.get((nameIx < 0 ? '' : row.cells[nameIx] ?? '').trim().toUpperCase())
+    if (known === undefined) continue
+    const currency = (currencyIx < 0 ? '' : row.cells[currencyIx] ?? '').trim().toUpperCase()
+    if (known.some((c) => c !== currency)) bad++
+  }
+  if (bad > 0) problems.push(`PO_CURRENCY_DIFFERS_FROM_SUPPLIER: ${bad} purchase-order line(s) state a currency that is not the currency stored on their supplier`)
 }
 
 async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void> {

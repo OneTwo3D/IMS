@@ -300,9 +300,12 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
 
   if (orders) {
     const supplierNames = new Set((suppliers?.data.rows ?? []).map((row) => cell(suppliers!, row, 'name').trim().toUpperCase()))
+    const supplierCurrencies = new Map((suppliers?.data.rows ?? []).map((row) => [cell(suppliers!, row, 'name').trim().toUpperCase(), cell(suppliers!, row, 'currency').trim().toUpperCase()] as const))
     for (const row of orders.data.rows) {
       const supplier = cell(orders, row, 'supplierName').trim().toUpperCase()
       if (!supplierNames.has(supplier)) problems.push(`purchase-orders ${rowLocation(row)}: the supplier is not in the suppliers file`)
+      // PO_CURRENCY_DIFFERS_FROM_SUPPLIER: prepare takes an order's currency from its supplier, so a difference here can only come from an edited or inconsistent file.
+      else if (cell(orders, row, 'currency').trim().toUpperCase() !== supplierCurrencies.get(supplier)) problems.push(`purchase-orders ${rowLocation(row)}: PO_CURRENCY_DIFFERS_FROM_SUPPLIER (the order's currency is not its supplier's currency in the suppliers file)`)
       const sku = cell(orders, row, 'sku').trim()
       if (!productByUpper.has(sku.toUpperCase())) problems.push(`purchase-orders ${rowLocation(row)}: the SKU is not a product in the products file`)
       const warehouse = cell(orders, row, 'destinationWarehouseCode').trim().toUpperCase()

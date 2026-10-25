@@ -40,7 +40,7 @@ test('the digest changes with the manifest and with the prepared files, and igno
   digests.set('runId', loadOk(honest, { runId: 'other-run' }).manifestDigest)
   digests.set('steps', loadOk(honest, { steps: ['suppliers', 'products'], expectWarehouses: undefined, acceptZeroCost: undefined, fxRates: undefined }).manifestDigest)
   digests.set('profile', loadOk(honest, { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true, syncToStore: true }, 'ZQSENT-OVER': { type: 'RESTOCK', availableForSale: false, syncToStore: false } } }).manifestDigest)
-  digests.set('file byte', loadOk(withConsistentFile(honest, SUPPLIERS, (text) => text.replace('GBP', 'USD'))).manifestDigest)
+  digests.set('file byte', loadOk(withConsistentFile(honest, SUPPLIERS, (text) => text.replace('NONE', 'INPUT2'))).manifestDigest)
   precondition(t, 'variants compared', digests.size)
   for (const [what, digest] of digests) assert.notEqual(digest, base, `${what} must change the digest`)
   assert.equal(new Set([...digests.values(), base]).size, digests.size + 1, 'and no two variants collide')
@@ -239,6 +239,14 @@ test('fx rates: the manifest declares none (a fxRates key is refused), and a pre
   precondition(t, 'non-base orders', 1)
   assert.throws(() => problemsOf(honest, { fxRates: { EUR: '1.25' } }), /unknown apply manifest key/)
   expectProblem(withConsistentFile(honest, '05-purchase-orders-001-of-001.csv', (text) => text.replace(',1.25,', ',0,')), /fxRateToBase is not an acceptable positive number/)
+})
+
+// [mutation: drop the currency comparison in loadPreparedRun]
+test('purchase orders: an order whose currency is not its supplier\'s (an edited file) is refused PO_CURRENCY_DIFFERS_FROM_SUPPLIER; a matching one loads', (t) => {
+  precondition(t, 'non-base orders', 1)
+  loadOk(honest)
+  expectProblem(withConsistentFile(honest, '05-purchase-orders-001-of-001.csv', (text) => text.replace(',EUR,1.25,', ',USD,1.25,')), /PO_CURRENCY_DIFFERS_FROM_SUPPLIER/)
+  expectProblem(withConsistentFile(honest, '05-purchase-orders-001-of-001.csv', (text) => text.replace(',GBP,', ',EUR,')), /PO_CURRENCY_DIFFERS_FROM_SUPPLIER/)
 })
 
 test('owner rulings: a SKU the manifest forbids may appear in no prepared file, in any case, as a SKU, parent or component', (t) => {
