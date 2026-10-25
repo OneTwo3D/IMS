@@ -1,5 +1,5 @@
 /**
- * Owner ruling (2026-10-25, o3d-q0x56.6): "one rate means the table rate". A purchase order's rate is ALWAYS the central fx_rates rate; a user-supplied rate is ignored (create,
+ * Owner ruling (2026-10-25): "one rate means the table rate". A purchase order's rate is ALWAYS the central fx_rates rate; a user-supplied rate is ignored (create,
  * edit: there is no such input) or refused (the CSV importer: a stated rate that is not the table rate). Run over a real scratch database with the REAL actions (permission, cache and
  * outbound hooks stubbed, as tests/concurrency does). Every arm names the mutation that turns it red.
  */

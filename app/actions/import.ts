@@ -1934,7 +1934,7 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
     if (!product) { result.errors.push(`Row ${lineNum}: SKU "${sku}" not found`); result.skipped++; continue }
 
     const currency = readCsvValue(row, 'currency').trim() || supplier.currency || baseCurrency
-    // An order's rate is ALWAYS the central fx_rates rate (o3d-q0x56.6). The file's fxRateToBase is not a source: blank is fine, and a stated rate is checked against the
+    // An order's rate is ALWAYS the central fx_rates rate. The file's fxRateToBase is not a source: blank is fine, and a stated rate is checked against the
     // table rate below and the order refused when it differs. createdOn (optional) is the day a SYSTEM import (the first load) prices the order at.
     const statedFxRate = readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate').trim()
     if (statedFxRate !== '' && !(Number.isFinite(Number(statedFxRate)) && Number(statedFxRate) > 0)) {

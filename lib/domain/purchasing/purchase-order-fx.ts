@@ -10,7 +10,7 @@ export type ResolvePurchaseOrderFxRateInput = {
 
 /**
  * A purchase order's rate to base: ALWAYS the central fx_rates rate (the latest row on or before `asOf`, lib/currencies/fx-lookup.ts getFxRateToBase), or 1 for the base
- * currency. There is no user-supplied rate and no tolerance band: "one rate means the table rate" (owner ruling 2026-10-25, o3d-q0x56.6). A missing rate throws
+ * currency. There is no user-supplied rate and no tolerance band: "one rate means the table rate" (owner ruling 2026-10-25). A missing rate throws
  * "Missing <base> FX rate for <cur> on or before <date>" and a stored zero/negative rate throws "Invalid stored <base> FX rate for <cur>". An admin who needs a different
  * rate pins a manual override row in fx_rates (Settings, Accounting, FX Rates: app/actions/currencies.ts setManualFxRate): it is simply the latest row.
  */

@@ -248,7 +248,7 @@ async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void>
   if (!step) return
   const col = (name: string): number => step.data.header.indexOf(name)
   const [currencyIx, rateIx, createdIx] = [col('currency'), col('fxRateToBase'), col('createdOn')]
-  // THE RULE (owner ruling 2026-10-25, o3d-q0x56.6): an order's rate is ALWAYS the central fx_rates rate. The prepare step looked each foreign order's rate up in fx_rates at the END
+  // THE RULE (owner ruling 2026-10-25): an order's rate is ALWAYS the central fx_rates rate. The prepare step looked each foreign order's rate up in fx_rates at the END
   // of the order's created day (the file's createdOn column), and the apply-time importer prices a system import at that same instant. This rail proves, against the database, that
   // each foreign order's rate in the file is EXACTLY (decimal-exact, not within a tolerance) the rate the central lookup returns for its currency at that instant. It is not compared
   // with today's rate: an old order may have a rate far from today's. The runner never writes a rate.

@@ -186,7 +186,7 @@ export async function createAndSendPo(
   if (opts.currency) {
     await dialog.locator(`select:has(option[value="${opts.currency}"])`).selectOption(opts.currency)
     if (opts.fxRate) {
-      // The rate field is READ-ONLY (o3d-q0x56.6): the order is raised at the fx_rates table rate. The caller seeded that rate, so the form must show it.
+      // The rate field is READ-ONLY: the order is raised at the fx_rates table rate. The caller seeded that rate, so the form must show it.
       const shown = await dialog.getByLabel('Exchange rate (from the FX Rates table)').inputValue()
       if (Number(shown) !== Number(opts.fxRate)) throw new Error(`the PO form shows the table rate ${shown}, not the seeded ${opts.fxRate}`)
     }
