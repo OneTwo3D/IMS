@@ -45,6 +45,31 @@ async function deps() {
   return { db, ...basis, ...readTx, ...constants, ...liveness, ...fixtures, ...live, ...ledger, ...evaluator, loadAsOfBasis }
 }
 
+/**
+ * The no-write proof, immune to other test files running in parallel against the same database: it digests ONLY the rows the basis
+ * load could touch and this test owns or sets (its settings keys, the Xero token, its organisation row, and everything tagged with
+ * its own ids), including each row's xmin, so ANY write to one of them (even an update to the same value) changes the digest. It
+ * does not count whole tables or read table-wide statistics, which other files change at any moment.
+ */
+async function ownedRowsDigest(db: { $queryRawUnsafe<T>(q: string, ...args: unknown[]): Promise<T> }, own: { settingKeys: string[]; orgId: string | null; idPrefix: string; runSources: string[]; productId: string; movementPrefix?: string }): Promise<string> {
+  const parts: Array<[string, string, unknown[]]> = [
+    ['settings', `SELECT s.*, s.xmin::text AS x FROM settings s WHERE s."key" = ANY($1)`, [own.settingKeys]],
+    ['tokens', `SELECT t.*, t.xmin::text AS x FROM accounting_tokens t WHERE t."connector" = 'xero'`, []],
+    ['org', `SELECT o.*, o.xmin::text AS x FROM organisations o WHERE o."id" = $1`, [own.orgId ?? '']],
+    ['accounts', `SELECT a.*, a.xmin::text AS x FROM accounting_accounts a WHERE a."externalAccountId" LIKE $1`, [`${own.idPrefix}%`]],
+    ['balances', `SELECT b.*, b.xmin::text AS x FROM accounting_account_balance_snapshots b WHERE b."externalAccountId" LIKE $1`, [`${own.idPrefix}%`]],
+    ['runs', `SELECT r.*, r.xmin::text AS x FROM inventory_snapshot_runs r WHERE r."source" = ANY($1)`, [own.runSources]],
+    ['snapshots', `SELECT i.*, i.xmin::text AS x FROM inventory_snapshots i WHERE i."productId" = $1`, [own.productId]],
+    ['movements', `SELECT m.*, m.xmin::text AS x FROM transit_subledger_movements m WHERE m."idempotency_key" LIKE $1`, [`${own.movementPrefix ?? 'no-such-prefix-'}%`]],
+  ]
+  const out: string[] = []
+  for (const [name, sql, args] of parts) {
+    const rows = await db.$queryRawUnsafe<Array<{ d: string }>>(`SELECT md5(coalesce(string_agg(q::text, '|' ORDER BY q::text), '')) AS d FROM (${sql}) q`, ...args)
+    out.push(`${name}:${rows[0]!.d}`)
+  }
+  return out.join(' ')
+}
+
 test('as-of basis against a real database', { skip }, async () => {
   const d = await deps()
   const { db } = d
@@ -52,7 +77,7 @@ test('as-of basis against a real database', { skip }, async () => {
   const codes = Object.fromEntries(d.PACK_BASIS_ACCOUNTS.map((a, i) => [a.kind, `RB${tag}${i}`])) as Record<string, string>
   const settingKeys = [d.INTEGRATION_PLUGIN_SETTING_KEYS.xero, ...d.PACK_BASIS_ACCOUNTS.map((a) => a.settingKey)]
   const savedSettings = await db.setting.findMany({ where: { key: { in: settingKeys } } })
-  const org = await db.organisation.findFirst({ select: { baseCurrency: true } })
+  const org = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
   const savedToken = await db.accountingToken.findUnique({ where: { connector: 'xero' } })
   const tenant = `tenant-${tag}`
   const createdOrg = org ? null : await db.organisation.create({ data: { name: `rb-${tag}` } })
@@ -91,21 +116,12 @@ test('as-of basis against a real database', { skip }, async () => {
     if (!moved.available) assert.equal(moved.reason, 'basis_moved')
     assert.equal((await d.loadAsOfBasis(D, bracket)).available, true, 'nothing moved: available')
 
-    // 2. NO WRITE: row counts of every table the basis reads, and the tuple counters, are unchanged by a load.
-    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_accounts', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots']
-    const counts = async () => {
-      const out: Record<string, string> = {}
-      for (const t of tables) out[t] = String((await db.$queryRawUnsafe<Array<{ n: bigint }>>(`SELECT count(*) AS n FROM "${t}"`))[0]!.n)
-      const stat = await db.$queryRawUnsafe<Array<{ s: string }>>(`SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del),0)::text AS s FROM pg_stat_user_tables WHERE relname = ANY($1)`, tables)
-      out.writes = stat[0]!.s
-      return out
-    }
-    await new Promise((r) => setTimeout(r, 1600))
-    const before = await counts()
+    // 2. NO WRITE: none of the rows this test owns or sets, and none of the rows a load reads, is touched by a load (xmin included).
+    const owned = () => ownedRowsDigest(db, { settingKeys, orgId: org?.id ?? createdOrg?.id ?? null, idPrefix: `rb-${tag}-`, runSources: ['rb-test'], productId: product.id })
+    const before = await owned()
     for (let i = 0; i < 3; i += 1) await d.loadAsOfBasis(D, bracket)
     await d.loadAsOfBasis(PREV, bracket)
-    await new Promise((r) => setTimeout(r, 1600))
-    assert.deepEqual(await counts(), before, 'a basis load changes no row and writes no tuple')
+    assert.equal(await owned(), before, 'a basis load changes no row it reads (no insert, update or delete, not even to the same value)')
 
     // 3. EXACT DATE: PREV has no balances at all for these accounts, so D-1 is not_for_date (D has them) and a day with none is not_for_date too, never the D row.
     const prev = await d.loadAsOfBasis(PREV, bracket)
@@ -184,7 +200,7 @@ test('transit leg and ledger items against a real database', { skip }, async () 
   const codes = Object.fromEntries(d.PACK_BASIS_ACCOUNTS.map((a, i) => [a.kind, `RL${tag}${i}`])) as Record<string, string>
   const settingKeys = [d.INTEGRATION_PLUGIN_SETTING_KEYS.xero, d.TRANSIT_COVERAGE_SETTING_KEY, ...d.PACK_BASIS_ACCOUNTS.map((a) => a.settingKey)]
   const savedSettings = await db.setting.findMany({ where: { key: { in: settingKeys } } })
-  const org = await db.organisation.findFirst({ select: { baseCurrency: true } })
+  const org = await db.organisation.findFirst({ select: { id: true, baseCurrency: true } })
   const savedToken = await db.accountingToken.findUnique({ where: { connector: 'xero' } })
   const tenant = `tenant-${tag}`
   const createdOrg = org ? null : await db.organisation.create({ data: { name: `rl-${tag}` } })
@@ -261,20 +277,11 @@ test('transit leg and ledger items against a real database', { skip }, async () 
     assert.equal(r10Withheld.outcome, 'inconclusive')
     await setBalance('transit', D, '50')
 
-    // 7. NO WRITE: a load changes no row and writes no tuple in any table it reads.
-    const tables = ['settings', 'accounting_tokens', 'organisations', 'accounting_accounts', 'accounting_account_balance_snapshots', 'inventory_snapshot_runs', 'inventory_snapshots', 'transit_subledger_movements']
-    const counts = async () => {
-      const out: Record<string, string> = {}
-      for (const t of tables) out[t] = String((await db.$queryRawUnsafe<Array<{ n: bigint }>>(`SELECT count(*) AS n FROM "${t}"`))[0]!.n)
-      const stat = await db.$queryRawUnsafe<Array<{ s: string }>>(`SELECT coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del),0)::text AS s FROM pg_stat_user_tables WHERE relname = ANY($1)`, tables)
-      out.writes = stat[0]!.s
-      return out
-    }
-    await new Promise((r) => setTimeout(r, 1600))
-    const before = await counts()
+    // 7. NO WRITE: a load including the transit leg touches none of the rows it reads (xmin included).
+    const owned = () => ownedRowsDigest(db, { settingKeys, orgId: org?.id ?? createdOrg?.id ?? null, idPrefix: `rl-${tag}-`, runSources: ['rl-test'], productId: product.id, movementPrefix: `rl-${tag}-` })
+    const before = await owned()
     for (let i = 0; i < 3; i += 1) await load()
-    await new Promise((r) => setTimeout(r, 1600))
-    assert.deepEqual(await counts(), before, 'a basis load including the transit leg changes no row and writes no tuple')
+    assert.equal(await owned(), before, 'a basis load including the transit leg changes no row it reads')
   } finally {
     await db.transitSubledgerMovement.deleteMany({ where: { idempotencyKey: { startsWith: `rl-${tag}-` } } })
     await db.inventorySnapshot.deleteMany({ where: { productId: product.id } })
