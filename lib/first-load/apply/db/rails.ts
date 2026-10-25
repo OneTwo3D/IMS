@@ -266,9 +266,9 @@ async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void>
     index += 1
     const at = `FX rate ${index} of the purchase-orders file (${currency}, created ${createdOn === '' ? 'on no stated day' : 'on a stated day'})`
     let rate: Dec
-    try { rate = new D(text) } catch { problems.push(`${at}: the rate is not a number`); continue }
+    try { rate = new D(text) } catch { problems.push(`PO_FX_RATE_UNREADABLE: ${at}: the rate is not a number`); continue }
     let asOf: Date
-    try { asOf = endOfBusinessDateUtc(createdOn) } catch { problems.push(`${at}: the order has no usable created day (createdOn), so its rate cannot be checked`); continue }
+    try { asOf = endOfBusinessDateUtc(createdOn) } catch { problems.push(`PO_FX_CREATED_ON_MISSING: ${at}: the order has no usable created day (createdOn), so its rate cannot be checked`); continue }
     const memo = `${currency}|${createdOn}`
     let expected = checked.get(memo)
     if (expected === undefined) {
@@ -277,11 +277,11 @@ async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void>
         checked.set(memo, expected)
       } catch (error) {
         if (!isMissingFxRateError(error)) throw error
-        problems.push(`${at}: the database holds no usable rate for it on or before the end of that day`)
+        problems.push(`PO_FX_RATE_MISSING: ${at}: the database holds no usable rate for it on or before the end of that day`)
         continue
       }
     }
-    if (!rate.eq(new D(expected))) problems.push(`${at}: the rate is not the fx_rates rate for that currency at the end of that day (it must be exactly the table rate; a rate is only ever read from fx_rates)`)
+    if (!rate.eq(new D(expected))) problems.push(`PO_FX_RATE_NOT_TABLE_RATE: ${at}: the rate is not the fx_rates rate for that currency at the end of that day (it must be exactly the table rate; a rate is only ever read from fx_rates)`)
   }
 }
 

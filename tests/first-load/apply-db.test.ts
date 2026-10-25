@@ -2191,6 +2191,13 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         // (3) no row on or before the end of that day.
         await m.db.fxRate.update({ where: { id: atDay.id }, data: { fetchedAt: new Date('2026-09-16T06:00:00Z') } })
         try { assert.match((await rails('purchase-orders')).join(';'), /the database holds no usable rate for it on or before the end of that day/) } finally { await m.db.fxRate.update({ where: { id: atDay.id }, data: { fetchedAt: new Date('2026-09-10T06:00:00Z') } }) }
+        // (3b) the file states no created day at apply: refused with its own code, never defaulted to today.
+        const step = prepared.steps.find((x) => x.step === 'purchase-orders')!
+        const ix = step.data.header.indexOf('createdOn')
+        const blanked = { ...prepared, steps: prepared.steps.map((x) => (x === step ? { ...x, data: { ...x.data, rows: x.data.rows.map((r) => ({ ...r, cells: r.cells.map((c, i) => (i === ix ? '' : c)) })) } } : x)) } as unknown as PreparedRun
+        assert.ok(ix >= 0)
+        assert.match((await evaluateRails(blanked, { phase: 'recheck', resuming: true, step: 'purchase-orders' })).join(';'), /PO_FX_CREATED_ON_MISSING/)
+        assert.match((await (async () => { await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.26' } }); try { return await rails('purchase-orders') } finally { await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.25' } }) } })()).join(';'), /PO_FX_RATE_NOT_TABLE_RATE/, 'a rate the table holds today (1.25) but not at the created day is refused')
         // (4) a currency with no stored rate at all.
         await m.db.fxRate.updateMany({ where: { toCurrency: 'EUR' }, data: { toCurrency: 'SEK' } })
         try { assert.match((await rails('purchase-orders')).join(';'), /the database holds no usable rate for it/) } finally { await m.db.fxRate.updateMany({ where: { toCurrency: 'SEK' }, data: { toCurrency: 'EUR' } }) }
