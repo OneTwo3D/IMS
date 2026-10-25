@@ -781,9 +781,94 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
  *
  * `importWcOrder` remains the only production entry point; nothing but the regression calls this.
  */
-export async function updateExistingWcOrderFromPayload(
+/**
+ * THE UNPAID -> PAID TRANSITION OF AN ORDER IMS ALREADY HOLDS goes through the SAME receipt rule as an order imported paid (o3d-q0x56.19):
+ *   - the settlement rate: the order's own rate when the payment is on the order's UTC day, else the central rate at the end of the payment's day
+ *     (`resolveWcReceiptSettlementRate`); a day with no rate is `foreign_payment_missing_rate`;
+ *   - a local Payment row carrying `settlementRateToBase`, and its ledger registration (`registerInvoicePaymentWithLedger`).
+ * It applies to the pending-FX retry AND the ordinary webhook/poll update: both reach `updateExistingWcOrderFromPayload`, so the gap (an order imported unpaid and
+ * paid later got `paidAt` and no receipt, no registration) was in both, and is closed in both.
+ *
+ * IDEMPOTENCY: the transition is claimed under the order's row lock by a conditional write, `updateMany({ id, paidAt: null })`, in the SAME transaction that creates the
+ * Payment. A retry or a duplicate delivery reads `paidAt` already set, claims nothing, and creates no second Payment. (There is no unique constraint on payments to lean on.)
+ *
+ * A missing rate leaves the order UNPAID (the rest of the update still applies) and the MissingFxRateError is rethrown after it, so `importWcOrder` keeps/queues the
+ * pending-FX row (it is not marked synced) and retries after the next rate refresh.
+ */
+type WcPaidTransition =
+  | { kind: 'none' }
+  | { kind: 'record'; settlementRate: number | null }
+  | { kind: 'blocked'; error: unknown }
+
+async function planWcPaidTransition(orderId: string, wcOrder: WcFullOrder): Promise<WcPaidTransition> {
+  if (!wcOrder.date_paid_gmt) return { kind: 'none' }
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, currency: true, fxRateToBase: true, totalForeign: true, createdAt: true } })
+  if (!order || order.paidAt !== null || !toDecimal(order.totalForeign).gt(0)) return { kind: 'none' }
+  if ((await db.payment.count({ where: { orderId, refundId: null } })) > 0) return { kind: 'none' }
+  try {
+    const rate = await resolveWcReceiptSettlementRate({
+      currency: order.currency,
+      baseCurrency: await (await import('@/lib/base-currency')).getBaseCurrencyCode(),
+      orderedAt: wcOrder.date_created_gmt ? parseWcGmtInstant(wcOrder.date_created_gmt) : order.createdAt,
+      orderRate: Number(order.fxRateToBase),
+      datePaidGmt: wcOrder.date_paid_gmt,
+      lookup: getFxRateToBase,
+    })
+    return { kind: 'record', settlementRate: rate === null ? null : Math.round(rate * 1e8) / 1e8 }
+  } catch (error) {
+    if (!isMissingFxRateError(error)) throw error
+    return { kind: 'blocked', error }
+  }
+}
+
+async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null): Promise<void> {
+  const claimed = await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const won = await tx.salesOrder.updateMany({ where: { id: orderId, paidAt: null }, data: { paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string) } })
+    if (won.count !== 1) return null
+    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true } })
+    const receipt = await tx.payment.create({
+      data: {
+        orderId,
+        amount: order.totalForeign,
+        currency: order.currency,
+        method: wcOrder.payment_method_title || wcOrder.payment_method || null,
+        reference: wcOrder.transaction_id || null,
+        notes: 'Recorded from WooCommerce (the order was imported unpaid and paid later)',
+        paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
+        settlementRateToBase: settlementRate,
+      },
+      select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true },
+    })
+    return { receipt, reference: order.externalOrderNumber ?? order.orderNumber ?? orderId }
+  })
+  if (!claimed) return
+  const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  await registerInvoicePaymentWithLedger({
+    orderId,
+    orderReference: claimed.reference,
+    paymentId: claimed.receipt.id,
+    amount: toDecimal(claimed.receipt.amount),
+    currency: claimed.receipt.currency,
+    method: claimed.receipt.method,
+    reference: claimed.receipt.reference,
+    paidAt: claimed.receipt.paidAt,
+    settlementRateToBase: settlementRate,
+  })
+}
+
+export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder): Promise<void> {
+  const transition = await planWcPaidTransition(orderId, wcOrder)
+  await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
+  if (transition.kind === 'record') await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate)
+  if (transition.kind === 'blocked') throw transition.error
+}
+
+async function updateExistingWcOrderCore(
   orderId: string,
   wcOrder: WcFullOrder,
+  /** The unpaid -> paid transition is handled by the receipt rule above: this update must not set the paid flag itself. */
+  paidTransitionHandledSeparately: boolean,
 ): Promise<void> {
   // STORE CREDIT ON AN ORDER IMS ALREADY HOLDS is NEVER recorded after creation: `storeCreditForeign` and the
   // discount are set once, by the credit-aware import, from one classification. A later delivery is
@@ -835,7 +920,7 @@ export async function updateExistingWcOrderFromPayload(
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
-        paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
+        paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? new Date(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //
         // This is the writer Codex found: an order imported UNPAID and paid in WooCommerce later.
@@ -849,7 +934,7 @@ export async function updateExistingWcOrderFromPayload(
         // `undefined` on the same condition as `paidAt`, not `null`: an unpaid payload must leave
         // BOTH columns exactly as they are, or a redelivery of the pre-payment webhook would wipe
         // the provenance off an order that is already paid and re-open the defect.
-        unregisteredPaidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
+        unregisteredPaidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? new Date(wcOrder.date_paid_gmt) : undefined,
       },
     })
   })
