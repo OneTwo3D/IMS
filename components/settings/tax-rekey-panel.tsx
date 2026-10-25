@@ -57,6 +57,9 @@ export function TaxRekeyPanel() {
           {busy === 'apply' && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}Apply the previewed plan
         </Button>
       </div>
+      {result && result.success && (
+        <p className={`text-xs ${result.hold.held ? 'text-muted-foreground' : 'text-amber-600'}`}>{result.hold.held ? 'Xero writes are held: a re-key may be applied.' : `Xero writes are not held, so the Apply will be refused (a re-key runs only before go-live). ${result.hold.detail}`}</p>
+      )}
       {result && !result.success && <p className="text-sm text-destructive">{result.error}</p>}
       {result && result.success && result.refusal && <p className="text-sm text-destructive">Refused: {result.refusal.code}. {result.refusal.detail} Nothing was written.</p>}
       {result && result.success && result.applied && !result.refusal && (

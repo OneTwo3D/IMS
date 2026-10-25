@@ -679,7 +679,7 @@ export async function getVatDifferenceReport(): Promise<VatDifferenceActionResul
 // ---------------------------------------------------------------------------
 
 export type TaxRekeyActionResult =
-  | { success: true; applied: boolean; wrote: boolean; plan: import('@/lib/tax/tax-rekey').RekeyPlan | null; refusal: import('@/lib/tax/tax-rekey').RekeyRefusal | null; written: import('@/lib/tax/tax-rekey').RekeyWriteResult | null }
+  | { success: true; applied: boolean; wrote: boolean; plan: import('@/lib/tax/tax-rekey').RekeyPlan | null; refusal: import('@/lib/tax/tax-rekey').RekeyRefusal | null; written: import('@/lib/tax/tax-rekey').RekeyWriteResult | null; hold: import('@/lib/tax/tax-rekey').XeroHoldState }
   | { success: false; error: string }
 
 /**
@@ -691,7 +691,7 @@ export async function previewTaxRekey(): Promise<TaxRekeyActionResult> {
   try {
     const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
     const result = await runTaxRekey({ apply: false })
-    return { success: true, applied: false, wrote: false, plan: result.plan, refusal: result.refusal, written: null }
+    return { success: true, applied: false, wrote: false, plan: result.plan, refusal: result.refusal, written: null, hold: result.hold }
   } catch (e) {
     unstable_rethrow(e)
     return { success: false, error: 'The re-key plan could not be produced.' }
@@ -708,7 +708,7 @@ export async function applyTaxRekey(input: { confirm: string; allowUnposted?: bo
     const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
     const result = await runTaxRekey({ apply: true, confirm: input.confirm, allowUnposted: input.allowUnposted === true })
     await runPostCommit(async () => { revalidatePath('/settings/accounting') }, 'Failed to refresh the tax settings')
-    return { success: true, applied: result.applied, wrote: result.wrote, plan: result.plan, refusal: result.refusal, written: result.written }
+    return { success: true, applied: result.applied, wrote: result.wrote, plan: result.plan, refusal: result.refusal, written: result.written, hold: result.hold }
   } catch (e) {
     unstable_rethrow(e)
     return { success: false, error: 'The re-key could not be applied.' }

@@ -4,7 +4,7 @@ import test from 'node:test'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
 import { DRIFT_MAX_STALENESS_MS } from '@/lib/domain/accounting/tax-rate-drift-status'
 import {
-  REKEY_OUTCOMES, applyRefusal, digestRekeyPlan, matchRekeyRates, projectRatesAfterRekey, readRekeyPlan, runTaxRekey, xeroNameCountry,
+  REKEY_OUTCOMES, applyRefusal, digestRekeyPlan, imsMeaningDifference, pickXeroHoldEnv, xeroHoldState, matchRekeyRates, projectRatesAfterRekey, readRekeyPlan, runTaxRekey, xeroNameCountry,
   type RekeyImsRate, type RekeyPlan, type RekeyReferences,
 } from '@/lib/tax/tax-rekey'
 import { TAX_REKEY_EXIT_CODES, parseTaxRekeyArgs, renderTaxRekeyText, taxRekeyExitCode } from '@/lib/tax/tax-rekey-cli'
@@ -371,7 +371,7 @@ test('the command line takes exactly --apply --confirm <64-hex>, --allow-unposte
   assert.deepEqual(parseTaxRekeyArgs(['--apply', '--confirm', 'token=abc']), { code: 'CREDENTIAL_ARGUMENT' })
 })
 
-const result = (over: Partial<Parameters<typeof renderTaxRekeyText>[0]> = {}) => ({ applied: false, wrote: false, plan: planOf(), refusal: null, written: null, ...over })
+const result = (over: Partial<Parameters<typeof renderTaxRekeyText>[0]> = {}) => ({ applied: false, wrote: false, plan: planOf(), refusal: null, written: null, hold: { held: true, detail: 'Xero is held' }, ...over })
 
 test('exit codes: 0 nothing to do or applied, 1 a preview that lists work, 2 refused', () => {
   assert.equal(TAX_REKEY_EXIT_CODES.length, 4)
@@ -396,12 +396,12 @@ test('the command: account, credential and database refusals, the replaced envir
   const base = { env: { DATABASE_URL: 'postgresql://x', HOME: '/tmp', PGHOST: '203.0.113.1', PGPASSWORD: 'x', NODE_OPTIONS: '--require /evil.js', SETTINGS_ENCRYPTION_KEY: 'k' }, uid: 0, checkoutOwnerUid: 1000, deps, stdout: (t: string) => out.push(t), stderr: (t: string) => err.push(t) }
 
   assert.equal(await runTaxRekeyCli({ ...base, argv: ['--apply', '--confirm', digest], onKeptEnv: (kept) => { assert.deepEqual(Object.keys(kept).sort(), ['DATABASE_URL', 'HOME', 'SETTINGS_ENCRYPTION_KEY']) } }), 0)
-  assert.deepEqual(calls, [{ apply: true, confirm: digest, allowUnposted: false }])
+  assert.deepEqual(calls, [{ apply: true, confirm: digest, allowUnposted: false, producerEnv: {} }])
   assert.match(out.join('\n'), /Applied: 1 rate\(s\) re-keyed/)
   assert.equal(await runTaxRekeyCli({ ...base, argv: ['--apply', '--confirm', digest, '--allow-unposted'] }), 0)
-  assert.deepEqual(calls[1], { apply: true, confirm: digest, allowUnposted: true })
+  assert.deepEqual(calls[1], { apply: true, confirm: digest, allowUnposted: true, producerEnv: {} })
   assert.equal(await runTaxRekeyCli({ ...base, argv: [] }), 0, 'a preview run passes apply false')
-  assert.deepEqual(calls[2], { apply: false, confirm: undefined, allowUnposted: false })
+  assert.deepEqual(calls[2], { apply: false, confirm: undefined, allowUnposted: false, producerEnv: {} })
   assert.equal(await runTaxRekeyCli({ ...base, argv: ['--apply'] }), 3)
   assert.equal(await runTaxRekeyCli({ ...base, uid: 1234, argv: [] }), 3, 'neither root nor the checkout\'s owner')
   assert.equal(await runTaxRekeyCli({ ...base, uid: 1000, argv: [] }), 0, 'the checkout\'s owner')
@@ -411,4 +411,52 @@ test('the command: account, credential and database refusals, the replaced envir
   assert.equal(calls.length, 4, 'a refused command never reached the run')
   assert.equal(await runTaxRekeyCli({ ...base, deps: { ...deps, run: async () => { throw new Error('boom secret=hunter2') } }, argv: [] }), 3)
   assert.equal(err.join('\n').includes('hunter2'), false, 'nothing from a failure is echoed')
+})
+
+// ---- the Xero hold (the structural guarantee) -------------------------------------------------------------
+
+// [mutation: held when only enforced (grant / live-from ignored) -> the live arms fail; mutation: xero not required in the list -> the "names another destination" arm fails]
+test('xeroHoldState: held ONLY when the hold is enforced for xero AND no grant / live-from instant is in force', () => {
+  const held = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }
+  assert.equal(xeroHoldState(held).held, true)
+  assert.equal(xeroHoldState({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'all' }).held, true)
+  assert.equal(xeroHoldState({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce, xero' }).held, true)
+  assert.equal(xeroHoldState({}).held, false, 'not enforced: producers would still queue deliverable work')
+  assert.equal(xeroHoldState({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'mintsoft' }).held, false, 'enforced for another destination only')
+  assert.equal(xeroHoldState({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'bogus' }).held, false, 'unreadable switch')
+  assert.equal(xeroHoldState({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITES_LIVE_FROM: '2026-12-01T00:00:00Z' }).held, false, 'a live-from instant (even a future one) is not held')
+  assert.equal(xeroHoldState({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITES_LIVE_FROM: 'garbage' }).held, false)
+  assert.equal(xeroHoldState({ ...held, XERO_WRITE_ALLOWED_TENANT: '11111111-2222-3333-4444-555555555555' }).held, false, 'a grant alone is inconsistent, not held')
+  const live = { ...held, XERO_WRITES_LIVE_FROM: '2026-01-01T00:00:00Z', XERO_WRITE_ALLOWED_TENANT: '11111111-2222-3333-4444-555555555555' }
+  assert.equal(xeroHoldState(live).held, false, 'destination live')
+  assert.deepEqual(Object.keys(pickXeroHoldEnv({ ...live, DATABASE_URL: 'x', SECRET: 'y' })).sort(), Object.keys(live).sort().filter((k) => k in pickXeroHoldEnv(live)), 'only the hold variables are picked')
+  assert.equal('DATABASE_URL' in pickXeroHoldEnv({ DATABASE_URL: 'x' }), false)
+})
+
+test('an apply is refused with XERO_NOT_HELD before the database is touched, unless Xero is held', async () => {
+  const confirm = 'c'.repeat(64)
+  for (const env of [{}, { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITES_LIVE_FROM: '2026-01-01T00:00:00Z' }]) {
+    const r = await runTaxRekey({ apply: true, confirm, producerEnv: env })
+    assert.deepEqual([r.refusal?.code, r.wrote, r.plan, r.hold.held], ['XERO_NOT_HELD', false, null, false], JSON.stringify(env))
+  }
+})
+
+// [mutation: the meaning comparison reduced to name + percentage (the pre-R4 check) -> every arm but the first fails]
+test('imsMeaningDifference: any difference in country, side, component breakdown, isCompound, reverseCharge or reportingCategory is a difference (the refund-snapshot identity check)', () => {
+  const base = ims('a', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'CY', usedFor: 'SALES', isCompound: false, reverseCharge: false, reportingCategory: 'EC_SALES' })
+  const with_ = (over: Partial<RekeyImsRate>) => imsMeaningDifference(base, { ...base, id: 'b', ...over })
+  assert.equal(with_({}), null, 'control: identical carriers')
+  assert.equal(with_({ name: ' CY VAT ' }), null, 'trimmed name')
+  assert.equal(with_({ name: 'CZ VAT' }), 'name')
+  assert.equal(with_({ rate: '0.2000' }), 'percentage')
+  assert.equal(with_({ countryCode: 'GR' }), 'country')
+  assert.equal(with_({ countryCode: null }), 'country')
+  assert.equal(with_({ usedFor: 'BOTH' }), 'side')
+  assert.equal(with_({ isCompound: true }), 'isCompound')
+  assert.equal(with_({ reverseCharge: true }), 'reverseCharge')
+  assert.equal(with_({ reportingCategory: 'OSS' }), 'reportingCategory')
+  const two = [{ rate: '0.1000', compoundOnPrevious: false, active: true, sortOrder: 0 }, { rate: '0.0900', compoundOnPrevious: false, active: true, sortOrder: 1 }]
+  assert.equal(with_({ components: two }), 'component breakdown', 'same headline percentage, another breakdown')
+  assert.equal(with_({ components: [{ rate: '0.1900', compoundOnPrevious: true, active: true, sortOrder: 0 }] }), 'component breakdown', 'compounding')
+  assert.equal(with_({ components: [{ rate: '0.1900', compoundOnPrevious: false, active: true, sortOrder: 0 }] }), null, 'one active component at the column equals none')
 })

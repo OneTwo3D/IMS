@@ -1509,7 +1509,7 @@ run that records tax-rate drift).
     a re-run changes nothing. The `accounting_reverse_charge_purchase_tax_type` setting is checked against the list and reported; no row is created for it.
 - **Used by** reconciliation-pack item R13 (the Xero leg), which reads the stored list in its own read-only snapshot. See
   *Reconciliation pack* in the installation guide.
-- **Custom tax codes differ per organisation: the re-key.** Xero numbers its custom tax types (`TAX001`...`TAXnnn`) per organisation, in creation order, so
+- **Custom tax codes differ per organisation: the re-key (a pre-go-live operation: refused unless Xero writes are held).** Xero numbers its custom tax types (`TAX001`...`TAXnnn`) per organisation, in creation order, so
   the codes on IMS's per-country VAT rates (created against a Demo organisation) can mean other rates in the live one (live `TAX005` = *BG VAT*, IMS's `TAX005` =
   *CY VAT*), and IMS posts a line's code. **Settings > Accounting > Tax > Re-key VAT rates** and `npm run tax:rekey` tie each active rate with a custom code
   to the live type of the **same name** (never by code), `ACTIVE`, with exactly the same percentage (EffectiveRate, else DisplayTaxRate) and a consistent

@@ -39,7 +39,9 @@ async function loadDeps() {
     import('../../lib/connectors/xero/tax-rate-drift-sweeper.ts'),
     import('../../lib/tax/vat-difference-run.ts'),
   ])
-  return { db, rekey, listLib, drift, vat }
+  // The apply is allowed only while Xero is held (xeroHoldState); the scratch environment is not, so the run is handed a held one.
+  const held = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }
+  return { db, rekey: { ...rekey, runTaxRekey: (o: Parameters<typeof rekey.runTaxRekey>[0]) => rekey.runTaxRekey({ producerEnv: held, ...o }) }, listLib, drift, vat }
 }
 type Deps = Awaited<ReturnType<typeof loadDeps>>
 
@@ -529,4 +531,67 @@ test('THE ENQUEUE GUARD: after a re-key, a payload built from the old code is re
   assert.equal(racing.wrote, false, 'the apply did not commit past a producer that had already queued the old code')
   assert.ok(racing.refusal?.code === 'QUEUED_PAYLOADS' || racing.refusal?.code === 'DIGEST_MISMATCH', String(racing.refusal?.code))
   assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w2.ids.be } })).active, true)
+})
+
+// [mutation: the hold check removed from runTaxRekey -> the not-held and live arms apply]
+test('THE STRUCTURAL GUARANTEE: an apply is refused unless Xero writes are HELD (hold enforced for xero, no grant, no live-from instant); a preview is not', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const w = await seedWorld(d)
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  const before = await ownedDigest(d, w)
+  const rekey = await import('../../lib/tax/tax-rekey.ts')
+  const envs: Array<[string, Record<string, string>]> = [
+    ['not enforced', {}],
+    ['enforced for another destination', { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'mintsoft' }],
+    ['destination live', { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: '11111111-2222-3333-4444-555555555555', XERO_WRITES_LIVE_FROM: '2026-01-01T00:00:00Z' }],
+    ['live-from without grant', { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITES_LIVE_FROM: '2026-01-01T00:00:00Z' }],
+  ]
+  for (const [label, producerEnv] of envs) {
+    const r = await rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true, producerEnv })
+    assert.deepEqual([r.refusal?.code, r.wrote], ['XERO_NOT_HELD', false], label)
+    assert.equal(await ownedDigest(d, w), before, `${label}: nothing written`)
+    const p = await rekey.runTaxRekey({ apply: false, producerEnv })
+    assert.deepEqual([p.refusal, p.hold.held], [null, false], `${label}: a preview still works and says so`)
+  }
+  const held = await rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true, producerEnv: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' } })
+  created.digests.push(preview.digest)
+  assert.deepEqual([held.refusal, held.wrote], [null, true], 'control: the same call writes while held')
+})
+
+// [mutation: the meaning comparison reduced to name + percentage -> every variant but the identical one applies]
+test('REFUND SNAPSHOT IDENTITY: ANY other carrier of the old code that differs in country, side, component breakdown, isCompound, reverseCharge or reportingCategory blocks the migration; an identical carrier does not', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { db } = d
+  const variants: Array<[string, Record<string, unknown>, boolean]> = [
+    ['identical inactive copy', {}, false],
+    ['country', { countryCode: 'ZZ' }, true],
+    ['side', { usedFor: 'PURCHASE' }, true],
+    ['isCompound', { isCompound: true }, true],
+    ['reverseCharge', { reverseCharge: true }, true],
+    ['reportingCategory', { reportingCategory: 'OSS' }, true],
+    ['component breakdown (same headline 24%)', { components: { create: [{ name: 'a', rate: '0.1000', sortOrder: 0 }, { name: 'b', rate: '0.1400', sortOrder: 1 }] } }, true],
+  ]
+  for (const [label, over, conflict] of variants) {
+    const w = await seedWorld(d)
+    // GR VAT (code A, unique in the world) has a pending refund line storing A. A historical INACTIVE rate also carries A.
+    const twin = await db.taxRate.create({
+      data: {
+        name: `${TAG}GR VAT`, rate: '0.2400', usedFor: 'BOTH', accountingTaxType: code('A'), countryCode: null, reportingCategory: 'EC_SALES', isCompound: false, reverseCharge: false, active: false,
+        components: { create: [{ name: 'VAT', rate: '0.2400', sortOrder: 0 }] }, ...over,
+      } as never,
+    })
+    created.rates.push(twin.id)
+    const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+    const gr = preview.references[w.ids.gr]!
+    assert.deepEqual([gr.pendingRefundLines, gr.refundSnapshotConflict], [1, conflict], label)
+    created.digests.push(preview.digest)
+    const r = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+    if (conflict) assert.deepEqual([r.refusal?.code, r.wrote], ['REFUND_SNAPSHOT_IDENTITY', false], label)
+    else {
+      assert.deepEqual([r.refusal, r.wrote], [null, true], label)
+      assert.equal((await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id: w.refundGrPending.lineId } })).accountingTaxType, code('D'), 'control: an identical carrier lets the snapshot migrate')
+    }
+  }
 })

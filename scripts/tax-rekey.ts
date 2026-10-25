@@ -17,7 +17,7 @@ import {
   TAX_REKEY_CLI_CODES, accountAllowed, buildTaxRekeyEnv, parseTaxRekeyArgs, renderTaxRekeyText, renderTaxRekeyUsage, taxRekeyExitCode,
   type TaxRekeyCliCode,
 } from '../lib/tax/tax-rekey-cli.ts'
-import type { TaxRekeyRunOptions, TaxRekeyRunResult } from '../lib/tax/tax-rekey.ts'
+import { pickXeroHoldEnv, type TaxRekeyRunOptions, type TaxRekeyRunResult } from '../lib/tax/tax-rekey.ts'
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const DISCONNECT_TIMEOUT_MS = 5_000
@@ -77,13 +77,15 @@ export async function runTaxRekeyCli(options: TaxRekeyCliOptions): Promise<numbe
     const parent = options.env ?? process.env
     if (!parent.DATABASE_URL) return refuse('DATABASE_URL_MISSING')
     // Before anything imports the application's database client.
+    // The Xero hold is read from the caller's environment (the same variables the application's producers obey); captured BEFORE the environment is replaced.
+    const producerEnv = pickXeroHoldEnv(parent)
     const kept = buildTaxRekeyEnv(parent, parent.HOME ?? '/tmp')
     if (options.env === undefined && options.keepProcessEnv !== true) replaceProcessEnv(kept)
     options.onKeptEnv?.(kept)
     const given = options.deps
     const deps: TaxRekeyDeps = given?.run !== undefined && given.disconnect !== undefined ? { run: given.run, disconnect: given.disconnect } : await defaultDeps()
     disconnect = deps.disconnect
-    const result = await deps.run({ apply: args.apply, confirm: args.confirm ?? undefined, allowUnposted: args.allowUnposted })
+    const result = await deps.run({ apply: args.apply, confirm: args.confirm ?? undefined, allowUnposted: args.allowUnposted, producerEnv })
     out(args.json ? JSON.stringify(result, null, 2) : renderTaxRekeyText(result))
     return taxRekeyExitCode(result)
   } catch {

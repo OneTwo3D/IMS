@@ -12,7 +12,7 @@ export { accountAllowed, buildVatDiffEnv as buildTaxRekeyEnv }
 export const TAX_REKEY_EXIT_CODES = [
   { code: 0, name: 'nothing-to-do', meaning: 'Every in-scope rate is ALREADY_CORRECT, or the apply was written (a re-run of an applied plan is also 0).' },
   { code: 1, name: 'plan-lists-work', meaning: 'A preview, and the plan has rates to re-key or rates that cannot be re-keyed (NO_MATCH, AMBIGUOUS, PERCENTAGE_DIFFERS, NAME_MATCHES_INACTIVE). Nothing was written.' },
-  { code: 2, name: 'refused', meaning: 'The stored Xero list could not be proven, or the apply was refused (missing/wrong digest, blockers, unposted documents, queued payloads, connection changed). Nothing was written.' },
+  { code: 2, name: 'refused', meaning: 'The stored Xero list could not be proven, or the apply was refused (missing/wrong digest, Xero not held, blockers, unposted documents, queued payloads, connection changed). Nothing was written.' },
   { code: 3, name: 'internal', meaning: 'The command could not start or failed (bad argument, account not allowed, database not given).' },
 ] as const
 
@@ -68,6 +68,7 @@ export function renderTaxRekeyUsage(): string {
     'Without --apply it is a read-only PREVIEW: it prints the plan and its digest and writes nothing. With --apply --confirm <digest> (the digest the preview printed) it re-keys, in',
     'one transaction: a new rate with the live code, the old one deactivated (never edited), supplier defaults and WooCommerce mappings re-pointed. Documents already sent to Xero are not touched.',
     'Not-cancelled orders and purchase orders (posted or not) referencing a re-keyed rate can still post its old code, so they refuse the apply unless --allow-unposted (their lines are then re-pointed); unposted refund lines storing the old code (migrated on the flag only when the code means the old rate alone), queued payloads carrying the old code always refuse it.',
+    'A re-key is a pre-go-live operation: an apply is refused (XERO_NOT_HELD) unless the producer-side hold is enforced for xero and Xero is not live (no outbound grant, no live-from instant), read from this command\'s environment as the application\'s producers read theirs.',
     'It reads the stored copy of Xero\'s list (the proven one) and never calls Xero or WooCommerce.',
     '',
     'Exit codes:',
@@ -105,6 +106,7 @@ export function renderTaxRekeyText(result: TaxRekeyRunResult): string {
   const lines: string[] = []
   if (result.refusal !== null) lines.push(`REFUSED: ${result.refusal.code}`, result.refusal.detail, 'Nothing was written.')
   if (result.plan !== null) lines.push(...(lines.length > 0 ? [''] : []), ...renderPlan(result.plan))
+  lines.push('', `Xero hold: ${result.hold.held ? 'HELD' : 'NOT HELD'} - ${result.hold.detail}${result.hold.held ? '' : ' (an apply is refused: a re-key runs only while Xero writes are held)'}`)
   if (result.applied && result.refusal === null) {
     lines.push('')
     if (result.written === null || result.written.created.length === 0) lines.push('Applied: nothing to re-key (a re-run changes nothing).')

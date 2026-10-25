@@ -15,6 +15,11 @@
  * It NEVER matches by code. Each rate gets ONE outcome (REKEY_OUTCOMES). Two further conditions are BLOCKERS that refuse the apply: two rates re-keying to one live type, and a live
  * type already carried by another active IMS rate that stays (a code on two active rates is ambiguous).
  *
+ * THE GUARANTEE: A RE-KEY IS A PRE-P2 OPERATION. The apply is refused (XERO_NOT_HELD) unless Xero writes are HELD: the producer-side hold is enforced for xero and no outbound grant /
+ * live-from instant is in force (xeroHoldState below). While held every Xero producer writes a shadow that is never delivered, and the writer-side cut-off at go-live refuses to deliver
+ * any row created before the live-from instant, so no payload built around the re-key - however long its producer paused between reading a rate and enqueueing - can reach Xero. The
+ * enqueue guard (lib/tax/retired-tax-code-guard.ts) and the queued-payload block below are belt and braces on top of that.
+ *
  * THE APPLY (explicit). `confirm` must be the digest of the plan the operator saw. In ONE transaction inside the Xero connection fence (the lock #797's import takes, so a rebind or a second
  * run cannot interleave) the plan is rebuilt from the locked state; a different digest writes NOTHING. For each REKEY it then:
  *   1. creates a NEW TaxRate (a component's own custom code that is not a live ACTIVE type is cleared to null on the new row, and listed in the plan) with the live code and the same name, rate, type, category, usedFor, country, flags and components; the old row is NEVER edited (documents reference it): it is only
@@ -51,6 +56,10 @@
  */
 import { createHash } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
+import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
+import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
+import { producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
+import { readProducerEnforcement } from '@/lib/security/producer-seam'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
 import { readStoredXeroList, type PurchaseTaxImportRefusalCode } from '@/lib/tax/purchase-tax-import'
 import { imsEffectivePercent, type ImsComponentRow } from '@/lib/tax/vat-difference-report'
@@ -71,7 +80,7 @@ export interface RekeyBlocker { code: RekeyBlockerCode; imsRateId: string; taxTy
 
 export const REKEY_REFUSAL_CODES = [
   'XERO_NOT_CONNECTED', 'XERO_CONNECTION_CHANGED', 'XERO_LIST_MISSING', 'XERO_LIST_UNREADABLE', 'XERO_LIST_NOT_STAMPED', 'XERO_LIST_STALE', 'XERO_LIST_WRONG_ORGANISATION',
-  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS', 'PENDING_REFUND_SNAPSHOTS', 'REFUND_SNAPSHOT_IDENTITY',
+  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS', 'PENDING_REFUND_SNAPSHOTS', 'REFUND_SNAPSHOT_IDENTITY', 'XERO_NOT_HELD',
 ] as const
 export type RekeyRefusalCode = (typeof REKEY_REFUSAL_CODES)[number]
 export interface RekeyRefusal { code: RekeyRefusalCode; detail: string }
@@ -85,6 +94,10 @@ export interface RekeyImsRate {
   countryCode: string | null
   accountingTaxType: string | null
   isDefault: boolean
+  /** The rest of what makes a rate mean what it means on a document (the refund-snapshot identity check compares them). Optional so a fixture may omit the defaults. */
+  isCompound?: boolean
+  reverseCharge?: boolean
+  reportingCategory?: string | null
   components: Array<ImsComponentRow & { name?: string; accountingTaxType?: string | null }>
 }
 
@@ -196,6 +209,29 @@ export function componentMeaningDifference(rate: Pick<RekeyImsRate, 'rate' | 'co
     if (!mine.rate.eq(theirs[index]!.rate)) return `component ${index + 1} is ${mine.rate.toFixed()}% in IMS and ${theirs[index]!.rate.toFixed()}% in Xero`
     if (mine.compound !== theirs[index]!.compound) return `component ${index + 1} differs on compounding`
   }
+  return null
+}
+/**
+ * Do two IMS rates mean the same thing on a document? Name (trimmed), percentage, ordered active components (rate, compound; a rate with none is one component at its column),
+ * country, side, isCompound, reverseCharge and reportingCategory. Used by the refund-snapshot identity check: a stored code is migrated only if EVERY carrier of the old code
+ * means exactly what the re-keyed row means. Returns the first difference, or null. (The live-type counterpart for Xero is componentMeaningDifference.)
+ */
+export function imsMeaningDifference(a: RekeyImsRate, b: RekeyImsRate): string | null {
+  if (a.name.trim() !== b.name.trim()) return 'name'
+  if (!new Dec(a.rate).eq(new Dec(b.rate))) return 'percentage'
+  const shape = (r: RekeyImsRate) => {
+    const active = r.components.filter((c) => c.active).sort((x, y) => x.sortOrder - y.sortOrder)
+    return active.length > 0 ? active.map((c) => ({ rate: new Dec(c.rate), compound: c.compoundOnPrevious })) : new Dec(r.rate).gt(0) ? [{ rate: new Dec(r.rate), compound: false }] : []
+  }
+  const sa = shape(a)
+  const sb = shape(b)
+  if (sa.length !== sb.length || sa.some((c, i) => !c.rate.eq(sb[i]!.rate) || c.compound !== sb[i]!.compound)) return 'component breakdown'
+  const country = (r: RekeyImsRate): string => (r.countryCode ?? '').trim().toUpperCase()
+  if (country(a) !== country(b)) return 'country'
+  if (a.usedFor !== b.usedFor) return 'side'
+  if ((a.isCompound ?? false) !== (b.isCompound ?? false)) return 'isCompound'
+  if ((a.reverseCharge ?? false) !== (b.reverseCharge ?? false)) return 'reverseCharge'
+  if ((a.reportingCategory ?? null) !== (b.reportingCategory ?? null)) return 'reportingCategory'
   return null
 }
 const candidateOf = (row: NormalisedXeroTaxRate): RekeyCandidate => ({ taxType: row.taxType, name: row.name, status: row.status, percent: statedPercent(row)?.toFixed() ?? null })
@@ -370,17 +406,26 @@ async function pendingRefundSnapshots(client: Client, code: string): Promise<{ r
   return { refunds: new Set(lines.map((l) => l.refundId)).size, lines: lines.length }
 }
 
-async function referencesOf(client: Client, row: RekeyRow, isDefault: boolean): Promise<RekeyReferences> {
+async function referencesOf(client: Client, row: RekeyRow, rate: RekeyImsRate): Promise<RekeyReferences> {
+  const isDefault = rate.isDefault
   const [suppliers, storefrontMappings, open, queued, refunds, sharing] = await Promise.all([
     client.supplier.count({ where: { taxRateId: row.imsRateId } }),
     client.shoppingTaxRateMapping.count({ where: { taxRateId: row.imsRateId } }),
     openDocumentsOf(client, row.imsRateId),
     queuedCounts(client, row.currentCode),
     pendingRefundSnapshots(client, row.currentCode),
-    client.taxRate.findMany({ where: { accountingTaxType: row.currentCode, id: { not: row.imsRateId } }, select: { id: true, name: true, rate: true, accountingTaxType: true } }),
+    client.taxRate.findMany({
+      where: { accountingTaxType: row.currentCode, id: { not: row.imsRateId } },
+      select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, isCompound: true, reverseCharge: true, reportingCategory: true, accountingTaxType: true, components: { select: { rate: true, compoundOnPrevious: true, active: true, sortOrder: true } } },
+    }),
   ])
+  // ANY other carrier of the old code (active or not) that differs in ANY posting meaning makes a stored snapshot of the code ambiguous: the snapshot is then not migrated.
   const refundSnapshotConflict = sharing.some((other) => other.id !== row.imsRateId && other.accountingTaxType === row.currentCode
-    && (other.name.trim() !== row.name.trim() || !new Dec(other.rate.toFixed(4)).mul(100).eq(row.imsPercent)))
+    && imsMeaningDifference(rate, {
+      id: other.id, name: other.name, rate: other.rate.toFixed(4), usedFor: other.usedFor, countryCode: other.countryCode, accountingTaxType: other.accountingTaxType, isDefault: false,
+      isCompound: other.isCompound, reverseCharge: other.reverseCharge, reportingCategory: other.reportingCategory,
+      components: (other.components ?? []).map((c) => ({ rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, active: c.active, sortOrder: c.sortOrder })),
+    }) !== null)
   return {
     suppliers, storefrontMappings, isDefault,
     unpostedSalesOrders: open.unpostedSalesOrders, unpostedSalesOrderLines: open.unpostedSalesLines,
@@ -404,18 +449,19 @@ export async function readRekeyPlan(client: Client, options: { now: Date; connec
   }
   const stored = await client.taxRate.findMany({
     where: { active: true },
-    select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, accountingTaxType: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
+    select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, accountingTaxType: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
     orderBy: [{ name: 'asc' }, { id: 'asc' }],
   })
   const rates: RekeyImsRate[] = stored.map((r) => ({
     id: r.id, name: r.name, rate: r.rate.toFixed(4), usedFor: r.usedFor, countryCode: r.countryCode, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault,
+    isCompound: r.isCompound, reverseCharge: r.reverseCharge, reportingCategory: r.reportingCategory,
     components: r.components.map((c) => ({ name: c.name, rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType, active: c.active, sortOrder: c.sortOrder })),
   }))
   const matched = matchRekeyRates({ rates, xero: read.list.rows })
   const references: Record<string, RekeyReferences> = {}
   for (const row of matched.rows) {
     if (row.outcome !== 'REKEY') continue
-    references[row.imsRateId] = await referencesOf(client, row, rates.find((r) => r.id === row.imsRateId)!.isDefault)
+    references[row.imsRateId] = await referencesOf(client, row, rates.find((r) => r.id === row.imsRateId)!)
   }
   const list = { tenantId: read.list.tenantId, fetchedAt: read.list.fetchedAt.toISOString(), rowCount: read.list.rows.length, digest: digestTaxRateList(read.list.tenantId, read.list.rows) }
   const plan: RekeyPlan = { list, ...matched, references, digest: '' }
@@ -495,6 +541,49 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
 }
 
 // ---------------------------------------------------------------------------
+// The structural guarantee: a re-key runs only while Xero writes are HELD
+// ---------------------------------------------------------------------------
+
+/** The environment variables the Xero hold is read from; the CLI hands exactly these (and nothing else) to the run, since it replaces the rest of its environment. */
+export const XERO_HOLD_ENV_NAMES = [PRODUCER_HOLD_ENFORCED_ENV, OUTBOUND_GRANT_ENV.xero, PRODUCER_CUTOFF_ENV.xero] as const
+
+export function pickXeroHoldEnv(source: Readonly<Record<string, string | undefined>>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const name of XERO_HOLD_ENV_NAMES) {
+    const value = Object.prototype.hasOwnProperty.call(source, name) ? source[name] : undefined
+    if (typeof value === 'string') out[name] = value
+  }
+  return out
+}
+
+export interface XeroHoldState { held: boolean; detail: string }
+
+/**
+ * IS XERO HELD? True only when the producer-side hold is ENFORCED for xero (PRODUCER_HOLD_ENFORCED_DESTINATIONS readable and naming xero or all) AND the destination is NOT live: no outbound
+ * grant and no live-from instant (producerGrantCutoffAgreement = agreed_held). It is the reading `npm run outbound:status` makes (lib/ops/outbound-producer-status.ts: enforced, agreement).
+ * Anything else - not enforced, an unreadable switch, a grant, a live-from instant (set, future or past), inconsistent or unreadable - is NOT held. Pure over the environment; never throws.
+ *
+ * WHY THIS IS THE GUARANTEE. While held, every Xero producer writes a SHADOW that is never delivered (lib/domain/accounting/xero-producer-seam.ts, createAccountingSyncLogRow's
+ * producer seam). At go-live, the writer-side cut-off (xeroCutoffFloor / xeroBeforeCutoffRefusal / xeroNotBeforeCutoffWhere, used by the sync processor's claims and re-queues; the same
+ * floor the outbox uses) refuses to deliver any row created before XERO_WRITES_LIVE_FROM. So no payload built around a re-key - however long its producer paused between reading a rate
+ * and enqueueing - can ever reach Xero. The enqueue guard (lib/tax/retired-tax-code-guard.ts) stays as belt and braces. A re-key is therefore a PRE-P2 operation: permitted only while
+ * Xero writes are held.
+ */
+export function xeroHoldState(env: Readonly<Record<string, string | undefined>> = process.env): XeroHoldState {
+  try {
+    const enforcement = readProducerEnforcement({ ...env })
+    if (!enforcement.enforced) return { held: false, detail: `${PRODUCER_HOLD_ENFORCED_ENV} is not set, so the producer-side hold is not enforced and Xero producers would still queue deliverable work` }
+    if (!enforcement.readable) return { held: false, detail: `${PRODUCER_HOLD_ENFORCED_ENV} is set but cannot be read` }
+    if (!enforcement.destinations.has('xero')) return { held: false, detail: `${PRODUCER_HOLD_ENFORCED_ENV} does not name xero` }
+    const agreement = producerGrantCutoffAgreement('xero', { ...env })
+    if (agreement.state !== 'agreed_held') return { held: false, detail: `Xero is not held: ${agreement.text}` }
+    return { held: true, detail: `Xero is held: ${PRODUCER_HOLD_ENFORCED_ENV} names xero, no outbound grant and no live-from instant are set` }
+  } catch {
+    return { held: false, detail: 'the Xero hold could not be read' }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The action
 // ---------------------------------------------------------------------------
 
@@ -504,6 +593,8 @@ export interface TaxRekeyRunOptions {
   confirm?: string
   /** Also re-point the lines of unposted documents (otherwise they block the apply). */
   allowUnposted?: boolean
+  /** The Xero hold variables (XERO_HOLD_ENV_NAMES) to read; default the process environment (the web app's own, which is the one its producers obey). The CLI passes its caller's. */
+  producerEnv?: Readonly<Record<string, string | undefined>>
   now?: Date
 }
 
@@ -513,6 +604,8 @@ export interface TaxRekeyRunResult {
   plan: RekeyPlan | null
   refusal: RekeyRefusal | null
   written: RekeyWriteResult | null
+  /** Whether Xero writes are held (an apply is refused unless they are). Shown with a preview so the operator knows before applying. */
+  hold: XeroHoldState
 }
 
 const DIGEST_RE = /^[0-9a-f]{64}$/
@@ -537,16 +630,19 @@ export function applyRefusal(plan: RekeyPlan, allowUnposted: boolean): RekeyRefu
  * cannot interleave), refuses unless its digest is the one confirmed, and writes that plan. Nothing to re-key is a no-op, not a refusal (the idempotent re-run).
  */
 export async function runTaxRekey(options: TaxRekeyRunOptions): Promise<TaxRekeyRunResult> {
-  const refuse = (refusal: RekeyRefusal, plan: RekeyPlan | null = null): TaxRekeyRunResult => ({ applied: options.apply, wrote: false, plan, refusal, written: null })
+  const hold = xeroHoldState(options.producerEnv ?? process.env)
+  const refuse = (refusal: RekeyRefusal, plan: RekeyPlan | null = null): TaxRekeyRunResult => ({ applied: options.apply, wrote: false, plan, refusal, written: null, hold })
   // Before the database is touched: an apply with no digest never reads anything.
   if (options.apply && (options.confirm === undefined || !DIGEST_RE.test(options.confirm))) return refuse({ code: 'CONFIRM_REQUIRED', detail: 'an apply needs the exact 64-character plan digest the operator saw in the preview' })
+  // A re-key is a pre-P2 operation: refused unless Xero writes are held (see xeroHoldState). Checked before the database is touched.
+  if (options.apply && !hold.held) return refuse({ code: 'XERO_NOT_HELD', detail: `${hold.detail}. Re-keying is allowed only while Xero writes are held (before go-live): an in-flight producer could otherwise enqueue a payload with a retired code that would be delivered.` })
   const { db } = await import('@/lib/db')
   const { captureXeroConnection, withXeroConnectionFence } = await import('@/lib/connectors/xero/connection-fence')
   const now = options.now ?? new Date()
   const connection = await captureXeroConnection()
   const first = await readRekeyPlan(db as unknown as Client, { now, connectedTenantId: connection?.tenantId ?? null })
   if (!first.ok) return refuse(first.refusal)
-  if (!options.apply) return { applied: false, wrote: false, plan: first.plan, refusal: null, written: null }
+  if (!options.apply) return { applied: false, wrote: false, plan: first.plan, refusal: null, written: null, hold }
   if (connection === null) return refuse({ code: 'XERO_NOT_CONNECTED', detail: 'no Xero organisation is connected' }, first.plan)
   const seen: { plan: RekeyPlan | null } = { plan: null }
   const fenced = await withXeroConnectionFence(connection, async (tx) => {
@@ -562,5 +658,5 @@ export async function runTaxRekey(options: TaxRekeyRunOptions): Promise<TaxRekey
   })
   if (!fenced.ok) return refuse({ code: 'XERO_CONNECTION_CHANGED', detail: fenced.error }, seen.plan ?? first.plan)
   const { refusal, plan, written } = fenced.value
-  return { applied: true, wrote: written !== null && written.created.length > 0, plan: plan ?? first.plan, refusal, written }
+  return { applied: true, wrote: written !== null && written.created.length > 0, plan: plan ?? first.plan, refusal, written, hold }
 }
