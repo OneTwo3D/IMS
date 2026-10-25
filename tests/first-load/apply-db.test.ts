@@ -2163,9 +2163,15 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       })
 
       it('purchase orders: a stored supplier whose currency differs from the order\'s is refused PO_CURRENCY_DIFFERS_FROM_SUPPLIER; restored, it passes', async () => {
-        const sup = await m.db.supplier.findFirstOrThrow({ where: { name: SUPPLIER_B } })
-        await m.db.supplier.update({ where: { id: sup.id }, data: { currency: 'USD' } })
-        try { assert.match((await rails('purchase-orders')).join(';'), /PO_CURRENCY_DIFFERS_FROM_SUPPLIER/) } finally { await m.db.supplier.update({ where: { id: sup.id }, data: { currency: sup.currency } }) }
+        // The suppliers step has not run, so the supplier is created here (as the suppliers step would) and removed again. The FX rail's own verdict is read, because the
+        // stray supplier row also trips the data-classes rail.
+        const fxRail = async () => (await m.rails.evaluateRailResults(prepared, { phase: 'recheck', resuming: true, step: 'purchase-orders' }, CLEAN_PRELOAD)).find((r) => r.id === 'fx-rates')!.problems
+        const sup = await m.db.supplier.create({ data: { name: 'ZQSENT Cotton Ltd', currency: 'USD' } }) // the synthetic prepared run's EUR supplier
+        try {
+          assert.match((await fxRail()).join(';'), /PO_CURRENCY_DIFFERS_FROM_SUPPLIER/)
+          await m.db.supplier.update({ where: { id: sup.id }, data: { currency: 'EUR' } })
+          assert.deepEqual(await fxRail(), [], 'a stored supplier with the order\'s currency passes')
+        } finally { await m.db.supplier.delete({ where: { id: sup.id } }) }
         assert.deepEqual(await rails('purchase-orders'), [])
       })
 
