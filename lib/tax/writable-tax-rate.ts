@@ -20,6 +20,8 @@
  * every document write with every enqueue.) Outside a transaction (a pooled client) the lock is released at once and only the read stands; callers that write in a transaction
  * pass the transaction.
  */
+import { Prisma } from '@/app/generated/prisma/client'
+
 const MAX_HOPS = 8
 
 export class TaxRateNotUsableError extends Error {
@@ -96,4 +98,20 @@ export async function resolveLinesTaxRates<L extends { taxRateId?: string | null
 export async function resolveWritableTaxRateId(client: unknown, id: string | null | undefined, options: WritableTaxRateOptions = {}): Promise<string | null | undefined> {
   if (!id) return id
   return (await resolveWritableTaxRateIds(client, [id], options)).get(id) ?? id
+}
+
+/**
+ * Share-lock (to the caller's commit) every rate row an order's tax identity is read from: its lines' rates and the active rate named by the order's taxRateName. One statement, run BEFORE the
+ * identity is read (the refund service), so a tax re-key apply's UPDATE of such a row waits for this transaction. A client without raw access (a structural test double) is not locked.
+ */
+export async function shareLockOrderTaxRates(tx: unknown, orderId: string): Promise<void> {
+  const c = tx as { $queryRaw?: (query: unknown) => Promise<unknown> }
+  if (typeof c.$queryRaw !== 'function') return
+  // A Prisma.Sql object (not a tagged template) so a structural double that reads bound values handles it like its other statements.
+  await c.$queryRaw(Prisma.sql`
+    SELECT id FROM tax_rates
+    WHERE id IN (SELECT "taxRateId" FROM sales_order_lines WHERE "orderId" = ${orderId} AND "taxRateId" IS NOT NULL)
+       OR (active AND name = (SELECT "taxRateName" FROM sales_orders WHERE id = ${orderId}))
+    ORDER BY id
+    FOR SHARE`)
 }

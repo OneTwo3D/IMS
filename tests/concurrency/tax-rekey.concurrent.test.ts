@@ -686,14 +686,14 @@ test('A SUPPLIER WRITE concurrent with the apply ends on the new rate (the apply
 test('A REFUND created concurrently with the apply ends with its snapshot on the new code (the apply waits for the refund\'s share lock, recounts, migrates)', { skip }, async () => {
   const d = await loadDeps()
   await precondition(d)
+  const { shareLockOrderTaxRates } = await import('../../lib/tax/writable-tax-rate.ts')
   const { db } = d
   const w = await seedWorld(d)
   const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
   created.digests.push(preview.digest)
   // The refund's shape (refund-service.ts): share-lock the order lines' rate rows, read the code, pause, insert the snapshot of the code it read.
   const refundWrite = db.$transaction(async (tx) => {
-    const rateIds = (await tx.salesOrderLine.findMany({ where: { orderId: w.soDraftGr.id, taxRateId: { not: null } }, select: { taxRateId: true } })).map((l) => l.taxRateId as string)
-    await tx.$queryRaw`SELECT id FROM tax_rates WHERE id = ANY(${rateIds}::text[]) ORDER BY id FOR SHARE`
+    await shareLockOrderTaxRates(tx, w.soDraftGr.id) // the very statement the refund service runs before it reads the identity
     const read = (await tx.salesOrderLine.findFirstOrThrow({ where: { orderId: w.soDraftGr.id }, select: { taxRate: { select: { accountingTaxType: true } } } })).taxRate?.accountingTaxType ?? null
     await new Promise((resolve) => setTimeout(resolve, 900))
     const r = await tx.salesOrderRefund.create({ data: { orderId: w.soDraftGr.id, totalForeign: 10, totalBase: 10, lines: { create: [{ description: 'x', qty: 1, unitPriceBase: 10, totalBase: 10, accountingTaxType: read }] } }, select: { id: true, lines: { select: { id: true } } } })

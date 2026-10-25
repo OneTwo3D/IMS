@@ -72,7 +72,7 @@ const WRITERS: Array<[string, RegExp, string, number]> = [
   ['app/actions/wc-sync.ts', /resolveWritableTaxRateId\(tx, taxRateId\)/, 'storefront mapping update, in its transaction', 1],
   ['lib/connectors/woocommerce/sync/taxes.ts', /resolveWritableTaxRateId\(tx, imsTaxRateId, \{ lenient: true \}\)/, 'storefront rate import, in the upsert transaction', 1],
   ['lib/connectors/woocommerce/sync/order-import.ts', /resolveLinesTaxRates\(tx, lineData, \{ lenient: true \}\)/, 'WooCommerce order import, in its transaction', 1],
-  ['lib/domain/sales/refund-service.ts', /FROM tax_rates WHERE id = ANY\(\$\{lockedRateIds\}::text\[\]\)[^`]*FOR SHARE/, 'refund snapshot: the rate rows are share-locked before the identity is read, to commit', 1],
+  ['lib/domain/sales/refund-service.ts', /await shareLockOrderTaxRates\(tx, input\.orderId\)/, 'refund snapshot: the rate rows are share-locked before the identity is read, to commit', 1],
 ]
 // [mutation: any one call removed from its writer -> that census row fails]
 test('CENSUS: every writer that persists a tax rate id resolves it through the shared helper', () => {
