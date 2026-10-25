@@ -2162,12 +2162,16 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.ok(cells >= 7)
       })
 
-      it('purchase orders: an FX rate outside the importer\'s 2%, and a currency with no stored rate, are refused', async () => {
+      it('purchase orders: a file rate that fx_rates does not hold, one outside the importer\'s 2% of today\'s, and a currency with no stored rate, are refused', async () => {
         const row = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR' } })
         await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.30' } })
-        try { assert.match((await rails('purchase-orders')).join(';'), /FX rate 1 of 1 in fxRates: it differs from the stored rate by more than the importer's tolerance/) } finally { await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.25' } }) }
+        try {
+          const text = (await rails('purchase-orders')).join(';')
+          assert.match(text, /is not a rate the database's fx_rates holds for it/)
+          assert.match(text, /by more than the purchase-order importer's tolerance/)
+        } finally { await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.25' } }) }
         await m.db.fxRate.update({ where: { id: row.id }, data: { toCurrency: 'SEK' } })
-        try { assert.match((await rails('purchase-orders')).join(';'), /the database holds no rate for it/) } finally { await m.db.fxRate.update({ where: { id: row.id }, data: { toCurrency: 'EUR' } }) }
+        try { assert.match((await rails('purchase-orders')).join(';'), /the database holds no usable rate for it/) } finally { await m.db.fxRate.update({ where: { id: row.id }, data: { toCurrency: 'EUR' } }) }
         assert.deepEqual(await rails('purchase-orders'), [])
       })
 

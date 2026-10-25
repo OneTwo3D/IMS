@@ -227,26 +227,39 @@ async function warehouses(prepared: PreparedRun, problems: string[]): Promise<vo
 
 async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
   const base = prepared.manifest.baseCurrency.toUpperCase()
-  const declared = Object.entries(prepared.manifest.fxRates).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const step = prepared.steps.find((s) => s.step === 'purchase-orders')
+  if (!step) return
+  const col = (name: string): number => step.data.header.indexOf(name)
+  const [currencyIx, rateIx] = [col('currency'), col('fxRateToBase')]
+  // The prepare step looked every foreign order's rate up in fx_rates (the central rule, at the end of the order's created day). No file and no manifest states a rate.
+  // This rail proves, against the database, that each rate in the file is a rate fx_rates holds for its currency, and that the importer (which compares an order's rate
+  // with the latest stored rate on or before today) will not refuse it.
+  const rates = new Map<string, Set<string>>()
+  for (const row of step.data.rows) {
+    const currency = (currencyIx < 0 ? '' : row.cells[currencyIx] ?? '').trim().toUpperCase()
+    if (currency === '' || currency === base) continue
+    const text = (rateIx < 0 ? '' : row.cells[rateIx] ?? '').trim()
+    rates.set(currency, (rates.get(currency) ?? new Set<string>()).add(text))
+  }
   const now = new Date()
-  for (const [index, [currency, stated]] of declared.entries()) {
-    const at = `FX rate ${index + 1} of ${declared.length} in fxRates`
-    if (currency === base) continue
-    // The one central lookup, "on or before now". A manifest rate is only ever compared with the stored one.
-    // TODO(o3d-q0x56.7): file rates are decided there (accepted or refused); this check then follows that ruling.
-    let stored: Dec
+  for (const [currency, texts] of [...rates.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    const at = `FX rates of the purchase-orders file for one currency (${[...rates.keys()].sort().indexOf(currency) + 1} of ${rates.size})`
+    const rows = await db.fxRate.findMany({ where: { fromCurrency: base, toCurrency: currency }, select: { rate: true } })
+    const stored = rows.map((r) => new D(r.rate.toFixed()))
+    let latest: Dec | null = null
     try {
-      stored = new D((await getFxRateToBase(db, { currency, asOf: now, baseCurrency: base })).rate.toFixed())
+      latest = new D((await getFxRateToBase(db, { currency, asOf: now, baseCurrency: base })).rate.toFixed())
     } catch (error) {
       if (!isMissingFxRateError(error)) throw error
-      if (error.reason === 'no_rate') problems.push(`${at}: the database holds no rate for it on or before today`)
-      else if (error.reason === 'non_positive_rate' || error.reason === 'non_finite_rate') problems.push(`${at}: the stored rate is not positive`)
-      else if (error.reason === 'ambiguous_rate') problems.push(`${at}: the database holds two different rates for it at the same instant`)
-      else problems.push(`${at}: it is not a usable currency code`)
-      continue
+      problems.push(`${at}: the database holds no usable rate for it on or before today`)
     }
-    const delta = new D(stated).minus(stored).abs().div(stored)
-    if (delta.gt(new D(PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE))) problems.push(`${at}: it differs from the stored rate by more than the importer's tolerance`)
+    for (const [index, text] of [...texts].sort().entries()) {
+      let rate: Dec
+      try { rate = new D(text) } catch { problems.push(`${at}: rate ${index + 1} is not a number`); continue }
+      if (!stored.some((s) => s.eq(rate))) problems.push(`${at}: rate ${index + 1} is not a rate the database's fx_rates holds for it (a rate is only ever read from fx_rates)`)
+      // The importer takes a rate only within its tolerance of the latest stored rate, and the purchase-order importer is not changed here (see docs/first-load-apply.md).
+      if (latest !== null && rate.minus(latest).abs().div(latest).gt(new D(PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE))) problems.push(`${at}: rate ${index + 1} differs from today's stored rate by more than the purchase-order importer's tolerance, which would refuse the order`)
+    }
   }
 }
 

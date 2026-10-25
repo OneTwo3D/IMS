@@ -175,13 +175,14 @@ genuine deposit suppliers, and let IMS resolve the contact id.
 
 Reduced to the outstanding quantity per line.
 
+**The file carries no currency and no rate.** An order's currency is the currency of its supplier in the same run's suppliers dataset (so an order whose currency differs from its supplier's cannot arise; it is not refused, because it cannot exist). A supplier with no currency is impossible (`MISSING_CURRENCY` rejects the supplier row first); `SUPPLIER_CURRENCY_MISSING` guards it anyway. The rate of a foreign order is read ONLY from IMS's `fx_rates`, through the `ims-fx-rates` list and the central rule (the latest row at or before the end of the `createdOn` day, UTC; a tie of different rates, or a zero, negative or unreadable row, refuses): `FX_RATES_NOT_SUPPLIED` (no list), `FX_RATE_MISSING` (no row on or before that day), `FX_RATE_UNUSABLE` (a bad or ambiguous row, or more than 8 decimal places). A rate is never taken from a file or defaulted. The written rate is foreign units per ONE base unit; the importer divides by it.
+
 | Column | Required | Meaning |
 | --- | --- | --- |
 | `orderKey` | yes | The incumbent's PO number. Written as `<purchaseOrderKeyPrefix><orderKey>`. |
-| `supplierName` | yes | Must be in the suppliers dataset, or (when supplied) in the ims-suppliers list. |
+| `supplierName` | yes | Must be in the suppliers dataset OF THE SAME RUN (`SUPPLIER_NOT_IN_FILE` otherwise, also when the supplier exists only in the ims-suppliers list: its currency is not known here). Matched the way the purchase-order importer matches (trimmed, upper-cased), after the suppliers dataset's own collision rules (a rejected or colliding supplier is `SUPPLIER_ROW_REJECTED`). |
 | `status` | no | OPEN (default if blank), CLOSED or CANCELLED. Anything not OPEN is excluded. |
-| `currency` | yes | 3-letter code. |
-| `fxRateToBase` | no | Required when `currency` is not the base currency. Foreign units per ONE base unit; the importer divides by it. At most 8 decimal places (the stored scale, Decimal(18,8)): a finer rate is rejected, never rounded. |
+| `createdOn` | no | The order's created date, `YYYY-MM-DD` (a native `Created on` converts through `dateFormats`). Required for an order in a foreign currency (`MISSING_CREATED_DATE`, `BAD_DATE`): the rate is looked up as of the END of that day, UTC. Not read for a base-currency order. |
 | `destinationWarehouseCode` | no | Passed through as given (trimmed). |
 | `sku` | yes | Passed through as given (trimmed). |
 | `lineNo` | no | The incumbent's line number. When an order repeats a SKU, EVERY such row must carry a non-blank line number and no two may share one; otherwise all of them are rejected as duplicates. A blank, space or zero-width value never makes a row distinct. |
@@ -293,6 +294,16 @@ The tax rates that already exist in the target IMS (an export you assemble from 
 | `usedFor` | no | `SALES`, `PURCHASE` or `BOTH`; anything else rejects the row (`BAD_USED_FOR`). Only `PURCHASE` and `BOTH` rates are eligible. |
 | `active` | no | `TRUE` or `FALSE`; anything else rejects the row (`BAD_ACTIVE`). Only active rates are eligible. |
 
+### Dataset: ims-fx-rates
+
+The rows of IMS's `fx_rates` table (an export you assemble from Settings, Currencies, or the table itself). It is the ONLY source of a foreign purchase order's rate: the transform applies the central lookup rule over it (it imports the pure rule, `lib/currencies/fx-select.ts`, not the database). Omit it and every foreign purchase order is rejected `FX_RATES_NOT_SUPPLIED`. Always a canonical file. A row for the base currency, or an unreadable row, is rejected.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `currency` | yes | The foreign currency, 3 letters (base to this currency). |
+| `rate` | yes | `fx_rates.rate`: 1 base = `rate` foreign, a plain decimal. A zero or negative row is kept so the lookup refuses it (`FX_RATE_UNUSABLE`) rather than skipping to an older one. |
+| `fetchedAt` | yes | `fx_rates.fetchedAt` as an ISO instant WITH a zone, e.g. `2026-10-20T06:00:00Z`. |
+
 ### Dataset: ims-skus
 
 SKUs that already exist in the target IMS (from `/api/export/products`). The fourth side of the coverage check. Omit it for an empty database.
@@ -335,7 +346,7 @@ purchase-order-lines and transfers; the 3PL (today Mintsoft) feeds wms-products 
 | `wide` | the wide warehouse blocks layout (below) |
 | `rowSelect` | `{ "column", "keep": [...], "skip": [...] }`: a closed list of the values of one source column; see "Row kinds and grouped parents" |
 | `parentFrom` | `{ "column", "parentValues", "skuColumn", "into" }`: rows after a parent row inherit its SKU; see "Row kinds and grouped parents" |
-| `derived` | canonical column to the canonical column it is derived from, e.g. `{ "currency": "supplierName", "fxRateToBase": "currency" }`; each needs its own closed `valueMaps` entry |
+| `derived` | canonical column to the canonical column it is derived from, e.g. `{ "taxClass": "supplierName" }` (no shipped map uses it); each needs its own closed `valueMaps` entry |
 | `dateFormats` | canonical column to a source date format; the value is converted to `YYYY-MM-DD` |
 
 It fails closed, and each of these is an error that stops the run (exit 3) rather than something guessed:
@@ -392,7 +403,7 @@ rejected as `UNLISTED_ROW_KIND`. That is how the Qoblex stock report's `Product 
 
 ### Derived columns and dates
 
-`derived` fills a column from another canonical column of the same record through the derived column's own closed `valueMaps` (a value not in it rejects the row): Qoblex's open purchase order file has no currency, so the currency comes from the supplier and the exchange rate from the currency.
+`derived` fills a column from another canonical column of the same record through the derived column's own closed `valueMaps` (a value not in it rejects the row). No shipped map uses it: Qoblex's open purchase order file has no currency, and its currency and rate are NOT derived by a map (see "Qoblex native exports").
 `dateFormats` converts a source date with the tokens `YYYY`, `MMM` (Jan-Dec), `ddd` (Mon-Sun), `MM`, `M`, `DD`, `D`; the whole value must match, the day must exist, and a `ddd` must be the real weekday (`Thu, Sep 24 2026` reads as 2026-09-24; `Fri, Sep 24 2026` is rejected as `BAD_DATE`).
 
 ### How to write the column map from a sample
@@ -474,7 +485,7 @@ How each fact the export states is read, and what is a decision for the owner:
   The five warehouse labels are mapped to the codes `MIL1`, `CAMBRIDGE`, `RESTOCK`, `QUARANTINE-CAMBRIDGE` and `RXT2`; these codes must exist in IMS (apply-time check `warehouse-exists`). **Owner decision:** the quarantine warehouse is imported as its own warehouse by default, so quarantined units are on hand but not mixed into a sellable warehouse; say so if it should not be loaded.
 - **Transfers are not needed for Qoblex.** Qoblex has no in-transit status for transfers: a booked transfer is already at the destination and a draft transfer is still in the origin warehouse, so on-hand per warehouse is already the truth. The `transfers` dataset is simply not supplied (the report lists it under "Not supplied"), `inTransitConvention` is not set, and the in-transit section below does not apply to Qoblex.
 - **Open purchase orders** come from the incoming-stock file, one row per line. `Status` is a closed list: `Approved` and `PartiallyReceived` are open (OPEN); any other status is rejected until the owner says whether it is open. Outstanding quantity is `Ordered Quantity` minus `Received Quantity`, so a fully received line is excluded. The destination warehouse is a constant (`MIL1`; the report's `Incoming Quantity` appears only for that warehouse in the sample); confirm it.
-  The file has **no currency and no exchange rate**: the currency is derived from the supplier (`derived`, from the supplier's currency in the contact export) and the rate from the currency, both closed lists in the map. A supplier whose contact has no currency is rejected until the owner gives one; the rates in the shipped map are placeholders for the synthetic suppliers only. The `Discount (%)` column is not read (every value in the sample is 0): it shows under "Source columns not read", and a non-zero value would be lost, so check it.
+  The file has **no currency and no exchange rate**, and the pinned map carries no supplier-to-currency or currency-to-rate table (the reconciliation pack's copy is byte-identical). The order's currency is that of the supplier with the same name in the same run's contact export; an unknown supplier is `SUPPLIER_NOT_IN_FILE`. The rate of a foreign order is read from the `ims-fx-rates` list (IMS's `fx_rates`) as of the end of the `Created on` day (`createdOn`, converted from `Thu, Sep 24 2026`); no rate for that day is `FX_RATE_MISSING`. The `Discount (%)` column is not read (every value in the sample is 0): it shows under "Source columns not read", and a non-zero value would be lost, so check it.
   `Due On` (`Thu, Oct 8 2026`) becomes `expectedDelivery`. The `Incoming Quantity` per warehouse in the stock report and these lines describe the same open orders: their per-SKU totals should agree, and a PO line for a SKU the catalogue lacks is rejected (`SKU_NOT_IN_CATALOGUE`).
 - **Supplier currency and tax rate.** `Currency` is required: a blank is `MISSING_CURRENCY` (the supplier importer's silent GBP default is refused; a GBP supplier must say GBP). `Purchase Tax Class Name` becomes the supplier's default tax rate through the **pinned** value map in `qoblex-contacts.map.json` (also pinned in code as `QOBLEX_PURCHASE_TAX_CLASS_TYPES` and by a test): `Purchase Tax` is `INPUT2` (20% VAT on expenses), `Zero Rated Purchase` is `ZERORATEDINPUT`, `No VAT` is `NONE` (Xero built-in tax types). Any other class is `UNMAPPED_VALUE`, a blank class is `MISSING_PURCHASE_TAX_TYPE`. Each type must then resolve to exactly one active purchase-capable IMS tax rate carrying it (`NO_IMS_PURCHASE_TAX_RATE` / `AMBIGUOUS_IMS_PURCHASE_TAX_RATE`; the rate is never chosen by name), so IMS tax rates must be mapped to Xero types (`INPUT2`, `ZERORATEDINPUT`, `NONE`) before the load.
 - **Suppliers** come from the contact export. **The export has no supplier/customer flag.** `Wholesale or Retail` is a closed list (`Wholesale` only): a `Retail` contact is rejected as `UNLISTED_ROW_KIND` for an owner decision. Every other contact is loaded as a supplier. Whether a contact is a supplier is read from its use: the suppliers named in the stock report's `Supplier` column and in the incoming-stock file's `Supplier` column should all be present (a purchase order line naming an absent supplier is rejected).
@@ -604,7 +615,7 @@ Every importer rejection rule that depends on what is in IMS. The importers' CSV
 | opening-stock-empty | opening-stock | The product and warehouse have no stock, cost layer or movement yet (importOpeningStockCsv refuses otherwise; it is not repeatable). |
 | po-supplier-exists | purchase-orders | Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first. |
 | supplier-tax-rate | suppliers | Each supplier's purchaseTaxType (a Xero tax type) resolves to exactly one active IMS tax rate that is usable for purchases (usedFor PURCHASE or BOTH) and carries that accountingTaxType. Several matching rates refuse the run; with none, the apply step first imports the rate from the stored Xero tax-rate list and refuses only if that import is refused (see docs/first-load-apply.md); the supplier importer sets the supplier's default tax rate to it and refuses the row otherwise. The tool performs this only against an ims-tax-rates list you supply; WITHOUT it the report says the resolution was NOT checked. |
-| po-fx-rate | purchase-orders | For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this. |
+| po-fx-rate | purchase-orders | Every non-base order's fxRateToBase is a rate IMS's fx_rates holds for its currency (it was looked up there at prepare time), and the purchase-order importer, which compares it with the latest stored rate on or before the import date, accepts it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE, 2%). The CSV dry-run does not run this. |
 | po-tax-rate | purchase-orders | Each line's taxRateName (names are matched case-insensitively, trimmed) or, when only a taxRateValue is given, its value (matched within 0.00005) resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. A line never carries both: the tool cannot show a name and a value agree. |
 | lookup-keys-unique-in-ims | all | In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers' case-insensitive matching: they build a Map and the last duplicate wins silently. The tool performs the supplier and SKU parts only against an ims-suppliers / ims-skus list you supply; WITHOUT that list the collision check against IMS is NOT performed and the report says so. Warehouse codes and tax names are never checked by the tool. |
 | po-reference-free | purchase-orders | No existing purchase order already has a prefixed orderKey as its reference (an existing one is skipped, not updated). |

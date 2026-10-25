@@ -90,7 +90,6 @@ export function manifestText(overrides: Record<string, unknown> = {}): string {
     steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'],
     expectWarehouses: WAREHOUSES,
     acceptZeroCost: ['ZQSENT-TSHIRT-M@ZQSENT-MAIN'],
-    fxRates: { EUR: '1.25' },
     restorePointDir: '/restore',
   }
   const merged = { ...base, ...overrides }

@@ -300,7 +300,6 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
 
   if (orders) {
     const supplierNames = new Set((suppliers?.data.rows ?? []).map((row) => cell(suppliers!, row, 'name').trim().toUpperCase()))
-    const currenciesUsed = new Set<string>()
     for (const row of orders.data.rows) {
       const supplier = cell(orders, row, 'supplierName').trim().toUpperCase()
       if (!supplierNames.has(supplier)) problems.push(`purchase-orders ${rowLocation(row)}: the supplier is not in the suppliers file`)
@@ -314,15 +313,12 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       if (currency === SUPPORTED_BASE_CURRENCY) {
         if (fx !== '' && fmt(new D(fx)) !== '1') problems.push(`purchase-orders ${rowLocation(row)}: a ${SUPPORTED_BASE_CURRENCY} order with an fxRateToBase other than 1`)
       } else {
-        currenciesUsed.add(currency)
-        const declared = manifest.fxRates[currency]
+        // The rate was looked up from fx_rates by the prepare step (the order's created day). Nothing here declares or compares a rate: the rail fx-rates proves, against the
+        // database, that every rate in the file is a rate fx_rates holds.
         const rate = parseDecimal(fx, 'fxRateToBase', NUMERIC_LIMITS.fx)
-        if (declared === undefined) problems.push(`purchase-orders ${rowLocation(row)}: the currency has no rate in the apply manifest fxRates`)
-        else if (!rate.ok) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase is not an acceptable number`)
-        else if (fmt(rate.value) !== declared) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase differs from the rate the apply manifest states for its currency`)
+        if (!rate.ok || !rate.value.gt(new D(0))) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase is not an acceptable positive number`)
       }
     }
-    for (const currency of Object.keys(manifest.fxRates)) if (!currenciesUsed.has(currency)) problems.push('the apply manifest fxRates lists a currency that no selected purchase order uses')
   }
 
   const declared = Object.keys(manifest.expectWarehouses).sort()
