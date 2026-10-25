@@ -1609,7 +1609,7 @@ The same table is printed by `npm run readiness:gate -- --help`.
 
 ## VAT difference report
 
-`npm run vat:diff` (add `-- --json` for machine-readable output) compares the VAT rates held in Xero, IMS and WooCommerce and lists every difference with a closed reason code. The owner ruled on 2026-10-25 that all three use the SAME set of VAT rates and that Xero is the master; WooCommerce tax-rate writes are operator-manual at P1 (you correct WooCommerce by hand from this report) and IMS's own from P2 (a later build). The command is read only:
+`npm run vat:diff` (add `-- --json` for machine-readable output; `-- --scheme uk|ioss|voec|other|all` limits it to one scheme, default `all`) compares the VAT rates held in Xero, IMS and WooCommerce and lists every difference with a closed reason code, as FOUR reports, one per VAT scheme (UK, IOSS, VOEC (Norway), other foreign: EU OSS and any other foreign registration), plus an **unclassified** section that is shown with every selection. The owner ruled on 2026-10-25 that all three use the SAME set of VAT rates and that Xero is the master; WooCommerce tax-rate writes are operator-manual at P1 (you correct WooCommerce by hand from this report) and IMS's own from P2 (a later build). The command is read only:
 
 - **Xero** is read from IMS's stored copy of its tax-rate list, proven first (header, row count, digest, last-success stamp, the organisation connected now, read within 26 hours). Xero is never called. An unusable list refuses the whole report (`XERO_NOT_CONNECTED`, `XERO_LIST_MISSING`, `XERO_LIST_NOT_STAMPED`, `XERO_LIST_STALE`, `XERO_LIST_WRONG_ORGANISATION`, `XERO_LIST_UNREADABLE`).
 - **IMS** is read in one `REPEATABLE READ`, `READ ONLY` transaction: the tax rates, their active components and the WooCommerce tax-rate mappings (the same mapping reconciliation-pack item R13 uses).
@@ -1619,12 +1619,18 @@ The environment is replaced by a short whitelist (`PATH`, `LANG`, `LC_ALL`, `TZ`
 
 | Exit code | Meaning |
 |---|---|
-| 0 | All three systems were read and proven and use the same rates. |
-| 1 | Read and proven; the report lists the differences. |
+| 0 | All three systems were read and proven and use the same rates in every shown scheme. |
+| 1 | Read and proven; any scheme report (or the unclassified section) lists a difference. Each scheme contributes its own status; any difference anywhere gives 1. |
 | 2 | Refused: a side could not be read or proven. Nothing was compared; this is NOT "no differences". |
 | 3 | The command could not start or failed. |
 
-Reason codes: `MISSING_IN_IMS`, `MISSING_IN_XERO`, `INACTIVE_IN_XERO`, `IMS_RATE_NO_XERO_TYPE`, `AMBIGUOUS_IMS_MAPPING`, `XERO_RATE_NOT_STATED`, `PERCENTAGE_MISMATCH_IMS_XERO`, `MISSING_IN_WOO`, `WOO_RATE_NO_IMS_MAPPING`, `WOO_RATE_GONE`, `WOO_MAPPED_TO_INACTIVE_IMS_RATE`, `WOO_PERCENTAGE_MISMATCH`, `WOO_COUNTRY_MISMATCH`, `WOO_CLASS_MISMATCH`, `WOO_COMPOUND_MISMATCH`, `WOO_SHIPPING_NOT_TAXED`, `WOO_REGIONAL_SCOPE`. `npm run vat:diff -- --help` prints each with its meaning. The same report is on **Settings > Accounting > Tax > VAT rate differences** (permission `settings.company`).
+`--json` is keyed by scheme: `schemes.uk`, `schemes.ioss`, `schemes.voec`, `schemes.other`, `schemes.unclassified`, each with its title, its own `exitStatus`, its `differences` and its per-reason `counts`.
+
+**How a rate gets its scheme** (`lib/tax/vat-scheme.ts`; every row cites the rule in `schemeSource`). In order: (1) IMS `TaxRate.reportingCategory`: today's values are DOMESTIC, REVERSE_CHARGE, EC_SALES and OSS; IOSS and VOEC are not written by IMS, so the tokens `IOSS` and `VOEC` are accepted as explicit markers you set on the rate, and `OSS` means other foreign. (2) The country (IMS `countryCode`, the WooCommerce rate's country, or for a Xero type no IMS rate carries, its upper-case ISO name prefix as in `lib/connectors/xero/tax-rate-report-type.ts`): `NO` is VOEC, `GB` is UK, an EU member state with no OSS or IOSS marker is **unclassified** (Xero files OSS and IOSS alike under `MOSSSALES`, so they cannot be told apart), any other country is other foreign. (3) A rate with no country is UK when its category is empty, DOMESTIC, REVERSE_CHARGE or EC_SALES and Xero's report type is not `MOSSSALES`. A WooCommerce rate is judged as the IMS rate it is mapped to, a Xero type as the IMS rate that carries it. Anything else is `UNCLASSIFIED_SCHEME`, listed in the unclassified section and never dropped.
+
+Rules of the comparison (owner rulings 2026-10-25): shipping always carries the VAT rate of the goods, so a WooCommerce rate above zero that does not apply to shipping is `WOO_SHIPPING_NOT_TAXED`. Regional WooCommerce rates (state, postcode or city, for example the Canary Islands) are legitimate and are not a difference by themselves: they are compared like any other rate against the IMS rate they are mapped to (percentage, class, compound, shipping, and the country, which must be equal), and the region is shown on the row as information.
+
+Reason codes: `MISSING_IN_IMS`, `MISSING_IN_XERO`, `INACTIVE_IN_XERO`, `IMS_RATE_NO_XERO_TYPE`, `AMBIGUOUS_IMS_MAPPING`, `XERO_RATE_NOT_STATED`, `PERCENTAGE_MISMATCH_IMS_XERO`, `MISSING_IN_WOO`, `WOO_RATE_NO_IMS_MAPPING`, `WOO_RATE_GONE`, `WOO_MAPPED_TO_INACTIVE_IMS_RATE`, `WOO_PERCENTAGE_MISMATCH`, `WOO_COUNTRY_MISMATCH` (country scope; no country means everywhere, on either side), `WOO_CLASS_MISMATCH` (a mapping with no recorded class means standard), `WOO_COMPOUND_MISMATCH`, `WOO_SHIPPING_NOT_TAXED`, `UNCLASSIFIED_SCHEME`. `npm run vat:diff -- --help` prints each with its meaning. The same report is on **Settings > Accounting > Tax > VAT rate differences** (permission `settings.company`), with one tab per scheme and an Unclassified section.
 
 ## Reconciliation pack
 

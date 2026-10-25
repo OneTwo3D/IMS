@@ -1513,7 +1513,7 @@ run that records tax-rate drift).
   WooCommerce tax-rate writes are **operator-manual at P1** (the ownership map row `woocommerce` / `tax-rate`: P1 `operator-manual`, P2 `IMS`; IMS
   has no producer for it yet). To make the manual correction easy, **Settings > Accounting > Tax > VAT rate differences** and `npm run vat:diff`
   compare this stored list, the IMS rates (with the WooCommerce mappings of reconciliation-pack item R13) and WooCommerce's `GET /taxes`, read only,
-  and list each difference by reason code (see *VAT difference report* in the installation guide). The owner fixes WooCommerce by hand in its tax
+  and list each difference by reason code, as four reports (UK, IOSS, VOEC, other foreign) plus an unclassified section (see *VAT difference report* in the installation guide). The owner fixes WooCommerce by hand in its tax
   screens and runs the report again until it is empty. The report requires the same proven, fresh stored list as the import above and refuses
   (never "no differences") when it is not.
 
