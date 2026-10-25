@@ -1671,7 +1671,7 @@ test('a REDELIVERY never resolves a marker (o3d-z82a)', async () => {
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
 
-  const redeliveryAt = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder)')
+  const redeliveryAt = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId)')
   assert.notEqual(redeliveryAt, -1)
   const redelivery = source.slice(redeliveryAt, source.indexOf('return { success: true, orderId: existing.id }', redeliveryAt))
   assert.ok(
