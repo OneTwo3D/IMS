@@ -134,6 +134,7 @@ test('a BASE-currency receipt is still recorded, at 1, without reading the table
   assert.equal(state.asOfs.length, 0)
   // o3d-q0x56.2: a base-currency receipt states there is no settlement rate to carry (null), not "unknown" (undefined, which would trigger a lookup).
   assert.equal((state.registered[0] as { settlementRateToBase?: number | null }).settlementRateToBase, null)
+  assert.equal((state.created[0] as { settlementRateToBase?: number | null }).settlementRateToBase, null, 'a base-currency receipt stores null')
 })
 
 test('a refund-payment (refundId) never needs a rate: it produces no FX journal, so it is recorded with no rate in the table', async () => {
@@ -161,6 +162,7 @@ test('[q0x56.16] a date-only paidAt looks the rate up as of the END of that day,
   // o3d-q0x56.2: the SAME rate that was resolved for this receipt is handed to the ledger registration, to ride on the queued payment as its CurrencyRate.
   assert.equal(state.registered.length, 1)
   assert.equal((state.registered[0] as { settlementRateToBase?: number | null }).settlementRateToBase, 1.6)
+  assert.equal((state.created[0] as { settlementRateToBase?: number | null }).settlementRateToBase, 1.6, 'and the SAME rate is STORED with the receipt, which is what every re-drive reads')
 })
 
 test('[q0x56.16] a real timestamp stays an instant: a rate fetched AFTER it is not visible', async () => {

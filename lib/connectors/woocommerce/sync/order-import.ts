@@ -1920,6 +1920,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // The order's own date bounds the rate. An order with no date at all is priced as of now (it used to be unbounded,
     // which meant the same thing: the latest row there is).
     const fxRate = await getFxRateToBase(currency, orderedAt ?? new Date())
+    // o3d-q0x56.2: the receipt row stores its settlement rate (8 dp, as the column does). An imported order is paid in its own currency at the
+    // time it was booked, so that is the order's own booked rate; a base-currency order stores none.
+    const importedReceiptSettlementRate = currency.trim().toUpperCase() === (await (await import('@/lib/base-currency')).getBaseCurrencyCode()).trim().toUpperCase()
+      ? null
+      : (usableStoredFxRate(fxRate)?.toNumber() ?? null)
 
     const pricesIncludeVat = wcOrder.prices_include_tax
 
@@ -2435,6 +2440,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               reference: wcOrder.transaction_id || null,
               notes: 'Imported from WooCommerce (paid when the order was imported)',
               paidAt: new Date(wcOrder.date_paid_gmt as string),
+              settlementRateToBase: importedReceiptSettlementRate === null ? null : Math.round(importedReceiptSettlementRate * 1e8) / 1e8,
             },
             select: { id: true },
           })

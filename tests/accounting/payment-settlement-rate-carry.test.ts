@@ -11,9 +11,9 @@ import { fakeFxClient, type FakeFxRow } from '../helpers/fx-fake-client'
  * registration-amount-enqueue-wiring.test.ts). What is read back is the payload handed to the enqueue, i.e. exactly what the Xero poster will later
  * send as the payment's CurrencyRate. Named mutations (each shown red, restored from a copy, md5-verified):
  *  a  rate-not-carried     the payload line `settlementRateToBase` is dropped: every "carries" arm goes red
- *  b  given-ignored        the caller's resolved rate is ignored and a fresh lookup used: the "the caller's rate, not a lookup" arm goes red
+ *  b  redrive-recalculates the stored rate is ignored and fx_rates is looked up again: the RE-DRIVE and LEGACY arms go red
  *  c  base-also-looked-up  a base-currency receipt is given a looked-up rate: the base arm goes red
- *  d  missing-fallback-1   a foreign receipt with no rate gets 1: the "no rate -> no rate on the payload" arm goes red
+ *  d  missing-fallback-1   a foreign receipt with no rate gets 1: the LEGACY arm goes red
  */
 
 type QueuedRow = { type: string; payload: Record<string, unknown>; idempotencyKey?: string }
@@ -27,7 +27,7 @@ const state = {
    * `Decimal(18, 4)` column and the whole finding is about what the enqueue does to it. A harness
    * that stored a number here could not tell the fix from the defect.
    */
-  payments: [] as Array<{ id: string; amount: Prisma.Decimal; currency: string; method: string | null; reference: string | null; paidAt: Date }>,
+  payments: [] as Array<{ id: string; amount: Prisma.Decimal; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase?: Prisma.Decimal | null }>,
   rates: [] as FakeFxRow[],
   order: {
     id: 'order-1',
@@ -135,6 +135,7 @@ function receipt(amount: string, id = 'pay-1') {
     method: 'card',
     reference: null,
     paidAt: new Date('2026-08-20T10:00:00.000Z'),
+    settlementRateToBase: null as Prisma.Decimal | null,
   }
 }
 
@@ -156,12 +157,12 @@ test.beforeEach(() => {
   state.order.shoppingLinks = []
 })
 
-async function register(params: { currency: string; settlementRateToBase?: number | null }) {
+async function register(params: { currency: string; settlementRateToBase: number | null }) {
   const m = await import('@/lib/domain/accounting/invoice-payment-enqueue')
   return m.registerInvoicePaymentWithLedger({
     orderId: 'order-1', orderReference: 'SO-1', paymentId: 'pay-1', amount: new Prisma.Decimal('100.0000'),
     currency: params.currency, method: 'card', reference: null, paidAt: new Date('2026-08-20T10:00:00.000Z'),
-    ...(params.settlementRateToBase === undefined ? {} : { settlementRateToBase: params.settlementRateToBase }),
+    settlementRateToBase: params.settlementRateToBase,
   })
 }
 
@@ -175,35 +176,34 @@ test('a foreign receipt carries the settlement rate its caller resolved, and NOT
   assert.equal(state.queued[0]!.payload.currency, 'EUR')
 })
 
-test('a foreign receipt whose caller does not know the rate (the deferred re-drive) carries the fx_rates rate as of the receipt date', async () => {
+test('RE-DRIVE: the deferred re-drive carries the rate STORED with the receipt, even after a later same-day rate lands', async () => {
   state.order.currency = 'EUR'
-  state.payments = [{ ...receipt('100.0000'), currency: 'EUR' }]
-  state.rates = [EUR('1.30', '2026-08-19T09:00:00.000Z'), EUR('1.17', '2026-08-20T09:00:00.000Z'), EUR('1.99', '2026-08-21T09:00:00.000Z')]
+  // recorded at the 09:00 rate of 1.20 (stored on the row); a 16:00 rate of 1.30 for the same business day landed afterwards
+  state.payments = [{ ...receipt('100.0000'), currency: 'EUR', settlementRateToBase: new Prisma.Decimal('1.20000000') }]
+  state.rates = [EUR('1.20', '2026-08-20T09:00:00.000Z'), EUR('1.30', '2026-08-20T16:00:00.000Z')]
   const result = await (await import('@/lib/domain/accounting/invoice-payment-enqueue')).registerDeferredOrderReceipts('order-1', { connector: 'xero', accountingInvoiceId: 'INV-1' }, {
     syncLogId: 'sync-1', connector: 'xero', generation: new Date('2026-08-01T00:00:00.000Z'), recovery: { consumer: 'sweep' },
   })
   assert.equal(result.settled, true)
   assert.equal(state.queued.length, 1)
-  assert.equal(state.queued[0]!.payload.settlementRateToBase, 1.17, 'the latest rate on or before the receipt date, not a later one')
+  assert.equal(state.queued[0]!.payload.settlementRateToBase, 1.2, 'the stored rate, never a recalculation (1.30 is in the table)')
 })
 
-test('a foreign receipt with NO rate anywhere carries none (the enqueue then refuses it) - never 1, never a default', async () => {
+test('LEGACY: a foreign receipt with NO stored rate carries none on re-drive (the enqueue then refuses it) - no fresh lookup, never 1', async () => {
   state.order.currency = 'EUR'
-  state.payments = [{ ...receipt('100.0000'), currency: 'EUR' }]
-  state.rates = []
-  await register({ currency: 'EUR' })
+  state.payments = [{ ...receipt('100.0000'), currency: 'EUR', settlementRateToBase: null }]
+  state.rates = [EUR('1.30', '2026-08-20T09:00:00.000Z')] // a perfectly good rate exists: it must NOT be looked up
+  await (await import('@/lib/domain/accounting/invoice-payment-enqueue')).registerDeferredOrderReceipts('order-1', { connector: 'xero', accountingInvoiceId: 'INV-1' }, {
+    syncLogId: 'sync-1', connector: 'xero', generation: new Date('2026-08-01T00:00:00.000Z'), recovery: { consumer: 'sweep' },
+  })
   assert.equal(state.queued.length, 1)
   assert.equal('settlementRateToBase' in state.queued[0]!.payload, false)
 })
 
-test('a base-currency receipt carries no settlement rate', async () => {
+test('a base-currency receipt carries no settlement rate (stored null)', async () => {
   state.payments = [receipt('100.0000')]
   state.rates = [EUR('1.17', '2026-08-20T09:00:00.000Z')]
   await register({ currency: 'GBP', settlementRateToBase: null })
   assert.equal(state.queued.length, 1)
   assert.equal('settlementRateToBase' in state.queued[0]!.payload, false)
-  state.queued = []
-  state.syncRows = []
-  await register({ currency: 'GBP' })
-  assert.equal('settlementRateToBase' in (state.queued[0]?.payload ?? {}), false)
 })

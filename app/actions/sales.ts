@@ -3761,6 +3761,9 @@ export async function addPayment(input: {
             baseCurrency,
             asOf: settlementAsOfFromInput(input.paidAt, paidAt),
           })
+          // Rounded to the 8 places the column stores, so the value used for the FX report and the first enqueue IS the stored one that every
+          // later enqueue of this receipt reads back (o3d-q0x56.2).
+          settlementRateToBase = Math.round(settlementRateToBase * 1e8) / 1e8
         } catch (error) {
           if (isMissingFxRateError(error)) return { error: `Payment not recorded: ${describeFxRefusal(error)}` }
           throw error
@@ -3776,6 +3779,9 @@ export async function addPayment(input: {
           reference: input.reference || null,
           notes: input.notes || null,
           paidAt,
+          // o3d-q0x56.2: stored WITH the receipt; every enqueue of it carries this value and none recalculates. Null for a base-currency
+          // receipt and for a refund payment.
+          settlementRateToBase,
         },
         // o3d-1xq8: `amount` is selected because the ledger registration below is enqueued from the
         // STORED `Decimal` and not from `input.amount`. The two are normally the same figure, and

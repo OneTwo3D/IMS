@@ -2320,6 +2320,9 @@ model Payment {
   notes           String?
   paidAt          DateTime  @default(now())
   createdAt       DateTime  @default(now())
+  /// The settlement rate IMS resolved when this receipt was recorded (1 base = X receipt currency). Every enqueue of the receipt carries THIS
+  /// value, never a fresh lookup. NULL = base-currency receipt, refund payment, or recorded before the column existed (a foreign NULL is refused).
+  settlementRateToBase Decimal? @db.Decimal(18, 8) @map("settlement_rate_to_base")
 
   order           SalesOrder       @relation(fields: [orderId], references: [id])
   refund          SalesOrderRefund? @relation(fields: [refundId], references: [id])
