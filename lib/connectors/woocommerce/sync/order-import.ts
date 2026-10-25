@@ -4,6 +4,7 @@
 
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
+import { resolveWcReceiptSettlementRate, parseWcGmtInstant } from './receipt-settlement-rate'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { logActivity } from '@/lib/activity-log'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
@@ -1919,13 +1920,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       : (wcOrder.date_created ? new Date(wcOrder.date_created) : undefined)
     // The order's own date bounds the rate. An order with no date at all is priced as of now (it used to be unbounded,
     // which meant the same thing: the latest row there is).
-    const fxRate = await getFxRateToBase(currency, orderedAt ?? new Date())
-    // o3d-q0x56.2: the receipt row stores its settlement rate (8 dp, as the column does). An imported order is paid in its own currency at the
-    // time it was booked, so that is the order's own booked rate; a base-currency order stores none.
-    const importedReceiptSettlementRate = currency.trim().toUpperCase() === (await (await import('@/lib/base-currency')).getBaseCurrencyCode()).trim().toUpperCase()
-      ? null
-      : (usableStoredFxRate(fxRate)?.toNumber() ?? null)
-
+    const orderInstant = orderedAt ?? new Date()
+    const fxRate = await getFxRateToBase(currency, orderInstant)
     const pricesIncludeVat = wcOrder.prices_include_tax
 
     // Line items (each one may carry its own externalTaxRateId)
@@ -2336,6 +2332,18 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     // Does this payload carry a receipt? Paid per WooCommerce, with a positive total the gateway charged.
     const importedReceipt = Boolean(wcOrder.date_paid_gmt) && toDecimal(totalForeign).gt(0)
+    // o3d-q0x56.19: resolved BEFORE the transaction, so a refusal (foreign_payment_missing_rate) writes nothing and queues the order.
+    // Same business day as the order: the order's booked rate; a later day: the central rate at that day's end; none: refused. Base: null.
+    const importedReceiptSettlementRate = importedReceipt
+      ? await resolveWcReceiptSettlementRate({
+        currency,
+        baseCurrency: await (await import('@/lib/base-currency')).getBaseCurrencyCode(),
+        orderedAt: orderInstant,
+        orderRate: fxRate,
+        datePaidGmt: wcOrder.date_paid_gmt as string,
+        lookup: getFxRateToBase,
+      })
+      : null
     // A ref cell, not a bare `let`: the write happens inside the transaction callback and control-flow
     // analysis would narrow a `let` to `null` at the read site below.
     const importedReceiptRef = { id: null as string | null }
@@ -2439,7 +2447,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               method: wcOrder.payment_method_title || wcOrder.payment_method || null,
               reference: wcOrder.transaction_id || null,
               notes: 'Imported from WooCommerce (paid when the order was imported)',
-              paidAt: new Date(wcOrder.date_paid_gmt as string),
+              paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
               settlementRateToBase: importedReceiptSettlementRate === null ? null : Math.round(importedReceiptSettlementRate * 1e8) / 1e8,
             },
             select: { id: true },
@@ -2729,6 +2737,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // `wcOrder.total` either: no payment is registered for it (the invoice is refused anyway; see
           // lib/domain/accounting/store-credit-invoice-refusal.ts).
           _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit,
+          // o3d-q0x56.19: the rate of THIS payment (the payment date's, or the order's on the same day). Never inferred from currencyRateToBase.
+          ...(importedReceiptSettlementRate !== null ? { _paymentSettlementRateToBase: Math.round(importedReceiptSettlementRate * 1e8) / 1e8 } : {}),
           // The local receipt this payment is (see the Payment row written with the order). Present only
           // where there is one; the poster carries it onto the INVOICE_PAYMENT as its identity.
           ...(importedReceiptRef.id ? { _paymentId: importedReceiptRef.id } : {}),

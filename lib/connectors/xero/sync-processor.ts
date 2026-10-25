@@ -7835,13 +7835,24 @@ async function decideInvoicePaymentFollowUp(
         // o3d-q0x56.2: an imported order is paid in the currency and at the time it was booked, so IMS's settlement rate for this payment is the
         // order's own STORED booked rate, carried on the queued work (never looked up). It is usable here by construction - the invoice that
         // was just posted could not have been sent without it - and the INVOICE_PAYMENT poster refuses a foreign payment that lacks one.
-        ...(isUsableImsRate(payload.currencyRateToBase) ? { settlementRateToBase: Number(payload.currencyRateToBase) } : {}),
+        // o3d-q0x56.19: the importer stamps THIS payment's own rate (`_paymentSettlementRateToBase`: the payment date's central rate, or the
+        // order's on the same day). When the key is declared it is the only source: an unusable value carries nothing and the central
+        // guard refuses it (foreign_payment_missing_rate), it does NOT fall back to the order's rate. Only a payload queued before the key
+        // existed (no key at all) still reads the order's stored rate.
+        ...settlementRateFromPayload(payload),
         method,
         ...(receiptId ? { paymentId: receiptId } : {}),
         sourceEntryId: entryId,
       }, { from: 'postedRow', record: origin })
     },
   })
+}
+
+export function settlementRateFromPayload(payload: Record<string, unknown>): { settlementRateToBase?: number } {
+  const source = Object.prototype.hasOwnProperty.call(payload, '_paymentSettlementRateToBase')
+    ? payload._paymentSettlementRateToBase
+    : payload.currencyRateToBase
+  return isUsableImsRate(source) ? { settlementRateToBase: Number(source) } : {}
 }
 
 async function enqueueSalesInvoiceFollowUps(
