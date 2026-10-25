@@ -865,7 +865,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
       action: 'wc_paid_transition_ambiguous_receipts',
       tag: 'sync',
       level: 'WARNING',
-      description: `WooCommerce order ${claimed.reference} is paid, but the receipts IMS already holds for it are in another currency than the order, so the uncovered amount cannot be computed. It is marked paid and NO receipt was recorded; record the payment by hand.`,
+      description: `WooCommerce order ${claimed.reference} is paid, but the receipts IMS already holds for it are in another currency than the order, so the uncovered amount cannot be computed. The order is marked paid and IMS added no payment for it. Record the payment on the order.`,
       metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), reason: 'receipt_currency_differs_from_order' },
     })
     return
