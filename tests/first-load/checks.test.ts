@@ -447,11 +447,12 @@ test('importer rejection sweep: product lifecycle rules of createPurchaseOrder a
   assert.equal(mk({ lifecycleStatus: 'EOL' }, 'transfer').blocking, false, 'an EOL product may be transferred')
 })
 
-test('the report lists the apply-time checks the tool cannot prove (FX availability and the 2% rule among them)', (t) => {
+test('the report lists the apply-time checks the tool cannot prove (the exact table-rate equality among them, with no 2% rule)', (t) => {
   const result = run(loadFixtureDatasets())
   precondition(t, 'apply-time checks listed', result.report.applyTimeChecks.length)
   const fx = result.report.applyTimeChecks.find((c) => c.id === 'po-fx-rate')
-  assert.ok(fx?.check.includes('within 2%'))
+  assert.ok(fx?.check.includes('EXACTLY the rate'), 'the check states exact equality with the table rate at the created day')
+  assert.ok(!/2%/.test(fx?.check ?? ''), 'no 2% tolerance is left in the check')
   assert.ok(findingCodes(result).length > 0)
 })
 

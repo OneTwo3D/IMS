@@ -4,7 +4,6 @@
  */
 import assert from 'node:assert/strict'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { parseCsvStrict } from '../../lib/first-load/csv.ts'
@@ -95,14 +94,14 @@ async function cli(args: string[], port: FxExportPort, env = process.env) {
 
 // [mutation: skip the --expect-db / --expect-system-id confirmation, write with a wider mode, overwrite an existing file, drop the digest]
 test('the command writes the CSV and its record mode 600 in a mode-700 directory, with the digest; the target must be confirmed; nothing is overwritten', async (t) => {
-  const root = mkdtempSync(path.join(tmpdir(), 'flfx-export-'))
+  const root = mkdtempSync('/var/tmp/first-load-export-')
   try {
     const env = envFile(root)
     const out = path.join(root, 'out')
     const base = ['--env-file', env, '--expect-db', 'ims', '--expect-system-id', '7001', '--out', out]
     const wrongDb = await cli(['--env-file', env, '--expect-db', 'other', '--expect-system-id', '7001', '--out', path.join(root, 'o1')], fakePort().port)
     const wrongSid = await cli(['--env-file', env, '--expect-db', 'ims', '--expect-system-id', '1', '--out', path.join(root, 'o2')], fakePort().port)
-    assert.equal(wrongDb.code, 3)
+    assert.equal(wrongDb.code, 3, wrongDb.err)
     assert.equal(wrongSid.code, 3)
     const ok = await cli(base, fakePort().port)
     precondition(t, 'cases', 3)
