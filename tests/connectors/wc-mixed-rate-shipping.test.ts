@@ -61,6 +61,7 @@ async function buildDocument(input: { goodsNet: number; goodsTaxType: string; sh
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
 }
 

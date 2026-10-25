@@ -102,7 +102,7 @@ import {
   settlementAsOfFromInput,
 } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
-import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
+import { isMissingStoredFxRateError, resolveStoredFxRateToBase, usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
   buildChargebackRefundLines,
@@ -1432,7 +1432,8 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
     // their own daily rate (which causes 1-3 % drift on multi-currency
     // invoices). Connector adapter inverts to the platform's convention.
-    currencyRateToBase: Number(so.fxRateToBase) || undefined,
+    // o3d-q0x56.3: the order's STORED booked rate, or absent. A foreign document without one is refused at the enqueue and again at the connector.
+    currencyRateToBase: usableStoredFxRate(so.fxRateToBase)?.toNumber(),
     reference: orderNumber,
     lines: so.lines.map((l) => {
       const qty = Number(l.qty)
@@ -2111,7 +2112,7 @@ async function queueRefundAccountingActions(input: {
       // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
       // that had a gross amount — is now netted at source, so this correctly grosses every line up.
       lineAmountsIncludeTax: false,
-      currencyRateToBase: Number(input.refundFxRate) || undefined,
+      currencyRateToBase: usableStoredFxRate(input.refundFxRate)?.toNumber(),
     },
   }))
 
@@ -3760,6 +3761,9 @@ export async function addPayment(input: {
             baseCurrency,
             asOf: settlementAsOfFromInput(input.paidAt, paidAt),
           })
+          // Rounded to the 8 places the column stores, so the value used for the FX report and the first enqueue IS the stored one that every
+          // later enqueue of this receipt reads back (o3d-q0x56.2).
+          settlementRateToBase = Math.round(settlementRateToBase * 1e8) / 1e8
         } catch (error) {
           if (isMissingFxRateError(error)) return { error: `Payment not recorded: ${describeFxRefusal(error)}` }
           throw error
@@ -3775,6 +3779,9 @@ export async function addPayment(input: {
           reference: input.reference || null,
           notes: input.notes || null,
           paidAt,
+          // o3d-q0x56.2: stored WITH the receipt; every enqueue of it carries this value and none recalculates. Null for a base-currency
+          // receipt and for a refund payment.
+          settlementRateToBase,
         },
         // o3d-1xq8: `amount` is selected because the ledger registration below is enqueued from the
         // STORED `Decimal` and not from `input.amount`. The two are normally the same figure, and
@@ -3927,6 +3934,9 @@ export async function addPayment(input: {
         method: input.method || null,
         reference: input.reference || null,
         paidAt: txResult.paidAt,
+        // o3d-q0x56.2: the SAME settlement rate this payment was recorded with (resolved before the first write above, and the one the
+        // FX gain/loss report measures against), carried on the queued payment so Xero books the realised FX at IMS's rate. No lookup later.
+        settlementRateToBase: txResult.settlementRateToBase,
       })
     }
 

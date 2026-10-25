@@ -196,7 +196,7 @@ async function addReceipt(d: Deps, orderId: string, amount: number): Promise<str
 async function register(d: Deps, orderId: string, paymentId: string, amount: number) {
   return d.registerInvoicePaymentWithLedger({
     orderId, orderReference: orderId, paymentId, amount: (await import('../../lib/domain/math/decimal.ts')).toDecimal(amount),
-    currency: 'GBP', method: METHOD, reference: null, paidAt: new Date('2026-08-09T12:00:00Z'),
+    currency: 'GBP', method: METHOD, reference: null, paidAt: new Date('2026-08-09T12:00:00Z'), settlementRateToBase: null,
   })
 }
 

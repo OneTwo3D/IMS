@@ -5,7 +5,8 @@
 import { xeroPost, xeroPut } from './api'
 import { findOrCreateContact } from './contacts'
 import { xeroDocumentRevisionAt } from './document-revision'
-import { imsRateToXeroCurrencyRate } from './fx'
+import { foreignCurrencyRateProblem, isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import type { BillData, InvoiceLine } from '../types'
 
 type XeroInvoiceResponse = {
@@ -19,11 +20,21 @@ type XeroInvoiceResponse = {
   }>
 }
 
-function buildPurchaseBillPayload(
+// Exported for unit tests (o3d-q0x56.3): the CurrencyRate decision is made here.
+export function buildPurchaseBillPayload(
   data: BillData,
   status: string,
   contactId: string,
+  /** The organisation's base currency. REQUIRED: whether a missing CurrencyRate is allowed depends on it (o3d-q0x56.3). */
+  baseCurrency: string,
 ): Record<string, unknown> {
+  // o3d-q0x56.3: decided FIRST. A foreign bill with no usable IMS rate THROWS; a base-currency bill with none omits the field, unchanged.
+  const xeroCurrencyRate = xeroCurrencyRateOrRefuse({
+    currency: data.currency,
+    baseCurrency,
+    rateToBase: data.currencyRateToBase,
+    what: `Purchase bill ${data.invoiceNumber ?? '(no number)'}`,
+  })
   // Xero mandates TaxType on every line; "NONE" is the no-tax fallback.
   const DEFAULT_TAX_TYPE = 'NONE'
 
@@ -63,7 +74,6 @@ function buildPurchaseBillPayload(
     DueDate: dueDate,
   }
   // Stamp the IMS rate so Xero doesn't apply its own daily XE rate.
-  const xeroCurrencyRate = imsRateToXeroCurrencyRate(data.currencyRateToBase)
   if (xeroCurrencyRate != null) invoice.CurrencyRate = xeroCurrencyRate
   if (data.invoiceNumber) invoice.InvoiceNumber = data.invoiceNumber
   if (data.reference) invoice.Reference = data.reference
@@ -76,6 +86,13 @@ async function preparePurchaseBillPayload(
   status: string,
   opts?: { supplierId?: string; supplierEmail?: string },
 ): Promise<{ success: true; invoice: Record<string, unknown> } | { success: false; error: string }> {
+  // o3d-q0x56.3: BEFORE the contact round trip, which creates a contact in Xero. A foreign bill with no usable rate leaves no trace.
+  const baseCurrency = await getBaseCurrencyCode()
+  const rateProblem = foreignCurrencyRateProblem({
+    currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Purchase bill ${data.invoiceNumber ?? '(no number)'}`,
+  })
+  if (rateProblem) return { success: false, error: rateProblem }
+
   // Find or create the supplier contact
   const contactResult = await findOrCreateContact(data.contactName, opts?.supplierEmail, true, { supplierId: opts?.supplierId })
   if (!contactResult.success || !contactResult.contactId) {
@@ -92,9 +109,14 @@ async function preparePurchaseBillPayload(
     }
   }
 
-  return {
-    success: true,
-    invoice: buildPurchaseBillPayload(data, status, contactResult.contactId),
+  try {
+    return {
+      success: true,
+      invoice: buildPurchaseBillPayload(data, status, contactResult.contactId, baseCurrency),
+    }
+  } catch (error) {
+    if (isXeroForeignCurrencyRateError(error)) return { success: false, error: error.message }
+    throw error
   }
 }
 

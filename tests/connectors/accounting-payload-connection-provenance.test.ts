@@ -384,6 +384,8 @@ const db = {
   accountingAccount: {
     async findFirst() { return { externalAccountId: 'BANK-1' } },
   },
+  // o3d-q0x56.2: the payment poster reads the base currency to tell a foreign payment from a base one.
+  organisation: { async findFirst() { return { baseCurrency: 'GBP' } } },
   // SALES_INVOICE resolves its contact (and any item) before it can build a body. Cached ids are
   // deliberately absent so the handler has to ASK Xero — which is the call the verdict intercepts.
   customer: { async findUnique() { return { accountingContactId: null, accountingContactProvenance: null } }, async update() { return {} }, async updateMany() { return { count: 0 } } },
@@ -545,6 +547,8 @@ const PAYMENT_PAYLOAD = {
   bankAccountId: 'BANK-1',
   amount: 250,
   paymentDate: '2026-01-02',
+  // o3d-q0x56.2: a payment payload names its currency (the processor refuses one that does not); this one is in the base currency.
+  currency: 'GBP',
 }
 
 test('o3d-19gy: a payment queued for the PREVIOUS organisation is refused, and nothing is sent', async () => {
@@ -568,7 +572,7 @@ test('o3d-19gy: the same payment posts normally when the connection has not chan
 
   const result = await runXeroSync()
 
-  assert.equal(result.succeeded, 1)
+  assert.equal(result.succeeded, 1, state.rows[0].errorMessage ?? 'no error recorded')
   assert.equal(state.posts.length, 1)
   assert.equal(state.posts[0].path, 'Payments')
   assert.equal(state.rows[0].externalTransactionId, 'PAY-1')

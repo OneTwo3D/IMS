@@ -6,6 +6,9 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
+import { isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
 import { xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
@@ -5038,6 +5041,50 @@ function xeroPostingMode(payload: SyncPayload): LedgerPostingMode {
 }
 
 /** Resolve _postingMode to Xero API status values */
+/**
+ * o3d-q0x56.2 - THE `CurrencyRate` A XERO PAYMENT CARRIES, OR A NAMED REFUSAL.
+ *
+ * The payload's `settlementRateToBase` is the rate IMS resolved for THIS payment when it recorded it (1 base = X payment currency). It is
+ * converted here (1 / rate, 6 dp) and sent as the payment's `CurrencyRate`, so Xero books the realised FX gain/loss at IMS's rate and
+ * never at its own XE.com day rate. This function never looks a rate up: the work carries it, or the payment is not sent.
+ *
+ *   - a payment with no `currency` in its payload is refused: whether it is foreign cannot be told, and guessing "base" is what would
+ *     let a foreign payment through unrated;
+ *   - a base-currency payment sends no CurrencyRate (Xero books it at 1), as before;
+ *   - a foreign payment without a usable rate is refused, before anything is claimed, fenced or sent.
+ */
+async function xeroPaymentCurrencyRate(
+  type: 'INVOICE_PAYMENT' | 'BILL_PAYMENT',
+  payload: SyncPayload,
+): Promise<{ ok: true; currencyRate: number | undefined } | { ok: false; error: string }> {
+  const currency = payload.currency
+  if (typeof currency !== 'string' || currency.trim() === '') {
+    return { ok: false, error: `${type} not sent: its payload names no currency, so IMS cannot tell whether it needs a settlement rate. Re-record the payment.` }
+  }
+  const baseCurrency = await getBaseCurrencyCode()
+  try {
+    const rate = payload.settlementRateToBase
+    return {
+      ok: true,
+      currencyRate: xeroCurrencyRateOrRefuse({
+        currency,
+        baseCurrency,
+        rateToBase: typeof rate === 'number' || typeof rate === 'string' ? Number(rate) : undefined,
+        what: `${type} payment`,
+      }),
+    }
+  } catch (error) {
+    if (isXeroForeignCurrencyRateError(error)) {
+      return { ok: false, error: `${type} not sent: ${error.message}` }
+    }
+    throw error
+  }
+}
+
+/** Why a queued REALISED_FX_JOURNAL row is retired instead of sent (o3d-q0x56.2). Exported so a test pins the exact words. */
+export const REALISED_FX_JOURNAL_RETIRED_REASON =
+  'Retired, not sent: Xero books the realised FX gain/loss itself, at the settlement rate IMS sends on the payment, so an IMS-generated realised-FX journal would book it twice.'
+
 function resolveInvoiceStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'AUTHORISED'
 }
@@ -6190,6 +6237,9 @@ export async function processClaimedEntry(
       const posting = moneyPostDateToSend(type, payload, new Date())
       if (!posting.ok) return { success: false, error: `Cannot date this INVOICE_PAYMENT: ${posting.reason}` }
       const paymentDate = posting.date
+      // o3d-q0x56.2: IMS's own settlement rate for this payment, or a named refusal - decided before any claim, fence or request.
+      const paymentRate = await xeroPaymentCurrencyRate('INVOICE_PAYMENT', payload)
+      if (!paymentRate.ok) return { success: false, error: paymentRate.error }
       // OVER-SETTLEMENT IS REFUSED HERE, NOT AT THE ENQUEUE (o3d-cjt8 round 2).
       //
       // The under-lock capacity re-check in registerInvoicePaymentWithLedger only ever covered the
@@ -6309,6 +6359,9 @@ export async function processClaimedEntry(
             Account: { AccountID: account.externalAccountId },
             Date: paymentDate,
             Amount: amount,
+            // o3d-q0x56.2: IMS's settlement rate for this payment (1 / rate, 6 dp), so Xero books the realised FX at IMS's rate, not its XE.com day
+            // rate. Absent only for a base-currency payment.
+            ...(paymentRate.currencyRate !== undefined ? { CurrencyRate: paymentRate.currencyRate } : {}),
             // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
             // amount or date has since been corrected in Xero. Derived from the same token the
             // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
@@ -6438,6 +6491,9 @@ export async function processClaimedEntry(
       const posting = moneyPostDateToSend(type, payload, new Date())
       if (!posting.ok) return { success: false, error: `Cannot date this BILL_PAYMENT: ${posting.reason}` }
       const paymentDate = posting.date
+      // o3d-q0x56.2: IMS's own settlement rate for this payment, or a named refusal - decided before any claim, fence or request.
+      const billPaymentRate = await xeroPaymentCurrencyRate('BILL_PAYMENT', payload)
+      if (!billPaymentRate.ok) return { success: false, error: billPaymentRate.error }
       // Resolve bank account — accept either Xero AccountID (preferred) or a legacy account code.
       const account = await db.accountingAccount.findFirst({
         where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
@@ -6478,6 +6534,8 @@ export async function processClaimedEntry(
             Account: { AccountID: account.externalAccountId },
             Date: paymentDate,
             Amount: amount,
+            // o3d-q0x56.2: IMS's settlement rate for this payment (1 / rate, 6 dp); absent only for a base-currency bill payment.
+            ...(billPaymentRate.currencyRate !== undefined ? { CurrencyRate: billPaymentRate.currencyRate } : {}),
             // The operator's reference is KEPT and the mark appended, never replaced: it is what they
             // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
             Reference: [payload.reference as string | undefined, settlementMarkerFor(followUpIdempotencySource(entryId, payload))]
@@ -6603,6 +6661,32 @@ export async function processClaimedEntry(
       })
     }
 
+    case 'REALISED_FX_JOURNAL': {
+      // o3d-q0x56.2 - XERO BOOKS THE REALISED FX ITSELF, AT IMS'S RATE, so an IMS journal for the same settlement is a second booking of the
+      // same gain or loss (and it targets the AR/AP control account, which Xero rejects). Every payment IMS sends now carries its own
+      // settlement rate as the payment's CurrencyRate, and IMS no longer queues this journal for Xero (isFxGainLossJournalSuppressed, the
+      // enqueue chokepoint).
+      //
+      // WORK QUEUED BEFORE THAT CHANGE, and any row a path outside the chokepoint writes, IS RETIRED HERE, NOT SENT: CANCELLED with the
+      // reason on the row, claim-fenced, before any request. Skipping it is the safe direction in both ways it could be wrong: if its payment
+      // was also queued, sending both would book the gain or loss twice; if its payment already posted without a rate, the journal would
+      // still be a second booking of what Xero already recorded. `computeRealisedFx` stays, for the IMS FX gain/loss report only.
+      const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
+        entryId,
+        claim: lease,
+        reason: REALISED_FX_JOURNAL_RETIRED_REASON,
+      }))
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_realised_fx_journal_retired',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `${REALISED_FX_JOURNAL_RETIRED_REASON} (sync row ${entryId}, ${referenceType} ${referenceId}).`,
+        metadata: { syncLogId: entryId, referenceType, referenceId, retired },
+      }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
+      return { success: true, skipped: true }
+    }
+
     case 'COGS_JOURNAL':
     case 'INVENTORY_ADJUSTMENT':
     case 'STOCK_IN_TRANSIT':
@@ -6619,7 +6703,6 @@ export async function processClaimedEntry(
     // o3d-0i5y r9: the orphaned-allocation reversal. A plain manual journal like every other type
     // in this group — the amount is decided (and evidenced) at staging time, not here.
     case 'ALLOCATION_REVERSAL':
-    case 'REALISED_FX_JOURNAL':
     case 'UNREALISED_FX_JOURNAL':
     case 'MANUFACTURING_JOURNAL':
     case 'MANUFACTURING_RECLASS': {
@@ -7749,6 +7832,10 @@ async function decideInvoicePaymentFollowUp(
         amount,
         paymentDate,
         currency,
+        // o3d-q0x56.2: an imported order is paid in the currency and at the time it was booked, so IMS's settlement rate for this payment is the
+        // order's own STORED booked rate, carried on the queued work (never looked up). It is usable here by construction - the invoice that
+        // was just posted could not have been sent without it - and the INVOICE_PAYMENT poster refuses a foreign payment that lacks one.
+        ...(isUsableImsRate(payload.currencyRateToBase) ? { settlementRateToBase: Number(payload.currencyRateToBase) } : {}),
         method,
         ...(receiptId ? { paymentId: receiptId } : {}),
         sourceEntryId: entryId,

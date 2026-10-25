@@ -6,7 +6,8 @@ import { xeroPost } from './api'
 import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
 import { xeroDocumentRevisionAt } from './document-revision'
-import { imsRateToXeroCurrencyRate } from './fx'
+import { foreignCurrencyRateProblem, isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
   withAccountingEgressAuthorization,
   type AccountingEgressRequest,
@@ -106,7 +107,17 @@ export function buildSalesInvoicePayload(
   status: string,
   contactId: string,
   droppedItemCodes: Set<string>,
+  /** The organisation's base currency. REQUIRED: whether a missing CurrencyRate is allowed depends on it (o3d-q0x56.3). */
+  baseCurrency: string,
 ): Record<string, unknown> {
+  // o3d-q0x56.3: decided FIRST, before any payload is built. A foreign invoice with no usable IMS rate THROWS, so Xero is never left to apply
+  // its XE.com day rate. A base-currency invoice with no rate omits the field, unchanged.
+  const xeroCurrencyRate = xeroCurrencyRateOrRefuse({
+    currency: data.currency,
+    baseCurrency,
+    rateToBase: data.currencyRateToBase,
+    what: `Sales invoice ${data.invoiceNumber ?? '(no number)'}`,
+  })
   // Xero requires a TaxType on every line item. "NONE" is the no-tax fallback
   // for customers/products that carry no VAT, so we default to it whenever the
   // caller hasn't supplied a specific tax type.
@@ -184,7 +195,6 @@ export function buildSalesInvoicePayload(
   }
   // Stamp the IMS rate on the invoice so Xero doesn't apply its own daily XE
   // rate (which drifts from IMS by 1–3 %). Inverted to match Xero's direction.
-  const xeroCurrencyRate = imsRateToXeroCurrencyRate(data.currencyRateToBase)
   if (xeroCurrencyRate != null) invoice.CurrencyRate = xeroCurrencyRate
   if (data.reference) invoice.Reference = data.reference
 
@@ -196,6 +206,13 @@ async function prepareSalesInvoicePayload(
   status: string,
   opts?: { customerId?: string },
 ): Promise<{ success: true; invoice: Record<string, unknown> } | { success: false; error: string }> {
+  // o3d-q0x56.3: BEFORE the contact and item round trips, which create things in Xero. A foreign invoice with no usable rate leaves no trace.
+  const baseCurrency = await getBaseCurrencyCode()
+  const rateProblem = foreignCurrencyRateProblem({
+    currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Sales invoice ${data.invoiceNumber ?? '(no number)'}`,
+  })
+  if (rateProblem) return { success: false, error: rateProblem }
+
   // Find or create the contact
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, false, { customerId: opts?.customerId })
   if (!contactResult.success || !contactResult.contactId) {
@@ -231,9 +248,14 @@ async function prepareSalesInvoicePayload(
     }
   }
 
-  return {
-    success: true,
-    invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes),
+  try {
+    return {
+      success: true,
+      invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes, baseCurrency),
+    }
+  } catch (error) {
+    if (isXeroForeignCurrencyRateError(error)) return { success: false, error: error.message }
+    throw error
   }
 }
 

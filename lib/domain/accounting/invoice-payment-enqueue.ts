@@ -508,7 +508,7 @@ async function fencedReceiptPass(
       // A refund payment settles a CREDIT NOTE, not this invoice — the same predicate the pass's own
       // read uses, because a wider one here would hold the obligation open over a refund.
       where: { orderId, refundId: null },
-      select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true },
+      select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true },
       orderBy: { paidAt: 'asc' },
     })
     const awaiting = selectReceiptsAwaitingRegistration({
@@ -1272,6 +1272,16 @@ export function deferredReceiptsFailedDescription(params: { connector: string; e
  */
 export type InvoicePaymentRegistrationConnector = AccountingConnectorId | null
 
+/**
+ * o3d-q0x56.2 - the settlement rate a receipt's queued payment carries. See {@link registerInvoicePaymentWithLedger}'s
+ * `settlementRateToBase`. Returns undefined when there is none to carry; the central enqueue guard then refuses a FOREIGN receipt.
+ */
+function settlementRateToCarry(given: number | null): number | undefined {
+  // The STORED rate of the receipt, or nothing. Never a lookup: a rate that landed later the same day must not change what an existing
+  // receipt is booked at. A foreign receipt with none is refused by the enqueue (foreign_payment_missing_rate).
+  return typeof given === 'number' && Number.isFinite(given) ? given : undefined
+}
+
 export async function registerInvoicePaymentWithLedger(params: {
   orderId: string
   orderReference: string
@@ -1294,6 +1304,19 @@ export async function registerInvoicePaymentWithLedger(params: {
   method: string | null
   reference: string | null
   paidAt: Date
+  /**
+   * o3d-q0x56.2 - THE SETTLEMENT RATE IMS RESOLVED FOR THIS RECEIPT (1 base = X receipt currency), carried on the queued work so the
+   * processor posts exactly this rate as the payment's `CurrencyRate` and never looks one up at send time.
+   *
+   *   a number     the rate STORED with the receipt (Payment.settlementRateToBase) when it was recorded. Every caller - the first enqueue, the
+   *                deferred re-drive, the operator re-drive, the ledger-check action - passes the stored value; nothing here looks a rate up;
+   *   `null`       there is none stored (a base-currency receipt, or a receipt recorded before the column existed).
+   *
+   * A foreign receipt with no stored rate is not sent without one: the enqueue refuses it with the named reason foreign_payment_missing_rate
+   * and an inbox row (foreign-currency-rate-guard.ts). There is deliberately no fresh lookup: a rate that landed later the same day must not
+   * change what an existing receipt is booked at.
+   */
+  settlementRateToBase: number | null
   /**
    * The post this registration is a consequence of (o3d-ekn8 r2). Supplied ONLY by the deferred
    * re-drive, which has it; the operator-entered receipt path has no such post behind it and passes
@@ -1694,6 +1717,10 @@ export async function registerInvoicePaymentWithLedger(params: {
       return registeredFor.connector
     }
 
+    // o3d-q0x56.2: the settlement rate this receipt carries to the ledger. Resolved BEFORE the transaction below (a read of fx_rates, no
+    // locks held), and never at send time.
+    const settlementRateForPayload = settlementRateToCarry(params.settlementRateToBase)
+
     // ENQUEUE UNDER THE ORDER LOCK, and only if the receipt is still there. The Payment row committed
     // before this runs, and deletePayment cancels a queued registration by looking for one — so a delete
     // landing in between saw nothing to cancel, and this then posted a payment to the ledger for a
@@ -1776,6 +1803,9 @@ export async function registerInvoicePaymentWithLedger(params: {
           // string and are read exactly as they are today.
           [REGISTERED_AMOUNT_DECIMAL_FIELD]: params.amount.toFixed(),
           currency: params.currency,
+          // o3d-q0x56.2: IMS's own settlement rate for this receipt (1 base = X currency). Absent only for a base-currency receipt or a rate
+          // IMS could not resolve - and a foreign receipt without it is refused by the enqueue below, never queued.
+          ...(settlementRateForPayload !== undefined ? { settlementRateToBase: settlementRateForPayload } : {}),
           paymentDate: params.paidAt.toISOString().slice(0, 10),
           method: params.method ?? '',
           reference: params.reference ?? undefined,
@@ -2006,7 +2036,7 @@ export async function registerDeferredOrderReceipts(
         payments: {
           // A refund payment settles a CREDIT NOTE, not this invoice, so it is not a receipt against it.
           where: { refundId: null },
-          select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true },
+          select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true },
           orderBy: { paidAt: 'asc' },
         },
       },
@@ -2112,6 +2142,8 @@ export async function registerDeferredOrderReceipts(
         method: receipt.method,
         reference: receipt.reference,
         paidAt: receipt.paidAt,
+        // o3d-q0x56.2: the rate STORED with the receipt when it was recorded. Never recalculated.
+        settlementRateToBase: receipt.settlementRateToBase === null ? null : Number(receipt.settlementRateToBase),
       })
     }
 

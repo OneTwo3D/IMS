@@ -43,6 +43,8 @@ let authorizeAnswers: Array<{ ok: true } | { ok: false; error: string }> = []
 /** How many requests had reached the wire the first time the authorisation was consulted. */
 let wireCountAtFirstAuthorize = -1
 
+// o3d-q0x56.2/.3: the payment and document posters read the base currency to tell a foreign posting from a base one.
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/connectors/xero/contacts', {
   namedExports: {
     findOrCreateContact: async () => {

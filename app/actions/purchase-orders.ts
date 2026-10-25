@@ -4129,6 +4129,9 @@ export async function markBillPaid(
               paymentDate: input.paymentDate,
               amount: paymentAmount,
               currency: invoice.po.currency,
+              // o3d-q0x56.2: the settlement rate IMS resolved for THIS payment above (1 base = X bill currency; 1 for a base-currency bill),
+              // carried on the queued work so Xero books the realised FX at IMS's rate. The processor posts exactly this; no lookup at send time.
+              settlementRateToBase,
               reference: input.reference ?? undefined,
             },
             // o3d-j625 r2: the connector that answered the bank-account list this payment's

@@ -6,7 +6,8 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
 import { xeroGet, xeroPost, xeroPut } from './api'
 import { findOrCreateContact } from './contacts'
-import { imsRateToXeroCurrencyRate } from './fx'
+import { foreignCurrencyRateProblem, xeroCurrencyRateOrRefuse } from './fx'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import type { CreditNoteData, InvoiceLine } from '../types'
 import { PAGE_SIZE } from './invoice-delta'
 import { readAllocatedToInvoiceCents, readSingleXeroDocument, readXeroBalance } from './single-document'
@@ -68,6 +69,13 @@ export async function pushCreditNote(
   status: string = 'AUTHORISED',
   opts?: { idempotencyKey?: string; customerId?: string },
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string }> {
+  // o3d-q0x56.3: BEFORE the contact round trip, which creates a contact in Xero. A foreign credit note with no usable rate leaves no trace.
+  const baseCurrency = await getBaseCurrencyCode()
+  const rateProblem = foreignCurrencyRateProblem({
+    currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}`,
+  })
+  if (rateProblem) return { success: false, error: rateProblem }
+
   // Find or create the contact
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, false, { customerId: opts?.customerId })
   if (!contactResult.success || !contactResult.contactId) {
@@ -110,8 +118,10 @@ export async function pushCreditNote(
     Status: status,
     CurrencyCode: data.currency,
   }
-  // Stamp the IMS rate so Xero doesn't apply its own daily XE rate.
-  const xeroCurrencyRate = imsRateToXeroCurrencyRate(data.currencyRateToBase)
+  // Stamp the IMS rate so Xero doesn't apply its own daily XE rate. Already proven usable (foreign) above; a base-currency note omits it as before.
+  const xeroCurrencyRate = xeroCurrencyRateOrRefuse({
+    currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}`,
+  })
   if (xeroCurrencyRate != null) creditNote.CurrencyRate = xeroCurrencyRate
   if (data.reference) creditNote.Reference = data.reference
 
@@ -134,8 +144,14 @@ export function buildXeroPurchaseCreditNote(
   data: CreditNoteData,
   status: string,
   contactId: string,
+  /** The organisation's base currency. REQUIRED: whether a missing CurrencyRate is allowed depends on it (o3d-q0x56.3). */
+  baseCurrency: string,
 ): Record<string, unknown> {
   const DEFAULT_TAX_TYPE = 'NONE'
+  // o3d-q0x56.3: decided FIRST. A foreign supplier credit note with no usable IMS rate THROWS; a base-currency one with none omits the field.
+  const xeroCurrencyRate = xeroCurrencyRateOrRefuse({
+    currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`,
+  })
   const creditNote: Record<string, unknown> = {
     Type: XERO_PURCHASE_CREDIT_NOTE_TYPE,
     Contact: { ContactID: contactId },
@@ -156,7 +172,6 @@ export function buildXeroPurchaseCreditNote(
     Status: status,
     CurrencyCode: data.currency,
   }
-  const xeroCurrencyRate = imsRateToXeroCurrencyRate(data.currencyRateToBase)
   if (xeroCurrencyRate != null) creditNote.CurrencyRate = xeroCurrencyRate
   if (data.reference) creditNote.Reference = data.reference
   return creditNote
@@ -385,6 +400,13 @@ export async function pushPurchaseCreditNote(
   })
   if (!minted.ok) return { success: false, error: minted.reason }
 
+  // o3d-q0x56.3: before the contact round trip and the ledger lookup. A foreign supplier credit note with no usable rate leaves no trace.
+  const baseCurrency = await getBaseCurrencyCode()
+  const rateProblem = foreignCurrencyRateProblem({
+    currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`,
+  })
+  if (rateProblem) return { success: false, error: rateProblem }
+
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, true, { supplierId: opts.supplierId })
   if (!contactResult.success || !contactResult.contactId) {
     return { success: false, error: `Contact error: ${contactResult.error}` }
@@ -411,7 +433,7 @@ export async function pushPurchaseCreditNote(
     return { success: true, creditNoteId: decision.creditNoteId, adopted: true, error: undefined }
   }
 
-  const creditNote = buildXeroPurchaseCreditNote(data, status, contactResult.contactId)
+  const creditNote = buildXeroPurchaseCreditNote(data, status, contactResult.contactId, baseCurrency)
   const res = await xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote, { idempotencyKey: opts.idempotencyKey })
   if (!res.ok || !res.data?.CreditNotes?.length) {
     return { success: false, error: res.error ?? 'Failed to create purchase credit note' }

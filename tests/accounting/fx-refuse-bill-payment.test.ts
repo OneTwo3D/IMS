@@ -148,6 +148,8 @@ test('a BASE-currency bill is still paid, at 1, without reading the rate table',
   assert.equal(state.committedPaid.length, 1)
   assert.equal(state.rateReads, 0)
   assert.equal(state.fxJournals.length, 0, 'no FX exposure in the base currency')
+  // o3d-q0x56.2: a base-currency bill payment carries its rate of 1 (no CurrencyRate is sent for it: see xero-payment-currency-rate.test.ts).
+  assert.equal((state.enqueuedTx[0] as { payload: Record<string, unknown> }).payload.settlementRateToBase, 1)
 })
 
 test('[q0x56.16] a rate fetched at 09:00 ON the payment date is the settlement rate for a date-only paymentDate', async () => {
@@ -157,6 +159,11 @@ test('[q0x56.16] a rate fetched at 09:00 ON the payment date is the settlement r
   assert.equal(result.success, true, JSON.stringify(result))
   assert.equal(state.fxJournals.length, 1)
   assert.equal(state.fxJournals[0].payload.settlementRateToBase, 1.6, 'the same-day 09:00 rate, not the previous day')
+  // o3d-q0x56.2: and the SAME rate rides on the queued BILL_PAYMENT, which is what the Xero poster sends as the payment's CurrencyRate.
+  const queuedPayment = state.enqueuedTx[0] as { type: string; payload: Record<string, unknown> }
+  assert.equal(queuedPayment.type, 'BILL_PAYMENT')
+  assert.equal(queuedPayment.payload.settlementRateToBase, 1.6, 'the queued payment carries the rate IMS resolved, not a later lookup')
+  assert.equal(queuedPayment.payload.currency, 'USD')
   assert.equal(state.committedPaid.length, 1)
 })
 

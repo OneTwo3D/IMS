@@ -100,6 +100,8 @@ const postingRefusalTable = {
 }
 const outstandingRows = () => refusalRows.filter((row) => row.resolvedAt === null)
 
+// o3d-q0x56.2/.3: the payment and document posters read the base currency to tell a foreign posting from a base one.
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/db/savepoint', {
   namedExports: { withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => fn() },
 })
@@ -159,6 +161,7 @@ async function register() {
     method: 'card',
     reference: null,
     paidAt: payment.paidAt,
+    settlementRateToBase: null,
   })
 }
 
@@ -253,7 +256,7 @@ test('[o3d-j625 r5 HIGH 3] a refused receipt’s row is keyed on THAT receipt, a
   const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
   await registerInvoicePaymentWithLedger({
     orderId: 'order-1', orderReference: 'SO-1', paymentId: other.id, amount: other.amount,
-    currency: 'GBP', method: 'card', reference: null, paidAt: other.paidAt,
+    currency: 'GBP', method: 'card', reference: null, paidAt: other.paidAt, settlementRateToBase: null,
   })
 
   assert.equal(state.queued.length, 1, 'PRECONDITION: B really was queued')

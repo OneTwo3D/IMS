@@ -131,7 +131,7 @@ export async function recordLedgerCheck(input: {
     const receipt = await db.payment.findUnique({
       where: { id: recorded.paymentId },
       select: {
-        id: true, amount: true, currency: true, method: true, reference: true, paidAt: true,
+        id: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true,
         order: { select: { id: true, orderNumber: true, externalOrderNumber: true, currency: true } },
       },
     })
@@ -145,6 +145,8 @@ export async function recordLedgerCheck(input: {
         method: receipt.method,
         reference: receipt.reference,
         paidAt: receipt.paidAt,
+        // o3d-q0x56.2: the rate STORED with the receipt; never recalculated.
+        settlementRateToBase: receipt.settlementRateToBase === null ? null : Number(receipt.settlementRateToBase),
       })
     }
     const rows = receipt

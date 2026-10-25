@@ -53,6 +53,7 @@ test('the coupon a WC order actually carries is deducted ONCE end-to-end', () =>
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
 
   assert.equal(
@@ -88,6 +89,7 @@ test('coupon money Woo left off the lines still reaches the invoice', () => {
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
 
   assert.equal(effectiveTotal(payload), 90)
@@ -105,6 +107,7 @@ test('a per-line discount with NO order-level coupon is unaffected', () => {
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
   assert.equal(effectiveTotal(payload), 90)
 })
@@ -121,6 +124,7 @@ test('an order-level discount with NO per-line discount is unaffected', () => {
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
   assert.equal(effectiveTotal(payload), 90)
 })
@@ -139,6 +143,7 @@ test('a NATIVE order keeps BOTH legs — the builder must not net them off', () 
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
   assert.equal(effectiveTotal(payload), 85)
 })
@@ -159,6 +164,7 @@ test('a discount too small to express as a percentage is not silently lost', () 
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
 
   const line = (payload.LineItems as Line[])[0]
@@ -180,6 +186,7 @@ test('an awkward fraction survives too, where a rounded percentage would drift',
     'AUTHORISED',
     'contact-1',
     new Set<string>(),
+    'GBP',
   )
   assert.equal((payload.LineItems as Line[])[0].DiscountAmount, 3.33)
   assert.equal(effectiveTotal(payload), 6.66)

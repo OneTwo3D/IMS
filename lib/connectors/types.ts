@@ -199,8 +199,9 @@ export type InvoiceData = {
   currency: string
   /**
    * FX rate stamped on the document. See top-level convention comment.
-   * Optional — when omitted the accounting platform will fall back to its own
-   * daily rate, which is what we are trying to avoid.
+   * Optional ONLY for a base-currency document. A foreign-currency document without a usable rate is
+   * refused at the enqueue and again by the connector (o3d-q0x56.3): omitting it would make the
+   * accounting platform fall back to its own daily rate, which is what we are trying to avoid.
    */
   currencyRateToBase?: number
   lines: InvoiceLine[]

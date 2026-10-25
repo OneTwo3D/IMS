@@ -45,6 +45,7 @@ const store = {
 let nextId = 1
 const newId = (prefix: string) => `${prefix}-${nextId++}`
 
+mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/activity-log', {
   namedExports: { logActivity: async (entry: Row) => { store.activity.push(entry) } },
 })
