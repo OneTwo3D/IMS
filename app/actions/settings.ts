@@ -675,6 +675,47 @@ export async function getVatDifferenceReport(): Promise<VatDifferenceActionResul
 }
 
 // ---------------------------------------------------------------------------
+// Re-key IMS tax rates to the custom tax codes of the connected Xero organisation (lib/tax/tax-rekey.ts)
+// ---------------------------------------------------------------------------
+
+export type TaxRekeyActionResult =
+  | { success: true; applied: boolean; wrote: boolean; plan: import('@/lib/tax/tax-rekey').RekeyPlan | null; refusal: import('@/lib/tax/tax-rekey').RekeyRefusal | null; written: import('@/lib/tax/tax-rekey').RekeyWriteResult | null }
+  | { success: false; error: string }
+
+/**
+ * READ-ONLY. The plan for re-keying the IMS rates that carry a custom Xero tax code (TAX001..TAXnnn) to the same-named type of the Xero organisation connected now, with its
+ * digest. Reads the STORED Xero list (proven first); never calls Xero; writes nothing.
+ */
+export async function previewTaxRekey(): Promise<TaxRekeyActionResult> {
+  await requirePermission('settings.company')
+  try {
+    const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
+    const result = await runTaxRekey({ apply: false })
+    return { success: true, applied: false, wrote: false, plan: result.plan, refusal: result.refusal, written: null }
+  } catch (e) {
+    unstable_rethrow(e)
+    return { success: false, error: 'The re-key plan could not be produced.' }
+  }
+}
+
+/**
+ * Apply the plan whose `confirm` digest the operator saw. One transaction inside the Xero connection fence; a changed plan (different digest) writes nothing; unposted documents
+ * refuse unless `allowUnposted`; queued payloads always refuse. Idempotent. New rows are created and old rows deactivated, never edited; defaults and storefront mappings are re-pointed.
+ */
+export async function applyTaxRekey(input: { confirm: string; allowUnposted?: boolean }): Promise<TaxRekeyActionResult> {
+  await requirePermission('settings.company')
+  try {
+    const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
+    const result = await runTaxRekey({ apply: true, confirm: input.confirm, allowUnposted: input.allowUnposted === true })
+    await runPostCommit(async () => { revalidatePath('/settings/accounting') }, 'Failed to refresh the tax settings')
+    return { success: true, applied: result.applied, wrote: result.wrote, plan: result.plan, refusal: result.refusal, written: result.written }
+  } catch (e) {
+    unstable_rethrow(e)
+    return { success: false, error: 'The re-key could not be applied.' }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Generate + map missing accounting tax rates (onetwo3d-ims-30tg)
 // ---------------------------------------------------------------------------
 

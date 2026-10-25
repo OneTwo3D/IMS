@@ -23,6 +23,7 @@
  */
 import { Client } from 'pg'
 import { randomUUID } from 'node:crypto'
+import { XERO_BUILT_IN_TAX_TYPES } from '../lib/tax/xero-built-in-tax-types.ts'
 
 const DRY_RUN = process.argv.includes('--dry-run')
 
@@ -42,12 +43,6 @@ function arg(flag: string): string | undefined {
  * OUTPUT2, whose Xero name is "20% (VAT on Income)"). So without this, any rate mapped to a
  * built-in arrives with a NULL tax type and posts to Xero with no TaxType at all (o3d-6ec).
  */
-const XERO_BUILT_IN_TAX_TYPES = new Set([
-  'OUTPUT', 'OUTPUT2', 'INPUT', 'INPUT2', 'RRINPUT', 'RROUTPUT',
-  'ZERORATEDOUTPUT', 'ZERORATEDINPUT', 'EXEMPTOUTPUT', 'EXEMPTINPUT',
-  'NONE', 'GSTONIMPORTS', 'REVERSECHARGES',
-  'ECZROUTPUT', 'ECZRINPUT', 'ECOUTPUT', 'ECINPUT', 'ECACQUISITIONS',
-])
 
 type Rate = {
   id: string
