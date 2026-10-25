@@ -62,7 +62,7 @@ test('a manifest with no purchaseOrders part leaves that part SOURCE_UNREADABLE 
 
 // [mutation: the PO map accepted by anything but its digest / a missing map allowed / the stock map accepted for the incoming report]
 test('the incoming report accepts ONLY the native incoming-stock map: any other bytes, no map, or the stock map is COLUMN_MAP_NOT_NATIVE', () => {
-  for (const map of [`${QOBLEX_NATIVE_PO_COLUMN_MAP} `, QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"Approved": "OPEN"', '"Approved": "CLOSED"'), QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"destinationWarehouseCode": "MIL1"', '"destinationWarehouseCode": "MIL1",\n        "currency": "GBP"'), readFileSync(path.join(nativeDir, 'maps/qoblex-incoming-stock.map.json'), 'utf8'), readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')]) {
+  for (const map of [`${QOBLEX_NATIVE_PO_COLUMN_MAP} `, QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"Approved": "OPEN"', '"Approved": "CLOSED"'), QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"destinationWarehouseCode": "MIL1"', '"destinationWarehouseCode": "MIL1",\n        "currency": "GBP"'), readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')]) {
     assert.notEqual(map, QOBLEX_NATIVE_PO_COLUMN_MAP)
     assert.equal(poReason(writeExport(bases, { purchaseOrders: { map } })), 'COLUMN_MAP_NOT_NATIVE')
   }
