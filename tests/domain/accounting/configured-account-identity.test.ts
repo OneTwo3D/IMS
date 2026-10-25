@@ -6,9 +6,9 @@ import test, { mock } from 'node:test'
  * GL reconciliation, COGS and transit reconciliations, the inventory valuation report) resolves the code to the one active chart
  * account, reads by that account's id under the connected organisation, and WITHHOLDS when that is unproven.
  */
-type Row = { id: string; connector: string; externalAccountId: string; accountCode: string; accountName: string; balanceDate: Date; currency: string; amountForeign: string; amountBase: string; sourcePayloadRef: null; tenantId: string | null; financialYearEnd: null; syncRunId: null; fetchedAt: Date }
+type Row = { id: string; connector: string; externalAccountId: string; accountCode: string; accountName: string; balanceDate: Date; currency: string; amountForeign: string; amountBase: string; sourcePayloadRef: null; tenantId: string | null; financialYearEnd: null; parserVersion: number | null; syncRunId: null; fetchedAt: Date }
 const day = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
-const row = (id: string, accountId: string, code: string, iso: string, amount: string, tenantId: string | null = 't1'): Row => ({ id, connector: 'xero', externalAccountId: accountId, accountCode: code, accountName: code, balanceDate: day(iso), currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId, financialYearEnd: null, parserVersion: 2 as number | null, syncRunId: null, fetchedAt: day(iso) })
+const row = (id: string, accountId: string, code: string, iso: string, amount: string, tenantId: string | null = 't1'): Row => ({ id, connector: 'xero', externalAccountId: accountId, accountCode: code, accountName: code, balanceDate: day(iso), currency: 'GBP', amountForeign: amount, amountBase: amount, sourcePayloadRef: null, tenantId, financialYearEnd: null, parserVersion: 2, syncRunId: null, fetchedAt: day(iso) })
 
 let rows: Row[] = []
 let chart: Array<{ code: string; externalAccountId: string; type: string }> = []
