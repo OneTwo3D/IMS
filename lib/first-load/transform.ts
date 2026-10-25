@@ -1763,10 +1763,11 @@ export function prepare(input: PrepareInput): PrepareResult {
   }
   needsPrefix('purchase-order-lines', config.purchaseOrderKeyPrefix, 'purchaseOrderKeyPrefix')
   needsPrefix('transfers', config.transferKeyPrefix, 'transferKeyPrefix')
-  if (input.datasets['purchase-order-lines']) {
+  // Required when orders OR suppliers are supplied: the apply-time supplier tax rail holds every supplier's default tax rate to it (SUPPLIER_TAX_RATE_ABOVE_MAX).
+  if (input.datasets['purchase-order-lines'] || input.datasets.suppliers) {
     const declared = config.maxPurchaseTaxRate
     if (declared === null || !/^(0(\.\d{1,6})?|1(\.0{1,6})?)$/.test(declared)) {
-      throw new ConfigError('maxPurchaseTaxRate must be set to the highest purchase tax rate any IMS tax rate or supplier default could apply, as a fraction between 0 and 1 (for example "0.25"): the importer resolves tax rates by name inside IMS, which this tool cannot read, so it bounds every order with this rate')
+      throw new ConfigError('maxPurchaseTaxRate must be set to the highest purchase tax rate any IMS tax rate or supplier default could apply, as a fraction between 0 and 1 (for example "0.25"): the importer resolves tax rates by name inside IMS, which this tool cannot read, so it bounds every order, and the apply step holds every supplier\'s default tax rate, to this rate')
     }
   }
   if (input.datasets.transfers && config.inTransitConvention === null) {

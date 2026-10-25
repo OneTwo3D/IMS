@@ -1479,6 +1479,25 @@ run that records tax-rate drift).
   rows. If the connection changes while a run is in flight, the run is discarded (see the connection fence above).
 - **Nothing is written to Xero and nothing else changes.** Mapping Xero's rates into IMS tax codes, pushing rates to WooCommerce and
   the tax-rate write path (*Generate missing Xero tax rates*, the multi-component sync) are not part of this store and behave as before.
+- **Importing IMS tax rates from the stored list.** The IMS rates documents use (`tax_rates`) are created from this list by one explicit,
+  operator-run action: **Settings > Accounting > Tax > Import purchase tax rates from Xero** (the first load calls the same function, see
+  `docs/first-load-apply.md`). It reads the **stored** list, never calls Xero and never writes to it. It requires a list that is proven
+  intact (header, row count, digest), has its last-success stamp, was read within 26 hours, and belongs to the organisation connected now;
+  otherwise it refuses by name (`XERO_NOT_CONNECTED`, `XERO_LIST_MISSING`, `XERO_LIST_NOT_STAMPED`, `XERO_LIST_STALE`, `XERO_LIST_WRONG_ORGANISATION`,
+  `XERO_LIST_UNREADABLE`).
+  - **Purchase rows.** For each of `INPUT2`, `ZERORATEDINPUT` and `NONE` that has no active IMS rate usable for purchases, it creates one active
+    **Purchases** rate with Xero's name, rate (the effective rate, converted exactly to a four-decimal fraction), components and tax type. A type
+    Xero does not list (`TYPE_NOT_IN_XERO`), does not mark `ACTIVE` (`TYPE_NOT_ACTIVE_IN_XERO`) or does not allow on expenses
+    (`TYPE_NOT_USABLE_ON_EXPENSES`), a rate that four decimals cannot hold (`RATE_NOT_REPRESENTABLE`), components that disagree with the rate
+    (`RATE_INCONSISTENT`), a non-recoverable component, a name already used by an active rate (`NAME_COLLISION`) or several existing rates for
+    the type (`AMBIGUOUS_EXISTING_RATES`) gets a named refusal and **no row**. A rate is never invented.
+  - **Sales-side rates on purchases (opt-in).** With *narrow* ticked, an active **Both** rate whose Xero tax type is sales-only (can apply to
+    revenue, not to expenses) becomes **Sales** only, so it can no longer be picked on a purchase; each change is reported with the number of
+    suppliers and purchase lines that reference it. Refused (`NARROW_REQUIRES_PURCHASE_ROWS`) unless every purchase type is satisfied.
+  - **Types not in the live list (opt-in).** An active rate whose tax type Xero does not list as active (for example leftover demo-organisation
+    rates `TAX001`...) is **reported**; it is deactivated only with *deactivate* ticked, and never when it is the default rate. The default is report-only.
+  - **Never.** Nothing is deleted; an existing row's rate, type, name and components are never changed (documents reference rows: a different rate is a new row);
+    a re-run changes nothing. The `accounting_reverse_charge_purchase_tax_type` setting is checked against the list and reported; no row is created for it.
 - **Used by** reconciliation-pack item R13 (the Xero leg), which reads the stored list in its own read-only snapshot. See
   *Reconciliation pack* in the installation guide.
 

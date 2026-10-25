@@ -18,6 +18,7 @@ import { CLEAN_PRELOAD, CLEAN_SNAPSHOT } from './apply-preload'
 import { loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
 import { precondition } from './helpers'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys'
+import { digestTaxRateList, type NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-list'
 
 /**
  * THE DATABASE SIDE OF THE FIRST-LOAD APPLY RUNNER, on a real throwaway PostgreSQL cluster with the migrations applied.
@@ -1477,7 +1478,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       it('the tax-rates rail refuses a suppliers file whose type matches no rate, several rates, or is blank, and passes one that matches exactly one', async (t) => {
         await fresh()
         try {
-          const prepared = (types: string[]) => ({ steps: [{ step: 'suppliers', data: { header: ['name', 'currency', 'purchaseTaxType'], rows: types.map((type, i) => ({ chunk: 1, line: i + 2, cells: [`S${i}`, 'GBP', type] })) } }] }) as unknown as PreparedRun
+          const prepared = (types: string[]) => ({ report: { config: { maxPurchaseTaxRate: '0.25' } }, steps: [{ step: 'suppliers', data: { header: ['name', 'currency', 'purchaseTaxType'], rows: types.map((type, i) => ({ chunk: 1, line: i + 2, cells: [`S${i}`, 'GBP', type] })) } }] }) as unknown as PreparedRun
           const problems = async (types: string[]) => { const p: string[] = []; await m.rails.supplierTaxRates(prepared(types), p); return p }
           assert.deepEqual(await problems(['INPUT2', 'ZERORATEDINPUT', 'NONE', 'INPUT2']), [], 'one rate each (the decoys do not count)')
           assert.deepEqual(await problems(['EXEMPTINPUT']), ['supplier tax: 1 supplier purchase tax type(s) match no active IMS tax rate usable for purchases'])
@@ -1485,6 +1486,185 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           await addRate('stdTwo', { name: 'ZQST Std Two', usedFor: 'BOTH', accountingTaxType: 'INPUT2' })
           assert.deepEqual(await problems(['INPUT2']), ['supplier tax: 1 supplier purchase tax type(s) match more than one active IMS tax rate usable for purchases'])
           precondition(t, 'rail cases', 4)
+        } finally { await cleanup() }
+      })
+    })
+
+
+    describe('import first: a supplier purchase tax type with no IMS rate is imported from the stored Xero list (owner ruling), and every supplier default is held to maxPurchaseTaxRate', () => {
+      // Mutations named (each was made, the arm went red, and it was reverted):
+      //   rails.supplierTaxRates: `none > 0 && options.allowImport` -> `false`                          -> 'a plan passes ... writes nothing' and the apply arm are red (the type is refused as before);
+      //   the plan path writes (call runPurchaseTaxImport with apply: true inside the rail)            -> 'a plan ... writes nothing' is red (tax_rates grew);
+      //   ports.recheckRails: drop the `importSupplierTaxRates` call                                    -> 'apply imports, then the suppliers resolve' is red (the strict re-check refuses);
+      //   ports.recheckRails: re-check with strictSupplierTax false                                     -> 'the strict re-check' arm is red (a lost import passes);
+      //   tax-import.ts: `requireAll: true` -> false                                                    -> 'nothing is imported when any needed type is refused' is red;
+      //   readStoredXeroList: drop the age / stamp / digest / organisation test                         -> the matching refusal arm is red (units: tests/connectors/purchase-tax-import.test.ts);
+      //   rails: drop the `d.rate.gt(ceiling)` / `d.effective.gt(ceiling)` test                          -> the ceiling arms are red; `declaredMax === null` branch dropped -> the undeclared arm is red.
+      const TENANT = 'zqxi-tenant'
+      const xeroRow = (taxType: string, name: string, percent: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({
+        taxType, name, status: 'ACTIVE', reportTaxType: null, effectiveRate: percent, displayTaxRate: percent,
+        components: Number(percent) === 0 ? [] : [{ name: 'VAT', rate: percent, compound: false, nonRecoverable: false }],
+        canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false }, ...over,
+      })
+      const LIST = () => [xeroRow('INPUT2', 'ZQXI 20% (VAT on Expenses)', '20.000000'), xeroRow('ZERORATEDINPUT', 'ZQXI Zero Rated Expenses', '0.000000'), xeroRow('NONE', 'ZQXI No VAT', '0.000000')]
+      const wipeXero = async () => {
+        await m.db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+        await m.db.xeroTaxRateList.deleteMany({})
+        await m.db.xeroTaxRate.deleteMany({})
+        await m.db.setting.deleteMany({ where: { key: 'xero_tax_rate_drift_last_checked_at' } })
+      }
+      const seedXero = async (rows: NormalisedXeroTaxRate[], over: { fetchedAt?: Date; stamp?: boolean } = {}) => {
+        await wipeXero()
+        const fetchedAt = over.fetchedAt ?? new Date(Date.now() - 600_000)
+        await m.db.accountingToken.create({ data: { connector: 'xero', accessToken: 'a', expiresAt: new Date(Date.now() + 3_600_000), tenantId: TENANT, tenantName: 'ZQXI Org', connectionGeneration: 'gen-zqxi' } })
+        await m.db.xeroTaxRate.createMany({ data: rows.map((r) => ({ connector: 'xero', tenantId: TENANT, taxType: r.taxType, name: r.name, status: r.status, reportTaxType: r.reportTaxType, effectiveRate: r.effectiveRate, displayTaxRate: r.displayTaxRate, components: r.components, canApplyToAssets: r.canApply.assets, canApplyToEquity: r.canApply.equity, canApplyToExpenses: r.canApply.expenses, canApplyToLiabilities: r.canApply.liabilities, canApplyToRevenue: r.canApply.revenue, fetchedAt })) })
+        await m.db.xeroTaxRateList.create({ data: { connector: 'xero', tenantId: TENANT, fetchedAt, rowCount: rows.length, digest: digestTaxRateList(TENANT, rows) } })
+        if (over.stamp !== false) await m.db.setting.upsert({ where: { key: 'xero_tax_rate_drift_last_checked_at' }, create: { key: 'xero_tax_rate_drift_last_checked_at', value: fetchedAt.toISOString() }, update: { value: fetchedAt.toISOString() } })
+      }
+      const fresh = async () => {
+        await resetData()
+        await wipeXero()
+        await m.db.taxRate.deleteMany({ where: { OR: [{ name: { startsWith: 'ZQXI ' } }, { name: { startsWith: 'ZQST ' } }] } })
+        // The shape of stage: no INPUT2 and no ZERORATEDINPUT at all; NONE exists (ZQDB No VAT, BOTH) from the suite's own configuration.
+        await m.db.taxRate.updateMany({ where: { accountingTaxType: { in: ['INPUT2', 'ZERORATEDINPUT'] } }, data: { active: false } })
+      }
+      const cleanup = async () => { await wipeXero(); await m.db.taxRate.deleteMany({ where: { name: { startsWith: 'ZQXI ' } } }); await resetData() }
+      const suppliersStub = (types: string[], max: string | null = '0.25') => {
+        const rows = stepRows(SUPPLIERS_IMPORT_HEADERS, types.map((purchaseTaxType, i) => ({ name: `ZQXI Supplier ${i}`, currency: 'GBP', purchaseTaxType })))
+        const report = { ...prepared.report, config: { ...prepared.report.config, maxPurchaseTaxRate: max } }
+        return { ...prepared, report, steps: [{ step: 'suppliers', target: 'suppliers', files: [], data: rows, units: keyStep('suppliers', rows).units }] } as unknown as PreparedRun
+      }
+      const taxRows = () => sql<{ name: string; used_for: string; accounting_tax_type: string; rate: string; active: boolean }>(`select name, "usedFor" as used_for, accounting_tax_type, rate::text, active from tax_rates where name like 'ZQXI %' order by name`)
+
+      it('a plan passes a type the import would create, says so in the rail\'s detail, and writes nothing', async (t) => {
+        await fresh()
+        try {
+          await seedXero(LIST())
+          const stub = suppliersStub(['INPUT2', 'ZERORATEDINPUT', 'NONE'])
+          const before = { rates: await count('tax_rates'), comps: await count('tax_rate_components'), logs: await count('activity_logs'), runs: await count('first_load_apply_runs') }
+          const results = await m.rails.evaluateRailResults(stub, { phase: 'preflight', resuming: false, step: null }, CLEAN_PRELOAD)
+          const taxRail = results.find((r) => r.id === 'tax-rates')!
+          assert.deepEqual(taxRail.problems, [], 'INPUT2 and ZERORATEDINPUT have no rate: the import would create them')
+          assert.match(taxRail.detail, /2 purchase tax type\(s\) would be imported from Xero before the suppliers load \(INPUT2, ZERORATEDINPUT\); a plan writes nothing/)
+          const planned = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), plan())
+          assert.equal(planned.exit, 'OK', planned.problems.join(';'))
+          assert.deepEqual({ rates: await count('tax_rates'), comps: await count('tax_rate_components'), logs: await count('activity_logs'), runs: await count('first_load_apply_runs') }, before, 'a plan wrote nothing')
+          assert.deepEqual(await taxRows(), [])
+          precondition(t, 'plan arms', 2)
+        } finally { await cleanup() }
+      })
+
+      it('apply imports, then the suppliers resolve to the imported rates; the import is recorded once on the run record', async (t) => {
+        await fresh()
+        try {
+          await seedXero(LIST())
+          const stub = suppliersStub(['INPUT2', 'ZERORATEDINPUT', 'NONE'])
+          const result = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(stub))
+          assert.ok(['OK', 'APPLIED_UNVERIFIED'].includes(result.exit), `${result.exit}: ${result.problems.join(';')}`)
+          assert.deepEqual((await taxRows()).map((r) => [r.accounting_tax_type, r.used_for, r.rate, r.active]), [['INPUT2', 'PURCHASE', '0.2000', true], ['ZERORATEDINPUT', 'PURCHASE', '0.0000', true]])
+          const suppliers = await sql<{ name: string; tax_type: string }>(`select s.name, t.accounting_tax_type as tax_type from suppliers s join tax_rates t on t.id = s."taxRateId" where s.name like 'ZQXI Supplier %' order by s.name`)
+          assert.deepEqual(suppliers.map((r) => r.tax_type), ['INPUT2', 'ZERORATEDINPUT', 'NONE'])
+          const facts = (await sql<{ facts: { purchaseTaxImport?: { created: Array<{ taxType: string }> } } }>('select facts from first_load_apply_runs'))[0]!.facts
+          assert.deepEqual(facts.purchaseTaxImport!.created.map((c) => c.taxType).sort(), ['INPUT2', 'ZERORATEDINPUT'])
+          // The sales-side and Demo rates are untouched: the first load never narrows or deactivates.
+          assert.equal((await sql<{ n: string }>(`select count(*)::text as n from tax_rates where name = 'ZQDB No VAT' and "usedFor" = 'BOTH' and active`))[0]!.n, '1')
+          precondition(t, 'apply arms', 3)
+        } finally { await cleanup() }
+      })
+
+      it('a missing, stale, unstamped or foreign stored list refuses the type by name, and nothing is written', async (t) => {
+        await fresh()
+        try {
+          const stub = suppliersStub(['INPUT2'])
+          const refusedWith = async (code: string) => {
+            const before = { rates: await count('tax_rates'), runs: await count('first_load_apply_runs') }
+            const problems = await evaluateRails(stub, { phase: 'preflight', resuming: false, step: null })
+            assert.ok(problems.some((p) => p.includes('match no active IMS tax rate usable for purchases and the import from Xero was refused') && p.includes(code)), `${code}: ${problems.join(' | ')}`)
+            const result = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(stub))
+            assert.equal(result.exit, 'PRECONDITION_REFUSED')
+            assert.deepEqual({ rates: await count('tax_rates'), runs: await count('first_load_apply_runs') }, before, `${code}: nothing written`)
+          }
+          await wipeXero()
+          await refusedWith('XERO_NOT_CONNECTED')
+          await seedXero(LIST()); await m.db.xeroTaxRateList.deleteMany({})
+          await refusedWith('XERO_LIST_MISSING')
+          await seedXero(LIST(), { stamp: false })
+          await refusedWith('XERO_LIST_NOT_STAMPED')
+          await seedXero(LIST(), { fetchedAt: new Date(Date.now() - 27 * 3_600_000) })
+          await refusedWith('XERO_LIST_STALE')
+          await seedXero(LIST()); await m.db.accountingToken.update({ where: { connector: 'xero' }, data: { tenantId: 'another-org' } })
+          await refusedWith('XERO_LIST_WRONG_ORGANISATION')
+          await seedXero(LIST().map((r) => (r.taxType === 'INPUT2' ? { ...r, canApply: { ...r.canApply, expenses: false } } : r)))
+          await refusedWith('TYPE_NOT_USABLE_ON_EXPENSES')
+          await seedXero(LIST().filter((r) => r.taxType !== 'INPUT2'))
+          await refusedWith('TYPE_NOT_IN_XERO')
+          await seedXero(LIST()) // control: the intact list passes the same rail
+          assert.deepEqual((await evaluateRails(stub, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('supplier tax')), [])
+          precondition(t, 'refusal arms', 7)
+        } finally { await cleanup() }
+      })
+
+      it('nothing is imported when any needed type is refused (all or nothing), and a lost import is caught by the strict re-check', async () => {
+        await fresh()
+        try {
+          await seedXero(LIST().filter((r) => r.taxType !== 'ZERORATEDINPUT'))
+          const stub = suppliersStub(['INPUT2', 'ZERORATEDINPUT'])
+          const { importSupplierTaxRates } = await import('../../lib/first-load/apply/db/tax-import')
+          const imported = await importSupplierTaxRates(stub)
+          assert.match(imported.problems.join(';'), /import from Xero was refused \(TYPE_NOT_IN_XERO \(ZERORATEDINPUT\)\); nothing was imported/)
+          assert.deepEqual(await taxRows(), [], 'INPUT2 was importable but is not written when ZERORATEDINPUT is refused')
+          // The strict evaluation (used right after the import) does not ask the import what it would do: with no rate it refuses.
+          const strict = await m.rails.evaluateRailResults(suppliersStub(['INPUT2']), { phase: 'recheck', resuming: true, step: 'suppliers', strictSupplierTax: true }, CLEAN_PRELOAD)
+          assert.match(strict.find((r) => r.id === 'tax-rates')!.problems.join(';'), /supplier tax: 1 supplier purchase tax type\(s\) match no active IMS tax rate usable for purchases$/)
+        } finally { await cleanup() }
+      })
+
+      it('an import that wrote nothing is caught by the strict re-check at the run level: the step refuses, no supplier is loaded', async () => {
+        await fresh()
+        await sql(`create or replace function zq_skip_tax_insert() returns trigger language plpgsql as $$ begin delete from tax_rates where id = new.id; return null; end $$`)
+        await sql(`create trigger zq_skip_tax_insert after insert on tax_rates for each row when (new.name like 'ZQXI %') execute function zq_skip_tax_insert()`)
+        try {
+          await seedXero(LIST())
+          // ZERORATEDINPUT has no components, so the trigger (which removes the row right after the insert: the import reports success and leaves nothing) cannot trip a foreign key.
+          const stub = suppliersStub(['ZERORATEDINPUT'])
+          const result = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(stub))
+          assert.equal(result.exit, 'STEP_FAILED', result.problems.join(';'))
+          assert.match(result.problems.join(';'), /suppliers: a rail no longer holds: supplier tax: 1 supplier purchase tax type\(s\) match no active IMS tax rate usable for purchases$/)
+          assert.equal((await sql<{ n: string }>(`select count(*)::text as n from suppliers where name like 'ZQXI Supplier %'`))[0]!.n, '0')
+        } finally { await sql('drop trigger if exists zq_skip_tax_insert on tax_rates'); await sql('drop function if exists zq_skip_tax_insert()'); await cleanup() }
+      })
+
+      it('maxPurchaseTaxRate is enforced on every supplier default rate: an existing rate, a rate about to be imported, and a manifest that declares none', async (t) => {
+        await fresh()
+        try {
+          await seedXero(LIST())
+          const rail = async (stub: PreparedRun) => (await evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'suppliers' })).filter((p) => p.startsWith('supplier tax'))
+          assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.25')), [], 'control: 20% about to be imported is within 25%')
+          assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.20')), [], 'control: equal to the ceiling is within it')
+          assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.10')), ['supplier tax [SUPPLIER_TAX_RATE_ABOVE_MAX]: 1 supplier default tax rate(s) are above the maximum purchase tax rate the prepared report declares'])
+          assert.deepEqual(await rail(suppliersStub(['INPUT2'], null)), ['supplier tax [SUPPLIER_TAX_MAX_UNDECLARED]: the prepared report declares no maximum purchase tax rate, so no supplier default rate can be shown to be within it'])
+          // An EXISTING rate above the ceiling (the rate column, and separately the effective rate from its components).
+          await m.db.taxRate.create({ data: { name: 'ZQXI Existing 30', rate: '0.3', usedFor: 'PURCHASE', accountingTaxType: 'INPUT2', active: true } })
+          assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.25')), ['supplier tax [SUPPLIER_TAX_RATE_ABOVE_MAX]: 1 supplier default tax rate(s) are above the maximum purchase tax rate the prepared report declares'])
+          // The rate COLUMN above the ceiling while the components (what tax is computed from) are within it: each is held to the ceiling on its own.
+          const existing30 = await m.db.taxRate.findFirstOrThrow({ where: { name: 'ZQXI Existing 30' } })
+          const within = await m.db.taxRateComponent.create({ data: { taxRateId: existing30.id, name: 'VAT', rate: '0.2', sortOrder: 0 } })
+          assert.ok((await rail(suppliersStub(['INPUT2'], '0.25'))).some((p) => p.includes('SUPPLIER_TAX_RATE_ABOVE_MAX')), 'the rate column (30%) is held to the ceiling although the components give 20%')
+          await m.db.taxRateComponent.delete({ where: { id: within.id } })
+          await m.db.taxRate.updateMany({ where: { name: 'ZQXI Existing 30' }, data: { rate: '0.2' } })
+          assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.25')), [], 'control: the same row at 20% passes')
+          await m.db.taxRateComponent.create({ data: { taxRateId: (await m.db.taxRate.findFirstOrThrow({ where: { name: 'ZQXI Existing 30' } })).id, name: 'VAT', rate: '0.3', sortOrder: 0 } })
+          assert.ok((await rail(suppliersStub(['INPUT2'], '0.25'))).some((p) => p.includes('SUPPLIER_TAX_RATE_ABOVE_MAX')), 'the effective rate (30% from the component) is held to the ceiling too')
+          // The run: a supplier file above the ceiling is refused before anything is written.
+          await m.db.taxRate.deleteMany({ where: { name: 'ZQXI Existing 30' } })
+          const before = { rates: await count('tax_rates'), runs: await count('first_load_apply_runs') }
+          const stub = suppliersStub(['ZERORATEDINPUT', 'NONE'], '0.25')
+          const result = await runLoad(suppliersStub(['INPUT2'], '0.10'), m.ports.createDbPorts(suppliersStub(['INPUT2'], '0.10'), { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(suppliersStub(['INPUT2'], '0.10')))
+          assert.equal(result.exit, 'PRECONDITION_REFUSED')
+          assert.match(result.problems.join(';'), /SUPPLIER_TAX_RATE_ABOVE_MAX/)
+          assert.deepEqual({ rates: await count('tax_rates'), runs: await count('first_load_apply_runs') }, before)
+          assert.deepEqual(await rail(stub), [], 'control: zero-rate types pass any ceiling')
+          precondition(t, 'ceiling arms', 8)
         } finally { await cleanup() }
       })
     })

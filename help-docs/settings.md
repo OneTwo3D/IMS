@@ -176,6 +176,16 @@ Setting `TaxRate.reverseCharge` to true changes how IMS posts the line to the ac
 
 If the reverse-charge tax type settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` — the line still posts but is not flagged as reverse-charge on the accounting side.
 
+### Import purchase tax rates from Xero
+
+**Where:** **Settings > Accounting > Tax**, below the rates table. Xero is the tax-rate master, so IMS can create its own **Purchases** rates from the copy of Xero's tax-rate list that the hourly `xero-tax-rate-drift` job stores (the button never calls Xero and never writes to it).
+
+- **Preview** shows what **Import** would do and writes nothing; always preview first.
+- **Import** creates, for each of `INPUT2` (20% VAT on expenses), `ZERORATEDINPUT` and `NONE` that has no active rate usable for purchases, one active **Purchases** rate with Xero's name, rate and tax type. A type that Xero does not list as active, or does not allow on expenses, is refused by name and no rate is created. Running it again changes nothing.
+- **Also narrow "Both" rates whose Xero tax type is sales-only to Sales** (off by default): a rate such as *UK VAT* (`OUTPUT2`) then stops appearing on purchases. Only done together with a complete set of purchase rates.
+- **Also deactivate rates whose tax type Xero does not list as active** (off by default): for example the `TAX001`...`TAX032` country rates left over from a demo organisation. Without the box they are only listed. The default rate is never deactivated.
+- Nothing is deleted and no existing rate's percentage or tax type is changed (documents refer to them). It needs a stored list read within the last 26 hours for the organisation connected now; otherwise it says why (`XERO_LIST_STALE`, `XERO_LIST_MISSING`, ...).
+
 ### Generate missing accounting tax rates
 
 **Where:** the VAT rates screen itself — **Settings > Accounting > Tax** (the same page where you add and enable/disable rates). When an accounting connector is connected, a **Generate missing rates** button appears next to **Add VAT Rate**. This complements the **Xero drift** chips on each rate ("no matching rate in Xero").

@@ -115,8 +115,8 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   supplier_credit_notes: { kind: 'MUST_BE_EMPTY', reason: 'supplier credit notes' },
   supplier_products: { kind: 'RUNNER_WRITES', reason: 'price cache written by every purchase order' },
   suppliers: { kind: 'RUNNER_WRITES', reason: 'the supplier list' },
-  tax_rate_components: { kind: 'CONFIG_ALLOWED', reason: 'components of the tax rates' },
-  tax_rates: { kind: 'CONFIG_ALLOWED', reason: 'tax rates (checked by the tax rails)' },
+  tax_rate_components: { kind: 'RUNNER_WRITES', reason: 'components of the tax rates: written only with a purchase tax rate the suppliers step imports from the stored Xero list (db/tax-import.ts)' },
+  tax_rates: { kind: 'RUNNER_WRITES', reason: 'tax rates: the target brings its own (checked by the tax rails); the suppliers step may ADD a purchase rate imported from the stored Xero list when a supplier\'s purchase tax type has none (db/tax-import.ts)' },
   transit_subledger_movements: { kind: 'MUST_BE_EMPTY', reason: 'in-transit ledger' },
   users: { kind: 'CONFIG_ALLOWED', reason: 'operator accounts' },
   warehouses: { kind: 'CONFIG_ALLOWED', reason: 'the warehouses the load needs; configuration (their profile is checked by a rail)' },
@@ -141,7 +141,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   xero_tax_rates: { kind: 'CONFIG_ALLOWED', reason: 'the stored copy of Xero\'s tax-rate list (Xero is the master), refreshed by the tax-rate cron, not business data' },
 }
 
-/** RUNNER_WRITES tables that may hold rows on a first run: the audit trail (the application logs its own use) and the run record (it has its own rule). */
-export const FRESH_RUN_MAY_HOLD: ReadonlySet<string> = new Set(['activity_logs', 'first_load_apply_runs'])
+/** RUNNER_WRITES tables that may hold rows on a first run: the audit trail (the application logs its own use), the run record (it has its own rule) and the tax rates (the target's own configuration; the tax rails judge them). */
+export const FRESH_RUN_MAY_HOLD: ReadonlySet<string> = new Set(['activity_logs', 'first_load_apply_runs', 'tax_rates', 'tax_rate_components'])
 
 export const tablesOfKind = (kind: TableKind): string[] => Object.entries(TABLE_CLASSES).filter(([, c]) => c.kind === kind).map(([name]) => name).sort()

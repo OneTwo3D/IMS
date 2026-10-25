@@ -69,6 +69,9 @@ const unattributed = <T>(rows: T[], attributed: (row: T) => boolean): number => 
 export const ATTRIBUTION_RULES: Readonly<Record<string, Rule>> = {
   activity_logs: async () => 0,
   first_load_apply_runs: async () => 0,
+  // The target's own tax configuration, judged by the tax rails; the only rows the runner adds are the purchase rates imported from the stored Xero list (recorded as the run's fact purchaseTaxImport).
+  tax_rates: async () => 0,
+  tax_rate_components: async () => 0,
   suppliers: async (p) => {
     const f = factsOf(p)
     return unattributed(await db.supplier.findMany({ select: { name: true } }), (r) => f.suppliers.has(r.name.trim().toLowerCase()))
