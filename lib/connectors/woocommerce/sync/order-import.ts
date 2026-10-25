@@ -739,12 +739,9 @@ async function recordPendingFxOrder(
 }
 
 async function markPendingFxRetryLogSynced(logId: string, orderId: string): Promise<void> {
-  // A ROW THAT NAMES (OR IS ABOUT) A STORED RECEIPT IS NEVER RETIRED UNTIL THAT RECEIPT'S OBLIGATION IS PROVEN ON RECORD, at this moment and not at the moment a branch was planned: the row is
-  // re-read (a concurrent delivery may have recorded a receiptPaymentId on it since), every WooCommerce-recorded receipt of the order (and the named one) is proven or re-registered, and a
+  // A ROW THAT NAMES (OR IS ABOUT) A STORED RECEIPT IS NEVER RETIRED UNTIL THAT RECEIPT'S OBLIGATION IS PROVEN ON RECORD, at this moment and not at the moment a branch was planned: every WooCommerce-recorded receipt of the order (which includes one a concurrent delivery named on this row since) is proven or re-registered, and a
   // failure to prove throws WcReceiptRegistrationNotRecorded, which keeps the row PENDING. The write itself only retires a row that is still PENDING.
-  const current = await db.shoppingSyncLog.findUnique({ where: { id: logId }, select: { payload: true } })
-  const named = (current?.payload as { receiptPaymentId?: unknown } | null)?.receiptPaymentId
-  await redriveUnregisteredWcReceipts(orderId, typeof named === 'string' ? named : undefined)
+  await redriveUnregisteredWcReceipts(orderId)
   await db.shoppingSyncLog.updateMany({
     where: { id: logId, status: 'PENDING' },
     data: {
@@ -979,7 +976,7 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
-  await redriveUnregisteredWcReceipts(orderId, receiptPaymentId)
+  if (transition.kind === 'record' || wcOrder.date_paid_gmt || receiptPaymentId) await redriveUnregisteredWcReceipts(orderId, receiptPaymentId)
 }
 
 async function updateExistingWcOrderCore(
