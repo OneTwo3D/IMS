@@ -137,15 +137,17 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
       const [{ db }, { recordAccountingPostingRefusal }, { defaultPostingRefusalKind }] = await Promise.all([
         import('@/lib/db'), import('@/lib/domain/accounting/posting-refusal-inbox'), import('@/lib/domain/accounting/posting-refusal-kinds'),
       ])
-      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, key, {
-        kind: defaultPostingRefusalKind(key.type, key.referenceType),
+      // Same shape as accounting.ts recordRefusalIfAsked: the enqueue does not know which SITE called it, so it records the posting's default kind.
+      const given = {
         chartConnector: typeof data.connector === 'string' ? data.connector : null,
         activeConnector: typeof data.connector === 'string' ? data.connector : null,
         reason: RETIRED_TAX_CODE_REASON,
         committed: 'the document change that raised this posting is committed in IMS',
         remedy: 'The payload carried a tax code that a tax re-key retired. Nothing was queued; repeat the action (or re-send the document) so it is rebuilt from the current tax rates.',
         detail: { codes: retiredCodes },
-      })
+      }
+      const record = { ...given, kind: defaultPostingRefusalKind(key.type, key.referenceType) }
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, key, record)
     } catch { /* best effort: the throw below is the refusal; the inbox row is the operator's trail */ }
     throw new RetiredTaxCodeInPayloadError(retiredCodes)
   }
