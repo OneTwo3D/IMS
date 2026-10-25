@@ -270,8 +270,17 @@ function findTotalRows(rows: XeroReportRow[] | undefined, found: XeroReportRow[]
 }
 
 /** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row (both YTD columns, exactly; a cell with more than two decimal places is unreadable). */
-function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: TrialBalanceColumns, sums: YtdSums, refused: number): string | null {
+function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: TrialBalanceColumns, sums: YtdSums, refused: number, readRows: ParsedXeroTrialBalance['rows']): string | null {
   if (refused > 0) return 'a row was refused, so the rows read cannot be summed'
+  // An account id on more than one data row, configured or not, means the rows can add up to the Total with another account's
+  // row missing (a repeated row standing in for an omitted one), so the sum proves nothing.
+  const seen = new Set<string>()
+  for (const row of readRows) {
+    const id = row.externalAccountId
+    if (id === null || id === undefined) return 'a data row carries no account id'
+    if (seen.has(id)) return `account id ${id} appears on more than one data row`
+    seen.add(id)
+  }
   const totals = findTotalRows(entryRows)
   if (totals.length !== 1) return `the report has ${totals.length} "Total" summary rows (exactly one is required)`
   const cells = totals[0]!.Cells ?? []
@@ -329,8 +338,9 @@ export function parseXeroTrialBalanceReport(report: XeroTrialBalanceReport): Par
     }
     const sums: YtdSums = { debit: toDecimal(0), credit: toDecimal(0) }
     const refusedBefore = output.refusedRows.length
+    const rowsBefore = output.rows.length
     collectRows(entry.Rows, located.columns, output, sums)
-    const problem = completenessProblem(entry.Rows, located.columns, sums, output.refusedRows.length - refusedBefore)
+    const problem = completenessProblem(entry.Rows, located.columns, sums, output.refusedRows.length - refusedBefore, output.rows.slice(rowsBefore))
     if (problem) output.completenessUnproven ??= problem
   }
   if ((report.Reports ?? []).length === 0) output.completenessUnproven = 'the response has no report'

@@ -197,3 +197,14 @@ test('COMPLETENESS IS EXACT: sums that equal the Total exactly prove the omissio
   await pull()
   assert.deepEqual(proven().map((s) => s.accountCode).sort(), ['260', '500', '631', '632'])
 })
+
+// [mutation: the duplicate-id check restricted to configured accounts]
+test('COMPLETENESS: an account id repeated on two data rows (even an UNCONFIGURED one) proves nothing - the omitted configured account is withheld, not proven zero', async () => {
+  reset()
+  // 999 is repeated (200 in total) and stands in for the omitted configured 631; the sums still equal the Total exactly.
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '0'), row('a-999', '999 - Other', '100'), row('a-999', '999 - Other', '100'), row('a-998', '998 - Equity', '0', '200')], '200', '200')
+  const result = await pull()
+  assert.deepEqual(proven(), [])
+  assert.ok(result.errors.some((e) => e.includes('TB_COMPLETENESS_UNPROVEN') && e.includes('a-999')), JSON.stringify(result.errors))
+  assert.ok(!persisted.some((snapshot) => snapshot.accountCode === '631'), 'the omitted configured account is withheld')
+})
