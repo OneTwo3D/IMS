@@ -293,6 +293,8 @@ export function taxLookups(step: NonNullable<PreparedRun['steps'][number]>, rate
 /** The supplier-tax rail's codes: each names one refusal in its problem text and in docs/first-load-apply.md. */
 export const SUPPLIER_TAX_RATE_ABOVE_MAX = 'SUPPLIER_TAX_RATE_ABOVE_MAX'
 export const SUPPLIER_TAX_MAX_UNDECLARED = 'SUPPLIER_TAX_MAX_UNDECLARED'
+export const SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO = 'SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO'
+export const SUPPLIER_TAX_XERO_UNTRUSTED = 'SUPPLIER_TAX_XERO_UNTRUSTED'
 
 export interface SupplierTaxRailOptions {
   /** true: a type with no eligible rate is asked of the Xero import (a read-only plan) and passes when the import would create exactly one. false: such a type is refused outright. */
@@ -361,6 +363,19 @@ export async function supplierTaxRates(prepared: PreparedRun, problems: string[]
     }
   } else {
     say(none, 'supplier purchase tax type(s) match no active IMS tax rate usable for purchases')
+  }
+
+  // Xero is the tax-rate master: every resolved supplier default that already EXISTS is held to the trusted stored Xero row (rate column and effective rate). An untrusted list refuses.
+  // (A rate about to be imported is Xero's by construction; after the import it is checked here like any other.)
+  if (existing.length > 0) {
+    const { checkRatesAgainstXero, connectedXeroTenantId } = await import('@/lib/tax/purchase-tax-import')
+    const pct = (fraction: string): string => new D(fraction).times(100).toFixed(4)
+    const agreement = await checkRatesAgainstXero(db as never, new Date(), await connectedXeroTenantId(), existing.map((row) => ({ taxType: row.accountingTaxType!, rate: new D(row.rate.toFixed()).toFixed(4), effective: effectiveRate(row) })))
+    if (!agreement.ok) problems.push(`supplier tax [${SUPPLIER_TAX_XERO_UNTRUSTED}]: ${existing.length} supplier default tax rate(s) cannot be compared with Xero, the tax-rate master, because the stored Xero list is not usable (${agreement.refusal.code}); refresh it with the tax-rate job`)
+    else if (agreement.disagreements.length > 0) {
+      const say2 = agreement.disagreements.map((d) => `${d.taxType}: IMS ${pct(d.imsRate)}% (effective ${pct(d.imsEffective)}%), Xero ${d.xeroRate === null ? d.reason : `${pct(d.xeroRate)}%`}`).sort().join('; ')
+      problems.push(`supplier tax [${SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO}]: ${agreement.disagreements.length} supplier default tax rate(s) disagree with Xero, the tax-rate master (${say2}); correct them with "Import purchase tax rates from Xero" with replace-differing (Settings > Accounting > Tax)`)
+    }
   }
 
   // maxPurchaseTaxRate (manifest, carried on the prepared report): only the rates the suppliers will actually default to are held to it.

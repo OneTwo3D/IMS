@@ -19,6 +19,7 @@ import { loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './
 import { precondition } from './helpers'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-list'
+import { seedXeroList as seedTrustedList } from './apply-xero-list'
 
 /**
  * THE DATABASE SIDE OF THE FIRST-LOAD APPLY RUNNER, on a real throwaway PostgreSQL cluster with the migrations applied.
@@ -216,6 +217,8 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
     await db.taxRate.create({ data: { name: VAT_NAME, rate: '0.2', usedFor: 'PURCHASE', active: true } })
     // The one rate the suppliers' purchaseTaxType NONE resolves to (exactly one active purchase-capable rate carries it).
     await db.taxRate.create({ data: { name: 'ZQDB No VAT', rate: '0', usedFor: 'BOTH', accountingTaxType: 'NONE', active: true } })
+    // Xero is the tax-rate master: the supplier tax rail holds every existing supplier default rate to this stored list (INPUT2 20%, ZERORATEDINPUT 0%, NONE 0%).
+    await seedTrustedList(db)
     await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date(Date.now() - 3_600_000) } })
 
     // WooCommerce configured and enabled, so that an effect that is NOT suppressed leaves an outbox row behind; the control below proves it would.
@@ -1052,13 +1055,15 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
           assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0, 'exactly false is off')
           await m.db.setting.update({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft }, data: { value: 'true' } })
           await m.db.setting.update({ where: { key: 'mintsoft_api_key' }, data: { value: '' } })
-          // Xero: enabled with a stored token.
+          // Xero: enabled with a stored token. (The suite's own trusted Xero list carries a token row; this arm starts without one and restores it below.)
+          await m.db.accountingToken.deleteMany({})
           await m.db.setting.upsert({ where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.xero }, create: { key: INTEGRATION_PLUGIN_SETTING_KEYS.xero, value: 'true' }, update: { value: 'true' } })
           assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 0)
           await m.db.accountingToken.create({ data: { connector: 'xero', accessToken: 'a', refreshToken: 'r', expiresAt: new Date(Date.now() + 3_600_000), tenantId: 't' } })
           assert.equal(m.preload.connectorFinding(await m.preload.readConnectorSnapshot({})).problems.length, 1, 'a stored accounting token')
         } finally {
           await m.db.accountingToken.deleteMany({})
+          await seedTrustedList(m.db)
           await clearSettings(INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft, INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'mintsoft_api_key')
           if (original) await m.db.setting.update({ where: { key: wooKeys[0]! }, data: { value: original.value } })
         }
@@ -1373,7 +1378,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       //   change `matches.length === 1`-style check in rails supplierTaxRates to `=== 0` only -> the several-rates arm is green when it must be red.
       const ids: Record<string, string> = {}
       const addRate = async (key: string, data: { name: string; usedFor: string; active?: boolean; accountingTaxType: string }) => {
-        ids[key] = (await m.db.taxRate.create({ data: { rate: '0.2', ...data, active: data.active ?? true }, select: { id: true } })).id
+        ids[key] = (await m.db.taxRate.create({ data: { rate: data.accountingTaxType === 'INPUT2' ? '0.2' : '0', ...data, active: data.active ?? true }, select: { id: true } })).id
       }
       const load = async (rows: Array<Record<string, string>>) => {
         const file = stepRows(SUPPLIERS_IMPORT_HEADERS, rows)
@@ -1528,7 +1533,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         // The shape of stage: no INPUT2 and no ZERORATEDINPUT at all; NONE exists (ZQDB No VAT, BOTH) from the suite's own configuration.
         await m.db.taxRate.updateMany({ where: { accountingTaxType: { in: ['INPUT2', 'ZERORATEDINPUT'] } }, data: { active: false } })
       }
-      const cleanup = async () => { await wipeXero(); await m.db.taxRate.deleteMany({ where: { name: { startsWith: 'ZQXI ' } } }); await resetData() }
+      const cleanup = async () => { await wipeXero(); await m.db.taxRate.deleteMany({ where: { name: { startsWith: 'ZQXI ' } } }); await resetData(); await seedTrustedList(m.db) }
       const suppliersStub = (types: string[], max: string | null = '0.25') => {
         const rows = stepRows(SUPPLIERS_IMPORT_HEADERS, types.map((purchaseTaxType, i) => ({ name: `ZQXI Supplier ${i}`, currency: 'GBP', purchaseTaxType })))
         const report = { ...prepared.report, config: { ...prepared.report.config, maxPurchaseTaxRate: max } }
@@ -1634,11 +1639,49 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         } finally { await sql('drop trigger if exists zq_skip_tax_insert on tax_rates'); await sql('drop function if exists zq_skip_tax_insert()'); await cleanup() }
       })
 
+      // Mutations named (made, red, reverted): rails: drop the `existing.length > 0` comparison block -> every arm below is red; compare only the rate column (drop `fraction !== r.effective`) -> the components arm is red;
+      // treat an untrusted list as agreement (drop the `!agreement.ok` branch) -> the stale/missing arms are red; drop the `fraction !== r.rate` half -> the 15% arm is red.
+      it('an EXISTING supplier default rate must equal Xero\'s stored row (rate column and components): refused in the plan and in the apply, with the type and both percentages; equal passes; an untrusted list refuses', async (t) => {
+        await fresh()
+        try {
+          await seedXero(LIST())
+          const rate = await m.db.taxRate.create({ data: { name: 'ZQXI Existing Std', rate: '0.2', usedFor: 'PURCHASE', accountingTaxType: 'INPUT2', active: true }, select: { id: true } })
+          const stub = suppliersStub(['INPUT2'])
+          const rail = async () => (await evaluateRails(stub, { phase: 'preflight', resuming: false, step: null })).filter((p) => p.startsWith('supplier tax'))
+          assert.deepEqual(await rail(), [], 'control: 20% equals Xero\'s 20%')
+          // The rate column differs.
+          await m.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.15' } })
+          const differs = await rail()
+          assert.equal(differs.length, 1)
+          assert.match(differs[0]!, /^supplier tax \[SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO\]: 1 supplier default tax rate\(s\) disagree with Xero, the tax-rate master \(INPUT2: IMS 15\.0000% \(effective 15\.0000%\), Xero 20\.0000%\); correct them with "Import purchase tax rates from Xero" with replace-differing/)
+          const before = { rates: await count('tax_rates'), runs: await count('first_load_apply_runs'), suppliers: await count('suppliers') }
+          const planned = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), plan())
+          assert.equal(planned.exit, 'PRECONDITION_REFUSED', 'the plan reports it (read-only)')
+          assert.match(planned.problems.join(';'), /SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO/)
+          const applied = await runLoad(stub, m.ports.createDbPorts(stub, { preload: CLEAN_PRELOAD, operator: 'Apply Test' }), apply(stub))
+          assert.equal(applied.exit, 'PRECONDITION_REFUSED')
+          assert.match(applied.problems.join(';'), /INPUT2: IMS 15\.0000% .*Xero 20\.0000%/)
+          assert.deepEqual({ rates: await count('tax_rates'), runs: await count('first_load_apply_runs'), suppliers: await count('suppliers') }, before, 'nothing written')
+          // The column agrees but the components (what tax is computed from) do not.
+          await m.db.taxRate.update({ where: { id: rate.id }, data: { rate: '0.2' } })
+          const component = await m.db.taxRateComponent.create({ data: { taxRateId: rate.id, name: 'VAT', rate: '0.15', sortOrder: 0 } })
+          assert.match((await rail()).join(';'), /SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO.*INPUT2: IMS 20\.0000% \(effective 15\.0000%\), Xero 20\.0000%/)
+          await m.db.taxRateComponent.delete({ where: { id: component.id } })
+          assert.deepEqual(await rail(), [], 'restored: passes again')
+          // An untrusted list refuses (no silent pass): stale, then missing.
+          await seedXero(LIST(), { fetchedAt: new Date(Date.now() - 27 * 3_600_000) })
+          assert.match((await rail()).join(';'), /\[SUPPLIER_TAX_XERO_UNTRUSTED\].*\(XERO_LIST_STALE\)/)
+          await m.db.xeroTaxRateList.deleteMany({})
+          assert.match((await rail()).join(';'), /\[SUPPLIER_TAX_XERO_UNTRUSTED\].*\(XERO_LIST_MISSING\)/)
+          precondition(t, 'agreement arms', 6)
+        } finally { await cleanup() }
+      })
+
       it('maxPurchaseTaxRate is enforced on every supplier default rate: an existing rate, a rate about to be imported, and a manifest that declares none', async (t) => {
         await fresh()
         try {
           await seedXero(LIST())
-          const rail = async (stub: PreparedRun) => (await evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'suppliers' })).filter((p) => p.startsWith('supplier tax'))
+          const rail = async (stub: PreparedRun) => (await evaluateRails(stub, { phase: 'recheck', resuming: true, step: 'suppliers' })).filter((p) => p.startsWith('supplier tax') && !p.includes('DISAGREES_WITH_XERO'))
           assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.25')), [], 'control: 20% about to be imported is within 25%')
           assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.20')), [], 'control: equal to the ceiling is within it')
           assert.deepEqual(await rail(suppliersStub(['INPUT2'], '0.10')), ['supplier tax [SUPPLIER_TAX_RATE_ABOVE_MAX]: 1 supplier default tax rate(s) are above the maximum purchase tax rate the prepared report declares'])

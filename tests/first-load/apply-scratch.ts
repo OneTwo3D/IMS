@@ -12,6 +12,7 @@ import { freePort, startCluster, type Cluster } from '../scripts/real-postgres-c
 import { databaseUrl, ident, inheritedEnv, randomHex, runChild, socketPsql, tail, withClient } from '../../scripts/rehearse-first-install'
 import { RUNNER_APPLICATION_NAME } from '../../lib/first-load/apply/constants'
 import { WAREHOUSES } from './apply-helpers'
+import { seedXeroList } from './apply-xero-list'
 
 export const SETTINGS_KEY = 'prod_readiness_ci_settings_key__'
 export const VAT_NAME = 'ZQSCR VAT 20'
@@ -84,6 +85,8 @@ export async function startScratch(prefix: string, database = 'ims_scratch'): Pr
   await db.taxRate.create({ data: { name: VAT_NAME, rate: '0.2', usedFor: 'PURCHASE', active: true } })
   // The one rate the suppliers' purchaseTaxType NONE resolves to (exactly one active purchase-capable rate carries it).
   await db.taxRate.create({ data: { name: 'ZQSCR No VAT', rate: '0', usedFor: 'BOTH', accountingTaxType: 'NONE', active: true } })
+  // Xero is the tax-rate master: the supplier tax rail holds the rates above to its stored list.
+  await seedXeroList(db)
   await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date(Date.now() - 3_600_000) } })
   const { serializeSettingValue } = await import('@/lib/settings-store')
   const { INTEGRATION_PLUGIN_SETTING_KEYS } = await import('@/lib/integration-plugin-keys')

@@ -1504,6 +1504,7 @@ run that records tax-rate drift).
     suppliers and purchase lines that reference it. Refused (`NARROW_REQUIRES_PURCHASE_ROWS`) unless every purchase type is satisfied.
   - **Types not in the live list (opt-in).** An active rate whose tax type Xero does not list as active (for example leftover demo-organisation
     rates `TAX001`...) is **reported**; it is deactivated only with *deactivate* ticked, and never when it is the default rate. The default is report-only.
+  - **The first load checks existing rates against this list.** A supplier's existing default rate that differs from Xero's stored row is refused by the first load (`SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO`); run this action with *replace differing* to correct it.
   - **Never.** Nothing is deleted; an existing row's rate, type, name and components are never changed (documents reference rows: a different rate is a new row);
     a re-run changes nothing. The `accounting_reverse_charge_purchase_tax_type` setting is checked against the list and reported; no row is created for it.
 - **Used by** reconciliation-pack item R13 (the Xero leg), which reads the stored list in its own read-only snapshot. See

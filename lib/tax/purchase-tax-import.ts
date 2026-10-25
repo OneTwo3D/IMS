@@ -197,6 +197,45 @@ export const SALES_TAX_IMPORT_TYPES = ['OUTPUT2', 'ZERORATEDOUTPUT'] as const
 
 const fourDp = (d: InstanceType<typeof Prisma.Decimal>): string => d.toFixed(4)
 
+/** Percent text -> the four-decimal fraction text Decimal(5,4) holds exactly, or null. The one conversion of Xero's percentage to an IMS rate. */
+export function percentToFraction(percent: string): string | null {
+  const fraction = new Prisma.Decimal(percent).div(100)
+  return fraction.decimalPlaces() <= 4 && fraction.gte(0) && fraction.lt(10) ? fourDp(fraction) : null
+}
+
+export interface RateToCheck { taxType: string; /** Fraction, the rate column. */ rate: string; /** Fraction, the rate tax is computed from (the active components'). */ effective: string }
+export interface XeroDisagreement {
+  taxType: string
+  imsRate: string
+  imsEffective: string
+  /** Xero's percentage as a fraction; null when Xero states none or none that four decimals hold. */
+  xeroRate: string | null
+  reason: 'DIFFERS' | 'NOT_IN_XERO' | 'NOT_ACTIVE_IN_XERO' | 'NOT_STATED'
+}
+export type XeroAgreement = { ok: true; disagreements: XeroDisagreement[] } | { ok: false; refusal: PurchaseTaxImportRefusal }
+
+/**
+ * Hold IMS rates to the trusted stored Xero rows (the SAME list proof as the import: readStoredXeroList). Both the rate column and the effective rate must equal Xero's percentage.
+ * An unavailable or untrusted list is a refusal, never a pass. Read-only.
+ */
+export async function checkRatesAgainstXero(client: Client, now: Date, connectedTenantId: string | null, rates: readonly RateToCheck[]): Promise<XeroAgreement> {
+  const read = await readStoredXeroList(client, now, connectedTenantId)
+  if (!read.ok) return { ok: false, refusal: read.refusal }
+  const byType = new Map(read.list.rows.map((row) => [row.taxType, row] as const))
+  const disagreements: XeroDisagreement[] = []
+  for (const r of rates) {
+    const xero = byType.get(r.taxType)
+    const base = { taxType: r.taxType, imsRate: r.rate, imsEffective: r.effective }
+    if (!xero) { disagreements.push({ ...base, xeroRate: null, reason: 'NOT_IN_XERO' }); continue }
+    if (xero.status !== 'ACTIVE') { disagreements.push({ ...base, xeroRate: null, reason: 'NOT_ACTIVE_IN_XERO' }); continue }
+    const stated = xero.effectiveRate ?? xero.displayTaxRate
+    const fraction = stated === null ? null : percentToFraction(stated)
+    if (fraction === null) { disagreements.push({ ...base, xeroRate: null, reason: 'NOT_STATED' }); continue }
+    if (fraction !== r.rate || fraction !== r.effective) disagreements.push({ ...base, xeroRate: fraction, reason: 'DIFFERS' })
+  }
+  return { ok: true, disagreements }
+}
+
 function sameName(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase()
 }
@@ -206,10 +245,7 @@ export async function planPurchaseTaxImport(client: Client, options: PlanOptions
   const types = [...new Set(options.types ?? PURCHASE_TAX_IMPORT_TYPES)]
   const plan: PurchaseTaxImportPlan = { list: null, types, salesTypes: [], creates: [], present: [], refusals: [], narrow: [], notInXero: [], differs: [], unmapped: [], rateSet: [], notes: [] }
 
-  const toFraction = (percent: string): string | null => {
-    const fraction = new Dec(percent).div(100)
-    return fraction.decimalPlaces() <= 4 && fraction.gte(0) && fraction.lt(10) ? fourDp(fraction) : null
-  }
+  const toFraction = percentToFraction
 
   const existing = await client.taxRate.findMany({
     select: {

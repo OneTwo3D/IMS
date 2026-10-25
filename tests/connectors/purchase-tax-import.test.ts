@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  describeRefusals, planPurchaseTaxImport, readStoredXeroList, writePurchaseTaxImport,
+  checkRatesAgainstXero, describeRefusals, planPurchaseTaxImport, readStoredXeroList, writePurchaseTaxImport,
   type PurchaseTaxImportPlan,
 } from '@/lib/tax/purchase-tax-import'
 import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
@@ -331,4 +331,28 @@ test('the rate set lists every in-scope type with Xero\'s percentage and side; r
     ['ZERORATEDINPUT', 'PURCHASE', '0.000000', 'created'], ['ZERORATEDOUTPUT', 'SALES', '0.000000', 'present'],
   ])
   assert.deepEqual(p.unmapped.map((u) => [u.id, u.rate]), [['se', '0.2500']])
+})
+
+// [mutation: `fraction !== r.rate` dropped -> the column arm is red; `fraction !== r.effective` dropped -> the components arm is red; the NOT_IN_XERO / NOT_ACTIVE branches dropped -> their arms are red; the refusal return dropped -> the untrusted arms are red]
+test('checkRatesAgainstXero holds the rate column AND the effective rate to Xero\'s stored row, and an untrusted list is a refusal, never a pass', async () => {
+  const check = (state: State, rates: Array<{ taxType: string; rate: string; effective: string }>, tenant: string | null = TENANT) => checkRatesAgainstXero(client(state), NOW, tenant, rates)
+  const state: State = { rates: [], list: XERO_LIST }
+  const ok = await check(state, [{ taxType: 'INPUT2', rate: '0.2000', effective: '0.2000' }])
+  assert.deepEqual(ok, { ok: true, disagreements: [] })
+  const column = await check(state, [{ taxType: 'INPUT2', rate: '0.1500', effective: '0.2000' }])
+  assert.ok(column.ok && column.disagreements.length === 1 && column.disagreements[0]!.reason === 'DIFFERS' && column.disagreements[0]!.xeroRate === '0.2000')
+  const components = await check(state, [{ taxType: 'INPUT2', rate: '0.2000', effective: '0.1500' }])
+  assert.ok(components.ok && components.disagreements.length === 1, 'the column agrees, the components do not')
+  const absent = await check(state, [{ taxType: 'NOPE', rate: '0.2000', effective: '0.2000' }])
+  assert.ok(absent.ok && absent.disagreements[0]!.reason === 'NOT_IN_XERO')
+  const archived = await check({ rates: [], list: XERO_LIST.map((r) => (r.taxType === 'INPUT2' ? { ...r, status: 'ARCHIVED' as const } : r)) }, [{ taxType: 'INPUT2', rate: '0.2000', effective: '0.2000' }])
+  assert.ok(archived.ok && archived.disagreements[0]!.reason === 'NOT_ACTIVE_IN_XERO')
+  for (const [label, bad, tenant] of [
+    ['stale', { rates: [], list: XERO_LIST, fetchedAt: new Date(NOW.getTime() - DRIFT_MAX_STALENESS_MS - 1000), stamp: undefined } as State, TENANT],
+    ['missing', { rates: [], list: null } as State, TENANT],
+    ['not connected', state, null],
+  ] as const) {
+    const r = await check(bad, [{ taxType: 'INPUT2', rate: '0.2000', effective: '0.2000' }], tenant)
+    assert.equal(r.ok, false, label)
+  }
 })
