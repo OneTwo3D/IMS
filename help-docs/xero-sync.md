@@ -1509,6 +1509,15 @@ run that records tax-rate drift).
     a re-run changes nothing. The `accounting_reverse_charge_purchase_tax_type` setting is checked against the list and reported; no row is created for it.
 - **Used by** reconciliation-pack item R13 (the Xero leg), which reads the stored list in its own read-only snapshot. See
   *Reconciliation pack* in the installation guide.
+- **Custom tax codes differ per organisation: the re-key.** Xero numbers its custom tax types (`TAX001`...`TAXnnn`) per organisation, in creation order, so
+  the codes on IMS's per-country VAT rates (created against a Demo organisation) can mean other rates in the live one (live `TAX005` = *BG VAT*, IMS's `TAX005` =
+  *CY VAT*), and IMS posts a line's code. **Settings > Accounting > Tax > Re-key VAT rates** and `npm run tax:rekey` tie each active rate with a custom code
+  to the live type of the **same name** (never by code), `ACTIVE`, with exactly the same percentage (EffectiveRate, else DisplayTaxRate) and a consistent
+  country, from this stored list (proven as above). The plan is the preview and has a digest; the apply must quote it, runs in one transaction inside the
+  connection fence, creates a new rate with the live code, deactivates the old one (never edits it) and moves supplier defaults and WooCommerce mappings. Posted
+  documents keep the old rate. The sales invoice and the supplier bill read the code from the line's rate **when they are enqueued** (`enqueueSalesInvoiceSync`,
+  `createPurchaseInvoice`) and the queued payload carries `lines[].taxType` as a snapshot, so unposted orders refuse the apply unless re-pointed on request, and
+  queued payloads carrying the old code always refuse it. After it, the VAT difference report shows no `PERCENTAGE_MISMATCH_IMS_XERO` for the re-keyed rates.
 - **One VAT set: the difference report.** Owner ruling 2026-10-25: WooCommerce, IMS and Xero use the same set of VAT rates and Xero is the master.
   WooCommerce tax-rate writes are **operator-manual at P1** (the ownership map row `woocommerce` / `tax-rate`: P1 `operator-manual`, P2 `IMS`; IMS
   has no producer for it yet). To make the manual correction easy, **Settings > Accounting > Tax > VAT rate differences** and `npm run vat:diff`
