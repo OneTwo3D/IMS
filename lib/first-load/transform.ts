@@ -1314,11 +1314,29 @@ function loadPurchaseOrders(run: Run): void {
   }
   // The same purchase order line twice would DOUBLE the outstanding quantity. A line is identified by order, SKU and (when the export
   // has one) line number; two rows with the same identity are either an exported-twice row or a conflict, and either way all are rejected.
+  //
+  // THE ORDER OF THE LINE FILTERS (owner ruling 2026-10-25), top to bottom, each line meeting the first filter that decides it:
+  //   1. Non-open lines are set aside FIRST, before the duplicate check: a line whose status is CLOSED or CANCELLED (after the status value map), or whose
+  //      ordered quantity is not above its received quantity (fully or over received), takes no part in the duplicate check. It is reported further down as
+  //      NOT_OPEN, FULLY_RECEIVED or OVER_RECEIVED, never as a duplicate. A finished line repeated in the export cannot block the run.
+  //   2. The duplicate check (DUPLICATE_PO_LINE / DUPLICATE_PO_LINE_CONFLICT), over OPEN lines only: a repeated open line still refuses every copy.
+  //   3. The loop below: identity and format checks, status, quantities, NOT_OPEN / OVER_RECEIVED / FULLY_RECEIVED, the product, the supplier, the rate.
+  // A line whose status or quantities cannot be read is not "known non-open", so it stays in the duplicate check and is rejected for its bad value as before.
+  const notOpenBeforeDuplicateCheck = (row: CanonRow): boolean => {
+    const v = row.values
+    const status = v.status === '' ? 'OPEN' : v.status.toUpperCase()
+    if (status === 'CLOSED' || status === 'CANCELLED') return true
+    if (status !== 'OPEN') return false
+    const ordered = parseDecimal(v.qtyOrdered, 'qtyOrdered', NUMERIC_LIMITS.lineQty)
+    const received = parseDecimal(v.qtyReceived, 'qtyReceived', NUMERIC_LIMITS.lineQty)
+    return ordered.ok && received.ok && ordered.value.sub(received.value).lte(0)
+  }
   const dupInfo = new Map<CanonRow, { exact: boolean; count: number }>()
   const byIdentity = new Map<string, CanonRow[]>()
   for (const row of run.rows('purchase-order-lines')) {
     const parsed = parseSku(row.values.sku)
     if (row.values.orderKey === '' || !parsed.ok) continue
+    if (notOpenBeforeDuplicateCheck(row)) continue
     const identity = [row.values.orderKey, parsed.key].join('\u0000')
     byIdentity.set(identity, [...(byIdentity.get(identity) ?? []), row])
   }

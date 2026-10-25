@@ -353,14 +353,17 @@ function productsOf(spec: PartSpec, files: Files): QoblexProduct[] {
 const isNonNegativeDecimal = (value: string): boolean => { const d = parseDecimalStrict(value); return d !== null && !d.isNegative() }
 
 /**
- * The Incoming report as the lines it lists. Every line must be an OPEN one (the native map's only statuses), carry a plain non-negative
+ * The Incoming report as the lines it lists. Every line must be an OPEN one (the native map's statuses are Approved and PartiallyReceived, which are OPEN, and Closed, which is dropped, see below), carry a plain non-negative
  * ordered and received quantity with received not above ordered, and a plain non-negative price in the order's own currency. The lines of one order share one supplier (the importer refuses an order that does not). An order number or SKU is the exact text of the file (assertRawIdentities) and an order number
  * is a plain token (QOBLEX_PO_NUMBER_RE); the same (order, SKU) twice, or two order numbers that differ only in case, is DUPLICATE_KEY (never
  * summed, never picked between). Anything else is a closed reason and no line is returned.
  */
 function purchaseOrdersOf(spec: PoSpec, files: Files): QoblexPurchaseOrders {
   const ingested = ingest('purchase-order-lines', spec, files)
-  const lines = ingested.rows.map((row): QoblexPoLine => {
+  // A CLOSED line (the native map's "Closed" status) is a finished one: R7 and R8 compare only open orders, so it is dropped here, BEFORE the
+  // duplicate check below (a closed line repeated in the export must not refuse the whole run). Only the exact mapped value CLOSED is dropped; any
+  // other status that is not OPEN is still BAD_VALUE, and a duplicate among OPEN lines is still DUPLICATE_KEY.
+  const lines = ingested.rows.filter((row) => (row.values.status ?? '') !== 'CLOSED').map((row): QoblexPoLine => {
     const v = row.values
     const sku = parseSku(v.sku ?? '')
     if (!sku.ok) return bad('BAD_KEY')

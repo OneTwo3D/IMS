@@ -213,7 +213,9 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
  *   constants.destinationWarehouseCode MIL1   the report has no destination column; the pack never reads the warehouse of an order.
  *   (no currency column: the report has NO currency or rate, and neither the pack nor the pinned map carries a supplier-to-currency or currency-to-rate table.
  *   The currency of an order is the one IMS RECORDED on the purchase order, and its rate is the central fx_rates row (purchase-order-items.ts).)
- *   valueMaps.status Approved/PartiallyReceived -> OPEN   the only two statuses the incoming report lists; any other status is not mapped and
+ *   valueMaps.status Approved/PartiallyReceived -> OPEN, Closed -> CLOSED   the only statuses the incoming report lists (a closed line is a finished one:
+ *                                               the first-load tool excludes it as NOT_OPEN, the pack reads only open orders and DROPS it before its
+ *                                               duplicate check, qoblex-source.ts); any other status is not mapped and
  *                                               the pack refuses a row whose status is not OPEN (BAD_VALUE), it never drops it.
  *   dateFormats.createdOn/expectedDelivery    a date format for columns the pack does not read.
  * LIMITS: the foreign unit price is read as being in the currency IMS recorded on the matched purchase order; the report cannot confirm
@@ -262,7 +264,8 @@ export const QOBLEX_NATIVE_PO_COLUMN_MAP = `{
       "valueMaps": {
         "status": {
           "Approved": "OPEN",
-          "PartiallyReceived": "OPEN"
+          "PartiallyReceived": "OPEN",
+          "Closed": "CLOSED"
         }
       }
     }

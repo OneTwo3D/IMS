@@ -40,7 +40,8 @@
       "valueMaps": {
         "status": {
           "Approved": "OPEN",
-          "PartiallyReceived": "OPEN"
+          "PartiallyReceived": "OPEN",
+          "Closed": "CLOSED"
         }
       }
     }
