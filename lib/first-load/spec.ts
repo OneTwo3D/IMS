@@ -227,6 +227,7 @@ export const DATASET_NAMES = [
   'ims-skus',
   'ims-suppliers',
   'ims-tax-rates',
+  'ims-fx-rates',
 ] as const
 export type DatasetName = (typeof DATASET_NAMES)[number]
 
@@ -277,12 +278,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
   },
   'purchase-order-lines': {
     columns: [
-      'orderKey', 'supplierName', 'status', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'sku', 'lineNo', 'qtyOrdered', 'qtyReceived',
+      'orderKey', 'supplierName', 'status', 'createdOn', 'destinationWarehouseCode', 'sku', 'lineNo', 'qtyOrdered', 'qtyReceived',
       'unitCostForeign', 'taxRateName', 'taxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'notes',
     ],
-    required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign', 'currency'],
+    required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign'],
     sources: ['qoblex'],
-    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file).',
+    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file). The file carries NO currency and NO rate: an order\'s currency is the currency of its supplier in the same run\'s suppliers dataset, and a foreign order\'s rate is read from the ims-fx-rates list at the end of the `createdOn` day.',
   },
   transfers: {
     columns: ['transferKey', 'status', 'fromWarehouseCode', 'toWarehouseCode', 'sku', 'qtyShipped', 'qtyReceived', 'dispatchDate', 'notes'],
@@ -333,6 +334,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     required: ['name'],
     sources: [],
     purpose: 'The tax rates that already exist in the target IMS (name, accounting tax type, usedFor, active). Lets the tool resolve each supplier\'s purchase tax type to exactly one active purchase-capable IMS rate at prepare time. Omit it and that resolution is NOT checked here (the apply-time rail supplier-tax-rates still refuses). Always canonical.',
+  },
+  'ims-fx-rates': {
+    columns: ['currency', 'rate', 'fetchedAt'],
+    required: ['currency', 'rate', 'fetchedAt'],
+    sources: [],
+    purpose: 'The rows of IMS\'s fx_rates table (base to currency: 1 base = `rate` foreign; `fetchedAt` an ISO instant with a zone, e.g. 2026-10-20T06:00:00Z). The ONLY source of a foreign purchase order\'s rate: the transform applies the central lookup rule (the latest row at or before the end of the order\'s created day, UTC) over this list. Omit it and every foreign order is rejected (a rate is never taken from a file or defaulted). Always canonical.',
   },
   'ims-skus': {
     columns: ['sku', 'type'],

@@ -46,7 +46,7 @@ test('exit 0: the fixture run writes the five import files and the report; outpu
     compared++
   }
   precondition(t, 'golden files compared', compared)
-  assert.match(stdout, /TOTAL\s+67\s+60\s+7\s+0\s+0/, 'the accounting table is printed')
+  assert.match(stdout, /TOTAL\s+71\s+64\s+7\s+0\s+0/, 'the accounting table is printed')
   assert.match(stdout, /Verdict: PASS/)
 })
 

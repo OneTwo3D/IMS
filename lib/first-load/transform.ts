@@ -13,6 +13,7 @@
  * because "the report said 3 rows were bad" is exactly the failure this tool exists to prevent.
  */
 import { createHash } from 'node:crypto'
+import { endOfBusinessDateUtc, isMissingFxRateError, selectFxRateFromRows, type FxRateRow } from '@/lib/currencies/fx-select'
 import { Buffer } from 'node:buffer'
 import { parseCsv } from '@/lib/csv'
 import { parseCsvStrict, serializeCsv } from './csv'
@@ -325,6 +326,8 @@ class Run {
   imsSupplierCollidedKeys = new Set<string>()
   /** The IMS tax rates the ims-tax-rates list states (rows that passed validation), in file order. */
   imsTaxRates: Array<{ name: string; accountingTaxType: string; usedFor: string; active: boolean }> = []
+  /** The fx_rates rows the ims-fx-rates list states (rows that passed validation). */
+  imsFxRates: FxRateRow[] = []
   suppliers = new Map<string, { name: string; cells: Record<string, string> }>()
   supplierStatus = new Map<string, 'ok' | 'rejected'>()
   stockGroups = new Map<string, StockGroup>()
@@ -885,6 +888,24 @@ function purchaseRatesForTaxType(run: Run, taxType: string): string[] {
   return run.imsTaxRates.filter((r) => r.active && (r.usedFor === 'PURCHASE' || r.usedFor === 'BOTH') && r.accountingTaxType === taxType).map((r) => r.name)
 }
 
+/** The fx_rates rows the ims-fx-rates list states (base to currency), validated; the rule over them is the central one (lib/currencies/fx-select.ts). */
+function loadImsFxRates(run: Run): void {
+  for (const row of run.rows('ims-fx-rates')) {
+    const v = row.values
+    const currency = parseCurrency(v.currency)
+    const label = `${v.currency.trim() || '(blank)'}@${v.fetchedAt.trim()}`
+    const reject = (code: string, reason: string) => run.add('ims-fx-rates', row.line, label, 'REJECTED', code, reason)
+    if (!currency) { reject('BAD_CURRENCY', `currency ${JSON.stringify(v.currency)} is not a 3-letter code`); continue }
+    if (currency === run.config.baseCurrency) { reject('BASE_CURRENCY_RATE', `the base currency ${currency} has no fx_rates row`); continue }
+    const rate = v.rate.trim()
+    if (!/^-?\d+(?:\.\d+)?$/.test(rate)) { reject('BAD_RATE', `rate ${JSON.stringify(v.rate)} is not a plain decimal`); continue }
+    const at = v.fetchedAt.trim()
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/.test(at) || Number.isNaN(Date.parse(at))) { reject('BAD_FETCHED_AT', `fetchedAt ${JSON.stringify(v.fetchedAt)} is not an ISO instant with a zone (e.g. 2026-10-20T06:00:00Z)`); continue }
+    run.imsFxRates.push({ fromCurrency: run.config.baseCurrency, toCurrency: currency, rate, fetchedAt: new Date(at) })
+    run.add('ims-fx-rates', row.line, label, 'EMITTED', 'IMS_FX_RATE_REGISTERED', 'used to look up a foreign purchase order\'s rate at its created date')
+  }
+}
+
 function loadSuppliers(run: Run): void {
   type Candidate = { row: CanonRow; name: string; cells: Record<string, string> }
   const groups = new Map<string, Candidate[]>()
@@ -1342,10 +1363,6 @@ function loadPurchaseOrders(run: Run): void {
     if (!received.ok) { reject('BAD_QTY', received.reason); continue }
     const cost = parseDecimal(v.unitCostForeign, 'unitCostForeign', NUMERIC_LIMITS.unitCost)
     if (!cost.ok) { reject('BAD_UNIT_COST', cost.reason); continue }
-    const currency = parseCurrency(v.currency)
-    if (!currency) { reject('BAD_CURRENCY', `currency ${JSON.stringify(v.currency)} is not a 3-letter code`); continue }
-    const fx = resolveFx(currency, config.baseCurrency, v.fxRateToBase)
-    if (!fx.ok) { reject('BAD_FX', fx.reason); continue }
     let warehouse = ''
     if (v.destinationWarehouseCode !== '') {
       const w = parseWarehouse(v.destinationWarehouseCode, 'destinationWarehouseCode')
@@ -1402,27 +1419,43 @@ function loadPurchaseOrders(run: Run): void {
     if (res.lifecycle !== null && res.lifecycle !== 'ACTIVE' && res.lifecycle !== 'DRAFT') { reject('PRODUCT_NOT_PURCHASABLE', `SKU ${sku.sku} will be created as ${res.lifecycle}; createPurchaseOrder only accepts ACTIVE or DRAFT products`); continue }
     if (res.type === 'KIT' || res.type === 'VARIABLE') { reject('TYPE_CANNOT_BE_PURCHASED', `SKU ${sku.sku} is ${res.type}; it can never be received into stock`); continue }
 
-    let supplierName = v.supplierName.normalize('NFC').trim()
+    // THE ORDER'S CURRENCY IS ITS SUPPLIER'S (owner ruling 2026-10-25). The Qoblex Incoming report has no currency column, and the pinned map carries no
+    // supplier-to-currency table: the currency is that of the supplier row with the same name in THIS run's suppliers dataset, matched the way the
+    // purchase-order importer matches (trimmed, upper-cased: app/actions/import.ts supplierMap) after the suppliers' own collision rules in loadSuppliers
+    // (a colliding or rejected supplier is SUPPLIER_ROW_REJECTED). A supplier that is not in that dataset (an IMS-only supplier's currency is not known here)
+    // is SUPPLIER_NOT_IN_FILE. An order whose currency differs from its supplier's therefore cannot arise (it is not refused, because it cannot exist).
+    const supplierName = v.supplierName.normalize('NFC').trim()
     const supplierKey = supplierName.toUpperCase()
-    const inFile = run.has('suppliers') ? run.suppliers.get(supplierKey) : undefined
-    if (run.has('suppliers') && run.supplierStatus.get(supplierKey) === 'rejected') { reject('SUPPLIER_ROW_REJECTED', `supplier ${JSON.stringify(supplierName)}'s row in the suppliers dataset was rejected`); continue }
-    if (inFile) supplierName = inFile.name
-    else if (run.has('ims-suppliers')) {
-      // The importer matches by upper-case, so a different case of the one IMS spelling IS the supplier; only a colliding pair in IMS is ambiguous.
-      const known = run.imsSuppliers.get(supplierKey)
-      const ambiguous = run.imsSupplierCollidedKeys.has(supplierKey) || run.imsSupplierCollidedKeys.has(supplierName.toLowerCase())
-      if (known !== undefined && !ambiguous) supplierName = known
-      else { reject(ambiguous ? 'SUPPLIER_AMBIGUOUS_IN_IMS' : 'SUPPLIER_NOT_IN_FILE', ambiguous ? `supplier ${JSON.stringify(supplierName)} matches two suppliers already in IMS that the importers cannot tell apart` : `supplier ${JSON.stringify(supplierName)} is in neither the suppliers dataset nor the IMS supplier list`); continue }
-    } else if (run.has('suppliers')) { reject('SUPPLIER_NOT_IN_FILE', `supplier ${JSON.stringify(supplierName)} is not in the suppliers dataset`); continue }
+    if (run.supplierStatus.get(supplierKey) === 'rejected') { reject('SUPPLIER_ROW_REJECTED', `supplier ${JSON.stringify(supplierName)}'s row in the suppliers dataset was rejected`); continue }
+    const inFile = run.suppliers.get(supplierKey)
+    if (!inFile) { reject('SUPPLIER_NOT_IN_FILE', `supplier ${JSON.stringify(supplierName)} is not in the suppliers dataset of this run; the order's currency is its supplier's, read from that dataset`); continue }
+    const currency = (inFile.cells.currency ?? '').trim().toUpperCase()
+    if (!/^[A-Z]{3}$/.test(currency)) { reject('SUPPLIER_CURRENCY_MISSING', `supplier ${JSON.stringify(inFile.name)} has no usable currency in the suppliers dataset (after the supplier currency rule this cannot happen)`); continue }
+    let fxText = '1'
+    if (currency !== config.baseCurrency) {
+      // A foreign order's rate comes ONLY from fx_rates (epic one-fx): the central rule over the supplied ims-fx-rates rows at the end of the order's created day.
+      if (v.createdOn === '') { reject('MISSING_CREATED_DATE', `the order has no created date, so its ${currency} rate cannot be looked up`); continue }
+      const createdMs = parseIsoDate(v.createdOn)
+      if (createdMs === null) { reject('BAD_DATE', `createdOn ${JSON.stringify(v.createdOn)} is not YYYY-MM-DD`); continue }
+      if (!run.has('ims-fx-rates')) { reject('FX_RATES_NOT_SUPPLIED', `the order is in ${currency} and no ims-fx-rates list was supplied; a rate is only ever read from fx_rates, never from a file or defaulted`); continue }
+      let found: Dec
+      try {
+        found = new D(selectFxRateFromRows(run.imsFxRates, { baseCurrency: config.baseCurrency, currency, asOf: endOfBusinessDateUtc(new Date(createdMs)) }).rate.toFixed())
+      } catch (error) {
+        if (!isMissingFxRateError(error)) throw error
+        reject(error.reason === 'no_rate' ? 'FX_RATE_MISSING' : 'FX_RATE_UNUSABLE', `${error.message} (order created ${v.createdOn})`)
+        continue
+      }
+      const parsed = parseDecimal(found.toFixed(), 'fxRateToBase', NUMERIC_LIMITS.fx)
+      if (!parsed.ok) { reject('FX_RATE_UNUSABLE', `the stored ${currency} rate cannot be used: ${parsed.reason}`); continue }
+      fxText = fmt(parsed.value)
+    }
     tally.open++
     candidates.push({
-      row, orderKey: v.orderKey, sku: res.sku, key: sku.key, supplierName, currency, fxText: fx.text, warehouse,
+      row, orderKey: v.orderKey, sku: res.sku, key: sku.key, supplierName: inFile.name, currency, fxText, warehouse,
       pricesIncludeVat: vat, supplierRef: v.supplierRef, expectedDelivery: v.expectedDelivery, notes: v.notes,
       taxRateName: v.taxRateName, taxRateValue, qty: outstanding, unitCost: cost.value, ordered: ordered.value,
     })
-  }
-  if (!run.has('suppliers') && !run.has('ims-suppliers') && candidates.length > 0) {
-    run.find('WARNING', 'SUPPLIER_NAMES_UNCHECKED', 'neither a suppliers dataset nor an IMS supplier list was supplied, so purchase-order supplier names were NOT checked. The importer refuses a name that does not exist in IMS.', 'purchase-order-lines', [...new Set(candidates.map((c) => c.supplierName))])
   }
   run.poOrdersNothingOutstanding = [...fullyReceivedOrders.values()].filter((t) => t.open === 0 && t.closed > 0).length
 
@@ -1793,6 +1826,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   if (run.has('products')) checkRecipesPresent(run)
   loadImsSuppliers(run)
   loadImsTaxRates(run)
+  loadImsFxRates(run)
   loadSuppliers(run)
   loadStock(run)
   loadTransfers(run)

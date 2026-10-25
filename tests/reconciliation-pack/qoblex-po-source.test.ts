@@ -25,16 +25,15 @@ const withPo = (csv: string, extra: Parameters<typeof writeExport>[1] = {}) => w
 const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
 
 // [mutation: the repository's copy edited, a rate or currency table put back, or the pin test removed]
-test('the pack\'s native incoming-stock map IS the first-load tool\'s tested map with the currency and rate tables removed (and the currency constant XXX), and carries no rate', () => {
-  const tested = JSON.parse(readFileSync(path.join(nativeDir, 'maps/qoblex-incoming-stock.map.json'), 'utf8')) as { datasets: Record<string, { derived?: unknown; valueMaps: Record<string, unknown>; constants: Record<string, string> }> }
-  const d = tested.datasets['purchase-order-lines']!
-  assert.ok(d.derived !== undefined && 'fxRateToBase' in d.valueMaps && 'currency' in d.valueMaps, 'precondition: the tested map does carry the tables this pin removes')
-  delete d.derived
-  delete d.valueMaps.currency
-  delete d.valueMaps.fxRateToBase
-  d.constants.currency = 'XXX'
-  assert.equal(QOBLEX_NATIVE_PO_COLUMN_MAP, `${JSON.stringify(tested, null, 2)}\n`)
-  assert.ok(!/fxRateToBase|Supplier Alpha|"USD"|"EUR"|1\.25|1\.15/.test(QOBLEX_NATIVE_PO_COLUMN_MAP), 'no supplier, currency or rate table is in the pinned map')
+test('the pack\'s native incoming-stock map IS the first-load tool\'s tested map byte for byte, and neither carries a currency, supplier or rate table', () => {
+  const text = readFileSync(path.join(nativeDir, 'maps/qoblex-incoming-stock.map.json'), 'utf8')
+  assert.equal(QOBLEX_NATIVE_PO_COLUMN_MAP, text)
+  const d = (JSON.parse(text) as { datasets: Record<string, { derived?: unknown; columns: Record<string, string>; valueMaps: Record<string, unknown>; constants: Record<string, string> }> }).datasets['purchase-order-lines']!
+  assert.equal(d.derived, undefined)
+  assert.deepEqual(Object.keys(d.valueMaps), ['status'])
+  assert.deepEqual(Object.keys(d.constants), ['destinationWarehouseCode'])
+  assert.ok(!('currency' in d.columns) && !('fxRateToBase' in d.columns))
+  assert.ok(!/fxRateToBase|currency|Supplier Alpha|"USD"|"EUR"|1\.25|1\.15/.test(QOBLEX_NATIVE_PO_COLUMN_MAP), 'no supplier, currency or rate table is in the pinned map')
 })
 
 test('a well-formed incoming report reads: each line as written, the declared prefix, and the digest of every file', () => {
@@ -63,7 +62,7 @@ test('a manifest with no purchaseOrders part leaves that part SOURCE_UNREADABLE 
 
 // [mutation: the PO map accepted by anything but its digest / a missing map allowed / the stock map accepted for the incoming report]
 test('the incoming report accepts ONLY the native incoming-stock map: any other bytes, no map, or the stock map is COLUMN_MAP_NOT_NATIVE', () => {
-  for (const map of [`${QOBLEX_NATIVE_PO_COLUMN_MAP} `, QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"Approved": "OPEN"', '"Approved": "CLOSED"'), QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"currency": "XXX"', '"currency": "GBP"'), readFileSync(path.join(nativeDir, 'maps/qoblex-incoming-stock.map.json'), 'utf8'), readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')]) {
+  for (const map of [`${QOBLEX_NATIVE_PO_COLUMN_MAP} `, QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"Approved": "OPEN"', '"Approved": "CLOSED"'), QOBLEX_NATIVE_PO_COLUMN_MAP.replace('"destinationWarehouseCode": "MIL1"', '"destinationWarehouseCode": "MIL1",\n        "currency": "GBP"'), readFileSync(path.join(nativeDir, 'maps/qoblex-incoming-stock.map.json'), 'utf8'), readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')]) {
     assert.notEqual(map, QOBLEX_NATIVE_PO_COLUMN_MAP)
     assert.equal(poReason(writeExport(bases, { purchaseOrders: { map } })), 'COLUMN_MAP_NOT_NATIVE')
   }

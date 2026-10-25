@@ -18,6 +18,7 @@
     { "dataset": "woo-products", "file": "woocommerce/products.csv", "columnMap": "maps/woocommerce.map.json" },
     { "dataset": "sku-exclusions", "file": "canonical/sku-exclusions.csv" },
     { "dataset": "ims-skus", "file": "canonical/ims-skus.csv" },
-    { "dataset": "ims-tax-rates", "file": "canonical/ims-tax-rates.csv" }
+    { "dataset": "ims-tax-rates", "file": "canonical/ims-tax-rates.csv" },
+    { "dataset": "ims-fx-rates", "file": "canonical/ims-fx-rates.csv" }
   ]
 }

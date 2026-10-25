@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ConfigError } from '../../lib/first-load/transform.ts'
 import { parseCsv } from '../../lib/csv.ts'
-import { dispositionCodes, ds, findingCodes, loadFixtureDatasets, lot, precondition, product, rowsOf, run } from './helpers.ts'
+import { dispositionCodes, ds, findingCodes, loadFixtureDatasets, lot, precondition, product, rowsOf, run, runBare } from './helpers.ts'
 
 const rejectedCodes = (result: ReturnType<typeof run>, dataset: string) => dispositionCodes(result, dataset, 'REJECTED')
 
@@ -78,18 +78,12 @@ test('decimals: unit costs beyond 15 significant digits (a double would round th
   assert.deepEqual(rejectedCodes(result, 'purchase-order-lines'), ['BAD_UNIT_COST'])
 })
 
-test('currency: fxRateToBase is required for a non-base currency on lots and on purchase orders; for the base it must be 1 or blank', (t) => {
+test('currency: fxRateToBase is required for a non-base currency on lots; for the base it must be 1 or blank (a purchase order has no file rate: see po-currency-from-supplier.test.ts)', (t) => {
   const stock = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'stock-lots': ds('stock-lots', [lot('A', '1', '2', extra)]) })
-  const po = (extra: Record<string, string>) => run({
-    products: ds('products', [product('A')]),
-    'purchase-order-lines': ds('purchase-order-lines', [{ orderKey: 'O1', supplierName: 'S', sku: 'A', qtyOrdered: '2', qtyReceived: '0', unitCostForeign: '1', currency: 'GBP', ...extra }]),
-  })
-  precondition(t, 'cases', 6)
+  precondition(t, 'cases', 4)
   assert.deepEqual(rejectedCodes(stock({ currency: 'EUR' }), 'stock-lots'), ['BAD_FX'])
   assert.deepEqual(rejectedCodes(stock({ currency: 'GBP', fxRateToBase: '2' }), 'stock-lots'), ['BAD_FX'])
   assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', fxRateToBase: '0' }), 'stock-lots'), ['BAD_FX'])
-  assert.deepEqual(rejectedCodes(po({ currency: 'USD' }), 'purchase-order-lines'), ['BAD_FX'])
-  assert.deepEqual(rejectedCodes(po({ currency: 'gb' }), 'purchase-order-lines'), ['BAD_CURRENCY'])
   const ok = stock({ currency: 'EUR', fxRateToBase: '1.25' })
   assert.equal(ok.blocking, false)
   assert.equal(rowsOf(ok, 'opening-stock')[0].unitCostBase, '1.600000', 'the rate is foreign units per ONE base unit, as in the purchase-order importer: base cost = cost / rate')
@@ -170,7 +164,15 @@ test('load order: parents and components never come after the rows that need the
   assert.deepEqual(result.report.selfCheckFailures, [])
 })
 
-const poLine = (extra: Record<string, string>) => ({ orderKey: 'O1', supplierName: 'Acme', sku: 'A', qtyOrdered: '10', qtyReceived: '0', unitCostForeign: '2.5', currency: 'GBP', ...extra })
+/** A run whose purchase orders are in foreign currencies: one supplier per currency (named `S-<code>`), and the given fx_rates rows (currency, rate, fetchedAt). */
+const foreignRun = (currencies: string[], rates: Array<[string, string]>, lines: Array<Record<string, string>>, at = '2026-01-01T00:00:00Z') => run({
+  products: ds('products', [product('A')]),
+  suppliers: ds('suppliers', currencies.map((c) => ({ name: `S-${c}`, currency: c }))),
+  'ims-fx-rates': ds('ims-fx-rates', rates.map(([currency, rate]) => ({ currency, rate, fetchedAt: at }))),
+  'purchase-order-lines': ds('purchase-order-lines', lines),
+})
+
+const poLine = (extra: Record<string, string>) => ({ orderKey: 'O1', supplierName: 'Acme', sku: 'A', qtyOrdered: '10', qtyReceived: '0', unitCostForeign: '2.5', ...extra })
 
 test('purchase orders: only the outstanding quantity is loaded, never negative, and anomalies are reported', (t) => {
   const result = run({
@@ -192,7 +194,9 @@ test('purchase orders: only the outstanding quantity is loaded, never negative, 
 test('purchase orders: inconsistent order-level fields, unknown suppliers, KIT lines and bad dates are rejected', (t) => {
   const inconsistent = run({
     products: ds('products', [product('A'), product('B')]),
-    'purchase-order-lines': ds('purchase-order-lines', [poLine({ sku: 'A' }), poLine({ sku: 'B', currency: 'EUR', fxRateToBase: '0.9' })]),
+    'purchase-order-lines': ds('purchase-order-lines', [poLine({ sku: 'A' }), poLine({ sku: 'B', createdOn: '2026-09-20' })]),
+    suppliers: ds('suppliers', [{ name: 'Acme', currency: 'EUR' }]),
+    'ims-fx-rates': ds('ims-fx-rates', [{ currency: 'EUR', rate: '1.1', fetchedAt: '2026-09-10T00:00:00Z' }, { currency: 'EUR', rate: '0.9', fetchedAt: '2026-09-18T00:00:00Z' }]),
   })
   const other = run({
     products: ds('products', [product('A'), product('K', 'KIT'), product('P')]),
@@ -209,11 +213,10 @@ test('purchase orders: inconsistent order-level fields, unknown suppliers, KIT l
   assert.deepEqual(rejectedCodes(other, 'purchase-order-lines').sort(), ['BAD_DATE', 'SUPPLIER_NOT_IN_FILE', 'TYPE_CANNOT_BE_PURCHASED'])
 })
 
-test('purchase orders: without a suppliers dataset the names are unchecked and the report says so', (t) => {
-  const result = run({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) })
+test('purchase orders: without a suppliers dataset the order has no currency to take, so every line is rejected SUPPLIER_NOT_IN_FILE', (t) => {
+  const result = runBare({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) })
   precondition(t, 'lines', 1)
-  assert.equal(result.blocking, false)
-  assert.ok(findingCodes(result, 'WARNING').includes('SUPPLIER_NAMES_UNCHECKED'))
+  assert.deepEqual(rejectedCodes(result, 'purchase-order-lines'), ['SUPPLIER_NOT_IN_FILE'])
 })
 
 test('transfers: draft and fully received transfers are excluded; contradictory statuses and same-warehouse rows are rejected', (t) => {
@@ -367,13 +370,15 @@ test('purchase order values: a line total, an order total (tax included) or a ba
   const order = (key: string, extra: Record<string, string>) => poLine({ orderKey: key, sku: 'A', ...extra })
   const result = run({
     products,
+    suppliers: ds('suppliers', [{ name: 'Acme' }, { name: 'S-XAA', currency: 'XAA' }, { name: 'S-XAB', currency: 'XAB' }, { name: 'S-XAC', currency: 'XAC' }]),
+    'ims-fx-rates': ds('ims-fx-rates', [{ currency: 'XAA', rate: '0.0001', fetchedAt: '2026-01-01T00:00:00Z' }, { currency: 'XAB', rate: '1000', fetchedAt: '2026-01-01T00:00:00Z' }, { currency: 'XAC', rate: '0.001', fetchedAt: '2026-01-01T00:00:00Z' }]),
     'purchase-order-lines': ds('purchase-order-lines', [
       order('BIG', { qtyOrdered: '99999999', unitCostForeign: '999999999' }),
       order('TAX', { qtyOrdered: '1000000', unitCostForeign: '99999999' }),
-      order('FXC', { qtyOrdered: '1', unitCostForeign: '900000000', currency: 'USD', fxRateToBase: '0.0001' }),
+      order('FXC', { qtyOrdered: '1', unitCostForeign: '900000000', supplierName: 'S-XAA' }),
       order('HIGHTAX', { qtyOrdered: '1', unitCostForeign: '1', taxRateValue: '30' }),
-      order('FOREIGN', { qtyOrdered: '1000000', unitCostForeign: '999999999', currency: 'EUR', fxRateToBase: '1000' }),
-      order('BASE', { qtyOrdered: '99999999', unitCostForeign: '100000', currency: 'USD', fxRateToBase: '0.001' }),
+      order('FOREIGN', { qtyOrdered: '1000000', unitCostForeign: '999999999', supplierName: 'S-XAB' }),
+      order('BASE', { qtyOrdered: '99999999', unitCostForeign: '100000', supplierName: 'S-XAC' }),
       order('OK', { qtyOrdered: '1000', unitCostForeign: '1000' }),
     ]),
   })
@@ -385,7 +390,7 @@ test('purchase order values: a line total, an order total (tax included) or a ba
 
 test('FX direction: the purchase-order importer DIVIDES by fxRateToBase, so the same order fits at a high rate and overflows at a low one', (t) => {
   const products = ds('products', [product('A')])
-  const at = (rate: string) => run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ orderKey: 'D', sku: 'A', qtyOrdered: '1000000', unitCostForeign: '20000000', currency: 'USD', fxRateToBase: rate })]) })
+  const at = (rate: string) => foreignRun(['XAA'], [['XAA', rate]], [poLine({ orderKey: 'D', sku: 'A', supplierName: 'S-XAA', qtyOrdered: '1000000', unitCostForeign: '20000000' })])
   const high = at('1000')
   const low = at('0.001')
   precondition(t, 'rates compared', 2)
@@ -404,10 +409,10 @@ test('the declared worst-case purchase tax rate is required with purchase orders
 })
 
 test('importer rejection sweep: every emitted number is checked against the scale it is STORED at, and rejected rather than rounded', (t) => {
-  const po = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({ currency: 'USD', fxRateToBase: '1.25', ...extra })]) })
+  const po = (extra: Record<string, string>) => foreignRun(['XAA'], [['XAA', extra.fx ?? '1.25']], [poLine({ supplierName: 'S-XAA', ...Object.fromEntries(Object.entries(extra).filter(([k]) => k !== 'fx')) })])
   const prod = (extra: Record<string, string>) => run({ products: ds('products', [product('A', 'SIMPLE', extra)]) })
   const cases: Array<[string, ReturnType<typeof run>, string]> = [
-    ['fx 9 dp (stored Decimal(18,8))', po({ fxRateToBase: '0.000000011' }), 'BAD_FX'],
+    ['fx 9 dp (stored Decimal(18,8))', po({ fx: '0.000000011' }), 'FX_RATE_UNUSABLE'],
     ['tax fraction 5 dp (stored Decimal(5,4))', po({ taxRateValue: '0.12345' }), 'TAX_RATE_PRECISION'],
     ['weight 5 dp (Decimal(10,4))', prod({ weight: '1.00001' }), 'BAD_NUMBER'],
     ['dimension 3 dp (Decimal(10,2))', prod({ widthCm: '1.001' }), 'BAD_NUMBER'],
@@ -419,7 +424,7 @@ test('importer rejection sweep: every emitted number is checked against the scal
     const codes = result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => d.code)
     assert.ok(codes.includes(code), `${name}: ${JSON.stringify(codes)}`)
   }
-  const ok = po({ fxRateToBase: '0.00000001', taxRateValue: '0.1234' })
+  const ok = po({ fx: '0.00000001', taxRateValue: '0.1234' })
   assert.equal(ok.blocking, false, 'the stored scale itself is accepted (8 dp rate, 4 dp tax fraction)')
   assert.ok(prod({ weight: '1.0001', widthCm: '1.01', salesPriceBase: '1.0001' }).blocking === false)
 })
@@ -557,12 +562,11 @@ test('supplier names versus suppliers already in IMS: a collision under either i
   assert.ok(check?.note.includes('NOT checked'))
 })
 
-test('purchase order supplier names resolve against the IMS supplier list when no suppliers file names them', (t) => {
-  const po = (name: string, imsNames: string[]) => run({ products: ds('products', [product('A')]), 'ims-suppliers': ds('ims-suppliers', imsNames.map((n) => ({ name: n }))), 'purchase-order-lines': ds('purchase-order-lines', [poLine({ supplierName: name })]) })
-  precondition(t, 'cases', 3)
-  assert.equal(po('acme', ['Acme']).blocking, false)
+test('a supplier that exists only in IMS is not enough for a purchase order: its currency is read from the suppliers dataset of the run (SUPPLIER_NOT_IN_FILE)', (t) => {
+  const po = (name: string, imsNames: string[]) => runBare({ products: ds('products', [product('A')]), 'ims-suppliers': ds('ims-suppliers', imsNames.map((n) => ({ name: n }))), 'purchase-order-lines': ds('purchase-order-lines', [poLine({ supplierName: name })]) })
+  precondition(t, 'cases', 2)
+  assert.deepEqual(rejectedCodes(po('Acme', ['Acme']), 'purchase-order-lines'), ['SUPPLIER_NOT_IN_FILE'])
   assert.deepEqual(rejectedCodes(po('Nobody', ['Acme']), 'purchase-order-lines'), ['SUPPLIER_NOT_IN_FILE'])
-  assert.equal(rowsOf(po('acme', ['Acme']), 'purchase-orders')[0].supplierName, 'Acme', 'the IMS spelling is written')
 })
 
 const BLANKISH = ['', ' ', '\t', '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u00a0', '\u2003', ' \u200b ', '\u3000']

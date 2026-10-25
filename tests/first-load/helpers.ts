@@ -14,10 +14,19 @@ export function ds(name: DatasetName, rows: Array<Record<string, string>>, file 
   // A supplier row must state its currency and purchase tax type (the transform refuses a blank, MISSING_CURRENCY / MISSING_PURCHASE_TAX_TYPE). Tests that are about something
   // else need not repeat them, so an ABSENT key takes GBP / NONE here; a test about the refusal passes the key with an empty value, which is kept as written.
   if (name === 'suppliers') rows = rows.map((row) => ({ ...('currency' in row ? {} : { currency: 'GBP' }), ...('purchaseTaxType' in row ? {} : { purchaseTaxType: 'NONE' }), ...row }))
+  // A purchase order line carries no currency or rate (its supplier's currency and the fx_rates list decide them); a test about the date passes createdOn itself, any other takes this one.
+  if (name === 'purchase-order-lines') rows = rows.map((row) => ({ createdOn: '2026-09-15', ...row }))
   const header = spec.columns.filter((column) => spec.required.includes(column) || rows.some((row) => column in row))
   const text = serializeCsv(header, rows.map((row) => header.map((column) => row[column] ?? '')))
   return ingestDataset(name, new TextEncoder().encode(text), file, null)
 }
+
+/** An fx_rates list for the tests: GBP base; EUR 1.25 and USD 1.3 from 2026-09-10, so any order created on or after that day finds a rate. */
+export const FX_RATES_ROWS = [
+  { currency: 'EUR', rate: '1.25', fetchedAt: '2026-09-10T06:00:00Z' },
+  { currency: 'USD', rate: '1.3', fetchedAt: '2026-09-10T06:00:00Z' },
+  { currency: 'JPY', rate: '190', fetchedAt: '2026-09-10T06:00:00Z' },
+]
 
 export function config(overrides: Partial<PrepareConfig> = {}): PrepareConfig {
   return {
@@ -37,6 +46,19 @@ export function run(datasets: Partial<Record<DatasetName, IngestedDataset>>, ove
   // variant-parents dataset gets a binding for exactly the bytes it was read from.
   const vp = datasets['variant-parents']
   const variantParentsBinding: VariantParentsBinding | undefined = vp ? { verified: true, csvSha256: vp.parts[0].sha256, snapshotPayloadSha256: 'test-stub' } : undefined
+  // A purchase order takes its currency from its supplier in the same run and a foreign one its rate from the fx_rates list. A run that supplies no suppliers dataset
+  // gets one GBP supplier per name the order lines use, and one that supplies no rate list gets the standard one; `runBare` adds neither.
+  const po = datasets['purchase-order-lines']
+  let withDefaults = datasets
+  if (po && !datasets.suppliers) {
+    const names = [...new Set(po.rows.map((r) => r.values.supplierName.trim()).filter((n) => n !== ''))]
+    withDefaults = { ...withDefaults, suppliers: ds('suppliers', names.map((name) => ({ name }))) }
+  }
+  if (po && !datasets['ims-fx-rates']) withDefaults = { ...withDefaults, 'ims-fx-rates': ds('ims-fx-rates', FX_RATES_ROWS) }
+  return runBare(withDefaults, overrides, variantParentsBinding)
+}
+
+export function runBare(datasets: Partial<Record<DatasetName, IngestedDataset>>, overrides: Partial<PrepareConfig> = {}, variantParentsBinding?: VariantParentsBinding): PrepareResult {
   return prepare({ config: config(overrides), datasets, variantParentsBinding })
 }
 
