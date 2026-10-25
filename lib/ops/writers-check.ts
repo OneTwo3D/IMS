@@ -125,6 +125,7 @@ export const WRITERS_WITHOUT_IMS_SWITCH: Readonly<Record<string, string>> = {
   'woocommerce.order.withdrawal-outcome': 'the endpoint lives in the storefront plugin; IMS only receives',
   'woocommerce.order.trackship-reconcile': 'the endpoint lives in the storefront plugin; IMS only receives',
   'woocommerce.order.invoice-document': 'IMS has no writer for it yet',
+  'woocommerce.tax-rate': 'IMS has no writer for it yet (P1: the owner corrects WooCommerce by hand from the VAT difference report; the P2 writer is a later build)',
 }
 
 export function writersCheckSettingKeys(): string[] {

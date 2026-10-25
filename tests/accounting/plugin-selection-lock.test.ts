@@ -1128,6 +1128,10 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // from the app's pooled client. It is READ ONLY by construction (the mode is read back, and nothing runs if it did
   // not take), so it cannot write `settings` and cannot move a plugin key.
   'lib/reconciliation-pack/read-tx.ts': 'runtime-assembled-sql',
+  // The VAT difference report (`npm run vat:diff`, Settings > Tax). Its transaction runs the constant `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`
+  // first and `SHOW transaction_read_only` (nothing is read unless it says on); the database refuses any write in it, so it cannot write `settings`
+  // and cannot move a plugin key. Its own pg connection only reads the stored storefront credentials (reconciliation-pack/woo-credentials.ts).
+  'lib/tax/vat-difference-run.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',

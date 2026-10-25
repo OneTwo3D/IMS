@@ -597,6 +597,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'The same Xero can-apply-to-revenue flag, read from the stored tax-rate list to decide whether a Xero tax type may be mirrored as a sales rate. A boolean on a tax-rate definition; no refund moves it.',
   },
   {
+    file: 'lib/tax/vat-difference-report.ts',
+    figures: ['revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Reads the same Xero can-apply-to-revenue flag from the stored tax-rate list to check that a rate is used only on a side its Xero type allows. A boolean on a tax-rate definition, reported as text in a difference row; no refund moves it.',
+  },
+  {
     file: 'scripts/shadow-reader-census.ts',
     figures: ['accounting_revenue_deferred_batch_ref', 'accounting_revenue_deferred_date', 'revenueDeferredBatchRef', 'revenueDeferredDate'],
     treatment: 'not-refund-sensitive',

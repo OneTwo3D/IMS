@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### VAT difference report: Xero, IMS and WooCommerce on one set of VAT rates (read-only)
+
+- **New: `npm run vat:diff` and Settings > Accounting > Tax > VAT rate differences.** Compares the stored, proven Xero tax-rate list, the IMS rates (with components and the WooCommerce mappings) and WooCommerce's `GET /taxes` (every page, through the reconciliation pack's GET-only transport) and lists each difference with a closed reason code (missing in IMS, Xero or WooCommerce, percentage mismatch with both values, inactive in Xero, IMS rate with no Xero type, WooCommerce rate with no mapping, ambiguous mapping, country, class, compound or shipping mismatch), as four reports (UK, IOSS, VOEC, other foreign; `--scheme`) plus a visible unclassified section. A Xero type is present in IMS only on a side an active rate usable on that side carries it (Sales needs a revenue type, Purchases an expenses type). Regional WooCommerce rates are compared like any other rate (the region is shown as information); shipping must carry the goods' rate. A stale or untrusted Xero list, or a WooCommerce read that fails, refuses the report instead of saying "no differences". Writes nothing anywhere.
+- **New: ownership row `woocommerce` / `tax-rate`: P1 operator-manual, P2 IMS** (owner ruling 2026-10-25). At P1 the owner corrects WooCommerce by hand from the report. No producer exists yet.
+
 ### Tax rates: import the purchase rates from Xero's stored list; the first load imports before it refuses
 
 - **New: Settings > Accounting > Tax > Import purchase tax rates from Xero.** Creates the missing active Purchases rate for each of `INPUT2`, `ZERORATEDINPUT` and `NONE` from the stored Xero tax-rate list (name, exact rate, components, tax type). Never calls or writes to Xero, never invents a rate, never deletes a row and never changes an existing row's rate or type; a re-run changes nothing. A type Xero does not list, does not mark `ACTIVE` or does not allow on expenses is refused by name and gets no row. Opt-in: narrow sales-only "Both" rates to Sales, and deactivate rates whose type Xero does not list as active (default: report only). Needs a stored list that is intact, stamped, read within 26 hours and for the connected organisation.

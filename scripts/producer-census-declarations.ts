@@ -52,6 +52,7 @@ export const NO_PRODUCER: Readonly<Record<string, string>> = {
   'woocommerce.order.withdrawal-outcome': 'Owner answer 6: the endpoint stays in the WooCommerce withdrawal plugin; IMS only RECEIVES the outcome through an authenticated API, so IMS has no outbound producer for it.',
   'woocommerce.order.trackship-reconcile': 'Owner answer 6: the endpoint stays in the TrackShip plugin; IMS only receives TrackShip events through an authenticated API, so IMS has no outbound producer for it.',
   'woocommerce.order.invoice-document': 'Owner answer 4: IMS will put the invoice into the customer\'s My Account at P2, but that producer is not written yet; there is no call site in this repo.',
+  'woocommerce.tax-rate': 'Owner ruling 2026-10-25: at P1 the owner corrects WooCommerce tax rates by hand from the read-only VAT difference report; IMS writes them from P2, but that producer is a later build and has no call site in this repo.',
 }
 
 export const DECLARATIONS: readonly Declaration[] = [

@@ -1,0 +1,424 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
+import { DRIFT_MAX_STALENESS_MS } from '@/lib/domain/accounting/tax-rate-drift-status'
+import { readWooTaxRateDetails, type WooGetPort, type WooPage, type WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
+import { wooHopRefusal } from '@/lib/reconciliation-pack/woo-transport'
+import { VAT_DIFFERENCE_REASONS, VAT_DIFFERENCE_REASON_LIST, compareVatSets, type ImsRateRow, type ImsXeroSnapshot, type VatDifferenceReason } from '@/lib/tax/vat-difference-report'
+import { runVatDifferenceReport, type VatRunDb } from '@/lib/tax/vat-difference-run'
+import { VAT_DIFF_EXIT_CODES, parseVatDiffArgs, vatDiffExitCode, vatDiffJson } from '@/lib/tax/vat-difference-cli'
+import { classifyImsRate, classifyWooRate, classifyXeroType } from '@/lib/tax/vat-scheme'
+import { WRITER_OWNERSHIP_MAP } from '@/lib/security/writer-ownership-map'
+import { runVatDiffCli } from '../../scripts/vat-difference-report'
+
+/**
+ * THE VAT DIFFERENCE REPORT (lib/tax/vat-difference-report.ts, vat-difference-run.ts, vat-difference-cli.ts). Pure comparison over fixtures, the
+ * trusted-list refusals over an in-memory client, the Woo walk over a fake GET-only port, and the CLI with doubles. Each guard has a
+ * `[mutation: ...]` line: the change that turns its arm red (made, seen red, reverted).
+ */
+
+const TENANT = 'tenant-1'
+const NOW = new Date('2026-10-25T12:00:00Z')
+const FETCHED = new Date('2026-10-25T11:30:00Z')
+
+const xeroRow = (taxType: string, pct: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({
+  taxType, name: `Xero ${taxType}`, status: 'ACTIVE', reportTaxType: taxType.startsWith('OUTPUT') ? 'OUTPUT' : taxType.startsWith('INPUT') ? 'INPUT' : null, effectiveRate: `${pct}.000000`, displayTaxRate: `${pct}.000000`, components: [],
+  canApply: { assets: false, equity: false, expenses: taxType.startsWith('INPUT'), liabilities: false, revenue: !taxType.startsWith('INPUT') && taxType !== 'NONE' }, ...over,
+})
+const imsRate = (id: string, type: string | null, fraction: string, over: Partial<ImsRateRow> = {}): ImsRateRow => ({
+  id, reportingCategory: null, name: `IMS ${id}`, rate: fraction, usedFor: 'SALES', active: true, accountingTaxType: type, countryCode: 'GB', isCompound: false, reverseCharge: false, components: [], ...over,
+})
+const wooRate = (id: string, rate: string, over: Partial<WooTaxRateDetail> = {}): WooTaxRateDetail => ({
+  id, name: `Woo ${id}`, rate, country: 'GB', state: '', postcode: '', city: '', class: 'standard', shipping: true, compound: false, ...over,
+})
+
+/** All three systems agree: OUTPUT2 20 and ZERORATEDOUTPUT 0 on sales (mapped to Woo rates 1 and 2), INPUT2 20 on purchases (no storefront rate). */
+function baseline(): { snapshot: ImsXeroSnapshot; woo: WooTaxRateDetail[] } {
+  return {
+    snapshot: {
+      xero: { tenantId: TENANT, fetchedAt: FETCHED, rows: [xeroRow('OUTPUT2', '20'), xeroRow('ZERORATEDOUTPUT', '0'), xeroRow('INPUT2', '20')] },
+      rates: [imsRate('uk', 'OUTPUT2', '0.2000'), imsRate('zr', 'ZERORATEDOUTPUT', '0.0000'), imsRate('in', 'INPUT2', '0.2000', { usedFor: 'PURCHASE', countryCode: null })],
+      mappings: [{ externalTaxRateId: '1', taxRateId: 'uk', externalClass: 'standard' }, { externalTaxRateId: '2', taxRateId: 'zr', externalClass: 'zero-rate' }],
+    },
+    woo: [wooRate('1', '20.0000'), wooRate('2', '0.0000', { class: 'zero-rate' })],
+  }
+}
+const reasons = (state: { snapshot: ImsXeroSnapshot; woo: WooTaxRateDetail[] }): VatDifferenceReason[] => compareVatSets(state).differences.map((d) => d.reason)
+
+// [mutation: any comparison made to report spuriously, or the empty-case short-circuit removed -> red]
+test('all three systems equal -> an empty report, with every reason counted at zero', () => {
+  const report = compareVatSets(baseline())
+  assert.equal(report.status, 'compared')
+  assert.deepEqual(report.differences, [])
+  assert.equal(VAT_DIFFERENCE_REASON_LIST.every((reason) => report.counts[reason] === 0), true)
+  assert.deepEqual(report.xero, { tenantId: TENANT, fetchedAt: FETCHED.toISOString(), types: 3, active: 3 })
+  assert.deepEqual(report.woo, { rates: 2 })
+  assert.equal(vatDiffExitCode(report), 0)
+})
+
+type Mutate = (s: ReturnType<typeof baseline>) => void
+const CASES: Record<VatDifferenceReason, { mutate: Mutate; extra?: VatDifferenceReason[] }> = {
+  MISSING_IN_IMS: { mutate: (s) => { s.snapshot.xero.rows.push(xeroRow('OUTPUT3', '5')) } },
+  MISSING_IN_XERO: { mutate: (s) => { s.snapshot.rates[0]!.accountingTaxType = 'GONE' }, extra: ['MISSING_IN_IMS'] },
+  INACTIVE_IN_XERO: { mutate: (s) => { s.snapshot.xero.rows[0] = xeroRow('OUTPUT2', '20', { status: 'ARCHIVED' }) } },
+  IMS_RATE_NO_XERO_TYPE: { mutate: (s) => { s.snapshot.rates.push(imsRate('local', null, '0.0500', { usedFor: 'PURCHASE' })) } },
+  AMBIGUOUS_IMS_MAPPING: { mutate: (s) => { s.snapshot.rates.push(imsRate('uk2', 'OUTPUT2', '0.2000', { usedFor: 'SALES' })) }, extra: ['MISSING_IN_WOO'] },
+  USED_FOR_NOT_ALLOWED_BY_XERO: { mutate: (s) => { s.snapshot.rates[0]!.usedFor = 'BOTH' } },
+  WOO_MAPPED_TO_NON_SALES_RATE: { mutate: (s) => { s.snapshot.rates[0]!.usedFor = 'PURCHASE' }, extra: ['MISSING_IN_IMS', 'USED_FOR_NOT_ALLOWED_BY_XERO'] },
+  XERO_RATE_NOT_STATED: { mutate: (s) => { s.snapshot.xero.rows[0] = xeroRow('OUTPUT2', '20', { effectiveRate: null, displayTaxRate: null }) } },
+  PERCENTAGE_MISMATCH_IMS_XERO: { mutate: (s) => { s.snapshot.rates[0]!.rate = '0.1900' } },
+  MISSING_IN_WOO: { mutate: (s) => { s.woo.splice(1, 1) }, extra: ['WOO_RATE_GONE'] },
+  WOO_RATE_NO_IMS_MAPPING: { mutate: (s) => { s.woo.push(wooRate('9', '20.0000')) } },
+  WOO_RATE_GONE: { mutate: (s) => { s.snapshot.mappings.push({ externalTaxRateId: '77', taxRateId: 'uk', externalClass: null }) } },
+  WOO_MAPPED_TO_INACTIVE_IMS_RATE: { mutate: (s) => { s.snapshot.rates.push(imsRate('old', 'OUTPUT2', '0.2000', { active: false })); s.snapshot.mappings.push({ externalTaxRateId: '9', taxRateId: 'old', externalClass: null }); s.woo.push(wooRate('9', '20.0000')) } },
+  WOO_PERCENTAGE_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '19.0000') } },
+  WOO_COUNTRY_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { country: 'FR' }) } },
+  WOO_CLASS_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { class: 'reduced-rate' }) } },
+  WOO_COMPOUND_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { compound: true }) } },
+  WOO_SHIPPING_NOT_TAXED: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { shipping: false }) } },
+  UNCLASSIFIED_SCHEME: { mutate: (s) => { s.snapshot.rates.push(imsRate('de', null, '0.1900', { usedFor: 'PURCHASE', countryCode: 'GB', reportingCategory: 'MYSTERY' })) }, extra: ['IMS_RATE_NO_XERO_TYPE'] },
+}
+
+for (const reason of VAT_DIFFERENCE_REASON_LIST) {
+  // [mutation: the branch that adds this reason removed from compareVatSets -> this arm red]
+  test(`reason ${reason} is reported, with the values on each side, and only with what it implies`, () => {
+    const state = baseline()
+    CASES[reason].mutate(state)
+    const got = reasons(state)
+    assert.ok(got.includes(reason), `${reason} reported, got ${got.join(',')}`)
+    assert.deepEqual([...new Set(got)].sort(), [reason, ...(CASES[reason].extra ?? [])].sort(), `no other reason than the implied ones for ${reason}`)
+  })
+}
+
+test('the cases cover every reason code exactly once (a new code needs an arm)', () => {
+  assert.deepEqual(Object.keys(CASES).sort(), [...VAT_DIFFERENCE_REASON_LIST].sort())
+  console.log(`# reason codes: ${VAT_DIFFERENCE_REASON_LIST.length}`)
+})
+
+test('a percentage mismatch shows BOTH values; Woo is held to Xero, not to a wrong IMS', () => {
+  const s = baseline()
+  s.snapshot.rates[0]!.rate = '0.1900'
+  s.woo[0] = wooRate('1', '19.0000')
+  const report = compareVatSets(s)
+  const ims = report.differences.find((d) => d.reason === 'PERCENTAGE_MISMATCH_IMS_XERO')!
+  assert.deepEqual([ims.xero, ims.ims], ['20', '19'])
+  const woo = report.differences.find((d) => d.reason === 'WOO_PERCENTAGE_MISMATCH')!
+  assert.deepEqual([woo.xero, woo.ims, woo.woo], ['20', '19', '19'], 'Woo agrees with IMS but both differ from the master')
+})
+
+// [mutation: the country check skipped for a global IMS rate / the class check skipped for a null recorded class -> red]
+test('scope is compared both ways, and a null recorded class is the standard class', () => {
+  const run = (mut: Mutate) => { const s = baseline(); mut(s); return compareVatSets(s).differences.filter((d) => d.reason === 'WOO_COUNTRY_MISMATCH' || d.reason === 'WOO_CLASS_MISMATCH') }
+  // global IMS rate, GB-only Woo rate
+  const a = run((s) => { s.snapshot.rates[0]!.countryCode = null })
+  assert.deepEqual(a.map((d) => [d.reason, d.ims, d.woo]), [['WOO_COUNTRY_MISMATCH', '(any)', 'GB']])
+  // country IMS rate, global Woo rate
+  const b = run((s) => { s.woo[0] = wooRate('1', '20.0000', { country: '' }) })
+  assert.deepEqual(b.map((d) => [d.reason, d.ims, d.woo]), [['WOO_COUNTRY_MISMATCH', 'GB', '(any)']])
+  // both global: equal
+  assert.deepEqual(run((s) => { s.snapshot.rates[0]!.countryCode = null; s.woo[0] = wooRate('1', '20.0000', { country: '' }) }), [])
+  // null recorded class + live reduced -> difference; + live standard -> none
+  const c = run((s) => { s.snapshot.mappings[0]!.externalClass = null; s.woo[0] = wooRate('1', '20.0000', { class: 'reduced-rate' }) })
+  assert.deepEqual(c.map((d) => [d.reason, d.ims, d.woo]), [['WOO_CLASS_MISMATCH', 'standard', 'reduced-rate']])
+  assert.deepEqual(run((s) => { s.snapshot.mappings[0]!.externalClass = null }), [])
+})
+
+// [mutation: a classification rule changed (NO no longer VOEC, OSS marker ignored, EU without marker guessed) -> the matching arm red]
+test('classification: UK, IOSS, VOEC, other and unclassified, each with its cited source', () => {
+  const ims = (countryCode: string | null, reportingCategory: string | null, reportType: string | null = null) => classifyImsRate({ countryCode, reportingCategory }, reportType)
+  const got = (c: { scheme: string; source: string }) => c.scheme
+  assert.equal(got(ims('GB', null)), 'uk'); assert.equal(got(ims('GB', 'DOMESTIC')), 'uk'); assert.equal(got(ims('GB', 'EC_SALES')), 'uk'); assert.equal(got(ims('UK', null)), 'uk')
+  assert.equal(got(ims(null, 'DOMESTIC', 'OUTPUT')), 'uk'); assert.equal(got(ims(null, null)), 'uk')
+  assert.equal(got(ims('DE', 'IOSS')), 'ioss'); assert.equal(got(ims(null, 'ioss')), 'ioss')
+  assert.equal(got(ims('NO', null)), 'voec'); assert.equal(got(ims('NO', 'OSS')), 'voec'); assert.equal(got(ims(null, 'VOEC')), 'voec')
+  assert.equal(got(ims('DE', 'OSS')), 'other'); assert.equal(got(ims('CH', null)), 'other'); assert.equal(got(ims('JE', 'OSS')), 'other')
+  assert.equal(got(ims('DE', null)), 'other', 'owner ruling 2026-10-25: an unmarked EU rate defaults to OSS'); assert.equal(got(ims('ES', 'DOMESTIC')), 'other')
+  assert.match(ims('DE', null).source, /EU default \(OSS\)/)
+  assert.equal(got(ims('DE', 'IOSS')), 'ioss', 'only an IOSS marker makes an EU rate IOSS'); assert.equal(got(ims('FR', 'ioss')), 'ioss')
+  assert.equal(got(ims('GB', 'OSS')), 'unclassified'); assert.equal(got(ims('GB', 'IOSS')), 'unclassified'); assert.equal(got(ims('GB', 'MYSTERY')), 'unclassified')
+  assert.equal(got(ims(null, null, 'MOSSSALES')), 'unclassified'); assert.equal(got(ims(null, 'MYSTERY')), 'unclassified')
+  assert.match(ims('NO', null).source, /VOEC/); assert.match(ims('DE', 'IOSS').source, /reportingCategory=IOSS/); assert.match(ims('GB', null).source, /IMS countryCode GB/)
+  // WooCommerce rates with no IMS mapping: by country only
+  assert.deepEqual([classifyWooRate('GB').scheme, classifyWooRate('NO').scheme, classifyWooRate('CH').scheme, classifyWooRate('FR').scheme, classifyWooRate('').scheme], ['uk', 'voec', 'other', 'other', 'unclassified'])
+  // Xero-only types: name prefix (upper case) and ReportTaxType
+  const x = (name: string, reportTaxType: string | null) => classifyXeroType({ name, reportTaxType }).scheme
+  assert.deepEqual([x('20% (VAT on Income)', 'OUTPUT'), x('NO 25%', 'MOSSSALES'), x('No VAT', null), x('CH 8.1%', 'MOSSSALES'), x('DE 19%', 'MOSSSALES'), x('Mystery', null), x('GB Reduced', 'OUTPUT')], ['uk', 'voec', 'unclassified', 'other', 'other', 'unclassified', 'uk'])
+})
+
+test('four scheme reports plus a visible unclassified section: each difference lands in its own scheme; none is dropped; exit status is any difference anywhere', () => {
+  const s = baseline()
+  // UK: Woo percentage wrong. VOEC: a NO rate whose Woo rate differs. Other: a CH rate missing in Woo. IOSS: a marked DE rate. Unclassified: a GB rate with an unknown category (an unmarked FR rate is EU OSS, "other").
+  s.woo[0] = wooRate('1', '19.0000')
+  s.snapshot.xero.rows.push(xeroRow('NO25', '25', { reportTaxType: 'MOSSSALES' }), xeroRow('CH8', '8', { reportTaxType: 'MOSSSALES' }), xeroRow('DE19', '19', { reportTaxType: 'MOSSSALES' }), xeroRow('FR20', '20', { reportTaxType: 'MOSSSALES' }))
+  s.snapshot.rates.push(imsRate('no', 'NO25', '0.2500', { countryCode: 'NO' }), imsRate('ch', 'CH8', '0.0800', { countryCode: 'CH' }), imsRate('de', 'DE19', '0.1900', { countryCode: 'DE', reportingCategory: 'IOSS' }), imsRate('fr', 'FR20', '0.2000', { countryCode: 'FR' }), imsRate('gbx', null, '0.0500', { countryCode: 'GB', reportingCategory: 'MYSTERY', usedFor: 'PURCHASE' }))
+  s.snapshot.mappings.push({ externalTaxRateId: '3', taxRateId: 'no', externalClass: 'standard' }, { externalTaxRateId: '5', taxRateId: 'de', externalClass: 'standard' })
+  s.woo.push(wooRate('3', '24.0000', { country: 'NO' }), wooRate('5', '19.0000', { country: 'DE' }))
+  const r = compareVatSets(s)
+  const by = (bucket: keyof typeof r.schemes) => r.schemes[bucket].differences.map((d) => `${d.reason}:${d.imsRateId ?? d.xeroTaxType}`)
+  assert.deepEqual(by('uk'), ['WOO_PERCENTAGE_MISMATCH:uk'])
+  assert.deepEqual(by('voec'), ['WOO_PERCENTAGE_MISMATCH:no'])
+  assert.deepEqual(by('other'), ['MISSING_IN_WOO:ch', 'MISSING_IN_WOO:fr'], 'the unmarked FR rate is EU OSS')
+  assert.deepEqual(by('ioss'), [])
+  assert.deepEqual(by('unclassified'), ['IMS_RATE_NO_XERO_TYPE:gbx', 'UNCLASSIFIED_SCHEME:gbx'])
+  assert.equal(r.differences.length, Object.values(r.schemes).reduce((n, sec) => n + sec.differences.length, 0), 'nothing is dropped between the flat list and the sections')
+  assert.ok(r.schemes.unclassified.differences.every((d) => d.schemeSource.length > 10), 'each row cites why')
+  assert.equal(vatDiffExitCode(r, 'all'), 1)
+  assert.equal(vatDiffExitCode(r, 'ioss'), 1, 'the unclassified section counts for every selection')
+  // Without the unclassified rate, a clean scheme exits 0 on its own and a dirty one exits 1.
+  const t = baseline()
+  assert.equal(vatDiffExitCode(compareVatSets(t), 'uk'), 0)
+  t.woo[0] = wooRate('1', '19.0000')
+  const dirty = compareVatSets(t)
+  assert.equal(vatDiffExitCode(dirty, 'uk'), 1); assert.equal(vatDiffExitCode(dirty, 'voec'), 0); assert.equal(vatDiffExitCode(dirty, 'all'), 1)
+  const json = vatDiffJson(dirty, 'voec') as { schemes: Record<string, unknown> }
+  assert.deepEqual(Object.keys(json.schemes), ['voec', 'unclassified'])
+  assert.deepEqual(Object.keys((vatDiffJson(dirty, 'all') as { schemes: Record<string, unknown> }).schemes), ['uk', 'ioss', 'voec', 'other', 'unclassified'])
+})
+
+// [mutation: the regional-scope reason restored / the region dropped from the row -> red]
+test('a regional WooCommerce rate is legitimate: compared like any other against its mapped rate, with the region shown as information only', () => {
+  const s = baseline()
+  // Canary Islands style: an ES postcode-scoped 0% rate, mapped to an ES 0% IMS rate marked OSS.
+  s.snapshot.xero.rows.push(xeroRow('ES0', '0', { reportTaxType: 'MOSSSALES' }))
+  s.snapshot.rates.push(imsRate('es0', 'ES0', '0.0000', { countryCode: 'ES', reportingCategory: 'OSS' }))
+  s.snapshot.mappings.push({ externalTaxRateId: '8', taxRateId: 'es0', externalClass: 'zero-rate' })
+  s.woo.push(wooRate('8', '0.0000', { country: 'ES', postcode: '35*;38*', class: 'zero-rate' }))
+  assert.deepEqual(compareVatSets(s).differences, [], 'a matching regional rate is not a difference')
+  // Compared like any other: a wrong percentage, class or country is reported, and the region rides along.
+  s.woo[2] = wooRate('8', '7.0000', { country: 'PT', postcode: '35*;38*', class: 'reduced-rate' })
+  const r = compareVatSets(s)
+  assert.deepEqual(r.differences.map((d) => d.reason).sort(), ['WOO_CLASS_MISMATCH', 'WOO_COUNTRY_MISMATCH', 'WOO_PERCENTAGE_MISMATCH'])
+  assert.ok(r.differences.every((d) => d.region === '35*;38*' && d.scheme === 'other'))
+})
+
+// [mutation: the shipping check removed, or applied to a zero rate -> red]
+test('shipping rule (owner ruling 2026-10-25): a rate above zero must apply to shipping; a zero rate need not', () => {
+  const s = baseline()
+  s.woo[0] = wooRate('1', '20.0000', { shipping: false })
+  assert.deepEqual(reasons(s), ['WOO_SHIPPING_NOT_TAXED'])
+  s.woo[0] = wooRate('1', '20.0000')
+  s.woo[1] = wooRate('2', '0.0000', { class: 'zero-rate', shipping: false })
+  assert.deepEqual(reasons(s), [])
+  assert.match(VAT_DIFFERENCE_REASONS.WOO_SHIPPING_NOT_TAXED, /2026-10-25.*shipping always carries/)
+})
+
+// [mutation: presence counts any active carrier regardless of usedFor / the Woo mapping not checked for sales use -> red]
+test('presence is per side: an OUTPUT2 rate switched to PURCHASE is not the sales rate, its Woo mapping is a difference, and the purchase side is judged too', () => {
+  const s = baseline()
+  s.snapshot.rates[0]!.usedFor = 'PURCHASE'
+  const r = compareVatSets(s).differences
+  const byReason = (reason: string) => r.filter((d) => d.reason === reason)
+  assert.equal(byReason('MISSING_IN_IMS').length, 1)
+  assert.equal(byReason('MISSING_IN_IMS')[0]!.ims, 'no active rate for sales')
+  assert.equal(byReason('WOO_MAPPED_TO_NON_SALES_RATE').length, 1)
+  assert.equal(byReason('USED_FOR_NOT_ALLOWED_BY_XERO').length, 1, 'a purchase rate on a revenue-only type')
+  // INPUT2 present only as SALES: the purchase side is missing.
+  const t = baseline()
+  t.snapshot.rates[2]!.usedFor = 'SALES'
+  const m = compareVatSets(t).differences.filter((d) => d.reason === 'MISSING_IN_IMS')
+  assert.deepEqual(m.map((d) => [d.xeroTaxType, d.ims]), [['INPUT2', 'no active rate for purchases']])
+  // BOTH on a revenue-only type: used-for violation, but both sides are otherwise present.
+  const u = baseline()
+  u.snapshot.rates[0]!.usedFor = 'BOTH'
+  assert.deepEqual(compareVatSets(u).differences.map((d) => d.reason), ['USED_FOR_NOT_ALLOWED_BY_XERO'])
+  // A type that can be applied to neither side needs any active carrier.
+  const v = baseline()
+  v.snapshot.xero.rows.push(xeroRow('NONE', '0', { canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: false } }))
+  assert.equal(compareVatSets(v).differences.filter((d) => d.reason === 'MISSING_IN_IMS').length, 1)
+})
+
+test('purchase-only and reverse-charge IMS rates need no storefront rate; a zero rate with shipping off is not a difference', () => {
+  const s = baseline()
+  s.snapshot.rates.push(imsRate('rc', 'OUTPUT2', '0.2000', { reverseCharge: true, usedFor: 'SALES' }), imsRate('xx', null, '0.0000', { usedFor: 'PURCHASE' }))
+  s.snapshot.rates.pop(); s.snapshot.rates.pop()
+  s.woo[1] = wooRate('2', '0.0000', { class: 'zero-rate', shipping: false })
+  assert.deepEqual(reasons(s), [])
+})
+
+// ---- the Xero list must be trusted --------------------------------------------------------------------------
+
+type ClientState = { list: NormalisedXeroTaxRate[] | null; tenant?: string; connected?: string | null; fetchedAt?: Date; stamp?: string | null; writes: string[] }
+const decimal = (s: string) => ({ toFixed: (dp?: number) => (dp === undefined ? s : Number(s).toFixed(dp)) })
+function client(state: ClientState) {
+  const list = state.list
+  const tenant = state.tenant ?? TENANT
+  const fetchedAt = state.fetchedAt ?? FETCHED
+  const base = baseline()
+  return {
+    accountingToken: { findUnique: async () => (state.connected === null ? null : { tenantId: state.connected ?? TENANT }) },
+    xeroTaxRateList: { findMany: async () => (list === null ? [] : [{ connector: 'xero', tenantId: tenant, fetchedAt, rowCount: list.length, digest: digestTaxRateList(tenant, list) }]) },
+    xeroTaxRate: {
+      findMany: async () => (list ?? []).map((r) => ({
+        connector: 'xero', tenantId: tenant, taxType: r.taxType, name: r.name, status: r.status, reportTaxType: r.reportTaxType,
+        effectiveRate: r.effectiveRate === null ? null : decimal(r.effectiveRate), displayTaxRate: r.displayTaxRate === null ? null : decimal(r.displayTaxRate),
+        components: r.components, canApplyToAssets: r.canApply.assets, canApplyToEquity: r.canApply.equity, canApplyToExpenses: r.canApply.expenses,
+        canApplyToLiabilities: r.canApply.liabilities, canApplyToRevenue: r.canApply.revenue,
+      })),
+    },
+    setting: { findUnique: async () => { const stamp = state.stamp === undefined ? fetchedAt.toISOString() : state.stamp; return stamp === null ? null : { value: stamp } } },
+    taxRate: { findMany: async () => base.snapshot.rates.map((r) => ({ ...r, rate: decimal(r.rate), components: [] })) },
+    shoppingTaxRateMapping: { findMany: async () => base.snapshot.mappings },
+    $executeRawUnsafe: async (sql: string) => { state.writes.push(sql); return 0 },
+    $queryRawUnsafe: async () => [{ transaction_read_only: 'on' }],
+  }
+}
+function dbFor(state: ClientState, override: Partial<ReturnType<typeof client>> = {}): VatRunDb {
+  return { $transaction: async (fn) => fn({ ...client(state), ...override } as never) }
+}
+
+/** A fake GET-only port serving `rates` in pages, recording every request. */
+function wooPort(rates: Array<Record<string, unknown>>, opts: { fail?: boolean; log?: string[] } = {}): WooGetPort {
+  return {
+    async get(collection, params): Promise<WooPage> {
+      opts.log?.push(`GET ${collection} page=${params.page} per_page=${params.per_page}`)
+      if (opts.fail) return { ok: false }
+      const perPage = Number(params.per_page)
+      const page = Number(params.page)
+      const body = rates.slice((page - 1) * perPage, page * perPage)
+      return { ok: true, status: 200, total: String(rates.length), totalPages: String(Math.max(1, Math.ceil(rates.length / perPage))), body }
+    },
+  }
+}
+const asApi = (r: WooTaxRateDetail) => ({ id: Number(r.id), name: r.name, rate: r.rate, country: r.country, state: r.state, postcode: r.postcode, city: r.city, class: r.class, shipping: r.shipping, compound: r.compound })
+const noSleep = { sleep: async () => undefined }
+const goodList = () => baseline().snapshot.xero.rows
+const run = (state: ClientState, woo: WooGetPort) => runVatDifferenceReport({ db: dbFor(state), now: () => NOW, woo, wooOptions: noSleep })
+
+// [mutation: the readStoredXeroList call replaced by an unchecked findMany -> every refusal arm below red]
+test('an untrusted or stale stored Xero list REFUSES the report (never "no differences"), and WooCommerce is not even asked', async () => {
+  const log: string[] = []
+  const woo = wooPort(baseline().woo.map(asApi), { log })
+  const cases: Array<[string, Partial<ClientState>, string]> = [
+    ['missing', { list: null }, 'XERO_LIST_MISSING'],
+    ['stale', { list: goodList(), fetchedAt: new Date(NOW.getTime() - DRIFT_MAX_STALENESS_MS - 60_000), stamp: new Date(NOW.getTime() - 60_000).toISOString() }, 'XERO_LIST_STALE'],
+    ['not stamped', { list: goodList(), stamp: null }, 'XERO_LIST_NOT_STAMPED'],
+    ['wrong organisation', { list: goodList(), tenant: 'other' }, 'XERO_LIST_WRONG_ORGANISATION'],
+    ['not connected', { list: goodList(), connected: null }, 'XERO_NOT_CONNECTED'],
+  ]
+  for (const [name, over, code] of cases) {
+    const report = await run({ list: goodList(), writes: [], ...over }, woo)
+    assert.equal(report.status, 'refused', name)
+    assert.equal(report.status === 'refused' && report.code, code, name)
+    assert.equal(vatDiffExitCode(report), 2, name)
+  }
+  assert.deepEqual(log, [], 'no WooCommerce request was made for a refused Xero side')
+  // The same fixture with a trusted list compares.
+  const ok = await run({ list: goodList(), writes: [] }, woo)
+  assert.equal(ok.status, 'compared')
+})
+
+// [mutation: a failed Woo walk returns an empty rate list instead of refusing -> red]
+test('a WooCommerce read failure (or a list that cannot be proven) REFUSES the report', async () => {
+  const failed = await run({ list: goodList(), writes: [] }, wooPort([], { fail: true }))
+  assert.equal(failed.status === 'refused' && failed.code, 'WOO_READ_FAILED')
+  assert.equal(failed.status === 'refused' && failed.wooReason, 'SOURCE_UNREADABLE')
+  // A page that disagrees with the total is not a short list to compare.
+  const lying: WooGetPort = { get: async () => ({ ok: true, status: 200, total: '5', totalPages: '1', body: [asApi(wooRate('1', '20.0000'))] }) }
+  const unstable = await run({ list: goodList(), writes: [] }, lying)
+  assert.equal(unstable.status === 'refused' && unstable.code, 'WOO_READ_FAILED')
+  // A store that returns a rate without its boolean flags is unreadable, not repaired.
+  const bad = await run({ list: goodList(), writes: [] }, wooPort([{ ...asApi(wooRate('1', '20.0000')), shipping: 'yes' }]))
+  assert.equal(bad.status === 'refused' && bad.code, 'WOO_READ_FAILED')
+})
+
+test('the IMS read runs in a READ ONLY transaction, and a transaction that is not read-only is not read', async () => {
+  const state: ClientState = { list: goodList(), writes: [] }
+  const log: string[] = []
+  const report = await run(state, wooPort(baseline().woo.map(asApi), { log }))
+  assert.equal(report.status, 'compared')
+  assert.deepEqual(state.writes, ['SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY'])
+  const notReadOnly = await runVatDifferenceReport({ db: dbFor({ list: goodList(), writes: [] }, { $queryRawUnsafe: async () => [{ transaction_read_only: 'off' }] }), now: () => NOW, woo: wooPort([]), wooOptions: noSleep })
+  assert.equal(notReadOnly.status === 'refused' && notReadOnly.code, 'IMS_UNREADABLE')
+})
+
+// ---- Woo pagination ------------------------------------------------------------------------------------------
+
+// [mutation: the walk stops after the first page / the short last page not required -> red]
+test('Woo pagination: every page is read (twice, for the proof), a short last page ends the walk, and nothing past it is asked', async () => {
+  const rates = ['1', '2', '3', '4', '5'].map((id) => asApi(wooRate(id, '20.0000')))
+  const log: string[] = []
+  const read = await readWooTaxRateDetails(wooPort(rates, { log }), { ...noSleep, perPage: 2 })
+  assert.equal(read.ok && read.value.rates.length, 5)
+  assert.deepEqual(log, ['1', '2', '3', '1', '2', '3'].map((p) => `GET taxes page=${p} per_page=2`), 'three pages, read twice, the third (one row) being the end')
+  // A store whose second page repeats the first is refused, not deduplicated.
+  const repeating: WooGetPort = { get: async () => ({ ok: true, status: 200, total: '4', totalPages: '2', body: [asApi(wooRate('1', '20.0000')), asApi(wooRate('2', '20.0000'))] }) }
+  const bad = await readWooTaxRateDetails(repeating, { ...noSleep, perPage: 2 })
+  assert.equal(bad.ok, false)
+  // The details survive: country, class, flags.
+  const one = await readWooTaxRateDetails(wooPort([asApi(wooRate('7', '5.0000', { country: 'IE', class: 'reduced-rate', shipping: false, compound: true }))]), noSleep)
+  assert.deepEqual(one.ok && one.value.rates[0], wooRate('7', '5.0000', { country: 'IE', class: 'reduced-rate', shipping: false, compound: true }))
+})
+
+// ---- the guard of the shared transport ---------------------------------------------------------------------------
+
+// [mutation: wooHopRefusal's method check removed, or the collection list widened to taxes/classes or any /taxes/<id> -> red]
+test('the transport guard the report reads through refuses a non-GET and an off-path request', () => {
+  const base = new URL('https://shop.example.com')
+  const hop = (url: string, method = 'GET') => wooHopRefusal(base, { method, url: new URL(url), redirectCount: 0 })
+  assert.equal(hop('https://shop.example.com/wp-json/wc/v3/taxes?page=1&per_page=100&orderby=id&order=asc&_fields=id,name,rate,country,state,postcode,city,class,shipping,compound'), null)
+  for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) assert.equal(hop('https://shop.example.com/wp-json/wc/v3/taxes', method), 'method')
+  assert.equal(hop('https://shop.example.com/wp-json/wc/v3/taxes/12'), 'path')
+  assert.equal(hop('https://shop.example.com/wp-json/wc/v3/taxes/classes'), 'path')
+  assert.equal(hop('https://shop.example.com/wp-json/wc/v3/settings'), 'path')
+  assert.equal(hop('https://evil.example.com/wp-json/wc/v3/taxes'), 'origin')
+  assert.equal(hop('https://shop.example.com/wp-json/wc/v3/taxes?force=true'), 'parameter')
+})
+
+// ---- the ownership row is pinned ---------------------------------------------------------------------------------
+
+// [mutation: the row removed, or P1/P2 changed -> red]
+test('the ownership row woocommerce.tax-rate is pinned: operator-manual at P1, IMS at P2, citing the 2026-10-25 ruling', () => {
+  const rows = WRITER_OWNERSHIP_MAP.filter((r) => r.destination === 'woocommerce' && r.operation === 'tax-rate')
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.owners.P1, 'operator-manual')
+  assert.equal(rows[0]!.owners.P2, 'IMS')
+  assert.equal(rows[0]!.owners.P0, 'nobody')
+  assert.ok(rows[0]!.note.includes('2026-10-25'))
+  assert.equal(rows[0]!.obligationTime, 'not-applicable')
+})
+
+// ---- the CLI -----------------------------------------------------------------------------------------------------
+
+test('CLI: argument and environment hardening, exit codes, --json', async () => {
+  assert.deepEqual(parseVatDiffArgs(['--json']), { json: true, help: false, scheme: 'all' })
+  assert.deepEqual(parseVatDiffArgs(['--scheme', 'voec']), { json: false, help: false, scheme: 'voec' })
+  assert.deepEqual(parseVatDiffArgs(['--scheme', 'eu']), { code: 'BAD_ARGUMENTS' })
+  assert.deepEqual(parseVatDiffArgs(['--scheme']), { code: 'BAD_ARGUMENTS' })
+  assert.deepEqual(parseVatDiffArgs(['--bogus']), { code: 'BAD_ARGUMENTS' })
+  assert.deepEqual(parseVatDiffArgs(['--json', '--json']), { code: 'BAD_ARGUMENTS' })
+  assert.deepEqual(parseVatDiffArgs(['postgres://u:p@h/db']), { code: 'CREDENTIAL_ARGUMENT' })
+  assert.deepEqual(VAT_DIFF_EXIT_CODES.map((c) => c.code), [0, 1, 2, 3])
+  const out: string[] = []
+  const err: string[] = []
+  let kept: Readonly<Record<string, string>> = {}
+  const env = { DATABASE_URL: 'postgres://x', PGPASSWORD: 'leak', PGHOST: 'leak', NODE_OPTIONS: '--require=/tmp/evil.js', SETTINGS_ENCRYPTION_KEY: 'k', XERO_ALLOWED_TENANT_IDS: 'x', PATH: '/bin' }
+  const different = baseline()
+  different.woo[0] = wooRate('1', '19.0000')
+  const common = { env, uid: 0, checkoutOwnerUid: 0, stdout: (t: string) => out.push(t), stderr: (t: string) => err.push(t), onKeptEnv: (k: Readonly<Record<string, string>>) => { kept = k } }
+  const deps = (woo: WooGetPort) => ({ now: () => NOW, woo, openDb: async () => ({ db: dbFor({ list: goodList(), writes: [] }), disconnect: async () => undefined }) })
+  const code = await runVatDiffCli({ ...common, argv: ['--json'], deps: deps(wooPort(different.woo.map(asApi))) })
+  assert.equal(code, 1)
+  const parsed = JSON.parse(out.join('\n')) as { status: string; schemes: Record<string, { exitStatus: number; differences: Array<{ reason: string }> }> }
+  assert.deepEqual(Object.keys(parsed.schemes), ['uk', 'ioss', 'voec', 'other', 'unclassified'], 'JSON is keyed by scheme')
+  assert.deepEqual(parsed.schemes.uk!.differences.map((d) => d.reason), ['WOO_PERCENTAGE_MISMATCH'])
+  assert.equal(parsed.schemes.uk!.exitStatus, 1)
+  assert.deepEqual(Object.keys(kept).sort(), ['DATABASE_URL', 'HOME', 'PATH', 'SETTINGS_ENCRYPTION_KEY'], 'a whitelist: no PG variable, loader variable or Xero guard variable survives')
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: ['--scheme', 'uk'], deps: deps(wooPort(different.woo.map(asApi))) }), 1)
+  assert.match(out.join('\n'), /== UK VAT: 1 difference/)
+  assert.doesNotMatch(out.join('\n'), /IOSS VAT/)
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: ['--scheme', 'voec'], deps: deps(wooPort(different.woo.map(asApi))) }), 0, 'a clean scheme exits 0 on its own')
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: [], deps: deps(wooPort(different.woo.map(asApi))) }), 1)
+  assert.deepEqual(['UK VAT', 'IOSS VAT', 'VOEC (Norway) VAT', 'Other foreign VAT'].map((t) => out.join('\n').includes(`== ${t}`)), [true, true, true, true], 'four sections')
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: [], deps: deps(wooPort(baseline().woo.map(asApi))) }), 0)
+  assert.match(out.join('\n'), /No differences/)
+  assert.equal(await runVatDiffCli({ ...common, argv: [], deps: deps(wooPort([], { fail: true })) }), 2)
+  assert.equal(await runVatDiffCli({ ...common, argv: [], uid: 1234, deps: deps(wooPort([])) }), 3)
+  assert.equal(await runVatDiffCli({ ...common, argv: [], env: { PATH: '/bin' }, deps: deps(wooPort([])) }), 3)
+  assert.equal(await runVatDiffCli({ ...common, argv: ['--help'], deps: deps(wooPort([])) }), 0)
+  assert.equal(err.every((line) => !line.includes('leak') && !line.includes('postgres://')), true)
+})

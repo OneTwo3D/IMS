@@ -73,7 +73,7 @@ export function isXeroReportTaxType(value: string | null | undefined): value is 
  * EU member-state ISO 3166-1 alpha-2 codes (27 states). Greece is included as
  * both GR (ISO) and EL (the EU/VAT variant). GB is intentionally excluded.
  */
-const EU_ISO_CODES = new Set([
+export const EU_ISO_CODES = new Set([
   'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR',
   'DE', 'GR', 'EL', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT',
   'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE',
@@ -83,7 +83,7 @@ const EU_ISO_CODES = new Set([
  * VOEC (VAT On E-Commerce) ISO codes — Norway's low-value-goods scheme. Like the
  * EU OSS/IOSS rates, VOEC sales report via MOSS Sales (onetwo3d-ims-tdzp).
  */
-const VOEC_ISO_CODES = new Set(['NO'])
+export const VOEC_ISO_CODES = new Set(['NO'])
 
 /** Normalise reportingCategory to the canonical uppercase token, or null. */
 function normalizeCategory(category: string | null | undefined): string | null {
