@@ -294,3 +294,59 @@ test('A/B interleaving: B loses the claim after A recorded a failed registration
   assert.equal(registrations.filter((r) => r.paymentId === paymentId).length, before + 1)
   oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real
 })
+
+// A process that stops after the Payment commits must leave the obligation with it. [mutation: write the obligation row outside the transaction / not at all]
+test('crash between the Payment commit and the registration: the obligation row was written by the Payment\'s own transaction', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  oi.wcReceiptRegistrationSeams.afterReceiptCommit = async () => { throw new Error('process stopped') }
+  try { await assert.rejects(oi.updateExistingWcOrderFromPayload(o.id, payload(Number(o.wcId), '2026-10-01T10:00:00')), /process stopped/) } finally { oi.wcReceiptRegistrationSeams.afterReceiptCommit = undefined }
+  const pays = await payments(o.id)
+  assert.equal(pays.length, 1)
+  assert.equal(registrations.length, 0, 'nothing registered: the crash came first')
+  const row = await s.db.shoppingSyncLog.findFirst({ where: { connector: 'woocommerce', externalId: String(o.wcId), status: 'PENDING', entityId: null } })
+  assert.ok(row, 'a PENDING obligation row exists, no catch ever ran')
+  assert.equal((row!.payload as { receiptPaymentId?: string }).receiptPaymentId, pays[0]!.id)
+  // and the scheduled retry then registers it once and retires the row
+  const before = registrations.length
+  await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+  assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: row!.id } })).status, 'SYNCED')
+  assert.ok(registrations.length >= before)
+})
+
+// [mutation: create the row after the transaction]
+test('the obligation row and the Payment are ONE transaction: a failure inside it leaves neither, and the order unpaid', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  oi.wcReceiptRegistrationSeams.insideReceiptTransaction = async () => { throw new Error('abort inside') }
+  try { await assert.rejects(oi.updateExistingWcOrderFromPayload(o.id, payload(Number(o.wcId), '2026-10-01T10:00:00')), /abort inside/) } finally { oi.wcReceiptRegistrationSeams.insideReceiptTransaction = undefined }
+  assert.equal((await payments(o.id)).length, 0)
+  assert.equal(await s.db.shoppingSyncLog.count({ where: { externalId: String(o.wcId) } }), 0)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt, null)
+})
+
+// [mutation: drop the sweep from the cron route / select receipts regardless of the posted invoice / ignore the on-record probe]
+test('the scheduled orphan sweep finds a stored WooCommerce receipt with no obligation on record and registers it exactly once', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  await s.db.salesOrder.update({ where: { id: o.id }, data: { accountingInvoiceId: `INV-${o.id}`, paidAt: new Date('2026-10-01T10:00:00Z') } })
+  const orphan = await s.db.payment.create({ data: { orderId: o.id, amount: 100, currency: 'EUR', method: 'Bank', notes: 'Recorded from WooCommerce (the order was imported unpaid and paid later)', settlementRateToBase: 1.1 } })
+  const noInvoice = await heldOrder()
+  const early = await s.db.payment.create({ data: { orderId: noInvoice.id, amount: 100, currency: 'EUR', notes: 'Recorded from WooCommerce (x)' } })
+  await s.sql(`update payments set "createdAt" = now() - interval '1 hour' where id = $1`, [orphan.id])
+  await s.sql(`update payments set "createdAt" = now() - interval '1 hour' where id = $1`, [early.id])
+  registrations.length = 0
+  const real = oi.wcReceiptRegistrationSeams.obligationIsOnRecord
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > 0
+  try {
+    const r1 = await oi.sweepUnregisteredWcReceipts()
+    assert.ok(r1.registered >= 1)
+    assert.equal(registrations.filter((r) => r.paymentId === orphan.id).length, 1)
+    assert.equal(registrations.filter((r) => r.paymentId === early.id).length, 0, 'an order with no posted invoice is not the sweep\'s (the invoice post registers it)')
+    await oi.sweepUnregisteredWcReceipts()
+    assert.equal(registrations.filter((r) => r.paymentId === orphan.id).length, 1, 'not again')
+  } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real }
+  const route = (await import('node:fs')).readFileSync('app/api/cron/fx-rates/route.ts', 'utf8')
+  assert.match(route, /sweepUnregisteredWcReceipts\(50\)/)
+})

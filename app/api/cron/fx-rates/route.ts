@@ -21,7 +21,8 @@ export async function GET(request: Request) {
       let receiptRetry: unknown = null
       try {
         const { retryPendingWcOrdersWaitingForFx } = await import('@/lib/connectors/woocommerce/sync/order-import')
-        receiptRetry = await retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+        const { sweepUnregisteredWcReceipts } = await import('@/lib/connectors/woocommerce/sync/order-import')
+        receiptRetry = { queue: await retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true }), orphans: await sweepUnregisteredWcReceipts(50) }
       } catch (error) {
         receiptRetry = { error: String(error).slice(0, 240) }
       }
