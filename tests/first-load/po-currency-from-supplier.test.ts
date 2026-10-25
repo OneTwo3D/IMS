@@ -132,17 +132,18 @@ test('the native Qoblex fixture prepares over the real export shape: supplier cu
 
 // Local smoke over the owner's real export. Counts and reasons only; never committed data. Skipped (and said so) when the files are not on this machine.
 test('local smoke: the real Incoming export with the real supplier file (counts and reasons only)', { skip: !(existsSync('/var/tmp/qoblex-incoming-2026-10-25.csv') && existsSync('/var/tmp/fl-sup-real-contacts.csv')) && 'the owner\'s real export is not on this machine' }, (t) => {
-  // The pinned map maps Approved/PartiallyReceived only; the real file also has Closed (an owner decision, UNMAPPED_VALUE). The smoke reads Closed as CLOSED in a private in-memory copy.
-  const map = parseColumnMap(readFileSync(path.join(NATIVE, 'maps', 'qoblex-incoming-stock.map.json'), 'utf8').replace('"Approved": "OPEN"', '"Approved": "OPEN", "Closed": "CLOSED"'), 'm.json').datasets['purchase-order-lines']!
+  // The PINNED map as shipped (Approved/PartiallyReceived -> OPEN, Closed -> CLOSED), unmodified.
+  const map = parseColumnMap(readFileSync(path.join(NATIVE, 'maps', 'qoblex-incoming-stock.map.json'), 'utf8'), 'm.json').datasets['purchase-order-lines']!
   const incoming = ingestDataset('purchase-order-lines', readFileSync('/var/tmp/qoblex-incoming-2026-10-25.csv'), 'incoming.csv', map)
   const supMap = parseColumnMap(readFileSync(path.join(NATIVE, 'maps', 'qoblex-contacts.map.json'), 'utf8'), 'c.json').datasets.suppliers!
   const suppliers = ingestDataset('suppliers', readFileSync('/var/tmp/fl-sup-real-contacts.csv'), 'contacts.csv', supMap)
   precondition(t, 'incoming records', incoming.recordsRead)
   const skus = [...new Set(incoming.rows.map((x) => x.values.sku))]
   const currencies = new Set(suppliers.rows.map((x) => x.values.currency))
-  const rates = [...currencies].filter((c) => c !== 'GBP' && c !== '').map((c) => ({ currency: c, rate: '1.2', fetchedAt: '2025-01-01T00:00:00Z' }))
+  const rates = [...currencies].filter((c) => c !== 'GBP' && c !== '').map((c) => ({ currency: c, rate: '1.2', fetchedAt: '2000-01-01T00:00:00Z' }))
   const r = runBare({ products: ds('products', skus.map((s) => product(s))), suppliers, ...(rates.length ? { 'ims-fx-rates': ds('ims-fx-rates', rates) } : {}), 'purchase-order-lines': incoming })
   const tally = (outcome: string) => Object.fromEntries([...dispositionCodes(r, 'purchase-order-lines', outcome as 'REJECTED').reduce((m, c) => m.set(c, (m.get(c) ?? 0) + 1), new Map<string, number>())])
+  t.diagnostic(`map-level rejects ${incoming.rejected.length} ${JSON.stringify(Object.fromEntries(incoming.rejected.reduce((m, x) => m.set(JSON.stringify((x as { code?: string }).code ?? 'unknown'), (m.get(JSON.stringify((x as { code?: string }).code ?? 'unknown')) ?? 0) + 1), new Map<string, number>())))}`)
   t.diagnostic(`incoming records ${incoming.recordsRead}, supplier records ${suppliers.recordsRead}, supplier currencies ${[...currencies].sort().join('/')}`)
   t.diagnostic(`rejected by code ${JSON.stringify(tally('REJECTED'))}; excluded by code ${JSON.stringify(tally('EXCLUDED'))}; emitted PO lines ${r.report.accountingByCode.filter((x) => x.dataset === 'purchase-order-lines' && x.outcome === 'EMITTED').reduce((n, x) => n + x.count, 0)}; orders ${r.report.purchaseOrders?.orders}; supplier rejects ${JSON.stringify(tally('REJECTED'))}; blocking ${r.blocking}`)
   assert.ok(true)
