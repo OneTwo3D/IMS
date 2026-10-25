@@ -60,18 +60,27 @@ test('the rows the answer rests on are locked FOR SHARE before they are read, in
 })
 
 // ---- the census: every writer of a tax rate id uses the helper ----------------------------------------------------------
-const WRITERS: Array<[string, RegExp, string]> = [
-  ['app/actions/sales.ts', /resolveLinesTaxRates\(tx, lineData\)/, 'sales order create (lines)'],
-  ['app/actions/sales.ts', /resolveWritableTaxRateIds\(tx, so\.lines/, 'sales order clone'],
-  ['app/actions/purchase-orders.ts', /resolveLinesTaxRates\(tx, lineData\)/, 'purchase order create (lines)'],
-  ['app/actions/purchase-orders.ts', /resolveWritableTaxRateIds\(client, overrideIds/, 'purchase order create / update (overrides)'],
-  ['app/actions/suppliers.ts', /resolveWritableTaxRateId\(db, input\.taxRateId \|\| null\)/, 'supplier create'],
-  ['app/actions/suppliers.ts', /resolveWritableTaxRateId\(db, input\.taxRateId, \{ keep/, 'supplier update'],
-  ['app/actions/wc-sync.ts', /resolveWritableTaxRateId\(db, taxRateId\)/, 'storefront mapping update'],
-  ['lib/connectors/woocommerce/sync/taxes.ts', /resolveWritableTaxRateId\(db, existing\.id, \{ lenient: true \}\)/, 'storefront rate import'],
-  ['lib/connectors/woocommerce/sync/order-import.ts', /resolveLinesTaxRates\(tx, lineData, \{ lenient: true \}\)/, 'WooCommerce order import'],
+const WRITERS: Array<[string, RegExp, string, number]> = [
+  ['app/actions/sales.ts', /resolveLinesTaxRates\(tx, lineData\)/, 'sales order create (lines), in the creating transaction', 1],
+  ['app/actions/sales.ts', /resolveWritableTaxRateIds\(tx, so\.lines/, 'sales order clone, in its transaction', 1],
+  ['app/actions/purchase-orders.ts', /resolveLinesTaxRates\(tx, lineData\)/, 'purchase order create (lines), in the creating transaction', 1],
+  ['app/actions/purchase-orders.ts', /resolveWritableTaxRateIds\(client, overrideIds/, 'purchase order create / edit (overrides; the edit passes its tx)', 1],
+  ['app/actions/purchase-orders.ts', /resolvePurchaseLineTaxRates\(input\.lines, orderDefaultCtx, tx, priorLineRates\)/, 'purchase order edit passes its transaction', 1],
+  ['app/actions/suppliers.ts', /resolveWritableTaxRateId\(tx, input\.taxRateId \|\| null\)/, 'supplier create, in the writing transaction', 1],
+  ['app/actions/suppliers.ts', /resolveWritableTaxRateId\(tx, input\.taxRateId, \{ keep/, 'supplier update, in the writing transaction', 1],
+  ['app/actions/suppliers.ts', /resolveWritableTaxRateId\(tx, taxRateId\)/, 'supplier CSV / first-load import (update and create), in the writing transaction', 2],
+  ['app/actions/wc-sync.ts', /resolveWritableTaxRateId\(tx, taxRateId\)/, 'storefront mapping update, in its transaction', 1],
+  ['lib/connectors/woocommerce/sync/taxes.ts', /resolveWritableTaxRateId\(tx, imsTaxRateId, \{ lenient: true \}\)/, 'storefront rate import, in the upsert transaction', 1],
+  ['lib/connectors/woocommerce/sync/order-import.ts', /resolveLinesTaxRates\(tx, lineData, \{ lenient: true \}\)/, 'WooCommerce order import, in its transaction', 1],
+  ['lib/domain/sales/refund-service.ts', /FROM tax_rates WHERE id = ANY\(\$\{lockedRateIds\}::text\[\]\)[^`]*FOR SHARE/, 'refund snapshot: the rate rows are share-locked before the identity is read, to commit', 1],
 ]
 // [mutation: any one call removed from its writer -> that census row fails]
 test('CENSUS: every writer that persists a tax rate id resolves it through the shared helper', () => {
-  for (const [file, pattern, what] of WRITERS) assert.match(readFileSync(file, 'utf8'), pattern, `${what} (${file}) must use lib/tax/writable-tax-rate.ts`)
+  for (const [file, pattern, what, times] of WRITERS) {
+    const text = readFileSync(file, 'utf8')
+    assert.match(text, pattern, `${what} (${file}) must use lib/tax/writable-tax-rate.ts`)
+    assert.equal((text.match(new RegExp(pattern.source, 'g')) ?? []).length, times, `${what}: expected ${times} site(s)`)
+  }
+  // Never the pooled client: a lock taken on `db` is released before the write, which is the split read/write this census exists to prevent.
+  for (const file of ['app/actions/suppliers.ts', 'app/actions/wc-sync.ts', 'lib/connectors/woocommerce/sync/taxes.ts', 'app/actions/sales.ts']) assert.doesNotMatch(readFileSync(file, 'utf8'), /resolveWritableTaxRateIds?\(db,/, `${file}: resolve inside the writing transaction, not on the pooled client`)
 })

@@ -656,3 +656,54 @@ test('WRITERS AFTER THE APPLY: a supplied id of a retired rate resolves to its r
   assert.equal((await db.salesOrderLine.findFirstOrThrow({ where: { orderId: lateOrder } })).taxRateId, newGr2, 'the order created during the apply is on the replacement')
   assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w2.ids.gr } })).active, false)
 })
+
+// [mutation: the helper's share lock removed -> the apply commits during the writer's pause and the supplier keeps the retired rate]
+test('A SUPPLIER WRITE concurrent with the apply ends on the new rate (the apply waits for the writer\'s share lock, then re-points)', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { resolveWritableTaxRateId } = await import('../../lib/tax/writable-tax-rate.ts')
+  const { db } = d
+  const w = await seedWorld(d)
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+  const supplier = await db.supplier.create({ data: { name: `${TAG}Racing supplier` } })
+  created.suppliers.push(supplier.id)
+  // The supplier action's shape: resolve in the writing transaction (share lock held to commit), pause, write.
+  const supplierWrite = db.$transaction(async (tx) => {
+    const writable = await resolveWritableTaxRateId(tx, w.ids.gr)
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    await tx.supplier.update({ where: { id: supplier.id }, data: { taxRateId: writable } })
+  })
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  const applied = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  await supplierWrite
+  assert.deepEqual([applied.refusal, applied.wrote], [null, true])
+  const newGr = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}GR VAT`, active: true } })).id
+  assert.equal((await db.supplier.findUniqueOrThrow({ where: { id: supplier.id } })).taxRateId, newGr, 'the supplier written during the apply ends on the new rate')
+})
+
+// [mutation: the post-deactivation recount of refund snapshots removed -> the snapshot keeps the old code]
+test('A REFUND created concurrently with the apply ends with its snapshot on the new code (the apply waits for the refund\'s share lock, recounts, migrates)', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { db } = d
+  const w = await seedWorld(d)
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+  // The refund's shape (refund-service.ts): share-lock the order lines' rate rows, read the code, pause, insert the snapshot of the code it read.
+  const refundWrite = db.$transaction(async (tx) => {
+    const rateIds = (await tx.salesOrderLine.findMany({ where: { orderId: w.soDraftGr.id, taxRateId: { not: null } }, select: { taxRateId: true } })).map((l) => l.taxRateId as string)
+    await tx.$queryRaw`SELECT id FROM tax_rates WHERE id = ANY(${rateIds}::text[]) ORDER BY id FOR SHARE`
+    const read = (await tx.salesOrderLine.findFirstOrThrow({ where: { orderId: w.soDraftGr.id }, select: { taxRate: { select: { accountingTaxType: true } } } })).taxRate?.accountingTaxType ?? null
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    const r = await tx.salesOrderRefund.create({ data: { orderId: w.soDraftGr.id, totalForeign: 10, totalBase: 10, lines: { create: [{ description: 'x', qty: 1, unitPriceBase: 10, totalBase: 10, accountingTaxType: read }] } }, select: { id: true, lines: { select: { id: true } } } })
+    created.refunds.push(r.id)
+    return { lineId: r.lines[0]!.id, read }
+  })
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  const applied = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  const refund = await refundWrite
+  assert.equal(refund.read, code('A'), 'the refund read GR VAT\'s old code before the apply committed')
+  assert.deepEqual([applied.refusal, applied.wrote], [null, true])
+  assert.equal((await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id: refund.lineId } })).accountingTaxType, code('D'), 'the refund snapshot committed during the apply was migrated to the new code')
+})

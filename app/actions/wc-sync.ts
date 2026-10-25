@@ -720,8 +720,9 @@ export async function updateShoppingTaxRateMapping(
 ): Promise<{ success: boolean }> {
   await requireSyncPermission()
   // A rate a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
-  const writableTaxRateId = (await resolveWritableTaxRateId(db, taxRateId)) ?? taxRateId
-  await db.shoppingTaxRateMapping.update({
+  await db.$transaction(async (tx) => {
+  const writableTaxRateId = (await resolveWritableTaxRateId(tx, taxRateId)) ?? taxRateId
+  await tx.shoppingTaxRateMapping.update({
     where: {
       connector_externalTaxRateId: {
         connector: 'woocommerce',
@@ -729,6 +730,7 @@ export async function updateShoppingTaxRateMapping(
       },
     },
     data: { taxRateId: writableTaxRateId },
+  })
   })
   revalidatePath('/sync')
   return { success: true }

@@ -51,7 +51,9 @@
  *   - STALE FORMS: the old row stays in forms opened before the apply and in imports that read it earlier, so every writer that persists a tax rate id (sales / purchase order create and
  *     edit, clone, supplier default, storefront rate mappings, WooCommerce order import) resolves a supplied id through lib/tax/writable-tax-rate.ts: an id of a row this apply retired
  *     (TaxRate.replacedById, written here) resolves to the replacement, a plainly inactive rate is refused. The helper share-locks the rows it relies on; this apply's UPDATE of the old row
- *     waits for such a writer, then re-counts (a document created meanwhile is re-pointed with the flag, else the apply rolls back: DOCUMENT_CREATED_DURING_APPLY).
+ *     waits for such a writer, then re-counts (a document created meanwhile is re-pointed with the flag, else the apply rolls back: DOCUMENT_CREATED_DURING_APPLY). Every writer resolves INSIDE its
+ *     own writing transaction, so the lock is held to commit; a refund share-locks the rate rows its tax identity is read from before reading them (lib/domain/sales/refund-service.ts), and the
+ *     apply counts pending refund snapshots again after the deactivation and migrates them (same identity rules) or rolls back. Suppliers and mappings are re-pointed after it too.
  *   - ENQUEUE RACE: a producer reads the line's rate BEFORE it takes the enqueue lock, so it can build an old-code payload, pause while this apply commits (no queued row to see), then
  *     insert it. createAccountingSyncLogRow (the one insert of a sync row) therefore refuses, under the lock this apply holds, any payload carrying a code recorded here as retired (setting
  *     tax_rekey_retired_codes, written in the apply's transaction)  that no active rate carries, or that now means another rate (a swap) within the quarantine window after this commit: lib/tax/retired-tax-code-guard.ts. The producer's retry rebuilds from the re-pointed rows.
@@ -522,14 +524,18 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     // without the flag that is a source the plan did not count, so the apply stops (and rolls back); with it, the re-pointing below picks it up.
     if (!options.allowUnposted) {
       const late = await openDocumentsOf(tx, old.id)
-      if (late.salesOrderIds.length + late.purchaseOrderIds.length > 0) throw new RekeyDocumentRaceError(row.imsRateId)
+      const lateRefunds = await pendingRefundSnapshots(tx, row.currentCode)
+      if (late.salesOrderIds.length + late.purchaseOrderIds.length + lateRefunds.lines > 0) throw new RekeyDocumentRaceError(row.imsRateId)
     }
     result.suppliersRepointed += (await tx.supplier.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     result.mappingsRepointed += (await tx.shoppingTaxRateMapping.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     if (options.allowUnposted) {
-      // Refund-line snapshots on refunds not yet posted: migrated only when the snapshot's tax identity IS the old row's (the plan refused otherwise).
-      const snap = plan.references[row.imsRateId]
-      if (snap !== undefined && snap.pendingRefundLines > 0 && !snap.refundSnapshotConflict) {
+      // Refund-line snapshots on refunds not yet posted. COUNTED AGAIN here, after the deactivation (which waited for any refund transaction holding a share lock on the old row - see
+      // refund-service.ts), so a snapshot a concurrent refund committed after the plan counted is migrated too (its identity is the old row's: the plan found no conflicting carrier), or the apply stops.
+      const late = await pendingRefundSnapshots(tx, row.currentCode)
+      if (late.lines > 0) {
+        const snap = plan.references[row.imsRateId]
+        if (snap !== undefined && snap.refundSnapshotConflict) throw new RekeyDocumentRaceError(row.imsRateId)
         result.refundLinesRepointed += (await tx.salesOrderRefundLine.updateMany({ where: { accountingTaxType: row.currentCode, refund: { accountingCreditNoteId: null } }, data: { accountingTaxType: toCode } })).count
       }
       const open = await openDocumentsOf(tx, old.id)

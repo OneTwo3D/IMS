@@ -3697,6 +3697,13 @@ export async function createSalesOrderRefund(
       }
     }
     await lockSalesOrder(tx, input.orderId)
+    // THE REFUND'S TAX IDENTITY IS READ FROM RATE ROWS (each line's rate, the order-default rate by name) and snapshotted onto the refund lines below. A tax re-key (lib/tax/tax-rekey.ts) must not
+    // commit between that read and the insert, or the snapshot would carry a retired code the apply never saw. So the rows are share-locked BEFORE the read and held to commit: the apply's UPDATE
+    // of a rate row waits for this transaction, then re-counts the pending snapshots and migrates them (or rolls back); and an apply that committed first is simply read as committed.
+    const lockedRateRows = await tx.salesOrderLine.findMany({ where: { orderId: input.orderId, taxRateId: { not: null } }, select: { taxRateId: true } })
+    const lockedRateIds = [...new Set(lockedRateRows.map((l) => l.taxRateId as string))]
+    const lockedOrderName = (await tx.salesOrder.findUnique({ where: { id: input.orderId }, select: { taxRateName: true } }))?.taxRateName ?? null
+    await tx.$queryRaw`SELECT id FROM tax_rates WHERE id = ANY(${lockedRateIds}::text[]) OR (${lockedOrderName}::text IS NOT NULL AND name = ${lockedOrderName}::text AND active) ORDER BY id FOR SHARE`
 
     const so = await tx.salesOrder.findUnique({
       where: { id: input.orderId },
