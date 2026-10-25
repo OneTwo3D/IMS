@@ -5,6 +5,7 @@ import {
   calculateAccountBalanceVarianceBase,
   findLatestAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
+  AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
   normalizeBalanceDate,
   persistAccountingAccountBalanceSnapshots,
@@ -25,16 +26,24 @@ function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): 
     amountBase: toDecimal('0'),
     sourcePayloadRef: null,
     tenantId: null,
+    financialYearEnd: null,
+    parserVersion: 2,
     syncRunId: null,
     fetchedAt: new Date('2026-06-01T01:00:00.000Z'),
     ...overrides,
   }
 }
 
-function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
-  const rows = [...initial]
+function snapshotClient(
+  initial: AccountingAccountBalanceSnapshotRow[] = [],
+  chart: { accountType: string | null; yearEnd?: string | null; chartIds?: string[] } = { accountType: 'EXPENSE', yearEnd: '12-31' },
+) {
+  // `yearEnd` (when given) stamps every row with that proven year end and one organisation; rows that already carry their own
+  // tenant/year end (the proof tests) are left alone.
+  const rows = initial.map((row) => (chart.yearEnd === undefined ? row : { ...row, tenantId: row.tenantId ?? 'tenant-1', financialYearEnd: row.financialYearEnd ?? chart.yearEnd }))
   return {
     rows,
+    accountingAccount: { findMany: async () => (chart.accountType === null ? [] : (chart.chartIds ?? ['cogs-account']).map((externalAccountId) => ({ externalAccountId, type: chart.accountType }))) },
     accountingAccountBalanceSnapshot: {
       async upsert(args: {
         where: { connector_externalAccountId_balanceDate_currency: { connector: string; externalAccountId: string; balanceDate: Date; currency: string } }
@@ -64,6 +73,8 @@ function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
           amountBase: args.create.amountBase,
           sourcePayloadRef: args.create.sourcePayloadRef,
           tenantId: args.create.tenantId,
+          financialYearEnd: args.create.financialYearEnd,
+          parserVersion: args.create.parserVersion,
           syncRunId: args.create.syncRunId,
           fetchedAt: args.create.fetchedAt,
         } as AccountingAccountBalanceSnapshotRow
@@ -77,11 +88,13 @@ function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
           currency?: string
           externalAccountId?: string
           accountCode?: string
+          parserVersion?: number
         }
         return rows
           .filter((row) =>
             row.connector === where.connector &&
             row.balanceDate <= where.balanceDate.lte &&
+            (where.parserVersion === undefined || row.parserVersion === where.parserVersion) &&
             (!where.currency || row.currency === where.currency) &&
             (!where.externalAccountId || row.externalAccountId === where.externalAccountId) &&
             (!where.accountCode || row.accountCode === where.accountCode),
@@ -297,4 +310,200 @@ test('the organisation a balance was fetched under is stored, and a later pull u
   assert.equal(client.rows[0]!.tenantId, 'tenant-b')
   await persistAccountingAccountBalanceSnapshots([{ ...base }], client as never)
   assert.equal(client.rows[0]!.tenantId, null, 'a pull that cannot name its organisation records none, not the previous one')
+})
+
+// P&L accounts are year-to-date in a Trial Balance: they restart at the financial-year start.
+function windowRows(openingDate: string, closingDate: string) {
+  const base = { externalAccountId: 'cogs-account', accountCode: '600', accountName: 'COGS' }
+  return [
+    makeSnapshot({ ...base, id: 'o', balanceDate: new Date(`${openingDate}T00:00:00.000Z`), amountBase: toDecimal('900'), amountForeign: toDecimal('900') }),
+    makeSnapshot({ ...base, id: 'c', balanceDate: new Date(`${closingDate}T00:00:00.000Z`), amountBase: toDecimal('40'), amountForeign: toDecimal('40') }),
+  ]
+}
+const lookup = (dateFrom: string, dateTo: string) => ({ connector: 'xero', accountCode: '600', dateFrom, dateTo, currency: 'GBP' })
+
+test('a profit-and-loss account is WITHHELD, not differenced, when the window crosses the financial-year start', async () => {
+  const client = snapshotClient(windowRows('2026-12-30', '2027-01-02'), { accountType: 'DIRECTCOSTS', yearEnd: '12-31' })
+  await assert.rejects(
+    () => getAccountBalancePeriodMovement(lookup('2026-12-31', '2027-01-02'), client as never),
+    (error) => error instanceof AccountBalanceMovementWithheldError && error.reason === 'window_crosses_financial_year_start',
+  )
+})
+
+test('the financial-year start day itself is inside the window; the day before is not', async () => {
+  const crossing = snapshotClient(windowRows('2026-12-31', '2027-01-01'), { accountType: 'EXPENSE', yearEnd: '12-31' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2027-01-01', '2027-01-01'), crossing as never), AccountBalanceMovementWithheldError)
+  const inside = snapshotClient(windowRows('2026-12-30', '2026-12-31'), { accountType: 'EXPENSE', yearEnd: '12-31' })
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-12-31', '2026-12-31'), inside as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('a profit-and-loss window inside one financial year is a plain difference', async () => {
+  const client = snapshotClient(windowRows('2026-05-31', '2026-06-30'), { accountType: 'EXPENSE', yearEnd: '03-31' })
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('a non-calendar year end (31 March) is honoured', async () => {
+  const client = snapshotClient(windowRows('2026-03-30', '2026-04-02'), { accountType: 'REVENUE', yearEnd: '03-31' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-03-31', '2026-04-02'), client as never), AccountBalanceMovementWithheldError)
+})
+
+test('a profit-and-loss account whose balances prove no valid financial-year end is withheld', async () => {
+  for (const yearEnd of [null, 'garbage', '02-30']) {
+    const client = snapshotClient(windowRows('2026-05-31', '2026-06-30'), { accountType: 'EXPENSE', yearEnd })
+    await assert.rejects(
+      () => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never),
+      (error) => error instanceof AccountBalanceMovementWithheldError && error.reason === 'financial_year_end_unproven',
+      String(yearEnd),
+    )
+  }
+})
+
+test('a balance-sheet account (lifetime balance) is differenced across a financial-year start', async () => {
+  for (const accountType of ['INVENTORY', 'CURRENT', 'CURRLIAB', 'ASSET']) {
+    const client = snapshotClient(windowRows('2026-12-30', '2027-01-02'), { accountType, yearEnd: '12-31' })
+    assert.equal((await getAccountBalancePeriodMovement(lookup('2026-12-31', '2027-01-02'), client as never)).movementBase.toFixed(2), '-860.00', accountType)
+  }
+})
+
+test('an account the chart does not know is withheld, not guessed', async () => {
+  const client = snapshotClient(windowRows('2026-12-30', '2027-01-02'), { accountType: null, yearEnd: '12-31' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-12-31', '2027-01-02'), client as never), AccountBalanceMovementWithheldError)
+})
+
+// The year end is proven BY THE TWO BALANCES, not by a current setting.
+function provenRows(opening: { yearEnd: string | null; tenant: string | null }, closing: { yearEnd: string | null; tenant: string | null }) {
+  const [o, c] = windowRows('2026-05-31', '2026-06-30')
+  return [
+    { ...o!, tenantId: opening.tenant, financialYearEnd: opening.yearEnd },
+    { ...c!, tenantId: closing.tenant, financialYearEnd: closing.yearEnd },
+  ]
+}
+const pnl = { accountType: 'EXPENSE' } as const
+const withheldAs = (error: unknown) => error instanceof AccountBalanceMovementWithheldError
+const unprovenAs = (error: unknown) => error instanceof AccountBalanceMovementWithheldError && error.reason === 'financial_year_end_unproven'
+
+test('P&L balances that prove the SAME year end for the SAME organisation, window not crossing, are differenced', async () => {
+  const client = snapshotClient(provenRows({ yearEnd: '12-31', tenant: 't1' }, { yearEnd: '12-31', tenant: 't1' }), pnl)
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('a financial-year end that CHANGED between the two pulls withholds the movement, even though neither window crosses a start', async () => {
+  const client = snapshotClient(provenRows({ yearEnd: '12-31', tenant: 't1' }, { yearEnd: '03-31', tenant: 't1' }), pnl)
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), unprovenAs)
+})
+
+test('a balance that proves no year end (either end of the window) withholds the movement', async () => {
+  for (const [o, c] of [[null, '12-31'], ['12-31', null], [null, null], ['13-01', '13-01']] as const) {
+    const client = snapshotClient(provenRows({ yearEnd: o, tenant: 't1' }, { yearEnd: c, tenant: 't1' }), pnl)
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), unprovenAs, `${o}/${c}`)
+  }
+})
+
+test('balances from different organisations, or with no organisation, withhold the movement', async () => {
+  for (const [o, c] of [['t1', 't2'], [null, null], ['t1', null], [null, 't1']] as const) {
+    const client = snapshotClient(provenRows({ yearEnd: '12-31', tenant: o }, { yearEnd: '12-31', tenant: c }), pnl)
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), withheldAs, `${o}/${c}`)
+  }
+})
+
+test('a balance-sheet account is differenced without any year-end proof', async () => {
+  const client = snapshotClient(provenRows({ yearEnd: null, tenant: 't1' }, { yearEnd: null, tenant: 't1' }), { accountType: 'INVENTORY' })
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('persistAccountingAccountBalanceSnapshots stores the year end with the balance and overwrites it (with null) on a re-pull', async () => {
+  const client = snapshotClient()
+  const base = { connector: 'xero', externalAccountId: 'a-1', accountCode: '310', accountName: 'COGS', balanceDate: '2026-06-30', currency: 'GBP', amountForeign: '1', amountBase: '1', tenantId: 't1' }
+  await persistAccountingAccountBalanceSnapshots([{ ...base, financialYearEnd: '03-31' }], client as never)
+  assert.equal(client.rows[0]!.financialYearEnd, '03-31')
+  await persistAccountingAccountBalanceSnapshots([{ ...base, financialYearEnd: null }], client as never)
+  assert.equal(client.rows[0]!.financialYearEnd, null, 'a re-pull without a year end clears the old one')
+  await persistAccountingAccountBalanceSnapshots([{ ...base, financialYearEnd: '02-30' }], client as never)
+  assert.equal(client.rows[0]!.financialYearEnd, null, 'an impossible year end is not stored')
+})
+
+// WHICH account the two balances belong to.
+const ids = (openingId: string, closingId: string, openingTenant = 't1', closingTenant = 't1') => {
+  const [o, c] = windowRows('2026-05-31', '2026-06-30')
+  return [{ ...o!, externalAccountId: openingId, tenantId: openingTenant }, { ...c!, externalAccountId: closingId, tenantId: closingTenant }]
+}
+
+test('a code reassigned to another account: the old account\'s opening is NEVER subtracted from the new account\'s closing', async () => {
+  for (const accountType of ['INVENTORY', 'EXPENSE']) {
+    const client = snapshotClient(ids('old-account', 'cogs-account'), { accountType, yearEnd: '12-31', chartIds: ['cogs-account'] })
+    await assert.rejects(
+      () => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never),
+      (error) => error instanceof MissingAccountBalanceSnapshotError && error.reason === 'missing_previous_day_snapshot',
+      accountType,
+    )
+  }
+})
+
+test('both balances of the configured account\'s own id, same organisation: differenced (every type)', async () => {
+  for (const accountType of ['INVENTORY', 'EXPENSE']) {
+    const client = snapshotClient(ids('cogs-account', 'cogs-account'), { accountType, yearEnd: '12-31' })
+    assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00', accountType)
+  }
+})
+
+test('a balance-sheet account whose two balances come from different organisations is withheld', async () => {
+  const client = snapshotClient(ids('cogs-account', 'cogs-account', 't1', 't2'), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), (e) => e instanceof AccountBalanceMovementWithheldError && e.reason === 'account_identity_changed')
+})
+
+test('a code the chart does not name exactly once (none, two active, or an unknown id) is withheld, never guessed', async () => {
+  for (const chart of [{ accountType: null }, { accountType: 'INVENTORY', chartIds: ['cogs-account', 'other-account'] }] as Array<{ accountType: string | null; chartIds?: string[] }>) {
+    const client = snapshotClient(ids('cogs-account', 'cogs-account'), chart)
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), (e) => e instanceof AccountBalanceMovementWithheldError && e.reason === 'account_identity_unproven')
+  }
+})
+
+test('an explicit externalAccountId in the lookup is the intended account (the chart is asked for that id)', async () => {
+  const client = snapshotClient(ids('cogs-account', 'cogs-account'), { accountType: 'INVENTORY' })
+  const movement = await getAccountBalancePeriodMovement({ ...lookup('2026-06-01', '2026-06-30'), accountCode: undefined, externalAccountId: 'cogs-account' }, client as never)
+  assert.equal(movement.movementBase.toFixed(2), '-860.00')
+})
+
+// EXACT dates: the latest balance on or before a date is not the balance AT that date.
+test('a closing balance from an EARLIER day is not the closing balance: missing_closing_snapshot (so the on-demand sync runs)', async () => {
+  const client = snapshotClient(windowRows('2026-05-31', '2026-06-29'), { accountType: 'INVENTORY' })
+  await assert.rejects(
+    () => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never),
+    (error) => error instanceof MissingAccountBalanceSnapshotError && error.reason === 'missing_closing_snapshot' && error.requiredBalanceDate === '2026-06-30',
+  )
+})
+
+test('an opening balance from before the day before the window is missing_previous_day_snapshot, and only the exact days are differenced', async () => {
+  const older = snapshotClient(windowRows('2026-05-30', '2026-06-30'), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), older as never), (e) => e instanceof MissingAccountBalanceSnapshotError && e.reason === 'missing_previous_day_snapshot')
+  const exact = snapshotClient(windowRows('2026-05-31', '2026-06-30'), { accountType: 'INVENTORY' })
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), exact as never)).movementBase.toFixed(2), '-860.00')
+})
+
+// ---- balances written by the EARLIER (column-shifting) parser are absent, never a value -----------------------------------
+const oldParser = (rows: ReturnType<typeof windowRows>, which: 'opening' | 'closing' | 'both', version: number | null = null) =>
+  rows.map((row, index) => (which === 'both' || (which === 'opening' ? index === 0 : index === 1) ? { ...row, parserVersion: version } : row))
+
+test('PARSER VERSION: an opening or closing balance written by an earlier parser is missing, so the on-demand sync / withhold path runs', async () => {
+  for (const version of [null, 1]) {
+    const closingOld = snapshotClient(oldParser(windowRows('2026-05-31', '2026-06-30'), 'closing', version), { accountType: 'INVENTORY' })
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), closingOld as never), (e) => e instanceof MissingAccountBalanceSnapshotError && e.reason === 'missing_closing_snapshot')
+    const openingOld = snapshotClient(oldParser(windowRows('2026-05-31', '2026-06-30'), 'opening', version), { accountType: 'INVENTORY' })
+    await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), openingOld as never), (e) => e instanceof MissingAccountBalanceSnapshotError && e.reason === 'missing_previous_day_snapshot')
+  }
+})
+
+test('PARSER VERSION: a re-pulled balance (upsert overwrites the version) is used again', async () => {
+  const client = snapshotClient(oldParser(windowRows('2026-05-31', '2026-06-30'), 'both'), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), MissingAccountBalanceSnapshotError)
+  for (const row of client.rows) {
+    await persistAccountingAccountBalanceSnapshots([{ connector: row.connector, externalAccountId: row.externalAccountId, accountCode: row.accountCode, accountName: row.accountName, balanceDate: row.balanceDate, currency: row.currency, amountForeign: row.amountBase, amountBase: row.amountBase, tenantId: row.tenantId, parserVersion: 2 }], client as never)
+  }
+  assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
+})
+
+test('PARSER VERSION: persist stores no version unless the caller names one (so a stray writer is never read as current)', async () => {
+  const client = snapshotClient()
+  await persistAccountingAccountBalanceSnapshots([{ connector: 'xero', externalAccountId: 'a', accountName: 'x', balanceDate: '2026-06-30', currency: 'GBP', amountForeign: '1', amountBase: '1' }], client as never)
+  assert.equal(client.rows[0]!.parserVersion, null)
 })

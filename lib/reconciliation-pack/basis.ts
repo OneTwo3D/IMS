@@ -41,6 +41,7 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 import { xeroTrialBalanceRef } from '@/lib/connectors/xero/account-balance-refs'
 import { INTEGRATION_PLUGIN_SETTING_KEYS, parseIntegrationPluginEnabled } from '@/lib/integration-plugin-keys'
 import { streamsVerdict, type LivenessBracket } from '@/lib/reconciliation-pack/liveness'
+import { XERO_TRIAL_BALANCE_PARSER_VERSION } from '@/lib/domain/accounting/snapshot-provenance'
 import { PACK_BASIS_ACCOUNTS, TRANSIT_COVERAGE_SETTING_KEY, type PackBasisAccountKind, type PackBasisReason, type PackEmptyProofCode, type PackReasonCode, type PackTransitLegReason } from '@/lib/reconciliation-pack/constants'
 import { withReadOnlySnapshot } from '@/lib/reconciliation-pack/read-tx'
 
@@ -109,6 +110,10 @@ function unavailable(asOf: string | null, reason: PackBasisReason, packReason: P
 
 export type BasisGlRow = {
   accountCode: string | null
+  /** The Xero account id the balance was pulled for. A code can be reassigned; the id cannot. */
+  externalAccountId: string
+  /** The parser that wrote the balance; only the current version is a value, anything else is absent. */
+  parserVersion: number | null
   balanceDate: Date
   currency: string
   amountBase: unknown
@@ -121,9 +126,11 @@ export type BasisTx = {
   setting: { findMany(args: { where: { key: { in: string[] } }; select: { key: true; value: true } }): Promise<Array<{ key: string; value: string }>> }
   accountingToken: { findUnique(args: { where: { connector: string }; select: { tenantId: true } }): Promise<{ tenantId: string } | null> }
   organisation: { findFirst(args: { select: { baseCurrency: true } }): Promise<{ baseCurrency: string | null } | null> }
+  /** The chart: which account id is the configured account for a code (active accounts only). */
+  accountingAccount: { findMany(args: { where: { connector: string; code: { in: string[] }; active: true }; select: { code: true; externalAccountId: true } }): Promise<Array<{ code: string | null; externalAccountId: string }>> }
   accountingAccountBalanceSnapshot: {
-    findMany(args: { where: { connector: string; currency: string; accountCode: { in: string[] }; balanceDate: Date }; select: { accountCode: true; balanceDate: true; currency: true; amountBase: true; sourcePayloadRef: true; tenantId: true; updatedAt: true } }): Promise<BasisGlRow[]>
-    count(args: { where: { connector: string; currency: string; accountCode: string; tenantId: string } }): Promise<number>
+    findMany(args: { where: { connector: string; currency: string; accountCode: { in: string[] }; balanceDate: Date; parserVersion: number }; select: { accountCode: true; externalAccountId: true; parserVersion: true; balanceDate: true; currency: true; amountBase: true; sourcePayloadRef: true; tenantId: true; updatedAt: true } }): Promise<BasisGlRow[]>
+    count(args: { where: { connector: string; currency: string; accountCode: string; tenantId: string; parserVersion: number } }): Promise<number>
   }
   transitSubledgerMovement: {
     aggregate(args: { where: { journalDate: { gt: Date; lte: Date } }; _sum: { baseDelta: true } }): Promise<{ _sum: { baseDelta: unknown } }>
@@ -168,18 +175,18 @@ const DAY_MS = 24 * 60 * 60 * 1000
  * A balance that is the zero the pull synthesised for an account the trial balance omitted is NOT a reported zero, at either end of
  * the window. Never throws: anything it cannot read is a named reason, and the change token still covers what it did read.
  */
-async function readTransitLeg(tx: BasisTx, input: { asOf: string; date: Date; currency: string; tenant: string; transitCode: string; closing: BasisGlBalance; transitShared: boolean; coverageStart: string | undefined }): Promise<{ leg: BasisTransit; evidence: unknown }> {
+async function readTransitLeg(tx: BasisTx, input: { asOf: string; date: Date; currency: string; tenant: string; transitCode: string; transitAccountId: string; closing: BasisGlBalance; transitShared: boolean; coverageStart: string | undefined }): Promise<{ leg: BasisTransit; evidence: unknown }> {
   const unavailable = (reason: PackTransitLegReason, evidence: unknown = null) => ({ leg: { available: false, reason } as BasisTransit, evidence })
   const opening = new Date(input.date.getTime() - DAY_MS)
   const openingString = balanceDateString(opening)
   if (!isTransitLedgerCoverageSatisfied(input.coverageStart, opening)) return unavailable('transit_ledger_not_covering')
   if (input.transitShared) return unavailable('transit_balance_unusable')
   const rows = await tx.accountingAccountBalanceSnapshot.findMany({
-    where: { connector: BASIS_CONNECTOR, currency: input.currency, accountCode: { in: [input.transitCode] }, balanceDate: opening },
-    select: { accountCode: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true, tenantId: true, updatedAt: true },
+    where: { connector: BASIS_CONNECTOR, currency: input.currency, accountCode: { in: [input.transitCode] }, balanceDate: opening, parserVersion: XERO_TRIAL_BALANCE_PARSER_VERSION },
+    select: { accountCode: true, externalAccountId: true, parserVersion: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true, tenantId: true, updatedAt: true },
   })
-  const own = rows.filter((row) => row.accountCode === input.transitCode && row.tenantId === input.tenant)
-  const evidence = { opening: rows.map((row) => [row.accountCode, row.balanceDate instanceof Date ? row.balanceDate.toISOString() : null, row.currency, row.amountBase === null || row.amountBase === undefined ? null : String(row.amountBase), row.sourcePayloadRef, row.tenantId, row.updatedAt instanceof Date ? row.updatedAt.toISOString() : null]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))) }
+  const own = rows.filter((row) => row.parserVersion === XERO_TRIAL_BALANCE_PARSER_VERSION && row.accountCode === input.transitCode && row.externalAccountId === input.transitAccountId && row.tenantId === input.tenant)
+  const evidence = { opening: rows.map((row) => [row.accountCode, row.externalAccountId, row.balanceDate instanceof Date ? row.balanceDate.toISOString() : null, row.currency, row.amountBase === null || row.amountBase === undefined ? null : String(row.amountBase), row.sourcePayloadRef, row.tenantId, row.updatedAt instanceof Date ? row.updatedAt.toISOString() : null]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))) }
   if (own.length !== 1) return unavailable('transit_balance_unusable', evidence)
   const row = own[0]!
   if (!(row.balanceDate instanceof Date) || Number.isNaN(row.balanceDate.getTime()) || balanceDateString(row.balanceDate) !== openingString || row.currency !== input.currency) return unavailable('transit_balance_unusable', evidence)
@@ -249,20 +256,30 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   // 3. The ledger balances for EXACTLY D. One query, then every row is judged against its account.
   const wanted = [...new Set(codes.values())]
   const glRows = await tx.accountingAccountBalanceSnapshot.findMany({
-    where: { connector: BASIS_CONNECTOR, currency, accountCode: { in: wanted }, balanceDate: date },
-    select: { accountCode: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true, tenantId: true, updatedAt: true },
+    where: { connector: BASIS_CONNECTOR, currency, accountCode: { in: wanted }, balanceDate: date, parserVersion: XERO_TRIAL_BALANCE_PARSER_VERSION },
+    select: { accountCode: true, externalAccountId: true, parserVersion: true, balanceDate: true, currency: true, amountBase: true, sourcePayloadRef: true, tenantId: true, updatedAt: true },
   })
+  // WHICH account: the configured code names exactly one active chart account, and a stored balance counts only if it was
+  // pulled for THAT account id (a code reassigned to another account leaves the old account's balances under the same code).
+  const chartRows = await tx.accountingAccount.findMany({ where: { connector: BASIS_CONNECTOR, code: { in: wanted }, active: true }, select: { code: true, externalAccountId: true } })
+  const chartIds = new Map<string, string[]>()
+  for (const row of chartRows) if (row.code !== null) chartIds.set(row.code, [...(chartIds.get(row.code) ?? []), row.externalAccountId])
   const gl: BasisGlBalance[] = []
   let failure: PackBasisReason | null = null
   const note = (reason: PackBasisReason) => { failure ??= reason }
   for (const account of PACK_BASIS_ACCOUNTS) {
     const code = codes.get(account.kind)!
-    const forAccount = glRows.filter((row) => row.accountCode === code)
+    const accountIds = chartIds.get(code) ?? []
+    if (accountIds.length !== 1) { note('gl_account_identity'); continue }
+    // A balance written by an earlier parser is ABSENT, not a value (the query already excludes it; this is the second wall).
+    const forCode = glRows.filter((row) => row.accountCode === code && row.parserVersion === XERO_TRIAL_BALANCE_PARSER_VERSION)
+    const forAccount = forCode.filter((row) => row.externalAccountId === accountIds[0])
+    if (forCode.length > 0 && forAccount.length === 0) { note('gl_account_identity'); continue }
     const own = forAccount.filter((row) => row.tenantId === tenant)
     if (own.length === 0 && forAccount.length > 0) { note('gl_snapshot_other_tenant'); continue }
     if (own.length === 0) {
       // Say whether the account has ANY stored balance of this organisation: a different date is `not_for_date`, never a stand-in.
-      const anyDate = await tx.accountingAccountBalanceSnapshot.count({ where: { connector: BASIS_CONNECTOR, currency, accountCode: code, tenantId: tenant } })
+      const anyDate = await tx.accountingAccountBalanceSnapshot.count({ where: { connector: BASIS_CONNECTOR, currency, accountCode: code, tenantId: tenant, parserVersion: XERO_TRIAL_BALANCE_PARSER_VERSION } })
       note(anyDate > 0 ? 'not_for_date' : 'no_gl_snapshot')
       continue
     }
@@ -284,7 +301,7 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   if (failure) return fail(failure)
 
   // 3b. The transit leg (R10 only): a separate result; its unavailability never makes the inventory basis unavailable.
-  const transit = await readTransitLeg(tx, { asOf, date, currency, tenant, transitCode: codes.get('transit')!, closing: gl.find((g) => g.kind === 'transit')!, transitShared: sharedCodeKinds.includes('transit'), coverageStart: settings.get(TRANSIT_COVERAGE_SETTING_KEY) })
+  const transit = await readTransitLeg(tx, { asOf, date, currency, tenant, transitCode: codes.get('transit')!, transitAccountId: chartIds.get(codes.get('transit')!)?.[0] ?? '', closing: gl.find((g) => g.kind === 'transit')!, transitShared: sharedCodeKinds.includes('transit'), coverageStart: settings.get(TRANSIT_COVERAGE_SETTING_KEY) })
 
   // 4. The subledger for D: the run row, then the rows (counted and summed in the same snapshot), then the reliable flag.
   const run = await tx.inventorySnapshotRun.findUnique({ where: { snapshotDate: date }, select: { snapshotCount: true } })
@@ -311,7 +328,7 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
   const changeToken = createHash('sha256').update(JSON.stringify({
     settings: settingRows.map((row) => [row.key, row.value]).sort(),
     tenant, currency,
-    gl: glRows.map((row) => [row.accountCode, stamp(row.balanceDate), row.currency, stamp(row.amountBase), row.sourcePayloadRef, row.tenantId, stamp(row.updatedAt)]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    gl: glRows.map((row) => [row.accountCode, row.externalAccountId, row.parserVersion, stamp(row.balanceDate), row.currency, stamp(row.amountBase), row.sourcePayloadRef, row.tenantId, stamp(row.updatedAt)]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     run: run.snapshotCount, rows: rowCount, sum: sum.toFixed(6), unreliable,
     transit: { leg: transit.leg, evidence: transit.evidence },
   })).digest('hex')

@@ -62,7 +62,7 @@ test('the evaluator is used unchanged for sweep and flag gaps', async () => {
 test('every IMS read happens inside the one run (the double throws on a read outside it) and reads nothing but the allowed tables', async () => {
   const { log, calls } = await load(goodState())
   assert.equal(calls, 2)
-  assert.deepEqual([...new Set(log)].sort(), ['accountingToken.findUnique', 'inventorySnapshot.aggregate', 'inventorySnapshot.count', 'organisation.findFirst', 'run.findUnique', 'setting.findMany', 'snapshot.findMany', 'transit.aggregate'])
+  assert.deepEqual([...new Set(log)].sort(), ['accountingAccount.findMany', 'accountingToken.findUnique', 'inventorySnapshot.aggregate', 'inventorySnapshot.count', 'organisation.findFirst', 'run.findUnique', 'setting.findMany', 'snapshot.findMany', 'transit.aggregate'])
 })
 
 // [mutation: findLatest-style (on-or-before) read] the exact date, never the latest earlier balance
@@ -344,6 +344,7 @@ test('text safety: the result carries kinds, counts and decimals; never an accou
   const hostile = ['sk', 'live', 'abcdefghijklmnopqrstuvwxyz0123'].join('_') + ' https://evil.example'
   state.settings.set('xero_cogs_account', hostile)
   state.gl = state.gl.map((row) => (row.accountCode === CODES.cogs ? { ...row, accountCode: hostile } : row))
+  state.chart = state.chart.map((row) => (row.code === CODES.cogs ? { ...row, code: hostile } : row))
   const { basis } = await load(state)
   assert.equal(basis.available, true)
   const text = JSON.stringify(basis)
@@ -352,7 +353,7 @@ test('text safety: the result carries kinds, counts and decimals; never an accou
 
 test('the closed reason table is exactly the reasons the basis can return', () => {
   assert.deepEqual([...PACK_BASIS_REASON_LIST].sort(), [
-    'basis_moved', 'basis_unreadable', 'gl_snapshot_ambiguous', 'gl_snapshot_other_tenant', 'gl_snapshot_unlabelled', 'inventory_accounts_shared', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
+    'basis_moved', 'basis_unreadable', 'gl_account_identity', 'gl_snapshot_ambiguous', 'gl_snapshot_other_tenant', 'gl_snapshot_unlabelled', 'inventory_accounts_shared', 'no_account_configured', 'no_gl_snapshot', 'no_subledger_snapshot',
     'not_for_date', 'stream_not_fresh', 'subledger_snapshot_incomplete', 'unreliable_subledger_snapshot',
   ])
   const kinds: PackBasisAccountKind[] = ['inventory', 'allocated', 'transit', 'cogs', 'unearned']
@@ -489,4 +490,88 @@ test('TRANSIT LEG: the transit leg changing between the read and the settle is B
 test('TRANSIT LEG: the closed reason table is exactly the reasons the leg can return, and a leg reason never reaches the basis reasons', () => {
   assert.deepEqual(Object.keys(PACK_TRANSIT_LEG_REASONS).sort(), ['transit_absent_from_tb', 'transit_balance_unusable', 'transit_ledger_not_covering'])
   assert.ok(!PACK_BASIS_REASON_LIST.some((r) => (r as string).startsWith('transit_')))
+})
+
+// [mutation: the account-id filter removed] a code reassigned to another account must not be read as the configured account's balance
+test('IDENTITY: a balance pulled for another account id under the configured code is never the configured account\'s', async () => {
+  for (const kind of KINDS) {
+    const state = goodState()
+    state.gl = state.gl.map((row) => (row.accountCode === CODES[kind] ? { ...row, externalAccountId: 'acct-OLD' } : row))
+    assert.equal(reason((await load(state)).basis), 'gl_account_identity', kind)
+  }
+})
+
+test('IDENTITY: the configured account\'s own balance is chosen even when an old account\'s balance sits under the same code', async () => {
+  const state = goodState()
+  const old = state.gl.find((row) => row.accountCode === CODES.inventory && row.balanceDate.getTime() === dateOf(D).getTime())!
+  state.gl = [...state.gl, { ...old, externalAccountId: 'acct-OLD', amountBase: '99999' }]
+  const { basis } = await load(state)
+  assert.equal(basis.available, true)
+  assert.equal((basis as unknown as { gl: Array<{ kind: string; amountBase: string }> }).gl.find((g) => g.kind === 'inventory')!.amountBase, '1000.500000')
+})
+
+test('IDENTITY: a code the chart names for no account, or for two active accounts, is gl_account_identity', async () => {
+  const none = goodState()
+  none.chart = none.chart.filter((row) => row.code !== CODES.cogs)
+  assert.equal(reason((await load(none)).basis), 'gl_account_identity')
+  const two = goodState()
+  two.chart = [...two.chart, { code: CODES.cogs, externalAccountId: 'acct-second' }]
+  assert.equal(reason((await load(two)).basis), 'gl_account_identity')
+})
+
+test('IDENTITY: the transit opening balance must be the configured transit account\'s own', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((row) => (row.balanceDate.getTime() === dateOf(PREVIOUS).getTime() ? { ...row, externalAccountId: 'acct-OLD' } : row))
+  const { basis } = await load(state)
+  assert.equal(basis.available, true)
+  assert.deepEqual((basis as unknown as { transit: unknown }).transit, { available: false, reason: 'transit_balance_unusable' })
+})
+
+// [mutation: the parser-version filter removed from the query AND the row check] a balance the earlier parser wrote is absent
+test('PARSER VERSION: a balance written by an earlier parser is ABSENT for the cycle date, never a value', async () => {
+  for (const version of [null, 1]) {
+    for (const kind of KINDS) {
+      const state = goodState()
+      state.gl = state.gl.map((row) => (row.accountCode === CODES[kind] && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, parserVersion: version } : row))
+      const { basis } = await load(state)
+      // The only row for that account on any date is the old one, so the account has no balance at all.
+      assert.equal(reason(basis), kind === 'transit' ? 'not_for_date' : 'no_gl_snapshot', `${kind} v${String(version)}`)
+    }
+  }
+})
+
+test('PARSER VERSION: an old-version row for D with a CURRENT-version row on another date is not_for_date', async () => {
+  const state = goodState()
+  const current = state.gl.find((row) => row.accountCode === CODES.inventory)!
+  state.gl = [...state.gl.map((row) => (row === current ? { ...row, parserVersion: null } : row)), { ...current, balanceDate: dateOf('2026-10-10'), sourcePayloadRef: REF('2026-10-10'), parserVersion: 2 }]
+  assert.equal(reason((await load(state)).basis), 'not_for_date')
+})
+
+test('PARSER VERSION: a re-pulled row (current version) is used again', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((row) => ({ ...row, parserVersion: null }))
+  assert.equal((await load(state)).basis.available, false)
+  state.gl = state.gl.map((row) => ({ ...row, parserVersion: 2 }))
+  assert.equal((await load(state)).basis.available, true)
+})
+
+test('PARSER VERSION: an old-version transit OPENING balance makes the transit leg unusable, not a number', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((row) => (row.balanceDate.getTime() === dateOf(PREVIOUS).getTime() ? { ...row, parserVersion: null } : row))
+  const { basis } = await load(state)
+  assert.equal(basis.available, true)
+  assert.deepEqual((basis as unknown as { transit: unknown }).transit, { available: false, reason: 'transit_balance_unusable' })
+})
+
+test('PARSER VERSION: even if the query returned an old-version row, the basis checks the row itself (second wall)', async () => {
+  const state = goodState()
+  state.queryIgnoresVersion = true
+  state.gl = state.gl.map((row) => (row.accountCode === CODES.inventory && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, parserVersion: null } : row))
+  assert.equal((await load(state)).basis.available, false)
+  const transit = goodState()
+  transit.queryIgnoresVersion = true
+  transit.gl = transit.gl.map((row) => (row.balanceDate.getTime() === dateOf(PREVIOUS).getTime() ? { ...row, parserVersion: null } : row))
+  const { basis } = await load(transit)
+  assert.equal(basis.available, true)
+  assert.deepEqual((basis as unknown as { transit: unknown }).transit, { available: false, reason: 'transit_balance_unusable' })
 })

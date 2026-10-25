@@ -59,7 +59,7 @@ async function seed(): Promise<Seed> {
   }
   await db.$executeRawUnsafe(`INSERT INTO inventory_snapshot_runs (id, "snapshotDate", "stockLevelCount", "snapshotCount", "updatedAt") VALUES ($1, '2026-10-19', 1, 1, now())`, `${TAG}-run`)
   await db.$executeRawUnsafe(`INSERT INTO inventory_snapshots (id, "snapshotDate", "productId", "warehouseId", qty, "valueBase", "unitCostBase") VALUES ($1, '2026-10-19', $2, $3, 5, 12.5, 2.5)`, `${TAG}-snap`, product.id, warehouse.id)
-  await db.$executeRawUnsafe(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "updatedAt") VALUES ($1, 'xero', $2, '630', 'Inventory', '2026-10-19', 'GBP', 7, 7, now())`, `${TAG}-bal`, `${TAG}-acct`)
+  await db.$executeRawUnsafe(`INSERT INTO accounting_account_balance_snapshots (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency, "amountForeign", "amountBase", "parserVersion", "updatedAt") VALUES ($1, 'xero', $2, '630', 'Inventory', '2026-10-19', 'GBP', 7, 7, 2, now())`, `${TAG}-bal`, `${TAG}-acct`)
   const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: TAG } })
   await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: warehouse.id, connector: 'mintsoft', externalWarehouseId: `${TAG}ext`, stockSyncMode: 'NOTIFICATION_ONLY' } })
   await db.wmsProductLink.create({ data: { productId: product.id, connector: 'mintsoft', externalProductId: `${TAG}ext-product` } })

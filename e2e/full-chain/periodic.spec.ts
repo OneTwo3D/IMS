@@ -1437,8 +1437,8 @@ async function seedTransitReconciliationResidue(
       db.query(
         `insert into accounting_account_balance_snapshots
            (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency,
-            "amountForeign", "amountBase", "sourcePayloadRef", "fetchedAt", "createdAt", "updatedAt")
-         values ($1, 'xero', $2, $3, 'Stock in Transit (e2e)', $4, 'GBP', $5, $5, $6, now(), now(), now())
+            "amountForeign", "amountBase", "sourcePayloadRef", "parserVersion", "fetchedAt", "createdAt", "updatedAt")
+         values ($1, 'xero', $2, $3, 'Stock in Transit (e2e)', $4, 'GBP', $5, $5, $6, 2, now(), now(), now())
          on conflict (connector, "externalAccountId", "balanceDate", currency)
            do update set "amountBase" = excluded."amountBase", "amountForeign" = excluded."amountForeign",
                          "sourcePayloadRef" = excluded."sourcePayloadRef", "fetchedAt" = now()`,

@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { LandedCostMethod, Prisma } from '@/app/generated/prisma/client'
 import { roundExact } from '@/lib/domain/math/exact-figure'
+import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   aggregateCogsRows,
   aggregateInventoryTurnoverRows,
@@ -10,6 +11,7 @@ import {
   assertInventoryTurnoverSourceLimit,
   getInventoryTurnoverReport,
   inventoryCostingFiltersFromSearch,
+  inventoryGlVarianceFromSnapshot,
   InventoryTurnoverSourceLimitError,
   resolveCogsRevenueKeys,
   type CogsAggregationInput,
@@ -787,5 +789,26 @@ describe('resolveCogsRevenueKeys (scjz.67 line-granularity revenue)', () => {
     )
     assert.equal(resolved[0]?.revenueKey, null)
     assert.equal(resolved[0]?.revenueBase, null)
+  })
+})
+
+describe('inventory valuation GL variance needs a GL balance dated EXACTLY the valuation date', () => {
+  const snap = (iso: string) => ({ balanceDate: new Date(`${iso}T00:00:00.000Z`), amountBase: toDecimal('100.00') })
+  it('uses a balance dated asOf', () => {
+    const r = inventoryGlVarianceFromSnapshot(snap('2026-10-25'), '2026-10-25', toDecimal('90.00'), '630')
+    assert.equal(r.glBalanceBase?.toFixed(2), '100.00')
+    assert.equal(r.glVarianceBase?.toFixed(2), '-10.00')
+    assert.deepEqual(r.notices, [])
+  })
+  it('does NOT present an earlier day\'s balance as the variance for asOf', () => {
+    const r = inventoryGlVarianceFromSnapshot(snap('2026-10-24'), '2026-10-25', toDecimal('90.00'), '630')
+    assert.equal(r.glBalanceBase, null)
+    assert.equal(r.glVarianceBase, null)
+    assert.match(r.notices[0]!, /dated 2026-10-24, not 2026-10-25/)
+  })
+  it('no balance at all is blank with the existing notice', () => {
+    const r = inventoryGlVarianceFromSnapshot(null, '2026-10-25', toDecimal('90.00'), '630')
+    assert.equal(r.glVarianceBase, null)
+    assert.match(r.notices[0]!, /No stored GL balance snapshot/)
   })
 })

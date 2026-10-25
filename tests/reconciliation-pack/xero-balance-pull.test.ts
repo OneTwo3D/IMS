@@ -32,7 +32,7 @@ mock.module('@/lib/connectors/xero/settings', {
 })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    xeroGet: async (path: string) => { getCalls.push(path); return { ok: true, data: trialBalance } },
+    xeroGet: async (path: string) => { getCalls.push(path); return { ok: true, data: path.startsWith('Accounts') ? { Accounts: chart.map((a) => ({ AccountID: a.externalAccountId, Code: a.code, Name: a.name, Type: 'ASSET', TaxType: 'NONE', Status: 'ACTIVE', Class: 'ASSET' })) } : trialBalance } },
     xeroGetCached: async (path: string) => { cachedCalls.push(path); return { ok: true, data: { Organisations: [{ BaseCurrency: 'GBP' }] } } },
   },
 })
@@ -40,7 +40,7 @@ mock.module('@/lib/connectors/xero/connection-fence', {
   namedExports: {
     captureXeroConnection: async () => ({ tenantId: 'tenant-x', connectionGeneration: 'gen-1' }),
     withXeroConnectionFence: async (_c: unknown, fn: (tx: unknown) => Promise<unknown>) => {
-      const tx = { setting: { upsert: async ({ where }: { where: { key: string } }) => { stamps.push(where.key) } }, snapshots: [] as Persisted }
+      const tx = { accountingAccount: { upsert: async () => undefined, updateMany: async () => undefined }, setting: { upsert: async ({ where }: { where: { key: string } }) => { stamps.push(where.key) } }, snapshots: [] as Persisted }
       const value = await fn(tx)
       return { ok: true, value }
     },
@@ -53,7 +53,9 @@ mock.module('@/lib/domain/accounting/account-balance-snapshots', {
   },
 })
 
-const row = (id: string, label: string, debit: string, credit = '0') => ({ RowType: 'Row', Cells: [{ Value: label, Attributes: [{ Id: 'account', Value: id }] }, { Value: debit }, { Value: credit }] })
+const LIVE_META = { ReportID: 'TrialBalance', ReportName: 'Trial Balance', ReportType: 'TrialBalance', ReportTitles: ['Trial Balance', 'One Two Enterprises Ltd', 'As at 19 October 2026'], ReportDate: '20 October 2026' }
+const row = (id: string, label: string, debit: string, credit = '0') => ({ RowType: 'Row', Cells: [{ Value: label, Attributes: [{ Id: 'account', Value: id }] }, { Value: '0' }, { Value: '0' }, { Value: debit }, { Value: credit }] })
+const TB_HEADER = { RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }
 const FULL_CHART = [
   { externalAccountId: 'a-630', code: '630', name: 'Inventory' },
   { externalAccountId: 'a-631', code: '631', name: 'Allocated' },
@@ -65,7 +67,7 @@ const FULL_CHART = [
 function reset() {
   getCalls = []; cachedCalls = []; persisted = []; stamps = []; unearnedCode = '260'
   chart = FULL_CHART
-  trialBalance = { Reports: [{ Rows: [{ RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '200'), row('a-632', '632 - Transit', '50'), row('a-500', '500 - COGS', '75'), row('a-260', '260 - Unearned Revenue', '0', '300')] }] }] }
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '200'), row('a-632', '632 - Transit', '50'), row('a-500', '500 - COGS', '75'), row('a-260', '260 - Unearned Revenue', '0', '300')] }] }] }
 }
 
 async function pull() {
@@ -104,8 +106,12 @@ test('ZERO EXTRA CALLS: the request count is identical with and without Unearned
   chart = FULL_CHART.filter((account) => account.code !== '260')
   await pull()
   assert.deepEqual({ gets: getCalls, cached: cachedCalls }, withUnearned)
-  assert.equal(withUnearned.gets.length, 1)
-  assert.match(withUnearned.gets[0]!, /^Reports\/TrialBalance\?date=2026-10-19$/)
+  // Three GETs: the pull brackets the Trial Balance with two reads of the CURRENT chart (Accounts), so a code Xero moves while the
+  // report is in flight is caught; adding an account to the list still adds none.
+  assert.equal(withUnearned.gets.length, 3)
+  assert.equal(withUnearned.gets[0], 'Accounts')
+  assert.match(withUnearned.gets[1]!, /^Reports\/TrialBalance\?date=2026-10-19$/)
+  assert.equal(withUnearned.gets[2], 'Accounts')
   assert.equal(withUnearned.cached.length, 1)
 })
 
@@ -120,7 +126,8 @@ test('an Unearned Revenue account that is configured but not in the chart stops 
 // [mutation: the absent suffix removed]
 test('a configured account that a NON-EMPTY Trial Balance omits is stored as a zero labelled absent-from-tb; a reported zero is not', async () => {
   reset()
-  trialBalance = { Reports: [{ Rows: [{ RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75')] }] }] }
+  // Complete by its own evidence: the rows add up to the Total row (the offsetting credit is on an unconfigured equity account).
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75'), row('a-999', '999 - Equity', '0', '1075')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '1075', '1075'].map((Value) => ({ Value })) }] }] }] }
   await pull()
   const byCode = new Map(persisted.map((snapshot) => [snapshot.accountCode, snapshot]))
   assert.equal(byCode.get('630')!.sourcePayloadRef, 'xero:trial-balance:2026-10-19')
@@ -133,7 +140,7 @@ test('a configured account that a NON-EMPTY Trial Balance omits is stored as a z
 
 test('an EMPTY Trial Balance synthesises nothing: it is an error, not a set of zeros', async () => {
   reset()
-  trialBalance = { Reports: [{ Rows: [] }] }
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [] }] }
   const result = await pull()
   assert.equal(persisted.length, 0)
   assert.equal(result.persisted, 0)

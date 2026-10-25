@@ -26,7 +26,7 @@ const sites: Array<{ file: string; signature: string; capture: RegExp; fetch: Re
   { file: 'lib/connectors/xero/account-balances.ts', signature: 'export async function syncXeroAccountBalanceSnapshots', capture: /captureXeroConnection\(\)/, fetch: /xeroGet<XeroTrialBalanceReport>/, write: /withXeroConnectionFence\(connection/ },
   { file: 'app/actions/settings.ts', signature: 'export async function generateMissingXeroTaxRates', capture: /captureXeroConnection\(\)/, fetch: /getXeroTaxRates\(\)/, write: /assertXeroConnectionUnchanged\(tx as never, connection\)/ },
   { file: 'app/actions/settings.ts', signature: 'export async function autoLinkXeroTaxRates', capture: /captureXeroConnection\(\)/, fetch: /getXeroTaxRates\(\)/, write: /assertXeroConnectionUnchanged\(tx as never, connection\)/ },
-  { file: 'lib/connectors/xero/accounts.ts', signature: 'export async function syncChartOfAccounts', capture: /captureXeroConnection\(\)/, fetch: /xeroGet<AccountingAccountResponse>/, write: /withXeroConnectionFence\(connection/ },
+  { file: 'lib/connectors/xero/accounts.ts', signature: 'export async function syncChartOfAccounts', capture: /captureXeroConnection\(\)/, fetch: /fetchXeroChartOfAccounts\(\)/, write: /withXeroConnectionFence\(connection/ },
   { file: 'lib/connectors/xero/tax-rate-drift-sweeper.ts', signature: 'export async function runXeroTaxRateDriftSweep', capture: /captureXeroConnection\(\)/, fetch: /fetchXeroTaxRatesBody\(\)/, write: /withXeroConnectionFence\(connection/ },
 ]
 

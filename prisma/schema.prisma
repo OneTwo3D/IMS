@@ -2598,6 +2598,12 @@ model AccountingAccountBalanceSnapshot {
   sourcePayloadRef  String?
   /// The Xero organisation the balance was fetched from (the bound connection's tenant at the pull). NULL = unknown.
   tenantId          String?
+  /// The organisation's financial-year end ("MM-DD") in force when this balance was pulled. NULL = not proven. The stored figure is
+  /// year-to-date, so a profit-and-loss balance can be differenced against another only when both prove the same year end.
+  financialYearEnd  String?
+  /// Which parser wrote the balance (lib/domain/accounting/snapshot-provenance.ts). NULL or an old number = written by the earlier,
+  /// column-shifting parser: readers treat the row as absent until the date is pulled again.
+  parserVersion     Int?
   syncRunId         String?
   fetchedAt         DateTime @default(now())
   createdAt         DateTime @default(now())
