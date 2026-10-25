@@ -279,7 +279,7 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   await precondition(d)
   const w = await seedWorld(d)
   const { db } = d
-  const frozen = async (id: string) => { const r = await db.taxRate.findUniqueOrThrow({ where: { id }, include: { components: { orderBy: { sortOrder: 'asc' } } } }); const { active: _a, isDefault: _d, updatedAt: _u, ...rest } = r; return JSON.stringify(rest) }
+  const frozen = async (id: string) => { const r = await db.taxRate.findUniqueOrThrow({ where: { id }, include: { components: { orderBy: { sortOrder: 'asc' } } } }); const rest: Record<string, unknown> = { ...r }; for (const k of ['active', 'isDefault', 'updatedAt']) delete rest[k]; return JSON.stringify(rest) }
   const oldBefore = { cy: await frozen(w.ids.cy), gr: await frozen(w.ids.gr), be: await frozen(w.ids.be), bg: await frozen(w.ids.bg), amb: await frozen(w.ids.amb), pct: await frozen(w.ids.pct), nope: await frozen(w.ids.nope) }
   const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
   const result = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
