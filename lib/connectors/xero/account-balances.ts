@@ -202,7 +202,11 @@ function trialBalanceColumns(header: XeroReportRow | null): { columns: TrialBala
 function ytdMoney(cell: XeroReportCell | undefined): Decimal | 'invalid' {
   const value = cell?.Value
   if (typeof value === 'string' && value.trim() === '') return toDecimal(0)
-  return parseMoneyCell(value) ?? 'invalid'
+  const amount = parseMoneyCell(value)
+  // Xero money is two decimal places. A cell beyond that is not a money amount this report can be read as (it would make an
+  // exact sum comparison meaningless), so it is invalid, never rounded.
+  if (amount === null || amount.decimalPlaces() > 2) return 'invalid'
+  return amount
 }
 
 type YtdSums = { debit: Decimal; credit: Decimal }
@@ -247,7 +251,7 @@ function collectRows(
     const ytdDebit = ytdMoney(cells[columns.ytdDebit])
     const ytdCredit = ytdMoney(cells[columns.ytdCredit])
     if (ytdDebit === 'invalid' || ytdCredit === 'invalid') {
-      refuse('TB_NON_MONEY_CELL', `its ${ytdDebit === 'invalid' ? 'YTD Debit' : 'YTD Credit'} cell is not a money amount`)
+      refuse('TB_NON_MONEY_CELL', `its ${ytdDebit === 'invalid' ? 'YTD Debit' : 'YTD Credit'} cell is not a money amount (or has more than two decimal places)`)
       continue
     }
     // Stored convention: debit minus credit, so a credit-balance account is negative.
@@ -265,7 +269,7 @@ function findTotalRows(rows: XeroReportRow[] | undefined, found: XeroReportRow[]
   return found
 }
 
-/** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row (both YTD columns, exact to the cent). */
+/** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row (both YTD columns, exactly; a cell with more than two decimal places is unreadable). */
 function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: TrialBalanceColumns, sums: YtdSums, refused: number): string | null {
   if (refused > 0) return 'a row was refused, so the rows read cannot be summed'
   const totals = findTotalRows(entryRows)
@@ -275,7 +279,8 @@ function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: Tr
   const totalDebit = ytdMoney(cells[columns.ytdDebit])
   const totalCredit = ytdMoney(cells[columns.ytdCredit])
   if (totalDebit === 'invalid' || totalCredit === 'invalid') return 'its Total row is not readable'
-  if (sums.debit.toFixed(2) !== totalDebit.toFixed(2) || sums.credit.toFixed(2) !== totalCredit.toFixed(2)) {
+  // EXACT decimal equality (every cell above is at most two decimal places, so nothing here is rounded).
+  if (!sums.debit.eq(totalDebit) || !sums.credit.eq(totalCredit)) {
     return `the rows read add up to ${sums.debit.toFixed(2)} / ${sums.credit.toFixed(2)} (YTD Debit / Credit) but the Total row says ${totalDebit.toFixed(2)} / ${totalCredit.toFixed(2)}`
   }
   // Deliberately NO debit == credit test: Xero's own Total row is not guaranteed to balance (the live organisation's differs by

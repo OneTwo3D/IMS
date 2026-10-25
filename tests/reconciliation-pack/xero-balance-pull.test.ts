@@ -166,3 +166,34 @@ test('every stored balance records the organisation of the connection the trial 
   assert.equal(persisted.length, 5)
   for (const snapshot of persisted) assert.equal(snapshot.tenantId, 'tenant-x')
 })
+
+const withTotal = (rows: unknown[], totalDebit: string, totalCredit: string) => ({ Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: rows }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', totalDebit, totalCredit].map((Value) => ({ Value })) }] }] }] })
+const proven = () => persisted.filter((snapshot) => String(snapshot.sourcePayloadRef).endsWith(':absent-from-complete-tb'))
+
+// [mutation: the sums compared through toFixed(2) with no decimal-place refusal]
+test('COMPLETENESS IS EXACT: rows summing 100.000 against a Total of 100.004 prove nothing; no proven-absent ref is written', async () => {
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100.000'), row('a-999', '999 - Equity', '0', '100.000')], '100.004', '100.000')
+  const result = await pull()
+  assert.deepEqual(proven(), [])
+  assert.ok(result.errors.some((e) => e.includes('TB_COMPLETENESS_UNPROVEN')))
+})
+
+test('COMPLETENESS IS EXACT: a YTD cell with more than two decimal places is refused (data row) or unreadable (Total row)', async () => {
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100.004'), row('a-999', '999 - Equity', '0', '100.004')], '100.004', '100.004')
+  const result = await pull()
+  assert.deepEqual(proven(), [])
+  assert.ok(result.errors.some((e) => e.includes('TB_NON_MONEY_CELL')), JSON.stringify(result.errors))
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100'), row('a-999', '999 - Equity', '0', '100')], '100.001', '100')
+  await pull()
+  assert.deepEqual(proven(), [])
+})
+
+test('COMPLETENESS IS EXACT: sums that equal the Total exactly prove the omission (a trailing-zero third place is the same amount)', async () => {
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100.50'), row('a-999', '999 - Equity', '0', '100.500')], '100.500', '100.50')
+  await pull()
+  assert.deepEqual(proven().map((s) => s.accountCode).sort(), ['260', '500', '631', '632'])
+})
