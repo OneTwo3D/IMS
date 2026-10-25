@@ -14,7 +14,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
-  VAT_DIFF_CLI_CODES, accountAllowed, buildVatDiffEnv, parseVatDiffArgs, renderVatDiffText, renderVatDiffUsage, vatDiffExitCode,
+  VAT_DIFF_CLI_CODES, accountAllowed, buildVatDiffEnv, parseVatDiffArgs, renderVatDiffText, renderVatDiffUsage, vatDiffExitCode, vatDiffJson,
   type VatDiffCliCode,
 } from '../lib/tax/vat-difference-cli.ts'
 import { createStoredWooPort, runVatDifferenceReport, type VatRunDb } from '../lib/tax/vat-difference-run.ts'
@@ -90,8 +90,8 @@ export async function runVatDiffCli(options: VatDiffOptions): Promise<number> {
     disconnect = opened.disconnect
     const report = await runVatDifferenceReport({ db: opened.db, now, woo: options.deps?.woo ?? createStoredWooPort() })
     options.onReport?.(report)
-    out(args.json ? JSON.stringify(report, null, 2) : renderVatDiffText(report))
-    return vatDiffExitCode(report)
+    out(args.json ? JSON.stringify(vatDiffJson(report, args.scheme), null, 2) : renderVatDiffText(report, args.scheme))
+    return vatDiffExitCode(report, args.scheme)
   } catch {
     err(`The VAT difference report failed before it reached an outcome (treat as not compared): INTERNAL`)
     return 3

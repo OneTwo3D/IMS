@@ -5,9 +5,10 @@ import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/
 import { DRIFT_MAX_STALENESS_MS } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { readWooTaxRateDetails, type WooGetPort, type WooPage, type WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
 import { wooHopRefusal } from '@/lib/reconciliation-pack/woo-transport'
-import { VAT_DIFFERENCE_REASON_LIST, compareVatSets, type ImsRateRow, type ImsXeroSnapshot, type VatDifferenceReason } from '@/lib/tax/vat-difference-report'
+import { VAT_DIFFERENCE_REASONS, VAT_DIFFERENCE_REASON_LIST, compareVatSets, type ImsRateRow, type ImsXeroSnapshot, type VatDifferenceReason } from '@/lib/tax/vat-difference-report'
 import { runVatDifferenceReport, type VatRunDb } from '@/lib/tax/vat-difference-run'
-import { VAT_DIFF_EXIT_CODES, parseVatDiffArgs, vatDiffExitCode } from '@/lib/tax/vat-difference-cli'
+import { VAT_DIFF_EXIT_CODES, parseVatDiffArgs, vatDiffExitCode, vatDiffJson } from '@/lib/tax/vat-difference-cli'
+import { classifyImsRate, classifyWooRate, classifyXeroType } from '@/lib/tax/vat-scheme'
 import { WRITER_OWNERSHIP_MAP } from '@/lib/security/writer-ownership-map'
 import { runVatDiffCli } from '../../scripts/vat-difference-report'
 
@@ -22,11 +23,11 @@ const NOW = new Date('2026-10-25T12:00:00Z')
 const FETCHED = new Date('2026-10-25T11:30:00Z')
 
 const xeroRow = (taxType: string, pct: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({
-  taxType, name: `Xero ${taxType}`, status: 'ACTIVE', reportTaxType: null, effectiveRate: `${pct}.000000`, displayTaxRate: `${pct}.000000`, components: [],
+  taxType, name: `Xero ${taxType}`, status: 'ACTIVE', reportTaxType: taxType.startsWith('OUTPUT') ? 'OUTPUT' : taxType.startsWith('INPUT') ? 'INPUT' : null, effectiveRate: `${pct}.000000`, displayTaxRate: `${pct}.000000`, components: [],
   canApply: { assets: false, equity: false, expenses: taxType.startsWith('INPUT'), liabilities: false, revenue: taxType.startsWith('OUTPUT') }, ...over,
 })
 const imsRate = (id: string, type: string | null, fraction: string, over: Partial<ImsRateRow> = {}): ImsRateRow => ({
-  id, name: `IMS ${id}`, rate: fraction, usedFor: 'SALES', active: true, accountingTaxType: type, countryCode: 'GB', isCompound: false, reverseCharge: false, components: [], ...over,
+  id, reportingCategory: null, name: `IMS ${id}`, rate: fraction, usedFor: 'SALES', active: true, accountingTaxType: type, countryCode: 'GB', isCompound: false, reverseCharge: false, components: [], ...over,
 })
 const wooRate = (id: string, rate: string, over: Partial<WooTaxRateDetail> = {}): WooTaxRateDetail => ({
   id, name: `Woo ${id}`, rate, country: 'GB', state: '', postcode: '', city: '', class: 'standard', shipping: true, compound: false, ...over,
@@ -74,7 +75,7 @@ const CASES: Record<VatDifferenceReason, { mutate: Mutate; extra?: VatDifference
   WOO_CLASS_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { class: 'reduced-rate' }) } },
   WOO_COMPOUND_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { compound: true }) } },
   WOO_SHIPPING_NOT_TAXED: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { shipping: false }) } },
-  WOO_REGIONAL_SCOPE: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { postcode: 'BT*' }) } },
+  UNCLASSIFIED_SCHEME: { mutate: (s) => { s.snapshot.rates.push(imsRate('de', null, '0.1900', { usedFor: 'PURCHASE', countryCode: 'DE' })) }, extra: ['IMS_RATE_NO_XERO_TYPE'] },
 }
 
 for (const reason of VAT_DIFFERENCE_REASON_LIST) {
@@ -119,6 +120,84 @@ test('scope is compared both ways, and a null recorded class is the standard cla
   const c = run((s) => { s.snapshot.mappings[0]!.externalClass = null; s.woo[0] = wooRate('1', '20.0000', { class: 'reduced-rate' }) })
   assert.deepEqual(c.map((d) => [d.reason, d.ims, d.woo]), [['WOO_CLASS_MISMATCH', 'standard', 'reduced-rate']])
   assert.deepEqual(run((s) => { s.snapshot.mappings[0]!.externalClass = null }), [])
+})
+
+// [mutation: a classification rule changed (NO no longer VOEC, OSS marker ignored, EU without marker guessed) -> the matching arm red]
+test('classification: UK, IOSS, VOEC, other and unclassified, each with its cited source', () => {
+  const ims = (countryCode: string | null, reportingCategory: string | null, reportType: string | null = null) => classifyImsRate({ countryCode, reportingCategory }, reportType)
+  const got = (c: { scheme: string; source: string }) => c.scheme
+  assert.equal(got(ims('GB', null)), 'uk'); assert.equal(got(ims('GB', 'DOMESTIC')), 'uk'); assert.equal(got(ims('GB', 'EC_SALES')), 'uk'); assert.equal(got(ims('UK', null)), 'uk')
+  assert.equal(got(ims(null, 'DOMESTIC', 'OUTPUT')), 'uk'); assert.equal(got(ims(null, null)), 'uk')
+  assert.equal(got(ims('DE', 'IOSS')), 'ioss'); assert.equal(got(ims(null, 'ioss')), 'ioss')
+  assert.equal(got(ims('NO', null)), 'voec'); assert.equal(got(ims('NO', 'OSS')), 'voec'); assert.equal(got(ims(null, 'VOEC')), 'voec')
+  assert.equal(got(ims('DE', 'OSS')), 'other'); assert.equal(got(ims('CH', null)), 'other'); assert.equal(got(ims('JE', 'OSS')), 'other')
+  assert.equal(got(ims('DE', null)), 'unclassified', 'an EU rate with no marker is OSS or IOSS: not guessed')
+  assert.equal(got(ims('ES', 'DOMESTIC')), 'unclassified')
+  assert.equal(got(ims('GB', 'OSS')), 'unclassified'); assert.equal(got(ims('GB', 'IOSS')), 'unclassified'); assert.equal(got(ims('GB', 'MYSTERY')), 'unclassified')
+  assert.equal(got(ims(null, null, 'MOSSSALES')), 'unclassified'); assert.equal(got(ims(null, 'MYSTERY')), 'unclassified')
+  assert.match(ims('NO', null).source, /VOEC/); assert.match(ims('DE', 'IOSS').source, /reportingCategory=IOSS/); assert.match(ims('GB', null).source, /IMS countryCode GB/)
+  // WooCommerce rates with no IMS mapping: by country only
+  assert.deepEqual([classifyWooRate('GB').scheme, classifyWooRate('NO').scheme, classifyWooRate('CH').scheme, classifyWooRate('FR').scheme, classifyWooRate('').scheme], ['uk', 'voec', 'other', 'unclassified', 'unclassified'])
+  // Xero-only types: name prefix (upper case) and ReportTaxType
+  const x = (name: string, reportTaxType: string | null) => classifyXeroType({ name, reportTaxType }).scheme
+  assert.deepEqual([x('20% (VAT on Income)', 'OUTPUT'), x('NO 25%', 'MOSSSALES'), x('No VAT', null), x('CH 8.1%', 'MOSSSALES'), x('DE 19%', 'MOSSSALES'), x('Mystery', null), x('GB Reduced', 'OUTPUT')], ['uk', 'voec', 'unclassified', 'other', 'unclassified', 'unclassified', 'uk'])
+})
+
+test('four scheme reports plus a visible unclassified section: each difference lands in its own scheme; none is dropped; exit status is any difference anywhere', () => {
+  const s = baseline()
+  // UK: Woo percentage wrong. VOEC: a NO rate whose Woo rate differs. Other: a CH rate missing in Woo. IOSS: a marked DE rate. Unclassified: an unmarked FR rate.
+  s.woo[0] = wooRate('1', '19.0000')
+  s.snapshot.xero.rows.push(xeroRow('NO25', '25', { reportTaxType: 'MOSSSALES' }), xeroRow('CH8', '8', { reportTaxType: 'MOSSSALES' }), xeroRow('DE19', '19', { reportTaxType: 'MOSSSALES' }), xeroRow('FR20', '20', { reportTaxType: 'MOSSSALES' }))
+  s.snapshot.rates.push(imsRate('no', 'NO25', '0.2500', { countryCode: 'NO' }), imsRate('ch', 'CH8', '0.0800', { countryCode: 'CH' }), imsRate('de', 'DE19', '0.1900', { countryCode: 'DE', reportingCategory: 'IOSS' }), imsRate('fr', 'FR20', '0.2000', { countryCode: 'FR' }))
+  s.snapshot.mappings.push({ externalTaxRateId: '3', taxRateId: 'no', externalClass: 'standard' }, { externalTaxRateId: '5', taxRateId: 'de', externalClass: 'standard' })
+  s.woo.push(wooRate('3', '24.0000', { country: 'NO' }), wooRate('5', '19.0000', { country: 'DE' }))
+  const r = compareVatSets(s)
+  const by = (bucket: keyof typeof r.schemes) => r.schemes[bucket].differences.map((d) => `${d.reason}:${d.imsRateId ?? d.xeroTaxType}`)
+  assert.deepEqual(by('uk'), ['WOO_PERCENTAGE_MISMATCH:uk'])
+  assert.deepEqual(by('voec'), ['WOO_PERCENTAGE_MISMATCH:no'])
+  assert.deepEqual(by('other'), ['MISSING_IN_WOO:ch'])
+  assert.deepEqual(by('ioss'), [])
+  assert.deepEqual(by('unclassified'), ['MISSING_IN_WOO:fr', 'UNCLASSIFIED_SCHEME:fr'])
+  assert.equal(r.differences.length, Object.values(r.schemes).reduce((n, sec) => n + sec.differences.length, 0), 'nothing is dropped between the flat list and the sections')
+  assert.ok(r.schemes.unclassified.differences.every((d) => d.schemeSource.length > 10), 'each row cites why')
+  assert.equal(vatDiffExitCode(r, 'all'), 1)
+  assert.equal(vatDiffExitCode(r, 'ioss'), 1, 'the unclassified section counts for every selection')
+  // Without the unclassified rate, a clean scheme exits 0 on its own and a dirty one exits 1.
+  const t = baseline()
+  assert.equal(vatDiffExitCode(compareVatSets(t), 'uk'), 0)
+  t.woo[0] = wooRate('1', '19.0000')
+  const dirty = compareVatSets(t)
+  assert.equal(vatDiffExitCode(dirty, 'uk'), 1); assert.equal(vatDiffExitCode(dirty, 'voec'), 0); assert.equal(vatDiffExitCode(dirty, 'all'), 1)
+  const json = vatDiffJson(dirty, 'voec') as { schemes: Record<string, unknown> }
+  assert.deepEqual(Object.keys(json.schemes), ['voec', 'unclassified'])
+  assert.deepEqual(Object.keys((vatDiffJson(dirty, 'all') as { schemes: Record<string, unknown> }).schemes), ['uk', 'ioss', 'voec', 'other', 'unclassified'])
+})
+
+// [mutation: the regional-scope reason restored / the region dropped from the row -> red]
+test('a regional WooCommerce rate is legitimate: compared like any other against its mapped rate, with the region shown as information only', () => {
+  const s = baseline()
+  // Canary Islands style: an ES postcode-scoped 0% rate, mapped to an ES 0% IMS rate marked OSS.
+  s.snapshot.xero.rows.push(xeroRow('ES0', '0', { reportTaxType: 'MOSSSALES' }))
+  s.snapshot.rates.push(imsRate('es0', 'ES0', '0.0000', { countryCode: 'ES', reportingCategory: 'OSS' }))
+  s.snapshot.mappings.push({ externalTaxRateId: '8', taxRateId: 'es0', externalClass: 'zero-rate' })
+  s.woo.push(wooRate('8', '0.0000', { country: 'ES', postcode: '35*;38*', class: 'zero-rate' }))
+  assert.deepEqual(compareVatSets(s).differences, [], 'a matching regional rate is not a difference')
+  // Compared like any other: a wrong percentage, class or country is reported, and the region rides along.
+  s.woo[2] = wooRate('8', '7.0000', { country: 'PT', postcode: '35*;38*', class: 'reduced-rate' })
+  const r = compareVatSets(s)
+  assert.deepEqual(r.differences.map((d) => d.reason).sort(), ['WOO_CLASS_MISMATCH', 'WOO_COUNTRY_MISMATCH', 'WOO_PERCENTAGE_MISMATCH'])
+  assert.ok(r.differences.every((d) => d.region === '35*;38*' && d.scheme === 'other'))
+})
+
+// [mutation: the shipping check removed, or applied to a zero rate -> red]
+test('shipping rule (owner ruling 2026-10-25): a rate above zero must apply to shipping; a zero rate need not', () => {
+  const s = baseline()
+  s.woo[0] = wooRate('1', '20.0000', { shipping: false })
+  assert.deepEqual(reasons(s), ['WOO_SHIPPING_NOT_TAXED'])
+  s.woo[0] = wooRate('1', '20.0000')
+  s.woo[1] = wooRate('2', '0.0000', { class: 'zero-rate', shipping: false })
+  assert.deepEqual(reasons(s), [])
+  assert.match(VAT_DIFFERENCE_REASONS.WOO_SHIPPING_NOT_TAXED, /2026-10-25.*shipping always carries/)
 })
 
 test('purchase-only and reverse-charge IMS rates need no storefront rate; a zero rate with shipping off is not a difference', () => {
@@ -274,7 +353,10 @@ test('the ownership row woocommerce.tax-rate is pinned: operator-manual at P1, I
 // ---- the CLI -----------------------------------------------------------------------------------------------------
 
 test('CLI: argument and environment hardening, exit codes, --json', async () => {
-  assert.deepEqual(parseVatDiffArgs(['--json']), { json: true, help: false })
+  assert.deepEqual(parseVatDiffArgs(['--json']), { json: true, help: false, scheme: 'all' })
+  assert.deepEqual(parseVatDiffArgs(['--scheme', 'voec']), { json: false, help: false, scheme: 'voec' })
+  assert.deepEqual(parseVatDiffArgs(['--scheme', 'eu']), { code: 'BAD_ARGUMENTS' })
+  assert.deepEqual(parseVatDiffArgs(['--scheme']), { code: 'BAD_ARGUMENTS' })
   assert.deepEqual(parseVatDiffArgs(['--bogus']), { code: 'BAD_ARGUMENTS' })
   assert.deepEqual(parseVatDiffArgs(['--json', '--json']), { code: 'BAD_ARGUMENTS' })
   assert.deepEqual(parseVatDiffArgs(['postgres://u:p@h/db']), { code: 'CREDENTIAL_ARGUMENT' })
@@ -289,9 +371,20 @@ test('CLI: argument and environment hardening, exit codes, --json', async () => 
   const deps = (woo: WooGetPort) => ({ now: () => NOW, woo, openDb: async () => ({ db: dbFor({ list: goodList(), writes: [] }), disconnect: async () => undefined }) })
   const code = await runVatDiffCli({ ...common, argv: ['--json'], deps: deps(wooPort(different.woo.map(asApi))) })
   assert.equal(code, 1)
-  const parsed = JSON.parse(out.join('\n')) as { status: string; differences: Array<{ reason: string }> }
-  assert.deepEqual(parsed.differences.map((d) => d.reason), ['WOO_PERCENTAGE_MISMATCH'])
+  const parsed = JSON.parse(out.join('\n')) as { status: string; schemes: Record<string, { exitStatus: number; differences: Array<{ reason: string }> }> }
+  assert.deepEqual(Object.keys(parsed.schemes), ['uk', 'ioss', 'voec', 'other', 'unclassified'], 'JSON is keyed by scheme')
+  assert.deepEqual(parsed.schemes.uk!.differences.map((d) => d.reason), ['WOO_PERCENTAGE_MISMATCH'])
+  assert.equal(parsed.schemes.uk!.exitStatus, 1)
   assert.deepEqual(Object.keys(kept).sort(), ['DATABASE_URL', 'HOME', 'PATH', 'SETTINGS_ENCRYPTION_KEY'], 'a whitelist: no PG variable, loader variable or Xero guard variable survives')
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: ['--scheme', 'uk'], deps: deps(wooPort(different.woo.map(asApi))) }), 1)
+  assert.match(out.join('\n'), /== UK VAT: 1 difference/)
+  assert.doesNotMatch(out.join('\n'), /IOSS VAT/)
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: ['--scheme', 'voec'], deps: deps(wooPort(different.woo.map(asApi))) }), 0, 'a clean scheme exits 0 on its own')
+  out.length = 0
+  assert.equal(await runVatDiffCli({ ...common, argv: [], deps: deps(wooPort(different.woo.map(asApi))) }), 1)
+  assert.deepEqual(['UK VAT', 'IOSS VAT', 'VOEC (Norway) VAT', 'Other foreign VAT'].map((t) => out.join('\n').includes(`== ${t}`)), [true, true, true, true], 'four sections')
   out.length = 0
   assert.equal(await runVatDiffCli({ ...common, argv: [], deps: deps(wooPort(baseline().woo.map(asApi))) }), 0)
   assert.match(out.join('\n'), /No differences/)

@@ -28,6 +28,7 @@ import type { PackReasonCode } from '@/lib/reconciliation-pack/constants'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 import { VAT_DIFFERENCE_REASON_LIST, type VatDifferenceReason } from '@/lib/tax/vat-difference-reasons'
+import { VAT_SCHEME_BUCKETS, classifyImsRate, classifyWooRate, classifyXeroType, type Classification, type VatSchemeBucket } from '@/lib/tax/vat-scheme'
 import { readStoredXeroList, type PurchaseTaxImportRefusalCode, type StoredXeroList } from '@/lib/tax/purchase-tax-import'
 
 export { VAT_DIFFERENCE_REASONS, VAT_DIFFERENCE_REASON_LIST, type VatDifferenceReason } from '@/lib/tax/vat-difference-reasons'
@@ -44,6 +45,11 @@ export type VatRefusalCode = (typeof VAT_REFUSAL_CODES)[number]
 
 export type VatDifference = {
   reason: VatDifferenceReason
+  /** The scheme report this row belongs to, and the rule that put it there (lib/tax/vat-scheme.ts). */
+  scheme: VatSchemeBucket
+  schemeSource: string
+  /** Information only, never a difference by itself: the state / postcode / city scope of the WooCommerce rate involved (regional rates are legitimate), or null. */
+  region: string | null
   /** Which system the owner has to look at first. */
   subject: 'xero' | 'ims' | 'woo'
   /** Xero tax type, IMS rate id or WooCommerce rate id, as named by `subject`. */
@@ -66,13 +72,19 @@ export type VatDifferenceReport =
     xero: { tenantId: string; fetchedAt: string; types: number; active: number }
     ims: { activeRates: number; mappings: number }
     woo: { rates: number }
+    /** Every difference of every scheme, in report order (each row carries its scheme). */
     differences: VatDifference[]
     counts: Record<VatDifferenceReason, number>
+    /** One report per scheme, plus the visible unclassified section. */
+    schemes: Record<VatSchemeBucket, SchemeReport>
   }
+
+export type SchemeReport = { differences: VatDifference[]; counts: Record<VatDifferenceReason, number> }
 
 export type ImsComponentRow = { rate: string; compoundOnPrevious: boolean; active: boolean; sortOrder: number }
 export type ImsRateRow = {
   id: string
+  reportingCategory: string | null
   name: string
   /** Fraction text (Decimal(5,4)), for example "0.2000". */
   rate: string
@@ -108,7 +120,7 @@ export async function readImsXeroSnapshot(client: ReadClient, now: Date): Promis
     }
     const rows = await client.taxRate.findMany({
       select: {
-        id: true, name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, countryCode: true, isCompound: true, reverseCharge: true,
+        id: true, name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, reportingCategory: true, countryCode: true, isCompound: true, reverseCharge: true,
         components: { select: { rate: true, compoundOnPrevious: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] },
       },
       orderBy: [{ name: 'asc' }, { id: 'asc' }],
@@ -123,7 +135,7 @@ export async function readImsXeroSnapshot(client: ReadClient, now: Date): Promis
       snapshot: {
         xero: read.list,
         rates: rows.map((row) => ({
-          id: row.id, name: row.name, rate: row.rate.toFixed(4), usedFor: row.usedFor, active: row.active, accountingTaxType: row.accountingTaxType,
+          id: row.id, reportingCategory: row.reportingCategory, name: row.name, rate: row.rate.toFixed(4), usedFor: row.usedFor, active: row.active, accountingTaxType: row.accountingTaxType,
           countryCode: row.countryCode, isCompound: row.isCompound, reverseCharge: row.reverseCharge,
           components: row.components.map((c) => ({ rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, active: c.active, sortOrder: c.sortOrder })),
         })),
@@ -169,9 +181,46 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
   const activeRates = snapshot.rates.filter((rate) => rate.active)
   const ratesById = new Map(snapshot.rates.map((rate) => [rate.id, rate] as const))
   const differences: VatDifference[] = []
+  const wooById = new Map(woo.map((rate) => [rate.id, rate] as const))
+  const mappingByWoo = new Map(snapshot.mappings.map((mapping) => [mapping.externalTaxRateId, mapping] as const))
+  // SCHEME OF EACH ITEM (lib/tax/vat-scheme.ts, which cites its sources). An IMS rate carries the classification of itself; a WooCommerce rate is judged
+  // as the IMS rate it is mapped to (or, unmapped, by its country); a Xero type is judged as the active IMS rate that carries it (or, if none, by itself).
+  const imsClassCache = new Map<string, Classification>()
+  const classOfIms = (rate: ImsRateRow): Classification => {
+    let found = imsClassCache.get(rate.id)
+    if (found === undefined) {
+      found = classifyImsRate(rate, rate.accountingTaxType === null ? null : (xeroByType.get(rate.accountingTaxType)?.reportTaxType ?? null))
+      imsClassCache.set(rate.id, found)
+    }
+    return found
+  }
+  const classOfXeroOnly = (taxType: string): Classification => {
+    const row = xeroByType.get(taxType)
+    return row === undefined ? { scheme: 'unclassified', source: 'tax type not in the Xero list' } : classifyXeroType(row)
+  }
+  const classOf = (ids: { xeroTaxType?: string | null; imsRateId?: string | null; wooRateId?: string | null }): Classification => {
+    const ims = ids.imsRateId ? ratesById.get(ids.imsRateId) : undefined
+    if (ims !== undefined) return classOfIms(ims)
+    if (ids.xeroTaxType) {
+      const carrier = activeRates.find((rate) => rate.accountingTaxType === ids.xeroTaxType)
+      if (carrier !== undefined) return classOfIms(carrier)
+    }
+    if (ids.wooRateId) {
+      const mapped = mappingByWoo.get(ids.wooRateId)
+      const target = mapped === undefined ? undefined : ratesById.get(mapped.taxRateId)
+      return target !== undefined ? classOfIms(target) : classifyWooRate(wooById.get(ids.wooRateId)?.country ?? '')
+    }
+    return ids.xeroTaxType ? classOfXeroOnly(ids.xeroTaxType) : { scheme: 'unclassified', source: 'no item to classify' }
+  }
+  const regionOf = (wooRateId: string | null | undefined): string | null => {
+    const rate = wooRateId ? wooById.get(wooRateId) : undefined
+    const parts = rate === undefined ? [] : [rate.state, rate.postcode, rate.city].filter((part) => part !== '')
+    return parts.length === 0 ? null : parts.join(' / ')
+  }
   const add = (reason: VatDifferenceReason, subject: VatDifference['subject'], subjectId: string, label: string, ids: { xeroTaxType?: string | null; imsRateId?: string | null; wooRateId?: string | null }, values: { xero?: string | null; ims?: string | null; woo?: string | null } = {}): void => {
+    const classification = classOf(ids)
     differences.push({
-      reason, subject, subjectId, label,
+      reason, scheme: classification.scheme, schemeSource: classification.source, region: regionOf(ids.wooRateId), subject, subjectId, label,
       xeroTaxType: ids.xeroTaxType ?? null, imsRateId: ids.imsRateId ?? null, wooRateId: ids.wooRateId ?? null,
       xero: values.xero ?? null, ims: values.ims ?? null, woo: values.woo ?? null,
     })
@@ -205,8 +254,6 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
   }
 
   // ---- IMS <-> WooCommerce, through the existing mapping ---------------------------------------------------
-  const wooById = new Map(woo.map((rate) => [rate.id, rate] as const))
-  const mappingByWoo = new Map(snapshot.mappings.map((mapping) => [mapping.externalTaxRateId, mapping] as const))
   const reachedByWoo = new Set<string>()
   for (const rate of woo) {
     const mapping = mappingByWoo.get(rate.id)
@@ -233,9 +280,6 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
     }
     if (rate.compound !== ims.isCompound) add('WOO_COMPOUND_MISMATCH', 'woo', rate.id, label, ids, { ims: String(ims.isCompound), woo: String(rate.compound) })
     if (!rate.shipping && reference.gt(0)) add('WOO_SHIPPING_NOT_TAXED', 'woo', rate.id, label, ids, { woo: 'shipping off' })
-    if (rate.state !== '' || rate.postcode !== '' || rate.city !== '') {
-      add('WOO_REGIONAL_SCOPE', 'woo', rate.id, label, ids, { woo: [rate.state, rate.postcode, rate.city].filter((part) => part !== '').join(' / ') })
-    }
   }
   for (const mapping of snapshot.mappings) {
     if (wooById.has(mapping.externalTaxRateId)) continue
@@ -247,7 +291,26 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
     add('MISSING_IN_WOO', 'ims', rate.id, rate.name, { imsRateId: rate.id, xeroTaxType: rate.accountingTaxType }, { ims: text(percentOfFraction(rate.rate)) })
   }
 
-  differences.sort((a, b) => (REASON_ORDER.get(a.reason)! - REASON_ORDER.get(b.reason)!) || a.subjectId.localeCompare(b.subjectId) || (a.wooRateId ?? '').localeCompare(b.wooRateId ?? '', undefined, { numeric: true }))
+  // Items that cannot be classified are listed once each, in the unclassified section (their other differences are there too).
+  for (const rate of activeRates) {
+    const c = classOfIms(rate)
+    if (c.scheme === 'unclassified') add('UNCLASSIFIED_SCHEME', 'ims', rate.id, rate.name, { imsRateId: rate.id, xeroTaxType: rate.accountingTaxType }, { ims: text(percentOfFraction(rate.rate)) })
+  }
+  for (const rate of woo) {
+    const mapped = mappingByWoo.get(rate.id)
+    if ((mapped === undefined || ratesById.get(mapped.taxRateId) === undefined) && classifyWooRate(rate.country).scheme === 'unclassified') {
+      add('UNCLASSIFIED_SCHEME', 'woo', rate.id, rate.name === '' ? `${rate.class} ${rate.country}`.trim() : rate.name, { wooRateId: rate.id }, { woo: rate.rate })
+    }
+  }
+  for (const row of snapshot.xero.rows) {
+    if (row.status === 'ACTIVE' && !activeByType.has(row.taxType) && classOfXeroOnly(row.taxType).scheme === 'unclassified') {
+      const stated = xeroPercent(row.taxType)
+      add('UNCLASSIFIED_SCHEME', 'xero', row.taxType, row.name, { xeroTaxType: row.taxType }, { xero: stated === null ? null : text(stated) })
+    }
+  }
+
+  const BUCKET_ORDER = new Map(VAT_SCHEME_BUCKETS.map((bucket, index) => [bucket, index] as const))
+  differences.sort((a, b) => (BUCKET_ORDER.get(a.scheme)! - BUCKET_ORDER.get(b.scheme)!) || (REASON_ORDER.get(a.reason)! - REASON_ORDER.get(b.reason)!) || a.subjectId.localeCompare(b.subjectId) || (a.wooRateId ?? '').localeCompare(b.wooRateId ?? '', undefined, { numeric: true }))
   const counts = Object.fromEntries(VAT_DIFFERENCE_REASON_LIST.map((reason) => [reason, 0])) as Record<VatDifferenceReason, number>
   for (const difference of differences) counts[difference.reason] += 1
   return {
@@ -257,5 +320,10 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
     woo: { rates: woo.length },
     differences,
     counts,
+    schemes: Object.fromEntries(VAT_SCHEME_BUCKETS.map((bucket) => {
+      const mine = differences.filter((d) => d.scheme === bucket)
+      const perReason = Object.fromEntries(VAT_DIFFERENCE_REASON_LIST.map((reason) => [reason, mine.filter((d) => d.reason === reason).length])) as Record<VatDifferenceReason, number>
+      return [bucket, { differences: mine, counts: perReason }] as const
+    })) as Record<VatSchemeBucket, SchemeReport>,
   }
 }
