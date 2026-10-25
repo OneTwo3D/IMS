@@ -88,6 +88,8 @@ export async function startScratch(prefix: string, database = 'ims_scratch'): Pr
   // Xero is the tax-rate master: the supplier tax rail holds the rates above to its stored list.
   await seedXeroList(db)
   await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date(Date.now() - 3_600_000) } })
+  // The same rate as the synthetic ims-fx-rates list (tests/first-load/apply-helpers.ts), at its instant: the rail reads a rate as of the END OF THE ORDER'S CREATED DAY (the synthetic orders are created 2026-09-15).
+  await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date('2026-09-10T06:00:00Z') } })
   const { serializeSettingValue } = await import('@/lib/settings-store')
   const { INTEGRATION_PLUGIN_SETTING_KEYS } = await import('@/lib/integration-plugin-keys')
   for (const [key, value] of [[INTEGRATION_PLUGIN_SETTING_KEYS.woocommerce, 'true'], ['wc_url', 'http://127.0.0.1:9'], ['wc_consumer_key', 'ck_scratch'], ['wc_consumer_secret', 'cs_scratch']] as const) {

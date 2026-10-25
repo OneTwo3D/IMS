@@ -45,10 +45,10 @@ test('the export runs in ONE read-only repeatable-read transaction and sends onl
   assert.match(FX_EXPORT_STATEMENTS.begin, /^BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ$/)
   for (const sql of Object.values(FX_EXPORT_STATEMENTS)) assert.ok(!/\b(insert|update|delete|truncate|alter|drop|create|grant)\b/i.test(sql), `no write verb in: ${sql.slice(0, 40)}`)
   // a failing read still rolls back
-  const failing: FxExportPort = { async query(sql) { if (sql === FX_EXPORT_STATEMENTS.rows) throw new Error('boom'); sent.push(sql); return { rows: [] } } }
-  sent.length = 0
+  const failingSent: string[] = []
+  const failing: FxExportPort = { async query(sql: string) { failingSent.push(sql); if (sql === FX_EXPORT_STATEMENTS.rows) throw new Error('boom'); return { rows: [] } } }
   await assert.rejects(readFxRates(failing, null))
-  assert.equal(sent.at(-1), FX_EXPORT_STATEMENTS.rollback)
+  assert.equal(failingSent.at(-1), FX_EXPORT_STATEMENTS.rollback)
 })
 
 // [mutation: export every fromCurrency, skip the base filter, drop the base stamp column]

@@ -54,7 +54,7 @@ async function seedMixedFreight() {
   await db.stockLevel.create({ data: { productId: product.id, warehouseId: warehouse.id, quantity: '0', reservedQty: '0' } })
   const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP' }, select: { id: true } })
   const goods = await createPurchaseOrder({
-    reference: tag, supplierId: supplier.id, currency: 'GBP', fxRateToBase: 1, destinationWarehouseId: warehouse.id,
+    reference: tag, supplierId: supplier.id, currency: 'GBP', destinationWarehouseId: warehouse.id,
     pricesIncludeVat: false, taxRateValue: 0,
     lines: [{ productId: product.id, sku: tag, productName: 'fbrace', qty: 4, unitCostForeign: 10 }],
   })

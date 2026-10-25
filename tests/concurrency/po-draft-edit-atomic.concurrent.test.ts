@@ -217,7 +217,7 @@ test('A2b: a rate-only (currency/fx) edit runs in the same locked transaction an
   const { updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
   const { po } = await seedDraft('a2fx', [2])
   const { db } = await import('@/lib/db')
-  const result = await updatePurchaseOrder(po.poId, { currency: 'GBP', fxRateToBase: 1 })
+  const result = await updatePurchaseOrder(po.poId, { currency: 'GBP', refreshFxRate: true })
   assert.equal(result.success, true, `a rate-only edit must succeed: ${result.error}`)
   const row = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { status: true, fxRateToBase: true } })
   assert.equal(row.status, 'DRAFT')

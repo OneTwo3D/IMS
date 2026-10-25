@@ -596,7 +596,7 @@ transferKey,fromWarehouseCode,toWarehouseCode,status,sku,qty,notes
 Importer: `importPurchaseOrdersCsv` (app/actions/import.ts). Template: `app/api/export/purchase-orders/route.ts`. Orders are created as DRAFT by the importer and stay DRAFT.
 
 ```text
-orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,unitCostForeign,lineDiscountForeign,lineDiscountStr,taxRateName,taxRateValue,orderTaxRateName,orderTaxRateValue,pricesIncludeVat,supplierRef,expectedDelivery,orderDiscountForeign,notes
+orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,unitCostForeign,lineDiscountForeign,lineDiscountStr,taxRateName,taxRateValue,orderTaxRateName,orderTaxRateValue,pricesIncludeVat,supplierRef,expectedDelivery,orderDiscountForeign,notes,createdOn
 ```
 
 `tests/first-load/importer-headers.test.ts` reads each route's source with the TypeScript parser and compares the list passed to `buildTemplateCsv(...)` with these, so a renamed header on either side fails the test.

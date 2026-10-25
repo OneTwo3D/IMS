@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE,
   resolvePurchaseOrderFxRateToBase,
 } from '@/lib/domain/purchasing/purchase-order-fx'
 import {
@@ -18,38 +17,30 @@ function createClient(rate: number | null) {
   return fakeFxClient(rate == null ? [] : [{ fromCurrency: 'GBP', toCurrency: 'EUR', rate, fetchedAt: new Date('2026-06-10T00:00:00.000Z') }])
 }
 
-test('purchase-order FX resolver defaults to the latest stored rate when input is missing', async () => {
-  const resolved = await resolvePurchaseOrderFxRateToBase(createClient(1.18) as never, {
-    currency: 'EUR',
-    baseCurrency: 'GBP',
-    asOf: new Date('2026-06-11T00:00:00.000Z'),
-    inputRateToBase: undefined,
-  })
+const ASOF = new Date('2026-06-11T00:00:00.000Z')
 
-  assert.equal(resolved, 1.18)
+// [mutation: re-add an input-rate parameter that wins over the table, or a tolerance band that lets a near rate through]
+test('purchase-order FX resolver returns the table rate and has no input rate to prefer: a rate field passed anyway is ignored', async () => {
+  const input = { currency: 'EUR', baseCurrency: 'GBP', asOf: ASOF }
+  assert.equal(await resolvePurchaseOrderFxRateToBase(createClient(1.18) as never, input), 1.18)
+  assert.deepEqual(Object.keys(input).sort(), ['asOf', 'baseCurrency', 'currency'], 'the resolver\'s input has no rate field')
+  for (const stray of [1.18 * 1.01, 1.18 * 1.5, 0.5]) {
+    const resolved = await resolvePurchaseOrderFxRateToBase(createClient(1.18) as never, { ...input, inputRateToBase: stray } as never)
+    assert.equal(resolved, 1.18, `a near (${stray}) or far rate is never stored`)
+  }
 })
 
-test('purchase-order FX resolver accepts manual overrides inside the tolerance band', async () => {
-  const resolved = await resolvePurchaseOrderFxRateToBase(createClient(1.18) as never, {
-    currency: 'EUR',
-    baseCurrency: 'GBP',
-    asOf: new Date('2026-06-11T00:00:00.000Z'),
-    inputRateToBase: 1.18 * (1 + PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE - 0.0001),
-  })
-
-  assert.equal(resolved, 1.18 * (1 + PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE - 0.0001))
-})
-
-test('purchase-order FX resolver rejects stale or mistyped manual overrides outside the tolerance band', async () => {
-  await assert.rejects(
-    () => resolvePurchaseOrderFxRateToBase(createClient(1.18) as never, {
-      currency: 'EUR',
-      baseCurrency: 'GBP',
-      asOf: new Date('2026-06-11T00:00:00.000Z'),
-      inputRateToBase: 1.40,
-    }),
-    /differs by 18\.64% from the latest GBP rate 1\.18/,
-  )
+// [mutation: pick the first row, the highest fetchedAt overall (ignoring asOf), or ignore manualOverride rows]
+test('purchase-order FX resolver: the latest row on or before the instant wins, so a manual override row (the latest) wins, and clearing it (a newer row) restores the feed', async () => {
+  const rows = [
+    { fromCurrency: 'GBP', toCurrency: 'EUR', rate: 1.18, fetchedAt: new Date('2026-06-01T06:00:00.000Z'), source: 'frankfurter', manualOverride: false },
+    { fromCurrency: 'GBP', toCurrency: 'EUR', rate: 1.30, fetchedAt: new Date('2026-06-05T09:00:00.000Z'), source: 'manual', manualOverride: true },
+  ]
+  const at = (iso: string) => resolvePurchaseOrderFxRateToBase(fakeFxClient(rows) as never, { currency: 'EUR', baseCurrency: 'GBP', asOf: new Date(iso) })
+  assert.equal(await at('2026-06-04T00:00:00.000Z'), 1.18, 'before the pin: the feed rate')
+  assert.equal(await at('2026-06-11T00:00:00.000Z'), 1.30, 'the admin\'s pinned override is the latest row, so it IS the rate')
+  const cleared = [...rows, { fromCurrency: 'GBP', toCurrency: 'EUR', rate: 1.19, fetchedAt: new Date('2026-06-08T06:00:00.000Z'), source: 'frankfurter', manualOverride: false }]
+  assert.equal(await resolvePurchaseOrderFxRateToBase(fakeFxClient(cleared) as never, { currency: 'EUR', baseCurrency: 'GBP', asOf: ASOF }), 1.19, 'a newer non-override row clears the pin')
 })
 
 test('purchase-order FX resolver requires a stored non-base-currency rate', async () => {
@@ -69,7 +60,7 @@ test('purchase-order FX resolver forces base-currency purchase orders to rate 1'
     baseCurrency: 'GBP',
     asOf: new Date('2026-06-11T00:00:00.000Z'),
     inputRateToBase: 1.40,
-  })
+  } as never)
 
   assert.equal(resolved, 1)
 })

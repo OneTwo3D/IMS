@@ -110,7 +110,7 @@ export const FINGERPRINT_SPECS: Readonly<Record<ApplyStepId, FingerprintSpec>> =
     key: ['orderKey'],
     fingerprinted: ['supplierName', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'orderTaxRateName', 'orderTaxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'orderDiscountForeign', 'notes'],
     lineLevel: ['sku', 'qty', 'unitCostForeign', 'lineDiscountForeign', 'lineDiscountStr', 'taxRateName', 'taxRateValue'],
-    comparedSeparately: {},
+    comparedSeparately: { createdOn: 'input only: the day a system import prices a foreign order at (the end of it). The order is created now and stores no created-on column; what the day decides is the stored fxRateToBase, which is fingerprinted, and the FX rates rail checks that rate against fx_rates at that day' },
     notPersisted: {},
   },
 }

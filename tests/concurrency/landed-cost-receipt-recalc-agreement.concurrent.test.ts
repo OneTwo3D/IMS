@@ -53,7 +53,6 @@ async function seedGoodsPo(label: string, qty: number, unitCost: number, extraLi
     reference: tag,
     supplierId: supplier.id,
     currency: 'GBP',
-    fxRateToBase: 1,
     destinationWarehouseId: warehouse.id,
     pricesIncludeVat: false,
     taxRateValue: 0,
