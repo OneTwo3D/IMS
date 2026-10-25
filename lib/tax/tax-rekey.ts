@@ -43,6 +43,9 @@
  *     (no other IMS rate of another name or percentage carries it - else REFUND_SNAPSHOT_IDENTITY, no override). Posted credit notes are history. Other stored tax-type snapshots:
  *     accounting_sync_logs.payload and accounting_events.linesJson (in-flight ones block via QUEUED_PAYLOADS; sent ones are history); TaxRateComponent.accountingTaxType (cleared above);
  *     the reverse-charge tax-type SETTINGS (accounting_reverse_charge_*_tax_type) are separate configuration, reported not changed. No other model stores a tax type.
+ *   - ENQUEUE RACE: a producer reads the line's rate BEFORE it takes the enqueue lock, so it can build an old-code payload, pause while this apply commits (no queued row to see), then
+ *     insert it. createAccountingSyncLogRow (the one insert of a sync row) therefore refuses, under the lock this apply holds, any payload carrying a code recorded here as retired (setting
+ *     tax_rekey_retired_codes, written in the apply's transaction) that no active rate carries: lib/tax/retired-tax-code-guard.ts. The producer's retry rebuilds from the re-pointed rows.
  *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED - a FAILED row keeps blocking until it is retried or cancelled - or an accounting event PENDING / FAILED,
  *     whose lines carry the old code) are snapshots IMS does not rewrite. They BLOCK the apply (QUEUED_PAYLOADS) with no override: let them post, or cancel them, first.
  */
@@ -52,6 +55,8 @@ import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/
 import { readStoredXeroList, type PurchaseTaxImportRefusalCode } from '@/lib/tax/purchase-tax-import'
 import { imsEffectivePercent, type ImsComponentRow } from '@/lib/tax/vat-difference-report'
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
+import { taxCodesInPayload } from '@/lib/tax/tax-code-fields'
+import { RETIRED_CODES_SETTING, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
 import { REKEY_OUTCOMES, type RekeyOutcome } from '@/lib/tax/tax-rekey-outcomes'
 
 export { REKEY_OUTCOMES, REKEY_OUTCOME_MEANING, type RekeyOutcome } from '@/lib/tax/tax-rekey-outcomes'
@@ -341,16 +346,22 @@ export async function openDocumentsOf(client: Client, rateId: string): Promise<{
   return out
 }
 
+/**
+ * Queued accounting payloads (sync rows PENDING / PROCESSING / FAILED, events PENDING / FAILED) carrying `taxType` as ANY tax-code field (lib/tax/tax-code-fields.ts: line `taxType`,
+ * `shippingTaxType`, `discountTaxType`, header `taxType`, ...). The sync rows are scanned on their own: the event mirror is best-effort and may be missing. TAX_RATE_SYNC rows define
+ * rates and are excluded. The text prefilter only narrows the rows; the key-aware scan decides.
+ */
 async function queuedCounts(client: Client, taxType: string): Promise<{ syncRows: number; events: number }> {
-  const syncRows = await client.$queryRaw<Array<{ n: bigint }>>`
-    SELECT count(*) AS n FROM accounting_sync_logs
-    WHERE status::text = ANY(${[...IN_FLIGHT_SYNC_STATUSES]}) AND payload IS NOT NULL
-      AND jsonb_path_exists(payload::jsonb, '$.** ? (@.taxType == $t)', jsonb_build_object('t', ${taxType}::text))`
-  const events = await client.$queryRaw<Array<{ n: bigint }>>`
-    SELECT count(*) AS n FROM accounting_events
+  const syncRows = await client.$queryRaw<Array<{ payload: unknown }>>`
+    SELECT payload FROM accounting_sync_logs
+    WHERE status::text = ANY(${[...IN_FLIGHT_SYNC_STATUSES]}) AND type::text <> 'TAX_RATE_SYNC' AND payload IS NOT NULL
+      AND position(${taxType} in payload::text) > 0`
+  const events = await client.$queryRaw<Array<{ payload: unknown }>>`
+    SELECT "linesJson" AS payload FROM accounting_events
     WHERE status = ANY(${[...IN_FLIGHT_EVENT_STATUSES]})
-      AND jsonb_path_exists("linesJson"::jsonb, '$.** ? (@.taxType == $t)', jsonb_build_object('t', ${taxType}::text))`
-  return { syncRows: Number(syncRows[0]?.n ?? 0), events: Number(events[0]?.n ?? 0) }
+      AND position(${taxType} in "linesJson"::text) > 0`
+  const carries = (row: { payload: unknown }): boolean => taxCodesInPayload(row.payload).includes(taxType)
+  return { syncRows: syncRows.filter(carries).length, events: events.filter(carries).length }
 }
 
 /** The refund-line snapshots (see RekeyReferences.pendingRefundLines) on not-yet-posted refunds that carry `code`. */
@@ -464,6 +475,14 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     result.created.push({ oldId: old.id, newId: fresh.id, name: old.name, fromCode: row.currentCode, toCode })
   }
   if (result.created.length > 0) {
+    // The enqueue guard's memory of what was retired (lib/tax/retired-tax-code-guard.ts), written in this same transaction under the same lock.
+    const existing = parseRetiredCodes((await tx.setting.findUnique({ where: { key: RETIRED_CODES_SETTING }, select: { value: true } }))?.value)
+    const retired: RetiredCodes = { ...existing }
+    const at = new Date().toISOString()
+    for (const c of result.created) retired[c.fromCode] = { rateId: c.oldId, newCode: c.toCode, at }
+    for (const c of result.created) if (retired[c.toCode] !== undefined && result.created.some((x) => x.toCode === c.toCode)) delete retired[c.toCode]
+    const value = JSON.stringify(retired)
+    await tx.setting.upsert({ where: { key: RETIRED_CODES_SETTING }, create: { key: RETIRED_CODES_SETTING, value }, update: { value } })
     await tx.activityLog.create({
       data: {
         entityType: 'SETTING', entityId: null, action: 'tax_rates_rekeyed_to_xero_codes', tag: 'settings', level: 'INFO',

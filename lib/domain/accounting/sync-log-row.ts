@@ -2,6 +2,7 @@ import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { RETIRED_TAX_CODE_REASON, RetiredTaxCodeInPayloadError, retiredTaxCodesInPayload } from '@/lib/tax/retired-tax-code-guard'
 import { HELD_SHADOW_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { xeroProducerSeamVerdict, type XeroSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { attachShadowSyncLog, recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
@@ -128,6 +129,25 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
       await reportSuppressedPosting(key, suppression)
       return { row: null, suppressed: 'handled_by_hand' }
     }
+  }
+  // THE RE-KEYED-AWAY TAX CODE GUARD (lib/tax/retired-tax-code-guard.ts): a payload built from a rate's old code, enqueued after a tax re-key retired it, is refused here under the shared lock.
+  const retiredCodes = await retiredTaxCodesInPayload(client, { type: String(data.type), payload: data.payload })
+  if (retiredCodes.length > 0) {
+    try {
+      const [{ db }, { recordAccountingPostingRefusal }, { defaultPostingRefusalKind }] = await Promise.all([
+        import('@/lib/db'), import('@/lib/domain/accounting/posting-refusal-inbox'), import('@/lib/domain/accounting/posting-refusal-kinds'),
+      ])
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, key, {
+        kind: defaultPostingRefusalKind(key.type, key.referenceType),
+        chartConnector: typeof data.connector === 'string' ? data.connector : null,
+        activeConnector: typeof data.connector === 'string' ? data.connector : null,
+        reason: RETIRED_TAX_CODE_REASON,
+        committed: 'the document change that raised this posting is committed in IMS',
+        remedy: 'The payload carried a tax code that a tax re-key retired. Nothing was queued; repeat the action (or re-send the document) so it is rebuilt from the current tax rates.',
+        detail: { codes: retiredCodes },
+      })
+    } catch { /* best effort: the throw below is the refusal; the inbox row is the operator's trail */ }
+    throw new RetiredTaxCodeInPayloadError(retiredCodes)
   }
   // THE PRODUCER SEAM. After the suppression read on purpose: a posting marked handled by hand, or held by an operator's
   // claim, is answered above whatever the hold says, so a shadow can never discharge or postpone a claim.

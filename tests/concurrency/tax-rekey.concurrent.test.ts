@@ -58,7 +58,14 @@ const created = { rates: [] as string[], suppliers: [] as string[], mappings: []
 async function wipeOwn(d: Deps) {
   const { db } = d
   const rateIds = (await db.taxRate.findMany({ where: { OR: [{ id: { in: created.rates } }, { name: { startsWith: TAG } }] }, select: { id: true } })).map((r) => r.id)
-  await db.accountingSyncLog.deleteMany({ where: { id: { in: created.logs } } })
+  await db.accountingPostingRefusal.deleteMany({ where: { referenceId: { in: created.orders } } })
+  await db.accountingSyncLog.deleteMany({ where: { OR: [{ id: { in: created.logs } }, { referenceId: { in: created.orders } }] } })
+  const retiredSetting = await db.setting.findUnique({ where: { key: 'tax_rekey_retired_codes' } })
+  if (retiredSetting) {
+    const kept = Object.fromEntries(Object.entries(JSON.parse(retiredSetting.value) as Record<string, unknown>).filter(([k]) => !k.startsWith(P)))
+    if (Object.keys(kept).length === 0) await db.setting.deleteMany({ where: { key: 'tax_rekey_retired_codes' } })
+    else await db.setting.update({ where: { key: 'tax_rekey_retired_codes' }, data: { value: JSON.stringify(kept) } })
+  }
   await db.accountingEvent.deleteMany({ where: { id: { in: created.events } } })
   await db.purchaseInvoice.deleteMany({ where: { id: { in: created.invoices } } })
   await db.purchaseOrderLine.deleteMany({ where: { OR: [{ poId: { in: created.pos } }, { taxRateId: { in: rateIds } }] } })
@@ -436,4 +443,78 @@ test('a pending refund line that stores a code shared with a rate of another nam
   }
   assert.equal(await ownedDigest(d, w), before)
   assert.equal((await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id: refund.lines[0]!.id } })).accountingTaxType, code('B'))
+})
+
+// [mutation: only `taxType` scanned in queuedCounts (the pre-R3 jsonpath) -> the shipping / discount arms apply with the payload queued]
+test('a queued payload with the old code ONLY in shippingTaxType or discountTaxType blocks the apply, with no event mirror; a sent row, and a rate-sync row, do not', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const w = await seedWorld(d)
+  const { db } = d
+  const queuedFor = async () => (await d.rekey.runTaxRekey({ apply: false })).plan!
+  const add = async (status: 'PENDING' | 'SYNCED', type: 'SALES_INVOICE' | 'TAX_RATE_SYNC', payload: unknown) => {
+    const row = await db.accountingSyncLog.create({ data: { type, status, referenceType: 'SalesOrder', referenceId: w.soDraftCy.id, payload: payload as never } })
+    created.logs.push(row.id)
+    return row.id
+  }
+  assert.equal((await queuedFor()).references[w.ids.cy]!.queuedSyncRows, 0)
+  await add('SYNCED', 'SALES_INVOICE', { lines: [], shippingTaxType: code('B') })
+  await add('PENDING', 'TAX_RATE_SYNC', { name: 'x', components: [{ accountingTaxType: code('B') }] })
+  assert.equal((await queuedFor()).references[w.ids.cy]!.queuedSyncRows, 0, 'a sent row and a rate-definition row are not queued uses of the code')
+  const ship = await add('PENDING', 'SALES_INVOICE', { lines: [{ taxType: 'OUTPUT2' }], shippingTaxType: code('B') })
+  let plan = await queuedFor()
+  assert.equal(plan.references[w.ids.cy]!.queuedSyncRows, 1, 'old code only in shippingTaxType')
+  const r1 = await d.rekey.runTaxRekey({ apply: true, confirm: plan.digest, allowUnposted: true })
+  assert.deepEqual([r1.refusal?.code, r1.wrote], ['QUEUED_PAYLOADS', false])
+  await db.accountingSyncLog.update({ where: { id: ship }, data: { status: 'SYNCED' } })
+  await add('PENDING', 'SALES_INVOICE', { lines: [], discountTaxType: code('B') })
+  plan = await queuedFor()
+  assert.equal(plan.references[w.ids.cy]!.queuedSyncRows, 1, 'old code only in discountTaxType')
+  const r2 = await d.rekey.runTaxRekey({ apply: true, confirm: plan.digest, allowUnposted: true })
+  assert.deepEqual([r2.refusal?.code, r2.wrote], ['QUEUED_PAYLOADS', false])
+})
+
+// [mutation: the guard call removed from createAccountingSyncLogRow -> the refusal arm inserts the stale payload; mutation: the advisory lock removed from the guard -> the interleaving arm: the apply commits during the producer's pause]
+test('THE ENQUEUE GUARD: after a re-key, a payload built from the old code is refused at the insert (named, with an inbox row); a producer that inserts first makes the apply see it and refuse', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { createAccountingSyncLogRow } = await import('../../lib/domain/accounting/sync-log-row.ts')
+  const { RetiredTaxCodeInPayloadError } = await import('../../lib/tax/retired-tax-code-guard.ts')
+  const { db } = d
+  const w = await seedWorld(d)
+  const insert = (client: unknown, payload: unknown) => createAccountingSyncLogRow(client as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: w.soDraftCy.id, payload: payload as never })
+
+  // (1) build-before / enqueue-after: the payload carries BE VAT's old code, which the apply retires.
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+  const done = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  assert.equal(done.wrote, true)
+  const before = await db.accountingSyncLog.count({ where: { referenceId: w.soDraftCy.id } })
+  await assert.rejects(insert(db, { lines: [{ taxType: code('OLD1') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.codes.join() === code('OLD1'))
+  await assert.rejects(insert(db, { lines: [], shippingTaxType: code('OLD1') }), RetiredTaxCodeInPayloadError, 'in any tax-code field')
+  assert.equal(await db.accountingSyncLog.count({ where: { referenceId: w.soDraftCy.id } }), before, 'nothing was queued')
+  const inbox = await db.accountingPostingRefusal.findFirst({ where: { type: 'SALES_INVOICE', referenceId: w.soDraftCy.id } })
+  assert.equal(inbox?.reason, 'retired_tax_code', 'the refusal is in the posting-refusal inbox with a named reason')
+  // Normal enqueues are unaffected: the live code, a built-in, a code no rate carries, and a payload with no tax code at all.
+  for (const payload of [{ lines: [{ taxType: code('A') }] }, { lines: [{ taxType: 'OUTPUT2' }] }, { lines: [{ taxType: code('NOSUCHRATE') }] }, { lines: [] }]) {
+    const ok = await insert(db, payload)
+    assert.ok(ok.row, JSON.stringify(payload))
+    created.logs.push(ok.row!.id)
+  }
+
+  // (2) the interleaving: a producer INSERTS first (the code is not retired yet) and holds the lock to its commit; the apply started meanwhile must wait for it and then see the queued row.
+  const w2 = await seedWorld(d)
+  const preview2 = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  const producer = db.$transaction(async (tx) => {
+    const r = await createAccountingSyncLogRow(tx as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: w2.soDraftCy.id, payload: { lines: [{ taxType: code('OLD1') }] } as never })
+    assert.ok(r.row)
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    return r.row!.id
+  })
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  const racing = await d.rekey.runTaxRekey({ apply: true, confirm: preview2.digest, allowUnposted: true })
+  await producer
+  assert.equal(racing.wrote, false, 'the apply did not commit past a producer that had already queued the old code')
+  assert.ok(racing.refusal?.code === 'QUEUED_PAYLOADS' || racing.refusal?.code === 'DIGEST_MISMATCH', String(racing.refusal?.code))
+  assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w2.ids.be } })).active, true)
 })
