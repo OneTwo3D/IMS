@@ -32,6 +32,8 @@ async function deps() {
   return { db, ...run, ...drift, ...listMod }
 }
 
+const withoutId = <T extends { id: string }>(row: T): Omit<T, 'id'> => { const copy = { ...row } as Partial<T>; delete copy.id; return copy as Omit<T, 'id'> }
+
 type Db = Awaited<ReturnType<typeof deps>>['db']
 
 async function ownedRowsDigest(db: Db, own: { rateIds: string[]; mappingIds: string[]; tenant: string; stampKey: string }): Promise<string> {
@@ -117,7 +119,7 @@ test('the VAT difference report reads a real database and writes nothing', { ski
     // The real command, in a child with a hostile environment: no WooCommerce credentials are stored, so it refuses (exit 2) and still writes nothing.
     const child = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/vat-difference-report.ts', '--json'], {
       cwd: process.cwd(), encoding: 'utf8', timeout: 120_000,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME ?? '/tmp', DATABASE_URL: process.env.DATABASE_URL, SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, PGHOST: '203.0.113.1' },
+      env: { PATH: process.env.PATH, HOME: process.env.HOME ?? '/tmp', DATABASE_URL: process.env.DATABASE_URL, SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, PGHOST: '203.0.113.1' } as unknown as NodeJS.ProcessEnv,
     })
     assert.equal(child.status, 2, `stderr: ${child.stderr.slice(0, 300)}`)
     assert.equal((JSON.parse(child.stdout) as { code: string }).code, 'WOO_READ_FAILED')
@@ -129,9 +131,9 @@ test('the VAT difference report reads a real database and writes nothing', { ski
     await db.xeroTaxRate.deleteMany({})
     await db.xeroTaxRateList.deleteMany({})
     await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
-    if (savedRates.length) await db.xeroTaxRate.createMany({ data: savedRates.map(({ id: _id, ...rest }) => ({ ...rest, components: rest.components as never })) })
-    if (savedLists.length) await db.xeroTaxRateList.createMany({ data: savedLists.map(({ id: _id, ...rest }) => rest) })
-    if (savedTokens.length) await db.accountingToken.createMany({ data: savedTokens.map(({ id: _id, ...rest }) => rest) })
+    if (savedRates.length) await db.xeroTaxRate.createMany({ data: savedRates.map((row) => ({ ...withoutId(row), components: row.components as never })) })
+    if (savedLists.length) await db.xeroTaxRateList.createMany({ data: savedLists.map(withoutId) })
+    if (savedTokens.length) await db.accountingToken.createMany({ data: savedTokens.map(withoutId) })
     if (savedStamp) await db.setting.update({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING }, data: { value: savedStamp.value } })
     else await db.setting.deleteMany({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } })
     await db.$disconnect()
