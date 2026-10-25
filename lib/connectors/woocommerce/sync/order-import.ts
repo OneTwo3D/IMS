@@ -804,7 +804,6 @@ async function planWcPaidTransition(orderId: string, wcOrder: WcFullOrder): Prom
   if (!wcOrder.date_paid_gmt) return { kind: 'none' }
   const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, currency: true, fxRateToBase: true, totalForeign: true, createdAt: true } })
   if (!order || order.paidAt !== null || !toDecimal(order.totalForeign).gt(0)) return { kind: 'none' }
-  if ((await db.payment.count({ where: { orderId, refundId: null } })) > 0) return { kind: 'none' }
   try {
     const rate = await resolveWcReceiptSettlementRate({
       currency: order.currency,
@@ -822,27 +821,55 @@ async function planWcPaidTransition(orderId: string, wcOrder: WcFullOrder): Prom
 }
 
 async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null): Promise<void> {
+  const paidAt = parseWcGmtInstant(wcOrder.date_paid_gmt as string)
   const claimed = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
-    const won = await tx.salesOrder.updateMany({ where: { id: orderId, paidAt: null }, data: { paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string), unregisteredPaidAt: null } })
-    if (won.count !== 1) return null
-    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true } })
+    // THE CLAIM: only one delivery moves paidAt from NULL; a duplicate or retry finds it set and does nothing.
+    // The episode marker is minted exactly as the update path always did (the value is the DATABASE's clock, whatever is written: trigger of migration 20260901090000),
+    // unless the receipts already on the order cover its total, which is the same rule addPayment applies (o3d-psrx r6/r8: a covering receipt clears the marker).
+    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true } })
+    if (order.paidAt !== null) return null
+    // WooCommerce paid the order TOTAL, so what is recorded is the part of it NOT already covered. Read and summed UNDER THE LOCK, so a receipt added after the plan was made is counted.
+    const existing = await tx.payment.findMany({ where: { orderId, refundId: null }, select: { amount: true, currency: true } })
+    const ambiguous = existing.some((p) => p.currency.trim().toUpperCase() !== order.currency.trim().toUpperCase())
+    let covered = toDecimal(0)
+    for (const p of existing) covered = covered.plus(toDecimal(p.amount))
+    const remaining = toDecimal(order.totalForeign).minus(covered)
+    const covers = !ambiguous && remaining.lte(0)
+    await tx.salesOrder.update({ where: { id: orderId }, data: { paidAt, unregisteredPaidAt: covers ? null : paidAt } })
+    const reference = order.externalOrderNumber ?? order.orderNumber ?? orderId
+    if (ambiguous || covers) return { receipt: null, reference, ambiguous, existingCount: existing.length }
     const receipt = await tx.payment.create({
       data: {
         orderId,
-        amount: order.totalForeign,
+        amount: remaining,
         currency: order.currency,
         method: wcOrder.payment_method_title || wcOrder.payment_method || null,
         reference: wcOrder.transaction_id || null,
-        notes: 'Recorded from WooCommerce (the order was imported unpaid and paid later)',
-        paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
+        notes: existing.length > 0
+          ? 'Recorded from WooCommerce (paid later than the import): the part of the order total not already covered by earlier receipts'
+          : 'Recorded from WooCommerce (the order was imported unpaid and paid later)',
+        paidAt,
         settlementRateToBase: settlementRate,
       },
       select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true },
     })
-    return { receipt, reference: order.externalOrderNumber ?? order.orderNumber ?? orderId }
+    return { receipt, reference, ambiguous: false, existingCount: existing.length }
   })
   if (!claimed) return
+  if (claimed.ambiguous) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'wc_paid_transition_ambiguous_receipts',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `WooCommerce order ${claimed.reference} is paid, but the receipts IMS already holds for it are in another currency than the order, so the uncovered amount cannot be computed. It is marked paid and NO receipt was recorded; record the payment by hand.`,
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), reason: 'receipt_currency_differs_from_order' },
+    })
+    return
+  }
+  if (!claimed.receipt) return
   const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
   await registerInvoicePaymentWithLedger({
     orderId,

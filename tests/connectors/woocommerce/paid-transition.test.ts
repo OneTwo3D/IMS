@@ -109,3 +109,51 @@ test('an order already paid in IMS, or an unpaid payload, gets no receipt from t
   assert.equal((await payments(paid.id)).length + (await payments(unpaid.id)).length, 0)
   assert.equal(registrations.length, 0)
 })
+
+const addReceipt = (orderId: string, amount: number, currency = 'EUR') => s.db.payment.create({ data: { orderId, amount, currency, method: 'Hand' } })
+
+// [mutation: record the full total regardless of earlier receipts, or sum outside the lock / not at all]
+test('partial receipts: an existing 20 on a 100 order leaves ONE new Payment of 80, total exactly 100, marker minted; a duplicate adds nothing', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  await addReceipt(o.id, 20)
+  registrations.length = 0
+  const p = payload(Number(o.wcId), '2026-10-01T10:00:00')
+  await Promise.all([updateExistingWcOrderFromPayload(o.id, p), updateExistingWcOrderFromPayload(o.id, p)])
+  await updateExistingWcOrderFromPayload(o.id, p)
+  const pays = await payments(o.id)
+  assert.deepEqual(pays.map((x) => Number(x.amount)).sort((a, b) => a - b), [20, 80])
+  assert.equal(registrations.length, 1)
+  assert.equal(Number(registrations[0]!.amount), 80)
+  const row = await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })
+  assert.ok(row.paidAt)
+  assert.ok(row.unregisteredPaidAt, 'the receipts do not cover the total before this one, so the episode is minted as the update always did')
+})
+
+// [mutation: create a Payment when receipts already cover the total, or leave the marker on a covering state]
+test('existing receipts that already cover the total: no new Payment, paid recorded, marker cleared (the covering-receipt rule)', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  await addReceipt(o.id, 60)
+  await addReceipt(o.id, 40)
+  registrations.length = 0
+  await updateExistingWcOrderFromPayload(o.id, payload(Number(o.wcId), '2026-10-01T10:00:00'))
+  assert.equal((await payments(o.id)).length, 2)
+  assert.equal(registrations.length, 0)
+  const row = await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })
+  assert.ok(row.paidAt)
+  assert.equal(row.unregisteredPaidAt, null)
+})
+
+// [mutation: sum receipts of another currency as if they were the order's]
+test('a receipt in another currency is ambiguous: paid recorded, NO new Payment, a named warning', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  await addReceipt(o.id, 100, 'GBP')
+  registrations.length = 0
+  await updateExistingWcOrderFromPayload(o.id, payload(Number(o.wcId), '2026-10-01T10:00:00'))
+  assert.equal((await payments(o.id)).length, 1)
+  assert.equal(registrations.length, 0)
+  assert.ok((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt)
+  assert.equal(await s.db.activityLog.count({ where: { entityId: o.id, action: 'wc_paid_transition_ambiguous_receipts' } }), 1)
+})
