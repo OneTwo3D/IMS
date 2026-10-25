@@ -130,8 +130,8 @@ test('partial receipts: an existing 20 on a 100 order leaves ONE new Payment of 
   assert.ok(row.unregisteredPaidAt, 'the receipts do not cover the total before this one, so the episode is minted as the update always did')
 })
 
-// [mutation: create a Payment when receipts already cover the total, or leave the marker on a covering state]
-test('existing receipts that already cover the total: no new Payment, paid recorded, marker cleared (the covering-receipt rule)', async () => {
+// [mutation: create a Payment when receipts already cover the total, or skip minting the episode]
+test('existing receipts that already cover the total: no new Payment, paid recorded, a new paid episode is minted as before', async () => {
   const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const o = await heldOrder()
   await addReceipt(o.id, 60)
@@ -142,7 +142,7 @@ test('existing receipts that already cover the total: no new Payment, paid recor
   assert.equal(registrations.length, 0)
   const row = await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })
   assert.ok(row.paidAt)
-  assert.equal(row.unregisteredPaidAt, null)
+  assert.ok(row.unregisteredPaidAt, 'the paid episode starts here whatever receipts exist; only addPayment clears the marker')
 })
 
 // [mutation: sum receipts of another currency as if they were the order's]

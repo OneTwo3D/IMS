@@ -825,8 +825,9 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
   const claimed = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
     // THE CLAIM: only one delivery moves paidAt from NULL; a duplicate or retry finds it set and does nothing.
-    // The episode marker is minted exactly as the update path always did (the value is the DATABASE's clock, whatever is written: trigger of migration 20260901090000),
-    // unless the receipts already on the order cover its total, which is the same rule addPayment applies (o3d-psrx r6/r8: a covering receipt clears the marker).
+    // The episode marker is minted EXACTLY as the update path always did, in the same write as paidAt, whatever receipts exist (the value is the DATABASE's clock, whatever is
+    // written: trigger of migration 20260901090000). A new paid episode starts here; only addPayment clears the marker, and only for a receipt it records (o3d-psrx r6/r8). The registration
+    // below, or an earlier one completing after this fence, discharges it.
     const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true } })
     if (order.paidAt !== null) return null
     // WooCommerce paid the order TOTAL, so what is recorded is the part of it NOT already covered. Read and summed UNDER THE LOCK, so a receipt added after the plan was made is counted.
@@ -836,7 +837,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     for (const p of existing) covered = covered.plus(toDecimal(p.amount))
     const remaining = toDecimal(order.totalForeign).minus(covered)
     const covers = !ambiguous && remaining.lte(0)
-    await tx.salesOrder.update({ where: { id: orderId }, data: { paidAt, unregisteredPaidAt: covers ? null : paidAt } })
+    await tx.salesOrder.update({ where: { id: orderId }, data: { paidAt, unregisteredPaidAt: paidAt } })
     const reference = order.externalOrderNumber ?? order.orderNumber ?? orderId
     if (ambiguous || covers) return { receipt: null, reference, ambiguous, existingCount: existing.length }
     const receipt = await tx.payment.create({
