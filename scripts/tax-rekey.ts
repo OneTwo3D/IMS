@@ -80,7 +80,8 @@ export async function runTaxRekeyCli(options: TaxRekeyCliOptions): Promise<numbe
     const kept = buildTaxRekeyEnv(parent, parent.HOME ?? '/tmp')
     if (options.env === undefined && options.keepProcessEnv !== true) replaceProcessEnv(kept)
     options.onKeptEnv?.(kept)
-    const deps = { ...(await defaultDepsUnless(options.deps)), ...options.deps }
+    const given = options.deps
+    const deps: TaxRekeyDeps = given?.run !== undefined && given.disconnect !== undefined ? { run: given.run, disconnect: given.disconnect } : await defaultDeps()
     disconnect = deps.disconnect
     const result = await deps.run({ apply: args.apply, confirm: args.confirm ?? undefined, allowUnposted: args.allowUnposted })
     out(args.json ? JSON.stringify(result, null, 2) : renderTaxRekeyText(result))
@@ -91,10 +92,6 @@ export async function runTaxRekeyCli(options: TaxRekeyCliOptions): Promise<numbe
   } finally {
     if (disconnect) await disconnect().catch(() => undefined)
   }
-}
-
-async function defaultDepsUnless(given: Partial<TaxRekeyDeps> | undefined): Promise<Partial<TaxRekeyDeps>> {
-  return given?.run !== undefined && given.disconnect !== undefined ? {} : defaultDeps()
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

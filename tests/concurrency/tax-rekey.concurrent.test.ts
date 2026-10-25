@@ -196,7 +196,7 @@ after(async () => {
   await d.db.$disconnect()
 })
 
-const ours = (plan: { rows: Array<{ name: string }> }) => plan.rows.filter((r) => r.name.startsWith(TAG))
+const ours = <T extends { name: string }>(plan: { rows: T[] }) => plan.rows.filter((r) => r.name.startsWith(TAG))
 const byName = (plan: { rows: Array<{ name: string; outcome: string }> }) => Object.fromEntries(ours(plan).map((r) => [r.name.slice(TAG.length), r.outcome]))
 const WOO = { async get(): Promise<{ ok: true; status: number; total: string; totalPages: string; body: unknown[] }> { return { ok: true, status: 200, total: '0', totalPages: '1', body: [] } } }
 
