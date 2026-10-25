@@ -37,7 +37,7 @@ const outcomeOf = (rates: RekeyImsRate[], xero: NormalisedXeroTaxRate[], id: str
 /** The Demo-organisation numbering on the IMS side against the live organisation's: the same codes mean other rates. */
 const LIVE = [
   xeroRow('TAX004', 'BE VAT', '21'), xeroRow('TAX005', 'BG VAT', '20'), xeroRow('TAX013', 'FR VAT', '20'), xeroRow('TAX020', 'IT VAT', '22'),
-  xeroRow('TAX008', 'CY VAT', '19'), xeroRow('TAX012', 'GR VAT', '24'), xeroRow('TAX018', 'LU VAT', '17'), xeroRow('OUTPUT2', '20% (VAT on Income)', '20'),
+  xeroRow('TAX008', 'CY VAT', '19', { canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: true } }), xeroRow('TAX012', 'GR VAT', '24'), xeroRow('TAX018', 'LU VAT', '17'), xeroRow('OUTPUT2', '20% (VAT on Income)', '20'),
 ]
 const DEMO = [
   ims('cy', 'CY VAT', 'TAX005', '0.1900'), ims('gr', 'GR VAT', 'TAX013', '0.2400'), ims('lu', 'LU VAT', 'TAX020', '0.1700'),
@@ -163,13 +163,16 @@ test('every outcome is reachable and the counts add up', () => {
   const live = [
     xeroRow('TAX008', 'CY VAT', '19'), xeroRow('TAX012', 'GR VAT', '24'), xeroRow('TAX004', 'BE VAT', '21'), xeroRow('TAX050', 'BE VAT', '21'),
     xeroRow('TAX018', 'LU VAT', '17'), xeroRow('TAX013', 'FR VAT', '20', { status: 'ARCHIVED' }),
+    xeroRow('TAX060', 'DE VAT', '19', { canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: false } }),
+    xeroRow('TAX061', 'ES VAT', '21', { components: [{ name: 'a', rate: '10.000000', compound: false, nonRecoverable: false }, { name: 'b', rate: '11.000000', compound: false, nonRecoverable: false }] }),
   ]
   const plan = match([
     ims('ok', 'CY VAT', 'TAX008', '0.1900'), ims('mv', 'GR VAT', 'TAX013', '0.2400'), ims('no', 'CI VAT', 'TAX004', '0.1800', { countryCode: 'CI' }),
     ims('am', 'BE VAT', 'TAX021', '0.2100'), ims('pd', 'LU VAT', 'TAX020', '0.1500'), ims('in', 'FR VAT', 'TAX013', '0.2000'),
+    ims('sd', 'DE VAT', 'TAX070', '0.1900'), ims('md', 'ES VAT', 'TAX071', '0.2100'),
   ], live)
   const byId = Object.fromEntries(plan.rows.map((r) => [r.imsRateId, r.outcome]))
-  assert.deepEqual(byId, { ok: 'ALREADY_CORRECT', mv: 'REKEY', no: 'NO_MATCH', am: 'AMBIGUOUS', pd: 'PERCENTAGE_DIFFERS', in: 'NAME_MATCHES_INACTIVE' })
+  assert.deepEqual(byId, { ok: 'ALREADY_CORRECT', mv: 'REKEY', no: 'NO_MATCH', am: 'AMBIGUOUS', pd: 'PERCENTAGE_DIFFERS', in: 'NAME_MATCHES_INACTIVE', sd: 'SIDE_NOT_ALLOWED', md: 'MEANING_DIFFERS' })
   assert.equal(REKEY_OUTCOMES.every((o) => plan.counts[o] === 1), true)
 })
 
@@ -187,11 +190,38 @@ test('components: a custom code that is not a live ACTIVE type is listed to be c
   assert.notEqual(digestRekeyPlan({ ...base, rows: base.rows.map((r) => r.imsRateId === 'cy' ? { ...r, clearedComponents: [{ sortOrder: 0, name: 'c', taxType: 'TAX099' }] } : r) }), base.digest, 'the digest covers the cleared components')
 })
 
+// [mutation: the canApply check removed -> the arm fails]
+test('SIDE_NOT_ALLOWED: the live type must be allowed on every side the IMS rate is used for (revenue for sales, expenses for purchases, both for BOTH)', () => {
+  const can = (revenue: boolean, expenses: boolean) => ({ assets: false, equity: false, expenses, liabilities: false, revenue })
+  const at = (usedFor: string, revenue: boolean, expenses: boolean) => outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { usedFor })], [xeroRow('TAX008', 'CY VAT', '19', { canApply: can(revenue, expenses) })], 'x')
+  assert.equal(at('SALES', false, true).outcome, 'SIDE_NOT_ALLOWED')
+  assert.equal(at('PURCHASE', true, false).outcome, 'SIDE_NOT_ALLOWED')
+  assert.equal(at('BOTH', true, false).outcome, 'SIDE_NOT_ALLOWED')
+  assert.match(at('BOTH', true, false).reason, /expenses/)
+  assert.deepEqual(['SALES', 'PURCHASE', 'BOTH'].map((u) => at(u, u !== 'PURCHASE', u !== 'SALES').outcome), ['REKEY', 'REKEY', 'REKEY'], 'control: allowed sides re-key')
+})
+
+// [mutation: the component comparison removed -> the arm fails; mutation: the non-recoverable check removed -> the last assertion fails]
+test('MEANING_DIFFERS: same percentage but another component breakdown, another compounding, or a non-recoverable component is not re-keyed; equal breakdowns are', () => {
+  const part = (rate: string, compound = false, nonRecoverable = false) => ({ name: 'p', rate, compound, nonRecoverable })
+  const comp = (rate: string, sortOrder: number, compoundOnPrevious = false) => ({ rate, compoundOnPrevious, active: true, sortOrder })
+  const two = [comp('0.1000', 0), comp('0.1100', 1)]
+  const at = (components: ReturnType<typeof comp>[], live: ReturnType<typeof part>[], pct = '21') => outcomeOf([ims('x', 'ES VAT', 'TAX005', Number(pct) / 100 === 0.21 ? '0.2100' : '0.1900', { components })], [xeroRow('TAX008', 'ES VAT', pct, { components: live })], 'x')
+  assert.equal(at(two, [part('10.000000'), part('11.000000')]).outcome, 'REKEY', 'control: the same two components')
+  assert.equal(at([], [part('21.000000')]).outcome, 'REKEY', 'control: no IMS components equals one live component at the rate')
+  assert.equal(at(two, [part('21.000000')]).outcome, 'MEANING_DIFFERS')
+  assert.match(at(two, [part('21.000000')]).reason, /2 component\(s\).*1/)
+  assert.equal(at(two, [part('9.000000'), part('12.000000')]).outcome, 'MEANING_DIFFERS')
+  assert.equal(at(two, [part('10.000000'), part('11.000000', true)]).outcome, 'MEANING_DIFFERS')
+  assert.equal(at([], [part('21.000000', false, true)]).outcome, 'MEANING_DIFFERS')
+  assert.match(at([], [part('21.000000', false, true)]).reason, /non-recoverable/)
+})
+
 // ---- the digest and the refusals to apply ---------------------------------------------------------------
 
 const refs = (over: Partial<RekeyReferences> = {}): RekeyReferences => ({
   suppliers: 1, storefrontMappings: 1, isDefault: false, unpostedSalesOrders: 0, unpostedSalesOrderLines: 0, unpostedPurchaseOrders: 0, unpostedPurchaseOrderLines: 0,
-  queuedSyncRows: 0, queuedEvents: 0, postedSalesOrderLines: 4, postedPurchaseOrderLines: 0, ...over,
+  queuedSyncRows: 0, queuedEvents: 0, postedSalesOrders: 0, postedSalesOrderLines: 0, postedPurchaseOrders: 0, postedPurchaseOrderLines: 0, ...over,
 })
 const planOf = (referenceOver: Partial<RekeyReferences> = {}): RekeyPlan => {
   const matched = match(DEMO, LIVE)
@@ -207,7 +237,7 @@ test('the digest is stable, changes with any decision-bearing fact, and ignores 
   assert.match(base.digest, /^[0-9a-f]{64}$/)
   assert.equal(planOf().digest, base.digest)
   assert.equal(digestRekeyPlan({ ...base, list: { ...base.list, fetchedAt: new Date(FETCHED.getTime() + 3_600_000).toISOString() } }), base.digest, 'the hourly re-read of an unchanged list keeps the digest')
-  assert.equal(digestRekeyPlan({ ...base, references: Object.fromEntries(Object.entries(base.references).map(([id, r]) => [id, { ...r, postedSalesOrderLines: 99 }])) }), base.digest, 'posted-line counts are information only')
+  assert.notEqual(planOf({ postedSalesOrders: 1, postedSalesOrderLines: 2 }).digest, base.digest, 'an already-posted order is a future posting source, so it is part of the plan')
   assert.notEqual(planOf({ unpostedSalesOrders: 1 }).digest, base.digest, 'an order that became unposted')
   assert.notEqual(planOf({ suppliers: 2 }).digest, base.digest, 'a supplier that now references the rate')
   assert.notEqual(digestRekeyPlan({ ...base, rows: base.rows.map((r) => r.imsRateId === 'cy' ? { ...r, target: { ...r.target!, taxType: 'TAX099' } } : r) }), base.digest, 'a different target code')
@@ -219,6 +249,10 @@ test('applyRefusal: blockers and queued payloads always refuse; unposted orders 
   assert.equal(applyRefusal(planOf(), false), null)
   assert.equal(applyRefusal(planOf({ unpostedSalesOrders: 2, unpostedSalesOrderLines: 3 }), false)?.code, 'UNPOSTED_DOCUMENTS')
   assert.equal(applyRefusal(planOf({ unpostedPurchaseOrders: 1, unpostedPurchaseOrderLines: 1 }), false)?.code, 'UNPOSTED_DOCUMENTS')
+  // An ALREADY-POSTED order still re-reads its lines' rate on an edit / re-send / credit note / refund / further bill: it blocks too (a part-billed PO, an invoiced SO).
+  assert.equal(applyRefusal(planOf({ postedSalesOrders: 1, postedSalesOrderLines: 1 }), false)?.code, 'UNPOSTED_DOCUMENTS')
+  assert.equal(applyRefusal(planOf({ postedPurchaseOrders: 1, postedPurchaseOrderLines: 1 }), false)?.code, 'UNPOSTED_DOCUMENTS')
+  assert.equal(applyRefusal(planOf({ postedSalesOrders: 1, postedPurchaseOrders: 1 }), true), null, 'control: the flag lets posted sources through')
   assert.equal(applyRefusal(planOf({ unpostedSalesOrders: 2 }), true), null, 'control: the flag lets unposted orders through')
   assert.equal(applyRefusal(planOf({ queuedSyncRows: 1 }), true)?.code, 'QUEUED_PAYLOADS', 'no flag overrides a queued payload')
   assert.equal(applyRefusal(planOf({ queuedEvents: 1 }), false)?.code, 'QUEUED_PAYLOADS')
@@ -246,7 +280,7 @@ function client(state: State) {
       findMany: async () => (list ?? []).map((r) => ({
         connector: 'xero', tenantId: tenant, taxType: r.taxType, name: r.name, status: r.status, reportTaxType: r.reportTaxType,
         effectiveRate: r.effectiveRate === null ? null : decimal(r.effectiveRate), displayTaxRate: r.displayTaxRate === null ? null : decimal(r.displayTaxRate),
-        components: r.components, canApplyToAssets: false, canApplyToEquity: false, canApplyToExpenses: false, canApplyToLiabilities: false, canApplyToRevenue: true,
+        components: r.components, canApplyToAssets: r.canApply.assets, canApplyToEquity: r.canApply.equity, canApplyToExpenses: r.canApply.expenses, canApplyToLiabilities: r.canApply.liabilities, canApplyToRevenue: r.canApply.revenue,
       })),
     },
     setting: { findUnique: async () => { const stamp = state.stamp === undefined ? fetchedAt.toISOString() : state.stamp; return stamp === null ? null : { value: stamp } } },
@@ -268,7 +302,7 @@ test('a trusted stored list gives a plan (control for the refusals below)', asyn
   assert.equal(read.ok, true)
   if (read.ok) {
     assert.equal(read.plan.counts.REKEY, 5)
-    assert.deepEqual(Object.values(read.plan.references)[0], { suppliers: 1, storefrontMappings: 2, isDefault: false, unpostedSalesOrders: 0, unpostedSalesOrderLines: 0, unpostedPurchaseOrders: 0, unpostedPurchaseOrderLines: 0, queuedSyncRows: 0, queuedEvents: 0, postedSalesOrderLines: 0, postedPurchaseOrderLines: 0 })
+    assert.deepEqual(Object.values(read.plan.references)[0], { suppliers: 1, storefrontMappings: 2, isDefault: false, unpostedSalesOrders: 0, unpostedSalesOrderLines: 0, unpostedPurchaseOrders: 0, unpostedPurchaseOrderLines: 0, postedSalesOrders: 0, postedSalesOrderLines: 0, postedPurchaseOrders: 0, postedPurchaseOrderLines: 0, queuedSyncRows: 0, queuedEvents: 0 })
     const again = await readRekeyPlan(client({ list: LIVE }), { now: NOW, connectedTenantId: TENANT })
     assert.equal(again.ok && again.plan.digest, read.plan.digest, 'the same state gives the same digest')
   }

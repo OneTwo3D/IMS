@@ -9,7 +9,7 @@ import { REKEY_OUTCOMES, REKEY_OUTCOME_MEANING } from '@/lib/tax/tax-rekey-outco
 /**
  * Re-key IMS tax rates to the custom tax codes of the connected Xero organisation. Xero numbers custom codes (TAX001..) per organisation, so rates created against another
  * (Demo) organisation carry codes that mean other rates in the live one. Preview shows, for each rate, the live type of the same name; Apply needs the digest of that preview,
- * so nothing can change between the two. New rates are created and the old ones deactivated (never edited); posted documents keep the old rate.
+ * so nothing can change between the two. New rates are created and the old ones deactivated (never edited); orders that can still post are re-pointed only on request.
  */
 export function TaxRekeyPanel() {
   const [busy, setBusy] = useState<'preview' | 'apply' | null>(null)
@@ -47,7 +47,7 @@ export function TaxRekeyPanel() {
       </p>
       <label className="flex items-center gap-2 text-xs">
         <input type="checkbox" checked={allowUnposted} onChange={(e) => setAllowUnposted(e.target.checked)} />
-        Also re-point the lines of orders that have not posted yet (otherwise they block the Apply)
+        Also re-point the lines of orders and purchase orders that can still post, posted or not (otherwise they block the Apply)
       </label>
       <div className="flex items-center gap-2">
         <Button variant="outline" size="sm" onClick={() => run('preview')} disabled={busy !== null}>
@@ -75,7 +75,7 @@ export function TaxRekeyPanel() {
               <p key={row.imsRateId} title={REKEY_OUTCOME_MEANING[row.outcome]}>
                 <strong>{row.outcome}</strong> {row.name} ({row.usedFor}{row.countryCode ? ` ${row.countryCode}` : ''}) {row.currentCode} {row.imsPercent}%
                 {row.target ? ` -> ${row.target.taxType} "${row.target.name}" ${row.target.percent ?? '?'}%` : ''} ({row.matchedBy ?? 'no name match'}: {row.reason}){row.clearedComponents.length > 0 ? ` [component code(s) cleared: ${row.clearedComponents.map((c) => c.taxType).join(', ')}]` : ''}
-                {refs ? ` [${refs.suppliers} supplier(s), ${refs.storefrontMappings} storefront mapping(s)${refs.isDefault ? ', default rate' : ''}, ${refs.unpostedSalesOrders + refs.unpostedPurchaseOrders} unposted order(s), ${refs.queuedSyncRows + refs.queuedEvents} queued payload(s)]` : ''}
+                {refs ? ` [${refs.suppliers} supplier(s), ${refs.storefrontMappings} storefront mapping(s)${refs.isDefault ? ', default rate' : ''}, ${refs.unpostedSalesOrders + refs.unpostedPurchaseOrders} never-posted and ${refs.postedSalesOrders + refs.postedPurchaseOrders} posted order(s) that can still post, ${refs.queuedSyncRows + refs.queuedEvents} queued payload(s)]` : ''}
               </p>
             )
           })}

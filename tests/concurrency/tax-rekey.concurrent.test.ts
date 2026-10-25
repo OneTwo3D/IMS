@@ -43,13 +43,13 @@ async function loadDeps() {
 }
 type Deps = Awaited<ReturnType<typeof loadDeps>>
 
-const xero = (taxType: string, name: string, percent: string) => ({
+const xero = (taxType: string, name: string, percent: string, expenses = false) => ({
   taxType, name: `${TAG}${name}`, status: 'ACTIVE' as const, reportTaxType: null, effectiveRate: `${percent}.000000`, displayTaxRate: `${percent}.000000`,
   components: [{ name: 'VAT', rate: `${percent}.000000`, compound: false, nonRecoverable: false }],
-  canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true },
+  canApply: { assets: false, equity: false, expenses, liabilities: false, revenue: true },
 })
 const LIVE = () => [
-  xero(code('A'), 'BE VAT', '21'), xero(code('B'), 'BG VAT', '20'), xero(code('C'), 'CY VAT', '19'), xero(code('D'), 'GR VAT', '24'),
+  xero(code('A'), 'BE VAT', '21'), xero(code('B'), 'BG VAT', '20'), xero(code('C'), 'CY VAT', '19'), xero(code('D'), 'GR VAT', '24', true),
   xero(code('E'), 'AMB VAT', '5'), xero(code('F'), 'AMB VAT', '5'), xero(code('X'), 'PCT VAT', '10'),
 ]
 
@@ -217,7 +217,7 @@ test('the PREVIEW reads a real database, gives each rate its outcome, and writes
   // Documents: the cancelled order and the posted ones are not "unposted"; the drafts are.
   const refs = plan.references
   assert.deepEqual(
-    [refs[w.ids.cy]!.unpostedSalesOrders, refs[w.ids.cy]!.postedSalesOrderLines, refs[w.ids.cy]!.postedPurchaseOrderLines, refs[w.ids.cy]!.suppliers, refs[w.ids.cy]!.storefrontMappings, refs[w.ids.cy]!.isDefault],
+    [refs[w.ids.cy]!.unpostedSalesOrders, refs[w.ids.cy]!.postedSalesOrders, refs[w.ids.cy]!.postedPurchaseOrders, refs[w.ids.cy]!.suppliers, refs[w.ids.cy]!.storefrontMappings, refs[w.ids.cy]!.isDefault],
     [1, 1, 1, 1, 1, true],
   )
   assert.deepEqual([refs[w.ids.gr]!.unpostedSalesOrders, refs[w.ids.be]!.unpostedPurchaseOrders], [1, 1])
@@ -312,11 +312,11 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   assert.deepEqual([await sup(w.supCy), await sup(w.supGr), await sup(w.supBg)], [newId('CY VAT'), newId('GR VAT'), w.ids.bg])
   const map = async (id: string) => (await db.shoppingTaxRateMapping.findUniqueOrThrow({ where: { id } })).taxRateId
   assert.deepEqual([await map(w.mapping), await map(w.mappingBg)], [newId('CY VAT'), w.ids.bg])
-  // Documents: the posted ones keep the old row (their posted meaning), the cancelled one is left alone, the unposted ones moved (the flag).
+  // Documents: EVERY not-cancelled one moved (posted ones can still be edited / re-sent / credited / billed again and would send the old code); the cancelled one is left alone.
   const soLine = async (id: string) => (await db.salesOrderLine.findUniqueOrThrow({ where: { id } })).taxRateId
-  assert.deepEqual([await soLine(w.soPosted.lineId), await soLine(w.soCancelled.lineId), await soLine(w.soDraftCy.lineId), await soLine(w.soDraftGr.lineId)], [w.ids.cy, w.ids.cy, newId('CY VAT'), newId('GR VAT')])
+  assert.deepEqual([await soLine(w.soPosted.lineId), await soLine(w.soCancelled.lineId), await soLine(w.soDraftCy.lineId), await soLine(w.soDraftGr.lineId)], [newId('CY VAT'), w.ids.cy, newId('CY VAT'), newId('GR VAT')])
   const poLine = async (id: string) => (await db.purchaseOrderLine.findUniqueOrThrow({ where: { id } })).taxRateId
-  assert.deepEqual([await poLine(w.poPostedCy.lineId), await poLine(w.poDraftBe.lineId)], [w.ids.cy, newId('BE VAT')])
+  assert.deepEqual([await poLine(w.poPostedCy.lineId), await poLine(w.poDraftBe.lineId)], [newId('CY VAT'), newId('BE VAT')])
   assert.equal(await db.activityLog.count({ where: { action: 'tax_rates_rekeyed_to_xero_codes', metadata: { path: ['planDigest'], equals: preview.digest } } }), 1)
 
   // The report afterwards: no percentage mismatch for a re-keyed rate.
@@ -372,4 +372,29 @@ test('two applies at once: exactly one writes, the other finds nothing to do; an
   } finally { target.findMany = original }
   const control = await d.rekey.runTaxRekey({ apply: true, confirm: preview2.digest, allowUnposted: true })
   assert.equal(control.wrote, true, 'control: with no rebind the same call writes')
+})
+
+// [mutation: posted documents excluded from the blocking set (back to "posted = stays") -> the arm applies without the flag and fails]
+test('an ALREADY-POSTED invoiced order and a part-billed PO are future posting sources: they alone block the apply, and the flag re-points their lines', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const w = await seedWorld(d)
+  const { db } = d
+  // Leave only posted sources: the never-posted drafts are cancelled (a cancelled document is not a source).
+  await db.salesOrder.updateMany({ where: { id: { in: [w.soDraftCy.id, w.soDraftGr.id] } }, data: { status: 'CANCELLED' } })
+  await db.purchaseOrder.updateMany({ where: { id: { in: [w.poDraftBe.id] } }, data: { status: 'CANCELLED' } })
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+  const cy = preview.references[w.ids.cy]!
+  assert.deepEqual([cy.unpostedSalesOrders, cy.postedSalesOrders, cy.postedPurchaseOrders], [0, 1, 1])
+  const before = await ownedDigest(d, w)
+  const refused = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest })
+  assert.deepEqual([refused.refusal?.code, refused.wrote], ['UNPOSTED_DOCUMENTS', false])
+  assert.equal(await ownedDigest(d, w), before)
+  const done = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  assert.equal(done.wrote, true)
+  const newCy = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}CY VAT`, active: true } })).id
+  assert.equal((await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soPosted.lineId } })).taxRateId, newCy, 'the invoiced order\'s line follows')
+  assert.equal((await db.purchaseOrderLine.findUniqueOrThrow({ where: { id: w.poPostedCy.lineId } })).taxRateId, newCy, 'the billed PO\'s line follows')
+  assert.equal((await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soCancelled.lineId } })).taxRateId, w.ids.cy, 'a cancelled order stays on the old row')
 })

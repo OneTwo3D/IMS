@@ -9,6 +9,8 @@
  *   NAME       the live type whose name equals the IMS rate's name, trimmed, case-sensitive FIRST; only if that finds none, case-insensitive. The plan says which matched.
  *   STATUS     the live type must be ACTIVE in the trusted stored list (readStoredXeroList: the proof #797's import uses).
  *   PERCENTAGE exactly the same percentage: Xero's EffectiveRate, else DisplayTaxRate, against the rate column AND the percentage tax is computed at (the active components'). Never rounded.
+ *   SIDE       the live type must be allowed on every side the IMS rate is used for (stored canApply.revenue for sales, canApply.expenses for purchases).
+ *   MEANING    the component breakdown must be the same (count, each component's rate, compound flag; no non-recoverable component): componentMeaningDifference.
  *   COUNTRY    where the IMS rate has a countryCode and the Xero name starts with a two-letter country prefix ("CY VAT"), they must agree.
  * It NEVER matches by code. Each rate gets ONE outcome (REKEY_OUTCOMES). Two further conditions are BLOCKERS that refuse the apply: two rates re-keying to one live type, and a live
  * type already carried by another active IMS rate that stays (a code on two active rates is ambiguous).
@@ -18,21 +20,24 @@
  *   1. creates a NEW TaxRate (a component's own custom code that is not a live ACTIVE type is cleared to null on the new row, and listed in the plan) with the live code and the same name, rate, type, category, usedFor, country, flags and components; the old row is NEVER edited (documents reference it): it is only
  *      deactivated (and loses isDefault, which the new row takes);
  *   2. re-points the supplier default tax rates and the WooCommerce rate mappings (ShoppingTaxRateMapping) to the new row;
- *   3. leaves every POSTED document on the old row: its posted meaning cannot change;
- *   4. OPEN DOCUMENTS (see below).
+ *   3. OPEN DOCUMENTS (see below): documents and payloads already sent are not touched; documents that can still post are re-pointed only on request.
  * A re-run finds the old rows inactive and the new rows ALREADY_CORRECT, so it writes nothing.
  *
- * OPEN DOCUMENTS - the decision. A sales order line / purchase order line posts the code of the TaxRate it references AT SEND TIME: the sales invoice is built when it is enqueued
- * (app/actions/sales.ts enqueueSalesInvoiceSync: `l.taxRate.accountingTaxType` read from the line's row, copied into the queued payload), the supplier bill likewise when it is raised
- * (app/actions/purchase-orders.ts createPurchaseInvoice reads each po line's taxRate and `supplier.taxRate`). A queued payload, by contrast, is a SNAPSHOT: lines[].taxType is sent as stored
- * (lib/connectors/xero/sync-processor.ts). So after a re-key:
- *   - POSTED documents keep the old row and the code they posted. Unchanged, and not counted as a problem.
- *   - UNPOSTED documents (an order with no invoice number / invoice id / invoice sync row / accounting event; a PO with no bill; neither cancelled) would still post the OLD code when they
- *     are sent, because their lines reference the old row. They BLOCK the apply (UNPOSTED_DOCUMENTS, with counts) unless the operator passes the explicit flag, which re-points those
- *     lines to the new row (same name, same percentage: no amount changes).
- *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED - a FAILED row keeps blocking until it is retried or cancelled - or an accounting event PENDING / FAILED, whose lines carry the old code) are snapshots IMS does not rewrite.
- *     They BLOCK the apply (QUEUED_PAYLOADS) with no override: let them post, or cancel them, first.
- * The rows an operator-confirmed apply would re-point are those counted in the plan the digest covers.
+ * OPEN DOCUMENTS - the decision. A document line posts the code of the TaxRate it references whenever a Xero document is BUILT from it, not once. The paths that read
+ * `line.taxRate.accountingTaxType` at send time:
+ *   sales   app/actions/sales.ts queueSalesInvoiceForOrder (~1330-1445: the first SALES_INVOICE and every SALES_INVOICE_UPDATE after an edit), the credit
+ *           note / refund accounting actions from an existing invoice (queueRefundAccountingActions, ~2000-2052), app/actions/sync-exceptions.ts (~1374, ~2751: re-send / credit-note rebuilds) and lib/domain/sales/refund-posted-tax-identity.ts
+ *           (~334, ~836: a refund resolves its line identity from the original line's rate);
+ *   purchase app/actions/purchase-orders.ts createInvoice (~3096-3186: EVERY bill, including the bill for the quantity still to bill on a part-billed PO), updateInvoice
+ *           (~3465-3586), postSupplierCreditNote (~4505-4559) and lib/domain/purchasing/purchase-invoice-edit.ts (~208: PURCHASE_INVOICE_UPDATE).
+ * A queued payload, by contrast, is a SNAPSHOT: lines[].taxType is sent as stored (lib/connectors/xero/sync-processor.ts). So after a re-key:
+ *   - EVERY not-cancelled document whose lines reference the old row is a FUTURE POSTING SOURCE, posted or not: it would send the OLD code on its next build. They BLOCK the apply
+ *     (UNPOSTED_DOCUMENTS, counts split into never-posted and already-posted) unless the operator passes the explicit flag, which re-points those lines to the new row. Documents
+ *     and payloads that already went to Xero are not touched. Is a posted document's next update then a change of meaning? No: the new row is the live type of the SAME name,
+ *     ACTIVE, with the same percentage, the same sides and the same component breakdown (the plan refuses otherwise), so the same tax meaning by construction; the old code was the
+ *     other organisation's number, so the update is a correction. No amount changes (same percentage). Cancelled documents are left on the old row.
+ *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED - a FAILED row keeps blocking until it is retried or cancelled - or an accounting event PENDING / FAILED,
+ *     whose lines carry the old code) are snapshots IMS does not rewrite. They BLOCK the apply (QUEUED_PAYLOADS) with no override: let them post, or cancel them, first.
  */
 import { createHash } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
@@ -101,17 +106,19 @@ export interface RekeyReferences {
   suppliers: number
   storefrontMappings: number
   isDefault: boolean
-  /** Unposted documents (and their lines) that reference the old row. */
+  /** Documents (not cancelled) that reference the old row and have NO posting evidence yet: the first post will read the old code. */
   unpostedSalesOrders: number
   unpostedSalesOrderLines: number
   unpostedPurchaseOrders: number
   unpostedPurchaseOrderLines: number
+  /** Documents (not cancelled) that reference the old row and HAVE posted: an edit / re-send / credit note / refund / further bill re-reads the line's rate, so they are future posting sources too. */
+  postedSalesOrders: number
+  postedSalesOrderLines: number
+  postedPurchaseOrders: number
+  postedPurchaseOrderLines: number
   /** Queued payloads whose lines carry the old code. */
   queuedSyncRows: number
   queuedEvents: number
-  /** Information only (not in the digest): lines on posted documents, which stay on the old row. */
-  postedSalesOrderLines: number
-  postedPurchaseOrderLines: number
 }
 
 export interface RekeyPlan {
@@ -151,6 +158,25 @@ const overlap = (a: string, b: string): boolean => sides(a).some((side) => sides
 const statedPercent = (row: NormalisedXeroTaxRate): Dec | null => {
   const stated = row.effectiveRate ?? row.displayTaxRate
   return stated === null ? null : new Dec(stated)
+}
+/**
+ * Do the IMS rate and the live type tax the same way? Each side is reduced to its ordered components (rate, compound): the IMS rate's ACTIVE components, else one component at the
+ * rate column when it is above zero; the live type's stored components (Xero's TaxComponents: name, rate, compound, nonRecoverable), else one at its stated percentage. Names are not
+ * compared. A non-recoverable live component can't be expressed by an IMS rate (the importer refuses it for the same reason). Returns why they differ, or null.
+ */
+export function componentMeaningDifference(rate: Pick<RekeyImsRate, 'rate' | 'components'>, live: NormalisedXeroTaxRate): string | null {
+  if (live.components.some((c) => c.nonRecoverable)) return 'the live type has a non-recoverable component, which an IMS rate cannot express'
+  const column = new Dec(rate.rate).mul(100)
+  const imsActive = rate.components.filter((c) => c.active).sort((a, b) => a.sortOrder - b.sortOrder)
+  const ims = imsActive.length > 0 ? imsActive.map((c) => ({ rate: new Dec(c.rate).mul(100), compound: c.compoundOnPrevious })) : column.gt(0) ? [{ rate: column, compound: false }] : []
+  const stated = statedPercent(live)
+  const theirs = live.components.length > 0 ? live.components.map((c) => ({ rate: new Dec(c.rate), compound: c.compound })) : stated !== null && stated.gt(0) ? [{ rate: stated, compound: false }] : []
+  if (ims.length !== theirs.length) return `the IMS rate has ${ims.length} component(s), the live type ${theirs.length}`
+  for (const [index, mine] of ims.entries()) {
+    if (!mine.rate.eq(theirs[index]!.rate)) return `component ${index + 1} is ${mine.rate.toFixed()}% in IMS and ${theirs[index]!.rate.toFixed()}% in Xero`
+    if (mine.compound !== theirs[index]!.compound) return `component ${index + 1} differs on compounding`
+  }
+  return null
 }
 const candidateOf = (row: NormalisedXeroTaxRate): RekeyCandidate => ({ taxType: row.taxType, name: row.name, status: row.status, percent: statedPercent(row)?.toFixed() ?? null })
 
@@ -204,6 +230,12 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
       done('PERCENTAGE_DIFFERS', live, `the live type is ${percent.toFixed()}% but the IMS rate is ${column.toFixed()}%${effective.eq(column) ? '' : ` (computed at ${effective.toFixed()}%)`}`)
       continue
     }
+    // Applicability (stored list: canApply.revenue / canApply.expenses, from Xero's CanApplyToRevenue / CanApplyToExpenses): every side the IMS rate is used for must be allowed.
+    const wrongSides = sides(rate.usedFor).filter((side) => (side === 'SALES' ? live.canApply.revenue : live.canApply.expenses) !== true)
+    if (wrongSides.length > 0) { done('SIDE_NOT_ALLOWED', live, `Xero does not allow ${live.taxType} on ${wrongSides.map((side) => (side === 'SALES' ? 'revenue' : 'expenses')).join(' and ')}, which the IMS rate is used for`); continue }
+    // Component treatment (stored list: components[] = name, rate, compound, nonRecoverable): same count, each rate, each compound flag, nothing non-recoverable.
+    const meaning = componentMeaningDifference(rate, live)
+    if (meaning !== null) { done('MEANING_DIFFERS', live, meaning); continue }
     done(live.taxType === currentCode ? 'ALREADY_CORRECT' : 'REKEY', live, live.taxType === currentCode ? 'the code is already the live type of this name' : `live type ${live.taxType} has this name; ${currentCode} does not`)
   }
 
@@ -231,14 +263,7 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
 /** A canonical, order-independent digest of everything the apply decides on. Not the list's fetch time (the hourly job moves it without changing a row), but the list's own digest. */
 export function digestRekeyPlan(plan: Pick<RekeyPlan, 'list' | 'rows' | 'blockers' | 'references'>): string {
   const refs = Object.keys(plan.references).sort().map((id) => {
-    const r = plan.references[id]!
-    // Without the posted-line counts: information only, and they move whenever a document posts.
-    return [id, {
-      suppliers: r.suppliers, storefrontMappings: r.storefrontMappings, isDefault: r.isDefault,
-      unpostedSalesOrders: r.unpostedSalesOrders, unpostedSalesOrderLines: r.unpostedSalesOrderLines,
-      unpostedPurchaseOrders: r.unpostedPurchaseOrders, unpostedPurchaseOrderLines: r.unpostedPurchaseOrderLines,
-      queuedSyncRows: r.queuedSyncRows, queuedEvents: r.queuedEvents,
-    }] as const
+    return [id, plan.references[id]!] as const
   })
   const canonical = { v: 1, tenantId: plan.list.tenantId, list: plan.list.digest, rows: plan.rows, blockers: plan.blockers, references: refs }
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
@@ -264,8 +289,14 @@ const SALES_INVOICE_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
 const IN_FLIGHT_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'FAILED'] as const
 const IN_FLIGHT_EVENT_STATUSES = ['PENDING', 'FAILED'] as const
 
-/** The sales orders / purchase orders that reference `rateId` and have not posted, plus the lines of posted ones (information). Reads only. */
-export async function openDocumentsOf(client: Client, rateId: string): Promise<{ salesOrderIds: string[]; salesLines: number; purchaseOrderIds: string[]; purchaseLines: number; postedSalesLines: number; postedPurchaseLines: number }> {
+/**
+ * The not-cancelled sales orders / purchase orders that reference `rateId`, split by whether they have posted. BOTH kinds can still post the line's rate code, so both are future posting
+ * sources (see the header). Cancelled documents are left alone. Reads only.
+ */
+export async function openDocumentsOf(client: Client, rateId: string): Promise<{
+  salesOrderIds: string[]; unpostedSalesOrders: number; unpostedSalesLines: number; postedSalesOrders: number; postedSalesLines: number
+  purchaseOrderIds: string[]; unpostedPurchaseOrders: number; unpostedPurchaseLines: number; postedPurchaseOrders: number; postedPurchaseLines: number
+}> {
   const orders = await client.salesOrder.findMany({
     where: { lines: { some: { taxRateId: rateId } } },
     select: { id: true, status: true, accountingInvoiceId: true, invoicedAt: true, invoiceNumber: true, lines: { where: { taxRateId: rateId }, select: { id: true } } },
@@ -274,28 +305,25 @@ export async function openDocumentsOf(client: Client, rateId: string): Promise<{
   const logs = orderIds.length === 0 ? [] : await client.accountingSyncLog.findMany({ where: { referenceType: 'SalesOrder', referenceId: { in: orderIds }, type: { in: [...SALES_INVOICE_TYPES] } }, select: { referenceId: true } })
   const events = orderIds.length === 0 ? [] : await client.accountingEvent.findMany({ where: { sourceEntityType: 'SalesOrder', sourceEntityId: { in: orderIds } }, select: { sourceEntityId: true } })
   const touched = new Set([...logs.map((l) => l.referenceId), ...events.map((e) => e.sourceEntityId)])
-  const salesOrderIds: string[] = []
-  let salesLines = 0
-  let postedSalesLines = 0
+  const out = { salesOrderIds: [] as string[], unpostedSalesOrders: 0, unpostedSalesLines: 0, postedSalesOrders: 0, postedSalesLines: 0, purchaseOrderIds: [] as string[], unpostedPurchaseOrders: 0, unpostedPurchaseLines: 0, postedPurchaseOrders: 0, postedPurchaseLines: 0 }
   for (const order of orders) {
     if (order.status === 'CANCELLED') continue
+    out.salesOrderIds.push(order.id)
     const posted = order.accountingInvoiceId !== null || order.invoicedAt !== null || order.invoiceNumber !== null || touched.has(order.id)
-    if (posted) postedSalesLines += order.lines.length
-    else { salesOrderIds.push(order.id); salesLines += order.lines.length }
+    if (posted) { out.postedSalesOrders += 1; out.postedSalesLines += order.lines.length } else { out.unpostedSalesOrders += 1; out.unpostedSalesLines += order.lines.length }
   }
   const pos = await client.purchaseOrder.findMany({
     where: { lines: { some: { taxRateId: rateId } } },
     select: { id: true, status: true, invoices: { select: { id: true }, take: 1 }, lines: { where: { taxRateId: rateId }, select: { id: true } } },
   })
-  const purchaseOrderIds: string[] = []
-  let purchaseLines = 0
-  let postedPurchaseLines = 0
   for (const po of pos) {
     if (po.status === 'CANCELLED') continue
-    if (po.invoices.length > 0) postedPurchaseLines += po.lines.length
-    else { purchaseOrderIds.push(po.id); purchaseLines += po.lines.length }
+    out.purchaseOrderIds.push(po.id)
+    if (po.invoices.length > 0) { out.postedPurchaseOrders += 1; out.postedPurchaseLines += po.lines.length } else { out.unpostedPurchaseOrders += 1; out.unpostedPurchaseLines += po.lines.length }
   }
-  return { salesOrderIds: salesOrderIds.sort(), salesLines, purchaseOrderIds: purchaseOrderIds.sort(), purchaseLines, postedSalesLines, postedPurchaseLines }
+  out.salesOrderIds.sort()
+  out.purchaseOrderIds.sort()
+  return out
 }
 
 async function queuedCounts(client: Client, taxType: string): Promise<{ syncRows: number; events: number }> {
@@ -319,10 +347,11 @@ async function referencesOf(client: Client, row: RekeyRow, isDefault: boolean): 
   ])
   return {
     suppliers, storefrontMappings, isDefault,
-    unpostedSalesOrders: open.salesOrderIds.length, unpostedSalesOrderLines: open.salesLines,
-    unpostedPurchaseOrders: open.purchaseOrderIds.length, unpostedPurchaseOrderLines: open.purchaseLines,
+    unpostedSalesOrders: open.unpostedSalesOrders, unpostedSalesOrderLines: open.unpostedSalesLines,
+    unpostedPurchaseOrders: open.unpostedPurchaseOrders, unpostedPurchaseOrderLines: open.unpostedPurchaseLines,
+    postedSalesOrders: open.postedSalesOrders, postedSalesOrderLines: open.postedSalesLines,
+    postedPurchaseOrders: open.postedPurchaseOrders, postedPurchaseOrderLines: open.postedPurchaseLines,
     queuedSyncRows: queued.syncRows, queuedEvents: queued.events,
-    postedSalesOrderLines: open.postedSalesLines, postedPurchaseOrderLines: open.postedPurchaseLines,
   }
 }
 
@@ -443,8 +472,8 @@ export function applyRefusal(plan: RekeyPlan, allowUnposted: boolean): RekeyRefu
   const refs = Object.values(plan.references)
   const queued = refs.reduce((n, r) => n + r.queuedSyncRows + r.queuedEvents, 0)
   if (queued > 0) return { code: 'QUEUED_PAYLOADS', detail: `${queued} queued accounting payload(s) still carry a code being re-keyed; let them post or cancel them first` }
-  const unposted = refs.reduce((n, r) => n + r.unpostedSalesOrders + r.unpostedPurchaseOrders, 0)
-  if (unposted > 0 && !allowUnposted) return { code: 'UNPOSTED_DOCUMENTS', detail: `${unposted} unposted order(s) reference a rate being re-keyed and would post the old code; pass the explicit flag to re-point their lines` }
+  const sources = refs.reduce((n, r) => n + r.unpostedSalesOrders + r.unpostedPurchaseOrders + r.postedSalesOrders + r.postedPurchaseOrders, 0)
+  if (sources > 0 && !allowUnposted) return { code: 'UNPOSTED_DOCUMENTS', detail: `${sources} order(s) (posted or not) still reference a rate being re-keyed and can post its old code (first post, edit, re-send, credit note, refund, further bill); pass the explicit flag to re-point their lines` }
   return null
 }
 

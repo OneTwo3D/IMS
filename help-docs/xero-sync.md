@@ -1514,9 +1514,9 @@ run that records tax-rate drift).
   *CY VAT*), and IMS posts a line's code. **Settings > Accounting > Tax > Re-key VAT rates** and `npm run tax:rekey` tie each active rate with a custom code
   to the live type of the **same name** (never by code), `ACTIVE`, with exactly the same percentage (EffectiveRate, else DisplayTaxRate) and a consistent
   country, from this stored list (proven as above). The plan is the preview and has a digest; the apply must quote it, runs in one transaction inside the
-  connection fence, creates a new rate with the live code, deactivates the old one (never edits it) and moves supplier defaults and WooCommerce mappings. Posted
-  documents keep the old rate. The sales invoice and the supplier bill read the code from the line's rate **when they are enqueued** (`enqueueSalesInvoiceSync`,
-  `createPurchaseInvoice`) and the queued payload carries `lines[].taxType` as a snapshot, so unposted orders refuse the apply unless re-pointed on request, and
+  connection fence, creates a new rate with the live code, deactivates the old one (never edits it) and moves supplier defaults and WooCommerce mappings. The live type must also be allowed on the rate's sides (`canApply` revenue / expenses) and have the same component breakdown (`SIDE_NOT_ALLOWED`, `MEANING_DIFFERS`).
+  Every document line reads the rate's code whenever a Xero document is built from it (`queueSalesInvoiceForOrder` for the invoice and each update, the refund / credit-note paths,
+  `createInvoice` / `updateInvoice` / `postSupplierCreditNote` for bills), and the queued payload carries `lines[].taxType` as a snapshot, so not-cancelled orders and purchase orders (posted or not) refuse the apply unless re-pointed on request (a correction: the new code is the same tax meaning), and
   queued payloads carrying the old code (FAILED sync rows included, until retried or cancelled) always refuse it. A component's own stale custom code is cleared on the new rate and shown in the plan. After it, the VAT difference report shows no `PERCENTAGE_MISMATCH_IMS_XERO` for the re-keyed rates.
 - **One VAT set: the difference report.** Owner ruling 2026-10-25: WooCommerce, IMS and Xero use the same set of VAT rates and Xero is the master.
   WooCommerce tax-rate writes are **operator-manual at P1** (the ownership map row `woocommerce` / `tax-rate`: P1 `operator-manual`, P2 `IMS`; IMS

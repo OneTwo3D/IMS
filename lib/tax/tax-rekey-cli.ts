@@ -66,8 +66,8 @@ export function renderTaxRekeyUsage(): string {
     'Xero numbers its custom tax codes (TAX001..TAXnnn) per organisation, so IMS rates created against another organisation (a Demo one) carry codes that mean other rates in the',
     'live organisation. This ties each active IMS rate with a custom code to the live Xero type of the SAME NAME (never by code), with the same percentage, ACTIVE, country-consistent.',
     'Without --apply it is a read-only PREVIEW: it prints the plan and its digest and writes nothing. With --apply --confirm <digest> (the digest the preview printed) it re-keys, in',
-    'one transaction: a new rate with the live code, the old one deactivated (never edited), supplier defaults and WooCommerce mappings re-pointed. Posted documents keep the old rate.',
-    'Unposted documents referencing a re-keyed rate refuse the apply unless --allow-unposted (their lines are then re-pointed); queued payloads carrying the old code always refuse it.',
+    'one transaction: a new rate with the live code, the old one deactivated (never edited), supplier defaults and WooCommerce mappings re-pointed. Documents already sent to Xero are not touched.',
+    'Not-cancelled orders and purchase orders (posted or not) referencing a re-keyed rate can still post its old code, so they refuse the apply unless --allow-unposted (their lines are then re-pointed); queued payloads carrying the old code always refuse it.',
     'It reads the stored copy of Xero\'s list (the proven one) and never calls Xero or WooCommerce.',
     '',
     'Exit codes:',
@@ -91,7 +91,7 @@ function renderPlan(plan: RekeyPlan): string[] {
     for (const row of rows) {
       const live = row.target === null ? '' : `  -> ${row.target.taxType} "${row.target.name}" ${row.target.percent ?? '(no percentage)'}%`
       const refs = plan.references[row.imsRateId]
-      const refText = refs === undefined ? '' : `  [suppliers ${refs.suppliers}, storefront mappings ${refs.storefrontMappings}${refs.isDefault ? ', DEFAULT RATE' : ''}, unposted orders ${refs.unpostedSalesOrders} sales / ${refs.unpostedPurchaseOrders} purchase, queued payloads ${refs.queuedSyncRows + refs.queuedEvents}, posted lines ${refs.postedSalesOrderLines + refs.postedPurchaseOrderLines} stay]`
+      const refText = refs === undefined ? '' : `  [suppliers ${refs.suppliers}, storefront mappings ${refs.storefrontMappings}${refs.isDefault ? ', DEFAULT RATE' : ''}, never-posted orders ${refs.unpostedSalesOrders} sales / ${refs.unpostedPurchaseOrders} purchase, already-posted orders ${refs.postedSalesOrders} sales / ${refs.postedPurchaseOrders} purchase, queued payloads ${refs.queuedSyncRows + refs.queuedEvents}]`
       for (const c of row.clearedComponents) lines.push(`    component "${c.name}" keeps no code: ${c.taxType} is not a live ACTIVE type, the new row gets none`)
       lines.push(`  ${row.name} [${row.usedFor}${row.countryCode ? ` ${row.countryCode}` : ''}] ${row.currentCode} ${row.imsPercent}%${live}  (${row.matchedBy ?? 'no name match'}: ${row.reason})${refText}`)
     }
