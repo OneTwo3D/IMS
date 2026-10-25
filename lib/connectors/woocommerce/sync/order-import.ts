@@ -824,7 +824,7 @@ async function planWcPaidTransition(orderId: string, wcOrder: WcFullOrder): Prom
 async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null): Promise<void> {
   const claimed = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
-    const won = await tx.salesOrder.updateMany({ where: { id: orderId, paidAt: null }, data: { paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string) } })
+    const won = await tx.salesOrder.updateMany({ where: { id: orderId, paidAt: null }, data: { paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string), unregisteredPaidAt: null } })
     if (won.count !== 1) return null
     const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true } })
     const receipt = await tx.payment.create({

@@ -82,8 +82,9 @@ test('an unreadable payment date is refused as foreign_payment_missing_rate', as
 
 test('order-import wires the helper before the transaction and stamps the follow-up payload, with no order-rate fallback', () => {
   const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
-  assert.equal((src.match(/resolveWcReceiptSettlementRate\(/g) ?? []).length, 1)
-  assert.ok(src.indexOf('resolveWcReceiptSettlementRate({') < src.indexOf('so = await db.$transaction'), 'resolved before the write')
+  // two call sites: the create path (below) and the unpaid-to-paid transition of an order IMS already holds (planWcPaidTransition)
+  assert.equal((src.match(/resolveWcReceiptSettlementRate\(/g) ?? []).length, 2)
+  assert.ok(src.lastIndexOf('resolveWcReceiptSettlementRate({') < src.indexOf('so = await db.$transaction'), 'resolved before the write')
   assert.match(src, /settlementRateToBase: importedReceiptSettlementRate === null/)
   assert.match(src, /_paymentSettlementRateToBase:/)
   assert.doesNotMatch(src, /usableStoredFxRate\(fxRate\)\?\.toNumber\(\) \?\? null/)
