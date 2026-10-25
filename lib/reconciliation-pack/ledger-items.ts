@@ -94,9 +94,10 @@ function inventoryLeg(basis: AsOfBasis & { available: true }): Leg {
   const inventory = byKind.get('inventory')
   const allocated = byKind.get('allocated')
   if (!inventory || !allocated) return { ok: false, reasons: ['SOURCE_UNREADABLE'] }
-  // Both legs of the GL sum must be balances Xero REPORTED. The basis also withholds the evaluator's result when either is the zero
-  // the pull synthesised; this does not rest on that alone.
-  if (inventory.provenance !== 'trial-balance-row' || allocated.provenance !== 'trial-balance-row') return { ok: false, reasons: ['GL_LEG_ABSENT'] }
+  // Both legs of the GL sum must be balances Xero REPORTED, or a zero a complete Trial Balance proved by omitting the account. The
+  // basis also withholds the evaluator's result when either is the unproven zero the pull synthesised; this does not rest on that alone.
+  const real = (provenance: unknown) => provenance === 'trial-balance-row' || provenance === 'trial-balance-proven-absent'
+  if (!real(inventory.provenance) || !real(allocated.provenance)) return { ok: false, reasons: ['GL_LEG_ABSENT'] }
   const inv = dec(inventory.amountBase)
   const alloc = dec(allocated.amountBase)
   const subledger = dec(basis.subledger?.valueBase)

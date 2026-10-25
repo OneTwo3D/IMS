@@ -124,7 +124,7 @@ test('an Unearned Revenue account that is configured but not in the chart stops 
 })
 
 // [mutation: the absent suffix removed]
-test('a configured account that a NON-EMPTY Trial Balance omits is stored as a zero labelled absent-from-tb; a reported zero is not', async () => {
+test('a configured account that a COMPLETE Trial Balance omits is stored as a zero labelled absent-from-complete-tb (the proof); a reported zero is not', async () => {
   reset()
   // Complete by its own evidence: the rows add up to the Total row (the offsetting credit is on an unconfigured equity account).
   trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75'), row('a-999', '999 - Equity', '0', '1075')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '1075', '1075'].map((Value) => ({ Value })) }] }] }] }
@@ -134,8 +134,19 @@ test('a configured account that a NON-EMPTY Trial Balance omits is stored as a z
   assert.equal(byCode.get('631')!.sourcePayloadRef, 'xero:trial-balance:2026-10-19', 'Xero reported 631 at zero: an explicit zero')
   for (const code of ['632', '260']) {
     assert.equal(toDecimal(byCode.get(code)!.amountBase as string).toFixed(2), '0.00', code)
-    assert.equal(byCode.get(code)!.sourcePayloadRef, 'xero:trial-balance:2026-10-19:absent-from-tb', code)
+    assert.equal(byCode.get(code)!.sourcePayloadRef, 'xero:trial-balance:2026-10-19:absent-from-complete-tb', code)
   }
+  assert.ok(persisted.every((snapshot) => !String(snapshot.sourcePayloadRef).endsWith(':absent-from-tb')), 'the unproven label is never written')
+})
+
+// [mutation: the proven label written whatever the completeness]
+test('an absent account of a Trial Balance that does NOT prove itself complete is stored under NO label (refused), never the proven one', async () => {
+  reset()
+  // Rows do not add up to the Total row: 1000 + 75 debit against a Total of 2000.
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-500', '500 - COGS', '75')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '2000', '2000'].map((Value) => ({ Value })) }] }] }] }
+  const result = await pull()
+  assert.ok(result.errors.some((e) => e.includes('TB_COMPLETENESS_UNPROVEN')))
+  assert.ok(persisted.every((snapshot) => snapshot.sourcePayloadRef === 'xero:trial-balance:2026-10-19'), 'only reported rows are stored; no absent zero of either label')
 })
 
 test('an EMPTY Trial Balance synthesises nothing: it is an error, not a set of zeros', async () => {
@@ -154,4 +165,46 @@ test('every stored balance records the organisation of the connection the trial 
   await pull()
   assert.equal(persisted.length, 5)
   for (const snapshot of persisted) assert.equal(snapshot.tenantId, 'tenant-x')
+})
+
+const withTotal = (rows: unknown[], totalDebit: string, totalCredit: string) => ({ Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: rows }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', totalDebit, totalCredit].map((Value) => ({ Value })) }] }] }] })
+const proven = () => persisted.filter((snapshot) => String(snapshot.sourcePayloadRef).endsWith(':absent-from-complete-tb'))
+
+// [mutation: the sums compared through toFixed(2) with no decimal-place refusal]
+test('COMPLETENESS IS EXACT: rows summing 100.000 against a Total of 100.004 prove nothing; no proven-absent ref is written', async () => {
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100.000'), row('a-999', '999 - Equity', '0', '100.000')], '100.004', '100.000')
+  const result = await pull()
+  assert.deepEqual(proven(), [])
+  assert.ok(result.errors.some((e) => e.includes('TB_COMPLETENESS_UNPROVEN')))
+})
+
+test('COMPLETENESS IS EXACT: a YTD cell with more than two decimal places is refused (data row) or unreadable (Total row)', async () => {
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100.004'), row('a-999', '999 - Equity', '0', '100.004')], '100.004', '100.004')
+  const result = await pull()
+  assert.deepEqual(proven(), [])
+  assert.ok(result.errors.some((e) => e.includes('TB_NON_MONEY_CELL')), JSON.stringify(result.errors))
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100'), row('a-999', '999 - Equity', '0', '100')], '100.001', '100')
+  await pull()
+  assert.deepEqual(proven(), [])
+})
+
+test('COMPLETENESS IS EXACT: sums that equal the Total exactly prove the omission (a trailing-zero third place is the same amount)', async () => {
+  reset()
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '100.50'), row('a-999', '999 - Equity', '0', '100.500')], '100.500', '100.50')
+  await pull()
+  assert.deepEqual(proven().map((s) => s.accountCode).sort(), ['260', '500', '631', '632'])
+})
+
+// [mutation: the duplicate-id check restricted to configured accounts]
+test('COMPLETENESS: an account id repeated on two data rows (even an UNCONFIGURED one) proves nothing - the omitted configured account is withheld, not proven zero', async () => {
+  reset()
+  // 999 is repeated (200 in total) and stands in for the omitted configured 631; the sums still equal the Total exactly.
+  trialBalance = withTotal([row('a-630', '630 - Inventory', '0'), row('a-999', '999 - Other', '100'), row('a-999', '999 - Other', '100'), row('a-998', '998 - Equity', '0', '200')], '200', '200')
+  const result = await pull()
+  assert.deepEqual(proven(), [])
+  assert.ok(result.errors.some((e) => e.includes('TB_COMPLETENESS_UNPROVEN') && e.includes('a-999')), JSON.stringify(result.errors))
+  assert.ok(!persisted.some((snapshot) => snapshot.accountCode === '631'), 'the omitted configured account is withheld')
 })

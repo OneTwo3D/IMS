@@ -23,7 +23,7 @@ const PREV = '2031-03-04'
 const LD = '2031-04-05'
 const LPREV = '2031-04-04'
 const date = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
-const ref = (iso: string, absent = false) => `xero:trial-balance:${iso}${absent ? ':absent-from-tb' : ''}`
+const ref = (iso: string, absent: boolean | 'proven' = false) => `xero:trial-balance:${iso}${absent === 'proven' ? ':absent-from-complete-tb' : absent ? ':absent-from-tb' : ''}`
 
 async function deps() {
   config({ path: '.env.local', quiet: true })
@@ -209,7 +209,7 @@ test('transit leg and ledger items against a real database', { skip }, async () 
   const product = await db.product.create({ data: { sku: `RL-${tag}`, name: 'rl' } })
   const warehouse = await db.warehouse.create({ data: { code: `RL${tag}`.toUpperCase(), name: 'rl' } })
   const load = async () => d.settleAsOfBasis(await d.readAsOfBasis(D), bracket)
-  const setBalance = async (kind: string, iso: string, amount: string, absent = false) => {
+  const setBalance = async (kind: string, iso: string, amount: string, absent: boolean | 'proven' = false) => {
     await db.accountingAccountBalanceSnapshot.deleteMany({ where: { externalAccountId: `rl-${tag}-${kind}`, balanceDate: date(iso) } })
     await db.accountingAccountBalanceSnapshot.create({ data: { connector: 'xero', externalAccountId: `rl-${tag}-${kind}`, accountCode: codes[kind]!, accountName: 'rl', balanceDate: date(iso), currency, amountForeign: amount, amountBase: amount, sourcePayloadRef: ref(iso, absent), tenantId: tenant , parserVersion: 2 } })
   }
@@ -275,6 +275,24 @@ test('transit leg and ledger items against a real database', { skip }, async () 
     assert.deepEqual(absentClosing.available && absentClosing.transit, { available: false, reason: 'transit_absent_from_tb' })
     const r10Withheld = await d.runLedgerItem('R10', absentClosing, { phase: 'P1', asOf: D, ims: async () => ({ ok: false, reason: 'READ_INCOMPLETE' }) })
     assert.equal(r10Withheld.outcome, 'inconclusive')
+    await setBalance('transit', D, '50')
+
+    // 6b. The same zero under the completeness PROOF is a real zero at either end: the leg is available, nothing is withheld.
+    await setBalance('transit', PREV, '0', 'proven')
+    const provenOpening = await load()
+    assert.deepEqual(provenOpening.available && provenOpening.transit.available && provenOpening.transit.glMovement, '50.000000')
+    await setBalance('transit', PREV, '40')
+    await setBalance('transit', D, '0', 'proven')
+    const provenClosing = await load()
+    assert.deepEqual(provenClosing.available && provenClosing.transit.available && provenClosing.transit.glMovement, '-40.000000')
+    assert.deepEqual(provenClosing.available && provenClosing.provenFromCompleteTrialBalance, ['transit'])
+    await setBalance('allocated', D, '0', 'proven')
+    const provenAllocated = await load()
+    assert.ok(provenAllocated.available && provenAllocated.inventoryGlWithheld === null && provenAllocated.inventoryGl !== null)
+    await setBalance('allocated', D, '0', true)
+    const unprovenAllocated = await load()
+    assert.ok(unprovenAllocated.available && unprovenAllocated.inventoryGlWithheld === 'absent-from-tb')
+    await setBalance('allocated', D, '20.25')
     await setBalance('transit', D, '50')
 
     // 7. NO WRITE: a load including the transit leg touches none of the rows it reads (xmin included).

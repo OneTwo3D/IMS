@@ -9,7 +9,7 @@ import type { ImsRead, ImsReadOptions, XeroPostingRow, XeroPostings } from '../.
 import { INVENTORY_LEG_TOKEN, TRANSIT_LEG_TOKEN, runLedgerItem, type LedgerItemContext } from '../../lib/reconciliation-pack/ledger-items.ts'
 import { buildReport } from '../../lib/reconciliation-pack/report.ts'
 import { memoisedInvariant, runItems } from '../../lib/reconciliation-pack/run.ts'
-import { CODES, D, PREVIOUS, REF, REF_ABSENT, cleanBracket, dateOf, fakeBasisPort, fakeRun, goodState, healthyLiveness, type FakeState } from './basis-fixtures.ts'
+import { CODES, D, PREVIOUS, REF, REF_ABSENT, REF_PROVEN_ABSENT, cleanBracket, dateOf, fakeBasisPort, fakeRun, goodState, healthyLiveness, type FakeState } from './basis-fixtures.ts'
 import { NOW, realEvidence } from './helpers.ts'
 
 /**
@@ -315,4 +315,13 @@ test('through runItems: R6 and R10 results are accepted by the report builder as
   assert.deepEqual(streams.map((s) => s.stream), ['xero-balance-snapshots'])
   assert.doesNotThrow(() => buildReport({ runId: '20261020T120000Z-aaaaaaaaaaaa', systemIdentifier: '7000000000000000001', phase: 'P1', asOf: D, startedAt: NOW.toISOString(), finishedAt: NOW.toISOString(), streams, items }, 1, null))
   void REF
+})
+
+// [mutation: R6 insisting on trial-balance-row provenance]
+test('R6 compares (not withheld) when Allocated is a zero a complete Trial Balance proved', async () => {
+  const state = goodState({ snapshots: [{ valueBase: '1000.50', valueReplayReliable: true }], run: { snapshotCount: 1 } })
+  state.gl = state.gl.map((r) => (r.accountCode === CODES.allocated && r.balanceDate.getTime() === dateOf(D).getTime() ? { ...r, amountBase: '0', sourcePayloadRef: REF_PROVEN_ABSENT(D) } : r))
+  const basis = await settled(state)
+  const item = await runLedgerItem('R6', basis, ctx())
+  assert.deepEqual([item.outcome, item.reasons], ['pass', []])
 })

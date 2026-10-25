@@ -14,6 +14,7 @@ export const CURRENT_PARSER = 2
 export const ACCT = (code: string) => `acct-${code}`
 export const REF = (iso: string) => `xero:trial-balance:${iso}`
 export const REF_ABSENT = (iso: string) => `xero:trial-balance:${iso}:absent-from-tb`
+export const REF_PROVEN_ABSENT = (iso: string) => `xero:trial-balance:${iso}:absent-from-complete-tb`
 
 export type SnapshotRow = { valueBase: unknown; valueReplayReliable: boolean }
 export type FakeState = {

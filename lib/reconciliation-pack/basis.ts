@@ -38,7 +38,7 @@ import { balanceDateString, normalizeBalanceDate } from '@/lib/domain/accounting
 import { evaluateAccountGlReconciliation, type AccountGlReconciliation } from '@/lib/domain/accounting/account-gl-reconciliation'
 import { isTransitLedgerCoverageSatisfied } from '@/lib/domain/accounting/transit-ledger-coverage'
 import { toDecimal } from '@/lib/domain/math/decimal'
-import { xeroTrialBalanceRef } from '@/lib/connectors/xero/account-balance-refs'
+import { parseXeroTrialBalanceRef } from '@/lib/connectors/xero/account-balance-refs'
 import { INTEGRATION_PLUGIN_SETTING_KEYS, parseIntegrationPluginEnabled } from '@/lib/integration-plugin-keys'
 import { streamsVerdict, type LivenessBracket } from '@/lib/reconciliation-pack/liveness'
 import { XERO_TRIAL_BALANCE_PARSER_VERSION } from '@/lib/domain/accounting/snapshot-provenance'
@@ -49,11 +49,17 @@ export const BASIS_CONNECTOR = 'xero'
 export const BASIS_STREAM = 'xero-balance-snapshots' as const
 const DEFAULT_BASE_CURRENCY = 'GBP'
 
-export type BasisProvenance = 'trial-balance-row' | 'absent-from-tb'
+/**
+ * - `trial-balance-row`: a row Xero returned.
+ * - `trial-balance-proven-absent`: the account was absent from a Trial Balance that proved itself complete (the pull stored the
+ *   zero under the proof's own reference, parser version 2), so Xero omitting a no-balance account is a REPORTED zero.
+ * - `absent-from-tb`: the zero the pull recorded for an omitted account WITHOUT that proof; never a reported zero.
+ */
+export type BasisProvenance = 'trial-balance-row' | 'trial-balance-proven-absent' | 'absent-from-tb'
 
 export type BasisGlBalance = {
   kind: PackBasisAccountKind
-  /** A plain decimal string, six places. For `absent-from-tb` it is the zero the pull recorded, NOT a reported zero. */
+  /** A plain decimal string, six places. For `absent-from-tb` it is the zero the pull recorded, NOT a reported zero; for `trial-balance-proven-absent` it is a proven zero. */
   amountBase: string
   provenance: BasisProvenance
 }
@@ -86,6 +92,8 @@ export type AsOfBasis =
       gl: readonly BasisGlBalance[]
       /** Kinds whose balance is the zero the pull recorded for an account absent from the trial balance. */
       absentFromTrialBalance: readonly PackBasisAccountKind[]
+      /** Kinds whose balance is a zero because a Trial Balance that proved itself complete omitted the account. A real balance. */
+      provenFromCompleteTrialBalance: readonly PackBasisAccountKind[]
       /** Kinds that share one configured code with an earlier kind (they resolve to the same stored balance). */
       sharedCodeKinds: readonly PackBasisAccountKind[]
       subledger: BasisSubledger
@@ -192,11 +200,12 @@ async function readTransitLeg(tx: BasisTx, input: { asOf: string; date: Date; cu
   if (!(row.balanceDate instanceof Date) || Number.isNaN(row.balanceDate.getTime()) || balanceDateString(row.balanceDate) !== openingString || row.currency !== input.currency) return unavailable('transit_balance_unusable', evidence)
   const amount = finiteDecimal(row.amountBase)
   if (amount === null) return unavailable('transit_balance_unusable', evidence)
-  let openingAbsent: boolean
-  if (row.sourcePayloadRef === xeroTrialBalanceRef(openingString, false)) openingAbsent = false
-  else if (row.sourcePayloadRef === xeroTrialBalanceRef(openingString, true)) openingAbsent = true
-  else return unavailable('transit_balance_unusable', evidence)
-  if (openingAbsent && !amount.isZero()) return unavailable('transit_balance_unusable', evidence)
+  const openingKind = parseXeroTrialBalanceRef(openingString, row.sourcePayloadRef)
+  if (openingKind === null) return unavailable('transit_balance_unusable', evidence)
+  // Either absent label is a zero by construction; anything else under it is not what the pull writes. The proven label
+  // also needs the parser version that applies the completeness proof (the query and `own` above already require it).
+  if (openingKind !== 'reported' && !amount.isZero()) return unavailable('transit_balance_unusable', evidence)
+  const openingAbsent = openingKind === 'absent'
   if (openingAbsent || input.closing.provenance === 'absent-from-tb') return unavailable('transit_absent_from_tb', evidence)
   const movement = await tx.transitSubledgerMovement.aggregate({ where: { journalDate: { gt: opening, lte: input.date } }, _sum: { baseDelta: true } })
   // The coverage watermark (checked above) is the proof that the ledger covers the window, so a sum of no rows is a true zero.
@@ -290,12 +299,13 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
     const amount = finiteDecimal(row.amountBase)
     if (amount === null) { note('basis_unreadable'); continue }
     const ref = row.sourcePayloadRef
-    let provenance: BasisProvenance
-    if (ref === xeroTrialBalanceRef(asOf, false)) provenance = 'trial-balance-row'
-    else if (ref === xeroTrialBalanceRef(asOf, true)) provenance = 'absent-from-tb'
-    else { note('gl_snapshot_unlabelled'); continue }
-    // A zero the pull synthesised is zero by construction; anything else under that label is not what the pull writes.
-    if (provenance === 'absent-from-tb' && !amount.isZero()) { note('basis_unreadable'); continue }
+    const refKind = parseXeroTrialBalanceRef(asOf, ref)
+    if (refKind === null) { note('gl_snapshot_unlabelled'); continue }
+    // A zero the pull synthesised is zero by construction; anything else under either absent label is not what the pull writes.
+    if (refKind !== 'reported' && !amount.isZero()) { note('basis_unreadable'); continue }
+    // The proven label is only honoured on the parser version that applies the completeness proof: a row of any other version
+    // never got here (the query and `forCode` above keep only the current version).
+    const provenance: BasisProvenance = refKind === 'reported' ? 'trial-balance-row' : refKind === 'proven-absent' ? 'trial-balance-proven-absent' : 'absent-from-tb'
     gl.push({ kind: account.kind, amountBase: amount.toFixed(6), provenance })
   }
   if (failure) return fail(failure)
@@ -341,6 +351,7 @@ async function readBasis(tx: BasisTx, asOf: string, date: Date): Promise<Resolve
       currency,
       gl,
       absentFromTrialBalance: gl.filter((g) => g.provenance === 'absent-from-tb').map((g) => g.kind),
+      provenFromCompleteTrialBalance: gl.filter((g) => g.provenance === 'trial-balance-proven-absent').map((g) => g.kind),
       sharedCodeKinds,
       subledger: { runPresent: true, rows: rowCount, valueBase: sum.toFixed(6), emptyProof: rowCount === 0 ? 'snapshot-run-row-present' : null },
       inventoryGl: inventoryLegAbsent ? null : evaluateAccountGlReconciliation({ subledgerValue: sum.toNumber(), glBalance: inventory.add(allocated).toNumber() }),

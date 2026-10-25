@@ -202,7 +202,11 @@ function trialBalanceColumns(header: XeroReportRow | null): { columns: TrialBala
 function ytdMoney(cell: XeroReportCell | undefined): Decimal | 'invalid' {
   const value = cell?.Value
   if (typeof value === 'string' && value.trim() === '') return toDecimal(0)
-  return parseMoneyCell(value) ?? 'invalid'
+  const amount = parseMoneyCell(value)
+  // Xero money is two decimal places. A cell beyond that is not a money amount this report can be read as (it would make an
+  // exact sum comparison meaningless), so it is invalid, never rounded.
+  if (amount === null || amount.decimalPlaces() > 2) return 'invalid'
+  return amount
 }
 
 type YtdSums = { debit: Decimal; credit: Decimal }
@@ -247,7 +251,7 @@ function collectRows(
     const ytdDebit = ytdMoney(cells[columns.ytdDebit])
     const ytdCredit = ytdMoney(cells[columns.ytdCredit])
     if (ytdDebit === 'invalid' || ytdCredit === 'invalid') {
-      refuse('TB_NON_MONEY_CELL', `its ${ytdDebit === 'invalid' ? 'YTD Debit' : 'YTD Credit'} cell is not a money amount`)
+      refuse('TB_NON_MONEY_CELL', `its ${ytdDebit === 'invalid' ? 'YTD Debit' : 'YTD Credit'} cell is not a money amount (or has more than two decimal places)`)
       continue
     }
     // Stored convention: debit minus credit, so a credit-balance account is negative.
@@ -265,9 +269,18 @@ function findTotalRows(rows: XeroReportRow[] | undefined, found: XeroReportRow[]
   return found
 }
 
-/** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row (both YTD columns, exact to the cent). */
-function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: TrialBalanceColumns, sums: YtdSums, refused: number): string | null {
+/** Why the rows read cannot be taken as the whole report, or null if they add up to its Total row (both YTD columns, exactly; a cell with more than two decimal places is unreadable). */
+function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: TrialBalanceColumns, sums: YtdSums, refused: number, readRows: ParsedXeroTrialBalance['rows']): string | null {
   if (refused > 0) return 'a row was refused, so the rows read cannot be summed'
+  // An account id on more than one data row, configured or not, means the rows can add up to the Total with another account's
+  // row missing (a repeated row standing in for an omitted one), so the sum proves nothing.
+  const seen = new Set<string>()
+  for (const row of readRows) {
+    const id = row.externalAccountId
+    if (id === null || id === undefined) return 'a data row carries no account id'
+    if (seen.has(id)) return `account id ${id} appears on more than one data row`
+    seen.add(id)
+  }
   const totals = findTotalRows(entryRows)
   if (totals.length !== 1) return `the report has ${totals.length} "Total" summary rows (exactly one is required)`
   const cells = totals[0]!.Cells ?? []
@@ -275,7 +288,8 @@ function completenessProblem(entryRows: XeroReportRow[] | undefined, columns: Tr
   const totalDebit = ytdMoney(cells[columns.ytdDebit])
   const totalCredit = ytdMoney(cells[columns.ytdCredit])
   if (totalDebit === 'invalid' || totalCredit === 'invalid') return 'its Total row is not readable'
-  if (sums.debit.toFixed(2) !== totalDebit.toFixed(2) || sums.credit.toFixed(2) !== totalCredit.toFixed(2)) {
+  // EXACT decimal equality (every cell above is at most two decimal places, so nothing here is rounded).
+  if (!sums.debit.eq(totalDebit) || !sums.credit.eq(totalCredit)) {
     return `the rows read add up to ${sums.debit.toFixed(2)} / ${sums.credit.toFixed(2)} (YTD Debit / Credit) but the Total row says ${totalDebit.toFixed(2)} / ${totalCredit.toFixed(2)}`
   }
   // Deliberately NO debit == credit test: Xero's own Total row is not guaranteed to balance (the live organisation's differs by
@@ -324,8 +338,9 @@ export function parseXeroTrialBalanceReport(report: XeroTrialBalanceReport): Par
     }
     const sums: YtdSums = { debit: toDecimal(0), credit: toDecimal(0) }
     const refusedBefore = output.refusedRows.length
+    const rowsBefore = output.rows.length
     collectRows(entry.Rows, located.columns, output, sums)
-    const problem = completenessProblem(entry.Rows, located.columns, sums, output.refusedRows.length - refusedBefore)
+    const problem = completenessProblem(entry.Rows, located.columns, sums, output.refusedRows.length - refusedBefore, output.rows.slice(rowsBefore))
     if (problem) output.completenessUnproven ??= problem
   }
   if ((report.Reports ?? []).length === 0) output.completenessUnproven = 'the response has no report'
@@ -442,7 +457,9 @@ export function buildXeroAccountBalanceSnapshotInputs(
       currency: input.baseCurrency,
       amountForeign: amount,
       amountBase: amount,
-      sourcePayloadRef: xeroTrialBalanceRef(input.balanceDate, parsed === null),
+      // An absent zero is a PROVEN zero only when the report proved itself complete (the unproven case was refused above), so
+      // the proof travels with the row; the plain absent label is never written by this path.
+      sourcePayloadRef: xeroTrialBalanceRef(input.balanceDate, parsed !== null ? 'reported' : 'proven-absent'),
       tenantId: input.tenantId ?? null,
       // Stored WITH the balance (the Trial Balance is year-to-date, so a P&L balance is only comparable with one that proves
       // the same year end). Null when the Organisation carried none: an old value is never kept.
