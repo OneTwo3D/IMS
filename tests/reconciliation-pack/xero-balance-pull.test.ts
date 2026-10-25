@@ -124,7 +124,7 @@ test('an Unearned Revenue account that is configured but not in the chart stops 
 })
 
 // [mutation: the absent suffix removed]
-test('a configured account that a NON-EMPTY Trial Balance omits is stored as a zero labelled absent-from-tb; a reported zero is not', async () => {
+test('a configured account that a COMPLETE Trial Balance omits is stored as a zero labelled absent-from-complete-tb (the proof); a reported zero is not', async () => {
   reset()
   // Complete by its own evidence: the rows add up to the Total row (the offsetting credit is on an unconfigured equity account).
   trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-631', '631 - Allocated', '0', '0'), row('a-500', '500 - COGS', '75'), row('a-999', '999 - Equity', '0', '1075')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '1075', '1075'].map((Value) => ({ Value })) }] }] }] }
@@ -134,8 +134,19 @@ test('a configured account that a NON-EMPTY Trial Balance omits is stored as a z
   assert.equal(byCode.get('631')!.sourcePayloadRef, 'xero:trial-balance:2026-10-19', 'Xero reported 631 at zero: an explicit zero')
   for (const code of ['632', '260']) {
     assert.equal(toDecimal(byCode.get(code)!.amountBase as string).toFixed(2), '0.00', code)
-    assert.equal(byCode.get(code)!.sourcePayloadRef, 'xero:trial-balance:2026-10-19:absent-from-tb', code)
+    assert.equal(byCode.get(code)!.sourcePayloadRef, 'xero:trial-balance:2026-10-19:absent-from-complete-tb', code)
   }
+  assert.ok(persisted.every((snapshot) => !String(snapshot.sourcePayloadRef).endsWith(':absent-from-tb')), 'the unproven label is never written')
+})
+
+// [mutation: the proven label written whatever the completeness]
+test('an absent account of a Trial Balance that does NOT prove itself complete is stored under NO label (refused), never the proven one', async () => {
+  reset()
+  // Rows do not add up to the Total row: 1000 + 75 debit against a Total of 2000.
+  trialBalance = { Reports: [{ ...LIVE_META, Rows: [TB_HEADER, { RowType: 'Section', Rows: [row('a-630', '630 - Inventory', '1000'), row('a-500', '500 - COGS', '75')] }, { RowType: 'Section', Rows: [{ RowType: 'SummaryRow', Cells: ['Total', '0', '0', '2000', '2000'].map((Value) => ({ Value })) }] }] }] }
+  const result = await pull()
+  assert.ok(result.errors.some((e) => e.includes('TB_COMPLETENESS_UNPROVEN')))
+  assert.ok(persisted.every((snapshot) => snapshot.sourcePayloadRef === 'xero:trial-balance:2026-10-19'), 'only reported rows are stored; no absent zero of either label')
 })
 
 test('an EMPTY Trial Balance synthesises nothing: it is an error, not a set of zeros', async () => {

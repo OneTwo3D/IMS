@@ -442,7 +442,9 @@ export function buildXeroAccountBalanceSnapshotInputs(
       currency: input.baseCurrency,
       amountForeign: amount,
       amountBase: amount,
-      sourcePayloadRef: xeroTrialBalanceRef(input.balanceDate, parsed === null),
+      // An absent zero is a PROVEN zero only when the report proved itself complete (the unproven case was refused above), so
+      // the proof travels with the row; the plain absent label is never written by this path.
+      sourcePayloadRef: xeroTrialBalanceRef(input.balanceDate, parsed !== null ? 'reported' : 'proven-absent'),
       tenantId: input.tenantId ?? null,
       // Stored WITH the balance (the Trial Balance is year-to-date, so a P&L balance is only comparable with one that proves
       // the same year end). Null when the Organisation carried none: an old value is never kept.

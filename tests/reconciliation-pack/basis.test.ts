@@ -6,7 +6,7 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
 import { readAsOfBasis, settleAsOfBasis, type AsOfBasis, type BasisDeps } from '../../lib/reconciliation-pack/basis.ts'
 import { PACK_BASIS_ACCOUNTS, PACK_BASIS_REASON_LIST, PACK_TRANSIT_LEG_REASONS, TRANSIT_COVERAGE_SETTING_KEY, type PackBasisAccountKind } from '../../lib/reconciliation-pack/constants.ts'
 import { bracketLiveness, reduceStatusReport } from '../../lib/reconciliation-pack/liveness.ts'
-import { CODES, D, PREVIOUS, TENANT, REF, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
+import { CODES, D, PREVIOUS, TENANT, REF, REF_ABSENT, REF_PROVEN_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
 import { goodReport, makeStale, withStamp } from './liveness-fixtures.ts'
 
 /**
@@ -574,4 +574,65 @@ test('PARSER VERSION: even if the query returned an old-version row, the basis c
   const { basis } = await load(transit)
   assert.equal(basis.available, true)
   assert.deepEqual((basis as unknown as { transit: unknown }).transit, { available: false, reason: 'transit_balance_unusable' })
+})
+
+// [mutation: the proven label read as absent-from-tb / as a plain reported row / accepted without parser version 2 / with a nonzero amount]
+test('PROVEN ABSENT: a zero a complete Trial Balance omitted is a real balance - the inventory comparison is available and is the evaluator\'s', async () => {
+  for (const kind of ['allocated', 'inventory'] as const) {
+    const other = kind === 'allocated' ? '1000.50' : '200.25'
+    const state = goodState({ snapshots: [{ valueBase: other, valueReplayReliable: true }], run: { snapshotCount: 1 } })
+    state.gl = state.gl.map((row) => (row.accountCode === CODES[kind] && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, amountBase: '0', sourcePayloadRef: REF_PROVEN_ABSENT(D) } : row))
+    const { basis } = await load(state)
+    assert.equal(basis.available, true, kind)
+    if (!basis.available) return
+    assert.equal(basis.inventoryGlWithheld, null, kind)
+    assert.deepEqual(basis.inventoryGl, evaluateAccountGlReconciliation({ subledgerValue: Number(other), glBalance: Number(other) }), kind)
+    assert.equal(basis.gl.find((g) => g.kind === kind)!.provenance, 'trial-balance-proven-absent')
+    assert.deepEqual(basis.absentFromTrialBalance, [], 'only the unproven ones are listed as absent')
+    assert.deepEqual(basis.provenFromCompleteTrialBalance, [kind])
+  }
+})
+
+test('PROVEN ABSENT: the old absent label (no proof) still withholds the inventory comparison and is listed as absent', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((row) => (row.accountCode === CODES.allocated && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, amountBase: '0', sourcePayloadRef: REF_ABSENT(D) } : row))
+  const { basis } = await load(state)
+  assert.ok(basis.available)
+  if (!basis.available) return
+  assert.equal(basis.inventoryGl, null)
+  assert.equal(basis.inventoryGlWithheld, 'absent-from-tb')
+  assert.deepEqual(basis.absentFromTrialBalance, ['allocated'])
+  assert.deepEqual(basis.provenFromCompleteTrialBalance, [])
+})
+
+test('PROVEN ABSENT: a nonzero amount under the proven label is basis_unreadable (as under the old one)', async () => {
+  for (const ref of [REF_PROVEN_ABSENT(D), REF_ABSENT(D)]) {
+    const state = goodState()
+    state.gl = state.gl.map((row) => (row.accountCode === CODES.allocated && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, sourcePayloadRef: ref } : row))
+    assert.equal(reason((await load(state)).basis), 'basis_unreadable', ref)
+  }
+})
+
+test('PROVEN ABSENT: the proven label without parser version 2 is not accepted - the inventory comparison is never available on it', async () => {
+  for (const queryIgnoresVersion of [false, true]) {
+    const state = goodState({ queryIgnoresVersion })
+    state.gl = state.gl.map((row) => (row.accountCode === CODES.allocated && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, parserVersion: 1, amountBase: '0', sourcePayloadRef: REF_PROVEN_ABSENT(D) } : row))
+    const { basis } = await load(state)
+    assert.ok(!basis.available || basis.inventoryGl === null, `queryIgnoresVersion=${queryIgnoresVersion}`)
+  }
+})
+
+// [mutation: the transit opening / closing proven label treated as absent]
+test('PROVEN ABSENT: a transit balance proven absent at the opening or closing is a real zero - the leg is available', async () => {
+  const opening = goodState()
+  opening.gl[OPENING(opening)] = { ...opening.gl[OPENING(opening)]!, amountBase: '0', sourcePayloadRef: REF_PROVEN_ABSENT(PREVIOUS) }
+  const o = await load(opening)
+  assert.deepEqual(transitOf(o.basis), { available: true, glMovement: '50.000000', subledgerMovement: '10.000000', reconciliation: evaluateAccountGlReconciliation({ subledgerValue: 10, glBalance: 50 }) })
+  const closing = goodState()
+  closing.gl = closing.gl.map((row) => (row.accountCode === CODES.transit && row.balanceDate.getTime() === dateOf(D).getTime() ? { ...row, amountBase: '0', sourcePayloadRef: REF_PROVEN_ABSENT(D) } : row))
+  const c = await load(closing)
+  assert.deepEqual(transitOf(c.basis), { available: true, glMovement: '-40.000000', subledgerMovement: '10.000000', reconciliation: evaluateAccountGlReconciliation({ subledgerValue: 10, glBalance: -40 }) })
+  const nonZero = goodState()
+  nonZero.gl[OPENING(nonZero)] = { ...nonZero.gl[OPENING(nonZero)]!, sourcePayloadRef: REF_PROVEN_ABSENT(PREVIOUS) }
+  assert.deepEqual(transitOf((await load(nonZero)).basis), { available: false, reason: 'transit_balance_unusable' })
 })
