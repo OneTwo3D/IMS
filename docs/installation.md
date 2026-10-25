@@ -1607,6 +1607,25 @@ A written acceptance is a person's recorded decision that a warning does not sto
 
 The same table is printed by `npm run readiness:gate -- --help`.
 
+## VAT difference report
+
+`npm run vat:diff` (add `-- --json` for machine-readable output) compares the VAT rates held in Xero, IMS and WooCommerce and lists every difference with a closed reason code. The owner ruled on 2026-10-25 that all three use the SAME set of VAT rates and that Xero is the master; WooCommerce tax-rate writes are operator-manual at P1 (you correct WooCommerce by hand from this report) and IMS's own from P2 (a later build). The command is read only:
+
+- **Xero** is read from IMS's stored copy of its tax-rate list, proven first (header, row count, digest, last-success stamp, the organisation connected now, read within 26 hours). Xero is never called. An unusable list refuses the whole report (`XERO_NOT_CONNECTED`, `XERO_LIST_MISSING`, `XERO_LIST_NOT_STAMPED`, `XERO_LIST_STALE`, `XERO_LIST_WRONG_ORGANISATION`, `XERO_LIST_UNREADABLE`).
+- **IMS** is read in one `REPEATABLE READ`, `READ ONLY` transaction: the tax rates, their active components and the WooCommerce tax-rate mappings (the same mapping reconciliation-pack item R13 uses).
+- **WooCommerce** is read with `GET /wp-json/wc/v3/taxes`, every page, twice, through the reconciliation pack's GET-only transport (any other method or path is refused before it is sent), with the stored credentials read in a read-only transaction. A failed or unproven read refuses the report (`WOO_READ_FAILED`, with the pack's reason code in `wooReason`).
+
+The environment is replaced by a short whitelist (`PATH`, `LANG`, `LC_ALL`, `TZ`, `HOME`, `DATABASE_URL`, `SETTINGS_ENCRYPTION_KEY`, `ENCRYPTION_KEY`); the account must be root or the checkout's owner; an argument that looks like a credential is refused.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | All three systems were read and proven and use the same rates. |
+| 1 | Read and proven; the report lists the differences. |
+| 2 | Refused: a side could not be read or proven. Nothing was compared; this is NOT "no differences". |
+| 3 | The command could not start or failed. |
+
+Reason codes: `MISSING_IN_IMS`, `MISSING_IN_XERO`, `INACTIVE_IN_XERO`, `IMS_RATE_NO_XERO_TYPE`, `AMBIGUOUS_IMS_MAPPING`, `XERO_RATE_NOT_STATED`, `PERCENTAGE_MISMATCH_IMS_XERO`, `MISSING_IN_WOO`, `WOO_RATE_NO_IMS_MAPPING`, `WOO_RATE_GONE`, `WOO_MAPPED_TO_INACTIVE_IMS_RATE`, `WOO_PERCENTAGE_MISMATCH`, `WOO_COUNTRY_MISMATCH`, `WOO_CLASS_MISMATCH`, `WOO_COMPOUND_MISMATCH`, `WOO_SHIPPING_NOT_TAXED`, `WOO_REGIONAL_SCOPE`. `npm run vat:diff -- --help` prints each with its meaning. The same report is on **Settings > Accounting > Tax > VAT rate differences** (permission `settings.company`).
+
 ## Reconciliation pack
 
 <!-- reconciliation-pack:overview -->

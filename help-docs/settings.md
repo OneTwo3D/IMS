@@ -188,6 +188,14 @@ If the reverse-charge tax type settings are empty, IMS falls back to the parent 
 - **Also deactivate rates whose tax type Xero does not list as active** (off by default): for example the `TAX001`...`TAX032` country rates left over from a demo organisation. Without the box they are only listed. The default rate is never deactivated.
 - Nothing is deleted and no existing rate's percentage or tax type is changed (documents refer to them). It needs a stored list read within the last 26 hours for the organisation connected now; otherwise it says why (`XERO_LIST_STALE`, `XERO_LIST_MISSING`, ...).
 
+### VAT rate differences (Xero, IMS, WooCommerce)
+
+**Where:** **Settings > Accounting > Tax**, below the import panel. The three systems must use the **same set of VAT rates** and **Xero is the master**. **Compare VAT rates** reads Xero's stored tax-rate list (Xero is not called), the IMS rates and their WooCommerce mappings, and WooCommerce's tax rates (read only, every page), and lists each difference with a reason: a rate missing in IMS, Xero or WooCommerce, a percentage that differs (both values are shown), a Xero type that is inactive, an IMS rate with no Xero type, a WooCommerce rate with no IMS mapping, an ambiguous mapping, or a country, class, compound, shipping or region setting that does not match. It changes nothing in any system.
+
+- **At P1 you correct WooCommerce by hand.** IMS does not write WooCommerce tax rates yet (that is a later build, from P2). Open **WooCommerce > Settings > Tax**, change the rate or setting named in the row so it matches Xero, then run **Compare VAT rates** again until it says *No differences*. A row about IMS or Xero (for example a type missing in IMS) is fixed in IMS (Import purchase tax rates from Xero, above) or in Xero first.
+- **A refusal is not "no differences".** If the stored Xero list is missing, stale or does not belong to the connected organisation, or WooCommerce cannot be read, the panel says why and compares nothing.
+- The same report is available on the server as `npm run vat:diff` (see the installation guide).
+
 ### Generate missing accounting tax rates
 
 **Where:** the VAT rates screen itself — **Settings > Accounting > Tax** (the same page where you add and enable/disable rates). When an accounting connector is connected, a **Generate missing rates** button appears next to **Add VAT Rate**. This complements the **Xero drift** chips on each rate ("no matching rate in Xero").
