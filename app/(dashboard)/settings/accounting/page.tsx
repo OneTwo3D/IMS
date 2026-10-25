@@ -12,6 +12,7 @@ import { getCurrencies, getLatestFxRates, getFxPushLog, getFxHealth } from '@/ap
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { FinancialYearStartSetting } from '@/components/settings/financial-year-start'
 import { TaxRatesTable } from '@/components/settings/tax-rates-table'
+import { PurchaseTaxImportPanel } from '@/components/settings/purchase-tax-import-panel'
 import { CurrenciesTable } from '@/components/settings/currencies-table'
 import { FxScheduleSettings } from '@/components/settings/fx-schedule'
 import { FxRatesTable } from '@/components/settings/fx-rates-table'
@@ -98,6 +99,7 @@ export default async function AccountingSettingsPage({
             {' '}These rates still apply even when no accounting connector is enabled.
           </p>
           <TaxRatesTable taxRates={taxData.taxRates} drift={taxData.drift?.byTaxRateId} driftSyncEnabled={taxData.drift?.syncEnabled} accountingConnected={taxData.accountingConnected} />
+          <div className="mt-6"><PurchaseTaxImportPanel /></div>
         </Card>
       )}
 

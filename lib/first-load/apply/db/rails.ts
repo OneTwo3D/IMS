@@ -9,7 +9,10 @@
  *   warehouses      every warehouse the manifest declares exists, is active, is unique under upper-casing and has exactly the declared profile;
  *   FX rates        (purchase orders) each stated rate has a stored base-to-currency rate, and is within the importer's 2% of it;
  *   tax rates       (suppliers) every purchase tax type the suppliers file states resolves to EXACTLY ONE active IMS tax rate usable for purchases (usedFor PURCHASE or BOTH)
- *                   with that accounting tax type: the supplier importer sets the supplier's default tax rate to it;
+ *                   with that accounting tax type: the supplier importer sets the supplier's default tax rate to it, and that rate (and its effective rate) is not above the manifest's
+ *                   maxPurchaseTaxRate. A type with NO such rate is not refused yet: the rail asks the Xero tax-rate import (lib/tax/purchase-tax-import.ts) what it WOULD create from the stored
+ *                   Xero list (a read; a plan writes nothing) and refuses only when that import is refused. The import itself runs in the ports, inside the suppliers step lock, just before the
+ *                   step's first write (ports.ts), and the rail is then evaluated again WITHOUT the import allowance;
  *                   (purchase orders) every tax a line names resolves to an active purchase rate, and every order-level tax NAME exists with
  *                   exactly that spelling (createPurchaseOrder looks the order-level name up case-exactly; the importer matches lines case-insensitively).
  *
@@ -45,6 +48,8 @@ export interface RailScope {
   resuming: boolean
   /** The step being rechecked; null for preflight, which checks every selected step's rails. */
   step: ApplyStepId | null
+  /** true: the supplier tax rail does NOT ask the Xero import what it would create (used right after the import ran: the rates must exist now). */
+  strictSupplierTax?: boolean
 }
 
 /** One rail's answer for one evaluation: its id, the refusals it raised and (for a rail that reports a state) a closed description of what it read. */
@@ -60,10 +65,11 @@ export async function evaluateRailResults(prepared: PreparedRun, scope: RailScop
     const results: RailResult[] = []
     const selected = new Set(prepared.steps.map((s) => s.step))
     const relevant = (step: ApplyStepId): boolean => selected.has(step) && (scope.step === null || scope.step === step)
-    const rail = async (id: RailId, body: (problems: string[]) => Promise<void>): Promise<void> => {
+    const rail = async (id: RailId, body: (problems: string[], note: (detail: string) => void) => Promise<void>): Promise<void> => {
       const problems: string[] = []
-      await body(problems)
-      results.push({ id, problems, detail: '' })
+      let detail = ''
+      await body(problems, (text) => { detail = text })
+      results.push({ id, problems, detail })
     }
 
     await rail('quiesce', quiesced)
@@ -74,8 +80,8 @@ export async function evaluateRailResults(prepared: PreparedRun, scope: RailScop
     if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await rail('warehouses', (p) => warehouses(prepared, p))
     if (relevant('purchase-orders')) await rail('fx-rates', (p) => fxRates(prepared, p))
     if (relevant('suppliers') || relevant('purchase-orders')) {
-      await rail('tax-rates', async (p) => {
-        if (relevant('suppliers')) await supplierTaxRates(prepared, p)
+      await rail('tax-rates', async (p, note) => {
+        if (relevant('suppliers')) await supplierTaxRates(prepared, p, { allowImport: scope.strictSupplierTax !== true, note })
         if (relevant('purchase-orders')) await taxRates(prepared, p)
       })
     }
@@ -284,30 +290,105 @@ export function taxLookups(step: NonNullable<PreparedRun['steps'][number]>, rate
   return { lookups, lineFacts, orderFacts }
 }
 
-/**
- * The suppliers file's purchase tax types against the IMS rates. A type with no eligible rate is refused (the importer would refuse the row), and so is a type with
- * SEVERAL: which of them the supplier should default to would be a guess, even when their profiles happen to be identical. Never by name similarity.
- */
-export async function supplierTaxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
+/** The supplier-tax rail's codes: each names one refusal in its problem text and in docs/first-load-apply.md. */
+export const SUPPLIER_TAX_RATE_ABOVE_MAX = 'SUPPLIER_TAX_RATE_ABOVE_MAX'
+export const SUPPLIER_TAX_MAX_UNDECLARED = 'SUPPLIER_TAX_MAX_UNDECLARED'
+export const SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO = 'SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO'
+export const SUPPLIER_TAX_XERO_UNTRUSTED = 'SUPPLIER_TAX_XERO_UNTRUSTED'
+
+export interface SupplierTaxRailOptions {
+  /** true: a type with no eligible rate is asked of the Xero import (a read-only plan) and passes when the import would create exactly one. false: such a type is refused outright. */
+  allowImport: boolean
+  /** Receives a closed, count-only description of what the rail read, for the report. */
+  note?: (detail: string) => void
+}
+
+/** The purchase tax types (distinct, non-blank) a prepared suppliers step states, or null when the step is not selected / has no such column. */
+export function supplierPurchaseTaxTypes(prepared: PreparedRun): { types: Set<string>; problem: string | null } | null {
   const step = prepared.steps.find((s) => s.step === 'suppliers')
-  if (!step) return
+  if (!step) return null
   const at = step.data.header.indexOf('purchaseTaxType')
-  if (at < 0) { problems.push('supplier tax: the suppliers file has no purchaseTaxType column'); return }
-  const types = new Set(step.data.rows.map((row) => (row.cells[at] ?? '').trim()))
+  if (at < 0) return { types: new Set(), problem: 'supplier tax: the suppliers file has no purchaseTaxType column' }
+  return { types: new Set(step.data.rows.map((row) => (row.cells[at] ?? '').trim())), problem: null }
+}
+
+/**
+ * The suppliers file's purchase tax types against the IMS rates. A type with SEVERAL eligible rates is refused (which of them the supplier should default to would be a guess, even when their
+ * profiles happen to be identical). Never by name similarity.
+ *
+ * A type with NONE: Xero is the tax-rate master, so before refusing the rail asks what importing it from the stored Xero list would do (`allowImport`). It passes only when that import
+ * would create the rate; otherwise it is refused with the import's own named refusal code(s) (XERO_LIST_MISSING, XERO_LIST_STALE, TYPE_NOT_USABLE_ON_EXPENSES ...). The rail itself writes nothing.
+ *
+ * Every supplier's default rate (the one rate its type resolves to, existing or about to be imported) must be within the manifest's maxPurchaseTaxRate, as the rate column and as the
+ * effective rate tax is computed from: SUPPLIER_TAX_RATE_ABOVE_MAX. A manifest that declares no ceiling cannot show that: SUPPLIER_TAX_MAX_UNDECLARED.
+ */
+export async function supplierTaxRates(prepared: PreparedRun, problems: string[], options: SupplierTaxRailOptions = { allowImport: false }): Promise<void> {
+  const stated = supplierPurchaseTaxTypes(prepared)
+  if (stated === null) return
+  if (stated.problem !== null) { problems.push(stated.problem); return }
   const byType = await loadPurchaseRatesByType(db)
   let none = 0
   let several = 0
   let blank = 0
-  for (const type of types) {
+  const missing: string[] = []
+  const resolved: string[] = []
+  for (const type of stated.types) {
     if (type === '') { blank++; continue }
     const eligible = byType.get(type) ?? []
-    if (eligible.length === 0) none++
+    if (eligible.length === 0) { none++; missing.push(type) }
     else if (eligible.length > 1) several++
+    else resolved.push(eligible[0]!)
   }
   const say = (n: number, text: string): void => { if (n > 0) problems.push(`supplier tax: ${n} ${text}`) }
   say(blank, 'supplier purchase tax type(s) are blank')
-  say(none, 'supplier purchase tax type(s) match no active IMS tax rate usable for purchases')
   say(several, 'supplier purchase tax type(s) match more than one active IMS tax rate usable for purchases')
+
+  // The default rates the suppliers will get, as fractions: the rates that exist, and (when the import is allowed) the ones it would create.
+  const defaults: Array<{ rate: Dec; effective: Dec }> = []
+  const existing = (await db.taxRate.findMany({ where: { id: { in: resolved } }, select: TAX_RATE_SELECT })) as unknown as TaxRateRow[]
+  for (const row of existing) defaults.push({ rate: new D(row.rate.toFixed()), effective: new D(effectiveRate(row)) })
+
+  let wouldImport: string[] = []
+  if (none > 0 && options.allowImport) {
+    const { planPurchaseTaxImport, describeRefusals, connectedXeroTenantId } = await import('@/lib/tax/purchase-tax-import')
+    const plan = await planPurchaseTaxImport(db as never, { now: new Date(), connectedTenantId: await connectedXeroTenantId(), types: missing })
+    // A refused type (or a refused list) is the rail's refusal; a type that is neither created nor refused cannot happen for a type with no eligible rate, and is refused too (fail closed).
+    const created = new Set(plan.creates.map((c) => c.taxType))
+    const unplanned = missing.filter((t) => !created.has(t))
+    if (plan.refusals.length > 0 || unplanned.length > 0) {
+      problems.push(`supplier tax: ${none} supplier purchase tax type(s) match no active IMS tax rate usable for purchases and the import from Xero was refused${plan.refusals.length > 0 ? ` (${describeRefusals(plan.refusals)})` : ''}`)
+    } else {
+      wouldImport = [...created].sort()
+      for (const c of plan.creates) defaults.push({ rate: new D(c.rate), effective: new D(c.rate) })
+    }
+  } else {
+    say(none, 'supplier purchase tax type(s) match no active IMS tax rate usable for purchases')
+  }
+
+  // Xero is the tax-rate master: every resolved supplier default that already EXISTS is held to the trusted stored Xero row (rate column and effective rate). An untrusted list refuses.
+  // (A rate about to be imported is Xero's by construction; after the import it is checked here like any other.)
+  if (existing.length > 0) {
+    const { checkRatesAgainstXero, connectedXeroTenantId } = await import('@/lib/tax/purchase-tax-import')
+    const pct = (fraction: string): string => new D(fraction).times(100).toFixed(4)
+    const agreement = await checkRatesAgainstXero(db as never, new Date(), await connectedXeroTenantId(), existing.map((row) => ({ taxType: row.accountingTaxType!, rate: new D(row.rate.toFixed()).toFixed(4), effective: effectiveRate(row) })))
+    if (!agreement.ok) problems.push(`supplier tax [${SUPPLIER_TAX_XERO_UNTRUSTED}]: ${existing.length} supplier default tax rate(s) cannot be compared with Xero, the tax-rate master, because the stored Xero list is not usable (${agreement.refusal.code}); refresh it with the tax-rate job`)
+    else if (agreement.disagreements.length > 0) {
+      const say2 = agreement.disagreements.map((d) => `${d.taxType}: IMS ${pct(d.imsRate)}% (effective ${pct(d.imsEffective)}%), Xero ${d.xeroRate === null ? d.reason : `${pct(d.xeroRate)}%`}`).sort().join('; ')
+      problems.push(`supplier tax [${SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO}]: ${agreement.disagreements.length} supplier default tax rate(s) disagree with Xero, the tax-rate master (${say2}); correct them with "Import purchase tax rates from Xero" with replace-differing (Settings > Accounting > Tax)`)
+    }
+  }
+
+  // maxPurchaseTaxRate (manifest, carried on the prepared report): only the rates the suppliers will actually default to are held to it.
+  const declaredMax = prepared.report?.config?.maxPurchaseTaxRate ?? null
+  if (stated.types.size > 0 && [...stated.types].some((t) => t !== '')) {
+    if (declaredMax === null) problems.push(`supplier tax [${SUPPLIER_TAX_MAX_UNDECLARED}]: the prepared report declares no maximum purchase tax rate, so no supplier default rate can be shown to be within it`)
+    else {
+      const ceiling = new D(declaredMax)
+      const above = defaults.filter((d) => d.rate.gt(ceiling) || d.effective.gt(ceiling)).length
+      if (above > 0) problems.push(`supplier tax [${SUPPLIER_TAX_RATE_ABOVE_MAX}]: ${above} supplier default tax rate(s) are above the maximum purchase tax rate the prepared report declares`)
+    }
+  }
+  if (options.note) options.note(wouldImport.length > 0 ? `${wouldImport.length} purchase tax type(s) would be imported from Xero before the suppliers load (${wouldImport.join(', ')}); a plan writes nothing` : `${resolved.length} supplier purchase tax type(s) resolve to one active purchase rate`)
 }
 
 async function taxRates(prepared: PreparedRun, problems: string[]): Promise<void> {

@@ -590,6 +590,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'PDF page margins — a layout inset, not a money figure.',
   },
   {
+    file: 'lib/tax/purchase-tax-import.ts',
+    figures: ['canApplyToRevenue', 'revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'The same Xero can-apply-to-revenue flag, read from the stored tax-rate list to decide whether a Xero tax type may be mirrored as a sales rate. A boolean on a tax-rate definition; no refund moves it.',
+  },
+  {
     file: 'scripts/shadow-reader-census.ts',
     figures: ['accounting_revenue_deferred_batch_ref', 'accounting_revenue_deferred_date', 'revenueDeferredBatchRef', 'revenueDeferredDate'],
     treatment: 'not-refund-sensitive',

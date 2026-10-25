@@ -31,7 +31,7 @@ test('every entry carries a reason, the three kinds are all used, and the runner
   for (const [name, entry] of Object.entries(TABLE_CLASSES)) assert.ok(entry.reason.trim().length >= 10, `${name} has a reason`)
   assert.deepEqual(tablesOfKind('RUNNER_WRITES'), [
     'activity_logs', 'bom_items', 'boms', 'cost_layers', 'first_load_apply_runs', 'product_categories', 'product_components', 'products', 'purchase_order_lines', 'purchase_orders',
-    'stock_levels', 'stock_movements', 'supplier_products', 'suppliers',
+    'stock_levels', 'stock_movements', 'supplier_products', 'suppliers', 'tax_rate_components', 'tax_rates',
   ])
   for (const name of FRESH_RUN_MAY_HOLD) assert.equal(TABLE_CLASSES[name]?.kind, 'RUNNER_WRITES')
 })

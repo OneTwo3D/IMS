@@ -590,6 +590,65 @@ export async function autoLinkXeroTaxRates(): Promise<{
 }
 
 // ---------------------------------------------------------------------------
+// Import IMS tax rates from the stored Xero list (Xero is the tax-rate master)
+// ---------------------------------------------------------------------------
+
+export type PurchaseTaxImportActionResult =
+  | { success: true; applied: boolean; wrote: boolean; plan: import('@/lib/tax/purchase-tax-import').PurchaseTaxImportPlan; warning?: string }
+  | { success: false; error: string }
+
+/**
+ * READ-ONLY. What "Import purchase tax rates from Xero" would do with the current options: the rates it would create, the sales-side rates it would narrow, the rates
+ * Xero does not list, and every refusal by code. Reads the STORED Xero list; never calls Xero.
+ */
+export async function previewPurchaseTaxImport(input: { narrowSalesTypes?: boolean; deactivateAbsent?: boolean; replaceDiffering?: boolean } = {}): Promise<PurchaseTaxImportActionResult> {
+  await requirePermission('settings.company')
+  try {
+    const { runPurchaseTaxImport } = await import('@/lib/tax/purchase-tax-import')
+    const result = await runPurchaseTaxImport({ apply: false, narrowSalesTypes: input.narrowSalesTypes === true, deactivateAbsent: input.deactivateAbsent === true, replaceDiffering: input.replaceDiffering === true, mirrorSales: true })
+    return { success: true, applied: false, wrote: false, plan: result.plan }
+  } catch (e) {
+    unstable_rethrow(e)
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Create the missing PURCHASE tax rates (INPUT2, ZERORATEDINPUT, NONE) from the stored Xero list, and - only when asked - narrow sales-side BOTH rates to SALES and
+ * deactivate rates Xero does not list. Idempotent; never deletes; never changes the rate or type of an existing row; never writes to Xero (see lib/tax/purchase-tax-import.ts).
+ */
+export async function importPurchaseTaxRatesFromXero(input: { narrowSalesTypes?: boolean; deactivateAbsent?: boolean; replaceDiffering?: boolean } = {}): Promise<PurchaseTaxImportActionResult> {
+  await requirePermission('settings.company')
+  try {
+    const { runPurchaseTaxImport } = await import('@/lib/tax/purchase-tax-import')
+    const result = await runPurchaseTaxImport({ apply: true, narrowSalesTypes: input.narrowSalesTypes === true, deactivateAbsent: input.deactivateAbsent === true, replaceDiffering: input.replaceDiffering === true, mirrorSales: true })
+    const { plan } = result
+    // POST-COMMIT: the rows are already written; a failure to log or revalidate must not read as a failed import.
+    const postCommit = await runPostCommit(async () => {
+      if (result.wrote) {
+        await logActivity({
+          entityType: 'SETTING',
+          tag: 'settings',
+          action: 'purchase_tax_rates_imported_from_xero',
+          description: `Imported purchase tax rates from the stored Xero list: ${plan.creates.length} created, ${plan.narrow.length} narrowed to sales only, ${plan.notInXero.filter((r) => r.deactivate).length} deactivated (${plan.refusals.length} refused)`,
+          metadata: {
+            created: plan.creates.map((c) => ({ taxType: c.taxType, name: c.name, rate: c.rate })),
+            narrowed: plan.narrow.map((n) => ({ id: n.id, taxType: n.taxType })),
+            deactivated: plan.notInXero.filter((r) => r.deactivate).map((r) => ({ id: r.id, taxType: r.taxType })),
+            refusals: plan.refusals,
+          },
+        })
+      }
+      revalidatePath('/settings/accounting')
+    }, 'Failed to record the import')
+    return { success: true, applied: result.applied, wrote: result.wrote, plan, ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}) }
+  } catch (e) {
+    unstable_rethrow(e)
+    return { success: false, error: String(e) }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Generate + map missing accounting tax rates (onetwo3d-ims-30tg)
 // ---------------------------------------------------------------------------
 

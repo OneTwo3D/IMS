@@ -22,6 +22,7 @@ import { StepLockError, type StepLock } from '../orchestrate'
 import { withStepLock } from './lock'
 import { observeStep } from './observe'
 import { QuiesceError, currentTaxProfiles, evaluateRailResults, quiesceProblems, type RailResult } from './rails'
+import { importSupplierTaxRates } from './tax-import'
 import type { PreloadReaders } from './preload-rails'
 import { DATABASE_READ_FAILED } from './observe'
 import { ObservationError } from '../residual'
@@ -94,6 +95,14 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
         } catch {
           throw new ObservationError(DATABASE_READ_FAILED)
         }
+      }
+      // Just before the first SUPPLIER write, with every rail holding: a purchase tax type with no IMS rate is imported from the stored Xero list (tax-import.ts), then the supplier tax rail is
+      // evaluated again WITHOUT the import allowance - the rates must now exist and be unique. The step lock is held and the run record exists; tax_rates is a table the runner may write.
+      if (problems.length === 0 && step === 'suppliers' && phase === 'before-first-write') {
+        const imported = await importSupplierTaxRates(prepared)
+        if (imported.problems.length > 0) return note([{ id: 'tax-rates', problems: imported.problems, detail: '' }])
+        if (imported.summary !== null) await setFactOnce('purchaseTaxImport', imported.summary)
+        return note(await evaluateRailResults(prepared, { phase: 'recheck', resuming: true, step, strictSupplierTax: true }, options.preload))
       }
       // Just before the first purchase-order write, with every rail holding: record which accounting profile each tax lookup of the file resolves to. Only the first recording counts.
       if (problems.length === 0 && step === 'purchase-orders' && phase === 'before-first-write') await setFactOnce('taxProfiles', await currentTaxProfiles(prepared))
