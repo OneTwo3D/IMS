@@ -1304,6 +1304,8 @@ function loadPurchaseOrders(run: Run): void {
     supplierName: string
     currency: string
     fxText: string
+    /** The order's created day (YYYY-MM-DD) for a foreign order, whose rate was looked up at its end; '' for a base-currency order. */
+    createdOn: string
     warehouse: string
     pricesIncludeVat: string
     supplierRef: string
@@ -1453,6 +1455,7 @@ function loadPurchaseOrders(run: Run): void {
     const currency = (inFile.cells.currency ?? '').trim().toUpperCase()
     if (!/^[A-Z]{3}$/.test(currency)) { reject('SUPPLIER_CURRENCY_MISSING', `supplier ${JSON.stringify(inFile.name)} has no usable currency in the suppliers dataset (after the supplier currency rule this cannot happen)`); continue }
     let fxText = '1'
+    let fxCreatedOn = ''
     if (currency !== config.baseCurrency) {
       // A foreign order's rate comes ONLY from fx_rates (epic one-fx): the central rule over the supplied ims-fx-rates rows at the end of the order's created day.
       if (v.createdOn === '') { reject('MISSING_CREATED_DATE', `the order has no created date, so its ${currency} rate cannot be looked up`); continue }
@@ -1470,10 +1473,11 @@ function loadPurchaseOrders(run: Run): void {
       const parsed = parseDecimal(found.toFixed(), 'fxRateToBase', NUMERIC_LIMITS.fx)
       if (!parsed.ok) { reject('FX_RATE_UNUSABLE', `the stored ${currency} rate cannot be used: ${parsed.reason}`); continue }
       fxText = fmt(parsed.value)
+      fxCreatedOn = v.createdOn
     }
     tally.open++
     candidates.push({
-      row, orderKey: v.orderKey, sku: res.sku, key: sku.key, supplierName: inFile.name, currency, fxText, warehouse,
+      row, orderKey: v.orderKey, sku: res.sku, key: sku.key, supplierName: inFile.name, currency, fxText, createdOn: fxCreatedOn, warehouse,
       pricesIncludeVat: vat, supplierRef: v.supplierRef, expectedDelivery: v.expectedDelivery, notes: v.notes,
       taxRateName: v.taxRateName, taxRateValue, qty: outstanding, unitCost: cost.value, ordered: ordered.value,
     })
@@ -1483,7 +1487,7 @@ function loadPurchaseOrders(run: Run): void {
   const byOrder = new Map<string, Line[]>()
   for (const c of candidates) byOrder.set(c.orderKey, [...(byOrder.get(c.orderKey) ?? []), c])
   for (const [orderKey, list] of [...byOrder.entries()].sort((a, b) => cmp(a[0], b[0]))) {
-    const shapes = new Set(list.map((l) => JSON.stringify([l.supplierName.toUpperCase(), l.currency, l.fxText, l.warehouse, l.pricesIncludeVat, l.supplierRef, l.expectedDelivery, l.notes, l.taxRateName, l.taxRateValue])))
+    const shapes = new Set(list.map((l) => JSON.stringify([l.supplierName.toUpperCase(), l.currency, l.fxText, l.createdOn, l.warehouse, l.pricesIncludeVat, l.supplierRef, l.expectedDelivery, l.notes, l.taxRateName, l.taxRateValue])))
     if (shapes.size > 1) {
       for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'REJECTED', 'INCONSISTENT_ORDER_FIELDS', 'open lines of one orderKey differ in supplier, currency, fx rate, warehouse, VAT flag, supplier reference, delivery date, notes or tax rate; the importer refuses such an order')
       continue
@@ -1511,7 +1515,7 @@ function loadPurchaseOrders(run: Run): void {
           orderKey: `${prefix}${orderKey}`, supplierName: l.supplierName, currency: l.currency, fxRateToBase: l.fxText,
           destinationWarehouseCode: l.warehouse, sku: l.sku, qty: fmt(l.qty), unitCostForeign: fmt(l.unitCost),
           taxRateName: l.taxRateName, taxRateValue: l.taxRateValue, pricesIncludeVat: l.pricesIncludeVat,
-          supplierRef: l.supplierRef, expectedDelivery: l.expectedDelivery, notes: l.notes,
+          supplierRef: l.supplierRef, expectedDelivery: l.expectedDelivery, notes: l.notes, createdOn: l.createdOn,
         }
         return IMPORT_TARGETS['purchase-orders'].headers.map((h) => cells[h] ?? '')
       }),

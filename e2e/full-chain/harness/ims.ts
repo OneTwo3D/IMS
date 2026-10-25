@@ -166,8 +166,8 @@ export async function createAndSendPo(
      * bill records (PP-08). The currency select is driven AFTER the supplier is chosen, because picking a
      * supplier resets the currency to that supplier's default (po-form.tsx handleSupplierChange). A seeded
      * fx_rate for base→currency on or before "now" is REQUIRED — createPurchaseOrder throws
-     * "Missing … FX rate" otherwise (purchase-order-fx.ts) — and the typed rate must be within 2% of it
-     * (PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE), so the caller seeds the booked rate first and passes it here.
+     * "Missing … FX rate" otherwise (purchase-order-fx.ts) — and it IS the order's rate (the form's rate field is read-only), so the caller seeds the booked rate
+     * first; `fxRate` here is only checked against what the form shows.
      */
     currency?: string
     fxRate?: string
@@ -186,7 +186,9 @@ export async function createAndSendPo(
   if (opts.currency) {
     await dialog.locator(`select:has(option[value="${opts.currency}"])`).selectOption(opts.currency)
     if (opts.fxRate) {
-      await dialog.locator('input[type="number"][min="0.0001"][step="0.0001"]').fill(opts.fxRate)
+      // The rate field is READ-ONLY (o3d-q0x56.6): the order is raised at the fx_rates table rate. The caller seeded that rate, so the form must show it.
+      const shown = await dialog.getByLabel('Exchange rate (from the FX Rates table)').inputValue()
+      if (Number(shown) !== Number(opts.fxRate)) throw new Error(`the PO form shows the table rate ${shown}, not the seeded ${opts.fxRate}`)
     }
   }
 

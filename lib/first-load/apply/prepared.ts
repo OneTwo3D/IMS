@@ -320,6 +320,9 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
         // database, that every rate in the file is a rate fx_rates holds.
         const rate = parseDecimal(fx, 'fxRateToBase', NUMERIC_LIMITS.fx)
         if (!rate.ok || !rate.value.gt(new D(0))) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase is not an acceptable positive number`)
+        // The apply-time importer prices a system import at the end of this day, and the rail checks the rate against the table at that instant: a foreign order must state it.
+        const createdOn = cell(orders, row, 'createdOn').trim()
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(createdOn) || Number.isNaN(Date.parse(`${createdOn}T00:00:00Z`))) problems.push(`purchase-orders ${rowLocation(row)}: a foreign order needs its created day (createdOn, YYYY-MM-DD): its rate is the fx_rates rate at the end of that day`)
       }
     }
   }

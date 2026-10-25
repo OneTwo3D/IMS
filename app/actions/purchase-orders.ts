@@ -318,7 +318,11 @@ export type CreatePoInput = {
   reference?: string
   supplierId: string
   currency: string
-  fxRateToBase?: number
+  /**
+   * The instant the order's exchange rate is looked up at. Honoured ONLY for a system import (the first-load apply runner, which prices an order at the END of its created
+   * day); every other caller gets "now". There is NO rate input: an order's rate is always the central fx_rates rate (lib/domain/purchasing/purchase-order-fx.ts).
+   */
+  fxRateAsOf?: Date
   destinationWarehouseId?: string
   supplierRef?: string
   expectedDelivery?: string
@@ -1145,8 +1149,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
     const fxRate = await resolvePurchaseOrderFxRateToBase(db, {
       currency: input.currency,
       baseCurrency,
-      asOf: new Date(),
-      inputRateToBase: input.fxRateToBase,
+      asOf: system?.systemImportToken === SYSTEM_IMPORT && input.fxRateAsOf ? input.fxRateAsOf : new Date(),
     })
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
@@ -1385,9 +1388,15 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
   }
 }
 
+/**
+ * A draft edit. There is no rate input: the stored rate is kept, and re-read from fx_rates (at "now") only when the currency changes or `refreshFxRate` is true.
+ * `fxRateAsOf` is not an edit field.
+ */
+export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf'>> & { refreshFxRate?: boolean }
+
 export async function updatePurchaseOrder(
   id: string,
-  input: Partial<CreatePoInput>,
+  input: UpdatePoInput,
 ): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
@@ -1440,11 +1449,11 @@ export async function updatePurchaseOrder(
       // A bill already exists: this edit would recompute the order's totals, VAT or exchange rate and leave the bill
       // on the old figures. Header-only edits (notes, delivery date, references) are unaffected.
       const changesBilledFigures = input.lines !== undefined || input.additionalCosts !== undefined || input.taxRateId !== undefined
-        || input.taxRateName !== undefined || input.taxRateValue !== undefined || input.currency !== undefined || input.fxRateToBase !== undefined
+        || input.taxRateName !== undefined || input.taxRateValue !== undefined || input.currency !== undefined || input.refreshFxRate === true
       if (changesBilledFigures && (await tx.purchaseInvoice.count({ where: { poId: id } })) > 0) {
         return { refused: PO_BILLED_FIGURES_EDIT_MESSAGE }
       }
-      const shouldRefreshFxRate = input.currency !== undefined || input.fxRateToBase !== undefined
+      const shouldRefreshFxRate = (input.currency !== undefined && input.currency !== locked.currency) || input.refreshFxRate === true
       const rateOnlyFxRefresh = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
       const baseCurrency = shouldRefreshFxRate ? await resolveBaseCurrencyCode(tx) : null
       const fxRate = shouldRefreshFxRate && !rateOnlyFxRefresh
@@ -1452,7 +1461,6 @@ export async function updatePurchaseOrder(
             currency: input.currency ?? locked.currency,
             baseCurrency: baseCurrency!,
             asOf: new Date(),
-            inputRateToBase: input.fxRateToBase,
           })
         : Number(locked.fxRateToBase)
       const inclVat = !!input.pricesIncludeVat
@@ -1663,7 +1671,6 @@ export async function updatePurchaseOrder(
               currency: input.currency ?? locked.currency,
               baseCurrency: baseCurrency!,
               asOf: new Date(),
-              inputRateToBase: input.fxRateToBase,
             })
             const rebasedPurchaseOrder = await rebasePurchaseOrderStoredBaseAmounts(
               tx as unknown as PurchaseOrderFxRebaseDb,

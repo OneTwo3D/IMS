@@ -12,7 +12,6 @@ export type PurchaseOrderFxRateOnlyExisting = PurchaseOrderFxRebaseStoredOrder &
 
 export type PurchaseOrderFxRateOnlyInput = {
   currency?: string
-  fxRateToBase?: number | null
 }
 
 export type PurchaseOrderFxRateOnlyUpdateDb<TResult = unknown> =
@@ -33,7 +32,6 @@ export async function updatePurchaseOrderFxRateOnly<TResult>(
     currency: input.currency ?? existing.currency,
     baseCurrency: options.baseCurrency,
     asOf: options.asOf,
-    inputRateToBase: input.fxRateToBase,
   })
 
   return rebasePurchaseOrderStoredBaseAmountsWithParentUpdate(db, poId, existing, fxRateToBase, {

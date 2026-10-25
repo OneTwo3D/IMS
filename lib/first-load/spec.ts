@@ -140,7 +140,7 @@ export const TRANSFERS_IMPORT_HEADERS = ['transferKey', 'fromWarehouseCode', 'to
 export const PURCHASE_ORDERS_IMPORT_HEADERS = [
   'orderKey', 'supplierName', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'sku', 'qty', 'unitCostForeign',
   'lineDiscountForeign', 'lineDiscountStr', 'taxRateName', 'taxRateValue', 'orderTaxRateName', 'orderTaxRateValue',
-  'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'orderDiscountForeign', 'notes',
+  'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'orderDiscountForeign', 'notes', 'createdOn',
 ] as const
 
 export type ImporterTarget = 'products' | 'suppliers' | 'opening-stock' | 'transfers' | 'purchase-orders'

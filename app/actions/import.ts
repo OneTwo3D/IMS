@@ -25,6 +25,8 @@ import {
 } from '@/lib/products/categories'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { endOfBusinessDateUtc } from '@/lib/currencies/fx-select'
+import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
@@ -1897,7 +1899,10 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
     importKey?: string
     supplierId: string
     currency: string
-    fxRateToBase: number
+    /** The rate the file STATES (blank when it states none). It is a claim to be checked against fx_rates, never a source: see the group loop below. */
+    statedFxRate: string
+    /** The order's created day (YYYY-MM-DD) or '' : the first load prices an order at the end of this day. */
+    createdOn: string
     notes?: string
     supplierRef?: string
     expectedDelivery?: string
@@ -1929,11 +1934,21 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
     if (!product) { result.errors.push(`Row ${lineNum}: SKU "${sku}" not found`); result.skipped++; continue }
 
     const currency = readCsvValue(row, 'currency').trim() || supplier.currency || baseCurrency
-    const fxRateResolved = getFxRateForCurrency(lineNum, currency, baseCurrency, readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate'))
-    if (!fxRateResolved.fxRate) {
-      result.errors.push(fxRateResolved.error ?? `Row ${lineNum}: invalid fxRateToBase`)
+    // An order's rate is ALWAYS the central fx_rates rate (o3d-q0x56.6). The file's fxRateToBase is not a source: blank is fine, and a stated rate is checked against the
+    // table rate below and the order refused when it differs. createdOn (optional) is the day a SYSTEM import (the first load) prices the order at.
+    const statedFxRate = readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate').trim()
+    if (statedFxRate !== '' && !(Number.isFinite(Number(statedFxRate)) && Number(statedFxRate) > 0)) {
+      result.errors.push(`Row ${lineNum}: fxRateToBase must be greater than zero`)
       result.skipped++
       continue
+    }
+    const createdOn = readCsvValue(row, 'createdOn', 'createdon').trim()
+    if (createdOn !== '') {
+      try { endOfBusinessDateUtc(createdOn) } catch {
+        result.errors.push(`Row ${lineNum}: createdOn "${createdOn}" is not a real date (YYYY-MM-DD)`)
+        result.skipped++
+        continue
+      }
     }
 
     const destinationWarehouseCode = readCsvValue(row, 'destinationWarehouseCode', 'warehouseCode', 'warehouse').trim().toUpperCase()
@@ -1962,7 +1977,8 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
       importKey: explicitKey || undefined,
       supplierId: supplier.id,
       currency,
-      fxRateToBase: fxRateResolved.fxRate,
+      statedFxRate,
+      createdOn,
       notes: readCsvValue(row, 'notes').trim() || undefined,
       supplierRef: readCsvValue(row, 'supplierRef', 'supplierref').trim() || undefined,
       expectedDelivery: readCsvValue(row, 'expectedDelivery', 'expecteddelivery').trim() || undefined,
@@ -1981,7 +1997,8 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
     } else if (
       existing.supplierId !== groupCandidate.supplierId ||
       existing.currency !== groupCandidate.currency ||
-      existing.fxRateToBase !== groupCandidate.fxRateToBase ||
+      existing.statedFxRate !== groupCandidate.statedFxRate ||
+      existing.createdOn !== groupCandidate.createdOn ||
       existing.notes !== groupCandidate.notes ||
       existing.supplierRef !== groupCandidate.supplierRef ||
       existing.expectedDelivery !== groupCandidate.expectedDelivery ||
@@ -2040,12 +2057,24 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
       continue
     }
     try {
+      // THE ORDER'S RATE IS THE TABLE RATE. A web import prices the order now (as createPurchaseOrder does); a SYSTEM import (the first load) prices it at the end of its created
+      // day. A rate the file states must equal that table rate exactly (a number read from the same decimal text is the same double), else the order is refused: a
+      // user-supplied rate is never stored. A missing table rate refuses the order (the central lookup's own message).
+      const fxAsOf = system?.systemImportToken === SYSTEM_IMPORT && g.createdOn !== '' ? endOfBusinessDateUtc(g.createdOn) : undefined
+      if (g.currency.trim().toUpperCase() !== baseCurrency.trim().toUpperCase()) {
+        const tableRate = await resolvePurchaseOrderFxRateToBase(db, { currency: g.currency, baseCurrency, asOf: fxAsOf ?? new Date() })
+        if (g.statedFxRate !== '' && Number(g.statedFxRate) !== tableRate) {
+          result.errors.push(`Purchase order "${importKey ?? groupKey}": the file states fxRateToBase ${g.statedFxRate} for ${g.currency}, but the fx_rates rate is ${tableRate}${fxAsOf ? ` as of ${fxAsOf.toISOString().slice(0, 10)}` : ''}; an order's rate is always the table rate (leave fxRateToBase blank, or pin an override on Settings, Accounting, FX Rates)`)
+          result.skipped += g.lines.length
+          continue
+        }
+      }
       if (!preview) {
         const created = await createPurchaseOrder({
           reference: importKey,
           supplierId: g.supplierId,
           currency: g.currency,
-          fxRateToBase: g.fxRateToBase,
+          fxRateAsOf: fxAsOf,
           destinationWarehouseId: g.destinationWarehouseId,
           supplierRef: g.supplierRef,
           expectedDelivery: g.expectedDelivery,

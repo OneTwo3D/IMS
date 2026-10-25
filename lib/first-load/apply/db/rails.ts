@@ -20,8 +20,7 @@
  * value is an ObservationError, never "fine". Problem text names a rail, a count or the position of an entry in the operator's manifest: never a value from a prepared file.
  */
 import { db } from '@/lib/db'
-import { getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
-import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
+import { endOfBusinessDateUtc, getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { D, fmtFixed, type Dec } from '../../money'
 import { RUNNER_APPLICATION_NAME, type ApplyStepId, type RailId } from '../constants'
 import { defaultPreloadReaders, evaluatePreloadRails, type PreloadReaders } from './preload-rails'
@@ -248,36 +247,41 @@ async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void>
   const step = prepared.steps.find((s) => s.step === 'purchase-orders')
   if (!step) return
   const col = (name: string): number => step.data.header.indexOf(name)
-  const [currencyIx, rateIx] = [col('currency'), col('fxRateToBase')]
-  // The prepare step looked every foreign order's rate up in fx_rates (the central rule, at the end of the order's created day). No file and no manifest states a rate.
-  // This rail proves, against the database, that each rate in the file is a rate fx_rates holds for its currency, and that the importer (which compares an order's rate
-  // with the latest stored rate on or before today) will not refuse it.
-  const rates = new Map<string, Set<string>>()
+  const [currencyIx, rateIx, createdIx] = [col('currency'), col('fxRateToBase'), col('createdOn')]
+  // THE RULE (owner ruling 2026-10-25, o3d-q0x56.6): an order's rate is ALWAYS the central fx_rates rate. The prepare step looked each foreign order's rate up in fx_rates at the END
+  // of the order's created day (the file's createdOn column), and the apply-time importer prices a system import at that same instant. This rail proves, against the database, that
+  // each foreign order's rate in the file is EXACTLY (decimal-exact, not within a tolerance) the rate the central lookup returns for its currency at that instant. It is not compared
+  // with today's rate: an old order may have a rate far from today's. The runner never writes a rate.
+  const seen = new Set<string>()
+  const checked = new Map<string, string>()
+  let index = 0
   for (const row of step.data.rows) {
     const currency = (currencyIx < 0 ? '' : row.cells[currencyIx] ?? '').trim().toUpperCase()
     if (currency === '' || currency === base) continue
     const text = (rateIx < 0 ? '' : row.cells[rateIx] ?? '').trim()
-    rates.set(currency, (rates.get(currency) ?? new Set<string>()).add(text))
-  }
-  const now = new Date()
-  for (const [currency, texts] of [...rates.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-    const at = `FX rates of the purchase-orders file for one currency (${[...rates.keys()].sort().indexOf(currency) + 1} of ${rates.size})`
-    const rows = await db.fxRate.findMany({ where: { fromCurrency: base, toCurrency: currency }, select: { rate: true } })
-    const stored = rows.map((r) => new D(r.rate.toFixed()))
-    let latest: Dec | null = null
-    try {
-      latest = new D((await getFxRateToBase(db, { currency, asOf: now, baseCurrency: base })).rate.toFixed())
-    } catch (error) {
-      if (!isMissingFxRateError(error)) throw error
-      problems.push(`${at}: the database holds no usable rate for it on or before today`)
+    const createdOn = (createdIx < 0 ? '' : row.cells[createdIx] ?? '').trim()
+    const key = `${currency}|${createdOn}|${text}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    index += 1
+    const at = `FX rate ${index} of the purchase-orders file (${currency}, created ${createdOn === '' ? 'on no stated day' : 'on a stated day'})`
+    let rate: Dec
+    try { rate = new D(text) } catch { problems.push(`${at}: the rate is not a number`); continue }
+    let asOf: Date
+    try { asOf = endOfBusinessDateUtc(createdOn) } catch { problems.push(`${at}: the order has no usable created day (createdOn), so its rate cannot be checked`); continue }
+    const memo = `${currency}|${createdOn}`
+    let expected = checked.get(memo)
+    if (expected === undefined) {
+      try {
+        expected = new D((await getFxRateToBase(db, { currency, asOf, baseCurrency: base })).rate.toFixed()).toFixed()
+        checked.set(memo, expected)
+      } catch (error) {
+        if (!isMissingFxRateError(error)) throw error
+        problems.push(`${at}: the database holds no usable rate for it on or before the end of that day`)
+        continue
+      }
     }
-    for (const [index, text] of [...texts].sort().entries()) {
-      let rate: Dec
-      try { rate = new D(text) } catch { problems.push(`${at}: rate ${index + 1} is not a number`); continue }
-      if (!stored.some((s) => s.eq(rate))) problems.push(`${at}: rate ${index + 1} is not a rate the database's fx_rates holds for it (a rate is only ever read from fx_rates)`)
-      // The importer takes a rate only within its tolerance of the latest stored rate, and the purchase-order importer is not changed here (see docs/first-load-apply.md).
-      if (latest !== null && rate.minus(latest).abs().div(latest).gt(new D(PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE))) problems.push(`${at}: rate ${index + 1} differs from today's stored rate by more than the purchase-order importer's tolerance, which would refuse the order`)
-    }
+    if (!rate.eq(new D(expected))) problems.push(`${at}: the rate is not the fx_rates rate for that currency at the end of that day (it must be exactly the table rate; a rate is only ever read from fx_rates)`)
   }
 }
 
