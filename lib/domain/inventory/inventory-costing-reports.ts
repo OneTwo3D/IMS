@@ -613,11 +613,33 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
     }
     throw error
   }
+  return inventoryGlVarianceFromSnapshot(snapshot, asOf, totalValueBase, context.inventoryAccountCode)
+}
+
+/**
+ * The GL variance for the valuation AT `asOf`. The stored balance must be dated EXACTLY `asOf`: the latest balance on or before it
+ * is the balance at an earlier date, and presenting it as the variance for `asOf` would compare today's stock with yesterday's
+ * ledger. Otherwise the variance is blank, with a notice naming the dates.
+ */
+export function inventoryGlVarianceFromSnapshot(
+  snapshot: { balanceDate: Date; amountBase: Decimal } | null,
+  asOf: string,
+  totalValueBase: Decimal,
+  accountCode: string,
+): { glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] } {
   if (!snapshot) {
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: [`No stored GL balance snapshot exists for inventory asset account ${context.inventoryAccountCode} on or before ${asOf}, so GL variance is blank.`],
+      notices: [`No stored GL balance snapshot exists for inventory asset account ${accountCode} on or before ${asOf}, so GL variance is blank.`],
+    }
+  }
+  const stored = utcDateOnly(snapshot.balanceDate)
+  if (stored !== asOf) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: [`The latest stored GL balance for inventory asset account ${accountCode} is dated ${stored}, not ${asOf}, so GL variance is blank (pull the Trial Balance for ${asOf}).`],
     }
   }
   return {

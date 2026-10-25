@@ -71,11 +71,6 @@ type MatchedAccount = {
   externalAccountId: string
   code: string | null
   name: string
-  /**
-   * True when NO other account in the chart (active or not) holds this code. Only then may a Trial Balance row that carries no
-   * account id be read by code. Absent means true (a caller that has no chart to ask).
-   */
-  codeUnique?: boolean
 }
 
 type XeroAccountBalanceSnapshotBuildInput = {
@@ -143,6 +138,7 @@ export type XeroTrialBalanceRefusalCode =
   | 'TB_ROW_CELL_COUNT'
   | 'TB_NON_MONEY_CELL'
   | 'TB_BLANK_LABEL'
+  | 'TB_ROW_WITHOUT_ACCOUNT_ID'
   | 'TB_COMPLETENESS_UNPROVEN'
   | 'TB_DUPLICATE_ACCOUNT_ROW'
 
@@ -236,6 +232,12 @@ function collectRows(
     }
     if (!label) {
       refuse('TB_BLANK_LABEL', 'its account label cell is blank')
+      continue
+    }
+    // EVERY data row must carry the Xero account id (the live report does, on its label cell). A code in a label is not an
+    // identity: it can be reassigned after the report date, so a row without an id is never tied to an account by its code.
+    if (identity.externalAccountId === null) {
+      refuse('TB_ROW_WITHOUT_ACCOUNT_ID', 'its label cell carries no account id')
       continue
     }
     if (cells.length !== columns.cellCount) {
@@ -398,22 +400,14 @@ export function buildXeroAccountBalanceSnapshotInputs(
       errors.push(`Configured account ${accountRef} was not stored: ${ownRefused.map((row) => row.message).join(' ')}`)
       continue
     }
-    // The row's own account id decides. The code is a fallback ONLY for a row that carries no id. EVERY matching row is
-    // collected: two rows for one account (a repeated id, or an id row and an id-less code row) are not resolved by taking the
-    // first, the account is refused.
-    const matches = [
-      ...parsedAll.filter((row) => row.externalAccountId === account.externalAccountId),
-      ...(account.code && account.codeUnique !== false ? parsedAll.filter((row) => row.externalAccountId === null && row.accountCode === account.code) : []),
-    ]
+    // The row's own account id decides; there is no fallback to the code. EVERY row with the id is collected: two rows for one
+    // account are not resolved by taking the first, the account is refused.
+    const matches = parsedAll.filter((row) => row.externalAccountId === account.externalAccountId)
     if (matches.length > 1) {
       errors.push(`TB_DUPLICATE_ACCOUNT_ROW: the Xero Trial Balance has ${matches.length} rows for ${accountRef} (${matches.map((row) => String(row.amount.toFixed(2))).join(', ')}); nothing was stored for it.`)
       continue
     }
     const parsed = matches[0] ?? null
-    if (!parsed && account.code && account.codeUnique === false && parsedAll.some((row) => row.externalAccountId === null && row.accountCode === account.code)) {
-      errors.push(`TB_CODE_NOT_UNIQUE: code ${account.code} is also held by another account in the current Xero chart and the Trial Balance row for it carries no account id, so it cannot be tied to ${accountRef}; nothing was stored for it.`)
-      continue
-    }
     if (!parsed) {
       const conflicting = account.code
         ? [...parsedAll, ...refusedAll].find((row) => row.accountCode === account.code && row.externalAccountId !== null && row.externalAccountId !== account.externalAccountId)
@@ -470,15 +464,15 @@ export function resolveConfiguredAccounts(codes: string[], chart: XeroChartAccou
       errors.push(`TB_CHART_CODE_UNRESOLVED: configured account code ${code} is held by ${active.length} active accounts in the current Xero chart (it must be exactly one); nothing was stored for it.`)
       continue
     }
-    accounts.push({ externalAccountId: active[0]!.AccountID, code, name: active[0]!.Name, codeUnique: holders.length === 1 })
+    accounts.push({ externalAccountId: active[0]!.AccountID, code, name: active[0]!.Name })
   }
   return { accounts, errors }
 }
 
 /**
  * Resolve against the chart read AFTER the Trial Balance, and accept an account only if the chart read BEFORE it resolves the
- * same code to the same holder (same account id, same code-uniqueness). A code Xero moved between the two reads could otherwise
- * attach an id-less row of the old account to the new one. A row's own account id still decides on its own.
+ * same code to the same holder (same account id). A code Xero moved between the two reads could otherwise make the configured
+ * account a different one from the account the report's rows were produced for. A row's own account id decides which row is whose.
  *
  * ACCEPTED LIMIT: a change that lands and is reverted between the two chart reads cannot be seen.
  */
@@ -489,7 +483,7 @@ export function resolveConfiguredAccountsStable(codes: string[], before: XeroCha
   const errors = [...second.errors]
   for (const account of second.accounts) {
     const earlier = first.accounts.find((candidate) => candidate.code === account.code)
-    if (!earlier || earlier.externalAccountId !== account.externalAccountId || earlier.codeUnique !== account.codeUnique) {
+    if (!earlier || earlier.externalAccountId !== account.externalAccountId) {
       errors.push(`TB_CHART_CHANGED_DURING_PULL: the Xero chart changed for configured account code ${account.code} while the Trial Balance was being read; nothing was stored for it. Pull again.`)
       continue
     }

@@ -5,7 +5,16 @@ import { buildXeroAccountBalanceSnapshotInputs, parseXeroTrialBalanceReport, par
 import { toDecimal } from '@/lib/domain/math/decimal'
 
 const HEADER = { RowType: 'Header', Cells: ['Account', 'Debit', 'Credit', 'YTD Debit', 'YTD Credit'].map((Value) => ({ Value })) }
-const row = (...values: string[]) => ({ RowType: 'Row', Cells: values.map((Value) => ({ Value })) })
+// The live report puts the account UUID on the label cell of EVERY data row (an `account` attribute). `row` models that, deriving a
+// stable id from the code in the label; `rowNoId` is the shape that is now refused.
+const idFor = (label: string): string | null => {
+  const paren = [...label.matchAll(/\(([^)]*\d[^)]*)\)/g)].map((m) => m[1]!).at(-1)
+  const lead = /^(\d[\w.-]*)/.exec(label.trim())?.[1]
+  const code = paren ?? lead
+  return code ? `a-${code}` : null
+}
+const row = (...values: string[]) => ({ RowType: 'Row', Cells: values.map((Value, i) => (i === 0 && idFor(Value) ? { Value, Attributes: [{ Id: 'account', Value: idFor(Value)! }] } : { Value })) })
+const rowNoId = (...values: string[]) => ({ RowType: 'Row', Cells: values.map((Value) => ({ Value })) })
 const report = (...rows: unknown[]) => ({ Reports: [{ Rows: rows }] }) as Parameters<typeof parseXeroTrialBalanceRows>[0]
 
 // The three rows below are REAL rows from the live organisation (report date 2026-10-23).
@@ -76,7 +85,7 @@ test('a non-money cell in a YTD column refuses THAT row by name; the other rows 
 })
 
 test('a null or missing cell value is not an empty string: the row is refused', () => {
-  const nullish = { RowType: 'Row', Cells: [{ Value: 'Null (103)' }, { Value: '' }, { Value: '' }, { Value: null }, { Value: '' }] }
+  const nullish = { RowType: 'Row', Cells: [{ Value: 'Null (103)', Attributes: [{ Id: 'account', Value: 'a-103' }] }, { Value: '' }, { Value: '' }, { Value: null }, { Value: '' }] }
   assert.equal(parseXeroTrialBalanceReport(report(HEADER, nullish)).refusedRows[0]!.code, 'TB_NON_MONEY_CELL')
 })
 
@@ -229,9 +238,25 @@ test('the configured account\'s own id row wins over a different-id row with the
   assert.deepEqual(result.errors, [])
 })
 
-test('the code fallback still applies to a row that carries no id', () => {
-  const result = buildFor([ACCOUNT_631], [row('Inventory Control (631)', '', '', '9', '')])
-  assert.deepEqual(result.snapshots.map((s) => String(s.amountBase)), ['9'])
+test('a row that carries NO account id is refused and never matched by its code', () => {
+  const parsed = parseXeroTrialBalanceReport(report(HEADER, rowNoId('Inventory Control (631)', '', '', '9', '')))
+  assert.deepEqual(parsed.rows, [])
+  assert.equal(parsed.refusedRows[0]!.code, 'TB_ROW_WITHOUT_ACCOUNT_ID')
+  const result = buildFor([ACCOUNT_631], [rowNoId('Inventory Control (631)', '', '', '9', ''), row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /631.*TB_ROW_WITHOUT_ACCOUNT_ID/)
+})
+
+test('an id-less row that names no code at all refuses the whole report', () => {
+  const result = buildFor([ACCOUNT_631], [rowNoId('Mystery Inventory', '', '', '9', ''), row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.snapshots, [])
+  assert.match(result.errors[0]!, /^TB_UNIDENTIFIED_REFUSED_ROW/)
+})
+
+test('LIVE SHAPE: every data row carries the account id on its label cell, and is matched to its account by that id', () => {
+  const result = buildFor([ACCOUNT_631], [row('Inventory Control (631)', '', '', '123639.63', ''), row('Cost of Goods Sold (310)', '', '', '5', '')])
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(result.snapshots.map((s) => [s.accountCode, String(s.amountBase)]), [['631', '123639.63']])
 })
 
 test('a refused row with a different id and the same code is a conflict too, not a zero for the configured account', () => {
@@ -338,18 +363,6 @@ test('an absent account is NOT zero when completeness is unproven, but an accoun
 // ---- duplicates ----------------------------------------------------------------------------------------------------------
 test('two rows with the same account id and different amounts: refused, nothing stored (not the first)', () => {
   const result = buildFor([ACCOUNT_631], [withId('Inventory Control (631)', 'a-631', '100'), withId('Inventory Control (631)', 'a-631', '200')])
-  assert.deepEqual(result.snapshots, [])
-  assert.match(result.errors[0]!, /^TB_DUPLICATE_ACCOUNT_ROW/)
-})
-
-test('two id-less rows for one unique code: refused', () => {
-  const result = buildFor([ACCOUNT_631], [row('Inventory Control (631)', '', '', '100', ''), row('Inventory Control (631)', '', '', '200', '')])
-  assert.deepEqual(result.snapshots, [])
-  assert.match(result.errors[0]!, /^TB_DUPLICATE_ACCOUNT_ROW/)
-})
-
-test('an id row and an id-less code row for the same account: refused', () => {
-  const result = buildFor([ACCOUNT_631], [withId('Inventory Control (631)', 'a-631', '100'), row('Inventory Control (631)', '', '', '200', '')])
   assert.deepEqual(result.snapshots, [])
   assert.match(result.errors[0]!, /^TB_DUPLICATE_ACCOUNT_ROW/)
 })
