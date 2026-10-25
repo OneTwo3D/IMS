@@ -896,6 +896,9 @@ function loadImsFxRates(run: Run): void {
     const label = `${v.currency.trim() || '(blank)'}@${v.fetchedAt.trim()}`
     const reject = (code: string, reason: string) => run.add('ims-fx-rates', row.line, label, 'REJECTED', code, reason)
     if (!currency) { reject('BAD_CURRENCY', `currency ${JSON.stringify(v.currency)} is not a 3-letter code`); continue }
+    // An export (npm run first-load:export-fx-rates) stamps each row with the base currency it was exported against; a different one is a list of another installation's rates.
+    const statedBase = (v.baseCurrency ?? '').trim().toUpperCase()
+    if (statedBase !== '' && statedBase !== run.config.baseCurrency) { reject('BASE_CURRENCY_MISMATCH', `the row was exported against base currency ${statedBase}, but this run's base currency is ${run.config.baseCurrency}`); continue }
     if (currency === run.config.baseCurrency) { reject('BASE_CURRENCY_RATE', `the base currency ${currency} has no fx_rates row`); continue }
     const rate = v.rate.trim()
     if (!/^-?\d+(?:\.\d+)?$/.test(rate)) { reject('BAD_RATE', `rate ${JSON.stringify(v.rate)} is not a plain decimal`); continue }

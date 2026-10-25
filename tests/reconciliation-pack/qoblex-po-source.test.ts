@@ -145,3 +145,16 @@ test('a file that hashes to something else than the manifest declares is unreada
   const r = read(dir)
   assert.ok(r.ok && r.value.stock.ok)
 })
+
+// R7 and R8 compare open orders only. [mutation: refuse a Closed line (BAD_VALUE) instead of dropping it; drop it AFTER the duplicate check; drop every non-open status, not only the mapped CLOSED]
+test('a Closed line of the Incoming report is dropped (R7 and R8 read open orders only), also when repeated; open duplicates still refuse', () => {
+  const open = { po: 'PO1', sku: 'SKU-1', ordered: '10', received: '4', price: '2.5' }
+  const closed = { po: 'PO9', sku: 'SKU-9', ordered: '5', received: '0', price: '1', status: 'Closed' }
+  const read1 = read(withPo(incomingCsv([open, closed, closed])))
+  assert.ok(read1.ok && read1.value.purchaseOrders.ok)
+  assert.deepEqual(read1.value.purchaseOrders.value.lines.map((l) => [l.orderKey, l.sku]), [['PO1', 'SKU-1']])
+  assert.equal(poReason(withPo(incomingCsv([open, open, closed]))), 'DUPLICATE_KEY')
+  assert.equal(poReason(withPo(incomingCsv([open, { ...closed, status: 'Received' }]))), 'SOURCE_UNREADABLE', 'an unmapped status is still refused at the map, never dropped')
+  const onlyClosed = read(withPo(incomingCsv([closed])))
+  assert.ok(onlyClosed.ok && onlyClosed.value.purchaseOrders.ok && onlyClosed.value.purchaseOrders.value.lines.length === 0)
+})
