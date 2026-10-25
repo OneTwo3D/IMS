@@ -7,8 +7,6 @@
  * assertion nobody checked. Every problem is collected, so one run shows the whole list.
  */
 import path from 'node:path'
-import { NUMERIC_LIMITS } from '../spec'
-import { D, parseDecimal, fmt } from '../money'
 import { normaliseStoreOrigin, parseVisibilityAttestation, type VisibilityAttestation } from '../snapshot'
 import {
   APPLY_MANIFEST_KEYS, APPLY_STEP_IDS, APPLY_WOO_SNAPSHOT_KEYS, RUN_ID_PATTERN, STEP_PREREQUISITES, SUPPORTED_BASE_CURRENCY, WAREHOUSE_PROFILE_KEYS, WAREHOUSE_TYPES,
@@ -56,7 +54,6 @@ export class ApplyManifestError extends Error {
 }
 
 const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._ -]{0,39}$/
-const CURRENCY_PATTERN = /^[A-Za-z]{3}$/
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
