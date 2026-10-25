@@ -193,3 +193,36 @@ test('the evidence probe: an order with no posted invoice owes nothing yet (the 
   const o = await heldOrder()
   assert.equal(await oi.wcReceiptRegistrationSeams.obligationIsOnRecord(o.id, 'any'), true)
 })
+
+// ONCE A PAYMENT IS COMMITTED, ANY failure of the registration or its proof is a retryable receipt obligation: the row stays PENDING (never FAILED), names the paymentId, and the
+// scheduled FX-refresh retry (lib/currencies/fx-refresh.ts -> retryPendingWcOrdersWaitingForFx, run by app/api/cron/fx-rates) re-drives that receipt once.
+// [mutation: let a generic error reach the FAILED catch; drop the paymentId from the queue row; drop the by-id redrive]
+test('a GENERIC failure in the proof keeps the pending-FX row PENDING with the paymentId; the scheduled retry registers that receipt exactly once', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  const log = await s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(o.wcId), payload: {} } })
+  const p = payload(Number(o.wcId), '2026-10-01T10:00:00')
+  const real = oi.wcReceiptRegistrationSeams.obligationIsOnRecord
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async () => { throw new Error('transient database read failure') }
+  try {
+    const r1 = await oi.importWcOrder(p, { pendingFxRetryLogId: log.id })
+    assert.equal(r1.success, false)
+  } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real }
+  const pays = await payments(o.id)
+  assert.equal(pays.length, 1)
+  const row = await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })
+  assert.equal(row.status, 'PENDING', 'never FAILED')
+  assert.equal((row.payload as { receiptPaymentId?: string }).receiptPaymentId, pays[0]!.id)
+  const before = registrations.filter((r) => r.paymentId === pays[0]!.id).length
+  // the evidence appears once the receipt has been registered a second time (the retry)
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_order: string, paymentId: string) => registrations.filter((r) => r.paymentId === paymentId).length >= before + 1
+  const swept = await oi.retryPendingWcOrdersWaitingForFx()
+  assert.ok(swept.attempted >= 1)
+  assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })).status, 'SYNCED')
+  assert.equal((await payments(o.id)).length, 1, 'still one Payment')
+  assert.equal(registrations.filter((r) => r.paymentId === pays[0]!.id).length, before + 1, 'the scheduled retry registered the receipt once')
+  await oi.retryPendingWcOrdersWaitingForFx()
+  assert.equal(registrations.filter((r) => r.paymentId === pays[0]!.id).length, before + 1, 'and not again')
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real
+})

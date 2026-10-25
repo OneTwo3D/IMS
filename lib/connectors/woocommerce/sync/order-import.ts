@@ -68,6 +68,8 @@ export type ImportWcOrderOptions = {
   skipAccounting?: boolean
   useWcDateAsCreatedAt?: boolean
   pendingFxRetryLogId?: string
+  /** The stored receipt a pending-FX retry row is waiting to register (its payload's `receiptPaymentId`). */
+  receiptPaymentId?: string
   /**
    * How this import may CREATE an order IMS has never seen (o3d-tj6v r5).
    *
@@ -116,6 +118,8 @@ export type PendingFxOrderPayload = {
   currency: string
   asOf: string | null
   order: WcFullOrder
+  /** Set when the row holds a stored receipt's registration obligation: the retry re-registers THIS receipt (by id). */
+  receiptPaymentId?: string
 }
 
 export function shouldBlockWcTaxRateFallback(lines: WcTaxRateFallbackLine[]): boolean {
@@ -624,7 +628,7 @@ export function reconcileWcDocumentTax(
 
 export function buildPendingFxOrderPayload(
   wcOrder: WcFullOrder,
-  error: { currency: string; asOf?: Date },
+  error: { currency: string; asOf?: Date; paymentId?: string },
 ): PendingFxOrderPayload {
   return {
     reason: MISSING_FX_RATE_QUEUE_REASON,
@@ -634,6 +638,7 @@ export function buildPendingFxOrderPayload(
     currency: error.currency,
     asOf: error.asOf?.toISOString() ?? null,
     order: wcOrder,
+    ...(error.paymentId ? { receiptPaymentId: error.paymentId } : {}),
   }
 }
 
@@ -669,7 +674,7 @@ async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'us
 
 async function recordPendingFxOrder(
   wcOrder: WcFullOrder,
-  error: { message: string; currency: string; asOf?: Date },
+  error: { message: string; currency: string; asOf?: Date; paymentId?: string },
   retryLogId?: string,
 ): Promise<void> {
   const payload = buildPendingFxOrderPayload(wcOrder, error)
@@ -809,8 +814,8 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
  * for this receipt (`invoice_payment_not_registered`, which names the hand remedy). The throw case (`invoice_payment_not_queued`) is none of these.
  */
 export class WcReceiptRegistrationNotRecorded extends Error {
-  constructor(readonly orderId: string, readonly paymentId: string, readonly currency: string) {
-    super(`the receipt ${paymentId} of order ${orderId} is stored but its ledger registration is not on record yet; it is retried`)
+  constructor(readonly orderId: string, readonly paymentId: string | null, readonly currency: string, readonly causeText?: string) {
+    super(`the receipt ${paymentId ?? '(not yet known)'} of order ${orderId} is stored but its ledger registration is not on record yet; it is retried${causeText ? ` (${causeText})` : ''}`)
     this.name = 'WcReceiptRegistrationNotRecorded'
   }
 }
@@ -832,6 +837,17 @@ export const wcReceiptRegistrationSeams = { obligationIsOnRecord: wcReceiptOblig
 
 /** Register one stored receipt and prove the obligation is on record, or throw so the caller keeps the work queued. */
 async function registerWcReceiptAndProveObligation(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
+  // ONCE A PAYMENT IS COMMITTED, EVERY FAILURE HERE IS A RETRYABLE RECEIPT OBLIGATION, never a failed import: whatever is thrown (a transient read in the proof, the
+  // registration itself) becomes WcReceiptRegistrationNotRecorded carrying the paymentId, so the pending-FX row stays PENDING and names the receipt to re-drive.
+  try {
+    await registerWcReceiptAndProveObligationUnguarded(orderId, reference, receipt)
+  } catch (error) {
+    if (error instanceof WcReceiptRegistrationNotRecorded) throw error
+    throw new WcReceiptRegistrationNotRecorded(orderId, receipt.id, receipt.currency, error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function registerWcReceiptAndProveObligationUnguarded(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
   const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
   await registerInvoicePaymentWithLedger({
     orderId,
@@ -848,16 +864,26 @@ async function registerWcReceiptAndProveObligation(orderId: string, reference: s
 }
 
 /** Receipts this path recorded earlier whose registration never reached the record (the call failed): registered again, idempotently. */
-async function redriveUnregisteredWcReceipts(orderId: string): Promise<void> {
-  const receipts = await db.payment.findMany({
-    where: { orderId, refundId: null, notes: { startsWith: 'Recorded from WooCommerce' } },
+async function redriveUnregisteredWcReceipts(orderId: string, receiptPaymentId?: string): Promise<void> {
+  let receipts
+  try {
+    receipts = await redriveCandidates(orderId, receiptPaymentId)
+  } catch (error) {
+    throw new WcReceiptRegistrationNotRecorded(orderId, receiptPaymentId ?? null, 'n/a', error instanceof Error ? error.message : String(error))
+  }
+  for (const r of receipts) {
+    if (await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, r.id).catch(() => false)) continue
+    await registerWcReceiptAndProveObligation(orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? orderId, r)
+  }
+}
+
+async function redriveCandidates(orderId: string, receiptPaymentId?: string) {
+  return db.payment.findMany({
+    // by the stored payment id the pending row names, and by the notes this path writes
+    where: { orderId, refundId: null, OR: [{ notes: { startsWith: 'Recorded from WooCommerce' } }, ...(receiptPaymentId ? [{ id: receiptPaymentId }] : [])] },
     select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { externalOrderNumber: true, orderNumber: true } } },
     orderBy: { createdAt: 'asc' },
   })
-  for (const r of receipts) {
-    if (await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, r.id)) continue
-    await registerWcReceiptAndProveObligation(orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? orderId, r)
-  }
 }
 
 type WcPaidTransition =
@@ -939,13 +965,13 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
   await registerWcReceiptAndProveObligation(orderId, claimed.reference, { ...claimed.receipt, settlementRateToBase: settlementRate })
 }
 
-export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder): Promise<void> {
+export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string): Promise<void> {
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
   if (transition.kind === 'record') await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate)
   if (transition.kind === 'blocked') throw transition.error
   // An order already paid in IMS: any receipt this path recorded whose registration never reached the record is registered again (idempotent).
-  if (transition.kind === 'none' && wcOrder.date_paid_gmt) await redriveUnregisteredWcReceipts(orderId)
+  if (transition.kind === 'none' && wcOrder.date_paid_gmt) await redriveUnregisteredWcReceipts(orderId, receiptPaymentId)
 }
 
 async function updateExistingWcOrderCore(
@@ -2014,7 +2040,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       },
     })
     if (existing) {
-      await updateExistingWcOrderFromPayload(existing.id, wcOrder)
+      await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId)
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
       // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
       // import that created the order is still between its create transaction and its
@@ -3049,7 +3075,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     return { success: true, orderId: so.id }
   } catch (e) {
     if (e instanceof WcReceiptRegistrationNotRecorded) {
-      await recordPendingFxOrder(wcOrder, { message: e.message, currency: e.currency }, options.pendingFxRetryLogId)
+      await recordPendingFxOrder(wcOrder, { message: e.message, currency: e.currency, ...(e.paymentId ? { paymentId: e.paymentId } : options.receiptPaymentId ? { paymentId: options.receiptPaymentId } : {}) }, options.pendingFxRetryLogId)
       return { success: false, error: `${e.message}; kept in the retry queue` }
     }
     if (isMissingFxRateError(e)) {
@@ -3113,11 +3139,12 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
     // acknowledges, and this retry would then import the STALE processing
     // snapshot with no marker, leaving it warehouse-eligible until the next
     // reconciliation — not a millisecond window.
-    const queuedOrder = row.payload.order
+    const queuedPayload = row.payload
+    const queuedOrder = queuedPayload.order
     const { importWcOrderGuarded } = await import('./withdrawal')
     const guarded = await importWcOrderGuarded(
       queuedOrder,
-      () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id }),
+      () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id, ...(queuedPayload.receiptPaymentId ? { receiptPaymentId: queuedPayload.receiptPaymentId } : {}) }),
     )
     if (guarded.outcome === 'skipped-withdrawal') {
       // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
@@ -3156,7 +3183,7 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
       )
     } else if (importResult.success) {
       result.imported++
-    } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh')) {
+    } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh') || importResult.error?.includes('kept in the retry queue')) {
       result.stillPending++
     } else {
       result.failed++
