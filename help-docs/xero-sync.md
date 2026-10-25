@@ -1491,6 +1491,14 @@ run that records tax-rate drift).
     (`TYPE_NOT_USABLE_ON_EXPENSES`), a rate that four decimals cannot hold (`RATE_NOT_REPRESENTABLE`), components that disagree with the rate
     (`RATE_INCONSISTENT`), a non-recoverable component, a name already used by an active rate (`NAME_COLLISION`) or several existing rates for
     the type (`AMBIGUOUS_EXISTING_RATES`) gets a named refusal and **no row**. A rate is never invented.
+  - **One set of rates (Xero master).** Each IMS tax rate corresponds to exactly one **active** Xero tax type with the **same percentage**: Xero's
+    `EffectiveRate` (stored as `effective_rate`), else `DisplayTaxRate` (`display_tax_rate`). The action mirrors the **sales** side under the same
+    rules: it creates the missing **Sales** rate for `OUTPUT2`, `ZERORATEDOUTPUT` and every other active Xero type that applies to revenue and not to
+    expenses (reduced-rate, EC and OSS types included); a type Xero does not allow on revenue is refused (`TYPE_NOT_USABLE_ON_REVENUE`). A rate whose
+    percentage differs from Xero's is **reported** and is corrected only with *replace* ticked, by creating a **new** rate and deactivating the old one
+    (never by editing a referenced rate; the default rate is never replaced). The result carries a machine-readable **rate set**
+    (type, name, Xero percentage, side, country, IMS id, status) for a later storefront sync (no WooCommerce write happens here) and lists the
+    active rates that have **no Xero tax type** (for example per-country storefront rates): no single set can contain them.
   - **Sales-side rates on purchases (opt-in).** With *narrow* ticked, an active **Both** rate whose Xero tax type is sales-only (can apply to
     revenue, not to expenses) becomes **Sales** only, so it can no longer be picked on a purchase; each change is reported with the number of
     suppliers and purchase lines that reference it. Refused (`NARROW_REQUIRES_PURCHASE_ROWS`) unless every purchase type is satisfied.

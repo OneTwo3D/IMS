@@ -34,7 +34,7 @@ const XERO_LIST = [
   xeroRow('ZERORATEDOUTPUT', { name: 'Zero Rated Income', effectiveRate: '0.000000', displayTaxRate: '0.000000', components: [{ name: 'Zero', rate: '0.000000', compound: false, nonRecoverable: false }], expenses: false, revenue: true }),
 ]
 
-type ImsRow = { id: string; name: string; rate: string; usedFor: string; active: boolean; accountingTaxType: string | null; isDefault: boolean; refs?: number }
+type ImsRow = { countryCode?: string | null; id: string; name: string; rate: string; usedFor: string; active: boolean; accountingTaxType: string | null; isDefault: boolean; refs?: number }
 type State = { rates: ImsRow[]; list: NormalisedXeroTaxRate[] | null; tenant?: string; fetchedAt?: Date; stamp?: string | null; headerDigest?: string; settings?: Record<string, string>; rowCount?: number }
 
 const decimal = (s: string) => ({ toFixed: (dp?: number) => (dp === undefined ? s : Number(s).toFixed(dp)) })
@@ -68,7 +68,7 @@ function client(state: State) {
     },
     taxRate: {
       findMany: async () => state.rates.map((r) => ({
-        id: r.id, name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault,
+        id: r.id, name: r.name, rate: decimal(r.rate), usedFor: r.usedFor, active: r.active, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault, countryCode: r.countryCode ?? null,
         _count: { supplierTaxRate: r.refs ?? 0, poLines: r.refs ?? 0, orderLines: 0, shoppingTaxRateMappings: 0 },
       })),
     },
@@ -281,4 +281,54 @@ test('the reverse-charge purchase tax type the settings name is reported (no row
 test('an unlisted type name is not a tax type', async () => {
   const p = await plan({ rates: [], list: XERO_LIST }, { types: ['bad type!'] })
   assert.deepEqual(codes(p), ['TYPE_NOT_VALID:bad type!'])
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// One set of rates, Xero master: the sales side, differing percentages, the rate set and the rows no set can contain.
+
+const REDUCED = xeroRow('OUTPUT5', { name: '5% (VAT on Income)', effectiveRate: '5.000000', displayTaxRate: '5.000000', components: [{ name: 'VAT', rate: '5.000000', compound: false, nonRecoverable: false }], expenses: false, revenue: true })
+
+// [mutation: the `options.mirrorSales` gate removed -> the default plan creates sales rows; the SALES side mapped to usedFor PURCHASE in the write -> red]
+test('sales mirroring creates the missing SALES rate for a revenue-only Xero type, under the same rules, and only when asked', async () => {
+  const state: State = { rates: stageRates(), list: [...XERO_LIST, REDUCED, xeroRow('OLDOUT', { status: 'ARCHIVED', expenses: false, revenue: true })] }
+  assert.deepEqual((await plan(state)).salesTypes, [], 'default: purchase side only')
+  const p = await plan(state, { mirrorSales: true })
+  assert.deepEqual(p.salesTypes, ['OUTPUT2', 'OUTPUT5', 'ZERORATEDOUTPUT'], 'an ARCHIVED type is not in scope')
+  assert.deepEqual(p.creates.filter((c) => c.side === 'SALES').map((c) => [c.taxType, c.name, c.rate]), [['OUTPUT5', '5% (VAT on Income)', '0.0500']], 'OUTPUT2 / ZERORATEDOUTPUT already have their BOTH rows')
+  const { calls } = await applyTo(state, p)
+  assert.equal(calls.find((c) => c.op === 'create' && c.data!.accountingTaxType === 'OUTPUT5')!.data!.usedFor, 'SALES')
+  const forced = await plan({ rates: [], list: XERO_LIST.map((r) => (r.taxType === 'ZERORATEDOUTPUT' ? { ...r, canApply: { ...r.canApply, revenue: null } } : r)) }, { mirrorSales: true, types: [] })
+  assert.ok(codes(forced).includes('TYPE_NOT_USABLE_ON_REVENUE:ZERORATEDOUTPUT'), 'a default sales type that Xero does not allow on revenue is refused by name')
+})
+
+// [mutation: the percentage comparison removed -> nothing is reported; the replace branch edits the old row's rate instead of creating -> red]
+test('a rate whose percentage differs from Xero is reported, and corrected only by a NEW row and a deactivated old one (opt-in), never by an edit', async () => {
+  const state: State = { rates: [ims('old', 'Old UK VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500', refs: 3 }), ims('in', 'Input old', 'PURCHASE', 'INPUT2', { rate: '0.1500' })], list: XERO_LIST }
+  const reported = await plan(state, { mirrorSales: true })
+  assert.deepEqual(reported.differs.map((d) => [d.taxType, d.side, d.imsRate, d.xeroRate, d.replaced, d.references.suppliers]).sort(), [['INPUT2', 'PURCHASE', '0.1500', '0.2000', false, 0], ['OUTPUT2', 'SALES', '0.1500', '0.2000', false, 3]])
+  assert.equal(reported.creates.some((c) => c.taxType === 'OUTPUT2' || c.taxType === 'INPUT2'), false, 'default: reported only')
+  assert.deepEqual(reported.rateSet.filter((e) => e.status === 'differs').map((e) => e.taxType).sort(), ['INPUT2', 'OUTPUT2'])
+  const replaced = await plan(state, { mirrorSales: true, replaceDiffering: true })
+  const before = JSON.stringify(state.rates.map((r) => [r.id, r.rate, r.accountingTaxType, r.name]))
+  const { calls } = await applyTo(state, replaced)
+  const newSales = calls.find((c) => c.op === 'create' && c.data!.accountingTaxType === 'OUTPUT2')!.data!
+  assert.deepEqual([newSales.rate, newSales.usedFor, newSales.name], ['0.2000', 'SALES', '20% (VAT on Income)'])
+  assert.deepEqual(state.rates.filter((r) => ['old', 'in'].includes(r.id)).map((r) => [r.rate, r.accountingTaxType, r.active]), [['0.1500', 'OUTPUT2', false], ['0.1500', 'INPUT2', false]], 'the old rows keep rate and type; they are only deactivated')
+  assert.equal(JSON.stringify(state.rates.filter((r) => ['old', 'in'].includes(r.id)).map((r) => [r.id, r.rate, r.accountingTaxType, r.name])), JSON.stringify(JSON.parse(before)), 'no existing row was edited')
+  assert.equal((await plan(state, { mirrorSales: true, replaceDiffering: true })).creates.length, 0, 're-run: nothing to do')
+  // The default rate is never replaced.
+  const dflt = await plan({ rates: [ims('d', 'Default VAT', 'BOTH', 'OUTPUT2', { rate: '0.1500', isDefault: true })], list: XERO_LIST }, { mirrorSales: true, replaceDiffering: true, types: [] })
+  assert.deepEqual(dflt.differs.map((d) => [d.replaced, d.keptBecause]), [[false, 'IS_DEFAULT_RATE']])
+})
+
+// [mutation: the unmapped scan removed / rateSet entries dropped -> red]
+test('the rate set lists every in-scope type with Xero\'s percentage and side; rows with no Xero type (per-country storefront rates) are reported as unmapped', async () => {
+  const state: State = { rates: [...stageRates(), ims('se', 'Sweden 25%', 'SALES', null, { rate: '0.2500', countryCode: 'se' } as never)], list: [...XERO_LIST, REDUCED] }
+  const p = await plan(state, { mirrorSales: true })
+  const set = p.rateSet.map((e) => [e.taxType, e.side, e.percentage, e.status]).sort()
+  assert.deepEqual(set, [
+    ['INPUT2', 'PURCHASE', '20.000000', 'created'], ['NONE', 'PURCHASE', '0.000000', 'created'], ['OUTPUT2', 'SALES', '20.000000', 'present'], ['OUTPUT5', 'SALES', '5.000000', 'created'],
+    ['ZERORATEDINPUT', 'PURCHASE', '0.000000', 'created'], ['ZERORATEDOUTPUT', 'SALES', '0.000000', 'present'],
+  ])
+  assert.deepEqual(p.unmapped.map((u) => [u.id, u.rate]), [['se', '0.2500']])
 })

@@ -601,11 +601,11 @@ export type PurchaseTaxImportActionResult =
  * READ-ONLY. What "Import purchase tax rates from Xero" would do with the current options: the rates it would create, the sales-side rates it would narrow, the rates
  * Xero does not list, and every refusal by code. Reads the STORED Xero list; never calls Xero.
  */
-export async function previewPurchaseTaxImport(input: { narrowSalesTypes?: boolean; deactivateAbsent?: boolean } = {}): Promise<PurchaseTaxImportActionResult> {
+export async function previewPurchaseTaxImport(input: { narrowSalesTypes?: boolean; deactivateAbsent?: boolean; replaceDiffering?: boolean } = {}): Promise<PurchaseTaxImportActionResult> {
   await requirePermission('settings.company')
   try {
     const { runPurchaseTaxImport } = await import('@/lib/tax/purchase-tax-import')
-    const result = await runPurchaseTaxImport({ apply: false, narrowSalesTypes: input.narrowSalesTypes === true, deactivateAbsent: input.deactivateAbsent === true })
+    const result = await runPurchaseTaxImport({ apply: false, narrowSalesTypes: input.narrowSalesTypes === true, deactivateAbsent: input.deactivateAbsent === true, replaceDiffering: input.replaceDiffering === true, mirrorSales: true })
     return { success: true, applied: false, wrote: false, plan: result.plan }
   } catch (e) {
     unstable_rethrow(e)
@@ -617,11 +617,11 @@ export async function previewPurchaseTaxImport(input: { narrowSalesTypes?: boole
  * Create the missing PURCHASE tax rates (INPUT2, ZERORATEDINPUT, NONE) from the stored Xero list, and - only when asked - narrow sales-side BOTH rates to SALES and
  * deactivate rates Xero does not list. Idempotent; never deletes; never changes the rate or type of an existing row; never writes to Xero (see lib/tax/purchase-tax-import.ts).
  */
-export async function importPurchaseTaxRatesFromXero(input: { narrowSalesTypes?: boolean; deactivateAbsent?: boolean } = {}): Promise<PurchaseTaxImportActionResult> {
+export async function importPurchaseTaxRatesFromXero(input: { narrowSalesTypes?: boolean; deactivateAbsent?: boolean; replaceDiffering?: boolean } = {}): Promise<PurchaseTaxImportActionResult> {
   await requirePermission('settings.company')
   try {
     const { runPurchaseTaxImport } = await import('@/lib/tax/purchase-tax-import')
-    const result = await runPurchaseTaxImport({ apply: true, narrowSalesTypes: input.narrowSalesTypes === true, deactivateAbsent: input.deactivateAbsent === true })
+    const result = await runPurchaseTaxImport({ apply: true, narrowSalesTypes: input.narrowSalesTypes === true, deactivateAbsent: input.deactivateAbsent === true, replaceDiffering: input.replaceDiffering === true, mirrorSales: true })
     const { plan } = result
     // POST-COMMIT: the rows are already written; a failure to log or revalidate must not read as a failed import.
     const postCommit = await runPostCommit(async () => {

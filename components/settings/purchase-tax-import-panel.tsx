@@ -13,13 +13,14 @@ import { importPurchaseTaxRatesFromXero, previewPurchaseTaxImport, type Purchase
 export function PurchaseTaxImportPanel() {
   const [narrow, setNarrow] = useState(false)
   const [deactivate, setDeactivate] = useState(false)
+  const [replace, setReplace] = useState(false)
   const [busy, setBusy] = useState<'preview' | 'import' | null>(null)
   const [result, setResult] = useState<PurchaseTaxImportActionResult | null>(null)
 
   async function run(kind: 'preview' | 'import') {
     setBusy(kind)
     try {
-      const options = { narrowSalesTypes: narrow, deactivateAbsent: deactivate }
+      const options = { narrowSalesTypes: narrow, deactivateAbsent: deactivate, replaceDiffering: replace }
       setResult(kind === 'preview' ? await previewPurchaseTaxImport(options) : await importPurchaseTaxRatesFromXero(options))
     } catch {
       setResult({ success: false, error: 'An unexpected error occurred.' })
@@ -40,6 +41,10 @@ export function PurchaseTaxImportPanel() {
       <label className="flex items-center gap-2 text-xs">
         <input type="checkbox" checked={deactivate} onChange={(e) => setDeactivate(e.target.checked)} />
         Also deactivate rates whose tax type Xero does not list as active (for example leftover demo-organisation rates)
+      </label>
+      <label className="flex items-center gap-2 text-xs">
+        <input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} />
+        Also replace rates whose percentage differs from Xero&apos;s (a new rate is created and the old one deactivated; the old one is never edited)
       </label>
       <div className="flex items-center gap-2">
         <Button variant="outline" size="sm" onClick={() => run('preview')} disabled={busy !== null}>
@@ -63,6 +68,9 @@ export function PurchaseTaxImportPanel() {
           {result.plan.refusals.length > 0 && (
             <p className="text-destructive">Refused: {result.plan.refusals.map((r) => `${r.code}${r.taxType ? ` (${r.taxType})` : ''}: ${r.detail}`).join('; ')}</p>
           )}
+          {result.plan.differs.length > 0 && <p>Percentage differs from Xero: {result.plan.differs.map((d) => `${d.name} (${d.taxType}) IMS ${d.imsRate} vs Xero ${d.xeroRate}${d.replaced ? ' - replaced' : ''}`).join('; ')}</p>}
+          {result.plan.unmapped.length > 0 && <p>No Xero tax type (no counterpart in the single rate set): {result.plan.unmapped.map((u) => `${u.name}${u.countryCode ? ` [${u.countryCode}]` : ''}`).join('; ')}</p>}
+          <p className="text-muted-foreground">Rate set: {result.plan.rateSet.length} entr{result.plan.rateSet.length === 1 ? 'y' : 'ies'} (in the action result for the storefront sync).</p>
           {result.plan.notes.map((n) => <p key={n} className="text-muted-foreground">{n}</p>)}
         </div>
       )}

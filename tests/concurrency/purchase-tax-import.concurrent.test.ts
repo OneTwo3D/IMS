@@ -183,3 +183,28 @@ test('a connection that changes between the plan and the write discards the writ
     assert.deepEqual([control.wrote, (await mine(deps)).length], [true, 3], 'control: with no rebind the same call writes')
   } finally { await restoreForeign(deps, foreign) }
 })
+
+// [mutation: the replaced row's rate edited in place instead of a new row -> red]
+test('sales mirroring and replacement are committed: a differing referenced rate keeps its rate and type, a new row carries Xero\'s percentage, the old one is only deactivated', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const { db } = deps
+  try {
+    await cleanRates(deps)
+    await seed(deps, [...LIST(), xero('ZQPTIOUT5', 'Reduced', '5.000000', { expenses: false, revenue: true })])
+    const old = await db.taxRate.create({ data: { name: `${TAG}Old reduced`, rate: '0.04', usedFor: 'BOTH', accountingTaxType: 'ZQPTIOUT5', active: true } })
+    const supplier = await db.supplier.create({ data: { name: `${TAG}Supplier2`, taxRateId: old.id } })
+    const reported = await deps.imp.runPurchaseTaxImport({ apply: true, types: [], mirrorSales: true })
+    assert.deepEqual(reported.plan.differs.filter((d) => d.id === old.id).map((d) => [d.imsRate, d.xeroRate, d.replaced, d.references.suppliers]), [['0.0400', '0.0500', false, 1]])
+    assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: old.id } })).active, true, 'default: reported only')
+    const replaced = await deps.imp.runPurchaseTaxImport({ apply: true, types: [], mirrorSales: true, replaceDiffering: true })
+    assert.equal(replaced.wrote, true)
+    const oldNow = await db.taxRate.findUniqueOrThrow({ where: { id: old.id } })
+    assert.deepEqual([oldNow.rate.toFixed(4), oldNow.accountingTaxType, oldNow.active], ['0.0400', 'ZQPTIOUT5', false])
+    const fresh = await db.taxRate.findMany({ where: { accountingTaxType: 'ZQPTIOUT5', active: true } })
+    assert.deepEqual(fresh.map((r) => [r.rate.toFixed(4), r.usedFor]), [['0.0500', 'SALES']])
+    assert.equal((await db.supplier.findUniqueOrThrow({ where: { id: supplier.id } })).taxRateId, old.id, 'documents keep pointing at the unchanged row')
+    const rate = replaced.plan.rateSet.find((e) => e.taxType === 'ZQPTIOUT5')!
+    assert.deepEqual([rate.percentage, rate.side, rate.status], ['5.000000', 'SALES', 'created'])
+    assert.equal((await deps.imp.runPurchaseTaxImport({ apply: true, types: [], mirrorSales: true, replaceDiffering: true })).wrote, false)
+  } finally { await cleanRates(deps) }
+})
