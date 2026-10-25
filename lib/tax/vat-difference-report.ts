@@ -222,10 +222,13 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
     const reference = xeroPct ?? imsPct
     const wooPct = new Dec(rate.rate)
     if (!wooPct.eq(reference)) add('WOO_PERCENTAGE_MISMATCH', 'woo', rate.id, label, ids, { xero: xeroPct === null ? null : text(xeroPct), ims: text(imsPct), woo: text(wooPct) })
-    if (ims.countryCode !== null && rate.country.trim().toUpperCase() !== ims.countryCode.trim().toUpperCase()) {
-      add('WOO_COUNTRY_MISMATCH', 'woo', rate.id, label, ids, { ims: ims.countryCode, woo: rate.country === '' ? '(any)' : rate.country })
-    }
-    if (mapping.externalClass !== null && normalClass(rate.class) !== normalClass(mapping.externalClass)) {
+    // SCOPE, both ways: an empty country (Woo) and a null country (IMS) both mean "everywhere", so a country-specific rate on one side and a global one on the other is a difference.
+    const imsScope = (ims.countryCode ?? '').trim().toUpperCase()
+    const wooScope = rate.country.trim().toUpperCase()
+    if (imsScope !== wooScope) add('WOO_COUNTRY_MISMATCH', 'woo', rate.id, label, ids, { ims: imsScope === '' ? '(any)' : imsScope, woo: wooScope === '' ? '(any)' : wooScope })
+    // CLASS: the importer stores `wcRate.class || null` (lib/connectors/woocommerce/sync/taxes.ts), so a null recorded class is the store's empty = standard class,
+    // and is compared with the live class like any other.
+    if (normalClass(rate.class) !== normalClass(mapping.externalClass)) {
       add('WOO_CLASS_MISMATCH', 'woo', rate.id, label, ids, { ims: normalClass(mapping.externalClass), woo: normalClass(rate.class) })
     }
     if (rate.compound !== ims.isCompound) add('WOO_COMPOUND_MISMATCH', 'woo', rate.id, label, ids, { ims: String(ims.isCompound), woo: String(rate.compound) })

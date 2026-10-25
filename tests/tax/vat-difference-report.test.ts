@@ -104,6 +104,23 @@ test('a percentage mismatch shows BOTH values; Woo is held to Xero, not to a wro
   assert.deepEqual([woo.xero, woo.ims, woo.woo], ['20', '19', '19'], 'Woo agrees with IMS but both differ from the master')
 })
 
+// [mutation: the country check skipped for a global IMS rate / the class check skipped for a null recorded class -> red]
+test('scope is compared both ways, and a null recorded class is the standard class', () => {
+  const run = (mut: Mutate) => { const s = baseline(); mut(s); return compareVatSets(s).differences.filter((d) => d.reason === 'WOO_COUNTRY_MISMATCH' || d.reason === 'WOO_CLASS_MISMATCH') }
+  // global IMS rate, GB-only Woo rate
+  const a = run((s) => { s.snapshot.rates[0]!.countryCode = null })
+  assert.deepEqual(a.map((d) => [d.reason, d.ims, d.woo]), [['WOO_COUNTRY_MISMATCH', '(any)', 'GB']])
+  // country IMS rate, global Woo rate
+  const b = run((s) => { s.woo[0] = wooRate('1', '20.0000', { country: '' }) })
+  assert.deepEqual(b.map((d) => [d.reason, d.ims, d.woo]), [['WOO_COUNTRY_MISMATCH', 'GB', '(any)']])
+  // both global: equal
+  assert.deepEqual(run((s) => { s.snapshot.rates[0]!.countryCode = null; s.woo[0] = wooRate('1', '20.0000', { country: '' }) }), [])
+  // null recorded class + live reduced -> difference; + live standard -> none
+  const c = run((s) => { s.snapshot.mappings[0]!.externalClass = null; s.woo[0] = wooRate('1', '20.0000', { class: 'reduced-rate' }) })
+  assert.deepEqual(c.map((d) => [d.reason, d.ims, d.woo]), [['WOO_CLASS_MISMATCH', 'standard', 'reduced-rate']])
+  assert.deepEqual(run((s) => { s.snapshot.mappings[0]!.externalClass = null }), [])
+})
+
 test('purchase-only and reverse-charge IMS rates need no storefront rate; a zero rate with shipping off is not a difference', () => {
   const s = baseline()
   s.snapshot.rates.push(imsRate('rc', 'OUTPUT2', '0.2000', { reverseCharge: true, usedFor: 'SALES' }), imsRate('xx', null, '0.0000', { usedFor: 'PURCHASE' }))
