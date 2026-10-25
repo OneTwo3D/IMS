@@ -300,7 +300,7 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   await precondition(d)
   const w = await seedWorld(d)
   const { db } = d
-  const frozen = async (id: string) => { const r = await db.taxRate.findUniqueOrThrow({ where: { id }, include: { components: { orderBy: { sortOrder: 'asc' } } } }); const rest: Record<string, unknown> = { ...r }; for (const k of ['active', 'isDefault', 'updatedAt']) delete rest[k]; return JSON.stringify(rest) }
+  const frozen = async (id: string) => { const r = await db.taxRate.findUniqueOrThrow({ where: { id }, include: { components: { orderBy: { sortOrder: 'asc' } } } }); const rest: Record<string, unknown> = { ...r }; for (const k of ['active', 'isDefault', 'updatedAt', 'replacedById']) delete rest[k]; return JSON.stringify(rest) }
   const oldBefore = { cy: await frozen(w.ids.cy), gr: await frozen(w.ids.gr), be: await frozen(w.ids.be), bg: await frozen(w.ids.bg), amb: await frozen(w.ids.amb), pct: await frozen(w.ids.pct), nope: await frozen(w.ids.nope) }
   const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
   assert.deepEqual([preview.references[w.ids.gr]!.pendingRefunds, preview.references[w.ids.gr]!.pendingRefundLines, preview.references[w.ids.gr]!.refundSnapshotConflict], [1, 1, false])
@@ -327,6 +327,7 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   // Components: a stale Demo code is cleared on the NEW row only; a built-in is kept; the old rows' components are untouched (the frozen snapshot above).
   assert.deepEqual(fresh.map((r) => [r.name.slice(TAG.length), r.components[0]?.accountingTaxType ?? null]), [['BE VAT', null], ['CY VAT', null], ['GR VAT', 'OUTPUT2']])
   assert.equal((await db.taxRateComponent.findFirstOrThrow({ where: { taxRateId: w.ids.cy } })).accountingTaxType, code('DEMO'), 'the referenced old row keeps its component as it was')
+  assert.deepEqual((await db.taxRate.findMany({ where: { id: { in: [w.ids.cy, w.ids.gr, w.ids.be] } }, select: { replacedById: true }, orderBy: { name: 'asc' } })).map((r) => r.replacedById), [fresh.find((r) => r.name === `${TAG}BE VAT`)!.id, fresh.find((r) => r.name === `${TAG}CY VAT`)!.id, fresh.find((r) => r.name === `${TAG}GR VAT`)!.id], 'each retired row points at its replacement')
   const newId = (name: string) => fresh.find((r) => r.name === `${TAG}${name}`)!.id
 
   // References: suppliers and mappings follow; the untouched rate's follow nothing.
@@ -594,4 +595,64 @@ test('REFUND SNAPSHOT IDENTITY: ANY other carrier of the old code that differs i
       assert.equal((await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id: w.refundGrPending.lineId } })).accountingTaxType, code('D'), 'control: an identical carrier lets the snapshot migrate')
     }
   }
+})
+
+// [mutation: replacedById not written by the apply -> the resolution arm rejects the old id; mutation: the helper's share lock removed -> the race arm: the apply commits past the writer and the document keeps the retired row]
+test('WRITERS AFTER THE APPLY: a supplied id of a retired rate resolves to its replacement, a plainly inactive rate is refused, an edit keeps what it had; a document created DURING the apply is never left on the retired row', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { resolveLinesTaxRates, TaxRateNotUsableError } = await import('../../lib/tax/writable-tax-rate.ts')
+  const { db } = d
+  const w = await seedWorld(d)
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+  assert.equal((await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })).wrote, true)
+  const newGr = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}GR VAT`, active: true } })).id
+
+  // A form opened before the apply submits the old id: a NEW order and a NEW purchase order created in a transaction end up on the replacement.
+  const so = await db.$transaction(async (tx) => {
+    const lines = [{ taxRateId: w.ids.gr, description: 'x', qty: 1, unitPriceForeign: 10, unitPriceBase: 10, totalForeign: 10, totalBase: 10 }]
+    assert.equal(await resolveLinesTaxRates(tx, lines), 1)
+    return tx.salesOrder.create({ data: { orderNumber: `RK${run}-after`, subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10, lines: { create: lines } }, select: { id: true, lines: { select: { taxRateId: true } } } })
+  })
+  created.orders.push(so.id)
+  assert.equal(so.lines[0]!.taxRateId, newGr, 'SO created with the old id is on the replacement')
+  const po = await db.$transaction(async (tx) => {
+    const lines = [{ taxRateId: w.ids.gr, productId: w.poDraftBe.lineId ? (await db.product.findFirstOrThrow({ where: { sku: `RK${run}` } })).id : '', qty: 1, unitCostForeign: 10, unitCostBase: 10, totalForeign: 10, totalBase: 10 }]
+    assert.equal(await resolveLinesTaxRates(tx, lines), 1)
+    return tx.purchaseOrder.create({ data: { reference: `PO-RK${run}-after`, supplierId: w.supCy, status: 'DRAFT', currency: 'GBP', fxRateToBase: 1, subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10, lines: { create: lines } }, select: { id: true, lines: { select: { taxRateId: true } } } })
+  })
+  created.pos.push(po.id)
+  assert.equal(po.lines[0]!.taxRateId, newGr, 'PO created with the old id is on the replacement')
+
+  // A plainly inactive rate (an operator switched it off) is refused for a new record, kept on an edit, and let through for an inbound order.
+  const plain = await db.taxRate.create({ data: { name: `${TAG}Plain off`, rate: '0.0500', usedFor: 'SALES', accountingTaxType: code('PLAIN'), active: false } })
+  created.rates.push(plain.id)
+  await assert.rejects(db.$transaction((tx) => resolveLinesTaxRates(tx, [{ taxRateId: plain.id }])), (e: unknown) => e instanceof TaxRateNotUsableError && e.code === 'TAX_RATE_INACTIVE')
+  assert.equal(await db.$transaction((tx) => resolveLinesTaxRates(tx, [{ taxRateId: plain.id }], { keep: new Set([plain.id]) })), 0)
+  assert.equal(await db.$transaction((tx) => resolveLinesTaxRates(tx, [{ taxRateId: plain.id }], { lenient: true })), 0)
+
+  // THE RACE: a writer has locked the rate GR VAT (still active) and is about to commit a new order that references it; the apply started meanwhile must wait for the writer.
+  const w2 = await seedWorld(d)
+  await db.salesOrder.updateMany({ where: { id: { in: [w2.soDraftGr.id] } }, data: { status: 'CANCELLED' } })
+  await db.salesOrderRefund.update({ where: { id: w2.refundGrPending.id }, data: { accountingCreditNoteId: `cn-${run}-race` } })
+  const preview2 = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  assert.deepEqual([preview2.references[w2.ids.gr]!.unpostedSalesOrders, preview2.references[w2.ids.gr]!.postedSalesOrders], [0, 0], 'no source for GR VAT yet')
+  let lateOrder = ''
+  const writer = db.$transaction(async (tx) => {
+    const lines = [{ taxRateId: w2.ids.gr, description: 'x', qty: 1, unitPriceForeign: 10, unitPriceBase: 10, totalForeign: 10, totalBase: 10 }]
+    await resolveLinesTaxRates(tx, lines) // GR VAT is active: kept, and now share-locked
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    const o = await tx.salesOrder.create({ data: { orderNumber: `RK${run}-race`, subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10, lines: { create: lines } }, select: { id: true } })
+    lateOrder = o.id
+    created.orders.push(o.id)
+  })
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  const racing = await d.rekey.runTaxRekey({ apply: true, confirm: preview2.digest, allowUnposted: true })
+  await writer
+  // The apply waited for the writer's commit (the row UPDATE conflicts with the writer's share lock), then re-pointed the order the writer created; it is never left on the retired row.
+  assert.deepEqual([racing.refusal, racing.wrote], [null, true])
+  const newGr2 = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}GR VAT`, active: true } })).id
+  assert.equal((await db.salesOrderLine.findFirstOrThrow({ where: { orderId: lateOrder } })).taxRateId, newGr2, 'the order created during the apply is on the replacement')
+  assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w2.ids.gr } })).active, false)
 })

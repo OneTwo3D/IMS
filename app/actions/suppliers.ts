@@ -1,5 +1,6 @@
 'use server'
 
+import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
@@ -211,6 +212,8 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
   try {
     const baseCurrency = await getBaseCurrencyCode()
     const normalizedCountry = input.country ? (toIsoCountryCode(input.country) ?? input.country.trim()) : null
+    // A default rate id that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
+    const writableTaxRateId = await resolveWritableTaxRateId(db, input.taxRateId || null)
     const s = await db.supplier.create({
       data: {
         name: input.name,
@@ -224,7 +227,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
         postcode: input.postcode || null,
         country: normalizedCountry,
         currency: input.currency || baseCurrency,
-        taxRateId: input.taxRateId || null,
+        taxRateId: writableTaxRateId ?? null,
         vatNumber: input.vatNumber || null,
         accountNumber: input.accountNumber || null,
         paymentTermsDays: input.paymentTermsDays ?? null,
@@ -249,6 +252,9 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
     const normalizedCountry = input.country !== undefined
       ? (input.country ? (toIsoCountryCode(input.country) ?? input.country.trim()) : null)
       : undefined
+    // As on create; the rate the supplier already has may stay even if it is inactive (editing other fields must not fail).
+    const currentTaxRateId = input.taxRateId ? (await db.supplier.findUnique({ where: { id }, select: { taxRateId: true } }))?.taxRateId : null
+    const writableTaxRateId = input.taxRateId ? await resolveWritableTaxRateId(db, input.taxRateId, { keep: new Set([currentTaxRateId]) }) : null
     const s = await db.supplier.update({
       where: { id },
       data: {
@@ -263,7 +269,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
         ...(input.postcode !== undefined && { postcode: input.postcode || null }),
         ...(normalizedCountry !== undefined && { country: normalizedCountry }),
         ...(input.currency !== undefined && { currency: input.currency }),
-        ...(input.taxRateId !== undefined && { taxRateId: input.taxRateId || null }),
+        ...(input.taxRateId !== undefined && { taxRateId: writableTaxRateId ?? null }),
         ...(input.vatNumber !== undefined && { vatNumber: input.vatNumber || null }),
         ...(input.accountNumber !== undefined && { accountNumber: input.accountNumber || null }),
         ...(input.paymentTermsDays !== undefined && { paymentTermsDays: input.paymentTermsDays ?? null }),

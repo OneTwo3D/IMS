@@ -1,5 +1,6 @@
 'use server'
 
+import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
@@ -1188,6 +1189,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         if (existing) throw new Error(`Order ${externalOrderNumber} already exists`)
       }
 
+      // A supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts), under the row share lock the apply waits on.
+      await resolveLinesTaxRates(tx, lineData)
       return tx.salesOrder.create({
         data: {
           externalOrderNumber,
@@ -3244,7 +3247,10 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     if (!so) return { success: false, error: 'Order not found' }
 
     const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
-    const clone = await db.salesOrder.create({
+    const clone = await db.$transaction(async (tx) => {
+    // A cloned line's rate that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
+    const cloneRates = await resolveWritableTaxRateIds(tx, so.lines.map((l) => l.taxRateId))
+    return tx.salesOrder.create({
       data: {
         orderNumber: ref,
         status: 'DRAFT',
@@ -3282,7 +3288,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
             unitPriceBase: l.unitPriceBase,
             discountStr: l.discountStr,
             discountAmount: l.discountAmount,
-            taxRateId: l.taxRateId,
+            taxRateId: l.taxRateId ? (cloneRates.get(l.taxRateId) ?? l.taxRateId) : l.taxRateId,
             taxForeign: l.taxForeign,
             taxBase: l.taxBase,
             totalForeign: l.totalForeign,
@@ -3290,6 +3296,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
           })),
         },
       },
+    })
     })
 
     // Auto-allocate stock for cloned order

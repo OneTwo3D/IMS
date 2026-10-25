@@ -48,6 +48,10 @@
  *     (no other IMS rate of another name or percentage carries it - else REFUND_SNAPSHOT_IDENTITY, no override). Posted credit notes are history. Other stored tax-type snapshots:
  *     accounting_sync_logs.payload and accounting_events.linesJson (in-flight ones block via QUEUED_PAYLOADS; sent ones are history); TaxRateComponent.accountingTaxType (cleared above);
  *     the reverse-charge tax-type SETTINGS (accounting_reverse_charge_*_tax_type) are separate configuration, reported not changed. No other model stores a tax type.
+ *   - STALE FORMS: the old row stays in forms opened before the apply and in imports that read it earlier, so every writer that persists a tax rate id (sales / purchase order create and
+ *     edit, clone, supplier default, storefront rate mappings, WooCommerce order import) resolves a supplied id through lib/tax/writable-tax-rate.ts: an id of a row this apply retired
+ *     (TaxRate.replacedById, written here) resolves to the replacement, a plainly inactive rate is refused. The helper share-locks the rows it relies on; this apply's UPDATE of the old row
+ *     waits for such a writer, then re-counts (a document created meanwhile is re-pointed with the flag, else the apply rolls back: DOCUMENT_CREATED_DURING_APPLY).
  *   - ENQUEUE RACE: a producer reads the line's rate BEFORE it takes the enqueue lock, so it can build an old-code payload, pause while this apply commits (no queued row to see), then
  *     insert it. createAccountingSyncLogRow (the one insert of a sync row) therefore refuses, under the lock this apply holds, any payload carrying a code recorded here as retired (setting
  *     tax_rekey_retired_codes, written in the apply's transaction)  that no active rate carries, or that now means another rate (a swap) within the quarantine window after this commit: lib/tax/retired-tax-code-guard.ts. The producer's retry rebuilds from the re-pointed rows.
@@ -80,7 +84,7 @@ export interface RekeyBlocker { code: RekeyBlockerCode; imsRateId: string; taxTy
 
 export const REKEY_REFUSAL_CODES = [
   'XERO_NOT_CONNECTED', 'XERO_CONNECTION_CHANGED', 'XERO_LIST_MISSING', 'XERO_LIST_UNREADABLE', 'XERO_LIST_NOT_STAMPED', 'XERO_LIST_STALE', 'XERO_LIST_WRONG_ORGANISATION',
-  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS', 'PENDING_REFUND_SNAPSHOTS', 'REFUND_SNAPSHOT_IDENTITY', 'XERO_NOT_HELD',
+  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS', 'PENDING_REFUND_SNAPSHOTS', 'REFUND_SNAPSHOT_IDENTITY', 'XERO_NOT_HELD', 'DOCUMENT_CREATED_DURING_APPLY',
 ] as const
 export type RekeyRefusalCode = (typeof REKEY_REFUSAL_CODES)[number]
 export interface RekeyRefusal { code: RekeyRefusalCode; detail: string }
@@ -473,6 +477,14 @@ export async function readRekeyPlan(client: Client, options: { now: Date; connec
 // The write
 // ---------------------------------------------------------------------------
 
+/** A document referencing a rate being re-keyed was committed by a concurrent writer while the apply ran (writable-tax-rate.ts share lock); the apply rolled back. */
+export class RekeyDocumentRaceError extends Error {
+  constructor(rateId: string) {
+    super(`a document referencing rate ${rateId} was created while the re-key was applying; nothing was written, run the preview again`)
+    this.name = 'RekeyDocumentRaceError'
+  }
+}
+
 export interface RekeyWriteResult {
   created: Array<{ oldId: string; newId: string; name: string; fromCode: string; toCode: string }>
   suppliersRepointed: number
@@ -504,8 +516,14 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
       },
       select: { id: true },
     })
-    const deactivated = await tx.taxRate.updateMany({ where: { id: old.id, active: true, accountingTaxType: row.currentCode }, data: { active: false, isDefault: false } })
+    const deactivated = await tx.taxRate.updateMany({ where: { id: old.id, active: true, accountingTaxType: row.currentCode }, data: { active: false, isDefault: false, replacedById: fresh.id } })
     if (deactivated.count !== 1) throw new Error(`rate ${row.imsRateId} could not be deactivated`)
+    // The UPDATE above waited for every writer that holds a share lock on the old row (lib/tax/writable-tax-rate.ts). A document such a writer committed meanwhile references the old row:
+    // without the flag that is a source the plan did not count, so the apply stops (and rolls back); with it, the re-pointing below picks it up.
+    if (!options.allowUnposted) {
+      const late = await openDocumentsOf(tx, old.id)
+      if (late.salesOrderIds.length + late.purchaseOrderIds.length > 0) throw new RekeyDocumentRaceError(row.imsRateId)
+    }
     result.suppliersRepointed += (await tx.supplier.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     result.mappingsRepointed += (await tx.shoppingTaxRateMapping.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     if (options.allowUnposted) {
@@ -645,7 +663,9 @@ export async function runTaxRekey(options: TaxRekeyRunOptions): Promise<TaxRekey
   if (!options.apply) return { applied: false, wrote: false, plan: first.plan, refusal: null, written: null, hold }
   if (connection === null) return refuse({ code: 'XERO_NOT_CONNECTED', detail: 'no Xero organisation is connected' }, first.plan)
   const seen: { plan: RekeyPlan | null } = { plan: null }
-  const fenced = await withXeroConnectionFence(connection, async (tx) => {
+  let fenced: Awaited<ReturnType<typeof withXeroConnectionFence<{ refusal: RekeyRefusal | null; plan: RekeyPlan | null; written: RekeyWriteResult | null }>>>
+  try {
+  fenced = await withXeroConnectionFence(connection, async (tx) => {
     const read = await readRekeyPlan(tx, { now, connectedTenantId: connection.tenantId })
     if (!read.ok) return { refusal: read.refusal, plan: null as RekeyPlan | null, written: null as RekeyWriteResult | null }
     seen.plan = read.plan
@@ -656,6 +676,10 @@ export async function runTaxRekey(options: TaxRekeyRunOptions): Promise<TaxRekey
     if (refusal !== null) return { refusal, plan, written: null }
     return { refusal: null, plan, written: await writeTaxRekey(tx, plan, { allowUnposted: options.allowUnposted === true }) }
   })
+  } catch (error) {
+    if (error instanceof RekeyDocumentRaceError) return refuse({ code: 'DOCUMENT_CREATED_DURING_APPLY', detail: error.message }, seen.plan ?? first.plan)
+    throw error
+  }
   if (!fenced.ok) return refuse({ code: 'XERO_CONNECTION_CHANGED', detail: fenced.error }, seen.plan ?? first.plan)
   const { refusal, plan, written } = fenced.value
   return { applied: true, wrote: written !== null && written.created.length > 0, plan: plan ?? first.plan, refusal, written, hold }

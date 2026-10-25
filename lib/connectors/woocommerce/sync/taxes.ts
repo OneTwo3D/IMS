@@ -9,6 +9,7 @@
  * WooCommerce order line items actually reference (line.taxes[].id).
  */
 
+import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { db } from '@/lib/db'
 import { wcFetch } from '../api'
 
@@ -89,7 +90,8 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
     if (!imsTaxRateId) {
       const existing = await db.taxRate.findFirst({ where: { name }, select: { id: true } })
       if (existing) {
-        imsTaxRateId = existing.id
+        // A same-named row a tax re-key retired follows its replacement (the import matches by name, active or not); lenient: an operator-deactivated row keeps its old behaviour.
+        imsTaxRateId = (await resolveWritableTaxRateId(db, existing.id, { lenient: true })) ?? existing.id
         reusedRates++
       } else {
         const ratePct = parseFloat(wcRate.rate) || 0
