@@ -3119,9 +3119,18 @@ export function isQueuedWcOrderPayload(payload: unknown): payload is PendingFxOr
     && typeof (payload as { order?: { id?: unknown } }).order?.id === 'number'
 }
 
-export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
+export async function retryPendingWcOrdersWaitingForFx(
+  limit = 50,
+  /**
+   * `receiptsOnly`: retry ONLY the rows that hold a stored receipt's registration obligation (payload.receiptPaymentId). Such a row is not waiting for a rate, so the
+   * scheduled cron retries it on every run whether or not any rate changed; the rows that DO wait for a rate stay on the after-a-rate-update path.
+   */
+  options: { receiptsOnly?: boolean } = {},
+): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
   const rows = await db.shoppingSyncLog.findMany({
-    where: pendingFxQueueWhere(),
+    where: options.receiptsOnly
+      ? { AND: [pendingFxQueueWhere(), { payload: { path: ['receiptPaymentId'], string_starts_with: '' } }] }
+      : pendingFxQueueWhere(),
     orderBy: { createdAt: 'asc' },
     take: Math.min(Math.max(limit, 1), 250),
     select: { id: true, payload: true },

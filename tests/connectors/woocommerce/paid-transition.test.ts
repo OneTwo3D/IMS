@@ -226,3 +226,32 @@ test('a GENERIC failure in the proof keeps the pending-FX row PENDING with the p
   assert.equal(registrations.filter((r) => r.paymentId === pays[0]!.id).length, before + 1, 'and not again')
   oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real
 })
+
+// [mutation: drop the receiptsOnly retry from the cron route / ignore the receipt filter]
+test('the scheduled fx-rates run retries a receipt obligation even when NO currency updated, and leaves rate-waiting rows alone', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  const log = await s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(o.wcId), payload: {} } })
+  const waiting = await s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: '8888888', payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: '8888888', externalOrderNumber: '8888888', currency: 'EUR', asOf: null, order: { id: 8888888 } } } })
+  const p = payload(Number(o.wcId), '2026-10-01T10:00:00')
+  const real = oi.wcReceiptRegistrationSeams.obligationIsOnRecord
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async () => { throw new Error('transient') }
+  try { await oi.importWcOrder(p, { pendingFxRetryLogId: log.id }) } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real }
+  assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })).status, 'PENDING')
+  const paymentId = (await payments(o.id))[0]!.id
+  const before = registrations.filter((r) => r.paymentId === paymentId).length
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length >= before + 1
+  // The cron route runs this on EVERY run, independent of the rate refresh's outcome (pinned from source: the route's run() calls it unconditionally after the refresh).
+  const { readFileSync } = await import('node:fs')
+  const route = readFileSync('app/api/cron/fx-rates/route.ts', 'utf8')
+  assert.match(route, /retryPendingWcOrdersWaitingForFx\(50, \{ receiptsOnly: true \}\)/)
+  assert.ok(route.indexOf('fetchAllFxRatesInternal()') < route.indexOf('receiptsOnly'), 'after the refresh, not inside a branch of it')
+  assert.ok(!/if \([^)]*updated/.test(route.slice(route.indexOf('receiptsOnly') - 600, route.indexOf('receiptsOnly'))), 'not conditional on a rate update')
+  const result = await oi.retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true })
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real
+  assert.equal(result.attempted, 1, 'only the receipt obligation, not the rate-waiting row')
+  assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })).status, 'SYNCED')
+  assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: waiting.id } })).status, 'PENDING')
+  assert.equal(registrations.filter((r) => r.paymentId === paymentId).length, before + 1)
+})
