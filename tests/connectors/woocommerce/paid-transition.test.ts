@@ -157,3 +157,39 @@ test('a receipt in another currency is ambiguous: paid recorded, NO new Payment,
   assert.ok((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt)
   assert.equal(await s.db.activityLog.count({ where: { entityId: o.id, action: 'wc_paid_transition_ambiguous_receipts' } }), 1)
 })
+
+// The registration obligation is durable: a registration that does not reach the record is retried, once, and the pending-FX row is not retired meanwhile.
+// [mutation: mark the pending row synced without the proof; skip the redrive for an already-paid order; drop the throw]
+test('registration not on record: the pending-FX row stays PENDING, a later delivery registers the SAME receipt again (one Payment), and only then is the row synced', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  const log = await s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(o.wcId), payload: {} } })
+  const p = payload(Number(o.wcId), '2026-10-01T10:00:00')
+  const real = oi.wcReceiptRegistrationSeams.obligationIsOnRecord
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async () => false
+  try {
+    const r1 = await oi.importWcOrder(p, { pendingFxRetryLogId: log.id })
+    assert.equal(r1.success, false)
+    assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })).status, 'PENDING', 'not retired while the obligation is not on record')
+    assert.equal((await payments(o.id)).length, 1, 'the receipt is stored once')
+    assert.equal(registrations.length, 1)
+    const r2 = await oi.importWcOrder(p, { pendingFxRetryLogId: log.id })
+    assert.equal(r2.success, false, 'the order is already paid, yet the redelivery re-attempts the registration')
+    assert.equal(registrations.length, 2)
+    assert.equal(registrations[1]!.paymentId, registrations[0]!.paymentId, 'the SAME receipt, so the enqueue key makes it once')
+  } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real }
+  // evidence appears (here: the real probe finds nothing owed because the test order has no posted invoice)
+  const r3 = await oi.importWcOrder(p, { pendingFxRetryLogId: log.id })
+  assert.equal(r3.success, true)
+  assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })).status, 'SYNCED')
+  assert.equal((await payments(o.id)).length, 1)
+  assert.equal(registrations.length, 2, 'once the obligation is on record nothing is registered again')
+})
+
+// [mutation: treat an order with no posted invoice as owing evidence]
+test('the evidence probe: an order with no posted invoice owes nothing yet (the invoice post\'s deferred pass registers its receipts)', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  assert.equal(await oi.wcReceiptRegistrationSeams.obligationIsOnRecord(o.id, 'any'), true)
+})

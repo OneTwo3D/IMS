@@ -795,6 +795,71 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
  * A missing rate leaves the order UNPAID (the rest of the update still applies) and the MissingFxRateError is rethrown after it, so `importWcOrder` keeps/queues the
  * pending-FX row (it is not marked synced) and retries after the next rate refresh.
  */
+/**
+ * THE REGISTRATION OBLIGATION OF A RECORDED RECEIPT IS DURABLE, AND THE PENDING-FX QUEUE IS WHAT HOLDS IT.
+ *
+ * `registerInvoicePaymentWithLedger` decides and writes its INVOICE_PAYMENT row in its own transaction and swallows a failure (it logs `invoice_payment_not_queued`, the same
+ * way `addPayment` does). The receipt here is committed before that call, so a failure would leave a receipt that no later delivery would ever send. So after the call this
+ * checks for the evidence that the obligation is on record, and when it is not, throws `WcReceiptRegistrationNotRecorded`: `importWcOrder` then keeps the pending-FX row
+ * PENDING (or opens one), and the next retry or redelivery runs `redriveUnregisteredWcReceipts`, which calls the registration again. The enqueue is idempotent per
+ * receipt and document (`invoicePaymentEnqueueKey`), so a repeat can never register twice.
+ *
+ * Evidence that the obligation is on record: (a) nothing is expected yet (no invoice posted: the invoice post's deferred pass registers the receipts then; or no accounting
+ * connector posts payments), (b) an INVOICE_PAYMENT sync row for THIS receipt, in any status (a refusal is recorded as an outstanding row), or (c) a decided refusal notice
+ * for this receipt (`invoice_payment_not_registered`, which names the hand remedy). The throw case (`invoice_payment_not_queued`) is none of these.
+ */
+export class WcReceiptRegistrationNotRecorded extends Error {
+  constructor(readonly orderId: string, readonly paymentId: string, readonly currency: string) {
+    super(`the receipt ${paymentId} of order ${orderId} is stored but its ledger registration is not on record yet; it is retried`)
+    this.name = 'WcReceiptRegistrationNotRecorded'
+  }
+}
+
+async function wcReceiptObligationIsOnRecord(orderId: string, paymentId: string): Promise<boolean> {
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { accountingInvoiceId: true, currency: true } })
+  if (!order || !order.accountingInvoiceId) return true
+  const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
+  const connector = await getActiveAccountingConnectorInfo().catch(() => null)
+  if (!connector) return true
+  if (!(await isAccountingSyncTypeEnabledFor(connector.id, 'INVOICE_PAYMENT').catch(() => true))) return true
+  const { loadInvoicePaymentSyncRows } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  if ((await loadInvoicePaymentSyncRows(orderId, connector.id, order.currency)).some((row) => row.paymentId === paymentId)) return true
+  return (await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_payment_not_registered', metadata: { path: ['paymentId'], equals: paymentId } } })) > 0
+}
+
+/** The evidence read, as a seam so a test can state "the registration did not reach the record" without a live accounting connector. */
+export const wcReceiptRegistrationSeams = { obligationIsOnRecord: wcReceiptObligationIsOnRecord }
+
+/** Register one stored receipt and prove the obligation is on record, or throw so the caller keeps the work queued. */
+async function registerWcReceiptAndProveObligation(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
+  const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  await registerInvoicePaymentWithLedger({
+    orderId,
+    orderReference: reference,
+    paymentId: receipt.id,
+    amount: toDecimal(receipt.amount as never),
+    currency: receipt.currency,
+    method: receipt.method,
+    reference: receipt.reference,
+    paidAt: receipt.paidAt,
+    settlementRateToBase: receipt.settlementRateToBase === null || receipt.settlementRateToBase === undefined ? null : Number(receipt.settlementRateToBase),
+  })
+  if (!(await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, receipt.id))) throw new WcReceiptRegistrationNotRecorded(orderId, receipt.id, receipt.currency)
+}
+
+/** Receipts this path recorded earlier whose registration never reached the record (the call failed): registered again, idempotently. */
+async function redriveUnregisteredWcReceipts(orderId: string): Promise<void> {
+  const receipts = await db.payment.findMany({
+    where: { orderId, refundId: null, notes: { startsWith: 'Recorded from WooCommerce' } },
+    select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { externalOrderNumber: true, orderNumber: true } } },
+    orderBy: { createdAt: 'asc' },
+  })
+  for (const r of receipts) {
+    if (await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, r.id)) continue
+    await registerWcReceiptAndProveObligation(orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? orderId, r)
+  }
+}
+
 type WcPaidTransition =
   | { kind: 'none' }
   | { kind: 'record'; settlementRate: number | null }
@@ -871,18 +936,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     return
   }
   if (!claimed.receipt) return
-  const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
-  await registerInvoicePaymentWithLedger({
-    orderId,
-    orderReference: claimed.reference,
-    paymentId: claimed.receipt.id,
-    amount: toDecimal(claimed.receipt.amount),
-    currency: claimed.receipt.currency,
-    method: claimed.receipt.method,
-    reference: claimed.receipt.reference,
-    paidAt: claimed.receipt.paidAt,
-    settlementRateToBase: settlementRate,
-  })
+  await registerWcReceiptAndProveObligation(orderId, claimed.reference, { ...claimed.receipt, settlementRateToBase: settlementRate })
 }
 
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder): Promise<void> {
@@ -890,6 +944,8 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
   if (transition.kind === 'record') await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate)
   if (transition.kind === 'blocked') throw transition.error
+  // An order already paid in IMS: any receipt this path recorded whose registration never reached the record is registered again (idempotent).
+  if (transition.kind === 'none' && wcOrder.date_paid_gmt) await redriveUnregisteredWcReceipts(orderId)
 }
 
 async function updateExistingWcOrderCore(
@@ -2992,6 +3048,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     return { success: true, orderId: so.id }
   } catch (e) {
+    if (e instanceof WcReceiptRegistrationNotRecorded) {
+      await recordPendingFxOrder(wcOrder, { message: e.message, currency: e.currency }, options.pendingFxRetryLogId)
+      return { success: false, error: `${e.message}; kept in the retry queue` }
+    }
     if (isMissingFxRateError(e)) {
       await recordPendingFxOrder(wcOrder, {
         message: e.message,
