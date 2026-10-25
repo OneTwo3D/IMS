@@ -131,7 +131,7 @@ export function imsSide(orders: readonly PoRow[], prefix: string, scope?: Readon
 /**
  * THE EXCHANGE RATE (one central source). For an order in the base currency the rate is 1. For any other currency it is the LATEST fx_rates row
  * (1 GBP = rate units of the currency) with fetchedAt ON OR BEFORE the instant the IMS purchase order was created, and nothing else: no
- * rate stored on the order is trusted (the first-load importer accepts a supplied rate within 2% of the table's, so the stored one is not provably
+ * rate stored on the order is trusted (an order stored before the table-rate rule, o3d-q0x56.6, may carry a typed rate within 2% of the table's, so the stored one is not provably
  * a table row), no fixed table is carried by the pack. The row must also be FRESH: no more than R7_FX_MAX_RATE_AGE_DAYS (7, inclusive) before that instant, except an admin-pinned
  * manual override that is still the latest row (it stays in force until cleared). No row on or before that instant, a stale one, a rate that is not a positive plain decimal, or two rows
  * at the latest instant that disagree, is null: the caller makes the item CURRENCY_UNKNOWN. The instant is the order's creation because that is

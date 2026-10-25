@@ -7,7 +7,7 @@
  *   forbidden SKUs  none of the manifest's forbidSkus (owner rulings that exclude a product) exists in the database either: a file cannot carry them, and a
  *                   load into a database that already has one would be building on a product the owner ruled out;
  *   warehouses      every warehouse the manifest declares exists, is active, is unique under upper-casing and has exactly the declared profile;
- *   FX rates        (purchase orders) each stated rate has a stored base-to-currency rate, and is within the importer's 2% of it;
+ *   FX rates        (purchase orders) each foreign order's rate is exactly the fx_rates rate at the end of its created day;
  *   tax rates       (suppliers) every purchase tax type the suppliers file states resolves to EXACTLY ONE active IMS tax rate usable for purchases (usedFor PURCHASE or BOTH)
  *                   with that accounting tax type: the supplier importer sets the supplier's default tax rate to it, and that rate (and its effective rate) is not above the manifest's
  *                   maxPurchaseTaxRate. A type with NO such rate is not refused yet: the rail asks the Xero tax-rate import (lib/tax/purchase-tax-import.ts) what it WOULD create from the stored

@@ -824,6 +824,7 @@ Every sales invoice, purchase bill, credit note and **payment** pushed to Xero i
 frankfurter.dev (ECB) → /api/cron/fx-rates → FxRate table
        ↓
 fxRateToBase stamped on SalesOrder / PurchaseOrder / SalesOrderRefund at creation
+(a PurchaseOrder: ALWAYS the fx_rates table rate, never a typed one)
        ↓
 queueAccountingSync() includes currencyRateToBase in the payload
        ↓
@@ -866,6 +867,8 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 **Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it. Xero sends the inverse form (`1 / x`) as `CurrencyRate`; QuickBooks also inverts the IMS rate before setting `ExchangeRate`, rounded to the connector's supported precision.
 
 **Downstream push to WooCommerce.** With the **onetwoInventory Helper** WordPress plugin installed and "Push FX rates daily" enabled in the IMS WC sync page, the same rates are also pushed to the WC store after each daily fetch. Aelia Currency Switcher (and any plugin reading the `wc_aelia_currencyswitcher_exchange_rate` filter) then converts cart prices using the IMS rate, so the storefront, IMS, and Xero all see the same exchange rate on the same order. See `docs/woocommerce.md` § onetwoInventory Helper WordPress plugin for installation steps.
+
+**A purchase order's rate is the table rate, never a typed one** (owner ruling 2026-10-25). `createPurchaseOrder`, the draft edit, the replenishment PO generator, the purchase-order CSV importer and the form all take the rate from the one lookup (`resolvePurchaseOrderFxRateToBase`, which calls `getFxRateToBase`); the former 2% override band (`PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE`) is gone. A PO is priced at the moment it is saved (the first load prices its orders at the end of their created day). A bill pushed to Xero therefore carries a `CurrencyRate` that IS an `fx_rates` row. An admin who needs another rate pins a manual override row (below); a stored PO rate is never rewritten.
 
 **Manual overrides and push log.** Settings → Accounting → **FX Rates** shows the current rate per currency, with a source badge (`ECB (frankfurter)` or `Manual override`). Pin a manual rate via the pencil icon — the daily fetch will then skip that currency until the override is cleared (the undo icon re-fetches from frankfurter). The same panel includes a recent-pushes table (one row per fan-out attempt to a shopping connector) so you can see whether the latest push to WooCommerce succeeded.
 

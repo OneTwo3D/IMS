@@ -17,27 +17,24 @@ The main purchasing page shows all purchase orders in a searchable table.
 1. Click **New Purchase Order**.
 2. Select a **supplier** from your supplier list.
 3. Confirm the **currency** (defaults to the supplier's currency).
-4. The **FX rate to base currency** is pre-filled from the stored exchange rate for the PO date. You can override this, but the system validates the rate against a 10% sanity band — see [FX rate validation](#fx-rate-validation) below.
+4. The **FX rate to base currency** is shown read-only: it is the rate in Settings > Accounting > FX Rates for the order's currency, read when the order is saved. It cannot be typed here (see [FX rate](#fx-rate) below).
 5. Select the **destination warehouse** where the goods will be received.
 6. Add lines by searching for products. The system pre-fills the last purchase price for that supplier if one exists.
 7. Enter quantities and adjust prices as needed.
 8. (Optional) Tick **"Skip preferred-supplier update"** on the PO header if you don't want this PO to overwrite the products' preferred suppliers — useful for emergency or one-off orders. See [Preferred supplier auto-update](#preferred-supplier-auto-update) below.
 9. Save the PO.
 
-### FX rate validation
+### FX rate
 
-For non-base-currency POs, the system protects against typos and stale rates:
+**One rate means the table rate.** A foreign-currency PO is always raised at the exchange rate held in Settings > Accounting > FX Rates (the `fx_rates` table) for its currency: the latest rate on or before the moment the PO is saved. There is no rate field to type, no override band and no warning: the number the PO form shows is the rate the PO is stored at. A currency with no stored rate cannot be used; the PO is refused with "Missing ... FX rate".
 
-- **Default** — the FX rate is auto-filled from the most recent stored rate for the PO date.
-- **Within 2% of stored rate** — accepted silently.
-- **2% to 10% deviation** — accepted but the system logs a WARNING activity entry and shows a yellow warning in the UI. Use this when there's a deliberate reason for the difference (forward contract, supplier-specific rate, etc.).
-- **More than 10% deviation** — rejected. Either correct the rate or refresh the stored rate via Settings > Accounting > FX Rates.
-
-This catches the "decimal in the wrong place" class of errors that previously could silently misprice every cost layer.
+- **A different rate for a deliberate reason** (a forward contract, a supplier-specific rate): an admin pins a **manual override** on Settings > Accounting > FX Rates (the pencil icon). The override is a new row in the table and is the latest rate, so every PO saved after it uses it, and the daily fetch skips that currency until the override is cleared. It applies to all POs in that currency, not to one.
+- **Existing POs keep the rate they were stored with.** A stored rate is never rewritten when the table changes.
+- **CSV import:** the `fxRateToBase` column is optional. Leave it blank; a rate that is not exactly the table rate is refused for that order, so a typo cannot misprice the cost layers.
 
 ### Editing currency or FX rate on a DRAFT PO
 
-Changing **only** the currency or the FX rate (without touching lines or additional costs) triggers
+A DRAFT PO keeps its stored rate when it is edited. The rate is read again from the table, at the moment of the edit, only when the **currency changes** (or a refresh is requested). Changing **only** the currency (without touching lines or additional costs) triggers
 a **stored base-amount rebase**: the persisted base values on the PO header, every line, and every
 freight cost line are recomputed against the new FX rate and written in a single database
 transaction. If anything in that transaction fails (e.g. a tax-resolution error), the entire
