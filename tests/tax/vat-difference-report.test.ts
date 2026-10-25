@@ -24,7 +24,7 @@ const FETCHED = new Date('2026-10-25T11:30:00Z')
 
 const xeroRow = (taxType: string, pct: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({
   taxType, name: `Xero ${taxType}`, status: 'ACTIVE', reportTaxType: taxType.startsWith('OUTPUT') ? 'OUTPUT' : taxType.startsWith('INPUT') ? 'INPUT' : null, effectiveRate: `${pct}.000000`, displayTaxRate: `${pct}.000000`, components: [],
-  canApply: { assets: false, equity: false, expenses: taxType.startsWith('INPUT'), liabilities: false, revenue: taxType.startsWith('OUTPUT') }, ...over,
+  canApply: { assets: false, equity: false, expenses: taxType.startsWith('INPUT'), liabilities: false, revenue: !taxType.startsWith('INPUT') && taxType !== 'NONE' }, ...over,
 })
 const imsRate = (id: string, type: string | null, fraction: string, over: Partial<ImsRateRow> = {}): ImsRateRow => ({
   id, reportingCategory: null, name: `IMS ${id}`, rate: fraction, usedFor: 'SALES', active: true, accountingTaxType: type, countryCode: 'GB', isCompound: false, reverseCharge: false, components: [], ...over,
@@ -63,7 +63,9 @@ const CASES: Record<VatDifferenceReason, { mutate: Mutate; extra?: VatDifference
   MISSING_IN_XERO: { mutate: (s) => { s.snapshot.rates[0]!.accountingTaxType = 'GONE' }, extra: ['MISSING_IN_IMS'] },
   INACTIVE_IN_XERO: { mutate: (s) => { s.snapshot.xero.rows[0] = xeroRow('OUTPUT2', '20', { status: 'ARCHIVED' }) } },
   IMS_RATE_NO_XERO_TYPE: { mutate: (s) => { s.snapshot.rates.push(imsRate('local', null, '0.0500', { usedFor: 'PURCHASE' })) } },
-  AMBIGUOUS_IMS_MAPPING: { mutate: (s) => { s.snapshot.rates.push(imsRate('uk2', 'OUTPUT2', '0.2000', { usedFor: 'BOTH' })) }, extra: ['MISSING_IN_WOO'] },
+  AMBIGUOUS_IMS_MAPPING: { mutate: (s) => { s.snapshot.rates.push(imsRate('uk2', 'OUTPUT2', '0.2000', { usedFor: 'SALES' })) }, extra: ['MISSING_IN_WOO'] },
+  USED_FOR_NOT_ALLOWED_BY_XERO: { mutate: (s) => { s.snapshot.rates[0]!.usedFor = 'BOTH' } },
+  WOO_MAPPED_TO_NON_SALES_RATE: { mutate: (s) => { s.snapshot.rates[0]!.usedFor = 'PURCHASE' }, extra: ['MISSING_IN_IMS', 'USED_FOR_NOT_ALLOWED_BY_XERO'] },
   XERO_RATE_NOT_STATED: { mutate: (s) => { s.snapshot.xero.rows[0] = xeroRow('OUTPUT2', '20', { effectiveRate: null, displayTaxRate: null }) } },
   PERCENTAGE_MISMATCH_IMS_XERO: { mutate: (s) => { s.snapshot.rates[0]!.rate = '0.1900' } },
   MISSING_IN_WOO: { mutate: (s) => { s.woo.splice(1, 1) }, extra: ['WOO_RATE_GONE'] },
@@ -198,6 +200,31 @@ test('shipping rule (owner ruling 2026-10-25): a rate above zero must apply to s
   s.woo[1] = wooRate('2', '0.0000', { class: 'zero-rate', shipping: false })
   assert.deepEqual(reasons(s), [])
   assert.match(VAT_DIFFERENCE_REASONS.WOO_SHIPPING_NOT_TAXED, /2026-10-25.*shipping always carries/)
+})
+
+// [mutation: presence counts any active carrier regardless of usedFor / the Woo mapping not checked for sales use -> red]
+test('presence is per side: an OUTPUT2 rate switched to PURCHASE is not the sales rate, its Woo mapping is a difference, and the purchase side is judged too', () => {
+  const s = baseline()
+  s.snapshot.rates[0]!.usedFor = 'PURCHASE'
+  const r = compareVatSets(s).differences
+  const byReason = (reason: string) => r.filter((d) => d.reason === reason)
+  assert.equal(byReason('MISSING_IN_IMS').length, 1)
+  assert.equal(byReason('MISSING_IN_IMS')[0]!.ims, 'no active rate for sales')
+  assert.equal(byReason('WOO_MAPPED_TO_NON_SALES_RATE').length, 1)
+  assert.equal(byReason('USED_FOR_NOT_ALLOWED_BY_XERO').length, 1, 'a purchase rate on a revenue-only type')
+  // INPUT2 present only as SALES: the purchase side is missing.
+  const t = baseline()
+  t.snapshot.rates[2]!.usedFor = 'SALES'
+  const m = compareVatSets(t).differences.filter((d) => d.reason === 'MISSING_IN_IMS')
+  assert.deepEqual(m.map((d) => [d.xeroTaxType, d.ims]), [['INPUT2', 'no active rate for purchases']])
+  // BOTH on a revenue-only type: used-for violation, but both sides are otherwise present.
+  const u = baseline()
+  u.snapshot.rates[0]!.usedFor = 'BOTH'
+  assert.deepEqual(compareVatSets(u).differences.map((d) => d.reason), ['USED_FOR_NOT_ALLOWED_BY_XERO'])
+  // A type that can be applied to neither side needs any active carrier.
+  const v = baseline()
+  v.snapshot.xero.rows.push(xeroRow('NONE', '0', { canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: false } }))
+  assert.equal(compareVatSets(v).differences.filter((d) => d.reason === 'MISSING_IN_IMS').length, 1)
 })
 
 test('purchase-only and reverse-charge IMS rates need no storefront rate; a zero rate with shipping off is not a difference', () => {

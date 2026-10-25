@@ -1,3 +1,4 @@
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
@@ -5,24 +6,26 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 /**
- * THE VAT DIFFERENCE REPORT AGAINST A REAL DATABASE WRITES NOTHING. GATED on RUN_DB_RETENTION_TESTS (npm run test:db).
- * It seeds its own tax rates, components, WooCommerce mapping, a stored Xero list (header, rows, last-success stamp) and a Xero token, digests
- * ONLY those rows (with each row's xmin, so any write, even of the same value, changes the digest) before and after a full report and a
- * refused report, and proves the transaction is READ ONLY (a write in it is refused by the database). The pre-existing stored Xero list
- * and token of the scratch database are set aside and restored.
+ * THE VAT DIFFERENCE REPORT AGAINST A REAL DATABASE WRITES NOTHING. It lives in the concurrency tier because that tier positively identifies a
+ * disposable database before ANY write (scratch-database-setup.ts above refuses to load unless `npm run test:concurrency`'s preload verified the
+ * database: stamped for its own name, declared in IMS_CONCURRENCY_SCRATCH_DB). It seeds its own uniquely tagged tenant, tax rates, components,
+ * WooCommerce mapping, stored Xero list (header, rows, last-success stamp) and Xero token, digests ONLY those rows (with each row's xmin, so any
+ * write, even of the same value, changes the digest) before and after a full report, a refused report and a CLI child run, and proves the
+ * transaction is READ ONLY (a write in it is refused by the database).
+ *
+ * It NEVER deletes or replaces data it did not create. The report reads the whole stored Xero list, so the test needs the Xero tables, the Xero
+ * token and the tax-rate stamp to be empty; if foreign rows are there it FAILS LOUDLY at the precondition (before any write) instead of clearing them.
+ * Its cleanup removes only its own tagged rows.
  *
  * Mutations (seen red, reverted): the SET TRANSACTION ... READ ONLY statement removed -> the "write refused" arm fails; a write
  * (an update of a seeded tax rate) added to readImsXeroSnapshot -> the digest arm fails.
  */
-const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
-if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
-  throw new Error('REQUIRE_DB_RETENTION_TESTS=1 but RUN_DB_RETENTION_TESTS is not 1: tests/db/vat-difference-report-no-write.test.ts would have been skipped.')
-}
+const skip = process.env.RUN_DB_CONCURRENCY_TESTS !== '1' && 'set RUN_DB_CONCURRENCY_TESTS=1 (npm run test:concurrency)'
 
 async function deps() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
   const [{ db }, run, drift, listMod] = await Promise.all([
     import('../../lib/db/index.ts'),
     import('../../lib/tax/vat-difference-run.ts'),
@@ -31,8 +34,6 @@ async function deps() {
   ])
   return { db, ...run, ...drift, ...listMod }
 }
-
-const withoutId = <T extends { id: string }>(row: T): Omit<T, 'id'> => { const copy = { ...row } as Partial<T>; delete copy.id; return copy as Omit<T, 'id'> }
 
 type Db = Awaited<ReturnType<typeof deps>>['db']
 
@@ -60,17 +61,17 @@ test('the VAT difference report reads a real database and writes nothing', { ski
   const tag = randomBytes(4).toString('hex')
   const tenant = `vatd-${tag}`
   const now = new Date()
-  // Set aside whatever the scratch database holds for the Xero list and token.
-  const savedLists = await db.xeroTaxRateList.findMany()
-  const savedRates = await db.xeroTaxRate.findMany()
-  const savedTokens = await db.accountingToken.findMany({ where: { connector: 'xero' } })
-  const savedStamp = await db.setting.findUnique({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } })
+  // PRECONDITION, before any write: the report reads the whole stored Xero list, so foreign rows would change what it reads. Nothing foreign is ever deleted.
+  const foreign = {
+    xeroRates: await db.xeroTaxRate.count(),
+    xeroLists: await db.xeroTaxRateList.count(),
+    xeroTokens: await db.accountingToken.count({ where: { connector: 'xero' } }),
+    stamp: await db.setting.count({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } }),
+  }
+  assert.deepEqual(foreign, { xeroRates: 0, xeroLists: 0, xeroTokens: 0, stamp: 0 }, 'PRECONDITION: this scratch database holds Xero rows this test did not create; it will not delete them. Use a database with an empty Xero store.')
   const rateIds: string[] = []
   const mappingIds: string[] = []
   try {
-    await db.xeroTaxRate.deleteMany({})
-    await db.xeroTaxRateList.deleteMany({})
-    await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
     await db.accountingToken.create({ data: { connector: 'xero', accessToken: 'x', expiresAt: new Date(now.getTime() + 3_600_000), tenantId: tenant } })
     const xeroRows = [
       { taxType: 'OUTPUT2', name: '20% (VAT on Income)', status: 'ACTIVE' as const, reportTaxType: null, effectiveRate: '20.000000', displayTaxRate: '20.000000', components: [], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } },
@@ -80,7 +81,7 @@ test('the VAT difference report reads a real database and writes nothing', { ski
       data: xeroRows.map((r) => ({ connector: 'xero', tenantId: tenant, taxType: r.taxType, name: r.name, status: r.status, effectiveRate: r.effectiveRate, displayTaxRate: r.displayTaxRate, components: r.components, canApplyToAssets: false, canApplyToEquity: false, canApplyToExpenses: r.canApply.expenses, canApplyToLiabilities: false, canApplyToRevenue: r.canApply.revenue, fetchedAt: now })),
     })
     await db.xeroTaxRateList.create({ data: { connector: 'xero', tenantId: tenant, fetchedAt: now, rowCount: xeroRows.length, digest: d.digestTaxRateList(tenant, xeroRows) } })
-    await db.setting.upsert({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING }, update: { value: now.toISOString() }, create: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: now.toISOString() } })
+    await db.setting.create({ data: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: now.toISOString() } })
     const uk = await db.taxRate.create({ data: { name: `VATD UK ${tag}`, rate: '0.2000', usedFor: 'SALES', accountingTaxType: 'OUTPUT2', countryCode: 'GB', components: { create: [{ name: 'VAT', rate: '0.2000', sortOrder: 0 }] } } })
     const purchase = await db.taxRate.create({ data: { name: `VATD IN ${tag}`, rate: '0.1900', usedFor: 'PURCHASE', accountingTaxType: 'INPUT2' } })
     rateIds.push(uk.id, purchase.id)
@@ -126,16 +127,13 @@ test('the VAT difference report reads a real database and writes nothing', { ski
     assert.equal(await ownedRowsDigest(db, own), before)
     console.log(`# digests equal; rows owned: rates=${rateIds.length} mappings=${mappingIds.length}`)
   } finally {
+    // Only what this test created, by its own tag and ids.
     await db.shoppingTaxRateMapping.deleteMany({ where: { id: { in: mappingIds } } })
     await db.taxRate.deleteMany({ where: { id: { in: rateIds } } })
-    await db.xeroTaxRate.deleteMany({})
-    await db.xeroTaxRateList.deleteMany({})
-    await db.accountingToken.deleteMany({ where: { connector: 'xero' } })
-    if (savedRates.length) await db.xeroTaxRate.createMany({ data: savedRates.map((row) => ({ ...withoutId(row), components: row.components as never })) })
-    if (savedLists.length) await db.xeroTaxRateList.createMany({ data: savedLists.map(withoutId) })
-    if (savedTokens.length) await db.accountingToken.createMany({ data: savedTokens.map(withoutId) })
-    if (savedStamp) await db.setting.update({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING }, data: { value: savedStamp.value } })
-    else await db.setting.deleteMany({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } })
+    await db.xeroTaxRate.deleteMany({ where: { tenantId: tenant } })
+    await db.xeroTaxRateList.deleteMany({ where: { tenantId: tenant } })
+    await db.accountingToken.deleteMany({ where: { connector: 'xero', tenantId: tenant } })
+    await db.setting.deleteMany({ where: { key: d.TAX_RATE_DRIFT_LAST_CHECKED_SETTING } })
     await db.$disconnect()
   }
 })

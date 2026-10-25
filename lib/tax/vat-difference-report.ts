@@ -235,6 +235,9 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
     const ids = { xeroTaxType: rate.accountingTaxType, imsRateId: rate.id }
     if (xero === undefined) { add('MISSING_IN_XERO', 'ims', rate.id, rate.name, ids, { ims: text(percentOfFraction(rate.rate)) }); continue }
     if (xero.status !== 'ACTIVE') { add('INACTIVE_IN_XERO', 'ims', rate.id, rate.name, ids, { xero: xero.status, ims: text(percentOfFraction(rate.rate)) }); continue }
+    // The sides the rate is used on must be sides the Xero type can be applied to (revenue for sales, expenses for purchases), as the import requires.
+    const refused = sides(rate.usedFor).filter((side) => (side === 'SALES' ? xero.canApply.revenue : xero.canApply.expenses) !== true)
+    if (refused.length > 0) add('USED_FOR_NOT_ALLOWED_BY_XERO', 'ims', rate.id, rate.name, ids, { xero: `revenue=${String(xero.canApply.revenue)} expenses=${String(xero.canApply.expenses)}`, ims: `used for ${rate.usedFor}` })
     const stated = xeroPercent(rate.accountingTaxType)
     if (stated === null) { add('XERO_RATE_NOT_STATED', 'xero', rate.accountingTaxType, xero.name, ids, { ims: text(percentOfFraction(rate.rate)) }); continue }
     const column = percentOfFraction(rate.rate)
@@ -246,10 +249,18 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
     const clash = rates.some((a, index) => rates.slice(index + 1).some((b) => sides(a.usedFor).some((side) => sides(b.usedFor).includes(side))))
     if (clash) add('AMBIGUOUS_IMS_MAPPING', 'xero', taxType, xeroByType.get(taxType)?.name ?? taxType, { xeroTaxType: taxType }, { ims: rates.map((r) => r.id).sort().join(',') })
   }
+  // PRESENT means usable on the side: a type Xero can apply to revenue needs an active rate usable for sales, one it can apply to expenses needs an active rate usable for purchases
+  // (a rate switched to the other side does not count); a type that can be applied to neither needs any active rate.
   for (const row of snapshot.xero.rows) {
-    if (row.status === 'ACTIVE' && !activeByType.has(row.taxType)) {
+    if (row.status !== 'ACTIVE') continue
+    const carriers = activeByType.get(row.taxType) ?? []
+    const missing: string[] = []
+    if (row.canApply.revenue === true && !carriers.some((rate) => sides(rate.usedFor).includes('SALES'))) missing.push('sales')
+    if (row.canApply.expenses === true && !carriers.some((rate) => sides(rate.usedFor).includes('PURCHASE'))) missing.push('purchases')
+    if (row.canApply.revenue !== true && row.canApply.expenses !== true && carriers.length === 0) missing.push('any use')
+    if (missing.length > 0) {
       const stated = xeroPercent(row.taxType)
-      add('MISSING_IN_IMS', 'xero', row.taxType, row.name, { xeroTaxType: row.taxType }, { xero: stated === null ? null : text(stated) })
+      add('MISSING_IN_IMS', 'xero', row.taxType, row.name, { xeroTaxType: row.taxType }, { xero: stated === null ? null : text(stated), ims: `no active rate for ${missing.join(' and ')}` })
     }
   }
 
@@ -262,6 +273,10 @@ export function compareVatSets(input: { snapshot: ImsXeroSnapshot; woo: readonly
     const ims = ratesById.get(mapping.taxRateId)
     if (ims === undefined) { add('WOO_RATE_NO_IMS_MAPPING', 'woo', rate.id, label, { wooRateId: rate.id }, { woo: rate.rate }); continue }
     if (!ims.active) { add('WOO_MAPPED_TO_INACTIVE_IMS_RATE', 'woo', rate.id, label, { wooRateId: rate.id, imsRateId: ims.id, xeroTaxType: ims.accountingTaxType }, { ims: text(percentOfFraction(ims.rate)), woo: rate.rate }); continue }
+    // A storefront (sales) rate must be usable for sales: used for sales and, where Xero lists the type, a type Xero can apply to revenue.
+    const salesType = ims.accountingTaxType === null ? undefined : xeroByType.get(ims.accountingTaxType)
+    const salesOk = sides(ims.usedFor).includes('SALES') && (salesType === undefined || salesType.status !== 'ACTIVE' || salesType.canApply.revenue === true)
+    if (!salesOk) { add('WOO_MAPPED_TO_NON_SALES_RATE', 'woo', rate.id, label, { wooRateId: rate.id, imsRateId: ims.id, xeroTaxType: ims.accountingTaxType }, { ims: `used for ${ims.usedFor}`, woo: rate.rate }); continue }
     reachedByWoo.add(ims.id)
     const ids = { wooRateId: rate.id, imsRateId: ims.id, xeroTaxType: ims.accountingTaxType }
     const xeroPct = xeroPercent(ims.accountingTaxType)
