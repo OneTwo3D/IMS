@@ -77,7 +77,7 @@ const CASES: Record<VatDifferenceReason, { mutate: Mutate; extra?: VatDifference
   WOO_CLASS_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { class: 'reduced-rate' }) } },
   WOO_COMPOUND_MISMATCH: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { compound: true }) } },
   WOO_SHIPPING_NOT_TAXED: { mutate: (s) => { s.woo[0] = wooRate('1', '20.0000', { shipping: false }) } },
-  UNCLASSIFIED_SCHEME: { mutate: (s) => { s.snapshot.rates.push(imsRate('de', null, '0.1900', { usedFor: 'PURCHASE', countryCode: 'DE' })) }, extra: ['IMS_RATE_NO_XERO_TYPE'] },
+  UNCLASSIFIED_SCHEME: { mutate: (s) => { s.snapshot.rates.push(imsRate('de', null, '0.1900', { usedFor: 'PURCHASE', countryCode: 'GB', reportingCategory: 'MYSTERY' })) }, extra: ['IMS_RATE_NO_XERO_TYPE'] },
 }
 
 for (const reason of VAT_DIFFERENCE_REASON_LIST) {
@@ -133,33 +133,34 @@ test('classification: UK, IOSS, VOEC, other and unclassified, each with its cite
   assert.equal(got(ims('DE', 'IOSS')), 'ioss'); assert.equal(got(ims(null, 'ioss')), 'ioss')
   assert.equal(got(ims('NO', null)), 'voec'); assert.equal(got(ims('NO', 'OSS')), 'voec'); assert.equal(got(ims(null, 'VOEC')), 'voec')
   assert.equal(got(ims('DE', 'OSS')), 'other'); assert.equal(got(ims('CH', null)), 'other'); assert.equal(got(ims('JE', 'OSS')), 'other')
-  assert.equal(got(ims('DE', null)), 'unclassified', 'an EU rate with no marker is OSS or IOSS: not guessed')
-  assert.equal(got(ims('ES', 'DOMESTIC')), 'unclassified')
+  assert.equal(got(ims('DE', null)), 'other', 'owner ruling 2026-10-25: an unmarked EU rate defaults to OSS'); assert.equal(got(ims('ES', 'DOMESTIC')), 'other')
+  assert.match(ims('DE', null).source, /EU default \(OSS\)/)
+  assert.equal(got(ims('DE', 'IOSS')), 'ioss', 'only an IOSS marker makes an EU rate IOSS'); assert.equal(got(ims('FR', 'ioss')), 'ioss')
   assert.equal(got(ims('GB', 'OSS')), 'unclassified'); assert.equal(got(ims('GB', 'IOSS')), 'unclassified'); assert.equal(got(ims('GB', 'MYSTERY')), 'unclassified')
   assert.equal(got(ims(null, null, 'MOSSSALES')), 'unclassified'); assert.equal(got(ims(null, 'MYSTERY')), 'unclassified')
   assert.match(ims('NO', null).source, /VOEC/); assert.match(ims('DE', 'IOSS').source, /reportingCategory=IOSS/); assert.match(ims('GB', null).source, /IMS countryCode GB/)
   // WooCommerce rates with no IMS mapping: by country only
-  assert.deepEqual([classifyWooRate('GB').scheme, classifyWooRate('NO').scheme, classifyWooRate('CH').scheme, classifyWooRate('FR').scheme, classifyWooRate('').scheme], ['uk', 'voec', 'other', 'unclassified', 'unclassified'])
+  assert.deepEqual([classifyWooRate('GB').scheme, classifyWooRate('NO').scheme, classifyWooRate('CH').scheme, classifyWooRate('FR').scheme, classifyWooRate('').scheme], ['uk', 'voec', 'other', 'other', 'unclassified'])
   // Xero-only types: name prefix (upper case) and ReportTaxType
   const x = (name: string, reportTaxType: string | null) => classifyXeroType({ name, reportTaxType }).scheme
-  assert.deepEqual([x('20% (VAT on Income)', 'OUTPUT'), x('NO 25%', 'MOSSSALES'), x('No VAT', null), x('CH 8.1%', 'MOSSSALES'), x('DE 19%', 'MOSSSALES'), x('Mystery', null), x('GB Reduced', 'OUTPUT')], ['uk', 'voec', 'unclassified', 'other', 'unclassified', 'unclassified', 'uk'])
+  assert.deepEqual([x('20% (VAT on Income)', 'OUTPUT'), x('NO 25%', 'MOSSSALES'), x('No VAT', null), x('CH 8.1%', 'MOSSSALES'), x('DE 19%', 'MOSSSALES'), x('Mystery', null), x('GB Reduced', 'OUTPUT')], ['uk', 'voec', 'unclassified', 'other', 'other', 'unclassified', 'uk'])
 })
 
 test('four scheme reports plus a visible unclassified section: each difference lands in its own scheme; none is dropped; exit status is any difference anywhere', () => {
   const s = baseline()
-  // UK: Woo percentage wrong. VOEC: a NO rate whose Woo rate differs. Other: a CH rate missing in Woo. IOSS: a marked DE rate. Unclassified: an unmarked FR rate.
+  // UK: Woo percentage wrong. VOEC: a NO rate whose Woo rate differs. Other: a CH rate missing in Woo. IOSS: a marked DE rate. Unclassified: a GB rate with an unknown category (an unmarked FR rate is EU OSS, "other").
   s.woo[0] = wooRate('1', '19.0000')
   s.snapshot.xero.rows.push(xeroRow('NO25', '25', { reportTaxType: 'MOSSSALES' }), xeroRow('CH8', '8', { reportTaxType: 'MOSSSALES' }), xeroRow('DE19', '19', { reportTaxType: 'MOSSSALES' }), xeroRow('FR20', '20', { reportTaxType: 'MOSSSALES' }))
-  s.snapshot.rates.push(imsRate('no', 'NO25', '0.2500', { countryCode: 'NO' }), imsRate('ch', 'CH8', '0.0800', { countryCode: 'CH' }), imsRate('de', 'DE19', '0.1900', { countryCode: 'DE', reportingCategory: 'IOSS' }), imsRate('fr', 'FR20', '0.2000', { countryCode: 'FR' }))
+  s.snapshot.rates.push(imsRate('no', 'NO25', '0.2500', { countryCode: 'NO' }), imsRate('ch', 'CH8', '0.0800', { countryCode: 'CH' }), imsRate('de', 'DE19', '0.1900', { countryCode: 'DE', reportingCategory: 'IOSS' }), imsRate('fr', 'FR20', '0.2000', { countryCode: 'FR' }), imsRate('gbx', null, '0.0500', { countryCode: 'GB', reportingCategory: 'MYSTERY', usedFor: 'PURCHASE' }))
   s.snapshot.mappings.push({ externalTaxRateId: '3', taxRateId: 'no', externalClass: 'standard' }, { externalTaxRateId: '5', taxRateId: 'de', externalClass: 'standard' })
   s.woo.push(wooRate('3', '24.0000', { country: 'NO' }), wooRate('5', '19.0000', { country: 'DE' }))
   const r = compareVatSets(s)
   const by = (bucket: keyof typeof r.schemes) => r.schemes[bucket].differences.map((d) => `${d.reason}:${d.imsRateId ?? d.xeroTaxType}`)
   assert.deepEqual(by('uk'), ['WOO_PERCENTAGE_MISMATCH:uk'])
   assert.deepEqual(by('voec'), ['WOO_PERCENTAGE_MISMATCH:no'])
-  assert.deepEqual(by('other'), ['MISSING_IN_WOO:ch'])
+  assert.deepEqual(by('other'), ['MISSING_IN_WOO:ch', 'MISSING_IN_WOO:fr'], 'the unmarked FR rate is EU OSS')
   assert.deepEqual(by('ioss'), [])
-  assert.deepEqual(by('unclassified'), ['MISSING_IN_WOO:fr', 'UNCLASSIFIED_SCHEME:fr'])
+  assert.deepEqual(by('unclassified'), ['IMS_RATE_NO_XERO_TYPE:gbx', 'UNCLASSIFIED_SCHEME:gbx'])
   assert.equal(r.differences.length, Object.values(r.schemes).reduce((n, sec) => n + sec.differences.length, 0), 'nothing is dropped between the flat list and the sections')
   assert.ok(r.schemes.unclassified.differences.every((d) => d.schemeSource.length > 10), 'each row cites why')
   assert.equal(vatDiffExitCode(r, 'all'), 1)

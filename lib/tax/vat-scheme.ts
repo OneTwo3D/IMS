@@ -10,11 +10,12 @@
  *      EU one-stop-shop / foreign registrations ("other").
  *   2. The country: IMS TaxRate.countryCode, the WooCommerce rate's country, or, for a Xero type no IMS rate carries, the ISO prefix of its name
  *      (upper-case two-letter prefix, the convention of lib/connectors/xero/tax-rate-report-type.ts). Norway (NO) is VOEC
- *      (VOEC_ISO_CODES of that module); GB/UK is the UK scheme; an EU member state (EU_ISO_CODES of that module) is ambiguous between OSS and IOSS
- *      (Xero files both under MOSSSALES) and is UNCLASSIFIED unless rule 1 marked it; any other country is "other".
+ *      (VOEC_ISO_CODES of that module); GB/UK is the UK scheme; an EU member state (EU_ISO_CODES of that module) with no IOSS marker is EU OSS, "other"
+ *      (owner ruling 2026-10-25: the default is OSS; only a rate marked IOSS in rule 1 is IOSS); any other country is "other".
  *   3. A global rate (no country) is UK when its category is empty, DOMESTIC, REVERSE_CHARGE or EC_SALES (UK VAT return concepts) and Xero's ReportTaxType is
  *      not MOSSSALES. For a Xero-only type (no category exists) Xero's ReportTaxType must be one of the UK return types.
- * Anything else, including a conflict (an OSS category on a GB rate, an unknown category) is UNCLASSIFIED with the reason.
+ * UNCLASSIFIED remains possible ONLY for: an IOSS/VOEC/OSS marker on a GB rate (conflict); an unknown reportingCategory on a GB rate or on a rate with no country; a rate with no
+ * country whose Xero ReportTaxType is MOSSSALES; a Xero-only type with no ISO name prefix and no UK ReportTaxType; a WooCommerce rate with no country and no IMS mapping.
  */
 
 import { EU_ISO_CODES, VOEC_ISO_CODES } from '@/lib/connectors/xero/tax-rate-report-type'
@@ -54,7 +55,8 @@ function classify(input: { country: string; countrySource: string; category: str
     if (input.xeroOnly) return input.reportType != null && UK_REPORT_TYPES.has(input.reportType) ? { scheme: 'uk', source: `Xero ReportTaxType ${input.reportType}` } : unclassified(`Xero type with no country prefix and ReportTaxType ${input.reportType ?? '(none)'}`)
     return { scheme: 'uk', source: `no country, reportingCategory ${category === '' ? '(none)' : category}` }
   }
-  if (EU_ISO_CODES.has(country)) return unclassified(`EU member state ${country} with no OSS or IOSS marker in reportingCategory (OSS and IOSS cannot be told apart)`)
+  // Owner ruling 2026-10-25: an EU member state with no IOSS marker is EU OSS ("other"); only rate marked IOSS in reportingCategory (rule 1) goes to the IOSS report.
+  if (EU_ISO_CODES.has(country)) return { scheme: 'other', source: `EU default (OSS): ${input.countrySource} ${country} is an EU member state with no IOSS marker` }
   return { scheme: 'other', source: `${input.countrySource} ${country} (not GB, NO or an EU member state)` }
 }
 

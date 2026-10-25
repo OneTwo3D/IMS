@@ -20,7 +20,7 @@ export const VAT_DIFFERENCE_REASONS = {
   WOO_CLASS_MISMATCH: 'A mapped WooCommerce tax rate is in a different tax class from the one the mapping recorded (a mapping with no recorded class means the standard class).',
   WOO_COMPOUND_MISMATCH: 'A mapped WooCommerce tax rate differs from the IMS tax rate in whether it is compound.',
   WOO_SHIPPING_NOT_TAXED: 'A mapped WooCommerce tax rate above zero does not apply to shipping. Owner ruling 2026-10-25: shipping always carries the VAT rate of the goods.',
-  UNCLASSIFIED_SCHEME: 'The rate cannot be assigned to UK, IOSS, VOEC or other foreign VAT from the data the systems hold (see lib/tax/vat-scheme.ts), so it is listed in the unclassified section instead of being compared under a guessed scheme.',
+  UNCLASSIFIED_SCHEME: 'The rate cannot be assigned to UK, IOSS, VOEC or other foreign VAT from the data the systems hold (a conflicting or unknown reporting category, a rate with no country and a MOSSSALES report type, or a rate with no country and no mapping; see lib/tax/vat-scheme.ts), so it is listed in the unclassified section instead of being compared under a guessed scheme.',
 } as const
 export type VatDifferenceReason = keyof typeof VAT_DIFFERENCE_REASONS
 export const VAT_DIFFERENCE_REASON_LIST = Object.keys(VAT_DIFFERENCE_REASONS) as VatDifferenceReason[]
