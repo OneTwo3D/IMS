@@ -36,6 +36,13 @@
  *     and payloads that already went to Xero are not touched. Is a posted document's next update then a change of meaning? No: the new row is the live type of the SAME name,
  *     ACTIVE, with the same percentage, the same sides and the same component breakdown (the plan refuses otherwise), so the same tax meaning by construction; the old code was the
  *     other organisation's number, so the update is a correction. No amount changes (same percentage). Cancelled documents are left on the old row.
+ *   - REFUND-LINE SNAPSHOTS: SalesOrderRefundLine.accountingTaxType is resolved at refund creation (lib/domain/sales/refund-service.ts) and the credit note build / retry prefers it to the
+ *     order line's rate (lib/domain/sales/refund-posted-tax-identity.ts creditNoteLineTaxTypeResolver ~922-938 returns `refundLine.accountingTaxType`; priceSnapshottedTaxIdentity ~977). A refund
+ *     whose credit note is not posted (SalesOrderRefund.accountingCreditNoteId null) may have no queued payload yet (enqueue failed / not yet run), so nothing else would stop the old
+ *     code going out. They BLOCK the apply (PENDING_REFUND_SNAPSHOTS); with the flag their snapshot code is migrated to the new code, but only when the old code means the old row alone
+ *     (no other IMS rate of another name or percentage carries it - else REFUND_SNAPSHOT_IDENTITY, no override). Posted credit notes are history. Other stored tax-type snapshots:
+ *     accounting_sync_logs.payload and accounting_events.linesJson (in-flight ones block via QUEUED_PAYLOADS; sent ones are history); TaxRateComponent.accountingTaxType (cleared above);
+ *     the reverse-charge tax-type SETTINGS (accounting_reverse_charge_*_tax_type) are separate configuration, reported not changed. No other model stores a tax type.
  *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED - a FAILED row keeps blocking until it is retried or cancelled - or an accounting event PENDING / FAILED,
  *     whose lines carry the old code) are snapshots IMS does not rewrite. They BLOCK the apply (QUEUED_PAYLOADS) with no override: let them post, or cancel them, first.
  */
@@ -59,7 +66,7 @@ export interface RekeyBlocker { code: RekeyBlockerCode; imsRateId: string; taxTy
 
 export const REKEY_REFUSAL_CODES = [
   'XERO_NOT_CONNECTED', 'XERO_CONNECTION_CHANGED', 'XERO_LIST_MISSING', 'XERO_LIST_UNREADABLE', 'XERO_LIST_NOT_STAMPED', 'XERO_LIST_STALE', 'XERO_LIST_WRONG_ORGANISATION',
-  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS',
+  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS', 'PENDING_REFUND_SNAPSHOTS', 'REFUND_SNAPSHOT_IDENTITY',
 ] as const
 export type RekeyRefusalCode = (typeof REKEY_REFUSAL_CODES)[number]
 export interface RekeyRefusal { code: RekeyRefusalCode; detail: string }
@@ -116,6 +123,14 @@ export interface RekeyReferences {
   postedSalesOrderLines: number
   postedPurchaseOrders: number
   postedPurchaseOrderLines: number
+  /**
+   * Refund lines (SalesOrderRefundLine.accountingTaxType, resolved at creation and preferred over the order line's rate when the credit note is built or retried) that carry the old code on
+   * a refund whose credit note is not posted (SalesOrderRefund.accountingCreditNoteId null): no queued payload exists to block on, but a later enqueue / retry would send the old code.
+   */
+  pendingRefunds: number
+  pendingRefundLines: number
+  /** True when another IMS rate (any status) carries the old code with another name or percentage: the snapshot's tax identity is then not the old row's, and it is not migrated. */
+  refundSnapshotConflict: boolean
   /** Queued payloads whose lines carry the old code. */
   queuedSyncRows: number
   queuedEvents: number
@@ -338,19 +353,30 @@ async function queuedCounts(client: Client, taxType: string): Promise<{ syncRows
   return { syncRows: Number(syncRows[0]?.n ?? 0), events: Number(events[0]?.n ?? 0) }
 }
 
+/** The refund-line snapshots (see RekeyReferences.pendingRefundLines) on not-yet-posted refunds that carry `code`. */
+async function pendingRefundSnapshots(client: Client, code: string): Promise<{ refunds: number; lines: number }> {
+  const lines = await client.salesOrderRefundLine.findMany({ where: { accountingTaxType: code, refund: { accountingCreditNoteId: null } }, select: { refundId: true } })
+  return { refunds: new Set(lines.map((l) => l.refundId)).size, lines: lines.length }
+}
+
 async function referencesOf(client: Client, row: RekeyRow, isDefault: boolean): Promise<RekeyReferences> {
-  const [suppliers, storefrontMappings, open, queued] = await Promise.all([
+  const [suppliers, storefrontMappings, open, queued, refunds, sharing] = await Promise.all([
     client.supplier.count({ where: { taxRateId: row.imsRateId } }),
     client.shoppingTaxRateMapping.count({ where: { taxRateId: row.imsRateId } }),
     openDocumentsOf(client, row.imsRateId),
     queuedCounts(client, row.currentCode),
+    pendingRefundSnapshots(client, row.currentCode),
+    client.taxRate.findMany({ where: { accountingTaxType: row.currentCode, id: { not: row.imsRateId } }, select: { id: true, name: true, rate: true, accountingTaxType: true } }),
   ])
+  const refundSnapshotConflict = sharing.some((other) => other.id !== row.imsRateId && other.accountingTaxType === row.currentCode
+    && (other.name.trim() !== row.name.trim() || !new Dec(other.rate.toFixed(4)).mul(100).eq(row.imsPercent)))
   return {
     suppliers, storefrontMappings, isDefault,
     unpostedSalesOrders: open.unpostedSalesOrders, unpostedSalesOrderLines: open.unpostedSalesLines,
     unpostedPurchaseOrders: open.unpostedPurchaseOrders, unpostedPurchaseOrderLines: open.unpostedPurchaseLines,
     postedSalesOrders: open.postedSalesOrders, postedSalesOrderLines: open.postedSalesLines,
     postedPurchaseOrders: open.postedPurchaseOrders, postedPurchaseOrderLines: open.postedPurchaseLines,
+    pendingRefunds: refunds.refunds, pendingRefundLines: refunds.lines, refundSnapshotConflict,
     queuedSyncRows: queued.syncRows, queuedEvents: queued.events,
   }
 }
@@ -396,6 +422,7 @@ export interface RekeyWriteResult {
   mappingsRepointed: number
   salesLinesRepointed: number
   purchaseLinesRepointed: number
+  refundLinesRepointed: number
 }
 
 /**
@@ -404,7 +431,7 @@ export interface RekeyWriteResult {
  * and components are never written. The re-point statements name the old row's id, so a re-run (old row inactive, nothing referencing it) matches nothing.
  */
 export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allowUnposted: boolean }): Promise<RekeyWriteResult> {
-  const result: RekeyWriteResult = { created: [], suppliersRepointed: 0, mappingsRepointed: 0, salesLinesRepointed: 0, purchaseLinesRepointed: 0 }
+  const result: RekeyWriteResult = { created: [], suppliersRepointed: 0, mappingsRepointed: 0, salesLinesRepointed: 0, purchaseLinesRepointed: 0, refundLinesRepointed: 0 }
   for (const row of plan.rows) {
     if (row.outcome !== 'REKEY') continue
     const old = await tx.taxRate.findUnique({ where: { id: row.imsRateId }, include: { components: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } })
@@ -425,6 +452,11 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     result.suppliersRepointed += (await tx.supplier.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     result.mappingsRepointed += (await tx.shoppingTaxRateMapping.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     if (options.allowUnposted) {
+      // Refund-line snapshots on refunds not yet posted: migrated only when the snapshot's tax identity IS the old row's (the plan refused otherwise).
+      const snap = plan.references[row.imsRateId]
+      if (snap !== undefined && snap.pendingRefundLines > 0 && !snap.refundSnapshotConflict) {
+        result.refundLinesRepointed += (await tx.salesOrderRefundLine.updateMany({ where: { accountingTaxType: row.currentCode, refund: { accountingCreditNoteId: null } }, data: { accountingTaxType: toCode } })).count
+      }
       const open = await openDocumentsOf(tx, old.id)
       if (open.salesOrderIds.length > 0) result.salesLinesRepointed += (await tx.salesOrderLine.updateMany({ where: { taxRateId: old.id, orderId: { in: open.salesOrderIds } }, data: { taxRateId: fresh.id } })).count
       if (open.purchaseOrderIds.length > 0) result.purchaseLinesRepointed += (await tx.purchaseOrderLine.updateMany({ where: { taxRateId: old.id, poId: { in: open.purchaseOrderIds } }, data: { taxRateId: fresh.id } })).count
@@ -472,6 +504,10 @@ export function applyRefusal(plan: RekeyPlan, allowUnposted: boolean): RekeyRefu
   const refs = Object.values(plan.references)
   const queued = refs.reduce((n, r) => n + r.queuedSyncRows + r.queuedEvents, 0)
   if (queued > 0) return { code: 'QUEUED_PAYLOADS', detail: `${queued} queued accounting payload(s) still carry a code being re-keyed; let them post or cancel them first` }
+  const conflicted = refs.filter((r) => r.pendingRefundLines > 0 && r.refundSnapshotConflict).length
+  if (conflicted > 0) return { code: 'REFUND_SNAPSHOT_IDENTITY', detail: `${conflicted} re-keyed rate(s) share their old code with a rate of another name or percentage, so the pending refund lines that carry it cannot be shown to mean the old row; resolve them first (no override)` }
+  const pendingRefunds = refs.reduce((n, r) => n + r.pendingRefundLines, 0)
+  if (pendingRefunds > 0 && !allowUnposted) return { code: 'PENDING_REFUND_SNAPSHOTS', detail: `${pendingRefunds} refund line(s) on refunds not yet posted carry a tax code being re-keyed in their stored snapshot (a later enqueue or retry prefers it to the order line's rate); pass the explicit flag to migrate them` }
   const sources = refs.reduce((n, r) => n + r.unpostedSalesOrders + r.unpostedPurchaseOrders + r.postedSalesOrders + r.postedPurchaseOrders, 0)
   if (sources > 0 && !allowUnposted) return { code: 'UNPOSTED_DOCUMENTS', detail: `${sources} order(s) (posted or not) still reference a rate being re-keyed and can post its old code (first post, edit, re-send, credit note, refund, further bill); pass the explicit flag to re-point their lines` }
   return null

@@ -53,7 +53,7 @@ const LIVE = () => [
   xero(code('E'), 'AMB VAT', '5'), xero(code('F'), 'AMB VAT', '5'), xero(code('X'), 'PCT VAT', '10'),
 ]
 
-const created = { rates: [] as string[], suppliers: [] as string[], mappings: [] as string[], orders: [] as string[], pos: [] as string[], products: [] as string[], logs: [] as string[], events: [] as string[], invoices: [] as string[], digests: [] as string[] }
+const created = { rates: [] as string[], suppliers: [] as string[], mappings: [] as string[], orders: [] as string[], pos: [] as string[], products: [] as string[], logs: [] as string[], events: [] as string[], invoices: [] as string[], refunds: [] as string[], digests: [] as string[] }
 
 async function wipeOwn(d: Deps) {
   const { db } = d
@@ -63,6 +63,8 @@ async function wipeOwn(d: Deps) {
   await db.purchaseInvoice.deleteMany({ where: { id: { in: created.invoices } } })
   await db.purchaseOrderLine.deleteMany({ where: { OR: [{ poId: { in: created.pos } }, { taxRateId: { in: rateIds } }] } })
   await db.purchaseOrder.deleteMany({ where: { id: { in: created.pos } } })
+  await db.salesOrderRefundLine.deleteMany({ where: { refundId: { in: created.refunds } } })
+  await db.salesOrderRefund.deleteMany({ where: { id: { in: created.refunds } } })
   await db.salesOrderLine.deleteMany({ where: { OR: [{ orderId: { in: created.orders } }, { taxRateId: { in: rateIds } }] } })
   await db.salesOrder.deleteMany({ where: { id: { in: created.orders } } })
   await db.shoppingTaxRateMapping.deleteMany({ where: { OR: [{ id: { in: created.mappings } }, { taxRateId: { in: rateIds } }] } })
@@ -159,9 +161,19 @@ async function seedWorld(d: Deps) {
     }
     return { id: p.id, lineId: p.lines[0]!.id }
   }
+  const refund = async (key: string, orderId: string, taxType: string, posted: boolean) => {
+    const r = await db.salesOrderRefund.create({
+      data: { orderId, totalForeign: 10, totalBase: 10, accountingCreditNoteId: posted ? `cn-${run}-${key}` : null, lines: { create: [{ description: 'x', qty: 1, unitPriceBase: 10, totalBase: 10, accountingTaxType: taxType }] } },
+      select: { id: true, lines: { select: { id: true } } },
+    })
+    created.refunds.push(r.id)
+    return { id: r.id, lineId: r.lines[0]!.id }
+  }
+  const refundGrPending = await refund('gr-pending', soDraftGr.id, code('A'), false)
+  const refundGrPosted = await refund('gr-posted', soDraftGr.id, code('A'), true)
   const poDraftBe = await po('be', ids.be, false)
   const poPostedCy = await po('posted-cy', ids.cy, true)
-  return { ids, supCy, supGr, supBg, mapping: mapping.id, mappingBg: mappingBg.id, soPosted, soDraftCy, soDraftGr, soCancelled, poDraftBe, poPostedCy }
+  return { refundGrPending, refundGrPosted, ids, supCy, supGr, supBg, mapping: mapping.id, mappingBg: mappingBg.id, soPosted, soDraftCy, soDraftGr, soCancelled, poDraftBe, poPostedCy }
 }
 type World = Awaited<ReturnType<typeof seedWorld>>
 
@@ -254,7 +266,7 @@ test('an apply is refused without the previewed digest, while unposted orders re
   assert.equal(await attempt({ apply: true }), 'CONFIRM_REQUIRED')
   assert.equal(await attempt({ apply: true, confirm: 'not-a-digest' }), 'CONFIRM_REQUIRED')
   assert.equal(await attempt({ apply: true, confirm: '0'.repeat(64), allowUnposted: true }), 'DIGEST_MISMATCH')
-  assert.equal(await attempt({ apply: true, confirm: preview.digest }), 'UNPOSTED_DOCUMENTS', 'the right digest still refuses while draft orders would post the old code')
+  assert.equal(await attempt({ apply: true, confirm: preview.digest }), 'PENDING_REFUND_SNAPSHOTS', 'the right digest still refuses while an unposted refund line stores the old code')
 
   // A queued payload carrying the old code blocks even with the flag (the digest changes with the count: re-preview).
   const log = await d.db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', status: 'PENDING', referenceType: 'SalesOrder', referenceId: w.soDraftCy.id, payload: { lines: [{ description: 'x', taxType: code('B') }] } } })
@@ -282,6 +294,7 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   const frozen = async (id: string) => { const r = await db.taxRate.findUniqueOrThrow({ where: { id }, include: { components: { orderBy: { sortOrder: 'asc' } } } }); const rest: Record<string, unknown> = { ...r }; for (const k of ['active', 'isDefault', 'updatedAt']) delete rest[k]; return JSON.stringify(rest) }
   const oldBefore = { cy: await frozen(w.ids.cy), gr: await frozen(w.ids.gr), be: await frozen(w.ids.be), bg: await frozen(w.ids.bg), amb: await frozen(w.ids.amb), pct: await frozen(w.ids.pct), nope: await frozen(w.ids.nope) }
   const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  assert.deepEqual([preview.references[w.ids.gr]!.pendingRefunds, preview.references[w.ids.gr]!.pendingRefundLines, preview.references[w.ids.gr]!.refundSnapshotConflict], [1, 1, false])
   const result = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
   created.digests.push(preview.digest)
   assert.equal(result.refusal, null)
@@ -317,6 +330,10 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   assert.deepEqual([await soLine(w.soPosted.lineId), await soLine(w.soCancelled.lineId), await soLine(w.soDraftCy.lineId), await soLine(w.soDraftGr.lineId)], [newId('CY VAT'), w.ids.cy, newId('CY VAT'), newId('GR VAT')])
   const poLine = async (id: string) => (await db.purchaseOrderLine.findUniqueOrThrow({ where: { id } })).taxRateId
   assert.deepEqual([await poLine(w.poPostedCy.lineId), await poLine(w.poDraftBe.lineId)], [newId('CY VAT'), newId('BE VAT')])
+  // Refund-line snapshots: the not-yet-posted refund's code is migrated (its identity is GR VAT alone); the posted credit note's is history and stays.
+  const refundCode = async (id: string) => (await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id } })).accountingTaxType
+  assert.deepEqual([await refundCode(w.refundGrPending.lineId), await refundCode(w.refundGrPosted.lineId)], [code('D'), code('A')])
+  assert.equal(result.written!.refundLinesRepointed, 1)
   assert.equal(await db.activityLog.count({ where: { action: 'tax_rates_rekeyed_to_xero_codes', metadata: { path: ['planDigest'], equals: preview.digest } } }), 1)
 
   // The report afterwards: no percentage mismatch for a re-keyed rate.
@@ -383,6 +400,7 @@ test('an ALREADY-POSTED invoiced order and a part-billed PO are future posting s
   // Leave only posted sources: the never-posted drafts are cancelled (a cancelled document is not a source).
   await db.salesOrder.updateMany({ where: { id: { in: [w.soDraftCy.id, w.soDraftGr.id] } }, data: { status: 'CANCELLED' } })
   await db.purchaseOrder.updateMany({ where: { id: { in: [w.poDraftBe.id] } }, data: { status: 'CANCELLED' } })
+  await db.salesOrderRefund.update({ where: { id: w.refundGrPending.id }, data: { accountingCreditNoteId: `cn-${run}-late` } })
   const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
   created.digests.push(preview.digest)
   const cy = preview.references[w.ids.cy]!
@@ -397,4 +415,25 @@ test('an ALREADY-POSTED invoiced order and a part-billed PO are future posting s
   assert.equal((await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soPosted.lineId } })).taxRateId, newCy, 'the invoiced order\'s line follows')
   assert.equal((await db.purchaseOrderLine.findUniqueOrThrow({ where: { id: w.poPostedCy.lineId } })).taxRateId, newCy, 'the billed PO\'s line follows')
   assert.equal((await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soCancelled.lineId } })).taxRateId, w.ids.cy, 'a cancelled order stays on the old row')
+})
+
+// [mutation: the refund-line migration removed from writeTaxRekey -> the main arm fails; mutation: the PENDING_REFUND_SNAPSHOTS refusal removed -> this arm applies without the flag]
+test('a pending refund line that stores a code shared with a rate of another name is NEVER migrated (REFUND_SNAPSHOT_IDENTITY), flag or not; and a pending refund blocks without the flag', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const w = await seedWorld(d)
+  const { db } = d
+  // CY VAT's old code (PB) is also BG VAT's code: a stored "PB" on an unposted refund cannot be shown to mean CY VAT.
+  const refund = await db.salesOrderRefund.create({ data: { orderId: w.soDraftCy.id, totalForeign: 10, totalBase: 10, lines: { create: [{ description: 'x', qty: 1, unitPriceBase: 10, totalBase: 10, accountingTaxType: code('B') }] } }, select: { id: true, lines: { select: { id: true } } } })
+  created.refunds.push(refund.id)
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  const cy = preview.references[w.ids.cy]!
+  assert.deepEqual([cy.pendingRefundLines, cy.refundSnapshotConflict], [1, true])
+  const before = await ownedDigest(d, w)
+  for (const allowUnposted of [false, true]) {
+    const r = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted })
+    assert.deepEqual([r.refusal?.code, r.wrote], ['REFUND_SNAPSHOT_IDENTITY', false])
+  }
+  assert.equal(await ownedDigest(d, w), before)
+  assert.equal((await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id: refund.lines[0]!.id } })).accountingTaxType, code('B'))
 })

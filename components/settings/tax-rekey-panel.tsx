@@ -43,7 +43,7 @@ export function TaxRekeyPanel() {
       <p className="text-xs text-muted-foreground">
         Xero numbers its custom tax codes (TAX001, TAX002 ...) per organisation, so rates created against another organisation (for example a Demo one) can carry codes that mean a different rate in the live one.
         This ties each rate to the live Xero type with the <strong>same name</strong> (never by code), the same percentage and status Active. Preview first; Apply creates a new rate with the live code,
-        deactivates the old one (it is never edited) and moves supplier defaults and WooCommerce mappings to the new rate. Documents that already posted keep the old rate. A component code of the old rate that is not a live active type is cleared on the new rate. Queued payloads carrying an old code, including FAILED ones, always block the Apply until they are retried or cancelled.
+        deactivates the old one (it is never edited) and moves supplier defaults and WooCommerce mappings to the new rate. Documents that already posted keep the old rate. A component code of the old rate that is not a live active type is cleared on the new rate. Refund lines of refunds not yet posted store their own tax code: they block the Apply, and the checkbox migrates them only when the old code means the old rate alone. Queued payloads carrying an old code, including FAILED ones, always block the Apply until they are retried or cancelled.
       </p>
       <label className="flex items-center gap-2 text-xs">
         <input type="checkbox" checked={allowUnposted} onChange={(e) => setAllowUnposted(e.target.checked)} />
@@ -75,7 +75,7 @@ export function TaxRekeyPanel() {
               <p key={row.imsRateId} title={REKEY_OUTCOME_MEANING[row.outcome]}>
                 <strong>{row.outcome}</strong> {row.name} ({row.usedFor}{row.countryCode ? ` ${row.countryCode}` : ''}) {row.currentCode} {row.imsPercent}%
                 {row.target ? ` -> ${row.target.taxType} "${row.target.name}" ${row.target.percent ?? '?'}%` : ''} ({row.matchedBy ?? 'no name match'}: {row.reason}){row.clearedComponents.length > 0 ? ` [component code(s) cleared: ${row.clearedComponents.map((c) => c.taxType).join(', ')}]` : ''}
-                {refs ? ` [${refs.suppliers} supplier(s), ${refs.storefrontMappings} storefront mapping(s)${refs.isDefault ? ', default rate' : ''}, ${refs.unpostedSalesOrders + refs.unpostedPurchaseOrders} never-posted and ${refs.postedSalesOrders + refs.postedPurchaseOrders} posted order(s) that can still post, ${refs.queuedSyncRows + refs.queuedEvents} queued payload(s)]` : ''}
+                {refs ? ` [${refs.suppliers} supplier(s), ${refs.storefrontMappings} storefront mapping(s)${refs.isDefault ? ', default rate' : ''}, ${refs.unpostedSalesOrders + refs.unpostedPurchaseOrders} never-posted and ${refs.postedSalesOrders + refs.postedPurchaseOrders} posted order(s) that can still post, ${refs.pendingRefundLines} pending refund line(s)${refs.refundSnapshotConflict ? ' (code shared with another rate: not migrated)' : ''}, ${refs.queuedSyncRows + refs.queuedEvents} queued payload(s)]` : ''}
               </p>
             )
           })}
