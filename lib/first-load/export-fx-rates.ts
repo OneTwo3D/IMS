@@ -160,3 +160,27 @@ export function parseFxExportArgs(argv: readonly string[]): FxExportParsed {
   if (problems.length > 0) return { kind: 'usage', problems }
   return { kind: 'run', args: { envFile: values.get('--env-file')!, expectDb: values.get('--expect-db')!, expectSystemId: values.get('--expect-system-id')!, out: path.resolve(values.get('--out')!), since } }
 }
+
+/** Every connection of this command carries this application name. */
+export const FX_EXPORT_APPLICATION_NAME = 'first-load-export-fx-rates'
+
+/** The only part of the caller's environment this command looks at. Never DATABASE_URL, never a PG variable. */
+const INHERITED_ENV = ['PATH', 'LANG', 'LC_ALL', 'TZ'] as const
+/** A variable of the env file that would point a client library somewhere else: refused, not dropped. */
+const FORBIDDEN_FROM_FILE = /^(PG[A-Z]*|PSQL.*|LD_PRELOAD|LD_LIBRARY_PATH|NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|PS4)$/
+
+/** The environment of one run: a short whitelist from the caller, then the env file's own variables. The database is the file's DATABASE_URL, never an inherited one. */
+export function buildExportEnv(fileEnv: Readonly<Record<string, string>>, parentEnv: Readonly<Record<string, string | undefined>>, home: string): { env: Record<string, string>; problems: string[] } {
+  const problems: string[] = []
+  const env: Record<string, string> = { HOME: home }
+  for (const name of INHERITED_ENV) {
+    const value = parentEnv[name]
+    if (value !== undefined) env[name] = value
+  }
+  for (const [name, value] of Object.entries(fileEnv)) {
+    if (FORBIDDEN_FROM_FILE.test(name)) problems.push(`the env file sets ${name}, which would redirect a client library; remove it from the file`)
+    else env[name] = value
+  }
+  if (typeof env.DATABASE_URL !== 'string' || env.DATABASE_URL === '') problems.push('the env file has no DATABASE_URL')
+  return { env, problems }
+}

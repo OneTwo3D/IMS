@@ -12,10 +12,8 @@ import { pathToFileURL } from 'node:url'
 
 import pg from 'pg'
 
-import { RUNNER_APPLICATION_NAME } from '../lib/first-load/apply/constants'
-import { buildRunnerEnv } from '../lib/first-load/apply/cli'
 import {
-  FX_EXPORT_EXIT, FX_EXPORT_FILE, FX_EXPORT_HELP, FX_EXPORT_RECORD_FILE, exportRecord, parseFxExportArgs, readFxRates, renderFxRatesCsv, type FxExportPort,
+  FX_EXPORT_APPLICATION_NAME, FX_EXPORT_EXIT, FX_EXPORT_FILE, FX_EXPORT_HELP, FX_EXPORT_RECORD_FILE, buildExportEnv, exportRecord, parseFxExportArgs, readFxRates, renderFxRatesCsv, type FxExportPort,
 } from '../lib/first-load/export-fx-rates'
 import { prepareReportDir, publishRecord, readEnvFile } from './lib/first-load-apply-files'
 
@@ -31,7 +29,7 @@ export interface CliDeps {
 }
 
 async function defaultOpen(url: string): Promise<{ port: FxExportPort; close: () => Promise<void> }> {
-  const client = new pg.Client({ connectionString: url, connectionTimeoutMillis: 10_000, options: '-c default_transaction_read_only=on', application_name: RUNNER_APPLICATION_NAME })
+  const client = new pg.Client({ connectionString: url, connectionTimeoutMillis: 10_000, options: '-c default_transaction_read_only=on', application_name: FX_EXPORT_APPLICATION_NAME })
   await client.connect()
   return { port: { query: async (sql) => ({ rows: (await client.query(sql)).rows as never[] }) }, close: () => client.end() }
 }
@@ -47,7 +45,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
   const fail = (code: number, problem: string): number => { io.err(`first-load-export-fx-rates: ${problem}\n`); return code }
   const envFile = readEnvFile(args.envFile)
   if (!envFile.ok) return fail(FX_EXPORT_EXIT.USAGE, envFile.problem)
-  const built = buildRunnerEnv(envFile.env, parentEnv, parentEnv.HOME ?? '/tmp')
+  const built = buildExportEnv(envFile.env, parentEnv, parentEnv.HOME ?? '/tmp')
   if (built.problems.length > 0) return fail(FX_EXPORT_EXIT.USAGE, built.problems.join('; '))
   const dir = prepareReportDir(args.out)
   if (!dir.ok) return fail(FX_EXPORT_EXIT.USAGE, dir.problem)
