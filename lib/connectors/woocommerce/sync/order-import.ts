@@ -739,8 +739,14 @@ async function recordPendingFxOrder(
 }
 
 async function markPendingFxRetryLogSynced(logId: string, orderId: string): Promise<void> {
-  await db.shoppingSyncLog.update({
-    where: { id: logId },
+  // A ROW THAT NAMES (OR IS ABOUT) A STORED RECEIPT IS NEVER RETIRED UNTIL THAT RECEIPT'S OBLIGATION IS PROVEN ON RECORD, at this moment and not at the moment a branch was planned: the row is
+  // re-read (a concurrent delivery may have recorded a receiptPaymentId on it since), every WooCommerce-recorded receipt of the order (and the named one) is proven or re-registered, and a
+  // failure to prove throws WcReceiptRegistrationNotRecorded, which keeps the row PENDING. The write itself only retires a row that is still PENDING.
+  const current = await db.shoppingSyncLog.findUnique({ where: { id: logId }, select: { payload: true } })
+  const named = (current?.payload as { receiptPaymentId?: unknown } | null)?.receiptPaymentId
+  await redriveUnregisteredWcReceipts(orderId, typeof named === 'string' ? named : undefined)
+  await db.shoppingSyncLog.updateMany({
+    where: { id: logId, status: 'PENDING' },
     data: {
       status: 'SYNCED',
       entityId: orderId,
@@ -833,7 +839,7 @@ async function wcReceiptObligationIsOnRecord(orderId: string, paymentId: string)
 }
 
 /** The evidence read, as a seam so a test can state "the registration did not reach the record" without a live accounting connector. */
-export const wcReceiptRegistrationSeams = { obligationIsOnRecord: wcReceiptObligationIsOnRecord }
+export const wcReceiptRegistrationSeams: { obligationIsOnRecord: (orderId: string, paymentId: string) => Promise<boolean>; afterPlan?: (orderId: string) => Promise<void> } = { obligationIsOnRecord: wcReceiptObligationIsOnRecord }
 
 /** Register one stored receipt and prove the obligation is on record, or throw so the caller keeps the work queued. */
 async function registerWcReceiptAndProveObligation(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
@@ -967,11 +973,13 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
 
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string): Promise<void> {
   const transition = await planWcPaidTransition(orderId, wcOrder)
+  await wcReceiptRegistrationSeams.afterPlan?.(orderId)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
   if (transition.kind === 'record') await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate)
   if (transition.kind === 'blocked') throw transition.error
-  // An order already paid in IMS: any receipt this path recorded whose registration never reached the record is registered again (idempotent).
-  if (transition.kind === 'none' && wcOrder.date_paid_gmt) await redriveUnregisteredWcReceipts(orderId, receiptPaymentId)
+  // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
+  // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
+  await redriveUnregisteredWcReceipts(orderId, receiptPaymentId)
 }
 
 async function updateExistingWcOrderCore(

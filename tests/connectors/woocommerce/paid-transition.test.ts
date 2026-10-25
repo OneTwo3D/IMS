@@ -255,3 +255,42 @@ test('the scheduled fx-rates run retries a receipt obligation even when NO curre
   assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: waiting.id } })).status, 'PENDING')
   assert.equal(registrations.filter((r) => r.paymentId === paymentId).length, before + 1)
 })
+
+// Two retries both plan unpaid -> paid. A commits the Payment and its registration fails (the row names the receipt); B (planned before A committed) loses the locked claim.
+// B must NOT retire the row on a receipt that has no obligation on record. [mutation: skip the redrive after a lost claim; mark SYNCED without the proof]
+test('A/B interleaving: B loses the claim after A recorded a failed registration; the row stays PENDING until the receipt is proven, then a sweep registers it exactly once', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  const log = await s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(o.wcId), payload: {} } })
+  const p = payload(Number(o.wcId), '2026-10-01T10:00:00')
+  const real = oi.wcReceiptRegistrationSeams.obligationIsOnRecord
+  const everFalse = async () => false
+  let ranA = false
+  oi.wcReceiptRegistrationSeams.afterPlan = async () => {
+    if (ranA) return
+    ranA = true
+    // A runs completely (plan, claim, Payment, a registration that does not reach the record) in the window between B's plan and B's claim.
+    oi.wcReceiptRegistrationSeams.obligationIsOnRecord = everFalse
+    await oi.importWcOrder(p, { pendingFxRetryLogId: log.id })
+  }
+  try {
+    // B: its plan said 'record'; by its claim A has committed. The proof is still false (A's registration is not on record): B must not retire the row.
+    const b = await oi.importWcOrder(p, { pendingFxRetryLogId: log.id })
+    assert.equal(b.success, false)
+  } finally { oi.wcReceiptRegistrationSeams.afterPlan = undefined }
+  assert.equal((await payments(o.id)).length, 1, 'one Payment: B lost the claim')
+  const row = await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })
+  assert.equal(row.status, 'PENDING')
+  const paymentId = (await payments(o.id))[0]!.id
+  assert.equal((row.payload as { receiptPaymentId?: string }).receiptPaymentId, paymentId)
+  // the evidence appears once the receipt has been registered again: the next sweep does that, exactly once
+  const before = registrations.filter((r) => r.paymentId === paymentId).length
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > before
+  await oi.retryPendingWcOrdersWaitingForFx()
+  assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: log.id } })).status, 'SYNCED')
+  assert.equal(registrations.filter((r) => r.paymentId === paymentId).length, before + 1)
+  await oi.retryPendingWcOrdersWaitingForFx()
+  assert.equal(registrations.filter((r) => r.paymentId === paymentId).length, before + 1)
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real
+})
