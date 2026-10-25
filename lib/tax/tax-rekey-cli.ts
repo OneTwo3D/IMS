@@ -92,6 +92,7 @@ function renderPlan(plan: RekeyPlan): string[] {
       const live = row.target === null ? '' : `  -> ${row.target.taxType} "${row.target.name}" ${row.target.percent ?? '(no percentage)'}%`
       const refs = plan.references[row.imsRateId]
       const refText = refs === undefined ? '' : `  [suppliers ${refs.suppliers}, storefront mappings ${refs.storefrontMappings}${refs.isDefault ? ', DEFAULT RATE' : ''}, unposted orders ${refs.unpostedSalesOrders} sales / ${refs.unpostedPurchaseOrders} purchase, queued payloads ${refs.queuedSyncRows + refs.queuedEvents}, posted lines ${refs.postedSalesOrderLines + refs.postedPurchaseOrderLines} stay]`
+      for (const c of row.clearedComponents) lines.push(`    component "${c.name}" keeps no code: ${c.taxType} is not a live ACTIVE type, the new row gets none`)
       lines.push(`  ${row.name} [${row.usedFor}${row.countryCode ? ` ${row.countryCode}` : ''}] ${row.currentCode} ${row.imsPercent}%${live}  (${row.matchedBy ?? 'no name match'}: ${row.reason})${refText}`)
     }
   }

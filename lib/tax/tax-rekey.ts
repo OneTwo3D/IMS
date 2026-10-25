@@ -15,7 +15,7 @@
  *
  * THE APPLY (explicit). `confirm` must be the digest of the plan the operator saw. In ONE transaction inside the Xero connection fence (the lock #797's import takes, so a rebind or a second
  * run cannot interleave) the plan is rebuilt from the locked state; a different digest writes NOTHING. For each REKEY it then:
- *   1. creates a NEW TaxRate with the live code and the same name, rate, type, category, usedFor, country, flags and components; the old row is NEVER edited (documents reference it): it is only
+ *   1. creates a NEW TaxRate (a component's own custom code that is not a live ACTIVE type is cleared to null on the new row, and listed in the plan) with the live code and the same name, rate, type, category, usedFor, country, flags and components; the old row is NEVER edited (documents reference it): it is only
  *      deactivated (and loses isDefault, which the new row takes);
  *   2. re-points the supplier default tax rates and the WooCommerce rate mappings (ShoppingTaxRateMapping) to the new row;
  *   3. leaves every POSTED document on the old row: its posted meaning cannot change;
@@ -30,7 +30,7 @@
  *   - UNPOSTED documents (an order with no invoice number / invoice id / invoice sync row / accounting event; a PO with no bill; neither cancelled) would still post the OLD code when they
  *     are sent, because their lines reference the old row. They BLOCK the apply (UNPOSTED_DOCUMENTS, with counts) unless the operator passes the explicit flag, which re-points those
  *     lines to the new row (same name, same percentage: no amount changes).
- *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED, or an accounting event PENDING / FAILED, whose lines carry the old code) are snapshots IMS does not rewrite.
+ *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED - a FAILED row keeps blocking until it is retried or cancelled - or an accounting event PENDING / FAILED, whose lines carry the old code) are snapshots IMS does not rewrite.
  *     They BLOCK the apply (QUEUED_PAYLOADS) with no override: let them post, or cancel them, first.
  * The rows an operator-confirmed apply would re-point are those counted in the plan the digest covers.
  */
@@ -68,8 +68,10 @@ export interface RekeyImsRate {
   countryCode: string | null
   accountingTaxType: string | null
   isDefault: boolean
-  components: ImsComponentRow[]
+  components: Array<ImsComponentRow & { name?: string; accountingTaxType?: string | null }>
 }
+
+export interface RekeyClearedComponent { sortOrder: number; name: string; taxType: string }
 
 export interface RekeyCandidate { taxType: string; name: string; status: string; percent: string | null }
 
@@ -91,6 +93,8 @@ export interface RekeyRow {
   /** The percentage tax is computed at (active components), when it differs from the column. */
   imsEffectivePercent: string | null
   reason: string
+  /** REKEY only: components of the old rate whose own custom code is not a live ACTIVE type; the new row's copy of each gets null (as the importer writes). Built-in and live-valid codes are kept. */
+  clearedComponents: RekeyClearedComponent[]
 }
 
 export interface RekeyReferences {
@@ -172,7 +176,16 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
     const matchedBy = exact.length > 0 ? 'EXACT' as const : tier.length > 0 ? 'CASE_INSENSITIVE' as const : null
     const candidates = tier.map(candidateOf)
     const done = (outcome: RekeyOutcome, target: NormalisedXeroTaxRate | null, reason: string): void => {
-      rows.push({ ...base, outcome, matchedBy, target: target === null ? null : candidateOf(target), candidates, reason })
+      const cleared: RekeyClearedComponent[] = []
+      if (outcome === 'REKEY') {
+        for (const [index, c] of rate.components.entries()) {
+          const t = c.accountingTaxType ?? null
+          if (t === null || !isOrganisationSpecificTaxType(t)) continue
+          if (xero.some((x) => x.taxType === t && x.status === 'ACTIVE')) continue
+          cleared.push({ sortOrder: c.sortOrder ?? index, name: c.name ?? '', taxType: t })
+        }
+      }
+      rows.push({ ...base, outcome, matchedBy, target: target === null ? null : candidateOf(target), candidates, reason, clearedComponents: cleared })
     }
     if (tier.length === 0) { done('NO_MATCH', null, 'no live Xero tax type has this name'); continue }
     const active = tier.filter((row) => row.status === 'ACTIVE')
@@ -325,12 +338,12 @@ export async function readRekeyPlan(client: Client, options: { now: Date; connec
   }
   const stored = await client.taxRate.findMany({
     where: { active: true },
-    select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, components: { where: { active: true }, select: { rate: true, compoundOnPrevious: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
+    select: { id: true, name: true, rate: true, usedFor: true, countryCode: true, accountingTaxType: true, isDefault: true, components: { select: { name: true, rate: true, compoundOnPrevious: true, accountingTaxType: true, active: true, sortOrder: true }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
     orderBy: [{ name: 'asc' }, { id: 'asc' }],
   })
   const rates: RekeyImsRate[] = stored.map((r) => ({
     id: r.id, name: r.name, rate: r.rate.toFixed(4), usedFor: r.usedFor, countryCode: r.countryCode, accountingTaxType: r.accountingTaxType, isDefault: r.isDefault,
-    components: r.components.map((c) => ({ rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, active: c.active, sortOrder: c.sortOrder })),
+    components: r.components.map((c) => ({ name: c.name, rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType, active: c.active, sortOrder: c.sortOrder })),
   }))
   const matched = matchRekeyRates({ rates, xero: read.list.rows })
   const references: Record<string, RekeyReferences> = {}
@@ -373,7 +386,7 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
         name: old.name, rate: old.rate, type: old.type, taxCategory: old.taxCategory, usedFor: old.usedFor, accountingTaxType: toCode, countryCode: old.countryCode,
         isCompound: old.isCompound, reverseCharge: old.reverseCharge, reportingCategory: old.reportingCategory, active: true, isDefault: old.isDefault,
         components: old.components.length === 0 ? undefined : {
-          create: old.components.map((c) => ({ name: c.name, rate: c.rate, compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType, sortOrder: c.sortOrder, active: c.active })),
+          create: old.components.map((c) => ({ name: c.name, rate: c.rate, compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: row.clearedComponents.some((x) => x.sortOrder === c.sortOrder && x.taxType === c.accountingTaxType) ? null : c.accountingTaxType, sortOrder: c.sortOrder, active: c.active })),
         },
       },
       select: { id: true },

@@ -173,6 +173,20 @@ test('every outcome is reachable and the counts add up', () => {
   assert.equal(REKEY_OUTCOMES.every((o) => plan.counts[o] === 1), true)
 })
 
+// [mutation: clearedComponents always empty -> the arm fails]
+test('components: a custom code that is not a live ACTIVE type is listed to be cleared on a REKEY; built-in and live-valid codes are kept; ALREADY_CORRECT lists none', () => {
+  const comp = (sortOrder: number, code: string | null) => ({ name: `c${sortOrder}`, rate: '0.1900', compoundOnPrevious: false, active: sortOrder === 0, sortOrder, accountingTaxType: code })
+  const live = [...LIVE, xeroRow('TAX077', 'Other VAT', '5', { status: 'ARCHIVED' })]
+  const rate = ims('cy', 'CY VAT', 'TAX005', '0.1900', { components: [comp(0, 'TAX099'), comp(1, 'OUTPUT2'), comp(2, 'TAX012'), comp(3, null), comp(4, 'TAX077')] })
+  const row = match([rate], live).rows[0]!
+  assert.equal(row.outcome, 'REKEY')
+  assert.deepEqual(row.clearedComponents.map((c) => [c.sortOrder, c.taxType]), [[0, 'TAX099'], [4, 'TAX077']])
+  const ok = match([ims('cy', 'CY VAT', 'TAX008', '0.1900', { components: [comp(0, 'TAX099')] })], live).rows[0]!
+  assert.deepEqual([ok.outcome, ok.clearedComponents], ['ALREADY_CORRECT', []])
+  const base = planOf()
+  assert.notEqual(digestRekeyPlan({ ...base, rows: base.rows.map((r) => r.imsRateId === 'cy' ? { ...r, clearedComponents: [{ sortOrder: 0, name: 'c', taxType: 'TAX099' }] } : r) }), base.digest, 'the digest covers the cleared components')
+})
+
 // ---- the digest and the refusals to apply ---------------------------------------------------------------
 
 const refs = (over: Partial<RekeyReferences> = {}): RekeyReferences => ({

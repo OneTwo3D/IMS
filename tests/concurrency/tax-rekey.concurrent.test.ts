@@ -110,7 +110,7 @@ async function seedWorld(d: Deps) {
     const row = await db.taxRate.create({
       data: {
         name: `${TAG}${name}`, rate: fraction, usedFor: over.usedFor ?? 'SALES', accountingTaxType: oldCode, countryCode: null, isDefault: over.isDefault ?? false, reportingCategory: 'EC_SALES', isCompound: false,
-        components: over.components === false ? undefined : { create: [{ name: 'VAT', rate: fraction, sortOrder: 0, accountingTaxType: null }] },
+        components: over.components === false ? undefined : { create: [{ name: 'VAT', rate: fraction, sortOrder: 0, accountingTaxType: key === 'cy' ? code('DEMO') : key === 'gr' ? 'OUTPUT2' : null }] },
       },
     })
     created.rates.push(row.id)
@@ -302,6 +302,9 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
     ['CY VAT', 'C', '0.1900', 'SALES', 'EC_SALES', true, 1, '0.1900'],
     ['GR VAT', 'D', '0.2400', 'BOTH', 'EC_SALES', false, 1, '0.2400'],
   ])
+  // Components: a stale Demo code is cleared on the NEW row only; a built-in is kept; the old rows' components are untouched (the frozen snapshot above).
+  assert.deepEqual(fresh.map((r) => [r.name.slice(TAG.length), r.components[0]?.accountingTaxType ?? null]), [['BE VAT', null], ['CY VAT', null], ['GR VAT', 'OUTPUT2']])
+  assert.equal((await db.taxRateComponent.findFirstOrThrow({ where: { taxRateId: w.ids.cy } })).accountingTaxType, code('DEMO'), 'the referenced old row keeps its component as it was')
   const newId = (name: string) => fresh.find((r) => r.name === `${TAG}${name}`)!.id
 
   // References: suppliers and mappings follow; the untouched rate's follow nothing.

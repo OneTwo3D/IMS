@@ -1517,7 +1517,7 @@ run that records tax-rate drift).
   connection fence, creates a new rate with the live code, deactivates the old one (never edits it) and moves supplier defaults and WooCommerce mappings. Posted
   documents keep the old rate. The sales invoice and the supplier bill read the code from the line's rate **when they are enqueued** (`enqueueSalesInvoiceSync`,
   `createPurchaseInvoice`) and the queued payload carries `lines[].taxType` as a snapshot, so unposted orders refuse the apply unless re-pointed on request, and
-  queued payloads carrying the old code always refuse it. After it, the VAT difference report shows no `PERCENTAGE_MISMATCH_IMS_XERO` for the re-keyed rates.
+  queued payloads carrying the old code (FAILED sync rows included, until retried or cancelled) always refuse it. A component's own stale custom code is cleared on the new rate and shown in the plan. After it, the VAT difference report shows no `PERCENTAGE_MISMATCH_IMS_XERO` for the re-keyed rates.
 - **One VAT set: the difference report.** Owner ruling 2026-10-25: WooCommerce, IMS and Xero use the same set of VAT rates and Xero is the master.
   WooCommerce tax-rate writes are **operator-manual at P1** (the ownership map row `woocommerce` / `tax-rate`: P1 `operator-manual`, P2 `IMS`; IMS
   has no producer for it yet). To make the manual correction easy, **Settings > Accounting > Tax > VAT rate differences** and `npm run vat:diff`
