@@ -70,20 +70,24 @@ export function redactedLinePreview(line: string): string {
 }
 
 /**
- * Pure. The ACTIVE lines of a cron.d file that sit outside the managed block (user field already removed). In cron.d mode the file
- * belongs entirely to the renderer: anything that is not blank, a comment or a NAME=value environment line, outside the START/END
- * markers, is a job cron will run (a copy of a managed job appended after END fires it twice), so it is not a scheduler the block can
- * vouch for. Marker problems (a second pair, an unbalanced one) are reported by `parseManagedBlock`.
+ * Pure. What a cron.d file holds OUTSIDE its managed block (user field already removed). In cron.d mode the file belongs entirely to
+ * the renderer, so outside the START/END markers only blank lines and `#` comments are allowed:
+ *   - an ACTIVE line is a job cron will also run (a copy of a managed job appended after END fires it twice);
+ *   - a `NAME=value` assignment is applied by cron to every job that follows it (`SHELL=/bin/false` before the block would stop every
+ *     managed job from running while the block itself still looks perfect).
+ * Either way the block cannot vouch for the schedule. Marker problems (a second pair, an unbalanced one) are reported by
+ * `parseManagedBlock`. Assignments INSIDE the block are whatever the renderer emits, covered by the exact block comparison.
  */
-export function activeLinesOutsideManagedBlock(text: string): string[] {
-  const out: string[] = []
+export function linesOutsideManagedBlock(text: string): { active: string[]; assignments: string[] } {
+  const out = { active: [] as string[], assignments: [] as string[] }
   let inside = false
   for (const line of text.replace(/\r\n?/g, '\n').split('\n')) {
     const trimmed = line.trim()
     if (trimmed === OTI_CRON_START_MARKER) { inside = true; continue }
     if (trimmed === OTI_CRON_END_MARKER) { inside = false; continue }
-    if (inside || trimmed === '' || trimmed.startsWith('#') || ASSIGNMENT_RE.test(trimmed)) continue
-    out.push(trimmed)
+    if (inside || trimmed === '' || trimmed.startsWith('#')) continue
+    if (ASSIGNMENT_RE.test(trimmed)) out.assignments.push(trimmed)
+    else out.active.push(trimmed)
   }
   return out
 }
@@ -155,13 +159,14 @@ export function readSchedulerCrontabFile(
   const text = bytes.toString('utf8')
   if (format !== 'cron.d') return { resolved: true, text }
   const stripped = stripCronDUserField(text)
-  const outside = activeLinesOutsideManagedBlock(stripped)
-  if (outside.length > 0) {
-    const shown = outside.slice(0, 3).map((line) => `"${redactedLinePreview(line)}"`).join(', ')
-    return {
-      resolved: false,
-      reason: `${OUTSIDE_LINES_REASON_PREFIX} ${outside.length} active line(s) outside the managed block that cron would also run (${shown}${outside.length > 3 ? ', ...' : ''}); the cron.d file must contain only the rendered block`,
-    }
+  const outside = linesOutsideManagedBlock(stripped)
+  if (outside.active.length > 0 || outside.assignments.length > 0) {
+    const preview = (lines: string[]) => lines.slice(0, 3).map((line) => `"${redactedLinePreview(line)}"`).join(', ') + (lines.length > 3 ? ', ...' : '')
+    const found = [
+      outside.active.length > 0 ? `${outside.active.length} active line(s) outside the managed block that cron would also run (${preview(outside.active)})` : '',
+      outside.assignments.length > 0 ? `${outside.assignments.length} environment assignment(s) outside the managed block that cron applies to the jobs after them (${preview(outside.assignments)})` : '',
+    ].filter(Boolean).join('; ')
+    return { resolved: false, reason: `${OUTSIDE_LINES_REASON_PREFIX} ${found}; the cron.d file must contain only the rendered block` }
   }
   return { resolved: true, text: stripped }
 }

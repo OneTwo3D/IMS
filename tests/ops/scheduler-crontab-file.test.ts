@@ -6,7 +6,7 @@ import { test } from 'node:test'
 
 import { readCrontabForReport } from '../../lib/ops/read-sync-status.ts'
 import {
-  activeLinesOutsideManagedBlock, redactedLinePreview, SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
+  linesOutsideManagedBlock, redactedLinePreview, SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
 } from '../../lib/ops/scheduler-crontab-file.ts'
 
 /** A stubbed stat: what cron checks on the host file. */
@@ -128,8 +128,8 @@ test('cron.d: an active line OUTSIDE the managed block makes the read unresolved
   const block = `${START}\n# Alpha Job\n* * * * *  root  curl -sf "$BASE_URL/a"\n${END}\n`
   const cronD = { [SCHEDULER_CRONTAB_FORMAT_ENV]: 'cron.d' }
   const read = (text: string) => readSchedulerCrontabFile('/host-cron.d/onetwo3d-ims', cronD, () => Buffer.from(text), ROOT_FILE)
-  // Allowed outside: blank lines, comments, NAME=value.
-  assert.equal(read(`# Source: saved\nSHELL=/bin/sh\nPATH=/usr/bin\n\n${block}\n# trailing\nMAILTO=""\n`).resolved, true)
+  // Allowed outside: blank lines and comments ONLY.
+  assert.equal(read(`# Source: saved\n# Layout: cron.d\n\n${block}\n# trailing\n`).resolved, true)
   // A copy of a managed job after END, an unrelated job, a job BEFORE the block: all run under cron.
   for (const stray of [`* * * * *  root  curl -sf "$BASE_URL/a"`, '0 3 * * * root /usr/local/bin/other --token=abc123', '@daily root run-it']) {
     for (const text of [`${block}${stray}\n`, `${stray}\n${block}`]) {
@@ -142,11 +142,34 @@ test('cron.d: an active line OUTSIDE the managed block makes the read unresolved
   }
   assert.match((read(`${block}0 3 * * * root /x --token=abc123\n`) as { reason: string }).reason, /--token=<redacted>/)
   // Two blocks: the reader keeps the text, and parseManagedBlock (the status reader) refuses the second region.
-  assert.equal(activeLinesOutsideManagedBlock(`${block}${block}`).length, 0)
+  assert.deepEqual(linesOutsideManagedBlock(`${block}${block}`), { active: [], assignments: [] })
   assert.equal(redactedLinePreview('x CRON_SECRET="s3cr3t" y=1'), 'x CRON_SECRET=<redacted> y=<redacted>')
 })
 
 test('user format: lines outside the block are the operator\'s own jobs and are left alone', () => {
   const text = `0 5 * * * /home/me/backup.sh\n${START}\n# Alpha Job\n* * * * *  curl x\n${END}\n30 6 * * * /home/me/other\n`
   assert.deepEqual(readSchedulerCrontabFile('/etc/ims/crontab', {}, () => Buffer.from(text)), { resolved: true, text })
+})
+
+test('cron.d: a NAME=value assignment OUTSIDE the block is refused (cron applies it to the jobs after it)', () => {
+  const block = `${START}\n# Alpha Job\n* * * * *  root  curl -sf "$BASE_URL/a"\n${END}\n`
+  const cronD = { [SCHEDULER_CRONTAB_FORMAT_ENV]: 'cron.d' }
+  const read = (text: string) => readSchedulerCrontabFile('/host-cron.d/onetwo3d-ims', cronD, () => Buffer.from(text), ROOT_FILE)
+  for (const text of [`SHELL=/bin/false\n${block}`, `${block}PATH=/nonexistent\n`, `MAILTO=\n${block}`, `${block}CRON_TZ=Asia/Tokyo\n`]) {
+    const result = read(text)
+    assert.equal(result.resolved, false, text)
+    assert.match((result as { reason: string }).reason, /^Host cron is out of date: 1 environment assignment\(s\) outside the managed block/)
+  }
+  const shell = (read(`SHELL=/bin/false\n${block}`) as { reason: string }).reason
+  assert.match(shell, /SHELL=<redacted>/)
+  assert.doesNotMatch(shell, /\/bin\/false/, 'the value is never shown')
+  // Comments and blank lines outside are fine; an assignment INSIDE the block is whatever the renderer emitted.
+  assert.equal(read(`# a comment\n\n${block}\n# another\n`).resolved, true)
+  assert.equal(read(`${START}\nBASE_URL="http://h/api/cron"\n${END}\n`).resolved, true)
+  // Both kinds at once are both reported.
+  const both = (read(`SHELL=/bin/false\n${block}* * * * * root x\n`) as { reason: string }).reason
+  assert.match(both, /1 active line\(s\).*; 1 environment assignment\(s\)/)
+  // The user format is unchanged: assignments outside the block are the operator's own.
+  const userText = `SHELL=/bin/sh\nPATH=/usr/bin\n${block}MAILTO=me\n`
+  assert.deepEqual(readSchedulerCrontabFile('/etc/ims/crontab', {}, () => Buffer.from(userText)), { resolved: true, text: userText })
 })
