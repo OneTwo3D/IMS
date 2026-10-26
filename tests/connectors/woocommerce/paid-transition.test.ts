@@ -339,6 +339,7 @@ test('the scheduled orphan sweep finds a stored WooCommerce receipt with no obli
   registrations.length = 0
   const real = oi.wcReceiptRegistrationSeams.obligationIsOnRecord
   oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > 0
+  oi.wcReceiptRegistrationSeams.registrationsAreOwed = async () => true
   try {
     const r1 = await oi.sweepUnregisteredWcReceipts()
     assert.ok(r1.registered >= 1)
@@ -346,7 +347,47 @@ test('the scheduled orphan sweep finds a stored WooCommerce receipt with no obli
     assert.equal(registrations.filter((r) => r.paymentId === early.id).length, 0, 'an order with no posted invoice is not the sweep\'s (the invoice post registers it)')
     await oi.sweepUnregisteredWcReceipts()
     assert.equal(registrations.filter((r) => r.paymentId === orphan.id).length, 1, 'not again')
-  } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real }
+  } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real; oi.wcReceiptRegistrationSeams.registrationsAreOwed = undefined }
   const route = (await import('node:fs')).readFileSync('app/api/cron/fx-rates/route.ts', 'utf8')
   assert.match(route, /sweepUnregisteredWcReceipts\(50\)/)
+})
+
+// STARVATION: a bounded batch must not be filled by rows that cannot make progress or need nothing.
+// [mutation: apply the limit before the filter (newest 50 eligible); order the batch without the last-attempt rotation]
+test('the sweep selects only unrecorded receipts BEFORE the limit: 50 registered newer receipts do not hide an older unresolved one', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const holder = await heldOrder()
+  await s.db.salesOrder.update({ where: { id: holder.id }, data: { accountingInvoiceId: `INV-${holder.id}`, paidAt: new Date('2026-10-01T10:00:00Z') } })
+  const unresolved = await s.db.payment.create({ data: { orderId: holder.id, amount: 1, currency: 'EUR', notes: 'Recorded from WooCommerce (x)' } })
+  const registered: string[] = []
+  for (let i = 0; i < 55; i++) {
+    const p = await s.db.payment.create({ data: { orderId: holder.id, amount: 1, currency: 'EUR', notes: 'Recorded from WooCommerce (y)' } })
+    registered.push(p.id)
+    await s.db.accountingSyncLog.create({ data: { type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: holder.id, status: 'SYNCED', payload: { paymentId: p.id } } })
+  }
+  await s.sql(`update payments set "createdAt" = now() - interval '2 hours' where id = $1`, [unresolved.id])
+  await s.sql(`update payments set "createdAt" = now() - interval '1 hour' where id = any($1::text[])`, [registered])
+  registrations.length = 0
+  oi.wcReceiptRegistrationSeams.registrationsAreOwed = async () => true
+  oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > 0
+  try {
+    const r = await oi.sweepUnregisteredWcReceipts(50)
+    assert.equal(registrations.filter((x) => x.paymentId === unresolved.id).length, 1, 'registered within one run')
+    assert.ok(r.examined <= 50)
+    assert.equal(registrations.filter((x) => registered.includes(x.paymentId as string)).length, 0, 'registered receipts took no slot')
+  } finally { oi.wcReceiptRegistrationSeams.registrationsAreOwed = undefined; oi.wcReceiptRegistrationSeams.obligationIsOnRecord = oi.wcReceiptRegistrationSeams.obligationIsOnRecord }
+})
+
+test('rotation: the batch is the rows attempted LEAST recently; a row just attempted goes behind a never-attempted newer one', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  await s.sql(`update shopping_sync_logs set status = 'FAILED' where status = 'PENDING'`)
+  const mk = async (n: number, extra: Record<string, unknown>) => s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: `77${n}`, payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: `77${n}`, externalOrderNumber: `77${n}`, currency: 'EUR', asOf: null, order: { id: 770 + n, status: 'processing', currency: 'EUR', date_created_gmt: '2026-10-01T09:00:00', line_items: [], meta_data: [] }, receiptPaymentId: `p${n}`, ...extra } } })
+  const old = await mk(1, { lastAttemptAt: new Date().toISOString() })
+  await new Promise((r) => setTimeout(r, 20))
+  const fresh = await mk(2, {})
+  await oi.retryPendingWcOrdersWaitingForFx(1, { receiptsOnly: true })
+  const after = async (id: string) => (await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id } }))
+  const touched = (row: Awaited<ReturnType<typeof after>>, prior: string | null) => row.status !== 'PENDING' || (row.payload as { lastAttemptAt?: string }).lastAttemptAt !== prior
+  assert.equal(touched(await after(fresh.id), null), true, 'the never-attempted row was attempted first')
+  assert.equal(touched(await after(old.id), (old.payload as { lastAttemptAt: string }).lastAttemptAt), false, 'the row attempted most recently was left for later, though it is older')
 })

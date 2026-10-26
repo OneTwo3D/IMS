@@ -836,7 +836,13 @@ async function wcReceiptObligationIsOnRecord(orderId: string, paymentId: string)
 }
 
 /** The evidence read, as a seam so a test can state "the registration did not reach the record" without a live accounting connector. */
-export const wcReceiptRegistrationSeams: { obligationIsOnRecord: (orderId: string, paymentId: string) => Promise<boolean>; afterPlan?: (orderId: string) => Promise<void>; afterReceiptCommit?: (orderId: string) => Promise<void>; insideReceiptTransaction?: () => Promise<void> } = { obligationIsOnRecord: wcReceiptObligationIsOnRecord }
+async function defaultRegistrationsAreOwed(): Promise<boolean> {
+  const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
+  const connector = await getActiveAccountingConnectorInfo().catch(() => null)
+  return connector !== null && (await isAccountingSyncTypeEnabledFor(connector.id, 'INVOICE_PAYMENT').catch(() => false))
+}
+
+export const wcReceiptRegistrationSeams: { obligationIsOnRecord: (orderId: string, paymentId: string) => Promise<boolean>; afterPlan?: (orderId: string) => Promise<void>; afterReceiptCommit?: (orderId: string) => Promise<void>; insideReceiptTransaction?: () => Promise<void>; registrationsAreOwed?: () => Promise<boolean> } = { obligationIsOnRecord: wcReceiptObligationIsOnRecord }
 
 /** Register one stored receipt and prove the obligation is on record, or throw so the caller keeps the work queued. */
 async function registerWcReceiptAndProveObligation(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
@@ -3148,20 +3154,38 @@ export function isQueuedWcOrderPayload(payload: unknown): payload is PendingFxOr
  * receipt (the enqueue key). Run by the scheduled fx-rates cron every run.
  */
 export async function sweepUnregisteredWcReceipts(limit = 50): Promise<{ examined: number; registered: number; failed: number }> {
+  const result = { examined: 0, registered: 0, failed: 0 }
+  // Nothing is owed when no accounting connector posts payments: asked ONCE, so such receipts never fill the batch.
+  if (!(await (wcReceiptRegistrationSeams.registrationsAreOwed ?? defaultRegistrationsAreOwed)())) return result
+  const take = Math.min(Math.max(limit, 1), 250)
+  const cutoff = new Date(Date.now() - 5 * 60_000)
+  // THE FILTER IS IN THE QUERY, BEFORE THE LIMIT: only receipts with NO INVOICE_PAYMENT sync row and NO decided-refusal notice are candidates (anti-joins), so receipts that are already
+  // registered can never occupy a slot. Ordered by the last failed attempt (never-attempted first), then oldest, so a receipt that keeps failing moves behind the others.
+  const candidates = await db.$queryRaw<Array<{ id: string }>>`
+    SELECT p.id FROM "payments" p
+    JOIN "sales_orders" o ON o.id = p."orderId"
+    WHERE p."refundId" IS NULL AND p.notes LIKE 'Recorded from WooCommerce%' AND p."createdAt" < ${cutoff} AND o.accounting_invoice_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" l WHERE l.type = 'INVOICE_PAYMENT' AND l."referenceType" = 'SalesOrder' AND l."referenceId" = p."orderId" AND l.payload->>'paymentId' = p.id)
+      AND NOT EXISTS (SELECT 1 FROM "activity_logs" a WHERE a.action = 'invoice_payment_not_registered' AND a."entityType" = 'SALES_ORDER' AND a."entityId" = p."orderId" AND a.metadata->>'paymentId' = p.id)
+    ORDER BY coalesce((SELECT max(f."createdAt") FROM "activity_logs" f WHERE f.action IN ('invoice_payment_not_queued', 'wc_receipt_sweep_attempt_failed') AND f."entityType" = 'SALES_ORDER' AND f."entityId" = p."orderId" AND f.metadata->>'paymentId' = p.id), 'epoch'::timestamp) ASC, p."createdAt" ASC
+    LIMIT ${take}`
   const rows = await db.payment.findMany({
-    where: { refundId: null, notes: { startsWith: 'Recorded from WooCommerce' }, createdAt: { lt: new Date(Date.now() - 5 * 60_000) }, order: { accountingInvoiceId: { not: null } } },
+    where: { id: { in: candidates.map((c) => c.id) } },
     select: { id: true, orderId: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { externalOrderNumber: true, orderNumber: true } } },
-    orderBy: { createdAt: 'desc' },
-    take: Math.min(Math.max(limit, 1), 250),
   })
-  const result = { examined: rows.length, registered: 0, failed: 0 }
-  for (const r of rows) {
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  result.examined = candidates.length
+  for (const c of candidates) {
+    const r = byId.get(c.id)
+    if (!r) continue
     try {
+      // the up-front query is the filter; the probe is the final word for what the query cannot see (a connector moved since)
       if (await wcReceiptRegistrationSeams.obligationIsOnRecord(r.orderId, r.id)) continue
       await registerWcReceiptAndProveObligation(r.orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? r.orderId, r)
       result.registered++
     } catch {
       result.failed++
+      await logActivity({ entityType: 'SALES_ORDER', entityId: r.orderId, action: 'wc_receipt_sweep_attempt_failed', tag: 'sync', level: 'WARNING', description: 'The scheduled sweep could not register a stored WooCommerce receipt; it is retried behind the others.', metadata: { paymentId: r.id } }).catch(() => undefined)
     }
   }
   return result
@@ -3175,75 +3199,90 @@ export async function retryPendingWcOrdersWaitingForFx(
    */
   options: { receiptsOnly?: boolean } = {},
 ): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
-  const rows = await db.shoppingSyncLog.findMany({
-    where: options.receiptsOnly
-      ? { AND: [pendingFxQueueWhere(), { payload: { path: ['receiptPaymentId'], string_starts_with: '' } }] }
-      : pendingFxQueueWhere(),
-    orderBy: { createdAt: 'asc' },
-    take: Math.min(Math.max(limit, 1), 250),
-    select: { id: true, payload: true },
-  })
+  // ROTATION: the batch is the rows attempted LEAST RECENTLY (payload.lastAttemptAt, never-attempted first, then oldest), and every attempt stamps the row afterwards, so a row that keeps
+  // failing moves to the back and cannot starve the ones behind it. The bound is unchanged.
+  const take = Math.min(Math.max(limit, 1), 250)
+  const ordered = options.receiptsOnly
+    ? await db.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "shopping_sync_logs"
+        WHERE connector = 'woocommerce' AND direction = 'FROM_CONNECTOR' AND status = 'PENDING' AND "entityType" = 'SalesOrder' AND "entityId" IS NULL
+          AND payload->>'reason' = ${MISSING_FX_RATE_QUEUE_REASON} AND payload->>'receiptPaymentId' IS NOT NULL
+        ORDER BY coalesce(payload->>'lastAttemptAt', '') ASC, "createdAt" ASC LIMIT ${take}`
+    : await db.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "shopping_sync_logs"
+        WHERE connector = 'woocommerce' AND direction = 'FROM_CONNECTOR' AND status = 'PENDING' AND "entityType" = 'SalesOrder' AND "entityId" IS NULL
+          AND payload->>'reason' = ${MISSING_FX_RATE_QUEUE_REASON}
+        ORDER BY coalesce(payload->>'lastAttemptAt', '') ASC, "createdAt" ASC LIMIT ${take}`
+  const found = await db.shoppingSyncLog.findMany({ where: { AND: [pendingFxQueueWhere(), { id: { in: ordered.map((r) => r.id) } }] }, select: { id: true, payload: true } })
+  const byId = new Map(found.map((r) => [r.id, r]))
+  const rows = ordered.map((r) => byId.get(r.id)).filter((r): r is NonNullable<typeof r> => r !== undefined)
 
   const result = { attempted: rows.length, imported: 0, stillPending: 0, failed: 0 }
   for (const row of rows) {
-    if (!isQueuedWcOrderPayload(row.payload)) {
-      await markPendingFxRetryLogFailed(row.id, 'Pending FX queue payload is missing the WooCommerce order snapshot')
-      result.failed++
-      continue
-    }
-    // Guarded (o3d-d82p): an order can be withdrawn while it sits in this
-    // queue waiting for an FX rate. The webhook records the suppression and
-    // acknowledges, and this retry would then import the STALE processing
-    // snapshot with no marker, leaving it warehouse-eligible until the next
-    // reconciliation — not a millisecond window.
-    const queuedPayload = row.payload
-    const queuedOrder = queuedPayload.order
-    const { importWcOrderGuarded } = await import('./withdrawal')
-    const guarded = await importWcOrderGuarded(
-      queuedOrder,
-      () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id, ...(queuedPayload.receiptPaymentId ? { receiptPaymentId: queuedPayload.receiptPaymentId } : {}) }),
-    )
-    if (guarded.outcome === 'skipped-withdrawal') {
-      // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
-      // row whose order is withdrawn would sit at the head forever and, once
-      // `limit` of them accumulate, every FX refresh would retry only those and
-      // never reach newer orders whose rates are now available — stranding
-      // unrelated paid orders unimported.
-      await markPendingFxRetryLogFailed(
-        row.id,
-        'The customer withdrew this order while it waited for an FX rate, so it was not imported',
+    try {
+      if (!isQueuedWcOrderPayload(row.payload)) {
+        await markPendingFxRetryLogFailed(row.id, 'Pending FX queue payload is missing the WooCommerce order snapshot')
+        result.failed++
+        continue
+      }
+      // Guarded (o3d-d82p): an order can be withdrawn while it sits in this
+      // queue waiting for an FX rate. The webhook records the suppression and
+      // acknowledges, and this retry would then import the STALE processing
+      // snapshot with no marker, leaving it warehouse-eligible until the next
+      // reconciliation — not a millisecond window.
+      const queuedPayload = row.payload
+      const queuedOrder = queuedPayload.order
+      const { importWcOrderGuarded } = await import('./withdrawal')
+      const guarded = await importWcOrderGuarded(
+        queuedOrder,
+        () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id, ...(queuedPayload.receiptPaymentId ? { receiptPaymentId: queuedPayload.receiptPaymentId } : {}) }),
       )
-      result.failed++
-      continue
-    }
-    if (guarded.outcome === 'unresolved') {
-      // Genuinely transient (WooCommerce unreachable): stays pending.
-      result.stillPending++
-      continue
-    }
-    const importResult = guarded.result
-    if (importResult.skipped) {
-      // The FX rate arrived but the order is no longer one IMS takes on. `refuseWcOrderCreate`
-      // has already retired this queue row and moved the order to the by-id admission-refusal
-      // queue, so counting it as imported — which is what a bare `success: true` did — would
-      // report an import that did not happen.
-      result.failed++
-      continue
-    }
-    if (importResult.success && guarded.compensationFailed) {
-      // importWcOrder already marked this queue row SYNCED, so there is no
-      // pending row left to carry the retry. Count it as failed and say why —
-      // the tombstone survives, so the next webhook or poll finishes the job.
-      result.failed++
-      console.error(
-        `[wc-fx-retry] order ${queuedOrder.id} imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
-      )
-    } else if (importResult.success) {
-      result.imported++
-    } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh') || importResult.error?.includes('kept in the retry queue')) {
-      result.stillPending++
-    } else {
-      result.failed++
+      if (guarded.outcome === 'skipped-withdrawal') {
+        // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
+        // row whose order is withdrawn would sit at the head forever and, once
+        // `limit` of them accumulate, every FX refresh would retry only those and
+        // never reach newer orders whose rates are now available — stranding
+        // unrelated paid orders unimported.
+        await markPendingFxRetryLogFailed(
+          row.id,
+          'The customer withdrew this order while it waited for an FX rate, so it was not imported',
+        )
+        result.failed++
+        continue
+      }
+      if (guarded.outcome === 'unresolved') {
+        // Genuinely transient (WooCommerce unreachable): stays pending.
+        result.stillPending++
+        continue
+      }
+      const importResult = guarded.result
+      if (importResult.skipped) {
+        // The FX rate arrived but the order is no longer one IMS takes on. `refuseWcOrderCreate`
+        // has already retired this queue row and moved the order to the by-id admission-refusal
+        // queue, so counting it as imported — which is what a bare `success: true` did — would
+        // report an import that did not happen.
+        result.failed++
+        continue
+      }
+      if (importResult.success && guarded.compensationFailed) {
+        // importWcOrder already marked this queue row SYNCED, so there is no
+        // pending row left to carry the retry. Count it as failed and say why —
+        // the tombstone survives, so the next webhook or poll finishes the job.
+        result.failed++
+        console.error(
+          `[wc-fx-retry] order ${queuedOrder.id} imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
+        )
+      } else if (importResult.success) {
+        result.imported++
+      } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh') || importResult.error?.includes('kept in the retry queue')) {
+        result.stillPending++
+      } else {
+        result.failed++
+      }
+  
+    } finally {
+      // stamp the attempt on a row that is still PENDING (a row that was retired or failed is not rotated)
+      await db.$executeRaw`UPDATE "shopping_sync_logs" SET payload = jsonb_set(payload::jsonb, '{lastAttemptAt}', to_jsonb(${new Date().toISOString()}::text)) WHERE id = ${row.id} AND status = 'PENDING'`.catch(() => undefined)
     }
   }
   if (result.attempted > 0) {
