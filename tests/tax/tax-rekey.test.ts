@@ -138,13 +138,29 @@ test('the name comparison is trimmed and case-sensitive FIRST; case-insensitive 
 // [mutation: the country check removed -> "CY VAT" for a Greek rate is re-keyed to the Cyprus type]
 test('country: an IMS country and a Xero name prefix must agree; no IMS country, or no prefix, is no objection', () => {
   const live = [xeroRow('TAX008', 'CY VAT', '19')]
-  assert.deepEqual([outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'GR' })], live, 'x').outcome, outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'GR' })], live, 'x').target], ['NO_MATCH', null])
+  assert.deepEqual([outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'GR' })], live, 'x').outcome, outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'GR' })], live, 'x').target?.taxType], ['COUNTRY_DIFFERS', 'TAX008'])
   assert.equal(outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'CY' })], live, 'x').outcome, 'REKEY')
   assert.equal(outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: null })], live, 'x').outcome, 'REKEY')
   assert.equal(outcomeOf([ims('x', 'Standard', 'TAX005', '0.2000', { countryCode: 'GB' })], [xeroRow('TAX040', 'Standard', '20')], 'x').outcome, 'REKEY')
   // UK is the IMS/Xero spelling of GB.
   assert.equal(outcomeOf([ims('x', 'UK VAT', 'TAX005', '0.2000', { countryCode: 'GB' })], [xeroRow('TAX040', 'UK VAT', '20')], 'x').outcome, 'REKEY')
-  assert.deepEqual([xeroNameCountry('CY VAT'), xeroNameCountry('EL VAT'), xeroNameCountry('Zero Rated'), xeroNameCountry('20% (VAT on Income)')], ['CY', 'GR', null, null])
+  assert.deepEqual([xeroNameCountry('CY VAT'), xeroNameCountry('EL VAT'), xeroNameCountry('Zero Rated'), xeroNameCountry('20% (VAT on Income)'), xeroNameCountry('cy VAT'), xeroNameCountry(' Uk-VAT'), xeroNameCountry('el vat')], ['CY', 'GR', null, null, 'CY', 'GB', 'GR'])
+})
+
+// [mutation: the prefix parse made uppercase-only again -> the lowercase-disagreeing arm re-keys a Bulgarian rate to the Cyprus type]
+test('country prefixes are parsed CASE-INSENSITIVELY, like the name comparison: IMS "CY VAT" (country BG) against a live "cy VAT" is refused; lowercase agreeing re-keys; an IMS name that disagrees with its own country is refused', () => {
+  const lowerLive = (name: string) => [xeroRow('TAX008', name, '19')]
+  const bg = outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'BG' })], lowerLive('cy VAT'), 'x')
+  assert.deepEqual([bg.outcome, bg.matchedBy, bg.target?.taxType], ['COUNTRY_DIFFERS', 'CASE_INSENSITIVE', 'TAX008'], 'the lowercase live prefix is a country statement')
+  assert.match(bg.reason, /live name prefix CY.*IMS name prefix CY.*IMS country BG/)
+  assert.equal(outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'CY' })], lowerLive('cy VAT'), 'x').outcome, 'REKEY', 'lowercase agreeing')
+  assert.equal(outcomeOf([ims('x', 'cy VAT', 'TAX005', '0.1900', { countryCode: 'cy' })], lowerLive('CY VAT'), 'x').outcome, 'REKEY', 'case differs on the IMS side, all agree')
+  // The IMS row's own name disagrees with its country, even against an identical live name.
+  assert.equal(outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { countryCode: 'BG' })], lowerLive('CY VAT'), 'x').outcome, 'COUNTRY_DIFFERS')
+  assert.equal(outcomeOf([ims('x', 'cy VAT', 'TAX005', '0.1900', { countryCode: 'BG' })], lowerLive('cy VAT'), 'x').outcome, 'COUNTRY_DIFFERS')
+  // No country on the IMS row: the name statements alone agree, so it re-keys; and a name with no prefix is no statement.
+  assert.equal(outcomeOf([ims('x', 'cy VAT', 'TAX005', '0.1900', { countryCode: null })], lowerLive('CY VAT'), 'x').outcome, 'REKEY')
+  assert.equal(outcomeOf([ims('x', 'Standard', 'TAX005', '0.2000', { countryCode: 'GB' })], [xeroRow('TAX040', 'standard', '20')], 'x').outcome, 'REKEY')
 })
 
 // [mutation: the duplicate-target blocker removed -> two rates are tied to one live type]
@@ -168,15 +184,16 @@ test('every outcome is reachable and the counts add up', () => {
     xeroRow('TAX018', 'LU VAT', '17'), xeroRow('TAX013', 'FR VAT', '20', { status: 'ARCHIVED' }),
     xeroRow('TAX060', 'DE VAT', '19', { canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: false } }),
     xeroRow('TAX062', 'IE VAT', '23', { reportTaxType: 'OUTPUT' }), xeroRow('TAX063', 'PT VAT', '23', { reportTaxType: null }),
+    xeroRow('TAX064', 'FI VAT', '24'),
     xeroRow('TAX061', 'ES VAT', '21', { components: [{ name: 'a', rate: '10.000000', compound: false, nonRecoverable: false }, { name: 'b', rate: '11.000000', compound: false, nonRecoverable: false }] }),
   ]
   const plan = match([
     ims('ok', 'CY VAT', 'TAX008', '0.1900'), ims('mv', 'GR VAT', 'TAX013', '0.2400'), ims('no', 'CI VAT', 'TAX004', '0.1800', { countryCode: 'CI' }),
     ims('am', 'BE VAT', 'TAX021', '0.2100'), ims('pd', 'LU VAT', 'TAX020', '0.1500'), ims('in', 'FR VAT', 'TAX013', '0.2000'),
-    ims('sd', 'DE VAT', 'TAX070', '0.1900'), ims('md', 'ES VAT', 'TAX071', '0.2100'), ims('rd', 'IE VAT', 'TAX072', '0.2300'), ims('ru', 'PT VAT', 'TAX073', '0.2300'),
+    ims('sd', 'DE VAT', 'TAX070', '0.1900'), ims('md', 'ES VAT', 'TAX071', '0.2100'), ims('cd', 'FI VAT', 'TAX074', '0.2400', { countryCode: 'SE' }), ims('rd', 'IE VAT', 'TAX072', '0.2300'), ims('ru', 'PT VAT', 'TAX073', '0.2300'),
   ], live)
   const byId = Object.fromEntries(plan.rows.map((r) => [r.imsRateId, r.outcome]))
-  assert.deepEqual(byId, { ok: 'ALREADY_CORRECT', mv: 'REKEY', no: 'NO_MATCH', am: 'AMBIGUOUS', pd: 'PERCENTAGE_DIFFERS', in: 'NAME_MATCHES_INACTIVE', sd: 'SIDE_NOT_ALLOWED', md: 'MEANING_DIFFERS', rd: 'REPORT_TYPE_DIFFERS', ru: 'REPORT_TYPE_UNKNOWN' })
+  assert.deepEqual(byId, { ok: 'ALREADY_CORRECT', mv: 'REKEY', no: 'NO_MATCH', am: 'AMBIGUOUS', pd: 'PERCENTAGE_DIFFERS', in: 'NAME_MATCHES_INACTIVE', sd: 'SIDE_NOT_ALLOWED', md: 'MEANING_DIFFERS', cd: 'COUNTRY_DIFFERS', rd: 'REPORT_TYPE_DIFFERS', ru: 'REPORT_TYPE_UNKNOWN' })
   assert.equal(REKEY_OUTCOMES.filter((o) => o !== 'CLEAR').every((o) => plan.counts[o] === 1), true, 'CLEAR exists only with the clear-unresolved choice')
   assert.equal(plan.counts.CLEAR, 0)
 })

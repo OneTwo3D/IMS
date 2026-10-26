@@ -213,7 +213,8 @@ const normaliseCountry = (code: string): string => {
 
 /** "CY VAT" -> "CY"; a name with no leading two-capital-letter word gives null. */
 export function xeroNameCountry(name: string): string | null {
-  const match = /^([A-Z]{2})(?:[\s-]|$)/.exec(name.trim())
+  // Case-insensitive, like the name comparison that finds the candidate: "cy VAT" has the prefix CY. (An uppercase-only parse treated it as no prefix and let a Cyprus type through for a Bulgarian rate.)
+  const match = /^([A-Za-z]{2})(?:[\s-]|$)/.exec(name.trim())
   return match ? normaliseCountry(match[1]!) : null
 }
 
@@ -306,11 +307,16 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
     const active = tier.filter((row) => row.status === 'ACTIVE')
     if (active.length === 0) { done('NAME_MATCHES_INACTIVE', null, `the live type(s) with this name are ${[...new Set(tier.map((row) => row.status))].join('/')}, not ACTIVE`); continue }
     const imsCountry = rate.countryCode === null || rate.countryCode.trim() === '' ? null : normaliseCountry(rate.countryCode)
-    const compatible = active.filter((row) => {
-      const prefix = xeroNameCountry(row.name)
-      return imsCountry === null || prefix === null || prefix === imsCountry
-    })
-    if (compatible.length === 0) { done('NO_MATCH', null, `the active live type(s) with this name carry another country (IMS ${imsCountry})`); continue }
+    // THREE country statements must agree wherever they exist: the live name's prefix, the IMS name's own prefix and the IMS countryCode (an IMS row whose own name disagrees with its country is
+    // refused too, not re-keyed). Prefixes are parsed case-insensitively and normalised (UK = GB, EL = GR).
+    const imsNamePrefix = xeroNameCountry(rate.name)
+    const statements = (row: NormalisedXeroTaxRate): string[] => [xeroNameCountry(row.name), imsNamePrefix, imsCountry].filter((x): x is string => x !== null)
+    const compatible = active.filter((row) => { const said = statements(row); return said.every((x) => x === said[0]) })
+    if (compatible.length === 0) {
+      const row = active[0]!
+      done('COUNTRY_DIFFERS', row, `the country statements disagree: live name prefix ${xeroNameCountry(row.name) ?? '(none)'}, IMS name prefix ${imsNamePrefix ?? '(none)'}, IMS country ${imsCountry ?? '(none)'}`)
+      continue
+    }
     if (compatible.length > 1) { done('AMBIGUOUS', null, `${compatible.length} active live types have this name: ${compatible.map((row) => row.taxType).sort().join(', ')}`); continue }
     const live = compatible[0]!
     const percent = statedPercent(live)
