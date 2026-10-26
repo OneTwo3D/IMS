@@ -5,6 +5,7 @@
  *
  *   node dist-scripts/render-managed-crontab.mjs --base-url http://127.0.0.1:3000 --secret-file /etc/ims/cron.env [--log-path /var/log/ims/cron.log]
  *   node dist-scripts/render-managed-crontab.mjs ... --format cron.d --cron-user root   (an /etc/cron.d file: PRODUCTION)
+ *   node dist-scripts/render-managed-crontab.mjs --check                (is the host cron file what the saved settings render? exit 0 / 1)
  *   node dist-scripts/render-managed-crontab.mjs ... --defaults-only        (no database: every job on, at its registry default)
  *
  * For a deployment whose cron runs on the HOST (the container image): install the output in the host's crontab for the account that
@@ -23,6 +24,7 @@ function arg(name: string): string | null {
 }
 
 async function main(): Promise<number> {
+  if (process.argv.includes('--check')) return check()
   const baseUrl = arg('--base-url')
   const secretFile = arg('--secret-file')
   const defaultsOnly = process.argv.includes('--defaults-only')
@@ -54,6 +56,30 @@ async function main(): Promise<number> {
   }
   process.stdout.write(rendered.text)
   return 0
+}
+
+/** --check: compare the saved settings with the host cron file this process can read (IMS_SCHEDULER_CRONTAB_FILE). Exit 0 in sync, 1 out of date or unreadable. */
+async function check(): Promise<number> {
+  if (!process.env.DATABASE_URL) {
+    process.stderr.write('DATABASE_URL is required\n')
+    return 2
+  }
+  const { readCronJobsAndSettings } = await import('../lib/crontab-reconcile.ts')
+  const { readCrontabForReport } = await import('../lib/ops/read-sync-status.ts')
+  const { hostCronDrift, describeHostCronDrift } = await import('../lib/ops/host-cron.ts')
+  const { db } = await import('../lib/db/index.ts')
+  try {
+    const [saved, host] = await Promise.all([readCronJobsAndSettings(), readCrontabForReport()])
+    if (!host.resolved) {
+      process.stdout.write(`host cron could not be read: ${host.reason}\n`)
+      return 1
+    }
+    const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: host.text })
+    process.stdout.write(`${describeHostCronDrift(drift)}\n`)
+    return drift.inSync ? 0 : 1
+  } finally {
+    await db.$disconnect()
+  }
 }
 
 main().then((code) => { process.exitCode = code }, (error: unknown) => {

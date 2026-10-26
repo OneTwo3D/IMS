@@ -1,3 +1,5 @@
+import { isHostCronPendingError } from '@/lib/ops/host-cron-constants'
+
 /**
  * A CRONTAB RECONCILIATION THAT RUNS AFTER A COMMITTED WRITE IS NOT PART OF THAT WRITE
  * (o3d-osl8 round 8, findings 1 and 2 — the shape, checked everywhere it occurs).
@@ -44,6 +46,8 @@ export const SCHEDULER_RECOVERY =
 
 /** The one sentence, so it cannot be re-typed per screen and drift. */
 export function schedulerBehindWarning(what: string, error: string): string {
+  // Container mode: the settings are saved; host cron is applied by the host, not by this page. A pending state, not a failure.
+  if (isHostCronPendingError(error)) return `${what} was SAVED. ${error}`
   return `${what} was SAVED, but the scheduler could not be updated to match it: ${error} ${SCHEDULER_RECOVERY}`
 }
 

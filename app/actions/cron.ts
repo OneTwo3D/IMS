@@ -11,7 +11,9 @@ import {
   parseOtiCrontabStatus,
   type OtiCrontabStatus,
 } from '@/lib/crontab-sync'
-import { reconcileCrontab, readOwnCrontabResult } from '@/lib/crontab-reconcile'
+import { reconcileCrontab, readOwnCrontabResult, readCronJobsAndSettings } from '@/lib/crontab-reconcile'
+import { hostCronDrift, isContainerSchedulerMode, describeHostCronDrift } from '@/lib/ops/host-cron'
+import { readCrontabForReport } from '@/lib/ops/read-sync-status'
 // The BARREL, not @/lib/cron-registry: registration is an import side effect of the job modules,
 // so the registry is EMPTY unless something has imported them. Reading it bare would have mirrored
 // no legacy key and reported nothing.
@@ -199,6 +201,11 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
    * sends them to press the one button that used to overwrite the crontab it could not read.
    */
   readError: string | null
+  /**
+   * Container mode only (cron runs on the host): the saved settings compared with the mounted host cron file. `message` is the
+   * sentence to show; `inSync` false is a warning. Absent outside container mode.
+   */
+  hostCron?: { inSync: boolean; differing: string[]; message: string }
 }
 
 /**
@@ -209,6 +216,15 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
  */
 export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
   await requirePermission('settings.company')
+  if (isContainerSchedulerMode()) {
+    // Cron runs on the host and the app cannot write it: compare what the saved settings would render with the mounted host file,
+    // through the same reader the status report uses. Nothing about the app user's own crontab applies here.
+    const [hostRead, secret, saved] = await Promise.all([readCrontabForReport(), getCronSecret(), readCronJobsAndSettings()])
+    const base = { ...parseOtiCrontabStatus('', secret), osUser: os.userInfo().username, runtimeSecretMatches: null }
+    if (!hostRead.resolved) return { ...base, readError: `The host cron file could not be read, so whether it matches the saved settings is UNKNOWN: ${hostRead.reason}` }
+    const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: hostRead.text })
+    return { ...base, readError: null, hostCron: { inSync: drift.inSync, differing: drift.differing, message: describeHostCronDrift(drift) } }
+  }
   const [read, secret] = await Promise.all([readOwnCrontabResult(), getCronSecret()])
   if (!read.resolved) {
     // Report the unanswered question as unanswered. Everything a drift panel would say about a

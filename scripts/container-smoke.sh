@@ -366,5 +366,27 @@ printf '%s' "$report_json" | jq -e '.summary.inconclusive == 0 and .summary.fail
 [ "$pack_code" = all-pass ] || fail "the pack code is ${pack_code}, expected all-pass"
 echo "    OK: conclusive reconciliation result: code=${pack_code}, summary $(printf '%s' "$report_json" | jq -c '.summary')"
 
+# In container mode a Save in Settings only records the settings; host cron changes when the host re-renders and installs the file.
+# The in-container drift check (the same one the Scheduler page shows) must say so: in sync, then out of date after a saved change,
+# then in sync again once the host file is re-rendered and installed.
+echo "==> host cron drift after a saved scheduler change"
+drift_check() { docker exec "$APP_NAME" node /app/dist-scripts/render-managed-crontab.mjs --check 2>&1 || true; }
+drift="$(drift_check)"
+echo "    before the change: ${drift}"
+case "$drift" in "Host cron is in sync"*) ;; *) fail "host cron should start in sync with the saved settings: ${drift}" ;; esac
+sql "INSERT INTO settings (key, value, \"updatedAt\") VALUES ('cron_backup_schedule', '5 2 * * *', now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value" >/dev/null
+drift="$(drift_check)"
+echo "    after saving a new backup schedule: ${drift%%. Host cron update pending*}"
+case "$drift" in "Host cron is out of date (1 job differ: backup)"*) ;; *) fail "a saved schedule change was not reported as host cron out of date: ${drift}" ;; esac
+docker run --rm --network "$NET" -e DATABASE_URL --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/render-managed-crontab.mjs \
+  --base-url "http://${APP_NAME}:3000" --secret-file "$SECRET_FILE" --log-path "$CRON_LOG" \
+  --format cron.d --cron-user root > "${CRONTAB_FILE}.new"
+as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
+drift="$(drift_check)"
+echo "    after re-rendering and installing the host file: ${drift}"
+case "$drift" in "Host cron is in sync"*) ;; *) fail "host cron did not return to in sync after the re-render and install: ${drift}" ;; esac
+echo "    OK: host cron drift reads in sync, out of date after a saved change, and in sync again after the host re-render"
+
 status=0
 exit 0

@@ -19,6 +19,8 @@ import {
 } from '@/lib/crontab-sync'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { HOST_CRON_PENDING_MESSAGE } from '@/lib/ops/host-cron-constants'
+import { isContainerSchedulerMode } from '@/lib/ops/host-cron'
 import { withCrontabReconcileLock, type HeldCrontabReconcileLock } from '@/lib/crontab-reconcile-lock'
 
 /** How long `crontab -` gets to accept the new file before it is killed and reported as failed. */
@@ -97,6 +99,9 @@ export type CrontabReconcileResult = {
  * other reconciliation wait for a log insert.
  */
 export async function reconcileCrontab(): Promise<CrontabReconcileResult> {
+  // Container mode: host cron is read-only to the app and there is no crontab binary. Nothing is run; the caller reports the pending
+  // state (a saved-but-not-applied warning, never a success) and the host re-renders and installs the file.
+  if (isContainerSchedulerMode()) return { success: false, error: HOST_CRON_PENDING_MESSAGE }
   const outcome = await withCrontabReconcileLock(applyCrontabFromSettings)
   if (!outcome.locked) return { success: false, error: outcome.error }
   const result = outcome.result

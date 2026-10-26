@@ -229,6 +229,16 @@ Mount the DIRECTORY, not the file: `install` replaces the file (a new inode), an
 one. Mounting `/etc/cron.d` read-only at, say, `/host-cron.d` and setting
 `IMS_SCHEDULER_CRONTAB_FILE=/host-cron.d/onetwo3d-ims` `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d` sees every reinstall at once.
 
+**In container mode, Save only records the settings.** The Scheduler page's Save & Apply (and every other save that used to rewrite
+the crontab) cannot change host cron: it commits the settings, runs no `crontab`, and reports a warning, never a success: "Host cron
+update pending: the host must re-render and install /etc/cron.d/onetwo3d-ims". The page also shows whether host cron is "in sync" or
+"out of date (N jobs differ)" by comparing the saved settings with the mounted file. The host applies a change by re-rendering and
+installing the file with the command below. A later deployment task will add a host timer that does this automatically every few
+minutes when the rendered output changes; until that exists, it is manual. Container mode is `IMS_SCHEDULER_CRONTAB_FILE` set together
+with `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d`; on a stage host (the `user` layout, `crontab -l`) Save & Apply still rewrites the crontab as
+before. The same drift check is available from the image: `docker exec <ims> node /app/dist-scripts/render-managed-crontab.mjs --check`
+(exit 0 in sync, 1 out of date).
+
 **Re-render and reinstall after ANY scheduler change in Settings (a job switched on or off, a schedule edited), and after every
 deploy** (a new image can register new jobs), using the command above. Until you do, host cron keeps firing the old schedule and the
 status reader reports the changed jobs as unscheduled. `--defaults-only` renders every job on at its registry default WITHOUT reading
