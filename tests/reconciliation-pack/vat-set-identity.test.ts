@@ -283,6 +283,30 @@ test('COMPONENTS_DIFFER: IMS and Xero must tax the same way component by compone
   assert.deepEqual(run([], []), [], 'no stored components is one component at the stated percentage')
 })
 
+test('SHIPPING_NOT_TAXED: a positive Woo rate with shipping off is a finding (the VAT difference report\'s rule); a zero rate is exempt; the reference is the live Xero percentage, else the IMS one', () => {
+  const run = (id: string, shipping: boolean, edit: (input: VatSetInput) => void = () => {}): VatSetRow[] => {
+    const input = base()
+    input.woo = input.woo.map((w) => (w.id === id ? { ...w, shipping } : w))
+    edit(input)
+    return compareVatSetIdentity(input)
+  }
+  assert.deepEqual(reasonsOf(run('1', false), 'woo', '1'), ['SHIPPING_NOT_TAXED'], '20% on every side, shipping off')
+  assert.deepEqual(reasonsOf(run('1', true), 'woo', '1'), [])
+  assert.deepEqual(reasonsOf(run('3', false), 'woo', '3'), [], 'a 0% rate: shipping at 0% carries the goods\' 0%, so it is exempt')
+  assert.deepEqual(reasonsOf(run('1', false), 'ims', 'rGB'), [], 'the finding belongs to the Woo row only')
+  // Reference = the ACTIVE live Xero percentage, else IMS: a Woo 0% rate against IMS 20% and Xero 20% is PERCENT_DIFFERS and (reference 20) also not taxing shipping.
+  const zeroWoo = run('1', false, (i) => { i.woo = i.woo.map((w) => (w.id === '1' ? { ...w, rate: '0.0000' } : w)) })
+  assert.deepEqual(reasonsOf(zeroWoo, 'woo', '1'), ['PERCENT_DIFFERS', 'SHIPPING_NOT_TAXED'])
+  // No ACTIVE live type: the IMS percentage is the reference.
+  const noXero = run('1', false, (i) => { i.xero = i.xero.filter((x) => x.taxType !== 'TAX001') })
+  assert.deepEqual(reasonsOf(noXero, 'woo', '1'), ['SHIPPING_NOT_TAXED'])
+  const imsZeroNoXero = run('3', false, (i) => { i.rates = i.rates.map((r) => (r.id === 'rCAN' ? { ...r, rate: '0.0000' } : r)); i.xero = i.xero.filter((x) => x.taxType !== 'TAX003') })
+  assert.deepEqual(reasonsOf(imsZeroNoXero, 'woo', '3'), [])
+  // A Woo rate mapped to an IMS rate that is out of scope is judged by the IMS_RATE_NOT_ACTIVE_SALES reason only (the difference report skips it too).
+  const inactive = run('1', false, (i) => { i.rates = i.rates.map((r) => (r.id === 'rGB' ? { ...r, active: false } : r)) })
+  assert.deepEqual(reasonsOf(inactive, 'woo', '1'), ['IMS_RATE_NOT_ACTIVE_SALES'])
+})
+
 test('the closed list is the one the report prints, every reason is reachable, and the summary counts rows and reasons exactly', () => {
   const input = base()
   input.woo = [...input.woo, woo('7', { country: 'FR' })]
@@ -294,5 +318,5 @@ test('the closed list is the one the report prints, every reason is reachable, a
   assert.equal(summary.byReason.WOO_UNMAPPED, 1)
   assert.equal(summary.byReason.XERO_NOT_IN_IMS, 1)
   assert.deepEqual(Object.keys(summary.byReason), VAT_SET_REASON_LIST)
-  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
+  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
 })

@@ -18,7 +18,7 @@
  *   country (the Woo country, the IMS countryCode, the IMS name prefix and the Xero name prefix must agree; UK = GB, EL = GR) and report type
  *   (xeroReportTaxType of the IMS rate against the live ReportTaxType).
  *   Two more identities close what an equal percentage leaves open: the Woo rate's class against the class its IMS mapping recorded (CLASS_DIFFERS; empty is "standard"),
- *   the Woo compound flag against the IMS isCompound (COMPOUND_DIFFERS), and the ordered components of the IMS rate against the Xero type's (COMPONENTS_DIFFER, the re-key's componentMeaningDifference).
+ *   a positive-percentage Woo rate must apply to shipping (SHIPPING_NOT_TAXED; a zero rate is exempt), the Woo compound flag against the IMS isCompound (COMPOUND_DIFFERS), and the ordered components of the IMS rate against the Xero type's (COMPONENTS_DIFFER, the re-key's componentMeaningDifference).
  *
  * Every row carries ZERO OR MORE reasons from a closed list; no reasons means the identity is identical across the systems it is in.
  */
@@ -50,6 +50,7 @@ export const VAT_SET_REASONS = {
   CLASS_DIFFERS: 'the tax class of the WooCommerce rate is not the class its IMS mapping recorded (empty and "standard" are the same class; case and surrounding spaces are ignored)',
   COMPOUND_DIFFERS: 'the WooCommerce rate is compound and the IMS rate is not, or the other way round',
   COMPONENTS_DIFFER: 'the IMS rate and the Xero type do not tax the same way: the ordered components (count, each rate, compounding) differ, or the Xero type has a non-recoverable component (the re-key\'s componentMeaningDifference)',
+  SHIPPING_NOT_TAXED: 'a WooCommerce rate with a positive percentage has "apply to shipping" off, but shipping always carries the goods\' VAT rate (owner ruling; the VAT difference report\'s WOO_SHIPPING_NOT_TAXED). A zero-rate is exempt: shipping at 0% is the same as no VAT on shipping',
   MISSING_IN_WOO: 'an in-scope IMS sales rate or Xero sales type has no WooCommerce counterpart',
   XERO_NOT_IN_IMS: 'an in-scope Xero sales type is carried by no active IMS sales rate',
 } as const
@@ -158,6 +159,10 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
       if (normaliseCountryCode(woo.country) !== imsCountry) reasons.add('COUNTRY_DIFFERS')
       if (normaliseClass(woo.class) !== mappedClass.get(woo.id)) reasons.add('CLASS_DIFFERS')
       if (woo.compound !== ims.isCompound) reasons.add('COMPOUND_DIFFERS')
+      // Same rule as the VAT difference report (WOO_SHIPPING_NOT_TAXED), judged on its reference percentage: the ACTIVE live Xero type's, else the IMS rate's. Only for a rate that report also judges (an in-scope IMS rate).
+      const liveType = ims.accountingTaxType === null ? undefined : xeroByType.get(ims.accountingTaxType)
+      const reference = (liveType !== undefined && liveType.status === 'ACTIVE' ? xeroPercent(liveType) : null) ?? imsValue
+      if (imsInScopeIds.has(ims.id) && !woo.shipping && reference !== null && reference.gt(0)) reasons.add('SHIPPING_NOT_TAXED')
     }
     add('woo', woo.id, reasons)
   }
