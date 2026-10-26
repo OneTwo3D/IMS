@@ -1,0 +1,106 @@
+name: Container Image
+
+# Builds the two container targets (runtime, migrate), proves the smoke test can fail, runs it for
+# real against postgres:17, and (push to development/main only) publishes both images to GHCR.
+# Pull requests build and test but NEVER push.
+on:
+  pull_request:
+  push:
+    branches:
+      - development
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUNTIME_IMAGE: ghcr.io/onetwo3d/ims
+  MIGRATE_IMAGE: ghcr.io/onetwo3d/ims-migrate
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    # `next build` is memory-hungry (it OOMs next to other gates), so this is the only job that runs
+    # it in this workflow and it gets a whole runner to itself.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The smoke test must be able to fail. busybox has no prisma, no node and no server, so a
+      # script that passes for it is not testing anything.
+      - name: Prove the smoke test can fail
+        run: |
+          if scripts/container-smoke.sh busybox:latest busybox:latest; then
+            echo "::error::container-smoke.sh passed for busybox; the smoke test is vacuous"
+            exit 1
+          fi
+          echo "container-smoke.sh failed for busybox, as required"
+
+      - name: Build migrate image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: migrate
+          load: true
+          tags: ims-migrate:ci
+          cache-from: type=gha,scope=ims-image
+          cache-to: type=gha,scope=ims-image,mode=max
+
+      - name: Build runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: ims:ci
+          cache-from: type=gha,scope=ims-image
+          cache-to: type=gha,scope=ims-image,mode=max
+
+      - name: Image sizes
+        run: docker image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -E '^(REPOSITORY|ims)'
+
+      - name: Smoke test (postgres:17, migrate, boot, GET /login)
+        run: scripts/container-smoke.sh ims:ci ims-migrate:ci
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same Dockerfile, same cache: these are cache hits for the images that just passed the smoke
+      # test, re-tagged and pushed.
+      - name: Push migrate image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: migrate
+          push: true
+          tags: |
+            ${{ env.MIGRATE_IMAGE }}:${{ github.sha }}
+            ${{ env.MIGRATE_IMAGE }}:${{ github.ref_name }}
+          cache-from: type=gha,scope=ims-image
+
+      - name: Push runtime image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: |
+            ${{ env.RUNTIME_IMAGE }}:${{ github.sha }}
+            ${{ env.RUNTIME_IMAGE }}:${{ github.ref_name }}
+          cache-from: type=gha,scope=ims-image
