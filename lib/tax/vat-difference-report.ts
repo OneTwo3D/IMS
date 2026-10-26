@@ -158,7 +158,7 @@ const normalClass = (value: string | null): string => {
 const sides = (usedFor: string): readonly string[] => (usedFor === 'BOTH' ? ['SALES', 'PURCHASE'] : [usedFor])
 
 /** The percentage IMS computes tax at: the active components' (when it has any), else the rate column. */
-function imsEffectivePercent(rate: ImsRateRow): Dec {
+export function imsEffectivePercent(rate: Pick<ImsRateRow, 'rate' | 'components'>): Dec {
   const active = rate.components.filter((c) => c.active)
   if (active.length === 0) return percentOfFraction(rate.rate)
   const effective = effectiveTaxRateFromComponents(active.map((c) => ({ rate: Number(c.rate), compoundOnPrevious: c.compoundOnPrevious })))

@@ -563,6 +563,9 @@ model TaxRate {
   reportingCategory String? @map("reporting_category") // e.g. DOMESTIC, REVERSE_CHARGE, EC_SALES, OSS
   active      Boolean     @default(true)
   isDefault   Boolean     @default(false)
+  /// Set by a tax re-key (lib/tax/tax-rekey.ts) on the row it deactivated: the id of the row that replaced it (same name, percentage, sides and components, the live Xero code).
+  /// Document writers resolve a supplied id of such a row to the replacement (lib/tax/writable-tax-rate.ts). NULL on every other row; no foreign key (a pointer for resolution, not a relation).
+  replacedById String?     @map("replaced_by_id")
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 

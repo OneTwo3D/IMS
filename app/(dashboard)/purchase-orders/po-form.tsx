@@ -222,6 +222,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           reportingCategory: null,
           isDefault: false,
           active: false,
+          replacedById: null,
           components: [],
         }
       : undefined

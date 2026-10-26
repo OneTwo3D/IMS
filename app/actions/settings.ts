@@ -1,5 +1,6 @@
 'use server'
 
+import { lockTaxRateForEdit } from '@/lib/tax/tax-rate-replaced'
 import { revalidatePath } from 'next/cache'
 import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
@@ -185,6 +186,8 @@ export type TaxRateRow = {
   reportingCategory: string | null
   isDefault: boolean
   active: boolean
+  /** Set when a tax re-key replaced this rate: it is read-only and the replacement is this id. */
+  replacedById: string | null
   components: {
     id: string
     name: string
@@ -224,6 +227,7 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
       reportingCategory: true,
       isDefault: true,
       active: true,
+      replacedById: true,
       components: {
         orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
         select: {
@@ -252,6 +256,7 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
     reportingCategory: r.reportingCategory,
     isDefault: r.isDefault,
     active: r.active,
+    replacedById: r.replacedById,
     components: r.components.map((component) => ({
       id: component.id,
       name: component.name,
@@ -391,6 +396,8 @@ export async function updateTaxRate(id: string, input: {
       }
       const components = input.components === undefined ? undefined : normalizeTaxRateComponents(input.components)
       const effectiveRate = components === undefined ? input.rate : (effectiveTaxRateFromComponents(components) ?? input.rate)
+      // A rate a tax re-key replaced is read-only, and the row lock serialises this edit with the re-key apply (lib/tax/tax-rate-replaced.ts).
+      await lockTaxRateForEdit(tx, id, input)
       const oldRate = await tx.taxRate.findUnique({
         where: { id },
         select: { id: true, name: true, rate: true },
@@ -558,7 +565,8 @@ export async function autoLinkXeroTaxRates(): Promise<{
     await db.$transaction(async (tx) => {
       await assertXeroConnectionUnchanged(tx as never, connection)
       for (const entry of plan) {
-        await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
+        // updateMany with replacedById: null: a rate a tax re-key replaced is never given a code again (lib/tax/tax-rate-replaced.ts).
+        await tx.taxRate.updateMany({ where: { id: entry.id, replacedById: null }, data: { accountingTaxType: entry.taxType } })
       }
     })
     linked = plan.length
@@ -671,6 +679,47 @@ export async function getVatDifferenceReport(): Promise<VatDifferenceActionResul
   } catch (e) {
     unstable_rethrow(e)
     return { success: false, error: 'The VAT difference report could not be produced.' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Re-key IMS tax rates to the custom tax codes of the connected Xero organisation (lib/tax/tax-rekey.ts)
+// ---------------------------------------------------------------------------
+
+export type TaxRekeyActionResult =
+  | { success: true; applied: boolean; wrote: boolean; plan: import('@/lib/tax/tax-rekey').RekeyPlan | null; refusal: import('@/lib/tax/tax-rekey').RekeyRefusal | null; written: import('@/lib/tax/tax-rekey').RekeyWriteResult | null; hold: import('@/lib/tax/tax-rekey').XeroHoldState }
+  | { success: false; error: string }
+
+/**
+ * READ-ONLY. The plan for re-keying the IMS rates that carry a custom Xero tax code (TAX001..TAXnnn) to the same-named type of the Xero organisation connected now, with its
+ * digest. Reads the STORED Xero list (proven first); never calls Xero; writes nothing.
+ */
+export async function previewTaxRekey(input: { clearUnresolved?: boolean } = {}): Promise<TaxRekeyActionResult> {
+  await requirePermission('settings.company')
+  try {
+    const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
+    const result = await runTaxRekey({ apply: false, clearUnresolved: input.clearUnresolved === true })
+    return { success: true, applied: false, wrote: false, plan: result.plan, refusal: result.refusal, written: null, hold: result.hold }
+  } catch (e) {
+    unstable_rethrow(e)
+    return { success: false, error: 'The re-key plan could not be produced.' }
+  }
+}
+
+/**
+ * Apply the plan whose `confirm` digest the operator saw. One transaction inside the Xero connection fence; a changed plan (different digest) writes nothing; unposted documents
+ * refuse unless `allowUnposted`; queued payloads always refuse. Idempotent. New rows are created and old rows deactivated, never edited; defaults and storefront mappings are re-pointed.
+ */
+export async function applyTaxRekey(input: { confirm: string; allowUnposted?: boolean; clearUnresolved?: boolean }): Promise<TaxRekeyActionResult> {
+  await requirePermission('settings.company')
+  try {
+    const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
+    const result = await runTaxRekey({ apply: true, confirm: input.confirm, allowUnposted: input.allowUnposted === true, clearUnresolved: input.clearUnresolved === true })
+    await runPostCommit(async () => { revalidatePath('/settings/accounting') }, 'Failed to refresh the tax settings')
+    return { success: true, applied: result.applied, wrote: result.wrote, plan: result.plan, refusal: result.refusal, written: result.written, hold: result.hold }
+  } catch (e) {
+    unstable_rethrow(e)
+    return { success: false, error: 'The re-key could not be applied.' }
   }
 }
 
@@ -808,7 +857,7 @@ export async function generateMissingXeroTaxRates(
         // refused if the instance has been rebound since, so another organisation's type never lands here.
         await db.$transaction(async (tx) => {
           await assertXeroConnectionUnchanged(tx as never, connection)
-          await tx.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: res.taxType } })
+          await tx.taxRate.updateMany({ where: { id: rate.id, replacedById: null }, data: { accountingTaxType: res.taxType } })
         })
         created++
       } catch (e) {

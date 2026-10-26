@@ -463,6 +463,7 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
               <TableCell className="font-medium">
                 <span className="inline-flex flex-wrap items-center gap-1.5">
                   {r.name}
+                  {r.replacedById && <span className="text-xs font-normal text-muted-foreground">Replaced by {rates.find((x) => x.id === r.replacedById)?.name ?? 'a re-keyed rate'} (read-only)</span>}
                   {drift?.[r.id] && <TaxRateDriftChip drift={drift[r.id]} syncEnabled={driftSyncEnabled} />}
                 </span>
               </TableCell>
@@ -491,10 +492,10 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
               </TableCell>
               <TableCell>
                 <div className="flex items-center gap-1 justify-end">
-                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(r)}>
+                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(r)} disabled={Boolean(r.replacedById)}>
                     <Pencil className="h-3 w-3" />
                   </Button>
-                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(r)} disabled={isPending}>
+                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(r)} disabled={isPending || Boolean(r.replacedById)}>
                     {r.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
                   </Button>
                 </div>

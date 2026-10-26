@@ -1,3 +1,4 @@
+import { shareLockOrderTaxRates } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
@@ -3697,6 +3698,10 @@ export async function createSalesOrderRefund(
       }
     }
     await lockSalesOrder(tx, input.orderId)
+    // THE REFUND'S TAX IDENTITY IS READ FROM RATE ROWS (each line's rate, the order-default rate by name) and snapshotted onto the refund lines below. A tax re-key (lib/tax/tax-rekey.ts) must not
+    // commit between that read and the insert, or the snapshot would carry a retired code the apply never saw. So the rows are share-locked BEFORE the read and held to commit: the apply's UPDATE
+    // of a rate row waits for this transaction, then re-counts the pending snapshots and migrates them (or rolls back); and an apply that committed first is simply read as committed.
+    await shareLockOrderTaxRates(tx, input.orderId)
 
     const so = await tx.salesOrder.findUnique({
       where: { id: input.orderId },

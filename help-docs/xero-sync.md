@@ -1512,6 +1512,16 @@ run that records tax-rate drift).
     a re-run changes nothing. The `accounting_reverse_charge_purchase_tax_type` setting is checked against the list and reported; no row is created for it.
 - **Used by** reconciliation-pack item R13 (the Xero leg), which reads the stored list in its own read-only snapshot. See
   *Reconciliation pack* in the installation guide.
+- **Custom tax codes differ per organisation: the re-key (a pre-go-live operation: refused unless Xero writes are held).** Xero numbers its custom tax types (`TAX001`...`TAXnnn`) per organisation, in creation order, so
+  the codes on IMS's per-country VAT rates (created against a Demo organisation) can mean other rates in the live one (live `TAX005` = *BG VAT*, IMS's `TAX005` =
+  *CY VAT*), and IMS posts a line's code. **Settings > Accounting > Tax > Re-key VAT rates** and `npm run tax:rekey` tie each active rate with a custom code
+  to the live type of the **same name** (never by code), `ACTIVE`, with exactly the same percentage (EffectiveRate, else DisplayTaxRate) and a consistent
+  country, from this stored list (proven as above). The plan is the preview and has a digest; the apply must quote it, runs in one transaction inside the
+  connection fence, creates a new rate with the live code, deactivates the old one (never edits it) and moves supplier defaults and WooCommerce mappings. The live type must also be allowed on the rate's sides (`canApply` revenue / expenses) and have the same component breakdown (`SIDE_NOT_ALLOWED`, `MEANING_DIFFERS`).
+  Every document line reads the rate's code whenever a Xero document is built from it (`queueSalesInvoiceForOrder` for the invoice and each update, the refund / credit-note paths,
+  `createInvoice` / `updateInvoice` / `postSupplierCreditNote` for bills), and the queued payload carries `lines[].taxType` as a snapshot, so not-cancelled orders and purchase orders (posted or not) refuse the apply unless re-pointed on request (a correction: the new code is the same tax meaning), and
+  pending refund-line tax snapshots (`SalesOrderRefundLine.accountingTaxType`, preferred over the order line's rate when a credit note is built or retried; migrated on request only when the old code means the old rate alone) refuse it too, and
+  queued payloads carrying the old code in any tax field - line, shipping or discount (FAILED sync rows included, until retried or cancelled) always refuse it. A component's own stale custom code is cleared on the new rate and shown in the plan. After an apply, an accounting payload built earlier from a retired code is refused when it is enqueued (reason `retired_tax_code` when the code was read from a rate that no longer carries it, or `retired_tax_code_unbound` when no source rate is named; listed in the exception inbox); repeating the action rebuilds it. After it, the VAT difference report shows no `PERCENTAGE_MISMATCH_IMS_XERO` for the re-keyed rates.
 - **One VAT set: the difference report.** Owner ruling 2026-10-25: WooCommerce, IMS and Xero use the same set of VAT rates and Xero is the master.
   WooCommerce tax-rate writes are **operator-manual at P1** (the ownership map row `woocommerce` / `tax-rate`: P1 `operator-manual`, P2 `IMS`; IMS
   has no producer for it yet). To make the manual correction easy, **Settings > Accounting > Tax > VAT rate differences** and `npm run vat:diff`

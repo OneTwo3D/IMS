@@ -1,5 +1,6 @@
 'use server'
 
+import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
@@ -1188,6 +1189,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         if (existing) throw new Error(`Order ${externalOrderNumber} already exists`)
       }
 
+      // A supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts), under the row share lock the apply waits on.
+      await resolveLinesTaxRates(tx, lineData)
       return tx.salesOrder.create({
         data: {
           externalOrderNumber,
@@ -1393,12 +1396,13 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   const manualPrefix = numbering.inv_prefix
   const orderNumber = getSalesOrderReference(so)
 
-  const orderDefaultTaxType = so.taxRateName
-    ? (await db.taxRate.findFirst({
+  const orderDefaultRate = so.taxRateName
+    ? await db.taxRate.findFirst({
         where: { name: so.taxRateName, active: true },
-        select: { accountingTaxType: true },
-      }))?.accountingTaxType ?? null
+        select: { id: true, accountingTaxType: true },
+      })
     : null
+  const orderDefaultTaxType = orderDefaultRate?.accountingTaxType ?? null
 
   const vatPct = Number(so.taxRatePercent ?? 0)
   const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
@@ -1453,6 +1457,9 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
         unitAmount: Number(l.unitPriceForeign),
         accountCode: settings.salesAccount,
         taxType,
+        // The rate this line's code was read from (never sent), bound whenever the line has one: the enqueue guard checks a retired code is still that rate's code and refuses a rate a re-key cleared
+        // (it has no code; the connector would send NONE). lib/tax/retired-tax-code-guard.ts.
+        taxRateId: l.taxRateId ?? undefined,
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
     }),
@@ -1460,9 +1467,11 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     shippingDescription: 'Shipping',
     shippingAccountCode: settings.shippingAccount || undefined,
     shippingTaxType: orderDefaultTaxType ?? undefined,
+    shippingTaxRateId: orderDefaultRate?.id,
     discountAmount: discountForeign > 0 ? discountForeign : undefined,
     discountAccountCode: settings.discountAccount || undefined,
     discountTaxType: orderDefaultTaxType ?? undefined,
+    discountTaxRateId: orderDefaultRate?.id,
     lineAmountsIncludeTax,
   }
 
@@ -2018,6 +2027,7 @@ async function queueRefundAccountingActions(input: {
         lines: {
           select: {
             id: true,
+            taxRateId: true,
             taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
           },
         },
@@ -2031,7 +2041,7 @@ async function queueRefundAccountingActions(input: {
   const cnTaxRate = orderForCN?.taxRateName
     ? await db.taxRate.findFirst({
         where: { name: orderForCN.taxRateName, active: true },
-        select: { accountingTaxType: true },
+        select: { id: true, accountingTaxType: true },
       })
     : null
   // The code each credit-note line carries, from the ONE definition the retry fence also reads
@@ -2108,6 +2118,14 @@ async function queueRefundAccountingActions(input: {
         // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
         // legacy rows with no snapshot (created before the column existed).
         taxType: creditNoteTaxTypeOf(line) ?? undefined,
+        // The rate this code can be traced to (never sent): the order line's own rate when the code is its code, else the order-default rate when it is that code's. Checked by the enqueue guard
+        // (lib/tax/retired-tax-code-guard.ts); absent for a swapped or snapshot-only code, which the guard refuses only if a re-key retired it.
+        taxRateId: ((): string | undefined => {
+          const code = creditNoteTaxTypeOf(line) ?? undefined
+          const own = orderForCN?.lines.find((ol) => ol.id === line.lineId)
+          if (own?.taxRateId && (code === undefined || own.taxRate?.accountingTaxType === code || own.taxRate?.accountingTaxType == null)) return own.taxRateId
+          return cnTaxRate?.id
+        })(),
       })),
       // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
       // that had a gross amount — is now netted at source, so this correctly grosses every line up.
@@ -3244,7 +3262,10 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     if (!so) return { success: false, error: 'Order not found' }
 
     const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
-    const clone = await db.salesOrder.create({
+    const clone = await db.$transaction(async (tx) => {
+    // A cloned line's rate that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
+    const cloneRates = await resolveWritableTaxRateIds(tx, so.lines.map((l) => l.taxRateId))
+    return tx.salesOrder.create({
       data: {
         orderNumber: ref,
         status: 'DRAFT',
@@ -3282,7 +3303,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
             unitPriceBase: l.unitPriceBase,
             discountStr: l.discountStr,
             discountAmount: l.discountAmount,
-            taxRateId: l.taxRateId,
+            taxRateId: l.taxRateId ? (cloneRates.get(l.taxRateId) ?? l.taxRateId) : l.taxRateId,
             taxForeign: l.taxForeign,
             taxBase: l.taxBase,
             totalForeign: l.totalForeign,
@@ -3290,6 +3311,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
           })),
         },
       },
+    })
     })
 
     // Auto-allocate stock for cloned order

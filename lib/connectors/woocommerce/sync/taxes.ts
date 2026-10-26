@@ -9,6 +9,7 @@
  * WooCommerce order line items actually reference (line.taxes[].id).
  */
 
+import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { db } from '@/lib/db'
 import { wcFetch } from '../api'
 
@@ -89,6 +90,7 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
     if (!imsTaxRateId) {
       const existing = await db.taxRate.findFirst({ where: { name }, select: { id: true } })
       if (existing) {
+        // (A same-named row a tax re-key retired is resolved to its replacement where the mapping is written, in that write's transaction.)
         imsTaxRateId = existing.id
         reusedRates++
       } else {
@@ -114,7 +116,10 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
 
     // 2. Upsert the WC rate id → IMS tax rate mapping.
     const ratePct = parseFloat(wcRate.rate) || 0
-    await db.shoppingTaxRateMapping.upsert({
+    // Resolved in the write's transaction under the row share lock (lib/tax/writable-tax-rate.ts), so a re-key apply cannot commit between the resolution and the upsert.
+    await db.$transaction(async (tx) => {
+    const mappedTaxRateId = (await resolveWritableTaxRateId(tx, imsTaxRateId, { lenient: true })) ?? imsTaxRateId
+    await tx.shoppingTaxRateMapping.upsert({
       where: {
         connector_externalTaxRateId: {
           connector: 'woocommerce',
@@ -128,15 +133,16 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
         externalCountry: wcRate.country || null,
         externalRatePct: ratePct.toFixed(4),
         externalClass: wcRate.class || null,
-        taxRateId: imsTaxRateId,
+        taxRateId: mappedTaxRateId,
       },
       update: {
         externalName: name,
         externalCountry: wcRate.country || null,
         externalRatePct: ratePct.toFixed(4),
         externalClass: wcRate.class || null,
-        taxRateId: imsTaxRateId,
+        taxRateId: mappedTaxRateId,
       },
+    })
     })
     mappedRates++
   }
