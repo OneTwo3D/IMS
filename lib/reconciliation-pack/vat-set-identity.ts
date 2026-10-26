@@ -19,6 +19,7 @@
  *   (xeroReportTaxType of the IMS rate against the live ReportTaxType).
  *   Two more identities close what an equal percentage leaves open: the Woo rate's class against the class its IMS mapping recorded (CLASS_DIFFERS; empty is "standard"),
  *   a positive-percentage Woo rate must apply to shipping (SHIPPING_NOT_TAXED; a zero rate is exempt), the Woo compound flag against the IMS isCompound (COMPOUND_DIFFERS), and the ordered components of the IMS rate against the Xero type's (COMPONENTS_DIFFER, the re-key's componentMeaningDifference).
+ *   REGION: IMS has no region field; it records a region only as the name suffix ("PT-30 VAT"). A Woo rate's state must equal it (REGION_DIFFERS); where IMS records none and the Woo rate is regional or shares country and class with another region, it is REGION_UNVERIFIED (a finding, never a pass), so a swapped pair of regional mappings cannot pass.
  *
  * Every row carries ZERO OR MORE reasons from a closed list; no reasons means the identity is identical across the systems it is in.
  */
@@ -51,6 +52,8 @@ export const VAT_SET_REASONS = {
   COMPOUND_DIFFERS: 'the WooCommerce rate is compound and the IMS rate is not, or the other way round',
   COMPONENTS_DIFFER: 'the IMS rate and the Xero type do not tax the same way: the ordered components (count, each rate, compounding) differ, or the Xero type has a non-recoverable component (the re-key\'s componentMeaningDifference)',
   SHIPPING_NOT_TAXED: 'a WooCommerce rate with a positive percentage has "apply to shipping" off, but shipping always carries the goods\' VAT rate (owner ruling; the VAT difference report\'s WOO_SHIPPING_NOT_TAXED). A zero-rate is exempt: shipping at 0% is the same as no VAT on shipping',
+  REGION_DIFFERS: 'the region of the WooCommerce rate (its state) is not the region its IMS rate records: IMS records a region only as the suffix of the rate name ("PT-30 VAT" is region 30), and the two disagree, including a regional IMS rate on a country-wide WooCommerce rate',
+  REGION_UNVERIFIED: 'the region of the WooCommerce rate cannot be confirmed against IMS, which has no region data for the rate (a finding, never a pass): the WooCommerce rate has a state, a postcode or a city, a postcode or city IMS cannot record, or it shares country and class with an in-scope WooCommerce rate of another region and its IMS rate names no region',
   MISSING_IN_WOO: 'an in-scope IMS sales rate or Xero sales type has no WooCommerce counterpart',
   XERO_NOT_IN_IMS: 'an in-scope Xero sales type is carried by no active IMS sales rate',
 } as const
@@ -101,6 +104,19 @@ const xeroPercent = (row: NormalisedXeroTaxRate): Decimal | null => exact(row.ef
 const normaliseClass = (value: string | null): string => { const slug = (value ?? '').trim().toLowerCase(); return slug === '' ? 'standard' : slug }
 const scopeKey = (rate: WooTaxRateDetail): string => [normaliseCountryCode(rate.country), rate.state.trim().toUpperCase(), rate.postcode.trim(), rate.city.trim().toUpperCase(), normaliseClass(rate.class)].join('|')
 
+/** A region token as one comparable string: upper case, letters and digits only, the leading country code dropped ("PT-30" and "30" are both "30"). */
+function regionToken(text: string, country: string): string {
+  const token = text.toUpperCase().replace(/[^A-Z0-9]/g, '')
+  return country !== '' && token.startsWith(country) && token.length > country.length ? token.slice(country.length) : token
+}
+const GENERIC_NAME_WORDS: ReadonlySet<string> = new Set(['VAT', 'TAX', 'GST', 'ZERO', 'STANDARD', 'REDUCED', 'RATE', 'OSS', 'IOSS', 'VOEC'])
+/** The region an IMS rate records: the token after the country prefix of its name joined by a hyphen ("PT-30 VAT" is "30"); null when the name states none. IMS has no region field. */
+function imsRegion(name: string, country: string): string | null {
+  const match = /^[A-Za-z]{2}-([A-Za-z0-9]+)/.exec(name.trim())
+  if (match === null || GENERIC_NAME_WORDS.has(match[1]!.toUpperCase())) return null
+  return regionToken(match[1]!, country)
+}
+
 export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
   const ratesById = new Map(input.rates.map((rate) => [rate.id, rate]))
   const xeroByType = new Map(input.xero.map((row) => [row.taxType, row]))
@@ -120,6 +136,18 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
   }
   const carriersByType = new Map<string, TaxRateRow[]>()
   for (const rate of imsInScope) if (rate.accountingTaxType !== null) carriersByType.set(rate.accountingTaxType, [...(carriersByType.get(rate.accountingTaxType) ?? []), rate])
+
+  // Woo rates of one country and class, by the regions they cover: a rate that shares both with a rate of another region is one a swap could hide.
+  const regionKeyOf = (woo: WooTaxRateDetail): string => [woo.state, woo.postcode, woo.city].map((part) => part.trim().toUpperCase()).join('|')
+  const regionsByCountryClass = new Map<string, Set<string>>()
+  for (const woo of input.woo) {
+    const target = mappedTo.get(woo.id)
+    if (target === undefined || !imsInScopeIds.has(target)) continue
+    const key = `${normaliseCountryCode(woo.country)}|${normaliseClass(woo.class)}`
+    const regions = regionsByCountryClass.get(key) ?? new Set<string>()
+    regions.add(regionKeyOf(woo))
+    regionsByCountryClass.set(key, regions)
+  }
 
   const rows: VatSetRow[] = []
   const add = (system: VatSetSystem, id: string, reasons: Set<VatSetReason>): void => { rows.push({ system, id, reasons: VAT_SET_REASON_LIST.filter((reason) => reasons.has(reason)) }) }
@@ -159,6 +187,15 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
       if (normaliseCountryCode(woo.country) !== imsCountry) reasons.add('COUNTRY_DIFFERS')
       if (normaliseClass(woo.class) !== mappedClass.get(woo.id)) reasons.add('CLASS_DIFFERS')
       if (woo.compound !== ims.isCompound) reasons.add('COMPOUND_DIFFERS')
+      // REGION: IMS records a region only in the rate name. A recorded region must equal the Woo state (and Woo then has no postcode or city IMS could not hold); where IMS records none, a Woo rate that is regional, or shares country and class with another region, cannot be confirmed.
+      const wooCountry = normaliseCountryCode(woo.country)
+      const recorded = imsRegion(ims.name, wooCountry)
+      const wooState = regionToken(woo.state, wooCountry)
+      const hasExtra = woo.postcode.trim() !== '' || woo.city.trim() !== ''
+      if (recorded !== null) {
+        if (wooState !== recorded) reasons.add('REGION_DIFFERS')
+        else if (hasExtra) reasons.add('REGION_UNVERIFIED')
+      } else if (wooState !== '' || hasExtra || (regionsByCountryClass.get(`${wooCountry}|${normaliseClass(woo.class)}`)?.size ?? 0) > 1) reasons.add('REGION_UNVERIFIED')
       // Same rule as the VAT difference report (WOO_SHIPPING_NOT_TAXED), judged on its reference percentage: the ACTIVE live Xero type's, else the IMS rate's. Only for a rate that report also judges (an in-scope IMS rate).
       const liveType = ims.accountingTaxType === null ? undefined : xeroByType.get(ims.accountingTaxType)
       const reference = (liveType !== undefined && liveType.status === 'ACTIVE' ? xeroPercent(liveType) : null) ?? imsValue
