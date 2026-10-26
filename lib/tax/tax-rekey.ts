@@ -43,7 +43,7 @@
  *     (UNPOSTED_DOCUMENTS, counts split into never-posted and already-posted) unless the operator passes the explicit flag, which re-points those lines to the new row. Documents
  *     and payloads that already went to Xero are not touched. Is a posted document's next update then a change of meaning? No: the new row is the live type of the SAME name,
  *     ACTIVE, with the same percentage, the same sides and the same component breakdown (the plan refuses otherwise), so the same tax meaning by construction; the old code was the
- *     other organisation's number, so the update is a correction. No amount changes (same percentage). Cancelled documents are left on the old row.
+ *     other organisation's number, so the update is a correction. No amount changes (same percentage). CANCELLED documents are re-pointed by every apply and never block it (nothing posted changes; a storefront status sync can reopen a cancelled order, and its next invoice build would otherwise read the retired code); they are their own bucket in the plan and the digest.
  *   - REFUND-LINE SNAPSHOTS: SalesOrderRefundLine.accountingTaxType is resolved at refund creation (lib/domain/sales/refund-service.ts) and the credit note build / retry prefers it to the
  *     order line's rate (lib/domain/sales/refund-posted-tax-identity.ts creditNoteLineTaxTypeResolver ~922-938 returns `refundLine.accountingTaxType`; priceSnapshottedTaxIdentity ~977). A refund
  *     whose credit note is not posted (SalesOrderRefund.accountingCreditNoteId null) may have no queued payload yet (enqueue failed / not yet run), so nothing else would stop the old
@@ -153,6 +153,11 @@ export interface RekeyReferences {
   postedSalesOrderLines: number
   postedPurchaseOrders: number
   postedPurchaseOrderLines: number
+  /** CANCELLED documents (and their lines) on the old row: never blocking, re-pointed by every apply (nothing posted changes; the new row means the same by construction). In the digest. */
+  cancelledSalesOrders: number
+  cancelledSalesOrderLines: number
+  cancelledPurchaseOrders: number
+  cancelledPurchaseOrderLines: number
   /**
    * Refund lines (SalesOrderRefundLine.accountingTaxType, resolved at creation and preferred over the order line's rate when the credit note is built or retried) that carry the old code on
    * a refund whose credit note is not posted (SalesOrderRefund.accountingCreditNoteId null): no queued payload exists to block on, but a later enqueue / retry would send the old code.
@@ -370,11 +375,13 @@ const IN_FLIGHT_EVENT_STATUSES = ['PENDING', 'FAILED'] as const
 
 /**
  * The not-cancelled sales orders / purchase orders that reference `rateId`, split by whether they have posted. BOTH kinds can still post the line's rate code, so both are future posting
- * sources (see the header). Cancelled documents are left alone. Reads only.
+ * sources (see the header). CANCELLED documents are their own bucket: they do not block (nothing posted changes), but they are re-pointed by every apply, because a storefront status
+ * sync can move a cancelled order back to a posting status and its next invoice update would read the line's rate. Reads only.
  */
 export async function openDocumentsOf(client: Client, rateId: string): Promise<{
   salesOrderIds: string[]; unpostedSalesOrders: number; unpostedSalesLines: number; postedSalesOrders: number; postedSalesLines: number
   purchaseOrderIds: string[]; unpostedPurchaseOrders: number; unpostedPurchaseLines: number; postedPurchaseOrders: number; postedPurchaseLines: number
+  cancelledSalesOrderIds: string[]; cancelledSalesLines: number; cancelledPurchaseOrderIds: string[]; cancelledPurchaseLines: number
 }> {
   const orders = await client.salesOrder.findMany({
     where: { lines: { some: { taxRateId: rateId } } },
@@ -384,9 +391,9 @@ export async function openDocumentsOf(client: Client, rateId: string): Promise<{
   const logs = orderIds.length === 0 ? [] : await client.accountingSyncLog.findMany({ where: { referenceType: 'SalesOrder', referenceId: { in: orderIds }, type: { in: [...SALES_INVOICE_TYPES] } }, select: { referenceId: true } })
   const events = orderIds.length === 0 ? [] : await client.accountingEvent.findMany({ where: { sourceEntityType: 'SalesOrder', sourceEntityId: { in: orderIds } }, select: { sourceEntityId: true } })
   const touched = new Set([...logs.map((l) => l.referenceId), ...events.map((e) => e.sourceEntityId)])
-  const out = { salesOrderIds: [] as string[], unpostedSalesOrders: 0, unpostedSalesLines: 0, postedSalesOrders: 0, postedSalesLines: 0, purchaseOrderIds: [] as string[], unpostedPurchaseOrders: 0, unpostedPurchaseLines: 0, postedPurchaseOrders: 0, postedPurchaseLines: 0 }
+  const out = { salesOrderIds: [] as string[], unpostedSalesOrders: 0, unpostedSalesLines: 0, postedSalesOrders: 0, postedSalesLines: 0, cancelledSalesOrderIds: [] as string[], cancelledSalesLines: 0, cancelledPurchaseOrderIds: [] as string[], cancelledPurchaseLines: 0, purchaseOrderIds: [] as string[], unpostedPurchaseOrders: 0, unpostedPurchaseLines: 0, postedPurchaseOrders: 0, postedPurchaseLines: 0 }
   for (const order of orders) {
-    if (order.status === 'CANCELLED') continue
+    if (order.status === 'CANCELLED') { out.cancelledSalesOrderIds.push(order.id); out.cancelledSalesLines += order.lines.length; continue }
     out.salesOrderIds.push(order.id)
     const posted = order.accountingInvoiceId !== null || order.invoicedAt !== null || order.invoiceNumber !== null || touched.has(order.id)
     if (posted) { out.postedSalesOrders += 1; out.postedSalesLines += order.lines.length } else { out.unpostedSalesOrders += 1; out.unpostedSalesLines += order.lines.length }
@@ -396,12 +403,14 @@ export async function openDocumentsOf(client: Client, rateId: string): Promise<{
     select: { id: true, status: true, invoices: { select: { id: true }, take: 1 }, lines: { where: { taxRateId: rateId }, select: { id: true } } },
   })
   for (const po of pos) {
-    if (po.status === 'CANCELLED') continue
+    if (po.status === 'CANCELLED') { out.cancelledPurchaseOrderIds.push(po.id); out.cancelledPurchaseLines += po.lines.length; continue }
     out.purchaseOrderIds.push(po.id)
     if (po.invoices.length > 0) { out.postedPurchaseOrders += 1; out.postedPurchaseLines += po.lines.length } else { out.unpostedPurchaseOrders += 1; out.unpostedPurchaseLines += po.lines.length }
   }
   out.salesOrderIds.sort()
   out.purchaseOrderIds.sort()
+  out.cancelledSalesOrderIds.sort()
+  out.cancelledPurchaseOrderIds.sort()
   return out
 }
 
@@ -455,6 +464,8 @@ async function referencesOf(client: Client, row: RekeyRow, rate: RekeyImsRate): 
     unpostedPurchaseOrders: open.unpostedPurchaseOrders, unpostedPurchaseOrderLines: open.unpostedPurchaseLines,
     postedSalesOrders: open.postedSalesOrders, postedSalesOrderLines: open.postedSalesLines,
     postedPurchaseOrders: open.postedPurchaseOrders, postedPurchaseOrderLines: open.postedPurchaseLines,
+    cancelledSalesOrders: open.cancelledSalesOrderIds.length, cancelledSalesOrderLines: open.cancelledSalesLines,
+    cancelledPurchaseOrders: open.cancelledPurchaseOrderIds.length, cancelledPurchaseOrderLines: open.cancelledPurchaseLines,
     pendingRefunds: refunds.refunds, pendingRefundLines: refunds.lines, refundSnapshotConflict,
     queuedSyncRows: queued.syncRows, queuedEvents: queued.events,
   }
@@ -510,6 +521,7 @@ export interface RekeyWriteResult {
   mappingsRepointed: number
   salesLinesRepointed: number
   purchaseLinesRepointed: number
+  cancelledLinesRepointed: number
   refundLinesRepointed: number
 }
 
@@ -519,7 +531,7 @@ export interface RekeyWriteResult {
  * and components are never written. The re-point statements name the old row's id, so a re-run (old row inactive, nothing referencing it) matches nothing.
  */
 export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allowUnposted: boolean }): Promise<RekeyWriteResult> {
-  const result: RekeyWriteResult = { created: [], suppliersRepointed: 0, mappingsRepointed: 0, salesLinesRepointed: 0, purchaseLinesRepointed: 0, refundLinesRepointed: 0 }
+  const result: RekeyWriteResult = { created: [], suppliersRepointed: 0, mappingsRepointed: 0, salesLinesRepointed: 0, purchaseLinesRepointed: 0, cancelledLinesRepointed: 0, refundLinesRepointed: 0 }
   for (const row of plan.rows) {
     if (row.outcome !== 'REKEY') continue
     const old = await tx.taxRate.findUnique({ where: { id: row.imsRateId }, include: { components: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } })
@@ -564,6 +576,10 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
       if (open.salesOrderIds.length > 0) result.salesLinesRepointed += (await tx.salesOrderLine.updateMany({ where: { taxRateId: old.id, orderId: { in: open.salesOrderIds } }, data: { taxRateId: fresh.id } })).count
       if (open.purchaseOrderIds.length > 0) result.purchaseLinesRepointed += (await tx.purchaseOrderLine.updateMany({ where: { taxRateId: old.id, poId: { in: open.purchaseOrderIds } }, data: { taxRateId: fresh.id } })).count
     }
+    // CANCELLED documents follow too, whatever the flag (they never block): a storefront status sync can reopen a cancelled order, and its next invoice build would read the line's rate.
+    const cancelled = await openDocumentsOf(tx, old.id)
+    if (cancelled.cancelledSalesOrderIds.length > 0) result.cancelledLinesRepointed += (await tx.salesOrderLine.updateMany({ where: { taxRateId: old.id, orderId: { in: cancelled.cancelledSalesOrderIds } }, data: { taxRateId: fresh.id } })).count
+    if (cancelled.cancelledPurchaseOrderIds.length > 0) result.cancelledLinesRepointed += (await tx.purchaseOrderLine.updateMany({ where: { taxRateId: old.id, poId: { in: cancelled.cancelledPurchaseOrderIds } }, data: { taxRateId: fresh.id } })).count
     result.created.push({ oldId: old.id, newId: fresh.id, name: old.name, fromCode: row.currentCode, toCode })
   }
   if (result.created.length > 0) {

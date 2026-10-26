@@ -67,7 +67,7 @@ export function renderTaxRekeyUsage(): string {
     'live organisation. This ties each active IMS rate with a custom code to the live Xero type of the SAME NAME (never by code), with the same percentage, ACTIVE, country-consistent.',
     'Without --apply it is a read-only PREVIEW: it prints the plan and its digest and writes nothing. With --apply --confirm <digest> (the digest the preview printed) it re-keys, in',
     'one transaction: a new rate with the live code, the old one deactivated (never edited), supplier defaults and WooCommerce mappings re-pointed. Documents already sent to Xero are not touched.',
-    'Not-cancelled orders and purchase orders (posted or not) referencing a re-keyed rate can still post its old code, so they refuse the apply unless --allow-unposted (their lines are then re-pointed); unposted refund lines storing the old code (migrated on the flag only when the code means the old rate alone), queued payloads carrying the old code always refuse it.',
+    'Not-cancelled orders and purchase orders (posted or not) referencing a re-keyed rate can still post its old code, so they refuse the apply unless --allow-unposted (their lines are then re-pointed); cancelled ones are always re-pointed and never block (a storefront status sync can reopen them); unposted refund lines storing the old code (migrated on the flag only when the code means the old rate alone), queued payloads carrying the old code always refuse it.',
     'A re-key is a pre-go-live operation: an apply is refused (XERO_NOT_HELD) unless the producer-side hold is enforced for xero and Xero is not live (no outbound grant, no live-from instant), read from this command\'s environment as the application\'s producers read theirs.',
     'It reads the stored copy of Xero\'s list (the proven one) and never calls Xero or WooCommerce.',
     '',
@@ -92,7 +92,7 @@ function renderPlan(plan: RekeyPlan): string[] {
     for (const row of rows) {
       const live = row.target === null ? '' : `  -> ${row.target.taxType} "${row.target.name}" ${row.target.percent ?? '(no percentage)'}%`
       const refs = plan.references[row.imsRateId]
-      const refText = refs === undefined ? '' : `  [suppliers ${refs.suppliers}, storefront mappings ${refs.storefrontMappings}${refs.isDefault ? ', DEFAULT RATE' : ''}, never-posted orders ${refs.unpostedSalesOrders} sales / ${refs.unpostedPurchaseOrders} purchase, already-posted orders ${refs.postedSalesOrders} sales / ${refs.postedPurchaseOrders} purchase, pending refund lines ${refs.pendingRefundLines}${refs.refundSnapshotConflict ? ' (CODE SHARED WITH ANOTHER RATE)' : ''}, queued payloads ${refs.queuedSyncRows + refs.queuedEvents}]`
+      const refText = refs === undefined ? '' : `  [suppliers ${refs.suppliers}, storefront mappings ${refs.storefrontMappings}${refs.isDefault ? ', DEFAULT RATE' : ''}, never-posted orders ${refs.unpostedSalesOrders} sales / ${refs.unpostedPurchaseOrders} purchase, already-posted orders ${refs.postedSalesOrders} sales / ${refs.postedPurchaseOrders} purchase, cancelled orders ${refs.cancelledSalesOrders} sales / ${refs.cancelledPurchaseOrders} purchase (re-pointed, never blocking), pending refund lines ${refs.pendingRefundLines}${refs.refundSnapshotConflict ? ' (CODE SHARED WITH ANOTHER RATE)' : ''}, queued payloads ${refs.queuedSyncRows + refs.queuedEvents}]`
       for (const c of row.clearedComponents) lines.push(`    component "${c.name}" keeps no code: ${c.taxType} is not a live ACTIVE type, the new row gets none`)
       lines.push(`  ${row.name} [${row.usedFor}${row.countryCode ? ` ${row.countryCode}` : ''}] ${row.currentCode} ${row.imsPercent}%${live}  (${row.matchedBy ?? 'no name match'}: ${row.reason})${refText}`)
     }
@@ -112,7 +112,7 @@ export function renderTaxRekeyText(result: TaxRekeyRunResult): string {
     if (result.written === null || result.written.created.length === 0) lines.push('Applied: nothing to re-key (a re-run changes nothing).')
     else {
       const w = result.written
-      lines.push(`Applied: ${w.created.length} rate(s) re-keyed (new row created, old row deactivated); re-pointed ${w.suppliersRepointed} supplier default(s), ${w.mappingsRepointed} storefront mapping(s), ${w.salesLinesRepointed} sales line(s), ${w.purchaseLinesRepointed} purchase line(s), ${w.refundLinesRepointed} pending refund line(s).`)
+      lines.push(`Applied: ${w.created.length} rate(s) re-keyed (new row created, old row deactivated); re-pointed ${w.suppliersRepointed} supplier default(s), ${w.mappingsRepointed} storefront mapping(s), ${w.salesLinesRepointed} sales line(s), ${w.purchaseLinesRepointed} purchase line(s), ${w.cancelledLinesRepointed} cancelled-order line(s), ${w.refundLinesRepointed} pending refund line(s).`)
       for (const c of w.created) lines.push(`  ${c.name}: ${c.fromCode} -> ${c.toCode}`)
       lines.push('Run npm run vat:diff to confirm the percentage differences are gone.')
     }

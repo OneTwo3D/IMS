@@ -156,10 +156,10 @@ async function seedWorld(d: Deps) {
   const soCancelled = await order('cancelled', ids.cy, { status: 'CANCELLED' })
   const product = await db.product.create({ data: { sku: `RK${run}`, name: `${TAG}product`, type: 'SIMPLE', countryOfOrigin: 'CN' }, select: { id: true } })
   created.products.push(product.id)
-  const po = async (key: string, taxRateId: string, posted: boolean) => {
+  const po = async (key: string, taxRateId: string, posted: boolean, status: 'DRAFT' | 'CANCELLED' = 'DRAFT') => {
     const p = await db.purchaseOrder.create({
       data: {
-        reference: `PO-RK${run}-${key}`, supplierId: supCy, status: 'DRAFT', currency: 'GBP', fxRateToBase: 1, ...money,
+        reference: `PO-RK${run}-${key}`, supplierId: supCy, status, currency: 'GBP', fxRateToBase: 1, ...money,
         lines: { create: [{ productId: product.id, qty: 1, unitCostForeign: 10, unitCostBase: 10, totalForeign: 10, totalBase: 10, taxRateId }] },
       }, select: { id: true, lines: { select: { id: true } } },
     })
@@ -182,7 +182,8 @@ async function seedWorld(d: Deps) {
   const refundGrPosted = await refund('gr-posted', soDraftGr.id, code('A'), true)
   const poDraftBe = await po('be', ids.be, false)
   const poPostedCy = await po('posted-cy', ids.cy, true)
-  return { refundGrPending, refundGrPosted, ids, supCy, supGr, supBg, mapping: mapping.id, mappingBg: mappingBg.id, soPosted, soDraftCy, soDraftGr, soCancelled, poDraftBe, poPostedCy }
+  const poCancelledCy = await po('cancelled-cy', ids.cy, false, 'CANCELLED')
+  return { refundGrPending, refundGrPosted, ids, supCy, supGr, supBg, mapping: mapping.id, mappingBg: mappingBg.id, soPosted, soDraftCy, soDraftGr, soCancelled, poDraftBe, poPostedCy, poCancelledCy }
 }
 type World = Awaited<ReturnType<typeof seedWorld>>
 
@@ -348,7 +349,14 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   assert.deepEqual([await map(w.mapping), await map(w.mappingBg)], [newId('CY VAT'), w.ids.bg])
   // Documents: EVERY not-cancelled one moved (posted ones can still be edited / re-sent / credited / billed again and would send the old code); the cancelled one is left alone.
   const soLine = async (id: string) => (await db.salesOrderLine.findUniqueOrThrow({ where: { id } })).taxRateId
-  assert.deepEqual([await soLine(w.soPosted.lineId), await soLine(w.soCancelled.lineId), await soLine(w.soDraftCy.lineId), await soLine(w.soDraftGr.lineId)], [newId('CY VAT'), w.ids.cy, newId('CY VAT'), newId('GR VAT')])
+  assert.deepEqual([await soLine(w.soPosted.lineId), await soLine(w.soCancelled.lineId), await soLine(w.soDraftCy.lineId), await soLine(w.soDraftGr.lineId)], [newId('CY VAT'), newId('CY VAT'), newId('CY VAT'), newId('GR VAT')])
+  // CANCELLED documents (sales and purchase) follow without blocking; reopened afterwards, the line reads the LIVE code.
+  const poCancelledLine = await db.purchaseOrderLine.findUniqueOrThrow({ where: { id: w.poCancelledCy.lineId }, include: { taxRate: true } })
+  assert.deepEqual([poCancelledLine.taxRateId, poCancelledLine.taxRate?.accountingTaxType], [newId('CY VAT'), code('C')])
+  assert.equal(result.written!.cancelledLinesRepointed, 2)
+  await db.salesOrder.update({ where: { id: w.soCancelled.id }, data: { status: 'PROCESSING' } })
+  const reopened = await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soCancelled.lineId }, include: { taxRate: true } })
+  assert.equal(reopened.taxRate?.accountingTaxType, code('C'), 'a cancelled order reopened by a status sync posts the live code, not the retired one')
   const poLine = async (id: string) => (await db.purchaseOrderLine.findUniqueOrThrow({ where: { id } })).taxRateId
   assert.deepEqual([await poLine(w.poPostedCy.lineId), await poLine(w.poDraftBe.lineId)], [newId('CY VAT'), newId('BE VAT')])
   // Refund-line snapshots: the not-yet-posted refund's code is migrated (its identity is GR VAT alone); the posted credit note's is history and stays.
@@ -435,7 +443,7 @@ test('an ALREADY-POSTED invoiced order and a part-billed PO are future posting s
   const newCy = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}CY VAT`, active: true } })).id
   assert.equal((await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soPosted.lineId } })).taxRateId, newCy, 'the invoiced order\'s line follows')
   assert.equal((await db.purchaseOrderLine.findUniqueOrThrow({ where: { id: w.poPostedCy.lineId } })).taxRateId, newCy, 'the billed PO\'s line follows')
-  assert.equal((await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soCancelled.lineId } })).taxRateId, w.ids.cy, 'a cancelled order stays on the old row')
+  assert.equal((await db.salesOrderLine.findUniqueOrThrow({ where: { id: w.soCancelled.lineId } })).taxRateId, (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}CY VAT`, active: true } })).id, 'a cancelled order follows too (it never blocks, and a status sync can reopen it)')
 })
 
 // [mutation: the refund-line migration removed from writeTaxRekey -> the main arm fails; mutation: the PENDING_REFUND_SNAPSHOTS refusal removed -> this arm applies without the flag]

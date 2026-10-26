@@ -252,7 +252,7 @@ test('REPORT TYPE: the live type must file to the VAT-return box IMS assigns the
 
 const refs = (over: Partial<RekeyReferences> = {}): RekeyReferences => ({
   suppliers: 1, storefrontMappings: 1, isDefault: false, unpostedSalesOrders: 0, unpostedSalesOrderLines: 0, unpostedPurchaseOrders: 0, unpostedPurchaseOrderLines: 0,
-  queuedSyncRows: 0, queuedEvents: 0, postedSalesOrders: 0, postedSalesOrderLines: 0, postedPurchaseOrders: 0, postedPurchaseOrderLines: 0, pendingRefunds: 0, pendingRefundLines: 0, refundSnapshotConflict: false, ...over,
+  queuedSyncRows: 0, queuedEvents: 0, postedSalesOrders: 0, postedSalesOrderLines: 0, postedPurchaseOrders: 0, postedPurchaseOrderLines: 0, cancelledSalesOrders: 0, cancelledSalesOrderLines: 0, cancelledPurchaseOrders: 0, cancelledPurchaseOrderLines: 0, pendingRefunds: 0, pendingRefundLines: 0, refundSnapshotConflict: false, ...over,
 })
 const planOf = (referenceOver: Partial<RekeyReferences> = {}): RekeyPlan => {
   const matched = match(DEMO, LIVE)
@@ -285,6 +285,9 @@ test('applyRefusal: blockers and queued payloads always refuse; unposted orders 
   assert.equal(applyRefusal(planOf({ postedPurchaseOrders: 1, postedPurchaseOrderLines: 1 }), false)?.code, 'UNPOSTED_DOCUMENTS')
   assert.equal(applyRefusal(planOf({ postedSalesOrders: 1, postedPurchaseOrders: 1 }), true), null, 'control: the flag lets posted sources through')
   assert.equal(applyRefusal(planOf({ unpostedSalesOrders: 2 }), true), null, 'control: the flag lets unposted orders through')
+  // CANCELLED documents never block (they are re-pointed by every apply) but are part of the plan the digest binds.
+  assert.equal(applyRefusal(planOf({ cancelledSalesOrders: 3, cancelledSalesOrderLines: 4, cancelledPurchaseOrders: 1, cancelledPurchaseOrderLines: 1 }), false), null)
+  assert.notEqual(planOf({ cancelledSalesOrders: 1 }).digest, planOf().digest)
   // Pending refund-line snapshots: no queued payload exists, yet a retry would send the old code.
   assert.equal(applyRefusal(planOf({ pendingRefunds: 1, pendingRefundLines: 2 }), false)?.code, 'PENDING_REFUND_SNAPSHOTS')
   assert.equal(applyRefusal(planOf({ pendingRefunds: 1, pendingRefundLines: 2 }), true), null, 'control: the flag migrates them')
@@ -339,7 +342,7 @@ test('a trusted stored list gives a plan (control for the refusals below)', asyn
   assert.equal(read.ok, true)
   if (read.ok) {
     assert.equal(read.plan.counts.REKEY, 5)
-    assert.deepEqual(Object.values(read.plan.references)[0], { suppliers: 1, storefrontMappings: 2, isDefault: false, unpostedSalesOrders: 0, unpostedSalesOrderLines: 0, unpostedPurchaseOrders: 0, unpostedPurchaseOrderLines: 0, postedSalesOrders: 0, postedSalesOrderLines: 0, postedPurchaseOrders: 0, postedPurchaseOrderLines: 0, pendingRefunds: 0, pendingRefundLines: 0, refundSnapshotConflict: false, queuedSyncRows: 0, queuedEvents: 0 })
+    assert.deepEqual(Object.values(read.plan.references)[0], { suppliers: 1, storefrontMappings: 2, isDefault: false, unpostedSalesOrders: 0, unpostedSalesOrderLines: 0, unpostedPurchaseOrders: 0, unpostedPurchaseOrderLines: 0, postedSalesOrders: 0, postedSalesOrderLines: 0, postedPurchaseOrders: 0, postedPurchaseOrderLines: 0, cancelledSalesOrders: 0, cancelledSalesOrderLines: 0, cancelledPurchaseOrders: 0, cancelledPurchaseOrderLines: 0, pendingRefunds: 0, pendingRefundLines: 0, refundSnapshotConflict: false, queuedSyncRows: 0, queuedEvents: 0 })
     const again = await readRekeyPlan(client({ list: LIVE }), { now: NOW, connectedTenantId: TENANT })
     assert.equal(again.ok && again.plan.digest, read.plan.digest, 'the same state gives the same digest')
   }
@@ -409,7 +412,7 @@ test('exit codes: 0 nothing to do or applied, 1 a preview that lists work, 2 ref
   assert.equal(taxRekeyExitCode(result()), 1)
   const clean = { ...planOf(), rows: planOf().rows.map((r) => ({ ...r, outcome: 'ALREADY_CORRECT' as const })) }
   assert.equal(taxRekeyExitCode(result({ plan: clean })), 0)
-  assert.equal(taxRekeyExitCode(result({ applied: true, wrote: true, written: { created: [], suppliersRepointed: 0, mappingsRepointed: 0, salesLinesRepointed: 0, purchaseLinesRepointed: 0, refundLinesRepointed: 0 } })), 0)
+  assert.equal(taxRekeyExitCode(result({ applied: true, wrote: true, written: { created: [], suppliersRepointed: 0, mappingsRepointed: 0, salesLinesRepointed: 0, purchaseLinesRepointed: 0, cancelledLinesRepointed: 0, refundLinesRepointed: 0 } })), 0)
   assert.equal(taxRekeyExitCode(result({ applied: true, refusal: { code: 'DIGEST_MISMATCH', detail: 'x' } })), 2)
   assert.equal(taxRekeyExitCode(result({ plan: null, refusal: { code: 'XERO_LIST_STALE', detail: 'x' } })), 2)
   const text = renderTaxRekeyText(result())
@@ -423,7 +426,7 @@ test('the command: account, credential and database refusals, the replaced envir
   const calls: unknown[] = []
   const out: string[] = []
   const err: string[] = []
-  const deps = { run: async (o: unknown) => { calls.push(o); return result({ applied: true, wrote: true, written: { created: [{ oldId: 'a', newId: 'b', name: 'CY VAT', fromCode: 'TAX005', toCode: 'TAX008' }], suppliersRepointed: 1, mappingsRepointed: 2, salesLinesRepointed: 0, purchaseLinesRepointed: 0, refundLinesRepointed: 0 } }) }, disconnect: async () => undefined }
+  const deps = { run: async (o: unknown) => { calls.push(o); return result({ applied: true, wrote: true, written: { created: [{ oldId: 'a', newId: 'b', name: 'CY VAT', fromCode: 'TAX005', toCode: 'TAX008' }], suppliersRepointed: 1, mappingsRepointed: 2, salesLinesRepointed: 0, purchaseLinesRepointed: 0, cancelledLinesRepointed: 0, refundLinesRepointed: 0 } }) }, disconnect: async () => undefined }
   const base = { env: { DATABASE_URL: 'postgresql://x', HOME: '/tmp', PGHOST: '203.0.113.1', PGPASSWORD: 'x', NODE_OPTIONS: '--require /evil.js', SETTINGS_ENCRYPTION_KEY: 'k' }, uid: 0, checkoutOwnerUid: 1000, deps, stdout: (t: string) => out.push(t), stderr: (t: string) => err.push(t) }
 
   assert.equal(await runTaxRekeyCli({ ...base, argv: ['--apply', '--confirm', digest], onKeptEnv: (kept) => { assert.deepEqual(Object.keys(kept).sort(), ['DATABASE_URL', 'HOME', 'SETTINGS_ENCRYPTION_KEY']) } }), 0)
