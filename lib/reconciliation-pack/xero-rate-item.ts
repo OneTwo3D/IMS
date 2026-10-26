@@ -27,7 +27,7 @@
  *
  *   IMS POSTINGS (Codex round 2). A record IMS posted (an IMS sync record, connector-confirmed, names its Xero id) is held to the rate that posting CARRIED, converted
  *   by the poster's own helper, not to the table now: the poster sends the stored rate and never looks one up. A second check holds that stored rate to the table
- *   where a date rule is stated in code (a storefront invoice or receipt); other posted records are counted, not table-checked. Records IMS did not post keep the
+ *   where a date rule is stated in code (a storefront invoice at the order's instant, a receipt by the importer's same-day test); other posted records are counted, not table-checked. Records IMS did not post keep the
  *   reconstruction below. An IMS link whose rate cannot be read is IMS_POSTING_UNREADABLE (a finding), never a pass.
  *
  *   FINDINGS, each a closed reason (the item fails with DIFFERENCES and the specific reasons):
@@ -57,6 +57,7 @@ import {
   type PackSourceCode,
 } from '@/lib/reconciliation-pack/constants'
 import { imsRateToXeroCurrencyRate } from '@/lib/connectors/xero/fx'
+import { receiptOnOrderDay } from '@/lib/connectors/woocommerce/sync/receipt-settlement-rate'
 import { endOfBusinessDateUtc, isMissingFxRateError, selectFxRateFromRows, type FxRateRow as SelectRow } from '@/lib/currencies/fx-select'
 import type { KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { FxRateRow, ImsRead, ImsReadOptions, XeroPostedRateRow } from '@/lib/reconciliation-pack/ims-readers'
@@ -187,16 +188,28 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     const tableKey = [...baseKey(document), sku('posted-vs-table'), sku(log.id)]
     let candidates: Prisma.Decimal[] | null = null
     if (log.type === 'INVOICE_PAYMENT' && log.wooReceipt) {
-      // A storefront receipt: the order's own booked rate when it was paid the day it was ordered, else the central rate at the end of the payment's day.
+      // A storefront receipt, by the importer's own rule (receiptOnOrderDay, the very function the importer calls): the order's booked rate when the payment's UTC day is
+      // the order's, and ONLY then; on any other day, or when the order's creation instant is unknown, the central rate at the end of the payment's day. A missing table
+      // rate on such a day is IMS_RATE_MISSING, never a pass through the order's rate.
       if (day === null) return unreadablePosting(log.id, 'date-unreadable')
-      const order = postedRateOf(log.orderRate)
-      const orderSent = order === null ? undefined : imsRateToXeroCurrencyRate(order.toNumber())
-      const table = tableRate(document.currency, endOfBusinessDateUtc(day))
-      candidates = [...(table === null ? [] : [table]), ...(orderSent === undefined ? [] : [D(orderSent)])]
+      const created = log.orderCreatedAt === null ? null : new Date(log.orderCreatedAt)
+      if (created !== null && Number.isNaN(created.getTime())) return unreadablePosting(log.id, 'order-date-unreadable')
+      if (receiptOnOrderDay(created, new Date(`${day}T00:00:00.000Z`))) {
+        const order = postedRateOf(log.orderRate)
+        const orderSent = order === null ? undefined : imsRateToXeroCurrencyRate(order.toNumber())
+        if (orderSent === undefined) return unreadablePosting(log.id, 'order-rate-unreadable')
+        candidates = [D(orderSent)]
+      } else {
+        const table = tableRate(document.currency, endOfBusinessDateUtc(day))
+        candidates = table === null ? [] : [table]
+      }
     } else if (log.type === 'SALES_INVOICE' && log.wooOrder) {
-      // A storefront invoice carries the order's rate fixed at the order's instant, which is not stored; the rule is that it is a central rate in force at some instant of the order's day.
+      // A storefront invoice carries the central rate at the order's instant (the importer prices it with the lookup as of date_created_gmt = externalCreatedAt): exactly
+      // that row when the instant is known. Only when it is unknown is the order's day the bound: a central rate in force at some instant of that UTC day.
       if (day === null) return unreadablePosting(log.id, 'date-unreadable')
-      const instants = [new Date(`${day}T00:00:00.000Z`), endOfBusinessDateUtc(day), ...(byCurrency.get(document.currency) ?? []).filter((r) => r.fetchedAt.toISOString().slice(0, 10) === day).map((r) => r.fetchedAt)]
+      const created = log.orderCreatedAt === null ? null : new Date(log.orderCreatedAt)
+      if (created !== null && Number.isNaN(created.getTime())) return unreadablePosting(log.id, 'order-date-unreadable')
+      const instants = created !== null ? [created] : [new Date(`${day}T00:00:00.000Z`), endOfBusinessDateUtc(day), ...(byCurrency.get(document.currency) ?? []).filter((r) => r.fetchedAt.toISOString().slice(0, 10) === day).map((r) => r.fetchedAt)]
       candidates = []
       for (const instant of instants) { const t = tableRate(document.currency, instant); if (t !== null) candidates.push(t) }
     }

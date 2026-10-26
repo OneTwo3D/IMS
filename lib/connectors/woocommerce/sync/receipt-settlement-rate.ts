@@ -1,4 +1,4 @@
-import { endOfBusinessDateUtc, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { endOfBusinessDateUtc, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-select'
 
 /**
  * o3d-q0x56.19 - THE SETTLEMENT RATE OF AN IMPORTED WOOCOMMERCE RECEIPT (owner ruling 2026-10-25).
@@ -29,6 +29,14 @@ export function utcCalendarDate(instant: Date): string {
   return instant.toISOString().slice(0, 10)
 }
 
+/**
+ * THE SAME-DAY TEST, the importer's own and the reconciliation pack's (R16 holds a posted receipt to it): the receipt keeps the order's booked rate only when
+ * the payment's UTC calendar date equals the order's. An unknown order instant (null) is never "the same day".
+ */
+export function receiptOnOrderDay(orderedAt: Date | null, paidAt: Date): boolean {
+  return orderedAt !== null && utcCalendarDate(paidAt) === utcCalendarDate(orderedAt)
+}
+
 export type WcReceiptRateLookup = (currency: string, asOf: Date) => Promise<number>
 
 export async function resolveWcReceiptSettlementRate(params: {
@@ -52,7 +60,7 @@ export async function resolveWcReceiptSettlementRate(params: {
     )
   }
   // no known order instant is never "the same day": the payment-day central rate is used
-  if (params.orderedAt !== null && utcCalendarDate(paidAt) === utcCalendarDate(params.orderedAt)) return params.orderRate
+  if (receiptOnOrderDay(params.orderedAt, paidAt)) return params.orderRate
   const asOf = endOfBusinessDateUtc(paidAt)
   try {
     return await params.lookup(currency, asOf)

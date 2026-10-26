@@ -101,5 +101,5 @@ export const eurInvoice = (n: number, rate: number | string | null, date = '2026
 
 /** What IMS recorded when it posted the Xero record `ref` (the Xero id of the row built with n = ref): a connector-confirmed sync record carrying `rate` (1 base = X foreign). */
 export const postedRow = (ref: number, type: string, over: Partial<XeroPostedRateRow> = {}): XeroPostedRateRow => ({
-  id: `log${ref}`, type, externalId: uuid(ref), noPayload: false, currency: 'EUR', date: '2026-09-10', rate: '1.25', wooReceipt: false, orderRate: null, wooOrder: false, ...over,
+  id: `log${ref}`, type, externalId: uuid(ref), noPayload: false, currency: 'EUR', date: '2026-09-10', rate: '1.25', wooReceipt: false, orderRate: null, wooOrder: false, orderCreatedAt: null, ...over,
 })

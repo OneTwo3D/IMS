@@ -217,7 +217,7 @@ export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; p
  * WooCommerce receipt) and that invoice entry's stored order rate; `wooOrder` is true for a document of a sales order imported from the storefront.
  * Read-only, in the snapshot of the other sections.
  */
-export type XeroPostedRateRow = { id: string; type: string; externalId: string; noPayload: boolean; currency: string | null; date: string | null; rate: string | null; wooReceipt: boolean; orderRate: string | null; wooOrder: boolean }
+export type XeroPostedRateRow = { id: string; type: string; externalId: string; noPayload: boolean; currency: string | null; date: string | null; rate: string | null; wooReceipt: boolean; orderRate: string | null; wooOrder: boolean; /** SalesOrder.externalCreatedAt (the storefront's creation instant, UTC ISO) of the order the record belongs to; null when unknown. */ orderCreatedAt: string | null }
 
 export type ImsSectionValues = {
   identity: ImsIdentity
@@ -519,7 +519,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const rows = await readCapped(tx, `SELECT l.id AS id, l.type::text AS type, l."externalTransactionId" AS external_id, (l.payload IS NULL) AS no_payload, l.payload->>'currency' AS currency,
       CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'paymentDate' ELSE l.payload->>'date' END AS doc_date,
       CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'settlementRateToBase' ELSE l.payload->>'currencyRateToBase' END AS rate,
-      COALESCE((src.payload ? '_paymentSettlementRateToBase'), false) AS woo_receipt, src.payload->>'currencyRateToBase' AS order_rate, (so."externalOrderNumber" IS NOT NULL) AS woo_order
+      COALESCE((src.payload ? '_paymentSettlementRateToBase'), false) AS woo_receipt, src.payload->>'currencyRateToBase' AS order_rate, (so."externalOrderNumber" IS NOT NULL) AS woo_order, ${UTC('so."externalCreatedAt"')} AS order_created
       FROM accounting_sync_logs l
       LEFT JOIN accounting_sync_logs src ON l.type::text = 'INVOICE_PAYMENT' AND src.id = l.payload->>'sourceEntryId'
       LEFT JOIN sales_orders so ON l."referenceType" = 'SalesOrder' AND so.id = l."referenceId"
@@ -527,7 +527,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
         AND l.type::text IN ('SALES_INVOICE', 'PURCHASE_INVOICE', 'CREDIT_NOTE', 'PURCHASE_CREDIT_NOTE', 'INVOICE_PAYMENT', 'BILL_PAYMENT') ORDER BY l.id`)
     const posted = rows.map((row): XeroPostedRateRow => ({
       id: text(row.id), type: text(row.type, 'SOURCE_UNREADABLE'), externalId: text(row.external_id), noPayload: bool(row.no_payload),
-      currency: textOrNull(row.currency), date: textOrNull(row.doc_date), rate: textOrNull(row.rate), wooReceipt: bool(row.woo_receipt), orderRate: textOrNull(row.order_rate), wooOrder: bool(row.woo_order === null ? false : row.woo_order),
+      currency: textOrNull(row.currency), date: textOrNull(row.doc_date), rate: textOrNull(row.rate), wooReceipt: bool(row.woo_receipt), orderRate: textOrNull(row.order_rate), wooOrder: bool(row.woo_order === null ? false : row.woo_order), orderCreatedAt: textOrNull(row.order_created),
     }))
     unique(posted, (row) => row.id)
     return posted
