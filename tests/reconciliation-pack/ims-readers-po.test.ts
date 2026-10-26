@@ -247,6 +247,7 @@ test('xeroPostedRates: reads the connector-confirmed creates of the six posting 
   const sql = client.sent.find((x) => /accounting_sync_logs l/.test(x.sql))!.sql
   assert.match(sql, /l\.connector = 'xero' AND l\.status::text = 'SYNCED' AND l\.settlement_basis IS NULL AND l\."externalTransactionId" IS NOT NULL/)
   assert.match(sql, /IN \('SALES_INVOICE', 'PURCHASE_INVOICE', 'CREDIT_NOTE', 'PURCHASE_CREDIT_NOTE', 'INVOICE_PAYMENT', 'BILL_PAYMENT'\)/)
+  assert.match(sql, /to_char\(so\."externalCreatedAt"[^)]*\) AS order_created/)
   assert.match(sql, /'settlementRateToBase' ELSE l\.payload->>'currencyRateToBase'/)
   const reason = async (rows: Array<Record<string, unknown>>, cap?: number) => {
     const s = await sectionOf('xeroPostedRates', fake((q) => (/accounting_sync_logs l/.test(q) ? rows : [])), undefined, cap)

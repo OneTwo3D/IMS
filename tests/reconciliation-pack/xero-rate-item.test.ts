@@ -410,6 +410,11 @@ test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is 
   assert.deepEqual([unknown.outcome, [...unknown.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTED_RATE_NOT_TABLE_RATE']], 'unknown creation instant: the payment-day rule')
   const sameNoOrderRate = await runXeroRateItem('R16', receipt('1.2', null, 0.833333, '2026-09-10T08:00:00.000Z', day10))
   assert.deepEqual([sameNoOrderRate.outcome, [...sameNoOrderRate.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], 'same day but the order rate cannot be read')
+  // An order creation instant that is not a date cannot be judged: a finding on a receipt and on an invoice.
+  for (const [type, lists] of [['INVOICE_PAYMENT', { payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8 })] }], ['SALES_INVOICE', { invoices: [eur(1, 0.8)] }]] as const) {
+    const bad = await runXeroRateItem('R16', context(lists, { ims: { rows: LATER, posted: [postedRow(1, type, { wooReceipt: true, wooOrder: true, orderRate: '1.25', orderCreatedAt: 'not-a-date' })] } }).ctx)
+    assert.deepEqual([bad.outcome, [...bad.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], type)
+  }
   // A storefront invoice with a known creation instant carries exactly the central rate AT that instant (1.25 from 06:00, 1.30 from 18:00), not any rate of the day.
   const at = (created: string | null, rate: string, xero: number) => context({ invoices: [eur(1, xero)] }, { ims: { rows: LATER, posted: [postedRow(1, 'SALES_INVOICE', { rate, wooOrder: true, orderCreatedAt: created })] } }).ctx
   assert.equal((await runXeroRateItem('R16', at('2026-09-10T10:00:00.000Z', '1.25', 0.8))).outcome, 'pass')
