@@ -54,6 +54,7 @@ export const VAT_SET_REASONS = {
   SHIPPING_NOT_TAXED: 'a WooCommerce rate with a positive percentage has "apply to shipping" off, but shipping always carries the goods\' VAT rate (owner ruling; the VAT difference report\'s WOO_SHIPPING_NOT_TAXED). A zero-rate is exempt: shipping at 0% is the same as no VAT on shipping',
   REGION_DIFFERS: 'the region of the WooCommerce rate (its state) is not the region its IMS rate records: IMS records a region only as the suffix of the rate name ("PT-30 VAT" is region 30), and the two disagree, including a regional IMS rate on a country-wide WooCommerce rate',
   REGION_UNVERIFIED: 'the region of the WooCommerce rate cannot be confirmed against IMS, which has no region data for the rate (a finding, never a pass): the WooCommerce rate has a state, a postcode or a city, a postcode or city IMS cannot record, or it shares country and class with an in-scope WooCommerce rate of another region and its IMS rate names no region',
+  XERO_NAME_DIFFERS: 'the IMS rate and the Xero type its accounting tax type code names do not have the same name (trimmed, whitespace runs collapsed, case ignored: the name the re-key matches and copies from), so the code may point at another rate of the same percentage, components and report type ("PT-30 VAT" against "PT-30 IOSS VAT"); the row carries both names',
   XERO_REGION_DIFFERS: 'the region the IMS rate name states and the region the Xero type name states are not the same ("PT-30 VAT" against "PT-20 VAT"), including one regional and one country-wide; the same name parser reads both',
   XERO_REGION_UNVERIFIED: 'the region of the IMS rate name or of the Xero type name cannot be read (a word after the country prefix that is not a hyphenated region, such as "PT Madeira VAT"), so the two cannot be compared (a finding, never a pass)',
   MISSING_IN_WOO: 'an in-scope IMS sales rate or Xero sales type has no WooCommerce counterpart',
@@ -63,7 +64,7 @@ export type VatSetReason = keyof typeof VAT_SET_REASONS
 export const VAT_SET_REASON_LIST = Object.keys(VAT_SET_REASONS) as VatSetReason[]
 
 export type VatSetSystem = 'woo' | 'ims' | 'xero'
-export type VatSetRow = { system: VatSetSystem; id: string; reasons: VatSetReason[] }
+export type VatSetRow = { system: VatSetSystem; id: string; reasons: VatSetReason[]; /** Both names, only on an IMS row with XERO_NAME_DIFFERS. */ names?: { ims: string; xero: string } }
 export type VatSetSummary = {
   inScope: Record<VatSetSystem, number>
   identical: Record<VatSetSystem, number>
@@ -127,6 +128,9 @@ function nameRegion(name: string, country: string): NameRegion {
   if (word !== null && !GENERIC_NAME_WORDS.has(word[1]!.toUpperCase())) return { kind: 'unreadable' }
   return { kind: 'wide' }
 }
+/** A rate name as the re-key compares it: trimmed, whitespace runs collapsed, case ignored. */
+const comparableName = (name: string): string => name.trim().replace(/\s+/g, ' ').toLowerCase()
+
 /** The region an IMS rate records in its name; null when it states none. IMS has no region field. */
 function imsRegion(name: string, country: string): string | null {
   const region = nameRegion(name, country)
@@ -166,7 +170,11 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
   }
 
   const rows: VatSetRow[] = []
-  const add = (system: VatSetSystem, id: string, reasons: Set<VatSetReason>): void => { rows.push({ system, id, reasons: VAT_SET_REASON_LIST.filter((reason) => reasons.has(reason)) }) }
+  const nameDifferences = new Map<string, { ims: string; xero: string }>()
+  const add = (system: VatSetSystem, id: string, reasons: Set<VatSetReason>): void => {
+    const names = system === 'ims' && reasons.has('XERO_NAME_DIFFERS') ? nameDifferences.get(id) : undefined
+    rows.push({ system, id, reasons: VAT_SET_REASON_LIST.filter((reason) => reasons.has(reason)), ...(names === undefined ? {} : { names }) })
+  }
 
   // The checks between an IMS rate and its live Xero type (shared by the IMS row).
   const imsXeroReasons = (rate: TaxRateRow, reasons: Set<VatSetReason>): void => {
@@ -182,6 +190,7 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     const imsPrefix = xeroNameCountry(rate.name)
     const livePrefix = xeroNameCountry(live.name)
     if ((imsPrefix !== null && imsPrefix !== country) || (livePrefix !== null && livePrefix !== country) || (country === '' && livePrefix !== null)) reasons.add('COUNTRY_DIFFERS')
+    if (comparableName(rate.name) !== comparableName(live.name)) { reasons.add('XERO_NAME_DIFFERS'); nameDifferences.set(rate.id, { ims: rate.name, xero: live.name }) }
     const imsNameRegion = nameRegion(rate.name, country)
     const liveNameRegion = nameRegion(live.name, country)
     if (imsNameRegion.kind === 'unreadable' || liveNameRegion.kind === 'unreadable') reasons.add('XERO_REGION_UNVERIFIED')
