@@ -411,7 +411,8 @@ test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is 
   const sameNoOrderRate = await runXeroRateItem('R16', receipt('1.2', null, 0.833333, '2026-09-10T08:00:00.000Z', day10))
   assert.deepEqual([sameNoOrderRate.outcome, [...sameNoOrderRate.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], 'same day but the order rate cannot be read')
   // An order creation instant that is not a date cannot be judged: a finding on a receipt and on an invoice.
-  for (const [type, lists] of [['INVOICE_PAYMENT', { payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8 })] }], ['SALES_INVOICE', { invoices: [eur(1, 0.8)] }]] as const) {
+  const dateCases: Array<[string, Parameters<typeof context>[0]]> = [['INVOICE_PAYMENT', { payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8 })] }], ['SALES_INVOICE', { invoices: [eur(1, 0.8)] }]]
+  for (const [type, lists] of dateCases) {
     const bad = await runXeroRateItem('R16', context(lists, { ims: { rows: LATER, posted: [postedRow(1, type, { wooReceipt: true, wooOrder: true, orderRate: '1.25', orderCreatedAt: 'not-a-date' })] } }).ctx)
     assert.deepEqual([bad.outcome, [...bad.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], type)
   }
