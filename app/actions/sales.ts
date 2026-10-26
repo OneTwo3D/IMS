@@ -1396,12 +1396,13 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   const manualPrefix = numbering.inv_prefix
   const orderNumber = getSalesOrderReference(so)
 
-  const orderDefaultTaxType = so.taxRateName
-    ? (await db.taxRate.findFirst({
+  const orderDefaultRate = so.taxRateName
+    ? await db.taxRate.findFirst({
         where: { name: so.taxRateName, active: true },
-        select: { accountingTaxType: true },
-      }))?.accountingTaxType ?? null
+        select: { id: true, accountingTaxType: true },
+      })
     : null
+  const orderDefaultTaxType = orderDefaultRate?.accountingTaxType ?? null
 
   const vatPct = Number(so.taxRatePercent ?? 0)
   const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
@@ -1456,6 +1457,8 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
         unitAmount: Number(l.unitPriceForeign),
         accountCode: settings.salesAccount,
         taxType,
+        // The rate this code was read from (never sent): the enqueue guard checks it is still that rate's code (lib/tax/retired-tax-code-guard.ts). Absent for a swapped reverse-charge code.
+        taxRateId: l.taxRateId && taxType === (l.taxRate?.accountingTaxType ?? undefined) ? l.taxRateId : undefined,
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
     }),
@@ -1463,9 +1466,11 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     shippingDescription: 'Shipping',
     shippingAccountCode: settings.shippingAccount || undefined,
     shippingTaxType: orderDefaultTaxType ?? undefined,
+    shippingTaxRateId: orderDefaultTaxType ? orderDefaultRate?.id : undefined,
     discountAmount: discountForeign > 0 ? discountForeign : undefined,
     discountAccountCode: settings.discountAccount || undefined,
     discountTaxType: orderDefaultTaxType ?? undefined,
+    discountTaxRateId: orderDefaultTaxType ? orderDefaultRate?.id : undefined,
     lineAmountsIncludeTax,
   }
 
@@ -2021,6 +2026,7 @@ async function queueRefundAccountingActions(input: {
         lines: {
           select: {
             id: true,
+            taxRateId: true,
             taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
           },
         },
@@ -2034,7 +2040,7 @@ async function queueRefundAccountingActions(input: {
   const cnTaxRate = orderForCN?.taxRateName
     ? await db.taxRate.findFirst({
         where: { name: orderForCN.taxRateName, active: true },
-        select: { accountingTaxType: true },
+        select: { id: true, accountingTaxType: true },
       })
     : null
   // The code each credit-note line carries, from the ONE definition the retry fence also reads
@@ -2111,6 +2117,15 @@ async function queueRefundAccountingActions(input: {
         // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
         // legacy rows with no snapshot (created before the column existed).
         taxType: creditNoteTaxTypeOf(line) ?? undefined,
+        // The rate this code can be traced to (never sent): the order line's own rate when the code is its code, else the order-default rate when it is that code's. Checked by the enqueue guard
+        // (lib/tax/retired-tax-code-guard.ts); absent for a swapped or snapshot-only code, which the guard refuses only if a re-key retired it.
+        taxRateId: ((): string | undefined => {
+          const code = creditNoteTaxTypeOf(line) ?? undefined
+          const own = orderForCN?.lines.find((ol) => ol.id === line.lineId)
+          if (code !== undefined && own?.taxRateId && own.taxRate?.accountingTaxType === code) return own.taxRateId
+          if (code !== undefined && cnTaxRate?.accountingTaxType === code) return cnTaxRate.id
+          return undefined
+        })(),
       })),
       // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
       // that had a gross amount — is now netted at source, so this correctly grosses every line up.

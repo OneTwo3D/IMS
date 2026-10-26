@@ -3131,6 +3131,7 @@ export async function createInvoice(
             product: { select: { sku: true } },
             taxRate: {
               select: {
+                id: true,
                 accountingTaxType: true,
                 reverseCharge: true,
                 name: true,
@@ -3191,10 +3192,11 @@ export async function createInvoice(
       getAccountingSettings(),
       db.purchaseOrder.findUnique({
         where: { id: poId },
-        select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
+        select: { supplier: { select: { name: true, taxRate: { select: { id: true, accountingTaxType: true } } } }, currency: true },
       }),
     ])
     const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
+    const fallbackTaxRateId = supplierData?.supplier?.taxRate?.id
     const invoiceCalculation = calculatePurchaseInvoice({
       lines: [
         ...productInputs.map((l): PurchaseInvoiceInputLine => ({
@@ -3218,6 +3220,7 @@ export async function createInvoice(
       poTaxRatePercent: po.taxRatePercent != null ? po.taxRatePercent.toString() : null,
       transitAccount: accountingSettings.transitAccount,
       fallbackTaxType,
+      fallbackTaxRateId,
       reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
       poLineById,
       costLineById,
@@ -3518,7 +3521,7 @@ export async function updateInvoice(
                 name: true,
                 email: true,
                 prepaid: true,
-                taxRate: { select: { accountingTaxType: true } },
+                taxRate: { select: { id: true, accountingTaxType: true } },
               },
             },
             lines: {
@@ -3530,6 +3533,7 @@ export async function updateInvoice(
                 product: { select: { sku: true } },
                 taxRate: {
                   select: {
+                    id: true,
                     accountingTaxType: true,
                     reverseCharge: true,
                     name: true,
@@ -3595,6 +3599,7 @@ export async function updateInvoice(
     const poLineById = new Map(invoice.po.lines.map((line) => [line.id, line]))
     const costLineById = new Map(invoice.po.freightCostLines.map((line) => [line.id, line]))
     const fallbackTaxType = invoice.po.supplier.taxRate?.accountingTaxType ?? undefined
+    const fallbackTaxRateId = invoice.po.supplier.taxRate?.id
     const accountingSettings = await getAccountingSettings()
     const invoiceInputLines: PurchaseInvoiceInputLine[] = []
     for (const existingLine of invoice.lines) {
@@ -3636,6 +3641,7 @@ export async function updateInvoice(
         poTaxRatePercent: invoice.po.taxRatePercent != null ? invoice.po.taxRatePercent.toString() : null,
         transitAccount: accountingSettings.transitAccount,
         fallbackTaxType,
+        fallbackTaxRateId,
         reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
         poLineById,
         costLineById,
@@ -4530,10 +4536,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         po: {
           select: {
             reference: true, type: true,
-            supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true, reverseCharge: true } } } },
+            supplier: { select: { name: true, taxRate: { select: { id: true, accountingTaxType: true, reverseCharge: true } } } },
             // Per-line tax rates drive the bill's per-line tax choice. A null line
             // rate means the line follows the order/supplier default rate.
-            lines: { select: { taxRate: { select: { accountingTaxType: true, reverseCharge: true } } } },
+            lines: { select: { taxRate: { select: { id: true, accountingTaxType: true, reverseCharge: true } } } },
           },
         },
       },
@@ -4567,7 +4573,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       : []
     const isReverseCharge = goodsLineRates.length > 0 && goodsLineRates.every((r) => !!r?.reverseCharge)
     // Base (non-RC) tax type: the line rate where overridden, else the supplier default.
-    const baseTaxType = (cn.po.lines.find((l) => l.taxRate)?.taxRate ?? supplierRate)?.accountingTaxType
+    const baseRate = cn.po.lines.find((l) => l.taxRate)?.taxRate ?? supplierRate
+    const baseTaxType = baseRate?.accountingTaxType
 
     // A reverse-charge goods PO carries no supplier VAT (taxForeign 0) but its bill
     // posts on the reverse-charge tax type, so the credit must reverse on that SAME
@@ -4687,6 +4694,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             amountForeign: Number(cn.amountForeign),
             transitAccount: settings.transitAccount,
             taxType: creditNoteTaxType,
+            // The rate that code was read from (the enqueue guard binds the code to it); none for a swapped / NONE type.
+            taxRateId: baseRate?.id && creditNoteTaxType === baseTaxType ? baseRate.id : undefined,
             // Reverse-charge credits carry a NET amount → post EXCLUSIVE so Xero
             // adds the notional VAT (mirroring the net/exclusive RC bill); all
             // others carry a GROSS amount → INCLUSIVE.

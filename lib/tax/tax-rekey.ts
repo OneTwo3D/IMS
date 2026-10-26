@@ -58,8 +58,10 @@
  *     own writing transaction, so the lock is held to commit; a refund share-locks the rate rows its tax identity is read from before reading them (lib/domain/sales/refund-service.ts), and the
  *     apply counts pending refund snapshots again after the deactivation and migrates them (same identity rules) or rolls back. Suppliers and mappings are re-pointed after it too.
  *   - ENQUEUE RACE: a producer reads the line's rate BEFORE it takes the enqueue lock, so it can build an old-code payload, pause while this apply commits (no queued row to see), then
- *     insert it. createAccountingSyncLogRow (the one insert of a sync row) therefore refuses, under the lock this apply holds, any payload carrying a code recorded here as retired (setting
- *     tax_rekey_retired_codes, written in the apply's transaction)  that no active rate carries, or that now means another rate (a swap) within the quarantine window after this commit: lib/tax/retired-tax-code-guard.ts. The producer's retry rebuilds from the re-pointed rows.
+ *     insert it. createAccountingSyncLogRow (the one insert of a sync row) therefore refuses, under the lock this apply holds, any payload with a code recorded here as retired (setting
+ *     tax_rekey_retired_codes, written in the apply's transaction) unless EVERY occurrence of that code names, beside it, a source rate that is active, not replaced and carries exactly that code; an
+ *     unbound occurrence is refused too. NO TIME WINDOW: elapsed time is no evidence (a producer can pause for hours), and in a code swap the retired code is carried by another active rate, so only
+ *     the source can tell the two apart. Every producer binds its codes (the census in tests/tax/retired-tax-code-guard.test.ts lists them). lib/tax/retired-tax-code-guard.ts. The producer's retry rebuilds from the re-pointed rows.
  *   - QUEUED payloads (an accounting sync row PENDING / PROCESSING / FAILED - a FAILED row keeps blocking until it is retried or cancelled - or an accounting event PENDING / FAILED,
  *     whose lines carry the old code) are snapshots IMS does not rewrite. They BLOCK the apply (QUEUED_PAYLOADS) with no override: let them post, or cancel them, first.
  */
@@ -588,7 +590,7 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     const retired: RetiredCodes = { ...existing }
     const at = new Date().toISOString()
     for (const c of result.created) retired[c.fromCode] = { rateId: c.oldId, newCode: c.toCode, at }
-    // A code that is both retired (from one rate) and a target (of another: the swap) STAYS in the set: it changed meaning, and the guard quarantines it for REKEY_QUARANTINE_MS.
+    // A code that is both retired (from one rate) and a target (of another: the swap) STAYS in the set: it changed meaning, and the guard admits it only for occurrences bound to a rate that carries it now.
     const value = JSON.stringify(retired)
     await tx.setting.upsert({ where: { key: RETIRED_CODES_SETTING }, create: { key: RETIRED_CODES_SETTING, value }, update: { value } })
     await tx.activityLog.create({

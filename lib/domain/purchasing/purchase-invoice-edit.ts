@@ -36,7 +36,7 @@ export type PurchaseInvoicePoLine = {
    */
   qtyReturned?: unknown
   product: { sku: string }
-  taxRate?: { accountingTaxType: string | null; reverseCharge?: boolean } | null
+  taxRate?: { id?: string; accountingTaxType: string | null; reverseCharge?: boolean } | null
 }
 
 export type PurchaseInvoiceCostLine = {
@@ -79,6 +79,8 @@ export type PurchaseInvoiceAccountingLine = {
   unitAmount: number
   accountCode: string
   taxType?: string
+  /** The rate `taxType` was read from; never sent (the enqueue guard binds the code to it, lib/tax/retired-tax-code-guard.ts). */
+  taxRateId?: string
 }
 
 export type PurchaseInvoiceCalculation = {
@@ -157,6 +159,8 @@ export function calculatePurchaseInvoice(params: {
   poTaxRatePercent?: number | string | null
   transitAccount: string
   fallbackTaxType?: string
+  /** The rate `fallbackTaxType` was read from (the supplier's default), bound beside the code for the enqueue guard (lib/tax/retired-tax-code-guard.ts). */
+  fallbackTaxRateId?: string
   /**
    * Accounting tax type to use when a line's resolved TaxRate has
    * reverseCharge=true. Falls back to the line's normal taxType (or
@@ -215,6 +219,8 @@ export function calculatePurchaseInvoice(params: {
         unitAmount: rounded4(line.unitCostForeign),
         accountCode: params.transitAccount,
         taxType: productTaxType,
+        // The rate that code was read from (never sent): the line's own rate, else the supplier's default; absent for a swapped reverse-charge code.
+        taxRateId: poLine.taxRate?.accountingTaxType != null && productTaxType === poLine.taxRate.accountingTaxType ? poLine.taxRate.id : (poLine.taxRate?.accountingTaxType == null && productTaxType === params.fallbackTaxType ? params.fallbackTaxRateId : undefined),
       })
       continue
     }
@@ -248,6 +254,7 @@ export function calculatePurchaseInvoice(params: {
       unitAmount: totalForeign,
       accountCode: params.transitAccount,
       taxType: costLine.vatable ? params.fallbackTaxType : undefined,
+      taxRateId: costLine.vatable ? params.fallbackTaxRateId : undefined,
     })
   }
 

@@ -117,3 +117,21 @@ export async function shareLockOrderTaxRates(tx: unknown, orderId: string): Prom
     ORDER BY id
     FOR SHARE`)
 }
+
+export type CurrentTaxRate = { id: string; accountingTaxType: string | null; reverseCharge: boolean }
+
+/**
+ * The rate each id stands for NOW: a row a re-key replaced is followed to its replacement (lenient: an operator-deactivated rate stands as it is), and the CURRENT code and reverse-charge
+ * flag are read from the resulting row. A producer that builds a tax code from this, rather than from a resolution it made earlier, takes the code from the rate row the line is
+ * (or will be) persisted with, and can bind the code to that row's id for the enqueue guard (lib/tax/retired-tax-code-guard.ts). Ids the table does not know are absent.
+ */
+export async function currentTaxRates(client: unknown, ids: readonly (string | null | undefined)[]): Promise<Map<string, CurrentTaxRate>> {
+  const resolved = await resolveWritableTaxRateIds(client, ids, { lenient: true })
+  const targets = [...new Set(resolved.values())]
+  const out = new Map<string, CurrentTaxRate>()
+  if (targets.length === 0) return out
+  const rows = await (client as { taxRate: { findMany(args: { where: { id: { in: string[] } }; select: { id: true; accountingTaxType: true; reverseCharge: true } }): Promise<CurrentTaxRate[]> } }).taxRate.findMany({ where: { id: { in: targets } }, select: { id: true, accountingTaxType: true, reverseCharge: true } })
+  const byId = new Map(rows.map((r) => [r.id, r] as const))
+  for (const [asked, target] of resolved) { const row = byId.get(target); if (row) out.set(asked, row) }
+  return out
+}

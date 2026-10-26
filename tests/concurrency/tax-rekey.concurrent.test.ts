@@ -512,11 +512,14 @@ test('THE ENQUEUE GUARD: after a re-key, a payload built from the old code is re
   const done = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
   assert.equal(done.wrote, true)
   const before = await db.accountingSyncLog.count({ where: { referenceId: w.soDraftCy.id } })
-  await assert.rejects(insert(db, { lines: [{ taxType: code('OLD1') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.codes.join() === code('OLD1'))
-  await assert.rejects(insert(db, { lines: [], shippingTaxType: code('OLD1') }), RetiredTaxCodeInPayloadError, 'in any tax-code field')
+  // BE VAT's old code OLD1 was retired. A payload that read it from the OLD row (bound to it) is refused, in any tax-code field, whenever it is enqueued.
+  await assert.rejects(insert(db, { lines: [{ taxType: code('OLD1'), taxRateId: w.ids.be }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.codes.join() === code('OLD1') && e.reason === 'retired_tax_code')
+  await assert.rejects(insert(db, { lines: [], shippingTaxType: code('OLD1'), shippingTaxRateId: w.ids.be }), RetiredTaxCodeInPayloadError, 'in any tax-code field')
+  // A retired code with NO binding is refused as unbound.
+  await assert.rejects(insert(db, { lines: [{ taxType: code('OLD1') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code_unbound')
   assert.equal(await db.accountingSyncLog.count({ where: { referenceId: w.soDraftCy.id } }), before, 'nothing was queued')
   const inbox = await db.accountingPostingRefusal.findFirst({ where: { type: 'SALES_INVOICE', referenceId: w.soDraftCy.id } })
-  assert.equal(inbox?.reason, 'retired_tax_code', 'the refusal is in the posting-refusal inbox with a named reason')
+  assert.ok(['retired_tax_code', 'retired_tax_code_unbound'].includes(inbox?.reason ?? ''), 'the refusal is in the posting-refusal inbox with a named reason')
   // Normal enqueues are unaffected: the live code, a built-in, a code no rate carries, and a payload with no tax code at all.
   for (const payload of [{ lines: [{ taxType: code('C') }] }, { lines: [{ taxType: 'OUTPUT2' }] }, { lines: [{ taxType: code('NOSUCHRATE') }] }, { lines: [] }]) {
     const ok = await insert(db, payload)
@@ -524,17 +527,19 @@ test('THE ENQUEUE GUARD: after a re-key, a payload built from the old code is re
     created.logs.push(ok.row!.id)
   }
 
-  // (1b) THE SWAP: GR VAT's old code A is retired while BE VAT's new row carries it. A GR payload built before the apply (code A) and enqueued after must NOT pass as "an active rate carries A".
-  await assert.rejects(insert(db, { lines: [{ taxType: code('A') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code_in_quarantine', 'swap, inside the quarantine window')
-  assert.equal((await db.accountingPostingRefusal.findFirst({ where: { type: 'SALES_INVOICE', referenceId: w.soDraftCy.id } }))?.reason, 'retired_tax_code_in_quarantine')
-  // After the window the code is accepted: a payload carrying A was built from current rows (BE VAT). The window is aged by rewriting the recorded commit time.
-  const setting = await db.setting.findUniqueOrThrow({ where: { key: 'tax_rekey_retired_codes' } })
-  const aged = Object.fromEntries(Object.entries(JSON.parse(setting.value) as Record<string, { at: string }>).map(([k, v]) => [k, { ...v, at: new Date(Date.now() - 20 * 60_000).toISOString() }]))
-  await db.setting.update({ where: { key: 'tax_rekey_retired_codes' }, data: { value: JSON.stringify(aged) } })
-  const late = await insert(db, { lines: [{ taxType: code('A') }] })
-  assert.ok(late.row, 'after the window')
-  created.logs.push(late.row!.id)
-  await assert.rejects(insert(db, { lines: [{ taxType: code('OLD1') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code', 'no active carrier: refused whatever the age')
+  // (1b) THE SWAP and CODEX'S SCENARIO: GR VAT's old code A is retired while BE VAT's NEW row carries it. A GR payload that read A from the OLD GR row, enqueued at ANY later time (no clock is consulted),
+  // is refused; a payload built from the NEW BE row (bound to it) is admitted whenever it is enqueued; an unbound A is refused.
+  const newBeRow = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}BE VAT`, active: true, NOT: { id: w.ids.be } } })).id
+  await db.setting.update({ where: { key: 'tax_rekey_retired_codes' }, data: { value: JSON.stringify(Object.fromEntries(Object.entries(JSON.parse((await db.setting.findUniqueOrThrow({ where: { key: 'tax_rekey_retired_codes' } })).value) as Record<string, { at: string }>).map(([k, v]) => [k, { ...v, at: new Date(Date.now() - 3 * 24 * 3_600_000).toISOString() }]))) } })
+  await assert.rejects(insert(db, { lines: [{ taxType: code('A'), taxRateId: w.ids.gr }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code', 'stale read of the old GR row, enqueued days later')
+  assert.equal((await db.accountingPostingRefusal.findFirst({ where: { type: 'SALES_INVOICE', referenceId: w.soDraftCy.id } }))?.reason, 'retired_tax_code')
+  await assert.rejects(insert(db, { lines: [{ taxType: code('A') }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code_unbound')
+  await assert.rejects(insert(db, { lines: [{ taxType: code('A'), taxRateId: newBeRow }, { taxType: code('A'), taxRateId: w.ids.gr }] }), RetiredTaxCodeInPayloadError, 'ONE stale line among valid ones refuses the payload')
+  await assert.rejects(insert(db, { lines: [{ taxType: code('A'), taxRateId: newBeRow }], discountTaxType: code('A') }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code_unbound', 'every occurrence needs its own binding')
+  const fresh = await insert(db, { lines: [{ taxType: code('A'), taxRateId: newBeRow }], shippingTaxType: code('A'), shippingTaxRateId: newBeRow })
+  assert.ok(fresh.row, 'a payload built from the new row is admitted, however long after the apply')
+  created.logs.push(fresh.row!.id)
+  await assert.rejects(insert(db, { lines: [{ taxType: code('A'), taxRateId: w.ids.cy }] }), RetiredTaxCodeInPayloadError, 'bound to a rate that does not carry the code')
 
   // (2) the interleaving: a producer INSERTS first (the code is not retired yet) and holds the lock to its commit; the apply started meanwhile must wait for it and then see the queued row.
   const w2 = await seedWorld(d)
@@ -627,6 +632,10 @@ test('WRITERS AFTER THE APPLY: a supplied id of a retired rate resolves to its r
   created.digests.push(preview.digest)
   assert.equal((await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })).wrote, true)
   const newGr = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}GR VAT`, active: true } })).id
+  // The WooCommerce import builds its payload codes from the rate rows its lines are persisted with, read NOW (currentTaxRates): the retired GR row's id yields the live row and its live code.
+  const { currentTaxRates } = await import('../../lib/tax/writable-tax-rate.ts')
+  const nowRates = await currentTaxRates(db, [w.ids.gr, w.ids.cy, null])
+  assert.deepEqual([nowRates.get(w.ids.gr)?.id, nowRates.get(w.ids.gr)?.accountingTaxType, nowRates.get(w.ids.cy)?.accountingTaxType], [newGr, code('D'), code('C')], 'a retired id reads as its replacement and the LIVE code')
 
   // A form opened before the apply submits the old id: a NEW order and a NEW purchase order created in a transaction end up on the replacement.
   const so = await db.$transaction(async (tx) => {
@@ -774,7 +783,7 @@ test('AN EDITOR changing a rate concurrently with the apply: the apply refuses o
   const newBe = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}BE VAT`, active: true, NOT: { id: w.ids.be } } })).id
   await db.taxRate.update({ where: { id: w.ids.be }, data: { active: true } })
   await assert.rejects(
-    createAccountingSyncLogRow(db as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: w.soDraftCy.id, payload: { lines: [{ taxType: code('OLD1') }] } as never }),
+    createAccountingSyncLogRow(db as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: w.soDraftCy.id, payload: { lines: [{ taxType: code('OLD1'), taxRateId: w.ids.be }] } as never }),
     (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code',
     'the reactivated retired row does not make its old code legitimate',
   )

@@ -42,7 +42,7 @@ test('CENSUS: every path that can activate a rate or change its code refuses a r
   assert.equal((demo.match(/replaced_by_id is null/g) ?? []).length, 2, 'the demo provisioning remaps skip replaced rows')
   assert.match(readFileSync('scripts/copy-tax-rates.ts', 'utf8'), /where tax_rates\.replaced_by_id is null/, 'the copy script never overwrites a replaced row')
   assert.match(readFileSync('lib/tax/writable-tax-rate.ts', 'utf8'), /r\.active && r\.replacedById === null/, 'writers never use a replaced row as it stands, active or not')
-  assert.match(readFileSync('lib/tax/retired-tax-code-guard.ts', 'utf8'), /r\.id !== entry\.rateId/, 'the enqueue guard never counts the retired row as a carrier')
+  assert.match(readFileSync('lib/tax/retired-tax-code-guard.ts', 'utf8'), /row\.active && row\.replacedById === null && row\.accountingTaxType === o\.code/, 'the enqueue guard admits a retired code only for a bound rate that is active, not replaced and carries it')
   // Nothing else in app/ or lib/ writes active=true on a tax rate: the only writer of that flag is the editor (the import only ever deactivates).
   const importer = readFileSync('lib/tax/purchase-tax-import.ts', 'utf8')
   assert.equal(/taxRate\.update(?:Many)?\([^)]*active: true/.test(importer), false)

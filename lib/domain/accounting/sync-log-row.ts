@@ -2,7 +2,7 @@ import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
-import { RETIRED_TAX_CODE_QUARANTINE_REASON, RETIRED_TAX_CODE_REASON, RetiredTaxCodeInPayloadError, retiredTaxCodesInPayload } from '@/lib/tax/retired-tax-code-guard'
+import { RETIRED_TAX_CODE_REASON, RetiredTaxCodeInPayloadError, retiredTaxCodesInPayload } from '@/lib/tax/retired-tax-code-guard'
 import { HELD_SHADOW_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { xeroProducerSeamVerdict, type XeroSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { attachShadowSyncLog, recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
@@ -134,7 +134,7 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
   const retiredFindings = await retiredTaxCodesInPayload(client, { type: String(data.type), payload: data.payload })
   if (retiredFindings.length > 0) {
     const retiredCodes = retiredFindings.map((f) => f.code)
-    const retiredReason = retiredFindings.some((f) => f.reason === RETIRED_TAX_CODE_REASON) ? RETIRED_TAX_CODE_REASON : RETIRED_TAX_CODE_QUARANTINE_REASON
+    const retiredReason = retiredFindings.some((f) => f.reason === RETIRED_TAX_CODE_REASON) ? RETIRED_TAX_CODE_REASON : retiredFindings[0]!.reason
     try {
       const [{ db }, { recordAccountingPostingRefusal }, { defaultPostingRefusalKind }] = await Promise.all([
         import('@/lib/db'), import('@/lib/domain/accounting/posting-refusal-inbox'), import('@/lib/domain/accounting/posting-refusal-kinds'),

@@ -27,3 +27,34 @@ export function taxCodesInPayload(payload: unknown): string[] {
   walk(payload, 0)
   return [...found].sort()
 }
+
+/**
+ * The binding of a tax-code field to the tax RATE the producer read the code from, carried as a sibling key in the same object (never read by a sender): `taxType` -> `taxRateId`,
+ * `shippingTaxType` -> `shippingTaxRateId`, `discountTaxType` -> `discountTaxRateId`. The enqueue guard (lib/tax/retired-tax-code-guard.ts) uses it to check, under the lock, that the code
+ * still IS that rate's code.
+ */
+export function bindingKeyFor(codeKey: string): string {
+  return codeKey === 'taxType' ? 'taxRateId' : codeKey.replace(/TaxType$/, 'TaxRateId')
+}
+
+export type TaxCodeOccurrence = { code: string; taxRateId: string | null }
+
+/** Every tax-code field of `payload` (one entry per occurrence, not per distinct code) with the rate id bound beside it, or null. */
+export function taxCodeOccurrences(payload: unknown): TaxCodeOccurrence[] {
+  const out: TaxCodeOccurrence[] = []
+  const walk = (value: unknown, depth: number): void => {
+    if (depth > MAX_DEPTH || value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) { for (const item of value) walk(item, depth + 1); return }
+    const record = value as Record<string, unknown>
+    for (const [key, child] of Object.entries(record)) {
+      if (typeof child === 'string') {
+        if (isTaxCodeKey(key) && child.trim() !== '') {
+          const bound = record[bindingKeyFor(key)]
+          out.push({ code: child.trim(), taxRateId: typeof bound === 'string' && bound !== '' ? bound : null })
+        }
+      } else walk(child, depth + 1)
+    }
+  }
+  walk(payload, 0)
+  return out
+}

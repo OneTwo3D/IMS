@@ -2,7 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
-import { resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
+import { currentTaxRates, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
@@ -382,6 +382,8 @@ export function resolveWcAccountingAmountConvention(input: {
 
 /** A tax rate as `resolveWcTaxRateById` reports it, reduced to what these decisions depend on. */
 export type WcResolvedRateForDocument = {
+  /** The IMS rate this resolution is, so the document's tax code can be taken from that rate's CURRENT row (and bound to it for the enqueue guard). */
+  taxRateId?: string | null
   accountingTaxType: string | null
   taxRateValue: number
   source?: 'mapped' | 'default'
@@ -390,6 +392,8 @@ export type WcResolvedRateForDocument = {
 export type WcShippingTaxResolution = {
   /** The accounting tax type to send on the shipping line. */
   taxType: string | null
+  /** The IMS rate that tax type was taken from (null when none is known). */
+  taxRateId?: string | null
   /** The rate that tax type will apply, as a fraction. */
   rateValue: number
   /** False when no rate we hold reproduces the tax Woo actually charged on shipping. */
@@ -486,7 +490,7 @@ export function resolveWcShippingTaxRate(input: {
   // No shipping line is put on the document at all below zero, so no tax type is used and there is
   // nothing here that can be wrong.
   if (!net.gt(0)) {
-    return { taxType: input.orderDefault.accountingTaxType, rateValue: 0, resolved: true, contributingRateCount: 0 }
+    return { taxType: input.orderDefault.accountingTaxType, taxRateId: input.orderDefault.taxRateId ?? null, rateValue: 0, resolved: true, contributingRateCount: 0 }
   }
 
   const reportedTax = input.shippingLines.reduce<Decimal>(
@@ -514,6 +518,7 @@ export function resolveWcShippingTaxRate(input: {
     const chosen = matching[0]
     return {
       taxType: chosen.accountingTaxType,
+      taxRateId: chosen.taxRateId ?? null,
       rateValue: chosen.taxRateValue,
       resolved: true,
       contributingRateCount: contributing.size,
@@ -522,6 +527,7 @@ export function resolveWcShippingTaxRate(input: {
   if (distinctTypes.size > 1) {
     return {
       taxType: input.orderDefault.accountingTaxType,
+      taxRateId: input.orderDefault.taxRateId ?? null,
       rateValue: input.orderDefault.taxRateValue,
       resolved: false,
       contributingRateCount: contributing.size,
@@ -534,6 +540,7 @@ export function resolveWcShippingTaxRate(input: {
   if (reproducesTax(net, input.orderDefault.taxRateValue, reportedTax, input.currency)) {
     return {
       taxType: input.orderDefault.accountingTaxType,
+      taxRateId: input.orderDefault.taxRateId ?? null,
       rateValue: input.orderDefault.taxRateValue,
       resolved: true,
       contributingRateCount: contributing.size,
@@ -541,6 +548,7 @@ export function resolveWcShippingTaxRate(input: {
   }
   return {
     taxType: input.orderDefault.accountingTaxType,
+    taxRateId: input.orderDefault.taxRateId ?? null,
     rateValue: input.orderDefault.taxRateValue,
     resolved: false,
     contributingRateCount: contributing.size,
@@ -2244,7 +2252,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       shippingLines: wcOrder.shipping_lines,
       shippingNetForeign: shippingForeign,
       rateById: wcResolvedById,
-      orderDefault: { accountingTaxType, taxRateValue },
+      orderDefault: { accountingTaxType, taxRateValue, taxRateId: orderDefaultTaxRateId },
       currency,
     })
     const documentTaxReconciliation = reconcileWcDocumentTax([
@@ -2673,6 +2681,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // order-level leg carries only what Woo left unallocated — see o3d-y14.
       // Built ONCE, with no invoice number in it, so the held path and the posting path can never
       // differ in anything but the number (o3d-k26m.6).
+      // THE TAX CODES COME FROM THE ROWS THE LINES ARE PERSISTED WITH (lineData[].taxRateId, redirected above to a re-keyed replacement), read now - not from the resolution made before the write -
+      // and each is bound to its rate for the enqueue guard (lib/tax/retired-tax-code-guard.ts).
+      const ratesNow = await currentTaxRates(db, [...lineData.map((l) => l.taxRateId), shippingTax.taxRateId, orderDefaultTaxRateId])
+      const lineRateNow = (idx: number) => (lineData[idx]?.taxRateId ? ratesNow.get(lineData[idx]!.taxRateId!) : undefined)
+      const shippingRateNow = shippingTax.taxRateId ? ratesNow.get(shippingTax.taxRateId) : undefined
+      const defaultRateNow = orderDefaultTaxRateId ? ratesNow.get(orderDefaultTaxRateId) : undefined
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
@@ -2682,7 +2696,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
           currencyRateToBase: usableStoredFxRate(fxRate)?.toNumber(),
           reference: orderNumber,
-          lines: lineData.map((l, idx) => ({
+          lines: lineData.map((l, idx) => {
+            const rateNow = lineRateNow(idx)
+            const lineTaxType = resolveSalesLineTaxType({
+              baseTaxType: rateNow?.accountingTaxType ?? lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
+              reverseCharge: rateNow?.reverseCharge ?? lineTaxResolved[idx]?.reverseCharge,
+              reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
+            })
+            return {
             itemCode: l.productId ? (l.sku || undefined) : undefined,
             description: l.description ?? l.sku ?? 'Item',
             quantity: l.qty,
@@ -2693,13 +2714,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             // reverse-charge order's goods lines post on the RC VAT boxes — not
             // the standard code. Every resolution path (resolver-derived, mapped
             // WC rate, forceNoTax) now carries a real reverseCharge flag.
-            taxType: resolveSalesLineTaxType({
-              baseTaxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
-              reverseCharge: lineTaxResolved[idx]?.reverseCharge,
-              reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-            }),
+            taxType: lineTaxType,
+            // The rate that code was read from (never sent): the guard checks it is still that rate's code. Absent for a swapped reverse-charge code.
+            taxRateId: rateNow && lineTaxType === rateNow.accountingTaxType ? rateNow.id : undefined,
             discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
-          })),
+            }
+          }),
           shippingAmount,
           shippingDescription: 'Shipping',
           shippingAccountCode: settings.shippingAccount || undefined,
@@ -2711,13 +2731,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // picks the tax type that reproduces the tax Woo actually charged on shipping, falling back
           // to the order default when that is the one that does — so a single-rate order is unchanged
           // and a zero-rated-postage order stops being taxed at the goods' rate.
-          shippingTaxType: shippingTax.taxType ?? accountingTaxType ?? undefined,
+          shippingTaxType: shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined),
+          shippingTaxRateId: shippingRateNow?.accountingTaxType ? shippingRateNow.id : undefined,
           // Only the residual — the coupon itself is already on the lines above as a per-line
           // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
           // discount line. Sending both deducted it twice (o3d-y14).
           discountAmount: orderLevelDiscountAmount,
           discountAccountCode: settings.discountAccount || undefined,
-          discountTaxType: accountingTaxType ?? undefined,
+          discountTaxType: defaultRateNow ? (defaultRateNow.accountingTaxType ?? undefined) : (accountingTaxType ?? undefined),
+          discountTaxRateId: defaultRateNow?.accountingTaxType ? defaultRateNow.id : undefined,
           lineAmountsIncludeTax,
           _postingMode: 'submitted',
           _paymentMethod: wcOrder.payment_method || undefined,
