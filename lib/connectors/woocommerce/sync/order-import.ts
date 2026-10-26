@@ -687,7 +687,8 @@ async function recordPendingFxOrder(
     externalId: String(wcOrder.id),
     payload: jsonPayload,
     errorMessage: error.message,
-    syncedAt: null,
+    // for a PENDING row, syncedAt is its LAST ATTEMPT (rotation order in retryPendingWcOrdersWaitingForFx)
+    syncedAt: new Date(),
   }
 
   if (retryLogId) {
@@ -3199,23 +3200,16 @@ export async function retryPendingWcOrdersWaitingForFx(
    */
   options: { receiptsOnly?: boolean } = {},
 ): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
-  // ROTATION: the batch is the rows attempted LEAST RECENTLY (payload.lastAttemptAt, never-attempted first, then oldest), and every attempt stamps the row afterwards, so a row that keeps
-  // failing moves to the back and cannot starve the ones behind it. The bound is unchanged.
-  const take = Math.min(Math.max(limit, 1), 250)
-  const ordered = options.receiptsOnly
-    ? await db.$queryRaw<Array<{ id: string }>>`
-        SELECT id FROM "shopping_sync_logs"
-        WHERE connector = 'woocommerce' AND direction = 'FROM_CONNECTOR' AND status = 'PENDING' AND "entityType" = 'SalesOrder' AND "entityId" IS NULL
-          AND payload->>'reason' = ${MISSING_FX_RATE_QUEUE_REASON} AND payload->>'receiptPaymentId' IS NOT NULL
-        ORDER BY coalesce(payload->>'lastAttemptAt', '') ASC, "createdAt" ASC LIMIT ${take}`
-    : await db.$queryRaw<Array<{ id: string }>>`
-        SELECT id FROM "shopping_sync_logs"
-        WHERE connector = 'woocommerce' AND direction = 'FROM_CONNECTOR' AND status = 'PENDING' AND "entityType" = 'SalesOrder' AND "entityId" IS NULL
-          AND payload->>'reason' = ${MISSING_FX_RATE_QUEUE_REASON}
-        ORDER BY coalesce(payload->>'lastAttemptAt', '') ASC, "createdAt" ASC LIMIT ${take}`
-  const found = await db.shoppingSyncLog.findMany({ where: { AND: [pendingFxQueueWhere(), { id: { in: ordered.map((r) => r.id) } }] }, select: { id: true, payload: true } })
-  const byId = new Map(found.map((r) => [r.id, r]))
-  const rows = ordered.map((r) => byId.get(r.id)).filter((r): r is NonNullable<typeof r> => r !== undefined)
+  // ROTATION: the batch is the rows attempted LEAST RECENTLY. For a PENDING row `syncedAt` is its last-attempt time (null = never attempted, first): a row that keeps failing is stamped
+  // after every attempt (recordPendingFxOrder, and the stamp below) and moves behind the others, so it cannot starve the ones behind it. The bound is unchanged.
+  const rows = await db.shoppingSyncLog.findMany({
+    where: options.receiptsOnly
+      ? { AND: [pendingFxQueueWhere(), { payload: { path: ['receiptPaymentId'], string_starts_with: '' } }] }
+      : pendingFxQueueWhere(),
+    orderBy: [{ syncedAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
+    take: Math.min(Math.max(limit, 1), 250),
+    select: { id: true, payload: true },
+  })
 
   const result = { attempted: rows.length, imported: 0, stillPending: 0, failed: 0 }
   for (const row of rows) {
@@ -3282,7 +3276,7 @@ export async function retryPendingWcOrdersWaitingForFx(
   
     } finally {
       // stamp the attempt on a row that is still PENDING (a row that was retired or failed is not rotated)
-      await db.$executeRaw`UPDATE "shopping_sync_logs" SET payload = jsonb_set(payload::jsonb, '{lastAttemptAt}', to_jsonb(${new Date().toISOString()}::text)) WHERE id = ${row.id} AND status = 'PENDING'`.catch(() => undefined)
+      try { await db.shoppingSyncLog.updateMany({ where: { id: row.id, status: 'PENDING' }, data: { syncedAt: new Date() } }) } catch { /* a missed stamp only delays the rotation */ }
     }
   }
   if (result.attempted > 0) {
