@@ -178,3 +178,48 @@ test('the rate checked is the rate written: a table rate that moved after the ch
   const ok = await createSalesOrder({ ...soInput('EUR'), expectedFxRate: 1.3 } as never)
   assert.equal(ok.success, true, ok.error)
 })
+
+// A clone is a NEW document: the table rate now, bases recomputed from the foreign amounts, nothing copied from the source's rate or base fields. Credit notes, refunds, bills and requotes
+// stay on their original document's rate (correct, unchanged). [mutation: copy so.fxRateToBase / the source's base amounts again]
+test('cloneSalesOrder: a legacy order at rate 1 or a typed rate is cloned at the table rate with recomputed bases; a missing rate refuses; the base currency stays 1', async () => {
+  const { cloneSalesOrder } = await import('@/app/actions/sales')
+  const legacy = async (currency: string, rate: number) => s.db.salesOrder.create({
+    data: {
+      currency, fxRateToBase: rate, orderNumber: `LEG-${++seq}`, customerName: 'Legacy', status: 'DRAFT',
+      subtotalForeign: '100', shippingForeign: '13', taxForeign: '22.6', totalForeign: '135.6',
+      subtotalBase: '100', shippingBase: '13', taxBase: '22.6', totalBase: '135.6',
+      lines: { create: [{ productId, sku: 'ORD-1', description: 'x', qty: 1, unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '22.6', taxBase: '22.6', totalForeign: '100', totalBase: '100' }] },
+    } as never,
+    select: { id: true },
+  })
+  const cases: Array<[string, number]> = [['rate one (1:1 legacy)', 1], ['typed rate', 1.9]]
+  for (const [label, rate] of cases) {
+    const src = await legacy('EUR', rate)
+    const r = await cloneSalesOrder(src.id)
+    assert.equal(r.success, true, `${label}: ${r.error}`)
+    const clone = await s.db.salesOrder.findUniqueOrThrow({ where: { id: r.newId! }, include: { lines: true } })
+    assert.equal(Number(clone.fxRateToBase), 1.3, label)
+    assert.equal(Number(clone.subtotalBase), 76.9231, `${label}: 100 / 1.3`)
+    assert.equal(Number(clone.shippingBase), 10, `${label}: 13 / 1.3`)
+    assert.equal(Number(clone.taxBase), 17.3846, `${label}: 22.6 / 1.3`)
+    assert.equal(Number(clone.totalBase), 104.3077, `${label}: 135.6 / 1.3`)
+    assert.equal(Number(clone.lines[0]!.unitPriceBase), 76.923077, `${label}: line unit price`)
+    assert.equal(Number(clone.lines[0]!.totalBase), 76.9231)
+    const source = await s.db.salesOrder.findUniqueOrThrow({ where: { id: src.id } })
+    assert.equal(Number(source.fxRateToBase), rate, 'the source order is untouched')
+  }
+  const before = await s.db.salesOrder.count()
+  const missing = await legacy('USD', 1)
+  const countAfterLegacy = await s.db.salesOrder.count()
+  const refused = await cloneSalesOrder(missing.id)
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /Missing GBP FX rate for USD/)
+  assert.equal(await s.db.salesOrder.count(), countAfterLegacy, 'no clone was written')
+  assert.ok(countAfterLegacy > before)
+  const base = await legacy('GBP', 3)
+  const cloned = await cloneSalesOrder(base.id)
+  assert.equal(cloned.success, true, cloned.error)
+  const baseClone = await s.db.salesOrder.findUniqueOrThrow({ where: { id: cloned.newId! } })
+  assert.equal(Number(baseClone.fxRateToBase), 1)
+  assert.equal(Number(baseClone.totalBase), 135.6)
+})

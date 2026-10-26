@@ -1,5 +1,6 @@
 'use server'
 
+import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -261,7 +262,7 @@ async function clearFullScope() {
 
   // Core company configuration / reference data
   await db.purchaseUnit.deleteMany({})
-  await db.fxRate.deleteMany({})
+  await withFxTableWriteLock((tx) => tx.fxRate.deleteMany({}))
   await db.currency.deleteMany({})
   await db.taxRate.deleteMany({})
   await db.adjustmentReason.deleteMany({})

@@ -28,6 +28,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { endOfBusinessDateUtc } from '@/lib/currencies/fx-select'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { FxTableBusyError, withFxTableHeldStill } from '@/lib/currencies/fx-table-lock'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
@@ -1637,6 +1638,22 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
 // ---------------------------------------------------------------------------
 
 export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImportActionResult> {
+  // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
+  // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
+  try {
+    return await withFxTableHeldStill(() => importSalesOrdersCsvLocked(formData))
+  } catch (error) {
+    if (error instanceof FxTableBusyError) {
+      const result = { created: 0, updated: 0, skipped: 0, errors: [error.message] }
+      return isCsvImportDryRunMode(getCsvImportMode(formData))
+        ? buildImportPreviewResult(0, result, 0, error.message)
+        : createCsvImportExecutionResult({ ...result, error: error.message, success: false })
+    }
+    throw error
+  }
+}
+
+async function importSalesOrdersCsvLocked(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'sales.create')
@@ -1891,6 +1908,22 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
 // ---------------------------------------------------------------------------
 
 export async function importPurchaseOrdersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
+  // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
+  try {
+    return await withFxTableHeldStill(() => importPurchaseOrdersCsvLocked(formData, system))
+  } catch (error) {
+    if (error instanceof FxTableBusyError) {
+      const result = { created: 0, updated: 0, skipped: 0, errors: [error.message] }
+      return isCsvImportDryRunMode(getCsvImportMode(formData))
+        ? buildImportPreviewResult(0, result, 0, error.message)
+        : createCsvImportExecutionResult({ ...result, error: error.message, success: false })
+    }
+    throw error
+  }
+}
+
+async function importPurchaseOrdersCsvLocked(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'purchasing.create', system)

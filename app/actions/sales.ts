@@ -3248,12 +3248,16 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     if (!so) return { success: false, error: 'Order not found' }
 
     const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+    // A CLONE IS A NEW DOCUMENT: its rate is the table rate NOW (as createSalesOrder), never the source order's (which may be a legacy typed or 1:1 rate), and every base amount is
+    // recomputed from the foreign amounts at that rate with the same rounding the draft re-pricing uses (nothing is copied from the source's base fields). A currency with no rate
+    // refuses (the central lookup's "Missing <base> FX rate ..."); the base currency is 1.
+    const fxRate = await resolveFxRateToBase(db, so.currency, await getBaseCurrencyCode(), new Date())
     const clone = await db.salesOrder.create({
       data: {
         orderNumber: ref,
         status: 'DRAFT',
         currency: so.currency,
-        fxRateToBase: so.fxRateToBase,
+        fxRateToBase: fxRate,
         customerId: so.customerId,
         customerName: so.customerName,
         customerEmail: so.customerEmail,
@@ -3264,10 +3268,10 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         shippingForeign: so.shippingForeign,
         taxForeign: so.taxForeign,
         totalForeign: so.totalForeign,
-        subtotalBase: so.subtotalBase,
-        shippingBase: so.shippingBase,
-        taxBase: so.taxBase,
-        totalBase: so.totalBase,
+        subtotalBase: divideRoundedNumber(so.subtotalForeign, fxRate, 4),
+        shippingBase: divideRoundedNumber(so.shippingForeign, fxRate, 4),
+        taxBase: divideRoundedNumber(so.taxForeign, fxRate, 4),
+        totalBase: divideRoundedNumber(so.totalForeign, fxRate, 4),
         shipFromWarehouseId: so.shipFromWarehouseId,
         salesRep: so.salesRep,
         discountStr: so.discountStr,
@@ -3283,14 +3287,14 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
             description: l.description,
             qty: l.qty,
             unitPriceForeign: l.unitPriceForeign,
-            unitPriceBase: l.unitPriceBase,
+            unitPriceBase: divideRoundedNumber(l.unitPriceForeign, fxRate, 6),
             discountStr: l.discountStr,
             discountAmount: l.discountAmount,
             taxRateId: l.taxRateId,
             taxForeign: l.taxForeign,
-            taxBase: l.taxBase,
+            taxBase: divideRoundedNumber(l.taxForeign, fxRate, 4),
             totalForeign: l.totalForeign,
-            totalBase: l.totalBase,
+            totalBase: divideRoundedNumber(l.totalForeign, fxRate, 4),
           })),
         },
       },

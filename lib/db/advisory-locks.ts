@@ -123,6 +123,15 @@ export const ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY = 918_274_233
 export const RECONCILIATION_PACK_SCHEDULE_LOCK_KEY = 918_274_301
 
 /**
+ * THE EXCHANGE-RATE TABLE'S STABILITY LOCK (owner ruling 2026-10-26, one rate).
+ *
+ * EVERY WRITER of `fx_rates` (and of the base currency the rates are measured against) takes it EXCLUSIVELY with `pg_advisory_xact_lock` inside its write transaction
+ * (`withFxTableWriteLock`, lib/currencies/fx-table-lock.ts). A CSV importer HOLDS IT SHARED (`pg_advisory_lock_shared`, pinned connection) from its first rate check to its last write, so the
+ * rates it checked cannot change mid-file and the file is never half imported. A writer therefore waits for a running import to finish; imports do not exclude each other. Its own domain.
+ */
+export const FX_TABLE_LOCK_KEY = 918_274_401
+
+/**
  * The SCHEDULED RECONCILIATION PACK's SETTINGS FENCE (transaction-scoped, `pg_advisory_xact_lock`).
  *
  * Taken first inside the save transaction of every writer of the job's rows (its enable switch, its schedule, its phase and its
@@ -162,6 +171,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY,
   RECONCILIATION_PACK_SCHEDULE_LOCK_KEY,
   RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY,
+  FX_TABLE_LOCK_KEY,
 } as const
 
 /**
