@@ -1,4 +1,4 @@
-import type { FxRateRow, ImsRead, ImsReadOptions } from '../../lib/reconciliation-pack/ims-readers.ts'
+import type { FxRateRow, ImsRead, ImsReadOptions, XeroPostedRateRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import type { XeroGetPort, XeroPage } from '../../lib/reconciliation-pack/xero-source.ts'
 import type { XeroResource } from '../../lib/reconciliation-pack/constants.ts'
 import type { XeroRateItemContext } from '../../lib/reconciliation-pack/xero-rate-item.ts'
@@ -23,7 +23,7 @@ export const FX_ROWS: FxRateRow[] = [
   { currency: 'USD', rate: '1.3', fetchedAt: '2026-09-10T06:00:00.000Z', manualOverride: false },
 ]
 
-export function imsRates(options: { base?: string; rows?: FxRateRow[]; fail?: 'throws' | 'read' | 'section' } = {}): { calls: ImsReadOptions[]; ims: NonNullable<XeroRateItemContext['ims']> } {
+export function imsRates(options: { base?: string; rows?: FxRateRow[]; posted?: XeroPostedRateRow[]; fail?: 'throws' | 'read' | 'section' | 'posted' } = {}): { calls: ImsReadOptions[]; ims: NonNullable<XeroRateItemContext['ims']> } {
   const calls: ImsReadOptions[] = []
   return {
     calls,
@@ -31,8 +31,9 @@ export function imsRates(options: { base?: string; rows?: FxRateRow[]; fail?: 't
       calls.push(read)
       if (options.fail === 'throws') throw new Error('boom')
       if (options.fail === 'read') return { ok: false, reason: 'READ_INCOMPLETE' }
-      if (options.fail === 'section') return { ok: true, snapshotId: '10:20:', sections: { baseCurrency: { ok: true, value: options.base ?? 'GBP' }, fxRates: { ok: false, reason: 'CAP_EXCEEDED' } } }
-      return { ok: true, snapshotId: '10:20:', sections: { baseCurrency: { ok: true, value: options.base ?? 'GBP' }, fxRates: { ok: true, value: options.rows ?? FX_ROWS } } }
+      if (options.fail === 'section') return { ok: true, snapshotId: '10:20:', sections: { baseCurrency: { ok: true, value: options.base ?? 'GBP' }, fxRates: { ok: false, reason: 'CAP_EXCEEDED' }, xeroPostedRates: { ok: true, value: [] } } }
+      if (options.fail === 'posted') return { ok: true, snapshotId: '10:20:', sections: { baseCurrency: { ok: true, value: options.base ?? 'GBP' }, fxRates: { ok: true, value: options.rows ?? FX_ROWS }, xeroPostedRates: { ok: false, reason: 'CAP_EXCEEDED' } } }
+      return { ok: true, snapshotId: '10:20:', sections: { baseCurrency: { ok: true, value: options.base ?? 'GBP' }, fxRates: { ok: true, value: options.rows ?? FX_ROWS }, xeroPostedRates: { ok: true, value: options.posted ?? [] } } }
     },
   }
 }
@@ -97,3 +98,8 @@ export function context(lists: Parameters<typeof rateDouble>[0], over: { double?
 
 /** A euro invoice dated 2026-09-10 unless said otherwise (1 GBP = 1.25 EUR from that morning, so Xero's rate should be 0.8). */
 export const eurInvoice = (n: number, rate: number | string | null, date = '2026-09-10'): Json => invoiceRow({ n, date, currency: 'EUR', rate })
+
+/** What IMS recorded when it posted the Xero record `ref` (the Xero id of the row built with n = ref): a connector-confirmed sync record carrying `rate` (1 base = X foreign). */
+export const postedRow = (ref: number, type: string, over: Partial<XeroPostedRateRow> = {}): XeroPostedRateRow => ({
+  id: `log${ref}`, type, externalId: uuid(ref), noPayload: false, currency: 'EUR', date: '2026-09-10', rate: '1.25', wooReceipt: false, orderRate: null, wooOrder: false, ...over,
+})

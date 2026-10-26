@@ -767,6 +767,18 @@ test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refr
     assert.ok((await run(['--vendor-reads-only'])).out.includes('R16 fail DIFFERENCES,XERO_RATE_DIFFERS'), 'a payment is judged on its own rate')
     paymentRate = 0.5
 
+    // A record IMS POSTED is held to the rate its posting carried (the real sync-log reader, in the pack's read-only snapshot): the log says IMS sent 1/1.9,
+    // Xero holds 0.5, which agrees with the table but not with the posting. Removed again so the other cases are unchanged.
+    await sql(`INSERT INTO accounting_sync_logs (id, connector, type, status, "referenceType", "referenceId", "externalTransactionId", payload) VALUES ($1, 'xero', 'SALES_INVOICE', 'SYNCED', 'SalesOrder', $2, $3, $4::jsonb)`, [`${RTAG}-log`, `${RTAG}-so`, uuid(1), JSON.stringify({ currency: 'NZD', date: '2026-09-05', currencyRateToBase: 1.9 })])
+    try {
+      const posted = await run(['--vendor-reads-only'])
+      assert.ok(posted.out.includes('R16 fail DIFFERENCES,XERO_RATE_DIFFERS'), posted.out.join('\n'))
+      await sql(`UPDATE accounting_sync_logs SET payload = NULL WHERE id = $1`, [`${RTAG}-log`])
+      assert.ok((await run(['--vendor-reads-only'])).out.includes('R16 fail DIFFERENCES,IMS_POSTING_UNREADABLE'), 'a link whose payload is gone is a finding')
+    } finally {
+      await sql(`DELETE FROM accounting_sync_logs WHERE id = $1`, [`${RTAG}-log`])
+    }
+
     // No IMS rate on or before the document date: IMS_RATE_MISSING, and the table is untouched by the run.
     await sql(`UPDATE fx_rates SET "fetchedAt" = '2026-09-06 06:00:00' WHERE id = $1`, [`${RTAG}-fx`])
     const missing = await run(['--vendor-reads-only'])

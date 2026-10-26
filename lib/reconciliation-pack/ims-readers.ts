@@ -55,7 +55,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'baseCurrency', 'firstLoadProvenance'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'baseCurrency', 'firstLoadProvenance', 'xeroPostedRates'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -208,6 +208,17 @@ export const TRANSIT_SOURCE_DOCUMENTS: ReadonlyArray<{ kind: string; sourceTypes
 ]
 export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; preWatermark: TransitPreWatermark; net: TransitNetRow[]; customerReturns: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
 
+/**
+ * R16, the IMS side of "what did IMS post": every connector-confirmed Xero create (SYNCED, a Xero document id, no operator assertion standing in for the
+ * connector) of a sales invoice, bill, sales or supplier credit note and invoice or bill payment, with the rate its stored sync payload carried (the
+ * payload is what the poster sent: documents `currencyRateToBase`, payments `settlementRateToBase`; 1 base = X foreign), as TEXT exactly as stored (null
+ * when the key is absent), and whether the payload is gone (retention compaction). `date` is the document date (payments: the payment date).
+ * `wooReceipt` and `orderRate` describe a payment whose source invoice entry carried the importer's `_paymentSettlementRateToBase` (an imported
+ * WooCommerce receipt) and that invoice entry's stored order rate; `wooOrder` is true for a document of a sales order imported from the storefront.
+ * Read-only, in the snapshot of the other sections.
+ */
+export type XeroPostedRateRow = { id: string; type: string; externalId: string; noPayload: boolean; currency: string | null; date: string | null; rate: string | null; wooReceipt: boolean; orderRate: string | null; wooOrder: boolean }
+
 export type ImsSectionValues = {
   identity: ImsIdentity
   boundaries: PopulationBoundaries
@@ -229,6 +240,7 @@ export type ImsSectionValues = {
   fxRates: FxRateRow[]
   baseCurrency: string
   firstLoadProvenance: FirstLoadProvenance | null
+  xeroPostedRates: XeroPostedRateRow[]
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -501,6 +513,24 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const logs = rows.map((row): XeroSyncLogRow => ({ id: text(row.id), type: text(row.type, 'SOURCE_UNREADABLE'), referenceType: text(row.ref_type), referenceId: text(row.ref_id), externalTransactionId: text(row.external_id) }))
     unique(logs, (log) => log.id)
     return logs
+  },
+
+  async xeroPostedRates(tx) {
+    const rows = await readCapped(tx, `SELECT l.id AS id, l.type::text AS type, l."externalTransactionId" AS external_id, (l.payload IS NULL) AS no_payload, l.payload->>'currency' AS currency,
+      CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'paymentDate' ELSE l.payload->>'date' END AS doc_date,
+      CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'settlementRateToBase' ELSE l.payload->>'currencyRateToBase' END AS rate,
+      COALESCE((src.payload ? '_paymentSettlementRateToBase'), false) AS woo_receipt, src.payload->>'currencyRateToBase' AS order_rate, (so."externalOrderNumber" IS NOT NULL) AS woo_order
+      FROM accounting_sync_logs l
+      LEFT JOIN accounting_sync_logs src ON l.type::text = 'INVOICE_PAYMENT' AND src.id = l.payload->>'sourceEntryId'
+      LEFT JOIN sales_orders so ON l."referenceType" = 'SalesOrder' AND so.id = l."referenceId"
+      WHERE l.connector = 'xero' AND l.status::text = 'SYNCED' AND l.settlement_basis IS NULL AND l."externalTransactionId" IS NOT NULL
+        AND l.type::text IN ('SALES_INVOICE', 'PURCHASE_INVOICE', 'CREDIT_NOTE', 'PURCHASE_CREDIT_NOTE', 'INVOICE_PAYMENT', 'BILL_PAYMENT') ORDER BY l.id`)
+    const posted = rows.map((row): XeroPostedRateRow => ({
+      id: text(row.id), type: text(row.type, 'SOURCE_UNREADABLE'), externalId: text(row.external_id), noPayload: bool(row.no_payload),
+      currency: textOrNull(row.currency), date: textOrNull(row.doc_date), rate: textOrNull(row.rate), wooReceipt: bool(row.woo_receipt), orderRate: textOrNull(row.order_rate), wooOrder: bool(row.woo_order === null ? false : row.woo_order),
+    }))
+    unique(posted, (row) => row.id)
+    return posted
   },
 
   async xeroPostings(tx) {

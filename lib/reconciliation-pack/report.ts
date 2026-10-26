@@ -405,11 +405,11 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
   if (has('NOT_SELECTED') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1)) fail('NOT_SELECTED is an inconclusive item with nothing listed and no other reason')
   if (findings > 0 && (input.outcome !== 'fail' || !has('DIFFERENCES'))) fail('a finding makes the item a fail with DIFFERENCES')
   // R16's finding reasons say WHY an entry is a finding, and each is coupled to the bucket it files under: a pair that differs (bothDiffer) is XERO_RATE_DIFFERS; a Xero row with no IMS counterpart (onlyVendor) is IMS_RATE_MISSING or DOCUMENT_UNREADABLE. No other item carries them.
-  const r16Reasons: readonly PackReasonCode[] = ['XERO_RATE_DIFFERS', 'IMS_RATE_MISSING', 'DOCUMENT_UNREADABLE']
-  if (input.id !== 'R16' && r16Reasons.some(has)) fail('XERO_RATE_DIFFERS, IMS_RATE_MISSING and DOCUMENT_UNREADABLE belong to R16 and nothing else')
+  const r16Reasons: readonly PackReasonCode[] = ['XERO_RATE_DIFFERS', 'IMS_RATE_MISSING', 'DOCUMENT_UNREADABLE', 'IMS_POSTED_RATE_NOT_TABLE_RATE', 'IMS_POSTING_UNREADABLE']
+  if (input.id !== 'R16' && r16Reasons.some(has)) fail('the R16 finding reasons belong to R16 and nothing else')
   if (input.id === 'R16') {
-    if (has('XERO_RATE_DIFFERS') !== (counts.bothDiffer > 0)) fail('XERO_RATE_DIFFERS and the differing pairs must agree')
-    if ((has('IMS_RATE_MISSING') || has('DOCUMENT_UNREADABLE')) !== (counts.onlyVendor > 0)) fail('IMS_RATE_MISSING and DOCUMENT_UNREADABLE belong to the Xero rows with no IMS rate, and those rows carry one of them')
+    if ((has('XERO_RATE_DIFFERS') || has('IMS_POSTED_RATE_NOT_TABLE_RATE')) !== (counts.bothDiffer > 0)) fail('XERO_RATE_DIFFERS and IMS_POSTED_RATE_NOT_TABLE_RATE are the differing pairs, and those pairs carry one of them')
+    if ((has('IMS_RATE_MISSING') || has('DOCUMENT_UNREADABLE') || has('IMS_POSTING_UNREADABLE')) !== (counts.onlyVendor > 0)) fail('IMS_RATE_MISSING, DOCUMENT_UNREADABLE and IMS_POSTING_UNREADABLE belong to the Xero rows with no IMS rate, and those rows carry one of them')
     if (counts.onlyIms > 0) fail('R16 lists nothing on the IMS side alone')
   }
   if (input.proof !== null && input.outcome !== 'pass') fail('only a pass carries a proof')

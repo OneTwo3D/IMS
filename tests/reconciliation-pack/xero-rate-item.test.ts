@@ -4,7 +4,7 @@ import test from 'node:test'
 import { R16_XERO_REQUEST_BUDGET } from '../../lib/reconciliation-pack/constants.ts'
 import { buildRateRows, runXeroRateCheck, runXeroRateItem, summariseRateCheck } from '../../lib/reconciliation-pack/xero-rate-item.ts'
 import type { XeroRateDocument } from '../../lib/reconciliation-pack/xero-rate-source.ts'
-import { ASOF, FX_ROWS, binding, context, creditNoteRow, invoiceRow, noSleep, paymentRow, uuid, type XeroTweak } from './xero-rate-fixtures.ts'
+import { ASOF, FX_ROWS, binding, context, creditNoteRow, invoiceRow, noSleep, paymentRow, postedRow, uuid, type XeroTweak } from './xero-rate-fixtures.ts'
 
 /**
  * R16, THE XERO RATE CHECK: what the item concludes from a fake Xero and a fake IMS read. Mutations are listed in the PR.
@@ -194,7 +194,7 @@ test('PAYMENTS AND DOCUMENTS: invoices, bills, credit notes and payments are eac
     [keyOf('purchase-bill', 2), '0.8', '0.9'],
     [keyOf('purchase-cn', 4), '0.8', '0.7'],
   ].sort())
-  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 2, creditNotes: 2, payments: 5 }, deletedPayments: 1, setAsideDocuments: 0, outsidePeriod: 0, baseCurrency: 1, compared: 7, equal: 4, xeroRateDiffers: 3, imsRateMissing: 0, documentUnreadable: 0 })
+  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 2, creditNotes: 2, payments: 5 }, deletedPayments: 1, setAsideDocuments: 0, outsidePeriod: 0, baseCurrency: 1, compared: 7, equal: 4, xeroRateDiffers: 3, imsRateMissing: 0, documentUnreadable: 0, imsPosted: 0, postedRateNotTableRate: 0, postingUnreadable: 0, postedTableNotChecked: 0 })
   // A payment is judged on its own rate, not on its invoice's: the same euro invoice at 0.8 does not rescue a payment at 0.79 (asserted above), and a payment
   // that names no document has no currency to judge.
   const orphan = await runXeroRateItem('R16', context({ payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8, holder: 'none' })] }).ctx)
@@ -278,7 +278,7 @@ test('the IMS side is read first and in one snapshot: an unreadable one makes no
   assert.equal(xeroBase.xero.calls.length, 1, 'only the organisation was read')
   const one = context({})
   await runXeroRateItem('R16', one.ctx)
-  assert.deepEqual(one.ims.calls, [{ sections: ['baseCurrency', 'fxRates'] }])
+  assert.deepEqual(one.ims.calls, [{ sections: ['baseCurrency', 'fxRates', 'xeroPostedRates'] }])
 })
 
 // [mutation: the connection not checked at the start / at the end]
@@ -307,7 +307,7 @@ test('the stored connection must be usable at the start and the same at the end 
 // [mutation: the sort removed / the key built from something that varies]
 test('THE ROWS ARE DETERMINISTIC: the order Xero lists them in does not change a byte of the result, and the identity is the kind and the Xero id only', async () => {
   const docs: XeroRateDocument[] = [1, 2, 3, 4].map((n) => ({ readable: true, kind: n % 2 === 0 ? 'payment' : 'sales-invoice', id: uuid(n), date: SEP, currency: 'EUR', rate: n === 3 ? '0.9' : '0.8' }))
-  const base = { read: { invoices: 2, creditNotes: 0, payments: 2 }, deletedPayments: 0, setAsideDocuments: 0, base: 'GBP', fxRows: FX_ROWS, periods: ['2026-08', '2026-09'] }
+  const base = { read: { invoices: 2, creditNotes: 0, payments: 2 }, deletedPayments: 0, setAsideDocuments: 0, base: 'GBP', fxRows: FX_ROWS, posted: [], periods: ['2026-08', '2026-09'] }
   const forward = buildRateRows({ ...base, documents: docs })
   const backward = buildRateRows({ ...base, documents: [...docs].reverse() })
   assert.deepEqual(forward, backward)
@@ -344,8 +344,8 @@ test('THE SUMMARY says what was read and how each row was judged', async () => {
     creditNotes: [creditNoteRow({ n: 8, date: SEP, currency: 'EUR', rate: 0.1, status: 'VOIDED' }), creditNoteRow({ n: 9, date: SEP, currency: 'EUR', rate: 0.1, status: 'DELETED' })],
     payments: [paymentRow({ n: 7, date: SEP, currency: 'EUR', rate: 0.8, status: 'DELETED' })],
   }).ctx)
-  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 6, creditNotes: 2, payments: 1 }, deletedPayments: 1, setAsideDocuments: 2, outsidePeriod: 1, baseCurrency: 1, compared: 2, equal: 1, xeroRateDiffers: 1, imsRateMissing: 1, documentUnreadable: 1 })
-  assert.equal(summariseRateCheck(run.summary!), 'periods 2026-08,2026-09; read 6 invoices and bills, 2 credit notes, 1 payments (1 deleted payments, 2 voided or deleted documents set aside as out of scope); 1 outside the periods, 1 in the base currency (out of scope); 2 foreign compared (1 equal, 1 differ), 1 without an IMS rate, 1 unreadable')
+  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 6, creditNotes: 2, payments: 1 }, deletedPayments: 1, setAsideDocuments: 2, outsidePeriod: 1, baseCurrency: 1, compared: 2, equal: 1, xeroRateDiffers: 1, imsRateMissing: 1, documentUnreadable: 1, imsPosted: 0, postedRateNotTableRate: 0, postingUnreadable: 0, postedTableNotChecked: 0 })
+  assert.equal(summariseRateCheck(run.summary!), 'periods 2026-08,2026-09; read 6 invoices and bills, 2 credit notes, 1 payments (1 deleted payments, 2 voided or deleted documents set aside as out of scope); 1 outside the periods, 1 in the base currency (out of scope); 2 foreign compared (1 equal, 1 differ), 1 without an IMS rate, 1 unreadable; 0 posted by IMS (held to the rate the posting carried; 0 not the table rate, 0 posting unreadable, 0 with no table rule)')
   assert.equal(ASOF, '2026-10-19')
   assert.equal((await runXeroRateCheck({ ...context({}).ctx, vendorReads: true, ims: undefined })).summary, null)
 })
@@ -353,4 +353,72 @@ test('THE SUMMARY says what was read and how each row was judged', async () => {
 test('an empty population with every list proven passes only on the named proof', async () => {
   const item = await runXeroRateItem('R16', context({}).ctx)
   assert.deepEqual([item.outcome, item.proof], ['pass', { kind: 'proven-empty', source: 'no-foreign-currency-documents' }])
+})
+
+// ---- IMS POSTINGS (Codex round 2): a record IMS posted is held to the rate its posting carried -----------------------------------------------------
+
+const LATER = [...FX_ROWS, { currency: 'EUR', rate: '1.3', fetchedAt: '2026-09-10T18:00:00.000Z', manualOverride: false }]
+const pair = (item: Awaited<ReturnType<typeof runXeroRateItem>>, bucket: string) => entries(item, bucket).map((e) => [e.key, e.ims, e.vendor])
+
+// [mutation: the posted rate replaced by the table lookup / the Xero rate compared with the later table row]
+test('A PAYMENT IMS POSTED AT 1.25, WITH A 1.30 ROW ARRIVING LATER THAT DAY: Xero holding 1/1.30 is a finding against the posting, not a pass against the later row', async () => {
+  const lists = { payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.769231 })] }
+  const posted = [postedRow(1, 'INVOICE_PAYMENT', { rate: '1.25' })]
+  const item = await runXeroRateItem('R16', context(lists, { ims: { rows: LATER, posted } }).ctx)
+  assert.deepEqual([item.outcome, [...item.reasons].sort()], ['fail', ['DIFFERENCES', 'XERO_RATE_DIFFERS']])
+  assert.deepEqual(pair(item, 'bothDiffer'), [[`xero-rate|payment|${uuid(1)}|ims-posting|log1`, '0.8', '0.769231']])
+  // The same Xero rate for a record IMS did NOT post is reconstructed against the table, as before, and passes.
+  const manual = await runXeroRateItem('R16', context(lists, { ims: { rows: LATER, posted: [postedRow(2, 'INVOICE_PAYMENT')] } }).ctx)
+  assert.equal(manual.outcome, 'pass')
+  // Xero holding what the posting carried passes, whatever the table says later, and the record kind has no table rule here (counted).
+  const equal = await runXeroRateCheck(context({ payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8 })] }, { ims: { rows: LATER, posted } }).ctx)
+  assert.equal(equal.item.outcome, 'pass')
+  assert.deepEqual([equal.summary?.imsPosted, equal.summary?.postedTableNotChecked, equal.summary?.equal], [1, 1, 1])
+})
+
+// [mutation: the table check removed / the table rule widened to accept any rate / the order rate alternative dropped]
+test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is IMS_POSTED_RATE_NOT_TABLE_RATE; the stored rate and the table rate are listed', async () => {
+  // A storefront invoice: the order rate must be a central rate in force on the order's day (1.25 from 06:00, 1.30 from 18:00).
+  const invoice = (rate: string, xero: number) => context({ invoices: [eur(1, xero)] }, { ims: { rows: LATER, posted: [postedRow(1, 'SALES_INVOICE', { rate, wooOrder: true })] } }).ctx
+  for (const [rate, xero] of [['1.25', 0.8], ['1.3', 0.769231]] as const) assert.equal((await runXeroRateItem('R16', invoice(rate, xero))).outcome, 'pass', rate)
+  const off = await runXeroRateItem('R16', invoice('1.4', 0.714286))
+  assert.deepEqual([off.outcome, [...off.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTED_RATE_NOT_TABLE_RATE']])
+  assert.deepEqual(pair(off, 'bothDiffer'), [[`xero-rate|sales-invoice|${uuid(1)}|posted-vs-table|log1`, '0.769231', '0.714286']])
+  // A record that is not a storefront one has no table rule: checked against Xero alone and counted.
+  const plain = await runXeroRateCheck(context({ invoices: [eur(1, 0.714286)] }, { ims: { rows: LATER, posted: [postedRow(1, 'SALES_INVOICE', { rate: '1.4' })] } }).ctx)
+  assert.deepEqual([plain.item.outcome, plain.summary?.postedTableNotChecked, plain.summary?.postedRateNotTableRate], ['pass', 1, 0])
+  // A storefront receipt: the order's own rate (paid the day it was ordered) or the central rate at the end of the payment day.
+  const receipt = (rate: string, orderRate: string | null, xero: number) => context({ payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: xero })] }, { ims: { rows: LATER, posted: [postedRow(1, 'INVOICE_PAYMENT', { rate, orderRate, wooReceipt: true })] } }).ctx
+  assert.equal((await runXeroRateItem('R16', receipt('1.2', '1.2', 0.833333))).outcome, 'pass', 'the order rate, same day')
+  assert.equal((await runXeroRateItem('R16', receipt('1.3', '1.2', 0.769231))).outcome, 'pass', 'the central rate at the end of the payment day')
+  const wrong = await runXeroRateItem('R16', receipt('1.2', '1.25', 0.833333))
+  assert.deepEqual([wrong.outcome, [...wrong.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTED_RATE_NOT_TABLE_RATE']])
+  // No central rate on the day at all: IMS_RATE_MISSING, never a pass.
+  const none = await runXeroRateItem('R16', context({ invoices: [eur(1, 0.8)] }, { ims: { rows: [], posted: [postedRow(1, 'SALES_INVOICE', { wooOrder: true })] } }).ctx)
+  assert.deepEqual([none.outcome, [...none.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_RATE_MISSING']])
+})
+
+// [mutation: an unreadable posting passed / treated as not posted / the link kind or currency not checked / an ambiguous link taken]
+test('A BROKEN LINK IS A FINDING, never a pass: gone payload, no rate, an unusable rate, a currency or kind that disagrees with Xero, two records naming one id, a storefront receipt with no date', async () => {
+  const cases: Array<[string, ReturnType<typeof postedRow>[]]> = [
+    ['payload gone', [postedRow(1, 'SALES_INVOICE', { noPayload: true, rate: null, currency: null, date: null })]],
+    ['no rate', [postedRow(1, 'SALES_INVOICE', { rate: null })]],
+    ['rate zero', [postedRow(1, 'SALES_INVOICE', { rate: '0' })]],
+    ['rate not a number', [postedRow(1, 'SALES_INVOICE', { rate: 'abc' })]],
+    ['no currency', [postedRow(1, 'SALES_INVOICE', { currency: null })]],
+    ['currency disagrees', [postedRow(1, 'SALES_INVOICE', { currency: 'USD' })]],
+    ['kind disagrees', [postedRow(1, 'CREDIT_NOTE')]],
+    ['two records', [postedRow(1, 'SALES_INVOICE'), { ...postedRow(1, 'SALES_INVOICE'), id: 'log1b' }]],
+    ['receipt with no date', [postedRow(1, 'SALES_INVOICE', { wooOrder: true, date: null })]],
+  ]
+  for (const [name, posted] of cases) {
+    const item = await runXeroRateItem('R16', context({ invoices: [eur(1, 0.8)] }, { ims: { posted } }).ctx)
+    assert.deepEqual([item.outcome, [...item.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], name)
+    assert.equal(entries(item, 'onlyVendor').length, 1, name)
+  }
+  // The posted-rates section failing to read is inconclusive, and nothing is requested from Xero first.
+  const failing = context({ invoices: [eur(1, 0.8)] }, { ims: { fail: 'posted' } })
+  const item = await runXeroRateItem('R16', failing.ctx)
+  assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['CAP_EXCEEDED']])
+  assert.equal(failing.xero.calls.length, 0)
 })
