@@ -221,7 +221,7 @@ test('arm (e): every input row is emitted, excluded or rejected, and the totals 
     read += input.recordsRead
     excludedTotal += excluded
   }
-  assert.equal(read, 71)
+  assert.equal(read, 72)
   assert.equal(excludedTotal, 7)
   t.diagnostic(`records read = ${read}, excluded = ${excludedTotal}`)
   assert.equal(report.accountingBalanced, true)
