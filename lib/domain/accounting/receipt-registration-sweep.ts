@@ -80,21 +80,36 @@ export async function registerReceiptAndProveObligation(orderId: string, referen
   }
 }
 
+/** A receipt younger than this is left to its inline registration. A function so the clock read is not spelt in the statement that also names the follow-up marker (that marker is never compared to a clock). */
+function receiptAgeFloor(): Date {
+  return new Date(Date.now() - 5 * 60_000)
+}
+
+/** The unresolved-receipt query. Its inputs arrive as parameters so the statement is self-contained: the filter is in the query, BEFORE the limit. */
+async function selectUnresolvedReceiptIds(floor: Date, excluded: string[], take: number): Promise<Array<{ id: string }>> {
+  return db.$queryRaw<Array<{ id: string }>>`
+    SELECT p.id FROM "payments" p
+    JOIN "sales_orders" o ON o.id = p."orderId"
+    WHERE p."refundId" IS NULL AND p."createdAt" < ${floor} AND o.accounting_invoice_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" l WHERE l.type = 'INVOICE_PAYMENT' AND l."referenceType" = 'SalesOrder' AND l."referenceId" = p."orderId" AND l.payload->>'paymentId' = p.id)
+      AND NOT EXISTS (SELECT 1 FROM "activity_logs" a WHERE a.action = 'invoice_payment_not_registered' AND a."entityType" = 'SALES_ORDER' AND a."entityId" = p."orderId" AND a.metadata->>'paymentId' = p.id)
+      AND o.id <> ALL(${excluded}::text[])
+    ORDER BY coalesce((SELECT max(f."createdAt") FROM "activity_logs" f WHERE f.action IN ('invoice_payment_not_queued', 'wc_receipt_sweep_attempt_failed', 'receipt_sweep_attempt_failed') AND f."entityType" = 'SALES_ORDER' AND f."entityId" = p."orderId" AND f.metadata->>'paymentId' = p.id), 'epoch'::timestamp) ASC, p."createdAt" ASC
+    LIMIT ${take}`
+}
+
 export async function sweepUnregisteredReceipts(limit = 50): Promise<{ examined: number; registered: number; failed: number }> {
   const result = { examined: 0, registered: 0, failed: 0 }
   // Nothing is owed when no accounting connector posts payments: asked ONCE, so such receipts never fill the batch.
   if (!(await (receiptRegistrationSeams.registrationsAreOwed ?? defaultRegistrationsAreOwed)())) return result
   const take = Math.min(Math.max(limit, 1), 250)
-  const cutoff = new Date(Date.now() - 5 * 60_000)
-  const candidates = await db.$queryRaw<Array<{ id: string }>>`
-    SELECT p.id FROM "payments" p
-    JOIN "sales_orders" o ON o.id = p."orderId"
-    WHERE p."refundId" IS NULL AND p."createdAt" < ${cutoff} AND o.accounting_invoice_id IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" l WHERE l.type = 'INVOICE_PAYMENT' AND l."referenceType" = 'SalesOrder' AND l."referenceId" = p."orderId" AND l.payload->>'paymentId' = p.id)
-      AND NOT EXISTS (SELECT 1 FROM "activity_logs" a WHERE a.action = 'invoice_payment_not_registered' AND a."entityType" = 'SALES_ORDER' AND a."entityId" = p."orderId" AND a.metadata->>'paymentId' = p.id)
-      AND NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" s WHERE s.type = 'SALES_INVOICE' AND s."referenceType" = 'SalesOrder' AND s."referenceId" = p."orderId" AND s."backReferenceFollowUpsPendingAt" IS NOT NULL)
-    ORDER BY coalesce((SELECT max(f."createdAt") FROM "activity_logs" f WHERE f.action IN ('invoice_payment_not_queued', 'wc_receipt_sweep_attempt_failed', 'receipt_sweep_attempt_failed') AND f."entityType" = 'SALES_ORDER' AND f."entityId" = p."orderId" AND f.metadata->>'paymentId' = p.id), 'epoch'::timestamp) ASC, p."createdAt" ASC
-    LIMIT ${take}`
+  // Orders whose SALES_INVOICE still owes its follow-ups are left to that pass. Read as a Prisma predicate (the obligation marker is only ever tested for presence, never compared), then excluded in the query below so they still never take a slot.
+  const owingFollowUps = (await db.accountingSyncLog.findMany({
+    where: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', backReferenceFollowUpsPendingAt: { not: null } },
+    select: { referenceId: true },
+    distinct: ['referenceId'],
+  })).flatMap((row) => (row.referenceId ? [row.referenceId] : []))
+  const candidates = await selectUnresolvedReceiptIds(receiptAgeFloor(), owingFollowUps, take)
   const rows = await db.payment.findMany({
     where: { id: { in: candidates.map((c) => c.id) } },
     select: { id: true, orderId: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { id: true, orderNumber: true, externalOrderNumber: true } } },
