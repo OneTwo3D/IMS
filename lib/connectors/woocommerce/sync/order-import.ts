@@ -6,6 +6,11 @@ import { currentTaxRates, resolveLinesTaxRates } from '@/lib/tax/writable-tax-ra
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { resolveWcReceiptSettlementRate, parseWcGmtInstant } from './receipt-settlement-rate'
+import {
+  ReceiptRegistrationNotRecorded as WcReceiptRegistrationNotRecorded,
+  receiptRegistrationSeams as wcReceiptRegistrationSeams,
+  registerReceiptAndProveObligation,
+} from '@/lib/domain/accounting/receipt-registration-sweep'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { logActivity } from '@/lib/activity-log'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
@@ -826,61 +831,7 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
  * connector posts payments), (b) an INVOICE_PAYMENT sync row for THIS receipt, in any status (a refusal is recorded as an outstanding row), or (c) a decided refusal notice
  * for this receipt (`invoice_payment_not_registered`, which names the hand remedy). The throw case (`invoice_payment_not_queued`) is none of these.
  */
-export class WcReceiptRegistrationNotRecorded extends Error {
-  constructor(readonly orderId: string, readonly paymentId: string | null, readonly currency: string, readonly causeText?: string) {
-    super(`the receipt ${paymentId ?? '(not yet known)'} of order ${orderId} is stored but its ledger registration is not on record yet; it is retried${causeText ? ` (${causeText})` : ''}`)
-    this.name = 'WcReceiptRegistrationNotRecorded'
-  }
-}
-
-async function wcReceiptObligationIsOnRecord(orderId: string, paymentId: string): Promise<boolean> {
-  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { accountingInvoiceId: true, currency: true } })
-  if (!order || !order.accountingInvoiceId) return true
-  const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
-  const connector = await getActiveAccountingConnectorInfo().catch(() => null)
-  if (!connector) return true
-  if (!(await isAccountingSyncTypeEnabledFor(connector.id, 'INVOICE_PAYMENT').catch(() => true))) return true
-  const { loadInvoicePaymentSyncRows } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
-  if ((await loadInvoicePaymentSyncRows(orderId, connector.id, order.currency)).some((row) => row.paymentId === paymentId)) return true
-  return (await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_payment_not_registered', metadata: { path: ['paymentId'], equals: paymentId } } })) > 0
-}
-
-/** The evidence read, as a seam so a test can state "the registration did not reach the record" without a live accounting connector. */
-async function defaultRegistrationsAreOwed(): Promise<boolean> {
-  const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
-  const connector = await getActiveAccountingConnectorInfo().catch(() => null)
-  return connector !== null && (await isAccountingSyncTypeEnabledFor(connector.id, 'INVOICE_PAYMENT').catch(() => false))
-}
-
-export const wcReceiptRegistrationSeams: { obligationIsOnRecord: (orderId: string, paymentId: string) => Promise<boolean>; afterPlan?: (orderId: string) => Promise<void>; afterReceiptCommit?: (orderId: string) => Promise<void>; insideReceiptTransaction?: () => Promise<void>; registrationsAreOwed?: () => Promise<boolean> } = { obligationIsOnRecord: wcReceiptObligationIsOnRecord }
-
-/** Register one stored receipt and prove the obligation is on record, or throw so the caller keeps the work queued. */
-async function registerWcReceiptAndProveObligation(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
-  // ONCE A PAYMENT IS COMMITTED, EVERY FAILURE HERE IS A RETRYABLE RECEIPT OBLIGATION, never a failed import: whatever is thrown (a transient read in the proof, the
-  // registration itself) becomes WcReceiptRegistrationNotRecorded carrying the paymentId, so the pending-FX row stays PENDING and names the receipt to re-drive.
-  try {
-    await registerWcReceiptAndProveObligationUnguarded(orderId, reference, receipt)
-  } catch (error) {
-    if (error instanceof WcReceiptRegistrationNotRecorded) throw error
-    throw new WcReceiptRegistrationNotRecorded(orderId, receipt.id, receipt.currency, error instanceof Error ? error.message : String(error))
-  }
-}
-
-async function registerWcReceiptAndProveObligationUnguarded(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
-  const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
-  await registerInvoicePaymentWithLedger({
-    orderId,
-    orderReference: reference,
-    paymentId: receipt.id,
-    amount: toDecimal(receipt.amount as never),
-    currency: receipt.currency,
-    method: receipt.method,
-    reference: receipt.reference,
-    paidAt: receipt.paidAt,
-    settlementRateToBase: receipt.settlementRateToBase === null || receipt.settlementRateToBase === undefined ? null : Number(receipt.settlementRateToBase),
-  })
-  if (!(await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, receipt.id))) throw new WcReceiptRegistrationNotRecorded(orderId, receipt.id, receipt.currency)
-}
+export { WcReceiptRegistrationNotRecorded, wcReceiptRegistrationSeams }
 
 /** Receipts this path recorded earlier whose registration never reached the record (the call failed): registered again, idempotently. */
 async function redriveUnregisteredWcReceipts(orderId: string, receiptPaymentId?: string): Promise<void> {
@@ -892,7 +843,7 @@ async function redriveUnregisteredWcReceipts(orderId: string, receiptPaymentId?:
   }
   for (const r of receipts) {
     if (await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, r.id).catch(() => false)) continue
-    await registerWcReceiptAndProveObligation(orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? orderId, r)
+    await registerReceiptAndProveObligation(orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? orderId, r)
   }
 }
 
@@ -1023,7 +974,7 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
   }
   if (!claimed.receipt) return
   await wcReceiptRegistrationSeams.afterReceiptCommit?.(orderId)
-  await registerWcReceiptAndProveObligation(orderId, claimed.reference, { ...claimed.receipt, settlementRateToBase: settlementRate })
+  await registerReceiptAndProveObligation(orderId, claimed.reference, { ...claimed.receipt, settlementRateToBase: settlementRate })
   // PROVEN: retire the obligation row this transaction wrote (a caller's retry row is retired by the caller after ITS proof).
   if (claimed.ownsObligationRow) {
     await db.shoppingSyncLog.updateMany({ where: { id: claimed.obligationRowId, status: 'PENDING' }, data: { status: 'SYNCED', entityId: orderId, errorMessage: null, syncedAt: new Date() } })
@@ -3204,49 +3155,6 @@ export function isQueuedWcOrderPayload(payload: unknown): payload is PendingFxOr
     && typeof (payload as { order?: { id?: unknown } }).order?.id === 'number'
 }
 
-/**
- * THE ORPHAN SWEEP (defence in depth for the obligation row written with the Payment). Stored WooCommerce-recorded receipts (notes prefix 'Recorded from WooCommerce') on orders whose
- * invoice has posted, older than a few minutes (so an in-flight registration is not raced), that have no obligation on record, are registered again. Bounded per run; idempotent per
- * receipt (the enqueue key). Run by the scheduled fx-rates cron every run.
- */
-export async function sweepUnregisteredWcReceipts(limit = 50): Promise<{ examined: number; registered: number; failed: number }> {
-  const result = { examined: 0, registered: 0, failed: 0 }
-  // Nothing is owed when no accounting connector posts payments: asked ONCE, so such receipts never fill the batch.
-  if (!(await (wcReceiptRegistrationSeams.registrationsAreOwed ?? defaultRegistrationsAreOwed)())) return result
-  const take = Math.min(Math.max(limit, 1), 250)
-  const cutoff = new Date(Date.now() - 5 * 60_000)
-  // THE FILTER IS IN THE QUERY, BEFORE THE LIMIT: only receipts with NO INVOICE_PAYMENT sync row and NO decided-refusal notice are candidates (anti-joins), so receipts that are already
-  // registered can never occupy a slot. Ordered by the last failed attempt (never-attempted first), then oldest, so a receipt that keeps failing moves behind the others.
-  const candidates = await db.$queryRaw<Array<{ id: string }>>`
-    SELECT p.id FROM "payments" p
-    JOIN "sales_orders" o ON o.id = p."orderId"
-    WHERE p."refundId" IS NULL AND p.notes LIKE 'Recorded from WooCommerce%' AND p."createdAt" < ${cutoff} AND o.accounting_invoice_id IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" l WHERE l.type = 'INVOICE_PAYMENT' AND l."referenceType" = 'SalesOrder' AND l."referenceId" = p."orderId" AND l.payload->>'paymentId' = p.id)
-      AND NOT EXISTS (SELECT 1 FROM "activity_logs" a WHERE a.action = 'invoice_payment_not_registered' AND a."entityType" = 'SALES_ORDER' AND a."entityId" = p."orderId" AND a.metadata->>'paymentId' = p.id)
-    ORDER BY coalesce((SELECT max(f."createdAt") FROM "activity_logs" f WHERE f.action IN ('invoice_payment_not_queued', 'wc_receipt_sweep_attempt_failed') AND f."entityType" = 'SALES_ORDER' AND f."entityId" = p."orderId" AND f.metadata->>'paymentId' = p.id), 'epoch'::timestamp) ASC, p."createdAt" ASC
-    LIMIT ${take}`
-  const rows = await db.payment.findMany({
-    where: { id: { in: candidates.map((c) => c.id) } },
-    select: { id: true, orderId: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { externalOrderNumber: true, orderNumber: true } } },
-  })
-  const byId = new Map(rows.map((r) => [r.id, r]))
-  result.examined = candidates.length
-  for (const c of candidates) {
-    const r = byId.get(c.id)
-    if (!r) continue
-    try {
-      // the up-front query is the filter; the probe is the final word for what the query cannot see (a connector moved since)
-      if (await wcReceiptRegistrationSeams.obligationIsOnRecord(r.orderId, r.id)) continue
-      await registerWcReceiptAndProveObligation(r.orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? r.orderId, r)
-      result.registered++
-    } catch {
-      result.failed++
-      await logActivity({ entityType: 'SALES_ORDER', entityId: r.orderId, action: 'wc_receipt_sweep_attempt_failed', tag: 'sync', level: 'WARNING', description: 'The scheduled sweep could not register a stored WooCommerce receipt; it is retried behind the others.', metadata: { paymentId: r.id } }).catch(() => undefined)
-    }
-  }
-  return result
-}
-
 export async function retryPendingWcOrdersWaitingForFx(
   limit = 50,
   /**
@@ -3328,7 +3236,11 @@ export async function retryPendingWcOrdersWaitingForFx(
       } else {
         result.failed++
       }
-  
+    } catch (error) {
+      // ONE BAD ROW MUST NOT STOP THE BATCH (or the cron steps after it): count it, log it, go on. The stamp below still moves it behind the others.
+      result.failed++
+      console.error(`[wc-fx-retry] pending row ${row.id} threw: ${String(error).slice(0, 240)}`)
+      await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'wc_order_fx_pending_retry_row_failed', level: 'WARNING', description: `A pending WooCommerce order row threw during the FX retry and was rotated to the back: ${String(error).slice(0, 240)}`, metadata: { syncLogId: row.id }, resolveUser: false }).catch(() => undefined)
     } finally {
       // stamp the attempt on a row that is still PENDING (a row that was retired or failed is not rotated)
       try { await db.shoppingSyncLog.updateMany({ where: { id: row.id, status: 'PENDING' }, data: { syncedAt: new Date() } }) } catch { /* a missed stamp only delays the rotation */ }

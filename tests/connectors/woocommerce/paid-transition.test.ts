@@ -14,10 +14,15 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 const registrations: Array<Record<string, unknown>> = []
 mock.module('@/lib/domain/accounting/invoice-payment-enqueue', { namedExports: { registerInvoicePaymentWithLedger: async (p: Record<string, unknown>) => { registrations.push(p); return null } } })
 
+let badWcOrderId: number | null = null
 let s: Scratch
 let seq = 0
 before(async () => {
   s = await startScratch('ims-wc-paid-transition')
+  const actualWithdrawal = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+  mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
+    namedExports: { ...actualWithdrawal, importWcOrderGuarded: async (...a: Parameters<typeof actualWithdrawal.importWcOrderGuarded>) => { if (badWcOrderId !== null && (a[0] as { id: number }).id === badWcOrderId) throw new Error('import blew up for this row'); return actualWithdrawal.importWcOrderGuarded(...a) } },
+  })
   await s.sql('truncate fx_rates')
   await s.db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.10', fetchedAt: new Date('2026-10-01T06:00:00Z') } })
 })
@@ -341,15 +346,15 @@ test('the scheduled orphan sweep finds a stored WooCommerce receipt with no obli
   oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > 0
   oi.wcReceiptRegistrationSeams.registrationsAreOwed = async () => true
   try {
-    const r1 = await oi.sweepUnregisteredWcReceipts()
+    const r1 = await (await import('@/lib/domain/accounting/receipt-registration-sweep')).sweepUnregisteredReceipts()
     assert.ok(r1.registered >= 1)
     assert.equal(registrations.filter((r) => r.paymentId === orphan.id).length, 1)
     assert.equal(registrations.filter((r) => r.paymentId === early.id).length, 0, 'an order with no posted invoice is not the sweep\'s (the invoice post registers it)')
-    await oi.sweepUnregisteredWcReceipts()
+    await (await import('@/lib/domain/accounting/receipt-registration-sweep')).sweepUnregisteredReceipts()
     assert.equal(registrations.filter((r) => r.paymentId === orphan.id).length, 1, 'not again')
   } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real; oi.wcReceiptRegistrationSeams.registrationsAreOwed = undefined }
   const route = (await import('node:fs')).readFileSync('app/api/cron/fx-rates/route.ts', 'utf8')
-  assert.match(route, /sweepUnregisteredWcReceipts\(50\)/)
+  assert.match(route, /sweepUnregisteredReceipts\(50\)/)
 })
 
 // STARVATION: a bounded batch must not be filled by rows that cannot make progress or need nothing.
@@ -371,7 +376,7 @@ test('the sweep selects only unrecorded receipts BEFORE the limit: 50 registered
   oi.wcReceiptRegistrationSeams.registrationsAreOwed = async () => true
   oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > 0
   try {
-    const r = await oi.sweepUnregisteredWcReceipts(50)
+    const r = await (await import('@/lib/domain/accounting/receipt-registration-sweep')).sweepUnregisteredReceipts(50)
     assert.equal(registrations.filter((x) => x.paymentId === unresolved.id).length, 1, 'registered within one run')
     assert.ok(r.examined <= 50)
     assert.equal(registrations.filter((x) => registered.includes(x.paymentId as string)).length, 0, 'registered receipts took no slot')
@@ -439,4 +444,25 @@ test('order created Oct 1 (no creation instant in the paid payload), imported un
   const unknownSameDay = await heldOrder({ externalCreatedAt: null })
   await noDate(unknownSameDay, '2026-10-01T11:00:00')
   assert.equal(Number((await payments(unknownSameDay.id))[0]!.settlementRateToBase), 1.1, 'the central rate on Oct 1 happens to be the same feed row (1.10): proves a lookup, not an assumption')
+})
+
+// [mutation: remove the per-row catch from retryPendingWcOrdersWaitingForFx (the throw escapes and the good row behind it is never attempted); drop the finally stamp (the bad row stays at the head)]
+test('the pending-FX retry survives a row that throws: it is counted failed, rotated to the back, and the good row is still processed', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const bad = await heldOrder()
+  const good = await heldOrder()
+  registrations.length = 0
+  const mk = (wcId: number) => s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(wcId), payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: String(wcId), externalOrderNumber: String(wcId), currency: 'EUR', asOf: null, order: payload(wcId, '2026-10-01T10:00:00') } } })
+  const badLog = await mk(bad.wcId)
+  const goodLog = await mk(good.wcId)
+  await s.sql(`update shopping_sync_logs set "createdAt" = now() - interval '2 hours' where id = $1`, [badLog.id]) // the bad row is at the head
+  badWcOrderId = bad.wcId
+  try {
+    const r = await oi.retryPendingWcOrdersWaitingForFx(250)
+    assert.equal(r.failed >= 1, true, 'the throwing row is counted')
+    assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: goodLog.id } })).status, 'SYNCED', 'the good row behind it was processed')
+    const stamped = await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: badLog.id } })
+    assert.equal(stamped.status, 'PENDING')
+    assert.ok(stamped.syncedAt, 'the bad row is stamped, so it rotates behind the others')
+  } finally { badWcOrderId = null }
 })
