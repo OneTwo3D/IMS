@@ -144,7 +144,7 @@ FIFO lots on hand per SKU and warehouse. A row with `qty` 0 states "zero on hand
 | `unitCost` | no | Required for a lot with stock. In `currency`; at most 10 decimal places. |
 | `currency` | yes | 3-letter code. |
 | `fxRateToBase` | no | Blank (or 1 for the base currency). A foreign lot's rate is the `fx_rates` rate at the end of its `receivedDate`, read from the `ims-fx-rates` list by the central rule; a rate stated here is a claim that must equal it exactly (`FX_RATE_NOT_TABLE_RATE`, also within 1%), and a non-positive or unreadable one is `BAD_FX`. Foreign units per ONE base unit: base cost = cost / rate. |
-| `receivedDate` | foreign lots | `YYYY-MM-DD`. Required for a lot in a foreign currency (`MISSING_RECEIVED_DATE`, `BAD_DATE`): its rate is looked up as of the END of that day, UTC (`FX_RATES_NOT_SUPPLIED` with no `ims-fx-rates` list, `FX_RATE_MISSING` with no row on or before that day). Informational for a base-currency lot. |
+| `receivedDate` | no | `YYYY-MM-DD`. Required for a lot in a foreign currency (`MISSING_RECEIVED_DATE`, `BAD_DATE`): its rate is looked up as of the END of that day, UTC (`FX_RATES_NOT_SUPPLIED` with no `ims-fx-rates` list, `FX_RATE_MISSING` with no row on or before that day). Informational for a base-currency lot. |
 | `lotRef` | no | Lot reference. Rows of one SKU and warehouse with the same quantity and cost are told apart ONLY by distinct, non-blank references: the same reference twice (spelling, case, spaces and zero-width characters ignored) is refused, and so are such rows when any of them has no reference. |
 
 ### Dataset: suppliers

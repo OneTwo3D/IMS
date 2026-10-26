@@ -190,9 +190,14 @@ test('T11 (DB): createFreightPo and updateFreightPoCosts persist IDENTICAL rows 
   const { db } = await import('@/lib/db')
   const goods = await seedGoodsPo('t11', 4, 10)
   // A freight order is priced at the TABLE rate (no typed rate): seed a GBP->EUR 2 row, the latest one, for this test only.
+  const eurExisted = (await db.currency.findUnique({ where: { code: 'EUR' }, select: { code: true } })) !== null
   await db.currency.upsert({ where: { code: 'EUR' }, update: {}, create: { code: 'EUR', name: 'EUR', symbol: 'EUR' } })
   const eurRate = await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: 2, fetchedAt: new Date(Date.now() - 1000), source: 'manual', manualOverride: true } })
-  t.after(async () => { await db.fxRate.deleteMany({ where: { id: eurRate.id } }) })
+  t.after(async () => {
+    await db.fxRate.deleteMany({ where: { id: eurRate.id } })
+    // leave no installed-application rows behind: the next file's scratch-database guard refuses a database that holds currencies
+    if (!eurExisted) await db.currency.deleteMany({ where: { code: 'EUR' } })
+  })
   const { createFreightPo, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
 
   const input = [{ description: 'odd fx', amountForeign: 0.1309, vatable: true, distributionMethod: 'BY_VALUE' }]
