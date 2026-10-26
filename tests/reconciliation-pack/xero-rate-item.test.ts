@@ -415,13 +415,15 @@ test('A BROKEN LINK IS A FINDING, never a pass: gone payload, no rate, an unusab
     ['invoice with no date', [postedRow(1, 'SALES_INVOICE', { wooOrder: true, date: null })]],
     ['payload gone, the other fields still present', [postedRow(1, 'SALES_INVOICE', { noPayload: true })]],
     ['rate so large that Xero\'s convention rounds to zero', [postedRow(1, 'SALES_INVOICE', { rate: '10000000' })]],
-    ['storefront receipt with no date', [postedRow(1, 'INVOICE_PAYMENT', { wooReceipt: true, orderRate: '1.25', date: null })]],
   ]
   for (const [name, posted] of cases) {
     const item = await runXeroRateItem('R16', context({ invoices: [eur(1, 0.8)] }, { ims: { posted } }).ctx)
     assert.deepEqual([item.outcome, [...item.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], name)
     assert.equal(entries(item, 'onlyVendor').length, 1, name)
   }
+  // A storefront receipt (a payment) with no payment date: its table rule cannot be applied, so it is a finding, not a pass (the rate itself agrees with Xero).
+  const undated = await runXeroRateItem('R16', context({ payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8 })] }, { ims: { posted: [postedRow(1, 'INVOICE_PAYMENT', { wooReceipt: true, orderRate: '1.25', date: null })] } }).ctx)
+  assert.deepEqual([undated.outcome, [...undated.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']])
   // The posted-rates section failing to read is inconclusive, and nothing is requested from Xero first.
   const failing = context({ invoices: [eur(1, 0.8)] }, { ims: { fail: 'posted' } })
   const item = await runXeroRateItem('R16', failing.ctx)
