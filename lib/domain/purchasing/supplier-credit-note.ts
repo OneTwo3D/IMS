@@ -233,6 +233,8 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   amountForeign: number
   transitAccount: string
   taxType: string
+  /** The rate `taxType` was read from; never sent (lib/tax/retired-tax-code-guard.ts binds the code to it). */
+  taxRateId?: string
   date: string
   // audit-v08m: the offset bill's external (Xero) id + the amount to apply, so the
   // post-credit follow-up can allocate the ACCPAYCREDIT to the bill. Omitted (and
@@ -258,6 +260,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         unitAmount: params.amountForeign,
         accountCode: params.transitAccount,
         taxType: params.taxType,
+        taxRateId: params.taxRateId,
       },
     ],
     // Standard/freight: the amount is GROSS (the over-credit cap is the bill's

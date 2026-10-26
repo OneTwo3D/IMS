@@ -243,7 +243,7 @@ async function remapOnly(db: Client) {
     log(`  ${r.name}: ${r.accounting_tax_type ?? '(unset)'} -> ${liveType}`)
     if (!DRY_RUN) {
       await db.query(
-        `update tax_rates set accounting_tax_type = $1, "updatedAt" = now() where name = $2`,
+        `update tax_rates set accounting_tax_type = $1, "updatedAt" = now() where name = $2 and replaced_by_id is null`,
         [liveType, r.name],
       )
     }
@@ -518,7 +518,7 @@ async function remapTaxTypes(db: Client, resolved: Map<string, string>) {
   for (const [name, taxType] of resolved) {
     const r = await db.query(
       `update tax_rates set accounting_tax_type = $1, "updatedAt" = now()
-        where name = $2 and coalesce(accounting_tax_type,'') <> $1`,
+        where name = $2 and replaced_by_id is null and coalesce(accounting_tax_type,'') <> $1`,
       [taxType, name],
     )
     if (r.rowCount) { changed += r.rowCount; log(`remapped tax rate "${name}" -> ${taxType}`) }

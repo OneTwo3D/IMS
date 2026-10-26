@@ -1,5 +1,6 @@
 'use server'
 
+import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
@@ -211,7 +212,11 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
   try {
     const baseCurrency = await getBaseCurrencyCode()
     const normalizedCountry = input.country ? (toIsoCountryCode(input.country) ?? input.country.trim()) : null
-    const s = await db.supplier.create({
+    // A default rate id that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
+    // Resolved INSIDE the write's transaction, holding the row share lock to commit, so a re-key apply cannot commit between the resolution and the insert (lib/tax/writable-tax-rate.ts).
+    const s = await db.$transaction(async (tx) => {
+    const writableTaxRateId = await resolveWritableTaxRateId(tx, input.taxRateId || null)
+    return tx.supplier.create({
       data: {
         name: input.name,
         contactName: input.contactName || null,
@@ -224,7 +229,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
         postcode: input.postcode || null,
         country: normalizedCountry,
         currency: input.currency || baseCurrency,
-        taxRateId: input.taxRateId || null,
+        taxRateId: writableTaxRateId ?? null,
         vatNumber: input.vatNumber || null,
         accountNumber: input.accountNumber || null,
         paymentTermsDays: input.paymentTermsDays ?? null,
@@ -233,6 +238,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
         notes: input.notes || null,
       },
       select: SUPPLIER_SELECT,
+    })
     })
     revalidatePath('/purchase-orders')
     await logActivity({ entityType: 'SUPPLIER', entityId: s.id, tag: 'purchase', action: 'created', description: `Created supplier: ${input.name}` })
@@ -249,7 +255,12 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
     const normalizedCountry = input.country !== undefined
       ? (input.country ? (toIsoCountryCode(input.country) ?? input.country.trim()) : null)
       : undefined
-    const s = await db.supplier.update({
+    // As on create; the rate the supplier already has may stay even if it is inactive (editing other fields must not fail).
+    // Inside the write's transaction, holding the row share lock to commit (lib/tax/writable-tax-rate.ts).
+    const s = await db.$transaction(async (tx) => {
+    const currentTaxRateId = input.taxRateId ? (await tx.supplier.findUnique({ where: { id }, select: { taxRateId: true } }))?.taxRateId : null
+    const writableTaxRateId = input.taxRateId ? await resolveWritableTaxRateId(tx, input.taxRateId, { keep: new Set([currentTaxRateId]) }) : null
+    return tx.supplier.update({
       where: { id },
       data: {
         ...(input.name !== undefined && { name: input.name }),
@@ -263,7 +274,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
         ...(input.postcode !== undefined && { postcode: input.postcode || null }),
         ...(normalizedCountry !== undefined && { country: normalizedCountry }),
         ...(input.currency !== undefined && { currency: input.currency }),
-        ...(input.taxRateId !== undefined && { taxRateId: input.taxRateId || null }),
+        ...(input.taxRateId !== undefined && { taxRateId: writableTaxRateId ?? null }),
         ...(input.vatNumber !== undefined && { vatNumber: input.vatNumber || null }),
         ...(input.accountNumber !== undefined && { accountNumber: input.accountNumber || null }),
         ...(input.paymentTermsDays !== undefined && { paymentTermsDays: input.paymentTermsDays ?? null }),
@@ -273,6 +284,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
         ...(input.active !== undefined && { active: input.active }),
       },
       select: SUPPLIER_SELECT,
+    })
     })
     revalidatePath('/purchase-orders')
     await logActivity({ entityType: 'SUPPLIER', entityId: s.id, tag: 'purchase', action: 'updated', description: `Updated supplier: ${s.name}` })
@@ -375,7 +387,10 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
       try {
         if (existing) {
           if (!preview) {
-            await db.supplier.update({
+            await db.$transaction(async (tx) => {
+            // The matched active rate is re-resolved in the write's transaction (a re-key may have retired it since the lookup).
+            const writableTaxRateId = taxRateId ? await resolveWritableTaxRateId(tx, taxRateId) : null
+            await tx.supplier.update({
               where: { id: existing.id },
               data: {
                 ...(name ? { name } : {}),
@@ -393,15 +408,18 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 ...(r.postcode?.trim() ? { postcode: r.postcode.trim() } : {}),
                 ...(r.country?.trim() ? { country: toIsoCountryCode(r.country.trim()) ?? r.country.trim() } : {}),
                 ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
-                ...(taxRateId ? { taxRateId } : {}),
+                ...(taxRateId ? { taxRateId: writableTaxRateId ?? taxRateId } : {}),
               },
+            })
             })
           }
           if (!preview) updatedSupplierIds.push(existing.id)
           updated++
         } else {
           if (!preview) {
-            const createdSupplier = await db.supplier.create({
+            const createdSupplier = await db.$transaction(async (tx) => {
+            const writableTaxRateId = taxRateId ? await resolveWritableTaxRateId(tx, taxRateId) : null
+            return tx.supplier.create({
               select: { id: true },
               data: {
                 name,
@@ -419,8 +437,9 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
                 postcode: r.postcode?.trim() || null,
                 country: r.country?.trim() ? (toIsoCountryCode(r.country.trim()) ?? r.country.trim()) : null,
                 notes: r.notes?.trim() || null,
-                taxRateId,
+                taxRateId: writableTaxRateId ?? taxRateId,
               },
+            })
             })
             createdSupplierIds.push(createdSupplier.id)
           }

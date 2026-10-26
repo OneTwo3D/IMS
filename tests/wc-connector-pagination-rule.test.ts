@@ -49,26 +49,29 @@ const db = {
   mappings: [] as Row[],
 }
 
-mock.module('@/lib/db', {
-  namedExports: {
-    db: {
-      taxRate: {
-        findFirst: async ({ where }: { where: { name: string } }) =>
-          db.taxRates.find((row) => row.name === where.name) ?? null,
-        create: async ({ data }: { data: Row }) => {
-          const row = { id: `tr-${db.taxRates.length + 1}`, ...data }
-          db.taxRates.push(row)
-          return row
-        },
-      },
-      shoppingTaxRateMapping: {
-        upsert: async ({ create }: { create: Row }) => {
-          db.mappings.push(create)
-          return create
-        },
-      },
+const mockDb = {
+  taxRate: {
+    findFirst: async ({ where }: { where: { name: string } }) =>
+      db.taxRates.find((row) => row.name === where.name) ?? null,
+    // The mapping write resolves its rate id inside a transaction (lib/tax/writable-tax-rate.ts): no row is retired in these tests.
+    findMany: async () => [] as Row[],
+    create: async ({ data }: { data: Row }) => {
+      const row = { id: `tr-${db.taxRates.length + 1}`, ...data }
+      db.taxRates.push(row)
+      return row
     },
   },
+  shoppingTaxRateMapping: {
+    upsert: async ({ create }: { create: Row }) => {
+      db.mappings.push(create)
+      return create
+    },
+  },
+  $transaction: async <T,>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(mockDb),
+}
+
+mock.module('@/lib/db', {
+  namedExports: { db: mockDb },
 })
 
 function reset() {

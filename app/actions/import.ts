@@ -28,7 +28,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { endOfBusinessDateUtc } from '@/lib/currencies/fx-select'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
-import { FxTableBusyError, withFxTableHeldStill } from '@/lib/currencies/fx-table-lock'
+import { FxTableBusyError, FxTableLockLostError, withFxTableHeldStill, type FxTableGuard } from '@/lib/currencies/fx-table-lock'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
@@ -205,6 +205,18 @@ function resolveImportedTaxRateId(
 // ---------------------------------------------------------------------------
 
 const VALID_TYPES = new Set<string>(['SIMPLE', 'VARIABLE', 'VARIANT', 'KIT', 'BOM', 'NON_INVENTORY'])
+
+/**
+ * THE FX TABLE LOCK WAS LOST MID-FILE. The importers write each order on its own connection, so a dead lock connection (PostgreSQL then frees the shared lock) does not stop them by itself.
+ * They check the lock immediately before every write and after the last. Lost before the first write: nothing is written. Lost later: the orders already saved cannot be safely unwound (a
+ * purchase order has no delete, only a cancel that keeps its reference; a sales order's delete is refused once accounting has touched it), so the importer stops, writes no more, and reports
+ * precisely which orders were saved and how many groups were not written, under the code FX_TABLE_LOCK_LOST. Re-importing the same file skips the saved orders as duplicates.
+ */
+function fxLockLostMessage(kind: string, saved: string[], notWritten: number): string {
+  if (saved.length === 0) return `FX_TABLE_LOCK_LOST: the exchange-rate table was no longer held still before the first write; the file was refused as a whole and no ${kind} was written.`
+  return `FX_TABLE_LOCK_LOST: the exchange-rate table stopped being held still after ${saved.length} ${kind}(s) were saved (${saved.join(', ')}); ${notWritten} further group(s) were NOT written. `
+    + 'Those saved were created under the rate checked at the start and are valid; re-import the file to add the rest (saved ones are skipped as duplicates).'
+}
 
 async function runWithConcurrency<T>(
   items: T[],
@@ -1642,7 +1654,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
   // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
   // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
   try {
-    return await withFxTableHeldStill(() => importSalesOrdersCsvLocked(formData))
+    return await withFxTableHeldStill((guard) => importSalesOrdersCsvLocked(formData, guard))
   } catch (error) {
     if (error instanceof FxTableBusyError) {
       const result = { created: 0, updated: 0, skipped: 0, errors: [error.message] }
@@ -1654,7 +1666,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
   }
 }
 
-async function importSalesOrdersCsvLocked(formData: FormData): Promise<CsvImportActionResult> {
+async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGuard): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'sales.create')
@@ -1842,7 +1854,10 @@ async function importSalesOrdersCsvLocked(formData: FormData): Promise<CsvImport
   const salesFileRefused = salesFxErrors.length > 0
   if (salesFileRefused) result.errors.push(...salesFxErrors, 'The file was refused as a whole because of the FX errors above: no sales order was written.')
 
-  for (const [groupKey, g] of groups.entries()) {
+  const savedSalesOrders: string[] = []
+  let salesLockLost = false
+  const salesGroups = [...groups.entries()]
+  for (const [groupIndex, [groupKey, g]] of salesGroups.entries()) {
     if (salesFileRefused) {
       result.skipped += g.lines.length
       continue
@@ -1857,8 +1872,11 @@ async function importSalesOrdersCsvLocked(formData: FormData): Promise<CsvImport
       result.skipped += g.lines.length
       continue
     }
+    let currentSaved = false
     try {
       if (!preview) {
+        // The lock is checked IMMEDIATELY before every write (a dead lock connection frees the lock; the writes below use other connections).
+        fxGuard.assertHeld('writing a sales order')
         const created = await createSalesOrder({
           externalOrderNumber: importKey,
           customerName: g.customerName,
@@ -1881,13 +1899,31 @@ async function importSalesOrdersCsvLocked(formData: FormData): Promise<CsvImport
         if (!created.success || !created.order) {
           throw new Error(created.error || 'Failed to create sales order')
         }
+        savedSalesOrders.push(importKey ?? created.order.id)
+        currentSaved = true
         await autoAllocateOrder(created.order.id)
       }
       result.created += g.lines.length
       if (importKey) existingSalesOrderKeys.add(importKey)
     } catch (e: unknown) {
+      if (!preview && (e instanceof FxTableLockLostError || fxGuard.lost)) {
+        // A guard failure after the lock died is the lock's fault, not the group's: stop, write nothing more, report exactly what was saved.
+        salesLockLost = true
+        const firstUnwritten = groupIndex + (currentSaved ? 1 : 0)
+        if (currentSaved) result.created += g.lines.length
+        result.errors.push(fxLockLostMessage('sales order', savedSalesOrders, salesGroups.length - firstUnwritten))
+        for (const [, rest] of salesGroups.slice(firstUnwritten)) result.skipped += rest.lines.length
+        break
+      }
       result.errors.push(String(e))
       result.skipped += g.lines.length
+    }
+  }
+  if (!preview && !salesLockLost && !salesFileRefused) {
+    // and once more after the last write: a lock lost during the final order is reported, never silently accepted.
+    try { fxGuard.assertHeld('finishing the sales order import') } catch (e) {
+      if (!(e instanceof FxTableLockLostError)) throw e
+      result.errors.push(fxLockLostMessage('sales order', savedSalesOrders, 0))
     }
   }
 
@@ -1913,7 +1949,7 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
   // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
   // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
   try {
-    return await withFxTableHeldStill(() => importPurchaseOrdersCsvLocked(formData, system))
+    return await withFxTableHeldStill((guard) => importPurchaseOrdersCsvLocked(formData, guard, system))
   } catch (error) {
     if (error instanceof FxTableBusyError) {
       const result = { created: 0, updated: 0, skipped: 0, errors: [error.message] }
@@ -1925,7 +1961,7 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
   }
 }
 
-async function importPurchaseOrdersCsvLocked(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+async function importPurchaseOrdersCsvLocked(formData: FormData, fxGuard: FxTableGuard, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'purchasing.create', system)
@@ -2120,7 +2156,10 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, system?: System
   const poFileRefused = poFxErrors.length > 0
   if (poFileRefused) result.errors.push(...poFxErrors, 'The file was refused as a whole because of the FX errors above: no purchase order was written.')
 
-  for (const [groupKey, g] of groups.entries()) {
+  const savedPurchaseOrders: string[] = []
+  let poLockLost = false
+  const poGroups = [...groups.entries()]
+  for (const [groupIndex, [groupKey, g]] of poGroups.entries()) {
     if (poFileRefused) {
       result.skipped += g.lines.length
       continue
@@ -2138,6 +2177,8 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, system?: System
     try {
       const fxAsOf = poFxRates.get(groupKey)?.asOf
       if (!preview) {
+        // The lock is checked IMMEDIATELY before every write (a dead lock connection frees the lock; the writes below use other connections).
+        fxGuard.assertHeld('writing a purchase order')
         const created = await createPurchaseOrder({
           reference: importKey,
           supplierId: g.supplierId,
@@ -2161,12 +2202,27 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, system?: System
           throw new Error(created.error || 'Failed to create purchase order')
         }
         createdPurchaseOrderIds.push(created.po.id)
+        savedPurchaseOrders.push(importKey ?? created.po.id)
       }
       result.created += g.lines.length
       if (importKey) existingPoRefs.add(importKey)
     } catch (e: unknown) {
+      if (!preview && (e instanceof FxTableLockLostError || fxGuard.lost)) {
+        // A guard failure after the lock died is the lock's fault, not the group's: stop, write nothing more, report exactly what was saved.
+        poLockLost = true
+        result.errors.push(fxLockLostMessage('purchase order', savedPurchaseOrders, poGroups.length - groupIndex))
+        for (const [, rest] of poGroups.slice(groupIndex)) result.skipped += rest.lines.length
+        break
+      }
       result.errors.push(String(e))
       result.skipped += g.lines.length
+    }
+  }
+  if (!preview && !poLockLost && !poFileRefused) {
+    // and once more after the last write: a lock lost during the final order is reported, never silently accepted.
+    try { fxGuard.assertHeld('finishing the purchase order import') } catch (e) {
+      if (!(e instanceof FxTableLockLostError)) throw e
+      result.errors.push(fxLockLostMessage('purchase order', savedPurchaseOrders, 0))
     }
   }
 

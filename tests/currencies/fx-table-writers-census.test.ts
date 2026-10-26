@@ -42,5 +42,10 @@ test('every fx_rates writer in app/ and lib/ writes through the exclusive lock',
   assert.match(readFileSync('app/actions/company.ts', 'utf8'), /withFxTableWriteLock\(\(tx\) => tx\.organisation\.updateMany/)
   // both importers hold the table still
   const imp = readFileSync('app/actions/import.ts', 'utf8')
-  assert.equal((imp.match(/withFxTableHeldStill\(\(\) => import(Sales|Purchase)OrdersCsvLocked/g) ?? []).length, 2)
+  assert.equal((imp.match(/withFxTableHeldStill\(\(guard\) => import(Sales|Purchase)OrdersCsvLocked\(formData, guard/g) ?? []).length, 2)
+  // and each checks the lock is STILL held immediately before every order write and once after the last (a dead lock connection frees the lock). [mutation: delete an assertHeld call]
+  for (const kind of ['sales order', 'purchase order']) {
+    assert.equal((imp.match(new RegExp(`fxGuard\\.assertHeld\\('writing a ${kind}'\\)\\n\\s+const created = await create`, 'g')) ?? []).length, 1, `${kind}: guard right before the write`)
+    assert.equal((imp.match(new RegExp(`fxGuard\\.assertHeld\\('finishing the ${kind} import'\\)`, 'g')) ?? []).length, 1, `${kind}: guard after the last write`)
+  }
 })

@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { FX_TABLE_LOCK_KEY } from '@/lib/db/advisory-locks'
-import { acquirePinnedSharedAdvisoryLockWaiting, AdvisoryLockWaitTimeoutError } from '@/lib/db/pinned-advisory-lock'
+import { acquirePinnedSharedAdvisoryLockWaiting, AdvisoryLockLostError, AdvisoryLockWaitTimeoutError } from '@/lib/db/pinned-advisory-lock'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 /**
@@ -16,6 +16,11 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * WHY THIS IS NOT A TRANSACTION AROUND THE IMPORT. The importers create each order through actions that run their own transactions on pooled connections; a wrapping transaction could not hold
  * them, and a long open transaction would pin a connection and its snapshot for the length of the file. A session-level SHARED advisory lock on a pinned connection (the same primitive the
  * accounting batches use, exclusive there) holds only a lock, not a snapshot. A writer waits for the import to finish; the importer waits up to IMPORT_WAIT_MS for a running writer.
+ *
+ * A DEAD LOCK CONNECTION. PostgreSQL frees a session lock the instant its connection dies, while the importer keeps writing on other connections. The importers therefore call guard.assertHeld before
+ * EVERY order write and once after the last. Lost before the first write: the file is refused, nothing written. Lost later: KNOWN LIMIT, the orders already saved stay saved (a purchase order has no
+ * delete, only a cancel that keeps its reference; a sales order's delete is refused once accounting has touched it, so a compensating delete cannot be guaranteed); the importer writes no more and
+ * reports exactly which orders were saved and how many groups were not written, code FX_TABLE_LOCK_LOST. Re-importing the same file skips the saved orders as duplicates.
  */
 const IMPORT_WAIT_MS = 30_000
 
@@ -33,8 +38,28 @@ export class FxTableBusyError extends Error {
   }
 }
 
-/** Run `work` with the rate table held still (shared). Released in a finally. */
-export async function withFxTableHeldStill<T>(work: () => Promise<T>): Promise<T> {
+/** What the held-still lock offers its work: a check that the lock is STILL held. */
+export type FxTableGuard = {
+  /** True once the pinned connection has failed: PostgreSQL has released the lock and a rate writer may already have run. */
+  readonly lost: boolean
+  /** Throws FxTableLockLostError if the lock has been lost. Call immediately before EACH write and once more after the last. */
+  assertHeld: (context?: string) => void
+}
+
+/** The shared lock was lost mid-import (its pinned connection died). Importers stop writing and report precisely what was saved: code FX_TABLE_LOCK_LOST. */
+export class FxTableLockLostError extends Error {
+  readonly code = 'FX_TABLE_LOCK_LOST'
+  constructor(detail?: string) {
+    super(`FX_TABLE_LOCK_LOST: the exchange-rate table was no longer held still${detail ? ` (${detail})` : ''}; the import stopped writing.`)
+    this.name = 'FxTableLockLostError'
+  }
+}
+
+/**
+ * Run `work` with the rate table held still (shared). Released in a finally. `work` receives a guard and MUST call guard.assertHeld before each write: if the pinned connection dies PostgreSQL
+ * frees the lock at once, a writer can change fx_rates, and the importer (which writes on other connections) would otherwise carry on and leave the file partly imported.
+ */
+export async function withFxTableHeldStill<T>(work: (guard: FxTableGuard) => Promise<T>): Promise<T> {
   let lock
   try {
     lock = await acquirePinnedSharedAdvisoryLockWaiting(FX_TABLE_LOCK_KEY, { timeoutMs: IMPORT_WAIT_MS })
@@ -42,9 +67,21 @@ export async function withFxTableHeldStill<T>(work: () => Promise<T>): Promise<T
     if (error instanceof AdvisoryLockWaitTimeoutError) throw new FxTableBusyError()
     throw error
   }
+  const held = lock
+  const guard: FxTableGuard = {
+    get lost() { return held.lost },
+    assertHeld(context?: string) {
+      try {
+        held.assertHeld(context)
+      } catch (error) {
+        if (error instanceof AdvisoryLockLostError) throw new FxTableLockLostError(context)
+        throw error
+      }
+    },
+  }
   try {
-    return await work()
+    return await work(guard)
   } finally {
-    await lock.release()
+    await held.release()
   }
 }

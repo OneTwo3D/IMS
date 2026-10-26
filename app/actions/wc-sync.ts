@@ -1,5 +1,6 @@
 'use server'
 
+import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -718,14 +719,18 @@ export async function updateShoppingTaxRateMapping(
   taxRateId: string,
 ): Promise<{ success: boolean }> {
   await requireSyncPermission()
-  await db.shoppingTaxRateMapping.update({
+  // A rate a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
+  await db.$transaction(async (tx) => {
+  const writableTaxRateId = (await resolveWritableTaxRateId(tx, taxRateId)) ?? taxRateId
+  await tx.shoppingTaxRateMapping.update({
     where: {
       connector_externalTaxRateId: {
         connector: 'woocommerce',
         externalTaxRateId,
       },
     },
-    data: { taxRateId },
+    data: { taxRateId: writableTaxRateId },
+  })
   })
   revalidatePath('/sync')
   return { success: true }

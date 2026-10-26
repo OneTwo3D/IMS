@@ -23,6 +23,7 @@
  */
 import { Client } from 'pg'
 import { randomUUID } from 'node:crypto'
+import { XERO_BUILT_IN_TAX_TYPES } from '../lib/tax/xero-built-in-tax-types.ts'
 
 const DRY_RUN = process.argv.includes('--dry-run')
 
@@ -42,12 +43,6 @@ function arg(flag: string): string | undefined {
  * OUTPUT2, whose Xero name is "20% (VAT on Income)"). So without this, any rate mapped to a
  * built-in arrives with a NULL tax type and posts to Xero with no TaxType at all (o3d-6ec).
  */
-const XERO_BUILT_IN_TAX_TYPES = new Set([
-  'OUTPUT', 'OUTPUT2', 'INPUT', 'INPUT2', 'RRINPUT', 'RROUTPUT',
-  'ZERORATEDOUTPUT', 'ZERORATEDINPUT', 'EXEMPTOUTPUT', 'EXEMPTINPUT',
-  'NONE', 'GSTONIMPORTS', 'REVERSECHARGES',
-  'ECZROUTPUT', 'ECZRINPUT', 'ECOUTPUT', 'ECINPUT', 'ECACQUISITIONS',
-])
 
 type Rate = {
   id: string
@@ -118,7 +113,9 @@ async function main() {
              -- coalesce, never clobber: a CUSTOM id already resolved here by --remap-only is
              -- correct for THIS org, and must not be overwritten with the source's (or null).
              accounting_tax_type = coalesce(excluded.accounting_tax_type, tax_rates.accounting_tax_type),
-             "updatedAt" = now()`,
+             "updatedAt" = now()
+           -- a rate a tax re-key replaced is read-only (lib/tax/tax-rate-replaced.ts)
+           where tax_rates.replaced_by_id is null`,
           [id, r.name, r.rate, r.type, r.countryCode, r.active, r.isDefault, r.usedFor,
            r.taxCategory, r.is_compound, r.reverse_charge, r.reporting_category,
            builtInTaxType(r.accounting_tax_type)],
