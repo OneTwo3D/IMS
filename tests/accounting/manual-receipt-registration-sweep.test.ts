@@ -19,6 +19,13 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidate
 mock.module('@/lib/shopping', { namedExports: { enqueueStockSync: async () => {} } })
 mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 
+mock.module('@/lib/cron-auth', { namedExports: { verifyCron: async () => null } })
+mock.module('@/lib/cron-rate-limit', { namedExports: { enforceCronRateLimit: async () => null } })
+mock.module('@/lib/maintenance-mode', { namedExports: { getMaintenanceModeResponse: async () => null } })
+let refreshMode: 'ok' | 'throw' = 'ok'
+let wcRetryMode: 'ok' | 'throw' = 'ok'
+mock.module('@/lib/currencies/fx-refresh', { namedExports: { fetchAllFxRatesInternal: async () => { if (refreshMode === 'throw') throw new Error('fx source down'); return { updated: 0 } } } })
+
 const calls: Array<{ paymentId: string; orderId: string }> = []
 let mode: 'fail' | 'record' = 'fail'
 let s: Scratch
@@ -26,6 +33,10 @@ let seq = 0
 
 before(async () => {
   s = await startScratch('ims-manual-receipt-sweep')
+  const actualImport = await import('@/lib/connectors/woocommerce/sync/order-import')
+  mock.module('@/lib/connectors/woocommerce/sync/order-import', {
+    namedExports: { ...actualImport, retryPendingWcOrdersWaitingForFx: async (...a: Parameters<typeof actualImport.retryPendingWcOrdersWaitingForFx>) => { if (wcRetryMode === 'throw') throw new Error('wc import threw on every retry'); return actualImport.retryPendingWcOrdersWaitingForFx(...a) } },
+  })
   const actual = await import('@/lib/domain/accounting/invoice-payment-enqueue')
   mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
     namedExports: {
@@ -198,6 +209,34 @@ test('a follow-up marker left on a SUPERSEDED invoice does not hide a later rece
   assert.ok(seen.includes(stale.id), 'a stale marker on the superseded invoice A must not exclude the order')
   assert.ok(!seen.includes(owing.id), 'the current invoice still owes its follow-ups: left to that pass')
   assert.ok(!seen.includes(midRepost.id), 'a re-post whose back-reference is not written yet still owes its follow-ups')
+})
+
+// [mutation: restore ONE shared error boundary around the Woo retry and the sweep (a throwing retry then skips the sweep); drop the per-step failure report (the response stays 200 with no stepFailures)]
+test('the fx-rates cron runs each step in its own boundary: a throwing Woo retry (or FX refresh) still lets the sweep register an unresolved manual receipt, and the failure is reported', async () => {
+  const { GET } = await import('@/app/api/cron/fx-rates/route')
+  const { receiptRegistrationSeams } = await import('@/lib/domain/accounting/receipt-registration-sweep')
+  const order = await postedOrder()
+  const orphan = await s.db.payment.create({ data: { orderId: order.id, amount: 11, currency: 'GBP', method: 'Hand' } })
+  await age(orphan.id, 90)
+  receiptRegistrationSeams.registrationsAreOwed = async () => true
+  receiptRegistrationSeams.obligationIsOnRecord = async (o, pid) => (await rowsFor(o, pid)) > 0
+  mode = 'record'
+  wcRetryMode = 'throw'
+  refreshMode = 'throw'
+  try {
+    const res = await GET(new Request('http://localhost/api/cron/fx-rates'))
+    const body = await res.json() as { stepFailures?: Array<{ step: string }> }
+    assert.equal(await rowsFor(order.id, orphan.id), 1, 'the sweep ran and registered the receipt although the refresh and the Woo retry threw')
+    assert.deepEqual((body.stepFailures ?? []).map((f) => f.step).sort(), ['fx-refresh', 'wc-receipt-retry'])
+    assert.equal(res.status, 500, 'the failure surfaces in the route status')
+  } finally {
+    wcRetryMode = 'ok'
+    refreshMode = 'ok'
+    receiptRegistrationSeams.registrationsAreOwed = undefined
+    receiptRegistrationSeams.obligationIsOnRecord = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptObligationIsOnRecord
+  }
+  const clean = await GET(new Request('http://localhost/api/cron/fx-rates'))
+  assert.equal(clean.status, 200, 'no failing step: 200')
 })
 
 // [mutation: apply the limit before the "no record" filter (drop the INVOICE_PAYMENT anti-join)]

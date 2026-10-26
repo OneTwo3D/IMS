@@ -14,10 +14,15 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 const registrations: Array<Record<string, unknown>> = []
 mock.module('@/lib/domain/accounting/invoice-payment-enqueue', { namedExports: { registerInvoicePaymentWithLedger: async (p: Record<string, unknown>) => { registrations.push(p); return null } } })
 
+let badWcOrderId: number | null = null
 let s: Scratch
 let seq = 0
 before(async () => {
   s = await startScratch('ims-wc-paid-transition')
+  const actualWithdrawal = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+  mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
+    namedExports: { ...actualWithdrawal, importWcOrderGuarded: async (...a: Parameters<typeof actualWithdrawal.importWcOrderGuarded>) => { if (badWcOrderId !== null && (a[0] as { id: number }).id === badWcOrderId) throw new Error('import blew up for this row'); return actualWithdrawal.importWcOrderGuarded(...a) } },
+  })
   await s.sql('truncate fx_rates')
   await s.db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.10', fetchedAt: new Date('2026-10-01T06:00:00Z') } })
 })
@@ -439,4 +444,25 @@ test('order created Oct 1 (no creation instant in the paid payload), imported un
   const unknownSameDay = await heldOrder({ externalCreatedAt: null })
   await noDate(unknownSameDay, '2026-10-01T11:00:00')
   assert.equal(Number((await payments(unknownSameDay.id))[0]!.settlementRateToBase), 1.1, 'the central rate on Oct 1 happens to be the same feed row (1.10): proves a lookup, not an assumption')
+})
+
+// [mutation: remove the per-row catch from retryPendingWcOrdersWaitingForFx (the throw escapes and the good row behind it is never attempted); drop the finally stamp (the bad row stays at the head)]
+test('the pending-FX retry survives a row that throws: it is counted failed, rotated to the back, and the good row is still processed', async () => {
+  const oi = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const bad = await heldOrder()
+  const good = await heldOrder()
+  registrations.length = 0
+  const mk = (wcId: number) => s.db.shoppingSyncLog.create({ data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', status: 'PENDING', entityType: 'SalesOrder', externalId: String(wcId), payload: { reason: 'missing_fx_rate', connector: 'woocommerce', externalOrderId: String(wcId), externalOrderNumber: String(wcId), currency: 'EUR', asOf: null, order: payload(wcId, '2026-10-01T10:00:00') } } })
+  const badLog = await mk(bad.wcId)
+  const goodLog = await mk(good.wcId)
+  await s.sql(`update shopping_sync_logs set "createdAt" = now() - interval '2 hours' where id = $1`, [badLog.id]) // the bad row is at the head
+  badWcOrderId = bad.wcId
+  try {
+    const r = await oi.retryPendingWcOrdersWaitingForFx(250)
+    assert.equal(r.failed >= 1, true, 'the throwing row is counted')
+    assert.equal((await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: goodLog.id } })).status, 'SYNCED', 'the good row behind it was processed')
+    const stamped = await s.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: badLog.id } })
+    assert.equal(stamped.status, 'PENDING')
+    assert.ok(stamped.syncedAt, 'the bad row is stamped, so it rotates behind the others')
+  } finally { badWcOrderId = null }
 })

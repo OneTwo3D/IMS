@@ -3236,7 +3236,11 @@ export async function retryPendingWcOrdersWaitingForFx(
       } else {
         result.failed++
       }
-  
+    } catch (error) {
+      // ONE BAD ROW MUST NOT STOP THE BATCH (or the cron steps after it): count it, log it, go on. The stamp below still moves it behind the others.
+      result.failed++
+      console.error(`[wc-fx-retry] pending row ${row.id} threw: ${String(error).slice(0, 240)}`)
+      await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'wc_order_fx_pending_retry_row_failed', level: 'WARNING', description: `A pending WooCommerce order row threw during the FX retry and was rotated to the back: ${String(error).slice(0, 240)}`, metadata: { syncLogId: row.id }, resolveUser: false }).catch(() => undefined)
     } finally {
       // stamp the attempt on a row that is still PENDING (a row that was retired or failed is not rotated)
       try { await db.shoppingSyncLog.updateMany({ where: { id: row.id, status: 'PENDING' }, data: { syncedAt: new Date() } }) } catch { /* a missed stamp only delays the rotation */ }
