@@ -219,6 +219,17 @@ after(async () => {
 
 const ours = <T extends { name: string }>(plan: { rows: T[] }) => plan.rows.filter((r) => r.name.startsWith(TAG))
 const byName = (plan: { rows: Array<{ name: string; outcome: string }> }) => Object.fromEntries(ours(plan).map((r) => [r.name.slice(TAG.length), r.outcome]))
+/** The apply started during a writer's transaction waits for its locks, then plans from the committed state: either it applies, or the digest no longer matches and it refuses having written nothing; the operator previews again. Consistency is what matters either way. */
+async function applyThroughRace(d: Deps, digest: string): Promise<{ firstRefusal: string | null }> {
+  const first = await d.rekey.runTaxRekey({ apply: true, confirm: digest, allowUnposted: true })
+  if (first.wrote) return { firstRefusal: null }
+  assert.equal(first.refusal?.code, 'DIGEST_MISMATCH', 'the only acceptable refusal of a race is the digest (nothing written)')
+  const again = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(again.digest)
+  const second = await d.rekey.runTaxRekey({ apply: true, confirm: again.digest, allowUnposted: true })
+  assert.equal(second.wrote, true)
+  return { firstRefusal: 'DIGEST_MISMATCH' }
+}
 const WOO = { async get(): Promise<{ ok: true; status: number; total: string; totalPages: string; body: unknown[] }> { return { ok: true, status: 200, total: '0', totalPages: '1', body: [] } } }
 
 // [mutation: a write (an updateMany of an owned rate) added to readRekeyPlan -> the digest arm fails]
@@ -648,10 +659,10 @@ test('WRITERS AFTER THE APPLY: a supplied id of a retired rate resolves to its r
     created.orders.push(o.id)
   })
   await new Promise((resolve) => setTimeout(resolve, 250))
-  const racing = await d.rekey.runTaxRekey({ apply: true, confirm: preview2.digest, allowUnposted: true })
+  const racing = applyThroughRace(d, preview2.digest)
   await writer
-  // The apply waited for the writer's commit (the row UPDATE conflicts with the writer's share lock), then re-pointed the order the writer created; it is never left on the retired row.
-  assert.deepEqual([racing.refusal, racing.wrote], [null, true])
+  // The apply waited for the writer's commit (its row lock conflicts with the writer's share lock), then planned from / re-pointed the order the writer created; it is never left on the retired row.
+  await racing
   const newGr2 = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}GR VAT`, active: true } })).id
   assert.equal((await db.salesOrderLine.findFirstOrThrow({ where: { orderId: lateOrder } })).taxRateId, newGr2, 'the order created during the apply is on the replacement')
   assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w2.ids.gr } })).active, false)
@@ -675,9 +686,9 @@ test('A SUPPLIER WRITE concurrent with the apply ends on the new rate (the apply
     await tx.supplier.update({ where: { id: supplier.id }, data: { taxRateId: writable } })
   })
   await new Promise((resolve) => setTimeout(resolve, 250))
-  const applied = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  const applied = applyThroughRace(d, preview.digest)
   await supplierWrite
-  assert.deepEqual([applied.refusal, applied.wrote], [null, true])
+  await applied
   const newGr = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}GR VAT`, active: true } })).id
   assert.equal((await db.supplier.findUniqueOrThrow({ where: { id: supplier.id } })).taxRateId, newGr, 'the supplier written during the apply ends on the new rate')
 })
@@ -701,9 +712,63 @@ test('A REFUND created concurrently with the apply ends with its snapshot on the
     return { lineId: r.lines[0]!.id, read }
   })
   await new Promise((resolve) => setTimeout(resolve, 250))
-  const applied = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  const applied = applyThroughRace(d, preview.digest)
   const refund = await refundWrite
+  await applied
   assert.equal(refund.read, code('A'), 'the refund read GR VAT\'s old code before the apply committed')
-  assert.deepEqual([applied.refusal, applied.wrote], [null, true])
   assert.equal((await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id: refund.lineId } })).accountingTaxType, code('D'), 'the refund snapshot committed during the apply was migrated to the new code')
+})
+
+// [mutation: the editor lock removed -> the race arm: the apply plans from the pre-edit row and the edit lands unlocked; mutation: the apply's FOR NO KEY UPDATE locks removed -> the arm gets DOCUMENT_CREATED_DURING_APPLY (the post-deactivation backstop) instead of the digest refusal]
+test('AN EDITOR changing a rate concurrently with the apply: the apply refuses on the digest (nothing copied from a row being edited); a replaced row is read-only afterwards', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { lockTaxRateForEdit, TaxRateReplacedError } = await import('../../lib/tax/tax-rate-replaced.ts')
+  const { resolveWritableTaxRateId } = await import('../../lib/tax/writable-tax-rate.ts')
+  const { createAccountingSyncLogRow } = await import('../../lib/domain/accounting/sync-log-row.ts')
+  const { RetiredTaxCodeInPayloadError } = await import('../../lib/tax/retired-tax-code-guard.ts')
+  const { db } = d
+  const w = await seedWorld(d)
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+
+  // The editor's shape (updateTaxRate): lock the row first, pause, change CY VAT 19% -> 20% (the rate and its component), commit.
+  const edit = db.$transaction(async (tx) => {
+    await lockTaxRateForEdit(tx, w.ids.cy, { rate: 0.2 })
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    await tx.taxRate.update({ where: { id: w.ids.cy }, data: { rate: '0.2000' } })
+    await tx.taxRateComponent.updateMany({ where: { taxRateId: w.ids.cy }, data: { rate: '0.2000' } })
+  })
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  const before = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  await edit
+  assert.deepEqual([before.refusal?.code, before.wrote], ['DIGEST_MISMATCH', false], 'the apply waited for the editor, planned from the edited row and refused: no replacement was built from a row being edited')
+  assert.equal((await db.taxRate.count({ where: { name: `${TAG}CY VAT`, active: true } })), 1, 'no replacement exists')
+
+  // The next preview shows 20% against live 19%: PERCENTAGE_DIFFERS, nothing re-keyed for CY VAT.
+  const replan = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  assert.equal(replan.rows.find((r) => r.imsRateId === w.ids.cy)!.outcome, 'PERCENTAGE_DIFFERS')
+
+  // Put CY VAT back and apply for real.
+  await db.taxRate.update({ where: { id: w.ids.cy }, data: { rate: '0.1900' } })
+  await db.taxRateComponent.updateMany({ where: { taxRateId: w.ids.cy }, data: { rate: '0.1900' } })
+  const p2 = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(p2.digest)
+  assert.equal((await d.rekey.runTaxRekey({ apply: true, confirm: p2.digest, allowUnposted: true })).wrote, true)
+
+  // A replaced row is read-only: reactivating it, or changing its code / percentage / components, is refused; switching it off is not.
+  for (const edit2 of [{ active: true }, { rate: 0.2 }, { accountingTaxType: 'TAX005' }, { components: [] }]) {
+    await assert.rejects(db.$transaction((tx) => lockTaxRateForEdit(tx, w.ids.cy, edit2)), TaxRateReplacedError, JSON.stringify(edit2))
+  }
+  await db.$transaction((tx) => lockTaxRateForEdit(tx, w.ids.cy, { active: false }))
+
+  // Even if something bypassed the editor and reactivated BE VAT's old row, it neither counts as a carrier of its old code nor is used by a writer.
+  const newBe = (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}BE VAT`, active: true, NOT: { id: w.ids.be } } })).id
+  await db.taxRate.update({ where: { id: w.ids.be }, data: { active: true } })
+  await assert.rejects(
+    createAccountingSyncLogRow(db as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: w.soDraftCy.id, payload: { lines: [{ taxType: code('OLD1') }] } as never }),
+    (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code',
+    'the reactivated retired row does not make its old code legitimate',
+  )
+  assert.equal(await resolveWritableTaxRateId(db, w.ids.be), newBe, 'a writer resolves the reactivated retired row to its replacement')
 })

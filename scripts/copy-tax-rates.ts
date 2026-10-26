@@ -113,7 +113,9 @@ async function main() {
              -- coalesce, never clobber: a CUSTOM id already resolved here by --remap-only is
              -- correct for THIS org, and must not be overwritten with the source's (or null).
              accounting_tax_type = coalesce(excluded.accounting_tax_type, tax_rates.accounting_tax_type),
-             "updatedAt" = now()`,
+             "updatedAt" = now()
+           -- a rate a tax re-key replaced is read-only (lib/tax/tax-rate-replaced.ts)
+           where tax_rates.replaced_by_id is null`,
           [id, r.name, r.rate, r.type, r.countryCode, r.active, r.isDefault, r.usedFor,
            r.taxCategory, r.is_compound, r.reverse_charge, r.reporting_category,
            builtInTaxType(r.accounting_tax_type)],

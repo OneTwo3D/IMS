@@ -68,14 +68,16 @@ export async function resolveWritableTaxRateIds(client: unknown, ids: readonly (
   for (const id of wanted) {
     let row = known.get(id)
     if (row === undefined) continue
-    if (row.active) { result.set(id, id); continue }
+    // A row a re-key replaced is never used as it stands, active flag or not (a reactivated one still means the other organisation's rate): it resolves to its replacement.
+    const usable = (r: Row | undefined): boolean => r !== undefined && r.active && r.replacedById === null
+    if (usable(row)) { result.set(id, id); continue }
     let hops = 0
-    while (row !== undefined && !row.active && row.replacedById !== null && hops < MAX_HOPS) {
+    while (row !== undefined && !usable(row) && row.replacedById !== null && hops < MAX_HOPS) {
       await load([row.replacedById])
       row = known.get(row.replacedById)
       hops += 1
     }
-    if (row !== undefined && row.active && hops > 0) { result.set(id, row.id); continue }
+    if (row !== undefined && usable(row) && hops > 0) { result.set(id, row.id); continue }
     if (hops > 0) { if (options.lenient) { result.set(id, id); continue } throw new TaxRateNotUsableError('TAX_RATE_REPLACEMENT_MISSING', id) }
     if (options.keep?.has(id) || options.lenient) { result.set(id, id); continue }
     throw new TaxRateNotUsableError('TAX_RATE_INACTIVE', id)

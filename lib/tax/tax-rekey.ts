@@ -506,7 +506,7 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
   for (const row of plan.rows) {
     if (row.outcome !== 'REKEY') continue
     const old = await tx.taxRate.findUnique({ where: { id: row.imsRateId }, include: { components: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } })
-    if (old === null || !old.active || old.accountingTaxType !== row.currentCode) throw new Error(`rate ${row.imsRateId} changed since the plan was built`)
+    if (old === null || !old.active || old.accountingTaxType !== row.currentCode || !old.rate.mul(100).equals(new Dec(row.imsPercent))) throw new Error(`rate ${row.imsRateId} changed since the plan was built`)
     const toCode = row.target!.taxType
     const fresh = await tx.taxRate.create({
       data: {
@@ -520,6 +520,11 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     })
     const deactivated = await tx.taxRate.updateMany({ where: { id: old.id, active: true, accountingTaxType: row.currentCode }, data: { active: false, isDefault: false, replacedById: fresh.id } })
     if (deactivated.count !== 1) throw new Error(`rate ${row.imsRateId} could not be deactivated`)
+    // Belt and braces behind the row locks the apply holds: the row as it stands after the deactivation (which waits for anything still holding the row) must be what was copied.
+    const after = await tx.taxRate.findUniqueOrThrow({ where: { id: old.id }, include: { components: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } })
+    const sameMeaning = after.rate.equals(old.rate) && after.name === old.name && after.usedFor === old.usedFor && after.countryCode === old.countryCode && after.isCompound === old.isCompound && after.reverseCharge === old.reverseCharge
+      && after.reportingCategory === old.reportingCategory && after.components.length === old.components.length && after.components.every((c, i) => c.rate.equals(old.components[i]!.rate) && c.compoundOnPrevious === old.components[i]!.compoundOnPrevious && c.active === old.components[i]!.active)
+    if (!sameMeaning) throw new RekeyDocumentRaceError(row.imsRateId)
     // The UPDATE above waited for every writer that holds a share lock on the old row (lib/tax/writable-tax-rate.ts). A document such a writer committed meanwhile references the old row:
     // without the flag that is a source the plan did not count, so the apply stops (and rolls back); with it, the re-pointing below picks it up.
     if (!options.allowUnposted) {
@@ -672,6 +677,11 @@ export async function runTaxRekey(options: TaxRekeyRunOptions): Promise<TaxRekey
   let fenced: Awaited<ReturnType<typeof withXeroConnectionFence<{ refusal: RekeyRefusal | null; plan: RekeyPlan | null; written: RekeyWriteResult | null }>>>
   try {
   fenced = await withXeroConnectionFence(connection, async (tx) => {
+    // Lock EVERY active rate and component row the plan reads and copies from, BEFORE the plan is built (FOR NO KEY UPDATE: an editor's UPDATE and its own lock wait, a document's foreign-key
+    // check does not), so the plan the digest binds is the plan of rows nobody can change until commit: an editor that held the lock first has committed (the digest then differs from the
+    // operator's and the apply refuses), and one that arrives later waits and finds the row replaced (lib/tax/tax-rate-replaced.ts).
+    await tx.$queryRaw`SELECT id FROM tax_rates WHERE active ORDER BY id FOR NO KEY UPDATE`
+    await tx.$queryRaw`SELECT c.id FROM tax_rate_components c JOIN tax_rates t ON t.id = c.tax_rate_id WHERE t.active ORDER BY c.id FOR NO KEY UPDATE OF c`
     const read = await readRekeyPlan(tx, { now, connectedTenantId: connection.tenantId })
     if (!read.ok) return { refusal: read.refusal, plan: null as RekeyPlan | null, written: null as RekeyWriteResult | null }
     seen.plan = read.plan

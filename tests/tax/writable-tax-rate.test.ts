@@ -24,6 +24,7 @@ const ROWS: Row[] = [
   { id: 'plain', active: false, replacedById: null },
   { id: 'orphan', active: false, replacedById: 'gone' },
   { id: 'dead-end', active: false, replacedById: 'plain' },
+  { id: 'reactivated', active: true, replacedById: 'live' },
 ]
 
 // [mutation: the replacedById follow removed -> the retired arm rejects instead of resolving; mutation: the reject removed -> the plain-inactive arm resolves it to itself]
@@ -34,6 +35,7 @@ test('an active rate is used; a rate a re-key retired RESOLVES (through a chain)
   await assert.rejects(resolveWritableTaxRateIds(client(ROWS), ['orphan']), (e: unknown) => e instanceof TaxRateNotUsableError && e.code === 'TAX_RATE_REPLACEMENT_MISSING')
   await assert.rejects(resolveWritableTaxRateIds(client(ROWS), ['dead-end']), (e: unknown) => e instanceof TaxRateNotUsableError && e.code === 'TAX_RATE_REPLACEMENT_MISSING', 'a replacement that is itself inactive')
   assert.equal(await resolveWritableTaxRateId(client(ROWS), 'old'), 'live')
+  assert.equal(await resolveWritableTaxRateId(client(ROWS), 'reactivated'), 'live', 'a replaced row someone reactivated is still resolved to its replacement')
   assert.deepEqual([await resolveWritableTaxRateId(client(ROWS), null), await resolveWritableTaxRateId(client(ROWS), undefined), await resolveWritableTaxRateId(client(ROWS), 'nope')], [null, undefined, 'nope'])
 })
 

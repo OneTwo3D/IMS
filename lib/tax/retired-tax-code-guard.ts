@@ -15,7 +15,7 @@
  * WHAT IS REFUSED. A payload (of any type except TAX_RATE_SYNC, which defines rates) carrying a tax code that a re-key retired (recorded by the apply under RETIRED_CODES_SETTING) AND that
  * no ACTIVE IMS rate carries now. Deliberately NOT "any code only an inactive rate carries": an operator may deactivate a rate and still need a credit note for its historical invoices
  * with its code; only the other organisation's number a re-key retired is wrong to send. Codes no rate carries at all (settings-held reverse-charge types) and Xero built-ins pass.
- * The refusal is a thrown RetiredTaxCodeInPayloadError after a best-effort row in the posting-refusal inbox on the pooled client; the producer's ordinary retry rebuilds the payload from
+ * (The retired row itself is never a carrier: reactivated by any means it still cannot make its old code legitimate again.) The refusal is a thrown RetiredTaxCodeInPayloadError after a best-effort row in the posting-refusal inbox on the pooled client; the producer's ordinary retry rebuilds the payload from
  * the current rates (the apply re-pointed the documents that could still post). A cancelled document that still references a retired rate cannot enqueue a Xero payload with that code.
  */
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
@@ -86,9 +86,10 @@ export async function retiredTaxCodesInPayload(client: unknown, input: { type: s
   const out: RetiredCodeFinding[] = []
   for (const code of suspect) {
     const entry = retired[code]!
-    const active = carriers.filter((r) => r.accountingTaxType === code)
+    // The row the code was retired from NEVER counts as a carrier, whatever its active flag says (a replaced row is read-only, lib/tax/tax-rate-replaced.ts; this holds even if something
+    // reactivated it): a code is legitimate only through some OTHER active rate.
+    const active = carriers.filter((r) => r.accountingTaxType === code && r.id !== entry.rateId)
     if (active.length === 0) { out.push({ code, reason: RETIRED_TAX_CODE_REASON }); continue }
-    if (active.some((r) => r.id === entry.rateId)) continue
     const at = Date.parse(entry.at)
     if (!Number.isFinite(at) || now < at + REKEY_QUARANTINE_MS) out.push({ code, reason: RETIRED_TAX_CODE_QUARANTINE_REASON })
   }

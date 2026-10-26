@@ -48,7 +48,7 @@ test('the guard refuses a retired code that no active rate carries, in any tax-c
   assert.deepEqual(await retiredTaxCodesInPayload(c, sales({ lines: [{ taxType: 'TAX008' }] })), [], 'control: the new code passes')
   assert.deepEqual(await retiredTaxCodesInPayload(c, sales({ lines: [{ taxType: 'TAX031' }] })), [], 'a code a re-key did not retire passes even if only an inactive rate carries it (operator-deactivated history)')
   assert.deepEqual(await retiredTaxCodesInPayload(c, sales({ lines: [{ taxType: 'OUTPUT2' }, { taxType: 'NONE' }] })), [], 'built-ins pass')
-  assert.deepEqual(await retiredTaxCodesInPayload(client({ retired, rates: [{ id: 'old', accountingTaxType: 'TAX005', active: true }] }), { ...sales({ lines: [{ taxType: 'TAX005' }] }), now: new Date(AT.getTime() + 1_000) }), [], 'the very rate it was retired from is active again: same meaning, passes')
+  assert.deepEqual(await retiredTaxCodesInPayload(client({ retired, rates: [{ id: 'old', accountingTaxType: 'TAX005', active: true }] }), { ...sales({ lines: [{ taxType: 'TAX005' }] }), now: new Date(AT.getTime() + 1_000) }), ['TAX005'], 'the very rate it was retired from, reactivated by any means, is NOT a carrier: its old code stays refused')
   assert.deepEqual(await retiredTaxCodesInPayload(c, { type: 'TAX_RATE_SYNC', payload: { components: [{ accountingTaxType: 'TAX005' }] } }), [], 'a rate definition is not a use of the code')
   assert.deepEqual(await retiredTaxCodesInPayload(client({ rates: [] }), sales({ lines: [{ taxType: 'TAX005' }] })), [], 'nothing retired -> nothing refused')
 })
@@ -72,7 +72,7 @@ test('the retired-codes setting is parsed defensively', () => {
   assert.deepEqual(Object.keys(parseRetiredCodes(JSON.stringify(retired))), ['TAX005'])
 })
 
-// [mutation: the quarantine branch removed -> the swap arm passes the stale CY payload; mutation: the window never ends (or is not checked against retired.at) -> the after-the-window arm fails]
+// [mutation: the retired row counted as a carrier again (the pre-R7 same-rate exemption) -> the reactivated-row arm fails; mutation: the quarantine branch removed -> the swap arm passes the stale CY payload; mutation: the window never ends (or is not checked against retired.at) -> the after-the-window arm fails]
 test('A CODE SWAP: CY VAT retires TAX005 while BG VAT gets it; a CY payload built before and enqueued after is refused in the quarantine window, a payload after the window is accepted', async () => {
   const c = client({ retired, rates: [{ id: 'bg-new', accountingTaxType: 'TAX005', active: true }] })
   const payload = sales({ lines: [{ taxType: 'TAX005' }] })

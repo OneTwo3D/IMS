@@ -1,5 +1,6 @@
 'use server'
 
+import { lockTaxRateForEdit } from '@/lib/tax/tax-rate-replaced'
 import { revalidatePath } from 'next/cache'
 import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
@@ -185,6 +186,8 @@ export type TaxRateRow = {
   reportingCategory: string | null
   isDefault: boolean
   active: boolean
+  /** Set when a tax re-key replaced this rate: it is read-only and the replacement is this id. */
+  replacedById: string | null
   components: {
     id: string
     name: string
@@ -224,6 +227,7 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
       reportingCategory: true,
       isDefault: true,
       active: true,
+      replacedById: true,
       components: {
         orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
         select: {
@@ -252,6 +256,7 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
     reportingCategory: r.reportingCategory,
     isDefault: r.isDefault,
     active: r.active,
+    replacedById: r.replacedById,
     components: r.components.map((component) => ({
       id: component.id,
       name: component.name,
@@ -391,6 +396,8 @@ export async function updateTaxRate(id: string, input: {
       }
       const components = input.components === undefined ? undefined : normalizeTaxRateComponents(input.components)
       const effectiveRate = components === undefined ? input.rate : (effectiveTaxRateFromComponents(components) ?? input.rate)
+      // A rate a tax re-key replaced is read-only, and the row lock serialises this edit with the re-key apply (lib/tax/tax-rate-replaced.ts).
+      await lockTaxRateForEdit(tx, id, input)
       const oldRate = await tx.taxRate.findUnique({
         where: { id },
         select: { id: true, name: true, rate: true },
@@ -558,7 +565,8 @@ export async function autoLinkXeroTaxRates(): Promise<{
     await db.$transaction(async (tx) => {
       await assertXeroConnectionUnchanged(tx as never, connection)
       for (const entry of plan) {
-        await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
+        // updateMany with replacedById: null: a rate a tax re-key replaced is never given a code again (lib/tax/tax-rate-replaced.ts).
+        await tx.taxRate.updateMany({ where: { id: entry.id, replacedById: null }, data: { accountingTaxType: entry.taxType } })
       }
     })
     linked = plan.length
@@ -849,7 +857,7 @@ export async function generateMissingXeroTaxRates(
         // refused if the instance has been rebound since, so another organisation's type never lands here.
         await db.$transaction(async (tx) => {
           await assertXeroConnectionUnchanged(tx as never, connection)
-          await tx.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: res.taxType } })
+          await tx.taxRate.updateMany({ where: { id: rate.id, replacedById: null }, data: { accountingTaxType: res.taxType } })
         })
         created++
       } catch (e) {
