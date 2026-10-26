@@ -156,6 +156,50 @@ test('selection: refunds, young receipts, unposted invoices, registered receipts
   assert.deepEqual(order, [older!.id, newer!.id, failedBefore!.id], 'oldest first, the recently failed one behind the others')
 })
 
+// [mutation: remove the current-invoice scoping of the follow-up exclusion (any marker row on the order excludes it) -> the stale-marker arm goes red; make the scoping too loose (ignore the marker entirely) -> the pending arms go red]
+test('a follow-up marker left on a SUPERSEDED invoice does not hide a later receipt; one on the CURRENT invoice still does', async () => {
+  const { sweepUnregisteredReceipts, receiptRegistrationSeams } = await import('@/lib/domain/accounting/receipt-registration-sweep')
+  const mkOrder = async (current: string) => {
+    const o = await postedOrder()
+    await s.db.salesOrder.update({ where: { id: o.id }, data: { accountingInvoiceId: current } })
+    return o
+  }
+  const row = (orderId: string, ext: string | null, created: string, marker: boolean) => s.db.accountingSyncLog.create({
+    data: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: orderId, status: 'SYNCED', externalTransactionId: ext, createdAt: new Date(created), ...(marker ? { backReferenceFollowUpsPendingAt: new Date() } : {}) },
+  })
+  const receipt = async (orderId: string) => { const p = await s.db.payment.create({ data: { orderId, amount: 7, currency: 'GBP', method: 'Hand' } }); await age(p.id, 60); return p }
+
+  // reposted: invoice A left a marker, invoice B is current and owes nothing; the inline enqueue of the later receipt failed
+  const reposted = await mkOrder('INV-B-1')
+  await row(reposted.id, 'INV-A-1', '2026-01-01T00:00:00Z', true)
+  await row(reposted.id, 'INV-B-1', '2026-02-01T00:00:00Z', false)
+  const stale = await receipt(reposted.id)
+  // control: the same order shape but the marker is on the CURRENT invoice B
+  const current = await mkOrder('INV-B-2')
+  await row(current.id, 'INV-A-2', '2026-01-01T00:00:00Z', false)
+  await row(current.id, 'INV-B-2', '2026-02-01T00:00:00Z', true)
+  const owing = await receipt(current.id)
+  // control: a re-post whose back-reference is not written yet (order still names A, latest row B carries the marker)
+  const pendingBackRef = await mkOrder('INV-A-3')
+  await row(pendingBackRef.id, 'INV-A-3', '2026-01-01T00:00:00Z', false)
+  await row(pendingBackRef.id, 'INV-B-3', '2026-02-01T00:00:00Z', true)
+  const midRepost = await receipt(pendingBackRef.id)
+
+  const seen: string[] = []
+  receiptRegistrationSeams.registrationsAreOwed = async () => true
+  receiptRegistrationSeams.obligationIsOnRecord = async () => false
+  receiptRegistrationSeams.beforeSweepRegisters = async (pid) => { seen.push(pid) }
+  mode = 'fail'
+  try { await sweepUnregisteredReceipts(250) } finally {
+    receiptRegistrationSeams.beforeSweepRegisters = undefined
+    receiptRegistrationSeams.registrationsAreOwed = undefined
+    receiptRegistrationSeams.obligationIsOnRecord = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptObligationIsOnRecord
+  }
+  assert.ok(seen.includes(stale.id), 'a stale marker on the superseded invoice A must not exclude the order')
+  assert.ok(!seen.includes(owing.id), 'the current invoice still owes its follow-ups: left to that pass')
+  assert.ok(!seen.includes(midRepost.id), 'a re-post whose back-reference is not written yet still owes its follow-ups')
+})
+
 // [mutation: apply the limit before the "no record" filter (drop the INVOICE_PAYMENT anti-join)]
 test('starvation: 55 newer registered receipts do not hide an older unresolved one from a batch of 50', async () => {
   const { sweepUnregisteredReceipts, receiptRegistrationSeams } = await import('@/lib/domain/accounting/receipt-registration-sweep')

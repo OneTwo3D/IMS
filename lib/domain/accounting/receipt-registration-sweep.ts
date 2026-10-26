@@ -11,8 +11,8 @@
  *   - `registerReceiptAndProveObligation`: register, then prove; a failure of either throws `ReceiptRegistrationNotRecorded` carrying the payment id (WooCommerce keeps a pending-FX row for it).
  *   - `sweepUnregisteredReceipts`: the scheduled sweep (run by the fx-rates cron every run) over every non-refund Payment on an order whose invoice has posted that has NO INVOICE_PAYMENT
  *     row and NO refusal notice. The filter is in the query, BEFORE the limit (registered receipts can never take a slot); the batch is oldest first with recently failed receipts
- *     behind; it returns at once when no connector posts INVOICE_PAYMENT; a receipt younger than 5 minutes is left to its inline registration; and an order whose SALES_INVOICE still
- *     owes its follow-ups (`backReferenceFollowUpsPendingAt`) is left to that pass. Registration is idempotent per receipt and document (`invoicePaymentEnqueueKey`), so an inline call
+ *     behind; it returns at once when no connector posts INVOICE_PAYMENT; a receipt younger than 5 minutes is left to its inline registration; and an order whose CURRENT SALES_INVOICE
+ *     still owes its follow-ups (`backReferenceFollowUpsPendingAt` on the current invoice's row; a marker on a superseded invoice excludes nothing) is left to that pass. Registration is idempotent per receipt and document (`invoicePaymentEnqueueKey`), so an inline call
  *     and a sweep that race register it once.
  */
 import { db } from '@/lib/db'
@@ -85,6 +85,22 @@ function receiptAgeFloor(): Date {
   return new Date(Date.now() - 5 * 60_000)
 }
 
+/**
+ * The orders whose CURRENT invoice still owes its SALES_INVOICE follow-ups: they are left to that pass and, being excluded in the query below, never take a slot. The marker is tested for presence only (never compared; this
+ * statement holds no comparison operator on purpose, and is kept apart from the clock-reading query for the same reason). A marker row is the CURRENT invoice's when it names the order's `accounting_invoice_id`, names no
+ * document yet (posted, not yet recorded), or is the order's latest SALES_INVOICE row (a re-post whose back-reference is not written yet). A marker left on a SUPERSEDED invoice (the order was re-posted: the row names
+ * another document and a later row exists) excludes nothing, or it would hide every later receipt of the order for ever.
+ */
+async function ordersOwingCurrentInvoiceFollowUps(): Promise<string[]> {
+  const rows = await db.$queryRaw<Array<{ id: string }>>`
+    SELECT DISTINCT m."referenceId" AS id FROM "accounting_sync_logs" m
+    JOIN "sales_orders" o ON o.id = m."referenceId"
+    WHERE m.type = 'SALES_INVOICE' AND m."referenceType" = 'SalesOrder' AND m."backReferenceFollowUpsPendingAt" IS NOT NULL
+      AND (m."externalTransactionId" IS NULL OR m."externalTransactionId" = o.accounting_invoice_id
+           OR m.id = (SELECT n.id FROM "accounting_sync_logs" n WHERE n.type = 'SALES_INVOICE' AND n."referenceType" = 'SalesOrder' AND n."referenceId" = m."referenceId" ORDER BY n."createdAt" DESC, n.id DESC LIMIT 1))`
+  return rows.map((r) => r.id)
+}
+
 /** The unresolved-receipt query. Its inputs arrive as parameters so the statement is self-contained: the filter is in the query, BEFORE the limit. */
 async function selectUnresolvedReceiptIds(floor: Date, excluded: string[], take: number): Promise<Array<{ id: string }>> {
   return db.$queryRaw<Array<{ id: string }>>`
@@ -103,13 +119,7 @@ export async function sweepUnregisteredReceipts(limit = 50): Promise<{ examined:
   // Nothing is owed when no accounting connector posts payments: asked ONCE, so such receipts never fill the batch.
   if (!(await (receiptRegistrationSeams.registrationsAreOwed ?? defaultRegistrationsAreOwed)())) return result
   const take = Math.min(Math.max(limit, 1), 250)
-  // Orders whose SALES_INVOICE still owes its follow-ups are left to that pass. Read as a Prisma predicate (the obligation marker is only ever tested for presence, never compared), then excluded in the query below so they still never take a slot.
-  const owingFollowUps = (await db.accountingSyncLog.findMany({
-    where: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', backReferenceFollowUpsPendingAt: { not: null } },
-    select: { referenceId: true },
-    distinct: ['referenceId'],
-  })).flatMap((row) => (row.referenceId ? [row.referenceId] : []))
-  const candidates = await selectUnresolvedReceiptIds(receiptAgeFloor(), owingFollowUps, take)
+  const candidates = await selectUnresolvedReceiptIds(receiptAgeFloor(), await ordersOwingCurrentInvoiceFollowUps(), take)
   const rows = await db.payment.findMany({
     where: { id: { in: candidates.map((c) => c.id) } },
     select: { id: true, orderId: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { id: true, orderNumber: true, externalOrderNumber: true } } },
