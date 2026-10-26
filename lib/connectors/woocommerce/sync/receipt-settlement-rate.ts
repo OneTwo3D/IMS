@@ -35,7 +35,7 @@ export async function resolveWcReceiptSettlementRate(params: {
   currency: string
   baseCurrency: string
   /** The instant the order was priced at (its `date_created_gmt`; now when it has none). */
-  orderedAt: Date
+  orderedAt: Date | null
   /** The order's own booked rate (1 base = X foreign). */
   orderRate: number
   /** WooCommerce `date_paid_gmt`. */
@@ -51,7 +51,8 @@ export async function resolveWcReceiptSettlementRate(params: {
       currency, undefined, 'invalid_as_of',
     )
   }
-  if (utcCalendarDate(paidAt) === utcCalendarDate(params.orderedAt)) return params.orderRate
+  // no known order instant is never "the same day": the payment-day central rate is used
+  if (params.orderedAt !== null && utcCalendarDate(paidAt) === utcCalendarDate(params.orderedAt)) return params.orderRate
   const asOf = endOfBusinessDateUtc(paidAt)
   try {
     return await params.lookup(currency, asOf)

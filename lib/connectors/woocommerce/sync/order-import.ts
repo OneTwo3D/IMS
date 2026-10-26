@@ -903,13 +903,14 @@ type WcPaidTransition =
 
 async function planWcPaidTransition(orderId: string, wcOrder: WcFullOrder): Promise<WcPaidTransition> {
   if (!wcOrder.date_paid_gmt) return { kind: 'none' }
-  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, currency: true, fxRateToBase: true, totalForeign: true, createdAt: true } })
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, currency: true, fxRateToBase: true, totalForeign: true, externalCreatedAt: true } })
   if (!order || order.paidAt !== null || !toDecimal(order.totalForeign).gt(0)) return { kind: 'none' }
   try {
     const rate = await resolveWcReceiptSettlementRate({
       currency: order.currency,
       baseCurrency: await (await import('@/lib/base-currency')).getBaseCurrencyCode(),
-      orderedAt: wcOrder.date_created_gmt ? parseWcGmtInstant(wcOrder.date_created_gmt) : order.createdAt,
+      // the order date the IMPORT persisted (from date_created_gmt, else date_created); IMS's own createdAt is NOT the order date. None persisted: not assumed same-day (the payment-day central rate is used).
+      orderedAt: order.externalCreatedAt ?? null,
       orderRate: Number(order.fxRateToBase),
       datePaidGmt: wcOrder.date_paid_gmt,
       lookup: getFxRateToBase,

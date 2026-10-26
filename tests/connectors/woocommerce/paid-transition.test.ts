@@ -23,9 +23,9 @@ before(async () => {
 })
 after(async () => { await s?.stop() })
 
-async function heldOrder(opts: { currency?: string; paidAt?: Date | null } = {}) {
+async function heldOrder(opts: { currency?: string; paidAt?: Date | null; externalCreatedAt?: Date | null } = {}) {
   const n = ++seq
-  const o = await s.db.salesOrder.create({ data: { currency: opts.currency ?? 'EUR', fxRateToBase: '1.1', subtotalForeign: '100', totalForeign: '100', subtotalBase: '90.9091', totalBase: '90.9091', paidAt: opts.paidAt ?? null, shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `9${n}` } } }, select: { id: true } })
+  const o = await s.db.salesOrder.create({ data: { currency: opts.currency ?? 'EUR', fxRateToBase: '1.1', subtotalForeign: '100', totalForeign: '100', subtotalBase: '90.9091', totalBase: '90.9091', paidAt: opts.paidAt ?? null, externalCreatedAt: opts.externalCreatedAt === undefined ? new Date('2026-10-01T09:00:00Z') : opts.externalCreatedAt, shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: `9${n}` } } }, select: { id: true } })
   return { id: o.id, wcId: Number(`9${n}`) }
 }
 const payload = (wcId: number, paid: string | null, created = '2026-10-01T09:00:00') => ({
@@ -416,4 +416,27 @@ test('paid payload whose total differs from the total IMS holds: no Payment, not
   assert.equal(Number(pays[0]!.amount), 120)
   assert.ok((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt)
   assert.equal(registrations.length, 1)
+})
+
+
+// The same-day test uses the order date the IMPORT persisted (externalCreatedAt), never IMS's createdAt. [mutation: fall back to the IMS createdAt / assume same-day when unknown]
+test('order created Oct 1 (no creation instant in the paid payload), imported unpaid and paid Oct 3: the payment-date central rate, not the booked rate; a real same-day payment keeps the order rate', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  await s.db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.33', fetchedAt: new Date('2026-10-03T06:00:00Z') } })
+  const noDate = async (o: { id: string; wcId: number }, paid: string) => updateExistingWcOrderFromPayload(o.id, { ...(payload(o.wcId, paid) as object), date_created_gmt: '', date_created: '' } as never)
+  // persisted creation instant Oct 1; the order row's own createdAt is "now" (imported Oct 3 or later)
+  const late = await heldOrder()
+  await noDate(late, '2026-10-03T10:00:00')
+  assert.equal(Number((await payments(late.id))[0]!.settlementRateToBase), 1.33, 'payment-date central rate')
+  // same real day: the order's booked rate
+  const same = await heldOrder()
+  await noDate(same, '2026-10-01T15:00:00')
+  assert.equal(Number((await payments(same.id))[0]!.settlementRateToBase), 1.1)
+  // no persisted creation instant at all: never assumed same-day
+  const unknown = await heldOrder({ externalCreatedAt: null })
+  await noDate(unknown, '2026-10-03T11:00:00')
+  assert.equal(Number((await payments(unknown.id))[0]!.settlementRateToBase), 1.33)
+  const unknownSameDay = await heldOrder({ externalCreatedAt: null })
+  await noDate(unknownSameDay, '2026-10-01T11:00:00')
+  assert.equal(Number((await payments(unknownSameDay.id))[0]!.settlementRateToBase), 1.1, 'the central rate on Oct 1 happens to be the same feed row (1.10): proves a lookup, not an assumption')
 })
