@@ -9,6 +9,7 @@ import {
 } from '@/lib/tax/tax-rekey'
 import { TAX_REKEY_EXIT_CODES, parseTaxRekeyArgs, renderTaxRekeyText, taxRekeyExitCode } from '@/lib/tax/tax-rekey-cli'
 import { compareVatSets, type ImsRateRow, type ImsXeroSnapshot } from '@/lib/tax/vat-difference-report'
+import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
 import { runTaxRekeyCli } from '../../scripts/tax-rekey'
 
@@ -23,8 +24,10 @@ const TENANT = 'tenant-live'
 const NOW = new Date('2026-10-25T12:00:00Z')
 const FETCHED = new Date('2026-10-25T11:30:00Z')
 
+/** A live type's own VAT-return treatment defaults to what IMS assigns a sales rate of that name (the same helper that creates Xero rates). */
+const reportOf = (name: string, pct: string): string => xeroReportTaxType({ reportingCategory: null, usedFor: 'SALES', name, rate: Number(pct) / 100 })
 const xeroRow = (taxType: string, name: string, pct: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({
-  taxType, name, status: 'ACTIVE', reportTaxType: null, effectiveRate: `${pct}.000000`, displayTaxRate: `${pct}.000000`,
+  taxType, name, status: 'ACTIVE', reportTaxType: reportOf(name, pct), effectiveRate: `${pct}.000000`, displayTaxRate: `${pct}.000000`,
   components: pct === '0' ? [] : [{ name: 'VAT', rate: `${pct}.000000`, compound: false, nonRecoverable: false }],
   canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true }, ...over,
 })
@@ -148,7 +151,7 @@ test('country: an IMS country and a Xero name prefix must agree; no IMS country,
 test('BLOCKERS: two rates re-keying to one live type on an overlapping side, and a live type another active rate keeps', () => {
   const duplicate = match([ims('a', 'CY VAT', 'TAX005', '0.1900', { usedFor: 'SALES' }), ims('b', 'CY VAT', 'TAX006', '0.1900', { usedFor: 'BOTH' })], LIVE)
   assert.deepEqual(duplicate.blockers.map((b) => [b.code, b.taxType]), [['DUPLICATE_TARGET', 'TAX008']])
-  // Disjoint sides are legitimate: a sales row and a purchase row of one name.
+  // A purchase-only rate files to INPUT, a sales rate of an EU name to MOSSSALES: one live type cannot be both, so they never collide on it.
   assert.deepEqual(match([ims('a', 'CY VAT', 'TAX005', '0.1900', { usedFor: 'SALES' }), ims('b', 'CY VAT', 'TAX006', '0.1900', { usedFor: 'PURCHASE' })], LIVE).blockers, [])
   // An unrelated active rate ("Other") already holds the live code TAX008 and stays.
   const held = match([ims('cy', 'CY VAT', 'TAX005', '0.1900'), ims('other', 'Other VAT', 'TAX008', '0.0500')], LIVE)
@@ -164,15 +167,16 @@ test('every outcome is reachable and the counts add up', () => {
     xeroRow('TAX008', 'CY VAT', '19'), xeroRow('TAX012', 'GR VAT', '24'), xeroRow('TAX004', 'BE VAT', '21'), xeroRow('TAX050', 'BE VAT', '21'),
     xeroRow('TAX018', 'LU VAT', '17'), xeroRow('TAX013', 'FR VAT', '20', { status: 'ARCHIVED' }),
     xeroRow('TAX060', 'DE VAT', '19', { canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: false } }),
+    xeroRow('TAX062', 'IE VAT', '23', { reportTaxType: 'OUTPUT' }), xeroRow('TAX063', 'PT VAT', '23', { reportTaxType: null }),
     xeroRow('TAX061', 'ES VAT', '21', { components: [{ name: 'a', rate: '10.000000', compound: false, nonRecoverable: false }, { name: 'b', rate: '11.000000', compound: false, nonRecoverable: false }] }),
   ]
   const plan = match([
     ims('ok', 'CY VAT', 'TAX008', '0.1900'), ims('mv', 'GR VAT', 'TAX013', '0.2400'), ims('no', 'CI VAT', 'TAX004', '0.1800', { countryCode: 'CI' }),
     ims('am', 'BE VAT', 'TAX021', '0.2100'), ims('pd', 'LU VAT', 'TAX020', '0.1500'), ims('in', 'FR VAT', 'TAX013', '0.2000'),
-    ims('sd', 'DE VAT', 'TAX070', '0.1900'), ims('md', 'ES VAT', 'TAX071', '0.2100'),
+    ims('sd', 'DE VAT', 'TAX070', '0.1900'), ims('md', 'ES VAT', 'TAX071', '0.2100'), ims('rd', 'IE VAT', 'TAX072', '0.2300'), ims('ru', 'PT VAT', 'TAX073', '0.2300'),
   ], live)
   const byId = Object.fromEntries(plan.rows.map((r) => [r.imsRateId, r.outcome]))
-  assert.deepEqual(byId, { ok: 'ALREADY_CORRECT', mv: 'REKEY', no: 'NO_MATCH', am: 'AMBIGUOUS', pd: 'PERCENTAGE_DIFFERS', in: 'NAME_MATCHES_INACTIVE', sd: 'SIDE_NOT_ALLOWED', md: 'MEANING_DIFFERS' })
+  assert.deepEqual(byId, { ok: 'ALREADY_CORRECT', mv: 'REKEY', no: 'NO_MATCH', am: 'AMBIGUOUS', pd: 'PERCENTAGE_DIFFERS', in: 'NAME_MATCHES_INACTIVE', sd: 'SIDE_NOT_ALLOWED', md: 'MEANING_DIFFERS', rd: 'REPORT_TYPE_DIFFERS', ru: 'REPORT_TYPE_UNKNOWN' })
   assert.equal(REKEY_OUTCOMES.every((o) => plan.counts[o] === 1), true)
 })
 
@@ -193,7 +197,7 @@ test('components: a custom code that is not a live ACTIVE type is listed to be c
 // [mutation: the canApply check removed -> the arm fails]
 test('SIDE_NOT_ALLOWED: the live type must be allowed on every side the IMS rate is used for (revenue for sales, expenses for purchases, both for BOTH)', () => {
   const can = (revenue: boolean, expenses: boolean) => ({ assets: false, equity: false, expenses, liabilities: false, revenue })
-  const at = (usedFor: string, revenue: boolean, expenses: boolean) => outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { usedFor })], [xeroRow('TAX008', 'CY VAT', '19', { canApply: can(revenue, expenses) })], 'x')
+  const at = (usedFor: string, revenue: boolean, expenses: boolean) => outcomeOf([ims('x', 'CY VAT', 'TAX005', '0.1900', { usedFor })], [xeroRow('TAX008', 'CY VAT', '19', { canApply: can(revenue, expenses), ...(usedFor === 'PURCHASE' ? { reportTaxType: 'INPUT' } : {}) })], 'x')
   assert.equal(at('SALES', false, true).outcome, 'SIDE_NOT_ALLOWED')
   assert.equal(at('PURCHASE', true, false).outcome, 'SIDE_NOT_ALLOWED')
   assert.equal(at('BOTH', true, false).outcome, 'SIDE_NOT_ALLOWED')
@@ -215,6 +219,33 @@ test('MEANING_DIFFERS: same percentage but another component breakdown, another 
   assert.equal(at(two, [part('10.000000'), part('11.000000', true)]).outcome, 'MEANING_DIFFERS')
   assert.equal(at([], [part('21.000000', false, true)]).outcome, 'MEANING_DIFFERS')
   assert.match(at([], [part('21.000000', false, true)]).reason, /non-recoverable/)
+})
+
+// [mutation: the report-type comparison removed -> the differs arms fail; mutation: the helper replaced by a constant OUTPUT -> the EU / EC / purchase arms fail]
+test('REPORT TYPE: the live type must file to the VAT-return box IMS assigns the rate (the same helper that creates Xero rates); a mismatch is shown with both values, also on an already-correct code; an undecidable one is refused', () => {
+  const at = (rate: RekeyImsRate, live: NormalisedXeroTaxRate) => outcomeOf([rate], [live], rate.id)
+  const eu = ims('x', 'CY VAT', 'TAX005', '0.1900')
+  // EU sales name -> MOSSSALES (OSS/IOSS/VOEC), not OUTPUT.
+  const wrong = at(eu, xeroRow('TAX008', 'CY VAT', '19', { reportTaxType: 'OUTPUT' }))
+  assert.deepEqual([wrong.outcome, wrong.reportType], ['REPORT_TYPE_DIFFERS', { expected: 'MOSSSALES', live: 'OUTPUT' }])
+  assert.match(wrong.reason, /MOSSSALES.*OUTPUT/)
+  assert.equal(at(eu, xeroRow('TAX008', 'CY VAT', '19', { reportTaxType: 'mosssales' })).outcome, 'REKEY', 'case-insensitive, and the matching type re-keys')
+  // The same check on a code that already points at the right name.
+  assert.equal(at(ims('x', 'CY VAT', 'TAX008', '0.1900'), xeroRow('TAX008', 'CY VAT', '19', { reportTaxType: 'OUTPUT' })).outcome, 'REPORT_TYPE_DIFFERS')
+  assert.equal(at(ims('x', 'CY VAT', 'TAX008', '0.1900'), xeroRow('TAX008', 'CY VAT', '19')).outcome, 'ALREADY_CORRECT')
+  // Category, side and zero rate decide as the helper does.
+  assert.equal(at(ims('x', 'Standard', 'TAX005', '0.2000', { countryCode: null, reportingCategory: 'EC_SALES' }), xeroRow('TAX040', 'Standard', '20', { reportTaxType: 'ECOUTPUTSERVICES' })).outcome, 'REKEY')
+  assert.equal(at(ims('x', 'Standard', 'TAX005', '0.2000', { countryCode: null, reportingCategory: 'REVERSE_CHARGE' }), xeroRow('TAX040', 'Standard', '20', { reportTaxType: 'OUTPUT' })).reportType.expected, 'REVERSECHARGES')
+  assert.equal(at(ims('x', 'Standard', 'TAX005', '0.2000', { countryCode: null, usedFor: 'PURCHASE' }), xeroRow('TAX040', 'Standard', '20', { reportTaxType: 'INPUT', canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } })).outcome, 'REKEY')
+  assert.equal(at(ims('x', 'CY VAT', 'TAX005', '0.1900', { usedFor: 'PURCHASE' }), xeroRow('TAX008', 'CY VAT', '19', { canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: false } })).outcome, 'REPORT_TYPE_DIFFERS', 'a purchase-only EU rate files to INPUT, not MOSSSALES')
+  // Undecidable: the live type states none, or the category is one IMS does not map.
+  const unknownLive = at(eu, xeroRow('TAX008', 'CY VAT', '19', { reportTaxType: null }))
+  assert.deepEqual([unknownLive.outcome, unknownLive.reportType.live], ['REPORT_TYPE_UNKNOWN', null])
+  assert.equal(at(ims('x', 'CY VAT', 'TAX005', '0.1900', { reportingCategory: 'SOMETHING_NEW' }), xeroRow('TAX008', 'CY VAT', '19')).outcome, 'REPORT_TYPE_UNKNOWN')
+  assert.equal(at(ims('x', 'CY VAT', 'TAX005', '0.1900', { reportingCategory: 'oss' }), xeroRow('TAX008', 'CY VAT', '19')).outcome, 'REKEY', 'the category is normalised like the helper does')
+  // The digest binds it.
+  const base = planOf()
+  assert.notEqual(digestRekeyPlan({ ...base, rows: base.rows.map((r) => r.imsRateId === 'cy' ? { ...r, reportType: { expected: 'MOSSSALES', live: 'OUTPUT' } } : r) }), base.digest)
 })
 
 // ---- the digest and the refusals to apply ---------------------------------------------------------------

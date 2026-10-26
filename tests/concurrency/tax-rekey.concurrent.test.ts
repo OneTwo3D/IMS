@@ -46,7 +46,7 @@ async function loadDeps() {
 type Deps = Awaited<ReturnType<typeof loadDeps>>
 
 const xero = (taxType: string, name: string, percent: string, expenses = false) => ({
-  taxType, name: `${TAG}${name}`, status: 'ACTIVE' as const, reportTaxType: null, effectiveRate: `${percent}.000000`, displayTaxRate: `${percent}.000000`,
+  taxType, name: `${TAG}${name}`, status: 'ACTIVE' as const, reportTaxType: 'ECOUTPUTSERVICES' /* the IMS fixture rates are EC_SALES sales rates: the box the report-type helper assigns them */, effectiveRate: `${percent}.000000`, displayTaxRate: `${percent}.000000`,
   components: [{ name: 'VAT', rate: `${percent}.000000`, compound: false, nonRecoverable: false }],
   canApply: { assets: false, equity: false, expenses, liabilities: false, revenue: true },
 })
@@ -771,4 +771,17 @@ test('AN EDITOR changing a rate concurrently with the apply: the apply refuses o
     'the reactivated retired row does not make its old code legitimate',
   )
   assert.equal(await resolveWritableTaxRateId(db, w.ids.be), newBe, 'a writer resolves the reactivated retired row to its replacement')
+})
+
+// [mutation: the report-type comparison removed -> the apply re-keys CY VAT to a live type that files to another box]
+test('REPORT TYPE against a real stored list: a live type that files to another VAT-return box than IMS assigns is not re-keyed', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const w = await seedWorld(d)
+  const rows = LIVE().map((r) => (r.name === `${TAG}CY VAT` ? { ...r, reportTaxType: 'OUTPUT' } : r))
+  await seedXero(d, rows)
+  const plan = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  const cy = plan.rows.find((r) => r.imsRateId === w.ids.cy)!
+  assert.deepEqual([cy.outcome, cy.reportType], ['REPORT_TYPE_DIFFERS', { expected: 'ECOUTPUTSERVICES', live: 'OUTPUT' }])
+  assert.equal(plan.rows.find((r) => r.imsRateId === w.ids.gr)!.outcome, 'REKEY', 'control: the others still re-key')
 })

@@ -11,6 +11,9 @@
  *   PERCENTAGE exactly the same percentage: Xero's EffectiveRate, else DisplayTaxRate, against the rate column AND the percentage tax is computed at (the active components'). Never rounded.
  *   SIDE       the live type must be allowed on every side the IMS rate is used for (stored canApply.revenue for sales, canApply.expenses for purchases).
  *   MEANING    the component breakdown must be the same (count, each component's rate, compound flag; no non-recoverable component): componentMeaningDifference.
+ *   REPORT     the live type's ReportTaxType must equal the VAT-return box IMS assigns the rate: lib/connectors/xero/tax-rate-report-type.ts xeroReportTaxType (reportingCategory, side, the name's
+ *              EU/VOEC country, zero rate) - the helper that creates Xero rates, so EU sales are MOSSSALES. A different box is REPORT_TYPE_DIFFERS (both values shown); a live type that states none, or a
+ *              reporting category IMS does not map, is REPORT_TYPE_UNKNOWN (refused, not guessed). Checked for ALREADY_CORRECT too, and bound by the digest.
  *   COUNTRY    where the IMS rate has a countryCode and the Xero name starts with a two-letter country prefix ("CY VAT"), they must agree.
  * It NEVER matches by code. Each rate gets ONE outcome (REKEY_OUTCOMES). Two further conditions are BLOCKERS that refuse the apply: two rates re-keying to one live type, and a live
  * type already carried by another active IMS rate that stays (a code on two active rates is ambiguous).
@@ -70,6 +73,7 @@ import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/
 import { readStoredXeroList, type PurchaseTaxImportRefusalCode } from '@/lib/tax/purchase-tax-import'
 import { imsEffectivePercent, type ImsComponentRow } from '@/lib/tax/vat-difference-report'
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
+import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import { taxCodesInPayload } from '@/lib/tax/tax-code-fields'
 import { RETIRED_CODES_SETTING, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
 import { REKEY_OUTCOMES, type RekeyOutcome } from '@/lib/tax/tax-rekey-outcomes'
@@ -129,6 +133,8 @@ export interface RekeyRow {
   /** The percentage tax is computed at (active components), when it differs from the column. */
   imsEffectivePercent: string | null
   reason: string
+  /** The VAT-return treatment: what IMS assigns this rate (the same helper that creates Xero rates, lib/connectors/xero/tax-rate-report-type.ts) and what the live type states. null before the check is reached. */
+  reportType: { expected: string | null; live: string | null }
   /** REKEY only: components of the old rate whose own custom code is not a live ACTIVE type; the new row's copy of each gets null (as the importer writes). Built-in and live-valid codes are kept. */
   clearedComponents: RekeyClearedComponent[]
 }
@@ -192,6 +198,7 @@ export function xeroNameCountry(name: string): string | null {
   return match ? normaliseCountry(match[1]!) : null
 }
 
+const KNOWN_REPORTING_CATEGORIES: ReadonlySet<string> = new Set(['DOMESTIC', 'REVERSE_CHARGE', 'EC_SALES', 'OSS'])
 const sides = (usedFor: string): readonly string[] => (usedFor === 'BOTH' ? ['SALES', 'PURCHASE'] : [usedFor])
 const overlap = (a: string, b: string): boolean => sides(a).some((side) => sides(b).includes(side))
 const statedPercent = (row: NormalisedXeroTaxRate): Dec | null => {
@@ -263,6 +270,7 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
     const tier = exact.length > 0 ? exact : xero.filter((row) => row.name.trim().toLowerCase() === name.toLowerCase())
     const matchedBy = exact.length > 0 ? 'EXACT' as const : tier.length > 0 ? 'CASE_INSENSITIVE' as const : null
     const candidates = tier.map(candidateOf)
+    let reportType: { expected: string | null; live: string | null } = { expected: null, live: null }
     const done = (outcome: RekeyOutcome, target: NormalisedXeroTaxRate | null, reason: string): void => {
       const cleared: RekeyClearedComponent[] = []
       if (outcome === 'REKEY') {
@@ -273,7 +281,7 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
           cleared.push({ sortOrder: c.sortOrder ?? index, name: c.name ?? '', taxType: t })
         }
       }
-      rows.push({ ...base, outcome, matchedBy, target: target === null ? null : candidateOf(target), candidates, reason, clearedComponents: cleared })
+      rows.push({ ...base, outcome, matchedBy, target: target === null ? null : candidateOf(target), candidates, reason, reportType, clearedComponents: cleared })
     }
     if (tier.length === 0) { done('NO_MATCH', null, 'no live Xero tax type has this name'); continue }
     const active = tier.filter((row) => row.status === 'ACTIVE')
@@ -298,6 +306,15 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
     // Component treatment (stored list: components[] = name, rate, compound, nonRecoverable): same count, each rate, each compound flag, nothing non-recoverable.
     const meaning = componentMeaningDifference(rate, live)
     if (meaning !== null) { done('MEANING_DIFFERS', live, meaning); continue }
+    // VAT-return treatment (Xero ReportTaxType): the live type must file to the box IMS assigns this rate - the helper that creates Xero rates decides (reportingCategory, side, name's country, zero rate).
+    // A category the helper does not know would silently fall to its default, which is a guess: refused.
+    const category = (rate.reportingCategory ?? '').trim().toUpperCase().replace(/[\s-]+/g, '_')
+    const expectedReport = xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name, rate: Number(rate.rate) })
+    const liveReport = live.reportTaxType === null ? null : live.reportTaxType.trim().toUpperCase()
+    reportType = { expected: expectedReport, live: liveReport }
+    if (category !== '' && !KNOWN_REPORTING_CATEGORIES.has(category)) { done('REPORT_TYPE_UNKNOWN', live, `the reporting category "${rate.reportingCategory}" is not one IMS maps to a VAT-return box`); continue }
+    if (liveReport === null) { done('REPORT_TYPE_UNKNOWN', live, `the live type states no ReportTaxType, so ${expectedReport} cannot be confirmed`); continue }
+    if (liveReport !== expectedReport) { done('REPORT_TYPE_DIFFERS', live, `IMS files this rate under ${expectedReport}, the live type under ${liveReport}`); continue }
     done(live.taxType === currentCode ? 'ALREADY_CORRECT' : 'REKEY', live, live.taxType === currentCode ? 'the code is already the live type of this name' : `live type ${live.taxType} has this name; ${currentCode} does not`)
   }
 
