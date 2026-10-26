@@ -189,7 +189,7 @@ Reduced to the outstanding quantity per line.
 | `qtyOrdered` | yes | At most 4 decimal places. |
 | `qtyReceived` | yes | At most 4 decimal places. |
 | `unitCostForeign` | yes | At most 6 decimal places and 9 integer digits. |
-| `lineDiscountPercent` | no | The line's discount percent (0 to 100, at most 6 decimal places). Never applied: an OPEN line with a non-zero value is refused as `PO_LINE_DISCOUNT_NOT_SUPPORTED`, a value that is not a number in 0 to 100 is `BAD_DISCOUNT`, a blank is 0, and a line with nothing outstanding or not open is not judged. |
+| `lineDiscountPercent` | yes | The line's discount percent (0 to 100, at most 6 decimal places). REQUIRED: a column map that omits it is refused, and a discount column the map leaves unread blocks the run (`DISCOUNT_COLUMN_NOT_READ`). Never applied: an OPEN line with a non-zero value is refused as `PO_LINE_DISCOUNT_NOT_SUPPORTED`, a value that is not a number in 0 to 100 is `BAD_DISCOUNT`, a blank is 0, and a line with nothing outstanding or not open is not judged. |
 | `taxRateName` | no | Matched to an IMS tax rate case-insensitively. A line gives a name OR a `taxRateValue`, never both (the importer resolves the name first and falls back to the value; the tool cannot read IMS to show they agree). |
 | `taxRateValue` | no | Percent or fraction as the importer reads it (above 1 means percent); as a fraction at most 4 decimal places (Decimal(5,4)) and not above `maxPurchaseTaxRate`. |
 | `pricesIncludeVat` | no | TRUE or FALSE. |

@@ -281,9 +281,9 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
       'orderKey', 'supplierName', 'status', 'createdOn', 'destinationWarehouseCode', 'sku', 'lineNo', 'qtyOrdered', 'qtyReceived',
       'unitCostForeign', 'lineDiscountPercent', 'taxRateName', 'taxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'notes',
     ],
-    required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign'],
+    required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign', 'lineDiscountPercent'],
     sources: ['qoblex'],
-    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file). The file carries NO currency and NO rate: an order\'s currency is the currency of its supplier in the same run\'s suppliers dataset, and a foreign order\'s rate is read from the ims-fx-rates list at the end of the `createdOn` day. The optional `lineDiscountPercent` (the export\'s per-line Discount (%)) is never applied: an OPEN line with a non-zero discount is refused (PO_LINE_DISCOUNT_NOT_SUPPORTED), because the price would otherwise load as the gross price.',
+    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file). The file carries NO currency and NO rate: an order\'s currency is the currency of its supplier in the same run\'s suppliers dataset, and a foreign order\'s rate is read from the ims-fx-rates list at the end of the `createdOn` day. The REQUIRED `lineDiscountPercent` (a map that leaves it out is refused, because an omitted column would read every discount as 0; the export\'s per-line Discount (%)) is never applied: an OPEN line with a non-zero discount is refused (PO_LINE_DISCOUNT_NOT_SUPPORTED), because the price would otherwise load as the gross price.',
   },
   transfers: {
     columns: ['transferKey', 'status', 'fromWarehouseCode', 'toWarehouseCode', 'sku', 'qtyShipped', 'qtyReceived', 'dispatchDate', 'notes'],

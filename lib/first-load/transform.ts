@@ -1324,6 +1324,11 @@ function loadTransfers(run: Run): void {
 
 function loadPurchaseOrders(run: Run): void {
   const { config } = run
+  // A discount column that the map leaves unread (for example a constant "0" given for lineDiscountPercent while the file still has a Discount (%) header)
+  // would load every discounted line at its gross price without a word: it blocks the run.
+  for (const header of run.input.datasets['purchase-order-lines']?.unmappedHeaders ?? []) {
+    if (/discount/i.test(header)) run.find('ERROR', 'DISCOUNT_COLUMN_NOT_READ', `the purchase-order file has a discount column ${JSON.stringify(header)} that the column map does not read; map it to lineDiscountPercent (an unread discount would load discounted lines at their gross price)`, 'purchase-order-lines')
+  }
   const prefix = config.purchaseOrderKeyPrefix
   type Line = {
     row: CanonRow

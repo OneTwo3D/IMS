@@ -69,3 +69,33 @@ test('the pinned native map reads Discount (%) into lineDiscountPercent, and a n
   const result = ingestDataset('purchase-order-lines', Buffer.from(csv, 'utf8'), 'incoming-stock.csv', mapping)
   assert.deepEqual(result.rows.map((row) => row.values.lineDiscountPercent), ['15', '0', '0', '0'])
 })
+
+const mapText = () => readFileSync(path.join(NATIVE, 'maps', 'qoblex-incoming-stock.map.json'), 'utf8')
+const withoutDiscount = (constant?: string) => {
+  const m = JSON.parse(mapText()) as { datasets: { 'purchase-order-lines': { columns: Record<string, string>; constants: Record<string, string> } } }
+  const d = m.datasets['purchase-order-lines']
+  delete d.columns.lineDiscountPercent
+  if (constant !== undefined) d.constants.lineDiscountPercent = constant
+  return JSON.stringify(m)
+}
+
+// [mutation: lineDiscountPercent dropped from the dataset's required columns]
+test('a column map that leaves lineDiscountPercent out is refused (an omitted column must not read every discount as 0); a canonical file without the header is refused too', (t) => {
+  precondition(t, 'maps', 1)
+  assert.throws(() => parseColumnMap(withoutDiscount(), 'po.map.json'), /required canonical column "lineDiscountPercent" is neither mapped nor given a constant.*PO_LINE_DISCOUNT_COLUMN_REQUIRED/)
+  assert.doesNotThrow(() => parseColumnMap(mapText(), 'po.map.json'), 'the full map works as today')
+  const header = 'orderKey,supplierName,sku,qtyOrdered,qtyReceived,unitCostForeign\r\nO1,Sup,A,2,0,100\r\n'
+  assert.throws(() => ingestDataset('purchase-order-lines', Buffer.from(header, 'utf8'), 'po.csv', null), /required column "lineDiscountPercent" is missing/)
+})
+
+// [mutation: the unread-discount-header check removed / narrowed to a different pattern]
+test('a discount header the map leaves unread blocks the run (DISCOUNT_COLUMN_NOT_READ), even when lineDiscountPercent is given a constant; the full map reads it and does not', (t) => {
+  const csv = Buffer.from(readFileSync(path.join(NATIVE, 'incoming-stock.csv'), 'utf8').replace('"18.5","0"', '"18.5","15"'), 'utf8')
+  precondition(t, 'csv', csv.length)
+  const ingest = (text: string) => ingestDataset('purchase-order-lines', csv, 'incoming-stock.csv', parseColumnMap(text, 'po.map.json').datasets['purchase-order-lines']!)
+  const finding = (d: ReturnType<typeof ingest>) => run({ products: ds('products', [product('SYN-1001'), product('SYN-1002'), product('SYN-3001'), product('SYN-3002')]), 'purchase-order-lines': d }).report.findings.filter((f) => f.code === 'DISCOUNT_COLUMN_NOT_READ' && f.severity === 'ERROR')
+  assert.equal(finding(ingest(withoutDiscount('0'))).length, 1, 'constant 0 with the header unread is blocked')
+  assert.equal(finding(ingest(mapText())).length, 0, 'the full map reads the column')
+  const blocked = run({ products: ds('products', [product('SYN-1001')]), 'purchase-order-lines': ingest(withoutDiscount('0')) })
+  assert.equal(blocked.blocking, true)
+})

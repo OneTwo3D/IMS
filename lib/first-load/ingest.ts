@@ -274,9 +274,14 @@ function parseLayoutKeys(
   }
 
   for (const required of spec.required) {
-    if (!supplied.has(required)) problems.push(`${where}: required canonical column "${required}" is neither mapped nor given a constant`)
+    if (!supplied.has(required)) problems.push(`${where}: required canonical column "${required}" is neither mapped nor given a constant${REQUIRED_COLUMN_HINTS[required] ?? ''}`)
   }
   return { rowsAboveHeader, wide, rowSelect, parentFrom, derived, dateFormats }
+}
+
+/** Why a required column is required, appended to the refusal. */
+const REQUIRED_COLUMN_HINTS: Record<string, string> = {
+  lineDiscountPercent: ' (PO_LINE_DISCOUNT_COLUMN_REQUIRED: the per-line discount must be read, or an omitted column would load every discounted line at its gross price; map the source\'s Discount (%) column to lineDiscountPercent)',
 }
 
 export function parseColumnMap(jsonText: string, label: string): ColumnMap {
@@ -673,7 +678,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       if (!canonical.has(name)) problems.push(`${file}: "${name}" is not a canonical column of ${dataset} (canonical: ${spec.columns.join(', ')})`)
       if ((headerCount.get(name) ?? 0) > 1) problems.push(`${file}: header "${name}" appears more than once`)
     }
-    for (const required of spec.required) if (!header.includes(required)) problems.push(`${file}: required column "${required}" is missing`)
+    for (const required of spec.required) if (!header.includes(required)) problems.push(`${file}: required column "${required}" is missing${REQUIRED_COLUMN_HINTS[required] ?? ''}`)
     header.forEach((name, index) => {
       if (canonical.has(name)) {
         indexOf.set(name, index)

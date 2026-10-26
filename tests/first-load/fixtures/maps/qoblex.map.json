@@ -65,6 +65,7 @@
       }
     },
     "purchase-order-lines": {
+      "constants": { "lineDiscountPercent": "0" },
       "columns": {
         "orderKey": "PO No",
         "supplierName": "Supplier",
