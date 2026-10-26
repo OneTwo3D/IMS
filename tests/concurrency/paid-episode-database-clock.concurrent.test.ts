@@ -250,7 +250,8 @@ test(
 
     const id = `PSRX6-${process.pid}-${randomUUID()}`
     const externalId = Math.floor(Math.random() * 2_000_000_000)
-    t.after(async () => { await db.salesOrder.deleteMany({ where: { id } }) })
+    // The paid delivery now also records the order's receipt (a Payment), so the cleanup removes it first.
+    t.after(async () => { await db.payment.deleteMany({ where: { orderId: id } }); await db.salesOrder.deleteMany({ where: { id } }) })
 
     // The order as IMS holds it before the payment: imported, linked, UNPAID. Nothing to fence yet.
     await db.salesOrder.create({

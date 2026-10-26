@@ -1167,6 +1167,8 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/first-load/apply/report.ts': 'names-the-tools-only',
   'lib/first-load/apply/db/verify.ts': 'operator-run-write',
   'scripts/first-load-apply.ts': 'operator-run-write',
+  // The first-load fx_rates export: the operator-run command that reads fx_rates, the base currency and the server identity in ONE `BEGIN READ ONLY` transaction on a connection opened default_transaction_read_only=on, and writes two files. It writes nothing to the database.
+  'scripts/first-load-export-fx-rates.ts': 'operator-run-read',
   'scripts/lib/first-load-rehearse.ts': 'operator-run-read',
   'scripts/run-migration-verifications.mjs': 'deploy-read-only-probe',
   // o3d-2sm1.5's post-migration ownership assertion. It runs one SELECT over pg_class and asks

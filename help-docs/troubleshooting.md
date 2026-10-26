@@ -84,9 +84,10 @@ When something goes wrong, three places hold the information you need:
 
 ## Purchase orders
 
-### "FX rate is more than 10% different from the latest stored rate"
-- The system rejects manual FX rates that differ from the stored rate by more than 10%, and warns above 2%. The threshold is per the order's creation date, not today.
-- Editing an old DRAFT PO with today's rate vs the PO's original-date rate can trigger this. Either refresh the rate via Settings > Accounting > Update Now, or accept the validation error and use a rate within band.
+### "The rate on a PO is not the one I expected"
+- A PO's rate is always the Settings > Accounting > FX Rates table rate for its currency at the moment it was saved; it cannot be typed (there is no 10% or 2% band any more).
+- To use a different rate, an admin pins a **manual override** on Settings > Accounting > FX Rates (pencil icon); POs saved afterwards use it. A saved PO keeps its stored rate; to re-read the table on a DRAFT PO, change its currency and back, or ask for a rate refresh.
+- A CSV import row whose `fxRateToBase` is not exactly the table rate is refused; leave the column blank.
 
 ### "Missing GBP FX rate for EUR" (or similar)
 - The FX rate cron hasn't fetched today's rate. Click **Update Now** in Settings > Accounting > FX Rates.

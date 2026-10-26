@@ -14,7 +14,20 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
   const { runId, result } = await runCronWithLogging({
     jobName: 'fx-rates',
-    run: async () => await fetchAllFxRatesInternal() as Record<string, unknown>,
+    run: async () => {
+      const refreshed = await fetchAllFxRatesInternal() as Record<string, unknown>
+      // A stored receipt whose ledger registration is not on record is retried on EVERY scheduled run, whether or not any rate changed (the refresh above retries the
+      // rate-waiting orders only after a fetch that updated a rate). Idempotent (the registration enqueue is keyed per receipt and document) and bounded (50 rows).
+      let receiptRetry: unknown = null
+      try {
+        const { retryPendingWcOrdersWaitingForFx } = await import('@/lib/connectors/woocommerce/sync/order-import')
+        const { sweepUnregisteredWcReceipts } = await import('@/lib/connectors/woocommerce/sync/order-import')
+        receiptRetry = { queue: await retryPendingWcOrdersWaitingForFx(50, { receiptsOnly: true }), orphans: await sweepUnregisteredWcReceipts(50) }
+      } catch (error) {
+        receiptRetry = { error: String(error).slice(0, 240) }
+      }
+      return { ...refreshed, pendingWcReceiptRetry: receiptRetry }
+    },
   })
 
   return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())

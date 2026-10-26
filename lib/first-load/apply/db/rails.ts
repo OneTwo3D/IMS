@@ -7,7 +7,7 @@
  *   forbidden SKUs  none of the manifest's forbidSkus (owner rulings that exclude a product) exists in the database either: a file cannot carry them, and a
  *                   load into a database that already has one would be building on a product the owner ruled out;
  *   warehouses      every warehouse the manifest declares exists, is active, is unique under upper-casing and has exactly the declared profile;
- *   FX rates        (purchase orders) each stated rate has a stored base-to-currency rate, and is within the importer's 2% of it;
+ *   FX rates        (purchase orders) each foreign order's rate is exactly the fx_rates rate at the end of its created day;
  *   tax rates       (suppliers) every purchase tax type the suppliers file states resolves to EXACTLY ONE active IMS tax rate usable for purchases (usedFor PURCHASE or BOTH)
  *                   with that accounting tax type: the supplier importer sets the supplier's default tax rate to it, and that rate (and its effective rate) is not above the manifest's
  *                   maxPurchaseTaxRate. A type with NO such rate is not refused yet: the rail asks the Xero tax-rate import (lib/tax/purchase-tax-import.ts) what it WOULD create from the stored
@@ -20,8 +20,7 @@
  * value is an ObservationError, never "fine". Problem text names a rail, a count or the position of an entry in the operator's manifest: never a value from a prepared file.
  */
 import { db } from '@/lib/db'
-import { getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
-import { PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE } from '@/lib/domain/purchasing/purchase-order-fx'
+import { endOfBusinessDateUtc, getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { D, fmtFixed, type Dec } from '../../money'
 import { RUNNER_APPLICATION_NAME, type ApplyStepId, type RailId } from '../constants'
 import { defaultPreloadReaders, evaluatePreloadRails, type PreloadReaders } from './preload-rails'
@@ -78,7 +77,7 @@ export async function evaluateRailResults(prepared: PreparedRun, scope: RailScop
     await rail('forbidden-skus', (p) => forbiddenSkus(prepared, p))
     if (scope.phase === 'preflight' && !scope.resuming) await rail('currency-lock', baseCurrencyNotLocked)
     if ((relevant('opening-stock') || relevant('purchase-orders')) && Object.keys(prepared.manifest.expectWarehouses).length > 0) await rail('warehouses', (p) => warehouses(prepared, p))
-    if (relevant('purchase-orders')) await rail('fx-rates', (p) => fxRates(prepared, p))
+    if (relevant('purchase-orders')) await rail('fx-rates', async (p) => { await fxRates(prepared, p); await poSupplierCurrencies(prepared, p) })
     if (relevant('suppliers') || relevant('purchase-orders')) {
       await rail('tax-rates', async (p, note) => {
         if (relevant('suppliers')) await supplierTaxRates(prepared, p, { allowImport: scope.strictSupplierTax !== true, note })
@@ -225,28 +224,64 @@ async function warehouses(prepared: PreparedRun, problems: string[]): Promise<vo
   })
 }
 
+/** PO_CURRENCY_DIFFERS_FROM_SUPPLIER against the database: a supplier already stored must have the currency the order states (the file check covers a supplier the suppliers step is about to create). */
+async function poSupplierCurrencies(prepared: PreparedRun, problems: string[]): Promise<void> {
+  const step = prepared.steps.find((s) => s.step === 'purchase-orders')
+  if (!step) return
+  const col = (name: string): number => step.data.header.indexOf(name)
+  const [nameIx, currencyIx] = [col('supplierName'), col('currency')]
+  const stored = new Map<string, string[]>()
+  for (const s of await db.supplier.findMany({ select: { name: true, currency: true } })) stored.set(s.name.toUpperCase(), [...(stored.get(s.name.toUpperCase()) ?? []), s.currency.toUpperCase()])
+  let bad = 0
+  for (const row of step.data.rows) {
+    const known = stored.get((nameIx < 0 ? '' : row.cells[nameIx] ?? '').trim().toUpperCase())
+    if (known === undefined) continue
+    const currency = (currencyIx < 0 ? '' : row.cells[currencyIx] ?? '').trim().toUpperCase()
+    if (known.some((c) => c !== currency)) bad++
+  }
+  if (bad > 0) problems.push(`PO_CURRENCY_DIFFERS_FROM_SUPPLIER: ${bad} purchase-order line(s) state a currency that is not the currency stored on their supplier`)
+}
+
 async function fxRates(prepared: PreparedRun, problems: string[]): Promise<void> {
   const base = prepared.manifest.baseCurrency.toUpperCase()
-  const declared = Object.entries(prepared.manifest.fxRates).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-  const now = new Date()
-  for (const [index, [currency, stated]] of declared.entries()) {
-    const at = `FX rate ${index + 1} of ${declared.length} in fxRates`
-    if (currency === base) continue
-    // The one central lookup, "on or before now". A manifest rate is only ever compared with the stored one.
-    // TODO(o3d-q0x56.7): file rates are decided there (accepted or refused); this check then follows that ruling.
-    let stored: Dec
-    try {
-      stored = new D((await getFxRateToBase(db, { currency, asOf: now, baseCurrency: base })).rate.toFixed())
-    } catch (error) {
-      if (!isMissingFxRateError(error)) throw error
-      if (error.reason === 'no_rate') problems.push(`${at}: the database holds no rate for it on or before today`)
-      else if (error.reason === 'non_positive_rate' || error.reason === 'non_finite_rate') problems.push(`${at}: the stored rate is not positive`)
-      else if (error.reason === 'ambiguous_rate') problems.push(`${at}: the database holds two different rates for it at the same instant`)
-      else problems.push(`${at}: it is not a usable currency code`)
-      continue
+  const step = prepared.steps.find((s) => s.step === 'purchase-orders')
+  if (!step) return
+  const col = (name: string): number => step.data.header.indexOf(name)
+  const [currencyIx, rateIx, createdIx] = [col('currency'), col('fxRateToBase'), col('createdOn')]
+  // THE RULE (owner ruling 2026-10-25): an order's rate is ALWAYS the central fx_rates rate. The prepare step looked each foreign order's rate up in fx_rates at the END
+  // of the order's created day (the file's createdOn column), and the apply-time importer prices a system import at that same instant. This rail proves, against the database, that
+  // each foreign order's rate in the file is EXACTLY (decimal-exact, not within a tolerance) the rate the central lookup returns for its currency at that instant. It is not compared
+  // with today's rate: an old order may have a rate far from today's. The runner never writes a rate.
+  const seen = new Set<string>()
+  const checked = new Map<string, string>()
+  let index = 0
+  for (const row of step.data.rows) {
+    const currency = (currencyIx < 0 ? '' : row.cells[currencyIx] ?? '').trim().toUpperCase()
+    if (currency === '' || currency === base) continue
+    const text = (rateIx < 0 ? '' : row.cells[rateIx] ?? '').trim()
+    const createdOn = (createdIx < 0 ? '' : row.cells[createdIx] ?? '').trim()
+    const key = `${currency}|${createdOn}|${text}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    index += 1
+    const at = `FX rate ${index} of the purchase-orders file (${currency}, created ${createdOn === '' ? 'on no stated day' : 'on a stated day'})`
+    let rate: Dec
+    try { rate = new D(text) } catch { problems.push(`PO_FX_RATE_UNREADABLE: ${at}: the rate is not a number`); continue }
+    let asOf: Date
+    try { asOf = endOfBusinessDateUtc(createdOn) } catch { problems.push(`PO_FX_CREATED_ON_MISSING: ${at}: the order has no usable created day (createdOn), so its rate cannot be checked`); continue }
+    const memo = `${currency}|${createdOn}`
+    let expected = checked.get(memo)
+    if (expected === undefined) {
+      try {
+        expected = new D((await getFxRateToBase(db, { currency, asOf, baseCurrency: base })).rate.toFixed()).toFixed()
+        checked.set(memo, expected)
+      } catch (error) {
+        if (!isMissingFxRateError(error)) throw error
+        problems.push(`PO_FX_RATE_MISSING: ${at}: the database holds no usable rate for it on or before the end of that day`)
+        continue
+      }
     }
-    const delta = new D(stated).minus(stored).abs().div(stored)
-    if (delta.gt(new D(PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE))) problems.push(`${at}: it differs from the stored rate by more than the importer's tolerance`)
+    if (!rate.eq(new D(expected))) problems.push(`PO_FX_RATE_NOT_TABLE_RATE: ${at}: the rate is not the fx_rates rate for that currency at the end of that day (it must be exactly the table rate; a rate is only ever read from fx_rates)`)
   }
 }
 

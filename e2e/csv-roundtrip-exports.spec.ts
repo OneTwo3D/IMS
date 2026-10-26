@@ -229,7 +229,7 @@ test.describe.serial('CSV round-trip exports', () => {
     await page.goto('/purchase-orders')
     await uploadCsvAndWaitForResult(page, [
       'orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,unitCostForeign,pricesIncludeVat,notes',
-      `${purchaseOrderKey},E2E Supplier,USD,1.25,DEFAULT,${product.sku},2,10.00,false,${purchaseNote}`,
+      `${purchaseOrderKey},E2E Supplier,USD,,DEFAULT,${product.sku},2,10.00,false,${purchaseNote}`,
     ].join('\n'))
     await expect.poll(() => tryRunFixture(['inspect-purchase-import', purchaseNote]), { timeout: 20000 }).toContain('"currency":"USD"')
 
@@ -266,7 +266,7 @@ test.describe.serial('CSV round-trip exports', () => {
       'orderKey', 'supplierName', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'sku', 'qty',
       'unitCostForeign', 'lineDiscountForeign', 'lineDiscountStr', 'taxRateName', 'taxRateValue',
       'orderTaxRateName', 'orderTaxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery',
-      'orderDiscountForeign', 'notes',
+      'orderDiscountForeign', 'notes', 'createdOn',
     ])
     expect(purchaseRows.some((row) => row.notes === purchaseNote && row.sku === product.sku && row.unitCostForeign === '10.000000')).toBe(true)
 

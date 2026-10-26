@@ -100,7 +100,7 @@ test('the held payload is PARKED, not discarded, so the advertised recovery can 
 
 test('a redelivery captures the number, may correct it before anything posts, and releases the held invoice', () => {
   const src = source(ORDER_IMPORT)
-  const start = src.indexOf('async function updateExistingWcOrderFromPayload(')
+  const start = src.indexOf('async function updateExistingWcOrderCore(')
   const body = src.slice(start, src.indexOf('\n}\n', start))
   assert.ok(body.includes('resolveWcAccountingInvoiceNumber(wcOrder)'), 'the redelivery path must look for the number')
   assert.ok(

@@ -24,6 +24,8 @@ const HEADERS = [
   'expectedDelivery',
   'orderDiscountForeign',
   'notes',
+  // The order's created day (UTC). A SYSTEM import (the first load) prices a foreign order at the end of this day; any other import prices it now.
+  'createdOn',
 ]
 const REQUIRED_HEADERS = ['supplierName', 'sku', 'qty', 'unitCostForeign']
 
@@ -78,6 +80,7 @@ export async function GET(req: NextRequest) {
         expectedDelivery: po.expectedDelivery?.toISOString().slice(0, 10),
         orderDiscountForeign: Number(po.discountAmount ?? 0).toFixed(4),
         notes: po.notes ?? '',
+        createdOn: po.createdAt.toISOString().slice(0, 10),
       })
     }
   }

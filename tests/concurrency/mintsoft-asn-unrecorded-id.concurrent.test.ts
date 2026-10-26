@@ -198,7 +198,6 @@ test(
       reference: tag,
       supplierId: supplier.id,
       currency: 'GBP',
-      fxRateToBase: 1,
       destinationWarehouseId: warehouse.id,
       pricesIncludeVat: false,
       taxRateValue: 0,

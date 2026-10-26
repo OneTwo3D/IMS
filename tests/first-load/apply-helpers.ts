@@ -59,10 +59,11 @@ export function syntheticDatasets(): Partial<Record<DatasetName, IngestedDataset
       lot('ZQSENT-LEG-01', '8', '12', { warehouseCode: 'ZQSENT-MAIN' }),
       lot('ZQSENT-TSHIRT-M', '3', '0', { warehouseCode: 'ZQSENT-MAIN' }),
     ]),
+    'ims-fx-rates': ds('ims-fx-rates', [{ currency: 'EUR', rate: '1.25', fetchedAt: '2026-09-10T06:00:00Z' }]),
     'purchase-order-lines': ds('purchase-order-lines', [
-      { orderKey: PO_ONE, supplierName: 'ZQSENT Timber Co', currency: 'GBP', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-OAK-BOARD', qtyOrdered: '60', qtyReceived: '0', unitCostForeign: '4.25' },
-      { orderKey: PO_TWO, supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-M', qtyOrdered: '20', qtyReceived: '0', unitCostForeign: '2.1' },
-      { orderKey: PO_TWO, supplierName: 'ZQSENT Cotton Ltd', currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-S', qtyOrdered: '30', qtyReceived: '0', unitCostForeign: '2.1' },
+      { orderKey: PO_ONE, supplierName: 'ZQSENT Timber Co', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-OAK-BOARD', qtyOrdered: '60', qtyReceived: '0', unitCostForeign: '4.25' },
+      { orderKey: PO_TWO, supplierName: 'ZQSENT Cotton Ltd', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-M', qtyOrdered: '20', qtyReceived: '0', unitCostForeign: '2.1' },
+      { orderKey: PO_TWO, supplierName: 'ZQSENT Cotton Ltd', destinationWarehouseCode: 'ZQSENT-MAIN', sku: 'ZQSENT-TSHIRT-S', qtyOrdered: '30', qtyReceived: '0', unitCostForeign: '2.1' },
     ]),
   }
 }
@@ -89,7 +90,6 @@ export function manifestText(overrides: Record<string, unknown> = {}): string {
     steps: ['suppliers', 'products', 'opening-stock', 'purchase-orders'],
     expectWarehouses: WAREHOUSES,
     acceptZeroCost: ['ZQSENT-TSHIRT-M@ZQSENT-MAIN'],
-    fxRates: { EUR: '1.25' },
     restorePointDir: '/restore',
   }
   const merged = { ...base, ...overrides }

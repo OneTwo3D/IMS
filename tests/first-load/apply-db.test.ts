@@ -125,7 +125,7 @@ const ODD_FILES: Record<ApplyStepId, StepRows> = {
   'purchase-orders': stepRows(PURCHASE_ORDERS_IMPORT_HEADERS, [
     { orderKey: PO_ONE, supplierName: SUPPLIER_A.toLowerCase(), currency: '', destinationWarehouseCode: 'zqsent-main', sku: `${TAG}-SIMPLE`, qty: '3', unitCostForeign: '1.10', lineDiscountForeign: '0.30', lineDiscountStr: '10%', taxRateName: VAT_NAME.toLowerCase(), orderTaxRateName: VAT_NAME, orderTaxRateValue: '20', pricesIncludeVat: 'yes', supplierRef: ' REF-1 ', expectedDelivery: '2027-03-01', orderDiscountForeign: '0.50', notes: 'note' },
     { orderKey: PO_ONE, supplierName: SUPPLIER_A.toLowerCase(), currency: '', destinationWarehouseCode: 'zqsent-main', sku: `${TAG}-BOM`, qty: '1.5', unitCostForeign: '2.333333', taxRateValue: '20', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20', pricesIncludeVat: 'yes', supplierRef: ' REF-1 ', expectedDelivery: '2027-03-01', orderDiscountForeign: '0.50', notes: 'note' },
-    { orderKey: PO_TWO, supplierName: SUPPLIER_B, currency: 'EUR', fxRateToBase: '1.25', destinationWarehouseCode: 'ZQSENT-OVER', sku: `${TAG}-VARIANT`, qty: '20', unitCostForeign: '0.5' },
+    { orderKey: PO_TWO, supplierName: SUPPLIER_B, currency: 'EUR', fxRateToBase: '1.25', createdOn: '2026-09-15', destinationWarehouseCode: 'ZQSENT-OVER', sku: `${TAG}-VARIANT`, qty: '20', unitCostForeign: '0.5' },
     // PO_THREE: the order names a tax; one line names none (the importer gives it the order's), one names it.
     { orderKey: PO_THREE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-SIMPLE`, qty: '2', unitCostForeign: '3', orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' },
     { orderKey: PO_THREE, supplierName: SUPPLIER_A, destinationWarehouseCode: 'ZQSENT-MAIN', sku: `${TAG}-BOM`, qty: '1', unitCostForeign: '4', taxRateName: VAT_NAME, orderTaxRateName: VAT_NAME, orderTaxRateValue: '20' },
@@ -220,6 +220,8 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
     // Xero is the tax-rate master: the supplier tax rail holds every existing supplier default rate to this stored list (INPUT2 20%, ZERORATEDINPUT 0%, NONE 0%).
     await seedTrustedList(db)
     await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date(Date.now() - 3_600_000) } })
+    // The order PO_TWO is created 2026-09-15: its rate is the table rate at the END of that day (the same row the synthetic ims-fx-rates list holds).
+    await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date('2026-09-10T06:00:00Z') } })
 
     // WooCommerce configured and enabled, so that an effect that is NOT suppressed leaves an outbox row behind; the control below proves it would.
     const { serializeSettingValue } = await import('@/lib/settings-store')
@@ -2162,12 +2164,46 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.ok(cells >= 7)
       })
 
-      it('purchase orders: an FX rate outside the importer\'s 2%, and a currency with no stored rate, are refused', async () => {
-        const row = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR' } })
-        await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.30' } })
-        try { assert.match((await rails('purchase-orders')).join(';'), /FX rate 1 of 1 in fxRates: it differs from the stored rate by more than the importer's tolerance/) } finally { await m.db.fxRate.update({ where: { id: row.id }, data: { rate: '1.25' } }) }
-        await m.db.fxRate.update({ where: { id: row.id }, data: { toCurrency: 'SEK' } })
-        try { assert.match((await rails('purchase-orders')).join(';'), /the database holds no rate for it/) } finally { await m.db.fxRate.update({ where: { id: row.id }, data: { toCurrency: 'EUR' } }) }
+      it('purchase orders: a stored supplier whose currency differs from the order\'s is refused PO_CURRENCY_DIFFERS_FROM_SUPPLIER; restored, it passes', async () => {
+        // The suppliers step has not run, so the supplier is created here (as the suppliers step would) and removed again. The FX rail's own verdict is read, because the
+        // stray supplier row also trips the data-classes rail.
+        const fxRail = async () => (await m.rails.evaluateRailResults(prepared, { phase: 'recheck', resuming: true, step: 'purchase-orders' }, CLEAN_PRELOAD)).find((r) => r.id === 'fx-rates')!.problems
+        const sup = await m.db.supplier.create({ data: { name: 'ZQSENT Cotton Ltd', currency: 'USD' } }) // the synthetic prepared run's EUR supplier
+        try {
+          assert.match((await fxRail()).join(';'), /PO_CURRENCY_DIFFERS_FROM_SUPPLIER/)
+          await m.db.supplier.update({ where: { id: sup.id }, data: { currency: 'EUR' } })
+          assert.deepEqual(await fxRail(), [], 'a stored supplier with the order\'s currency passes')
+        } finally { await m.db.supplier.delete({ where: { id: sup.id } }) }
+        assert.deepEqual(await rails('purchase-orders'), [])
+      })
+
+      // [mutation: compare with today\'s rate or within a tolerance instead of decimal-exact equality at the created day; read the latest row instead of the row at that day; skip the created-day lookup]
+      it('purchase orders: the file\'s rate must be EXACTLY the fx_rates rate at the end of the order\'s created day (not within 2%, not today\'s rate); a missing rate refuses', async () => {
+        const atDay = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR', fetchedAt: new Date('2026-09-10T06:00:00Z') } })
+        const today = await m.db.fxRate.findFirstOrThrow({ where: { toCurrency: 'EUR', id: { not: atDay.id } } })
+        assert.deepEqual(await rails('purchase-orders'), [], 'control: the file\'s 1.25 is the table rate at the created day')
+        // (1) the table rate at that day differs from the file by 0.8%: inside the old 2% band, refused now.
+        await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.26' } })
+        try { assert.match((await rails('purchase-orders')).join(';'), /the rate is not the fx_rates rate for that currency at the end of that day/) } finally { await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.25' } }) }
+        // (2) today\'s rate is far from the file\'s (60%): an old order is NOT refused for that (the removed limit).
+        await m.db.fxRate.update({ where: { id: today.id }, data: { rate: '2.00' } })
+        try { assert.deepEqual(await rails('purchase-orders'), [], 'an order created long ago may have a rate far from today\'s') } finally { await m.db.fxRate.update({ where: { id: today.id }, data: { rate: '1.25' } }) }
+        // (3) no row on or before the end of that day.
+        await m.db.fxRate.update({ where: { id: atDay.id }, data: { fetchedAt: new Date('2026-09-16T06:00:00Z') } })
+        try { assert.match((await rails('purchase-orders')).join(';'), /the database holds no usable rate for it on or before the end of that day/) } finally { await m.db.fxRate.update({ where: { id: atDay.id }, data: { fetchedAt: new Date('2026-09-10T06:00:00Z') } }) }
+        // (3b) the file states no created day at apply: refused with its own code, never defaulted to today.
+        const step = prepared.steps.find((x) => x.step === 'purchase-orders')!
+        const ix = step.data.header.indexOf('createdOn')
+        const blanked = { ...prepared, steps: prepared.steps.map((x) => (x === step ? { ...x, data: { ...x.data, rows: x.data.rows.map((r) => ({ ...r, cells: r.cells.map((c, i) => (i === ix ? '' : c)) })) } } : x)) } as unknown as PreparedRun
+        assert.ok(ix >= 0)
+        assert.match((await evaluateRails(blanked, { phase: 'recheck', resuming: true, step: 'purchase-orders' })).join(';'), /PO_FX_CREATED_ON_MISSING/)
+        assert.match((await (async () => { await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.26' } }); try { return await rails('purchase-orders') } finally { await m.db.fxRate.update({ where: { id: atDay.id }, data: { rate: '1.25' } }) } })()).join(';'), /PO_FX_RATE_NOT_TABLE_RATE/, 'a rate the table holds today (1.25) but not at the created day is refused')
+        // (4) a currency with no stored rate at all.
+        await m.db.fxRate.updateMany({ where: { toCurrency: 'EUR' }, data: { toCurrency: 'SEK' } })
+        try { assert.match((await rails('purchase-orders')).join(';'), /the database holds no usable rate for it/) } finally { await m.db.fxRate.updateMany({ where: { toCurrency: 'SEK' }, data: { toCurrency: 'EUR' } }) }
+        // (5) a manual override pinned on the created day is the latest row at that instant, so it IS the table rate and the file\'s old rate no longer equals it.
+        const pin = await m.db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.31', fetchedAt: new Date('2026-09-15T08:00:00Z'), source: 'manual', manualOverride: true } })
+        try { assert.match((await rails('purchase-orders')).join(';'), /the rate is not the fx_rates rate/, 'a manual override on the created day is the latest row at that instant, so it is the table rate') } finally { await m.db.fxRate.delete({ where: { id: pin.id } }) }
         assert.deepEqual(await rails('purchase-orders'), [])
       })
 

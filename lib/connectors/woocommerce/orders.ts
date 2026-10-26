@@ -1,4 +1,5 @@
 import { after } from 'next/server'
+import { parseWcGmtInstant } from './sync/receipt-settlement-rate'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
@@ -189,7 +190,7 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
         const wcOrderRef = `wc-${order.id}`
         if (alreadyImported.has(wcOrderRef)) { progress.ordersSkipped++; continue }
 
-        const orderDate = new Date(order.date_created)
+        const orderDate = parseWcGmtInstant(order.date_created) // suffix-less: read as UTC, never in the server's zone
 
         for (const item of order.line_items) {
           if (!item.sku || item.quantity <= 0) continue

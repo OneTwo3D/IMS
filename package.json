@@ -27,6 +27,7 @@
     "first-load:prepare": "tsx scripts/first-load-prepare.ts",
     "first-load:woo-snapshot": "tsx scripts/first-load-woo-snapshot.ts",
     "first-load:apply": "tsx scripts/first-load-apply.ts",
+    "first-load:export-fx-rates": "tsx scripts/first-load-export-fx-rates.ts",
     "repair:duplicate-bom": "tsx scripts/deactivate-duplicate-bom.ts",
     "db:stamp-scratch": "tsx scripts/stamp-scratch-database.ts",
     "db:unstamp-scratch": "tsx scripts/stamp-scratch-database.ts --unstamp",

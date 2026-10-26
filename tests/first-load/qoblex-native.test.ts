@@ -236,27 +236,28 @@ test('dates: "Thu, Sep 24 2026" reads as 2026-09-24; a wrong weekday, an impossi
   for (const value of bad) assert.equal(parseDateByFormat(format, value), null, value)
 })
 
-test('open purchase orders: due dates are converted, the currency and rate are derived from the supplier by a closed list, status is a closed list', (t) => {
+test('open purchase orders: dates are converted, no currency or rate is read or derived, status is a closed list', (t) => {
   const mapping = parseColumnMap(readMap('qoblex-incoming-stock.map.json'), 'po.map.json').datasets['purchase-order-lines']!
   const result = ingestDataset('purchase-order-lines', read('incoming-stock.csv'), 'incoming-stock.csv', mapping)
   precondition(t, 'records', result.recordsRead)
   assert.equal(result.hadBom, true)
   assert.deepEqual(
-    result.rows.map((row) => [row.values.orderKey, row.values.sku, row.values.status, row.values.currency, row.values.fxRateToBase, row.values.expectedDelivery, row.values.destinationWarehouseCode]),
+    result.rows.map((row) => [row.values.orderKey, row.values.sku, row.values.status, row.values.createdOn, row.values.expectedDelivery, row.values.destinationWarehouseCode, row.values.supplierName]),
     [
-      ['PO900', 'SYN-1001', 'OPEN', 'USD', '1.25', '2026-10-08', 'MIL1'],
-      ['PO900', 'SYN-1002', 'OPEN', 'USD', '1.25', '2026-10-08', 'MIL1'],
-      ['PO901', 'SYN-3001', 'OPEN', 'EUR', '1.15', '2026-10-14', 'MIL1'],
-      ['PO901', 'SYN-3002', 'OPEN', 'EUR', '1.15', '2026-10-14', 'MIL1'],
+      ['PO900', 'SYN-1001', 'OPEN', '2026-09-24', '2026-10-08', 'MIL1', 'Supplier Alpha'],
+      ['PO900', 'SYN-1002', 'OPEN', '2026-09-24', '2026-10-08', 'MIL1', 'Supplier Alpha'],
+      ['PO901', 'SYN-3001', 'OPEN', '2026-04-22', '2026-10-14', 'MIL1', 'Supplier Gamma'],
+      ['PO901', 'SYN-3002', 'OPEN', '2026-04-22', '2026-10-14', 'MIL1', 'Supplier Gamma'],
     ],
   )
-  assert.deepEqual(result.unmappedHeaders, ['Product variant', 'Created on', 'Received on', 'Discount (%)'], 'unread columns (a discount among them) stay visible')
-  // A supplier that is not in the closed list, a status that is not, and a bad date are each refused on their row (one edit per case).
+  assert.ok(!('currency' in mapping.columns) && !('fxRateToBase' in mapping.columns) && Object.keys(mapping.derived).length === 0 && !('currency' in mapping.valueMaps) && !('fxRateToBase' in mapping.valueMaps), 'the map carries no currency or rate')
+  assert.deepEqual(result.unmappedHeaders, ['Product variant', 'Received on', 'Discount (%)'], 'unread columns (a discount among them) stay visible')
+  // A status that is not in the closed list and a bad date are each refused on their row (one edit per case).
   const original = readFileSync(path.join(NATIVE, 'incoming-stock.csv'), 'utf8')
   const edits: Array<[string, string, string, RegExp]> = [
-    ['supplier', '"Supplier Alpha","REF-1"', '"Supplier Unlisted","REF-1"', /currency is derived from supplierName = "Supplier Unlisted"/],
     ['status', '"Approved"', '"Draft"', /status value "Draft" is not in the column map's valueMaps\.status/],
     ['weekday', '"Wed, Oct 14 2026"', '"Tue, Oct 14 2026"', /does not match the declared date format/],
+    ['created weekday', '"Thu, Sep 24 2026","","Thu, Oct 8 2026","PO900","Approved","16"', '"Fri, Sep 24 2026","","Thu, Oct 8 2026","PO900","Approved","16"', /does not match the declared date format/],
   ]
   for (const [name, from, to, expected] of edits) {
     assert.ok(original.includes(from), `precondition not reached: ${name}`)

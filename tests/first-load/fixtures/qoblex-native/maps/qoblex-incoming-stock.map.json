@@ -27,32 +27,21 @@
         "qtyReceived": "Received Quantity",
         "unitCostForeign": "Price",
         "supplierRef": "Supplier Reference",
+        "createdOn": "Created on",
         "expectedDelivery": "Due On"
       },
       "constants": {
         "destinationWarehouseCode": "MIL1"
       },
-      "derived": {
-        "currency": "supplierName",
-        "fxRateToBase": "currency"
-      },
       "dateFormats": {
+        "createdOn": "ddd, MMM D YYYY",
         "expectedDelivery": "ddd, MMM D YYYY"
       },
       "valueMaps": {
         "status": {
           "Approved": "OPEN",
-          "PartiallyReceived": "OPEN"
-        },
-        "currency": {
-          "Supplier Alpha": "USD",
-          "Supplier Beta": "GBP",
-          "Supplier Gamma": "EUR"
-        },
-        "fxRateToBase": {
-          "GBP": "",
-          "USD": "1.25",
-          "EUR": "1.15"
+          "PartiallyReceived": "OPEN",
+          "Closed": "CLOSED"
         }
       }
     }

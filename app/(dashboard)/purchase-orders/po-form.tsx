@@ -234,6 +234,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   // Header state — prefilled from existingPo when editing
   const [supplierId, setSupplierId] = useState(existingPo?.supplierId ?? '')
   const [currency, setCurrency] = useState(existingPo?.currency ?? baseCurrency.code)
+  // Display only: the server stores the rate it reads from fx_rates, never this number.
   const [fxRate, setFxRate] = useState(existingPo?.fxRateToBase ?? 1)
   const [destinationWarehouseId, setDestinationWarehouseId] = useState(existingPo?.destinationWarehouseId ?? '')
   const [supplierRef, setSupplierRef] = useState(existingPo?.supplierRef ?? '')
@@ -649,7 +650,6 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     const payload = {
       supplierId,
       currency,
-      fxRateToBase: fxRate,
       destinationWarehouseId: destinationWarehouseId || undefined,
       supplierRef: supplierRef || undefined,
       skipPreferredSupplierUpdate,
@@ -779,7 +779,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           </div>
 
           <div className="space-y-1.5">
-            <Label>Currency / FX Rate</Label>
+            <Label>Currency / FX Rate (table rate)</Label>
             <div className="flex gap-2">
               <select
                 value={currency}
@@ -793,10 +793,13 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               </select>
               <div className="flex-1 relative">
                 <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 {baseCurrency.code} =</span>
+                {/* Read-only: an order's rate is always the Settings -> Accounting -> FX Rates table rate (a manual override there is pinned by an admin), re-read when the order is saved with a new currency. */}
                 <Input
-                  type="number" min="0.0001" step="0.0001"
+                  type="number"
                   value={fxRate}
-                  onChange={(e) => setFxRate(Number(e.target.value) || 1)}
+                  readOnly
+                  aria-label="Exchange rate (from the FX Rates table)"
+                  title="Set by the FX Rates table (Settings, Accounting). It cannot be typed here."
                   className="pl-16 h-9 font-mono text-sm"
                   disabled={currency === baseCurrency.code}
                 />

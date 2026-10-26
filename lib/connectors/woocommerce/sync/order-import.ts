@@ -4,6 +4,7 @@
 
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
+import { resolveWcReceiptSettlementRate, parseWcGmtInstant } from './receipt-settlement-rate'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { logActivity } from '@/lib/activity-log'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
@@ -67,6 +68,8 @@ export type ImportWcOrderOptions = {
   skipAccounting?: boolean
   useWcDateAsCreatedAt?: boolean
   pendingFxRetryLogId?: string
+  /** The stored receipt a pending-FX retry row is waiting to register (its payload's `receiptPaymentId`). */
+  receiptPaymentId?: string
   /**
    * How this import may CREATE an order IMS has never seen (o3d-tj6v r5).
    *
@@ -115,6 +118,8 @@ export type PendingFxOrderPayload = {
   currency: string
   asOf: string | null
   order: WcFullOrder
+  /** Set when the row holds a stored receipt's registration obligation: the retry re-registers THIS receipt (by id). */
+  receiptPaymentId?: string
 }
 
 export function shouldBlockWcTaxRateFallback(lines: WcTaxRateFallbackLine[]): boolean {
@@ -623,7 +628,7 @@ export function reconcileWcDocumentTax(
 
 export function buildPendingFxOrderPayload(
   wcOrder: WcFullOrder,
-  error: { currency: string; asOf?: Date },
+  error: { currency: string; asOf?: Date; paymentId?: string },
 ): PendingFxOrderPayload {
   return {
     reason: MISSING_FX_RATE_QUEUE_REASON,
@@ -633,6 +638,7 @@ export function buildPendingFxOrderPayload(
     currency: error.currency,
     asOf: error.asOf?.toISOString() ?? null,
     order: wcOrder,
+    ...(error.paymentId ? { receiptPaymentId: error.paymentId } : {}),
   }
 }
 
@@ -668,7 +674,7 @@ async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'us
 
 async function recordPendingFxOrder(
   wcOrder: WcFullOrder,
-  error: { message: string; currency: string; asOf?: Date },
+  error: { message: string; currency: string; asOf?: Date; paymentId?: string },
   retryLogId?: string,
 ): Promise<void> {
   const payload = buildPendingFxOrderPayload(wcOrder, error)
@@ -681,7 +687,8 @@ async function recordPendingFxOrder(
     externalId: String(wcOrder.id),
     payload: jsonPayload,
     errorMessage: error.message,
-    syncedAt: null,
+    // for a PENDING row, syncedAt is its LAST ATTEMPT (rotation order in retryPendingWcOrdersWaitingForFx)
+    syncedAt: new Date(),
   }
 
   if (retryLogId) {
@@ -733,8 +740,11 @@ async function recordPendingFxOrder(
 }
 
 async function markPendingFxRetryLogSynced(logId: string, orderId: string): Promise<void> {
-  await db.shoppingSyncLog.update({
-    where: { id: logId },
+  // A ROW THAT NAMES (OR IS ABOUT) A STORED RECEIPT IS NEVER RETIRED UNTIL THAT RECEIPT'S OBLIGATION IS PROVEN ON RECORD, at this moment and not at the moment a branch was planned: every WooCommerce-recorded receipt of the order (which includes one a concurrent delivery named on this row since) is proven or re-registered, and a
+  // failure to prove throws WcReceiptRegistrationNotRecorded, which keeps the row PENDING. The write itself only retires a row that is still PENDING.
+  await redriveUnregisteredWcReceipts(orderId)
+  await db.shoppingSyncLog.updateMany({
+    where: { id: logId, status: 'PENDING' },
     data: {
       status: 'SYNCED',
       entityId: orderId,
@@ -780,9 +790,253 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
  *
  * `importWcOrder` remains the only production entry point; nothing but the regression calls this.
  */
-export async function updateExistingWcOrderFromPayload(
+/**
+ * THE UNPAID -> PAID TRANSITION OF AN ORDER IMS ALREADY HOLDS goes through the SAME receipt rule as an order imported paid (o3d-q0x56.19):
+ *   - the settlement rate: the order's own rate when the payment is on the order's UTC day, else the central rate at the end of the payment's day
+ *     (`resolveWcReceiptSettlementRate`); a day with no rate is `foreign_payment_missing_rate`;
+ *   - a local Payment row carrying `settlementRateToBase`, and its ledger registration (`registerInvoicePaymentWithLedger`).
+ * It applies to the pending-FX retry AND the ordinary webhook/poll update: both reach `updateExistingWcOrderFromPayload`, so the gap (an order imported unpaid and
+ * paid later got `paidAt` and no receipt, no registration) was in both, and is closed in both.
+ *
+ * IDEMPOTENCY: the transition is claimed under the order's row lock by a conditional write, `updateMany({ id, paidAt: null })`, in the SAME transaction that creates the
+ * Payment. A retry or a duplicate delivery reads `paidAt` already set, claims nothing, and creates no second Payment. (There is no unique constraint on payments to lean on.)
+ *
+ * A missing rate leaves the order UNPAID (the rest of the update still applies) and the MissingFxRateError is rethrown after it, so `importWcOrder` keeps/queues the
+ * pending-FX row (it is not marked synced) and retries after the next rate refresh.
+ */
+/**
+ * THE REGISTRATION OBLIGATION OF A RECORDED RECEIPT IS DURABLE, AND THE PENDING-FX QUEUE IS WHAT HOLDS IT.
+ *
+ * `registerInvoicePaymentWithLedger` decides and writes its INVOICE_PAYMENT row in its own transaction and swallows a failure (it logs `invoice_payment_not_queued`, the same
+ * way `addPayment` does). The receipt here is committed before that call, so a failure would leave a receipt that no later delivery would ever send. So after the call this
+ * checks for the evidence that the obligation is on record, and when it is not, throws `WcReceiptRegistrationNotRecorded`: `importWcOrder` then keeps the pending-FX row
+ * PENDING (or opens one), and the next retry or redelivery runs `redriveUnregisteredWcReceipts`, which calls the registration again. The enqueue is idempotent per
+ * receipt and document (`invoicePaymentEnqueueKey`), so a repeat can never register twice.
+ *
+ * Evidence that the obligation is on record: (a) nothing is expected yet (no invoice posted: the invoice post's deferred pass registers the receipts then; or no accounting
+ * connector posts payments), (b) an INVOICE_PAYMENT sync row for THIS receipt, in any status (a refusal is recorded as an outstanding row), or (c) a decided refusal notice
+ * for this receipt (`invoice_payment_not_registered`, which names the hand remedy). The throw case (`invoice_payment_not_queued`) is none of these.
+ */
+export class WcReceiptRegistrationNotRecorded extends Error {
+  constructor(readonly orderId: string, readonly paymentId: string | null, readonly currency: string, readonly causeText?: string) {
+    super(`the receipt ${paymentId ?? '(not yet known)'} of order ${orderId} is stored but its ledger registration is not on record yet; it is retried${causeText ? ` (${causeText})` : ''}`)
+    this.name = 'WcReceiptRegistrationNotRecorded'
+  }
+}
+
+async function wcReceiptObligationIsOnRecord(orderId: string, paymentId: string): Promise<boolean> {
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { accountingInvoiceId: true, currency: true } })
+  if (!order || !order.accountingInvoiceId) return true
+  const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
+  const connector = await getActiveAccountingConnectorInfo().catch(() => null)
+  if (!connector) return true
+  if (!(await isAccountingSyncTypeEnabledFor(connector.id, 'INVOICE_PAYMENT').catch(() => true))) return true
+  const { loadInvoicePaymentSyncRows } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  if ((await loadInvoicePaymentSyncRows(orderId, connector.id, order.currency)).some((row) => row.paymentId === paymentId)) return true
+  return (await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_payment_not_registered', metadata: { path: ['paymentId'], equals: paymentId } } })) > 0
+}
+
+/** The evidence read, as a seam so a test can state "the registration did not reach the record" without a live accounting connector. */
+async function defaultRegistrationsAreOwed(): Promise<boolean> {
+  const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
+  const connector = await getActiveAccountingConnectorInfo().catch(() => null)
+  return connector !== null && (await isAccountingSyncTypeEnabledFor(connector.id, 'INVOICE_PAYMENT').catch(() => false))
+}
+
+export const wcReceiptRegistrationSeams: { obligationIsOnRecord: (orderId: string, paymentId: string) => Promise<boolean>; afterPlan?: (orderId: string) => Promise<void>; afterReceiptCommit?: (orderId: string) => Promise<void>; insideReceiptTransaction?: () => Promise<void>; registrationsAreOwed?: () => Promise<boolean> } = { obligationIsOnRecord: wcReceiptObligationIsOnRecord }
+
+/** Register one stored receipt and prove the obligation is on record, or throw so the caller keeps the work queued. */
+async function registerWcReceiptAndProveObligation(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
+  // ONCE A PAYMENT IS COMMITTED, EVERY FAILURE HERE IS A RETRYABLE RECEIPT OBLIGATION, never a failed import: whatever is thrown (a transient read in the proof, the
+  // registration itself) becomes WcReceiptRegistrationNotRecorded carrying the paymentId, so the pending-FX row stays PENDING and names the receipt to re-drive.
+  try {
+    await registerWcReceiptAndProveObligationUnguarded(orderId, reference, receipt)
+  } catch (error) {
+    if (error instanceof WcReceiptRegistrationNotRecorded) throw error
+    throw new WcReceiptRegistrationNotRecorded(orderId, receipt.id, receipt.currency, error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function registerWcReceiptAndProveObligationUnguarded(orderId: string, reference: string, receipt: { id: string; amount: unknown; currency: string; method: string | null; reference: string | null; paidAt: Date; settlementRateToBase: unknown }): Promise<void> {
+  const { registerInvoicePaymentWithLedger } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  await registerInvoicePaymentWithLedger({
+    orderId,
+    orderReference: reference,
+    paymentId: receipt.id,
+    amount: toDecimal(receipt.amount as never),
+    currency: receipt.currency,
+    method: receipt.method,
+    reference: receipt.reference,
+    paidAt: receipt.paidAt,
+    settlementRateToBase: receipt.settlementRateToBase === null || receipt.settlementRateToBase === undefined ? null : Number(receipt.settlementRateToBase),
+  })
+  if (!(await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, receipt.id))) throw new WcReceiptRegistrationNotRecorded(orderId, receipt.id, receipt.currency)
+}
+
+/** Receipts this path recorded earlier whose registration never reached the record (the call failed): registered again, idempotently. */
+async function redriveUnregisteredWcReceipts(orderId: string, receiptPaymentId?: string): Promise<void> {
+  let receipts
+  try {
+    receipts = await redriveCandidates(orderId, receiptPaymentId)
+  } catch (error) {
+    throw new WcReceiptRegistrationNotRecorded(orderId, receiptPaymentId ?? null, 'n/a', error instanceof Error ? error.message : String(error))
+  }
+  for (const r of receipts) {
+    if (await wcReceiptRegistrationSeams.obligationIsOnRecord(orderId, r.id).catch(() => false)) continue
+    await registerWcReceiptAndProveObligation(orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? orderId, r)
+  }
+}
+
+async function redriveCandidates(orderId: string, receiptPaymentId?: string) {
+  return db.payment.findMany({
+    // by the stored payment id the pending row names, and by the notes this path writes
+    where: { orderId, refundId: null, OR: [{ notes: { startsWith: 'Recorded from WooCommerce' } }, ...(receiptPaymentId ? [{ id: receiptPaymentId }] : [])] },
+    select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { externalOrderNumber: true, orderNumber: true } } },
+    orderBy: { createdAt: 'asc' },
+  })
+}
+
+type WcPaidTransition =
+  | { kind: 'none' }
+  | { kind: 'record'; settlementRate: number | null }
+  | { kind: 'blocked'; error: unknown }
+
+async function planWcPaidTransition(orderId: string, wcOrder: WcFullOrder): Promise<WcPaidTransition> {
+  if (!wcOrder.date_paid_gmt) return { kind: 'none' }
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, currency: true, fxRateToBase: true, totalForeign: true, externalCreatedAt: true } })
+  if (!order || order.paidAt !== null || !toDecimal(order.totalForeign).gt(0)) return { kind: 'none' }
+  try {
+    const rate = await resolveWcReceiptSettlementRate({
+      currency: order.currency,
+      baseCurrency: await (await import('@/lib/base-currency')).getBaseCurrencyCode(),
+      // the order date the IMPORT persisted (from date_created_gmt, else date_created); IMS's own createdAt is NOT the order date. None persisted: not assumed same-day (the payment-day central rate is used).
+      orderedAt: order.externalCreatedAt ?? null,
+      orderRate: Number(order.fxRateToBase),
+      datePaidGmt: wcOrder.date_paid_gmt,
+      lookup: getFxRateToBase,
+    })
+    return { kind: 'record', settlementRate: rate === null ? null : Math.round(rate * 1e8) / 1e8 }
+  } catch (error) {
+    if (!isMissingFxRateError(error)) throw error
+    return { kind: 'blocked', error }
+  }
+}
+
+async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, settlementRate: number | null, retryLogId?: string): Promise<void> {
+  const paidAt = parseWcGmtInstant(wcOrder.date_paid_gmt as string)
+  const claimed = await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    // THE CLAIM: only one delivery moves paidAt from NULL; a duplicate or retry finds it set and does nothing.
+    // The episode marker is minted EXACTLY as the update path always did, in the same write as paidAt, whatever receipts exist (the value is the DATABASE's clock, whatever is
+    // written: trigger of migration 20260901090000). A new paid episode starts here; only addPayment clears the marker, and only for a receipt it records (o3d-psrx r6/r8). The registration
+    // below, or an earlier one completing after this fence, discharges it.
+    const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true } })
+    if (order.paidAt !== null) return null
+    // THE PAID TOTAL MUST BE THE TOTAL IMS HOLDS. An update delivery refreshes addresses and notes but NOT the lines or the total (updateExistingWcOrderCore), so an order edited in
+    // WooCommerce between the import and the payment still carries the old total here. Compared to the minor unit of the order currency, under the lock: if they differ nothing is
+    // recorded (no paidAt, no Payment) and a review notice is written; a later delivery after the totals agree records it.
+    const dp = currencyMinorUnits(order.currency)
+    let paidTotalText: string | null = null
+    try { paidTotalText = toDecimal(wcOrder.total).toFixed(dp) } catch { paidTotalText = null }
+    const storedTotalText = toDecimal(order.totalForeign).toFixed(dp)
+    if (paidTotalText === null || paidTotalText !== storedTotalText) {
+      return { mismatch: { stored: storedTotalText, paid: paidTotalText ?? String(wcOrder.total ?? ''), currency: order.currency, reference: order.externalOrderNumber ?? order.orderNumber ?? orderId } } as const
+    }
+    // WooCommerce paid the order TOTAL, so what is recorded is the part of it NOT already covered. Read and summed UNDER THE LOCK, so a receipt added after the plan was made is counted.
+    const existing = await tx.payment.findMany({ where: { orderId, refundId: null }, select: { amount: true, currency: true } })
+    const ambiguous = existing.some((p) => p.currency.trim().toUpperCase() !== order.currency.trim().toUpperCase())
+    let covered = toDecimal(0)
+    for (const p of existing) covered = covered.plus(toDecimal(p.amount))
+    const remaining = toDecimal(order.totalForeign).minus(covered)
+    const covers = !ambiguous && remaining.lte(0)
+    await tx.salesOrder.update({ where: { id: orderId }, data: { paidAt, unregisteredPaidAt: paidAt } })
+    const reference = order.externalOrderNumber ?? order.orderNumber ?? orderId
+    if (ambiguous || covers) return { receipt: null, reference, ambiguous, existingCount: existing.length }
+    const receipt = await tx.payment.create({
+      data: {
+        orderId,
+        amount: remaining,
+        currency: order.currency,
+        method: wcOrder.payment_method_title || wcOrder.payment_method || null,
+        reference: wcOrder.transaction_id || null,
+        notes: existing.length > 0
+          ? 'Recorded from WooCommerce (paid later than the import): the part of the order total not already covered by earlier receipts'
+          : 'Recorded from WooCommerce (the order was imported unpaid and paid later)',
+        paidAt,
+        settlementRateToBase: settlementRate,
+      },
+      select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true },
+    })
+    // THE OBLIGATION ROW COMMITS WITH THE PAYMENT. A pending-FX row naming the receipt (status PENDING, entityId null, payload.receiptPaymentId) is written in THIS transaction, so a
+    // process that stops anywhere after the commit leaves the receipt and the record that it must be registered together; the scheduled fx-rates run retries PENDING rows. An existing
+    // retry row (the caller's) is updated in place, otherwise one is created. It is retired only after the registration is proven (below), never before.
+    const queuePayload = JSON.parse(JSON.stringify(buildPendingFxOrderPayload(wcOrder, { currency: order.currency, paymentId: receipt.id }))) as Prisma.InputJsonValue
+    const queueData = { connector: 'woocommerce', direction: 'FROM_CONNECTOR' as const, status: 'PENDING' as const, entityType: 'SalesOrder', externalId: String(wcOrder.id), payload: queuePayload, errorMessage: 'The receipt is stored; its ledger registration is not yet proven', syncedAt: null }
+    let obligationRowId: string
+    if (retryLogId) {
+      await tx.shoppingSyncLog.update({ where: { id: retryLogId }, data: queueData })
+      obligationRowId = retryLogId
+    } else {
+      obligationRowId = (await tx.shoppingSyncLog.create({ data: queueData, select: { id: true } })).id
+    }
+    await wcReceiptRegistrationSeams.insideReceiptTransaction?.()
+    return { receipt, reference, ambiguous: false, existingCount: existing.length, obligationRowId, ownsObligationRow: !retryLogId }
+  })
+  if (!claimed) return
+  if ('mismatch' in claimed && claimed.mismatch) {
+    const m = claimed.mismatch
+    // idempotent per order and total pair: the same disagreement is written once however often it is delivered
+    const already = await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_paid_total_differs', AND: [{ metadata: { path: ['imsTotal'], equals: m.stored } }, { metadata: { path: ['paidTotal'], equals: m.paid } }] } })
+    if (already === 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'wc_paid_total_differs',
+        tag: 'sync',
+        level: 'ERROR',
+        description: `WooCommerce reports order ${m.reference} paid at ${m.currency} ${m.paid}, but IMS holds ${m.currency} ${m.stored}. The payment was NOT recorded and the order is not marked paid. Bring the order's total into line with WooCommerce; the payment is recorded on the next delivery once the totals agree.`,
+        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), imsTotal: m.stored, paidTotal: m.paid, currency: m.currency },
+      })
+    }
+    return
+  }
+  if (claimed.ambiguous) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'wc_paid_transition_ambiguous_receipts',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `WooCommerce order ${claimed.reference} is paid, but the receipts IMS already holds for it are in another currency than the order, so the uncovered amount cannot be computed. The order is marked paid and IMS added no payment for it. Record the payment on the order.`,
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), reason: 'receipt_currency_differs_from_order' },
+    })
+    return
+  }
+  if (!claimed.receipt) return
+  await wcReceiptRegistrationSeams.afterReceiptCommit?.(orderId)
+  await registerWcReceiptAndProveObligation(orderId, claimed.reference, { ...claimed.receipt, settlementRateToBase: settlementRate })
+  // PROVEN: retire the obligation row this transaction wrote (a caller's retry row is retired by the caller after ITS proof).
+  if (claimed.ownsObligationRow) {
+    await db.shoppingSyncLog.updateMany({ where: { id: claimed.obligationRowId, status: 'PENDING' }, data: { status: 'SYNCED', entityId: orderId, errorMessage: null, syncedAt: new Date() } })
+  }
+}
+
+export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string): Promise<void> {
+  const transition = await planWcPaidTransition(orderId, wcOrder)
+  await wcReceiptRegistrationSeams.afterPlan?.(orderId)
+  await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
+  if (transition.kind === 'record') await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId)
+  if (transition.kind === 'blocked') throw transition.error
+  // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
+  // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
+  if (transition.kind === 'record' || wcOrder.date_paid_gmt || receiptPaymentId) await redriveUnregisteredWcReceipts(orderId, receiptPaymentId)
+}
+
+async function updateExistingWcOrderCore(
   orderId: string,
   wcOrder: WcFullOrder,
+  /** The unpaid -> paid transition is handled by the receipt rule above: this update must not set the paid flag itself. */
+  paidTransitionHandledSeparately: boolean,
 ): Promise<void> {
   // STORE CREDIT ON AN ORDER IMS ALREADY HOLDS is NEVER recorded after creation: `storeCreditForeign` and the
   // discount are set once, by the credit-aware import, from one classification. A later delivery is
@@ -834,7 +1088,7 @@ export async function updateExistingWcOrderFromPayload(
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
-        paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
+        paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //
         // This is the writer Codex found: an order imported UNPAID and paid in WooCommerce later.
@@ -848,7 +1102,7 @@ export async function updateExistingWcOrderFromPayload(
         // `undefined` on the same condition as `paidAt`, not `null`: an unpaid payload must leave
         // BOTH columns exactly as they are, or a redelivery of the pre-payment webhook would wipe
         // the provenance off an order that is already paid and re-open the defect.
-        unregisteredPaidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
+        unregisteredPaidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
       },
     })
   })
@@ -1844,7 +2098,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       },
     })
     if (existing) {
-      await updateExistingWcOrderFromPayload(existing.id, wcOrder)
+      await updateExistingWcOrderFromPayload(existing.id, wcOrder, options.receiptPaymentId, options.pendingFxRetryLogId)
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
       // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
       // import that created the order is still between its create transaction and its
@@ -1914,18 +2168,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       || 'WooCommerce Customer'
 
     // FX, against the currency read above.
+    // WooCommerce's GMT fields carry no zone suffix: ALWAYS read through parseWcGmtInstant (as UTC), never `new Date(<string>)`, which reads a suffix-less string in the SERVER's zone.
+    // The site-local `date_created` fallback has no zone in the payload and the site's zone is not known here, so it is read the same way (as UTC): deterministic, independent of the server TZ.
     const orderedAt = wcOrder.date_created_gmt
-      ? new Date(`${wcOrder.date_created_gmt.replace(/Z$/, '')}Z`)
-      : (wcOrder.date_created ? new Date(wcOrder.date_created) : undefined)
+      ? parseWcGmtInstant(wcOrder.date_created_gmt)
+      : (wcOrder.date_created ? parseWcGmtInstant(wcOrder.date_created) : undefined)
     // The order's own date bounds the rate. An order with no date at all is priced as of now (it used to be unbounded,
     // which meant the same thing: the latest row there is).
-    const fxRate = await getFxRateToBase(currency, orderedAt ?? new Date())
-    // o3d-q0x56.2: the receipt row stores its settlement rate (8 dp, as the column does). An imported order is paid in its own currency at the
-    // time it was booked, so that is the order's own booked rate; a base-currency order stores none.
-    const importedReceiptSettlementRate = currency.trim().toUpperCase() === (await (await import('@/lib/base-currency')).getBaseCurrencyCode()).trim().toUpperCase()
-      ? null
-      : (usableStoredFxRate(fxRate)?.toNumber() ?? null)
-
+    const orderInstant = orderedAt ?? new Date()
+    const fxRate = await getFxRateToBase(currency, orderInstant)
     const pricesIncludeVat = wcOrder.prices_include_tax
 
     // Line items (each one may carry its own externalTaxRateId)
@@ -2336,6 +2587,18 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     // Does this payload carry a receipt? Paid per WooCommerce, with a positive total the gateway charged.
     const importedReceipt = Boolean(wcOrder.date_paid_gmt) && toDecimal(totalForeign).gt(0)
+    // o3d-q0x56.19: resolved BEFORE the transaction, so a refusal (foreign_payment_missing_rate) writes nothing and queues the order.
+    // Same business day as the order: the order's booked rate; a later day: the central rate at that day's end; none: refused. Base: null.
+    const importedReceiptSettlementRate = importedReceipt
+      ? await resolveWcReceiptSettlementRate({
+        currency,
+        baseCurrency: await (await import('@/lib/base-currency')).getBaseCurrencyCode(),
+        orderedAt: orderInstant,
+        orderRate: fxRate,
+        datePaidGmt: wcOrder.date_paid_gmt as string,
+        lookup: getFxRateToBase,
+      })
+      : null
     // A ref cell, not a bare `let`: the write happens inside the transaction callback and control-flow
     // analysis would narrow a `let` to `null` at the read site below.
     const importedReceiptRef = { id: null as string | null }
@@ -2356,9 +2619,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           ...(invoiceNumberResolution.ok ? { invoiceNumber: invoiceNumberResolution.invoiceNumber } : {}),
           paymentMethod: wcOrder.payment_method || null,
           paymentMethodTitle: wcOrder.payment_method_title || null,
-          externalCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
-          externalUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
-          ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
+          externalCreatedAt: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created),
+          externalUpdatedAt: parseWcGmtInstant(wcOrder.date_modified_gmt || wcOrder.date_modified),
+          ...(options.useWcDateAsCreatedAt ? { createdAt: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
           status: lifecycleStatus,
           refundStatus: importRefundDisposition,
           shipFromWarehouseId: wcDefaultWarehouseId,
@@ -2398,7 +2661,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // backfill refuses to reinterpret an amount whose model it cannot establish.
           discountModel: 'LINE_ALLOCATED',
           notes: wcOrder.customer_note || null,
-          paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
+          paidAt: wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null,
           // o3d-psrx r2 — the initial import's half of the same fact, in the same CREATE.
           //
           // This order's receipt IS destined for the ledger: the SALES_INVOICE is queued with
@@ -2408,7 +2671,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // created, the order is held as paid with no receipt and no registration — the same window,
           // reached by a different route. Stamped here, it withholds for exactly that window and stops
           // mattering the moment the registration posts.
-          unregisteredPaidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
+          unregisteredPaidAt: wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null,
           shoppingLinks: {
             create: {
               connector: 'woocommerce',
@@ -2439,7 +2702,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               method: wcOrder.payment_method_title || wcOrder.payment_method || null,
               reference: wcOrder.transaction_id || null,
               notes: 'Imported from WooCommerce (paid when the order was imported)',
-              paidAt: new Date(wcOrder.date_paid_gmt as string),
+              paidAt: parseWcGmtInstant(wcOrder.date_paid_gmt as string),
               settlementRateToBase: importedReceiptSettlementRate === null ? null : Math.round(importedReceiptSettlementRate * 1e8) / 1e8,
             },
             select: { id: true },
@@ -2673,7 +2936,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
-          date: new Date(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+          date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
           currency,
           // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
@@ -2729,6 +2992,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // `wcOrder.total` either: no payment is registered for it (the invoice is refused anyway; see
           // lib/domain/accounting/store-credit-invoice-refusal.ts).
           _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder && !hasStoreCredit,
+          // o3d-q0x56.19: the rate of THIS payment (the payment date's, or the order's on the same day). Never inferred from currencyRateToBase.
+          ...(importedReceiptSettlementRate !== null ? { _paymentSettlementRateToBase: Math.round(importedReceiptSettlementRate * 1e8) / 1e8 } : {}),
           // The local receipt this payment is (see the Payment row written with the order). Present only
           // where there is one; the poster carries it onto the INVOICE_PAYMENT as its identity.
           ...(importedReceiptRef.id ? { _paymentId: importedReceiptRef.id } : {}),
@@ -2869,6 +3134,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     return { success: true, orderId: so.id }
   } catch (e) {
+    if (e instanceof WcReceiptRegistrationNotRecorded) {
+      await recordPendingFxOrder(wcOrder, { message: e.message, currency: e.currency, ...(e.paymentId ? { paymentId: e.paymentId } : options.receiptPaymentId ? { paymentId: options.receiptPaymentId } : {}) }, options.pendingFxRetryLogId)
+      return { success: false, error: `${e.message}; kept in the retry queue` }
+    }
     if (isMissingFxRateError(e)) {
       await recordPendingFxOrder(wcOrder, {
         message: e.message,
@@ -2910,73 +3179,134 @@ export function isQueuedWcOrderPayload(payload: unknown): payload is PendingFxOr
     && typeof (payload as { order?: { id?: unknown } }).order?.id === 'number'
 }
 
-export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
+/**
+ * THE ORPHAN SWEEP (defence in depth for the obligation row written with the Payment). Stored WooCommerce-recorded receipts (notes prefix 'Recorded from WooCommerce') on orders whose
+ * invoice has posted, older than a few minutes (so an in-flight registration is not raced), that have no obligation on record, are registered again. Bounded per run; idempotent per
+ * receipt (the enqueue key). Run by the scheduled fx-rates cron every run.
+ */
+export async function sweepUnregisteredWcReceipts(limit = 50): Promise<{ examined: number; registered: number; failed: number }> {
+  const result = { examined: 0, registered: 0, failed: 0 }
+  // Nothing is owed when no accounting connector posts payments: asked ONCE, so such receipts never fill the batch.
+  if (!(await (wcReceiptRegistrationSeams.registrationsAreOwed ?? defaultRegistrationsAreOwed)())) return result
+  const take = Math.min(Math.max(limit, 1), 250)
+  const cutoff = new Date(Date.now() - 5 * 60_000)
+  // THE FILTER IS IN THE QUERY, BEFORE THE LIMIT: only receipts with NO INVOICE_PAYMENT sync row and NO decided-refusal notice are candidates (anti-joins), so receipts that are already
+  // registered can never occupy a slot. Ordered by the last failed attempt (never-attempted first), then oldest, so a receipt that keeps failing moves behind the others.
+  const candidates = await db.$queryRaw<Array<{ id: string }>>`
+    SELECT p.id FROM "payments" p
+    JOIN "sales_orders" o ON o.id = p."orderId"
+    WHERE p."refundId" IS NULL AND p.notes LIKE 'Recorded from WooCommerce%' AND p."createdAt" < ${cutoff} AND o.accounting_invoice_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" l WHERE l.type = 'INVOICE_PAYMENT' AND l."referenceType" = 'SalesOrder' AND l."referenceId" = p."orderId" AND l.payload->>'paymentId' = p.id)
+      AND NOT EXISTS (SELECT 1 FROM "activity_logs" a WHERE a.action = 'invoice_payment_not_registered' AND a."entityType" = 'SALES_ORDER' AND a."entityId" = p."orderId" AND a.metadata->>'paymentId' = p.id)
+    ORDER BY coalesce((SELECT max(f."createdAt") FROM "activity_logs" f WHERE f.action IN ('invoice_payment_not_queued', 'wc_receipt_sweep_attempt_failed') AND f."entityType" = 'SALES_ORDER' AND f."entityId" = p."orderId" AND f.metadata->>'paymentId' = p.id), 'epoch'::timestamp) ASC, p."createdAt" ASC
+    LIMIT ${take}`
+  const rows = await db.payment.findMany({
+    where: { id: { in: candidates.map((c) => c.id) } },
+    select: { id: true, orderId: true, amount: true, currency: true, method: true, reference: true, paidAt: true, settlementRateToBase: true, order: { select: { externalOrderNumber: true, orderNumber: true } } },
+  })
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  result.examined = candidates.length
+  for (const c of candidates) {
+    const r = byId.get(c.id)
+    if (!r) continue
+    try {
+      // the up-front query is the filter; the probe is the final word for what the query cannot see (a connector moved since)
+      if (await wcReceiptRegistrationSeams.obligationIsOnRecord(r.orderId, r.id)) continue
+      await registerWcReceiptAndProveObligation(r.orderId, r.order.externalOrderNumber ?? r.order.orderNumber ?? r.orderId, r)
+      result.registered++
+    } catch {
+      result.failed++
+      await logActivity({ entityType: 'SALES_ORDER', entityId: r.orderId, action: 'wc_receipt_sweep_attempt_failed', tag: 'sync', level: 'WARNING', description: 'The scheduled sweep could not register a stored WooCommerce receipt; it is retried behind the others.', metadata: { paymentId: r.id } }).catch(() => undefined)
+    }
+  }
+  return result
+}
+
+export async function retryPendingWcOrdersWaitingForFx(
+  limit = 50,
+  /**
+   * `receiptsOnly`: retry ONLY the rows that hold a stored receipt's registration obligation (payload.receiptPaymentId). Such a row is not waiting for a rate, so the
+   * scheduled cron retries it on every run whether or not any rate changed; the rows that DO wait for a rate stay on the after-a-rate-update path.
+   */
+  options: { receiptsOnly?: boolean } = {},
+): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
+  // ROTATION: the batch is the rows attempted LEAST RECENTLY. For a PENDING row `syncedAt` is its last-attempt time (null = never attempted, first): a row that keeps failing is stamped
+  // after every attempt (recordPendingFxOrder, and the stamp below) and moves behind the others, so it cannot starve the ones behind it. The bound is unchanged.
   const rows = await db.shoppingSyncLog.findMany({
-    where: pendingFxQueueWhere(),
-    orderBy: { createdAt: 'asc' },
+    where: options.receiptsOnly
+      ? { AND: [pendingFxQueueWhere(), { payload: { path: ['receiptPaymentId'], string_starts_with: '' } }] }
+      : pendingFxQueueWhere(),
+    orderBy: [{ syncedAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
     take: Math.min(Math.max(limit, 1), 250),
     select: { id: true, payload: true },
   })
 
   const result = { attempted: rows.length, imported: 0, stillPending: 0, failed: 0 }
   for (const row of rows) {
-    if (!isQueuedWcOrderPayload(row.payload)) {
-      await markPendingFxRetryLogFailed(row.id, 'Pending FX queue payload is missing the WooCommerce order snapshot')
-      result.failed++
-      continue
-    }
-    // Guarded (o3d-d82p): an order can be withdrawn while it sits in this
-    // queue waiting for an FX rate. The webhook records the suppression and
-    // acknowledges, and this retry would then import the STALE processing
-    // snapshot with no marker, leaving it warehouse-eligible until the next
-    // reconciliation — not a millisecond window.
-    const queuedOrder = row.payload.order
-    const { importWcOrderGuarded } = await import('./withdrawal')
-    const guarded = await importWcOrderGuarded(
-      queuedOrder,
-      () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id }),
-    )
-    if (guarded.outcome === 'skipped-withdrawal') {
-      // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
-      // row whose order is withdrawn would sit at the head forever and, once
-      // `limit` of them accumulate, every FX refresh would retry only those and
-      // never reach newer orders whose rates are now available — stranding
-      // unrelated paid orders unimported.
-      await markPendingFxRetryLogFailed(
-        row.id,
-        'The customer withdrew this order while it waited for an FX rate, so it was not imported',
+    try {
+      if (!isQueuedWcOrderPayload(row.payload)) {
+        await markPendingFxRetryLogFailed(row.id, 'Pending FX queue payload is missing the WooCommerce order snapshot')
+        result.failed++
+        continue
+      }
+      // Guarded (o3d-d82p): an order can be withdrawn while it sits in this
+      // queue waiting for an FX rate. The webhook records the suppression and
+      // acknowledges, and this retry would then import the STALE processing
+      // snapshot with no marker, leaving it warehouse-eligible until the next
+      // reconciliation — not a millisecond window.
+      const queuedPayload = row.payload
+      const queuedOrder = queuedPayload.order
+      const { importWcOrderGuarded } = await import('./withdrawal')
+      const guarded = await importWcOrderGuarded(
+        queuedOrder,
+        () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id, ...(queuedPayload.receiptPaymentId ? { receiptPaymentId: queuedPayload.receiptPaymentId } : {}) }),
       )
-      result.failed++
-      continue
-    }
-    if (guarded.outcome === 'unresolved') {
-      // Genuinely transient (WooCommerce unreachable): stays pending.
-      result.stillPending++
-      continue
-    }
-    const importResult = guarded.result
-    if (importResult.skipped) {
-      // The FX rate arrived but the order is no longer one IMS takes on. `refuseWcOrderCreate`
-      // has already retired this queue row and moved the order to the by-id admission-refusal
-      // queue, so counting it as imported — which is what a bare `success: true` did — would
-      // report an import that did not happen.
-      result.failed++
-      continue
-    }
-    if (importResult.success && guarded.compensationFailed) {
-      // importWcOrder already marked this queue row SYNCED, so there is no
-      // pending row left to carry the retry. Count it as failed and say why —
-      // the tombstone survives, so the next webhook or poll finishes the job.
-      result.failed++
-      console.error(
-        `[wc-fx-retry] order ${queuedOrder.id} imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
-      )
-    } else if (importResult.success) {
-      result.imported++
-    } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh')) {
-      result.stillPending++
-    } else {
-      result.failed++
+      if (guarded.outcome === 'skipped-withdrawal') {
+        // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
+        // row whose order is withdrawn would sit at the head forever and, once
+        // `limit` of them accumulate, every FX refresh would retry only those and
+        // never reach newer orders whose rates are now available — stranding
+        // unrelated paid orders unimported.
+        await markPendingFxRetryLogFailed(
+          row.id,
+          'The customer withdrew this order while it waited for an FX rate, so it was not imported',
+        )
+        result.failed++
+        continue
+      }
+      if (guarded.outcome === 'unresolved') {
+        // Genuinely transient (WooCommerce unreachable): stays pending.
+        result.stillPending++
+        continue
+      }
+      const importResult = guarded.result
+      if (importResult.skipped) {
+        // The FX rate arrived but the order is no longer one IMS takes on. `refuseWcOrderCreate`
+        // has already retired this queue row and moved the order to the by-id admission-refusal
+        // queue, so counting it as imported — which is what a bare `success: true` did — would
+        // report an import that did not happen.
+        result.failed++
+        continue
+      }
+      if (importResult.success && guarded.compensationFailed) {
+        // importWcOrder already marked this queue row SYNCED, so there is no
+        // pending row left to carry the retry. Count it as failed and say why —
+        // the tombstone survives, so the next webhook or poll finishes the job.
+        result.failed++
+        console.error(
+          `[wc-fx-retry] order ${queuedOrder.id} imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
+        )
+      } else if (importResult.success) {
+        result.imported++
+      } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh') || importResult.error?.includes('kept in the retry queue')) {
+        result.stillPending++
+      } else {
+        result.failed++
+      }
+  
+    } finally {
+      // stamp the attempt on a row that is still PENDING (a row that was retired or failed is not rotated)
+      try { await db.shoppingSyncLog.updateMany({ where: { id: row.id, status: 'PENDING' }, data: { syncedAt: new Date() } }) } catch { /* a missed stamp only delays the rotation */ }
     }
   }
   if (result.attempted > 0) {

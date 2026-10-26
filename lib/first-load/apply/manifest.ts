@@ -7,8 +7,6 @@
  * assertion nobody checked. Every problem is collected, so one run shows the whole list.
  */
 import path from 'node:path'
-import { NUMERIC_LIMITS } from '../spec'
-import { D, parseDecimal, fmt } from '../money'
 import { normaliseStoreOrigin, parseVisibilityAttestation, type VisibilityAttestation } from '../snapshot'
 import {
   APPLY_MANIFEST_KEYS, APPLY_STEP_IDS, APPLY_WOO_SNAPSHOT_KEYS, RUN_ID_PATTERN, STEP_PREREQUISITES, SUPPORTED_BASE_CURRENCY, WAREHOUSE_PROFILE_KEYS, WAREHOUSE_TYPES,
@@ -39,8 +37,6 @@ export interface ApplyManifest {
   expectWarehouses: Record<string, WarehouseProfile>
   /** Normalised "UPPERSKU@UPPERWAREHOUSE", sorted, unique. */
   acceptZeroCost: string[]
-  /** Keyed by UPPER-CASE currency; plain decimal strings. */
-  fxRates: Record<string, string>
   /** Normalised UPPER-CASE SKUs that must appear in NO prepared file (for example products the owner ruled out). */
   forbidSkus: string[]
   /** Location only: not part of the digest. */
@@ -58,7 +54,6 @@ export class ApplyManifestError extends Error {
 }
 
 const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._ -]{0,39}$/
-const CURRENCY_PATTERN = /^[A-Za-z]{3}$/
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -162,26 +157,6 @@ export function parseApplyManifest(text: string): ApplyManifest {
   }
   if (!usesStock && acceptZeroCost.length > 0) fail('apply manifest acceptZeroCost is given but opening-stock is not a step')
 
-  const fxRates: Record<string, string> = {}
-  if (raw.fxRates !== undefined) {
-    if (!isObject(raw.fxRates)) fail('apply manifest fxRates must be an object of currency to rate')
-    else {
-      for (const [fxIndex, [currency, rate]] of Object.entries(raw.fxRates).entries()) {
-        const at = `fxRates entry ${fxIndex + 1}`
-        if (!CURRENCY_PATTERN.test(currency)) { fail(`apply manifest ${at} is not a 3-letter currency`); continue }
-        const upper = currency.toUpperCase()
-        if (upper === SUPPORTED_BASE_CURRENCY) { fail(`apply manifest fxRates must not list the base currency ${SUPPORTED_BASE_CURRENCY}`); continue }
-        if (upper in fxRates) { fail(`apply manifest ${at} lists a currency twice`); continue }
-        const parsed = typeof rate === 'string' ? parseDecimal(rate, 'rate', NUMERIC_LIMITS.fx) : { ok: false as const, reason: 'rate must be a string such as "1.25" (a JSON number would lose digits)' }
-        // parseDecimal's reason quotes the text it was given: only the fact is reported.
-        if (!parsed.ok) { fail(typeof rate === 'string' ? `apply manifest ${at} is not an acceptable rate (a plain decimal string within the limits)` : `apply manifest ${at} must be a string such as "1.25" (a JSON number would lose digits)`); continue }
-        if (!parsed.value.gt(new D(0))) { fail(`apply manifest ${at} must be greater than zero`); continue }
-        fxRates[upper] = fmt(parsed.value)
-      }
-    }
-  }
-  if (!usesPurchaseOrders && Object.keys(fxRates).length > 0) fail('apply manifest fxRates is given but purchase-orders is not a step')
-
   const forbidSkus: string[] = []
   if (raw.forbidSkus !== undefined) {
     if (!Array.isArray(raw.forbidSkus)) fail('apply manifest forbidSkus must be a list of SKUs')
@@ -223,7 +198,6 @@ export function parseApplyManifest(text: string): ApplyManifest {
     steps,
     expectWarehouses,
     acceptZeroCost,
-    fxRates,
     forbidSkus,
     restorePointDir: restorePointDir as string,
     wooSnapshot,
@@ -238,7 +212,6 @@ export function digestableManifest(manifest: ApplyManifest): unknown {
     steps: manifest.steps,
     expectWarehouses: manifest.expectWarehouses,
     acceptZeroCost: manifest.acceptZeroCost,
-    fxRates: manifest.fxRates,
     forbidSkus: manifest.forbidSkus,
     wooSnapshot: manifest.wooSnapshot === null ? null : { origin: manifest.wooSnapshot.origin, visibilityChecked: manifest.wooSnapshot.visibilityChecked },
   }

@@ -140,7 +140,7 @@ export const TRANSFERS_IMPORT_HEADERS = ['transferKey', 'fromWarehouseCode', 'to
 export const PURCHASE_ORDERS_IMPORT_HEADERS = [
   'orderKey', 'supplierName', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'sku', 'qty', 'unitCostForeign',
   'lineDiscountForeign', 'lineDiscountStr', 'taxRateName', 'taxRateValue', 'orderTaxRateName', 'orderTaxRateValue',
-  'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'orderDiscountForeign', 'notes',
+  'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'orderDiscountForeign', 'notes', 'createdOn',
 ] as const
 
 export type ImporterTarget = 'products' | 'suppliers' | 'opening-stock' | 'transfers' | 'purchase-orders'
@@ -227,6 +227,7 @@ export const DATASET_NAMES = [
   'ims-skus',
   'ims-suppliers',
   'ims-tax-rates',
+  'ims-fx-rates',
 ] as const
 export type DatasetName = (typeof DATASET_NAMES)[number]
 
@@ -277,12 +278,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
   },
   'purchase-order-lines': {
     columns: [
-      'orderKey', 'supplierName', 'status', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'sku', 'lineNo', 'qtyOrdered', 'qtyReceived',
+      'orderKey', 'supplierName', 'status', 'createdOn', 'destinationWarehouseCode', 'sku', 'lineNo', 'qtyOrdered', 'qtyReceived',
       'unitCostForeign', 'taxRateName', 'taxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'notes',
     ],
-    required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign', 'currency'],
+    required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign'],
     sources: ['qoblex'],
-    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file).',
+    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file). The file carries NO currency and NO rate: an order\'s currency is the currency of its supplier in the same run\'s suppliers dataset, and a foreign order\'s rate is read from the ims-fx-rates list at the end of the `createdOn` day.',
   },
   transfers: {
     columns: ['transferKey', 'status', 'fromWarehouseCode', 'toWarehouseCode', 'sku', 'qtyShipped', 'qtyReceived', 'dispatchDate', 'notes'],
@@ -333,6 +334,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     required: ['name'],
     sources: [],
     purpose: 'The tax rates that already exist in the target IMS (name, accounting tax type, usedFor, active). Lets the tool resolve each supplier\'s purchase tax type to exactly one active purchase-capable IMS rate at prepare time. Omit it and that resolution is NOT checked here (the apply-time rail supplier-tax-rates still refuses). Always canonical.',
+  },
+  'ims-fx-rates': {
+    columns: ['currency', 'rate', 'fetchedAt', 'baseCurrency'],
+    required: ['currency', 'rate', 'fetchedAt'],
+    sources: [],
+    purpose: 'The rows of IMS\'s fx_rates table (base to currency: 1 base = `rate` foreign; `fetchedAt` an ISO instant with a zone, e.g. 2026-10-20T06:00:00Z). The ONLY source of a foreign purchase order\'s rate: the transform applies the central lookup rule (the latest row at or before the end of the order\'s created day, UTC) over this list. Omit it and every foreign order is rejected (a rate is never taken from a file or defaulted). Written by `npm run first-load:export-fx-rates`, which stamps every row with `baseCurrency`; a row whose `baseCurrency` differs from the run\'s base currency is rejected (BASE_CURRENCY_MISMATCH). Always canonical.',
   },
   'ims-skus': {
     columns: ['sku', 'type'],
@@ -489,7 +496,7 @@ export const APPLY_TIME_CHECKS: ReadonlyArray<{ id: string; area: string; check:
   { id: 'opening-stock-empty', area: 'opening-stock', check: 'The product and warehouse have no stock, cost layer or movement yet (importOpeningStockCsv refuses otherwise; it is not repeatable).' },
   { id: 'po-supplier-exists', area: 'purchase-orders', check: 'Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first.' },
   { id: 'supplier-tax-rate', area: 'suppliers', check: 'Each supplier\'s purchaseTaxType (a Xero tax type) resolves to exactly one active IMS tax rate that is usable for purchases (usedFor PURCHASE or BOTH) and carries that accountingTaxType. Several matching rates refuse the run; with none, the apply step first imports the rate from the stored Xero tax-rate list and refuses only if that import is refused (see docs/first-load-apply.md); the supplier importer sets the supplier\'s default tax rate to it and refuses the row otherwise. The tool performs this only against an ims-tax-rates list you supply; WITHOUT it the report says the resolution was NOT checked.' },
-  { id: 'po-fx-rate', area: 'purchase-orders', check: 'For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this.' },
+  { id: 'po-fx-rate', area: 'purchase-orders', check: 'Every non-base order\'s fxRateToBase is EXACTLY the rate IMS\'s fx_rates gives for its currency at the end of the order\'s created day (the createdOn column; it was looked up there at prepare time). An order\'s rate is always the table rate: the purchase-order importer takes none from the file and refuses a stated rate that differs. It is not compared with today\'s rate, so an order created long ago may have a rate far from today\'s. The CSV dry-run does not run this.' },
   { id: 'po-tax-rate', area: 'purchase-orders', check: 'Each line\'s taxRateName (names are matched case-insensitively, trimmed) or, when only a taxRateValue is given, its value (matched within 0.00005) resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. A line never carries both: the tool cannot show a name and a value agree.' },
   { id: 'lookup-keys-unique-in-ims', area: 'all', check: 'In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers\' case-insensitive matching: they build a Map and the last duplicate wins silently. The tool performs the supplier and SKU parts only against an ims-suppliers / ims-skus list you supply; WITHOUT that list the collision check against IMS is NOT performed and the report says so. Warehouse codes and tax names are never checked by the tool.' },
   { id: 'po-reference-free', area: 'purchase-orders', check: 'No existing purchase order already has a prefixed orderKey as its reference (an existing one is skipped, not updated).' },
