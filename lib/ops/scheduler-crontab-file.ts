@@ -37,9 +37,12 @@ export const CRON_D_FILE_NAME_RE = /^[A-Za-z0-9_-]+$/
 /**
  * Pure. Turns the text of a cron.d-layout file into the text `crontab -l` would show for the same jobs: the user field is removed
  * from every job line. A job line whose sixth field is not a plausible user name has NO user field, so cron would run the first word
- * of the command as the user and the job would never run correctly; such a line is DROPPED, so the job reads as unscheduled instead of
- * matching the generator's text. Comments, blank lines and NAME=value lines are left alone.
+ * of the command as the user and the job would never run correctly; such a line is replaced by an inert comment (so line numbers hold), and
+ * the job reads as unscheduled instead of matching the generator's text. Comments, blank lines and NAME=value lines are left alone.
  */
+/** Stands in for a dropped line, so every later line keeps its line number in diagnostics. An inert comment. */
+const IGNORED_LINE = '# (a line without a valid user field was ignored here)'
+
 export function stripCronDUserField(text: string): string {
   const out: string[] = []
   for (const line of text.split('\n')) {
@@ -47,12 +50,12 @@ export function stripCronDUserField(text: string): string {
     if (trimmed === '' || trimmed.startsWith('#') || ASSIGNMENT_RE.test(trimmed)) { out.push(line); continue }
     const special = SPECIAL_RE.exec(trimmed)
     if (special) {
-      if (USER_RE.test(special[2]!)) out.push(`${special[1]}  ${special[3]}`)
+      out.push(USER_RE.test(special[2]!) ? `${special[1]}  ${special[3]}` : IGNORED_LINE)
       continue
     }
     const five = FIVE_FIELD_RE.exec(trimmed)
     if (five) {
-      if (USER_RE.test(five[2]!)) out.push(`${five[1]}  ${five[3]}`)
+      out.push(USER_RE.test(five[2]!) ? `${five[1]}  ${five[3]}` : IGNORED_LINE)
       continue
     }
     out.push(line)
@@ -60,14 +63,11 @@ export function stripCronDUserField(text: string): string {
   return out.join('\n')
 }
 
-/** Words that make a `NAME=value` assignment look like a credential; any value assignment is redacted in a preview anyway. */
-const VALUE_ASSIGNMENT_RE = /([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S+)/g
-
-/** A short preview of a stray line that cannot leak a value: every NAME=value is shown as NAME=<redacted>. Pure. */
-export function redactedLinePreview(line: string): string {
-  const redacted = line.trim().replace(VALUE_ASSIGNMENT_RE, '$1=<redacted>')
-  return redacted.length > 100 ? `${redacted.slice(0, 100)}...` : redacted
-}
+/*
+ * DIAGNOSTICS NEVER CARRY INSTALLED COMMAND TEXT. A host cron line can hold a bearer token or any other credential, and these
+ * messages reach the Scheduler page and `--check` output, so they give line numbers and a classification only; the one piece of an
+ * assignment that is ever shown is its variable NAME, never its value.
+ */
 
 /**
  * Pure. What a cron.d file holds OUTSIDE its managed block (user field already removed). In cron.d mode the file belongs entirely to
@@ -78,16 +78,18 @@ export function redactedLinePreview(line: string): string {
  * Either way the block cannot vouch for the schedule. Marker problems (a second pair, an unbalanced one) are reported by
  * `parseManagedBlock`. Assignments INSIDE the block are whatever the renderer emits, covered by the exact block comparison.
  */
-export function linesOutsideManagedBlock(text: string): { active: string[]; assignments: string[] } {
-  const out = { active: [] as string[], assignments: [] as string[] }
+export function linesOutsideManagedBlock(text: string): { active: number[]; assignments: { line: number; name: string }[] } {
+  const out = { active: [] as number[], assignments: [] as { line: number; name: string }[] }
   let inside = false
-  for (const line of text.replace(/\r\n?/g, '\n').split('\n')) {
-    const trimmed = line.trim()
+  const lines = text.replace(/\r\n?/g, '\n').split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i]!.trim()
     if (trimmed === OTI_CRON_START_MARKER) { inside = true; continue }
     if (trimmed === OTI_CRON_END_MARKER) { inside = false; continue }
     if (inside || trimmed === '' || trimmed.startsWith('#')) continue
-    if (ASSIGNMENT_RE.test(trimmed)) out.assignments.push(trimmed)
-    else out.active.push(trimmed)
+    const assignment = /^([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(trimmed)
+    if (assignment) out.assignments.push({ line: i + 1, name: assignment[1]! })
+    else out.active.push(i + 1)
   }
   return out
 }
@@ -96,13 +98,14 @@ export function linesOutsideManagedBlock(text: string): { active: string[]; assi
  * Pure. Installed job lines (anywhere in the file, user field already removed) whose five schedule fields are not a valid cron
  * schedule. cron ignores such a line, so the job never runs while an exact-text comparison with the renderer's output can still match.
  */
-export function invalidScheduleLines(text: string): { line: string; error: string }[] {
-  const out: { line: string; error: string }[] = []
-  for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
-    const trimmed = raw.trim()
+export function invalidScheduleLines(text: string): { line: number; field: string; kind: string }[] {
+  const out: { line: number; field: string; kind: string }[] = []
+  const lines = text.replace(/\r\n?/g, '\n').split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i]!.trim()
     if (!/^[0-9*]/.test(trimmed)) continue
     const check = validateCronSchedule(trimmed.split(/\s+/).slice(0, 5).join(' '))
-    if (!check.ok) out.push({ line: trimmed, error: check.error })
+    if (!check.ok) out.push({ line: i + 1, field: check.field, kind: check.kind })
   }
   return out
 }
@@ -176,17 +179,17 @@ export function readSchedulerCrontabFile(
   const stripped = stripCronDUserField(text)
   const invalid = invalidScheduleLines(stripped)
   if (invalid.length > 0) {
-    const shown = invalid.slice(0, 3).map((entry) => `"${redactedLinePreview(entry.line)}" (${entry.error})`).join(', ')
-    return { resolved: false, reason: `${OUTSIDE_LINES_REASON_PREFIX} ${invalid.length} installed job line(s) with a schedule cron would not run (${shown}${invalid.length > 3 ? ', ...' : ''})` }
+    const shown = invalid.slice(0, 5).map((entry) => `line ${entry.line}: invalid ${entry.field} (${entry.kind})`).join('; ')
+    return { resolved: false, reason: `${OUTSIDE_LINES_REASON_PREFIX} ${invalid.length} installed job line(s) with a schedule cron would not run (${shown}${invalid.length > 5 ? '; ...' : ''})` }
   }
   const outside = linesOutsideManagedBlock(stripped)
   if (outside.active.length > 0 || outside.assignments.length > 0) {
-    const preview = (lines: string[]) => lines.slice(0, 3).map((line) => `"${redactedLinePreview(line)}"`).join(', ') + (lines.length > 3 ? ', ...' : '')
     const found = [
-      outside.active.length > 0 ? `${outside.active.length} active line(s) outside the managed block that cron would also run (${preview(outside.active)})` : '',
-      outside.assignments.length > 0 ? `${outside.assignments.length} environment assignment(s) outside the managed block that cron applies to the jobs after them (${preview(outside.assignments)})` : '',
-    ].filter(Boolean).join('; ')
-    return { resolved: false, reason: `${OUTSIDE_LINES_REASON_PREFIX} ${found}; the cron.d file must contain only the rendered block` }
+      ...outside.active.slice(0, 5).map((line) => `line ${line}: active job line outside the managed block`),
+      ...outside.assignments.slice(0, 5).map((entry) => `line ${entry.line}: environment assignment outside the managed block (${entry.name})`),
+    ]
+    const total = outside.active.length + outside.assignments.length
+    return { resolved: false, reason: `${OUTSIDE_LINES_REASON_PREFIX} ${total} line(s) outside the managed block that cron would run or apply (${found.join('; ')}${total > found.length ? '; ...' : ''}); the cron.d file must contain only the rendered block` }
   }
   return { resolved: true, text: stripped }
 }

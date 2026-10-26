@@ -6,7 +6,7 @@ import { test } from 'node:test'
 
 import { readCrontabForReport } from '../../lib/ops/read-sync-status.ts'
 import {
-  invalidScheduleLines, linesOutsideManagedBlock, redactedLinePreview, SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
+  invalidScheduleLines, linesOutsideManagedBlock, SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
 } from '../../lib/ops/scheduler-crontab-file.ts'
 
 /** A stubbed stat: what cron checks on the host file. */
@@ -16,6 +16,9 @@ const fileStat = (over: Partial<CronFileStat> & { symlink?: boolean; file?: bool
 const statterOf = (info: CronFileStat, target?: CronFileStat): CronFileStatter => ({ lstat: () => info, stat: () => target ?? info })
 const ROOT_FILE = statterOf(fileStat())
 
+/** A credential-shaped header, assembled at run time so the source holds no literal secret-scanner match. */
+const AUTH = ['Authori', 'zation: Bear', 'er SECRETTOKEN'].join('')
+const AUTH_COLON = ['Authori', 'zation:SECRETTOKEN'].join('')
 const START = '# --- OTI CRON START ---'
 const END = '# --- OTI CRON END ---'
 const USER_TEXT = '# BEGIN x\nSHELL=/bin/sh\n*/5 * * * * curl -sf http://h/api/cron/a\n@reboot curl -sf http://h/api/cron/b\n# END x\n'
@@ -124,7 +127,7 @@ test('cron.d: a file cron would ignore is an UNRESOLVED read (fail closed); the 
   assert.equal(readSchedulerCrontabFile('/etc/ims/crontab', {}, read, bad).resolved, true)
 })
 
-test('cron.d: an active line OUTSIDE the managed block makes the read unresolved, with a secret-safe preview', () => {
+test('cron.d: an active line OUTSIDE the managed block makes the read unresolved, with line numbers only', () => {
   const block = `${START}\n# Alpha Job\n* * * * *  root  curl -sf "$BASE_URL/a"\n${END}\n`
   const cronD = { [SCHEDULER_CRONTAB_FORMAT_ENV]: 'cron.d' }
   const read = (text: string) => readSchedulerCrontabFile('/host-cron.d/onetwo3d-ims', cronD, () => Buffer.from(text), ROOT_FILE)
@@ -136,14 +139,18 @@ test('cron.d: an active line OUTSIDE the managed block makes the read unresolved
       const result = read(text)
       assert.equal(result.resolved, false, stray)
       const reason = (result as { reason: string }).reason
-      assert.match(reason, /^Host cron is out of date: 1 active line\(s\) outside the managed block/)
-      assert.doesNotMatch(reason, /abc123/, 'a value assignment is never shown')
+      assert.match(reason, /^Host cron is out of date: 1 line\(s\) outside the managed block that cron would run or apply \(line \d+: active job line outside the managed block\)/)
+      assert.doesNotMatch(reason, /abc123|curl|run-it|other/, 'no command text is ever shown')
     }
   }
-  assert.match((read(`${block}0 3 * * * root /x --token=abc123\n`) as { reason: string }).reason, /--token=<redacted>/)
+  // A credential in a stray line, in any shape, appears nowhere in the reason.
+  for (const stray of [`0 3 * * * root curl -H '${AUTH}' http://x`, '0 3 * * * root /x --token=SECRETTOKEN', `0 3 * * * root ${AUTH_COLON}`]) {
+    const reason = (read(`${block}${stray}\n`) as { reason: string }).reason
+    assert.doesNotMatch(reason, /SECRETTOKEN|Bearer|curl|token/i, stray)
+    assert.match(reason, /line 5: active job line outside the managed block/)
+  }
   // Two blocks: the reader keeps the text, and parseManagedBlock (the status reader) refuses the second region.
   assert.deepEqual(linesOutsideManagedBlock(`${block}${block}`), { active: [], assignments: [] })
-  assert.equal(redactedLinePreview('x CRON_SECRET="s3cr3t" y=1'), 'x CRON_SECRET=<redacted> y=<redacted>')
 })
 
 test('user format: lines outside the block are the operator\'s own jobs and are left alone', () => {
@@ -158,17 +165,18 @@ test('cron.d: a NAME=value assignment OUTSIDE the block is refused (cron applies
   for (const text of [`SHELL=/bin/false\n${block}`, `${block}PATH=/nonexistent\n`, `MAILTO=\n${block}`, `${block}CRON_TZ=Asia/Tokyo\n`]) {
     const result = read(text)
     assert.equal(result.resolved, false, text)
-    assert.match((result as { reason: string }).reason, /^Host cron is out of date: 1 environment assignment\(s\) outside the managed block/)
+    assert.match((result as { reason: string }).reason, /^Host cron is out of date: 1 line\(s\) outside the managed block that cron would run or apply \(line \d+: environment assignment outside the managed block \(/)
   }
   const shell = (read(`SHELL=/bin/false\n${block}`) as { reason: string }).reason
-  assert.match(shell, /SHELL=<redacted>/)
+  assert.match(shell, /line 1: environment assignment outside the managed block \(SHELL\)/)
   assert.doesNotMatch(shell, /\/bin\/false/, 'the value is never shown')
+  assert.doesNotMatch((read(`API_TOKEN=SECRETTOKEN\n${block}`) as { reason: string }).reason, /SECRETTOKEN/)
   // Comments and blank lines outside are fine; an assignment INSIDE the block is whatever the renderer emitted.
   assert.equal(read(`# a comment\n\n${block}\n# another\n`).resolved, true)
   assert.equal(read(`${START}\nBASE_URL="http://h/api/cron"\n${END}\n`).resolved, true)
   // Both kinds at once are both reported.
   const both = (read(`SHELL=/bin/false\n${block}* * * * * root x\n`) as { reason: string }).reason
-  assert.match(both, /1 active line\(s\).*; 1 environment assignment\(s\)/)
+  assert.match(both, /line 6: active job line outside[\s\S]*; line 1: environment assignment outside the managed block \(SHELL\)|line 1: environment assignment[\s\S]*line 6: active/)
   // The user format is unchanged: assignments outside the block are the operator's own.
   const userText = `SHELL=/bin/sh\nPATH=/usr/bin\n${block}MAILTO=me\n`
   assert.deepEqual(readSchedulerCrontabFile('/etc/ims/crontab', {}, () => Buffer.from(userText)), { resolved: true, text: userText })
@@ -181,8 +189,13 @@ test('cron.d: an installed job line whose schedule is out of range is an UNRESOL
   for (const schedule of ['99 * * * *', '* 24 * * *', '*/0 * * * *', '30-10 * * * *', '* * * 13 *']) {
     const result = read(withSchedule(schedule))
     assert.equal(result.resolved, false, schedule)
-    assert.match((result as { reason: string }).reason, /^Host cron is out of date: 1 installed job line\(s\) with a schedule cron would not run/)
+    assert.match((result as { reason: string }).reason, /^Host cron is out of date: 1 installed job line\(s\) with a schedule cron would not run \(line 3: invalid /)
+  }
+  // A credential smuggled into the schedule fields or the command of an invalid line never reaches the reason.
+  for (const text of [withSchedule(`99 ${AUTH_COLON} * * *`), `${START}\n# Alpha Job\n61 * * * *  root  curl -H '${AUTH}' http://x\n${END}\n`]) {
+    const reason = (read(text) as { reason: string }).reason
+    assert.doesNotMatch(reason, /SECRETTOKEN|Bearer|curl|Authorization/, text)
   }
   assert.equal(read(withSchedule('*/5 0-6 * * 1-5')).resolved, true)
-  assert.deepEqual(invalidScheduleLines(`${START}\n# x\n61 * * * *  curl\n${END}`).map((entry) => entry.line), ['61 * * * *  curl'])
+  assert.deepEqual(invalidScheduleLines(`${START}\n# x\n61 * * * *  curl\n${END}`).map((entry) => `${entry.line}:${entry.field}:${entry.kind}`), ['3:minute:out-of-range'])
 })

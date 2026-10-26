@@ -409,8 +409,8 @@ backup_line="$(grep -F '$BASE_URL/backup"' "${CRONTAB_FILE}.new" | head -n 1)"
 [ -n "$backup_line" ] || fail "no backup job line to copy"
 { cat "${CRONTAB_FILE}.new"; printf '%s\n' "$backup_line"; } > "${CRONTAB_FILE}.stray"
 as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.stray" "${CROND_DIR}/onetwo3d-ims"
-expect_drift "after appending a copy of a job line outside the block" "Host cron is out of date: 1 active line\(s\) outside the managed block*" "an active line outside the managed block was not reported as drift"
-case "$drift" in *"CRON_SECRET=<redacted>"*) ;; *) fail "the outside-line preview is not redacted: ${drift}" ;; esac
+expect_drift "after appending a copy of a job line outside the block" "Host cron is out of date: 1 line\(s\) outside the managed block that cron would run or apply \(line [0-9]*: active job line outside the managed block\)*" "an active line outside the managed block was not reported as drift"
+case "$drift" in *CRON_SECRET*|*curl*|*grep*) fail "the outside-line diagnostic quotes installed command text: ${drift}" ;; esac
 as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
 expect_drift "after restoring the rendered file" "Host cron is in sync*" "host cron did not return to in sync after the stray line was removed"
 
@@ -418,8 +418,7 @@ expect_drift "after restoring the rendered file" "Host cron is in sync*" "host c
 #    stops every managed job from running while the block itself still looks perfect.
 { printf 'SHELL=/bin/false\n'; cat "${CRONTAB_FILE}.new"; } > "${CRONTAB_FILE}.shell"
 as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.shell" "${CROND_DIR}/onetwo3d-ims"
-expect_drift "after prepending SHELL=/bin/false outside the block" "Host cron is out of date: 1 environment assignment\(s\) outside the managed block*" "an environment assignment outside the managed block was not reported as drift"
-case "$drift" in *"SHELL=<redacted>"*) ;; *) fail "the assignment preview is not redacted: ${drift}" ;; esac
+expect_drift "after prepending SHELL=/bin/false outside the block" "Host cron is out of date: 1 line\(s\) outside the managed block that cron would run or apply \(line 1: environment assignment outside the managed block \(SHELL\)\)*" "an environment assignment outside the managed block was not reported as drift"
 case "$drift" in *"/bin/false"*) fail "the assignment's value is shown: ${drift}" ;; esac
 as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
 expect_drift "after restoring the rendered file" "Host cron is in sync*" "host cron did not return to in sync after the assignment was removed"

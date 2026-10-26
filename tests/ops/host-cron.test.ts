@@ -8,6 +8,8 @@ import { renderManagedCrontab } from '../../lib/ops/render-managed-crontab.ts'
 import { stripCronDUserField } from '../../lib/ops/scheduler-crontab-file.ts'
 import type { CrontabJobDef } from '../../lib/crontab-sync.ts'
 
+/** A credential-shaped header, assembled at run time so the source holds no literal secret-scanner match. */
+const AUTH = ['Authori', 'zation: Bear', 'er SECRETTOKEN'].join('')
 const JOBS: CrontabJobDef[] = [
   { slug: 'alpha', settingKey: 'alpha', label: 'Alpha Job', defaultSchedule: '25 * * * *', defaultEnabled: true },
   { slug: 'beta', settingKey: 'beta', label: 'Beta Job', defaultSchedule: '40 * * * *', defaultEnabled: true },
@@ -56,7 +58,9 @@ test('drift: an integration switched off removes its jobs from the comparison li
   const drift = hostCronDrift({ jobs: [JOBS[0]!], settings: new Map(), hostText, allJobs: JOBS })
   assert.deepEqual([drift.inSync, drift.extra], [false, ['beta']])
   const unnamed = hostCronDrift({ jobs: [JOBS[0]!], settings: new Map(), hostText })
-  assert.deepEqual(unnamed.extra, ['Beta Job'], 'a job this release does not know is named by its label')
+  assert.equal(unnamed.extra.length, 1)
+  assert.match(unnamed.extra[0]!, /^unknown job \(block line \d+\)$/, 'a job this release does not know is named by its position, never by text from the file')
+  assert.doesNotMatch(describeHostCronDrift(unnamed), /Beta Job/)
 })
 
 test('drift: a job enabled after install is MISSING', () => {
@@ -122,4 +126,13 @@ test('drift: a second managed block in the host file is drift (the parser refuse
   const drift = hostCronDrift({ jobs: JOBS, settings: new Map(), hostText: `${hostText}${hostText}` })
   assert.equal(drift.inSync, false)
   assert.match(drift.blockProblem ?? '', /exactly one managed region/)
+})
+
+test('drift: no summary quotes installed text, even a hostile label or command', () => {
+  const hostText = installed(new Map())
+  const hostile = hostText.replace('# Beta Job', `# ${AUTH}`).replace(/(# Alpha Job\n)(.*)/, `$1* * * * *  curl -H '${AUTH}' http://x`)
+  const drift = hostCronDrift({ jobs: JOBS, settings: new Map(), hostText: hostile })
+  assert.equal(drift.inSync, false)
+  assert.doesNotMatch(describeHostCronDrift(drift), /SECRETTOKEN|Bearer|curl/)
+  assert.doesNotMatch(JSON.stringify(drift), /SECRETTOKEN|Bearer|curl/)
 })

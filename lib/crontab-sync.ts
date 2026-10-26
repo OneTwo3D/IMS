@@ -150,43 +150,48 @@ const CRON_FIELDS = [
   { name: 'day of week', min: 0, max: 7 },
 ] as const
 
-export type CronScheduleCheck = { ok: true } | { ok: false; field: string; error: string }
+export type CronScheduleKind = 'field-count' | 'malformed' | 'out-of-range' | 'step-zero' | 'step-too-large' | 'step-on-value' | 'reversed-range'
+export type CronScheduleCheck = { ok: true } | { ok: false; field: string; kind: CronScheduleKind; error: string }
 
-function checkCronField(field: (typeof CRON_FIELDS)[number], text: string): string | null {
-  const bad = (why: string) => `${field.name} "${text}" ${why}`
+function checkCronField(field: (typeof CRON_FIELDS)[number], text: string): { kind: CronScheduleKind; error: string } | null {
+  const bad = (kind: CronScheduleKind, why: string) => ({ kind, error: `${field.name} "${text}" ${why}` })
   const num = (value: string): number | null => (/^[0-9]+$/.test(value) ? Number(value) : null)
   for (const item of text.split(',')) {
     const [range, step, extra] = item.split('/')
-    if (extra !== undefined || range === undefined || range === '') return bad('is not a valid cron field')
+    if (extra !== undefined || range === undefined || range === '') return bad('malformed', 'is not a valid cron field')
     if (step !== undefined) {
       const n = num(step)
-      if (n === null) return bad('has a step that is not a number')
-      if (n < 1) return bad('has a step of 0 (the step must be at least 1)')
-      if (n > field.max) return bad(`has a step larger than ${field.max}`)
+      if (n === null) return bad('malformed', 'has a step that is not a number')
+      if (n < 1) return bad('step-zero', 'has a step of 0 (the step must be at least 1)')
+      if (n > field.max) return bad('step-too-large', `has a step larger than ${field.max}`)
     }
     if (range === '*') continue
     if (step !== undefined && !range.includes('-') && range !== '*') {
       // `a/n` is not valid cron; only `*/n` and `a-b/n` take a step.
-      return bad('has a step on a single value (use */n or a-b/n)')
+      return bad('step-on-value', 'has a step on a single value (use */n or a-b/n)')
     }
     const [lo, hi, more] = range.split('-')
     const a = num(lo ?? '')
     const b = hi === undefined ? a : num(hi)
-    if (more !== undefined || a === null || b === null) return bad('is not a valid cron field')
-    if (a < field.min || a > field.max || b < field.min || b > field.max) return bad(`is out of range (${field.min}-${field.max})`)
-    if (a > b) return bad('is a reversed range')
+    if (more !== undefined || a === null || b === null) return bad('malformed', 'is not a valid cron field')
+    if (a < field.min || a > field.max || b < field.min || b > field.max) return bad('out-of-range', `is out of range (${field.min}-${field.max})`)
+    if (a > b) return bad('reversed-range', 'is a reversed range')
   }
   return null
 }
 
+/**
+ * `error` quotes the offending field text and is for a SAVED setting the operator typed. A caller reporting on a line read from a host
+ * file must use `field` and `kind` instead and never `error`: those fields are the host file's text, which can be anything.
+ */
 export function validateCronSchedule(schedule: string): CronScheduleCheck {
   const parts = schedule.split(' ')
   if (parts.length !== 5 || parts.some((part) => part === '')) {
-    return { ok: false, field: 'schedule', error: 'must have exactly 5 fields (minute hour day-of-month month day-of-week) separated by single spaces' }
+    return { ok: false, field: 'schedule', kind: 'field-count', error: 'must have exactly 5 fields (minute hour day-of-month month day-of-week) separated by single spaces' }
   }
   for (let i = 0; i < 5; i += 1) {
-    const error = checkCronField(CRON_FIELDS[i]!, parts[i]!)
-    if (error) return { ok: false, field: CRON_FIELDS[i]!.name, error }
+    const problem = checkCronField(CRON_FIELDS[i]!, parts[i]!)
+    if (problem) return { ok: false, field: CRON_FIELDS[i]!.name, kind: problem.kind, error: problem.error }
   }
   return { ok: true }
 }

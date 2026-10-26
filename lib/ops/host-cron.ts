@@ -17,7 +17,7 @@ export function isContainerSchedulerMode(env: Readonly<Record<string, string | u
 
 export type HostCronDrift = {
   inSync: boolean
-  /** Job slugs (or labels, for a job this release does not know) that differ in any way, sorted. */
+  /** Job slugs (or `unknown job (block line N)` for an installed job this release does not know) that differ in any way, sorted. */
   differing: string[]
   blockProblem: string | null
   /** Expected from the saved settings but not installed. */
@@ -32,7 +32,7 @@ export type HostCronDrift = {
   otherDifference: boolean
 }
 
-type BlockEntry = { label: string; command: string }
+type BlockEntry = { label: string; command: string; line: number }
 
 /** The `# label` + job line pairs of a block, after its header. Pure. */
 function blockEntries(lines: readonly string[], from: number): BlockEntry[] {
@@ -41,7 +41,7 @@ function blockEntries(lines: readonly string[], from: number): BlockEntry[] {
     const line = lines[i]!
     const next = lines[i + 1]!
     if (line.startsWith('# ') && !line.includes('OTI CRON') && next !== '' && !next.startsWith('#')) {
-      out.push({ label: line.slice(2), command: next })
+      out.push({ label: line.slice(2), command: next, line: i + 1 })
       i += 1
     }
   }
@@ -58,7 +58,7 @@ const normalise = (lines: readonly string[]): string[] => lines.map((line) => li
  * are compared line for line with trailing whitespace ignored, so an extra job (disabled since, or of an integration switched off
  * since, whose jobs are no longer even in `jobs`), a duplicated line, a changed schedule and a reordered block are all drift. Lines
  * outside the markers (the renderer's own `# Source:` comment) are not part of the block. `allJobs` names extra jobs by slug when the
- * registry knows them. Pure.
+ * registry knows them; otherwise by block line number. No diagnostic here ever quotes installed text. Pure.
  */
 export function hostCronDrift(input: {
   jobs: readonly CrontabJobDef[]
@@ -83,12 +83,17 @@ export function hostCronDrift(input: {
 
   const names = new Map((input.allJobs ?? input.jobs).map((job) => [job.label, job.slug] as const))
   for (const job of input.jobs) names.set(job.label, job.slug)
-  const nameOf = (label: string): string => names.get(label) ?? label
+  // A label read from the host file is free text, so a job this release does not know is named by its position, never by that text.
+  const firstLine = new Map<string, number>()
   const want = blockEntries(expected, parsed.headerLength)
   const have = blockEntries(installed, parsed.headerLength)
   const wantByLabel = new Map(want.map((entry) => [entry.label, entry.command] as const))
   const haveByLabel = new Map<string, string[]>()
-  for (const entry of have) haveByLabel.set(entry.label, [...(haveByLabel.get(entry.label) ?? []), entry.command])
+  for (const entry of have) {
+    haveByLabel.set(entry.label, [...(haveByLabel.get(entry.label) ?? []), entry.command])
+    if (!firstLine.has(entry.label)) firstLine.set(entry.label, entry.line)
+  }
+  const nameOf = (label: string): string => names.get(label) ?? `unknown job (block line ${firstLine.get(label) ?? '?'})`
 
   const missing = want.filter((entry) => !haveByLabel.has(entry.label)).map((entry) => nameOf(entry.label))
   const extra = [...haveByLabel.keys()].filter((label) => !wantByLabel.has(label)).map(nameOf)
