@@ -1264,7 +1264,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
         const { autoAllocateOrder } = await import('./allocation')
         await autoAllocateOrder(so.id)
       } catch (allocationError) {
-        postCommitWarnings.push(`stock was NOT allocated to the order (${String(allocationError)}); allocate the order again`)
+        postCommitWarnings.push(`stock was NOT allocated to the order (${String(allocationError)})`)
       }
     }
 
@@ -1275,7 +1275,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       try {
         await queueSalesInvoiceForOrder(so.id)
       } catch (accountingError) {
-        postCommitWarnings.push('the accounting sales invoice was NOT queued; finalise or re-save the order to queue it')
+        postCommitWarnings.push('the accounting sales invoice was NOT queued')
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: so.id,

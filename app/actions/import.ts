@@ -1922,7 +1922,7 @@ async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGu
         try {
           await autoAllocateOrder(created.order.id)
         } catch (allocationError) {
-          warnings.push(`stock was NOT allocated to the order (${String(allocationError)}); allocate the order again`)
+          warnings.push(`stock was NOT allocated to the order (${String(allocationError)})`)
         }
         if (warnings.length > 0) result.errors.push(`Sales order "${importKey ?? created.order.id}" (id ${created.order.id}) WAS CREATED, but: ${warnings.join('; ')}`)
       }
