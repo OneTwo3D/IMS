@@ -54,7 +54,7 @@ test('the partial-shipment and FX paths report the hold text verbatim, not Strin
     namedExports: { getSettingValues: async () => settings, getSettingValue: async (k: string) => settings.get(k) ?? null },
   })
   mock.module('@/lib/db', {
-    namedExports: { db: { shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '42' }) } } },
+    namedExports: { db: { shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '42' }) }, setting: { findUnique: async () => null } } },
   })
   const { pushPartialShipmentToWc } = await import('../lib/connectors/woocommerce/sync/partial-shipment')
   const { pushFxRatesToWc } = await import('../lib/connectors/woocommerce/fx-rates')

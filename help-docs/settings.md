@@ -129,6 +129,7 @@ This section only appears when an accounting plugin is enabled.
 - **Financial year start** — set your financial year start date (UK format)
 - **VAT rates** — manage VAT rate profiles (see below)
 - **Currencies & FX rates** — add currencies and manage exchange rates
+- **Exchange-rate source** (Accounting → FX Rates) — `ECB (frankfurter)` (default) or `Aelia`. With Aelia, IMS reads the store's currency switcher rates (the rate before Aelia's markup; the markup is never stored) instead of fetching frankfurter, health judges Aelia's freshness, and the IMS → WooCommerce rate push is disabled. Needs the onetwoInventory Helper plugin 1.3.0 or later deployed on the store first (owner-approved); see `docs/woocommerce.md`
 - **FX rate schedule** — enable automatic exchange rate updates, set the update interval, or trigger an immediate update with the **Update Now** button
 - **Reverse-charge accounting tax types** — connector-specific tax codes that IMS swaps in for any line whose `TaxRate.reverseCharge` is true. Configure `accounting_reverse_charge_sales_tax_type` (typical Xero: `ECOUTPUTSERVICES`) and `accounting_reverse_charge_purchase_tax_type` (typical Xero: `REVERSECHARGES`). Empty values disable the swap — the line posts with the parent `TaxRate.accountingTaxType` and is not flagged as reverse-charge on the VAT return.
 
@@ -368,7 +369,7 @@ The system relies on scheduled jobs to keep external systems in sync and to main
 
 | Cron endpoint | Purpose | Typical cadence |
 |---|---|---|
-| `/api/cron/fx-rates` | Fetch exchange rates from frankfurter.dev | Daily |
+| `/api/cron/fx-rates` | Fetch exchange rates from frankfurter.dev (or, with the Aelia FX source, read them from Aelia) | Daily |
 | `/api/cron/wc-reconcile` | WooCommerce reconciliation + stock catch-up | Daily |
 | `/api/cron/accounting-daily-batch` | Xero sub-ledger A1/A2/B journals | Daily |
 | `/api/cron/accounting-sync` | Drain pending accounting sync queue | Every 5 min |

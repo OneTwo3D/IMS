@@ -34,7 +34,7 @@ mock.module('@/lib/settings-store', {
     getSettingValue: async () => null,
   },
 })
-mock.module('@/lib/db', { namedExports: { db: { shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '42' }) } } } })
+mock.module('@/lib/db', { namedExports: { db: { shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '42' }) }, setting: { findUnique: async () => null } } } })
 
 async function withEnv<T>(values: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const saved = ENV_KEYS.map((key) => [key, process.env[key]] as const)

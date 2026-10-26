@@ -1,4 +1,6 @@
 /**
+ * DISABLED while the FX source is 'aelia' (lib/currencies/fx-source.ts): Aelia is the master and IMS never writes its rates. The code stays for the 'ecb' source.
+ *
  * Push FX rates from IMS to a WooCommerce store running the
  * "onetwoInventory Helper" companion plugin.
  *
@@ -24,6 +26,7 @@ import { getSettingValues } from '@/lib/settings-store'
 import type { FxRatePush, FxRatePushResult } from '../types'
 import { validateWooCommerceBaseUrl } from './url-safety'
 import { wooEgressHold } from './producer-egress'
+import { AELIA_PUSH_DISABLED_MESSAGE, getFxRateSource } from '@/lib/currencies/fx-source'
 
 const HELPER_PATH = '/wp-json/oti/v1/fx-rates'
 const PUSH_TIMEOUT_MS = 15_000
@@ -34,6 +37,8 @@ const PUSH_TIMEOUT_MS = 15_000
  * cron fan-out can iterate over enabled connectors without special-casing.
  */
 export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushResult> {
+  // The FX source is Aelia: Aelia owns the rates and IMS never writes them. Checked FIRST, before the settings or the store are touched; this is the lowest level, so every caller is covered.
+  if ((await getFxRateSource()) === 'aelia') return { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] }
   const config = await getSettingValues(['wc_url', 'wc_webhook_secret', 'wc_fx_push_enabled'])
   const url = config.get('wc_url') ?? ''
   const secret = config.get('wc_webhook_secret') ?? ''
@@ -199,6 +204,7 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
  * "Push now" button in settings.
  */
 export async function pushCurrentFxRatesToWc(): Promise<FxRatePushResult> {
+  if ((await getFxRateSource()) === 'aelia') return { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] }
   const baseSetting = await db.organisation.findFirst({ select: { baseCurrency: true } })
   const base = baseSetting?.baseCurrency ?? 'GBP'
 

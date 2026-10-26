@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -19,6 +19,10 @@
  *      that One Two Inventory pushes daily ECB rates to. Stored rates are
  *      surfaced to the Aelia Currency Switcher (and other plugins via filter)
  *      so the storefront converts at the same rate as IMS and Xero.
+ *      A second, GET-only endpoint GET /wp-json/oti/v1/aelia-rates READS Aelia's own
+ *      rate table (base currency, per-currency rate, markup, set_manually, decimals and
+ *      Aelia's own last-update time) so IMS can take Aelia as the exchange-rate master.
+ *      It writes nothing, anywhere.
  *   1b. Warehouse (WMS) Status — renders the live WMS order status that IMS pushes
  *      onto the WC order as `_oti_wms_*` meta: an order-edit meta box + an orders-list
  *      "Warehouse" column. Read-only; WMS-neutral.
@@ -268,12 +272,20 @@ const OTI_FX_LASTPUSH_OPT = 'oti_fx_last_push';
 const OTI_INVOICE_PDF_SECRET_OPT = 'oti_invoice_pdf_shared_secret';
 const OTI_IMS_INVOICE_PDF_BASE_URL_OPT = 'oti_ims_invoice_pdf_base_url';
 const OTI_FX_NAMESPACE    = 'oti/v1';
+// Aelia Currency Switcher keeps ALL of its settings in this one option; the per-currency table is under 'exchange_rates'.
+const OTI_AELIA_SETTINGS_OPT = 'wc_aelia_currency_switcher';
 
 add_action('rest_api_init', function () {
     register_rest_route(OTI_FX_NAMESPACE, '/fx-rates', [
         'methods'             => 'POST',
         'permission_callback' => 'oti_verify_fx_signature',
         'callback'            => 'oti_handle_fx_push',
+    ]);
+    // READ ONLY: returns Aelia's own rate table. Same HMAC check as the other signed routes (the signature of an empty body for a GET).
+    register_rest_route(OTI_FX_NAMESPACE, '/aelia-rates', [
+        'methods'             => 'GET',
+        'permission_callback' => 'oti_verify_fx_signature',
+        'callback'            => 'oti_handle_aelia_rates_read',
     ]);
     register_rest_route(OTI_FX_NAMESPACE, '/invoice-pdf/(?P<order_id>\d+)', [
         'methods'             => 'GET',
@@ -365,6 +377,75 @@ if (!function_exists('oti_handle_fx_push')) {
             'ok'      => true,
             'pushed'  => count($clean),
             'skipped' => $skipped,
+        ]);
+    }
+}
+
+if (!function_exists('oti_aelia_last_update_iso')) {
+    /**
+     * Aelia's own last-update time of its rate table as an ISO-8601 UTC string, or null when it cannot be read.
+     * Returns [iso|null, name of the settings key it was read from|null].
+     *
+     * @param array<string,mixed> $settings
+     * @return array{0:?string,1:?string}
+     */
+    function oti_aelia_last_update_iso(array $settings): array
+    {
+        foreach (['exchange_rates_last_update', 'exchange_rates_update_time', 'exchange_rates_last_updated'] as $key) {
+            if (!isset($settings[$key]) || $settings[$key] === '' || $settings[$key] === null) continue;
+            $raw = $settings[$key];
+            if (is_numeric($raw)) {
+                $ts = (int) $raw;
+            } else {
+                $ts = strtotime((string) $raw . ((preg_match('/(Z|[+-]\d{2}:?\d{2})$/', (string) $raw) === 1) ? '' : ' UTC'));
+            }
+            if ($ts === false || $ts <= 0) continue;
+            return [gmdate('Y-m-d\TH:i:s\Z', $ts), $key];
+        }
+        return [null, null];
+    }
+}
+
+if (!function_exists('oti_handle_aelia_rates_read')) {
+    /**
+     * GET /wp-json/oti/v1/aelia-rates. READ ONLY: no update_option, no delete_option, no database write.
+     *
+     * Returns Aelia's rate table EXACTLY as Aelia holds it. `rate` is the rate BEFORE markup and `markup` is Aelia's
+     * `rate_markup` (an absolute amount that Aelia adds to the rate for storefront prices). The two are returned
+     * separately and never combined here; the combination is a storefront price uplift and is not an exchange rate.
+     */
+    function oti_handle_aelia_rates_read(WP_REST_Request $request)
+    {
+        $settings = get_option(OTI_AELIA_SETTINGS_OPT, null);
+        if (!is_array($settings) || !isset($settings['exchange_rates']) || !is_array($settings['exchange_rates'])) {
+            return new WP_Error('oti_aelia_not_found', 'Aelia Currency Switcher settings not found', ['status' => 404]);
+        }
+
+        $out = [];
+        foreach ($settings['exchange_rates'] as $code => $row) {
+            if (!is_array($row)) continue;
+            $entry = [
+                'currency'     => strtoupper((string) $code),
+                'rate'         => isset($row['rate']) ? trim((string) $row['rate']) : null,
+                'markup'       => isset($row['rate_markup']) ? trim((string) $row['rate_markup']) : null,
+                'set_manually' => !empty($row['set_manually']),
+            ];
+            if (isset($row['exchange_rate_decimals']) && is_numeric($row['exchange_rate_decimals'])) {
+                $entry['decimals'] = (int) $row['exchange_rate_decimals'];
+            } elseif (isset($row['decimals']) && is_numeric($row['decimals'])) {
+                $entry['decimals'] = (int) $row['decimals'];
+            }
+            $out[] = $entry;
+        }
+
+        [$updated, $updated_key] = oti_aelia_last_update_iso($settings);
+
+        return new WP_REST_Response([
+            'ok'                 => true,
+            'base'               => strtoupper((string) get_option('woocommerce_currency', '')),
+            'last_update'        => $updated,
+            'last_update_source' => $updated_key,
+            'rates'              => $out,
         ]);
     }
 }

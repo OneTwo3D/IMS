@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useTransition, useEffect, useCallback, useRef } from 'react'
+import { getFxRateSourceSetting } from '@/app/actions/currencies'
 import { useRouter } from 'next/navigation'
 import { Loader2, RefreshCw, Check, AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Trash2, Download, CheckCircle2, Eye, EyeOff, KeyRound, Copy } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -206,6 +207,13 @@ function HelperPluginCard({
   const formatDateTime = useFormatDateTime()
   const [pushing, setPushing] = useState(false)
   const [pushResult, setPushResult] = useState<{ ok: boolean; text: string } | null>(null)
+  // The FX source switch: with 'aelia' the push is disabled (Aelia owns the rates; IMS never writes them to the store).
+  const [aeliaSource, setAeliaSource] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    getFxRateSourceSetting().then((source) => { if (!cancelled) setAeliaSource(source === 'aelia') }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [])
 
   async function handlePushNow() {
     setPushing(true)
@@ -262,6 +270,11 @@ function HelperPluginCard({
             and any other plugin reading the <code className="bg-muted px-1 rounded">wc_aelia_currencyswitcher_exchange_rate</code> filter,
             so the storefront, IMS, and Xero converge on the same rate.
           </p>
+          {aeliaSource && (
+            <p className="text-xs text-amber-700 mt-2 dark:text-amber-300">
+              Disabled: the FX source is Aelia (Settings → Accounting → FX Rates). Aelia owns the exchange rates; IMS reads them and never pushes rates to the store.
+            </p>
+          )}
           <div className="flex items-center gap-3 pt-2">
             <label className="flex items-center gap-2 text-sm cursor-pointer">
               <input
@@ -269,7 +282,7 @@ function HelperPluginCard({
                 checked={fxPushEnabled}
                 onChange={(e) => onFxPushToggle(e.target.checked)}
                 className="rounded border-input"
-                disabled={!webhookSecret}
+                disabled={!webhookSecret || aeliaSource}
               />
               <span>Push FX rates daily</span>
             </label>
@@ -280,7 +293,7 @@ function HelperPluginCard({
             )}
           </div>
           <div className="flex items-center gap-2 pt-3">
-            <Button variant="outline" size="sm" onClick={handlePushNow} disabled={pushing || !fxPushEnabled}>
+            <Button variant="outline" size="sm" onClick={handlePushNow} disabled={pushing || !fxPushEnabled || aeliaSource}>
               {pushing ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
               Push Now
             </Button>

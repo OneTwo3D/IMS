@@ -226,9 +226,9 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'required',
     note: 'Owner answer 4: IMS puts the one invoice (generated in Xero) into the customer\'s My Account, replacing what Xeroom and the PDF-invoices plugin do today.',
   }),
-  row('woocommerce', 'fx-rates', { P1: 'aelia', P2: 'IMS' }, {
+  row('woocommerce', 'fx-rates', { P1: 'aelia', P2: 'aelia' }, {
     obligationTime: 'not-applicable',
-    note: 'Owner answer 2026-10-09: exchange rates come from the Aelia currency plugin in P1; IMS owns from P2.',
+    note: 'Owner ruling 2026-10-26 (replaces the 2026-10-09 answer): Aelia, the currency switcher on the store, is the exchange-rate master in P1 AND P2, and IMS only reads its pre-markup rates into fx_rates (FX source setting `fx_rate_source` = aelia). IMS never writes Aelia\'s rates; the IMS to WooCommerce rate push is disabled while that source is on.',
   }),
   row('woocommerce', 'webhooks', { P1: 'nobody', P2: 'IMS' }, {
     obligationTime: 'not-applicable',

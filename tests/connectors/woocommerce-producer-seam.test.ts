@@ -333,7 +333,7 @@ test('EGRESS, the helper-plugin POSTs: the FX push, the FX probe and the partial
   mock.module('@/lib/settings-store', {
     namedExports: { getSettingValues: async () => settings, getSettingValue: async (k: string) => settings.get(k) ?? null },
   })
-  mock.module('@/lib/db', { namedExports: { db: { shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '42' }) } } } })
+  mock.module('@/lib/db', { namedExports: { db: { shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '42' }) }, setting: { findUnique: async () => null } } } })
   const { pushFxRatesToWc, probeFxHelperPlugin } = await import('@/lib/connectors/woocommerce/fx-rates')
   const { pushPartialShipmentToWc } = await import('@/lib/connectors/woocommerce/sync/partial-shipment')
   await withEnv({}, async () => {

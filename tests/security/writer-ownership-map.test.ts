@@ -68,11 +68,11 @@ test('owner answers of 2026-10-08 are in the map', () => {
   assert.equal(owner('mintsoft.order.create', 'P2'), 'IMS')
 })
 
-test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation, and P2 is unchanged', () => {
+test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation, and P2 is unchanged (except woocommerce.fx-rates: owner ruling 2026-10-26, Aelia stays the master)', () => {
   const rulings: Array<[string, WriterOwner, WriterOwner]> = [
     ['mintsoft.asn.create', 'operator-manual', 'IMS'],
     ['mintsoft.order.comment', 'operator-manual', 'IMS'],
-    ['woocommerce.fx-rates', 'aelia', 'IMS'],
+    ['woocommerce.fx-rates', 'aelia', 'aelia'],
     ['woocommerce.stock', 'qoblex-native', 'IMS'],
     ['xero.daily-batch', 'qoblex-native', 'IMS'],
     ['xero.inventory.journals', 'qoblex-native', 'IMS'],
@@ -105,6 +105,14 @@ test('owner rulings of 2026-10-09: who writes each formerly unknown P1 operation
     assert.ok(users.length > 0, `${kind} is used by a row`)
     assert.ok(!/o3d-[a-z0-9]{3,}/.test(kind), 'no tracker ids in identifiers')
   }
+})
+
+test('owner ruling 2026-10-26: the P2 owner of woocommerce fx-rates is aelia, so IMS never writes the store\'s rates', () => {
+  const row = WRITER_OWNERSHIP_MAP.find((candidate) => candidate.destination === 'woocommerce' && candidate.operation === 'fx-rates')
+  assert.ok(row)
+  assert.equal(row.owners.P1, 'aelia')
+  assert.equal(row.owners.P2, 'aelia')
+  assert.ok(row.note.includes('2026-10-26'))
 })
 
 test('unknown owners are exactly the listed set, now EMPTY (a change here is a decision, not an accident)', () => {

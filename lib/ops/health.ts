@@ -458,7 +458,10 @@ export function buildFxSyncHealthFromLastFetched(
   lastFetchedAt: string | null | undefined,
   now: Date = new Date(),
   attempt: FxSyncAttemptHealthInput = {},
+  /** Which source the freshness is judged for. 'aelia': `lastFetchedAt` is AELIA'S OWN last-update time of its rates (not the time IMS read them). */
+  source: 'frankfurter' | 'aelia' = 'frankfurter',
 ): LatestOperationHealthCheck {
+  const aelia = source === 'aelia'
   const attemptDetails = {
     lastAttemptAt: attempt.lastAttemptAt ?? null,
     lastAttemptStatus: attempt.lastAttemptStatus ?? null,
@@ -475,7 +478,7 @@ export function buildFxSyncHealthFromLastFetched(
       message: attempt.error ? `Latest FX fetch failed: ${attempt.error}` : 'Latest FX fetch failed',
       lastRunAt: attempt.lastAttemptAt ?? null,
       lastStatus: 'failed',
-      reference: 'frankfurter',
+      reference: source,
       details: attemptDetails,
     }
   }
@@ -496,7 +499,7 @@ export function buildFxSyncHealthFromLastFetched(
     return {
       status: 'warning',
       checkedAt: checkedAtFrom(now),
-      message: 'No FX rate fetch timestamp found',
+      message: aelia ? 'No Aelia rate update time found' : 'No FX rate fetch timestamp found',
       lastRunAt: null,
       lastStatus: null,
       reference: null,
@@ -509,7 +512,7 @@ export function buildFxSyncHealthFromLastFetched(
     return {
       status: 'warning',
       checkedAt: checkedAtFrom(now),
-      message: 'FX rate fetch timestamp is invalid',
+      message: aelia ? 'Aelia rate update time is invalid' : 'FX rate fetch timestamp is invalid',
       lastRunAt: null,
       lastStatus: null,
       reference: null,
@@ -523,10 +526,10 @@ export function buildFxSyncHealthFromLastFetched(
   return {
     status: stale ? 'warning' : 'ok',
     checkedAt: checkedAtFrom(now),
-    message: stale ? 'Latest FX fetch is stale' : undefined,
+    message: stale ? (aelia ? 'Aelia has not updated its exchange rates recently' : 'Latest FX fetch is stale') : undefined,
     lastRunAt: lastFetchedDate.toISOString(),
     lastStatus: stale ? 'stale' : 'fetched',
-    reference: 'frankfurter',
+    reference: source,
     details: {
       ageMs,
       staleAfterMs: FX_SYNC_STALE_AFTER_MS,
@@ -988,6 +991,9 @@ async function getLatestWooCommerceSync(now: Date = new Date()): Promise<LatestO
 async function getLatestFxSync(now: Date = new Date()): Promise<LatestOperationHealthCheck> {
   try {
     const { db } = await import('@/lib/db')
+    const { getFxRateSource } = await import('@/lib/currencies/fx-source')
+    // The FX source switch: with 'aelia' the freshness judged is Aelia's own update time, not the last frankfurter fetch.
+    const fxSource = await getFxRateSource()
     const [
       latestFetch,
       lastAttemptAt,
@@ -997,7 +1003,7 @@ async function getLatestFxSync(now: Date = new Date()): Promise<LatestOperationH
       skippedManualOverrides,
       lastError,
     ] = await Promise.all([
-      db.setting.findUnique({ where: { key: 'fx_last_fetched' }, select: { value: true } }),
+      db.setting.findUnique({ where: { key: fxSource === 'aelia' ? 'fx_aelia_last_update_at' : 'fx_last_fetched' }, select: { value: true } }),
       db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_at' }, select: { value: true } }),
       db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_status' }, select: { value: true } }),
       db.setting.findUnique({ where: { key: 'fx_last_fetch_retry_count' }, select: { value: true } }),
@@ -1013,7 +1019,7 @@ async function getLatestFxSync(now: Date = new Date()): Promise<LatestOperationH
       failedCurrencies: splitCsvSetting(failedCurrencies?.value),
       skippedManualOverrideCurrencies: splitCsvSetting(skippedManualOverrides?.value),
       error: lastError?.value || null,
-    })
+    }, fxSource === 'aelia' ? 'aelia' : 'frankfurter')
   } catch (error) {
     console.error('Admin health FX sync check failed', error)
     return errorLatest('FX sync check failed', now)

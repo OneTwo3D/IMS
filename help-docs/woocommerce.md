@@ -672,7 +672,20 @@ A single companion WordPress plugin provides every WC-side hook IMS uses. The pl
 ### What it does
 
 - **Invoice buttons** (Customer My Account orders list, customer order detail, wp-admin order screen meta box). Reads `_invoice_pdf_url` and `_accounting_invoice_url` order meta. HPOS-compatible.
-- **FX rate receiver** — exposes `POST /wp-json/oti/v1/fx-rates`. IMS pushes daily ECB rates here, signed with HMAC-SHA256 using the same shared secret as WC webhooks. Stored rates are surfaced to Aelia Currency Switcher via the `wc_aelia_currencyswitcher_exchange_rate` filter, so the storefront, IMS, and Xero see the same exchange rate.
+- **FX rate receiver** — exposes `POST /wp-json/oti/v1/fx-rates`. With the default FX source (ECB), IMS pushes daily ECB rates here, signed with HMAC-SHA256 using the same shared secret as WC webhooks. Stored rates are surfaced to Aelia Currency Switcher via the `wc_aelia_currencyswitcher_exchange_rate` filter, so the storefront, IMS, and Xero see the same exchange rate. **This push is switched off while the FX source is Aelia** (below).
+- **Aelia rate read (plugin 1.3.0)** — exposes `GET /wp-json/oti/v1/aelia-rates`, a READ-ONLY endpoint (it writes nothing) signed the same way as the other endpoints (HMAC-SHA256 of the empty body in `X-OTI-Signature`). It returns Aelia's base currency and, per currency, `rate`, `markup` (Aelia's `rate_markup`), `set_manually`, `decimals` when Aelia holds one, and Aelia's own last-update time. It reads Aelia's settings option `wc_aelia_currency_switcher` (`exchange_rates`) and the store currency (`woocommerce_currency`).
+
+### Aelia as the FX master (flag, default OFF)
+
+Owner ruling 2026-10-26: Aelia, the WooCommerce currency switcher, is the exchange-rate master and `fx_rates` is IMS's central copy.
+
+- **The flag.** Settings → Accounting → **FX Rates → Exchange-rate source** (setting `fx_rate_source`): `ECB (frankfurter)` is the default and changes nothing. `Aelia` makes the scheduled FX refresh (and **Update now**) READ Aelia through the helper plugin instead of fetching frankfurter, makes the health check judge Aelia's freshness (Aelia's own last-update time, warning after 36 h) instead of the last frankfurter fetch, and **disables the IMS → WooCommerce rate push** (the toggle and **Push Now** on the sync page, the push after a fetch, and the push log gets a notice). The frankfurter and push code stay in place for the ECB source. Switching it back to ECB restores both.
+- **The pre-markup rule.** Aelia stores a `rate` and a `rate_markup` per currency. The markup is an absolute amount Aelia adds to the rate for storefront prices (a price uplift, not an exchange rate). IMS stores the `rate` **exactly as Aelia holds it** (`source = aelia`) and never `rate + markup`; the endpoint returns the markup separately only so it can be seen and checked. Xero, documents and the ledger therefore convert at the exchange rate.
+- **Dating.** Each stored row's time is Aelia's own last-update time, not the time IMS read it, so re-reading the same Aelia update writes no second row. A rate that changes under the same update time is refused.
+- **What is refused (nothing stored, nothing substituted: never 1, never frankfurter).** A missing rate; a rate that is not a plain positive number; a rate with more than 8 decimals (it would be rounded, so the row would not equal Aelia's); a base currency different from IMS's (the whole read); a missing or future update time (the whole read); a currency Aelia lists that IMS does not know; an active IMS currency Aelia does not list. Refusals show as a partial or failed refresh in FX health and in the activity log, and the existing rates stay in use.
+- **Manual overrides** keep working: a pinned currency is skipped by the Aelia read, and a pin is ranked over any Aelia row like any other row. Clearing a pin under the Aelia source takes Aelia's rate (before markup), dated by the clearing action so that it supersedes the pin.
+- **A new currency** added under the Aelia source gets its rate at the next scheduled read (frankfurter is not asked).
+- **Before switching the flag on.** The helper plugin **1.3.0 or later must be deployed on the store, with the shared secret set, by the owner (owner-approved deploy)**; IMS does not install it. Until it is there the Aelia read fails visibly (404 from the store) and the old rates stay in use. After switching on, the newest ECB row is newer than Aelia's last update, so the stored Aelia rates take effect once Aelia's next update lands.
 
 ### Installation
 
@@ -680,11 +693,11 @@ A single companion WordPress plugin provides every WC-side hook IMS uses. The pl
 2. In WordPress admin, go to **Plugins → Add New → Upload Plugin**, choose the zip, and click **Install Now**.
 3. Activate the plugin.
 4. In WordPress admin go to **Settings → onetwoInventory** and paste the same shared secret used for WC webhooks (visible in the IMS Sync → WooCommerce → Orders tab).
-5. Back in IMS, on the same Connection page, tick **Push FX rates daily** and click **Push Now** to verify connectivity.
+5. Back in IMS, on the same Connection page, tick **Push FX rates daily** and click **Push Now** to verify connectivity (not applicable while the FX source is Aelia: Aelia is read instead, see above).
 
 ### Aelia Currency Switcher
 
-If you use Aelia, you do not need to register a custom rate provider — the helper plugin's filter takes effect automatically as soon as IMS has pushed at least one set of rates. Aelia's transient cache is invalidated on each push so new rates take effect immediately. Aelia per-currency markups still apply on top of the IMS rate; only the *base* rate is overridden.
+If you use Aelia, you do not need to register a custom rate provider — the helper plugin's filter takes effect automatically as soon as IMS has pushed at least one set of rates. Aelia's transient cache is invalidated on each push so new rates take effect immediately. Aelia per-currency markups still apply on top of the IMS rate; only the *base* rate is overridden. (With the Aelia FX source the direction is reversed: Aelia's own pre-markup rate is read into IMS and IMS pushes nothing.)
 
 ### Other multi-currency plugins
 

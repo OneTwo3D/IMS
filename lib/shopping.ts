@@ -462,6 +462,9 @@ export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResu
         const { db } = await import('@/lib/db')
         const { logActivity } = await import('@/lib/activity-log')
         try {
+          // The FX source is Aelia: IMS does not push rates at all. Before the producer seam, so no shadow record is left for a push that is not attempted.
+          const { getFxRateSource } = await import('@/lib/currencies/fx-source')
+          if ((await getFxRateSource()) === 'aelia') return { connector, supported: false, pushed: 0, errors: [] }
           // The producer seam: with the hold enforced and the decision SHADOW, record it and send nothing. Not a failure, so no
           // FAILED fxRatePushLog row and no WARNING: the log tells the operator what was sent, and nothing was.
           const seam = await wooProducerSeam({ operation: 'fx-rates', subjectType: 'FxRates', subjectId: 'current', payload: { kind: 'current-rates' } })
