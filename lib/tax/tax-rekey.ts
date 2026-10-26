@@ -23,6 +23,14 @@
  * any row created before the live-from instant, so no payload built around the re-key - however long its producer paused between reading a rate and enqueueing - can reach Xero. The
  * enqueue guard (lib/tax/retired-tax-code-guard.ts) and the queued-payload block below are belt and braces on top of that.
  *
+ * NO PARTIAL APPLY: the apply is refused (UNRESOLVED_RATES) while any in-scope active rate has an outcome other than REKEY or ALREADY_CORRECT, unless the clear choice (part of the plan and the
+ * digest) turns each into a CLEAR row: retired like a re-key, but its replacement carries NO tax code and the old code joins the retired set. The connectors send NONE for a line with no tax type and
+ * the invoice falls back to the order default's code, so the enqueue guard refuses a payload bound to a cleared rate (missing_tax_code) until someone maps it.
+ *
+ * WHAT THE DIGEST DOES NOT BIND: it binds the plan (rows, outcomes, targets, report types, cleared components, counts, the clear choice, the list digest), not every field copied to the new row
+ * (reverseCharge, isCompound, taxCategory, component details beyond count / rate / compound / active). Those are protected by the row locks held from before the plan is built and by the
+ * comparison of the old row after its deactivation - a known limit, tracked separately.
+ *
  * THE APPLY (explicit). `confirm` must be the digest of the plan the operator saw. In ONE transaction inside the Xero connection fence (the lock #797's import takes, so a rebind or a second
  * run cannot interleave) the plan is rebuilt from the locked state; a different digest writes NOTHING. For each REKEY it then:
  *   1. creates a NEW TaxRate (a component's own custom code that is not a live ACTIVE type is cleared to null on the new row, and listed in the plan) with the live code and the same name, rate, type, category, usedFor, country, flags and components; the old row is NEVER edited (documents reference it): it is only
@@ -77,7 +85,7 @@ import { imsEffectivePercent, type ImsComponentRow } from '@/lib/tax/vat-differe
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
 import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import { taxCodesInPayload } from '@/lib/tax/tax-code-fields'
-import { RETIRED_CODES_SETTING, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
+import { CLEARED_RATES_SETTING, RETIRED_CODES_SETTING, parseClearedRates, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
 import { REKEY_OUTCOMES, type RekeyOutcome } from '@/lib/tax/tax-rekey-outcomes'
 
 export { REKEY_OUTCOMES, REKEY_OUTCOME_MEANING, type RekeyOutcome } from '@/lib/tax/tax-rekey-outcomes'
@@ -92,7 +100,7 @@ export interface RekeyBlocker { code: RekeyBlockerCode; imsRateId: string; taxTy
 
 export const REKEY_REFUSAL_CODES = [
   'XERO_NOT_CONNECTED', 'XERO_CONNECTION_CHANGED', 'XERO_LIST_MISSING', 'XERO_LIST_UNREADABLE', 'XERO_LIST_NOT_STAMPED', 'XERO_LIST_STALE', 'XERO_LIST_WRONG_ORGANISATION',
-  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS', 'PENDING_REFUND_SNAPSHOTS', 'REFUND_SNAPSHOT_IDENTITY', 'XERO_NOT_HELD', 'DOCUMENT_CREATED_DURING_APPLY',
+  'CONFIRM_REQUIRED', 'DIGEST_MISMATCH', 'PLAN_HAS_BLOCKERS', 'UNPOSTED_DOCUMENTS', 'QUEUED_PAYLOADS', 'PENDING_REFUND_SNAPSHOTS', 'REFUND_SNAPSHOT_IDENTITY', 'XERO_NOT_HELD', 'DOCUMENT_CREATED_DURING_APPLY', 'UNRESOLVED_RATES',
 ] as const
 export type RekeyRefusalCode = (typeof REKEY_REFUSAL_CODES)[number]
 export interface RekeyRefusal { code: RekeyRefusalCode; detail: string }
@@ -118,6 +126,8 @@ export interface RekeyClearedComponent { sortOrder: number; name: string; taxTyp
 export interface RekeyCandidate { taxType: string; name: string; status: string; percent: string | null }
 
 export interface RekeyRow {
+  /** CLEAR rows only: the outcome the rate would have had without the clear-unresolved choice. */
+  wasOutcome?: RekeyOutcome
   imsRateId: string
   name: string
   usedFor: string
@@ -183,6 +193,8 @@ export interface RekeyPlan {
   blockers: RekeyBlocker[]
   /** Per REKEY row, keyed by the old IMS rate id. */
   references: Record<string, RekeyReferences>
+  /** True when the plan was built with the clear-unresolved choice (bound into the digest): unresolved rates are CLEAR rows instead of a refusal. */
+  clearUnresolved: boolean
   /** Sha-256 of the plan's decision-bearing content. The apply needs exactly this. */
   digest: string
 }
@@ -347,11 +359,11 @@ export function matchRekeyRates(input: { rates: readonly RekeyImsRate[]; xero: r
 }
 
 /** A canonical, order-independent digest of everything the apply decides on. Not the list's fetch time (the hourly job moves it without changing a row), but the list's own digest. */
-export function digestRekeyPlan(plan: Pick<RekeyPlan, 'list' | 'rows' | 'blockers' | 'references'>): string {
+export function digestRekeyPlan(plan: Pick<RekeyPlan, 'list' | 'rows' | 'blockers' | 'references' | 'clearUnresolved'>): string {
   const refs = Object.keys(plan.references).sort().map((id) => {
     return [id, plan.references[id]!] as const
   })
-  const canonical = { v: 1, tenantId: plan.list.tenantId, list: plan.list.digest, rows: plan.rows, blockers: plan.blockers, references: refs }
+  const canonical = { v: 2, clearUnresolved: plan.clearUnresolved, tenantId: plan.list.tenantId, list: plan.list.digest, rows: plan.rows, blockers: plan.blockers, references: refs }
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }
 
@@ -477,7 +489,7 @@ async function referencesOf(client: Client, row: RekeyRow, rate: RekeyImsRate): 
  * Build the plan: prove the stored list (same checks as the import), read the active IMS rates, match, count the references. Read only. `client` is the plain client for a preview
  * and the fence's transaction for an apply. Total over a database that answers: a list that cannot be proven is a named refusal, never a plan.
  */
-export async function readRekeyPlan(client: Client, options: { now: Date; connectedTenantId: string | null }): Promise<RekeyPlanRead> {
+export async function readRekeyPlan(client: Client, options: { now: Date; connectedTenantId: string | null; clearUnresolved?: boolean }): Promise<RekeyPlanRead> {
   const read = await readStoredXeroList(client, options.now, options.connectedTenantId)
   if (!read.ok) {
     const code = (REKEY_REFUSAL_CODES as readonly string[]).includes(read.refusal.code) ? (read.refusal.code as PurchaseTaxImportRefusalCode as RekeyRefusalCode) : 'XERO_LIST_UNREADABLE'
@@ -494,13 +506,18 @@ export async function readRekeyPlan(client: Client, options: { now: Date; connec
     components: r.components.map((c) => ({ name: c.name, rate: c.rate.toFixed(4), compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: c.accountingTaxType, active: c.active, sortOrder: c.sortOrder })),
   }))
   const matched = matchRekeyRates({ rates, xero: read.list.rows })
+  // The clear-unresolved choice turns every in-scope rate with no resolved live type into a CLEAR row (same transaction, same copy path, NO code); without it they are a refusal of the apply.
+  if (options.clearUnresolved === true) {
+    matched.rows = matched.rows.map((row) => (row.outcome === 'REKEY' || row.outcome === 'ALREADY_CORRECT' ? row : { ...row, outcome: 'CLEAR' as const, wasOutcome: row.outcome, reason: `${row.outcome}: ${row.reason}`, clearedComponents: [] }))
+    matched.counts = Object.fromEntries(REKEY_OUTCOMES.map((outcome) => [outcome, matched.rows.filter((row) => row.outcome === outcome).length])) as Record<RekeyOutcome, number>
+  }
   const references: Record<string, RekeyReferences> = {}
   for (const row of matched.rows) {
-    if (row.outcome !== 'REKEY') continue
+    if (row.outcome !== 'REKEY' && row.outcome !== 'CLEAR') continue
     references[row.imsRateId] = await referencesOf(client, row, rates.find((r) => r.id === row.imsRateId)!)
   }
   const list = { tenantId: read.list.tenantId, fetchedAt: read.list.fetchedAt.toISOString(), rowCount: read.list.rows.length, digest: digestTaxRateList(read.list.tenantId, read.list.rows) }
-  const plan: RekeyPlan = { list, ...matched, references, digest: '' }
+  const plan: RekeyPlan = { list, ...matched, references, clearUnresolved: options.clearUnresolved === true, digest: '' }
   plan.digest = digestRekeyPlan(plan)
   return { ok: true, plan }
 }
@@ -518,7 +535,8 @@ export class RekeyDocumentRaceError extends Error {
 }
 
 export interface RekeyWriteResult {
-  created: Array<{ oldId: string; newId: string; name: string; fromCode: string; toCode: string }>
+  /** toCode is null for a CLEAR (the new rate carries no tax code). */
+  created: Array<{ oldId: string; newId: string; name: string; fromCode: string; toCode: string | null }>
   suppliersRepointed: number
   mappingsRepointed: number
   salesLinesRepointed: number
@@ -535,16 +553,17 @@ export interface RekeyWriteResult {
 export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allowUnposted: boolean }): Promise<RekeyWriteResult> {
   const result: RekeyWriteResult = { created: [], suppliersRepointed: 0, mappingsRepointed: 0, salesLinesRepointed: 0, purchaseLinesRepointed: 0, cancelledLinesRepointed: 0, refundLinesRepointed: 0 }
   for (const row of plan.rows) {
-    if (row.outcome !== 'REKEY') continue
+    if (row.outcome !== 'REKEY' && row.outcome !== 'CLEAR') continue
     const old = await tx.taxRate.findUnique({ where: { id: row.imsRateId }, include: { components: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } })
     if (old === null || !old.active || old.accountingTaxType !== row.currentCode || !old.rate.mul(100).equals(new Dec(row.imsPercent))) throw new Error(`rate ${row.imsRateId} changed since the plan was built`)
-    const toCode = row.target!.taxType
+    // CLEAR: the Demo-organisation code is not carried over - the replacement has NO code (and its components none), the old code is retired below, and documents on it refuse to post.
+    const toCode: string | null = row.outcome === 'CLEAR' ? null : row.target!.taxType
     const fresh = await tx.taxRate.create({
       data: {
         name: old.name, rate: old.rate, type: old.type, taxCategory: old.taxCategory, usedFor: old.usedFor, accountingTaxType: toCode, countryCode: old.countryCode,
         isCompound: old.isCompound, reverseCharge: old.reverseCharge, reportingCategory: old.reportingCategory, active: true, isDefault: old.isDefault,
         components: old.components.length === 0 ? undefined : {
-          create: old.components.map((c) => ({ name: c.name, rate: c.rate, compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: row.clearedComponents.some((x) => x.sortOrder === c.sortOrder && x.taxType === c.accountingTaxType) ? null : c.accountingTaxType, sortOrder: c.sortOrder, active: c.active })),
+          create: old.components.map((c) => ({ name: c.name, rate: c.rate, compoundOnPrevious: c.compoundOnPrevious, accountingTaxType: row.outcome === 'CLEAR' ? null : row.clearedComponents.some((x) => x.sortOrder === c.sortOrder && x.taxType === c.accountingTaxType) ? null : c.accountingTaxType, sortOrder: c.sortOrder, active: c.active })),
         },
       },
       select: { id: true },
@@ -589,7 +608,16 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     const existing = parseRetiredCodes((await tx.setting.findUnique({ where: { key: RETIRED_CODES_SETTING }, select: { value: true } }))?.value)
     const retired: RetiredCodes = { ...existing }
     const at = new Date().toISOString()
-    for (const c of result.created) retired[c.fromCode] = { rateId: c.oldId, newCode: c.toCode, at }
+    for (const c of result.created) retired[c.fromCode] = { rateId: c.oldId, newCode: c.toCode ?? '', at }
+    // The replacements of CLEARED rates carry no code: a document whose line is on one would reach Xero as 'NONE' (the connectors' default for a missing tax type) or as the order default's code, so the
+    // enqueue guard refuses a payload bound to one of them (missing_tax_code) until the rate is mapped to a live code by hand.
+    const clearedNow = result.created.filter((c) => c.toCode === null)
+    if (clearedNow.length > 0) {
+      const prior = parseClearedRates((await tx.setting.findUnique({ where: { key: CLEARED_RATES_SETTING }, select: { value: true } }))?.value)
+      for (const c of clearedNow) prior[c.newId] = { at }
+      const clearedValue = JSON.stringify(prior)
+      await tx.setting.upsert({ where: { key: CLEARED_RATES_SETTING }, create: { key: CLEARED_RATES_SETTING, value: clearedValue }, update: { value: clearedValue } })
+    }
     // A code that is both retired (from one rate) and a target (of another: the swap) STAYS in the set: it changed meaning, and the guard admits it only for occurrences bound to a rate that carries it now.
     const value = JSON.stringify(retired)
     await tx.setting.upsert({ where: { key: RETIRED_CODES_SETTING }, create: { key: RETIRED_CODES_SETTING, value }, update: { value } })
@@ -657,6 +685,8 @@ export interface TaxRekeyRunOptions {
   confirm?: string
   /** Also re-point the lines of unposted documents (otherwise they block the apply). */
   allowUnposted?: boolean
+  /** Retire every in-scope rate with no resolved live type (a CLEAR row) instead of refusing the apply for it. Part of the plan, so of the digest. */
+  clearUnresolved?: boolean
   /** The Xero hold variables (XERO_HOLD_ENV_NAMES) to read; default the process environment (the web app's own, which is the one its producers obey). The CLI passes its caller's. */
   producerEnv?: Readonly<Record<string, string | undefined>>
   now?: Date
@@ -686,6 +716,10 @@ export function applyRefusal(plan: RekeyPlan, allowUnposted: boolean): RekeyRefu
   if (pendingRefunds > 0 && !allowUnposted) return { code: 'PENDING_REFUND_SNAPSHOTS', detail: `${pendingRefunds} refund line(s) on refunds not yet posted carry a tax code being re-keyed in their stored snapshot (a later enqueue or retry prefers it to the order line's rate); pass the explicit flag to migrate them` }
   const sources = refs.reduce((n, r) => n + r.unpostedSalesOrders + r.unpostedPurchaseOrders + r.postedSalesOrders + r.postedPurchaseOrders, 0)
   if (sources > 0 && !allowUnposted) return { code: 'UNPOSTED_DOCUMENTS', detail: `${sources} order(s) (posted or not) still reference a rate being re-keyed and can post its old code (first post, edit, re-send, credit note, refund, further bill); pass the explicit flag to re-point their lines` }
+  // NO PARTIAL APPLY: every in-scope active rate with a custom code must end re-keyed, already correct, or (with the explicit clear choice, part of the digest) cleared. A rate left active with its
+  // Demo-organisation code would be posted under whatever that number means in this organisation.
+  const unresolved = plan.rows.filter((r) => r.outcome !== 'REKEY' && r.outcome !== 'ALREADY_CORRECT' && r.outcome !== 'CLEAR')
+  if (unresolved.length > 0) return { code: 'UNRESOLVED_RATES', detail: `${unresolved.length} active rate(s) with a custom code have no resolved live type and would stay active with their Demo-organisation code: ${unresolved.map((r) => `${r.name} (${r.currentCode}) ${r.outcome}`).join('; ')}. Fix them, or choose to clear them (retired, replaced by rates with no tax code that refuse to post until mapped)` }
   return null
 }
 
@@ -704,7 +738,7 @@ export async function runTaxRekey(options: TaxRekeyRunOptions): Promise<TaxRekey
   const { captureXeroConnection, withXeroConnectionFence } = await import('@/lib/connectors/xero/connection-fence')
   const now = options.now ?? new Date()
   const connection = await captureXeroConnection()
-  const first = await readRekeyPlan(db as unknown as Client, { now, connectedTenantId: connection?.tenantId ?? null })
+  const first = await readRekeyPlan(db as unknown as Client, { now, connectedTenantId: connection?.tenantId ?? null, clearUnresolved: options.clearUnresolved === true })
   if (!first.ok) return refuse(first.refusal)
   if (!options.apply) return { applied: false, wrote: false, plan: first.plan, refusal: null, written: null, hold }
   if (connection === null) return refuse({ code: 'XERO_NOT_CONNECTED', detail: 'no Xero organisation is connected' }, first.plan)
@@ -717,11 +751,12 @@ export async function runTaxRekey(options: TaxRekeyRunOptions): Promise<TaxRekey
     // operator's and the apply refuses), and one that arrives later waits and finds the row replaced (lib/tax/tax-rate-replaced.ts).
     await tx.$queryRaw`SELECT id FROM tax_rates WHERE active ORDER BY id FOR NO KEY UPDATE`
     await tx.$queryRaw`SELECT c.id FROM tax_rate_components c JOIN tax_rates t ON t.id = c.tax_rate_id WHERE t.active ORDER BY c.id FOR NO KEY UPDATE OF c`
-    const read = await readRekeyPlan(tx, { now, connectedTenantId: connection.tenantId })
+    const read = await readRekeyPlan(tx, { now, connectedTenantId: connection.tenantId, clearUnresolved: options.clearUnresolved === true })
     if (!read.ok) return { refusal: read.refusal, plan: null as RekeyPlan | null, written: null as RekeyWriteResult | null }
     seen.plan = read.plan
     const plan = read.plan
-    if (plan.counts.REKEY === 0 && plan.blockers.length === 0) return { refusal: null, plan, written: null }
+    const unresolved = plan.rows.some((r) => r.outcome !== 'REKEY' && r.outcome !== 'ALREADY_CORRECT' && r.outcome !== 'CLEAR')
+    if (plan.counts.REKEY === 0 && plan.counts.CLEAR === 0 && plan.blockers.length === 0 && !unresolved) return { refusal: null, plan, written: null }
     if (plan.digest !== options.confirm) return { refusal: { code: 'DIGEST_MISMATCH', detail: 'the plan changed since it was previewed (or this is not its digest); preview again' } as RekeyRefusal, plan, written: null }
     const refusal = applyRefusal(plan, options.allowUnposted === true)
     if (refusal !== null) return { refusal, plan, written: null }

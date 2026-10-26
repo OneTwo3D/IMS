@@ -58,3 +58,17 @@ export function taxCodeOccurrences(payload: unknown): TaxCodeOccurrence[] {
   walk(payload, 0)
   return out
 }
+
+/** Every rate id a payload binds (beside a tax-code field, or on its own), distinct. */
+export function taxRateBindings(payload: unknown): string[] {
+  const out = new Set<string>()
+  const walk = (value: unknown, depth: number): void => {
+    if (depth > MAX_DEPTH || value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) { for (const item of value) walk(item, depth + 1); return }
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof child === 'string') { if ((key === 'taxRateId' || /^[a-z]+TaxRateId$/.test(key)) && child !== '') out.add(child) } else walk(child, depth + 1)
+    }
+  }
+  walk(payload, 0)
+  return [...out]
+}

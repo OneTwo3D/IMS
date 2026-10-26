@@ -177,7 +177,8 @@ test('every outcome is reachable and the counts add up', () => {
   ], live)
   const byId = Object.fromEntries(plan.rows.map((r) => [r.imsRateId, r.outcome]))
   assert.deepEqual(byId, { ok: 'ALREADY_CORRECT', mv: 'REKEY', no: 'NO_MATCH', am: 'AMBIGUOUS', pd: 'PERCENTAGE_DIFFERS', in: 'NAME_MATCHES_INACTIVE', sd: 'SIDE_NOT_ALLOWED', md: 'MEANING_DIFFERS', rd: 'REPORT_TYPE_DIFFERS', ru: 'REPORT_TYPE_UNKNOWN' })
-  assert.equal(REKEY_OUTCOMES.every((o) => plan.counts[o] === 1), true)
+  assert.equal(REKEY_OUTCOMES.filter((o) => o !== 'CLEAR').every((o) => plan.counts[o] === 1), true, 'CLEAR exists only with the clear-unresolved choice')
+  assert.equal(plan.counts.CLEAR, 0)
 })
 
 // [mutation: clearedComponents always empty -> the arm fails]
@@ -257,7 +258,7 @@ const refs = (over: Partial<RekeyReferences> = {}): RekeyReferences => ({
 const planOf = (referenceOver: Partial<RekeyReferences> = {}): RekeyPlan => {
   const matched = match(DEMO, LIVE)
   const references = Object.fromEntries(matched.rows.filter((r) => r.outcome === 'REKEY').map((r) => [r.imsRateId, refs(referenceOver)]))
-  const plan: RekeyPlan = { list: { tenantId: TENANT, fetchedAt: FETCHED.toISOString(), rowCount: LIVE.length, digest: digestTaxRateList(TENANT, LIVE) }, ...matched, references, digest: '' }
+  const plan: RekeyPlan = { list: { tenantId: TENANT, fetchedAt: FETCHED.toISOString(), rowCount: LIVE.length, digest: digestTaxRateList(TENANT, LIVE) }, ...matched, references, clearUnresolved: false, digest: '' }
   plan.digest = digestRekeyPlan(plan)
   return plan
 }
@@ -396,11 +397,14 @@ test('AFTER APPLY the VAT difference report shows no PERCENTAGE_MISMATCH_IMS_XER
 
 test('the command line takes exactly --apply --confirm <64-hex>, --allow-unposted, --json, --help; confirm and the flag need --apply', () => {
   const digest = 'a'.repeat(64)
-  assert.deepEqual(parseTaxRekeyArgs([]), { apply: false, confirm: null, allowUnposted: false, json: false, help: false })
-  assert.deepEqual(parseTaxRekeyArgs(['--apply', '--confirm', digest, '--allow-unposted', '--json']), { apply: true, confirm: digest, allowUnposted: true, json: true, help: false })
+  assert.deepEqual(parseTaxRekeyArgs([]), { apply: false, confirm: null, allowUnposted: false, clearUnresolved: false, json: false, help: false })
+  assert.deepEqual(parseTaxRekeyArgs(['--apply', '--confirm', digest, '--allow-unposted', '--json']), { apply: true, confirm: digest, allowUnposted: true, clearUnresolved: false, json: true, help: false })
   for (const argv of [['--confirm', digest], ['--allow-unposted'], ['--apply', '--confirm', 'xyz'], ['--apply', '--confirm'], ['--apply', '--apply'], ['--other'], ['--apply', '--confirm', digest, '--confirm', digest]]) {
     assert.deepEqual(parseTaxRekeyArgs(argv), { code: 'BAD_ARGUMENTS' }, argv.join(' '))
   }
+  assert.deepEqual(parseTaxRekeyArgs(['--clear-unresolved']), { apply: false, confirm: null, allowUnposted: false, clearUnresolved: true, json: false, help: false }, 'the preview takes the clear choice too: it is part of the plan and the digest')
+  assert.deepEqual(parseTaxRekeyArgs(['--apply', '--confirm', digest, '--clear-unresolved']), { apply: true, confirm: digest, allowUnposted: false, clearUnresolved: true, json: false, help: false })
+  assert.deepEqual(parseTaxRekeyArgs(['--clear-unresolved', '--clear-unresolved']), { code: 'BAD_ARGUMENTS' })
   assert.deepEqual(parseTaxRekeyArgs(['postgres://u:p@h/db']), { code: 'CREDENTIAL_ARGUMENT' })
   assert.deepEqual(parseTaxRekeyArgs(['--apply', '--confirm', 'token=abc']), { code: 'CREDENTIAL_ARGUMENT' })
 })
@@ -430,12 +434,12 @@ test('the command: account, credential and database refusals, the replaced envir
   const base = { env: { DATABASE_URL: 'postgresql://x', HOME: '/tmp', PGHOST: '203.0.113.1', PGPASSWORD: 'x', NODE_OPTIONS: '--require /evil.js', SETTINGS_ENCRYPTION_KEY: 'k' }, uid: 0, checkoutOwnerUid: 1000, deps, stdout: (t: string) => out.push(t), stderr: (t: string) => err.push(t) }
 
   assert.equal(await runTaxRekeyCli({ ...base, argv: ['--apply', '--confirm', digest], onKeptEnv: (kept) => { assert.deepEqual(Object.keys(kept).sort(), ['DATABASE_URL', 'HOME', 'SETTINGS_ENCRYPTION_KEY']) } }), 0)
-  assert.deepEqual(calls, [{ apply: true, confirm: digest, allowUnposted: false, producerEnv: {} }])
+  assert.deepEqual(calls, [{ apply: true, confirm: digest, allowUnposted: false, clearUnresolved: false, producerEnv: {} }])
   assert.match(out.join('\n'), /Applied: 1 rate\(s\) re-keyed/)
   assert.equal(await runTaxRekeyCli({ ...base, argv: ['--apply', '--confirm', digest, '--allow-unposted'] }), 0)
-  assert.deepEqual(calls[1], { apply: true, confirm: digest, allowUnposted: true, producerEnv: {} })
+  assert.deepEqual(calls[1], { apply: true, confirm: digest, allowUnposted: true, clearUnresolved: false, producerEnv: {} })
   assert.equal(await runTaxRekeyCli({ ...base, argv: [] }), 0, 'a preview run passes apply false')
-  assert.deepEqual(calls[2], { apply: false, confirm: undefined, allowUnposted: false, producerEnv: {} })
+  assert.deepEqual(calls[2], { apply: false, confirm: undefined, allowUnposted: false, clearUnresolved: false, producerEnv: {} })
   assert.equal(await runTaxRekeyCli({ ...base, argv: ['--apply'] }), 3)
   assert.equal(await runTaxRekeyCli({ ...base, uid: 1234, argv: [] }), 3, 'neither root nor the checkout\'s owner')
   assert.equal(await runTaxRekeyCli({ ...base, uid: 1000, argv: [] }), 0, 'the checkout\'s owner')
@@ -493,4 +497,32 @@ test('imsMeaningDifference: any difference in country, side, component breakdown
   assert.equal(with_({ components: two }), 'component breakdown', 'same headline percentage, another breakdown')
   assert.equal(with_({ components: [{ rate: '0.1900', compoundOnPrevious: true, active: true, sortOrder: 0 }] }), 'component breakdown', 'compounding')
   assert.equal(with_({ components: [{ rate: '0.1900', compoundOnPrevious: false, active: true, sortOrder: 0 }] }), null, 'one active component at the column equals none')
+})
+
+// [mutation: the unresolved check removed from applyRefusal -> the apply succeeds half done; mutation: the clear choice not part of the digest -> the digest arm fails]
+test('NO PARTIAL APPLY: unresolved rates refuse the apply (listed), the clear choice turns them into CLEAR rows bound into the digest', async () => {
+  const live = [xeroRow('TAX008', 'CY VAT', '19', { canApply: { assets: false, equity: false, expenses: true, liabilities: false, revenue: true } })]
+  const rates = [ims('cy', 'CY VAT', 'TAX005', '0.1900'), ims('be', 'BE VAT', 'TAX021', '0.2100')]
+  const planFor = async (clearUnresolved: boolean) => {
+    const read = await readRekeyPlan(client({ list: live, rates }), { now: NOW, connectedTenantId: TENANT, clearUnresolved })
+    assert.equal(read.ok, true)
+    return read.ok ? read.plan : (undefined as never)
+  }
+  const plain = await planFor(false)
+  assert.deepEqual(plain.rows.map((r) => `${r.name}:${r.outcome}`), ['BE VAT:NO_MATCH', 'CY VAT:REKEY'])
+  const refusal = applyRefusal(plain, true)
+  assert.equal(refusal?.code, 'UNRESOLVED_RATES')
+  assert.match(refusal!.detail, /BE VAT \(TAX021\) NO_MATCH/)
+  const clearing = await planFor(true)
+  assert.deepEqual(clearing.rows.map((r) => `${r.name}:${r.outcome}:${r.wasOutcome ?? ''}`), ['BE VAT:CLEAR:NO_MATCH', 'CY VAT:REKEY:'])
+  assert.deepEqual([clearing.counts.CLEAR, clearing.counts.REKEY, clearing.clearUnresolved], [1, 1, true])
+  assert.equal(applyRefusal(clearing, true), null, 'with the clear choice nothing is left unresolved')
+  assert.notEqual(clearing.digest, plain.digest, 'the digest changes with the flag')
+  assert.equal((await planFor(true)).digest, clearing.digest, 'and is stable')
+  // The flag itself is in the digest even when it changes no row.
+  const okRates = [ims('cy', 'CY VAT', 'TAX005', '0.1900')]
+  const onlyRekey = async (clearUnresolved: boolean) => { const read = await readRekeyPlan(client({ list: live, rates: okRates }), { now: NOW, connectedTenantId: TENANT, clearUnresolved }); return read.ok ? read.plan.digest : '' }
+  assert.notEqual(await onlyRekey(true), await onlyRekey(false), 'the digest binds the choice, not only its effects')
+  // A rate that is already correct or re-keyable is never CLEAR, and an in-scope-free plan has nothing unresolved.
+  assert.equal(applyRefusal({ ...plain, rows: plain.rows.filter((r) => r.outcome === 'REKEY') }, true), null)
 })

@@ -85,7 +85,7 @@ export async function runTaxRekeyCli(options: TaxRekeyCliOptions): Promise<numbe
     const given = options.deps
     const deps: TaxRekeyDeps = given?.run !== undefined && given.disconnect !== undefined ? { run: given.run, disconnect: given.disconnect } : await defaultDeps()
     disconnect = deps.disconnect
-    const result = await deps.run({ apply: args.apply, confirm: args.confirm ?? undefined, allowUnposted: args.allowUnposted, producerEnv })
+    const result = await deps.run({ apply: args.apply, confirm: args.confirm ?? undefined, allowUnposted: args.allowUnposted, clearUnresolved: args.clearUnresolved, producerEnv })
     out(args.json ? JSON.stringify(result, null, 2) : renderTaxRekeyText(result))
     return taxRekeyExitCode(result)
   } catch {

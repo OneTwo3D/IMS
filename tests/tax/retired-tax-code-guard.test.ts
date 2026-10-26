@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { bindingKeyFor, isTaxCodeKey, taxCodeOccurrences, taxCodesInPayload } from '@/lib/tax/tax-code-fields'
-import { RETIRED_CODES_SETTING, parseRetiredCodes, retiredTaxCodesInPayload as findings } from '@/lib/tax/retired-tax-code-guard'
+import { bindingKeyFor, isTaxCodeKey, taxCodeOccurrences, taxCodesInPayload, taxRateBindings } from '@/lib/tax/tax-code-fields'
+import { CLEARED_RATES_SETTING, RETIRED_CODES_SETTING, parseRetiredCodes, retiredTaxCodesInPayload as findings } from '@/lib/tax/retired-tax-code-guard'
 
 /**
  * THE TAX-CODE FIELDS OF AN ACCOUNTING PAYLOAD AND THE SOURCE BINDING OF EACH (lib/tax/tax-code-fields.ts) AND THE ENQUEUE GUARD (lib/tax/retired-tax-code-guard.ts), over doubles.
@@ -27,10 +27,10 @@ test('every tax-code field is found by name with the rate id bound beside it; re
 })
 
 type Row = { id: string; active: boolean; replacedById: string | null; accountingTaxType: string | null }
-function client(opts: { retired?: Record<string, unknown>; rates?: Row[]; locks?: string[] }) {
+function client(opts: { retired?: Record<string, unknown>; cleared?: Record<string, unknown>; rates?: Row[]; locks?: string[] }) {
   return {
     $executeRaw: async () => { opts.locks?.push('lock'); return 0 },
-    setting: { findUnique: async ({ where }: { where: { key: string } }) => (where.key === RETIRED_CODES_SETTING && opts.retired ? { value: JSON.stringify(opts.retired) } : null) },
+    setting: { findUnique: async ({ where }: { where: { key: string } }) => (where.key === RETIRED_CODES_SETTING && opts.retired ? { value: JSON.stringify(opts.retired) } : where.key === CLEARED_RATES_SETTING && opts.cleared ? { value: JSON.stringify(opts.cleared) } : null) },
     taxRate: { findMany: async ({ where }: { where: { id: { in: string[] } } }) => (opts.rates ?? []).filter((r) => where.id.in.includes(r.id)) },
   }
 }
@@ -68,6 +68,16 @@ test('a retired code is admitted ONLY for an occurrence bound to a rate that is 
   assert.deepEqual(await reasons(client({ rates: RATES }), { lines: [{ taxType: 'TAX005', taxRateId: 'cy-old' }] }), [], 'nothing retired -> nothing refused')
 })
 
+// [mutation: the cleared-rate check removed -> a line on a cleared rate is admitted]
+test('a line bound to a rate a re-key CLEARED (no tax code) is refused whatever code it carries: the connectors would send NONE or another rate\'s code', async () => {
+  const c = client({ cleared: { 'cleared-1': { at: '2026-10-25T12:00:00.000Z' } }, rates: RATES })
+  assert.deepEqual(await reasons(c, { lines: [{ description: 'x', taxRateId: 'cleared-1' }] }), ['(no tax code):missing_tax_code'], 'no code at all')
+  assert.deepEqual(await reasons(c, { lines: [{ taxType: 'TAX008', taxRateId: 'cleared-1' }] }), ['(no tax code):missing_tax_code'], 'the order default\'s code is no substitute')
+  assert.deepEqual(await reasons(c, { lines: [], shippingTaxRateId: 'cleared-1' }), ['(no tax code):missing_tax_code'], 'any field')
+  assert.deepEqual(await reasons(c, { lines: [{ taxType: 'TAX008', taxRateId: 'cy-new' }] }), [], 'an ordinary rate is untouched')
+  assert.deepEqual(taxRateBindings({ lines: [{ taxRateId: 'a' }, { taxRateId: 'a' }], shippingTaxRateId: 'b', discountTaxRateId: '', other: 'c' }).sort(), ['a', 'b'])
+})
+
 test('the guard has no clock: elapsed time is not evidence', () => {
   const text = readFileSync('lib/tax/retired-tax-code-guard.ts', 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
   assert.equal(/Date\b|QUARANTINE|Date\.now|\.at\b|getTime/.test(text), false, 'no time-based admission in the guard')
@@ -94,18 +104,18 @@ test('the retired-codes setting is parsed defensively', () => {
 
 // ---- the census: every producer that builds a payload with tax codes binds them -------------------------------------------
 const PRODUCERS: Array<[string, RegExp, string]> = [
-  ['app/actions/sales.ts', /taxRateId: l\.taxRateId && taxType === /, 'sales invoice / update: line codes'],
-  ['app/actions/sales.ts', /shippingTaxRateId: orderDefaultTaxType \? orderDefaultRate\?\.id/, 'sales invoice / update: shipping code'],
-  ['app/actions/sales.ts', /discountTaxRateId: orderDefaultTaxType \? orderDefaultRate\?\.id/, 'sales invoice / update: discount code'],
-  ['app/actions/sales.ts', /own\.taxRate\?\.accountingTaxType === code\) return own\.taxRateId/, 'sales credit note / refund lines'],
-  ['lib/connectors/woocommerce/sync/order-import.ts', /taxRateId: rateNow && lineTaxType === rateNow\.accountingTaxType/, 'WooCommerce import: line codes from the persisted rates'],
-  ['lib/connectors/woocommerce/sync/order-import.ts', /shippingTaxRateId: shippingRateNow/, 'WooCommerce import: shipping code'],
-  ['lib/connectors/woocommerce/sync/order-import.ts', /discountTaxRateId: defaultRateNow/, 'WooCommerce import: discount code'],
+  ['app/actions/sales.ts', /taxRateId: l\.taxRateId \?\? undefined/, 'sales invoice / update: line rate'],
+  ['app/actions/sales.ts', /shippingTaxRateId: orderDefaultRate\?\.id/, 'sales invoice / update: shipping rate'],
+  ['app/actions/sales.ts', /discountTaxRateId: orderDefaultRate\?\.id/, 'sales invoice / update: discount rate'],
+  ['app/actions/sales.ts', /if \(own\?\.taxRateId && \(code === undefined/, 'sales credit note / refund lines'],
+  ['lib/connectors/woocommerce/sync/order-import.ts', /taxRateId: rateNow\?\.id/, 'WooCommerce import: line rate from the persisted rates'],
+  ['lib/connectors/woocommerce/sync/order-import.ts', /shippingTaxRateId: \(shippingRateNow \?\? defaultRateNow\)\?\.id/, 'WooCommerce import: shipping rate'],
+  ['lib/connectors/woocommerce/sync/order-import.ts', /discountTaxRateId: defaultRateNow\?\.id/, 'WooCommerce import: discount rate'],
   ['lib/connectors/woocommerce/sync/order-import.ts', /currentTaxRates\(db, \[\.\.\.lineData\.map/, 'WooCommerce import: codes read from the rate rows now'],
-  ['lib/domain/purchasing/purchase-invoice-edit.ts', /\.\.\.optionalRateId\(poLine\.taxRate\?\.accountingTaxType != null/, 'purchase bill / update: PO line codes'],
+  ['lib/domain/purchasing/purchase-invoice-edit.ts', /\.\.\.optionalRateId\(poLine\.taxRate\?\.id \?\? params\.fallbackTaxRateId\)/, 'purchase bill / update: PO line codes'],
   ['lib/domain/purchasing/purchase-invoice-edit.ts', /\.\.\.optionalRateId\(costLine\.vatable \? params\.fallbackTaxRateId/, 'purchase bill / update: cost-line (freight) codes'],
   ['lib/domain/purchasing/supplier-credit-note.ts', /taxRateId: params\.taxRateId/, 'supplier credit note'],
-  ['app/actions/purchase-orders.ts', /taxRateId: baseRate\?\.id && creditNoteTaxType === baseTaxType/, 'supplier credit note: the rate the type was read from'],
+  ['app/actions/purchase-orders.ts', /taxRateId: baseRate\?\.id,/, 'supplier credit note: the rate the type was read from'],
 ]
 // [mutation: any one binding removed from its producer -> that census row fails]
 test('CENSUS: every producer of a payload with tax codes binds each code to the rate it was read from', () => {

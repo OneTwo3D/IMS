@@ -2716,7 +2716,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             // WC rate, forceNoTax) now carries a real reverseCharge flag.
             taxType: lineTaxType,
             // The rate that code was read from (never sent): the guard checks it is still that rate's code. Absent for a swapped reverse-charge code.
-            taxRateId: rateNow && lineTaxType === rateNow.accountingTaxType ? rateNow.id : undefined,
+            taxRateId: rateNow?.id,
             discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
             }
           }),
@@ -2732,14 +2732,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // to the order default when that is the one that does — so a single-rate order is unchanged
           // and a zero-rated-postage order stops being taxed at the goods' rate.
           shippingTaxType: shippingRateNow ? (shippingRateNow.accountingTaxType ?? undefined) : (shippingTax.taxType ?? accountingTaxType ?? undefined),
-          shippingTaxRateId: shippingRateNow?.accountingTaxType ? shippingRateNow.id : undefined,
+          shippingTaxRateId: (shippingRateNow ?? defaultRateNow)?.id,
           // Only the residual — the coupon itself is already on the lines above as a per-line
           // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
           // discount line. Sending both deducted it twice (o3d-y14).
           discountAmount: orderLevelDiscountAmount,
           discountAccountCode: settings.discountAccount || undefined,
           discountTaxType: defaultRateNow ? (defaultRateNow.accountingTaxType ?? undefined) : (accountingTaxType ?? undefined),
-          discountTaxRateId: defaultRateNow?.accountingTaxType ? defaultRateNow.id : undefined,
+          discountTaxRateId: defaultRateNow?.id,
           lineAmountsIncludeTax,
           _postingMode: 'submitted',
           _paymentMethod: wcOrder.payment_method || undefined,

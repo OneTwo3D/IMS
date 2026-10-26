@@ -223,7 +223,7 @@ export function calculatePurchaseInvoice(params: {
         accountCode: params.transitAccount,
         taxType: productTaxType,
         // The rate that code was read from (never sent): the line's own rate, else the supplier's default; absent for a swapped reverse-charge code.
-        ...optionalRateId(poLine.taxRate?.accountingTaxType != null && productTaxType === poLine.taxRate.accountingTaxType ? poLine.taxRate.id : (poLine.taxRate?.accountingTaxType == null && productTaxType === params.fallbackTaxType ? params.fallbackTaxRateId : undefined)),
+        ...optionalRateId(poLine.taxRate?.id ?? params.fallbackTaxRateId),
       })
       continue
     }

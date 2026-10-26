@@ -1457,8 +1457,9 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
         unitAmount: Number(l.unitPriceForeign),
         accountCode: settings.salesAccount,
         taxType,
-        // The rate this code was read from (never sent): the enqueue guard checks it is still that rate's code (lib/tax/retired-tax-code-guard.ts). Absent for a swapped reverse-charge code.
-        taxRateId: l.taxRateId && taxType === (l.taxRate?.accountingTaxType ?? undefined) ? l.taxRateId : undefined,
+        // The rate this line's code was read from (never sent), bound whenever the line has one: the enqueue guard checks a retired code is still that rate's code and refuses a rate a re-key cleared
+        // (it has no code; the connector would send NONE). lib/tax/retired-tax-code-guard.ts.
+        taxRateId: l.taxRateId ?? undefined,
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
     }),
@@ -1466,11 +1467,11 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     shippingDescription: 'Shipping',
     shippingAccountCode: settings.shippingAccount || undefined,
     shippingTaxType: orderDefaultTaxType ?? undefined,
-    shippingTaxRateId: orderDefaultTaxType ? orderDefaultRate?.id : undefined,
+    shippingTaxRateId: orderDefaultRate?.id,
     discountAmount: discountForeign > 0 ? discountForeign : undefined,
     discountAccountCode: settings.discountAccount || undefined,
     discountTaxType: orderDefaultTaxType ?? undefined,
-    discountTaxRateId: orderDefaultTaxType ? orderDefaultRate?.id : undefined,
+    discountTaxRateId: orderDefaultRate?.id,
     lineAmountsIncludeTax,
   }
 
@@ -2122,9 +2123,8 @@ async function queueRefundAccountingActions(input: {
         taxRateId: ((): string | undefined => {
           const code = creditNoteTaxTypeOf(line) ?? undefined
           const own = orderForCN?.lines.find((ol) => ol.id === line.lineId)
-          if (code !== undefined && own?.taxRateId && own.taxRate?.accountingTaxType === code) return own.taxRateId
-          if (code !== undefined && cnTaxRate?.accountingTaxType === code) return cnTaxRate.id
-          return undefined
+          if (own?.taxRateId && (code === undefined || own.taxRate?.accountingTaxType === code || own.taxRate?.accountingTaxType == null)) return own.taxRateId
+          return cnTaxRate?.id
         })(),
       })),
       // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller

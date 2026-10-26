@@ -12,7 +12,7 @@ export { accountAllowed, buildVatDiffEnv as buildTaxRekeyEnv }
 export const TAX_REKEY_EXIT_CODES = [
   { code: 0, name: 'nothing-to-do', meaning: 'Every in-scope rate is ALREADY_CORRECT, or the apply was written (a re-run of an applied plan is also 0).' },
   { code: 1, name: 'plan-lists-work', meaning: 'A preview, and the plan has rates to re-key or rates that cannot be re-keyed (NO_MATCH, AMBIGUOUS, PERCENTAGE_DIFFERS, NAME_MATCHES_INACTIVE). Nothing was written.' },
-  { code: 2, name: 'refused', meaning: 'The stored Xero list could not be proven, or the apply was refused (missing/wrong digest, Xero not held, blockers, unposted documents, queued payloads, connection changed). Nothing was written.' },
+  { code: 2, name: 'refused', meaning: 'The stored Xero list could not be proven, or the apply was refused (missing/wrong digest, Xero not held, unresolved rates, blockers, unposted documents, queued payloads, connection changed). Nothing was written.' },
   { code: 3, name: 'internal', meaning: 'The command could not start or failed (bad argument, account not allowed, database not given).' },
 ] as const
 
@@ -27,7 +27,7 @@ export type TaxRekeyCliCode = keyof typeof TAX_REKEY_CLI_CODES
 
 const CREDENTIAL_SHAPE = /[a-z][a-z0-9+.-]*:\/\/|[?&=](?:password|passwd|pwd|secret|token|key)|(?:password|passwd|pwd|secret|token|apikey|api_key)\s*[=:]/i
 
-export type TaxRekeyArgs = { apply: boolean; confirm: string | null; allowUnposted: boolean; json: boolean; help: boolean }
+export type TaxRekeyArgs = { apply: boolean; confirm: string | null; allowUnposted: boolean; clearUnresolved: boolean; json: boolean; help: boolean }
 
 export function parseTaxRekeyArgs(argv: readonly string[]): TaxRekeyArgs | { code: TaxRekeyCliCode } {
   const flags = new Set<string>()
@@ -41,14 +41,14 @@ export function parseTaxRekeyArgs(argv: readonly string[]): TaxRekeyArgs | { cod
       i += 1
       continue
     }
-    if (arg !== '--apply' && arg !== '--allow-unposted' && arg !== '--json' && arg !== '--help') return { code: CREDENTIAL_SHAPE.test(arg) ? 'CREDENTIAL_ARGUMENT' : 'BAD_ARGUMENTS' }
+    if (arg !== '--apply' && arg !== '--allow-unposted' && arg !== '--clear-unresolved' && arg !== '--json' && arg !== '--help') return { code: CREDENTIAL_SHAPE.test(arg) ? 'CREDENTIAL_ARGUMENT' : 'BAD_ARGUMENTS' }
     if (flags.has(arg)) return { code: 'BAD_ARGUMENTS' }
     flags.add(arg)
   }
   const apply = flags.has('--apply')
   // --apply needs the digest of the preview, and the digest and the flag mean nothing without --apply.
   if (apply !== (confirm !== null) || (!apply && flags.has('--allow-unposted'))) return { code: 'BAD_ARGUMENTS' }
-  return { apply, confirm, allowUnposted: flags.has('--allow-unposted'), json: flags.has('--json'), help: flags.has('--help') }
+  return { apply, confirm, allowUnposted: flags.has('--allow-unposted'), clearUnresolved: flags.has('--clear-unresolved'), json: flags.has('--json'), help: flags.has('--help') }
 }
 
 export function taxRekeyExitCode(result: TaxRekeyRunResult): 0 | 1 | 2 {
@@ -61,7 +61,9 @@ export function taxRekeyExitCode(result: TaxRekeyRunResult): 0 | 1 | 2 {
 
 export function renderTaxRekeyUsage(): string {
   return [
-    `Usage: ${TAX_REKEY_COMMAND} -- [--apply --confirm <digest> [--allow-unposted]] [--json]`,
+    `Usage: ${TAX_REKEY_COMMAND} -- [--clear-unresolved] [--apply --confirm <digest> [--allow-unposted]] [--json]`,
+    '--clear-unresolved: also retire every active rate with a custom code that has NO resolved live type (shown as CLEAR in the plan and bound into the digest: preview and apply must both pass it). Without it',
+    'an apply is refused (UNRESOLVED_RATES) while any such rate exists, so it never ends half done. A cleared rate is replaced by one with NO tax code and its old code is refused at the enqueue; documents on it refuse to post until it is mapped.',
     '',
     'Xero numbers its custom tax codes (TAX001..TAXnnn) per organisation, so IMS rates created against another organisation (a Demo one) carry codes that mean other rates in the',
     'live organisation. This ties each active IMS rate with a custom code to the live Xero type of the SAME NAME (never by code), with the same percentage, ACTIVE, country-consistent.',
@@ -113,7 +115,7 @@ export function renderTaxRekeyText(result: TaxRekeyRunResult): string {
     else {
       const w = result.written
       lines.push(`Applied: ${w.created.length} rate(s) re-keyed (new row created, old row deactivated); re-pointed ${w.suppliersRepointed} supplier default(s), ${w.mappingsRepointed} storefront mapping(s), ${w.salesLinesRepointed} sales line(s), ${w.purchaseLinesRepointed} purchase line(s), ${w.cancelledLinesRepointed} cancelled-order line(s), ${w.refundLinesRepointed} pending refund line(s).`)
-      for (const c of w.created) lines.push(`  ${c.name}: ${c.fromCode} -> ${c.toCode}`)
+      for (const c of w.created) lines.push(`  ${c.name}: ${c.fromCode} -> ${c.toCode ?? '(CLEARED: no tax code until mapped)'}`)
       lines.push('Run npm run vat:diff to confirm the percentage differences are gone.')
     }
   }

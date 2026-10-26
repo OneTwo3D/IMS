@@ -694,11 +694,11 @@ export type TaxRekeyActionResult =
  * READ-ONLY. The plan for re-keying the IMS rates that carry a custom Xero tax code (TAX001..TAXnnn) to the same-named type of the Xero organisation connected now, with its
  * digest. Reads the STORED Xero list (proven first); never calls Xero; writes nothing.
  */
-export async function previewTaxRekey(): Promise<TaxRekeyActionResult> {
+export async function previewTaxRekey(input: { clearUnresolved?: boolean } = {}): Promise<TaxRekeyActionResult> {
   await requirePermission('settings.company')
   try {
     const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
-    const result = await runTaxRekey({ apply: false })
+    const result = await runTaxRekey({ apply: false, clearUnresolved: input.clearUnresolved === true })
     return { success: true, applied: false, wrote: false, plan: result.plan, refusal: result.refusal, written: null, hold: result.hold }
   } catch (e) {
     unstable_rethrow(e)
@@ -710,11 +710,11 @@ export async function previewTaxRekey(): Promise<TaxRekeyActionResult> {
  * Apply the plan whose `confirm` digest the operator saw. One transaction inside the Xero connection fence; a changed plan (different digest) writes nothing; unposted documents
  * refuse unless `allowUnposted`; queued payloads always refuse. Idempotent. New rows are created and old rows deactivated, never edited; defaults and storefront mappings are re-pointed.
  */
-export async function applyTaxRekey(input: { confirm: string; allowUnposted?: boolean }): Promise<TaxRekeyActionResult> {
+export async function applyTaxRekey(input: { confirm: string; allowUnposted?: boolean; clearUnresolved?: boolean }): Promise<TaxRekeyActionResult> {
   await requirePermission('settings.company')
   try {
     const { runTaxRekey } = await import('@/lib/tax/tax-rekey')
-    const result = await runTaxRekey({ apply: true, confirm: input.confirm, allowUnposted: input.allowUnposted === true })
+    const result = await runTaxRekey({ apply: true, confirm: input.confirm, allowUnposted: input.allowUnposted === true, clearUnresolved: input.clearUnresolved === true })
     await runPostCommit(async () => { revalidatePath('/settings/accounting') }, 'Failed to refresh the tax settings')
     return { success: true, applied: result.applied, wrote: result.wrote, plan: result.plan, refusal: result.refusal, written: result.written, hold: result.hold }
   } catch (e) {

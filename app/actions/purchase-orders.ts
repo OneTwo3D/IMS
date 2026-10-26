@@ -4695,7 +4695,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             transitAccount: settings.transitAccount,
             taxType: creditNoteTaxType,
             // The rate that code was read from (the enqueue guard binds the code to it); none for a swapped / NONE type.
-            taxRateId: baseRate?.id && creditNoteTaxType === baseTaxType ? baseRate.id : undefined,
+            taxRateId: baseRate?.id,
             // Reverse-charge credits carry a NET amount → post EXCLUSIVE so Xero
             // adds the notional VAT (mirroring the net/exclusive RC bill); all
             // others carry a GROSS amount → INCLUSIVE.

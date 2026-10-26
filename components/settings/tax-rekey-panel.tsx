@@ -16,16 +16,17 @@ export function TaxRekeyPanel() {
   const [result, setResult] = useState<TaxRekeyActionResult | null>(null)
   const [digest, setDigest] = useState<string | null>(null)
   const [allowUnposted, setAllowUnposted] = useState(false)
+  const [clearUnresolved, setClearUnresolved] = useState(false)
 
   async function run(kind: 'preview' | 'apply') {
     setBusy(kind)
     try {
       if (kind === 'preview') {
-        const next = await previewTaxRekey()
+        const next = await previewTaxRekey({ clearUnresolved })
         setResult(next)
         setDigest(next.success && next.plan ? next.plan.digest : null)
       } else if (digest) {
-        const next = await applyTaxRekey({ confirm: digest, allowUnposted })
+        const next = await applyTaxRekey({ confirm: digest, allowUnposted, clearUnresolved })
         setResult(next)
         setDigest(null)
       }
@@ -49,11 +50,15 @@ export function TaxRekeyPanel() {
         <input type="checkbox" checked={allowUnposted} onChange={(e) => setAllowUnposted(e.target.checked)} />
         Also re-point the lines of orders and purchase orders that can still post, posted or not (otherwise they block the Apply)
       </label>
+      <label className="flex items-center gap-2 text-xs">
+        <input type="checkbox" checked={clearUnresolved} onChange={(e) => { setClearUnresolved(e.target.checked); setDigest(null) }} />
+        Also clear rates with no matching live type: they are retired and replaced by rates with <strong>no tax code</strong>, and documents on them will refuse to post until you map them (without this, the Apply is refused while any such rate exists). Preview again after changing this.
+      </label>
       <div className="flex items-center gap-2">
         <Button variant="outline" size="sm" onClick={() => run('preview')} disabled={busy !== null}>
           {busy === 'preview' && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}Preview
         </Button>
-        <Button size="sm" onClick={() => run('apply')} disabled={busy !== null || digest === null || plan === null || plan.counts.REKEY === 0}>
+        <Button size="sm" onClick={() => run('apply')} disabled={busy !== null || digest === null || plan === null || plan.counts.REKEY + plan.counts.CLEAR === 0}>
           {busy === 'apply' && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}Apply the previewed plan
         </Button>
       </div>

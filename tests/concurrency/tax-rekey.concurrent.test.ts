@@ -62,6 +62,12 @@ async function wipeOwn(d: Deps) {
   const rateIds = (await db.taxRate.findMany({ where: { OR: [{ id: { in: created.rates } }, { name: { startsWith: TAG } }] }, select: { id: true } })).map((r) => r.id)
   await db.accountingPostingRefusal.deleteMany({ where: { referenceId: { in: created.orders } } })
   await db.accountingSyncLog.deleteMany({ where: { OR: [{ id: { in: created.logs } }, { referenceId: { in: created.orders } }] } })
+  const clearedSetting = await db.setting.findUnique({ where: { key: 'tax_rekey_cleared_rates' } })
+  if (clearedSetting) {
+    const kept = Object.fromEntries(Object.entries(JSON.parse(clearedSetting.value) as Record<string, unknown>).filter(([id]) => !rateIds.includes(id)))
+    if (Object.keys(kept).length === 0) await db.setting.deleteMany({ where: { key: 'tax_rekey_cleared_rates' } })
+    else await db.setting.update({ where: { key: 'tax_rekey_cleared_rates' }, data: { value: JSON.stringify(kept) } })
+  }
   const retiredSetting = await db.setting.findUnique({ where: { key: 'tax_rekey_retired_codes' } })
   if (retiredSetting) {
     const kept = Object.fromEntries(Object.entries(JSON.parse(retiredSetting.value) as Record<string, unknown>).filter(([k]) => !k.startsWith(P)))
@@ -113,7 +119,8 @@ async function seedXero(d: Deps, rows = LIVE(), fetchedAt = new Date(Date.now() 
   await d.db.setting.upsert({ where: { key: d.drift.TAX_RATE_DRIFT_LAST_CHECKED_SETTING }, create: { key: d.drift.TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: fetchedAt.toISOString() }, update: { value: fetchedAt.toISOString() } })
 }
 
-async function seedWorld(d: Deps) {
+/** `unresolved`: also seed the three rates with no resolved live type (AMBIGUOUS / PERCENTAGE_DIFFERS / NO_MATCH). An apply refuses while any exist (UNRESOLVED_RATES), so only the tests about that seed them. */
+async function seedWorld(d: Deps, unresolved = false) {
   const { db } = d
   await wipeOwn(d)
   await seedXero(d)
@@ -132,9 +139,11 @@ async function seedWorld(d: Deps) {
     await rate('gr', 'GR VAT', '0.2400', code('A'), { usedFor: 'BOTH' }),
     await rate('be', 'BE VAT', '0.2100', code('OLD1')),
     await rate('bg', 'BG VAT', '0.2000', code('B')),
-    await rate('amb', 'AMB VAT', '0.0500', code('OLD2')),
-    await rate('pct', 'PCT VAT', '0.1200', code('OLD3')),
-    await rate('nope', 'NOPE VAT', '0.0700', code('OLD4')),
+    ...(unresolved ? [
+      await rate('amb', 'AMB VAT', '0.0500', code('OLD2')),
+      await rate('pct', 'PCT VAT', '0.1200', code('OLD3')),
+      await rate('nope', 'NOPE VAT', '0.0700', code('OLD4')),
+    ] : []),
   ]) as Record<'cy' | 'gr' | 'be' | 'bg' | 'amb' | 'pct' | 'nope', string>
   const supplier = async (name: string, taxRateId: string) => { const s = await db.supplier.create({ data: { name: `${TAG}${name}`, taxRateId } }); created.suppliers.push(s.id); return s.id }
   const supCy = await supplier('Sup CY', ids.cy)
@@ -237,7 +246,7 @@ const WOO = { async get(): Promise<{ ok: true; status: number; total: string; to
 test('the PREVIEW reads a real database, gives each rate its outcome, and writes nothing (not even on a refusal)', { skip }, async () => {
   const d = await loadDeps()
   await precondition(d)
-  const w = await seedWorld(d)
+  const w = await seedWorld(d, true)
   const before = await ownedDigest(d, w)
   const preview = await d.rekey.runTaxRekey({ apply: false })
   assert.equal(preview.refusal, null)
@@ -313,21 +322,21 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   const w = await seedWorld(d)
   const { db } = d
   const frozen = async (id: string) => { const r = await db.taxRate.findUniqueOrThrow({ where: { id }, include: { components: { orderBy: { sortOrder: 'asc' } } } }); const rest: Record<string, unknown> = { ...r }; for (const k of ['active', 'isDefault', 'updatedAt', 'replacedById']) delete rest[k]; return JSON.stringify(rest) }
-  const oldBefore = { cy: await frozen(w.ids.cy), gr: await frozen(w.ids.gr), be: await frozen(w.ids.be), bg: await frozen(w.ids.bg), amb: await frozen(w.ids.amb), pct: await frozen(w.ids.pct), nope: await frozen(w.ids.nope) }
+  const oldBefore = { cy: await frozen(w.ids.cy), gr: await frozen(w.ids.gr), be: await frozen(w.ids.be), bg: await frozen(w.ids.bg) }
   const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
   assert.deepEqual([preview.references[w.ids.gr]!.pendingRefunds, preview.references[w.ids.gr]!.pendingRefundLines, preview.references[w.ids.gr]!.refundSnapshotConflict], [1, 1, false])
   const result = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
   created.digests.push(preview.digest)
   assert.equal(result.refusal, null)
   assert.equal(result.wrote, true)
-  assert.deepEqual(result.written!.created.map((c) => `${c.fromCode.slice(P.length)}->${c.toCode.slice(P.length)}`).sort(), ['A->D', 'B->C', 'OLD1->A'])
+  assert.deepEqual(result.written!.created.map((c) => `${c.fromCode.slice(P.length)}->${c.toCode!.slice(P.length)}`).sort(), ['A->D', 'B->C', 'OLD1->A'])
 
   // The old rows: only active/isDefault changed (name, rate, code, flags, components all as they were); the untouched outcomes are not touched at all.
   for (const [key, id] of Object.entries(w.ids)) assert.equal(await frozen(id), oldBefore[key as keyof typeof oldBefore], `${key}: nothing but active/isDefault may change on an existing row`)
   const oldRows = await db.taxRate.findMany({ where: { id: { in: [w.ids.cy, w.ids.gr, w.ids.be] } }, select: { id: true, active: true, isDefault: true } })
   assert.deepEqual(oldRows.map((r) => [r.active, r.isDefault]), [[false, false], [false, false], [false, false]])
-  const untouched = await db.taxRate.findMany({ where: { id: { in: [w.ids.bg, w.ids.amb, w.ids.pct, w.ids.nope] } }, select: { active: true } })
-  assert.deepEqual(untouched.map((r) => r.active), [true, true, true, true])
+  const untouched = await db.taxRate.findMany({ where: { id: { in: [w.ids.bg] } }, select: { active: true } })
+  assert.deepEqual(untouched.map((r) => r.active), [true])
 
   // The new rows: the live code, everything else the old row's, components copied, active, the default moved.
   const fresh = await db.taxRate.findMany({ where: { name: { startsWith: TAG }, active: true, accountingTaxType: { in: [code('A'), code('C'), code('D')] }, NOT: { id: { in: [w.ids.bg] } } }, include: { components: true }, orderBy: { name: 'asc' } })
@@ -379,7 +388,7 @@ test('the apply creates new rows, deactivates the old and never edits a referenc
   assert.deepEqual([again.refusal, again.wrote, again.written], [null, false, null])
   const replan = (await d.rekey.runTaxRekey({ apply: false })).plan!
   assert.equal(replan.counts.REKEY, ours(replan).filter((r) => r.name === 'nothing').length, 'no rate of this run is left to re-key')
-  assert.deepEqual(byName(replan), { 'BE VAT': 'ALREADY_CORRECT', 'CY VAT': 'ALREADY_CORRECT', 'GR VAT': 'ALREADY_CORRECT', 'BG VAT': 'ALREADY_CORRECT', 'AMB VAT': 'AMBIGUOUS', 'PCT VAT': 'PERCENTAGE_DIFFERS', 'NOPE VAT': 'NO_MATCH' })
+  assert.deepEqual(byName(replan), { 'BE VAT': 'ALREADY_CORRECT', 'CY VAT': 'ALREADY_CORRECT', 'GR VAT': 'ALREADY_CORRECT', 'BG VAT': 'ALREADY_CORRECT' })
   assert.equal(await ownedDigest(d, w), settled, 'a re-run wrote nothing')
 })
 
@@ -396,7 +405,7 @@ test('two applies at once: exactly one writes, the other finds nothing to do; an
   ])
   assert.equal([a, b].filter((r) => r.wrote).length, 1, 'only one of the two wrote')
   assert.deepEqual([a, b].map((r) => r.refusal === null || r.refusal.code === 'DIGEST_MISMATCH'), [true, true])
-  const active = await d.db.taxRate.findMany({ where: { name: { startsWith: TAG }, active: true, id: { notIn: [w.ids.bg, w.ids.amb, w.ids.pct, w.ids.nope] } } })
+  const active = await d.db.taxRate.findMany({ where: { name: { startsWith: TAG }, active: true, id: { notIn: [w.ids.bg] } } })
   assert.equal(active.length, 3, 'each rate re-keyed exactly once')
 
   // The connection is rebound after the first plan has read the stored list and before the locked write.
@@ -801,4 +810,78 @@ test('REPORT TYPE against a real stored list: a live type that files to another 
   const cy = plan.rows.find((r) => r.imsRateId === w.ids.cy)!
   assert.deepEqual([cy.outcome, cy.reportType], ['REPORT_TYPE_DIFFERS', { expected: 'ECOUTPUTSERVICES', live: 'OUTPUT' }])
   assert.equal(plan.rows.find((r) => r.imsRateId === w.ids.gr)!.outcome, 'REKEY', 'control: the others still re-key')
+})
+
+// [mutation: the UNRESOLVED_RATES refusal removed -> CY is re-keyed and the apply "succeeds" with the other rates still active on their Demo codes; mutation: the cleared-rate guard removed -> a document on a cleared rate is queued and would be sent as NONE]
+test('NO PARTIAL APPLY: a rate with no resolved live type refuses the apply unless the clear choice (bound into the digest) retires it; a document on a cleared rate then refuses to post', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { createAccountingSyncLogRow } = await import('../../lib/domain/accounting/sync-log-row.ts')
+  const { RetiredTaxCodeInPayloadError } = await import('../../lib/tax/retired-tax-code-guard.ts')
+  const { db } = d
+  const w = await seedWorld(d, true)
+  const insert = (payload: unknown) => createAccountingSyncLogRow(db as never, { connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: w.soDraftCy.id, payload: payload as never })
+
+  // CY REKEY + NOPE (NO_MATCH), AMB, PCT: refused, nothing written.
+  const plain = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  const before = await ownedDigest(d, w)
+  const refused = await d.rekey.runTaxRekey({ apply: true, confirm: plain.digest, allowUnposted: true })
+  assert.deepEqual([refused.refusal?.code, refused.wrote], ['UNRESOLVED_RATES', false])
+  assert.match(refused.refusal!.detail, /NOPE VAT.*NO_MATCH/)
+  assert.equal(await ownedDigest(d, w), before, 'nothing was written')
+  assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w.ids.cy } })).active, true, 'CY VAT was NOT re-keyed on its own')
+
+  // The clear choice is part of the plan: CLEAR rows, a different digest; the old digest does not authorise it.
+  const cleared = (await d.rekey.runTaxRekey({ apply: false, clearUnresolved: true })).plan!
+  created.digests.push(cleared.digest)
+  assert.notEqual(cleared.digest, plain.digest, 'the digest changes with the flag')
+  assert.deepEqual(cleared.rows.filter((r) => r.name.startsWith(TAG)).map((r) => `${r.name.slice(TAG.length)}:${r.outcome}${r.wasOutcome ? `(${r.wasOutcome})` : ''}`).sort(), [
+    'AMB VAT:CLEAR(AMBIGUOUS)', 'BE VAT:REKEY', 'BG VAT:ALREADY_CORRECT', 'CY VAT:REKEY', 'GR VAT:REKEY', 'NOPE VAT:CLEAR(NO_MATCH)', 'PCT VAT:CLEAR(PERCENTAGE_DIFFERS)',
+  ])
+  const wrongDigest = await d.rekey.runTaxRekey({ apply: true, confirm: plain.digest, allowUnposted: true, clearUnresolved: true })
+  assert.deepEqual([wrongDigest.refusal?.code, wrongDigest.wrote], ['DIGEST_MISMATCH', false])
+  const done = await d.rekey.runTaxRekey({ apply: true, confirm: cleared.digest, allowUnposted: true, clearUnresolved: true })
+  assert.deepEqual([done.refusal, done.wrote], [null, true])
+  assert.equal(done.written!.created.filter((c) => c.toCode === null).length, 3)
+
+  // CY re-keyed; NOPE VAT cleared: the old row is retired and replaced by a row with NO code; its old code is retired.
+  const oldNope = await db.taxRate.findUniqueOrThrow({ where: { id: w.ids.nope } })
+  assert.deepEqual([oldNope.active, oldNope.accountingTaxType], [false, code('OLD4')])
+  const newNope = await db.taxRate.findUniqueOrThrow({ where: { id: oldNope.replacedById! }, include: { components: true } })
+  assert.deepEqual([newNope.active, newNope.accountingTaxType, newNope.name, newNope.rate.toFixed(4), newNope.components.every((c) => c.accountingTaxType === null)], [true, null, `${TAG}NOPE VAT`, '0.0700', true])
+  assert.equal((await db.taxRate.findUniqueOrThrow({ where: { id: w.ids.cy } })).active, false)
+
+  // THE GUARD: the retired demo code is refused; a document on the cleared rate would reach Xero as 'NONE' or as another code, so it is refused as missing_tax_code - with no code, with the default's code, anything.
+  await assert.rejects(insert({ lines: [{ taxType: code('OLD4'), taxRateId: w.ids.nope }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'retired_tax_code', 'the demo code')
+  await assert.rejects(insert({ lines: [{ description: 'x', taxRateId: newNope.id }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'missing_tax_code', 'a line on the cleared rate with no code')
+  await assert.rejects(insert({ lines: [{ taxType: code('C'), taxRateId: newNope.id }] }), (e: unknown) => e instanceof RetiredTaxCodeInPayloadError && e.reason === 'missing_tax_code', 'the order default\'s code is no substitute')
+  await assert.rejects(insert({ lines: [], shippingTaxType: code('C'), shippingTaxRateId: newNope.id }), RetiredTaxCodeInPayloadError, 'in any field')
+  const fine = await insert({ lines: [{ taxType: code('C'), taxRateId: (await db.taxRate.findFirstOrThrow({ where: { name: `${TAG}CY VAT`, active: true } })).id }] })
+  assert.ok(fine.row, 'a re-keyed rate\'s document posts')
+  created.logs.push(fine.row!.id)
+
+  // Idempotent: nothing is unresolved any more; a re-run (with or without the flag) changes nothing.
+  const settled = await ownedDigest(d, w)
+  const again = await d.rekey.runTaxRekey({ apply: true, confirm: cleared.digest, allowUnposted: true, clearUnresolved: true })
+  assert.deepEqual([again.refusal?.code ?? null, again.wrote], [null, false])
+  assert.equal(await ownedDigest(d, w), settled)
+})
+
+// [mutation: the no-op shortcut ignores unresolved rates -> an apply with nothing to re-key "succeeds" over a rate left on its Demo code]
+test('an apply with NOTHING to re-key but an unresolved rate left is refused, not reported as done', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { db } = d
+  const w = await seedWorld(d, true)
+  // Leave only BG VAT (ALREADY_CORRECT) and NOPE VAT (NO_MATCH) in scope.
+  await db.taxRate.updateMany({ where: { id: { in: [w.ids.cy, w.ids.gr, w.ids.be, w.ids.amb, w.ids.pct] } }, data: { active: false } })
+  const plan = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  assert.deepEqual([plan.counts.REKEY, plan.counts.NO_MATCH, plan.counts.ALREADY_CORRECT], [0, 1, 1])
+  const r = await d.rekey.runTaxRekey({ apply: true, confirm: plan.digest, allowUnposted: true })
+  assert.deepEqual([r.refusal?.code, r.wrote], ['UNRESOLVED_RATES', false])
+  // With the flag it is one CLEAR, and the digest differs from the plain plan's.
+  const clearing = (await d.rekey.runTaxRekey({ apply: false, clearUnresolved: true })).plan!
+  assert.notEqual(clearing.digest, plan.digest)
+  created.digests.push(clearing.digest)
+  assert.equal((await d.rekey.runTaxRekey({ apply: true, confirm: clearing.digest, allowUnposted: true, clearUnresolved: true })).wrote, true)
 })
