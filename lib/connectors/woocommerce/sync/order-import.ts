@@ -1088,7 +1088,7 @@ async function updateExistingWcOrderCore(
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
-        paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? new Date(wcOrder.date_paid_gmt) : undefined,
+        paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //
         // This is the writer Codex found: an order imported UNPAID and paid in WooCommerce later.
@@ -1102,7 +1102,7 @@ async function updateExistingWcOrderCore(
         // `undefined` on the same condition as `paidAt`, not `null`: an unpaid payload must leave
         // BOTH columns exactly as they are, or a redelivery of the pre-payment webhook would wipe
         // the provenance off an order that is already paid and re-open the defect.
-        unregisteredPaidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? new Date(wcOrder.date_paid_gmt) : undefined,
+        unregisteredPaidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
       },
     })
   })
@@ -2168,9 +2168,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       || 'WooCommerce Customer'
 
     // FX, against the currency read above.
+    // WooCommerce's GMT fields carry no zone suffix: ALWAYS read through parseWcGmtInstant (as UTC), never `new Date(<string>)`, which reads a suffix-less string in the SERVER's zone.
+    // The site-local `date_created` fallback has no zone in the payload and the site's zone is not known here, so it is read the same way (as UTC): deterministic, independent of the server TZ.
     const orderedAt = wcOrder.date_created_gmt
-      ? new Date(`${wcOrder.date_created_gmt.replace(/Z$/, '')}Z`)
-      : (wcOrder.date_created ? new Date(wcOrder.date_created) : undefined)
+      ? parseWcGmtInstant(wcOrder.date_created_gmt)
+      : (wcOrder.date_created ? parseWcGmtInstant(wcOrder.date_created) : undefined)
     // The order's own date bounds the rate. An order with no date at all is priced as of now (it used to be unbounded,
     // which meant the same thing: the latest row there is).
     const orderInstant = orderedAt ?? new Date()
@@ -2617,9 +2619,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           ...(invoiceNumberResolution.ok ? { invoiceNumber: invoiceNumberResolution.invoiceNumber } : {}),
           paymentMethod: wcOrder.payment_method || null,
           paymentMethodTitle: wcOrder.payment_method_title || null,
-          externalCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
-          externalUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
-          ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
+          externalCreatedAt: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created),
+          externalUpdatedAt: parseWcGmtInstant(wcOrder.date_modified_gmt || wcOrder.date_modified),
+          ...(options.useWcDateAsCreatedAt ? { createdAt: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
           status: lifecycleStatus,
           refundStatus: importRefundDisposition,
           shipFromWarehouseId: wcDefaultWarehouseId,
@@ -2659,7 +2661,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // backfill refuses to reinterpret an amount whose model it cannot establish.
           discountModel: 'LINE_ALLOCATED',
           notes: wcOrder.customer_note || null,
-          paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
+          paidAt: wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null,
           // o3d-psrx r2 — the initial import's half of the same fact, in the same CREATE.
           //
           // This order's receipt IS destined for the ledger: the SALES_INVOICE is queued with
@@ -2669,7 +2671,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // created, the order is held as paid with no receipt and no registration — the same window,
           // reached by a different route. Stamped here, it withholds for exactly that window and stops
           // mattering the moment the registration posts.
-          unregisteredPaidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
+          unregisteredPaidAt: wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null,
           shoppingLinks: {
             create: {
               connector: 'woocommerce',
@@ -2934,7 +2936,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
-          date: new Date(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+          date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
           currency,
           // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
