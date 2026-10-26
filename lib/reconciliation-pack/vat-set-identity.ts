@@ -17,6 +17,8 @@
  *   The same rules as the re-key: percentage (Xero EffectiveRate, else DisplayTaxRate, as an exact decimal, against the rate IMS computes tax at),
  *   country (the Woo country, the IMS countryCode, the IMS name prefix and the Xero name prefix must agree; UK = GB, EL = GR) and report type
  *   (xeroReportTaxType of the IMS rate against the live ReportTaxType).
+ *   Two more identities close what an equal percentage leaves open: the Woo rate's class against the class its IMS mapping recorded (CLASS_DIFFERS; empty is "standard"),
+ *   the Woo compound flag against the IMS isCompound (COMPOUND_DIFFERS), and the ordered components of the IMS rate against the Xero type's (COMPONENTS_DIFFER, the re-key's componentMeaningDifference).
  *
  * Every row carries ZERO OR MORE reasons from a closed list; no reasons means the identity is identical across the systems it is in.
  */
@@ -28,6 +30,7 @@ import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import type { TaxComponentRateRow, TaxMappingRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
 import { normaliseCountryCode, xeroNameCountry } from '@/lib/tax/tax-country'
+import { componentMeaningDifference } from '@/lib/tax/tax-rekey'
 import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 import { XERO_BUILT_IN_TAX_TYPES } from '@/lib/tax/xero-built-in-tax-types'
 
@@ -44,6 +47,9 @@ export const VAT_SET_REASONS = {
   COUNTRY_DIFFERS: 'the country of the WooCommerce rate, the IMS country code, the IMS name prefix and the Xero name prefix do not all agree',
   REPORT_TYPE_DIFFERS: 'the Xero ReportTaxType is not the one IMS files the rate under (xeroReportTaxType of the IMS rate)',
   REPORT_TYPE_UNKNOWN: 'the IMS reporting category is not one IMS maps to a VAT-return box, or the Xero type states no ReportTaxType, so the report type cannot be confirmed',
+  CLASS_DIFFERS: 'the tax class of the WooCommerce rate is not the class its IMS mapping recorded (empty and "standard" are the same class; case and surrounding spaces are ignored)',
+  COMPOUND_DIFFERS: 'the WooCommerce rate is compound and the IMS rate is not, or the other way round',
+  COMPONENTS_DIFFER: 'the IMS rate and the Xero type do not tax the same way: the ordered components (count, each rate, compounding) differ, or the Xero type has a non-recoverable component (the re-key\'s componentMeaningDifference)',
   MISSING_IN_WOO: 'an in-scope IMS sales rate or Xero sales type has no WooCommerce counterpart',
   XERO_NOT_IN_IMS: 'an in-scope Xero sales type is carried by no active IMS sales rate',
 } as const
@@ -90,12 +96,15 @@ function imsPercent(rate: TaxRateRow, components: readonly TaxComponentRateRow[]
 }
 
 const xeroPercent = (row: NormalisedXeroTaxRate): Decimal | null => exact(row.effectiveRate ?? row.displayTaxRate)
-const scopeKey = (rate: WooTaxRateDetail): string => [normaliseCountryCode(rate.country), rate.state.trim().toUpperCase(), rate.postcode.trim(), rate.city.trim().toUpperCase(), rate.class.trim().toLowerCase() || 'standard'].join('|')
+/** The tax class as Woo states it: empty is the standard class; case and surrounding spaces do not count. */
+const normaliseClass = (value: string | null): string => { const slug = (value ?? '').trim().toLowerCase(); return slug === '' ? 'standard' : slug }
+const scopeKey = (rate: WooTaxRateDetail): string => [normaliseCountryCode(rate.country), rate.state.trim().toUpperCase(), rate.postcode.trim(), rate.city.trim().toUpperCase(), normaliseClass(rate.class)].join('|')
 
 export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
   const ratesById = new Map(input.rates.map((rate) => [rate.id, rate]))
   const xeroByType = new Map(input.xero.map((row) => [row.taxType, row]))
   const mappedTo = new Map(input.mappings.map((mapping) => [mapping.externalTaxRateId, mapping.taxRateId]))
+  const mappedClass = new Map(input.mappings.map((mapping) => [mapping.externalTaxRateId, normaliseClass(mapping.externalClass)]))
 
   const imsInScope = input.rates.filter((rate) => rate.active && isSales(rate.usedFor) && !rate.reverseCharge)
   const imsInScopeIds = new Set(imsInScope.map((rate) => rate.id))
@@ -123,6 +132,7 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     const ims = imsPercent(rate, input.componentRates)
     const stated = xeroPercent(live)
     if (ims === null || stated === null || !ims.eq(stated)) reasons.add('PERCENT_DIFFERS')
+    if (componentMeaningDifference({ rate: rate.rate, components: input.componentRates.filter((component) => component.taxRateId === rate.id) }, live) !== null) reasons.add('COMPONENTS_DIFFER')
     const country = rate.countryCode === null ? '' : normaliseCountryCode(rate.countryCode)
     const imsPrefix = xeroNameCountry(rate.name)
     const livePrefix = xeroNameCountry(live.name)
@@ -146,6 +156,8 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
       if (wooPercent === null || imsValue === null || !wooPercent.eq(imsValue)) reasons.add('PERCENT_DIFFERS')
       const imsCountry = ims.countryCode === null ? '' : normaliseCountryCode(ims.countryCode)
       if (normaliseCountryCode(woo.country) !== imsCountry) reasons.add('COUNTRY_DIFFERS')
+      if (normaliseClass(woo.class) !== mappedClass.get(woo.id)) reasons.add('CLASS_DIFFERS')
+      if (woo.compound !== ims.isCompound) reasons.add('COMPOUND_DIFFERS')
     }
     add('woo', woo.id, reasons)
   }

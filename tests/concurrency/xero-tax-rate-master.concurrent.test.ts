@@ -146,7 +146,18 @@ test('CONTROL: a sweep stores the full list, the header and the stamp together, 
   assert.notEqual(await deps.db.setting.findUnique({ where: { key: SNAPSHOT_KEY } }), null)
 
   const section = await readSection(deps)
-  assert.deepEqual(section, { state: 'proven', tenantId: `tenant-A-${run}`, fetchedAt: checked, taxTypes: [{ taxType: 'INPUT2', status: 'ARCHIVED' }, { taxType: 'NONE', status: 'ACTIVE' }, { taxType: 'OUTPUT2', status: 'ACTIVE' }] })
+  // The proven store also carries the rows themselves (R13's set identity reads them): name, status, report type, both rates, the stored components and the can-apply flags, in taxType order.
+  const canApply = { assets: false, equity: false, expenses: true, liabilities: false, revenue: true }
+  const vat20 = [{ name: 'VAT', rate: '20.000000', compound: false, nonRecoverable: false }]
+  assert.deepEqual(section, {
+    state: 'proven', tenantId: `tenant-A-${run}`, fetchedAt: checked,
+    taxTypes: [{ taxType: 'INPUT2', status: 'ARCHIVED' }, { taxType: 'NONE', status: 'ACTIVE' }, { taxType: 'OUTPUT2', status: 'ACTIVE' }],
+    rows: [
+      { taxType: 'INPUT2', name: 'Rate INPUT2', status: 'ARCHIVED', reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: vat20, canApply },
+      { taxType: 'NONE', name: 'Rate NONE', status: 'ACTIVE', reportTaxType: 'OUTPUT', effectiveRate: null, displayTaxRate: '20.000000', components: [{ name: 'Zero', rate: '0.000000', compound: false, nonRecoverable: false }], canApply },
+      { taxType: 'OUTPUT2', name: 'Rate OUTPUT2', status: 'ACTIVE', reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: vat20, canApply },
+    ],
+  })
 })
 
 // [mutation: the validation call removed from the sweep / the empty-list refusal removed]

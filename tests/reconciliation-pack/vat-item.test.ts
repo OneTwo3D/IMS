@@ -211,7 +211,7 @@ test('two rates of one key are summed; two Woo rate ids of one IMS rate are summ
   const second = rate('rGB2', { accountingTaxType: 'OUTPUT5', countryCode: 'GB', reportingCategory: 'domestic' })
   const types = [...REPORT_TYPES, { taxType: 'OUTPUT5', reportTaxType: 'OUTPUT' }]
   const s = standard({
-    ims: { rates: [R_GB, R_IE, R_DE_OSS, second], reportTypes: types, store: provenStore(types.map((t) => t.taxType)), mappings: [...MAPPINGS, { connector: 'woocommerce', externalTaxRateId: '14', taxRateId: 'rGB2' }], sales: [sale('2026-09', 'rGB', '60.00'), sale('2026-09', 'rGB2', '40.00'), sale('2026-08', 'rGB', '50.00')] },
+    ims: { rates: [R_GB, R_IE, R_DE_OSS, second], reportTypes: types, store: provenStore(types.map((t) => t.taxType)), mappings: [...MAPPINGS, { connector: 'woocommerce', externalTaxRateId: '14', taxRateId: 'rGB2', externalClass: null }], sales: [sale('2026-09', 'rGB', '60.00'), sale('2026-09', 'rGB2', '40.00'), sale('2026-08', 'rGB', '50.00')] },
     xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT5', tax: 40 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
     woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '60.00'], [14, '40.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
   })

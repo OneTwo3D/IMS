@@ -12,15 +12,15 @@ export const noSleep = async (): Promise<void> => undefined
 
 export const BOUNDARIES: PopulationBoundaries = { firstLoad: { state: 'verified', cutAt: '2026-01-01T00:00:00.000Z' }, storefrontImport: { state: 'completed', cutAt: '2026-01-01T00:00:00.000Z' }, retentionMonths: 0 }
 
-export const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: null, countryCode: null, reportingCategory: null, ...over })
+export const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: null, countryCode: null, reportingCategory: null, isCompound: false, ...over })
 export const R_GB = rate('rGB', { accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: 'DOMESTIC' })
 export const R_IE = rate('rIE', { accountingTaxType: 'OUTPUT9', countryCode: 'IE', reportingCategory: 'DOMESTIC' })
 export const R_DE_OSS = rate('rDE', { accountingTaxType: 'MOSS1', countryCode: 'DE', reportingCategory: 'OSS' })
 export const REPORT_TYPES = [{ taxType: 'OUTPUT2', reportTaxType: 'OUTPUT' }, { taxType: 'OUTPUT9', reportTaxType: 'OUTPUT' }, { taxType: 'MOSS1', reportTaxType: 'MOSSSALES' }]
 export const MAPPINGS: TaxMappingRow[] = [
-  { connector: 'woocommerce', externalTaxRateId: '11', taxRateId: 'rGB' },
-  { connector: 'woocommerce', externalTaxRateId: '12', taxRateId: 'rIE' },
-  { connector: 'woocommerce', externalTaxRateId: '13', taxRateId: 'rDE' },
+  { connector: 'woocommerce', externalTaxRateId: '11', taxRateId: 'rGB', externalClass: null },
+  { connector: 'woocommerce', externalTaxRateId: '12', taxRateId: 'rIE', externalClass: null },
+  { connector: 'woocommerce', externalTaxRateId: '13', taxRateId: 'rDE', externalClass: null },
 ]
 
 export type ImsFixture = {
