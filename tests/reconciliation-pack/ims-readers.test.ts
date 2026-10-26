@@ -378,7 +378,7 @@ test('more stored Xero rows than the cap is CAP_EXCEEDED for that section, never
 
 function taxesFake(opts: { components?: Array<Record<string, unknown>>; componentRates?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>> } = {}) {
   return fake((sql) => {
-    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: 'OUTPUT2', country: 'GB', category: null }]
+    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: 'OUTPUT2', country: 'GB', category: null, is_compound: false }]
     if (/FROM shopping_tax_rate_mappings/.test(sql)) return []
     if (/FROM tax_rate_components/.test(sql) && /compound_on_previous/.test(sql)) return opts.componentRates ?? []
     if (/FROM tax_rate_components/.test(sql)) return opts.components ?? []
@@ -389,6 +389,22 @@ function taxesFake(opts: { components?: Array<Record<string, unknown>>; componen
 const taxesOf = async (client: ReturnType<typeof taxesFake>) => { const read = await readImsSnapshot(client, { sections: ['taxes'] }); assert.ok(read.ok); return read.ok ? read.sections.taxes : undefined }
 
 // [mutation: the component or settings query dropped]
+test('the taxes section reads the isCompound flag of each rate and the externalClass of each mapping (null stays null)', async () => {
+  const client = fake((sql) => {
+    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: 'OUTPUT2', country: 'GB', category: null, is_compound: true }]
+    if (/FROM shopping_tax_rate_mappings/.test(sql)) return [{ connector: 'woocommerce', external_id: '11', rate_id: 'r1', external_class: 'reduced-rate' }, { connector: 'woocommerce', external_id: '12', rate_id: 'r1', external_class: null }]
+    return []
+  })
+  const read = await readImsSnapshot(client, { sections: ['taxes'] })
+  assert.ok(read.ok)
+  if (!read.ok) return
+  const section = read.sections.taxes
+  assert.ok(section && section.ok)
+  if (!section || !section.ok) return
+  assert.equal(section.value.rates[0]!.isCompound, true)
+  assert.deepEqual(section.value.mappings, [{ connector: 'woocommerce', externalTaxRateId: '11', taxRateId: 'r1', externalClass: 'reduced-rate' }, { connector: 'woocommerce', externalTaxRateId: '12', taxRateId: 'r1', externalClass: null }])
+})
+
 test('the taxes section also reads every component accounting tax type and the two reverse-charge settings (trimmed; absent or blank is none)', async () => {
   const client = taxesFake({ components: [{ id: 'c1', rate_id: 'r1', active: true, tax_type: 'COMP1' }, { id: 'c2', rate_id: 'r1', active: false, tax_type: 'COMP2' }], settings: [{ key: 'accounting_reverse_charge_sales_tax_type', value: ' ECOUTPUTSERVICES ' }] })
   const section = await taxesOf(client)
@@ -396,7 +412,7 @@ test('the taxes section also reads every component accounting tax type and the t
   if (!section || !section.ok) return
   assert.deepEqual(section.value.componentTaxTypes, [{ id: 'c1', taxRateId: 'r1', active: true, accountingTaxType: 'COMP1' }, { id: 'c2', taxRateId: 'r1', active: false, accountingTaxType: 'COMP2' }])
   assert.deepEqual(section.value.reverseCharge, { sales: 'ECOUTPUTSERVICES', purchase: '' })
-  assert.deepEqual(section.value.rates, [{ id: 'r1', name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: null }])
+  assert.deepEqual(section.value.rates, [{ id: 'r1', name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: null, isCompound: false }])
   assert.ok(client.sent.some((sql) => /FROM tax_rate_components WHERE accounting_tax_type IS NOT NULL ORDER BY id LIMIT/.test(sql)), 'every component that names a type is asked for')
   assert.ok(client.sent.some((sql) => /FROM settings WHERE key IN \('accounting_reverse_charge_sales_tax_type', 'accounting_reverse_charge_purchase_tax_type'\)/.test(sql)))
 })
