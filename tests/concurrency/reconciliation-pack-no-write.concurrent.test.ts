@@ -325,7 +325,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     const first = url.searchParams.get('page') === '1'
     const json = (body: unknown, total: number) => { res.writeHead(200, { 'content-type': 'application/json', 'x-wp-total': String(total), 'x-wp-totalpages': String(total ? 1 : 0) }); res.end(JSON.stringify(body)) }
     if (url.pathname === '/wp-json/wc/v3/orders') return url.searchParams.get('status') === 'processing' ? json(first ? [row(9001), row(9002)] : [], 2) : json([], 0)
-    if (url.pathname === '/wp-json/wc/v3/taxes') return json(first ? [{ id: 7001 }] : [], 1)
+    if (url.pathname === '/wp-json/wc/v3/taxes') return json(first ? [{ id: 7001, name: 'x', rate: '20.0000', country: '', state: '', postcode: '', city: '', class: '', shipping: true, compound: false }] : [], 1)
     res.writeHead(404); res.end('{}')
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -422,6 +422,18 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
       await sql(`UPDATE xero_tax_rate_lists SET digest = $2 WHERE id = $1`, [`${VTAG}-xl`, digestTaxRateList(tenant, [xeroRows[0]!, { ...xeroRows[1]!, status: 'ACTIVE' as const }])])
       const unreferenced = await run(['--vendor-reads-only'])
       assert.ok(unreferenced.out.includes('R13 pass -'), unreferenced.out.join('\n'))
+      // SET IDENTITY: the rate IMS charges at differing from the store's and Xero's (exact decimals) is a finding, and restoring it is a pass again.
+      await sql(`UPDATE tax_rates SET rate = 0.21 WHERE id = $1`, [`${VTAG}-t`])
+      const percent = await run(['--vendor-reads-only'])
+      assert.ok(percent.out.includes('R13 fail DIFFERENCES'), percent.out.join('\n'))
+      await sql(`UPDATE tax_rates SET rate = 0.2 WHERE id = $1`, [`${VTAG}-t`])
+      // ...and an ACTIVE custom Xero sales type that no IMS rate carries is a finding (XERO_NOT_IN_IMS), where an unreferenced type that cannot be applied to revenue is not.
+      await sql(`UPDATE xero_tax_rates SET "canApplyToRevenue" = true WHERE id = $1`, [`${VTAG}-x-OLD1`])
+      await sql(`UPDATE xero_tax_rate_lists SET digest = $2 WHERE id = $1`, [`${VTAG}-xl`, digestTaxRateList(tenant, [xeroRows[0]!, { ...xeroRows[1]!, status: 'ACTIVE' as const, canApply: { ...xeroRows[1]!.canApply, revenue: true } }])])
+      const orphan = await run(['--vendor-reads-only'])
+      assert.ok(orphan.out.includes('R13 fail DIFFERENCES'), orphan.out.join('\n'))
+      await sql(`UPDATE xero_tax_rates SET "canApplyToRevenue" = NULL WHERE id = $1`, [`${VTAG}-x-OLD1`])
+      await sql(`UPDATE xero_tax_rate_lists SET digest = $2 WHERE id = $1`, [`${VTAG}-xl`, digestTaxRateList(tenant, [xeroRows[0]!, { ...xeroRows[1]!, status: 'ACTIVE' as const }])])
       // A type IMS names that the stored list does not hold as ACTIVE is a finding (R13 fails, by type code).
       await sql(`UPDATE tax_rates SET accounting_tax_type = 'MISSING9' WHERE id = $1`, [`${VTAG}-t`])
       const unmapped = await run(['--vendor-reads-only'])

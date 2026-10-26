@@ -182,7 +182,7 @@ export const PACK_ITEMS: ReadonlyArray<{ id: PackItemId; title: string; derivedF
   { id: 'R10', title: 'Xero control accounts (Inventory, Allocated, Transit, COGS, Unearned Revenue)', derivedFrom: null, source: 'the reconciliation pack report: the inventory and transit control accounts against their sub-ledgers for the cycle date, and no IMS-originated write to Xero since the first load began' },
   { id: 'R11', title: 'Stock in Transit against the open-PO goods-in-transit schedule', derivedFrom: null, source: 'the reconciliation pack report: the stored Stock in Transit balance for the cycle date against the open-order transit schedule of the IMS transit sub-ledger' },
   { id: 'R12', title: 'VAT by country and reporting category, IMS against Xero and WooCommerce', derivedFrom: null, source: 'needs Xero VAT and WooCommerce tax reports' },
-  { id: 'R13', title: 'Tax-rate mapping coverage', derivedFrom: null, source: 'no runner on this tree' },
+  { id: 'R13', title: 'VAT rate set identity: WooCommerce, IMS and Xero', derivedFrom: null, source: 'no runner on this tree' },
   { id: 'R14', title: 'SKU coverage across Qoblex, WooCommerce, Mintsoft and IMS', derivedFrom: null, source: 'needs the four extracts; /api/export/products is the IMS side' },
   { id: 'R15', title: 'The invariant report: zero critical findings, every warning accepted', derivedFrom: 'invariant-report', source: 'the invariant-preflight check of this gate' },
 ]

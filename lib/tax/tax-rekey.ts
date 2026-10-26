@@ -83,6 +83,7 @@ import { digestTaxRateList, type NormalisedXeroTaxRate } from '@/lib/connectors/
 import { readStoredXeroList, type PurchaseTaxImportRefusalCode } from '@/lib/tax/purchase-tax-import'
 import { imsEffectivePercent, type ImsComponentRow } from '@/lib/tax/vat-difference-report'
 import { isOrganisationSpecificTaxType } from '@/lib/tax/xero-built-in-tax-types'
+import { normaliseCountryCode, xeroNameCountry } from '@/lib/tax/tax-country'
 import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import { taxCodesInPayload } from '@/lib/tax/tax-code-fields'
 import { CLEARED_RATES_SETTING, RETIRED_CODES_SETTING, parseClearedRates, parseRetiredCodes, type RetiredCodes } from '@/lib/tax/retired-tax-code-guard'
@@ -205,18 +206,8 @@ export type RekeyPlanRead = { ok: true; plan: RekeyPlan } | { ok: false; refusal
 // Matching (pure)
 // ---------------------------------------------------------------------------
 
-const ALIASES: Record<string, string> = { UK: 'GB', EL: 'GR' }
-const normaliseCountry = (code: string): string => {
-  const upper = code.trim().toUpperCase()
-  return ALIASES[upper] ?? upper
-}
-
-/** "CY VAT" -> "CY"; a name with no leading two-capital-letter word gives null. */
-export function xeroNameCountry(name: string): string | null {
-  // Case-insensitive, like the name comparison that finds the candidate: "cy VAT" has the prefix CY. (An uppercase-only parse treated it as no prefix and let a Cyprus type through for a Bulgarian rate.)
-  const match = /^([A-Za-z]{2})(?:[\s-]|$)/.exec(name.trim())
-  return match ? normaliseCountry(match[1]!) : null
-}
+const normaliseCountry = normaliseCountryCode
+export { xeroNameCountry }
 
 const KNOWN_REPORTING_CATEGORIES: ReadonlySet<string> = new Set(['DOMESTIC', 'REVERSE_CHARGE', 'EC_SALES', 'OSS'])
 const sides = (usedFor: string): readonly string[] => (usedFor === 'BOTH' ? ['SALES', 'PURCHASE'] : [usedFor])

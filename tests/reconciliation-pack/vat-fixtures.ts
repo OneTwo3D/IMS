@@ -2,6 +2,7 @@ import type { WooGetPort, WooPage } from '../../lib/reconciliation-pack/woo-sour
 import type { XeroGetPort, XeroPage } from '../../lib/reconciliation-pack/xero-source.ts'
 import type { ImsRead, ImsReadOptions, ImsVat, PopulationBoundaries, TaxMappingRow, TaxRateRow, VatSalesRow, XeroTaxRateStore } from '../../lib/reconciliation-pack/ims-readers.ts'
 import type { VatItemContext } from '../../lib/reconciliation-pack/vat-item.ts'
+import type { NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-list.ts'
 import type { XeroResource } from '../../lib/reconciliation-pack/constants.ts'
 
 /** The cycle date of the fixtures: the closed months are 2026-08 and 2026-09 (October is not closed until the 8th of November). */
@@ -11,7 +12,7 @@ export const noSleep = async (): Promise<void> => undefined
 
 export const BOUNDARIES: PopulationBoundaries = { firstLoad: { state: 'verified', cutAt: '2026-01-01T00:00:00.000Z' }, storefrontImport: { state: 'completed', cutAt: '2026-01-01T00:00:00.000Z' }, retentionMonths: 0 }
 
-export const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, active: true, accountingTaxType: null, countryCode: null, reportingCategory: null, ...over })
+export const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: null, countryCode: null, reportingCategory: null, ...over })
 export const R_GB = rate('rGB', { accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: 'DOMESTIC' })
 export const R_IE = rate('rIE', { accountingTaxType: 'OUTPUT9', countryCode: 'IE', reportingCategory: 'DOMESTIC' })
 export const R_DE_OSS = rate('rDE', { accountingTaxType: 'MOSS1', countryCode: 'DE', reportingCategory: 'OSS' })
@@ -39,7 +40,8 @@ export type ImsFixture = {
   fail?: 'read' | 'throws' | { section: 'boundaries' | 'taxes' | 'xeroTaxRates' | 'vat'; reason: 'CAP_EXCEEDED' | 'READ_INCOMPLETE' }
 }
 
-export const provenStore = (taxTypes: string[] = REPORT_TYPES.map((entry) => entry.taxType)): XeroTaxRateStore => ({ state: 'proven', tenantId: TENANT, fetchedAt: '2026-10-19T01:00:00.000Z', taxTypes: taxTypes.map((taxType) => ({ taxType, status: 'ACTIVE' })) })
+export const xeroRow = (taxType: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({ taxType, name: 'GB VAT', status: 'ACTIVE', reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: [], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true }, ...over })
+export const provenStore = (taxTypes: string[] = REPORT_TYPES.map((entry) => entry.taxType)): XeroTaxRateStore => ({ state: 'proven', tenantId: TENANT, fetchedAt: '2026-10-19T01:00:00.000Z', taxTypes: taxTypes.map((taxType) => ({ taxType, status: 'ACTIVE' })), rows: taxTypes.map((taxType) => xeroRow(taxType)) })
 
 export function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; ims: NonNullable<VatItemContext['ims']> } {
   const calls: ImsReadOptions[] = []
@@ -63,7 +65,7 @@ export function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; im
       }
       const values: Record<string, unknown> = {
         boundaries: fixture.boundaries ?? BOUNDARIES,
-        taxes: { rates: fixture.rates ?? [R_GB, R_IE, R_DE_OSS], mappings: fixture.mappings ?? MAPPINGS, componentTaxTypes: [], reverseCharge: { sales: '', purchase: '' } },
+        taxes: { rates: fixture.rates ?? [R_GB, R_IE, R_DE_OSS], mappings: fixture.mappings ?? MAPPINGS, componentTaxTypes: [], componentRates: [], reverseCharge: { sales: '', purchase: '' } },
         xeroTaxRates: fixture.store ?? provenStore(),
         vat,
       }

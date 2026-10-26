@@ -1510,7 +1510,7 @@ run that records tax-rate drift).
   - **The first load checks existing rates against this list.** A supplier's existing default rate that differs from Xero's stored row is refused by the first load (`SUPPLIER_TAX_RATE_DISAGREES_WITH_XERO`); run this action with *replace differing* to correct it.
   - **Never.** Nothing is deleted; an existing row's rate, type, name and components are never changed (documents reference rows: a different rate is a new row);
     a re-run changes nothing. The `accounting_reverse_charge_purchase_tax_type` setting is checked against the list and reported; no row is created for it.
-- **Used by** reconciliation-pack item R13 (the Xero leg), which reads the stored list in its own read-only snapshot. See
+- **Used by** reconciliation-pack item R13 (the Xero leg and the VAT set identity: WooCommerce, IMS and Xero must use the same set of VAT rates, judged row by row with closed reason codes), which reads the stored list in its own read-only snapshot. See
   *Reconciliation pack* in the installation guide.
 - **Custom tax codes differ per organisation: the re-key (a pre-go-live operation: refused unless Xero writes are held).** Xero numbers its custom tax types (`TAX001`...`TAXnnn`) per organisation, in creation order, so
   the codes on IMS's per-country VAT rates (created against a Demo organisation) can mean other rates in the live one (live `TAX005` = *BG VAT*, IMS's `TAX005` =
@@ -1526,7 +1526,7 @@ run that records tax-rate drift).
   WooCommerce tax-rate writes are **operator-manual at P1** (the ownership map row `woocommerce` / `tax-rate`: P1 `operator-manual`, P2 `IMS`; IMS
   has no producer for it yet). To make the manual correction easy, **Settings > Accounting > Tax > VAT rate differences** and `npm run vat:diff`
   compare this stored list, the IMS rates (with the WooCommerce mappings of reconciliation-pack item R13) and WooCommerce's `GET /taxes`, read only,
-  and list each difference by reason code, as four reports (UK, IOSS, VOEC, other foreign) plus an unclassified section (see *VAT difference report* in the installation guide). The owner fixes WooCommerce by hand in its tax
+  and list each difference by reason code (the reconciliation pack's R13 proves the same identity of the three sets as a gate item, from the same stored list), as four reports (UK, IOSS, VOEC, other foreign) plus an unclassified section (see *VAT difference report* in the installation guide). The owner fixes WooCommerce by hand in its tax
   screens and runs the report again until it is empty. The report requires the same proven, fresh stored list as the import above and refuses
   (never "no differences") when it is not.
 

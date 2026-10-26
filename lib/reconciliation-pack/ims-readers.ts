@@ -77,12 +77,15 @@ export type OrderRow = { id: string; status: string; currency: string; totalFore
 export type StorefrontMappingRow = { externalStatus: string; imsStatus: string }
 /** `withdrawal` is the pair of customer-withdrawal statuses the importer ALSO admits (normalised; each setting's documented default when its row is absent or empty). */
 export type StorefrontStatusConfig = { configured: string[]; withdrawal: { submitted: string; approved: string }; mappings: StorefrontMappingRow[] }
-export type TaxRateRow = { id: string; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null }
+/** `rate` is the fraction text of the rate column (Decimal(5,4), for example "0.2000"); `usedFor` is SALES, PURCHASE or BOTH. R13's set identity reads name, rate, usedFor and reverseCharge. */
+export type TaxRateRow = { id: string; name: string; rate: string; usedFor: string; reverseCharge: boolean; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null }
 export type TaxMappingRow = { connector: string; externalTaxRateId: string; taxRateId: string }
 export type TaxComponentTypeRow = { id: string; taxRateId: string; active: boolean; accountingTaxType: string }
 /** The two reverse-charge settings: Xero tax-type CODES IMS posts with. A blank value is "none". */
 export type ReverseChargeTaxTypes = { sales: string; purchase: string }
-export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[]; componentTaxTypes: TaxComponentTypeRow[]; reverseCharge: ReverseChargeTaxTypes }
+/** A component of a rate with its own rate (fraction text, Decimal(5,4)); the rate IMS computes tax at is the active components' effective rate when it has any. */
+export type TaxComponentRateRow = { taxRateId: string; rate: string; compoundOnPrevious: boolean; active: boolean; sortOrder: number }
+export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[]; componentTaxTypes: TaxComponentTypeRow[]; componentRates: TaxComponentRateRow[]; reverseCharge: ReverseChargeTaxTypes }
 /**
  * The stored copy of Xero's tax-rate list for the organisation CURRENTLY connected, with the proof that it is one complete read.
  * `proven` only when the header row of THAT organisation exists, its row count equals the rows read, every row carries the
@@ -91,7 +94,7 @@ export type ImsTaxes = { rates: TaxRateRow[]; mappings: TaxMappingRow[]; compone
  */
 export type XeroTaxRateStoreCause = 'NO_CONNECTION' | 'NO_HEADER' | 'COUNT_MISMATCH' | 'DIGEST_MISMATCH' | 'MIXED_READ' | 'MALFORMED_ROW'
 export type XeroTaxRateStore =
-  | { state: 'proven'; tenantId: string; fetchedAt: string; taxTypes: Array<{ taxType: string; status: string }> }
+  | { state: 'proven'; tenantId: string; fetchedAt: string; taxTypes: Array<{ taxType: string; status: string }>; /** The proven rows themselves (name, rates, report type, can-apply flags), for R13's set identity. */ rows: NormalisedXeroTaxRate[] }
   | { state: 'unproven'; cause: XeroTaxRateStoreCause }
 export type XeroSyncLogRow = { id: string; type: string; referenceType: string; referenceId: string; externalTransactionId: string }
 export type SnapshotValueRow = { productId: string; warehouseId: string; qty: string; valueBase: string; valueReplayReliable: boolean }
@@ -442,7 +445,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   },
 
   async taxes(tx) {
-    const rates = (await readCapped(tx, 'SELECT id, active, accounting_tax_type AS tax_type, "countryCode" AS country, reporting_category AS category FROM tax_rates ORDER BY id')).map((row): TaxRateRow => ({ id: text(row.id), active: bool(row.active), accountingTaxType: textOrNull(row.tax_type), countryCode: textOrNull(row.country), reportingCategory: textOrNull(row.category) }))
+    const rates = (await readCapped(tx, 'SELECT id, name, rate::text AS rate, "usedFor" AS used_for, reverse_charge, active, accounting_tax_type AS tax_type, "countryCode" AS country, reporting_category AS category FROM tax_rates ORDER BY id')).map((row): TaxRateRow => ({ id: text(row.id), name: text(row.name), rate: text(row.rate), usedFor: text(row.used_for), reverseCharge: bool(row.reverse_charge), active: bool(row.active), accountingTaxType: textOrNull(row.tax_type), countryCode: textOrNull(row.country), reportingCategory: textOrNull(row.category) }))
     unique(rates, (rate) => rate.id)
     const mappings = (await readCapped(tx, 'SELECT connector, "externalTaxRateId" AS external_id, "taxRateId" AS rate_id FROM shopping_tax_rate_mappings ORDER BY id')).map((row): TaxMappingRow => ({ connector: text(row.connector), externalTaxRateId: text(row.external_id), taxRateId: text(row.rate_id) }))
     unique(mappings, (mapping) => `${mapping.connector}\u0001${mapping.externalTaxRateId}`)
@@ -451,6 +454,9 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     // Every other place IMS names a Xero tax type: a component's own accounting tax type, and the two reverse-charge settings.
     const componentTaxTypes = (await readCapped(tx, 'SELECT id, tax_rate_id AS rate_id, active, accounting_tax_type AS tax_type FROM tax_rate_components WHERE accounting_tax_type IS NOT NULL ORDER BY id')).map((row): TaxComponentTypeRow => ({ id: text(row.id), taxRateId: text(row.rate_id), active: bool(row.active), accountingTaxType: text(row.tax_type) }))
     unique(componentTaxTypes, (component) => component.id)
+    const componentRates = (await readCapped(tx, 'SELECT id, tax_rate_id AS rate_id, rate::text AS rate, compound_on_previous AS compound, active, sort_order FROM tax_rate_components ORDER BY tax_rate_id, sort_order, id')).map((row): TaxComponentRateRow & { id: string } => ({ id: text(row.id), taxRateId: text(row.rate_id), rate: text(row.rate), compoundOnPrevious: bool(row.compound), active: bool(row.active), sortOrder: count(row.sort_order) }))
+    unique(componentRates, (component) => component.id)
+    if (componentRates.some((component) => !known.has(component.taxRateId))) throw new Unreadable('SOURCE_UNREADABLE')
     if (componentTaxTypes.some((component) => !known.has(component.taxRateId))) throw new Unreadable('SOURCE_UNREADABLE')
     const settingRows = await readCapped(tx, "SELECT key, value FROM settings WHERE key IN ('accounting_reverse_charge_sales_tax_type', 'accounting_reverse_charge_purchase_tax_type') ORDER BY key")
     const reverseValue = (key: string): string => {
@@ -459,7 +465,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       if (typeof row.value !== 'string' || /[\u0000-\u001f\u007f]/.test(row.value)) throw new Unreadable('SOURCE_UNREADABLE')
       return row.value.trim()
     }
-    return { rates, mappings, componentTaxTypes, reverseCharge: { sales: reverseValue('accounting_reverse_charge_sales_tax_type'), purchase: reverseValue('accounting_reverse_charge_purchase_tax_type') } }
+    return { rates, mappings, componentTaxTypes, componentRates: componentRates.map(({ id: _id, ...rest }) => rest), reverseCharge: { sales: reverseValue('accounting_reverse_charge_sales_tax_type'), purchase: reverseValue('accounting_reverse_charge_purchase_tax_type') } }
   },
 
   async xeroTaxRates(tx) {
@@ -491,7 +497,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       })
     }
     if (digestTaxRateList(tenantId, rows) !== header.digest) return { state: 'unproven', cause: 'DIGEST_MISMATCH' }
-    return { state: 'proven', tenantId, fetchedAt, taxTypes: rows.map((row) => ({ taxType: row.taxType, status: row.status })) }
+    return { state: 'proven', tenantId, fetchedAt, taxTypes: rows.map((row) => ({ taxType: row.taxType, status: row.status })), rows }
   },
 
   async xeroSyncLogs(tx) {

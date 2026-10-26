@@ -373,6 +373,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'The same Xero can-apply-to flag, read back from the stored tax-rate list to prove it is one complete read. A boolean, not a figure.',
   },
   {
+    file: 'lib/reconciliation-pack/vat-set-identity.ts',
+    figures: ['revenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`revenue` is the Xero can-apply-to flag of a tax type (canApply.revenue: it may be applied to revenue accounts), read to decide whether a type is a sales type. A boolean on a tax-rate definition, not a figure; no refund moves it.',
+  },
+  {
     file: 'lib/reconciliation-pack/constants.ts',
     figures: ['xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',

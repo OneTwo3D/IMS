@@ -44,7 +44,7 @@ async function store(): Promise<{ base: string; seen: Seen[] }> {
       const rows = url.searchParams.get('status') === 'processing' ? [order(11, 'processing', { billing: { email: EMAIL }, customer_note: `call ${SECRET}` }), order(12)] : []
       res.writeHead(200, { ...headers, 'x-wp-total': String(rows.length), 'x-wp-totalpages': String(rows.length ? 1 : 0) }); res.end(JSON.stringify(page === 1 ? rows : [])); return
     }
-    if (url.pathname === '/wp-json/wc/v3/taxes') { res.writeHead(200, { ...headers, 'x-wp-total': '1', 'x-wp-totalpages': '1' }); res.end(JSON.stringify(page === 1 ? [{ id: 5 }] : [])); return }
+    if (url.pathname === '/wp-json/wc/v3/taxes') { res.writeHead(200, { ...headers, 'x-wp-total': '1', 'x-wp-totalpages': '1' }); res.end(JSON.stringify(page === 1 ? [{ id: 5, name: 'VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: '', shipping: true, compound: false }] : [])); return }
     res.writeHead(404, headers); res.end('{}')
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -69,7 +69,7 @@ function rig(base: string): Rig {
       if (/'wc_initial_import_completed'/.test(sql)) return { rows: [{ key: 'wc_initial_import_completed', value: 'true', at: '2026-09-01T00:00:00.000Z' }] }
       if (/FROM sales_orders/.test(sql)) return { rows: imsOrders.map((o) => ({ ...o })) }
       if (/FROM shopping_order_links/.test(sql)) return { rows: [{ order_id: imsOrders[0]!.id, connector: 'woocommerce', external_id: '11' }, { order_id: imsOrders[1]!.id, connector: 'woocommerce', external_id: '12' }] }
-      if (/FROM tax_rates/.test(sql)) return { rows: [{ id: 'r1', active: true, tax_type: null, country: 'GB', category: null }] }
+      if (/FROM tax_rates/.test(sql)) return { rows: [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: null, country: 'GB', category: null }] }
       if (/FROM shopping_tax_rate_mappings/.test(sql)) return { rows: [{ connector: 'woocommerce', external_id: '5', rate_id: 'r1' }] }
       return { rows: [] }
     },
