@@ -6,6 +6,8 @@
  * A resource's list is returned only when ALL of the following hold; any other state is a closed reason and NO list at all (a partial list is
  * never handed to the comparison, and the item is then inconclusive, never a pass):
  *
+ *   - the document lists ask for every status Xero gives a document, and a row whose status is not one of those six is SOURCE_UNREADABLE (a
+ *     status filter that left a status out would hide its rows from every pagination check, so none is left out);
  *   - every response is HTTP 200 with a JSON object body carrying Xero's own `pagination` object (page, pageSize, pageCount, itemCount), all
  *     plain whole numbers; no page size is sent and none is assumed (the size Xero reports is what the page lengths are checked against);
  *   - the item count is not above the walk cap (CAP_EXCEEDED), the page count is exactly ceil(itemCount / pageSize) (a zero count may report 0
@@ -29,7 +31,7 @@
  */
 
 import { Prisma } from '@/app/generated/prisma/client'
-import { isKnownCurrency, type PackReasonCode, type XeroResource } from '@/lib/reconciliation-pack/constants'
+import { R16_XERO_CHECKED_STATUSES, R16_XERO_DOCUMENT_STATUSES, R16_XERO_SET_ASIDE_STATUSES, isKnownCurrency, type PackReasonCode, type XeroResource } from '@/lib/reconciliation-pack/constants'
 import { XERO_MAX_PAGE_SIZE } from '@/lib/reconciliation-pack/constants'
 import { DATE_RE, Stop, UUID_RE, decimalOf, reasonOf, record, request, validDate, wholeNumber, type Walker, type XeroWalkWindow } from '@/lib/reconciliation-pack/xero-source'
 
@@ -47,6 +49,8 @@ export type XeroRateRead = {
   totals: { invoices: number; creditNotes: number; payments: number }
   /** Payments Xero lists as DELETED: read, counted in the total, and set aside (a deleted payment books nothing). */
   deletedPayments: number
+  /** Invoices, bills and credit notes Xero lists as VOIDED or DELETED: read, counted in the totals, and set aside as out of scope (reversed or removed, they book nothing). */
+  setAsideDocuments: number
 }
 
 const DATE_STRING_RE = /^([0-9]{4}-[0-9]{2}-[0-9]{2})T00:00:00$/
@@ -97,13 +101,17 @@ function documentSpec(resource: 'Invoices' | 'CreditNotes'): Spec {
   return {
     resource,
     listKey: resource,
-    statuses: 'AUTHORISED,PAID',
+    statuses: R16_XERO_DOCUMENT_STATUSES.join(','),
     parse(rawRow, window) {
       const r = record(rawRow)
       const id = identity(r, resource === 'Invoices' ? 'InvoiceID' : 'CreditNoteID')
       if (typeof r.Type !== 'string' || !Object.prototype.hasOwnProperty.call(kinds, r.Type)) throw new Stop('SOURCE_UNREADABLE')
       const kind = kinds[r.Type]!
-      if (r.Status !== 'AUTHORISED' && r.Status !== 'PAID') throw new Stop('SOURCE_UNREADABLE')
+      // EVERY status is read. A live one is checked; a voided or deleted one is read, counted and set aside (out of scope, it books nothing); a
+      // status that is neither (one this code does not know) is a service that is not what was understood, so the whole read is closed.
+      if (typeof r.Status !== 'string') throw new Stop('SOURCE_UNREADABLE')
+      if ((R16_XERO_SET_ASIDE_STATUSES as readonly string[]).includes(r.Status)) return { document: { readable: false, kind, id, date: null }, deleted: true }
+      if (!(R16_XERO_CHECKED_STATUSES as readonly string[]).includes(r.Status)) throw new Stop('SOURCE_UNREADABLE')
       const date = dateOf(r.DateString)
       // A row whose date cannot be read has no place in the window to prove: it is the one unreadable document, not a reason to drop the list.
       if (date === null) return { document: { readable: false, kind, id, date: null }, deleted: false }
@@ -191,7 +199,7 @@ async function walkProven(w: Walker, spec: Spec, window: XeroWalkWindow): Promis
 }
 
 /**
- * Every invoice and bill (AUTHORISED or PAID), every credit note (AUTHORISED or PAID) and every payment dated in [window.from, window.toExclusive),
+ * Every invoice, bill and credit note of EVERY status (DRAFT, SUBMITTED, AUTHORISED and PAID are checked; VOIDED and DELETED are counted and set aside) and every payment dated in [window.from, window.toExclusive),
  * each list proven as above. Any resource that cannot be proven makes the whole read a closed reason: the rate check never judges a part of Xero.
  */
 export async function readXeroRateDocuments(w: Walker, window: XeroWalkWindow): Promise<{ ok: true; value: XeroRateRead } | { ok: false; reason: PackReasonCode }> {
@@ -203,7 +211,7 @@ export async function readXeroRateDocuments(w: Walker, window: XeroWalkWindow): 
     const documents = [...invoices.documents, ...creditNotes.documents, ...payments.documents]
     // One identity is one document: a repeat across the three lists (different resources never share an id) is a service that is not consistent.
     if (new Set(documents.map((d) => d.id)).size !== documents.length) return { ok: false, reason: 'VENDOR_READ_UNSTABLE' }
-    return { ok: true, value: { documents, totals: { invoices: invoices.total, creditNotes: creditNotes.total, payments: payments.total }, deletedPayments: payments.deleted } }
+    return { ok: true, value: { documents, totals: { invoices: invoices.total, creditNotes: creditNotes.total, payments: payments.total }, deletedPayments: payments.deleted, setAsideDocuments: invoices.deleted + creditNotes.deleted } }
   } catch (error) {
     return { ok: false, reason: reasonOf(error) }
   }

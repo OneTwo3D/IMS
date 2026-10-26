@@ -151,7 +151,9 @@ test('A XERO READ THAT IS INCOMPLETE OR UNPROVEN IS INCONCLUSIVE, NEVER A PASS, 
     ['a failed request', (call) => (call.resource === 'CreditNotes' ? { ok: false } : undefined), 'SOURCE_UNREADABLE'],
     ['a row outside the window that was asked for', onResource('Invoices', (b) => ({ ...b, Invoices: [eur(1, 0.8, '2026-12-25'), ...(b.Invoices as unknown[]).slice(1)] })), 'SOURCE_UNREADABLE'],
     ['a row of the wrong type', onResource('Invoices', (b) => ({ ...b, Invoices: [{ ...(b.Invoices as Array<Record<string, unknown>>)[0], Type: 'ACCRECCREDIT' }, ...(b.Invoices as unknown[]).slice(1)] })), 'SOURCE_UNREADABLE'],
-    ['a draft that the status filter should have removed', onResource('Invoices', (b) => ({ ...b, Invoices: [{ ...(b.Invoices as Array<Record<string, unknown>>)[0], Status: 'DRAFT' }, ...(b.Invoices as unknown[]).slice(1)] })), 'SOURCE_UNREADABLE'],
+    ['an invoice in a status this code does not know', onResource('Invoices', (b) => ({ ...b, Invoices: [{ ...(b.Invoices as Array<Record<string, unknown>>)[0], Status: 'ARCHIVED' }, ...(b.Invoices as unknown[]).slice(1)] })), 'SOURCE_UNREADABLE'],
+    ['a credit note in a status this code does not know', onResource('CreditNotes', (b) => ({ ...b, CreditNotes: [{ ...(b.CreditNotes as Array<Record<string, unknown>>)[0], Status: 'ARCHIVED' }, ...(b.CreditNotes as unknown[]).slice(1)] })), 'SOURCE_UNREADABLE'],
+    ['an invoice with no status', onResource('Invoices', (b) => ({ ...b, Invoices: [{ ...(b.Invoices as Array<Record<string, unknown>>)[0], Status: undefined }, ...(b.Invoices as unknown[]).slice(1)] })), 'SOURCE_UNREADABLE'],
     ['an identity that is not an identifier', onResource('Payments', (b) => ({ ...b, Payments: [{ ...(b.Payments as Array<Record<string, unknown>>)[0], PaymentID: 'not-an-id' }] })), 'SOURCE_UNREADABLE'],
   ]
   for (const [name, tweak, reason] of cases) {
@@ -192,7 +194,7 @@ test('PAYMENTS AND DOCUMENTS: invoices, bills, credit notes and payments are eac
     [keyOf('purchase-bill', 2), '0.8', '0.9'],
     [keyOf('purchase-cn', 4), '0.8', '0.7'],
   ].sort())
-  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 2, creditNotes: 2, payments: 5 }, deletedPayments: 1, outsidePeriod: 0, baseCurrency: 1, compared: 7, equal: 4, xeroRateDiffers: 3, imsRateMissing: 0, documentUnreadable: 0 })
+  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 2, creditNotes: 2, payments: 5 }, deletedPayments: 1, setAsideDocuments: 0, outsidePeriod: 0, baseCurrency: 1, compared: 7, equal: 4, xeroRateDiffers: 3, imsRateMissing: 0, documentUnreadable: 0 })
   // A payment is judged on its own rate, not on its invoice's: the same euro invoice at 0.8 does not rescue a payment at 0.79 (asserted above), and a payment
   // that names no document has no currency to judge.
   const orphan = await runXeroRateItem('R16', context({ payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8, holder: 'none' })] }).ctx)
@@ -243,7 +245,7 @@ test('every request is a read of one of the four resources, with the status filt
   for (const call of xero.calls) {
     if (call.resource === 'Organisation') assert.deepEqual(call.params, {})
     else if (call.resource === 'Payments') assert.deepEqual(Object.keys(call.params).sort(), ['page', 'where'])
-    else assert.deepEqual([Object.keys(call.params).sort(), call.params.Statuses], [['Statuses', 'page', 'where'], 'AUTHORISED,PAID'])
+    else assert.deepEqual([Object.keys(call.params).sort(), call.params.Statuses], [['Statuses', 'page', 'where'], 'DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED'])
   }
   assert.equal(xero.calls.length, 7)
 })
@@ -305,7 +307,7 @@ test('the stored connection must be usable at the start and the same at the end 
 // [mutation: the sort removed / the key built from something that varies]
 test('THE ROWS ARE DETERMINISTIC: the order Xero lists them in does not change a byte of the result, and the identity is the kind and the Xero id only', async () => {
   const docs: XeroRateDocument[] = [1, 2, 3, 4].map((n) => ({ readable: true, kind: n % 2 === 0 ? 'payment' : 'sales-invoice', id: uuid(n), date: SEP, currency: 'EUR', rate: n === 3 ? '0.9' : '0.8' }))
-  const base = { read: { invoices: 2, creditNotes: 0, payments: 2 }, deletedPayments: 0, base: 'GBP', fxRows: FX_ROWS, periods: ['2026-08', '2026-09'] }
+  const base = { read: { invoices: 2, creditNotes: 0, payments: 2 }, deletedPayments: 0, setAsideDocuments: 0, base: 'GBP', fxRows: FX_ROWS, periods: ['2026-08', '2026-09'] }
   const forward = buildRateRows({ ...base, documents: docs })
   const backward = buildRateRows({ ...base, documents: [...docs].reverse() })
   assert.deepEqual(forward, backward)
@@ -316,14 +318,34 @@ test('THE ROWS ARE DETERMINISTIC: the order Xero lists them in does not change a
   assert.equal(a, b)
 })
 
+// [mutation: the status filter narrowed back to AUTHORISED,PAID / VOIDED or DELETED judged / an unknown status accepted]
+test('EVERY STATUS IS READ: a differing DRAFT invoice and a differing SUBMITTED credit note are findings, and VOIDED and DELETED documents are counted and set aside', async () => {
+  const run = await runXeroRateCheck(context({
+    invoices: [eur(1, 0.9, SEP, { status: 'DRAFT' }), eur(2, 0.8, SEP, { status: 'DRAFT' }), eur(3, 0.9, SEP, { status: 'VOIDED' }), eur(4, 0.9, SEP, { status: 'DELETED' }), eur(5, 0.8, SEP, { status: 'PAID' })],
+    creditNotes: [creditNoteRow({ n: 6, date: SEP, currency: 'EUR', rate: 0.7, status: 'SUBMITTED' }), creditNoteRow({ n: 7, date: SEP, currency: 'EUR', rate: 0.7, status: 'VOIDED' })],
+  }).ctx)
+  assert.deepEqual([run.item.outcome, [...run.item.reasons].sort()], ['fail', ['DIFFERENCES', 'XERO_RATE_DIFFERS']])
+  assert.deepEqual(entries(run.item, 'bothDiffer').map((e) => e.key).sort(), [keyOf('sales-cn', 6), keyOf('sales-invoice', 1)].sort())
+  assert.deepEqual(entries(run.item, 'bothEqual').map((e) => e.key).sort(), [keyOf('sales-invoice', 2), keyOf('sales-invoice', 5)].sort())
+  assert.deepEqual([run.summary?.read, run.summary?.setAsideDocuments, run.summary?.compared], [{ invoices: 5, creditNotes: 2, payments: 0 }, 3, 4])
+  // A voided document alone, at a rate that would differ, is not a finding: it is out of scope and says so in the summary.
+  const voided = await runXeroRateCheck(context({ invoices: [eur(1, 0.9, SEP, { status: 'VOIDED' })] }).ctx)
+  assert.equal(voided.item.outcome, 'pass')
+  assert.equal(voided.summary?.setAsideDocuments, 1)
+  // A status that is not one of the six makes the run inconclusive, never a pass (even when the only row would otherwise be equal).
+  const unknown = await runXeroRateItem('R16', context({ invoices: [eur(1, 0.8, SEP, { status: 'ARCHIVED' })] }).ctx)
+  assert.deepEqual([unknown.outcome, unknown.reasons], ['inconclusive', ['SOURCE_UNREADABLE']])
+})
+
 // [mutation: a count left out / counted twice]
 test('THE SUMMARY says what was read and how each row was judged', async () => {
   const run = await runXeroRateCheck(context({
     invoices: [eur(1, 0.8), eur(2, 0.9), eur(3, null), eur(4, 0.8, '2026-09-09'), invoiceRow({ n: 5, date: SEP, currency: 'GBP', rate: 1 }), eur(6, 0.8, '2026-10-01')],
+    creditNotes: [creditNoteRow({ n: 8, date: SEP, currency: 'EUR', rate: 0.1, status: 'VOIDED' }), creditNoteRow({ n: 9, date: SEP, currency: 'EUR', rate: 0.1, status: 'DELETED' })],
     payments: [paymentRow({ n: 7, date: SEP, currency: 'EUR', rate: 0.8, status: 'DELETED' })],
   }).ctx)
-  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 6, creditNotes: 0, payments: 1 }, deletedPayments: 1, outsidePeriod: 1, baseCurrency: 1, compared: 2, equal: 1, xeroRateDiffers: 1, imsRateMissing: 1, documentUnreadable: 1 })
-  assert.equal(summariseRateCheck(run.summary!), 'periods 2026-08,2026-09; read 6 invoices and bills, 0 credit notes, 1 payments (1 deleted); 1 outside the periods, 1 in the base currency (out of scope); 2 foreign compared (1 equal, 1 differ), 1 without an IMS rate, 1 unreadable')
+  assert.deepEqual(run.summary, { periods: ['2026-08', '2026-09'], read: { invoices: 6, creditNotes: 2, payments: 1 }, deletedPayments: 1, setAsideDocuments: 2, outsidePeriod: 1, baseCurrency: 1, compared: 2, equal: 1, xeroRateDiffers: 1, imsRateMissing: 1, documentUnreadable: 1 })
+  assert.equal(summariseRateCheck(run.summary!), 'periods 2026-08,2026-09; read 6 invoices and bills, 2 credit notes, 1 payments (1 deleted payments, 2 voided or deleted documents set aside as out of scope); 1 outside the periods, 1 in the base currency (out of scope); 2 foreign compared (1 equal, 1 differ), 1 without an IMS rate, 1 unreadable')
   assert.equal(ASOF, '2026-10-19')
   assert.equal((await runXeroRateCheck({ ...context({}).ctx, vendorReads: true, ims: undefined })).summary, null)
 })

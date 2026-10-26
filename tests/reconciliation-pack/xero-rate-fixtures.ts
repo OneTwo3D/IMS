@@ -39,6 +39,9 @@ export function imsRates(options: { base?: string; rows?: FxRateRow[]; fail?: 't
 
 // ---- Xero --------------------------------------------------------------------------------------
 
+/** The statuses Xero gives a document; a row in any other status is returned whatever the request named (a service that answers outside its own filter). */
+const KNOWN_STATUSES = new Set(['DRAFT', 'SUBMITTED', 'AUTHORISED', 'PAID', 'VOIDED', 'DELETED'])
+
 export type RateRow = { n: number; date: string; currency: string; rate: number | string | null; type?: string; status?: string; over?: Json }
 /** An invoice or bill (ACCREC unless `type` says otherwise). The rate field is left off when `rate` is null. */
 export const invoiceRow = (row: RateRow): Json => ({
@@ -72,7 +75,9 @@ export function rateDouble(lists: { invoices?: Json[]; creditNotes?: Json[]; pay
       let body: Json
       if (resource === 'Organisation') body = { Organisations: [{ BaseCurrency: options.baseCurrency ?? 'GBP' }] }
       else {
-        const sorted = [...source[resource]!].sort((a, b) => String(a[idKey[resource]!]).localeCompare(String(b[idKey[resource]!])))
+        // Like Xero, the double returns only the statuses a request names (none named = all): a request that leaves a status out never sees its rows.
+        const wanted = params.Statuses === undefined ? null : new Set(params.Statuses.split(','))
+        const sorted = [...source[resource]!].filter((row) => wanted === null || wanted.has(String(row.Status)) || !KNOWN_STATUSES.has(String(row.Status))).sort((a, b) => String(a[idKey[resource]!]).localeCompare(String(b[idKey[resource]!])))
         const page = Number(params.page)
         body = { [resource]: sorted.slice((page - 1) * pageSize, page * pageSize).map((row) => ({ ...row })), pagination: { page, pageSize, pageCount: Math.ceil(sorted.length / pageSize), itemCount: sorted.length } }
       }

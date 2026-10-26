@@ -95,6 +95,28 @@ test('A PAYMENT IN A STATUS THAT IS NEITHER AUTHORISED NOR DELETED is SOURCE_UNR
   assert.equal(read.value.totals.payments, 2, 'the total Xero reported counts the deleted one')
 })
 
+// [mutation: the status filter narrowed back / the document status check removed / a voided or deleted document judged]
+test('DOCUMENT STATUSES: the request names all six, DRAFT and SUBMITTED rows are read as documents, VOIDED and DELETED are counted and set aside, any other status closes the list', async () => {
+  const rows = (status: string) => [invoiceRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8 }), invoiceRow({ n: 2, date: SEP, currency: 'EUR', rate: 0.9, status })]
+  for (const status of ['DRAFT', 'SUBMITTED', 'AUTHORISED', 'PAID']) {
+    const read = await walk(rateDouble({ invoices: rows(status), creditNotes: [creditNoteRow({ n: 3, date: SEP, currency: 'EUR', rate: 0.9, status })] }))
+    assert.ok(read.ok, status)
+    assert.deepEqual([read.value.documents.map((d) => d.id).sort(), read.value.setAsideDocuments], [[uuid(1), uuid(2), uuid(3)], 0], status)
+  }
+  for (const status of ['VOIDED', 'DELETED']) {
+    const read = await walk(rateDouble({ invoices: rows(status), creditNotes: [creditNoteRow({ n: 3, date: SEP, currency: 'EUR', rate: 0.9, status })] }))
+    assert.ok(read.ok, status)
+    assert.deepEqual([read.value.documents.map((d) => d.id), read.value.setAsideDocuments, read.value.totals.invoices, read.value.totals.creditNotes], [[uuid(1)], 2, 2, 1], status)
+  }
+  for (const status of ['ARCHIVED', 'authorised', '', 'PENDING']) {
+    assert.deepEqual(await walk(rateDouble({ invoices: rows(status) })), { ok: false, reason: 'SOURCE_UNREADABLE' }, status)
+    assert.deepEqual(await walk(rateDouble({ creditNotes: [creditNoteRow({ n: 3, date: SEP, currency: 'EUR', rate: 0.9, status })] })), { ok: false, reason: 'SOURCE_UNREADABLE' }, status)
+  }
+  const double = rateDouble({ invoices: rows('DRAFT') })
+  await walk(double)
+  assert.ok(double.calls.filter((c) => c.resource !== 'Payments').every((c) => c.params.Statuses === 'DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED'))
+})
+
 test('what a readable row carries: its kind, date, currency and rate as Xero gave them, and an absent rate as null', async () => {
   const read = await walk(rateDouble({
     invoices: [invoiceRow({ n: 1, date: SEP, currency: 'EUR', rate: 0.8 }), invoiceRow({ n: 2, date: SEP, currency: 'EUR', rate: null, type: 'ACCPAY' })],

@@ -11,8 +11,11 @@
  *   PERIOD. The same as R12 (vat-item.ts r12ClosedPeriods): the latest R12_WINDOW_MONTHS calendar months (UTC) closed for the cycle date. Xero is
  *   asked for the window widened by R12_XERO_DATE_MARGIN_DAYS each side and every row is then cut by its own date.
  *
- *   POPULATION. Every invoice and bill (AUTHORISED or PAID), every credit note (AUTHORISED or PAID) and every payment (not DELETED) dated in the
- *   period, read as proven complete lists (xero-rate-source.ts). A document in the organisation's base currency is OUT OF SCOPE: it is counted in
+ *   POPULATION. Every invoice, bill and credit note in a status of DRAFT, SUBMITTED, AUTHORISED or PAID (a document IMS posted is checked from the
+ *   moment it exists, not only once approved) and every payment (not DELETED) dated in the period, read as proven complete lists (xero-rate-source.ts).
+ *   VOIDED and DELETED documents are read too and are OUT OF SCOPE by decision: a voided or deleted document is reversed or removed and books
+ *   nothing, so its CurrencyRate is not a booked rate; they are counted in the summary (never silently dropped), as a deleted payment is. Any other
+ *   status makes the read unreadable (inconclusive). A document in the organisation's base currency is OUT OF SCOPE: it is counted in
  *   the summary and never listed. Xero's base currency and IMS's must both be GBP (the fx_rates table is read from GBP), else BASE_CURRENCY_NOT_GBP.
  *
  *   THE RATE RULE. A business date maps to the END of that day, UTC (endOfBusinessDateUtc, lib/currencies/fx-select.ts: the one date rule). The
@@ -88,6 +91,8 @@ export type RateCheckSummary = {
   /** Rows Xero reported per list (documents, credit notes, payments), deleted payments included. */
   read: { invoices: number; creditNotes: number; payments: number }
   deletedPayments: number
+  /** Invoices, bills and credit notes read as VOIDED or DELETED: out of scope, counted. */
+  setAsideDocuments: number
   /** Rows read that are dated outside the periods (the widened margin) and so not judged. */
   outsidePeriod: number
   /** Documents and payments in the base currency: out of scope. */
@@ -108,7 +113,7 @@ const six = (value: Prisma.Decimal): Prisma.Decimal => value.toDecimalPlaces(R16
  * Judge every document against the IMS rows. Pure: no clock, no database, no network. `fxRows` are the fx_rates rows from the base currency
  * (read in one snapshot); `periods` are the closed months (YYYY-MM) that are in scope.
  */
-export function buildRateRows(input: { documents: readonly XeroRateDocument[]; read: XeroRateRead['totals']; deletedPayments: number; base: string; fxRows: readonly FxRateRow[]; periods: readonly string[] }): RateCheckRows {
+export function buildRateRows(input: { documents: readonly XeroRateDocument[]; read: XeroRateRead['totals']; deletedPayments: number; setAsideDocuments: number; base: string; fxRows: readonly FxRateRow[]; periods: readonly string[] }): RateCheckRows {
   const { base } = input
   const periodSet = new Set(input.periods)
   const byCurrency = new Map<string, SelectRow[]>()
@@ -117,7 +122,7 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     list.push({ fromCurrency: base, toCurrency: row.currency, rate: row.rate, fetchedAt: new Date(row.fetchedAt), manualOverride: row.manualOverride })
     byCurrency.set(row.currency, list)
   }
-  const summary: RateCheckSummary = { periods: [...input.periods], read: { ...input.read }, deletedPayments: input.deletedPayments, outsidePeriod: 0, baseCurrency: 0, compared: 0, equal: 0, xeroRateDiffers: 0, imsRateMissing: 0, documentUnreadable: 0 }
+  const summary: RateCheckSummary = { periods: [...input.periods], read: { ...input.read }, deletedPayments: input.deletedPayments, setAsideDocuments: input.setAsideDocuments, outsidePeriod: 0, baseCurrency: 0, compared: 0, equal: 0, xeroRateDiffers: 0, imsRateMissing: 0, documentUnreadable: 0 }
   const ims: SideRow[] = []
   const vendor: SideRow[] = []
   // Sorted, so the evidence order does not depend on the order Xero listed its rows in.
@@ -158,7 +163,7 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
 /** The one-line account of a run, for the PR and for a person reading the evidence: what was read and how each row was judged. */
 export function summariseRateCheck(summary: RateCheckSummary): string {
   const s = summary
-  return `periods ${s.periods.join(',')}; read ${s.read.invoices} invoices and bills, ${s.read.creditNotes} credit notes, ${s.read.payments} payments (${s.deletedPayments} deleted); ${s.outsidePeriod} outside the periods, ${s.baseCurrency} in the base currency (out of scope); ${s.compared} foreign compared (${s.equal} equal, ${s.xeroRateDiffers} differ), ${s.imsRateMissing} without an IMS rate, ${s.documentUnreadable} unreadable`
+  return `periods ${s.periods.join(',')}; read ${s.read.invoices} invoices and bills, ${s.read.creditNotes} credit notes, ${s.read.payments} payments (${s.deletedPayments} deleted payments, ${s.setAsideDocuments} voided or deleted documents set aside as out of scope); ${s.outsidePeriod} outside the periods, ${s.baseCurrency} in the base currency (out of scope); ${s.compared} foreign compared (${s.equal} equal, ${s.xeroRateDiffers} differ), ${s.imsRateMissing} without an IMS rate, ${s.documentUnreadable} unreadable`
 }
 
 export type XeroRateRun = { item: ItemInput; summary: RateCheckSummary | null }
@@ -199,7 +204,7 @@ export async function runXeroRateCheck(context: XeroRateItemContext): Promise<Xe
   const end = await xero.binding()
   if (end === null || end.tenantId !== start.tenantId || end.connectionGeneration !== start.connectionGeneration) return none(inconclusive([IMS, XERO], 'XERO_CONNECTION_UNUSABLE'))
 
-  const rows = buildRateRows({ documents: documents.value.documents, read: documents.value.totals, deletedPayments: documents.value.deletedPayments, base: base.value, fxRows, periods })
+  const rows = buildRateRows({ documents: documents.value.documents, read: documents.value.totals, deletedPayments: documents.value.deletedPayments, setAsideDocuments: documents.value.setAsideDocuments, base: base.value, fxRows, periods })
   const s = rows.summary
   const result = compareItem('R16', {
     ims: rows.ims,

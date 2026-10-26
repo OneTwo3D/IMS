@@ -50,23 +50,30 @@ test('the hop gate admits exactly the R16 reads (invoices, credit notes, payment
   const where = encodeURIComponent(xeroDateWhere({ from: '2026-07-31', toExclusive: '2026-10-02' }))
   const root = 'https://api.xero.com/api.xro/2.0'
   assert.equal(where, encodeURIComponent('Date>=DateTime(2026, 7, 31) AND Date<DateTime(2026, 10, 2)'))
-  assert.equal(hop(`${root}/Invoices?where=${where}&Statuses=AUTHORISED,PAID&page=1`), null)
-  assert.equal(hop(`${root}/CreditNotes?where=${where}&Statuses=AUTHORISED,PAID&page=3`), null)
+  assert.equal(hop(`${root}/Invoices?where=${where}&Statuses=DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED&page=1`), null)
+  assert.equal(hop(`${root}/CreditNotes?where=${where}&Statuses=DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED&page=3`), null)
   assert.equal(hop(`${root}/Payments?where=${where}&page=1`), null)
+  // R16's document lists take EVERY status and nothing narrower; R12's own status list belongs to R12's typed read alone (the pairing is exact).
+  const r12where = encodeURIComponent(xeroInvoiceWhere({ from: '2026-07-31', toExclusive: '2026-10-02' }))
+  for (const narrowed of ['AUTHORISED,PAID', 'DRAFT,SUBMITTED,AUTHORISED,PAID', 'AUTHORISED,PAID,VOIDED,DELETED', 'DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED', 'DRAFT', 'DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED,FOO']) {
+    assert.equal(hop(`${root}/Invoices?where=${where}&Statuses=${narrowed}&page=1`), 'parameter', narrowed)
+    assert.equal(hop(`${root}/CreditNotes?where=${where}&Statuses=${narrowed}&page=1`), 'parameter', narrowed)
+  }
+  assert.equal(hop(`${root}/Invoices?where=${r12where}&Statuses=DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED&page=1`), 'parameter')
   // R12's own read is unchanged.
   assert.equal(hop(`${root}/Invoices?where=${encodeURIComponent(xeroInvoiceWhere({ from: '2026-07-31', toExclusive: '2026-10-02' }))}&Statuses=AUTHORISED,PAID&page=1`), null)
   // Only a GET.
   for (const resource of ['Invoices', 'CreditNotes', 'Payments']) for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) assert.equal(hop(`${root}/${resource}?where=${where}&Statuses=AUTHORISED,PAID&page=1`, method), 'method')
   // The credit-note list needs all three parameters and the payment list takes no status.
   assert.equal(hop(`${root}/CreditNotes?where=${where}&page=1`), 'parameter')
-  assert.equal(hop(`${root}/CreditNotes?Statuses=AUTHORISED,PAID&page=1`), 'parameter')
-  assert.equal(hop(`${root}/CreditNotes?where=${where}&Statuses=AUTHORISED,PAID`), 'parameter')
+  assert.equal(hop(`${root}/CreditNotes?Statuses=DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED&page=1`), 'parameter')
+  assert.equal(hop(`${root}/CreditNotes?where=${where}&Statuses=DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED`), 'parameter')
   assert.equal(hop(`${root}/Payments?where=${where}&Statuses=AUTHORISED,PAID&page=1`), 'parameter')
   assert.equal(hop(`${root}/Payments?where=${where}`), 'parameter')
   assert.equal(hop(`${root}/Payments?page=1`), 'parameter')
   // A Type clause belongs to R12's invoice read alone: the credit-note and payment lists take the date window and nothing else.
   const typed = encodeURIComponent('Type=="ACCREC" AND Date>=DateTime(2026, 7, 31) AND Date<DateTime(2026, 10, 2)')
-  assert.equal(hop(`${root}/CreditNotes?where=${typed}&Statuses=AUTHORISED,PAID&page=1`), 'parameter')
+  assert.equal(hop(`${root}/CreditNotes?where=${typed}&Statuses=DRAFT,SUBMITTED,AUTHORISED,PAID,VOIDED,DELETED&page=1`), 'parameter')
   assert.equal(hop(`${root}/Payments?where=${typed}&page=1`), 'parameter')
   for (const clause of ['Date>=DateTime(2026, 7, 31)', 'Date>=DateTime(2026, 07, 31) AND Date<DateTime(2026, 10, 2)', 'Date>=DateTime(2026, 7, 31) AND Date<DateTime(2026, 10, 2) OR Status=="DRAFT"', 'Status=="PAID"', 'Date>=DateTime(2026, 7, 31) AND Date<DateTime(2026, 10, 2); DELETE']) {
     assert.equal(hop(`${root}/Payments?where=${encodeURIComponent(clause)}&page=1`), 'parameter', clause)

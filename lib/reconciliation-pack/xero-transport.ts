@@ -15,7 +15,7 @@
  * its parsed JSON is returned, and no error text, URL or body is kept.
  */
 
-import { R12_XERO_INVOICE_STATUSES, XERO_API_BASE_URL, XERO_READ_PARAMS, XERO_READ_RESOURCES, XERO_REQUEST_TIMEOUT_MS, type XeroResource } from '@/lib/reconciliation-pack/constants'
+import { R12_XERO_INVOICE_STATUSES, R16_XERO_DOCUMENT_STATUSES, XERO_API_BASE_URL, XERO_READ_PARAMS, XERO_READ_RESOURCES, XERO_REQUEST_TIMEOUT_MS, type XeroResource } from '@/lib/reconciliation-pack/constants'
 import type { XeroAccess } from '@/lib/reconciliation-pack/xero-credentials'
 import type { XeroGetPort, XeroPage } from '@/lib/reconciliation-pack/xero-source'
 import { connectorFetch, type ConnectorFetchOptions } from '@/lib/security/connector-fetch'
@@ -24,7 +24,9 @@ export const XERO_WHERE_RE = /^Type=="ACCREC" AND Date>=DateTime\([1-9][0-9]{3},
 /** R16: the documents (and payments) dated in a window, of every type. */
 export const XERO_DATE_WHERE_RE = /^Date>=DateTime\([1-9][0-9]{3}, [1-9][0-9]?, [1-9][0-9]?\) AND Date<DateTime\([1-9][0-9]{3}, [1-9][0-9]?, [1-9][0-9]?\)$/
 const PAGE_RE = /^[1-9][0-9]{0,6}$/
-const STATUSES_VALUE = R12_XERO_INVOICE_STATUSES.join(',')
+/** R12 reads sales invoices that are authorised or paid; R16 reads every status of every document type (the two are paired with their own `where` below). */
+export const R12_STATUSES_VALUE = R12_XERO_INVOICE_STATUSES.join(',')
+export const R16_STATUSES_VALUE = R16_XERO_DOCUMENT_STATUSES.join(',')
 
 export type XeroTransportDeps = {
   /** Reads the access on first use. null = not configured / not trusted / not current: no request is made. */
@@ -48,16 +50,22 @@ export function xeroHopRefusal(base: URL, hop: { method: string; url: URL; redir
   const resource = hop.url.pathname.slice(prefix.length)
   if (!(XERO_READ_RESOURCES as readonly string[]).includes(resource)) return 'path'
   const seen = new Set<string>()
+  let r12Where = false
+  let statuses = ''
   for (const [name, value] of hop.url.searchParams) {
     if (!(XERO_READ_PARAMS as readonly string[]).includes(name) || seen.has(name)) return 'parameter'
     seen.add(name)
     if (name === 'where' && !(resource === 'Invoices' ? XERO_WHERE_RE.test(value) || XERO_DATE_WHERE_RE.test(value) : XERO_DATE_WHERE_RE.test(value))) return 'parameter'
-    if (name === 'Statuses' && value !== STATUSES_VALUE) return 'parameter'
+    if (name === 'Statuses' && value !== R12_STATUSES_VALUE && value !== R16_STATUSES_VALUE) return 'parameter'
+    if (name === 'where' && XERO_WHERE_RE.test(value)) r12Where = true
+    if (name === 'Statuses') statuses = value
     if (name === 'page' && !PAGE_RE.test(value)) return 'parameter'
   }
   // The organisation read takes no parameter at all; the invoice and credit-note lists take all three; the payment list takes a where and a page and no status.
   if (resource === 'Organisation' && seen.size !== 0) return 'parameter'
   if ((resource === 'Invoices' || resource === 'CreditNotes') && !(seen.has('where') && seen.has('Statuses') && seen.has('page'))) return 'parameter'
+  // R12's invoice read (a Type clause) takes its own status list and R16's date-only read takes every status; never the other pairing.
+  if (seen.has('Statuses') && statuses !== (r12Where ? R12_STATUSES_VALUE : R16_STATUSES_VALUE)) return 'parameter'
   if (resource === 'Payments' && !(seen.has('where') && seen.has('page') && !seen.has('Statuses'))) return 'parameter'
   return null
 }
