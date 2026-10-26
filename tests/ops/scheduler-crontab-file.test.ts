@@ -6,7 +6,7 @@ import { test } from 'node:test'
 
 import { readCrontabForReport } from '../../lib/ops/read-sync-status.ts'
 import {
-  linesOutsideManagedBlock, redactedLinePreview, SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
+  invalidScheduleLines, linesOutsideManagedBlock, redactedLinePreview, SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
 } from '../../lib/ops/scheduler-crontab-file.ts'
 
 /** A stubbed stat: what cron checks on the host file. */
@@ -172,4 +172,17 @@ test('cron.d: a NAME=value assignment OUTSIDE the block is refused (cron applies
   // The user format is unchanged: assignments outside the block are the operator's own.
   const userText = `SHELL=/bin/sh\nPATH=/usr/bin\n${block}MAILTO=me\n`
   assert.deepEqual(readSchedulerCrontabFile('/etc/ims/crontab', {}, () => Buffer.from(userText)), { resolved: true, text: userText })
+})
+
+test('cron.d: an installed job line whose schedule is out of range is an UNRESOLVED read (cron would never run it)', () => {
+  const cronD = { [SCHEDULER_CRONTAB_FORMAT_ENV]: 'cron.d' }
+  const read = (text: string) => readSchedulerCrontabFile('/host-cron.d/onetwo3d-ims', cronD, () => Buffer.from(text), ROOT_FILE)
+  const withSchedule = (schedule: string) => `${START}\n# Alpha Job\n${schedule}  root  curl -sf "$BASE_URL/a"\n${END}\n`
+  for (const schedule of ['99 * * * *', '* 24 * * *', '*/0 * * * *', '30-10 * * * *', '* * * 13 *']) {
+    const result = read(withSchedule(schedule))
+    assert.equal(result.resolved, false, schedule)
+    assert.match((result as { reason: string }).reason, /^Host cron is out of date: 1 installed job line\(s\) with a schedule cron would not run/)
+  }
+  assert.equal(read(withSchedule('*/5 0-6 * * 1-5')).resolved, true)
+  assert.deepEqual(invalidScheduleLines(`${START}\n# x\n61 * * * *  curl\n${END}`).map((entry) => entry.line), ['61 * * * *  curl'])
 })

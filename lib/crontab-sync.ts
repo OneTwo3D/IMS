@@ -138,8 +138,62 @@ export function extractOtiBlock(crontabText: string): string[] {
   return lines.filter((_, idx) => drop[idx])
 }
 
-// Strict cron expression validation: 5 fields, only digits / * / , / - / /
-const CRON_RE = /^(\*|(\*\/)?[0-9]+([,-][0-9]+)*)( (\*|(\*\/)?[0-9]+([,-][0-9]+)*)){4}$/
+// Strict cron expression validation: 5 space-separated fields, each `*`, `*/n`, or a list of numbers, `a-b` ranges and `a-b/n` steps,
+// every number inside its field's real range. The one validator: the scheduler Save action, the crontab builder (so the in-app
+// writer and the container image's renderer), and the host-cron reader all use it. Names (jan, sun) and @macros are not accepted,
+// as before.
+const CRON_FIELDS = [
+  { name: 'minute', min: 0, max: 59 },
+  { name: 'hour', min: 0, max: 23 },
+  { name: 'day of month', min: 1, max: 31 },
+  { name: 'month', min: 1, max: 12 },
+  { name: 'day of week', min: 0, max: 7 },
+] as const
+
+export type CronScheduleCheck = { ok: true } | { ok: false; field: string; error: string }
+
+function checkCronField(field: (typeof CRON_FIELDS)[number], text: string): string | null {
+  const bad = (why: string) => `${field.name} "${text}" ${why}`
+  const num = (value: string): number | null => (/^[0-9]+$/.test(value) ? Number(value) : null)
+  for (const item of text.split(',')) {
+    const [range, step, extra] = item.split('/')
+    if (extra !== undefined || range === undefined || range === '') return bad('is not a valid cron field')
+    if (step !== undefined) {
+      const n = num(step)
+      if (n === null) return bad('has a step that is not a number')
+      if (n < 1) return bad('has a step of 0 (the step must be at least 1)')
+      if (n > field.max) return bad(`has a step larger than ${field.max}`)
+    }
+    if (range === '*') continue
+    if (step !== undefined && !range.includes('-') && range !== '*') {
+      // `a/n` is not valid cron; only `*/n` and `a-b/n` take a step.
+      return bad('has a step on a single value (use */n or a-b/n)')
+    }
+    const [lo, hi, more] = range.split('-')
+    const a = num(lo ?? '')
+    const b = hi === undefined ? a : num(hi)
+    if (more !== undefined || a === null || b === null) return bad('is not a valid cron field')
+    if (a < field.min || a > field.max || b < field.min || b > field.max) return bad(`is out of range (${field.min}-${field.max})`)
+    if (a > b) return bad('is a reversed range')
+  }
+  return null
+}
+
+export function validateCronSchedule(schedule: string): CronScheduleCheck {
+  const parts = schedule.split(' ')
+  if (parts.length !== 5 || parts.some((part) => part === '')) {
+    return { ok: false, field: 'schedule', error: 'must have exactly 5 fields (minute hour day-of-month month day-of-week) separated by single spaces' }
+  }
+  for (let i = 0; i < 5; i += 1) {
+    const error = checkCronField(CRON_FIELDS[i]!, parts[i]!)
+    if (error) return { ok: false, field: CRON_FIELDS[i]!.name, error }
+  }
+  return { ok: true }
+}
+
+export function isValidCronSchedule(schedule: string): boolean {
+  return validateCronSchedule(schedule).ok
+}
 
 export type CrontabJobDef = {
   slug: string
@@ -287,8 +341,9 @@ export function buildOtiCrontabBlock(params: {
     if (!enabled) continue
 
     const schedule = settings.get(`cron_${job.settingKey}_schedule`) ?? job.defaultSchedule
-    if (!CRON_RE.test(schedule)) {
-      return { ok: false, error: `Invalid cron schedule for ${job.label}: "${schedule}"` }
+    const check = validateCronSchedule(schedule)
+    if (!check.ok) {
+      return { ok: false, error: `Invalid cron schedule for ${job.label}: "${schedule}" (${check.error})` }
     }
 
     lines.push(

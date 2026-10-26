@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
-import { OTI_CRON_END_MARKER, OTI_CRON_START_MARKER } from '@/lib/crontab-sync'
+import { OTI_CRON_END_MARKER, OTI_CRON_START_MARKER, validateCronSchedule } from '@/lib/crontab-sync'
 
 /**
  * WHERE THE SCHEDULER'S CRONTAB COMES FROM WHEN THE PROCESS CANNOT RUN `crontab -l`.
@@ -92,6 +92,21 @@ export function linesOutsideManagedBlock(text: string): { active: string[]; assi
   return out
 }
 
+/**
+ * Pure. Installed job lines (anywhere in the file, user field already removed) whose five schedule fields are not a valid cron
+ * schedule. cron ignores such a line, so the job never runs while an exact-text comparison with the renderer's output can still match.
+ */
+export function invalidScheduleLines(text: string): { line: string; error: string }[] {
+  const out: { line: string; error: string }[] = []
+  for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const trimmed = raw.trim()
+    if (!/^[0-9*]/.test(trimmed)) continue
+    const check = validateCronSchedule(trimmed.split(/\s+/).slice(0, 5).join(' '))
+    if (!check.ok) out.push({ line: trimmed, error: check.error })
+  }
+  return out
+}
+
 export const OUTSIDE_LINES_REASON_PREFIX = 'Host cron is out of date:'
 
 /** The configured file, or null when the variable is unset (or blank). Pure. */
@@ -159,6 +174,11 @@ export function readSchedulerCrontabFile(
   const text = bytes.toString('utf8')
   if (format !== 'cron.d') return { resolved: true, text }
   const stripped = stripCronDUserField(text)
+  const invalid = invalidScheduleLines(stripped)
+  if (invalid.length > 0) {
+    const shown = invalid.slice(0, 3).map((entry) => `"${redactedLinePreview(entry.line)}" (${entry.error})`).join(', ')
+    return { resolved: false, reason: `${OUTSIDE_LINES_REASON_PREFIX} ${invalid.length} installed job line(s) with a schedule cron would not run (${shown}${invalid.length > 3 ? ', ...' : ''})` }
+  }
   const outside = linesOutsideManagedBlock(stripped)
   if (outside.active.length > 0 || outside.assignments.length > 0) {
     const preview = (lines: string[]) => lines.slice(0, 3).map((line) => `"${redactedLinePreview(line)}"`).join(', ') + (lines.length > 3 ? ', ...' : '')

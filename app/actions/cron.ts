@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { getCronSecret } from '@/lib/cron-secret'
 import {
+  validateCronSchedule,
   emulateRuntimeSecretExtraction,
   parseOtiCrontabStatus,
   type OtiCrontabStatus,
@@ -96,6 +97,17 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
     return rows
   })
   if (entries.length === 0) return { status: 'saved' }
+
+  // EVERY schedule is checked against the real cron field ranges BEFORE anything is written, in every mode: `99 * * * *` passes a
+  // shape check, would be stored, and in container mode would be installed on the host by a file nothing syntax-checks, where cron
+  // silently never runs the job.
+  const labelBySettingKey = new Map(getAllCronJobs().map((job) => [job.settingKey, job.label]))
+  for (const job of jobs) {
+    const check = validateCronSchedule(job.schedule)
+    if (!check.ok) {
+      return { status: 'refused', error: `Invalid schedule for "${labelBySettingKey.get(job.settingKey) ?? job.settingKey}": ${check.error}. Nothing was saved.` }
+    }
+  }
 
   // The scheduled reconciliation pack re-reads its switch, schedule, phase and vendor option under this fence just before it starts
   // a run, so a save that changes any of them takes it first (and waits only for that short read, never for a running child).

@@ -236,7 +236,8 @@ update pending: the host must re-render and install /etc/cron.d/onetwo3d-ims". T
 installing the file with the command below. A later deployment task will add a host timer that does this automatically every few
 minutes when the rendered output changes; until that exists, it is manual. Container mode is `IMS_SCHEDULER_CRONTAB_FILE` set together
 with `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d`; on a stage host (the `user` layout, `crontab -l`) Save & Apply still rewrites the crontab as
-before. The same drift check is available from the image: `docker exec <ims> node /app/dist-scripts/render-managed-crontab.mjs --check`
+before. Schedules are validated against the real cron field ranges (minute 0-59, hour 0-23, day of month 1-31, month 1-12, day of week 0-7; `*`, lists, ranges and steps, no names or macros): Save refuses an invalid one, the renderer refuses to render a saved one (naming the job and field), and the reader treats an installed line with one as unreadable, because cron silently ignores such a line.
+The same drift check is available from the image: `docker exec <ims> node /app/dist-scripts/render-managed-crontab.mjs --check`
 (exit 0 in sync, 1 out of date).
 
 **Re-render and reinstall after ANY scheduler change in Settings (a job switched on or off, a schedule edited), and after every

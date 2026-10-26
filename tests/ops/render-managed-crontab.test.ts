@@ -65,3 +65,12 @@ test('cron.d render: every job line carries the user field, and the reader turns
   assert.equal(body(stripped), body(asUser.text))
   assert.deepEqual(verifyJobsScheduled(stripped, [JOBS[0]!], { alpha: '* * * * *' }), { blockProblem: null, missing: [] })
 })
+
+test('the renderer refuses an out-of-range saved schedule, naming the job and the field (an old bad row cannot reach the host)', () => {
+  const out = renderManagedCrontab({ jobs: JOBS, settings: new Map([['cron_alpha_schedule', '99 * * * *']]), defaultsOnly: false, ...BASE, format: 'cron.d' })
+  assert.equal(out.ok, false)
+  assert.match((out as { error: string }).error, /Invalid cron schedule for Alpha Job: "99 \* \* \* \*" \(minute "99" is out of range \(0-59\)\)/)
+  // A disabled job's bad row is not rendered, so it does not block the render.
+  const disabled = renderManagedCrontab({ jobs: JOBS, settings: new Map([['cron_alpha_schedule', '99 * * * *'], ['cron_alpha_enabled', 'false']]), defaultsOnly: false, ...BASE })
+  assert.equal(disabled.ok, true)
+})

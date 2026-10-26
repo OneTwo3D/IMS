@@ -423,6 +423,21 @@ case "$drift" in *"SHELL=<redacted>"*) ;; *) fail "the assignment preview is not
 case "$drift" in *"/bin/false"*) fail "the assignment's value is shown: ${drift}" ;; esac
 as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
 expect_drift "after restoring the rendered file" "Host cron is in sync*" "host cron did not return to in sync after the assignment was removed"
+
+# 5. An out-of-range saved schedule written straight into the settings row (bypassing Save). `99 * * * *` has the right shape, but cron
+#    would never run it, and nothing on the host syntax-checks a cron.d file, so the renderer must refuse to render it.
+sql "UPDATE settings SET value = '99 * * * *' WHERE key = 'cron_backup_schedule'" >/dev/null
+render_err="$(mktemp)"
+render_rc=0
+docker run --rm --network "$NET" -e DATABASE_URL --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/render-managed-crontab.mjs \
+  --base-url "http://${APP_NAME}:3000" --secret-file "$SECRET_FILE" --log-path "$CRON_LOG" --format cron.d --cron-user root \
+  > /dev/null 2> "$render_err" || render_rc=$?
+echo "    renderer with a saved out-of-range schedule: exit ${render_rc}: $(head -c 300 "$render_err")"
+[ "$render_rc" != 0 ] || fail "the renderer rendered an out-of-range saved schedule"
+grep -q 'Invalid cron schedule for Database Backup' "$render_err" || fail "the renderer's refusal does not name the job"
+grep -q 'minute "99" is out of range' "$render_err" || fail "the renderer's refusal does not name the bad field"
+sql "UPDATE settings SET value = '5 2 * * *' WHERE key = 'cron_backup_schedule'" >/dev/null
+expect_drift "after restoring the saved schedule" "Host cron is in sync*" "host cron did not return to in sync after the bad schedule was restored"
 echo "    OK: host cron drift reads in sync, out of date with an EXTRA job and with a changed schedule, and in sync again after each host re-render"
 
 status=0
