@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
 /**
@@ -64,10 +64,37 @@ export function configuredSchedulerCrontabFile(env: Readonly<Record<string, stri
   return raw ? raw : null
 }
 
+export type CronFileStat = { isFile(): boolean; isSymbolicLink(): boolean; uid: number; mode: number; nlink: number }
+export type CronFileStatter = { lstat: (file: string) => CronFileStat; stat: (file: string) => CronFileStat }
+const REAL_STATTER: CronFileStatter = { lstat: (f) => lstatSync(f), stat: (f) => statSync(f) }
+
+/**
+ * Debian cron silently IGNORES a cron.d file that is not a regular file with a single link, is not owned by root, or is writable by
+ * group or others. The reader applies the same rules before it accepts the file, because a file cron ignores is a scheduler in which
+ * no job ever fires. Through a read-only bind mount the container sees the host file's own uid and mode bits (a bind mount does not
+ * remap them), so these are the values cron checks on the host. A symlink is followed and the TARGET is judged, as cron does.
+ * Returns the reason cron would ignore the file, or null.
+ */
+export function cronWouldIgnore(file: string, statter: CronFileStatter = REAL_STATTER): string | null {
+  let info: CronFileStat
+  try {
+    info = statter.lstat(file)
+    if (info.isSymbolicLink()) info = statter.stat(file)
+  } catch (error) {
+    return `cron would ignore ${file}: it cannot be inspected (${(error as NodeJS.ErrnoException).code ?? 'error'})`
+  }
+  if (!info.isFile()) return `cron would ignore ${file}: not a regular file`
+  if (info.uid !== 0) return `cron would ignore ${file}: not owned by root (uid ${info.uid})`
+  if ((info.mode & 0o022) !== 0) return `cron would ignore ${file}: group/world-writable (mode ${(info.mode & 0o7777).toString(8).padStart(4, '0')})`
+  if (info.nlink !== 1) return `cron would ignore ${file}: it has ${info.nlink} hard links`
+  return null
+}
+
 export function readSchedulerCrontabFile(
   file: string,
   env: Readonly<Record<string, string | undefined>> = process.env,
   readFile: (file: string) => Buffer = (f) => readFileSync(f),
+  statter: CronFileStatter = REAL_STATTER,
 ): SchedulerCrontabRead {
   const format = env[SCHEDULER_CRONTAB_FORMAT_ENV]?.trim() || 'user'
   if (format !== 'user' && format !== 'cron.d') {
@@ -78,6 +105,10 @@ export function readSchedulerCrontabFile(
   }
   if (format === 'cron.d' && !CRON_D_FILE_NAME_RE.test(path.basename(file))) {
     return { resolved: false, reason: `cron ignores a cron.d file named "${path.basename(file)}" (only letters, digits, "_" and "-" are allowed, so no dots); the installed file would never run` }
+  }
+  if (format === 'cron.d') {
+    const ignored = cronWouldIgnore(file, statter)
+    if (ignored !== null) return { resolved: false, reason: ignored }
   }
   let bytes: Buffer
   try {

@@ -34,6 +34,7 @@ APP_NAME="ims-smoke-app-${SUFFIX}"
 CRON_NAME="ims-smoke-cron-${SUFFIX}"
 CROND_DIR=""
 SMOKE_DIR=""
+BAD_DIR=""
 as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
 
 # Throwaway per-run values (generated, never committed, never reused).
@@ -61,6 +62,7 @@ cleanup() {
   docker rm -f "$CRON_NAME" "$APP_NAME" "$PG_NAME" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   if [ -n "${CROND_DIR:-}" ]; then as_root rm -rf "$CROND_DIR" || true; fi
+  if [ -n "${BAD_DIR:-}" ]; then as_root rm -rf "$BAD_DIR" || true; fi
   if [ -n "${SMOKE_DIR:-}" ]; then rm -rf "$SMOKE_DIR" || true; fi
 }
 trap cleanup EXIT
@@ -329,6 +331,28 @@ printf '%s' "$status_json" | jq -e '.scheduler.examined == true and .scheduler.u
 control_json="$(docker exec -e IMS_SCHEDULER_CRONTAB_FILE=/nonexistent/crontab "$APP_NAME" node /app/dist-scripts/read-sync-status.mjs --json 2>/dev/null || true)"
 printf '%s' "$control_json" | jq -e '.scheduler.unreadable != null' >/dev/null || fail "a missing crontab file was not reported as an unreadable scheduler"
 echo "    OK: scheduler examined, trusted, nothing unscheduled; a missing file fails closed"
+
+# Control: cron silently ignores a cron.d file that is not root-owned or is group/world-writable, so the reader must not trust one
+# either. The same installed file is copied with each property, mounted read-only into a one-off reader, and read.
+echo "==> a cron.d file that cron would ignore is not trusted"
+BAD_DIR="$(mktemp -d)"
+as_root chown root:root "$BAD_DIR"
+as_root chmod 0755 "$BAD_DIR"
+read_copy_scheduler() { # <mode> <owner>  -> the status JSON read from a copy installed with that mode and owner
+  as_root install -m "$1" -o "$2" -g "$2" "$CRONTAB_FILE" "${BAD_DIR}/onetwo3d-ims"
+  docker run --rm --network "$NET" -e DATABASE_URL -e IMS_SCHEDULER_CRONTAB_FORMAT -e IMS_SCHEDULER_CRONTAB_FILE=/bad/onetwo3d-ims \
+    -v "${BAD_DIR}:/bad:ro" --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/read-sync-status.mjs --json 2>/dev/null || true
+}
+good_copy="$(read_copy_scheduler 0644 root)"
+printf '%s' "$good_copy" | jq -e '.scheduler.unreadable == null and (.scheduler.unscheduled | length) == 0' >/dev/null || fail "the harness does not read a root-owned 0644 copy"
+for variant in "0664 root" "0646 root" "0644 1001"; do
+  # shellcheck disable=SC2086  # deliberate split into mode and owner
+  bad_copy="$(read_copy_scheduler $variant)"
+  reason="$(printf '%s' "$bad_copy" | jq -r '.scheduler.unreadable // empty')"
+  echo "    mode/owner ${variant}: ${reason:-<trusted>}"
+  case "$reason" in *"cron would ignore"*) ;; *) fail "a cron.d file with mode/owner ${variant} was trusted" ;; esac
+done
+echo "    OK: a cron.d file cron would ignore (group/world-writable, or not owned by root) reads as an unreadable scheduler"
 
 pack_run_id="$(jq -r '.packRunId // empty' "$body")"
 report_json="$(docker exec "$APP_NAME" cat "/var/tmp/ims-reconciliation-pack-reports/${pack_run_id}/reconciliation-pack.json")" || fail "cannot read the published pack report"
