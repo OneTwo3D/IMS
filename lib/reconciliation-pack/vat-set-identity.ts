@@ -54,6 +54,8 @@ export const VAT_SET_REASONS = {
   SHIPPING_NOT_TAXED: 'a WooCommerce rate with a positive percentage has "apply to shipping" off, but shipping always carries the goods\' VAT rate (owner ruling; the VAT difference report\'s WOO_SHIPPING_NOT_TAXED). A zero-rate is exempt: shipping at 0% is the same as no VAT on shipping',
   REGION_DIFFERS: 'the region of the WooCommerce rate (its state) is not the region its IMS rate records: IMS records a region only as the suffix of the rate name ("PT-30 VAT" is region 30), and the two disagree, including a regional IMS rate on a country-wide WooCommerce rate',
   REGION_UNVERIFIED: 'the region of the WooCommerce rate cannot be confirmed against IMS, which has no region data for the rate (a finding, never a pass): the WooCommerce rate has a state, a postcode or a city, a postcode or city IMS cannot record, or it shares country and class with an in-scope WooCommerce rate of another region and its IMS rate names no region',
+  XERO_REGION_DIFFERS: 'the region the IMS rate name states and the region the Xero type name states are not the same ("PT-30 VAT" against "PT-20 VAT"), including one regional and one country-wide; the same name parser reads both',
+  XERO_REGION_UNVERIFIED: 'the region of the IMS rate name or of the Xero type name cannot be read (a word after the country prefix that is not a hyphenated region, such as "PT Madeira VAT"), so the two cannot be compared (a finding, never a pass)',
   MISSING_IN_WOO: 'an in-scope IMS sales rate or Xero sales type has no WooCommerce counterpart',
   XERO_NOT_IN_IMS: 'an in-scope Xero sales type is carried by no active IMS sales rate',
 } as const
@@ -109,12 +111,26 @@ function regionToken(text: string, country: string): string {
   const token = text.toUpperCase().replace(/[^A-Z0-9]/g, '')
   return country !== '' && token.startsWith(country) && token.length > country.length ? token.slice(country.length) : token
 }
-const GENERIC_NAME_WORDS: ReadonlySet<string> = new Set(['VAT', 'TAX', 'GST', 'ZERO', 'STANDARD', 'REDUCED', 'RATE', 'OSS', 'IOSS', 'VOEC'])
-/** The region an IMS rate records: the token after the country prefix of its name joined by a hyphen ("PT-30 VAT" is "30"); null when the name states none. IMS has no region field. */
+const GENERIC_NAME_WORDS: ReadonlySet<string> = new Set(['VAT', 'TAX', 'GST', 'ZERO', 'STANDARD', 'REDUCED', 'RATE', 'OSS', 'IOSS', 'VOEC', 'EXEMPT'])
+/**
+ * The region a rate NAME states, one parser for IMS and Xero names: the token after a two-letter country prefix joined by a hyphen ("PT-30 VAT" is "30").
+ *   region    a hyphenated region token ("PT-30 VAT")
+ *   wide      the prefix is followed by a generic word or nothing ("PT VAT", "GB VAT (Income)", "UK Standard Rate (20%)"), or there is no country prefix: no region is stated
+ *   unreadable  the prefix is followed by a word that is not generic ("ES Canary VAT", "PT Madeira VAT"): a region may be stated in a convention this parser does not read
+ */
+type NameRegion = { kind: 'region'; token: string } | { kind: 'wide' } | { kind: 'unreadable' }
+function nameRegion(name: string, country: string): NameRegion {
+  const text = name.trim()
+  const hyphen = /^[A-Za-z]{2}-([A-Za-z0-9]+)/.exec(text)
+  if (hyphen !== null && !GENERIC_NAME_WORDS.has(hyphen[1]!.toUpperCase())) return { kind: 'region', token: regionToken(hyphen[1]!, country) }
+  const word = /^[A-Za-z]{2}[\s-]+([A-Za-z]+)/.exec(text)
+  if (word !== null && !GENERIC_NAME_WORDS.has(word[1]!.toUpperCase())) return { kind: 'unreadable' }
+  return { kind: 'wide' }
+}
+/** The region an IMS rate records in its name; null when it states none. IMS has no region field. */
 function imsRegion(name: string, country: string): string | null {
-  const match = /^[A-Za-z]{2}-([A-Za-z0-9]+)/.exec(name.trim())
-  if (match === null || GENERIC_NAME_WORDS.has(match[1]!.toUpperCase())) return null
-  return regionToken(match[1]!, country)
+  const region = nameRegion(name, country)
+  return region.kind === 'region' ? region.token : null
 }
 
 export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
@@ -166,6 +182,10 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     const imsPrefix = xeroNameCountry(rate.name)
     const livePrefix = xeroNameCountry(live.name)
     if ((imsPrefix !== null && imsPrefix !== country) || (livePrefix !== null && livePrefix !== country) || (country === '' && livePrefix !== null)) reasons.add('COUNTRY_DIFFERS')
+    const imsNameRegion = nameRegion(rate.name, country)
+    const liveNameRegion = nameRegion(live.name, country)
+    if (imsNameRegion.kind === 'unreadable' || liveNameRegion.kind === 'unreadable') reasons.add('XERO_REGION_UNVERIFIED')
+    else if ((imsNameRegion.kind === 'region' ? imsNameRegion.token : null) !== (liveNameRegion.kind === 'region' ? liveNameRegion.token : null)) reasons.add('XERO_REGION_DIFFERS')
     const category = (rate.reportingCategory ?? '').trim().toUpperCase().replace(/[\s-]+/g, '_')
     const liveReport = live.reportTaxType === null ? null : live.reportTaxType.trim().toUpperCase()
     if ((category !== '' && !KNOWN_CATEGORIES.has(category)) || liveReport === null) reasons.add('REPORT_TYPE_UNKNOWN')

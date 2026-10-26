@@ -366,6 +366,35 @@ test('REGION_DIFFERS / REGION_UNVERIFIED: a swapped pair of regional rates canno
   assert.deepEqual(reasonsOf(compareVatSetIdentity(outOfScope), 'woo', '1'), [])
 })
 
+test('XERO_REGION_DIFFERS / XERO_REGION_UNVERIFIED: the IMS name and the Xero name must state the same region, read by one parser; an unreadable name is a finding, never a pass', () => {
+  const xeroName = (id: string, name: string, edit: (input: VatSetInput) => void = () => {}): VatSetRow[] => {
+    const input = base(); input.xero = input.xero.map((x) => (x.taxType === id ? { ...x, name } : x)); edit(input)
+    return compareVatSetIdentity(input)
+  }
+  assert.deepEqual(reasonsOf(compareVatSetIdentity(base()), 'ims', 'rPT30'), [], 'the correct pair passes')
+  assert.deepEqual(reasonsOf(xeroName('TAX004', 'PT-20 VAT'), 'ims', 'rPT30'), ['XERO_REGION_DIFFERS'], 'PT-30 against PT-20 at the same percentage, components and report type')
+  assert.deepEqual(reasonsOf(xeroName('TAX004', 'PT-30 VAT'), 'ims', 'rPT30'), [])
+  assert.deepEqual(reasonsOf(xeroName('TAX004', 'pt-30 VAT'), 'ims', 'rPT30'), [], 'case does not count')
+  // An equal-rate regional swap of two Xero codes.
+  const swap = base()
+  swap.rates = [...swap.rates, ims('rAZ', 'TAX005', { name: 'PT-20 VAT', rate: '0.2200', countryCode: 'PT', reportingCategory: 'OSS' })]
+  swap.xero = [...swap.xero, xero('TAX005', { name: 'PT-20 VAT', reportTaxType: 'MOSSSALES', effectiveRate: '22.000000', displayTaxRate: '22.000000' })]
+  swap.woo = [...swap.woo, woo('5', { country: 'PT', state: 'PT-20', rate: '22.0000' })]
+  swap.mappings = [...swap.mappings, map('5', 'rAZ')]
+  assert.deepEqual(compareVatSetIdentity(swap).filter((row) => row.reasons.length > 0), [], 'the correct two-region set passes')
+  swap.rates = swap.rates.map((r) => (r.id === 'rPT30' ? { ...r, accountingTaxType: 'TAX005' } : r.id === 'rAZ' ? { ...r, accountingTaxType: 'TAX004' } : r))
+  const swapped = compareVatSetIdentity(swap)
+  assert.deepEqual([reasonsOf(swapped, 'ims', 'rPT30'), reasonsOf(swapped, 'ims', 'rAZ')], [['XERO_REGION_DIFFERS'], ['XERO_REGION_DIFFERS']])
+  // One side regional and the other country-wide, both ways.
+  assert.deepEqual(reasonsOf(xeroName('TAX004', 'PT VAT'), 'ims', 'rPT30'), ['XERO_REGION_DIFFERS'], 'regional IMS, country-wide Xero')
+  assert.deepEqual(reasonsOf(xeroName('TAX001', 'GB-SCT VAT'), 'ims', 'rGB'), ['XERO_REGION_DIFFERS'], 'country-wide IMS, regional Xero')
+  // A name this parser cannot read, on either side.
+  assert.deepEqual(reasonsOf(xeroName('TAX004', 'PT Madeira VAT'), 'ims', 'rPT30'), ['XERO_REGION_UNVERIFIED'])
+  assert.deepEqual(reasonsOf(xeroName('TAX001', 'GB Standard Rate (20%)'), 'ims', 'rGB'), [], 'generic words after the prefix state no region')
+  const imsSide = base(); imsSide.rates = imsSide.rates.map((r) => (r.id === 'rPT30' ? { ...r, name: 'PT Madeira VAT' } : r))
+  assert.ok(reasonsOf(compareVatSetIdentity(imsSide), 'ims', 'rPT30').includes('XERO_REGION_UNVERIFIED'))
+})
+
 test('the closed list is the one the report prints, every reason is reachable, and the summary counts rows and reasons exactly', () => {
   const input = base()
   input.woo = [...input.woo, woo('7', { country: 'FR' })]
@@ -377,5 +406,5 @@ test('the closed list is the one the report prints, every reason is reachable, a
   assert.equal(summary.byReason.WOO_UNMAPPED, 1)
   assert.equal(summary.byReason.XERO_NOT_IN_IMS, 1)
   assert.deepEqual(Object.keys(summary.byReason), VAT_SET_REASON_LIST)
-  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'REGION_DIFFERS', 'REGION_UNVERIFIED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
+  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'REGION_DIFFERS', 'REGION_UNVERIFIED', 'XERO_REGION_DIFFERS', 'XERO_REGION_UNVERIFIED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
 })
