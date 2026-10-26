@@ -341,15 +341,15 @@ test('the scheduled orphan sweep finds a stored WooCommerce receipt with no obli
   oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > 0
   oi.wcReceiptRegistrationSeams.registrationsAreOwed = async () => true
   try {
-    const r1 = await oi.sweepUnregisteredWcReceipts()
+    const r1 = await (await import('@/lib/domain/accounting/receipt-registration-sweep')).sweepUnregisteredReceipts()
     assert.ok(r1.registered >= 1)
     assert.equal(registrations.filter((r) => r.paymentId === orphan.id).length, 1)
     assert.equal(registrations.filter((r) => r.paymentId === early.id).length, 0, 'an order with no posted invoice is not the sweep\'s (the invoice post registers it)')
-    await oi.sweepUnregisteredWcReceipts()
+    await (await import('@/lib/domain/accounting/receipt-registration-sweep')).sweepUnregisteredReceipts()
     assert.equal(registrations.filter((r) => r.paymentId === orphan.id).length, 1, 'not again')
   } finally { oi.wcReceiptRegistrationSeams.obligationIsOnRecord = real; oi.wcReceiptRegistrationSeams.registrationsAreOwed = undefined }
   const route = (await import('node:fs')).readFileSync('app/api/cron/fx-rates/route.ts', 'utf8')
-  assert.match(route, /sweepUnregisteredWcReceipts\(50\)/)
+  assert.match(route, /sweepUnregisteredReceipts\(50\)/)
 })
 
 // STARVATION: a bounded batch must not be filled by rows that cannot make progress or need nothing.
@@ -371,7 +371,7 @@ test('the sweep selects only unrecorded receipts BEFORE the limit: 50 registered
   oi.wcReceiptRegistrationSeams.registrationsAreOwed = async () => true
   oi.wcReceiptRegistrationSeams.obligationIsOnRecord = async (_o: string, pid: string) => registrations.filter((r) => r.paymentId === pid).length > 0
   try {
-    const r = await oi.sweepUnregisteredWcReceipts(50)
+    const r = await (await import('@/lib/domain/accounting/receipt-registration-sweep')).sweepUnregisteredReceipts(50)
     assert.equal(registrations.filter((x) => x.paymentId === unresolved.id).length, 1, 'registered within one run')
     assert.ok(r.examined <= 50)
     assert.equal(registrations.filter((x) => registered.includes(x.paymentId as string)).length, 0, 'registered receipts took no slot')
