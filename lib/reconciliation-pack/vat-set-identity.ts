@@ -10,7 +10,7 @@
  *
  * HOW A WOOCOMMERCE RATE FINDS ITS IMS RATE: only through the stored mapping of the storefront connector (ShoppingTaxRateMapping, keyed by the store's rate id).
  *   Country, state, postcode and city never choose an IMS rate; they describe the Woo rate's scope. The country must agree with the IMS rate's country;
- *   state, postcode, city and class are the scope that a second Woo rate must share to be a duplicate of the first (below). A regional rate
+ *   a second Woo rate on the same IMS rate is a duplicate (DUPLICATE_MAPPING) whatever its scope, equal or different (one counterpart each). A regional rate
  *   (Canary Islands, PT-30) therefore needs its own mapping to its own IMS rate, and shows as WOO_UNMAPPED until it has one.
  *
  * HOW AN IMS RATE FINDS ITS XERO TYPE: by the accounting tax type CODE it carries, which must be an ACTIVE type of the proven stored list (never by name).
@@ -40,7 +40,7 @@ type Decimal = InstanceType<typeof Prisma.Decimal>
 
 export const VAT_SET_REASONS = {
   WOO_UNMAPPED: 'a WooCommerce tax rate has no IMS mapping of the storefront connector',
-  DUPLICATE_MAPPING: 'the counterpart is not unique: two WooCommerce rates of different scope (country, state, postcode, city or class) map to one IMS rate, or two active IMS sales rates carry one Xero tax type',
+  DUPLICATE_MAPPING: 'the counterpart is not unique: two or more WooCommerce rates (whatever their scope, equal or different) map to one IMS rate, or two active IMS sales rates carry one Xero tax type',
   IMS_RATE_NOT_ACTIVE_SALES: 'the IMS rate a WooCommerce rate maps to is inactive, purchase-only or a reverse-charge rate',
   IMS_NOT_IN_XERO: 'an in-scope IMS sales rate carries no Xero tax type, or a type that is not an ACTIVE type of the stored Xero list',
   XERO_NOT_SALES_TYPE: 'the Xero type an IMS sales rate carries cannot be applied to revenue',
@@ -105,7 +105,6 @@ function imsPercent(rate: TaxRateRow, components: readonly TaxComponentRateRow[]
 const xeroPercent = (row: NormalisedXeroTaxRate): Decimal | null => exact(row.effectiveRate ?? row.displayTaxRate)
 /** The tax class as Woo states it: empty is the standard class; case and surrounding spaces do not count. */
 const normaliseClass = (value: string | null): string => { const slug = (value ?? '').trim().toLowerCase(); return slug === '' ? 'standard' : slug }
-const scopeKey = (rate: WooTaxRateDetail): string => [normaliseCountryCode(rate.country), rate.state.trim().toUpperCase(), rate.postcode.trim(), rate.city.trim().toUpperCase(), normaliseClass(rate.class)].join('|')
 
 /** A region token as one comparable string: upper case, letters and digits only, the leading country code dropped ("PT-30" and "30" are both "30"). */
 function regionToken(text: string, country: string): string {
@@ -145,14 +144,13 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
 
   const imsInScope = input.rates.filter((rate) => rate.active && isSales(rate.usedFor) && !rate.reverseCharge)
   const imsInScopeIds = new Set(imsInScope.map((rate) => rate.id))
-  // Which IMS rates have a Woo rate that is really in the store's list, and from which scopes.
-  const wooScopesByIms = new Map<string, Set<string>>()
+
+  // The Woo rate IDS on each IMS rate: more than one is a duplicate whether or not their scopes are equal (owner ruling: one identical set, one counterpart each).
+  const wooIdsByIms = new Map<string, Set<string>>()
   for (const woo of input.woo) {
     const target = mappedTo.get(woo.id)
     if (target === undefined) continue
-    const scopes = wooScopesByIms.get(target) ?? new Set<string>()
-    scopes.add(scopeKey(woo))
-    wooScopesByIms.set(target, scopes)
+    wooIdsByIms.set(target, new Set([...(wooIdsByIms.get(target) ?? []), woo.id]))
   }
   const carriersByType = new Map<string, TaxRateRow[]>()
   for (const rate of imsInScope) if (rate.accountingTaxType !== null) carriersByType.set(rate.accountingTaxType, [...(carriersByType.get(rate.accountingTaxType) ?? []), rate])
@@ -208,7 +206,7 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     if (target === undefined || ims === undefined) reasons.add('WOO_UNMAPPED')
     else {
       if (!imsInScopeIds.has(ims.id)) reasons.add('IMS_RATE_NOT_ACTIVE_SALES')
-      if ((wooScopesByIms.get(ims.id)?.size ?? 0) > 1) reasons.add('DUPLICATE_MAPPING')
+      if ((wooIdsByIms.get(ims.id)?.size ?? 0) > 1) reasons.add('DUPLICATE_MAPPING')
       const wooPercent = exact(woo.rate)
       const imsValue = imsPercent(ims, input.componentRates)
       if (wooPercent === null || imsValue === null || !wooPercent.eq(imsValue)) reasons.add('PERCENT_DIFFERS')
@@ -235,7 +233,7 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
 
   for (const rate of imsInScope) {
     const reasons = new Set<VatSetReason>()
-    if ((wooScopesByIms.get(rate.id)?.size ?? 0) === 0) reasons.add('MISSING_IN_WOO')
+    if ((wooIdsByIms.get(rate.id)?.size ?? 0) === 0) reasons.add('MISSING_IN_WOO')
     imsXeroReasons(rate, reasons)
     if (rate.accountingTaxType !== null && (carriersByType.get(rate.accountingTaxType)?.length ?? 0) > 1) reasons.add('DUPLICATE_MAPPING')
     add('ims', rate.id, reasons)
@@ -246,7 +244,7 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     const reasons = new Set<VatSetReason>()
     const carriers = carriersByType.get(live.taxType) ?? []
     if (carriers.length === 0) reasons.add('XERO_NOT_IN_IMS')
-    else if (!carriers.some((rate) => (wooScopesByIms.get(rate.id)?.size ?? 0) > 0)) reasons.add('MISSING_IN_WOO')
+    else if (!carriers.some((rate) => (wooIdsByIms.get(rate.id)?.size ?? 0) > 0)) reasons.add('MISSING_IN_WOO')
     add('xero', live.taxType, reasons)
   }
   return rows

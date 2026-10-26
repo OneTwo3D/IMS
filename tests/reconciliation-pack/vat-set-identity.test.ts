@@ -194,11 +194,20 @@ test('IMS_RATE_NOT_ACTIVE_SALES: a Woo rate mapped to an inactive, purchase-only
   assert.deepEqual(compareVatSetIdentity(both).filter((row) => row.reasons.length > 0), [], 'a BOTH rate is a sales rate')
 })
 
-test('DUPLICATE_MAPPING: two Woo rates of DIFFERENT scope on one IMS rate, or two active IMS sales rates on one Xero type; the same scope twice is one counterpart', () => {
+test('DUPLICATE_MAPPING: two or more Woo rates on one IMS rate, of equal or different scope, or two active IMS sales rates on one Xero type; one to one passes', () => {
   let input = base()
   input.woo = [...input.woo, woo('5', { country: 'ES', state: 'CN', rate: '0.0000', shipping: false })]
   input.mappings = [...input.mappings, map('5', 'rCAN')]
-  assert.deepEqual(compareVatSetIdentity(input).filter((row) => row.reasons.length > 0), [], 'the same scope listed twice (shipping toggled) is not a duplicate')
+  let same = compareVatSetIdentity(input)
+  assert.deepEqual([reasonsOf(same, 'woo', '3'), reasonsOf(same, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING']], 'the same scope listed twice is still two Woo rates on one IMS rate; flagged on both')
+  assert.deepEqual(reasonsOf(same, 'ims', 'rCAN'), [])
+  // Two identical-scope Woo rates (same everything, shipping on) on one IMS rate.
+  input = base()
+  input.woo = [...input.woo, woo('5', { country: 'ES', state: 'CN', rate: '0.0000' })]
+  input.mappings = [...input.mappings, map('5', 'rCAN')]
+  same = compareVatSetIdentity(input)
+  assert.deepEqual([reasonsOf(same, 'woo', '3'), reasonsOf(same, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING']])
+  assert.deepEqual(compareVatSetIdentity(base()).filter((row) => row.reasons.length > 0), [], 'one to one passes')
   input = base()
   input.woo = [...input.woo, woo('5', { country: 'ES', state: 'TF', rate: '0.0000' })]
   input.mappings = [...input.mappings, map('5', 'rCAN')]
