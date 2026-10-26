@@ -26,6 +26,9 @@ test('every fx_rates writer in app/ and lib/ writes through the exclusive lock',
   const bad: string[] = []
   for (const f of files) {
     if (f.endsWith('fx-table-lock.ts')) continue
+    // The FACTORY RESET empties every table (documents, orders, settings and the rate table) behind a fresh-admin confirmation code, with the application stopped; no import can outlive it and
+    // it changes no rate for a live document. It is the one exemption, and it is listed so a second one cannot appear silently.
+    if (f === path.join('app', 'actions', 'reset.ts')) { sites.push(`${f}:deleteMany (exempt: factory reset)`); continue }
     const text = readFileSync(f, 'utf8')
     for (const m of text.matchAll(WRITE)) {
       sites.push(`${f}:${m[2]}`)

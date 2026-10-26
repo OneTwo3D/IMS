@@ -1638,6 +1638,7 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
 // ---------------------------------------------------------------------------
 
 export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImportActionResult> {
+  await requirePermission('sales.create')
   // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
   // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
   try {
@@ -1908,6 +1909,7 @@ async function importSalesOrdersCsvLocked(formData: FormData): Promise<CsvImport
 // ---------------------------------------------------------------------------
 
 export async function importPurchaseOrdersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
   // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
   // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
   try {

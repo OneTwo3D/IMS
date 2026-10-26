@@ -59,7 +59,10 @@ test('an admin override waits for a running import; the whole file lands at the 
   const keyB = 'FXHB-' + uid()
   const created: string[] = []
   t.after(async () => {
-    await db.salesOrder.deleteMany({ where: { externalOrderNumber: { in: [keyA, keyB] } } })
+    const ids = (await db.salesOrder.findMany({ where: { externalOrderNumber: { in: [keyA, keyB] } }, select: { id: true } })).map((r) => r.id)
+    await db.salesOrderLine.deleteMany({ where: { orderId: { in: ids } } })
+    await db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+    await db.product.deleteMany({ where: { id: product.id } }).catch(() => undefined)
     await db.fxRate.deleteMany({ where: { toCurrency: 'EUR' } })
     if (!eurExisted) await db.currency.deleteMany({ where: { code: 'EUR' } })
     void created
