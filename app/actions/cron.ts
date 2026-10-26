@@ -222,7 +222,7 @@ export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
     const [hostRead, secret, saved] = await Promise.all([readCrontabForReport(), getCronSecret(), readCronJobsAndSettings()])
     const base = { ...parseOtiCrontabStatus('', secret), osUser: os.userInfo().username, runtimeSecretMatches: null }
     if (!hostRead.resolved) return { ...base, readError: `The host cron file could not be read, so whether it matches the saved settings is UNKNOWN: ${hostRead.reason}` }
-    const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: hostRead.text })
+    const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: hostRead.text, allJobs: getAllCronJobs() })
     return { ...base, readError: null, hostCron: { inSync: drift.inSync, differing: drift.differing, message: describeHostCronDrift(drift) } }
   }
   const [read, secret] = await Promise.all([readOwnCrontabResult(), getCronSecret()])

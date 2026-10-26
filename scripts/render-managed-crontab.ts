@@ -74,7 +74,7 @@ async function check(): Promise<number> {
       process.stdout.write(`host cron could not be read: ${host.reason}\n`)
       return 1
     }
-    const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: host.text })
+    const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: host.text, allJobs: getAllCronJobs() })
     process.stdout.write(`${describeHostCronDrift(drift)}\n`)
     return drift.inSync ? 0 : 1
   } finally {

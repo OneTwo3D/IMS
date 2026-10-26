@@ -35,14 +35,19 @@ export type SchedulerVerdict = {
   missing: string[]
 }
 
-export function verifyJobsScheduled(
-  rawCrontabText: string,
-  wanted: readonly CrontabJobDef[],
-  storedSchedules: Readonly<Record<string, string | undefined>>,
-): SchedulerVerdict {
+export type ParsedManagedBlock =
+  | { ok: true; block: string[]; baseUrl: string; secretRef: CrontabSecretRef; logPath: string; headerLength: number }
+  | { ok: false; problem: string }
+
+/**
+ * The managed block of a crontab text with the BASE_URL, secret source and log path it names, after the checks that make it
+ * trustworthy: exactly one managed region, both markers, and a header equal to the one the generator renders from those three.
+ * Shared by `verifyJobsScheduled` and the host-cron drift comparison so both read a block the same way. Pure.
+ */
+export function parseManagedBlock(rawCrontabText: string): ParsedManagedBlock {
   // CRLF and lone CR are line endings too: normalise ONCE, before marker detection, extraction and header comparison.
   const crontabText = rawCrontabText.replace(/\r\n?/g, '\n')
-  const allMissing = (blockProblem: string): SchedulerVerdict => ({ blockProblem, missing: wanted.map((job) => job.slug) })
+  const allMissing = (problem: string): ParsedManagedBlock => ({ ok: false, problem })
 
   // EXACTLY ONE managed region. extractOtiBlock concatenates every region it finds, so a valid block plus a
   // second complete or malformed one (or a stray, nested or extra marker) would otherwise be read as one
@@ -87,6 +92,20 @@ export function verifyJobsScheduled(
   if (installedHeader.join('\n') !== header.lines.slice(0, headerEnd).join('\n')) {
     return allMissing('the managed block\'s header is not what the scheduler writes (an edited or partial block)')
   }
+
+  return { ok: true, block, baseUrl, secretRef, logPath, headerLength: headerEnd }
+}
+
+export function verifyJobsScheduled(
+  rawCrontabText: string,
+  wanted: readonly CrontabJobDef[],
+  storedSchedules: Readonly<Record<string, string | undefined>>,
+): SchedulerVerdict {
+  const parsed = parseManagedBlock(rawCrontabText)
+  if (!parsed.ok) return { blockProblem: parsed.problem, missing: wanted.map((job) => job.slug) }
+  const { block, baseUrl, secretRef, logPath } = parsed
+  const render = (jobs: CrontabJobDef[], settings: Map<string, string>) =>
+    buildOtiCrontabBlock({ jobs, settings, secretRef, baseUrl, logPath })
 
   const missing: string[] = []
   for (const job of wanted) {

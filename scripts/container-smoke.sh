@@ -371,22 +371,37 @@ echo "    OK: conclusive reconciliation result: code=${pack_code}, summary $(pri
 # then in sync again once the host file is re-rendered and installed.
 echo "==> host cron drift after a saved scheduler change"
 drift_check() { docker exec "$APP_NAME" node /app/dist-scripts/render-managed-crontab.mjs --check 2>&1 || true; }
+rerender_and_install() {
+  docker run --rm --network "$NET" -e DATABASE_URL --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/render-managed-crontab.mjs \
+    --base-url "http://${APP_NAME}:3000" --secret-file "$SECRET_FILE" --log-path "$CRON_LOG" \
+    --format cron.d --cron-user root > "${CRONTAB_FILE}.new"
+  as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
+}
+expect_drift() { # <label> <expected prefix glob> <what to say on failure>
+  drift="$(drift_check)"
+  echo "    $1: ${drift%%. Host cron update pending*}"
+  # shellcheck disable=SC2254  # the pattern is a deliberate glob
+  case "$drift" in $2) ;; *) fail "$3: ${drift}" ;; esac
+}
 drift="$(drift_check)"
-echo "    before the change: ${drift}"
+echo "    before any change: ${drift}"
 case "$drift" in "Host cron is in sync"*) ;; *) fail "host cron should start in sync with the saved settings: ${drift}" ;; esac
+
+# 1. A whole job switched off in the saved settings, WITHOUT re-rendering: its lines are still installed, so host cron would keep
+#    firing it. The check compares the whole block, so it must report the job as extra.
+sql "INSERT INTO settings (key, value, \"updatedAt\") VALUES ('cron_activity_cleanup_enabled', 'false', now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value" >/dev/null
+expect_drift "after switching a job off without re-rendering" "Host cron is out of date (1 job differ: activity-cleanup) \[extra: activity-cleanup\]*" "a job switched off but still installed was not reported as extra"
+rerender_and_install
+expect_drift "after re-rendering and installing" "Host cron is in sync*" "host cron did not return to in sync after the extra job was removed"
+
+# 2. A changed saved schedule.
 sql "INSERT INTO settings (key, value, \"updatedAt\") VALUES ('cron_backup_schedule', '5 2 * * *', now())
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value" >/dev/null
-drift="$(drift_check)"
-echo "    after saving a new backup schedule: ${drift%%. Host cron update pending*}"
-case "$drift" in "Host cron is out of date (1 job differ: backup)"*) ;; *) fail "a saved schedule change was not reported as host cron out of date: ${drift}" ;; esac
-docker run --rm --network "$NET" -e DATABASE_URL --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/render-managed-crontab.mjs \
-  --base-url "http://${APP_NAME}:3000" --secret-file "$SECRET_FILE" --log-path "$CRON_LOG" \
-  --format cron.d --cron-user root > "${CRONTAB_FILE}.new"
-as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
-drift="$(drift_check)"
-echo "    after re-rendering and installing the host file: ${drift}"
-case "$drift" in "Host cron is in sync"*) ;; *) fail "host cron did not return to in sync after the re-render and install: ${drift}" ;; esac
-echo "    OK: host cron drift reads in sync, out of date after a saved change, and in sync again after the host re-render"
+expect_drift "after saving a new backup schedule" "Host cron is out of date (1 job differ: backup) \[changed: backup\]*" "a saved schedule change was not reported as host cron out of date"
+rerender_and_install
+expect_drift "after re-rendering and installing" "Host cron is in sync*" "host cron did not return to in sync after the re-render and install"
+echo "    OK: host cron drift reads in sync, out of date with an EXTRA job and with a changed schedule, and in sync again after each host re-render"
 
 status=0
 exit 0

@@ -29,24 +29,59 @@ test('container mode is exactly: a scheduler file AND the cron.d format', () => 
   assert.equal(isContainerSchedulerMode({ IMS_SCHEDULER_CRONTAB_FILE: '/x', IMS_SCHEDULER_CRONTAB_FORMAT: 'cron.d' }), true)
 })
 
-test('drift: in sync when the host file is what the saved settings render', () => {
+test('drift: in sync only when the installed block is identical to the one the saved settings render', () => {
   const saved = new Map([['cron_alpha_schedule', '17 * * * *'], ['cron_beta_enabled', 'false']])
   const drift = hostCronDrift({ jobs: JOBS, settings: saved, hostText: installed(saved) })
-  assert.deepEqual(drift, { inSync: true, differing: [], blockProblem: null })
+  assert.equal(drift.inSync, true)
+  assert.deepEqual([drift.differing, drift.missing, drift.extra, drift.duplicate, drift.changed], [[], [], [], [], []])
   assert.match(describeHostCronDrift(drift), /in sync/)
+  // Trailing whitespace and CRLF do not count; the renderer's own comment lines before the start marker are not part of the block.
+  assert.equal(hostCronDrift({ jobs: JOBS, settings: saved, hostText: installed(saved).replace(/\n/g, '  \r\n') }).inSync, true)
 })
 
-test('drift: out of date when a saved schedule differs, a job was disabled or a job was enabled since the file was installed', () => {
-  const old = new Map<string, string>()
-  const hostText = installed(old)
-  const changedSchedule = hostCronDrift({ jobs: JOBS, settings: new Map([['cron_alpha_schedule', '17 * * * *']]), hostText })
-  assert.deepEqual([changedSchedule.inSync, changedSchedule.differing], [false, ['alpha']])
-  const disabled = hostCronDrift({ jobs: JOBS, settings: new Map([['cron_beta_enabled', 'false']]), hostText })
-  assert.deepEqual([disabled.inSync, disabled.differing], [false, ['beta']], 'a job the settings disabled is still installed')
-  const enabledLater = hostCronDrift({ jobs: JOBS, settings: new Map(), hostText: installed(new Map([['cron_beta_enabled', 'false']])) })
-  assert.deepEqual([enabledLater.inSync, enabledLater.differing], [false, ['beta']], 'a job the settings enable is not installed')
-  const both = hostCronDrift({ jobs: JOBS, settings: new Map([['cron_alpha_schedule', '17 * * * *'], ['cron_beta_enabled', 'false']]), hostText })
-  assert.match(describeHostCronDrift(both), /out of date \(2 jobs differ: alpha, beta\)/)
+test('drift: a changed saved schedule is out of date (changed)', () => {
+  const drift = hostCronDrift({ jobs: JOBS, settings: new Map([['cron_alpha_schedule', '17 * * * *']]), hostText: installed(new Map()) })
+  assert.deepEqual([drift.inSync, drift.changed, drift.missing, drift.extra], [false, ['alpha'], [], []])
+  assert.match(describeHostCronDrift(drift), /out of date \(1 job differ: alpha\) \[changed: alpha\]/)
+})
+
+test('drift: a job disabled after install is still in the file, so it is EXTRA', () => {
+  const drift = hostCronDrift({ jobs: JOBS, settings: new Map([['cron_beta_enabled', 'false']]), hostText: installed(new Map()) })
+  assert.deepEqual([drift.inSync, drift.extra, drift.missing], [false, ['beta'], []])
+})
+
+test('drift: an integration switched off removes its jobs from the comparison list, but its installed lines are still EXTRA', () => {
+  const hostText = installed(new Map())
+  // `jobs` is what the registry offers now (the integration's job is gone); `allJobs` is the whole registry, used only to name it.
+  const drift = hostCronDrift({ jobs: [JOBS[0]!], settings: new Map(), hostText, allJobs: JOBS })
+  assert.deepEqual([drift.inSync, drift.extra], [false, ['beta']])
+  const unnamed = hostCronDrift({ jobs: [JOBS[0]!], settings: new Map(), hostText })
+  assert.deepEqual(unnamed.extra, ['Beta Job'], 'a job this release does not know is named by its label')
+})
+
+test('drift: a job enabled after install is MISSING', () => {
+  const drift = hostCronDrift({ jobs: JOBS, settings: new Map(), hostText: installed(new Map([['cron_beta_enabled', 'false']])) })
+  assert.deepEqual([drift.inSync, drift.missing, drift.extra], [false, ['beta'], []])
+})
+
+test('drift: a duplicated enabled-job line is DUPLICATE (it would fire twice)', () => {
+  const hostText = installed(new Map())
+  const doubled = hostText.replace(/(# Alpha Job\n.*\n)/, '$1$1')
+  assert.notEqual(doubled, hostText)
+  const drift = hostCronDrift({ jobs: JOBS, settings: new Map(), hostText: doubled })
+  assert.deepEqual([drift.inSync, drift.duplicate], [false, ['alpha']])
+  assert.match(describeHostCronDrift(drift), /duplicate: alpha/)
+})
+
+test('drift: a reordered but otherwise identical block IS drift (the renderer is deterministic, so order is part of the block)', () => {
+  const hostText = installed(new Map())
+  const [alpha, beta] = [hostText.match(/# Alpha Job\n.*\n\n/)![0], hostText.match(/# Beta Job\n.*\n\n/)![0]]
+  const reordered = hostText.replace(alpha + beta, beta + alpha)
+  assert.notEqual(reordered, hostText)
+  const drift = hostCronDrift({ jobs: JOBS, settings: new Map(), hostText: reordered })
+  assert.equal(drift.inSync, false)
+  assert.equal(drift.otherDifference, true)
+  assert.match(describeHostCronDrift(drift), /order or stray lines/)
 })
 
 test('drift: a host file with no managed block is out of date, not in sync', () => {
