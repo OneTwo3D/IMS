@@ -384,6 +384,9 @@ test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is 
   const off = await runXeroRateItem('R16', invoice('1.4', 0.714286))
   assert.deepEqual([off.outcome, [...off.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTED_RATE_NOT_TABLE_RATE']])
   assert.deepEqual(pair(off, 'bothDiffer'), [[`xero-rate|sales-invoice|${uuid(1)}|posted-vs-table|log1`, '0.769231', '0.714286']])
+  // The rate in force at the START of the order's day (the previous day's last row) is a table rate for an order placed early that day.
+  const early = [{ currency: 'EUR', rate: '1.2', fetchedAt: '2026-09-09T06:00:00.000Z', manualOverride: false }, ...LATER]
+  assert.equal((await runXeroRateItem('R16', context({ invoices: [eur(1, 0.833333)] }, { ims: { rows: early, posted: [postedRow(1, 'SALES_INVOICE', { rate: '1.2', wooOrder: true })] } }).ctx)).outcome, 'pass')
   // A record that is not a storefront one has no table rule: checked against Xero alone and counted.
   const plain = await runXeroRateCheck(context({ invoices: [eur(1, 0.714286)] }, { ims: { rows: LATER, posted: [postedRow(1, 'SALES_INVOICE', { rate: '1.4' })] } }).ctx)
   assert.deepEqual([plain.item.outcome, plain.summary?.postedTableNotChecked, plain.summary?.postedRateNotTableRate], ['pass', 1, 0])
@@ -399,7 +402,7 @@ test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is 
 })
 
 // [mutation: an unreadable posting passed / treated as not posted / the link kind or currency not checked / an ambiguous link taken]
-test('A BROKEN LINK IS A FINDING, never a pass: gone payload, no rate, an unusable rate, a currency or kind that disagrees with Xero, two records naming one id, a storefront receipt with no date', async () => {
+test('A BROKEN LINK IS A FINDING, never a pass: gone payload, no rate, an unusable rate, a currency or kind that disagrees with Xero, two records naming one id, a storefront record with no date', async () => {
   const cases: Array<[string, ReturnType<typeof postedRow>[]]> = [
     ['payload gone', [postedRow(1, 'SALES_INVOICE', { noPayload: true, rate: null, currency: null, date: null })]],
     ['no rate', [postedRow(1, 'SALES_INVOICE', { rate: null })]],
@@ -409,7 +412,10 @@ test('A BROKEN LINK IS A FINDING, never a pass: gone payload, no rate, an unusab
     ['currency disagrees', [postedRow(1, 'SALES_INVOICE', { currency: 'USD' })]],
     ['kind disagrees', [postedRow(1, 'CREDIT_NOTE')]],
     ['two records', [postedRow(1, 'SALES_INVOICE'), { ...postedRow(1, 'SALES_INVOICE'), id: 'log1b' }]],
-    ['receipt with no date', [postedRow(1, 'SALES_INVOICE', { wooOrder: true, date: null })]],
+    ['invoice with no date', [postedRow(1, 'SALES_INVOICE', { wooOrder: true, date: null })]],
+    ['payload gone, the other fields still present', [postedRow(1, 'SALES_INVOICE', { noPayload: true })]],
+    ['rate so large that Xero\'s convention rounds to zero', [postedRow(1, 'SALES_INVOICE', { rate: '10000000' })]],
+    ['storefront receipt with no date', [postedRow(1, 'INVOICE_PAYMENT', { wooReceipt: true, orderRate: '1.25', date: null })]],
   ]
   for (const [name, posted] of cases) {
     const item = await runXeroRateItem('R16', context({ invoices: [eur(1, 0.8)] }, { ims: { posted } }).ctx)
