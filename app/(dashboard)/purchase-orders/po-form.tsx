@@ -708,6 +708,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       } else {
         const result = await createPurchaseOrder(payload)
         if (result.success && result.po) {
+          if (result.postCommitWarnings?.length) window.alert(`The purchase order was created, but: ${result.postCommitWarnings.join('; ')}`)
           router.refresh()
           onClose()
           router.push(`/purchase-orders/${result.po.id}`)

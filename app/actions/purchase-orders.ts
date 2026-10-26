@@ -1134,7 +1134,14 @@ async function resolvePurchaseLineTaxRates(
   })
 }
 
-export async function createPurchaseOrder(input: CreatePoInput, system?: SystemImportContext): Promise<{ success: boolean; po?: PoRow; error?: string }> {
+/**
+ * `success: true` + `po` means the purchase order is COMMITTED. The work after the commit (supplier last-price rows, cache refresh) can fail without un-creating it; each failure is named in
+ * `postCommitWarnings` (the order is still reported with its id) and no caller may treat a warning as a failed create. The supplier-price upsert is idempotent: it is redone by the next PO for
+ * the same supplier and product. Callers MUST surface the warnings.
+ */
+export type CreatePurchaseOrderResult = { success: boolean; po?: PoRow; error?: string; postCommitWarnings?: string[] }
+
+export async function createPurchaseOrder(input: CreatePoInput, system?: SystemImportContext): Promise<CreatePurchaseOrderResult> {
   try {
     // A system-actor context (the first-load apply runner) replaces the session check; anything that is not the real
     // capability takes the permission check, so a forged argument fails closed.
@@ -1356,8 +1363,10 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
     })
     })
 
+    const postCommitWarnings: string[] = []
     // Update SupplierProduct last prices (in supplier's currency, net of VAT)
     for (const ld of lineData) {
+      try {
       await db.supplierProduct.upsert({
         where: { supplierId_productId: { supplierId: input.supplierId, productId: ld.productId } },
         create: {
@@ -1372,9 +1381,12 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
           currency: input.currency,
         },
       })
+      } catch (priceError) {
+        postCommitWarnings.push(`supplier last price NOT updated for product ${ld.productId} (${String(priceError)})`)
+      }
     }
 
-    if (system?.systemImportToken !== SYSTEM_IMPORT) revalidatePath('/purchase-orders')
+    if (system?.systemImportToken !== SYSTEM_IMPORT) { try { revalidatePath('/purchase-orders') } catch { /* cache refresh only */ } }
     const mapped = mapPoRow(po)
     await logActivity(withSystemActor({
       entityType: 'PURCHASE_ORDER',
@@ -1386,7 +1398,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       metadata: { reference: mapped.reference, supplierId: input.supplierId, currency: input.currency, lineCount: input.lines.length },
     }, system))
 
-    return { success: true, po: mapped }
+    return postCommitWarnings.length > 0 ? { success: true, po: mapped, postCommitWarnings } : { success: true, po: mapped }
   } catch (e) {
     await logActivity(withSystemActor({
       entityType: 'PURCHASE_ORDER',

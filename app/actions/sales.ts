@@ -916,7 +916,13 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
 // Mutations
 // ---------------------------------------------------------------------------
 
-export async function createSalesOrder(input: CreateSoInput): Promise<{ success: boolean; order?: SoRow; error?: string }> {
+/**
+ * `success: true` + `order` means the order is COMMITTED. Work that runs after the commit (stock allocation, the accounting queue, bookkeeping) can fail without un-creating it; each such failure
+ * is named in `postCommitWarnings` (the order is still reported with its id) and no caller may treat a warning as a failed create. Callers MUST surface the warnings.
+ */
+export type CreateSalesOrderResult = { success: boolean; order?: SoRow; error?: string; postCommitWarnings?: string[] }
+
+export async function createSalesOrder(input: CreateSoInput): Promise<CreateSalesOrderResult> {
   try {
     await requirePermission('sales.create')
     if (!input.lines.length) return { success: false, error: 'Add at least one line item' }
@@ -1232,6 +1238,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       })
     }, STOCK_TX_OPTIONS)
 
+    const postCommitWarnings: string[] = []
     for (const warning of taxValidation.warnings ?? []) {
       await logActivity({
         entityType: 'SALES_ORDER',
@@ -1253,8 +1260,12 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     // allocation happens when the draft is finalised so the draft can still
     // be freely edited without holding stock.
     if (!input.isDraft) {
-      const { autoAllocateOrder } = await import('./allocation')
-      await autoAllocateOrder(so.id)
+      try {
+        const { autoAllocateOrder } = await import('./allocation')
+        await autoAllocateOrder(so.id)
+      } catch (allocationError) {
+        postCommitWarnings.push(`stock was NOT allocated to the order (${String(allocationError)}); allocate the order again`)
+      }
     }
 
     // Queue accounting sales invoice (DRAFT — manual orders have no payment yet).
@@ -1264,6 +1275,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       try {
         await queueSalesInvoiceForOrder(so.id)
       } catch (accountingError) {
+        postCommitWarnings.push('the accounting sales invoice was NOT queued; finalise or re-save the order to queue it')
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: so.id,
@@ -1299,7 +1311,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       })
     }
 
-    revalidatePath('/sales')
+    try { revalidatePath('/sales') } catch { /* cache refresh only */ }
     const mapped = mapSoRow(so)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -1310,7 +1322,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       description: `Created sales order ${mapped.displayOrderNumber}`,
       metadata: { orderNumber: mapped.displayOrderNumber, totalBase: mapped.totalBase, currency: mapped.currency },
     })
-    return { success: true, order: mapped }
+    return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
     await logActivity({
       entityType: 'SALES_ORDER',

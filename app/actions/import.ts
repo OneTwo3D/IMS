@@ -1605,28 +1605,44 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
       result.skipped += g.lines.length
       continue
     }
+    let transferSaved = false
     try {
       if (!preview) {
         const created = await createTransfer(g.fromId, g.toId, g.lines, g.notes || undefined, g.importKey)
         if (!created.success || !created.transfer) {
           throw new Error(created.message || 'Failed to create transfer')
         }
+        // COMMITTED from here: a later status step that fails leaves a saved transfer, which a retry skips as a duplicate. It is counted as created and the step that did not happen is named.
+        transferSaved = true
+        const label = g.importKey ?? created.transfer.id
         if (g.status === 'IN_TRANSIT' || g.status === 'RECEIVED') {
           const dispatched = await dispatchTransfer(created.transfer.id)
           if (!dispatched.success) {
-            throw new Error(dispatched.message || 'Failed to dispatch transfer')
+            result.errors.push(`Transfer "${label}" (id ${created.transfer.id}) WAS CREATED but was NOT dispatched: ${dispatched.message || 'Failed to dispatch transfer'}`)
+            result.created += g.lines.length
+            if (g.importKey) existingTransferRefs.add(g.importKey)
+            continue
           }
         }
         if (g.status === 'RECEIVED') {
           const received = await receiveTransfer(created.transfer.id)
           if (!received.success) {
-            throw new Error(received.message || 'Failed to receive transfer')
+            result.errors.push(`Transfer "${label}" (id ${created.transfer.id}) WAS CREATED and dispatched but was NOT received: ${received.message || 'Failed to receive transfer'}`)
+            result.created += g.lines.length
+            if (g.importKey) existingTransferRefs.add(g.importKey)
+            continue
           }
         }
       }
       result.created += g.lines.length
       if (g.importKey) existingTransferRefs.add(g.importKey)
     } catch (e: unknown) {
+      if (transferSaved) {
+        result.created += g.lines.length
+        if (g.importKey) existingTransferRefs.add(g.importKey)
+        result.errors.push(`Transfer "${g.importKey ?? '?'}" WAS CREATED, but a later step failed: ${String(e)}`)
+        continue
+      }
       result.errors.push(String(e))
       result.skipped += g.lines.length
     }
@@ -1899,9 +1915,16 @@ async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGu
         if (!created.success || !created.order) {
           throw new Error(created.error || 'Failed to create sales order')
         }
+        // From here the order is COMMITTED: it is counted, its id is listed, and nothing below may turn it into a skipped group (a retry would then skip it as a duplicate with no record of it).
         savedSalesOrders.push(importKey ?? created.order.id)
         currentSaved = true
-        await autoAllocateOrder(created.order.id)
+        const warnings = [...(created.postCommitWarnings ?? [])]
+        try {
+          await autoAllocateOrder(created.order.id)
+        } catch (allocationError) {
+          warnings.push(`stock was NOT allocated to the order (${String(allocationError)}); allocate the order again`)
+        }
+        if (warnings.length > 0) result.errors.push(`Sales order "${importKey ?? created.order.id}" (id ${created.order.id}) WAS CREATED, but: ${warnings.join('; ')}`)
       }
       result.created += g.lines.length
       if (importKey) existingSalesOrderKeys.add(importKey)
@@ -1914,6 +1937,13 @@ async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGu
         result.errors.push(fxLockLostMessage('sales order', savedSalesOrders, salesGroups.length - firstUnwritten))
         for (const [, rest] of salesGroups.slice(firstUnwritten)) result.skipped += rest.lines.length
         break
+      }
+      if (currentSaved) {
+        // committed before the failure: still created, never skipped
+        result.created += g.lines.length
+        if (importKey) existingSalesOrderKeys.add(importKey)
+        result.errors.push(`Sales order "${importKey ?? '?'}" WAS CREATED, but a later step failed: ${String(e)}`)
+        continue
       }
       result.errors.push(String(e))
       result.skipped += g.lines.length
@@ -2201,8 +2231,12 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, fxGuard: FxTabl
         if (!created.success || !created.po) {
           throw new Error(created.error || 'Failed to create purchase order')
         }
+        // From here the order is COMMITTED: counted, its id listed, reported with any post-commit warning; never a skipped group (a retry would skip it as a duplicate with no record of it).
         createdPurchaseOrderIds.push(created.po.id)
         savedPurchaseOrders.push(importKey ?? created.po.id)
+        if (created.postCommitWarnings && created.postCommitWarnings.length > 0) {
+          result.errors.push(`Purchase order "${importKey ?? created.po.id}" (id ${created.po.id}) WAS CREATED, but: ${created.postCommitWarnings.join('; ')}`)
+        }
       }
       result.created += g.lines.length
       if (importKey) existingPoRefs.add(importKey)

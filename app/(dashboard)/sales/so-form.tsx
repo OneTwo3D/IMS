@@ -518,6 +518,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         }),
       })
       if (result.success && result.order) {
+        if (result.postCommitWarnings?.length) window.alert(`The order was created, but: ${result.postCommitWarnings.join('; ')}`)
         router.refresh()
         onClose()
         router.push(`/sales/${result.order.id}`)
