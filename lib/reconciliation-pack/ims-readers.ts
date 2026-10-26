@@ -55,7 +55,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'firstLoadProvenance'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'baseCurrency', 'firstLoadProvenance'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -227,6 +227,7 @@ export type ImsSectionValues = {
   purchaseOrders: PoRow[]
   transitSchedule: ImsTransitSchedule
   fxRates: FxRateRow[]
+  baseCurrency: string
   firstLoadProvenance: FirstLoadProvenance | null
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
@@ -652,6 +653,13 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   async fxRates(tx) {
     const rows = await readCapped(tx, `SELECT "toCurrency" AS currency, rate::text AS rate, "manualOverride" AS manual, ${UTC('"fetchedAt"')} AS fetched FROM fx_rates WHERE "fromCurrency" = $1 ORDER BY id`, [QOBLEX_BASE_CURRENCY])
     return rows.map((row): FxRateRow => ({ currency: text(row.currency, 'CURRENCY_UNKNOWN'), rate: decimal(row.rate), fetchedAt: text(row.fetched, 'SOURCE_UNREADABLE'), manualOverride: bool(row.manual) }))
+  },
+
+  /** The organisation's base currency (the same read and fallback as the `vat` section: no organisation row means GBP; more than one organisation row is DUPLICATE_KEY, as there). */
+  async baseCurrency(tx) {
+    const orgs = await tx.query('SELECT "baseCurrency" AS base FROM organisations ORDER BY id')
+    if (orgs.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    return orgs.length === 0 ? 'GBP' : text(orgs[0]!.base, 'CURRENCY_UNKNOWN')
   },
 
   async transitSchedule(tx) {

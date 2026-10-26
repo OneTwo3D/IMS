@@ -84,7 +84,7 @@ test('with healthy dependencies the collection yields a GO on this tree (the con
   assert.equal(verdict.verdict, 'GO', verdict.blockingReasons.join('; '))
   assert.deepEqual(d.spawned.map((spec) => spec.script), [...SCHEMA_STATE_SCRIPTS], 'only the read-only schema scripts are spawned when there is no read-sync script')
   assert.equal(d.spawned.some((spec) => spec.script === 'validate:db' || /generate/.test(spec.script)), false, 'validate:db and any generate script are never run')
-  assert.equal(Object.keys(results).length, 22)
+  assert.equal(Object.keys(results).length, 23)
 })
 
 test('every dependency that throws, rejects or returns garbage becomes NO-GO, never a pass [mutation: unreadable treated as empty]', async () => {

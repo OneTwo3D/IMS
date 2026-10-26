@@ -137,7 +137,7 @@ const item = (record: Record<string, any>, id: PackItemId) => record.items.find(
 test('the reader accepts what the builder wrote', () => {
   const parsed = parseReport(JSON.stringify(goodRecord()))
   assert.equal(parsed.exitCode, 0)
-  assert.equal(parsed.items.filter((i) => i.outcome === 'pass').length, 12)
+  assert.equal(parsed.items.filter((i) => i.outcome === 'pass').length, 13)
 })
 
 test('the reader rejects every way a pass can lose its footing, after the file is written', () => {

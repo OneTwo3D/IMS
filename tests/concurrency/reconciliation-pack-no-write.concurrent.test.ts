@@ -652,6 +652,156 @@ test('[reconciliation pack] R12 with --vendor-reads-only: the stored (never refr
   }
 })
 
+// ---- R16 end to end: the real IMS reads (fx_rates), the real stored Xero connection, the real GET-only transport, a LOOPBACK Xero ------
+
+const RTAG = `RCXR${process.pid}`
+const RTENANT = 'c3d4e5f6-0000-4000-8000-000000000016'
+
+test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refreshed) Xero token, GET requests to the loopback Xero only, the fx_rates rate against Xero\'s CurrencyRate, and not one row written', { skip: !RUN }, async () => {
+  const http = await import('node:http')
+  const { runPackCli } = await import('../../scripts/reconciliation-pack.ts')
+  const { healthyLiveness } = await import('../reconciliation-pack/basis-fixtures.ts')
+  const { createXeroGetPort } = await import('../../lib/reconciliation-pack/xero-transport.ts')
+  const { readXeroAccess, readXeroBinding } = await import('../../lib/reconciliation-pack/xero-credentials.ts')
+  const { randomBytes } = await import('node:crypto')
+  const TOKEN = `xero_tok_${RTAG}`
+  const xeroSeen: Array<{ method: string; url: string; authorization: string | undefined; tenant: string | undefined }> = []
+  // 1 GBP = 2 NZD from 2026-09-01, so Xero's CurrencyRate on a NZD document dated later in the closed months must be 0.5.
+  let invoiceRate = 0.5
+  let paymentRate = 0.5
+  let breakCreditNotes = false
+  const uuid = (n: number) => `00000000-0000-4000-8000-0000000016${String(n).padStart(2, '0')}`
+  const send = (res: import('node:http').ServerResponse, body: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)) }
+  const xeroServer = http.createServer((req, res) => {
+    xeroSeen.push({ method: req.method ?? '', url: req.url ?? '', authorization: req.headers.authorization, tenant: req.headers['xero-tenant-id'] as string | undefined })
+    const url = new URL(req.url ?? '/', 'http://x')
+    const page = Number(url.searchParams.get('page'))
+    const list = (key: string, rows: unknown[]) => send(res, { [key]: page === 1 ? rows : [], pagination: { page, pageSize: 100, pageCount: rows.length === 0 ? 0 : 1, itemCount: rows.length } })
+    if (url.pathname === '/api.xro/2.0/Organisation') return send(res, { Organisations: [{ BaseCurrency: 'GBP' }] })
+    if (url.pathname === '/api.xro/2.0/Invoices') return list('Invoices', [
+      { InvoiceID: uuid(1), Type: 'ACCREC', Status: 'AUTHORISED', DateString: '2026-09-05T00:00:00', CurrencyCode: 'NZD', CurrencyRate: invoiceRate },
+      { InvoiceID: uuid(2), Type: 'ACCPAY', Status: 'PAID', DateString: '2026-09-20T00:00:00', CurrencyCode: 'GBP', CurrencyRate: 1 },
+    ])
+    if (url.pathname === '/api.xro/2.0/CreditNotes') {
+      const rows = [{ CreditNoteID: uuid(3), Type: 'ACCRECCREDIT', Status: 'AUTHORISED', DateString: '2026-09-06T00:00:00', CurrencyCode: 'NZD', CurrencyRate: 0.5 }]
+      // The broken list reports two items and sends one: a count that does not match the rows proves nothing.
+      return send(res, { CreditNotes: page === 1 ? rows : [], pagination: { page, pageSize: 100, pageCount: 1, itemCount: breakCreditNotes ? 2 : 1 } })
+    }
+    if (url.pathname === '/api.xro/2.0/Payments') return list('Payments', [{ PaymentID: uuid(4), Status: 'AUTHORISED', DateString: '2026-09-07T00:00:00', CurrencyRate: paymentRate, Invoice: { InvoiceID: uuid(1), CurrencyCode: 'NZD' } }])
+    res.writeHead(404); res.end('{}')
+  })
+  await new Promise<void>((resolve) => xeroServer.listen(0, '127.0.0.1', resolve))
+  const xeroPort = (xeroServer.address() as import('node:net').AddressInfo).port
+  const dir = mkdtempSync('/var/tmp/recon-pack-nw-')
+  chmodSync(dir, 0o700)
+  let estate: Held = NOTHING_HELD
+  const sql = (text: string, values: unknown[] = []) => withClient((client) => client.query(text, values))
+  const targets: string[] = []
+  const original = net.Socket.prototype.connect
+  const previous = { E2E_TEST_MODE: process.env.E2E_TEST_MODE, SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY, ENCRYPTION_KEY: process.env.ENCRYPTION_KEY, XERO_ALLOWED_TENANT_IDS: process.env.XERO_ALLOWED_TENANT_IDS }
+  let insertedCurrency = false
+  const savedSettings = await sql(`SELECT key, value FROM settings WHERE key = 'xero_expected_tenant_id'`).then((r) => r.rows as Array<{ key: string; value: string }>)
+  const setting = (key: string, value: string, at = '2026-01-01 00:00:00') => sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "updatedAt" = EXCLUDED."updatedAt"`, [key, value, at])
+  try {
+    process.env.E2E_TEST_MODE = '1'
+    process.env.SETTINGS_ENCRYPTION_KEY = randomBytes(32).toString('base64')
+    delete process.env.ENCRYPTION_KEY
+    process.env.XERO_ALLOWED_TENANT_IDS = RTENANT
+    await setting('xero_expected_tenant_id', RTENANT)
+    estate = await holdForeignEstate()
+    await sql(`INSERT INTO accounting_tokens (id, connector, "accessToken", "expiresAt", "tenantId", "connectionGeneration", "updatedAt") VALUES ($1, 'xero', $2, '2031-01-01', $3, 'gen-e2e', now())`, [`${RTAG}-tok`, TOKEN, RTENANT])
+    insertedCurrency = (await sql(`INSERT INTO currencies (code, name, symbol) VALUES ('NZD', 'New Zealand Dollar', '$') ON CONFLICT (code) DO NOTHING RETURNING code`)).rows.length === 1
+    await sql(`INSERT INTO fx_rates (id, "fromCurrency", "toCurrency", rate, "fetchedAt", source, "manualOverride") VALUES ($1, 'GBP', 'NZD', 2, '2026-09-01 06:00:00', 'frankfurter', false)`, [`${RTAG}-fx`])
+
+    const run = async (extra: string[]) => {
+      const out: string[] = []
+      const before = await census()
+      xeroSeen.length = 0; targets.length = 0
+      net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+        const raw = args[0] as unknown
+        const first = (Array.isArray(raw) ? raw[0] : raw) as { host?: string; port?: number; path?: string } | number | string
+        targets.push(typeof first === 'object' && first !== null ? (first.path ? `unix:${first.path}` : `${first.host ?? 'localhost'}:${first.port}`) : `${typeof args[1] === 'string' ? args[1] : 'localhost'}:${String(first)}`)
+        return (original as (...a: unknown[]) => unknown).apply(this, args)
+      } as typeof original
+      // The loopback double: the same transport and stored-connection reader the command uses, aimed at the double. The grant in the seam's
+      // environment is what lets the fetch seam's outbound hold reach a non-Xero host; the command itself never sets it.
+      const xero = {
+        port: createXeroGetPort({ readAccess: () => withClient((client) => readXeroAccess(client as never, { now: new Date() })), baseUrl: `http://127.0.0.1:${xeroPort}/api.xro/2.0`, env: { E2E_TEST_MODE: '1', NODE_ENV: 'test', XERO_WRITE_ALLOWED_TENANT: RTENANT } }),
+        binding: () => withClient((client) => readXeroBinding(client as never)),
+      }
+      const code = await runPackCli({ argv: ['--phase', 'P1', '--as-of', '2026-10-19', '--items', 'R16', '--report-dir', dir, ...extra], env: { DATABASE_URL: process.env.DATABASE_URL }, keepProcessEnv: true, uid: 0, checkoutOwnerUid: 0, repoRoot: process.cwd(), deps: { liveness: healthyLiveness(), xero, xeroOptions: { sleep: async () => undefined } }, stdout: (t) => out.push(t), stderr: (t) => out.push(t) })
+      net.Socket.prototype.connect = original
+      const after = await census()
+      assert.deepEqual(after.counts, before.counts, 'every table has the rows it had')
+      assert.deepEqual(after.stats, before.stats, 'no table saw an insert, update or delete')
+      return { code, out, targets: [...targets] }
+    }
+    const url = new URL(process.env.DATABASE_URL!)
+    const allowed = (target: string) => target === `${url.hostname}:${url.port}` || target === `127.0.0.1:${url.port}` || target === `localhost:${url.port}` || target === `127.0.0.1:${xeroPort}`
+
+    // Without the flag: no request to the double, no connection to anything but the database.
+    const off = await run([])
+    assert.ok(off.out.includes('R16 inconclusive VENDOR_READS_OFF'), off.out.join('\n'))
+    assert.equal(xeroSeen.length, 0)
+    assert.ok(off.targets.every((target) => !target.endsWith(`:${xeroPort}`)), off.targets.join(','))
+
+    // With it: the invoice, the credit note and the payment agree with the table (the sterling bill is out of scope); GET only, to the three lists.
+    const on = await run(['--vendor-reads-only'])
+    assert.ok(on.out.includes('R16 pass -'), on.out.join('\n'))
+    assert.deepEqual([...new Set(xeroSeen.map((s) => s.method))], ['GET'])
+    assert.deepEqual(xeroSeen.map((s) => new URL(s.url, 'http://x').pathname.replace('/api.xro/2.0/', '')), ['Organisation', 'Invoices', 'Invoices', 'CreditNotes', 'CreditNotes', 'Payments', 'Payments'])
+    assert.ok(xeroSeen.every((s) => s.authorization === `Bearer ${TOKEN}` && s.tenant === RTENANT && !s.url.includes(TOKEN)))
+    for (const target of on.targets) assert.ok(allowed(target), `unexpected connection to ${target}`)
+    assert.ok(on.targets.some((target) => target === `127.0.0.1:${xeroPort}`), 'precondition: the double was contacted')
+    assert.ok(!on.out.join('\n').includes(TOKEN))
+
+    // A rate that differs by one millionth is a finding: the run fails (exit 1) and names the reason.
+    invoiceRate = 0.500001
+    const differ = await run(['--vendor-reads-only'])
+    assert.equal(differ.code, 1, differ.out.join('\n'))
+    assert.ok(differ.out.includes('R16 fail DIFFERENCES,XERO_RATE_DIFFERS'), differ.out.join('\n'))
+    invoiceRate = 0.5000004
+    assert.ok((await run(['--vendor-reads-only'])).out.includes('R16 pass -'), 'within half a millionth agrees at six places')
+    invoiceRate = 0.5
+    paymentRate = 0.49
+    assert.ok((await run(['--vendor-reads-only'])).out.includes('R16 fail DIFFERENCES,XERO_RATE_DIFFERS'), 'a payment is judged on its own rate')
+    paymentRate = 0.5
+
+    // No IMS rate on or before the document date: IMS_RATE_MISSING, and the table is untouched by the run.
+    await sql(`UPDATE fx_rates SET "fetchedAt" = '2026-09-06 06:00:00' WHERE id = $1`, [`${RTAG}-fx`])
+    const missing = await run(['--vendor-reads-only'])
+    assert.ok(missing.out.includes('R16 fail DIFFERENCES,IMS_RATE_MISSING'), missing.out.join('\n'))
+    await sql(`UPDATE fx_rates SET "fetchedAt" = '2026-09-01 06:00:00' WHERE id = $1`, [`${RTAG}-fx`])
+
+    // An unproven Xero list (the count it reports is not the rows it sent) is inconclusive, never a pass.
+    breakCreditNotes = true
+    const unstable = await run(['--vendor-reads-only'])
+    assert.ok(unstable.out.includes('R16 inconclusive VENDOR_READ_UNSTABLE'), unstable.out.join('\n'))
+    breakCreditNotes = false
+
+    // A token the read-sync has not renewed is never refreshed by the pack: no request to Xero, the token row untouched.
+    await sql(`UPDATE accounting_tokens SET "expiresAt" = now() + interval '1 minute' WHERE id = $1`, [`${RTAG}-tok`])
+    const before = (await sql(`SELECT "accessToken", "refreshToken", "expiresAt", "updatedAt" FROM accounting_tokens WHERE id = $1`, [`${RTAG}-tok`])).rows[0]
+    const expired = await run(['--vendor-reads-only'])
+    assert.ok(expired.out.includes('R16 inconclusive XERO_CONNECTION_UNUSABLE'), expired.out.join('\n'))
+    assert.equal(xeroSeen.length, 0)
+    assert.deepEqual((await sql(`SELECT "accessToken", "refreshToken", "expiresAt", "updatedAt" FROM accounting_tokens WHERE id = $1`, [`${RTAG}-tok`])).rows[0], before)
+    await sql(`UPDATE accounting_tokens SET "expiresAt" = '2031-01-01' WHERE id = $1`, [`${RTAG}-tok`])
+    assert.ok((await run(['--vendor-reads-only'])).out.includes('R16 pass -'))
+  } finally {
+    net.Socket.prototype.connect = original
+    for (const [name, value] of Object.entries(previous)) { if (value === undefined) delete process.env[name]; else process.env[name] = value }
+    await new Promise<void>((resolve) => { xeroServer.close(() => resolve()); xeroServer.closeAllConnections() })
+    await sql(`DELETE FROM fx_rates WHERE id LIKE '${RTAG}%'`)
+    if (insertedCurrency) await sql(`DELETE FROM currencies WHERE code = 'NZD'`)
+    await sql(`DELETE FROM accounting_tokens WHERE id LIKE '${RTAG}%'`)
+    await restoreForeignEstate(estate)
+    await sql(`DELETE FROM settings WHERE key = 'xero_expected_tenant_id'`)
+    for (const prior of savedSettings) await setting(prior.key, prior.value, '2026-09-01 00:00:00')
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // ---- R1 end to end: the real IMS reads, the real stored-credential read, the real GET-only reader, a LOOPBACK Mintsoft ---------------
 
 const MTAG = `RCMS${process.pid}`

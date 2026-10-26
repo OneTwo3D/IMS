@@ -63,7 +63,7 @@ test('arguments: every refusal is a closed code, and a good line parses to exact
     ['value missing', ['--phase']], ['value is a flag', ['--phase', '--as-of']], ['empty value', ['--phase', 'P1', '--report-dir', '']],
     ['as-of not a date', ['--phase', 'P1', '--as-of', '2026-13-01']], ['as-of 30 Feb', ['--phase', 'P1', '--as-of', '2026-02-30']], ['as-of today', ['--phase', 'P1', '--as-of', '2026-10-20']],
     ['as-of future', ['--phase', 'P1', '--as-of', '2027-01-01']], ['as-of with time', ['--phase', 'P1', '--as-of', '2026-10-19T00:00:00Z']],
-    ['unknown item', ['--phase', 'P1', '--items', 'R16']], ['repeated item', ['--phase', 'P1', '--items', 'R3,R3']], ['empty item', ['--phase', 'P1', '--items', 'R3,']], ['lower-case item', ['--phase', 'P1', '--items', 'r3']],
+    ['unknown item', ['--phase', 'P1', '--items', 'R17']], ['repeated item', ['--phase', 'P1', '--items', 'R3,R3']], ['empty item', ['--phase', 'P1', '--items', 'R3,']], ['lower-case item', ['--phase', 'P1', '--items', 'r3']],
     ['basis-only with items', ['--phase', 'P1', '--basis-only', '--items', 'R3']], ['control character', ['--phase', 'P1', '--report-dir', '/var/tmp/a\nb']],
     ['positional argument', ['--phase', 'P1', 'R3']],
   ]

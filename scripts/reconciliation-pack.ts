@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * THE RECONCILIATION PACK (npm run reconcile:pack): runs the pack's items, publishes one report, exits with a code derived from
- * the items. READ-ONLY against the database, NO call to any vendor unless --vendor-reads-only (then GET only: WooCommerce, the warehouse system with its stored fixed key (never a login), and Xero for R12 with the stored token (never refreshed)), no secret on a command line, and no overall verdict (the
+ * the items. READ-ONLY against the database, NO call to any vendor unless --vendor-reads-only (then GET only: WooCommerce, the warehouse system with its stored fixed key (never a login), and Xero for R12 and R16 with the stored token (never refreshed)), no secret on a command line, and no overall verdict (the
  * readiness gate decides). Flags, closed codes and exit codes are single-sourced in lib/reconciliation-pack/constants.ts and
  * rendered into docs/installation.md ("Reconciliation pack"); `--help` prints them.
  *
@@ -38,6 +38,7 @@ import { readWooCredentials } from '../lib/reconciliation-pack/woo-credentials.t
 import { createXeroGetPort } from '../lib/reconciliation-pack/xero-transport.ts'
 import { readXeroAccess, readXeroBinding } from '../lib/reconciliation-pack/xero-credentials.ts'
 import type { XeroVatVendor } from '../lib/reconciliation-pack/vat-item.ts'
+import type { XeroSourceOptions } from '../lib/reconciliation-pack/xero-source.ts'
 import type { VendorPorts } from '../lib/reconciliation-pack/vendor-items.ts'
 import { createWmsReadSession, type WmsReadPort } from '../lib/reconciliation-pack/wms-source.ts'
 import type { WooGetPort } from '../lib/reconciliation-pack/woo-source.ts'
@@ -69,6 +70,8 @@ export type PackCliDeps = {
   wmsSkus?: SkuListPort
   /** The Xero port and binding reader (R12). Consulted ONLY with --vendor-reads-only; the default is the GET-only transport over the stored connection (xero-transport.ts), which never refreshes a token. */
   xero?: XeroVatVendor
+  /** Test seam for the Xero walks' pacing and budget (R12, R16); the command never sets it. */
+  xeroOptions?: XeroSourceOptions
   /** The warehouse-system port (R1). Consulted ONLY with --vendor-reads-only; the default is the GET-only, fixed-key reader (lib/connectors/mintsoft/reconciliation-read.ts). */
   wms?: WmsReadPort
   /** Called last, whatever happened: closes the application's database client if the invariant run opened it. */
@@ -253,7 +256,7 @@ export async function runPackCli(options: PackCliOptions): Promise<number> {
       ledgerRunners: deps.ledgerRunners,
       // What the previous report carries for each item that settles, from the chain read above (trusted, or the run stopped).
       carried: Object.fromEntries(PACK_ITEM_IDS.filter((id) => getPackItem(id).settles).map((id) => [id, carriedStateFromChain(chain, id, { phase: args.phase, systemIdentifier: systemIdentifier! })])) as Partial<Record<PackItemId, CarriedState>>,
-      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor, wmsSession, qoblex, skuExclusions: exclusions.file, wmsSkus: args.vendorReadsOnly ? deps.wmsSkus : undefined },
+      context: { phase: args.phase, asOf: args.asOf!, now: deps.now, acceptances: accepted.file, invariant: memoisedInvariant(deps.runInvariant), ims: (readOptions) => readIms(deps, readOptions), vendorReads: args.vendorReadsOnly, vendor, wmsSession, qoblex, skuExclusions: exclusions.file, wmsSkus: args.vendorReadsOnly ? deps.wmsSkus : undefined, xeroOptions: args.vendorReadsOnly ? deps.xeroOptions : undefined },
     })
     const finishedAt = deps.now()
     const published = publishPackReport(reportDir, {
