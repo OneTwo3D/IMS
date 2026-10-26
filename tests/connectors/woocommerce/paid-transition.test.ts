@@ -393,3 +393,27 @@ test('rotation: the batch is the rows attempted LEAST recently; a row just attem
   assert.equal(touched(await after(fresh.id), null), true, 'the never-attempted row was attempted first')
   assert.equal(touched(await after(old.id), attemptedAt), false, 'the row attempted most recently was left for later, though it is older')
 })
+
+// The update delivery refreshes addresses and notes, NOT lines or the total, so a total edited in WooCommerce before payment is not in IMS. [mutation: remove the total comparison]
+test('paid payload whose total differs from the total IMS holds: no Payment, not paid, ONE review notice; once the totals agree the full amount is recorded', async () => {
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const o = await heldOrder()
+  registrations.length = 0
+  const edited = { ...(payload(Number(o.wcId), '2026-10-01T10:00:00') as object), total: '120.00' } as never
+  await updateExistingWcOrderFromPayload(o.id, edited)
+  await updateExistingWcOrderFromPayload(o.id, edited)
+  assert.equal((await payments(o.id)).length, 0)
+  assert.equal(registrations.length, 0)
+  assert.equal((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt, null)
+  const notices = await s.db.activityLog.findMany({ where: { entityId: o.id, action: 'wc_paid_total_differs' } })
+  assert.equal(notices.length, 1, 'idempotent per order and total pair')
+  assert.deepEqual([(notices[0]!.metadata as { imsTotal: string }).imsTotal, (notices[0]!.metadata as { paidTotal: string }).paidTotal], ['100.00', '120.00'])
+  // resync: the order now holds 120
+  await s.db.salesOrder.update({ where: { id: o.id }, data: { subtotalForeign: '120', totalForeign: '120' } })
+  await updateExistingWcOrderFromPayload(o.id, edited)
+  const pays = await payments(o.id)
+  assert.equal(pays.length, 1)
+  assert.equal(Number(pays[0]!.amount), 120)
+  assert.ok((await s.db.salesOrder.findUniqueOrThrow({ where: { id: o.id } })).paidAt)
+  assert.equal(registrations.length, 1)
+})

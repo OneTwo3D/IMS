@@ -931,6 +931,16 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     // below, or an earlier one completing after this fence, discharges it.
     const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true } })
     if (order.paidAt !== null) return null
+    // THE PAID TOTAL MUST BE THE TOTAL IMS HOLDS. An update delivery refreshes addresses and notes but NOT the lines or the total (updateExistingWcOrderCore), so an order edited in
+    // WooCommerce between the import and the payment still carries the old total here. Compared to the minor unit of the order currency, under the lock: if they differ nothing is
+    // recorded (no paidAt, no Payment) and a review notice is written; a later delivery after the totals agree records it.
+    const dp = currencyMinorUnits(order.currency)
+    let paidTotalText: string | null = null
+    try { paidTotalText = toDecimal(wcOrder.total).toFixed(dp) } catch { paidTotalText = null }
+    const storedTotalText = toDecimal(order.totalForeign).toFixed(dp)
+    if (paidTotalText === null || paidTotalText !== storedTotalText) {
+      return { mismatch: { stored: storedTotalText, paid: paidTotalText ?? String(wcOrder.total ?? ''), currency: order.currency, reference: order.externalOrderNumber ?? order.orderNumber ?? orderId } } as const
+    }
     // WooCommerce paid the order TOTAL, so what is recorded is the part of it NOT already covered. Read and summed UNDER THE LOCK, so a receipt added after the plan was made is counted.
     const existing = await tx.payment.findMany({ where: { orderId, refundId: null }, select: { amount: true, currency: true } })
     const ambiguous = existing.some((p) => p.currency.trim().toUpperCase() !== order.currency.trim().toUpperCase())
@@ -972,6 +982,23 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     return { receipt, reference, ambiguous: false, existingCount: existing.length, obligationRowId, ownsObligationRow: !retryLogId }
   })
   if (!claimed) return
+  if ('mismatch' in claimed && claimed.mismatch) {
+    const m = claimed.mismatch
+    // idempotent per order and total pair: the same disagreement is written once however often it is delivered
+    const already = await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_paid_total_differs', AND: [{ metadata: { path: ['imsTotal'], equals: m.stored } }, { metadata: { path: ['paidTotal'], equals: m.paid } }] } })
+    if (already === 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'wc_paid_total_differs',
+        tag: 'sync',
+        level: 'ERROR',
+        description: `WooCommerce reports order ${m.reference} paid at ${m.currency} ${m.paid}, but IMS holds ${m.currency} ${m.stored}. The payment was NOT recorded and the order is not marked paid. Bring the order's total into line with WooCommerce; the payment is recorded on the next delivery once the totals agree.`,
+        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), imsTotal: m.stored, paidTotal: m.paid, currency: m.currency },
+      })
+    }
+    return
+  }
   if (claimed.ambiguous) {
     await logActivity({
       entityType: 'SALES_ORDER',
