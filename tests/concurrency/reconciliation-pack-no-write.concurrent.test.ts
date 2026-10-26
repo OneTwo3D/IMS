@@ -400,7 +400,7 @@ test('[reconciliation pack] R9 and R13 with --vendor-reads-only: stored credenti
     // request to Xero (the only connections are the database and the loopback store) and not one row written.
     const { digestTaxRateList } = await import('../../lib/connectors/xero/tax-rate-list.ts')
     const xeroRows = [
-      { taxType: 'OUTPUT2', name: 'Standard', status: 'ACTIVE' as const, reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: [{ name: 'VAT', rate: '20.000000', compound: false, nonRecoverable: false }], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } },
+      { taxType: 'OUTPUT2', name: 'x', status: 'ACTIVE' as const, reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: [{ name: 'VAT', rate: '20.000000', compound: false, nonRecoverable: false }], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true } },
       { taxType: 'OLD1', name: 'Retired', status: 'ARCHIVED' as const, reportTaxType: null, effectiveRate: null, displayTaxRate: null, components: [], canApply: { assets: null, equity: null, expenses: null, liabilities: null, revenue: null } },
     ]
     const tenant = `${VTAG}-tenant`
