@@ -180,3 +180,24 @@ test('starvation: 55 newer registered receipts do not hide an older unresolved o
   assert.equal(await rowsFor(order.id, unresolved.id), 1, 'registered within one run')
   assert.equal(calls.filter((c) => registered.includes(c.paymentId)).length, 0)
 })
+
+// [mutation: drop the "registrations are owed" guard at the top of the sweep]
+test('no connector posts INVOICE_PAYMENT: the sweep returns at once, examines nothing and registers nothing', async () => {
+  const { sweepUnregisteredReceipts, receiptRegistrationSeams } = await import('@/lib/domain/accounting/receipt-registration-sweep')
+  const order = await postedOrder()
+  const orphan = await s.db.payment.create({ data: { orderId: order.id, amount: 3, currency: 'GBP', method: 'Hand' } })
+  await age(orphan.id, 90)
+  calls.length = 0
+  mode = 'record'
+  receiptRegistrationSeams.registrationsAreOwed = async () => false
+  receiptRegistrationSeams.obligationIsOnRecord = async () => false
+  try {
+    const r = await sweepUnregisteredReceipts(250)
+    assert.deepEqual(r, { examined: 0, registered: 0, failed: 0 })
+  } finally {
+    receiptRegistrationSeams.registrationsAreOwed = undefined
+    receiptRegistrationSeams.obligationIsOnRecord = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptObligationIsOnRecord
+  }
+  assert.equal(calls.filter((c) => c.paymentId === orphan.id).length, 0)
+  assert.equal(await rowsFor(order.id, orphan.id), 0)
+})
