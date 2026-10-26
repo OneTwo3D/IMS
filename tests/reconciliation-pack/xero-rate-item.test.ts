@@ -309,7 +309,7 @@ test('THE ROWS ARE DETERMINISTIC: the order Xero lists them in does not change a
   const forward = buildRateRows({ ...base, documents: docs })
   const backward = buildRateRows({ ...base, documents: [...docs].reverse() })
   assert.deepEqual(forward, backward)
-  assert.deepEqual(forward.ims.map((r) => (r.key as Array<{ raw: string }>).map((p) => p.raw)), [['xero-rate', 'payment', uuid(2)], ['xero-rate', 'payment', uuid(4)], ['xero-rate', 'sales-invoice', uuid(1)], ['xero-rate', 'sales-invoice', uuid(3)]])
+  assert.deepEqual(forward.ims.map((r) => (r.key as unknown as Array<{ raw: string }>).map((p) => p.raw)), [['xero-rate', 'payment', uuid(2)], ['xero-rate', 'payment', uuid(4)], ['xero-rate', 'sales-invoice', uuid(1)], ['xero-rate', 'sales-invoice', uuid(3)]])
   // The same inputs in two runs give the same item, byte for byte.
   const a = JSON.stringify(await runXeroRateItem('R16', context({ invoices: [eur(1, 0.8), eur(2, 0.9)], payments: [paymentRow({ n: 3, date: SEP, currency: 'EUR', rate: 0.8 })] }).ctx))
   const b = JSON.stringify(await runXeroRateItem('R16', context({ invoices: [eur(2, 0.9), eur(1, 0.8)], payments: [paymentRow({ n: 3, date: SEP, currency: 'EUR', rate: 0.8 })] }, { double: { pageSize: 1 } }).ctx))
