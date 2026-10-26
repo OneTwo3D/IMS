@@ -87,17 +87,19 @@ function receiptAgeFloor(): Date {
 
 /**
  * The orders whose CURRENT invoice still owes its SALES_INVOICE follow-ups: they are left to that pass and, being excluded in the query below, never take a slot. The marker is tested for presence only (never compared; this
- * statement holds no comparison operator on purpose, and is kept apart from the clock-reading query for the same reason). A marker row is the CURRENT invoice's when it names the order's `accounting_invoice_id`, names no
- * document yet (posted, not yet recorded), or is the order's latest SALES_INVOICE row (a re-post whose back-reference is not written yet). A marker left on a SUPERSEDED invoice (the order was re-posted: the row names
- * another document and a later row exists) excludes nothing, or it would hide every later receipt of the order for ever.
+ * statement holds no comparison operator on purpose, and is kept apart from the clock-reading query for the same reason). A marker row is the CURRENT invoice's in exactly these cases: it names the order's
+ * `accounting_invoice_id`; or it is the order's latest SALES_INVOICE row by (createdAt, id) (a re-post whose back-reference is not written yet, or a post whose document id is not recorded yet). A row with no document id is NOT
+ * current merely for being unrecorded: an older one behind a newer row is superseded. "Latest" ignores FAILED and CANCELLED rows, which never became the invoice (a later failed attempt must not demote the real pending row); when
+ * EVERY row failed there is no viable row to supersede anything, so a marker row stays current. A marker left on a SUPERSEDED invoice excludes nothing, or it would hide every later receipt of the order for ever.
  */
 async function ordersOwingCurrentInvoiceFollowUps(): Promise<string[]> {
   const rows = await db.$queryRaw<Array<{ id: string }>>`
     SELECT DISTINCT m."referenceId" AS id FROM "accounting_sync_logs" m
     JOIN "sales_orders" o ON o.id = m."referenceId"
     WHERE m.type = 'SALES_INVOICE' AND m."referenceType" = 'SalesOrder' AND m."backReferenceFollowUpsPendingAt" IS NOT NULL
-      AND (m."externalTransactionId" IS NULL OR m."externalTransactionId" = o.accounting_invoice_id
-           OR m.id = (SELECT n.id FROM "accounting_sync_logs" n WHERE n.type = 'SALES_INVOICE' AND n."referenceType" = 'SalesOrder' AND n."referenceId" = m."referenceId" ORDER BY n."createdAt" DESC, n.id DESC LIMIT 1))`
+      AND (m."externalTransactionId" = o.accounting_invoice_id
+           OR m.id = (SELECT n.id FROM "accounting_sync_logs" n WHERE n.type = 'SALES_INVOICE' AND n."referenceType" = 'SalesOrder' AND n."referenceId" = m."referenceId" AND n.status NOT IN ('FAILED', 'CANCELLED') ORDER BY n."createdAt" DESC, n.id DESC LIMIT 1)
+           OR NOT EXISTS (SELECT 1 FROM "accounting_sync_logs" v WHERE v.type = 'SALES_INVOICE' AND v."referenceType" = 'SalesOrder' AND v."referenceId" = m."referenceId" AND v.status NOT IN ('FAILED', 'CANCELLED')))`
   return rows.map((r) => r.id)
 }
 

@@ -167,7 +167,7 @@ test('selection: refunds, young receipts, unposted invoices, registered receipts
   assert.deepEqual(order, [older!.id, newer!.id, failedBefore!.id], 'oldest first, the recently failed one behind the others')
 })
 
-// [mutation: remove the current-invoice scoping of the follow-up exclusion (any marker row on the order excludes it) -> the stale-marker arm goes red; make the scoping too loose (ignore the marker entirely) -> the pending arms go red]
+// [mutation: restore the standalone null-document-id clause (an unrecorded id counts as current) -> the older-null-id arm goes red; remove the current-invoice scoping of the follow-up exclusion (any marker row on the order excludes it) -> the stale-marker arm goes red; make the scoping too loose (ignore the marker entirely) -> the pending arms go red]
 test('a follow-up marker left on a SUPERSEDED invoice does not hide a later receipt; one on the CURRENT invoice still does', async () => {
   const { sweepUnregisteredReceipts, receiptRegistrationSeams } = await import('@/lib/domain/accounting/receipt-registration-sweep')
   const mkOrder = async (current: string) => {
@@ -175,8 +175,8 @@ test('a follow-up marker left on a SUPERSEDED invoice does not hide a later rece
     await s.db.salesOrder.update({ where: { id: o.id }, data: { accountingInvoiceId: current } })
     return o
   }
-  const row = (orderId: string, ext: string | null, created: string, marker: boolean) => s.db.accountingSyncLog.create({
-    data: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: orderId, status: 'SYNCED', externalTransactionId: ext, createdAt: new Date(created), ...(marker ? { backReferenceFollowUpsPendingAt: new Date() } : {}) },
+  const row = (orderId: string, ext: string | null, created: string, marker: boolean, status: 'SYNCED' | 'FAILED' = 'SYNCED') => s.db.accountingSyncLog.create({
+    data: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: orderId, status, externalTransactionId: ext, createdAt: new Date(created), ...(marker ? { backReferenceFollowUpsPendingAt: new Date() } : {}) },
   })
   const receipt = async (orderId: string) => { const p = await s.db.payment.create({ data: { orderId, amount: 7, currency: 'GBP', method: 'Hand' } }); await age(p.id, 60); return p }
 
@@ -196,6 +196,22 @@ test('a follow-up marker left on a SUPERSEDED invoice does not hide a later rece
   await row(pendingBackRef.id, 'INV-B-3', '2026-02-01T00:00:00Z', true)
   const midRepost = await receipt(pendingBackRef.id)
 
+  // an OLDER marker row with NO document id, behind a newer row the order points to: superseded, must not exclude
+  const nullOld = await mkOrder('INV-B-4')
+  await row(nullOld.id, null, '2026-01-01T00:00:00Z', true)
+  await row(nullOld.id, 'INV-B-4', '2026-02-01T00:00:00Z', false)
+  const nullOldReceipt = await receipt(nullOld.id)
+  // a marker row with no document id that IS the latest: still owes
+  const nullLatest = await mkOrder('INV-A-5')
+  await row(nullLatest.id, 'INV-A-5', '2026-01-01T00:00:00Z', false)
+  await row(nullLatest.id, null, '2026-02-01T00:00:00Z', true)
+  const nullLatestReceipt = await receipt(nullLatest.id)
+  // a later FAILED attempt that never became the invoice does not demote the real pending row
+  const failedBehind = await mkOrder('INV-A-6')
+  await row(failedBehind.id, null, '2026-01-01T00:00:00Z', true)
+  await row(failedBehind.id, null, '2026-02-01T00:00:00Z', false, 'FAILED')
+  const failedBehindReceipt = await receipt(failedBehind.id)
+
   const seen: string[] = []
   receiptRegistrationSeams.registrationsAreOwed = async () => true
   receiptRegistrationSeams.obligationIsOnRecord = async () => false
@@ -206,6 +222,9 @@ test('a follow-up marker left on a SUPERSEDED invoice does not hide a later rece
     receiptRegistrationSeams.registrationsAreOwed = undefined
     receiptRegistrationSeams.obligationIsOnRecord = (await import('@/lib/domain/accounting/receipt-registration-sweep')).receiptObligationIsOnRecord
   }
+  assert.ok(seen.includes(nullOldReceipt.id), 'an older null-id marker row behind a newer row is superseded')
+  assert.ok(!seen.includes(nullLatestReceipt.id), 'a null-id marker row that is the latest still owes')
+  assert.ok(!seen.includes(failedBehindReceipt.id), 'a later FAILED row does not demote the real pending row')
   assert.ok(seen.includes(stale.id), 'a stale marker on the superseded invoice A must not exclude the order')
   assert.ok(!seen.includes(owing.id), 'the current invoice still owes its follow-ups: left to that pass')
   assert.ok(!seen.includes(midRepost.id), 'a re-post whose back-reference is not written yet still owes its follow-ups')
