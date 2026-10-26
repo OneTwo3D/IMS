@@ -151,24 +151,24 @@ function normalizeTaxRateValue(value: number | null): number | undefined {
  * read as 1), and must be EXACTLY the central fx_rates rate for the document (FX_RATE_NOT_TABLE_RATE); a currency with no rate refuses (FX_RATE_MISSING: never 1:1). The base currency is 1, so a
  * stated base-currency rate other than 1 is FX_RATE_NOT_TABLE_RATE. Returns the refusal text, or null when the document may be created (createSalesOrder / createPurchaseOrder then store the table rate).
  */
-async function checkStatedFxRate(args: { label: string; currency: string; baseCurrency: string; stated: string; asOf: Date }): Promise<string | null> {
+async function checkStatedFxRate(args: { label: string; currency: string; baseCurrency: string; stated: string; asOf: Date }): Promise<{ refusal: string | null; rate: number }> {
   const { label, currency, baseCurrency, stated, asOf } = args
   if (stated !== '') {
     const n = Number(stated)
-    if (!Number.isFinite(n) || n <= 0) return `${label}: FX_RATE_INVALID: fxRateToBase "${stated}" must be a number above zero (it is never read as 1)`
+    if (!Number.isFinite(n) || n <= 0) return { rate: 0, refusal: `${label}: FX_RATE_INVALID: fxRateToBase "${stated}" must be a number above zero (it is never read as 1)` }
   }
   const isBase = currency.trim().toUpperCase() === baseCurrency.trim().toUpperCase()
   let tableRate: number
   try {
     tableRate = await resolvePurchaseOrderFxRateToBase(db, { currency, baseCurrency, asOf })
   } catch (error) {
-    if (isMissingFxRateError(error)) return `${label}: FX_RATE_MISSING: ${error.message}`
+    if (isMissingFxRateError(error)) return { rate: 0, refusal: `${label}: FX_RATE_MISSING: ${error.message}` }
     throw error
   }
   if (stated !== '' && Number(stated) !== tableRate) {
-    return `${label}: FX_RATE_NOT_TABLE_RATE: the file states fxRateToBase ${stated} for ${currency}, but the fx_rates rate is ${tableRate}${isBase ? '' : ` as of ${asOf.toISOString().slice(0, 10)}`}; a document's rate is always the table rate (leave fxRateToBase blank, or pin an override on Settings, Accounting, FX Rates)`
+    return { rate: tableRate, refusal: `${label}: FX_RATE_NOT_TABLE_RATE: the file states fxRateToBase ${stated} for ${currency}, but the fx_rates rate is ${tableRate}${isBase ? '' : ` as of ${asOf.toISOString().slice(0, 10)}`}; a document's rate is always the table rate (leave fxRateToBase blank, or pin an override on Settings, Accounting, FX Rates)` }
   }
-  return null
+  return { refusal: null, rate: tableRate }
 }
 
 type TaxRateLookupRow = {
@@ -1808,7 +1808,27 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       )
     : new Set<string>()
 
+  // FIRST PASS, BEFORE ANY WRITE: every group that would be created is rate-checked here, once. If ANY fails, the WHOLE file is refused, nothing is written (dry run and apply alike) and
+  // every FX error is reported together, so a retry never meets half the file already saved. The rate checked here is handed to createSalesOrder, which refuses (writes nothing) if the table
+  // rate it resolves at write time is not this one. (Other row errors keep the importer's existing rule: valid groups import, bad ones are reported and skipped.)
+  const salesFxRates = new Map<string, number>()
+  const salesFxErrors: string[] = []
   for (const [groupKey, g] of groups.entries()) {
+    if (g.invalid) continue
+    const key = g.importKey ?? (groupKey.startsWith('row-') ? undefined : groupKey)
+    if (key && existingSalesOrderKeys.has(key)) continue
+    const checked = await checkStatedFxRate({ label: `Sales order "${key ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: new Date() })
+    if (checked.refusal) salesFxErrors.push(checked.refusal)
+    else salesFxRates.set(groupKey, checked.rate)
+  }
+  const salesFileRefused = salesFxErrors.length > 0
+  if (salesFileRefused) result.errors.push(...salesFxErrors, 'The file was refused as a whole because of the FX errors above: no sales order was written.')
+
+  for (const [groupKey, g] of groups.entries()) {
+    if (salesFileRefused) {
+      result.skipped += g.lines.length
+      continue
+    }
     if (g.invalid) {
       result.skipped += g.lines.length
       continue
@@ -1820,18 +1840,13 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       continue
     }
     try {
-      const fxRefusal = await checkStatedFxRate({ label: `Sales order "${importKey ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: new Date() })
-      if (fxRefusal) {
-        result.errors.push(fxRefusal)
-        result.skipped += g.lines.length
-        continue
-      }
       if (!preview) {
         const created = await createSalesOrder({
           externalOrderNumber: importKey,
           customerName: g.customerName,
           customerEmail: g.customerEmail,
           currency: g.currency,
+          expectedFxRate: salesFxRates.get(groupKey),
           shipFromWarehouseId: g.shipFromWarehouseId,
           expectedDelivery: g.expectedDelivery,
           salesRep: g.salesRep,
@@ -2053,7 +2068,28 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
       )
     : new Set<string>()
 
+  // FIRST PASS, BEFORE ANY WRITE (see the sales importer): every creatable group is rate-checked once, at the instant it will be priced (a system import: the end of its createdOn day);
+  // any failure refuses the whole file, all FX errors are reported together, nothing is written, and the checked rate is handed to createPurchaseOrder as the rate it must resolve to.
+  const poFxRates = new Map<string, { rate: number; asOf: Date | undefined }>()
+  const poFxErrors: string[] = []
   for (const [groupKey, g] of groups.entries()) {
+    if (g.invalid) continue
+    const key = g.importKey ?? (groupKey.startsWith('row-') ? undefined : groupKey)
+    if (key && existingPoRefs.has(key)) continue
+    let asOf: Date | undefined
+    try { asOf = system?.systemImportToken === SYSTEM_IMPORT && g.createdOn !== '' ? endOfBusinessDateUtc(g.createdOn) : undefined } catch { asOf = undefined }
+    const checked = await checkStatedFxRate({ label: `Purchase order "${key ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: asOf ?? new Date() })
+    if (checked.refusal) poFxErrors.push(checked.refusal)
+    else poFxRates.set(groupKey, { rate: checked.rate, asOf })
+  }
+  const poFileRefused = poFxErrors.length > 0
+  if (poFileRefused) result.errors.push(...poFxErrors, 'The file was refused as a whole because of the FX errors above: no purchase order was written.')
+
+  for (const [groupKey, g] of groups.entries()) {
+    if (poFileRefused) {
+      result.skipped += g.lines.length
+      continue
+    }
     if (g.invalid) {
       result.skipped += g.lines.length
       continue
@@ -2065,22 +2101,14 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
       continue
     }
     try {
-      // THE ORDER'S RATE IS THE TABLE RATE. A web import prices the order now (as createPurchaseOrder does); a SYSTEM import (the first load) prices it at the end of its created
-      // day. A rate the file states must equal that table rate exactly (a number read from the same decimal text is the same double), else the order is refused: a
-      // user-supplied rate is never stored. A missing table rate refuses the order (the central lookup's own message).
-      const fxAsOf = system?.systemImportToken === SYSTEM_IMPORT && g.createdOn !== '' ? endOfBusinessDateUtc(g.createdOn) : undefined
-      const fxRefusal = await checkStatedFxRate({ label: `Purchase order "${importKey ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: fxAsOf ?? new Date() })
-      if (fxRefusal) {
-        result.errors.push(fxRefusal)
-        result.skipped += g.lines.length
-        continue
-      }
+      const fxAsOf = poFxRates.get(groupKey)?.asOf
       if (!preview) {
         const created = await createPurchaseOrder({
           reference: importKey,
           supplierId: g.supplierId,
           currency: g.currency,
           fxRateAsOf: fxAsOf,
+          expectedFxRate: poFxRates.get(groupKey)?.rate,
           destinationWarehouseId: g.destinationWarehouseId,
           supplierRef: g.supplierRef,
           expectedDelivery: g.expectedDelivery,

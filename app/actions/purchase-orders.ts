@@ -323,6 +323,8 @@ export type CreatePoInput = {
    * day); every other caller gets "now". There is NO rate input: an order's rate is always the central fx_rates rate (lib/domain/purchasing/purchase-order-fx.ts).
    */
   fxRateAsOf?: Date
+  /** A GUARD, never a source: the rate a caller already checked. If the table rate resolved at write time is not exactly this, the order is refused and nothing is written. */
+  expectedFxRate?: number
   destinationWarehouseId?: string
   supplierRef?: string
   expectedDelivery?: string
@@ -1151,6 +1153,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       baseCurrency,
       asOf: system?.systemImportToken === SYSTEM_IMPORT && input.fxRateAsOf ? input.fxRateAsOf : new Date(),
     })
+    if (input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { success: false, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     let subtotalForeign = 0
@@ -1392,7 +1395,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
  * A draft edit. There is no rate input: the stored rate is kept, and re-read from fx_rates (at "now") only when the currency changes or `refreshFxRate` is true.
  * `fxRateAsOf` is not an edit field.
  */
-export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf'>> & { refreshFxRate?: boolean }
+export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf' | 'expectedFxRate'>> & { refreshFxRate?: boolean }
 
 export async function updatePurchaseOrder(
   id: string,

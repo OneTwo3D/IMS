@@ -128,3 +128,53 @@ test('CSV purchase order import carries the same codes', async () => {
   const ok = await importPurchaseOrdersCsv(form(poCsv('EUR', '')))
   assert.equal((ok as { created?: number }).created, 1)
 })
+
+// The importers' existing rule for OTHER row errors is unchanged (a valid group imports, a bad one is reported and skipped: result = created/skipped/errors). An FX error is different: it
+// refuses the WHOLE file before any write, so a retry never meets half of it already saved. [mutation: the per-group order restored (check and create group by group)]
+test('CSV import: a valid order followed by wrong-rate orders writes NOTHING, reports every FX error at once; an all-valid file writes all; the dry run refuses the same way', async () => {
+  const { importSalesOrdersCsv, importPurchaseOrdersCsv } = await import('@/app/actions/import')
+  const soRows = (rows: Array<[string, string, string]>) => `orderKey,customerName,currency,fxRateToBase,sku,qty,unitPriceForeign\r\n${rows.map(([k, c, r]) => `${k},Rate Customer,${c},${r},ORD-1,1,10`).join('\r\n')}\r\n`
+  const poRows = (rows: Array<[string, string, string]>) => `orderKey,supplierName,currency,fxRateToBase,sku,qty,unitCostForeign\r\n${rows.map(([k, c, r]) => `${k},ORD Supplier,${c},${r},ORD-1,1,2`).join('\r\n')}\r\n`
+  const t = ++seq
+  const bad = soRows([[`ATO-OK-${t}`, 'EUR', ''], [`ATO-BAD1-${t}`, 'EUR', '1.31'], [`ATO-BAD2-${t}`, 'USD', '']])
+  const before = await s.db.salesOrder.count()
+  const r = await importSalesOrdersCsv(form(bad))
+  assert.equal(await s.db.salesOrder.count(), before, 'nothing written: the valid first order is not saved')
+  const text = errorsOf(r)
+  assert.match(text, /FX_RATE_NOT_TABLE_RATE/)
+  assert.match(text, /FX_RATE_MISSING/, 'both FX errors are reported together')
+  const dry = new FormData(); dry.set('file', new File([bad], 'x.csv')); dry.set('mode', 'preview')
+  assert.match(errorsOf(await importSalesOrdersCsv(dry)), /FX_RATE_MISSING/)
+  const good = await importSalesOrdersCsv(form(soRows([[`ATO-G1-${t}`, 'EUR', ''], [`ATO-G2-${t}`, 'EUR', '1.3']])))
+  assert.equal(await s.db.salesOrder.count(), before + 2, 'an all-valid file writes all')
+  assert.equal(JSON.stringify((good as { errors?: unknown[] }).errors ?? []), '[]')
+  // the retry of the bad file after fixing it does not hit a saved duplicate
+  const fixed = await importSalesOrdersCsv(form(soRows([[`ATO-OK-${t}`, 'EUR', ''], [`ATO-BAD1-${t}`, 'EUR', ''], [`ATO-BAD2-${t}`, 'EUR', '']])))
+  assert.equal(await s.db.salesOrder.count(), before + 5)
+  assert.equal(JSON.stringify((fixed as { errors?: unknown[] }).errors ?? []), '[]')
+  // purchase orders: the same
+  const poBefore = await s.db.purchaseOrder.count()
+  const poBad = poRows([[`ATP-OK-${t}`, 'EUR', ''], [`ATP-BAD-${t}`, 'EUR', '1.31']])
+  assert.match(errorsOf(await importPurchaseOrdersCsv(form(poBad))), /FX_RATE_NOT_TABLE_RATE/)
+  assert.equal(await s.db.purchaseOrder.count(), poBefore)
+  await importPurchaseOrdersCsv(form(poRows([[`ATP-OK-${t}`, 'EUR', ''], [`ATP-G-${t}`, 'EUR', '1.3']])))
+  assert.equal(await s.db.purchaseOrder.count(), poBefore + 2)
+})
+
+// [mutation: drop the expectedFxRate comparison in createSalesOrder / createPurchaseOrder]
+test('the rate checked is the rate written: a table rate that moved after the check refuses the write', async () => {
+  const { createSalesOrder } = await import('@/app/actions/sales')
+  const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const so0 = await s.db.salesOrder.count()
+  const so = await createSalesOrder({ ...soInput('EUR'), expectedFxRate: 1.2 } as never)
+  assert.equal(so.success, false)
+  assert.match(String(so.error), /FX_RATE_CHANGED/)
+  assert.equal(await s.db.salesOrder.count(), so0)
+  const po0 = await s.db.purchaseOrder.count()
+  const po = await createPurchaseOrder({ reference: `ATO-PO-${++seq}`, supplierId, currency: 'EUR', expectedFxRate: 1.2, destinationWarehouseId: warehouseId, pricesIncludeVat: false, taxRateValue: 0, lines: [{ productId, sku: 'ORD-1', productName: 'x', qty: 1, unitCostForeign: 5 }] } as never)
+  assert.equal(po.success, false)
+  assert.match(String(po.error), /FX_RATE_CHANGED/)
+  assert.equal(await s.db.purchaseOrder.count(), po0)
+  const ok = await createSalesOrder({ ...soInput('EUR'), expectedFxRate: 1.3 } as never)
+  assert.equal(ok.success, true, ok.error)
+})
