@@ -407,8 +407,9 @@ Sales orders can be in any configured currency. The system handles the conversio
 
 When you create an order:
 
-- The current stored exchange rate for the order date is fetched from the FX rate table.
+- The current stored exchange rate is fetched from the FX rate table (Settings > Accounting > FX Rates). **There is no rate to type**: the form shows it read-only, and a rate sent any other way is ignored. A currency with no stored rate cannot be used: the order is refused with "Missing ... FX rate" and is never booked 1:1. An admin who needs a different rate pins a manual override on the FX Rates page.
 - The rate is stamped on the order as `fxRateToBase`.
+- **CSV import:** `fxRateToBase` is optional. Leave it blank. A value that is not exactly the table rate is refused for that order (`FX_RATE_NOT_TABLE_RATE`), a zero, negative or unreadable value is `FX_RATE_INVALID` (never read as 1), and a currency with no rate is `FX_RATE_MISSING`.
 - All base-currency totals on the order use this stamped rate.
 
 Even if the daily rate changes tomorrow, the order's base-currency totals don't drift. This stamping is forwarded to Xero as `CurrencyRate` so Xero uses the same rate the IMS recorded.

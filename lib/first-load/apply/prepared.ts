@@ -317,7 +317,8 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
         if (fx !== '' && fmt(new D(fx)) !== '1') problems.push(`purchase-orders ${rowLocation(row)}: a ${SUPPORTED_BASE_CURRENCY} order with an fxRateToBase other than 1`)
       } else {
         // The rate was looked up from fx_rates by the prepare step (the order's created day). Nothing here declares or compares a rate: the rail fx-rates proves, against the
-        // database, that every rate in the file is a rate fx_rates holds.
+        // database, that each rate in the file is EXACTLY the fx_rates rate at the end of the order's created day (no tolerance). No other apply input carries a rate: the opening-stock
+        // file states a base cost, and no sales order is loaded.
         const rate = parseDecimal(fx, 'fxRateToBase', NUMERIC_LIMITS.fx)
         if (!rate.ok || !rate.value.gt(new D(0))) problems.push(`purchase-orders ${rowLocation(row)}: fxRateToBase is not an acceptable positive number`)
         // The apply-time importer prices a system import at the end of this day, and the rail checks the rate against the table at that instant: a foreign order must state it.

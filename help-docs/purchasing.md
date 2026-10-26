@@ -30,7 +30,8 @@ The main purchasing page shows all purchase orders in a searchable table.
 
 - **A different rate for a deliberate reason** (a forward contract, a supplier-specific rate): an admin pins a **manual override** on Settings > Accounting > FX Rates (the pencil icon). The override is a new row in the table and is the latest rate, so every PO saved after it uses it, and the daily fetch skips that currency until the override is cleared. It applies to all POs in that currency, not to one.
 - **Existing POs keep the rate they were stored with.** A stored rate is never rewritten when the table changes.
-- **CSV import:** the `fxRateToBase` column is optional. Leave it blank; a rate that is not exactly the table rate is refused for that order, so a typo cannot misprice the cost layers.
+- **CSV import:** the `fxRateToBase` column is optional. Leave it blank; a rate that is not exactly the table rate is refused for that order (`FX_RATE_NOT_TABLE_RATE`; zero, negative or unreadable is `FX_RATE_INVALID`, no rate for the currency is `FX_RATE_MISSING`), so a typo cannot misprice the cost layers.
+- **Freight POs** take the table rate too: the rate shown on the freight form is read-only.
 
 ### Editing currency or FX rate on a DRAFT PO
 
