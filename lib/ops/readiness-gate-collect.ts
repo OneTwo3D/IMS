@@ -24,7 +24,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { lstatSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 
 import { createHash } from 'node:crypto'
@@ -132,7 +132,7 @@ async function guarded(label: string, collect: () => Promise<CheckResult> | Chec
  * schema commands (scripts/prisma-dev-db.sh refuses a DATABASE_URL that is not on this host without it); the gate never
  * sets it, so a database on another host makes the schema check fail with that script's refusal until the operator exports it.
  * NOT a connector credential, an outbound grant, SMTP, NODE_OPTIONS or PG*. */
-export const CHILD_ENV_WHITELIST = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'npm_config_cache', 'DATABASE_URL', 'PRISMA_DEV_DB_CONFIRM'] as const
+export const CHILD_ENV_WHITELIST = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'npm_config_cache', 'DATABASE_URL', 'PRISMA_DEV_DB_CONFIRM', 'IMS_SCHEDULER_CRONTAB_FILE', 'IMS_SCHEDULER_CRONTAB_FORMAT'] as const
 
 /** Fixed additions: do not source the checkout's .env over the database URL, and make no telemetry request. */
 export const CHILD_ENV_FIXED: Record<string, string> = {
@@ -160,13 +160,33 @@ function tail(text: string): string {
 /** A started `npm run` child: `spawned` settles when the process exists (or could not be started); `done` is its result. */
 export type StartedScript = { spawned: Promise<void>; done: Promise<ChildResult>; kill: () => void }
 
+/**
+ * Scripts that the container image ships PRE-BUNDLED (one self-contained file each, built by the Dockerfile's build stage into
+ * `<cwd>/dist-scripts/`). The image has no `npm`-runnable `scripts/` tree and no tsx, so where the bundle exists the child is
+ * `node <bundle> <args>`; everywhere else (the stage host, a checkout) no bundle exists and the child is `npm run <script>` exactly as before.
+ */
+const BUNDLED_SCRIPT_FILES: Readonly<Record<string, string>> = {
+  'reconcile:pack': 'reconciliation-pack.mjs',
+  'read-sync:status': 'read-sync-status.mjs',
+}
+
+export function bundledScriptPath(script: string, cwd: string, exists: (file: string) => boolean = existsSync): string | null {
+  if (!Object.prototype.hasOwnProperty.call(BUNDLED_SCRIPT_FILES, script)) return null
+  const file = path.join(cwd, 'dist-scripts', BUNDLED_SCRIPT_FILES[script])
+  return exists(file) ? file : null
+}
+
 /** `npm run [--silent] <script>` with no shell. The child leads its own process group so a timeout stops what it started. */
 export function startNpmScript(spec: ChildSpec): StartedScript {
   let kill = () => {}
   let spawned!: Promise<void>
   const done = new Promise<ChildResult>((resolve) => {
-    const args = ['run', ...(spec.silent ? ['--silent'] : []), spec.script, ...(spec.args && spec.args.length > 0 ? ['--', ...spec.args] : [])]
-    const child = spawn('npm', args, { cwd: spec.cwd, env: spec.env as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true, shell: false })
+    const bundle = bundledScriptPath(spec.script, spec.cwd)
+    const program = bundle === null ? 'npm' : process.execPath
+    const args = bundle === null
+      ? ['run', ...(spec.silent ? ['--silent'] : []), spec.script, ...(spec.args && spec.args.length > 0 ? ['--', ...spec.args] : [])]
+      : [bundle, ...(spec.args ?? [])]
+    const child = spawn(program, args, { cwd: spec.cwd, env: spec.env as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true, shell: false })
     spawned = new Promise<void>((ok, fail) => {
       child.once('spawn', () => ok())
       child.once('error', (error) => fail(error))
