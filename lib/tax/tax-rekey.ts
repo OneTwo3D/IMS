@@ -585,13 +585,12 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     result.suppliersRepointed += (await tx.supplier.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     result.mappingsRepointed += (await tx.shoppingTaxRateMapping.updateMany({ where: { taxRateId: old.id }, data: { taxRateId: fresh.id } })).count
     if (options.allowUnposted) {
-      // Refund-line snapshots on refunds not yet posted. COUNTED AGAIN here, after the deactivation (which waited for any refund transaction holding a share lock on the old row - see
+      // Refund-line snapshots on refunds not yet posted: the conflict check is made here per rate (they are MOVED by id after the loop, see below). COUNTED AGAIN here, after the deactivation (which waited for any refund transaction holding a share lock on the old row - see
       // refund-service.ts), so a snapshot a concurrent refund committed after the plan counted is migrated too (its identity is the old row's: the plan found no conflicting carrier), or the apply stops.
       const late = await pendingRefundSnapshots(tx, row.currentCode)
       if (late.lines > 0) {
         const snap = plan.references[row.imsRateId]
         if (snap !== undefined && snap.refundSnapshotConflict) throw new RekeyDocumentRaceError(row.imsRateId)
-        result.refundLinesRepointed += (await tx.salesOrderRefundLine.updateMany({ where: { accountingTaxType: row.currentCode, refund: { accountingCreditNoteId: null } }, data: { accountingTaxType: toCode } })).count
       }
       const open = await openDocumentsOf(tx, old.id)
       if (open.salesOrderIds.length > 0) result.salesLinesRepointed += (await tx.salesOrderLine.updateMany({ where: { taxRateId: old.id, orderId: { in: open.salesOrderIds } }, data: { taxRateId: fresh.id } })).count
@@ -602,6 +601,24 @@ export async function writeTaxRekey(tx: Client, plan: RekeyPlan, options: { allo
     if (cancelled.cancelledSalesOrderIds.length > 0) result.cancelledLinesRepointed += (await tx.salesOrderLine.updateMany({ where: { taxRateId: old.id, orderId: { in: cancelled.cancelledSalesOrderIds } }, data: { taxRateId: fresh.id } })).count
     if (cancelled.cancelledPurchaseOrderIds.length > 0) result.cancelledLinesRepointed += (await tx.purchaseOrderLine.updateMany({ where: { taxRateId: old.id, poId: { in: cancelled.cancelledPurchaseOrderIds } }, data: { taxRateId: fresh.id } })).count
     result.created.push({ oldId: old.id, newId: fresh.id, name: old.name, fromCode: row.currentCode, toCode })
+  }
+  // REFUND-LINE SNAPSHOTS ARE MOVED BY ID, EXACTLY ONCE. They hold a CODE, and in a swap (A: X->Y, B: Y->X) or a rotation (X->Y->Z->X) an update "by the old code's value" run one rate after the
+  // other would pick up the rows the previous update had just moved and move them again, leaving A's refund with B's identity. So (after every rate is deactivated, which waited for any refund
+  // transaction still holding a share lock) the ids of the pending snapshots are captured per ORIGINAL code in one pass with no write in between, each id is claimed by the first rate with that
+  // code, and each captured set is then updated once, to its own replacement's code. (Every other statement in this function is keyed by an id that cannot chain: suppliers, mappings and document
+  // lines by the OLD rate's id; the retired / cleared settings by old code / new id; the replacement rows are created with their final codes. Nothing else updates a code by value.)
+  if (options.allowUnposted && result.created.length > 0) {
+    const claimed = new Set<string>()
+    const captured: Array<{ ids: string[]; toCode: string | null }> = []
+    for (const c of result.created) {
+      const rows = await tx.salesOrderRefundLine.findMany({ where: { accountingTaxType: c.fromCode, refund: { accountingCreditNoteId: null } }, select: { id: true } })
+      const ids = rows.map((r) => r.id).filter((id) => !claimed.has(id))
+      for (const id of ids) claimed.add(id)
+      captured.push({ ids, toCode: c.toCode })
+    }
+    for (const { ids, toCode } of captured) {
+      if (ids.length > 0) result.refundLinesRepointed += (await tx.salesOrderRefundLine.updateMany({ where: { id: { in: ids } }, data: { accountingTaxType: toCode } })).count
+    }
   }
   if (result.created.length > 0) {
     // The enqueue guard's memory of what was retired (lib/tax/retired-tax-code-guard.ts), written in this same transaction under the same lock.

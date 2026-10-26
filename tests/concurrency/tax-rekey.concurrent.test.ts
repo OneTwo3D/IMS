@@ -98,6 +98,14 @@ async function wipeXero(d: Deps) {
 }
 
 async function precondition(d: Deps) {
+  // THE APPLY IS GLOBAL: it refuses (UNRESOLVED_RATES) while ANY active rate with a custom code has no live match, so a rate leaked by a run that was killed mid-test (kill -9, a CI timeout) would make
+  // every apply arm fail with an unrelated-looking refusal. (Measured: one leaked active "ZQRK... CY VAT" failed 8 of 17 arms.) Leftovers of THIS file's own runs are recognised by their name prefix
+  // and switched off (never deleted: documents may reference them); any other active custom-coded rate is not ours, is never touched, and fails the run loudly here instead.
+  await d.db.taxRate.updateMany({ where: { name: { startsWith: 'ZQRK' }, NOT: { name: { startsWith: TAG } }, active: true }, data: { active: false } })
+  const { XERO_BUILT_IN_TAX_TYPES } = await import('../../lib/tax/xero-built-in-tax-types.ts')
+  const foreignRates = (await d.db.taxRate.findMany({ where: { active: true, accountingTaxType: { not: null }, NOT: { name: { startsWith: TAG } } }, select: { name: true, accountingTaxType: true } }))
+    .filter((r) => !XERO_BUILT_IN_TAX_TYPES.has(r.accountingTaxType!))
+  assert.deepEqual(foreignRates, [], 'PRECONDITION: this scratch database holds active tax rates with custom codes that this test did not create (a re-key applies to every active rate, so they would change its outcome); it will not touch them. Use a database without them.')
   const foreign = {
     xeroRates: await d.db.xeroTaxRate.count({ where: { NOT: { tenantId: TENANT } } }),
     xeroLists: await d.db.xeroTaxRateList.count({ where: { NOT: { tenantId: TENANT } } }),
@@ -884,4 +892,33 @@ test('an apply with NOTHING to re-key but an unresolved rate left is refused, no
   assert.notEqual(clearing.digest, plan.digest)
   created.digests.push(clearing.digest)
   assert.equal((await d.rekey.runTaxRekey({ apply: true, confirm: clearing.digest, allowUnposted: true, clearUnresolved: true })).wrote, true)
+})
+
+// [mutation: the by-id capture replaced by sequential updates by the old code's value -> the swap and the rotation chain-move the snapshots]
+test('REFUND SNAPSHOTS in a code SWAP and a three-way ROTATION each end on their OWN replacement\'s code (moved by id, once)', { skip }, async () => {
+  const d = await loadDeps()
+  await precondition(d)
+  const { db } = d
+  await wipeOwn(d)
+  const live = (type: string, name: string) => ({ ...xero(code(type), name, '20'), reportTaxType: 'OUTPUT' })
+  // IMS (Demo numbering) -> live: A: X->Y, B: Y->X (swap); R1: P->Q, R2: Q->R, R3: R->P (rotation).
+  await seedXero(d, [live('Y', 'A VAT'), live('X', 'B VAT'), live('Q', 'R1 VAT'), live('R', 'R2 VAT'), live('P', 'R3 VAT')])
+  const order = await db.salesOrder.create({ data: { orderNumber: `RK${run}-swap`, subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10 }, select: { id: true } })
+  created.orders.push(order.id)
+  const mk = async (name: string, from: string) => {
+    const r = await db.taxRate.create({ data: { name: `${TAG}${name}`, rate: '0.2000', usedFor: 'SALES', accountingTaxType: code(from), reportingCategory: null } })
+    created.rates.push(r.id)
+    const refund = await db.salesOrderRefund.create({ data: { orderId: order.id, totalForeign: 10, totalBase: 10, lines: { create: [{ description: name, qty: 1, unitPriceBase: 10, totalBase: 10, accountingTaxType: code(from) }] } }, select: { lines: { select: { id: true } } } })
+    created.refunds.push((await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id: refund.lines[0]!.id } })).refundId)
+    return refund.lines[0]!.id
+  }
+  const lines = { A: await mk('A VAT', 'X'), B: await mk('B VAT', 'Y'), R1: await mk('R1 VAT', 'P'), R2: await mk('R2 VAT', 'Q'), R3: await mk('R3 VAT', 'R') }
+  const preview = (await d.rekey.runTaxRekey({ apply: false })).plan!
+  created.digests.push(preview.digest)
+  assert.deepEqual(preview.rows.filter((r) => r.name.startsWith(TAG)).map((r) => r.outcome), ['REKEY', 'REKEY', 'REKEY', 'REKEY', 'REKEY'])
+  const done = await d.rekey.runTaxRekey({ apply: true, confirm: preview.digest, allowUnposted: true })
+  assert.deepEqual([done.refusal, done.wrote, done.written?.refundLinesRepointed], [null, true, 5])
+  const codeOf = async (id: string) => (await db.salesOrderRefundLine.findUniqueOrThrow({ where: { id } })).accountingTaxType
+  assert.deepEqual([await codeOf(lines.A), await codeOf(lines.B)], [code('Y'), code('X')], 'swap: A\'s snapshot is A\'s replacement (live Y), B\'s is X - not chained')
+  assert.deepEqual([await codeOf(lines.R1), await codeOf(lines.R2), await codeOf(lines.R3)], [code('Q'), code('R'), code('P')], 'rotation: each on its own replacement')
 })
