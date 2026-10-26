@@ -32,6 +32,8 @@ NET="ims-smoke-net-${SUFFIX}"
 PG_NAME="ims-smoke-pg-${SUFFIX}"
 APP_NAME="ims-smoke-app-${SUFFIX}"
 CRON_NAME="ims-smoke-cron-${SUFFIX}"
+APP2_NAME="ims-smoke-app2-${SUFFIX}"
+STATE_VOLUME="ims-smoke-state-${SUFFIX}"
 CROND_DIR=""
 SMOKE_DIR=""
 BAD_DIR=""
@@ -59,7 +61,8 @@ cleanup() {
     docker logs "$APP_NAME" 2>&1 | tail -n 200 >&2 || true
     echo "::endgroup::" >&2
   fi
-  docker rm -f "$CRON_NAME" "$APP_NAME" "$PG_NAME" >/dev/null 2>&1 || true
+  docker rm -f "$CRON_NAME" "$APP2_NAME" "$APP_NAME" "$PG_NAME" >/dev/null 2>&1 || true
+  docker volume rm "$STATE_VOLUME" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   if [ -n "${CROND_DIR:-}" ]; then as_root rm -rf "$CROND_DIR" || true; fi
   if [ -n "${BAD_DIR:-}" ]; then as_root rm -rf "$BAD_DIR" || true; fi
@@ -163,6 +166,7 @@ docker run -d --name "$APP_NAME" --network "$NET" -p "127.0.0.1:${PORT}:3000" \
   -e IMS_SCHEDULER_CRONTAB_FILE \
   -e IMS_SCHEDULER_CRONTAB_FORMAT \
   -v "${CROND_DIR}:/host-cron.d:ro" \
+  -v "${STATE_VOLUME}:/var/lib/onetwoinventory" \
   "$RUNTIME_IMAGE" >/dev/null
 
 echo "==> polling http://127.0.0.1:${PORT}/login for ${TIMEOUT_S}s"
@@ -438,6 +442,30 @@ grep -q 'minute "99" is out of range' "$render_err" || fail "the renderer's refu
 sql "UPDATE settings SET value = '5 2 * * *' WHERE key = 'cron_backup_schedule'" >/dev/null
 expect_drift "after restoring the saved schedule" "Host cron is in sync*" "host cron did not return to in sync after the bad schedule was restored"
 echo "    OK: host cron drift reads in sync, out of date with an EXTRA job and with a changed schedule, and in sync again after each host re-render"
+
+# Persistent state must outlive the container. The runtime above was started on a NAMED volume (the documented deployment shape):
+# the scheduled backup is already on it, and an upload marker is written now. The container is then removed and a NEW one started
+# on the same volume; both the backup and the marker must still be there and readable by uid 1001 (the container user).
+echo "==> state survives replacing the container (named volume ${STATE_VOLUME})"
+docker exec "$APP_NAME" sh -c 'echo persisted > /var/lib/onetwoinventory/uploads/persist-marker.txt'
+docker rm -f "$CRON_NAME" "$APP_NAME" >/dev/null
+docker run -d --name "$APP2_NAME" --network "$NET" \
+  -e DATABASE_URL -e AUTH_SECRET -e AUTH_URL -e NEXT_PUBLIC_APP_URL -e CRON_SECRET -e SETTINGS_ENCRYPTION_KEY \
+  -e PRODUCER_HOLD_ENFORCED_DESTINATIONS=all \
+  -v "${STATE_VOLUME}:/var/lib/onetwoinventory" \
+  "$RUNTIME_IMAGE" >/dev/null
+replacement_ready=0
+for _ in $(seq 1 30); do
+  if docker exec "$APP2_NAME" true >/dev/null 2>&1; then replacement_ready=1; break; fi
+  sleep 1
+done
+[ "$replacement_ready" = 1 ] || fail "the replacement container did not start"
+uid="$(docker exec "$APP2_NAME" id -u)"
+[ "$uid" = 1001 ] || fail "the replacement container runs as uid ${uid}, not 1001"
+docker exec "$APP2_NAME" sh -c 'test -s "$0" && grep -q "PostgreSQL database dump" "$0"' "$dump" || fail "the backup ${dump} did not survive the container replacement (or is not readable by uid ${uid})"
+marker="$(docker exec "$APP2_NAME" cat /var/lib/onetwoinventory/uploads/persist-marker.txt)"
+[ "$marker" = persisted ] || fail "the upload marker did not survive the container replacement (read: ${marker})"
+echo "    OK: after removing the container, a new one on ${STATE_VOLUME} (uid ${uid}) still reads the backup ${dump} and the upload marker"
 
 status=0
 exit 0

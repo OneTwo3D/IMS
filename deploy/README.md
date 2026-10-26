@@ -145,7 +145,8 @@ Deploy by the full-SHA tag; the moving tags exist for convenience only.
   query-engine binary, and `pg` / `@prisma/adapter-pg` are pure JS, so nothing native is needed
   for the database. `HEALTHCHECK` is `GET /login` expecting 200 (done with `node`; there is no
   `curl`). Persistent state lives under `/var/lib/onetwoinventory/{backups,uploads,public-uploads,invoice-pdfs}`
-  (a declared `VOLUME`, pre-owned by uid 1001; the matching `*_DIR` variables default to these).
+  (a declared `VOLUME`, pre-owned by uid 1001; the matching `*_DIR` variables default to these). **A persistent mount there is
+  REQUIRED**: see "Persistent state" below.
 - **`migrate`**: the Prisma CLI (version taken from `package-lock.json`), `dotenv`, `prisma/`
   and `prisma.config.ts`, plus `openssl` for the schema engine. Its default command is
   `prisma migrate deploy`. Run it against the target database **before** starting the new
@@ -280,6 +281,41 @@ credentials (WooCommerce, Mintsoft, Xero) are normally entered in the app and st
 Postgres. A fresh install should also set `PRODUCER_HOLD_ENFORCED_DESTINATIONS=all` until the
 connectors are deliberately released (see `lib/security/producer-seam.ts`); the outbound-write
 hold already refuses every write by default.
+
+### Persistent state: a mount on `/var/lib/onetwoinventory` is REQUIRED
+
+Backups, uploads, public uploads and invoice PDFs live under `/var/lib/onetwoinventory`. The image declares it as a `VOLUME`, so a
+`docker run` without a `-v` for it gets an ANONYMOUS volume: it survives `docker stop` / `start` of that one container, but a
+replacement container (every deploy, rollback or `docker rm` + `docker run`) gets a NEW empty anonymous volume, and the old one is
+orphaned under a random name. Backups and uploads then look lost after a redeploy. So every `docker run` and compose file for the
+runtime image MUST mount that path from something that outlives the container, one of:
+
+```bash
+# A. a named volume (Docker creates it owned by the image's directory, uid:gid 1001:1001, on first use)
+docker run -d --name ims -v ims-state:/var/lib/onetwoinventory ... ghcr.io/onetwo3d/ims:<sha>
+
+# B. a host bind mount: create it first, owned by the container user (1001:1001), mode 0750
+install -d -o 1001 -g 1001 -m 0750 /srv/ims/state
+docker run -d --name ims -v /srv/ims/state:/var/lib/onetwoinventory ... ghcr.io/onetwo3d/ims:<sha>
+```
+
+```yaml
+# compose
+services:
+  ims:
+    image: ghcr.io/onetwo3d/ims:<sha>
+    volumes:
+      - ims-state:/var/lib/onetwoinventory   # or /srv/ims/state:/var/lib/onetwoinventory
+volumes:
+  ims-state:
+```
+
+Replace the container by starting the new one on the SAME volume or directory. The container cannot reliably tell a named volume from
+an anonymous one (both are plain mounts to it, and the naming Docker uses for anonymous volumes is not a contract), so there is no
+startup warning; the mount is the operator's responsibility. The container smoke test proves persistence: it takes a backup and
+writes an upload on a named volume, removes the container, starts a new one on the same volume and checks both are still there and
+readable by uid 1001. The reconciliation pack's reports (`/var/tmp/ims-reconciliation-pack-reports`) are a separate path, not
+covered by this mount.
 
 ### Smoke test
 
