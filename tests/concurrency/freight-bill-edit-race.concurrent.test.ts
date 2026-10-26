@@ -62,7 +62,7 @@ async function seedMixedFreight() {
   const goodsPo = await db.purchaseOrder.findUniqueOrThrow({ where: { reference: tag }, select: { id: true } })
   await db.purchaseOrder.update({ where: { id: goodsPo.id }, data: { status: 'PO_SENT' } })
   const freight = await createFreightPo({
-    supplierId: supplier.id, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goodsPo.id], taxRateValue: 0.2,
+    supplierId: supplier.id, currency: 'GBP', primaryPoIds: [goodsPo.id], taxRateValue: 0.2,
     costLines: [
       { description: 'Duty', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' },
       { description: 'Handling', amountForeign: 100, vatable: false, distributionMethod: 'BY_VALUE' },

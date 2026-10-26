@@ -4802,7 +4802,8 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     }
     const input = parsedInput.data
 
-    const fxRate = input.fxRateToBase
+    // the table rate (a missing rate refuses; the base currency is 1), never a typed one
+    const fxRate = await resolvePurchaseOrderFxRateToBase(db, { currency: input.currency, baseCurrency: await getBaseCurrencyCode(), asOf: new Date() })
     // The ONE row builder, shared with updateFreightPoCosts: the same input persists the same rows.
     const built = buildFreightCostLineRows(input.costLines, fxRate, input.taxRateValue ?? 0)
     // The payable TOTAL (net plus VAT), not only the sum of the lines, must not be negative.

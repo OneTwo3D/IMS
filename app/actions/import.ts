@@ -27,6 +27,7 @@ import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { endOfBusinessDateUtc } from '@/lib/currencies/fx-select'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
+import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
@@ -145,18 +146,29 @@ function normalizeTaxRateValue(value: number | null): number | undefined {
   return value > 1 ? value / 100 : value
 }
 
-function getFxRateForCurrency(lineNum: number, currency: string, baseCurrency: string, rawFxRate: string): { fxRate: number | null; error?: string } {
-  const parsed = parseOptionalNumber(rawFxRate)
-  if (currency.toUpperCase() === baseCurrency.toUpperCase()) {
-    if (parsed !== null && parsed <= 0) {
-      return { fxRate: null, error: `Row ${lineNum}: fxRateToBase must be greater than zero` }
-    }
-    return { fxRate: parsed && parsed > 0 ? parsed : 1 }
+/**
+ * A CSV's fxRateToBase is a CLAIM, never a source (owner ruling 2026-10-25, one rate: the table rate). Blank is fine. A stated value must be a number above zero (FX_RATE_INVALID: it is never
+ * read as 1), and must be EXACTLY the central fx_rates rate for the document (FX_RATE_NOT_TABLE_RATE); a currency with no rate refuses (FX_RATE_MISSING: never 1:1). The base currency is 1, so a
+ * stated base-currency rate other than 1 is FX_RATE_NOT_TABLE_RATE. Returns the refusal text, or null when the document may be created (createSalesOrder / createPurchaseOrder then store the table rate).
+ */
+async function checkStatedFxRate(args: { label: string; currency: string; baseCurrency: string; stated: string; asOf: Date }): Promise<string | null> {
+  const { label, currency, baseCurrency, stated, asOf } = args
+  if (stated !== '') {
+    const n = Number(stated)
+    if (!Number.isFinite(n) || n <= 0) return `${label}: FX_RATE_INVALID: fxRateToBase "${stated}" must be a number above zero (it is never read as 1)`
   }
-  if (parsed === null || parsed <= 0) {
-    return { fxRate: null, error: `Row ${lineNum}: fxRateToBase is required for non-base currency ${currency}` }
+  const isBase = currency.trim().toUpperCase() === baseCurrency.trim().toUpperCase()
+  let tableRate: number
+  try {
+    tableRate = await resolvePurchaseOrderFxRateToBase(db, { currency, baseCurrency, asOf })
+  } catch (error) {
+    if (isMissingFxRateError(error)) return `${label}: FX_RATE_MISSING: ${error.message}`
+    throw error
   }
-  return { fxRate: parsed }
+  if (stated !== '' && Number(stated) !== tableRate) {
+    return `${label}: FX_RATE_NOT_TABLE_RATE: the file states fxRateToBase ${stated} for ${currency}, but the fx_rates rate is ${tableRate}${isBase ? '' : ` as of ${asOf.toISOString().slice(0, 10)}`}; a document's rate is always the table rate (leave fxRateToBase blank, or pin an override on Settings, Accounting, FX Rates)`
+  }
+  return null
 }
 
 type TaxRateLookupRow = {
@@ -1661,7 +1673,8 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
     customerEmail?: string
     importKey?: string
     currency: string
-    fxRateToBase: number
+    /** What the file STATES (blank when nothing): a claim checked against fx_rates, never stored. */
+    statedFxRate: string
     notes?: string
     shipFromWarehouseId?: string
     expectedDelivery?: string
@@ -1693,12 +1706,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
     if (!product) { result.errors.push(`Row ${lineNum}: SKU "${sku}" not found`); result.skipped++; continue }
 
     const currency = readCsvValue(row, 'currency').trim() || baseCurrency
-    const fxRateResolved = getFxRateForCurrency(lineNum, currency, baseCurrency, readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate'))
-    if (!fxRateResolved.fxRate) {
-      result.errors.push(fxRateResolved.error ?? `Row ${lineNum}: invalid fxRateToBase`)
-      result.skipped++
-      continue
-    }
+    const statedFxRate = readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate').trim()
 
     const shipFromWarehouseCode = readCsvValue(row, 'shipFromWarehouseCode', 'warehouseCode', 'warehouse').trim().toUpperCase()
     const shipFromWarehouseId = shipFromWarehouseCode ? warehouseCodeToId.get(shipFromWarehouseCode) : undefined
@@ -1728,7 +1736,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       customerEmail: readCsvValue(row, 'customerEmail', 'customeremail').trim() || undefined,
       importKey: explicitKey || undefined,
       currency,
-      fxRateToBase: fxRateResolved.fxRate,
+      statedFxRate,
       notes: readCsvValue(row, 'notes').trim() || undefined,
       shipFromWarehouseId,
       expectedDelivery: readCsvValue(row, 'expectedDelivery', 'expecteddelivery').trim() || undefined,
@@ -1750,7 +1758,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       existing.customerName !== groupCandidate.customerName ||
       existing.customerEmail !== groupCandidate.customerEmail ||
       existing.currency !== groupCandidate.currency ||
-      existing.fxRateToBase !== groupCandidate.fxRateToBase ||
+      existing.statedFxRate !== groupCandidate.statedFxRate ||
       existing.notes !== groupCandidate.notes ||
       existing.shipFromWarehouseId !== groupCandidate.shipFromWarehouseId ||
       existing.expectedDelivery !== groupCandidate.expectedDelivery ||
@@ -1812,13 +1820,18 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       continue
     }
     try {
+      const fxRefusal = await checkStatedFxRate({ label: `Sales order "${importKey ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: new Date() })
+      if (fxRefusal) {
+        result.errors.push(fxRefusal)
+        result.skipped += g.lines.length
+        continue
+      }
       if (!preview) {
         const created = await createSalesOrder({
           externalOrderNumber: importKey,
           customerName: g.customerName,
           customerEmail: g.customerEmail,
           currency: g.currency,
-          fxRateToBase: g.fxRateToBase,
           shipFromWarehouseId: g.shipFromWarehouseId,
           expectedDelivery: g.expectedDelivery,
           salesRep: g.salesRep,
@@ -1937,11 +1950,6 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
     // An order's rate is ALWAYS the central fx_rates rate. The file's fxRateToBase is not a source: blank is fine, and a stated rate is checked against the
     // table rate below and the order refused when it differs. createdOn (optional) is the day a SYSTEM import (the first load) prices the order at.
     const statedFxRate = readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate').trim()
-    if (statedFxRate !== '' && !(Number.isFinite(Number(statedFxRate)) && Number(statedFxRate) > 0)) {
-      result.errors.push(`Row ${lineNum}: fxRateToBase must be greater than zero`)
-      result.skipped++
-      continue
-    }
     const createdOn = readCsvValue(row, 'createdOn', 'createdon').trim()
     if (createdOn !== '') {
       try { endOfBusinessDateUtc(createdOn) } catch {
@@ -2061,13 +2069,11 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
       // day. A rate the file states must equal that table rate exactly (a number read from the same decimal text is the same double), else the order is refused: a
       // user-supplied rate is never stored. A missing table rate refuses the order (the central lookup's own message).
       const fxAsOf = system?.systemImportToken === SYSTEM_IMPORT && g.createdOn !== '' ? endOfBusinessDateUtc(g.createdOn) : undefined
-      if (g.currency.trim().toUpperCase() !== baseCurrency.trim().toUpperCase()) {
-        const tableRate = await resolvePurchaseOrderFxRateToBase(db, { currency: g.currency, baseCurrency, asOf: fxAsOf ?? new Date() })
-        if (g.statedFxRate !== '' && Number(g.statedFxRate) !== tableRate) {
-          result.errors.push(`Purchase order "${importKey ?? groupKey}": the file states fxRateToBase ${g.statedFxRate} for ${g.currency}, but the fx_rates rate is ${tableRate}${fxAsOf ? ` as of ${fxAsOf.toISOString().slice(0, 10)}` : ''}; an order's rate is always the table rate (leave fxRateToBase blank, or pin an override on Settings, Accounting, FX Rates)`)
-          result.skipped += g.lines.length
-          continue
-        }
+      const fxRefusal = await checkStatedFxRate({ label: `Purchase order "${importKey ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: fxAsOf ?? new Date() })
+      if (fxRefusal) {
+        result.errors.push(fxRefusal)
+        result.skipped += g.lines.length
+        continue
       }
       if (!preview) {
         const created = await createPurchaseOrder({

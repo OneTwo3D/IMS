@@ -176,7 +176,7 @@ test('o3d-nrl4 PR A: no pooled client inside the revaluation transactions', { sk
     await pooled.landedCostLink.deleteMany({ where: { primaryPoId: world.goodsId } })
     resetTrap()
     const result = await createFreightPo({
-      supplierId: world.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [world.goodsId],
+      supplierId: world.supplierId, currency: 'GBP', primaryPoIds: [world.goodsId],
       costLines: [{ description: 'Freight', amountForeign: 30, vatable: false, distributionMethod: 'BY_VALUE' }],
     })
     const own = trap.hits.filter((h) => h.transaction === 1)

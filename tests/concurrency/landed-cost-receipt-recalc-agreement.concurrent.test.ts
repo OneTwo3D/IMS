@@ -185,14 +185,18 @@ test('T6: receipt floors a credit at zero: layer 0, movement value 0, no STOCK_R
 
 // ─── T11 (DB): the two freight actions persist byte-identical rows, and accept a deliberate credit ──────
 
-test('T11 (DB): createFreightPo and updateFreightPoCosts persist IDENTICAL rows and totals for the same input; {+20,-5} is accepted; a net credit is refused', SKIP, async () => {
+test('T11 (DB): createFreightPo and updateFreightPoCosts persist IDENTICAL rows and totals for the same input; {+20,-5} is accepted; a net credit is refused', SKIP, async (t) => {
   loadEnv()
   const { db } = await import('@/lib/db')
   const goods = await seedGoodsPo('t11', 4, 10)
+  // A freight order is priced at the TABLE rate (no typed rate): seed a GBP->EUR 2 row, the latest one, for this test only.
+  await db.currency.upsert({ where: { code: 'EUR' }, update: {}, create: { code: 'EUR', name: 'EUR', symbol: 'EUR' } })
+  const eurRate = await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: 2, fetchedAt: new Date(Date.now() - 1000), source: 'manual', manualOverride: true } })
+  t.after(async () => { await db.fxRate.deleteMany({ where: { id: eurRate.id } }) })
   const { createFreightPo, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
 
   const input = [{ description: 'odd fx', amountForeign: 0.1309, vatable: true, distributionMethod: 'BY_VALUE' }]
-  const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'EUR', fxRateToBase: 2, primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: input })
+  const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'EUR', primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: input })
   assert.equal(created.success, true, `PRECONDITION: createFreightPo must succeed: ${created.error}`)
   const snapshot = async (poId: string) => {
     const po = await db.purchaseOrder.findUniqueOrThrow({
@@ -220,7 +224,7 @@ test('T11 (DB): createFreightPo and updateFreightPoCosts persist IDENTICAL rows 
     { description: 'freight', amountForeign: 20, vatable: false, distributionMethod: 'BY_VALUE' },
     { description: 'discount', amountForeign: -5, vatable: false, distributionMethod: 'BY_VALUE' },
   ]
-  const second = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], costLines: mixed })
+  const second = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', primaryPoIds: [goods.poId], costLines: mixed })
   assert.equal(second.success, true, `{+20,-5} must be accepted: ${second.error}`)
   const signed = await db.freightCostLine.findMany({ where: { poId: second.po!.id }, orderBy: { sortOrder: 'asc' }, select: { amountBase: true } })
   assert.deepEqual(signed.map((row) => Number(row.amountBase)), [20, -5])
@@ -234,7 +238,7 @@ test('T11 (DB): createFreightPo and updateFreightPoCosts persist IDENTICAL rows 
   assert.match(String(refusedUpdate.error), /supplier credit note/)
   assert.equal(await snapshot(second.po!.id), before, 'a refused update changed nothing')
   const poCountBefore = await db.purchaseOrder.count({ where: { supplierId: goods.supplierId, type: 'FREIGHT' } })
-  const refusedCreate = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], costLines: [{ description: 'credit', amountForeign: -1, vatable: false, distributionMethod: 'BY_VALUE' }] })
+  const refusedCreate = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', primaryPoIds: [goods.poId], costLines: [{ description: 'credit', amountForeign: -1, vatable: false, distributionMethod: 'BY_VALUE' }] })
   assert.equal(refusedCreate.success, false)
   assert.match(String(refusedCreate.error), /supplier credit note/)
   assert.equal(await db.purchaseOrder.count({ where: { supplierId: goods.supplierId, type: 'FREIGHT' } }), poCountBefore, 'a refused create persisted no freight order')
@@ -282,13 +286,13 @@ test('VAT cannot sneak a NEGATIVE freight order total past the net rule (create 
     { description: 'credit', amountForeign: -100, vatable: true, distributionMethod: 'BY_VALUE' },
   ]
   const before = await db.purchaseOrder.count({ where: { supplierId: goods.supplierId, type: 'FREIGHT' } })
-  const refused = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: lines })
+  const refused = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: lines })
   console.log(`VAT PRECONDITION: subtotal 0, total would be -20; create outcome ${JSON.stringify(refused)}`)
   assert.equal(refused.success, false)
   assert.match(String(refused.error), /supplier credit note/)
   assert.equal(await db.purchaseOrder.count({ where: { supplierId: goods.supplierId, type: 'FREIGHT' } }), before, 'nothing was persisted')
 
-  const ok = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [lines[0]!, { ...lines[1]!, amountForeign: -50 }] })
+  const ok = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [lines[0]!, { ...lines[1]!, amountForeign: -50 }] })
   assert.equal(ok.success, true, `total 100 - 50 - 10 = 40 is accepted: ${ok.error}`)
   const total = await db.purchaseOrder.findUniqueOrThrow({ where: { id: ok.po!.id }, select: { totalForeign: true } })
   assert.equal(total.totalForeign.toString(), '40')
@@ -413,7 +417,7 @@ test('VAT: creation records the rate; an edit that sends none KEEPS it; a tax-on
   const goods = await seedGoodsPo('vat2', 4, 10)
   const { createFreightPo, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
   const { FREIGHT_TAX_RATE_UNKNOWN_MESSAGE } = await import('@/lib/domain/purchasing/freight-cost-lines')
-  const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [{ description: 'freight', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' }] })
+  const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [{ description: 'freight', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' }] })
   assert.equal(created.success, true, String(created.error))
   const poId = created.po!.id
   const header = async () => db.purchaseOrder.findUniqueOrThrow({ where: { id: poId }, select: { taxForeign: true, totalForeign: true, taxRatePercent: true } })
@@ -511,7 +515,7 @@ test('billed order: a VAT-rate change is refused and leaves the order VAT and th
   const { FREIGHT_BILLED_VAT_CHANGE_MESSAGE } = await import('@/lib/domain/purchasing/freight-cost-lines')
   const make = async (label: string) => {
     const goods = await seedGoodsPo(label, 4, 10)
-    const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [{ description: 'freight', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' }] })
+    const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [{ description: 'freight', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' }] })
     assert.equal(created.success, true, String(created.error))
     const poId = created.po!.id
     const line = await db.freightCostLine.findFirstOrThrow({ where: { poId }, select: { id: true } })

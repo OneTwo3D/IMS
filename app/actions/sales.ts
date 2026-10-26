@@ -320,7 +320,6 @@ export type CreateSoInput = {
   billingAddress?: unknown
   shippingAddress?: unknown
   currency: string
-  fxRateToBase: number
   shipFromWarehouseId?: string
   expectedDelivery?: string
   salesRep?: string
@@ -932,7 +931,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       if (existing) return { success: false, error: `Order ${externalOrderNumber} already exists` }
     }
 
-    const fxRate = input.fxRateToBase && input.fxRateToBase > 0 ? input.fxRateToBase : 1
+    // THE ORDER'S RATE IS THE TABLE RATE (owner ruling 2026-10-25, one rate). There is no typed rate: a foreign order is priced by the central lookup at the moment it is created
+    // (end-of-day rule inside getFxRateToBase), and a missing rate REFUSES the order ("Missing <base> FX rate for <cur> on or before <date>"); it is never read as 1:1. The base currency is 1.
+    const fxRate = await resolveFxRateToBase(db, input.currency, await getBaseCurrencyCode(), new Date())
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     // Storage convention:
