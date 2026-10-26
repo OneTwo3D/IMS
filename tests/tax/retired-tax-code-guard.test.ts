@@ -102,8 +102,8 @@ const PRODUCERS: Array<[string, RegExp, string]> = [
   ['lib/connectors/woocommerce/sync/order-import.ts', /shippingTaxRateId: shippingRateNow/, 'WooCommerce import: shipping code'],
   ['lib/connectors/woocommerce/sync/order-import.ts', /discountTaxRateId: defaultRateNow/, 'WooCommerce import: discount code'],
   ['lib/connectors/woocommerce/sync/order-import.ts', /currentTaxRates\(db, \[\.\.\.lineData\.map/, 'WooCommerce import: codes read from the rate rows now'],
-  ['lib/domain/purchasing/purchase-invoice-edit.ts', /taxRateId: poLine\.taxRate\?\.accountingTaxType != null/, 'purchase bill / update: PO line codes'],
-  ['lib/domain/purchasing/purchase-invoice-edit.ts', /taxRateId: costLine\.vatable \? params\.fallbackTaxRateId/, 'purchase bill / update: cost-line (freight) codes'],
+  ['lib/domain/purchasing/purchase-invoice-edit.ts', /\.\.\.optionalRateId\(poLine\.taxRate\?\.accountingTaxType != null/, 'purchase bill / update: PO line codes'],
+  ['lib/domain/purchasing/purchase-invoice-edit.ts', /\.\.\.optionalRateId\(costLine\.vatable \? params\.fallbackTaxRateId/, 'purchase bill / update: cost-line (freight) codes'],
   ['lib/domain/purchasing/supplier-credit-note.ts', /taxRateId: params\.taxRateId/, 'supplier credit note'],
   ['app/actions/purchase-orders.ts', /taxRateId: baseRate\?\.id && creditNoteTaxType === baseTaxType/, 'supplier credit note: the rate the type was read from'],
 ]

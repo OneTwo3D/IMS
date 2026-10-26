@@ -73,6 +73,9 @@ export type PurchaseInvoiceLineDraft = {
   totalBase: number
 }
 
+/** `{ taxRateId }` only when there is one (no explicit undefined key on the line). */
+const optionalRateId = (id: string | undefined): { taxRateId?: string } => (id ? { taxRateId: id } : {})
+
 export type PurchaseInvoiceAccountingLine = {
   description: string
   quantity: number
@@ -220,7 +223,7 @@ export function calculatePurchaseInvoice(params: {
         accountCode: params.transitAccount,
         taxType: productTaxType,
         // The rate that code was read from (never sent): the line's own rate, else the supplier's default; absent for a swapped reverse-charge code.
-        taxRateId: poLine.taxRate?.accountingTaxType != null && productTaxType === poLine.taxRate.accountingTaxType ? poLine.taxRate.id : (poLine.taxRate?.accountingTaxType == null && productTaxType === params.fallbackTaxType ? params.fallbackTaxRateId : undefined),
+        ...optionalRateId(poLine.taxRate?.accountingTaxType != null && productTaxType === poLine.taxRate.accountingTaxType ? poLine.taxRate.id : (poLine.taxRate?.accountingTaxType == null && productTaxType === params.fallbackTaxType ? params.fallbackTaxRateId : undefined)),
       })
       continue
     }
@@ -254,7 +257,7 @@ export function calculatePurchaseInvoice(params: {
       unitAmount: totalForeign,
       accountCode: params.transitAccount,
       taxType: costLine.vatable ? params.fallbackTaxType : undefined,
-      taxRateId: costLine.vatable ? params.fallbackTaxRateId : undefined,
+      ...optionalRateId(costLine.vatable ? params.fallbackTaxRateId : undefined),
     })
   }
 
