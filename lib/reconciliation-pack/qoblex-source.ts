@@ -67,7 +67,7 @@ export type QoblexProduct = { sku: string; type: string }
  * quantities and the unit price in the order's own currency. The report carries no currency or rate: the currency is the one IMS recorded on
  * the matched purchase order and the rate is the central fx_rates row (purchase-order-items.ts).
  */
-export type QoblexPoLine = { orderKey: string; sku: string; supplier: string; qtyOrdered: string; qtyReceived: string; unitCostForeign: string }
+export type QoblexPoLine = { orderKey: string; sku: string; supplier: string; qtyOrdered: string; qtyReceived: string; unitCostForeign: string; /** The per-line Discount (%) as a plain decimal in 0-100; blank is '0'. Judged only on a line with a quantity outstanding. */ lineDiscountPercent: string }
 /** `keyPrefix` is what the first load put in front of a Qoblex order number to make the IMS purchase-order reference (the manifest's declaration; it only maps identities and never narrows a population). */
 export type QoblexPurchaseOrders = { keyPrefix: string; lines: QoblexPoLine[] }
 export type QoblexPart<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
@@ -375,7 +375,15 @@ function purchaseOrdersOf(spec: PoSpec, files: Files): QoblexPurchaseOrders {
     const price = v.unitCostForeign ?? ''
     if (!isNonNegativeDecimal(qtyOrdered) || !isNonNegativeDecimal(qtyReceived) || !isNonNegativeDecimal(price)) return bad('BAD_VALUE')
     if (parseDecimalStrict(qtyReceived)!.gt(parseDecimalStrict(qtyOrdered)!)) return bad('BAD_VALUE')
-    return { orderKey, sku: sku.sku, supplier: v.supplierName ?? '', qtyOrdered, qtyReceived, unitCostForeign: price }
+    // The per-line discount: blank is 0; on a line with a quantity outstanding it must be a plain decimal from 0 to 100 (anything else is BAD_VALUE, the pack's
+    // counterpart of the first-load tool's BAD_DISCOUNT). A fully received line is not compared, so its discount is never judged (an unreadable one is carried as 0).
+    const rawDiscount = (v.lineDiscountPercent ?? '').trim()
+    let lineDiscountPercent = rawDiscount === '' ? '0' : rawDiscount
+    if (parseDecimalStrict(qtyReceived)!.lt(parseDecimalStrict(qtyOrdered)!)) {
+      const parsed = parseDecimalStrict(lineDiscountPercent)
+      if (parsed === null || parsed.isNegative() || parsed.gt(100)) return bad('BAD_VALUE')
+    } else if (parseDecimalStrict(lineDiscountPercent) === null) lineDiscountPercent = '0'
+    return { orderKey, sku: sku.sku, supplier: v.supplierName ?? '', qtyOrdered, qtyReceived, unitCostForeign: price, lineDiscountPercent }
   })
   const lineIds = new Set<string>()
   const orderIds = new Map<string, string>()

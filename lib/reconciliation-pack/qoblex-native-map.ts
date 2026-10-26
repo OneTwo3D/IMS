@@ -209,7 +209,9 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
  * tool takes an order's currency from its supplier and its rate from fx_rates). A test pins this text byte for byte to that file.
  *
  * EVERY TRANSFORM IN IT, and why none can change a compared value:
- *   columns orderKey/supplierName/status/sku/qtyOrdered/qtyReceived/unitCostForeign/supplierRef/createdOn/expectedDelivery  header renames only.
+ *   columns orderKey/supplierName/status/sku/qtyOrdered/qtyReceived/unitCostForeign/lineDiscountPercent/supplierRef/createdOn/expectedDelivery  header renames only.
+ *                                              (lineDiscountPercent, the per-line Discount (%), is READ but never applied: the first-load tool refuses an open line that has a
+ *                                              non-zero one, and R7 is inconclusive on such a line, so a gross price is never compared with a gross price.)
  *   constants.destinationWarehouseCode MIL1   the report has no destination column; the pack never reads the warehouse of an order.
  *   (no currency column: the report has NO currency or rate, and neither the pack nor the pinned map carries a supplier-to-currency or currency-to-rate table.
  *   The currency of an order is the one IMS RECORDED on the purchase order, and its rate is the central fx_rates row (purchase-order-items.ts).)
@@ -250,6 +252,7 @@ export const QOBLEX_NATIVE_PO_COLUMN_MAP = `{
         "qtyOrdered": "Ordered Quantity",
         "qtyReceived": "Received Quantity",
         "unitCostForeign": "Price",
+        "lineDiscountPercent": "Discount (%)",
         "supplierRef": "Supplier Reference",
         "createdOn": "Created on",
         "expectedDelivery": "Due On"

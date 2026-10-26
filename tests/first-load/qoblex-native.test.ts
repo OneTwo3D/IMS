@@ -251,7 +251,7 @@ test('open purchase orders: dates are converted, no currency or rate is read or 
     ],
   )
   assert.ok(!('currency' in mapping.columns) && !('fxRateToBase' in mapping.columns) && Object.keys(mapping.derived).length === 0 && !('currency' in mapping.valueMaps) && !('fxRateToBase' in mapping.valueMaps), 'the map carries no currency or rate')
-  assert.deepEqual(result.unmappedHeaders, ['Product variant', 'Received on', 'Discount (%)'], 'unread columns (a discount among them) stay visible')
+  assert.deepEqual(result.unmappedHeaders, ['Product variant', 'Received on'], 'unread columns stay visible (the discount is now read)')
   // A status that is not in the closed list and a bad date are each refused on their row (one edit per case).
   const original = readFileSync(path.join(NATIVE, 'incoming-stock.csv'), 'utf8')
   const edits: Array<[string, string, string, RegExp]> = [

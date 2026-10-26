@@ -26,6 +26,7 @@
         "qtyOrdered": "Ordered Quantity",
         "qtyReceived": "Received Quantity",
         "unitCostForeign": "Price",
+        "lineDiscountPercent": "Discount (%)",
         "supplierRef": "Supplier Reference",
         "createdOn": "Created on",
         "expectedDelivery": "Due On"

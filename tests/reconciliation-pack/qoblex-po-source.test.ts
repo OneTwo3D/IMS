@@ -158,3 +158,17 @@ test('a Closed line of the Incoming report is dropped (R7 and R8 read open order
   const onlyClosed = read(withPo(incomingCsv([closed])))
   assert.ok(onlyClosed.ok && onlyClosed.value.purchaseOrders.ok && onlyClosed.value.purchaseOrders.value.lines.length === 0)
 })
+
+// [mutation: the discount column dropped from the pinned map / a bad discount on an open line accepted / one on a received line judged / blank not 0]
+test('the per-line discount is read through the pinned map: 0 and blank read as 0, 15 is carried; on an open line a non-number, a negative or a value above 100 is BAD_VALUE; a received line is not judged', () => {
+  const lines = (rows: Parameters<typeof incomingCsv>[0]) => {
+    const r = read(writeExport(bases, { purchaseOrders: { csv: incomingCsv(rows) } }))
+    assert.ok(r.ok && r.value.purchaseOrders.ok, JSON.stringify(r))
+    return r.value.purchaseOrders.ok ? r.value.purchaseOrders.value.lines.map((l) => l.lineDiscountPercent) : []
+  }
+  const base = { po: 'PO1', ordered: '10', received: '4', price: '2.5' }
+  assert.deepEqual(lines([{ ...base, sku: 'SKU-1', discount: '15' }, { ...base, sku: 'SKU-2', discount: '0' }, { ...base, sku: 'SKU-3', discount: '' }]), ['15', '0', '0'])
+  for (const bad of ['abc', '120', '-1', '100.5']) assert.equal(poReason(withPo(incomingCsv([{ ...base, sku: 'SKU-1', discount: bad }]))), 'BAD_VALUE', bad)
+  assert.equal(poReason(withPo(incomingCsv([{ ...base, sku: 'SKU-1', discount: '100' }]))), 'ok', '100 is in range')
+  assert.equal(poReason(withPo(incomingCsv([{ ...base, received: '10', sku: 'SKU-1', discount: 'abc' }]))), 'ok', 'a fully received line is not judged')
+})

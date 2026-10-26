@@ -279,11 +279,11 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
   'purchase-order-lines': {
     columns: [
       'orderKey', 'supplierName', 'status', 'createdOn', 'destinationWarehouseCode', 'sku', 'lineNo', 'qtyOrdered', 'qtyReceived',
-      'unitCostForeign', 'taxRateName', 'taxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'notes',
+      'unitCostForeign', 'lineDiscountPercent', 'taxRateName', 'taxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'notes',
     ],
     required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign'],
     sources: ['qoblex'],
-    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file). The file carries NO currency and NO rate: an order\'s currency is the currency of its supplier in the same run\'s suppliers dataset, and a foreign order\'s rate is read from the ims-fx-rates list at the end of the `createdOn` day.',
+    purpose: 'Purchase order lines with ordered and received quantity. Reduced to the OUTSTANDING quantity (the purchase-orders import file). The file carries NO currency and NO rate: an order\'s currency is the currency of its supplier in the same run\'s suppliers dataset, and a foreign order\'s rate is read from the ims-fx-rates list at the end of the `createdOn` day. The optional `lineDiscountPercent` (the export\'s per-line Discount (%)) is never applied: an OPEN line with a non-zero discount is refused (PO_LINE_DISCOUNT_NOT_SUPPORTED), because the price would otherwise load as the gross price.',
   },
   transfers: {
     columns: ['transferKey', 'status', 'fromWarehouseCode', 'toWarehouseCode', 'sku', 'qtyShipped', 'qtyReceived', 'dispatchDate', 'notes'],

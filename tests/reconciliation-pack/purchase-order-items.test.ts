@@ -455,6 +455,18 @@ test('ORDER-LEVEL DISCOUNT: an in-scope order with a non-zero order discount mak
   assert.equal((await run('R7', [po('PO1', [line('A', '10', '4', '2')], { discount: '0.000000' })], lines)).item.outcome, 'pass')
 })
 
+// [mutation: the open-line discount check removed / applied to a fully received line / applied to R8 / a blank discount treated as non-zero]
+test('LINE DISCOUNT: an open Qoblex line with a non-zero Discount (%) makes R7 inconclusive (a gross price is never compared with a gross price); a fully received discounted line, a blank or 0 discount and R8 are unaffected', async () => {
+  const mine = [po('PO1', [line('A', '10', '4', '2')])]
+  const open15 = [poLine('PO1', 'A', '10', '4', '2', { lineDiscountPercent: '15' })]
+  const r7 = await run('R7', mine, open15)
+  assert.deepEqual([r7.item.outcome, r7.item.reasons], ['inconclusive', ['VALUE_SHAPE_MISMATCH']])
+  assert.equal((await run('R8', mine, open15)).item.outcome, 'pass', 'R8 compares quantities only')
+  const receivedOnly = [poLine('PO1', 'A', '10', '4', '2'), poLine('PO1', 'B', '5', '5', '9', { lineDiscountPercent: '15' })]
+  assert.equal((await run('R7', mine, receivedOnly)).item.outcome, 'pass', 'a fully received discounted line is not compared')
+  for (const zero of ['0', '', '0.00']) assert.equal((await run('R7', mine, [poLine('PO1', 'A', '10', '4', '2', { lineDiscountPercent: zero })])).item.outcome, 'pass', JSON.stringify(zero))
+})
+
 // [mutation: the empty proof granted when only first-load orders are counted]
 test('THE EMPTY PROOF NEEDS NO INCOMING GOODS ORDER AT ALL: a verified first load with no incoming first-load order, a NATIVE incoming order and an empty report is EMPTY_UNPROVEN (never a pass); with no incoming order at all it passes on the named proof', async () => {
   const native = po('PN', [line('B', '5', '0', '1')])
