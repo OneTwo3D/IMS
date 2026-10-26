@@ -1,5 +1,6 @@
 'use server'
 
+import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -128,7 +129,9 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
     }
 
     await ensureOrganisationExists()
-    await db.organisation.updateMany({ data: updateData })
+    // A change of the BASE currency is a write the rate table depends on: it takes the same exclusive lock as the rate writers (a CSV import holds the table still).
+    if (updateData.baseCurrency) await withFxTableWriteLock((tx) => tx.organisation.updateMany({ data: updateData }))
+    else await db.organisation.updateMany({ data: updateData })
     if (updateData.baseCurrency) {
       await db.setting.upsert({
         where: { key: 'base_currency_locked' },

@@ -1,5 +1,6 @@
 'use server'
 
+import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -162,13 +163,13 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
     }
     if (rate === null) return null
 
-    await db.fxRate.create({
+    await withFxTableWriteLock((tx) => tx.fxRate.create({
       data: {
         fromCurrency: baseCurrency,
         toCurrency: code,
         rate,
       },
-    })
+    }))
     return rate
   } catch {
     return null
@@ -227,7 +228,7 @@ export async function setManualFxRate(toCurrency: string, rate: number): Promise
   const baseCurrency = await getBaseCurrencyCode()
   if (code === baseCurrency) return { success: false, error: 'Cannot override the base currency' }
 
-  await db.fxRate.create({
+  await withFxTableWriteLock((tx) => tx.fxRate.create({
     data: {
       fromCurrency: baseCurrency,
       toCurrency: code,
@@ -235,7 +236,7 @@ export async function setManualFxRate(toCurrency: string, rate: number): Promise
       source: 'manual',
       manualOverride: true,
     },
-  })
+  }))
   await logActivity({
     entityType: 'SETTING',
     tag: 'settings',
@@ -272,9 +273,9 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
   if (typeof fresh !== 'number' || fresh <= 0) {
     return { success: false, error: `frankfurter.dev did not return a rate for ${code}` }
   }
-  await db.fxRate.create({
+  await withFxTableWriteLock((tx) => tx.fxRate.create({
     data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false },
-  })
+  }))
   await logActivity({
     entityType: 'SETTING',
     tag: 'settings',

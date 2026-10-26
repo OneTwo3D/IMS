@@ -135,6 +135,8 @@ function heldPinnedLock(
   label: string,
   params: string,
   args: number[],
+  /** The SQL function that releases this lock: `pg_advisory_unlock` for an exclusive session lock, `pg_advisory_unlock_shared` for a shared one. */
+  unlockFunction = 'pg_advisory_unlock',
 ): PinnedAdvisoryLock {
   const { client } = connection
   return {
@@ -159,7 +161,7 @@ function heldPinnedLock(
       }
       try {
         const released = await client.query<{ unlocked: boolean }>(
-          `SELECT pg_advisory_unlock(${params}) AS unlocked`,
+          `SELECT ${unlockFunction}(${params}) AS unlocked`,
           args,
         )
         if (!released.rows[0]?.unlocked) {
@@ -280,4 +282,28 @@ export async function acquirePinnedAdvisoryLockWaiting(
     throw error
   }
   return heldPinnedLock(connection, label, params, args)
+}
+
+/**
+ * Take `key` in SHARED mode, on a pinned connection, waiting for any exclusive holder up to `timeoutMs` (`pg_advisory_lock_shared`). Any number of shared holders coexist; an exclusive
+ * request (`pg_advisory_xact_lock(key)` in a writer's transaction) waits for all of them to release. Release in a finally. Used by the CSV importers to hold the exchange-rate table still
+ * from their first rate check to their last write (lib/currencies/fx-table-lock.ts).
+ */
+export async function acquirePinnedSharedAdvisoryLockWaiting(key: number, options: { timeoutMs: number; namespace?: number }): Promise<PinnedAdvisoryLock> {
+  const { label, args, params } = advisoryLockCall(key, options.namespace)
+  const timeoutMs = Math.max(1, Math.trunc(options.timeoutMs))
+  const connection = await openPinnedConnection(`${label} (shared)`)
+  try {
+    await connection.client.query(`SET lock_timeout = ${timeoutMs}`)
+    await connection.client.query(`SELECT pg_advisory_lock_shared(${params})`, args)
+    await connection.client.query('RESET lock_timeout')
+  } catch (error) {
+    connection.detach()
+    connection.client.release(true)
+    if ((error as { code?: string } | null)?.code === LOCK_NOT_AVAILABLE) {
+      throw new AdvisoryLockWaitTimeoutError(`Timed out after ${timeoutMs}ms waiting for advisory lock ${label} (shared).`)
+    }
+    throw error
+  }
+  return heldPinnedLock(connection, label, params, args, 'pg_advisory_unlock_shared')
 }

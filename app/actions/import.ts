@@ -27,6 +27,8 @@ import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { endOfBusinessDateUtc } from '@/lib/currencies/fx-select'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
+import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { FxTableBusyError, FxTableLockLostError, withFxTableHeldStill, type FxTableGuard } from '@/lib/currencies/fx-table-lock'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
@@ -145,18 +147,29 @@ function normalizeTaxRateValue(value: number | null): number | undefined {
   return value > 1 ? value / 100 : value
 }
 
-function getFxRateForCurrency(lineNum: number, currency: string, baseCurrency: string, rawFxRate: string): { fxRate: number | null; error?: string } {
-  const parsed = parseOptionalNumber(rawFxRate)
-  if (currency.toUpperCase() === baseCurrency.toUpperCase()) {
-    if (parsed !== null && parsed <= 0) {
-      return { fxRate: null, error: `Row ${lineNum}: fxRateToBase must be greater than zero` }
-    }
-    return { fxRate: parsed && parsed > 0 ? parsed : 1 }
+/**
+ * A CSV's fxRateToBase is a CLAIM, never a source (owner ruling 2026-10-25, one rate: the table rate). Blank is fine. A stated value must be a number above zero (FX_RATE_INVALID: it is never
+ * read as 1), and must be EXACTLY the central fx_rates rate for the document (FX_RATE_NOT_TABLE_RATE); a currency with no rate refuses (FX_RATE_MISSING: never 1:1). The base currency is 1, so a
+ * stated base-currency rate other than 1 is FX_RATE_NOT_TABLE_RATE. Returns the refusal text, or null when the document may be created (createSalesOrder / createPurchaseOrder then store the table rate).
+ */
+async function checkStatedFxRate(args: { label: string; currency: string; baseCurrency: string; stated: string; asOf: Date }): Promise<{ refusal: string | null; rate: number }> {
+  const { label, currency, baseCurrency, stated, asOf } = args
+  if (stated !== '') {
+    const n = Number(stated)
+    if (!Number.isFinite(n) || n <= 0) return { rate: 0, refusal: `${label}: FX_RATE_INVALID: fxRateToBase "${stated}" must be a number above zero (it is never read as 1)` }
   }
-  if (parsed === null || parsed <= 0) {
-    return { fxRate: null, error: `Row ${lineNum}: fxRateToBase is required for non-base currency ${currency}` }
+  const isBase = currency.trim().toUpperCase() === baseCurrency.trim().toUpperCase()
+  let tableRate: number
+  try {
+    tableRate = await resolvePurchaseOrderFxRateToBase(db, { currency, baseCurrency, asOf })
+  } catch (error) {
+    if (isMissingFxRateError(error)) return { rate: 0, refusal: `${label}: FX_RATE_MISSING: ${error.message}` }
+    throw error
   }
-  return { fxRate: parsed }
+  if (stated !== '' && Number(stated) !== tableRate) {
+    return { rate: tableRate, refusal: `${label}: FX_RATE_NOT_TABLE_RATE: the file states fxRateToBase ${stated} for ${currency}, but the fx_rates rate is ${tableRate}${isBase ? '' : ` as of ${asOf.toISOString().slice(0, 10)}`}; a document's rate is always the table rate (leave fxRateToBase blank, or pin an override on Settings, Accounting, FX Rates)` }
+  }
+  return { refusal: null, rate: tableRate }
 }
 
 type TaxRateLookupRow = {
@@ -192,6 +205,18 @@ function resolveImportedTaxRateId(
 // ---------------------------------------------------------------------------
 
 const VALID_TYPES = new Set<string>(['SIMPLE', 'VARIABLE', 'VARIANT', 'KIT', 'BOM', 'NON_INVENTORY'])
+
+/**
+ * THE FX TABLE LOCK WAS LOST MID-FILE. The importers write each order on its own connection, so a dead lock connection (PostgreSQL then frees the shared lock) does not stop them by itself.
+ * They check the lock immediately before every write and after the last. Lost before the first write: nothing is written. Lost later: the orders already saved cannot be safely unwound (a
+ * purchase order has no delete, only a cancel that keeps its reference; a sales order's delete is refused once accounting has touched it), so the importer stops, writes no more, and reports
+ * precisely which orders were saved and how many groups were not written, under the code FX_TABLE_LOCK_LOST. Re-importing the same file skips the saved orders as duplicates.
+ */
+function fxLockLostMessage(kind: string, saved: string[], notWritten: number): string {
+  if (saved.length === 0) return `FX_TABLE_LOCK_LOST: the exchange-rate table was no longer held still before the first write; the file was refused as a whole and no ${kind} was written.`
+  return `FX_TABLE_LOCK_LOST: the exchange-rate table stopped being held still after ${saved.length} ${kind}(s) were saved (${saved.join(', ')}); ${notWritten} further group(s) were NOT written. `
+    + 'Those saved were created under the rate checked at the start and are valid; re-import the file to add the rest (saved ones are skipped as duplicates).'
+}
 
 async function runWithConcurrency<T>(
   items: T[],
@@ -1580,28 +1605,44 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
       result.skipped += g.lines.length
       continue
     }
+    let transferSaved = false
     try {
       if (!preview) {
         const created = await createTransfer(g.fromId, g.toId, g.lines, g.notes || undefined, g.importKey)
         if (!created.success || !created.transfer) {
           throw new Error(created.message || 'Failed to create transfer')
         }
+        // COMMITTED from here: a later status step that fails leaves a saved transfer, which a retry skips as a duplicate. It is counted as created and the step that did not happen is named.
+        transferSaved = true
+        const label = g.importKey ?? created.transfer.id
         if (g.status === 'IN_TRANSIT' || g.status === 'RECEIVED') {
           const dispatched = await dispatchTransfer(created.transfer.id)
           if (!dispatched.success) {
-            throw new Error(dispatched.message || 'Failed to dispatch transfer')
+            result.errors.push(`Transfer "${label}" (id ${created.transfer.id}) WAS CREATED but was NOT dispatched: ${dispatched.message || 'Failed to dispatch transfer'}`)
+            result.created += g.lines.length
+            if (g.importKey) existingTransferRefs.add(g.importKey)
+            continue
           }
         }
         if (g.status === 'RECEIVED') {
           const received = await receiveTransfer(created.transfer.id)
           if (!received.success) {
-            throw new Error(received.message || 'Failed to receive transfer')
+            result.errors.push(`Transfer "${label}" (id ${created.transfer.id}) WAS CREATED and dispatched but was NOT received: ${received.message || 'Failed to receive transfer'}`)
+            result.created += g.lines.length
+            if (g.importKey) existingTransferRefs.add(g.importKey)
+            continue
           }
         }
       }
       result.created += g.lines.length
       if (g.importKey) existingTransferRefs.add(g.importKey)
     } catch (e: unknown) {
+      if (transferSaved) {
+        result.created += g.lines.length
+        if (g.importKey) existingTransferRefs.add(g.importKey)
+        result.errors.push(`Transfer "${g.importKey ?? '?'}" WAS CREATED, but a later step failed: ${String(e)}`)
+        continue
+      }
       result.errors.push(String(e))
       result.skipped += g.lines.length
     }
@@ -1625,6 +1666,23 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
 // ---------------------------------------------------------------------------
 
 export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImportActionResult> {
+  await requirePermission('sales.create')
+  // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
+  // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
+  try {
+    return await withFxTableHeldStill((guard) => importSalesOrdersCsvLocked(formData, guard))
+  } catch (error) {
+    if (error instanceof FxTableBusyError) {
+      const result = { created: 0, updated: 0, skipped: 0, errors: [error.message] }
+      return isCsvImportDryRunMode(getCsvImportMode(formData))
+        ? buildImportPreviewResult(0, result, 0, error.message)
+        : createCsvImportExecutionResult({ ...result, error: error.message, success: false })
+    }
+    throw error
+  }
+}
+
+async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGuard): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'sales.create')
@@ -1661,7 +1719,8 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
     customerEmail?: string
     importKey?: string
     currency: string
-    fxRateToBase: number
+    /** What the file STATES (blank when nothing): a claim checked against fx_rates, never stored. */
+    statedFxRate: string
     notes?: string
     shipFromWarehouseId?: string
     expectedDelivery?: string
@@ -1693,12 +1752,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
     if (!product) { result.errors.push(`Row ${lineNum}: SKU "${sku}" not found`); result.skipped++; continue }
 
     const currency = readCsvValue(row, 'currency').trim() || baseCurrency
-    const fxRateResolved = getFxRateForCurrency(lineNum, currency, baseCurrency, readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate'))
-    if (!fxRateResolved.fxRate) {
-      result.errors.push(fxRateResolved.error ?? `Row ${lineNum}: invalid fxRateToBase`)
-      result.skipped++
-      continue
-    }
+    const statedFxRate = readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate').trim()
 
     const shipFromWarehouseCode = readCsvValue(row, 'shipFromWarehouseCode', 'warehouseCode', 'warehouse').trim().toUpperCase()
     const shipFromWarehouseId = shipFromWarehouseCode ? warehouseCodeToId.get(shipFromWarehouseCode) : undefined
@@ -1728,7 +1782,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       customerEmail: readCsvValue(row, 'customerEmail', 'customeremail').trim() || undefined,
       importKey: explicitKey || undefined,
       currency,
-      fxRateToBase: fxRateResolved.fxRate,
+      statedFxRate,
       notes: readCsvValue(row, 'notes').trim() || undefined,
       shipFromWarehouseId,
       expectedDelivery: readCsvValue(row, 'expectedDelivery', 'expecteddelivery').trim() || undefined,
@@ -1750,7 +1804,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       existing.customerName !== groupCandidate.customerName ||
       existing.customerEmail !== groupCandidate.customerEmail ||
       existing.currency !== groupCandidate.currency ||
-      existing.fxRateToBase !== groupCandidate.fxRateToBase ||
+      existing.statedFxRate !== groupCandidate.statedFxRate ||
       existing.notes !== groupCandidate.notes ||
       existing.shipFromWarehouseId !== groupCandidate.shipFromWarehouseId ||
       existing.expectedDelivery !== groupCandidate.expectedDelivery ||
@@ -1800,7 +1854,30 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       )
     : new Set<string>()
 
+  // FIRST PASS, BEFORE ANY WRITE: every group that would be created is rate-checked here, once. If ANY fails, the WHOLE file is refused, nothing is written (dry run and apply alike) and
+  // every FX error is reported together, so a retry never meets half the file already saved. The rate checked here is handed to createSalesOrder, which refuses (writes nothing) if the table
+  // rate it resolves at write time is not this one. (Other row errors keep the importer's existing rule: valid groups import, bad ones are reported and skipped.)
+  const salesFxRates = new Map<string, number>()
+  const salesFxErrors: string[] = []
   for (const [groupKey, g] of groups.entries()) {
+    if (g.invalid) continue
+    const key = g.importKey ?? (groupKey.startsWith('row-') ? undefined : groupKey)
+    if (key && existingSalesOrderKeys.has(key)) continue
+    const checked = await checkStatedFxRate({ label: `Sales order "${key ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: new Date() })
+    if (checked.refusal) salesFxErrors.push(checked.refusal)
+    else salesFxRates.set(groupKey, checked.rate)
+  }
+  const salesFileRefused = salesFxErrors.length > 0
+  if (salesFileRefused) result.errors.push(...salesFxErrors, 'The file was refused as a whole because of the FX errors above: no sales order was written.')
+
+  const savedSalesOrders: string[] = []
+  let salesLockLost = false
+  const salesGroups = [...groups.entries()]
+  for (const [groupIndex, [groupKey, g]] of salesGroups.entries()) {
+    if (salesFileRefused) {
+      result.skipped += g.lines.length
+      continue
+    }
     if (g.invalid) {
       result.skipped += g.lines.length
       continue
@@ -1811,14 +1888,17 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       result.skipped += g.lines.length
       continue
     }
+    let currentSaved = false
     try {
       if (!preview) {
+        // The lock is checked IMMEDIATELY before every write (a dead lock connection frees the lock; the writes below use other connections).
+        fxGuard.assertHeld('writing a sales order')
         const created = await createSalesOrder({
           externalOrderNumber: importKey,
           customerName: g.customerName,
           customerEmail: g.customerEmail,
           currency: g.currency,
-          fxRateToBase: g.fxRateToBase,
+          expectedFxRate: salesFxRates.get(groupKey),
           shipFromWarehouseId: g.shipFromWarehouseId,
           expectedDelivery: g.expectedDelivery,
           salesRep: g.salesRep,
@@ -1835,13 +1915,45 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
         if (!created.success || !created.order) {
           throw new Error(created.error || 'Failed to create sales order')
         }
-        await autoAllocateOrder(created.order.id)
+        // From here the order is COMMITTED: it is counted, its id is listed, and nothing below may turn it into a skipped group (a retry would then skip it as a duplicate with no record of it).
+        savedSalesOrders.push(importKey ?? created.order.id)
+        currentSaved = true
+        const warnings = [...(created.postCommitWarnings ?? [])]
+        try {
+          await autoAllocateOrder(created.order.id)
+        } catch (allocationError) {
+          warnings.push(`stock was NOT allocated to the order (${String(allocationError)})`)
+        }
+        if (warnings.length > 0) result.errors.push(`Sales order "${importKey ?? created.order.id}" (id ${created.order.id}) WAS CREATED, but: ${warnings.join('; ')}`)
       }
       result.created += g.lines.length
       if (importKey) existingSalesOrderKeys.add(importKey)
     } catch (e: unknown) {
+      if (!preview && (e instanceof FxTableLockLostError || fxGuard.lost)) {
+        // A guard failure after the lock died is the lock's fault, not the group's: stop, write nothing more, report exactly what was saved.
+        salesLockLost = true
+        const firstUnwritten = groupIndex + (currentSaved ? 1 : 0)
+        if (currentSaved) result.created += g.lines.length
+        result.errors.push(fxLockLostMessage('sales order', savedSalesOrders, salesGroups.length - firstUnwritten))
+        for (const [, rest] of salesGroups.slice(firstUnwritten)) result.skipped += rest.lines.length
+        break
+      }
+      if (currentSaved) {
+        // committed before the failure: still created, never skipped
+        result.created += g.lines.length
+        if (importKey) existingSalesOrderKeys.add(importKey)
+        result.errors.push(`Sales order "${importKey ?? '?'}" WAS CREATED, but a later step failed: ${String(e)}`)
+        continue
+      }
       result.errors.push(String(e))
       result.skipped += g.lines.length
+    }
+  }
+  if (!preview && !salesLockLost && !salesFileRefused) {
+    // and once more after the last write: a lock lost during the final order is reported, never silently accepted.
+    try { fxGuard.assertHeld('finishing the sales order import') } catch (e) {
+      if (!(e instanceof FxTableLockLostError)) throw e
+      result.errors.push(fxLockLostMessage('sales order', savedSalesOrders, 0))
     }
   }
 
@@ -1863,6 +1975,23 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
 // ---------------------------------------------------------------------------
 
 export async function importPurchaseOrdersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
+  // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
+  // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
+  try {
+    return await withFxTableHeldStill((guard) => importPurchaseOrdersCsvLocked(formData, guard, system))
+  } catch (error) {
+    if (error instanceof FxTableBusyError) {
+      const result = { created: 0, updated: 0, skipped: 0, errors: [error.message] }
+      return isCsvImportDryRunMode(getCsvImportMode(formData))
+        ? buildImportPreviewResult(0, result, 0, error.message)
+        : createCsvImportExecutionResult({ ...result, error: error.message, success: false })
+    }
+    throw error
+  }
+}
+
+async function importPurchaseOrdersCsvLocked(formData: FormData, fxGuard: FxTableGuard, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'purchasing.create', system)
@@ -1937,11 +2066,6 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
     // An order's rate is ALWAYS the central fx_rates rate. The file's fxRateToBase is not a source: blank is fine, and a stated rate is checked against the
     // table rate below and the order refused when it differs. createdOn (optional) is the day a SYSTEM import (the first load) prices the order at.
     const statedFxRate = readCsvValue(row, 'fxRateToBase', 'fxRate', 'fxrate').trim()
-    if (statedFxRate !== '' && !(Number.isFinite(Number(statedFxRate)) && Number(statedFxRate) > 0)) {
-      result.errors.push(`Row ${lineNum}: fxRateToBase must be greater than zero`)
-      result.skipped++
-      continue
-    }
     const createdOn = readCsvValue(row, 'createdOn', 'createdon').trim()
     if (createdOn !== '') {
       try { endOfBusinessDateUtc(createdOn) } catch {
@@ -2045,7 +2169,31 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
       )
     : new Set<string>()
 
+  // FIRST PASS, BEFORE ANY WRITE (see the sales importer): every creatable group is rate-checked once, at the instant it will be priced (a system import: the end of its createdOn day);
+  // any failure refuses the whole file, all FX errors are reported together, nothing is written, and the checked rate is handed to createPurchaseOrder as the rate it must resolve to.
+  const poFxRates = new Map<string, { rate: number; asOf: Date | undefined }>()
+  const poFxErrors: string[] = []
   for (const [groupKey, g] of groups.entries()) {
+    if (g.invalid) continue
+    const key = g.importKey ?? (groupKey.startsWith('row-') ? undefined : groupKey)
+    if (key && existingPoRefs.has(key)) continue
+    let asOf: Date | undefined
+    try { asOf = system?.systemImportToken === SYSTEM_IMPORT && g.createdOn !== '' ? endOfBusinessDateUtc(g.createdOn) : undefined } catch { asOf = undefined }
+    const checked = await checkStatedFxRate({ label: `Purchase order "${key ?? groupKey}"`, currency: g.currency, baseCurrency, stated: g.statedFxRate, asOf: asOf ?? new Date() })
+    if (checked.refusal) poFxErrors.push(checked.refusal)
+    else poFxRates.set(groupKey, { rate: checked.rate, asOf })
+  }
+  const poFileRefused = poFxErrors.length > 0
+  if (poFileRefused) result.errors.push(...poFxErrors, 'The file was refused as a whole because of the FX errors above: no purchase order was written.')
+
+  const savedPurchaseOrders: string[] = []
+  let poLockLost = false
+  const poGroups = [...groups.entries()]
+  for (const [groupIndex, [groupKey, g]] of poGroups.entries()) {
+    if (poFileRefused) {
+      result.skipped += g.lines.length
+      continue
+    }
     if (g.invalid) {
       result.skipped += g.lines.length
       continue
@@ -2057,24 +2205,16 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
       continue
     }
     try {
-      // THE ORDER'S RATE IS THE TABLE RATE. A web import prices the order now (as createPurchaseOrder does); a SYSTEM import (the first load) prices it at the end of its created
-      // day. A rate the file states must equal that table rate exactly (a number read from the same decimal text is the same double), else the order is refused: a
-      // user-supplied rate is never stored. A missing table rate refuses the order (the central lookup's own message).
-      const fxAsOf = system?.systemImportToken === SYSTEM_IMPORT && g.createdOn !== '' ? endOfBusinessDateUtc(g.createdOn) : undefined
-      if (g.currency.trim().toUpperCase() !== baseCurrency.trim().toUpperCase()) {
-        const tableRate = await resolvePurchaseOrderFxRateToBase(db, { currency: g.currency, baseCurrency, asOf: fxAsOf ?? new Date() })
-        if (g.statedFxRate !== '' && Number(g.statedFxRate) !== tableRate) {
-          result.errors.push(`Purchase order "${importKey ?? groupKey}": the file states fxRateToBase ${g.statedFxRate} for ${g.currency}, but the fx_rates rate is ${tableRate}${fxAsOf ? ` as of ${fxAsOf.toISOString().slice(0, 10)}` : ''}; an order's rate is always the table rate (leave fxRateToBase blank, or pin an override on Settings, Accounting, FX Rates)`)
-          result.skipped += g.lines.length
-          continue
-        }
-      }
+      const fxAsOf = poFxRates.get(groupKey)?.asOf
       if (!preview) {
+        // The lock is checked IMMEDIATELY before every write (a dead lock connection frees the lock; the writes below use other connections).
+        fxGuard.assertHeld('writing a purchase order')
         const created = await createPurchaseOrder({
           reference: importKey,
           supplierId: g.supplierId,
           currency: g.currency,
           fxRateAsOf: fxAsOf,
+          expectedFxRate: poFxRates.get(groupKey)?.rate,
           destinationWarehouseId: g.destinationWarehouseId,
           supplierRef: g.supplierRef,
           expectedDelivery: g.expectedDelivery,
@@ -2091,13 +2231,32 @@ export async function importPurchaseOrdersCsv(formData: FormData, system?: Syste
         if (!created.success || !created.po) {
           throw new Error(created.error || 'Failed to create purchase order')
         }
+        // From here the order is COMMITTED: counted, its id listed, reported with any post-commit warning; never a skipped group (a retry would skip it as a duplicate with no record of it).
         createdPurchaseOrderIds.push(created.po.id)
+        savedPurchaseOrders.push(importKey ?? created.po.id)
+        if (created.postCommitWarnings && created.postCommitWarnings.length > 0) {
+          result.errors.push(`Purchase order "${importKey ?? created.po.id}" (id ${created.po.id}) WAS CREATED, but: ${created.postCommitWarnings.join('; ')}`)
+        }
       }
       result.created += g.lines.length
       if (importKey) existingPoRefs.add(importKey)
     } catch (e: unknown) {
+      if (!preview && (e instanceof FxTableLockLostError || fxGuard.lost)) {
+        // A guard failure after the lock died is the lock's fault, not the group's: stop, write nothing more, report exactly what was saved.
+        poLockLost = true
+        result.errors.push(fxLockLostMessage('purchase order', savedPurchaseOrders, poGroups.length - groupIndex))
+        for (const [, rest] of poGroups.slice(groupIndex)) result.skipped += rest.lines.length
+        break
+      }
       result.errors.push(String(e))
       result.skipped += g.lines.length
+    }
+  }
+  if (!preview && !poLockLost && !poFileRefused) {
+    // and once more after the last write: a lock lost during the final order is reported, never silently accepted.
+    try { fxGuard.assertHeld('finishing the purchase order import') } catch (e) {
+      if (!(e instanceof FxTableLockLostError)) throw e
+      result.errors.push(fxLockLostMessage('purchase order', savedPurchaseOrders, 0))
     }
   }
 

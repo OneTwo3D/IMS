@@ -324,6 +324,8 @@ export type CreatePoInput = {
    * day); every other caller gets "now". There is NO rate input: an order's rate is always the central fx_rates rate (lib/domain/purchasing/purchase-order-fx.ts).
    */
   fxRateAsOf?: Date
+  /** A GUARD, never a source: the rate a caller already checked. If the table rate resolved at write time is not exactly this, the order is refused and nothing is written. */
+  expectedFxRate?: number
   destinationWarehouseId?: string
   supplierRef?: string
   expectedDelivery?: string
@@ -1132,7 +1134,14 @@ async function resolvePurchaseLineTaxRates(
   })
 }
 
-export async function createPurchaseOrder(input: CreatePoInput, system?: SystemImportContext): Promise<{ success: boolean; po?: PoRow; error?: string }> {
+/**
+ * `success: true` + `po` means the purchase order is COMMITTED. The work after the commit (supplier last-price rows, cache refresh) can fail without un-creating it; each failure is named in
+ * `postCommitWarnings` (the order is still reported with its id) and no caller may treat a warning as a failed create. The supplier-price upsert is idempotent: it is redone by the next PO for
+ * the same supplier and product. Callers MUST surface the warnings.
+ */
+export type CreatePurchaseOrderResult = { success: boolean; po?: PoRow; error?: string; postCommitWarnings?: string[] }
+
+export async function createPurchaseOrder(input: CreatePoInput, system?: SystemImportContext): Promise<CreatePurchaseOrderResult> {
   try {
     // A system-actor context (the first-load apply runner) replaces the session check; anything that is not the real
     // capability takes the permission check, so a forged argument fails closed.
@@ -1157,6 +1166,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       baseCurrency,
       asOf: system?.systemImportToken === SYSTEM_IMPORT && input.fxRateAsOf ? input.fxRateAsOf : new Date(),
     })
+    if (input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { success: false, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     let subtotalForeign = 0
@@ -1353,8 +1363,10 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
     })
     })
 
+    const postCommitWarnings: string[] = []
     // Update SupplierProduct last prices (in supplier's currency, net of VAT)
     for (const ld of lineData) {
+      try {
       await db.supplierProduct.upsert({
         where: { supplierId_productId: { supplierId: input.supplierId, productId: ld.productId } },
         create: {
@@ -1369,9 +1381,12 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
           currency: input.currency,
         },
       })
+      } catch (priceError) {
+        postCommitWarnings.push(`supplier last price NOT updated for product ${ld.productId} (${String(priceError)})`)
+      }
     }
 
-    if (system?.systemImportToken !== SYSTEM_IMPORT) revalidatePath('/purchase-orders')
+    if (system?.systemImportToken !== SYSTEM_IMPORT) { try { revalidatePath('/purchase-orders') } catch { /* cache refresh only */ } }
     const mapped = mapPoRow(po)
     await logActivity(withSystemActor({
       entityType: 'PURCHASE_ORDER',
@@ -1383,7 +1398,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       metadata: { reference: mapped.reference, supplierId: input.supplierId, currency: input.currency, lineCount: input.lines.length },
     }, system))
 
-    return { success: true, po: mapped }
+    return postCommitWarnings.length > 0 ? { success: true, po: mapped, postCommitWarnings } : { success: true, po: mapped }
   } catch (e) {
     await logActivity(withSystemActor({
       entityType: 'PURCHASE_ORDER',
@@ -1402,7 +1417,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
  * A draft edit. There is no rate input: the stored rate is kept, and re-read from fx_rates (at "now") only when the currency changes or `refreshFxRate` is true.
  * `fxRateAsOf` is not an edit field.
  */
-export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf'>> & { refreshFxRate?: boolean }
+export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf' | 'expectedFxRate'>> & { refreshFxRate?: boolean }
 
 export async function updatePurchaseOrder(
   id: string,
@@ -4822,7 +4837,8 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     }
     const input = parsedInput.data
 
-    const fxRate = input.fxRateToBase
+    // the table rate (a missing rate refuses; the base currency is 1), never a typed one
+    const fxRate = await resolvePurchaseOrderFxRateToBase(db, { currency: input.currency, baseCurrency: await getBaseCurrencyCode(), asOf: new Date() })
     // The ONE row builder, shared with updateFreightPoCosts: the same input persists the same rows.
     const built = buildFreightCostLineRows(input.costLines, fxRate, input.taxRateValue ?? 0)
     // The payable TOTAL (net plus VAT), not only the sum of the lines, must not be negative.

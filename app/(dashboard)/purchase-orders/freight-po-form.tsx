@@ -103,7 +103,6 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
       const result = await createFreightPo({
         supplierId,
         currency,
-        fxRateToBase: fxRate,
         primaryPoIds: selectedPoIds,
         supplierRef: supplierRef || undefined,
         notes: notes || undefined,
@@ -166,9 +165,11 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
                   <div className="flex-1 relative">
                     <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 {baseCurrency.code} =</span>
                     <Input
-                      type="number" min="0.0001" step="0.0001"
+                      type="number"
                       value={fxRate}
-                      onChange={(e) => setFxRate(Number(e.target.value) || 1)}
+                      readOnly
+                      aria-label="Exchange rate (from the FX Rates table)"
+                      title="Set by the FX Rates table (Settings, Accounting). It cannot be typed here."
                       className="pl-16 h-9 font-mono text-sm"
                       disabled={currency === baseCurrency.code}
                     />

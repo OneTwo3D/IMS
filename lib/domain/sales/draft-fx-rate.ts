@@ -7,7 +7,7 @@ import { getFxRateToBase } from '@/lib/currencies/fx-lookup'
  *
  * The base currency itself is 1. Every other currency reads the one central lookup (lib/currencies/fx-lookup.ts); a
  * missing rate THROWS ("Missing <base> FX rate for <cur> on or before <date>"), as it always did.
- * TODO(o3d-q0x56.5): manual sales orders take a user-typed rate; decide there whether this refresh may keep a booked rate.
+ * A manual sales order is created at this same lookup (createSalesOrder): no order takes a typed rate.
  */
 export async function resolveFxRateToBase(
   tx: Pick<Prisma.TransactionClient, 'fxRate'>,

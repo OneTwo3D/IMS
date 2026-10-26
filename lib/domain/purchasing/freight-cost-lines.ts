@@ -93,7 +93,7 @@ export function assertFreightTotalNotNegative(built: Pick<FreightCostLineRows, '
 export const CreateFreightPoInputSchema = z.object({
   supplierId: z.string().min(1, 'Select a supplier'),
   currency: z.string().min(1, 'Currency is required'),
-  fxRateToBase: finiteNumber('Exchange rate').gt(0, 'Exchange rate must be greater than zero'),
+  // NO typed rate: a freight order is priced by the central fx_rates lookup when it is created (createFreightPo), like every purchase order. A stray fxRateToBase in the input is stripped.
   // costLines before primaryPoIds: the first issue is what the caller reports, and "add a cost line" has
   // always been reported before "link a primary PO".
   costLines: FreightCostLinesSchema.min(1, 'Add at least one cost line'),

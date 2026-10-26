@@ -488,7 +488,6 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         shippingAddress: shippingAddrObj ?? undefined,
         customerEmail: customerEmail || undefined,
         currency,
-        fxRateToBase: fxRate,
         shipFromWarehouseId: warehouseId || undefined,
         expectedDelivery: expectedDelivery || undefined,
         salesRep: salesRep || undefined,
@@ -519,6 +518,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         }),
       })
       if (result.success && result.order) {
+        if (result.postCommitWarnings?.length) window.alert(`The order was created, but: ${result.postCommitWarnings.join('; ')}`)
         router.refresh()
         onClose()
         router.push(`/sales/${result.order.id}`)
@@ -565,14 +565,14 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                 )}
               </div>
               <div className="space-y-1.5">
-                <Label>Currency{currency !== baseCurrency.code ? ' / FX Rate' : ''}</Label>
+                <Label>Currency{currency !== baseCurrency.code ? ' / FX Rate (table rate)' : ''}</Label>
                 <div className="flex gap-2">
                   <select value={currency} onChange={(e) => setCurrencyAndRate(e.target.value)} className={`${currency === baseCurrency.code ? 'w-full' : 'w-28'} h-9 rounded-md border border-input bg-background px-3 text-sm font-mono`}>
                     <option value={baseCurrency.code}>{baseCurrency.code} {baseCurrency.symbol}</option>
                     {currencies.filter((c) => c.code !== baseCurrency.code).map((c) => (<option key={c.code} value={c.code}>{c.code} {c.symbol}</option>))}
                   </select>
                   {currency !== baseCurrency.code && (
-                    <Input type="number" min="0.0001" step="0.0001" value={fxRate} onChange={(e) => setFxRate(Number(e.target.value) || 1)} className="flex-1 min-w-0 h-9 font-mono text-sm" />
+                    <Input type="number" value={fxRate} readOnly aria-label="Exchange rate (from the FX Rates table)" title="Set by the FX Rates table (Settings, Accounting). It cannot be typed here." className="flex-1 min-w-0 h-9 font-mono text-sm" />
                   )}
                 </div>
               </div>

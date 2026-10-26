@@ -1,4 +1,5 @@
 import { revalidatePath } from 'next/cache'
+import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -98,17 +99,20 @@ export async function fetchAllFxRatesInternal(): Promise<{
     const updated: string[] = []
     const failed: string[] = []
 
-    for (const code of codes) {
-      const rate = rates[code]
-      if (typeof rate === 'number' && rate > 0) {
-        await db.fxRate.create({
-          data: { fromCurrency: baseCurrency, toCurrency: code, rate, source: 'frankfurter' },
-        })
-        updated.push(code)
-      } else {
-        failed.push(code)
+    // The exclusive side of the rate table's stability lock: a running CSV import holds the table still (shared) and this write waits for it to finish.
+    await withFxTableWriteLock(async (tx) => {
+      for (const code of codes) {
+        const rate = rates[code]
+        if (typeof rate === 'number' && rate > 0) {
+          await tx.fxRate.create({
+            data: { fromCurrency: baseCurrency, toCurrency: code, rate, source: 'frankfurter' },
+          })
+          updated.push(code)
+        } else {
+          failed.push(code)
+        }
       }
-    }
+    })
 
     await recordFxFetchAttempt({
       status: failed.length ? 'partial' : 'success',

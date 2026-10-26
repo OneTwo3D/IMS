@@ -321,7 +321,8 @@ export type CreateSoInput = {
   billingAddress?: unknown
   shippingAddress?: unknown
   currency: string
-  fxRateToBase: number
+  /** A GUARD, never a source: the rate a caller already checked. If the table rate resolved at write time is not exactly this, the order is refused and nothing is written. */
+  expectedFxRate?: number
   shipFromWarehouseId?: string
   expectedDelivery?: string
   salesRep?: string
@@ -915,7 +916,13 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
 // Mutations
 // ---------------------------------------------------------------------------
 
-export async function createSalesOrder(input: CreateSoInput): Promise<{ success: boolean; order?: SoRow; error?: string }> {
+/**
+ * `success: true` + `order` means the order is COMMITTED. Work that runs after the commit (stock allocation, the accounting queue, bookkeeping) can fail without un-creating it; each such failure
+ * is named in `postCommitWarnings` (the order is still reported with its id) and no caller may treat a warning as a failed create. Callers MUST surface the warnings.
+ */
+export type CreateSalesOrderResult = { success: boolean; order?: SoRow; error?: string; postCommitWarnings?: string[] }
+
+export async function createSalesOrder(input: CreateSoInput): Promise<CreateSalesOrderResult> {
   try {
     await requirePermission('sales.create')
     if (!input.lines.length) return { success: false, error: 'Add at least one line item' }
@@ -933,7 +940,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       if (existing) return { success: false, error: `Order ${externalOrderNumber} already exists` }
     }
 
-    const fxRate = input.fxRateToBase && input.fxRateToBase > 0 ? input.fxRateToBase : 1
+    // THE ORDER'S RATE IS THE TABLE RATE (owner ruling 2026-10-25, one rate). There is no typed rate: a foreign order is priced by the central lookup at the moment it is created
+    // (end-of-day rule inside getFxRateToBase), and a missing rate REFUSES the order ("Missing <base> FX rate for <cur> on or before <date>"); it is never read as 1:1. The base currency is 1.
+    const fxRate = await resolveFxRateToBase(db, input.currency, await getBaseCurrencyCode(), new Date())
+    if (input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { success: false, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     // Storage convention:
@@ -1228,6 +1238,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       })
     }, STOCK_TX_OPTIONS)
 
+    const postCommitWarnings: string[] = []
     for (const warning of taxValidation.warnings ?? []) {
       await logActivity({
         entityType: 'SALES_ORDER',
@@ -1249,8 +1260,12 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     // allocation happens when the draft is finalised so the draft can still
     // be freely edited without holding stock.
     if (!input.isDraft) {
-      const { autoAllocateOrder } = await import('./allocation')
-      await autoAllocateOrder(so.id)
+      try {
+        const { autoAllocateOrder } = await import('./allocation')
+        await autoAllocateOrder(so.id)
+      } catch (allocationError) {
+        postCommitWarnings.push(`stock was NOT allocated to the order (${String(allocationError)})`)
+      }
     }
 
     // Queue accounting sales invoice (DRAFT — manual orders have no payment yet).
@@ -1260,6 +1275,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       try {
         await queueSalesInvoiceForOrder(so.id)
       } catch (accountingError) {
+        postCommitWarnings.push('the accounting sales invoice was NOT queued')
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: so.id,
@@ -1295,7 +1311,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       })
     }
 
-    revalidatePath('/sales')
+    try { revalidatePath('/sales') } catch { /* cache refresh only */ }
     const mapped = mapSoRow(so)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -1306,7 +1322,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       description: `Created sales order ${mapped.displayOrderNumber}`,
       metadata: { orderNumber: mapped.displayOrderNumber, totalBase: mapped.totalBase, currency: mapped.currency },
     })
-    return { success: true, order: mapped }
+    return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -3262,6 +3278,10 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     if (!so) return { success: false, error: 'Order not found' }
 
     const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+    // A CLONE IS A NEW DOCUMENT: its rate is the table rate NOW (as createSalesOrder), never the source order's (which may be a legacy typed or 1:1 rate), and every base amount is
+    // recomputed from the foreign amounts at that rate with the same rounding the draft re-pricing uses (nothing is copied from the source's base fields). A currency with no rate
+    // refuses (the central lookup's "Missing <base> FX rate ..."); the base currency is 1.
+    const fxRate = await resolveFxRateToBase(db, so.currency, await getBaseCurrencyCode(), new Date())
     const clone = await db.$transaction(async (tx) => {
     // A cloned line's rate that a tax re-key retired follows its replacement; a plainly inactive one is refused (lib/tax/writable-tax-rate.ts).
     const cloneRates = await resolveWritableTaxRateIds(tx, so.lines.map((l) => l.taxRateId))
@@ -3270,7 +3290,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         orderNumber: ref,
         status: 'DRAFT',
         currency: so.currency,
-        fxRateToBase: so.fxRateToBase,
+        fxRateToBase: fxRate,
         customerId: so.customerId,
         customerName: so.customerName,
         customerEmail: so.customerEmail,
@@ -3281,10 +3301,10 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         shippingForeign: so.shippingForeign,
         taxForeign: so.taxForeign,
         totalForeign: so.totalForeign,
-        subtotalBase: so.subtotalBase,
-        shippingBase: so.shippingBase,
-        taxBase: so.taxBase,
-        totalBase: so.totalBase,
+        subtotalBase: divideRoundedNumber(so.subtotalForeign, fxRate, 4),
+        shippingBase: divideRoundedNumber(so.shippingForeign, fxRate, 4),
+        taxBase: divideRoundedNumber(so.taxForeign, fxRate, 4),
+        totalBase: divideRoundedNumber(so.totalForeign, fxRate, 4),
         shipFromWarehouseId: so.shipFromWarehouseId,
         salesRep: so.salesRep,
         discountStr: so.discountStr,
@@ -3300,14 +3320,14 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
             description: l.description,
             qty: l.qty,
             unitPriceForeign: l.unitPriceForeign,
-            unitPriceBase: l.unitPriceBase,
+            unitPriceBase: divideRoundedNumber(l.unitPriceForeign, fxRate, 6),
             discountStr: l.discountStr,
             discountAmount: l.discountAmount,
             taxRateId: l.taxRateId ? (cloneRates.get(l.taxRateId) ?? l.taxRateId) : l.taxRateId,
             taxForeign: l.taxForeign,
-            taxBase: l.taxBase,
+            taxBase: divideRoundedNumber(l.taxForeign, fxRate, 4),
             totalForeign: l.totalForeign,
-            totalBase: l.totalBase,
+            totalBase: divideRoundedNumber(l.totalForeign, fxRate, 4),
           })),
         },
       },

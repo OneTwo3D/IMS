@@ -78,15 +78,27 @@ test('decimals: unit costs beyond 15 significant digits (a double would round th
   assert.deepEqual(rejectedCodes(result, 'purchase-order-lines'), ['BAD_UNIT_COST'])
 })
 
-test('currency: fxRateToBase is required for a non-base currency on lots; for the base it must be 1 or blank (a purchase order has no file rate: see po-currency-from-supplier.test.ts)', (t) => {
-  const stock = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'stock-lots': ds('stock-lots', [lot('A', '1', '2', extra)]) })
-  precondition(t, 'cases', 4)
-  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR' }), 'stock-lots'), ['BAD_FX'])
+test('currency: a foreign lot takes the TABLE rate at its received day; a stated file rate must equal it; the base currency is 1 or blank (a purchase order has no file rate: see po-currency-from-supplier.test.ts)', (t) => {
+  const rates = ds('ims-fx-rates', [{ currency: 'EUR', rate: '1.25', fetchedAt: '2026-03-01T06:00:00Z' }, { currency: 'EUR', rate: '1.5', fetchedAt: '2026-05-01T06:00:00Z' }])
+  const stock = (extra: Record<string, string>, list: ReturnType<typeof ds> | null = rates) => runBare({ products: ds('products', [product('A')]), ...(list ? { 'ims-fx-rates': list } : {}), 'stock-lots': ds('stock-lots', [lot('A', '1', '2', extra)]) })
+  precondition(t, 'cases', 9)
+  // [mutation: take the file rate, default 1, or skip the equality check]
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', receivedDate: '2026-04-04' }, null), 'stock-lots'), ['FX_RATES_NOT_SUPPLIED'])
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR' }), 'stock-lots'), ['MISSING_RECEIVED_DATE'])
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', receivedDate: '2026-04-31' }), 'stock-lots'), ['BAD_DATE'])
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', receivedDate: '2026-02-01' }), 'stock-lots'), ['FX_RATE_MISSING'])
   assert.deepEqual(rejectedCodes(stock({ currency: 'GBP', fxRateToBase: '2' }), 'stock-lots'), ['BAD_FX'])
-  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', fxRateToBase: '0' }), 'stock-lots'), ['BAD_FX'])
-  const ok = stock({ currency: 'EUR', fxRateToBase: '1.25' })
-  assert.equal(ok.blocking, false)
-  assert.equal(rowsOf(ok, 'opening-stock')[0].unitCostBase, '1.600000', 'the rate is foreign units per ONE base unit, as in the purchase-order importer: base cost = cost / rate')
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', fxRateToBase: '0', receivedDate: '2026-04-04' }), 'stock-lots'), ['BAD_FX'])
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', fxRateToBase: '1.26', receivedDate: '2026-04-04' }), 'stock-lots'), ['FX_RATE_NOT_TABLE_RATE'], '1.26 is within 1% of the table rate and is still refused')
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', fxRateToBase: '1.5', receivedDate: '2026-04-04' }), 'stock-lots'), ['FX_RATE_NOT_TABLE_RATE'], 'a rate that is a table row, but not the one at that day')
+  const blank = stock({ currency: 'EUR', receivedDate: '2026-04-04' })
+  const exact = stock({ currency: 'EUR', fxRateToBase: '1.25', receivedDate: '2026-04-04' })
+  const later = stock({ currency: 'EUR', receivedDate: '2026-05-02' })
+  assert.equal(blank.blocking, false)
+  assert.equal(exact.blocking, false)
+  assert.equal(rowsOf(blank, 'opening-stock')[0].unitCostBase, '1.600000', 'the rate is foreign units per ONE base unit, as in the purchase-order importer: base cost = cost / rate')
+  assert.equal(rowsOf(exact, 'opening-stock')[0].unitCostBase, '1.600000')
+  assert.equal(rowsOf(later, 'opening-stock')[0].unitCostBase, '1.333333', 'a later received day reads the later table row (1.5)')
 })
 
 test('variants: a VARIANT needs a VARIABLE parent that is itself loaded; parentSku on anything else is refused', (t) => {
@@ -331,7 +343,7 @@ test('a CR or CRLF inside a quoted value is written as LF, which is exactly what
 test('stock ranges: a collapsed quantity, a converted cost and an in-transit addition that the target columns cannot hold are rejected, not emitted', (t) => {
   const products = ds('products', [product('A'), product('B'), product('C')])
   const sumOver = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '60000000', '1', { lotRef: 'L1' }), lot('A', '60000000', '1', { lotRef: 'L2' })]) })
-  const fxOver = run({ products, 'stock-lots': ds('stock-lots', [lot('B', '1', '900000000', { currency: 'EUR', fxRateToBase: '0.5' })]) })
+  const fxOver = runBare({ products, 'ims-fx-rates': ds('ims-fx-rates', [{ currency: 'EUR', rate: '0.5', fetchedAt: '2026-01-01T00:00:00Z' }]), 'stock-lots': ds('stock-lots', [lot('B', '1', '900000000', { currency: 'EUR', receivedDate: '2026-02-01' })]) })
   const inTransitOver = run({
     products,
     'stock-lots': ds('stock-lots', [lot('C', '99999999', '1')]),
@@ -396,7 +408,7 @@ test('FX direction: the purchase-order importer DIVIDES by fxRateToBase, so the 
   precondition(t, 'rates compared', 2)
   assert.equal(high.blocking, false, 'foreign 2e13 / 1000 = 2e10 base fits (a multiply would give 2e16 and reject)')
   assert.deepEqual(rejectedCodes(low, 'purchase-order-lines'), ['ORDER_VALUE_OUT_OF_RANGE'])
-  const base = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '1', '3', { currency: 'EUR', fxRateToBase: '2' })]) })
+  const base = runBare({ products, 'ims-fx-rates': ds('ims-fx-rates', [{ currency: 'EUR', rate: '2', fetchedAt: '2026-01-01T00:00:00Z' }]), 'stock-lots': ds('stock-lots', [lot('A', '1', '3', { currency: 'EUR', receivedDate: '2026-02-01' })]) })
   assert.equal(rowsOf(base, 'opening-stock')[0].unitCostBase, '1.500000')
 })
 

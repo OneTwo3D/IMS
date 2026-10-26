@@ -1059,8 +1059,37 @@ function loadStock(run: Run): void {
     }
     const currency = parseCurrency(v.currency)
     if (!currency) { reject('BAD_CURRENCY', `currency ${JSON.stringify(v.currency)} is not a 3-letter code`); continue }
-    const fx = resolveFx(currency, run.config.baseCurrency, v.fxRateToBase)
-    if (!fx.ok) { reject('BAD_FX', fx.reason); continue }
+    // A FOREIGN LOT'S RATE IS THE TABLE RATE at the end of its received day (owner ruling 2026-10-25, one rate), read from the ims-fx-rates list by the central rule. A rate the file states is a
+    // claim: it must equal that table rate exactly (FX_RATE_NOT_TABLE_RATE); blank is fine. No received date, no list, or no rate for the day refuses the lot; a rate is never taken from the file alone
+    // and never defaulted. The base currency keeps 1 (blank or 1 in the file).
+    let fx: { ok: true; fx: Dec; text: string } | { ok: false; reason: string }
+    if (currency === run.config.baseCurrency) {
+      fx = resolveFx(currency, run.config.baseCurrency, v.fxRateToBase)
+      if (!fx.ok) { reject('BAD_FX', fx.reason); continue }
+    } else {
+      const day = v.receivedDate.trim()
+      if (day === '') { reject('MISSING_RECEIVED_DATE', `the lot is in ${currency}: its receivedDate (YYYY-MM-DD) is required, because its rate is the fx_rates rate at the end of that day`); continue }
+      const dayMs = parseIsoDate(day)
+      if (dayMs === null) { reject('BAD_DATE', `receivedDate ${JSON.stringify(v.receivedDate)} is not YYYY-MM-DD`); continue }
+      if (!run.has('ims-fx-rates')) { reject('FX_RATES_NOT_SUPPLIED', `the lot is in ${currency} and no ims-fx-rates list was supplied; a rate is only ever read from fx_rates, never from a file or defaulted`); continue }
+      let found: Dec
+      try {
+        found = new D(selectFxRateFromRows(run.imsFxRates, { baseCurrency: run.config.baseCurrency, currency, asOf: endOfBusinessDateUtc(new Date(dayMs)) }).rate.toFixed())
+      } catch (error) {
+        if (!isMissingFxRateError(error)) throw error
+        reject(error.reason === 'no_rate' ? 'FX_RATE_MISSING' : 'FX_RATE_UNUSABLE', `${error.message} (lot received ${day})`)
+        continue
+      }
+      const parsedTable = parseDecimal(found.toFixed(), 'fxRateToBase', NUMERIC_LIMITS.fx)
+      if (!parsedTable.ok) { reject('FX_RATE_UNUSABLE', `the stored ${currency} rate cannot be used: ${parsedTable.reason}`); continue }
+      if (v.fxRateToBase.trim() !== '') {
+        const stated = parseDecimal(v.fxRateToBase, 'fxRateToBase', NUMERIC_LIMITS.fx)
+        if (!stated.ok) { reject('BAD_FX', stated.reason); continue }
+        if (stated.value.lte(0)) { reject('BAD_FX', `fxRateToBase ${v.fxRateToBase.trim()} must be greater than zero`); continue }
+        if (!stated.value.eq(parsedTable.value)) { reject('FX_RATE_NOT_TABLE_RATE', `the file states fxRateToBase ${v.fxRateToBase.trim()} for ${currency}, but the fx_rates rate at the end of ${day} is ${fmt(parsedTable.value)}; a rate is always the table rate (leave it blank)`); continue }
+      }
+      fx = { ok: true, fx: parsedTable.value, text: fmt(parsedTable.value) }
+    }
     if (v.unitCost === '') { reject('MISSING_UNIT_COST', 'a lot with stock on hand has no unit cost'); continue }
     const cost = parseDecimal(v.unitCost, 'unitCost', NUMERIC_LIMITS.lotUnitCost)
     if (!cost.ok) { reject('BAD_UNIT_COST', cost.reason); continue }

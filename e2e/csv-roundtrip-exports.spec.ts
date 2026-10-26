@@ -220,7 +220,7 @@ test.describe.serial('CSV round-trip exports', () => {
     await page.goto('/sales')
     await uploadCsvAndWaitForResult(page, [
       'orderKey,customerName,currency,fxRateToBase,sku,qty,unitPriceForeign,pricesIncludeVat,notes',
-      `${salesOrderKey},Roundtrip Customer,EUR,1.20,${product.sku},1,24.00,false,${salesNote}`,
+      `${salesOrderKey},Roundtrip Customer,EUR,,${product.sku},1,24.00,false,${salesNote}`,
     ].join('\n'))
     await expect.poll(() => tryRunFixture(['inspect-sales-import', salesNote]), { timeout: 20000 }).toContain('"currency":"EUR"')
 

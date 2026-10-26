@@ -66,14 +66,13 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidate
 const baseCreate = {
   supplierId: 's1',
   currency: 'GBP',
-  fxRateToBase: 1,
   primaryPoIds: ['po-1'],
   costLines: [GOOD],
 }
 
 // ─── Schema ──────────────────────────────────────────────────────────────────────────────────────────────
 
-test('T11 schema: finite signed numbers, the four methods, fx above zero — and the net-subtotal rule', () => {
+test('T11 schema: finite signed numbers, the four methods — and the net-subtotal rule', () => {
   const bad: Array<[string, unknown]> = [
     ['NaN amount', [line({ amountForeign: Number.NaN })]],
     ['Infinity amount', [line({ amountForeign: Number.POSITIVE_INFINITY })]],
@@ -103,9 +102,6 @@ test('T11 schema: finite signed numbers, the four methods, fx above zero — and
   for (const [label, lines] of accepted) assert.equal(FreightCostLinesSchema.safeParse(lines).success, true, `${label} must be accepted`)
   console.log(`T11 PRECONDITION: rejected ${rejected} malformed/net-negative shapes, accepted ${accepted.length} deliberate shapes`)
 
-  for (const fx of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-    assert.equal(CreateFreightPoInputSchema.safeParse({ ...baseCreate, fxRateToBase: fx }).success, false, `fx ${fx}`)
-  }
   assert.equal(CreateFreightPoInputSchema.safeParse({ ...baseCreate, taxRateValue: -0.2 }).success, false)
   assert.equal(CreateFreightPoInputSchema.safeParse({ ...baseCreate, costLines: [] }).success, false)
   assert.equal(CreateFreightPoInputSchema.safeParse({ ...baseCreate, primaryPoIds: [] }).success, false)
@@ -178,14 +174,8 @@ test('T11 actions: both actions refuse the same bad input BEFORE touching the da
     assert.deepEqual(touches, [], `update ${label}: the database was reached`)
     update += 1
   }
-  // fx at the action boundary (create only: update reads the stored rate).
-  for (const fx of [0, -2, Number.NaN]) {
-    touches.length = 0
-    const created = await createFreightPo({ ...baseCreate, fxRateToBase: fx })
-    assert.equal(created.success, false, `create fx ${fx}`)
-    assert.deepEqual(touches, [])
-  }
-  console.log(`T11 PRECONDITION: rejected before any database touch: create x${create + 3}, update x${update}`)
+  // There is no typed exchange rate to validate any more: createFreightPo prices the order at the central fx_rates rate (see the census below).
+  console.log(`T11 PRECONDITION: rejected before any database touch: create x${create}, update x${update}`)
   // The net-negative message is the operator's reason.
   const net = await updateFreightPoCosts('freight-1', [line({ amountForeign: -3 })])
   assert.equal(net.error, FREIGHT_NET_CREDIT_MESSAGE)
@@ -342,4 +332,15 @@ test('edit plan: on an order with ANY billed line a VAT-rate or vatable-flag cha
   assert.equal(plan(unbilled, [submit('a', 30), submit('b', 20, { vatable: true })], false).kind, 'apply')
   // An unchanged save of a fully billed order is still fine.
   assert.equal(plan(allBilled, unchangedLines, false).kind, 'noop')
+})
+
+// o3d-q0x56.5: a freight order takes no typed rate. [mutation: read input.fxRateToBase again, or default to 1]
+test('freight PO: the schema has no rate field (a stray one is stripped) and createFreightPo prices at the central lookup', () => {
+  assert.ok(!('fxRateToBase' in CreateFreightPoInputSchema.shape), 'the schema carries no fxRateToBase')
+  const parsed = CreateFreightPoInputSchema.parse({ ...baseCreate, fxRateToBase: 9 })
+  assert.equal((parsed as Record<string, unknown>).fxRateToBase, undefined, 'a typed rate is stripped')
+  const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
+  const body = source.slice(source.indexOf('export async function createFreightPo('), source.indexOf('export async function updateFreightPoCosts('))
+  assert.match(body, /resolvePurchaseOrderFxRateToBase\(db, \{ currency: input\.currency/)
+  assert.ok(!/input\.fxRateToBase/.test(body))
 })
