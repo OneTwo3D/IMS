@@ -71,7 +71,7 @@ async function check(): Promise<number> {
   try {
     const [saved, host] = await Promise.all([readCronJobsAndSettings(), readCrontabForReport()])
     if (!host.resolved) {
-      process.stdout.write(`host cron could not be read: ${host.reason}\n`)
+      process.stdout.write(host.reason.startsWith('Host cron is out of date:') ? `${host.reason}\n` : `host cron could not be read: ${host.reason}\n`)
       return 1
     }
     const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: host.text, allJobs: getAllCronJobs() })

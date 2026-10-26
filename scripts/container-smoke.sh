@@ -401,6 +401,18 @@ sql "INSERT INTO settings (key, value, \"updatedAt\") VALUES ('cron_backup_sched
 expect_drift "after saving a new backup schedule" "Host cron is out of date (1 job differ: backup) \[changed: backup\]*" "a saved schedule change was not reported as host cron out of date"
 rerender_and_install
 expect_drift "after re-rendering and installing" "Host cron is in sync*" "host cron did not return to in sync after the re-render and install"
+
+# 3. An active line OUTSIDE the managed block: a copy of a managed job appended after the END marker still runs under cron (it would
+#    fire twice), so the file is no longer what the settings render. Installed root:root 0644, so only this property differs.
+# shellcheck disable=SC2016  # the pattern is the literal text $BASE_URL, not an expansion
+backup_line="$(grep -F '$BASE_URL/backup"' "${CRONTAB_FILE}.new" | head -n 1)"
+[ -n "$backup_line" ] || fail "no backup job line to copy"
+{ cat "${CRONTAB_FILE}.new"; printf '%s\n' "$backup_line"; } > "${CRONTAB_FILE}.stray"
+as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.stray" "${CROND_DIR}/onetwo3d-ims"
+expect_drift "after appending a copy of a job line outside the block" "Host cron is out of date: 1 active line\(s\) outside the managed block*" "an active line outside the managed block was not reported as drift"
+case "$drift" in *"CRON_SECRET=<redacted>"*) ;; *) fail "the outside-line preview is not redacted: ${drift}" ;; esac
+as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
+expect_drift "after restoring the rendered file" "Host cron is in sync*" "host cron did not return to in sync after the stray line was removed"
 echo "    OK: host cron drift reads in sync, out of date with an EXTRA job and with a changed schedule, and in sync again after each host re-render"
 
 status=0

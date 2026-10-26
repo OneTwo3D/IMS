@@ -116,3 +116,10 @@ test('reconcileCrontab in container mode runs no crontab and returns the pending
     }
   }
 })
+
+test('drift: a second managed block in the host file is drift (the parser refuses more than one region)', () => {
+  const hostText = installed(new Map())
+  const drift = hostCronDrift({ jobs: JOBS, settings: new Map(), hostText: `${hostText}${hostText}` })
+  assert.equal(drift.inSync, false)
+  assert.match(drift.blockProblem ?? '', /exactly one managed region/)
+})

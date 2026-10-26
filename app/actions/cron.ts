@@ -14,6 +14,8 @@ import {
 import { reconcileCrontab, readOwnCrontabResult, readCronJobsAndSettings } from '@/lib/crontab-reconcile'
 import { hostCronDrift, isContainerSchedulerMode, describeHostCronDrift } from '@/lib/ops/host-cron'
 import { readCrontabForReport } from '@/lib/ops/read-sync-status'
+import { OUTSIDE_LINES_REASON_PREFIX } from '@/lib/ops/scheduler-crontab-file'
+import { HOST_CRON_PENDING_MESSAGE } from '@/lib/ops/host-cron-constants'
 // The BARREL, not @/lib/cron-registry: registration is an import side effect of the job modules,
 // so the registry is EMPTY unless something has imported them. Reading it bare would have mirrored
 // no legacy key and reported nothing.
@@ -221,6 +223,9 @@ export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
     // through the same reader the status report uses. Nothing about the app user's own crontab applies here.
     const [hostRead, secret, saved] = await Promise.all([readCrontabForReport(), getCronSecret(), readCronJobsAndSettings()])
     const base = { ...parseOtiCrontabStatus('', secret), osUser: os.userInfo().username, runtimeSecretMatches: null }
+    if (!hostRead.resolved && hostRead.reason.startsWith(OUTSIDE_LINES_REASON_PREFIX)) {
+      return { ...base, readError: null, hostCron: { inSync: false, differing: [], message: `${hostRead.reason}. ${HOST_CRON_PENDING_MESSAGE}` } }
+    }
     if (!hostRead.resolved) return { ...base, readError: `The host cron file could not be read, so whether it matches the saved settings is UNKNOWN: ${hostRead.reason}` }
     const drift = hostCronDrift({ jobs: saved.jobs, settings: saved.settings, hostText: hostRead.text, allJobs: getAllCronJobs() })
     return { ...base, readError: null, hostCron: { inSync: drift.inSync, differing: drift.differing, message: describeHostCronDrift(drift) } }

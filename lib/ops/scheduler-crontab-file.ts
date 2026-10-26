@@ -1,6 +1,8 @@
 import { lstatSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
+import { OTI_CRON_END_MARKER, OTI_CRON_START_MARKER } from '@/lib/crontab-sync'
+
 /**
  * WHERE THE SCHEDULER'S CRONTAB COMES FROM WHEN THE PROCESS CANNOT RUN `crontab -l`.
  *
@@ -57,6 +59,36 @@ export function stripCronDUserField(text: string): string {
   }
   return out.join('\n')
 }
+
+/** Words that make a `NAME=value` assignment look like a credential; any value assignment is redacted in a preview anyway. */
+const VALUE_ASSIGNMENT_RE = /([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S+)/g
+
+/** A short preview of a stray line that cannot leak a value: every NAME=value is shown as NAME=<redacted>. Pure. */
+export function redactedLinePreview(line: string): string {
+  const redacted = line.trim().replace(VALUE_ASSIGNMENT_RE, '$1=<redacted>')
+  return redacted.length > 100 ? `${redacted.slice(0, 100)}...` : redacted
+}
+
+/**
+ * Pure. The ACTIVE lines of a cron.d file that sit outside the managed block (user field already removed). In cron.d mode the file
+ * belongs entirely to the renderer: anything that is not blank, a comment or a NAME=value environment line, outside the START/END
+ * markers, is a job cron will run (a copy of a managed job appended after END fires it twice), so it is not a scheduler the block can
+ * vouch for. Marker problems (a second pair, an unbalanced one) are reported by `parseManagedBlock`.
+ */
+export function activeLinesOutsideManagedBlock(text: string): string[] {
+  const out: string[] = []
+  let inside = false
+  for (const line of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed === OTI_CRON_START_MARKER) { inside = true; continue }
+    if (trimmed === OTI_CRON_END_MARKER) { inside = false; continue }
+    if (inside || trimmed === '' || trimmed.startsWith('#') || ASSIGNMENT_RE.test(trimmed)) continue
+    out.push(trimmed)
+  }
+  return out
+}
+
+export const OUTSIDE_LINES_REASON_PREFIX = 'Host cron is out of date:'
 
 /** The configured file, or null when the variable is unset (or blank). Pure. */
 export function configuredSchedulerCrontabFile(env: Readonly<Record<string, string | undefined>> = process.env): string | null {
@@ -121,5 +153,15 @@ export function readSchedulerCrontabFile(
     return { resolved: false, reason: `the scheduler crontab file is larger than ${SCHEDULER_CRONTAB_MAX_BYTES} bytes` }
   }
   const text = bytes.toString('utf8')
-  return { resolved: true, text: format === 'cron.d' ? stripCronDUserField(text) : text }
+  if (format !== 'cron.d') return { resolved: true, text }
+  const stripped = stripCronDUserField(text)
+  const outside = activeLinesOutsideManagedBlock(stripped)
+  if (outside.length > 0) {
+    const shown = outside.slice(0, 3).map((line) => `"${redactedLinePreview(line)}"`).join(', ')
+    return {
+      resolved: false,
+      reason: `${OUTSIDE_LINES_REASON_PREFIX} ${outside.length} active line(s) outside the managed block that cron would also run (${shown}${outside.length > 3 ? ', ...' : ''}); the cron.d file must contain only the rendered block`,
+    }
+  }
+  return { resolved: true, text: stripped }
 }

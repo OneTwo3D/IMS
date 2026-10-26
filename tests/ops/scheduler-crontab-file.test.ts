@@ -6,7 +6,7 @@ import { test } from 'node:test'
 
 import { readCrontabForReport } from '../../lib/ops/read-sync-status.ts'
 import {
-  SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
+  activeLinesOutsideManagedBlock, redactedLinePreview, SCHEDULER_CRONTAB_FILE_ENV, SCHEDULER_CRONTAB_FORMAT_ENV, configuredSchedulerCrontabFile, cronWouldIgnore, type CronFileStat, type CronFileStatter, readSchedulerCrontabFile, stripCronDUserField,
 } from '../../lib/ops/scheduler-crontab-file.ts'
 
 /** A stubbed stat: what cron checks on the host file. */
@@ -16,6 +16,8 @@ const fileStat = (over: Partial<CronFileStat> & { symlink?: boolean; file?: bool
 const statterOf = (info: CronFileStat, target?: CronFileStat): CronFileStatter => ({ lstat: () => info, stat: () => target ?? info })
 const ROOT_FILE = statterOf(fileStat())
 
+const START = '# --- OTI CRON START ---'
+const END = '# --- OTI CRON END ---'
 const USER_TEXT = '# BEGIN x\nSHELL=/bin/sh\n*/5 * * * * curl -sf http://h/api/cron/a\n@reboot curl -sf http://h/api/cron/b\n# END x\n'
 
 function withFile<T>(text: string, fn: (file: string) => T): T {
@@ -36,8 +38,8 @@ test('the crontab text is read from the named file, unchanged, in the default (u
 })
 
 test('cron.d format: the user field is removed from job lines only', () => {
-  const dTab = '# BEGIN x\nSHELL=/bin/sh\n*/5 * * * * root curl -sf http://h/api/cron/a\n@reboot root curl -sf http://h/api/cron/b\n# END x\n'
-  const expected = '# BEGIN x\nSHELL=/bin/sh\n*/5 * * * *  curl -sf http://h/api/cron/a\n@reboot  curl -sf http://h/api/cron/b\n# END x\n'
+  const dTab = `${START}\nSHELL=/bin/sh\n*/5 * * * * root curl -sf http://h/api/cron/a\n@reboot root curl -sf http://h/api/cron/b\n${END}\n`
+  const expected = `${START}\nSHELL=/bin/sh\n*/5 * * * *  curl -sf http://h/api/cron/a\n@reboot  curl -sf http://h/api/cron/b\n${END}\n`
   assert.equal(stripCronDUserField(dTab), expected)
   withFile(dTab, (file) => {
     assert.deepEqual(readSchedulerCrontabFile(file, { [SCHEDULER_CRONTAB_FORMAT_ENV]: 'cron.d' }, undefined, ROOT_FILE), { resolved: true, text: expected })
@@ -120,4 +122,31 @@ test('cron.d: a file cron would ignore is an UNRESOLVED read (fail closed); the 
   assert.equal(cronD.resolved, false)
   assert.match((cronD as { reason: string }).reason, /cron would ignore/)
   assert.equal(readSchedulerCrontabFile('/etc/ims/crontab', {}, read, bad).resolved, true)
+})
+
+test('cron.d: an active line OUTSIDE the managed block makes the read unresolved, with a secret-safe preview', () => {
+  const block = `${START}\n# Alpha Job\n* * * * *  root  curl -sf "$BASE_URL/a"\n${END}\n`
+  const cronD = { [SCHEDULER_CRONTAB_FORMAT_ENV]: 'cron.d' }
+  const read = (text: string) => readSchedulerCrontabFile('/host-cron.d/onetwo3d-ims', cronD, () => Buffer.from(text), ROOT_FILE)
+  // Allowed outside: blank lines, comments, NAME=value.
+  assert.equal(read(`# Source: saved\nSHELL=/bin/sh\nPATH=/usr/bin\n\n${block}\n# trailing\nMAILTO=""\n`).resolved, true)
+  // A copy of a managed job after END, an unrelated job, a job BEFORE the block: all run under cron.
+  for (const stray of [`* * * * *  root  curl -sf "$BASE_URL/a"`, '0 3 * * * root /usr/local/bin/other --token=abc123', '@daily root run-it']) {
+    for (const text of [`${block}${stray}\n`, `${stray}\n${block}`]) {
+      const result = read(text)
+      assert.equal(result.resolved, false, stray)
+      const reason = (result as { reason: string }).reason
+      assert.match(reason, /^Host cron is out of date: 1 active line\(s\) outside the managed block/)
+      assert.doesNotMatch(reason, /abc123/, 'a value assignment is never shown')
+    }
+  }
+  assert.match((read(`${block}0 3 * * * root /x --token=abc123\n`) as { reason: string }).reason, /--token=<redacted>/)
+  // Two blocks: the reader keeps the text, and parseManagedBlock (the status reader) refuses the second region.
+  assert.equal(activeLinesOutsideManagedBlock(`${block}${block}`).length, 0)
+  assert.equal(redactedLinePreview('x CRON_SECRET="s3cr3t" y=1'), 'x CRON_SECRET=<redacted> y=<redacted>')
+})
+
+test('user format: lines outside the block are the operator\'s own jobs and are left alone', () => {
+  const text = `0 5 * * * /home/me/backup.sh\n${START}\n# Alpha Job\n* * * * *  curl x\n${END}\n30 6 * * * /home/me/other\n`
+  assert.deepEqual(readSchedulerCrontabFile('/etc/ims/crontab', {}, () => Buffer.from(text)), { resolved: true, text })
 })
