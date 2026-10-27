@@ -20,10 +20,10 @@ const map = (wooId: string, taxRateId: string): TaxMappingRow => ({ connector: '
 function base(): VatSetInput {
   return {
     woo: [
-      woo('1'),
-      woo('2', { country: 'DE', rate: '19.0000' }),
-      woo('3', { country: 'ES', state: 'CN', rate: '0.0000' }),
-      woo('4', { country: 'PT', state: 'PT-30', rate: '22.0000' }),
+      woo('1', { name: 'GB VAT' }),
+      woo('2', { name: 'DE VAT', country: 'DE', rate: '19.0000' }),
+      woo('3', { name: 'ES-CN VAT', country: 'ES', state: 'CN', rate: '0.0000' }),
+      woo('4', { name: 'PT-30 VAT', country: 'PT', state: 'PT-30', rate: '22.0000' }),
     ],
     rates: [
       ims('rGB', 'TAX001'),
@@ -196,26 +196,26 @@ test('IMS_RATE_NOT_ACTIVE_SALES: a Woo rate mapped to an inactive, purchase-only
 
 test('DUPLICATE_MAPPING: two or more Woo rates on one IMS rate, of equal or different scope, or two active IMS sales rates on one Xero type; one to one passes', () => {
   let input = base()
-  input.woo = [...input.woo, woo('5', { country: 'ES', state: 'CN', rate: '0.0000', shipping: false })]
+  input.woo = [...input.woo, woo('5', { name: 'ES-CN VAT', country: 'ES', state: 'CN', rate: '0.0000', shipping: false })]
   input.mappings = [...input.mappings, map('5', 'rCAN')]
   let same = compareVatSetIdentity(input)
   assert.deepEqual([reasonsOf(same, 'woo', '3'), reasonsOf(same, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING']], 'the same scope listed twice is still two Woo rates on one IMS rate; flagged on both')
   assert.deepEqual(reasonsOf(same, 'ims', 'rCAN'), [])
   // Two identical-scope Woo rates (same everything, shipping on) on one IMS rate.
   input = base()
-  input.woo = [...input.woo, woo('5', { country: 'ES', state: 'CN', rate: '0.0000' })]
+  input.woo = [...input.woo, woo('5', { name: 'ES-CN VAT', country: 'ES', state: 'CN', rate: '0.0000' })]
   input.mappings = [...input.mappings, map('5', 'rCAN')]
   same = compareVatSetIdentity(input)
   assert.deepEqual([reasonsOf(same, 'woo', '3'), reasonsOf(same, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING']])
   assert.deepEqual(compareVatSetIdentity(base()).filter((row) => row.reasons.length > 0), [], 'one to one passes')
   input = base()
-  input.woo = [...input.woo, woo('5', { country: 'ES', state: 'TF', rate: '0.0000' })]
+  input.woo = [...input.woo, woo('5', { name: 'ES-CN VAT', country: 'ES', state: 'TF', rate: '0.0000' })]
   input.mappings = [...input.mappings, map('5', 'rCAN')]
   const rows = compareVatSetIdentity(input)
   assert.deepEqual([reasonsOf(rows, 'woo', '3'), reasonsOf(rows, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING', 'REGION_DIFFERS']], 'the Tenerife rate on the Canary-named IMS rate is also a different region')
   // A second Woo rate that differs ONLY in its tax class is a different scope (and its class matches its own mapping).
   input = base()
-  input.woo = [...input.woo, woo('5', { class: 'reduced-rate' })]
+  input.woo = [...input.woo, woo('5', { name: 'GB VAT', class: 'reduced-rate' })]
   input.mappings = [...input.mappings, { ...map('5', 'rGB'), externalClass: 'reduced-rate' }]
   const byClass = compareVatSetIdentity(input)
   assert.deepEqual([reasonsOf(byClass, 'woo', '1'), reasonsOf(byClass, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING']])
@@ -320,7 +320,7 @@ test('REGION_DIFFERS / REGION_UNVERIFIED: a swapped pair of regional rates canno
   // Two regions of Spain, same percentage, class, compound and shipping, each with its own IMS rate and Xero type.
   const pair = (): VatSetInput => {
     const input = base()
-    input.woo = [...input.woo, woo('5', { country: 'ES', state: 'TF', rate: '0.0000' })]
+    input.woo = [...input.woo, woo('5', { name: 'ES-TF VAT', country: 'ES', state: 'TF', rate: '0.0000' })]
     input.rates = [...input.rates, ims('rTF', 'TAX005', { name: 'ES-TF VAT', rate: '0.0000', countryCode: 'ES', reportingCategory: 'OSS' })]
     input.xero = [...input.xero, xero('TAX005', { name: 'ES-TF VAT', reportTaxType: 'MOSSSALES', effectiveRate: '0.000000', displayTaxRate: '0.000000' })]
     input.mappings = [...input.mappings, map('5', 'rTF')]
@@ -330,7 +330,7 @@ test('REGION_DIFFERS / REGION_UNVERIFIED: a swapped pair of regional rates canno
   const swapped = pair()
   swapped.mappings = swapped.mappings.map((m) => (m.externalTaxRateId === '3' ? { ...m, taxRateId: 'rTF' } : m.externalTaxRateId === '5' ? { ...m, taxRateId: 'rCAN' } : m))
   const rows = compareVatSetIdentity(swapped)
-  assert.deepEqual([reasonsOf(rows, 'woo', '3'), reasonsOf(rows, 'woo', '5')], [['REGION_DIFFERS'], ['REGION_DIFFERS']], 'the swap is a finding on both Woo rows')
+  assert.deepEqual([reasonsOf(rows, 'woo', '3'), reasonsOf(rows, 'woo', '5')], [['REGION_DIFFERS', 'WOO_NAME_DIFFERS'], ['REGION_DIFFERS', 'WOO_NAME_DIFFERS']], 'the swap is a finding on both Woo rows')
   // The region is read with the country prefix and punctuation ignored (Woo "PT-30", "PT30" and "30" all state region 30).
   for (const state of ['PT30', '30', ' pt-30 ']) {
     const input = base(); input.woo = input.woo.map((w) => (w.id === '4' ? { ...w, state } : w))
@@ -340,14 +340,14 @@ test('REGION_DIFFERS / REGION_UNVERIFIED: a swapped pair of regional rates canno
   const wide = base(); wide.woo = wide.woo.map((w) => (w.id === '4' ? { ...w, state: '' } : w))
   assert.deepEqual(reasonsOf(compareVatSetIdentity(wide), 'woo', '4'), ['REGION_DIFFERS'])
   // IMS records no region: a regional Woo rate cannot be confirmed.
-  const noRegion = base(); noRegion.rates = noRegion.rates.map((r) => (r.id === 'rCAN' ? { ...r, name: 'ES Canary VAT' } : r))
+  const noRegion = base(); noRegion.woo = noRegion.woo.map((w) => (w.id === '3' ? { ...w, name: 'ES Canary VAT' } : w)); noRegion.rates = noRegion.rates.map((r) => (r.id === 'rCAN' ? { ...r, name: 'ES Canary VAT' } : r))
   assert.deepEqual(reasonsOf(compareVatSetIdentity(noRegion), 'woo', '3'), ['REGION_UNVERIFIED'])
   // A postcode or city IMS cannot record is never confirmed, even when the state matches.
   const postcode = base(); postcode.woo = postcode.woo.map((w) => (w.id === '3' ? { ...w, postcode: '35*; 38*' } : w))
   assert.deepEqual(reasonsOf(compareVatSetIdentity(postcode), 'woo', '3'), ['REGION_UNVERIFIED'])
   // Two country-wide-looking rates of one country and class with a regional sibling: the unmarked ones are unverified; with no sibling a country-wide rate is untouched.
   const sibling = base()
-  sibling.woo = [...sibling.woo, woo('5', { country: 'GB', state: 'SCT' })]
+  sibling.woo = [...sibling.woo, woo('5', { name: 'GB VAT 2', country: 'GB', state: 'SCT' })]
   sibling.rates = [...sibling.rates, ims('rSCT', 'TAX005', { name: 'GB VAT 2' })]
   sibling.xero = [...sibling.xero, xero('TAX005')]
   sibling.mappings = [...sibling.mappings, map('5', 'rSCT')]
@@ -356,7 +356,7 @@ test('REGION_DIFFERS / REGION_UNVERIFIED: a swapped pair of regional rates canno
   assert.deepEqual(reasonsOf(compareVatSetIdentity(base()), 'woo', '1'), [], 'a single country-wide rate is unaffected')
   // Regions that differ only in postcode make a country-wide sibling unverified too; a postcode alone on an unmarked IMS rate is unverified.
   const byPostcode = base()
-  byPostcode.woo = [...byPostcode.woo, woo('5', { postcode: 'EH*' })]
+  byPostcode.woo = [...byPostcode.woo, woo('5', { name: 'GB VAT 2', postcode: 'EH*' })]
   byPostcode.rates = [...byPostcode.rates, ims('rEH', 'TAX005', { name: 'GB VAT 2' })]
   byPostcode.xero = [...byPostcode.xero, xero('TAX005')]
   byPostcode.mappings = [...byPostcode.mappings, map('5', 'rEH')]
@@ -365,11 +365,11 @@ test('REGION_DIFFERS / REGION_UNVERIFIED: a swapped pair of regional rates canno
   const lone = base(); lone.woo = lone.woo.map((w) => (w.id === '1' ? { ...w, postcode: 'EH*' } : w))
   assert.deepEqual(reasonsOf(compareVatSetIdentity(lone), 'woo', '1'), ['REGION_UNVERIFIED'], 'a lone rate with a postcode scope and no IMS region')
   // A generic word after the hyphen is not a region ("GB-VAT" states none).
-  const generic = base(); generic.rates = generic.rates.map((r) => (r.id === 'rGB' ? { ...r, name: 'GB-VAT' } : r))
+  const generic = base(); generic.woo = generic.woo.map((w) => (w.id === '1' ? { ...w, name: 'GB-VAT' } : w)); generic.rates = generic.rates.map((r) => (r.id === 'rGB' ? { ...r, name: 'GB-VAT' } : r))
   assert.deepEqual(reasonsOf(compareVatSetIdentity(generic), 'woo', '1'), [])
   // The sibling must be in scope: a rate whose IMS rate is inactive does not make a country-wide rate unverified.
   const outOfScope = base()
-  outOfScope.woo = [...outOfScope.woo, woo('5', { state: 'SCT' })]
+  outOfScope.woo = [...outOfScope.woo, woo('5', { name: 'GB VAT', state: 'SCT' })]
   outOfScope.rates = [...outOfScope.rates, ims('rSCT', null, { active: false })]
   outOfScope.mappings = [...outOfScope.mappings, map('5', 'rSCT')]
   assert.deepEqual(reasonsOf(compareVatSetIdentity(outOfScope), 'woo', '1'), [])
@@ -388,7 +388,7 @@ test('XERO_REGION_DIFFERS / XERO_REGION_UNVERIFIED: the IMS name and the Xero na
   const swap = base()
   swap.rates = [...swap.rates, ims('rAZ', 'TAX005', { name: 'PT-20 VAT', rate: '0.2200', countryCode: 'PT', reportingCategory: 'OSS' })]
   swap.xero = [...swap.xero, xero('TAX005', { name: 'PT-20 VAT', reportTaxType: 'MOSSSALES', effectiveRate: '22.000000', displayTaxRate: '22.000000' })]
-  swap.woo = [...swap.woo, woo('5', { country: 'PT', state: 'PT-20', rate: '22.0000' })]
+  swap.woo = [...swap.woo, woo('5', { name: 'PT-20 VAT', country: 'PT', state: 'PT-20', rate: '22.0000' })]
   swap.mappings = [...swap.mappings, map('5', 'rAZ')]
   assert.deepEqual(compareVatSetIdentity(swap).filter((row) => row.reasons.length > 0), [], 'the correct two-region set passes')
   swap.rates = swap.rates.map((r) => (r.id === 'rPT30' ? { ...r, accountingTaxType: 'TAX005' } : r.id === 'rAZ' ? { ...r, accountingTaxType: 'TAX004' } : r))
@@ -410,7 +410,7 @@ test('XERO_NAME_DIFFERS: an IMS rate and the Xero type its code names must have 
     const input = base()
     input.rates = [...input.rates, ims('rIOSS', 'TAX005', { name: 'PT-30 IOSS VAT', rate: '0.2200', countryCode: 'PT', reportingCategory: 'OSS' })]
     input.xero = [...input.xero, xero('TAX005', { name: 'PT-30 IOSS VAT', reportTaxType: 'MOSSSALES', effectiveRate: '22.000000', displayTaxRate: '22.000000' })]
-    input.woo = [...input.woo, woo('5', { country: 'PT', state: 'PT-30', class: 'ioss', rate: '22.0000' })]
+    input.woo = [...input.woo, woo('5', { name: 'PT-30 IOSS VAT', country: 'PT', state: 'PT-30', class: 'ioss', rate: '22.0000' })]
     input.mappings = [...input.mappings, { ...map('5', 'rIOSS'), externalClass: 'ioss' }]
     return input
   }
@@ -435,6 +435,35 @@ test('XERO_NAME_DIFFERS: an IMS rate and the Xero type its code names must have 
   assert.deepEqual(reasonsOf(compareVatSetIdentity(archived), 'ims', 'rGB'), ['IMS_NOT_IN_XERO'])
 })
 
+test('WOO_NAME_DIFFERS: a Woo rate must have the name of the IMS rate it maps to (trimmed, whitespace collapsed, case ignored); no swap of mapping targets can pass', () => {
+  // Two same-scope, same-percent Woo rates with different labels (different treatments), each on its own IMS rate and Xero type.
+  const pair = (): VatSetInput => {
+    const input = base()
+    input.woo = [...input.woo, woo('5', { name: 'GB VAT (digital)' })]
+    input.rates = [...input.rates, ims('rDig', 'TAX005', { name: 'GB VAT (digital)' })]
+    input.xero = [...input.xero, xero('TAX005', { name: 'GB VAT (digital)' })]
+    input.mappings = [...input.mappings, map('5', 'rDig')]
+    return input
+  }
+  const correct = compareVatSetIdentity(pair())
+  assert.deepEqual(correct.filter((row) => row.reasons.length > 0).map((row) => `${row.system}|${row.id}|${row.reasons.join(',')}`), [], 'the correct pair passes')
+  const swapped = pair()
+  swapped.mappings = swapped.mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, taxRateId: 'rDig' } : m.externalTaxRateId === '5' ? { ...m, taxRateId: 'rGB' } : m))
+  const rows = compareVatSetIdentity(swapped)
+  assert.deepEqual([reasonsOf(rows, 'woo', '1'), reasonsOf(rows, 'woo', '5')], [['WOO_NAME_DIFFERS'], ['WOO_NAME_DIFFERS']], 'the swap is a finding on both Woo rows')
+  assert.deepEqual(rows.find((row) => row.system === 'woo' && row.id === '1')?.names, { ims: 'GB VAT (digital)', woo: 'GB VAT' }, 'the row carries both names')
+  assert.equal(rows.find((row) => row.system === 'ims' && row.id === 'rGB')?.names, undefined)
+  // Cosmetic differences pass.
+  for (const name of ['GB  VAT', ' GB VAT ', 'gb vat', 'GB\tVAT']) {
+    const input = base(); input.woo = input.woo.map((w) => (w.id === '1' ? { ...w, name } : w))
+    assert.deepEqual(reasonsOf(compareVatSetIdentity(input), 'woo', '1'), [], JSON.stringify(name))
+  }
+  // A generic Woo label is a finding.
+  const generic = base(); generic.woo = generic.woo.map((w) => (w.id === '1' ? { ...w, name: 'VAT' } : w))
+  assert.deepEqual(reasonsOf(compareVatSetIdentity(generic), 'woo', '1'), ['WOO_NAME_DIFFERS'])
+  assert.deepEqual(reasonsOf(compareVatSetIdentity(generic), 'ims', 'rGB'), [], 'on the Woo row only')
+})
+
 test('the closed list is the one the report prints, every reason is reachable, and the summary counts rows and reasons exactly', () => {
   const input = base()
   input.woo = [...input.woo, woo('7', { country: 'FR' })]
@@ -446,5 +475,5 @@ test('the closed list is the one the report prints, every reason is reachable, a
   assert.equal(summary.byReason.WOO_UNMAPPED, 1)
   assert.equal(summary.byReason.XERO_NOT_IN_IMS, 1)
   assert.deepEqual(Object.keys(summary.byReason), VAT_SET_REASON_LIST)
-  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'REGION_DIFFERS', 'REGION_UNVERIFIED', 'XERO_NAME_DIFFERS', 'XERO_REGION_DIFFERS', 'XERO_REGION_UNVERIFIED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
+  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'REGION_DIFFERS', 'REGION_UNVERIFIED', 'WOO_NAME_DIFFERS', 'XERO_NAME_DIFFERS', 'XERO_REGION_DIFFERS', 'XERO_REGION_UNVERIFIED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
 })

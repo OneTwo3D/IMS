@@ -54,6 +54,7 @@ export const VAT_SET_REASONS = {
   SHIPPING_NOT_TAXED: 'a WooCommerce rate with a positive percentage has "apply to shipping" off, but shipping always carries the goods\' VAT rate (owner ruling; the VAT difference report\'s WOO_SHIPPING_NOT_TAXED). A zero-rate is exempt: shipping at 0% is the same as no VAT on shipping',
   REGION_DIFFERS: 'the region of the WooCommerce rate (its state) is not the region its IMS rate records: IMS records a region only as the suffix of the rate name ("PT-30 VAT" is region 30), and the two disagree, including a regional IMS rate on a country-wide WooCommerce rate',
   REGION_UNVERIFIED: 'the region of the WooCommerce rate cannot be confirmed against IMS, which has no region data for the rate (a finding, never a pass): the WooCommerce rate has a state, a postcode or a city, a postcode or city IMS cannot record, or it shares country and class with an in-scope WooCommerce rate of another region and its IMS rate names no region',
+  WOO_NAME_DIFFERS: 'the name of the WooCommerce rate is not the name of the IMS rate it maps to (trimmed, whitespace runs collapsed, case ignored: the same comparison as XERO_NAME_DIFFERS), so with the IMS and Xero names equal, no swap of mapping targets or of codes can pass; WooCommerce labels must be renamed to match IMS and Xero; the row carries both names',
   XERO_NAME_DIFFERS: 'the IMS rate and the Xero type its accounting tax type code names do not have the same name (trimmed, whitespace runs collapsed, case ignored: the name the re-key matches and copies from), so the code may point at another rate of the same percentage, components and report type ("PT-30 VAT" against "PT-30 IOSS VAT"); the row carries both names',
   XERO_REGION_DIFFERS: 'the region the IMS rate name states and the region the Xero type name states are not the same ("PT-30 VAT" against "PT-20 VAT"), including one regional and one country-wide; the same name parser reads both',
   XERO_REGION_UNVERIFIED: 'the region of the IMS rate name or of the Xero type name cannot be read (a word after the country prefix that is not a hyphenated region, such as "PT Madeira VAT"), so the two cannot be compared (a finding, never a pass)',
@@ -64,7 +65,7 @@ export type VatSetReason = keyof typeof VAT_SET_REASONS
 export const VAT_SET_REASON_LIST = Object.keys(VAT_SET_REASONS) as VatSetReason[]
 
 export type VatSetSystem = 'woo' | 'ims' | 'xero'
-export type VatSetRow = { system: VatSetSystem; id: string; reasons: VatSetReason[]; /** Both names, only on an IMS row with XERO_NAME_DIFFERS. */ names?: { ims: string; xero: string } }
+export type VatSetRow = { system: VatSetSystem; id: string; reasons: VatSetReason[]; /** Both names, only on an IMS row with XERO_NAME_DIFFERS (ims, xero) and a Woo row with WOO_NAME_DIFFERS (ims, woo). */ names?: { ims: string; xero?: string; woo?: string } }
 export type VatSetSummary = {
   inScope: Record<VatSetSystem, number>
   identical: Record<VatSetSystem, number>
@@ -168,9 +169,9 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
   }
 
   const rows: VatSetRow[] = []
-  const nameDifferences = new Map<string, { ims: string; xero: string }>()
+  const nameDifferences = new Map<string, { ims: string; xero?: string; woo?: string }>()
   const add = (system: VatSetSystem, id: string, reasons: Set<VatSetReason>): void => {
-    const names = system === 'ims' && reasons.has('XERO_NAME_DIFFERS') ? nameDifferences.get(id) : undefined
+    const names = (system === 'ims' && reasons.has('XERO_NAME_DIFFERS')) || (system === 'woo' && reasons.has('WOO_NAME_DIFFERS')) ? nameDifferences.get(`${system}|${id}`) : undefined
     rows.push({ system, id, reasons: VAT_SET_REASON_LIST.filter((reason) => reasons.has(reason)), ...(names === undefined ? {} : { names }) })
   }
 
@@ -188,7 +189,7 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
     const imsPrefix = xeroNameCountry(rate.name)
     const livePrefix = xeroNameCountry(live.name)
     if ((imsPrefix !== null && imsPrefix !== country) || (livePrefix !== null && livePrefix !== country) || (country === '' && livePrefix !== null)) reasons.add('COUNTRY_DIFFERS')
-    if (comparableName(rate.name) !== comparableName(live.name)) { reasons.add('XERO_NAME_DIFFERS'); nameDifferences.set(rate.id, { ims: rate.name, xero: live.name }) }
+    if (comparableName(rate.name) !== comparableName(live.name)) { reasons.add('XERO_NAME_DIFFERS'); nameDifferences.set(`ims|${rate.id}`, { ims: rate.name, xero: live.name }) }
     const imsNameRegion = nameRegion(rate.name, country)
     const liveNameRegion = nameRegion(live.name, country)
     if (imsNameRegion.kind === 'unreadable' || liveNameRegion.kind === 'unreadable') reasons.add('XERO_REGION_UNVERIFIED')
@@ -214,6 +215,7 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
       if (normaliseCountryCode(woo.country) !== imsCountry) reasons.add('COUNTRY_DIFFERS')
       if (normaliseClass(woo.class) !== mappedClass.get(woo.id)) reasons.add('CLASS_DIFFERS')
       if (woo.compound !== ims.isCompound) reasons.add('COMPOUND_DIFFERS')
+      if (comparableName(woo.name) !== comparableName(ims.name)) { reasons.add('WOO_NAME_DIFFERS'); nameDifferences.set(`woo|${woo.id}`, { ims: ims.name, woo: woo.name }) }
       // REGION: IMS records a region only in the rate name. A recorded region must equal the Woo state (and Woo then has no postcode or city IMS could not hold); where IMS records none, a Woo rate that is regional, or shares country and class with another region, cannot be confirmed.
       const wooCountry = normaliseCountryCode(woo.country)
       const recorded = imsRegion(ims.name, wooCountry)
