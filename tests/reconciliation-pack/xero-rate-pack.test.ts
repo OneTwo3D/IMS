@@ -171,12 +171,16 @@ test('a real R16 finding is written and read back, and the reasons are coupled t
   accepts(notTable)
   rejects({ ...notTable, reasons: ['DIFFERENCES'] })
   rejects({ ...notTable, entries: { bothEqual: [pair(1, '0.8', '0.8')] } })
+  const dateDiffers: ItemInput = { ...differs, reasons: ['DIFFERENCES', 'XERO_DATE_DIFFERS'], entries: { bothDiffer: [pair(1, '20260910', '20260911')] } }
+  accepts(dateDiffers)
+  rejects({ ...dateDiffers, reasons: ['DIFFERENCES'] })
+  rejects({ ...dateDiffers, entries: { bothEqual: [pair(1, '20260910', '20260910')] } })
   const unreadablePosting: ItemInput = { ...gone, reasons: ['DIFFERENCES', 'IMS_POSTING_UNREADABLE'] }
   accepts(unreadablePosting)
   rejects({ ...unreadablePosting, entries: { bothDiffer: [pair(1, '0.8', '0.9')] } })
   rejects({ ...unreadablePosting, entries: undefined })
   // The five reasons belong to R16 alone.
-  for (const reason of ['XERO_RATE_DIFFERS', 'IMS_RATE_MISSING', 'DOCUMENT_UNREADABLE', 'IMS_POSTED_RATE_NOT_TABLE_RATE', 'IMS_POSTING_UNREADABLE'] as PackReasonCode[]) {
+  for (const reason of ['XERO_RATE_DIFFERS', 'IMS_RATE_MISSING', 'DOCUMENT_UNREADABLE', 'IMS_POSTED_RATE_NOT_TABLE_RATE', 'XERO_DATE_DIFFERS', 'IMS_POSTING_UNREADABLE'] as PackReasonCode[]) {
     assert.ok(reason in PACK_REASON_CODES)
     assert.throws(() => buildReport(reportInput(put(defaultItems('P1'), { id: 'R12', outcome: 'fail', reasons: ['DIFFERENCES', reason], sources: ['ims-ledger', 'xero-api', 'woocommerce-api'], entries: { bothDiffer: [pair(1, '0.8', '0.9')] } })), 1, null), ReportInvalid, reason)
     // The control: the same item without the R16 reason is a good R12 failure, so it is the reason that is refused.

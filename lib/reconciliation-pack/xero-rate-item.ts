@@ -29,7 +29,8 @@
  *   by the poster's own helper, not to the table now: the poster sends the stored rate and never looks one up. A second check holds that stored rate to the table
  *   where a date rule is stated in code (a storefront invoice at the order's instant, a receipt by the importer's same-day test; a receipt is identified by its payments-row
  *   provenance as well as the importer's marker, and unproven provenance on a storefront order is a finding); other posted records are counted, not table-checked. Records IMS did not post keep the
- *   reconstruction below. An IMS link whose rate cannot be read is IMS_POSTING_UNREADABLE (a finding), never a pass.
+ *   reconstruction below. An IMS link whose rate cannot be read is IMS_POSTING_UNREADABLE (a finding), never a pass. The date Xero holds must be the date the posting
+ *   carried (the same UTC day): a moved date is XERO_DATE_DIFFERS, listed as a pair of dates (YYYYMMDD); a posting with no readable date is IMS_POSTING_UNREADABLE.
  *
  *   FINDINGS, each a closed reason (the item fails with DIFFERENCES and the specific reasons):
  *     XERO_RATE_DIFFERS    both rates exist and differ: listed as a pair (the IMS rate in Xero's convention against Xero's).
@@ -114,6 +115,8 @@ export type RateCheckSummary = {
   imsPosted: number
   /** Posted records whose stored rate is not the central table rate under the record's date rule (IMS_POSTED_RATE_NOT_TABLE_RATE). */
   postedRateNotTableRate: number
+  /** Posted records whose Xero date is not the date the posting carried (XERO_DATE_DIFFERS). */
+  xeroDateDiffers: number
   /** Posted records whose link or stored rate cannot be read (IMS_POSTING_UNREADABLE). */
   postingUnreadable: number
   /** Posted records of a kind with no verified date rule (not a storefront-imported invoice or receipt): checked against Xero only, not against the table. */
@@ -147,7 +150,7 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     list.push({ fromCurrency: base, toCurrency: row.currency, rate: row.rate, fetchedAt: new Date(row.fetchedAt), manualOverride: row.manualOverride })
     byCurrency.set(row.currency, list)
   }
-  const summary: RateCheckSummary = { periods: [...input.periods], read: { ...input.read }, deletedPayments: input.deletedPayments, setAsideDocuments: input.setAsideDocuments, outsidePeriod: 0, baseCurrency: 0, compared: 0, equal: 0, xeroRateDiffers: 0, imsRateMissing: 0, documentUnreadable: 0, imsPosted: 0, postedRateNotTableRate: 0, postingUnreadable: 0, postedTableNotChecked: 0 }
+  const summary: RateCheckSummary = { periods: [...input.periods], read: { ...input.read }, deletedPayments: input.deletedPayments, setAsideDocuments: input.setAsideDocuments, outsidePeriod: 0, baseCurrency: 0, compared: 0, equal: 0, xeroRateDiffers: 0, imsRateMissing: 0, documentUnreadable: 0, imsPosted: 0, postedRateNotTableRate: 0, xeroDateDiffers: 0, postingUnreadable: 0, postedTableNotChecked: 0 }
   const postedById = new Map<string, XeroPostedRateRow[]>()
   for (const row of input.posted) postedById.set(row.externalId.toLowerCase(), [...(postedById.get(row.externalId.toLowerCase()) ?? []), row])
   const ims: SideRow[] = []
@@ -178,6 +181,17 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     const sent = imsRateToXeroCurrencyRate(posted.toNumber())
     if (sent === undefined || !D(sent).gt(0)) return unreadablePosting(log.id, 'rate-unusable')
     const expectedSent = D(sent)
+    // THE DATE. The poster sends the posted date as the document's Date (invoices, bills, credit notes) or the payment's Date (the first ten characters, the UTC day), and Xero
+    // stores it as a plain date: the two must be the same day. A posting whose date cannot be read cannot be held to anything; one that differs from Xero's is XERO_DATE_DIFFERS
+    // (both dates listed as a pair), whatever the rates say: the rate rule below is the posted date's, and Xero may since have been moved to another day.
+    const day = log.date !== null && DAY_RE.test(log.date.slice(0, 10)) && validDay(log.date.slice(0, 10)) ? log.date.slice(0, 10) : null
+    if (day === null) return unreadablePosting(log.id, 'date-unreadable')
+    if (document.date !== day) {
+      summary.xeroDateDiffers += 1
+      const dateKey = [...baseKey(document), sku('ims-posting-date'), sku(log.id)]
+      ims.push({ key: dateKey, value: day.replace(/-/g, '') })
+      vendor.push({ key: dateKey, value: document.date.replace(/-/g, '') })
+    }
     const key = [...baseKey(document), sku('ims-posting'), sku(log.id)]
     summary.compared += 1
     if (expectedSent.eq(xeroRate)) summary.equal += 1
@@ -185,7 +199,6 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     ims.push({ key, value: expectedSent.toFixed() })
     vendor.push({ key, value: xeroRate.toFixed() })
     // Check 2: the stored rate against the central table, under the date rule of the record's kind.
-    const day = log.date !== null && DAY_RE.test(log.date.slice(0, 10)) && validDay(log.date.slice(0, 10)) ? log.date.slice(0, 10) : null
     const tableKey = [...baseKey(document), sku('posted-vs-table'), sku(log.id)]
     let candidates: Prisma.Decimal[] | null = null
     // A storefront receipt is identified by its PROVENANCE, never by the importer's rate marker alone (a payload from before the marker falls back to the order's rate and is
@@ -197,7 +210,6 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
       // A storefront receipt, by the importer's own rule (receiptOnOrderDay, the very function the importer calls): the order's booked rate when the payment's UTC day is
       // the order's, and ONLY then; on any other day, or when the order's creation instant is unknown, the central rate at the end of the payment's day. A missing table
       // rate on such a day is IMS_RATE_MISSING, never a pass through the order's rate.
-      if (day === null) return unreadablePosting(log.id, 'date-unreadable')
       const created = log.orderCreatedAt === null ? null : new Date(log.orderCreatedAt)
       if (created !== null && Number.isNaN(created.getTime())) return unreadablePosting(log.id, 'order-date-unreadable')
       if (receiptOnOrderDay(created, new Date(`${day}T00:00:00.000Z`))) {
@@ -212,7 +224,6 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     } else if (log.type === 'SALES_INVOICE' && log.wooOrder) {
       // A storefront invoice carries the central rate at the order's instant (the importer prices it with the lookup as of date_created_gmt = externalCreatedAt): exactly
       // that row when the instant is known. Only when it is unknown is the order's day the bound: a central rate in force at some instant of that UTC day.
-      if (day === null) return unreadablePosting(log.id, 'date-unreadable')
       const created = log.orderCreatedAt === null ? null : new Date(log.orderCreatedAt)
       if (created !== null && Number.isNaN(created.getTime())) return unreadablePosting(log.id, 'order-date-unreadable')
       const instants = created !== null ? [created] : [new Date(`${day}T00:00:00.000Z`), endOfBusinessDateUtc(day), ...(byCurrency.get(document.currency) ?? []).filter((r) => r.fetchedAt.toISOString().slice(0, 10) === day).map((r) => r.fetchedAt)]
@@ -271,7 +282,7 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
 /** The one-line account of a run, for the PR and for a person reading the evidence: what was read and how each row was judged. */
 export function summariseRateCheck(summary: RateCheckSummary): string {
   const s = summary
-  return `periods ${s.periods.join(',')}; read ${s.read.invoices} invoices and bills, ${s.read.creditNotes} credit notes, ${s.read.payments} payments (${s.deletedPayments} deleted payments, ${s.setAsideDocuments} voided or deleted documents set aside as out of scope); ${s.outsidePeriod} outside the periods, ${s.baseCurrency} in the base currency (out of scope); ${s.compared} foreign compared (${s.equal} equal, ${s.xeroRateDiffers} differ), ${s.imsRateMissing} without an IMS rate, ${s.documentUnreadable} unreadable; ${s.imsPosted} posted by IMS (held to the rate the posting carried; ${s.postedRateNotTableRate} not the table rate, ${s.postingUnreadable} posting unreadable, ${s.postedTableNotChecked} with no table rule)`
+  return `periods ${s.periods.join(',')}; read ${s.read.invoices} invoices and bills, ${s.read.creditNotes} credit notes, ${s.read.payments} payments (${s.deletedPayments} deleted payments, ${s.setAsideDocuments} voided or deleted documents set aside as out of scope); ${s.outsidePeriod} outside the periods, ${s.baseCurrency} in the base currency (out of scope); ${s.compared} foreign compared (${s.equal} equal, ${s.xeroRateDiffers} differ), ${s.imsRateMissing} without an IMS rate, ${s.documentUnreadable} unreadable; ${s.imsPosted} posted by IMS (held to the rate the posting carried; ${s.postedRateNotTableRate} not the table rate, ${s.xeroDateDiffers} on another date in Xero, ${s.postingUnreadable} posting unreadable, ${s.postedTableNotChecked} with no table rule)`
 }
 
 export type XeroRateRun = { item: ItemInput; summary: RateCheckSummary | null }
@@ -330,6 +341,7 @@ export async function runXeroRateCheck(context: XeroRateItemContext): Promise<Xe
     if (s.imsRateMissing > 0) specific.push('IMS_RATE_MISSING')
     if (s.documentUnreadable > 0) specific.push('DOCUMENT_UNREADABLE')
     if (s.postedRateNotTableRate > 0) specific.push('IMS_POSTED_RATE_NOT_TABLE_RATE')
+    if (s.xeroDateDiffers > 0) specific.push('XERO_DATE_DIFFERS')
     if (s.postingUnreadable > 0) specific.push('IMS_POSTING_UNREADABLE')
   }
   return {
