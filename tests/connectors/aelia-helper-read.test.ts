@@ -63,6 +63,9 @@ test('the read: not configured makes no request; a non-2xx and a non-JSON answer
   const none = await readAeliaRatesFromWc({ fetchImpl: counting, settings: { url: '', secret: 'x' } })
   assert.equal(none.ok, false)
   assert.equal(count, 0)
+  const noSecret = await readAeliaRatesFromWc({ fetchImpl: counting, settings: { url: 'https://shop.example.com', secret: '' } })
+  assert.equal(noSecret.ok, false)
+  assert.equal(count, 0, 'no shared secret, no request (an unsigned read is never sent)')
   const notFound = await readAeliaRatesFromWc({ fetchImpl: counting, settings: { url: 'https://shop.example.com', secret: 'x' } })
   assert.deepEqual([notFound.ok, notFound.ok ? '' : notFound.reason], [false, 'http_status'])
   const html = (async () => new Response('<html>', { status: 200 })) as never
