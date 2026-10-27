@@ -65,7 +65,6 @@
       }
     },
     "purchase-order-lines": {
-      "constants": { "lineDiscountPercent": "0" },
       "columns": {
         "orderKey": "PO No",
         "supplierName": "Supplier",
@@ -75,7 +74,8 @@
         "sku": "Item Code",
         "qtyOrdered": "Ord",
         "qtyReceived": "Rcvd",
-        "unitCostForeign": "Cost"
+        "unitCostForeign": "Cost",
+        "lineDiscountPercent": "Disc %"
       },
       "valueMaps": {
         "status": { "Open": "OPEN", "Closed": "CLOSED" },

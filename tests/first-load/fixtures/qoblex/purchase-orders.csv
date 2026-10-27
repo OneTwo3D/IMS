@@ -1,7 +1,7 @@
-PO No,Supplier,Created,PO State,Ship To,Item Code,Ord,Rcvd,Cost
-PO-5001,Timber Co,2026-09-15,Open,Main Warehouse,OAK-BOARD,100,40,4.25
-PO-5001,Timber Co,2026-09-15,Open,Main Warehouse,widget-9,50,50,1.20
-PO-5002,Cotton Ltd,2026-09-15,Open,Main Warehouse,TSHIRT-S,30,0,2.10
-PO-5002,Cotton Ltd,2026-09-15,Open,Main Warehouse,TSHIRT-M,30,10,2.10
-PO-5003,Hardware Inc,2026-09-15,Closed,Main Warehouse,WIDGET-9,10,10,1.00
-PO-5004,Timber Co,2026-09-15,Open,Main Warehouse,OAK-BOARD,10,12,4.25
+PO No,Supplier,Created,PO State,Ship To,Item Code,Ord,Rcvd,Cost,Disc %
+PO-5001,Timber Co,2026-09-15,Open,Main Warehouse,OAK-BOARD,100,40,4.25,0
+PO-5001,Timber Co,2026-09-15,Open,Main Warehouse,widget-9,50,50,1.20,0
+PO-5002,Cotton Ltd,2026-09-15,Open,Main Warehouse,TSHIRT-S,30,0,2.10,0
+PO-5002,Cotton Ltd,2026-09-15,Open,Main Warehouse,TSHIRT-M,30,10,2.10,0
+PO-5003,Hardware Inc,2026-09-15,Closed,Main Warehouse,WIDGET-9,10,10,1.00,0
+PO-5004,Timber Co,2026-09-15,Open,Main Warehouse,OAK-BOARD,10,12,4.25,0

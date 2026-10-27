@@ -279,6 +279,51 @@ function parseLayoutKeys(
   return { rowsAboveHeader, wide, rowSelect, parentFrom, derived, dateFormats }
 }
 
+/**
+ * COLUMNS THAT CARRY A VALUE INTO A COST OR A QUANTITY MUST BE READ FROM A SOURCE COLUMN, ROW BY ROW (VALUATION_COLUMN_NOT_DIRECT). A constant, a derived value or a value map
+ * could hide a real per-row figure (a constant discount of 0 over a file that has discounts loads every line at its gross price). The per-line discount must also be
+ * mapped (a map that leaves it out is refused, see the required columns), and where the map declares the source's headers, the discount header it names must be the one
+ * that looks like a discount: a header that looks like a discount (DISCOUNT_HEADER_PATTERN) can only be mapped to lineDiscountPercent, and the pinned Qoblex header is
+ * exactly "Discount (%)".
+ * Stock-lot currency is NOT in this list: the Qoblex stock export is declared in one currency by a constant in its pinned map (the report has no currency column).
+ */
+export const DIRECT_COLUMNS: Partial<Record<DatasetName, readonly string[]>> = {
+  'purchase-order-lines': ['lineDiscountPercent', 'unitCostForeign', 'qtyOrdered', 'qtyReceived'],
+  'stock-lots': ['qty', 'unitCost', 'fxRateToBase'],
+  transfers: ['qtyShipped', 'qtyReceived'],
+}
+/** Words for a discount in a source header (English, German, French, Italian, Spanish). */
+export const DISCOUNT_HEADER_PATTERN = /disc|rabatt|remise|sconto|descuento/i
+export const PINNED_DISCOUNT_HEADER = 'Discount (%)'
+
+function directColumnProblems(
+  where: string,
+  name: DatasetName,
+  columns: Record<string, string>,
+  constants: Record<string, string>,
+  valueMaps: Record<string, Record<string, string>>,
+  derived: Record<string, string>,
+  expectedHeaders: string[] | null,
+  problems: string[],
+): void {
+  for (const column of DIRECT_COLUMNS[name] ?? []) {
+    if (column in constants) problems.push(`${where}: VALUATION_COLUMN_NOT_DIRECT: "${column}" is given a constant; it must be mapped to a source column (a constant could hide a real per-row value)`)
+    if (column in valueMaps) problems.push(`${where}: VALUATION_COLUMN_NOT_DIRECT: "${column}" has a valueMaps entry; it must be read as written from a source column`)
+    if (column in derived) problems.push(`${where}: VALUATION_COLUMN_NOT_DIRECT: "${column}" is derived from another column; it must be mapped to a source column`)
+  }
+  if (name !== 'purchase-order-lines') return
+  if (!('lineDiscountPercent' in columns) && !('lineDiscountPercent' in constants) && !('lineDiscountPercent' in derived)) return // reported as a missing required column
+  const mapped = columns.lineDiscountPercent
+  if (mapped !== undefined && expectedHeaders !== null) {
+    if (expectedHeaders.includes(PINNED_DISCOUNT_HEADER) && mapped !== PINNED_DISCOUNT_HEADER) {
+      problems.push(`${where}.columns.lineDiscountPercent: VALUATION_COLUMN_NOT_DIRECT: the file has the "${PINNED_DISCOUNT_HEADER}" header, so lineDiscountPercent must be mapped to exactly that header (found ${JSON.stringify(mapped)})`)
+    }
+    for (const header of expectedHeaders) {
+      if (DISCOUNT_HEADER_PATTERN.test(header) && header !== mapped) problems.push(`${where}: the expected header ${JSON.stringify(header)} looks like a discount column but lineDiscountPercent is mapped to ${JSON.stringify(mapped)}; map the discount column to it (an unread discount loads at the gross price)`)
+    }
+  }
+}
+
 /** Why a required column is required, appended to the refusal. */
 const REQUIRED_COLUMN_HINTS: Record<string, string> = {
   lineDiscountPercent: ' (PO_LINE_DISCOUNT_COLUMN_REQUIRED: the per-line discount must be read, or an omitted column would load every discounted line at its gross price; map the source\'s Discount (%) column to lineDiscountPercent)',
@@ -353,6 +398,7 @@ export function parseColumnMap(jsonText: string, label: string): ColumnMap {
         if (mapped.length > 1) problems.push(`${where}.columns: source header "${header}" is mapped to more than one canonical column (${mapped.join(', ')}); that is ambiguous`)
       }
       const layout = parseLayoutKeys(entry, where, name, spec, { columns, constants, valueMaps }, problems)
+      directColumnProblems(where, name as DatasetName, columns, constants, valueMaps, layout.derived, expectedHeaders, problems)
       datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
     }
   }

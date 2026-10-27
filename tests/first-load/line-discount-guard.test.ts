@@ -88,14 +88,60 @@ test('a column map that leaves lineDiscountPercent out is refused (an omitted co
   assert.throws(() => ingestDataset('purchase-order-lines', Buffer.from(header, 'utf8'), 'po.csv', null), /required column "lineDiscountPercent" is missing/)
 })
 
-// [mutation: the unread-discount-header check removed / narrowed to a different pattern]
-test('a discount header the map leaves unread blocks the run (DISCOUNT_COLUMN_NOT_READ), even when lineDiscountPercent is given a constant; the full map reads it and does not', (t) => {
-  const csv = Buffer.from(readFileSync(path.join(NATIVE, 'incoming-stock.csv'), 'utf8').replace('"18.5","0"', '"18.5","15"'), 'utf8')
-  precondition(t, 'csv', csv.length)
-  const ingest = (text: string) => ingestDataset('purchase-order-lines', csv, 'incoming-stock.csv', parseColumnMap(text, 'po.map.json').datasets['purchase-order-lines']!)
-  const finding = (d: ReturnType<typeof ingest>) => run({ products: ds('products', [product('SYN-1001'), product('SYN-1002'), product('SYN-3001'), product('SYN-3002')]), 'purchase-order-lines': d }).report.findings.filter((f) => f.code === 'DISCOUNT_COLUMN_NOT_READ' && f.severity === 'ERROR')
-  assert.equal(finding(ingest(withoutDiscount('0'))).length, 1, 'constant 0 with the header unread is blocked')
-  assert.equal(finding(ingest(mapText())).length, 0, 'the full map reads the column')
-  const blocked = run({ products: ds('products', [product('SYN-1001')]), 'purchase-order-lines': ingest(withoutDiscount('0')) })
-  assert.equal(blocked.blocking, true)
+type PoMap = { datasets: { 'purchase-order-lines': { columns: Record<string, string>; constants: Record<string, string>; valueMaps: Record<string, Record<string, string>>; derived?: Record<string, string>; expectedHeaders?: string[] } } }
+const editedMap = (edit: (d: PoMap['datasets']['purchase-order-lines']) => void) => {
+  const m = JSON.parse(mapText()) as PoMap
+  edit(m.datasets['purchase-order-lines'])
+  return JSON.stringify(m)
+}
+
+// [mutation: the direct-column rule removed / limited to lineDiscountPercent / the constant check removed for one column]
+test('a valuation column given a constant is refused (VALUATION_COLUMN_NOT_DIRECT): the discount, the price, both quantities, the stock-lot figures and the transfer quantities', (t) => {
+  const cases: Array<[string, string, string]> = [
+    ['purchase-order-lines', 'lineDiscountPercent', 'Discount (%)'], ['purchase-order-lines', 'unitCostForeign', 'Price'], ['purchase-order-lines', 'qtyOrdered', 'Ordered Quantity'], ['purchase-order-lines', 'qtyReceived', 'Received Quantity'],
+    ['stock-lots', 'qty', 'Q'], ['stock-lots', 'unitCost', 'C'], ['stock-lots', 'fxRateToBase', 'R'], ['transfers', 'qtyShipped', 'S'], ['transfers', 'qtyReceived', 'R'],
+  ]
+  precondition(t, 'cases', cases.length)
+  for (const [dataset, column, header] of cases) {
+    const base = { formatVersion: 1, source: 'qoblex', datasets: { [dataset]: { columns: { [column]: header }, constants: {} } } }
+    const text = (edit: (d: { columns: Record<string, string>; constants: Record<string, string>; valueMaps?: Record<string, Record<string, string>> }) => void) => { const m = JSON.parse(JSON.stringify(base)); edit(m.datasets[dataset]); return JSON.stringify(m) }
+    const refusedWith = (json: string) => { try { parseColumnMap(json, 'x.map.json'); return '' } catch (e) { return String((e as Error).message) } }
+    assert.match(refusedWith(text((d) => { delete d.columns[column]; d.constants[column] = '0' })), /VALUATION_COLUMN_NOT_DIRECT: "[A-Za-z]+" is given a constant/, `${dataset}.${column} constant`)
+    assert.match(refusedWith(text((d) => { d.valueMaps = { [column]: { x: '1' } } })), /VALUATION_COLUMN_NOT_DIRECT: "[A-Za-z]+" has a valueMaps entry/, `${dataset}.${column} value map`)
+  }
+})
+
+// [mutation: the derived check removed]
+test('a valuation column that is derived is refused (VALUATION_COLUMN_NOT_DIRECT)', (t) => {
+  precondition(t, 'maps', 1)
+  const text = editedMap((d) => { delete d.columns.lineDiscountPercent; d.derived = { lineDiscountPercent: 'qtyOrdered' }; d.valueMaps.lineDiscountPercent = { '2': '0' } })
+  assert.throws(() => parseColumnMap(text, 'x.map.json'), /VALUATION_COLUMN_NOT_DIRECT: "lineDiscountPercent" is derived/)
+})
+
+// [mutation: the renamed-header map rejected / the header looked up by name]
+test('a direct map to a renamed header is accepted for a custom map, with or without declared headers', (t) => {
+  precondition(t, 'maps', 2)
+  assert.doesNotThrow(() => parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Disc %'; delete d.expectedHeaders }), 'x.map.json'))
+  assert.doesNotThrow(() => parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Disc %'; d.expectedHeaders = (d.expectedHeaders ?? []).map((h) => (h === 'Discount (%)' ? 'Disc %' : h)) }), 'x.map.json'))
+})
+
+// [mutation: the exact-header rule removed / the discount-looking header rule removed]
+test('a map whose file has the pinned "Discount (%)" header must map lineDiscountPercent to exactly it; a declared discount-looking header must be the mapped one', (t) => {
+  precondition(t, 'maps', 3)
+  assert.throws(() => parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Received on' }), 'x.map.json'), /must be mapped to exactly that header/)
+  assert.throws(() => parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Received on'; d.expectedHeaders = (d.expectedHeaders ?? []).map((h) => (h === 'Discount (%)' ? 'Disc (%)' : h)) }), 'x.map.json'), /looks like a discount column/)
+  assert.doesNotThrow(() => parseColumnMap(mapText(), 'x.map.json'))
+})
+
+// [mutation: the unread-discount-header finding removed / narrowed to "discount" / downgraded to a warning]
+test('BACKSTOP: a discount-looking header the map leaves unread (Rabatt, Remise, Sconto, Descuento, Disc) blocks the run (DISCOUNT_COLUMN_NOT_READ); the full map does not', (t) => {
+  const names = ['Rabatt', 'Remise %', 'Sconto', 'Descuento', 'Disc (%)']
+  precondition(t, 'names', names.length)
+  for (const name of names) {
+    const csv = `Purchase Order,Supplier,SKU,Ordered Quantity,Received Quantity,Price,Disc,Status,${name}\r\nO1,Sup,A,2,0,100,0,Approved,15\r\n`
+    const mapped = parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Disc'; d.columns.status = 'Status'; delete d.expectedHeaders; delete d.dateFormats; delete d.columns.createdOn; delete d.columns.expectedDelivery; delete d.columns.supplierRef }), 'x.map.json').datasets['purchase-order-lines']!
+    const ingested = ingestDataset('purchase-order-lines', Buffer.from(csv, 'utf8'), 'po.csv', mapped)
+    const found = run({ products: ds('products', [product('A')]), 'purchase-order-lines': ingested }).report.findings.filter((f) => f.code === 'DISCOUNT_COLUMN_NOT_READ' && f.severity === 'ERROR')
+    assert.equal(found.length, 1, name)
+  }
 })
