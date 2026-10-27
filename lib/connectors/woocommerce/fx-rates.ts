@@ -27,7 +27,7 @@ import type { FxRatePush, FxRatePushResult } from '../types'
 import { validateWooCommerceBaseUrl } from './url-safety'
 import { wooEgressHold } from './producer-egress'
 import { AELIA_PUSH_DISABLED_MESSAGE, getFxRateSource } from '@/lib/currencies/fx-source'
-import { FxTableBusyError, FxTableLockLostError, withFxTableHeldStill, type FxTableGuard } from '@/lib/currencies/fx-table-lock'
+import { FxTableBusyError, FxTableLockLostError, withFxTableHeldStill } from '@/lib/currencies/fx-table-lock'
 
 const HELPER_PATH = '/wp-json/oti/v1/fx-rates'
 const PUSH_TIMEOUT_MS = 15_000
@@ -44,68 +44,66 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
   // the importer. BOUNDS: the lock is waited for at most 30 s (the importer's own wait; on timeout the push is not sent), and once held it is kept for the POST, which is aborted at PUSH_TIMEOUT_MS (15 s),
   // so a writer (the refresh, or the switch) waits for a push for at most about 15 s plus the settings read; a slow store cannot hold the table longer, and on that timeout the push fails (nothing is retried here).
   try {
-    return await withFxTableHeldStill((guard) => pushFxRatesToWcLocked(rates, guard))
+    return await withFxTableHeldStill(async (guard): Promise<FxRatePushResult> => {
+      // The FX source is Aelia: Aelia owns the rates and IMS never writes them. Checked FIRST, before the settings or the store are touched; this is the lowest level, so every caller is covered.
+      if ((await getFxRateSource()) === 'aelia') return { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] }
+      const config = await getSettingValues(['wc_url', 'wc_webhook_secret', 'wc_fx_push_enabled'])
+      const url = config.get('wc_url') ?? ''
+      const secret = config.get('wc_webhook_secret') ?? ''
+      const enabled = config.get('wc_fx_push_enabled') === 'true'
+
+      if (!enabled) return { supported: false, pushed: 0, errors: [] }
+      if (!url || !secret) {
+        return { supported: false, pushed: 0, errors: ['WooCommerce URL or webhook secret not configured'] }
+      }
+      const validatedUrl = validateWooCommerceBaseUrl(url)
+      if (!validatedUrl.ok) {
+        return { supported: true, pushed: 0, errors: [validatedUrl.error] }
+      }
+
+      if (!rates.length) return { supported: true, pushed: 0, errors: [] }
+
+      // The last barrier of the producer-side hold (see ./producer-egress): nothing leaves while the destination is held.
+      const egressHold = wooEgressHold()
+      if (egressHold.held) return { supported: true, pushed: 0, errors: [egressHold.notice] }
+
+      const body = JSON.stringify({ rates })
+      const signature = createHmac('sha256', secret).update(body).digest('hex')
+      const endpoint = validatedUrl.normalizedUrl + HELPER_PATH
+
+      try {
+        guard.assertHeld('sending the exchange-rate push') // a dead lock connection frees the lock: then nothing is sent
+        const res = await connectorFetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-OTI-Signature': signature,
+          },
+          body,
+          signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+        }, {
+          connectorName: 'WooCommerce',
+        })
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => '')
+          return {
+            supported: true,
+            pushed: 0,
+            errors: [`HTTP ${res.status}: ${text.slice(0, 200) || res.statusText}`],
+          }
+        }
+
+        const json = (await res.json().catch(() => ({}))) as { pushed?: number; ok?: boolean }
+        return { supported: true, pushed: Number(json.pushed ?? rates.length), errors: [] }
+      } catch (e) {
+        return { supported: true, pushed: 0, errors: [isOutboundWriteHeldError(e) ? e.message : String(e)] }
+      }
+    })
   } catch (e) {
     if (e instanceof FxTableBusyError) return { supported: true, pushed: 0, errors: ['The exchange-rate table is busy (a CSV import or a rate update is running); the push was not sent.'] }
     if (e instanceof FxTableLockLostError) return { supported: true, pushed: 0, errors: [e.message] }
     throw e
-  }
-}
-
-async function pushFxRatesToWcLocked(rates: FxRatePush[], guard: FxTableGuard): Promise<FxRatePushResult> {
-  // The FX source is Aelia: Aelia owns the rates and IMS never writes them. Checked FIRST, before the settings or the store are touched; this is the lowest level, so every caller is covered.
-  if ((await getFxRateSource()) === 'aelia') return { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] }
-  const config = await getSettingValues(['wc_url', 'wc_webhook_secret', 'wc_fx_push_enabled'])
-  const url = config.get('wc_url') ?? ''
-  const secret = config.get('wc_webhook_secret') ?? ''
-  const enabled = config.get('wc_fx_push_enabled') === 'true'
-
-  if (!enabled) return { supported: false, pushed: 0, errors: [] }
-  if (!url || !secret) {
-    return { supported: false, pushed: 0, errors: ['WooCommerce URL or webhook secret not configured'] }
-  }
-  const validatedUrl = validateWooCommerceBaseUrl(url)
-  if (!validatedUrl.ok) {
-    return { supported: true, pushed: 0, errors: [validatedUrl.error] }
-  }
-
-  if (!rates.length) return { supported: true, pushed: 0, errors: [] }
-
-  // The last barrier of the producer-side hold (see ./producer-egress): nothing leaves while the destination is held.
-  const egressHold = wooEgressHold()
-  if (egressHold.held) return { supported: true, pushed: 0, errors: [egressHold.notice] }
-
-  const body = JSON.stringify({ rates })
-  const signature = createHmac('sha256', secret).update(body).digest('hex')
-  const endpoint = validatedUrl.normalizedUrl + HELPER_PATH
-
-  try {
-    guard.assertHeld('sending the exchange-rate push') // a dead lock connection frees the lock: then nothing is sent
-    const res = await connectorFetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-OTI-Signature': signature,
-      },
-      body,
-      signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
-    }, {
-      connectorName: 'WooCommerce',
-    })
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      return {
-        supported: true,
-        pushed: 0,
-        errors: [`HTTP ${res.status}: ${text.slice(0, 200) || res.statusText}`],
-      }
-    }
-
-    const json = (await res.json().catch(() => ({}))) as { pushed?: number; ok?: boolean }
-    return { supported: true, pushed: Number(json.pushed ?? rates.length), errors: [] }
-  } catch (e) {
-    return { supported: true, pushed: 0, errors: [isOutboundWriteHeldError(e) ? e.message : String(e)] }
   }
 }
 

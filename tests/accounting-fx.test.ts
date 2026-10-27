@@ -144,6 +144,7 @@ test('reverses prior unrealised FX journal lines by swapping debits and credits'
 test('settlement FX resolver: a MISSING rate refuses (no fallback to the booked rate, no 1, nothing logged)', async () => {
   const tx = {
     fxRate: fakeFxClient([]).fxRate,
+    setting: fakeFxClient([]).setting,
     activityLog: { create: async () => { assert.fail('no fallback may be logged: there is no fallback') } },
   }
   await assert.rejects(
