@@ -342,8 +342,8 @@ echo "==> a cron.d file that cron would ignore is not trusted"
 BAD_DIR="$(mktemp -d)"
 as_root chown root:root "$BAD_DIR"
 as_root chmod 0755 "$BAD_DIR"
-read_copy_scheduler() { # <mode> <owner> [source]  -> the status JSON read from a copy of the source installed with that mode and owner
-  as_root install -m "$1" -o "$2" -g "$2" "${3:-$CRONTAB_FILE}" "${BAD_DIR}/onetwo3d-ims"
+read_copy_scheduler() { # <mode> <owner>  -> the status JSON read from a copy installed with that mode and owner
+  as_root install -m "$1" -o "$2" -g "$2" "$CRONTAB_FILE" "${BAD_DIR}/onetwo3d-ims"
   docker run --rm --network "$NET" -e DATABASE_URL -e IMS_SCHEDULER_CRONTAB_FORMAT -e IMS_SCHEDULER_CRONTAB_FILE=/bad/onetwo3d-ims \
     -v "${BAD_DIR}:/bad:ro" --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/read-sync-status.mjs --json 2>/dev/null || true
 }
@@ -370,45 +370,66 @@ printf '%s' "$report_json" | jq -e '.summary.inconclusive == 0 and .summary.fail
 [ "$pack_code" = all-pass ] || fail "the pack code is ${pack_code}, expected all-pass"
 echo "    OK: conclusive reconciliation result: code=${pack_code}, summary $(printf '%s' "$report_json" | jq -c '.summary')"
 
-# The reader fails closed on anything in the installed cron.d file that is not exactly what the renderer wrote. Each variant is a copy
-# of the installed file (installed root:root 0644 into a throwaway directory, so only its CONTENT differs), read by the same status
-# reader the pack uses. The diagnostics give line numbers and classifications only, never installed text.
-echo "==> the reader refuses installed content that cron would run or apply outside the block, or never run"
-unreadable_reason() { printf '%s' "$1" | jq -r '.scheduler.unreadable // empty'; }
-# shellcheck disable=SC2016  # the pattern is the literal text $BASE_URL, not an expansion
-backup_line="$(grep -F '$BASE_URL/backup"' "$CRONTAB_FILE" | head -n 1)"
-[ -n "$backup_line" ] || fail "no backup job line to copy"
+# In container mode a Save in Settings only records the settings; host cron changes when the host re-renders and installs the file.
+# The in-container drift check (the same one the Scheduler page shows) must say so: in sync, then out of date after a saved change,
+# then in sync again once the host file is re-rendered and installed.
+echo "==> host cron drift after a saved scheduler change"
+drift_check() { docker exec "$APP_NAME" node /app/dist-scripts/render-managed-crontab.mjs --check 2>&1 || true; }
+rerender_and_install() {
+  docker run --rm --network "$NET" -e DATABASE_URL --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/render-managed-crontab.mjs \
+    --base-url "http://${APP_NAME}:3000" --secret-file "$SECRET_FILE" --log-path "$CRON_LOG" \
+    --format cron.d --cron-user root > "${CRONTAB_FILE}.new"
+  as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
+}
+expect_drift() { # <label> <expected prefix glob> <what to say on failure>
+  drift="$(drift_check)"
+  echo "    $1: ${drift%%. Host cron update pending*}"
+  # shellcheck disable=SC2254  # the pattern is a deliberate glob
+  case "$drift" in $2) ;; *) fail "$3: ${drift}" ;; esac
+}
+drift="$(drift_check)"
+echo "    before any change: ${drift}"
+case "$drift" in "Host cron is in sync"*) ;; *) fail "host cron should start in sync with the saved settings: ${drift}" ;; esac
 
-# 1. An active line OUTSIDE the managed block: a copy of a managed job appended after END still runs under cron (it would fire twice).
-{ cat "$CRONTAB_FILE"; printf '%s\n' "$backup_line"; } > "${CRONTAB_FILE}.stray"
-reason="$(unreadable_reason "$(read_copy_scheduler 0644 root "${CRONTAB_FILE}.stray")")"
-echo "    a job line appended after the block: ${reason}"
-case "$reason" in "Host cron is out of date: 1 line(s) outside the managed block that cron would run or apply (line "*": active job line outside the managed block)"*) ;; *) fail "an active line outside the managed block was trusted or misreported: ${reason:-<trusted>}" ;; esac
-case "$reason" in *CRON_SECRET*|*curl*|*grep*) fail "the outside-line diagnostic quotes installed command text: ${reason}" ;; esac
-
-# 2. An environment assignment OUTSIDE the block: cron applies it to every job after it, so SHELL=/bin/false ahead of the block stops
-#    every managed job from running while the block itself still looks perfect.
-{ printf 'SHELL=/bin/false\n'; cat "$CRONTAB_FILE"; } > "${CRONTAB_FILE}.shell"
-reason="$(unreadable_reason "$(read_copy_scheduler 0644 root "${CRONTAB_FILE}.shell")")"
-echo "    SHELL=/bin/false ahead of the block: ${reason}"
-case "$reason" in "Host cron is out of date: 1 line(s) outside the managed block that cron would run or apply (line 1: environment assignment outside the managed block (SHELL))"*) ;; *) fail "an environment assignment outside the managed block was trusted or misreported: ${reason:-<trusted>}" ;; esac
-case "$reason" in *"/bin/false"*) fail "the assignment's value is shown: ${reason}" ;; esac
-
-# 3. An installed job line whose schedule is out of range: cron never runs it.
-sed -E '0,/^\* \* \* \* \*  root  /s//99 * * * *  root  /' "$CRONTAB_FILE" > "${CRONTAB_FILE}.badsched"
-cmp -s "$CRONTAB_FILE" "${CRONTAB_FILE}.badsched" && fail "the out-of-range variant was not produced"
-reason="$(unreadable_reason "$(read_copy_scheduler 0644 root "${CRONTAB_FILE}.badsched")")"
-echo "    an installed 99 * * * * schedule: ${reason}"
-case "$reason" in "Host cron is out of date: 1 installed job line(s) with a schedule cron would not run (line "*": invalid minute (out-of-range))"*) ;; *) fail "an installed out-of-range schedule was trusted or misreported: ${reason:-<trusted>}" ;; esac
-
-# 4. The control that proves the harness reads a good copy at all.
-reason="$(unreadable_reason "$(read_copy_scheduler 0644 root "$CRONTAB_FILE")")"
-[ -z "$reason" ] || fail "an untouched copy of the installed file was refused: ${reason}"
-
-# 5. An out-of-range schedule written straight into the saved-settings row (bypassing Save): the right shape, but cron would never run
-#    it, and nothing on the host syntax-checks a cron.d file, so the renderer must refuse to render it.
-sql "INSERT INTO settings (key, value, \"updatedAt\") VALUES ('cron_backup_schedule', '99 * * * *', now())
+# 1. A whole job switched off in the saved settings, WITHOUT re-rendering: its lines are still installed, so host cron would keep
+#    firing it. The check compares the whole block, so it must report the job as extra.
+sql "INSERT INTO settings (key, value, \"updatedAt\") VALUES ('cron_activity_cleanup_enabled', 'false', now())
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value" >/dev/null
+expect_drift "after switching a job off without re-rendering" "Host cron is out of date (1 job differ: activity-cleanup) \[extra: activity-cleanup\]*" "a job switched off but still installed was not reported as extra"
+rerender_and_install
+expect_drift "after re-rendering and installing" "Host cron is in sync*" "host cron did not return to in sync after the extra job was removed"
+
+# 2. A changed saved schedule.
+sql "INSERT INTO settings (key, value, \"updatedAt\") VALUES ('cron_backup_schedule', '5 2 * * *', now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value" >/dev/null
+expect_drift "after saving a new backup schedule" "Host cron is out of date (1 job differ: backup) \[changed: backup\]*" "a saved schedule change was not reported as host cron out of date"
+rerender_and_install
+expect_drift "after re-rendering and installing" "Host cron is in sync*" "host cron did not return to in sync after the re-render and install"
+
+# 3. An active line OUTSIDE the managed block: a copy of a managed job appended after the END marker still runs under cron (it would
+#    fire twice), so the file is no longer what the settings render. Installed root:root 0644, so only this property differs.
+# shellcheck disable=SC2016  # the pattern is the literal text $BASE_URL, not an expansion
+backup_line="$(grep -F '$BASE_URL/backup"' "${CRONTAB_FILE}.new" | head -n 1)"
+[ -n "$backup_line" ] || fail "no backup job line to copy"
+{ cat "${CRONTAB_FILE}.new"; printf '%s\n' "$backup_line"; } > "${CRONTAB_FILE}.stray"
+as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.stray" "${CROND_DIR}/onetwo3d-ims"
+expect_drift "after appending a copy of a job line outside the block" "Host cron is out of date: 1 line\(s\) outside the managed block that cron would run or apply \(line [0-9]*: active job line outside the managed block\)*" "an active line outside the managed block was not reported as drift"
+case "$drift" in *CRON_SECRET*|*curl*|*grep*) fail "the outside-line diagnostic quotes installed command text: ${drift}" ;; esac
+as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
+expect_drift "after restoring the rendered file" "Host cron is in sync*" "host cron did not return to in sync after the stray line was removed"
+
+# 4. An environment assignment OUTSIDE the managed block: cron applies it to every job after it, so SHELL=/bin/false ahead of the block
+#    stops every managed job from running while the block itself still looks perfect.
+{ printf 'SHELL=/bin/false\n'; cat "${CRONTAB_FILE}.new"; } > "${CRONTAB_FILE}.shell"
+as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.shell" "${CROND_DIR}/onetwo3d-ims"
+expect_drift "after prepending SHELL=/bin/false outside the block" "Host cron is out of date: 1 line\(s\) outside the managed block that cron would run or apply \(line 1: environment assignment outside the managed block \(SHELL\)\)*" "an environment assignment outside the managed block was not reported as drift"
+case "$drift" in *"/bin/false"*) fail "the assignment's value is shown: ${drift}" ;; esac
+as_root install -m 0644 -o root -g root "${CRONTAB_FILE}.new" "${CROND_DIR}/onetwo3d-ims"
+expect_drift "after restoring the rendered file" "Host cron is in sync*" "host cron did not return to in sync after the assignment was removed"
+
+# 5. An out-of-range saved schedule written straight into the settings row (bypassing Save). `99 * * * *` has the right shape, but cron
+#    would never run it, and nothing on the host syntax-checks a cron.d file, so the renderer must refuse to render it.
+sql "UPDATE settings SET value = '99 * * * *' WHERE key = 'cron_backup_schedule'" >/dev/null
 render_err="$(mktemp)"
 render_rc=0
 docker run --rm --network "$NET" -e DATABASE_URL --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/render-managed-crontab.mjs \
@@ -418,11 +439,9 @@ echo "    renderer with a saved out-of-range schedule: exit ${render_rc}: $(head
 [ "$render_rc" != 0 ] || fail "the renderer rendered an out-of-range saved schedule"
 grep -q 'Invalid cron schedule for Database Backup' "$render_err" || fail "the renderer's refusal does not name the job"
 grep -q 'minute "99" is out of range' "$render_err" || fail "the renderer's refusal does not name the bad field"
-sql "DELETE FROM settings WHERE key = 'cron_backup_schedule'" >/dev/null
-docker run --rm --network "$NET" -e DATABASE_URL --entrypoint node "$RUNTIME_IMAGE" /app/dist-scripts/render-managed-crontab.mjs \
-  --base-url "http://${APP_NAME}:3000" --secret-file "$SECRET_FILE" --log-path "$CRON_LOG" --format cron.d --cron-user root \
-  | grep -q 'OTI CRON START' || fail "the renderer does not render again once the bad schedule is removed"
-echo "    OK: the reader refuses an outside line, an outside assignment and an installed out-of-range schedule; the renderer refuses a saved one"
+sql "UPDATE settings SET value = '5 2 * * *' WHERE key = 'cron_backup_schedule'" >/dev/null
+expect_drift "after restoring the saved schedule" "Host cron is in sync*" "host cron did not return to in sync after the bad schedule was restored"
+echo "    OK: host cron drift reads in sync, out of date with an EXTRA job and with a changed schedule, and in sync again after each host re-render"
 
 # Persistent state must outlive the container. The runtime above was started on a NAMED volume (the documented deployment shape):
 # the scheduled backup is already on it, and an upload marker is written now. The container is then removed and a NEW one started

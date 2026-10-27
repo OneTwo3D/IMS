@@ -42,7 +42,7 @@ export type ParsedManagedBlock =
 /**
  * The managed block of a crontab text with the BASE_URL, secret source and log path it names, after the checks that make it
  * trustworthy: exactly one managed region, both markers, and a header equal to the one the generator renders from those three.
- * Split out of `verifyJobsScheduled` so that a block is read in one place. Pure.
+ * Shared by `verifyJobsScheduled` and the host-cron drift comparison so both read a block the same way. Pure.
  */
 export function parseManagedBlock(rawCrontabText: string): ParsedManagedBlock {
   // CRLF and lone CR are line endings too: normalise ONCE, before marker detection, extraction and header comparison.
