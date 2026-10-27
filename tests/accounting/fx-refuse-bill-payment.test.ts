@@ -63,6 +63,7 @@ function transactionClient(pending: Array<() => void>) {
     purchaseInvoice: {
       updateMany: async (args: { data?: unknown }) => { pending.push(() => state.committedPaid.push(args.data)); return { count: 1 } },
     },
+    setting: { findMany: async () => [] },
     fxRate: {
       groupBy: async (args: never) => { state.rateReads++; return fx.fxRate.groupBy(args) },
       findMany: async (args: never) => fx.fxRate.findMany(args),

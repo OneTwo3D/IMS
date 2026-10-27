@@ -1,5 +1,6 @@
 import { Prisma, type PrismaClient } from '@/app/generated/prisma/client'
 import { resolveBaseCurrencyCode } from '@/lib/base-currency'
+import { getFxSourceRegime } from './fx-source-regime'
 
 import {
   FX_MISSING_REASONS, MissingFxRateError, isMissingFxRateError, endOfBusinessDateUtc, isValidCurrencyCode, isValidDate, refuse, selectFxRateFromRows,
@@ -39,6 +40,8 @@ export type { FxMissingReason, FxRateRow, FxRateToBase }
 /** What the helper needs from a Prisma client or transaction client. `organisation` is only read when no `baseCurrency` is passed. */
 export type FxLookupClient = {
   fxRate: Pick<Prisma.TransactionClient['fxRate'], 'groupBy' | 'findMany'>
+  /** Read for the FX source regime (lib/currencies/fx-source-regime.ts): every lookup applies it, so a client must be able to read the two settings. */
+  setting: Pick<Prisma.TransactionClient['setting'], 'findMany'>
   organisation?: Pick<PrismaClient['organisation'], 'findFirst'>
 }
 
@@ -75,22 +78,26 @@ export async function resolveFxRatesToBase(
   }
   if (toQuery.length === 0) return out
 
+  const regime = await getFxSourceRegime(client)
+  const restricted = regime?.source === 'aelia' && asOf.getTime() >= regime.since.getTime()
+  const eligible = { OR: [{ source: 'aelia' }, { manualOverride: true }] }
   const latest = await client.fxRate.groupBy({
     by: ['toCurrency'],
-    where: { fromCurrency: base, toCurrency: { in: toQuery }, fetchedAt: { lte: asOf } },
+    where: { fromCurrency: base, toCurrency: { in: toQuery }, fetchedAt: { lte: asOf }, ...(restricted ? eligible : {}) },
     _max: { fetchedAt: true },
   })
   const pairs = latest.flatMap((g) => (g._max.fetchedAt ? [{ toCurrency: g.toCurrency, fetchedAt: g._max.fetchedAt }] : []))
   const rows = pairs.length === 0 ? [] : await client.fxRate.findMany({
-    where: { fromCurrency: base, OR: pairs.map((p) => ({ toCurrency: p.toCurrency, fetchedAt: p.fetchedAt })) },
+    where: { fromCurrency: base, AND: [{ OR: pairs.map((p) => ({ toCurrency: p.toCurrency, fetchedAt: p.fetchedAt })) }, ...(restricted ? [eligible] : [])] },
     select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true, source: true, manualOverride: true },
   })
   for (const currency of toQuery) {
     try {
-      out.set(currency, { ok: true, ...selectFxRateFromRows(rows, { baseCurrency: base, currency, asOf }) })
+      out.set(currency, { ok: true, ...selectFxRateFromRows(rows, { baseCurrency: base, currency, asOf, regime }) })
     } catch (error) {
       if (!isMissingFxRateError(error)) throw error
-      out.set(currency, { ok: false, error })
+      // Under the Aelia regime the query only fetched eligible rows, so "no row" means the selected source has not given this currency.
+      out.set(currency, { ok: false, error: restricted && error.reason === 'no_rate' ? refuse('no_rate_from_selected_source', base, currency, asOf) : error })
     }
   }
   return out

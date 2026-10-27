@@ -53,6 +53,13 @@ test('the partial-shipment and FX paths report the hold text verbatim, not Strin
   mock.module('@/lib/settings-store', {
     namedExports: { getSettingValues: async () => settings, getSettingValue: async (k: string) => settings.get(k) ?? null },
   })
+  mock.module('@/lib/currencies/fx-table-lock', {
+    namedExports: {
+      withFxTableHeldStill: async (work: (guard: { lost: boolean; assertHeld: () => void }) => unknown) => work({ lost: false, assertHeld: () => {} }),
+      FxTableBusyError: class FxTableBusyError extends Error {},
+      FxTableLockLostError: class FxTableLockLostError extends Error {},
+    },
+  })
   mock.module('@/lib/db', {
     namedExports: { db: { shoppingOrderLink: { findFirst: async () => ({ externalOrderId: '42' }) }, setting: { findUnique: async () => null } } },
   })

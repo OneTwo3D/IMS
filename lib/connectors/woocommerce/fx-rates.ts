@@ -27,6 +27,7 @@ import type { FxRatePush, FxRatePushResult } from '../types'
 import { validateWooCommerceBaseUrl } from './url-safety'
 import { wooEgressHold } from './producer-egress'
 import { AELIA_PUSH_DISABLED_MESSAGE, getFxRateSource } from '@/lib/currencies/fx-source'
+import { FxTableBusyError, FxTableLockLostError, withFxTableHeldStill, type FxTableGuard } from '@/lib/currencies/fx-table-lock'
 
 const HELPER_PATH = '/wp-json/oti/v1/fx-rates'
 const PUSH_TIMEOUT_MS = 15_000
@@ -37,6 +38,21 @@ const PUSH_TIMEOUT_MS = 15_000
  * cron fan-out can iterate over enabled connectors without special-casing.
  */
 export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushResult> {
+  // THE CUTOVER BARRIER (push half; the other half is setFxRateSource, which changes the FX source under the EXCLUSIVE table lock). The push holds the table lock SHARED from its source check through the
+  // end of its POST, and the source is checked INSIDE the lock, so a switch to Aelia either waits for a push already under way (which was sent under the old source) or happens first and the push is
+  // disabled: no POST can follow the switch's commit. SHARED, not exclusive, because pushes and CSV imports do not need to exclude each other (only the writers do), and a shared hold cannot be starved by
+  // the importer. BOUNDS: the lock is waited for at most 30 s (the importer's own wait; on timeout the push is not sent), and once held it is kept for the POST, which is aborted at PUSH_TIMEOUT_MS (15 s),
+  // so a writer (the refresh, or the switch) waits for a push for at most about 15 s plus the settings read; a slow store cannot hold the table longer, and on that timeout the push fails (nothing is retried here).
+  try {
+    return await withFxTableHeldStill((guard) => pushFxRatesToWcLocked(rates, guard))
+  } catch (e) {
+    if (e instanceof FxTableBusyError) return { supported: true, pushed: 0, errors: ['The exchange-rate table is busy (a CSV import or a rate update is running); the push was not sent.'] }
+    if (e instanceof FxTableLockLostError) return { supported: true, pushed: 0, errors: [e.message] }
+    throw e
+  }
+}
+
+async function pushFxRatesToWcLocked(rates: FxRatePush[], guard: FxTableGuard): Promise<FxRatePushResult> {
   // The FX source is Aelia: Aelia owns the rates and IMS never writes them. Checked FIRST, before the settings or the store are touched; this is the lowest level, so every caller is covered.
   if ((await getFxRateSource()) === 'aelia') return { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] }
   const config = await getSettingValues(['wc_url', 'wc_webhook_secret', 'wc_fx_push_enabled'])
@@ -64,6 +80,7 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
   const endpoint = validatedUrl.normalizedUrl + HELPER_PATH
 
   try {
+    guard.assertHeld('sending the exchange-rate push') // a dead lock connection frees the lock: then nothing is sent
     const res = await connectorFetch(endpoint, {
       method: 'POST',
       headers: {

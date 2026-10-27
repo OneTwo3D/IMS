@@ -61,9 +61,19 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
     },
   }
 
+  const setting = {
+    findUnique: async (args: { where: { key: string } }) => (settings.has(args.where.key) ? { key: args.where.key, value: settings.get(args.where.key) } : null),
+    findMany: async (args: { where: { key: { in: string[] } } }) => args.where.key.in.filter((k) => settings.has(k)).map((key) => ({ key, value: settings.get(key) })),
+    upsert: async (args: { where: { key: string }; create: { value: string }; update: { value: string } }) => {
+      settings.set(args.where.key, settings.has(args.where.key) ? args.update.value : args.create.value)
+      return {}
+    },
+  }
+
   const tx = {
     $executeRaw: async () => { events.push('lock'); return 1 },
     fxRate,
+    setting,
   }
 
   const db = {
@@ -72,13 +82,7 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
         currencies.filter((c) => (args.where?.active === undefined || c.active === args.where.active) && (args.where?.code?.not === undefined || c.code !== args.where.code.not)),
     },
     fxRate,
-    setting: {
-      findUnique: async (args: { where: { key: string } }) => (settings.has(args.where.key) ? { key: args.where.key, value: settings.get(args.where.key) } : null),
-      upsert: async (args: { where: { key: string }; create: { value: string }; update: { value: string } }) => {
-        settings.set(args.where.key, settings.has(args.where.key) ? args.update.value : args.create.value)
-        return {}
-      },
-    },
+    setting,
     user: { findMany: async () => [] },
     // The ECB path's "which currencies are pinned" read: the latest row per currency among the given codes.
     $queryRaw: async (_strings: unknown, codes: string[]) => {

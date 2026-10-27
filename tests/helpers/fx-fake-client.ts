@@ -19,7 +19,10 @@ type Where = {
   fromCurrency?: string
   toCurrency?: string | { in: string[] }
   fetchedAt?: Date | { lte?: Date }
+  source?: string
+  manualOverride?: boolean
   OR?: Where[]
+  AND?: Where[]
 }
 
 function matches(row: FakeFxRow, where: Where | undefined): boolean {
@@ -29,11 +32,14 @@ function matches(row: FakeFxRow, where: Where | undefined): boolean {
   if (typeof where.toCurrency === 'object' && where.toCurrency && !where.toCurrency.in.includes(row.toCurrency)) return false
   if (where.fetchedAt instanceof Date && row.fetchedAt.getTime() !== where.fetchedAt.getTime()) return false
   if (where.fetchedAt && !(where.fetchedAt instanceof Date) && where.fetchedAt.lte && row.fetchedAt.getTime() > where.fetchedAt.lte.getTime()) return false
+  if (where.source !== undefined && (row.source ?? 'frankfurter') !== where.source) return false
+  if (where.manualOverride !== undefined && (row.manualOverride ?? false) !== where.manualOverride) return false
   if (where.OR && !where.OR.some((w) => matches(row, w))) return false
+  if (where.AND && !where.AND.every((w) => matches(row, w))) return false
   return true
 }
 
-export function fakeFxClient(rows: FakeFxRow[], baseCurrency: string | null = 'GBP'): FxLookupClient & { calls: Array<{ op: string; args: unknown }> } {
+export function fakeFxClient(rows: FakeFxRow[], baseCurrency: string | null = 'GBP', settings: Record<string, string> = {}): FxLookupClient & { calls: Array<{ op: string; args: unknown }> } {
   const calls: Array<{ op: string; args: unknown }> = []
   const client = {
     calls,
@@ -41,6 +47,12 @@ export function fakeFxClient(rows: FakeFxRow[], baseCurrency: string | null = 'G
       findFirst: async (args: unknown) => {
         calls.push({ op: 'organisation.findFirst', args })
         return baseCurrency === null ? null : { baseCurrency }
+      },
+    },
+    setting: {
+      findMany: async (args: unknown) => {
+        calls.push({ op: 'setting.findMany', args })
+        return Object.entries(settings).map(([key, value]) => ({ key, value }))
       },
     },
     fxRate: {

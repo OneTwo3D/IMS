@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { notify } from '@/lib/notifications'
-import { getFxRateSource } from '@/lib/currencies/fx-source'
+import { FX_SOURCE_CHANGED_MESSAGE, getFxRateSource, getFxRateSourceInTx } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
 // Core FX-rate refresh logic.
@@ -103,7 +103,11 @@ export async function fetchAllFxRatesInternal(): Promise<{
     const failed: string[] = []
 
     // The exclusive side of the rate table's stability lock: a running CSV import holds the table still (shared) and this write waits for it to finish.
+    // THE CUTOVER BARRIER (the other half is setFxRateSource, which changes the source under this same exclusive lock): the source is re-read INSIDE the lock, and a switch to Aelia that committed while
+    // frankfurter was being asked aborts the write, so no ECB row is stored after the switch.
+    let sourceChanged = false
     await withFxTableWriteLock(async (tx) => {
+      if ((await getFxRateSourceInTx(tx)) === 'aelia') { sourceChanged = true; return }
       for (const code of codes) {
         const rate = rates[code]
         if (typeof rate === 'number' && rate > 0) {
@@ -117,6 +121,10 @@ export async function fetchAllFxRatesInternal(): Promise<{
       }
     })
 
+    if (sourceChanged) {
+      await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'WARNING', description: `ECB FX refresh discarded: ${FX_SOURCE_CHANGED_MESSAGE}` })
+      return { success: false, updated: [], failed: [], error: FX_SOURCE_CHANGED_MESSAGE, retryCount }
+    }
     await recordFxFetchAttempt({
       status: failed.length ? 'partial' : 'success',
       retryCount,

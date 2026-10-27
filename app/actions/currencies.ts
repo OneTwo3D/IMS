@@ -7,7 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
-import { FX_RATE_SOURCE_SETTING, FX_RATE_SOURCES, getFxRateSource, type FxRateSource } from '@/lib/currencies/fx-source'
+import { FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -166,13 +166,13 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
     }
     if (rate === null) return null
 
-    await withFxTableWriteLock((tx) => tx.fxRate.create({
-      data: {
-        fromCurrency: baseCurrency,
-        toCurrency: code,
-        rate,
-      },
-    }))
+    // Re-read the source inside the lock: a switch to Aelia that committed while frankfurter was being asked wins, and the ECB row is not stored.
+    const stored = await withFxTableWriteLock(async (tx) => {
+      if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
+      await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate } })
+      return true
+    })
+    if (!stored) return null
     return rate
   } catch {
     return null
@@ -300,9 +300,12 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
   if (typeof fresh !== 'number' || fresh <= 0) {
     return { success: false, error: `frankfurter.dev did not return a rate for ${code}` }
   }
-  await withFxTableWriteLock((tx) => tx.fxRate.create({
-    data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false },
-  }))
+  const stored = await withFxTableWriteLock(async (tx) => {
+    if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
+    await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false } })
+    return true
+  })
+  if (!stored) return { success: false, error: 'The FX source changed to Aelia while this ran; nothing was stored.' }
   await logActivity({
     entityType: 'SETTING',
     tag: 'settings',
@@ -461,18 +464,23 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
       return { success: false, error: 'Set the WooCommerce store address and the shared secret first: Aelia is read through the onetwoInventory Helper plugin (1.3.0 or later) on the store.' }
     }
   }
-  await db.setting.upsert({
-    where: { key: FX_RATE_SOURCE_SETTING },
-    create: { key: FX_RATE_SOURCE_SETTING, value: source },
-    update: { value: source },
+  // THE CUTOVER BARRIER. The source and the instant of the change are written together under the EXCLUSIVE FX table lock: a rate push (which holds the lock shared from its source check through its POST) and a
+  // CSV import finish first, and every ECB refresh write re-reads the source inside this same lock. So once this commits no ECB row and no rate POST can follow it.
+  const switchedAt = new Date()
+  const changed = await withFxTableWriteLock(async (tx) => {
+    if ((await getFxRateSourceInTx(tx)) === source) return false
+    await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SETTING }, create: { key: FX_RATE_SOURCE_SETTING, value: source }, update: { value: source } })
+    await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SINCE_SETTING }, create: { key: FX_RATE_SOURCE_SINCE_SETTING, value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
+    return true
   })
+  if (!changed) return { success: true }
   await logActivity({
     entityType: 'SETTING',
     tag: 'settings',
     action: 'fx_rate_source_changed',
     description: source === 'aelia'
-      ? 'FX source set to Aelia: rates are read from the store (before markup) and the IMS to WooCommerce rate push is disabled'
-      : 'FX source set to ECB (frankfurter): rates are fetched daily and may be pushed to WooCommerce',
+      ? `FX source set to Aelia from ${switchedAt.toISOString()}: rates are read from the store (before markup), lookups from that instant use only Aelia rates and manual overrides, and the IMS to WooCommerce rate push is disabled`
+      : `FX source set to ECB (frankfurter) from ${switchedAt.toISOString()}: rates are fetched daily and may be pushed to WooCommerce`,
   })
   revalidatePath('/settings/accounting')
   revalidatePath('/sync')

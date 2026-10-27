@@ -13,7 +13,7 @@ import { aeliaAnswer, createFxSourceFakeDb } from '@/tests/helpers/fx-source-fak
 
 const ACTIVE = [{ code: 'GBP', active: true }, { code: 'EUR', active: true }, { code: 'USD', active: true }, { code: 'NOK', active: true }]
 let fake = createFxSourceFakeDb()
-const calls = { aeliaRead: 0, frankfurter: 0, connectorPush: 0, facadePush: 0, wcFetch: 0 }
+const calls = { aeliaRead: 0, frankfurter: 0, connectorPush: 0, facadePush: 0, wcFetch: 0, lockHeld: 0 }
 let aeliaAnswerBody: unknown = aeliaAnswer()
 let aeliaReadResult: { ok: boolean; body?: unknown; reason?: string; message?: string } | null = null
 
@@ -131,6 +131,11 @@ test('flag ON: a missing or non-positive rate is reported per currency (status p
 })
 
 test('the push to WooCommerce: flag OFF unchanged (it goes to the store); flag ON disabled at the lowest level, nothing sent', async () => {
+  // The push holds the FX table lock shared (a real-database arm is in tests/concurrency/fx-source-cutover.concurrent.test.ts); here the lock is a recording pass-through.
+  const realLock = await import('@/lib/currencies/fx-table-lock')
+  mock.module('@/lib/currencies/fx-table-lock', {
+    namedExports: { ...realLock, withFxTableHeldStill: async (work: (g: { lost: boolean; assertHeld: () => void }) => unknown) => { calls.lockHeld += 1; return work({ lost: false, assertHeld: () => {} }) } },
+  })
   const { pushFxRatesToWc, pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
   const { AELIA_PUSH_DISABLED_MESSAGE } = await import('@/lib/currencies/fx-source')
   const rates = [{ fromCurrency: 'GBP', toCurrency: 'EUR', rate: 1.19, fetchedAt: '2026-10-23T23:36:05Z' }]
@@ -139,6 +144,7 @@ test('the push to WooCommerce: flag OFF unchanged (it goes to the store); flag O
   const off = await pushFxRatesToWc(rates)
   assert.deepEqual(off, { supported: true, pushed: 3, errors: [] })
   assert.equal(calls.wcFetch, 1, 'CONTROL: with the flag off the push really reaches the transport')
+  assert.equal(calls.lockHeld, 1, 'the push ran inside the FX table lock')
 
   reset('aelia')
   assert.deepEqual(await pushFxRatesToWc(rates), { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] })
@@ -193,5 +199,47 @@ test('the setting key is fx_rate_source and the source switch is a settings.comp
   const src = readFileSync('app/actions/currencies.ts', 'utf8')
   const action = src.slice(src.indexOf('export async function setFxRateSource'))
   assert.match(action, /requirePermission\('settings\.company'\)/)
-  assert.match(readFileSync('lib/currencies/fx-source.ts', 'utf8'), /FX_RATE_SOURCE_SETTING = 'fx_rate_source'/)
+  assert.match(readFileSync('lib/currencies/fx-source-regime.ts', 'utf8'), /FX_RATE_SOURCE_SETTING = 'fx_rate_source'/)
+  assert.match(readFileSync('lib/currencies/fx-source-regime.ts', 'utf8'), /FX_RATE_SOURCE_SINCE_SETTING = 'fx_rate_source_since'/)
+})
+
+test('CUTOVER BARRIER, refresh half: an ECB refresh that was in flight when the source switched to Aelia stores NO ECB row', async () => {
+  reset()
+  // the switch commits while frankfurter is being asked (what setFxRateSource does, under the exclusive lock)
+  globalThis.fetch = (async () => {
+    calls.frankfurter += 1
+    fake.settings.set('fx_rate_source', 'aelia')
+    return new Response(JSON.stringify({ rates: { EUR: 1.1, USD: 1.25, NOK: 12.1 } }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  const { fetchAllFxRatesInternal } = await import('@/lib/currencies/fx-refresh')
+  const result = await fetchAllFxRatesInternal()
+  assert.equal(calls.frankfurter, 1, 'PRECONDITION: the ECB fetch really happened')
+  assert.equal(result.success, false)
+  assert.deepEqual(result.updated, [])
+  assert.equal(fake.rates.length, 0, 'no ECB row stored after the switch')
+  assert.equal(calls.facadePush, 0)
+  assert.equal(fake.settings.has('fx_last_fetched'), false)
+})
+
+test('CUTOVER BARRIER, wiring: setFxRateSource writes source and instant together under the exclusive lock; the other frankfurter writers re-read the source inside their lock', () => {
+  const src = readFileSync('app/actions/currencies.ts', 'utf8')
+  const sw = src.slice(src.indexOf('export async function setFxRateSource'))
+  assert.match(sw, /withFxTableWriteLock\(async \(tx\) => \{[\s\S]*?FX_RATE_SOURCE_SETTING[\s\S]*?FX_RATE_SOURCE_SINCE_SETTING[\s\S]*?\}\)/)
+  const single = src.slice(src.indexOf('async function fetchSingleFxRate'), src.indexOf('/** Fetch FX rates for all active currencies'))
+  assert.ok(single.indexOf('withFxTableWriteLock') < single.indexOf("getFxRateSourceInTx(tx)") && single.indexOf("getFxRateSourceInTx(tx)") < single.indexOf('tx.fxRate.create'))
+  const clear = src.slice(src.indexOf('export async function clearManualFxRate'), src.indexOf('export type FxPushLogRow'))
+  assert.ok(clear.lastIndexOf('withFxTableWriteLock') < clear.lastIndexOf("getFxRateSourceInTx(tx)") && clear.lastIndexOf("getFxRateSourceInTx(tx)") < clear.lastIndexOf('tx.fxRate.create'))
+  const refresh = readFileSync('lib/currencies/fx-refresh.ts', 'utf8')
+  const ecb = refresh.slice(refresh.indexOf('let sourceChanged = false'), refresh.indexOf('recordFxFetchAttempt({\n      status: failed.length'))
+  assert.ok(ecb.indexOf("getFxRateSourceInTx(tx)") < ecb.indexOf('tx.fxRate.create'))
+  const push = readFileSync('lib/connectors/woocommerce/fx-rates.ts', 'utf8')
+  assert.match(push, /withFxTableHeldStill\(\(guard\) => pushFxRatesToWcLocked\(rates, guard\)\)/)
+  const locked = push.slice(push.indexOf('async function pushFxRatesToWcLocked'))
+  assert.ok(locked.indexOf("getFxRateSource()) === 'aelia'") < locked.indexOf('connectorFetch('), 'the source is checked inside the lock, before the POST')
+  assert.ok(locked.indexOf("guard.assertHeld") < locked.indexOf('connectorFetch('))
+  assert.match(locked, /signal: AbortSignal\.timeout\(PUSH_TIMEOUT_MS\)/, 'the POST is bounded, so the shared hold is bounded')
+  assert.match(push, /const PUSH_TIMEOUT_MS = 15_000/)
+  const fin = readFileSync('lib/domain/finance/finance-period-analytics.ts', 'utf8')
+  assert.equal((fin.match(/settlementRateToBase\([^)]*fxRegime\)/g) ?? []).length, 2, 'the FX gain/loss report applies the source regime to both of its lookups')
+  assert.match(fin, /getFxSourceRegime\(\{ setting: client\.setting/)
 })

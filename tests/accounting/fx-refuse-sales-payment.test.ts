@@ -45,6 +45,7 @@ const tx = {
     create: async (args: { data: Row }) => { state.created.push(args.data); return { id: 'pay-1', paidAt: args.data.paidAt, amount: args.data.amount } },
   },
   salesOrderRefund: { findFirst: async (): Promise<{ totalForeign: number } | null> => null },
+  setting: { findMany: async () => [] },
   fxRate: {
     groupBy: async (args: { where: { fetchedAt: { lte: Date } } }) => { state.asOfs.push(args.where.fetchedAt.lte); return fakeFxClient(state.rates).fxRate.groupBy(args as never) },
     findMany: async (args: never) => fakeFxClient(state.rates).fxRate.findMany(args),
