@@ -88,7 +88,7 @@ test('a column map that leaves lineDiscountPercent out is refused (an omitted co
   assert.throws(() => ingestDataset('purchase-order-lines', Buffer.from(header, 'utf8'), 'po.csv', null), /required column "lineDiscountPercent" is missing/)
 })
 
-type PoMap = { datasets: { 'purchase-order-lines': { columns: Record<string, string>; constants: Record<string, string>; valueMaps: Record<string, Record<string, string>>; derived?: Record<string, string>; expectedHeaders?: string[] } } }
+type PoMap = { datasets: { 'purchase-order-lines': { columns: Record<string, string>; constants: Record<string, string>; valueMaps: Record<string, Record<string, string>>; derived?: Record<string, string>; dateFormats?: Record<string, string>; expectedHeaders?: string[] } } }
 const editedMap = (edit: (d: PoMap['datasets']['purchase-order-lines']) => void) => {
   const m = JSON.parse(mapText()) as PoMap
   edit(m.datasets['purchase-order-lines'])
