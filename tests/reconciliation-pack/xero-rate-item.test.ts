@@ -416,6 +416,19 @@ test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is 
     const bad = await runXeroRateItem('R16', context(lists, { ims: { rows: LATER, posted: [postedRow(1, type, { wooReceipt: true, wooOrder: true, orderRate: '1.25', orderCreatedAt: 'not-a-date' })] } }).ctx)
     assert.deepEqual([bad.outcome, [...bad.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], type)
   }
+  // A payload from BEFORE the importer's rate marker has no marker; the receipt is told from its provenance (the payment row is the importer's), and judged by the same rule.
+  const legacy = (rate: string, orderRate: string | null, xero: number, orderCreatedAt: string | null, over: Partial<ReturnType<typeof postedRow>> = {}) => context({ payments: [paymentRow({ n: 1, date: SEP, currency: 'EUR', rate: xero })] }, { ims: { rows: day10, posted: [postedRow(1, 'INVOICE_PAYMENT', { rate, orderRate, wooReceipt: false, wooOrder: true, hasPaymentId: true, paymentFound: true, paymentFromStorefront: true, orderCreatedAt, ...over })] } }).ctx
+  const legacyLater = await runXeroRateItem('R16', legacy('1.2', '1.2', 0.833333, sep9))
+  assert.deepEqual([legacyLater.outcome, [...legacyLater.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTED_RATE_NOT_TABLE_RATE']], 'no marker, a later day, differing rates')
+  assert.equal((await runXeroRateItem('R16', legacy('1.2', '1.2', 0.833333, '2026-09-10T08:00:00.000Z'))).outcome, 'pass', 'no marker, the same day, the order rate')
+  assert.equal((await runXeroRateItem('R16', legacy('1.4', '1.2', 0.714286, sep9))).outcome, 'pass', 'no marker, a later day, the payment-day rate')
+  for (const [name, over] of [['no payment named', { hasPaymentId: false, paymentFound: false, paymentFromStorefront: false }], ['the payment row is gone', { paymentFound: false, paymentFromStorefront: false }]] as const) {
+    const unproven = await runXeroRateItem('R16', legacy('1.2', '1.2', 0.833333, sep9, over))
+    assert.deepEqual([unproven.outcome, [...unproven.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], name)
+  }
+  // A payment of a storefront order that is provably NOT the importer's (a hand-entered one) has no storefront rule: checked against Xero only and counted.
+  const hand = await runXeroRateCheck(legacy('1.2', '1.2', 0.833333, sep9, { paymentFromStorefront: false }))
+  assert.deepEqual([hand.item.outcome, hand.summary?.postedTableNotChecked], ['pass', 1])
   // A storefront invoice with a known creation instant carries exactly the central rate AT that instant (1.25 from 06:00, 1.30 from 18:00), not any rate of the day.
   const at = (created: string | null, rate: string, xero: number) => context({ invoices: [eur(1, xero)] }, { ims: { rows: LATER, posted: [postedRow(1, 'SALES_INVOICE', { rate, wooOrder: true, orderCreatedAt: created })] } }).ctx
   assert.equal((await runXeroRateItem('R16', at('2026-09-10T10:00:00.000Z', '1.25', 0.8))).outcome, 'pass')

@@ -27,7 +27,8 @@
  *
  *   IMS POSTINGS (Codex round 2). A record IMS posted (an IMS sync record, connector-confirmed, names its Xero id) is held to the rate that posting CARRIED, converted
  *   by the poster's own helper, not to the table now: the poster sends the stored rate and never looks one up. A second check holds that stored rate to the table
- *   where a date rule is stated in code (a storefront invoice at the order's instant, a receipt by the importer's same-day test); other posted records are counted, not table-checked. Records IMS did not post keep the
+ *   where a date rule is stated in code (a storefront invoice at the order's instant, a receipt by the importer's same-day test; a receipt is identified by its payments-row
+ *   provenance as well as the importer's marker, and unproven provenance on a storefront order is a finding); other posted records are counted, not table-checked. Records IMS did not post keep the
  *   reconstruction below. An IMS link whose rate cannot be read is IMS_POSTING_UNREADABLE (a finding), never a pass.
  *
  *   FINDINGS, each a closed reason (the item fails with DIFFERENCES and the specific reasons):
@@ -187,7 +188,12 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     const day = log.date !== null && DAY_RE.test(log.date.slice(0, 10)) && validDay(log.date.slice(0, 10)) ? log.date.slice(0, 10) : null
     const tableKey = [...baseKey(document), sku('posted-vs-table'), sku(log.id)]
     let candidates: Prisma.Decimal[] | null = null
-    if (log.type === 'INVOICE_PAYMENT' && log.wooReceipt) {
+    // A storefront receipt is identified by its PROVENANCE, never by the importer's rate marker alone (a payload from before the marker falls back to the order's rate and is
+    // judged by the same rule): the marker, or an INVOICE_PAYMENT of a storefront order whose payments row is the importer's. A storefront order's payment whose row cannot be found,
+    // or whose payload names none, cannot be told from a storefront receipt: unreadable, never a skip.
+    const storefrontReceipt = log.type === 'INVOICE_PAYMENT' && (log.wooReceipt || (log.wooOrder && log.paymentFromStorefront))
+    if (log.type === 'INVOICE_PAYMENT' && log.wooOrder && !storefrontReceipt && !(log.hasPaymentId && log.paymentFound)) return unreadablePosting(log.id, 'receipt-provenance-unproven')
+    if (storefrontReceipt) {
       // A storefront receipt, by the importer's own rule (receiptOnOrderDay, the very function the importer calls): the order's booked rate when the payment's UTC day is
       // the order's, and ONLY then; on any other day, or when the order's creation instant is unknown, the central rate at the end of the payment's day. A missing table
       // rate on such a day is IMS_RATE_MISSING, never a pass through the order's rate.
