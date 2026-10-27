@@ -65,7 +65,7 @@ export function stripCronDUserField(text: string): string {
 
 /*
  * DIAGNOSTICS NEVER CARRY INSTALLED COMMAND TEXT. A host cron line can hold a bearer token or any other credential, and these
- * messages reach the Scheduler page and `--check` output, so they give line numbers and a classification only; the one piece of an
+ * messages reach the Scheduler page and the status output, so they give line numbers and a classification only; the one piece of an
  * assignment that is ever shown is its variable NAME, never its value.
  */
 

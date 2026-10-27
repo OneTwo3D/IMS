@@ -77,12 +77,9 @@ export default async function SystemSettingsPage({
   // that will drift outside the app's control.
   const crontabWarnings: string[] = []
   let hostCronNotice: string | null = null
-  if (crontabStatus?.hostCron) {
-    // Container mode: host cron is installed by the host, so the only question is whether it matches the saved settings.
-    if (crontabStatus.hostCron.inSync) hostCronNotice = crontabStatus.hostCron.message
-    else crontabWarnings.push(crontabStatus.hostCron.message)
-  } else if (crontabStatus?.readError?.startsWith('The host cron file')) {
-    crontabWarnings.push(crontabStatus.readError)
+  if (crontabStatus?.hostManaged) {
+    // Container mode: host cron is installed by the host, not by this page.
+    hostCronNotice = 'Cron runs on the host (container mode). Saving here records the settings only; the host applies them by re-rendering and installing /etc/cron.d/onetwo3d-ims (deploy/README.md, "Cron runs on the host, not in the container").'
   } else if (crontabStatus?.readError) {
     // An unreadable crontab answers NONE of the drift questions below, so none of them are asked.
     crontabWarnings.push(`The crontab for the app user (${crontabStatus.osUser}) could not be read, so whether the managed block is present and current is UNKNOWN — this is not a report that it is missing. ${crontabStatus.readError}.`)

@@ -232,20 +232,20 @@ one. Mounting `/etc/cron.d` read-only at, say, `/host-cron.d` and setting
 
 **In container mode, Save only records the settings.** The Scheduler page's Save & Apply (and every other save that used to rewrite
 the crontab) cannot change host cron: it commits the settings, runs no `crontab`, and reports a warning, never a success: "Host cron
-update pending: the host must re-render and install /etc/cron.d/onetwo3d-ims". The page also shows whether host cron is "in sync" or
-"out of date (N jobs differ)" by comparing the saved settings with the mounted file. The host applies a change by re-rendering and
+update pending: the host must re-render and install /etc/cron.d/onetwo3d-ims". The Scheduler page says that cron runs on the host. The host applies a change by re-rendering and
 installing the file with the command below. A later deployment task will add a host timer that does this automatically every few
 minutes when the rendered output changes; until that exists, it is manual. Container mode is `IMS_SCHEDULER_CRONTAB_FILE` set together
 with `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d`; on a stage host (the `user` layout, `crontab -l`) Save & Apply still rewrites the crontab as
 before. Schedules are validated against the real cron field ranges (minute 0-59, hour 0-23, day of month 1-31, month 1-12, day of week 0-7; `*`, lists, ranges and steps, no names or macros): Save refuses an invalid one, the renderer refuses to render a saved one (naming the job and field), and the reader treats an installed line with one as unreadable, because cron silently ignores such a line.
-The same drift check is available from the image: `docker exec <ims> node /app/dist-scripts/render-managed-crontab.mjs --check`
-(exit 0 in sync, 1 out of date).
+A check that compares the installed host file with the saved settings (and shows "in sync" or "out of date" on the Scheduler page)
+is deliberately not part of this change; it is in a separate follow-up pull request. Until it lands, re-render after every change and
+treat the installed file as unverified against Settings.
 
 **Re-render and reinstall after ANY scheduler change in Settings (a job switched on or off, a schedule edited), and after every
 deploy** (a new image can register new jobs), using the command above. Until you do, host cron keeps firing the old schedule and the
 status reader reports the changed jobs as unscheduled. `--defaults-only` renders every job on at its registry default WITHOUT reading
-the database (for a host that has no database yet); its output says `DEFAULTS ONLY` on the first line and will drift from Settings
-as soon as anything is saved. For a stage host or any account crontab, omit `--format` (the `user` layout, the text `crontab -l`
+the database (for a host that has no database yet); its output says `DEFAULTS ONLY` on the first line and will not follow Settings
+once anything is saved. For a stage host or any account crontab, omit `--format` (the `user` layout, the text `crontab -l`
 prints) and install it with `crontab`.
 
 Each rendered line reads `CRON_SECRET=` from the secret file named by `--secret-file` when it fires. Requirements for that file on
