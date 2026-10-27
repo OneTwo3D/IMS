@@ -134,13 +134,13 @@ test('db: the Aelia source regime filters in SQL: a newer ECB row is ignored aft
       { to: 'JPY', rate: '160', at: '2026-10-25T12:00:00Z', source: 'manual', manual: true },
     ])
     // the settings are stubbed (writing `settings` here would show up in the basis test's tuple counts); the fx_rates SQL is the real one
-    const client = { fxRate: tx.fxRate, setting: { findMany: async () => [{ key: 'fx_rate_source', value: 'aelia' }, { key: 'fx_rate_source_since', value: '2026-10-24T00:00:00Z' }] } }
+    const client = { fxRate: tx.fxRate, setting: { findMany: async () => [{ key: 'fx_rate_source', value: 'aelia' }, { key: 'fx_rate_source_since', value: '2026-10-24T00:00:00Z' }] } } as never
     const after = D('2026-10-26T12:00:00Z')
     assert.equal((await getFxRateToBase(client, { currency: 'EUR', asOf: after, baseCurrency: 'GBP' })).rate.toString(), '1.19')
     await assert.rejects(getFxRateToBase(client, { currency: 'USD', asOf: after, baseCurrency: 'GBP' }), (e: unknown) => e instanceof MissingFxRateError && e.reason === 'no_rate_from_selected_source')
     assert.equal((await getFxRateToBase(client, { currency: 'EUR', asOf: D('2026-10-20T12:00:00Z'), baseCurrency: 'GBP' })).rate.toString(), '1.1')
     assert.equal((await getFxRateToBase(client, { currency: 'JPY', asOf: after, baseCurrency: 'GBP' })).rate.toString(), '160')
-    const ecb = { fxRate: tx.fxRate, setting: { findMany: async () => [] } }
+    const ecb = { fxRate: tx.fxRate, setting: { findMany: async () => [] } } as never
     assert.equal((await getFxRateToBase(ecb, { currency: 'EUR', asOf: after, baseCurrency: 'GBP' })).rate.toString(), '1.25')
   })
 })

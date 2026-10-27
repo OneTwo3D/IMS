@@ -10,7 +10,7 @@ import { getFxRateToBase } from '@/lib/currencies/fx-lookup'
  * A manual sales order is created at this same lookup (createSalesOrder): no order takes a typed rate.
  */
 export async function resolveFxRateToBase(
-  tx: Pick<Prisma.TransactionClient, 'fxRate'>,
+  tx: Pick<Prisma.TransactionClient, 'fxRate' | 'setting'>,
   currency: string,
   baseCurrency: string,
   asOf: Date,

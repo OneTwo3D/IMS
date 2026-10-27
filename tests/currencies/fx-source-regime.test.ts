@@ -85,7 +85,7 @@ test('database lookup (getFxRateToBase): the same four arms through the real que
 })
 
 test('database lookup: flag OFF (no setting, or ecb) is exactly today\'s plain latest row', async () => {
-  for (const s of [{}, { fx_rate_source: 'ecb', fx_rate_source_since: SINCE }]) {
+  for (const s of [{}, { fx_rate_source: 'ecb', fx_rate_source_since: SINCE }] as Array<Record<string, string>>) {
     const client = fakeFxClient(rows, 'GBP', s)
     assert.equal((await getFxRateToBase(client, { currency: 'EUR', asOf: AFTER })).rate.toString(), '1.25')
     assert.equal((await getFxRateToBase(client, { currency: 'USD', asOf: AFTER })).rate.toString(), '1.3')
