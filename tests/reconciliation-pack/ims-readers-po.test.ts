@@ -251,6 +251,7 @@ test('xeroPostedRates: reads the connector-confirmed creates of the six posting 
   assert.match(sql, /LEFT JOIN payments pay ON l\.type::text = 'INVOICE_PAYMENT' AND pay\.id = l\.payload->>'paymentId'/)
   assert.match(sql, /pay\.notes LIKE 'Imported from WooCommerce%' OR pay\.notes LIKE 'Recorded from WooCommerce%'/)
   assert.match(sql, /so\."fxRateToBase"::text AS order_rate/)
+  assert.match(sql, /\(l\.payload->>'paymentId'\) IS NOT NULL\) AS has_payment_id/)
   assert.match(sql, /'settlementRateToBase' ELSE l\.payload->>'currencyRateToBase'/)
   const reason = async (rows: Array<Record<string, unknown>>, cap?: number) => {
     const s = await sectionOf('xeroPostedRates', fake((q) => (/accounting_sync_logs l/.test(q) ? rows : [])), undefined, cap)

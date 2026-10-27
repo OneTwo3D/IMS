@@ -422,7 +422,7 @@ test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is 
   assert.deepEqual([legacyLater.outcome, [...legacyLater.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTED_RATE_NOT_TABLE_RATE']], 'no marker, a later day, differing rates')
   assert.equal((await runXeroRateItem('R16', legacy('1.2', '1.2', 0.833333, '2026-09-10T08:00:00.000Z'))).outcome, 'pass', 'no marker, the same day, the order rate')
   assert.equal((await runXeroRateItem('R16', legacy('1.4', '1.2', 0.714286, sep9))).outcome, 'pass', 'no marker, a later day, the payment-day rate')
-  for (const [name, over] of [['no payment named', { hasPaymentId: false, paymentFound: false, paymentFromStorefront: false }], ['the payment row is gone', { paymentFound: false, paymentFromStorefront: false }]] as const) {
+  for (const [name, over] of [['no payment named', { hasPaymentId: false, paymentFound: false, paymentFromStorefront: false }], ['the payment row is gone', { paymentFound: false, paymentFromStorefront: false }], ['a row found for a payment the payload does not name', { hasPaymentId: false, paymentFound: true, paymentFromStorefront: false }]] as const) {
     const unproven = await runXeroRateItem('R16', legacy('1.2', '1.2', 0.833333, sep9, over))
     assert.deepEqual([unproven.outcome, [...unproven.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], name)
   }
