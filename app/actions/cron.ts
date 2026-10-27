@@ -7,11 +7,13 @@ import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { getCronSecret } from '@/lib/cron-secret'
 import {
+  validateCronSchedule,
   emulateRuntimeSecretExtraction,
   parseOtiCrontabStatus,
   type OtiCrontabStatus,
 } from '@/lib/crontab-sync'
 import { reconcileCrontab, readOwnCrontabResult } from '@/lib/crontab-reconcile'
+import { isContainerSchedulerMode } from '@/lib/ops/host-cron'
 // The BARREL, not @/lib/cron-registry: registration is an import side effect of the job modules,
 // so the registry is EMPTY unless something has imported them. Reading it bare would have mirrored
 // no legacy key and reported nothing.
@@ -92,6 +94,17 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
     return rows
   })
   if (entries.length === 0) return { status: 'saved' }
+
+  // EVERY schedule is checked against the real cron field ranges BEFORE anything is written, in every mode: `99 * * * *` passes a
+  // shape check, would be stored, and in container mode would be installed on the host by a file nothing syntax-checks, where cron
+  // silently never runs the job.
+  const labelBySettingKey = new Map(getAllCronJobs().map((job) => [job.settingKey, job.label]))
+  for (const job of jobs) {
+    const check = validateCronSchedule(job.schedule)
+    if (!check.ok) {
+      return { status: 'refused', error: `Invalid schedule for "${labelBySettingKey.get(job.settingKey) ?? job.settingKey}": ${check.error}. Nothing was saved.` }
+    }
+  }
 
   // The scheduled reconciliation pack re-reads its switch, schedule, phase and vendor option under this fence just before it starts
   // a run, so a save that changes any of them takes it first (and waits only for that short read, never for a running child).
@@ -199,6 +212,8 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
    * sends them to press the one button that used to overwrite the crontab it could not read.
    */
   readError: string | null
+  /** Container mode: cron runs on the host and this process cannot read or write it, so the crontab questions do not apply. */
+  hostManaged?: true
 }
 
 /**
@@ -209,6 +224,11 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
  */
 export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
   await requirePermission('settings.company')
+  if (isContainerSchedulerMode()) {
+    // Cron runs on the host and the app can neither read nor write the app user's crontab here (there is no crontab binary), so none of
+    // the drift questions below apply; the page says so instead of reporting a missing block.
+    return { ...parseOtiCrontabStatus('', await getCronSecret()), osUser: os.userInfo().username, runtimeSecretMatches: null, readError: null, hostManaged: true }
+  }
   const [read, secret] = await Promise.all([readOwnCrontabResult(), getCronSecret()])
   if (!read.resolved) {
     // Report the unanswered question as unanswered. Everything a drift panel would say about a

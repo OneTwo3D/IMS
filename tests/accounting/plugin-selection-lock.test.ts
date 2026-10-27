@@ -1268,6 +1268,9 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/audit-xero-live-contamination.ts': 'operator-run-read',
   'scripts/check-stock-quantity-constraints.mjs': 'rolled-back-constraint-probe',
   'scripts/cogs-e2e-fixture.ts': 'operator-run-write',
+  // Runs `prisma migrate deploy` only INSIDE a throwaway migrate-image container against a postgres:17
+  // container it starts and removes itself; it never connects to any database of this installation.
+  'scripts/container-smoke.sh': 'names-the-tools-only',
   'scripts/copy-tax-rates.ts': 'operator-run-write',
   'scripts/csv-import-e2e-fixture.ts': 'operator-run-write',
   // o3d-zjsb5.9 r10. THE duplicate-recipe repair an operator runs when an import is refused because a

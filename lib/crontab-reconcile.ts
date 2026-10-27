@@ -19,6 +19,8 @@ import {
 } from '@/lib/crontab-sync'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { HOST_CRON_PENDING_MESSAGE } from '@/lib/ops/host-cron-constants'
+import { isContainerSchedulerMode } from '@/lib/ops/host-cron'
 import { withCrontabReconcileLock, type HeldCrontabReconcileLock } from '@/lib/crontab-reconcile-lock'
 
 /** How long `crontab -` gets to accept the new file before it is killed and reported as failed. */
@@ -97,6 +99,9 @@ export type CrontabReconcileResult = {
  * other reconciliation wait for a log insert.
  */
 export async function reconcileCrontab(): Promise<CrontabReconcileResult> {
+  // Container mode: host cron is read-only to the app and there is no crontab binary. Nothing is run; the caller reports the pending
+  // state (a saved-but-not-applied warning, never a success) and the host re-renders and installs the file.
+  if (isContainerSchedulerMode()) return { success: false, error: HOST_CRON_PENDING_MESSAGE }
   const outcome = await withCrontabReconcileLock(applyCrontabFromSettings)
   if (!outcome.locked) return { success: false, error: outcome.error }
   const result = outcome.result
@@ -136,6 +141,32 @@ export async function reconcileCrontab(): Promise<CrontabReconcileResult> {
 }
 
 /**
+ * The jobs the scheduler writes and the SAVED enablement/schedule rows (plus legacy enablement keys) it renders them from. The one
+ * reader: the in-app crontab writer and the container image's crontab renderer both call it, so a block rendered outside the app
+ * reflects exactly the settings the app would write.
+ */
+export async function readCronJobsAndSettings(): Promise<{ jobs: ReturnType<typeof getAllCronJobs>; settings: Map<string, string> }> {
+  const pluginState = await getIntegrationPluginState()
+  const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
+
+  // Read enabled/schedule settings for every registered job, plus legacy keys
+  const settingKeys = jobs.flatMap((j) => [
+    `cron_${j.settingKey}_enabled`,
+    `cron_${j.settingKey}_schedule`,
+  ])
+  const legacyKeys = jobs
+    .filter((j) => j.legacyEnabledKey)
+    .map((j) => j.legacyEnabledKey!)
+
+  const rows = await db.setting.findMany({
+    where: { key: { in: [...settingKeys, ...legacyKeys] } },
+  })
+  const settings = new Map(rows.map((r) => [r.key, r.value]))
+
+  return { jobs, settings }
+}
+
+/**
  * The read-modify-write itself: SNAPSHOT the settings, read the crontab, write the crontab.
  *
  * Not exported, and called from exactly one place — `reconcileCrontab` above, under the lock. All
@@ -154,22 +185,7 @@ async function applyCrontabFromSettings(
   if (!baseUrl) {
     return { success: false, error: 'Public app URL is not configured.' }
   }
-  const pluginState = await getIntegrationPluginState()
-  const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
-
-  // Read enabled/schedule settings for every registered job, plus legacy keys
-  const settingKeys = jobs.flatMap((j) => [
-    `cron_${j.settingKey}_enabled`,
-    `cron_${j.settingKey}_schedule`,
-  ])
-  const legacyKeys = jobs
-    .filter((j) => j.legacyEnabledKey)
-    .map((j) => j.legacyEnabledKey!)
-
-  const rows = await db.setting.findMany({
-    where: { key: { in: [...settingKeys, ...legacyKeys] } },
-  })
-  const settings = new Map(rows.map((r) => [r.key, r.value]))
+  const { jobs, settings } = await readCronJobsAndSettings()
 
   const logPath = process.env.OTI_CRON_LOG_PATH?.trim() || undefined
   const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })

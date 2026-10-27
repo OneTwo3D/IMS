@@ -121,3 +121,223 @@ guarantee.
   aim to keep it in the "OK"/"exposed" range or better.
 - Do **not** add `MemoryDenyWriteExecute=true` — it breaks the V8 JIT and the
   process will crash on start.
+
+## Container image
+
+A CI-built, production-shaped image of IMS. It is built by `.github/workflows/image.yml`
+from the repo-root `Dockerfile` and published to GHCR on every push to `development` and
+`main` (pull requests build and smoke-test but never push). Nothing about the existing
+`next start` unit or the stage host changes: `next.config.ts` only emits a standalone
+bundle when `NEXT_OUTPUT=standalone`, and only the Dockerfile's build stage sets it.
+
+| Image | Dockerfile target | Tags |
+|-------|-------------------|------|
+| `ghcr.io/onetwo3d/ims` | `runtime` (default) | `<full-git-sha>`, `development` or `main` |
+| `ghcr.io/onetwo3d/ims-migrate` | `migrate` | `<full-git-sha>`, `development` or `main` |
+
+Deploy by the full-SHA tag; the moving tags exist for convenience only.
+
+### What is in each target
+
+- **`runtime`**: Next.js standalone server (`node server.js`) on `0.0.0.0:3000`, running as
+  non-root uid/gid 1001 `ims`, base `node:22-bookworm-slim`. It does **not** carry the full
+  `node_modules`: only what Next's file tracing put in `.next/standalone`. Prisma 7 has no
+  query-engine binary, and `pg` / `@prisma/adapter-pg` are pure JS, so nothing native is needed
+  for the database. `HEALTHCHECK` is `GET /login` expecting 200 (done with `node`; there is no
+  `curl`). Persistent state lives under `/var/lib/onetwoinventory/{backups,uploads,public-uploads,invoice-pdfs}`
+  (a declared `VOLUME`, pre-owned by uid 1001; the matching `*_DIR` variables default to these). **A persistent mount there is
+  REQUIRED**: see "Persistent state" below.
+- **`migrate`**: the Prisma CLI (version taken from `package-lock.json`), `dotenv`, `prisma/`
+  and `prisma.config.ts`, plus `openssl` for the schema engine. Its default command is
+  `prisma migrate deploy`. Run it against the target database **before** starting the new
+  runtime image.
+
+Copied into `runtime` by hand because tracing cannot see them (dynamic paths):
+
+| Path | Why |
+|------|-----|
+| `.next/static`, `public/` | By design not part of standalone output |
+| `help-docs/` | `app/actions/help.ts` reads it via `process.cwd()` |
+| `lib/connectors/woocommerce/wp-plugin/` | `app/api/woocommerce/helper-plugin/route.ts` serves it via `process.cwd()` |
+| `node_modules/pdfkit/js/data/` | pdfkit reads its built-in font metrics with `__dirname + '/data/*.afm'` |
+| `dist-scripts/*.mjs` | Built in the build stage with esbuild (see below); not traced because they are started as child processes |
+
+The build stage also asserts that `@img/sharp-linux-*` (sharp's native binary) was traced into
+the bundle. `public/uploads` is deliberately excluded (see `.dockerignore`): uploads are
+runtime state, supplied through the volume above.
+
+### External programs the server starts
+
+Every `child_process` call in `app/` and `lib/` was checked:
+
+| Program | Used by | In the image? |
+|---------|---------|---------------|
+| `pg_dump` | manual backup (`/api/backup/create`) and scheduled backup (`/api/cron/backup`) | Yes: `postgresql-client-17` from the PGDG apt repository (bookworm's own client is 15 and `pg_dump` must be at least the server's version; production runs 17). The build fails if `pg_dump --version` is not 17. |
+| `psql` | backup restore (`/api/backup/restore`) | Yes, same package |
+| `flock` | the crontab/reconcile lock helper | Yes: `util-linux`, part of the base image |
+| `crontab` | in-app Scheduler reconciliation (`lib/crontab-reconcile*.ts`) | No: there is no cron daemon in the container. Schedule the cron endpoints externally with `CRON_SECRET` |
+| file scanner (for example `clamscan`) | `lib/security/file-scan.ts`, only when `FILE_SCAN_COMMAND` / `FILE_SCAN_COMMAND_ARGV` is configured | No: none is configured by default. Deployments that enable upload scanning must supply the scanner (a derived image or a sidecar) |
+| `git` | `lib/ops/build-identity.ts`, used only by the operator readiness-gate commands | No: those commands are not run from the container |
+| `npm` / `tsx` | the readiness-gate commands, and the reconciliation pack child (below) | No: replaced by pre-bundled scripts where the server needs them |
+
+### Scripts the server starts as children
+
+`/api/cron/reconciliation-pack` normally runs `npm run reconcile:pack` (`tsx scripts/reconciliation-pack.ts`), and that
+command in turn runs `npm run read-sync:status`. The image has no `scripts/` tree and no `tsx`, so the build stage bundles those
+two entry points with esbuild into self-contained files, `/app/dist-scripts/reconciliation-pack.mjs` and
+`/app/dist-scripts/read-sync-status.mjs`. `lib/ops/readiness-gate-collect.ts` (`bundledScriptPath`) runs `node <bundle>` when
+`<cwd>/dist-scripts/<file>` exists for one of those two scripts, and `npm run <script>` otherwise, so the stage host and
+checkouts are unchanged. `/app` is owned by the `ims` user because the pack only runs when the running uid is root or owns the
+checkout root. Its reports go to `/var/tmp/ims-reconciliation-pack-reports` inside the container (not a declared volume;
+mount one there to keep them). The container smoke test runs the pack through the cron route.
+
+### Cron runs on the host, not in the container
+
+The container never runs its own scheduler: it has no cron daemon and no `crontab` binary, and a blue/green deploy briefly runs two
+containers, which would fire every job twice. The host's cron calls the cron endpoints with `CRON_SECRET`; installing it is the
+host's responsibility. The in-app Scheduler's "Save & Apply" therefore has nothing to write to.
+
+**Production layout: one file, `/etc/cron.d/onetwo3d-ims`.** The rendered block is installed directly as the file host cron reads
+(cron.d layout, with a user field), and the IMS container mounts that same host file read-only, so the state the status reader sees
+IS the installed cron config; there is no separate copy. Requirements for the file: owned by `root:root`, mode `0644`, and a name
+with no dots (cron ignores `cron.d` files whose names contain a dot; the reader refuses such a name too).
+
+The read-sync status and the reconciliation pack need to know that the host really schedules the jobs, because an unreadable
+scheduler makes every reconciliation item inconclusive. They read the cron text from a file when told to:
+
+| Variable | Meaning |
+|----------|---------|
+| `IMS_SCHEDULER_CRONTAB_FILE` | Absolute path, inside the container, of the installed host file. Set: the file is the only source, and a missing, unreadable, oversized or relative-path file is a failure (the scheduler reads as unreadable), never an empty crontab. Unset: `crontab -l` is used exactly as before (stage hosts, checkouts). |
+| `IMS_SCHEDULER_CRONTAB_FORMAT` | `cron.d` for production: the file is read as cron reads it, `m h dom mon dow USER command`. The user field is removed before the managed block is checked; a job line with no valid user field is dropped (cron would run the first word of the command as the user), so it reads as unscheduled; a file name cron would ignore is refused, and so is a file cron itself would ignore (not a regular file with one link, not owned by root, or writable by group or others; the container sees the host's own owner and mode bits through the mount). `user` (the default) is the text `crontab -l` prints and is for stage hosts and checkouts. |
+
+The block must be the one the in-app scheduler writes (`# --- OTI CRON START ---` ... `END`), byte for byte, because a job counts as
+scheduled only if the exact generated lines are present. The image ships the generator, so the file can be produced without a
+checkout. It reads the SAVED scheduler settings (which jobs are enabled and their schedules, from Settings > System > Scheduler)
+from the database with the app's own reader, so it needs `DATABASE_URL`; a job with no saved row uses its registry default, exactly
+as the in-app writer does. The output starts with a comment line saying where the values came from.
+
+Install (render to a temporary file, validate it, then install it atomically):
+
+```bash
+tmp=$(mktemp) && docker run --rm --network <db-network> -e DATABASE_URL --entrypoint node ghcr.io/onetwo3d/ims:<sha> \
+  /app/dist-scripts/render-managed-crontab.mjs --format cron.d --cron-user root \
+  --base-url http://127.0.0.1:3000 --secret-file /etc/ims/cron.env --log-path /var/log/ims/cron.log > "$tmp" \
+  && [ "$(grep -c '^# --- OTI CRON \(START\|END\) ---$' "$tmp")" = 2 ] \
+  && install -m 0644 -o root -g root "$tmp" /etc/cron.d/onetwo3d-ims && rm -f "$tmp"
+```
+
+Mount the DIRECTORY, not the file: `install` replaces the file (a new inode), and a single-file bind mount keeps pointing at the old
+one. Mounting `/etc/cron.d` read-only at, say, `/host-cron.d` and setting
+`IMS_SCHEDULER_CRONTAB_FILE=/host-cron.d/onetwo3d-ims` `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d` sees every reinstall at once.
+
+**In container mode, Save only records the settings.** The Scheduler page's Save & Apply (and every other save that used to rewrite
+the crontab) cannot change host cron: it commits the settings, runs no `crontab`, and reports a warning, never a success: "Host cron
+update pending: the host must re-render and install /etc/cron.d/onetwo3d-ims". The Scheduler page says that cron runs on the host. The host applies a change by re-rendering and
+installing the file with the command below. A later deployment task will add a host timer that does this automatically every few
+minutes when the rendered output changes; until that exists, it is manual. Container mode is `IMS_SCHEDULER_CRONTAB_FILE` set together
+with `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d`; on a stage host (the `user` layout, `crontab -l`) Save & Apply still rewrites the crontab as
+before. Schedules are validated against the real cron field ranges (minute 0-59, hour 0-23, day of month 1-31, month 1-12, day of week 0-7; `*`, lists, ranges and steps, no names or macros): Save refuses an invalid one, the renderer refuses to render a saved one (naming the job and field), and the reader treats an installed line with one as unreadable, because cron silently ignores such a line.
+A check that compares the installed host file with the saved settings (and shows "in sync" or "out of date" on the Scheduler page)
+is deliberately not part of this change; it is in a separate follow-up pull request. Until it lands, re-render after every change and
+treat the installed file as unverified against Settings.
+
+**Re-render and reinstall after ANY scheduler change in Settings (a job switched on or off, a schedule edited), and after every
+deploy** (a new image can register new jobs), using the command above. Until you do, host cron keeps firing the old schedule and the
+status reader reports the changed jobs as unscheduled. `--defaults-only` renders every job on at its registry default WITHOUT reading
+the database (for a host that has no database yet); its output says `DEFAULTS ONLY` on the first line and will not follow Settings
+once anything is saved. For a stage host or any account crontab, omit `--format` (the `user` layout, the text `crontab -l`
+prints) and install it with `crontab`.
+
+Each rendered line reads `CRON_SECRET=` from the secret file named by `--secret-file` when it fires. Requirements for that file on
+the host:
+
+- path: the one passed to `--secret-file` (convention: `/etc/ims/cron.env`), containing a line `CRON_SECRET=<the app's CRON_SECRET>`;
+- mode `0600`, owned by the account whose crontab (or `cron.d` entry) runs the jobs;
+- check, run as that account: `test -r /etc/ims/cron.env && grep -q '^CRON_SECRET=.\{32,\}' /etc/ims/cron.env && echo ok`.
+
+A missing or unreadable file does not send an unauthenticated request: the job sends nothing, `grep` reports the error on stderr
+(cron mails it) and the job log gets `cron-auth: CRON_SECRET is missing or unusable ... was not run`. The job's exit status is still
+0, so watch the job log (or the Read-Sync Liveness Alarm), not the exit status. The container smoke test executes a rendered line
+with the secret file present (the backup runs) and absent (it is refused with that output), and runs a real Debian cron daemon
+over the installed `/etc/cron.d/onetwo3d-ims` (a saved every-minute schedule) and asserts the daemon fired the job and the endpoint
+completed it.
+
+Not available inside the container: the in-app Scheduler's `crontab` reconciliation (see above).
+
+### Required runtime environment
+
+All supplied at `docker run` / compose time. The image contains no secrets and no `.env`.
+
+| Variable | Notes |
+|----------|-------|
+| `DATABASE_URL` | PostgreSQL connection string (also needed by the `migrate` image) |
+| `AUTH_SECRET` | Session signing secret |
+| `AUTH_URL`, `NEXT_PUBLIC_APP_URL` | Public origin; the two must share an origin |
+| `SETTINGS_ENCRYPTION_KEY` | AES-256 key (32 raw bytes, base64 of 32 bytes, or 64 hex chars) |
+| `CRON_SECRET` | At least 32 characters; the server refuses to start in production without it |
+
+Everything else in `.env.example` is optional and applies as it does elsewhere. Connector
+credentials (WooCommerce, Mintsoft, Xero) are normally entered in the app and stored encrypted in
+Postgres. A fresh install should also set `PRODUCER_HOLD_ENFORCED_DESTINATIONS=all` until the
+connectors are deliberately released (see `lib/security/producer-seam.ts`); the outbound-write
+hold already refuses every write by default.
+
+### Persistent state: a mount on `/var/lib/onetwoinventory` is REQUIRED
+
+Backups, uploads, public uploads and invoice PDFs live under `/var/lib/onetwoinventory`. The image declares it as a `VOLUME`, so a
+`docker run` without a `-v` for it gets an ANONYMOUS volume: it survives `docker stop` / `start` of that one container, but a
+replacement container (every deploy, rollback or `docker rm` + `docker run`) gets a NEW empty anonymous volume, and the old one is
+orphaned under a random name. Backups and uploads then look lost after a redeploy. So every `docker run` and compose file for the
+runtime image MUST mount that path from something that outlives the container, one of:
+
+```bash
+# A. a named volume (Docker creates it owned by the image's directory, uid:gid 1001:1001, on first use)
+docker run -d --name ims -v ims-state:/var/lib/onetwoinventory ... ghcr.io/onetwo3d/ims:<sha>
+
+# B. a host bind mount: create it first, owned by the container user (1001:1001), mode 0750
+install -d -o 1001 -g 1001 -m 0750 /srv/ims/state
+docker run -d --name ims -v /srv/ims/state:/var/lib/onetwoinventory ... ghcr.io/onetwo3d/ims:<sha>
+```
+
+```yaml
+# compose
+services:
+  ims:
+    image: ghcr.io/onetwo3d/ims:<sha>
+    volumes:
+      - ims-state:/var/lib/onetwoinventory   # or /srv/ims/state:/var/lib/onetwoinventory
+volumes:
+  ims-state:
+```
+
+Replace the container by starting the new one on the SAME volume or directory. The container cannot reliably tell a named volume from
+an anonymous one (both are plain mounts to it, and the naming Docker uses for anonymous volumes is not a contract), so there is no
+startup warning; the mount is the operator's responsibility. The container smoke test proves persistence: it takes a backup and
+writes an upload on a named volume, removes the container, starts a new one on the same volume and checks both are still there and
+readable by uid 1001. The reconciliation pack's reports (`/var/tmp/ims-reconciliation-pack-reports`) are a separate path, not
+covered by this mount.
+
+### Smoke test
+
+```bash
+docker build --target migrate -t ims-migrate:local .
+docker build --target runtime -t ims:local .
+scripts/container-smoke.sh ims:local ims-migrate:local
+```
+
+The script starts `postgres:17` on a private network, runs the migrate image against it, starts
+the runtime image with the minimal environment above (throwaway generated secrets, no connector
+credentials, `PRODUCER_HOLD_ENFORCED_DESTINATIONS=all`), and polls `http://127.0.0.1:3000/login`
+for 90 s (`SMOKE_PORT`, `SMOKE_TIMEOUT_S` override). Once `/login` answers 200 it also runs a scheduled backup through
+`/api/cron/backup` (asserting a non-empty `pg_dump` file in the backup directory and restoring it with the image's `psql` into a
+scratch database), and the reconciliation pack through `/api/cron/reconciliation-pack` (asserting the child ran and ended with a
+closed outcome, not a start failure); it needs `jq` on the host. It exits 0 only if all of that holds, always removes
+what it created, and prints the runtime container's logs on failure. CI also runs it against
+`busybox:latest` and requires that run to fail, so the test cannot pass vacuously.
+
+### Secrets are never baked in
+
+The repository is public. `.dockerignore` keeps `.env*`, key material, `.git`, tests, docs,
+archives and upload/backup directories out of the build context, and the Dockerfile has no
+secret-bearing `ENV` or `ARG`. The one placeholder `DATABASE_URL` used during `next build` is an
+inline dummy on that single `RUN` and is not present in the image.

@@ -501,3 +501,16 @@ test('the dead FX schedule keys are gone from the application', () => {
     'the comment is stripped and the code use survives',
   )
 })
+
+test('saveCronJobSettings refuses an out-of-range schedule with a field-level error and writes nothing', async () => {
+  reset()
+  const { saveCronJobSettings } = await import('@/app/actions/cron')
+  const result = await saveCronJobSettings([{ settingKey: 'backup', enabled: true, schedule: '99 * * * *' }])
+  assert.equal(result.status, 'refused')
+  assert.match((result as { error: string }).error, /Invalid schedule for "Database Backup": minute "99" is out of range \(0-59\)\. Nothing was saved\./)
+  assert.deepEqual(state.writes, [], 'no row was written')
+  assert.equal(state.transactions, 0, 'no transaction was opened')
+  assert.equal(state.cronCalledAfterWrites, null, 'and no crontab reconciliation ran')
+  reset()
+  assert.deepEqual(await saveCronJobSettings([{ settingKey: 'backup', enabled: true, schedule: '0 1 * * *' }]), { status: 'saved' })
+})

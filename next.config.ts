@@ -17,6 +17,10 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // Opt-in self-contained server bundle for the container image (see Dockerfile). Only the
+  // Dockerfile's build stage sets NEXT_OUTPUT=standalone; every other build (CI, `next start`
+  // on the stage host, `next dev`) leaves this undefined and behaves exactly as before.
+  output: process.env.NEXT_OUTPUT === 'standalone' ? 'standalone' : undefined,
   compress: false,
   // Do not advertise the framework/version in responses.
   poweredByHeader: false,

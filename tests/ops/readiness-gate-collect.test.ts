@@ -305,12 +305,14 @@ test('absence: no gate source contains a database write, an activity-log write, 
   assert.match('logActivity({})', forbidden[2]![1])
 })
 
-test('the only program the gate runs is npm run <script>, with no shell', () => {
+test('the only programs the gate runs are npm run <script>, or node on a pre-bundled script from the allow-list, with no shell', () => {
   const text = readFileSync(path.join(ROOT, 'lib/ops/readiness-gate-collect.ts'), 'utf8')
   const spawns = [...text.matchAll(/\bspawn\(([^)]*)\)/g)].map((match) => match[1]!)
   console.log(`precondition: ${spawns.length} spawn call(s) found`)
   assert.equal(spawns.length, 1)
-  assert.match(spawns[0]!, /^'npm', args/)
+  assert.match(spawns[0]!, /^program, args/)
+  assert.match(text, /const program = bundle === null \? 'npm' : process\.execPath/)
+  assert.match(text, /const bundle = bundledScriptPath\(spec\.script, spec\.cwd\)/)
   assert.match(text, /shell: false/)
 })
 

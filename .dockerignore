@@ -1,0 +1,80 @@
+# Build context for the container image. The repository is PUBLIC and the image is built in CI, so
+# nothing secret, local or large may enter the context. Configuration reaches the container only as
+# environment variables at start-up.
+
+# VCS and editor/agent state
+.git
+.github
+.claude
+.codex
+.beads
+.beads-hooks
+.dolt
+.opentrace
+.remember
+.cache
+.config
+.npm-cache
+.mcp.json
+AGENTS.local.md
+
+# Secrets and key material (never in the image)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+*.gitleaks*
+.gitleaks.toml
+.gitleaksignore
+
+# Dependencies and build output (rebuilt inside the image)
+node_modules
+.next
+out
+build
+coverage
+app/generated/prisma
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+
+# Tests, fixtures and test output
+tests
+e2e
+test-results
+playwright-report
+playwright*.config.ts
+
+# Not needed at run time
+archive
+docs
+# Operator/dev tooling; nothing in app/ or lib/ imports it, and many of these scripts import from
+# tests/ and e2e/ (excluded above), so keeping them would only add type errors to `next build`.
+scripts
+# ...except the three that the image bundles with esbuild (see the Dockerfile build stage).
+!scripts/reconciliation-pack.ts
+!scripts/read-sync-status.ts
+!scripts/render-managed-crontab.ts
+*.md
+!help-docs/**
+runuser
+
+# Backup, upload and runtime-state directories (mounted as volumes, never baked in)
+backups
+data
+uploads
+public/uploads
+locks
+# Root-anchored on purpose: prisma/migrations/*/migration.sql must stay in the context.
+*.sql
+*.dump
+*.bak*

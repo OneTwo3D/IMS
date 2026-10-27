@@ -76,7 +76,11 @@ export default async function SystemSettingsPage({
   // secret (every managed job silently 401s), or unmanaged /api/cron/ lines
   // that will drift outside the app's control.
   const crontabWarnings: string[] = []
-  if (crontabStatus?.readError) {
+  let hostCronNotice: string | null = null
+  if (crontabStatus?.hostManaged) {
+    // Container mode: host cron is installed by the host, not by this page.
+    hostCronNotice = 'Cron runs on the host (container mode). Saving here records the settings only; the host applies them by re-rendering and installing /etc/cron.d/onetwo3d-ims (deploy/README.md, "Cron runs on the host, not in the container").'
+  } else if (crontabStatus?.readError) {
     // An unreadable crontab answers NONE of the drift questions below, so none of them are asked.
     crontabWarnings.push(`The crontab for the app user (${crontabStatus.osUser}) could not be read, so whether the managed block is present and current is UNKNOWN — this is not a report that it is missing. ${crontabStatus.readError}.`)
   } else if (crontabStatus) {
@@ -205,6 +209,7 @@ export default async function SystemSettingsPage({
               </ul>
             </div>
           )}
+          {hostCronNotice && <p className="text-sm text-muted-foreground" role="status">{hostCronNotice}</p>}
           <Card className="p-6">
             <div className="flex items-center gap-2 mb-4">
               <Timer className="h-4 w-4 text-muted-foreground" />

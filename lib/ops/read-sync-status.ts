@@ -13,6 +13,7 @@
 
 import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
 import type { CrontabJobDef } from '@/lib/crontab-sync'
+import { configuredSchedulerCrontabFile, readSchedulerCrontabFile } from './scheduler-crontab-file'
 import { verifyJobsScheduled } from './read-sync-scheduler'
 
 import {
@@ -287,6 +288,9 @@ export function renderReadSyncStatusText(report: ReadSyncReport): string {
 // ---------------------------------------------------------------------------------------------
 
 export async function readCrontabForReport(): Promise<{ resolved: true; text: string } | { resolved: false; reason: string }> {
+  // A deployment whose cron runs elsewhere (the container image) names the file to read; set means the file is the only source.
+  const file = configuredSchedulerCrontabFile()
+  if (file !== null) return readSchedulerCrontabFile(file)
   const reconcileModule = await import('@/lib/crontab-reconcile') as unknown as {
     readOwnCrontabResult?: () => Promise<{ resolved: true; text: string } | { resolved: false; reason: string }>
     default?: { readOwnCrontabResult: () => Promise<{ resolved: true; text: string } | { resolved: false; reason: string }> }

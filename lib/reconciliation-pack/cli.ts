@@ -94,7 +94,7 @@ export function parsePackArgs(argv: readonly string[], now: Date): PackArgs | { 
 }
 
 /** The only variables a run keeps. Never a PG variable, a grant, a credential other than the database URL, or anything that loads code. */
-export const KEPT_ENV = ['PATH', 'LANG', 'LC_ALL', 'TZ', 'DATABASE_URL'] as const
+export const KEPT_ENV = ['PATH', 'LANG', 'LC_ALL', 'TZ', 'DATABASE_URL', 'IMS_SCHEDULER_CRONTAB_FILE', 'IMS_SCHEDULER_CRONTAB_FORMAT'] as const
 /**
  * The variables the Xero tenant guard judges the stored connection by (lib/connectors/xero/tenant-guard.ts readXeroTenantAllowList): the
  * allow-list, the block-list, the demo requirement, and the two that say whether the instance is production. Kept only for a run that
