@@ -138,10 +138,53 @@ test('BACKSTOP: a discount-looking header the map leaves unread (Rabatt, Remise,
   const names = ['Rabatt', 'Remise %', 'Sconto', 'Descuento', 'Disc (%)']
   precondition(t, 'names', names.length)
   for (const name of names) {
-    const csv = `Purchase Order,Supplier,SKU,Ordered Quantity,Received Quantity,Price,Disc,Status,${name}\r\nO1,Sup,A,2,0,100,0,Approved,15\r\n`
-    const mapped = parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Disc'; d.columns.status = 'Status'; delete d.expectedHeaders; delete d.dateFormats; delete d.columns.createdOn; delete d.columns.expectedDelivery; delete d.columns.supplierRef }), 'x.map.json').datasets['purchase-order-lines']!
+    const csv = `Purchase Order,Supplier,SKU,Ordered Quantity,Received Quantity,Price,Pct,Status,${name}\r\nO1,Sup,A,2,0,100,0,Approved,15\r\n`
+    const mapped = parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Pct'; (d as Record<string, unknown>).discountHeader = 'Pct'; d.columns.status = 'Status'; delete d.expectedHeaders; delete d.dateFormats; delete d.columns.createdOn; delete d.columns.expectedDelivery; delete d.columns.supplierRef }), 'x.map.json').datasets['purchase-order-lines']!
     const ingested = ingestDataset('purchase-order-lines', Buffer.from(csv, 'utf8'), 'po.csv', mapped)
     const found = run({ products: ds('products', [product('A')]), 'purchase-order-lines': ingested }).report.findings.filter((f) => f.code === 'DISCOUNT_COLUMN_NOT_READ' && f.severity === 'ERROR')
     assert.equal(found.length, 1, name)
   }
+})
+
+// A map WITHOUT expectedHeaders, over a synthetic file with the given header; every other column keeps the fixture map's reading.
+const noHeaderMap = (discount: string, extra: (d: PoMap['datasets']['purchase-order-lines']) => void = () => {}) => parseColumnMap(editedMap((d) => {
+  d.columns = { orderKey: 'Purchase Order', supplierName: 'Supplier', sku: 'SKU', qtyOrdered: 'Ordered Quantity', qtyReceived: 'Received Quantity', unitCostForeign: 'Price', status: 'Status', lineDiscountPercent: discount }
+  delete d.expectedHeaders; delete d.dateFormats
+  extra(d)
+}), 'x.map.json').datasets['purchase-order-lines']!
+const refusal = (header: string, mapping: ReturnType<typeof noHeaderMap>) => {
+  const cells = ['O1', 'Sup', 'A', '2', '0', '100', 'Approved'].concat(header.split(',').slice(7).map(() => 'x'))
+  const csv = `${header}\r\n${cells.join(',')}\r\n`
+  try { ingestDataset('purchase-order-lines', Buffer.from(csv, 'utf8'), 'po.csv', mapping); return '' } catch (e) { return String((e as Error).message) }
+}
+const HEADER = 'Purchase Order,Supplier,SKU,Ordered Quantity,Received Quantity,Price,Status'
+
+// [mutation: the misrouted check removed / limited to when expectedHeaders is given]
+test('R3: a discount header mapped to another field is refused even with no expectedHeaders (Codex swap: Discount (%) read as supplierRef, lineDiscountPercent a blank column)', (t) => {
+  precondition(t, 'cases', 1)
+  const swapped = noHeaderMap('Received on', (d) => { d.columns.supplierRef = 'Discount (%)'; })
+  assert.match(refusal(`${HEADER},Received on,Discount (%),Created on`, swapped), /DISCOUNT_COLUMN_MISROUTED/)
+})
+
+// [mutation: the not-declared rule removed / the discountHeader assertion ignored]
+test('R3: lineDiscountPercent on a header that does not look like a discount is refused unless discountHeader names it', (t) => {
+  precondition(t, 'cases', 2)
+  const file = `${HEADER},Received on,Created on`
+  assert.match(refusal(file, noHeaderMap('Received on')), /DISCOUNT_COLUMN_NOT_DECLARED/)
+  assert.equal(refusal(file, noHeaderMap('Received on', (d) => { (d as Record<string, unknown>).discountHeader = 'Received on' })), '')
+  assert.throws(() => noHeaderMap('Received on', (d) => { (d as Record<string, unknown>).discountHeader = 'Other' }), /discountHeader.*must be the header lineDiscountPercent is mapped to/)
+})
+
+// [mutation: the ambiguity check removed]
+test('R3: two discount-looking headers are ambiguous and refused', (t) => {
+  precondition(t, 'cases', 1)
+  const mapping = noHeaderMap('Discount (%)')
+  assert.match(refusal(`${HEADER},Discount (%),Rabatt`, mapping), /DISCOUNT_COLUMN_AMBIGUOUS/)
+})
+
+// [mutation: a correct no-expectedHeaders map refused]
+test('R3: a correct custom map without expectedHeaders works, and a renamed header with a looks-like-discount name needs no assertion', (t) => {
+  precondition(t, 'cases', 2)
+  assert.equal(refusal(`${HEADER},Discount (%)`, noHeaderMap('Discount (%)')), '')
+  assert.equal(refusal(`${HEADER},Disc %`, noHeaderMap('Disc %')), '')
 })

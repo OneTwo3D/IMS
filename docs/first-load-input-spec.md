@@ -344,6 +344,7 @@ purchase-order-lines and transfers; the 3PL (today Mintsoft) feeds wms-products 
 | `constants` | a fixed value for a canonical column (for example the currency when the file has none) |
 | `valueMaps` | per canonical column, a **closed list** from the source's value to the canonical value |
 | `expectedHeaders` | optional; when present the file's header row must equal it exactly |
+| `discountHeader` | optional, purchase-order-lines only: the source header the map deliberately reads as `lineDiscountPercent` when its name does not look like a discount (`disc`, `rabatt`, `remise`, `sconto`, `descuento`). It must equal the header `lineDiscountPercent` is mapped to. Checked against the file's actual headers on every load, with or without `expectedHeaders`: a discount-looking header is read only as `lineDiscountPercent` (`DISCOUNT_COLUMN_MISROUTED`), at most one exists (`DISCOUNT_COLUMN_AMBIGUOUS`), and `lineDiscountPercent` maps to a discount-looking header or to the declared `discountHeader` (`DISCOUNT_COLUMN_NOT_DECLARED`). Stated limit: the other direct columns (price, quantities, stock-lot figures) have no header-name check, since the names that mean cost or quantity are too varied to pattern safely. |
 | `delimiter` | `,` (default), `;`, tab or `\|` |
 | `decimalSeparator` | optional; only `.` is accepted |
 | `rowsAboveHeader` | `0` (default) or `1`: one row of labels above the header row (needed by `wide`; also set on a map that reads the same file without `wide`, so the label row is skipped) |

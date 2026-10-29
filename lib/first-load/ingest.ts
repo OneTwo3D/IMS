@@ -49,6 +49,8 @@ export interface DatasetMapping {
   derived: Record<string, string>
   /** canonical column -> source date format (see dates.ts); the value is converted to YYYY-MM-DD. */
   dateFormats: Record<string, string>
+  /** purchase-order-lines only: the source header the map DELIBERATELY reads as the line discount although its name does not look like a discount. Without it, lineDiscountPercent must map to a discount-looking header. */
+  discountHeader: string | null
 }
 
 export interface WideLayout {
@@ -86,7 +88,7 @@ export interface ColumnMap {
 }
 
 const MAP_KEYS = new Set(['formatVersion', 'source', 'datasets'])
-const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats'])
+const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats', 'discountHeader'])
 const DELIMITERS = new Set([',', ';', '\t', '|'])
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -324,6 +326,25 @@ function directColumnProblems(
   }
 }
 
+/**
+ * THE DISCOUNT COLUMN IS CHECKED AGAINST THE ACTUAL FILE HEADERS, whether or not the map declares expectedHeaders: a discount-looking header is read ONLY as lineDiscountPercent
+ * (DISCOUNT_COLUMN_MISROUTED: mapping "Discount (%)" to supplierRef while lineDiscountPercent reads a blank column would load gross prices), there is at most one
+ * (DISCOUNT_COLUMN_AMBIGUOUS), and lineDiscountPercent reads a discount-looking header unless the map names its header deliberately in discountHeader (DISCOUNT_COLUMN_NOT_DECLARED).
+ */
+function discountHeaderProblems(file: string, header: string[], mapping: DatasetMapping, problems: string[]): void {
+  const looks = [...new Set(header.filter((name) => DISCOUNT_HEADER_PATTERN.test(name)))]
+  if (looks.length > 1) problems.push(`${file}: DISCOUNT_COLUMN_AMBIGUOUS: more than one header looks like a discount column (${JSON.stringify(looks)}); which one is the line discount cannot be decided`)
+  for (const name of looks) {
+    const to = Object.entries(mapping.columns).filter(([, source]) => source === name).map(([column]) => column)
+    const wrong = to.filter((column) => column !== 'lineDiscountPercent')
+    if (wrong.length > 0) problems.push(`${file}: DISCOUNT_COLUMN_MISROUTED: the discount-looking header ${JSON.stringify(name)} is mapped to ${wrong.join(', ')}; a discount header is read only as lineDiscountPercent`)
+  }
+  const mapped = mapping.columns.lineDiscountPercent
+  if (mapped !== undefined && !DISCOUNT_HEADER_PATTERN.test(mapped) && mapping.discountHeader !== mapped) {
+    problems.push(`${file}: DISCOUNT_COLUMN_NOT_DECLARED: lineDiscountPercent is mapped to ${JSON.stringify(mapped)}, which does not look like a discount header; if that is deliberate, name it in the map as discountHeader`)
+  }
+}
+
 /** Why a required column is required, appended to the refusal. */
 const REQUIRED_COLUMN_HINTS: Record<string, string> = {
   lineDiscountPercent: ' (PO_LINE_DISCOUNT_COLUMN_REQUIRED: the per-line discount must be read, or an omitted column would load every discounted line at its gross price; map the source\'s Discount (%) column to lineDiscountPercent)',
@@ -399,7 +420,14 @@ export function parseColumnMap(jsonText: string, label: string): ColumnMap {
       }
       const layout = parseLayoutKeys(entry, where, name, spec, { columns, constants, valueMaps }, problems)
       directColumnProblems(where, name as DatasetName, columns, constants, valueMaps, layout.derived, expectedHeaders, problems)
-      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
+      let discountHeader: string | null = null
+      if (entry.discountHeader !== undefined) {
+        if (name !== 'purchase-order-lines') problems.push(`${where}.discountHeader: only the purchase-order-lines dataset has a discount`)
+        else if (typeof entry.discountHeader !== 'string' || entry.discountHeader.trim() === '') problems.push(`${where}.discountHeader must be a non-empty string`)
+        else if (columns.lineDiscountPercent !== entry.discountHeader) problems.push(`${where}.discountHeader: ${JSON.stringify(entry.discountHeader)} must be the header lineDiscountPercent is mapped to (found ${JSON.stringify(columns.lineDiscountPercent ?? null)})`)
+        else discountHeader = entry.discountHeader
+      }
+      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, discountHeader, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
     }
   }
   if (problems.length > 0) throw new InputError(problems)
@@ -754,6 +782,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         readIndexes.add(at)
       }
     }
+    if (dataset === 'purchase-order-lines') discountHeaderProblems(file, header, mapping, problems)
     if (mapping.rowSelect) {
       selectIndex = locate(mapping.rowSelect.column, 'rowSelect')
       if (selectIndex >= 0) readIndexes.add(selectIndex)
