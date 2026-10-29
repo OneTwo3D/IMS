@@ -29,6 +29,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import type { NormalisedXeroTaxRate } from '@/lib/connectors/xero/tax-rate-list'
 import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import type { TaxComponentRateRow, TaxMappingRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
+import { knownWcTaxClassCategory } from '@/lib/connectors/woocommerce/sync/tax-class-category'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
 import { normaliseCountryCode, xeroNameCountry } from '@/lib/tax/tax-country'
 import { componentMeaningDifference } from '@/lib/tax/tax-rekey'
@@ -49,6 +50,8 @@ export const VAT_SET_REASONS = {
   REPORT_TYPE_DIFFERS: 'the Xero ReportTaxType is not the one IMS files the rate under (xeroReportTaxType of the IMS rate)',
   REPORT_TYPE_UNKNOWN: 'the IMS reporting category is not one IMS maps to a VAT-return box, or the Xero type states no ReportTaxType, so the report type cannot be confirmed',
   CLASS_DIFFERS: 'the tax class of the WooCommerce rate is not the class its IMS mapping recorded (empty and "standard" are the same class; case and surrounding spaces are ignored)',
+  CATEGORY_DIFFERS: 'the IMS tax category the tax class of the WooCommerce rate means (the order import\'s own class-to-category table: standard or empty is STANDARD, zero-rate ZERO, reduced-rate REDUCED, second-reduced-rate SECOND_REDUCED, exempt EXEMPT) is not the tax category of the IMS rate it maps to, and IMS picks the order tax rate by tax category',
+  CATEGORY_UNVERIFIED: 'the tax class of the WooCommerce rate is not one the order import maps to an IMS tax category, so its category cannot be compared (a finding, never a pass)',
   COMPOUND_DIFFERS: 'the WooCommerce rate is compound and the IMS rate is not, or the other way round',
   COMPONENTS_DIFFER: 'the IMS rate and the Xero type do not tax the same way: the ordered components (count, each rate, compounding) differ, or the Xero type has a non-recoverable component (the re-key\'s componentMeaningDifference)',
   SHIPPING_NOT_TAXED: 'a WooCommerce rate with a positive percentage has "apply to shipping" off, but shipping always carries the goods\' VAT rate (owner ruling; the VAT difference report\'s WOO_SHIPPING_NOT_TAXED). A zero-rate is exempt: shipping at 0% is the same as no VAT on shipping',
@@ -215,6 +218,9 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
       if (normaliseCountryCode(woo.country) !== imsCountry) reasons.add('COUNTRY_DIFFERS')
       if (normaliseClass(woo.class) !== mappedClass.get(woo.id)) reasons.add('CLASS_DIFFERS')
       if (woo.compound !== ims.isCompound) reasons.add('COMPOUND_DIFFERS')
+      const wooCategory = knownWcTaxClassCategory(woo.class)
+      if (wooCategory === null) reasons.add('CATEGORY_UNVERIFIED')
+      else if (wooCategory !== ims.taxCategory) reasons.add('CATEGORY_DIFFERS')
       if (comparableName(woo.name) !== comparableName(ims.name)) { reasons.add('WOO_NAME_DIFFERS'); nameDifferences.set(`woo|${woo.id}`, { ims: ims.name, woo: woo.name }) }
       // REGION: IMS records a region only in the rate name. A recorded region must equal the Woo state (and Woo then has no postcode or city IMS could not hold); where IMS records none, a Woo rate that is regional, or shares country and class with another region, cannot be confirmed.
       const wooCountry = normaliseCountryCode(woo.country)

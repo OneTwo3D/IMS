@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { knownWcTaxClassCategory } from '../../lib/connectors/woocommerce/sync/tax-class-category.ts'
 import type { NormalisedXeroTaxRate } from '../../lib/connectors/xero/tax-rate-list.ts'
 import type { TaxComponentRateRow, TaxMappingRow, TaxRateRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { VAT_SET_REASON_LIST, compareVatSetIdentity, summariseVatSet, type VatSetInput, type VatSetRow } from '../../lib/reconciliation-pack/vat-set-identity.ts'
@@ -12,7 +13,7 @@ import type { WooTaxRateDetail } from '../../lib/reconciliation-pack/woo-source.
  */
 
 const woo = (id: string, over: Partial<WooTaxRateDetail> = {}): WooTaxRateDetail => ({ id, name: 'VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: '', shipping: true, compound: false, ...over })
-const ims = (id: string, accountingTaxType: string | null, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType, countryCode: 'GB', reportingCategory: 'DOMESTIC', isCompound: false, ...over })
+const ims = (id: string, accountingTaxType: string | null, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType, countryCode: 'GB', reportingCategory: 'DOMESTIC', isCompound: false, taxCategory: 'STANDARD', ...over })
 const xero = (taxType: string, over: Partial<NormalisedXeroTaxRate> = {}): NormalisedXeroTaxRate => ({ taxType, name: 'GB VAT', status: 'ACTIVE', reportTaxType: 'OUTPUT', effectiveRate: '20.000000', displayTaxRate: '20.000000', components: [], canApply: { assets: false, equity: false, expenses: false, liabilities: false, revenue: true }, ...over })
 const map = (wooId: string, taxRateId: string): TaxMappingRow => ({ connector: 'woocommerce', externalTaxRateId: wooId, taxRateId, externalClass: null })
 
@@ -218,7 +219,7 @@ test('DUPLICATE_MAPPING: two or more Woo rates on one IMS rate, of equal or diff
   input.woo = [...input.woo, woo('5', { name: 'GB VAT', class: 'reduced-rate' })]
   input.mappings = [...input.mappings, { ...map('5', 'rGB'), externalClass: 'reduced-rate' }]
   const byClass = compareVatSetIdentity(input)
-  assert.deepEqual([reasonsOf(byClass, 'woo', '1'), reasonsOf(byClass, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING']])
+  assert.deepEqual([reasonsOf(byClass, 'woo', '1'), reasonsOf(byClass, 'woo', '5')], [['DUPLICATE_MAPPING'], ['DUPLICATE_MAPPING', 'CATEGORY_DIFFERS']], 'the reduced-rate Woo rate is also on a STANDARD IMS rate')
   input = base()
   input.rates = [...input.rates, ims('rGB2', 'TAX001')]
   const dup = compareVatSetIdentity(input)
@@ -243,11 +244,33 @@ test('SCOPE: built-in Xero types, non-ACTIVE and non-revenue types, and the IMS 
   assert.deepEqual(rows.filter((row) => row.system === 'ims').map((row) => row.id).sort(), ['rCAN', 'rDE', 'rGB', 'rPT30'])
 })
 
+test('CATEGORY_DIFFERS / CATEGORY_UNVERIFIED: the IMS category the Woo class means (the order import\'s own table) must be the tax category of the mapped IMS rate; an unknown class is a finding, never a pass', () => {
+  const run = (wooClass: string, taxCategory: string): VatSetRow[] => {
+    const input = base()
+    input.woo = input.woo.map((w) => (w.id === '1' ? { ...w, class: wooClass } : w))
+    input.mappings = input.mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, externalClass: wooClass } : m))
+    input.rates = input.rates.map((r) => (r.id === 'rGB' ? { ...r, taxCategory } : r))
+    return compareVatSetIdentity(input)
+  }
+  assert.deepEqual(reasonsOf(run('reduced-rate', 'STANDARD'), 'woo', '1'), ['CATEGORY_DIFFERS'], 'a reduced-rate Woo rate on a STANDARD IMS rate')
+  assert.deepEqual(reasonsOf(run('', 'ZERO'), 'woo', '1'), ['CATEGORY_DIFFERS'], 'and the other way round')
+  assert.deepEqual(reasonsOf(run('zero-rate', 'ZERO'), 'woo', '1'), [])
+  assert.deepEqual(reasonsOf(run('standard', 'STANDARD'), 'woo', '1'), [])
+  assert.deepEqual(reasonsOf(run('', 'STANDARD'), 'woo', '1'), [], 'empty is standard')
+  assert.deepEqual(reasonsOf(run(' Reduced-Rate ', 'REDUCED'), 'woo', '1'), [], 'case and spaces do not count')
+  assert.deepEqual(reasonsOf(run('second-reduced-rate', 'SECOND_REDUCED'), 'woo', '1'), [])
+  assert.deepEqual(reasonsOf(run('exempt', 'EXEMPT'), 'woo', '1'), [])
+  assert.deepEqual(reasonsOf(run('super-reduced', 'STANDARD'), 'woo', '1'), ['CATEGORY_UNVERIFIED'], 'an unknown class is never a pass, whatever the IMS category')
+  assert.deepEqual(reasonsOf(run('super-reduced', 'REDUCED'), 'woo', '1'), ['CATEGORY_UNVERIFIED'])
+  assert.deepEqual(reasonsOf(run('reduced-rate', 'STANDARD'), 'ims', 'rGB'), [], 'on the Woo row only')
+})
+
 test('CLASS_DIFFERS: the live Woo class against the class the IMS mapping recorded; empty and "standard" are one class, case and spaces do not count', () => {
   const withClass = (wooClass: string, mapped: string | null): VatSetRow[] => {
     const input = base()
     input.woo = input.woo.map((w) => (w.id === '1' ? { ...w, class: wooClass } : w))
     input.mappings = input.mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, externalClass: mapped } : m))
+    input.rates = input.rates.map((r) => (r.id === 'rGB' ? { ...r, taxCategory: knownWcTaxClassCategory(wooClass) ?? 'STANDARD' } : r)) // the category agrees, so only the class is judged here
     return compareVatSetIdentity(input)
   }
   assert.deepEqual(reasonsOf(withClass('reduced-rate', null), 'woo', '1'), ['CLASS_DIFFERS'], 'moved from the standard class to a reduced one, same id, percent and country')
@@ -410,8 +433,8 @@ test('XERO_NAME_DIFFERS: an IMS rate and the Xero type its code names must have 
     const input = base()
     input.rates = [...input.rates, ims('rIOSS', 'TAX005', { name: 'PT-30 IOSS VAT', rate: '0.2200', countryCode: 'PT', reportingCategory: 'OSS' })]
     input.xero = [...input.xero, xero('TAX005', { name: 'PT-30 IOSS VAT', reportTaxType: 'MOSSSALES', effectiveRate: '22.000000', displayTaxRate: '22.000000' })]
-    input.woo = [...input.woo, woo('5', { name: 'PT-30 IOSS VAT', country: 'PT', state: 'PT-30', class: 'ioss', rate: '22.0000' })]
-    input.mappings = [...input.mappings, { ...map('5', 'rIOSS'), externalClass: 'ioss' }]
+    input.woo = [...input.woo, woo('5', { name: 'PT-30 IOSS VAT', country: 'PT', state: 'PT-30', rate: '22.0000' })]
+    input.mappings = [...input.mappings, map('5', 'rIOSS')]
     return input
   }
   assert.deepEqual(compareVatSetIdentity(pair()).filter((row) => row.reasons.length > 0), [], 'the correct pair passes')
@@ -475,5 +498,5 @@ test('the closed list is the one the report prints, every reason is reachable, a
   assert.equal(summary.byReason.WOO_UNMAPPED, 1)
   assert.equal(summary.byReason.XERO_NOT_IN_IMS, 1)
   assert.deepEqual(Object.keys(summary.byReason), VAT_SET_REASON_LIST)
-  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'REGION_DIFFERS', 'REGION_UNVERIFIED', 'WOO_NAME_DIFFERS', 'XERO_NAME_DIFFERS', 'XERO_REGION_DIFFERS', 'XERO_REGION_UNVERIFIED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
+  assert.deepEqual(VAT_SET_REASON_LIST, ['WOO_UNMAPPED', 'DUPLICATE_MAPPING', 'IMS_RATE_NOT_ACTIVE_SALES', 'IMS_NOT_IN_XERO', 'XERO_NOT_SALES_TYPE', 'PERCENT_DIFFERS', 'COUNTRY_DIFFERS', 'REPORT_TYPE_DIFFERS', 'REPORT_TYPE_UNKNOWN', 'CLASS_DIFFERS', 'CATEGORY_DIFFERS', 'CATEGORY_UNVERIFIED', 'COMPOUND_DIFFERS', 'COMPONENTS_DIFFER', 'SHIPPING_NOT_TAXED', 'REGION_DIFFERS', 'REGION_UNVERIFIED', 'WOO_NAME_DIFFERS', 'XERO_NAME_DIFFERS', 'XERO_REGION_DIFFERS', 'XERO_REGION_UNVERIFIED', 'MISSING_IN_WOO', 'XERO_NOT_IN_IMS'])
 })

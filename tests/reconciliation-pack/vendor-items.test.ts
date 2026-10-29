@@ -241,7 +241,7 @@ test('WITHOUT THE OPT-IN nothing is touched: no IMS read, no vendor request, no 
 
 // ---- R13 ---------------------------------------------------------------------------------------
 
-const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: null, countryCode: 'GB', reportingCategory: null, isCompound: false, ...over })
+const rate = (id: string, over: Partial<TaxRateRow> = {}): TaxRateRow => ({ id, name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: null, countryCode: 'GB', reportingCategory: null, isCompound: false, taxCategory: 'STANDARD', ...over })
 const mapping = (externalTaxRateId: string, taxRateId = 'r1', connector = 'woocommerce'): TaxMappingRow => ({ connector, externalTaxRateId, taxRateId, externalClass: null })
 const wooTax = (id: number, over: Record<string, unknown> = {}): Record<string, unknown> => ({ id, name: 'GB VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: '', shipping: true, compound: false, ...over })
 const wooTaxes = (...ids: number[]): StoreData => ({ taxes: ids.map((id) => wooTax(id)) })

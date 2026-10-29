@@ -78,7 +78,7 @@ export type StorefrontMappingRow = { externalStatus: string; imsStatus: string }
 /** `withdrawal` is the pair of customer-withdrawal statuses the importer ALSO admits (normalised; each setting's documented default when its row is absent or empty). */
 export type StorefrontStatusConfig = { configured: string[]; withdrawal: { submitted: string; approved: string }; mappings: StorefrontMappingRow[] }
 /** `rate` is the fraction text of the rate column (Decimal(5,4), for example "0.2000"); `usedFor` is SALES, PURCHASE or BOTH. R13's set identity reads name, rate, usedFor and reverseCharge. */
-export type TaxRateRow = { id: string; name: string; rate: string; usedFor: string; reverseCharge: boolean; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null; isCompound: boolean }
+export type TaxRateRow = { id: string; name: string; rate: string; usedFor: string; reverseCharge: boolean; active: boolean; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null; isCompound: boolean; taxCategory: string }
 export type TaxMappingRow = { connector: string; externalTaxRateId: string; taxRateId: string; externalClass: string | null }
 export type TaxComponentTypeRow = { id: string; taxRateId: string; active: boolean; accountingTaxType: string }
 /** The two reverse-charge settings: Xero tax-type CODES IMS posts with. A blank value is "none". */
@@ -445,7 +445,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   },
 
   async taxes(tx) {
-    const rates = (await readCapped(tx, 'SELECT id, name, rate::text AS rate, "usedFor" AS used_for, reverse_charge, active, accounting_tax_type AS tax_type, "countryCode" AS country, reporting_category AS category, is_compound FROM tax_rates ORDER BY id')).map((row): TaxRateRow => ({ id: text(row.id), name: text(row.name), rate: text(row.rate), usedFor: text(row.used_for), reverseCharge: bool(row.reverse_charge), active: bool(row.active), accountingTaxType: textOrNull(row.tax_type), countryCode: textOrNull(row.country), reportingCategory: textOrNull(row.category), isCompound: bool(row.is_compound) }))
+    const rates = (await readCapped(tx, 'SELECT id, name, rate::text AS rate, "usedFor" AS used_for, reverse_charge, active, accounting_tax_type AS tax_type, "countryCode" AS country, reporting_category AS category, is_compound, "taxCategory"::text AS tax_category FROM tax_rates ORDER BY id')).map((row): TaxRateRow => ({ id: text(row.id), name: text(row.name), rate: text(row.rate), usedFor: text(row.used_for), reverseCharge: bool(row.reverse_charge), active: bool(row.active), accountingTaxType: textOrNull(row.tax_type), countryCode: textOrNull(row.country), reportingCategory: textOrNull(row.category), isCompound: bool(row.is_compound), taxCategory: text(row.tax_category) }))
     unique(rates, (rate) => rate.id)
     const mappings = (await readCapped(tx, 'SELECT connector, "externalTaxRateId" AS external_id, "taxRateId" AS rate_id, "externalClass" AS external_class FROM shopping_tax_rate_mappings ORDER BY id')).map((row): TaxMappingRow => ({ connector: text(row.connector), externalTaxRateId: text(row.external_id), taxRateId: text(row.rate_id), externalClass: textOrNull(row.external_class) }))
     unique(mappings, (mapping) => `${mapping.connector}\u0001${mapping.externalTaxRateId}`)

@@ -9,6 +9,7 @@ import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type Decima
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine, WcMeta } from './types'
 import { classifyWcCouponLines } from './coupon-classification'
+import { knownWcTaxClassCategory } from './tax-class-category'
 
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
@@ -184,13 +185,8 @@ export type MappedLine = {
 }
 
 function mapWcTaxClassToCategory(taxClass: string | null | undefined): TaxCategory {
-  const normalized = (taxClass ?? '').trim().toLowerCase()
-  if (!normalized) return 'STANDARD'
-  if (normalized === 'zero-rate' || normalized === 'zero') return 'ZERO'
-  if (normalized === 'reduced-rate' || normalized === 'reduced') return 'REDUCED'
-  if (normalized === 'second-reduced-rate' || normalized === 'second-reduced') return 'SECOND_REDUCED'
-  if (normalized === 'exempt' || normalized === 'exemption') return 'EXEMPT'
-  return 'STANDARD'
+  // An unknown class falls back to STANDARD on import (the table is shared with the R13 VAT set identity, which reports it instead).
+  return knownWcTaxClassCategory(taxClass) ?? 'STANDARD'
 }
 
 export async function mapWcLineItems(

@@ -69,7 +69,7 @@ function rig(base: string): Rig {
       if (/'wc_initial_import_completed'/.test(sql)) return { rows: [{ key: 'wc_initial_import_completed', value: 'true', at: '2026-09-01T00:00:00.000Z' }] }
       if (/FROM sales_orders/.test(sql)) return { rows: imsOrders.map((o) => ({ ...o })) }
       if (/FROM shopping_order_links/.test(sql)) return { rows: [{ order_id: imsOrders[0]!.id, connector: 'woocommerce', external_id: '11' }, { order_id: imsOrders[1]!.id, connector: 'woocommerce', external_id: '12' }] }
-      if (/FROM tax_rates/.test(sql)) return { rows: [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: null, country: 'GB', category: null, is_compound: false }] }
+      if (/FROM tax_rates/.test(sql)) return { rows: [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: null, country: 'GB', category: null, is_compound: false, tax_category: 'STANDARD' }] }
       if (/FROM shopping_tax_rate_mappings/.test(sql)) return { rows: [{ connector: 'woocommerce', external_id: '5', rate_id: 'r1', external_class: null }] }
       return { rows: [] }
     },
