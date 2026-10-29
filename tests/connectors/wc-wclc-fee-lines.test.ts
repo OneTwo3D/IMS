@@ -160,3 +160,27 @@ test('untaxed legacy fee still reconciles at rate 0 (forceNoTax lines carry rate
   )
   assert.equal(rec.reconciles, true)
 })
+
+// --- order-level components (persisted as nullable columns) ---------------------------------------
+const { readWclcOrderComponents } = unwrap(fieldMappingNs)
+const orderMeta = (...pairs: Array<[string, unknown]>) => ({ meta_data: pairs.map(([key, value], id) => ({ id, key, value })) })
+
+test('order components: duty, import VAT and handling are mirrored as reported', () => {
+  assert.deepEqual(
+    readWclcOrderComponents(orderMeta(['_wclc_duty_component', '12.50'], ['_wclc_tax_component', '40.38'], ['_wclc_handling_component', '2.00'])),
+    { dutyComponent: '12.50', taxComponent: '40.38', handlingComponent: '2.00' },
+  )
+  assert.deepEqual(
+    readWclcOrderComponents(orderMeta(['_wclc_duty_component', 3], ['_wclc_tax_component', '0'])),
+    { dutyComponent: '3', taxComponent: '0', handlingComponent: null },
+  )
+})
+
+test('order components: handling is absent unless above zero; junk, negatives and a missing key read as null', () => {
+  assert.equal(readWclcOrderComponents(orderMeta(['_wclc_handling_component', '0'])).handlingComponent, null)
+  assert.equal(readWclcOrderComponents(orderMeta(['_wclc_handling_component', '0.00'])).handlingComponent, null)
+  assert.equal(readWclcOrderComponents(orderMeta(['_wclc_duty_component', '-1'])).dutyComponent, null)
+  assert.equal(readWclcOrderComponents(orderMeta(['_wclc_duty_component', 'abc'])).dutyComponent, null)
+  assert.equal(readWclcOrderComponents(orderMeta(['_wclc_duty_component', ''])).dutyComponent, null)
+  assert.deepEqual(readWclcOrderComponents({ meta_data: [] }), { dutyComponent: null, taxComponent: null, handlingComponent: null })
+})

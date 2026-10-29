@@ -20,7 +20,7 @@ import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from 
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
-  mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
+  mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
@@ -981,6 +981,16 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
   }
 }
 
+/** The three mirrored wclc duty/tax/handling components as SalesOrder columns (null = the order carries none). */
+export function wclcComponentColumns(wcOrder: WcFullOrder): {
+  wclcDutyComponent: string | null
+  wclcTaxComponent: string | null
+  wclcHandlingComponent: string | null
+} {
+  const c = readWclcOrderComponents(wcOrder)
+  return { wclcDutyComponent: c.dutyComponent, wclcTaxComponent: c.taxComponent, wclcHandlingComponent: c.handlingComponent }
+}
+
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string): Promise<void> {
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
@@ -1045,6 +1055,7 @@ async function updateExistingWcOrderCore(
       data: {
         externalOrderNumber: wcOrder.number,
         customerVatNumber: readWcCustomerVat(wcOrder),
+        ...wclcComponentColumns(wcOrder),
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
@@ -2505,6 +2516,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       return {
         productId: l.productId,
         externalLineItemId: l.externalLineItemId,
+        wclcFeeKind: l.wclcFeeKind ?? null,
         sku: l.sku,
         description: l.description,
         qty: l.qty,
@@ -2593,6 +2605,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           customerName,
           customerEmail: wcOrder.billing.email || null,
           customerVatNumber: readWcCustomerVat(wcOrder),
+          ...wclcComponentColumns(wcOrder),
           billingAddress: mapWcAddress(wcOrder.billing),
           shippingAddress: mapWcAddress(wcOrder.shipping),
           subtotalForeign,

@@ -210,6 +210,36 @@ export function readWclcFeeKind(feeLine: Pick<WcFeeLine, 'meta_data'>): WclcFeeK
   return typeof kind === 'string' && (WCLC_FEE_KINDS as readonly string[]).includes(kind.trim()) ? (kind.trim() as WclcFeeKind) : null
 }
 
+export type WclcOrderComponents = {
+  dutyComponent: string | null
+  taxComponent: string | null
+  /** Present only when above zero, as wclc writes it. */
+  handlingComponent: string | null
+}
+
+function wclcComponentAmount(meta: WcMeta[], key: string): string | null {
+  const entry = meta.find((m) => m.key === key)
+  if (!entry) return null
+  const raw = typeof entry.value === 'number' ? String(entry.value) : typeof entry.value === 'string' ? entry.value.trim() : ''
+  // A plain non-negative decimal only; anything else (empty, junk, negative) is "not carried", never a guess.
+  return /^\d+(\.\d+)?$/.test(raw) ? raw : null
+}
+
+/**
+ * The order-level split wclc records when it charges duty: `_wclc_duty_component`, `_wclc_tax_component` (import VAT
+ * only) and `_wclc_handling_component` (the Union handling fee NET inside the over-EUR-150 duty line). Mirrored as
+ * reported. The handling component is absent unless it is above zero, so a stored zero is read as absent.
+ */
+export function readWclcOrderComponents(order: Pick<WcFullOrder, 'meta_data'>): WclcOrderComponents {
+  const meta = order.meta_data ?? []
+  const handling = wclcComponentAmount(meta, '_wclc_handling_component')
+  return {
+    dutyComponent: wclcComponentAmount(meta, '_wclc_duty_component'),
+    taxComponent: wclcComponentAmount(meta, '_wclc_tax_component'),
+    handlingComponent: handling !== null && parseFloat(handling) > 0 ? handling : null,
+  }
+}
+
 function mapWcTaxClassToCategory(taxClass: string | null | undefined): TaxCategory {
   // An unknown class falls back to STANDARD on import (the table is shared with the R13 VAT set identity, which reports it instead).
   return knownWcTaxClassCategory(taxClass) ?? 'STANDARD'
