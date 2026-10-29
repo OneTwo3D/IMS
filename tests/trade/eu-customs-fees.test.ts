@@ -22,7 +22,7 @@ import {
 const L = (...hsCodes: string[]): EuFeeLineInput => ({ hsCodes })
 const AFTER = new Date('2026-11-02T12:00:00Z')
 
-function run(over: Partial<EuFeeInput> & { lines: EuFeeLineInput[] }) {
+function run(over: Omit<Partial<EuFeeInput>, 'lines'> & { lines: readonly EuFeeLineInput[] }) {
   return computeEuCustomsFees({
     destinationCountry: 'DE',
     customer: 'private',
