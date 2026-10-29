@@ -7,6 +7,7 @@ case "$*" in
     echo "nginx -t [$(tr '\n' ' ' < "$IMS_UPSTREAM_FILE" 2>/dev/null)]" >> "$STUB/calls.log"
     if [ -e "$STUB/nginx_t_fail_once" ]; then rm -f "$STUB/nginx_t_fail_once"; exit 1; fi
     [ ! -e "$STUB/nginx_t_fail" ] ;;
+  -T) cat "$STUB/nginx_T" 2>/dev/null || true ;;       # the rendered configuration, if the test provides one
   "-s reload")
     n="$(grep -c '^nginx reload' "$STUB/calls.log" || true)"
     echo "nginx reload" >> "$STUB/calls.log"

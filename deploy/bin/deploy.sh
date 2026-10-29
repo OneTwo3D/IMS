@@ -144,10 +144,7 @@ fi
 
 # --- 8. previous slot: stop, keep ---------------------------------------------------------------------------------------------
 if [ "$old_slot" != none ]; then
-  sleep "$IMS_DRAIN_S"
-  # Only stop the old slot once the RUNNING nginx reports the new one.
-  assert_not_serving "$old_slot" || die "nginx still serves $(slot_name "$old_slot") after the switch; left running, nothing recorded"
-  docker stop "$(slot_name "$old_slot")" >/dev/null 2>&1 || log "warning: could not stop $(slot_name "$old_slot")"
+  drain_and_stop_slot "$old_slot" || die "nginx still serves $(slot_name "$old_slot") after the switch; left running, nothing recorded"
 fi
 
 # --- 9. record: previous first, so an interruption never leaves current ahead of previous ---------------------------------------

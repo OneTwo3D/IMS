@@ -307,7 +307,9 @@ database. The container's environment is the env file plus the flags the scripts
 **What `deploy.sh` does**, in order: pull both images; check the pending migrations; run the migrate image (host network, env file);
 start the new image in the idle slot; wait up to 120 s for `http://127.0.0.1:<slot port>/login` = 200 (otherwise stop the new slot, keep
 the old one serving, exit non-zero); switch the upstream; check `http://127.0.0.1:3000/login` = 200 through nginx (otherwise switch
-back); stop, but do not remove, the previous slot; record `/srv/ims/deploy/previous` then `current` (`<sha> <slot>`, written
+back); wait until no nginx worker is left in the "shutting down" state (those still carry in-flight requests to the old slot; bounded by the
+site's `proxy_read_timeout` from `nginx -T`, 600 s if absent, plus 15 s, after which it logs a warning and goes on), then stop with
+`docker stop -t 30`, but do not remove, the previous slot; record `/srv/ims/deploy/previous` then `current` (`<sha> <slot>`, written
 atomically, only after a successful switch); re-render and install the host crontab. It takes a lock, so a second deploy, a rollback and
 the cron timer cannot overlap. When `/usr/local/bin/o3d-hc` exists the run is wrapped in it (`ims-deploy`; the cron timer uses
 `ims-cron-render`); without it nothing changes.

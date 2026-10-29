@@ -17,9 +17,9 @@ case "${1:-}" in
     esac ;;
   rm) for a in "${@:2}"; do case "$a" in -*) ;; *) rm -f "$cdir/$a" ;; esac; done ;;
   stop|start)
-    f="$cdir/$2"; [ -f "$f" ] || exit 1
-    [ ! -e "$STUB/stop_fail_$2" ] || [ "$1" != stop ] || exit 1            # a container that cannot be stopped
-    [ ! -e "$STUB/stop_ignored_$2" ] || [ "$1" != stop ] || exit 0         # docker says ok, the container keeps running
+    cname="${*: -1}"; f="$cdir/$cname"; [ -f "$f" ] || exit 1
+    [ ! -e "$STUB/stop_fail_$cname" ] || [ "$1" != stop ] || exit 1            # a container that cannot be stopped
+    [ ! -e "$STUB/stop_ignored_$cname" ] || [ "$1" != stop ] || exit 0         # docker says ok, the container keeps running
     v=0; [ "$1" = start ] && v=1
     sed -i "s/^running=.*/running=$v/" "$f" ;;
   run)

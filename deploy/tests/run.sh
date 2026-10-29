@@ -31,7 +31,7 @@ setup() {
   chmod 600 "$T/etc/ims.env"; echo 'CRON_SECRET=x' > "$T/etc/cron.env"; chmod 600 "$T/etc/cron.env"
   export IMS_ENV_FILE="$T/etc/ims.env" IMS_CRON_ENV_FILE="$T/etc/cron.env" IMS_STATE_DIR="$T/state" IMS_DEPLOY_DIR="$T/deploy" \
          IMS_UPSTREAM_FILE="$T/nginx/ims-upstream.conf" IMS_CROND_DIR="$T/crond" IMS_DEPLOY_NO_ROOT_CHECK=1 IMS_HC_BIN="$T/none" \
-         IMS_DRAIN_S=0 IMS_HEALTH_TIMEOUT_S=6 IMS_FRONT_TIMEOUT_S=4 IMS_HEALTH_INTERVAL_S=2
+         IMS_DRAIN_POLL_S=2 IMS_HEALTH_TIMEOUT_S=6 IMS_FRONT_TIMEOUT_S=4 IMS_HEALTH_INTERVAL_S=2
   export PATH="$HERE/stubs:$PATH"
   printf '# header\n# --- OTI CRON START ---\n* * * * *  root  echo job\n# --- OTI CRON END ---\n' > "$STUB/cronout"
   : > "$STUB/applied"
@@ -112,7 +112,7 @@ t_expand_only_pending_migrations_proceed_without_flags() {
   deploy "$B"
   eq "$rc" 0 "deploy of expand-only migrations"
   before '^MIGRATE' '^RUN-SLOT ims-green'
-  before '^nginx reload' '^docker stop ims-blue'   # no maintenance stop: the old slot serves until the switch
+  before '^nginx reload' '^docker stop -t 30 ims-blue'   # no maintenance stop: the old slot serves until the switch
 }
 
 t_first_install_on_an_empty_database_is_exempt_and_uses_blue() {
@@ -271,6 +271,69 @@ t_contract_migration_refused_when_a_slot_is_still_running_after_stop() {
   grep -q 'still running' "$T/out" || fail "no explanation"
 }
 
+t_deploy_waits_for_draining_workers_before_stopping_the_old_slot() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  echo 3 > "$STUB/ps_drain_polls"; export IMS_DRAIN_BOUND_S=100
+  deploy "$B"
+  eq "$rc" 0 "deploy: $(tail -n 3 "$T/out")"
+  eq "$(grep -c '^ps draining' "$STUB/calls.log")" 3 "polls that saw a draining worker"
+  last_draining="$(grep -n '^ps draining' "$STUB/calls.log" | tail -n 1 | cut -d: -f1)"
+  stop_line="$(line_of '^docker stop -t 30 ims-blue')"
+  [ -n "$stop_line" ] && [ "$last_draining" -lt "$stop_line" ] || fail "the old slot was stopped (line ${stop_line:-none}) before the last draining poll (line $last_draining)"
+  log_has '^ps clear'
+  before '^nginx reload' '^ps draining'
+}
+
+t_deploy_stops_immediately_when_no_worker_is_draining() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  deploy "$B"
+  eq "$rc" 0 "deploy"
+  log_lacks '^ps draining'
+  ! grep -q 'still draining' "$T/out" || fail "ordinary workers or a process merely naming the phrase were treated as draining"
+  eq "$(grep -c '^ps clear' "$STUB/calls.log")" 1 "exactly one poll when nothing drains"
+  before '^ps clear' '^docker stop -t 30 ims-blue'
+}
+
+t_deploy_stops_anyway_after_the_bound_and_says_so() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=10
+  deploy "$B"
+  eq "$rc" 0 "an expired drain must not fail the deploy: $(tail -n 3 "$T/out")"
+  grep -q 'still draining after 10s' "$T/out" || fail "no warning: $(tail -n 5 "$T/out")"
+  grep -q 'shutting down' "$T/out" || fail "the draining workers are not listed"
+  eq "$(grep -c '^ps draining' "$STUB/calls.log")" 6 "polls until the bound (0,2,...,10)"
+  log_has '^docker stop -t 30 ims-blue'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
+}
+
+t_drain_bound_is_the_sites_proxy_read_timeout_plus_a_margin() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  printf 'server {\n  location / {\n    proxy_read_timeout 90s;\n  }\n}\n' > "$STUB/nginx_T"
+  touch "$STUB/ps_drain_forever"; export IMS_DRAIN_POLL_S=15
+  deploy "$B"
+  eq "$rc" 0 "deploy"
+  eq "$(grep -c '^ps draining' "$STUB/calls.log")" 8 "bound 90+15 at a 15 s poll (0,15,...,105)"
+}
+
+t_drain_bound_falls_back_to_600_plus_a_margin() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/ps_drain_forever"; export IMS_DRAIN_POLL_S=205      # no nginx -T output: 600 + 15 = 615
+  deploy "$B"
+  eq "$rc" 0 "deploy"
+  eq "$(grep -c '^ps draining' "$STUB/calls.log")" 4 "bound 615 at a 205 s poll (0,205,410,615)"
+}
+
+t_rollback_waits_for_draining_workers_before_stopping_the_current_slot() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  echo 2 > "$STUB/ps_drain_polls"; export IMS_DRAIN_BOUND_S=100
+  rollback
+  eq "$rc" 0 "rollback: $(tail -n 3 "$T/out")"
+  eq "$(grep -c '^ps draining' "$STUB/calls.log")" 2
+  last_draining="$(grep -n '^ps draining' "$STUB/calls.log" | tail -n 1 | cut -d: -f1)"
+  stop_line="$(line_of '^docker stop -t 30 ims-green')"
+  [ -n "$stop_line" ] && [ "$last_draining" -lt "$stop_line" ] || fail "the current slot was stopped before the workers finished"
+}
+
 t_deploy_refuses_a_world_readable_env_file() {
   seed_active blue "$A"; migs "$B" m1:expand; chmod 644 "$IMS_ENV_FILE"
   deploy "$B"
@@ -293,7 +356,7 @@ t_interrupted_switch_never_removes_the_serving_slot() {
   grep -q 'interrupted' "$T/out" || fail "the interrupted switch was not reported"
   log_lacks '^docker rm -f ims-blue'
   before '^nginx reload' '^RUN-SLOT ims-green'     # the file was put back to the serving slot BEFORE anything was replaced
-  before '^RUN-SLOT ims-green' '^docker stop ims-blue'
+  before '^RUN-SLOT ims-green' '^docker stop -t 30 ims-blue'
   eq "$(cat "$IMS_DEPLOY_DIR/current")" "$C green"
   eq "$(cat "$IMS_DEPLOY_DIR/previous")" "$A blue"
 }

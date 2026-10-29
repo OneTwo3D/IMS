@@ -19,7 +19,8 @@ IMS_HC_BIN="${IMS_HC_BIN:-/usr/local/bin/o3d-hc}"
 IMS_HEALTH_TIMEOUT_S="${IMS_HEALTH_TIMEOUT_S:-120}"
 IMS_HEALTH_INTERVAL_S="${IMS_HEALTH_INTERVAL_S:-2}"
 IMS_FRONT_TIMEOUT_S="${IMS_FRONT_TIMEOUT_S:-30}"
-IMS_DRAIN_S="${IMS_DRAIN_S:-10}"
+IMS_DRAIN_POLL_S="${IMS_DRAIN_POLL_S:-2}"       # how often to look for nginx workers still draining
+IMS_DRAIN_BOUND_S="${IMS_DRAIN_BOUND_S:-}"      # total wait; default = the site's proxy_read_timeout (600 if not found) + 15
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 die() { log "ERROR: $*"; exit "${DIE_RC:-1}"; }
@@ -102,6 +103,47 @@ stop_unless_serving() { # <slot>
   fi
   log "MANUAL ATTENTION: nginx serves (or may serve) $(slot_name "$1"); it is left running. Check ${IMS_FRONT_URL}/login and ${IMS_UPSTREAM_FILE} by hand; both slots may be running."
   return 1
+}
+# --- draining the old slot ------------------------------------------------------------------------------------------------------
+# After a reload, old nginx workers keep proxying their in-flight requests to the OLD slot for up to proxy_read_timeout. Those workers
+# show as "nginx: worker process is shutting down". They are matched by a case prefix on each ps line (no grep/pgrep pattern whose own
+# command line could match itself).
+draining_workers() {
+  local line
+  ps -eo args= 2>/dev/null | while IFS= read -r line; do
+    case "$line" in "nginx: worker process is shutting down"*) printf '%s\n' "$line" ;; esac
+  done
+}
+drain_bound_s() { # the rendered config's proxy_read_timeout (largest value, seconds; 600 if absent) + 15
+  local best=0 n unit secs
+  if [ -n "$IMS_DRAIN_BOUND_S" ]; then printf '%s\n' "$IMS_DRAIN_BOUND_S"; return 0; fi
+  while read -r n unit; do
+    [ -n "$n" ] || continue
+    secs="$n"; [ "$unit" != m ] || secs=$((n * 60))
+    [ "$secs" -le "$best" ] || best="$secs"
+  done < <(nginx -T 2>/dev/null | sed -nE 's/^[[:space:]]*proxy_read_timeout[[:space:]]+([0-9]+)(s|m)?[[:space:]]*;.*/\1 \2/p')
+  [ "$best" -gt 0 ] || best=600
+  printf '%s\n' $((best + 15))
+}
+# Wait for the old workers to finish, then stop the old slot (kept, not removed). The new slot is already live, so running out of time
+# is a warning, not a failure.
+drain_and_stop_slot() { # <slot>
+  local slot="$1" bound waited=0 still
+  bound="$(drain_bound_s)"
+  while :; do
+    still="$(draining_workers)"
+    [ -n "$still" ] || break
+    if [ "$waited" -ge "$bound" ]; then
+      log "WARNING: nginx workers are still draining after ${bound}s; stopping $(slot_name "$slot") anyway:"
+      sed 's/^/  /' <<< "$still" >&2
+      break
+    fi
+    sleep "$IMS_DRAIN_POLL_S"
+    waited=$((waited + IMS_DRAIN_POLL_S))
+  done
+  # Only stop the slot once the RUNNING nginx reports it is not serving from it.
+  assert_not_serving "$slot" || return 1
+  docker stop -t 30 "$(slot_name "$slot")" >/dev/null 2>&1 || log "warning: could not stop $(slot_name "$slot")"
 }
 slot_running() { [ "$(docker inspect --format '{{.State.Running}}' "$(slot_name "$1")" 2>/dev/null)" = true ]; }
 

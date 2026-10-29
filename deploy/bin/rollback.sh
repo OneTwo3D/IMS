@@ -77,9 +77,7 @@ if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S"; then
   stop_unless_serving "$prev_slot" || true
   die "${IMS_FRONT_URL}/login did not answer 200 after the switch"
 fi
-sleep "$IMS_DRAIN_S"
-assert_not_serving "$cur_slot" || die "nginx still serves ${cur_name} after the switch; left running, nothing recorded"
-docker stop "$cur_name" >/dev/null 2>&1 || log "warning: could not stop ${cur_name}"
+drain_and_stop_slot "$cur_slot" || die "nginx still serves ${cur_name} after the switch; left running, nothing recorded"
 
 # --- swap the records (previous first) ------------------------------------------------------------------------------------------
 write_atomic "${IMS_DEPLOY_DIR}/previous" "${cur_sha} ${cur_slot}"

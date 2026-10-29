@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Test stub for ps -eo args=: an nginx master, plus (while the test says so) a worker that is shutting down.
+#   $STUB/ps_drain_polls = N   the first N calls show a draining worker, later ones do not
+#   $STUB/ps_drain_forever     every call shows one
+set -u
+echo "nginx: master process /usr/sbin/nginx"
+echo "nginx: worker process"
+echo "grep -F nginx: worker process is shutting down"       # something that merely MENTIONS the phrase must not count
+draining=0
+if [ -e "$STUB/ps_drain_forever" ]; then draining=1
+elif [ -e "$STUB/ps_drain_polls" ]; then
+  n="$(cat "$STUB/ps_drain_polls")"
+  if [ "$n" -gt 0 ]; then draining=1; echo $((n - 1)) > "$STUB/ps_drain_polls"; fi
+fi
+if [ "$draining" = 1 ]; then echo "nginx: worker process is shutting down"; echo "ps draining" >> "$STUB/calls.log"; else echo "ps clear" >> "$STUB/calls.log"; fi
