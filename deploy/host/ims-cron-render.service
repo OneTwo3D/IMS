@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-render and install the IMS host crontab (/etc/cron.d/onetwo3d-ims)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Wrapped in the o3d-hc heartbeat (slug ims-cron-render) by the script itself when /usr/local/bin/o3d-hc exists; skipped silently otherwise.
+ExecStart=/usr/local/lib/ims-deploy/cron-render.sh --only-if-changed
+TimeoutStartSec=300

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Test stub for nginx: -t fails when $STUB/nginx_t_fail exists; every call is logged.
+set -u
+case "$*" in
+  -t)
+    # What the upstream file looked like at the moment of the test: complete, never half-written.
+    echo "nginx -t [$(tr '\n' ' ' < "$IMS_UPSTREAM_FILE" 2>/dev/null)]" >> "$STUB/calls.log"
+    if [ -e "$STUB/nginx_t_fail_once" ]; then rm -f "$STUB/nginx_t_fail_once"; exit 1; fi
+    [ ! -e "$STUB/nginx_t_fail" ] ;;
+  -T) cat "$STUB/nginx_T" 2>/dev/null || true ;;       # the rendered configuration, if the test provides one
+  "-s reload")
+    n="$(grep -c '^nginx reload' "$STUB/calls.log" || true)"
+    echo "nginx reload" >> "$STUB/calls.log"; touch "$STUB/reloaded"
+    # $STUB/reload_fail_after holds N: the first N reloads work, every later one fails and does not load the file.
+    if [ -e "$STUB/reload_fail_after" ] && [ "$n" -ge "$(cat "$STUB/reload_fail_after")" ]; then exit 1; fi
+    cp "$IMS_UPSTREAM_FILE" "$STUB/loaded" ;;   # the "loaded config" is the file as of the last reload
+  *) echo "nginx $*" >> "$STUB/calls.log" ;;
+esac

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Test stub for curl: answers 200 for a running container's port unless its image is marked unhealthy; port 3000 follows the nginx upstream file.
+set -u
+url="${*: -1}"
+# The upstream port the RUNNING nginx uses: the file as of the last reload (a switch that never reloaded is not live).
+loaded_port() { grep -oE 'server 127\.0\.0\.1:[0-9]+' "$STUB/loaded" 2>/dev/null | head -n1 | cut -d: -f2; }
+port="$(sed -E 's#^http://[^:/]+:([0-9]+).*#\1#' <<< "$url")"
+if [ "$port" = 3000 ]; then
+  port="$(loaded_port)"
+  case " $* " in *" -sI "*|*" -I "*)
+    if [ -e "$STUB/no_header" ]; then exit 0; fi
+    slot=none; [ "$port" = 3101 ] && slot=blue; [ "$port" = 3102 ] && slot=green
+    echo "curl -I $url -> $slot" >> "$STUB/calls.log"
+    printf 'HTTP/1.1 200 OK\r\nX-IMS-Slot: %s\r\n\r\n' "$slot"; exit 0 ;;
+  esac
+  if grep -q '^# MAINTENANCE' "$STUB/loaded" 2>/dev/null; then echo "curl $url -> 503 (maintenance)" >> "$STUB/calls.log"; echo -n 503; exit 0; fi
+  [ ! -e "$STUB/front_fail" ] || { echo -n 000; echo "curl $url -> 000" >> "$STUB/calls.log"; exit 7; }
+fi
+code=000
+for f in "$STUB"/containers/*; do
+  [ -f "$f" ] || continue
+  cport="$(sed -n 's/^port=//p' "$f")" crun="$(sed -n 's/^running=//p' "$f")" cimg="$(sed -n 's/^image=//p' "$f")"
+  if [ "$cport" = "${port:-}" ] && [ "$crun" = 1 ] && [ ! -e "$STUB/unhealthy/${cimg##*:}" ]; then code=200; fi
+done
+echo "curl $url -> $code" >> "$STUB/calls.log"
+echo -n "$code"
+[ "$code" = 200 ] || exit 7
