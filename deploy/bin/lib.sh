@@ -149,6 +149,34 @@ drain_and_stop_slot() { # <slot>
   assert_not_serving "$slot" || return 1
   docker stop -t 30 "$(slot_name "$slot")" >/dev/null 2>&1 || log "warning: could not stop $(slot_name "$slot")"
 }
+# deploy/current can lag the truth after an interrupted run. Reconcile it against the slot nginx actually serves: if current names the
+# OTHER slot, the served slot's container is running and its image tag is a full sha, trust the served slot (the stale current becomes
+# previous). Anything else is refused with a repair hint. rc 0 when the records are consistent (or were repaired).
+reconcile_state() { # <served-slot>
+  local served="$1" cur cur_slot sha
+  cur="$(read_state current)"; cur_slot="${cur#* }"
+  [ "$cur_slot" != "$served" ] || return 0
+  if [ -n "$cur" ] && [ "$served" != none ] && [ "$cur_slot" = "$(other_slot "$served")" ] && slot_running "$served"; then
+    sha="$(container_image_sha "$(slot_name "$served")")"
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      log "MISMATCH: deploy/current says '${cur}' but nginx serves $(slot_name "$served") running ${sha}; trusting the served slot (an earlier run was interrupted after the switch)"
+      write_atomic "${IMS_DEPLOY_DIR}/previous" "$cur" && write_atomic "${IMS_DEPLOY_DIR}/current" "${sha} ${served}"
+      return $?
+    fi
+  fi
+  log "MISMATCH: deploy/current says '${cur:-nothing}' but nginx serves '${served}', and the served slot cannot be confirmed as a running recorded release. Repair: write '<full-sha> <slot>' into ${IMS_DEPLOY_DIR}/current (and previous) for what is really running."
+  return 1
+}
+# The release nginx really serves (sha), for the cron renderer; empty if it cannot be confirmed.
+served_release_sha() {
+  local served sha
+  served="$(header_slot)" || return 0
+  case "$served" in blue|green) ;; *) return 0 ;; esac
+  slot_running "$served" || return 0
+  sha="$(container_image_sha "$(slot_name "$served")")"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && printf '%s\n' "$sha"
+  return 0
+}
 slot_running() { [ "$(docker inspect --format '{{.State.Running}}' "$(slot_name "$1")" 2>/dev/null)" = true ]; }
 
 # --- images / containers --------------------------------------------------------------------------------------------------------
@@ -212,6 +240,23 @@ producer_hold_value() { # the value, whitespace-trimmed
 # the live-from instant is ever read from a settings row or the database (the code says so), so this list is complete for the decision.
 # Enforcement = all is not enough on its own: a grant plus a live-from instant in the past makes that destination's work LIVE.
 RELEASE_VARS=(WC_WRITEBACK_ALLOWED_ORIGIN MINTSOFT_WRITE_ALLOWED XERO_WRITE_ALLOWED_TENANT WC_WRITES_LIVE_FROM MINTSOFT_WRITES_LIVE_FROM XERO_WRITES_LIVE_FROM)
+# The migration precheck reads public._prisma_migrations. Production and stage use the `public` schema only; a DATABASE_URL that points
+# the application at another schema (?schema=, or options= which can set search_path) would make that read look at the wrong table, so
+# it is refused. Per-tenant schemas are deliberately not supported by this deploy path.
+check_database_url_schema() {
+  local url query part
+  url="$(env_value DATABASE_URL)"
+  case "$url" in *\?*) query="${url#*\?}" ;; *) return 0 ;; esac
+  query="${query%%#*}"
+  local IFS='&'
+  for part in $query; do
+    case "$part" in
+      schema=public) ;;
+      [Ss][Cc][Hh][Ee][Mm][Aa]=*) die "DATABASE_URL sets ${part}; this deploy path supports only the public schema (the migration check reads public._prisma_migrations)" ;;
+      [Oo][Pp][Tt][Ii][Oo][Nn][Ss]=*) die "DATABASE_URL sets options=, which can change the schema search path; this deploy path supports only the public schema" ;;
+    esac
+  done
+}
 check_env_file() {
   [ -f "$IMS_ENV_FILE" ] || die "$IMS_ENV_FILE does not exist"
   local mode
@@ -230,6 +275,7 @@ check_env_file() {
     fi
   done
   [ -n "$(env_value DATABASE_URL)" ] || die "$IMS_ENV_FILE does not set DATABASE_URL"
+  check_database_url_schema
 }
 
 # --- migrations -----------------------------------------------------------------------------------------------------------------

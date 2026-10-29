@@ -134,7 +134,7 @@ wait_http_200 "http://127.0.0.1:${new_port}/login" "$IMS_HEALTH_TIMEOUT_S" \
 
 # --- 6./7. switch and verify through nginx --------------------------------------------------------------------------------------
 switch_upstream "$new_port" || fail_new_slot "could not switch the nginx upstream; the previous upstream is restored"
-if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S"; then
+if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S" || [ "$(header_slot || true)" != "$new_slot" ]; then
   if [ "$old_slot" != none ] && [ "$contract" = 0 ]; then
     log "nginx does not serve the new release; switching back to ${old_slot}"
     switch_upstream "$(slot_port "$old_slot")" || log "ALSO could not switch back; fix ${IMS_UPSTREAM_FILE} by hand"
@@ -142,16 +142,17 @@ if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S"; then
   fail_new_slot "${IMS_FRONT_URL}/login did not answer 200 after the switch"
 fi
 
-# --- 8. previous slot: stop, keep ---------------------------------------------------------------------------------------------
-if [ "$old_slot" != none ]; then
-  drain_and_stop_slot "$old_slot" || die "nginx still serves $(slot_name "$old_slot") after the switch; left running, nothing recorded"
-fi
-
-# --- 9. record: previous first, so an interruption never leaves current ahead of previous ---------------------------------------
+# --- 8. record: previous first, so an interruption never leaves current ahead of previous. Done as soon as nginx is verified serving the
+#        new slot and BEFORE the drain wait (up to ~10 minutes) so that a crash while draining cannot leave the records naming the old one.
 mkdir -p "$IMS_DEPLOY_DIR"
 if [ "$old_slot" != none ]; then write_atomic "${IMS_DEPLOY_DIR}/previous" "${old_sha} ${old_slot}"; fi
 write_atomic "${IMS_DEPLOY_DIR}/current" "${sha} ${new_slot}"
 log "deployed ${sha} to ${new_slot}"
+
+# --- 9. previous slot: drain, stop, keep --------------------------------------------------------------------------------------
+if [ "$old_slot" != none ]; then
+  drain_and_stop_slot "$old_slot" || die "nginx still serves $(slot_name "$old_slot") after the switch; it is left running (deploy/current already names ${sha})"
+fi
 
 # --- 10. host cron --------------------------------------------------------------------------------------------------------------
 install_host_cron "$sha" || { DIE_RC=4 die "deployed, but the host crontab could not be re-rendered (the ims-cron-render timer retries every 5 minutes)"; }

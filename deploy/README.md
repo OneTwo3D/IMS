@@ -332,6 +332,12 @@ overrides.
 not serving from it. If a switch-back fails and nginx still serves the new slot, both slots are left running, nothing is recorded in the
 state files that is not true, and the script exits non-zero with `MANUAL ATTENTION` in the log.
 
+**Records.** `previous` then `current` are written as soon as nginx is verified serving the new slot (the X-IMS-Slot header names it),
+BEFORE the drain wait, so a crash while draining cannot leave them naming the old release. If they still disagree with what nginx
+serves (an older interrupted run), `rollback.sh` trusts the served slot when its container is running and its image tag is a full sha,
+and otherwise refuses with a repair hint; the cron renderer also uses the served release. `DATABASE_URL` must use the `public` schema:
+a `schema=` other than `public`, or any `options=`, is refused (per-tenant schemas are not supported by this deploy path).
+
 **Rollback.** `rollback.sh` always RE-CREATES the previous slot from the recorded release image with the CURRENT, re-validated `ims.env`
 (a stopped container would keep the environment it was made with, stale after a credential rotation; `docker start` is never used; a
 missing image is pulled or the rollback refuses), health-checks it,

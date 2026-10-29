@@ -1,2 +1,4 @@
 #!/usr/bin/env bash
+# No real sleeping. With $STUB/sleep_kills_parent the calling script is killed on its first sleep: a crash in the middle of the drain wait.
+[ ! -e "${STUB:-/nonexistent}/sleep_kills_parent" ] || kill -9 "$PPID"
 exit 0

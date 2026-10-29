@@ -28,12 +28,13 @@ require_root
 check_env_file
 take_lock 0
 
+active="$(serving_slot)" || die "cannot determine which slot nginx serves; nothing was changed"
+reconcile_state "$active" || die "deploy/current does not match what nginx serves and cannot be reconciled; nothing was changed"
 cur="$(read_state current)" prev="$(read_state previous)"
 [ -n "$cur" ] && [ -n "$prev" ] || die "deploy/current and deploy/previous must both exist; there is nothing to roll back to"
 cur_sha="${cur%% *}" cur_slot="${cur#* }" prev_sha="${prev%% *}" prev_slot="${prev#* }"
 require_sha "$cur_sha"; require_sha "$prev_sha"
 [ "$cur_slot" != "$prev_slot" ] || die "current and previous name the same slot ($cur_slot)"
-active="$(serving_slot)" || die "cannot determine which slot nginx serves; nothing was changed"
 [ "$active" = "$cur_slot" ] || die "nginx serves '${active}' but deploy/current says ${cur_slot}; resolve that by hand first"
 prev_name="$(slot_name "$prev_slot")" prev_port="$(slot_port "$prev_slot")" cur_name="$(slot_name "$cur_slot")"
 log "rolling back ${cur_sha} (${cur_slot}) -> ${prev_sha} (${prev_slot})"
@@ -73,16 +74,15 @@ if ! switch_upstream "$prev_port"; then
   stop_unless_serving "$prev_slot" || true
   die "could not switch the nginx upstream; the current release keeps serving"
 fi
-if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S"; then
+if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S" || [ "$(header_slot || true)" != "$prev_slot" ]; then
   log "nginx does not serve the rolled-back release; switching back to ${cur_slot}"
   switch_upstream "$(slot_port "$cur_slot")" || log "ALSO could not switch back; fix ${IMS_UPSTREAM_FILE} by hand"
   stop_unless_serving "$prev_slot" || true
   die "${IMS_FRONT_URL}/login did not answer 200 after the switch"
 fi
-drain_and_stop_slot "$cur_slot" || die "nginx still serves ${cur_name} after the switch; left running, nothing recorded"
-
-# --- swap the records (previous first) ------------------------------------------------------------------------------------------
+# --- swap the records (previous first) as soon as nginx is verified on the target, BEFORE the drain wait ------------------------
 write_atomic "${IMS_DEPLOY_DIR}/previous" "${cur_sha} ${cur_slot}"
 write_atomic "${IMS_DEPLOY_DIR}/current" "${prev_sha} ${prev_slot}"
 log "rolled back to ${prev_sha} (${prev_slot})"
+drain_and_stop_slot "$cur_slot" || die "nginx still serves ${cur_name} after the switch; it is left running (deploy/current already names ${prev_sha})"
 install_host_cron "$prev_sha" || { DIE_RC=4 die "rolled back, but the host crontab could not be re-rendered (the ims-cron-render timer retries every 5 minutes)"; }

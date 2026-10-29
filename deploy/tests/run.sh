@@ -745,6 +745,75 @@ t_cron_install_refuses_when_the_log_directory_is_missing() {
   log_lacks 'entrypoint node'
 }
 
+t_state_is_recorded_before_the_drain_wait() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/ps_drain_forever" "$STUB/sleep_kills_parent"      # the deploy dies on its first sleep while draining
+  deploy "$B"
+  [ "$rc" != 0 ] || fail "the crash did not happen"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green" "current must already name the new release"
+  eq "$(cat "$IMS_DEPLOY_DIR/previous")" "$A blue"
+  log_lacks '^docker stop -t 30'
+}
+
+t_rollback_records_state_before_the_drain_wait() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/ps_drain_forever" "$STUB/sleep_kills_parent"
+  rollback
+  [ "$rc" != 0 ] || fail "the crash did not happen"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue" "current must already name the rolled-back release"
+  eq "$(cat "$IMS_DEPLOY_DIR/previous")" "$B green"
+}
+
+t_rollback_reconciles_a_stale_current_with_the_served_slot() {
+  # the old order's crash window: nginx serves B (green, running) but deploy/current still says A (blue)
+  seed_active green "$B"; seed_stopped blue "$A"; echo "$A blue" > "$IMS_DEPLOY_DIR/current"
+  migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  rollback
+  eq "$rc" 0 "rollback: $(tail -n 4 "$T/out")"
+  grep -q 'MISMATCH' "$T/out" || fail "the mismatch was not reported loudly"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue" "rolled back to A, the release that was stale-current"
+  eq "$(cat "$IMS_DEPLOY_DIR/previous")" "$B green"
+  grep -q 'server 127.0.0.1:3101;' "$IMS_UPSTREAM_FILE" || fail "nginx not switched to blue"
+}
+
+t_rollback_refuses_a_stale_current_when_the_served_slot_is_not_running() {
+  seed_active green "$B"; seed_stopped blue "$A"; echo "$A blue" > "$IMS_DEPLOY_DIR/current"
+  sed -i 's/^running=.*/running=0/' "$STUB/containers/ims-green"
+  migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  rollback
+  [ "$rc" != 0 ] || fail "rollback guessed"
+  grep -q 'Repair' "$T/out" || fail "no repair hint"
+  log_lacks '^RUN-SLOT'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue"
+}
+
+t_cron_render_uses_the_served_release() {
+  seed_active green "$B"; echo "$A blue" > "$IMS_DEPLOY_DIR/current"      # current is stale
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render"
+  log_has "--entrypoint node ghcr.io/onetwo3d/ims:$B "
+  log_lacks "ims:$A /app/dist-scripts"
+}
+
+t_database_url_must_use_the_public_schema() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  for q in '?schema=tenant' '?connection_limit=5&schema=tenant' '?schema=public%20' '?options=-c%20search_path%3Dtenant' '?SCHEMA=tenant'; do
+    : > "$STUB/calls.log"; grep -v '^DATABASE_URL' "$IMS_ENV_FILE" > "$T/e"; cat "$T/e" > "$IMS_ENV_FILE"
+    echo "DATABASE_URL=postgresql://u:${PW}@127.0.0.1:5432/ims$q" >> "$IMS_ENV_FILE"
+    deploy "$B"
+    [ "$rc" != 0 ] || fail "deploy accepted DATABASE_URL query '$q'"
+    grep -q 'public schema' "$T/out" || fail "no clear message for '$q'"
+    log_lacks '^docker (pull|run)'
+  done
+  for q in '?schema=public' '?connection_limit=5&schema=public&sslmode=require' ''; do
+    seed_active blue "$A"; rm -f "$STUB/containers/ims-green"; : > "$STUB/calls.log"
+    grep -v '^DATABASE_URL' "$IMS_ENV_FILE" > "$T/e"; cat "$T/e" > "$IMS_ENV_FILE"
+    echo "DATABASE_URL=postgresql://u:${PW}@127.0.0.1:5432/ims$q" >> "$IMS_ENV_FILE"
+    deploy "$B"
+    eq "$rc" 0 "deploy with DATABASE_URL query '$q': $(tail -n 3 "$T/out")"
+  done
+}
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 tests=("$@")
 if [ "${#tests[@]}" = 0 ]; then mapfile -t tests < <(declare -F | awk '{print $3}' | grep '^t_'); fi

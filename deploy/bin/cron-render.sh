@@ -26,4 +26,7 @@ take_lock 120
 cur="$(read_state current)"
 if [ -z "$cur" ]; then log "no release deployed yet; nothing to render"; exit 0; fi
 [ -f "$IMS_ENV_FILE" ] || die "$IMS_ENV_FILE does not exist"
-install_host_cron "${cur%% *}" "$mode"
+# Render with the release nginx actually serves; fall back to the recorded current only if that cannot be confirmed.
+sha="$(served_release_sha)"
+if [ -z "$sha" ]; then sha="${cur%% *}"; elif [ "$sha" != "${cur%% *}" ]; then log "note: deploy/current says ${cur%% *} but nginx serves ${sha}; rendering with the served release"; fi
+install_host_cron "$sha" "$mode"
