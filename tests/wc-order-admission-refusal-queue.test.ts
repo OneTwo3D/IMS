@@ -73,6 +73,7 @@ mock.module('@/lib/connectors/woocommerce/sync/field-mapping', {
     mapWcLineItems: async () => [],
     mapWcOrderDiscount: () => ({ discountStr: null, discountAmount: 0 }),
     mapWcFeeLines: () => [],
+    readWclcOrderComponents: () => ({ dutyComponent: null, taxComponent: null, handlingComponent: null }),
     mapWcShipping: () => ({ shippingForeign: 0, shippingService: null }),
     resolveWcTaxRateById: async () => ({
       taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, reverseCharge: false,

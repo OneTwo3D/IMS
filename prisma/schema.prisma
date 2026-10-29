@@ -1746,6 +1746,12 @@ model SalesOrder {
   customerName      String?
   customerEmail     String?
   customerVatNumber String?          // customer-entered VAT/IOSS number from the storefront, sent to the WMS for customs
+  /// Mirrored from the WooCommerce order meta the wclc plugin writes on an EU order (never recomputed): the customs
+  /// duty, the import VAT (import VAT only) and, only when it is above zero, the Union handling fee NET carried inside
+  /// the over-EUR-150 duty line. In the ORDER currency. Null when the order carries none (or predates the plugin).
+  wclcDutyComponent     Decimal?  @db.Decimal(18, 4) @map("wclc_duty_component")
+  wclcTaxComponent      Decimal?  @db.Decimal(18, 4) @map("wclc_tax_component")
+  wclcHandlingComponent Decimal?  @db.Decimal(18, 4) @map("wclc_handling_component")
   billingAddress    Json?
   shippingAddress   Json?
 
@@ -2042,6 +2048,10 @@ model SalesOrderLine {
   orderId         String
   productId       String?    // null if product deleted / not found
   externalLineItemId Int?
+  /// Which wclc fee a mirrored WooCommerce FEE line is (duty_flat | uhf | duty_fee), from the line's own item meta.
+  /// Null on every goods line and on any fee line that carries no wclc marker. Identifies a fee line without
+  /// inferring it from an empty SKU.
+  wclcFeeKind     String?    @map("wclc_fee_kind")
   description     String
   sku             String?
   qty             Decimal    @db.Decimal(12, 4)

@@ -182,6 +182,64 @@ export type MappedLine = {
   externalTaxRateId: number | null
   externalLineItemId: number | null
   taxCategoryFallback?: TaxCategory
+  /**
+   * Which wclc fee a fee line is, read from the line's own `_wclc_fee_kind` item meta (only when the `_wclc_fee`
+   * marker is set). Mirrored, never derived: `duty_flat` is the EUR 3 per HS code "EU Import Duty", `uhf` the EUR 2
+   * "EU Customs Fee", `duty_fee` the non-taxable over-EUR-150 "Import Duty" line. Null for any other line.
+   * Informational on the mapped line: it changes no amount and no tax.
+   */
+  wclcFeeKind?: WclcFeeKind | null
+  /** True on every line `mapWcFeeLines` produces (and on nothing else): scopes fee-only decisions such as the explicit no-tax accounting code. */
+  isFeeLine?: boolean
+}
+
+export const WCLC_FEE_KINDS = ['duty_flat', 'uhf', 'duty_fee'] as const
+export type WclcFeeKind = (typeof WCLC_FEE_KINDS)[number]
+
+/** Truthiness of a WooCommerce meta value as the plugin writes it ('1', 1, true, 'yes'); anything else is not a marker. */
+function wcMetaFlag(value: unknown): boolean {
+  if (value === true || value === 1) return true
+  if (typeof value !== 'string') return false
+  return ['1', 'true', 'yes'].includes(value.trim().toLowerCase())
+}
+
+/** The wclc fee kind of a fee line, or null when it is not a marked wclc fee (or names a kind this build does not know). */
+export function readWclcFeeKind(feeLine: Pick<WcFeeLine, 'meta_data'>): WclcFeeKind | null {
+  const meta = feeLine.meta_data ?? []
+  const marker = meta.find((m) => m.key === '_wclc_fee')
+  if (!marker || !wcMetaFlag(marker.value)) return null
+  const kind = meta.find((m) => m.key === '_wclc_fee_kind')?.value
+  return typeof kind === 'string' && (WCLC_FEE_KINDS as readonly string[]).includes(kind.trim()) ? (kind.trim() as WclcFeeKind) : null
+}
+
+export type WclcOrderComponents = {
+  dutyComponent: string | null
+  taxComponent: string | null
+  /** Present only when above zero, as wclc writes it. */
+  handlingComponent: string | null
+}
+
+function wclcComponentAmount(meta: WcMeta[], key: string): string | null {
+  const entry = meta.find((m) => m.key === key)
+  if (!entry) return null
+  const raw = typeof entry.value === 'number' ? String(entry.value) : typeof entry.value === 'string' ? entry.value.trim() : ''
+  // A plain non-negative decimal only; anything else (empty, junk, negative) is "not carried", never a guess.
+  return /^\d+(\.\d+)?$/.test(raw) ? raw : null
+}
+
+/**
+ * The order-level split wclc records when it charges duty: `_wclc_duty_component`, `_wclc_tax_component` (import VAT
+ * only) and `_wclc_handling_component` (the Union handling fee NET inside the over-EUR-150 duty line). Mirrored as
+ * reported. The handling component is absent unless it is above zero, so a stored zero is read as absent.
+ */
+export function readWclcOrderComponents(order: Pick<WcFullOrder, 'meta_data'>): WclcOrderComponents {
+  const meta = order.meta_data ?? []
+  const handling = wclcComponentAmount(meta, '_wclc_handling_component')
+  return {
+    dutyComponent: wclcComponentAmount(meta, '_wclc_duty_component'),
+    taxComponent: wclcComponentAmount(meta, '_wclc_tax_component'),
+    handlingComponent: handling !== null && parseFloat(handling) > 0 ? handling : null,
+  }
 }
 
 function mapWcTaxClassToCategory(taxClass: string | null | undefined): TaxCategory {
@@ -246,6 +304,8 @@ export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {
         externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
         externalLineItemId: null,
         taxCategoryFallback: mapWcTaxClassToCategory(feeLine.tax_class),
+        wclcFeeKind: readWclcFeeKind(feeLine),
+        isFeeLine: true,
       }
     })
   return mapped.filter((line): line is MappedLine => line !== null)

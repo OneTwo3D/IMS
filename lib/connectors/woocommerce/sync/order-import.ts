@@ -20,7 +20,7 @@ import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from 
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
-  mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
+  mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
@@ -607,6 +607,28 @@ export type WcDocumentTaxReconciliation = {
  * compare against; inventing one would make this check assert its own guess. Its exposure is
  * unchanged by this function and is the same one o3d-y14 records.
  */
+/** Xero's built-in "no tax" code (the connector's own default for a line with none). */
+export const WC_NO_TAX_ACCOUNTING_TYPE = 'NONE'
+
+/**
+ * The accounting tax code of ONE imported line.
+ *
+ * A line WooCommerce reported with NO tax and no tax rate (`forceNoTax`: the over-EUR-150 non-taxable "Import Duty",
+ * a legacy untaxed fee, a tax-free item) resolves to rate 0 and NO code for the reconciliation. Left at that, the
+ * accounting payload would fall through the missing code to the ORDER DEFAULT, which on an EU order is the taxable
+ * IOSS code, and Xero would add VAT to a line WooCommerce charged none on. So the decision is carried across: those
+ * lines are sent on the explicit no-tax code, never on the order default.
+ */
+export function resolveWcLineAccountingTaxType(params: {
+  forceNoTax: boolean | undefined
+  baseTaxType: string | null | undefined
+  reverseCharge: boolean | null | undefined
+  reverseChargeSalesTaxType: string | null | undefined
+}): string | undefined {
+  if (params.forceNoTax) return WC_NO_TAX_ACCOUNTING_TYPE
+  return resolveSalesLineTaxType(params)
+}
+
 export function reconcileWcDocumentTax(
   components: WcDocumentTaxComponent[],
   /**
@@ -981,6 +1003,16 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
   }
 }
 
+/** The three mirrored wclc duty/tax/handling components as SalesOrder columns (null = the order carries none). */
+export function wclcComponentColumns(wcOrder: WcFullOrder): {
+  wclcDutyComponent: string | null
+  wclcTaxComponent: string | null
+  wclcHandlingComponent: string | null
+} {
+  const c = readWclcOrderComponents(wcOrder)
+  return { wclcDutyComponent: c.dutyComponent, wclcTaxComponent: c.taxComponent, wclcHandlingComponent: c.handlingComponent }
+}
+
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string): Promise<void> {
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
@@ -1045,6 +1077,9 @@ async function updateExistingWcOrderCore(
       data: {
         externalOrderNumber: wcOrder.number,
         customerVatNumber: readWcCustomerVat(wcOrder),
+        // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
+        // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
+        // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
@@ -2505,6 +2540,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       return {
         productId: l.productId,
         externalLineItemId: l.externalLineItemId,
+        wclcFeeKind: l.wclcFeeKind ?? null,
         sku: l.sku,
         description: l.description,
         qty: l.qty,
@@ -2593,6 +2629,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           customerName,
           customerEmail: wcOrder.billing.email || null,
           customerVatNumber: readWcCustomerVat(wcOrder),
+          ...wclcComponentColumns(wcOrder),
           billingAddress: mapWcAddress(wcOrder.billing),
           shippingAddress: mapWcAddress(wcOrder.shipping),
           subtotalForeign,
@@ -2912,7 +2949,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           reference: orderNumber,
           lines: lineData.map((l, idx) => {
             const rateNow = lineRateNow(idx)
-            const lineTaxType = resolveSalesLineTaxType({
+            const lineTaxType = resolveWcLineAccountingTaxType({
+              // FEE lines only: goods and shipping resolve exactly as before.
+              forceNoTax: mappedLines[idx]?.isFeeLine === true ? mappedLines[idx]?.forceNoTax : undefined,
               baseTaxType: rateNow?.accountingTaxType ?? lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
               reverseCharge: rateNow?.reverseCharge ?? lineTaxResolved[idx]?.reverseCharge,
               reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
