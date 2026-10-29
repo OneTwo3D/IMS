@@ -86,7 +86,7 @@ nginx_dir="$R/etc/nginx"
 install -d -m 0755 "$nginx_dir/sites-available" "$nginx_dir/sites-enabled"
 if [ ! -e "$nginx_dir/ims-upstream.conf" ]; then
   # Placeholder: names no slot port, so nothing is "active" and the holding page answers until the first deploy.
-  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\n# Placeholder until the first deploy.\nupstream ims_active {\n    server 127.0.0.1:3100;\n    keepalive 16;\n}\nmap $server_name $ims_slot {\n    default none;\n}\n' > "$nginx_dir/ims-upstream.conf"
+  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\n# Placeholder until the first deploy.\nupstream ims_active {\n    server 127.0.0.1:3100;\n    keepalive 16;\n}\nmap $server_name $ims_slot {\n    default none;\n}\nmap $server_name $ims_maint {\n    default 0;\n}\n' > "$nginx_dir/ims-upstream.conf"
   chmod 0644 "$nginx_dir/ims-upstream.conf"; log "wrote the placeholder upstream"
 fi
 # The site swap is staged and reversible: the new site is written as sites-available/ims.new, the CURRENT site file and the

@@ -140,7 +140,7 @@ t_successful_deploy_switches_then_records_state() {
   before '^nginx reload' 'curl http://127.0.0.1:3000/login -> 200'
   log_has 'curl http://127.0.0.1:3102/login -> 200'
   [ "$(stat -c %i "$IMS_UPSTREAM_FILE")" != "$inode_before" ] || fail "the upstream file was edited in place, not replaced by rename"
-  log_has '^nginx -t \[# Managed by deploy.sh / rollback.sh. Do not edit by hand. upstream ims_active \{ +server 127.0.0.1:3102; +keepalive 16; \} map \$server_name \$ims_slot \{ +default green; +\} \]'
+  log_has '^nginx -t \[# Managed by deploy.sh / rollback.sh. Do not edit by hand. upstream ims_active \{ +server 127.0.0.1:3102; +keepalive 16; \} map \$server_name \$ims_slot \{ +default green; +\} map \$server_name \$ims_maint \{ +default 0; +\} \]'
   no_temp_files
 }
 
@@ -985,6 +985,54 @@ t_deploying_an_older_image_with_unknown_markers_is_refused() {
   deploy "$A"
   eq "$rc" 3 "unverifiable markers"
   log_lacks '^MIGRATE'
+}
+
+t_maintenance_deploy_switches_to_maintenance_drains_stops_then_migrates() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  echo 2 > "$STUB/ps_drain_polls"; export IMS_DRAIN_BOUND_S=100
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 0 "maintenance deploy: $(tail -n 4 "$T/out")"
+  before '^nginx reload' '^curl .*-> 503 \(maintenance\)'        # 1. maintenance switched in and verified through nginx
+  before '^curl .*-> 503 \(maintenance\)' '^ps draining'          # 2. then the workers are drained
+  eq "$(grep -c '^ps draining' "$STUB/calls.log")" 2 "polls that saw a draining worker"
+  before '^ps draining' '^docker stop ims-blue'                  # 3. only then the slots are stopped
+  before '^docker stop ims-blue' '^MIGRATE'                      # 4. and the migration runs last
+  before '^MIGRATE' '^RUN-SLOT ims-green'
+  grep -q 'server 127.0.0.1:3102;' "$IMS_UPSTREAM_FILE" && grep -q 'default 0;' "$IMS_UPSTREAM_FILE" && ! grep -q 'MAINTENANCE' "$IMS_UPSTREAM_FILE" || fail "maintenance was not left by the normal switch: $(cat "$IMS_UPSTREAM_FILE")"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
+}
+
+t_maintenance_deploy_refuses_to_migrate_while_old_workers_drain() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  touch "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=10
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 5 "workers never exit: $(tail -n 4 "$T/out")"
+  log_lacks '^MIGRATE'
+  log_lacks '^docker stop'
+  log_lacks '^RUN-SLOT'
+  eq "$(container_running ims-blue)" 1 "nothing may be stopped while old workers drain"
+  grep -q '^# MAINTENANCE' "$IMS_UPSTREAM_FILE" || fail "maintenance must stay on"
+  grep -q "deploy.sh --allow-contract-migration --maintenance $B" "$T/out" || fail "no resume instruction"
+  grep -q 'To abort' "$T/out" || fail "no abort instruction"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue"
+}
+
+t_a_failed_migration_in_maintenance_keeps_maintenance_and_prints_recovery_steps() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  touch "$STUB/migrate_fail"
+  deploy --allow-contract-migration --maintenance "$B"
+  [ "$rc" != 0 ] || fail "deploy succeeded although the migration failed"
+  grep -q '^# MAINTENANCE' "$IMS_UPSTREAM_FILE" || fail "maintenance must stay on after a failed migration"
+  grep -q 'To resume' "$T/out" && grep -q 'To abort' "$T/out" || fail "no recovery steps: $(tail -n 4 "$T/out")"
+  log_lacks '^RUN-SLOT'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue"
+}
+
+t_normal_deploy_never_enters_maintenance() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  deploy "$B"
+  eq "$rc" 0 "deploy"
+  log_lacks 'maintenance'
 }
 
 # ---------------------------------------------------------------------------------------------------------------------------------

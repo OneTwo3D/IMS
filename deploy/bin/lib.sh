@@ -16,6 +16,7 @@ IMS_CROND_NAME="${IMS_CROND_NAME:-onetwo3d-ims}"
 # missing directory fails every job before curl runs. host-bootstrap.sh creates it; install_host_cron refuses without it.
 IMS_CRON_LOG_DIR="${IMS_CRON_LOG_DIR:-/var/log/one-two-inventory}"
 IMS_REGISTRY="${IMS_REGISTRY:-ghcr.io/onetwo3d}"
+IMS_PLACEHOLDER_PORT="${IMS_PLACEHOLDER_PORT:-3100}"    # nothing listens here: the "no slot" upstream (bootstrap placeholder, maintenance)
 IMS_BLUE_PORT="${IMS_BLUE_PORT:-3101}"
 IMS_GREEN_PORT="${IMS_GREEN_PORT:-3102}"
 IMS_FRONT_URL="${IMS_FRONT_URL:-http://127.0.0.1:3000}"
@@ -136,21 +137,27 @@ EXIT_CLEANUP_PENDING=5
 # are STILL draining when the bound expires, the old slot is NOT stopped: proxy_read_timeout bounds the gap between reads, not a whole
 # (for example streamed) response, so killing it could cut a live download. rc 0 stopped; rc 1 nginx still serves it (refused);
 # rc 5 cleanup pending (left running, or the stop failed; run cleanup-old-slot.sh later).
-drain_and_stop_slot() { # <slot> [context for the log, default "deploy complete, cleanup pending"]
-  local slot="$1" context="${2:-deploy complete, cleanup pending}" what="${3:-old slot}" bound waited=0 still
-  bound="$(drain_bound_s)"
+# Wait (bounded by drain_bound_s) until no nginx worker is shutting down. rc 0 drained; rc 5 the bound expired (DRAIN_STILL lists the
+# workers, DRAIN_BOUND is the bound). The one wait used by the slot switch, the failure paths and the maintenance deploy.
+wait_workers_drained() {
+  local waited=0
+  DRAIN_BOUND="$(drain_bound_s)"
   while :; do
-    still="$(draining_workers)"
-    [ -n "$still" ] || break
-    if [ "$waited" -ge "$bound" ]; then
-      log "${context}: ${what} $(slot_name "$slot") kept running for $(printf '%s\n' "$still" | grep -c .) draining nginx worker(s) after ${bound}s:"
-      sed 's/^/  /' <<< "$still" >&2
-      log "stop it later with: $(dirname "${BASH_SOURCE[0]}")/cleanup-old-slot.sh   (it re-checks for draining workers first)"
-      return "$EXIT_CLEANUP_PENDING"
-    fi
+    DRAIN_STILL="$(draining_workers)"
+    [ -n "$DRAIN_STILL" ] || return 0
+    [ "$waited" -lt "$DRAIN_BOUND" ] || return "$EXIT_CLEANUP_PENDING"
     sleep "$IMS_DRAIN_POLL_S"
     waited=$((waited + IMS_DRAIN_POLL_S))
   done
+}
+drain_and_stop_slot() { # <slot> [context for the log, default "deploy complete, cleanup pending"]
+  local slot="$1" context="${2:-deploy complete, cleanup pending}" what="${3:-old slot}"
+  wait_workers_drained || {
+    log "${context}: ${what} $(slot_name "$slot") kept running for $(printf '%s\n' "$DRAIN_STILL" | grep -c .) draining nginx worker(s) after ${DRAIN_BOUND}s:"
+    sed 's/^/  /' <<< "$DRAIN_STILL" >&2
+    log "stop it later with: $(dirname "${BASH_SOURCE[0]}")/cleanup-old-slot.sh   (it re-checks for draining workers first)"
+    return "$EXIT_CLEANUP_PENDING"
+  }
   # Only stop the slot once the RUNNING nginx reports it is not serving from it.
   assert_not_serving "$slot" || return 1
   docker stop -t 30 "$(slot_name "$slot")" >/dev/null 2>&1 || true
@@ -380,16 +387,19 @@ read_state() { # <current|previous> -> "<sha> <slot>" or empty
 # Atomically point nginx at the slot's port: new content goes to a temp file in the same directory and is mv'd over the include;
 # `nginx -t` then validates the whole configuration, and a failure restores the previous file (also by mv) before returning 1.
 # `nginx -s reload` is graceful: old workers finish their connections.
-upstream_content() { # <port>   (the map gives the site its X-IMS-Slot header, so the header always matches the loaded upstream)
-  local slot=none
-  [ "$1" != "$IMS_BLUE_PORT" ] || slot=blue
-  [ "$1" != "$IMS_GREEN_PORT" ] || slot=green
-  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\nupstream ims_active {\n    server 127.0.0.1:%s;\n    keepalive 16;\n}\nmap $server_name $ims_slot {\n    default %s;\n}\n' "$1" "$slot"
+# <port>, or the word "maintenance": the placeholder port (no slot), slot `none`, and $ims_maint = 1, which the site answers with a 503 and
+# Retry-After (the holding page). Leaving maintenance is an ordinary switch to a slot port, which writes $ims_maint = 0.
+upstream_content() {
+  local slot=none port="$1" maint=0 note=""
+  if [ "$1" = maintenance ]; then port="$IMS_PLACEHOLDER_PORT"; maint=1; note="# MAINTENANCE: the site answers 503 until a slot is switched in.\n"; fi
+  [ "$port" != "$IMS_BLUE_PORT" ] || slot=blue
+  [ "$port" != "$IMS_GREEN_PORT" ] || slot=green
+  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\n%bupstream ims_active {\n    server 127.0.0.1:%s;\n    keepalive 16;\n}\nmap $server_name $ims_slot {\n    default %s;\n}\nmap $server_name $ims_maint {\n    default %s;\n}\n' "$note" "$port" "$slot" "$maint"
 }
 restore_upstream() { # <backup-file or empty>
   if [ -n "$1" ]; then mv -f "$1" "$IMS_UPSTREAM_FILE"; else rm -f "$IMS_UPSTREAM_FILE"; fi
 }
-switch_upstream() { # <port>
+switch_upstream() { # <port|maintenance>
   local port="$1" dir backup="" tmp
   dir="$(dirname "$IMS_UPSTREAM_FILE")"
   if [ -f "$IMS_UPSTREAM_FILE" ]; then

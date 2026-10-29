@@ -320,8 +320,12 @@ must work with the OLD code. Mark such a migration by making the FIRST line of i
 would apply (the image's `prisma/migrations` against `_prisma_migrations`, read only) and exits with status 3 BEFORE migrating if any
 pending one lacks the marker. A contract (destructive) migration ships on its own, after the release that needed the old shape is
 retired: `deploy.sh --allow-contract-migration --maintenance <sha>` stops the slots first, migrates, and starts the new release,
-accepting the downtime. EVERY app slot (blue and green) is stopped and verified stopped before the migration runs, so a slot left
-running by an earlier failed switch-back cannot serve the old code against the new schema (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
+accepting the downtime. The order is: nginx is switched to a maintenance response (503 with `Retry-After`, the holding page), which is
+verified through nginx; the nginx workers still proxying to the running slot are drained with the same wait and bound as a slot switch
+(if they outlive the bound nothing is stopped or migrated, the deploy exits 5 and nginx stays in maintenance); then EVERY app slot (blue and green) is stopped and verified stopped before the migration runs, so a slot left
+running by an earlier failed switch-back cannot serve the old code against the new schema. The ordinary verified switch to the new slot
+leaves maintenance. After any failure in this mode nginx stays in maintenance and the log prints how to resume (rerun the same
+command) or abort (`deploy.sh <previous sha>`; `rollback.sh` cannot be used while nginx serves no slot) (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
 fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A database with no applied migrations is exempt ONLY
 when nothing is serving (nginx reports no slot and neither slot container is running): the first install. An empty history while a
 release is serving or running means `DATABASE_URL` points at the wrong database, and the deploy refuses (status 3) unless the

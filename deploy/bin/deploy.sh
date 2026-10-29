@@ -128,27 +128,44 @@ if [ -n "$bad" ]; then
 fi
 
 # --- 3. migrate -----------------------------------------------------------------------------------------------------------------
+MAINTENANCE_HINT="nginx is left in MAINTENANCE (503 + Retry-After). To resume: fix the cause and rerun 'deploy.sh --allow-contract-migration --maintenance ${sha}'. To abort: run 'deploy.sh <previous full sha>' (an ordinary deploy that leaves maintenance through its verified switch). rollback.sh cannot be used while nginx serves no slot."
 if [ "$contract" = 1 ]; then
-  # MAINTENANCE: the one place stopping the serving slot is intended. EVERY app slot is stopped, not just the serving one (a failed
-  # switch-back can leave both running), and it is verified that none runs before the destructive migration starts.
+  # MAINTENANCE: the one place stopping the serving slot is intended, and it is done in this order: (1) nginx answers 503 for everyone,
+  # (2) the maintenance response is verified through nginx, (3) nginx workers still proxying to the old slot are drained, with the same
+  # wait and bound as a slot switch, (4) EVERY app slot (a failed switch-back can leave both running) is stopped and verified stopped,
+  # (5) only then does the destructive migration run. If workers outlive the bound nothing is stopped or migrated.
+  log "MAINTENANCE: switching nginx to the maintenance response"
+  switch_upstream maintenance || die "could not switch nginx to maintenance (the previous upstream is restored); nothing was stopped or migrated"
+  m=0
+  until [ "$(http_code "${IMS_FRONT_URL}/login")" = 503 ] && [ "$(header_slot || true)" = none ]; do
+    m=$((m + IMS_HEALTH_INTERVAL_S))
+    [ "$m" -le "$IMS_FRONT_TIMEOUT_S" ] || { DIE_RC=1 die "nginx does not answer 503 after the maintenance switch; nothing was stopped or migrated. ${MAINTENANCE_HINT}"; }
+    sleep "$IMS_HEALTH_INTERVAL_S"
+  done
+  log "MAINTENANCE: verified (503) through nginx; waiting for in-flight requests to drain"
+  if ! wait_workers_drained; then
+    log "nginx workers are still draining after ${DRAIN_BOUND}s; they may still be proxying to the running slot(s):"
+    sed 's/^/  /' <<< "$DRAIN_STILL" >&2
+    DIE_RC="$EXIT_CLEANUP_PENDING" die "REFUSING to stop the app slots or migrate while old workers may still be proxying. Nothing was stopped or migrated. ${MAINTENANCE_HINT}"
+  fi
   for slot in blue green; do
     if container_exists "$(slot_name "$slot")"; then
       log "MAINTENANCE: stopping $(slot_name "$slot") before the contract migration"
-      docker stop "$(slot_name "$slot")" >/dev/null || die "cannot stop $(slot_name "$slot"); not migrating"
+      docker stop "$(slot_name "$slot")" >/dev/null || die "cannot stop $(slot_name "$slot"); not migrating. ${MAINTENANCE_HINT}"
     fi
   done
   for slot in blue green; do
-    if slot_running "$slot"; then die "$(slot_name "$slot") is still running after docker stop; not migrating"; fi
+    if slot_running "$slot"; then die "$(slot_name "$slot") is still running after docker stop; not migrating. ${MAINTENANCE_HINT}"; fi
   done
 fi
 log "running $(migrate_image "$sha")"
-run_migrate "$sha" || die "prisma migrate deploy failed (the ${old_slot} release was not touched unless this is a maintenance deploy)"
+run_migrate "$sha" || { if [ "$contract" = 1 ]; then die "prisma migrate deploy failed during a maintenance deploy; no app slot is running. ${MAINTENANCE_HINT}"; fi; die "prisma migrate deploy failed (the ${old_slot} release was not touched)"; }
 
 # --- 4./5. start and health-check the new slot ----------------------------------------------------------------------------------
 fail_new_slot() {
   log "$1"
   stop_unless_serving "$new_slot" || true
-  if [ "$contract" = 1 ]; then log "the active slot was stopped for the maintenance deploy and is NOT restarted: the schema may no longer fit it"; fi
+  if [ "$contract" = 1 ]; then log "the active slot was stopped for the maintenance deploy and is NOT restarted: the schema may no longer fit it. ${MAINTENANCE_HINT}"; fi
   exit 1
 }
 run_slot "$new_slot" "$sha" || fail_new_slot "could not start ${new_name}"
