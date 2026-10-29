@@ -63,6 +63,8 @@ export type WcFeeLine = {
   total: string
   total_tax: string
   taxes?: { id: number; total: string }[]
+  /** Item meta. The wclc plugin marks its fee lines here (`_wclc_fee`, `_wclc_fee_kind`); absent on older payloads. */
+  meta_data?: WcMeta[]
 }
 
 export type WcTaxLine = {

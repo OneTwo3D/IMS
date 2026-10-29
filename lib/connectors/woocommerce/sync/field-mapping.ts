@@ -182,6 +182,32 @@ export type MappedLine = {
   externalTaxRateId: number | null
   externalLineItemId: number | null
   taxCategoryFallback?: TaxCategory
+  /**
+   * Which wclc fee a fee line is, read from the line's own `_wclc_fee_kind` item meta (only when the `_wclc_fee`
+   * marker is set). Mirrored, never derived: `duty_flat` is the EUR 3 per HS code "EU Import Duty", `uhf` the EUR 2
+   * "EU Customs Fee", `duty_fee` the non-taxable over-EUR-150 "Import Duty" line. Null for any other line.
+   * Informational on the mapped line: it changes no amount and no tax.
+   */
+  wclcFeeKind?: WclcFeeKind | null
+}
+
+export const WCLC_FEE_KINDS = ['duty_flat', 'uhf', 'duty_fee'] as const
+export type WclcFeeKind = (typeof WCLC_FEE_KINDS)[number]
+
+/** Truthiness of a WooCommerce meta value as the plugin writes it ('1', 1, true, 'yes'); anything else is not a marker. */
+function wcMetaFlag(value: unknown): boolean {
+  if (value === true || value === 1) return true
+  if (typeof value !== 'string') return false
+  return ['1', 'true', 'yes'].includes(value.trim().toLowerCase())
+}
+
+/** The wclc fee kind of a fee line, or null when it is not a marked wclc fee (or names a kind this build does not know). */
+export function readWclcFeeKind(feeLine: Pick<WcFeeLine, 'meta_data'>): WclcFeeKind | null {
+  const meta = feeLine.meta_data ?? []
+  const marker = meta.find((m) => m.key === '_wclc_fee')
+  if (!marker || !wcMetaFlag(marker.value)) return null
+  const kind = meta.find((m) => m.key === '_wclc_fee_kind')?.value
+  return typeof kind === 'string' && (WCLC_FEE_KINDS as readonly string[]).includes(kind.trim()) ? (kind.trim() as WclcFeeKind) : null
 }
 
 function mapWcTaxClassToCategory(taxClass: string | null | undefined): TaxCategory {
@@ -246,6 +272,7 @@ export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {
         externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
         externalLineItemId: null,
         taxCategoryFallback: mapWcTaxClassToCategory(feeLine.tax_class),
+        wclcFeeKind: readWclcFeeKind(feeLine),
       }
     })
   return mapped.filter((line): line is MappedLine => line !== null)
