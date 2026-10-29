@@ -233,6 +233,50 @@ echo json_encode(['error' => $r instanceof WP_Error ? $r->code : null, 'status' 
   assert.equal(control.stdout, '["update_option"]')
 })
 
+test('plugin source: the plugin no longer hooks any Aelia rate filter, converts a stored rate, or touches Aelia caches', () => {
+  const code = PHP.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  assert.doesNotMatch(code, /wc_aelia_currencyswitcher_\w+/, 'no Aelia filter or action is hooked')
+  assert.doesNotMatch(code, /oti_resolve_rate|oti_invalidate_aelia_cache|_transient_aelia|reset_settings_cache/)
+  // every remaining read of the stored FX options is the read-only table of the settings page
+  const reads = [...code.matchAll(/get_option\(OTI_FX_(OPTION|BASE_OPT|LASTPUSH_OPT)/g)]
+  assert.equal(reads.length, 3)
+  const settings = phpFunction('oti_render_settings_page')
+  assert.equal([...settings.matchAll(/get_option\(OTI_FX_(OPTION|BASE_OPT|LASTPUSH_OPT)/g)].length, 3, 'all three reads are in the settings page')
+  // CONTROL: the pattern does see a hook when there is one
+  assert.match("add_filter('wc_aelia_currencyswitcher_exchange_rate', fn)", /wc_aelia_currencyswitcher_\w+/)
+})
+
+test('plugin EXECUTED (php CLI): with oti_fx_rates populated with a DIFFERENT rate, the Aelia exchange-rate filter output equals its input', { skip: PHP_BIN === null && 'php not installed' }, () => {
+  const script = `<?php
+define('ABSPATH', '/tmp/');
+$filters = [];
+function add_filter($tag, $cb, $p = 10, $n = 1) { global $filters; $filters[$tag][] = $cb; }
+function add_action(...$a) {}
+function register_rest_route(...$a) {}
+function register_setting(...$a) {}
+function add_options_page(...$a) {}
+function add_meta_box(...$a) {}
+function wp_register_script(...$a) {}
+function get_option($k, $d = null) {
+  if ($k === 'oti_fx_rates') return ['EUR' => ['from' => 'GBP', 'rate' => 9.87, 'fetchedAt' => 'x']];
+  if ($k === 'oti_fx_base_currency') return 'GBP';
+  return $d;
+}
+function apply_filters($tag, $value, ...$args) { global $filters; foreach ($filters[$tag] ?? [] as $cb) { $value = $cb($value, ...$args); } return $value; }
+function __($s) { return $s; }
+function plugin_dir_path($f) { return ''; }
+register_shutdown_function(function () { global $filters; echo "\\n" . json_encode(['out' => apply_filters('wc_aelia_currencyswitcher_exchange_rate', 1.19, 'GBP', 'EUR'), 'hooked' => array_keys($filters)]); });
+require getenv('PLUGIN');
+`
+  const res = spawnSync('php', ['-d', 'display_errors=stderr'], { input: script, env: { ...process.env, PLUGIN: `${process.cwd()}/lib/connectors/woocommerce/wp-plugin/onetwoinventory-helper.php` }, encoding: 'utf8' })
+  const parsed = JSON.parse(res.stdout.slice(res.stdout.indexOf('{"out"'))) as { out: number; hooked: string[] }
+  assert.equal(parsed.out, 1.19, 'the filter output is its input: the stored 9.87 is never served')
+  assert.equal(parsed.hooked.includes('wc_aelia_currencyswitcher_exchange_rate'), false)
+  // CONTROL: a plugin that did hook it would change the output (the harness really applies filters)
+  const control = spawnSync('php', [], { input: `<?php $f = []; function add_filter($t, $cb) { global $f; $f[$t][] = $cb; } add_filter('x', fn($v) => 9.87); $v = 1.19; foreach ($f['x'] as $cb) $v = $cb($v); echo $v;`, encoding: 'utf8' })
+  assert.equal(control.stdout, '9.87')
+})
+
 test('plugin EXECUTED, end to end into the TS parser: the live-shaped answer parses with no refusal and no base entry', { skip: PHP_BIN === null && 'php not installed' }, async () => {
   const { parseAeliaRatesPayload } = await import('@/lib/currencies/aelia-ingest')
   const parsed = parseAeliaRatesPayload(runHandler(LIVE_OPTION), new Date('2026-10-29T12:00:00Z'))

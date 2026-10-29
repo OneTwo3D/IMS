@@ -731,85 +731,15 @@ if (!function_exists('oti_proxy_invoice_pdf')) {
     }
 }
 
-if (!function_exists('oti_invalidate_aelia_cache')) {
-    function oti_invalidate_aelia_cache(): void
-    {
-        // Aelia stores rates inside its own settings option and may cache them
-        // in transients. Delete any transient keys that look like Aelia rate
-        // caches so the next storefront request picks up the new values.
-        global $wpdb;
-        if (!isset($wpdb) || !is_object($wpdb)) return;
-        $like = $wpdb->esc_like('_transient_aelia_cs_exchange_rates') . '%';
-        $wpdb->query(
-            $wpdb->prepare(
-                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
-                $like,
-                '_transient_timeout_aelia_cs_exchange_rates%'
-            )
-        );
-
-        // Newer Aelia versions expose a public reset method. If present, call it.
-        if (class_exists('\Aelia\WC\CurrencySwitcher\WC_Aelia_CurrencySwitcher')) {
-            $obj = \Aelia\WC\CurrencySwitcher\WC_Aelia_CurrencySwitcher::instance();
-            if (is_object($obj) && method_exists($obj, 'reset_settings_cache')) {
-                $obj->reset_settings_cache();
-            }
-        }
-    }
-}
-
 /* ------------------------------------------------------------
- * Aelia Currency Switcher integration
+ * Aelia Currency Switcher integration: RETIRED in 1.3.0
  *
- * We hook the per-pair exchange rate filter rather than
- * registering a full provider class. This is forward-compatible
- * across Aelia versions and avoids depending on Aelia's internal
- * class hierarchy.
- *
- * Direction handling: IMS sends rates as "1 base = X to-currency".
- * Aelia asks for the rate to convert "from" → "to". We resolve any
- * conversion that touches the IMS base currency:
- *   - base → X       : direct lookup, return stored rate
- *   - X    → base    : inverted lookup (1 / rate)
- *   - X    → Y       : cross-rate via base (Y_rate / X_rate)
+ * Earlier versions hooked `wc_aelia_currencyswitcher_exchange_rate` and served the rates IMS had pushed (option `oti_fx_rates`)
+ * in place of Aelia's own. Aelia is the exchange-rate master, so this plugin NO LONGER hooks that filter (nor flushes Aelia's
+ * caches): nothing here overrides, converts or caches an Aelia rate, stale or not. The options `oti_fx_rates`,
+ * `oti_fx_base_currency` and `oti_fx_last_push` left by earlier versions are left as they are (nothing writes them any more and
+ * nothing reads them except the read-only table on the settings page). A site admin may delete those three options at will.
  * ------------------------------------------------------------ */
-
-add_filter('wc_aelia_currencyswitcher_exchange_rate', function ($default, $from_currency, $to_currency) {
-    $rates = get_option(OTI_FX_OPTION, []);
-    $base  = (string) get_option(OTI_FX_BASE_OPT, '');
-    if (!is_array($rates) || empty($rates) || $base === '') {
-        return $default;
-    }
-
-    $from = strtoupper((string) $from_currency);
-    $to   = strtoupper((string) $to_currency);
-    if ($from === $to) return 1.0;
-
-    $resolved = oti_resolve_rate($from, $to, $base, $rates);
-    return $resolved !== null ? $resolved : $default;
-}, 10, 3);
-
-if (!function_exists('oti_resolve_rate')) {
-    /**
-     * @param array<string,array{from:string,rate:float,fetchedAt:string}> $rates
-     */
-    function oti_resolve_rate(string $from, string $to, string $base, array $rates): ?float
-    {
-        if ($from === $base) {
-            return isset($rates[$to]) ? (float) $rates[$to]['rate'] : null;
-        }
-        if ($to === $base) {
-            if (!isset($rates[$from])) return null;
-            $r = (float) $rates[$from]['rate'];
-            return $r > 0 ? 1 / $r : null;
-        }
-        // Cross rate via base.
-        if (!isset($rates[$from]) || !isset($rates[$to])) return null;
-        $rFrom = (float) $rates[$from]['rate'];
-        $rTo   = (float) $rates[$to]['rate'];
-        return $rFrom > 0 ? $rTo / $rFrom : null;
-    }
-}
 
 /* ------------------------------------------------------------
  * Settings page: paste the shared secret + view current state

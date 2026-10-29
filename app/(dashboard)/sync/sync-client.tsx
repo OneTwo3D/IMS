@@ -265,10 +265,7 @@ function HelperPluginCard({
         <div>
           <h3 className="text-sm font-medium">2. Enable FX rate push</h3>
           <p className="text-xs text-muted-foreground mt-1">
-            When enabled, IMS sends the daily FX rates (frankfurter / ECB) to the helper plugin
-            after each fetch. The helper plugin makes them available to Aelia Currency Switcher
-            and any other plugin reading the <code className="bg-muted px-1 rounded">wc_aelia_currencyswitcher_exchange_rate</code> filter,
-            so the storefront, IMS, and Xero converge on the same rate.
+            Retired: helper plugin 1.3.0 refuses every rate push and no longer overrides Aelia&apos;s rates (Aelia is the exchange-rate master). With an older plugin, IMS sends the daily FX rates (frankfurter / ECB) after each fetch.
           </p>
           {aeliaSource && (
             <p className="text-xs text-amber-700 mt-2 dark:text-amber-300">
