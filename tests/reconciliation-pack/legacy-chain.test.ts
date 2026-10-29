@@ -141,7 +141,9 @@ test('the readiness gate reads a pre-R16 report for R1 to R15 as before and R16 
   const r16 = assessPackItem({ record }, 'R16', context)
   assert.equal(r16.kind, 'not-available')
   assert.match(r16.kind === 'not-available' ? r16.reason : '', /added after/)
-  assert.equal(assessPackItem({ record }, 'R3', context).kind, 'not-available', 'R3 is read from the old report as always (the synthetic run has no runner)')
+  // R1 to R15 are judged from the old report exactly as from a new one: here R3 passed in it.
+  const passing: ReportRecord = { ...record, items: record.items.map((item) => item.id === 'R3' ? { ...item, outcome: 'pass', reasons: [], proof: { kind: 'compared' } } : item) }
+  assert.equal(assessPackItem({ record: passing }, 'R3', context).kind, 'pass')
 })
 
 // [mutation: carried state read from a report that does not list the item as usable]
