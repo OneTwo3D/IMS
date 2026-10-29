@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import {
   setManualFxRate,
   clearManualFxRate,
+  setFxRateSource,
   type FxRateRow,
   type FxPushLogRow,
   type FxHealth,
@@ -32,6 +33,7 @@ export function FxRatesTable({ baseCurrency, rates, pushLog, health }: Props) {
   return (
     <div className="space-y-6">
       <FxHealthCard health={health} />
+      <FxSourceCard source={health.fxSource} />
 
       <div>
         <p className="text-sm text-muted-foreground mb-3">
@@ -47,7 +49,7 @@ export function FxRatesTable({ baseCurrency, rates, pushLog, health }: Props) {
               <TableHead>Currency</TableHead>
               <TableHead className="text-right">Rate</TableHead>
               <TableHead>Source</TableHead>
-              <TableHead>Last fetched</TableHead>
+              <TableHead>{rates.some((r) => r.source === 'aelia') ? 'Rate time' : 'Last fetched'}</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -83,7 +85,7 @@ export function FxRatesTable({ baseCurrency, rates, pushLog, health }: Props) {
         </Table>
       </div>
 
-      <PushLogSection rows={pushLog} />
+      <PushLogSection rows={pushLog} pushDisabledByAelia={health.fxSource === 'aelia'} />
 
       {editing && (
         <ManualOverrideDialog
@@ -108,7 +110,45 @@ function SourceBadge({ source, manualOverride }: { source: string; manualOverrid
   if (source === 'frankfurter') {
     return <span className="text-xs text-muted-foreground">ECB (frankfurter)</span>
   }
+  if (source === 'aelia') {
+    return <span className="text-xs text-muted-foreground">Aelia (before markup)</span>
+  }
   return <span className="text-xs text-muted-foreground">{source}</span>
+}
+
+function FxSourceCard({ source }: { source: 'ecb' | 'aelia' }) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [error, setError] = useState<string | null>(null)
+
+  function choose(next: 'ecb' | 'aelia') {
+    if (next === source) return
+    if (next === 'aelia' && !confirm('Read the exchange rates from Aelia on the store (before its markup) and stop pushing rates to WooCommerce? The onetwoInventory Helper plugin 1.3.0 or later must already be deployed on the store.')) return
+    setError(null)
+    startTransition(async () => {
+      const result = await setFxRateSource(next)
+      if (!result.success) setError(result.error ?? 'Could not change the FX source')
+      else router.refresh()
+    })
+  }
+
+  return (
+    <div className="rounded-md border bg-muted/20 p-4 space-y-2">
+      <h3 className="text-sm font-medium">Exchange-rate source</h3>
+      <p className="text-xs text-muted-foreground">
+        <strong>ECB (frankfurter)</strong> is the default: rates are fetched daily and may be pushed to the store.
+        {' '}<strong>Aelia</strong> makes the store&apos;s currency switcher the master: IMS reads Aelia&apos;s rate <em>before</em> its
+        markup (the markup is a storefront price uplift and is never stored) and does not push rates to the store.
+        Needs the onetwoInventory Helper plugin 1.3.0 or later, deployed by the owner. Pinned manual overrides keep working under either source.
+      </p>
+      <div className="flex items-center gap-2">
+        <Button variant={source === 'ecb' ? 'default' : 'outline'} size="sm" disabled={isPending} onClick={() => choose('ecb')}>ECB (frankfurter)</Button>
+        <Button variant={source === 'aelia' ? 'default' : 'outline'} size="sm" disabled={isPending} onClick={() => choose('aelia')}>Aelia</Button>
+        {isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+      </div>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  )
 }
 
 function ClearOverrideButton({ currency }: { currency: string }) {
@@ -210,11 +250,16 @@ function ManualOverrideDialog({
   )
 }
 
-function PushLogSection({ rows }: { rows: FxPushLogRow[] }) {
+function PushLogSection({ rows, pushDisabledByAelia }: { rows: FxPushLogRow[]; pushDisabledByAelia: boolean }) {
   const formatDateTime = useFormatDateTime()
   return (
     <div>
       <h3 className="text-sm font-medium mb-2">Recent pushes to shopping connectors</h3>
+      {pushDisabledByAelia && (
+        <p className="text-xs text-amber-700 mb-3 dark:text-amber-300">
+          Pushing is disabled: the FX source is Aelia, which owns the exchange rates. IMS reads them and never writes them to the store. The rows below are earlier pushes.
+        </p>
+      )}
       <p className="text-xs text-muted-foreground mb-3">
         One row per fan-out attempt to a shopping connector (currently WooCommerce via the
         onetwoInventory Helper plugin). The cron writes here after each daily fetch, and the
@@ -304,11 +349,11 @@ function FxHealthCard({ health }: { health: FxHealth }) {
       <div className="grid gap-2 text-sm sm:grid-cols-2">
         <HealthRow
           ok={!health.fetchStale}
-          label="Last ECB fetch"
+          label={health.fxSource === 'aelia' ? 'Aelia last updated its rates' : 'Last ECB fetch'}
           value={health.lastFetchedAt
             ? `${formatDateTime(health.lastFetchedAt)} (${formatAge(health.lastFetchAgeMs)})`
             : 'never'}
-          warning={health.fetchStale ? 'Stale — fetch hasn\'t run in over 36h. Check the cron schedule.' : null}
+          warning={health.fetchStale ? (health.fxSource === 'aelia' ? 'Stale — Aelia has not updated its rates in over 36h. Check Aelia\'s update schedule on the store.' : 'Stale — fetch hasn\'t run in over 36h. Check the cron schedule.') : null}
         />
         <HealthRow
           ok={health.lastFetchAttemptStatus !== 'failed'}

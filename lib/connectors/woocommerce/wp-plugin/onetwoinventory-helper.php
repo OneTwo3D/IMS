@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -15,10 +15,14 @@
  *   1. Invoice Buttons — adds invoice PDF / accounting links to My Account
  *      orders and the wp-admin order screen, reading order meta written by
  *      One Two Inventory.
- *   2. FX Rate Receiver — exposes a signed REST endpoint POST /wp-json/oti/v1/fx-rates
- *      that One Two Inventory pushes daily ECB rates to. Stored rates are
+ *   2. FX Rate Receiver — RETIRED in 1.3.0: POST /wp-json/oti/v1/fx-rates refuses every push (410 oti_fx_push_retired)
+ *      and writes nothing, because Aelia is the master. Rates stored by earlier versions are
  *      surfaced to the Aelia Currency Switcher (and other plugins via filter)
  *      so the storefront converts at the same rate as IMS and Xero.
+ *      A second, GET-only endpoint GET /wp-json/oti/v1/aelia-rates READS Aelia's own
+ *      rate table (base currency, per-currency rate, markup, set_manually, decimals and
+ *      Aelia's own last-update time) so IMS can take Aelia as the exchange-rate master.
+ *      It writes nothing, anywhere.
  *   1b. Warehouse (WMS) Status — renders the live WMS order status that IMS pushes
  *      onto the WC order as `_oti_wms_*` meta: an order-edit meta box + an orders-list
  *      "Warehouse" column. Read-only; WMS-neutral.
@@ -268,12 +272,20 @@ const OTI_FX_LASTPUSH_OPT = 'oti_fx_last_push';
 const OTI_INVOICE_PDF_SECRET_OPT = 'oti_invoice_pdf_shared_secret';
 const OTI_IMS_INVOICE_PDF_BASE_URL_OPT = 'oti_ims_invoice_pdf_base_url';
 const OTI_FX_NAMESPACE    = 'oti/v1';
+// Aelia Currency Switcher keeps ALL of its settings in this one option; the per-currency table is under 'exchange_rates'.
+const OTI_AELIA_SETTINGS_OPT = 'wc_aelia_currency_switcher';
 
 add_action('rest_api_init', function () {
     register_rest_route(OTI_FX_NAMESPACE, '/fx-rates', [
         'methods'             => 'POST',
         'permission_callback' => 'oti_verify_fx_signature',
         'callback'            => 'oti_handle_fx_push',
+    ]);
+    // READ ONLY: returns Aelia's own rate table. Same HMAC check as the other signed routes (the signature of an empty body for a GET).
+    register_rest_route(OTI_FX_NAMESPACE, '/aelia-rates', [
+        'methods'             => 'GET',
+        'permission_callback' => 'oti_verify_fx_signature',
+        'callback'            => 'oti_handle_aelia_rates_read',
     ]);
     register_rest_route(OTI_FX_NAMESPACE, '/invoice-pdf/(?P<order_id>\d+)', [
         'methods'             => 'GET',
@@ -328,43 +340,87 @@ if (!function_exists('oti_verify_fx_signature')) {
 }
 
 if (!function_exists('oti_handle_fx_push')) {
-    function oti_handle_fx_push(WP_REST_Request $request): WP_REST_Response
+    /**
+     * RETIRED (plugin 1.3.0). Aelia is the exchange-rate master and IMS no longer pushes rates, so this receiver refuses EVERY write:
+     * HTTP 410 with the code `oti_fx_push_retired`, and it writes nothing (no Aelia option, no `oti_fx_*` option, no cache flush).
+     * The signature is still checked first (permission_callback), so an unsigned request is still a 401. The refusal fences any IMS
+     * push, whatever state its client-side lock is in.
+     */
+    function oti_handle_fx_push(WP_REST_Request $request)
     {
-        $params = $request->get_json_params();
-        $rates  = isset($params['rates']) && is_array($params['rates']) ? $params['rates'] : [];
+        return new WP_Error(
+            'oti_fx_push_retired',
+            'The exchange-rate push is retired: Aelia is the exchange-rate master. Nothing was stored.',
+            ['status' => 410]
+        );
+    }
+}
 
-        $clean   = [];
-        $base    = '';
-        $skipped = 0;
-
-        foreach ($rates as $row) {
-            $from = isset($row['fromCurrency']) ? strtoupper((string) $row['fromCurrency']) : '';
-            $to   = isset($row['toCurrency'])   ? strtoupper((string) $row['toCurrency'])   : '';
-            $rate = isset($row['rate']) ? (float) $row['rate'] : 0.0;
-            if ($from === '' || $to === '' || !is_finite($rate) || $rate <= 0) {
-                $skipped++;
-                continue;
+if (!function_exists('oti_aelia_last_update_iso')) {
+    /**
+     * Aelia's own last-update time of its rate table as an ISO-8601 UTC string, or null when it cannot be read.
+     * Returns [iso|null, name of the settings key it was read from|null].
+     *
+     * @param array<string,mixed> $settings
+     * @return array{0:?string,1:?string}
+     */
+    function oti_aelia_last_update_iso(array $settings): array
+    {
+        foreach (['exchange_rates_last_update', 'exchange_rates_update_time', 'exchange_rates_last_updated'] as $key) {
+            if (!isset($settings[$key]) || $settings[$key] === '' || $settings[$key] === null) continue;
+            $raw = $settings[$key];
+            if (is_numeric($raw)) {
+                $ts = (int) $raw;
+            } else {
+                $ts = strtotime((string) $raw . ((preg_match('/(Z|[+-]\d{2}:?\d{2})$/', (string) $raw) === 1) ? '' : ' UTC'));
             }
-            // Last write wins per `to` currency.
-            $clean[$to] = [
-                'from'      => $from,
-                'rate'      => $rate,
-                'fetchedAt' => isset($row['fetchedAt']) ? (string) $row['fetchedAt'] : gmdate('c'),
-            ];
-            if ($base === '') $base = $from;
+            if ($ts === false || $ts <= 0) continue;
+            return [gmdate('Y-m-d\TH:i:s\Z', $ts), $key];
+        }
+        return [null, null];
+    }
+}
+
+if (!function_exists('oti_handle_aelia_rates_read')) {
+    /**
+     * GET /wp-json/oti/v1/aelia-rates. READ ONLY: no update_option, no delete_option, no database write.
+     *
+     * Returns Aelia's rate table EXACTLY as Aelia holds it. `rate` is the rate BEFORE markup and `markup` is Aelia's
+     * `rate_markup` (an absolute amount that Aelia adds to the rate for storefront prices). The two are returned
+     * separately and never combined here; the combination is a storefront price uplift and is not an exchange rate.
+     */
+    function oti_handle_aelia_rates_read(WP_REST_Request $request)
+    {
+        $settings = get_option(OTI_AELIA_SETTINGS_OPT, null);
+        if (!is_array($settings) || !isset($settings['exchange_rates']) || !is_array($settings['exchange_rates'])) {
+            return new WP_Error('oti_aelia_not_found', 'Aelia Currency Switcher settings not found', ['status' => 404]);
         }
 
-        update_option(OTI_FX_OPTION, $clean, /* autoload */ false);
-        if ($base !== '') update_option(OTI_FX_BASE_OPT, $base, false);
-        update_option(OTI_FX_LASTPUSH_OPT, gmdate('c'), false);
+        $out = [];
+        foreach ($settings['exchange_rates'] as $code => $row) {
+            if (!is_array($row)) continue;
+            $entry = [
+                'currency'     => strtoupper((string) $code),
+                'rate'         => isset($row['rate']) ? trim((string) $row['rate']) : null,
+                'markup'       => isset($row['rate_markup']) ? trim((string) $row['rate_markup']) : null,
+                'set_manually' => !empty($row['set_manually']),
+            ];
+            if (isset($row['exchange_rate_decimals']) && is_numeric($row['exchange_rate_decimals'])) {
+                $entry['decimals'] = (int) $row['exchange_rate_decimals'];
+            } elseif (isset($row['decimals']) && is_numeric($row['decimals'])) {
+                $entry['decimals'] = (int) $row['decimals'];
+            }
+            $out[] = $entry;
+        }
 
-        // Best-effort cache invalidation for Aelia Currency Switcher.
-        oti_invalidate_aelia_cache();
+        [$updated, $updated_key] = oti_aelia_last_update_iso($settings);
 
         return new WP_REST_Response([
-            'ok'      => true,
-            'pushed'  => count($clean),
-            'skipped' => $skipped,
+            'ok'                 => true,
+            'base'               => strtoupper((string) get_option('woocommerce_currency', '')),
+            'last_update'        => $updated,
+            'last_update_source' => $updated_key,
+            'rates'              => $out,
         ]);
     }
 }
@@ -675,85 +731,15 @@ if (!function_exists('oti_proxy_invoice_pdf')) {
     }
 }
 
-if (!function_exists('oti_invalidate_aelia_cache')) {
-    function oti_invalidate_aelia_cache(): void
-    {
-        // Aelia stores rates inside its own settings option and may cache them
-        // in transients. Delete any transient keys that look like Aelia rate
-        // caches so the next storefront request picks up the new values.
-        global $wpdb;
-        if (!isset($wpdb) || !is_object($wpdb)) return;
-        $like = $wpdb->esc_like('_transient_aelia_cs_exchange_rates') . '%';
-        $wpdb->query(
-            $wpdb->prepare(
-                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
-                $like,
-                '_transient_timeout_aelia_cs_exchange_rates%'
-            )
-        );
-
-        // Newer Aelia versions expose a public reset method. If present, call it.
-        if (class_exists('\Aelia\WC\CurrencySwitcher\WC_Aelia_CurrencySwitcher')) {
-            $obj = \Aelia\WC\CurrencySwitcher\WC_Aelia_CurrencySwitcher::instance();
-            if (is_object($obj) && method_exists($obj, 'reset_settings_cache')) {
-                $obj->reset_settings_cache();
-            }
-        }
-    }
-}
-
 /* ------------------------------------------------------------
- * Aelia Currency Switcher integration
+ * Aelia Currency Switcher integration: RETIRED in 1.3.0
  *
- * We hook the per-pair exchange rate filter rather than
- * registering a full provider class. This is forward-compatible
- * across Aelia versions and avoids depending on Aelia's internal
- * class hierarchy.
- *
- * Direction handling: IMS sends rates as "1 base = X to-currency".
- * Aelia asks for the rate to convert "from" → "to". We resolve any
- * conversion that touches the IMS base currency:
- *   - base → X       : direct lookup, return stored rate
- *   - X    → base    : inverted lookup (1 / rate)
- *   - X    → Y       : cross-rate via base (Y_rate / X_rate)
+ * Earlier versions hooked `wc_aelia_currencyswitcher_exchange_rate` and served the rates IMS had pushed (option `oti_fx_rates`)
+ * in place of Aelia's own. Aelia is the exchange-rate master, so this plugin NO LONGER hooks that filter (nor flushes Aelia's
+ * caches): nothing here overrides, converts or caches an Aelia rate, stale or not. The options `oti_fx_rates`,
+ * `oti_fx_base_currency` and `oti_fx_last_push` left by earlier versions are left as they are (nothing writes them any more and
+ * nothing reads them except the read-only table on the settings page). A site admin may delete those three options at will.
  * ------------------------------------------------------------ */
-
-add_filter('wc_aelia_currencyswitcher_exchange_rate', function ($default, $from_currency, $to_currency) {
-    $rates = get_option(OTI_FX_OPTION, []);
-    $base  = (string) get_option(OTI_FX_BASE_OPT, '');
-    if (!is_array($rates) || empty($rates) || $base === '') {
-        return $default;
-    }
-
-    $from = strtoupper((string) $from_currency);
-    $to   = strtoupper((string) $to_currency);
-    if ($from === $to) return 1.0;
-
-    $resolved = oti_resolve_rate($from, $to, $base, $rates);
-    return $resolved !== null ? $resolved : $default;
-}, 10, 3);
-
-if (!function_exists('oti_resolve_rate')) {
-    /**
-     * @param array<string,array{from:string,rate:float,fetchedAt:string}> $rates
-     */
-    function oti_resolve_rate(string $from, string $to, string $base, array $rates): ?float
-    {
-        if ($from === $base) {
-            return isset($rates[$to]) ? (float) $rates[$to]['rate'] : null;
-        }
-        if ($to === $base) {
-            if (!isset($rates[$from])) return null;
-            $r = (float) $rates[$from]['rate'];
-            return $r > 0 ? 1 / $r : null;
-        }
-        // Cross rate via base.
-        if (!isset($rates[$from]) || !isset($rates[$to])) return null;
-        $rFrom = (float) $rates[$from]['rate'];
-        $rTo   = (float) $rates[$to]['rate'];
-        return $rFrom > 0 ? $rTo / $rFrom : null;
-    }
-}
 
 /* ------------------------------------------------------------
  * Settings page: paste the shared secret + view current state

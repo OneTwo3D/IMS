@@ -8,6 +8,13 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Aelia as the exchange-rate master (behind a flag, default OFF)
+
+- **New: FX source setting `fx_rate_source` (Settings > Accounting > FX Rates > Exchange-rate source).** `ECB (frankfurter)` is the default and changes nothing. `Aelia` makes the scheduled refresh read the store's currency switcher through the helper plugin, stores Aelia's rate BEFORE markup (never rate + markup) as `source = aelia` dated by Aelia's own update time, checks Aelia's freshness in health, and disables the IMS to WooCommerce rate push. A missing, non-positive, non-finite or over-precise rate, a base-currency mismatch and an unknown currency are refused; nothing is substituted. Manual overrides keep working. Every write takes the FX table lock.
+- **New: onetwoInventory Helper plugin 1.3.0** with a read-only `GET /wp-json/oti/v1/aelia-rates` endpoint. It must be deployed (owner-approved) before the flag can be switched on. Not deployed by this change.
+- **Changed: the exchange-rate lookup is source-aware.** Under the Aelia source, lookups dated at or after the cutover instant (`fx_rate_source_since`) use only Aelia rows and manual overrides and refuse (`no_rate_from_selected_source`) rather than fall back to ECB; earlier dates are unchanged. The source switch takes the exclusive FX table lock; the rate push holds it shared through its POST; ECB writes re-read the source inside the lock.
+- **Changed: ownership row `woocommerce` / `fx-rates` is now P1 aelia, P2 aelia** (owner ruling 2026-10-26; was P2 IMS).
+
 ### VAT difference report: Xero, IMS and WooCommerce on one set of VAT rates (read-only)
 
 - **New: `npm run vat:diff` and Settings > Accounting > Tax > VAT rate differences.** Compares the stored, proven Xero tax-rate list, the IMS rates (with components and the WooCommerce mappings) and WooCommerce's `GET /taxes` (every page, through the reconciliation pack's GET-only transport) and lists each difference with a closed reason code (missing in IMS, Xero or WooCommerce, percentage mismatch with both values, inactive in Xero, IMS rate with no Xero type, WooCommerce rate with no mapping, ambiguous mapping, country, class, compound or shipping mismatch), as four reports (UK, IOSS, VOEC, other foreign; `--scheme`) plus a visible unclassified section. A Xero type is present in IMS only on a side an active rate usable on that side carries it (Sales needs a revenue type, Purchases an expenses type). Regional WooCommerce rates are compared like any other rate (the region is shown as information); shipping must carry the goods' rate. A stale or untrusted Xero list, or a WooCommerce read that fails, refuses the report instead of saying "no differences". Writes nothing anywhere.

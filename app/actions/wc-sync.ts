@@ -996,6 +996,9 @@ export async function probeFxHelperPluginAction(): Promise<{
 export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: number; supported: boolean; error?: string; shadowed?: boolean }> {
   await requireSyncPermission()
   try {
+    // The FX source is Aelia: the push is disabled (Aelia owns the rates). Nothing is sent, shadowed or logged.
+    const { AELIA_PUSH_DISABLED_MESSAGE, getFxRateSource } = await import('@/lib/currencies/fx-source')
+    if ((await getFxRateSource()) === 'aelia') return { success: false, pushed: 0, supported: false, error: AELIA_PUSH_DISABLED_MESSAGE }
     // The producer-side hold: with it enforced and the decision SHADOW, nothing is sent and nothing is logged as pushed or failed.
     const { wooFxRatePushShadow } = await import('@/lib/connectors/woocommerce/operator-action-seam')
     const fxShadow = await wooFxRatePushShadow()
@@ -1004,6 +1007,11 @@ export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: 
     const result = await pushCurrentFxRatesToWc()
     if (!result.supported) {
       return { success: false, pushed: 0, supported: false, error: result.errors[0] ?? 'FX rate push not enabled or WooCommerce not configured' }
+    }
+    if (result.retired) {
+      const { FX_PUSH_RETIRED_MESSAGE } = await import('@/lib/connectors/woocommerce/fx-rates')
+      await db.fxRatePushLog.create({ data: { connector: 'woocommerce', ratesCount: 0, status: 'SKIPPED', errorMessage: FX_PUSH_RETIRED_MESSAGE } })
+      return { success: false, pushed: 0, supported: false, error: FX_PUSH_RETIRED_MESSAGE }
     }
     if (result.errors.length) {
       await db.fxRatePushLog.create({

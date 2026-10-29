@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
+import { FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -142,6 +143,8 @@ export async function toggleCurrency(code: string, active: boolean): Promise<{ s
 
 /** Fetch FX rate for a single currency from exchangerate.host (free, no key) */
 async function fetchSingleFxRate(code: string): Promise<number | null> {
+  // The FX source is Aelia: frankfurter is never asked (no other source stands in for Aelia). The new currency gets its rate from Aelia at the next scheduled read.
+  if ((await getFxRateSource()) === 'aelia') return null
   try {
     const baseCurrency = await getBaseCurrencyCode()
     // Use frankfurter.dev (free, no API key required, ECB data)
@@ -163,13 +166,13 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
     }
     if (rate === null) return null
 
-    await withFxTableWriteLock((tx) => tx.fxRate.create({
-      data: {
-        fromCurrency: baseCurrency,
-        toCurrency: code,
-        rate,
-      },
-    }))
+    // Re-read the source inside the lock: a switch to Aelia that committed while frankfurter was being asked wins, and the ECB row is not stored.
+    const stored = await withFxTableWriteLock(async (tx) => {
+      if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
+      await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate } })
+      return true
+    })
+    if (!stored) return null
     return rate
   } catch {
     return null
@@ -258,6 +261,30 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
   if (!code) return { success: false, error: 'Currency code required' }
   const baseCurrency = await getBaseCurrencyCode()
 
+  // The FX source is Aelia: the override is replaced by Aelia's own rate (before markup), never by a frankfurter rate.
+  if ((await getFxRateSource()) === 'aelia') {
+    const [{ readAeliaRatesFromWc }, { clearOverrideFromAelia, AeliaRefusedError }] = await Promise.all([
+      import('@/lib/connectors/woocommerce/aelia-rates'),
+      import('@/lib/currencies/aelia-ingest'),
+    ])
+    const read = await readAeliaRatesFromWc()
+    if (!read.ok) return { success: false, error: read.message }
+    try {
+      const cleared = await clearOverrideFromAelia(read.body, code)
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'fx_rate_override_cleared',
+        description: `Cleared manual override for ${code}; new rate from Aelia (before markup): 1 ${baseCurrency} = ${cleared.rate} ${code}`,
+      })
+    } catch (e) {
+      if (e instanceof AeliaRefusedError) return { success: false, error: `${e.reason}: ${e.message}` }
+      throw e
+    }
+    revalidatePath('/settings/accounting')
+    return { success: true }
+  }
+
   let res: Response | null = null
   try {
     res = await fetch(
@@ -273,9 +300,12 @@ export async function clearManualFxRate(toCurrency: string): Promise<{ success: 
   if (typeof fresh !== 'number' || fresh <= 0) {
     return { success: false, error: `frankfurter.dev did not return a rate for ${code}` }
   }
-  await withFxTableWriteLock((tx) => tx.fxRate.create({
-    data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false },
-  }))
+  const stored = await withFxTableWriteLock(async (tx) => {
+    if ((await getFxRateSourceInTx(tx)) === 'aelia') return false
+    await tx.fxRate.create({ data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false } })
+    return true
+  })
+  if (!stored) return { success: false, error: 'The FX source changed to Aelia while this ran; nothing was stored.' }
   await logActivity({
     entityType: 'SETTING',
     tag: 'settings',
@@ -317,6 +347,8 @@ export type FxHealth = {
   lastWcPushAgeMs: number | null
   wcPushStale: boolean
   manualOverrideCount: number
+  /** The FX source switch ('ecb' default, or 'aelia'). With 'aelia' `lastFetchedAt` is Aelia's own update time and the WooCommerce push is disabled. */
+  fxSource: FxRateSource
 }
 
 /**
@@ -327,6 +359,7 @@ export type FxHealth = {
 export async function getFxHealth(): Promise<FxHealth> {
   await requireInternalUser()
   const baseCurrency = await getBaseCurrencyCode()
+  const fxSource = await getFxRateSource()
 
   const [
     lastFetchedSetting,
@@ -340,7 +373,7 @@ export async function getFxHealth(): Promise<FxHealth> {
     lastPushSetting,
     overrideRows,
   ] = await Promise.all([
-    db.setting.findUnique({ where: { key: 'fx_last_fetched' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: fxSource === 'aelia' ? 'fx_aelia_last_update_at' : 'fx_last_fetched' }, select: { value: true } }),
     db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_at' }, select: { value: true } }),
     db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_status' }, select: { value: true } }),
     db.setting.findUnique({ where: { key: 'fx_last_fetch_retry_count' }, select: { value: true } }),
@@ -363,7 +396,8 @@ export async function getFxHealth(): Promise<FxHealth> {
   const now = Date.now()
   const lastFetchedAt = lastFetchedSetting?.value ?? null
   const lastFetchAgeMs = lastFetchedAt ? now - new Date(lastFetchedAt).getTime() : null
-  const wcPushEnabled = wcEnabledSetting?.value === 'true'
+  // Under the Aelia source the push is disabled whatever its own setting says.
+  const wcPushEnabled = fxSource !== 'aelia' && wcEnabledSetting?.value === 'true'
   const lastWcPushAt = lastPushSetting?.value || null
   const lastWcPushAgeMs = lastWcPushAt ? now - new Date(lastWcPushAt).getTime() : null
 
@@ -383,6 +417,7 @@ export async function getFxHealth(): Promise<FxHealth> {
     // Only flag push-stale when the operator has actually enabled push.
     wcPushStale: wcPushEnabled && (lastWcPushAgeMs == null || lastWcPushAgeMs > FX_STALE_THRESHOLD_MS),
     manualOverrideCount: Number(overrideRows[0]?.count ?? 0),
+    fxSource,
   }
 }
 
@@ -404,4 +439,50 @@ export async function getFxPushLog(limit = 20): Promise<FxPushLogRow[]> {
     status: r.status,
     errorMessage: r.errorMessage,
   }))
+}
+
+// ---------------------------------------------------------------------------
+// The FX source switch (default OFF = 'ecb'). See lib/currencies/fx-source.ts.
+// ---------------------------------------------------------------------------
+
+export async function getFxRateSourceSetting(): Promise<FxRateSource> {
+  await requireInternalUser()
+  return getFxRateSource()
+}
+
+/**
+ * Choose the source of the exchange rates. 'aelia' needs the WooCommerce store configured (its address and the shared secret) AND the onetwoInventory Helper plugin 1.3.0 or later deployed on it:
+ * the plugin is deployed by the owner, and nothing here installs it. If it is not there the first scheduled read fails visibly (health warning, admin notification) and the existing rates stay in use.
+ */
+export async function setFxRateSource(source: string): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('settings.company')
+  if (!(FX_RATE_SOURCES as readonly string[]).includes(source)) return { success: false, error: 'Unknown FX source' }
+  if (source === 'aelia') {
+    const { getSettingValues } = await import('@/lib/settings-store')
+    const config = await getSettingValues(['wc_url', 'wc_webhook_secret'])
+    if (!config.get('wc_url') || !config.get('wc_webhook_secret')) {
+      return { success: false, error: 'Set the WooCommerce store address and the shared secret first: Aelia is read through the onetwoInventory Helper plugin (1.3.0 or later) on the store.' }
+    }
+  }
+  // THE CUTOVER BARRIER. The source and the instant of the change are written together under the EXCLUSIVE FX table lock: a rate push (which holds the lock shared from its source check through its POST) and a
+  // CSV import finish first, and every ECB refresh write re-reads the source inside this same lock. So once this commits no ECB row and no rate POST can follow it.
+  const switchedAt = new Date()
+  const changed = await withFxTableWriteLock(async (tx) => {
+    if ((await getFxRateSourceInTx(tx)) === source) return false
+    await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SETTING }, create: { key: FX_RATE_SOURCE_SETTING, value: source }, update: { value: source } })
+    await tx.setting.upsert({ where: { key: FX_RATE_SOURCE_SINCE_SETTING }, create: { key: FX_RATE_SOURCE_SINCE_SETTING, value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })
+    return true
+  })
+  if (!changed) return { success: true }
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'fx_rate_source_changed',
+    description: source === 'aelia'
+      ? `FX source set to Aelia from ${switchedAt.toISOString()}: rates are read from the store (before markup), lookups from that instant use only Aelia rates and manual overrides, and the IMS to WooCommerce rate push is disabled`
+      : `FX source set to ECB (frankfurter) from ${switchedAt.toISOString()}: rates are fetched daily and may be pushed to WooCommerce`,
+  })
+  revalidatePath('/settings/accounting')
+  revalidatePath('/sync')
+  return { success: true }
 }

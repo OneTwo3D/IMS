@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { notify } from '@/lib/notifications'
+import { FX_SOURCE_CHANGED_MESSAGE, getFxRateSource, getFxRateSourceInTx } from '@/lib/currencies/fx-source'
 
 // ---------------------------------------------------------------------------
 // Core FX-rate refresh logic.
@@ -26,6 +27,8 @@ export async function fetchAllFxRatesInternal(): Promise<{
   pendingWcOrderRetry?: { attempted: number; imported: number; stillPending: number; failed: number } | null
 }> {
   try {
+    // The FX source switch (default 'ecb' = everything below, unchanged). 'aelia' reads Aelia's rates through the helper plugin instead and never contacts frankfurter.
+    if ((await getFxRateSource()) === 'aelia') return await refreshFromAelia()
     const baseCurrency = await getBaseCurrencyCode()
     const currencies = await db.currency.findMany({
       where: { active: true, code: { not: baseCurrency } },
@@ -100,7 +103,11 @@ export async function fetchAllFxRatesInternal(): Promise<{
     const failed: string[] = []
 
     // The exclusive side of the rate table's stability lock: a running CSV import holds the table still (shared) and this write waits for it to finish.
+    // THE CUTOVER BARRIER (the other half is setFxRateSource, which changes the source under this same exclusive lock): the source is re-read INSIDE the lock, and a switch to Aelia that committed while
+    // frankfurter was being asked aborts the write, so no ECB row is stored after the switch.
+    let sourceChanged = false
     await withFxTableWriteLock(async (tx) => {
+      if ((await getFxRateSourceInTx(tx)) === 'aelia') { sourceChanged = true; return }
       for (const code of codes) {
         const rate = rates[code]
         if (typeof rate === 'number' && rate > 0) {
@@ -114,6 +121,10 @@ export async function fetchAllFxRatesInternal(): Promise<{
       }
     })
 
+    if (sourceChanged) {
+      await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'WARNING', description: `ECB FX refresh discarded: ${FX_SOURCE_CHANGED_MESSAGE}` })
+      return { success: false, updated: [], failed: [], error: FX_SOURCE_CHANGED_MESSAGE, retryCount }
+    }
     await recordFxFetchAttempt({
       status: failed.length ? 'partial' : 'success',
       retryCount,
@@ -182,6 +193,78 @@ export async function fetchAllFxRatesInternal(): Promise<{
     })
     return { success: false, updated: [], failed: [], error, retryCount: 0 }
   }
+}
+
+type FxRefreshResult = Awaited<ReturnType<typeof fetchAllFxRatesInternal>>
+
+/**
+ * The scheduled refresh when the FX source is Aelia: ONE read of the helper plugin (no retries here; the next scheduled run is the retry), then lib/currencies/aelia-ingest.ts validates and stores.
+ * No frankfurter fallback exists on this path: a read or a currency that cannot be had is reported and the existing rates stay in use. The IMS -> WooCommerce rate push is not run (Aelia owns the rates).
+ */
+async function refreshFromAelia(): Promise<FxRefreshResult> {
+  const [{ readAeliaRatesFromWc }, { ingestAeliaRates, AeliaRefusedError }] = await Promise.all([
+    import('@/lib/connectors/woocommerce/aelia-rates'),
+    import('@/lib/currencies/aelia-ingest'),
+  ])
+  const fail = async (error: string, failed: string[] = []): Promise<FxRefreshResult> => {
+    await recordFxFetchAttempt({ status: 'failed', retryCount: 1, failed, error })
+    await logActivity({
+      entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'ERROR',
+      description: `Aelia FX rate read failed; existing rates remain in use: ${error.slice(0, 240)}`,
+    })
+    await notifyActiveAdmins({
+      type: 'error',
+      title: 'FX rate refresh failed',
+      message: `Reading Aelia's exchange rates failed: ${error.slice(0, 200)}. Existing rates remain in use.`,
+      actionUrl: '/settings/accounting?tab=fx-rates',
+    })
+    return { success: false, updated: [], failed, error, retryCount: 1 }
+  }
+
+  const read = await readAeliaRatesFromWc()
+  if (!read.ok) return fail(read.message)
+
+  let result: Awaited<ReturnType<typeof ingestAeliaRates>>
+  try {
+    result = await ingestAeliaRates(read.body)
+  } catch (e) {
+    if (e instanceof AeliaRefusedError) return fail(`${e.reason}: ${e.message}`)
+    throw e
+  }
+
+  const failed = result.refused.flatMap((r) => (r.currency ? [r.currency] : []))
+  await recordFxFetchAttempt({
+    status: result.refused.length ? 'partial' : 'success',
+    retryCount: 1,
+    failed,
+    skippedManualOverrides: result.skippedManualOverrides,
+    error: result.refused.map((r) => `${r.currency ?? '?'}: ${r.reason}`).join('; ').slice(0, 500),
+  })
+  // Aelia's freshness, in Aelia's own time (not the time IMS looked): what the health check judges.
+  await setSetting('fx_aelia_last_update_at', result.updatedAt.toISOString())
+  await setSetting('fx_aelia_last_read_at', new Date().toISOString())
+  await logActivity({
+    entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched',
+    level: result.refused.length ? 'WARNING' : 'INFO',
+    description: `Read Aelia FX rates (Aelia updated ${result.updatedAt.toISOString()}): ${result.written.length} stored, ${result.unchanged.length} already stored, ${result.skippedManualOverrides.length} pinned, ${result.refused.length} refused`,
+    metadata: { refused: result.refused.map((r) => ({ currency: r.currency, reason: r.reason })) },
+  })
+
+  let pendingWcOrderRetry: { attempted: number; imported: number; stillPending: number; failed: number } | null = null
+  if (result.written.length > 0) {
+    try {
+      const { retryPendingWcOrdersWaitingForFx } = await import('@/lib/connectors/woocommerce/sync/order-import')
+      pendingWcOrderRetry = await retryPendingWcOrdersWaitingForFx()
+    } catch (e) {
+      await logActivity({
+        entityType: 'SYNC', tag: 'sync', action: 'wc_order_fx_pending_retry', level: 'WARNING',
+        description: `Failed to retry WooCommerce orders waiting for FX rates: ${String(e).slice(0, 240)}`,
+      })
+    }
+  }
+  revalidatePath('/settings', 'layout')
+  revalidatePath('/purchase-orders')
+  return { success: true, updated: result.written, failed, retryCount: 1, skippedManualOverrides: result.skippedManualOverrides, pendingWcOrderRetry }
 }
 
 /**

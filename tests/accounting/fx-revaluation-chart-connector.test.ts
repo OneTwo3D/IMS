@@ -145,6 +145,7 @@ mock.module('@/lib/db', {
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
         // o3d-q0x56.4: a missing rate now SKIPS the document, so the USD balance below is given the rate it used to fall back to.
         fxRate: fakeFxClient([{ fromCurrency: 'GBP', toCurrency: 'USD', rate: '0.8', fetchedAt: new Date('2020-01-01T00:00:00.000Z') }]).fxRate,
+        setting: fakeFxClient([]).setting,
         // ...and it records a WARNING when it falls back, through the same transaction.
         activityLog: { create: async () => ({ id: 'activity-1' }) },
       }),

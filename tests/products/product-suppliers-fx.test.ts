@@ -29,6 +29,7 @@ mock.module('@/lib/db', {
       currency: { findMany: async () => [{ code: 'EUR', symbol: '€' }, { code: 'USD', symbol: '$' }] },
       get organisation() { return state.fx.organisation },
       get fxRate() { return state.fx.fxRate },
+      get setting() { return state.fx.setting },
     },
   },
 })

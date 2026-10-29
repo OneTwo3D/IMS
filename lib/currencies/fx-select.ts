@@ -1,4 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { eligibleUnderAeliaRegime, type FxSourceRegime } from './fx-source-regime'
 
 /**
  * The PURE half of the one exchange-rate lookup (no database, no base-currency module): the closed refusal reasons, the date rule and the row
@@ -14,6 +15,7 @@ export const FX_MISSING_REASONS = [
   'non_positive_rate',
   'non_finite_rate',
   'ambiguous_rate',
+  'no_rate_from_selected_source',
 ] as const
 export type FxMissingReason = (typeof FX_MISSING_REASONS)[number]
 
@@ -100,6 +102,7 @@ export function refuse(reason: FxMissingReason, base: string, currency: string, 
     non_positive_rate: `Invalid stored ${base} FX rate for ${currency}`,
     non_finite_rate: `Invalid stored ${base} FX rate for ${currency}`,
     ambiguous_rate: `Ambiguous ${base} FX rate for ${currency} on or before ${when}`,
+    no_rate_from_selected_source: `The FX source is Aelia and it has given no ${base} rate for ${currency} on or before ${when}; no other source is used`,
   }
   return new MissingFxRateError(message ?? defaults[reason], currency, isValidDate(asOf) ? asOf : undefined, reason, base)
 }
@@ -120,13 +123,16 @@ function toRate(value: unknown): Prisma.Decimal | null {
  */
 export function selectFxRateFromRows(
   rows: readonly FxRateRow[],
-  params: { baseCurrency: string; currency: string; asOf: Date },
+  params: { baseCurrency: string; currency: string; asOf: Date; regime?: FxSourceRegime },
 ): FxRateToBase {
-  const { baseCurrency, currency, asOf } = params
-  const candidates = rows.filter(
+  const { baseCurrency, currency, asOf, regime } = params
+  const inPair = rows.filter(
     (r) => r.fromCurrency === baseCurrency && r.toCurrency === currency && isValidDate(r.fetchedAt) && r.fetchedAt.getTime() <= asOf.getTime(),
   )
-  if (candidates.length === 0) throw refuse('no_rate', baseCurrency, currency, asOf)
+  // THE SOURCE REGIME (fx-source-regime.ts): at or after the Aelia cutover only Aelia rows and manual overrides are eligible; before it, nothing changes.
+  const restricted = regime?.source === 'aelia' && asOf.getTime() >= regime.since.getTime()
+  const candidates = restricted ? inPair.filter(eligibleUnderAeliaRegime) : inPair
+  if (candidates.length === 0) throw refuse(inPair.length > 0 ? 'no_rate_from_selected_source' : 'no_rate', baseCurrency, currency, asOf)
   const latest = candidates.reduce((max, r) => Math.max(max, r.fetchedAt.getTime()), -Infinity)
   const tied = candidates.filter((r) => r.fetchedAt.getTime() === latest)
   const rates: Prisma.Decimal[] = []

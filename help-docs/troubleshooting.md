@@ -92,6 +92,7 @@ When something goes wrong, three places hold the information you need:
 ### "Missing GBP FX rate for EUR" (or similar)
 - The FX rate cron hasn't fetched today's rate. Click **Update Now** in Settings > Accounting > FX Rates.
 - If the fetch keeps failing, check **Settings > System > Health** for FX sync status. The frankfurter.dev API outage will surface here.
+- With the **Aelia** FX source, a failure names its cause: HTTP 404 from the store means the helper plugin 1.3.0+ is not deployed or the shared secret is not set; `base_mismatch`, `no_update_time`, `missing_rate`, `non_positive_rate`, `rate_precision`, `unknown_currency` or `not_listed_by_aelia` name the rate Aelia gave that IMS refuses. Nothing is substituted; fix Aelia or the currency list, or switch the source back to ECB.
 
 ### PO cancellation refused
 - POs in PARTIALLY_RECEIVED state can be cancelled, but the system will reverse all received cost layers and stock. Confirm the cancellation if you're sure.

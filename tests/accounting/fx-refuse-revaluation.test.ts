@@ -59,6 +59,7 @@ mock.module('@/lib/db', {
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
         const tx = {
         __pending: [] as Array<Enqueued & { chartConnector: unknown }>,
+        setting: { findMany: async () => [] },
         fxRate: {
           groupBy: async (args: { where: { fetchedAt: { lte: Date } } }) => { state.asOfs.push(args.where.fetchedAt.lte); return fakeFxClient(state.rates).fxRate.groupBy(args as never) },
           findMany: async (args: never) => fakeFxClient(state.rates).fxRate.findMany(args),

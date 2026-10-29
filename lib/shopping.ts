@@ -462,6 +462,9 @@ export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResu
         const { db } = await import('@/lib/db')
         const { logActivity } = await import('@/lib/activity-log')
         try {
+          // The FX source is Aelia: IMS does not push rates at all. Before the producer seam, so no shadow record is left for a push that is not attempted.
+          const { getFxRateSource } = await import('@/lib/currencies/fx-source')
+          if ((await getFxRateSource()) === 'aelia') return { connector, supported: false, pushed: 0, errors: [] }
           // The producer seam: with the hold enforced and the decision SHADOW, record it and send nothing. Not a failure, so no
           // FAILED fxRatePushLog row and no WARNING: the log tells the operator what was sent, and nothing was.
           const seam = await wooProducerSeam({ operation: 'fx-rates', subjectType: 'FxRates', subjectId: 'current', payload: { kind: 'current-rates' } })
@@ -469,6 +472,12 @@ export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResu
           const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
           const pushResult = await pushCurrentFxRatesToWc()
           if (!pushResult.supported) return { connector, supported: false, pushed: 0, errors: [] }
+          if (pushResult.retired) {
+            // The store retired the receiver (helper plugin 1.3.0): a terminal refusal, logged once per run as SKIPPED, not FAILED, no WARNING, never retried.
+            const { FX_PUSH_RETIRED_MESSAGE } = await import('@/lib/connectors/woocommerce/fx-rates')
+            await db.fxRatePushLog.create({ data: { connector, ratesCount: 0, status: 'SKIPPED', errorMessage: FX_PUSH_RETIRED_MESSAGE } })
+            return { connector, supported: false, pushed: 0, errors: [] }
+          }
           if (pushResult.errors.length) {
             await db.fxRatePushLog.create({
               data: { connector, ratesCount: pushResult.pushed, status: 'FAILED', errorMessage: pushResult.errors.join('; ').slice(0, 500) },

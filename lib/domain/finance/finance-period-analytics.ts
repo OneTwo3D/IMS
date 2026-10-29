@@ -4,6 +4,7 @@ import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { isMissingFxRateError, selectFxRateFromRows } from '@/lib/currencies/fx-lookup'
+import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-source-regime'
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
@@ -25,6 +26,8 @@ export type FinanceAnalyticsClient = {
   payment: FindManyDelegate
   purchaseInvoice: FindManyDelegate
   fxRate: FindManyDelegate
+  /** Read for the FX source regime (lib/currencies/fx-source-regime.ts); a real client always has it. */
+  setting?: FindManyDelegate
 }
 
 export type FinanceAnalyticsDeps = {
@@ -446,12 +449,13 @@ function settlementRateToBase(
   baseCurrency: string,
   currency: string,
   paidAt: Date,
+  regime: FxSourceRegime,
 ): { rate: Prisma.Decimal; reason: null } | { rate: null; reason: string } {
   if (currency === baseCurrency) return { rate: new Prisma.Decimal(1), reason: null }
   try {
-    return { rate: selectFxRateFromRows(rates, { baseCurrency, currency, asOf: settlementAsOfFromStored(paidAt) }).rate, reason: null }
+    return { rate: selectFxRateFromRows(rates, { baseCurrency, currency, asOf: settlementAsOfFromStored(paidAt), regime }).rate, reason: null }
   } catch (error) {
-    if (!(isMissingFxRateError(error) && (error.reason === 'no_rate' || error.reason === 'invalid_currency'))) throw error
+    if (!(isMissingFxRateError(error) && (error.reason === 'no_rate' || error.reason === 'no_rate_from_selected_source' || error.reason === 'invalid_currency'))) throw error
     return { rate: null, reason: describeFxRefusal(error) }
   }
 }
@@ -1014,6 +1018,11 @@ export async function getCurrencySummaryReport(
   ], options.paginate !== false)
 }
 
+async function loadFxRegime(client: FinanceAnalyticsClient): Promise<FxSourceRegime> {
+  // Same rule as every other lookup (fx-lookup.ts): under the Aelia source only Aelia rows and manual overrides are eligible at or after the cutover.
+  return client.setting ? getFxSourceRegime({ setting: client.setting as never }) : null
+}
+
 async function loadFxRates(client: FinanceAnalyticsClient, baseCurrency: string, window: { dateToExclusive: Date }): Promise<FxRateRow[]> {
   return client.fxRate.findMany({
     // Strictly before the window's exclusive end: every lookup below is `asOf` a payment/invoice instant inside the
@@ -1035,7 +1044,7 @@ export async function getFxGainLossReport(
   const window = period(filters, generatedAt)
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const settings = options.deps?.accountingSettings ? await options.deps.accountingSettings() : await getAccountingSettings()
-  const [payments, purchaseInvoices, fxRates] = await Promise.all([
+  const [payments, purchaseInvoices, fxRates, fxRegime] = await Promise.all([
     client.payment.findMany({
       where: {
         refundId: null,
@@ -1082,12 +1091,13 @@ export async function getFxGainLossReport(
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<PurchaseInvoiceFxRow[]>,
     loadFxRates(client, baseCurrency, window),
+    loadFxRegime(client),
   ])
   assertSourceLimit(Math.max(payments.length, purchaseInvoices.length, fxRates.length), SOURCE_ROW_LIMIT, 'FX gain/loss source rows')
 
   const rows: FxGainLossReportRow[] = []
   for (const payment of payments) {
-    const settlement = settlementRateToBase(fxRates, baseCurrency, payment.currency, payment.paidAt)
+    const settlement = settlementRateToBase(fxRates, baseCurrency, payment.currency, payment.paidAt, fxRegime)
     const paymentForeign = toDecimal(payment.amount).abs()
     const orderTotalForeign = toDecimal(payment.order.totalForeign)
     if (settlement.rate === null) {
@@ -1146,7 +1156,7 @@ export async function getFxGainLossReport(
   }
   for (const invoice of purchaseInvoices) {
     if (!invoice.paidAt) continue
-    const settlement = settlementRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt)
+    const settlement = settlementRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt, fxRegime)
     if (settlement.rate === null) {
       rows.push({
         side: 'payable',

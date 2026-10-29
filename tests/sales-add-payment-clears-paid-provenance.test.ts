@@ -81,6 +81,7 @@ const tx = {
   salesOrderRefund: { findFirst: async (): Promise<{ totalForeign: number } | null> => null },
   // o3d-q0x56.4: a foreign receipt REFUSES without a rate, so the CLF orders below are given one.
   fxRate: fakeFxClient([{ fromCurrency: 'GBP', toCurrency: 'CLF', rate: '0.03', fetchedAt: new Date('2026-01-01T00:00:00.000Z') }]).fxRate,
+  setting: fakeFxClient([]).setting,
   activityLog: { create: async () => ({}) },
 }
 

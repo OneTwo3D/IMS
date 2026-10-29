@@ -59,7 +59,7 @@ registerCronJobs([
     module: 'system',
     moduleLabel: 'System',
     label: 'FX Rate Update',
-    description: 'Fetches daily exchange rates from the ECB via frankfurter.dev.',
+    description: 'Fetches daily exchange rates from the ECB via frankfurter.dev, or reads them from Aelia when the FX source is Aelia.',
     defaultSchedule: '0 7 * * *',
     defaultEnabled: true,
   },
