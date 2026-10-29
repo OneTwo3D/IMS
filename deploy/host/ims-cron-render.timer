@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply saved IMS scheduler changes to host cron every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
