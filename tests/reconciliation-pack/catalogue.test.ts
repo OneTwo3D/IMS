@@ -9,9 +9,9 @@ import {
   EXACT_DECIMAL_TOLERANCE, R5_ABSOLUTE_FLOOR_GBP, R5_RELATIVE_FRACTION,
 } from '../../lib/reconciliation-pack/constants.ts'
 
-test('the catalogue is R1..R15 once each, in order, with the gate\'s own titles', () => {
+test('the catalogue is R1..R16 once each, in order, with the gate\'s own titles', () => {
   assert.deepEqual(PACK_ITEM_CATALOGUE.map((s) => s.id), [...PACK_ITEM_IDS])
-  assert.equal(PACK_ITEM_CATALOGUE.length, 15)
+  assert.equal(PACK_ITEM_CATALOGUE.length, 16)
   for (const spec of PACK_ITEM_CATALOGUE) assert.equal(spec.title, PACK_ITEMS.find((i) => i.id === spec.id)!.title)
 })
 

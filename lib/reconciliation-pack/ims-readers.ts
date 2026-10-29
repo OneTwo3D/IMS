@@ -55,7 +55,7 @@ export interface ImsQueryClient {
   query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
 }
 
-export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'firstLoadProvenance'] as const
+export const IMS_SECTIONS = ['identity', 'boundaries', 'stock', 'products', 'orders', 'storefrontStatus', 'taxes', 'xeroTaxRates', 'xeroSyncLogs', 'snapshots', 'wmsBindings', 'wmsProductLinks', 'xeroPostings', 'vat', 'warehouses', 'purchaseOrders', 'transitSchedule', 'fxRates', 'baseCurrency', 'firstLoadProvenance', 'xeroPostedRates'] as const
 export type ImsSectionId = (typeof IMS_SECTIONS)[number]
 
 // ---------------------------------------------------------------------------------------------
@@ -211,6 +211,17 @@ export const TRANSIT_SOURCE_DOCUMENTS: ReadonlyArray<{ kind: string; sourceTypes
 ]
 export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; preWatermark: TransitPreWatermark; net: TransitNetRow[]; customerReturns: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
 
+/**
+ * R16, the IMS side of "what did IMS post": every connector-confirmed Xero create (SYNCED, a Xero document id, no operator assertion standing in for the
+ * connector) of a sales invoice, bill, sales or supplier credit note and invoice or bill payment, with the rate its stored sync payload carried (the
+ * payload is what the poster sent: documents `currencyRateToBase`, payments `settlementRateToBase`; 1 base = X foreign), as TEXT exactly as stored (null
+ * when the key is absent), and whether the payload is gone (retention compaction). `date` is the document date (payments: the payment date).
+ * `wooReceipt` is true for a payment whose source invoice entry carried the importer's `_paymentSettlementRateToBase` marker (a payload from before the marker lacks it, so the
+ * payment's own provenance is read too, below) and `orderRate` is the order's stored rate (SalesOrder.fxRateToBase, the rate the importer gives a same-day receipt); `wooOrder` is true for a document of a sales order imported from the storefront.
+ * Read-only, in the snapshot of the other sections.
+ */
+export type XeroPostedRateRow = { id: string; type: string; externalId: string; noPayload: boolean; currency: string | null; date: string | null; rate: string | null; wooReceipt: boolean; orderRate: string | null; wooOrder: boolean; /** The payment's own provenance, from the payments row its payload names (`paymentId`): `hasPaymentId` the payload names one, `paymentFound` it exists, `paymentFromStorefront` its notes are the importer's ('Imported from WooCommerce' / 'Recorded from WooCommerce'). A receipt is identified by this, not by the importer's rate marker, so a payload from before the marker is judged too. */ hasPaymentId: boolean; paymentFound: boolean; paymentFromStorefront: boolean; /** SalesOrder.externalCreatedAt (the storefront's creation instant, UTC ISO) of the order the record belongs to; null when unknown. */ orderCreatedAt: string | null }
+
 export type ImsSectionValues = {
   identity: ImsIdentity
   boundaries: PopulationBoundaries
@@ -230,7 +241,9 @@ export type ImsSectionValues = {
   purchaseOrders: PoRow[]
   transitSchedule: ImsTransitSchedule
   fxRates: FxRateRow[]
+  baseCurrency: string
   firstLoadProvenance: FirstLoadProvenance | null
+  xeroPostedRates: XeroPostedRateRow[]
 }
 export type SectionResult<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type ImsSections = { [K in ImsSectionId]?: SectionResult<ImsSectionValues[K]> }
@@ -508,6 +521,26 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     return logs
   },
 
+  async xeroPostedRates(tx) {
+    const rows = await readCapped(tx, `SELECT l.id AS id, l.type::text AS type, l."externalTransactionId" AS external_id, (l.payload IS NULL) AS no_payload, l.payload->>'currency' AS currency,
+      CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'paymentDate' ELSE l.payload->>'date' END AS doc_date,
+      CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'settlementRateToBase' ELSE l.payload->>'currencyRateToBase' END AS rate,
+      COALESCE((src.payload ? '_paymentSettlementRateToBase'), false) AS woo_receipt, so."fxRateToBase"::text AS order_rate,
+      ((l.payload->>'paymentId') IS NOT NULL) AS has_payment_id, (pay.id IS NOT NULL) AS payment_found, COALESCE((pay.notes LIKE 'Imported from WooCommerce%' OR pay.notes LIKE 'Recorded from WooCommerce%'), false) AS payment_woo, (so."externalOrderNumber" IS NOT NULL) AS woo_order, ${UTC('so."externalCreatedAt"')} AS order_created
+      FROM accounting_sync_logs l
+      LEFT JOIN accounting_sync_logs src ON l.type::text = 'INVOICE_PAYMENT' AND src.id = l.payload->>'sourceEntryId'
+      LEFT JOIN payments pay ON l.type::text = 'INVOICE_PAYMENT' AND pay.id = l.payload->>'paymentId'
+      LEFT JOIN sales_orders so ON l."referenceType" = 'SalesOrder' AND so.id = l."referenceId"
+      WHERE l.connector = 'xero' AND l.status::text = 'SYNCED' AND l.settlement_basis IS NULL AND l."externalTransactionId" IS NOT NULL
+        AND l.type::text IN ('SALES_INVOICE', 'PURCHASE_INVOICE', 'CREDIT_NOTE', 'PURCHASE_CREDIT_NOTE', 'INVOICE_PAYMENT', 'BILL_PAYMENT') ORDER BY l.id`)
+    const posted = rows.map((row): XeroPostedRateRow => ({
+      id: text(row.id), type: text(row.type, 'SOURCE_UNREADABLE'), externalId: text(row.external_id), noPayload: bool(row.no_payload),
+      currency: textOrNull(row.currency), date: textOrNull(row.doc_date), rate: textOrNull(row.rate), wooReceipt: bool(row.woo_receipt), orderRate: textOrNull(row.order_rate), wooOrder: bool(row.woo_order === null ? false : row.woo_order), hasPaymentId: bool(row.has_payment_id), paymentFound: bool(row.payment_found), paymentFromStorefront: bool(row.payment_woo), orderCreatedAt: textOrNull(row.order_created),
+    }))
+    unique(posted, (row) => row.id)
+    return posted
+  },
+
   async xeroPostings(tx) {
     const runs = await tx.query(`SELECT status, ${UTC('created_at')} AS started FROM first_load_apply_runs`)
     if (runs.length > 1) throw new Unreadable('DUPLICATE_KEY')
@@ -658,6 +691,13 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   async fxRates(tx) {
     const rows = await readCapped(tx, `SELECT "toCurrency" AS currency, rate::text AS rate, "manualOverride" AS manual, ${UTC('"fetchedAt"')} AS fetched FROM fx_rates WHERE "fromCurrency" = $1 ORDER BY id`, [QOBLEX_BASE_CURRENCY])
     return rows.map((row): FxRateRow => ({ currency: text(row.currency, 'CURRENCY_UNKNOWN'), rate: decimal(row.rate), fetchedAt: text(row.fetched, 'SOURCE_UNREADABLE'), manualOverride: bool(row.manual) }))
+  },
+
+  /** The organisation's base currency (the same read and fallback as the `vat` section: no organisation row means GBP; more than one organisation row is DUPLICATE_KEY, as there). */
+  async baseCurrency(tx) {
+    const orgs = await tx.query('SELECT "baseCurrency" AS base FROM organisations ORDER BY id')
+    if (orgs.length > 1) throw new Unreadable('DUPLICATE_KEY')
+    return orgs.length === 0 ? 'GBP' : text(orgs[0]!.base, 'CURRENCY_UNKNOWN')
   },
 
   async transitSchedule(tx) {

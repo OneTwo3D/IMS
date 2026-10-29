@@ -180,6 +180,20 @@ test('R12 reads the ledger as of its cycle date: a fresh report about an old dat
   assert.equal(assessPackItem({ record: packRecord('P1', { asOf: '2026-09-03', finishedAt: new Date(NOW.getTime() - limit - 1), items: { [id]: packPass(id) } }) }, id, ctx()).kind, 'unreadable')
 })
 
+// [mutation: 'R16' removed from the gate's cycle-dated items]
+test('R16 chooses its months by the cycle date although it reads no cycle-dated source: a fresh report about an old date, a day not yet ended or an unreadable date is not established', () => {
+  const id: PackItemId = 'R16'
+  assert.deepEqual([...getPackItem(id).sources], ['ims-database', 'xero-api'], 'no cycle-dated source: the item itself is what makes it cycle-dated')
+  assert.equal(getPackItem(id).cadence, 'monthly')
+  const at = (asOf: string, finishedAt: Date = new Date(NOW.getTime() - 3600_000)) => assessPackItem({ record: packRecord('P1', { asOf, finishedAt, items: { [id]: packPass(id) } }) }, id, ctx()).kind
+  assert.equal(at('2026-10-07'), 'pass', 'yesterday, read after it ended')
+  assert.equal(at('2026-09-02'), 'unreadable', 'a fresh report about an old cycle date')
+  assert.equal(at('2026-10-08'), 'unreadable', 'today, not yet ended')
+  assert.equal(at('2026-10-07', new Date('2026-10-07T23:00:00.000Z')), 'unreadable', 'read before its day ended')
+  // An item that reads no cycle-dated evidence and is not named is not held to it.
+  assert.equal(assessPackItem({ record: packRecord('P1', { asOf: '2026-09-01' }) }, 'R3', ctx()).kind, 'pass')
+})
+
 // [mutation: the age check removed / the cadence ignored / the boundary moved]
 test('a report is current by its item\'s cadence: daily 36 hours, weekly 8 days, monthly 35 days - inclusive at the limit, stale one millisecond past it', () => {
   // R12 (monthly) and R14 (weekly) read cycle-dated sources, so each is judged by the end of its cycle day: their own tests follow.
@@ -311,7 +325,7 @@ test('collected: a pack reader that throws, or a system identifier that cannot b
   assert.ok(!JSON.stringify(throwsId.results).includes('hunter2'), 'nothing the database said reaches the text')
   const emptyId = await collectGateResults(OPTIONS, gateDeps({ readSystemIdentifier: async () => '' }))
   assert.equal(emptyId.results['pack-R3']!.kind, 'unreadable')
-  assert.equal(Object.keys(throwsId.results).length, 22, 'every slot still has a result')
+  assert.equal(Object.keys(throwsId.results).length, 23, 'every slot still has a result')
 })
 
 test('collected, P2: an item the pack reports as failing blocks, one it could not prove blocks, and a pass the report supports does not', async () => {

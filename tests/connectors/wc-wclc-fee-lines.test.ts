@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import * as fieldMappingNs from '../../lib/connectors/woocommerce/sync/field-mapping.ts'
 import * as couponNs from '../../lib/connectors/woocommerce/sync/coupon-classification.ts'
+import * as xeroInvoicesNs from '../../lib/connectors/xero/invoices.ts'
 import * as orderImportNs from '../../lib/connectors/woocommerce/sync/order-import.ts'
 import type { WcFeeLine, WcFullOrder } from '../../lib/connectors/woocommerce/sync/types.ts'
 
@@ -19,7 +20,8 @@ function unwrap<T extends object>(ns: T): Mod<T> {
 }
 const { mapWcFeeLines, readWclcFeeKind } = unwrap(fieldMappingNs)
 const { wcReportedOrderAmounts } = unwrap(couponNs)
-const { reconcileWcDocumentTax } = unwrap(orderImportNs)
+const { reconcileWcDocumentTax, resolveWcLineAccountingTaxType } = unwrap(orderImportNs)
+const { buildSalesInvoicePayload } = unwrap(xeroInvoicesNs)
 
 const NL_STANDARD = 7 // an arbitrary WooCommerce tax-rate id: the mapper passes it through untouched
 
@@ -106,6 +108,7 @@ test('old untaxed order: fee lines with no meta map exactly as before (tax 0, fo
     externalLineItemId: null,
     taxCategoryFallback: 'STANDARD',
     wclcFeeKind: null,
+    isFeeLine: true,
   })
   // A payload with no `taxes` key at all (older WooCommerce) behaves the same.
   const bare = { id: 10, name: 'Handling', total: '1.00', total_tax: '0.00' } as WcFeeLine
@@ -183,4 +186,98 @@ test('order components: handling is absent unless above zero; junk, negatives an
   assert.equal(readWclcOrderComponents(orderMeta(['_wclc_duty_component', 'abc'])).dutyComponent, null)
   assert.equal(readWclcOrderComponents(orderMeta(['_wclc_duty_component', ''])).dutyComponent, null)
   assert.deepEqual(readWclcOrderComponents({ meta_data: [] }), { dutyComponent: null, taxComponent: null, handlingComponent: null })
+})
+
+// --- the ACCOUNTING payload: untaxed fee lines must not fall through to the order default tax code ---------------------
+
+const OUTPUT_IOSS = 'OUTPUT2' // the taxable order-default code on an EU order
+const XERO_RATE: Record<string, number> = { OUTPUT2: 0.21, NONE: 0 }
+const penny = (v: number) => Math.round(v * 100) / 100
+
+type XeroLine = { Quantity?: number; UnitAmount?: number; DiscountAmount?: number; TaxType?: string; Description?: string }
+
+/** What Xero makes of the payload: each line's net plus net x the rate of the code it was sent on. */
+function xeroTotal(payload: Record<string, unknown>): number {
+  assert.equal(payload.LineAmountTypes, 'Exclusive')
+  return penny((payload.LineItems as XeroLine[]).reduce((sum, l) => {
+    const net = penny((l.Quantity ?? 0) * (l.UnitAmount ?? 0) - (l.DiscountAmount ?? 0))
+    return sum + net + penny(net * (XERO_RATE[l.TaxType ?? ''] ?? 0))
+  }, 0))
+}
+
+/** The import's per-line step: mapped WooCommerce lines -> accounting lines, the way order-import builds them. */
+function accountingLines(fees: WcFeeLine[], usePatchedResolution: boolean) {
+  const mapped = mapWcFeeLines(fees)
+  const goodsLine = { description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: OUTPUT_IOSS }
+  const feeLines = mapped.map((l) => {
+    // Taxed fee: its own WooCommerce rate id resolves to the mapped IOSS code. No-tax fee: resolution yields no code.
+    const base = l.forceNoTax ? undefined : OUTPUT_IOSS
+    const taxType = usePatchedResolution
+      ? resolveWcLineAccountingTaxType({ forceNoTax: l.forceNoTax, baseTaxType: base, reverseCharge: false, reverseChargeSalesTaxType: '' })
+      : (base ?? OUTPUT_IOSS) // the old behaviour: a missing code falls through to the order default
+    return { description: l.description, quantity: 1, unitAmount: l.unitPriceForeign, accountCode: '260', taxType }
+  })
+  return [goodsLine, ...feeLines]
+}
+
+function invoice(lines: ReturnType<typeof accountingLines>) {
+  return buildSalesInvoicePayload(
+    { invoiceNumber: 'WC-1', contactName: 'A Customer', date: '2026-11-02', currency: 'EUR', lines },
+    'AUTHORISED', 'contact-1', new Set<string>(), 'EUR',
+  )
+}
+
+test('accounting payload: taxed EU fees keep the IOSS code, untaxed fees go on NONE, and the total equals WooCommerce\'s', () => {
+  const fees = [
+    fee(1, 'EU Import Duty', '6.00', '1.26', 'duty_flat'),               // taxed
+    fee(2, 'EU Customs Fee', '4.00', '0.84', 'uhf'),                      // taxed
+    fee(3, 'Import Duty', '53.40', '0.00', 'duty_fee', null),             // >EUR 150 non-taxable line
+    { id: 4, name: 'EU Duty', tax_class: '', total: '3.00', total_tax: '0.00', taxes: [] } as WcFeeLine, // legacy untaxed fee
+  ]
+  // WooCommerce: goods 100 + 21.00, fees 6 + 1.26, 4 + 0.84, 53.40, 3.00 = 189.50.
+  const wooTotal = penny(100 + 21 + 6 + 1.26 + 4 + 0.84 + 53.4 + 3)
+  assert.equal(wooTotal, 189.5)
+
+  const patched = invoice(accountingLines(fees, true))
+  const types = (patched.LineItems as XeroLine[]).map((l) => `${l.Description}=${l.TaxType}`)
+  assert.deepEqual(types, ['Widget=OUTPUT2', 'EU Import Duty=OUTPUT2', 'EU Customs Fee=OUTPUT2', 'Import Duty=NONE', 'EU Duty=NONE'])
+  assert.equal(xeroTotal(patched), wooTotal)
+
+  // The control: the old fall-through taxes the two untaxed fees at the IOSS rate and the total is wrong by their VAT.
+  const old = invoice(accountingLines(fees, false))
+  assert.equal(xeroTotal(old), penny(wooTotal + penny(53.4 * 0.21) + penny(3 * 0.21)))
+  assert.notEqual(xeroTotal(old), wooTotal)
+})
+
+test('resolveWcLineAccountingTaxType: forceNoTax is NONE whatever the base; otherwise the normal resolution (incl. reverse charge)', () => {
+  const base = { baseTaxType: 'OUTPUT2', reverseCharge: false, reverseChargeSalesTaxType: 'ECOUTPUT' }
+  assert.equal(resolveWcLineAccountingTaxType({ ...base, forceNoTax: true }), 'NONE')
+  assert.equal(resolveWcLineAccountingTaxType({ ...base, baseTaxType: undefined, forceNoTax: true }), 'NONE')
+  assert.equal(resolveWcLineAccountingTaxType({ ...base, forceNoTax: false }), 'OUTPUT2')
+  assert.equal(resolveWcLineAccountingTaxType({ ...base, forceNoTax: undefined, reverseCharge: true }), 'ECOUTPUT')
+})
+
+// --- scope: the explicit no-tax accounting code is for FEE lines only ----------------------------------------------------
+
+const { mapWcLineItems } = unwrap(fieldMappingNs)
+
+test('fee lines are marked isFeeLine; goods lines never are, and carry no forceNoTax', async () => {
+  const [feeLine] = mapWcFeeLines([{ id: 9, name: 'EU Duty', tax_class: '', total: '3.00', total_tax: '0.00', taxes: [] }])
+  assert.equal(feeLine.isFeeLine, true)
+  assert.equal(feeLine.forceNoTax, true)
+  // A no-rate goods line (no SKU, so no database lookup): unchanged vs development - no forceNoTax, not a fee.
+  const [goods] = await mapWcLineItems([
+    { id: 1, name: 'Gift card', product_id: 5, variation_id: 0, quantity: 1, tax_class: '', subtotal: '25.00', subtotal_tax: '0.00', total: '25.00', total_tax: '0.00', sku: '', price: 25, taxes: [], meta_data: [] } as never,
+  ], 1)
+  assert.equal(goods.forceNoTax, undefined)
+  assert.equal(goods.isFeeLine, undefined)
+  // The accounting code of such a line is the normal resolution (the order default when it has no code), exactly as on development.
+  assert.equal(
+    resolveWcLineAccountingTaxType({ forceNoTax: goods.isFeeLine === true ? goods.forceNoTax : undefined, baseTaxType: 'OUTPUT2', reverseCharge: false, reverseChargeSalesTaxType: '' }),
+    'OUTPUT2',
+  )
+  assert.equal(
+    resolveWcLineAccountingTaxType({ forceNoTax: undefined, baseTaxType: undefined, reverseCharge: false, reverseChargeSalesTaxType: '' }),
+    undefined,
+  )
 })

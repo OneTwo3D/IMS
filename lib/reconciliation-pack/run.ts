@@ -28,6 +28,7 @@ import type { ImsRead, ImsReadOptions } from '@/lib/reconciliation-pack/ims-read
 import { isLedgerItem, runLedgerItem, type LedgerItemId } from '@/lib/reconciliation-pack/ledger-items'
 import { bracketLiveness, itemLivenessVerdict, publishedStreamBrackets, type LivenessBracket, type LivenessRead } from '@/lib/reconciliation-pack/liveness'
 import { buildReport, type ItemInput, type StreamBracket } from '@/lib/reconciliation-pack/report'
+import { runXeroRateItem } from '@/lib/reconciliation-pack/xero-rate-item'
 import { runVatItem } from '@/lib/reconciliation-pack/vat-item'
 import { runVendorItem, type VendorPorts } from '@/lib/reconciliation-pack/vendor-items'
 import { wmsSkuListPort } from '@/lib/reconciliation-pack/wms-skus'
@@ -109,6 +110,8 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
     runVendorItem(id, { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, wmsOptions: context.wmsOptions, wmsSession: context.wmsSession, settling: context.settling })
   const fromVat: ItemRunner = (context) =>
     runVatItem('R12', { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, wooOptions: context.wooOptions, xeroOptions: context.xeroOptions })
+  const fromXeroRate: ItemRunner = (context) =>
+    runXeroRateItem('R16', { asOf: context.asOf, vendorReads: context.vendorReads, vendor: context.vendor, ims: context.ims, xeroOptions: context.xeroOptions })
   const fromQoblex = (id: QoblexItemId): ItemRunner => (context) => runQoblexItem(id, { asOf: context.asOf, ims: context.ims, qoblex: context.qoblex })
   // R7 and R8 apply at P2 only: the runner is handed the phase and reads nothing at any other (purchase-order-items.ts).
   const fromPo = (id: PoItemId): ItemRunner => (context) => runPoItem(id, { phase: context.phase, ims: context.ims, qoblex: context.qoblex })
@@ -122,7 +125,7 @@ export function builtInRunners(): Partial<Record<PackItemId, ItemRunner>> {
     asOf: context.asOf, now: context.now, vendorReads: context.vendorReads, woo: context.vendor?.woo, wooOptions: context.wooOptions,
     ims: context.ims, qoblex: context.qoblex, wms: wmsLeg(context), exclusions: context.skuExclusions,
   })
-  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat, R2: fromQoblex('R2'), R5: fromQoblex('R5'), R7: fromPo('R7'), R8: fromPo('R8'), R14: coverage }
+  return { R1: fromVendor('R1'), R3: fromInvariant('R3'), R4: fromInvariant('R4'), R15: fromInvariant('R15'), R9: fromVendor('R9'), R13: fromVendor('R13'), R12: fromVat, R16: fromXeroRate, R2: fromQoblex('R2'), R5: fromQoblex('R5'), R7: fromPo('R7'), R8: fromPo('R8'), R14: coverage }
 }
 
 /** R6, R10 and R11 read the settled as-of basis (ledger-items.ts). */

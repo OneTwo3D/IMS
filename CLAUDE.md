@@ -646,6 +646,7 @@ setting to clear. See `lib/domain/accounting/money-attempt-provenance.ts`.
 - Always review schema.prisma changes before deployment
 - Follow `docs/migration-conventions.md` for NOT NULL add-columns, NOT VALID constraints, column renames, large-table indexes, and column drops
 - Test migrations on staging first
+- **Expand-only rule for the production blue/green deploy:** a migration that ships in a normal deploy must work with the previous release, which keeps serving while it runs. Mark it with `-- expand-only` as the FIRST line of its `migration.sql` (additive changes only). `deploy/bin/deploy.sh` refuses any pending migration without the marker, and `rollback.sh` refuses to roll back across one. A contract (destructive) migration goes out alone as a maintenance deploy (`--allow-contract-migration --maintenance`). See `deploy/README.md`, "Production host: blue/green deploy".
 
 See `@docs/deployment.md` for full deployment guide including backups, monitoring, and rollback procedures.
 
