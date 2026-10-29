@@ -339,9 +339,14 @@ function discountHeaderProblems(file: string, header: string[], mapping: Dataset
     const wrong = to.filter((column) => column !== 'lineDiscountPercent')
     if (wrong.length > 0) problems.push(`${file}: DISCOUNT_COLUMN_MISROUTED: the discount-looking header ${JSON.stringify(name)} is mapped to ${wrong.join(', ')}; a discount header is read only as lineDiscountPercent`)
   }
+  // THE ONE RULE, computed from the file's headers and the lineDiscountPercent mapping alone (not from what else reads a header: rowSelect, wide, derived and the rest cannot hide a discount header from it):
+  // if the file has a discount-looking header, lineDiscountPercent reads exactly that header; discountHeader is an escape only for a file with none.
   const mapped = mapping.columns.lineDiscountPercent
-  if (mapped !== undefined && !DISCOUNT_HEADER_PATTERN.test(mapped) && mapping.discountHeader !== mapped) {
-    problems.push(`${file}: DISCOUNT_COLUMN_NOT_DECLARED: lineDiscountPercent is mapped to ${JSON.stringify(mapped)}, which does not look like a discount header; if that is deliberate, name it in the map as discountHeader`)
+  if (mapped === undefined) return
+  if (looks.length > 0) {
+    if (!looks.includes(mapped)) problems.push(`${file}: DISCOUNT_COLUMN_NOT_THE_DISCOUNT_HEADER: the file has the discount-looking header ${JSON.stringify(looks[0])} but lineDiscountPercent is mapped to ${JSON.stringify(mapped)}; lineDiscountPercent must read exactly that header (discountHeader does not override a discount-looking header)`)
+  } else if (mapping.discountHeader !== mapped) {
+    problems.push(`${file}: DISCOUNT_COLUMN_NOT_DECLARED: the file has no discount-looking header and lineDiscountPercent is mapped to ${JSON.stringify(mapped)}; if that is deliberate, name it in the map as discountHeader`)
   }
 }
 

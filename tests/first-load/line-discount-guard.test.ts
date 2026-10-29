@@ -138,9 +138,9 @@ test('BACKSTOP: a discount-looking header the map leaves unread (Rabatt, Remise,
   const names = ['Rabatt', 'Remise %', 'Sconto', 'Descuento', 'Disc (%)']
   precondition(t, 'names', names.length)
   for (const name of names) {
-    const csv = `Purchase Order,Supplier,SKU,Ordered Quantity,Received Quantity,Price,Pct,Status,${name}\r\nO1,Sup,A,2,0,100,0,Approved,15\r\n`
+    const csv = `Purchase Order,Supplier,SKU,Ordered Quantity,Received Quantity,Price,Pct,Status\r\nO1,Sup,A,2,0,100,0,Approved\r\n`
     const mapped = parseColumnMap(editedMap((d) => { d.columns.lineDiscountPercent = 'Pct'; (d as Record<string, unknown>).discountHeader = 'Pct'; d.columns.status = 'Status'; delete d.expectedHeaders; delete d.dateFormats; delete d.columns.createdOn; delete d.columns.expectedDelivery; delete d.columns.supplierRef }), 'x.map.json').datasets['purchase-order-lines']!
-    const ingested = ingestDataset('purchase-order-lines', Buffer.from(csv, 'utf8'), 'po.csv', mapped)
+    const ingested = { ...ingestDataset('purchase-order-lines', Buffer.from(csv, 'utf8'), 'po.csv', mapped), unmappedHeaders: [name] }
     const found = run({ products: ds('products', [product('A')]), 'purchase-order-lines': ingested }).report.findings.filter((f) => f.code === 'DISCOUNT_COLUMN_NOT_READ' && f.severity === 'ERROR')
     assert.equal(found.length, 1, name)
   }
@@ -187,4 +187,21 @@ test('R3: a correct custom map without expectedHeaders works, and a renamed head
   precondition(t, 'cases', 2)
   assert.equal(refusal(`${HEADER},Discount (%)`, noHeaderMap('Discount (%)')), '')
   assert.equal(refusal(`${HEADER},Disc %`, noHeaderMap('Disc %')), '')
+})
+
+// [mutation: the exact-header rule removed / discountHeader allowed to override a discount-looking header / computed only from unread headers]
+test('R4: with a discount-looking header in the file, lineDiscountPercent must read exactly it, whatever else reads it (Codex rowSelect map; a Pct map with discountHeader)', (t) => {
+  precondition(t, 'cases', 3)
+  const file = `${HEADER},Pct,Discount (%)`
+  const rowSelect = noHeaderMap('Pct', (d) => { (d as Record<string, unknown>).discountHeader = 'Pct'; (d as Record<string, unknown>).rowSelect = { column: 'Discount (%)', keep: ['x'] } })
+  assert.match(refusal(file, rowSelect), /DISCOUNT_COLUMN_NOT_THE_DISCOUNT_HEADER/)
+  assert.match(refusal(file, noHeaderMap('Pct', (d) => { (d as Record<string, unknown>).discountHeader = 'Pct' })), /DISCOUNT_COLUMN_NOT_THE_DISCOUNT_HEADER/)
+  assert.match(refusal(file, noHeaderMap('Pct')), /DISCOUNT_COLUMN_NOT_THE_DISCOUNT_HEADER/)
+})
+
+// [mutation: discountHeader refused when the file has no discount-looking header]
+test('R4: discountHeader works for a file with no discount-looking header, and the normal map works', (t) => {
+  precondition(t, 'cases', 2)
+  assert.equal(refusal(`${HEADER},Pct`, noHeaderMap('Pct', (d) => { (d as Record<string, unknown>).discountHeader = 'Pct' })), '')
+  assert.equal(refusal(`${HEADER},Discount (%)`, noHeaderMap('Discount (%)')), '')
 })
