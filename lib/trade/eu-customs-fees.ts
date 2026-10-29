@@ -40,6 +40,7 @@
  *   MONEY      exact decimals, EUR, half-up to the cent. Conversion into another order currency is the
  *              caller's, as it is in wclc (amounts are EUR-denominated there too).
  */
+import { isAssignedIsoAlpha2 } from '@/lib/iso-3166-1-alpha2'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export const EU_27_COUNTRIES: ReadonlySet<string> = new Set([
@@ -241,7 +242,8 @@ export function computeEuCustomsFees(input: EuFeeInput): EuFeeResult {
   const country = (input.destinationCountry ?? '').trim().toUpperCase()
   // wclc: an EMPTY destination (a guest on the cart page, an express sheet before its address callback) is the cart
   // that was never priced, not a deliberate non-charge. Only a known non-EU country is "not applicable".
-  if (!/^[A-Z]{2}$/.test(country)) return none('unpriced', 'destination_unknown')
+  // Validated against the repo's assigned ISO 3166-1 set, so reserved and unassigned codes (ZZ, AA, EU, UN ...) are unknown, not "non-EU".
+  if (!isAssignedIsoAlpha2(country)) return none('unpriced', 'destination_unknown')
   if (!EU_27_COUNTRIES.has(country)) return none('not_applicable', 'not_eu_27')
   if (input.customer === 'business') return none('not_applicable', 'business_customer')
 

@@ -332,7 +332,7 @@ test('the FX band is [150, 153] inclusive of the top and the fallback applies be
 
 test('an empty / unreadable destination is UNPRICED (the cart never priced), a known non-EU country is not applicable', () => {
   const lines = [L('3926909790')]
-  for (const bad of ['', '   ', 'D', 'DEU', '1', '??']) {
+  for (const bad of ['', '   ', 'D', 'DEU', '1', '??', 'ZZ', 'AA', 'zz', 'EU', 'UN', 'XA']) {
     const r = run({ lines, destinationCountry: bad })
     assert.equal(r.regime, 'unpriced', `destination '${bad}'`)
     assert.equal(r.reason, 'destination_unknown')
