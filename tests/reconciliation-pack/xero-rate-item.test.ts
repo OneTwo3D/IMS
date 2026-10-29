@@ -501,3 +501,33 @@ test('THE DATE: Xero must hold the date the posting carried (the same UTC day), 
   // A posted timestamp is compared on its first ten characters, the UTC day the poster sends.
   assert.equal((await runXeroRateItem('R16', context({ invoices: [eur(1, 0.8)] }, { ims: { rows, posted: [postedRow(1, 'SALES_INVOICE', { date: '2026-09-10T23:59:59.000Z' })] } }).ctx)).outcome, 'pass')
 })
+
+// [mutation: a payment on a base document skipped whatever its rate / whatever its posting / a linked foreign posting not listed]
+test('A PAYMENT ON A BASE-CURRENCY DOCUMENT is out of scope only when it is also provably a base payment: a foreign linked posting or a rate other than 1 is a finding, never a skip', async () => {
+  const gbp = (n: number, rate: number | null) => paymentRow({ n, date: SEP, currency: 'GBP', rate })
+  // Linked: the poster sent a euro payment (its own currency and rate) and Xero reads the settled document as GBP. Not skipped: IMS_POSTING_UNREADABLE.
+  const linked = await runXeroRateCheck(context({ payments: [gbp(1, 0.8)] }, { ims: { rows: LATER, posted: [postedRow(1, 'INVOICE_PAYMENT', { currency: 'EUR', rate: '1.25' })] } }).ctx)
+  assert.deepEqual([linked.item.outcome, [...linked.item.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']])
+  assert.deepEqual([linked.summary?.postingUnreadable, linked.summary?.baseCurrency, linked.summary?.imsPosted], [1, 0, 1])
+  // The same with a rate of 1 or none on the Xero payment: the posted currency alone keeps it from being set aside.
+  for (const rate of [1, null]) {
+    const item = await runXeroRateItem('R16', context({ payments: [gbp(1, rate)] }, { ims: { rows: LATER, posted: [postedRow(1, 'BILL_PAYMENT', { currency: 'USD', rate: '1.3' })] } }).ctx)
+    assert.deepEqual([item.outcome, [...item.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE']], String(rate))
+  }
+  // A linked GBP payment (posted in GBP) at rate 1 is a base payment and is skipped.
+  const base = await runXeroRateCheck(context({ payments: [gbp(1, 1)] }, { ims: { rows: LATER, posted: [postedRow(1, 'INVOICE_PAYMENT', { currency: 'GBP', rate: '1' })] } }).ctx)
+  assert.equal(base.summary?.baseCurrency, 1)
+  assert.equal(base.summary?.postingUnreadable, 0)
+  // Unlinked: Xero's Payment carries no currency of its own, so a CurrencyRate other than 1 on a base document cannot be shown to be a base payment: listed as unreadable.
+  const cross = await runXeroRateCheck(context({ payments: [gbp(1, 0.85)] }).ctx)
+  assert.deepEqual([cross.item.outcome, [...cross.item.reasons].sort()], ['fail', ['DIFFERENCES', 'DOCUMENT_UNREADABLE']])
+  assert.deepEqual([cross.summary?.documentUnreadable, cross.summary?.baseCurrency], [1, 0])
+  // Unlinked at rate 1, or with none recorded: a base payment, skipped as before.
+  for (const rate of [1, null]) {
+    const item = await runXeroRateCheck(context({ payments: [gbp(1, rate)] }).ctx)
+    assert.equal(item.summary?.baseCurrency, 1, String(rate))
+    assert.equal(item.summary?.documentUnreadable, 0, String(rate))
+  }
+  // Documents carry their own currency: a GBP invoice at any rate is still out of scope.
+  assert.equal((await runXeroRateCheck(context({ invoices: [invoiceRow({ n: 1, date: SEP, currency: 'GBP', rate: 0.85 })] }).ctx)).summary?.baseCurrency, 1)
+})

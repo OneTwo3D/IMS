@@ -15,7 +15,7 @@
  *   moment it exists, not only once approved) and every payment (not DELETED) dated in the period, read as proven complete lists (xero-rate-source.ts).
  *   VOIDED and DELETED documents are read too and are OUT OF SCOPE by decision: a voided or deleted document is reversed or removed and books
  *   nothing, so its CurrencyRate is not a booked rate; they are counted in the summary (never silently dropped), as a deleted payment is. Any other
- *   status makes the read unreadable (inconclusive). A document in the organisation's base currency is OUT OF SCOPE: it is counted in
+ *   status makes the read unreadable (inconclusive). A document in the organisation's base currency is OUT OF SCOPE (a payment on a base document only when it is also provably a base payment: rate 1 or none, and no linked posting in another currency): it is counted in
  *   the summary and never listed. Xero's base currency and IMS's must both be GBP (the fx_rates table is read from GBP), else BASE_CURRENCY_NOT_GBP.
  *
  *   THE RATE RULE. A business date maps to the END of that day, UTC (endOfBusinessDateUtc, lib/currencies/fx-select.ts: the one date rule). The
@@ -243,8 +243,26 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
   }
   for (const document of documents) {
     if (document.date !== null && !periodSet.has(document.date.slice(0, 7))) { summary.outsidePeriod += 1; continue }
-    if (document.readable && document.currency === base) { summary.baseCurrency += 1; continue }
     const unreadable = (): void => { summary.documentUnreadable += 1; vendor.push({ key: [...baseKey(document), sku('document-unreadable')], value: '0' }) }
+    if (document.readable && document.currency === base) {
+      // A payment has no currency of its own in Xero: the item reads the settled document's. The poster, though, sends the payment payload's own currency and rate, so a payment on a
+      // base-currency document is NOT out of scope until both agree it is a base payment. A linked payment whose posting carried another currency is IMS_POSTING_UNREADABLE (the same
+      // closed reason as every currency disagreement between a posting and Xero), and a payment whose CurrencyRate is anything but 1 on a base document cannot be shown to be a base
+      // payment (a cross-currency payment): it is listed as unreadable, never set aside. A rate of 1, or none, on a base document is skipped as before.
+      if (document.kind === 'payment') {
+        const postedHere = postedById.get(document.id)
+        const foreignPosting = postedHere?.find((p) => p.currency !== null && p.currency.trim().toUpperCase() !== base)
+        if (postedHere !== undefined && foreignPosting !== undefined) {
+          summary.imsPosted += 1
+          summary.postingUnreadable += 1
+          vendor.push({ key: [...baseKey(document), sku('ims-posting-unreadable'), sku(foreignPosting.id), sku('currency-mismatch')], value: document.rate ?? '0' })
+          continue
+        }
+        if (document.rate !== null && !D(document.rate).eq(1)) { unreadable(); continue }
+      }
+      summary.baseCurrency += 1
+      continue
+    }
     if (!document.readable || document.rate === null) { unreadable(); continue }
     const xero = six(D(document.rate))
     // A Xero rate that rounds to nothing at six places cannot be compared: it is not a rate.
