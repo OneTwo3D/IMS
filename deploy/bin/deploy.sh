@@ -115,7 +115,7 @@ docker run --rm --network host --env-file "$IMS_ENV_FILE" "$(migrate_image "$sha
 # --- 4./5. start and health-check the new slot ----------------------------------------------------------------------------------
 fail_new_slot() {
   log "$1"
-  docker stop "$new_name" >/dev/null 2>&1 || true
+  stop_unless_serving "$new_slot" || true
   if [ "$contract" = 1 ]; then log "the active slot was stopped for the maintenance deploy and is NOT restarted: the schema may no longer fit it"; fi
   exit 1
 }

@@ -93,6 +93,16 @@ assert_not_serving() { # <slot>
   hdr="$(header_slot)" || { log "cannot tell whether $(slot_name "$1") is serving; not touching it"; return 1; }
   if [ "$hdr" = "$1" ]; then log "REFUSING to remove or stop $(slot_name "$1"): nginx is serving from it"; return 1; fi
 }
+# Stop a slot only after the RUNNING nginx confirms it is not serving from it. If it is (or nginx cannot be asked), leave it running
+# and say so loudly; rc 1. Used by every failure path, so a failed switch-back can never take production down.
+stop_unless_serving() { # <slot>
+  if assert_not_serving "$1"; then
+    docker stop "$(slot_name "$1")" >/dev/null 2>&1 || true
+    return 0
+  fi
+  log "MANUAL ATTENTION: nginx serves (or may serve) $(slot_name "$1"); it is left running. Check ${IMS_FRONT_URL}/login and ${IMS_UPSTREAM_FILE} by hand; both slots may be running."
+  return 1
+}
 slot_running() { [ "$(docker inspect --format '{{.State.Running}}' "$(slot_name "$1")" 2>/dev/null)" = true ]; }
 
 # --- images / containers --------------------------------------------------------------------------------------------------------
@@ -118,7 +128,7 @@ run_slot() { # <slot> <sha>
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" --restart unless-stopped --network host \
     --env-file "$IMS_ENV_FILE" \
-    -e "PORT=$(slot_port "$slot")" -e HOSTNAME=127.0.0.1 \
+    -e "PORT=$(slot_port "$slot")" -e HOSTNAME=127.0.0.1 -e PRODUCER_HOLD_ENFORCED_DESTINATIONS=all \
     -e IMS_SCHEDULER_CRONTAB_FILE="/host-cron.d/${IMS_CROND_NAME}" -e IMS_SCHEDULER_CRONTAB_FORMAT=cron.d \
     -v "${IMS_STATE_DIR}:/var/lib/onetwoinventory" \
     -v "${IMS_CROND_DIR}:/host-cron.d:ro" \
@@ -145,13 +155,23 @@ env_value() { # <NAME> -> the value of the LAST NAME=value line (docker --env-fi
   printf '%s\n' "${line#*=}"
 }
 
+producer_hold_value() { # the value, whitespace-trimmed
+  local v
+  v="$(env_value PRODUCER_HOLD_ENFORCED_DESTINATIONS)"
+  v="${v#"${v%%[![:space:]]*}"}"
+  printf '%s\n' "${v%"${v##*[![:space:]]}"}"
+}
 check_env_file() {
   [ -f "$IMS_ENV_FILE" ] || die "$IMS_ENV_FILE does not exist"
   local mode
   mode="$(stat -c %a "$IMS_ENV_FILE")"
   case "$mode" in 600|400) ;; *) die "$IMS_ENV_FILE has mode $mode; it holds secrets and must be 0600 (root)" ;; esac
-  [ -n "$(env_value PRODUCER_HOLD_ENFORCED_DESTINATIONS)" ] \
-    || die "$IMS_ENV_FILE does not set PRODUCER_HOLD_ENFORCED_DESTINATIONS (to a non-empty value, e.g. all). Refusing to start a release whose connector writers are not explicitly held or released."
+  # THE PRODUCER HOLD MUST COVER EVERY CONNECTOR. The producer seam takes a destination LIST, so a value such as `xero` would pass a
+  # "non-empty" test while Mintsoft and WooCommerce keep writing. Only exactly `all` (surrounding whitespace trimmed, case-sensitive)
+  # is accepted. There is deliberately NO override flag: releasing connectors belongs to the first-load plan's single enforced writer
+  # switch, which will change this gate when it lands. run_slot also passes the trimmed value explicitly, so the app reads `all`.
+  [ "$(producer_hold_value)" = all ] \
+    || die "$IMS_ENV_FILE must set PRODUCER_HOLD_ENFORCED_DESTINATIONS=all (found: '$(producer_hold_value)'). Every connector writer stays held until the first-load plan's writer switch replaces this gate; there is no override."
   [ -n "$(env_value DATABASE_URL)" ] || die "$IMS_ENV_FILE does not set DATABASE_URL"
 }
 

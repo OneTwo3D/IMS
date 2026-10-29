@@ -170,17 +170,44 @@ t_nginx_test_failure_restores_the_old_upstream() {
   no_temp_files
 }
 
-t_deploy_refuses_without_the_producer_hold_setting() {
-  seed_active blue "$A"; migs "$B" m1:expand
-  grep -v '^PRODUCER_HOLD' "$IMS_ENV_FILE" > "$T/e" && cat "$T/e" > "$IMS_ENV_FILE"
+set_hold() { grep -v '^PRODUCER_HOLD' "$IMS_ENV_FILE" > "$T/e"; cat "$T/e" > "$IMS_ENV_FILE"; [ "$#" = 0 ] || printf 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=%s\n' "$1" >> "$IMS_ENV_FILE"; }
+
+t_deploy_refuses_a_producer_hold_that_is_not_exactly_all() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  for v in xero 'mintsoft,woocommerce' 'all,xero' ALL 'none' ''; do
+    : > "$STUB/calls.log"; set_hold "$v"
+    deploy "$B"
+    [ "$rc" != 0 ] || fail "deploy accepted PRODUCER_HOLD_ENFORCED_DESTINATIONS='$v'"
+    log_lacks '^docker (pull|run)'
+    eq "$(container_running ims-blue)" 1 "nothing may change for '$v'"
+  done
+  : > "$STUB/calls.log"; set_hold   # missing entirely
   deploy "$B"
   [ "$rc" != 0 ] || fail "deploy ran without PRODUCER_HOLD_ENFORCED_DESTINATIONS"
-  grep -q PRODUCER_HOLD_ENFORCED_DESTINATIONS "$T/out" || fail "the message does not name the missing setting"
+  grep -q PRODUCER_HOLD_ENFORCED_DESTINATIONS "$T/out" || fail "the message does not name the setting"
   log_lacks '^docker (pull|run)'
-  echo 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=' >> "$IMS_ENV_FILE"
-  deploy "$B"
-  [ "$rc" != 0 ] || fail "deploy ran with an EMPTY PRODUCER_HOLD_ENFORCED_DESTINATIONS"
-  log_lacks '^docker (pull|run)'
+}
+
+t_deploy_accepts_all_and_trims_whitespace() {
+  for v in all '  all  '; do
+    seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1; : > "$STUB/calls.log"
+    echo "$A blue" > "$IMS_DEPLOY_DIR/current"; rm -f "$IMS_DEPLOY_DIR/previous"
+    set_hold "$v"; deploy "$B"
+    eq "$rc" 0 "deploy with hold '$v': $(tail -n 3 "$T/out")"
+    grep -E '^docker run -d' "$STUB/calls.log" | grep -qF -- '-e PRODUCER_HOLD_ENFORCED_DESTINATIONS=all' || fail "the slot is not started with the trimmed value 'all' for '$v'"
+    seed_active blue "$A"; rm -f "$STUB/containers/ims-green"
+  done
+}
+
+t_rollback_refuses_a_producer_hold_that_is_not_exactly_all() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  set_hold xero
+  rollback
+  [ "$rc" != 0 ] || fail "rollback accepted a partial hold"
+  log_lacks '^docker (start|run)'
+  set_hold ' all '
+  rollback
+  eq "$rc" 0 "rollback with a trimmed 'all'"
 }
 
 t_deploy_refuses_a_world_readable_env_file() {
@@ -310,6 +337,29 @@ PSQL
   done
   ! grep -q leaked "$T/psql.env" || fail "DATABASE_URL was passed on to psql"
   grep -q 'default_transaction_read_only' "$BIN/lib.sh" || fail "the read-only session option is gone"
+}
+
+t_deploy_does_not_stop_the_new_slot_when_the_switch_back_fails() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/front_fail"; echo 1 > "$STUB/reload_fail_after"      # the switch reloads once; the switch-back's reload fails
+  deploy "$B"
+  [ "$rc" != 0 ] || fail "deploy reported success"
+  grep -q 'MANUAL ATTENTION' "$T/out" || fail "no MANUAL ATTENTION message: $(tail -n 5 "$T/out")"
+  eq "$(container_running ims-green)" 1 "nginx still serves green, so it must keep running"
+  eq "$(container_running ims-blue)" 1 "the old slot must keep running too"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue" "state must only record what is true"
+  [ ! -e "$IMS_DEPLOY_DIR/previous" ] || fail "previous written"
+}
+
+t_rollback_does_not_stop_the_target_slot_when_the_switch_back_fails() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/front_fail"; echo 1 > "$STUB/reload_fail_after"
+  rollback
+  [ "$rc" != 0 ] || fail "rollback reported success"
+  grep -q 'MANUAL ATTENTION' "$T/out" || fail "no MANUAL ATTENTION message: $(tail -n 5 "$T/out")"
+  eq "$(container_running ims-blue)" 1 "nginx serves blue, so it must keep running"
+  eq "$(container_running ims-green)" 1
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green" "state must only record what is true"
 }
 
 t_rollback_refuses_across_a_non_expand_migration() {

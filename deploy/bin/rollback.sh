@@ -64,17 +64,17 @@ else
   run_slot "$prev_slot" "$prev_sha" || die "cannot start ${prev_name}"
 fi
 if ! wait_http_200 "http://127.0.0.1:${prev_port}/login" "$IMS_HEALTH_TIMEOUT_S"; then
-  docker stop "$prev_name" >/dev/null 2>&1 || true
+  stop_unless_serving "$prev_slot" || true
   die "${prev_name} did not become healthy; the current release keeps serving"
 fi
 if ! switch_upstream "$prev_port"; then
-  docker stop "$prev_name" >/dev/null 2>&1 || true
+  stop_unless_serving "$prev_slot" || true
   die "could not switch the nginx upstream; the current release keeps serving"
 fi
 if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S"; then
   log "nginx does not serve the rolled-back release; switching back to ${cur_slot}"
   switch_upstream "$(slot_port "$cur_slot")" || log "ALSO could not switch back; fix ${IMS_UPSTREAM_FILE} by hand"
-  docker stop "$prev_name" >/dev/null 2>&1 || true
+  stop_unless_serving "$prev_slot" || true
   die "${IMS_FRONT_URL}/login did not answer 200 after the switch"
 fi
 sleep "$IMS_DRAIN_S"

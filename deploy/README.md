@@ -292,8 +292,10 @@ lines. Both are rendered from the password manager by a separate step; the boots
 is not 0600/0400.
 
 **Connector writers are held by default.** `deploy.sh` and `rollback.sh` refuse to start a release unless `ims.env` sets
-`PRODUCER_HOLD_ENFORCED_DESTINATIONS` to a non-empty value (the template says `all`). Until the connectors are deliberately released,
-leave it at `all`.
+`PRODUCER_HOLD_ENFORCED_DESTINATIONS` to exactly `all` (surrounding whitespace trimmed, case-sensitive). A partial list such as `xero`
+would leave Mintsoft and WooCommerce writing, so it is refused too. There is deliberately NO override flag: releasing connectors belongs
+to the first-load plan's single enforced writer switch (a later task), which will change this gate. The slots are started with the
+trimmed value passed explicitly.
 
 **What `deploy.sh` does**, in order: pull both images; check the pending migrations; run the migrate image (host network, env file);
 start the new image in the idle slot; wait up to 120 s for `http://127.0.0.1:<slot port>/login` = 200 (otherwise stop the new slot, keep
@@ -315,6 +317,10 @@ when nothing is serving (nginx reports no slot and neither slot container is run
 release is serving or running means `DATABASE_URL` points at the wrong database, and the deploy refuses (status 3) unless the
 maintenance flags are given. `rollback.sh` refuses when any migration applied since `previous` lacks the marker; `--force-schema-mismatch`
 overrides.
+
+**Failures never take down the slot nginx serves.** Every failure path stops a slot only after the X-IMS-Slot header confirms nginx is
+not serving from it. If a switch-back fails and nginx still serves the new slot, both slots are left running, nothing is recorded in the
+state files that is not true, and the script exits non-zero with `MANUAL ATTENTION` in the log.
 
 **Rollback.** `rollback.sh` starts the previous slot (re-creating it from the recorded image if it was removed), health-checks it,
 switches nginx back, stops the current slot (kept) and swaps `current` and `previous`.
