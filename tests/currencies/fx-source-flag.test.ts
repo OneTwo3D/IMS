@@ -36,9 +36,13 @@ mock.module('@/lib/settings-store', {
 })
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
-    connectorFetch: async () => { calls.wcFetch += 1; return new Response(JSON.stringify({ ok: true, pushed: 3 }), { status: 200 }) },
+    connectorFetch: async () => { calls.wcFetch += 1; return wcReply() },
   },
 })
+
+let lockLost = false
+let wcReply = (): Response => new Response(JSON.stringify({ ok: true, pushed: 3 }), { status: 200 })
+const RETIRED_REPLY = () => new Response(JSON.stringify({ code: 'oti_fx_push_retired', message: 'retired', data: { status: 410 } }), { status: 410 })
 
 const realFetch = globalThis.fetch
 function installFrankfurter() {
@@ -134,12 +138,13 @@ test('the push to WooCommerce: flag OFF unchanged (it goes to the store); flag O
   // The push holds the FX table lock shared (a real-database arm is in tests/concurrency/fx-source-cutover.concurrent.test.ts); here the lock is a recording pass-through.
   const realLock = await import('@/lib/currencies/fx-table-lock')
   mock.module('@/lib/currencies/fx-table-lock', {
-    namedExports: { ...realLock, withFxTableHeldStill: async (work: (g: { lost: boolean; assertHeld: () => void }) => unknown) => { calls.lockHeld += 1; return work({ lost: false, assertHeld: () => {} }) } },
+    namedExports: { ...realLock, withFxTableHeldStill: async (work: (g: { lost: boolean; assertHeld: () => void }) => unknown) => { calls.lockHeld += 1; return work({ lost: lockLost, assertHeld: () => {} }) } },
   })
   const { pushFxRatesToWc, pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
   const { AELIA_PUSH_DISABLED_MESSAGE } = await import('@/lib/currencies/fx-source')
   const rates = [{ fromCurrency: 'GBP', toCurrency: 'EUR', rate: 1.19, fetchedAt: '2026-10-23T23:36:05Z' }]
 
+  wcReply = () => new Response(JSON.stringify({ ok: true, pushed: 3 }), { status: 200 })
   reset()
   const off = await pushFxRatesToWc(rates)
   assert.deepEqual(off, { supported: true, pushed: 3, errors: [] })
@@ -150,6 +155,48 @@ test('the push to WooCommerce: flag OFF unchanged (it goes to the store); flag O
   assert.deepEqual(await pushFxRatesToWc(rates), { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] })
   assert.deepEqual(await pushCurrentFxRatesToWc(), { supported: false, pushed: 0, errors: [AELIA_PUSH_DISABLED_MESSAGE] })
   assert.equal(calls.wcFetch, 0, 'nothing is sent while Aelia is the source')
+})
+
+test('the store refuses the push for good (plugin 1.3.0, 410 oti_fx_push_retired): terminal, no error, sent once, and a lost lock changes nothing', async () => {
+  // A push whose lock connection died after the check: the lock is gone (lost) but the POST still goes out; the STORE refuses it.
+  lockLost = true
+  const { pushFxRatesToWc, FX_PUSH_RETIRED_MESSAGE } = await import('@/lib/connectors/woocommerce/fx-rates')
+  const rates = [{ fromCurrency: 'GBP', toCurrency: 'EUR', rate: 1.19, fetchedAt: '2026-10-23T23:36:05Z' }]
+  reset()
+  wcReply = RETIRED_REPLY
+  try {
+    assert.deepEqual(await pushFxRatesToWc(rates), { supported: true, pushed: 0, errors: [], retired: true })
+    assert.equal(calls.wcFetch, 1, 'one request, no retry')
+    // a 403 with the same code is the same terminal answer
+    wcReply = () => new Response(JSON.stringify({ code: 'oti_fx_push_retired' }), { status: 403 })
+    assert.equal((await pushFxRatesToWc(rates)).retired, true)
+    // CONTROL: any other refusal is an ordinary error (so the detection can fail)
+    wcReply = () => new Response('Forbidden', { status: 403 })
+    const other = await pushFxRatesToWc(rates)
+    assert.equal(other.retired, undefined)
+    assert.equal(other.errors.length, 1)
+    wcReply = () => new Response('Gone', { status: 410 })
+    assert.equal((await pushFxRatesToWc(rates)).retired, undefined, 'a 410 without the code is not the retirement')
+  } finally {
+    lockLost = false
+    wcReply = () => new Response(JSON.stringify({ ok: true, pushed: 3 }), { status: 200 })
+  }
+  assert.match(FX_PUSH_RETIRED_MESSAGE, /retired/)
+})
+
+test('the retirement is logged as SKIPPED once per run (never FAILED, never a WARNING) by both callers', () => {
+  const shopping = readFileSync('lib/shopping.ts', 'utf8')
+  const fan = shopping.slice(shopping.indexOf('if (pushResult.retired)'), shopping.indexOf('if (pushResult.errors.length)'))
+  assert.match(fan, /status: 'SKIPPED'/)
+  assert.doesNotMatch(fan.replace(/\/\/.*$/gm, ''), /FAILED|WARNING|logActivity/)
+  const action = readFileSync('app/actions/wc-sync.ts', 'utf8')
+  const now = action.slice(action.indexOf('if (result.retired)'), action.indexOf('if (result.errors.length)', action.indexOf('if (result.retired)')))
+  assert.match(now, /status: 'SKIPPED'/)
+  assert.match(now, /supported: false/)
+  assert.doesNotMatch(now, /FAILED/)
+  // the retired check precedes the error and success branches in both
+  assert.ok(shopping.indexOf('if (pushResult.retired)') < shopping.indexOf("status: 'OK'"))
+  assert.ok(action.indexOf('if (result.retired)') < action.indexOf("status: 'OK'", action.indexOf('if (result.retired)')))
 })
 
 test('the other push entry points check the flag first (facade fan-out and the Push Now button), before the producer seam', () => {

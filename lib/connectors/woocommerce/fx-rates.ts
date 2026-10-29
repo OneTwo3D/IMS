@@ -32,6 +32,10 @@ import { FxTableBusyError, FxTableLockLostError, withFxTableHeldStill } from '@/
 const HELPER_PATH = '/wp-json/oti/v1/fx-rates'
 const PUSH_TIMEOUT_MS = 15_000
 
+/** Helper plugin 1.3.0 retired the receiver: it answers every push with HTTP 410 and this code and stores nothing. */
+export const FX_PUSH_RETIRED_CODE = 'oti_fx_push_retired'
+export const FX_PUSH_RETIRED_MESSAGE = 'The WooCommerce helper plugin has retired the exchange-rate push (Aelia is the master); nothing was stored and the push is not retried.'
+
 /**
  * Send the current rate set to the WC helper plugin. Safe to call when WC is
  * not configured — returns `{ supported: false }` rather than throwing, so the
@@ -87,6 +91,10 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
 
         if (!res.ok) {
           const text = await res.text().catch(() => '')
+          // TERMINAL: the store fences the push itself, whatever IMS's lock state (a lost lock connection can no longer let a stale push land). Not an error and not retryable.
+          if ((res.status === 410 || res.status === 403) && text.includes(FX_PUSH_RETIRED_CODE)) {
+            return { supported: true, pushed: 0, errors: [], retired: true }
+          }
           return {
             supported: true,
             pushed: 0,

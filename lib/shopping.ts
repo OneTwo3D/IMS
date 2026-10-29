@@ -472,6 +472,12 @@ export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResu
           const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
           const pushResult = await pushCurrentFxRatesToWc()
           if (!pushResult.supported) return { connector, supported: false, pushed: 0, errors: [] }
+          if (pushResult.retired) {
+            // The store retired the receiver (helper plugin 1.3.0): a terminal refusal, logged once per run as SKIPPED, not FAILED, no WARNING, never retried.
+            const { FX_PUSH_RETIRED_MESSAGE } = await import('@/lib/connectors/woocommerce/fx-rates')
+            await db.fxRatePushLog.create({ data: { connector, ratesCount: 0, status: 'SKIPPED', errorMessage: FX_PUSH_RETIRED_MESSAGE } })
+            return { connector, supported: false, pushed: 0, errors: [] }
+          }
           if (pushResult.errors.length) {
             await db.fxRatePushLog.create({
               data: { connector, ratesCount: pushResult.pushed, status: 'FAILED', errorMessage: pushResult.errors.join('; ').slice(0, 500) },

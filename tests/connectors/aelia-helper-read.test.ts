@@ -128,8 +128,21 @@ test('plugin source: the GET handler and its helper make NO write', () => {
     const body = phpFunction(name)
     assert.doesNotMatch(body, writes, `${name} has no write`)
   }
-  // CONTROL: the same pattern does see the writes of the push handler, so it can fail
-  assert.match(phpFunction('oti_handle_fx_push'), writes)
+  // CONTROL: the same pattern sees a write when there is one, so it can fail
+  assert.match("function x() { update_option('a', 1); }", writes)
+  assert.match("function x() { $wpdb->query('x'); }", writes)
+})
+
+test('plugin source: the FX-rate WRITE endpoint is retired: it refuses with 410 oti_fx_push_retired and has no write', () => {
+  const writes = /\b(update_option|add_option|delete_option|delete_transient|set_transient|wp_cache_\w+|update_post_meta|add_post_meta|wp_insert_\w+|wp_update_\w+|wp_remote_\w+|file_put_contents|fopen|unlink|curl_\w+|oti_invalidate_aelia_cache)\b|\$wpdb|->(insert|update|delete|query|replace)\(/
+  const body = phpFunction('oti_handle_fx_push')
+  assert.match(body, /new WP_Error\(\s*'oti_fx_push_retired'[\s\S]*?\['status' => 410\]/)
+  assert.doesNotMatch(body.replace(/\/\*\*[\s\S]*?\*\//g, ''), writes, 'the retired receiver writes nothing')
+  assert.doesNotMatch(body.replace(/\/\*\*[\s\S]*?\*\//g, ''), /get_json_params|get_body/, 'and does not even read the payload')
+  // the route is still signature-checked first, so an unsigned request is still a 401
+  assert.match(PHP, /register_rest_route\(OTI_FX_NAMESPACE, '\/fx-rates', \[\s*'methods'\s*=>\s*'POST',\s*'permission_callback'\s*=>\s*'oti_verify_fx_signature',\s*'callback'\s*=>\s*'oti_handle_fx_push'/)
+  // no function of the plugin updates an FX option any more (nothing is left that could store a pushed rate)
+  assert.doesNotMatch(PHP.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, ''), /update_option\(\s*OTI_FX_(OPTION|BASE_OPT|LASTPUSH_OPT)/)
 })
 
 // ------------------------------------------------------------------ the live option's shape: an epoch-INTEGER update time, and a base row without rate_markup / set_manually
@@ -195,6 +208,29 @@ test('plugin EXECUTED (php CLI): an epoch-integer update time becomes ISO UTC; t
   assert.equal((runHandler({ ...LIVE_OPTION, exchange_rates_last_update: 0 }) as { last_update: unknown }).last_update, null)
   // CONTROL: a different epoch gives a different time, so the assertion above can fail
   assert.equal((runHandler({ ...LIVE_OPTION, exchange_rates_last_update: 1793273766 }) as { last_update: string }).last_update, '2026-10-29T11:36:06Z')
+})
+
+test('plugin EXECUTED (php CLI): a signed push is refused with 410 oti_fx_push_retired and NOTHING is written (every write function is a trap)', { skip: PHP_BIN === null && 'php not installed' }, () => {
+  const start = PHP.indexOf("if (!function_exists('oti_handle_fx_push'))")
+  const end = PHP.indexOf("if (!function_exists('oti_aelia_last_update_iso'))")
+  assert.ok(start > 0 && end > start)
+  const traps = ['update_option', 'add_option', 'delete_option', 'set_transient', 'delete_transient', 'wp_cache_flush', 'wp_cache_delete', 'wp_cache_set', 'oti_invalidate_aelia_cache']
+  const script = `<?php
+class WP_REST_Request { function get_json_params() { return ['rates' => [['fromCurrency' => 'GBP', 'toCurrency' => 'EUR', 'rate' => 1.19]]]; } }
+class WP_REST_Response { public $data; function __construct($d) { $this->data = $d; } }
+class WP_Error { public $code; public $data; function __construct($c, $m = '', $d = null) { $this->code = $c; $this->data = $d; } }
+$writes = [];
+${traps.map((t) => `function ${t}(...$a) { global $writes; $writes[] = '${t}'; return true; }`).join('\n')}
+${PHP.slice(start, end)}
+$r = oti_handle_fx_push(new WP_REST_Request());
+echo json_encode(['error' => $r instanceof WP_Error ? $r->code : null, 'status' => $r instanceof WP_Error ? $r->data['status'] : null, 'writes' => $writes]);
+`
+  const res = spawnSync('php', ['-d', 'display_errors=stderr'], { input: script, encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  assert.deepEqual(JSON.parse(res.stdout), { error: 'oti_fx_push_retired', status: 410, writes: [] })
+  // CONTROL: the traps record, so the empty list above can fail
+  const control = spawnSync('php', [], { input: `<?php $writes = []; function update_option(...$a) { global $writes; $writes[] = 'update_option'; } update_option('x', 1); echo json_encode($writes);`, encoding: 'utf8' })
+  assert.equal(control.stdout, '["update_option"]')
 })
 
 test('plugin EXECUTED, end to end into the TS parser: the live-shaped answer parses with no refusal and no base entry', { skip: PHP_BIN === null && 'php not installed' }, async () => {

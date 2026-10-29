@@ -1008,6 +1008,11 @@ export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: 
     if (!result.supported) {
       return { success: false, pushed: 0, supported: false, error: result.errors[0] ?? 'FX rate push not enabled or WooCommerce not configured' }
     }
+    if (result.retired) {
+      const { FX_PUSH_RETIRED_MESSAGE } = await import('@/lib/connectors/woocommerce/fx-rates')
+      await db.fxRatePushLog.create({ data: { connector: 'woocommerce', ratesCount: 0, status: 'SKIPPED', errorMessage: FX_PUSH_RETIRED_MESSAGE } })
+      return { success: false, pushed: 0, supported: false, error: FX_PUSH_RETIRED_MESSAGE }
+    }
     if (result.errors.length) {
       await db.fxRatePushLog.create({
         data: {

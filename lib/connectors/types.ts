@@ -92,6 +92,8 @@ export type FxRatePushResult = {
   supported: boolean
   pushed: number
   errors: string[]
+  /** The store refused the push for good (helper plugin 1.3.0 retired the receiver): terminal, not a failure, never retried. */
+  retired?: true
 }
 
 export interface ShoppingConnector {

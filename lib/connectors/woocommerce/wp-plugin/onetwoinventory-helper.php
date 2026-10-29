@@ -15,8 +15,8 @@
  *   1. Invoice Buttons — adds invoice PDF / accounting links to My Account
  *      orders and the wp-admin order screen, reading order meta written by
  *      One Two Inventory.
- *   2. FX Rate Receiver — exposes a signed REST endpoint POST /wp-json/oti/v1/fx-rates
- *      that One Two Inventory pushes daily ECB rates to. Stored rates are
+ *   2. FX Rate Receiver — RETIRED in 1.3.0: POST /wp-json/oti/v1/fx-rates refuses every push (410 oti_fx_push_retired)
+ *      and writes nothing, because Aelia is the master. Rates stored by earlier versions are
  *      surfaced to the Aelia Currency Switcher (and other plugins via filter)
  *      so the storefront converts at the same rate as IMS and Xero.
  *      A second, GET-only endpoint GET /wp-json/oti/v1/aelia-rates READS Aelia's own
@@ -340,44 +340,19 @@ if (!function_exists('oti_verify_fx_signature')) {
 }
 
 if (!function_exists('oti_handle_fx_push')) {
-    function oti_handle_fx_push(WP_REST_Request $request): WP_REST_Response
+    /**
+     * RETIRED (plugin 1.3.0). Aelia is the exchange-rate master and IMS no longer pushes rates, so this receiver refuses EVERY write:
+     * HTTP 410 with the code `oti_fx_push_retired`, and it writes nothing (no Aelia option, no `oti_fx_*` option, no cache flush).
+     * The signature is still checked first (permission_callback), so an unsigned request is still a 401. The refusal fences any IMS
+     * push, whatever state its client-side lock is in.
+     */
+    function oti_handle_fx_push(WP_REST_Request $request)
     {
-        $params = $request->get_json_params();
-        $rates  = isset($params['rates']) && is_array($params['rates']) ? $params['rates'] : [];
-
-        $clean   = [];
-        $base    = '';
-        $skipped = 0;
-
-        foreach ($rates as $row) {
-            $from = isset($row['fromCurrency']) ? strtoupper((string) $row['fromCurrency']) : '';
-            $to   = isset($row['toCurrency'])   ? strtoupper((string) $row['toCurrency'])   : '';
-            $rate = isset($row['rate']) ? (float) $row['rate'] : 0.0;
-            if ($from === '' || $to === '' || !is_finite($rate) || $rate <= 0) {
-                $skipped++;
-                continue;
-            }
-            // Last write wins per `to` currency.
-            $clean[$to] = [
-                'from'      => $from,
-                'rate'      => $rate,
-                'fetchedAt' => isset($row['fetchedAt']) ? (string) $row['fetchedAt'] : gmdate('c'),
-            ];
-            if ($base === '') $base = $from;
-        }
-
-        update_option(OTI_FX_OPTION, $clean, /* autoload */ false);
-        if ($base !== '') update_option(OTI_FX_BASE_OPT, $base, false);
-        update_option(OTI_FX_LASTPUSH_OPT, gmdate('c'), false);
-
-        // Best-effort cache invalidation for Aelia Currency Switcher.
-        oti_invalidate_aelia_cache();
-
-        return new WP_REST_Response([
-            'ok'      => true,
-            'pushed'  => count($clean),
-            'skipped' => $skipped,
-        ]);
+        return new WP_Error(
+            'oti_fx_push_retired',
+            'The exchange-rate push is retired: Aelia is the exchange-rate master. Nothing was stored.',
+            ['status' => 410]
+        );
     }
 }
 
