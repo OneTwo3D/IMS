@@ -45,6 +45,11 @@ export type PushTotalsInput = {
   /** How many lines contribute to withheldGoodsGross (each adds a stored net and a stored VAT to the expected side). */
   withheldLineCount?: number
   /**
+   * Lines left out of the payload whose stored NET only is withheld (a mirrored fee line: its VAT is inside the
+   * payload's total VAT, so only the net leaves the expected side). Each adds ONE independently rounded operand.
+   */
+  withheldNetOnlyLineCount?: number
+  /**
    * Store credit applied to the order, GROSS. A payment, so the order total is LOWER than the goods the
    * payload states by exactly this: the payload carries the full goods value.
    */
@@ -129,6 +134,7 @@ export function reconcilePushTotals(input: PushTotalsInput): PushTotalsVerdict {
     + 1 // totalVat
     + 1 // order total
     + 2 * (input.withheldLineCount ?? 0)
+    + (input.withheldNetOnlyLineCount ?? 0)
   const bound = roundingBoundMinorUnits(operands)
   const driftMinor = drift.abs().div(unit)
 
