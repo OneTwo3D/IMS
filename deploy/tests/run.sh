@@ -29,7 +29,7 @@ setup() {
   mkdir -p "$T/log"; export IMS_CRON_LOG_DIR="$T/log"
   mkdir -p "$STUB/containers" "$STUB/migs" "$STUB/unhealthy" "$T/etc" "$T/state" "$T/deploy" "$T/nginx" "$T/crond"
   : > "$STUB/calls.log"
-  printf 'DATABASE_URL=postgresql://u:${PW}@127.0.0.1:5432/ims\nCRON_SECRET=x\nPRODUCER_HOLD_ENFORCED_DESTINATIONS=all\n' > "$T/etc/ims.env"
+  printf 'DATABASE_URL=postgresql://u:%s@127.0.0.1:5432/ims\nCRON_SECRET=x\nPRODUCER_HOLD_ENFORCED_DESTINATIONS=all\n' "$PW" > "$T/etc/ims.env"
   chmod 600 "$T/etc/ims.env"; echo 'CRON_SECRET=x' > "$T/etc/cron.env"; chmod 600 "$T/etc/cron.env"
   export IMS_ENV_FILE="$T/etc/ims.env" IMS_CRON_ENV_FILE="$T/etc/cron.env" IMS_STATE_DIR="$T/state" IMS_DEPLOY_DIR="$T/deploy" \
          IMS_UPSTREAM_FILE="$T/nginx/ims-upstream.conf" IMS_CROND_DIR="$T/crond" IMS_DEPLOY_NO_ROOT_CHECK=1 IMS_HC_BIN="$T/none" \
@@ -525,6 +525,9 @@ PSQL
   done
   ! grep -q leaked "$T/psql.env" || fail "DATABASE_URL was passed on to psql"
   grep -q 'default_transaction_read_only' "$BIN/lib.sh" || fail "the read-only session option is gone"
+  # every reference to the migrations table is schema-qualified: none may appear without public. in front of it
+  ! sed 's/public\."_prisma_migrations"//g' "$T/psql.argv" | grep -q '_prisma_migrations' || fail "an unqualified _prisma_migrations reference: $(cat "$T/psql.argv")"
+  grep -q 'public."_prisma_migrations"' "$T/psql.argv" || fail "no qualified reference was recorded (the check proves nothing)"
 }
 
 t_deploy_does_not_stop_the_new_slot_when_the_switch_back_fails() {
@@ -874,6 +877,28 @@ t_database_url_must_use_the_public_schema() {
     deploy "$B"
     eq "$rc" 0 "deploy with DATABASE_URL query '$q': $(tail -n 3 "$T/out")"
   done
+}
+
+t_precheck_session_pins_search_path_and_migrate_targets_public() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  deploy "$B"
+  eq "$rc" 0 "deploy"
+  grep -E '^docker run .*--entrypoint node' "$STUB/calls.log" | grep -q 'search_path=public' || fail "the precheck session does not pin search_path=public"
+  grep -qF 'PGOPTIONS=-c default_transaction_read_only=on -c search_path=public' "$STUB/calls.log" || fail "PGOPTIONS lacks the read-only and search_path settings"
+  eq "$(cat "$STUB/migrate_database_url")" "postgresql://u:${PW}@127.0.0.1:5432/ims?schema=public" "the migrate container's DATABASE_URL"
+  ! grep -E '^docker run .*(MIGRATE|ims-migrate)' "$STUB/calls.log" | grep -q "$PW" || fail "the URL is on the migrate command line"
+}
+
+t_migrate_database_url_keeps_other_parameters_and_adds_schema_public_once() {
+  rc=0; out="$( . "$BIN/lib.sh"
+    for u in 'postgresql://h/d' 'postgresql://h/d?sslmode=require' 'postgresql://h/d?schema=public' 'postgresql://h/d?schema=public&sslmode=require'; do
+      printf 'DATABASE_URL=%s\n' "$u" > "$IMS_ENV_FILE"; migrate_database_url
+    done )" || rc=$?
+  eq "$rc" 0 "function"
+  eq "$out" "postgresql://h/d?schema=public
+postgresql://h/d?sslmode=require&schema=public
+postgresql://h/d?schema=public
+postgresql://h/d?schema=public&sslmode=require"
 }
 
 # ---------------------------------------------------------------------------------------------------------------------------------

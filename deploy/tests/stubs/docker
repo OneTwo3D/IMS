@@ -54,7 +54,7 @@ case "${1:-}" in
       [ ! -e "$STUB/render_fail" ] || exit 1
       cat "$STUB/cronout"
     else
-      echo "MIGRATE $sha" >> "$STUB/calls.log"
+      echo "MIGRATE $sha" >> "$STUB/calls.log"; printf "%s" "${DATABASE_URL:-}" > "$STUB/migrate_database_url"
       [ ! -e "$STUB/migrate_fail" ]
     fi ;;
   *) exit 0 ;;

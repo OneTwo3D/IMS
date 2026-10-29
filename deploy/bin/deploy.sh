@@ -121,7 +121,7 @@ if [ "$contract" = 1 ]; then
   done
 fi
 log "running $(migrate_image "$sha")"
-docker run --rm --network host --env-file "$IMS_ENV_FILE" "$(migrate_image "$sha")" || die "prisma migrate deploy failed (the ${old_slot} release was not touched unless this is a maintenance deploy)"
+run_migrate "$sha" || die "prisma migrate deploy failed (the ${old_slot} release was not touched unless this is a maintenance deploy)"
 
 # --- 4./5. start and health-check the new slot ----------------------------------------------------------------------------------
 fail_new_slot() {

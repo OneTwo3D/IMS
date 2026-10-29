@@ -319,12 +319,32 @@ const env = { ...process.env, PGHOST: u.hostname.replace(/^\[|\]$/g, ""), PGPORT
 const ssl = u.searchParams.get("sslmode"); if (ssl) env.PGSSLMODE = ssl;
 delete env.DATABASE_URL;
 const q = (sql) => execFileSync("psql", ["-X", "-Atq", "-v", "ON_ERROR_STOP=1", "-c", sql], { env, encoding: "utf8" }).trim();
-if (q("select to_regclass($$public._prisma_migrations$$) is not null") === "t") {
-  const rows = q("select migration_name from _prisma_migrations where finished_at is not null and rolled_back_at is null order by migration_name");
+// Every reference is schema-qualified, and the session also runs with search_path=public (PGOPTIONS, set in applied_migrations), so a
+// role-level or database-level search_path cannot send the read to another schema.
+if (q("select to_regclass($$public.\"_prisma_migrations\"$$) is not null") === "t") {
+  const rows = q("select migration_name from public.\"_prisma_migrations\" where finished_at is not null and rolled_back_at is null order by migration_name");
   if (rows) console.log(rows);
 }'
+# The DATABASE_URL for the migrate container only: schema=public made explicit. Without a `?schema=` Prisma's default for PostgreSQL is
+# `public` (the Prisma datasource documentation; lib/db/index.ts relies on the same default), but that is not asserted here to hold
+# regardless of a role's search_path, so the migrate container is told. check_database_url_schema has already refused any other schema=
+# or options=, so only the absent / public cases reach this point.
+migrate_database_url() {
+  local url
+  url="$(env_value DATABASE_URL)"
+  case "$url" in
+    *[?\&]schema=public|*[?\&]schema=public\&*) printf '%s\n' "$url" ;;
+    *\?*) printf '%s&schema=public\n' "$url" ;;
+    *) printf '%s?schema=public\n' "$url" ;;
+  esac
+}
+# Runs the migrate image. The URL reaches the container through the environment of this command ONLY (`-e DATABASE_URL` copies it by
+# name), never on a command line.
+run_migrate() { # <sha>
+  DATABASE_URL="$(migrate_database_url)" docker run --rm --network host --env-file "$IMS_ENV_FILE" -e DATABASE_URL "$(migrate_image "$1")"
+}
 applied_migrations() { # <sha of an image that carries psql and node>
-  docker run --rm --network host --env-file "$IMS_ENV_FILE" -e PGOPTIONS='-c default_transaction_read_only=on' \
+  docker run --rm --network host --env-file "$IMS_ENV_FILE" -e PGOPTIONS='-c default_transaction_read_only=on -c search_path=public' \
     --entrypoint node "$(runtime_image "$1")" -e "$APPLIED_JS"
 }
 
