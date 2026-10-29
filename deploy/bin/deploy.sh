@@ -22,7 +22,8 @@
 # Writers are held off by default: the release is not started unless the env file sets PRODUCER_HOLD_ENFORCED_DESTINATIONS.
 #
 # Exit codes: 0 deployed; 1 failed with the old release still serving (or, in maintenance mode, stopped); 2 usage;
-# 3 refused by the pre-migration check; 4 deployed, but the host crontab could not be re-rendered.
+# 3 refused by the pre-migration check; 4 deployed, but the host crontab could not be re-rendered;
+# 5 deployed and recorded, but the previous slot is still running for draining nginx workers: run cleanup-old-slot.sh later.
 set -euo pipefail
 
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
@@ -63,6 +64,7 @@ if [ "$old_slot" != none ]; then
   if [ "${recorded#* }" = "$old_slot" ]; then old_sha="${recorded%% *}"; else old_sha="$(container_image_sha "$(slot_name "$old_slot")")"; fi
   [ -n "$old_sha" ] || die "nginx serves the ${old_slot} slot but its release cannot be determined (no matching deploy/current, no container); fix deploy/current and retry"
 fi
+assert_no_draining_workers || die "an earlier switch is still draining; nothing was changed"
 log "deploying ${sha}: active slot ${old_slot}${old_sha:+ (${old_sha})}, new release goes to ${new_slot}"
 
 # --- 1. images ------------------------------------------------------------------------------------------------------------------
@@ -150,10 +152,15 @@ write_atomic "${IMS_DEPLOY_DIR}/current" "${sha} ${new_slot}"
 log "deployed ${sha} to ${new_slot}"
 
 # --- 9. previous slot: drain, stop, keep --------------------------------------------------------------------------------------
+cleanup_rc=0
 if [ "$old_slot" != none ]; then
-  drain_and_stop_slot "$old_slot" || die "nginx still serves $(slot_name "$old_slot") after the switch; it is left running (deploy/current already names ${sha})"
+  drain_and_stop_slot "$old_slot" || cleanup_rc=$?
+  if [ "$cleanup_rc" != 0 ] && [ "$cleanup_rc" != "$EXIT_CLEANUP_PENDING" ]; then
+    die "nginx still serves $(slot_name "$old_slot") after the switch; it is left running (deploy/current already names ${sha})"
+  fi
 fi
 
 # --- 10. host cron --------------------------------------------------------------------------------------------------------------
 install_host_cron "$sha" || { DIE_RC=4 die "deployed, but the host crontab could not be re-rendered (the ims-cron-render timer retries every 5 minutes)"; }
+[ "$cleanup_rc" = 0 ] || exit "$cleanup_rc"
 log "done"

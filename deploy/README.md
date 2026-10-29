@@ -332,6 +332,14 @@ overrides.
 not serving from it. If a switch-back fails and nginx still serves the new slot, both slots are left running, nothing is recorded in the
 state files that is not true, and the script exits non-zero with `MANUAL ATTENTION` in the log.
 
+**Draining and exit code 5.** After the switch the old slot is stopped only when no nginx worker is left shutting down. If workers are
+still draining when the bound expires (`proxy_read_timeout` bounds the gap between reads, not a whole streamed download), the old slot is
+NOT stopped: `deploy.sh` and `rollback.sh` log "deploy complete, cleanup pending", finish (state recorded, host cron installed) and exit
+with status **5** ("deployed, cleanup incomplete"). Run `cleanup-old-slot.sh` later: it re-checks for draining workers and stops the
+non-served slot only when none remain. Until then a further deploy or rollback is refused up front, and `run_slot` itself refuses to
+replace a slot while workers drain. Exit codes of `deploy.sh`: 0 deployed; 1 failed; 2 usage; 3 refused by the pre-migration check;
+4 deployed but the crontab could not be re-rendered; 5 deployed, old slot kept running for draining workers.
+
 **Records.** `previous` then `current` are written as soon as nginx is verified serving the new slot (the X-IMS-Slot header names it),
 BEFORE the drain wait, so a crash while draining cannot leave them naming the old release. If they still disagree with what nginx
 serves (an older interrupted run), `rollback.sh` trusts the served slot when its container is running and its image tag is a full sha,

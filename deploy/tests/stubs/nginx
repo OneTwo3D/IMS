@@ -10,7 +10,7 @@ case "$*" in
   -T) cat "$STUB/nginx_T" 2>/dev/null || true ;;       # the rendered configuration, if the test provides one
   "-s reload")
     n="$(grep -c '^nginx reload' "$STUB/calls.log" || true)"
-    echo "nginx reload" >> "$STUB/calls.log"
+    echo "nginx reload" >> "$STUB/calls.log"; touch "$STUB/reloaded"
     # $STUB/reload_fail_after holds N: the first N reloads work, every later one fails and does not load the file.
     if [ -e "$STUB/reload_fail_after" ] && [ "$n" -ge "$(cat "$STUB/reload_fail_after")" ]; then exit 1; fi
     cp "$IMS_UPSTREAM_FILE" "$STUB/loaded" ;;   # the "loaded config" is the file as of the last reload

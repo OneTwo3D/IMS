@@ -133,7 +133,7 @@ if [ "$need_swap" = 1 ]; then
 fi
 
 # --- 4. deploy scripts and the cron-render timer --------------------------------------------------------------------------------
-for f in lib.sh deploy.sh rollback.sh cron-render.sh; do put "$here/$f" "$R/usr/local/lib/ims-deploy/$f" 0755; done
+for f in lib.sh deploy.sh rollback.sh cron-render.sh cleanup-old-slot.sh; do put "$here/$f" "$R/usr/local/lib/ims-deploy/$f" 0755; done
 unit_changed=0
 for f in ims-cron-render.service ims-cron-render.timer; do
   if [ ! -f "$R/etc/systemd/system/$f" ] || ! cmp -s "$repo_deploy/host/$f" "$R/etc/systemd/system/$f"; then unit_changed=1; fi

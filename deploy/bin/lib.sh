@@ -129,8 +129,14 @@ drain_bound_s() { # the rendered config's proxy_read_timeout (largest value, sec
   [ "$best" -gt 0 ] || best=600
   printf '%s\n' $((best + 15))
 }
-# Wait for the old workers to finish, then stop the old slot (kept, not removed). The new slot is already live, so running out of time
-# is a warning, not a failure.
+# Exit code of deploy.sh / rollback.sh / cleanup-old-slot.sh when the release is live and recorded but the old slot could not be stopped
+# yet because nginx workers are still draining connections to it.
+EXIT_CLEANUP_PENDING=5
+
+# Wait for the old workers to finish, then stop the old slot (kept, not removed). The new slot is already live and recorded. If workers
+# are STILL draining when the bound expires, the old slot is NOT stopped: proxy_read_timeout bounds the gap between reads, not a whole
+# (for example streamed) response, so killing it could cut a live download. rc 0 stopped; rc 1 nginx still serves it (refused);
+# rc 5 cleanup pending (left running; run cleanup-old-slot.sh later).
 drain_and_stop_slot() { # <slot>
   local slot="$1" bound waited=0 still
   bound="$(drain_bound_s)"
@@ -138,9 +144,10 @@ drain_and_stop_slot() { # <slot>
     still="$(draining_workers)"
     [ -n "$still" ] || break
     if [ "$waited" -ge "$bound" ]; then
-      log "WARNING: nginx workers are still draining after ${bound}s; stopping $(slot_name "$slot") anyway:"
+      log "deploy complete, cleanup pending: old slot $(slot_name "$slot") kept running for $(printf '%s\n' "$still" | grep -c .) draining nginx worker(s) after ${bound}s:"
       sed 's/^/  /' <<< "$still" >&2
-      break
+      log "stop it later with: $(dirname "${BASH_SOURCE[0]}")/cleanup-old-slot.sh   (it re-checks for draining workers first)"
+      return "$EXIT_CLEANUP_PENDING"
     fi
     sleep "$IMS_DRAIN_POLL_S"
     waited=$((waited + IMS_DRAIN_POLL_S))
@@ -148,6 +155,16 @@ drain_and_stop_slot() { # <slot>
   # Only stop the slot once the RUNNING nginx reports it is not serving from it.
   assert_not_serving "$slot" || return 1
   docker stop -t 30 "$(slot_name "$slot")" >/dev/null 2>&1 || log "warning: could not stop $(slot_name "$slot")"
+}
+# Refuse to touch the idle slot while nginx workers may still be using it (an earlier drain ran out of time). rc 1 = refused.
+assert_no_draining_workers() {
+  local still
+  still="$(draining_workers)"
+  [ -z "$still" ] && return 0
+  log "REFUSING: nginx workers are still draining connections to the previous slot, which may be the slot this run would replace:"
+  sed 's/^/  /' <<< "$still" >&2
+  log "wait for them to finish and run $(dirname "${BASH_SOURCE[0]}")/cleanup-old-slot.sh, then retry"
+  return 1
 }
 # deploy/current can lag the truth after an interrupted run. Reconcile it against the slot nginx actually serves: if current names the
 # OTHER slot, the served slot's container is running and its image tag is a full sha, trust the served slot (the stale current becomes
@@ -199,6 +216,7 @@ run_slot() { # <slot> <sha>
   local slot="$1" sha="$2" name
   name="$(slot_name "$slot")"
   assert_not_serving "$slot" || return 1
+  assert_no_draining_workers || return 1
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" --restart unless-stopped --network host \
     --env-file "$IMS_ENV_FILE" \

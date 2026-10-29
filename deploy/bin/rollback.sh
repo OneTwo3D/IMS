@@ -29,6 +29,7 @@ check_env_file
 take_lock 0
 
 active="$(serving_slot)" || die "cannot determine which slot nginx serves; nothing was changed"
+assert_no_draining_workers || die "an earlier switch is still draining; nothing was changed"
 reconcile_state "$active" || die "deploy/current does not match what nginx serves and cannot be reconciled; nothing was changed"
 cur="$(read_state current)" prev="$(read_state previous)"
 [ -n "$cur" ] && [ -n "$prev" ] || die "deploy/current and deploy/previous must both exist; there is nothing to roll back to"
@@ -84,5 +85,10 @@ fi
 write_atomic "${IMS_DEPLOY_DIR}/previous" "${cur_sha} ${cur_slot}"
 write_atomic "${IMS_DEPLOY_DIR}/current" "${prev_sha} ${prev_slot}"
 log "rolled back to ${prev_sha} (${prev_slot})"
-drain_and_stop_slot "$cur_slot" || die "nginx still serves ${cur_name} after the switch; it is left running (deploy/current already names ${prev_sha})"
+cleanup_rc=0
+drain_and_stop_slot "$cur_slot" || cleanup_rc=$?
+if [ "$cleanup_rc" != 0 ] && [ "$cleanup_rc" != "$EXIT_CLEANUP_PENDING" ]; then
+  die "nginx still serves ${cur_name} after the switch; it is left running (deploy/current already names ${prev_sha})"
+fi
 install_host_cron "$prev_sha" || { DIE_RC=4 die "rolled back, but the host crontab could not be re-rendered (the ims-cron-render timer retries every 5 minutes)"; }
+[ "$cleanup_rc" = 0 ] || exit "$cleanup_rc"   # 5: rolled back and recorded, old slot kept for draining workers (cleanup-old-slot.sh)

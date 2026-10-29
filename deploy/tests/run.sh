@@ -296,15 +296,77 @@ t_deploy_stops_immediately_when_no_worker_is_draining() {
   before '^ps clear' '^docker stop -t 30 ims-blue'
 }
 
-t_deploy_stops_anyway_after_the_bound_and_says_so() {
+t_deploy_keeps_the_old_slot_when_workers_never_exit() {
   seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
   touch "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=10
   deploy "$B"
-  eq "$rc" 0 "an expired drain must not fail the deploy: $(tail -n 3 "$T/out")"
-  grep -q 'still draining after 10s' "$T/out" || fail "no warning: $(tail -n 5 "$T/out")"
-  grep -q 'shutting down' "$T/out" || fail "the draining workers are not listed"
+  eq "$rc" 5 "deployed, cleanup pending: $(tail -n 4 "$T/out")"
+  grep -q 'deploy complete, cleanup pending: old slot ims-blue kept running' "$T/out" || fail "no cleanup-pending message: $(tail -n 5 "$T/out")"
+  grep -q 'cleanup-old-slot.sh' "$T/out" || fail "the message does not point at the cleanup command"
   eq "$(grep -c '^ps draining' "$STUB/calls.log")" 6 "polls until the bound (0,2,...,10)"
+  log_lacks '^docker stop -t 30'
+  eq "$(container_running ims-blue)" 1 "the old slot must NOT be stopped while workers drain"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green" "the release is live and recorded"
+  eq "$(cat "$IMS_DEPLOY_DIR/previous")" "$A blue"
+  [ -f "$IMS_CROND_DIR/onetwo3d-ims" ] || fail "the host crontab was not installed for the live release"
+}
+
+t_cleanup_stops_the_idle_slot_once_no_worker_drains() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=4
+  deploy "$B"; eq "$rc" 5 "setup deploy"
+  rc=0; "$BIN/cleanup-old-slot.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 5 "cleanup while a worker still drains"
+  eq "$(container_running ims-blue)" 1 "must not be stopped while workers drain"
+  log_lacks '^docker stop -t 30'
+  rm -f "$STUB/ps_drain_forever"
+  rc=0; "$BIN/cleanup-old-slot.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "cleanup after the workers are gone: $(tail -n 3 "$T/out")"
   log_has '^docker stop -t 30 ims-blue'
+  eq "$(container_running ims-blue)" 0
+  eq "$(container_running ims-green)" 1 "the served slot must keep running"
+  rc=0; "$BIN/cleanup-old-slot.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "a second cleanup has nothing to do"
+}
+
+t_next_deploy_is_refused_while_workers_still_drain() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; migs "$C" m1:expand; applied m1
+  touch "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=4
+  deploy "$B"; eq "$rc" 5 "setup deploy"
+  : > "$STUB/calls.log"
+  deploy "$C"
+  [ "$rc" != 0 ] || fail "a second deploy ran while workers still use the idle slot"
+  grep -q 'cleanup-old-slot.sh' "$T/out" || fail "the refusal does not point at the cleanup command"
+  log_lacks '^(docker (rm|pull|run)|MIGRATE|RUN-SLOT)'
+  eq "$(container_running ims-blue)" 1
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
+}
+
+t_run_slot_itself_refuses_to_replace_a_slot_while_workers_drain() {
+  seed_active green "$B"; printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=3101\n' "$A" > "$STUB/containers/ims-blue"
+  touch "$STUB/reloaded" "$STUB/ps_drain_forever"
+  rc=0; ( . "$BIN/lib.sh"; run_slot blue "$C" ) > "$T/out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "run_slot replaced a slot that workers may still use"
+  log_lacks '^docker rm'
+}
+
+t_rollback_keeps_the_slot_when_workers_never_exit() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=10
+  rollback
+  eq "$rc" 5 "rolled back, cleanup pending: $(tail -n 4 "$T/out")"
+  eq "$(container_running ims-green)" 1 "the slot being left must not be stopped while workers drain"
+  log_lacks '^docker stop -t 30'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue"
+}
+
+t_rollback_is_refused_while_workers_still_drain() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/reloaded" "$STUB/ps_drain_forever"
+  rollback
+  [ "$rc" != 0 ] || fail "rollback ran while workers drain"
+  grep -q 'cleanup-old-slot.sh' "$T/out" || fail "no pointer to the cleanup command"
+  log_lacks '^(docker (rm|run)|RUN-SLOT)'
   eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
 }
 
@@ -313,7 +375,7 @@ t_drain_bound_is_the_sites_proxy_read_timeout_plus_a_margin() {
   printf 'server {\n  location / {\n    proxy_read_timeout 90s;\n  }\n}\n' > "$STUB/nginx_T"
   touch "$STUB/ps_drain_forever"; export IMS_DRAIN_POLL_S=15
   deploy "$B"
-  eq "$rc" 0 "deploy"
+  eq "$rc" 5 "deploy (cleanup pending)"
   eq "$(grep -c '^ps draining' "$STUB/calls.log")" 8 "bound 90+15 at a 15 s poll (0,15,...,105)"
 }
 
@@ -321,7 +383,7 @@ t_drain_bound_falls_back_to_600_plus_a_margin() {
   seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
   touch "$STUB/ps_drain_forever"; export IMS_DRAIN_POLL_S=205      # no nginx -T output: 600 + 15 = 615
   deploy "$B"
-  eq "$rc" 0 "deploy"
+  eq "$rc" 5 "deploy (cleanup pending)"
   eq "$(grep -c '^ps draining' "$STUB/calls.log")" 4 "bound 615 at a 205 s poll (0,205,410,615)"
 }
 
