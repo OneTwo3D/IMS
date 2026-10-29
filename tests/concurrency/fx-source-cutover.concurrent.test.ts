@@ -80,6 +80,7 @@ test('a switch to Aelia during a rate push waits for the push; after it commits 
   const realGlobalFetch = globalThis.fetch
   const startedAt = new Date()
   t.after(async () => {
+    releasePost() // an assertion that fails while the push is parked in its POST must not leave the test (and its connections) hanging
     globalThis.fetch = realGlobalFetch
     await db.setting.deleteMany({ where: { key: { in: keys } } })
     for (const s of saved) await db.setting.create({ data: { key: s.key, value: s.value } })
