@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { currencyMinorUnits, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
+import { isMirroredFeeLine } from './mirrored-fee-line'
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
@@ -470,14 +471,25 @@ export function largerAdvisoryPence(a: number | null, b: number | null): number 
   return Math.max(a, b)
 }
 
+/** The stored NET of the fee lines left out of the payload, in the order currency. */
+export function feeLinesNet(feeLines: Array<{ totalForeign: unknown }>) {
+  return feeLines.reduce((sum, line) => sum.add(dec(line.totalForeign)), toDecimal(0))
+}
+
 export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPushInput): number | null {
   try {
+    const goodsLines = order.lines.filter((line) => !isMirroredFeeLine(line))
+    const feeLines = order.lines.filter((line) => isMirroredFeeLine(line))
     const verdict = reconcilePushTotals({
       currency: order.currency,
       orderTotal: order.totalForeign as Parameters<typeof reconcilePushTotals>[0]['orderTotal'],
       storeCreditGross: dec(order.storeCreditForeign),
-      withheldGoodsGross: withheldGoodsGross(order.lines, refundedQtyByLine(order)),
-      withheldLineCount: withheldLineCount(order.lines, refundedQtyByLine(order)),
+      // Fee lines are not pushed (see mirrored-fee-line.ts), so the order total they are part of is balanced by
+      // withholding their NET from the expected side. Their VAT is NOT withheld: it is inside `totalVat`, which the
+      // payload sends in full (the plugin's TotalVat is WooCommerce's total tax), so it sits on both sides already.
+      withheldGoodsGross: withheldGoodsGross(goodsLines, refundedQtyByLine(order)).add(feeLinesNet(feeLines)),
+      withheldLineCount: withheldLineCount(goodsLines, refundedQtyByLine(order)),
+      withheldNetOnlyLineCount: feeLines.length,
       payload: input,
       pricesIncludeVat: order.pricesIncludeVat,
     })
@@ -496,6 +508,10 @@ export function readAddress(raw: unknown, customerName: string | null): WmsOrder
 
 type CandidateLine = {
   id?: string
+  /** Fee-line recognition (see mirrored-fee-line.ts); absent on a hand-built port, where only an empty sku counts. */
+  wclcFeeKind?: string | null
+  productId?: string | null
+  externalLineItemId?: number | null
   sku: string | null
   qty: unknown
   taxForeign: unknown
@@ -503,9 +519,19 @@ type CandidateLine = {
   description: string
 }
 
+/**
+ * A stored order whose every line is a mirrored fee has no goods to fulfil. Pushing it would create an item-less order at the
+ * warehouse (a LIVE order), so it is refused locally like any other payload that cannot be built: parked VALIDATION_FAILED before
+ * a claim, with no remote call, and re-queued by the revalidation pass if goods are ever added.
+ */
+export const NO_GOODS_TO_PUSH_REASON = 'Sales order has only fee lines (no goods to fulfil); cannot push to WMS'
+
 export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>): WmsOrderPushLine[] {
   const pushLines: WmsOrderPushLine[] = []
   for (const line of lines) {
+    // A mirrored WooCommerce FEE line is not goods: never an order item (see mirrored-fee-line.ts). Skipped BEFORE the
+    // SKU check, which would otherwise fail the whole order on it.
+    if (isMirroredFeeLine(line)) continue
     // A line with no SKU can't be fulfilled by the WMS — fail the whole order rather than
     // silently dropping the line. o3d-92fu: the create pass builds the payload BEFORE it
     // claims anything, so this no longer retries and dead-letters; it parks the order
@@ -532,6 +558,11 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
       description: line.description || null,
     })
   }
+  // Fee lines are skipped above, so a stored order made ONLY of them leaves nothing to send. (An order whose goods were all
+  // refunded is a different, pre-existing case and keeps its behaviour: it still has goods lines.)
+  if (pushLines.length === 0 && lines.length > 0 && lines.every((line) => isMirroredFeeLine(line))) {
+    throw new Error(NO_GOODS_TO_PUSH_REASON)
+  }
   return pushLines
 }
 
@@ -556,7 +587,7 @@ const ORDER_PUSH_SELECT = {
   storeCreditForeign: true,
   storeCreditAssessment: true,
   totalForeign: true,
-  lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
+  lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true, wclcFeeKind: true, productId: true, externalLineItemId: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
   paidAt: true,
   createdAt: true,
