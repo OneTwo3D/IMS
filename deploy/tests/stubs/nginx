@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Test stub for nginx: -t fails when $STUB/nginx_t_fail exists; every call is logged.
+set -u
+case "$*" in
+  -t)
+    # What the upstream file looked like at the moment of the test: complete, never half-written.
+    echo "nginx -t [$(tr '\n' ' ' < "$IMS_UPSTREAM_FILE" 2>/dev/null)]" >> "$STUB/calls.log"
+    [ ! -e "$STUB/nginx_t_fail" ] ;;
+  "-s reload") echo "nginx reload" >> "$STUB/calls.log" ;;
+  *) echo "nginx $*" >> "$STUB/calls.log" ;;
+esac

@@ -1,0 +1,42 @@
+name: Deploy Scripts
+
+# shellcheck and the stubbed-docker tests for the production deploy/rollback/cron scripts in deploy/bin. No docker daemon, nginx,
+# database or network is used: docker, curl, nginx and sleep are stubs (deploy/tests/stubs). Deliberately no `paths:` filter: the
+# job takes seconds, and a hand-kept path list is one more thing that can go stale.
+on:
+  pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-scripts-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: shellcheck
+        run: shellcheck -x -P SCRIPTDIR -S warning deploy/bin/*.sh deploy/tests/run.sh deploy/tests/stubs/*
+      - name: Tests
+        run: deploy/tests/run.sh
+      # The tests must be able to fail: break the health-failure handling and require the matching test to go red.
+      - name: Prove the tests can fail
+        run: |
+          set -u
+          sed -i 's|fail_new_slot "${new_name} did not become healthy[^"]*"|log ignored|' deploy/bin/deploy.sh
+          if git diff --quiet deploy/bin/deploy.sh; then echo "::error::the mutation did not apply"; exit 1; fi
+          if deploy/tests/run.sh health_failure_keeps_old_slot_serving; then
+            echo "::error::the health-failure test passed against a broken deploy.sh; the tests are vacuous"
+            exit 1
+          fi
+          git checkout -- deploy/bin/deploy.sh
+          echo "the test failed against the broken script, as required"

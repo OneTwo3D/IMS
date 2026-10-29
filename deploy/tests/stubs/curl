@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Test stub for curl: answers 200 for a running container's port unless its image is marked unhealthy; port 3000 follows the nginx upstream file.
+set -u
+url="${*: -1}"
+port="$(sed -E 's#^http://[^:/]+:([0-9]+).*#\1#' <<< "$url")"
+if [ "$port" = 3000 ]; then
+  [ ! -e "$STUB/front_fail" ] || { echo -n 000; echo "curl $url -> 000" >> "$STUB/calls.log"; exit 7; }
+  port="$(grep -oE '127\.0\.0\.1:[0-9]+' "$IMS_UPSTREAM_FILE" | head -n1 | cut -d: -f2)"
+fi
+code=000
+for f in "$STUB"/containers/*; do
+  [ -f "$f" ] || continue
+  cport="$(sed -n 's/^port=//p' "$f")" crun="$(sed -n 's/^running=//p' "$f")" cimg="$(sed -n 's/^image=//p' "$f")"
+  if [ "$cport" = "${port:-}" ] && [ "$crun" = 1 ] && [ ! -e "$STUB/unhealthy/${cimg##*:}" ]; then code=200; fi
+done
+echo "curl $url -> $code" >> "$STUB/calls.log"
+echo -n "$code"
+[ "$code" = 200 ] || exit 7
