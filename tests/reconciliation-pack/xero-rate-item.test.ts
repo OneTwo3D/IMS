@@ -546,6 +546,11 @@ test('A LINKED FOREIGN POSTING returned by Xero as base currency is a finding fo
     const run = await runXeroRateCheck(context(lists, { ims: { rows: LATER, posted: [postedRow(1, type, { currency: 'EUR', rate: '1.25' })] } }).ctx)
     assert.deepEqual([run.item.outcome, [...run.item.reasons].sort(), run.summary?.baseCurrency, run.summary?.postingUnreadable], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE'], 0, 1], name)
   }
+  // A VOIDED or DELETED document that IMS posted as live is out of scope by decision (reversed or removed, it books nothing): counted, never judged, whatever its posting carries.
+  for (const status of ['VOIDED', 'DELETED']) {
+    const run = await runXeroRateCheck(context({ invoices: [eur(1, 0.9, SEP, { status })] }, { ims: { rows: LATER, posted: [postedRow(1, 'SALES_INVOICE', { currency: 'EUR', rate: '1.25' })] } }).ctx)
+    assert.deepEqual([run.item.outcome, run.summary?.setAsideDocuments, run.summary?.imsPosted, run.summary?.postingUnreadable], ['pass', 1, 0, 0], status)
+  }
   // Unlinked, or linked with a base posted currency (or none recorded): a base record, set aside.
   for (const posted of [[], [postedRow(1, 'SALES_INVOICE', { currency: 'GBP', rate: '1' })], [postedRow(1, 'SALES_INVOICE', { currency: null })]]) {
     const run = await runXeroRateCheck(context({ invoices: [gbpInvoice] }, { ims: { rows: LATER, posted } }).ctx)
