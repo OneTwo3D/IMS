@@ -157,7 +157,7 @@ export type OverThresholdUhf = {
 export type EuFeeResult = {
   regime: 'not_applicable' | 'unpriced' | 'flat_rate' | 'over_threshold'
   /** Why nothing applies or the cart is unpriced. */
-  reason?: 'not_eu_27' | 'business_customer' | 'value_unknown' | 'destination_deferred' | 'no_request'
+  reason?: 'not_eu_27' | 'business_customer' | 'destination_unknown' | 'value_unknown' | 'destination_deferred' | 'no_request'
   distinctHsCodes: number
   uncodedLines: number
   /** The shared unit count: distinct codes + (when charged) uncoded lines. */
@@ -238,7 +238,10 @@ export function computeEuCustomsFees(input: EuFeeInput): EuFeeResult {
     duty: null, uhf: null, overThresholdUhf: null, dutyEstimate: null, vatRateMissing: false,
   })
 
-  const country = input.destinationCountry.trim().toUpperCase()
+  const country = (input.destinationCountry ?? '').trim().toUpperCase()
+  // wclc: an EMPTY destination (a guest on the cart page, an express sheet before its address callback) is the cart
+  // that was never priced, not a deliberate non-charge. Only a known non-EU country is "not applicable".
+  if (!/^[A-Z]{2}$/.test(country)) return none('unpriced', 'destination_unknown')
   if (!EU_27_COUNTRIES.has(country)) return none('not_applicable', 'not_eu_27')
   if (input.customer === 'business') return none('not_applicable', 'business_customer')
 
@@ -309,22 +312,24 @@ export function computeEuCustomsFees(input: EuFeeInput): EuFeeResult {
         if (threshold.gt(0) && value.gte(threshold) && value.lte(bandTop)) return noQuoteUhf() // the FX band: no duty estimate, UHF alone
         // The percent-of-goods fallback estimate (duty alone) plus the UHF, whatever the over-threshold mode says.
         const percent = toDecimal(config.dutyFallbackPercent)
-        const g = grossed(!config.dutyFeeLineTaxable)
-        const uhfAmount = uhfOwed ? g.amount : toDecimal(0)
-        if (percent.lte(0)) {
-          if (uhfAmount.gt(ROUNDING_TOLERANCE)) return { ...base, overThresholdUhf: make(uhfAmount, g.missing, 'uhf_only_line', false), vatRateMissing: g.missing }
-          return { ...base, overThresholdUhf: null }
-        }
+        // THE RULE: whenever the UHF ends up on a NON-taxable line it is grossed by the standard VAT (nothing taxes it
+        // afterwards); it goes in NET only on a line that is actually taxed. A UHF-only line is never taxable.
+        const alone = grossed(true)
+        const aloneAmount = uhfOwed ? alone.amount : toDecimal(0)
+        const onLine = grossed(!config.dutyFeeLineTaxable)
+        const onLineAmount = uhfOwed ? onLine.amount : toDecimal(0)
+        const aloneResult = (): EuFeeResult =>
+          aloneAmount.gt(ROUNDING_TOLERANCE)
+            ? { ...base, overThresholdUhf: make(aloneAmount, alone.missing, 'uhf_only_line', false), vatRateMissing: alone.missing }
+            : { ...base, overThresholdUhf: null }
+        if (percent.lte(0)) return aloneResult()
         const estimate = cents(value.mul(percent).div(100))
-        if (estimate.lte(ROUNDING_TOLERANCE)) {
-          if (uhfAmount.gt(ROUNDING_TOLERANCE)) return { ...base, overThresholdUhf: make(uhfAmount, g.missing, 'uhf_only_line', false), vatRateMissing: g.missing }
-          return { ...base, overThresholdUhf: null }
-        }
+        if (estimate.lte(ROUNDING_TOLERANCE)) return aloneResult()
         return {
           ...base,
           dutyEstimate: estimate,
-          overThresholdUhf: uhfAmount.gt(0) ? make(uhfAmount, g.missing, 'fallback_line', config.dutyFeeLineTaxable) : null,
-          vatRateMissing: uhfAmount.gt(0) && g.missing,
+          overThresholdUhf: onLineAmount.gt(0) ? make(onLineAmount, onLine.missing, 'fallback_line', config.dutyFeeLineTaxable) : null,
+          vatRateMissing: onLineAmount.gt(0) && onLine.missing,
         }
       }
       case 'usable':

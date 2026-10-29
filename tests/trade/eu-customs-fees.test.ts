@@ -328,6 +328,57 @@ test('the FX band is [150, 153] inclusive of the top and the fallback applies be
   assert.equal(f(at('153.01').dutyEstimate), '3.06') // beyond it: 2% of 153.01
 })
 
+// --- unknown destination: unpriced; only a KNOWN non-EU country is not applicable ------------------------------
+
+test('an empty / unreadable destination is UNPRICED (the cart never priced), a known non-EU country is not applicable', () => {
+  const lines = [L('3926909790')]
+  for (const bad of ['', '   ', 'D', 'DEU', '1', '??']) {
+    const r = run({ lines, destinationCountry: bad })
+    assert.equal(r.regime, 'unpriced', `destination '${bad}'`)
+    assert.equal(r.reason, 'destination_unknown')
+    assert.equal(r.duty, null)
+    assert.equal(r.uhf, null)
+  }
+  assert.equal(run({ lines, destinationCountry: undefined as never }).reason, 'destination_unknown')
+  assert.equal(run({ lines, destinationCountry: 'NO' }).regime, 'not_applicable')
+  assert.equal(run({ lines, destinationCountry: 'US' }).reason, 'not_eu_27')
+  // A business cart with no destination is still unpriced: the destination is judged first, as in wclc.
+  assert.equal(run({ lines, destinationCountry: '', customer: 'business' }).regime, 'unpriced')
+})
+
+// --- the UHF on a non-taxable line is always grossed; net only on a line that is actually taxed ---------------------
+
+test('fallback + TAXABLE duty class: percent > 0 puts the UHF NET on the taxed line; percent ~ 0 puts it GROSSED on its own non-taxable line', () => {
+  const taxable: Partial<EuFeeConfig> = { dutyFeeLineTaxable: true }
+  // percent > 0: estimate 4.00 + NET 2.00 on the taxed Duty Fee line (6.00 in wclc).
+  const withEstimate = over({ dutyFee: { quote: 'unusable' }, config: { ...taxable, dutyFallbackPercent: '2' } })
+  assert.equal(f(withEstimate.dutyEstimate), '4.00')
+  assert.equal(f(FEE(withEstimate)?.gross), '2.00')
+  assert.equal(FEE(withEstimate)?.lineTaxable, true)
+  assert.equal(FEE(withEstimate)?.placement, 'fallback_line')
+  // percent 0: the only line is the UHF, non-taxable, so it must be grossed (2.38 at DE 19%), not 2.00.
+  const off = over({ dutyFee: { quote: 'unusable' }, config: { ...taxable, dutyFallbackPercent: '0' } })
+  assert.equal(f(FEE(off)?.gross), '2.38')
+  assert.equal(FEE(off)?.placement, 'uhf_only_line')
+  assert.equal(FEE(off)?.lineTaxable, false)
+  assert.equal(f(FEE(off)?.taxPart), '0.38')
+  // percent ~ 0 (the estimate rounds to a cent or less): same.
+  const tiny = over({ dutyFee: { quote: 'unusable' }, config: { ...taxable, dutyFallbackPercent: '0.001' } })
+  assert.equal(tiny.dutyEstimate, null)
+  assert.equal(f(FEE(tiny)?.gross), '2.38')
+  assert.equal(FEE(tiny)?.lineTaxable, false)
+})
+
+test('invariant: any result whose UHF sits on a non-taxable line is grossed, across every placement and class', () => {
+  const quotes: DutyQuoteState[] = ['usable', 'none', 'unconfigured', 'unusable']
+  for (const quote of quotes) for (const taxable of [false, true]) for (const pct of ['0', '0.001', '2']) for (const value of [151, 200]) {
+    const r = over({ consignmentValueEur: value, dutyFee: { quote }, config: { dutyFeeLineTaxable: taxable, dutyFallbackPercent: pct } })
+    const u = FEE(r)
+    if (!u) continue
+    assert.equal(u.taxPart.gt(0), !u.lineTaxable, `${quote} taxable=${taxable} pct=${pct} value=${value}: ${u.placement} gross ${u.gross.toFixed(2)}`)
+  }
+})
+
 // --- the module is unused until the switchover ----------------------------------------------------
 test('unused until switchover: no production source imports the module', () => {
   const root = process.cwd()
