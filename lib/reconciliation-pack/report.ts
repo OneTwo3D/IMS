@@ -516,6 +516,8 @@ export function buildReport(raw: ReportInput, sequence: number, previousReportSh
   const jsonText = `${JSON.stringify(record, null, 2)}\n`
   // The reader's own validation, on the finished text, before anything can be written.
   const parsed = parseReport(jsonText)
+  // The reader still accepts version 1 as history; a report being WRITTEN is never one.
+  if (parsed.schemaVersion !== PACK_SCHEMA_VERSION) throw new ReportInvalid('a new report carries the current schema version')
   verifyEvidence(evidenceText, parsed)
   if (sha256Hex(markdown) !== parsed.companionMarkdownSha256) throw new ReportInvalid('the Markdown does not match its digest')
   return { body, record, jsonText, evidenceText, markdown }

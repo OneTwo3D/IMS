@@ -7,7 +7,7 @@ import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
 import { buildChildEnv, startNpmScript, type ChildResult, type ChildSpec, type StartedScript } from '@/lib/ops/readiness-gate-collect'
 import { VENDOR_ENV } from '@/lib/reconciliation-pack/cli'
 import { checkAncestors, readTrustedRegularFileBytes } from '@/lib/ops/published-report'
-import { DEFAULT_PACK_REPORT_DIR, MAX_EVIDENCE_BYTES, MAX_REPORT_JSON_BYTES, PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN } from '@/lib/reconciliation-pack/constants'
+import { DEFAULT_PACK_REPORT_DIR, MAX_EVIDENCE_BYTES, MAX_REPORT_JSON_BYTES, PACK_EVIDENCE_FILE, PACK_REPORT_JSON, PACK_REPORT_MARKDOWN, PACK_SCHEMA_VERSION } from '@/lib/reconciliation-pack/constants'
 import { RUN_ID_RE, parseReport, sha256Hex, verifyEvidence } from '@/lib/reconciliation-pack/report'
 import { lockPackScheduleSettings } from '@/lib/reconciliation-pack/schedule-lock'
 import { db } from '@/lib/db'
@@ -122,6 +122,8 @@ export function verifyNamedPackReport(parsed: ParsedPackOutput, exitCode: number
     const jsonBytes = readTrustedRegularFileBytes(path.join(dir, PACK_REPORT_JSON), MAX_REPORT_JSON_BYTES)
     const record = parseReport(jsonBytes.toString('utf8'))
     if (record.runId !== parsed.runId) return null
+    // A report this build just published is the current schema version; version 1 is read-only history.
+    if (record.schemaVersion !== PACK_SCHEMA_VERSION) return null
     const markdown = readTrustedRegularFileBytes(path.join(dir, PACK_REPORT_MARKDOWN), MAX_REPORT_JSON_BYTES)
     if (sha256Hex(markdown) !== record.companionMarkdownSha256) return null
     const evidence = readTrustedRegularFileBytes(path.join(dir, PACK_EVIDENCE_FILE), MAX_EVIDENCE_BYTES)

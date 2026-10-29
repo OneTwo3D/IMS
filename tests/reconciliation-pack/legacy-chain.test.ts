@@ -4,6 +4,7 @@ import path from 'node:path'
 import test, { after } from 'node:test'
 
 import { assessPackItem } from '../../lib/ops/readiness-gate-pack.ts'
+import { verifyNamedPackReport } from '../../lib/ops/reconciliation-pack-schedule.ts'
 import { PACK_ITEM_IDS_BY_SCHEMA, PACK_SCHEMA_VERSION } from '../../lib/reconciliation-pack/constants.ts'
 import { publishSyntheticRun } from '../../lib/reconciliation-pack/harness.ts'
 import { ReportInvalid, deriveExitCode, parseReport, sha256Hex, summarise, verifyEvidence, type ReportRecord } from '../../lib/reconciliation-pack/report.ts'
@@ -157,4 +158,37 @@ test('settling reads the carried state of an item from a pre-R16 head, and never
   assert.equal(carriedStateFromChain(chain, 'R12', where).usable, false)
   assert.equal(carriedStateFromChain(chain, 'R16', where).usable, false)
   assert.equal(readdirSync(dir).filter((n) => !n.startsWith('.')).length, 1)
+})
+
+// [mutation: the monotonic check removed from the chain reader]
+test('a schema version never goes down the chain: v2 then v1 is refused with SCHEMA_REGRESSED, v1 then v1 then v2 is accepted', () => {
+  const regressed = fresh()
+  publish(regressed, 0)
+  const second = publish(regressed, 1)
+  toPreR16(second.json) // a head that sheds R16 by claiming the legacy schema, still linked to its predecessor
+  const chain = chainOf(regressed)
+  assert.deepEqual(chain.ok ? null : chain.code, 'SCHEMA_REGRESSED')
+  assert.equal((chain.ok ? null : chain.runId), second.record.runId)
+
+  const history = fresh()
+  const a = publish(history, 0); toPreR16(a.json)
+  const b = publish(history, 1); toPreR16(b.json)
+  const c = publish(history, 2)
+  const ok = chainOf(history)
+  assert.equal(ok.ok, true, JSON.stringify(ok))
+  assert.deepEqual((ok as Extract<typeof ok, { ok: true }>).reports.map((r) => r.record.schemaVersion), [1, 1, 2])
+  assert.equal(c.record.schemaVersion, PACK_SCHEMA_VERSION)
+})
+
+// [mutation: a v1 report allowed on the write path (the version guard in buildReport together with the writer's version) / the scheduled-run verifier accepting v1]
+test('nothing publishes a v1 report: the writer always writes the current version, and the scheduled-run verifier refuses a v1 report', () => {
+  const dir = fresh()
+  const result = publish(dir, 0)
+  assert.equal(result.record.schemaVersion, PACK_SCHEMA_VERSION)
+  assert.equal((JSON.parse(readFileSync(result.json, 'utf8')) as Json).schemaVersion, 2)
+  const parsed = { code: null, runId: result.record.runId, reportJson: result.json, reportMarkdown: result.markdown }
+  assert.deepEqual(verifyNamedPackReport(parsed, result.exitCode, dir), { sequence: 1 })
+  toPreR16(result.json)
+  assert.equal(readPackChain(dir).ok, true, 'as history it still reads')
+  assert.equal(verifyNamedPackReport(parsed, deriveExitCode(parseReport(readFileSync(result.json, 'utf8')).items), dir), null, 'but it is not a newly published report')
 })

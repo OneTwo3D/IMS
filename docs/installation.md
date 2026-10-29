@@ -1906,6 +1906,7 @@ A run is refused, and the trend reader refuses a directory, with exactly one of 
 | FORK | two reports claim the same sequence or the same predecessor |
 | LINK_BROKEN | a report's previousReportSha256 is not the digest of the report before it |
 | SYSTEM_MISMATCH | the chain mixes reports of different system identifiers |
+| SCHEMA_REGRESSED | a report claims an older schema version than the report before it (a pre-R16 report may only precede the first current one, never follow it) |
 | LOCK_HELD | another run holds the run lock (a live holder is never displaced, however old its lock) |
 | LOCK_UNREADABLE | the run lock exists but cannot be read or understood, so it was not taken |
 | LOCK_STALE_CONTENDED | a stale lock is being reclaimed by another run, or a reclaim guard was left behind |
