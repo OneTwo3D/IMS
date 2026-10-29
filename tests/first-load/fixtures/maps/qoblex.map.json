@@ -74,7 +74,8 @@
         "sku": "Item Code",
         "qtyOrdered": "Ord",
         "qtyReceived": "Rcvd",
-        "unitCostForeign": "Cost"
+        "unitCostForeign": "Cost",
+        "lineDiscountPercent": "Disc %"
       },
       "valueMaps": {
         "status": { "Open": "OPEN", "Closed": "CLOSED" },

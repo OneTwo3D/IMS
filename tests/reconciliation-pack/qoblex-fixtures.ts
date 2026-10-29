@@ -109,15 +109,15 @@ export const lot = (sku: string, location: string, qty: string, unitCost: string
 /** The prefix the first load gave the IMS references of the Qoblex purchase orders in these fixtures. */
 export const PO_PREFIX = 'QBX-'
 /** One line of the Incoming report (GBP unless stated). */
-export const poLine = (orderKey: string, sku: string, ordered: string, received: string, price: string, over: Partial<QoblexPoLine> = {}): QoblexPoLine => ({ orderKey, sku, supplier: 'Supplier Beta', qtyOrdered: ordered, qtyReceived: received, unitCostForeign: price, ...over })
+export const poLine = (orderKey: string, sku: string, ordered: string, received: string, price: string, over: Partial<QoblexPoLine> = {}): QoblexPoLine => ({ orderKey, sku, supplier: 'Supplier Beta', qtyOrdered: ordered, qtyReceived: received, unitCostForeign: price, lineDiscountPercent: '0', ...over })
 export const poLines = (lines: QoblexPoLine[], keyPrefix = PO_PREFIX): QoblexPurchaseOrders => ({ keyPrefix, lines })
 
 export const INCOMING_HEADERS = ['Product variant', 'SKU', 'Created on', 'Received on', 'Due On', 'Purchase Order', 'Status', 'Ordered Quantity', 'Received Quantity', 'Price', 'Discount (%)', 'Supplier', 'Supplier Reference']
-export type IncomingRow = { po: string; sku: string; ordered: string; received: string; price: string; supplier?: string; status?: string }
+export type IncomingRow = { po: string; sku: string; ordered: string; received: string; price: string; supplier?: string; status?: string; discount?: string }
 /** The incoming report in the native layout (the suppliers are the pinned map's: Alpha USD at 1.25, Beta GBP, Gamma EUR at 1.15). */
 export function incomingCsv(rows: readonly IncomingRow[], headers: readonly string[] = INCOMING_HEADERS): string {
   const cell = (value: string) => `"${value}"`
-  const lines = rows.map((r) => [`Product ${r.sku}`, r.sku, 'Thu, Sep 24 2026', '', 'Thu, Oct 8 2026', r.po, r.status ?? 'Approved', r.ordered, r.received, r.price, '0', r.supplier ?? 'Supplier Beta', ''].map(cell).join(','))
+  const lines = rows.map((r) => [`Product ${r.sku}`, r.sku, 'Thu, Sep 24 2026', '', 'Thu, Oct 8 2026', r.po, r.status ?? 'Approved', r.ordered, r.received, r.price, r.discount ?? '0', r.supplier ?? 'Supplier Beta', ''].map(cell).join(','))
   return [headers.map(cell).join(','), ...lines].join('\r\n') + '\r\n'
 }
 export const DEFAULT_INCOMING = incomingCsv([{ po: 'PO1', sku: 'SKU-1', ordered: '10', received: '4', price: '2.5' }, { po: 'PO1', sku: 'SKU-2', ordered: '3', received: '0', price: '10' }, { po: 'PO2', sku: 'SKU-3', ordered: '8', received: '0', price: '12.5', supplier: 'Supplier Alpha' }])

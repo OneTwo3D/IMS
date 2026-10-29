@@ -159,6 +159,17 @@ export function rateAt(currency: string, createdAt: string, rows: readonly FxRat
   return new Dec([...rates][0]!)
 }
 
+/** True when a line of the report still has a quantity outstanding and carries a non-zero per-line discount (blank is 0; a malformed one was refused when the report was read). */
+export function hasOpenDiscountedLine(lines: readonly QoblexPoLine[]): boolean {
+  return lines.some((line) => {
+    const ordered = dec(line.qtyOrdered)
+    const received = dec(line.qtyReceived)
+    const discount = dec(line.lineDiscountPercent === '' ? '0' : line.lineDiscountPercent)
+    if (ordered === null || received === null || discount === null) return false
+    return ordered.minus(received).gt(0) && !discount.isZero()
+  })
+}
+
 /**
  * The Qoblex side: the orders of the report that still have a quantity outstanding, keyed by their number. The report has no currency, so an
  * order that an IMS order explains is converted in THAT order's recorded currency at the central rate (rateAt); one that no IMS order explains
@@ -295,6 +306,10 @@ export async function runPoItem(id: PoItemId, context: PoItemContext): Promise<I
       if (!fx.ok) return inconclusive(id, SOURCES, fx.reason)
       fxRates = fx.value
     }
+    // A per-line discount on an open Qoblex line: the report's Price is the GROSS price and the pack does not apply the discount, so R7 would compare a gross price with
+    // IMS's cost. The first-load tool refuses such a line, so no IMS order can carry the same figure; R7 is inconclusive with the closed code for a value one side
+    // carries and the other cannot (VALUE_SHAPE_MISMATCH) rather than ever comparing gross against gross. R8 compares quantities and is unaffected.
+    if (id === 'R7' && hasOpenDiscountedLine(lines)) return inconclusive(id, SOURCES, 'VALUE_SHAPE_MISMATCH')
     const theirs = qoblexSide(lines, { mine: mine.orders, fxRates })
     if (!theirs.ok) return inconclusive(id, SOURCES, theirs.reason)
 

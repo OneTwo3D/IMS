@@ -17,7 +17,7 @@ import { endOfBusinessDateUtc, isMissingFxRateError, selectFxRateFromRows, type 
 import { Buffer } from 'node:buffer'
 import { parseCsv } from '@/lib/csv'
 import { parseCsvStrict, serializeCsv } from './csv'
-import { PART_LINE_STRIDE, type CanonRow, type IngestedDataset } from './ingest'
+import { DISCOUNT_HEADER_PATTERN, PART_LINE_STRIDE, type CanonRow, type IngestedDataset } from './ingest'
 import { D, fmt, fmtFixed, parseDecimal, roundTo, sum, type Dec } from './money'
 import {
   APPLY_TIME_CHECKS,
@@ -1324,6 +1324,11 @@ function loadTransfers(run: Run): void {
 
 function loadPurchaseOrders(run: Run): void {
   const { config } = run
+  // A discount column that the map leaves unread (for example a constant "0" given for lineDiscountPercent while the file still has a Discount (%) header)
+  // would load every discounted line at its gross price without a word: it blocks the run.
+  for (const header of run.input.datasets['purchase-order-lines']?.unmappedHeaders ?? []) {
+    if (DISCOUNT_HEADER_PATTERN.test(header)) run.find('ERROR', 'DISCOUNT_COLUMN_NOT_READ', `the purchase-order file has a discount column ${JSON.stringify(header)} that the column map does not read; map it to lineDiscountPercent (an unread discount would load discounted lines at their gross price)`, 'purchase-order-lines')
+  }
   const prefix = config.purchaseOrderKeyPrefix
   type Line = {
     row: CanonRow
@@ -1460,6 +1465,19 @@ function loadPurchaseOrders(run: Run): void {
       run.add('purchase-order-lines', row.line, label, 'EXCLUDED', 'FULLY_RECEIVED', 'ordered and received quantities are equal: nothing is outstanding (the received portion stays with the incumbent)')
       tally.closed++
       continue
+    }
+    // THE LINE DISCOUNT IS NEVER APPLIED (owner ruling 2026-10-26). The export's per-line Discount (%) would have to reduce the unit price; the load takes the price
+    // as written, so an OPEN line that carries a discount would import the GROSS price as its unit cost and overstate the order's value, landed cost and stock value
+    // (and the reconciliation would compare gross with gross). The line is refused instead. Only a line that is actually imported (open, quantity outstanding) is
+    // judged: a received or closed line is not loaded, so its discount changes nothing. A blank discount is 0.
+    if (v.lineDiscountPercent.trim() !== '') {
+      const discount = parseDecimal(v.lineDiscountPercent, 'lineDiscountPercent', { maxIntDigits: 3, maxDp: 6 })
+      if (!discount.ok) { reject('BAD_DISCOUNT', discount.reason); continue }
+      if (discount.value.gt(100)) { reject('BAD_DISCOUNT', `lineDiscountPercent ${JSON.stringify(v.lineDiscountPercent)} is above 100`); continue }
+      if (!discount.value.isZero()) {
+        reject('PO_LINE_DISCOUNT_NOT_SUPPORTED', `order ${v.orderKey} line ${sku.sku} is open (${fmt(outstanding)} outstanding) and carries a ${fmt(discount.value)}% line discount, which this load does not apply: it would import the gross price ${fmt(cost.value)} as the unit cost. Resolve the line in the source (receive it, close it, or re-price it to the net price) and re-export`)
+        continue
+      }
     }
 
     const res = resolveProduct(run, sku.key)

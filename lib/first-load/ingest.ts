@@ -49,6 +49,8 @@ export interface DatasetMapping {
   derived: Record<string, string>
   /** canonical column -> source date format (see dates.ts); the value is converted to YYYY-MM-DD. */
   dateFormats: Record<string, string>
+  /** purchase-order-lines only: the source header the map DELIBERATELY reads as the line discount although its name does not look like a discount. Without it, lineDiscountPercent must map to a discount-looking header. */
+  discountHeader: string | null
 }
 
 export interface WideLayout {
@@ -86,7 +88,7 @@ export interface ColumnMap {
 }
 
 const MAP_KEYS = new Set(['formatVersion', 'source', 'datasets'])
-const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats'])
+const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats', 'discountHeader'])
 const DELIMITERS = new Set([',', ';', '\t', '|'])
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -274,9 +276,83 @@ function parseLayoutKeys(
   }
 
   for (const required of spec.required) {
-    if (!supplied.has(required)) problems.push(`${where}: required canonical column "${required}" is neither mapped nor given a constant`)
+    if (!supplied.has(required)) problems.push(`${where}: required canonical column "${required}" is neither mapped nor given a constant${REQUIRED_COLUMN_HINTS[required] ?? ''}`)
   }
   return { rowsAboveHeader, wide, rowSelect, parentFrom, derived, dateFormats }
+}
+
+/**
+ * COLUMNS THAT CARRY A VALUE INTO A COST OR A QUANTITY MUST BE READ FROM A SOURCE COLUMN, ROW BY ROW (VALUATION_COLUMN_NOT_DIRECT). A constant, a derived value or a value map
+ * could hide a real per-row figure (a constant discount of 0 over a file that has discounts loads every line at its gross price). The per-line discount must also be
+ * mapped (a map that leaves it out is refused, see the required columns), and where the map declares the source's headers, the discount header it names must be the one
+ * that looks like a discount: a header that looks like a discount (DISCOUNT_HEADER_PATTERN) can only be mapped to lineDiscountPercent, and the pinned Qoblex header is
+ * exactly "Discount (%)".
+ * Stock-lot currency is NOT in this list: the Qoblex stock export is declared in one currency by a constant in its pinned map (the report has no currency column).
+ */
+export const DIRECT_COLUMNS: Partial<Record<DatasetName, readonly string[]>> = {
+  'purchase-order-lines': ['lineDiscountPercent', 'unitCostForeign', 'qtyOrdered', 'qtyReceived'],
+  'stock-lots': ['qty', 'unitCost', 'fxRateToBase'],
+  transfers: ['qtyShipped', 'qtyReceived'],
+}
+/** Words for a discount in a source header (English, German, French, Italian, Spanish). */
+export const DISCOUNT_HEADER_PATTERN = /disc|rabatt|remise|sconto|descuento/i
+export const PINNED_DISCOUNT_HEADER = 'Discount (%)'
+
+function directColumnProblems(
+  where: string,
+  name: DatasetName,
+  columns: Record<string, string>,
+  constants: Record<string, string>,
+  valueMaps: Record<string, Record<string, string>>,
+  derived: Record<string, string>,
+  expectedHeaders: string[] | null,
+  problems: string[],
+): void {
+  for (const column of DIRECT_COLUMNS[name] ?? []) {
+    if (column in constants) problems.push(`${where}: VALUATION_COLUMN_NOT_DIRECT: "${column}" is given a constant; it must be mapped to a source column (a constant could hide a real per-row value)`)
+    if (column in valueMaps) problems.push(`${where}: VALUATION_COLUMN_NOT_DIRECT: "${column}" has a valueMaps entry; it must be read as written from a source column`)
+    if (column in derived) problems.push(`${where}: VALUATION_COLUMN_NOT_DIRECT: "${column}" is derived from another column; it must be mapped to a source column`)
+  }
+  if (name !== 'purchase-order-lines') return
+  if (!('lineDiscountPercent' in columns) && !('lineDiscountPercent' in constants) && !('lineDiscountPercent' in derived)) return // reported as a missing required column
+  const mapped = columns.lineDiscountPercent
+  if (mapped !== undefined && expectedHeaders !== null) {
+    if (expectedHeaders.includes(PINNED_DISCOUNT_HEADER) && mapped !== PINNED_DISCOUNT_HEADER) {
+      problems.push(`${where}.columns.lineDiscountPercent: VALUATION_COLUMN_NOT_DIRECT: the file has the "${PINNED_DISCOUNT_HEADER}" header, so lineDiscountPercent must be mapped to exactly that header (found ${JSON.stringify(mapped)})`)
+    }
+    for (const header of expectedHeaders) {
+      if (DISCOUNT_HEADER_PATTERN.test(header) && header !== mapped) problems.push(`${where}: the expected header ${JSON.stringify(header)} looks like a discount column but lineDiscountPercent is mapped to ${JSON.stringify(mapped)}; map the discount column to it (an unread discount loads at the gross price)`)
+    }
+  }
+}
+
+/**
+ * THE DISCOUNT COLUMN IS CHECKED AGAINST THE ACTUAL FILE HEADERS, whether or not the map declares expectedHeaders: a discount-looking header is read ONLY as lineDiscountPercent
+ * (DISCOUNT_COLUMN_MISROUTED: mapping "Discount (%)" to supplierRef while lineDiscountPercent reads a blank column would load gross prices), there is at most one
+ * (DISCOUNT_COLUMN_AMBIGUOUS), and lineDiscountPercent reads a discount-looking header unless the map names its header deliberately in discountHeader (DISCOUNT_COLUMN_NOT_DECLARED).
+ */
+function discountHeaderProblems(file: string, header: string[], mapping: DatasetMapping, problems: string[]): void {
+  const looks = [...new Set(header.filter((name) => DISCOUNT_HEADER_PATTERN.test(name)))]
+  if (looks.length > 1) problems.push(`${file}: DISCOUNT_COLUMN_AMBIGUOUS: more than one header looks like a discount column (${JSON.stringify(looks)}); which one is the line discount cannot be decided`)
+  for (const name of looks) {
+    const to = Object.entries(mapping.columns).filter(([, source]) => source === name).map(([column]) => column)
+    const wrong = to.filter((column) => column !== 'lineDiscountPercent')
+    if (wrong.length > 0) problems.push(`${file}: DISCOUNT_COLUMN_MISROUTED: the discount-looking header ${JSON.stringify(name)} is mapped to ${wrong.join(', ')}; a discount header is read only as lineDiscountPercent`)
+  }
+  // THE ONE RULE, computed from the file's headers and the lineDiscountPercent mapping alone (not from what else reads a header: rowSelect, wide, derived and the rest cannot hide a discount header from it):
+  // if the file has a discount-looking header, lineDiscountPercent reads exactly that header; discountHeader is an escape only for a file with none.
+  const mapped = mapping.columns.lineDiscountPercent
+  if (mapped === undefined) return
+  if (looks.length > 0) {
+    if (!looks.includes(mapped)) problems.push(`${file}: DISCOUNT_COLUMN_NOT_THE_DISCOUNT_HEADER: the file has the discount-looking header ${JSON.stringify(looks[0])} but lineDiscountPercent is mapped to ${JSON.stringify(mapped)}; lineDiscountPercent must read exactly that header (discountHeader does not override a discount-looking header)`)
+  } else if (mapping.discountHeader !== mapped) {
+    problems.push(`${file}: DISCOUNT_COLUMN_NOT_DECLARED: the file has no discount-looking header and lineDiscountPercent is mapped to ${JSON.stringify(mapped)}; if that is deliberate, name it in the map as discountHeader`)
+  }
+}
+
+/** Why a required column is required, appended to the refusal. */
+const REQUIRED_COLUMN_HINTS: Record<string, string> = {
+  lineDiscountPercent: ' (PO_LINE_DISCOUNT_COLUMN_REQUIRED: the per-line discount must be read, or an omitted column would load every discounted line at its gross price; map the source\'s Discount (%) column to lineDiscountPercent)',
 }
 
 export function parseColumnMap(jsonText: string, label: string): ColumnMap {
@@ -348,7 +424,15 @@ export function parseColumnMap(jsonText: string, label: string): ColumnMap {
         if (mapped.length > 1) problems.push(`${where}.columns: source header "${header}" is mapped to more than one canonical column (${mapped.join(', ')}); that is ambiguous`)
       }
       const layout = parseLayoutKeys(entry, where, name, spec, { columns, constants, valueMaps }, problems)
-      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
+      directColumnProblems(where, name as DatasetName, columns, constants, valueMaps, layout.derived, expectedHeaders, problems)
+      let discountHeader: string | null = null
+      if (entry.discountHeader !== undefined) {
+        if (name !== 'purchase-order-lines') problems.push(`${where}.discountHeader: only the purchase-order-lines dataset has a discount`)
+        else if (typeof entry.discountHeader !== 'string' || entry.discountHeader.trim() === '') problems.push(`${where}.discountHeader must be a non-empty string`)
+        else if (columns.lineDiscountPercent !== entry.discountHeader) problems.push(`${where}.discountHeader: ${JSON.stringify(entry.discountHeader)} must be the header lineDiscountPercent is mapped to (found ${JSON.stringify(columns.lineDiscountPercent ?? null)})`)
+        else discountHeader = entry.discountHeader
+      }
+      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, discountHeader, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
     }
   }
   if (problems.length > 0) throw new InputError(problems)
@@ -673,7 +757,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       if (!canonical.has(name)) problems.push(`${file}: "${name}" is not a canonical column of ${dataset} (canonical: ${spec.columns.join(', ')})`)
       if ((headerCount.get(name) ?? 0) > 1) problems.push(`${file}: header "${name}" appears more than once`)
     }
-    for (const required of spec.required) if (!header.includes(required)) problems.push(`${file}: required column "${required}" is missing`)
+    for (const required of spec.required) if (!header.includes(required)) problems.push(`${file}: required column "${required}" is missing${REQUIRED_COLUMN_HINTS[required] ?? ''}`)
     header.forEach((name, index) => {
       if (canonical.has(name)) {
         indexOf.set(name, index)
@@ -703,6 +787,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         readIndexes.add(at)
       }
     }
+    if (dataset === 'purchase-order-lines') discountHeaderProblems(file, header, mapping, problems)
     if (mapping.rowSelect) {
       selectIndex = locate(mapping.rowSelect.column, 'rowSelect')
       if (selectIndex >= 0) readIndexes.add(selectIndex)
