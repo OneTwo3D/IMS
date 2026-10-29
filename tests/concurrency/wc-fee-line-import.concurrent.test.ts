@@ -148,7 +148,7 @@ test('[wclc fees] a new import mirrors taxed and untaxed fee lines, persists kin
   assert.equal(Math.round(documentTotal * 100) / 100, 189.5, 'the invoice totals what WooCommerce charged')
 })
 
-test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines as stored and only refreshes the order-level components', { skip }, async (t) => {
+test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines AND its components exactly as stored', { skip }, async (t) => {
   const db = await loadDb()
   const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const id = `WFL-${process.pid}-${randomUUID()}`
@@ -158,31 +158,28 @@ test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines 
     await db.salesOrderLine.deleteMany({ where: { orderId: id } })
     await db.salesOrder.deleteMany({ where: { id } })
   })
-  // An order imported BEFORE the columns existed: a fee line with no kind, no components on the order.
+  // An order imported BEFORE the columns existed (a fee line with no kind, no components), and one imported after (components set).
   await db.salesOrder.create({
     data: {
       id, status: 'PROCESSING', currency: 'GBP', subtotalForeign: 109, totalForeign: 109, subtotalBase: 109, totalBase: 109,
+      wclcDutyComponent: '7.00', wclcTaxComponent: '1.00',
       shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: String(externalId), externalOrderNumber: String(externalId) } },
       lines: { create: [{ description: 'EU Duty', sku: '', qty: 1, unitPriceForeign: 9, unitPriceBase: 9, totalForeign: 9, totalBase: 9 }] },
     },
   })
-  const delivery = payload(externalId, 1, [
-    { id: 1, key: '_wclc_duty_component', value: '9.00' },
-    { id: 2, key: '_wclc_tax_component', value: '40.38' },
-    { id: 3, key: '_wclc_handling_component', value: '2.00' },
-  ])
-  await updateExistingWcOrderFromPayload(id, delivery as never)
-  const after = await db.salesOrder.findUniqueOrThrow({ where: { id }, include: { lines: true } })
-  // The delivery carries four fee lines and a goods line; the update path rebuilds none of them.
-  assert.equal(after.lines.length, 1, 'no line was added or rebuilt')
-  assert.equal(after.lines[0]!.wclcFeeKind, null, 'the stored line keeps its (null) kind')
-  assert.equal(after.lines[0]!.totalForeign.toString(), '9')
-  assert.equal(after.wclcDutyComponent?.toString(), '9')
-  assert.equal(after.wclcTaxComponent?.toString(), '40.38')
-  assert.equal(after.wclcHandlingComponent?.toString(), '2')
-  // A later delivery without them clears the order-level components (mirrored as reported).
-  await updateExistingWcOrderFromPayload(id, payload(externalId, 1) as never)
-  const cleared = await db.salesOrder.findUniqueOrThrow({ where: { id } })
-  assert.equal(cleared.wclcDutyComponent, null)
-  assert.equal(cleared.wclcHandlingComponent, null)
+  // The components split the lines stored with them, and the update rebuilds no lines: a delivery carrying different
+  // components, or none, changes neither the lines nor the stored split.
+  for (const meta of [
+    [{ id: 1, key: '_wclc_duty_component', value: '9.00' }, { id: 2, key: '_wclc_tax_component', value: '40.38' }, { id: 3, key: '_wclc_handling_component', value: '2.00' }],
+    [],
+  ]) {
+    await updateExistingWcOrderFromPayload(id, payload(externalId, 1, meta) as never)
+    const after = await db.salesOrder.findUniqueOrThrow({ where: { id }, include: { lines: true } })
+    assert.equal(after.lines.length, 1, 'no line was added or rebuilt')
+    assert.equal(after.lines[0]!.wclcFeeKind, null, 'the stored line keeps its (null) kind')
+    assert.equal(after.lines[0]!.totalForeign.toString(), '9')
+    assert.equal(after.wclcDutyComponent?.toString(), '7', 'the stored duty component is untouched')
+    assert.equal(after.wclcTaxComponent?.toString(), '1', 'the stored tax component is untouched')
+    assert.equal(after.wclcHandlingComponent, null, 'no handling component appears from a later delivery')
+  }
 })

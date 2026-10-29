@@ -189,6 +189,8 @@ export type MappedLine = {
    * Informational on the mapped line: it changes no amount and no tax.
    */
   wclcFeeKind?: WclcFeeKind | null
+  /** True on every line `mapWcFeeLines` produces (and on nothing else): scopes fee-only decisions such as the explicit no-tax accounting code. */
+  isFeeLine?: boolean
 }
 
 export const WCLC_FEE_KINDS = ['duty_flat', 'uhf', 'duty_fee'] as const
@@ -303,6 +305,7 @@ export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {
         externalLineItemId: null,
         taxCategoryFallback: mapWcTaxClassToCategory(feeLine.tax_class),
         wclcFeeKind: readWclcFeeKind(feeLine),
+        isFeeLine: true,
       }
     })
   return mapped.filter((line): line is MappedLine => line !== null)

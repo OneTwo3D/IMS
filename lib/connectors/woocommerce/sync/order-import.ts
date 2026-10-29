@@ -1077,7 +1077,9 @@ async function updateExistingWcOrderCore(
       data: {
         externalOrderNumber: wcOrder.number,
         customerVatNumber: readWcCustomerVat(wcOrder),
-        ...wclcComponentColumns(wcOrder),
+        // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
+        // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
+        // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
@@ -2948,7 +2950,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           lines: lineData.map((l, idx) => {
             const rateNow = lineRateNow(idx)
             const lineTaxType = resolveWcLineAccountingTaxType({
-              forceNoTax: mappedLines[idx]?.forceNoTax,
+              // FEE lines only: goods and shipping resolve exactly as before.
+              forceNoTax: mappedLines[idx]?.isFeeLine === true ? mappedLines[idx]?.forceNoTax : undefined,
               baseTaxType: rateNow?.accountingTaxType ?? lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
               reverseCharge: rateNow?.reverseCharge ?? lineTaxResolved[idx]?.reverseCharge,
               reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,

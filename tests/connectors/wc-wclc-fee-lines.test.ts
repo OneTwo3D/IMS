@@ -108,6 +108,7 @@ test('old untaxed order: fee lines with no meta map exactly as before (tax 0, fo
     externalLineItemId: null,
     taxCategoryFallback: 'STANDARD',
     wclcFeeKind: null,
+    isFeeLine: true,
   })
   // A payload with no `taxes` key at all (older WooCommerce) behaves the same.
   const bare = { id: 10, name: 'Handling', total: '1.00', total_tax: '0.00' } as WcFeeLine
@@ -254,4 +255,29 @@ test('resolveWcLineAccountingTaxType: forceNoTax is NONE whatever the base; othe
   assert.equal(resolveWcLineAccountingTaxType({ ...base, baseTaxType: undefined, forceNoTax: true }), 'NONE')
   assert.equal(resolveWcLineAccountingTaxType({ ...base, forceNoTax: false }), 'OUTPUT2')
   assert.equal(resolveWcLineAccountingTaxType({ ...base, forceNoTax: undefined, reverseCharge: true }), 'ECOUTPUT')
+})
+
+// --- scope: the explicit no-tax accounting code is for FEE lines only ----------------------------------------------------
+
+const { mapWcLineItems } = unwrap(fieldMappingNs)
+
+test('fee lines are marked isFeeLine; goods lines never are, and carry no forceNoTax', async () => {
+  const [feeLine] = mapWcFeeLines([{ id: 9, name: 'EU Duty', tax_class: '', total: '3.00', total_tax: '0.00', taxes: [] }])
+  assert.equal(feeLine.isFeeLine, true)
+  assert.equal(feeLine.forceNoTax, true)
+  // A no-rate goods line (no SKU, so no database lookup): unchanged vs development - no forceNoTax, not a fee.
+  const [goods] = await mapWcLineItems([
+    { id: 1, name: 'Gift card', product_id: 5, variation_id: 0, quantity: 1, tax_class: '', subtotal: '25.00', subtotal_tax: '0.00', total: '25.00', total_tax: '0.00', sku: '', price: 25, taxes: [], meta_data: [] } as never,
+  ], 1)
+  assert.equal(goods.forceNoTax, undefined)
+  assert.equal(goods.isFeeLine, undefined)
+  // The accounting code of such a line is the normal resolution (the order default when it has no code), exactly as on development.
+  assert.equal(
+    resolveWcLineAccountingTaxType({ forceNoTax: goods.isFeeLine === true ? goods.forceNoTax : undefined, baseTaxType: 'OUTPUT2', reverseCharge: false, reverseChargeSalesTaxType: '' }),
+    'OUTPUT2',
+  )
+  assert.equal(
+    resolveWcLineAccountingTaxType({ forceNoTax: undefined, baseTaxType: undefined, reverseCharge: false, reverseChargeSalesTaxType: '' }),
+    undefined,
+  )
 })
