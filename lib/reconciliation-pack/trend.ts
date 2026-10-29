@@ -95,5 +95,9 @@ export function readPackChain(reportDir: string): ChainResult {
 
 /** One item's outcome over the chain, in sequence order. */
 export function itemSeries(reports: readonly ChainEntry[], id: PackItemId): Array<{ sequence: number; outcome: PackOutcome }> {
-  return reports.map((entry) => ({ sequence: entry.sequence, outcome: entry.record.items.find((item) => item.id === id)!.outcome }))
+  // A report published before an item existed does not carry it: it has no outcome for it, which is not a missing value to guess at.
+  return reports.flatMap((entry) => {
+    const item = entry.record.items.find((candidate) => candidate.id === id)
+    return item === undefined ? [] : [{ sequence: entry.sequence, outcome: item.outcome }]
+  })
 }

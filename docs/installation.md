@@ -1752,7 +1752,7 @@ What this does not cover (the residual): a credential that avoids every listed w
 
 | Field | Appears in | Grammar |
 |---|---|---|
-| schemaVersion | JSON | the integer 1 |
+| schemaVersion | JSON | the integer 2 (a report published before R16 carries the integer 1 and exactly R1 to R15; it stays readable under the rules it was published under) |
 | kind | JSON; proof.kind | reconciliation-pack, compared or proven-empty |
 | runId | JSON, Markdown, directory name, claim file | 8 digits, T, 6 digits, Z, a hyphen and 12 lower-case hex digits |
 | systemIdentifier | JSON, Markdown | 10 to 20 digits: the identifier PostgreSQL itself produces for the cluster |
@@ -1766,7 +1766,7 @@ What this does not cover (the residual): a credential that avoids every listed w
 | later | evidence settling | a list of ISO times in UTC with a trailing Z |
 | count | evidence settling | a whole number equal to the length of later |
 | streams | JSON | at most six stream brackets |
-| items | JSON | exactly sixteen item records, R1 to R16 in order |
+| items | JSON | exactly sixteen item records, R1 to R16 in order (fifteen, R1 to R15, in a schemaVersion 1 report) |
 | evidence | JSON | an object with file, sha256 and lines |
 | proof | JSON items | null, or an object with kind (and source) |
 | sequence | JSON | a positive whole number |
