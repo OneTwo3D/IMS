@@ -20,10 +20,23 @@
  *                - EUR 3 x units "EU Import Duty" and, from 2026-11-01 00:00 UTC, EUR 2 x units "EU Customs
  *                  Fee", as two separate fee lines. BOTH carry VAT at the destination STANDARD rate
  *                  (taxable lines; the VAT is WooCommerce's line tax, rounded half up to the cent).
- *              Above EUR 150 the duty is a Dutify quote and is NOT modelled here. Only the UHF is (from the
- *              same date): it is folded into the one non-taxable duty line GROSSED by the destination's
- *              standard VAT (net x (1 + rate)), with the net recorded as the handling component, so that
- *              duty + tax + handling = the line. `uhfOverThreshold: 'dutify'` switches that top-up off.
+ *              Above EUR 150 the duty is a Dutify quote and is NOT modelled here. Only the UHF is, from the same date,
+ *              and WHERE it goes depends on what the Duty Fee could be priced from (`dutyFee.quote`), exactly as in
+ *              wclc's WCLC_Duty_Fee::maybe_add_fee:
+ *                - usable quote: the UHF is topped up onto the quote's one non-taxable Duty Fee line, GROSSED by the
+ *                  destination standard VAT (net x (1 + rate)); on a line that is itself taxable it goes in NET (the
+ *                  line's own VAT covers it). `uhfOverThreshold: 'dutify'` (Dutify's quote already holds it) turns
+ *                  the top-up off, and ONLY here and in the "quote priced nothing" case.
+ *                - no quote at all (duty off, Calcurates stand-down, no API key, the FX band just above the
+ *                  threshold) or the quote priced nothing: a Duty Fee line holding the UHF ALONE, grossed, always
+ *                  NON-taxable. Except "priced nothing", these ignore `uhfOverThreshold`: there is no quote to hold it.
+ *                - quote unusable outside the band: the percent-of-goods fallback estimate plus the UHF
+ *                  (`gross_amount`, whatever the mode says).
+ *                - destination still a guess (deferred) or no request could be built: nothing is charged and the cart is
+ *                  UNPRICED, with no UHF.
+ *              The net of the UHF is recorded as the handling component, so duty + tax + handling = the line.
+ *   UNKNOWN VALUE  a missing/unreadable consignment value is UNPRICED (wclc leaves the cart unpriced when it cannot
+ *              express the value in the threshold currency), never read as 0 and so as the relieved regime.
  *   MONEY      exact decimals, EUR, half-up to the cent. Conversion into another order currency is the
  *              caller's, as it is in wclc (amounts are EUR-denominated there too).
  */
@@ -52,7 +65,9 @@ export type EuFeeConfig = {
   hsDigits: number
   /** wclc `hs_charge_uncoded`: one unit per line with no usable code. */
   chargeUncoded: boolean
-  /** wclc `uhf_over_threshold`: 'wclc' adds the UHF above the threshold, 'dutify' leaves it to the quote. */
+  /** wclc `duty_fallback_percent`: the percent-of-goods duty estimate when no usable quote could be had. */
+  dutyFallbackPercent: string
+  /** wclc `uhf_over_threshold`: 'wclc' tops the UHF up onto a usable quote, 'dutify' leaves it to the quote. */
   uhfOverThreshold: 'wclc' | 'dutify'
   /**
    * wclc `duty_tax_class` taxed (not the default). When the over-threshold duty line is itself taxable
@@ -72,6 +87,7 @@ export const DEFAULT_EU_FEE_CONFIG: EuFeeConfig = {
   uhfEnabled: true,
   hsDigits: 6,
   chargeUncoded: true,
+  dutyFallbackPercent: '2',
   uhfOverThreshold: 'wclc',
   dutyFeeLineTaxable: false,
 }
@@ -81,11 +97,32 @@ export type EuFeeLineInput = {
   hsCodes: readonly string[]
 }
 
+/**
+ * What the Duty Fee (above the threshold) could be priced from, as wclc's Dutify client reports it:
+ * `usable` a quote; `none` Dutify priced nothing (an answer); `unconfigured` no API key; `unusable` no usable figure (API
+ * failure); `deferred` the destination is still a geolocation guess; `no_request` the cart could not be described to ask.
+ */
+export type DutyQuoteState = 'usable' | 'none' | 'unconfigured' | 'unusable' | 'deferred' | 'no_request'
+
+export type DutyFeeContext = {
+  /** wclc `duty_enabled` (default true). Off: the UHF is still owed, alone. */
+  dutyEnabled?: boolean
+  /** Calcurates already folds the duty into shipping (the stand-down): the UHF is still owed, alone. */
+  calcuratesStandDown?: boolean
+  /** Default `usable`. */
+  quote?: DutyQuoteState
+}
+
 export type EuFeeInput = {
   destinationCountry: string
   customer: 'private' | 'business'
-  /** Consignment intrinsic value in EUR (goods actually paid, post-discount, ex-VAT: wclc `goods_ex_tax`). */
-  consignmentValueEur: DecimalInput
+  /**
+   * Consignment intrinsic value in EUR (goods actually paid, post-discount, ex-VAT: wclc `goods_ex_tax`). REQUIRED: null,
+   * undefined, empty or unreadable gives an `unpriced` result, never the relieved regime.
+   */
+  consignmentValueEur: DecimalInput | undefined
+  /** Only read above the threshold. */
+  dutyFee?: DutyFeeContext
   lines: readonly EuFeeLineInput[]
   /** When the order is placed (the UHF date gate is judged on this instant). */
   at: Date
@@ -101,10 +138,26 @@ export type EuFeeAmounts = {
   vat: Decimal
 }
 
+export type OverThresholdUhf = {
+  /** The amount the UHF adds: net x (1 + VAT) where grossed, else the net. */
+  gross: Decimal
+  /** The UHF net (`_wclc_handling_component`). */
+  handlingComponent: Decimal
+  /** gross - net: belongs to `_wclc_tax_component`. */
+  taxPart: Decimal
+  /**
+   * Where it lands: `quote_line` topped onto the usable quote's Duty Fee line; `uhf_only_line` a Duty Fee line holding
+   * the UHF alone (always non-taxable); `fallback_line` on the percent-of-goods fallback line.
+   */
+  placement: 'quote_line' | 'uhf_only_line' | 'fallback_line'
+  /** Whether the line it lands on is taxable (a UHF-only line never is). */
+  lineTaxable: boolean
+}
+
 export type EuFeeResult = {
-  regime: 'not_applicable' | 'flat_rate' | 'over_threshold'
-  /** Why nothing applies (regime 'not_applicable' only). */
-  reason?: 'not_eu_27' | 'business_customer'
+  regime: 'not_applicable' | 'unpriced' | 'flat_rate' | 'over_threshold'
+  /** Why nothing applies or the cart is unpriced. */
+  reason?: 'not_eu_27' | 'business_customer' | 'value_unknown' | 'destination_deferred' | 'no_request'
   distinctHsCodes: number
   uncodedLines: number
   /** The shared unit count: distinct codes + (when charged) uncoded lines. */
@@ -113,13 +166,10 @@ export type EuFeeResult = {
   duty: EuFeeAmounts | null
   /** "EU Customs Fee" fee line (flat_rate only), taxable. Null when not owed. */
   uhf: EuFeeAmounts | null
-  /**
-   * over_threshold only: what is added to the Duty Fee line for the UHF. `gross` is the amount added to the line
-   * (net x (1 + VAT) on a non-taxable line, net on a taxable one); `handlingComponent` is the net
-   * (`_wclc_handling_component`); `taxPart` is gross - net (it belongs to `_wclc_tax_component`).
-   * The Dutify duty itself is NOT modelled. Null when not owed.
-   */
-  overThresholdUhf: { gross: Decimal; handlingComponent: Decimal; taxPart: Decimal } | null
+  /** over_threshold only: the UHF and where it lands. The Dutify duty itself is NOT modelled. Null when not owed. */
+  overThresholdUhf: OverThresholdUhf | null
+  /** over_threshold, `unusable` outside the band, percent above zero: the percent-of-goods duty estimate (EUR). */
+  dutyEstimate: Decimal | null
   /** over_threshold, grossing wanted, but no standard rate configured: wclc adds the fee net and warns. */
   vatRateMissing: boolean
 }
@@ -165,18 +215,38 @@ export function isUhfLive(at: Date, config: Pick<EuFeeConfig, 'uhfEnabled' | 'uh
   return config.uhfEnabled && at.getTime() >= config.uhfEffective.getTime()
 }
 
+/** A present, finite, non-negative EUR value, or null. */
+function readConsignmentValue(value: DecimalInput | undefined): Decimal | null {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string' && value.trim() === '') return null
+  try {
+    const d = toDecimal(value)
+    return d.isNegative() ? null : d
+  } catch {
+    return null
+  }
+}
+
+const ROUNDING_TOLERANCE = toDecimal('0.01')
+/** wclc `FALLBACK_BAND_PERCENT`: just above the threshold, where the duty fallback is suppressed. */
+const FALLBACK_BAND_PERCENT = 2
+
 export function computeEuCustomsFees(input: EuFeeInput): EuFeeResult {
   const config: EuFeeConfig = { ...DEFAULT_EU_FEE_CONFIG, ...input.config }
-  const empty = (reason: 'not_eu_27' | 'business_customer'): EuFeeResult => ({
-    regime: 'not_applicable', reason, distinctHsCodes: 0, uncodedLines: 0, units: 0,
-    duty: null, uhf: null, overThresholdUhf: null, vatRateMissing: false,
+  const none = (regime: EuFeeResult['regime'], reason: NonNullable<EuFeeResult['reason']>, counts?: ReturnType<typeof countCustomsUnits>): EuFeeResult => ({
+    regime, reason, distinctHsCodes: counts?.distinctHsCodes ?? 0, uncodedLines: counts?.uncodedLines ?? 0, units: counts?.units ?? 0,
+    duty: null, uhf: null, overThresholdUhf: null, dutyEstimate: null, vatRateMissing: false,
   })
 
   const country = input.destinationCountry.trim().toUpperCase()
-  if (!EU_27_COUNTRIES.has(country)) return empty('not_eu_27')
-  if (input.customer === 'business') return empty('business_customer')
+  if (!EU_27_COUNTRIES.has(country)) return none('not_applicable', 'not_eu_27')
+  if (input.customer === 'business') return none('not_applicable', 'business_customer')
 
   const counts = countCustomsUnits(input.lines, config)
+  const value = readConsignmentValue(input.consignmentValueEur)
+  // wclc: a value that cannot be expressed in the threshold currency leaves the cart unpriced - charging either regime would be a guess.
+  if (value === null) return none('unpriced', 'value_unknown', counts)
+
   const units = toDecimal(counts.units)
   const ratePercent = input.standardVatRatePercent == null ? null : toDecimal(input.standardVatRatePercent)
   const rate = ratePercent !== null && ratePercent.gt(0) ? ratePercent : null
@@ -184,19 +254,86 @@ export function computeEuCustomsFees(input: EuFeeInput): EuFeeResult {
   const uhfUnit = toDecimal(config.uhfPerUnit)
   const uhfOwed = isUhfLive(input.at, config) && counts.units > 0 && uhfUnit.gt(0)
   const vatOn = (net: Decimal): Decimal => (rate === null ? toDecimal(0) : cents(net.mul(rate).div(100)))
+  const threshold = toDecimal(config.thresholdEur)
 
   // Strictly above the threshold is the Duty Fee regime; exactly on it is still relieved.
-  if (toDecimal(input.consignmentValueEur).gt(toDecimal(config.thresholdEur))) {
-    let overThresholdUhf: EuFeeResult['overThresholdUhf'] = null
-    let vatRateMissing = false
-    if (uhfOwed && config.uhfOverThreshold === 'wclc') {
-      const net = cents(uhfUnit.mul(units))
-      const grossUp = !config.dutyFeeLineTaxable
-      vatRateMissing = grossUp && rate === null
-      const gross = grossUp && rate !== null ? cents(uhfUnit.mul(units).mul(toDecimal(1).add(rate.div(100)))) : net
-      overThresholdUhf = { gross, handlingComponent: net, taxPart: gross.sub(net) }
+  if (value.gt(threshold)) {
+    const ctx = input.dutyFee ?? {}
+    const quote: DutyQuoteState = ctx.quote ?? 'usable'
+    const base = { ...none('over_threshold', 'value_unknown', counts), reason: undefined }
+    const unpriced = (reason: 'destination_deferred' | 'no_request'): EuFeeResult => ({ ...none('unpriced', reason, counts) })
+
+    const net = cents(uhfUnit.mul(units))
+    // gross_amount(cart, gross): net x (1 + rate) when grossing and a standard rate exists, else the net (with a warning).
+    const grossed = (gross: boolean) => {
+      const missing = gross && rate === null
+      const amount = gross && rate !== null ? cents(uhfUnit.mul(units).mul(toDecimal(1).add(rate.div(100)))) : net
+      return { amount, missing }
     }
-    return { regime: 'over_threshold', ...counts, duty: null, uhf: null, overThresholdUhf, vatRateMissing }
+    const make = (amount: Decimal, missing: boolean, placement: OverThresholdUhf['placement'], lineTaxable: boolean): OverThresholdUhf => ({
+      gross: amount, handlingComponent: net, taxPart: amount.sub(net), placement, lineTaxable,
+    })
+    /** charge_uhf_only: a Duty Fee line holding the UHF alone, non-taxable; not charged at or under a cent. */
+    const uhfOnly = (amount: number | Decimal, missing: boolean): EuFeeResult => {
+      const a = toDecimal(amount)
+      if (!uhfOwed || a.lte(ROUNDING_TOLERANCE)) return { ...base, overThresholdUhf: null }
+      return { ...base, overThresholdUhf: make(a, missing, 'uhf_only_line', false), vatRateMissing: missing }
+    }
+    // The top-up onto a usable quote: gross on a non-taxable line, net on a taxable one; nothing in 'dutify' mode.
+    const topUp = (): { amount: Decimal; missing: boolean } | null => {
+      if (!uhfOwed || config.uhfOverThreshold === 'dutify') return null
+      return grossed(!config.dutyFeeLineTaxable)
+    }
+
+    // Paths that price no duty at all and so owe the UHF alone (wclc: charge_uhf_only(cart, true)): grossed whatever the mode says.
+    const noQuoteUhf = () => { const g = grossed(true); return uhfOnly(g.amount, g.missing) }
+
+    if (ctx.dutyEnabled === false || ctx.calcuratesStandDown === true) return noQuoteUhf()
+
+    switch (quote) {
+      case 'unconfigured':
+        return noQuoteUhf()
+      case 'deferred':
+      case 'no_request':
+        return unpriced(quote === 'deferred' ? 'destination_deferred' : 'no_request')
+      case 'none': {
+        // Dutify priced nothing: the UHF is still due where the mode allows it (top_up), grossed, on its own line.
+        const t = topUp()
+        // A top-up always grosses here (wclc calls top_up($cart) with the default), whatever duty_tax_class says.
+        if (t === null) return { ...base, overThresholdUhf: null }
+        const g = grossed(true)
+        return uhfOnly(g.amount, g.missing)
+      }
+      case 'unusable': {
+        const bandTop = threshold.mul(toDecimal(1).add(toDecimal(FALLBACK_BAND_PERCENT).div(100)))
+        if (threshold.gt(0) && value.gte(threshold) && value.lte(bandTop)) return noQuoteUhf() // the FX band: no duty estimate, UHF alone
+        // The percent-of-goods fallback estimate (duty alone) plus the UHF, whatever the over-threshold mode says.
+        const percent = toDecimal(config.dutyFallbackPercent)
+        const g = grossed(!config.dutyFeeLineTaxable)
+        const uhfAmount = uhfOwed ? g.amount : toDecimal(0)
+        if (percent.lte(0)) {
+          if (uhfAmount.gt(ROUNDING_TOLERANCE)) return { ...base, overThresholdUhf: make(uhfAmount, g.missing, 'uhf_only_line', false), vatRateMissing: g.missing }
+          return { ...base, overThresholdUhf: null }
+        }
+        const estimate = cents(value.mul(percent).div(100))
+        if (estimate.lte(ROUNDING_TOLERANCE)) {
+          if (uhfAmount.gt(ROUNDING_TOLERANCE)) return { ...base, overThresholdUhf: make(uhfAmount, g.missing, 'uhf_only_line', false), vatRateMissing: g.missing }
+          return { ...base, overThresholdUhf: null }
+        }
+        return {
+          ...base,
+          dutyEstimate: estimate,
+          overThresholdUhf: uhfAmount.gt(0) ? make(uhfAmount, g.missing, 'fallback_line', config.dutyFeeLineTaxable) : null,
+          vatRateMissing: uhfAmount.gt(0) && g.missing,
+        }
+      }
+      case 'usable':
+      default: {
+        const t = topUp()
+        if (t === null) return { ...base, overThresholdUhf: null }
+        return { ...base, overThresholdUhf: make(t.amount, t.missing, 'quote_line', config.dutyFeeLineTaxable), vatRateMissing: t.missing }
+      }
+    }
   }
 
   const dutyNet = config.dutyEnabled && counts.units > 0 && dutyUnit.gt(0) ? cents(dutyUnit.mul(units)) : null
@@ -207,6 +344,7 @@ export function computeEuCustomsFees(input: EuFeeInput): EuFeeResult {
     duty: dutyNet === null ? null : { net: dutyNet, vat: vatOn(dutyNet) },
     uhf: uhfNet === null ? null : { net: uhfNet, vat: vatOn(uhfNet) },
     overThresholdUhf: null,
+    dutyEstimate: null,
     vatRateMissing: false,
   }
 }

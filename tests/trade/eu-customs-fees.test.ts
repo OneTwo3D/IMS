@@ -16,6 +16,7 @@ import {
   type EuFeeConfig,
   type EuFeeInput,
   type EuFeeLineInput,
+  type DutyQuoteState,
 } from '@/lib/trade/eu-customs-fees'
 
 const L = (...hsCodes: string[]): EuFeeLineInput => ({ hsCodes })
@@ -202,6 +203,129 @@ test('config type: a partial override leaves the other defaults', () => {
   const r = run({ lines: [L('3926909790')], config: cfg })
   assert.equal(f(r.duty?.net), '4.00')
   assert.equal(f(r.uhf?.net), '2.00')
+})
+
+// --- unknown value: unpriced, never the relieved regime ------------------------------------------------
+
+test('unknown consignment value is UNPRICED, not read as 0 and so as the relieved flat-rate regime', () => {
+  const lines = [L('3926909790')]
+  for (const bad of [null, undefined, '', '   ', 'abc', Number.NaN, Number.POSITIVE_INFINITY, -1, '-5']) {
+    const r = run({ lines, consignmentValueEur: bad as never })
+    assert.equal(r.regime, 'unpriced', `value ${String(bad)}`)
+    assert.equal(r.reason, 'value_unknown')
+    assert.equal(r.duty, null)
+    assert.equal(r.uhf, null)
+    assert.equal(r.overThresholdUhf, null)
+  }
+  // Zero is a real value (a free-goods cart): relieved, charged per unit.
+  assert.equal(run({ lines, consignmentValueEur: 0 }).regime, 'flat_rate')
+  assert.equal(run({ lines, consignmentValueEur: '0' }).regime, 'flat_rate')
+  // The gates come first, as in wclc: a business or non-EU cart is simply not applicable, value or no value.
+  assert.equal(run({ lines, destinationCountry: 'US', consignmentValueEur: null as never }).regime, 'not_applicable')
+  assert.equal(run({ lines, customer: 'business', consignmentValueEur: undefined }).regime, 'not_applicable')
+})
+
+// --- over EUR 150: where the UHF goes depends on what the Duty Fee could be priced from ------------------
+
+const over = (extra: Partial<EuFeeInput> = {}) => run({ lines: [L('3926909790')], consignmentValueEur: 200, ...extra })
+const FEE = (r: ReturnType<typeof over>) => r.overThresholdUhf
+
+test('over threshold, wclc "exits that price no duty": no API key, the FX band, duty off, Calcurates stand-down -> the UHF alone 2.38, non-taxable', () => {
+  const cases: Array<[string, ReturnType<typeof over>]> = [
+    ['unconfigured (no key)', over({ dutyFee: { quote: 'unconfigured' } })],
+    ['FX band (151, unusable quote)', over({ consignmentValueEur: 151, dutyFee: { quote: 'unusable' } })],
+    ['duty switched off', over({ dutyFee: { dutyEnabled: false } })],
+    ['Calcurates stand-down', over({ dutyFee: { calcuratesStandDown: true } })],
+  ]
+  for (const [name, r] of cases) {
+    assert.equal(r.regime, 'over_threshold', name)
+    assert.equal(f(FEE(r)?.gross), '2.38', name)
+    assert.equal(FEE(r)?.placement, 'uhf_only_line', name)
+    assert.equal(FEE(r)?.lineTaxable, false, name)
+    assert.equal(f(FEE(r)?.handlingComponent), '2.00', name)
+    assert.equal(r.dutyEstimate, null, name)
+  }
+})
+
+test('those no-quote paths owe the UHF in EVERY over-threshold mode (dutify mode has no quote to hold it), even on a taxable duty_tax_class', () => {
+  const dutify: Partial<EuFeeConfig> = { uhfOverThreshold: 'dutify', dutyFeeLineTaxable: true }
+  assert.equal(f(FEE(over({ config: dutify, dutyFee: { dutyEnabled: false } }))?.gross), '2.38')
+  assert.equal(f(FEE(over({ config: dutify, dutyFee: { calcuratesStandDown: true } }))?.gross), '2.38')
+  assert.equal(f(FEE(over({ config: dutify, dutyFee: { quote: 'unconfigured' } }))?.gross), '2.38')
+  assert.equal(f(FEE(over({ config: dutify, consignmentValueEur: 151, dutyFee: { quote: 'unusable' } }))?.gross), '2.38')
+  // Duty off + taxable class: the line is forced non-taxable and grossed ("not taxed again either").
+  assert.equal(FEE(over({ config: { dutyFeeLineTaxable: true }, dutyFee: { dutyEnabled: false } }))?.lineTaxable, false)
+})
+
+test('before 2026-11-01 those paths owe nothing, exactly the old behaviour', () => {
+  const before = new Date('2026-10-31T12:00:00Z')
+  for (const dutyFee of [{ quote: 'unconfigured' }, { dutyEnabled: false }, { calcuratesStandDown: true }] as const) {
+    assert.equal(FEE(over({ at: before, dutyFee })), null)
+  }
+  assert.equal(FEE(over({ at: before, consignmentValueEur: 151, dutyFee: { quote: 'unusable' } })), null)
+  assert.equal(FEE(over({ at: new Date('2026-11-01T00:00:00Z'), dutyFee: { quote: 'unconfigured' } }))?.gross.toFixed(2), '2.38')
+})
+
+test('usable quote: topped up onto the quote line, grossed (2.38); dutify mode adds nothing; a TAXABLE line takes it net (52.00 in wclc)', () => {
+  const usable = over({ dutyFee: { quote: 'usable' } })
+  assert.equal(f(FEE(usable)?.gross), '2.38')
+  assert.equal(FEE(usable)?.placement, 'quote_line')
+  assert.equal(over({ config: { uhfOverThreshold: 'dutify' } }).overThresholdUhf, null) // 50.0 in wclc: the quote as it came
+  const taxable = over({ config: { dutyFeeLineTaxable: true } })
+  assert.equal(f(FEE(taxable)?.gross), '2.00') // 10 + 40 + the NET fee 2 = 52.00
+  assert.equal(FEE(taxable)?.lineTaxable, true)
+})
+
+test('"Dutify priced nothing": the UHF alone via the top-up - grossed, on its own non-taxable line, but off in dutify mode', () => {
+  const none = over({ dutyFee: { quote: 'none' } })
+  assert.equal(f(FEE(none)?.gross), '2.38')
+  assert.equal(FEE(none)?.placement, 'uhf_only_line')
+  assert.equal(FEE(none)?.lineTaxable, false)
+  assert.equal(FEE(over({ dutyFee: { quote: 'none' }, config: { dutyFeeLineTaxable: true } }))?.lineTaxable, false) // "not taxed again either"
+  assert.equal(FEE(over({ dutyFee: { quote: 'none' }, config: { uhfOverThreshold: 'dutify' } })), null)
+})
+
+test('deferred destination / no request: UNPRICED, no UHF', () => {
+  for (const quote of ['deferred', 'no_request'] as DutyQuoteState[]) {
+    const r = over({ dutyFee: { quote } })
+    assert.equal(r.regime, 'unpriced')
+    assert.equal(r.reason, quote === 'deferred' ? 'destination_deferred' : 'no_request')
+    assert.equal(r.overThresholdUhf, null)
+  }
+})
+
+test('unusable quote outside the band: the percent-of-goods estimate (2% of 200 = 4.00) plus the UHF whatever the mode says (4 + 2.38)', () => {
+  const r = over({ dutyFee: { quote: 'unusable' } })
+  assert.equal(f(r.dutyEstimate), '4.00')
+  assert.equal(f(FEE(r)?.gross), '2.38')
+  assert.equal(FEE(r)?.placement, 'fallback_line')
+  assert.equal(FEE(r)?.lineTaxable, false)
+  // Mode does not matter (no quote to hold the fee in).
+  assert.equal(f(FEE(over({ dutyFee: { quote: 'unusable' }, config: { uhfOverThreshold: 'dutify' } }))?.gross), '2.38')
+  // A taxable Duty Fee line: 4 + the NET fee 2 = 6.00 in wclc.
+  const taxable = over({ dutyFee: { quote: 'unusable' }, config: { dutyFeeLineTaxable: true } })
+  assert.equal(f(taxable.dutyEstimate), '4.00')
+  assert.equal(f(FEE(taxable)?.gross), '2.00')
+  assert.equal(FEE(taxable)?.lineTaxable, true)
+})
+
+test('unusable quote, fallback switched off or estimate a cent or less: the UHF alone, or nothing without it', () => {
+  const off = over({ dutyFee: { quote: 'unusable' }, config: { dutyFallbackPercent: '0' } })
+  assert.equal(off.dutyEstimate, null)
+  assert.equal(f(FEE(off)?.gross), '2.38')
+  assert.equal(FEE(off)?.placement, 'uhf_only_line')
+  const tiny = over({ dutyFee: { quote: 'unusable' }, config: { dutyFallbackPercent: '0.001' } })
+  assert.equal(tiny.dutyEstimate, null)
+  assert.equal(FEE(tiny)?.placement, 'uhf_only_line')
+  const beforeDate = over({ dutyFee: { quote: 'unusable' }, config: { dutyFallbackPercent: '0' }, at: new Date('2026-10-31T12:00:00Z') })
+  assert.equal(FEE(beforeDate), null)
+})
+
+test('the FX band is [150, 153] inclusive of the top and the fallback applies beyond it', () => {
+  const at = (v: number | string) => over({ consignmentValueEur: v, dutyFee: { quote: 'unusable' } })
+  assert.equal(at('150.01').dutyEstimate, null) // in the band: UHF alone, no estimate
+  assert.equal(at('153').dutyEstimate, null)
+  assert.equal(f(at('153.01').dutyEstimate), '3.06') // beyond it: 2% of 153.01
 })
 
 // --- the module is unused until the switchover ----------------------------------------------------
