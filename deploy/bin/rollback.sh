@@ -46,12 +46,7 @@ docker image inspect "$(migrate_image "$prev_sha")" >/dev/null 2>&1 || docker pu
 applied="$(applied_migrations "$cur_sha")" || die "cannot read _prisma_migrations from the database"
 prev_known="$(list_image_migrations "$prev_sha" | cut -f1)" || die "cannot list the migrations in $(migrate_image "$prev_sha")"
 cur_listing="$(list_image_migrations "$cur_sha")" || die "cannot list the migrations in $(migrate_image "$cur_sha")"
-unsafe=""
-while IFS= read -r name; do
-  [ -n "$name" ] || continue
-  grep -Fxq -- "$name" <<< "$prev_known" && continue
-  if ! grep -Fxq -- "${name}"$'\t'expand <<< "$cur_listing"; then unsafe+="${name}"$'\n'; fi
-done <<< "$applied"
+unsafe="$(absent_unsafe_migrations "$applied" "$prev_known" "$cur_listing")"
 if [ -n "$unsafe" ]; then
   log "migrations applied since ${prev_sha} that are NOT marked '-- expand-only':"
   sed 's/^/  /' <<< "$unsafe" >&2

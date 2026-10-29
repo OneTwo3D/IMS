@@ -326,7 +326,9 @@ fit it). `--allow-contract-migration` without `--maintenance` is a usage error. 
 when nothing is serving (nginx reports no slot and neither slot container is running): the first install. An empty history while a
 release is serving or running means `DATABASE_URL` points at the wrong database, and the deploy refuses (status 3) unless the
 maintenance flags are given. `rollback.sh` refuses when any migration applied since `previous` lacks the marker; `--force-schema-mismatch`
-overrides.
+overrides. `deploy.sh` applies the same rule to an OLDER target image: any already-applied migration the target does not ship must be
+marked expand-only (looked up in the serving release), otherwise it exits 3 before migrating or starting anything; the same
+`--force-schema-mismatch` overrides. Both scripts call one shared function, `absent_unsafe_migrations`.
 
 **Failures never take down the slot nginx serves.** Every failure path stops a slot only after the X-IMS-Slot header confirms nginx is
 not serving from it. If a switch-back fails and nginx still serves the new slot, both slots are left running, nothing is recorded in the

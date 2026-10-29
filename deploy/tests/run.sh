@@ -953,6 +953,40 @@ t_a_stop_that_does_not_take_effect_is_cleanup_pending_for_rollback_and_cleanup()
   grep -q 'still running after docker stop' "$T/out" || fail "no message from cleanup"
 }
 
+t_deploying_an_older_image_is_refused_when_it_lacks_an_applied_contract_migration() {
+  seed_active blue "$B"; migs "$B" m1:expand m2:other; migs "$A" m1:expand; applied m1 m2        # m2 is applied but A does not ship it
+  deploy "$A"
+  eq "$rc" 3 "older image across a non-expand migration"
+  grep -q 'm2' "$T/out" || fail "the offending migration is not named"
+  grep -q 'lacks' "$T/out" || fail "no clear message"
+  log_lacks '^MIGRATE'
+  log_lacks '^RUN-SLOT'
+  eq "$(container_running ims-blue)" 1
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B blue"
+}
+
+t_deploying_an_older_image_is_allowed_across_expand_only_migrations() {
+  seed_active blue "$B"; migs "$B" m1:expand m2:expand; migs "$A" m1:expand; applied m1 m2
+  deploy "$A"
+  eq "$rc" 0 "older image across an expand-only migration: $(tail -n 3 "$T/out")"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A green"
+}
+
+t_deploying_an_older_image_can_be_forced() {
+  seed_active blue "$B"; migs "$B" m1:expand m2:other; migs "$A" m1:expand; applied m1 m2
+  deploy --force-schema-mismatch "$A"
+  eq "$rc" 0 "forced: $(tail -n 3 "$T/out")"
+  grep -q 'force-schema-mismatch given' "$T/out" || fail "the override was not logged"
+}
+
+t_deploying_an_older_image_with_unknown_markers_is_refused() {
+  seed_active blue "$B"; migs "$A" m1:expand; applied m1 m2      # no listing for B at all: the markers cannot be verified
+  : > "$STUB/migs/$B"
+  deploy "$A"
+  eq "$rc" 3 "unverifiable markers"
+  log_lacks '^MIGRATE'
+}
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 tests=("$@")
 if [ "${#tests[@]}" = 0 ]; then mapfile -t tests < <(declare -F | awk '{print $3}' | grep '^t_'); fi

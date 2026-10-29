@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Blue/green deploy of a CI-built IMS release on the production host.
 #
-#   deploy.sh [--allow-contract-migration --maintenance] <full-commit-sha>
+#   deploy.sh [--allow-contract-migration --maintenance] [--force-schema-mismatch] <full-commit-sha>
 #
 # Two app slots (ims-blue on 127.0.0.1:3101, ims-green on 127.0.0.1:3102) run the same image family; nginx on :3000 proxies to the
 # ACTIVE one through an included upstream file. A deploy starts the new release in the idle slot, health-checks it, switches the
@@ -19,6 +19,10 @@
 # accepts the downtime. A database with no applied migrations yet (the very first install) has no running release to protect and is
 # exempt.
 #
+# Deploying an OLDER image is checked like a rollback: every migration already applied to the database that the target image does not ship
+# must be marked expand-only (looked up in the release currently serving), or the deploy is refused (status 3) before anything is
+# migrated or started. --force-schema-mismatch overrides, exactly as for rollback.sh.
+#
 # Writers are held off by default: the release is not started unless the env file sets PRODUCER_HOLD_ENFORCED_DESTINATIONS.
 #
 # Exit codes: 0 deployed; 1 failed with the old release still serving (or, in maintenance mode, stopped); 2 usage;
@@ -32,11 +36,12 @@ here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
 hc_reexec ims-deploy "${BASH_SOURCE[0]}" "$@"
 
-allow_contract=0 maintenance=0 sha=""
+allow_contract=0 maintenance=0 force_schema=0 sha=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --allow-contract-migration) allow_contract=1 ;;
     --maintenance) maintenance=1 ;;
+    --force-schema-mismatch) force_schema=1 ;;
     -h|--help) sed -n '2,25p' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) [ -z "$sha" ] || { echo "only one commit sha may be given" >&2; exit 2; }; sha="$1" ;;
@@ -75,6 +80,22 @@ docker pull "$(migrate_image "$sha")" >/dev/null || die "cannot pull $(migrate_i
 applied="$(applied_migrations "$sha")" || die "cannot read _prisma_migrations from the database"
 shipped="$(list_image_migrations "$sha")" || die "cannot list the migrations in $(migrate_image "$sha")"
 [ -n "$shipped" ] || die "$(migrate_image "$sha") lists no migrations; refusing to continue"
+# Schema compatibility of the TARGET with what the database already holds (the rollback.sh rule): an older image must not be started
+# against migrations it does not know unless they are expand-only. Markers come from the release currently serving.
+target_known="$(cut -f1 <<< "$shipped")"
+marker_listing=""
+if [ -n "$old_sha" ]; then
+  { docker image inspect "$(migrate_image "$old_sha")" >/dev/null 2>&1 || docker pull "$(migrate_image "$old_sha")" >/dev/null 2>&1; } \
+    && marker_listing="$(list_image_migrations "$old_sha")" || marker_listing=""
+fi
+unsafe_absent="$(absent_unsafe_migrations "$applied" "$target_known" "$marker_listing")"
+if [ -n "$unsafe_absent" ]; then
+  log "target image ${sha} lacks applied migration(s) that are not verified expand-only:"
+  sed 's/^/  /' <<< "$unsafe_absent" >&2
+  if [ "$force_schema" = 1 ]; then log "--force-schema-mismatch given: continuing"; else
+    DIE_RC=3 die "target image ${sha} lacks the applied migration(s) above (contract or unverified): refusing, before anything is migrated or started. Override with --force-schema-mismatch only if the older code is known to be compatible."
+  fi
+fi
 pending="" bad=""
 while IFS=$'\t' read -r name marker; do
   [ -n "$name" ] || continue

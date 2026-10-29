@@ -352,6 +352,19 @@ applied_migrations() { # <sha of an image that carries psql and node>
     --entrypoint node "$(runtime_image "$1")" -e "$APPLIED_JS"
 }
 
+# The schema-compatibility rule shared by deploy.sh and rollback.sh. Prints (one per line) every APPLIED migration that the target image
+# does not ship (it is "absent") and that is not verified expand-only in the marker listing (an image that does ship it). Such a
+# migration may have changed the schema in a way the target's older code cannot run against. Unknown to the listing counts as unsafe.
+#   absent_unsafe_migrations <applied names> <target image's migration names> <"name<TAB>expand|other" listing that carries the markers>
+absent_unsafe_migrations() {
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    grep -Fxq -- "$name" <<< "$2" && continue
+    grep -Fxq -- "${name}"$'\t'expand <<< "$3" || printf '%s\n' "$name"
+  done <<< "$1"
+}
+
 # --- atomic file writes ---------------------------------------------------------------------------------------------------------
 write_atomic() { # <path> <content>   (temp file in the same directory, then mv)
   local path="$1" tmp
