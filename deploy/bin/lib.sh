@@ -43,8 +43,9 @@ slot_port() { case "$1" in blue) echo "$IMS_BLUE_PORT" ;; green) echo "$IMS_GREE
 other_slot() { case "$1" in blue) echo green ;; green) echo blue ;; *) die "unknown slot $1" ;; esac; }
 slot_name() { echo "ims-$1"; }
 
-# The slot nginx is sending traffic to RIGHT NOW (the upstream file is the truth; the state files are only a record). Prints
-# blue, green or none (no upstream file, or one that names neither slot port, e.g. the bootstrap placeholder).
+# The slot named by the upstream FILE (what the next nginx reload will serve). Prints blue, green or none (no file, or one that names
+# neither slot port, e.g. the bootstrap placeholder). This is NOT proof of what is serving: a switch interrupted between the file write
+# and the reload leaves the file ahead of the running nginx. Use serving_slot for that.
 active_slot() {
   local line=""
   [ -f "$IMS_UPSTREAM_FILE" ] && line="$(grep -E '^[[:space:]]*server[[:space:]]+127\.0\.0\.1:[0-9]+' "$IMS_UPSTREAM_FILE" | head -n1 || true)"
@@ -54,6 +55,45 @@ active_slot() {
     *) echo none ;;
   esac
 }
+
+# The slot the RUNNING nginx serves from, read from the X-IMS-Slot response header that the loaded configuration adds (the upstream
+# include defines the value in the same file as the upstream, so the header always matches the loaded upstream). blue, green or none;
+# rc 1 when nginx does not answer or the header is missing or unrecognised.
+header_slot() {
+  local out value
+  out="$(curl -sI --max-time 5 "${IMS_FRONT_URL}/login" 2>/dev/null)" || return 1
+  value="$(printf '%s\n' "$out" | tr -d '\r' | awk -F': *' 'tolower($1) == "x-ims-slot" { print $2; exit }')"
+  case "$value" in blue|green|none) printf '%s\n' "$value" ;; *) return 1 ;; esac
+}
+
+# Which slot is serving, from the running nginx. If the upstream file disagrees, a switch was interrupted after the file write but
+# before the reload: the file is rolled back to what is actually serving (nginx -t, graceful reload) and the header re-read. Never
+# guesses: if nginx cannot be asked, or the state cannot be reconciled, it stops.
+serving_slot() {
+  local hdr file i
+  hdr="$(header_slot)" || { log "cannot read the X-IMS-Slot header from ${IMS_FRONT_URL}/login (is nginx up with the ims site?)"; return 1; }
+  file="$(active_slot)"
+  if [ "$hdr" != "$file" ]; then
+    log "nginx serves '${hdr}' but ${IMS_UPSTREAM_FILE} names '${file}': an earlier switch was interrupted"
+    if [ "$hdr" = none ]; then log "nothing is serving; fix ${IMS_UPSTREAM_FILE} and nginx by hand"; return 1; fi
+    log "restoring the upstream file to the serving slot (${hdr})"
+    switch_upstream "$(slot_port "$hdr")" || return 1
+    for i in 1 2 3 4 5; do
+      [ "$(header_slot || true)" = "$hdr" ] && break
+      [ "$i" = 5 ] && { log "nginx does not report '${hdr}' after the restore"; return 1; }
+      sleep 1
+    done
+  fi
+  printf '%s\n' "$hdr"
+}
+
+# Refuse to remove or stop a slot nginx is serving from.
+assert_not_serving() { # <slot>
+  local hdr
+  hdr="$(header_slot)" || { log "cannot tell whether $(slot_name "$1") is serving; not touching it"; return 1; }
+  if [ "$hdr" = "$1" ]; then log "REFUSING to remove or stop $(slot_name "$1"): nginx is serving from it"; return 1; fi
+}
+slot_running() { [ "$(docker inspect --format '{{.State.Running}}' "$(slot_name "$1")" 2>/dev/null)" = true ]; }
 
 # --- images / containers --------------------------------------------------------------------------------------------------------
 runtime_image() { echo "${IMS_REGISTRY}/ims:$1"; }
@@ -74,6 +114,7 @@ container_image_sha() { # <container> -> the sha tag of its image, empty if it d
 run_slot() { # <slot> <sha>
   local slot="$1" sha="$2" name
   name="$(slot_name "$slot")"
+  assert_not_serving "$slot" || return 1
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" --restart unless-stopped --network host \
     --env-file "$IMS_ENV_FILE" \
@@ -125,12 +166,25 @@ list_image_migrations() { # <sha>
 
 # Names of the migrations the database has applied (empty, rc 0, when it has no _prisma_migrations table yet: a fresh database).
 # Read-only: the session is forced into a read-only transaction mode. psql runs from the RUNTIME image (it carries the PostgreSQL 17
-# client) on the host network, with the env file supplying DATABASE_URL.
-# shellcheck disable=SC2016  # runs in the container's shell, not here
-APPLIED_SCRIPT='[ "$(psql "$DATABASE_URL" -X -Atq -c "select to_regclass(\$\$public._prisma_migrations\$\$) is not null")" = t ] || exit 0; psql "$DATABASE_URL" -X -Atq -c "select migration_name from _prisma_migrations where finished_at is not null and rolled_back_at is null order by migration_name"'
-applied_migrations() { # <sha of an image that carries psql>
+# client) on the host network. DATABASE_URL reaches the container only through --env-file; a small node script splits it into the
+# libpq environment variables (PGHOST, PGPASSWORD, ...) for the psql child, so no argument anywhere (docker run, node, psql) holds the
+# URL or the password, and the host process table never shows them. (libpq does not read a URI from PGDATABASE.)
+# shellcheck disable=SC2016  # JavaScript, not shell
+APPLIED_JS='
+const { execFileSync } = require("node:child_process");
+const u = new URL(process.env.DATABASE_URL);
+const env = { ...process.env, PGHOST: u.hostname.replace(/^\[|\]$/g, ""), PGPORT: u.port || "5432",
+  PGUSER: decodeURIComponent(u.username), PGPASSWORD: decodeURIComponent(u.password), PGDATABASE: decodeURIComponent(u.pathname.slice(1)) };
+const ssl = u.searchParams.get("sslmode"); if (ssl) env.PGSSLMODE = ssl;
+delete env.DATABASE_URL;
+const q = (sql) => execFileSync("psql", ["-X", "-Atq", "-v", "ON_ERROR_STOP=1", "-c", sql], { env, encoding: "utf8" }).trim();
+if (q("select to_regclass($$public._prisma_migrations$$) is not null") === "t") {
+  const rows = q("select migration_name from _prisma_migrations where finished_at is not null and rolled_back_at is null order by migration_name");
+  if (rows) console.log(rows);
+}'
+applied_migrations() { # <sha of an image that carries psql and node>
   docker run --rm --network host --env-file "$IMS_ENV_FILE" -e PGOPTIONS='-c default_transaction_read_only=on' \
-    --entrypoint sh "$(runtime_image "$1")" -c "$APPLIED_SCRIPT"
+    --entrypoint node "$(runtime_image "$1")" -e "$APPLIED_JS"
 }
 
 # --- atomic file writes ---------------------------------------------------------------------------------------------------------
@@ -148,8 +202,11 @@ read_state() { # <current|previous> -> "<sha> <slot>" or empty
 # Atomically point nginx at the slot's port: new content goes to a temp file in the same directory and is mv'd over the include;
 # `nginx -t` then validates the whole configuration, and a failure restores the previous file (also by mv) before returning 1.
 # `nginx -s reload` is graceful: old workers finish their connections.
-upstream_content() { # <port>
-  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\nupstream ims_active {\n    server 127.0.0.1:%s;\n    keepalive 16;\n}\n' "$1"
+upstream_content() { # <port>   (the map gives the site its X-IMS-Slot header, so the header always matches the loaded upstream)
+  local slot=none
+  [ "$1" != "$IMS_BLUE_PORT" ] || slot=blue
+  [ "$1" != "$IMS_GREEN_PORT" ] || slot=green
+  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\nupstream ims_active {\n    server 127.0.0.1:%s;\n    keepalive 16;\n}\nmap $server_name $ims_slot {\n    default %s;\n}\n' "$1" "$slot"
 }
 restore_upstream() { # <backup-file or empty>
   if [ -n "$1" ]; then mv -f "$1" "$IMS_UPSTREAM_FILE"; else rm -f "$IMS_UPSTREAM_FILE"; fi

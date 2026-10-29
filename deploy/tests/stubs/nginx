@@ -5,7 +5,8 @@ case "$*" in
   -t)
     # What the upstream file looked like at the moment of the test: complete, never half-written.
     echo "nginx -t [$(tr '\n' ' ' < "$IMS_UPSTREAM_FILE" 2>/dev/null)]" >> "$STUB/calls.log"
+    if [ -e "$STUB/nginx_t_fail_once" ]; then rm -f "$STUB/nginx_t_fail_once"; exit 1; fi
     [ ! -e "$STUB/nginx_t_fail" ] ;;
-  "-s reload") echo "nginx reload" >> "$STUB/calls.log" ;;
+  "-s reload") echo "nginx reload" >> "$STUB/calls.log"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded" ;;   # the "loaded config" is the file as of the last reload
   *) echo "nginx $*" >> "$STUB/calls.log" ;;
 esac

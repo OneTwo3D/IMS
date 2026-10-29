@@ -73,34 +73,50 @@ nginx_dir="$R/etc/nginx"
 install -d -m 0755 "$nginx_dir/sites-available" "$nginx_dir/sites-enabled"
 if [ ! -e "$nginx_dir/ims-upstream.conf" ]; then
   # Placeholder: names no slot port, so nothing is "active" and the holding page answers until the first deploy.
-  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\n# Placeholder until the first deploy.\nupstream ims_active {\n    server 127.0.0.1:3100;\n    keepalive 16;\n}\n' > "$nginx_dir/ims-upstream.conf"
+  printf '# Managed by deploy.sh / rollback.sh. Do not edit by hand.\n# Placeholder until the first deploy.\nupstream ims_active {\n    server 127.0.0.1:3100;\n    keepalive 16;\n}\nmap $server_name $ims_slot {\n    default none;\n}\n' > "$nginx_dir/ims-upstream.conf"
   chmod 0644 "$nginx_dir/ims-upstream.conf"; log "wrote the placeholder upstream"
 fi
-site_changed=0
-put_site() { if [ ! -f "$nginx_dir/sites-available/ims" ] || ! cmp -s "$repo_deploy/host/nginx-ims.conf" "$nginx_dir/sites-available/ims"; then site_changed=1; fi; put "$repo_deploy/host/nginx-ims.conf" "$nginx_dir/sites-available/ims" 0644; }
-put_site
+# The site swap is staged and reversible: the new site is written as sites-available/ims.new, the CURRENT site file and the
+# enabled-link state are saved, the new file is moved into place (rename), `nginx -t` runs, and on failure the saved site file and
+# links are put back exactly and `nginx -t` runs again to prove it. The live file is never edited in place; nginx is only reloaded
+# after a passing test.
+site="$nginx_dir/sites-available/ims"
 holding_link="$nginx_dir/sites-enabled/ims-holding"
 ims_link="$nginx_dir/sites-enabled/ims"
-holding_moved=""
-if [ -L "$holding_link" ]; then
-  holding_moved="$(readlink "$holding_link")"; rm -f "$holding_link"; site_changed=1
-elif [ -e "$holding_link" ]; then
-  holding_moved="$holding_link.bootstrap-saved"; mv "$holding_link" "$holding_moved"; site_changed=1
-fi
-if [ "$(readlink "$ims_link" 2>/dev/null || true)" != "../sites-available/ims" ]; then
-  ln -sfn "../sites-available/ims" "$ims_link"; site_changed=1; log "enabled the ims site"
-fi
-if [ "$site_changed" = 1 ] && [ -z "$R" ]; then
-  if ! nginx -t; then
-    log "nginx -t failed; undoing the site swap"
+want_link="../sites-available/ims"
+need_swap=0
+{ [ -f "$site" ] && cmp -s "$repo_deploy/host/nginx-ims.conf" "$site"; } || need_swap=1
+[ "$(readlink "$ims_link" 2>/dev/null || true)" = "$want_link" ] || need_swap=1
+{ [ -e "$holding_link" ] || [ -L "$holding_link" ]; } && need_swap=1
+if [ "$need_swap" = 1 ]; then
+  bk="$(mktemp -d "$nginx_dir/.ims-bootstrap.XXXXXX")"
+  had_site=0; [ -f "$site" ] && { had_site=1; cp -p "$site" "$bk/site"; }
+  ims_link_was=""; [ -L "$ims_link" ] && ims_link_was="$(readlink "$ims_link")"
+  ims_link_kind="none"; if [ -L "$ims_link" ]; then ims_link_kind="link"; elif [ -e "$ims_link" ]; then ims_link_kind="file"; cp -p "$ims_link" "$bk/ims-enabled-file"; fi
+  holding_kind="none"; holding_was=""
+  if [ -L "$holding_link" ]; then holding_kind="link"; holding_was="$(readlink "$holding_link")"
+  elif [ -e "$holding_link" ]; then holding_kind="file"; cp -p "$holding_link" "$bk/holding-file"; fi
+  restore_site() {
+    if [ "$had_site" = 1 ]; then cp -p "$bk/site" "$site.restore" && mv -f "$site.restore" "$site"; else rm -f "$site"; fi
     rm -f "$ims_link"
-    if [ -n "$holding_moved" ]; then
-      case "$holding_moved" in *.bootstrap-saved) mv "$holding_moved" "$holding_link" ;; *) ln -s "$holding_moved" "$holding_link" ;; esac
-    fi
-    die "nginx -t failed; the previous nginx configuration is back in place"
+    case "$ims_link_kind" in link) ln -s "$ims_link_was" "$ims_link" ;; file) cp -p "$bk/ims-enabled-file" "$ims_link" ;; esac
+    rm -f "$holding_link"
+    case "$holding_kind" in link) ln -s "$holding_was" "$holding_link" ;; file) cp -p "$bk/holding-file" "$holding_link" ;; esac
+  }
+  cp "$repo_deploy/host/nginx-ims.conf" "$site.new" && chmod 0644 "$site.new"
+  mv -f "$site.new" "$site"; own root:root "$site"
+  rm -f "$holding_link"
+  ln -sfn "$want_link" "$ims_link"
+  if ! nginx -t; then
+    log "nginx -t rejected the new site; restoring the previous site file and links"
+    restore_site
+    nginx -t || die "nginx -t FAILS AFTER THE RESTORE as well; fix $nginx_dir by hand (copies are in $bk)"
+    rm -rf "$bk"
+    die "nginx -t failed; the previous nginx configuration is back in place and nginx was not reloaded"
   fi
   nginx -s reload
-  log "nginx reloaded"
+  rm -rf "$bk"
+  log "installed the ims site and reloaded nginx"
 fi
 
 # --- 4. deploy scripts and the cron-render timer --------------------------------------------------------------------------------

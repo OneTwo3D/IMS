@@ -53,7 +53,7 @@ require_root
 check_env_file
 take_lock 0
 
-old_slot="$(active_slot)"
+old_slot="$(serving_slot)" || die "cannot determine which slot nginx serves; nothing was changed"
 if [ "$old_slot" = none ]; then new_slot=blue; else new_slot="$(other_slot "$old_slot")"; fi
 new_name="$(slot_name "$new_slot")"
 new_port="$(slot_port "$new_slot")"
@@ -81,8 +81,15 @@ while IFS=$'\t' read -r name marker; do
   [ "$marker" = expand ] || bad+="${name}"$'\n'
 done <<< "$shipped"
 if [ -z "$applied" ]; then
-  log "the database has no applied migrations (first install): the expand-only rule has no running release to protect"
-  bad=""
+  if [ "$old_slot" = none ] && ! slot_running blue && ! slot_running green; then
+    log "the database has no applied migrations and nothing is serving (first install): the expand-only rule has no running release to protect"
+    bad=""
+  elif [ "$allow_contract" = 1 ]; then
+    log "the database has NO applied migrations, but a release is serving or running (is DATABASE_URL pointing at the right database?); continuing because --allow-contract-migration --maintenance was given"
+    bad="${bad:-<empty migration history>}"
+  else
+    DIE_RC=3 die "the database has no applied migrations, but a release is serving or running (nginx: ${old_slot}). That means DATABASE_URL points at the wrong database or the history was lost. Refusing to migrate (override: --allow-contract-migration --maintenance)."
+  fi
 fi
 log "pending migrations: $(printf '%s' "$pending" | grep -c . || true)"
 [ -z "$pending" ] || sed 's/^/  /' <<< "$pending" >&2
@@ -129,6 +136,8 @@ fi
 # --- 8. previous slot: stop, keep ---------------------------------------------------------------------------------------------
 if [ "$old_slot" != none ]; then
   sleep "$IMS_DRAIN_S"
+  # Only stop the old slot once the RUNNING nginx reports the new one.
+  assert_not_serving "$old_slot" || die "nginx still serves $(slot_name "$old_slot") after the switch; left running, nothing recorded"
   docker stop "$(slot_name "$old_slot")" >/dev/null 2>&1 || log "warning: could not stop $(slot_name "$old_slot")"
 fi
 

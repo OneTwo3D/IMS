@@ -276,7 +276,10 @@ CI-built images above, deployed by full commit SHA with the scripts in `deploy/b
 - `deploy.sh [--allow-contract-migration --maintenance] <full-sha>`, `rollback.sh [--force-schema-mismatch]`, `cron-render.sh`.
 
 **Layout.** Two slots, `ims-blue` on 127.0.0.1:3101 and `ims-green` on 127.0.0.1:3102, both `docker run --network host` with `PORT` and
-`HOSTNAME=127.0.0.1` set per slot. nginx on :3000 proxies to the active slot through `/etc/nginx/ims-upstream.conf`; the OpenLiteSpeed
+`HOSTNAME=127.0.0.1` set per slot. nginx on :3000 proxies to the active slot through `/etc/nginx/ims-upstream.conf`, which also defines the value of the `X-IMS-Slot`
+response header (`blue`, `green` or `none`). The scripts ask the RUNNING nginx which slot it serves (`curl -sI http://127.0.0.1:3000/login`),
+not the file: a switch interrupted between the file write and the reload leaves the file ahead of nginx, and the next run puts the file
+back to the serving slot before doing anything else (and stops if it cannot). No slot nginx serves from is ever removed or stopped; the OpenLiteSpeed
 vhost `ims.onetwo3d.co.uk` proxies to `10.0.3.15:3000` and is never touched. A switch rewrites the upstream file atomically (temp file in
 the same directory, then `mv`), runs `nginx -t` (a failure restores the old file) and reloads gracefully. The state directory
 `/srv/ims/state` (uid:gid 1001:1001, 0750) is a bind mount on `/var/lib/onetwoinventory`, the SAME directory for both slots, never an
@@ -307,8 +310,10 @@ would apply (the image's `prisma/migrations` against `_prisma_migrations`, read 
 pending one lacks the marker. A contract (destructive) migration ships on its own, after the release that needed the old shape is
 retired: `deploy.sh --allow-contract-migration --maintenance <sha>` stops the active slot first, migrates, and starts the new release,
 accepting the downtime (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
-fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A database with no applied migrations (the first
-install) is exempt. `rollback.sh` refuses when any migration applied since `previous` lacks the marker; `--force-schema-mismatch`
+fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A database with no applied migrations is exempt ONLY
+when nothing is serving (nginx reports no slot and neither slot container is running): the first install. An empty history while a
+release is serving or running means `DATABASE_URL` points at the wrong database, and the deploy refuses (status 3) unless the
+maintenance flags are given. `rollback.sh` refuses when any migration applied since `previous` lacks the marker; `--force-schema-mismatch`
 overrides.
 
 **Rollback.** `rollback.sh` starts the previous slot (re-creating it from the recorded image if it was removed), health-checks it,

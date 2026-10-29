@@ -9,6 +9,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/../bin" && pwd)"
 A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+C=cccccccccccccccccccccccccccccccccccccccc
+PW=s3cretpw
 
 fail() { echo "    FAIL: $*" >&2; exit 1; }
 eq() { [ "$1" = "$2" ] || fail "${3:-values differ}: expected [$2], got [$1]"; }
@@ -25,7 +27,7 @@ setup() {
   T="$(mktemp -d)"; export T STUB="$T/stub"
   mkdir -p "$STUB/containers" "$STUB/migs" "$STUB/unhealthy" "$T/etc" "$T/state" "$T/deploy" "$T/nginx" "$T/crond"
   : > "$STUB/calls.log"
-  printf 'DATABASE_URL=postgresql://u:p@127.0.0.1:5432/ims\nCRON_SECRET=x\nPRODUCER_HOLD_ENFORCED_DESTINATIONS=all\n' > "$T/etc/ims.env"
+  printf 'DATABASE_URL=postgresql://u:${PW}@127.0.0.1:5432/ims\nCRON_SECRET=x\nPRODUCER_HOLD_ENFORCED_DESTINATIONS=all\n' > "$T/etc/ims.env"
   chmod 600 "$T/etc/ims.env"; echo 'CRON_SECRET=x' > "$T/etc/cron.env"; chmod 600 "$T/etc/cron.env"
   export IMS_ENV_FILE="$T/etc/ims.env" IMS_CRON_ENV_FILE="$T/etc/cron.env" IMS_STATE_DIR="$T/state" IMS_DEPLOY_DIR="$T/deploy" \
          IMS_UPSTREAM_FILE="$T/nginx/ims-upstream.conf" IMS_CROND_DIR="$T/crond" IMS_DEPLOY_NO_ROOT_CHECK=1 IMS_HC_BIN="$T/none" \
@@ -37,7 +39,9 @@ setup() {
 teardown() { rm -rf "$T"; }
 
 port_of() { case "$1" in blue) echo 3101 ;; green) echo 3102 ;; esac; }
-set_upstream() { printf 'upstream ims_active {\n    server 127.0.0.1:%s;\n}\n' "$(port_of "$1")" > "$IMS_UPSTREAM_FILE"; }
+# Writes the upstream file AND marks it loaded (as if nginx had been reloaded). set_upstream_file_only is a crashed switch.
+set_upstream_file_only() { printf 'upstream ims_active {\n    server 127.0.0.1:%s;\n}\n' "$(port_of "$1")" > "$IMS_UPSTREAM_FILE"; }
+set_upstream() { set_upstream_file_only "$1"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"; }
 # A running release in a slot, serving, and recorded as current.
 seed_active() { # <slot> <sha>
   printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=%s\n' "$2" "$(port_of "$1")" > "$STUB/containers/ims-$1"
@@ -68,7 +72,7 @@ t_health_failure_keeps_old_slot_serving() {
   eq "$(container_running ims-green)" 0 "the unhealthy new slot must be stopped"
   eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue" "current must be untouched"
   [ ! -e "$IMS_DEPLOY_DIR/previous" ] || fail "previous was written"
-  log_lacks 'render-managed-crontab|--entrypoint node'
+  log_lacks 'render-managed-crontab'
   no_temp_files
 }
 
@@ -113,7 +117,7 @@ t_expand_only_pending_migrations_proceed_without_flags() {
 
 t_first_install_on_an_empty_database_is_exempt_and_uses_blue() {
   migs "$B" m1:other m2:other; : > "$STUB/applied"; touch "$STUB/no_table"
-  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"
+  printf 'upstream ims_active {\n    server 127.0.0.1:3100;\n}\n' > "$IMS_UPSTREAM_FILE"; cp "$IMS_UPSTREAM_FILE" "$STUB/loaded"
   deploy "$B"
   eq "$rc" 0 "first install"
   eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B blue"
@@ -134,7 +138,7 @@ t_successful_deploy_switches_then_records_state() {
   before '^nginx reload' 'curl http://127.0.0.1:3000/login -> 200'
   log_has 'curl http://127.0.0.1:3102/login -> 200'
   [ "$(stat -c %i "$IMS_UPSTREAM_FILE")" != "$inode_before" ] || fail "the upstream file was edited in place, not replaced by rename"
-  log_has '^nginx -t \[# Managed by deploy.sh / rollback.sh. Do not edit by hand. upstream ims_active \{ +server 127.0.0.1:3102; +keepalive 16; \} \]'
+  log_has '^nginx -t \[# Managed by deploy.sh / rollback.sh. Do not edit by hand. upstream ims_active \{ +server 127.0.0.1:3102; +keepalive 16; \} map \$server_name \$ims_slot \{ +default green; +\} \]'
   no_temp_files
 }
 
@@ -189,6 +193,123 @@ t_deploy_refuses_a_world_readable_env_file() {
 t_deploy_rejects_a_short_or_missing_sha() {
   deploy abc123; eq "$rc" 2 "short sha"
   deploy; eq "$rc" 2 "no sha"
+}
+
+t_interrupted_switch_never_removes_the_serving_slot() {
+  # A previous deploy of B wrote the upstream file (green) and died before the reload: nginx still serves blue.
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; migs "$C" m1:expand; applied m1
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=3102\n' "$B" > "$STUB/containers/ims-green"
+  set_upstream_file_only green
+  deploy "$C"
+  eq "$rc" 0 "the next deploy must reconcile and succeed: $(tail -n 5 "$T/out")"
+  grep -q 'interrupted' "$T/out" || fail "the interrupted switch was not reported"
+  log_lacks '^docker rm -f ims-blue'
+  before '^nginx reload' '^RUN-SLOT ims-green'     # the file was put back to the serving slot BEFORE anything was replaced
+  before '^RUN-SLOT ims-green' '^docker stop ims-blue'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$C green"
+  eq "$(cat "$IMS_DEPLOY_DIR/previous")" "$A blue"
+}
+
+t_header_and_file_disagreement_with_nothing_serving_is_refused() {
+  migs "$B" m1:expand; applied m1
+  set_upstream_file_only blue; rm -f "$STUB/loaded"          # file says blue, the running nginx serves nothing
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=3101\n' "$A" > "$STUB/containers/ims-blue"
+  deploy "$B"
+  [ "$rc" != 0 ] || fail "deploy guessed a slot"
+  grep -q 'interrupted' "$T/out" || fail "the disagreement was not detected"
+  log_lacks '^docker (rm|stop|run)'
+}
+
+t_deploy_stops_when_nginx_reports_no_slot_header() {
+  seed_active blue "$A"; migs "$B" m1:expand; applied m1
+  touch "$STUB/no_header"
+  deploy "$B"
+  [ "$rc" != 0 ] || fail "deploy ran without being able to ask nginx"
+  log_lacks '^docker (rm|stop|run|pull)'
+}
+
+t_removing_the_slot_nginx_serves_is_refused() {
+  seed_active blue "$A"
+  rc=0; ( . "$BIN/lib.sh"; run_slot blue "$B" ) > "$T/out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "run_slot replaced the serving slot"
+  log_lacks '^docker rm'
+  log_lacks '^RUN-SLOT'
+  grep -q 'REFUSING' "$T/out" || fail "no refusal message"
+  rc=0; ( . "$BIN/lib.sh"; run_slot green "$B" ) > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "the idle slot may be replaced"
+  log_has "^RUN-SLOT ims-green $B"
+}
+
+t_old_slot_is_not_stopped_while_nginx_still_serves_it() {
+  # The switch "succeeds" on disk but the reload does not take effect: the running nginx keeps serving blue.
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  mkdir -p "$T/stubbin"; printf '#!/usr/bin/env bash\ncase "$*" in "-s reload") echo "nginx reload" >> "$STUB/calls.log" ;; "-t") ;; esac\n' > "$T/stubbin/nginx"; chmod +x "$T/stubbin/nginx"
+  PATH="$T/stubbin:$PATH" deploy "$B"
+  [ "$rc" != 0 ] || fail "deploy went on although nginx still serves the old slot"
+  eq "$(container_running ims-blue)" 1 "the serving slot must not be stopped"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue"
+}
+
+t_empty_migration_history_with_a_serving_release_is_refused() {
+  seed_active blue "$A"; migs "$B" m1:other; : > "$STUB/applied"      # the table exists but holds no rows
+  deploy "$B"
+  eq "$rc" 3 "empty history while serving"
+  log_lacks '^MIGRATE'
+  grep -q 'wrong database' "$T/out" || fail "the message does not point at the database"
+  eq "$(container_running ims-blue)" 1
+}
+
+t_empty_migration_history_with_a_running_slot_but_no_serving_is_refused() {
+  migs "$B" m1:other; : > "$STUB/applied"
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=3102\n' "$A" > "$STUB/containers/ims-green"
+  deploy "$B"
+  eq "$rc" 3 "empty history with a running slot"
+  log_lacks '^MIGRATE'
+}
+
+t_empty_migration_history_with_a_serving_release_needs_maintenance_flags() {
+  seed_active blue "$A"; migs "$B" m1:other; : > "$STUB/applied"
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 0 "maintenance override: $(tail -n 3 "$T/out")"
+  before '^docker stop ims-blue' '^MIGRATE'
+}
+
+t_empty_migration_history_with_nothing_serving_is_a_first_install() {
+  migs "$B" m1:other m2:other; : > "$STUB/applied"
+  deploy "$B"
+  eq "$rc" 0 "first install, table present but empty"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B blue"
+}
+
+t_database_credentials_never_appear_in_any_argv() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  deploy "$B"
+  eq "$rc" 0 "deploy"
+  ! grep -Eq "$PW|postgresql://|DATABASE_URL=" "$STUB/calls.log" || fail "a credential or the URL is in a recorded argv: $(grep -E "$PW|postgresql://|DATABASE_URL=" "$STUB/calls.log" | head -n 2)"
+  grep -Eq -- "--env-file $IMS_ENV_FILE .*--entrypoint node .* -e " "$STUB/calls.log" || fail "the applied-migrations query did not take its URL from the env file"
+}
+
+t_applied_query_hands_credentials_to_psql_through_the_environment() {
+  command -v node >/dev/null || { echo "    (node missing; skipped)"; return 0; }
+  mkdir -p "$T/fakebin"
+  cat > "$T/fakebin/psql" <<'PSQL'
+#!/usr/bin/env bash
+echo "$*" >> "$T/psql.argv"
+env | grep '^PG' >> "$T/psql.env"
+env | grep -q '^DATABASE_URL=' && echo leaked >> "$T/psql.env"
+case "$*" in *to_regclass*) echo t ;; *) echo 20260101000000_one ;; esac
+PSQL
+  chmod +x "$T/fakebin/psql"
+  js="$(. "$BIN/lib.sh"; printf '%s' "$APPLIED_JS")"
+  out="$(PATH="$T/fakebin:$PATH" DATABASE_URL='postgresql://us%40er:p%40ss@127.0.0.1:5433/db?sslmode=require' node -e "$js")" || fail "the query script failed"
+  eq "$out" 20260101000000_one "applied migration names"
+  ! grep -Eq 'p@ss|p%40ss|postgresql://' "$T/psql.argv" || fail "psql's argv holds a credential: $(cat "$T/psql.argv")"
+  for want in PGPASSWORD=p@ss PGUSER=us@er PGHOST=127.0.0.1 PGPORT=5433 PGDATABASE=db PGSSLMODE=require 'PGOPTIONS=' ; do
+    [ "$want" = 'PGOPTIONS=' ] && continue
+    grep -qxF -- "$want" "$T/psql.env" || fail "psql's environment lacks $want"
+  done
+  ! grep -q leaked "$T/psql.env" || fail "DATABASE_URL was passed on to psql"
+  grep -q 'default_transaction_read_only' "$BIN/lib.sh" || fail "the read-only session option is gone"
 }
 
 t_rollback_refuses_across_a_non_expand_migration() {
@@ -323,7 +444,7 @@ t_heartbeat_wraps_deploy_and_cron_render_when_installed() {
 }
 
 t_bootstrap_is_idempotent_and_leaves_secrets_and_postgres_alone() {
-  R="$T/root"; export IMS_BOOTSTRAP_ROOT="$R"
+  R="$T/root"; export IMS_BOOTSTRAP_ROOT="$R" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf"
   mkdir -p "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled"
   echo 'server { listen 3000; }' > "$R/etc/nginx/sites-available/ims-holding"
   ln -s ../sites-available/ims-holding "$R/etc/nginx/sites-enabled/ims-holding"
@@ -334,6 +455,7 @@ t_bootstrap_is_idempotent_and_leaves_secrets_and_postgres_alone() {
   [ -f "$R/etc/nginx/ims-upstream.conf" ] || fail "no upstream placeholder"
   eq "$(stat -c %a "$R/srv/ims/state")" 750
   eq "$(stat -c %a "$R/etc/ims")" 700
+  log_has '^nginx reload'
   [ ! -e "$R/etc/ims/ims.env" ] && [ ! -e "$R/etc/ims/cron.env" ] || fail "bootstrap created a secrets file"
   for f in deploy.sh rollback.sh cron-render.sh lib.sh; do [ -x "$R/usr/local/lib/ims-deploy/$f" ] || fail "$f not installed"; done
   [ -f "$R/etc/systemd/system/ims-cron-render.timer" ] && [ -f "$R/etc/systemd/system/ims-cron-render.service" ] || fail "units not installed"
@@ -347,6 +469,42 @@ t_bootstrap_is_idempotent_and_leaves_secrets_and_postgres_alone() {
   ! grep -q 'wrote' "$T/out2" || fail "a re-run reported writes: $(grep wrote "$T/out2")"
   grep -q 'server 127.0.0.1:3102;' "$R/etc/nginx/ims-upstream.conf" || fail "the live upstream was overwritten"
   ! grep -Eiq 'postgres(ql)?\.conf|pg_hba|createrole|createuser|CREATE (ROLE|USER)|ALTER (ROLE|USER)|systemctl[^#]*postgres' "$BIN/host-bootstrap.sh" || fail "bootstrap mentions Postgres configuration"
+}
+
+bootstrap_prepare() {
+  R="$T/root"; export IMS_BOOTSTRAP_ROOT="$R" IMS_UPSTREAM_FILE="$T/root/etc/nginx/ims-upstream.conf"
+  mkdir -p "$R/etc/nginx/sites-available" "$R/etc/nginx/sites-enabled"
+  echo 'server { listen 3000; }' > "$R/etc/nginx/sites-available/ims-holding"
+  ln -s ../sites-available/ims-holding "$R/etc/nginx/sites-enabled/ims-holding"
+  site_dir="$R/etc/nginx"
+}
+bootstrap() { rc=0; "$BIN/host-bootstrap.sh" > "$T/out" 2>&1 || rc=$?; }
+
+t_bootstrap_rerun_with_a_rejected_site_restores_the_previous_one() {
+  bootstrap_prepare; bootstrap; eq "$rc" 0 "first run: $(tail -n 3 "$T/out")"
+  echo '# an older, working site' > "$site_dir/sites-available/ims"           # differs from the repo copy: the rerun wants to replace it
+  cp -p "$site_dir/sites-available/ims" "$T/site.before"
+  link_before="$(readlink "$site_dir/sites-enabled/ims")"
+  ln -s ../sites-available/ims-holding "$site_dir/sites-enabled/ims-holding"; holding_before="$(readlink "$site_dir/sites-enabled/ims-holding")"
+  : > "$STUB/calls.log"; touch "$STUB/nginx_t_fail_once"
+  bootstrap
+  [ "$rc" != 0 ] || fail "bootstrap succeeded although nginx rejected the site"
+  cmp -s "$site_dir/sites-available/ims" "$T/site.before" || fail "the previous site file was not restored byte for byte"
+  eq "$(readlink "$site_dir/sites-enabled/ims")" "$link_before" "the ims link"
+  eq "$(readlink "$site_dir/sites-enabled/ims-holding")" "$holding_before" "the holding link"
+  log_lacks '^nginx reload'
+  eq "$(grep -c '^nginx -t' "$STUB/calls.log")" 2 "nginx -t must run again after the restore"
+  [ -z "$(find "$site_dir" \( -name '*.new' -o -name '*.restore' -o -name '.ims-bootstrap.*' \))" ] || fail "leftovers: $(find "$site_dir" \( -name '*.new' -o -name '*.restore' -o -name '.ims-bootstrap.*' \))"
+}
+
+t_bootstrap_first_run_with_a_rejected_site_leaves_the_holding_site_enabled() {
+  bootstrap_prepare; touch "$STUB/nginx_t_fail_once"
+  bootstrap
+  [ "$rc" != 0 ] || fail "bootstrap succeeded although nginx rejected the site"
+  eq "$(readlink "$site_dir/sites-enabled/ims-holding")" ../sites-available/ims-holding
+  [ ! -e "$site_dir/sites-enabled/ims" ] && [ ! -L "$site_dir/sites-enabled/ims" ] || fail "the ims link is still there"
+  [ ! -e "$site_dir/sites-available/ims" ] || fail "the new site file is still there"
+  log_lacks '^nginx reload'
 }
 
 # ---------------------------------------------------------------------------------------------------------------------------------

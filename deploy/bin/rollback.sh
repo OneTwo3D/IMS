@@ -33,7 +33,7 @@ cur="$(read_state current)" prev="$(read_state previous)"
 cur_sha="${cur%% *}" cur_slot="${cur#* }" prev_sha="${prev%% *}" prev_slot="${prev#* }"
 require_sha "$cur_sha"; require_sha "$prev_sha"
 [ "$cur_slot" != "$prev_slot" ] || die "current and previous name the same slot ($cur_slot)"
-active="$(active_slot)"
+active="$(serving_slot)" || die "cannot determine which slot nginx serves; nothing was changed"
 [ "$active" = "$cur_slot" ] || die "nginx serves '${active}' but deploy/current says ${cur_slot}; resolve that by hand first"
 prev_name="$(slot_name "$prev_slot")" prev_port="$(slot_port "$prev_slot")" cur_name="$(slot_name "$cur_slot")"
 log "rolling back ${cur_sha} (${cur_slot}) -> ${prev_sha} (${prev_slot})"
@@ -78,6 +78,7 @@ if ! wait_http_200 "${IMS_FRONT_URL}/login" "$IMS_FRONT_TIMEOUT_S"; then
   die "${IMS_FRONT_URL}/login did not answer 200 after the switch"
 fi
 sleep "$IMS_DRAIN_S"
+assert_not_serving "$cur_slot" || die "nginx still serves ${cur_name} after the switch; left running, nothing recorded"
 docker stop "$cur_name" >/dev/null 2>&1 || log "warning: could not stop ${cur_name}"
 
 # --- swap the records (previous first) ------------------------------------------------------------------------------------------

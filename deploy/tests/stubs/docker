@@ -11,7 +11,10 @@ case "${1:-}" in
     [ -f "$cdir/$name" ] || exit 1
     # shellcheck disable=SC1090
     . "$cdir/$name"
-    case "$*" in *Config.Image*) echo "$image" ;; esac ;;
+    case "$*" in
+      *Config.Image*) echo "$image" ;;
+      *State.Running*) if [ "$(sed -n 's/^running=//p' "$cdir/$name")" = 1 ]; then echo true; else echo false; fi ;;
+    esac ;;
   rm) for a in "${@:2}"; do case "$a" in -*) ;; *) rm -f "$cdir/$a" ;; esac; done ;;
   stop|start)
     f="$cdir/$2"; [ -f "$f" ] || exit 1
@@ -38,7 +41,7 @@ case "${1:-}" in
       echo "RUN-SLOT $name $sha port=$port" >> "$STUB/calls.log"
     elif [ "$entry" = sh ] && [[ "$image" == */ims-migrate:* ]]; then
       cat "$STUB/migs/$sha"
-    elif [ "$entry" = sh ]; then
+    elif [ "$entry" = node ] && [ "${1:-}" = -e ]; then   # the applied-migrations query
       [ -e "$STUB/no_table" ] || cat "$STUB/applied"
     elif [ "$entry" = node ]; then
       [ ! -e "$STUB/render_fail" ] || exit 1
