@@ -51,9 +51,10 @@ import {
 import { canonicalKey, isKey, type KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
 import type { XeroVatVendor } from '@/lib/reconciliation-pack/vat-item'
+import { compareVatSetIdentity } from '@/lib/reconciliation-pack/vat-set-identity'
 import { runWmsItem } from '@/lib/reconciliation-pack/wms-items'
 import type { WmsReadPort, WmsReadSession, WmsSourceOptions } from '@/lib/reconciliation-pack/wms-source'
-import { readWooOrders, readWooTaxRates, type WooGetPort, type WooOrderRow, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
+import { readWooOrders, readWooTaxRateDetails, type WooGetPort, type WooOrderRow, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
 import { normaliseWcOrderStatus, resolveWcPullStatuses } from '@/lib/connectors/woocommerce/order-status-filter'
 
 export const VENDOR_ITEM_IDS = ['R1', 'R9', 'R13'] as const
@@ -221,6 +222,11 @@ async function runR9(context: VendorItemContext): Promise<ItemInput> {
 
 const wooRateKey = (id: string): KeyPart[] => [{ kind: 'sku', raw: 'woo-tax-rate' }, { kind: 'vendor-id', raw: id }]
 const xeroTypeKey = (taxType: string): KeyPart[] => [{ kind: 'sku', raw: 'xero-tax-type' }, { kind: 'sku', raw: taxType }]
+/** A set-identity row: system, then the reason in lower case with hyphens (or "identical"), then the identity. A key part cannot hold an underscore. */
+const setKey = (system: 'woo' | 'ims' | 'xero', id: string, reason: string | null): KeyPart[] => [
+  { kind: 'sku', raw: 'vat-set' }, { kind: 'sku', raw: system }, { kind: 'sku', raw: reason === null ? 'identical' : reason.toLowerCase().replace(/_/g, '-') },
+  system === 'woo' ? { kind: 'vendor-id', raw: id } : system === 'ims' ? { kind: 'ims-id', raw: id } : { kind: 'sku', raw: id },
+]
 
 async function runR13(context: VendorItemContext): Promise<ItemInput> {
   const woo = context.vendor?.woo
@@ -238,7 +244,7 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
     if (!TAX_ID_RE.test(mapping.externalTaxRateId)) return inconclusive('R13', [IMS], 'BAD_KEY')
     imsWoo.push({ key: wooRateKey(mapping.externalTaxRateId) })
   }
-  const walked = await readWooTaxRates(woo, context.wooOptions)
+  const walked = await readWooTaxRateDetails(woo, context.wooOptions)
   if (!walked.ok) return inconclusive('R13', [IMS, WOO], walked.reason)
   const vendorWoo: SideRow[] = walked.value.rates.map((rate) => ({ key: wooRateKey(rate.id) }))
 
@@ -267,11 +273,22 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
   if (!imsTypes.every((type) => XERO_TAX_TYPE_RE.test(type))) return inconclusive('R13', [IMS, WOO, XERO], 'BAD_KEY')
   const types = stored.taxTypes.filter((entry) => entry.status === 'ACTIVE').map((entry) => entry.taxType)
   if (!types.every((type) => typeof type === 'string' && XERO_TAX_TYPE_RE.test(type))) return inconclusive('R13', [IMS, WOO, XERO], 'BAD_KEY')
-  const ims = [...imsWoo, ...imsTypes.map((type): SideRow => ({ key: xeroTypeKey(type) }))]
-  const vendor = [...vendorWoo, ...types.map((type): SideRow => ({ key: xeroTypeKey(type) }))]
+  const ims: SideRow[] = [...imsWoo, ...imsTypes.map((type): SideRow => ({ key: xeroTypeKey(type) }))]
+  const vendor: SideRow[] = [...vendorWoo, ...types.map((type): SideRow => ({ key: xeroTypeKey(type) }))]
   // Judged: every WooCommerce identity and every type IMS names. A Xero type nothing names is outside the population.
   const population = new Set<string>()
   for (const row of [...imsWoo, ...vendorWoo, ...imsTypes.map((type): SideRow => ({ key: xeroTypeKey(type) }))]) population.add(canonicalKey(row.key))
+  // SET IDENTITY (lib/reconciliation-pack/vat-set-identity.ts): one listed identity per in-scope WooCommerce rate, IMS sales rate and Xero sales type.
+  // An identical one is on both sides; one with reasons is on the IMS side only, once per reason (the reason is part of the key), so it is a finding.
+  const setRows = compareVatSetIdentity({ woo: walked.value.rates, rates, mappings, componentRates: section.value.componentRates, xero: stored.rows })
+  for (const row of setRows) {
+    const keys = row.reasons.length === 0 ? [setKey(row.system, row.id, null)] : row.reasons.map((reason) => setKey(row.system, row.id, reason))
+    for (const key of keys) {
+      ims.push({ key })
+      if (row.reasons.length === 0) vendor.push({ key })
+      population.add(canonicalKey(key))
+    }
+  }
   const result = compareItem('R13', { ims, vendor, imsComplete: true, vendorComplete: true, population, emptyProof: walked.value.total === 0 && imsTypes.length === 0 ? 'vendor-total-zero' : undefined })
   return fromComparison('R13', result, [IMS, WOO, XERO])
 }

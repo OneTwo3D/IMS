@@ -332,7 +332,14 @@ const xeroSection = async (client: ReturnType<typeof xeroFake>) => {
 // [mutation: the proof is skipped and the rows are returned as proven]
 test('the stored Xero list is PROVEN only for a header that exists for the connected organisation, whose count and digest match the rows read', async () => {
   const client = xeroFake()
-  assert.deepEqual(await xeroSection(client), { ok: true, value: { state: 'proven', tenantId: 'tenant-A', fetchedAt: FETCHED, taxTypes: [{ taxType: 'INPUT2', status: 'ACTIVE' }, { taxType: 'OUTPUT2', status: 'DELETED' }] } })
+  const section = await xeroSection(client)
+  assert.ok(section && section.ok && section.value.state === 'proven')
+  if (section && section.ok && section.value.state === 'proven') {
+    // The proven ROWS are what R13's set identity reads: the same rows the digest covered, nothing else.
+    const { rows, ...rest } = section.value
+    assert.deepEqual(rest, { state: 'proven', tenantId: 'tenant-A', fetchedAt: FETCHED, taxTypes: [{ taxType: 'INPUT2', status: 'ACTIVE' }, { taxType: 'OUTPUT2', status: 'DELETED' }] })
+    assert.deepEqual(rows.map((row) => row.taxType), ['INPUT2', 'OUTPUT2'])
+  }
   assert.ok(client.sent.some((s) => /FROM xero_tax_rate_lists WHERE connector = 'xero' AND "tenantId" = \$1/.test(s)), 'the header is asked for by organisation')
   assert.ok(client.sent.some((s) => /FROM xero_tax_rates WHERE connector = 'xero' AND "tenantId" = \$1/.test(s)), 'and so are the rows')
 })
@@ -369,10 +376,11 @@ test('more stored Xero rows than the cap is CAP_EXCEEDED for that section, never
 
 // ---- the other places IMS names a Xero tax type -------------------------------------------------------------------------------
 
-function taxesFake(opts: { components?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>> } = {}) {
+function taxesFake(opts: { components?: Array<Record<string, unknown>>; componentRates?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>> } = {}) {
   return fake((sql) => {
-    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', active: true, tax_type: 'OUTPUT2', country: 'GB', category: null }]
+    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: 'OUTPUT2', country: 'GB', category: null, is_compound: false, tax_category: 'STANDARD' }]
     if (/FROM shopping_tax_rate_mappings/.test(sql)) return []
+    if (/FROM tax_rate_components/.test(sql) && /compound_on_previous/.test(sql)) return opts.componentRates ?? []
     if (/FROM tax_rate_components/.test(sql)) return opts.components ?? []
     if (/FROM settings/.test(sql)) return opts.settings ?? []
     return []
@@ -381,6 +389,22 @@ function taxesFake(opts: { components?: Array<Record<string, unknown>>; settings
 const taxesOf = async (client: ReturnType<typeof taxesFake>) => { const read = await readImsSnapshot(client, { sections: ['taxes'] }); assert.ok(read.ok); return read.ok ? read.sections.taxes : undefined }
 
 // [mutation: the component or settings query dropped]
+test('the taxes section reads the isCompound flag of each rate and the externalClass of each mapping (null stays null)', async () => {
+  const client = fake((sql) => {
+    if (/FROM tax_rates/.test(sql)) return [{ id: 'r1', name: 'GB VAT', rate: '0.2000', used_for: 'SALES', reverse_charge: false, active: true, tax_type: 'OUTPUT2', country: 'GB', category: null, is_compound: true, tax_category: 'STANDARD' }]
+    if (/FROM shopping_tax_rate_mappings/.test(sql)) return [{ connector: 'woocommerce', external_id: '11', rate_id: 'r1', external_class: 'reduced-rate' }, { connector: 'woocommerce', external_id: '12', rate_id: 'r1', external_class: null }]
+    return []
+  })
+  const read = await readImsSnapshot(client, { sections: ['taxes'] })
+  assert.ok(read.ok)
+  if (!read.ok) return
+  const section = read.sections.taxes
+  assert.ok(section && section.ok)
+  if (!section || !section.ok) return
+  assert.equal(section.value.rates[0]!.isCompound, true)
+  assert.deepEqual(section.value.mappings, [{ connector: 'woocommerce', externalTaxRateId: '11', taxRateId: 'r1', externalClass: 'reduced-rate' }, { connector: 'woocommerce', externalTaxRateId: '12', taxRateId: 'r1', externalClass: null }])
+})
+
 test('the taxes section also reads every component accounting tax type and the two reverse-charge settings (trimmed; absent or blank is none)', async () => {
   const client = taxesFake({ components: [{ id: 'c1', rate_id: 'r1', active: true, tax_type: 'COMP1' }, { id: 'c2', rate_id: 'r1', active: false, tax_type: 'COMP2' }], settings: [{ key: 'accounting_reverse_charge_sales_tax_type', value: ' ECOUTPUTSERVICES ' }] })
   const section = await taxesOf(client)
@@ -388,6 +412,7 @@ test('the taxes section also reads every component accounting tax type and the t
   if (!section || !section.ok) return
   assert.deepEqual(section.value.componentTaxTypes, [{ id: 'c1', taxRateId: 'r1', active: true, accountingTaxType: 'COMP1' }, { id: 'c2', taxRateId: 'r1', active: false, accountingTaxType: 'COMP2' }])
   assert.deepEqual(section.value.reverseCharge, { sales: 'ECOUTPUTSERVICES', purchase: '' })
+  assert.deepEqual(section.value.rates, [{ id: 'r1', name: 'GB VAT', rate: '0.2000', usedFor: 'SALES', reverseCharge: false, active: true, accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: null, isCompound: false, taxCategory: 'STANDARD' }])
   assert.ok(client.sent.some((sql) => /FROM tax_rate_components WHERE accounting_tax_type IS NOT NULL ORDER BY id LIMIT/.test(sql)), 'every component that names a type is asked for')
   assert.ok(client.sent.some((sql) => /FROM settings WHERE key IN \('accounting_reverse_charge_sales_tax_type', 'accounting_reverse_charge_purchase_tax_type'\)/.test(sql)))
 })
