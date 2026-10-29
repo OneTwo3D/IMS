@@ -153,7 +153,7 @@ export type FixedCheckId =
   | 'reconciliation-completeness'
   | 'read-sync-liveness'
 
-export const PACK_ITEM_IDS = ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15'] as const
+export const PACK_ITEM_IDS = ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15', 'R16'] as const
 export type PackItemId = (typeof PACK_ITEM_IDS)[number]
 export type PackCheckId = `pack-${PackItemId}`
 export type CheckId = FixedCheckId | PackCheckId
@@ -185,7 +185,11 @@ export const PACK_ITEMS: ReadonlyArray<{ id: PackItemId; title: string; derivedF
   { id: 'R13', title: 'VAT rate set identity: WooCommerce, IMS and Xero', derivedFrom: null, source: 'no runner on this tree' },
   { id: 'R14', title: 'SKU coverage across Qoblex, WooCommerce, Mintsoft and IMS', derivedFrom: null, source: 'needs the four extracts; /api/export/products is the IMS side' },
   { id: 'R15', title: 'The invariant report: zero critical findings, every warning accepted', derivedFrom: 'invariant-report', source: 'the invariant-preflight check of this gate' },
+  { id: 'R16', title: 'Xero exchange rates, IMS central rate against the rate on each foreign-currency Xero document and payment', derivedFrom: null, source: 'the reconciliation pack report: the CurrencyRate of each foreign-currency Xero invoice, bill, credit note and payment of the closed months against the fx_rates rate at the document date' },
 ]
+
+/** Pack items that are listed at every phase and never block: documents booked before the one-rate ruling carry Xero's own rate, so the item reports them rather than gating the switchover on them. The owner promotes an item by removing it here. */
+export const ADVISORY_PACK_ITEMS: readonly PackItemId[] = ['R16']
 
 export const CHECK_CATALOGUE: readonly CheckDefinition[] = [
   {
@@ -241,11 +245,13 @@ export const CHECK_CATALOGUE: readonly CheckDefinition[] = [
   ...PACK_ITEMS.map((item): CheckDefinition => ({
     id: `pack-${item.id}`,
     title: `${item.id}: ${item.title}`,
-    requirement: { P0: 'listed-only', P1: 'listed-only', P2: 'required' },
+    requirement: { P0: 'listed-only', P1: 'listed-only', P2: ADVISORY_PACK_ITEMS.includes(item.id) ? 'listed-only' : 'required' },
     expectation: {
       P0: 'Listed. Not available items are not checked and do not block.',
       P1: 'Listed. Not available items are not checked and do not block.',
-      P2: 'Must be available and pass. An item that is NOT YET AVAILABLE makes the verdict NO-GO.',
+      P2: ADVISORY_PACK_ITEMS.includes(item.id)
+        ? 'Listed. Advisory: it is reported and never blocks.'
+        : 'Must be available and pass. An item that is NOT YET AVAILABLE makes the verdict NO-GO.',
     },
   })),
 ]

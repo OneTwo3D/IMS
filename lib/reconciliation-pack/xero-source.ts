@@ -63,16 +63,16 @@ export type XeroSourceOptions = {
 
 export type XeroWalkWindow = { from: string; toExclusive: string }
 
-class Stop extends Error {
+export class Stop extends Error {
   constructor(readonly reason: PackReasonCode) { super(reason) }
 }
 
-const DATE_RE = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/
+export const DATE_RE = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/
 const DATE_STRING_RE = /^([0-9]{4}-[0-9]{2}-[0-9]{2})T00:00:00$/
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const ACCOUNT_CODE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
-type Walker = { port: XeroGetPort; left: number; requests: number; maxRows: number; sleep: (ms: number) => Promise<void> }
+export type Walker = { port: XeroGetPort; left: number; requests: number; maxRows: number; sleep: (ms: number) => Promise<void> }
 
 export function makeXeroWalker(port: XeroGetPort, options: XeroSourceOptions = {}): Walker {
   return {
@@ -84,18 +84,18 @@ export function makeXeroWalker(port: XeroGetPort, options: XeroSourceOptions = {
   }
 }
 
-function record(value: unknown): Record<string, unknown> {
+export function record(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Stop('SOURCE_UNREADABLE')
   return value as Record<string, unknown>
 }
 
-function wholeNumber(value: unknown, min: number, max: number): number {
+export function wholeNumber(value: unknown, min: number, max: number): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) throw new Stop('SOURCE_UNREADABLE')
   return value
 }
 
 /** A JSON number as exact decimal text; a number with an exponent form, too many places or too large is BAD_VALUE. */
-function decimalOf(value: unknown, places: number): string {
+export function decimalOf(value: unknown, places: number): string {
   if (typeof value !== 'number' || !Number.isFinite(value) || Math.abs(value) >= 1e12) throw new Stop('BAD_VALUE')
   const text = new Prisma.Decimal(value).toFixed()
   const fraction = text.split('.')[1]
@@ -103,7 +103,7 @@ function decimalOf(value: unknown, places: number): string {
   return text
 }
 
-function validDate(text: string): boolean {
+export function validDate(text: string): boolean {
   const m = DATE_RE.exec(text)
   if (!m) return false
   const parsed = new Date(`${text}T00:00:00.000Z`)
@@ -165,7 +165,7 @@ function parseInvoice(raw: unknown, window: XeroWalkWindow): XeroInvoiceRow {
   return { id: r.InvoiceID.toLowerCase(), date, currency, rate, lines }
 }
 
-async function request(w: Walker, resource: XeroResource, params: Readonly<Record<string, string>>): Promise<Record<string, unknown>> {
+export async function request(w: Walker, resource: XeroResource, params: Readonly<Record<string, string>>): Promise<Record<string, unknown>> {
   if (w.left <= 0) throw new Stop('CAP_EXCEEDED')
   w.left -= 1
   if (w.requests > 0) await w.sleep(XERO_MIN_REQUEST_INTERVAL_MS)
@@ -227,7 +227,7 @@ async function walkInvoicesOnce(w: Walker, window: XeroWalkWindow): Promise<{ ro
 
 const canonical = (rows: readonly XeroInvoiceRow[]): string[] => rows.map((row) => JSON.stringify(row)).sort()
 
-function reasonOf(error: unknown): PackReasonCode {
+export function reasonOf(error: unknown): PackReasonCode {
   return error instanceof Stop ? error.reason : 'SOURCE_UNREADABLE'
 }
 

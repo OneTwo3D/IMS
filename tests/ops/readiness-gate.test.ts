@@ -7,6 +7,7 @@ import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import {
   ACCEPTANCE_MAX_DAYS,
   CHECK_CATALOGUE,
+  ADVISORY_PACK_ITEMS,
   PACK_ITEMS,
   BUILD_SCOPE_TEXT,
   SCHEMA_CHECKS_RAN_TEXT,
@@ -134,7 +135,15 @@ test('R-pack slots: not available is listed and does not block P0 or P1, and is 
     for (const id of unavailable) assert.ok(verdict.notYetAvailable.includes(id), `${phase} lists ${id}`)
   }
   assert.equal(verdictOf('P2', real).verdict, 'NO-GO')
-  for (const id of unavailable) {
+  // An advisory item (ADVISORY_PACK_ITEMS) is listed at every phase and never blocks, even at P2: asserted below, once.
+  const advisory = ADVISORY_PACK_ITEMS.map((id) => `pack-${id}`)
+  assert.ok(advisory.includes('pack-R16'))
+  for (const id of advisory) {
+    const onlyThisOne = { ...allPassing(), [id]: { kind: 'not-available', reason: 'no runner' } as CheckResult }
+    assert.equal(verdictOf('P2', onlyThisOne).verdict, 'GO', `P2: advisory ${id} alone does not block`)
+    assert.ok(verdictOf('P2', onlyThisOne).notYetAvailable.includes(id), `P2 still lists ${id}`)
+  }
+  for (const id of unavailable.filter((entry) => !advisory.includes(entry))) {
     const onlyThisOne = { ...allPassing(), [id]: { kind: 'not-available', reason: 'no runner' } as CheckResult }
     assert.equal(verdictOf('P2', onlyThisOne).verdict, 'NO-GO', `P2: ${id} alone forces NO-GO`)
     assert.equal(verdictOf('P0', onlyThisOne).verdict, 'GO', `P0: ${id} alone does not`)

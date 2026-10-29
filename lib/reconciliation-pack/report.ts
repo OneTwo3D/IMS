@@ -404,6 +404,14 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
   if (has('QOBLEX_EXPORT_OFF') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1 || input.sources.length !== 0 || !spec.sources.includes('qoblex-file'))) fail('QOBLEX_EXPORT_OFF is an inconclusive item that stands on the Qoblex export, with nothing listed, nothing read and no other reason')
   if (has('NOT_SELECTED') && (input.outcome !== 'inconclusive' || everything !== 0 || reasons.length !== 1)) fail('NOT_SELECTED is an inconclusive item with nothing listed and no other reason')
   if (findings > 0 && (input.outcome !== 'fail' || !has('DIFFERENCES'))) fail('a finding makes the item a fail with DIFFERENCES')
+  // R16's finding reasons say WHY an entry is a finding, and each is coupled to the bucket it files under: a pair that differs (bothDiffer) is XERO_RATE_DIFFERS; a Xero row with no IMS counterpart (onlyVendor) is IMS_RATE_MISSING or DOCUMENT_UNREADABLE. No other item carries them.
+  const r16Reasons: readonly PackReasonCode[] = ['XERO_RATE_DIFFERS', 'IMS_RATE_MISSING', 'DOCUMENT_UNREADABLE', 'IMS_POSTED_RATE_NOT_TABLE_RATE', 'XERO_DATE_DIFFERS', 'IMS_POSTING_UNREADABLE']
+  if (input.id !== 'R16' && r16Reasons.some(has)) fail('the R16 finding reasons belong to R16 and nothing else')
+  if (input.id === 'R16') {
+    if ((has('XERO_RATE_DIFFERS') || has('IMS_POSTED_RATE_NOT_TABLE_RATE') || has('XERO_DATE_DIFFERS')) !== (counts.bothDiffer > 0)) fail('XERO_RATE_DIFFERS, IMS_POSTED_RATE_NOT_TABLE_RATE and XERO_DATE_DIFFERS are the differing pairs, and those pairs carry one of them')
+    if ((has('IMS_RATE_MISSING') || has('DOCUMENT_UNREADABLE') || has('IMS_POSTING_UNREADABLE')) !== (counts.onlyVendor > 0)) fail('IMS_RATE_MISSING, DOCUMENT_UNREADABLE and IMS_POSTING_UNREADABLE belong to the Xero rows with no IMS rate, and those rows carry one of them')
+    if (counts.onlyIms > 0) fail('R16 lists nothing on the IMS side alone')
+  }
   if (input.proof !== null && input.outcome !== 'pass') fail('only a pass carries a proof')
 
   if (applicability === 'not-applicable') {
@@ -470,7 +478,7 @@ export function buildReport(raw: ReportInput, sequence: number, previousReportSh
   for (const [index, bracket] of streams.entries()) if (index > 0 && streams[index - 1]!.stream === bracket.stream) throw new ReportInvalid('a stream is repeated')
   const byId = new Map(input.items.map((item) => [item.id, item]))
   if (byId.size !== input.items.length || PACK_ITEM_IDS.some((id) => !byId.has(id)) || input.items.length !== PACK_ITEM_IDS.length) {
-    throw new ReportInvalid('the report must carry each of R1 to R15 exactly once')
+    throw new ReportInvalid('the report must carry each of R1 to R16 exactly once')
   }
 
   const evidenceLines: string[] = []
@@ -577,12 +585,12 @@ export function parseReport(text: string): ReportRecord {
   })
   if (new Set(streams.map((s) => s.stream)).size !== streams.length) throw new ReportInvalid('a stream is repeated')
 
-  if (!Array.isArray(raw.items) || raw.items.length !== PACK_ITEM_IDS.length) throw new ReportInvalid('the report must carry R1 to R15')
+  if (!Array.isArray(raw.items) || raw.items.length !== PACK_ITEM_IDS.length) throw new ReportInvalid('the report must carry R1 to R16')
   const items: ItemResult[] = raw.items.map((entry: unknown, index: number) => {
     if (!isRecord(entry)) throw new ReportInvalid('bad item')
     exactKeys(entry, ITEM_KEYS, 'an item')
     const id = PACK_ITEM_IDS[index]!
-    if (entry.id !== id) throw new ReportInvalid('items are not R1 to R15 in order')
+    if (entry.id !== id) throw new ReportInvalid('items are not R1 to R16 in order')
     const applicability = itemApplicability(id, phase)
     if (entry.applicability !== applicability || !(PACK_APPLICABILITY as readonly string[]).includes(entry.applicability as string)) throw new ReportInvalid(`item ${id}: applicability does not match the catalogue`)
     if (typeof entry.outcome !== 'string' || !(PACK_OUTCOMES as readonly string[]).includes(entry.outcome)) throw new ReportInvalid(`item ${id}: bad outcome`)

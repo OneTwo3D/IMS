@@ -21,7 +21,7 @@ function fake(answer: (sql: string, values?: unknown[]) => Array<Record<string, 
     },
   }
 }
-const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule' | 'fxRates' | 'firstLoadProvenance'>(name: K, client: ImsQueryClient, asOf?: string, rowCap?: number) => {
+const sectionOf = async <K extends 'purchaseOrders' | 'transitSchedule' | 'fxRates' | 'firstLoadProvenance' | 'xeroPostedRates'>(name: K, client: ImsQueryClient, asOf?: string, rowCap?: number) => {
   const read = await readImsSnapshot(client, { sections: [name], ...(asOf !== undefined ? { asOf } : {}), ...(rowCap !== undefined ? { rowCap } : {}) })
   assert.ok(read.ok)
   return read.sections[name]!
@@ -229,4 +229,36 @@ test('transitSchedule: counts, per DURABLE source document kind, what predates t
   assert.equal(none.sent.filter((q) => /count\(\*\)::text/.test(q.sql)).length, 0)
   const bad = await sectionOf('transitSchedule', fake(transitAnswer({ pre: { 'landed-cost-links': 'x' } })), '2026-10-19')
   assert.deepEqual(bad, { ok: false, reason: 'BAD_VALUE' })
+})
+
+// ---- xeroPostedRates ------------------------------------------------------------------------------
+
+// [mutation: the status or settlement-basis filter dropped, a posting type added or removed, the payment rate read from the document key, a null flag defaulted]
+test('xeroPostedRates: reads the connector-confirmed creates of the six posting types with the rate the stored payload carried, as text; a bad flag is unreadable and a read over the cap is CAP_EXCEEDED', async () => {
+  const row = (over: Record<string, unknown> = {}) => ({ id: 'l1', type: 'SALES_INVOICE', external_id: 'x1', no_payload: false, currency: 'EUR', doc_date: '2026-09-10', rate: '1.25', woo_receipt: false, order_rate: null, woo_order: true, has_payment_id: true, payment_found: true, payment_woo: false, order_created: '2026-09-10T08:30:00.000Z', ...over })
+  const client = fake((sql) => (/FROM accounting_sync_logs l/.test(sql) ? [row(), row({ id: 'l2', type: 'INVOICE_PAYMENT', external_id: 'x2', woo_receipt: true, order_rate: '1.2', woo_order: null, payment_woo: true }), row({ id: 'l3', no_payload: true, currency: null, doc_date: null, rate: null })] : []))
+  const section = await sectionOf('xeroPostedRates', client)
+  assert.ok(section.ok)
+  assert.deepEqual(section.value.map((r) => [r.id, r.type, r.externalId, r.noPayload, r.currency, r.date, r.rate, r.wooReceipt, r.orderRate, r.wooOrder, r.hasPaymentId, r.paymentFound, r.paymentFromStorefront, r.orderCreatedAt]), [
+    ['l1', 'SALES_INVOICE', 'x1', false, 'EUR', '2026-09-10', '1.25', false, null, true, true, true, false, '2026-09-10T08:30:00.000Z'],
+    ['l2', 'INVOICE_PAYMENT', 'x2', false, 'EUR', '2026-09-10', '1.25', true, '1.2', false, true, true, true, '2026-09-10T08:30:00.000Z'],
+    ['l3', 'SALES_INVOICE', 'x1', true, null, null, null, false, null, true, true, true, false, '2026-09-10T08:30:00.000Z'],
+  ])
+  const sql = client.sent.find((x) => /accounting_sync_logs l/.test(x.sql))!.sql
+  assert.match(sql, /l\.connector = 'xero' AND l\.status::text = 'SYNCED' AND l\.settlement_basis IS NULL AND l\."externalTransactionId" IS NOT NULL/)
+  assert.match(sql, /IN \('SALES_INVOICE', 'PURCHASE_INVOICE', 'CREDIT_NOTE', 'PURCHASE_CREDIT_NOTE', 'INVOICE_PAYMENT', 'BILL_PAYMENT'\)/)
+  assert.match(sql, /to_char\(so\."externalCreatedAt"[^)]*\) AS order_created/)
+  assert.match(sql, /LEFT JOIN payments pay ON l\.type::text = 'INVOICE_PAYMENT' AND pay\.id = l\.payload->>'paymentId'/)
+  assert.match(sql, /pay\.notes LIKE 'Imported from WooCommerce%' OR pay\.notes LIKE 'Recorded from WooCommerce%'/)
+  assert.match(sql, /so\."fxRateToBase"::text AS order_rate/)
+  assert.match(sql, /\(l\.payload->>'paymentId'\) IS NOT NULL\) AS has_payment_id/)
+  assert.match(sql, /'settlementRateToBase' ELSE l\.payload->>'currencyRateToBase'/)
+  const reason = async (rows: Array<Record<string, unknown>>, cap?: number) => {
+    const s = await sectionOf('xeroPostedRates', fake((q) => (/accounting_sync_logs l/.test(q) ? rows : [])), undefined, cap)
+    return s.ok ? 'ok' : s.reason
+  }
+  assert.equal(await reason([row({ woo_receipt: null })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([row({ no_payload: 'f' })]), 'SOURCE_UNREADABLE')
+  assert.equal(await reason([row(), row()]), 'DUPLICATE_KEY')
+  assert.equal(await reason([row(), row({ id: 'l2' })], 1), 'CAP_EXCEEDED')
 })

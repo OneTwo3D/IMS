@@ -74,6 +74,8 @@ function reportProblem(record: ReportRecord, context: PackAssessContext, cadence
 
 /** Sources read as a stored snapshot for the run's cycle date (the as-of basis): a fresh report about an old date proves nothing current. */
 const CYCLE_DATED_SOURCES: ReadonlySet<string> = new Set(['xero-trial-balance', 'ims-ledger', 'qoblex-file'])
+/** Items whose population is chosen by the cycle date (the closed months before it) although they read no cycle-dated source: a report about an old date proves nothing current. */
+const CYCLE_DATED_ITEMS: ReadonlySet<string> = new Set(['R16'])
 const DAY_MS = 86_400_000
 
 /**
@@ -107,7 +109,7 @@ export function assessPackItem(read: PackReportRead, id: PackItemId, context: Pa
   const record = read.record
   const spec = getPackItem(id)
   const problem = reportProblem(record, context, PACK_CADENCE_MAX_AGE_MS[spec.cadence])
-    ?? (spec.sources.some((source) => CYCLE_DATED_SOURCES.has(source)) ? cycleDateProblem(record, context, PACK_CADENCE_MAX_AGE_MS[spec.cadence]) : null)
+    ?? (spec.sources.some((source) => CYCLE_DATED_SOURCES.has(source)) || CYCLE_DATED_ITEMS.has(id) ? cycleDateProblem(record, context, PACK_CADENCE_MAX_AGE_MS[spec.cadence]) : null)
   if (problem !== null) return unreadable(`${problem}, so ${id} is not established`)
   const matches = record.items.filter((item) => item.id === id)
   if (matches.length !== 1) return unreadable(`the newest reconciliation pack report lists ${id} ${matches.length} times, expected exactly once`)
@@ -145,7 +147,7 @@ export function combineDerivations(id: PackItemId, gate: CheckResult, pack: Chec
   return unreadable(`${id} is read two ways and they do not agree: the gate's own reading of the invariant report is ${gate.kind}, the reconciliation pack's is ${pack.kind}${pack.kind === 'unreadable' ? ` (${pack.reason})` : ''}; the stricter reading wins, so it is not established`)
 }
 
-/** The gate's slots for all fifteen items, from one read of the pack report. */
+/** The gate's slots for all sixteen items, from one read of the pack report. */
 export function assessPackItems(read: PackReportRead, context: PackAssessContext): Record<PackItemId, CheckResult> {
   return Object.fromEntries(PACK_ITEMS.map((item) => [item.id, assessPackItem(read, item.id, context)])) as Record<PackItemId, CheckResult>
 }

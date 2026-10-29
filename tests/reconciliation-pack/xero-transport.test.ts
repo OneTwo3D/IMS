@@ -80,7 +80,7 @@ test('the hop gate refuses everything but a GET to the organisation or the invoi
   for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'get', '']) assert.equal(hop(good, method), 'method', method)
   assert.equal(hop(good, 'GET', 1), 'redirect')
   for (const url of [
-    'https://api.xero.com/api.xro/2.0/Invoices/abc', 'https://api.xero.com/api.xro/2.0/Contacts', 'https://api.xero.com/api.xro/2.0/Payments', 'https://api.xero.com/api.xro/2.0/CreditNotes', 'https://api.xero.com/api.xro/2.0/Journals',
+    'https://api.xero.com/api.xro/2.0/Invoices/abc', 'https://api.xero.com/api.xro/2.0/Contacts', 'https://api.xero.com/api.xro/2.0/Payments/abc', 'https://api.xero.com/api.xro/2.0/CreditNotes/abc', 'https://api.xero.com/api.xro/2.0/Journals', 'https://api.xero.com/api.xro/2.0/payments', 'https://api.xero.com/api.xro/2.0/BankTransactions', 'https://api.xero.com/api.xro/2.0/Prepayments', 'https://api.xero.com/api.xro/2.0/Overpayments',
     'https://api.xero.com/api.xro/2.0/Reports/TrialBalance', 'https://api.xero.com/api.xro/2.0/Invoices/', 'https://api.xero.com/api.xro/2.0/invoices', 'https://api.xero.com/api.xro/2.0', 'https://api.xero.com/api.xro/1.0/Invoices',
     'https://api.xero.com/connections', 'https://api.xero.com/api.xro/2.0/Organisation/../Contacts', 'https://api.xero.com/',
   ]) assert.equal(hop(url), 'path', url)
