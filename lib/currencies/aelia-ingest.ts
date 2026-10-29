@@ -18,6 +18,9 @@ import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
  * does not know, an IMS currency Aelia does not list, a base currency that differs from IMS's, and a missing or future update time are all refused: nothing is stored for them and nothing is
  * substituted (never 1, never another source). A refusal of the base currency or of the update time refuses the whole read; the others refuse that currency only.
  *
+ * MARKUP RULE. `rate_markup` is never an input to the stored rate, so a non-base currency whose markup is absent is still stored at its `rate`; its markup is reported as null (unknown), never as 0.
+ * The base currency's own row is skipped (see parseAeliaRatesPayload).
+ *
  * MANUAL OVERRIDES keep working exactly as for the ECB fetch: a currency whose latest row is a manual override is skipped (the pin stays until the admin clears it), and a row written here is an
  * ordinary row that selectFxRateFromRows ranks by fetchedAt like any other.
  *
@@ -132,6 +135,9 @@ export function parseAeliaRatesPayload(body: unknown, now: Date = new Date()): A
     const row = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
     const currency = typeof row.currency === 'string' ? row.currency.trim().toUpperCase() : ''
     if (!CURRENCY.test(currency)) { refused.push({ currency: null, reason: 'payload_invalid', message: 'An Aelia entry has no valid currency code' }); continue }
+    // THE BASE ROW (the live option holds one: the base currency has `rate` and decimals but NO `rate_markup` and NO `set_manually`). The base against itself is not a rate, so the row is not read at
+    // all: it can neither refuse the read nor become a stored row, and its absent markup is never taken for a markup of 0 on a foreign currency.
+    if (currency === base) continue
     if (seen.has(currency)) { duplicated.add(currency); continue }
     seen.add(currency)
     const parsed = parseRate(row.rate)
@@ -184,7 +190,7 @@ export async function ingestAeliaRates(body: unknown, options: { now?: Date } = 
   const markups: Record<string, string | null> = {}
   const usable: AeliaRateEntry[] = []
   for (const entry of parsed.entries) {
-    if (entry.currency === baseCurrency) continue // the base against itself is not a stored rate
+    if (entry.currency === baseCurrency) continue // unreachable after parsing (the base row is dropped there); kept as the second guard that no base row is ever stored
     markups[entry.currency] = entry.markup
     if (!knownByCode.has(entry.currency)) {
       refused.push({ currency: entry.currency, reason: 'unknown_currency', message: `Aelia lists ${entry.currency}, which IMS does not know; nothing was stored for it` })

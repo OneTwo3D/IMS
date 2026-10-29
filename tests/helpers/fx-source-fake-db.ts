@@ -119,3 +119,20 @@ export function aeliaAnswer(overrides: Record<string, unknown> = {}) {
     ...overrides,
   }
 }
+
+/**
+ * The answer in the shape of the LIVE store (synthetic numbers): Aelia's own update time was an epoch INTEGER (1793273765) that the plugin renders as ISO, and the BASE row (GBP) is listed with a
+ * rate and decimals but NO markup and NO set_manually, which the plugin returns as markup null / set_manually false.
+ */
+export function liveShapedAeliaAnswer(overrides: Record<string, unknown> = {}) {
+  return aeliaAnswer({
+    last_update: '2026-10-29T11:36:05Z', // gmdate of 1793273765
+    rates: [
+      { currency: 'EUR', rate: '1.150000', markup: '0.01', set_manually: false, decimals: 4 },
+      { currency: 'GBP', rate: '1', markup: null, set_manually: false, decimals: 4 },
+      { currency: 'NOK', rate: '12.250000', markup: '0.10', set_manually: false, decimals: 4 },
+      { currency: 'USD', rate: '1.300000', markup: null, set_manually: false, decimals: 4 },
+    ],
+    ...overrides,
+  })
+}

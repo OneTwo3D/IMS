@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
@@ -129,4 +130,78 @@ test('plugin source: the GET handler and its helper make NO write', () => {
   }
   // CONTROL: the same pattern does see the writes of the push handler, so it can fail
   assert.match(phpFunction('oti_handle_fx_push'), writes)
+})
+
+// ------------------------------------------------------------------ the live option's shape: an epoch-INTEGER update time, and a base row without rate_markup / set_manually
+
+test('plugin source: the update time accepts an epoch integer (the live option stores exchange_rates_last_update that way) and renders it ISO-8601 UTC', () => {
+  const body = phpFunction('oti_aelia_last_update_iso')
+  assert.match(body, /'exchange_rates_last_update'/, 'the key the live option uses is the first one tried')
+  assert.ok(body.indexOf("'exchange_rates_last_update'") < body.indexOf("'exchange_rates_update_time'"))
+  assert.match(body, /is_numeric\(\$raw\)[\s\S]*?\(int\) \$raw/, 'a numeric value is an epoch')
+  assert.match(body, /gmdate\('Y-m-d\\TH:i:s\\Z', \$ts\)/)
+  // a row without rate_markup returns markup null, never a 0
+  assert.match(phpFunction('oti_handle_aelia_rates_read'), /'markup'\s*=>\s*isset\(\$row\['rate_markup'\]\) \? trim\(\(string\) \$row\['rate_markup'\]\) : null/)
+})
+
+const PHP_BIN = spawnSync('php', ['-v']).status === 0 ? 'php' : null
+
+/** Run the REAL plugin functions under the php CLI with the WordPress calls they make stubbed; returns the response data. */
+function runHandler(option: unknown, currency = 'GBP'): unknown {
+  const start = PHP.indexOf("if (!function_exists('oti_aelia_last_update_iso'))")
+  const end = PHP.indexOf("if (!function_exists('oti_ps_parts_done'))")
+  assert.ok(start > 0 && end > start)
+  const script = `<?php
+const OTI_AELIA_SETTINGS_OPT = 'wc_aelia_currency_switcher';
+class WP_REST_Request {}
+class WP_REST_Response { public $data; function __construct($d) { $this->data = $d; } }
+class WP_Error { public $code; function __construct($c) { $this->code = $c; } }
+function get_option($k, $d = null) { $o = json_decode(getenv('OPT'), true); return $k === 'woocommerce_currency' ? getenv('CUR') : ($o === null ? $d : $o); }
+${PHP.slice(start, end)}
+$r = oti_handle_aelia_rates_read(new WP_REST_Request());
+echo json_encode($r instanceof WP_Error ? ['error' => $r->code] : $r->data);
+`
+  const res = spawnSync('php', ['-d', 'display_errors=stderr'], { input: script, env: { ...process.env, OPT: JSON.stringify(option), CUR: currency }, encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  assert.equal(res.stderr, '', 'no PHP warning or notice')
+  return JSON.parse(res.stdout)
+}
+
+// The live option's structure with synthetic numbers: the update time is an epoch INTEGER, GBP (the base) has rate and decimals only.
+const LIVE_OPTION = {
+  exchange_rates_last_update: 1793273765,
+  exchange_rates_update_enable: '1',
+  exchange_rates_update_schedule: 'twicedaily',
+  enabled_currencies: ['EUR', 'GBP', 'NOK', 'USD'],
+  exchange_rates: {
+    EUR: { rate: '1.150000', rate_markup: '0.01', set_manually: '', exchange_rate_decimals: 4, symbol: 'E' },
+    GBP: { rate: '1', decimals: 4 },
+    NOK: { rate: '12.250000', rate_markup: '0.10', set_manually: '', decimals: 4 },
+    USD: { rate: '1.300000', rate_markup: '', set_manually: '', decimals: 4 },
+  },
+}
+
+test('plugin EXECUTED (php CLI): an epoch-integer update time becomes ISO UTC; the base row has markup null and set_manually false', { skip: PHP_BIN === null && 'php not installed' }, () => {
+  const out = runHandler(LIVE_OPTION) as { ok: boolean; base: string; last_update: string; last_update_source: string; rates: Array<Record<string, unknown>> }
+  assert.equal(out.last_update, '2026-10-29T11:36:05Z')
+  assert.equal(out.last_update_source, 'exchange_rates_last_update')
+  assert.equal(out.base, 'GBP')
+  const gbp = out.rates.find((r) => r.currency === 'GBP')
+  assert.deepEqual(gbp, { currency: 'GBP', rate: '1', markup: null, set_manually: false, decimals: 4 }, 'the base row: no markup is invented as 0')
+  assert.deepEqual(out.rates.find((r) => r.currency === 'EUR'), { currency: 'EUR', rate: '1.150000', markup: '0.01', set_manually: false, decimals: 4 })
+  assert.equal(out.rates.find((r) => r.currency === 'USD')?.markup, '', 'an empty markup is returned as Aelia holds it, never combined')
+  // a string epoch and an ISO string work too; a non-positive epoch is not a time
+  assert.equal((runHandler({ ...LIVE_OPTION, exchange_rates_last_update: '1793273765' }) as { last_update: string }).last_update, '2026-10-29T11:36:05Z')
+  assert.equal((runHandler({ ...LIVE_OPTION, exchange_rates_last_update: 0 }) as { last_update: unknown }).last_update, null)
+  // CONTROL: a different epoch gives a different time, so the assertion above can fail
+  assert.equal((runHandler({ ...LIVE_OPTION, exchange_rates_last_update: 1793273766 }) as { last_update: string }).last_update, '2026-10-29T11:36:06Z')
+})
+
+test('plugin EXECUTED, end to end into the TS parser: the live-shaped answer parses with no refusal and no base entry', { skip: PHP_BIN === null && 'php not installed' }, async () => {
+  const { parseAeliaRatesPayload } = await import('@/lib/currencies/aelia-ingest')
+  const parsed = parseAeliaRatesPayload(runHandler(LIVE_OPTION), new Date('2026-10-29T12:00:00Z'))
+  assert.equal(parsed.updatedAt.getTime(), 1793273765 * 1000)
+  assert.deepEqual(parsed.entries.map((e) => e.currency).sort(), ['EUR', 'NOK', 'USD'])
+  assert.deepEqual(parsed.refused, [])
+  assert.deepEqual(Object.fromEntries(parsed.entries.map((e) => [e.currency, e.markup])), { EUR: '0.01', NOK: '0.10', USD: null })
 })

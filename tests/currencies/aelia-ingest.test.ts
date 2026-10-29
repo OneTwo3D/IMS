@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { aeliaAnswer, createFxSourceFakeDb, type FakeFxRateRow } from '@/tests/helpers/fx-source-fake-db'
+import { aeliaAnswer, createFxSourceFakeDb, liveShapedAeliaAnswer, type FakeFxRateRow } from '@/tests/helpers/fx-source-fake-db'
 
 /**
  * AELIA'S RATES INTO fx_rates (lib/currencies/aelia-ingest.ts). Database faked; the exclusive FX table lock is the REAL withFxTableWriteLock over the fake transaction.
@@ -231,4 +231,49 @@ test('every fx_rates write of the ingest happens inside the exclusive lock trans
     if (e === 'lock') sawLock = true
     if (e.startsWith('fxRate.create')) assert.ok(sawLock, 'the lock was taken before the write')
   }
+})
+
+// ------------------------------------------------------------------ the live store's shape: an epoch-int update time (rendered ISO by the plugin) and a BASE row without markup
+
+test('LIVE SHAPE: the base row (rate, no markup, no set_manually) neither refuses the read nor is stored; the foreign currencies are stored before markup', async () => {
+  reset()
+  const { ingestAeliaRates, parseAeliaRatesPayload } = await load()
+  const answer = liveShapedAeliaAnswer()
+  assert.ok((answer.rates as Array<{ currency: string }>).some((r) => r.currency === 'GBP'), 'PRECONDITION: the answer does list the base row')
+  const parsed = parseAeliaRatesPayload(answer, new Date('2026-10-29T12:00:00Z'))
+  assert.equal(parsed.entries.some((e) => e.currency === 'GBP'), false, 'the base row is not read')
+  assert.deepEqual(parsed.refused, [])
+  const result = await ingestAeliaRates(answer, { now: new Date('2026-10-29T12:00:00Z') })
+  assert.deepEqual(result.written.sort(), ['EUR', 'NOK', 'USD'])
+  assert.deepEqual(result.refused, [])
+  assert.equal(rowOf('GBP').length, 0, 'no GBP row is ever stored')
+  assert.equal(fake.rates.filter((r) => r.toCurrency === 'GBP' || r.fromCurrency === r.toCurrency).length, 0)
+  assert.equal(rowOf('EUR')[0].rate, '1.150000')
+  assert.equal(rowOf('NOK')[0].rate, '12.250000')
+  assert.equal(rowOf('EUR')[0].fetchedAt.toISOString(), '2026-10-29T11:36:05.000Z', 'the epoch 1793273765, as the plugin renders it')
+  assert.equal(new Date(1793273765 * 1000).toISOString(), '2026-10-29T11:36:05.000Z')
+})
+
+test('LIVE SHAPE: whatever the base row holds (1, nothing, zero, a wrong number, a word) it is skipped and never refuses the read', async () => {
+  const { parseAeliaRatesPayload } = await load()
+  for (const base of [{ rate: '1' }, {}, { rate: '0' }, { rate: '0.9' }, { rate: 'abc' }, { rate: null }]) {
+    const answer = liveShapedAeliaAnswer({ rates: [{ currency: 'GBP', ...base, decimals: 4 }, { currency: 'EUR', rate: '1.15', markup: '0.01' }] })
+    const parsed = parseAeliaRatesPayload(answer, new Date('2026-10-29T12:00:00Z'))
+    assert.deepEqual(parsed.entries.map((e) => e.currency), ['EUR'], JSON.stringify(base))
+    assert.deepEqual(parsed.refused, [], JSON.stringify(base))
+  }
+})
+
+test('MARKUP RULE: a non-base currency with no markup is stored at its rate with markup null; the base row\'s absent markup is never read as 0 for anyone', async () => {
+  reset()
+  const { ingestAeliaRates } = await load()
+  const result = await ingestAeliaRates(liveShapedAeliaAnswer(), { now: new Date('2026-10-29T12:00:00Z') })
+  assert.deepEqual(result.markups, { EUR: '0.01', NOK: '0.10', USD: null }, 'USD has no markup: null (unknown), not 0; GBP is not reported at all')
+  assert.equal(rowOf('USD')[0].rate, '1.300000', 'a missing markup does not change or block the stored rate')
+  assert.equal('GBP' in result.markups, false)
+  // the key is absent altogether (not only null) on a foreign currency: the same
+  const noKey = liveShapedAeliaAnswer({ rates: [{ currency: 'EUR', rate: '1.15' }, { currency: 'USD', rate: '1.3' }, { currency: 'NOK', rate: '12.25' }] })
+  reset()
+  const again = await ingestAeliaRates(noKey, { now: new Date('2026-10-29T12:00:00Z') })
+  assert.deepEqual(again.markups, { EUR: null, USD: null, NOK: null })
 })
