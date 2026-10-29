@@ -98,15 +98,14 @@ assert_not_serving() { # <slot>
   hdr="$(header_slot)" || { log "cannot tell whether $(slot_name "$1") is serving; not touching it"; return 1; }
   if [ "$hdr" = "$1" ]; then log "REFUSING to remove or stop $(slot_name "$1"): nginx is serving from it"; return 1; fi
 }
-# Stop a slot only after the RUNNING nginx confirms it is not serving from it. If it is (or nginx cannot be asked), leave it running
-# and say so loudly; rc 1. Used by every failure path, so a failed switch-back can never take production down.
+# Failure paths stop the slot they attempted through the SAME drain logic as a successful switch (drain_and_stop_slot): after a
+# switch-back, old nginx workers may still be proxying to the attempted slot. rc 0 stopped; rc 5 left running for draining workers (or
+# a failed stop): "failed; cleanup pending"; rc 1 nginx serves it (or cannot be asked): MANUAL ATTENTION. The caller still fails.
 stop_unless_serving() { # <slot>
-  if assert_not_serving "$1"; then
-    docker stop "$(slot_name "$1")" >/dev/null 2>&1 || true
-    return 0
-  fi
-  log "MANUAL ATTENTION: nginx serves (or may serve) $(slot_name "$1"); it is left running. Check ${IMS_FRONT_URL}/login and ${IMS_UPSTREAM_FILE} by hand; both slots may be running."
-  return 1
+  local rc=0
+  drain_and_stop_slot "$1" "deploy FAILED; cleanup pending" "attempted slot" || rc=$?
+  [ "$rc" != 1 ] || log "MANUAL ATTENTION: nginx serves (or may serve) $(slot_name "$1"); it is left running. Check ${IMS_FRONT_URL}/login and ${IMS_UPSTREAM_FILE} by hand; both slots may be running."
+  return "$rc"
 }
 # --- draining the old slot ------------------------------------------------------------------------------------------------------
 # After a reload, old nginx workers keep proxying their in-flight requests to the OLD slot for up to proxy_read_timeout. Those workers
@@ -136,15 +135,15 @@ EXIT_CLEANUP_PENDING=5
 # Wait for the old workers to finish, then stop the old slot (kept, not removed). The new slot is already live and recorded. If workers
 # are STILL draining when the bound expires, the old slot is NOT stopped: proxy_read_timeout bounds the gap between reads, not a whole
 # (for example streamed) response, so killing it could cut a live download. rc 0 stopped; rc 1 nginx still serves it (refused);
-# rc 5 cleanup pending (left running; run cleanup-old-slot.sh later).
-drain_and_stop_slot() { # <slot>
-  local slot="$1" bound waited=0 still
+# rc 5 cleanup pending (left running, or the stop failed; run cleanup-old-slot.sh later).
+drain_and_stop_slot() { # <slot> [context for the log, default "deploy complete, cleanup pending"]
+  local slot="$1" context="${2:-deploy complete, cleanup pending}" what="${3:-old slot}" bound waited=0 still
   bound="$(drain_bound_s)"
   while :; do
     still="$(draining_workers)"
     [ -n "$still" ] || break
     if [ "$waited" -ge "$bound" ]; then
-      log "deploy complete, cleanup pending: old slot $(slot_name "$slot") kept running for $(printf '%s\n' "$still" | grep -c .) draining nginx worker(s) after ${bound}s:"
+      log "${context}: ${what} $(slot_name "$slot") kept running for $(printf '%s\n' "$still" | grep -c .) draining nginx worker(s) after ${bound}s:"
       sed 's/^/  /' <<< "$still" >&2
       log "stop it later with: $(dirname "${BASH_SOURCE[0]}")/cleanup-old-slot.sh   (it re-checks for draining workers first)"
       return "$EXIT_CLEANUP_PENDING"
@@ -154,7 +153,12 @@ drain_and_stop_slot() { # <slot>
   done
   # Only stop the slot once the RUNNING nginx reports it is not serving from it.
   assert_not_serving "$slot" || return 1
-  docker stop -t 30 "$(slot_name "$slot")" >/dev/null 2>&1 || log "warning: could not stop $(slot_name "$slot")"
+  docker stop -t 30 "$(slot_name "$slot")" >/dev/null 2>&1 || true
+  # A stop that failed (or did not take effect) is not success: verify, and report cleanup pending.
+  if slot_running "$slot"; then
+    log "${context}: $(slot_name "$slot") is still running after docker stop; stop it later with $(dirname "${BASH_SOURCE[0]}")/cleanup-old-slot.sh"
+    return "$EXIT_CLEANUP_PENDING"
+  fi
 }
 # Refuse to touch the idle slot while nginx workers may still be using it (an earlier drain ran out of time). rc 1 = refused.
 assert_no_draining_workers() {

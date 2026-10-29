@@ -338,7 +338,10 @@ NOT stopped: `deploy.sh` and `rollback.sh` log "deploy complete, cleanup pending
 with status **5** ("deployed, cleanup incomplete"). Run `cleanup-old-slot.sh` later: it re-checks for draining workers and stops the
 non-served slot only when none remain. Until then a further deploy or rollback is refused up front, and `run_slot` itself refuses to
 replace a slot while workers drain. Exit codes of `deploy.sh`: 0 deployed; 1 failed; 2 usage; 3 refused by the pre-migration check;
-4 deployed but the crontab could not be re-rendered; 5 deployed, old slot kept running for draining workers.
+4 deployed but the crontab could not be re-rendered; 5 deployed, old slot kept running for draining workers (or its `docker stop` failed,
+which is verified with `docker inspect`). A FAILED deploy or rollback (exit 1) stops the slot it attempted through the same drain logic:
+if workers still drain after the switch-back, that slot is kept running and the log says "deploy FAILED; cleanup pending"; the result
+is still a failure, and `cleanup-old-slot.sh` stops it later.
 
 **Records.** `previous` then `current` are written as soon as nginx is verified serving the new slot (the X-IMS-Slot header names it),
 BEFORE the drain wait, so a crash while draining cannot leave them naming the old release. If they still disagree with what nginx

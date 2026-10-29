@@ -901,6 +901,58 @@ postgresql://h/d?schema=public
 postgresql://h/d?schema=public&sslmode=require"
 }
 
+t_failed_verification_keeps_the_attempted_slot_while_workers_drain() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/front_fail" "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=10
+  deploy "$B"
+  eq "$rc" 1 "a failed deploy stays a failure (exit 1)"
+  grep -q 'deploy FAILED; cleanup pending: attempted slot ims-green kept running' "$T/out" || fail "no failed/cleanup-pending message: $(tail -n 6 "$T/out")"
+  eq "$(container_running ims-green)" 1 "the attempted slot must not be stopped while workers drain"
+  log_lacks '^docker stop -t 30'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$A blue"
+  grep -q 'server 127.0.0.1:3101;' "$IMS_UPSTREAM_FILE" || fail "nginx was not switched back"
+}
+
+t_failed_verification_stops_the_attempted_slot_only_after_workers_exit() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/front_fail"; echo 2 > "$STUB/ps_drain_polls"; export IMS_DRAIN_BOUND_S=100
+  deploy "$B"
+  eq "$rc" 1 "failed deploy"
+  eq "$(grep -c '^ps draining' "$STUB/calls.log")" 2
+  last="$(grep -n '^ps draining' "$STUB/calls.log" | tail -n 1 | cut -d: -f1)"; stop="$(line_of '^docker stop -t 30 ims-green')"
+  [ -n "$stop" ] && [ "$last" -lt "$stop" ] || fail "the attempted slot was stopped (line ${stop:-none}) before the workers finished (line $last)"
+  eq "$(container_running ims-green)" 0
+}
+
+t_failed_rollback_verification_keeps_the_attempted_slot_while_workers_drain() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/front_fail" "$STUB/ps_drain_forever"; export IMS_DRAIN_BOUND_S=10
+  rollback
+  eq "$rc" 1 "failed rollback"
+  grep -q 'cleanup pending: attempted slot ims-blue kept running' "$T/out" || fail "no cleanup-pending message: $(tail -n 6 "$T/out")"
+  eq "$(container_running ims-blue)" 1
+  log_lacks '^docker stop -t 30'
+}
+
+t_a_failed_docker_stop_of_the_old_slot_is_cleanup_pending() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/stop_fail_ims-blue"
+  deploy "$B"
+  eq "$rc" 5 "deployed, but the old slot could not be stopped: $(tail -n 4 "$T/out")"
+  grep -q 'still running after docker stop' "$T/out" || fail "no message"
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
+}
+
+t_a_stop_that_does_not_take_effect_is_cleanup_pending_for_rollback_and_cleanup() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/stop_ignored_ims-green"
+  rollback
+  eq "$rc" 5 "rolled back, old slot would not stop: $(tail -n 3 "$T/out")"
+  rc=0; "$BIN/cleanup-old-slot.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 5 "cleanup-old-slot.sh must report the failed stop too"
+  grep -q 'still running after docker stop' "$T/out" || fail "no message from cleanup"
+}
+
 # ---------------------------------------------------------------------------------------------------------------------------------
 tests=("$@")
 if [ "${#tests[@]}" = 0 ]; then mapfile -t tests < <(declare -F | awk '{print $3}' | grep '^t_'); fi

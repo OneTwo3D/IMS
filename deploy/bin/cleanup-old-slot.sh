@@ -26,5 +26,6 @@ if [ -n "$still" ]; then
   exit "$EXIT_CLEANUP_PENDING"
 fi
 assert_not_serving "$idle" || exit 1
-docker stop -t 30 "$(slot_name "$idle")" >/dev/null || die "cannot stop $(slot_name "$idle")"
+docker stop -t 30 "$(slot_name "$idle")" >/dev/null 2>&1 || true
+if slot_running "$idle"; then log "$(slot_name "$idle") is still running after docker stop; cleanup is still pending"; exit "$EXIT_CLEANUP_PENDING"; fi
 log "stopped $(slot_name "$idle")"
