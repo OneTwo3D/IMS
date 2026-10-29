@@ -245,21 +245,21 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     if (document.date !== null && !periodSet.has(document.date.slice(0, 7))) { summary.outsidePeriod += 1; continue }
     const unreadable = (): void => { summary.documentUnreadable += 1; vendor.push({ key: [...baseKey(document), sku('document-unreadable')], value: '0' }) }
     if (document.readable && document.currency === base) {
-      // A payment has no currency of its own in Xero: the item reads the settled document's. The poster, though, sends the payment payload's own currency and rate, so a payment on a
-      // base-currency document is NOT out of scope until both agree it is a base payment. A linked payment whose posting carried another currency is IMS_POSTING_UNREADABLE (the same
-      // closed reason as every currency disagreement between a posting and Xero), and a payment whose CurrencyRate is anything but 1 on a base document cannot be shown to be a base
-      // payment (a cross-currency payment): it is listed as unreadable, never set aside. A rate of 1, or none, on a base document is skipped as before.
-      if (document.kind === 'payment') {
-        const postedHere = postedById.get(document.id)
-        const foreignPosting = postedHere?.find((p) => p.currency !== null && p.currency.trim().toUpperCase() !== base)
-        if (postedHere !== undefined && foreignPosting !== undefined) {
-          summary.imsPosted += 1
-          summary.postingUnreadable += 1
-          vendor.push({ key: [...baseKey(document), sku('ims-posting-unreadable'), sku(foreignPosting.id), sku('currency-mismatch')], value: document.rate ?? '0' })
-          continue
-        }
-        if (document.rate !== null && !D(document.rate).eq(1)) { unreadable(); continue }
+      // THE ONE GUARD, for every kind (invoice, bill, credit note, supplier credit, payment): the linked IMS posting is consulted BEFORE a document is set aside as base currency.
+      // IMS posted the record in the currency its payload carries; if that is another currency than the base, Xero now reading the record as base is a disagreement between the two,
+      // and it is IMS_POSTING_UNREADABLE (currency-mismatch, the closed reason every posting/Xero currency disagreement already has), never a skip. Only a record that is unlinked, or
+      // linked with a base posted currency (or none recorded), may be set aside as base. A payment has no currency of its own in Xero (the item reads the settled document's) while the
+      // poster sends the payment payload's own currency and rate, so a payment is further held to rate 1 (or none) on a base document: any other rate cannot be shown to be a base
+      // payment (a cross-currency payment) and is listed as unreadable. Voided or deleted documents never reach this loop (they are set aside by decision at the read, see the header).
+      const postedHere = postedById.get(document.id)
+      const foreignPosting = postedHere?.find((p) => p.currency !== null && p.currency.trim().toUpperCase() !== base)
+      if (postedHere !== undefined && foreignPosting !== undefined) {
+        summary.imsPosted += 1
+        summary.postingUnreadable += 1
+        vendor.push({ key: [...baseKey(document), sku('ims-posting-unreadable'), sku(foreignPosting.id), sku('currency-mismatch')], value: document.rate ?? '0' })
+        continue
       }
+      if (document.kind === 'payment' && document.rate !== null && !D(document.rate).eq(1)) { unreadable(); continue }
       summary.baseCurrency += 1
       continue
     }

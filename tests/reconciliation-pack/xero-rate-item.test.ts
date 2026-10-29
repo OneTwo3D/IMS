@@ -531,3 +531,24 @@ test('A PAYMENT ON A BASE-CURRENCY DOCUMENT is out of scope only when it is also
   // Documents carry their own currency: a GBP invoice at any rate is still out of scope.
   assert.equal((await runXeroRateCheck(context({ invoices: [invoiceRow({ n: 1, date: SEP, currency: 'GBP', rate: 0.85 })] }).ctx)).summary?.baseCurrency, 1)
 })
+
+// [mutation: the linked-posting guard confined to payments / a base document with a foreign posting skipped / the guard moved after the skip]
+test('A LINKED FOREIGN POSTING returned by Xero as base currency is a finding for EVERY kind; an unlinked or base-posted one is skipped', async () => {
+  const gbpInvoice = invoiceRow({ n: 1, date: SEP, currency: 'GBP', rate: 1 })
+  const gbp = (n: number, type: string) => ({ n, date: SEP, currency: 'GBP', rate: 1, type })
+  const cases: Array<[string, string, Parameters<typeof context>[0]]> = [
+    ['SALES_INVOICE', 'invoice', { invoices: [gbpInvoice] }],
+    ['PURCHASE_INVOICE', 'bill', { invoices: [invoiceRow(gbp(1, 'ACCPAY'))] }],
+    ['CREDIT_NOTE', 'credit note', { creditNotes: [creditNoteRow(gbp(1, 'ACCRECCREDIT'))] }],
+    ['PURCHASE_CREDIT_NOTE', 'supplier credit', { creditNotes: [creditNoteRow(gbp(1, 'ACCPAYCREDIT'))] }],
+  ]
+  for (const [type, name, lists] of cases) {
+    const run = await runXeroRateCheck(context(lists, { ims: { rows: LATER, posted: [postedRow(1, type, { currency: 'EUR', rate: '1.25' })] } }).ctx)
+    assert.deepEqual([run.item.outcome, [...run.item.reasons].sort(), run.summary?.baseCurrency, run.summary?.postingUnreadable], ['fail', ['DIFFERENCES', 'IMS_POSTING_UNREADABLE'], 0, 1], name)
+  }
+  // Unlinked, or linked with a base posted currency (or none recorded): a base record, set aside.
+  for (const posted of [[], [postedRow(1, 'SALES_INVOICE', { currency: 'GBP', rate: '1' })], [postedRow(1, 'SALES_INVOICE', { currency: null })]]) {
+    const run = await runXeroRateCheck(context({ invoices: [gbpInvoice] }, { ims: { rows: LATER, posted } }).ctx)
+    assert.deepEqual([run.summary?.baseCurrency, run.summary?.postingUnreadable], [1, 0])
+  }
+})
