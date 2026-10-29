@@ -223,18 +223,19 @@ tmp=$(mktemp) && docker run --rm --network <db-network> -e DATABASE_URL --entryp
   /app/dist-scripts/render-managed-crontab.mjs --format cron.d --cron-user root \
   --base-url http://127.0.0.1:3000 --secret-file /etc/ims/cron.env --log-path /var/log/ims/cron.log > "$tmp" \
   && [ "$(grep -c '^# --- OTI CRON \(START\|END\) ---$' "$tmp")" = 2 ] \
-  && install -m 0644 -o root -g root "$tmp" /etc/cron.d/onetwo3d-ims && rm -f "$tmp"
+  && install -m 0644 -o root -g root "$tmp" /etc/cron.d/.onetwo3d-ims.new && mv -f /etc/cron.d/.onetwo3d-ims.new /etc/cron.d/onetwo3d-ims && rm -f "$tmp"
 ```
 
-Mount the DIRECTORY, not the file: `install` replaces the file (a new inode), and a single-file bind mount keeps pointing at the old
+Never `install` straight onto the live path: write the dotted temp file (cron ignores names with a dot) and `mv -f` it over, which is atomic.
+Mount the DIRECTORY, not the file: the `mv` replaces the file (a new inode), and a single-file bind mount keeps pointing at the old
 one. Mounting `/etc/cron.d` read-only at, say, `/host-cron.d` and setting
 `IMS_SCHEDULER_CRONTAB_FILE=/host-cron.d/onetwo3d-ims` `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d` sees every reinstall at once.
 
 **In container mode, Save only records the settings.** The Scheduler page's Save & Apply (and every other save that used to rewrite
 the crontab) cannot change host cron: it commits the settings, runs no `crontab`, and reports a warning, never a success: "Host cron
 update pending: the host must re-render and install /etc/cron.d/onetwo3d-ims". The Scheduler page says that cron runs on the host. The host applies a change by re-rendering and
-installing the file with the command below. A later deployment task will add a host timer that does this automatically every few
-minutes when the rendered output changes; until that exists, it is manual. Container mode is `IMS_SCHEDULER_CRONTAB_FILE` set together
+installing the file with the command below. On the production host the `ims-cron-render` timer (see "Production host: blue/green deploy")
+does this every 5 minutes, replacing the file only when the rendered output changed; elsewhere it is manual. Container mode is `IMS_SCHEDULER_CRONTAB_FILE` set together
 with `IMS_SCHEDULER_CRONTAB_FORMAT=cron.d`; on a stage host (the `user` layout, `crontab -l`) Save & Apply still rewrites the crontab as
 before. Schedules are validated against the real cron field ranges (minute 0-59, hour 0-23, day of month 1-31, month 1-12, day of week 0-7; `*`, lists, ranges and steps, no names or macros): Save refuses an invalid one, the renderer refuses to render a saved one (naming the job and field), and the reader treats an installed line with one as unreadable, because cron silently ignores such a line.
 A check that compares the installed host file with the saved settings (and shows "in sync" or "out of date" on the Scheduler page)
@@ -263,6 +264,71 @@ over the installed `/etc/cron.d/onetwo3d-ims` (a saved every-minute schedule) an
 completed it.
 
 Not available inside the container: the in-app Scheduler's `crontab` reconciliation (see above).
+
+### Production host: blue/green deploy
+
+Production runs on one Proxmox container (CT 115, Debian 13) with PostgreSQL 17 installed natively (127.0.0.1:5432). Releases are the
+CI-built images above, deployed by full commit SHA with the scripts in `deploy/bin`:
+
+- `host-bootstrap.sh`: one-time, re-runnable host setup (Docker from Debian's `docker.io`, `/srv/ims/state`, `/etc/ims`, the nginx
+  site on :3000 replacing the `ims-holding` page, the scripts under `/usr/local/lib/ims-deploy`, the cron-render timer). It never
+  touches PostgreSQL, OpenLiteSpeed, `ims.env` or `cron.env`. The images are public: no `docker login` and no token.
+- `deploy.sh [--allow-contract-migration --maintenance] <full-sha>`, `rollback.sh [--force-schema-mismatch]`, `cron-render.sh`.
+
+**Layout.** Two slots, `ims-blue` on 127.0.0.1:3101 and `ims-green` on 127.0.0.1:3102, both `docker run --network host` with `PORT` and
+`HOSTNAME=127.0.0.1` set per slot. nginx on :3000 proxies to the active slot through `/etc/nginx/ims-upstream.conf`; the OpenLiteSpeed
+vhost `ims.onetwo3d.co.uk` proxies to `10.0.3.15:3000` and is never touched. A switch rewrites the upstream file atomically (temp file in
+the same directory, then `mv`), runs `nginx -t` (a failure restores the old file) and reloads gracefully. The state directory
+`/srv/ims/state` (uid:gid 1001:1001, 0750) is a bind mount on `/var/lib/onetwoinventory`, the SAME directory for both slots, never an
+anonymous volume. `/etc/cron.d` is mounted read-only at `/host-cron.d` with `IMS_SCHEDULER_CRONTAB_FILE=/host-cron.d/onetwo3d-ims` and
+`IMS_SCHEDULER_CRONTAB_FORMAT=cron.d`.
+
+**Secrets.** `/etc/ims/ims.env` (root, 0600) is the runtime environment, passed with `--env-file` and never on a command line;
+`deploy/host/ims.env.template` lists what it must hold. `/etc/ims/cron.env` (root, 0600) holds `CRON_SECRET=<value>` for the host cron
+lines. Both are rendered from the password manager by a separate step; the bootstrap does not create them. The deploy refuses a file that
+is not 0600/0400.
+
+**Connector writers are held by default.** `deploy.sh` and `rollback.sh` refuse to start a release unless `ims.env` sets
+`PRODUCER_HOLD_ENFORCED_DESTINATIONS` to a non-empty value (the template says `all`). Until the connectors are deliberately released,
+leave it at `all`.
+
+**What `deploy.sh` does**, in order: pull both images; check the pending migrations; run the migrate image (host network, env file);
+start the new image in the idle slot; wait up to 120 s for `http://127.0.0.1:<slot port>/login` = 200 (otherwise stop the new slot, keep
+the old one serving, exit non-zero); switch the upstream; check `http://127.0.0.1:3000/login` = 200 through nginx (otherwise switch
+back); stop, but do not remove, the previous slot; record `/srv/ims/deploy/previous` then `current` (`<sha> <slot>`, written
+atomically, only after a successful switch); re-render and install the host crontab. It takes a lock, so a second deploy, a rollback and
+the cron timer cannot overlap. When `/usr/local/bin/o3d-hc` exists the run is wrapped in it (`ims-deploy`; the cron timer uses
+`ims-cron-render`); without it nothing changes.
+
+**Expand-only migrations.** The old release keeps serving while the new one migrates, so a migration that runs under a normal deploy
+must work with the OLD code. Mark such a migration by making the FIRST line of its `migration.sql` the comment `-- expand-only`
+(additive: new nullable columns, new tables, new indexes, constraints added `NOT VALID`). `deploy.sh` lists the migrations the new image
+would apply (the image's `prisma/migrations` against `_prisma_migrations`, read only) and exits with status 3 BEFORE migrating if any
+pending one lacks the marker. A contract (destructive) migration ships on its own, after the release that needed the old shape is
+retired: `deploy.sh --allow-contract-migration --maintenance <sha>` stops the active slot first, migrates, and starts the new release,
+accepting the downtime (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
+fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A database with no applied migrations (the first
+install) is exempt. `rollback.sh` refuses when any migration applied since `previous` lacks the marker; `--force-schema-mismatch`
+overrides.
+
+**Rollback.** `rollback.sh` starts the previous slot (re-creating it from the recorded image if it was removed), health-checks it,
+switches nginx back, stops the current slot (kept) and swaps `current` and `previous`.
+
+**Host cron.** After a deploy or rollback, and every 5 minutes from `ims-cron-render.timer`, the host renders the crontab with the
+current release's own renderer (`--format cron.d --cron-user root --base-url http://127.0.0.1:3000 --secret-file /etc/ims/cron.env`;
+only `DATABASE_URL` reaches the renderer), checks the START/END markers, writes `/etc/cron.d/.onetwo3d-ims.new` (root:root 0644) and
+`mv -f`s it onto `/etc/cron.d/onetwo3d-ims`. The timer replaces the file only when the content changed; that is what applies a scheduler
+change saved in the app.
+
+**Tests.** `deploy/tests/run.sh` runs the scripts against stub `docker`, `curl`, `nginx` and `sleep` (`deploy/tests/stubs`); CI runs
+it, with shellcheck, in `.github/workflows/deploy-scripts.yml`. Paths, ports and timeouts the scripts read (`IMS_ENV_FILE`,
+`IMS_UPSTREAM_FILE`, `IMS_CROND_DIR`, `IMS_HEALTH_TIMEOUT_S`, ...) are defined at the top of `deploy/bin/lib.sh`; production uses the defaults.
+
+**Docker in the LXC container.** Docker runs inside CT 115 with `features: nesting=1,keyctl=1` (already set). Both slots use the host
+network, which avoids the bridge/iptables and `net.ipv4.ip_unprivileged_port_start` failures that Docker's default network can hit in
+an unprivileged container. If `docker run` still fails with an AppArmor, sysctl or cgroup permission error, the usual remedies are on the
+Proxmox host (for CT 115: `lxc.apparmor.profile: unconfined` or a profile that allows Docker, and a `docker.io`/`runc` version known to
+work in LXC); change those under supervision, not from a deploy script. `docker info` is checked by the bootstrap.
 
 ### Required runtime environment
 
