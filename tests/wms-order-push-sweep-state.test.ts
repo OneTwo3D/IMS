@@ -559,6 +559,32 @@ test('o3d-92fu create: a line with no SKU parks VALIDATION_FAILED — no claim, 
   assert.deepEqual((audited[0].after as { remoteCallMade: boolean }).remoteCallMade, false)
 })
 
+test('create: an order of FEE lines only parks VALIDATION_FAILED - no claim, no pushOrder (a live Mintsoft order is never created item-less)', async () => {
+  let pushed = 0
+  const feeOnly = [
+    { sku: '', qty: 1, taxForeign: 1.26, totalForeign: 6, description: 'EU Import Duty', wclcFeeKind: 'duty_flat', productId: null, externalLineItemId: null },
+    { sku: '', qty: 1, taxForeign: 0.84, totalForeign: 4, description: 'EU Customs Fee', wclcFeeKind: 'uhf', productId: null, externalLineItemId: null },
+  ]
+  const { port, upserts, claims, validationFailures } = makePort({ createCandidates: [candidate({ lines: feeOnly })] })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ pushOrder: async () => { pushed += 1; return okPush() } }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.validationFailed, 1)
+  assert.equal(r.deadLettered, 0)
+  assert.equal(r.failed, 0)
+  assert.equal(pushed, 0, 'pushOrder must not be called')
+  assert.deepEqual(claims, [], 'no claim before the payload is known to build')
+  assert.deepEqual(upserts, [])
+  assert.equal(validationFailures.length, 1)
+  assert.match(validationFailures[0].error, /only fee lines/)
+  // Control: the same order with a goods line pushes.
+  let pushedControl = 0
+  const control = makePort({ createCandidates: [candidate({ lines: [...feeOnly, { sku: 'SKU-A', qty: 1, taxForeign: 2, totalForeign: 10, description: 'Widget', productId: 'p1', externalLineItemId: 5, wclcFeeKind: null }] })] })
+  await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { pushedControl += 1; return okPush() } }), 'mintsoft', control.port, { now: NOW })
+  assert.equal(pushedControl, 1, 'control: with goods the order is pushed')
+})
+
 test('create: an order with no street line on either address parks VALIDATION_FAILED with the single-sourced reason, no remote call', async () => {
   let pushed = 0
   const { port, claims, validationFailures } = makePort({

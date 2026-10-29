@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildLines, buildPushInput, payloadTotalMismatchPence } from '../lib/domain/wms/order-push-sweep.ts'
+import { NO_GOODS_TO_PUSH_REASON, buildLines, buildPushInput, payloadTotalMismatchPence } from '../lib/domain/wms/order-push-sweep.ts'
 import { buildPushPayload } from '../lib/connectors/mintsoft/api/order-push.ts'
 import { isMirroredFeeLine } from '../lib/domain/wms/mirrored-fee-line.ts'
 import { reconcilePushTotals } from '../lib/domain/wms/push-total-guard.ts'
@@ -81,8 +81,12 @@ test('goods are never mistaken for fees: a line with a SKU is never skipped, wha
   assert.equal(buildLines([goods]).length, 1)
 })
 
-test('an order of fee lines alone yields no items (nothing to fulfil) rather than a SKU error', () => {
-  assert.deepEqual(buildLines([duty, uhf]), [])
+test('an order of fee lines alone has no goods to fulfil: refused locally, never an item-less push', () => {
+  assert.throws(() => buildLines([duty, uhf]), (e: Error) => e.message === NO_GOODS_TO_PUSH_REASON)
+  assert.throws(() => buildPushInput(order([duty, uhf, legacyFee]), '301'), /only fee lines/)
+  // An order with goods is unaffected, and an order with no stored lines at all keeps its previous behaviour.
+  assert.equal(buildLines([goods, duty]).length, 1)
+  assert.deepEqual(buildLines([]), [])
 })
 
 test('a SKU-less line whose product / line-item columns were not read is not assumed to be a fee', () => {

@@ -519,6 +519,13 @@ type CandidateLine = {
   description: string
 }
 
+/**
+ * A stored order whose every line is a mirrored fee has no goods to fulfil. Pushing it would create an item-less order at the
+ * warehouse (a LIVE order), so it is refused locally like any other payload that cannot be built: parked VALIDATION_FAILED before
+ * a claim, with no remote call, and re-queued by the revalidation pass if goods are ever added.
+ */
+export const NO_GOODS_TO_PUSH_REASON = 'Sales order has only fee lines (no goods to fulfil); cannot push to WMS'
+
 export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>): WmsOrderPushLine[] {
   const pushLines: WmsOrderPushLine[] = []
   for (const line of lines) {
@@ -550,6 +557,11 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
       unitPriceVat: tax / orderedQty,
       description: line.description || null,
     })
+  }
+  // Fee lines are skipped above, so a stored order made ONLY of them leaves nothing to send. (An order whose goods were all
+  // refunded is a different, pre-existing case and keeps its behaviour: it still has goods lines.)
+  if (pushLines.length === 0 && lines.length > 0 && lines.every((line) => isMirroredFeeLine(line))) {
+    throw new Error(NO_GOODS_TO_PUSH_REASON)
   }
   return pushLines
 }
