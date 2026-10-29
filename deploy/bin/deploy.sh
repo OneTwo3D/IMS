@@ -105,9 +105,18 @@ if [ -n "$bad" ]; then
 fi
 
 # --- 3. migrate -----------------------------------------------------------------------------------------------------------------
-if [ "$contract" = 1 ] && [ "$old_slot" != none ]; then
-  log "MAINTENANCE: stopping the active slot $(slot_name "$old_slot") before the contract migration"
-  docker stop "$(slot_name "$old_slot")" >/dev/null || die "cannot stop $(slot_name "$old_slot")"
+if [ "$contract" = 1 ]; then
+  # MAINTENANCE: the one place stopping the serving slot is intended. EVERY app slot is stopped, not just the serving one (a failed
+  # switch-back can leave both running), and it is verified that none runs before the destructive migration starts.
+  for slot in blue green; do
+    if container_exists "$(slot_name "$slot")"; then
+      log "MAINTENANCE: stopping $(slot_name "$slot") before the contract migration"
+      docker stop "$(slot_name "$slot")" >/dev/null || die "cannot stop $(slot_name "$slot"); not migrating"
+    fi
+  done
+  for slot in blue green; do
+    if slot_running "$slot"; then die "$(slot_name "$slot") is still running after docker stop; not migrating"; fi
+  done
 fi
 log "running $(migrate_image "$sha")"
 docker run --rm --network host --env-file "$IMS_ENV_FILE" "$(migrate_image "$sha")" || die "prisma migrate deploy failed (the ${old_slot} release was not touched unless this is a maintenance deploy)"

@@ -297,6 +297,13 @@ would leave Mintsoft and WooCommerce writing, so it is refused too. There is del
 to the first-load plan's single enforced writer switch (a later task), which will change this gate. The slots are started with the
 trimmed value passed explicitly.
 
+`all` alone does not prove writes are held: a connector's grant plus a live-from instant in the past makes that destination's work live
+even when enforcement is `all`. So the deploy ALSO refuses to start a slot if `ims.env` contains any of the six variables that release a
+connector, naming the variable: `WC_WRITEBACK_ALLOWED_ORIGIN`, `MINTSOFT_WRITE_ALLOWED`, `XERO_WRITE_ALLOWED_TENANT`,
+`WC_WRITES_LIVE_FROM`, `MINTSOFT_WRITES_LIVE_FROM` and `XERO_WRITES_LIVE_FROM` (from the producer seam and the outbound-write grant
+code). Both the grants and the live-from instants are environment-only in the application; neither is read from a settings row or the
+database. The container's environment is the env file plus the flags the scripts set, so this check covers every source.
+
 **What `deploy.sh` does**, in order: pull both images; check the pending migrations; run the migrate image (host network, env file);
 start the new image in the idle slot; wait up to 120 s for `http://127.0.0.1:<slot port>/login` = 200 (otherwise stop the new slot, keep
 the old one serving, exit non-zero); switch the upstream; check `http://127.0.0.1:3000/login` = 200 through nginx (otherwise switch
@@ -310,8 +317,9 @@ must work with the OLD code. Mark such a migration by making the FIRST line of i
 (additive: new nullable columns, new tables, new indexes, constraints added `NOT VALID`). `deploy.sh` lists the migrations the new image
 would apply (the image's `prisma/migrations` against `_prisma_migrations`, read only) and exits with status 3 BEFORE migrating if any
 pending one lacks the marker. A contract (destructive) migration ships on its own, after the release that needed the old shape is
-retired: `deploy.sh --allow-contract-migration --maintenance <sha>` stops the active slot first, migrates, and starts the new release,
-accepting the downtime (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
+retired: `deploy.sh --allow-contract-migration --maintenance <sha>` stops the slots first, migrates, and starts the new release,
+accepting the downtime. EVERY app slot (blue and green) is stopped and verified stopped before the migration runs, so a slot left
+running by an earlier failed switch-back cannot serve the old code against the new schema (if the new release then fails its health check the old slot is NOT restarted, because the schema may no longer
 fit it). `--allow-contract-migration` without `--maintenance` is a usage error. A database with no applied migrations is exempt ONLY
 when nothing is serving (nginx reports no slot and neither slot container is running): the first install. An empty history while a
 release is serving or running means `DATABASE_URL` points at the wrong database, and the deploy refuses (status 3) unless the

@@ -210,6 +210,67 @@ t_rollback_refuses_a_producer_hold_that_is_not_exactly_all() {
   eq "$rc" 0 "rollback with a trimmed 'all'"
 }
 
+t_deploy_refuses_any_variable_that_can_release_a_connector() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  for v in WC_WRITEBACK_ALLOWED_ORIGIN MINTSOFT_WRITE_ALLOWED XERO_WRITE_ALLOWED_TENANT WC_WRITES_LIVE_FROM MINTSOFT_WRITES_LIVE_FROM XERO_WRITES_LIVE_FROM; do
+    : > "$STUB/calls.log"; grep -vE '^(WC|MINTSOFT|XERO)_WRIT' "$IMS_ENV_FILE" > "$T/e"; cat "$T/e" > "$IMS_ENV_FILE"; printf '%s=x\n' "$v" >> "$IMS_ENV_FILE"
+    deploy "$B"
+    [ "$rc" != 0 ] || fail "deploy accepted $v with the hold at all"
+    grep -q "$v" "$T/out" || fail "the message does not name $v"
+    log_lacks '^docker (pull|run)'
+    eq "$(container_running ims-blue)" 1 "nothing may change for $v"
+  done
+  # a Mintsoft grant together with its live-from instant: the real shape of a release
+  : > "$STUB/calls.log"; set_hold all
+  printf 'MINTSOFT_WRITE_ALLOWED=https://api.mintsoft.co.uk|89\nMINTSOFT_WRITES_LIVE_FROM=2026-01-01T00:00:00Z\n' >> "$IMS_ENV_FILE"
+  deploy "$B"
+  [ "$rc" != 0 ] || fail "deploy accepted a Mintsoft grant and live-from instant"
+  log_lacks '^docker (pull|run)'
+}
+
+t_deploy_allows_the_hold_at_all_with_no_release_variables() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  deploy "$B"
+  eq "$rc" 0 "deploy with all and no grants: $(tail -n 3 "$T/out")"
+}
+
+t_rollback_refuses_a_variable_that_can_release_a_connector() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  echo 'XERO_WRITE_ALLOWED_TENANT=00000000-0000-0000-0000-000000000000' >> "$IMS_ENV_FILE"
+  rollback
+  [ "$rc" != 0 ] || fail "rollback accepted a Xero grant"
+  log_lacks '^docker (start|run)'
+}
+
+t_contract_migration_stops_every_slot_and_verifies_before_migrating() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=3102\n' "$C" > "$STUB/containers/ims-green"   # the idle slot is running too
+  deploy --allow-contract-migration --maintenance "$B"
+  eq "$rc" 0 "maintenance deploy: $(tail -n 3 "$T/out")"
+  before '^docker stop ims-blue' '^MIGRATE'
+  before '^docker stop ims-green' '^MIGRATE'
+  before 'inspect --format \{\{.State.Running\}\} ims-green' '^MIGRATE'
+}
+
+t_contract_migration_refused_when_a_slot_will_not_stop() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=3102\n' "$C" > "$STUB/containers/ims-green"
+  touch "$STUB/stop_fail_ims-green"
+  deploy --allow-contract-migration --maintenance "$B"
+  [ "$rc" != 0 ] || fail "deploy migrated although a slot would not stop"
+  log_lacks '^MIGRATE'
+}
+
+t_contract_migration_refused_when_a_slot_is_still_running_after_stop() {
+  seed_active blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand m2:other; applied m1
+  printf 'image=ghcr.io/onetwo3d/ims:%s\nrunning=1\nport=3102\n' "$C" > "$STUB/containers/ims-green"
+  touch "$STUB/stop_ignored_ims-green"
+  deploy --allow-contract-migration --maintenance "$B"
+  [ "$rc" != 0 ] || fail "deploy migrated although a slot still ran"
+  log_lacks '^MIGRATE'
+  grep -q 'still running' "$T/out" || fail "no explanation"
+}
+
 t_deploy_refuses_a_world_readable_env_file() {
   seed_active blue "$A"; migs "$B" m1:expand; chmod 644 "$IMS_ENV_FILE"
   deploy "$B"

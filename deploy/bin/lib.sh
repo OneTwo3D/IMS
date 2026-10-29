@@ -161,6 +161,11 @@ producer_hold_value() { # the value, whitespace-trimmed
   v="${v#"${v%%[![:space:]]*}"}"
   printf '%s\n' "${v%"${v##*[![:space:]]}"}"
 }
+# Every environment variable that can RELEASE a connector, read from the producer seam (lib/security/outbound-write-hold-constants.ts:
+# OUTBOUND_GRANT_ENV; lib/security/producer-disposition-constants.ts: PRODUCER_CUTOFF_ENV). All are environment-only: neither the grant nor
+# the live-from instant is ever read from a settings row or the database (the code says so), so this list is complete for the decision.
+# Enforcement = all is not enough on its own: a grant plus a live-from instant in the past makes that destination's work LIVE.
+RELEASE_VARS=(WC_WRITEBACK_ALLOWED_ORIGIN MINTSOFT_WRITE_ALLOWED XERO_WRITE_ALLOWED_TENANT WC_WRITES_LIVE_FROM MINTSOFT_WRITES_LIVE_FROM XERO_WRITES_LIVE_FROM)
 check_env_file() {
   [ -f "$IMS_ENV_FILE" ] || die "$IMS_ENV_FILE does not exist"
   local mode
@@ -172,6 +177,12 @@ check_env_file() {
   # switch, which will change this gate when it lands. run_slot also passes the trimmed value explicitly, so the app reads `all`.
   [ "$(producer_hold_value)" = all ] \
     || die "$IMS_ENV_FILE must set PRODUCER_HOLD_ENFORCED_DESTINATIONS=all (found: '$(producer_hold_value)'). Every connector writer stays held until the first-load plan's writer switch replaces this gate; there is no override."
+  local name
+  for name in "${RELEASE_VARS[@]}"; do
+    if grep -Eq "^${name}=" "$IMS_ENV_FILE"; then
+      die "$IMS_ENV_FILE sets ${name}, which can release a connector to write. Remove it: connectors are released only by the first-load plan's writer switch, not by this deploy."
+    fi
+  done
   [ -n "$(env_value DATABASE_URL)" ] || die "$IMS_ENV_FILE does not set DATABASE_URL"
 }
 
