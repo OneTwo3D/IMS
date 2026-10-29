@@ -25,6 +25,8 @@ container_running() { sed -n 's/^running=//p' "$STUB/containers/$1" 2>/dev/null;
 
 setup() {
   T="$(mktemp -d)"; export T STUB="$T/stub"
+  mkdir -p "$T/log"; export IMS_CRON_LOG_DIR="$T/log"
+  mkdir -p "$T/log"; export IMS_CRON_LOG_DIR="$T/log"
   mkdir -p "$STUB/containers" "$STUB/migs" "$STUB/unhealthy" "$T/etc" "$T/state" "$T/deploy" "$T/nginx" "$T/crond"
   : > "$STUB/calls.log"
   printf 'DATABASE_URL=postgresql://u:${PW}@127.0.0.1:5432/ims\nCRON_SECRET=x\nPRODUCER_HOLD_ENFORCED_DESTINATIONS=all\n' > "$T/etc/ims.env"
@@ -493,7 +495,7 @@ t_rollback_refuses_across_a_non_expand_migration() {
   rollback
   [ "$rc" != 0 ] || fail "rollback crossed a non-expand migration"
   grep -q 'm2' "$T/out" || fail "output does not name m2"
-  log_lacks '^docker start'
+  log_lacks '^RUN-SLOT'
   cmp -s "$IMS_UPSTREAM_FILE" "$T/upstream.before" || fail "upstream changed"
   eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
 }
@@ -517,7 +519,7 @@ t_rollback_across_expand_only_migrations_is_allowed() {
   eq "$(container_running ims-blue)" 1
   eq "$(container_running ims-green)" 0
   [ -f "$STUB/containers/ims-green" ] || fail "the rolled-back slot must be kept"
-  before '^docker start ims-blue' '^nginx reload'
+  before '^RUN-SLOT ims-blue' '^nginx reload'
   no_temp_files
 }
 
@@ -679,6 +681,68 @@ t_bootstrap_first_run_with_a_rejected_site_leaves_the_holding_site_enabled() {
   [ ! -e "$site_dir/sites-enabled/ims" ] && [ ! -L "$site_dir/sites-enabled/ims" ] || fail "the ims link is still there"
   [ ! -e "$site_dir/sites-available/ims" ] || fail "the new site file is still there"
   log_lacks '^nginx reload'
+}
+
+t_rollback_recreates_the_previous_slot_with_the_current_env_file() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  echo 'AUTH_SECRET=rotated-after-the-old-container-was-made' >> "$IMS_ENV_FILE"       # a credential rotation since ims-blue was created
+  rollback
+  eq "$rc" 0 "rollback: $(tail -n 3 "$T/out")"
+  log_lacks '^docker start'
+  before '^docker rm -f ims-blue' "^RUN-SLOT ims-blue $A"
+  grep -qx 'AUTH_SECRET=rotated-after-the-old-container-was-made' "$STUB/env_at_run_ims-blue" || fail "the recreated container did not get the current env file"
+  run_line="$(grep -E '^docker run -d --name ims-blue' "$STUB/calls.log")"
+  for want in '--network host' "--env-file $IMS_ENV_FILE" '-e PORT=3101' "-v $IMS_STATE_DIR:/var/lib/onetwoinventory" "-v $IMS_CROND_DIR:/host-cron.d:ro" '-e PRODUCER_HOLD_ENFORCED_DESTINATIONS=all'; do
+    grep -qF -- "$want" <<< "$run_line" || fail "rollback's docker run lacks: $want"
+  done
+}
+
+t_rollback_refuses_when_the_previous_image_is_gone_and_cannot_be_pulled() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/missing_image_ims_$A" "$STUB/pull_fail"      # the RUNTIME image only: the migrate image is present
+  rollback
+  [ "$rc" != 0 ] || fail "rollback went ahead without the image"
+  log_lacks '^RUN-SLOT'
+  eq "$(cat "$IMS_DEPLOY_DIR/current")" "$B green"
+}
+
+t_rollback_pulls_a_missing_previous_image() {
+  seed_active green "$B"; seed_stopped blue "$A"; migs "$A" m1:expand; migs "$B" m1:expand; applied m1
+  touch "$STUB/missing_image_ims_$A"
+  rollback
+  eq "$rc" 0 "rollback with a pullable image: $(tail -n 3 "$T/out")"
+  log_has "^docker pull ghcr.io/onetwo3d/ims:$A"
+  before "^docker pull ghcr.io/onetwo3d/ims:$A" "^RUN-SLOT ims-blue $A"
+}
+
+t_cron_log_directory_is_ensured_by_bootstrap_and_matches_the_renderer_default() {
+  # the renderer's own default, read from the application source (not typed a second time here)
+  app_default="$(sed -n "s/^export const DEFAULT_CRON_LOG_PATH = '\\(.*\\)'.*/\\1/p" "$HERE/../../lib/crontab-sync.ts")"
+  [ -n "$app_default" ] || fail "could not read DEFAULT_CRON_LOG_PATH from lib/crontab-sync.ts"
+  lib_default="$(env -u IMS_CRON_LOG_DIR bash -c '. "$1"; printf "%s" "$IMS_CRON_LOG_DIR/cron.log"' _ "$BIN/lib.sh")"
+  eq "$lib_default" "$app_default" "the scripts' log path vs the renderer default"
+  # a fresh host: bootstrap creates the directory (and the rotation) for exactly the path the crontab is rendered with
+  unset IMS_CRON_LOG_DIR
+  bootstrap_prepare; bootstrap
+  eq "$rc" 0 "bootstrap: $(tail -n 3 "$T/out")"
+  [ -d "$R$(dirname "$app_default")" ] || fail "bootstrap did not create $(dirname "$app_default")"
+  eq "$(stat -c %a "$R$(dirname "$app_default")")" 750
+  grep -qF "$app_default {" "$R/etc/logrotate.d/one-two-inventory-cron" || fail "no logrotate entry for $app_default"
+  # and the crontab render is told that same path
+  export IMS_CRON_LOG_DIR; IMS_CRON_LOG_DIR="$(dirname "$app_default")"
+  mkdir -p "$T/log2"; IMS_CRON_LOG_DIR="$T/log2"
+  seed_active blue "$A"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  eq "$rc" 0 "render"
+  log_has "--log-path $T/log2/cron.log"
+}
+
+t_cron_install_refuses_when_the_log_directory_is_missing() {
+  seed_active blue "$A"; echo old > "$IMS_CROND_DIR/onetwo3d-ims"; rm -rf "$IMS_CRON_LOG_DIR"
+  rc=0; "$BIN/cron-render.sh" > "$T/out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail "the crontab was installed without a log directory"
+  eq "$(cat "$IMS_CROND_DIR/onetwo3d-ims")" old "the live cron file"
+  log_lacks 'entrypoint node'
 }
 
 # ---------------------------------------------------------------------------------------------------------------------------------

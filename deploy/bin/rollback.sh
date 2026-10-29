@@ -3,7 +3,7 @@
 #
 #   rollback.sh [--force-schema-mismatch]
 #
-# Starts the previous slot's container (re-creating it from the recorded image if it was removed), health-checks it, switches nginx
+# Re-creates the previous slot's container from the recorded image with the CURRENT ims.env (never `docker start`), health-checks it, switches nginx
 # back, stops the current slot (kept, not removed) and swaps deploy/current and deploy/previous.
 #
 # Refused if any migration applied to the database since `previous` shipped lacks the `-- expand-only` first-line marker: the older
@@ -39,8 +39,8 @@ prev_name="$(slot_name "$prev_slot")" prev_port="$(slot_port "$prev_slot")" cur_
 log "rolling back ${cur_sha} (${cur_slot}) -> ${prev_sha} (${prev_slot})"
 
 # --- schema check ---------------------------------------------------------------------------------------------------------------
-docker pull "$(migrate_image "$prev_sha")" >/dev/null 2>&1 || true   # normally already local
-docker pull "$(runtime_image "$prev_sha")" >/dev/null 2>&1 || true
+docker image inspect "$(migrate_image "$prev_sha")" >/dev/null 2>&1 || docker pull "$(migrate_image "$prev_sha")" >/dev/null 2>&1 \
+  || die "$(migrate_image "$prev_sha") is not available locally and cannot be pulled; refusing to roll back"
 applied="$(applied_migrations "$cur_sha")" || die "cannot read _prisma_migrations from the database"
 prev_known="$(list_image_migrations "$prev_sha" | cut -f1)" || die "cannot list the migrations in $(migrate_image "$prev_sha")"
 cur_listing="$(list_image_migrations "$cur_sha")" || die "cannot list the migrations in $(migrate_image "$cur_sha")"
@@ -57,12 +57,14 @@ if [ -n "$unsafe" ]; then
 fi
 
 # --- start the previous slot ----------------------------------------------------------------------------------------------------
-if [ "$(container_image_sha "$prev_name")" = "$prev_sha" ]; then
-  docker start "$prev_name" >/dev/null || die "cannot start ${prev_name}"
-else
-  log "${prev_name} is gone or holds another release; re-creating it from ${prev_sha}"
-  run_slot "$prev_slot" "$prev_sha" || die "cannot start ${prev_name}"
-fi
+# ALWAYS re-created with the shared run_slot, from the recorded release image and the CURRENT validated ims.env (check_env_file above):
+# a stopped container keeps the environment it was created with, which is stale after a credential rotation. Never `docker start`.
+for img in "$(runtime_image "$prev_sha")" "$(migrate_image "$prev_sha")"; do
+  docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img" >/dev/null 2>&1 \
+    || die "the image $img is not available locally and cannot be pulled; refusing to roll back"
+done
+log "re-creating ${prev_name} from ${prev_sha} with the current ${IMS_ENV_FILE}"
+run_slot "$prev_slot" "$prev_sha" || die "cannot start ${prev_name}"
 if ! wait_http_200 "http://127.0.0.1:${prev_port}/login" "$IMS_HEALTH_TIMEOUT_S"; then
   stop_unless_serving "$prev_slot" || true
   die "${prev_name} did not become healthy; the current release keeps serving"

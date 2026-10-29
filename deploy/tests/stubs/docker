@@ -2,9 +2,12 @@
 # Test stub for docker. State lives in $STUB (set by deploy/tests/run.sh); every call is appended to $STUB/calls.log.
 set -u
 echo "docker $*" >> "$STUB/calls.log"
+# <repo>_<sha>, e.g. ims_aaaa… or ims-migrate_aaaa…
+image_key() { local ref="$1" repo; repo="${ref%%:*}"; printf "%s_%s" "${repo##*/}" "${ref##*:}"; }
 cdir="$STUB/containers"; mkdir -p "$cdir"
 case "${1:-}" in
-  pull) [ ! -e "$STUB/pull_fail" ] ;;
+  pull) [ ! -e "$STUB/pull_fail" ] || exit 1; rm -f "$STUB/missing_image_$(image_key "${*: -1}")" ;;
+  image) [ ! -e "$STUB/missing_image_$(image_key "${*: -1}")" ] ;;
   logs) exit 0 ;;
   inspect)
     name="${*: -1}"
@@ -24,14 +27,15 @@ case "${1:-}" in
     sed -i "s/^running=.*/running=$v/" "$f" ;;
   run)
     shift
-    name="" entry="" detach=0 port="" image=""
+    name="" entry="" detach=0 port="" image="" envfile=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         -d) detach=1 ;;
         --rm) ;;
         --name) name="$2"; shift ;;
         --entrypoint) entry="$2"; shift ;;
-        --restart|--network|--env-file|-v) shift ;;
+        --env-file) envfile="$2"; shift ;;
+        --restart|--network|-v) shift ;;
         -e) case "$2" in PORT=*) port="${2#PORT=}" ;; esac; shift ;;
         *) image="$1"; shift; break ;;
       esac
@@ -39,6 +43,7 @@ case "${1:-}" in
     done
     sha="${image##*:}"
     if [ "$detach" = 1 ]; then
+      [ -z "$envfile" ] || cp "$envfile" "$STUB/env_at_run_$name"      # what the container is created with
       printf 'image=%s\nrunning=1\nport=%s\n' "$image" "$port" > "$cdir/$name"
       echo "RUN-SLOT $name $sha port=$port" >> "$STUB/calls.log"
     elif [ "$entry" = sh ] && [[ "$image" == */ims-migrate:* ]]; then

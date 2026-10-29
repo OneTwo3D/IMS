@@ -11,6 +11,10 @@ IMS_DEPLOY_DIR="${IMS_DEPLOY_DIR:-/srv/ims/deploy}"
 IMS_UPSTREAM_FILE="${IMS_UPSTREAM_FILE:-/etc/nginx/ims-upstream.conf}"
 IMS_CROND_DIR="${IMS_CROND_DIR:-/etc/cron.d}"
 IMS_CROND_NAME="${IMS_CROND_NAME:-onetwo3d-ims}"
+# The directory the rendered cron jobs append to. It MUST be the renderer's own default (DEFAULT_CRON_LOG_PATH in lib/crontab-sync.ts; a
+# test compares them) and must exist and be writable by the cron user (root) BEFORE the crontab is installed: a redirection into a
+# missing directory fails every job before curl runs. host-bootstrap.sh creates it; install_host_cron refuses without it.
+IMS_CRON_LOG_DIR="${IMS_CRON_LOG_DIR:-/var/log/one-two-inventory}"
 IMS_REGISTRY="${IMS_REGISTRY:-ghcr.io/onetwo3d}"
 IMS_BLUE_PORT="${IMS_BLUE_PORT:-3101}"
 IMS_GREEN_PORT="${IMS_GREEN_PORT:-3102}"
@@ -320,11 +324,15 @@ install_host_cron() {
   local sha="$1" only_if_changed="${2:-}" work rendered live tmp
   work="$(mktemp -d)" || return 1
   rendered="${work}/rendered"
+  if ! { [ -d "$IMS_CRON_LOG_DIR" ] && [ -w "$IMS_CRON_LOG_DIR" ]; }; then
+    log "the cron log directory ${IMS_CRON_LOG_DIR} is missing or not writable; every cron job would fail before it ran. Not installing the crontab (run host-bootstrap.sh)."
+    rm -rf "$work"; return 1
+  fi
   live="${IMS_CROND_DIR}/${IMS_CROND_NAME}"
   ( umask 077; printf 'DATABASE_URL=%s\n' "$(env_value DATABASE_URL)" > "${work}/db.env" ) || { rm -rf "$work"; return 1; }
   if ! docker run --rm --network host --env-file "${work}/db.env" --entrypoint node "$(runtime_image "$sha")" \
         /app/dist-scripts/render-managed-crontab.mjs --format cron.d --cron-user root \
-        --base-url "$IMS_FRONT_URL" --secret-file "$IMS_CRON_ENV_FILE" > "$rendered"; then
+        --base-url "$IMS_FRONT_URL" --secret-file "$IMS_CRON_ENV_FILE" --log-path "${IMS_CRON_LOG_DIR}/cron.log" > "$rendered"; then
     log "the crontab renderer failed; the installed cron file is unchanged"
     rm -rf "$work"; return 1
   fi

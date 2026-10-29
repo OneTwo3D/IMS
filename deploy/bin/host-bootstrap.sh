@@ -24,9 +24,13 @@ set -euo pipefail
 
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 repo_deploy="$(dirname "$here")"
+# Only the shared path definitions (IMS_CRON_LOG_DIR); this script keeps its own log/die.
+# shellcheck source=lib.sh
+. "$here/lib.sh"
 R="${IMS_BOOTSTRAP_ROOT:-}"
 log() { printf '%s\n' "bootstrap: $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
 
 [ "$(id -u)" = 0 ] || [ -n "$R" ] || die "must run as root"
 [ -z "${1:-}" ] || { sed -n '2,5p' "${BASH_SOURCE[0]}"; exit 2; }
@@ -56,11 +60,20 @@ if [ -z "$R" ]; then
   docker info >/dev/null 2>&1 || die "docker is installed but 'docker info' fails; see deploy/README.md \"Docker in the LXC container\""
 fi
 
+T_LOGROTATE_TMP="$(mktemp)"; trap 'rm -f "$T_LOGROTATE_TMP"' EXIT
 # --- 2. directories and templates -----------------------------------------------------------------------------------------------
 install -d -m 0755 "$R/srv/ims" "$R/srv/ims/deploy" "$R/srv/ims/holding"
 install -d -m 0750 "$R/srv/ims/state"; own 1001:1001 "$R/srv/ims/state"
 chmod 0750 "$R/srv/ims/state"
 install -d -m 0700 "$R/etc/ims"; own root:root "$R/etc/ims"
+# The cron log directory: cron runs the jobs as root and each job appends to ${IMS_CRON_LOG_DIR}/cron.log. Created before anything that
+# installs or enables host cron, and checked writable, or bootstrap stops.
+install -d -m 0750 "$R$IMS_CRON_LOG_DIR"; own root:root "$R$IMS_CRON_LOG_DIR"
+probe="$R$IMS_CRON_LOG_DIR/.bootstrap-probe.$$"
+{ : > "$probe"; } 2>/dev/null && rm -f "$probe" || die "$R$IMS_CRON_LOG_DIR is not writable; the cron jobs would fail before they ran"
+logrotate_file="$R/etc/logrotate.d/one-two-inventory-cron"
+printf '%s\n' "$IMS_CRON_LOG_DIR/cron.log {" "    weekly" "    rotate 8" "    compress" "    delaycompress" "    missingok" "    notifempty" "    copytruncate" "}" > "$T_LOGROTATE_TMP"
+put "$T_LOGROTATE_TMP" "$logrotate_file" 0644
 put "$repo_deploy/host/ims.env.template" "$R/etc/ims/ims.env.template" 0600
 [ -f "$R/etc/ims/ims.env" ] || log "note: $R/etc/ims/ims.env and cron.env do not exist yet; they are rendered from the password manager by a separate task"
 if [ ! -f "$R/srv/ims/holding/__ims_holding.html" ]; then

@@ -332,10 +332,14 @@ overrides.
 not serving from it. If a switch-back fails and nginx still serves the new slot, both slots are left running, nothing is recorded in the
 state files that is not true, and the script exits non-zero with `MANUAL ATTENTION` in the log.
 
-**Rollback.** `rollback.sh` starts the previous slot (re-creating it from the recorded image if it was removed), health-checks it,
+**Rollback.** `rollback.sh` always RE-CREATES the previous slot from the recorded release image with the CURRENT, re-validated `ims.env`
+(a stopped container would keep the environment it was made with, stale after a credential rotation; `docker start` is never used; a
+missing image is pulled or the rollback refuses), health-checks it,
 switches nginx back, stops the current slot (kept) and swaps `current` and `previous`.
 
-**Host cron.** After a deploy or rollback, and every 5 minutes from `ims-cron-render.timer`, the host renders the crontab with the
+**Host cron.** The jobs append to `/var/log/one-two-inventory/cron.log` (the renderer's default, passed explicitly); `host-bootstrap.sh`
+creates that directory (root, 0750) with a logrotate entry, checks it is writable, and the crontab is not installed without it.
+After a deploy or rollback, and every 5 minutes from `ims-cron-render.timer`, the host renders the crontab with the
 current release's own renderer (`--format cron.d --cron-user root --base-url http://127.0.0.1:3000 --secret-file /etc/ims/cron.env`;
 only `DATABASE_URL` reaches the renderer), checks the START/END markers, writes `/etc/cron.d/.onetwo3d-ims.new` (root:root 0644) and
 `mv -f`s it onto `/etc/cron.d/onetwo3d-ims`. The timer replaces the file only when the content changed; that is what applies a scheduler
