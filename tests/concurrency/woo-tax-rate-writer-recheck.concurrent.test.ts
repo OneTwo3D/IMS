@@ -296,6 +296,13 @@ test('a duplicate DELETE: the keeper removed from the store after the plan means
     assert.match(done.stopped?.reason ?? '', /^KEEPER_GONE/)
   }))
   await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
+    // the keeper is intact in the store but its mapping is no longer stamped for this store: it is not a counterpart this writer owns
+    const plan = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
+    const done = await w.m.writer.applyWooTaxPlan(depsWith(w, async () => { await w.m.db.shoppingTaxRateMapping.updateMany({ where: { externalTaxRateId: w.woo.w1 }, data: { storeIdentity: null } }) }), { confirm: plan.digest })
+    assert.ok(!w.store.calls.some((c) => c.op === 'remove' && c.id === w6), 'the duplicate was not deleted')
+    assert.equal(done.outcome === 'DONE' ? done.stopped?.key : null, `delete:${w6}`)
+  }))
+  await buildWorld(t, modules, (w) => withDuplicate(w, async (w6) => {
     const done = await applyDuplicate(w, w6, () => undefined)
     assert.ok(w.store.calls.some((c) => c.op === 'remove' && c.id === w6), 'the duplicate was deleted')
     assert.equal(done.stopped ?? null, null)
