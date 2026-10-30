@@ -70,6 +70,8 @@ test('exit codes: a preview with work is 1, with nothing is 0; a refused apply i
   assert.equal(wooTaxPlanExitCode({ args: apply, preview: null, applied: done({ shadowed: plan.changes.map((c) => c.key) }) }), 0)
   assert.equal(wooTaxPlanExitCode({ args: apply, preview: null, applied: done({ failed: { key: 'update:2', kind: 'UPDATE', error: 'x' } }) }), 2)
   assert.equal(wooTaxPlanExitCode({ args: apply, preview: null, applied: done({ unrecorded: { key: 'create:rFR', reason: 'x' } }) }), 2)
+  assert.equal(wooTaxPlanExitCode({ args: apply, preview: null, applied: done({ stopped: { key: 'delete:2', reason: 'MAPPING_REPOINTED: x' } }) }), 2)
+  assert.match(renderWooTaxPlanText({ args: apply, preview: null, applied: done({ stopped: { key: 'delete:2', reason: 'MAPPING_REPOINTED: x' } }) }, HELD), /STOPPED at delete:2 BEFORE SENDING IT: MAPPING_REPOINTED/)
   assert.deepEqual(WOO_TAX_PLAN_EXIT_CODES.map((c) => c.code), [0, 1, 2, 3])
 })
 

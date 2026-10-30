@@ -247,7 +247,7 @@ test('STORE URL CHANGE: the old mappings are no longer owned: findings only, not
     await w.m.db.taxRate.update({ where: { id: w.ids.fr }, data: { active: false } }) // so that nothing at all is left to create
     const before = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
     assert.ok(before.changes.length > 0, 'PRECONDITION: against the store the mappings were made for, there is work')
-    const moved = { ...w.deps(LIVE), storeIdentity: async () => OTHER }
+    const moved = { ...w.deps(LIVE), storeIdentity: async () => OTHER, configuredStoreIdentity: async () => OTHER }
     const plan = (await w.m.writer.readWooTaxPlan(moved)).plan!
     assert.deepEqual(plan.changes, [])
     assert.deepEqual(plan.findings.map((f) => f.code), ['MAPPING_NOT_ADOPTED', 'MAPPING_NOT_ADOPTED', 'MAPPING_NOT_ADOPTED', 'MAPPING_NOT_ADOPTED'])
@@ -256,6 +256,8 @@ test('STORE URL CHANGE: the old mappings are no longer owned: findings only, not
     assert.equal(r.outcome, 'NOTHING_TO_DO')
     assert.deepEqual(w.store.calls, [])
     assert.deepEqual(await w.counts(), { writes: 0, mappings: 4, shadows: 0 })
+    // The run's pinned store and the store configured now must be the same one.
+    assert.deepEqual(await w.m.writer.applyWooTaxPlan({ ...w.deps(LIVE), storeIdentity: async () => OTHER }, { confirm: before.digest }), { outcome: 'REFUSED', code: 'STORE_CHANGED', plan: null })
     // A store with no usable URL is a refusal, not a guess.
     const none = await w.m.writer.applyWooTaxPlan({ ...w.deps(LIVE), storeIdentity: async () => null }, { confirm: before.digest })
     assert.deepEqual(none, { outcome: 'REFUSED', code: 'STORE_UNIDENTIFIED', plan: null })

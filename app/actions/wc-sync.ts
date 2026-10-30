@@ -1,7 +1,7 @@
 'use server'
 
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
-import { repointStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
+import { lockStorefrontMappingWrites, repointStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -732,7 +732,11 @@ export async function updateShoppingTaxRateMapping(
 
 export async function deleteShoppingTaxRateMapping(id: string): Promise<{ success: boolean }> {
   await requireSyncPermission()
-  await db.shoppingTaxRateMapping.delete({ where: { id } })
+  // Under the shared apply lock: a mapping must not vanish between a running tax-rate apply's last ownership check and its send.
+  await db.$transaction(async (tx) => {
+    await lockStorefrontMappingWrites(tx)
+    await tx.shoppingTaxRateMapping.delete({ where: { id } })
+  })
   revalidatePath('/sync')
   return { success: true }
 }

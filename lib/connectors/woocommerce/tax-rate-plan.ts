@@ -319,6 +319,73 @@ function outOfScopeReason(rate: TaxRateRow): DeleteReason {
   return 'IMS_RATE_PURCHASE_ONLY'
 }
 
+// ---------------------------------------------------------------------------
+// The check made immediately before each send
+// ---------------------------------------------------------------------------
+
+export const REVALIDATION_FAILURES = {
+  MAPPING_GONE: 'the mapping row of the store rate went away since the plan',
+  MAPPING_REPOINTED: 'the mapping row of the store rate now points at another IMS rate',
+  STAMP_CHANGED: 'the mapping row of the store rate no longer carries the identity of this store',
+  SNAPSHOT_CHANGED: 'the snapshot (name, country, percent, class) on the mapping row is not the one the plan rested on',
+  LIVE_CHANGED: 'the store rate, read again just now, is not the rate the plan rested on',
+  IMS_RATE_CHANGED: 'the IMS rate (its scope, percent or name) is not what the plan rested on',
+  MAPPING_APPEARED: 'a mapping to the IMS rate appeared or changed since the plan, so a created rate could be a second counterpart',
+} as const
+export type RevalidationFailure = keyof typeof REVALIDATION_FAILURES
+
+export type RevalidationInput = {
+  change: WooTaxChange
+  /** The store the plan is bound to (the pinned credentials'). */
+  storeIdentity: string
+  /** The IMS rate the change is for, as it stands now; undefined when it is gone. */
+  rate: TaxRateRow | undefined
+  componentRates: readonly TaxComponentRateRow[]
+  /** Every storefront mapping row, as they stand now. */
+  mappings: readonly WooTaxMappingRow[]
+  /** The store rate re-read just now (UPDATE and DELETE); undefined for a CREATE. */
+  live: WooTaxRateDetail | undefined
+}
+
+const sameFields = (a: WooTaxRateFields, b: WooTaxRateFields): boolean => WOO_TAX_FIELDS.every((field) => a[field] === b[field])
+
+/**
+ * Whether a change the operator confirmed may still be sent, judged on what IMS and the store say NOW. Returns the first thing that is no longer what the plan rested on, or null.
+ * Pure: the writer reads the rows and the live rate (under the lock that keeps every mapping writer out) and asks this immediately before the send.
+ *   CREATE         the IMS rate is still in scope with the same desired rate, and the mapping rows of the IMS rate are exactly the ones the plan saw (the stale ones)
+ *   UPDATE/DELETE  the mapping row exists, points at the same IMS rate, carries this store's stamp, and its snapshot is the rate the plan saw; the live rate equals that same rate;
+ *                  the IMS rate is still what justified the change (in scope with the same desired state for an UPDATE; the same reason for a DELETE, and still another counterpart for a duplicate)
+ */
+export function revalidateWooTaxChange(input: RevalidationInput): RevalidationFailure | null {
+  const { change, rate } = input
+  if (change.kind === 'CREATE') {
+    if (rate === undefined || !rate.active || !isSales(rate.usedFor) || rate.reverseCharge) return 'IMS_RATE_CHANGED'
+    const desired = desiredOf(rate, input.componentRates)
+    if (desired === null || !sameFields({ ...desired.fields, shipping: desired.percent.gt(0) }, change.after)) return 'IMS_RATE_CHANGED'
+    const now = input.mappings.filter((m) => m.taxRateId === change.imsRateId).map((m) => m.externalTaxRateId).sort(idOrder)
+    const planned = [...change.staleWooIds].sort(idOrder)
+    return now.length === planned.length && now.every((id, index) => id === planned[index]) ? null : 'MAPPING_APPEARED'
+  }
+  const mapping = input.mappings.find((m) => m.externalTaxRateId === change.wooId)
+  if (mapping === undefined) return 'MAPPING_GONE'
+  if (mapping.taxRateId !== change.imsRateId) return 'MAPPING_REPOINTED'
+  if (mapping.storeIdentity !== input.storeIdentity) return 'STAMP_CHANGED'
+  // The rate as the plan saw it in the store: a DELETE records it; an UPDATE records the fields it changes (the rest are the same before and after).
+  const planned: WooTaxRateFields = change.kind === 'DELETE' ? change.before : { ...change.after, ...Object.fromEntries(change.fields.map((f) => [f.field, f.before])) }
+  if (!sameRateIdentity(identityOfMapping(mapping), { name: planned.name, country: planned.country, rate: planned.rate, class: planned.class })) return 'SNAPSHOT_CHANGED'
+  // The mapping's snapshot is the planned rate (above) and the rate read again is that same rate field for field, so the live rate equals the snapshot.
+  if (input.live === undefined || !sameFields(fieldsOfWoo(input.live), planned)) return 'LIVE_CHANGED'
+  if (rate === undefined) return 'IMS_RATE_CHANGED'
+  const inScope = rate.active && isSales(rate.usedFor) && !rate.reverseCharge
+  if (change.kind === 'UPDATE') {
+    const desired = inScope ? desiredOf(rate, input.componentRates) : null
+    return desired !== null && sameFields(compareToDesired(input.live, rate, desired).after, change.after) ? null : 'IMS_RATE_CHANGED'
+  }
+  if (!inScope) return outOfScopeReason(rate) === change.reason ? null : 'IMS_RATE_CHANGED'
+  if (change.reason !== 'DUPLICATE_COUNTERPART') return 'IMS_RATE_CHANGED'
+  return input.mappings.some((m) => m.taxRateId === rate.id && m.externalTaxRateId !== change.wooId && m.storeIdentity === input.storeIdentity) ? null : 'IMS_RATE_CHANGED'
+}
+
 const KIND_ORDER = new Map(WOO_TAX_CHANGE_KINDS.map((kind, index) => [kind, index] as const))
 
 export function digestWooTaxPlan(plan: Pick<WooTaxPlan, 'changes' | 'blockers' | 'findings'>, storeIdentity = ''): string {

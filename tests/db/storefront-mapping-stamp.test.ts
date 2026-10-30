@@ -113,7 +113,7 @@ test('REPLACED RATE 10: the owner replaces the store rate by another and imports
     const row = await rowOf(r, r.ids[0]!)
     assert.equal(row?.storeIdentity, null)
     const store = new FakeWooStore([woo(r.ids[0]!, { name: replaced.name as string, rate: '5.0000', country: 'IE' })])
-    const deps = { readWoo: store.readWoo, storeIdentity: async () => STORE, port: store, context: { env: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' }, now: new Date('2026-06-01T00:00:00Z') } }
+    const deps = { readWoo: store.readWoo, readWooRate: store.readWooRate, storeIdentity: async () => STORE, configuredStoreIdentity: async () => STORE, port: store, context: { env: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' }, now: new Date('2026-06-01T00:00:00Z') } }
     const plan = (await r.writer.readWooTaxPlan(deps)).plan!
     assert.ok(plan.findings.some((f) => f.code === 'MAPPING_NOT_ADOPTED' && f.wooId === r.ids[0]))
     assert.ok(!plan.changes.some((c) => c.kind === 'DELETE'), 'no DELETE of the replaced rate')

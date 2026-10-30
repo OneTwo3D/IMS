@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  ADOPTION_REASONS, DELETE_REASONS, WOO_TAX_BLOCKER_CODES, WOO_TAX_FINDING_CODES, identityOfMapping, identityOfWoo, normaliseStoreIdentity, ownedWooIdsFromRecords, planAdoption, planWooTaxRates, sameRateIdentity,
+  ADOPTION_REASONS, DELETE_REASONS, WOO_TAX_BLOCKER_CODES, WOO_TAX_FINDING_CODES, identityOfMapping, identityOfWoo, normaliseStoreIdentity, ownedWooIdsFromRecords, planAdoption, planWooTaxRates, revalidateWooTaxChange, sameRateIdentity,
   type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxPlanInput,
 } from '../../lib/connectors/woocommerce/tax-rate-plan.ts'
 import { compareVatSetIdentity } from '../../lib/reconciliation-pack/vat-set-identity.ts'
@@ -520,4 +520,71 @@ test('STORE IDENTITY: the digest names the store: the same (here empty) plan aga
   const empty = (storeIdentity: string) => planWooTaxRates({ woo: [], rates: [], mappings: [], componentRates: [], recordedOwnedWooIds: new Set(), storeIdentity })
   assert.equal(empty(STORE).digest, empty(STORE).digest)
   assert.notEqual(empty(STORE).digest, empty(OTHER_STORE).digest)
+})
+
+
+// ---------------------------------------------------------------------------
+// The check made immediately before each send
+// ---------------------------------------------------------------------------
+
+/** The input the writer hands the check: the world as the plan saw it, with the live rate of the change, then edited by the case. */
+function recheck(input: Input, changeKey: string, edit: (w: { rates: Input['rates']; mappings: WooTaxMappingRow[]; live: WooTaxRateDetail | undefined }) => void = () => undefined): string | null {
+  const change = plan(input).changes.find((c) => c.key === changeKey)
+  assert.ok(change, `PRECONDITION: the plan has ${changeKey}`)
+  const w = { rates: input.rates.map((r) => ({ ...r })), mappings: input.mappings.map((m) => ({ ...m })), live: 'wooId' in change ? input.woo.find((x) => x.id === change.wooId) : undefined }
+  edit(w)
+  return revalidateWooTaxChange({ change, storeIdentity: STORE, rate: w.rates.find((r) => r.id === change.imsRateId), componentRates: [], mappings: w.mappings, live: w.live })
+}
+const deleteWorld = (): Input => { const i = consistent(); i.rates = i.rates.map((r) => (r.id === 'rDE' ? { ...r, active: false } : r)); return i }
+const updateWorld = (): Input => { const i = consistent(); i.woo = i.woo.map((x) => (x.id === '2' ? { ...x, rate: '18.0000' } : x)); i.mappings = i.mappings.map((m) => (m.externalTaxRateId === '2' ? { ...m, externalRatePct: '18.0000' } : m)); return i }
+const createWorld = (): Input => { const i = consistent(); i.rates = [...i.rates, ims('rFR', { name: 'FR VAT', countryCode: 'FR' })]; return i }
+
+test('RECHECK: a change whose world is unchanged passes, for each kind', () => {
+  assert.equal(recheck(deleteWorld(), 'delete:2'), null)
+  assert.equal(recheck(updateWorld(), 'update:2'), null)
+  assert.equal(recheck(createWorld(), 'create:rFR'), null)
+})
+
+test('RECHECK DELETE/UPDATE: every way the ownership can move is named and refuses the send', () => {
+  for (const [key, world] of [['delete:2', deleteWorld], ['update:2', updateWorld]] as const) {
+    assert.equal(recheck(world(), key, (w) => { w.mappings = w.mappings.filter((m) => m.externalTaxRateId !== '2') }), 'MAPPING_GONE', key)
+    // repointed to another ACTIVE IMS rate: the case where a planned DELETE would remove a rate IMS now uses
+    assert.equal(recheck(world(), key, (w) => { w.mappings = w.mappings.map((m) => (m.externalTaxRateId === '2' ? { ...m, taxRateId: 'rGB' } : m)) }), 'MAPPING_REPOINTED', key)
+    assert.equal(recheck(world(), key, (w) => { w.mappings = w.mappings.map((m) => (m.externalTaxRateId === '2' ? { ...m, storeIdentity: null } : m)) }), 'STAMP_CHANGED', key)
+    assert.equal(recheck(world(), key, (w) => { w.mappings = w.mappings.map((m) => (m.externalTaxRateId === '2' ? { ...m, storeIdentity: OTHER_STORE } : m)) }), 'STAMP_CHANGED', key)
+    assert.equal(recheck(world(), key, (w) => { w.mappings = w.mappings.map((m) => (m.externalTaxRateId === '2' ? { ...m, externalName: 'Another rate' } : m)) }), 'SNAPSHOT_CHANGED', key)
+    assert.equal(recheck(world(), key, (w) => { w.mappings = w.mappings.map((m) => (m.externalTaxRateId === '2' ? { ...m, externalClass: 'reduced-rate' } : m)) }), 'SNAPSHOT_CHANGED', key)
+    // the live rate read again is not the rate the plan saw
+    assert.equal(recheck(world(), key, (w) => { w.live = { ...w.live!, rate: '25.0000' } }), 'LIVE_CHANGED', key)
+    assert.equal(recheck(world(), key, (w) => { w.live = { ...w.live!, shipping: !w.live!.shipping } }), 'LIVE_CHANGED', key)
+    assert.equal(recheck(world(), key, (w) => { w.live = undefined }), 'LIVE_CHANGED', key)
+    assert.equal(recheck(world(), key, (w) => { w.rates = w.rates.filter((r) => r.id !== 'rDE') }), 'IMS_RATE_CHANGED', key)
+  }
+})
+
+test('RECHECK DELETE: the IMS rate must still be out of scope for the same reason (reactivated, or a different reason, refuses); an UPDATE needs the rate in scope with the same desired state', () => {
+  assert.equal(recheck(deleteWorld(), 'delete:2', (w) => { w.rates = w.rates.map((r) => (r.id === 'rDE' ? { ...r, active: true } : r)) }), 'IMS_RATE_CHANGED')
+  const reverse = deleteWorld(); reverse.rates = reverse.rates.map((r) => (r.id === 'rDE' ? { ...r, active: true, reverseCharge: true } : r))
+  assert.equal(recheck(reverse, 'delete:2'), null)
+  assert.equal(recheck(reverse, 'delete:2', (w) => { w.rates = w.rates.map((r) => (r.id === 'rDE' ? { ...r, active: false } : r)) }), 'IMS_RATE_CHANGED', 'a different reason is a different plan')
+  assert.equal(recheck(updateWorld(), 'update:2', (w) => { w.rates = w.rates.map((r) => (r.id === 'rDE' ? { ...r, active: false } : r)) }), 'IMS_RATE_CHANGED')
+  assert.equal(recheck(updateWorld(), 'update:2', (w) => { w.rates = w.rates.map((r) => (r.id === 'rDE' ? { ...r, rate: '0.2100' } : r)) }), 'IMS_RATE_CHANGED')
+})
+
+test('RECHECK DELETE of a duplicate counterpart needs the other counterpart still stamped for this store', () => {
+  const input = consistent()
+  const extra = woo('9', { name: 'GB VAT', rate: '21.0000' })
+  input.woo = [...input.woo, extra]
+  input.mappings = [...input.mappings, mapOf(extra, 'rGB')]
+  assert.equal(recheck(input, 'delete:9'), null)
+  assert.equal(recheck(input, 'delete:9', (w) => { w.mappings = w.mappings.map((m) => (m.externalTaxRateId === '1' ? { ...m, storeIdentity: null } : m)) }), 'IMS_RATE_CHANGED')
+  assert.equal(recheck(input, 'delete:9', (w) => { w.mappings = w.mappings.filter((m) => m.externalTaxRateId !== '1') }), 'IMS_RATE_CHANGED')
+})
+
+test('RECHECK CREATE: the IMS rate must still be in scope with the same desired rate, and no mapping may have appeared for it', () => {
+  assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.map((r) => (r.id === 'rFR' ? { ...r, active: false } : r)) }), 'IMS_RATE_CHANGED')
+  assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.map((r) => (r.id === 'rFR' ? { ...r, usedFor: 'PURCHASE' } : r)) }), 'IMS_RATE_CHANGED')
+  assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.map((r) => (r.id === 'rFR' ? { ...r, rate: '0.2500' } : r)) }), 'IMS_RATE_CHANGED')
+  assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.rates = w.rates.filter((r) => r.id !== 'rFR') }), 'IMS_RATE_CHANGED')
+  assert.equal(recheck(createWorld(), 'create:rFR', (w) => { w.mappings = [...w.mappings, { externalTaxRateId: '77', taxRateId: 'rFR', externalName: 'FR VAT', externalCountry: 'FR', externalRatePct: '20.0000', externalClass: 'standard', storeIdentity: null }] }), 'MAPPING_APPEARED')
 })

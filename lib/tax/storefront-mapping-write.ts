@@ -10,8 +10,8 @@
  * THE DECISION IS MADE BY THE DATABASE, IN THE WRITE ITSELF, never from a row read earlier: the upsert is ONE `INSERT ... ON CONFLICT DO UPDATE` whose `store_identity` is
  * `CASE WHEN <the row as it is when the update runs still means what it was stamped for> THEN <its stamp> ELSE NULL END`, and the re-point is one `UPDATE` with the same shape. PostgreSQL locks
  * the row at the conflict and evaluates the CASE against its latest committed version, so a row another transaction creates and adopts (or re-points) first is judged as that transaction left it.
- * Why SQL and not an advisory lock on the key: a lock would have to be taken by every writer, including the raw-SQL bulk ones and future ones, to mean anything; the CASE needs nothing
- * from the other writers, and the absent row needs no special case (a created row is unstamped; a row that appears meanwhile hits the conflict branch and is judged by the CASE).
+ * The CASE guards the stamp against every writer (it needs nothing from them); the shared apply lock (lockStorefrontMappingWrites) is a second, separate thing: it keeps writers out of a
+ * RUNNING APPLY, whose send cannot be undone, and the census requires every writer to take it. The absent row needs no special case (a created row is unstamped; a row that appears meanwhile hits the conflict branch and is judged by the CASE).
  * The SQL comparison mirrors `sameRateIdentity` (R13's comparisons) and is stricter in every case it differs from it (it can only clear more); a differential test pins that.
  *
  * The census (tests/tax/storefront-mapping-writers-census.test.ts) lists every writer of the table and fails on one that does not use this or clear the stamp itself.
@@ -19,6 +19,7 @@
 
 import { Prisma } from '@/app/generated/prisma/client'
 
+import { WOO_TAX_RATE_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { identityOfMapping, sameRateIdentity } from '@/lib/connectors/woocommerce/tax-rate-plan'
 
 export type StorefrontMappingFields = {
@@ -30,7 +31,16 @@ export type StorefrontMappingFields = {
   taxRateId: string
 }
 
-export type StorefrontMappingClient = Pick<Prisma.TransactionClient, '$queryRaw'>
+export type StorefrontMappingClient = Pick<Prisma.TransactionClient, '$queryRaw' | '$executeRaw'>
+
+/**
+ * THE APPLY LOCK, TAKEN BY EVERY WRITER OF THE TABLE. The tax-rate writer's apply holds WOO_TAX_RATE_WRITE_LOCK_KEY exclusively for its whole run and re-reads the ownership it rests on
+ * immediately before each send; this takes the same key SHARED until the caller's transaction ends, so no mapping write can land between that re-read and the send. Call it as the FIRST
+ * statement of the transaction (before any row lock, so a waiting writer holds nothing the apply needs). `tx` must be a real transaction: outside one the lock is released at once.
+ */
+export async function lockStorefrontMappingWrites(tx: Pick<StorefrontMappingClient, '$executeRaw'>): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${WOO_TAX_RATE_WRITE_LOCK_KEY}::bigint)`
+}
 
 /** Whether a stamped row still means what it was stamped for after `merged` replaces `existing`: same IMS rate, same four identity fields. (The SQL below is the same rule.) */
 export function mappingKeepsStamp(existing: StorefrontMappingFields, merged: StorefrontMappingFields): boolean {
@@ -63,6 +73,7 @@ export async function upsertStorefrontTaxMapping(
   key: { connector: string; externalTaxRateId: string },
   fields: StorefrontMappingFields,
 ): Promise<{ created: boolean }> {
+  await lockStorefrontMappingWrites(tx)
   const rows = await tx.$queryRaw<Array<{ created: boolean }>>(Prisma.sql`
     INSERT INTO ${T} (id, connector, "externalTaxRateId", "externalName", "externalCountry", "externalRatePct", "externalClass", "taxRateId", "createdAt", "updatedAt")
     VALUES (gen_random_uuid()::text, ${key.connector}, ${key.externalTaxRateId}, ${fields.externalName}, ${fields.externalCountry}, ${fields.externalRatePct}::numeric, ${fields.externalClass}, ${fields.taxRateId}, now(), now())
@@ -84,6 +95,7 @@ export async function repointStorefrontTaxMapping(
   key: { connector: string; externalTaxRateId: string },
   taxRateId: string,
 ): Promise<void> {
+  await lockStorefrontMappingWrites(tx)
   const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     UPDATE ${T} SET "taxRateId" = ${taxRateId}, "updatedAt" = now(),
       store_identity = CASE WHEN "taxRateId" = ${taxRateId} THEN store_identity ELSE NULL END

@@ -36,7 +36,7 @@ import type { ProducerDecisionContext } from '@/lib/security/producer-dispositio
 import { producerSeamVerdict } from '@/lib/security/producer-seam'
 import type { TaxComponentRateRow, TaxRateRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { WooTaxRateDetail } from '@/lib/reconciliation-pack/woo-source'
-import { planAdoption, planWooTaxRates, ownedWooIdsFromRecords, type AdoptionPlan, type FieldChange, type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxRateFields } from './tax-rate-plan'
+import { planAdoption, planWooTaxRates, ownedWooIdsFromRecords, revalidateWooTaxChange, REVALIDATION_FAILURES, type AdoptionPlan, type FieldChange, type WooTaxChange, type WooTaxMappingRow, type WooTaxPlan, type WooTaxRateFields } from './tax-rate-plan'
 import { wooProducerSeam } from './producer-seam'
 
 const DIGEST_RE = /^[0-9a-f]{64}$/
@@ -57,8 +57,15 @@ export type WooTaxReadResult = { ok: true; rates: WooTaxRateDetail[] } | { ok: f
 export type WooTaxWriterDeps = {
   /** The proven, GET-only read of the store's tax rates. */
   readWoo: () => Promise<WooTaxReadResult>
-  /** The normalised URL of the store configured now (`normaliseStoreIdentity`), or null when none is usable. Every ownership source is bound to it. */
+  /**
+   * The normalised URL of the store the run's PINNED credentials point at (`normaliseStoreIdentity`), or null when none is usable. Every ownership source, and the digest, are bound to it.
+   * The reads (`readWoo`, `readWooRate`) and the `port` must use those same pinned credentials (lib/connectors/woocommerce/tax-rate-session.ts builds all of them from one resolution).
+   */
   storeIdentity: () => Promise<string | null>
+  /** Required by an apply: the normalised URL of the store configured RIGHT NOW (the settings read again). Differing from `storeIdentity` refuses the apply and stops a running one. */
+  configuredStoreIdentity?: () => Promise<string | null>
+  /** Required by an apply: ONE store rate read again (GET only, the pinned credentials), checked immediately before each UPDATE or DELETE is sent. */
+  readWooRate?: (wooId: string) => Promise<{ ok: true; rate: WooTaxRateDetail } | { ok: false }>
   /** Required by an apply. */
   port?: WooTaxRateWritePort
   /** Test seam: the environment and clock the producer decision reads (default: the process). */
@@ -80,7 +87,8 @@ export function wooTaxHold(context?: ProducerDecisionContext): WooTaxHold {
 
 export const WOO_TAX_REFUSALS = {
   CONFIRM_REQUIRED: 'an apply needs the exact 64-character plan digest the operator saw in the preview',
-  PORT_MISSING: 'no WooCommerce write port was given to the apply',
+  PORT_MISSING: 'no WooCommerce write port (or no way to re-read a store rate or the configured store before a send) was given to the apply',
+  STORE_CHANGED: 'the store configured now is not the store the plan and the credentials of this run were bound to; nothing was sent. Preview again',
   HOLD_NOT_ENFORCED: 'the producer-side hold is not enforced for WooCommerce, so this writer does not run (it has no earlier behaviour to preserve)',
   BUSY: 'another apply of the WooCommerce tax rates is running and did not finish in time',
   IMS_UNREADABLE: 'the IMS tax rates, mappings or the writer record could not be read',
@@ -112,6 +120,8 @@ export type WooTaxApplyResult =
       failed: FailedChange | null
       /** A change that WAS sent but could not be recorded (the mapping row it rests on is not the one planned, or the commit failed): the run stopped there. */
       unrecorded: { key: string; reason: string } | null
+      /** A change NOT sent because what it rested on changed after the plan (checked immediately before the send): the run stopped there and nothing later was sent. */
+      stopped?: { key: string; reason: string } | null
     }
 
 type ReadClient = Pick<Prisma.TransactionClient, 'taxRate' | 'taxRateComponent' | 'shoppingTaxRateMapping' | 'wooTaxRateWrite'>
@@ -213,6 +223,32 @@ async function send(port: WooTaxRateWritePort, change: WooTaxChange): Promise<Wo
   }
 }
 
+/**
+ * The check made under the lock IMMEDIATELY before a send: the store configured now is still the pinned one; the IMS rows the change rests on are read again (they cannot change under the lock);
+ * for an UPDATE or DELETE the one store rate is read again. Returns why the change must NOT be sent, or null.
+ */
+async function recheckBeforeSend(deps: WooTaxWriterDeps, change: WooTaxChange, storeIdentity: string): Promise<string | null> {
+  const configured = await deps.configuredStoreIdentity!().catch(() => null)
+  if (configured !== storeIdentity) return 'STORE_CHANGED: the store configured now is not the store this run was bound to'
+  let ims: ImsState
+  try {
+    ims = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SET TRANSACTION READ ONLY`
+      return readImsState(tx, storeIdentity)
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 60_000, maxWait: 20_000 })
+  } catch {
+    return 'IMS_UNREADABLE: the IMS rows could not be read again'
+  }
+  let live: WooTaxRateDetail | undefined
+  if (change.kind !== 'CREATE') {
+    const read = await deps.readWooRate!(change.wooId).catch(() => ({ ok: false as const }))
+    if (!read.ok) return 'WOO_UNREADABLE: the store rate could not be read again'
+    live = read.rate
+  }
+  const failure = revalidateWooTaxChange({ change, storeIdentity, rate: ims.rates.find((r) => r.id === change.imsRateId), componentRates: ims.componentRates, mappings: ims.mappings, live })
+  return failure === null ? null : `${failure}: ${REVALIDATION_FAILURES[failure]}`
+}
+
 async function recordApplied(digest: string, change: WooTaxChange, newId: string | null, storeIdentity: string): Promise<void> {
   await db.$transaction(async (tx) => {
     const wooId = change.kind === 'CREATE' ? newId : change.wooId
@@ -249,7 +285,7 @@ export async function applyWooTaxPlan(deps: WooTaxWriterDeps, options: { confirm
   const refuse = (code: WooTaxRefusalCode, plan: WooTaxPlan | null = null): WooTaxApplyResult => ({ outcome: 'REFUSED', code, plan })
   // Before the database is touched: an apply with no digest never reads anything.
   if (options.confirm === undefined || !DIGEST_RE.test(options.confirm)) return refuse('CONFIRM_REQUIRED')
-  if (deps.port === undefined) return refuse('PORT_MISSING')
+  if (deps.port === undefined || deps.readWooRate === undefined || deps.configuredStoreIdentity === undefined) return refuse('PORT_MISSING')
   if (wooTaxHold(deps.context).mode === 'not-enforced') return refuse('HOLD_NOT_ENFORCED')
 
   let lock
@@ -262,6 +298,8 @@ export async function applyWooTaxPlan(deps: WooTaxWriterDeps, options: { confirm
   try {
     const read = await readPlan(deps)
     if (!read.ok) return refuse(read.code)
+    // The credentials of this run were resolved once; the settings may have been changed since. A plan confirmed for one store is never sent to another.
+    if ((await deps.configuredStoreIdentity().catch(() => null)) !== read.storeIdentity) return refuse('STORE_CHANGED')
     const plan = read.plan
     if (plan.changes.length === 0) return { outcome: 'NOTHING_TO_DO', plan }
     if (plan.digest !== options.confirm) return refuse('DIGEST_MISMATCH', plan)
@@ -278,6 +316,12 @@ export async function applyWooTaxPlan(deps: WooTaxWriterDeps, options: { confirm
         result.shadowed.push(change.key)
         if (!answer.recorded) result.shadowUnrecorded += 1
         continue
+      }
+      // THE RE-CHECK, inside the lock that keeps every mapping writer out and immediately before the send (which cannot be undone): what the change rests on is read again and must be what the plan saw.
+      const changed = await recheckBeforeSend(deps, change, read.storeIdentity)
+      if (changed !== null) {
+        result.stopped = { key: change.key, reason: changed }
+        break
       }
       const sent = await send(deps.port, change)
       if (!sent.ok) {
@@ -345,6 +389,8 @@ export async function applyWooAdoption(deps: WooTaxWriterDeps, options: { confir
   try {
     const read = await readAdoptionPlan(deps)
     if (read.plan === null) return refuse(read.refused)
+    // A stamp is bound to the store of the run's pinned credentials; if the configured store moved on, nothing is stamped.
+    if (deps.configuredStoreIdentity !== undefined && (await deps.configuredStoreIdentity().catch(() => null)) !== read.plan.storeIdentity) return refuse('STORE_CHANGED')
     const plan = read.plan
     if (plan.rows.length === 0) return { outcome: 'NOTHING_TO_DO', plan }
     if (plan.digest !== options.confirm) return refuse('DIGEST_MISMATCH', plan)

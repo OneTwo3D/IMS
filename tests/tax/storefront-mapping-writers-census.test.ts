@@ -16,6 +16,12 @@ import test from 'node:test'
  *   removes-only   only deletes rows (a deleted row owns nothing)
  *   stamps         the tax-rate writer and its adoption step: they set the stamp on purpose
  *   impl           the helper itself
+ *
+ * AND EVERY WRITER TAKES THE APPLY LOCK. The WooCommerce tax-rate apply holds WOO_TAX_RATE_WRITE_LOCK_KEY exclusively for its whole run and re-reads the ownership it rests on just before each
+ * send; a mapping writer that does not take the same key SHARED (lockStorefrontMappingWrites, pg_advisory_xact_lock_shared) can change a row between that re-read and the send. So: a file that
+ * writes the table directly must call lockStorefrontMappingWrites( (or take the shared lock in SQL, as the copy script does); a file that writes only through the helper gets it from the helper,
+ * and the helper's two entry points must call it; the stamping writer must take the lock exclusively. Reset (the factory reset deletes every row) takes it too: a row that vanishes under a
+ * running apply is exactly the ownership change the re-read is there to catch, and only a coordinated delete leaves no gap between the re-read and the send.
  */
 
 type Rule = 'helper' | 'clears-inline' | 'creates-only' | 'removes-only' | 'stamps' | 'impl'
@@ -74,6 +80,8 @@ export function censusFindings(files: ReadonlyMap<string, string>, declared: Rea
     const decl = declared[file]
     if (decl === undefined) { failures.push(`UNDECLARED ${file} writes shopping_tax_rate_mappings (${[...ops].join(', ') || 'through the helper'}): declare it in WRITERS with its rule, and clear the ownership stamp when it changes a row's IMS rate or identity snapshot`); continue }
     const changes = ops.has('update')
+    if (decl.rule !== 'stamps' && decl.rule !== 'impl' && ops.size > 0 && !/\blockStorefrontMappingWrites\s*\(|pg_advisory_xact_lock_shared/.test(text)) failures.push(`LOCK ${file} writes the table directly but never takes the shared apply lock (lockStorefrontMappingWrites)`)
+    if (decl.rule === 'stamps' && !/acquirePinnedAdvisoryLockWaiting\(\s*WOO_TAX_RATE_WRITE_LOCK_KEY/.test(text)) failures.push(`LOCK ${file} stamps rows but does not take the apply lock exclusively`)
     switch (decl.rule) {
       case 'helper':
         if (!usesHelper) failures.push(`HELPER ${file} is declared a helper user but never calls the helper (upsertStorefrontTaxMapping / repointStorefrontTaxMapping)`)
@@ -90,6 +98,15 @@ export function censusFindings(files: ReadonlyMap<string, string>, declared: Rea
         if (changes || ops.has('create')) failures.push(`REMOVES-ONLY ${file} also creates or updates rows`)
         break
       case 'stamps': case 'impl': break
+    }
+  }
+  const impl = files.get('lib/tax/storefront-mapping-write.ts')
+  if (impl !== undefined) {
+    if (!/pg_advisory_xact_lock_shared\(\$\{WOO_TAX_RATE_WRITE_LOCK_KEY\}/.test(impl)) failures.push('LOCK the helper\'s lockStorefrontMappingWrites no longer takes pg_advisory_xact_lock_shared on WOO_TAX_RATE_WRITE_LOCK_KEY')
+    for (const fn of ['upsertStorefrontTaxMapping', 'repointStorefrontTaxMapping']) {
+      const body = impl.slice(impl.indexOf(`export async function ${fn}(`))
+      const upToNextExport = body.slice(0, body.indexOf('\nexport ', 10) === -1 ? undefined : body.indexOf('\nexport ', 10))
+      if (!/await lockStorefrontMappingWrites\(tx\)/.test(upToNextExport)) failures.push(`LOCK the helper's ${fn} does not take the shared apply lock`)
     }
   }
   for (const file of Object.keys(declared)) if (!seen.has(file)) failures.push(`STALE ${file} is declared but no longer writes the table`)
@@ -132,7 +149,23 @@ test('MUTATION: each writer that loses its rule is red', () => {
   assert.ok(mutate('scripts/commerce-accounting-e2e-fixture.ts', (t) => `${t}\nawait db.shoppingTaxRateMapping.update({ where: {} as never, data: {} })`).some((f) => f.startsWith('CREATES-ONLY')))
   assert.ok(mutate('app/actions/reset.ts', (t) => `${t}\nawait db.shoppingTaxRateMapping.create({ data: {} as never })`).some((f) => f.startsWith('REMOVES-ONLY')))
   // a declared writer that stops writing is stale
-  assert.ok(mutate('app/actions/reset.ts', (t) => t.replace('await db.shoppingTaxRateMapping.deleteMany({})', '')).some((f) => f.startsWith('STALE app/actions/reset.ts')))
+  assert.ok(mutate('app/actions/reset.ts', (t) => t.replace('await tx.shoppingTaxRateMapping.deleteMany({})', '')).some((f) => f.startsWith('STALE app/actions/reset.ts')))
+})
+
+test('MUTATION: a writer that stops taking the apply lock is red, each one, and so is a helper that stops taking it', () => {
+  const mutate = (file: string, edit: (text: string) => string) => { const files = new Map(real); files.set(file, edit(real.get(file)!)); return censusFindings(files) }
+  const strip = (t: string) => t.replaceAll('lockStorefrontMappingWrites(', 'somethingElse(').replaceAll('pg_advisory_xact_lock_shared', 'pg_something_else')
+  for (const file of ['app/actions/wc-sync.ts', 'lib/tax/tax-rekey.ts', 'scripts/copy-tax-rates.ts', 'scripts/commerce-accounting-e2e-fixture.ts', 'app/actions/reset.ts']) {
+    assert.ok(mutate(file, strip).some((f) => f.startsWith(`LOCK ${file}`)), file)
+  }
+  assert.ok(mutate('lib/tax/storefront-mapping-write.ts', (t) => t.replace('await lockStorefrontMappingWrites(tx)\n  const rows = await tx.$queryRaw<Array<{ created', 'const rows = await tx.$queryRaw<Array<{ created')).some((f) => f.includes('upsertStorefrontTaxMapping does not take')))
+  assert.ok(mutate('lib/tax/storefront-mapping-write.ts', (t) => t.replace('await lockStorefrontMappingWrites(tx)\n  const rows = await tx.$queryRaw<Array<{ id', 'const rows = await tx.$queryRaw<Array<{ id')).some((f) => f.includes('repointStorefrontTaxMapping does not take')))
+  assert.ok(mutate('lib/tax/storefront-mapping-write.ts', (t) => t.replace('pg_advisory_xact_lock_shared', 'pg_something_else')).some((f) => f.startsWith('LOCK the helper')))
+  assert.ok(mutate('lib/connectors/woocommerce/tax-rate-writer.ts', (t) => t.replaceAll('acquirePinnedAdvisoryLockWaiting(WOO_TAX_RATE_WRITE_LOCK_KEY', 'acquirePinnedAdvisoryLockWaiting(1')).some((f) => f.startsWith('LOCK lib/connectors/woocommerce/tax-rate-writer.ts')))
+  // a brand-new writer that is declared but takes no lock is red
+  const files = new Map(real)
+  files.set('lib/new-writer.ts', 'export const f = (tx: any) => tx.shoppingTaxRateMapping.updateMany({ data: { storeIdentity: null } })')
+  assert.equal(censusFindings(files, { ...WRITERS, 'lib/new-writer.ts': { rule: 'clears-inline', token: 'storeIdentity: null', why: 'x' } }).filter((f) => f.startsWith('LOCK lib/new-writer.ts')).length, 1)
 })
 
 test('the scanner sees what it claims to: Prisma delegates, raw SQL in each form, and ON CONFLICT DO UPDATE as an update; reads and prose are not writes', () => {

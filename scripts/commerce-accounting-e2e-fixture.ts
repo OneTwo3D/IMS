@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { db } from '../lib/db/index.ts'
+import { lockStorefrontMappingWrites } from '../lib/tax/storefront-mapping-write.ts'
 import { lockIntegrationPluginSelection } from '../lib/integration-plugin-selection-lock.ts'
 import { importWcOrder } from '../lib/connectors/woocommerce/sync/order-import.ts'
 import type { WcFullOrder, WcRefund } from '../lib/connectors/woocommerce/sync/types.ts'
@@ -538,27 +539,30 @@ async function importWcFeeScenario() {
   const standardExternalRateId = String(Math.floor(Date.now() % 1_000_000))
   const reducedExternalRateId = String((Math.floor(Date.now() % 1_000_000)) + 1)
 
-  await db.shoppingTaxRateMapping.createMany({
-    data: [
-      {
-        connector: 'woocommerce',
-        externalTaxRateId: standardExternalRateId,
-        externalName: 'Standard',
-        externalCountry: 'GB',
-        externalRatePct: 20,
-        externalClass: '',
-        taxRateId: standardTaxRate.id,
-      },
-      {
-        connector: 'woocommerce',
-        externalTaxRateId: reducedExternalRateId,
-        externalName: 'Reduced',
-        externalCountry: 'GB',
-        externalRatePct: 5,
-        externalClass: 'reduced-rate',
-        taxRateId: reducedTaxRate.id,
-      },
-    ],
+  await db.$transaction(async (tx) => {
+    await lockStorefrontMappingWrites(tx)
+    await tx.shoppingTaxRateMapping.createMany({
+      data: [
+        {
+          connector: 'woocommerce',
+          externalTaxRateId: standardExternalRateId,
+          externalName: 'Standard',
+          externalCountry: 'GB',
+          externalRatePct: 20,
+          externalClass: '',
+          taxRateId: standardTaxRate.id,
+        },
+        {
+          connector: 'woocommerce',
+          externalTaxRateId: reducedExternalRateId,
+          externalName: 'Reduced',
+          externalCountry: 'GB',
+          externalRatePct: 5,
+          externalClass: 'reduced-rate',
+          taxRateId: reducedTaxRate.id,
+        },
+      ],
+    })
   })
 
   const externalOrderId = Math.floor(Date.now() / 1000)
@@ -1420,16 +1424,19 @@ async function importWcDiscountScenario() {
   })
 
   const standardExternalRateId = String(Math.floor(Date.now() % 1_000_000))
-  await db.shoppingTaxRateMapping.create({
-    data: {
-      connector: 'woocommerce',
-      externalTaxRateId: standardExternalRateId,
-      externalName: 'Standard',
-      externalCountry: 'GB',
-      externalRatePct: 20,
-      externalClass: '',
-      taxRateId: standardTaxRate.id,
-    },
+  await db.$transaction(async (tx) => {
+    await lockStorefrontMappingWrites(tx)
+    await tx.shoppingTaxRateMapping.create({
+      data: {
+        connector: 'woocommerce',
+        externalTaxRateId: standardExternalRateId,
+        externalName: 'Standard',
+        externalCountry: 'GB',
+        externalRatePct: 20,
+        externalClass: '',
+        taxRateId: standardTaxRate.id,
+      },
+    })
   })
 
   const externalOrderId = Math.floor(Date.now() / 1000)

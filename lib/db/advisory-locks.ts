@@ -163,7 +163,11 @@ export const RECONCILIATION_PACK_SCHEDULE_SETTINGS_LOCK_KEY = 918_274_302
  *
  * Held (session-scoped, waiting, on a pinned connection) for the whole of an apply: it reads the store, rebuilds the plan, checks the digest and sends the changes one at a time. A second
  * apply started meanwhile waits, then rebuilds its plan from the store as the first left it (usually nothing to do) instead of sending the same changes twice. A transaction cannot hold
- * it: the sends are network calls and each change commits its own record and mapping row. Its own domain, shared with nothing.
+ * it: the sends are network calls and each change commits its own record and mapping row.
+ *
+ * It is ALSO the lock that keeps every other writer of shopping_tax_rate_mappings out of an apply: the apply holds it EXCLUSIVE, and every such writer takes it SHARED for the life of its own
+ * transaction (`pg_advisory_xact_lock_shared`, lib/tax/storefront-mapping-write.ts `lockStorefrontMappingWrites`). So the ownership the apply checks just before a send cannot change
+ * before the send, and a writer waits for a running apply (and an apply waits for writers in flight, then is BUSY after its wait). Shared writers do not exclude one another.
  */
 export const WOO_TAX_RATE_WRITE_LOCK_KEY = 918_274_501
 

@@ -15,6 +15,8 @@ export type World = {
   store: FakeWooStore
   ids: { gb: string; de: string; pt30: string; old: string; fr: string }
   woo: { w1: string; w2: string; w3: string; w4: string; w5: string }
+  /** The store identity the settings answer now (change it to simulate wc_url changing mid-apply). */
+  configured: { value: string | null }
   deps: (env: Record<string, string>) => Parameters<Mods['writer']['applyWooTaxPlan']>[0]
   counts: () => Promise<{ writes: number; mappings: number; shadows: number }>
   mappingRows: () => Promise<unknown[]>
@@ -50,6 +52,7 @@ async function buildLockedWorld(m: Mods, body: (w: World) => Promise<void>): Pro
   const store = new FakeWooStore([w1, w2, w3, w4, w5], base + 100)
   for (const [w, r] of [[w1, gb], [w2, de], [w3, pt30], [w4, old]] as const) await db.shoppingTaxRateMapping.create({ data: { connector: 'woocommerce', externalTaxRateId: w.id, taxRateId: r.id, externalName: w.name, externalCountry: w.country, externalRatePct: w.rate, externalClass: w.class, storeIdentity: STORE } })
   const mine = [gb.id, de.id, pt30.id, old.id, fr.id]
+  const configured: { value: string | null } = { value: STORE }
   const cleanup = async () => {
     await db.wooTaxRateWrite.deleteMany({ where: { imsTaxRateId: { in: mine } } })
     await db.shoppingTaxRateMapping.deleteMany({ where: { taxRateId: { in: mine } } })
@@ -67,7 +70,8 @@ async function buildLockedWorld(m: Mods, body: (w: World) => Promise<void>): Pro
     await body({
       m, store, ids: { gb: gb.id, de: de.id, pt30: pt30.id, old: old.id, fr: fr.id },
       woo: { w1: w1.id, w2: w2.id, w3: w3.id, w4: w4.id, w5: w5.id },
-      deps: (env) => ({ readWoo: store.readWoo, storeIdentity: async () => STORE, port: store, context: ctx(env) }),
+      configured,
+      deps: (env) => ({ readWoo: store.readWoo, readWooRate: store.readWooRate, storeIdentity: async () => STORE, configuredStoreIdentity: async () => configured.value, port: store, context: ctx(env) }),
       counts,
       mappingRows: () => db.shoppingTaxRateMapping.findMany({ where: { taxRateId: { in: mine } }, orderBy: { externalTaxRateId: 'asc' } }),
     })

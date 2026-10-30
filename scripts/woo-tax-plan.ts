@@ -52,26 +52,18 @@ function replaceProcessEnv(env: Record<string, string>): void {
 }
 
 async function defaultDeps(): Promise<WooTaxPlanDeps> {
-  const [writer, port, source, run, plan, api, { db }] = await Promise.all([
+  const [writer, session, api, { db }] = await Promise.all([
     import('../lib/connectors/woocommerce/tax-rate-writer.ts'),
-    import('../lib/connectors/woocommerce/tax-rate-port.ts'),
-    import('../lib/reconciliation-pack/woo-source.ts'),
-    import('../lib/tax/vat-difference-run.ts'),
-    import('../lib/connectors/woocommerce/tax-rate-plan.ts'),
+    import('../lib/connectors/woocommerce/tax-rate-session.ts'),
     import('../lib/connectors/woocommerce/api.ts'),
     import('../lib/db/index.ts'),
   ])
   return {
     run: async ({ confirm, adopt, holdEnv }) => {
-      const wooPort = run.createStoredWooPort()
-      const deps = {
-        readWoo: async () => { const read = await source.readWooTaxRateDetails(wooPort); return read.ok ? { ok: true as const, rates: read.value.rates } : { ok: false as const } },
-        // The store the writes go to: the same stored credentials wcPost and wcPut send with.
-        storeIdentity: async () => { const creds = await api.getWcCredentials(); return creds === null ? null : plan.normaliseStoreIdentity(creds.url) },
-        port: port.createWooTaxRateWritePort(),
-        context: { env: holdEnv },
-      }
-      const hold = writer.wooTaxHold(deps.context)
+      // ONE credential resolution for the whole run: the reads and the writes all use it (lib/connectors/woocommerce/tax-rate-session.ts), and the configured store is compared with it before each send.
+      const pinned = await api.getWcCredentials().catch(() => null)
+      const deps = session.createWooTaxWriterDeps({ pinned, configured: () => api.getWcCredentials(), context: { env: holdEnv } })
+      const hold = writer.wooTaxHold({ env: holdEnv })
       if (adopt === true) {
         return confirm === null
           ? { preview: null, applied: null, adoptionPreview: await writer.readWooAdoptionPlan(deps), hold }

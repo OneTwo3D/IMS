@@ -48,6 +48,17 @@ export class FakeWooStore implements WooTaxRateWritePort {
     this.next = nextId
   }
 
+  /** Every single-rate re-read (the check made before each send), in order. */
+  rateReads: string[] = []
+  /** Test seam: runs when a single rate is read, before it answers (to change the store between the plan and the send). */
+  onRateRead: ((id: string) => void | Promise<void>) | null = null
+  readWooRate = async (id: string): Promise<{ ok: true; rate: WooTaxRateDetail } | { ok: false }> => {
+    this.rateReads.push(id)
+    await this.onRateRead?.(id)
+    const rate = this.rates.get(id)
+    return rate === undefined ? { ok: false } : { ok: true, rate: { ...rate } }
+  }
+
   list(): WooTaxRateDetail[] { return [...this.rates.values()].sort((a, b) => Number(BigInt(a.id) - BigInt(b.id))) }
   readWoo = async (): Promise<{ ok: true; rates: WooTaxRateDetail[] }> => ({ ok: true, rates: this.list().map((rate) => ({ ...rate })) })
 

@@ -10,6 +10,7 @@
  */
 
 import { wcPost, wcPut } from './api'
+import type { ConnectorCredentials } from '../types'
 import type { WooTaxPortResult, WooTaxRateWritePort } from './tax-rate-writer'
 import type { WooTaxRateFields } from './tax-rate-plan'
 
@@ -22,10 +23,14 @@ function record(value: unknown): Record<string, unknown> | null {
 const failure = (answer: { error?: string; held?: true }): WooTaxPortResult =>
   answer.held === true ? { ok: false, error: answer.error ?? 'held', held: true } : { ok: false, error: answer.error ?? 'WooCommerce did not answer' }
 
-export function createWooTaxRateWritePort(): WooTaxRateWritePort {
+/**
+ * `creds`: the ONE credential set the run resolved at its start. When given, every send uses it and nothing reloads the settings (a store URL changed mid-run cannot redirect a send); the
+ * writer's own check before each send then stops the run. Absent: the transport reloads the stored credentials on every call, as every other caller of wcPost and wcPut does.
+ */
+export function createWooTaxRateWritePort(creds?: ConnectorCredentials | null): WooTaxRateWritePort {
   return {
     async create(fields: WooTaxRateFields): Promise<WooTaxPortResult> {
-      const answer = await wcPost('/taxes', fields)
+      const answer = await wcPost('/taxes', fields, creds)
       if (answer.error !== undefined) return failure(answer)
       const id = record(answer.data)?.id
       const text = typeof id === 'number' || typeof id === 'string' ? String(id) : ''
@@ -33,13 +38,13 @@ export function createWooTaxRateWritePort(): WooTaxRateWritePort {
     },
     async update(wooId: string, changed: Readonly<Partial<WooTaxRateFields>>): Promise<WooTaxPortResult> {
       if (!ID_RE.test(wooId)) return { ok: false, error: 'not a WooCommerce tax rate id' }
-      const answer = await wcPut(`/taxes/${wooId}`, changed)
+      const answer = await wcPut(`/taxes/${wooId}`, changed, creds)
       if (answer.error !== undefined) return failure(answer)
       return record(answer.data) === null ? { ok: false, error: 'WooCommerce answered an update without a rate' } : { ok: true, id: wooId }
     },
     async remove(wooId: string): Promise<WooTaxPortResult> {
       if (!ID_RE.test(wooId)) return { ok: false, error: 'not a WooCommerce tax rate id' }
-      const answer = await wcPost('/taxes/batch', { delete: [Number(wooId)] })
+      const answer = await wcPost('/taxes/batch', { delete: [Number(wooId)] }, creds)
       if (answer.error !== undefined) return failure(answer)
       const deleted = record(answer.data)?.delete
       const first = Array.isArray(deleted) && deleted.length === 1 ? record(deleted[0]) : null
