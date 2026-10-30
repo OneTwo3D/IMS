@@ -23,3 +23,25 @@ export async function readWithin<T extends { ok: boolean }>(ms: number, read: ()
   }
 }
 
+
+/**
+ * THE CUTOVER MUST RESOLVE TO THIS READ. For every active foreign currency that is not pinned by a manual override, the real lookup at the cutover instant must give exactly the rate and the time of the
+ * Aelia read that this cutover ingested; a different rate or time means something else (a newer or conflicting stored row) is what the lookup would use, so the switch is refused. A pinned currency is judged
+ * by the lookup alone. Returns one text per mismatch (empty = all agree).
+ */
+export function cutoverReadMismatches(
+  outcomes: ReadonlyMap<string, { ok: true; rate: { toString(): string; equals(other: string): boolean }; fetchedAt: Date } | { ok: false }>,
+  read: { updatedAt: Date; readRates: Readonly<Record<string, string>>; pinned: readonly string[] },
+): string[] {
+  const pinned = new Set(read.pinned)
+  const out: string[] = []
+  for (const [code, outcome] of outcomes) {
+    if (!outcome.ok || pinned.has(code)) continue
+    const rate = read.readRates[code]
+    if (rate === undefined) { out.push(`${code} (not in this read)`); continue }
+    if (!outcome.rate.equals(rate) || outcome.fetchedAt.getTime() !== read.updatedAt.getTime()) {
+      out.push(`${code} (resolves to ${outcome.rate.toString()} at ${outcome.fetchedAt.toISOString()}, this read has ${rate} at ${read.updatedAt.toISOString()})`)
+    }
+  }
+  return out
+}

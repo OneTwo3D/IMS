@@ -1,6 +1,6 @@
 'use server'
 
-import { AELIA_CUTOVER_READ_BOUND_MS, AELIA_CUTOVER_TX_TIMEOUT_MS, FxCutoverRefusedError, readWithin } from '@/lib/currencies/aelia-cutover'
+import { AELIA_CUTOVER_READ_BOUND_MS, AELIA_CUTOVER_TX_TIMEOUT_MS, FxCutoverRefusedError, cutoverReadMismatches, readWithin } from '@/lib/currencies/aelia-cutover'
 import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -523,6 +523,11 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
         const failures = [...outcomes].flatMap(([code, o]) => (o.ok ? [] : [`${code} (${o.error.reason})`]))
         if (failures.length) {
           throw new FxCutoverRefusedError(`After the switch these currencies would not resolve to an Aelia rate or a manual override: ${failures.join(', ')}; the source was not changed (it is still ECB and nothing was stored).`)
+        }
+        // And what each unpinned currency resolves to must be THIS read's rate and time, not some other stored row.
+        const differing = cutoverReadMismatches(outcomes, aeliaResult)
+        if (differing.length) {
+          throw new FxCutoverRefusedError(`After the switch these currencies would resolve to something other than this Aelia read: ${differing.join(', ')}; the source was not changed (it is still ECB and nothing was stored).`)
         }
         await tx.setting.upsert({ where: { key: 'fx_aelia_last_update_at' }, create: { key: 'fx_aelia_last_update_at', value: aeliaResult.updatedAt.toISOString() }, update: { value: aeliaResult.updatedAt.toISOString() } })
         await tx.setting.upsert({ where: { key: 'fx_aelia_last_read_at' }, create: { key: 'fx_aelia_last_read_at', value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })

@@ -267,3 +267,44 @@ test('wiring: the read sits inside the exclusive lock, is bounded, and the trans
   assert.match(card, /setError\(result\.error \?\? 'Could not change the FX source'\)/)
   assert.match(card, /role="alert"/)
 })
+
+test('A PINNED currency that Aelia OMITS still counts as covered: the switch commits, nothing is stored for it, and the real lookup resolves through the pin', async () => {
+  const { setFxRateSource } = await import('@/app/actions/currencies')
+  reset([...ECB_ROWS(), ecbRow('USD', '1.40', '2026-10-26T00:00:00Z', { manualOverride: true })])
+  readImpl = async () => ({ ok: true, body: answerWithout('USD') })
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  assert.equal(fake.settings.get('fx_rate_source'), 'aelia')
+  assert.deepEqual(aeliaRows().map((r) => r.toCurrency).sort(), ['EUR', 'NOK'])
+  const usd = (await resolveNow(new Date())).get('USD')
+  assert.ok(usd?.ok && usd.manualOverride && usd.rate.toString() === '1.4', 'USD resolves through its pin')
+
+  // Aelia REFUSES the pinned currency (rate 0): the same
+  reset([...ECB_ROWS(), ecbRow('USD', '1.40', '2026-10-26T00:00:00Z', { manualOverride: true })])
+  readImpl = async () => ({ ok: true, body: aeliaAnswer({ rates: [{ currency: 'EUR', rate: '1.19' }, { currency: 'USD', rate: '0' }, { currency: 'NOK', rate: '12.5' }] }) })
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+
+  // CONTROL: the same omission WITHOUT a pin is refused (the pin is what covers it)
+  reset()
+  readImpl = async () => ({ ok: true, body: answerWithout('USD') })
+  const bad = await setFxRateSource('aelia')
+  assert.equal(bad.success, false)
+  assert.match(bad.error ?? '', /USD/)
+})
+
+test('a REGRESSED Aelia update time (older than a stored Aelia row) refuses the cutover: that currency counts as missing, nothing is stored', async () => {
+  const { setFxRateSource } = await import('@/app/actions/currencies')
+  // a stored Aelia row for EUR NEWER than the answer's update time (2026-10-23T23:36:05Z)
+  reset([...ECB_ROWS(), ecbRow('EUR', '1.2', '2026-10-24T10:00:00Z', { source: 'aelia' })])
+  const result = await setFxRateSource('aelia')
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /EUR \(aelia_update_regressed\)/)
+  assert.equal(fake.settings.has('fx_rate_source'), false)
+  assert.deepEqual(aeliaRows().map((r) => r.toCurrency), ['EUR'], 'only the stored row remains: the rows of this read were rolled back')
+  assert.ok(fake.events.includes('tx.rollback'))
+  // CONTROL: the same stored row at an OLDER time is no regression: the cutover commits
+  reset([...ECB_ROWS(), ecbRow('EUR', '1.2', '2026-10-22T10:00:00Z', { source: 'aelia' })])
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  // and a stored Aelia row identical to this read (same rate, same time) is the idempotent case: the cutover commits and the lookup agrees with the read
+  reset([...ECB_ROWS(), ecbRow('EUR', '1.194344', '2026-10-23T23:36:05Z', { source: 'aelia' })])
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+})

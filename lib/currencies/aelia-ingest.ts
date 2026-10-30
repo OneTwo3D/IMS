@@ -1,5 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { getFxRateSourceInTx } from '@/lib/currencies/fx-source'
 import { withFxTableWriteLock } from '@/lib/currencies/fx-table-lock'
 
 type FxTx = Parameters<Parameters<typeof withFxTableWriteLock>[0]>[0]
@@ -21,6 +22,12 @@ type FxTx = Parameters<Parameters<typeof withFxTableWriteLock>[0]>[0]
  *
  * MARKUP RULE. `rate_markup` is never an input to the stored rate, so a non-base currency whose markup is absent is still stored at its `rate`; its markup is reported as null (unknown), never as 0.
  * The base currency's own row is skipped (see parseAeliaRatesPayload).
+ *
+ * NO REGRESSION. An update time EARLIER than the newest stored source='aelia' row of that currency is refused for that currency (aelia_update_regressed) and nothing is stored for it: an older Aelia answer
+ * (a lagging store replica, a restored backup) must not slip in behind a newer one. The same time is the idempotent re-read; a later time is a new rate.
+ *
+ * THE SOURCE IS RE-CHECKED IN THE WRITE LOCK. The regular ingest (ingestAeliaRates) re-reads fx_rate_source inside its lock transaction and writes nothing if it is no longer 'aelia': a refresh that
+ * started while Aelia was selected may finish after setFxRateSource('ecb') committed. (ingestAeliaRatesInTx does not: the cutover itself runs it while the source is still ECB.)
  *
  * MANUAL OVERRIDES keep working exactly as for the ECB fetch: a currency whose latest row is a manual override is skipped (the pin stays until the admin clears it), and a row written here is an
  * ordinary row that selectFxRateFromRows ranks by fetchedAt like any other.
@@ -50,8 +57,12 @@ export const AELIA_REFUSALS = [
   'not_listed_by_aelia',
   'duplicate_currency',
   'changed_without_update',
+  'aelia_update_regressed',
+  'source_changed',
 ] as const
 export type AeliaRefusalReason = (typeof AELIA_REFUSALS)[number]
+
+export const AELIA_SOURCE_CHANGED_MESSAGE = 'The FX source is no longer Aelia; nothing was stored.'
 
 export type AeliaRefusal = { currency: string | null; reason: AeliaRefusalReason; message: string }
 
@@ -166,8 +177,12 @@ export type AeliaIngestResult = {
   written: string[]
   /** Currencies whose row for this Aelia update already exists with the same rate (an idempotent re-read). */
   unchanged: string[]
-  /** Currencies skipped because their latest row is a manual override. */
+  /** Currencies in this read skipped because their latest row is a manual override. */
   skippedManualOverrides: string[]
+  /** EVERY active foreign currency whose latest row is a manual override, whether or not Aelia's answer has a usable entry for it: the pin is its rate and covers it. */
+  pinned: string[]
+  /** The rate (before markup) of this read for each currency it stored or found already stored: what an unpinned currency must resolve to. */
+  readRates: Record<string, string>
   refused: AeliaRefusal[]
   /** Aelia's markup per currency, as returned. For verification only: it is stored nowhere. */
   markups: Record<string, string | null>
@@ -183,7 +198,15 @@ export type AeliaIngestResult = {
  * Everything else is reported per currency in the result.
  */
 export async function ingestAeliaRates(body: unknown, options: { now?: Date } = {}): Promise<AeliaIngestResult> {
-  return withFxTableWriteLock((tx) => ingestAeliaRatesInTx(tx, body, options))
+  return withFxTableWriteLock(async (tx) => {
+    await requireAeliaSourceInTx(tx)
+    return ingestAeliaRatesInTx(tx, body, options)
+  })
+}
+
+/** The source re-check of the Aelia writers: throws AeliaRefusedError('source_changed') unless fx_rate_source is 'aelia' as seen inside the lock transaction. */
+async function requireAeliaSourceInTx(tx: FxTx): Promise<void> {
+  if ((await getFxRateSourceInTx(tx)) !== 'aelia') throw new AeliaRefusedError('source_changed', AELIA_SOURCE_CHANGED_MESSAGE)
 }
 
 /**
@@ -224,37 +247,54 @@ export async function ingestAeliaRatesInTx(tx: FxTx, body: unknown, options: { n
   const written: string[] = []
   const unchanged: string[] = []
   const skippedManualOverrides: string[] = []
+  const readRates: Record<string, string> = {}
 
-  {
-    const latest = await tx.fxRate.findMany({
-      where: { fromCurrency: baseCurrency, toCurrency: { in: usable.map((u) => u.currency) } },
-      orderBy: [{ toCurrency: 'asc' }, { fetchedAt: 'desc' }],
-      distinct: ['toCurrency'],
-      select: { toCurrency: true, manualOverride: true },
-    })
-    const overridden = new Set(latest.filter((r) => r.manualOverride).map((r) => r.toCurrency))
-    for (const entry of usable) {
-      if (overridden.has(entry.currency)) { skippedManualOverrides.push(entry.currency); continue }
-      const existing = await tx.fxRate.findFirst({
-        where: { fromCurrency: baseCurrency, toCurrency: entry.currency, source: AELIA_SOURCE, fetchedAt: parsed.updatedAt },
-        select: { rate: true },
-      })
-      if (existing) {
-        if (new Prisma.Decimal(String(existing.rate)).equals(new Prisma.Decimal(entry.rate))) { unchanged.push(entry.currency); continue }
-        // Same Aelia update time, different rate: two rows at one instant would make the lookup refuse as ambiguous. Refuse here instead and store nothing new.
-        refused.push({ currency: entry.currency, reason: 'changed_without_update', message: `Aelia's rate for ${entry.currency} changed without a new update time` })
-        continue
-      }
-      await tx.fxRate.create({
-        data: { fromCurrency: baseCurrency, toCurrency: entry.currency, rate: entry.rate, source: AELIA_SOURCE, fetchedAt: parsed.updatedAt, manualOverride: false },
-      })
-      written.push(entry.currency)
+  // The latest row of EVERY active foreign currency decides whether it is pinned, including one Aelia's answer omits or refuses: the pin is its rate and the real lookup resolves it.
+  const activeForeign = [...knownByCode].filter(([code, active]) => active && code !== baseCurrency).map(([code]) => code)
+  const latest = await tx.fxRate.findMany({
+    where: { fromCurrency: baseCurrency, toCurrency: { in: activeForeign } },
+    orderBy: [{ toCurrency: 'asc' }, { fetchedAt: 'desc' }],
+    distinct: ['toCurrency'],
+    select: { toCurrency: true, manualOverride: true },
+  })
+  const overridden = new Set(latest.filter((r) => r.manualOverride).map((r) => r.toCurrency))
+  const pinned = activeForeign.filter((code) => overridden.has(code)).sort()
+
+  // The newest stored Aelia row per currency: an update time before it is a regression.
+  const newestAelia = await tx.fxRate.findMany({
+    where: { fromCurrency: baseCurrency, toCurrency: { in: usable.map((u) => u.currency) }, source: AELIA_SOURCE },
+    orderBy: [{ toCurrency: 'asc' }, { fetchedAt: 'desc' }],
+    distinct: ['toCurrency'],
+    select: { toCurrency: true, fetchedAt: true },
+  })
+  const newestByCurrency = new Map(newestAelia.map((r) => [r.toCurrency, r.fetchedAt]))
+  for (const entry of usable) {
+    if (overridden.has(entry.currency)) { skippedManualOverrides.push(entry.currency); continue }
+    const newest = newestByCurrency.get(entry.currency)
+    if (newest && newest.getTime() > parsed.updatedAt.getTime()) {
+      refused.push({ currency: entry.currency, reason: 'aelia_update_regressed', message: `Aelia's update time ${parsed.updatedAt.toISOString()} is earlier than the newest stored Aelia rate for ${entry.currency} (${newest.toISOString()}); nothing was stored` })
+      continue
     }
+    const existing = await tx.fxRate.findFirst({
+      where: { fromCurrency: baseCurrency, toCurrency: entry.currency, source: AELIA_SOURCE, fetchedAt: parsed.updatedAt },
+      select: { rate: true },
+    })
+    if (existing) {
+      if (new Prisma.Decimal(String(existing.rate)).equals(new Prisma.Decimal(entry.rate))) { unchanged.push(entry.currency); readRates[entry.currency] = entry.rate; continue }
+      // Same Aelia update time, different rate: two rows at one instant would make the lookup refuse as ambiguous. Refuse here instead and store nothing new.
+      refused.push({ currency: entry.currency, reason: 'changed_without_update', message: `Aelia's rate for ${entry.currency} changed without a new update time` })
+      continue
+    }
+    await tx.fxRate.create({
+      data: { fromCurrency: baseCurrency, toCurrency: entry.currency, rate: entry.rate, source: AELIA_SOURCE, fetchedAt: parsed.updatedAt, manualOverride: false },
+    })
+    written.push(entry.currency)
+    readRates[entry.currency] = entry.rate
   }
 
-  const have = new Set([...written, ...unchanged, ...skippedManualOverrides])
-  const missing = [...knownByCode].filter(([code, active]) => active && code !== baseCurrency && !have.has(code)).map(([code]) => code).sort()
-  return { updatedAt: parsed.updatedAt, written, unchanged, skippedManualOverrides, refused, markups, missing }
+  const have = new Set([...written, ...unchanged, ...pinned])
+  const missing = activeForeign.filter((code) => !have.has(code)).sort()
+  return { updatedAt: parsed.updatedAt, written, unchanged, skippedManualOverrides, pinned, readRates, refused, markups, missing }
 }
 
 /**
@@ -272,6 +312,8 @@ export async function clearOverrideFromAelia(body: unknown, currency: string, op
     throw new AeliaRefusedError(why?.reason ?? 'not_listed_by_aelia', why?.message ?? `Aelia does not list ${currency}; no rate was stored and none was substituted`)
   }
   await withFxTableWriteLock(async (tx) => {
+    // The source is re-read inside the lock: a switch back to ECB that committed while the store was being read leaves no Aelia row behind.
+    await requireAeliaSourceInTx(tx)
     await tx.fxRate.create({
       data: { fromCurrency: baseCurrency, toCurrency: currency, rate: entry.rate, source: AELIA_SOURCE, fetchedAt: clearedAt, manualOverride: false },
     })

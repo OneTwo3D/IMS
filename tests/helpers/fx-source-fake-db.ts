@@ -40,7 +40,10 @@ export function createFxSourceFakeDb(seed: { currencies?: Array<{ code: string; 
   const fxRate = {
     findMany: async (args: { where?: Record<string, unknown>; orderBy?: unknown; distinct?: string[]; select?: unknown } = {}) => {
       events.push('fxRate.findMany')
-      const matched = rates.filter((r) => matchRate(r, args.where)).sort((a, b) => a.toCurrency.localeCompare(b.toCurrency) || b.fetchedAt.getTime() - a.fetchedAt.getTime())
+      // The order is the query's: toCurrency, then fetchedAt in the direction asked (descending when unspecified), so `distinct` keeps the first row of that order as the database does.
+      const orders = (Array.isArray(args.orderBy) ? args.orderBy : []) as Array<{ fetchedAt?: 'asc' | 'desc' }>
+      const direction = orders.find((o) => o.fetchedAt)?.fetchedAt ?? 'desc'
+      const matched = rates.filter((r) => matchRate(r, args.where)).sort((a, b) => a.toCurrency.localeCompare(b.toCurrency) || (direction === 'asc' ? 1 : -1) * (a.fetchedAt.getTime() - b.fetchedAt.getTime()))
       if (!args.distinct) return matched
       const seen = new Set<string>()
       return matched.filter((r) => (seen.has(r.toCurrency) ? false : (seen.add(r.toCurrency), true)))
