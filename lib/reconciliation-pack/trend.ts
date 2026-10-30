@@ -89,11 +89,17 @@ export function readPackChain(reportDir: string): ChainResult {
     if (entry.sequence !== index + 1) return refuse('GAP', entry.runId)
     if (index > 0 && entry.record.previousReportSha256 !== found[index - 1]!.sha256) return refuse('LINK_BROKEN', entry.runId)
     if (entry.record.systemIdentifier !== found[0]!.record.systemIdentifier) return refuse('SYSTEM_MISMATCH', entry.runId)
+    // A schema version never goes down along the chain: once a report carries the current catalogue, a later one cannot shed an item by claiming the one before it.
+    if (index > 0 && entry.record.schemaVersion < found[index - 1]!.record.schemaVersion) return refuse('SCHEMA_REGRESSED', entry.runId)
   }
   return { ok: true, reports: found, head: found.length ? found[found.length - 1]! : null, unpublishedRuns: unpublished }
 }
 
 /** One item's outcome over the chain, in sequence order. */
 export function itemSeries(reports: readonly ChainEntry[], id: PackItemId): Array<{ sequence: number; outcome: PackOutcome }> {
-  return reports.map((entry) => ({ sequence: entry.sequence, outcome: entry.record.items.find((item) => item.id === id)!.outcome }))
+  // A report published before an item existed does not carry it: it has no outcome for it, which is not a missing value to guess at.
+  return reports.flatMap((entry) => {
+    const item = entry.record.items.find((candidate) => candidate.id === id)
+    return item === undefined ? [] : [{ sequence: entry.sequence, outcome: item.outcome }]
+  })
 }

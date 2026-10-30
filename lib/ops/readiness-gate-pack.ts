@@ -29,7 +29,7 @@ import { lstatSync } from 'node:fs'
 
 import type { CheckResult } from '@/lib/ops/readiness-gate'
 import { PACK_ITEMS, type PackItemId, type ReadinessPhase } from '@/lib/ops/readiness-gate-constants'
-import { PACK_CADENCE_MAX_AGE_MS, PACK_OUTCOMES, getPackItem, itemApplicability, type PackOutcome } from '@/lib/reconciliation-pack/constants'
+import { PACK_CADENCE_MAX_AGE_MS, PACK_ITEM_IDS_BY_SCHEMA, PACK_LEGACY_SCHEMA_VERSION, PACK_OUTCOMES, getPackItem, itemApplicability, type PackOutcome } from '@/lib/reconciliation-pack/constants'
 import type { ReportRecord } from '@/lib/reconciliation-pack/report'
 import { readPackChain } from '@/lib/reconciliation-pack/trend'
 
@@ -107,6 +107,8 @@ export function assessPackItem(read: PackReportRead, id: PackItemId, context: Pa
   if ('none' in read) return unreadable(`${read.none}, so ${id} is not established`)
   if ('untrusted' in read) return unreadable(`${read.untrusted}; ${id} is not established`)
   const record = read.record
+  // A report published under an older catalogue (schema version 1: R1 to R15) never carried an item added later. That is the state the slot had before the item existed (not available), not a malformed report.
+  if (record.schemaVersion === PACK_LEGACY_SCHEMA_VERSION && !(PACK_ITEM_IDS_BY_SCHEMA[PACK_LEGACY_SCHEMA_VERSION] as readonly string[]).includes(id)) return { kind: 'not-available', reason: `${id} was added after reconciliation pack run ${record.runId} was published (schema version ${record.schemaVersion}), so that report does not carry it` }
   const spec = getPackItem(id)
   const problem = reportProblem(record, context, PACK_CADENCE_MAX_AGE_MS[spec.cadence])
     ?? (spec.sources.some((source) => CYCLE_DATED_SOURCES.has(source)) || CYCLE_DATED_ITEMS.has(id) ? cycleDateProblem(record, context, PACK_CADENCE_MAX_AGE_MS[spec.cadence]) : null)

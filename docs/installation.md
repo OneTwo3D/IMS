@@ -1752,7 +1752,7 @@ What this does not cover (the residual): a credential that avoids every listed w
 
 | Field | Appears in | Grammar |
 |---|---|---|
-| schemaVersion | JSON | the integer 1 |
+| schemaVersion | JSON | the integer 2 (a report published before R16 carries the integer 1 and exactly R1 to R15; it stays readable under the rules it was published under) |
 | kind | JSON; proof.kind | reconciliation-pack, compared or proven-empty |
 | runId | JSON, Markdown, directory name, claim file | 8 digits, T, 6 digits, Z, a hyphen and 12 lower-case hex digits |
 | systemIdentifier | JSON, Markdown | 10 to 20 digits: the identifier PostgreSQL itself produces for the cluster |
@@ -1766,7 +1766,7 @@ What this does not cover (the residual): a credential that avoids every listed w
 | later | evidence settling | a list of ISO times in UTC with a trailing Z |
 | count | evidence settling | a whole number equal to the length of later |
 | streams | JSON | at most six stream brackets |
-| items | JSON | exactly sixteen item records, R1 to R16 in order |
+| items | JSON | exactly sixteen item records, R1 to R16 in order (fifteen, R1 to R15, in a schemaVersion 1 report) |
 | evidence | JSON | an object with file, sha256 and lines |
 | proof | JSON items | null, or an object with kind (and source) |
 | sequence | JSON | a positive whole number |
@@ -1906,6 +1906,7 @@ A run is refused, and the trend reader refuses a directory, with exactly one of 
 | FORK | two reports claim the same sequence or the same predecessor |
 | LINK_BROKEN | a report's previousReportSha256 is not the digest of the report before it |
 | SYSTEM_MISMATCH | the chain mixes reports of different system identifiers |
+| SCHEMA_REGRESSED | a report claims an older schema version than the report before it (a pre-R16 report may only precede the first current one, never follow it) |
 | LOCK_HELD | another run holds the run lock (a live holder is never displaced, however old its lock) |
 | LOCK_UNREADABLE | the run lock exists but cannot be read or understood, so it was not taken |
 | LOCK_STALE_CONTENDED | a stale lock is being reclaimed by another run, or a reclaim guard was left behind |

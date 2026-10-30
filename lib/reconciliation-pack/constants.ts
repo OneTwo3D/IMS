@@ -20,7 +20,17 @@ export type { PackItemId } from '@/lib/ops/readiness-gate-constants'
 
 export const PACK_COMMAND = 'npm run reconcile:pack'
 export const PACK_REPORT_KIND = 'reconciliation-pack'
-export const PACK_SCHEMA_VERSION = 1
+/**
+ * The report's own record of which catalogue it was published under is its schemaVersion. Version 2 is the catalogue of sixteen items (R1 to R16); version 1 is
+ * the catalogue before R16 existed (R1 to R15), and a report published then stays valid under THOSE rules: it must carry exactly R1 to R15, never R16. New reports
+ * are always version 2. The two lists are written out, never derived from one another, so a later item cannot silently change what an old report must contain.
+ */
+export const PACK_SCHEMA_VERSION = 2
+export const PACK_LEGACY_SCHEMA_VERSION = 1
+export const PACK_ITEM_IDS_BY_SCHEMA = {
+  1: ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15'],
+  2: ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15', 'R16'],
+} as const satisfies Record<number, readonly PackItemId[]>
 export const PACK_REPORT_JSON = 'reconciliation-pack.json'
 export const PACK_REPORT_MARKDOWN = 'reconciliation-pack.md'
 export const PACK_EVIDENCE_FILE = 'evidence.jsonl'
@@ -159,6 +169,7 @@ export const PACK_CHAIN_CODES = {
   FORK: 'two reports claim the same sequence or the same predecessor',
   LINK_BROKEN: 'a report\'s previousReportSha256 is not the digest of the report before it',
   SYSTEM_MISMATCH: 'the chain mixes reports of different system identifiers',
+  SCHEMA_REGRESSED: 'a report claims an older schema version than the report before it (a pre-R16 report may only precede the first current one, never follow it)',
   LOCK_HELD: 'another run holds the run lock (a live holder is never displaced, however old its lock)',
   LOCK_UNREADABLE: 'the run lock exists but cannot be read or understood, so it was not taken',
   LOCK_STALE_CONTENDED: 'a stale lock is being reclaimed by another run, or a reclaim guard was left behind',
@@ -614,7 +625,7 @@ const CODE = (words: readonly string[]) => new RegExp(`^(?:${words.join('|')})$`
 const HEX64 = /^[0-9a-f]{64}$/
 const ISO_STAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?Z$/
 export const PACK_PUBLISHED_FIELDS: readonly PackPublishedField[] = [
-  { field: 'schemaVersion', where: 'JSON', grammar: 'the integer 1', pattern: null },
+  { field: 'schemaVersion', where: 'JSON', grammar: 'the integer 2 (a report published before R16 carries the integer 1 and exactly R1 to R15; it stays readable under the rules it was published under)', pattern: null },
   { field: 'kind', where: 'JSON; proof.kind', grammar: 'reconciliation-pack, compared or proven-empty', pattern: /^(?:reconciliation-pack|compared|proven-empty)$/ },
   { field: 'runId', where: 'JSON, Markdown, directory name, claim file', grammar: '8 digits, T, 6 digits, Z, a hyphen and 12 lower-case hex digits', pattern: /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/ },
   { field: 'systemIdentifier', where: 'JSON, Markdown', grammar: '10 to 20 digits: the identifier PostgreSQL itself produces for the cluster', pattern: /^[0-9]{10,20}$/ },
@@ -628,7 +639,7 @@ export const PACK_PUBLISHED_FIELDS: readonly PackPublishedField[] = [
   { field: 'later', where: 'evidence settling', grammar: 'a list of ISO times in UTC with a trailing Z', pattern: ISO_STAMP },
   { field: 'count', where: 'evidence settling', grammar: 'a whole number equal to the length of later', pattern: null },
   { field: 'streams', where: 'JSON', grammar: 'at most six stream brackets', pattern: null },
-  { field: 'items', where: 'JSON', grammar: 'exactly sixteen item records, R1 to R16 in order', pattern: null },
+  { field: 'items', where: 'JSON', grammar: 'exactly sixteen item records, R1 to R16 in order (fifteen, R1 to R15, in a schemaVersion 1 report)', pattern: null },
   { field: 'evidence', where: 'JSON', grammar: 'an object with file, sha256 and lines', pattern: null },
   { field: 'proof', where: 'JSON items', grammar: 'null, or an object with kind (and source)', pattern: null },
   { field: 'sequence', where: 'JSON', grammar: 'a positive whole number', pattern: null },

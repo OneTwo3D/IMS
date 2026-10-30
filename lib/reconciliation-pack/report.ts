@@ -28,6 +28,8 @@ import {
   PACK_ITEM_IDS,
   PACK_OUTCOMES,
   PACK_REPORT_KIND,
+  PACK_ITEM_IDS_BY_SCHEMA,
+  PACK_LEGACY_SCHEMA_VERSION,
   PACK_SCHEMA_VERSION,
   PACK_APPLICABILITY,
   SYSTEM_IDENTIFIER_RE,
@@ -103,7 +105,7 @@ export type ItemResult = {
 export type ReportSummary = { pass: number; fail: number; inconclusive: number; notApplicable: number }
 
 export type ReportBody = {
-  schemaVersion: typeof PACK_SCHEMA_VERSION
+  schemaVersion: typeof PACK_SCHEMA_VERSION | typeof PACK_LEGACY_SCHEMA_VERSION
   kind: typeof PACK_REPORT_KIND
   runId: string
   systemIdentifier: string
@@ -514,6 +516,8 @@ export function buildReport(raw: ReportInput, sequence: number, previousReportSh
   const jsonText = `${JSON.stringify(record, null, 2)}\n`
   // The reader's own validation, on the finished text, before anything can be written.
   const parsed = parseReport(jsonText)
+  // The reader still accepts version 1 as history; a report being WRITTEN is never one.
+  if (parsed.schemaVersion !== PACK_SCHEMA_VERSION) throw new ReportInvalid('a new report carries the current schema version')
   verifyEvidence(evidenceText, parsed)
   if (sha256Hex(markdown) !== parsed.companionMarkdownSha256) throw new ReportInvalid('the Markdown does not match its digest')
   return { body, record, jsonText, evidenceText, markdown }
@@ -563,7 +567,10 @@ export function parseReport(text: string): ReportRecord {
   try { raw = JSON.parse(text) } catch { throw new ReportInvalid('the report is not JSON') }
   if (!isRecord(raw)) throw new ReportInvalid('the report is not an object')
   exactKeys(raw, BODY_KEYS, 'the report')
-  if (raw.schemaVersion !== PACK_SCHEMA_VERSION || raw.kind !== PACK_REPORT_KIND) throw new ReportInvalid('wrong schema version or kind')
+  if ((raw.schemaVersion !== PACK_SCHEMA_VERSION && raw.schemaVersion !== PACK_LEGACY_SCHEMA_VERSION) || raw.kind !== PACK_REPORT_KIND) throw new ReportInvalid('wrong schema version or kind')
+  // The catalogue the report was published under is the one its schemaVersion names: version 1 is exactly R1 to R15 (before R16), version 2 exactly R1 to R16. A mixture is refused.
+  const schemaVersion = raw.schemaVersion
+  const expectedIds: readonly PackItemId[] = PACK_ITEM_IDS_BY_SCHEMA[schemaVersion]
   if (typeof raw.runId !== 'string' || !RUN_ID_RE.test(raw.runId)) throw new ReportInvalid('bad runId')
   if (typeof raw.systemIdentifier !== 'string' || !SYSTEM_IDENTIFIER_RE.test(raw.systemIdentifier)) throw new ReportInvalid('bad systemIdentifier')
   if (typeof raw.phase !== 'string' || !(PHASES as readonly string[]).includes(raw.phase)) throw new ReportInvalid('bad phase')
@@ -585,12 +592,12 @@ export function parseReport(text: string): ReportRecord {
   })
   if (new Set(streams.map((s) => s.stream)).size !== streams.length) throw new ReportInvalid('a stream is repeated')
 
-  if (!Array.isArray(raw.items) || raw.items.length !== PACK_ITEM_IDS.length) throw new ReportInvalid('the report must carry R1 to R16')
+  if (!Array.isArray(raw.items) || raw.items.length !== expectedIds.length) throw new ReportInvalid(`the report must carry R1 to ${expectedIds[expectedIds.length - 1]!} (schema version ${schemaVersion})`)
   const items: ItemResult[] = raw.items.map((entry: unknown, index: number) => {
     if (!isRecord(entry)) throw new ReportInvalid('bad item')
     exactKeys(entry, ITEM_KEYS, 'an item')
-    const id = PACK_ITEM_IDS[index]!
-    if (entry.id !== id) throw new ReportInvalid('items are not R1 to R16 in order')
+    const id = expectedIds[index]!
+    if (entry.id !== id) throw new ReportInvalid(`items are not R1 to ${expectedIds[expectedIds.length - 1]!} in order`)
     const applicability = itemApplicability(id, phase)
     if (entry.applicability !== applicability || !(PACK_APPLICABILITY as readonly string[]).includes(entry.applicability as string)) throw new ReportInvalid(`item ${id}: applicability does not match the catalogue`)
     if (typeof entry.outcome !== 'string' || !(PACK_OUTCOMES as readonly string[]).includes(entry.outcome)) throw new ReportInvalid(`item ${id}: bad outcome`)
@@ -631,7 +638,7 @@ export function parseReport(text: string): ReportRecord {
   if (raw.evidence.lines !== items.reduce((sum, item) => sum + item.evidenceLines, 0)) throw new ReportInvalid('the evidence line count does not match the items')
 
   return {
-    schemaVersion: PACK_SCHEMA_VERSION, kind: PACK_REPORT_KIND, runId: raw.runId, systemIdentifier: raw.systemIdentifier, phase, asOf: raw.asOf,
+    schemaVersion, kind: PACK_REPORT_KIND, runId: raw.runId, systemIdentifier: raw.systemIdentifier, phase, asOf: raw.asOf,
     startedAt: raw.startedAt, finishedAt: raw.finishedAt, sequence: raw.sequence, previousReportSha256: raw.previousReportSha256 as string | null,
     streams, items, summary, exitCode: raw.exitCode, evidence: { file: PACK_EVIDENCE_FILE, sha256: raw.evidence.sha256, lines: raw.evidence.lines },
     companionMarkdownSha256: raw.companionMarkdownSha256,
@@ -664,6 +671,7 @@ export function verifyEvidence(text: string, record: ReportRecord): void {
     if (typeof fields.item !== 'string' || !(PACK_ITEM_IDS as readonly string[]).includes(fields.item)) throw new ReportInvalid('an evidence line names an unknown item')
     if (typeof fields.bucket !== 'string' || !(LISTED_BUCKETS as readonly string[]).includes(fields.bucket)) throw new ReportInvalid('an evidence line names an unknown bucket')
     const id = fields.item as PackItemId
+    if (!record.items.some((item) => item.id === id)) throw new ReportInvalid(`an evidence line names ${id}, which this report (schema version ${record.schemaVersion}) does not carry`)
     const bucket = fields.bucket as ComparisonBucket
     let entry: CleanEntry
     try {
