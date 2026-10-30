@@ -408,3 +408,25 @@ test('A STORE THAT CANNOT BE READ is a refusal, never an empty store: the previe
     assert.deepEqual(await w.counts(), { writes: 0, mappings: 4, shadows: 0 })
   })
 })
+
+test('ADOPTION of a drifted rate rewrites its snapshot from the live rate (percent 18 -> 19) and the writer then plans from it; a malformed digest is refused', SKIP, async (t) => {
+  await withWorld(t, async (w) => {
+    w.store.rates.set(w.woo.w2, woo(w.woo.w2, { name: 'DE VAT', country: 'DE', rate: '19.0000' })) // hand-corrected after the snapshot (18)
+    const before = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
+    assert.ok(before.findings.some((f) => f.code === 'RE_ADOPTION_REQUIRED' && f.wooId === w.woo.w2))
+    const plan = (await w.m.writer.readWooAdoptionPlan(w.deps(LIVE))).plan!
+    assert.deepEqual(plan.rows.map((x) => `${x.wooId}:${x.reason}`), [`${w.woo.w2}:SNAPSHOT_DIFFERS`])
+    for (const confirm of ['', 'abc', plan.digest.toUpperCase(), plan.digest.slice(1), `${plan.digest}0`]) {
+      assert.deepEqual(await w.m.writer.applyWooAdoption(w.deps(LIVE), { confirm }), { outcome: 'REFUSED', code: 'CONFIRM_REQUIRED', plan: null }, confirm)
+    }
+    assert.equal((await mappingOf(w, w.woo.w2))?.externalRatePct.toFixed(4), '18.0000', 'nothing was stamped by a refused adoption')
+    assert.equal((await w.m.writer.applyWooAdoption(w.deps(LIVE), { confirm: plan.digest })).outcome, 'ADOPTED')
+    const row = await mappingOf(w, w.woo.w2)
+    assert.equal(row?.externalRatePct.toFixed(4), '19.0000', 'the snapshot is the live rate')
+    assert.equal(row?.storeIdentity, 'https://store.example')
+    const after = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
+    assert.ok(!after.findings.some((f) => f.code === 'RE_ADOPTION_REQUIRED'))
+    assert.ok(!after.changes.some((c) => c.kind === 'UPDATE' && c.wooId === w.woo.w2), 'live 19 equals IMS 19: nothing to update')
+    assert.deepEqual(w.store.calls, [])
+  })
+})
