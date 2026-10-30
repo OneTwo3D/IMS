@@ -112,7 +112,7 @@ test('two ADOPTIONS at once: the second waits on the same lock and then has noth
       const [a, b] = await Promise.all([first, second])
       assert.equal(a.outcome, 'ADOPTED')
       assert.equal(b.outcome, 'NOTHING_TO_DO')
-      assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT' } }), 4, 'one ADOPT record per row, not two')
+      assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT', imsTaxRateId: { in: Object.values(w.ids) } } }), 4, 'one ADOPT record per row, not two')
     } finally {
       release()
       await Promise.allSettled([first, second])

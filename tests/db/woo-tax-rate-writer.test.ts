@@ -319,7 +319,7 @@ test('ADOPTION: legacy rows (no store identity) are findings until the operator 
     assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT', planDigest: plan.digest, status: 'APPLIED', storeIdentity: 'https://store.example' } }), 4)
     const again = await w.m.writer.applyWooAdoption(w.deps(LIVE), { confirm: plan.digest })
     assert.equal(again.outcome, 'NOTHING_TO_DO')
-    assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT' } }), 4)
+    assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT', imsTaxRateId: { in: Object.values(w.ids) } } }), 4)
     // and now the writer has its ordinary work again; an ADOPT record owns nothing by itself
     const after = (await w.m.writer.readWooTaxPlan(w.deps(LIVE))).plan!
     assert.deepEqual(after.changes.map((c) => c.key), expectedKeys(w))
@@ -340,7 +340,7 @@ test('ADOPTION also re-stamps a rate that drifted from its snapshot, in ONE tran
     const r = await w.m.writer.applyWooAdoption(racing, { confirm: two.digest })
     assert.deepEqual(r, { outcome: 'REFUSED', code: 'ADOPTION_FAILED', plan: two })
     assert.equal((await mappingOf(w, w.woo.w1))?.storeIdentity, null, 'the other stamp was rolled back with it')
-    assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT' } }), 0)
+    assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'ADOPT', imsTaxRateId: { in: Object.values(w.ids) } } }), 0)
   })
 })
 
@@ -381,7 +381,7 @@ test('UNRECORDED: a mapping row re-pointed at another IMS rate (or stamped for a
       const r = await w.m.writer.applyWooTaxPlan({ ...w.deps(LIVE), port }, { confirm: plan.digest })
       assert.equal(r.outcome === 'DONE' ? r.unrecorded?.key : r.outcome, `delete:${w.woo.w4}`, tamper)
       assert.equal(w.store.calls.length, 1, tamper)
-      assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'DELETE' } }), 0, tamper)
+      assert.equal(await w.m.db.wooTaxRateWrite.count({ where: { kind: 'DELETE', imsTaxRateId: { in: Object.values(w.ids) } } }), 0, tamper)
     })
   }
 })
