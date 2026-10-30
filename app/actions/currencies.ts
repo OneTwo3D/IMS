@@ -527,7 +527,7 @@ export async function setFxRateSource(source: string): Promise<{ success: boolea
         // And what each unpinned currency resolves to must be THIS read's rate and time, not some other stored row.
         const differing = cutoverReadMismatches(outcomes, aeliaResult)
         if (differing.length) {
-          throw new FxCutoverRefusedError(`After the switch these currencies would resolve to something other than this Aelia read: ${differing.join(', ')}; the source was not changed (it is still ECB and nothing was stored).`)
+          throw new FxCutoverRefusedError(`After the switch these currencies would not resolve as this Aelia read and the pins say (an unpinned one to this read's rate and time, a pinned one to its manual override): ${differing.join(', ')}; the source was not changed (it is still ECB and nothing was stored).`)
         }
         await tx.setting.upsert({ where: { key: 'fx_aelia_last_update_at' }, create: { key: 'fx_aelia_last_update_at', value: aeliaResult.updatedAt.toISOString() }, update: { value: aeliaResult.updatedAt.toISOString() } })
         await tx.setting.upsert({ where: { key: 'fx_aelia_last_read_at' }, create: { key: 'fx_aelia_last_read_at', value: switchedAt.toISOString() }, update: { value: switchedAt.toISOString() } })

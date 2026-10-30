@@ -249,10 +249,11 @@ export async function ingestAeliaRatesInTx(tx: FxTx, body: unknown, options: { n
   const skippedManualOverrides: string[] = []
   const readRates: Record<string, string> = {}
 
-  // The latest row of EVERY active foreign currency decides whether it is pinned, including one Aelia's answer omits or refuses: the pin is its rate and the real lookup resolves it.
+  // The latest row IN FORCE AT `now` (the cutover instant, or the instant of the refresh: the lookup ignores a row dated after its asOf) of EVERY active foreign currency decides whether it is pinned,
+  // including one Aelia's answer omits or refuses: the pin is its rate and the real lookup resolves it. A manual row dated in the future is no pin yet.
   const activeForeign = [...knownByCode].filter(([code, active]) => active && code !== baseCurrency).map(([code]) => code)
   const latest = await tx.fxRate.findMany({
-    where: { fromCurrency: baseCurrency, toCurrency: { in: activeForeign } },
+    where: { fromCurrency: baseCurrency, toCurrency: { in: activeForeign }, fetchedAt: { lte: now } },
     orderBy: [{ toCurrency: 'asc' }, { fetchedAt: 'desc' }],
     distinct: ['toCurrency'],
     select: { toCurrency: true, manualOverride: true },

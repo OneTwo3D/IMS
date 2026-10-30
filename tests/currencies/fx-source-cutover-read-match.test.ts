@@ -68,6 +68,14 @@ test('a cutover whose resolved rate or time differs from THIS read is refused an
   tamper = (code, o) => (code === 'USD' ? { ...o, rate: new Prisma.Decimal('9') } : o)
   assert.deepEqual(await setFxRateSource('aelia'), { success: true })
 
+  // a currency LABELLED pinned whose lookup resolves a non-override is refused and named
+  fake = createFxSourceFakeDb({ currencies: ACTIVE, rates: [...seed(), ecbRow('USD', '1.40', { fetchedAt: new Date('2026-10-26T00:00:00Z'), manualOverride: true })] })
+  tamper = (code, o) => (code === 'USD' ? { ...o, manualOverride: false, source: 'aelia' } : o)
+  const label = await setFxRateSource('aelia')
+  assert.equal(label.success, false)
+  assert.match(label.error ?? '', /USD \(counted as pinned/)
+  assert.equal(fake.settings.has('fx_rate_source'), false)
+
   // CONTROL: untouched lookup commits
   fake = createFxSourceFakeDb({ currencies: ACTIVE, rates: seed() })
   tamper = null
@@ -76,11 +84,15 @@ test('a cutover whose resolved rate or time differs from THIS read is refused an
 
 test('cutoverReadMismatches: equal rate (any trailing zeros) and time agree; a currency not in the read, a different rate or a different time is reported; pinned and failed outcomes are skipped', () => {
   const at = new Date('2026-10-23T23:36:05Z')
-  type Outcome = { ok: true; rate: Prisma.Decimal; fetchedAt: Date } | { ok: false }
-  const ok = (rate: string, fetchedAt = at): Outcome => ({ ok: true, rate: new Prisma.Decimal(rate), fetchedAt })
+  type Outcome = { ok: true; rate: Prisma.Decimal; fetchedAt: Date; manualOverride: boolean } | { ok: false }
+  const ok = (rate: string, fetchedAt = at, manualOverride = false): Outcome => ({ ok: true, rate: new Prisma.Decimal(rate), fetchedAt, manualOverride })
   const failed: Outcome = { ok: false }
   const read = { updatedAt: at, readRates: { EUR: '1.1900', NOK: '12.5' }, pinned: ['USD'] }
-  assert.deepEqual(cutoverReadMismatches(new Map<string, Outcome>([['EUR', ok('1.19')], ['NOK', ok('12.5')], ['USD', ok('9')], ['SEK', failed]]), read), [])
+  assert.deepEqual(cutoverReadMismatches(new Map<string, Outcome>([['EUR', ok('1.19')], ['NOK', ok('12.5')], ['USD', ok('9', at, true)], ['SEK', failed]]), read), [])
+  // a currency LABELLED pinned that resolves to a non-override is a disagreement
+  const unpinnedLookup = cutoverReadMismatches(new Map<string, Outcome>([['USD', ok('1.3')]]), read)
+  assert.equal(unpinnedLookup.length, 1)
+  assert.match(unpinnedLookup[0], /^USD \(counted as pinned/)
   const bad = cutoverReadMismatches(new Map<string, Outcome>([['EUR', ok('1.2')], ['NOK', ok('12.5', new Date('2026-10-23T23:36:06Z'))], ['CHF', ok('1')]]), read)
   assert.equal(bad.length, 3)
   assert.match(bad[0], /^EUR/)

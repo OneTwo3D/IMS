@@ -308,3 +308,21 @@ test('a REGRESSED Aelia update time (older than a stored Aelia row) refuses the 
   reset([...ECB_ROWS(), ecbRow('EUR', '1.194344', '2026-10-23T23:36:05Z', { source: 'aelia' })])
   assert.deepEqual(await setFxRateSource('aelia'), { success: true })
 })
+
+test('A manual row DATED IN THE FUTURE is no pin: with an older Aelia row and USD omitted the switch is refused (the lookup would resolve the old Aelia row); once the row is in force it pins', async () => {
+  const { setFxRateSource } = await import('@/app/actions/currencies')
+  const future = new Date(Date.now() + 86_400_000).toISOString()
+  reset([...ECB_ROWS(), ecbRow('USD', '1.2', '2026-10-01T00:00:00Z', { source: 'aelia' }), ecbRow('USD', '1.40', future, { manualOverride: true })])
+  readImpl = async () => ({ ok: true, body: answerWithout('USD') })
+  const refused = await setFxRateSource('aelia')
+  assert.equal(refused.success, false)
+  assert.match(refused.error ?? '', /USD/)
+  assert.equal(fake.settings.has('fx_rate_source'), false)
+  assert.ok(fake.events.includes('tx.rollback'))
+  // the same row IN FORCE (dated before the cutover instant) is a valid pin: the switch commits and USD resolves through it
+  reset([...ECB_ROWS(), ecbRow('USD', '1.2', '2026-10-01T00:00:00Z', { source: 'aelia' }), ecbRow('USD', '1.40', '2026-10-26T00:00:00Z', { manualOverride: true })])
+  readImpl = async () => ({ ok: true, body: answerWithout('USD') })
+  assert.deepEqual(await setFxRateSource('aelia'), { success: true })
+  const usd = (await resolveNow(new Date())).get('USD')
+  assert.ok(usd?.ok && usd.manualOverride && usd.rate.toString() === '1.4')
+})

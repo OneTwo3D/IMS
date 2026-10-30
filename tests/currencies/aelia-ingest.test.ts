@@ -360,3 +360,20 @@ test('SOURCE RE-CHECK: clearOverrideFromAelia after the switch back to ECB is re
   assert.deepEqual(await clearOverrideFromAelia(aeliaAnswer(), 'EUR', { now: NOW }), { rate: '1.194344', markup: '0.02' })
   assert.equal(fake.rates.length, 2)
 })
+
+test('PINS ARE JUDGED AT THE READ\'S INSTANT: a manual row dated after `now` is no pin (omitted: missing; listed: Aelia\'s row is written); a row dated at or before it is', async () => {
+  const { ingestAeliaRates } = await load()
+  const future = pinRow('USD', '1.4', '2026-10-30T00:00:00Z') // NOW is 2026-10-24T08:00
+  reset({ rates: [aeliaRow('USD', '1.2', '2026-10-01T00:00:00Z'), future] })
+  const omitted = await ingestAeliaRates(answerWithout('USD'), { now: NOW })
+  assert.deepEqual(omitted.pinned, [])
+  assert.deepEqual(omitted.missing, ['USD'])
+  reset({ rates: [aeliaRow('USD', '1.2', '2026-10-01T00:00:00Z'), future] })
+  const listed = await ingestAeliaRates(aeliaAnswer(), { now: NOW })
+  assert.deepEqual(listed.pinned, [])
+  assert.deepEqual(listed.skippedManualOverrides, [])
+  assert.ok(listed.written.includes('USD'), 'the refresh stores Aelia\'s rate for it: the future row is not in force')
+  // in force exactly at `now`
+  reset({ rates: [pinRow('USD', '1.4', NOW.toISOString())] })
+  assert.deepEqual((await ingestAeliaRates(answerWithout('USD'), { now: NOW })).pinned, ['USD'])
+})
