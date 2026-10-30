@@ -1,13 +1,14 @@
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getAccountingSettings, getActiveAccountingConnectorInfo, getAccountingSettingsFor } from '@/lib/accounting'
-import { AccountBalanceMovementWithheldError, balanceDateString, findLatestConfiguredAccountBalanceSnapshot } from './account-balance-snapshots'
+import { AccountBalanceMovementWithheldError, balanceDateString, findLatestConfiguredAccountBalanceSnapshot, glLegProvenance } from './account-balance-snapshots'
 import {
   DEFAULT_GL_SWEEP_LIMIT,
   buildAccountReconciliationSweepJournal,
   evaluateAccountGlReconciliation,
   type AccountGlReconciliation,
   type AccountGlReconciliationAction,
+  type GlLegProvenance,
   type AccountReconciliationSweepJournal,
 } from './account-gl-reconciliation'
 
@@ -61,12 +62,13 @@ export type InventoryGlReconciliationUnavailableReason =
   | 'no_account_configured'
   | 'no_gl_snapshot'
   | 'account_identity_unproven'
+  | 'gl_balance_unproven'
   | 'no_subledger_snapshot'
   | 'unreliable_subledger_snapshot'
 
 export type InventoryGlReconciliationResult =
   | { available: false; reason: InventoryGlReconciliationUnavailableReason }
-  | ({ available: true; balanceDate: string } & InventoryGlReconciliation)
+  | ({ available: true; balanceDate: string; /** Where each of the two stored balances came from; `proven-absent` is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is. */ glProvenance?: Record<string, GlLegProvenance> } & InventoryGlReconciliation)
 
 /**
  * Load the inventory GL reconciliation as of the latest synced GL balance date:
@@ -131,7 +133,7 @@ export async function loadInventoryGlReconciliation(options?: {
       currency,
     })
   } catch (error) {
-    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: 'account_identity_unproven' }
+    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: error.reason === 'balance_provenance_unproven' ? 'gl_balance_unproven' : 'account_identity_unproven' }
     throw error
   }
   const balanceDate = inventorySnapshot.balanceDate
@@ -169,6 +171,8 @@ export async function loadInventoryGlReconciliation(options?: {
   return {
     available: true,
     balanceDate: balanceDateString(balanceDate),
+    // Both legs passed the provenance check in the reader: each is a balance Xero reported or a proven-absent zero, and says which.
+    glProvenance: { inventory: glLegProvenance(inventorySnapshot), allocated: glLegProvenance(allocatedSnapshot) },
     ...evaluateInventoryGlReconciliation({
       subledgerValue,
       glBalance,

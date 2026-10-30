@@ -1,3 +1,4 @@
+import { xeroTrialBalanceRef } from '@/lib/connectors/xero/account-balance-refs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -9,11 +10,14 @@ import {
   MissingAccountBalanceSnapshotError,
   normalizeBalanceDate,
   persistAccountingAccountBalanceSnapshots,
+  storedBalanceProvenance,
+  glLegProvenance,
   type AccountingAccountBalanceSnapshotRow,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
 function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): AccountingAccountBalanceSnapshotRow {
+  const balanceDate = overrides.balanceDate ?? new Date('2026-06-01T00:00:00.000Z')
   return {
     id: 'snapshot',
     connector: 'xero',
@@ -24,7 +28,8 @@ function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): 
     currency: 'GBP',
     amountForeign: toDecimal('0'),
     amountBase: toDecimal('0'),
-    sourcePayloadRef: null,
+    // a Xero-reported row, labelled for its own date (the readers take only a balance that proves its provenance)
+    sourcePayloadRef: xeroTrialBalanceRef(balanceDate.toISOString().slice(0, 10), 'reported'),
     tenantId: null,
     financialYearEnd: null,
     parserVersion: 2,
@@ -497,7 +502,7 @@ test('PARSER VERSION: a re-pulled balance (upsert overwrites the version) is use
   const client = snapshotClient(oldParser(windowRows('2026-05-31', '2026-06-30'), 'both'), { accountType: 'INVENTORY' })
   await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never), MissingAccountBalanceSnapshotError)
   for (const row of client.rows) {
-    await persistAccountingAccountBalanceSnapshots([{ connector: row.connector, externalAccountId: row.externalAccountId, accountCode: row.accountCode, accountName: row.accountName, balanceDate: row.balanceDate, currency: row.currency, amountForeign: row.amountBase, amountBase: row.amountBase, tenantId: row.tenantId, parserVersion: 2 }], client as never)
+    await persistAccountingAccountBalanceSnapshots([{ connector: row.connector, externalAccountId: row.externalAccountId, accountCode: row.accountCode, accountName: row.accountName, balanceDate: row.balanceDate, currency: row.currency, amountForeign: row.amountBase, amountBase: row.amountBase, sourcePayloadRef: row.sourcePayloadRef, tenantId: row.tenantId, parserVersion: 2 }], client as never)
   }
   assert.equal((await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), client as never)).movementBase.toFixed(2), '-860.00')
 })
@@ -506,4 +511,37 @@ test('PARSER VERSION: persist stores no version unless the caller names one (so 
   const client = snapshotClient()
   await persistAccountingAccountBalanceSnapshots([{ connector: 'xero', externalAccountId: 'a', accountName: 'x', balanceDate: '2026-06-30', currency: 'GBP', amountForeign: '1', amountBase: '1' }], client as never)
   assert.equal(client.rows[0]!.parserVersion, null)
+})
+
+// [mutation: the provenance check dropped / a legacy zero accepted / the date of the reference not matched / the amount of a proven zero not checked / the parser version not checked]
+test('PROVENANCE: only a reported row or a date-matched proven-absent zero at parser version 2 is a balance; everything else is unproven', () => {
+  const at = (ref: string | null, over: Partial<AccountingAccountBalanceSnapshotRow> = {}) => makeSnapshot({ balanceDate: new Date('2026-06-30T00:00:00.000Z'), sourcePayloadRef: ref, ...over })
+  const day = '2026-06-30'
+  assert.equal(storedBalanceProvenance(at(xeroTrialBalanceRef(day, 'reported'), { amountBase: toDecimal('5') })), 'reported')
+  assert.equal(storedBalanceProvenance(at(xeroTrialBalanceRef(day, 'proven-absent'))), 'proven-absent')
+  assert.equal(glLegProvenance(at(xeroTrialBalanceRef(day, 'proven-absent'))), 'proven-absent')
+  assert.equal(glLegProvenance(at(xeroTrialBalanceRef(day, 'reported'))), 'reported')
+  const unproven: Array<[string, AccountingAccountBalanceSnapshotRow]> = [
+    ['legacy absent-from-tb zero', at(xeroTrialBalanceRef(day, 'absent'))],
+    ['no reference', at(null)],
+    ['unknown reference', at('xero:trial-balance:2026-06-30:something')],
+    ['another date\'s reported reference', at(xeroTrialBalanceRef('2026-06-29', 'reported'))],
+    ['another date\'s proven reference', at(xeroTrialBalanceRef('2026-06-29', 'proven-absent'))],
+    ['a proven reference over a non-zero amount', at(xeroTrialBalanceRef(day, 'proven-absent'), { amountBase: toDecimal('0.01') })],
+    ['a reported reference at another parser version', at(xeroTrialBalanceRef(day, 'reported'), { parserVersion: 1 })],
+    ['a proven reference with no parser version', at(xeroTrialBalanceRef(day, 'proven-absent'), { parserVersion: null })],
+  ]
+  for (const [name, row] of unproven) assert.equal(storedBalanceProvenance(row), 'unproven', name)
+})
+
+test('PROVENANCE: a movement is withheld by name when either leg is a legacy unproven zero, and differences a proven-absent zero opening', async () => {
+  const rowsWith = (openingRef: string, closingRef: string) => windowRows('2026-05-31', '2026-06-30').map((row, i) => ({ ...row, sourcePayloadRef: i === 0 ? openingRef : closingRef, ...(i === 0 ? { amountBase: toDecimal('0'), amountForeign: toDecimal('0') } : {}) }))
+  const legacyOpening = snapshotClient(rowsWith(xeroTrialBalanceRef('2026-05-31', 'absent'), xeroTrialBalanceRef('2026-06-30', 'reported')), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), legacyOpening as never), (e) => e instanceof AccountBalanceMovementWithheldError && e.reason === 'balance_provenance_unproven')
+  const legacyClosing = snapshotClient(rowsWith(xeroTrialBalanceRef('2026-05-31', 'reported'), xeroTrialBalanceRef('2026-06-30', 'absent')), { accountType: 'INVENTORY' })
+  await assert.rejects(() => getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), legacyClosing as never), (e) => e instanceof AccountBalanceMovementWithheldError && e.reason === 'balance_provenance_unproven')
+  const proven = snapshotClient(rowsWith(xeroTrialBalanceRef('2026-05-31', 'proven-absent'), xeroTrialBalanceRef('2026-06-30', 'reported')), { accountType: 'INVENTORY' })
+  const movement = await getAccountBalancePeriodMovement(lookup('2026-06-01', '2026-06-30'), proven as never)
+  assert.equal(movement.movementBase.toFixed(2), '40.00')
+  assert.equal(glLegProvenance(movement.opening), 'proven-absent')
 })

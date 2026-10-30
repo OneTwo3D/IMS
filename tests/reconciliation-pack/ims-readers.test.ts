@@ -114,6 +114,19 @@ test('a row that cannot be read exactly makes its WHOLE section unreadable with 
   }
 })
 
+test('a product type outside the ProductType enum is never classed untracked: the stock section is unreadable', async () => {
+  for (const [name, type] of [['a new stock-bearing type', 'BUNDLE'], ['lower case of a known type', 'simple'], ['empty', ''], ['null', null], ['not text', 5]] as const) {
+    const read = await readImsSnapshot(fake(() => [stockRow(), stockRow({ id: 'sl2', product_id: 'p2', sku: 'A2', product_type: type })]), { sections: ['stock'] })
+    assert.ok(read.ok, name)
+    assert.deepEqual(read.sections.stock, { ok: false, reason: 'SOURCE_UNREADABLE' }, name)
+  }
+  // every real enum value stays readable: the known no-stock types are listed, never an error
+  const real = await readImsSnapshot(fake(() => ['SIMPLE', 'VARIABLE', 'VARIANT', 'KIT', 'BOM', 'NON_INVENTORY'].map((t, i) => stockRow({ id: `s${i}`, product_id: `p${i}`, sku: `K${i}`, product_type: t }))), { sections: ['stock'] })
+  assert.ok(real.ok && real.sections.stock!.ok)
+  const stock = real.ok ? real.sections.stock : undefined
+  if (stock?.ok) assert.equal(stock.value.tracked.length + stock.value.untracked.length, 6)
+})
+
 test('duplicate identities are DUPLICATE_KEY: the same stock level id, the same product and warehouse, the same sku', async () => {
   const dup = async (sections: Parameters<typeof readImsSnapshot>[1]['sections'], rows: Array<Record<string, unknown>>) => (await readImsSnapshot(fake(() => rows), { sections }) as Extract<Awaited<ReturnType<typeof readImsSnapshot>>, { ok: true }>).sections
   assert.deepEqual((await dup(['stock'], [stockRow(), stockRow()])).stock, { ok: false, reason: 'DUPLICATE_KEY' })

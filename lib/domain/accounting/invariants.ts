@@ -1283,6 +1283,7 @@ export async function runAccountingInvariantReport(options: {
       message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
       details: {
         balanceDate: inventoryReconciliation.balanceDate,
+        glProvenance: inventoryReconciliation.glProvenance ?? null,
         glBalance: inventoryReconciliation.glBalance,
         subledgerValue: inventoryReconciliation.subledgerValue,
         delta: inventoryReconciliation.delta,
@@ -1304,6 +1305,7 @@ export async function runAccountingInvariantReport(options: {
       message: `GL COGS movement (${cogsReconciliation.glBalance.toFixed(2)}) does not reconcile to the COGS subledger movement (${cogsReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
       details: {
         balanceDate: cogsReconciliation.balanceDate,
+        glProvenance: cogsReconciliation.glProvenance ?? null,
         glBalance: cogsReconciliation.glBalance,
         subledgerValue: cogsReconciliation.subledgerValue,
         delta: cogsReconciliation.delta,
@@ -1326,6 +1328,7 @@ export async function runAccountingInvariantReport(options: {
       message: `GL transit movement (${transitReconciliation.glBalance.toFixed(2)}) does not reconcile to the transit subledger movement (${transitReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
       details: {
         balanceDate: transitReconciliation.balanceDate,
+        glProvenance: transitReconciliation.glProvenance ?? null,
         glBalance: transitReconciliation.glBalance,
         subledgerValue: transitReconciliation.subledgerValue,
         delta: transitReconciliation.delta,

@@ -8,7 +8,7 @@ import type { ImsRead, ImsReadOptions, ImsTransitSchedule, TransitNetRow, Transi
 import { runLedgerItem, type LedgerItemContext } from '../../lib/reconciliation-pack/ledger-items.ts'
 import { TRANSIT_SOURCE_DOCUMENTS } from '../../lib/reconciliation-pack/ims-readers.ts'
 import { buildTransitSchedule, TRANSIT_BALANCE_TOKEN } from '../../lib/reconciliation-pack/transit-schedule.ts'
-import { CODES, D, REF_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
+import { CODES, D, REF_ABSENT, REF_PROVEN_ABSENT, cleanBracket, dateOf, fakeRun, goodState, type FakeState } from './basis-fixtures.ts'
 
 /**
  * R11 over the REAL settled basis (the stored transit balance of D is 50 in the shared fixture) and a double of the IMS transit schedule.
@@ -161,6 +161,15 @@ test('R11: a transit balance that is the zero the pull synthesised for an accoun
   const { item, port } = await r11(section({ net: [], orders: [], openOrders: [] }), state)
   assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['GL_LEG_ABSENT']])
   assert.equal(port.calls.length, 0)
+})
+
+// [mutation: R11 insisting on trial-balance-row provenance]
+test('R11: a transit zero the pull stored under the completeness proof is a real zero and is compared (an empty schedule passes)', async () => {
+  const state = goodState()
+  state.gl = state.gl.map((r) => (r.accountCode === CODES.transit ? { ...r, amountBase: '0', sourcePayloadRef: r.balanceDate.getTime() === dateOf(D).getTime() ? REF_PROVEN_ABSENT(D) : r.sourcePayloadRef } : r))
+  const { item } = await r11(section({ net: [], orders: [], openOrders: [] }), state)
+  assert.notDeepEqual(item.reasons, ['GL_LEG_ABSENT'])
+  assert.equal(item.outcome, 'pass')
 })
 
 // [mutation: the phase check removed / the read made before it]

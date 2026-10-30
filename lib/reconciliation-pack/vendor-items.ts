@@ -31,8 +31,9 @@
  *        master; the xero-tax-rate-drift sweep replaces it whole), read in the same snapshot as the IMS rates for the organisation now
  *        connected, and it counts only when the header row proves it is one complete read (present for that organisation, its count
  *        equal to the rows read, its digest equal to the rows'); otherwise the Xero leg is VENDOR_LIST_UNPROVEN. No request is made to
- *        Xero. A WooCommerce leg with a finding is still a FAIL (it is true whatever the Xero leg says), and it
- *        carries VENDOR_LIST_UNPROVEN beside DIFFERENCES; a clean WooCommerce leg with an unproven Xero leg is inconclusive, never a pass.
+ *        Xero. With an unproven Xero list the Woo-IMS identity checks still run (mapping presence and the set identity between the two systems, with no Xero
+ *        rule); a difference they establish (Woo 20% against IMS 19%) is still a FAIL (it is true whatever the Xero leg says), and it
+ *        carries VENDOR_LIST_UNPROVEN beside DIFFERENCES; a clean Woo-IMS result with an unproven Xero leg is inconclusive, never a pass.
  *
  * R9 SETTLES (owner decision D7): a difference first seen is UNSETTLED (inconclusive UNSETTLED_PENDING), and fails only when it is still
  * there after two LATER successful runs of the order sweep stream, counted as distinct last-success stamps carried in the pack's own
@@ -253,8 +254,23 @@ async function runR13(context: VendorItemContext): Promise<ItemInput> {
   const xeroSection = read.sections.xeroTaxRates
   const stored = xeroSection !== undefined && xeroSection.ok ? xeroSection.value : null
   if (stored === null || stored.state !== 'proven') {
-    // The WooCommerce leg alone cannot pass the item, but a finding in it is a finding.
-    const leg = compareItem('R13', { ims: imsWoo, vendor: vendorWoo, imsComplete: true, vendorComplete: true, emptyProof: walked.value.total === 0 ? 'vendor-total-zero' : undefined })
+    // The Xero leg cannot be judged, so R13 can never pass; but the WooCommerce-to-IMS identity needs no Xero list, so it is judged anyway
+    // (mapping presence AND the set identity between the two systems that ARE proven: a Woo 20% against an IMS 19% is a finding whatever
+    // state the Xero list is in). An established difference fails the item with VENDOR_LIST_UNPROVEN beside it; otherwise it is inconclusive.
+    const imsLeg = [...imsWoo]
+    const vendorLeg = [...vendorWoo]
+    const legPopulation = new Set<string>()
+    for (const row of [...imsWoo, ...vendorWoo]) legPopulation.add(canonicalKey(row.key))
+    for (const row of compareVatSetIdentity({ woo: walked.value.rates, rates, mappings, componentRates: section.value.componentRates, xero: null })) {
+      // With the Xero leg skipped there is no Xero row, and the only IMS-row reason left is MISSING_IN_WOO.
+      const keys = row.reasons.length === 0 ? [setKey(row.system, row.id, null)] : row.reasons.map((reason) => setKey(row.system, row.id, reason))
+      for (const key of keys) {
+        imsLeg.push({ key })
+        if (row.reasons.length === 0) vendorLeg.push({ key })
+        legPopulation.add(canonicalKey(key))
+      }
+    }
+    const leg = compareItem('R13', { ims: imsLeg, vendor: vendorLeg, imsComplete: true, vendorComplete: true, population: legPopulation, emptyProof: walked.value.total === 0 ? 'vendor-total-zero' : undefined })
     if (leg.status === 'compared' && outcomeOfComparison(leg).outcome === 'fail') return fromComparison('R13', leg, [IMS, WOO], ['VENDOR_LIST_UNPROVEN'])
     if (leg.status === 'unreadable') return inconclusive('R13', [IMS, WOO], leg.reason, 'VENDOR_LIST_UNPROVEN')
     return inconclusive('R13', [IMS, WOO], 'VENDOR_LIST_UNPROVEN')

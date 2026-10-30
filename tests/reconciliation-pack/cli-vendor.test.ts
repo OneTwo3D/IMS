@@ -44,7 +44,7 @@ async function store(): Promise<{ base: string; seen: Seen[] }> {
       const rows = url.searchParams.get('status') === 'processing' ? [order(11, 'processing', { billing: { email: EMAIL }, customer_note: `call ${SECRET}` }), order(12)] : []
       res.writeHead(200, { ...headers, 'x-wp-total': String(rows.length), 'x-wp-totalpages': String(rows.length ? 1 : 0) }); res.end(JSON.stringify(page === 1 ? rows : [])); return
     }
-    if (url.pathname === '/wp-json/wc/v3/taxes') { res.writeHead(200, { ...headers, 'x-wp-total': '1', 'x-wp-totalpages': '1' }); res.end(JSON.stringify(page === 1 ? [{ id: 5, name: 'VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: '', shipping: true, compound: false }] : [])); return }
+    if (url.pathname === '/wp-json/wc/v3/taxes') { res.writeHead(200, { ...headers, 'x-wp-total': '1', 'x-wp-totalpages': '1' }); res.end(JSON.stringify(page === 1 ? [{ id: 5, name: 'GB VAT', rate: '20.0000', country: 'GB', state: '', postcode: '', city: '', class: '', shipping: true, compound: false }] : [])); return }
     res.writeHead(404, headers); res.end('{}')
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))

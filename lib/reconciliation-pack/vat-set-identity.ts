@@ -81,8 +81,8 @@ export type VatSetInput = {
   /** Mappings of the storefront connector only. */
   mappings: readonly TaxMappingRow[]
   componentRates: readonly TaxComponentRateRow[]
-  /** The rows of the PROVEN stored Xero list. */
-  xero: readonly NormalisedXeroTaxRate[]
+  /** The rows of the PROVEN stored Xero list, or null when the stored list is not proven: the Xero leg is then not judged at all (no Xero row, no IMS-to-Xero reason, no Xero-type sharing) and only the WooCommerce-to-IMS identity checks run. */
+  xero: readonly NormalisedXeroTaxRate[] | null
 }
 
 const isSales = (usedFor: string): boolean => usedFor === 'SALES' || usedFor === 'BOTH'
@@ -117,7 +117,8 @@ function imsRegion(name: string, country: string): string | null {
 
 export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
   const ratesById = new Map(input.rates.map((rate) => [rate.id, rate]))
-  const xeroByType = new Map(input.xero.map((row) => [row.taxType, row]))
+  const xeroRows = input.xero ?? []
+  const xeroByType = new Map(xeroRows.map((row) => [row.taxType, row]))
   const mappedTo = new Map(input.mappings.map((mapping) => [mapping.externalTaxRateId, mapping.taxRateId]))
   const mappedClass = new Map(input.mappings.map((mapping) => [mapping.externalTaxRateId, normaliseClass(mapping.externalClass)]))
 
@@ -217,12 +218,12 @@ export function compareVatSetIdentity(input: VatSetInput): VatSetRow[] {
   for (const rate of imsInScope) {
     const reasons = new Set<VatSetReason>()
     if ((wooIdsByIms.get(rate.id)?.size ?? 0) === 0) reasons.add('MISSING_IN_WOO')
-    imsXeroReasons(rate, reasons)
-    if (rate.accountingTaxType !== null && (carriersByType.get(rate.accountingTaxType)?.length ?? 0) > 1) reasons.add('DUPLICATE_MAPPING')
+    if (input.xero !== null) imsXeroReasons(rate, reasons)
+    if (input.xero !== null && rate.accountingTaxType !== null && (carriersByType.get(rate.accountingTaxType)?.length ?? 0) > 1) reasons.add('DUPLICATE_MAPPING')
     add('ims', rate.id, reasons)
   }
 
-  for (const live of input.xero) {
+  for (const live of xeroRows) {
     if (live.status !== 'ACTIVE' || XERO_BUILT_IN_TAX_TYPES.has(live.taxType) || live.canApply.revenue !== true) continue
     const reasons = new Set<VatSetReason>()
     const carriers = carriersByType.get(live.taxType) ?? []

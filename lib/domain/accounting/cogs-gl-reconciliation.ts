@@ -8,6 +8,7 @@ import {
   AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
   findLatestConfiguredAccountBalanceSnapshot,
+  glLegProvenance,
 } from './account-balance-snapshots'
 import {
   buildAccountReconciliationSweepJournal,
@@ -55,6 +56,7 @@ export type CogsGlReconciliationUnavailableReason =
   | 'no_opening_snapshot'
   | 'financial_year_boundary'
   | 'account_identity_unproven'
+  | 'gl_balance_unproven'
   | 'ledger_not_covering_window'
 
 export type CogsGlReconciliationResult = AccountGlReconciliationResult<CogsGlReconciliationUnavailableReason>
@@ -111,7 +113,7 @@ export async function loadCogsGlReconciliation(options?: {
       currency,
     })
   } catch (error) {
-    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: 'account_identity_unproven' }
+    if (error instanceof AccountBalanceMovementWithheldError) return { available: false, reason: error.reason === 'balance_provenance_unproven' ? 'gl_balance_unproven' : 'account_identity_unproven' }
     throw error
   }
   if (!closing) return { available: false, reason: 'no_gl_snapshot' }
@@ -133,7 +135,7 @@ export async function loadCogsGlReconciliation(options?: {
     // COGS is a profit-and-loss account: its stored balance is year-to-date, so a window over a financial-year start (or an
     // unknown year end) has no movement to compare. Withheld by name.
     if (error instanceof AccountBalanceMovementWithheldError) {
-      return { available: false, reason: 'financial_year_boundary' }
+      return { available: false, reason: error.reason === 'balance_provenance_unproven' ? 'gl_balance_unproven' : 'financial_year_boundary' }
     }
     throw error
   }
@@ -169,6 +171,7 @@ export async function loadCogsGlReconciliation(options?: {
   return {
     available: true,
     balanceDate: balanceDateString(closingDate),
+    glProvenance: { opening: glLegProvenance(movement.opening), closing: glLegProvenance(movement.closing) },
     ...evaluateAccountGlReconciliation({
       subledgerValue,
       glBalance,

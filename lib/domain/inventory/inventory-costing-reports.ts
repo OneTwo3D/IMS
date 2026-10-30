@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import {
   calculateAccountBalanceVarianceBase,
   findLatestConfiguredAccountBalanceSnapshot,
+  glLegProvenance,
   getAccountBalancePeriodMovement,
   AccountBalanceMovementWithheldError,
   MissingAccountBalanceSnapshotError,
@@ -605,6 +606,13 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
     })
   } catch (error) {
     if (error instanceof AccountBalanceMovementWithheldError) {
+      if (error.reason === 'balance_provenance_unproven') {
+        return {
+          glBalanceBase: null,
+          glVarianceBase: null,
+          notices: [`The stored GL balance for inventory asset account ${context.inventoryAccountCode} is not one Xero reported and not a zero from a Trial Balance that proved itself complete (a legacy unproven absent-from-tb zero, or an unlabelled row), so GL variance is blank (pull the Trial Balance again).`],
+        }
+      }
       return {
         glBalanceBase: null,
         glVarianceBase: null,
@@ -613,7 +621,12 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
     }
     throw error
   }
-  return inventoryGlVarianceFromSnapshot(snapshot, asOf, totalValueBase, context.inventoryAccountCode)
+  const variance = inventoryGlVarianceFromSnapshot(snapshot, asOf, totalValueBase, context.inventoryAccountCode)
+  // A proven-absent zero is compared as the real zero it is, and the figure says it is not a balance Xero reported.
+  if (snapshot && variance.glBalanceBase !== null && glLegProvenance(snapshot) === 'proven-absent') {
+    variance.notices.push(`The GL balance for inventory asset account ${context.inventoryAccountCode} is zero because the account is absent from a Xero Trial Balance that proved itself complete; Xero reported no row for it.`)
+  }
+  return variance
 }
 
 /**
@@ -706,6 +719,8 @@ function cogsMovementWithheldNotice(error: AccountBalanceMovementWithheldError):
   switch (error.reason) {
     case 'window_crosses_financial_year_start':
       return 'The period crosses the start of a financial year, when the COGS account\'s year-to-date GL balance restarts from zero, so no GL COGS movement can be taken from two stored balances. The GL variance is blank.'
+    case 'balance_provenance_unproven':
+      return 'A stored GL COGS balance is not one Xero reported and not a zero from a Trial Balance that proved itself complete (a legacy unproven absent-from-tb zero, or an unlabelled row), so no movement is taken from it (pull the Trial Balance again). The GL variance is blank.'
     case 'account_identity_unproven':
     case 'account_identity_changed':
       return 'The two stored GL COGS balances cannot be shown to be the configured COGS account\'s own, from one organisation (the account code may have been reassigned), so no movement is taken from them. The GL variance is blank.'

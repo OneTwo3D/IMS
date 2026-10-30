@@ -250,7 +250,7 @@ const xeroRow = (taxType: string, over: Partial<NormalisedXeroTaxRate> = {}): No
 const xero = (...taxTypes: string[]): XeroTaxRateStore => ({ state: 'proven', tenantId: 'tenant-A', fetchedAt: '2026-10-19T00:00:00.000Z', taxTypes: taxTypes.map((entry) => { const [taxType, status] = entry.split(':'); return { taxType: taxType!, status: status ?? 'ACTIVE' } }), rows: taxTypes.map((entry) => { const [taxType, status] = entry.split(':'); return xeroRow(taxType!, { status: (status ?? 'ACTIVE') as NormalisedXeroTaxRate['status'] }) }) })
 
 test('R13 with a clean WooCommerce leg is INCONCLUSIVE (VENDOR_LIST_UNPROVEN) while the Xero list is not proven complete: it can never pass on half of its claim', async () => {
-  const c = context({ rates: [rate('r1')], mappings: [mapping('1'), mapping('2')] }, wooTaxes(1, 2))
+  const c = context({ rates: [rate('r1'), rate('r2')], mappings: [mapping('1'), mapping('2', 'r2')] }, wooTaxes(1, 2))
   const item = await runVendorItem('R13', c.ctx)
   assert.deepEqual([item.outcome, item.reasons, item.proof ?? null, item.sources], ['inconclusive', ['VENDOR_LIST_UNPROVEN'], null, ['ims-database', 'woocommerce-api']])
   // Not proven, whatever the cause: every closed cause, an unreadable section and an absent section.
@@ -272,13 +272,41 @@ test('R13: an unmapped WooCommerce rate, or a mapping to a rate the store no lon
   const unmapped = await runVendorItem('R13', context({ mappings: [mapping('1')] }, wooTaxes(1, 2)).ctx)
   assert.deepEqual([unmapped.outcome, unmapped.reasons, keys(unmapped, 'onlyVendor'), keys(unmapped, 'bothEqual')], ['fail', ['DIFFERENCES', 'VENDOR_LIST_UNPROVEN'], ['woo-tax-rate|2'], ['woo-tax-rate|1']])
   const stale = await runVendorItem('R13', context({ mappings: [mapping('1'), mapping('3')] }, wooTaxes(1)).ctx)
-  assert.deepEqual([stale.outcome, keys(stale, 'onlyIms')], ['fail', ['woo-tax-rate|3']])
+  assert.deepEqual([stale.outcome, keys(stale, 'onlyIms').filter((key) => !key.startsWith('vat-set|'))], ['fail', ['woo-tax-rate|3']])
   // IDENTITY SWAP: equal counts, one identity swapped.
   const swap = await runVendorItem('R13', context({ mappings: [mapping('1'), mapping('2')] }, wooTaxes(1, 3)).ctx)
-  assert.deepEqual([swap.outcome, keys(swap, 'onlyIms'), keys(swap, 'onlyVendor')], ['fail', ['woo-tax-rate|2'], ['woo-tax-rate|3']])
+  assert.deepEqual([swap.outcome, keys(swap, 'onlyIms').filter((key) => !key.startsWith('vat-set|')), keys(swap, 'onlyVendor')], ['fail', ['woo-tax-rate|2'], ['woo-tax-rate|3']])
   // Mappings of another connector are not the storefront's.
-  const other = await runVendorItem('R13', context({ mappings: [mapping('1'), mapping('9', 'r1', 'xero')] }, wooTaxes(1)).ctx)
+  const other = await runVendorItem('R13', context({ rates: [rate('r1')], mappings: [mapping('1'), mapping('9', 'r1', 'xero')] }, wooTaxes(1)).ctx)
   assert.deepEqual(other.reasons, ['VENDOR_LIST_UNPROVEN'])
+})
+
+// [mutation: the Woo-IMS identity skipped while the Xero list is unproven / the Xero-only reasons let into the unproven leg / the unproven reason dropped from a fail]
+test('R13 with an UNPROVEN Xero list still judges the Woo-IMS identity: an established difference fails beside VENDOR_LIST_UNPROVEN, an otherwise clean result stays inconclusive, and no Xero difference is reported', async () => {
+  const unprovenStores = [{ state: 'unproven', cause: 'DIGEST_MISMATCH' }, { state: 'unproven', cause: 'NO_HEADER' }] as const
+  for (const xeroStore of unprovenStores) {
+    // Woo 20% against IMS 19%.
+    const pct = await runVendorItem('R13', context({ rates: [rate('r1', { rate: '0.1900' })], mappings: [mapping('1')], xeroStore }, wooTaxes(1)).ctx)
+    assert.deepEqual([pct.outcome, pct.reasons, keys(pct, 'onlyIms').filter((key) => key.startsWith('vat-set|')), pct.sources], ['fail', ['DIFFERENCES', 'VENDOR_LIST_UNPROVEN'], ['vat-set|woo|percent-differs|1'], ['ims-database', 'woocommerce-api']], xeroStore.cause)
+    // the same differences are reported whatever the cause of the unproven list, and a different Woo-IMS field is found too (class, compound)
+    const compound = await runVendorItem('R13', context({ rates: [rate('r1')], mappings: [mapping('1')], xeroStore }, { taxes: [wooTax(1, { compound: true })] }).ctx)
+    assert.deepEqual([compound.outcome, compound.reasons, keys(compound, 'onlyIms').filter((key) => key.startsWith('vat-set|'))], ['fail', ['DIFFERENCES', 'VENDOR_LIST_UNPROVEN'], ['vat-set|woo|compound-differs|1']], xeroStore.cause)
+    // An IMS sales rate no Woo rate maps to is a Woo-IMS difference as well.
+    const missing = await runVendorItem('R13', context({ rates: [rate('r1'), rate('r2')], mappings: [mapping('1')], xeroStore }, wooTaxes(1)).ctx)
+    assert.equal(missing.outcome, 'fail', xeroStore.cause)
+    assert.deepEqual(keys(missing, 'onlyIms').filter((key) => key.startsWith('vat-set|')).map((key) => key.replace(/\|[^|]*$/, '')), ['vat-set|ims|missing-in-woo'], xeroStore.cause)
+    // Clean Woo-IMS: inconclusive, never a pass, and the identical identities are not findings.
+    const clean = await runVendorItem('R13', context({ rates: [rate('r1')], mappings: [mapping('1')], xeroStore }, wooTaxes(1)).ctx)
+    assert.deepEqual([clean.outcome, clean.reasons], ['inconclusive', ['VENDOR_LIST_UNPROVEN']], xeroStore.cause)
+  }
+  // No Xero reason is judged on an unproven list: an IMS rate with no Xero tax type (IMS_NOT_IN_XERO) and two rates sharing one type are not findings here.
+  const xeroOnly = await runVendorItem('R13', context({ rates: [rate('r1', { accountingTaxType: 'TAXNOPE' })], mappings: [mapping('1')], xeroStore: { state: 'unproven', cause: 'DIGEST_MISMATCH' } }, wooTaxes(1)).ctx)
+  assert.deepEqual([xeroOnly.outcome, xeroOnly.reasons], ['inconclusive', ['VENDOR_LIST_UNPROVEN']])
+  const shared = await runVendorItem('R13', context({ rates: [rate('r1', { accountingTaxType: 'TAX001' }), rate('r2', { accountingTaxType: 'TAX001' })], mappings: [mapping('1'), mapping('2', 'r2')], xeroStore: { state: 'unproven', cause: 'DIGEST_MISMATCH' } }, wooTaxes(1, 2)).ctx)
+  assert.deepEqual([shared.outcome, shared.reasons], ['inconclusive', ['VENDOR_LIST_UNPROVEN']])
+  // A section that failed to read is the same unproven leg.
+  const failed = await runVendorItem('R13', context({ rates: [rate('r1', { rate: '0.1900' })], mappings: [mapping('1')], fail: { xeroTaxRates: 'CAP_EXCEEDED' } as never }, wooTaxes(1)).ctx)
+  assert.deepEqual([failed.outcome, failed.reasons], ['fail', ['DIFFERENCES', 'VENDOR_LIST_UNPROVEN']])
 })
 
 // [mutation: a bad external id turned into a skipped row]
@@ -339,8 +367,10 @@ test('R13 WITH a proven Xero list, the presence leg: only the types IMS USES are
   assert.deepEqual((await run(['OUTPUT2', 'OUTPUT2'])).reasons, ['DUPLICATE_KEY'])
   // A WooCommerce finding still fails with the Xero leg proven.
   assert.equal((await run(['OUTPUT2', 'TAX001'], {}, wooTaxes(1, 2))).outcome, 'fail')
-  // A proven list is still required: an unproven one never passes however clean the references are.
-  assert.deepEqual((await runVendorItem('R13', context({ rates, mappings: [mapping('1')], xeroStore: { state: 'unproven', cause: 'DIGEST_MISMATCH' } }, wooTaxes(1)).ctx)).reasons, ['VENDOR_LIST_UNPROVEN'])
+  // A proven list is still required: an unproven one never passes however clean the references are (here the Woo-IMS identity is judged and finds the four IMS rates with no Woo counterpart).
+  const unproven = await runVendorItem('R13', context({ rates, mappings: [mapping('1')], xeroStore: { state: 'unproven', cause: 'DIGEST_MISMATCH' } }, wooTaxes(1)).ctx)
+  assert.notEqual(unproven.outcome, 'pass')
+  assert.ok(unproven.reasons.includes('VENDOR_LIST_UNPROVEN'))
 })
 
 // [mutation: the set rows left out of the comparison / a finding row also put on the vendor side / the reason dropped from the key]
