@@ -210,6 +210,13 @@ async function main() {
                            "externalCountry" = excluded."externalCountry",
                            "externalRatePct" = excluded."externalRatePct",
                            "externalClass"   = excluded."externalClass",
+                           -- the ownership stamp survives only a copy that changes nothing of what it was stamped for (lib/tax/storefront-mapping-write.ts)
+                           store_identity    = case when shopping_tax_rate_mappings."taxRateId" = excluded."taxRateId"
+                                                     and shopping_tax_rate_mappings."externalName" = excluded."externalName"
+                                                     and shopping_tax_rate_mappings."externalCountry" is not distinct from excluded."externalCountry"
+                                                     and shopping_tax_rate_mappings."externalRatePct" = excluded."externalRatePct"
+                                                     and shopping_tax_rate_mappings."externalClass" is not distinct from excluded."externalClass"
+                                                then shopping_tax_rate_mappings.store_identity else null end,
                            "updatedAt"       = now()`,
           [randomUUID(), m.connector, m.externalTaxRateId, m.externalName, m.externalCountry,
            m.externalRatePct, m.externalClass, taxRateId],

@@ -10,6 +10,7 @@
  */
 
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
+import { writeStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { db } from '@/lib/db'
 import { wcFetch } from '../api'
 
@@ -119,30 +120,16 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
     // Resolved in the write's transaction under the row share lock (lib/tax/writable-tax-rate.ts), so a re-key apply cannot commit between the resolution and the upsert.
     await db.$transaction(async (tx) => {
     const mappedTaxRateId = (await resolveWritableTaxRateId(tx, imsTaxRateId, { lenient: true })) ?? imsTaxRateId
-    await tx.shoppingTaxRateMapping.upsert({
-      where: {
-        connector_externalTaxRateId: {
-          connector: 'woocommerce',
-          externalTaxRateId: String(wcRate.id),
-        },
-      },
-      create: {
-        connector: 'woocommerce',
-        externalTaxRateId: String(wcRate.id),
-        externalName: name,
-        externalCountry: wcRate.country || null,
-        externalRatePct: ratePct.toFixed(4),
-        externalClass: wcRate.class || null,
-        taxRateId: mappedTaxRateId,
-      },
-      update: {
-        externalName: name,
-        externalCountry: wcRate.country || null,
-        externalRatePct: ratePct.toFixed(4),
-        externalClass: wcRate.class || null,
-        taxRateId: mappedTaxRateId,
-      },
-    })
+    // The ownership stamp of a row survives this write only if the row still means what it was stamped for (same IMS rate, same name, country, percent and class);
+    // a new row is born unstamped (lib/tax/storefront-mapping-write.ts).
+    const fields = {
+      externalName: name,
+      externalCountry: wcRate.country || null,
+      externalRatePct: ratePct.toFixed(4),
+      externalClass: wcRate.class || null,
+      taxRateId: mappedTaxRateId,
+    }
+    await writeStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId: String(wcRate.id) }, fields, fields)
     })
     mappedRates++
   }
