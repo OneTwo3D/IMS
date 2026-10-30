@@ -18,7 +18,7 @@
  * settings this script wrote, exactly as it does in production.
  */
 import { db } from '@/lib/db'
-import { writeStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
+import { upsertStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { serializeSettingValue } from '@/lib/settings-store'
 
 const FIXTURE_SKUS = {
@@ -81,7 +81,7 @@ async function prepare(): Promise<void> {
   const reduced = await db.taxRate.findFirstOrThrow({ where: { name: 'UK Reduced Rate (5%)' } })
   for (const [externalId, name, pct, taxRateId] of [['1', 'VAT', '20', standard.id], ['2', 'Reduced rate VAT', '5', reduced.id]] as const) {
     // Through the one writer that ends an ownership stamp the row no longer earns (lib/tax/storefront-mapping-write.ts).
-    await db.$transaction((tx) => writeStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId: externalId }, { taxRateId }, { externalName: name, externalCountry: 'GB', externalRatePct: pct, externalClass: null, taxRateId }))
+    await db.$transaction((tx) => upsertStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId: externalId }, { externalName: name, externalCountry: 'GB', externalRatePct: pct, externalClass: null, taxRateId }))
   }
 
   // 1 GBP = 1.25 EUR and 1.30 USD, dated before every fixture order. The USD rate can be left out (a dedicated arm models an installation without it).

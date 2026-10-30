@@ -229,9 +229,9 @@ async function recordApplied(digest: string, change: WooTaxChange, newId: string
     // The mapping row the change rests on must still be EXACTLY the planned one (this rate id, this IMS rate, this store) and must be hit exactly once: a row that went away or was re-pointed
     // between the plan and now leaves the store changed with nothing to show for it, so the record is rolled back and the run says so.
     const target = { connector: 'woocommerce', externalTaxRateId: change.wooId, taxRateId: change.imsRateId, storeIdentity }
-    const hit = change.kind === 'UPDATE'
-      ? (await tx.shoppingTaxRateMapping.updateMany({ where: target, data: mappingFields(change.after) })).count
-      : await tx.shoppingTaxRateMapping.count({ where: target })
+    // A DELETE keeps its mapping row (historic orders still resolve their tax lines through it) but ENDS its stamp in this same write: the rate is gone, and if the store ever gives that id to
+    // another rate (even one that looks identical) it is not ours until the operator adopts it.
+    const hit = (await tx.shoppingTaxRateMapping.updateMany({ where: target, data: change.kind === 'UPDATE' ? mappingFields(change.after) : { storeIdentity: null } })).count
     if (hit !== 1) throw new UnrecordedSendError(`the mapping row of store rate ${change.wooId} is not the planned one any more (${hit} row(s) matched its id, IMS rate and store)`)
   })
 }

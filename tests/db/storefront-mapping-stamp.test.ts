@@ -112,25 +112,88 @@ test('REPLACED RATE 10: the owner replaces the store rate by another and imports
   })
 })
 
-test('THE WRITER (lib/tax/storefront-mapping-write.ts): re-pointing a stamped row at another IMS rate clears the stamp, re-mapping to the same rate keeps it, an unstamped row stays unstamped, a missing row is an error', SKIP, async (t) => {
+test('THE HELPER (lib/tax/storefront-mapping-write.ts): an upsert or a re-point of a stamped row clears the stamp when the IMS rate or the identity changes and keeps it when not; a created row and an unstamped row stay unstamped; re-pointing a missing row is an error', SKIP, async (t) => {
   await withRun(t, async (r) => {
     const a = await r.db.taxRate.create({ data: { name: `${r.tag} A`, rate: '0.2000', usedFor: 'SALES' } })
     const b = await r.db.taxRate.create({ data: { name: `${r.tag} B`, rate: '0.2000', usedFor: 'SALES' } })
     const key = { connector: 'woocommerce', externalTaxRateId: r.ids[1]! }
     const fields = { externalName: `${r.tag} A`, externalCountry: 'GB', externalRatePct: '20.0000', externalClass: 'standard', taxRateId: a.id }
-    const made = await r.db.$transaction((tx) => r.helper.writeStorefrontTaxMapping(tx, key, fields, fields))
-    assert.deepEqual(made, { created: true, stampCleared: false })
-    assert.equal((await rowOf(r, r.ids[1]!))?.storeIdentity, null)
+    const stampOf = async () => (await rowOf(r, r.ids[1]!))?.storeIdentity
+    assert.deepEqual(await r.db.$transaction((tx) => r.helper.upsertStorefrontTaxMapping(tx, key, fields)), { created: true })
+    assert.equal(await stampOf(), null, 'a created row is unstamped')
     await stamp(r, r.ids[1]!)
-    const same = await r.db.$transaction((tx) => r.helper.writeStorefrontTaxMapping(tx, key, { taxRateId: a.id }, null))
-    assert.deepEqual(same, { created: false, stampCleared: false })
-    assert.equal((await rowOf(r, r.ids[1]!))?.storeIdentity, STORE)
-    const moved = await r.db.$transaction((tx) => r.helper.writeStorefrontTaxMapping(tx, key, { taxRateId: b.id }, null))
-    assert.deepEqual(moved, { created: false, stampCleared: true })
-    assert.equal((await rowOf(r, r.ids[1]!))?.storeIdentity, null)
-    const unstamped = await r.db.$transaction((tx) => r.helper.writeStorefrontTaxMapping(tx, key, { taxRateId: a.id }, null))
-    assert.deepEqual(unstamped, { created: false, stampCleared: false })
-    await assert.rejects(() => r.db.$transaction((tx) => r.helper.writeStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId: '1' }, { taxRateId: a.id }, null)), /no storefront tax-rate mapping/)
+    assert.deepEqual(await r.db.$transaction((tx) => r.helper.upsertStorefrontTaxMapping(tx, key, fields)), { created: false })
+    assert.equal(await stampOf(), STORE, 'an upsert that changes nothing keeps the stamp')
+    await r.db.$transaction((tx) => r.helper.upsertStorefrontTaxMapping(tx, key, { ...fields, externalName: `  ${r.tag.toLowerCase()}   a `, externalCountry: 'uk', externalRatePct: '20', externalClass: '' }))
+    assert.equal(await stampOf(), STORE, 'the same rate by R13\'s comparisons keeps it')
+    await r.db.$transaction((tx) => r.helper.repointStorefrontTaxMapping(tx, key, a.id))
+    assert.equal(await stampOf(), STORE, 're-pointing to the same IMS rate keeps it')
+    for (const over of [{ externalRatePct: '21.0000' }, { externalCountry: 'IE' }, { externalClass: 'zero-rate' }, { externalName: `${r.tag} A2` }, { taxRateId: b.id }]) {
+      await stamp(r, r.ids[1]!)
+      await r.db.$transaction((tx) => r.helper.upsertStorefrontTaxMapping(tx, key, { ...fields, ...over }))
+      assert.equal(await stampOf(), null, `an upsert that changes ${Object.keys(over)[0]} clears it`)
+      await r.db.$transaction((tx) => r.helper.upsertStorefrontTaxMapping(tx, key, fields))
+    }
+    await stamp(r, r.ids[1]!)
+    await r.db.$transaction((tx) => r.helper.repointStorefrontTaxMapping(tx, key, b.id))
+    assert.equal(await stampOf(), null, 're-pointing to another IMS rate clears it')
+    await r.db.$transaction((tx) => r.helper.repointStorefrontTaxMapping(tx, key, a.id))
+    assert.equal(await stampOf(), null, 'an unstamped row stays unstamped')
+    await assert.rejects(() => r.db.$transaction((tx) => r.helper.repointStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId: '1' }, a.id)), /no storefront tax-rate mapping/)
+  })
+})
+
+test('DIFFERENTIAL: the SQL decision and mappingKeepsStamp agree over a matrix of names, countries, percents and classes (SQL may only be stricter)', SKIP, async (t) => {
+  await withRun(t, async (r) => {
+    const a = await r.db.taxRate.create({ data: { name: `${r.tag} A`, rate: '0.2000', usedFor: 'SALES' } })
+    const key = { connector: 'woocommerce', externalTaxRateId: r.ids[1]! }
+    const base = { externalName: `${r.tag} Alpha VAT`, externalCountry: 'GB' as string | null, externalRatePct: '20.0000', externalClass: 'standard' as string | null, taxRateId: a.id }
+    const names = [base.externalName, `  ${r.tag.toLowerCase()}  alpha   vat `, `${r.tag} Alpha  VAT`, `${r.tag} Beta VAT`, `${r.tag} alpha vat.`]
+    const countries: Array<string | null> = ['GB', 'gb', ' GB ', 'UK', 'uk', null, '', 'IE', 'EL', 'GR']
+    const pcts = ['20.0000', '20', '20.00', '20.0001', '19.9999', '0']
+    const classes: Array<string | null> = ['standard', '', null, ' Standard ', 'zero-rate', 'reduced-rate']
+    let compared = 0
+    let sqlStricter = 0
+    for (const externalName of names) for (const externalCountry of countries) for (const externalRatePct of pcts.slice(0, 4)) for (const externalClass of classes) {
+      const next = { ...base, externalName, externalCountry, externalRatePct, externalClass }
+      await r.db.$transaction((tx) => r.helper.upsertStorefrontTaxMapping(tx, key, base))
+      await stamp(r, r.ids[1]!)
+      await r.db.$transaction((tx) => r.helper.upsertStorefrontTaxMapping(tx, key, next))
+      const sqlKept = (await rowOf(r, r.ids[1]!))?.storeIdentity === STORE
+      const jsKept = r.helper.mappingKeepsStamp(base, next)
+      compared += 1
+      if (sqlKept && !jsKept) assert.fail(`SQL kept a stamp the reference rule clears: ${JSON.stringify(next)}`)
+      if (!sqlKept && jsKept) sqlStricter += 1
+      if (compared > 400) break
+    }
+    console.log(`# differential: ${compared} combinations, SQL stricter in ${sqlStricter}`)
+    assert.ok(compared >= 200)
+    assert.ok(sqlStricter <= 4, `SQL should differ from the reference rule only in rare whitespace corners, differed in ${sqlStricter}`)
+  })
+})
+
+test('DELETE ENDS THE STAMP: a deleted rate\'s mapping row stays (historic orders) but is unstamped, so a store that reuses the id for a look-alike rate gets no DELETE', SKIP, async (t) => {
+  const { buildWorld } = await import('../helpers/woo-tax-world.ts')
+  await buildWorld(t, async () => { const m = await modules(); return { db: m.db, writer: m.writer } }, async (w) => {
+    const live = { env: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://stage.example.com', WC_WRITES_LIVE_FROM: '2026-01-01T00:00:00Z' } }
+    const plan = (await w.m.writer.readWooTaxPlan(w.deps(live.env))).plan!
+    const r = await w.m.writer.applyWooTaxPlan(w.deps(live.env), { confirm: plan.digest })
+    assert.equal(r.outcome, 'DONE')
+    const row = await rowOf({ db: w.m.db }, w.woo.w4)
+    assert.ok(row, 'the mapping row of the deleted rate is kept')
+    assert.equal(row.storeIdentity, null, 'but its stamp is gone')
+    // The store gives that id to a rate that looks identical (same name, country, percent, class). IMS never adopted it.
+    w.store.rates.set(w.woo.w4, woo(w.woo.w4, { name: 'XX Old VAT', country: 'XX', rate: '10.0000' }))
+    const next = (await w.m.writer.readWooTaxPlan(w.deps(live.env))).plan!
+    assert.ok(!next.changes.some((c) => c.kind === 'DELETE' && c.wooId === w.woo.w4), 'the look-alike is not deleted')
+    assert.ok(next.findings.some((f) => f.code === 'MAPPING_NOT_ADOPTED' && f.wooId === w.woo.w4))
+    const calls = w.store.calls.length
+    await w.m.writer.applyWooTaxPlan(w.deps(live.env), { confirm: next.digest })
+    assert.equal(w.store.calls.length, calls)
+    assert.equal(w.store.rates.has(w.woo.w4), true)
+    // and it can be adopted explicitly
+    const adoption = (await w.m.writer.readWooAdoptionPlan(w.deps(live.env))).plan!
+    assert.ok(adoption.rows.some((x) => x.wooId === w.woo.w4 && x.reason === 'UNSTAMPED'))
   })
 })
 

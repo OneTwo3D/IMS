@@ -10,7 +10,7 @@
  */
 
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
-import { writeStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
+import { upsertStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { db } from '@/lib/db'
 import { wcFetch } from '../api'
 
@@ -129,7 +129,7 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
       externalClass: wcRate.class || null,
       taxRateId: mappedTaxRateId,
     }
-    await writeStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId: String(wcRate.id) }, fields, fields)
+    await upsertStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId: String(wcRate.id) }, fields)
     })
     mappedRates++
   }

@@ -10,7 +10,7 @@ import test from 'node:test'
  * write (lib/tax/storefront-mapping-write.ts, or inline where the writer is a bulk statement). This test scans the tree for every write to the table (a Prisma delegate call or raw SQL) and
  * requires each file to be declared with the rule that holds for it, and the rule to be visible in the file. A new writer is red until it is declared; a declared one that loses its rule is red.
  *
- *   helper         changes rows only through writeStorefrontTaxMapping (which keeps the stamp only if the row still means the same); may also delete rows
+ *   helper         changes rows only through upsertStorefrontTaxMapping / repointStorefrontTaxMapping (which keeps the stamp only if the row still means the same); may also delete rows
  *   clears-inline  changes rows itself and clears the stamp in the same statement (the declared token must be in the file)
  *   creates-only   only creates rows (born unstamped); no update, upsert or ON CONFLICT DO UPDATE
  *   removes-only   only deletes rows (a deleted row owns nothing)
@@ -68,7 +68,7 @@ export function censusFindings(files: ReadonlyMap<string, string>, declared: Rea
   const seen = new Set<string>()
   for (const [file, text] of files) {
     const ops = writesOf(text)
-    const usesHelper = /writeStorefrontTaxMapping\s*\(/.test(text)
+    const usesHelper = /\b(upsert|repoint)StorefrontTaxMapping\s*\(/.test(text)
     if (ops.size === 0 && !usesHelper) continue
     seen.add(file)
     const decl = declared[file]
@@ -76,7 +76,7 @@ export function censusFindings(files: ReadonlyMap<string, string>, declared: Rea
     const changes = ops.has('update')
     switch (decl.rule) {
       case 'helper':
-        if (!usesHelper) failures.push(`HELPER ${file} is declared a helper user but never calls writeStorefrontTaxMapping`)
+        if (!usesHelper) failures.push(`HELPER ${file} is declared a helper user but never calls the helper (upsertStorefrontTaxMapping / repointStorefrontTaxMapping)`)
         if (changes) failures.push(`HELPER ${file} changes rows directly (update/upsert) next to the helper: that write keeps a stale stamp`)
         if (ops.has('create')) failures.push(`HELPER ${file} creates rows directly: go through the helper`)
         break
@@ -101,7 +101,7 @@ const real = new Map<string, string>()
 for (const root of ROOTS) for (const path of walk(join(ROOT, root))) real.set(relative(ROOT, path), readFileSync(path, 'utf8'))
 
 test('PRECONDITION: the census reached the tree, found every declared writer, and the real tree is green', () => {
-  const found = [...real].filter(([, text]) => writesOf(text).size > 0 || /writeStorefrontTaxMapping\s*\(/.test(text)).map(([file]) => file).sort()
+  const found = [...real].filter(([, text]) => writesOf(text).size > 0 || /\b(upsert|repoint)StorefrontTaxMapping\s*\(/.test(text)).map(([file]) => file).sort()
   console.log(`# mapping-writer census: ${real.size} files scanned, ${found.length} writers: ${found.join(', ')}`)
   assert.ok(real.size > 800)
   assert.deepEqual(found, Object.keys(WRITERS).sort())
@@ -121,10 +121,10 @@ test('MUTATION: a new writer in a new file, in Prisma and in raw SQL, is red unt
 test('MUTATION: each writer that loses its rule is red', () => {
   const mutate = (file: string, edit: (text: string) => string) => { const files = new Map(real); files.set(file, edit(real.get(file)!)); return censusFindings(files) }
   // the import stops using the helper and goes back to a plain upsert
-  assert.ok(mutate('lib/connectors/woocommerce/sync/taxes.ts', (t) => t.replace('await writeStorefrontTaxMapping(', 'await tx.shoppingTaxRateMapping.upsert({ where: {} as never, create: {} as never, update: {} as never }) || (')).some((f) => /^(HELPER|STALE) lib\/connectors\/woocommerce\/sync\/taxes\.ts/.test(f)))
-  assert.ok(mutate('lib/connectors/woocommerce/sync/taxes.ts', (t) => t.replaceAll('writeStorefrontTaxMapping', 'somethingElse')).some((f) => /^(HELPER|STALE) lib\/connectors\/woocommerce\/sync\/taxes\.ts/.test(f)))
-  assert.ok(mutate('app/actions/wc-sync.ts', (t) => t.replace('await writeStorefrontTaxMapping(tx,', 'await tx.shoppingTaxRateMapping.update({ where: {} as never, data: {} }) || (tx,')).some((f) => f.startsWith('HELPER app/actions/wc-sync.ts')))
-  assert.ok(mutate('scripts/lib/woo-import-driver.ts', (t) => t.replace('writeStorefrontTaxMapping(tx,', 'tx.shoppingTaxRateMapping.update(')).some((f) => f.startsWith('HELPER scripts/lib/woo-import-driver.ts')))
+  assert.ok(mutate('lib/connectors/woocommerce/sync/taxes.ts', (t) => t.replace('await upsertStorefrontTaxMapping(', 'await tx.shoppingTaxRateMapping.upsert({ where: {} as never, create: {} as never, update: {} as never }) || (')).some((f) => /^(HELPER|STALE) lib\/connectors\/woocommerce\/sync\/taxes\.ts/.test(f)))
+  assert.ok(mutate('lib/connectors/woocommerce/sync/taxes.ts', (t) => t.replaceAll('upsertStorefrontTaxMapping', 'somethingElse')).some((f) => /^(HELPER|STALE) lib\/connectors\/woocommerce\/sync\/taxes\.ts/.test(f)))
+  assert.ok(mutate('app/actions/wc-sync.ts', (t) => t.replace('await repointStorefrontTaxMapping(tx,', 'await tx.shoppingTaxRateMapping.update({ where: {} as never, data: {} }) || (tx,')).some((f) => f.startsWith('HELPER app/actions/wc-sync.ts')))
+  assert.ok(mutate('scripts/lib/woo-import-driver.ts', (t) => t.replace('upsertStorefrontTaxMapping(tx,', 'tx.shoppingTaxRateMapping.update(')).some((f) => f.startsWith('HELPER scripts/lib/woo-import-driver.ts')))
   // the re-key stops clearing; the copy script's ON CONFLICT DO UPDATE stops clearing
   assert.ok(mutate('lib/tax/tax-rekey.ts', (t) => t.replace('data: { taxRateId: fresh.id, storeIdentity: null }', 'data: { taxRateId: fresh.id }')).some((f) => f.startsWith('CLEARS lib/tax/tax-rekey.ts')))
   assert.ok(mutate('scripts/copy-tax-rates.ts', (t) => t.replaceAll('store_identity', 'something_else')).some((f) => f.startsWith('CLEARS scripts/copy-tax-rates.ts')))

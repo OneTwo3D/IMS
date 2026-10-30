@@ -1,7 +1,7 @@
 'use server'
 
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
-import { writeStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
+import { repointStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -724,7 +724,7 @@ export async function updateShoppingTaxRateMapping(
   await db.$transaction(async (tx) => {
   const writableTaxRateId = (await resolveWritableTaxRateId(tx, taxRateId)) ?? taxRateId
   // Re-pointing a mapped rate at another IMS rate ends any ownership stamp on the row (lib/tax/storefront-mapping-write.ts); re-mapping to the same rate keeps it.
-  await writeStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId }, { taxRateId: writableTaxRateId }, null)
+  await repointStorefrontTaxMapping(tx, { connector: 'woocommerce', externalTaxRateId }, writableTaxRateId)
   })
   revalidatePath('/sync')
   return { success: true }

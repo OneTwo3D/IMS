@@ -62,14 +62,13 @@ const mockDb = {
     },
   },
   shoppingTaxRateMapping: {
-    // The mapping write reads the row first (lib/tax/storefront-mapping-write.ts): none exists in these tests.
-    findUnique: async () => null,
     upsert: async ({ create }: { create: Row }) => {
       db.mappings.push(create)
       return create
     },
   },
-  $queryRaw: async () => [] as Row[],
+  // The mapping write is one INSERT ... ON CONFLICT statement (lib/tax/storefront-mapping-write.ts); it answers whether it created the row.
+  $queryRaw: async () => [{ created: true }] as Row[],
   $transaction: async <T,>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(mockDb),
 }
 
